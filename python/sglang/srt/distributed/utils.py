@@ -196,6 +196,54 @@ def tp_partition_offset(
     return sum(tp_partition_sizes(total, tp_size, units)[:rank])
 
 
+def tp_plan_active(tp_size: int) -> bool:
+    """True when an uneven-TP ratio plan is installed AND applies to a
+    layer/group of the given tp_size (disable_tp layers with tp_size=1 and
+    groups of a different size keep the classic even split)."""
+    ratios = _TP_PARTITION_RATIOS
+    return bool(ratios) and len(ratios) == tp_size
+
+
+def tp_loaded_shard_start(
+    loaded_full: int,
+    tp_size: Optional[int],
+    rank: int,
+    shard_size: int,
+    units: Optional[int] = None,
+) -> int:
+    """Start offset when narrowing a full checkpoint dimension of
+    `loaded_full` elements down to this rank's shard of `shard_size`.
+
+    Even TP (no ratio plan installed, or the plan does not match
+    `tp_size`): `rank * shard_size` -- the classic formula, bit-for-bit
+    the previous behavior. Uneven TP (--rank-tp-ratio): the prefix sum of
+    the per-rank partition sizes (with `units` = the dimension's
+    indivisible unit count, e.g. kv heads); the given `shard_size` must
+    match this rank's partition, which cross-checks the parameter shape
+    against the plan.
+
+    `tp_size=None` means "derive from the plan" (callers such as the
+    parameter-class loaders that only know the rank); with no plan
+    installed this still degrades to `rank * shard_size`.
+    """
+    ratios = _TP_PARTITION_RATIOS
+    if not ratios or (tp_size is not None and len(ratios) != tp_size):
+        return rank * shard_size
+    if shard_size == loaded_full:
+        # Fully replicated component: every rank loads the whole
+        # checkpoint dimension.
+        return 0
+    sizes = partition_sizes(loaded_full, ratios, units)
+    if sizes[rank] != shard_size:
+        raise ValueError(
+            f"uneven-TP shard mismatch: expected size {sizes[rank]} for "
+            f"rank {rank} of dimension {loaded_full} under weight vector "
+            f"{list(ratios)} (units={units}), but the parameter shard "
+            f"has {shard_size}."
+        )
+    return sum(sizes[:rank])
+
+
 def split_tensor_along_last_dim(
     tensor: torch.Tensor,
     num_partitions: int,
