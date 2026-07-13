@@ -328,10 +328,16 @@ class Envs:
     # nondeterministic resume (or a checkpoint at a wrong position) can be
     # attributed from server logs.
     SGLANG_MAMBA_CKPT_DEBUG = EnvBool(False)
-    # Debug lever: zero the full-attention KV buffers on /flush_cache so a
-    # flushed server matches a fresh boot even if some kernel reads residual
-    # bytes beyond the valid region. Diagnostic only (slow, idle-time).
-    SGLANG_FLUSH_ZERO_KV = EnvBool(False)
+    # Zero the attention KV data buffers on /flush_cache (default ON, set 0
+    # to opt out): a flushed server must match a fresh boot bit-for-bit even
+    # if some kernel folds residual bytes beyond the valid region into its
+    # result. Idle-time only, cost irrelevant.
+    SGLANG_FLUSH_ZERO_KV = EnvBool(True)
+    # Debug lever: after /flush_cache's empty_cache, claim + zero + release
+    # the free device memory so allocator-recycled pages read as zeros like
+    # the first-touch pages of a fresh boot. Discriminates kernels that are
+    # sensitive to residual bytes in uninitialized activation scratch.
+    SGLANG_FLUSH_SCRUB_FREE_MEMORY = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)

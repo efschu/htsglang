@@ -3788,6 +3788,8 @@ class Scheduler(
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             if envs.SGLANG_FLUSH_ZERO_KV.get():
+                # Default part of the flush (opt-out env): the post-flush
+                # state must equal a fresh boot, whose pools are torch.zeros.
                 self._flush_zero_kv_buffers()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
@@ -3797,6 +3799,8 @@ class Scheduler(
 
             if empty_cache:
                 current_platform.empty_cache()
+            if envs.SGLANG_FLUSH_SCRUB_FREE_MEMORY.get():
+                self._flush_scrub_free_memory()
             # Per-DP-group leader logs once: ranks within a DP group are
             # state-synchronous, but DP groups may diverge.
             if self.metrics_reporter.is_stats_logging_rank:
@@ -3812,31 +3816,51 @@ class Scheduler(
         return success
 
     def _flush_zero_kv_buffers(self):
-        """SGLANG_FLUSH_ZERO_KV debug lever: zero the full-attention KV data
-        buffers during an idle flush, so a flushed server matches a freshly
-        booted one bit-for-bit even if some kernel folds residual bytes
-        beyond the valid sequence region into its result. Diagnostic tool
-        for attributing warm-path nondeterminism; not a production default.
-        """
-        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-        pools = [kvcache]
-        for attr in ("full_kv_pool", "swa_kv_pool"):
-            sub = getattr(kvcache, attr, None)
-            if sub is not None:
-                pools.append(sub)
-        zeroed = 0
-        for pool in pools:
-            for name in ("k_buffer", "v_buffer", "kv_buffer"):
-                bufs = getattr(pool, name, None)
-                if bufs is None:
-                    continue
-                if isinstance(bufs, torch.Tensor):
-                    bufs = [bufs]
-                for t in bufs:
-                    t.zero_()
-                    zeroed += 1
+        """Zero the attention KV data buffers during an idle flush (default,
+        SGLANG_FLUSH_ZERO_KV=0 opts out), so a flushed server matches a
+        freshly booted one bit-for-bit even if some kernel folds residual
+        bytes beyond the valid sequence region into its result."""
+        from sglang.srt.mem_cache.memory_pool import zero_kv_data_buffers
+
+        zeroed = zero_kv_data_buffers(self.token_to_kv_pool_allocator.get_kvcache())
         current_platform.synchronize()
-        logger.info("SGLANG_FLUSH_ZERO_KV: zeroed %d KV buffers", zeroed)
+        logger.info("flush: zeroed %d KV data buffers", zeroed)
+
+    def _flush_scrub_free_memory(self):
+        """SGLANG_FLUSH_SCRUB_FREE_MEMORY debug lever: after empty_cache,
+        claim as much of the free device memory as possible, zero it and
+        release it again. Allocator-recycled pages then read as zeros — the
+        same content a freshly booted process sees on its first-touch pages
+        — which discriminates (and works around) kernels whose results
+        depend on residual bytes in uninitialized activation scratch.
+        Best effort; idle-time only, cost irrelevant.
+        """
+        if not current_platform.is_cuda():
+            return
+        device = self.tp_worker.model_runner.device
+        scrubbed = 0
+        buffers = []
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info()
+            chunk = int(free_bytes * 0.95)
+            min_chunk = 256 << 20
+            while chunk >= min_chunk:
+                try:
+                    # torch.zeros allocates AND memsets the pages.
+                    buffers.append(
+                        torch.zeros(chunk, dtype=torch.uint8, device=device)
+                    )
+                    scrubbed += chunk
+                except torch.OutOfMemoryError:
+                    chunk //= 2
+        finally:
+            buffers.clear()
+            current_platform.empty_cache()
+            current_platform.synchronize()
+        logger.info(
+            "SGLANG_FLUSH_SCRUB_FREE_MEMORY: scrubbed %.2f GiB of free memory",
+            scrubbed / (1 << 30),
+        )
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(vars(get_server_args()))  # vars returns a ref to obj.__dict__

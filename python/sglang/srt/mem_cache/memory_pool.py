@@ -308,6 +308,11 @@ class ReqToTokenPool:
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation.zero_()
+        # Flush invariant: post-flush state must equal a fresh boot. The
+        # token table starts zeroed at init; stale mappings would otherwise
+        # survive a flush (including the padding row 0, which CUDA-graph
+        # padded batches deliberately read).
+        self.req_to_token.zero_()
 
 
 class MambaPool:
@@ -1282,6 +1287,37 @@ class KvBufferDesc:
     def item_len_bytes(self, page_size: int) -> int:
         """Per-page transfer chunk (one page's worth of this buffer)."""
         return (page_size // self.tokens_per_row) * self.row_bytes
+
+
+def zero_kv_data_buffers(kvcache) -> int:
+    """Zero the KV data buffers of ``kvcache`` (and its sub-pools) in place;
+    returns the number of buffers zeroed.
+
+    Flush invariant helper: freshly booted pools are torch.zeros, so an
+    idle-time flush must also return the DATA bytes to zero — otherwise a
+    kernel that folds residual bytes beyond the valid sequence region into
+    its result behaves differently (and run-dependently) after a flush.
+    Covers the dense-attribute layouts (k_buffer / v_buffer / kv_buffer,
+    tensor or list-of-tensors) plus the hybrid sub-pools; exotic pools
+    without these attributes are simply skipped (best effort).
+    """
+    pools = [kvcache]
+    for attr in ("full_kv_pool", "swa_kv_pool"):
+        sub = getattr(kvcache, attr, None)
+        if sub is not None:
+            pools.append(sub)
+    zeroed = 0
+    for pool in pools:
+        for name in ("k_buffer", "v_buffer", "kv_buffer"):
+            bufs = getattr(pool, name, None)
+            if bufs is None:
+                continue
+            if isinstance(bufs, torch.Tensor):
+                bufs = [bufs]
+            for t in bufs:
+                t.zero_()
+                zeroed += 1
+    return zeroed
 
 
 class KVCache(abc.ABC):
