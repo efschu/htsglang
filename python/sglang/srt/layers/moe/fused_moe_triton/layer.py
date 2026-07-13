@@ -12,6 +12,11 @@ from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
+from sglang.srt.distributed.utils import (
+    tp_partition_offset,
+    tp_partition_size,
+    tp_plan_active,
+)
 from sglang.srt.distributed import (
     get_moe_ep_group,
     get_tp_group,
@@ -229,8 +234,25 @@ class FusedMoE(torch.nn.Module):
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
         self._pending_fp8_shared_scales: dict[tuple[int, str], torch.Tensor] = {}
 
-        assert intermediate_size % self.moe_tp_size == 0
-        self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
+        # Uneven TP (--rank-tp-ratio): partition the expert intermediate
+        # size by the shard plan in quant-block units (128er FP8 blocks),
+        # so every rank's share stays block-aligned. One unit count
+        # divides both the weight grid and the scale grid. Without a
+        # plan this is the classic even split.
+        _moe_units = intermediate_size
+        _block = getattr(quant_config, "weight_block_size", None) if quant_config else None
+        if _block and intermediate_size % _block[0] == 0:
+            _moe_units = intermediate_size // _block[0]
+        self.moe_tp_units = _moe_units
+        if tp_plan_active(self.moe_tp_size):
+            self.intermediate_size_per_partition = tp_partition_size(
+                intermediate_size, self.moe_tp_size, self.moe_tp_rank, _moe_units
+            )
+        else:
+            assert intermediate_size % self.moe_tp_size == 0
+            self.intermediate_size_per_partition = (
+                intermediate_size // self.moe_tp_size
+            )
         self.reduce_results = reduce_results
         self.use_presharded_weights = use_presharded_weights
 
@@ -501,7 +523,9 @@ class FusedMoE(torch.nn.Module):
                 expert_data,
                 loaded_weight,
                 start,
-                shard_size * tp_rank,
+                self._moe_src_start(
+                    loaded_weight.shape[shard_dim], shard_size, tp_rank
+                ),
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -512,11 +536,29 @@ class FusedMoE(torch.nn.Module):
                     # do not transpose for bias
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
+                    shard_dim,
+                    self._moe_src_start(
+                        loaded_weight.shape[shard_dim], shard_size, tp_rank
+                    ),
+                    shard_size,
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
         expert_data.copy_(loaded_weight)
+
+
+    def _moe_src_start(
+        self, loaded_total: int, shard_size: int, tp_rank: int
+    ) -> int:
+        """Source-side start of this rank's shard in a full checkpoint
+        tensor. Even TP: rank * shard_size. Uneven TP: prefix sum of the
+        plan partition; works for weight AND block-scale grids because
+        moe_tp_units divides both."""
+        if not tp_plan_active(self.moe_tp_size):
+            return shard_size * tp_rank
+        return tp_partition_offset(
+            loaded_total, self.moe_tp_size, tp_rank, self.moe_tp_units
+        )
 
     def _load_w2(
         self,
@@ -572,7 +614,9 @@ class FusedMoE(torch.nn.Module):
                 expert_data,
                 loaded_weight,
                 0,  # param_data_start
-                shard_size * tp_rank,
+                self._moe_src_start(
+                    loaded_weight.shape[shard_dim], shard_size, tp_rank
+                ),
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -582,7 +626,11 @@ class FusedMoE(torch.nn.Module):
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
+                    shard_dim,
+                    self._moe_src_start(
+                        loaded_weight.shape[shard_dim], shard_size, tp_rank
+                    ),
+                    shard_size,
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
