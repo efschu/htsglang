@@ -36,7 +36,11 @@ from sglang.srt.mem_cache.mamba_ckpt_utils import (
     mamba_checkpoint_track_target,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
+    zero_kv_data_buffers,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
@@ -419,6 +423,79 @@ class TestFlushResetsMambaPool(unittest.TestCase):
         self.assertEqual(
             pool.mamba_allocator.available_size(), mamba_pool.size
         )
+
+    def test_flush_equals_fresh_boot_bitwise(self):
+        """Full flush invariance: after the scheduler-side flush sequence
+        (req_to_token_pool.clear + kv allocator clear + KV data zeroing),
+        every stateful tensor of the pool stack must be bit-identical to a
+        freshly built twin, and the allocators must hand out identical
+        slot/token orders."""
+        dirty = _build_tree(None, enable_linear_replayssm=True)
+        fresh = _build_tree(None, enable_linear_replayssm=True)
+        d_tree, d_alloc, d_pool, d_make = dirty
+        f_tree, f_alloc, f_pool, _ = fresh
+
+        # Simulate traffic on the dirty stack.
+        req = d_make()
+        _insert_seq(d_tree, d_alloc, d_pool, SEQ[:8])
+        d_pool.req_to_token[req.req_pool_idx, :12] = 7
+        d_pool.req_to_token[0, :] = 9  # padding row
+        for conv in d_pool.mamba_pool.mamba_cache.conv:
+            conv.fill_(1.0)
+        d_pool.mamba_pool.mamba_cache.temporal.fill_(2.0)
+        d_pool.mamba_pool.replayssm_write_pos.fill_(7)
+        d_kvcache = d_alloc.get_kvcache()
+        for buf in d_kvcache.full_kv_pool.k_buffer:
+            buf.fill_(3.0)
+        for buf in d_kvcache.full_kv_pool.v_buffer:
+            buf.fill_(4.0)
+
+        # Scheduler flush sequence (scheduler.flush_cache order).
+        d_tree.reset()
+        d_pool.clear()
+        d_alloc.clear()
+        zeroed = zero_kv_data_buffers(d_kvcache)
+        self.assertGreater(zeroed, 0)
+
+        # Bitwise comparison against the fresh twin.
+        f_kvcache = f_alloc.get_kvcache()
+        pairs = [
+            (d_pool.req_to_token, f_pool.req_to_token),
+            (d_pool.req_generation, f_pool.req_generation),
+            (
+                d_pool.req_index_to_mamba_index_mapping,
+                f_pool.req_index_to_mamba_index_mapping,
+            ),
+            (
+                d_pool.mamba_pool.replayssm_write_pos,
+                f_pool.mamba_pool.replayssm_write_pos,
+            ),
+            (d_pool.mamba_pool.mamba_cache.temporal, f_pool.mamba_pool.mamba_cache.temporal),
+        ]
+        pairs += list(
+            zip(d_pool.mamba_pool.mamba_cache.conv, f_pool.mamba_pool.mamba_cache.conv)
+        )
+        for name in ("replayssm_d", "replayssm_k", "replayssm_g"):
+            pairs.append(
+                (
+                    getattr(d_pool.mamba_pool.mamba_cache, name),
+                    getattr(f_pool.mamba_pool.mamba_cache, name),
+                )
+            )
+        pairs += list(zip(d_kvcache.full_kv_pool.k_buffer, f_kvcache.full_kv_pool.k_buffer))
+        pairs += list(zip(d_kvcache.full_kv_pool.v_buffer, f_kvcache.full_kv_pool.v_buffer))
+        for i, (a, b) in enumerate(pairs):
+            self.assertTrue(torch.equal(a, b), f"tensor pair {i} differs after flush")
+
+        # Allocation order identical to a fresh boot.
+        self.assertEqual(d_pool.free_slots, f_pool.free_slots)
+        self.assertEqual(
+            d_pool.mamba_allocator.available_size(),
+            f_pool.mamba_allocator.available_size(),
+        )
+        d_first = d_alloc.alloc(4)
+        f_first = f_alloc.alloc(4)
+        self.assertTrue(torch.equal(d_first, f_first))
 
 
 class _FakeSpecAlgo:
