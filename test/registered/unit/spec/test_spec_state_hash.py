@@ -17,6 +17,7 @@ from sglang.srt.debug_utils.spec_state_hash import (
     hash_tensor,
     maybe_dump_on_request_finish,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -24,6 +25,18 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 # Traverse into this test module's classes plus torch.nn containers.
 _PREFIXES = (__name__, "torch.nn.", "sglang.")
+
+
+class _SglNode:
+    """Node whose type claims an sglang module: traversed under the DEFAULT
+    prefixes (for tests that exercise _build_roots / reset_probe end-to-end).
+    """
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+_SglNode.__module__ = "sglang.srt.test_fake"
 
 
 class _Node:
@@ -197,15 +210,108 @@ class TestRequestFinishHook(CustomTestCase):
         )
         logger_name = "sglang.srt.debug_utils.spec_state_hash"
         # Unfinished batch: no dump lines.
-        with self.assertLogs(logger_name, level="INFO") as cm:
+        with envs.SGLANG_SPEC_STATE_HASH.override(True), self.assertLogs(
+            logger_name, level="INFO"
+        ) as cm:
             maybe_dump_on_request_finish(sched, running)
             maybe_dump_on_request_finish(sched, finished)
         text = "\n".join(cm.output)
         self.assertIn("SPEC_STATE_HASH BEGIN tag=req_end_1 rank=0", text)
         self.assertEqual(text.count("BEGIN"), 1)
-        with self.assertLogs(logger_name, level="INFO") as cm2:
+        with envs.SGLANG_SPEC_STATE_HASH.override(True), self.assertLogs(
+            logger_name, level="INFO"
+        ) as cm2:
             maybe_dump_on_request_finish(sched, finished)
         self.assertIn("tag=req_end_2", "\n".join(cm2.output))
+
+    def test_scheduler_root_covers_scheduler_only_state(self):
+        # Round 9: the workers' state was fully accounted for while the
+        # output still advanced per request ordinal — the scheduler object
+        # itself must be walked too (as the LAST root, so worker paths stay
+        # stable across rounds).
+        class FakeScheduler:
+            pass
+
+        FakeScheduler.__module__ = "sglang.srt.test_fake"
+        sched = FakeScheduler()
+        sched.tp_rank = 0
+        sched.draft_worker = _SglNode(buf=torch.zeros(2))
+        sched.tp_worker = None
+        sched.some_counter = 41
+        roots = spec_state_hash._build_roots(sched)
+        entries, _, _ = collect_state_entries(roots)
+        paths = _entry_map(entries)
+        # Worker-owned tensor keeps its worker-root path (insertion order).
+        self.assertIn("draft_worker.buf", paths)
+        self.assertNotIn("scheduler.draft_worker.buf", paths)
+        # Scheduler-only scalar state is now covered.
+        self.assertIn("scheduler.some_counter", paths)
+        self.assertIn("value=41", paths["scheduler.some_counter"])
+
+
+class TestResetProbe(CustomTestCase):
+    def _make_sched(self):
+        class FakeWrapper:
+            pass
+
+        FakeWrapper.__module__ = "flashinfer.prefill"
+        w = FakeWrapper()
+        w._int_workspace_buffer = torch.ones(8, dtype=torch.int32)
+        w._kv_lens_buffer = torch.ones(4, dtype=torch.int32)
+        w._max_kv_len = 123  # python scalar: must be left alone
+
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            CudaGraphBufferRegistry,
+            GraphSlot,
+        )
+
+        reg = CudaGraphBufferRegistry(
+            device=torch.device("cpu"), max_bs=2, max_num_tokens=4
+        )
+        reg.register_slot(
+            GraphSlot("input_ids", lambda _b, mt: (mt,), torch.int64)
+        )
+        reg.get_slot("input_ids").buffer.fill_(9)
+
+        class FakeScheduler:
+            pass
+
+        FakeScheduler.__module__ = "sglang.srt.test_fake"
+        sched = FakeScheduler()
+        sched.tp_rank = 0
+        sched.draft_worker = _SglNode(wrapper=w, registry=reg)
+        sched.tp_worker = None
+        return sched, w, reg
+
+    def test_flashinfer_family_zeroes_wrapper_tensors_only(self):
+        sched, w, reg = self._make_sched()
+        spec_state_hash.reset_probe(sched, {"flashinfer"})
+        self.assertTrue(torch.all(w._int_workspace_buffer == 0))
+        self.assertTrue(torch.all(w._kv_lens_buffer == 0))
+        self.assertEqual(w._max_kv_len, 123)  # scalars untouched
+        self.assertTrue(torch.all(reg.get_slot("input_ids").buffer == 9))
+
+    def test_registry_family_zeroes_slot_buffers_only(self):
+        sched, w, reg = self._make_sched()
+        spec_state_hash.reset_probe(sched, {"registry"})
+        self.assertTrue(torch.all(reg.get_slot("input_ids").buffer == 0))
+        self.assertTrue(torch.all(w._int_workspace_buffer == 1))
+
+    def test_hook_runs_probe_without_hash_env(self):
+        spec_state_hash._finished_request_count = 0
+        sched, w, _ = self._make_sched()
+        finished = SimpleNamespace(
+            reqs=[SimpleNamespace(finished=lambda: True)]
+        )
+        logger_name = "sglang.srt.debug_utils.spec_state_hash"
+        with envs.SGLANG_SPEC_RESET_PROBE.override(
+            "flashinfer"
+        ), self.assertLogs(logger_name, level="INFO") as cm:
+            maybe_dump_on_request_finish(sched, finished)
+        text = "\n".join(cm.output)
+        self.assertIn("SPEC_RESET_PROBE families=flashinfer", text)
+        self.assertNotIn("SPEC_STATE_HASH BEGIN", text)  # hash env off
+        self.assertTrue(torch.all(w._int_workspace_buffer == 0))
 
 
 if __name__ == "__main__":

@@ -366,6 +366,18 @@ class Envs:
     # localizes it); bit-identical output exonerates the stale-tail class
     # for the whole registry. Diagnostic boots only.
     SGLANG_POISON_GRAPH_PAD = EnvBool(False)
+    # Reset probe (#50 campaign, round 9): comma-separated families of
+    # process-persistent state to hard-reset after every finished request.
+    #   "flashinfer" — zero every tensor held by flashinfer/sgl_kernel
+    #                  wrapper objects (plan/workspace/kv_lens buffers);
+    #                  the next plan() must rebuild everything it consumes
+    #                  from the current batch alone.
+    #   "registry"   — zero every CudaGraphBufferRegistry slot buffer.
+    # If the request-ordinal-dependent output sequence flattens under a
+    # family, that family carries the cross-request state; if the sequence
+    # continues unchanged, the family is exonerated wholesale. Diagnostic
+    # boots only.
+    SGLANG_SPEC_RESET_PROBE = EnvStr("")
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
