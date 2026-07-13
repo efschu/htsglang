@@ -8,6 +8,7 @@ from torch import nn
 from sglang.srt.distributed import (
     get_pp_group,
 )
+from sglang.srt.distributed.utils import tp_attention_head_counts
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -86,18 +87,15 @@ class Qwen3Attention(nn.Module):
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
-        assert self.total_num_heads % attn_tp_size == 0
-        self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= attn_tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % attn_tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
+        # Default path: classic assert/divide/replicate. Uneven TP
+        # (--rank-tp-ratio): heads follow the shard plan with kv heads as
+        # indivisible units, matching the split in QKVParallelLinear.
+        # (Uneven TP is pure single-node TP, so attn_tp_size == tp_size
+        # whenever a plan is installed.)
+        self.num_heads, self.num_kv_heads = tp_attention_head_counts(
+            self.total_num_heads, self.total_num_kv_heads, attn_tp_size, attn_tp_rank
+        )
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -137,6 +135,10 @@ class Qwen3Attention(nn.Module):
             tp_size=attn_tp_size,
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
+            # Uneven TP: the o_proj input dim is partitioned like the q
+            # heads in qkv_proj (kv-head units). Ignored on the default
+            # path (no shard plan installed).
+            tp_units=self.total_num_kv_heads,
         )
 
         self.rotary_emb = get_rope(
@@ -450,6 +452,10 @@ class Qwen3Model(Qwen2Model):
 
 
 class Qwen3ForCausalLM(nn.Module):
+    # This architecture's head/state computations are shard-plan aware
+    # (uneven TP via --rank-tp-ratio); checked at load time in
+    # model_loader/loader.py.
+    supports_uneven_tp = True
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",

@@ -26,6 +26,7 @@ from transformers import (
     PreTrainedModel,
 )
 
+from sglang.srt.distributed.utils import tp_attention_head_counts
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
@@ -124,22 +125,16 @@ class Gemma3Attention(nn.Module):
         self.layer_id = layer_id
         self.config = config
         tp_size = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
 
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
+        # Default path: classic assert/divide/replicate. Uneven TP
+        # (--rank-tp-ratio): heads follow the shard plan with kv heads as
+        # indivisible units, matching the split in QKVParallelLinear.
+        self.num_heads, self.num_kv_heads = tp_attention_head_counts(
+            self.total_num_heads, self.total_num_kv_heads, tp_size, tp_rank
+        )
 
         hidden_size = config.hidden_size
 
@@ -169,6 +164,10 @@ class Gemma3Attention(nn.Module):
             bias=config.attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
+            # Uneven TP: the o_proj input dim is partitioned like the q
+            # heads in qkv_proj (kv-head units). Ignored on the default
+            # path (no shard plan installed).
+            tp_units=self.total_num_kv_heads,
         )
 
         self.is_sliding = config.layer_types[layer_id] == "sliding_attention"
@@ -667,6 +666,10 @@ class Gemma3TextModel(PreTrainedModel):
 
 
 class Gemma3ForCausalLM(PreTrainedModel):
+    # This architecture's head/state computations are shard-plan aware
+    # (uneven TP via --rank-tp-ratio); checked at load time in
+    # model_loader/loader.py.
+    supports_uneven_tp = True
     config_class = Gemma3TextConfig
 
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}

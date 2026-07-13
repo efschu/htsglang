@@ -28,6 +28,7 @@ from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.distributed.utils import tp_plan_active
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
     BATCH_BUCKETS,
@@ -1232,6 +1233,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
 
         self.use_data_parallel = get_server_args().mm_enable_dp_encoder
+
+        # Uneven TP (--rank-tp-ratio): the vision tower's model-side head
+        # math is NOT shard-plan aware (only the language model is), so it
+        # must run replicated on every rank. Reject at build time instead
+        # of failing later with a weight-shape mismatch.
+        if tp_plan_active(get_parallel().tp_size) and not self.use_data_parallel:
+            raise ValueError(
+                "Uneven TP (--rank-tp-ratio) requires the vision encoder to "
+                "run replicated: pass --mm-enable-dp-encoder. The language "
+                "model follows the shard plan; the vision tower does not."
+            )
 
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,

@@ -1067,6 +1067,10 @@ class HybridLayerType(enum.Enum):
 
 
 class Qwen3NextForCausalLM(nn.Module):
+    # This architecture's head/state computations are shard-plan aware
+    # (uneven TP via --rank-tp-ratio); checked at load time in
+    # model_loader/loader.py.
+    supports_uneven_tp = True
     fall_back_to_pt_during_load = False
 
     # Map fused module names to their checkpoint (unfused) counterparts.

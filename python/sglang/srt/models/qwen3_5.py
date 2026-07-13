@@ -1173,6 +1173,10 @@ ALL_DECODER_LAYER_TYPES = {
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
+    # This architecture's head/state computations are shard-plan aware
+    # (uneven TP via --rank-tp-ratio); checked at load time in
+    # model_loader/loader.py.
+    supports_uneven_tp = True
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1698,6 +1702,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    # The language model is shard-plan aware (uneven TP via
+    # --rank-tp-ratio). The VISION tower is not: it must run
+    # replicated via --mm-enable-dp-encoder (enforced in
+    # Qwen3VLForConditionalGeneration when a plan is installed).
+    supports_uneven_tp = True
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
@@ -1854,6 +1863,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    # The language model is shard-plan aware (uneven TP via
+    # --rank-tp-ratio). The VISION tower is not: it must run
+    # replicated via --mm-enable-dp-encoder (enforced in
+    # Qwen3VLForConditionalGeneration when a plan is installed).
+    supports_uneven_tp = True
     """Qwen3.5 MoE Vision-Language Model."""
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping

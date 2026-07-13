@@ -204,6 +204,57 @@ def tp_plan_active(tp_size: int) -> bool:
     return bool(ratios) and len(ratios) == tp_size
 
 
+def tp_attention_head_counts(
+    total_num_heads: int,
+    total_num_kv_heads: int,
+    tp_size: int,
+    tp_rank: int,
+) -> Tuple[int, int]:
+    """Per-rank ``(num_heads, num_kv_heads)`` for the standard GQA
+    attention head computation in the model files.
+
+    Default path (no shard plan installed, or the plan does not match
+    ``tp_size``): bit-identical to the classic model-side computation --
+    ``assert total % tp == 0`` for q heads, partition-or-replicate for kv
+    heads (``max(1, total_kv // tp)``).
+
+    Uneven TP (--rank-tp-ratio): unit partition with kv heads as the
+    indivisible units, so every rank owns whole GQA groups and the q
+    heads follow the same unit distribution -- matching the split in
+    QKVParallelLinear. Models whose kv-head count is below tp_size would
+    need kv-head replication, which has no meaningful uneven shard
+    (every rank must own >= 1 kv head); they are rejected here with a
+    clear error at model build time instead of failing later with a
+    shape mismatch.
+    """
+    if tp_plan_active(tp_size):
+        if total_num_kv_heads < tp_size:
+            raise ValueError(
+                f"Uneven TP (--rank-tp-ratio) requires at least one kv head "
+                f"per rank, but the model has {total_num_kv_heads} kv heads "
+                f"for tp_size={tp_size} (kv-head replication is not "
+                f"supported with uneven shards). Use tp_size <= "
+                f"{total_num_kv_heads} or drop --rank-tp-ratio."
+            )
+        num_heads = tp_partition_size(
+            total_num_heads, tp_size, tp_rank, total_num_kv_heads
+        )
+        num_kv_heads = tp_partition_size(
+            total_num_kv_heads, tp_size, tp_rank, total_num_kv_heads
+        )
+        return num_heads, num_kv_heads
+    assert total_num_heads % tp_size == 0
+    if total_num_kv_heads >= tp_size:
+        # Number of KV heads is greater than TP size, so we partition
+        # the KV heads across multiple tensor parallel GPUs.
+        assert total_num_kv_heads % tp_size == 0
+    else:
+        # Number of KV heads is less than TP size, so we replicate
+        # the KV heads across multiple tensor parallel GPUs.
+        assert tp_size % total_num_kv_heads == 0
+    return total_num_heads // tp_size, max(1, total_num_kv_heads // tp_size)
+
+
 def tp_loaded_shard_start(
     loaded_full: int,
     tp_size: Optional[int],

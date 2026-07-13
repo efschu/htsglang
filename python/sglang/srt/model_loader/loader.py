@@ -296,6 +296,37 @@ def _get_quantization_config(
     return None
 
 
+def _check_uneven_tp_support(model_class) -> None:
+    """Fail fast when an uneven-TP shard plan (--rank-tp-ratio) is
+    installed but the model architecture has not been converted to the
+    rank-aware helpers (tp_attention_head_counts / tp_partition_*).
+
+    Unconverted models still compute heads as ``total // tp_size``; under
+    a plan their layer shapes would not match the plan-aware weight
+    loader offsets (a wall of shape mismatches at load, or in the worst
+    case silently inconsistent shards). Converted architectures carry a
+    ``supports_uneven_tp = True`` class attribute.
+    """
+    from sglang.srt.distributed.utils import get_tp_partition_ratios
+
+    if get_tp_partition_ratios() is None:
+        return
+    if getattr(model_class, "supports_uneven_tp", False):
+        return
+    raise ValueError(
+        f"Model architecture {model_class.__name__} does not support uneven "
+        "tensor parallelism (--rank-tp-ratio): its head/state computations "
+        "still assume an even total//tp_size split, which does not match the "
+        "shard plan's weight partitioning. Converted architectures include "
+        "the llama family, Qwen2/Qwen3 dense, Mixtral, Gemma3 (text) and "
+        "Qwen3-Next / Qwen3.5 / Qwen3.6 (GDN, incl. their MTP drafts). "
+        "Either drop --rank-tp-ratio (--rank-gpu-id placement with an even "
+        "split still works for every model) or convert the model following "
+        "the pattern in models/llama.py and mark it with "
+        "supports_uneven_tp = True."
+    )
+
+
 def _initialize_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
@@ -303,6 +334,7 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
+    _check_uneven_tp_support(model_class)
     kwargs = {
         "config": model_config.hf_config,
         "quant_config": quant_config,

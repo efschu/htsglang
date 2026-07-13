@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
+    # The draft wraps the shard-plan-aware Qwen3_5ForCausalLM (plus a
+    # replicated fc), so it is uneven-TP ready as well; checked at load
+    # time in model_loader/loader.py.
+    supports_uneven_tp = True
 
     def __init__(
         self,
