@@ -1322,8 +1322,8 @@ class KvBufferDesc:
 
 def maybe_poison_pool_data(tensors, source: str) -> None:
     """SGLANG_POISON_POOL_DATA: fill freshly allocated pool DATA buffers with
-    NaN instead of zeros (float dtypes only; index/cursor tensors must stay
-    semantic zeros and are not passed here).
+    NaN instead of zeros (index/cursor tensors must stay semantic zeros and
+    are not passed here).
 
     Diagnostic falsifier for read-before-write bugs: a fresh boot normally
     reads zeros from first-touch pages, which can HIDE a kernel that consumes
@@ -1332,6 +1332,14 @@ def maybe_poison_pool_data(tensors, source: str) -> None:
     silent, traffic-dependent divergence later. Claimed slots that go through
     the regular clear paths (deferred clear / full-state scatter) behave
     exactly as in production.
+
+    uint8 buffers are fp8 KV data in disguise (MHATokenToKVPool stores
+    float8_e5m2 / float8_e4m3fn as torch.uint8 because index_put lacks fp8
+    support) — fill those with 0xFF, which decodes to NaN in BOTH fp8
+    formats. Without this the fp8-KV configuration silently skipped the KV
+    buffers and the falsifier reported a false pass for the KV read paths.
+    (For the packed-fp4 pool 0xFF is not NaN but a saturated extreme value —
+    still a loud, deterministic poison.)
     """
     if not envs.SGLANG_POISON_POOL_DATA.get():
         return
@@ -1342,9 +1350,13 @@ def maybe_poison_pool_data(tensors, source: str) -> None:
         if t.is_floating_point():
             t.fill_(float("nan"))
             poisoned += 1
+        elif t.dtype == torch.uint8:
+            t.fill_(0xFF)
+            poisoned += 1
     logger.warning(
-        "SGLANG_POISON_POOL_DATA: poisoned %d %s buffers with NaN — any "
-        "read-before-write of pool data will now surface as NaN output.",
+        "SGLANG_POISON_POOL_DATA: poisoned %d %s buffers with NaN "
+        "(0xFF for fp8-as-uint8 storage) — any read-before-write of pool "
+        "data will now surface as NaN output.",
         poisoned,
         source,
     )
