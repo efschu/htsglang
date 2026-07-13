@@ -189,6 +189,9 @@ class Qwen2MoeMLP(nn.Module):
             prefix=add_prefix("gate_up_proj", prefix),
             tp_rank=tp_rank,
             tp_size=tp_size,
+            # Uneven TP: intermediate size is the unit family — gate/up
+            # outputs and down input share the same per-rank partition.
+            tp_units=intermediate_size,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -199,6 +202,7 @@ class Qwen2MoeMLP(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             tp_rank=tp_rank,
             tp_size=tp_size,
+            tp_units=intermediate_size,
         )
         if hidden_act != "silu":
             raise ValueError(
