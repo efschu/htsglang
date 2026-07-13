@@ -314,6 +314,28 @@ class TestCheckpointIntervalResume(unittest.TestCase):
         matched, _ = _match_len(tree, SEQ[:8])
         self.assertEqual(matched, 4)
 
+    def test_prompt_shorter_than_interval_always_resumes_zero(self):
+        """Identity-prompt scenario (GPU round 2, hint 1): the prompt is
+        shorter than the interval, so NO grid boundary exists inside it.
+        Surviving off-grid checkpoints on the shared template path (e.g.
+        decode-track positions other traffic would leave behind if any
+        insert guard were bypassed) must never be accepted — the resume
+        falls back to 0 deterministically, before and after churn."""
+        interval = 16  # prompt (12 tokens) < interval
+        tree, allocator, pool, _ = _build_tree(interval)
+        _insert_seq(tree, allocator, pool, SEQ[:6])  # off-grid survivors
+        _insert_seq(tree, allocator, pool, SEQ[:12])
+        matched, result = _match_len(tree, SEQ[:12])
+        self.assertEqual(matched, 0)
+        self.assertIs(result.last_device_node, tree.root_node)
+        # No grid boundary inside the match -> no branching target either.
+        self.assertIsNone(result.mamba_branching_seqlen)
+        # Churn one of the off-grid checkpoints: resume stays 0.
+        tree.evict(EvictParams(num_tokens=0, mamba_num=1))
+        matched, result = _match_len(tree, SEQ[:12])
+        self.assertEqual(matched, 0)
+        self.assertIs(result.last_device_node, tree.root_node)
+
 
 class TestCheckpointEvictionWindow(unittest.TestCase):
     INTERVAL = 4

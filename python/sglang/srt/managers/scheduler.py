@@ -3787,6 +3787,8 @@ class Scheduler(
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
+            if envs.SGLANG_FLUSH_ZERO_KV.get():
+                self._flush_zero_kv_buffers()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
 
@@ -3808,6 +3810,33 @@ class Scheduler(
             )
             success = False
         return success
+
+    def _flush_zero_kv_buffers(self):
+        """SGLANG_FLUSH_ZERO_KV debug lever: zero the full-attention KV data
+        buffers during an idle flush, so a flushed server matches a freshly
+        booted one bit-for-bit even if some kernel folds residual bytes
+        beyond the valid sequence region into its result. Diagnostic tool
+        for attributing warm-path nondeterminism; not a production default.
+        """
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        pools = [kvcache]
+        for attr in ("full_kv_pool", "swa_kv_pool"):
+            sub = getattr(kvcache, attr, None)
+            if sub is not None:
+                pools.append(sub)
+        zeroed = 0
+        for pool in pools:
+            for name in ("k_buffer", "v_buffer", "kv_buffer"):
+                bufs = getattr(pool, name, None)
+                if bufs is None:
+                    continue
+                if isinstance(bufs, torch.Tensor):
+                    bufs = [bufs]
+                for t in bufs:
+                    t.zero_()
+                    zeroed += 1
+        current_platform.synchronize()
+        logger.info("SGLANG_FLUSH_ZERO_KV: zeroed %d KV buffers", zeroed)
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(vars(get_server_args()))  # vars returns a ref to obj.__dict__

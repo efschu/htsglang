@@ -323,6 +323,15 @@ class Envs:
     # boundary of the full-KV match (else recompute from 0) instead of the
     # deepest surviving on-grid checkpoint.
     SGLANG_MAMBA_CKPT_STRICT_RESUME = EnvBool(False)
+    # Per-request mamba checkpoint diagnostics: log match length, resume
+    # length, checkpoint node/slot and cache-insert positions so a
+    # nondeterministic resume (or a checkpoint at a wrong position) can be
+    # attributed from server logs.
+    SGLANG_MAMBA_CKPT_DEBUG = EnvBool(False)
+    # Debug lever: zero the full-attention KV buffers on /flush_cache so a
+    # flushed server matches a fresh boot even if some kernel reads residual
+    # bytes beyond the valid region. Diagnostic only (slow, idle-time).
+    SGLANG_FLUSH_ZERO_KV = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)

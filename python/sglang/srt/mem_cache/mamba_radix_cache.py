@@ -452,6 +452,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # full-KV match; if that exact checkpoint is missing, recompute from
         # scratch instead of a shallower (survivor-dependent) checkpoint.
         self.mamba_ckpt_strict_resume = envs.SGLANG_MAMBA_CKPT_STRICT_RESUME.get()
+        # Per-request resume/insert attribution logging (GPU debugging).
+        self.ckpt_debug = envs.SGLANG_MAMBA_CKPT_DEBUG.get()
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -653,6 +655,17 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
             )
             mamba_exist = result.mamba_exist
+            if self.ckpt_debug:
+                logger.info(
+                    "mamba-ckpt cache_finished: rid=%s cache_len=%d slot=%s "
+                    "mamba_exist=%s last_track=%s total_len=%d",
+                    req.rid,
+                    cache_len,
+                    int(mamba_value[0].item()),
+                    mamba_exist,
+                    req.mamba_last_track_seqlen,
+                    kv_committed_len,
+                )
             if mamba_exist and self.int8_ckpt_pool is not None:
                 # state already cached -> the int8 slot we just allocated is a duplicate
                 self.int8_ckpt_pool.free(mamba_value)
@@ -776,6 +789,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
+        if self.ckpt_debug:
+            logger.info(
+                "mamba-ckpt cache_unfinished: rid=%s cache_len=%d slot=%s "
+                "mamba_exist=%s fill_len=%d",
+                req.rid,
+                cache_len,
+                int(mamba_value_donated[0].item()),
+                mamba_exist,
+                len(token_ids),
+            )
         if mamba_exist:
             self._free_mamba_value(mamba_value_donated)
 
@@ -1273,6 +1296,35 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req.mamba_pool_idx = dst_index[0]
             req.mamba_cow_src_index = last_node.mamba_value
             req.mamba_needs_clear = False
+
+        if self.ckpt_debug:
+            # Per-request resume attribution (see debug env): with the
+            # interval set, resume_tokens MUST be an interval multiple.
+            full_match_tokens = sum(len(v) for v in value)
+            resume_tokens = sum(len(v) for v in value[:best_value_len])
+            slot = (
+                int(last_node.mamba_value[0].item())
+                if last_node.mamba_value is not None
+                else None
+            )
+            logger.info(
+                "mamba-ckpt match: rid=%s full_match=%d resume=%d node=%s "
+                "slot=%s branching=%s strict=%s",
+                getattr(req, "rid", None),
+                full_match_tokens,
+                resume_tokens,
+                last_node.id,
+                slot,
+                mamba_branching_seqlen,
+                self.mamba_ckpt_strict_resume,
+            )
+            if not is_on_interval(resume_tokens, self.mamba_checkpoint_interval):
+                logger.error(
+                    "mamba-ckpt match: OFF-GRID RESUME %d (interval %s), rid=%s",
+                    resume_tokens,
+                    self.mamba_checkpoint_interval,
+                    getattr(req, "rid", None),
+                )
 
         value = value[:best_value_len]
         if value:
