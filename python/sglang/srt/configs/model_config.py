@@ -1045,27 +1045,64 @@ class ModelConfig:
         # equal to the number of attention heads.
         return self.hf_text_config.num_attention_heads
 
-    def get_num_kv_heads(self, tensor_parallel_size) -> int:
-        """Returns the number of KV heads per GPU."""
+    @staticmethod
+    def _uneven_tp_num_kv_heads(
+        total_num_kv_heads: int, tensor_parallel_size: int, rank: Optional[int]
+    ) -> Optional[int]:
+        """Per-rank kv-head count under an installed uneven-TP shard plan
+        (--rank-tp-ratio): kv heads are distributed as indivisible units
+        over the ratio vector. Returns None when no plan applies (default
+        even split). Without an explicit `rank`, the smallest share is
+        returned as a conservative basis for engine-level callers."""
+        from sglang.srt.distributed.utils import (
+            get_tp_partition_ratios,
+            partition_sizes,
+            tp_plan_active,
+        )
+
+        if not tp_plan_active(tensor_parallel_size):
+            return None
+        sizes = partition_sizes(
+            total_num_kv_heads,
+            weights=get_tp_partition_ratios(),
+            units=total_num_kv_heads,
+        )
+        return sizes[rank] if rank is not None else min(sizes)
+
+    def get_num_kv_heads(self, tensor_parallel_size, rank: Optional[int] = None) -> int:
+        """Returns the number of KV heads per GPU.
+
+        With an installed uneven-TP shard plan (--rank-tp-ratio) the count
+        is rank-dependent; pass `rank` to get that rank's share (omitting
+        it returns the smallest share as a conservative basis)."""
         total_num_kv_heads = self.get_total_num_kv_heads()
+        uneven = self._uneven_tp_num_kv_heads(
+            total_num_kv_heads, tensor_parallel_size, rank
+        )
+        if uneven is not None:
+            return uneven
         # If tensor parallelism is used, we divide the number of KV heads by
         # the tensor parallel size. We will replicate the KV heads in the
         # case where the number of KV heads is smaller than the tensor
         # parallel size so each GPU has at least one KV head.
         return max(1, total_num_kv_heads // tensor_parallel_size)
 
-    def get_swa_num_kv_heads(self, tensor_parallel_size) -> int:
+    def get_swa_num_kv_heads(self, tensor_parallel_size, rank: Optional[int] = None) -> int:
         """Similar to get_num_kv_heads(), but for SWA."""
         if hasattr(self.hf_text_config, "swa_num_key_value_heads"):
             total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
-            return max(1, total_num_kv_heads // tensor_parallel_size)
         elif hasattr(self.hf_text_config, "attention_other_setting"):  # For step3p5
             total_num_kv_heads = self.hf_text_config.attention_other_setting.get(
                 "num_attention_groups"
             )
-            return max(1, total_num_kv_heads // tensor_parallel_size)
         else:
-            return self.get_num_kv_heads(tensor_parallel_size)
+            return self.get_num_kv_heads(tensor_parallel_size, rank)
+        uneven = self._uneven_tp_num_kv_heads(
+            total_num_kv_heads, tensor_parallel_size, rank
+        )
+        if uneven is not None:
+            return uneven
+        return max(1, total_num_kv_heads // tensor_parallel_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
