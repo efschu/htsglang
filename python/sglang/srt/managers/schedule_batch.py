@@ -2400,6 +2400,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
+        ckpt_interval = server_args.mamba_checkpoint_interval
+        if ckpt_interval is not None:
+            return self._mamba_ckpt_interval_req_prepare_for_extend(
+                req, ckpt_interval, mamba_cache_chunk_size
+            )
+
         mask = req.extend_range.length >= mamba_cache_chunk_size
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
@@ -2464,6 +2470,79 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return _MambaRadixCacheV2TrackEntry(
             track_mask=mask,
+            track_index=track_index,
+            track_seqlen=mamba_track_seqlen,
+        )
+
+    def _mamba_ckpt_interval_req_prepare_for_extend(
+        self,
+        req: Req,
+        ckpt_interval: int,
+        mamba_cache_chunk_size: int,
+    ) -> _MambaRadixCacheV2TrackEntry:
+        """--mamba-checkpoint-interval variant of the extend-track setup.
+
+        Instead of the default's step-relative snapshot position
+        (``prefix + floor(extend/chunk) * chunk`` — a function of the
+        traffic-dependent prefill split), track the deepest ABSOLUTE
+        multiple of the checkpoint interval inside this step, so the
+        cached checkpoint positions of a request depend only on its token
+        history. Mid-step targets reuse the existing intermediate-``h``
+        retrieval (the ``+1`` force, see ``_force_track_h`` in the default
+        path); a target at the exact step end reads
+        ``last_recurrent_state``. Unreachable targets (no boundary in the
+        step, or a chunk-unaligned offset after an unaligned resume edge)
+        deterministically skip tracking for this step.
+        """
+        from sglang.srt.mem_cache.mamba_ckpt_utils import (
+            mamba_checkpoint_track_target,
+        )
+
+        server_args = get_server_args()
+        prefix_len = len(req.prefix_indices)
+        end = prefix_len + req.extend_range.length
+        target = mamba_checkpoint_track_target(
+            prefix_len, req.extend_range.length, ckpt_interval, mamba_cache_chunk_size
+        )
+        track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
+        mamba_track_seqlen = -1
+        if target is not None:
+            if target == end:
+                # Last position of the step: state comes from
+                # last_recurrent_state (chunk-aligned routing).
+                mamba_track_seqlen = end
+            else:
+                # Mid-step: retrieve from intermediate h. +1 forces the
+                # unaligned routing that indexes h at (target - prefix) /
+                # chunk (same trick as the default path's _force_track_h).
+                assert target % mamba_cache_chunk_size == 0
+                mamba_track_seqlen = target + 1
+            mamba_track_seqlen_aligned = target
+
+            if not server_args.enable_mamba_extra_buffer_lazy():
+                req.mamba_next_track_idx = (
+                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        req.mamba_next_track_idx
+                    )
+                )
+            if req.mamba_branching_seqlen is not None:
+                # Re-establish a missing checkpoint at the branching point if
+                # it lies inside this step; it is on the interval grid by
+                # construction (_match_post_processor) — verify defensively.
+                branching = req.mamba_branching_seqlen
+                if (
+                    branching > prefix_len
+                    and branching < target
+                    and branching % ckpt_interval == 0
+                    and (branching - prefix_len) % mamba_cache_chunk_size == 0
+                ):
+                    assert branching % mamba_cache_chunk_size == 0
+                    mamba_track_seqlen = branching + 1
+                    mamba_track_seqlen_aligned = branching
+            req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+
+        return _MambaRadixCacheV2TrackEntry(
+            track_mask=target is not None,
             track_index=track_index,
             track_seqlen=mamba_track_seqlen,
         )
