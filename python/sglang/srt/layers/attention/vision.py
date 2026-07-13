@@ -944,11 +944,20 @@ class VisionAttention(nn.Module):
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
-        self.num_attention_heads_per_partition = dist_utils.divide(
-            num_dummy_heads + num_heads, self.tp_size
+        # Under an uneven-TP shard plan the vision heads follow the same
+        # prefix-sum unit partition as the language layers (whole heads
+        # per rank); without a plan this is exactly divide().
+        self.num_attention_heads_per_partition = dist_utils.tp_partition_size(
+            num_dummy_heads + num_heads,
+            self.tp_size,
+            self.tp_rank,
+            units=num_dummy_heads + num_heads,
         )
-        self.num_attention_kv_heads_per_partition = dist_utils.divide(
-            num_dummy_heads + num_kv_heads, self.tp_size
+        self.num_attention_kv_heads_per_partition = dist_utils.tp_partition_size(
+            num_dummy_heads + num_kv_heads,
+            self.tp_size,
+            self.tp_rank,
+            units=num_dummy_heads + num_kv_heads,
         )
 
         self.q_size = self.num_attention_heads_per_partition * self.head_size
@@ -1015,6 +1024,9 @@ class VisionAttention(nn.Module):
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 prefix=add_prefix("qkv_proj", prefix),
+                # Uneven TP: vision head count is this dimension's unit
+                # family, so the split lands on whole heads per rank.
+                tp_units=num_dummy_heads + num_heads,
             )
         self.proj = RowParallelLinear(
             input_size=self.dummy_dim,
@@ -1025,6 +1037,7 @@ class VisionAttention(nn.Module):
             tp_size=self.tp_size,
             prefix=add_prefix("proj", prefix),
             use_dp_attention_reduce=use_dp_attention_reduce,
+            tp_units=num_dummy_heads + num_heads,
         )
 
         self.workspace_buffer = workspace_buffer
