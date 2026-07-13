@@ -310,6 +310,124 @@ def tp_loaded_shard_start(
     return sum(sizes[:rank])
 
 
+def solve_unit_rebalance_multi(
+    free_bytes: Sequence[float],
+    bytes_per_token: Sequence[float],
+    families: dict,
+    min_units: int = 1,
+) -> Tuple[dict, int]:
+    """Maximin solver for the uneven-TP self-calibration over one or
+    more weight FAMILIES (the dense-MLP "mlp" family and the
+    expert-weight "moe" family): find the per-rank unit counts per
+    family that maximize the MINIMUM token capacity.
+
+    `families` maps a family name to (units, bytes_per_unit): rank r
+    currently owns units[r] units of that family; every unit it sheds
+    frees bytes_per_unit[r] weight bytes (measured empirically as the
+    rank's family parameter bytes divided by its unit count), which
+    become KV budget. Rank r's profiled KV byte budget is free_bytes[r]
+    and one KV token costs bytes_per_token[r] (both rank-local —
+    per-token bytes scale with the rank's kv-head share):
+
+        capacity_r = (free[r] + sum_f shed_units_f[r] * bpu_f[r])
+                     / bytes_per_token[r]
+
+    Since the scheduler's single max_total_num_tokens is the MIN over
+    ranks, the objective is maximin. Greedy over single units suffices:
+    the minimum only ever rises when the pinned (capacity-poorest) rank
+    sheds a unit, so iteratively move — in whichever family raises the
+    minimum most — one unit from the pinned rank to the rank that stays
+    capacity-richest after receiving it, as long as the minimum strictly
+    increases. Every rank keeps >= min_units units per family
+    (partition_units requires >= 1 per rank).
+
+    Conservation law: moving weight bytes between ranks leaves
+    sum(free) unchanged, so the achievable maximin is bounded by
+    sum(free) / sum(bytes_per_token) — the pure-TP balance point.
+    Additional families do NOT raise that ceiling; they supply the
+    shiftable weight mass needed to actually reach it (on MoE models
+    the dense-MLP family alone is usually too small).
+
+    Returns (new_units_by_family, projected_min_tokens).
+    """
+    n = len(free_bytes)
+    if n != len(bytes_per_token):
+        raise ValueError(
+            "solve_unit_rebalance: input vectors must have equal length, "
+            f"got {len(free_bytes)}/{len(bytes_per_token)}."
+        )
+    if any(b <= 0 for b in bytes_per_token):
+        raise ValueError(
+            "solve_unit_rebalance: bytes_per_token must be positive; got "
+            f"bytes_per_token={list(bytes_per_token)}."
+        )
+    fams: dict = {}
+    for name, (units, bytes_per_unit) in families.items():
+        if not (n == len(units) == len(bytes_per_unit)):
+            raise ValueError(
+                "solve_unit_rebalance: input vectors must have equal "
+                f"length, got {len(units)}/{len(bytes_per_unit)} for "
+                f"family {name!r} vs {n} ranks."
+            )
+        if any(u < min_units for u in units):
+            raise ValueError(
+                f"solve_unit_rebalance: every rank must own >= "
+                f"{min_units} unit(s) of family {name!r}; got "
+                f"units={list(units)}."
+            )
+        fams[name] = (list(units), list(bytes_per_unit))
+
+    u = {name: list(units) for name, (units, _) in fams.items()}
+
+    def capacity(r: int) -> float:
+        freed = sum(
+            (fams[name][0][r] - u[name][r]) * fams[name][1][r] for name in fams
+        )
+        return (free_bytes[r] + freed) / bytes_per_token[r]
+
+    while fams:
+        caps = [capacity(r) for r in range(n)]
+        cur_min = min(caps)
+        donor = min(range(n), key=lambda r: (caps[r], r))
+        # Try a one-unit move in every family; commit the move that
+        # raises the minimum most.
+        best = None  # (new_min, family, receiver)
+        for name in fams:
+            if u[name][donor] <= min_units:
+                continue
+            bpu = fams[name][1]
+            # Receiver: the rank that remains capacity-richest after
+            # taking on the unit's weight bytes (hurts maximin least).
+            receiver = max(
+                (r for r in range(n) if r != donor),
+                key=lambda r: (
+                    (free_bytes[r]
+                     + sum(
+                         (fams[f][0][r] - u[f][r]) * fams[f][1][r]
+                         for f in fams
+                     )
+                     - bpu[r])
+                    / bytes_per_token[r],
+                    -r,
+                ),
+            )
+            u[name][donor] -= 1
+            u[name][receiver] += 1
+            new_min = min(capacity(r) for r in range(n))
+            u[name][donor] += 1
+            u[name][receiver] -= 1
+            if new_min > cur_min and (best is None or new_min > best[0]):
+                best = (new_min, name, receiver)
+        if best is None:
+            break
+        _, name, receiver = best
+        u[name][donor] -= 1
+        u[name][receiver] += 1
+
+    projected = int(min(capacity(r) for r in range(n))) if n else 0
+    return u, projected
+
+
 def solve_unit_rebalance(
     free_bytes: Sequence[float],
     bytes_per_token: Sequence[float],
@@ -317,72 +435,74 @@ def solve_unit_rebalance(
     bytes_per_unit: Sequence[float],
     min_units: int = 1,
 ) -> Tuple[list, int]:
-    """Maximin solver for the uneven-TP self-calibration: find the
-    per-rank MLP unit counts that maximize the MINIMUM token capacity.
+    """Single-family convenience wrapper around
+    solve_unit_rebalance_multi (see there for the capacity model).
 
-    Model: rank r currently owns units[r] MLP units; its profiled KV byte
-    budget is free_bytes[r] and one KV token costs bytes_per_token[r]
-    (both rank-local — per-token bytes scale with the rank's kv-head
-    share). Every MLP unit a rank sheds frees bytes_per_unit[r] weight
-    bytes (measured empirically as the rank's mlp-family parameter bytes
-    divided by its unit count), which become KV budget:
+    Returns (new_units, projected_min_tokens)."""
+    new_units, projected = solve_unit_rebalance_multi(
+        free_bytes,
+        bytes_per_token,
+        {"_": (units, bytes_per_unit)},
+        min_units=min_units,
+    )
+    return new_units["_"], projected
 
-        capacity_r(u) = (free[r] + (units[r] - u[r]) * bytes_per_unit[r])
-                        / bytes_per_token[r]
 
-    Since the scheduler's single max_total_num_tokens is the MIN over
-    ranks, the objective is maximin. Greedy over single units suffices:
-    the minimum only ever rises when the pinned (capacity-poorest) rank
-    sheds a unit, so iteratively move one unit from the pinned rank to
-    the rank that stays capacity-richest after receiving it, as long as
-    the minimum strictly increases. Every rank keeps >= min_units units
-    (partition_units requires >= 1 per rank).
+def suggest_unit_rebalance_multi(
+    free_bytes: Sequence[float],
+    bytes_per_token: Sequence[float],
+    families: dict,
+    imbalance_threshold: float = 1.10,
+) -> Optional[Tuple[dict, int, int]]:
+    """Decide whether shifting family units between uneven-TP ranks
+    would meaningfully raise the (MIN-synced) KV token capacity.
 
-    Returns (new_units, projected_min_tokens).
+    `families` maps a family name to (units, family_bytes) per rank —
+    the values gathered after rank-local KV profiling (bytes_per_unit is
+    derived as family_bytes / units per rank). Families with degenerate
+    inputs (zero units or zero bytes on any rank) are dropped rather
+    than blocking the calibration of the remaining families.
+
+    Returns None when the capacities are already balanced (max/min <=
+    imbalance_threshold), when nothing can be calibrated, or when the
+    solver finds no strictly better partition. Otherwise returns
+    (new_units_by_family, current_min_tokens, projected_min_tokens);
+    new_units_by_family only contains families whose vector CHANGED.
     """
-    n = len(units)
-    if not (n == len(free_bytes) == len(bytes_per_token) == len(bytes_per_unit)):
-        raise ValueError(
-            "solve_unit_rebalance: input vectors must have equal length, "
-            f"got {len(free_bytes)}/{len(bytes_per_token)}/{len(units)}/"
-            f"{len(bytes_per_unit)}."
+    n = len(free_bytes)
+    if n < 2 or n != len(bytes_per_token):
+        return None
+    if any(f < 0 for f in free_bytes) or any(b <= 0 for b in bytes_per_token):
+        return None
+    usable = {}
+    for name, (units, family_bytes) in families.items():
+        if len(units) != n or len(family_bytes) != n:
+            continue
+        if any(u <= 0 for u in units) or any(b <= 0 for b in family_bytes):
+            continue
+        usable[name] = (
+            list(units),
+            [family_bytes[r] / units[r] for r in range(n)],
         )
-    if any(b <= 0 for b in bytes_per_token) or any(u < min_units for u in units):
-        raise ValueError(
-            "solve_unit_rebalance: bytes_per_token must be positive and "
-            f"every rank must own >= {min_units} unit(s); got "
-            f"bytes_per_token={list(bytes_per_token)}, units={list(units)}."
-        )
-
-    u = list(units)
-
-    def capacity(r: int, u_r: int) -> float:
-        return (
-            free_bytes[r] + (units[r] - u_r) * bytes_per_unit[r]
-        ) / bytes_per_token[r]
-
-    while True:
-        caps = [capacity(r, u[r]) for r in range(n)]
-        cur_min = min(caps)
-        donor = min(range(n), key=lambda r: (caps[r], r))
-        if u[donor] <= min_units:
-            break
-        # Receiver: the rank that remains capacity-richest after taking
-        # on the unit's weight bytes (hurts the maximin objective least).
-        receiver = max(
-            (r for r in range(n) if r != donor),
-            key=lambda r: (capacity(r, u[r] + 1), -r),
-        )
-        u_try = list(u)
-        u_try[donor] -= 1
-        u_try[receiver] += 1
-        new_min = min(capacity(r, u_try[r]) for r in range(n))
-        if new_min <= cur_min:
-            break
-        u = u_try
-
-    projected = int(min(capacity(r, u[r]) for r in range(n)))
-    return u, projected
+    if not usable:
+        return None
+    capacities = [free_bytes[r] / bytes_per_token[r] for r in range(n)]
+    cur_min = min(capacities)
+    if cur_min <= 0:
+        return None
+    if max(capacities) / cur_min <= imbalance_threshold:
+        return None
+    new_units, projected = solve_unit_rebalance_multi(
+        free_bytes, bytes_per_token, usable
+    )
+    changed = {
+        name: vec
+        for name, vec in new_units.items()
+        if vec != usable[name][0]
+    }
+    if not changed or projected <= int(cur_min):
+        return None
+    return changed, int(cur_min), projected
 
 
 def suggest_unit_rebalance(
@@ -392,39 +512,20 @@ def suggest_unit_rebalance(
     family_bytes: Sequence[float],
     imbalance_threshold: float = 1.10,
 ) -> Optional[Tuple[list, int, int]]:
-    """Decide whether shifting MLP units between uneven-TP ranks would
-    meaningfully raise the (MIN-synced) KV token capacity.
+    """Single-family convenience wrapper around
+    suggest_unit_rebalance_multi (see there for semantics).
 
-    Inputs are the per-rank values gathered after rank-local KV
-    profiling: profiled free bytes, bytes per KV token, current mlp
-    family partition in units and the mlp family's total parameter bytes
-    (bytes_per_unit is derived as family_bytes / units per rank).
-
-    Returns None when the capacities are already balanced (max/min <=
-    imbalance_threshold), when the inputs cannot be calibrated, or when
-    the solver finds no strictly better partition. Otherwise returns
-    (new_units, current_min_tokens, projected_min_tokens).
-    """
-    n = len(units)
-    if n < 2:
-        return None
-    if any(u <= 0 for u in units) or any(b <= 0 for b in family_bytes):
-        return None
-    if any(f < 0 for f in free_bytes) or any(b <= 0 for b in bytes_per_token):
-        return None
-    capacities = [free_bytes[r] / bytes_per_token[r] for r in range(n)]
-    cur_min = min(capacities)
-    if cur_min <= 0:
-        return None
-    if max(capacities) / cur_min <= imbalance_threshold:
-        return None
-    bytes_per_unit = [family_bytes[r] / units[r] for r in range(n)]
-    new_units, projected = solve_unit_rebalance(
-        free_bytes, bytes_per_token, units, bytes_per_unit
+    Returns None or (new_units, current_min_tokens, projected)."""
+    result = suggest_unit_rebalance_multi(
+        free_bytes,
+        bytes_per_token,
+        {"_": (units, family_bytes)},
+        imbalance_threshold=imbalance_threshold,
     )
-    if new_units == list(units) or projected <= int(cur_min):
+    if result is None:
         return None
-    return new_units, int(cur_min), projected
+    changed, cur_min, projected = result
+    return changed["_"], cur_min, projected
 
 
 def split_tensor_along_last_dim(
