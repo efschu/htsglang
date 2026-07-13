@@ -191,7 +191,13 @@ class Qwen2MoeMLP(nn.Module):
             tp_size=tp_size,
             # Uneven TP: intermediate size is the unit family — gate/up
             # outputs and down input share the same per-rank partition.
+            # tp_family="mlp" lets SGLANG_UNEVEN_MLP_VECTOR /
+            # --rank-mlp-ratio re-balance the dense-MLP shards
+            # independently of the attention/KV base plan (self-
+            # calibration lever for maximizing the KV pool); without an
+            # installed mlp vector it falls back to the base plan.
             tp_units=intermediate_size,
+            tp_family="mlp",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -203,6 +209,7 @@ class Qwen2MoeMLP(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
             tp_units=intermediate_size,
+            tp_family="mlp",
         )
         if hidden_act != "silu":
             raise ValueError(
