@@ -3529,13 +3529,42 @@ class Scheduler(
         # #50 campaign debug levers: hash-dump all persistent state and/or
         # hard-reset selected state families after each finished request, so
         # deterministic cross-request state evolution can be diffed and its
-        # carrier isolated. No-op unless one of the envs is set.
+        # carrier isolated. No-op unless one of the envs is set. Runs BEFORE
+        # the production workspace zeroing below so dumps see the state the
+        # request actually left behind.
         if envs.SGLANG_SPEC_STATE_HASH.get() or envs.SGLANG_SPEC_RESET_PROBE.get():
             from sglang.srt.debug_utils.spec_state_hash import (
                 maybe_dump_on_request_finish,
             )
 
             maybe_dump_on_request_finish(self, batch)
+
+        # #50 root fix: restore the flashinfer float-workspace boot contract
+        # (first-touch zeros) at request boundaries — the fa2 split-KV
+        # kernels read workspace regions the current forward did not write,
+        # so residue of the previous request otherwise perturbs the next
+        # request's logits in the last bits (request-ordinal-dependent
+        # outputs; degenerate attractor under cuda graphs). Proven by the
+        # round-11 GPU bisection: zeroing exactly _float_workspace_buffer
+        # per finished request flattens the ordinal sequence at the natural
+        # run-1 value. Enqueued on the worker forward stream when one exists
+        # (overlap scheduling): stream order makes the memset land between
+        # forwards, never inside one; without a forward stream the scheduler
+        # thread's current stream IS the forward stream.
+        if envs.SGLANG_FLASHINFER_ZERO_WORKSPACE_PER_REQUEST.get() and any(
+            req.finished() for req in batch.reqs
+        ):
+            # Only when the flashinfer backend module is actually loaded
+            # (otherwise no workspaces exist, and importing it would pull in
+            # the flashinfer package on boots that do not use it).
+            fi_mod = sys.modules.get("sglang.srt.layers.attention.flashinfer_backend")
+            if fi_mod is not None:
+                forward_stream = getattr(self.tp_worker, "forward_stream", None)
+                if forward_stream is not None:
+                    with torch.cuda.stream(forward_stream):
+                        fi_mod.zero_flashinfer_workspaces()
+                else:
+                    fi_mod.zero_flashinfer_workspaces()
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
