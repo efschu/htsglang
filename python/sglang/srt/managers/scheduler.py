@@ -3526,10 +3526,11 @@ class Scheduler(
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
 
-        # #50 campaign debug lever: hash-dump all worker-persistent state
-        # after each finished request so deterministic cross-request state
-        # evolution can be diffed request-to-request. No-op unless set.
-        if envs.SGLANG_SPEC_STATE_HASH.get():
+        # #50 campaign debug levers: hash-dump all persistent state and/or
+        # hard-reset selected state families after each finished request, so
+        # deterministic cross-request state evolution can be diffed and its
+        # carrier isolated. No-op unless one of the envs is set.
+        if envs.SGLANG_SPEC_STATE_HASH.get() or envs.SGLANG_SPEC_RESET_PROBE.get():
             from sglang.srt.debug_utils.spec_state_hash import (
                 maybe_dump_on_request_finish,
             )
