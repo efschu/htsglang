@@ -677,7 +677,16 @@ class MambaPool:
         ``replayssm_write_pos``) or state bytes survive a flush can leak
         stale-state effects into later requests, so a flushed server would
         not behave like a freshly started one.
+
+        Ordering: this is launched from the scheduler thread (default
+        stream) while model forwards run on their own stream. Synchronize
+        the device on BOTH sides of the memsets — (a) so they cannot overlap
+        the async tail of pre-flush work and (b) so no post-flush prefill
+        can start while the reset is still zeroing buffers underneath it (a
+        half-finished reset corrupts the first post-flush request
+        nondeterministically, which is worse than not resetting at all).
         """
+        self._sync_device()
         raw = getattr(self, "_raw", None)
         if raw is not None:
             # Envelope layout: conv/temporal are views into one byte buffer.
@@ -702,6 +711,14 @@ class MambaPool:
                 t.zero_()
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos.zero_()
+        self._sync_device()
+
+    def _sync_device(self):
+        """Device-wide barrier for the (rare, idle-time) reset path. No-op on
+        CPU pools (the accelerator platform may be unavailable there)."""
+        if str(self.device).startswith("cpu"):
+            return
+        current_platform.synchronize()
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
