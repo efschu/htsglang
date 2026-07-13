@@ -418,5 +418,99 @@ class TestGpuIdLookup(CustomTestCase):
         )
 
 
+class TestMlpRatio(CustomTestCase):
+    """--rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR: the MLP-family weight
+    vector of the uneven-TP self-calibration (env wins over CLI; only
+    valid on top of an active base plan)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(cls.parser)
+
+    def _valid_base(self, **kwargs):
+        return make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=[26000, 17000, 17000],
+            rank_tp_ratio=[2, 1, 1],
+            **kwargs,
+        )
+
+    def test_cli_parsing(self):
+        parsed = self.parser.parse_args(
+            ["--model-path", "m", "--rank-mlp-ratio", "5,3,3"]
+        )
+        self.assertEqual(parsed.rank_mlp_ratio, [5, 3, 3])
+        self.assertIsNone(
+            self.parser.parse_args(["--model-path", "m"]).rank_mlp_ratio
+        )
+
+    def test_valid_with_base_plan(self):
+        args = run_handler(self._valid_base(rank_mlp_ratio=[5, 3, 3]))
+        self.assertEqual(args.rank_mlp_ratio, [5, 3, 3])
+
+    def test_requires_base_plan(self):
+        # With --rank-gpu-id but WITHOUT a ratio plan the vector is
+        # meaningless (every family already splits evenly).
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=15000,
+            rank_mlp_ratio=[5, 3, 3],
+        )
+        with self.assertRaisesRegex(ValueError, "base plan"):
+            run_handler(args)
+
+    def test_requires_base_plan_on_default_path(self):
+        # Fully default path (no rank flags at all): a vector must fail
+        # fast rather than being silently ignored.
+        args = make_args(tp_size=3, rank_mlp_ratio=[5, 3, 3])
+        with self.assertRaisesRegex(ValueError, "base plan"):
+            run_handler(args)
+
+    def test_length_must_match_tp_size(self):
+        args = self._valid_base(rank_mlp_ratio=[5, 3])
+        with self.assertRaisesRegex(ValueError, "length"):
+            run_handler(args)
+
+    def test_entries_must_be_positive(self):
+        for bad in ([5, 0, 3], [5, -1, 3]):
+            args = self._valid_base(rank_mlp_ratio=bad)
+            with self.assertRaisesRegex(ValueError, "positive"):
+                run_handler(args)
+
+    def test_env_wins_over_cli(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_UNEVEN_MLP_VECTOR.override("7,4,4"):
+            args = run_handler(self._valid_base(rank_mlp_ratio=[5, 3, 3]))
+        self.assertEqual(args.rank_mlp_ratio, [7, 4, 4])
+
+    def test_env_alone(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_UNEVEN_MLP_VECTOR.override("7,4,4"):
+            args = run_handler(self._valid_base())
+        self.assertEqual(args.rank_mlp_ratio, [7, 4, 4])
+
+    def test_env_validated_like_cli(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_UNEVEN_MLP_VECTOR.override("7,4"):
+            with self.assertRaisesRegex(ValueError, "length"):
+                run_handler(self._valid_base())
+        with envs.SGLANG_UNEVEN_MLP_VECTOR.override("banana"):
+            with self.assertRaisesRegex(ValueError, "integer"):
+                run_handler(self._valid_base())
+
+    def test_env_without_base_plan_fails_fast(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_UNEVEN_MLP_VECTOR.override("7,4,4"):
+            with self.assertRaisesRegex(ValueError, "base plan"):
+                run_handler(make_args(tp_size=3))
+
+
 if __name__ == "__main__":
     unittest.main()
