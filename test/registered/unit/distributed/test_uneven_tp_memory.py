@@ -277,6 +277,59 @@ class TestMamba2StateShapeUneven(UnevenTPTestCase):
             Mamba2StateShape.create(tp_world_size=3, **self.KW)
 
 
+class TestCustomAllReduceFallback(UnevenTPTestCase):
+    """--rank-gpu-id disables custom all-reduce whenever its symmetric-
+    peer assumptions cannot hold (heterogeneous cards, co-location,
+    uneven shard plan); NCCL remains the collective backend."""
+
+    def test_heterogeneous_cards_disable(self):
+        args = run_handler(
+            make_args(tp_size=2, rank_gpu_id=[0, 1], rank_gpu_memory_mib=16400)
+        )
+        self.assertTrue(args.disable_custom_all_reduce)
+
+    def test_homogeneous_even_placement_keeps_it_enabled(self):
+        # Two identical 20-GiB cards, one rank each, no ratio: the
+        # symmetric assumptions hold — do not touch the default.
+        args = run_handler(
+            make_args(tp_size=2, rank_gpu_id=[1, 2], rank_gpu_memory_mib=15000)
+        )
+        self.assertFalse(args.disable_custom_all_reduce)
+
+    def test_colocation_disables(self):
+        args = run_handler(
+            make_args(tp_size=2, rank_gpu_id=[0, 0], rank_gpu_memory_mib=15000)
+        )
+        self.assertTrue(args.disable_custom_all_reduce)
+
+    def test_uneven_plan_disables_even_on_equal_cards(self):
+        args = run_handler(
+            make_args(
+                tp_size=2,
+                rank_gpu_id=[1, 2],
+                rank_gpu_memory_mib=[13000, 6500],
+                rank_tp_ratio=[2, 1],
+            )
+        )
+        self.assertTrue(args.disable_custom_all_reduce)
+
+    def test_explicit_disable_stays_disabled(self):
+        args = run_handler(
+            make_args(
+                tp_size=2,
+                rank_gpu_id=[0, 1],
+                rank_gpu_memory_mib=16400,
+                disable_custom_all_reduce=True,
+            )
+        )
+        self.assertTrue(args.disable_custom_all_reduce)
+
+    def test_default_path_untouched(self):
+        args = make_args(tp_size=2)
+        args._handle_uneven_tp()
+        self.assertFalse(args.disable_custom_all_reduce)
+
+
 class TestNumKvHeadsAutoRank(UnevenTPTestCase):
     def _mc(self, total_kv=8):
         from sglang.srt.configs.model_config import ModelConfig
