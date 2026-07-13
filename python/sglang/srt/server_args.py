@@ -3909,6 +3909,31 @@ class ServerArgs:
             + (tp_rank % tp_size_per_node) * self.gpu_id_step
         )
 
+    def uneven_memory_budgets_active(self) -> bool:
+        """True when --rank-gpu-memory-mib per-rank budgets are in force.
+
+        In this mode the KV memory profiling must stay rank-local (no
+        min-reduce of free bytes across ranks); consistency is restored
+        by min-reducing the derived TOKEN capacities instead."""
+        return self.rank_gpu_memory_mib is not None
+
+    def apply_rank_memory_budget(self, tp_rank: int) -> Optional[float]:
+        """Apply this rank's --rank-gpu-memory-mib budget as its
+        mem_fraction_static (worker-process side).
+
+        The fraction was derived once at resolution time as
+        budget_mib / nvml_total_mib(this rank's physical GPU) — see
+        _handle_uneven_tp. It is applied as-is: the MiB value is the
+        rank's ENTIRE budget, so no further utilization ceiling or safety
+        factor is added here. Returns the fraction, or None when the
+        uneven-memory mode is off (default path untouched)."""
+        fractions = getattr(self, "_rank_mem_fraction_static", None)
+        if fractions is None:
+            return None
+        fraction = fractions[tp_rank]
+        self.override("uneven_tp.rank_mem_fraction", mem_fraction_static=fraction)
+        return fraction
+
     #: Default NVML-total headroom (MiB) reserved per GPU when
     #: --rank-tp-ratio auto derives the budgets itself (CUDA context,
     #: fragmentation, lazily appearing NCCL/attention buffers).
@@ -4187,6 +4212,22 @@ class ServerArgs:
                     f"whose budgets sum to {required_mib} MiB. Reduce "
                     "--rank-gpu-memory-mib or place fewer ranks on this GPU."
                 )
+
+        # MiB -> fraction, computed ONCE per rank at resolution time:
+        #   fraction_for_rank = budget_mib / nvml_total_mib(rank's GPU).
+        # --rank-gpu-memory-mib is each rank's ENTIRE memory budget
+        # (weights + KV cache + runtime state); the fraction is applied as
+        # that rank's mem_fraction_static UNMODIFIED — no additional
+        # utilization ceiling, safety factor, or rounding is layered on
+        # top. Leaving headroom for CUDA context/fragmentation inside the
+        # MiB value is the user's responsibility. On heterogeneous GPUs
+        # the same MiB value therefore maps to DIFFERENT fractions.
+        # Underscore attribute: derived (not a CLI field), pickled to the
+        # scheduler child processes with the rest of the instance.
+        self._rank_mem_fraction_static = [
+            budgets[r] / mem_info[self.rank_gpu_id[r]][0]
+            for r in range(self.tp_size)
+        ]
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
