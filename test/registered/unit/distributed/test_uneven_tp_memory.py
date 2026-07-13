@@ -375,5 +375,160 @@ class TestNumKvHeadsAutoRank(UnevenTPTestCase):
             self.assertEqual(mc.get_num_kv_heads(4), 2)
 
 
+class _FakeMlpLayer(torch.nn.Module):
+    def __init__(self, rows, cols, tp_family="mlp", tp_units=None):
+        super().__init__()
+        self.tp_family = tp_family
+        self.tp_units = tp_units
+        self.weight = torch.nn.Parameter(
+            torch.zeros(rows, cols), requires_grad=False
+        )
+
+
+class TestMlpRebalanceHint(UnevenTPTestCase):
+    """_maybe_suggest_mlp_rebalance: gating + the one-line restart hint."""
+
+    PLAN = [5, 3, 3]
+    UNITS_TOTAL = 28
+
+    def _fake_model(self, with_mlp=True):
+        model = torch.nn.Module()
+        if with_mlp:
+            # partition_units(28, [5,3,3]) = [13, 8, 7]; rank 0 sees 13.
+            model.mlp = _FakeMlpLayer(13, 8, tp_units=self.UNITS_TOTAL)
+        model.attn = _FakeMlpLayer(14, 8, tp_family=None)
+        return model
+
+    def _run(
+        self,
+        *,
+        uneven=True,
+        world_size=3,
+        plan=True,
+        with_mlp=True,
+        gathered=None,
+        user_limit=None,
+        budget_bytes=10 * (1 << 30),
+        local_tokens=500_000,
+    ):
+        import sglang.srt.model_executor.model_runner_kv_cache_mixin as mixin
+        import sglang.srt.model_executor.pool_configurator as pool_configurator
+
+        if plan:
+            set_tp_partition_ratios(self.PLAN)
+        fake_self = SimpleNamespace(
+            server_args=SimpleNamespace(
+                max_total_tokens=user_limit,
+                uneven_memory_budgets_active=lambda: uneven,
+            ),
+            tp_size=3,
+            tp_rank=0,
+            page_size=1,
+            model=self._fake_model(with_mlp=with_mlp),
+        )
+        # Bind the sibling mixin method onto the fake runner.
+        fake_self._mlp_family_local_stats = (
+            lambda: mixin.ModelRunnerKVCacheMixin._mlp_family_local_stats(
+                fake_self
+            )
+        )
+        gather_calls = []
+
+        def fake_all_gather_object(out, payload, group=None):
+            gather_calls.append(payload)
+            if gathered is not None:
+                out[:] = list(gathered)
+            else:
+                out[:] = [payload] * len(out)
+
+        fake_configurator = SimpleNamespace(
+            calculate_pool_sizes=lambda budget, page: SimpleNamespace(
+                max_total_num_tokens=local_tokens
+            )
+        )
+        fake_group = SimpleNamespace(world_size=world_size, cpu_group=object())
+        warnings_logged = []
+        with patch.object(
+            mixin, "get_world_group", return_value=fake_group
+        ), patch.object(
+            pool_configurator,
+            "create_memory_pool_configurator",
+            return_value=fake_configurator,
+        ), patch(
+            "torch.distributed.all_gather_object",
+            side_effect=fake_all_gather_object,
+        ), patch.object(
+            mixin.logger,
+            "warning",
+            side_effect=lambda msg, *a: warnings_logged.append(msg % a),
+        ):
+            mixin.ModelRunnerKVCacheMixin._maybe_suggest_mlp_rebalance(
+                fake_self, budget_bytes
+            )
+        return gather_calls, warnings_logged
+
+    def test_default_path_is_silent_noop(self):
+        gather_calls, warnings_logged = self._run(uneven=False)
+        self.assertEqual(gather_calls, [])
+        self.assertEqual(warnings_logged, [])
+
+    def test_single_process_noop(self):
+        gather_calls, warnings_logged = self._run(world_size=1)
+        self.assertEqual(gather_calls, [])
+        self.assertEqual(warnings_logged, [])
+
+    def test_no_plan_noop(self):
+        gather_calls, warnings_logged = self._run(plan=False)
+        self.assertEqual(gather_calls, [])
+        self.assertEqual(warnings_logged, [])
+
+    def test_no_mlp_family_layers_noop(self):
+        gather_calls, warnings_logged = self._run(with_mlp=False)
+        self.assertEqual(gather_calls, [])
+        self.assertEqual(warnings_logged, [])
+
+    def test_balanced_ranks_stay_silent(self):
+        # Equal capacities on every rank (gathered = own payload): no hint
+        # — in particular an active vector that balanced the ranks.
+        gather_calls, warnings_logged = self._run()
+        self.assertEqual(len(gather_calls), 1)
+        self.assertEqual(warnings_logged, [])
+
+    def test_imbalanced_ranks_log_restart_hint(self):
+        GB = 1 << 30
+        bpu = 48 * 3 * 5120.0
+        gathered = [
+            (594_999 * 26_000.0 + 1.23 * GB, 642_303, 4608, 4608 * bpu),
+            (594_999 * 13_000.0, 594_999, 2765, 2765 * bpu),
+            (594_999 * 13_000.0 + 1.14 * GB, 689_157, 2765, 2765 * bpu),
+        ]
+        gather_calls, warnings_logged = self._run(gathered=gathered)
+        self.assertEqual(len(gather_calls), 1)
+        self.assertEqual(len(warnings_logged), 1)
+        msg = warnings_logged[0]
+        self.assertIn("SGLANG_UNEVEN_MLP_VECTOR=", msg)
+        self.assertIn("from 594999 to ~", msg)
+        # The suggested vector conserves the units and sheds from TP1.
+        vector = [
+            int(v)
+            for v in msg.split("SGLANG_UNEVEN_MLP_VECTOR=")[1]
+            .split(" ")[0]
+            .split(",")
+        ]
+        self.assertEqual(sum(vector), 4608 + 2765 + 2765)
+        self.assertLess(vector[1], 2765)
+
+    def test_user_cap_below_capacity_stays_silent(self):
+        GB = 1 << 30
+        bpu = 48 * 3 * 5120.0
+        gathered = [
+            (594_999 * 26_000.0 + 1.23 * GB, 642_303, 4608, 4608 * bpu),
+            (594_999 * 13_000.0, 594_999, 2765, 2765 * bpu),
+            (594_999 * 13_000.0 + 1.14 * GB, 689_157, 2765, 2765 * bpu),
+        ]
+        _, warnings_logged = self._run(gathered=gathered, user_limit=500_000)
+        self.assertEqual(warnings_logged, [])
+
+
 if __name__ == "__main__":
     unittest.main()
