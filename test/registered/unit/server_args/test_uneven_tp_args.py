@@ -1,0 +1,422 @@
+"""Unit tests for the heterogeneous rank placement / uneven TP server args
+(--rank-gpu-id, --rank-gpu-memory-mib, --rank-tp-ratio,
+--rank-auto-reserve-mib) — CPU only, NVML mocked."""
+
+import argparse
+import unittest
+from unittest.mock import patch
+
+import sglang.srt.server_args as server_args_module
+from sglang.srt.server_args import ServerArgs
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+
+# NVML totals/free (MiB) used by all tests: GPU 0 is a 32 GiB card, GPUs 1/2
+# are 20 GiB cards. Keyed by CUDA device index (the mapping to NVML physical
+# indices is inside the mocked function).
+FAKE_GPU_MEMORY = {
+    0: (32768, 30000),
+    1: (20480, 19000),
+    2: (20480, 19000),
+}
+
+
+def _fake_query(gpu_ids):
+    result = {}
+    for gpu_id in sorted(set(gpu_ids)):
+        if gpu_id not in FAKE_GPU_MEMORY:
+            raise ValueError(
+                f"--rank-gpu-id names GPU {gpu_id}, but NVML only reports "
+                f"{len(FAKE_GPU_MEMORY)} device(s) "
+                f"(indices 0-{len(FAKE_GPU_MEMORY) - 1})."
+            )
+        result[gpu_id] = FAKE_GPU_MEMORY[gpu_id]
+    return result
+
+
+def make_args(**kwargs):
+    """ServerArgs with model_path='dummy' short-circuits __post_init__, so
+    the uneven-TP handler can be exercised in isolation."""
+    return ServerArgs(model_path="dummy", **kwargs)
+
+
+def run_handler(args):
+    with patch.object(
+        server_args_module, "_query_rank_gpu_memory_mib", _fake_query
+    ):
+        args._handle_uneven_tp()
+    return args
+
+
+class TestCliParsing(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(cls.parser)
+
+    def parse(self, *extra):
+        return self.parser.parse_args(["--model-path", "m", *extra])
+
+    def test_defaults(self):
+        parsed = self.parse()
+        self.assertIsNone(parsed.rank_gpu_id)
+        self.assertIsNone(parsed.rank_gpu_memory_mib)
+        self.assertIsNone(parsed.rank_tp_ratio)
+        self.assertEqual(int(parsed.rank_auto_reserve_mib), 2048)
+
+    def test_rank_gpu_id_list(self):
+        parsed = self.parse("--rank-gpu-id", "0,0,1,2")
+        self.assertEqual(parsed.rank_gpu_id, [0, 0, 1, 2])
+
+    def test_memory_mib_scalar_and_list(self):
+        self.assertEqual(
+            self.parse("--rank-gpu-memory-mib", "15000").rank_gpu_memory_mib,
+            15000,
+        )
+        self.assertEqual(
+            self.parse(
+                "--rank-gpu-memory-mib", "26000,17000,17000"
+            ).rank_gpu_memory_mib,
+            [26000, 17000, 17000],
+        )
+
+    def test_ratio_list_and_auto(self):
+        self.assertEqual(self.parse("--rank-tp-ratio", "2,1,1").rank_tp_ratio, [2, 1, 1])
+        self.assertEqual(self.parse("--rank-tp-ratio", "auto").rank_tp_ratio, "auto")
+
+    def test_reserve_stays_string(self):
+        parsed = self.parse("--rank-auto-reserve-mib", "2048,2048,10240")
+        self.assertEqual(parsed.rank_auto_reserve_mib, "2048,2048,10240")
+
+
+class TestValidationDefaults(CustomTestCase):
+    def test_no_flags_is_a_noop(self):
+        args = make_args(tp_size=4, mem_fraction_static=0.8, base_gpu_id=1)
+        run_handler(args)  # must not raise, must not mutate
+        self.assertEqual(args.mem_fraction_static, 0.8)
+        self.assertIsNone(args.rank_tp_ratio)
+
+    def test_reserve_without_auto_rejected(self):
+        args = make_args(rank_auto_reserve_mib="4096")
+        with self.assertRaisesRegex(ValueError, "rank-auto-reserve-mib"):
+            run_handler(args)
+
+
+class TestMutualRequirements(CustomTestCase):
+    def test_gpu_id_requires_memory(self):
+        args = make_args(tp_size=2, rank_gpu_id=[0, 1])
+        with self.assertRaisesRegex(ValueError, "rank-gpu-memory-mib"):
+            run_handler(args)
+
+    def test_memory_requires_gpu_id(self):
+        args = make_args(tp_size=2, rank_gpu_memory_mib=15000)
+        with self.assertRaisesRegex(ValueError, "requires --rank-gpu-id"):
+            run_handler(args)
+
+    def test_ratio_requires_gpu_id(self):
+        args = make_args(tp_size=2, rank_tp_ratio=[2, 1])
+        with self.assertRaisesRegex(ValueError, "requires --rank-gpu-id"):
+            run_handler(args)
+
+
+class TestLengthAndValueChecks(CustomTestCase):
+    def test_gpu_id_length_mismatch(self):
+        args = make_args(tp_size=4, rank_gpu_id=[0, 1], rank_gpu_memory_mib=15000)
+        with self.assertRaisesRegex(ValueError, "length"):
+            run_handler(args)
+
+    def test_negative_gpu_id(self):
+        args = make_args(tp_size=2, rank_gpu_id=[0, -1], rank_gpu_memory_mib=15000)
+        with self.assertRaisesRegex(ValueError, ">= 0"):
+            run_handler(args)
+
+    def test_unknown_gpu_id(self):
+        args = make_args(tp_size=2, rank_gpu_id=[0, 7], rank_gpu_memory_mib=15000)
+        with self.assertRaisesRegex(ValueError, "GPU 7"):
+            run_handler(args)
+
+    def test_ratio_length_mismatch(self):
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=15000,
+            rank_tp_ratio=[2, 1],
+        )
+        with self.assertRaisesRegex(ValueError, "rank-tp-ratio length"):
+            run_handler(args)
+
+    def test_ratio_nonpositive(self):
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=15000,
+            rank_tp_ratio=[2, 0, 1],
+        )
+        with self.assertRaisesRegex(ValueError, "positive integers"):
+            run_handler(args)
+
+    def test_ratio_identical_entries_rejected(self):
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=15000,
+            rank_tp_ratio=[2, 2, 2],
+        )
+        with self.assertRaisesRegex(ValueError, "even.*split"):
+            run_handler(args)
+
+    def test_invalid_ratio_string(self):
+        args = make_args(
+            tp_size=2,
+            rank_gpu_id=[0, 1],
+            rank_gpu_memory_mib=15000,
+            rank_tp_ratio="fastest",
+        )
+        with self.assertRaisesRegex(ValueError, "auto"):
+            run_handler(args)
+
+    def test_memory_list_requires_ratio(self):
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=[26000, 17000, 17000],
+        )
+        with self.assertRaisesRegex(ValueError, "requires\\s+--rank-tp-ratio"):
+            run_handler(args)
+
+    def test_memory_list_length_mismatch(self):
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=[26000, 17000],
+            rank_tp_ratio=[2, 1, 1],
+        )
+        with self.assertRaisesRegex(ValueError, "list length"):
+            run_handler(args)
+
+    def test_memory_nonpositive(self):
+        args = make_args(tp_size=2, rank_gpu_id=[0, 1], rank_gpu_memory_mib=0)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            run_handler(args)
+
+
+class TestPureTpScope(CustomTestCase):
+    def _base(self, **kwargs):
+        return make_args(
+            tp_size=2, rank_gpu_id=[0, 1], rank_gpu_memory_mib=15000, **kwargs
+        )
+
+    def test_pp_rejected(self):
+        with self.assertRaisesRegex(ValueError, "pp-size"):
+            run_handler(self._base(pp_size=2))
+
+    def test_dp_rejected(self):
+        with self.assertRaisesRegex(ValueError, "dp-size"):
+            run_handler(self._base(dp_size=2))
+
+    def test_ep_rejected(self):
+        with self.assertRaisesRegex(ValueError, "ep-size"):
+            run_handler(self._base(ep_size=2))
+
+    def test_multi_node_rejected(self):
+        with self.assertRaisesRegex(ValueError, "single-node"):
+            run_handler(self._base(nnodes=2))
+
+    def test_mem_fraction_static_conflict(self):
+        with self.assertRaisesRegex(ValueError, "mem-fraction-static"):
+            run_handler(self._base(mem_fraction_static=0.8))
+
+    def test_base_gpu_id_conflict(self):
+        with self.assertRaisesRegex(ValueError, "base-gpu-id"):
+            run_handler(self._base(base_gpu_id=1))
+
+    def test_gpu_id_step_conflict(self):
+        with self.assertRaisesRegex(ValueError, "gpu-id-step"):
+            run_handler(self._base(gpu_id_step=2))
+
+
+class TestPhysicalImpossibility(CustomTestCase):
+    def test_scalar_budget_fits(self):
+        # 2 x 15000 on the 32 GiB card, 1 x 15000 on each 20 GiB card.
+        args = make_args(
+            tp_size=4, rank_gpu_id=[0, 0, 1, 2], rank_gpu_memory_mib=15000
+        )
+        run_handler(args)  # must not raise
+        self.assertIsNone(args.rank_tp_ratio)
+
+    def test_scalar_budget_colocated_overflow(self):
+        # 2 x 17000 = 34000 > 32768 on GPU 0.
+        args = make_args(
+            tp_size=4, rank_gpu_id=[0, 0, 1, 2], rank_gpu_memory_mib=17000
+        )
+        with self.assertRaisesRegex(
+            ValueError, r"Physical impossibility.*GPU 0.*32768.*34000"
+        ):
+            run_handler(args)
+
+    def test_list_budget_overflow(self):
+        # 25000 > 20480 on GPU 1.
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=[26000, 25000, 17000],
+            rank_tp_ratio=[2, 1, 1],
+        )
+        with self.assertRaisesRegex(ValueError, "GPU 1"):
+            run_handler(args)
+
+    def test_list_budget_fits(self):
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=[26000, 17000, 17000],
+            rank_tp_ratio=[2, 1, 1],
+        )
+        run_handler(args)
+        self.assertEqual(args.rank_tp_ratio, [2, 1, 1])
+
+
+class TestAutoRatio(CustomTestCase):
+    def test_auto_derives_budgets_and_weights(self):
+        args = make_args(tp_size=3, rank_gpu_id=[0, 1, 2], rank_tp_ratio="auto")
+        run_handler(args)
+        # budget = min(total - 2048, free - 1024) per GPU, one rank each:
+        # GPU 0: min(30720, 28976) = 28976; GPU 1/2: min(18432, 17976) = 17976.
+        self.assertEqual(args.rank_gpu_memory_mib, [28976, 17976, 17976])
+        # gcd(28976, 17976, 17976) = 8.
+        self.assertEqual(args.rank_tp_ratio, [3622, 2247, 2247])
+
+    def test_auto_colocated_budget_split(self):
+        args = make_args(tp_size=4, rank_gpu_id=[0, 0, 1, 2], rank_tp_ratio="auto")
+        run_handler(args)
+        # GPU 0 budget 28976 shared by two ranks -> 14488 each.
+        self.assertEqual(
+            args.rank_gpu_memory_mib, [14488, 14488, 17976, 17976]
+        )
+        self.assertEqual(args.rank_tp_ratio, [1811, 1811, 2247, 2247])
+
+    def test_auto_uniform_budgets_collapse_to_even_split(self):
+        # Same card type for both ranks -> uniform budgets: the ratio must
+        # collapse to None and the budget list to a single scalar
+        # (vLLM bugfix 74cfec1a9).
+        args = make_args(tp_size=2, rank_gpu_id=[1, 2], rank_tp_ratio="auto")
+        run_handler(args)
+        self.assertIsNone(args.rank_tp_ratio)
+        self.assertEqual(args.rank_gpu_memory_mib, 17976)
+
+    def test_auto_with_explicit_uniform_budget_list_collapses(self):
+        args = make_args(
+            tp_size=2,
+            rank_gpu_id=[0, 1],
+            rank_gpu_memory_mib=[15000, 15000],
+            rank_tp_ratio="auto",
+        )
+        run_handler(args)
+        self.assertIsNone(args.rank_tp_ratio)
+        self.assertEqual(args.rank_gpu_memory_mib, 15000)
+
+    def test_auto_with_explicit_budget_list_derives_weights(self):
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=[26000, 17000, 17000],
+            rank_tp_ratio="auto",
+        )
+        run_handler(args)
+        self.assertEqual(args.rank_tp_ratio, [26, 17, 17])
+
+    def test_auto_requires_gpu_id(self):
+        args = make_args(tp_size=2, rank_tp_ratio="auto")
+        with self.assertRaisesRegex(ValueError, "requires --rank-gpu-id"):
+            run_handler(args)
+
+    def test_auto_reserve_scalar(self):
+        args = make_args(
+            tp_size=2,
+            rank_gpu_id=[1, 2],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib="4096",
+        )
+        run_handler(args)
+        # min(20480 - 4096, 19000 - 1024) = 16384 per rank.
+        self.assertEqual(args.rank_gpu_memory_mib, 16384)
+
+    def test_auto_reserve_per_rank_max_wins_per_gpu(self):
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 0, 1],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib="2048,8192,2048",
+        )
+        run_handler(args)
+        # GPU 0: reserve max(2048, 8192) = 8192 -> min(24576, 28976) // 2
+        # = 12288 per rank; GPU 1: min(18432, 17976) = 17976.
+        self.assertEqual(args.rank_gpu_memory_mib, [12288, 12288, 17976])
+
+    def test_auto_reserve_list_length_mismatch(self):
+        args = make_args(
+            tp_size=2,
+            rank_gpu_id=[0, 1],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib="2048,2048,2048",
+        )
+        with self.assertRaisesRegex(ValueError, "entries"):
+            run_handler(args)
+
+    def test_auto_reserve_negative(self):
+        args = make_args(
+            tp_size=2,
+            rank_gpu_id=[0, 1],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib="-1",
+        )
+        with self.assertRaisesRegex(ValueError, ">= 0"):
+            run_handler(args)
+
+    def test_auto_reserve_not_an_int(self):
+        args = make_args(
+            tp_size=2,
+            rank_gpu_id=[0, 1],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib="lots",
+        )
+        with self.assertRaisesRegex(ValueError, "integer"):
+            run_handler(args)
+
+    def test_auto_reserve_leaves_no_budget(self):
+        args = make_args(
+            tp_size=2,
+            rank_gpu_id=[1, 2],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib="20480",
+        )
+        with self.assertRaisesRegex(ValueError, "leaves no budget"):
+            run_handler(args)
+
+
+class TestGpuIdLookup(CustomTestCase):
+    def test_default_formula_unchanged(self):
+        args = make_args(tp_size=4, base_gpu_id=2, gpu_id_step=2)
+        for tp_rank in range(4):
+            self.assertEqual(
+                args.gpu_id_for_rank(0, tp_rank, 1, 4), 2 + tp_rank * 2
+            )
+
+    def test_default_formula_with_pp(self):
+        args = make_args(tp_size=2, pp_size=2)
+        self.assertEqual(args.gpu_id_for_rank(0, 0, 2, 2), 0)
+        self.assertEqual(args.gpu_id_for_rank(0, 1, 2, 2), 1)
+        self.assertEqual(args.gpu_id_for_rank(1, 0, 2, 2), 2)
+        self.assertEqual(args.gpu_id_for_rank(1, 1, 2, 2), 3)
+
+    def test_explicit_mapping_wins(self):
+        args = make_args(tp_size=4, rank_gpu_id=[0, 0, 1, 2])
+        self.assertEqual(
+            [args.gpu_id_for_rank(0, r, 1, 4) for r in range(4)], [0, 0, 1, 2]
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
