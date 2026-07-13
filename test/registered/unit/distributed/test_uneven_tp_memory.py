@@ -385,17 +385,31 @@ class _FakeMlpLayer(torch.nn.Module):
         )
 
 
+class _FakeMoeLayer(torch.nn.Module):
+    """FusedMoE-shaped module: family/units via moe_tp_* attributes."""
+
+    def __init__(self, rows, cols, moe_tp_units):
+        super().__init__()
+        self.moe_tp_family = "moe"
+        self.moe_tp_units = moe_tp_units
+        self.w13_weight = torch.nn.Parameter(
+            torch.zeros(rows, cols), requires_grad=False
+        )
+
+
 class TestMlpRebalanceHint(UnevenTPTestCase):
     """_maybe_suggest_mlp_rebalance: gating + the one-line restart hint."""
 
     PLAN = [5, 3, 3]
     UNITS_TOTAL = 28
 
-    def _fake_model(self, with_mlp=True):
+    def _fake_model(self, with_mlp=True, with_moe=False):
         model = torch.nn.Module()
         if with_mlp:
             # partition_units(28, [5,3,3]) = [13, 8, 7]; rank 0 sees 13.
             model.mlp = _FakeMlpLayer(13, 8, tp_units=self.UNITS_TOTAL)
+        if with_moe:
+            model.moe = _FakeMoeLayer(64, 8, moe_tp_units=self.UNITS_TOTAL)
         model.attn = _FakeMlpLayer(14, 8, tp_family=None)
         return model
 
@@ -406,6 +420,7 @@ class TestMlpRebalanceHint(UnevenTPTestCase):
         world_size=3,
         plan=True,
         with_mlp=True,
+        with_moe=False,
         gathered=None,
         user_limit=None,
         budget_bytes=10 * (1 << 30),
@@ -424,13 +439,16 @@ class TestMlpRebalanceHint(UnevenTPTestCase):
             tp_size=3,
             tp_rank=0,
             page_size=1,
-            model=self._fake_model(with_mlp=with_mlp),
+            model=self._fake_model(with_mlp=with_mlp, with_moe=with_moe),
         )
-        # Bind the sibling mixin method onto the fake runner.
-        fake_self._mlp_family_local_stats = (
-            lambda: mixin.ModelRunnerKVCacheMixin._mlp_family_local_stats(
-                fake_self
+        # Bind the sibling mixin members onto the fake runner.
+        fake_self._family_local_stats = (
+            lambda family: mixin.ModelRunnerKVCacheMixin._family_local_stats(
+                fake_self, family
             )
+        )
+        fake_self._CALIBRATION_FAMILY_ENV = (
+            mixin.ModelRunnerKVCacheMixin._CALIBRATION_FAMILY_ENV
         )
         gather_calls = []
 
@@ -498,9 +516,9 @@ class TestMlpRebalanceHint(UnevenTPTestCase):
         GB = 1 << 30
         bpu = 48 * 3 * 5120.0
         gathered = [
-            (594_999 * 26_000.0 + 1.23 * GB, 642_303, 4608, 4608 * bpu),
-            (594_999 * 13_000.0, 594_999, 2765, 2765 * bpu),
-            (594_999 * 13_000.0 + 1.14 * GB, 689_157, 2765, 2765 * bpu),
+            (594_999 * 26_000.0 + 1.23 * GB, 642_303, {"mlp": (4608, 4608 * bpu)}),
+            (594_999 * 13_000.0, 594_999, {"mlp": (2765, 2765 * bpu)}),
+            (594_999 * 13_000.0 + 1.14 * GB, 689_157, {"mlp": (2765, 2765 * bpu)}),
         ]
         gather_calls, warnings_logged = self._run(gathered=gathered)
         self.assertEqual(len(gather_calls), 1)
@@ -518,13 +536,43 @@ class TestMlpRebalanceHint(UnevenTPTestCase):
         self.assertEqual(sum(vector), 4608 + 2765 + 2765)
         self.assertLess(vector[1], 2765)
 
+    def test_moe_family_supplies_the_shiftable_mass(self):
+        # MoE model: the dense-MLP family is tiny (its shiftable bytes
+        # cannot unpin TP1) while the expert family carries the weight
+        # mass — the hint must rebalance via SGLANG_UNEVEN_MOE_VECTOR.
+        GB = 1 << 30
+        mlp_bpu = 3 * 512.0  # tiny shared expert
+        moe_bpu = 48 * 3 * 5120.0 * 8  # expert weights dominate
+        def fams(units_mlp, units_moe):
+            return {
+                "mlp": (units_mlp, units_mlp * mlp_bpu),
+                "moe": (units_moe, units_moe * moe_bpu),
+            }
+        gathered = [
+            (594_999 * 26_000.0 + 1.23 * GB, 642_303, fams(4608, 4608)),
+            (594_999 * 13_000.0, 594_999, fams(2765, 2765)),
+            (594_999 * 13_000.0 + 1.14 * GB, 689_157, fams(2765, 2765)),
+        ]
+        _, warnings_logged = self._run(gathered=gathered, with_moe=True)
+        self.assertEqual(len(warnings_logged), 1)
+        msg = warnings_logged[0]
+        self.assertIn("SGLANG_UNEVEN_MOE_VECTOR=", msg)
+        moe_vector = [
+            int(v)
+            for v in msg.split("SGLANG_UNEVEN_MOE_VECTOR=")[1]
+            .split(" ")[0]
+            .split(",")
+        ]
+        self.assertEqual(sum(moe_vector), 4608 + 2765 + 2765)
+        self.assertLess(moe_vector[1], 2765)  # shed from the pinned rank
+
     def test_user_cap_below_capacity_stays_silent(self):
         GB = 1 << 30
         bpu = 48 * 3 * 5120.0
         gathered = [
-            (594_999 * 26_000.0 + 1.23 * GB, 642_303, 4608, 4608 * bpu),
-            (594_999 * 13_000.0, 594_999, 2765, 2765 * bpu),
-            (594_999 * 13_000.0 + 1.14 * GB, 689_157, 2765, 2765 * bpu),
+            (594_999 * 26_000.0 + 1.23 * GB, 642_303, {"mlp": (4608, 4608 * bpu)}),
+            (594_999 * 13_000.0, 594_999, {"mlp": (2765, 2765 * bpu)}),
+            (594_999 * 13_000.0 + 1.14 * GB, 689_157, {"mlp": (2765, 2765 * bpu)}),
         ]
         _, warnings_logged = self._run(gathered=gathered, user_limit=500_000)
         self.assertEqual(warnings_logged, [])
