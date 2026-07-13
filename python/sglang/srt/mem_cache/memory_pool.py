@@ -667,6 +667,42 @@ class MambaPool:
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_cache.at_layer_idx(layer_id)
 
+    def reset_state(self):
+        """Return every device buffer of the pool to its freshly-initialized
+        (all-zero) contents: conv/temporal states, spec intermediate caches,
+        GDN ReplaySSM rings and their per-slot write cursors.
+
+        Used by the idle-time cache flush: freeing the slots alone is not
+        enough — recycled slots whose per-slot metadata (most notably
+        ``replayssm_write_pos``) or state bytes survive a flush can leak
+        stale-state effects into later requests, so a flushed server would
+        not behave like a freshly started one.
+        """
+        raw = getattr(self, "_raw", None)
+        if raw is not None:
+            # Envelope layout: conv/temporal are views into one byte buffer.
+            raw.zero_()
+        else:
+            for conv in self.mamba_cache.conv:
+                conv.zero_()
+            self.mamba_cache.temporal.zero_()
+        for name in ("replayssm_d", "replayssm_k", "replayssm_g"):
+            t = getattr(self.mamba_cache, name, None)
+            if t is not None:
+                t.zero_()
+        if isinstance(self.mamba_cache, self.SpeculativeState):
+            self.mamba_cache.intermediate_ssm.zero_()
+            # The logical conv-window views may be as_strided over shared
+            # physical buffers; zero the physical storage where it exists
+            # (UnifiedMambaPool holds only the dense logical tensors).
+            phys = getattr(self, "_intermediate_conv_window_phys", None)
+            for t in phys if phys is not None else (
+                self.mamba_cache.intermediate_conv_window
+            ):
+                t.zero_()
+        if self.replayssm_write_pos is not None:
+            self.replayssm_write_pos.zero_()
+
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
         if not _is_npu:
@@ -1136,6 +1172,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
         self.mamba_allocator.clear()
+        # A flush must also reset the mamba pool's device-side state
+        # (conv/temporal, ReplaySSM rings + write cursors, spec
+        # intermediates): freed slot ids get recycled, and any surviving
+        # per-slot metadata would make a flushed server behave differently
+        # from a freshly started one.
+        self.mamba_pool.reset_state()
         # The int8 checkpoint pool holds radix-cached states in its own slots; a
         # flush/reset drops the radix tree, so its slots must be released too,
         # otherwise the (now unreferenced) slots leak and break the int8-pool
