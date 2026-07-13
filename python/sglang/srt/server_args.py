@@ -1186,6 +1186,23 @@ class ServerArgs:
             type_parser=_parse_int_list,
         ),
     ] = None
+    rank_moe_ratio: A[
+        Optional[List[int]],
+        Arg(
+            help="Uneven TP self-calibration: comma-separated positive "
+            "integer weights, one per rank (length must equal --tp-size), "
+            "for the fused expert-weight (MoE) family ONLY. On MoE models "
+            "the expert weights are the bulk of the shiftable mass, so "
+            "this is the main lever for growing the MIN-synced KV token "
+            "pool; attention/KV splits keep following --rank-tp-ratio. "
+            "The server's profiling logs a suggested vector ('restart "
+            "with SGLANG_UNEVEN_MOE_VECTOR=...') when rebalancing gains "
+            "> 10%. The environment variable SGLANG_UNEVEN_MOE_VECTOR "
+            "takes precedence over this flag. Requires an active "
+            "--rank-tp-ratio plan.",
+            type_parser=_parse_int_list,
+        ),
+    ] = None
     random_seed: A[Optional[int], "The random seed."] = None
     watchdog_timeout: A[
         float,
@@ -4278,53 +4295,67 @@ class ServerArgs:
 
         self._handle_uneven_mlp_ratio()
 
+    #: Shiftable weight families of the uneven-TP self-calibration:
+    #: (ServerArgs field, CLI flag, environment variable). The env var
+    #: wins over the CLI flag.
+    UNEVEN_FAMILY_RATIO_SPECS = (
+        ("rank_mlp_ratio", "--rank-mlp-ratio", "SGLANG_UNEVEN_MLP_VECTOR"),
+        ("rank_moe_ratio", "--rank-moe-ratio", "SGLANG_UNEVEN_MOE_VECTOR"),
+    )
+
     def _handle_uneven_mlp_ratio(self):
-        """Validate --rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR (the
-        MLP-family weight vector of the uneven-TP self-calibration).
+        """Validate the family weight vectors of the uneven-TP
+        self-calibration (--rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR for
+        the dense-MLP family, --rank-moe-ratio / SGLANG_UNEVEN_MOE_VECTOR
+        for the fused expert weights).
 
-        The environment variable wins over the CLI flag (the calibration
+        The environment variables win over the CLI flags (the calibration
         hint is phrased as an env restart, mirroring vLLM's token-vector
-        pattern). The vector is only meaningful on top of an ACTIVE base
-        plan: it re-balances the dense-MLP family relative to the
-        attention/KV splits, which follow --rank-tp-ratio. Runs after the
-        base plan is resolved ('auto' may collapse to None on uniform
-        budgets), so a vector without a resolved plan is a hard error."""
-        env_value = envs.SGLANG_UNEVEN_MLP_VECTOR.get()
-        if env_value:
-            try:
-                env_vector = _parse_int_list(env_value)
-            except ValueError as e:
-                raise ValueError(
-                    "SGLANG_UNEVEN_MLP_VECTOR must be a comma-separated "
-                    f"integer list, got {env_value!r}."
-                ) from e
-            if self.rank_mlp_ratio is not None and self.rank_mlp_ratio != env_vector:
-                logger.warning(
-                    "SGLANG_UNEVEN_MLP_VECTOR=%s overrides --rank-mlp-ratio %s.",
-                    env_value,
-                    self.rank_mlp_ratio,
-                )
-            self.rank_mlp_ratio = env_vector
+        pattern). A vector is only meaningful on top of an ACTIVE base
+        plan: it re-balances its family relative to the attention/KV
+        splits, which follow --rank-tp-ratio. Runs after the base plan is
+        resolved ('auto' may collapse to None on uniform budgets), so a
+        vector without a resolved plan is a hard error."""
+        for field, flag, env_name in self.UNEVEN_FAMILY_RATIO_SPECS:
+            env_value = getattr(envs, env_name).get()
+            if env_value:
+                try:
+                    env_vector = _parse_int_list(env_value)
+                except ValueError as e:
+                    raise ValueError(
+                        f"{env_name} must be a comma-separated integer "
+                        f"list, got {env_value!r}."
+                    ) from e
+                current = getattr(self, field)
+                if current is not None and current != env_vector:
+                    logger.warning(
+                        "%s=%s overrides %s %s.",
+                        env_name,
+                        env_value,
+                        flag,
+                        current,
+                    )
+                setattr(self, field, env_vector)
 
-        if self.rank_mlp_ratio is None:
-            return
-        if not isinstance(self.rank_tp_ratio, list):
-            raise ValueError(
-                "--rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR requires an "
-                "active uneven-TP base plan (--rank-tp-ratio); without one "
-                "every family already uses the even split."
-            )
-        if len(self.rank_mlp_ratio) != self.tp_size:
-            raise ValueError(
-                f"--rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR length "
-                f"({len(self.rank_mlp_ratio)}) must equal --tp-size "
-                f"({self.tp_size})."
-            )
-        if any(not isinstance(r, int) or r <= 0 for r in self.rank_mlp_ratio):
-            raise ValueError(
-                "--rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR entries must "
-                f"be positive integers, got {self.rank_mlp_ratio}."
-            )
+            vector = getattr(self, field)
+            if vector is None:
+                continue
+            if not isinstance(self.rank_tp_ratio, list):
+                raise ValueError(
+                    f"{flag} / {env_name} requires an active uneven-TP "
+                    "base plan (--rank-tp-ratio); without one every "
+                    "family already uses the even split."
+                )
+            if len(vector) != self.tp_size:
+                raise ValueError(
+                    f"{flag} / {env_name} length ({len(vector)}) must "
+                    f"equal --tp-size ({self.tp_size})."
+                )
+            if any(not isinstance(r, int) or r <= 0 for r in vector):
+                raise ValueError(
+                    f"{flag} / {env_name} entries must be positive "
+                    f"integers, got {vector}."
+                )
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
