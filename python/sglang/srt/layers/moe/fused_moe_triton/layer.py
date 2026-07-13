@@ -239,14 +239,26 @@ class FusedMoE(torch.nn.Module):
         # so every rank's share stays block-aligned. One unit count
         # divides both the weight grid and the scale grid. Without a
         # plan this is the classic even split.
+        #
+        # The expert weights form the "moe" family
+        # (--rank-moe-ratio / SGLANG_UNEVEN_MOE_VECTOR): together with
+        # the dense-MLP "mlp" family this is the shiftable weight mass
+        # of the KV-pool self-calibration. Without an installed moe
+        # vector the family falls back to the base plan (bit-identical
+        # to before).
         _moe_units = intermediate_size
         _block = getattr(quant_config, "weight_block_size", None) if quant_config else None
         if _block and intermediate_size % _block[0] == 0:
             _moe_units = intermediate_size // _block[0]
         self.moe_tp_units = _moe_units
-        if tp_plan_active(self.moe_tp_size):
+        self.moe_tp_family = "moe"
+        if tp_plan_active(self.moe_tp_size, self.moe_tp_family):
             self.intermediate_size_per_partition = tp_partition_size(
-                intermediate_size, self.moe_tp_size, self.moe_tp_rank, _moe_units
+                intermediate_size,
+                self.moe_tp_size,
+                self.moe_tp_rank,
+                _moe_units,
+                self.moe_tp_family,
             )
         else:
             assert intermediate_size % self.moe_tp_size == 0
@@ -552,12 +564,17 @@ class FusedMoE(torch.nn.Module):
     ) -> int:
         """Source-side start of this rank's shard in a full checkpoint
         tensor. Even TP: rank * shard_size. Uneven TP: prefix sum of the
-        plan partition; works for weight AND block-scale grids because
-        moe_tp_units divides both."""
-        if not tp_plan_active(self.moe_tp_size):
+        plan partition ("moe" family, falling back to the base plan);
+        works for weight AND block-scale grids because moe_tp_units
+        divides both."""
+        if not tp_plan_active(self.moe_tp_size, self.moe_tp_family):
             return shard_size * tp_rank
         return tp_partition_offset(
-            loaded_total, self.moe_tp_size, tp_rank, self.moe_tp_units
+            loaded_total,
+            self.moe_tp_size,
+            tp_rank,
+            self.moe_tp_units,
+            self.moe_tp_family,
         )
 
     def _load_w2(
