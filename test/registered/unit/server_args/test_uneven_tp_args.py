@@ -512,5 +512,65 @@ class TestMlpRatio(CustomTestCase):
                 run_handler(make_args(tp_size=3))
 
 
+class TestMoeRatio(CustomTestCase):
+    """--rank-moe-ratio / SGLANG_UNEVEN_MOE_VECTOR: the expert-weight
+    family vector (same rules as the mlp family: env wins, base plan
+    required)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(cls.parser)
+
+    def _valid_base(self, **kwargs):
+        return make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=[26000, 17000, 17000],
+            rank_tp_ratio=[2, 1, 1],
+            **kwargs,
+        )
+
+    def test_cli_parsing(self):
+        parsed = self.parser.parse_args(
+            ["--model-path", "m", "--rank-moe-ratio", "5,3,3"]
+        )
+        self.assertEqual(parsed.rank_moe_ratio, [5, 3, 3])
+        self.assertIsNone(
+            self.parser.parse_args(["--model-path", "m"]).rank_moe_ratio
+        )
+
+    def test_valid_with_base_plan(self):
+        args = run_handler(self._valid_base(rank_moe_ratio=[5, 3, 3]))
+        self.assertEqual(args.rank_moe_ratio, [5, 3, 3])
+
+    def test_requires_base_plan(self):
+        args = make_args(tp_size=3, rank_moe_ratio=[5, 3, 3])
+        with self.assertRaisesRegex(ValueError, "base plan"):
+            run_handler(args)
+
+    def test_length_and_positivity(self):
+        with self.assertRaisesRegex(ValueError, "length"):
+            run_handler(self._valid_base(rank_moe_ratio=[5, 3]))
+        with self.assertRaisesRegex(ValueError, "positive"):
+            run_handler(self._valid_base(rank_moe_ratio=[5, 0, 3]))
+
+    def test_env_wins_over_cli(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_UNEVEN_MOE_VECTOR.override("9,5,5"):
+            args = run_handler(self._valid_base(rank_moe_ratio=[5, 3, 3]))
+        self.assertEqual(args.rank_moe_ratio, [9, 5, 5])
+
+    def test_both_families_together(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_UNEVEN_MLP_VECTOR.override("7,4,4"):
+            with envs.SGLANG_UNEVEN_MOE_VECTOR.override("9,5,5"):
+                args = run_handler(self._valid_base())
+        self.assertEqual(args.rank_mlp_ratio, [7, 4, 4])
+        self.assertEqual(args.rank_moe_ratio, [9, 5, 5])
+
+
 if __name__ == "__main__":
     unittest.main()

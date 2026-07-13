@@ -294,6 +294,27 @@ class TestFamilyWeightLoading(FamilyPlanTestCase):
         self.assertTrue(torch.equal(torch.cat(base_shards), base_full))
         self.assertTrue(torch.equal(torch.cat(mlp_shards, dim=1), mlp_full))
 
+    def test_moe_src_start_uses_moe_family(self):
+        # FusedMoE loads expert shards under the "moe" family: with an
+        # installed moe vector the source offset follows it; without one
+        # it falls back to the base plan; without any plan it is the
+        # classic rank * shard_size.
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        fake = SimpleNamespace(
+            moe_tp_size=TP, moe_tp_units=self.INTERMEDIATE, moe_tp_family="moe"
+        )
+        set_tp_partition_ratios(BASE, families={"moe": MLP})
+        # moe (3,2,2) of 28 -> sizes [12,8,8], rank-1 offset 12.
+        self.assertEqual(FusedMoE._moe_src_start(fake, 28, 8, 1), 12)
+        set_tp_partition_ratios(BASE)
+        # Fallback to base (2,1,1): sizes [14,7,7], rank-1 offset 14.
+        self.assertEqual(FusedMoE._moe_src_start(fake, 28, 7, 1), 14)
+        set_tp_partition_ratios(None)
+        self.assertEqual(FusedMoE._moe_src_start(fake, 30, 10, 1), 10)
+
     def test_default_path_regression_with_family_kwarg(self):
         # No plan installed: tp_family layers behave exactly like the
         # classic even split (byte-identical default path).
