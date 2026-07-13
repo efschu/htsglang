@@ -283,18 +283,28 @@ def reset_probe(scheduler, families) -> None:
     cross-request state; if it continues, the family is exonerated.
 
     families:
-      "flashinfer" — zero every tensor attribute of flashinfer/sgl_kernel
-          wrapper objects (plan buffers, int/float workspaces, kv_lens/pinned
-          buffers). All of them are (re)written by the next plan() for the
-          region it consumes — any behavior change proves a read of stale
-          plan/workspace state from the previous request. Plan-derived python
-          scalars (_max_q_len, ...) are left alone: plan() overwrites them
-          unconditionally (audited, flashinfer 0.6.x).
+      "flashinfer" — zero tensor attributes of flashinfer/sgl_kernel wrapper
+          objects. CAUTION (round-10 confound): in non-graph mode plan()
+          stores _qo_indptr_buf / _paged_kv_*_buf as REFERENCES to
+          sglang-owned buffer slices (`.to(device)` is a no-op on the same
+          device), so an unfiltered zero also wipes sglang backend buffers —
+          including the semantic-ones kv_last_page_len, which is never
+          refilled. Use SGLANG_SPEC_RESET_PROBE_FILTER (comma-separated
+          fnmatch globs on the ATTRIBUTE NAME, e.g.
+          "_int_workspace_buffer,_kv_lens*") to restrict the wipe to
+          genuinely wrapper-owned persistents; the run()-audited shortlist
+          is _float_workspace_buffer, _int_workspace_buffer,
+          _pin_memory_int_workspace_buffer, _kv_lens_buffer. Per-name zero
+          counts are logged so every boot documents exactly what was wiped.
+          Plan-derived python scalars (_max_q_len, ...) are left alone:
+          plan() overwrites them unconditionally (audited, flashinfer 0.6.x).
       "registry" — zero every CudaGraphBufferRegistry slot buffer (the
           "dead tail" claim, complementary to SGLANG_POISON_GRAPH_PAD).
     Never raises.
     """
     try:
+        import fnmatch
+
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             CudaGraphBufferRegistry,
         )
@@ -302,7 +312,9 @@ def reset_probe(scheduler, families) -> None:
         roots = _build_roots(scheduler)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        n_wrapper_tensors = 0
+        raw_filter = envs.SGLANG_SPEC_RESET_PROBE_FILTER.get()
+        name_globs = [g.strip() for g in raw_filter.split(",") if g.strip()] or None
+        zeroed_by_name: dict = {}
         n_wrapper_objs = 0
         n_registry_bufs = 0
         do_fi = "flashinfer" in families
@@ -311,12 +323,18 @@ def reset_probe(scheduler, families) -> None:
             mod = getattr(type(obj), "__module__", "") or ""
             if do_fi and mod.startswith(("flashinfer", "sgl_kernel")):
                 n_wrapper_objs += 1
-                for _, val in _object_items(obj):
-                    if isinstance(val, torch.Tensor) and not isinstance(
+                for suffix, val in _object_items(obj):
+                    if not isinstance(val, torch.Tensor) or isinstance(
                         val, torch.nn.Parameter
                     ):
-                        val.zero_()
-                        n_wrapper_tensors += 1
+                        continue
+                    attr = suffix.lstrip(".")
+                    if name_globs is not None and not any(
+                        fnmatch.fnmatchcase(attr, g) for g in name_globs
+                    ):
+                        continue
+                    val.zero_()
+                    zeroed_by_name[attr] = zeroed_by_name.get(attr, 0) + 1
             if do_reg and isinstance(obj, CudaGraphBufferRegistry):
                 for slot in obj._slots.values():
                     if slot.buffer is not None:
@@ -324,13 +342,16 @@ def reset_probe(scheduler, families) -> None:
                         n_registry_bufs += 1
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        names = ",".join(f"{k}:{v}" for k, v in sorted(zeroed_by_name.items()))
         logger.info(
             "SPEC_RESET_PROBE families=%s wrapper_objs=%d wrapper_tensors=%d "
-            "registry_buffers=%d",
+            "registry_buffers=%d filter=%s names=%s",
             ",".join(sorted(families)),
             n_wrapper_objs,
-            n_wrapper_tensors,
+            sum(zeroed_by_name.values()),
             n_registry_bufs,
+            ",".join(name_globs) if name_globs else "<all>",
+            names or "<none>",
         )
     except Exception:
         logger.exception("SPEC_RESET_PROBE failed")
