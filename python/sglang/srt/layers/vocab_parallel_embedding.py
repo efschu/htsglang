@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.3.post1/vllm/model_executor/layers/vocab_parallel_embedding.py
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -14,6 +15,7 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.utils import tp_plan_active
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -261,6 +263,14 @@ class VocabParallelEmbedding(torch.nn.Module):
             and pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0
         ):
             padding_size *= self.tp_size
+        # Uneven TP (--rank-tp-ratio): the vocab dimension deliberately
+        # KEEPS the classic even split across ranks (LM-head logits and
+        # embedding all-reduce stay symmetric). The default padding (64)
+        # only guarantees even divisibility for power-of-two TP sizes;
+        # with e.g. TP=3 pad to a multiple of lcm(padding, tp_size).
+        # Never taken on the default path (no plan installed).
+        if self.tp_size > 1 and tp_plan_active(self.tp_size):
+            padding_size = math.lcm(padding_size, self.tp_size)
         self.padding_size = padding_size
 
         num_added_embeddings = num_embeddings - self.org_vocab_size
