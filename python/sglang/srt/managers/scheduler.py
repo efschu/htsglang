@@ -3526,6 +3526,16 @@ class Scheduler(
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
 
+        # #50 campaign debug lever: hash-dump all worker-persistent state
+        # after each finished request so deterministic cross-request state
+        # evolution can be diffed request-to-request. No-op unless set.
+        if envs.SGLANG_SPEC_STATE_HASH.get():
+            from sglang.srt.debug_utils.spec_state_hash import (
+                maybe_dump_on_request_finish,
+            )
+
+            maybe_dump_on_request_finish(self, batch)
+
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
             # Return some signal for the health check.
