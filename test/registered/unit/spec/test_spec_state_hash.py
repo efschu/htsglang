@@ -158,6 +158,28 @@ class TestCollectStateEntries(CustomTestCase):
         # root itself is not traversable under this prefix either
         self.assertEqual(n_tensors, 0)
 
+    def test_flashinfer_like_wrappers_are_traversed_by_default(self):
+        # Round-8 coverage hole: attention wrapper objects (module prefix
+        # "flashinfer...") hold persistent plan/workspace tensors and must be
+        # reached with the DEFAULT prefixes.
+        class FakeWrapper:
+            pass
+
+        FakeWrapper.__module__ = "flashinfer.prefill"
+        w = FakeWrapper()
+        w._int_workspace_buffer = torch.zeros(8, dtype=torch.int32)
+
+        class FakeBackend:
+            pass
+
+        FakeBackend.__module__ = "sglang.srt.test_fake"
+        root = FakeBackend()
+        root.wrapper = w
+        entries, n_tensors, _ = collect_state_entries({"r": root})
+        paths = _entry_map(entries)
+        self.assertIn("r.wrapper._int_workspace_buffer", paths)
+        self.assertEqual(n_tensors, 1)
+
 
 class TestRequestFinishHook(CustomTestCase):
     def test_dump_emitted_only_on_finish_and_counts(self):

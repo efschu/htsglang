@@ -48,8 +48,13 @@ logger = logging.getLogger(__name__)
 
 # Only objects whose type lives in these module prefixes are traversed into.
 # torch.nn covers container modules (ModuleList/Sequential) between sglang
-# layers; everything else torch-internal stays a leaf.
-DEFAULT_TRAVERSE_PREFIXES = ("sglang.", "torch.nn.")
+# layers; everything else torch-internal stays a leaf. flashinfer/sgl_kernel
+# wrapper objects are included because their internal plan/workspace buffers
+# are persistent, partially rewritten per plan() and read by every kernel
+# run — exactly the state class this locator exists for. (Round 8 coverage
+# hole: the attention wrappers were skipped as foreign modules, so their
+# plan/workspace state was invisible to the dump.)
+DEFAULT_TRAVERSE_PREFIXES = ("sglang.", "torch.nn.", "flashinfer", "sgl_kernel")
 
 _MAX_DEPTH = 20
 _MAX_ENTRIES = 500_000

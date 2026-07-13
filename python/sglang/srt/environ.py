@@ -354,11 +354,17 @@ class Envs:
     # fingerprinted from a strided sample instead (faster, still detects
     # virtually any realistic mutation).
     SGLANG_SPEC_STATE_HASH_MAX_MB = EnvInt(0)
-    # Falsifier for the draft-extend cuda-graph tail reset: fill the padded
-    # tail rows of the replayed input buffers with loud junk (token id 100 /
-    # hidden 1024.0) instead of the neutral zero reset. If outputs differ
-    # from a zero-fill boot, the padded rows demonstrably couple into the
-    # real rows (MoE grouped-GEMM batch composition).
+    # Falsifier for stale-tail reads of persistent input buffers, eager AND
+    # graph replay: (a) the draft-extend graph runner fills the padded tail
+    # rows of its replayed input buffers with loud junk (token id 100 /
+    # hidden 1024.0) instead of the neutral zero reset; (b) the
+    # CudaGraphBufferRegistry poisons every slot-buffer element beyond the
+    # current iteration's raw region (floats NaN, uint8 0xFF, ints 100)
+    # before the semantic pad reset and head copy. If outputs differ from a
+    # clean boot, some kernel reads beyond the active region (a KEEP_PAD /
+    # FOREACH_COPY "tail is never read" claim is violated and the junk
+    # localizes it); bit-identical output exonerates the stale-tail class
+    # for the whole registry. Diagnostic boots only.
     SGLANG_POISON_GRAPH_PAD = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
