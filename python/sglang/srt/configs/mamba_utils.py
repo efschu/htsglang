@@ -20,7 +20,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 
-from sglang.srt.distributed.utils import divide
+from sglang.srt.distributed.utils import divide, tp_partition_size, tp_plan_active
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -159,7 +159,44 @@ class Mamba2StateShape:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
+        tp_rank: Optional[int] = None,
     ) -> "Mamba2StateShape":
+        if tp_plan_active(tp_world_size):
+            # Uneven TP (--rank-tp-ratio): the GDN layers partition the
+            # k/v heads and the conv channels in whole k-head units
+            # (see Qwen3GatedDeltaNet), so the per-rank state shapes must
+            # follow the same unit partition. Requires the caller to pass
+            # this rank (worker processes know it).
+            if tp_rank is None:
+                raise ValueError(
+                    "Mamba2StateShape.create needs tp_rank when an "
+                    "uneven-TP shard plan is installed."
+                )
+            num_k_heads_per_tp = tp_partition_size(
+                n_groups, tp_world_size, tp_rank, n_groups
+            )
+            conv_dim = intermediate_size + 2 * n_groups * state_size
+            conv_state_shape = (
+                tp_partition_size(conv_dim, tp_world_size, tp_rank, n_groups),
+                conv_kernel - 1,
+            )
+            temporal_state_shape = (
+                tp_partition_size(num_heads, tp_world_size, tp_rank, n_groups),
+                head_dim,
+                state_size,
+            )
+            return Mamba2StateShape(
+                conv=[conv_state_shape],
+                temporal=temporal_state_shape,
+                intermediate_size=intermediate_size,
+                conv_dim=conv_dim,
+                ssm_state_size=state_size,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                state_size=state_size,
+                conv_kernel=conv_kernel,
+                num_k_heads_per_tp=num_k_heads_per_tp,
+            )
         # The q/k projections are sharded by `num_k_heads // tp` heads (the
         # ORIGINAL n_groups, before the conv head-shard extension below), so the
         # runtime `H` the packed kernels see equals divide(n_groups, tp). Only

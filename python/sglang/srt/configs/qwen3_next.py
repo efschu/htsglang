@@ -291,14 +291,24 @@ class Qwen3NextConfig(PretrainedConfig):
             world_size = get_parallel().attn_tp_size
             adjust_tp_num_heads_if_necessary(self, world_size, False)
 
+        from sglang.srt.distributed.utils import tp_plan_active
+
+        # Uneven TP: the per-rank state shapes follow the k-head-unit
+        # partition of the GDN layers; pass this rank. None on the
+        # default path (create() then ignores it).
+        attn_tp_size = get_parallel().attn_tp_size
+        tp_rank = (
+            get_parallel().attn_tp_rank if tp_plan_active(attn_tp_size) else None
+        )
         shape = Mamba2StateShape.create(
-            tp_world_size=get_parallel().attn_tp_size,
+            tp_world_size=attn_tp_size,
             intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
             n_groups=self.linear_num_key_heads,
             num_heads=self.linear_num_value_heads,
             head_dim=self.linear_value_head_dim,
             state_size=self.linear_key_head_dim,
             conv_kernel=self.linear_conv_kernel_dim,
+            tp_rank=tp_rank,
         )
 
         return Mamba2CacheParams(
