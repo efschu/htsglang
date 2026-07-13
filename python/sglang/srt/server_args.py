@@ -5549,16 +5549,38 @@ class ServerArgs:
         # The int8 mamba checkpoint pool is only wired into the built-in
         # MambaRadixCache. The host-offload variant (HiMambaRadixCache, enabled by
         # --enable-hierarchical-cache) and custom radix-cache backends are NOT
-        # int8-aware: they would read int8 checkpoint slots as bf16 active slots
-        # (wrong pool / out-of-range). Reject the combination up front rather than
-        # silently corrupting state.
+        # int8-aware. Structurally, with int8 enabled a radix node's
+        # ``mamba_value`` holds slot indices of the int8 CHECKPOINT pool
+        # (default 2x the active-pool size), while the whole HiCache host
+        # transfer machinery is built against the ACTIVE MambaPool:
+        #   * MambaPoolHost sizes/types its host buffers from
+        #     mamba_cache.temporal/.conv and captures those tensors'
+        #     data_ptrs for kernel IO -- indexing them with checkpoint-slot
+        #     ids reads the wrong pool and can go out of range;
+        #   * the host layout has no qdata+scale pair, so int8 checkpoints
+        #     cannot be stored losslessly (and every host->device load-back
+        #     would have to RE-quantize, breaking the quantize-once quality
+        #     invariant documented in mamba_checkpoint_pool.py);
+        #   * HiMambaRadixCache frees/COWs mamba_value via the active
+        #     allocator (write_backup / eviction / mamba_cow_src_index).
+        # Making the combination work needs an int8-native host pool
+        # (qdata+scale+conv buffers + new IO paths); until then, reject the
+        # combination up front rather than silently corrupting state.
         if not self.enable_int8_mamba_checkpoint:
             return
         if self.enable_hierarchical_cache:
             raise ValueError(
                 "--enable-int8-mamba-checkpoint is not supported together with "
-                "--enable-hierarchical-cache: the host-offload path "
-                "(HiMambaRadixCache) is not int8-aware. Disable one of them."
+                "--enable-hierarchical-cache: with int8 checkpoints, radix-cached "
+                "mamba states live in a separate int8 checkpoint pool (qdata+scale, "
+                "own slot namespace, default 2x the active-pool slot count), but the "
+                "hierarchical cache (HiMambaRadixCache/MambaPoolHost) transfers, "
+                "frees and copy-on-writes node states against the ACTIVE MambaPool "
+                "tensors and allocator. Checkpoint slot ids would index the wrong "
+                "pool (or out of range), the host pool has no int8 qdata+scale "
+                "layout, and every host load-back would re-quantize the state "
+                "(the int8 design quantizes exactly once). Disable one of the two "
+                "flags."
             )
         if self.radix_cache_backend is not None:
             raise ValueError(
