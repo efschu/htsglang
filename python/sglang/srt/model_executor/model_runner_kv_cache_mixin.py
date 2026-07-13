@@ -17,7 +17,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import (
-    suggest_unit_rebalance,
+    suggest_unit_rebalance_multi,
     tp_partition_size,
     tp_plan_active,
 )
@@ -1455,63 +1455,90 @@ class ModelRunnerKVCacheMixin:
 
         return token_capacity
 
-    def _mlp_family_local_stats(self: ModelRunner) -> Optional[tuple]:
-        """(per-rank mlp units, mlp-family parameter bytes) of this rank.
+    #: Weight families the self-calibration can shift, mapped to the
+    #: environment variable of the restart hint. "mlp" = dense-MLP /
+    #: shared experts (tp_family on the linear layers), "moe" = fused
+    #: expert weights (moe_tp_family on FusedMoE).
+    _CALIBRATION_FAMILY_ENV = {
+        "mlp": "SGLANG_UNEVEN_MLP_VECTOR",
+        "moe": "SGLANG_UNEVEN_MOE_VECTOR",
+    }
 
-        Walks the model for layers that partition under the "mlp" family
-        (tp_family="mlp", e.g. Qwen2MoeMLP gate_up/down). The unit
-        currency is the finest unit count among those layers (layers
-        whose units were quant-block-coarsened partition proportionally,
-        which is exact enough for the calibration estimate). Returns None
-        when the model has no converted mlp-family layers."""
+    def _family_local_stats(self: ModelRunner, family: str) -> Optional[tuple]:
+        """(per-rank units, family parameter bytes) of this rank for one
+        shiftable weight family.
+
+        Walks the model for layers partitioning under `family`: linear
+        layers carry tp_family/tp_units (dense MLP / shared experts),
+        FusedMoE carries moe_tp_family/moe_tp_units (expert weights).
+        The unit currency is the finest unit count among those layers
+        (quant-block-coarsened layers partition proportionally, which is
+        exact enough for the calibration estimate). Returns None when
+        the model has no layers of this family."""
         units_total = 0
-        mlp_bytes = 0
+        family_bytes = 0
         for module in self.model.modules():
-            if getattr(module, "tp_family", None) != "mlp":
+            module_family = getattr(module, "tp_family", None) or getattr(
+                module, "moe_tp_family", None
+            )
+            if module_family != family:
                 continue
-            module_units = getattr(module, "tp_units", None)
+            module_units = getattr(module, "tp_units", None) or getattr(
+                module, "moe_tp_units", None
+            )
             if module_units:
                 units_total = max(units_total, module_units)
-            mlp_bytes += sum(
+            family_bytes += sum(
                 p.numel() * p.element_size()
                 for p in module.parameters(recurse=False)
             )
-        if units_total <= 0 or mlp_bytes <= 0:
+        if units_total <= 0 or family_bytes <= 0:
             return None
         local_units = tp_partition_size(
-            units_total, self.tp_size, self.tp_rank, units_total, "mlp"
+            units_total, self.tp_size, self.tp_rank, units_total, family
         )
-        return local_units, mlp_bytes
+        return local_units, family_bytes
 
     def _maybe_suggest_mlp_rebalance(self: ModelRunner, budget_bytes: int) -> None:
         """Uneven-TP self-calibration: after the rank-local KV profiling,
-        check whether shifting dense-MLP units between ranks would raise
-        the MIN-synced KV token pool, and log a one-line restart hint.
+        check whether shifting weight-family units (dense-MLP "mlp" and
+        expert "moe") between ranks would raise the MIN-synced KV token
+        pool, and log a one-line restart hint.
 
         Every rank contributes (profiled KV byte budget, local token
-        capacity, current mlp partition in units, mlp-family parameter
-        bytes) via all_gather; when the token capacities diverge by more
-        than 10%, the maximin solver computes the MLP unit vector that
-        equalizes them (each shed unit turns its weight bytes into KV
-        budget on the pinned rank). Purely advisory — nothing is resized
-        in-process; the hint asks for a restart with
-        SGLANG_UNEVEN_MLP_VECTOR. Silent when the active vector already
-        balances the ranks. All gating conditions are rank-uniform, so
-        every rank reaches the collective or none does."""
+        capacity, and per family its current partition in units + the
+        family's parameter bytes) via all_gather; when the token
+        capacities diverge by more than 10%, the maximin solver computes
+        the unit vectors that equalize them (each shed unit turns its
+        weight bytes into KV budget on the pinned rank; on MoE models
+        the "moe" family supplies most of the shiftable mass). Purely
+        advisory — nothing is resized in-process; the hint asks for a
+        restart with SGLANG_UNEVEN_MLP_VECTOR / SGLANG_UNEVEN_MOE_VECTOR.
+        Silent when the active vectors already balance the ranks. All
+        gating conditions are rank-uniform, so every rank reaches the
+        collective or none does.
+
+        Ceiling note: shifting weights conserves the summed free bytes,
+        so the reachable pool is bounded by sum(budget) /
+        sum(bytes_per_token) — growing beyond that needs bigger budgets
+        or smaller weights (quantization), not a different vector."""
         if not self.server_args.uneven_memory_budgets_active():
             return
         if get_world_group().world_size <= 1:
             return
         if not tp_plan_active(self.tp_size):
-            # The mlp family vector requires an active base plan.
+            # The family vectors require an active base plan.
             return
 
-        local_stats = self._mlp_family_local_stats()
-        if local_stats is None:
-            # Model has no mlp-family layers (not converted for uneven
-            # TP); identical on every rank, so returning here is safe.
+        local_families = {}
+        for family in self._CALIBRATION_FAMILY_ENV:
+            stats = self._family_local_stats(family)
+            if stats is not None:
+                local_families[family] = stats
+        if not local_families:
+            # Model has no shiftable family layers (not converted for
+            # uneven TP); identical on every rank, so returning is safe.
             return
-        local_units, mlp_bytes = local_stats
 
         # Local token capacity of this rank's budget (pre-MIN-sync).
         from sglang.srt.model_executor.pool_configurator import (
@@ -1529,8 +1556,10 @@ class ModelRunnerKVCacheMixin:
         payload = (
             float(budget_bytes),
             int(local_tokens),
-            int(local_units),
-            float(mlp_bytes),
+            {
+                family: (int(units), float(fam_bytes))
+                for family, (units, fam_bytes) in local_families.items()
+            },
         )
         gathered: list = [None] * world
         torch.distributed.all_gather_object(
@@ -1538,8 +1567,6 @@ class ModelRunnerKVCacheMixin:
         )
         free_bytes = [g[0] for g in gathered]
         tokens = [g[1] for g in gathered]
-        units = [g[2] for g in gathered]
-        family_bytes = [g[3] for g in gathered]
         if any(t <= 0 for t in tokens):
             return
         cur_min = min(tokens)
@@ -1550,21 +1577,41 @@ class ModelRunnerKVCacheMixin:
         if user_limit is not None and user_limit <= cur_min:
             return
 
+        # Families present on every rank (the module sets are identical
+        # across ranks, so this is normally all of them).
+        family_names = set(gathered[0][2])
+        for g in gathered[1:]:
+            family_names &= set(g[2])
+        families = {
+            family: (
+                [g[2][family][0] for g in gathered],
+                [g[2][family][1] for g in gathered],
+            )
+            for family in sorted(family_names)
+        }
+        if not families:
+            return
+
         bytes_per_token = [free_bytes[r] / tokens[r] for r in range(world)]
-        suggestion = suggest_unit_rebalance(
-            free_bytes, bytes_per_token, units, family_bytes
+        suggestion = suggest_unit_rebalance_multi(
+            free_bytes, bytes_per_token, families
         )
         if suggestion is None:
             # Balanced (max/min <= 1.10) or no strictly better partition
-            # — in particular: an active SGLANG_UNEVEN_MLP_VECTOR that
-            # already equalizes the ranks stays silent.
+            # — in particular: active vectors that already equalize the
+            # ranks stay silent.
             return
-        new_units, cur_min_tokens, projected = suggestion
+        changed, cur_min_tokens, projected = suggestion
         if self.tp_rank == 0:
+            assignments = " ".join(
+                f"{self._CALIBRATION_FAMILY_ENV[family]}="
+                + ",".join(str(u) for u in changed[family])
+                for family in sorted(changed)
+            )
             logger.warning(
-                "uneven TP: restart with SGLANG_UNEVEN_MLP_VECTOR=%s to "
-                "raise the KV pool from %d to ~%d tokens",
-                ",".join(str(u) for u in new_units),
+                "uneven TP: restart with %s to raise the KV pool from "
+                "%d to ~%d tokens",
+                assignments,
                 cur_min_tokens,
                 projected,
             )
