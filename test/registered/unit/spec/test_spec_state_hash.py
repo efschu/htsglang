@@ -297,6 +297,23 @@ class TestResetProbe(CustomTestCase):
         self.assertTrue(torch.all(reg.get_slot("input_ids").buffer == 0))
         self.assertTrue(torch.all(w._int_workspace_buffer == 1))
 
+    def test_name_filter_restricts_wipe_and_logs_counts(self):
+        # Round-10 bisection support: only attribute names matching the
+        # fnmatch globs are zeroed (protects sglang-owned buffers aliased as
+        # _qo_indptr_buf/_paged_kv_*_buf in non-graph mode), and the log line
+        # carries per-name counts so every boot documents what was wiped.
+        sched, w, _ = self._make_sched()
+        logger_name = "sglang.srt.debug_utils.spec_state_hash"
+        with envs.SGLANG_SPEC_RESET_PROBE_FILTER.override(
+            "_int_workspace*"
+        ), self.assertLogs(logger_name, level="INFO") as cm:
+            spec_state_hash.reset_probe(sched, {"flashinfer"})
+        self.assertTrue(torch.all(w._int_workspace_buffer == 0))
+        self.assertTrue(torch.all(w._kv_lens_buffer == 1))  # filtered out
+        text = "\n".join(cm.output)
+        self.assertIn("filter=_int_workspace*", text)
+        self.assertIn("names=_int_workspace_buffer:1", text)
+
     def test_hook_runs_probe_without_hash_env(self):
         spec_state_hash._finished_request_count = 0
         sched, w, _ = self._make_sched()
