@@ -665,6 +665,23 @@ class MambaPool:
             self.mem_usage = mem_usage_bytes / GB
             self.num_mamba_layers = num_mamba_layers
 
+        # Diagnostic read-before-write falsifier (no-op unless the env is set).
+        # Data buffers only; replayssm_write_pos is a semantic cursor and must
+        # stay zero.
+        poison_tensors = list(self.mamba_cache.conv) + [
+            self.mamba_cache.temporal,
+            getattr(self.mamba_cache, "replayssm_d", None),
+            getattr(self.mamba_cache, "replayssm_k", None),
+            getattr(self.mamba_cache, "replayssm_g", None),
+        ]
+        if isinstance(self.mamba_cache, self.SpeculativeState):
+            poison_tensors.append(self.mamba_cache.intermediate_ssm)
+            poison_tensors.extend(
+                getattr(self, "_intermediate_conv_window_phys", None)
+                or self.mamba_cache.intermediate_conv_window
+            )
+        maybe_poison_pool_data(poison_tensors, "mamba pool")
+
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
         return self.mamba_cache
@@ -1101,6 +1118,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         buf[:n] = slots
         req.mamba_ping_pong_track_buffer = buf
         req.mamba_next_track_idx = 0
+        # Claimed slots must be zeroed before any kernel can observe them
+        # (deferred to the forward stream, alongside the active-slot clear):
+        # recycled slots otherwise expose the previous occupant's state to
+        # any premature or partial read.
+        req.mamba_pingpong_clear_indices = slots.clone()
 
     def set_mamba_ping_pong_slot(self, req: Req, idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.
@@ -1135,6 +1157,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
             f"rid={req.rid}"
         )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
+        # The replacement slot is a fresh claim: queue it for the deferred
+        # forward-stream clear (see _alloc_ping_pong_buffer).
+        fresh = new_slot.clone()
+        if req.mamba_pingpong_clear_indices is None:
+            req.mamba_pingpong_clear_indices = fresh
+        else:
+            req.mamba_pingpong_clear_indices = torch.cat(
+                [req.mamba_pingpong_clear_indices, fresh]
+            )
         return mamba_value_donated
 
     def free_mamba_cache(
@@ -1287,6 +1318,36 @@ class KvBufferDesc:
     def item_len_bytes(self, page_size: int) -> int:
         """Per-page transfer chunk (one page's worth of this buffer)."""
         return (page_size // self.tokens_per_row) * self.row_bytes
+
+
+def maybe_poison_pool_data(tensors, source: str) -> None:
+    """SGLANG_POISON_POOL_DATA: fill freshly allocated pool DATA buffers with
+    NaN instead of zeros (float dtypes only; index/cursor tensors must stay
+    semantic zeros and are not passed here).
+
+    Diagnostic falsifier for read-before-write bugs: a fresh boot normally
+    reads zeros from first-touch pages, which can HIDE a kernel that consumes
+    pool bytes never written for the current request. With poison, any such
+    read propagates NaN into the output loudly and immediately, instead of a
+    silent, traffic-dependent divergence later. Claimed slots that go through
+    the regular clear paths (deferred clear / full-state scatter) behave
+    exactly as in production.
+    """
+    if not envs.SGLANG_POISON_POOL_DATA.get():
+        return
+    poisoned = 0
+    for t in tensors:
+        if t is None:
+            continue
+        if t.is_floating_point():
+            t.fill_(float("nan"))
+            poisoned += 1
+    logger.warning(
+        "SGLANG_POISON_POOL_DATA: poisoned %d %s buffers with NaN — any "
+        "read-before-write of pool data will now surface as NaN output.",
+        poisoned,
+        source,
+    )
 
 
 def zero_kv_data_buffers(kvcache) -> int:
@@ -1515,6 +1576,12 @@ class MHATokenToKVPool(KVCache):
                     assert self.v_head_dim % self._kv_vector_x == 0
 
         self._create_buffers()
+        # Diagnostic read-before-write falsifier (no-op unless the env is set).
+        maybe_poison_pool_data(
+            list(getattr(self, "k_buffer", []) or [])
+            + list(getattr(self, "v_buffer", []) or []),
+            "MHA KV pool",
+        )
 
         self.device_module = torch.get_device_module(self.device)
 

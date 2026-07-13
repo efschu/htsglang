@@ -806,6 +806,11 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
         self.mamba_needs_clear: bool = False
+        # Deferred clear for freshly claimed ping-pong track slots: every
+        # claimed mamba slot must be zeroed before any kernel can observe it
+        # (fresh-boot semantics; recycled slots otherwise expose the previous
+        # occupant's state to any premature/partial read).
+        self.mamba_pingpong_clear_indices: Optional[torch.Tensor] = None
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
         self.mamba_lazy_is_insert: bool = True
@@ -2561,6 +2566,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             elif req.mamba_needs_clear:
                 clear_tensors.append(req.mamba_pool_idx.unsqueeze(0))
                 req.mamba_needs_clear = False
+            if req.mamba_pingpong_clear_indices is not None:
+                # Freshly claimed ping-pong track slots: zero on the forward
+                # stream like the active slot, so no premature read can ever
+                # observe the previous occupant's state.
+                clear_tensors.append(req.mamba_pingpong_clear_indices)
+                req.mamba_pingpong_clear_indices = None
         self.mamba_cow_src_indices = (
             torch.cat(cow_src_tensors) if cow_src_tensors else None
         )
