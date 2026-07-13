@@ -16,6 +16,7 @@
 import dataclasses
 import faulthandler
 import logging
+import math
 import os
 import signal
 import sys
@@ -1362,20 +1363,33 @@ class Scheduler(
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
-        if not self.server_args.enable_deterministic_inference:
-            self.truncation_align_size = None
-            return
+        self.truncation_align_size = None
+        if self.server_args.enable_deterministic_inference:
+            backend_sizes = {
+                "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
+                "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
+            }
+            env_var, default_size = backend_sizes.get(
+                self.server_args.attention_backend, (None, None)
+            )
+            self.truncation_align_size = (
+                get_int_env_var(env_var, default_size) if env_var else None
+            )
 
-        backend_sizes = {
-            "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
-            "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
-        }
-        env_var, default_size = backend_sizes.get(
-            self.server_args.attention_backend, (None, None)
-        )
-        self.truncation_align_size = (
-            get_int_env_var(env_var, default_size) if env_var else None
-        )
+        # --mamba-checkpoint-interval: chunked prefill steps must end on the
+        # checkpoint grid. A resumed prefix is on the grid (match is capped
+        # to grid checkpoints), so making every chunk a multiple of the
+        # interval keeps all chunk ends — and thus every cached mamba
+        # snapshot — on absolute interval positions, independent of the
+        # traffic-dependent token budget of each round.
+        ckpt_interval = self.server_args.mamba_checkpoint_interval
+        if ckpt_interval is not None:
+            if self.truncation_align_size is None:
+                self.truncation_align_size = ckpt_interval
+            else:
+                self.truncation_align_size = math.lcm(
+                    self.truncation_align_size, ckpt_interval
+                )
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
