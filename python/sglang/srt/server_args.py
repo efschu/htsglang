@@ -1170,6 +1170,22 @@ class ServerArgs:
             type_parser=str,
         ),
     ] = 2048
+    rank_mlp_ratio: A[
+        Optional[List[int]],
+        Arg(
+            help="Uneven TP self-calibration: comma-separated positive "
+            "integer weights, one per rank (length must equal --tp-size), "
+            "for the dense-MLP weight family ONLY. Attention/KV splits keep "
+            "following --rank-tp-ratio; shifting MLP units between ranks "
+            "re-balances the per-rank weight bytes so the MIN-synced KV "
+            "token pool grows. The server logs a suggested vector "
+            "('restart with SGLANG_UNEVEN_MLP_VECTOR=...') when its "
+            "profiling detects a rebalancing gain > 10%. The environment "
+            "variable SGLANG_UNEVEN_MLP_VECTOR takes precedence over this "
+            "flag. Requires an active --rank-tp-ratio plan.",
+            type_parser=_parse_int_list,
+        ),
+    ] = None
     random_seed: A[Optional[int], "The random seed."] = None
     watchdog_timeout: A[
         float,
@@ -4073,6 +4089,8 @@ class ServerArgs:
                     "--rank-auto-reserve-mib only applies with "
                     "--rank-tp-ratio auto."
                 )
+            # Raises if an MLP-family vector is set without a base plan.
+            self._handle_uneven_mlp_ratio()
             return
 
         # Resolve 'auto' BEFORE the mutual-requirement checks (auto may
@@ -4102,6 +4120,7 @@ class ServerArgs:
         if self.rank_tp_ratio is not None and self.rank_gpu_id is None:
             raise ValueError("--rank-tp-ratio requires --rank-gpu-id to be set.")
         if self.rank_gpu_id is None:
+            self._handle_uneven_mlp_ratio()
             return
 
         # Length vs tp_size.
@@ -4255,6 +4274,56 @@ class ServerArgs:
                 "Custom all-reduce is disabled for --rank-gpu-id: %s. "
                 "Falling back to NCCL for TP collectives.",
                 "; ".join(reasons),
+            )
+
+        self._handle_uneven_mlp_ratio()
+
+    def _handle_uneven_mlp_ratio(self):
+        """Validate --rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR (the
+        MLP-family weight vector of the uneven-TP self-calibration).
+
+        The environment variable wins over the CLI flag (the calibration
+        hint is phrased as an env restart, mirroring vLLM's token-vector
+        pattern). The vector is only meaningful on top of an ACTIVE base
+        plan: it re-balances the dense-MLP family relative to the
+        attention/KV splits, which follow --rank-tp-ratio. Runs after the
+        base plan is resolved ('auto' may collapse to None on uniform
+        budgets), so a vector without a resolved plan is a hard error."""
+        env_value = envs.SGLANG_UNEVEN_MLP_VECTOR.get()
+        if env_value:
+            try:
+                env_vector = _parse_int_list(env_value)
+            except ValueError as e:
+                raise ValueError(
+                    "SGLANG_UNEVEN_MLP_VECTOR must be a comma-separated "
+                    f"integer list, got {env_value!r}."
+                ) from e
+            if self.rank_mlp_ratio is not None and self.rank_mlp_ratio != env_vector:
+                logger.warning(
+                    "SGLANG_UNEVEN_MLP_VECTOR=%s overrides --rank-mlp-ratio %s.",
+                    env_value,
+                    self.rank_mlp_ratio,
+                )
+            self.rank_mlp_ratio = env_vector
+
+        if self.rank_mlp_ratio is None:
+            return
+        if not isinstance(self.rank_tp_ratio, list):
+            raise ValueError(
+                "--rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR requires an "
+                "active uneven-TP base plan (--rank-tp-ratio); without one "
+                "every family already uses the even split."
+            )
+        if len(self.rank_mlp_ratio) != self.tp_size:
+            raise ValueError(
+                f"--rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR length "
+                f"({len(self.rank_mlp_ratio)}) must equal --tp-size "
+                f"({self.tp_size})."
+            )
+        if any(not isinstance(r, int) or r <= 0 for r in self.rank_mlp_ratio):
+            raise ValueError(
+                "--rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR entries must "
+                f"be positive integers, got {self.rank_mlp_ratio}."
             )
 
     def _handle_gpu_memory_settings(self, gpu_mem):

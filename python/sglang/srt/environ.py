@@ -400,6 +400,10 @@ class Envs:
     # Model Parallel
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
+    # Uneven TP: MLP-family weight vector ("a,b,c", one positive integer
+    # per TP rank). Takes precedence over --rank-mlp-ratio when both are
+    # set. Emitted by the KV-pool self-calibration as a restart hint.
+    SGLANG_UNEVEN_MLP_VECTOR = EnvStr(None)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
     # Override the distributed init method used by torch.distributed.init_process_group.
