@@ -74,18 +74,68 @@ def divide(numerator, denominator):
 # server_args.rank_tp_ratio) before the model is built; when unset, all
 # helpers reproduce the classic even split (divide) exactly, so the
 # default path stays unchanged.
+#
+# NAMED FAMILY PLANS (--rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR): on top
+# of the base vector, individual weight FAMILIES (today: "mlp", the dense
+# MLP intermediate dimension) may carry their own weight vector. Layers
+# opt in by passing tp_family=<name>; families without an installed
+# vector fall back to the base plan, so passing a family is always safe
+# and the base behavior is unchanged. This is the calibration lever for
+# maximizing the KV pool: shifting MLP units between ranks re-balances
+# the per-rank weight bytes without touching attention/KV-head splits.
 # ---------------------------------------------------------------------------
 
 _TP_PARTITION_RATIOS: Optional[list] = None
+_TP_PARTITION_FAMILIES: dict = {}
 
 
-def set_tp_partition_ratios(ratios: Optional[Sequence[int]]) -> None:
-    """Install the uneven-TP ratio vector for this process (or None)."""
-    global _TP_PARTITION_RATIOS
-    _TP_PARTITION_RATIOS = list(ratios) if ratios else None
+def set_tp_partition_ratios(
+    ratios: Optional[Sequence[int]],
+    families: Optional[dict] = None,
+) -> None:
+    """Install the uneven-TP ratio vector for this process (or None).
+
+    `families` optionally maps family names (e.g. "mlp") to their own
+    weight vectors, overriding the base vector for layers constructed
+    with a matching tp_family. Families are only valid together with a
+    base vector and must have the same length; empty/None entries are
+    ignored. Every call replaces the complete plan (base + families)."""
+    global _TP_PARTITION_RATIOS, _TP_PARTITION_FAMILIES
+    base = list(ratios) if ratios else None
+    fams: dict = {}
+    if families:
+        for name, vec in families.items():
+            vec = list(vec) if vec else None
+            if not vec:
+                continue
+            if base is None:
+                raise ValueError(
+                    f"Family shard plan {name!r} requires an active base "
+                    "plan (--rank-tp-ratio)."
+                )
+            if len(vec) != len(base):
+                raise ValueError(
+                    f"Family shard plan {name!r} has {len(vec)} entries "
+                    f"but the base plan has {len(base)} "
+                    f"({vec} vs {base})."
+                )
+            if any(not isinstance(w, int) or w <= 0 for w in vec):
+                raise ValueError(
+                    f"Family shard plan {name!r} entries must be positive "
+                    f"integers, got {vec}."
+                )
+            fams[name] = vec
+    _TP_PARTITION_RATIOS = base
+    _TP_PARTITION_FAMILIES = fams
 
 
-def get_tp_partition_ratios() -> Optional[list]:
+def get_tp_partition_ratios(family: Optional[str] = None) -> Optional[list]:
+    """The installed weight vector: the family's own vector when one is
+    installed under `family`, otherwise the base vector (or None)."""
+    if family is not None:
+        vec = _TP_PARTITION_FAMILIES.get(family)
+        if vec is not None:
+            return vec
     return _TP_PARTITION_RATIOS
 
 
@@ -169,13 +219,18 @@ def partition_offsets(
 
 
 def tp_partition_sizes(
-    total: int, tp_size: int, units: Optional[int] = None
+    total: int,
+    tp_size: int,
+    units: Optional[int] = None,
+    family: Optional[str] = None,
 ) -> list:
     """Per-rank sizes of a sharded dimension under the process-global
     shard plan. Without an installed ratio vector (or when this layer runs
     with its own tp_size, e.g. disable_tp layers use tp_size=1), this is
-    the classic even split via divide()."""
-    ratios = _TP_PARTITION_RATIOS
+    the classic even split via divide(). `family` selects a named family
+    plan (e.g. "mlp") and falls back to the base vector when that family
+    has no own vector installed."""
+    ratios = get_tp_partition_ratios(family)
     if not ratios or len(ratios) != tp_size:
         ensure_divisibility(total, tp_size)
         return [total // tp_size] * tp_size
@@ -183,24 +238,32 @@ def tp_partition_sizes(
 
 
 def tp_partition_size(
-    total: int, tp_size: int, rank: int, units: Optional[int] = None
+    total: int,
+    tp_size: int,
+    rank: int,
+    units: Optional[int] = None,
+    family: Optional[str] = None,
 ) -> int:
     """This rank's size of a sharded dimension under the global plan."""
-    return tp_partition_sizes(total, tp_size, units)[rank]
+    return tp_partition_sizes(total, tp_size, units, family)[rank]
 
 
 def tp_partition_offset(
-    total: int, tp_size: int, rank: int, units: Optional[int] = None
+    total: int,
+    tp_size: int,
+    rank: int,
+    units: Optional[int] = None,
+    family: Optional[str] = None,
 ) -> int:
     """This rank's start offset (prefix sum) in a sharded dimension."""
-    return sum(tp_partition_sizes(total, tp_size, units)[:rank])
+    return sum(tp_partition_sizes(total, tp_size, units, family)[:rank])
 
 
-def tp_plan_active(tp_size: int) -> bool:
+def tp_plan_active(tp_size: int, family: Optional[str] = None) -> bool:
     """True when an uneven-TP ratio plan is installed AND applies to a
     layer/group of the given tp_size (disable_tp layers with tp_size=1 and
     groups of a different size keep the classic even split)."""
-    ratios = _TP_PARTITION_RATIOS
+    ratios = get_tp_partition_ratios(family)
     return bool(ratios) and len(ratios) == tp_size
 
 
@@ -210,6 +273,7 @@ def tp_loaded_shard_start(
     rank: int,
     shard_size: int,
     units: Optional[int] = None,
+    family: Optional[str] = None,
 ) -> int:
     """Start offset when narrowing a full checkpoint dimension of
     `loaded_full` elements down to this rank's shard of `shard_size`.
@@ -224,9 +288,11 @@ def tp_loaded_shard_start(
 
     `tp_size=None` means "derive from the plan" (callers such as the
     parameter-class loaders that only know the rank); with no plan
-    installed this still degrades to `rank * shard_size`.
+    installed this still degrades to `rank * shard_size`. `family`
+    selects a named family plan (falling back to the base vector) and
+    must match the family the owning layer partitioned with.
     """
-    ratios = _TP_PARTITION_RATIOS
+    ratios = get_tp_partition_ratios(family)
     if not ratios or (tp_size is not None and len(ratios) != tp_size):
         return rank * shard_size
     if shard_size == loaded_full:
@@ -242,6 +308,123 @@ def tp_loaded_shard_start(
             f"has {shard_size}."
         )
     return sum(sizes[:rank])
+
+
+def solve_unit_rebalance(
+    free_bytes: Sequence[float],
+    bytes_per_token: Sequence[float],
+    units: Sequence[int],
+    bytes_per_unit: Sequence[float],
+    min_units: int = 1,
+) -> Tuple[list, int]:
+    """Maximin solver for the uneven-TP self-calibration: find the
+    per-rank MLP unit counts that maximize the MINIMUM token capacity.
+
+    Model: rank r currently owns units[r] MLP units; its profiled KV byte
+    budget is free_bytes[r] and one KV token costs bytes_per_token[r]
+    (both rank-local — per-token bytes scale with the rank's kv-head
+    share). Every MLP unit a rank sheds frees bytes_per_unit[r] weight
+    bytes (measured empirically as the rank's mlp-family parameter bytes
+    divided by its unit count), which become KV budget:
+
+        capacity_r(u) = (free[r] + (units[r] - u[r]) * bytes_per_unit[r])
+                        / bytes_per_token[r]
+
+    Since the scheduler's single max_total_num_tokens is the MIN over
+    ranks, the objective is maximin. Greedy over single units suffices:
+    the minimum only ever rises when the pinned (capacity-poorest) rank
+    sheds a unit, so iteratively move one unit from the pinned rank to
+    the rank that stays capacity-richest after receiving it, as long as
+    the minimum strictly increases. Every rank keeps >= min_units units
+    (partition_units requires >= 1 per rank).
+
+    Returns (new_units, projected_min_tokens).
+    """
+    n = len(units)
+    if not (n == len(free_bytes) == len(bytes_per_token) == len(bytes_per_unit)):
+        raise ValueError(
+            "solve_unit_rebalance: input vectors must have equal length, "
+            f"got {len(free_bytes)}/{len(bytes_per_token)}/{len(units)}/"
+            f"{len(bytes_per_unit)}."
+        )
+    if any(b <= 0 for b in bytes_per_token) or any(u < min_units for u in units):
+        raise ValueError(
+            "solve_unit_rebalance: bytes_per_token must be positive and "
+            f"every rank must own >= {min_units} unit(s); got "
+            f"bytes_per_token={list(bytes_per_token)}, units={list(units)}."
+        )
+
+    u = list(units)
+
+    def capacity(r: int, u_r: int) -> float:
+        return (
+            free_bytes[r] + (units[r] - u_r) * bytes_per_unit[r]
+        ) / bytes_per_token[r]
+
+    while True:
+        caps = [capacity(r, u[r]) for r in range(n)]
+        cur_min = min(caps)
+        donor = min(range(n), key=lambda r: (caps[r], r))
+        if u[donor] <= min_units:
+            break
+        # Receiver: the rank that remains capacity-richest after taking
+        # on the unit's weight bytes (hurts the maximin objective least).
+        receiver = max(
+            (r for r in range(n) if r != donor),
+            key=lambda r: (capacity(r, u[r] + 1), -r),
+        )
+        u_try = list(u)
+        u_try[donor] -= 1
+        u_try[receiver] += 1
+        new_min = min(capacity(r, u_try[r]) for r in range(n))
+        if new_min <= cur_min:
+            break
+        u = u_try
+
+    projected = int(min(capacity(r, u[r]) for r in range(n)))
+    return u, projected
+
+
+def suggest_unit_rebalance(
+    free_bytes: Sequence[float],
+    bytes_per_token: Sequence[float],
+    units: Sequence[int],
+    family_bytes: Sequence[float],
+    imbalance_threshold: float = 1.10,
+) -> Optional[Tuple[list, int, int]]:
+    """Decide whether shifting MLP units between uneven-TP ranks would
+    meaningfully raise the (MIN-synced) KV token capacity.
+
+    Inputs are the per-rank values gathered after rank-local KV
+    profiling: profiled free bytes, bytes per KV token, current mlp
+    family partition in units and the mlp family's total parameter bytes
+    (bytes_per_unit is derived as family_bytes / units per rank).
+
+    Returns None when the capacities are already balanced (max/min <=
+    imbalance_threshold), when the inputs cannot be calibrated, or when
+    the solver finds no strictly better partition. Otherwise returns
+    (new_units, current_min_tokens, projected_min_tokens).
+    """
+    n = len(units)
+    if n < 2:
+        return None
+    if any(u <= 0 for u in units) or any(b <= 0 for b in family_bytes):
+        return None
+    if any(f < 0 for f in free_bytes) or any(b <= 0 for b in bytes_per_token):
+        return None
+    capacities = [free_bytes[r] / bytes_per_token[r] for r in range(n)]
+    cur_min = min(capacities)
+    if cur_min <= 0:
+        return None
+    if max(capacities) / cur_min <= imbalance_threshold:
+        return None
+    bytes_per_unit = [family_bytes[r] / units[r] for r in range(n)]
+    new_units, projected = solve_unit_rebalance(
+        free_bytes, bytes_per_token, units, bytes_per_unit
+    )
+    if new_units == list(units) or projected <= int(cur_min):
+        return None
+    return new_units, int(cur_min), projected
 
 
 def split_tensor_along_last_dim(
