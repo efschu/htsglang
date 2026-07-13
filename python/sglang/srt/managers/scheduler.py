@@ -4362,6 +4362,21 @@ def configure_scheduler_process(
         else None
     )
 
+    # Apply this rank's --rank-gpu-memory-mib budget as its
+    # mem_fraction_static (MiB -> fraction against the rank's physical
+    # GPU NVML total, derived once at resolution time). The MiB value is
+    # the rank's ENTIRE budget — it is applied unmodified, without any
+    # additional utilization ceiling. No-op on the default path.
+    rank_fraction = server_args.apply_rank_memory_budget(tp_rank)
+    if rank_fraction is not None:
+        logger.info(
+            "Uneven TP: rank %d uses mem_fraction_static=%.4f "
+            "(--rank-gpu-memory-mib budget on GPU %s).",
+            tp_rank,
+            rank_fraction,
+            server_args.rank_gpu_id[tp_rank],
+        )
+
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
