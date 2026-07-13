@@ -338,6 +338,11 @@ class Envs:
     # the first-touch pages of a fresh boot. Discriminates kernels that are
     # sensitive to residual bytes in uninitialized activation scratch.
     SGLANG_FLUSH_SCRUB_FREE_MEMORY = EnvBool(False)
+    # Debug lever: fill pool DATA buffers (mamba states/intermediates/rings,
+    # MHA KV) with NaN at boot instead of zeros. Any kernel that reads pool
+    # bytes never written for the current request then surfaces as NaN
+    # output immediately, instead of a silent traffic-dependent divergence.
+    SGLANG_POISON_POOL_DATA = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)

@@ -111,6 +111,7 @@ def _build_tree(
     enable_linear_replayssm=False,
     max_context_len=128,
     size=256,
+    enable_mamba_extra_buffer=False,
 ):
     """MambaRadixCache + pools on CPU, mirroring test_mamba_unittest's setup."""
     server_args = ServerArgs(model_path="dummy", page_size=1)
@@ -149,7 +150,7 @@ def _build_tree(
         enable_memory_saver=False,
         cache_params=mamba2_cache_params,
         mamba_layer_ids=mamba_layers,
-        enable_mamba_extra_buffer=False,
+        enable_mamba_extra_buffer=enable_mamba_extra_buffer,
         enable_linear_replayssm=enable_linear_replayssm,
     )
     pool = HybridLinearKVPool(
@@ -496,6 +497,86 @@ class TestFlushResetsMambaPool(unittest.TestCase):
         d_first = d_alloc.alloc(4)
         f_first = f_alloc.alloc(4)
         self.assertTrue(torch.equal(d_first, f_first))
+
+
+class TestPoolClaimPoison(unittest.TestCase):
+    """Round 5: read-before-write hygiene at the mamba slot claim.
+
+    Poison the pool, run the CPU-reachable claim paths, and assert that every
+    claimed slot is queued for the deferred forward-stream clear and that the
+    clear actually removes the poison — i.e. no kernel can ever observe a
+    previous occupant's state in a freshly claimed slot. (RED on the pre-fix
+    code: ping-pong claims were never queued for clearing.)
+    """
+
+    def _poison(self, mamba_pool):
+        for conv in mamba_pool.mamba_cache.conv:
+            conv.fill_(float("nan"))
+        mamba_pool.mamba_cache.temporal.fill_(float("nan"))
+
+    def test_pingpong_claim_is_queued_and_cleared(self):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        tree, allocator, pool, make_req = _build_tree(
+            None, enable_mamba_extra_buffer=True
+        )
+        self._poison(pool.mamba_pool)
+
+        req = make_req()  # HybridReqToTokenPool.alloc -> _alloc_ping_pong_buffer
+        self.assertIsNotNone(req.mamba_ping_pong_track_buffer)
+        pp_slots = req.mamba_ping_pong_track_buffer[
+            req.mamba_ping_pong_track_buffer >= 0
+        ]
+        self.assertGreater(pp_slots.numel(), 0)
+        # Claim contract: the fresh ping-pong slots are queued for clearing.
+        self.assertIsNotNone(req.mamba_pingpong_clear_indices)
+        queued = set(req.mamba_pingpong_clear_indices.tolist())
+        self.assertEqual(queued, set(pp_slots.tolist()))
+        # ... and the active slot uses the existing mamba_needs_clear contract.
+        self.assertTrue(req.mamba_needs_clear)
+
+        # Collector picks both up (as the extend prepare would).
+        batch = ScheduleBatch.__new__(ScheduleBatch)
+        batch._collect_deferred_mamba_cow_and_clear([req])
+        self.assertIsNone(req.mamba_pingpong_clear_indices)
+        clear_indices = batch.mamba_clear_indices
+        expected = {int(req.mamba_pool_idx.item())} | queued
+        self.assertEqual(set(clear_indices.tolist()), expected)
+
+        # The deferred clear (forward-stream in production) removes the poison.
+        pool.mamba_pool.clear_slots(pool.translate_mamba_indices(clear_indices))
+        for idx in expected:
+            for conv in pool.mamba_pool.mamba_cache.conv:
+                self.assertFalse(torch.isnan(conv[:, idx]).any())
+            self.assertFalse(
+                torch.isnan(pool.mamba_pool.mamba_cache.temporal[:, idx]).any()
+            )
+
+    def test_donate_replacement_slot_is_queued(self):
+        tree, allocator, pool, make_req = _build_tree(
+            None, enable_mamba_extra_buffer=True
+        )
+        req = make_req()
+        req.mamba_pingpong_clear_indices = None  # consumed by a prior forward
+        new_slot = pool.mamba_allocator.alloc(1)
+        pool.donate_mamba_ping_pong_slot(req, new_slot)
+        self.assertIsNotNone(req.mamba_pingpong_clear_indices)
+        self.assertEqual(
+            req.mamba_pingpong_clear_indices.tolist(), new_slot.tolist()
+        )
+
+    def test_poison_helper_touches_only_float_buffers(self):
+        from sglang.srt.mem_cache.memory_pool import maybe_poison_pool_data
+
+        f = torch.zeros(4, dtype=torch.float32)
+        i = torch.zeros(4, dtype=torch.int32)
+        with envs.SGLANG_POISON_POOL_DATA.override(True):
+            maybe_poison_pool_data([f, i, None], "test")
+        self.assertTrue(torch.isnan(f).all())
+        self.assertTrue(torch.all(i == 0))
+        f2 = torch.zeros(4, dtype=torch.float32)
+        maybe_poison_pool_data([f2], "test")  # env off -> no-op
+        self.assertTrue(torch.all(f2 == 0))
 
 
 class _FakeSpecAlgo:
