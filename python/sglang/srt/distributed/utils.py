@@ -64,6 +64,138 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
+# ---------------------------------------------------------------------------
+# Uneven tensor-parallel partitioning (--rank-tp-ratio).
+#
+# When a ratio vector like (2, 1, 1) is active, TP rank r owns
+# total * ratio[r] / sum(ratio) of every sharded dimension instead of
+# total / tp_size. Offsets become prefix sums. The ratio vector is
+# process-global state installed once per scheduler process (from
+# server_args.rank_tp_ratio) before the model is built; when unset, all
+# helpers reproduce the classic even split (divide) exactly, so the
+# default path stays unchanged.
+# ---------------------------------------------------------------------------
+
+_TP_PARTITION_RATIOS: Optional[list] = None
+
+
+def set_tp_partition_ratios(ratios: Optional[Sequence[int]]) -> None:
+    """Install the uneven-TP ratio vector for this process (or None)."""
+    global _TP_PARTITION_RATIOS
+    _TP_PARTITION_RATIOS = list(ratios) if ratios else None
+
+
+def get_tp_partition_ratios() -> Optional[list]:
+    return _TP_PARTITION_RATIOS
+
+
+def partition_units(units: int, weights: Sequence[int]) -> list:
+    """Split `units` indivisible units over ranks proportionally to
+    `weights` (largest-remainder rounding, every rank gets >= 1 unit).
+
+    Deterministic pure function of (units, weights) so every process
+    computes the identical partition. Ties in the fractional parts are
+    broken toward the lower rank index.
+    """
+    n = len(weights)
+    if units < n:
+        raise ValueError(
+            f"Cannot give each of {n} ranks at least one of {units} units."
+        )
+    total_w = sum(weights)
+    quotas = [units * w / total_w for w in weights]
+    sizes = [int(q) for q in quotas]
+    # Reserve a minimum of one unit per rank before distributing the rest.
+    sizes = [max(s, 1) for s in sizes]
+    remaining = units - sum(sizes)
+    if remaining < 0:
+        # Minimum-1 bumping overshot: take back from the largest shares.
+        for _ in range(-remaining):
+            i = max(range(n), key=lambda r: (sizes[r], -r))
+            sizes[i] -= 1
+        remaining = 0
+    order = sorted(
+        range(n), key=lambda r: (quotas[r] - int(quotas[r]), -r), reverse=True
+    )
+    for k in range(remaining):
+        sizes[order[k % n]] += 1
+    assert sum(sizes) == units and all(s >= 1 for s in sizes)
+    return sizes
+
+
+def partition_sizes(
+    total: int, weights: Sequence[int], units: Optional[int] = None
+) -> list:
+    """Per-rank sizes of a sharded dimension of `total` elements under the
+    weight vector `weights`.
+
+    With `units`, the dimension is treated as `units` indivisible units of
+    `total // units` elements each (e.g. attention heads): the units are
+    distributed by largest-remainder rounding (every rank >= 1 unit) and
+    scaled back to elements, so any positive weights work. `total` must be
+    a multiple of `units`.
+
+    Without `units`, per-rank sizes must be exact: `total` must be
+    divisible by sum(weights); otherwise this raises, naming the offending
+    dimension size.
+    """
+    if units is not None:
+        if total % units != 0:
+            raise ValueError(
+                f"Dimension of size {total} is not a multiple of its "
+                f"unit count {units}."
+            )
+        scale = total // units
+        return [s * scale for s in partition_units(units, weights)]
+    denom = sum(weights)
+    if total % denom != 0:
+        raise ValueError(
+            f"Cannot partition dimension of size {total} with weight "
+            f"vector {list(weights)}: {total} is not divisible by "
+            f"sum(weights)={denom}. Choose weights whose sum divides every "
+            "sharded dimension, or pass the dimension's unit count."
+        )
+    unit = total // denom
+    return [unit * w for w in weights]
+
+
+def partition_offsets(
+    total: int, weights: Sequence[int], rank: int, units: Optional[int] = None
+) -> Tuple[int, int]:
+    """(start offset, size) of `rank` in a sharded dimension of `total`
+    elements: the prefix sum over partition_sizes and this rank's share."""
+    sizes = partition_sizes(total, weights, units)
+    return sum(sizes[:rank]), sizes[rank]
+
+
+def tp_partition_sizes(
+    total: int, tp_size: int, units: Optional[int] = None
+) -> list:
+    """Per-rank sizes of a sharded dimension under the process-global
+    shard plan. Without an installed ratio vector (or when this layer runs
+    with its own tp_size, e.g. disable_tp layers use tp_size=1), this is
+    the classic even split via divide()."""
+    ratios = _TP_PARTITION_RATIOS
+    if not ratios or len(ratios) != tp_size:
+        ensure_divisibility(total, tp_size)
+        return [total // tp_size] * tp_size
+    return partition_sizes(total, ratios, units)
+
+
+def tp_partition_size(
+    total: int, tp_size: int, rank: int, units: Optional[int] = None
+) -> int:
+    """This rank's size of a sharded dimension under the global plan."""
+    return tp_partition_sizes(total, tp_size, units)[rank]
+
+
+def tp_partition_offset(
+    total: int, tp_size: int, rank: int, units: Optional[int] = None
+) -> int:
+    """This rank's start offset (prefix sum) in a sharded dimension."""
+    return sum(tp_partition_sizes(total, tp_size, units)[:rank])
+
+
 def split_tensor_along_last_dim(
     tensor: torch.Tensor,
     num_partitions: int,
