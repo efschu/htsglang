@@ -4353,9 +4353,10 @@ def configure_scheduler_process(
 
     # Install the uneven-TP shard plan (--rank-tp-ratio) for this worker
     # process before any model code runs. None (the default) keeps the
-    # classic even split everywhere. The optional "mlp" family vector
-    # (--rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR, validated in
-    # server_args) re-balances the dense-MLP family only; families
+    # classic even split everywhere. The optional family vectors
+    # ("mlp" = --rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR, "moe" =
+    # --rank-moe-ratio / SGLANG_UNEVEN_MOE_VECTOR, validated in
+    # server_args) re-balance only their weight family; families
     # without a vector fall back to the base plan.
     from sglang.srt.distributed.utils import set_tp_partition_ratios
 
@@ -4364,11 +4365,12 @@ def configure_scheduler_process(
         if isinstance(server_args.rank_tp_ratio, list)
         else None
     )
-    mlp_plan = getattr(server_args, "rank_mlp_ratio", None)
-    set_tp_partition_ratios(
-        base_plan,
-        families={"mlp": mlp_plan} if isinstance(mlp_plan, list) else None,
-    )
+    family_plans = {}
+    for family, field in (("mlp", "rank_mlp_ratio"), ("moe", "rank_moe_ratio")):
+        vector = getattr(server_args, field, None)
+        if isinstance(vector, list):
+            family_plans[family] = vector
+    set_tp_partition_ratios(base_plan, families=family_plans or None)
 
     # Apply this rank's --rank-gpu-memory-mib budget as its
     # mem_fraction_static (MiB -> fraction against the rank's physical
