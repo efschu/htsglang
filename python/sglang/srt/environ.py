@@ -354,6 +354,12 @@ class Envs:
     # fingerprinted from a strided sample instead (faster, still detects
     # virtually any realistic mutation).
     SGLANG_SPEC_STATE_HASH_MAX_MB = EnvInt(0)
+    # Falsifier for the draft-extend cuda-graph tail reset: fill the padded
+    # tail rows of the replayed input buffers with loud junk (token id 100 /
+    # hidden 1024.0) instead of the neutral zero reset. If outputs differ
+    # from a zero-fill boot, the padded rows demonstrably couple into the
+    # real rows (MoE grouped-GEMM batch composition).
+    SGLANG_POISON_GRAPH_PAD = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
