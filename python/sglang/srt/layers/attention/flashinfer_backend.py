@@ -179,14 +179,19 @@ FULL_CG_PREFILL_WORKSPACE_MARGIN = 1.25
 
 # Every allocated flashinfer float workspace (the shared global one, private
 # init_new_workspace ones, the dedicated full-CG prefill one). Weak refs: the
-# registry must not extend buffer lifetimes across re-inits.
-_WORKSPACE_BUFFERS: "weakref.WeakSet[torch.Tensor]" = weakref.WeakSet()
+# registry must not extend buffer lifetimes across re-inits. Keyed by id()
+# in a WeakValueDictionary instead of a WeakSet: WeakSet membership falls
+# back to elementwise Tensor.__eq__ on hash collisions ("Boolean value of
+# Tensor ... is ambiguous").
+_WORKSPACE_BUFFERS: "weakref.WeakValueDictionary[int, torch.Tensor]" = (
+    weakref.WeakValueDictionary()
+)
 
 
 def register_flashinfer_workspace_buffer(buf: torch.Tensor) -> torch.Tensor:
     """Track a flashinfer float-workspace allocation for the per-request
     zeroing contract (see zero_flashinfer_workspaces)."""
-    _WORKSPACE_BUFFERS.add(buf)
+    _WORKSPACE_BUFFERS[id(buf)] = buf
     return buf
 
 
@@ -212,7 +217,7 @@ def zero_flashinfer_workspaces() -> int:
     itself, so run-to-run bit-stability is unaffected.
     """
     n = 0
-    for buf in list(_WORKSPACE_BUFFERS):
+    for buf in list(_WORKSPACE_BUFFERS.values()):
         buf.zero_()
         n += 1
     return n
