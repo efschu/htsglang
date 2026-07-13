@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
@@ -70,6 +71,50 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
+
+
+def reset_replay_tail_buffers(
+    buffers: EagleDraftExtendInputBuffers,
+    seq_len_fill_value: int,
+    num_tokens_per_bs: int,
+) -> None:
+    """Reset every graph-read input buffer to a request-independent state
+    before the partial copy-in of a draft-extend replay.
+
+    The captured graph always reads the FULL bs*num_tokens_per_bs token rows;
+    a replay only rewrites [:num_tokens] (num_tokens = accepted tokens, which
+    varies per iteration). Without a reset, the tail rows keep the PREVIOUS
+    replay's token ids and hidden states — residue of an EARLIER REQUEST
+    enters every subsequent draft-extend forward through the padded rows.
+    The rows are masked for attention/logits, but with an MoE draft layer the
+    stale tail tokens still join expert routing and change per-expert group
+    sizes, i.e. grouped-GEMM tiling, which perturbs the REAL rows' logits in
+    the last bits. Under greedy verify on near-ties that flips accepted
+    tokens: deterministic cross-request contamination that converges to a
+    degenerate fixed point (#50 Rest A; vanishes with --disable-cuda-graph).
+
+    SGLANG_POISON_GRAPH_PAD=1 is the falsifier: fill the token/hidden tails
+    with loud junk instead of the neutral reset — if outputs differ vs. a
+    zero-fill boot, the tail->real-row coupling is proven. Either fill makes
+    replays history-independent.
+    """
+    buffers.seq_lens.fill_(seq_len_fill_value)
+    buffers.out_cache_loc.zero_()
+    buffers.positions.zero_()
+    # Pair with seq_lens fill: padded rows must point at reserved
+    # req_pool slot 0 (req_to_token[0, :] is all zeros from init).
+    buffers.req_pool_indices.zero_()
+    buffers.num_correct_drafts.fill_(num_tokens_per_bs)
+    buffers.num_accept_tokens.fill_(num_tokens_per_bs)
+    buffers.extend_seq_lens.fill_(num_tokens_per_bs)
+    if envs.SGLANG_POISON_GRAPH_PAD.get():
+        buffers.input_ids.fill_(100)
+        if buffers.hidden_states is not None:
+            buffers.hidden_states.fill_(1024.0)
+    else:
+        buffers.input_ids.zero_()
+        if buffers.hidden_states is not None:
+            buffers.hidden_states.zero_()
 
 
 class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
@@ -491,15 +536,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             bs = self._pad_to_bucket(raw_bs, self.capture_bs)
 
         if bs * self.num_tokens_per_bs != num_tokens:
-            buffers.seq_lens.fill_(self.seq_len_fill_value)
-            buffers.out_cache_loc.zero_()
-            buffers.positions.zero_()
-            # Pair with seq_lens fill: padded rows must point at reserved
-            # req_pool slot 0 (req_to_token[0, :] is all zeros from init).
-            buffers.req_pool_indices.zero_()
-            buffers.num_correct_drafts.fill_(self.num_tokens_per_bs)
-            buffers.num_accept_tokens.fill_(self.num_tokens_per_bs)
-            buffers.extend_seq_lens.fill_(self.num_tokens_per_bs)
+            # Full-buffer reset (incl. the input_ids / hidden_states token
+            # tails the graph reads but this replay does not rewrite) — see
+            # reset_replay_tail_buffers for the #50 Rest-A analysis.
+            reset_replay_tail_buffers(
+                buffers, self.seq_len_fill_value, self.num_tokens_per_bs
+            )
 
         # Batch the small per-field device copies into a grouped foreach copy
         # (one foreach call per dtype pair) to cut launch overhead. hidden_states
