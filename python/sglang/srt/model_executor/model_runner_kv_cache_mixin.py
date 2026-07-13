@@ -244,16 +244,53 @@ class ModelRunnerKVCacheMixin:
             server_args.disable_radix_cache
             and server_args.max_running_requests is not None
         ):
-            # Use explicitly set max_running_requests when radix cache is disabled
+            # Radix cache disabled: max_running_requests is the natural pool
+            # size (one slot per running request), but it must be jointly
+            # fitted against the memory budget like the radix-enabled branch
+            # below — main state + spec intermediate states together. The old
+            # unconditional `size = max_running_requests` reserved
+            # per_req * size * (1 + D) bytes regardless of budget, which on
+            # small per-rank budgets ate the whole KV headroom and surfaced
+            # as a misleading "no memory for KV cache" error downstream.
+            per_req = config.mamba2_cache_params.mamba_cache_per_req
+            assert per_req > 0
+            requested_size = server_args.max_running_requests // (
+                server_args.dp_size if server_args.enable_dp_attention else 1
+            )
+            mamba_budget_bytes = (
+                total_rest_memory
+                * server_args.mamba_full_memory_ratio
+                / (1 + server_args.mamba_full_memory_ratio)
+                * (1 << 30)
+            )
+            # ratio is 1 with the radix cache disabled; D/ratio mirrors the
+            # joint solve of the radix-enabled branch.
+            ratio = self._calculate_mamba_ratio()
+            D = server_args.speculative_num_draft_tokens if has_spec_dec else 0
+            budget_size = int(mamba_budget_bytes // (per_req * (1 + D / ratio)))
+            size = min(requested_size, budget_size)
+            if size < requested_size:
+                logger.warning(
+                    "Mamba pool with --disable-radix-cache: the memory budget "
+                    "fits %d request states (per_req=%.2f MiB, spec draft "
+                    "tokens=%d), capping the effective concurrency below "
+                    "--max-running-requests=%d.",
+                    size,
+                    per_req / (1 << 20),
+                    D,
+                    requested_size,
+                )
             server_args.override(
                 "mamba_pool.from_max_running_requests",
-                max_mamba_cache_size=server_args.max_running_requests
-                // (server_args.dp_size if server_args.enable_dp_attention else 1),
+                max_mamba_cache_size=size,
             )
-            # Reserve intermediate memory based on capped max_num_reqs
+            # Uneven TP: agree on the min across ranks before the
+            # intermediate reservation consumes the size (see below).
+            self._sync_uneven_mamba_cache_size()
+            # Reserve intermediate memory based on the fitted size
             if has_spec_dec:
                 intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
+                    per_req
                     * server_args.max_mamba_cache_size
                     * server_args.speculative_num_draft_tokens
                 )
