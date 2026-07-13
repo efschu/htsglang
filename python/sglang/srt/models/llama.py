@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_pp_indices,
 )
+from sglang.srt.distributed.utils import tp_partition_size, tp_plan_active
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -140,19 +141,32 @@ class LlamaAttention(nn.Module):
         self.hidden_size = hidden_size
         self.start_layer = start_layer
         tp_size = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+        if tp_plan_active(tp_size):
+            # Uneven TP (--rank-tp-ratio): heads follow the shard plan
+            # with kv heads as indivisible units, matching the split in
+            # QKVParallelLinear (whole GQA groups per rank; kv-head
+            # replication is rejected there).
+            self.num_heads = tp_partition_size(
+                self.total_num_heads, tp_size, tp_rank, self.total_num_kv_heads
+            )
+            self.num_kv_heads = tp_partition_size(
+                self.total_num_kv_heads, tp_size, tp_rank, self.total_num_kv_heads
+            )
         else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert self.total_num_heads % tp_size == 0
+            self.num_heads = self.total_num_heads // tp_size
+            if self.total_num_kv_heads >= tp_size:
+                # Number of KV heads is greater than TP size, so we partition
+                # the KV heads across multiple tensor parallel GPUs.
+                assert self.total_num_kv_heads % tp_size == 0
+            else:
+                # Number of KV heads is less than TP size, so we replicate
+                # the KV heads across multiple tensor parallel GPUs.
+                assert tp_size % self.total_num_kv_heads == 0
+            self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         # MistralConfig has an optional head_dim introduced by Mistral-Nemo
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads
@@ -180,6 +194,10 @@ class LlamaAttention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
+            # Uneven TP: the o_proj input dim is partitioned like the q
+            # heads in qkv_proj (kv-head units). Ignored on the default
+            # path (no shard plan installed).
+            tp_units=self.total_num_kv_heads,
         )
 
         self.rotary_emb = get_rope(
