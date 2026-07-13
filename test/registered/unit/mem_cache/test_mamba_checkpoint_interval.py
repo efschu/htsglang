@@ -578,6 +578,25 @@ class TestPoolClaimPoison(unittest.TestCase):
         maybe_poison_pool_data([f2], "test")  # env off -> no-op
         self.assertTrue(torch.all(f2 == 0))
 
+    def test_poison_helper_covers_fp8_as_uint8_storage(self):
+        # fp8 KV pools store their data as torch.uint8 (index_put lacks fp8
+        # support); the poison must cover them with 0xFF, which is NaN in
+        # both float8_e5m2 and float8_e4m3fn.
+        from sglang.srt.mem_cache.memory_pool import maybe_poison_pool_data
+
+        u = torch.zeros(8, dtype=torch.uint8)
+        i32 = torch.zeros(8, dtype=torch.int32)
+        with envs.SGLANG_POISON_POOL_DATA.override(True):
+            maybe_poison_pool_data([u, i32], "test")
+        self.assertTrue(torch.all(u == 0xFF))
+        self.assertTrue(torch.all(i32 == 0))  # non-uint8 ints stay semantic
+        for fp8_dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
+            decoded = u.view(fp8_dtype).float()
+            self.assertTrue(
+                torch.isnan(decoded).all(),
+                f"0xFF must decode to NaN under {fp8_dtype}",
+            )
+
 
 class _FakeSpecAlgo:
     def __init__(self, none):
