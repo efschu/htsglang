@@ -4229,6 +4229,34 @@ class ServerArgs:
             for r in range(self.tp_size)
         ]
 
+        # Custom all-reduce assumes symmetric peers: it allocates
+        # equal-sized IPC buffers on every rank and probes a full
+        # NVLink/P2P mesh. Heterogeneous cards (different NVML totals /
+        # compute capabilities), an uneven shard plan (per-rank tensor
+        # shapes differ by design) and co-located ranks (two processes,
+        # one device) all violate those assumptions — fall back to NCCL.
+        heterogeneous = (
+            len({mem_info[g][0] for g in set(self.rank_gpu_id)}) > 1
+        )
+        colocated = len(set(self.rank_gpu_id)) < len(self.rank_gpu_id)
+        uneven_plan = self.rank_tp_ratio is not None
+        if (
+            heterogeneous or colocated or uneven_plan
+        ) and not self.disable_custom_all_reduce:
+            reasons = []
+            if heterogeneous:
+                reasons.append("heterogeneous GPUs (different NVML totals)")
+            if colocated:
+                reasons.append("co-located ranks (shared physical GPU)")
+            if uneven_plan:
+                reasons.append("uneven shard plan (--rank-tp-ratio)")
+            self.disable_custom_all_reduce = True
+            logger.warning(
+                "Custom all-reduce is disabled for --rank-gpu-id: %s. "
+                "Falling back to NCCL for TP collectives.",
+                "; ".join(reasons),
+            )
+
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
         Configure GPU memory-dependent settings including
