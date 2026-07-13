@@ -725,6 +725,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.server_args.speculative_use_rejection_sampling,
                 )
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            # Sync per-step draft picks across TP ranks: per-rank
+            # next_token_logits differ in the last bits (especially on
+            # heterogeneous GPUs under uneven TP), so argmax/topk can flip on
+            # near-ties. A single divergent pick desynchronizes the draft
+            # chain inputs, the candidate tree, and ultimately the KV written
+            # during target verify across ranks. Broadcast from rank 0,
+            # mirroring the verify-result sync in eagle_utils.
+            from sglang.srt.distributed import get_tp_group
+            from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+            tp_group = (
+                get_parallel().attn_tp_group
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
+            if tp_group.world_size > 1:
+                tp_group.broadcast(topk_index, src=0)
+                tp_group.broadcast(topk_p, src=0)
             maybe_detect_oob(
                 topk_index,
                 0,

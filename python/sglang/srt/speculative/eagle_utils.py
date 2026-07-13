@@ -755,19 +755,21 @@ def eagle_sample(
             deterministic=True,
         )
 
-        # Sync sampling results across TP ranks: different GPUs may
-        # produce slightly different target_probs due to floating-point
-        # non-determinism in softmax/top_k/top_p, causing different
-        # sampled tokens. Broadcast from rank 0 to ensure consistency.
-        tp_group = (
-            get_parallel().attn_tp_group
-            if is_dp_attention_enabled()
-            else get_tp_group()
-        )
-        if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+    # Sync verify results across TP ranks: different GPUs may produce
+    # slightly different next_token_logits due to floating-point
+    # non-determinism, causing different sampled OR argmax'd tokens.
+    # This must cover the greedy branch too: on heterogeneous GPUs
+    # (uneven TP across different architectures) per-rank argmax flips on
+    # near-ties are common, and a single divergent accept desynchronizes
+    # KV/recurrent state across ranks for the rest of the sequence.
+    # Broadcast from rank 0 to ensure consistency.
+    tp_group = (
+        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+    )
+    if tp_group.world_size > 1:
+        tp_group.broadcast(predict, src=0)
+        tp_group.broadcast(accept_index, src=0)
+        tp_group.broadcast(num_correct_drafts, src=0)
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
