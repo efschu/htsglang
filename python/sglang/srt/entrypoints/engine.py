@@ -620,13 +620,27 @@ class Engine(EngineScoreMixin, EngineBase):
                 )
             )
 
+            if server_args.rank_gpu_id is not None:
+                # Explicit rank placement: every scheduler process must see
+                # exactly its assigned physical GPU (cuda:0 inside the
+                # process), so co-located ranks sharing one GPU stay
+                # unambiguous. maybe_reindex_device_id() below implements
+                # this isolation via CUDA_VISIBLE_DEVICES.
+                from sglang.srt.environ import envs
+
+                if not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
+                    envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.set(True)
+                    logger.info(
+                        "--rank-gpu-id is set: forcing "
+                        "SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1 so each "
+                        "scheduler process sees exactly one GPU."
+                    )
+
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
                     reader, writer = mp.Pipe(duplex=False)
-                    gpu_id = (
-                        server_args.base_gpu_id
-                        + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                        + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                    gpu_id = server_args.gpu_id_for_rank(
+                        pp_rank, tp_rank, pp_size_per_node, tp_size_per_node
                     )
                     attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
                         server_args, tp_rank
