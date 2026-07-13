@@ -121,6 +121,9 @@ class Qwen3_VisionMLP(nn.Module):
             prefix=add_prefix("linear_fc1", prefix),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            # Uneven TP: element-granular unit family; fc1 output and
+            # fc2 input share (total, units) and thus the same partition.
+            tp_units=hidden_features,
         )
         self.linear_fc2 = RowParallelLinear(
             hidden_features,
@@ -131,6 +134,7 @@ class Qwen3_VisionMLP(nn.Module):
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             use_dp_attention_reduce=is_dp_attention_enabled(),
+            tp_units=hidden_features,
         )
         self.act = ACT2FN[hidden_act]
 
@@ -281,6 +285,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             prefix=add_prefix("linear_fc1", prefix),
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            tp_units=self.padded_context_dim,
         )
         self.act_fn = nn.GELU()
         self.linear_fc2 = RowParallelLinear(
@@ -292,6 +297,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             use_dp_attention_reduce=is_dp_attention_enabled(),
+            tp_units=self.padded_context_dim,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
