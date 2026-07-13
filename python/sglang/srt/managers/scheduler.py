@@ -4351,6 +4351,17 @@ def configure_scheduler_process(
     if server_args.ep_size > 1:
         prefix += f" EP{moe_ep_rank}"
 
+    # Install the uneven-TP shard plan (--rank-tp-ratio) for this worker
+    # process before any model code runs. None (the default) keeps the
+    # classic even split everywhere.
+    from sglang.srt.distributed.utils import set_tp_partition_ratios
+
+    set_tp_partition_ratios(
+        server_args.rank_tp_ratio
+        if isinstance(server_args.rank_tp_ratio, list)
+        else None
+    )
+
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
