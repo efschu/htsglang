@@ -2241,6 +2241,20 @@ class ServerArgs:
         int,
         "The interval to track the mamba state during decode.",
     ] = 256
+    mamba_checkpoint_interval: A[
+        Optional[int],
+        "Pin ALL radix-cached mamba/GDN checkpoints to absolute multiples of "
+        "this token count (prefill snapshots, decode tracking, and prefix-"
+        "resume points). Off (None) by default: checkpoints then land on "
+        "traffic-dependent positions (prefill step ends relative to the "
+        "resume point), so the resume point of identical requests — and with "
+        "it greedy/temp=0 output — can drift run-to-run once the checkpoint "
+        "pool churns under mixed traffic. Setting a fixed interval makes the "
+        "checkpoint grid a pure function of the token history. Must be a "
+        "multiple of the page size and of the model's mamba/FLA chunk size; "
+        "overrides --mamba-track-interval to the same value. Recommended: "
+        "2048, or the chunked prefill size.",
+    ] = None
     enable_int8_mamba_checkpoint: A[
         bool,
         "Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
@@ -5301,12 +5315,100 @@ class ServerArgs:
         run_post_process_pass(self, _mamba_radix_cache_resolution)
         view = resolved_view(self)
         if not view.uses_mamba_radix_cache:
+            if self.mamba_checkpoint_interval is not None:
+                raise ValueError(
+                    "--mamba-checkpoint-interval only applies to models that "
+                    "use the hybrid-mamba radix cache; this model "
+                    f"({model_arch}) does not."
+                )
             return
+
+        self._handle_mamba_checkpoint_interval(view)
 
         if mamba_extra_buffer_of(view):
             self._validate_mamba_extra_buffer(view, model_arch)
         else:
             self._validate_mamba_no_buffer(view, model_arch)
+
+    def _handle_mamba_checkpoint_interval(self, view) -> None:
+        """Validate --mamba-checkpoint-interval and unify the tracking grid.
+
+        When set, every mamba/GDN checkpoint position (prefill snapshot,
+        decode track, prefix resume) is an absolute multiple of the
+        interval, so the checkpoint grid is a pure function of the token
+        history instead of the traffic-dependent prefill split. The decode
+        grid is unified by forcing mamba_track_interval to the same value.
+        Idempotent: runs at every legacy validation slot.
+        """
+        interval = self.mamba_checkpoint_interval
+        if interval is None:
+            return
+        if self.disable_radix_cache:
+            raise ValueError(
+                "--mamba-checkpoint-interval requires the (mamba) radix "
+                "cache; remove --disable-radix-cache."
+            )
+        if self.enable_hierarchical_cache:
+            raise ValueError(
+                "--mamba-checkpoint-interval does not support "
+                "--enable-hierarchical-cache yet (HiMambaRadixCache has its "
+                "own match/evict paths)."
+            )
+        if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+            raise ValueError(
+                "--mamba-checkpoint-interval does not support the unified "
+                "radix tree yet (its mamba component has its own match/"
+                "branching path)."
+            )
+        if interval <= 0:
+            raise ValueError(
+                f"--mamba-checkpoint-interval must be positive, got {interval}."
+            )
+        chunk_size = self.mamba_cache_chunk_size
+        if chunk_size is not None and interval % chunk_size != 0:
+            raise ValueError(
+                f"--mamba-checkpoint-interval ({interval}) must be a "
+                f"multiple of the mamba/FLA cache chunk size ({chunk_size}): "
+                "mid-step state snapshots only exist at chunk-aligned "
+                "offsets."
+            )
+        page_size = view.page_size
+        if page_size is not None and interval % page_size != 0:
+            raise ValueError(
+                f"--mamba-checkpoint-interval ({interval}) must be a "
+                f"multiple of --page-size ({page_size})."
+            )
+        if (
+            self.chunked_prefill_size is not None
+            and self.chunked_prefill_size > 0
+            and interval > self.chunked_prefill_size
+        ):
+            raise ValueError(
+                f"--mamba-checkpoint-interval ({interval}) must not exceed "
+                f"--chunked-prefill-size ({self.chunked_prefill_size}): "
+                "prefill steps are clipped to checkpoint boundaries and "
+                "could never reach one."
+            )
+        if view.mamba_track_interval != interval:
+            if view.mamba_track_interval != 256:
+                # 256 is the field default; any other value was set on purpose.
+                raise ValueError(
+                    "--mamba-track-interval "
+                    f"({view.mamba_track_interval}) conflicts with "
+                    f"--mamba-checkpoint-interval ({interval}); the "
+                    "checkpoint interval owns the whole tracking grid, drop "
+                    "the explicit --mamba-track-interval."
+                )
+            logger.info(
+                "mamba checkpoint interval: overriding --mamba-track-interval "
+                "%d -> %d so decode tracking lands on the checkpoint grid.",
+                view.mamba_track_interval,
+                interval,
+            )
+            self.override(
+                "mamba_checkpoint_interval.track_grid",
+                mamba_track_interval=interval,
+            )
 
     def _handle_sampling_backend(self):
         # Moved to the resolution pipeline (arg_groups/overrides.py:
