@@ -97,17 +97,47 @@ class HostLRUList(LRUList):
 class HiMambaRadixCache(MambaRadixCache):
     """Hierarchical cache for hybrid Mamba models."""
 
+    @staticmethod
+    def normalize_hicache_args(server_args: ServerArgs) -> None:
+        """Normalize the HiCache layout/IO knobs to the one combination
+        the hybrid-Mamba host pool supports.
+
+        MambaPoolHost only supports the ``page_first_direct`` layout (the
+        write-back staging kernel is incompatible with the mamba state
+        pool), and ``page_first_direct`` in turn requires the ``direct``
+        IO backend. With the stock defaults (``page_first`` + ``kernel``)
+        hybrid-model HiCache would otherwise crash deep in the pool
+        assembly — normalize with a warning up front instead.
+        """
+        if server_args.hicache_mem_layout != "page_first_direct":
+            logger.warning(
+                "Hybrid-Mamba HiCache (HiMambaRadixCache) only supports the "
+                "page_first_direct host layout; switching from %s.",
+                server_args.hicache_mem_layout,
+            )
+            server_args.override(
+                "hicache.hybrid_mamba_layout",
+                hicache_mem_layout="page_first_direct",
+            )
+        if server_args.hicache_io_backend == "kernel":
+            logger.warning(
+                "The kernel IO backend does not support the page_first_direct "
+                "layout required by hybrid-Mamba HiCache; switching to the "
+                "direct IO backend."
+            )
+            server_args.override(
+                "hicache.hybrid_mamba_io", hicache_io_backend="direct"
+            )
+        elif server_args.hicache_io_backend not in ("direct",):
+            logger.warning(
+                "Hybrid-Mamba HiCache is only validated with the direct IO "
+                "backend; keeping %s (page_first_direct layout is enforced).",
+                server_args.hicache_io_backend,
+            )
+
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
-        if server_args.hicache_io_backend == "direct":
-            if server_args.hicache_mem_layout == "page_first":
-                server_args.override(
-                    "hicache.mem_layout_force", hicache_mem_layout="page_first_direct"
-                )
-                logger.warning(
-                    "Page first layout is not supported with direct IO backend, "
-                    "switching to page first direct layout"
-                )
+        self.normalize_hicache_args(server_args)
 
         self.page_size = params.page_size
         self.hybrid_kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
