@@ -122,6 +122,30 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
+def _broadcast_draft_picks(*tensors: Optional[torch.Tensor]) -> None:
+    """Sync per-rank draft decisions from TP rank 0.
+
+    Per-rank logits differ in the last bits (especially on heterogeneous
+    GPUs under uneven TP), so argmax/topk/sampling can flip on near-ties.
+    Any pick that feeds the draft chain, the candidate tree, or the verify
+    input must therefore be identical on every rank — a single divergent
+    pick silently desynchronizes the KV / recurrent state across ranks for
+    the rest of the sequence. Mirrors the verify-result sync in
+    eagle_utils.eagle_sample.
+    """
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+    tp_group = (
+        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+    )
+    if tp_group.world_size == 1:
+        return
+    for t in tensors:
+        if t is not None:
+            tp_group.broadcast(t, src=0)
+
+
 def _get_plan_stream(
     device: str,
 ) -> Tuple[any, contextlib.AbstractContextManager]:
@@ -725,24 +749,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.server_args.speculative_use_rejection_sampling,
                 )
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            # Sync per-step draft picks across TP ranks: per-rank
-            # next_token_logits differ in the last bits (especially on
-            # heterogeneous GPUs under uneven TP), so argmax/topk can flip on
-            # near-ties. A single divergent pick desynchronizes the draft
-            # chain inputs, the candidate tree, and ultimately the KV written
-            # during target verify across ranks. Broadcast from rank 0,
-            # mirroring the verify-result sync in eagle_utils.
-            from sglang.srt.distributed import get_tp_group
-            from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-
-            tp_group = (
-                get_parallel().attn_tp_group
-                if is_dp_attention_enabled()
-                else get_tp_group()
+            # Sync per-step draft picks across TP ranks (see
+            # _broadcast_draft_picks). draft_probs (rejection sampling) feeds
+            # the verify accept decision and must match too.
+            _broadcast_draft_picks(
+                topk_index,
+                topk_p,
+                (
+                    draft_probs_list[-1]
+                    if self.server_args.speculative_use_rejection_sampling
+                    else None
+                ),
             )
-            if tp_group.world_size > 1:
-                tp_group.broadcast(topk_index, src=0)
-                tp_group.broadcast(topk_p, src=0)
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -891,6 +909,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk_p, topk_index = fast_sample(probs, num_samples=1)
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        # The step-0 pick of the first draft round after prefill: must be
+        # rank-consistent like every other pick (see _broadcast_draft_picks).
+        _broadcast_draft_picks(
+            topk_index, topk_p, probs if use_rejection_sampling else None
+        )
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -1047,6 +1070,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None
+        # The step-0 pick for the NEXT draft round (runs every decode
+        # iteration, outside any cuda graph — "selected-row topk is owned by
+        # the worker"): the per-rank argmax/topk/sample here was the last
+        # unsynced decision point after the in-loop and verify syncs.
+        _broadcast_draft_picks(ret_topk_index, ret_topk_p, ret_draft_probs)
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
