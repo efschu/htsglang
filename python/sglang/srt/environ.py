@@ -667,6 +667,15 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # #50 root fix: zero every flashinfer float workspace when a request
+    # finishes. The fa2 split-KV kernels read workspace regions the current
+    # forward did not write; on a fresh boot those read as first-touch zeros
+    # (the contract the kernels were validated against), afterwards as the
+    # previous request's partials — making outputs a function of the request
+    # ordinal (greedy near-tie flips; degenerate fixed point under cuda
+    # graphs). One ~384 MiB memset per finished request (~0.5 ms). Set 0 to
+    # restore the old (nondeterministic-across-requests) behavior.
+    SGLANG_FLASHINFER_ZERO_WORKSPACE_PER_REQUEST = EnvBool(True)
     # Enable NVFP4 per-token activation scaling path for FlashInfer TRT-LLM MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.

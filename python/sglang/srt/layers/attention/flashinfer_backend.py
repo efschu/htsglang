@@ -11,6 +11,7 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 
 import logging
 import os
+import weakref
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -175,6 +176,46 @@ class PrefillMetadata:
 # flashinfer sizing drift across versions). Sizing logic lives in
 # FlashInferAttnBackend._full_cg_prefill_workspace_bytes.
 FULL_CG_PREFILL_WORKSPACE_MARGIN = 1.25
+
+# Every allocated flashinfer float workspace (the shared global one, private
+# init_new_workspace ones, the dedicated full-CG prefill one). Weak refs: the
+# registry must not extend buffer lifetimes across re-inits.
+_WORKSPACE_BUFFERS: "weakref.WeakSet[torch.Tensor]" = weakref.WeakSet()
+
+
+def register_flashinfer_workspace_buffer(buf: torch.Tensor) -> torch.Tensor:
+    """Track a flashinfer float-workspace allocation for the per-request
+    zeroing contract (see zero_flashinfer_workspaces)."""
+    _WORKSPACE_BUFFERS.add(buf)
+    return buf
+
+
+def zero_flashinfer_workspaces() -> int:
+    """Zero every registered flashinfer float workspace; returns the count.
+
+    Root fix for #50's cross-request nondeterminism: the fa2 split-KV
+    kernels' partial/merge scratch lives in these persistent workspaces,
+    allocated as torch.empty and shared across every wrapper (target +
+    draft + per-step spec backends). The attention path reads workspace
+    regions the current forward did not write (proven by the round-11 GPU
+    bisection: zeroing exactly _float_workspace_buffer after each request
+    flattens the request-ordinal output sequence at the natural run-1
+    value; int workspace / kv_lens wipes do not). On a fresh boot those
+    regions are first-touch-zero cudaMalloc pages — i.e. the kernels were
+    only ever validated against a zeroed workspace. Restoring that boot
+    state at request boundaries makes every request see the same workspace
+    contract instead of the previous request's residue.
+
+    Called at request-finish (scheduler); a 384 MiB memset is ~0.5 ms per
+    finished request — negligible against request latency. Within-request
+    residue remains, but it is a deterministic function of the request
+    itself, so run-to-run bit-stability is unaffected.
+    """
+    n = 0
+    for buf in list(_WORKSPACE_BUFFERS):
+        buf.zero_()
+        n += 1
+    return n
 
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
@@ -383,20 +424,30 @@ class FlashInferAttnBackend(AttentionBackend):
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
 
         # Allocate buffers
-        # different from flashinfer zero_init_global_workspace_buffer
-        global_workspace_buffer = get_buffer(
-            "flashinfer_workspace",
-            lambda: torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
-            ),
+        # different from flashinfer zero_init_global_workspace_buffer.
+        # NOTE(#50): torch.empty is fine at boot ONLY because fresh cudaMalloc
+        # pages read as zeros (first touch); the split-KV kernels read
+        # workspace regions the current forward did not write, so the zeroed
+        # state is the contract they were validated against. It is restored
+        # at request boundaries via zero_flashinfer_workspaces() — every
+        # workspace allocation below must be registered.
+        global_workspace_buffer = register_flashinfer_workspace_buffer(
+            get_buffer(
+                "flashinfer_workspace",
+                lambda: torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                ),
+            )
         )
         if init_new_workspace:
-            self.workspace_buffer = torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
+            self.workspace_buffer = register_flashinfer_workspace_buffer(
+                torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
             )
         else:
             self.workspace_buffer = global_workspace_buffer
@@ -1030,8 +1081,8 @@ class FlashInferAttnBackend(AttentionBackend):
             max_num_tokens,
             num_slots,
         )
-        self.full_cg_prefill_workspace_buffer = torch.empty(
-            workspace_bytes, dtype=torch.uint8, device=device
+        self.full_cg_prefill_workspace_buffer = register_flashinfer_workspace_buffer(
+            torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
         )
         self.full_cg_prefill_qo_indptr = [
             torch.zeros((num_slots + 1,), dtype=torch.int32, device=device)
