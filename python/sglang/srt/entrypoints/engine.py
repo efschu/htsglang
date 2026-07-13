@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import dataclasses
+from collections import Counter
 import logging
 import multiprocessing as mp
 import os
@@ -635,6 +636,11 @@ class Engine(EngineScoreMixin, EngineBase):
                         "SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1 so each "
                         "scheduler process sees exactly one GPU."
                     )
+
+                # If ranks are co-located on a physical GPU, configure NCCL
+                # env vars here (parent process) so the spawned scheduler
+                # processes inherit them.
+                _configure_nccl_env_for_colocation(server_args)
 
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
@@ -1409,6 +1415,73 @@ def _wait_for_scheduler_ready(
                     raise _scheduler_died_error(j, scheduler_procs[j])
 
     return scheduler_infos
+
+
+def _configure_nccl_env_for_colocation(server_args: ServerArgs) -> None:
+    """Configure NCCL env vars when --rank-gpu-id co-locates ranks on one GPU.
+
+    Must run in the parent process BEFORE the scheduler processes are
+    spawned so the environment variables are inherited by every worker.
+    Each variable is only set if the user has not set it already
+    (user-provided values always win):
+
+    - NCCL_MULTI_RANK_GPU_ENABLE=1: allow several NCCL ranks to map onto
+      the same physical GPU (NCCL >= 2.28; older NCCL ignores it and
+      fails later with a clear "Duplicate GPU detected" error).
+    - NCCL_NVLS_ENABLE=0: NVLS (NVLink SHARP) registration is not valid
+      when two ranks share a device. NCCL's default of 2 silently
+      disables NVLS in unsupported topologies, but we set 0 explicitly
+      (with a warning) instead of relying on that silent fallback.
+    - NCCL_MAX_CTAS: heuristically capped to max(1, 8 // max_colocated)
+      so co-located ranks' NCCL kernels leave SM headroom for each other.
+      Override by exporting NCCL_MAX_CTAS yourself.
+    """
+    rank_gpu_id = server_args.rank_gpu_id
+    if rank_gpu_id is None or len(rank_gpu_id) == len(set(rank_gpu_id)):
+        return
+
+    max_colocated = max(Counter(rank_gpu_id).values())
+
+    if os.environ.get("NCCL_MULTI_RANK_GPU_ENABLE") is None:
+        os.environ["NCCL_MULTI_RANK_GPU_ENABLE"] = "1"
+        logger.info(
+            "--rank-gpu-id co-locates ranks on one physical GPU: setting "
+            "NCCL_MULTI_RANK_GPU_ENABLE=1 (requires NCCL >= 2.28)."
+        )
+    if os.environ.get("NCCL_NVLS_ENABLE") is None:
+        os.environ["NCCL_NVLS_ENABLE"] = "0"
+        logger.warning(
+            "--rank-gpu-id co-locates ranks on one physical GPU: setting "
+            "NCCL_NVLS_ENABLE=0 (NVLS is unsupported with multiple ranks "
+            "per GPU; disabling explicitly instead of relying on NCCL's "
+            "silent fallback). Export NCCL_NVLS_ENABLE to override."
+        )
+    if os.environ.get("NCCL_MAX_CTAS") is None:
+        suggested_max_ctas = max(1, 8 // max_colocated)
+        os.environ["NCCL_MAX_CTAS"] = str(suggested_max_ctas)
+        logger.info(
+            "--rank-gpu-id co-locates up to %d ranks per physical GPU: "
+            "capping NCCL_MAX_CTAS=%d so NCCL kernels of co-located ranks "
+            "leave SM headroom for each other. Export NCCL_MAX_CTAS to "
+            "override.",
+            max_colocated,
+            suggested_max_ctas,
+        )
+
+    # Without CUDA MPS, processes sharing a GPU are TIME-SLICED: their
+    # kernels never run concurrently, but NCCL collectives busy-spin
+    # waiting for the peer rank. Measured impact on the vLLM sibling of
+    # this feature: ~3 tok/s without MPS vs ~78 tok/s with MPS (>20x).
+    mps_pipe_dir = os.environ.get("CUDA_MPS_PIPE_DIRECTORY", "/tmp/nvidia-mps")
+    if not os.path.exists(mps_pipe_dir):
+        logger.warning(
+            "Multiple ranks share a physical GPU but the CUDA MPS control "
+            "pipe (%s) was not found. Without MPS, co-located ranks are "
+            "time-sliced and NCCL collectives become extremely slow (>20x "
+            "slowdown). Start MPS with 'nvidia-cuda-mps-control -d' before "
+            "launching sglang.",
+            mps_pipe_dir,
+        )
 
 
 def _calculate_rank_ranges(
