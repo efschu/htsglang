@@ -29,7 +29,7 @@ import socket
 import tempfile
 import uuid
 from functools import cached_property
-from typing import Any, Callable, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import A, Arg, add_cli_args_from_dataclass
@@ -402,6 +402,103 @@ def add_rl_on_policy_target_choices(choices):
 
 def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
+
+
+# -----------------------------------------------------------------------------
+# Heterogeneous rank placement / uneven TP (--rank-gpu-id, --rank-tp-ratio)
+# -----------------------------------------------------------------------------
+
+
+def _parse_int_list(value: str) -> List[int]:
+    """Parse a comma-separated integer list ("0,0,1" -> [0, 0, 1])."""
+    return [int(part.strip()) for part in value.split(",")]
+
+
+def _parse_mib_scalar_or_list(value: str) -> Union[int, List[int]]:
+    """Parse a MiB budget: a single scalar or a comma-separated list."""
+    if "," in value:
+        return [int(part.strip()) for part in value.split(",")]
+    return int(value)
+
+
+def _parse_rank_tp_ratio(value: str) -> Union[str, List[int]]:
+    """Parse --rank-tp-ratio: 'auto' or a comma-separated integer list."""
+    if value.strip() == "auto":
+        return "auto"
+    return [int(part.strip()) for part in value.split(",")]
+
+
+def _torch_to_nvml_gpu_index_mapping() -> Dict[int, int]:
+    """CUDA device index -> NVML physical index, bridged via PCI bus IDs.
+
+    torch.cuda/CUDA_VISIBLE_DEVICES and NVML/nvidia-smi can enumerate GPUs
+    in different orders (CUDA defaults to FASTEST_FIRST, NVML to PCI bus
+    order), so NVML memory queries must not blindly reuse CUDA indices.
+    Returns {} when the mapping cannot be resolved (no CUDA support);
+    callers then fall back to identity.
+    """
+    try:
+        import pynvml
+        import torch
+
+        if not torch.cuda.is_available():
+            return {}
+        pynvml.nvmlInit()
+        try:
+            nvml_bus_to_idx: Dict[int, int] = {}
+            for nvml_idx in range(pynvml.nvmlDeviceGetCount()):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_idx)
+                bus_id = pynvml.nvmlDeviceGetPciInfo(handle).busId
+                if isinstance(bus_id, bytes):
+                    bus_id = bus_id.decode("utf-8")
+                # Extract the bus number (format: "00000000:BB:00.0").
+                bus_num = int(bus_id.split(":")[1], 16)
+                nvml_bus_to_idx[bus_num] = nvml_idx
+
+            mapping: Dict[int, int] = {}
+            for torch_idx in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(torch_idx)
+                bus_num = getattr(props, "pci_bus_id", None)
+                if bus_num in nvml_bus_to_idx:
+                    mapping[torch_idx] = nvml_bus_to_idx[bus_num]
+            return mapping
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as e:
+        logger.warning(
+            "Could not resolve the CUDA -> NVML device index mapping (%s); "
+            "assuming identical enumeration orders.",
+            e,
+        )
+        return {}
+
+
+def _query_rank_gpu_memory_mib(gpu_ids) -> Dict[int, Tuple[int, int]]:
+    """NVML (total_mib, free_mib) for each CUDA device index in `gpu_ids`.
+
+    Raises ValueError for indices that NVML cannot resolve.
+    """
+    import pynvml
+
+    mapping = _torch_to_nvml_gpu_index_mapping()
+    pynvml.nvmlInit()
+    try:
+        device_count = pynvml.nvmlDeviceGetCount()
+        result: Dict[int, Tuple[int, int]] = {}
+        for gpu_id in sorted(set(gpu_ids)):
+            nvml_idx = mapping.get(gpu_id, gpu_id)
+            if gpu_id < 0 or nvml_idx < 0 or nvml_idx >= device_count:
+                raise ValueError(
+                    f"--rank-gpu-id names GPU {gpu_id}, but NVML only "
+                    f"reports {device_count} device(s) "
+                    f"(indices 0-{device_count - 1})."
+                )
+            handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_idx)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            result[gpu_id] = (mem.total // 2**20, mem.free // 2**20)
+        return result
+    finally:
+        pynvml.nvmlShutdown()
 
 
 @dataclasses.dataclass
@@ -1010,6 +1107,69 @@ class ServerArgs:
         int,
         "The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,...",
     ] = 1
+    # Heterogeneous rank placement and uneven tensor parallelism. These flags
+    # replace the base_gpu_id/gpu_id_step formula with an explicit
+    # rank -> GPU mapping and (optionally) proportional TP shard sizes.
+    rank_gpu_id: A[
+        Optional[List[int]],
+        Arg(
+            help="Comma-separated GPU device indices, one per tensor-parallel "
+            "rank (CUDA device order as seen by torch.cuda, which is not "
+            "necessarily the nvidia-smi/NVML order). Duplicates co-locate "
+            "several ranks on one physical GPU. Length must equal --tp-size. "
+            "Replaces the --base-gpu-id/--gpu-id-step formula; requires "
+            "--rank-gpu-memory-mib (or --rank-tp-ratio auto). Only pure "
+            "single-node tensor parallelism is supported. "
+            "Example: --rank-gpu-id 0,0,1,2 (TP=4, two ranks share GPU 0).",
+            type_parser=_parse_int_list,
+        ),
+    ] = None
+    rank_gpu_memory_mib: A[
+        Optional[Union[int, List[int]]],
+        Arg(
+            help="Absolute memory budget in MiB per rank when --rank-gpu-id "
+            "is set. A single scalar applies uniformly to every rank (even "
+            "TP: all shards are structurally equal). With --rank-tp-ratio a "
+            "comma-separated per-rank list may be given instead (e.g. "
+            "26000,17000,17000), since shards then differ in size. The value "
+            "is each rank's ENTIRE budget — no additional utilization "
+            "ceiling or safety margin is applied on top; leaving headroom "
+            "for the CUDA context is the user's responsibility. Required "
+            "when --rank-gpu-id is set, except with --rank-tp-ratio auto "
+            "(budgets are then derived from the NVML totals). Conflicts "
+            "with an explicitly set --mem-fraction-static.",
+            type_parser=_parse_mib_scalar_or_list,
+        ),
+    ] = None
+    rank_tp_ratio: A[
+        Optional[Union[List[int], str]],
+        Arg(
+            help="UNEVEN tensor parallelism: comma-separated positive integer "
+            "weights, one per rank (length must equal --tp-size), or 'auto'. "
+            "Example: 2,1,1 gives rank 0 half of every sharded dimension and "
+            "ranks 1/2 a quarter each — one large GPU plus two smaller ones. "
+            "sum(weights) must divide every sharded dimension. 'auto' "
+            "derives the weights from the --rank-gpu-memory-mib list, or, "
+            "when that is omitted, from the NVML totals of the GPUs named "
+            "in --rank-gpu-id (minus --rank-auto-reserve-mib). Requires "
+            "--rank-gpu-id.",
+            type_parser=_parse_rank_tp_ratio,
+        ),
+    ] = None
+    rank_auto_reserve_mib: A[
+        Union[int, str],
+        Arg(
+            help="Headroom (MiB) subtracted from the NVML total when "
+            "--rank-tp-ratio auto derives the memory budgets itself. Either "
+            "a single value applied to every GPU, or a comma-separated list "
+            "with one value per rank (aligned with --rank-gpu-id). When "
+            "several ranks share one physical GPU, the largest reserve "
+            "among them applies to that GPU. Covers the CUDA context plus "
+            "allocations that appear lazily after KV sizing (NCCL buffers, "
+            "attention workspaces). Only valid with --rank-tp-ratio auto.",
+            type_parser=str,
+        ),
+    ] = 2048
     random_seed: A[Optional[int], "The random seed."] = None
     watchdog_timeout: A[
         float,
@@ -2843,6 +3003,11 @@ class ServerArgs:
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
+        # Validate heterogeneous rank placement / uneven TP flags. Must run
+        # before _handle_gpu_memory_settings so an explicitly passed
+        # --mem-fraction-static is still distinguishable (None = unset).
+        self._handle_uneven_tp()
+
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
 
@@ -3722,6 +3887,306 @@ class ServerArgs:
             f"Please set --attention-backend flashinfer when using --enable-mis. "
             f"Current backends: prefill={prefill_backend}, decode={decode_backend}"
         )
+
+    def gpu_id_for_rank(
+        self,
+        pp_rank: int,
+        tp_rank: int,
+        pp_size_per_node: int,
+        tp_size_per_node: int,
+    ) -> int:
+        """GPU device index for a scheduler process.
+
+        With --rank-gpu-id the explicit per-rank mapping wins (pure TP:
+        pp_rank is always 0 in that mode); otherwise the classic
+        base_gpu_id/gpu_id_step formula applies unchanged.
+        """
+        if self.rank_gpu_id is not None:
+            return self.rank_gpu_id[tp_rank]
+        return (
+            self.base_gpu_id
+            + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+            + (tp_rank % tp_size_per_node) * self.gpu_id_step
+        )
+
+    #: Default NVML-total headroom (MiB) reserved per GPU when
+    #: --rank-tp-ratio auto derives the budgets itself (CUDA context,
+    #: fragmentation, lazily appearing NCCL/attention buffers).
+    AUTO_RANK_MEMORY_RESERVE_MIB = 2048
+
+    def _resolve_auto_rank_tp_ratio(self):
+        """--rank-tp-ratio auto: fill the available VRAM as well as
+        possible. Budgets default to each assigned GPU's NVML total minus
+        a fixed reserve (shared between co-located ranks); the weights are
+        the gcd-reduced budgets — capacity is maximized when each rank's
+        share of every sharded dimension is proportional to its memory
+        budget. Explicit integer weights keep working unchanged."""
+        if self.rank_gpu_id is None:
+            raise ValueError("--rank-tp-ratio auto requires --rank-gpu-id.")
+
+        if self.rank_gpu_memory_mib is None:
+            from collections import Counter
+
+            # --rank-auto-reserve-mib: single value for every GPU, or one
+            # value per rank (aligned with --rank-gpu-id).
+            try:
+                reserve_per_rank = [
+                    int(part) for part in str(self.rank_auto_reserve_mib).split(",")
+                ]
+            except ValueError as e:
+                raise ValueError(
+                    "--rank-auto-reserve-mib must be an integer or a "
+                    "comma-separated list of integers, got "
+                    f"{self.rank_auto_reserve_mib!r}."
+                ) from e
+            if len(reserve_per_rank) == 1:
+                reserve_per_rank *= len(self.rank_gpu_id)
+            if len(reserve_per_rank) != len(self.rank_gpu_id):
+                raise ValueError(
+                    f"--rank-auto-reserve-mib has {len(reserve_per_rank)} "
+                    f"entries but --rank-gpu-id names "
+                    f"{len(self.rank_gpu_id)} ranks; pass one value or "
+                    "exactly one per rank."
+                )
+            if any(r < 0 for r in reserve_per_rank):
+                raise ValueError(
+                    "--rank-auto-reserve-mib values must be >= 0, got "
+                    f"{reserve_per_rank}."
+                )
+            # The reserve is a per-physical-GPU property: if co-located
+            # ranks disagree, the largest requested headroom wins.
+            reserve_per_gpu: Dict[int, int] = {}
+            for gpu_id, res in zip(self.rank_gpu_id, reserve_per_rank):
+                reserve_per_gpu[gpu_id] = max(reserve_per_gpu.get(gpu_id, 0), res)
+
+            counts = Counter(self.rank_gpu_id)
+            mem_info = _query_rank_gpu_memory_mib(self.rank_gpu_id)
+            budgets = []
+            for gpu_id in self.rank_gpu_id:
+                total_mib, free_mib = mem_info[gpu_id]
+                # The budget can never exceed what is actually free when
+                # the worker checks it — and the worker checks AFTER
+                # creating its own CUDA context, so cap at "free now minus
+                # a context allowance". reserve=0 therefore means "use
+                # everything that is free now, minus the worker's own
+                # context".
+                budget = (
+                    min(total_mib - reserve_per_gpu[gpu_id], free_mib - 1024)
+                    // counts[gpu_id]
+                )
+                if budget <= 0:
+                    raise ValueError(
+                        f"--rank-auto-reserve-mib "
+                        f"{reserve_per_gpu[gpu_id]} MiB leaves no budget "
+                        f"on GPU {gpu_id} (NVML total {total_mib} MiB, "
+                        f"{counts[gpu_id]} rank(s))."
+                    )
+                budgets.append(budget)
+            self.rank_gpu_memory_mib = budgets
+            logger.info(
+                "--rank-tp-ratio auto: derived memory budgets %s MiB from "
+                "NVML totals (reserve per GPU: %s MiB).",
+                budgets,
+                {g: r for g, r in sorted(reserve_per_gpu.items())},
+            )
+
+        budgets = (
+            list(self.rank_gpu_memory_mib)
+            if isinstance(self.rank_gpu_memory_mib, list)
+            else [self.rank_gpu_memory_mib] * self.tp_size
+        )
+        g = math.gcd(*budgets)
+        weights = [b // g for b in budgets]
+        if len(set(weights)) == 1:
+            logger.info(
+                "--rank-tp-ratio auto: budgets are uniform, using the "
+                "classic even split."
+            )
+            self.rank_tp_ratio = None
+            if isinstance(self.rank_gpu_memory_mib, list):
+                # The even split takes a single scalar budget (a per-rank
+                # list requires a ratio); uniform weights imply equal
+                # budgets, so collapsing to min() is lossless.
+                self.rank_gpu_memory_mib = min(self.rank_gpu_memory_mib)
+            return
+        self.rank_tp_ratio = weights
+        logger.info(
+            "--rank-tp-ratio auto: derived weights %s from memory budgets "
+            "%s MiB.",
+            weights,
+            budgets,
+        )
+
+    def _handle_uneven_tp(self):
+        """Validate --rank-gpu-id / --rank-gpu-memory-mib / --rank-tp-ratio
+        (heterogeneous rank placement and uneven tensor parallelism).
+
+        Fail-fast validation:
+        1. --rank-tp-ratio 'auto' resolution (may derive budgets via NVML)
+        2. Mutual requirement: --rank-gpu-id <-> --rank-gpu-memory-mib
+        3. Lengths vs --tp-size; positive weights/budgets
+        4. Pure single-node TP only (no PP/DP/EP, nnodes == 1)
+        5. Conflicts: explicit --mem-fraction-static, --base-gpu-id/--gpu-id-step
+        6. Physical impossibility: sum of co-located budgets <= NVML total
+
+        Must run before _handle_gpu_memory_settings so an explicitly passed
+        --mem-fraction-static is still distinguishable (None = unset).
+        No-op when none of the flags is used — the default path stays
+        unchanged.
+        """
+        ratio_was_auto = self.rank_tp_ratio == "auto"
+
+        if (
+            self.rank_gpu_id is None
+            and self.rank_gpu_memory_mib is None
+            and self.rank_tp_ratio is None
+        ):
+            if str(self.rank_auto_reserve_mib) != str(
+                ServerArgs.AUTO_RANK_MEMORY_RESERVE_MIB
+            ):
+                raise ValueError(
+                    "--rank-auto-reserve-mib only applies with "
+                    "--rank-tp-ratio auto."
+                )
+            return
+
+        # Resolve 'auto' BEFORE the mutual-requirement checks (auto may
+        # omit --rank-gpu-memory-mib and derive it from NVML).
+        if ratio_was_auto:
+            self._resolve_auto_rank_tp_ratio()
+        elif isinstance(self.rank_tp_ratio, str):
+            raise ValueError(
+                f"Invalid --rank-tp-ratio value {self.rank_tp_ratio!r}: "
+                "expected a comma-separated integer list or 'auto'."
+            )
+        if not ratio_was_auto and str(self.rank_auto_reserve_mib) != str(
+            ServerArgs.AUTO_RANK_MEMORY_RESERVE_MIB
+        ):
+            raise ValueError(
+                "--rank-auto-reserve-mib only applies with --rank-tp-ratio auto."
+            )
+
+        # Mutual requirements.
+        if self.rank_gpu_id is None and self.rank_gpu_memory_mib is not None:
+            raise ValueError("--rank-gpu-memory-mib requires --rank-gpu-id to be set.")
+        if self.rank_gpu_memory_mib is None and self.rank_gpu_id is not None:
+            raise ValueError(
+                "--rank-gpu-id requires --rank-gpu-memory-mib to be set "
+                "(or --rank-tp-ratio auto to derive the budgets from NVML)."
+            )
+        if self.rank_tp_ratio is not None and self.rank_gpu_id is None:
+            raise ValueError("--rank-tp-ratio requires --rank-gpu-id to be set.")
+        if self.rank_gpu_id is None:
+            return
+
+        # Length vs tp_size.
+        if len(self.rank_gpu_id) != self.tp_size:
+            raise ValueError(
+                f"--rank-gpu-id length ({len(self.rank_gpu_id)}) must equal "
+                f"--tp-size ({self.tp_size})."
+            )
+        if any(g < 0 for g in self.rank_gpu_id):
+            raise ValueError(
+                f"--rank-gpu-id entries must be >= 0, got {self.rank_gpu_id}."
+            )
+
+        # Uneven-TP ratio checks.
+        if self.rank_tp_ratio is not None:
+            if len(self.rank_tp_ratio) != self.tp_size:
+                raise ValueError(
+                    f"--rank-tp-ratio length ({len(self.rank_tp_ratio)}) "
+                    f"must equal --tp-size ({self.tp_size})."
+                )
+            if any(not isinstance(r, int) or r <= 0 for r in self.rank_tp_ratio):
+                raise ValueError(
+                    "--rank-tp-ratio entries must be positive integers, "
+                    f"got {self.rank_tp_ratio}."
+                )
+            if len(set(self.rank_tp_ratio)) == 1:
+                raise ValueError(
+                    "--rank-tp-ratio with identical entries is the even "
+                    "split — omit the flag instead."
+                )
+
+        # Per-rank MiB list checks.
+        if isinstance(self.rank_gpu_memory_mib, list):
+            if self.rank_tp_ratio is None:
+                raise ValueError(
+                    "--rank-gpu-memory-mib as a list requires "
+                    "--rank-tp-ratio (with even TP all ranks are "
+                    "structurally equal — use a single scalar)."
+                )
+            if len(self.rank_gpu_memory_mib) != self.tp_size:
+                raise ValueError(
+                    f"--rank-gpu-memory-mib list length "
+                    f"({len(self.rank_gpu_memory_mib)}) must equal "
+                    f"--tp-size ({self.tp_size})."
+                )
+            if any(m <= 0 for m in self.rank_gpu_memory_mib):
+                raise ValueError("--rank-gpu-memory-mib entries must be positive.")
+        elif self.rank_gpu_memory_mib <= 0:
+            raise ValueError("--rank-gpu-memory-mib must be positive.")
+
+        # Only pure single-node tensor parallelism is supported.
+        if self.pp_size > 1:
+            raise ValueError(
+                f"--rank-gpu-id is not compatible with --pp-size > 1 "
+                f"(current: {self.pp_size}). Only pure tensor parallelism "
+                "is supported."
+            )
+        if self.dp_size > 1:
+            raise ValueError(
+                f"--rank-gpu-id is not compatible with --dp-size > 1 "
+                f"(current: {self.dp_size}). Only pure tensor parallelism "
+                "is supported."
+            )
+        if self.ep_size > 1:
+            raise ValueError(
+                f"--rank-gpu-id is not compatible with --ep-size > 1 "
+                f"(current: {self.ep_size}). Only pure tensor parallelism "
+                "is supported."
+            )
+        if self.nnodes > 1:
+            raise ValueError(
+                f"--rank-gpu-id is single-node only (current: "
+                f"--nnodes {self.nnodes})."
+            )
+
+        # Conflicting flags.
+        if self.mem_fraction_static is not None:
+            raise ValueError(
+                "--mem-fraction-static cannot be set together with "
+                "--rank-gpu-id; --rank-gpu-memory-mib is the (absolute) "
+                "per-rank memory budget in this mode."
+            )
+        if self.base_gpu_id != 0 or self.gpu_id_step != 1:
+            raise ValueError(
+                "--base-gpu-id/--gpu-id-step are replaced by the explicit "
+                "--rank-gpu-id mapping; remove them."
+            )
+
+        # Physical impossibility check via NVML: the summed budgets of the
+        # ranks co-located on one physical GPU must fit into its total
+        # VRAM. This is the hard physical limit — no additional safety
+        # margin is enforced on top (leaving headroom for the CUDA
+        # context etc. is the user's responsibility).
+        budgets = (
+            list(self.rank_gpu_memory_mib)
+            if isinstance(self.rank_gpu_memory_mib, list)
+            else [self.rank_gpu_memory_mib] * self.tp_size
+        )
+        mem_info = _query_rank_gpu_memory_mib(self.rank_gpu_id)
+        for gpu_id in sorted(set(self.rank_gpu_id)):
+            ranks = [r for r, g in enumerate(self.rank_gpu_id) if g == gpu_id]
+            required_mib = sum(budgets[r] for r in ranks)
+            total_mib = mem_info[gpu_id][0]
+            if required_mib > total_mib:
+                raise ValueError(
+                    f"Physical impossibility: GPU {gpu_id} "
+                    f"(NVML total {total_mib} MiB) cannot fit ranks {ranks} "
+                    f"whose budgets sum to {required_mib} MiB. Reduce "
+                    "--rank-gpu-memory-mib or place fewer ranks on this GPU."
+                )
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
