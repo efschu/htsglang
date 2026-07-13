@@ -16,6 +16,11 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.distributed.utils import (
+    suggest_unit_rebalance,
+    tp_partition_size,
+    tp_plan_active,
+)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -506,6 +511,10 @@ class ModelRunnerKVCacheMixin:
             int(max(0.0, free_gb - headroom_gb) * (1 << 30))
             + pool.post_capture_backed_bytes
         )
+        # Uneven-TP self-calibration: this post-capture budget is the
+        # most accurate per-rank measurement (weights + graphs resident),
+        # matching the restart the hint asks for.
+        self._maybe_suggest_mlp_rebalance(budget_bytes)
         config = self._config_from_budget(
             budget_bytes, cap_tokens=self.max_total_num_tokens
         )
@@ -1446,6 +1455,120 @@ class ModelRunnerKVCacheMixin:
 
         return token_capacity
 
+    def _mlp_family_local_stats(self: ModelRunner) -> Optional[tuple]:
+        """(per-rank mlp units, mlp-family parameter bytes) of this rank.
+
+        Walks the model for layers that partition under the "mlp" family
+        (tp_family="mlp", e.g. Qwen2MoeMLP gate_up/down). The unit
+        currency is the finest unit count among those layers (layers
+        whose units were quant-block-coarsened partition proportionally,
+        which is exact enough for the calibration estimate). Returns None
+        when the model has no converted mlp-family layers."""
+        units_total = 0
+        mlp_bytes = 0
+        for module in self.model.modules():
+            if getattr(module, "tp_family", None) != "mlp":
+                continue
+            module_units = getattr(module, "tp_units", None)
+            if module_units:
+                units_total = max(units_total, module_units)
+            mlp_bytes += sum(
+                p.numel() * p.element_size()
+                for p in module.parameters(recurse=False)
+            )
+        if units_total <= 0 or mlp_bytes <= 0:
+            return None
+        local_units = tp_partition_size(
+            units_total, self.tp_size, self.tp_rank, units_total, "mlp"
+        )
+        return local_units, mlp_bytes
+
+    def _maybe_suggest_mlp_rebalance(self: ModelRunner, budget_bytes: int) -> None:
+        """Uneven-TP self-calibration: after the rank-local KV profiling,
+        check whether shifting dense-MLP units between ranks would raise
+        the MIN-synced KV token pool, and log a one-line restart hint.
+
+        Every rank contributes (profiled KV byte budget, local token
+        capacity, current mlp partition in units, mlp-family parameter
+        bytes) via all_gather; when the token capacities diverge by more
+        than 10%, the maximin solver computes the MLP unit vector that
+        equalizes them (each shed unit turns its weight bytes into KV
+        budget on the pinned rank). Purely advisory — nothing is resized
+        in-process; the hint asks for a restart with
+        SGLANG_UNEVEN_MLP_VECTOR. Silent when the active vector already
+        balances the ranks. All gating conditions are rank-uniform, so
+        every rank reaches the collective or none does."""
+        if not self.server_args.uneven_memory_budgets_active():
+            return
+        if get_world_group().world_size <= 1:
+            return
+        if not tp_plan_active(self.tp_size):
+            # The mlp family vector requires an active base plan.
+            return
+
+        local_stats = self._mlp_family_local_stats()
+        if local_stats is None:
+            # Model has no mlp-family layers (not converted for uneven
+            # TP); identical on every rank, so returning here is safe.
+            return
+        local_units, mlp_bytes = local_stats
+
+        # Local token capacity of this rank's budget (pre-MIN-sync).
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        configurator = create_memory_pool_configurator(self)
+        local_tokens = configurator.calculate_pool_sizes(
+            budget_bytes, self.page_size
+        ).max_total_num_tokens
+        if local_tokens <= 0:
+            local_tokens = 0
+
+        world = get_world_group().world_size
+        payload = (
+            float(budget_bytes),
+            int(local_tokens),
+            int(local_units),
+            float(mlp_bytes),
+        )
+        gathered: list = [None] * world
+        torch.distributed.all_gather_object(
+            gathered, payload, group=get_world_group().cpu_group
+        )
+        free_bytes = [g[0] for g in gathered]
+        tokens = [g[1] for g in gathered]
+        units = [g[2] for g in gathered]
+        family_bytes = [g[3] for g in gathered]
+        if any(t <= 0 for t in tokens):
+            return
+        cur_min = min(tokens)
+
+        # A user token cap below every rank's capacity pins the pool
+        # anyway; rebalancing cannot grow it.
+        user_limit = self.server_args.max_total_tokens
+        if user_limit is not None and user_limit <= cur_min:
+            return
+
+        bytes_per_token = [free_bytes[r] / tokens[r] for r in range(world)]
+        suggestion = suggest_unit_rebalance(
+            free_bytes, bytes_per_token, units, family_bytes
+        )
+        if suggestion is None:
+            # Balanced (max/min <= 1.10) or no strictly better partition
+            # — in particular: an active SGLANG_UNEVEN_MLP_VECTOR that
+            # already equalizes the ranks stays silent.
+            return
+        new_units, cur_min_tokens, projected = suggestion
+        if self.tp_rank == 0:
+            logger.warning(
+                "uneven TP: restart with SGLANG_UNEVEN_MLP_VECTOR=%s to "
+                "raise the KV pool from %d to ~%d tokens",
+                ",".join(str(u) for u in new_units),
+                cur_min_tokens,
+                projected,
+            )
+
     def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
@@ -1547,6 +1670,11 @@ class ModelRunnerKVCacheMixin:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        if not self.post_capture_kv_active:
+            # Uneven-TP self-calibration on the final profiled budget;
+            # with post-capture sizing the (more accurate) post-capture
+            # measurement runs it instead.
+            self._maybe_suggest_mlp_rebalance(available_bytes)
         config = self._config_from_budget(available_bytes)
         config.max_running_requests = self._resolve_max_num_reqs(
             config.max_total_num_tokens
