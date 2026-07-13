@@ -147,8 +147,12 @@ def collect_state_entries(
     n_tensors = 0
     n_params_skipped = 0
     visited = set()
+    # Roots are processed in INSERTION order (first root claims shared
+    # objects/tensors for its path prefix) — keeps dump paths stable when a
+    # broader root (e.g. the scheduler itself) is appended behind the worker
+    # roots.
     stack: List[Tuple[str, Any, int]] = [
-        (name, obj, 0) for name, obj in sorted(roots.items(), reverse=True)
+        (name, obj, 0) for name, obj in reversed(list(roots.items()))
     ]
 
     while stack and len(entries) < _MAX_ENTRIES:
@@ -194,6 +198,21 @@ def collect_state_entries(
     return entries, n_tensors, n_params_skipped
 
 
+def _build_roots(scheduler) -> dict:
+    """Worker roots first (stable dump paths vs earlier rounds), then the
+    scheduler itself so its own advancing state (counters, batch bookkeeping,
+    spec accumulators) is covered too — round 9 showed the workers' state is
+    fully accounted for while the output still advances per request ordinal,
+    so the blind spots must shrink."""
+    roots = {}
+    if getattr(scheduler, "draft_worker", None) is not None:
+        roots["draft_worker"] = scheduler.draft_worker
+    if getattr(scheduler, "tp_worker", None) is not None:
+        roots["tp_worker"] = scheduler.tp_worker
+    roots["scheduler"] = scheduler
+    return roots
+
+
 def dump_spec_state_hashes(scheduler, tag: str) -> None:
     """Log one SPEC_STATE_HASH line per persistent tensor/scalar of the
     target and draft workers. Never raises."""
@@ -205,11 +224,7 @@ def dump_spec_state_hashes(scheduler, tag: str) -> None:
             rank = getattr(ps, "tp_rank", -1) if ps is not None else -1
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        roots = {}
-        if getattr(scheduler, "draft_worker", None) is not None:
-            roots["draft_worker"] = scheduler.draft_worker
-        if getattr(scheduler, "tp_worker", None) is not None:
-            roots["tp_worker"] = scheduler.tp_worker
+        roots = _build_roots(scheduler)
         max_bytes = envs.SGLANG_SPEC_STATE_HASH_MAX_MB.get() * (1 << 20)
         t0 = time.perf_counter()
         entries, n_tensors, n_params = collect_state_entries(
@@ -233,12 +248,101 @@ def dump_spec_state_hashes(scheduler, tag: str) -> None:
         logger.exception("SPEC_STATE_HASH dump failed (tag=%s)", tag)
 
 
+def _iter_objects(roots: dict, traverse_prefixes=DEFAULT_TRAVERSE_PREFIXES):
+    """Yield every traversable object reachable from ``roots`` (dedup by id),
+    using the same traversal rules as ``collect_state_entries``."""
+    visited = set()
+    stack = [obj for _, obj in reversed(list(roots.items()))]
+    depth = {id(obj): 0 for obj in stack}
+    while stack:
+        obj = stack.pop()
+        if obj is None or isinstance(
+            obj, (torch.Tensor, bool, int, float, str, bytes, type)
+        ):
+            continue
+        if inspect.isroutine(obj) or not _is_traversable(obj, traverse_prefixes):
+            continue
+        if id(obj) in visited:
+            continue
+        visited.add(id(obj))
+        d = depth.get(id(obj), 0)
+        if d > _MAX_DEPTH:
+            continue
+        yield obj
+        for _, child in _object_items(obj):
+            if id(child) not in visited:
+                depth[id(child)] = d + 1
+                stack.append(child)
+
+
+def reset_probe(scheduler, families) -> None:
+    """SGLANG_SPEC_RESET_PROBE: hard-reset the given persistent-state families
+    after a finished request (GPU idle at the hook point). Discriminator for
+    the round-9 finding that the output is a pure function of the request
+    ordinal: if the sequence flattens under a family, that family carries the
+    cross-request state; if it continues, the family is exonerated.
+
+    families:
+      "flashinfer" — zero every tensor attribute of flashinfer/sgl_kernel
+          wrapper objects (plan buffers, int/float workspaces, kv_lens/pinned
+          buffers). All of them are (re)written by the next plan() for the
+          region it consumes — any behavior change proves a read of stale
+          plan/workspace state from the previous request. Plan-derived python
+          scalars (_max_q_len, ...) are left alone: plan() overwrites them
+          unconditionally (audited, flashinfer 0.6.x).
+      "registry" — zero every CudaGraphBufferRegistry slot buffer (the
+          "dead tail" claim, complementary to SGLANG_POISON_GRAPH_PAD).
+    Never raises.
+    """
+    try:
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            CudaGraphBufferRegistry,
+        )
+
+        roots = _build_roots(scheduler)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        n_wrapper_tensors = 0
+        n_wrapper_objs = 0
+        n_registry_bufs = 0
+        do_fi = "flashinfer" in families
+        do_reg = "registry" in families
+        for obj in _iter_objects(roots):
+            mod = getattr(type(obj), "__module__", "") or ""
+            if do_fi and mod.startswith(("flashinfer", "sgl_kernel")):
+                n_wrapper_objs += 1
+                for _, val in _object_items(obj):
+                    if isinstance(val, torch.Tensor) and not isinstance(
+                        val, torch.nn.Parameter
+                    ):
+                        val.zero_()
+                        n_wrapper_tensors += 1
+            if do_reg and isinstance(obj, CudaGraphBufferRegistry):
+                for slot in obj._slots.values():
+                    if slot.buffer is not None:
+                        slot.buffer.zero_()
+                        n_registry_bufs += 1
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        logger.info(
+            "SPEC_RESET_PROBE families=%s wrapper_objs=%d wrapper_tensors=%d "
+            "registry_buffers=%d",
+            ",".join(sorted(families)),
+            n_wrapper_objs,
+            n_wrapper_tensors,
+            n_registry_bufs,
+        )
+    except Exception:
+        logger.exception("SPEC_RESET_PROBE failed")
+
+
 _finished_request_count = 0
 
 
 def maybe_dump_on_request_finish(scheduler, batch) -> None:
     """Hook: called at the end of Scheduler.process_batch_result. Emits one
-    dump per batch that finished at least one request."""
+    dump per batch that finished at least one request, and runs the reset
+    probe when SGLANG_SPEC_RESET_PROBE selects state families."""
     global _finished_request_count
     try:
         reqs = getattr(batch, "reqs", None) or []
@@ -248,4 +352,12 @@ def maybe_dump_on_request_finish(scheduler, batch) -> None:
     if n_finished == 0:
         return
     _finished_request_count += n_finished
-    dump_spec_state_hashes(scheduler, tag=f"req_end_{_finished_request_count}")
+    if envs.SGLANG_SPEC_STATE_HASH.get():
+        dump_spec_state_hashes(scheduler, tag=f"req_end_{_finished_request_count}")
+    families = {
+        f.strip()
+        for f in envs.SGLANG_SPEC_RESET_PROBE.get().split(",")
+        if f.strip()
+    }
+    if families:
+        reset_probe(scheduler, families)
