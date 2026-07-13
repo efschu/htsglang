@@ -7738,7 +7738,11 @@ class ServerArgs:
 
             hf_config = self.get_model_config().hf_config
             chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
-            page_size = resolved_view(self).page_size
+            # This property can be reached before the resolution pipeline has
+            # assigned a page size (e.g. the --mamba-checkpoint-interval
+            # validation runs at an early legacy slot); fall back to the SSM
+            # default of 1 instead of comparing None against an int below.
+            page_size = resolved_view(self).page_size or 1
             assert (
                 max(chunk_size, page_size) % min(chunk_size, page_size) == 0
             ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
