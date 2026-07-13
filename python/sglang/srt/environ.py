@@ -378,6 +378,16 @@ class Envs:
     # continues unchanged, the family is exonerated wholesale. Diagnostic
     # boots only.
     SGLANG_SPEC_RESET_PROBE = EnvStr("")
+    # Bisection filter for the "flashinfer" reset-probe family: comma-
+    # separated fnmatch globs on wrapper ATTRIBUTE names; only matching
+    # tensors are zeroed (empty = all). Needed because in non-graph mode the
+    # wrappers' _qo_indptr_buf / _paged_kv_*_buf are REFERENCES to
+    # sglang-owned buffer slices (zeroing them perturbs more than wrapper
+    # state — kv_last_page_len is init-ones and never refilled). The
+    # wrapper-OWNED persistents are: _float_workspace_buffer,
+    # _int_workspace_buffer, _pin_memory_int_workspace_buffer,
+    # _kv_lens_buffer.
+    SGLANG_SPEC_RESET_PROBE_FILTER = EnvStr("")
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
