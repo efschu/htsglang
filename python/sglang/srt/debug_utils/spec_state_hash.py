@@ -198,7 +198,11 @@ def dump_spec_state_hashes(scheduler, tag: str) -> None:
     """Log one SPEC_STATE_HASH line per persistent tensor/scalar of the
     target and draft workers. Never raises."""
     try:
-        rank = getattr(scheduler, "tp_rank", -1)
+        # Scheduler keeps its ranks on the ParallelState namespace (`ps`).
+        rank = getattr(scheduler, "tp_rank", None)
+        if rank is None:
+            ps = getattr(scheduler, "ps", None)
+            rank = getattr(ps, "tp_rank", -1) if ps is not None else -1
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         roots = {}
