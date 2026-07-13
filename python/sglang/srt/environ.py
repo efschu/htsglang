@@ -343,6 +343,17 @@ class Envs:
     # bytes never written for the current request then surfaces as NaN
     # output immediately, instead of a silent traffic-dependent divergence.
     SGLANG_POISON_POOL_DATA = EnvBool(False)
+    # Debug lever (#50 campaign): after every finished request, walk the
+    # process-persistent objects of the target/draft workers (model runners,
+    # attn backends, cuda-graph runners, spec workers) and log a sha256 per
+    # reachable tensor plus every plain int/float/bool attribute. Diffing the
+    # dumps of two identical requests pinpoints exactly which persistent
+    # state a request mutates (deterministic cross-request state evolution).
+    SGLANG_SPEC_STATE_HASH = EnvBool(False)
+    # 0 = hash every tensor fully. >0 = tensors above this many MiB are
+    # fingerprinted from a strided sample instead (faster, still detects
+    # virtually any realistic mutation).
+    SGLANG_SPEC_STATE_HASH_MAX_MB = EnvInt(0)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
