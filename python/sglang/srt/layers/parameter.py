@@ -9,6 +9,7 @@ from typing import Callable, Optional, Union
 import torch
 from torch.nn import Parameter
 
+from sglang.srt.distributed.utils import tp_loaded_shard_start
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import is_cpu
@@ -150,6 +151,16 @@ class _ColumnvLLMParameter(BasevLLMParameter):
     ):
         if not use_presharded_weights:
             shard_size = self.data.shape[self.output_dim]
+            # Even TP: tp_rank * shard_size. Uneven TP (--rank-tp-ratio):
+            # prefix-sum offset from the shard plan (tp_units is set by
+            # the owning layer in that mode only).
+            start_idx = tp_loaded_shard_start(
+                loaded_weight.shape[self.output_dim],
+                None,
+                tp_rank,
+                shard_size,
+                getattr(self, "tp_units", None),
+            )
 
             from sglang.srt.model_loader.weight_utils import (
                 narrow_padded_param_and_loaded_weight,
@@ -160,7 +171,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.data,
                     loaded_weight,
                     0,  # param_data_start
-                    tp_rank * shard_size,
+                    start_idx,
                     self.output_dim,
                     shard_size,
                 )
@@ -169,7 +180,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 return
             else:
                 loaded_weight = loaded_weight.narrow(
-                    self.output_dim, tp_rank * shard_size, shard_size
+                    self.output_dim, start_idx, shard_size
                 )
 
         copy_with_check(self.data, loaded_weight)
@@ -192,6 +203,16 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
 
+        # Even TP: tp_rank * shard_size. Uneven TP: prefix-sum offset of
+        # this rank's partition in the loaded (per-output) dimension.
+        start_idx = tp_loaded_shard_start(
+            loaded_weight.shape[self.output_dim],
+            None,
+            tp_rank,
+            shard_size,
+            getattr(self, "tp_units", None),
+        )
+
         from sglang.srt.model_loader.weight_utils import (
             narrow_padded_param_and_loaded_weight,
         )
@@ -201,7 +222,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 param_data,
                 loaded_weight,
                 0,  # param_data_start
-                tp_rank * shard_size,
+                start_idx,
                 self.output_dim,
                 shard_size,
                 not use_presharded_weights,
@@ -209,7 +230,6 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         else:
             if not use_presharded_weights:
                 # Padding for special case like qwen2_5_VL's mlp which is not 8-aligned
-                start_idx = tp_rank * shard_size
                 end_idx = start_idx + shard_size
                 if end_idx > loaded_weight.shape[self.output_dim]:
                     loaded_weight = pad_or_narrow_weight(
@@ -248,6 +268,19 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         shard_id = tp_rank if shard_id == "q" else tp_rank // num_heads
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
 
+        # Even TP: shard_id * shard_size (kv replication folds several
+        # ranks onto the same checkpoint shard). Uneven TP: prefix-sum
+        # offset from the shard plan (kv-head units; replication is
+        # rejected by QKVParallelLinear in that mode, so shard_id equals
+        # tp_rank here).
+        start_idx = tp_loaded_shard_start(
+            loaded_weight.shape[self.output_dim],
+            None,
+            shard_id,
+            shard_size,
+            getattr(self, "tp_units", None),
+        )
+
         if _is_cpu:
             from sglang.srt.model_loader.weight_utils import (
                 narrow_padded_param_and_loaded_weight,
@@ -257,7 +290,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 param_data,
                 loaded_weight,
                 0,  # param_data_start
-                shard_id * shard_size,
+                start_idx,
                 self.output_dim,
                 shard_size,
                 not use_presharded_weights,
@@ -265,7 +298,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         else:
             if not use_presharded_weights:
                 loaded_weight = loaded_weight.narrow(
-                    self.output_dim, shard_id * shard_size, shard_size
+                    self.output_dim, start_idx, shard_size
                 )
 
         assert (
@@ -298,6 +331,15 @@ class RowvLLMParameter(BasevLLMParameter):
     ):
         if not use_presharded_weights:
             shard_size = self.data.shape[self.input_dim]
+            # Even TP: tp_rank * shard_size. Uneven TP: prefix-sum offset
+            # of this rank's partition in the checkpoint dimension.
+            start_idx = tp_loaded_shard_start(
+                loaded_weight.shape[self.input_dim],
+                None,
+                tp_rank,
+                shard_size,
+                getattr(self, "tp_units", None),
+            )
 
             from sglang.srt.model_loader.weight_utils import (
                 narrow_padded_param_and_loaded_weight,
@@ -308,7 +350,7 @@ class RowvLLMParameter(BasevLLMParameter):
                     self.data,
                     loaded_weight,
                     0,  # param_data_start
-                    tp_rank * shard_size,
+                    start_idx,
                     self.input_dim,
                     shard_size,
                 )
@@ -319,7 +361,6 @@ class RowvLLMParameter(BasevLLMParameter):
                 return
             else:
                 # Padding for special case like qwen2_5_VL's mlp which is not 8-aligned
-                start_idx = tp_rank * shard_size
                 end_idx = start_idx + shard_size
                 if end_idx > loaded_weight.shape[self.input_dim]:
                     loaded_weight = pad_or_narrow_weight(

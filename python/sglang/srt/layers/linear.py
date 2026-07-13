@@ -21,6 +21,12 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_quant_all_reduce,
 )
+from sglang.srt.distributed.utils import (
+    tp_loaded_shard_start,
+    tp_partition_size,
+    tp_partition_sizes,
+    tp_plan_active,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -326,6 +332,7 @@ class ColumnParallelLinear(LinearBase):
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
         skip_block_quant_check: bool = False,
+        tp_units: Optional[int] = None,
     ):
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
@@ -340,13 +347,22 @@ class ColumnParallelLinear(LinearBase):
         if tp_size is None:
             tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
+        # Uneven TP (--rank-tp-ratio): unit count of this layer's output
+        # dimension (e.g. kv heads); shard cuts land on unit boundaries.
+        # Without an installed ratio plan, tp_partition_size() reproduces
+        # divide() exactly, so the default path is unchanged.
+        if not hasattr(self, "tp_units"):
+            self.tp_units = tp_units
         assert self.quant_method is not None
-        self.output_size_per_partition = divide(self.output_size, tp_size)
+        self.output_size_per_partition = tp_partition_size(
+            self.output_size, tp_size, tp_rank, self.tp_units
+        )
         self.output_partition_sizes = [self.output_size_per_partition]
         # If QKV or MergedColumn, use output size of each partition.
         if hasattr(self, "output_sizes"):
             self.output_partition_sizes = [
-                divide(output_size, tp_size) for output_size in self.output_sizes
+                tp_partition_size(output_size, tp_size, tp_rank, self.tp_units)
+                for output_size in self.output_sizes
             ]
 
         if output_sizes is None:
@@ -366,6 +382,12 @@ class ColumnParallelLinear(LinearBase):
                 else self.weight_loader
             ),
         )
+        if self.tp_units is not None and tp_plan_active(self.tp_size):
+            # Uneven TP only: expose the unit count to the v2 weight
+            # loaders in layers/parameter.py (AFTER create_weights, which
+            # registers the parameters). Not set on the default path.
+            for p in self.parameters():
+                set_weight_attrs(p, {"tp_units": self.tp_units})
         if bias:
             self.bias = Parameter(
                 torch.zeros(self.output_size_per_partition, dtype=params_dtype)
@@ -392,6 +414,11 @@ class ColumnParallelLinear(LinearBase):
 
         # Materialize GGUF UninitializedParameter
         if is_gguf_weight and isinstance(param, UninitializedParameter):
+            if tp_plan_active(self.tp_size):
+                raise NotImplementedError(
+                    "GGUF weight loading is not supported with uneven TP "
+                    "(--rank-tp-ratio)."
+                )
             weight_shape = list(loaded_weight.shape)
             if output_dim is not None:
                 weight_shape[output_dim] = weight_shape[output_dim] // self.tp_size
@@ -403,7 +430,15 @@ class ColumnParallelLinear(LinearBase):
         use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
         if output_dim is not None and not use_bitsandbytes_4bit:
             shard_size = param_data.shape[output_dim]
-            start_idx = self.tp_rank * shard_size
+            # Even TP: rank * shard_size. Uneven TP: prefix-sum offset of
+            # this rank's partition in the checkpoint dimension.
+            start_idx = tp_loaded_shard_start(
+                loaded_weight.shape[output_dim],
+                self.tp_size,
+                self.tp_rank,
+                shard_size,
+                self.tp_units,
+            )
 
             if _is_cpu:
                 from sglang.srt.model_loader.weight_utils import (
@@ -521,6 +556,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
+        tp_units: Optional[int] = None,
     ):
         self.output_sizes = output_sizes
         if tp_rank is None:
@@ -528,7 +564,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         if tp_size is None:
             tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
-        assert all(output_size % tp_size == 0 for output_size in output_sizes)
+        self.tp_units = tp_units
+        for output_size in output_sizes:
+            # Validates partitionability of every packed output. Even TP:
+            # divisibility by tp_size (assert, as before). Uneven TP:
+            # raises a ValueError naming the dimension and the weight
+            # vector if the shard plan cannot split it.
+            tp_partition_sizes(output_size, tp_size, tp_units)
         self.use_presharded_weights = use_presharded_weights
         super().__init__(
             input_size=input_size,
@@ -569,6 +611,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             return
 
         if is_gguf_weight:
+            if tp_plan_active(self.tp_size):
+                raise NotImplementedError(
+                    "GGUF weight loading is not supported with uneven TP "
+                    "(--rank-tp-ratio)."
+                )
             output_dim = getattr(param, "output_dim", None)
             shard_size = loaded_weight.size(output_dim) // self.tp_size
             start_idx = self.tp_rank * shard_size
@@ -647,8 +694,20 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         assert loaded_shard_id < len(self.output_sizes)
         if output_dim is not None:
-            shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-            shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
+            # Per packed output its own partition: offset = sum of the
+            # preceding outputs' per-rank sizes, size = this output's
+            # per-rank size (uneven TP: from the shard plan; even TP:
+            # exactly output_size // tp_size as before).
+            shard_offset = sum(
+                tp_partition_size(sz, self.tp_size, self.tp_rank, self.tp_units)
+                for sz in self.output_sizes[:loaded_shard_id]
+            )
+            shard_size = tp_partition_size(
+                self.output_sizes[loaded_shard_id],
+                self.tp_size,
+                self.tp_rank,
+                self.tp_units,
+            )
             # Special case for quantization.
             # If quantized, we need to adjust the offset and size to account
             # for the packing.
@@ -667,7 +726,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
-            start_idx = self.tp_rank * shard_size
+            start_idx = tp_loaded_shard_start(
+                loaded_weight.shape[output_dim],
+                self.tp_size,
+                self.tp_rank,
+                shard_size,
+                self.tp_units,
+            )
 
             if _is_cpu:
                 from sglang.srt.model_loader.weight_utils import (
@@ -777,6 +842,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         Handle block-wise scale loading for MergedColumnParallelLinear.
         Similar to QKVParallelLinear._load_qkv_block_scale, but for merged column layers.
         """
+        if tp_plan_active(self.tp_size):
+            raise NotImplementedError(
+                "Block-quant scale loading (fused on disk) is not supported "
+                "with uneven TP (--rank-tp-ratio) yet."
+            )
         weight_block_size = self.quant_method.quant_config.weight_block_size
         block_n, _ = weight_block_size[0], weight_block_size[1]
         block_n = 1 if getattr(param, "format_ue8m0", False) else block_n
@@ -863,6 +933,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         assert loaded_shard_id < len(self.output_sizes)
 
         if isinstance(param, BlockQuantScaleParameter):
+            if tp_plan_active(self.tp_size):
+                raise NotImplementedError(
+                    "Block-quant scale loading is not supported with uneven "
+                    "TP (--rank-tp-ratio) yet."
+                )
             weight_block_size = self.quant_method.quant_config.weight_block_size
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]
             block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
@@ -875,8 +950,17 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 // self.tp_size
             )
         else:
-            shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-            shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
+            # Per packed output its own partition (see weight_loader).
+            shard_offset = sum(
+                tp_partition_size(sz, self.tp_size, self.tp_rank, self.tp_units)
+                for sz in self.output_sizes[:loaded_shard_id]
+            )
+            shard_size = tp_partition_size(
+                self.output_sizes[loaded_shard_id],
+                self.tp_size,
+                self.tp_rank,
+                self.tp_units,
+            )
 
         param.load_merged_column_weight(
             loaded_weight=loaded_weight,
@@ -945,27 +1029,73 @@ class QKVParallelLinear(ColumnParallelLinear):
         if tp_size is None:
             tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
-        self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
-            self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
-        else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+        if tp_plan_active(tp_size):
+            # Uneven TP (--rank-tp-ratio): heads are distributed by the
+            # shard plan with the KV heads as indivisible units, so every
+            # rank owns whole GQA groups (its q heads are an exact
+            # multiple of its kv heads). KV-head replication is not
+            # supported in this mode: every rank must own at least one
+            # whole kv head.
+            if tp_size > self.total_num_kv_heads:
+                raise ValueError(
+                    f"--rank-tp-ratio: tp_size ({tp_size}) exceeds "
+                    f"total_num_kv_heads ({self.total_num_kv_heads}); "
+                    "kv-head replication is not supported with uneven TP. "
+                    "Every rank must own at least one whole kv head."
+                )
+            if self.total_num_heads % self.total_num_kv_heads != 0:
+                raise ValueError(
+                    f"--rank-tp-ratio: total_num_heads "
+                    f"({self.total_num_heads}) must be a multiple of "
+                    f"total_num_kv_heads ({self.total_num_kv_heads}) to "
+                    "distribute whole GQA groups per rank."
+                )
+            self.tp_units = self.total_num_kv_heads
+            self.num_heads = tp_partition_size(
+                self.total_num_heads, tp_size, tp_rank, self.tp_units
+            )
+            self.num_kv_heads = tp_partition_size(
+                self.total_num_kv_heads, tp_size, tp_rank, self.tp_units
+            )
             self.num_kv_head_replicas = 1
+        else:
+            self.tp_units = None
+            self.num_heads = divide(self.total_num_heads, tp_size)
+            if tp_size >= self.total_num_kv_heads:
+                self.num_kv_heads = 1
+                self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+            else:
+                self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+                self.num_kv_head_replicas = 1
         self.q_proj_shard_size = self.num_heads * self.head_size
         self.kv_proj_shard_size = self.num_kv_heads * self.head_size
         self.v_proj_shard_size = self.num_kv_heads * self.v_head_size
         input_size = self.hidden_size
-        output_size = (
-            self.num_heads * self.head_size
-            + self.num_kv_heads * self.head_size
-            + self.num_kv_heads * self.v_head_size
-        ) * tp_size
-        self.output_sizes = [
-            self.num_heads * self.head_size * tp_size,  # q_proj
-            self.num_kv_heads * self.head_size * tp_size,  # k_proj
-            self.num_kv_heads * self.v_head_size * tp_size,  # v_proj
-        ]
+        if self.tp_units is not None:
+            # Uneven TP: per-rank sizes vary, so hand the checkpoint
+            # totals to the base class; it partitions them per rank via
+            # the shard plan (kv-head units).
+            output_size = (
+                self.total_num_heads * self.head_size
+                + self.total_num_kv_heads * self.head_size
+                + self.total_num_kv_heads * self.v_head_size
+            )
+            self.output_sizes = [
+                self.total_num_heads * self.head_size,  # q_proj
+                self.total_num_kv_heads * self.head_size,  # k_proj
+                self.total_num_kv_heads * self.v_head_size,  # v_proj
+            ]
+        else:
+            output_size = (
+                self.num_heads * self.head_size
+                + self.num_kv_heads * self.head_size
+                + self.num_kv_heads * self.v_head_size
+            ) * tp_size
+            self.output_sizes = [
+                self.num_heads * self.head_size * tp_size,  # q_proj
+                self.num_kv_heads * self.head_size * tp_size,  # k_proj
+                self.num_kv_heads * self.v_head_size * tp_size,  # v_proj
+            ]
         self.use_presharded_weights = load_presharded_attn
         quant_config = None if _disable_hip_linear_quant else quant_config
 
@@ -1050,6 +1180,11 @@ class QKVParallelLinear(ColumnParallelLinear):
     def _load_qkv_block_scale(
         self, param: BasevLLMParameter, loaded_weight: torch.Tensor
     ):
+        if tp_plan_active(self.tp_size):
+            raise NotImplementedError(
+                "Block-quant scale loading (fused on disk) is not supported "
+                "with uneven TP (--rank-tp-ratio) yet."
+            )
         block_n, _ = self.quant_method.quant_config.weight_block_size
         q_size = self.total_num_heads * self.head_size // block_n
         k_size = self.total_num_kv_heads * self.head_size // block_n
@@ -1136,6 +1271,11 @@ class QKVParallelLinear(ColumnParallelLinear):
             return
 
         if is_gguf_weight:
+            if tp_plan_active(self.tp_size):
+                raise NotImplementedError(
+                    "GGUF weight loading is not supported with uneven TP "
+                    "(--rank-tp-ratio)."
+                )
             output_dim = getattr(param, "output_dim", None)
             shard_size = loaded_weight.size(output_dim) // self.tp_size
             start_idx = self.tp_rank * shard_size
@@ -1285,7 +1425,17 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_id = self.tp_rank
             else:
                 shard_id = self.tp_rank // self.num_kv_head_replicas
-            start_idx = shard_id * shard_size
+            # Even TP: shard_id * shard_size (kv replication folds several
+            # ranks onto the same checkpoint shard). Uneven TP: prefix-sum
+            # offset by the shard plan (kv-head units; replication is
+            # rejected in __init__, so shard_id == tp_rank here).
+            start_idx = tp_loaded_shard_start(
+                loaded_weight.shape[output_dim],
+                self.tp_size,
+                shard_id,
+                shard_size,
+                self.tp_units,
+            )
 
             if _is_cpu:
                 from sglang.srt.model_loader.weight_utils import (
@@ -1376,6 +1526,7 @@ class RowParallelLinear(LinearBase):
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
         use_dp_attention_reduce: bool = False,
+        tp_units: Optional[int] = None,
     ):
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
@@ -1392,7 +1543,14 @@ class RowParallelLinear(LinearBase):
         if tp_size is None:
             tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
-        self.input_size_per_partition = divide(input_size, self.tp_size)
+        # Uneven TP: unit count of the INPUT dimension (matches the paired
+        # column-parallel layer's units, e.g. kv heads for o_proj).
+        # Without an installed ratio plan, tp_partition_size() reproduces
+        # divide() exactly, so the default path is unchanged.
+        self.tp_units = tp_units
+        self.input_size_per_partition = tp_partition_size(
+            input_size, self.tp_size, self.tp_rank, tp_units
+        )
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
 
@@ -1409,6 +1567,12 @@ class RowParallelLinear(LinearBase):
                 else self.weight_loader
             ),
         )
+        if self.tp_units is not None and tp_plan_active(self.tp_size):
+            # Uneven TP only: expose the unit count to the v2 weight
+            # loaders in layers/parameter.py (AFTER create_weights, which
+            # registers the parameters). Not set on the default path.
+            for p in self.parameters():
+                set_weight_attrs(p, {"tp_units": self.tp_units})
 
         if bias:
             self.bias = Parameter(torch.zeros(self.output_size, dtype=params_dtype))
@@ -1434,6 +1598,11 @@ class RowParallelLinear(LinearBase):
 
         # Materialize GGUF UninitializedParameter
         if is_gguf_weight and isinstance(param, UninitializedParameter):
+            if tp_plan_active(self.tp_size):
+                raise NotImplementedError(
+                    "GGUF weight loading is not supported with uneven TP "
+                    "(--rank-tp-ratio)."
+                )
             weight_shape = list(loaded_weight.shape)
             if input_dim:
                 weight_shape[input_dim] = weight_shape[input_dim] // self.tp_size
@@ -1448,7 +1617,15 @@ class RowParallelLinear(LinearBase):
             and not self.use_presharded_weights
         ):
             shard_size = param_data.shape[input_dim]
-            start_idx = self.tp_rank * shard_size
+            # Even TP: rank * shard_size. Uneven TP: prefix-sum offset of
+            # this rank's partition in the checkpoint dimension.
+            start_idx = tp_loaded_shard_start(
+                loaded_weight.shape[input_dim],
+                self.tp_size,
+                self.tp_rank,
+                shard_size,
+                self.tp_units,
+            )
 
             if _is_cpu:
                 from sglang.srt.model_loader.weight_utils import (
