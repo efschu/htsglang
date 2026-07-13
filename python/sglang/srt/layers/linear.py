@@ -369,6 +369,7 @@ class ColumnParallelLinear(LinearBase):
         use_presharded_weights: bool = False,
         skip_block_quant_check: bool = False,
         tp_units: Optional[int] = None,
+        tp_family: Optional[str] = None,
     ):
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
@@ -389,6 +390,13 @@ class ColumnParallelLinear(LinearBase):
         # divide() exactly, so the default path is unchanged.
         if not hasattr(self, "tp_units"):
             self.tp_units = tp_units
+        # tp_family names an optional FAMILY shard plan (e.g. "mlp",
+        # --rank-mlp-ratio / SGLANG_UNEVEN_MLP_VECTOR) that overrides the
+        # base vector for this layer only. Families without an installed
+        # vector fall back to the base plan, so passing a family never
+        # changes behavior on its own.
+        if not hasattr(self, "tp_family"):
+            self.tp_family = tp_family
         assert self.quant_method is not None
         # tp_units is defined against the PER-PART output size (merged
         # layers partition each part independently), so quant-block
@@ -403,13 +411,15 @@ class ColumnParallelLinear(LinearBase):
             _units_basis, self.tp_units, quant_config, 0
         )
         self.output_size_per_partition = tp_partition_size(
-            self.output_size, tp_size, tp_rank, self.tp_units
+            self.output_size, tp_size, tp_rank, self.tp_units, self.tp_family
         )
         self.output_partition_sizes = [self.output_size_per_partition]
         # If QKV or MergedColumn, use output size of each partition.
         if hasattr(self, "output_sizes"):
             self.output_partition_sizes = [
-                tp_partition_size(output_size, tp_size, tp_rank, self.tp_units)
+                tp_partition_size(
+                    output_size, tp_size, tp_rank, self.tp_units, self.tp_family
+                )
                 for output_size in self.output_sizes
             ]
 
@@ -430,12 +440,16 @@ class ColumnParallelLinear(LinearBase):
                 else self.weight_loader
             ),
         )
-        if self.tp_units is not None and tp_plan_active(self.tp_size):
-            # Uneven TP only: expose the unit count to the v2 weight
-            # loaders in layers/parameter.py (AFTER create_weights, which
-            # registers the parameters). Not set on the default path.
+        if self.tp_units is not None and tp_plan_active(self.tp_size, self.tp_family):
+            # Uneven TP only: expose the unit count (and family, so the
+            # loaders resolve the SAME weight vector the shapes were
+            # partitioned with) to the v2 weight loaders in
+            # layers/parameter.py (AFTER create_weights, which registers
+            # the parameters). Not set on the default path.
             for p in self.parameters():
-                set_weight_attrs(p, {"tp_units": self.tp_units})
+                set_weight_attrs(
+                    p, {"tp_units": self.tp_units, "tp_family": self.tp_family}
+                )
         if bias:
             self.bias = Parameter(
                 torch.zeros(self.output_size_per_partition, dtype=params_dtype)
@@ -486,6 +500,7 @@ class ColumnParallelLinear(LinearBase):
                 self.tp_rank,
                 shard_size,
                 self.tp_units,
+                self.tp_family,
             )
 
             if _is_cpu:
@@ -605,6 +620,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
         tp_units: Optional[int] = None,
+        tp_family: Optional[str] = None,
     ):
         self.output_sizes = output_sizes
         if tp_rank is None:
@@ -613,12 +629,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
         self.tp_units = tp_units
+        self.tp_family = tp_family
         for output_size in output_sizes:
             # Validates partitionability of every packed output. Even TP:
             # divisibility by tp_size (assert, as before). Uneven TP:
             # raises a ValueError naming the dimension and the weight
             # vector if the shard plan cannot split it.
-            tp_partition_sizes(output_size, tp_size, tp_units)
+            tp_partition_sizes(output_size, tp_size, tp_units, tp_family)
         self.use_presharded_weights = use_presharded_weights
         super().__init__(
             input_size=input_size,
@@ -747,7 +764,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             # per-rank size (uneven TP: from the shard plan; even TP:
             # exactly output_size // tp_size as before).
             shard_offset = sum(
-                tp_partition_size(sz, self.tp_size, self.tp_rank, self.tp_units)
+                tp_partition_size(
+                    sz, self.tp_size, self.tp_rank, self.tp_units, self.tp_family
+                )
                 for sz in self.output_sizes[:loaded_shard_id]
             )
             shard_size = tp_partition_size(
@@ -755,6 +774,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 self.tp_size,
                 self.tp_rank,
                 self.tp_units,
+                self.tp_family,
             )
             # Special case for quantization.
             # If quantized, we need to adjust the offset and size to account
@@ -780,6 +800,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 self.tp_rank,
                 shard_size,
                 self.tp_units,
+                self.tp_family,
             )
 
             if _is_cpu:
@@ -984,7 +1005,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             weight_block_size = self.quant_method.quant_config.weight_block_size
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]
             block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
-            if tp_plan_active(self.tp_size) and self.tp_units is not None:
+            if (
+                tp_plan_active(self.tp_size, self.tp_family)
+                and self.tp_units is not None
+            ):
                 # Uneven TP: the units were coarsened to quant-block
                 # multiples in __init__, so every rank's weight shard is
                 # block_n-aligned and the scale-grid shard is exactly the
@@ -994,7 +1018,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_offset = (
                     sum(
                         tp_partition_size(
-                            sz, self.tp_size, self.tp_rank, self.tp_units
+                            sz,
+                            self.tp_size,
+                            self.tp_rank,
+                            self.tp_units,
+                            self.tp_family,
                         )
                         for sz in self.output_sizes[:loaded_shard_id]
                     )
@@ -1006,6 +1034,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                         self.tp_size,
                         self.tp_rank,
                         self.tp_units,
+                        self.tp_family,
                     )
                     // block_n
                 )
@@ -1022,7 +1051,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         else:
             # Per packed output its own partition (see weight_loader).
             shard_offset = sum(
-                tp_partition_size(sz, self.tp_size, self.tp_rank, self.tp_units)
+                tp_partition_size(
+                    sz, self.tp_size, self.tp_rank, self.tp_units, self.tp_family
+                )
                 for sz in self.output_sizes[:loaded_shard_id]
             )
             shard_size = tp_partition_size(
@@ -1030,6 +1061,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 self.tp_size,
                 self.tp_rank,
                 self.tp_units,
+                self.tp_family,
             )
 
         param.load_merged_column_weight(
@@ -1597,6 +1629,7 @@ class RowParallelLinear(LinearBase):
         use_presharded_weights: bool = False,
         use_dp_attention_reduce: bool = False,
         tp_units: Optional[int] = None,
+        tp_family: Optional[str] = None,
     ):
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
@@ -1614,14 +1647,16 @@ class RowParallelLinear(LinearBase):
             tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
         # Uneven TP: unit count of the INPUT dimension (matches the paired
-        # column-parallel layer's units, e.g. kv heads for o_proj).
+        # column-parallel layer's units, e.g. kv heads for o_proj) and the
+        # optional family plan (must match the paired layer's family).
         # Without an installed ratio plan, tp_partition_size() reproduces
         # divide() exactly, so the default path is unchanged.
         self.tp_units = _quant_block_aligned_units(
             input_size, tp_units, quant_config, 1
         )
+        self.tp_family = tp_family
         self.input_size_per_partition = tp_partition_size(
-            input_size, self.tp_size, self.tp_rank, self.tp_units
+            input_size, self.tp_size, self.tp_rank, self.tp_units, self.tp_family
         )
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
@@ -1639,12 +1674,15 @@ class RowParallelLinear(LinearBase):
                 else self.weight_loader
             ),
         )
-        if self.tp_units is not None and tp_plan_active(self.tp_size):
-            # Uneven TP only: expose the unit count to the v2 weight
-            # loaders in layers/parameter.py (AFTER create_weights, which
-            # registers the parameters). Not set on the default path.
+        if self.tp_units is not None and tp_plan_active(self.tp_size, self.tp_family):
+            # Uneven TP only: expose the unit count (and family) to the
+            # v2 weight loaders in layers/parameter.py (AFTER
+            # create_weights, which registers the parameters). Not set on
+            # the default path.
             for p in self.parameters():
-                set_weight_attrs(p, {"tp_units": self.tp_units})
+                set_weight_attrs(
+                    p, {"tp_units": self.tp_units, "tp_family": self.tp_family}
+                )
 
         if bias:
             self.bias = Parameter(torch.zeros(self.output_size, dtype=params_dtype))
@@ -1697,6 +1735,7 @@ class RowParallelLinear(LinearBase):
                 self.tp_rank,
                 shard_size,
                 self.tp_units,
+                self.tp_family,
             )
 
             if _is_cpu:
