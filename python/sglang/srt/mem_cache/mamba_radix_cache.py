@@ -58,6 +58,8 @@ if TYPE_CHECKING:
 
 import logging
 
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.mamba_ckpt_utils import floor_to_interval, is_on_interval
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -436,6 +438,20 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        # --mamba-checkpoint-interval: when set, checkpoints live only at
+        # absolute multiples of this token count; the prefix-resume point is
+        # capped to that grid and the deepest checkpoints per path are
+        # shielded from mamba eviction (see evict_mamba). None = upstream
+        # behavior, byte-identical.
+        self.mamba_checkpoint_interval = get_server_args().mamba_checkpoint_interval
+        # Live window: how many of the deepest on-grid checkpoints per
+        # root-to-leaf path evict_mamba tries to keep (best effort; a
+        # second pass ignores the window when the pool must yield a slot).
+        self.mamba_ckpt_window = envs.SGLANG_MAMBA_CKPT_WINDOW.get()
+        # Strict resume: only resume at the DEEPEST interval boundary of the
+        # full-KV match; if that exact checkpoint is missing, recompute from
+        # scratch instead of a shallower (survivor-dependent) checkpoint.
+        self.mamba_ckpt_strict_resume = envs.SGLANG_MAMBA_CKPT_STRICT_RESUME.get()
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -542,6 +558,21 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if is_insert:
             if self.enable_mamba_extra_buffer:
                 cache_len = req.mamba_last_track_seqlen
+                # --mamba-checkpoint-interval: the tracked position is on the
+                # grid by construction (prefill targets and decode tracking
+                # both use the interval); enforce it so an off-grid state can
+                # never enter the tree.
+                if cache_len is not None and not is_on_interval(
+                    cache_len, self.mamba_checkpoint_interval
+                ):
+                    logger.warning(
+                        "mamba checkpoint interval: dropping off-grid tracked "
+                        "state at %d (interval %d), rid=%s",
+                        cache_len,
+                        self.mamba_checkpoint_interval,
+                        req.rid,
+                    )
+                    cache_len = 0
             else:
                 cache_len = len(token_ids)
                 # ReplaySSM (no_buffer): `temporal[slot]` lags the live state by
@@ -553,6 +584,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if write_pos_buf is not None:
                     cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
                     write_pos_buf[req.mamba_pool_idx] = 0
+                # --mamba-checkpoint-interval (no_buffer): the donated state
+                # sits exactly at `cache_len`; there is no mechanism to
+                # snapshot an earlier position, so an off-grid finish is NOT
+                # cached at all (rounding the key down would pair a deeper
+                # state with a shorter key). Prefill-step checkpoints (grid-
+                # clipped chunk ends) remain the resume points.
+                if not is_on_interval(cache_len, self.mamba_checkpoint_interval):
+                    cache_len = 0
             if cache_len is None:
                 cache_len = 0
             if cache_len != len(token_ids):
@@ -659,6 +698,21 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             else len(token_ids)
         )
         if self.disable or cache_len is None:
+            return _skip_cache_unfinished_req(req)
+        # --mamba-checkpoint-interval: only grid positions may carry a
+        # checkpoint. extra_buffer targets are on-grid by construction;
+        # no_buffer donates the live state at the chunk end, which the
+        # scheduler clips to the grid — an off-grid end (edge paths) is
+        # simply not cached this step.
+        if not is_on_interval(cache_len, self.mamba_checkpoint_interval):
+            if self.enable_mamba_extra_buffer:
+                logger.warning(
+                    "mamba checkpoint interval: off-grid unfinished track "
+                    "position %d (interval %d), skipping cache, rid=%s",
+                    cache_len,
+                    self.mamba_checkpoint_interval,
+                    req.rid,
+                )
             return _skip_cache_unfinished_req(req)
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
@@ -817,9 +871,25 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def evict_mamba(self, mamba_num: int) -> int:
-        """Evict mamba states. Returns the number of mamba states evicted."""
+        """Evict mamba states. Returns the number of mamba states evicted.
+
+        With --mamba-checkpoint-interval a first pass spares the deepest
+        ``mamba_ckpt_window`` checkpoints of every path (the prefix-resume
+        anchors: losing the deepest one silently moves the resume point of
+        identical requests and re-introduces run-to-run drift). The window
+        is best effort — a second pass ignores it when the pool must yield.
+        """
         if self.disable or mamba_num <= 0:
             return 0
+        protect = self.mamba_checkpoint_interval is not None
+        mamba_num_evicted = self._evict_mamba_pass(mamba_num, protect_window=protect)
+        if protect and mamba_num_evicted < mamba_num:
+            mamba_num_evicted += self._evict_mamba_pass(
+                mamba_num - mamba_num_evicted, protect_window=False
+            )
+        return mamba_num_evicted
+
+    def _evict_mamba_pass(self, mamba_num: int, protect_window: bool) -> int:
         # get the least recently used node that is not locked, doesn't have to be a leaf
         x = self.mamba_lru_list.get_lru_no_lock()
         mamba_num_evicted = 0
@@ -831,6 +901,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             ), f"node has abnormal mamba length, {x.id=}, {len(x.mamba_value)=}"
             assert x != self.root_node, f"root node is not evictable, {x.id=}"
             assert x.mamba_lock_ref == 0, f"node is in use by mamba kv indices, {x.id=}"
+
+            if protect_window and self._in_ckpt_live_window(x):
+                x = self.mamba_lru_list.get_prev_no_lock(x)
+                continue
 
             if len(x.children) > 0:
                 # 1. an internal node, free mamba tokens.
@@ -850,6 +924,30 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             x = x_next
 
         return mamba_num_evicted
+
+    def _in_ckpt_live_window(self, node: TreeNode) -> bool:
+        """True if ``node`` is one of the deepest ``mamba_ckpt_window``
+        checkpoints on some root-to-leaf path through it (i.e. fewer than
+        ``mamba_ckpt_window`` mamba-valued nodes exist strictly below it
+        along at least one descendant path)."""
+        window = self.mamba_ckpt_window
+        if window <= 0:
+            return False
+        if len(node.children) == 0:
+            return True  # a leaf is always the deepest checkpoint of its path
+        # DFS with the running count of checkpoints below `node`; early out
+        # as soon as one path stays under the window.
+        stack = [(child, 0) for child in node.children.values()]
+        while stack:
+            cur, cnt = stack.pop()
+            if cur.mamba_value is not None:
+                cnt += 1
+            if cnt >= window:
+                continue
+            if len(cur.children) == 0:
+                return True
+            stack.extend((child, cnt) for child in cur.children.values())
+        return False
 
     def evict_full(self, full_num_tokens: int) -> int:
         """Evict full KV cache. Returns the number of tokens evicted."""
@@ -1054,12 +1152,20 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         child_key = key.child_key(self.page_size)
 
         value: List[torch.Tensor] = []
+        # Token depth of `node` (sum of matched value lengths so far). With
+        # --mamba-checkpoint-interval only checkpoints at absolute interval
+        # multiples are resume candidates: off-grid checkpoints (legacy
+        # entries or unaligned edge paths) would re-introduce
+        # traffic-dependent resume points.
+        cum_tokens = 0
         best_value_len = 0
         best_last_node = node
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             # update best_value_len and best_last_node if needed
-            if node.mamba_value is not None:
+            if node.mamba_value is not None and is_on_interval(
+                cum_tokens, self.mamba_checkpoint_interval
+            ):
                 best_value_len = len(value)
                 best_last_node = node
 
@@ -1071,13 +1177,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 break
             else:
                 value.append(child.value)
+                cum_tokens += len(child.value)
                 node = child
                 key = key[prefix_len:]
 
                 if len(key):
                     child_key = key.child_key(self.page_size)
         # handle best_value_len and best_last_node, for the case that last node is fully matched
-        if node.mamba_value is not None:
+        if node.mamba_value is not None and is_on_interval(
+            cum_tokens, self.mamba_checkpoint_interval
+        ):
             best_value_len = len(value)
             best_last_node = node
 
@@ -1118,12 +1227,33 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             node_update = node_update.parent
 
+        # --mamba-checkpoint-interval strict resume: identical requests must
+        # resume at the DEEPEST interval boundary of their match or not at
+        # all — a shallower surviving checkpoint depends on which entries
+        # the LRU churn spared and would vary run-to-run. The branching
+        # logic below then re-establishes the missing deep checkpoint.
+        if (
+            self.mamba_checkpoint_interval is not None
+            and self.mamba_ckpt_strict_resume
+            and best_value_len > 0
+        ):
+            total_match_tokens = sum(len(v) for v in value)
+            best_depth = sum(len(v) for v in value[:best_value_len])
+            if best_depth != floor_to_interval(
+                total_match_tokens, self.mamba_checkpoint_interval
+            ):
+                best_value_len = 0
+                last_node = self.root_node
+
         # Calculate the branching point. It is defined as the last aligned position that
-        # does not have a mamba value.
+        # does not have a mamba value. With --mamba-checkpoint-interval the
+        # alignment grid is the (coarser) checkpoint interval, so
+        # re-established checkpoints stay on the deterministic grid.
         if len(value) > best_value_len:
+            branch_grid = self.mamba_checkpoint_interval or self.mamba_cache_chunk_size
             chunk_aligned_seqlen = (
-                sum(len(v) for v in value) // self.mamba_cache_chunk_size
-            ) * self.mamba_cache_chunk_size
+                sum(len(v) for v in value) // branch_grid
+            ) * branch_grid
             mamba_branching_seqlen = (
                 chunk_aligned_seqlen if chunk_aligned_seqlen > 0 else None
             )
