@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -145,6 +146,41 @@ def adjust_shard_offsets(shard_offsets, loaded_weight, dim):
             new_offset += actual_shard_size
         return new_shard_offsets
     return shard_offsets
+
+
+def _quant_block_aligned_units(
+    total: int, units: Optional[int], quant_config, block_idx: int
+) -> Optional[int]:
+    """Coarsen an element-granular unit family so every rank's shard is a
+    multiple of the weight-quant block (block-quantized FP8 etc.).
+
+    Head-granular families (unit element counts that are already
+    multiples of the quant block) pass through unchanged; only
+    fine-grained families (e.g. units == total, one element per unit)
+    are re-expressed in quant-block units. block_idx: 0 = output/block_n,
+    1 = input/block_k.
+    """
+    if units is None or quant_config is None:
+        return units
+    block = getattr(quant_config, "weight_block_size", None)
+    if not block:
+        return units
+    b = block[block_idx]
+    if total % b != 0:
+        # Dimension is not block-quantizable at all (e.g. tiny GDN
+        # projections) — the quant method's own skip/validation logic
+        # owns this case; do not coarsen.
+        return units
+    unit_elems = total // units
+    if unit_elems % b == 0:
+        return units
+    lcm = math.lcm(unit_elems, b)
+    if total % lcm != 0:
+        raise ValueError(
+            f"Cannot align uneven-TP units (unit={unit_elems} elems) of a "
+            f"{total}-wide dimension to the weight quant block {b}."
+        )
+    return total // lcm
 
 
 class LinearBase(torch.nn.Module):
@@ -354,6 +390,18 @@ class ColumnParallelLinear(LinearBase):
         if not hasattr(self, "tp_units"):
             self.tp_units = tp_units
         assert self.quant_method is not None
+        # tp_units is defined against the PER-PART output size (merged
+        # layers partition each part independently), so quant-block
+        # coarsening must use the same basis — the total would halve the
+        # effective granularity for gate_up-style two-part layers.
+        _units_basis = (
+            self.output_sizes[0]
+            if hasattr(self, "output_sizes") and self.output_sizes
+            else self.output_size
+        )
+        self.tp_units = _quant_block_aligned_units(
+            _units_basis, self.tp_units, quant_config, 0
+        )
         self.output_size_per_partition = tp_partition_size(
             self.output_size, tp_size, tp_rank, self.tp_units
         )
@@ -933,22 +981,44 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         assert loaded_shard_id < len(self.output_sizes)
 
         if isinstance(param, BlockQuantScaleParameter):
-            if tp_plan_active(self.tp_size):
-                raise NotImplementedError(
-                    "Block-quant scale loading is not supported with uneven "
-                    "TP (--rank-tp-ratio) yet."
-                )
             weight_block_size = self.quant_method.quant_config.weight_block_size
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]
             block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
-            shard_offset = (
-                (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
-            ) // self.tp_size
-            shard_size = (
-                (self.output_sizes[loaded_shard_id] + block_n - 1)
-                // block_n
-                // self.tp_size
-            )
+            if tp_plan_active(self.tp_size) and self.tp_units is not None:
+                # Uneven TP: the units were coarsened to quant-block
+                # multiples in __init__, so every rank's weight shard is
+                # block_n-aligned and the scale-grid shard is exactly the
+                # weight shard / block_n. The source-side offset follows
+                # from the same unit distribution via the param's
+                # tp_units attribute in load_merged_column_weight.
+                shard_offset = (
+                    sum(
+                        tp_partition_size(
+                            sz, self.tp_size, self.tp_rank, self.tp_units
+                        )
+                        for sz in self.output_sizes[:loaded_shard_id]
+                    )
+                    // block_n
+                )
+                shard_size = (
+                    tp_partition_size(
+                        self.output_sizes[loaded_shard_id],
+                        self.tp_size,
+                        self.tp_rank,
+                        self.tp_units,
+                    )
+                    // block_n
+                )
+            else:
+                shard_offset = (
+                    (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1)
+                    // block_n
+                ) // self.tp_size
+                shard_size = (
+                    (self.output_sizes[loaded_shard_id] + block_n - 1)
+                    // block_n
+                    // self.tp_size
+                )
         else:
             # Per packed output its own partition (see weight_loader).
             shard_offset = sum(
@@ -1547,9 +1617,11 @@ class RowParallelLinear(LinearBase):
         # column-parallel layer's units, e.g. kv heads for o_proj).
         # Without an installed ratio plan, tp_partition_size() reproduces
         # divide() exactly, so the default path is unchanged.
-        self.tp_units = tp_units
+        self.tp_units = _quant_block_aligned_units(
+            input_size, tp_units, quant_config, 1
+        )
         self.input_size_per_partition = tp_partition_size(
-            input_size, self.tp_size, self.tp_rank, tp_units
+            input_size, self.tp_size, self.tp_rank, self.tp_units
         )
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
