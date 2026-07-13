@@ -11,6 +11,11 @@ from sglang.srt.configs.mamba_utils import (
 from sglang.srt.distributed import (
     divide,
 )
+from sglang.srt.distributed.utils import (
+    tp_partition_offset,
+    tp_partition_size,
+    tp_plan_active,
+)
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
 from sglang.srt.layers.attention.mamba.ops import (
@@ -85,11 +90,18 @@ def mamba_v2_sharded_weight_loader(
     shard_spec: List[Tuple[int, int, float]],
     tp_size: int,
     tp_rank: int,
+    tp_units: Optional[int] = None,
 ) -> LoaderFunction:
     """Create a weight loader for mamba v2. This ensures that the projections
     are correctly sharded so that they can be split into x, B, C. It also
     ensures that all the groups corresponding to a head shard is placed
     together with it.
+
+    `tp_units` (uneven TP, --rank-tp-ratio): unit count of every group in
+    the spec (e.g. GDN k heads); each group is then partitioned by the
+    installed shard plan (prefix-sum offsets) instead of the uniform
+    full_dim // tp_size split. None keeps the classic behavior bit for
+    bit.
     """
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -128,17 +140,24 @@ def mamba_v2_sharded_weight_loader(
             #   groups to accompany head shards.
 
             # - size of the loaded shard
-            shard_size = full_dim // tp_size
+            if tp_units is not None and tp_plan_active(tp_size) and not duplicate_groups:
+                # Uneven TP: this rank's unit-based partition of the
+                # group, offset by the prefix sum of the earlier ranks.
+                shard_size = tp_partition_size(full_dim, tp_size, tp_rank, tp_units)
+                loaded_skip = tp_partition_offset(full_dim, tp_size, tp_rank, tp_units)
+            else:
+                shard_size = full_dim // tp_size
 
-            # - compute the rank into the loaded shard.
-            # - if there is replication, different TP shards will
-            #   take from the same rank.
-            # NOTE: currently we only support duplication
-            # in the case where num_groups == 1
-            rank = 0 if duplicate_groups else tp_rank
+                # - compute the rank into the loaded shard.
+                # - if there is replication, different TP shards will
+                #   take from the same rank.
+                # NOTE: currently we only support duplication
+                # in the case where num_groups == 1
+                rank = 0 if duplicate_groups else tp_rank
 
-            # - leftmost boundary index into loaded weight.
-            loaded_skip = rank * shard_size
+                # - leftmost boundary index into loaded weight.
+                loaded_skip = rank * shard_size
+
             loaded_start_idx = loaded_boundary + loaded_skip
 
             # - take these many dims from the loaded weight.

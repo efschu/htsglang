@@ -35,6 +35,7 @@ from sglang.srt.configs.qwen3_5 import (
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed.utils import tp_partition_size, tp_plan_active
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
@@ -189,6 +190,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.alt_stream = alt_stream
 
+        # Per-rank (local) GDN head counts. Even TP: total // tp_size,
+        # exactly as before. Uneven TP (--rank-tp-ratio): this rank's
+        # share of the shard plan, with the k heads as indivisible units
+        # (v heads are a fixed multiple of k heads, so both stay aligned).
+        self.local_num_k_heads = tp_partition_size(
+            self.num_k_heads, self.attn_tp_size, self.attn_tp_rank, self.num_k_heads
+        )
+        self.local_num_v_heads = tp_partition_size(
+            self.num_v_heads, self.attn_tp_size, self.attn_tp_rank, self.num_k_heads
+        )
+
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.layer_id = layer_id
         self.activation = config.hidden_act
@@ -205,6 +217,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("conv1d", prefix),
+            # Uneven TP: conv channels are partitioned in whole k-head
+            # units (each unit carries 2*head_k_dim + ratio*head_v_dim
+            # channels). Ignored on the default path.
+            tp_units=self.num_k_heads,
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
@@ -248,28 +264,38 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 ],
                 self.attn_tp_size,
                 self.attn_tp_rank,
+                # Uneven TP: partition every conv group in whole k-head
+                # units. None (default path) keeps the classic
+                # full_dim // tp_size split.
+                tp_units=self.num_k_heads,
             ),
         )
 
         # State parameters
         self.dt_bias = nn.Parameter(
-            torch.ones(self.num_v_heads // self.attn_tp_size),
+            torch.ones(self.local_num_v_heads),
         )
         self.A_log = nn.Parameter(
-            torch.empty(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
+            torch.empty(self.local_num_v_heads, dtype=torch.float32),
         )
 
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.A_log,
+            {"weight_loader": sharded_weight_loader(0), "tp_units": self.num_k_heads},
+        )
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0), "tp_units": self.num_k_heads},
+        )
 
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
         self.attn = RadixLinearAttention(
             layer_id=layer_id,
-            num_q_heads=self.num_k_heads // self.attn_tp_size,
-            num_k_heads=self.num_k_heads // self.attn_tp_size,
-            num_v_heads=self.num_v_heads // self.attn_tp_size,
+            num_q_heads=self.local_num_k_heads,
+            num_k_heads=self.local_num_k_heads,
+            num_v_heads=self.local_num_v_heads,
             head_q_dim=self.head_k_dim,
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
@@ -304,6 +330,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("out_proj", prefix),
+            # Uneven TP: the input (value) dim is partitioned in whole
+            # k-head units, matching the in_proj/conv1d split.
+            tp_units=self.num_k_heads,
         )
 
     @staticmethod
@@ -428,6 +457,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=prefix,
             tp_rank=tp_rank,
             tp_size=tp_size,
+            # Uneven TP: q/k/v/z are partitioned in whole k-head units so
+            # all four packed outputs stay aligned per rank.
+            tp_units=self.num_k_heads,
         )
 
     def create_ba_proj(
@@ -450,6 +482,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=prefix,
             tp_rank=tp_rank,
             tp_size=tp_size,
+            # Uneven TP: b/a are per-v-head scalars, partitioned in whole
+            # k-head units to stay aligned with the qkvz split.
+            tp_units=self.num_k_heads,
         )
 
     def fix_query_key_value_ordering(
@@ -460,9 +495,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         Derives `query`, `key` and `value` tensors from `mixed_qkvzba`.
         """
-        k_tp = self.key_dim // self.attn_tp_size
-        v_tp = self.value_dim // self.attn_tp_size
-        nv_tp = self.num_v_heads // self.attn_tp_size
+        k_tp = self.local_num_k_heads * self.head_k_dim
+        v_tp = self.local_num_v_heads * self.head_v_dim
+        nv_tp = self.local_num_v_heads
 
         # Directly split, no head group reshape
         query, key, value, z = mixed_qkvz.split([k_tp, k_tp, v_tp, v_tp], dim=-1)
@@ -525,8 +560,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 projected_states_qkvz,
                 projected_states_ba,
-                triton.cdiv(self.num_k_heads, self.attn_tp_size),
-                triton.cdiv(self.num_v_heads, self.attn_tp_size),
+                self.local_num_k_heads,
+                self.local_num_v_heads,
                 self.head_k_dim,
                 self.head_v_dim,
             )
@@ -535,8 +570,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
                     projected_states_qkvz,
                     projected_states_ba,
-                    self.num_k_heads // self.attn_tp_size,
-                    self.num_v_heads // self.attn_tp_size,
+                    self.local_num_k_heads,
+                    self.local_num_v_heads,
                     self.head_k_dim,
                     self.head_v_dim,
                 )
@@ -735,15 +770,38 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % self.attn_tp_size == 0
-        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= self.attn_tp_size:
-            assert self.total_num_kv_heads % self.attn_tp_size == 0
+        if tp_plan_active(self.attn_tp_size):
+            # Uneven TP (--rank-tp-ratio): heads follow the shard plan
+            # with kv heads as indivisible units, matching the split in
+            # QKVParallelLinear (whole GQA groups per rank; kv-head
+            # replication is rejected there).
+            self.num_heads = tp_partition_size(
+                self.total_num_heads,
+                self.attn_tp_size,
+                self.attn_tp_rank,
+                self.total_num_kv_heads,
+            )
+            self.num_kv_heads = tp_partition_size(
+                self.total_num_kv_heads,
+                self.attn_tp_size,
+                self.attn_tp_rank,
+                self.total_num_kv_heads,
+            )
+            # The fallback head_dim must not depend on the per-rank head
+            # count under uneven TP.
+            self.head_dim = config.head_dim or (
+                self.hidden_size // self.total_num_heads
+            )
         else:
-            assert self.attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
-        self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
+            assert self.total_num_heads % self.attn_tp_size == 0
+            self.num_heads = self.total_num_heads // self.attn_tp_size
+            if self.total_num_kv_heads >= self.attn_tp_size:
+                assert self.total_num_kv_heads % self.attn_tp_size == 0
+            else:
+                assert self.attn_tp_size % self.total_num_kv_heads == 0
+            self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
+            self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -799,6 +857,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("o_proj", prefix),
+            # Uneven TP: the o_proj input dim is partitioned like the q
+            # heads in qkv_proj (kv-head units). Ignored on the default
+            # path (no shard plan installed).
+            tp_units=self.total_num_kv_heads,
         )
 
         self.attn = RadixAttention(

@@ -1386,10 +1386,22 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        from sglang.srt.distributed.utils import tp_loaded_shard_start
+
         tp_rank = get_parallel().attn_tp_rank
 
         shard_size = param.data.shape[shard_axis]
-        start_idx = tp_rank * shard_size
+        # Even TP: tp_rank * shard_size, as before. Uneven TP
+        # (--rank-tp-ratio): prefix-sum offset from the shard plan; the
+        # optional `tp_units` attribute on the parameter (e.g. GDN k
+        # heads) marks the dimension's indivisible unit count.
+        start_idx = tp_loaded_shard_start(
+            loaded_weight.shape[shard_axis],
+            get_parallel().attn_tp_size,
+            tp_rank,
+            shard_size,
+            getattr(param, "tp_units", None),
+        )
 
         if (
             is_cpu()
