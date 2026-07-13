@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.input_buffers import share_input_buffer
 
 if TYPE_CHECKING:
@@ -224,6 +225,42 @@ class GraphSlot:
             return self.buffer
         return self.buffer[: self._padded_n(padded_bs, padded_num_tokens)]
 
+    def poison_inactive_tail(self, raw_n: int) -> None:
+        """SGLANG_POISON_GRAPH_PAD falsifier (#50 campaign): overwrite every
+        buffer element beyond this iteration's raw region with loud,
+        deterministic junk — floats NaN, uint8 0xFF, other ints 100 — BEFORE
+        the semantic pad reset (which restores the [raw:padded] window for
+        ZERO/FILL_SENTINEL slots) and before the head copy.
+
+        KEEP_PAD / FOREACH_COPY slots carry a "the tail is never read" proof
+        obligation; this lever tests it empirically: if a boot with the env
+        set produces different output than a clean boot, some kernel DOES
+        read beyond the active region (and the junk localizes it). If output
+        is bit-identical, the stale-tail class is exonerated for the entire
+        registry — eager and graph mode alike.
+        """
+        if self.buffer is None:
+            return
+        if self.axis == "none":
+            return  # full buffer is always active
+        if self.slice_fn is not None:
+            # slice_fn slices the same axis slice_for exposes; numel() is a
+            # safe over-bound that torch clamps to the full extent.
+            full = self.slice_fn(self.buffer, self.buffer.numel())
+            tail = full[..., raw_n:] if full.dim() > 1 else full[raw_n:]
+        else:
+            tail = self.buffer[raw_n:]
+        if tail.numel() == 0:
+            return
+        if tail.is_floating_point():
+            tail.fill_(float("nan"))
+        elif tail.dtype == torch.uint8:
+            tail.fill_(0xFF)
+        elif tail.dtype == torch.bool:
+            return  # both values are semantic for masks; leave untouched
+        else:
+            tail.fill_(100)
+
     def reset_padding(self, raw_n: int, padded_n: int) -> None:
         """Reset the padded tail according to ``padding_policy``."""
         if self.buffer is None or raw_n >= padded_n:
@@ -410,12 +447,19 @@ class CudaGraphBufferRegistry:
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        # Phase 1: reset padded regions where it matters.
+        # Phase 1: reset padded regions where it matters. With
+        # SGLANG_POISON_GRAPH_PAD, first poison everything beyond the raw
+        # region (falsifier for "the tail is never read" claims); the
+        # semantic pad reset below then restores the [raw:padded] window for
+        # ZERO / FILL_SENTINEL slots, and Phase 2 rewrites the head.
+        poison_pad = envs.SGLANG_POISON_GRAPH_PAD.get()
         for slot in self._slots.values():
             if not slot.enabled or slot.buffer is None:
                 continue
             raw_n = slot._raw_n(raw_bs, raw_num_tokens)
             padded_n = slot._padded_n(padded_bs, padded_num_tokens)
+            if poison_pad:
+                slot.poison_inactive_tail(raw_n)
             slot.reset_padding(raw_n, padded_n)
 
         # Phase 2: collect (dst, src) pairs and dispatch a grouped copy.
