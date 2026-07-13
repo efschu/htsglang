@@ -1052,8 +1052,10 @@ class ModelConfig:
         """Per-rank kv-head count under an installed uneven-TP shard plan
         (--rank-tp-ratio): kv heads are distributed as indivisible units
         over the ratio vector. Returns None when no plan applies (default
-        even split). Without an explicit `rank`, the smallest share is
-        returned as a conservative basis for engine-level callers."""
+        even split). Without an explicit `rank`, this rank is auto-
+        resolved from the initialized attn-TP group (worker processes);
+        engine-level callers (no group yet) get the smallest share as a
+        conservative basis."""
         from sglang.srt.distributed.utils import (
             get_tp_partition_ratios,
             partition_sizes,
@@ -1067,6 +1069,16 @@ class ModelConfig:
             weights=get_tp_partition_ratios(),
             units=total_num_kv_heads,
         )
+        if rank is None:
+            # Auto-resolve so every worker-process caller (KV pools, pool
+            # configurator, attention backends) gets ITS rank's share
+            # without threading the rank through each call site.
+            try:
+                from sglang.srt.runtime_context import get_parallel
+
+                rank = get_parallel().attn_tp_rank
+            except Exception:
+                rank = None
         return sizes[rank] if rank is not None else min(sizes)
 
     def get_num_kv_heads(self, tensor_parallel_size, rank: Optional[int] = None) -> int:
