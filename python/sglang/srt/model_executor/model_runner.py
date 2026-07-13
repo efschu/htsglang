@@ -1181,13 +1181,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if moe_intermediate_size is None:
                 return
 
-            if moe_intermediate_size % moe_tp_size != 0:
+            from sglang.srt.distributed.utils import (
+                partition_sizes,
+                get_tp_partition_ratios,
+                tp_plan_active,
+            )
+
+            _plan = get_tp_partition_ratios()
+            if tp_plan_active(moe_tp_size) and _plan and len(_plan) == moe_tp_size:
+                # Uneven TP: the expert intermediate is partitioned in
+                # quant-block units by the shard plan — validate that
+                # every rank's share is a whole multiple of the quant
+                # block instead of requiring even divisibility.
+                _units = moe_intermediate_size
+                if weight_block_size_n and (
+                    moe_intermediate_size % weight_block_size_n == 0
+                ):
+                    _units = moe_intermediate_size // weight_block_size_n
+                partition_sizes(moe_intermediate_size, _plan, _units)
+            elif moe_intermediate_size % moe_tp_size != 0:
                 raise ValueError(
                     f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
                 )
 
             if (
                 not envs.SGLANG_SHARED_EXPERT_TP1.get()
+                and not (
+                    tp_plan_active(moe_tp_size)
+                    and _plan
+                    and len(_plan) == moe_tp_size
+                )
                 and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
                 and not _use_aiter
             ):
