@@ -315,6 +315,14 @@ class Envs:
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
     # Scheduler: force lazy extra_buffer prealloc to fail at decode boundaries
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
+    # --mamba-checkpoint-interval: how many of the deepest on-grid mamba
+    # checkpoints per radix path evict_mamba keeps live (best effort; a
+    # second eviction pass ignores the window when the pool must yield).
+    SGLANG_MAMBA_CKPT_WINDOW = EnvInt(2)
+    # --mamba-checkpoint-interval: resume only at the DEEPEST interval
+    # boundary of the full-KV match (else recompute from 0) instead of the
+    # deepest surviving on-grid checkpoint.
+    SGLANG_MAMBA_CKPT_STRICT_RESUME = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
