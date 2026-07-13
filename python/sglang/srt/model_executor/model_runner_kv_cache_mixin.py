@@ -105,10 +105,26 @@ class ModelRunnerKVCacheMixin:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
+        #
+        # --rank-gpu-memory-mib: mem_fraction_static was set per rank
+        # (budget_mib / nvml_total of the rank's GPU, applied unmodified),
+        # so the measurement must stay LOCAL — the classic min-reduce of
+        # free bytes would collapse every rank onto the weakest GPU and
+        # throw the uneven budgets away. Rank consistency is restored in
+        # _apply_token_constraints by min-reducing the derived TOKEN
+        # capacities (per-token bytes scale with each rank's kv-head
+        # share, so proportional budgets yield near-equal token counts).
+        uneven_memory = self.server_args.uneven_memory_budgets_active()
+        if uneven_memory and get_world_group().world_size > 1:
+            # Serialize the profiling of co-located ranks per physical
+            # GPU: a barrier guarantees every rank finished loading its
+            # weights before any rank reads the (shared) free memory, so
+            # the measurement is deterministic.
+            torch.distributed.barrier(group=get_world_group().cpu_group)
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=get_world_group().world_size > 1 and not uneven_memory,
             cpu_group=get_world_group().cpu_group,
         )
 
@@ -134,6 +150,20 @@ class ModelRunnerKVCacheMixin:
             suggested_mem_fraction_static = (
                 math.ceil(minimum_mem_fraction_static * 1000) / 1000
             )
+            if uneven_memory:
+                # In this mode --mem-fraction-static is rejected up front;
+                # phrase the fix in the budget's own unit (MiB).
+                used_gb = pre_model_load_memory - available_gpu_memory
+                raise ValueError(
+                    f"Loaded weights leave no GPU memory for the KV cache "
+                    f"under --rank-gpu-memory-mib on rank {self.tp_rank}: "
+                    f"the rank already uses {used_gb:.2f} GiB "
+                    f"(~{math.ceil(used_gb * 1024)} MiB) for weights and "
+                    f"runtime state, which exhausts the per-rank budget. "
+                    f"Raise --rank-gpu-memory-mib above that, or place "
+                    f"fewer ranks on this GPU. If using speculative "
+                    f"decoding, draft weights are now counted."
+                )
             raise ValueError(
                 f"Loaded weights leave no GPU memory for the KV cache under "
                 f"--mem-fraction-static={self.mem_fraction_static}. "
@@ -145,6 +175,34 @@ class ModelRunnerKVCacheMixin:
             )
 
         return int(rest_memory * (1 << 30))  # return in bytes
+
+    def _sync_uneven_mamba_cache_size(self: ModelRunner) -> None:
+        """Agree on one max_mamba_cache_size across uneven-TP ranks.
+
+        Under --rank-gpu-memory-mib the memory-derived Mamba pool size
+        differs per rank: the byte budget is rank-local and (with a shard
+        plan) the per-request state size scales with the rank's k-head
+        share. The pool size is a request COUNT that the scheduler and the
+        (Mamba)RadixCache assume to be identical on every rank, so — like
+        the KV token capacity — the ranks agree on the minimum. With
+        budgets proportional to the head ratio the min is nearly lossless.
+        No-op on the default path (byte-level MIN already unified it)."""
+        if not self.server_args.uneven_memory_budgets_active():
+            return
+        if get_world_group().world_size <= 1:
+            return
+        local_size = self.server_args.max_mamba_cache_size
+        tensor = torch.tensor(local_size, dtype=torch.int64)
+        torch.distributed.all_reduce(
+            tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=get_world_group().cpu_group,
+        )
+        agreed = int(tensor.item())
+        if agreed != local_size:
+            self.server_args.override(
+                "mamba_pool.uneven_tp_min", max_mamba_cache_size=agreed
+            )
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config
@@ -222,6 +280,10 @@ class ModelRunnerKVCacheMixin:
                         mamba_budget_bytes // (per_req * (1 + D / ratio))
                     ),
                 )
+                # Uneven TP: the size was derived from rank-local bytes /
+                # per-req state; agree on the min BEFORE it feeds
+                # capped_reqs and the intermediate-memory reservation.
+                self._sync_uneven_mamba_cache_size()
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
@@ -235,6 +297,31 @@ class ModelRunnerKVCacheMixin:
                 server_args.override(
                     "mamba_pool.memory_budget",
                     max_mamba_cache_size=int(mamba_budget_bytes // per_req),
+                )
+                # Uneven TP: agree on the min across ranks (see above).
+                self._sync_uneven_mamba_cache_size()
+
+        # Uneven TP (--rank-gpu-memory-mib): the ratio-based auto-sizing
+        # above ran on rank-LOCAL memory, so the derived request COUNT can
+        # differ slightly per rank (the per-request state bytes scale with
+        # each rank's head share, so proportional budgets give near-equal
+        # counts). The schedulers run in lockstep and must agree on one
+        # count — min-reduce it before anything consumes it.
+        if (
+            self.server_args.uneven_memory_budgets_active()
+            and get_world_group().world_size > 1
+        ):
+            tensor = torch.tensor(server_args.max_mamba_cache_size, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_world_group().cpu_group,
+            )
+            synced_size = int(tensor.item())
+            if synced_size != server_args.max_mamba_cache_size:
+                server_args.override(
+                    "mamba_pool.uneven_tp_min_sync",
+                    max_mamba_cache_size=synced_size,
                 )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
@@ -379,10 +466,16 @@ class ModelRunnerKVCacheMixin:
         """Resize the KV pool after capture."""
         pool = self.token_to_kv_pool
         torch.cuda.synchronize()
+        # --rank-gpu-memory-mib: keep the measurement rank-local (see
+        # _profile_available_bytes); the resulting token count is clamped
+        # by _apply_token_constraints via _config_from_budget below.
+        uneven_memory = self.server_args.uneven_memory_budgets_active()
+        if uneven_memory and get_world_group().world_size > 1:
+            torch.distributed.barrier(group=get_world_group().cpu_group)
         free_gb = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=get_world_group().world_size > 1 and not uneven_memory,
             cpu_group=get_world_group().cpu_group,
         )
         headroom_gb = self.pre_model_load_memory * (1 - self.mem_fraction_static)
@@ -1332,8 +1425,17 @@ class ModelRunnerKVCacheMixin:
                 )
             token_capacity = min(token_capacity, user_limit)
 
-        # Sync across PP ranks (each may have different layer counts)
-        if self.pp_size > 1:
+        # Sync across PP ranks (each may have different layer counts) and
+        # across uneven-TP ranks (--rank-gpu-memory-mib: byte profiling is
+        # rank-local, and per-token bytes differ with each rank's kv-head
+        # share — the TOKEN capacity is the unit every rank must agree
+        # on, so the scheduler's single max_total_num_tokens stays
+        # consistent; proportional budgets make the min nearly lossless).
+        needs_capacity_sync = self.pp_size > 1 or (
+            self.server_args.uneven_memory_budgets_active()
+            and get_world_group().world_size > 1
+        )
+        if needs_capacity_sync:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,

@@ -1316,19 +1316,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"(tp_size={self.tp_size}, pp_size={self.pp_size}, ep_size={self.moe_ep_size})"
                 )
 
+        # --rank-gpu-memory-mib: budgets are deliberately per-rank, so the
+        # free-byte measurement must stay LOCAL (no min-reduce across
+        # ranks); consistency across ranks is restored later by
+        # min-reducing the derived token capacities.
+        uneven_memory = self.server_args.uneven_memory_budgets_active()
         pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=get_world_group().world_size > 1 and not uneven_memory,
             cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()
         self.pp_group = get_pp_group()
         self.attention_tp_group = get_parallel().attn_tp_group
 
-        # Check memory for tensor parallelism
+        # Check memory for tensor parallelism (definitionally unbalanced
+        # under per-rank memory budgets — skip in that mode).
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        if self.tp_size > 1 and not self.is_draft_worker:
+        if self.tp_size > 1 and not self.is_draft_worker and not uneven_memory:
             if pre_model_load_memory < local_gpu_memory * 0.9:
                 msg = "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
                 msg += f"{pre_model_load_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
