@@ -476,14 +476,19 @@ class ColumnParallelLinear(LinearBase):
 
         # Materialize GGUF UninitializedParameter
         if is_gguf_weight and isinstance(param, UninitializedParameter):
-            if tp_plan_active(self.tp_size):
-                raise NotImplementedError(
-                    "GGUF weight loading is not supported with uneven TP "
-                    "(--rank-tp-ratio)."
-                )
             weight_shape = list(loaded_weight.shape)
             if output_dim is not None:
-                weight_shape[output_dim] = weight_shape[output_dim] // self.tp_size
+                # Uneven TP: this rank's row (output) partition. Reproduces the
+                # even `// tp_size` split when no ratio plan is installed. GGUF
+                # rows are whole, so output sharding never splits a quant block
+                # (the narrow below uses the matching prefix-sum start).
+                weight_shape[output_dim] = tp_partition_size(
+                    weight_shape[output_dim],
+                    self.tp_size,
+                    self.tp_rank,
+                    self.tp_units,
+                    self.tp_family,
+                )
             param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
             param_data = param.data
 
@@ -658,7 +663,54 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: tuple[int, ...] | int | None = None,
     ):
+        # Special case for GGUF
+        # initialize GGUF param after we know the quantize type
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+
         if isinstance(loaded_shard_id, tuple):
+            # GDN in_proj_qkvz packs [q, k, v, z]. For GGUF the q,k,v part
+            # arrives as ONE already-fused tensor (attn_qkv) tagged with the
+            # multi-index shard (0, 1, 2); load it as a single combined shard
+            # keyed by the whole tuple (the fused output already has q|k|v in
+            # order, so downstream padding/apply treat it as one contiguous
+            # shard). bf16/fp8 params instead take the v2 merged-column path.
+            if is_gguf_weight_type:
+                for idx in loaded_shard_id:
+                    param.data[idx].copy_(loaded_weight)
+                param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+                return
+            if is_gguf_weight:
+                if self.tp_size > 1:
+                    # The multi-index (0,1,2) shard is the GDN in_proj_qkvz whose
+                    # q|k|v are FUSED in one GGUF tensor. Splitting the fused
+                    # block across ranks would cut through the q/k/v boundaries;
+                    # correct TP>1 needs a de-fuse-then-per-head split (TODO).
+                    raise NotImplementedError(
+                        "GGUF sharding of the fused GDN in_proj_qkvz across "
+                        "TP>1 is not supported yet (fused q|k|v must be de-fused "
+                        "and split per head). Use TP=1 for qwen35 GGUF for now."
+                    )
+                output_dim = getattr(param, "output_dim", None)
+                total = loaded_weight.size(output_dim)
+                # This rank's row (output) partition of the fused component;
+                # at TP=1 tp_partition_size returns the whole tensor.
+                shard_size = tp_partition_size(
+                    total, self.tp_size, self.tp_rank, self.tp_units, self.tp_family
+                )
+                start_idx = tp_loaded_shard_start(
+                    total,
+                    self.tp_size,
+                    self.tp_rank,
+                    shard_size,
+                    self.tp_units,
+                    self.tp_family,
+                )
+                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+                param.shard_id.append(loaded_shard_id)
+                param.shard_id_map[loaded_shard_id] = len(param.data_container)
+                param.data_container.append(loaded_weight)
+                return
             if hasattr(param, "load_merged_column_weight"):
                 return self.weight_loader_v2(param, loaded_weight, loaded_shard_id)
             raise NotImplementedError(
@@ -666,24 +718,27 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 "please use weight_loader_v2 instead."
             )
 
-        # Special case for GGUF
-        # initialize GGUF param after we know the quantize type
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
         if is_gguf_weight_type:
             param.data[loaded_shard_id].copy_(loaded_weight)
             param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
             return
 
         if is_gguf_weight:
-            if tp_plan_active(self.tp_size):
-                raise NotImplementedError(
-                    "GGUF weight loading is not supported with uneven TP "
-                    "(--rank-tp-ratio)."
-                )
             output_dim = getattr(param, "output_dim", None)
-            shard_size = loaded_weight.size(output_dim) // self.tp_size
-            start_idx = self.tp_rank * shard_size
+            total = loaded_weight.size(output_dim)
+            # Uneven TP: this rank's row (output) partition; reproduces even
+            # //tp_size with no plan. Rows are whole -> no quant-block concern.
+            shard_size = tp_partition_size(
+                total, self.tp_size, self.tp_rank, self.tp_units, self.tp_family
+            )
+            start_idx = tp_loaded_shard_start(
+                total,
+                self.tp_size,
+                self.tp_rank,
+                shard_size,
+                self.tp_units,
+                self.tp_family,
+            )
 
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
@@ -1373,14 +1428,21 @@ class QKVParallelLinear(ColumnParallelLinear):
             return
 
         if is_gguf_weight:
-            if tp_plan_active(self.tp_size):
-                raise NotImplementedError(
-                    "GGUF weight loading is not supported with uneven TP "
-                    "(--rank-tp-ratio)."
-                )
             output_dim = getattr(param, "output_dim", None)
-            shard_size = loaded_weight.size(output_dim) // self.tp_size
-            start_idx = self.tp_rank * shard_size
+            total = loaded_weight.size(output_dim)
+            # Uneven TP: this rank's row (output) partition; reproduces even
+            # //tp_size with no plan. Rows are whole -> no quant-block concern.
+            shard_size = tp_partition_size(
+                total, self.tp_size, self.tp_rank, self.tp_units, self.tp_family
+            )
+            start_idx = tp_loaded_shard_start(
+                total,
+                self.tp_size,
+                self.tp_rank,
+                shard_size,
+                self.tp_units,
+                self.tp_family,
+            )
 
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
@@ -1706,13 +1768,47 @@ class RowParallelLinear(LinearBase):
         if is_gguf_weight_type:
             param.weight_type = loaded_weight.item()
 
-        # Materialize GGUF UninitializedParameter
+        # Materialize GGUF UninitializedParameter (row-parallel: the sharded
+        # input dim of the qweight holds PACKED bytes, not elements).
         if is_gguf_weight and isinstance(param, UninitializedParameter):
-            if tp_plan_active(self.tp_size):
-                raise NotImplementedError(
-                    "GGUF weight loading is not supported with uneven TP "
-                    "(--rank-tp-ratio)."
+            if input_dim is not None and tp_plan_active(self.tp_size):
+                # Uneven TP: shard the packed input on quant-block boundaries.
+                # The byte dim holds `in_elems // ggml_block` blocks of
+                # `type_size` bytes; partition in ELEMENT space (units already
+                # coarsened to whole blocks by _quant_block_aligned_units via
+                # GGUFConfig.weight_block_size) and map to byte offsets. The
+                # ggml type is on the sibling qweight_type param, loaded first.
+                import gguf as _gguf
+
+                wtype = _gguf.GGMLQuantizationType(self.qweight_type.weight_type)
+                block_size, type_size = _gguf.GGML_QUANT_SIZES[wtype]
+                total_bytes = loaded_weight.shape[input_dim]
+                in_features = total_bytes // type_size * block_size
+                my_elems = tp_partition_size(
+                    in_features,
+                    self.tp_size,
+                    self.tp_rank,
+                    self.tp_units,
+                    self.tp_family,
                 )
+                elem_start = tp_loaded_shard_start(
+                    in_features,
+                    self.tp_size,
+                    self.tp_rank,
+                    my_elems,
+                    self.tp_units,
+                    self.tp_family,
+                )
+                # my_elems / elem_start are whole-block multiples -> exact bytes
+                byte_start = elem_start // block_size * type_size
+                byte_size = my_elems // block_size * type_size
+                weight_shape = list(loaded_weight.shape)
+                weight_shape[input_dim] = byte_size
+                param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
+                param.data.copy_(
+                    loaded_weight.narrow(input_dim, byte_start, byte_size)
+                )
+                return
             weight_shape = list(loaded_weight.shape)
             if input_dim:
                 weight_shape[input_dim] = weight_shape[input_dim] // self.tp_size
