@@ -1426,8 +1426,11 @@ def _configure_nccl_env_for_colocation(server_args: ServerArgs) -> None:
     (user-provided values always win):
 
     - NCCL_MULTI_RANK_GPU_ENABLE=1: allow several NCCL ranks to map onto
-      the same physical GPU (NCCL >= 2.28; older NCCL ignores it and
-      fails later with a clear "Duplicate GPU detected" error).
+      the same physical GPU (NCCL >= 2.30 — NVIDIA's NCCL docs list this
+      variable as "since 2.30 (experimental)"; older NCCL ignores it and
+      fails later with a clear "Duplicate GPU detected" error. Verified
+      empirically on this codebase: NCCL 2.28.9 rejects the co-located
+      communicator, NCCL 2.30.7 builds it and serves).
     - NCCL_NVLS_ENABLE=0: NVLS (NVLink SHARP) registration is not valid
       when two ranks share a device. NCCL's default of 2 silently
       disables NVLS in unsupported topologies, but we set 0 explicitly
@@ -1446,7 +1449,7 @@ def _configure_nccl_env_for_colocation(server_args: ServerArgs) -> None:
         os.environ["NCCL_MULTI_RANK_GPU_ENABLE"] = "1"
         logger.info(
             "--rank-gpu-id co-locates ranks on one physical GPU: setting "
-            "NCCL_MULTI_RANK_GPU_ENABLE=1 (requires NCCL >= 2.28)."
+            "NCCL_MULTI_RANK_GPU_ENABLE=1 (requires NCCL >= 2.30)."
         )
     if os.environ.get("NCCL_NVLS_ENABLE") is None:
         os.environ["NCCL_NVLS_ENABLE"] = "0"
