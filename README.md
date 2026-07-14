@@ -87,11 +87,9 @@ Prebuilt runtime image on GitHub Packages:
 The image ships an ENV-driven entrypoint, so launch flags are set via
 environment variables.
 
-The package is currently **private**, so authenticate to GHCR first (a GitHub
-token with `read:packages`), then pull:
+Pull it:
 
 ```bash
-echo "$GITHUB_TOKEN" | docker login ghcr.io -u efschu --password-stdin
 docker pull ghcr.io/efschu/htsglang:cu130-nccl2307
 ```
 
