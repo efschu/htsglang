@@ -23,6 +23,7 @@ from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.distributed.utils import tp_partition_size
 from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
@@ -222,6 +223,50 @@ def zero_flashinfer_workspaces() -> int:
         n += 1
     return n
 
+
+def _local_attn_head_counts(model_runner: "ModelRunner") -> tuple:
+    """This rank's real (num_qo_heads, num_kv_heads) for the flashinfer
+    wrappers.
+
+    Under uneven TP (--rank-tp-ratio) the attention heads are split
+    UNEVENLY across ranks -- whole GQA groups per rank, kv heads as the
+    indivisible units -- exactly as QKVParallelLinear / Qwen3NextAttention
+    partition them (see qwen3_next.py: num_heads = tp_partition_size(...,
+    units=total_num_kv_heads)). The q/k/v tensors handed to wrapper.run()
+    therefore carry THIS rank's uneven head count (layer.tp_q_head_num).
+
+    flashinfer's plan() builds the split-KV work partition (and the merge
+    schedule) from the num_qo_heads / num_kv_heads it is told; run() also
+    forwards those same planned counts to the kernel. If they are computed
+    as a uniform ``num_attention_heads // attn_tp_size`` they diverge from
+    the real per-rank q tensor (e.g. 24 heads over ratio [2,1,1]: real
+    [12,6,6] vs uniform 8) and, worse, the planned gqa_group_size no longer
+    matches the tensors. That mis-sizes the split-KV partition/merge for
+    long contexts (split-KV only engages once the KV is long enough),
+    silently corrupting attention on the long-context path -- divergently
+    per rank -- while short prompts (single tile, no split) stay correct.
+    Under deterministic inference (fixed_split_size) the same inconsistency
+    makes the fixed schedule unsatisfiable and the prefill kernel hangs.
+
+    num_kv_heads already auto-resolves to this rank via get_num_kv_heads()
+    inside a worker; num_qo_heads did not -- both are made explicit here.
+
+    Default path (no ratio plan installed): tp_partition_size degrades to
+    the even ``total // tp_size`` and get_num_kv_heads(rank=...) to the even
+    share, i.e. byte-identical to the previous behavior.
+    """
+    mc = model_runner.model_config
+    tp_size = get_parallel().attn_tp_size
+    tp_rank = get_parallel().attn_tp_rank
+    num_qo_heads = tp_partition_size(
+        mc.num_attention_heads,
+        tp_size,
+        tp_rank,
+        mc.get_total_num_kv_heads(),  # kv heads = the indivisible GQA units
+    )
+    num_kv_heads = mc.get_num_kv_heads(tp_size, rank=tp_rank)
+    return num_qo_heads, num_kv_heads
+
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
@@ -367,14 +412,14 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
 
-        # Parse constants
+        # Parse constants. Use THIS rank's real head counts so uneven TP
+        # (--rank-tp-ratio) picks the decode kernel path from the actual
+        # per-rank q/kv shapes (see _local_attn_head_counts).
+        _num_qo_heads, _num_kv_heads = _local_attn_head_counts(model_runner)
         self.decode_use_tensor_cores = should_use_tensor_core(
             kv_cache_dtype=model_runner.kv_cache_dtype,
-            num_attention_heads=model_runner.model_config.num_attention_heads
-            // get_parallel().attn_tp_size,
-            num_kv_heads=model_runner.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size
-            ),
+            num_attention_heads=_num_qo_heads,
+            num_kv_heads=_num_kv_heads,
         )
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
@@ -1355,12 +1400,11 @@ class FlashInferAttnBackend(AttentionBackend):
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
-        self.num_qo_heads = (
-            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
-        )
-        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size
-        )
+        # THIS rank's real head counts: under uneven TP (--rank-tp-ratio)
+        # the split is uneven, and flashinfer's split-KV plan/merge must
+        # match the actual per-rank q/kv tensors (see
+        # _local_attn_head_counts). Degrades to the even split by default.
+        self.num_qo_heads, self.num_kv_heads = _local_attn_head_counts(model_runner)
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
@@ -1623,12 +1667,11 @@ class FlashInferIndicesUpdaterDecode:
 class FlashInferIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
-        self.num_qo_heads = (
-            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
-        )
-        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size
-        )
+        # THIS rank's real head counts: under uneven TP (--rank-tp-ratio)
+        # the split is uneven, and flashinfer's split-KV plan/merge must
+        # match the actual per-rank q/kv tensors (see
+        # _local_attn_head_counts). Degrades to the even split by default.
+        self.num_qo_heads, self.num_kv_heads = _local_attn_head_counts(model_runner)
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
