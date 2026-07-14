@@ -132,6 +132,11 @@ class ModelRunnerKVCacheMixin:
             distributed=get_world_group().world_size > 1 and not uneven_memory,
             cpu_group=get_world_group().cpu_group,
         )
+        # Co-located ranks: mem_get_info() above charged this rank for its
+        # sibling(s)' weights too. Add their own footprint back so only
+        # this rank's weights are charged against its budget (no-op on the
+        # default / even-TP / one-rank-per-GPU paths).
+        available_gpu_memory += self._colocated_sibling_reserved_gb()
 
         slack_gb = pre_model_load_memory * (1 - self.mem_fraction_static)
         if self.mambaish_config is not None and self.post_capture_kv_active:
@@ -180,6 +185,65 @@ class ModelRunnerKVCacheMixin:
             )
 
         return int(rest_memory * (1 << 30))  # return in bytes
+
+    def _colocated_sibling_reserved_gb(self: ModelRunner) -> float:
+        """GiB of GPU memory reserved by TP siblings that SHARE this rank's
+        physical GPU (duplicate --rank-gpu-id entries), to be ADDED BACK to
+        the profiled free memory.
+
+        get_available_gpu_memory() reads torch.cuda.mem_get_info(), i.e.
+        DRIVER-level free memory of the physical device. When two ranks are
+        co-located on one GPU, that reading has BOTH ranks' weights
+        subtracted, but the slack/headroom term only accounts for THIS
+        rank's single budget — so rest_memory collapses to
+        ``budget - own_weights - sibling_weights`` and goes negative once
+        the summed per-rank budgets approach the card's capacity, crashing
+        the whole TP group via the downstream min-reduce.
+
+        Adding the siblings' own resident footprint back makes each rank
+        see only its OWN weights charged. torch.cuda.memory_reserved() is
+        per-PROCESS (unlike mem_get_info), so it is the rank-isolated
+        primitive; the barrier in the callers guarantees every sibling's
+        weights are resident before we gather.
+
+        This restores single-rank semantics MINUS each sibling's CUDA
+        context (~0.3-0.6 GB, which memory_reserved() does not count). That
+        residual is deliberate and conservative: the resulting budget is a
+        touch SMALLER than a true single-rank profile, never larger, so
+        co-located ranks can never over-allocate. Do NOT "fix" the apparent
+        context gap by adding it back — the front-end
+        ``Σ rank_gpu_memory_mib ≤ card total`` check plus this pessimism is
+        what keeps the summed co-located pools under the card's capacity.
+
+        Returns 0.0 on the default path, in even TP, and for ranks that do
+        not share their GPU — leaving those budgets byte-for-byte unchanged.
+
+        Collective: the guard below is world-wide identical, so every rank
+        either participates in the all_gather or none do — never a subset
+        (which would hang).
+        """
+        rgid = self.server_args.rank_gpu_id
+        if (
+            not self.server_args.uneven_memory_budgets_active()
+            or rgid is None
+            or len(set(rgid)) == len(rgid)  # no co-location anywhere
+            or get_world_group().world_size <= 1
+        ):
+            return 0.0
+        my_gpu = rgid[self.tp_rank]
+        own_reserved = torch.cuda.memory_reserved(self.gpu_id)
+        gathered = [None] * get_world_group().world_size
+        torch.distributed.all_gather_object(
+            gathered,
+            (self.tp_rank, my_gpu, own_reserved),
+            group=get_world_group().cpu_group,
+        )
+        sibling_bytes = sum(
+            reserved
+            for (rk, gpu, reserved) in gathered
+            if gpu == my_gpu and rk != self.tp_rank
+        )
+        return sibling_bytes / (1 << 30)
 
     def _sync_uneven_mamba_cache_size(self: ModelRunner) -> None:
         """Agree on one max_mamba_cache_size across uneven-TP ranks.
@@ -520,6 +584,10 @@ class ModelRunnerKVCacheMixin:
             distributed=get_world_group().world_size > 1 and not uneven_memory,
             cpu_group=get_world_group().cpu_group,
         )
+        # Co-located ranks: undo the sibling's weight charge in the
+        # physical-free reading (see _colocated_sibling_reserved_gb /
+        # _profile_available_bytes). No-op on the default path.
+        free_gb += self._colocated_sibling_reserved_gb()
         headroom_gb = self.pre_model_load_memory * (1 - self.mem_fraction_static)
         decode_cuda_graph_config = self.server_args.cuda_graph_config.decode
         decode_max_bs = int(decode_cuda_graph_config.max_bs or 0)
