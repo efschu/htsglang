@@ -1,3 +1,137 @@
+# htsglang — sglang fork: heterogeneous tensor parallelism for mismatched GPUs
+
+**htsglang** ("split heterogeneous sglang") is a fork of
+[sgl-project/sglang](https://github.com/sgl-project/sglang) that makes a
+**single tensor-parallel group run well on mismatched GPUs** — cards with
+different VRAM sizes, and multiple ranks co-located on one physical GPU. It is
+the sglang sibling of the author's vLLM fork
+[**shvllm**](https://github.com/efschu/shvllm): same heterogeneous-TP feature
+set, but built around sglang's native **RadixAttention** prefix cache (the
+reason a second fork exists rather than only patching vLLM).
+
+Fork: [github.com/efschu/htsglang](https://github.com/efschu/htsglang) ·
+branch `feature/uneven-tp`.
+
+## 1. Explicit rank → GPU placement (`--rank-gpu-id` / `--rank-gpu-memory-mib`)
+
+Pin each TP rank to a specific **physical** GPU, one entry per rank. Duplicate
+an index and two ranks share that card:
+
+```bash
+# TP=4 on 3 GPUs — two ranks co-located on GPU 0, one absolute budget per rank
+python -m sglang.launch_server \
+  --model /models/Qwen3.6-27B-FP8 \
+  --tp-size 4 \
+  --rank-gpu-id 0,0,1,2 \
+  --rank-gpu-memory-mib 13500
+```
+
+`--rank-gpu-memory-mib` is a single absolute MiB budget applied per rank (under
+pure TP every rank holds a structurally equal shard). It converts to each
+card's own utilization fraction, so heterogeneous totals are handled correctly.
+Co-locating multiple ranks on one GPU needs **NCCL ≥ 2.30**; the fork
+auto-sets `NCCL_MULTI_RANK_GPU_ENABLE=1` (torch 2.11 ships NCCL 2.28, which
+rejects co-located communicators — use the Docker image below, which pins
+NCCL 2.30.7).
+
+## 2. Uneven tensor parallelism (`--rank-tp-ratio auto`)
+
+The headline feature. Instead of splitting the model into equal TP shards,
+htsglang splits **proportionally to each card's memory** so a 32 GB card carries
+a bigger slice than a 20 GB card. The split is applied per dimension:
+
+- attention heads,
+- GDN (gated-delta-net) linear-attention heads,
+- dense MLP columns and MoE expert partitions,
+- and the KV-cache pool.
+
+```bash
+# TP=3, memory-proportional shards derived automatically per card
+python -m sglang.launch_server \
+  --model /models/Qwen3.6-27B-FP8 \
+  --tp-size 3 \
+  --rank-gpu-id 0,1,2 \
+  --rank-tp-ratio auto \
+  --rank-auto-reserve-mib 2048
+```
+
+`auto` fills each card's available VRAM (minus `--rank-auto-reserve-mib` for
+CUDA context / workspaces) and derives the per-rank weights itself. The KV
+split is **self-calibrating**: at startup the server logs a suggested
+`SGLANG_UNEVEN_MLP_VECTOR=...` (and, for MoE models, `SGLANG_UNEVEN_MOE_VECTOR`)
+hint; feeding it back on restart rebalances the MLP/MoE shards and grows the KV
+pool. Manual override via `--rank-mlp-ratio` / `--rank-moe-ratio` is also
+available.
+
+**Validated:** Qwen3.6-27B FP8, **TP=3 on 1× RTX 5090 + 2× RTX 3080** — clean
+boot, ~297k `max_total_num_tokens` @ 32k context, coherent output, greedy
+decode **bit-identical cold vs. warm**. Hybrid GDN + full-attention models and
+**NEXTN / MTP speculative decoding** both work under the uneven layout. With
+NEXTN spec decode at batch 1, measured decode throughput is **~86 t/s (prose) /
+~90 t/s (code)** and prefill ~1319 t/s on this tri-GPU box (ahead of the same
+config on the vLLM fork).
+
+## 3. HiCache (hierarchical KV cache)
+
+sglang's tiered KV cache — host-RAM L1 pool plus a file storage backend for
+L2/L3 — runs on top of the uneven-TP layout, so evicted RadixAttention prefixes
+spill to host memory and disk and are restored across restarts. Enabled in the
+Docker profile via `--enable-hierarchical-cache` with the `file` backend.
+
+## 4. Qwen3.5 / 3.6 GGUF loading — **experimental / in progress**
+
+On branch **`htsglang-gguf`**: a dedicated loader for the Qwen3.5/3.6 hybrid
+GDN + full-attention GGUFs (GGUF archs `qwen35` / `qwen35moe`) that sglang's
+generic GGUF path cannot handle. It builds the tensor **name map** from a
+template of HF param names and inverts llama.cpp's **weight transforms** on
+load (Gemma-style `+1` RMSNorm gammas, `ssm_a = -exp(A_log)`, conv1d reshape,
+grouped→tiled GDN v-head re-tiling), reusing `sgl_kernel`'s existing GGUF
+dequant/matmul kernels (`ggml_dequantize`, `ggml_mul_mat_a8`, `ggml_moe_a8`, …).
+Uneven-TP GGUF and perf tuning are still under active development — treat quant
+coverage as **not yet validated**.
+
+## Docker
+
+Prebuilt runtime image: **`ghcr.io/efschu/htsglang:cu130-nccl2307`** — CUDA
+13.0, built for **sm75–sm120** (Turing … Blackwell / RTX 5090), **NCCL 2.30.7**
+(baked in for multi-rank-per-GPU), and the HiCache file backend. The image ships
+an ENV-driven entrypoint, so launch flags are set via environment variables.
+
+Minimal `docker run`:
+
+```bash
+docker run --rm --gpus all \
+  --ipc=host --shm-size=16g \
+  --security-opt apparmor=unconfined \
+  -p 8011:30000 \
+  -v /models-cache:/models-cache:ro \
+  -e MODEL_PATH=/models-cache/Qwen3.6-27B-FP8 \
+  -e TP_SIZE=3 -e RANK_GPU_ID=0,1,2 -e RANK_TP_RATIO=auto \
+  ghcr.io/efschu/htsglang:cu130-nccl2307
+```
+
+Or via `docker/htsglang.yml` (default profile: TP=3 uneven, 1 rank per GPU,
+HiCache + NEXTN). For multi-rank-per-GPU co-location set an absolute budget,
+which auto-disables the ratio flags:
+
+```bash
+# .env next to docker/htsglang.yml — two ranks on GPU 0
+RANK_GPU_ID=0,0,1,2
+RANK_GPU_MEMORY_MIB=13500
+```
+
+```bash
+cd docker && docker compose -f htsglang.yml up
+```
+
+The compose file requires `apparmor=unconfined` (LXC/Proxmox host), `ipc: host`
++ `shm_size` (NCCL / shared-memory IPC), and the `nvidia` device reservation; it
+maps host port **8011 → container 30000**.
+
+*Upstream sglang README below.*
+
+--------------------------------------------------------------------------------
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
