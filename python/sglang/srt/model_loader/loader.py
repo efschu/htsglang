@@ -2192,7 +2192,20 @@ class GGUFModelLoader(BaseModelLoader):
     ) -> nn.Module:
 
         local_model_path = self._prepare_weights(model_config.model_path)
-        gguf_weights_map = self._get_gguf_weights_map(model_config)
+
+        # Qwen3.5/3.6 (hybrid GDN) need a bespoke name map + llama.cpp inverse
+        # weight transforms that the generic path cannot express.
+        from sglang.srt.model_loader.gguf_qwen35 import (
+            Qwen35GGUFAdapter,
+            is_qwen35_gguf_arch,
+        )
+
+        qwen35_adapter = None
+        if is_qwen35_gguf_arch(getattr(model_config.hf_config, "model_type", None)):
+            qwen35_adapter = Qwen35GGUFAdapter(model_config.hf_config, local_model_path)
+            gguf_weights_map = qwen35_adapter.build_name_map()
+        else:
+            gguf_weights_map = self._get_gguf_weights_map(model_config)
         # we can only know if tie word embeddings after mapping weights
         if "lm_head.weight" in get_gguf_extra_tensor_names(
             local_model_path, gguf_weights_map
@@ -2201,12 +2214,21 @@ class GGUFModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
+        if qwen35_adapter is not None and quant_config is not None:
+            # GDN in_proj_ba (and any other F32-in-GGUF projection) must be built
+            # unquantized so the plain-`weight` tensor loads (see adapter).
+            for prefix in qwen35_adapter.unquantized_module_prefixes():
+                if prefix not in quant_config.modules_to_not_convert:
+                    quant_config.modules_to_not_convert.append(prefix)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
-            model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
+            weights_iterator = self._get_weights_iterator(
+                local_model_path, gguf_weights_map
             )
+            if qwen35_adapter is not None:
+                weights_iterator = qwen35_adapter.transform_stream(weights_iterator)
+            model.load_weights(weights_iterator)
 
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)

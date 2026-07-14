@@ -46,6 +46,22 @@ def _set_architectures(config, arch_name):
     config.update({"architectures": [arch_name]})
 
 
+def _peek_qwen35_gguf_arch(gguf_path: str) -> Optional[str]:
+    """Return "qwen35"/"qwen35moe" if the GGUF's ``general.architecture`` is a
+    Qwen3.5/3.6 hybrid, else None. Reads only the GGUF header (cheap)."""
+    try:
+        import gguf
+
+        reader = gguf.GGUFReader(gguf_path)
+        field = reader.fields.get("general.architecture")
+        if field is None:
+            return None
+        arch = str(field.contents())
+        return arch if arch in ("qwen35", "qwen35moe") else None
+    except Exception:
+        return None
+
+
 def _apply_deepseek_ocr_overrides(config, model):
     _override_v_head_dim_if_zero(config)
     _set_architectures(config, "DeepseekOCRForCausalLM")
@@ -224,6 +240,7 @@ def get_config(
     **kwargs,
 ):
     is_gguf = check_gguf_file(model)
+    gguf_qwen35_arch = None
     if is_gguf:
         if model_config_parser not in ("auto", "hf"):
             raise ValueError(
@@ -231,7 +248,14 @@ def get_config(
                 "with GGUF inputs; only 'hf' (or 'auto') is supported."
             )
         _ensure_gguf_version()
-        kwargs["gguf_file"] = model
+        # Qwen3.5/3.6 (hybrid GDN) GGUFs use arch "qwen35"/"qwen35moe", which
+        # transformers' GGUF metadata reader rejects ("architecture qwen35 is
+        # not supported yet"). These checkpoints ship a sibling config.json, so
+        # we read that directly (NO gguf_file kwarg) and route to the text-only
+        # causal-LM class below. See model_loader/gguf_qwen35.py.
+        gguf_qwen35_arch = _peek_qwen35_gguf_arch(model)
+        if gguf_qwen35_arch is None:
+            kwargs["gguf_file"] = model
         model = Path(model).parent
         # Skip auto-resolution for GGUF: the name-based Mistral heuristic
         # would misfire on the rewritten parent dir.
@@ -257,6 +281,14 @@ def get_config(
         config.update(model_override_args)
 
     if is_gguf:
+        if gguf_qwen35_arch is not None:
+            # Hybrid GDN qwen35: config.json was read directly (no gguf_file), so
+            # it already carries the correct architecture
+            # (Qwen3_5[Moe]ForConditionalGeneration, whose ``self.model`` gives the
+            # "model.layers.*" / "lm_head" param names the GGUF name map targets).
+            # The MODEL_FOR_CAUSAL_LM check below rejects conditional-generation
+            # model_types, so return here.
+            return config
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])

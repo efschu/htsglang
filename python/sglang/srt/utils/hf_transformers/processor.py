@@ -154,6 +154,16 @@ def get_processor(
     revision = kwargs.pop("revision", tokenizer_revision)
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
 
+    # A GGUF model_path is not a JSON config; the (multimodal) processor config
+    # lives in the sibling directory next to the .gguf. Rewrite to the parent so
+    # AutoConfig/AutoProcessor read config.json + preprocessor_config.json.
+    if (
+        model_name is not None
+        and str(model_name).endswith(".gguf")
+        and Path(model_name).is_file()
+    ):
+        model_name = str(Path(model_name).parent)
+
     if is_mistral_model(tokenizer_name):
         config = load_mistral_config(
             tokenizer_name,
