@@ -78,24 +78,22 @@ L2/L3 — runs on top of the uneven-TP layout, so evicted RadixAttention prefixe
 spill to host memory and disk and are restored across restarts. Enabled in the
 Docker profile via `--enable-hierarchical-cache` with the `file` backend.
 
-## 4. Qwen3.5 / 3.6 GGUF loading — **experimental / in progress**
-
-On branch **`htsglang-gguf`**: a dedicated loader for the Qwen3.5/3.6 hybrid
-GDN + full-attention GGUFs (GGUF archs `qwen35` / `qwen35moe`) that sglang's
-generic GGUF path cannot handle. It builds the tensor **name map** from a
-template of HF param names and inverts llama.cpp's **weight transforms** on
-load (Gemma-style `+1` RMSNorm gammas, `ssm_a = -exp(A_log)`, conv1d reshape,
-grouped→tiled GDN v-head re-tiling), reusing `sgl_kernel`'s existing GGUF
-dequant/matmul kernels (`ggml_dequantize`, `ggml_mul_mat_a8`, `ggml_moe_a8`, …).
-Uneven-TP GGUF and perf tuning are still under active development — treat quant
-coverage as **not yet validated**.
-
 ## Docker
 
-Prebuilt runtime image: **`ghcr.io/efschu/htsglang:cu130-nccl2307`** — CUDA
-13.0, built for **sm75–sm120** (Turing … Blackwell / RTX 5090), **NCCL 2.30.7**
-(baked in for multi-rank-per-GPU), and the HiCache file backend. The image ships
-an ENV-driven entrypoint, so launch flags are set via environment variables.
+Prebuilt runtime image on GitHub Packages:
+[**`ghcr.io/efschu/htsglang:cu130-nccl2307`**](https://github.com/users/efschu/packages/container/package/htsglang)
+— CUDA 13.0, built for **sm75–sm120** (Turing … Blackwell / RTX 5090),
+**NCCL 2.30.7** (baked in for multi-rank-per-GPU), and the HiCache file backend.
+The image ships an ENV-driven entrypoint, so launch flags are set via
+environment variables.
+
+The package is currently **private**, so authenticate to GHCR first (a GitHub
+token with `read:packages`), then pull:
+
+```bash
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u efschu --password-stdin
+docker pull ghcr.io/efschu/htsglang:cu130-nccl2307
+```
 
 Minimal `docker run`:
 
