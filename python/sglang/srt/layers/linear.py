@@ -681,32 +681,38 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
                 return
             if is_gguf_weight:
-                if self.tp_size > 1:
-                    # The multi-index (0,1,2) shard is the GDN in_proj_qkvz whose
-                    # q|k|v are FUSED in one GGUF tensor. Splitting the fused
-                    # block across ranks would cut through the q/k/v boundaries;
-                    # correct TP>1 needs a de-fuse-then-per-head split (TODO).
-                    raise NotImplementedError(
-                        "GGUF sharding of the fused GDN in_proj_qkvz across "
-                        "TP>1 is not supported yet (fused q|k|v must be de-fused "
-                        "and split per head). Use TP=1 for qwen35 GGUF for now."
-                    )
                 output_dim = getattr(param, "output_dim", None)
-                total = loaded_weight.size(output_dim)
-                # This rank's row (output) partition of the fused component;
-                # at TP=1 tp_partition_size returns the whole tensor.
-                shard_size = tp_partition_size(
-                    total, self.tp_size, self.tp_rank, self.tp_units, self.tp_family
+                # The GGUF attn_qkv tensor fuses the sub-components named by the
+                # tuple (e.g. q|k|v = output_sizes[0:3]) in one tensor. For TP>1
+                # each sub-component must be split PER HEAD independently, then
+                # re-fused for this rank — splitting the whole fused block would
+                # cut through the q/k/v boundaries. At TP=1 each partition is the
+                # whole component, so this reproduces the un-sharded fused tensor.
+                parts = []
+                offset = 0
+                for comp in loaded_shard_id:
+                    comp_size = self.output_sizes[comp]
+                    comp_w = loaded_weight.narrow(output_dim, offset, comp_size)
+                    offset += comp_size
+                    my_size = tp_partition_size(
+                        comp_size,
+                        self.tp_size,
+                        self.tp_rank,
+                        self.tp_units,
+                        self.tp_family,
+                    )
+                    my_start = tp_loaded_shard_start(
+                        comp_size,
+                        self.tp_size,
+                        self.tp_rank,
+                        my_size,
+                        self.tp_units,
+                        self.tp_family,
+                    )
+                    parts.append(comp_w.narrow(output_dim, my_start, my_size))
+                loaded_weight = (
+                    parts[0] if len(parts) == 1 else torch.cat(parts, dim=output_dim)
                 )
-                start_idx = tp_loaded_shard_start(
-                    total,
-                    self.tp_size,
-                    self.tp_rank,
-                    shard_size,
-                    self.tp_units,
-                    self.tp_family,
-                )
-                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
                 param.shard_id.append(loaded_shard_id)
                 param.shard_id_map[loaded_shard_id] = len(param.data_container)
                 param.data_container.append(loaded_weight)
