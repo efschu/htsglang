@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -74,6 +75,15 @@ class GGUFConfig(QuantizationConfig):
         if _is_hip:
             warnings.warn(f"Only CUDA and MUSA support GGUF quantization currently.")
         self.modules_to_not_convert = modules_to_not_convert or []
+        # Uneven-TP (--rank-tp-ratio) block alignment, consumed by
+        # linear._quant_block_aligned_units([out_block, in_block]).
+        # GGUF packs each row as `in_elems // ggml_block * type_size` opaque
+        # bytes ALONG THE INPUT dim, so only input (block_idx=1) shard
+        # boundaries must land on a quant block; use 256 = the K-quant
+        # superblock (also a multiple of the 32-block standard quants), the
+        # worst case since the per-tensor ggml type is unknown at layer build.
+        # Output (block_idx=0) needs no alignment — rows are whole, hence 1.
+        self.weight_block_size = [1, 256]
 
     def __repr__(self) -> str:
         return "GGUFConfig()"
@@ -115,6 +125,13 @@ class GGUFConfig(QuantizationConfig):
                 return GGUFLinearAscendMethod(self)
             return GGUFLinearMethod(self)
         elif isinstance(layer, VocabParallelEmbedding):
+            # Allow skipping (dense weight) for embedding/lm_head too: returning
+            # None makes VocabParallelEmbedding fall back to
+            # UnquantizedEmbeddingMethod (a plain `.weight`). Needed for NEXTN
+            # spec decode, which shares the target's lm_head.weight with the
+            # draft (get_embed_and_head) — a quantized lm_head has no `.weight`.
+            if is_layer_skipped_gguf(prefix, self.modules_to_not_convert):
+                return None
             if _is_npu:
                 return GGUFEmbeddingAscendMethod(self)
             return GGUFEmbeddingMethod(self)
@@ -163,6 +180,14 @@ DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
+# MMQ (quantized GEMM) is weight-bandwidth-bound and does NOT scale with batch,
+# so it only wins for tiny token counts; above this threshold a one-shot
+# dequantize + cuBLAS fp16 GEMM is far faster (measured on RTX 3080 / Q6_K:
+# MMQ wins <=~8 tokens, dequant+cuBLAS up to ~13x faster at 2048 tokens). The
+# stock path used MMQ for K-quants at ALL batch sizes, crippling prefill.
+# Env-tunable; MMVQ still owns the batch<=mmvq_safe decode path below.
+_MMQ_MAX_TOKENS = int(os.environ.get("SGLANG_GGUF_MMQ_MAX_TOKENS", "8"))
+
 
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
@@ -181,10 +206,14 @@ def fused_mul_mat_gguf(
     # enable MMVQ in contiguous batching with batch_size=1
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
-    # Use MMQ Kernel if it's available (standard + k-quants)
-    elif qweight_type in MMQ_QUANT_TYPES:
+    # MMQ (quantized GEMM) only for small batches (standard + k-quants): it is
+    # weight-bandwidth-bound and does not scale with token count, so above
+    # _MMQ_MAX_TOKENS the dequant + cuBLAS branch below is far faster.
+    elif qweight_type in MMQ_QUANT_TYPES and x.shape[0] <= _MMQ_MAX_TOKENS:
         y = ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
-    # If there is no available MMQ kernel, fallback to dequantize
+    # Large batch (or a type without an MMQ kernel): dequantize once, then a
+    # single fp16 cuBLAS GEMM. All MMQ types are also in DEQUANT_TYPES, so
+    # large-batch K-quants land here.
     elif qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
@@ -435,7 +464,20 @@ class GGUFLinearMethod(LinearMethodBase):
 
         if shard_id:
             # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            if "q" in shard_id:
+                shard_id = ["q", "k", "v"]
+            else:
+                # Append order == GGUF tensor order, which may NOT match the
+                # fused output-partition order: a Qwen3.5 GGUF stores attn_gate
+                # (z, shard 3) BEFORE attn_qkv (shard (0,1,2)), so concatenating
+                # in append order yields [z|q|k|v] and the consumer's
+                # [q|k|v|z] split reads garbage. Order shards by their logical
+                # partition index (tuple -> its min) so the cat is correct.
+                # (Also makes gate_up robust to checkpoint tensor order.)
+                shard_id = sorted(
+                    shard_id,
+                    key=lambda s: min(s) if isinstance(s, tuple) else s,
+                )
             qweight = layer.qweight
             result = []
             for idx in shard_id:
