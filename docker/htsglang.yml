@@ -1,0 +1,70 @@
+# htsglang (uneven-TP sglang fork) — Qwen3.6-27B AEON FP8-MTP, tri-GPU.
+# Sibling of shvllm.yml (the vLLM fork). Same host-integration pattern:
+#   security_opt: apparmor=unconfined   (LXC/Proxmox — REQUIRED)
+#   deploy.devices driver: nvidia       (GPU via nvidia-container-runtime)
+#   shm_size + ipc: host                (NCCL / shared-memory IPC)
+#
+# The image bakes in the ENV-driven entrypoint (htsglang-entrypoint.sh) and the
+# froggeric v21.3 chat template (/etc/htsglang/chat_template.jinja), so the
+# launch flags live in `environment:` here, not in `command:`.
+#
+# Default profile = production 1-rank-per-GPU uneven TP (mirrors shvllm.yml:
+# TP=3, rank-gpu-id 0,1,2, rank-tp-ratio auto) + HiCache file backend + NEXTN.
+# For multi-rank-per-GPU co-location (e.g. 2 ranks on the 5090) override via
+# the environment or a .env file next to this compose:
+#   RANK_GPU_ID=0,0,1,2   RANK_GPU_MEMORY_MIB=13500
+# RANK_GPU_MEMORY_MIB auto-disables the ratio/reserve flags; needs NCCL>=2.30
+# (baked in). Verified: boots, sizes, serves.
+#
+# Run (on proxmox):
+#   cd <this dir> && docker compose -f htsglang.yml up
+services:
+  htsglang-qwen36-27b-tri:
+    image: htsglang:cu130-nccl2307
+    container_name: "${ESTATE_CONTAINER:-htsglang-qwen36-27b}"
+    restart: no
+    security_opt:
+      - apparmor=unconfined
+    ports:
+      - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8011}}:30000"
+    volumes:
+      # Model cache (same source dir shvllm.yml mounts) -> /models-cache.
+      - ${MODEL_DIR:-../../../../../../models-cache}:/models-cache:ro
+      # HiCache file backend L2/L3 storage (persist across restarts).
+      - ../../../cache/htsglang-hicache:/sgl-workspace/sglang_storage
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${ESTATE_GPUS:-${NVIDIA_VISIBLE_DEVICES:-all}}
+      # --- model + identity ---
+      - MODEL_PATH=/models-cache/Qwen3.6-27B-AEON-Ultimate-Uncensored-FP8-MTP
+      - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-qwen3.6-27b-aeon-fp8}
+      # --- (uneven) tensor parallelism: 1 rank per GPU, proportional shards ---
+      - TP_SIZE=${TP_SIZE:-3}
+      - RANK_GPU_ID=${RANK_GPU_ID:-0,1,2}
+      - RANK_TP_RATIO=${RANK_TP_RATIO:-auto}
+      - RANK_AUTO_RESERVE_MIB=${RANK_AUTO_RESERVE_MIB:-2048}
+      # Absolute per-rank budget (set for multi-rank-per-GPU; empty = ratio mode)
+      - RANK_GPU_MEMORY_MIB=${RANK_GPU_MEMORY_MIB:-}
+      # Uneven-TP MLP self-calibration vector (first boot may suggest one;
+      # put it here + restart for the full KV pool). Empty = uncalibrated.
+      - SGLANG_UNEVEN_MLP_VECTOR=${SGLANG_UNEVEN_MLP_VECTOR:-}
+      # --- kv cache / NEXTN spec decode ---
+      - KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_e4m3}
+      - SPECULATIVE_ALGORITHM=${SPECULATIVE_ALGORITHM:-NEXTN}
+      # --- HiCache (RAM L1 + file L2/L3) ---
+      - ENABLE_HIERARCHICAL_CACHE=${ENABLE_HIERARCHICAL_CACHE:-1}
+      - HICACHE_STORAGE_BACKEND=${HICACHE_STORAGE_BACKEND:-file}
+      - HICACHE_RATIO=${HICACHE_RATIO:-0.5}
+      - HICACHE_MEM_LAYOUT=${HICACHE_MEM_LAYOUT:-page_first_direct}
+      # --- server sizing ---
+      - MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-8}
+      - CONTEXT_LENGTH=${CONTEXT_LENGTH:-32768}
+      - PORT=30000
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
