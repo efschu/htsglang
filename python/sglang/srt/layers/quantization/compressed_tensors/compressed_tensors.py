@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import suppress
 from typing import (
     TYPE_CHECKING,
@@ -129,6 +130,41 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.linear_fp8_config = linear_fp8_config
 
+    @staticmethod
+    def _group_size_block(
+        target_scheme_map: Dict[str, Any]
+    ) -> Optional[List[int]]:
+        """Uneven-TP group alignment for group-quantized schemes (AWQ/GPTQ INT4,
+        group_size G).
+
+        Such a scheme groups `group_size` input channels under one scale, so
+        every per-rank shard boundary must be a multiple of G along the grouped
+        dim — exactly like block-quantized FP8/GGUF. The uneven-TP machinery
+        (`_quant_block_aligned_units` / `tp_partition_size` /
+        `fused_moe_triton.layer`) already coarsens a split to
+        `quant_config.weight_block_size`; a group-quant config simply has to
+        expose G so that coarsening fires. Without it, an uneven
+        `--rank-tp-ratio` split produces `input_size_per_partition % group_size
+        != 0` and the wNa16 scheme asserts (this is what blocked AWQ under
+        uneven TP; even TP happened to divide cleanly).
+
+        Both dims are set to G so a column-parallel OUTPUT split (gate_up / w1)
+        lands on the same boundary as its coupled row-parallel INPUT split
+        (down / w2) — mirroring GGUFConfig.weight_block_size = [256, 256].
+        Returns None when no scheme is group-quantized (channel/tensor/fp8 →
+        the existing even-only path is unchanged and untouched).
+        """
+        group_sizes = set()
+        for scheme in (target_scheme_map or {}).values():
+            weights = scheme.get("weights") if isinstance(scheme, dict) else None
+            g = getattr(weights, "group_size", None)
+            if g and int(g) > 0:
+                group_sizes.add(int(g))
+        if not group_sizes:
+            return None
+        g = math.lcm(*group_sizes)  # a shard that is a multiple of the lcm is a
+        return [g, g]               # multiple of every layer's group_size.
+
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
 
@@ -207,12 +243,19 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     @property
     def weight_block_size(self) -> Optional[List[int]]:
-        """Get the weight block size from the quantization config."""
+        """Get the weight block size from the quantization config.
+
+        Block-structured schemes (FP8) expose an explicit block_structure.
+        Group-quantized schemes (AWQ/GPTQ INT4) instead carry a group_size,
+        which serves the same uneven-TP alignment role — fall back to it so a
+        `--rank-tp-ratio` split coarsens per-rank shards to group-multiples
+        (see _group_size_block)."""
         if "Linear" in self.target_scheme_map:
             weights_config = self.target_scheme_map["Linear"].get("weights")
-            if weights_config and hasattr(weights_config, "block_structure"):
-                return weights_config.block_structure
-        return None
+            block_structure = getattr(weights_config, "block_structure", None)
+            if block_structure:
+                return block_structure
+        return self._group_size_block(self.target_scheme_map)
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> CompressedTensorsConfig:
