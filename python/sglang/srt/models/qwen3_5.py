@@ -57,6 +57,7 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    _quant_block_aligned_units,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.parameter import (
@@ -190,15 +191,32 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.alt_stream = alt_stream
 
-        # Per-rank (local) GDN head counts. Even TP: total // tp_size,
-        # exactly as before. Uneven TP (--rank-tp-ratio): this rank's
-        # share of the shard plan, with the k heads as indivisible units
-        # (v heads are a fixed multiple of k heads, so both stay aligned).
+        # Uneven-TP unit family for ALL coupled GDN projections. Normally the
+        # k heads are the indivisible unit (v heads are a fixed multiple). For a
+        # weight-quantized checkpoint whose block does not divide a head (GGUF
+        # K-quant: block 256 = 2*head_dim), that unit is coarsened so every
+        # rank's shard of the packed out_proj input still lands on a quant block
+        # — and crucially the SAME coarsened unit is used for the head counts
+        # and every projection, so the model and the GGUF loader agree (mirrors
+        # the vLLM plugin's global group_size=256 family). FP8 (block 128 =
+        # head_dim) and unquantized checkpoints pass through unchanged.
+        self.gdn_tp_units = _quant_block_aligned_units(
+            self.value_dim, self.num_k_heads, quant_config, 1
+        )
+        # Expose the coarsened unit to the mamba/conv state-cache shape
+        # derivation (config.mamba2_cache_params -> Mamba2StateShape.create),
+        # so the per-rank state cache uses the SAME uneven-TP split as these
+        # layers. Same text-config object as the runner's mambaish_config.
+        config.gdn_tp_units = self.gdn_tp_units
+
+        # Per-rank (local) GDN head counts. Even TP: total // tp_size, exactly
+        # as before. Uneven TP (--rank-tp-ratio): this rank's share of the shard
+        # plan, in whole gdn_tp_units.
         self.local_num_k_heads = tp_partition_size(
-            self.num_k_heads, self.attn_tp_size, self.attn_tp_rank, self.num_k_heads
+            self.num_k_heads, self.attn_tp_size, self.attn_tp_rank, self.gdn_tp_units
         )
         self.local_num_v_heads = tp_partition_size(
-            self.num_v_heads, self.attn_tp_size, self.attn_tp_rank, self.num_k_heads
+            self.num_v_heads, self.attn_tp_size, self.attn_tp_rank, self.gdn_tp_units
         )
 
         self.conv_kernel_size = config.linear_conv_kernel_dim
@@ -220,7 +238,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # Uneven TP: conv channels are partitioned in whole k-head
             # units (each unit carries 2*head_k_dim + ratio*head_v_dim
             # channels). Ignored on the default path.
-            tp_units=self.num_k_heads,
+            tp_units=self.gdn_tp_units,
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
@@ -267,7 +285,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 # Uneven TP: partition every conv group in whole k-head
                 # units. None (default path) keeps the classic
                 # full_dim // tp_size split.
-                tp_units=self.num_k_heads,
+                tp_units=self.gdn_tp_units,
             ),
         )
 
@@ -281,11 +299,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         set_weight_attrs(
             self.A_log,
-            {"weight_loader": sharded_weight_loader(0), "tp_units": self.num_k_heads},
+            {"weight_loader": sharded_weight_loader(0), "tp_units": self.gdn_tp_units},
         )
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0), "tp_units": self.num_k_heads},
+            {"weight_loader": sharded_weight_loader(0), "tp_units": self.gdn_tp_units},
         )
 
         conv_weights = self.conv1d.weight.view(
@@ -332,7 +350,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=add_prefix("out_proj", prefix),
             # Uneven TP: the input (value) dim is partitioned in whole
             # k-head units, matching the in_proj/conv1d split.
-            tp_units=self.num_k_heads,
+            tp_units=self.gdn_tp_units,
         )
 
     @staticmethod
@@ -459,7 +477,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=tp_size,
             # Uneven TP: q/k/v/z are partitioned in whole k-head units so
             # all four packed outputs stay aligned per rank.
-            tp_units=self.num_k_heads,
+            tp_units=self.gdn_tp_units,
         )
 
     def create_ba_proj(
@@ -484,7 +502,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=tp_size,
             # Uneven TP: b/a are per-v-head scalars, partitioned in whole
             # k-head units to stay aligned with the qkvz split.
-            tp_units=self.num_k_heads,
+            tp_units=self.gdn_tp_units,
         )
 
     def fix_query_key_value_ordering(

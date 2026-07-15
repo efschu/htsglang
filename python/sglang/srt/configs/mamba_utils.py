@@ -160,28 +160,31 @@ class Mamba2StateShape:
         state_size: int,
         conv_kernel: int,
         tp_rank: Optional[int] = None,
+        tp_units: Optional[int] = None,
     ) -> "Mamba2StateShape":
         if tp_plan_active(tp_world_size):
             # Uneven TP (--rank-tp-ratio): the GDN layers partition the
-            # k/v heads and the conv channels in whole k-head units
-            # (see Qwen3GatedDeltaNet), so the per-rank state shapes must
-            # follow the same unit partition. Requires the caller to pass
-            # this rank (worker processes know it).
+            # k/v heads and the conv channels in whole units (see
+            # Qwen3_5GatedDeltaNet.gdn_tp_units — normally the k heads, but
+            # coarsened for GGUF K-quant so shards land on a quant block), so
+            # the per-rank state shapes must follow the SAME unit partition.
+            # Requires the caller to pass this rank (worker processes know it).
             if tp_rank is None:
                 raise ValueError(
                     "Mamba2StateShape.create needs tp_rank when an "
                     "uneven-TP shard plan is installed."
                 )
+            units = tp_units if tp_units is not None else n_groups
             num_k_heads_per_tp = tp_partition_size(
-                n_groups, tp_world_size, tp_rank, n_groups
+                n_groups, tp_world_size, tp_rank, units
             )
             conv_dim = intermediate_size + 2 * n_groups * state_size
             conv_state_shape = (
-                tp_partition_size(conv_dim, tp_world_size, tp_rank, n_groups),
+                tp_partition_size(conv_dim, tp_world_size, tp_rank, units),
                 conv_kernel - 1,
             )
             temporal_state_shape = (
-                tp_partition_size(num_heads, tp_world_size, tp_rank, n_groups),
+                tp_partition_size(num_heads, tp_world_size, tp_rank, units),
                 head_dim,
                 state_size,
             )

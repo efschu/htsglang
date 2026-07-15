@@ -309,6 +309,10 @@ class Qwen3NextConfig(PretrainedConfig):
             state_size=self.linear_key_head_dim,
             conv_kernel=self.linear_conv_kernel_dim,
             tp_rank=tp_rank,
+            # Coarsened GDN unit family (set by Qwen3_5GatedDeltaNet for GGUF
+            # K-quant so the state cache matches the layers' block-aligned
+            # split). None -> falls back to n_groups (k heads), unchanged.
+            tp_units=getattr(self, "gdn_tp_units", None),
         )
 
         return Mamba2CacheParams(

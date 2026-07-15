@@ -82,8 +82,14 @@ class GGUFConfig(QuantizationConfig):
         # boundaries must land on a quant block; use 256 = the K-quant
         # superblock (also a multiple of the 32-block standard quants), the
         # worst case since the per-tensor ggml type is unknown at layer build.
-        # Output (block_idx=0) needs no alignment — rows are whole, hence 1.
-        self.weight_block_size = [1, 256]
+        # Both dims use 256 so that a column-parallel OUTPUT split (e.g. MLP
+        # gate_up, GDN in_proj) lands on the SAME unit boundary as the coupled
+        # row-parallel INPUT split (down_proj, out_proj) — otherwise the two
+        # ends of the residual disagree on the per-rank intermediate/value size
+        # under uneven TP (activation "hidden size must be divisible by vector
+        # size" / matmul shape mismatch). Output rows are byte-whole regardless,
+        # so 256 on block_idx=0 only affects the uneven-split granularity.
+        self.weight_block_size = [256, 256]
 
     def __repr__(self) -> str:
         return "GGUFConfig()"
@@ -188,6 +194,31 @@ MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 # Env-tunable; MMVQ still owns the batch<=mmvq_safe decode path below.
 _MMQ_MAX_TOKENS = int(os.environ.get("SGLANG_GGUF_MMQ_MAX_TOKENS", "8"))
 
+# Per-device MMVQ->MMQ crossover (see the long note in fused_mul_mat_gguf). The
+# crossover M scales with memory bandwidth; we proxy that by compute capability
+# (major >= 9 == Hopper/Blackwell high-bandwidth parts). Override per rank with
+# SGLANG_GGUF_MMVQ_SAFE. Cached by device index (each TP rank is its own process).
+_mmvq_safe_by_dev: dict = {}
+
+
+def _mmvq_safe_for_device() -> int:
+    override = os.environ.get("SGLANG_GGUF_MMVQ_SAFE")
+    if override is not None:
+        return int(override)
+    dev = torch.cuda.current_device()
+    v = _mmvq_safe_by_dev.get(dev)
+    if v is None:
+        try:
+            major = torch.cuda.get_device_capability(dev)[0]
+        except Exception:
+            major = 0
+        # High-bandwidth (Hopper sm90, Blackwell sm100/sm120): MMVQ's linear cost
+        # stays under MMQ's flat floor through the small MTP verify batch (M<=6).
+        # Consumer Ampere/Ada (RTX 3080/4090): MMQ overtakes at M=3.
+        v = 6 if major >= 9 else 2
+        _mmvq_safe_by_dev[dev] = v
+    return v
+
 
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
@@ -195,7 +226,21 @@ def fused_mul_mat_gguf(
     if qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
     else:
-        mmvq_safe = 2 if qweight.shape[0] > 5120 else 6
+        # MMVQ (ggml_mul_mat_vec_a8) is a mat-VEC kernel whose cost scales ~LINEARLY
+        # with the token count M (it iterates over the M activation columns),
+        # whereas MMQ (ggml_mul_mat_a8) is a weight-bandwidth-bound GEMM whose cost
+        # is ~flat up to ~M=16. Their crossover M is therefore GPU-dependent: it
+        # sits where MMVQ's rising line meets MMQ's flat floor, which moves out on
+        # higher-memory-bandwidth cards. Measured on this system / Q6_K:
+        #   RTX 3080 (sm86, ~760 GB/s):  MMVQ wins M<=2, MMQ faster from M=3
+        #   RTX 5090 (sm120, ~1.8 TB/s): MMVQ wins through M>=6 (M=4: MMVQ 0.033ms
+        #                                vs MMQ 0.049ms)
+        # This matters for the MTP / speculative-decode VERIFY forward, which runs
+        # at M = num_draft_tokens (typically 4): a single wrong global cap either
+        # sends the 5090's verify onto the slower MMQ (cap=2) or the 3080's verify
+        # onto the slower MMVQ (cap=6). Pick per physical GPU (each TP rank is a
+        # separate process bound to one device) once, cached by device index.
+        mmvq_safe = _mmvq_safe_for_device()
     # HACK: when doing chunked prefill we don't generate output tokens
     # so input to logits generator is empty which causes invalid parameter
     if x.shape[0] == 0:
