@@ -38,6 +38,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=htsglang-apt \
       protobuf-compiler \
       libssl-dev libnuma1 libnuma-dev \
       libgl1 libglib2.0-0 \
+      ffmpeg \
     && wget -q https://bootstrap.pypa.io/get-pip.py \
     && python3.12 get-pip.py --break-system-packages && rm get-pip.py \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
