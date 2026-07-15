@@ -357,6 +357,32 @@ class Qwen35GGUFAdapter:
         block_size, _ = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType(qtype)]
         return self.head_v_dim % block_size != 0
 
+    @staticmethod
+    def _is_dense_gguf_type(qtype: int) -> bool:
+        """True for GGUF "unquantized" tensor types (F16/BF16/F32), whose data
+        is a plain element matrix rather than block-packed quantized bytes.
+
+        This matters for out_proj (see ``_undo_gdn_reorder`` / ``transform_stream``):
+        heretic-style GGUFs store GDN out_proj as a quantized type (e.g. Q8_0,
+        block 32) whose ``.qweight`` columns are RAW BYTES, so the v-head un-tile
+        must operate on byte-granularity (``head_bytes``).  unsloth "UD"
+        (Ultra-Dynamic) quants instead KEEP out_proj as dense F16, but sglang's
+        GGUF iterator still renames any non-F32 tensor ``.weight`` -> ``.qweight``
+        (+ a ``.qweight_type``).  A dense F16 out_proj therefore reaches the
+        ``.qweight`` code path even though its columns are plain value-dim
+        ELEMENTS, not packed bytes -- it must be un-tiled element-wise with
+        ``head_v_dim`` (exactly like the dense ``out_proj.weight`` path), NOT with
+        a byte stride.  (F32 tensors are never renamed to ``.qweight`` by the
+        iterator, so they only appear here for completeness.)
+        """
+        import gguf
+
+        return gguf.GGMLQuantizationType(qtype) in (
+            gguf.GGMLQuantizationType.F16,
+            gguf.GGMLQuantizationType.BF16,
+            gguf.GGMLQuantizationType.F32,
+        )
+
     def _undo_gdn_reorder(
         self, hf_name: str, weight: torch.Tensor, qweight_types: Dict[str, int]
     ) -> torch.Tensor:
@@ -449,20 +475,40 @@ class Qwen35GGUFAdapter:
 
             # --- track quant types so out_proj retiling can see them ---
             if name.endswith(".qweight_type"):
-                qweight_types[name.removesuffix("_type")] = int(weight.item())
-                if name.endswith(
-                    "linear_attn.out_proj.qweight_type"
-                ) and self._out_proj_dequant_needed(int(weight.item())):
-                    # Layer is loaded unquantized; drop the type param.
+                qtype = int(weight.item())
+                qweight_types[name.removesuffix("_type")] = qtype
+                if name.endswith("linear_attn.out_proj.qweight_type") and (
+                    self._out_proj_dequant_needed(qtype)
+                    or self._is_dense_gguf_type(qtype)
+                ):
+                    # Layer is loaded unquantized (block-misaligned quant that we
+                    # dequantize, OR a dense F16/BF16 out_proj as in unsloth "UD"
+                    # quants); either way the module has a plain `.weight` param
+                    # and no `.qweight_type`, so drop the type param.
                     continue
                 yield name, weight
                 continue
 
-            # --- GDN out_proj: block-misaligned -> dequant + element un-tile ---
+            # --- GDN out_proj: un-tile the v-head reorder ---
             if name.endswith("linear_attn.out_proj.qweight"):
                 qtype = qweight_types.get(name)
                 assert qtype is not None, "out_proj qweight_type not seen yet"
+                if self._is_dense_gguf_type(qtype):
+                    # unsloth "UD": out_proj kept DENSE (F16/BF16), but sglang's
+                    # GGUF iterator renamed `.weight`->`.qweight`. The tensor is a
+                    # plain element matrix, so un-tile its columns element-wise
+                    # with head_v_dim (like the dense out_proj.weight path) and
+                    # re-emit as `.weight` for the unquantized module. Do NOT run
+                    # the byte-stride path below (it would compute head_units =
+                    # head_v_dim * type_size and reshape to 2x the real size).
+                    dense = self._undo_v_tiling(weight, 1, self.head_v_dim)
+                    yield name.removesuffix(".qweight") + ".weight", dense.to(
+                        self.config.torch_dtype
+                    )
+                    continue
                 if self._out_proj_dequant_needed(qtype):
+                    # Block-misaligned quantized out_proj (e.g. K-quant block 256
+                    # with head_v_dim 128): dequantize, then element-wise un-tile.
                     deq = torch.from_numpy(
                         dequantize(weight.numpy(), gguf.GGMLQuantizationType(qtype))
                     )
@@ -471,6 +517,8 @@ class Qwen35GGUFAdapter:
                         self.config.torch_dtype
                     )
                     continue
+                # Block-aligned quantized out_proj (heretic's Q8_0, block 32):
+                # `.qweight` columns are raw bytes; un-tile at byte granularity.
                 yield name, self._undo_gdn_reorder(name, weight, qweight_types)
                 continue
 
