@@ -3005,6 +3005,13 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        # Record whether the user explicitly set --max-running-requests BEFORE any
+        # handler (e.g. the speculative-decoding hook) auto-defaults it to a fixed
+        # value. Downstream demand-driven sizing (the uneven-DCP auto-mamba pool)
+        # must not treat that auto-default as an explicit user concurrency target,
+        # or it over-provisions the mamba pool and OOMs at pool init.
+        self.max_running_requests_user_set = self.max_running_requests is not None
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3273,6 +3280,27 @@ class ServerArgs:
                     "DCP path -- SGLANG_UNEVEN_DCP=1 + "
                     "SGLANG_UNEVEN_DCP_WEIGHTED=1 on a non-uniform "
                     "--rank-tp-ratio -- is the only supported spec+DCP config.)"
+                )
+            # The uneven-weighted DCP verify path attends draft->draft with plain
+            # CAUSAL masking (a linear chain), which is correct ONLY for
+            # --speculative-eagle-topk 1. A branching tree (topk>1) needs the
+            # draft->draft tree sub-mask sliced out of spec_info.custom_mask and
+            # fed to the ragged wrapper; that is NOT implemented, so a topk>1 tree
+            # would produce silently-wrong draft->draft attention. Hard-error
+            # instead of returning incorrect output.
+            if (
+                uneven_weighted_dcp
+                and self.speculative_eagle_topk is not None
+                and self.speculative_eagle_topk > 1
+            ):
+                raise ValueError(
+                    "Tree/branching speculative decoding "
+                    f"(--speculative-eagle-topk={self.speculative_eagle_topk} > 1) "
+                    "is not yet supported under uneven-hybrid weighted DCP "
+                    "(SGLANG_UNEVEN_DCP=1 + SGLANG_UNEVEN_DCP_WEIGHTED=1). The "
+                    "DCP verify path attends draft->draft with a plain causal "
+                    "chain mask, which is only correct for a linear draft chain. "
+                    "Use --speculative-eagle-topk 1."
                 )
         else:
             raise ValueError(
