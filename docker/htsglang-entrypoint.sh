@@ -29,6 +29,12 @@ fi
 # --- model + identity -----------------------------------------------------
 : "${MODEL_PATH:=/model}"
 : "${SERVED_MODEL_NAME:=qwen3.6-27b-aeon-fp8}"
+# GGUF: point MODEL_PATH at the .gguf file, TOKENIZER_PATH at the sibling dir
+# (config.json + tokenizer live there), and set LOAD_FORMAT/QUANTIZATION=gguf.
+# All empty by default -> omitted, so the FP8/safetensors path is unchanged.
+: "${TOKENIZER_PATH:=}"
+: "${LOAD_FORMAT:=}"
+: "${QUANTIZATION:=}"
 
 # --- (uneven) tensor parallelism -----------------------------------------
 : "${TP_SIZE:=3}"
@@ -57,6 +63,11 @@ fi
 : "${SPECULATIVE_NUM_STEPS:=3}"
 : "${SPECULATIVE_EAGLE_TOPK:=1}"
 : "${SPECULATIVE_NUM_DRAFT_TOKENS:=4}"
+# NEXTN on Qwen3.5/3.6 GGUF needs the draft path explicitly (the MTP layer lives
+# in the SAME .gguf) — set it to the same file as MODEL_PATH. Empty -> omitted.
+: "${SPECULATIVE_DRAFT_MODEL_PATH:=}"
+# 2x3080 (and 5090+3080) have no P2P -> custom all-reduce falls back noisily.
+: "${DISABLE_CUSTOM_ALL_REDUCE:=}"
 
 # --- chat template / parsers ---------------------------------------------
 : "${CHAT_TEMPLATE:=/etc/htsglang/chat_template.jinja}"
@@ -95,6 +106,9 @@ add_flag() { # add_flag <flag> <bool-ish> : append flag when value is truthy
 
 add --model-path "$MODEL_PATH"
 add --served-model-name "$SERVED_MODEL_NAME"
+add --tokenizer-path "$TOKENIZER_PATH"
+add --load-format "$LOAD_FORMAT"
+add --quantization "$QUANTIZATION"
 add --tp-size "$TP_SIZE"
 add --rank-gpu-id "$RANK_GPU_ID"
 add --rank-tp-ratio "$RANK_TP_RATIO"
@@ -106,6 +120,8 @@ add --speculative-algorithm "$SPECULATIVE_ALGORITHM"
 add --speculative-num-steps "$SPECULATIVE_NUM_STEPS"
 add --speculative-eagle-topk "$SPECULATIVE_EAGLE_TOPK"
 add --speculative-num-draft-tokens "$SPECULATIVE_NUM_DRAFT_TOKENS"
+add --speculative-draft-model-path "$SPECULATIVE_DRAFT_MODEL_PATH"
+add_flag --disable-custom-all-reduce "$DISABLE_CUSTOM_ALL_REDUCE"
 add --chat-template "$CHAT_TEMPLATE"
 add --reasoning-parser "$REASONING_PARSER"
 add --tool-call-parser "$TOOL_CALL_PARSER"
