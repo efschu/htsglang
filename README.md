@@ -21,6 +21,63 @@
 <a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
 </p>
 
+--------------------------------------------------------------------------------
+
+## This fork: Qwen3.5/3.6 GGUF + uneven Tensor Parallelism
+
+This is a fork of SGLang that adds two things upstream does not have:
+
+1. **GGUF loading for the Qwen3.5 / 3.6 hybrid models.** These models mix
+   gated-delta-net (GDN) linear-attention layers with periodic full-attention
+   layers. `llama.cpp` rewrites several tensors on conversion (Gemma-norm
+   offset, `A_log = log(-ssm_a)`, conv1d unsqueeze, GDN value-head retiling when
+   `num_v_heads != num_k_heads`, block-aligned `out_proj` permute), so the raw
+   GGUF tensors can **not** be loaded directly — upstream SGLang's generic GGUF
+   path produces garbage or crashes. This fork ships a dedicated adapter that
+   inverts every transform. **All K-quants work** (Q4_K_M, Q5_K_M, Q6_K, Q8_0),
+   verified coherent + greedy-deterministic (Q6_K perplexity 1.86).
+
+2. **MTP / NEXTN speculative decoding straight from the GGUF.** The MTP block
+   the converter preserves inside the same `.gguf` (`blk.<num_layers>` /
+   `nextn.*`) is loaded as the draft model — no separate draft checkpoint. The
+   draft shares the target's embedding and (dense) lm_head. Point
+   `--speculative-draft-model-path` at the same `.gguf`.
+
+On top of the base fork's **uneven Tensor Parallelism** (`--rank-tp-ratio auto`:
+per-rank shard sizes proportional to each GPU's VRAM, for mismatched cards such
+as a 5090 + 2×3080), so a single large GGUF spans heterogeneous GPUs.
+
+### Run it
+
+```bash
+python -m sglang.launch_server \
+  --model-path  /models/Qwen3.6-27B-...-Q6_K.gguf \
+  --tokenizer-path /models/Qwen3.6-27B-...-GGUF \   # sibling dir: config.json + tokenizer
+  --load-format gguf --quantization gguf \
+  --tp 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto --rank-auto-reserve-mib 2048 \
+  --kv-cache-dtype fp8_e4m3 --disable-custom-all-reduce \
+  --speculative-algorithm NEXTN --speculative-draft-model-path /models/Qwen3.6-27B-...-Q6_K.gguf \
+  --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --context-length 8192 --host 0.0.0.0 --port 30000
+```
+
+A prebuilt runtime image is published at
+`ghcr.io/efschu/htsglang-qwen35-gguf` (see `docker/`); its ENV-driven entrypoint
+exposes every flag above, so you only override `MODEL_PATH` / `TOKENIZER_PATH`.
+
+### A note on GGUF + MTP throughput
+
+MTP gives only a modest speedup on GGUF (measured ~+10–25%, single-stream near
+break-even), and this is **fundamental, not a bug**: GGUF's quantized mat-vec
+kernels are compute-bound, so the speculative *verify* forward (M = num draft
+tokens) costs ~2.4× a single-token decode rather than ~1×. A tensor-core format
+(FP8) is memory-bound and does get the large MTP speedup. In a like-for-like
+A/B on the same hardware (5090 + 2×3080, Q6_K, uneven TP=3) this fork is
+**faster than the vLLM GGUF plugin** at every batch size, with comparable
+acceptance length (~2.8–3.1).
+
+--------------------------------------------------------------------------------
+
 ## News
 - [2026/06] 🔥 The next generation of speculative decoding: DFlash and Spec V2 ([blog](https://lmsys.org/blog/2026-06-15-next-generation-speculative-decoding-dflash-v2/)).
 - [2026/04] 🔥 DeepSeek-V4 on Day 0: From Fast Inference to Verified RL with SGLang and Miles ([blog](https://lmsys.org/blog/2026-04-25-deepseek-v4/)).
