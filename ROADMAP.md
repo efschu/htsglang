@@ -78,6 +78,15 @@ lanes)** are **separate** factors: a card can be fast in compute/VRAM yet be
 starved by a narrow PCIe link (lanes limit it, not compute/VRAM). The split
 should account for both independently.
 
+Two independent gain sources, both to be weighed:
+1. **Off-loading** a slow / link-limited card (as above).
+2. **Splitting across fast cards even when it is not memory-forced.** If both
+   cards are fast, splitting the model may raise decode/prefill throughput
+   (extra compute + memory bandwidth via TP) **even at a small context that
+   would fit entirely on one card** — as long as the TP compute/bandwidth gain
+   outweighs the cross-rank communication overhead. So the mode must be able to
+   "split for speed" without any memory need, not only to relieve a slow card.
+
 ### Parameters
 
 - **`auto performance`** — select this split objective (max speed) instead of
