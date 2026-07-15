@@ -326,23 +326,41 @@ class ModelRunnerKVCacheMixin:
             < 1e-9
         )
 
+    def _auto_mamba_target_concurrency(self: ModelRunner) -> int:
+        """Effective per-worker concurrency target used to size the demand-driven
+        mamba pool.
+
+        Only a USER-supplied --max-running-requests is treated as an explicit
+        concurrency target. When it was auto-defaulted by another handler
+        (e.g. the speculative-decoding hook resets an unset value to 48), that
+        value does NOT reflect real demand -- sizing the mamba pool to it
+        over-provisions several GB (48 * ratio * safety slots) and OOMs at pool
+        init once the draft weights are also counted. In that case fall back to
+        the modest MAMBA_AUTO_TARGET_CONCURRENCY default, and never let an
+        auto-defaulted value push the target above it."""
+        sa = self.server_args
+        per_worker = sa.dp_size if sa.enable_dp_attention else 1
+        user_set = getattr(sa, "max_running_requests_user_set", False)
+        if sa.max_running_requests is not None and user_set:
+            return max(sa.max_running_requests // per_worker, 1)
+        if sa.max_running_requests is not None:
+            return min(
+                max(sa.max_running_requests // per_worker, 1),
+                MAMBA_AUTO_TARGET_CONCURRENCY,
+            )
+        return MAMBA_AUTO_TARGET_CONCURRENCY
+
     def _auto_mamba_demand_size(self: ModelRunner, ratio: int) -> int:
         """Demand-driven mamba pool size (a request-STATE-slot count).
 
         slots = ceil(target_concurrency * mamba_ratio * safety), where
-        target_concurrency is --max-running-requests (per dp worker) when set,
-        else MAMBA_AUTO_TARGET_CONCURRENCY. mamba_ratio is the per-request slot
-        multiplier (base state + overlap ping-pong extra-buffer), so the pool
-        admits ~target_concurrency*safety requests
+        target_concurrency is _auto_mamba_target_concurrency(). mamba_ratio is
+        the per-request slot multiplier (base state + overlap ping-pong
+        extra-buffer), so the pool admits ~target_concurrency*safety requests
         (max_num_reqs = slots // ratio). Floored at `ratio` so at least one
         request is always admissible -- the scheduler is never starved
         ("state cache too small" / max_num_reqs=0 can't return)."""
-        sa = self.server_args
-        per_worker = sa.dp_size if sa.enable_dp_attention else 1
-        if sa.max_running_requests is not None:
-            target = max(sa.max_running_requests // per_worker, 1)
-        else:
-            target = MAMBA_AUTO_TARGET_CONCURRENCY
+        target = self._auto_mamba_target_concurrency()
         slots = math.ceil(target * ratio * MAMBA_AUTO_SAFETY_MARGIN)
         return int(max(slots, ratio))
 
@@ -397,16 +415,23 @@ class ModelRunnerKVCacheMixin:
             )
             size = min(demand_size, max(fit_cap, 0))
             reserve_gb = MAMBA_AUTO_ACTIVATION_RESERVE_MIB / 1024.0
+            effective_target = self._auto_mamba_target_concurrency()
+            # Show the EFFECTIVE (possibly capped) target actually used for
+            # sizing, plus the raw --max-running-requests so a capped
+            # auto-default (e.g. spec-hook 48 -> capped 16) is visible.
+            target_desc = (
+                str(effective_target)
+                if getattr(server_args, "max_running_requests_user_set", False)
+                and server_args.max_running_requests is not None
+                else f"{effective_target}(auto; max_running_requests="
+                f"{server_args.max_running_requests})"
+            )
             logger.info(
                 "[auto-mamba] demand-driven mamba pool: target_concurrency=%s "
                 "ratio=%d safety=%.2f -> max_mamba_cache_size=%d slots "
                 "(%.2f GB @ per_req=%.2f MiB; fit_cap=%d) -> admits ~%d reqs; "
                 "activation_reserve=%.2f GB; remaining VRAM -> KV pool.",
-                (
-                    server_args.max_running_requests
-                    if server_args.max_running_requests is not None
-                    else f"auto({MAMBA_AUTO_TARGET_CONCURRENCY})"
-                ),
+                target_desc,
                 ratio,
                 MAMBA_AUTO_SAFETY_MARGIN,
                 size,
