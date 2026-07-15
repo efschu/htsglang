@@ -445,7 +445,17 @@ class FlashInferAttnBackend(AttentionBackend):
 
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
-        self.uneven_dcp = uneven_dcp_kv_replicated(self.dcp_size)
+        # M4 (MTP+DCP): the DRAFT worker (EAGLE/NEXTN) does NOT token-shard its
+        # tiny 1-layer KV pool. It runs as a plain uneven-TP model -- head-sharded
+        # kv (whole GQA groups per rank, [2,1,1]) with the FULL token context
+        # resident on every rank -- so its draft/verify KV indices never need the
+        # weighted DCP owner rule. Only the TARGET model uses DCP token-sharding.
+        # This is the coordinator's "keep the draft heads local, not DCP-split"
+        # simplification (minimal variant: head-sharded across ranks, reusing the
+        # existing uneven-TP weight loading, rather than whole-on-one-card).
+        self.uneven_dcp = uneven_dcp_kv_replicated(self.dcp_size) and not getattr(
+            model_runner, "is_draft_worker", False
+        )
         # WEIGHTED owner rule (SGLANG_UNEVEN_DCP_WEIGHTED): a non-uniform token
         # vector is installed, so this rank owns the contiguous virtual-block
         # offset range [cp_lo, cp_hi) of every block of cp_S slots (instead of
@@ -1289,9 +1299,14 @@ class FlashInferAttnBackend(AttentionBackend):
         q = q.contiguous()
 
         if self.uneven_dcp:
+            # target-VERIFY: the committed prefix is ALWAYS present (decode-phase
+            # verify), and its length is seq_lens (not extend_prefix_lens, which
+            # is unset for verify). Force the prefix read so the draft tokens
+            # attend the token-sharded context.
+            force_prefix = forward_batch.forward_mode.is_target_verify()
             return self._forward_extend_dcp(
                 q, k, v, layer, forward_batch, prefill_wrapper_paged, cache_loc,
-                logits_soft_cap, save_kv_cache,
+                logits_soft_cap, save_kv_cache, force_prefix=force_prefix,
             )
 
         if not self.forward_metadata.use_ragged:
@@ -1529,6 +1544,7 @@ class FlashInferAttnBackend(AttentionBackend):
         cache_loc,
         logits_soft_cap,
         save_kv_cache,
+        force_prefix=False,
     ):
         group = get_parallel().dcp_group
         # 1. Write the current chunk's KV (full replicated kv-heads) into this
@@ -1556,8 +1572,13 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # has_prefix is a global (rank-uniform) property, so every rank takes the
         # same branch -> the DCP collectives below stay balanced (no deadlock).
-        prefix_cpu = forward_batch.extend_prefix_lens_cpu
-        has_prefix = prefix_cpu is not None and any(prefix_cpu)
+        # target-VERIFY (force_prefix) always reads the committed prefix, whose
+        # length is seq_lens (extend_prefix_lens is unset for verify).
+        if force_prefix:
+            has_prefix = True
+        else:
+            prefix_cpu = forward_batch.extend_prefix_lens_cpu
+            has_prefix = prefix_cpu is not None and any(prefix_cpu)
         if not has_prefix:
             return o_cur.contiguous().view(
                 -1, layer.tp_q_head_num * layer.head_dim
@@ -2342,6 +2363,76 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = cross_attention_custom_mask
+        elif (
+            self.attn_backend.uneven_dcp
+            and spec_info is not None
+            and getattr(spec_info, "spec_input_type", None)
+            == SpecInputType.EAGLE_VERIFY
+        ):
+            # M4 (MTP+DCP): target-VERIFY under uneven-weighted DCP. Split the
+            # verify into (a) the draft tokens attending the committed PREFIX
+            # (paged, token-sharded owned slots, FULL replicated kv-heads,
+            # non-causal, cross-rank LSE-combined) and (b) the draft tokens
+            # attending EACH OTHER (ragged, LOCAL heads). With
+            # --speculative-eagle-topk 1 the draft is a linear CHAIN, so the
+            # draft->draft mask is plain causal and the ragged wrapper needs no
+            # tree custom_mask (a branching topk>1 tree would require slicing the
+            # draft->draft block out of spec_info.custom_mask -- NOT handled
+            # here; see _forward_target_verify_dcp). The prefix read excludes the
+            # draft tokens (paged_kernel_lens == committed seq_lens); the draft
+            # KV is written to owned compact slots by _dcp_masked_write and
+            # attended only through the ragged wrapper.
+            use_ragged = True
+            draft_num = spec_info.draft_token_num
+            # Paged prefix (committed context) over this rank's OWNED slots.
+            if self.attn_backend.uneven_dcp_weighted:
+                kv_indptr, kv_indices = _build_dcp_weighted_kv_indices(
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,  # == committed seq_lens (verify prefix)
+                    kv_indptr,
+                    None,
+                    self.attn_backend.cp_S,
+                    self.attn_backend.cp_lo,
+                    self.attn_backend.cp_hi,
+                    self.attn_backend.cp_ratio,
+                    pad=256,
+                )
+            else:
+                dcp_size = self.attn_backend.dcp_size
+                dcp_rank = self.attn_backend.dcp_rank
+                dcp_lens = get_dcp_lens(paged_kernel_lens, dcp_size, dcp_rank, None)
+                kv_indptr[1 : bs + 1] = torch.cumsum(dcp_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = torch.empty(
+                    int(dcp_lens.sum().item()) + 256,
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
+                create_triton_kv_indices_for_dcp_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    dcp_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                    dcp_size,
+                    dcp_rank,
+                )
+            # Each of the draft_num draft tokens is a query row (both for the
+            # paged prefix read and the ragged draft->draft attention).
+            qo_indptr = torch.arange(
+                0,
+                (bs + 1) * draft_num,
+                step=draft_num,
+                dtype=torch.int32,
+                device=req_pool_indices.device,
+            )
+            # Paged prefix read is non-causal (every draft query sees all prefix
+            # keys); the causal draft->draft masking is done by the ragged
+            # wrapper in the forward.
+            custom_mask = None
         elif spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
