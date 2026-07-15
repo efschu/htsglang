@@ -148,9 +148,31 @@ class CompressedTensorsConfig(QuantizationConfig):
         != 0` and the wNa16 scheme asserts (this is what blocked AWQ under
         uneven TP; even TP happened to divide cleanly).
 
-        Both dims are set to G so a column-parallel OUTPUT split (gate_up / w1)
-        lands on the same boundary as its coupled row-parallel INPUT split
-        (down / w2) — mirroring GGUFConfig.weight_block_size = [256, 256].
+        Both dims are set to the same value so a column-parallel OUTPUT split
+        (gate_up / w1) lands on the same boundary as its coupled row-parallel
+        INPUT split (down / w2) — mirroring GGUFConfig.weight_block_size =
+        [256, 256]. A single shared block is mandatory for the coupled MLP
+        pair: gate_up's output units and down's input units partition the SAME
+        intermediate dimension, so they must coarsen identically or the
+        per-rank shards diverge.
+
+        The block is NOT simply the group size. These group-quantized schemes
+        execute through the Marlin (wNa16) GEMM, which additionally requires
+        the partitioned K dim to be a multiple of its thread tile
+        (min_thread_k = 128). A group-only multiple (e.g. 32) can still land on
+        a K that is group-valid but NOT tile-valid under an uneven
+        --rank-tp-ratio split (e.g. down_proj K=4768 = 149*32, 4768 % 128 = 32)
+        and then crash inside the kernel with "Invalid thread config" even
+        though the group constraint is satisfied. So coarsen to the lcm of the
+        group size(s) AND the Marlin K tile — every uneven shard is then
+        simultaneously group-aligned and tile-aligned. (min_thread_k=128 also
+        dominates min_thread_n=64, so the shared value keeps the column-parallel
+        OUTPUT dim tile-valid too.) Dense / ignored layers carry no scheme here
+        and are unaffected: _quant_block_aligned_units only re-expresses a unit
+        family that is not already block-aligned, so a component whose units
+        already divide the block (e.g. GDN k-head units) passes through
+        unchanged.
+
         Returns None when no scheme is group-quantized (channel/tensor/fp8 →
         the existing even-only path is unchanged and untouched).
         """
@@ -163,7 +185,18 @@ class CompressedTensorsConfig(QuantizationConfig):
         if not group_sizes:
             return None
         g = math.lcm(*group_sizes)  # a shard that is a multiple of the lcm is a
-        return [g, g]               # multiple of every layer's group_size.
+        # multiple of every layer's group_size; fold in the Marlin K tile so it
+        # is also a valid GEMM thread-tile boundary under uneven TP.
+        try:
+            from sglang.srt.layers.quantization.marlin_utils import (
+                GPTQ_MARLIN_MIN_THREAD_K,
+            )
+
+            marlin_k_tile = int(GPTQ_MARLIN_MIN_THREAD_K)
+        except Exception:
+            marlin_k_tile = 128
+        g = math.lcm(g, marlin_k_tile)
+        return [g, g]
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
