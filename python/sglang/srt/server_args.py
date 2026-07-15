@@ -3249,13 +3249,30 @@ class ServerArgs:
         if is_hip():
             return
         elif is_cuda():
-            if self.speculative_algorithm is not None:
+            # M4: the uneven-hybrid WEIGHTED DCP path (SGLANG_UNEVEN_DCP=1 +
+            # SGLANG_UNEVEN_DCP_WEIGHTED=1 on a non-uniform --rank-tp-ratio,
+            # dcp_size==tp_size) routes the draft + verify KV indexing through
+            # the same weighted owner rule as the main forward, so MTP/NEXTN
+            # speculative decoding is supported on that path. Keep the guard for
+            # every other CUDA DCP+spec configuration, which is NOT made safe.
+            uneven_weighted_dcp = (
+                self.speculative_algorithm is not None
+                and os.environ.get("SGLANG_UNEVEN_DCP", "0") == "1"
+                and os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0") == "1"
+                and self.rank_tp_ratio is not None
+                and len(set(self.rank_tp_ratio)) > 1
+                and self.dcp_size == self.tp_size
+            )
+            if self.speculative_algorithm is not None and not uneven_weighted_dcp:
                 raise ValueError(
                     "Decode context parallel (--dcp-size / "
                     "--decode-context-parallel-size > 1) on CUDA platform "
                     "does not support any speculative algorithm, but got "
                     f"dcp_size={self.dcp_size} on a CUDA platform with "
-                    "speculative decoding enabled."
+                    "speculative decoding enabled. (The uneven-hybrid weighted "
+                    "DCP path -- SGLANG_UNEVEN_DCP=1 + "
+                    "SGLANG_UNEVEN_DCP_WEIGHTED=1 on a non-uniform "
+                    "--rank-tp-ratio -- is the only supported spec+DCP config.)"
                 )
         else:
             raise ValueError(
