@@ -1434,7 +1434,12 @@ class ModelRunnerKVCacheMixin:
                     uneven_dcp_kv_replicated,
                 )
 
-                if uneven_dcp_kv_replicated(self.dcp_size):
+                # M4 (MTP+DCP): the DRAFT worker keeps a plain uneven-TP pool
+                # (LOCAL head-sharded kv, FULL token context) -- it is NOT
+                # DCP-token-sharded (see FlashInferAttnBackend.__init__ draft
+                # gate). Only the TARGET model replicates heads + token-shards.
+                _draft_non_dcp = self.is_draft_worker
+                if uneven_dcp_kv_replicated(self.dcp_size) and not _draft_non_dcp:
                     _hybrid_kv_head_num = self.model_config.get_total_num_kv_heads()
                 else:
                     _hybrid_kv_head_num = self.model_config.get_num_kv_heads(
@@ -1443,8 +1448,10 @@ class ModelRunnerKVCacheMixin:
                 # WEIGHTED uneven-DCP: max_total_num_tokens is the shared CONTEXT
                 # budget C; this rank physically stores only its owned share
                 # C * ratio_r / S (ratio-proportional -- the 5090 holds more than
-                # the 3080s). Even/default keep the uniform per-rank size.
-                if uneven_dcp_active(self.dcp_size):
+                # the 3080s). Even/default keep the uniform per-rank size. The
+                # non-DCP draft pool keeps the full C tokens (raw out_cache_loc
+                # index space; the draft is tiny -- 1 layer, local heads).
+                if uneven_dcp_active(self.dcp_size) and not _draft_non_dcp:
                     _ratios = get_cp_token_ratios()
                     _S = cp_token_split_factor(self.dcp_size)
                     _ratio_r = _ratios[get_parallel().attn_dcp_rank]
