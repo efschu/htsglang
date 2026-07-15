@@ -44,6 +44,38 @@ class Mamba2StateDType:
     temporal: torch.dtype
 
 
+def _model_dtype_from_config(config) -> Optional[torch.dtype]:
+    """Best-effort extraction of the model's runtime activation dtype from a
+    (text) config. Returns one of {float16, bfloat16, float32} or None.
+
+    For VL/hybrid models the runtime dtype lives on the text sub-config; the
+    mamba cache is built from the text config directly, but we also look into
+    a nested ``text_config`` defensively. transformers renamed ``torch_dtype``
+    to ``dtype`` (with the old name deprecated), so accept either.
+    """
+    if config is None:
+        return None
+
+    def _extract(cfg):
+        return getattr(cfg, "dtype", None) or getattr(cfg, "torch_dtype", None)
+
+    dt = _extract(config)
+    if dt is None and hasattr(config, "text_config"):
+        dt = _extract(config.text_config)
+
+    if isinstance(dt, str):
+        return {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "half": torch.float16,
+        }.get(dt)
+    if isinstance(dt, torch.dtype):
+        if dt in (torch.float16, torch.bfloat16, torch.float32):
+            return dt
+    return None
+
+
 def mamba2_state_dtype(config=None) -> Mamba2StateDType:
     """
     Get mamba2 state dtype from config or environment variable.
@@ -65,7 +97,26 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
     }
-    conv_dtype = dtype_map.get(envs.SGLANG_MAMBA_CONV_DTYPE.get(), torch.bfloat16)
+
+    # The conv-state cache stores recent *input activations* for the causal
+    # conv1d, so its dtype MUST match the model's runtime activation dtype.
+    # Hardcoding bfloat16 silently breaks any model whose config resolves to
+    # float16 (e.g. AWQ / compressed-tensors checkpoints without an explicit
+    # torch_dtype -> "auto" downcasts float32 to float16): the GDN in_proj
+    # emits fp16 while a bf16 conv cache rejects the write
+    # (`Index put requires source and destination dtypes match`). Follow the
+    # model dtype from the config instead; fall back to bfloat16 only when no
+    # config dtype is available. An explicit SGLANG_MAMBA_CONV_DTYPE always wins.
+    # NOTE: SGLANG_MAMBA_CONV_DTYPE has a non-None default ("bfloat16"), so we
+    # must check is_set() — not the returned value — to know whether the user
+    # explicitly pinned the conv dtype. Only an explicit override wins; the
+    # default defers to the model's runtime dtype.
+    if envs.SGLANG_MAMBA_CONV_DTYPE.is_set():
+        conv_dtype = dtype_map.get(
+            envs.SGLANG_MAMBA_CONV_DTYPE.get(), torch.bfloat16
+        )
+    else:
+        conv_dtype = _model_dtype_from_config(config) or torch.bfloat16
 
     # Get SSM dtype: default -> config -> env var
     ssm_dtype = torch.float32  # Step 1: Default value

@@ -453,6 +453,19 @@ class ModelConfig:
             is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
+        # Pin the *resolved* runtime dtype back onto the HF config(s) so every
+        # downstream consumer that reads `config.torch_dtype` (GDN RMSNormGated,
+        # the mamba conv/ssm state-cache dtype, etc.) sees the dtype the model
+        # actually runs in — not the raw checkpoint value, which may be missing
+        # (-> "auto" downcast to float16) or overridden via --dtype. Without this
+        # a float16-resolved hybrid model mismatches its bf16-defaulted state
+        # cache. Only the runtime dtype is authoritative once resolution is done.
+        for _cfg in (self.hf_config, self.hf_text_config):
+            if _cfg is not None:
+                try:
+                    _cfg.torch_dtype = self.dtype
+                except Exception:
+                    pass
 
         # Derive context length and model shapes
         self._derive_context_length(context_length)
