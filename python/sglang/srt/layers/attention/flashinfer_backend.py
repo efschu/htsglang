@@ -28,6 +28,12 @@ from sglang.srt.layers.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
 )
+from sglang.srt.layers.dcp import (
+    cp_all_gather_heads_uneven,
+    cp_lse_ag_out_ar_mha_uneven,
+    create_triton_kv_indices_for_dcp_triton,
+    get_dcp_lens,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -421,6 +427,58 @@ class FlashInferAttnBackend(AttentionBackend):
             num_attention_heads=_num_qo_heads,
             num_kv_heads=_num_kv_heads,
         )
+
+        # Uneven-DCP (--rank-tp-ratio + dcp_size==tp_size): the full-attention
+        # KV cache is TOKEN-sharded with the FULL kv-heads replicated on every
+        # rank. The paged wrappers must be planned with the FULL gathered head
+        # counts (24 q / 4 kv here) and per-rank DCP kv_indices; the attention
+        # forward gathers this rank's uneven q/kv shards, runs local paged
+        # attention over its owned token slots, and LSE-combines across the DCP
+        # group. See _local_attn_head_counts / cp_*_uneven. Off by default
+        # (predicate False) -> stock flashinfer path is bit-identical.
+        from sglang.srt.distributed.utils import (
+            cp_token_prefix,
+            tp_partition_sizes,
+            uneven_dcp_active,
+            uneven_dcp_kv_replicated,
+        )
+
+        self.dcp_size = get_parallel().attn_dcp_size
+        self.dcp_rank = get_parallel().attn_dcp_rank
+        self.uneven_dcp = uneven_dcp_kv_replicated(self.dcp_size)
+        # WEIGHTED owner rule (SGLANG_UNEVEN_DCP_WEIGHTED): a non-uniform token
+        # vector is installed, so this rank owns the contiguous virtual-block
+        # offset range [cp_lo, cp_hi) of every block of cp_S slots (instead of
+        # the even modulo residue == dcp_rank). Physical (compact) slot of an
+        # out_cache_loc L owned by this rank is
+        #   (L // cp_S) * cp_ratio + (L % cp_S - cp_lo)
+        # which is an injective, ratio-proportional packing (reduces EXACTLY to
+        # the even L // dcp_size when ratios are all 1). False -> even modulo.
+        self.uneven_dcp_weighted = self.uneven_dcp and uneven_dcp_active(
+            self.dcp_size
+        )
+        if self.uneven_dcp_weighted:
+            _cp_prefix = cp_token_prefix(self.dcp_size)
+            self.cp_S = _cp_prefix[-1]
+            self.cp_lo = _cp_prefix[self.dcp_rank]
+            self.cp_hi = _cp_prefix[self.dcp_rank + 1]
+            self.cp_ratio = self.cp_hi - self.cp_lo
+        if self.uneven_dcp:
+            mc = model_runner.model_config
+            attn_tp_size = get_parallel().attn_tp_size
+            total_kv = mc.get_total_num_kv_heads()
+            # Per-rank uneven head partitions (whole GQA groups per rank), e.g.
+            # 24 q over [2,1,1] kv units -> q [12,6,6], kv [2,1,1].
+            self.dcp_q_head_counts = tp_partition_sizes(
+                mc.num_attention_heads, attn_tp_size, units=total_kv
+            )
+            self.dcp_kv_head_counts = tp_partition_sizes(
+                total_kv, attn_tp_size, units=total_kv
+            )
+            # FULL gathered counts the paged wrappers are planned with.
+            self.dcp_full_qo_heads = mc.num_attention_heads
+            self.dcp_full_kv_heads = total_kv
+
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -1229,6 +1287,13 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
+
+        if self.uneven_dcp:
+            return self._forward_extend_dcp(
+                q, k, v, layer, forward_batch, prefill_wrapper_paged, cache_loc,
+                logits_soft_cap, save_kv_cache,
+            )
+
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
@@ -1360,6 +1425,11 @@ class FlashInferAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
+        if self.uneven_dcp:
+            return self._forward_decode_dcp(
+                q, k, v, layer, forward_batch, decode_wrapper, cache_loc, save_kv_cache
+            )
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -1385,6 +1455,152 @@ class FlashInferAttnBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
+    def _dcp_masked_write(self, layer, forward_batch, cache_loc, k, v):
+        """Gather this rank's local kv-head shard [2,1,1] up to the FULL
+        replicated kv-heads [4] and write only the token slots this rank OWNS
+        (even-modulo owner rule) at the compacted physical slot loc//dcp_size."""
+        group = get_parallel().dcp_group
+        k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+        v = v.view(-1, layer.tp_v_head_num, layer.head_dim)
+        k_full = cp_all_gather_heads_uneven(k, group, self.dcp_kv_head_counts)
+        v_full = cp_all_gather_heads_uneven(v, group, self.dcp_kv_head_counts)
+        if self.uneven_dcp_weighted:
+            # WEIGHTED owner rule: ownership + compact physical slot are derived
+            # from the out_cache_loc itself (not the sequence position), so the
+            # slot is an injective function of L and stays collision-free across
+            # concurrent requests exactly like the even L // dcp_size. This rank
+            # owns L iff (L % cp_S) in [cp_lo, cp_hi); its compact slot is
+            # (L // cp_S) * cp_ratio + (L % cp_S - cp_lo).
+            off = cache_loc % self.cp_S
+            block = cache_loc // self.cp_S
+            dcp_kv_mask = (off >= self.cp_lo) & (off < self.cp_hi)
+            loc = torch.where(
+                dcp_kv_mask,
+                block * self.cp_ratio + (off - self.cp_lo),
+                torch.zeros_like(cache_loc),
+            )
+        else:
+            loc = cache_loc // self.dcp_size
+            positions = forward_batch.positions
+            if positions is not None and positions.numel() == loc.numel():
+                dcp_kv_mask = positions % self.dcp_size == self.dcp_rank
+            else:
+                dcp_kv_mask = forward_batch.dcp_kv_mask
+        self.token_to_kv_pool.set_kv_buffer(
+            layer,
+            loc,
+            k_full.clone(),
+            v_full.clone(),
+            layer.k_scale,
+            layer.v_scale,
+            dcp_kv_mask=dcp_kv_mask,
+        )
+
+    def _forward_decode_dcp(
+        self, q, k, v, layer, forward_batch, decode_wrapper, cache_loc, save_kv_cache
+    ):
+        group = get_parallel().dcp_group
+        if k is not None and save_kv_cache:
+            self._dcp_masked_write(layer, forward_batch, cache_loc, k, v)
+
+        q_local = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        q_full = cp_all_gather_heads_uneven(q_local, group, self.dcp_q_head_counts)
+        o, lse = decode_wrapper.forward_return_lse(
+            q_full,
+            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
+        # o: [tokens, 24, D], lse: [tokens, 24]; combine across the DCP token
+        # shards and slice back to this rank's [12/6/6] head shard.
+        o = cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
+        return o.reshape(-1, layer.tp_q_head_num * layer.head_dim).to(q.dtype)
+
+    def _forward_extend_dcp(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        prefill_wrapper_paged,
+        cache_loc,
+        logits_soft_cap,
+        save_kv_cache,
+    ):
+        group = get_parallel().dcp_group
+        # 1. Write the current chunk's KV (full replicated kv-heads) into this
+        #    rank's owned token slots (token-sharded cache).
+        if k is not None and save_kv_cache:
+            self._dcp_masked_write(layer, forward_batch, cache_loc, k, v)
+
+        causal = (
+            not layer.is_cross_attention
+            and layer.attn_type != AttentionType.ENCODER_ONLY
+        )
+        q_local = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        # 2. Current chunk: ragged LOCAL head-sharded attention (causal). k/v are
+        #    the freshly-projected bf16 current tokens, fully present on every
+        #    rank, so this is exact local GQA attention (no DCP gather needed).
+        o_cur, lse_cur = self.prefill_wrapper_ragged.forward_return_lse(
+            q_local,
+            k.view(-1, layer.tp_k_head_num, layer.head_dim),
+            v.view(-1, layer.tp_v_head_num, layer.head_dim),
+            causal=causal,
+            sm_scale=layer.scaling,
+            logits_soft_cap=logits_soft_cap,
+        )
+
+        # has_prefix is a global (rank-uniform) property, so every rank takes the
+        # same branch -> the DCP collectives below stay balanced (no deadlock).
+        prefix_cpu = forward_batch.extend_prefix_lens_cpu
+        has_prefix = prefix_cpu is not None and any(prefix_cpu)
+        if not has_prefix:
+            return o_cur.contiguous().view(
+                -1, layer.tp_q_head_num * layer.head_dim
+            )
+
+        # 3. Prefix: paged DCP read over this rank's OWNED prefix slots with the
+        #    FULL gathered q-heads (non-causal: all prefix keys precede every
+        #    current query). Combine the per-rank partials across the DCP group
+        #    and slice back to this rank's local heads.
+        q_full = cp_all_gather_heads_uneven(q_local, group, self.dcp_q_head_counts)
+        o_pre, lse_pre = prefill_wrapper_paged.forward_return_lse(
+            q_full,
+            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            causal=False,
+            sm_scale=layer.scaling,
+            logits_soft_cap=logits_soft_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
+        o_pre, lse_pre = cp_lse_ag_out_ar_mha_uneven(
+            o_pre, lse_pre, group, self.dcp_q_head_counts, return_lse=True
+        )
+
+        # 4. Merge current chunk with prefix (both in this rank's local-head
+        #    space) by natural-log LSE. lse_pre is a torch.logsumexp (natural
+        #    log) from the cross-rank combine, and flashinfer's ragged
+        #    forward_return_lse also returns natural-log LSE, so logaddexp mixes
+        #    them consistently. (flashinfer's merge_state uses a different
+        #    internal convention and must NOT be used across these two sources.)
+        lse_cur = lse_cur.float()
+        lse_pre = lse_pre.float()
+        final_lse = torch.logaddexp(lse_cur, lse_pre)
+        sc_cur = torch.nan_to_num(
+            torch.exp(lse_cur - final_lse), nan=0.0, posinf=0.0, neginf=0.0
+        ).unsqueeze(-1)
+        sc_pre = torch.nan_to_num(
+            torch.exp(lse_pre - final_lse), nan=0.0, posinf=0.0, neginf=0.0
+        ).unsqueeze(-1)
+        o = o_cur.float() * sc_cur + o_pre.float() * sc_pre
+        return o.to(q.dtype).contiguous().view(
+            -1, layer.tp_q_head_num * layer.head_dim
+        )
+
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
             return 0
@@ -1395,6 +1611,65 @@ class FlashInferAttnBackend(AttentionBackend):
             return layer.is_cross_attention
 
         raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")
+
+
+def _build_dcp_weighted_kv_indices(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    paged_kernel_lens: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_start_idx: Optional[torch.Tensor],
+    cp_S: int,
+    cp_lo: int,
+    cp_hi: int,
+    cp_ratio: int,
+    pad: int = 0,
+):
+    """Weighted-DCP paged kv_indices: this rank's OWNED cache slots, compacted.
+
+    Builds the full per-request out_cache_loc list for [kv_start, kv_start+len),
+    keeps the slots this rank owns under the WEIGHTED owner rule
+    (loc % cp_S in [cp_lo, cp_hi)) and maps each to its compact physical slot
+    (loc // cp_S) * cp_ratio + (loc % cp_S - cp_lo) -- the exact inverse of the
+    _dcp_masked_write packing, so a token is read from the slot it was written
+    to. Writes the per-request owned counts into ``kv_indptr`` and returns
+    (kv_indptr[:bs+1], kv_indices).
+    """
+    bs = len(req_pool_indices)
+    device = req_pool_indices.device
+    lens64 = paged_kernel_lens.to(torch.int64)
+    full_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+    full_indptr[1:] = torch.cumsum(lens64, dim=0).to(torch.int32)
+    total = int(full_indptr[bs].item())
+    full_kv = torch.empty(max(total, 1), dtype=torch.int32, device=device)
+    if total > 0:
+        create_flashinfer_kv_indices_triton[(bs,)](
+            req_to_token,
+            req_pool_indices,
+            paged_kernel_lens,
+            full_indptr,
+            kv_start_idx,
+            full_kv,
+            req_to_token.shape[1],
+        )
+    full_kv = full_kv[:total]
+    full_kv64 = full_kv.to(torch.int64)
+    off = full_kv64 % cp_S
+    owned = (off >= cp_lo) & (off < cp_hi)
+    compact = ((full_kv64 // cp_S) * cp_ratio + (off - cp_lo)).to(torch.int32)
+    kv_indices = compact[owned].contiguous()
+    if pad > 0:
+        kv_indices = torch.cat([kv_indices, kv_indices.new_zeros(pad)])
+    if total > 0:
+        seg = torch.repeat_interleave(
+            torch.arange(bs, device=device, dtype=torch.int64), lens64
+        )
+        owned_per_req = torch.zeros(bs, dtype=torch.int64, device=device)
+        owned_per_req.scatter_add_(0, seg, owned.to(torch.int64))
+    else:
+        owned_per_req = torch.zeros(bs, dtype=torch.int64, device=device)
+    kv_indptr[1 : bs + 1] = torch.cumsum(owned_per_req, dim=0)
+    return kv_indptr[: bs + 1], kv_indices
 
 
 class FlashInferIndicesUpdaterDecode:
@@ -1410,6 +1685,15 @@ class FlashInferIndicesUpdaterDecode:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+
+        # Uneven-DCP: the paged decode wrapper reads the token-sharded KV with
+        # FULL replicated kv-heads and the GATHERED q-heads, so plan it with the
+        # full counts (see FlashInferAttnBackend.uneven_dcp). The forward gathers
+        # this rank's q shard up to these full counts and slices the combined
+        # output back down.
+        if attn_backend.uneven_dcp:
+            self.num_qo_heads = attn_backend.dcp_full_qo_heads
+            self.num_kv_heads = attn_backend.dcp_full_kv_heads
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -1572,7 +1856,53 @@ class FlashInferIndicesUpdaterDecode:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
-        if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
+        if (
+            self.attn_backend.uneven_dcp
+            and (spec_info is None or getattr(spec_info, "kv_indptr", None) is None)
+        ):
+            # Uneven-DCP decode: this rank's paged read sees only the token
+            # slots it OWNS (even-modulo owner rule pos % dcp_size == dcp_rank,
+            # physical slot = global_loc // dcp_size). Build per-rank owned
+            # lengths + compacted kv_indices via the DCP index kernel.
+            bs = len(req_pool_indices)
+            dcp_size = self.attn_backend.dcp_size
+            dcp_rank = self.attn_backend.dcp_rank
+            if self.attn_backend.uneven_dcp_weighted:
+                # WEIGHTED owner rule: owned slots + compact indices from the
+                # out_cache_loc (loc % cp_S in [cp_lo, cp_hi)); see
+                # _build_dcp_weighted_kv_indices / _dcp_masked_write.
+                kv_indptr, kv_indices = _build_dcp_weighted_kv_indices(
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    self.attn_backend.cp_S,
+                    self.attn_backend.cp_lo,
+                    self.attn_backend.cp_hi,
+                    self.attn_backend.cp_ratio,
+                )
+            else:
+                dcp_lens = get_dcp_lens(
+                    paged_kernel_lens, dcp_size, dcp_rank, kv_start_idx
+                )
+                kv_indptr[1 : bs + 1] = torch.cumsum(dcp_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = torch.empty(
+                    int(dcp_lens.sum().item()), dtype=torch.int32, device="cuda"
+                )
+                create_triton_kv_indices_for_dcp_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    dcp_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                    dcp_size,
+                    dcp_rank,
+                )
+        elif spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
@@ -1677,6 +2007,17 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+
+        # Uneven-DCP: the RAGGED wrapper attends the current chunk with this
+        # rank's LOCAL (head-sharded) q/kv shards; the PAGED wrapper attends the
+        # token-sharded prefix with the FULL gathered q + replicated kv-heads.
+        # Keep both head-count pairs so each wrapper is planned correctly.
+        self.dcp_local_qo_heads = self.num_qo_heads
+        self.dcp_local_kv_heads = self.num_kv_heads
+        if attn_backend.uneven_dcp:
+            self.num_qo_heads = attn_backend.dcp_full_qo_heads
+            self.num_kv_heads = attn_backend.dcp_full_kv_heads
+
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.kv_last_page_len = attn_backend.kv_last_page_len
@@ -1949,7 +2290,59 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
-        if spec_info is None:
+        if spec_info is None and self.attn_backend.uneven_dcp:
+            # Uneven-DCP extend: the paged (prefix) wrapper reads only this
+            # rank's OWNED prefix token slots (even-modulo owner rule), with the
+            # FULL replicated kv-heads. The current-chunk k/v stay local and are
+            # attended by the ragged wrapper (local heads) in the forward.
+            assert prefix_lens is not None
+            assert len(seq_lens) == len(req_pool_indices)
+            # DCP ALWAYS splits current-chunk (ragged, local heads) from prefix
+            # (paged, token-sharded, full heads), regardless of the incoming
+            # use_ragged (this model reports is_multimodal -> use_ragged=False,
+            # but DCP still needs the split because the paged prefix read cannot
+            # causally mask a sparse owned-slot subset). The paged part covers
+            # the PREFIX only; force the ragged plan below.
+            use_ragged = True
+            dcp_size = self.attn_backend.dcp_size
+            dcp_rank = self.attn_backend.dcp_rank
+            if self.attn_backend.uneven_dcp_weighted:
+                kv_indptr, kv_indices = _build_dcp_weighted_kv_indices(
+                    self.req_to_token,
+                    req_pool_indices,
+                    prefix_lens,
+                    kv_indptr,
+                    None,
+                    self.attn_backend.cp_S,
+                    self.attn_backend.cp_lo,
+                    self.attn_backend.cp_hi,
+                    self.attn_backend.cp_ratio,
+                    pad=256,
+                )
+            else:
+                dcp_lens = get_dcp_lens(prefix_lens, dcp_size, dcp_rank, None)
+                kv_indptr[1 : bs + 1] = torch.cumsum(dcp_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = torch.empty(
+                    int(dcp_lens.sum().item()) + 256,
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
+                create_triton_kv_indices_for_dcp_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    dcp_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                    dcp_size,
+                    dcp_rank,
+                )
+            qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
+            qo_indptr = qo_indptr[: bs + 1]
+            custom_mask = cross_attention_custom_mask
+        elif spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
@@ -1997,11 +2390,24 @@ class FlashInferIndicesUpdaterPrefill:
 
         # extend part
         if use_ragged:
+            # Uneven-DCP: the current chunk is attended with this rank's LOCAL
+            # head-sharded q/kv (the full replicated kv-head gather happens only
+            # for the paged prefix read + the KV write, not the ragged chunk).
+            ragged_qo_heads = (
+                self.dcp_local_qo_heads
+                if self.attn_backend.uneven_dcp
+                else self.num_qo_heads
+            )
+            ragged_kv_heads = (
+                self.dcp_local_kv_heads
+                if self.attn_backend.uneven_dcp
+                else self.num_kv_heads
+            )
             wrapper_ragged.begin_forward(
                 qo_indptr,
                 qo_indptr,
-                self.num_qo_heads,
-                self.num_kv_heads,
+                ragged_qo_heads,
+                ragged_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
             )
