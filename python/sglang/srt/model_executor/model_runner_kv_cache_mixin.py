@@ -20,6 +20,7 @@ from sglang.srt.distributed.utils import (
     suggest_unit_rebalance_multi,
     tp_partition_size,
     tp_plan_active,
+    uneven_dcp_active,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import (
@@ -80,6 +81,34 @@ MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
+
+# --- Demand-driven ("auto") mamba pool sizing (uneven-DCP path) ---------------
+# The stock code reserves a fixed FRACTION of post-weights VRAM for the mamba
+# state cache (--mamba-full-memory-ratio, default 0.9 -> ~47% of the remaining
+# memory). Because the mamba pool is the concurrency limiter
+# (max_num_reqs = max_mamba_cache_size // mamba_ratio), a fixed fraction
+# over-provisions it several-fold for real workloads and steals that VRAM from
+# the KV/token pool, capping max_total_num_tokens well below the achievable
+# optimum. The auto path below sizes the pool to the actual serving concurrency
+# and hands ALL remaining VRAM to KV -- mirroring vLLM's align-mode coupling of
+# mamba blocks to running sequences -- so the KV ceiling reaches its optimum
+# with NO manual --mamba-full-memory-ratio tuning.
+MAMBA_FULL_MEMORY_RATIO_DEFAULT = 0.9
+# Default steady-state concurrent-request target when --max-running-requests is
+# unset. The pool holds `mamba_ratio` state slots per running request (base
+# state + overlap ping-pong extra-buffer), so this couples the pool to a modest,
+# realistic concurrency instead of a VRAM fraction. Comfortably above the
+# 8-way concurrency correctness bar.
+MAMBA_AUTO_TARGET_CONCURRENCY = 16
+# Small headroom on the concurrency target (NOT a VRAM fraction). Keeps the pool
+# from being sized to the exact target so a burst above it still admits.
+MAMBA_AUTO_SAFETY_MARGIN = 1.25
+# Prefill-activation scratch (MiB) folded back OUT of the KV budget on the auto
+# path. Giving 100% of the freed VRAM to KV would let the token pool grow to the
+# physical ceiling and starve the transient DCP-extend prefix-gather activation
+# scratch, OOM'ing a large (~18k-token) prefill. Reserving this back lets the
+# default --rank-auto-reserve-mib stand (no need to raise it to buy headroom).
+MAMBA_AUTO_ACTIVATION_RESERVE_MIB = 1024
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +302,50 @@ class ModelRunnerKVCacheMixin:
                 "mamba_pool.uneven_tp_min", max_mamba_cache_size=agreed
             )
 
+    def _auto_mamba_demand_active(self: ModelRunner) -> bool:
+        """Whether to size the mamba state pool by DEMAND (concurrency) rather
+        than by the fixed --mamba-full-memory-ratio fraction.
+
+        Gated narrowly so stock behavior is byte-identical unless it is clearly
+        safe to diverge:
+          * uneven-DCP must be in force (a non-uniform token vector installed,
+            i.e. SGLANG_UNEVEN_DCP + _WEIGHTED). The default path, the
+            even-modulo DCP path, and single-GPU all keep the fixed fraction.
+          * the user must NOT have pinned --max-mamba-cache-size (handled by the
+            explicit branch above) or --mamba-full-memory-ratio (an explicit
+            fraction is honored as an override -> fixed-fraction path).
+          * radix cache must be enabled (the disable-radix branch owns its own
+            request-count sizing).
+        """
+        sa = self.server_args
+        return (
+            uneven_dcp_active(sa.dcp_size)
+            and sa.max_mamba_cache_size is None
+            and not sa.disable_radix_cache
+            and abs(sa.mamba_full_memory_ratio - MAMBA_FULL_MEMORY_RATIO_DEFAULT)
+            < 1e-9
+        )
+
+    def _auto_mamba_demand_size(self: ModelRunner, ratio: int) -> int:
+        """Demand-driven mamba pool size (a request-STATE-slot count).
+
+        slots = ceil(target_concurrency * mamba_ratio * safety), where
+        target_concurrency is --max-running-requests (per dp worker) when set,
+        else MAMBA_AUTO_TARGET_CONCURRENCY. mamba_ratio is the per-request slot
+        multiplier (base state + overlap ping-pong extra-buffer), so the pool
+        admits ~target_concurrency*safety requests
+        (max_num_reqs = slots // ratio). Floored at `ratio` so at least one
+        request is always admissible -- the scheduler is never starved
+        ("state cache too small" / max_num_reqs=0 can't return)."""
+        sa = self.server_args
+        per_worker = sa.dp_size if sa.enable_dp_attention else 1
+        if sa.max_running_requests is not None:
+            target = max(sa.max_running_requests // per_worker, 1)
+        else:
+            target = MAMBA_AUTO_TARGET_CONCURRENCY
+        slots = math.ceil(target * ratio * MAMBA_AUTO_SAFETY_MARGIN)
+        return int(max(slots, ratio))
+
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config
         server_args = self.server_args
@@ -304,6 +377,65 @@ class ModelRunnerKVCacheMixin:
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+        elif self._auto_mamba_demand_active():
+            # === Demand-driven mamba pool (uneven-DCP auto-sizing) ===========
+            # Size the pool to the real serving concurrency, NOT to a fixed
+            # fraction of post-weights VRAM. All remaining VRAM then flows to
+            # the KV/token pool, so its ceiling reaches the optimum with no
+            # manual --mamba-full-memory-ratio flag (the "self-determined +
+            # optimal" requirement). See the module-level constants for the
+            # rationale.
+            per_req = config.mamba2_cache_params.mamba_cache_per_req
+            assert per_req > 0
+            ratio = self._calculate_mamba_ratio()
+            D = server_args.speculative_num_draft_tokens if has_spec_dec else 0
+            demand_size = self._auto_mamba_demand_size(ratio)
+            # Never exceed what the post-weights budget can physically hold
+            # (main state + spec-decode intermediate state per admitted req).
+            fit_cap = int(
+                total_rest_memory * (1 << 30) // (per_req * (1 + D / ratio))
+            )
+            size = min(demand_size, max(fit_cap, 0))
+            reserve_gb = MAMBA_AUTO_ACTIVATION_RESERVE_MIB / 1024.0
+            logger.info(
+                "[auto-mamba] demand-driven mamba pool: target_concurrency=%s "
+                "ratio=%d safety=%.2f -> max_mamba_cache_size=%d slots "
+                "(%.2f GB @ per_req=%.2f MiB; fit_cap=%d) -> admits ~%d reqs; "
+                "activation_reserve=%.2f GB; remaining VRAM -> KV pool.",
+                (
+                    server_args.max_running_requests
+                    if server_args.max_running_requests is not None
+                    else f"auto({MAMBA_AUTO_TARGET_CONCURRENCY})"
+                ),
+                ratio,
+                MAMBA_AUTO_SAFETY_MARGIN,
+                size,
+                size * per_req / (1 << 30),
+                per_req / (1 << 20),
+                fit_cap,
+                size // ratio,
+                reserve_gb,
+            )
+            server_args.override(
+                "mamba_pool.demand_driven",
+                max_mamba_cache_size=size,
+            )
+            # Uneven TP: agree on the min request count across ranks BEFORE it
+            # feeds the intermediate-memory reservation below.
+            self._sync_uneven_mamba_cache_size()
+            if has_spec_dec:
+                capped_reqs = min(
+                    server_args.max_running_requests
+                    // (self.dp_size if server_args.enable_dp_attention else 1),
+                    server_args.max_mamba_cache_size // ratio,
+                )
+                intermediate_size = per_req * capped_reqs * D
+                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+            # Fold prefill-activation headroom back OUT of the KV budget so the
+            # token pool does not grow to the physical ceiling and starve the
+            # transient DCP-extend prefix-gather scratch (which OOMs a large
+            # prefill). This lets the default --rank-auto-reserve-mib stand.
+            total_rest_memory = total_rest_memory - reserve_gb
         elif (
             server_args.disable_radix_cache
             and server_args.max_running_requests is not None
