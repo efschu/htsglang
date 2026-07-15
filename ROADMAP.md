@@ -116,6 +116,14 @@ Before implementing, confirm the win is real on this hardware:
   time; that card is the prime candidate to off-load under this mode.
 - Decide whether the speed gained (more work on the fast/well-linked card,
   slow/link-limited card off-loaded) justifies the context lost.
+- **More-than-3-card scenarios via code analysis.** This box has only 3 GPUs,
+  so the >3-card behavior must be studied by **analyzing the code / the split
+  math**, not on hardware. Investigate whether, for example, 4 cards split
+  `2:2:2:1` or `3:2:1:1` would raise decode/prefill throughput — and how the
+  best split shifts as a function of the desired maximum KV-cache size (a larger
+  target context pushes toward a more even, capacity-first split; a
+  speed-first target pushes toward concentrating work on the fast/well-linked
+  cards). Derive the relationship from the code rather than measurement.
 
 ### Hardware note
 
