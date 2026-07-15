@@ -57,3 +57,59 @@ is itself undecided and must be measured.
 
 Cross-reference: existing multi-rank-per-GPU support via `--rank-gpu-id`
 duplicates and NCCL >= 2.30 multi-rank communicators.
+
+## Performance-oriented uneven split ("auto performance" mode)
+
+Status: unimplemented, feasibility-gated (investigate first, see below).
+
+### Goal
+
+Today the uneven split (`--rank-tp-ratio auto` + uneven-DCP KV token-sharding)
+optimizes for **maximum VRAM / context** — it fills every card and hands the KV
+pool as many tokens as the hardware allows. Add an alternative **"auto
+performance"** mode that instead distributes the split for **maximum decode /
+prefill throughput**, accepting a bounded loss of context.
+
+The idea: shift more of the model/work toward the **faster** card (higher
+compute + memory bandwidth) **and** the **better-connected** card (more PCIe
+lanes / higher link generation), and leave **more free space on the slower or
+slower-linked** card. Crucially, compute/VRAM-bandwidth and **link speed (PCIe
+lanes)** are **separate** factors: a card can be fast in compute/VRAM yet be
+starved by a narrow PCIe link (lanes limit it, not compute/VRAM). The split
+should account for both independently.
+
+### Parameters
+
+- **`auto performance`** — select this split objective (max speed) instead of
+  the default max-VRAM objective.
+- **`max auto loose ctx in percent`** — the precondition/constraint: how much
+  max-available context may be sacrificed, in percent, relative to the
+  VRAM-optimal split. This defines a **hard floor**: the optimizer shifts load
+  toward the fast/well-linked card only until the max-available context would
+  fall below `(100 - X)%` of the VRAM optimum. There is an **automatic, natural
+  lower bound** here — the floor is derived from the maximum-available context
+  itself, not chosen arbitrarily; at `X = 0` only speed gains that do not reduce
+  context are taken.
+- **`max auto tune both|dec|enc`** — the tuning target: `both` (decode +
+  prefill jointly), `dec` (decode throughput only), or `enc` (encode / prefill
+  throughput only).
+
+### Feasibility investigation (do this FIRST)
+
+Before implementing, confirm the win is real on this hardware:
+- Load the slow cards (the 3080s) only **very little** (split heavily toward the
+  5090 + the well-linked card) and measure decode/prefill throughput vs. the
+  balanced VRAM-optimal split.
+- Quantify the role of the PCIe link. On this box (NVML order 0=3080, 1=5090,
+  2=3080) one 3080 sits on **PCIe Gen2 x4 (~2 GB/s)** while the 5090 and the
+  other 3080 run **Gen4 x8 (~16 GB/s)** — an ~8x slower link on that one card.
+  Measure per-card all-reduce / comm cost and the slow link's share of the step
+  time; that card is the prime candidate to off-load under this mode.
+- Decide whether the speed gained (more work on the fast/well-linked card,
+  slow/link-limited card off-loaded) justifies the context lost.
+
+### Hardware note
+
+Because compute-fast and link-fast are independent, the mode must read both
+`pcie.link.width/gen` (or measured link bandwidth) and compute/VRAM-bandwidth
+per physical GPU, not just VRAM size.
