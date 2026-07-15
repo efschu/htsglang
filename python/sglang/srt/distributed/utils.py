@@ -8,6 +8,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import dataclasses
 import logging
+import math
 import os
 import pickle
 import time
@@ -137,6 +138,187 @@ def get_tp_partition_ratios(family: Optional[str] = None) -> Optional[list]:
         if vec is not None:
             return vec
     return _TP_PARTITION_RATIOS
+
+
+# ---------------------------------------------------------------------------
+# Uneven decode context parallel (uneven DCP) token-axis split.
+#
+# When --rank-tp-ratio is non-uniform AND dcp_size == tp_size, the KV cache of
+# the full-attention layers is split along the TOKEN axis instead of the head
+# axis: every rank stores the FULL (replicated) kv-heads but only the context
+# tokens it owns. Rank r owns ratio[r] contiguous slots of every virtual block
+# of sum(ratio) tokens (weighted prefix-range owner rule, generalizing the even
+# modulo rule owner==pos%N). The scheduler pool is pinned in VIRTUAL blocks
+# (min over ranks of local_tokens/ratio[r], times sum(ratio)), so the total
+# max_total_num_tokens can far exceed any single rank's local capacity.
+#
+# The token vector is SEPARATE from the weight (head) vector: q/kv heads follow
+# --rank-tp-ratio, but the token split follows this vector (derived from each
+# rank's free KV budget so every card fills up). When all-equal, this collapses
+# to the classic even DCP (modulo) fast path, keeping that path bit-identical.
+# ---------------------------------------------------------------------------
+
+_CP_TOKEN_RATIOS: Optional[list] = None
+
+
+def set_cp_token_ratios(ratios: Optional[Sequence[int]]) -> None:
+    """Install the uneven-DCP token-axis split vector for this process (or
+    None to disable, restoring the even modulo path)."""
+    global _CP_TOKEN_RATIOS
+    _CP_TOKEN_RATIOS = list(ratios) if ratios else None
+
+
+def get_cp_token_ratios() -> Optional[list]:
+    """The installed uneven-DCP token-axis split vector (or None)."""
+    return _CP_TOKEN_RATIOS
+
+
+def uneven_dcp_active(dcp_size: Optional[int] = None) -> bool:
+    """True when the uneven-DCP token-axis split is in force: a non-uniform
+    token vector is installed. When `dcp_size` is given, the vector must also
+    match it (guards against a stale vector on a differently-sized group).
+    All-equal vectors are NOT uneven -- they use the even modulo fast path."""
+    ratios = _CP_TOKEN_RATIOS
+    if not ratios or len(set(ratios)) == 1:
+        return False
+    if dcp_size is not None and len(ratios) != dcp_size:
+        return False
+    return True
+
+
+def cp_token_split_factor(dcp_size: int) -> int:
+    """The number of token slots per virtual block along the DCP axis.
+
+    Uneven DCP: sum(token ratios) -- the virtual block that the weighted
+    prefix-range owner rule cycles over, and the factor the KV pool / page
+    size is inflated by. Even DCP (uniform or no vector installed): dcp_size,
+    reproducing the classic modulo layout exactly."""
+    if uneven_dcp_active(dcp_size):
+        return sum(_CP_TOKEN_RATIOS)
+    return dcp_size
+
+
+def uneven_dcp_kv_replicated(dcp_size: int) -> bool:
+    """True when the uneven-TP + DCP KV-replication path is in force: DCP spans
+    the whole TP group (dcp_size>1) AND a --rank-tp-ratio base plan is installed
+    (so kv-heads are split UNEVENLY and cannot be head-sharded across the DCP
+    group). Under this path every rank stores the FULL (replicated) kv-heads but
+    only its owned token slots. Covers BOTH the even-modulo (no token vector) and
+    the weighted (token vector installed) owner rules. False -> stock behavior
+    (even head-sharded DCP, or no DCP), keeping those paths bit-identical."""
+    return dcp_size > 1 and get_tp_partition_ratios() is not None
+
+
+def cp_token_prefix(dcp_size: int) -> list:
+    """Prefix sums of the token ratios: cp_token_prefix()[r] is the first slot
+    index (within a virtual block of cp_token_split_factor tokens) owned by
+    rank r; entry [dcp_size] == the block size. Even DCP -> [0,1,2,...,N]."""
+    if uneven_dcp_active(dcp_size):
+        ratios = _CP_TOKEN_RATIOS
+    else:
+        ratios = [1] * dcp_size
+    out = [0]
+    for r in ratios:
+        out.append(out[-1] + r)
+    return out
+
+
+def _checkpoint_size_mib(model_path: Optional[str]) -> int:
+    """Total on-disk checkpoint size (MiB), 0 if unknown. Deterministic in
+    every process so the derived token vector is identical everywhere."""
+    import glob
+
+    if not model_path:
+        return 0
+    if os.path.isfile(model_path):
+        return os.path.getsize(model_path) // 2**20
+    if not os.path.isdir(model_path):
+        return 0
+    total = sum(
+        os.path.getsize(f)
+        for f in glob.glob(os.path.join(model_path, "*.safetensors"))
+    )
+    if total == 0:
+        total = sum(
+            os.path.getsize(f) for f in glob.glob(os.path.join(model_path, "*.gguf"))
+        )
+    return total // 2**20
+
+
+def resolve_cp_token_ratios(server_args, checkpoint_size_mib: Optional[int] = None) -> Optional[list]:
+    """Token-axis split vector for uneven DCP, derived from the server args.
+
+    Returns None (use even modulo) when no uneven plan applies. Otherwise a
+    small positive-integer vector (gcd-reduced) proportional to each rank's
+    FREE KV budget, so heterogeneous cards each fill up:
+
+        avail[r] = rank_gpu_memory_mib[r]
+                   - checkpoint_size_mib * weight[r] / sum(weights)  (weight bytes)
+                   - _CP_TOKEN_OVERHEAD_MIB                          (context/frag)
+
+    integerized to _CP_TOKEN_UNITS units (>=1 per rank), gcd-reduced so the
+    virtual scheduler block (page_size * sum(ratios)) stays as fine as
+    possible. When no per-rank byte budgets are available, falls back to the
+    gcd-reduced --rank-tp-ratio weights (a simple weights-based split).
+
+    Deterministic pure function of the args so every rank computes the same
+    vector (the pool pinning and owner rule must agree across ranks)."""
+    weights = getattr(server_args, "rank_tp_ratio", None)
+    dcp_size = getattr(server_args, "dcp_size", 1)
+    if not weights or dcp_size <= 1 or len(set(weights)) == 1:
+        return None
+    if len(weights) != dcp_size:
+        return None
+
+    # Self-calibration override: SGLANG_UNEVEN_TOKEN_VECTOR wins over the
+    # budget-estimate derivation below. The KV-pool calibration emits it as a
+    # restart hint (measured optimal from the actual per-rank profiled token
+    # capacity); feeding it back here converges the pools to that optimum on
+    # the next boot. Model-type-agnostic (dtype-independent measured capacity).
+    from sglang.srt.environ import envs
+
+    env_vec = envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()
+    if env_vec:
+        parsed = [int(x) for x in env_vec.split(",") if x.strip() != ""]
+        if len(parsed) != dcp_size or any(v <= 0 for v in parsed):
+            raise ValueError(
+                f"SGLANG_UNEVEN_TOKEN_VECTOR must be {dcp_size} positive "
+                f"integers (one per DCP rank), got {env_vec!r}."
+            )
+        if len(set(parsed)) == 1:
+            return None
+        g = math.gcd(*parsed)
+        return [v // g for v in parsed]
+
+    if checkpoint_size_mib is None:
+        checkpoint_size_mib = _checkpoint_size_mib(
+            getattr(server_args, "model_path", None)
+        )
+
+    budgets = getattr(server_args, "rank_gpu_memory_mib", None)
+    if (
+        isinstance(budgets, list)
+        and len(budgets) == len(weights)
+        and checkpoint_size_mib > 0
+    ):
+        total_w = sum(weights)
+        avail = [
+            max(b - checkpoint_size_mib * w / total_w - _CP_TOKEN_OVERHEAD_MIB, 1.0)
+            for b, w in zip(budgets, weights)
+        ]
+        vector = partition_units(_CP_TOKEN_UNITS, [max(int(a), 1) for a in avail])
+        g = math.gcd(*vector)
+        return [v // g for v in vector]
+
+    g = math.gcd(*weights)
+    return [w // g for w in weights]
+
+
+#: Token-vector resolution granularity (units) and the assumed
+#: weight-independent per-rank overhead (CUDA context, fragmentation,
+#: attention scratch) subtracted before the free-memory split.
+_CP_TOKEN_UNITS = 64
+_CP_TOKEN_OVERHEAD_MIB = 1536
 
 
 def partition_units(units: int, weights: Sequence[int]) -> list:

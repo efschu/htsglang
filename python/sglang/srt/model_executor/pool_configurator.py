@@ -258,8 +258,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes
         else:
+            # Uneven-DCP KV replication: every rank stores the FULL kv-heads
+            # (replicated across the DCP group, not head-sharded) but only its
+            # owned token slots, so per-token bytes reflect the FULL kv-head
+            # count, not this rank's uneven projection share. Stock paths keep
+            # the per-rank get_num_kv_heads(tp_size).
+            from sglang.srt.distributed.utils import uneven_dcp_kv_replicated
+
+            if uneven_dcp_kv_replicated(get_parallel().attn_dcp_size):
+                num_kv_heads_cell = model_config.get_total_num_kv_heads()
+            else:
+                num_kv_heads_cell = model_config.get_num_kv_heads(tp_size)
             cell_size = (
-                model_config.get_num_kv_heads(tp_size)
+                num_kv_heads_cell
                 * (model_config.head_dim + model_config.v_head_dim)
                 * effective_num_layers
                 * kv_size

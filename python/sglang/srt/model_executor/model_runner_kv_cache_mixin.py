@@ -620,6 +620,7 @@ class ModelRunnerKVCacheMixin:
         # most accurate per-rank measurement (weights + graphs resident),
         # matching the restart the hint asks for.
         self._maybe_suggest_mlp_rebalance(budget_bytes)
+        self._maybe_suggest_dcp_token_vector(budget_bytes)
         config = self._config_from_budget(
             budget_bytes, cap_tokens=self.max_total_num_tokens
         )
@@ -1288,13 +1289,41 @@ class ModelRunnerKVCacheMixin:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
+                # Uneven-DCP KV replication: the full-attention sub-pool stores
+                # the FULL (replicated) kv-heads (gathered in the attention
+                # forward from this rank's uneven [2,1,1] projection) but only
+                # this rank's owned token slots. head_num must therefore be the
+                # FULL total_num_kv_heads, not this rank's uneven share. Stock
+                # paths keep the per-rank get_num_kv_heads(attn_tp_size).
+                from sglang.srt.distributed.utils import (
+                    cp_token_split_factor,
+                    get_cp_token_ratios,
+                    uneven_dcp_active,
+                    uneven_dcp_kv_replicated,
+                )
+
+                if uneven_dcp_kv_replicated(self.dcp_size):
+                    _hybrid_kv_head_num = self.model_config.get_total_num_kv_heads()
+                else:
+                    _hybrid_kv_head_num = self.model_config.get_num_kv_heads(
+                        get_parallel().attn_tp_size
+                    )
+                # WEIGHTED uneven-DCP: max_total_num_tokens is the shared CONTEXT
+                # budget C; this rank physically stores only its owned share
+                # C * ratio_r / S (ratio-proportional -- the 5090 holds more than
+                # the 3080s). Even/default keep the uniform per-rank size.
+                if uneven_dcp_active(self.dcp_size):
+                    _ratios = get_cp_token_ratios()
+                    _S = cp_token_split_factor(self.dcp_size)
+                    _ratio_r = _ratios[get_parallel().attn_dcp_rank]
+                    _hybrid_pool_size = (self.max_total_num_tokens // _S) * _ratio_r
+                else:
+                    _hybrid_pool_size = self.max_total_num_tokens
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
-                    size=self.max_total_num_tokens,
+                    size=_hybrid_pool_size,
                     dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_parallel().attn_tp_size
-                    ),
+                    head_num=_hybrid_kv_head_num,
                     head_dim=self.model_config.head_dim,
                     # if draft worker, we only need 1 attention layer's kv pool
                     full_attention_layer_ids=(
@@ -1466,7 +1495,56 @@ class ModelRunnerKVCacheMixin:
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                         )
+                    elif self.server_args.rank_tp_ratio is not None:
+                        # Uneven-DCP token-sharding (this feature): the
+                        # allocator's index space is the GLOBAL token positions
+                        # (max_total * split_factor); each rank physically stores
+                        # 1/split_factor of them via the owner rule
+                        # (loc // split_factor in the kernels).
+                        #
+                        # split_factor is dcp_size for even (modulo) DCP and
+                        # sum(token ratios) for weighted DCP; it MUST equal the
+                        # divisor the DCP kernels use so out_cache_loc //
+                        # split_factor stays within the physical pool.
+                        #
+                        # CRITICAL (hybrid-mamba invariant): the paged page_size
+                        # stays NATURAL (base page_size), never inflated by the
+                        # factor. Inflating it (the stock `page_size * dcp_size`)
+                        # forces the radix cache's page granularity to the DCP
+                        # factor, which collides with mamba_cache_chunk_size and
+                        # fails page-alignment asserts on non-factor-aligned
+                        # sequence lengths under concurrent load. The token-
+                        # interleave belongs in the indexing/owner layer, not in
+                        # the allocator's page granularity.
+                        from sglang.srt.distributed.utils import (
+                            cp_token_split_factor,
+                            uneven_dcp_active,
+                        )
+
+                        # Even (modulo) DCP: max_total_num_tokens is this rank's
+                        # per-rank physical pool, and the GLOBAL virtual index
+                        # space is max_total * split_factor. WEIGHTED DCP:
+                        # max_total_num_tokens is ALREADY the global context C
+                        # (= virtual index space); each rank stores only its
+                        # ratio_r/S share via the weighted compact owner rule, so
+                        # the allocator index space is C itself (not C * factor).
+                        if uneven_dcp_active(self.dcp_size):
+                            dcp_alloc_size = self.max_total_num_tokens
+                        else:
+                            dcp_alloc_size = self.max_total_num_tokens * (
+                                cp_token_split_factor(self.dcp_size)
+                            )
+                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                            dcp_alloc_size,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=self.token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
                     else:
+                        # Stock even-DCP (unchanged): interleave via inflated
+                        # page granularity.
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                             self.max_total_num_tokens * self.dcp_size,
                             page_size=self.page_size * self.dcp_size,
@@ -1538,6 +1616,40 @@ class ModelRunnerKVCacheMixin:
                     f"{token_capacity}. Use the profiled value instead."
                 )
             token_capacity = min(token_capacity, user_limit)
+
+        # WEIGHTED uneven-DCP: decouple the reported CONTEXT budget from each
+        # rank's non-uniform physical pool. token_capacity arrives as P_r =
+        # this rank's physical token capacity (available_bytes // full-kv-head
+        # cell). Under the weighted token split rank r physically stores
+        # C * ratio_r / S tokens, so the largest context that fits EVERY rank
+        # is C = min_r(P_r // ratio_r) * S. This C becomes max_total_num_tokens
+        # (what the scheduler admits and reports); the per-rank pool + allocator
+        # are sized from it separately (HybridLinearKVPool / allocator below).
+        from sglang.srt.distributed.utils import (
+            cp_token_split_factor,
+            get_cp_token_ratios,
+            uneven_dcp_active,
+        )
+
+        if (
+            uneven_dcp_active(self.dcp_size)
+            and get_world_group().world_size > 1
+        ):
+            ratios = get_cp_token_ratios()
+            split_factor = cp_token_split_factor(self.dcp_size)
+            ratio_r = ratios[get_parallel().attn_dcp_rank]
+            local_blocks = torch.tensor(
+                int(token_capacity) // int(ratio_r), dtype=torch.int64
+            )
+            torch.distributed.all_reduce(
+                local_blocks,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_world_group().cpu_group,
+            )
+            token_capacity = int(local_blocks.item()) * split_factor
+            if user_limit is not None:
+                token_capacity = min(token_capacity, user_limit)
+            return token_capacity
 
         # Sync across PP ranks (each may have different layer counts) and
         # across uneven-TP ranks (--rank-gpu-memory-mib: byte profiling is
@@ -1721,6 +1833,105 @@ class ModelRunnerKVCacheMixin:
                 projected,
             )
 
+    def _maybe_suggest_dcp_token_vector(
+        self: ModelRunner, budget_bytes: int
+    ) -> None:
+        """Uneven-DCP token-vector self-calibration (analogue of vLLM's
+        VLLM_UNEVEN_TOKEN_VECTOR): after the rank-local KV profiling, derive
+        the OPTIMAL token-axis split vector from each rank's ACTUAL profiled
+        token capacity P_r (not the rough pre-boot budget estimate) and, if it
+        differs from the active vector, log a restart hint.
+
+        Under the weighted owner rule the reported context budget is
+        C = min_r(P_r // ratio_r) * sum(ratios); it is maximized when the
+        ratios are proportional to the measured P_r. P_r = physical token
+        capacity of this rank's budget with the full-kv-head cell — the same
+        quantity _apply_token_constraints consumes, and dtype-independent
+        (works for FP8 / AWQ / GGUF alike). The optimal vector is
+        partition_units(64, [P_r...]) (largest-remainder), gcd-reduced.
+
+        Purely advisory — nothing is resized in-process; the hint asks for a
+        restart with SGLANG_UNEVEN_TOKEN_VECTOR=a,b,c, which resolve_cp_token_
+        ratios honors on the next boot so the pool converges to the optimum.
+        Because P_r is independent of the active vector, this converges in one
+        feedback step. All gating conditions are rank-uniform, so every rank
+        reaches the collective or none does."""
+        from sglang.srt.distributed.utils import (
+            cp_token_split_factor,
+            get_cp_token_ratios,
+            partition_units,
+            uneven_dcp_active,
+        )
+
+        if not uneven_dcp_active(self.dcp_size):
+            return
+        if get_world_group().world_size <= 1:
+            return
+        active = get_cp_token_ratios()
+        if not active or len(active) != self.dcp_size:
+            return
+
+        # Local physical token capacity P_r of this rank's budget (full-kv-head
+        # cell, pre owner-rule split) — matches _apply_token_constraints' input.
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        configurator = create_memory_pool_configurator(self)
+        local_p = configurator.calculate_pool_sizes(
+            budget_bytes, self.page_size
+        ).max_total_num_tokens
+        if local_p <= 0:
+            return
+
+        world = get_world_group().world_size
+        payload = (int(get_parallel().attn_dcp_rank), int(local_p))
+        gathered: list = [None] * world
+        torch.distributed.all_gather_object(
+            gathered, payload, group=get_world_group().cpu_group
+        )
+        # Order the capacities by DCP rank (the token vector is indexed by
+        # attn_dcp_rank, which need not equal the global rank).
+        p_by_rank = [0] * self.dcp_size
+        for dcp_rank, p_val in gathered:
+            if 0 <= dcp_rank < self.dcp_size:
+                p_by_rank[dcp_rank] = p_val
+        if any(p <= 0 for p in p_by_rank):
+            return
+
+        optimal = partition_units(64, p_by_rank)
+        g = math.gcd(*optimal)
+        optimal = [v // g for v in optimal]
+
+        def _context_budget(vector: list) -> int:
+            return min(p_by_rank[r] // vector[r] for r in range(self.dcp_size)) * sum(
+                vector
+            )
+
+        c_active = _context_budget(active)
+        c_optimal = _context_budget(optimal)
+
+        if self.tp_rank == 0:
+            if optimal == active or c_optimal <= c_active:
+                logger.info(
+                    "Uneven DCP token vector converged (balanced): %s, "
+                    "max_total_num_tokens=%d (per-rank profiled capacity %s).",
+                    active,
+                    c_active,
+                    p_by_rank,
+                )
+            else:
+                logger.warning(
+                    "Uneven DCP: restart with SGLANG_UNEVEN_TOKEN_VECTOR=%s to "
+                    "raise max_total_num_tokens from %d to ~%d (per-rank "
+                    "profiled capacity %s; active vector %s leaves ranks idle).",
+                    ",".join(str(v) for v in optimal),
+                    c_active,
+                    c_optimal,
+                    p_by_rank,
+                    active,
+                )
+
     def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
@@ -1827,6 +2038,7 @@ class ModelRunnerKVCacheMixin:
             # with post-capture sizing the (more accurate) post-capture
             # measurement runs it instead.
             self._maybe_suggest_mlp_rebalance(available_bytes)
+            self._maybe_suggest_dcp_token_vector(available_bytes)
         config = self._config_from_budget(available_bytes)
         config.max_running_requests = self._resolve_max_num_reqs(
             config.max_total_num_tokens

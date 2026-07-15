@@ -480,6 +480,14 @@ class Envs:
     # family, MOE = fused expert-weight family.
     SGLANG_UNEVEN_MLP_VECTOR = EnvStr(None)
     SGLANG_UNEVEN_MOE_VECTOR = EnvStr(None)
+    # Uneven DCP token-axis split vector ("a,b,c", one positive integer per
+    # DCP rank). Overrides the budget-estimate vector resolve_cp_token_ratios
+    # would otherwise derive. Emitted by the KV-pool self-calibration as a
+    # restart hint (measured optimal from the actual per-rank profiled token
+    # capacity); feeding it back on the next boot converges the per-rank KV
+    # pools to the profiled optimum. Model-type-agnostic (keys off measured
+    # capacity, which is dtype-independent).
+    SGLANG_UNEVEN_TOKEN_VECTOR = EnvStr(None)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
     # Override the distributed init method used by torch.distributed.init_process_group.
