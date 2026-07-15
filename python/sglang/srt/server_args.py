@@ -4307,6 +4307,23 @@ class ServerArgs:
                 "; ".join(reasons),
             )
 
+        # Uneven DCP (M1): a non-uniform --rank-tp-ratio switches the
+        # full-attention KV cache from head-sharding to TOKEN-sharding, so
+        # the decode-context-parallel group must span the whole TP group
+        # (dcp_size == tp_size, every rank a DCP rank).
+        if (
+            uneven_plan
+            and self.dcp_size == 1
+            and os.environ.get("SGLANG_UNEVEN_DCP", "0") == "1"
+        ):
+            self.dcp_size = self.tp_size
+            logger.info(
+                "Uneven DCP: auto-set dcp_size=%d (= tp_size) for token-axis "
+                "KV sharding under the non-uniform --rank-tp-ratio %s.",
+                self.dcp_size,
+                self.rank_tp_ratio,
+            )
+
         self._handle_uneven_mlp_ratio()
 
     #: Shiftable weight families of the uneven-TP self-calibration:

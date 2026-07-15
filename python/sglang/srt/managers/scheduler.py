@@ -1817,6 +1817,18 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
         )
 
+    def _pool_stats_dcp_factor(self) -> int:
+        """Multiplier turning per-rank max_total_num_tokens into the GLOBAL DCP
+        token capacity for pool-utilization stats. Even (modulo) DCP: dcp_size
+        (max_total is this rank's physical pool). WEIGHTED DCP: 1, because
+        max_total_num_tokens is ALREADY the global context C (the physical pool
+        is the smaller per-rank ratio_r/S share, sized separately)."""
+        from sglang.srt.distributed.utils import uneven_dcp_active
+
+        if uneven_dcp_active(self.server_args.dcp_size):
+            return 1
+        return self.server_args.dcp_size
+
     def init_pool_stats_observer(self) -> None:
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
@@ -1829,7 +1841,8 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens * self.server_args.dcp_size,
+            max_total_num_tokens=self.max_total_num_tokens
+            * self._pool_stats_dcp_factor(),
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -4478,6 +4491,29 @@ def configure_scheduler_process(
         if isinstance(vector, list):
             family_plans[family] = vector
     set_tp_partition_ratios(base_plan, families=family_plans or None)
+
+    # Uneven DCP (M1): install the token-axis split vector so the KV pool
+    # pinning and the weighted owner rule agree across ranks. None keeps the
+    # even modulo DCP path. Gated behind dcp_size>1 (auto-set for a
+    # non-uniform --rank-tp-ratio) so the default path is untouched.
+    from sglang.srt.distributed.utils import (
+        resolve_cp_token_ratios,
+        set_cp_token_ratios,
+    )
+
+    # The weighted owner rule (SGLANG_UNEVEN_DCP_WEIGHTED=1) installs the token
+    # vector so cp_token_split_factor()=sum(ratios); without it, DCP uses the
+    # even modulo owner rule (split_factor=dcp_size). Staged so the allocator
+    # size factor always matches the divisor the DCP kernels use.
+    if (
+        getattr(server_args, "dcp_size", 1) > 1
+        and base_plan is not None
+        and os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0") == "1"
+    ):
+        cp_vector = resolve_cp_token_ratios(server_args)
+        set_cp_token_ratios(cp_vector)
+        if cp_vector is not None:
+            logger.info("Uneven DCP token vector installed: %s", cp_vector)
 
     # Apply this rank's --rank-gpu-memory-mib budget as its
     # mem_fraction_static (MiB -> fraction against the rank's physical

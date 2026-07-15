@@ -103,6 +103,91 @@ def cp_lse_ag_out_rs_mha(
     return out
 
 
+def cp_all_gather_heads_uneven(
+    x: torch.Tensor,
+    cp_group: GroupCoordinator,
+    head_counts: list,
+) -> torch.Tensor:
+    """All-gather along the head dim (dim=1) when per-rank head counts differ
+    (uneven TP / --rank-tp-ratio).
+
+    torch's all_gather requires EQUAL shapes on every rank, so an uneven
+    ``[12,6,6]`` q-head split would deadlock the collective (ranks disagree on
+    the gathered size). The sync trick (ported from the vLLM uneven-DCP fork,
+    ``ops/common.cp_all_gather_heads_uneven``): pad every rank's head dim to
+    ``max(head_counts)``, all-gather the equal-shaped padded tensor, then slice
+    out each rank's TRUE head count and re-concatenate in rank order (= global
+    head order, since head shards are contiguous prefix-sum slices). Shapes are
+    static per rank, so this is cuda-graph friendly; the pad garbage is sliced
+    away before any compute.
+
+    x: [ ..., local_heads, D ] with local_heads == head_counts[this_rank].
+    Returns [ ..., sum(head_counts), D ].
+    """
+    counts = list(head_counts)
+    local_heads = x.shape[1]
+    rank = cp_group.rank_in_group
+    assert counts[rank] == local_heads, (
+        f"cp_all_gather_heads_uneven: head_counts[{rank}]={counts[rank]} != "
+        f"local head dim {local_heads}"
+    )
+    max_heads = max(counts)
+    if all(c == max_heads for c in counts):
+        # Equal split: the padded path is a no-op; use the plain collective.
+        return cp_group.all_gather(x, dim=1)
+    pad_shape = list(x.shape)
+    pad_shape[1] = max_heads
+    padded = x.new_zeros(pad_shape)
+    padded[:, :local_heads].copy_(x)
+    gathered = cp_group.all_gather(padded, dim=1)
+    parts = [
+        gathered[:, r * max_heads : r * max_heads + counts[r]]
+        for r in range(cp_group.world_size)
+    ]
+    return torch.cat(parts, dim=1).contiguous()
+
+
+def cp_local_head_bounds(cp_group: GroupCoordinator, head_counts: list) -> tuple:
+    """(start, stop) of this rank's head slice in the gathered full head set
+    under uneven DCP (head_counts = per-rank q-head partition, e.g. [12,6,6])."""
+    rank = cp_group.rank_in_group
+    start = sum(head_counts[:rank])
+    return start, start + head_counts[rank]
+
+
+def cp_lse_ag_out_ar_mha_uneven(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    head_counts: list,
+    return_lse: bool = False,
+):
+    """Uneven-DCP MHA combine: like ``cp_lse_ag_out_rs_mha`` but per-rank head
+    shards differ (--rank-tp-ratio), so the equal ``H // world_size`` slice is
+    replaced by this rank's prefix-sum head bounds (from ``head_counts``).
+
+    cp_attn_out: [ tokens, H_total, D ]  (H_total = sum(head_counts))
+    cp_attn_lse: [ tokens, H_total ]
+    """
+    if cp_group.world_size == 1:
+        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
+
+    cp_attn_lse = cp_attn_lse.contiguous()
+    lses = _ag_lse(cp_attn_lse, cp_group)
+    global_lse = torch.logsumexp(lses, dim=0)
+    scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
+    scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
+
+    out = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0) * scale
+    out = cp_group.all_reduce(out)
+
+    start, stop = cp_local_head_bounds(cp_group, head_counts)
+    out = out[:, start:stop, :].contiguous()
+    if return_lse:
+        return out, global_lse[:, start:stop].contiguous()
+    return out
+
+
 def cp_lse_ag_out_rs_mla(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
