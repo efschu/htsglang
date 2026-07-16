@@ -29,6 +29,7 @@ be loaded by sglang's generic GGUF path for three reasons:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -46,6 +47,70 @@ _MODEL_TYPE_TO_GGUF_ARCH = {
 
 def is_qwen35_gguf_arch(model_type: Optional[str]) -> bool:
     return model_type in _MODEL_TYPE_TO_GGUF_ARCH
+
+
+def detect_gguf_multimodal(model: str) -> Optional[Path]:
+    """Return the mmproj*.gguf lying next to a backbone GGUF file, if any.
+
+    llama.cpp stores the vision tower (arch "clip", projector
+    "qwen3vl_merger") in a separate mmproj file in the same directory as the
+    text backbone. Ported from vllm-gguf-plugin gguf_utils.detect_gguf_multimodal.
+    """
+    try:
+        model_path = Path(model)
+        if model_path.is_file() and str(model).endswith(".gguf"):
+            model_dir = model_path.parent
+        elif model_path.is_dir():
+            model_dir = model_path
+        else:
+            return None
+        for pattern in ("mmproj.gguf", "mmproj-*.gguf", "*mmproj*.gguf"):
+            mmproj_files = sorted(model_dir.glob(pattern))
+            if mmproj_files:
+                return mmproj_files[0]
+        return None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Vision tower (mmproj GGUF, arch "clip", projector "qwen3vl_merger")
+# ---------------------------------------------------------------------------
+# clip.* tensor names local to one vision block -> HF checkpoint names inside
+# model.visual.blocks.{i}. (Qwen3_5ForConditionalGeneration.load_weights then
+# rewrites "model.visual." -> "visual." and "attn.qkv." -> "attn.qkv_proj.",
+# exactly as for the FP8/AWQ safetensors checkpoints.)
+_VISION_BLOCK_TENSORS = {
+    "attn_qkv.weight": "attn.qkv.weight",
+    "attn_qkv.bias": "attn.qkv.bias",
+    "attn_out.weight": "attn.proj.weight",
+    "attn_out.bias": "attn.proj.bias",
+    "ffn_up.weight": "mlp.linear_fc1.weight",
+    "ffn_up.bias": "mlp.linear_fc1.bias",
+    "ffn_down.weight": "mlp.linear_fc2.weight",
+    "ffn_down.bias": "mlp.linear_fc2.bias",
+    "ln1.weight": "norm1.weight",
+    "ln1.bias": "norm1.bias",
+    "ln2.weight": "norm2.weight",
+    "ln2.bias": "norm2.bias",
+}
+
+# llama.cpp splits the Conv3d patch embedding along the temporal dimension
+# into weight / weight.1; they are re-stacked (dim=2) in the iterator.
+_PATCH_EMBED_T0 = "model.visual.patch_embed.proj.weight.__t0"
+_PATCH_EMBED_T1 = "model.visual.patch_embed.proj.weight.__t1"
+_VISION_TOP_TENSORS = {
+    "v.patch_embd.weight": _PATCH_EMBED_T0,
+    "v.patch_embd.weight.1": _PATCH_EMBED_T1,
+    "v.patch_embd.bias": "model.visual.patch_embed.proj.bias",
+    "v.position_embd.weight": "model.visual.pos_embed.weight",
+    "v.post_ln.weight": "model.visual.merger.norm.weight",
+    "v.post_ln.bias": "model.visual.merger.norm.bias",
+    "mm.0.weight": "model.visual.merger.linear_fc1.weight",
+    "mm.0.bias": "model.visual.merger.linear_fc1.bias",
+    "mm.2.weight": "model.visual.merger.linear_fc2.weight",
+    "mm.2.bias": "model.visual.merger.linear_fc2.bias",
+}
 
 
 # Gemma-style RMSNorm gammas (implemented as ``x * (1 + w)`` with zero-centered
@@ -89,6 +154,19 @@ class Qwen35GGUFAdapter:
         # MTP block is stored as blk.<num_hidden_layers>.
         archs = getattr(config, "architectures", None) or []
         self.is_draft = archs[:1] == ["Qwen3_5ForCausalLMMTP"]
+        # Vision tower: only the multimodal wrapper arch has one, and only
+        # when an mmproj GGUF actually lies next to the backbone. The draft
+        # (NEXTN/MTP) never loads vision. Without an mmproj, model_config.py
+        # force-disables multimodal and the v./mm. skip below keeps the old
+        # text-only behavior.
+        self.vision_config = getattr(config, "vision_config", None)
+        self.mmproj_path: Optional[Path] = None
+        if (
+            not self.is_draft
+            and self.vision_config is not None
+            and any("ForConditionalGeneration" in a for a in archs)
+        ):
+            self.mmproj_path = detect_gguf_multimodal(gguf_file)
         self.num_k = int(getattr(text_config, "linear_num_key_heads", 0) or 0)
         self.num_v = int(getattr(text_config, "linear_num_value_heads", 0) or 0)
         self.head_k_dim = int(getattr(text_config, "linear_key_head_dim", 0) or 0)
@@ -260,6 +338,96 @@ class Qwen35GGUFAdapter:
             n,
         )
         return gguf_to_hf
+
+    # ------------------------------------------------------------------
+    # Vision tower (mmproj GGUF)
+    # ------------------------------------------------------------------
+
+    def build_vision_name_map(self) -> Dict[str, str]:
+        """clip.* -> HF names for the vision encoder + qwen3vl merger."""
+        assert self.vision_config is not None
+        depth = int(
+            getattr(self.vision_config, "depth", None)
+            or getattr(self.vision_config, "num_hidden_layers", 0)
+        )
+        name_map = dict(_VISION_TOP_TENSORS)
+        for i in range(depth):
+            for gguf_local, hf_local in _VISION_BLOCK_TENSORS.items():
+                name_map[f"v.blk.{i}.{gguf_local}"] = (
+                    f"model.visual.blocks.{i}.{hf_local}"
+                )
+        return name_map
+
+    def vision_weights_iterator(self) -> Iterable[Tuple[str, torch.Tensor]]:
+        """Yield the vision tower weights from the mmproj GGUF next to the
+        backbone as dense torch tensors with HF checkpoint names.
+
+        mmproj tensors are stored dense (BF16/F16/F32 in practice); the
+        vision modules are built with quant_config=None (see
+        Qwen3VLForConditionalGeneration), so plain ``.weight``/``.bias``
+        names are emitted — never ``.qweight``. gguf-py exposes BF16 data as
+        raw uint8 bytes (last dim doubled), which must be re-viewed as
+        bfloat16; F16/F32 arrive as properly shaped numpy arrays.
+        """
+        import gguf
+        from gguf.quants import dequantize
+
+        assert self.mmproj_path is not None
+        name_map = self.build_vision_name_map()
+        reader = gguf.GGUFReader(str(self.mmproj_path))
+
+        dense_types = {
+            gguf.GGMLQuantizationType.F32,
+            gguf.GGMLQuantizationType.F16,
+        }
+        patch_embed_parts: Dict[str, torch.Tensor] = {}
+        count = 0
+        for tensor in reader.tensors:
+            hf_name = name_map.get(tensor.name)
+            if hf_name is None:
+                # Fail fast: an unmapped vision tensor would silently leave a
+                # module uninitialized (the exact NaN hazard this feature
+                # removes).
+                raise RuntimeError(
+                    f"qwen35 mmproj: unmapped tensor {tensor.name!r} in "
+                    f"{self.mmproj_path}"
+                )
+            qtype = tensor.tensor_type
+            if qtype == gguf.GGMLQuantizationType.BF16:
+                weight = torch.tensor(tensor.data).view(torch.bfloat16)
+            elif qtype in dense_types:
+                weight = torch.tensor(tensor.data)
+            else:
+                weight = torch.from_numpy(
+                    dequantize(tensor.data, qtype).copy()
+                )
+            if hf_name in (_PATCH_EMBED_T0, _PATCH_EMBED_T1):
+                # Re-stack llama.cpp's temporal split of the Conv3d patch
+                # embedding: two (out, in, H, W) halves -> (out, in, T=2, H, W).
+                patch_embed_parts[hf_name] = weight
+                if len(patch_embed_parts) == 2:
+                    fused = torch.stack(
+                        [
+                            patch_embed_parts[_PATCH_EMBED_T0],
+                            patch_embed_parts[_PATCH_EMBED_T1],
+                        ],
+                        dim=2,
+                    )
+                    count += 1
+                    yield "model.visual.patch_embed.proj.weight", fused
+                continue
+            count += 1
+            yield hf_name, weight
+        if len(patch_embed_parts) not in (0, 2):
+            raise RuntimeError(
+                "qwen35 mmproj: patch_embd temporal halves incomplete "
+                f"({sorted(patch_embed_parts)}) in {self.mmproj_path}"
+            )
+        logger.info(
+            "qwen35 GGUF vision tower loaded from mmproj: %d tensors (%s)",
+            count,
+            self.mmproj_path,
+        )
 
     def unquantized_module_prefixes(self) -> List[str]:
         """Linear modules whose GGUF tensors are stored unquantized (F32/F16/

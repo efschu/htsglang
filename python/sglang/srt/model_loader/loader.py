@@ -10,6 +10,7 @@ import dataclasses
 import fnmatch
 import gc
 import glob
+import itertools
 import json
 import logging
 import math
@@ -2228,6 +2229,20 @@ class GGUFModelLoader(BaseModelLoader):
             )
             if qwen35_adapter is not None:
                 weights_iterator = qwen35_adapter.transform_stream(weights_iterator)
+                if qwen35_adapter.mmproj_path is not None:
+                    # Multimodal GGUF: the vision tower lives in the mmproj
+                    # file next to the backbone (llama.cpp convention). Chain
+                    # its dense weights so the wrapper's visual modules are
+                    # fully initialized (uninitialized vision = NaN hazard,
+                    # see model_config.py GGUF multimodal gate).
+                    logger.info(
+                        "qwen35 GGUF: loading vision encoder from %s",
+                        qwen35_adapter.mmproj_path,
+                    )
+                    weights_iterator = itertools.chain(
+                        weights_iterator,
+                        qwen35_adapter.vision_weights_iterator(),
+                    )
             model.load_weights(weights_iterator)
 
             for _, module in model.named_modules():

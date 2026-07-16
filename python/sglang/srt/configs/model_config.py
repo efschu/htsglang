@@ -315,18 +315,46 @@ class ModelConfig:
             is_multimodal_model(self.hf_config.architectures)
             or hasattr(self.hf_config, "vision_config")
         ):
-            if enable_multimodal:
-                logger.warning(
-                    "--enable-multimodal is ignored for GGUF checkpoints: "
-                    "GGUF carries no vision/mmproj tensors, image inputs "
-                    "would run an uninitialized vision tower."
+            # Exception: a qwen35-family GGUF with an mmproj*.gguf next to
+            # the backbone DOES have vision weights — the GGUF loader reads
+            # the vision tower from that file (loader.py chains
+            # Qwen35GGUFAdapter.vision_weights_iterator), so multimodal can
+            # stay enabled. Everything else (no mmproj, or an arch whose
+            # GGUF loader cannot load vision) keeps the text-only fallback.
+            from sglang.srt.model_loader.gguf_qwen35 import (
+                detect_gguf_multimodal,
+                is_qwen35_gguf_arch,
+            )
+
+            mmproj_path = None
+            if is_qwen35_gguf_arch(
+                getattr(self.hf_config, "model_type", None)
+            ) and any(
+                "ForConditionalGeneration" in a
+                for a in (self.hf_config.architectures or [])
+            ):
+                mmproj_path = detect_gguf_multimodal(self.model_path)
+
+            if mmproj_path is not None:
+                logger.info(
+                    "GGUF multimodal: found %s next to the backbone; the "
+                    "vision tower will be loaded from it and multimodal "
+                    "stays enabled.",
+                    mmproj_path,
                 )
             else:
-                logger.info(
-                    "Multimodal is disabled for GGUF checkpoint "
-                    "(text tensors only; no mmproj/vision weights)."
-                )
-            enable_multimodal = False
+                if enable_multimodal:
+                    logger.warning(
+                        "--enable-multimodal is ignored for GGUF checkpoints: "
+                        "GGUF carries no vision/mmproj tensors, image inputs "
+                        "would run an uninitialized vision tower."
+                    )
+                else:
+                    logger.info(
+                        "Multimodal is disabled for GGUF checkpoint "
+                        "(text tensors only; no mmproj/vision weights)."
+                    )
+                enable_multimodal = False
 
         # Set enable_multimodal
         if enable_multimodal is None:
