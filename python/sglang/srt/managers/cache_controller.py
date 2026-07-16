@@ -437,6 +437,22 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
+        # Weighted uneven-DCP owner mode: page files are owner-written and
+        # rank-shared; only the file backend implements that key scheme, and
+        # the per-page owner rule needs page_size == 1 (a multi-token page
+        # would span owner ranks). Fail fast instead of silently writing an
+        # allocation-dependent (corrupt) store (task #60).
+        if self.storage_config.dcp_owner_mode:
+            if storage_backend != "file":
+                raise NotImplementedError(
+                    "Weighted uneven-DCP HiCache storage currently supports "
+                    f"only the 'file' backend, got '{storage_backend}'."
+                )
+            if self.page_size != 1:
+                raise NotImplementedError(
+                    "Weighted uneven-DCP HiCache storage requires page_size == 1, "
+                    f"got {self.page_size}."
+                )
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (
             self.storage_config.is_mla_model
@@ -614,6 +630,9 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            # Weighted uneven-DCP: KV pages are token-sharded with FULL
+            # replicated kv-heads -> owner-written, rank-shared page files.
+            dcp_owner_mode=self._dcp_owner_ctx() is not None,
         )
 
     def reset(self):
@@ -691,11 +710,22 @@ class HiCacheController:
         start_event = device_module.Event()
         finish_event = device_module.Event()
 
+        # Weighted uneven-DCP: back up only this rank's owned tokens, from
+        # their COMPACT device slots (identity when the gate is off). The
+        # draft pool below is NOT DCP-token-sharded (full token context,
+        # global indices) and keeps the raw pair list.
+        kv_host_indices, kv_device_indices = self._dcp_kv_transfer_pairs(
+            host_indices, device_indices
+        )
+
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
             self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device, host_indices, device_indices, self.io_backend
+                self.mem_pool_device,
+                kv_host_indices,
+                kv_device_indices,
+                self.io_backend,
             )
             if self.has_draft:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
@@ -708,10 +738,14 @@ class HiCacheController:
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the write stream is executing.
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.write_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.write_stream)
+            for indices in (
+                host_indices,
+                device_indices,
+                kv_host_indices,
+                kv_device_indices,
+            ):
+                if indices.is_cuda:
+                    indices.record_stream(self.write_stream)
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
@@ -731,6 +765,44 @@ class HiCacheController:
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
         return device_indices
+
+    def _dcp_owner_ctx(self) -> Optional[tuple]:
+        """(S, lo, hi) of this rank's weighted uneven-DCP owner range, or None.
+
+        Cached: the token vector is installed once at engine init, before the
+        cache controller is constructed. When active, the radix tree hands the
+        controller GLOBAL allocator indices while the device KV pool only holds
+        this rank's COMPACT owned slots -- every device-side KV transfer must
+        go through _dcp_kv_transfer_pairs (task #60)."""
+        if not hasattr(self, "_dcp_owner_ctx_cache"):
+            from sglang.srt.distributed.utils import uneven_dcp_owner_bounds
+
+            self._dcp_owner_ctx_cache = uneven_dcp_owner_bounds()
+        return self._dcp_owner_ctx_cache
+
+    def _dcp_kv_transfer_pairs(
+        self, host_indices: torch.Tensor, device_indices: torch.Tensor
+    ):
+        """Translate a (host page, GLOBAL device slot) pair list into the
+        (host page, COMPACT device slot) pairs this rank actually owns.
+
+        Weighted uneven-DCP stores token L's KV on the rank whose owner range
+        [lo, hi) contains L % S, at compact physical slot
+        (L // S) * (hi - lo) + (L % S - lo). Tokens outside [lo, hi) do not
+        exist on this rank's device pool: their host pages are neither backed
+        up nor loaded here (their L3 page file is written by the owner rank
+        and holds the FULL replicated kv-heads). Gate off -> identity, keeping
+        the stock path byte-identical."""
+        ctx = self._dcp_owner_ctx()
+        if ctx is None:
+            return host_indices, device_indices
+        S, lo, hi = ctx
+        dev = device_indices.to(torch.int64)
+        off = dev % S
+        owned = (off >= lo) & (off < hi)
+        compact = (dev // S) * (hi - lo) + (off - lo)
+        host_owned = host_indices[owned.to(host_indices.device)]
+        return host_owned, compact[owned]
 
     def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
         # move indices to GPU if using kernels, to host if using direct indexing
@@ -767,13 +839,20 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
+        # Weighted uneven-DCP: load only this rank's owned tokens into their
+        # COMPACT device slots (identity when the gate is off). Draft pool is
+        # not DCP-token-sharded and keeps the raw pair list.
+        kv_host_indices, kv_device_indices = self._dcp_kv_transfer_pairs(
+            host_indices, device_indices
+        )
+
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
-                    host_indices,
-                    device_indices,
+                    kv_host_indices,
+                    kv_device_indices,
                     i,
                     self.io_backend,
                 )
@@ -789,10 +868,14 @@ class HiCacheController:
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+            for indices in (
+                host_indices,
+                device_indices,
+                kv_host_indices,
+                kv_device_indices,
+            ):
+                if indices.is_cuda:
+                    indices.record_stream(self.load_stream)
 
         self.ack_load_queue.append(
             HiCacheAck(
@@ -1067,6 +1150,7 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        kv_page_owner_mask: Optional[torch.Tensor] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
@@ -1074,6 +1158,7 @@ class HiCacheController:
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
+        operation.kv_page_owner_mask = kv_page_owner_mask
         self.backup_queue.put(operation)
         return operation.id
 
@@ -1160,6 +1245,12 @@ class HiCacheController:
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
+        # Weighted uneven-DCP owner mode: only the pages this rank owned at
+        # backup time carry real data in the host pool -- write exactly those
+        # (the rank-shared page file is complete: full replicated kv-heads).
+        # Pages owned by other ranks are persisted by their owners; they still
+        # count as completed here so ack/host-release semantics are unchanged.
+        owner_mask = getattr(operation, "kv_page_owner_mask", None)
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
@@ -1168,7 +1259,29 @@ class HiCacheController:
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            if owner_mask is not None:
+                owned_pos = [
+                    j for j in range(len(batch_hashes)) if bool(owner_mask[i + j])
+                ]
+                if owned_pos:
+                    owned_hashes = [batch_hashes[j] for j in owned_pos]
+                    owned_host_indices = torch.cat(
+                        [
+                            batch_host_indices[
+                                j * self.page_size : (j + 1) * self.page_size
+                            ]
+                            for j in owned_pos
+                        ]
+                    )
+                    success = self.page_set_func(
+                        owned_hashes, owned_host_indices, extra_info
+                    )
+                else:
+                    success = True
+            else:
+                success = self.page_set_func(
+                    batch_hashes, batch_host_indices, extra_info
+                )
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."

@@ -38,6 +38,13 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # Weighted uneven-DCP owner mode (task #60): KV pages are token-sharded
+    # with FULL replicated kv-heads, so a KV page's bytes are complete on its
+    # owner rank and rank-independent. KV page keys drop the _{tp_rank}_{tp_size}
+    # suffix (one shared file per page, written only by its backup-time owner,
+    # readable by every rank), while component pools (mamba/SWA: genuinely
+    # per-rank shards) keep the rank suffix.
+    dcp_owner_mode: bool = False
 
 
 @dataclass
@@ -368,15 +375,27 @@ class HiCacheFile(HiCacheStorage):
         attn_cp_size = storage_config.attn_cp_size
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
+        self.dcp_owner_mode = bool(getattr(storage_config, "dcp_owner_mode", False))
         self.config_suffix = f"_{model_name}"
+        # Weighted uneven-DCP owner mode: KV pages carry FULL replicated
+        # kv-heads and are token-sharded, so a page's bytes are complete on its
+        # backup-time owner rank and identical from every rank's perspective.
+        # KV keys therefore drop the rank suffix (single shared file per page,
+        # written by its owner only); component pools (mamba/SWA, genuinely
+        # per-rank shards) keep the rank-suffixed keys below.
+        self.kv_config_suffix = f"_{model_name}"
         if not is_mla_model:
             self.config_suffix += f"_{tp_rank}_{tp_size}"
+            if not self.dcp_owner_mode:
+                self.kv_config_suffix += f"_{tp_rank}_{tp_size}"
         if enable_pp:
             self.config_suffix += f"_{pp_size}_{pp_rank}"
+            self.kv_config_suffix += f"_{pp_size}_{pp_rank}"
         # Under NSA context parallel each CP rank holds a disjoint slice of every
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+            self.kv_config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -424,6 +443,12 @@ class HiCacheFile(HiCacheStorage):
         )
 
     def _get_suffixed_key(self, key: str) -> str:
+        # Plain KV page keys are bare page hashes (hex, no '.'); component /
+        # draft keys are '{hash}.{pool_name}'. In dcp_owner_mode only the KV
+        # pages are rank-shared (full replicated kv-heads, owner-written) --
+        # component and draft pools stay per-rank.
+        if self.dcp_owner_mode and "." not in key:
+            return key + self.kv_config_suffix
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
@@ -447,8 +472,11 @@ class HiCacheFile(HiCacheStorage):
             if not fn.endswith(".bin"):
                 continue
             stem = fn[:-4]
-            # Only files belonging to this rank/model.
-            if stem.endswith(self.config_suffix):
+            # Only files belonging to this rank/model (dcp_owner_mode: rank-shared
+            # KV files carry the rank-less kv_config_suffix instead).
+            if stem.endswith(self.config_suffix) or (
+                self.dcp_owner_mode and stem.endswith(self.kv_config_suffix)
+            ):
                 self.metadata_cache.add(stem)
 
     def get(
