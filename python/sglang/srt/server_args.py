@@ -422,9 +422,10 @@ def _parse_mib_scalar_or_list(value: str) -> Union[int, List[int]]:
 
 
 def _parse_rank_tp_ratio(value: str) -> Union[str, List[int]]:
-    """Parse --rank-tp-ratio: 'auto' or a comma-separated integer list."""
-    if value.strip() == "auto":
-        return "auto"
+    """Parse --rank-tp-ratio: 'auto', 'auto-performance', or a
+    comma-separated integer list."""
+    if value.strip() in ("auto", "auto-performance"):
+        return value.strip()
     return [int(part.strip()) for part in value.split(",")]
 
 
@@ -1145,14 +1146,20 @@ class ServerArgs:
         Optional[Union[List[int], str]],
         Arg(
             help="UNEVEN tensor parallelism: comma-separated positive integer "
-            "weights, one per rank (length must equal --tp-size), or 'auto'. "
+            "weights, one per rank (length must equal --tp-size), 'auto', or "
+            "'auto-performance'. "
             "Example: 2,1,1 gives rank 0 half of every sharded dimension and "
             "ranks 1/2 a quarter each — one large GPU plus two smaller ones. "
             "sum(weights) must divide every sharded dimension. 'auto' "
             "derives the weights from the --rank-gpu-memory-mib list, or, "
             "when that is omitted, from the NVML totals of the GPUs named "
-            "in --rank-gpu-id (minus --rank-auto-reserve-mib). Requires "
-            "--rank-gpu-id.",
+            "in --rank-gpu-id (minus --rank-auto-reserve-mib). "
+            "'auto-performance' starts from the same VRAM-auto split and "
+            "additionally derives a dense-MLP family vector "
+            "(--rank-mlp-ratio) from a measured hardware profile to "
+            "maximize prefill/throughput, subject to the "
+            "--rank-perf-loose-ctx-percent context floor (see also "
+            "--rank-perf-tune). Requires --rank-gpu-id.",
             type_parser=_parse_rank_tp_ratio,
         ),
     ] = None
@@ -1170,6 +1177,37 @@ class ServerArgs:
             type_parser=str,
         ),
     ] = 2048
+    rank_perf_loose_ctx_percent: A[
+        float,
+        Arg(
+            help="Context floor of --rank-tp-ratio auto-performance: the "
+            "optimizer only considers candidate splits whose PREDICTED max "
+            "context stays >= (100 - X)%% of the VRAM-auto split's "
+            "prediction. X=0 (default) is the automatic natural lower "
+            "bound: only free gains are taken (MLP-vector shifts that do "
+            "not reduce the predicted context -- these exist because "
+            "MLP-only shifts conserve the summed free bytes). Prediction "
+            "uses the same per-rank capacity math as the pool sizing "
+            "(budgets -> weight/SSM-pool/reserve terms -> per-rank token "
+            "capacity -> weighted-DCP context). Only valid with "
+            "--rank-tp-ratio auto-performance.",
+        ),
+    ] = 0.0
+    rank_perf_tune: A[
+        str,
+        Arg(
+            help="Tuning target of --rank-tp-ratio auto-performance: 'enc' "
+            "maximizes prefill throughput (family-selective MLP "
+            "concentration toward compute-strong ranks -- the measured "
+            "lever); 'both' (default) targets prefill + concurrent "
+            "throughput, which ride the same lever; 'dec' is a documented "
+            "near-no-op -- the VRAM-auto split already sits at the decode "
+            "optimum (decode is flat across representable splits on "
+            "heterogeneous rigs), so only free gains apply. Only valid "
+            "with --rank-tp-ratio auto-performance.",
+            choices=["both", "dec", "enc"],
+        ),
+    ] = "both"
     rank_mlp_ratio: A[
         Optional[List[int]],
         Arg(
@@ -4031,6 +4069,28 @@ class ServerArgs:
     #: fragmentation, lazily appearing NCCL/attention buffers).
     AUTO_RANK_MEMORY_RESERVE_MIB = 2048
 
+    def _check_perf_flags(self, ratio_was_perf: bool) -> None:
+        """Fail fast on --rank-perf-* flags outside the auto-performance
+        mode, and on out-of-range values inside it."""
+        loose = float(self.rank_perf_loose_ctx_percent)
+        if not ratio_was_perf:
+            if loose != 0.0 or self.rank_perf_tune != "both":
+                raise ValueError(
+                    "--rank-perf-loose-ctx-percent / --rank-perf-tune only "
+                    "apply with --rank-tp-ratio auto-performance."
+                )
+            return
+        if not (0.0 <= loose < 100.0):
+            raise ValueError(
+                "--rank-perf-loose-ctx-percent must be in [0, 100), got "
+                f"{self.rank_perf_loose_ctx_percent!r}."
+            )
+        if self.rank_perf_tune not in ("both", "dec", "enc"):
+            raise ValueError(
+                "--rank-perf-tune must be one of both|dec|enc, got "
+                f"{self.rank_perf_tune!r}."
+            )
+
     def _resolve_auto_rank_tp_ratio(self):
         """--rank-tp-ratio auto: fill the available VRAM as well as
         possible. Budgets default to each assigned GPU's NVML total minus
@@ -4151,7 +4211,9 @@ class ServerArgs:
         No-op when none of the flags is used — the default path stays
         unchanged.
         """
-        ratio_was_auto = self.rank_tp_ratio == "auto"
+        ratio_was_perf = self.rank_tp_ratio == "auto-performance"
+        ratio_was_auto = self.rank_tp_ratio == "auto" or ratio_was_perf
+        self._check_perf_flags(ratio_was_perf)
 
         if (
             self.rank_gpu_id is None
@@ -4171,9 +4233,17 @@ class ServerArgs:
 
         # Resolve 'auto' BEFORE the mutual-requirement checks (auto may
         # omit --rank-gpu-memory-mib and derive it from NVML).
+        # 'auto-performance' resolves the IDENTICAL VRAM-auto base split
+        # (decode is flat across splits — M22 — so attention/GDN/KV splits
+        # are not performance levers) and then derives a dense-MLP family
+        # vector from the measured hardware profile on top.
         if ratio_was_auto:
             self._resolve_auto_rank_tp_ratio()
-        elif isinstance(self.rank_tp_ratio, str):
+        if ratio_was_perf:
+            from sglang.srt.uneven_perf import apply_auto_performance
+
+            apply_auto_performance(self)
+        if not ratio_was_auto and isinstance(self.rank_tp_ratio, str):
             raise ValueError(
                 f"Invalid --rank-tp-ratio value {self.rank_tp_ratio!r}: "
                 "expected a comma-separated integer list or 'auto'."
