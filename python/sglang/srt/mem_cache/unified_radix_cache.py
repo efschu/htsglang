@@ -1757,6 +1757,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
 
+        if envs.SGLANG_HICACHE_MAMBA_DEBUG.get():
+            # #48 observability: one line per host load-back (previously the
+            # only trace was the indirect prefill throughput drop).
+            aux_desc = ",".join(
+                f"{x.name}:{len(x.host_indices) if x.host_indices is not None else 0}"
+                for x in aux_xfers
+            )
+            logger.info(
+                "hicache load_back: node=%d kv_tokens=%d aux=[%s] "
+                "enqueue_elapsed=%.3fs",
+                best_match_node.id,
+                kv_tokens,
+                aux_desc or "-",
+                time.perf_counter() - start_time,
+            )
+
         return True
 
     def _build_sidecar_transfers(

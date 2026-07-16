@@ -388,6 +388,16 @@ class Envs:
     # _int_workspace_buffer, _pin_memory_int_workspace_buffer,
     # _kv_lens_buffer.
     SGLANG_SPEC_RESET_PROBE_FILTER = EnvStr("")
+    # #48 HiCache-GDN observability: per-request log lines for mamba-relevant
+    # HiCache activity — match-time resume source (device value vs host
+    # backup) with a state fingerprint (sha256 over the resume slot's
+    # conv+temporal bytes), load-back transfers (node, kv tokens, aux pools,
+    # duration) and host write-through commits. The fingerprint is THE
+    # discriminator for host-vs-device resume divergence: identical
+    # fingerprints with differing outputs exonerate the mamba state path;
+    # differing fingerprints pin it. Debug boots only (fingerprinting syncs
+    # the device).
+    SGLANG_HICACHE_MAMBA_DEBUG = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)

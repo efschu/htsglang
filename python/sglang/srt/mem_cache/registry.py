@@ -186,6 +186,16 @@ def _create_unified_radix_cache(
         params.component_registry_override = {
             ComponentType.MAMBA: MlxAuxiliaryStateComponent,
         }
+    if ctx.enable_hierarchical_cache and ctx.is_hybrid_ssm:
+        # MambaPoolHost only supports page_first_direct + direct IO; with the
+        # stock defaults (page_first + kernel) the unified hybrid-SSM HiCache
+        # boot crashed deep in the pool assembly instead of auto-adjusting.
+        # Reuse the exact normalization the HiMambaRadixCache path already
+        # applies (#48).
+        from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
+
+        HiMambaRadixCache.normalize_hicache_args(server_args)
+
     cache = UnifiedRadixCache(params)
     if ctx.enable_hierarchical_cache:
         cache.init_hicache(server_args, params)

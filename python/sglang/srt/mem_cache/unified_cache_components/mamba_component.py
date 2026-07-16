@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
+
+from sglang.srt.environ import envs
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -35,6 +38,8 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
+
+logger = logging.getLogger(__name__)
 
 
 class MambaComponent(TreeComponent):
@@ -120,7 +125,81 @@ class MambaComponent(TreeComponent):
                 mamba_host_hit_length=max(result.mamba_host_hit_length, 1)
             )
 
+        if envs.SGLANG_HICACHE_MAMBA_DEBUG.get():
+            self._log_match_debug(result, params, last_node)
+
         return result._replace(mamba_branching_seqlen=branching_seqlen)
+
+    # ---- #48 observability -------------------------------------------------
+
+    def _state_fingerprint(
+        self,
+        device_slot: Optional[torch.Tensor] = None,
+        host_slot: Optional[torch.Tensor] = None,
+    ) -> str:
+        """sha256 (16 hex chars) over the resume slot's conv+temporal bytes.
+
+        Comparable across the device and host representations by
+        construction: both hash per-layer temporal then conv state bytes of
+        ONE slot. Identical fingerprints on a host-resume vs a later
+        device-resume prove the mamba state input was bit-identical (the
+        divergence must then come from elsewhere, e.g. the KV bytes);
+        differing fingerprints pin the mamba path."""
+        import hashlib
+
+        from sglang.srt.debug_utils.spec_state_hash import hash_tensor
+
+        try:
+            h = hashlib.sha256()
+            if device_slot is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                pool = self.cache.req_to_token_pool.mamba_pool
+                idx = int(
+                    self.cache.req_to_token_pool.translate_mamba_indices(
+                        device_slot.view(-1)
+                    )[0]
+                )
+                parts = [pool.mamba_cache.temporal[:, idx]] + [
+                    conv[:, idx] for conv in pool.mamba_cache.conv
+                ]
+            elif host_slot is not None and self._mamba_pool_host is not None:
+                hp = self._mamba_pool_host
+                idx = int(host_slot.view(-1)[0])
+                parts = [hp.temporal_buffer[idx]] + [
+                    conv[idx] for conv in hp.conv_buffer
+                ]
+            else:
+                return "-"
+            for t in parts:
+                h.update(hash_tensor(t).encode())
+            return h.hexdigest()[:16]
+        except Exception as e:  # debug path must never break serving
+            return f"ERR:{type(e).__name__}"
+
+    def _log_match_debug(self, result, params, last_node) -> None:
+        try:
+            cd = last_node.component_data[self.component_type]
+            if cd.value is not None:
+                src, fp = "device", self._state_fingerprint(device_slot=cd.value)
+            elif cd.host_value is not None:
+                src, fp = "host", self._state_fingerprint(host_slot=cd.host_value)
+            else:
+                src, fp = "none", "-"
+            req = params.req
+            logger.info(
+                "hicache-mamba match: rid=%s kv_dev_tokens=%d node=%d src=%s "
+                "slot=%s host_slot=%s fp=%s",
+                getattr(req, "rid", None),
+                len(result.device_indices),
+                last_node.id,
+                src,
+                cd.value.tolist() if cd.value is not None else None,
+                cd.host_value.tolist() if cd.host_value is not None else None,
+                fp,
+            )
+        except Exception:
+            logger.exception("hicache-mamba match debug logging failed")
 
     def commit_insert_component_data(
         self,
@@ -553,6 +632,18 @@ class MambaComponent(TreeComponent):
                 cd = node.component_data[ct]
                 if cd.host_value is None:
                     cd.host_value = transfers[0].host_indices.clone()
+                    if envs.SGLANG_HICACHE_MAMBA_DEBUG.get():
+                        logger.info(
+                            "hicache-mamba backup_host: node=%d dev_slot=%s "
+                            "host_slot=%s",
+                            node.id,
+                            (
+                                cd.value.tolist()
+                                if cd.value is not None
+                                else transfers[0].device_indices
+                            ),
+                            cd.host_value.tolist(),
+                        )
 
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers:
@@ -568,6 +659,24 @@ class MambaComponent(TreeComponent):
                     host_lru.remove_node(node)
                 self.cache.lru_lists[ct].insert_mru(node)
                 self.cache.component_evictable_size_[ct] += count
+                if envs.SGLANG_HICACHE_MAMBA_DEBUG.get():
+                    # NOTE: fingerprinting here would race the async load
+                    # stream — the H->D copy is only enqueued at this point.
+                    # State fingerprints are taken at MATCH time instead
+                    # (states at rest); this line documents the transfer
+                    # topology (which host slot fills which device slot).
+                    logger.info(
+                        "hicache-mamba load_back commit: node=%d host_slot=%s "
+                        "-> dev_slot=%s n_transfers=%d",
+                        node.id,
+                        (
+                            transfer.host_indices.tolist()
+                            if transfer.host_indices is not None
+                            else None
+                        ),
+                        cd.value.tolist(),
+                        len(transfers),
+                    )
 
         elif phase == CacheTransferPhase.PREFETCH:
             if not transfers:
