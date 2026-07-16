@@ -608,6 +608,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
+        self._fmha_backend = fmha_backend
 
         # Two wrappers: one for sliding window attention and one for full attention.
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
@@ -652,6 +653,13 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+        # Uneven-DCP target-verify under CUDA graphs: per-bucket graph-mode
+        # RAGGED wrappers (see _get_verify_ragged_cg_wrapper). Keyed by bs.
+        # _ragged_wrapper_override is installed by init_forward_metadata_out_graph
+        # for the DCP verify buckets and cleared everywhere else, so all
+        # non-DCP / eager paths keep using the shared prefill_wrapper_ragged.
+        self.verify_ragged_cg_wrappers: dict = {}
+        self._ragged_wrapper_override = None
         # Plain EXTEND under full prefill CUDA graph: one wrapper set
         # shared across all captured num_tokens buckets (bs fixed at 1).
         # Created lazily on first capture in _prepare_cuda_graph_metadata.
@@ -840,6 +848,14 @@ class FlashInferAttnBackend(AttentionBackend):
             num_tokens = forward_batch.positions.numel()
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
 
+        # Uneven-DCP target-verify graphs run the ragged draft->draft attention
+        # inside the capture; that requires the per-bucket graph-mode ragged
+        # wrapper (fixed indptr buffers). All other modes use the shared one.
+        if self.uneven_dcp and forward_mode.is_target_verify():
+            self._ragged_wrapper_override = self._get_verify_ragged_cg_wrapper(bs)
+        else:
+            self._ragged_wrapper_override = None
+
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
@@ -946,6 +962,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # Eager path: never use a graph-bucket ragged wrapper.
+        self._ragged_wrapper_override = None
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             assert self._swa_kv_pool is not None
@@ -1233,6 +1251,57 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             for i in range(self.num_wrappers)
         ]
+
+    @property
+    def active_ragged_wrapper(self) -> BatchPrefillWithRaggedKVCacheWrapper:
+        """The RAGGED wrapper the current forward must use. Identical to the
+        shared prefill_wrapper_ragged unless the uneven-DCP target-verify CUDA
+        graph installed a per-bucket graph-mode override (see
+        _get_verify_ragged_cg_wrapper)."""
+        return self._ragged_wrapper_override or self.prefill_wrapper_ragged
+
+    def _get_verify_ragged_cg_wrapper(
+        self, bs: int
+    ) -> BatchPrefillWithRaggedKVCacheWrapper:
+        """Per-bucket CUDA-graph-mode RAGGED wrapper for the uneven-DCP
+        target-verify graph.
+
+        ROOT CAUSE this fixes (MTP+graphs+DCP bs>1 illegal memory access):
+        the DCP verify path runs the draft->draft chain attention through a
+        RAGGED wrapper INSIDE the captured graph (_forward_extend_dcp). The
+        shared prefill_wrapper_ragged is NOT in cuda-graph mode, so its plan()
+        stores ``self._qo_indptr_buf = qo_indptr.to(self.device)`` -- for an
+        already-on-device tensor that is a bare REFERENCE to the caller's
+        transient ``torch.arange`` (call_begin_forward). The captured kernel
+        freezes that raw pointer; the tensor is freed after the next plan()
+        (later bucket captures / replays), the allocator reuses the block, and
+        replaying any bs>1 bucket reads garbage indptr -> out-of-bounds ragged
+        attention -> cudaErrorIllegalAddress. bs=1 only survived by allocator
+        luck: it is captured LAST, its [0, draft_num] indptr block is never
+        clobbered, and its content is constant.
+
+        The fix is flashinfer's intended cuda-graph usage: one ragged wrapper
+        per captured bucket with FIXED qo/kv indptr buffers (plan() then
+        copy_()s into them, so the captured pointers stay valid and refreshed).
+        Buffers are tiny (bs+1 int32); each wrapper owns its 8 MiB int
+        workspace, kept alive in verify_ragged_cg_wrappers for the process
+        lifetime -- sized by what capture+replay actually needs, no heuristics.
+        """
+        wrapper = self.verify_ragged_cg_wrappers.get(bs)
+        if wrapper is None:
+            device = self.kv_last_page_len.device
+            qo_indptr_buf = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+            kv_indptr_buf = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+            wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                use_cuda_graph=True,
+                qo_indptr_buf=qo_indptr_buf,
+                kv_indptr_buf=kv_indptr_buf,
+                backend=self._fmha_backend,
+            )
+            self.verify_ragged_cg_wrappers[bs] = wrapper
+        return wrapper
 
     def _prepare_cuda_graph_metadata(
         self,
@@ -1561,7 +1630,10 @@ class FlashInferAttnBackend(AttentionBackend):
         # 2. Current chunk: ragged LOCAL head-sharded attention (causal). k/v are
         #    the freshly-projected bf16 current tokens, fully present on every
         #    rank, so this is exact local GQA attention (no DCP gather needed).
-        o_cur, lse_cur = self.prefill_wrapper_ragged.forward_return_lse(
+        #    active_ragged_wrapper: under a captured verify graph this is the
+        #    per-bucket graph-mode wrapper (fixed indptr buffers) -- the shared
+        #    non-graph wrapper's transient plan tensors are NOT replay-safe.
+        o_cur, lse_cur = self.active_ragged_wrapper.forward_return_lse(
             q_local,
             k.view(-1, layer.tp_k_head_num, layer.head_dim),
             v.view(-1, layer.tp_v_head_num, layer.head_dim),
@@ -2104,7 +2176,9 @@ class FlashInferIndicesUpdaterPrefill:
             paged_kernel_lens_sum = seq_lens_sum
 
         self.call_begin_forward(
-            self.prefill_wrapper_ragged,
+            # active_ragged_wrapper: per-bucket graph-mode wrapper under a
+            # captured uneven-DCP verify graph, the shared one otherwise.
+            self.attn_backend.active_ragged_wrapper,
             prefill_wrappers[0],
             req_pool_indices,
             paged_kernel_lens,
