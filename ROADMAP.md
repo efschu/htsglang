@@ -60,7 +60,55 @@ duplicates and NCCL >= 2.30 multi-rank communicators.
 
 ## Additional model families on this 72 GB heterogeneous rig
 
-Status: not started - candidate screening planned.
+Status: screening DONE (2026-07-16, task #55, research-only - no GPU use, no
+code changes). Full matrix + gap list + bring-up tasks:
+`/root/.claude/jobs/1481bb40/tmp/MODEL_SCREENING.md`. Summary of findings:
+
+### Screening results (2026-07-16)
+
+Decisive fork facts (code-verified):
+- Uneven TP=3 splits attention/GDN in WHOLE kv-head units
+  (`distributed/utils.py:352 partition_units`, every rank >= 1 unit) ->
+  **num_kv_heads >= 3 is mandatory**; kv < 3 requires the
+  "TP > num_kv_heads" work above.
+- MPS TP=4 attention is FORCIBLY EVEN (M22) -> kv-heads divisible by 4.
+- MoE experts are ALREADY uneven-TP-shardable via the "moe" family
+  (`fused_moe_triton/layer.py:237-267`, expert intermediate split in
+  quant-block units, EP stays out of scope) -> MoE is NOT the blocker for
+  any candidate; kv-geometry is.
+- Model classes already in-fork: `gemma4_causal/_mtp/_mm/_vision/_audio`,
+  `qwen3_next(+_mtp)`, `mistral*`, `gpt_oss`.
+
+Ranking (fit vs 72 GB + geometry vs uneven TP=3 / MPS TP=4):
+1. **Gemma 4 31B dense - WINNER (effort S).** Global layers kv=4, sliding
+   kv=16 (kaitchup config analysis) -> uneven TP=3 works (4 -> [2,1,1]) AND
+   MPS TP=4 works (4/4=1) with NO new distribution code. Native MTP drafter
+   (dim 1024), AWQ-INT4 20.5 GB / NVFP4 32.7 GB / QAT / unsloth-GGUF+mmproj,
+   Apache 2.0, SWA (5:1, only 10/60 global layers) keeps the KV pool small.
+   Gap = pure bring-up: config mapping, SWA pool sizing, MTP->NEXTN hookup,
+   quant-path test. Note: `--rank-vocab-ratio` is fail-fast-forbidden for
+   gemma4_mtp (skip_all_gather, M24) - not a blocker.
+2. **Gemma 4 12B dense (S)** - same code path, cheap smoke/regression
+   vehicle; kv-head count of its global layers UNVERIFIED (blocker check
+   needed).
+3. **Qwen3.6-35B-A3B (L)** - attractive (3B active, native MTP head,
+   unsloth GGUF+MTP checkpoints, 256 experts x intermediate 512 shardable
+   under the moe family: FP8 512/128=4 units >= 3), BUT global-attention
+   layers have only **kv=2** (16 q heads, head_dim 256; 75% GDN layers) ->
+   blocked on "TP > num_kv_heads" for BOTH uneven TP=3 and MPS TP=4.
+4. **Gemma 4 26B-A4B MoE (M-L)** - same kv=2 blocker (global layers), plus
+   no w4a16 checkpoint (small expert dims; INT8/GGUF-UD only).
+5. **Mistral Small 4 24B (S-M)** - pure attention, low risk, but no native
+   MTP head and not a 2026 quality leader; fallback option.
+6. **gpt-oss-20B (S)** - trivial fit, low quality ceiling; test vehicle.
+
+Over budget as of July 2026 (excluded): GLM-5/5.2 (744B/40B active),
+DeepSeek V4, Kimi K2.6/2.7, MiniMax M3, Mistral Small 4 **119B**, Llama 4
+(Scout fits but quality-lags). GLM-5 Air/Flash NOT yet released - watch.
+
+Recommended order: bring up **Gemma 4 31B dense** first (task S, no
+prerequisite); build **"TP > num_kv_heads"** (head-clone approach preferred)
+as the explicit prerequisite before Qwen3.6-35B-A3B / Gemma-4-26B-MoE.
 
 ### Goal
 
