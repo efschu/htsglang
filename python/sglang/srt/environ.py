@@ -488,6 +488,9 @@ class Envs:
     # pools to the profiled optimum. Model-type-agnostic (keys off measured
     # capacity, which is dtype-independent).
     SGLANG_UNEVEN_TOKEN_VECTOR = EnvStr(None)
+    # Force a fresh stage-0 hardware micro-probe for --rank-tp-ratio
+    # auto-performance, ignoring the cached profile under ~/.cache/sglang.
+    SGLANG_PERF_REPROBE = EnvBool(False)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
     # Override the distributed init method used by torch.distributed.init_process_group.
