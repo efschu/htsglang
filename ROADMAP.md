@@ -177,7 +177,35 @@ implementation starts.
 
 ## Performance-oriented uneven split ("auto performance" mode)
 
-Status: unimplemented, feasibility-gated (investigate first, see below).
+Status: feasibility CONFIRMED (M22 measurements, 2026-07-16) - build as a
+PREFILL/THROUGHPUT mode. Key findings from the measured ratio matrix
+(AWQ-INT4, MTP, CUDA graphs, weighted DCP, TP=3 auto as reference):
+
+- **Decode is flat across splits (+-2%)**: the VRAM-auto split already sits
+  near the bandwidth optimum for decode; over-concentrating makes the 5090
+  itself the bottleneck (-6-8%). Decode is NOT the lever.
+- **Prefill/aggregate is the lever**: in-ring MLP concentration
+  (`--rank-mlp-ratio 5,1,1` on top of auto) is a STRICT win: +10% prefill,
+  +7% concurrent, +20% active max_total, -1.3% converged context. Dropping
+  the narrow-link card entirely (TP=2 @ 5:2 or 32:8) buys +55-76% prefill /
+  +25-30% concurrent at -72% context.
+- **Attention/GDN shifting is the wrong knob**: TP=3 attention can ONLY
+  materialize [2,1,1] permutations (4 GQA units); GDN shifting drags the
+  SSM pool with it (4.68 MiB/req/GDN-unit) and can collapse context
+  (5:1:1 -> -92%). The optimizer's real degrees of freedom: MLP units
+  (544, fine-grained, ~free), DCP token vector (64 units), TP degree.
+  TP=4 attention is forcibly even; TP>=5 uneven does not boot.
+- **TP-degree reduction must be an optimizer candidate**: TP=2 @ 32:8
+  dominated the extreme TP=3 ratio on both axes.
+- The `p x max-KV` objective parametrizes the measured Pareto front
+  cleanly (p=1.0 -> auto + MLP concentration; p~0.28 -> TP=2 5:2;
+  p~0.19 -> 32:8).
+- Cost-model must include: SSM pool ∝ GDN-units x max-running-requests,
+  BF16 weight families inside INT4 checkpoints, the draft's transient
+  embed/lm_head duplicates (made MTP@TP=1 impossible on 32 GB), and
+  --max-total-tokens as the headroom valve against prefill OOM.
+- Link-map correction: the narrow 3080 is **Gen4 x4** (~2x penalty vs the
+  x8 cards), not Gen2 x4 (~8x) as earlier notes claimed.
 
 ### Goal
 
@@ -227,7 +255,8 @@ Before implementing, confirm the win is real on this hardware:
   5090 + the well-linked card) and measure decode/prefill throughput vs. the
   balanced VRAM-optimal split.
 - Quantify the role of the PCIe link. On this box (NVML order 0=3080, 1=5090,
-  2=3080) one 3080 sits on **PCIe Gen2 x4 (~2 GB/s)** while the 5090 and the
+  2=3080) one 3080 sits on **PCIe Gen4 x4** (corrected by M22 load
+  measurement; earlier notes wrongly said Gen2 x4) while the 5090 and the
   other 3080 run **Gen4 x8 (~16 GB/s)** — an ~8x slower link on that one card.
   Measure per-card all-reduce / comm cost and the slow link's share of the step
   time; that card is the prime candidate to off-load under this mode.
