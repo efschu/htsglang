@@ -1886,6 +1886,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ):
             return
 
+        # Weighted uneven-DCP owner mode (task #60): each rank's host pool only
+        # holds real data for the tokens it OWNED at backup time (owner rule on
+        # the GLOBAL device slot). Pass a per-page owner mask so _page_backup
+        # writes exactly those pages to the rank-shared L3 page files.
+        kv_page_owner_mask = None
+        owner_ctx = self.cache_controller._dcp_owner_ctx()
+        if owner_ctx is not None:
+            device_value = node.component_data[BASE_COMPONENT_TYPE].value
+            if device_value is None:
+                # Ownership can no longer be derived (node already device-
+                # evicted). Skipping is safe: batch_exists prefix semantics
+                # just truncate at the first missing page, identically on
+                # every rank (rank-shared file names).
+                logger.warning(
+                    "[uneven-dcp hicache] skipping storage backup of node %d: "
+                    "device indices gone, page ownership unknown.",
+                    node.id,
+                )
+                return
+            S, lo, hi = owner_ctx
+            off = device_value.to(torch.int64) % S
+            # page_size == 1 is enforced at storage attach; index per page.
+            kv_page_owner_mask = (
+                ((off >= lo) & (off < hi))[:: self.page_size].contiguous().cpu()
+            )
+
         prefix_keys = None
         if self.hicache_storage_pass_prefix_keys:
             prefix_keys = node.get_prefix_hash_values(node.parent)
@@ -1918,6 +1944,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node.hash_value,
             prefix_keys,
             extra_pools=aux_xfers or None,
+            kv_page_owner_mask=kv_page_owner_mask,
         )
         self.ongoing_backup[operation_id] = (
             node,

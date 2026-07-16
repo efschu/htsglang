@@ -223,6 +223,34 @@ def cp_token_prefix(dcp_size: int) -> list:
     return out
 
 
+def uneven_dcp_owner_bounds() -> Optional[tuple]:
+    """(S, lo, hi) of this rank's DCP owner range under the uneven-TP
+    KV-replication path, or None when that path is not in force.
+
+    Under the owner rule a GLOBAL allocator slot L is owned by this rank iff
+    (L % S) in [lo, hi); its physical slot in this rank's COMPACT per-rank KV
+    pool is (L // S) * (hi - lo) + (L % S - lo). Weighted DCP: S = sum(token
+    ratios) with the prefix-range bounds; even-modulo (no token vector):
+    S = dcp_size, [lo, hi) = [rank, rank+1) -- the classic L // dcp_size
+    compaction. HiCache must use exactly this mapping for its device<->host
+    KV transfers: the radix tree stores GLOBAL indices, while the device pool
+    only holds this rank's compact owned slots (see FlashInferAttnBackend
+    uneven_dcp / uneven_dcp_weighted). Indexing the compact pool with raw
+    global indices captures rows that belong to OTHER (usually later) tokens
+    -- time-dependent content, all-zero before those rows are first written
+    (task #60 L3 zero-page corruption)."""
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    dcp_size = parallel.attn_dcp_size
+    if not uneven_dcp_kv_replicated(dcp_size):
+        return None
+    prefix = cp_token_prefix(dcp_size)
+    lo = prefix[parallel.attn_dcp_rank]
+    hi = prefix[parallel.attn_dcp_rank + 1]
+    return prefix[-1], lo, hi
+
+
 def _checkpoint_size_mib(model_path: Optional[str]) -> int:
     """Total on-disk checkpoint size (MiB), 0 if unknown. Deterministic in
     every process so the derived token vector is identical everywhere."""

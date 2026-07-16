@@ -408,6 +408,14 @@ class HybridCacheController(BaseHiCacheController):
                 self.move_hybrid_indices(op)
             )
         self.write_queue.clear()
+        # Weighted uneven-DCP: back up only this rank's owned tokens, from
+        # their COMPACT device slots (identity when the gate is off). Only the
+        # anchor KV transfer is token-sharded; pool_transfers (mamba/SWA) use
+        # their own per-rank indices and the draft pool holds the full token
+        # context with global indices -- both keep the raw pair list.
+        kv_host_indices, kv_device_indices = self._dcp_kv_transfer_pairs(
+            host_indices, device_indices
+        )
         start_event = device_module.Event()
         finish_event = device_module.Event()
         start_event.record()
@@ -415,8 +423,8 @@ class HybridCacheController(BaseHiCacheController):
             start_event.wait(self.write_stream)
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
-                host_indices,
-                device_indices,
+                kv_host_indices,
+                kv_device_indices,
                 self.io_backend,
                 pool_transfers=resolved_pool_transfers,
             )
@@ -433,6 +441,9 @@ class HybridCacheController(BaseHiCacheController):
                 host_indices,
                 device_indices,
                 resolved_pool_transfers,
+            )
+            self._record_transfer_indices_on_stream(
+                self.write_stream, kv_host_indices, kv_device_indices
             )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
@@ -488,6 +499,12 @@ class HybridCacheController(BaseHiCacheController):
             self.move_hybrid_indices(op)
         )
         self.load_queue.clear()
+        # Weighted uneven-DCP: load only this rank's owned tokens into their
+        # COMPACT device slots (identity when the gate is off). pool_transfers
+        # and the draft pool keep the raw pair list (see start_writing).
+        kv_host_indices, kv_device_indices = self._dcp_kv_transfer_pairs(
+            host_indices, device_indices
+        )
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
         with device_module.stream(self.load_stream):
@@ -495,8 +512,8 @@ class HybridCacheController(BaseHiCacheController):
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
-                    host_indices,
-                    device_indices,
+                    kv_host_indices,
+                    kv_device_indices,
                     i,
                     self.io_backend,
                     pool_transfers=resolved_pool_transfers,
@@ -519,6 +536,9 @@ class HybridCacheController(BaseHiCacheController):
                 host_indices,
                 device_indices,
                 resolved_pool_transfers,
+            )
+            self._record_transfer_indices_on_stream(
+                self.load_stream, kv_host_indices, kv_device_indices
             )
         self.ack_load_queue.append(
             HiCacheAck(
@@ -573,6 +593,7 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        kv_page_owner_mask: Optional[torch.Tensor] = None,
     ) -> int:
         operation = StorageOperation(
             host_indices,
@@ -581,6 +602,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        operation.kv_page_owner_mask = kv_page_owner_mask
         self.backup_queue.put(operation)
         return operation.id
 
