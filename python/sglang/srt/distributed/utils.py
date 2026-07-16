@@ -441,6 +441,27 @@ def tp_partition_offset(
     return sum(tp_partition_sizes(total, tp_size, units, family)[:rank])
 
 
+def tp_vocab_ratios(tp_size: int) -> Optional[list]:
+    """The EXPLICIT vocab family vector (--rank-vocab-ratio /
+    SGLANG_UNEVEN_VOCAB_VECTOR) when it is active for a group of `tp_size`
+    ranks and non-uniform; None otherwise.
+
+    Deliberately does NOT fall back to the base --rank-tp-ratio vector
+    (unlike get_tp_partition_ratios(family)): the vocab dimension of
+    VocabParallelEmbedding / ParallelLMHead keeps the classic EVEN split
+    under a plain uneven-TP plan ("vocab always even" by design, M22);
+    only the explicit vocab flag opts into the ratio-weighted vocab
+    split (per-rank shard widths ~ memory bandwidth, so the lm_head
+    matvec finishes simultaneously on heterogeneous cards). A uniform
+    vector IS the even split and reports as inactive, keeping the
+    classic path byte-identical.
+    """
+    vec = _TP_PARTITION_FAMILIES.get("vocab")
+    if not vec or len(vec) != tp_size or len(set(vec)) == 1:
+        return None
+    return vec
+
+
 def tp_plan_active(tp_size: int, family: Optional[str] = None) -> bool:
     """True when an uneven-TP ratio plan is installed AND applies to a
     layer/group of the given tp_size (disable_tp layers with tp_size=1 and

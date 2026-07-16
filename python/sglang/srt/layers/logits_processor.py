@@ -24,7 +24,9 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.srt.distributed import tensor_model_parallel_all_gather
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.distributed.utils import tp_vocab_ratios
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -363,6 +365,25 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_server_args().enable_mis
         self.rl_on_policy_target = get_server_args().rl_on_policy_target
+
+        # Ratio-weighted vocab sharding (--rank-vocab-ratio): per-rank logit
+        # shards have UNEQUAL widths, so the equal-shard gatherers (multimem
+        # kernel / plain NCCL all-gather) cannot be used. The layer itself
+        # carries its per-rank plan (lm_head.vocab_partition_sizes, checked at
+        # gather time); here only the unsupported combinations fail fast.
+        # None on the default path -- every new branch below stays dormant.
+        self._uneven_vocab_plan = tp_vocab_ratios(get_parallel().tp_size)
+        if self._uneven_vocab_plan is not None:
+            if skip_all_gather:
+                raise NotImplementedError(
+                    "--rank-vocab-ratio is not supported for models that "
+                    "skip the logits all-gather (skip_all_gather=True)."
+                )
+            if self.use_attn_tp_group:
+                raise NotImplementedError(
+                    "--rank-vocab-ratio is not supported together with "
+                    "--enable-dp-lm-head."
+                )
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -926,7 +947,13 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         if self.do_tensor_parallel_all_gather:
-            if self.use_attn_tp_group:
+            uneven_vocab_sizes = getattr(lm_head, "vocab_partition_sizes", None)
+            if uneven_vocab_sizes is not None:
+                # Ratio-weighted vocab sharding: unequal per-rank widths.
+                logits = self._gather_uneven_vocab_logits(
+                    logits, uneven_vocab_sizes
+                )
+            elif self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
                 logits = self._logits_gatherer(logits)
@@ -1005,6 +1032,43 @@ class LogitsProcessor(nn.Module):
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
             return hidden_states, local_hidden_states
         return hidden_states, hidden_states
+
+    def _gather_uneven_vocab_logits(
+        self, logits: torch.Tensor, sizes: List[int]
+    ) -> torch.Tensor:
+        """All-gather per-rank logit shards of UNEQUAL width along the vocab
+        dim (--rank-vocab-ratio).
+
+        torch/NCCL all-gather needs equal shapes on every rank, so this uses
+        the pad-to-max trick of ``cp_all_gather_heads_uneven`` (layers/dcp/
+        comm.py): pad each rank's shard to ``max(sizes)``, gather the
+        equal-shaped tensor, then slice out each rank's true width and
+        re-concatenate in rank order (= global vocab order: the shards are
+        contiguous prefix-sum slices of the padded vocab, so the identity
+        index->token_id mapping of the even split is preserved). Shapes are
+        static per rank and there is no data-dependent control flow, so the
+        path is CUDA-graph safe (M16 lesson: allocations below are made
+        inside capture and replay at fixed addresses; nothing is cached
+        across steps). The pad garbage is sliced away before any compute.
+        """
+        from sglang.srt.distributed import get_tp_group
+
+        rank = get_tp_group().rank_in_group
+        assert logits.shape[-1] == sizes[rank], (
+            f"uneven-vocab gather: local logits width {logits.shape[-1]} != "
+            f"vocab_partition_sizes[{rank}]={sizes[rank]}"
+        )
+        max_size = max(sizes)
+        pad_shape = list(logits.shape)
+        pad_shape[-1] = max_size
+        padded = logits.new_zeros(pad_shape)
+        padded[..., : sizes[rank]].copy_(logits)
+        gathered = tensor_model_parallel_all_gather(padded, dim=-1)
+        parts = [
+            gathered[..., r * max_size : r * max_size + sizes[r]]
+            for r in range(len(sizes))
+        ]
+        return torch.cat(parts, dim=-1)
 
     def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
         if self.vocab_size % self.attn_tp_size == 0:

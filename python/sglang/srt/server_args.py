@@ -429,6 +429,13 @@ def _parse_rank_tp_ratio(value: str) -> Union[str, List[int]]:
     return [int(part.strip()) for part in value.split(",")]
 
 
+def _parse_rank_vocab_ratio(value: str) -> Union[str, List[int]]:
+    """Parse --rank-vocab-ratio: 'auto' or a comma-separated integer list."""
+    if value.strip() == "auto":
+        return "auto"
+    return [int(part.strip()) for part in value.split(",")]
+
+
 def _torch_to_nvml_gpu_index_mapping() -> Dict[int, int]:
     """CUDA device index -> NVML physical index, bridged via PCI bus IDs.
 
@@ -1222,6 +1229,28 @@ class ServerArgs:
             "variable SGLANG_UNEVEN_MLP_VECTOR takes precedence over this "
             "flag. Requires an active --rank-tp-ratio plan.",
             type_parser=_parse_int_list,
+        ),
+    ] = None
+    rank_vocab_ratio: A[
+        Optional[Union[str, List[int]]],
+        Arg(
+            help="Ratio-weighted vocab sharding for the tied vocab layers "
+            "(VocabParallelEmbedding / ParallelLMHead, shared with NEXTN/"
+            "EAGLE drafts): 'auto' or comma-separated positive integer "
+            "weights, one per rank (length must equal --tp-size). The "
+            "lm_head matvec streams the whole weight shard every decode "
+            "step, so on heterogeneous cards the EVEN vocab split (the "
+            "default, kept even under --rank-tp-ratio) is bounded by the "
+            "SLOWEST card; weighting the shard widths by memory bandwidth "
+            "balances the read TIME instead. 'auto' derives the weights "
+            "from the cached auto-performance hardware profile's memory-"
+            "bandwidth scores when available, else falls back to the "
+            "resolved --rank-tp-ratio vector. The environment variable "
+            "SGLANG_UNEVEN_VOCAB_VECTOR (explicit vector) takes precedence "
+            "over this flag. Requires an active --rank-tp-ratio plan. "
+            "Default OFF: without the flag, vocab sharding stays even and "
+            "behavior is unchanged.",
+            type_parser=_parse_rank_vocab_ratio,
         ),
     ] = None
     rank_moe_ratio: A[
@@ -4447,7 +4476,76 @@ class ServerArgs:
     UNEVEN_FAMILY_RATIO_SPECS = (
         ("rank_mlp_ratio", "--rank-mlp-ratio", "SGLANG_UNEVEN_MLP_VECTOR"),
         ("rank_moe_ratio", "--rank-moe-ratio", "SGLANG_UNEVEN_MOE_VECTOR"),
+        ("rank_vocab_ratio", "--rank-vocab-ratio", "SGLANG_UNEVEN_VOCAB_VECTOR"),
     )
+
+    def _resolve_rank_vocab_ratio(self):
+        """Resolve --rank-vocab-ratio 'auto' into an explicit integer vector
+        (the generic family-vector validation below then applies unchanged).
+
+        'auto' derives the weights from the cached auto-performance hardware
+        profile's memory-bandwidth scores (CACHE-ONLY -- it never triggers a
+        fresh probe), else falls back to the resolved --rank-tp-ratio vector.
+        No-op when the flag is unset (default path) or already explicit."""
+        value = self.rank_vocab_ratio
+        if value is not None and self.enable_dp_lm_head:
+            raise ValueError(
+                "--rank-vocab-ratio is not compatible with "
+                "--enable-dp-lm-head (attention-TP-group vocab layers)."
+            )
+        if value != "auto":
+            # None or an explicit vector: nothing to resolve.
+            return
+        if envs.SGLANG_UNEVEN_VOCAB_VECTOR.get():
+            # The env var (explicit vector) wins; the generic loop installs it.
+            return
+        if not isinstance(self.rank_tp_ratio, list):
+            raise ValueError(
+                "--rank-vocab-ratio requires an active uneven-TP base plan "
+                "(--rank-tp-ratio); without one every family already uses "
+                "the even split."
+            )
+        vector = None
+        source = None
+        if self.rank_gpu_id is not None:
+            try:
+                from sglang.srt.uneven_perf import (
+                    get_cached_hardware_profile,
+                    vocab_ratio_from_membw,
+                )
+
+                profile, gpus = get_cached_hardware_profile()
+                if profile is not None:
+                    uuid_by_idx = {g["cuda_index"]: g["uuid"] for g in gpus}
+                    membw = []
+                    for gid in self.rank_gpu_id:
+                        entry = profile["gpus"].get(uuid_by_idx.get(gid, ""))
+                        if entry is None:
+                            membw = None
+                            break
+                        membw.append(float(entry["membw_gbs"]))
+                    if membw:
+                        vector = vocab_ratio_from_membw(membw)
+                        source = (
+                            "cached hardware profile membw "
+                            f"{[round(b) for b in membw]} GB/s"
+                        )
+            except Exception as e:
+                logger.warning(
+                    "--rank-vocab-ratio auto: could not use the cached "
+                    "hardware profile (%s); falling back to the resolved "
+                    "--rank-tp-ratio.",
+                    e,
+                )
+        if vector is None:
+            vector = list(self.rank_tp_ratio)
+            source = "resolved --rank-tp-ratio (no cached hardware profile)"
+        self.rank_vocab_ratio = vector
+        logger.info(
+            "--rank-vocab-ratio auto -> %s (%s).",
+            ",".join(map(str, vector)),
+            source,
+        )
 
     def _handle_uneven_mlp_ratio(self):
         """Validate the family weight vectors of the uneven-TP
@@ -4462,6 +4560,7 @@ class ServerArgs:
         splits, which follow --rank-tp-ratio. Runs after the base plan is
         resolved ('auto' may collapse to None on uniform budgets), so a
         vector without a resolved plan is a hard error."""
+        self._resolve_rank_vocab_ratio()
         for field, flag, env_name in self.UNEVEN_FAMILY_RATIO_SPECS:
             env_value = getattr(envs, env_name).get()
             if env_value:

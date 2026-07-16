@@ -394,6 +394,46 @@ def get_hardware_profile() -> Tuple[Optional[dict], str, List[dict]]:
         return None, "probe failed", gpus
 
 
+def get_cached_hardware_profile() -> Tuple[Optional[dict], List[dict]]:
+    """Cache-only variant of ``get_hardware_profile``: returns the cached
+    profile when its (sorted GPU UUIDs, driver, version) key matches, else
+    (None, inventory). NEVER triggers a probe -- used by consumers that only
+    want opportunistic access to the measured scores (--rank-vocab-ratio
+    auto), where a multi-second probe would be a surprising side effect."""
+    gpus, driver = _nvml_gpu_inventory()
+    uuids = [g["uuid"] for g in gpus]
+    path = profile_cache_path(uuids, driver)
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                profile = json.load(f)
+            if (
+                profile.get("version") == PROFILE_VERSION
+                and profile.get("driver") == driver
+                and profile.get("uuids") == sorted(uuids)
+            ):
+                return profile, gpus
+        except Exception:
+            pass
+    return None, gpus
+
+
+def vocab_ratio_from_membw(membw_gbs: Sequence[float], base: int = 6) -> List[int]:
+    """Integer weight vector proportional to the per-rank memory-bandwidth
+    scores, for ratio-weighted vocab sharding (--rank-vocab-ratio auto).
+
+    The lm_head matvec is bandwidth-bound (it streams the whole vocab shard
+    once per forward), so shard widths proportional to membw equalize the
+    per-rank read TIME. Scaled so the smallest rank gets `base` units
+    (granularity ~ base/sum, ample for the 64-row padded vocab units), then
+    gcd-reduced. Example: 1558/723/723 GB/s -> [13, 6, 6]."""
+    low = min(membw_gbs)
+    assert low > 0, f"non-positive membw scores: {membw_gbs}"
+    scaled = [max(1, round(b / low * base)) for b in membw_gbs]
+    g = math.gcd(*scaled)
+    return [s // g for s in scaled]
+
+
 # ---------------------------------------------------------------------------
 # Cost model: per-rank weight bytes + capacity prediction from the model
 # config, mirroring the terms the real pool sizing pays (M22 cost-model
@@ -1098,6 +1138,18 @@ def apply_auto_performance(server_args) -> None:
     else:
         lines.append(
             "CHOSEN: keep plain VRAM-auto split (no MLP vector override)."
+        )
+
+    # Ratio-weighted vocab sharding hint (--rank-vocab-ratio, M20 BEIFANG 2):
+    # a separate opt-in flag (never applied here); the membw-weighted vocab
+    # split balances the per-rank lm_head read time (~+4% MTP decode class).
+    if server_args.rank_vocab_ratio is None:
+        vocab_vec = vocab_ratio_from_membw(rank_scores_bw)
+        lines.append(
+            "VOCAB HINT: the membw-weighted vocab shard for embed/lm_head "
+            f"is --rank-vocab-ratio {','.join(map(str, vocab_vec))} "
+            "(or 'auto'; separate opt-in flag, balances the per-rank "
+            "lm_head read time -- helps MTP drafts and every sampling step)."
         )
 
     rec = _tp_drop_recommendation(server_args, profile, gpus, model)
