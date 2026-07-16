@@ -4486,7 +4486,14 @@ def configure_scheduler_process(
         else None
     )
     family_plans = {}
-    for family, field in (("mlp", "rank_mlp_ratio"), ("moe", "rank_moe_ratio")):
+    # "vocab" (--rank-vocab-ratio / SGLANG_UNEVEN_VOCAB_VECTOR) is read
+    # exclusively through tp_vocab_ratios(), which does NOT fall back to
+    # the base plan: without the flag, vocab sharding stays even.
+    for family, field in (
+        ("mlp", "rank_mlp_ratio"),
+        ("moe", "rank_moe_ratio"),
+        ("vocab", "rank_vocab_ratio"),
+    ):
         vector = getattr(server_args, field, None)
         if isinstance(vector, list):
             family_plans[family] = vector

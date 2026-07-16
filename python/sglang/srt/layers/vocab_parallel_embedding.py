@@ -15,7 +15,11 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.utils import tp_plan_active
+from sglang.srt.distributed.utils import (
+    partition_units,
+    tp_plan_active,
+    tp_vocab_ratios,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -288,6 +292,38 @@ class VocabParallelEmbedding(torch.nn.Module):
         )
         assert self.org_vocab_size_padded <= self.num_embeddings_padded
 
+        # Ratio-weighted vocab sharding (--rank-vocab-ratio): per-rank PADDED
+        # shard widths (prefix-sum layout over the padded vocab, each a
+        # multiple of padding_size) when the explicit vocab family vector is
+        # installed and non-uniform; None keeps the classic even split
+        # byte-identical (tp_vocab_ratios never falls back to the base
+        # --rank-tp-ratio plan). The gathered logits keep the identity
+        # index->token_id mapping because the shards are contiguous
+        # prefix-sum slices of the padded vocab, exactly like the even split.
+        self.vocab_partition_sizes: Optional[List[int]] = None
+        vocab_ratios = tp_vocab_ratios(self.tp_size) if self.enable_tp else None
+        if vocab_ratios is not None:
+            if self.use_attn_tp_group:
+                raise NotImplementedError(
+                    "--rank-vocab-ratio is not supported together with "
+                    "attention-TP-group vocab layers (enable_dp_lm_head / "
+                    "DP attention)."
+                )
+            if self.num_embeddings_padded != self.org_vocab_size_padded:
+                raise NotImplementedError(
+                    "--rank-vocab-ratio does not support added (LoRA) vocab "
+                    f"embeddings (org_vocab_size_padded="
+                    f"{self.org_vocab_size_padded}, num_embeddings_padded="
+                    f"{self.num_embeddings_padded})."
+                )
+            vocab_units = self.org_vocab_size_padded // self.padding_size
+            self.vocab_partition_sizes = [
+                u * self.padding_size
+                for u in partition_units(vocab_units, vocab_ratios)
+            ]
+            assert sum(self.vocab_partition_sizes) == self.num_embeddings_padded
+
+        self.tp_rank = tp_rank
         self.shard_indices = self._get_indices(
             self.num_embeddings_padded,
             self.org_vocab_size_padded,
@@ -295,6 +331,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.org_vocab_size,
             tp_rank,
             self.tp_size,
+            padded_org_sizes=self.vocab_partition_sizes,
         )
         self.embedding_dim = embedding_dim
 
@@ -323,9 +360,13 @@ class VocabParallelEmbedding(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
         # Divide the weight matrix along the vocaburaly dimension.
         self.num_added_embeddings = self.num_embeddings - self.org_vocab_size
-        self.num_embeddings_per_partition = divide(
-            self.num_embeddings_padded, self.tp_size
-        )
+        if self.vocab_partition_sizes is not None:
+            # Ratio-weighted vocab shard: this rank's width from the plan.
+            self.num_embeddings_per_partition = self.vocab_partition_sizes[tp_rank]
+        else:
+            self.num_embeddings_per_partition = divide(
+                self.num_embeddings_padded, self.tp_size
+            )
         assert (
             self.shard_indices.num_elements_padded == self.num_embeddings_per_partition
         )
@@ -357,10 +398,32 @@ class VocabParallelEmbedding(torch.nn.Module):
         org_vocab_size: int,
         tp_rank: int,
         tp_size: int,
+        padded_org_sizes: Optional[List[int]] = None,
     ) -> VocabParallelEmbeddingShardIndices:
         """Get start and end indices for vocab parallel embedding, following the
         layout outlined in the class docstring, based on the given tp_rank and
-        tp_size."""
+        tp_size.
+
+        `padded_org_sizes` (ratio-weighted vocab sharding, --rank-vocab-ratio):
+        per-rank PADDED shard widths; rank boundaries become their prefix sums
+        instead of the even `rank * padded // tp_size`. Only supported without
+        added (LoRA) vocab (vocab_size_padded == org_vocab_size_padded, checked
+        by the caller), so the added range collapses to the empty range at
+        org_vocab_size exactly like the even split with 0 added embeddings."""
+        if padded_org_sizes is not None:
+            assert vocab_size_padded == org_vocab_size_padded
+            start = sum(padded_org_sizes[:tp_rank])
+            end = start + padded_org_sizes[tp_rank]
+            return VocabParallelEmbeddingShardIndices(
+                padded_org_vocab_start_index=start,
+                padded_org_vocab_end_index=end,
+                padded_added_vocab_start_index=org_vocab_size,
+                padded_added_vocab_end_index=org_vocab_size,
+                org_vocab_start_index=min(start, org_vocab_size),
+                org_vocab_end_index=min(end, org_vocab_size),
+                added_vocab_start_index=min(org_vocab_size, vocab_size),
+                added_vocab_end_index=min(org_vocab_size, vocab_size),
+            )
         num_added_embeddings_padded = vocab_size_padded - org_vocab_size_padded
         padded_org_vocab_start_index, padded_org_vocab_end_index = (
             vocab_range_from_global_vocab_size(org_vocab_size_padded, tp_rank, tp_size)
@@ -403,6 +466,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         base_embeddings: List[int] = []
         added_embeddings: List[int] = []
         padding: List[int] = []
+        # Per-rank padded shard widths: uneven under --rank-vocab-ratio,
+        # uniform otherwise.
+        partition_sizes = self.vocab_partition_sizes or [
+            self.num_embeddings_per_partition
+        ] * self.tp_size
         for tp_rank in range(self.tp_size):
             shard_indices = self._get_indices(
                 self.num_embeddings_padded,
@@ -411,9 +479,10 @@ class VocabParallelEmbedding(torch.nn.Module):
                 self.org_vocab_size,
                 tp_rank,
                 self.tp_size,
+                padded_org_sizes=self.vocab_partition_sizes,
             )
-            range_start = self.num_embeddings_per_partition * tp_rank
-            range_end = self.num_embeddings_per_partition * (tp_rank + 1)
+            range_start = sum(partition_sizes[:tp_rank])
+            range_end = range_start + partition_sizes[tp_rank]
             base_embeddings.extend(
                 range(range_start, range_start + shard_indices.num_org_elements)
             )
@@ -463,6 +532,16 @@ class VocabParallelEmbedding(torch.nn.Module):
         elif isinstance(param, UninitializedParameter):
             shape = list(loaded_weight.shape)
             if output_dim is not None:
+                if self.vocab_partition_sizes is not None:
+                    # Ratio-weighted vocab sharding: lazily materialized
+                    # (GGUF-quantized) vocab weights would need uneven
+                    # byte-row offsets here; the supported GGUF path
+                    # dequantizes embed_tokens/lm_head to dense weights
+                    # before this loader runs (gguf_qwen35 transform_stream).
+                    raise NotImplementedError(
+                        "--rank-vocab-ratio does not support lazily "
+                        "materialized (GGUF-quantized) vocab weights."
+                    )
                 shape[output_dim] = shape[output_dim] // self.tp_size
             param.materialize(tuple(shape), dtype=loaded_weight.dtype)
 
@@ -494,6 +573,16 @@ class VocabParallelEmbedding(torch.nn.Module):
             assert loaded_weight.shape[output_dim] == (
                 self.org_vocab_size // param.packed_factor
             )
+            if self.vocab_partition_sizes is not None and (
+                start_idx % packed_factor != 0 or shard_size % packed_factor != 0
+            ):
+                # Ratio-weighted vocab shard boundaries must stay aligned to
+                # the pack factor of vocab-packed quantized weights.
+                raise ValueError(
+                    "--rank-vocab-ratio shard bounds "
+                    f"({start_idx}, +{shard_size}) are not aligned to the "
+                    f"pack factor {packed_factor} of {type(param).__name__}."
+                )
             start_idx = start_idx // packed_factor
             shard_size = shard_size // packed_factor
         else:
