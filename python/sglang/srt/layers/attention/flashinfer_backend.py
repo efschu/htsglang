@@ -1319,6 +1319,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_mode.is_target_verify()
                 and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
+                # Uneven-DCP verify NEVER plans a packed custom mask (chain
+                # topk=1: the ragged wrapper handles draft->draft causality,
+                # the paged prefix read is non-causal; tree-spec is guarded
+                # off under DCP). flashinfer decides mask mode by BUFFER
+                # PRESENCE, not by what plan() received (prefill.py run():
+                # `if self._custom_mask_buf is not None: mask_mode=CUSTOM`),
+                # so initializing custom_mask_buf here would force every
+                # captured verify run into CUSTOM mask mode against the
+                # never-refreshed all-zero cuda_graph_custom_mask -> the
+                # committed-prefix read is fully masked out and the verify
+                # logits are prompt-blind (M16, MTP+graphs+DCP corruption).
+                and not self.uneven_dcp
             )
             prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
@@ -1949,6 +1961,9 @@ class FlashInferIndicesUpdaterDecode:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
+        # Host-side kv indptr for the DCP cuda-graph replay plan (see below);
+        # None on every non-DCP / non-graph path.
+        dcp_graph_indptr_host: Optional[torch.Tensor] = None
         if (
             self.attn_backend.uneven_dcp
             and (spec_info is None or getattr(spec_info, "kv_indptr", None) is None)
@@ -1995,6 +2010,41 @@ class FlashInferIndicesUpdaterDecode:
                     dcp_size,
                     dcp_rank,
                 )
+            # CUDA-graph REPLAY contract (root cause of the silent decode
+            # corruption under uneven-DCP + graphs, all quantizations, M16):
+            # the captured decode kernels read the wrapper's FIXED buffers
+            # (_paged_kv_indices_buf / _paged_kv_indptr_buf, raw pointers
+            # frozen at capture). After capture, begin_forward is
+            # fast_decode_plan, which deliberately skips every
+            # device-to-device copy into those buffers and assumes the caller
+            # wrote them in place -- exactly what the stock non-DCP branch
+            # below does by building indices directly in
+            # wrapper._paged_kv_indices_buf. This DCP branch builds a FRESH
+            # kv_indices tensor instead, so every replay kept reading the
+            # STALE capture-time indices -> attention over garbage prompt KV
+            # (the "prompt is all '!'" signature). kv_indptr is already
+            # written in place (self.kv_indptr[0] is the same storage the
+            # wrapper was created on); the indices must be copied explicitly.
+            # Additionally, fast_decode_plan's host-side work partition must
+            # see the OWNED per-rank lens: the module-global
+            # global_override_indptr_cpu built from the FULL seq_lens below
+            # would mis-partition split-KV against the owned device indptr.
+            if (
+                hasattr(wrapper.begin_forward, "func")
+                and wrapper.begin_forward.func == fast_decode_plan
+            ):
+                num_owned = kv_indices.numel()
+                assert_buffer_fits(
+                    num_owned,
+                    wrapper._paged_kv_indices_buf.numel(),
+                    "uneven-DCP decode graph kv_indices buffer",
+                    bs=bs,
+                )
+                wrapper._paged_kv_indices_buf[:num_owned].copy_(kv_indices)
+                kv_indices = wrapper._paged_kv_indices_buf[:num_owned]
+                # Blocking D2H of (bs+1) int32 once per decode step, outside
+                # the graph -- negligible against the replay itself.
+                dcp_graph_indptr_host = kv_indptr.to("cpu")
         elif spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -2062,7 +2112,13 @@ class FlashInferIndicesUpdaterDecode:
                 disable_split_kv=(
                     disable_split_kv if disable_split_kv is not None else False
                 ),
-                global_override_indptr_cpu=global_override_indptr_cpu,
+                # DCP graph replay: host plan must use the OWNED per-rank
+                # indptr, not the full-seq_lens override (see the DCP branch).
+                global_override_indptr_cpu=(
+                    dcp_graph_indptr_host
+                    if dcp_graph_indptr_host is not None
+                    else global_override_indptr_cpu
+                ),
             )
         else:
             # When using original begin_forward, don't pass global_override_indptr_cpu
