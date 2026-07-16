@@ -247,3 +247,45 @@ Before implementing, confirm the win is real on this hardware:
 Because compute-fast and link-fast are independent, the mode must read both
 `pcie.link.width/gen` (or measured link bandwidth) and compute/VRAM-bandwidth
 per physical GPU, not just VRAM size.
+
+### Calibration & weighting design (how the weights are DERIVED)
+
+For a trustworthy automatic weighting, the calibration must briefly MEASURE
+each card - not read spec sheets - before deriving a distribution:
+
+1. **Stage 0 - hardware probe (once per rig, not per boot).** A short
+   (~2-3 s/card) micro-probe: max memory bandwidth (large-copy/triad), max
+   compute throughput (GEMM burst at model-relevant shapes), and the full
+   pairwise link matrix (collective latency + bandwidth per card pair - this
+   is what exposes a Gen2-x4 straggler). Results are cached in a local
+   hardware-profile file keyed by the GPU-UUID set + driver version, so the
+   probe runs ONCE per hardware configuration and later boots reuse it
+   silently; any hardware change invalidates the cache automatically.
+   Measurement building blocks already exist (m20 GEMV + NCCL benches).
+2. **Stage 1 - cost model.** Derive per-rank weights from the probe: decode
+   is VRAM-bandwidth-bound, prefill is compute-bound, and the link matrix
+   adds a per-rank communication penalty (a rank behind a slow link attracts
+   fewer heads/tokens even if its VRAM is large). The tuning target
+   (`both|dec|enc`) selects the blend of the three factors.
+3. **Stage 2 - in-situ refinement (the part synthetic probes cannot do).**
+   Synthetic numbers miss the actual workload mix: quant-kernel choice
+   (MMVQ/MMQ vs marlin vs cutlass), the mamba/GDN share, the MTP draft loop.
+   So after boot, measure the REAL per-rank step times over the first N
+   decode steps and refine the vector once - the same converge-in-one-
+   feedback-step mechanic the uneven-DCP token-vector calibration already
+   uses.
+4. **Pinning (skip calibration entirely).** Every derived weighting is
+   printed as a pinnable startup hint (exactly the existing
+   SGLANG_UNEVEN_TOKEN_VECTOR UX): pass the vector at launch and neither the
+   probe nor the refinement runs again. Cache + pin together mean the full
+   calibration cost is paid once per rig, ever.
+
+### Benchmark-methodology notes (from the in-session design discussion)
+
+- Ratio experiments (e.g. 5:1:1 vs 3:2:2) should use the AWQ16-INT4 model
+  rather than FP8: the halved weight footprint keeps extreme ratios from
+  starving the small cards' KV, so the speed effect of the ratio is measured
+  rather than a memory cliff.
+- A TP=2 @ 5:2 layout (dropping the third card entirely) eliminates the slow
+  x4 link from the collective ring altogether and is a legitimate
+  perf-split candidate - only feasible with the smaller INT4 weights.
