@@ -58,6 +58,64 @@ is itself undecided and must be measured.
 Cross-reference: existing multi-rank-per-GPU support via `--rank-gpu-id`
 duplicates and NCCL >= 2.30 multi-rank communicators.
 
+## Additional model families on this 72 GB heterogeneous rig
+
+Status: not started - candidate screening planned.
+
+### Goal
+
+Identify current-generation model families beyond Qwen3.5/3.6-27B that
+(a) fit the total VRAM budget of this rig - 72 GB across 1x RTX 5090 (32 GB)
++ 2x RTX 3080 (20 GB) under uneven TP=3 - with usable context headroom, and
+(b) can be made compatible with the fork's feature set: uneven TP, weighted
+uneven-DCP token sharding, MTP/NEXTN speculative decoding, CUDA graphs, the
+GGUF/AWQ/FP8 quant paths, and mmproj vision loading.
+
+### Named candidates (specs to verify at investigation time, not assumed)
+
+- **Gemma 4 family** - the variants whose quantized weights fit ~72 GB minus
+  per-rank reserves. Verify: attention geometry (kv-head count vs. TP=3
+  whole-head splits, sliding-window layers), availability of FP8 / AWQ /
+  GGUF(+mmproj) checkpoints, and whether any MTP/EAGLE-style draft head
+  exists for spec decode.
+- **Qwen3.6-35B-A3B** (MoE, ~3B active parameters) - attractive because the
+  small active set promises fast decode on this rig while total weights
+  (~35B) still fit quantized. The open question is the **expert layout under
+  UNEVEN TP**: Expert Parallelism is out of scope for this fork, so experts
+  must run TP-sharded (per-expert weight split across ranks, divisibility vs.
+  the uneven per-rank ratios) or replicated - to be derived from the
+  fork's split math. Family relationship to Qwen3.5/3.6-27B should make the
+  text-stack port cheap; verify the MoE router + shared-expert handling.
+- **Screen of other currently "valuable" architectures** at investigation
+  time (releases move fast): anything with strong quality-per-VRAM that fits
+  72 GB quantized. Explicitly out: models whose smallest useful quant exceeds
+  the budget.
+
+### Compatibility checklist per candidate
+
+1. Weight footprint under FP8 / AWQ-INT4 / GGUF quants vs. 72 GB minus
+   per-rank reserves (weights + activations + draft head).
+2. Attention geometry: query/kv-head counts vs. whole-head uneven splits over
+   TP=3 (GQA group preservation; kv-heads < 3 needs the "TP > num_kv_heads"
+   work above).
+3. Hybrid layers (Mamba/GDN/linear attention/SWA): pool-configurator support
+   and the CP-free path under DCP.
+4. MoE: expert weight layout under uneven ratios (TP-shard vs. replicate; EP
+   explicitly out of scope).
+5. Spec decode: MTP/EAGLE/NEXTN head availability (native or community
+   checkpoints).
+6. Vision: HF vision tower and/or GGUF mmproj availability.
+7. Quant availability: FP8 checkpoints, AWQ, unsloth-style GGUF dynamic
+   quants.
+8. Estimated max context via the calibrated uneven-DCP pool math
+   (C = min_r(P_r/ratio_r) x S).
+
+### Deliverable
+
+A compatibility matrix over the candidates, a ranked implementation-gap list
+(what each model needs from the fork), and per-model bring-up tasks for the
+winners.
+
 ## Performance-oriented uneven split ("auto performance" mode)
 
 Status: unimplemented, feasibility-gated (investigate first, see below).
