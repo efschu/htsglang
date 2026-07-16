@@ -220,6 +220,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+
+        # NEXTN/EAGLE (non-EAGLE3) drafts ALWAYS share embed_tokens + lm_head
+        # with the target (init_lm_head -> set_embed_and_head). Do the sharing
+        # HERE, right after the draft weights finish loading, instead of in
+        # alloc_memory_pool(): the scheduler profiles free VRAM for the KV
+        # budget (target alloc_memory_pool -> init_memory_pool) BETWEEN
+        # draft-worker construction and the draft's alloc_memory_pool, so the
+        # late share made the profiler permanently charge the draft's own
+        # transient embed+lm_head copies (~1.7 GB/rank at 248k vocab, freed
+        # moments later) against max_total_num_tokens.
+        # set_embed_and_head() itself calls torch.cuda.empty_cache(), so the
+        # released VRAM is visible to the profiler's mem_get_info() read.
+        # EAGLE3 (which may keep dedicated embeddings / hot-token heads)
+        # keeps the original late-share timing in alloc_memory_pool() —
+        # zero behavior change there and for non-spec configs.
+        self._embed_head_shared_early = False
+        if not self.speculative_algorithm.is_eagle3():
+            self.init_token_map()
+            self.init_lm_head()
+            self._embed_head_shared_early = True
+
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
@@ -244,8 +265,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
+        if not self._embed_head_shared_early:
+            # EAGLE3 path: original timing (share/keep-dedicated decided here).
+            self.init_token_map()
+            self.init_lm_head()
 
         if self.server_args.speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
