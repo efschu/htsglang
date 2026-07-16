@@ -116,6 +116,65 @@ A compatibility matrix over the candidates, a ranked implementation-gap list
 (what each model needs from the fork), and per-model bring-up tasks for the
 winners.
 
+## Uneven Tensor Parallelism across nodes over RDMA NICs (full feature set)
+
+Status: not started - investigation planned.
+
+### Goal
+
+Extend uneven TP beyond a single machine: ranks distributed across multiple
+nodes connected via RDMA-capable NICs (InfiniBand or RoCE), with the FULL
+feature set working - uneven per-rank ratios, weighted uneven-DCP token
+sharding, MTP/NEXTN speculative decoding, CUDA graphs, the FP8/AWQ/GGUF
+quant paths, and mmproj vision. Not a degraded "multi-node but even split
+only" mode: the same heterogeneous math, spanning nodes.
+
+### Why this is harder than in-node
+
+- **Every decode step pays the network.** The per-step collectives (TP
+  all-reduce per layer, the DCP LSE all-gather) move from PCIe (~2-16 GB/s,
+  microsecond-scale) to the NIC. Inter-node round-trip latency enters the
+  per-token critical path; the split math must treat NIC latency/bandwidth
+  as a first-class cost, not an afterthought.
+- **GPUDirect RDMA caveat on this hardware class.** GeForce cards (3080,
+  5090) do not support GPUDirect RDMA - NCCL falls back to host-staging
+  (GPU -> host memory -> NIC). That doubles PCIe crossings per transfer and
+  adds CPU copy cost. Cross-reference: the HTCCL work (branch feature/htccl)
+  already built a vendor-neutral HOST-STAGING collective layer for
+  NVIDIA+AMD TP - its staging path is the natural transport candidate here,
+  or NCCL's net transport with careful tuning.
+- **Rank mapping needs a node dimension.** --rank-gpu-id (and the ratio
+  vector) must address node:gpu pairs; process launch, NCCL rendezvous and
+  the NVML-based device identity checks must work across hosts.
+- **Calibration gains a new axis.** The self-calibrating token vector today
+  measures per-rank VRAM. Across nodes, the effective per-rank throughput
+  also depends on which side of the NIC a rank sits on; the perf-split
+  ("auto performance") objective and the RDMA topology interact - a rank
+  behind a slow link should attract fewer tokens/heads even if its VRAM is
+  large (same principle as the PCIe Gen2-x4 finding in-node, amplified).
+- **DCP ownership across nodes.** The weighted owner rule is
+  position-based and node-agnostic in principle, but prefix gathers for
+  long-context extend cross the NIC; chunking/overlap strategies need
+  investigation.
+
+### Investigation order
+
+1. Transport baseline: NCCL over the actual NICs (IB/RoCE), host-staging
+   penalty measured (all-reduce latency/bandwidth table inter-node vs
+   in-node, small-to-large sizes) - the decode-step viability check.
+2. Decide transport: NCCL net path vs HTCCL host-staging extension.
+3. Rank/node mapping + launch plumbing (two-host bring-up, even split
+   first as a stepping stone, then uneven ratios).
+4. Full feature matrix on two nodes: DCP, MTP, graphs (graph capture with
+   inter-node collectives!), quants, vision.
+5. Fold NIC cost into calibration and the perf-split objective.
+
+### Hardware note
+
+Requires a second RDMA-capable machine; current rig is single-node
+(1x 5090 + 2x 3080). Test plan must name the second node's GPUs/NICs before
+implementation starts.
+
 ## Performance-oriented uneven split ("auto performance" mode)
 
 Status: unimplemented, feasibility-gated (investigate first, see below).
