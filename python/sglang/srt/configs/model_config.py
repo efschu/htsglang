@@ -294,6 +294,40 @@ class ModelConfig:
             **kwargs,
         )
 
+        # GGUF checkpoints are TEXT-ONLY in this fork: llama.cpp stores the
+        # vision tower in a separate mmproj file, and the GGUF loader maps
+        # only text (+ NEXTN) tensors — v./mm. tensors are skipped even when
+        # present (gguf_qwen35.py name map). A multimodal wrapper arch would
+        # therefore run its vision tower with UNINITIALIZED weights: any
+        # image request — including the server's automatic VLM image warmup
+        # (http_server.py _execute_server_warmup sends a real PNG when
+        # /model_info advertises has_image_understanding) — produces
+        # garbage/NaN image features that contaminate that request's
+        # GDN/mamba states. The NaN residue left in the freed-then-recycled
+        # mamba slots then deterministically corrupts every later request
+        # whose prompt crosses the mamba chunk grid (>=64 tokens, the
+        # in-prefill track path) until /flush_cache resets the mamba pool
+        # (issue #52: GGUF-only early-boot corruption, healed permanently by
+        # one flush). A checkpoint without vision weights is not an
+        # image-understanding model: force multimodal off so the warmup and
+        # the API take the text path.
+        if (self.quantization == "gguf" or self.model_path.endswith(".gguf")) and (
+            is_multimodal_model(self.hf_config.architectures)
+            or hasattr(self.hf_config, "vision_config")
+        ):
+            if enable_multimodal:
+                logger.warning(
+                    "--enable-multimodal is ignored for GGUF checkpoints: "
+                    "GGUF carries no vision/mmproj tensors, image inputs "
+                    "would run an uninitialized vision tower."
+                )
+            else:
+                logger.info(
+                    "Multimodal is disabled for GGUF checkpoint "
+                    "(text tensors only; no mmproj/vision weights)."
+                )
+            enable_multimodal = False
+
         # Set enable_multimodal
         if enable_multimodal is None:
             mm_disabled_models = [
@@ -981,6 +1015,22 @@ class ModelConfig:
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
+        if self.num_nextn_predict_layers is None:
+            # The draft-arch rewrites in _config_draft_model() set
+            # num_nextn_predict_layers on self.hf_config. For multimodal
+            # wrapper configs (e.g. Qwen3_5ForConditionalGeneration, whose
+            # text_config only carries `mtp_num_hidden_layers`), hf_config is
+            # the WRAPPER while hf_text_config is the inner text config — so
+            # the value set by the rewrite is invisible here. Without this
+            # fallback, a NEXTN draft loaded via --speculative-draft-model-path
+            # reports None, and model_runner falls back to the FULL target
+            # depth (num_hidden_layers=64) for draft KV sizing, scaling the
+            # spec KV cell by (1 + 64/16) = 5x and collapsing max_total_num_tokens
+            # ~5x (#49). Only fires when the attribute exists on hf_config
+            # (i.e. a draft rewrite or the checkpoint itself put it there).
+            self.num_nextn_predict_layers = getattr(
+                self.hf_config, "num_nextn_predict_layers", None
+            )
         self.vocab_size = self.hf_text_config.vocab_size
         # GLM-Image is the only model here whose output head predicts vision tokens.
         # Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
