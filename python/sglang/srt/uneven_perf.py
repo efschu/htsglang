@@ -394,6 +394,60 @@ def get_hardware_profile() -> Tuple[Optional[dict], str, List[dict]]:
         return None, "probe failed", gpus
 
 
+def _integerize_membw_ratio(membw_gbs: Sequence[float]) -> List[int]:
+    """Small positive-integer vector proportional to the per-rank memory
+    bandwidths: the weakest card gets 6 units (quantization error < ~9%),
+    then gcd-reduced. E.g. [1558, 723, 723] GB/s -> [13, 6, 6]."""
+    scale = 6.0 / min(membw_gbs)
+    vec = [max(1, round(bw * scale)) for bw in membw_gbs]
+    g = math.gcd(*vec)
+    return [v // g for v in vec]
+
+
+def derive_vocab_ratio_from_cache(rank_gpu_id: Sequence[int]) -> Optional[List[int]]:
+    """Per-rank vocab shard weights from the CACHED hardware profile's
+    memory-bandwidth scores, or None when no valid cache entry exists.
+
+    Used by --rank-vocab-ratio 'auto': the lm_head matvec is a pure
+    streamed weight read, so vocab rows proportional to each rank's membw
+    equalize the per-rank read TIME (M20). Cache-only by design -- this
+    never launches the stage-0 probe subprocess (boot once with
+    --rank-tp-ratio auto-performance to create the cache)."""
+    try:
+        gpus, driver = _nvml_gpu_inventory()
+    except Exception as e:
+        logger.warning("--rank-vocab-ratio auto: NVML inventory failed (%s).", e)
+        return None
+    uuids = [g["uuid"] for g in gpus]
+    path = profile_cache_path(uuids, driver)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            profile = json.load(f)
+    except Exception as e:
+        logger.warning(
+            "--rank-vocab-ratio auto: could not read cached profile %s (%s).",
+            path,
+            e,
+        )
+        return None
+    if (
+        profile.get("version") != PROFILE_VERSION
+        or profile.get("driver") != driver
+        or profile.get("uuids") != sorted(uuids)
+    ):
+        return None
+    uuid_by_idx = {g["cuda_index"]: g["uuid"] for g in gpus}
+    membw = []
+    for gid in rank_gpu_id:
+        entry = (profile.get("gpus") or {}).get(uuid_by_idx.get(gid, ""))
+        if entry is None or not entry.get("membw_gbs"):
+            return None
+        membw.append(float(entry["membw_gbs"]))
+    return _integerize_membw_ratio(membw)
+
+
 # ---------------------------------------------------------------------------
 # Cost model: per-rank weight bytes + capacity prediction from the model
 # config, mirroring the terms the real pool sizing pays (M22 cost-model
@@ -965,6 +1019,19 @@ def apply_auto_performance(server_args) -> None:
             f"GEMM {rank_scores_gemm[r]:.1f} TFLOPS, "
             f"membw {rank_scores_bw[r]:.0f} GB/s"
         )
+    # Ratio-weighted vocab sharding recommendation (task #57 / M20): the
+    # embedding/LM-head vocab split stays EVEN unless --rank-vocab-ratio is
+    # set explicitly, so surface the membw-derived vector as a hint only.
+    if getattr(server_args, "rank_vocab_ratio", None) is None:
+        vocab_vec = _integerize_membw_ratio(rank_scores_bw)
+        if len(set(vocab_vec)) > 1:
+            lines.append(
+                "VOCAB HINT: the embed/lm_head vocab split stays EVEN by "
+                "default; add --rank-vocab-ratio "
+                f"{','.join(map(str, vocab_vec))} (or 'auto') to balance "
+                "the per-rank lm_head read time (M20: the lm_head matvec "
+                "is bound by the slowest card under the even split)."
+            )
     links = profile.get("links") or {}
     pair_bws = [v["p2p_gbs"] for k, v in links.items() if k != "__group__"]
     min_link = min(pair_bws) if pair_bws else 8.0

@@ -24,6 +24,7 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.srt.distributed import tensor_model_parallel_all_gather
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -364,11 +365,32 @@ class LogitsProcessor(nn.Module):
         self.enable_mis = get_server_args().enable_mis
         self.rl_on_policy_target = get_server_args().rl_on_policy_target
 
+        # Ratio-weighted vocab sharding (--rank-vocab-ratio): the per-rank
+        # PADDED lm_head shard sizes (from the shared helper, so the gather
+        # layout matches the layer sharding exactly), or None (default even
+        # split). The equal-shard gatherers cannot express uneven shards, so
+        # the gather goes through _all_gather_uneven_vocab_logits instead.
+        self.uneven_vocab_shard_sizes = None
+        if self.do_tensor_parallel_all_gather and not self.use_attn_tp_group:
+            from sglang.srt.layers.vocab_parallel_embedding import (
+                DEFAULT_VOCAB_PADDING_SIZE,
+                uneven_vocab_padded_shard_sizes,
+            )
+
+            self.uneven_vocab_shard_sizes = uneven_vocab_padded_shard_sizes(
+                self.vocab_size,
+                DEFAULT_VOCAB_PADDING_SIZE,
+                get_parallel().tp_size,
+            )
+            self._uneven_vocab_tp_rank = get_parallel().tp_rank
+
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
             ),
-            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            enabled=self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and self.uneven_vocab_shard_sizes is None,
             skip_entry_sync=True,
         )
 
@@ -926,7 +948,9 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         if self.do_tensor_parallel_all_gather:
-            if self.use_attn_tp_group:
+            if self.uneven_vocab_shard_sizes is not None:
+                logits = self._all_gather_uneven_vocab_logits(logits)
+            elif self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:
                 logits = self._logits_gatherer(logits)
@@ -1005,6 +1029,40 @@ class LogitsProcessor(nn.Module):
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
             return hidden_states, local_hidden_states
         return hidden_states, hidden_states
+
+    def _all_gather_uneven_vocab_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """All-gather logits when the per-rank lm_head vocab shards differ
+        (--rank-vocab-ratio).
+
+        NCCL all-gather requires EQUAL shapes on every rank, so the uneven
+        shards use the pad-to-max sync trick (same pattern as the uneven
+        head gather in layers/dcp/comm.cp_all_gather_heads_uneven): pad this
+        rank's logits to max(shard sizes), all-gather the equal-shaped
+        padded tensor, then slice out each rank's TRUE shard and
+        re-concatenate in rank order (= global vocab order, since vocab
+        shards are contiguous prefix-sum slices). Every op is functional
+        with per-rank-static shapes: F.pad rewrites both the copied and the
+        zero region on each graph replay and the slices/cat allocate from
+        the capture pool, so no buffer can go stale across replays
+        (cuda-graph safe; the pad garbage is sliced away before compute).
+        """
+        sizes = self.uneven_vocab_shard_sizes
+        local = logits.shape[-1]
+        assert local == sizes[self._uneven_vocab_tp_rank], (
+            f"uneven vocab gather: local logits width {local} != this rank's "
+            f"shard size {sizes[self._uneven_vocab_tp_rank]} (plan {sizes})"
+        )
+        max_size = max(sizes)
+        if local < max_size:
+            padded = torch.nn.functional.pad(logits, (0, max_size - local))
+        else:
+            padded = logits
+        gathered = tensor_model_parallel_all_gather(padded.contiguous(), dim=-1)
+        parts = [
+            gathered[:, r * max_size : r * max_size + sizes[r]]
+            for r in range(len(sizes))
+        ]
+        return torch.cat(parts, dim=-1)
 
     def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
         if self.vocab_size % self.attn_tp_size == 0:

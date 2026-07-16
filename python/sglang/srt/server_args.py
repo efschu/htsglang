@@ -429,6 +429,13 @@ def _parse_rank_tp_ratio(value: str) -> Union[str, List[int]]:
     return [int(part.strip()) for part in value.split(",")]
 
 
+def _parse_rank_vocab_ratio(value: str) -> Union[str, List[int]]:
+    """Parse --rank-vocab-ratio: 'auto' or a comma-separated integer list."""
+    if value.strip() == "auto":
+        return "auto"
+    return [int(part.strip()) for part in value.split(",")]
+
+
 def _torch_to_nvml_gpu_index_mapping() -> Dict[int, int]:
     """CUDA device index -> NVML physical index, bridged via PCI bus IDs.
 
@@ -1239,6 +1246,29 @@ class ServerArgs:
             "takes precedence over this flag. Requires an active "
             "--rank-tp-ratio plan.",
             type_parser=_parse_int_list,
+        ),
+    ] = None
+    rank_vocab_ratio: A[
+        Optional[Union[List[int], str]],
+        Arg(
+            help="Uneven TP: ratio-weighted VOCAB sharding of the embedding "
+            "and LM head (comma-separated positive integer weights, one per "
+            "rank, or 'auto'). By default (flag unset) the vocab dimension "
+            "ALWAYS keeps the classic even split, even under an uneven "
+            "--rank-tp-ratio plan — the LM-head matvec then runs at the "
+            "SLOWEST card's weight-read time. This flag splits the vocab "
+            "rows proportionally to the given weights instead (e.g. 13,6,6 "
+            "on one fast + two slow cards), balancing the per-rank lm_head "
+            "read TIME. 'auto' derives the weights from the cached hardware "
+            "profile's memory-bandwidth scores (written by --rank-tp-ratio "
+            "auto-performance) and falls back to the resolved "
+            "--rank-tp-ratio weights when no profile is cached. Affects the "
+            "target model AND any NEXTN/EAGLE draft that shares its "
+            "embed/lm_head. The environment variable "
+            "SGLANG_UNEVEN_VOCAB_VECTOR takes precedence over this flag. "
+            "Requires an active --rank-tp-ratio plan; incompatible with "
+            "--enable-dp-lm-head.",
+            type_parser=_parse_rank_vocab_ratio,
         ),
     ] = None
     random_seed: A[Optional[int], "The random seed."] = None
@@ -4447,6 +4477,7 @@ class ServerArgs:
     UNEVEN_FAMILY_RATIO_SPECS = (
         ("rank_mlp_ratio", "--rank-mlp-ratio", "SGLANG_UNEVEN_MLP_VECTOR"),
         ("rank_moe_ratio", "--rank-moe-ratio", "SGLANG_UNEVEN_MOE_VECTOR"),
+        ("rank_vocab_ratio", "--rank-vocab-ratio", "SGLANG_UNEVEN_VOCAB_VECTOR"),
     )
 
     def _handle_uneven_mlp_ratio(self):
@@ -4462,6 +4493,7 @@ class ServerArgs:
         splits, which follow --rank-tp-ratio. Runs after the base plan is
         resolved ('auto' may collapse to None on uniform budgets), so a
         vector without a resolved plan is a hard error."""
+        self._resolve_auto_rank_vocab_ratio()
         for field, flag, env_name in self.UNEVEN_FAMILY_RATIO_SPECS:
             env_value = getattr(envs, env_name).get()
             if env_value:
@@ -4502,6 +4534,67 @@ class ServerArgs:
                     f"{flag} / {env_name} entries must be positive "
                     f"integers, got {vector}."
                 )
+
+        # Vocab-family-specific constraints: the ratio-weighted logits
+        # gather runs over the FULL TP group; the attn-TP-group LM head
+        # (--enable-dp-lm-head) keeps the even vocab layout.
+        if self.rank_vocab_ratio is not None and self.enable_dp_lm_head:
+            raise ValueError(
+                "--rank-vocab-ratio is incompatible with "
+                "--enable-dp-lm-head (the attn-TP-group logits gather "
+                "assumes even vocab shards)."
+            )
+
+    def _resolve_auto_rank_vocab_ratio(self):
+        """Resolve --rank-vocab-ratio 'auto' into an integer vector.
+
+        Runs after the base plan is resolved ('auto'/'auto-performance'
+        have collapsed to a list or None). Preference order:
+        1. memory-bandwidth scores from the CACHED hardware profile (the
+           lm_head matvec is a pure streamed weight read, so shards
+           proportional to membw equalize the per-rank read time). Cache
+           only -- 'auto' never triggers the stage-0 probe subprocess;
+           boot with --rank-tp-ratio auto-performance once to create it.
+        2. fallback: the resolved --rank-tp-ratio weights (gcd-reduced).
+        A uniform result collapses to None (vocab stays even)."""
+        if self.rank_vocab_ratio != "auto":
+            return
+        if not isinstance(self.rank_tp_ratio, list):
+            raise ValueError(
+                "--rank-vocab-ratio auto requires an active uneven-TP "
+                "base plan (--rank-tp-ratio); without one the vocab "
+                "split is already the even optimum."
+            )
+
+        vector = None
+        source = None
+        if self.rank_gpu_id is not None:
+            from sglang.srt.uneven_perf import derive_vocab_ratio_from_cache
+
+            vector = derive_vocab_ratio_from_cache(self.rank_gpu_id)
+            if vector is not None:
+                source = "cached hardware profile membw scores"
+        if vector is None:
+            weights = list(self.rank_tp_ratio)
+            g = math.gcd(*weights)
+            vector = [w // g for w in weights]
+            source = "resolved --rank-tp-ratio weights (no cached profile)"
+
+        if len(set(vector)) == 1:
+            logger.info(
+                "--rank-vocab-ratio auto resolved to a uniform vector %s "
+                "(%s); keeping the classic even vocab split.",
+                vector,
+                source,
+            )
+            self.rank_vocab_ratio = None
+            return
+        logger.info(
+            "--rank-vocab-ratio auto resolved to %s (%s).",
+            vector,
+            source,
+        )
+        self.rank_vocab_ratio = vector
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """

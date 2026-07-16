@@ -140,6 +140,21 @@ def get_tp_partition_ratios(family: Optional[str] = None) -> Optional[list]:
     return _TP_PARTITION_RATIOS
 
 
+def tp_vocab_ratios(tp_size: int) -> Optional[list]:
+    """The vocab family's OWN weight vector (--rank-vocab-ratio), or None.
+
+    Unlike the other families ("mlp"/"moe", which fall back to the base
+    --rank-tp-ratio plan), the vocab dimension deliberately does NOT
+    inherit the base vector: without an EXPLICIT vocab vector the
+    embedding / LM-head split stays the classic even one (M22: "vocab
+    always even by design"), keeping the default and plain-uneven-TP
+    paths byte-identical. A uniform vector collapses to None (= even)."""
+    vec = _TP_PARTITION_FAMILIES.get("vocab")
+    if not vec or len(vec) != tp_size or len(set(vec)) == 1:
+        return None
+    return vec
+
+
 # ---------------------------------------------------------------------------
 # Uneven decode context parallel (uneven DCP) token-axis split.
 #

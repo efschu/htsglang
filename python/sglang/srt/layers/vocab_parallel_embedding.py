@@ -15,7 +15,11 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.distributed.utils import tp_plan_active
+from sglang.srt.distributed.utils import (
+    partition_sizes,
+    tp_plan_active,
+    tp_vocab_ratios,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -72,6 +76,34 @@ def vocab_range_from_global_vocab_size(
     per_partition_vocab_size = divide(global_vocab_size, world_size)
     return vocab_range_from_per_partition_vocab_size(
         per_partition_vocab_size, rank, offset=offset
+    )
+
+
+def uneven_vocab_padded_shard_sizes(
+    org_vocab_size: int,
+    padding_size: int,
+    tp_size: int,
+) -> Optional[List[int]]:
+    """Per-rank PADDED vocab shard sizes under --rank-vocab-ratio, or None
+    when no (non-uniform) vocab family vector is installed.
+
+    The padded vocab is treated as ``org_vocab_size_padded / padding_size``
+    indivisible units of ``padding_size`` rows, distributed by
+    largest-remainder rounding (partition_sizes), so every shard stays a
+    multiple of the padding size and the prefix-sum shard bounds stay
+    aligned. Ratio-weighted shards do NOT need the padded vocab to be
+    divisible by tp_size, so the lcm(padding, tp_size) bump of the even
+    uneven-TP path is skipped -- the base padding (default 64) applies.
+
+    Shared single source of truth for the layer sharding
+    (VocabParallelEmbedding/ParallelLMHead) and the logits gather
+    (LogitsProcessor), which must agree on the exact per-rank sizes."""
+    ratios = tp_vocab_ratios(tp_size)
+    if ratios is None:
+        return None
+    org_vocab_size_padded = pad_vocab_size(org_vocab_size, padding_size)
+    return partition_sizes(
+        org_vocab_size_padded, ratios, units=org_vocab_size_padded // padding_size
     )
 
 
@@ -257,9 +289,33 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.num_embeddings = num_embeddings
         self.org_vocab_size = org_num_embeddings or num_embeddings
 
+        # Ratio-weighted vocab sharding (--rank-vocab-ratio): per-rank
+        # PADDED shard sizes, or None (the default) for the classic even
+        # split. Only an EXPLICIT non-uniform vocab family vector activates
+        # this; a plain --rank-tp-ratio plan keeps vocab even (M22).
+        # use_attn_tp_group (enable_dp_lm_head) is rejected in server_args.
+        self.uneven_vocab_shard_sizes: Optional[List[int]] = None
+        if self.enable_tp and self.tp_size > 1 and not use_attn_tp_group:
+            self.uneven_vocab_shard_sizes = uneven_vocab_padded_shard_sizes(
+                self.org_vocab_size, padding_size, self.tp_size
+            )
+        if self.uneven_vocab_shard_sizes is not None:
+            if num_embeddings != self.org_vocab_size:
+                raise NotImplementedError(
+                    "--rank-vocab-ratio does not support added (LoRA) "
+                    f"vocab embeddings (num_embeddings={num_embeddings}, "
+                    f"org_vocab_size={self.org_vocab_size})."
+                )
+            if use_presharded_weights:
+                raise NotImplementedError(
+                    "--rank-vocab-ratio does not support presharded "
+                    "vocab weights (the checkpoint is pre-split evenly)."
+                )
+
         # Support the case where the vocab size is not divisible by the TP size.
         if (
             _is_cpu
+            and self.uneven_vocab_shard_sizes is None
             and pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0
         ):
             padding_size *= self.tp_size
@@ -268,8 +324,14 @@ class VocabParallelEmbedding(torch.nn.Module):
         # embedding all-reduce stay symmetric). The default padding (64)
         # only guarantees even divisibility for power-of-two TP sizes;
         # with e.g. TP=3 pad to a multiple of lcm(padding, tp_size).
-        # Never taken on the default path (no plan installed).
-        if self.tp_size > 1 and tp_plan_active(self.tp_size):
+        # Never taken on the default path (no plan installed). With an
+        # explicit --rank-vocab-ratio the per-unit partition handles any
+        # tp_size, so the base padding is kept.
+        if (
+            self.tp_size > 1
+            and self.uneven_vocab_shard_sizes is None
+            and tp_plan_active(self.tp_size)
+        ):
             padding_size = math.lcm(padding_size, self.tp_size)
         self.padding_size = padding_size
 
@@ -295,6 +357,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.org_vocab_size,
             tp_rank,
             self.tp_size,
+            uneven_shard_sizes=self.uneven_vocab_shard_sizes,
         )
         self.embedding_dim = embedding_dim
 
@@ -323,9 +386,16 @@ class VocabParallelEmbedding(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
         # Divide the weight matrix along the vocaburaly dimension.
         self.num_added_embeddings = self.num_embeddings - self.org_vocab_size
-        self.num_embeddings_per_partition = divide(
-            self.num_embeddings_padded, self.tp_size
-        )
+        if self.uneven_vocab_shard_sizes is not None:
+            # Ratio-weighted shards: this rank's padded shard size (per-rank
+            # sizes differ by design; even TP keeps the classic divide()).
+            self.num_embeddings_per_partition = self.uneven_vocab_shard_sizes[
+                tp_rank
+            ]
+        else:
+            self.num_embeddings_per_partition = divide(
+                self.num_embeddings_padded, self.tp_size
+            )
         assert (
             self.shard_indices.num_elements_padded == self.num_embeddings_per_partition
         )
@@ -357,19 +427,40 @@ class VocabParallelEmbedding(torch.nn.Module):
         org_vocab_size: int,
         tp_rank: int,
         tp_size: int,
+        uneven_shard_sizes: Optional[List[int]] = None,
     ) -> VocabParallelEmbeddingShardIndices:
         """Get start and end indices for vocab parallel embedding, following the
         layout outlined in the class docstring, based on the given tp_rank and
-        tp_size."""
-        num_added_embeddings_padded = vocab_size_padded - org_vocab_size_padded
-        padded_org_vocab_start_index, padded_org_vocab_end_index = (
-            vocab_range_from_global_vocab_size(org_vocab_size_padded, tp_rank, tp_size)
-        )
-        padded_added_vocab_start_index, padded_added_vocab_end_index = (
-            vocab_range_from_global_vocab_size(
-                num_added_embeddings_padded, tp_rank, tp_size, offset=org_vocab_size
+        tp_size.
+
+        With `uneven_shard_sizes` (--rank-vocab-ratio; no added/LoRA vocab,
+        enforced in __init__), the padded org-vocab bounds are the prefix-sum
+        slices of the per-rank padded shard sizes instead of the even split;
+        the (empty) added-vocab range degenerates to [org_vocab_size,
+        org_vocab_size) exactly like the even zero-added case."""
+        if uneven_shard_sizes is not None:
+            assert vocab_size_padded == org_vocab_size_padded  # no added vocab
+            padded_org_vocab_start_index = sum(uneven_shard_sizes[:tp_rank])
+            padded_org_vocab_end_index = (
+                padded_org_vocab_start_index + uneven_shard_sizes[tp_rank]
             )
-        )
+            padded_added_vocab_start_index = org_vocab_size
+            padded_added_vocab_end_index = org_vocab_size
+        else:
+            num_added_embeddings_padded = vocab_size_padded - org_vocab_size_padded
+            padded_org_vocab_start_index, padded_org_vocab_end_index = (
+                vocab_range_from_global_vocab_size(
+                    org_vocab_size_padded, tp_rank, tp_size
+                )
+            )
+            padded_added_vocab_start_index, padded_added_vocab_end_index = (
+                vocab_range_from_global_vocab_size(
+                    num_added_embeddings_padded,
+                    tp_rank,
+                    tp_size,
+                    offset=org_vocab_size,
+                )
+            )
         # remove padding
         org_vocab_start_index = min(padded_org_vocab_start_index, org_vocab_size)
         org_vocab_end_index = min(padded_org_vocab_end_index, org_vocab_size)
@@ -400,6 +491,14 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.tp_size < 2:
             return None
 
+        # Per-rank padded shard sizes: uniform on the even path, the ratio
+        # partition under --rank-vocab-ratio (prefix sums replace the
+        # `per_partition * rank` formula; identical for uniform sizes).
+        if self.uneven_vocab_shard_sizes is not None:
+            per_rank_sizes = self.uneven_vocab_shard_sizes
+        else:
+            per_rank_sizes = [self.num_embeddings_per_partition] * self.tp_size
+
         base_embeddings: List[int] = []
         added_embeddings: List[int] = []
         padding: List[int] = []
@@ -411,9 +510,10 @@ class VocabParallelEmbedding(torch.nn.Module):
                 self.org_vocab_size,
                 tp_rank,
                 self.tp_size,
+                uneven_shard_sizes=self.uneven_vocab_shard_sizes,
             )
-            range_start = self.num_embeddings_per_partition * tp_rank
-            range_end = self.num_embeddings_per_partition * (tp_rank + 1)
+            range_start = sum(per_rank_sizes[:tp_rank])
+            range_end = range_start + per_rank_sizes[tp_rank]
             base_embeddings.extend(
                 range(range_start, range_start + shard_indices.num_org_elements)
             )
@@ -461,6 +561,18 @@ class VocabParallelEmbedding(torch.nn.Module):
             param.weight_type = loaded_weight.item()
             return
         elif isinstance(param, UninitializedParameter):
+            if self.uneven_vocab_shard_sizes is not None:
+                # Lazily-materialized vocab params (quantized GGUF qweight)
+                # bake the even `full // tp_size` split into their shape and
+                # row-block layout; ratio-weighted shards would need
+                # quant-block-aware offsets. Qwen3.5/3.6 GGUF de-quantizes
+                # embed/lm_head to dense before loading, so this path is
+                # never hit there.
+                raise NotImplementedError(
+                    "--rank-vocab-ratio does not support lazily-materialized "
+                    "(quantized) vocab weights; only dense embed/lm_head "
+                    "checkpoints are supported."
+                )
             shape = list(loaded_weight.shape)
             if output_dim is not None:
                 shape[output_dim] = shape[output_dim] // self.tp_size

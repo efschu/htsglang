@@ -480,6 +480,12 @@ class Envs:
     # family, MOE = fused expert-weight family.
     SGLANG_UNEVEN_MLP_VECTOR = EnvStr(None)
     SGLANG_UNEVEN_MOE_VECTOR = EnvStr(None)
+    # Uneven TP: ratio-weighted VOCAB sharding of embedding/LM head
+    # ("a,b,c", one positive integer per TP rank). Takes precedence over
+    # --rank-vocab-ratio. Unlike the MLP/MOE families the vocab dimension
+    # does NOT follow the base --rank-tp-ratio plan by default -- without
+    # an explicit vector it stays evenly split (stock behavior).
+    SGLANG_UNEVEN_VOCAB_VECTOR = EnvStr(None)
     # Uneven DCP token-axis split vector ("a,b,c", one positive integer per
     # DCP rank). Overrides the budget-estimate vector resolve_cp_token_ratios
     # would otherwise derive. Emitted by the KV-pool self-calibration as a
