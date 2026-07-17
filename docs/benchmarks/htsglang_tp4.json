@@ -1,0 +1,128 @@
+{
+  "_meta": {
+    "engine": "htsglang (sglang fork, GGUF plugin + uneven-TP capable) — S3 TP=4 CO-LOCATED: 4 even ranks on 3 physical GPUs, two ranks sharing the RTX 5090 via NVIDIA MPS. Even split (no uneven-TP ratios; V1/V2 n/a — absolute per-rank budget mode).",
+    "repo": "Image htsglang-qwen35-gguf:cu130-3e76cbbf1 (6bcbce9eb2c4, 22.4GB) = thin overlay on htsglang:cu130-nccl2307, python tree at HEAD 3e76cbbf1, NCCL 2.30.7 baked. Runs as DOCKER on the proxmox HOST (VM-local NCCL 2.28.9 < 2.30 makes co-located TP=4 INFEASIBLE locally — proven crash, see MATRIX_PLAN).",
+    "model": "Qwen3.6-27B (hybrid GDN/linear-attn + embedded MTP/NEXTN draft blk.64). Quants: original Qwen3.6-27B-FP8; AWQ-BF16-INT4 (compressed-tensors); unsloth UD-GGUF Q6_K_XL (+mmproj-BF16 vision tower auto-loaded). Q8_K_XL INFEASIBLE (no boot attempted, known loader bug — see q8 cell).",
+    "host": "proxmox HOST docker (driven from VM CT999 via ssh; port 30011->30000, container htsbench). HW: NVML idx 0=RTX3080(20480MiB), 1=RTX5090(32607MiB), 2=RTX3080(20480MiB) — re-verified this phase, all 0 MiB at start. Container CUDA order is FASTEST_FIRST => cuda:0=5090, so --rank-gpu-id 0,0,1,2 co-locates ranks 0+1 on the 5090 (F4-class container-vs-host-ordering fix from 3b applies; verified from the wrapper AND from the boot memory profile).",
+    "mps": "MPS MANDATORY and VERIFIED LIVE via control-daemon response (echo get_default_active_thread_percentage | nvidia-cuda-mps-control -> 100.0), NOT via ls /tmp/nvidia-mps (PROVEN false positive, M27b: daemon was dead after 3b with sockets still present; restarted this phase). Co-location confirmed during first boot: 3 compute processes on the 5090 UUID (2 rank processes + MPS server), 5090 ~28.9GB = 2x rank budget, each 3080 ~14GB = 1 rank. MPS server contexts = 38/63/38 MiB residual between cells (MPS baseline); after final 'echo quit' all 3 GPUs true 0 MiB.",
+    "rank_mib": "RANK_GPU_MEMORY_MIB=13500 for ALL cells. FOOTNOTE (F1, MATRIX_READY): the plan's 14500 OOMs at draft-CUDA-graph capture on the 31.34GiB 5090 (both co-located ranks reach ~15.5GiB = budget + ~1GiB non-KV overhead: CUDA ctx, NCCL, graph pools); --cuda-graph-max-bs-decode 16 did not change the allocation profile. 13500 boots cleanly. shvllm S3 fits at 14500 (M27b G-A) — engine difference, flag on any cross-engine maxKV comparison.",
+    "measured_by": "Phase 3c PART3 (M27e) 2026-07-17, 05:54-06:29 CEST. Thermal gate <=80C before every boot (fired every time, 45-59C GO). One container at a time; teardown docker rm -f htsbench + VRAM-drop confirmation between cells (back to MPS baseline 139 MiB total).",
+    "harness": "bench_measure.py --api sglang (/generate meta_info; ignore_eos + warmup-prefill + warmup-decode); dk_cell.sh -> dk_launch/dk_measure/dk_down via htsglang_dk_run.sh; KV_PARSE=sglang (max_total_num_tokens boot line). Raw logs: matrix_logs/htsglang_{fp8,awq,q6}_tp4_dk/ + CELL_*_driver*.log.",
+    "metric_defs": {
+      "prefill20k": "P1: single request, 20000 exact unique input_ids, max_new_tokens=1, tok/s (after discarded warmup prefill)",
+      "decode1k_code": "D1 CODE: single ~1000-tok decode (ignore_eos), tok/s",
+      "decode1k_prose": "D1 PROSE: same, prose prompt",
+      "par8_prefill": "P8: 8 parallel x 6000 exact input_ids, total prompt / batch wall (aggregate tok/s)",
+      "par8_decode_code": "D8 CODE: 8 parallel x ~400-tok decode (ignore_eos), aggregate tok/s",
+      "par8_decode_prose": "D8 PROSE: same, prose",
+      "maxKV_tokens": "sglang boot line max_total_num_tokens at the cell's config (ctx 24576, RANK_MIB=13500)",
+      "accept_*": "MTP/NEXTN spec_accept_length (sglang-native), per decode group"
+    },
+    "global_caveats": [
+      "fp8 KV everywhere (--kv-cache-dtype fp8_e4m3). MTP/NEXTN spec ACTIVE every decode (--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4).",
+      "CUDA graphs: decode + target-verify + draft graphs captured on all 4 ranks. Prefill CUDA graph auto-DISABLED in every cell ('Breakable CUDA graph is incompatible with multimodal model' — fired for FP8 and Q6 boots; AWQ prefill backend likewise 'disabled' in boot config).",
+      "Fork's co-location NCCL handling engaged (logged): custom all-reduce disabled (heterogeneous GPUs + co-located ranks -> NCCL for TP collectives), NCCL_MULTI_RANK_GPU_ENABLE=1 auto-set (requires NCCL >= 2.30 — the reason this is docker-only), NCCL_MAX_CTAS capped to 4 for 2 co-located ranks (override via env).",
+      "mem_fraction_static derived per-rank from the absolute budget: 13500 MiB / 5090-total -> 0.7324 (logged). Even 1/4 TP split, no uneven ratios, no DCP — V1/V2 variants do not apply to this scenario.",
+      "UNCACHED verified: unique-nonce token-id prompts; max_cached_tokens=0 every cell.",
+      "Q6 GGUF is multimodal (mmproj-BF16 auto-loaded next to the backbone). Booted with --skip-server-warmup (M27d lesson: the image's built-in warmup sends an IMAGE request which OOMs at maxed KV pools; text-only bench never touches the vision path). GGUF cells booted with DROP_CACHES=1.",
+      "Battery pushes 3080s to 78-84 C by the end of each cell (gpu_temps_after) — thermal gate between boots is doing real work.",
+      "Harness fix during this part (F3-class, same as M27a-F3/M27b-1): htsglang_dk_run.sh MODELPATH pointed at the HOST mount path; bench_measure runs on the VM and needs the VM-local models-cache path for the tokenizer. Fixed in-wrapper (MC_VM). First FP8 boot was healthy (KV=330824) but its battery crashed on this before any metric was recorded; re-run clean. No other fix attempts needed."
+    ]
+  },
+  "fp8_tp4": {
+    "cell": "S3 TP=4 co-located (5090 x2 + 2x3080, MPS), FP8 (original Qwen3.6-27B-FP8), even split @13500 MiB/rank",
+    "quant": "Qwen3.6-27B-FP8",
+    "variant": "even (absolute per-rank budget; V1/V2 n/a)",
+    "startup_args": {
+      "wrapper": "RANK_MIB=13500 bash htsglang_dk_run.sh fp8 tp4",
+      "docker": "docker run -d --name htsbench --gpus all --ipc=host --shm-size=16gb --security-opt apparmor=unconfined -v <models-cache>:/models -v /tmp/nvidia-mps:/tmp/nvidia-mps -e MODEL_PATH=/models/Qwen3.6-27B-FP8 -e CONTEXT_LENGTH=24576 -e KV_CACHE_DTYPE=fp8_e4m3 -e TP_SIZE=4 -e RANK_GPU_ID=0,0,1,2 -e RANK_GPU_MEMORY_MIB=13500 -p 30011:30000 htsglang-qwen35-gguf:cu130-3e76cbbf1",
+      "server": "sglang.launch_server --model-path /models/Qwen3.6-27B-FP8 --tp-size 4 --rank-gpu-id 0,0,1,2 --rank-gpu-memory-mib 13500 --kv-cache-dtype fp8_e4m3 --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --enable-hierarchical-cache --hicache-storage-backend file --hicache-ratio 0.5 --hicache-mem-layout page_first_direct --max-running-requests 8 --context-length 24576",
+      "evidence": "mem_fraction_static=0.732414375 (=13500 MiB of 5090 total); NCCL_MULTI_RANK_GPU_ENABLE=1 + NCCL_MAX_CTAS=4 auto-set; custom all-reduce disabled; healthy after 296s; boot GPU profile 5090=28.9GB (2 ranks) / 3080s=14.0GB (1 rank each)."
+    },
+    "notes": [
+      "Measured on the 2nd boot; 1st boot was equally healthy (KV=330824 vs 330818 — boot-to-boot KV jitter ~6 tokens) but its battery died on the MODELPATH harness bug before any metric.",
+      "First decode after boot took ~57s for 50 tok (lazy spec-decode/graph init under MPS) — absorbed by the harness warmup decode, not in any metric.",
+      "D1 accept 2.79/2.75 lower than TP=3 uneven FP8 V1 (3.28/2.69 code) — same model+spec config, even-split TP=4 co-located regime."
+    ],
+    "prefill20k": 1326.3,
+    "decode1k_code": 92.1,
+    "decode1k_prose": 91.5,
+    "par8_prefill": 1341.4,
+    "par8_decode_code": 244.6,
+    "par8_decode_prose": 244.6,
+    "maxKV_tokens": 330818,
+    "accept_D1_code": 2.793296089385475,
+    "accept_D1_prose": 2.7548209366391183,
+    "accept_D8_code": 3.158,
+    "accept_D8_prose": 3.024,
+    "max_cached_tokens": 0,
+    "uncached_ok": true
+  },
+  "awq_tp4": {
+    "cell": "S3 TP=4 co-located (5090 x2 + 2x3080, MPS), AWQ-BF16-INT4 (compressed-tensors), even split @13500 MiB/rank",
+    "quant": "Qwen3.6-27B-AWQ-BF16-INT4",
+    "variant": "even (absolute per-rank budget; V1/V2 n/a)",
+    "startup_args": {
+      "wrapper": "RANK_MIB=13500 bash htsglang_dk_run.sh awq tp4",
+      "docker": "as fp8_tp4 but -e MODEL_PATH=/models/Qwen3.6-27B-AWQ-BF16-INT4 -e QUANTIZATION=compressed-tensors",
+      "server": "sglang.launch_server --model-path /models/Qwen3.6-27B-AWQ-BF16-INT4 --quantization compressed-tensors --tp-size 4 --rank-gpu-id 0,0,1,2 --rank-gpu-memory-mib 13500 --kv-cache-dtype fp8_e4m3 --speculative-algorithm NEXTN [same spec/hicache/ctx flags as fp8_tp4]",
+      "evidence": "healthy after 296s; KV Cache allocated #tokens 345064 on all 4 ranks; same NCCL co-location log lines as fp8."
+    },
+    "notes": [
+      "AWQ beats FP8 in single-stream decode here (D1c 115.3 vs 92.1) — OPPOSITE of shvllm TP=4 @14500 (103.2 vs 107.3, M27b OPEN item). htsglang's sglang decode path favors INT4-dequant at TP=4 co-located.",
+      "Largest maxKV of the three cells (345064): INT4 weights leave the most budget for KV."
+    ],
+    "prefill20k": 1330.7,
+    "decode1k_code": 115.3,
+    "decode1k_prose": 103.5,
+    "par8_prefill": 1351.9,
+    "par8_decode_code": 259.0,
+    "par8_decode_prose": 216.2,
+    "maxKV_tokens": 345064,
+    "accept_D1_code": 3.1847133757961785,
+    "accept_D1_prose": 2.840909090909091,
+    "accept_D8_code": 3.269,
+    "accept_D8_prose": 2.72,
+    "max_cached_tokens": 0,
+    "uncached_ok": true
+  },
+  "q6_tp4": {
+    "cell": "S3 TP=4 co-located (5090 x2 + 2x3080, MPS), GGUF UD-Q6_K_XL (+mmproj), even split @13500 MiB/rank, --skip-server-warmup",
+    "quant": "unsloth Qwen3.6-27B-UD-Q6_K_XL.gguf",
+    "variant": "even (absolute per-rank budget; V1/V2 n/a)",
+    "startup_args": {
+      "wrapper": "DROP_CACHES=1 RANK_MIB=13500 EXTRA_ARGS=\"--skip-server-warmup\" bash htsglang_dk_run.sh q6 tp4",
+      "docker": "as fp8_tp4 but -e MODEL_PATH=.../Qwen3.6-27B-UD-Q6_K_XL.gguf -e LOAD_FORMAT=gguf -e QUANTIZATION=gguf -e TOKENIZER_PATH=/models/unsloth/Qwen3.6-27B-MTP-GGUF -e SPECULATIVE_DRAFT_MODEL_PATH=<same .gguf> -e DISABLE_CUSTOM_ALL_REDUCE=1 + trailing --skip-server-warmup",
+      "server": "sglang.launch_server --model-path .../Qwen3.6-27B-UD-Q6_K_XL.gguf --load-format gguf --quantization gguf --tokenizer-path .../Qwen3.6-27B-MTP-GGUF --tp-size 4 --rank-gpu-id 0,0,1,2 --rank-gpu-memory-mib 13500 --speculative-draft-model-path <same .gguf> --disable-custom-all-reduce [same spec/hicache/ctx flags] --skip-server-warmup",
+      "evidence": "GGUF multimodal: mmproj-BF16.gguf auto-loaded, prefill CUDA graph disabled (multimodal); healthy after 272s (skip-server-warmup); KV #tokens 322174 all ranks."
+    },
+    "notes": [
+      "--skip-server-warmup applied per M27d (image warmup sends an image request -> OOM at maxed pools); text-only battery never exercises the vision path.",
+      "No runtime dequant OOM (unlike TP=2 @0.90 uncapped, M27c): the absolute-budget path leaves enough headroom at 13500.",
+      "Highest D1 code accept of the three (3.448)."
+    ],
+    "prefill20k": 1282.3,
+    "decode1k_code": 76.4,
+    "decode1k_prose": 65.6,
+    "par8_prefill": 1311.9,
+    "par8_decode_code": 166.0,
+    "par8_decode_prose": 164.3,
+    "maxKV_tokens": 322174,
+    "accept_D1_code": 3.4482758620689653,
+    "accept_D1_prose": 2.9761904761904763,
+    "accept_D8_code": 3.249,
+    "accept_D8_prose": 3.052,
+    "max_cached_tokens": 0,
+    "uncached_ok": true
+  },
+  "q8_tp4": {
+    "cell": "S3 TP=4 co-located, GGUF UD-Q8_K_XL",
+    "quant": "unsloth Qwen3.6-27B-UD-Q8_K_XL.gguf",
+    "variant": "even (n/a)",
+    "status": "INFEASIBLE — recorded WITHOUT a boot attempt (per task; known loader infeasibility, task #64)",
+    "error_reference": "M27d (TP=3, same image code at HEAD 3e76cbbf1, TP-mode-independent): UD-Q8_K_XL loads past the shard-quantized check, but ALL 64 GDN layers log 'Parameter model.layers.N.linear_attn.in_proj_qkvz.qweight not found in params_dict', then the scheduler crashes: model_loader/loader.py:2252 -> layers/quantization/gguf.py:475 _create_padded_weight_param -> AssertionError: Data container has mixed dtypes: {torch.float16, torch.uint8}. The fused GDN in_proj_qkvz is stored mixed-precision (fp16+uint8) in Q8_K_XL; the GGUF QuantMethod padding path assumes ONE dtype. Q6_K_XL loads cleanly in the same plugin => Q8_K_XL-specific layout. Fix = implement mixed-dtype/incomplete-quant GGUF layers (flagged to main as TODO); outside measurement scope.",
+    "notes": [
+      "shvllm rejects the same checkpoint earlier with a different error mode (is_layer_skipped fused-shard check, M27b) — same root cause, both engines INFEASIBLE on Q8_K_XL."
+    ]
+  }
+}

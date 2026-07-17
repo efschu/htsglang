@@ -1,0 +1,88 @@
+{
+  "_meta": {
+    "engine": "htsglang (sglang fork, GGUF plugin + uneven-TP capable; TP=2 even split here)",
+    "repo": "/spinning/htsglang-gguf at HEAD 3e76cbbf1 (UNMODIFIED, local VM venv /spinning/htsglang-gpu/.venv, NCCL 2.28.9)",
+    "model": "Qwen3.6-27B (+ embedded MTP/NEXTN draft), quants: unsloth UD-GGUF Q6 (+mmproj vision tower), AWQ-BF16-INT4 (compressed-tensors)",
+    "host": "VM local (NOT docker). HARDWARE STATE: RTX 5090 PHYSICALLY REMOVED for this phase -> only 2x RTX 3080 20GB, NVML/PCI indices 0 and 1 (enumeration SHIFTED vs all earlier notes). 5090 returned to the system immediately AFTER the last measurement (new order 0=3080, 1=5090, 2=3080).",
+    "measured_by": "Phase 3c PART 1 (M27c) 2026-07-16 21:02-21:39 CEST",
+    "harness": "bench_measure.py --api sglang (/generate, meta_info; NEW M27c fix: ignore_eos:true in sampling_params); bench_run.sh via htsglang_local_run.sh (tp2 path now resolves the two 3080 indices at runtime via NVML under CUDA_DEVICE_ORDER=PCI_BUS_ID); KV_PARSE=sglang (max_total_num_tokens boot line)",
+    "metric_defs": {
+      "prefill20k": "P1: single request, 20000 exact unique input_ids, max_new_tokens=1 -> prompt_tokens/wall (tok/s), AFTER a discarded full-size warmup prefill",
+      "decode1k_code": "D1 CODE: single ~1000-token decode (max_new_tokens=1000, ignore_eos:true) -> completion_tokens/wall (tok/s)",
+      "decode1k_prose": "D1 PROSE: same, prose prompt",
+      "par8_prefill": "P8: 8 parallel x 6000 exact input_ids, max_new_tokens=1 -> total prompt_tokens / batch wall (aggregate tok/s)",
+      "par8_decode_code": "D8 CODE: 8 parallel x ~400-token decode (ignore_eos) -> total completion_tokens / wall (aggregate tok/s)",
+      "par8_decode_prose": "D8 PROSE: same, prose prompts",
+      "maxKV_tokens": "sglang boot line max_total_num_tokens at the cell's config"
+    },
+    "global_caveats": [
+      "fp8 KV everywhere: --kv-cache-dtype fp8_e4m3 (KV Cache allocated dtype torch.float8_e4m3fn verified in boot log).",
+      "MTP/NEXTN spec ACTIVE on every decode: --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4. sglang /generate EXPOSES spec_accept_length (unlike the vLLM/llama.cpp surfaces) -> accept lengths recorded per cell.",
+      "CONCURRENCY CAPPED AT 2 in BOTH cells: the hybrid GDN model's mamba/linear-attention state cache (73-75 MiB per request-state slot per rank) is the bottleneck on 20GB cards, NOT KV tokens. sglang auto-reduced max_running_requests 16 -> 2 (mamba slots 11 (q6) / 13 (awq), mamba_ratio 5). All par8 metrics therefore run 8 requests QUEUED 2-at-a-time - they measure throughput at the config's real admissible concurrency, not 8-way batching.",
+      "BOTH cells needed --mem-fraction-static 0.90 (wrapper default auto-derives 0.749): at 0.749 the mamba pool computes to 0-3 slots -> hard RuntimeError at boot ('Hybrid state cache too small'). This is an sglang-fork memory-accounting behavior on 2x20GB with this model, hit by BOTH quants.",
+      "CUDA graphs ON (decode + target-verify + draft graphs captured, bs=[1,2] per the concurrency cap). Prefill CUDA graph auto-disabled by sglang: 'Breakable CUDA graph is incompatible with multimodal model' (both checkpoints carry the vision tower). Even TP=2 split, --disable-custom-all-reduce, no DCP/uneven envs (wrapper tp2 path sets none).",
+      "UNCACHED verified: unique-nonce token-id prompts; cached_tokens == 0 on every request in every run (max_cached_tokens=0, uncached_ok=true).",
+      "tok/s are client wall-clock based (sglang /generate e2e_latency ~= wall; no server-native prefill tps on this surface); one warmed battery per boot.",
+      "HARNESS FIX applied (M27c, documented in-file): bench_measure.py sglang adapter now sends ignore_eos:true in sampling_params. It was the ONE adapter still missing the M27a/M27b fix; without it 3/8 D8_prose decodes in the first q6 battery stopped at 4/34/89 tokens (deflated aggregate). Q6 was RE-RUN with the fix; both recorded cells are fully clean (all decode completion_tokens exact).",
+      "ENVIRONMENT INCIDENT (resolved): first 2 boot attempts crashed with 'CUDA unknown error' (error 999) at cuInit -> sglang 'No accelerator available'. Cause: cold driver re-init after the 5090's physical removal; a stale kernel-mounted /dev/nvidia2 node persisted (unremovable, 'Device or resource busy') while nvidia-smi showed 2 GPUs. Fixed by running a tiny torch CUDA warmup (torch.cuda.init + alloc on both 3080s) immediately before each server boot; persistence mode is not settable in this VM (Insufficient Permissions). After the first successful cuInit the driver stayed stable for all subsequent boots.",
+      "Thermal gate (cooldown.sh, <=80C) fired before every boot except the 21:12 retry which used the documented COOLDOWN_SKIP=1 escape (gate had passed 10 min earlier at 60C and the intervening boot crashed in 8 s at parse time without GPU load). Teardown to 0 MiB verified after every run."
+    ]
+  },
+
+  "q6_tp2": {
+    "cell": "S2 TP=2, GGUF Q6 (UD-Q6_K_XL + mmproj vision tower), 2x RTX3080 (5090 absent)",
+    "quant": "unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q6_K_XL.gguf (26.0 GB) via fork GGUF loader; mmproj-BF16.gguf vision tower AUTO-LOADED (multimodal stays enabled, +~0.9 GB weights); MTP draft = 15 tensors (blk.64) from the same GGUF",
+    "prefill20k": 1126.1,
+    "decode1k_code": 54.5,
+    "decode1k_prose": 48.7,
+    "par8_prefill": 1098.7,
+    "par8_decode_code": 65.5,
+    "par8_decode_prose": 49.8,
+    "maxKV_tokens": 32768,
+    "accept_D1_code": 3.356,
+    "accept_D1_prose": 3.04,
+    "accept_D8_code": 3.26,
+    "accept_D8_prose": 2.492,
+    "startup_args": {
+      "wrapper": "EXTRA_FLAGS=\"--mem-fraction-static 0.90 --max-total-tokens 32768 --max-running-requests 16\" HEALTH_TIMEOUT=1000 bash htsglang_local_run.sh q6 tp2",
+      "env": "CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,1 (runtime-NVML-resolved 3080 indices; 5090 absent) + torch-CUDA driver warmup before boot",
+      "server": "python -m sglang.launch_server --model-path .../Qwen3.6-27B-UD-Q6_K_XL.gguf --tokenizer-path .../Qwen3.6-27B-MTP-GGUF --load-format gguf --quantization gguf --speculative-draft-model-path <same gguf> --tp 2 --disable-custom-all-reduce --kv-cache-dtype fp8_e4m3 --context-length 24576 --trust-remote-code --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --host 127.0.0.1 --port 30010 --mem-fraction-static 0.90 --max-total-tokens 32768 --max-running-requests 16"
+    },
+    "notes": [
+      "TIGHT AS PREDICTED, but the 20k prefill DID fit (no reduced-prefill fallback needed). Weights/rank: 14.03 GB main+vision + 2.62 GB MTP draft = 16.65 GB of 19.58 GiB usable -> ~2.6 GB post-weights.",
+      "DOES NOT SERVE with wrapper defaults - 2 distinct failure modes, both reproduced: (1) auto mem_fraction_static=0.749 -> mamba pool 0 slots -> boot RuntimeError; (2) at 0.90 UNCAPPED the KV pool auto-sizes to 102,328 tokens (1.56 GB) leaving 0.63 GB runtime headroom -> server passes /health then OOMs on the FIRST real forward: torch.OutOfMemoryError 'Tried to allocate 86.00 MiB' inside ggml_dequantize (sgl_kernel GGUF on-the-fly dequant scratch, qwen2_moe down_proj). The tuned boot (KV capped to 32,768 -> 1.70 GB headroom) serves the full battery stably, twice.",
+      "maxKV 32768 is therefore a MANUAL CAP, not the natural pool: 102,328 boots but cannot serve. Comparison note vs shvllm q6_tp2 (maxKV 25,600 SERVING at GMU 0.88): the vLLM fork needs no such tuning - the memory-efficiency gap is flagged to main as an open investigation item.",
+      "D8 barely above D1 (65.5 vs 54.5 code): concurrency 2 + shared GGUF dequant bandwidth; NOT an 8-way batching measurement (see global caveat).",
+      "Battery run twice (pre/post ignore_eos fix): P1 1088.6->1126.1, P8 1090.4->1098.7, D1 code 54.1->54.5 - reproducible within MTP-acceptance noise. Recorded row = clean second run.",
+      "Boot count 4: 2x environment CUDA-init crash (not model-related), 1x runtime-OOM diagnosis boot, 1+1 successful battery boots (the 2-fix-attempt budget was spent on mem-fraction and KV-cap)."
+    ]
+  },
+
+  "awq_tp2": {
+    "cell": "S2 TP=2, AWQ-BF16-INT4 (compressed-tensors), 2x RTX3080 (5090 absent)",
+    "quant": "Qwen3.6-27B-AWQ-BF16-INT4; NOTE: loads at 13.32 GB/rank - barely lighter than Q6's 14.03 GB, because non-quantized schemes (incl. vision tower) fall back to UnquantizedLinearMethod bf16 ('Acceleration for non-quantized schemes is not supported by Compressed Tensors' in boot log); MTP draft 2.57 GB",
+    "prefill20k": 1169.2,
+    "decode1k_code": 86.5,
+    "decode1k_prose": 63.9,
+    "par8_prefill": 1157.2,
+    "par8_decode_code": 136.5,
+    "par8_decode_prose": 119.7,
+    "maxKV_tokens": 148864,
+    "accept_D1_code": 3.215,
+    "accept_D1_prose": 2.375,
+    "accept_D8_code": 3.187,
+    "accept_D8_prose": 2.837,
+    "startup_args": {
+      "wrapper": "EXTRA_FLAGS=\"--mem-fraction-static 0.90 --max-running-requests 16\" HEALTH_TIMEOUT=1000 bash htsglang_local_run.sh awq tp2",
+      "env": "CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,1 (runtime-NVML-resolved) + torch-CUDA driver warmup before boot",
+      "server": "python -m sglang.launch_server --model-path .../Qwen3.6-27B-AWQ-BF16-INT4 --quantization compressed-tensors --tp 2 --disable-custom-all-reduce --kv-cache-dtype fp8_e4m3 --context-length 24576 --trust-remote-code --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --host 127.0.0.1 --port 30010 --mem-fraction-static 0.90 --max-running-requests 16"
+    },
+    "notes": [
+      "Wrapper default (auto mem_fraction 0.749, max_running_requests 48) FAILS at boot with the same mamba error as Q6: max_mamba_cache_size=3, mamba_ratio=5 -> max_num_reqs=0. One fix attempt (--mem-fraction-static 0.90 --max-running-requests 16) boots and serves cleanly - NO KV cap needed.",
+      "maxKV 148,864 is the NATURAL pool at 0.90 (vs shvllm awq_tp2 94,400 at GMU 0.88) and survives the battery: unlike GGUF, the marlin/bf16 forward path has no per-forward full-tensor dequant scratch, so 0.63 GB post-capture headroom suffices.",
+      "Concurrency still capped at 2 (mamba 13 slots) -> par8 = queued 2-at-a-time, but decode scales better than Q6 (D8 1.6x D1) since compute, not dequant bandwidth, dominates.",
+      "vs shvllm awq_tp2: prefill ~equal (1169 vs 1154), single-stream decode better (86.5 vs 75.5 code), par8 decode WORSE (136.5 vs 195.0) - shvllm admits real 8-way batching, htsglang is mamba-capped at 2.",
+      "Boot count 2: 1x default-config failure (diagnosis), 1x successful battery."
+    ]
+  }
+}
