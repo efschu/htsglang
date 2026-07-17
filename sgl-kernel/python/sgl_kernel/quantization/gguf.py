@@ -2,10 +2,17 @@ import torch
 
 
 def ggml_dequantize(
-    weight: torch.Tensor, quant_type: int, M: int, N: int, dtype: torch.dtype
+    weight: torch.Tensor,
+    quant_type: int,
+    M: int,
+    N: int,
+    dtype: torch.dtype,
+    out: torch.Tensor = None,
 ):
     assert M > 0 and N > 0, "GGUF weight Input shape must be of positive dimensions"
-    return torch.ops.sgl_kernel.ggml_dequantize.default(weight, quant_type, M, N, dtype)
+    return torch.ops.sgl_kernel.ggml_dequantize.default(
+        weight, quant_type, M, N, dtype, out
+    )
 
 
 def ggml_mul_mat_vec_a8(

@@ -1295,11 +1295,25 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Embedding layer
         if self.pp_group.is_first_rank:
+            # GGUF only: build embed_tokens QUANTIZED-RESIDENT (packed
+            # `qweight` via GGUFEmbeddingMethod) instead of the dense bf16
+            # materialization -- saves ~1.1 GiB/rank on a 248k vocab. Every
+            # non-GGUF quantization keeps quant_config=None here, i.e. the
+            # default path is byte-identical. SGLANG_GGUF_DENSE_VOCAB=1
+            # restores the legacy dense embed for GGUF too.
+            embedding_quant_config = None
+            if quant_config is not None and quant_config.get_name() == "gguf":
+                from sglang.srt.model_loader.gguf_qwen35 import gguf_dense_vocab
+
+                if not gguf_dense_vocab():
+                    embedding_quant_config = quant_config
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
                 enable_tp=not is_dp_attention_enabled(),
+                quant_config=embedding_quant_config,
+                prefix=add_prefix("embed_tokens", prefix),
             )
         else:
             self.embed_tokens = PPMissingLayer()

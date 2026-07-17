@@ -29,12 +29,29 @@ be loaded by sglang's generic GGUF path for three reasons:
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def gguf_dense_vocab() -> bool:
+    """Legacy-behavior switch for the GGUF vocab family.
+
+    Default (False): ``token_embd``/``output`` stay QUANTIZED-RESIDENT --
+    embed_tokens/lm_head are built with the GGUF quant_config
+    (GGUFEmbeddingMethod, packed ``qweight``), the NEXTN draft shares the
+    target's MODULES, and every lm_head pass streams the packed bytes
+    (e.g. Q8_0: 1.26 GiB) instead of a bf16 materialization (2.37 GiB).
+
+    ``SGLANG_GGUF_DENSE_VOCAB=1`` restores the previous behavior (dequantize
+    token_embd/output to dense bf16 at load; tensor-level NEXTN sharing) for
+    A/B validation and as an escape hatch.
+    """
+    return os.environ.get("SGLANG_GGUF_DENSE_VOCAB", "0") == "1"
 
 # HF model_type -> GGUF arch name (values as in gguf.MODEL_ARCH_NAMES).
 _MODEL_TYPE_TO_GGUF_ARCH = {
@@ -459,8 +476,23 @@ class Qwen35GGUFAdapter:
         }
         prefixes = set()
         name_map = self.build_name_map()
+        # Only F32 tensors force an UNQUANTIZED module: the GGUF iterator
+        # keeps F32 as plain `.weight` (never renamed to `.qweight`), so an
+        # F32 projection cannot load into a GGUF-quantized layer. Dense
+        # F16/BF16 tensors DO arrive as `.qweight` (+`.qweight_type`) and
+        # stay inside quantized modules as dense-typed shards; the quant
+        # method casts them to params_dtype at weight finalize
+        # (GGUFLinearMethod._create_flat_weight_param/_cast_dense_qweight).
+        # This is what makes UD-Q8_K_XL loadable (task #64 "mixed-dtype
+        # qkvz": F16 in_proj_z beside Q8_0 in_proj_qkv, F16 attn_q/k beside
+        # Q8_0 attn_v, and 5 fully-F16 MLP layers).
+        f32_type = gguf.GGMLQuantizationType.F32
+        # fused/base module -> set of ggml types of its split tensors, to
+        # fail fast on the unsupportable mix "F32 split + quantized sibling"
+        # (the F32 half needs a dense module, the quantized half a qweight).
+        module_split_types: Dict[str, set] = {}
         for gname, hf in name_map.items():
-            if types.get(gname) not in unq_types or not hf.endswith(".weight"):
+            if not hf.endswith(".weight"):
                 continue
             base = hf[: -len(".weight")]
             # Only Linear projections matter (norms/conv1d are not GGUF-quantized
@@ -471,7 +503,18 @@ class Qwen35GGUFAdapter:
                 if base.endswith(split):
                     base = base[: -len(split)] + fused
                     break
-            prefixes.add(base)
+            module_split_types.setdefault(base, set()).add(types.get(gname))
+            if types.get(gname) == f32_type:
+                prefixes.add(base)
+        for base in sorted(prefixes):
+            tset = module_split_types.get(base, set())
+            if any(t is not None and t not in unq_types for t in tset):
+                raise RuntimeError(
+                    f"qwen35 GGUF: module {base!r} mixes an F32 split with a "
+                    f"quantized sibling ({sorted(t.name for t in tset if t is not None)}); "
+                    "this cannot be loaded either dense or quantized. "
+                    "Re-quantize the F32 tensor (e.g. to Q8_0/F16)."
+                )
 
         # GDN out_proj whose value head is NOT a multiple of the ggml block
         # (e.g. K-quant block 256 with head_v_dim 128) is dequantized on the fly
@@ -487,12 +530,16 @@ class Qwen35GGUFAdapter:
             ):
                 prefixes.add(hf[: -len(".weight")])
 
-        # lm_head must be a DENSE weight for GGUF: NEXTN spec decode shares the
-        # target's lm_head.weight with the draft (get_embed_and_head), and a
-        # quantized lm_head (GGUFEmbeddingMethod) has only `qweight`. The main
-        # model dequantizes `output`->lm_head.weight (transform_stream); the
-        # draft's lm_head is injected from the target.
-        prefixes.add("lm_head")
+        # Vocab family (lm_head): QUANTIZED-RESIDENT by default. NEXTN spec
+        # decode shares the target's lm_head/embed_tokens MODULES
+        # (set_embed_and_head_modules), so a packed `qweight` head works for
+        # target AND draft; each lm_head pass then streams the packed bytes
+        # (e.g. Q8_0: 1.26 GiB) instead of a dense bf16 materialization
+        # (2.37 GiB) -- 4 passes per MTP iteration (2 draft + 1 extend +
+        # 1 verify). SGLANG_GGUF_DENSE_VOCAB=1 restores the old dense
+        # lm_head (paired with tensor-level get/set_embed_and_head sharing).
+        if gguf_dense_vocab():
+            prefixes.add("lm_head")
         return sorted(prefixes)
 
     # ------------------------------------------------------------------
@@ -605,8 +652,10 @@ class Qwen35GGUFAdapter:
     ) -> Iterable[Tuple[str, torch.Tensor]]:
         """Wrap the raw GGUF weight iterator, applying all inverse transforms.
 
-        ``embed_tokens`` is created without a quant_config (plain ``weight``),
-        so a quantized ``token_embd`` must be dequantized on the fly.
+        Vocab family: by default ``token_embd``/``output`` pass through as
+        packed ``.qweight`` (quantized-resident embed_tokens/lm_head). Under
+        ``SGLANG_GGUF_DENSE_VOCAB=1`` they are dequantized on the fly for the
+        legacy dense modules.
         """
         import gguf
         from gguf.quants import dequantize
@@ -615,15 +664,22 @@ class Qwen35GGUFAdapter:
 
         # Modules built WITHOUT a quant_config expect a plain `.weight`, so a
         # quantized GGUF tensor for them must be dequantized on the fly:
-        #  - main model: `model.embed_tokens` (lm_head stays quantized via
-        #    GGUFEmbeddingMethod, so `output`->lm_head keeps its qweight).
         #  - MTP draft: `mtp.fc` (eh_proj, a plain nn.Linear); the draft's
         #    embed_tokens/lm_head are injected from the target, not loaded here.
-        dequant_prefixes = (
-            ("mtp.fc.",)
-            if self.is_draft
-            else ("model.embed_tokens.", "lm_head.")
-        )
+        #  - main model, ONLY under SGLANG_GGUF_DENSE_VOCAB=1 (legacy):
+        #    `model.embed_tokens` + `lm_head` are materialized dense bf16.
+        # Default: token_embd/output stay QUANTIZED-RESIDENT -- the model
+        # builds embed_tokens/lm_head with the GGUF quant_config
+        # (GGUFEmbeddingMethod) and the `.qweight` rows are vocab-sharded by
+        # vocab_parallel_embedding.weight_loader (even AND --rank-vocab-ratio
+        # uneven splits: GGUF packs along the hidden dim only, so any ggml
+        # type shards byte-cleanly at row granularity).
+        if self.is_draft:
+            dequant_prefixes = ("mtp.fc.",)
+        elif gguf_dense_vocab():
+            dequant_prefixes = ("model.embed_tokens.", "lm_head.")
+        else:
+            dequant_prefixes = ()
         deq_qtype: Dict[str, int] = {}
         for name, weight in weights:
             hit = next((p for p in dequant_prefixes if name.startswith(p)), None)

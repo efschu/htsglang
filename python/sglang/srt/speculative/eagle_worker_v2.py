@@ -380,8 +380,43 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-        target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
+        target_model = self.target_worker.model_runner.model
+        target_lm_head = getattr(target_model, "lm_head", None)
+
+        # GGUF quantized-resident vocab: the target's lm_head (and usually
+        # embed_tokens) carries packed `qweight` -- there is no `.weight`
+        # tensor to hand over, so share the MODULES wholesale. Draft and
+        # target then use the SAME module objects, which keeps the row
+        # layout identical by construction under even AND --rank-vocab-ratio
+        # uneven vocab sharding. Runs at the same early point as the tensor
+        # path (M21: before KV profiling; set_embed_and_head_modules calls
+        # empty_cache so the profiler sees the released draft dupes).
+        # Non-GGUF targets always have `.weight` and never take this branch.
+        if (
+            target_lm_head is not None
+            and not hasattr(target_lm_head, "weight")
+            and hasattr(target_lm_head, "qweight")
+        ):
+            draft_model = self.draft_runner.model
+            if (
+                self.speculative_algorithm.is_eagle3()
+                or self.hot_token_id is not None
+                or not hasattr(draft_model, "set_embed_and_head_modules")
+            ):
+                raise NotImplementedError(
+                    "GGUF quantized-resident lm_head requires a NEXTN/EAGLE "
+                    "draft supporting module-level sharing "
+                    "(set_embed_and_head_modules) and no hot-token vocab. "
+                    "Set SGLANG_GGUF_DENSE_VOCAB=1 to restore the dense "
+                    "lm_head path."
+                )
+            embed_module = getattr(
+                getattr(target_model, "model", None), "embed_tokens", None
+            )
+            draft_model.set_embed_and_head_modules(embed_module, target_lm_head)
+            return
+
+        embed, head = target_model.get_embed_and_head()
 
         def maybe_share_target_lm_head():
             if (
