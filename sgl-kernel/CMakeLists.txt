@@ -243,6 +243,32 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     )
 endif()
 
+# Rig-local build accelerator (task #66): when SGL_KERNEL_LIMIT_CUDA_ARCHS is
+# a non-empty semicolon list (e.g. "80;86;120a"), REPLACE the auto-assembled
+# -gencode set above with exactly these archs. Unset (default) -> flag list
+# is byte-identical to stock. Non-gencode flags are preserved.
+set(SGL_KERNEL_LIMIT_CUDA_ARCHS "" CACHE STRING
+    "If non-empty, replace the auto gencode list with these archs (e.g. 80;86;120a)")
+if (NOT "${SGL_KERNEL_LIMIT_CUDA_ARCHS}" STREQUAL "")
+    set(_sgl_flags_nogencode "")
+    foreach(_flag IN LISTS SGL_KERNEL_CUDA_FLAGS)
+        if (NOT _flag MATCHES "^-gencode")
+            list(APPEND _sgl_flags_nogencode "${_flag}")
+        endif()
+    endforeach()
+    set(SGL_KERNEL_CUDA_FLAGS ${_sgl_flags_nogencode})
+    foreach(_arch IN LISTS SGL_KERNEL_LIMIT_CUDA_ARCHS)
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_${_arch},code=sm_${_arch}")
+    endforeach()
+    message(STATUS "SGL_KERNEL_LIMIT_CUDA_ARCHS active: ${SGL_KERNEL_LIMIT_CUDA_ARCHS}")
+endif()
+
+# Skip the (fast-math) SM90 variant entirely -- e.g. on rigs without any
+# Hopper GPU, where sgl_kernel/load_utils only ever loads the sm100 dir.
+# Default OFF -> stock behavior.
+option(SGL_KERNEL_SKIP_SM90_VARIANT "Do not build/install the sm90 fast-math common_ops variant" OFF)
+
 # All source files
 # NOTE: Please sort the filenames alphabetically
 set(SOURCES
@@ -322,6 +348,7 @@ set(INCLUDES
 
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)
+if (NOT SGL_KERNEL_SKIP_SM90_VARIANT)
 Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
 target_compile_options(common_ops_sm90_build PRIVATE
@@ -333,6 +360,7 @@ set_target_properties(common_ops_sm90_build PROPERTIES
     OUTPUT_NAME "common_ops"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
 )
+endif()
 
 # =========================== Common SM100+ Build ============================= #
 # Build SM100+ library with precise math (same namespace, different directory)
@@ -364,15 +392,19 @@ else()
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
 endif()
 
+if (NOT SGL_KERNEL_SKIP_SM90_VARIANT)
 target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
+endif()
 target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt)
 
 # sparse flash attention
+if (NOT SGL_KERNEL_SKIP_SM90_VARIANT)
 target_compile_definitions(common_ops_sm90_build PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
     FLASHATTENTION_DISABLE_UNEVEN_K
 )
+endif()
 target_compile_definitions(common_ops_sm100_build PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
@@ -382,7 +414,9 @@ target_compile_definitions(common_ops_sm100_build PRIVATE
 # Install to different subdirectories
 # CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
 # and install them to the specified destinations
+if (NOT SGL_KERNEL_SKIP_SM90_VARIANT)
 install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
+endif()
 install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
 # ============================ Optional Install: FA3 ============================= #

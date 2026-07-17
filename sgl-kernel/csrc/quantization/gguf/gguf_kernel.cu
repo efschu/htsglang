@@ -76,11 +76,24 @@ torch::Tensor ggml_dequantize(
     int64_t type,
     int64_t m,
     int64_t n,
-    std::optional<at::ScalarType> const& dtype) {
+    std::optional<at::ScalarType> const& dtype,
+    std::optional<torch::Tensor> out) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(W));
   auto dtype_ = dtype.value_or(torch::kFloat16);
-  auto options = torch::TensorOptions().dtype(dtype_).device(W.device());
-  at::Tensor DW = torch::empty({m, n}, options);
+  at::Tensor DW;
+  if (out.has_value()) {
+    // Persistent-workspace path (#63): dequantize into a caller-provided
+    // buffer instead of a fresh per-call allocation.
+    DW = out.value();
+    TORCH_CHECK(DW.is_contiguous(), "ggml_dequantize: out must be contiguous");
+    TORCH_CHECK(DW.device() == W.device(), "ggml_dequantize: out on wrong device");
+    TORCH_CHECK(DW.scalar_type() == dtype_, "ggml_dequantize: out dtype mismatch");
+    TORCH_CHECK(
+        DW.dim() == 2 && DW.size(0) == m && DW.size(1) == n, "ggml_dequantize: out must have shape (m, n)");
+  } else {
+    auto options = torch::TensorOptions().dtype(dtype_).device(W.device());
+    DW = torch::empty({m, n}, options);
+  }
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   DISPATCH_FLOAT_TYPES(DW.scalar_type(), "ggml_dequantize", [&] {

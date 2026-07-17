@@ -756,7 +756,13 @@ void qserve_w4a8_per_group_gemm(
  * From csrc/quantization/gguf
  */
 torch::Tensor
-ggml_dequantize(torch::Tensor W, int64_t type, int64_t m, int64_t n, std::optional<at::ScalarType> const& dtype);
+ggml_dequantize(
+    torch::Tensor W,
+    int64_t type,
+    int64_t m,
+    int64_t n,
+    std::optional<at::ScalarType> const& dtype,
+    std::optional<torch::Tensor> out);
 
 torch::Tensor ggml_mul_mat_vec_a8(torch::Tensor W, torch::Tensor X, int64_t type, int64_t row);
 

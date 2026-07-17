@@ -141,8 +141,24 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 is_draft_worker=True,
             )
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-        if hasattr(self.draft_model_runner.model, "set_embed_and_head"):
+        target_model = self.target_worker.model_runner.model
+        target_lm_head = getattr(target_model, "lm_head", None)
+        if (
+            target_lm_head is not None
+            and not hasattr(target_lm_head, "weight")
+            and hasattr(target_lm_head, "qweight")
+            and hasattr(self.draft_model_runner.model, "set_embed_and_head_modules")
+        ):
+            # GGUF quantized-resident vocab: share MODULES (no `.weight`
+            # tensor exists); see eagle_worker_v2.init_lm_head.
+            embed_module = getattr(
+                getattr(target_model, "model", None), "embed_tokens", None
+            )
+            self.draft_model_runner.model.set_embed_and_head_modules(
+                embed_module, target_lm_head
+            )
+        elif hasattr(self.draft_model_runner.model, "set_embed_and_head"):
+            embed, head = target_model.get_embed_and_head()
             self.draft_model_runner.model.set_embed_and_head(embed, head)
         else:
             logger.debug(

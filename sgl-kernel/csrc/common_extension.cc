@@ -429,7 +429,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def(
       "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "
-      "dtype) -> Tensor");
+      "dtype, Tensor(a!)? out=None) -> Tensor");
   m.impl("ggml_dequantize", torch::kCUDA, &ggml_dequantize);
 
   m.def(
