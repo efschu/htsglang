@@ -10,6 +10,8 @@ from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkvzba_split_reshape_c
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.utils import (
+    attn_kv_replicated,
+    attn_q_partition_units,
     tp_loaded_shard_start,
     tp_partition_size,
     tp_plan_active,
@@ -666,28 +668,81 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.total_num_heads = config.num_attention_heads
         self.total_num_kv_heads = config.num_key_value_heads
         if tp_plan_active(self.attn_tp_size):
-            # Uneven TP (--rank-tp-ratio): heads follow the shard plan
-            # with kv heads as indivisible units, matching the split in
-            # QKVParallelLinear (whole GQA groups per rank; kv-head
-            # replication is rejected there).
+            # Uneven TP (--rank-tp-ratio): heads follow the shard plan,
+            # matching the split in QKVParallelLinear. Normal mode: kv
+            # heads as indivisible units (whole GQA groups per rank).
+            # REPLICATED-KV mode (TP > num_kv_heads, task #62): ALL kv
+            # heads on every rank, q split in kv_total-sized units — the
+            # unit count is attn_q_partition_units(q, kv, tp).
+            self._kv_replicated = attn_kv_replicated(
+                self.attn_tp_size, self.total_num_kv_heads
+            )
+            _q_units = attn_q_partition_units(
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                self.attn_tp_size,
+            )
             self.num_heads = tp_partition_size(
                 self.total_num_heads,
                 self.attn_tp_size,
                 self.attn_tp_rank,
-                self.total_num_kv_heads,
+                _q_units,
             )
-            self.num_kv_heads = tp_partition_size(
-                self.total_num_kv_heads,
-                self.attn_tp_size,
-                self.attn_tp_rank,
-                self.total_num_kv_heads,
-            )
+            if self._kv_replicated:
+                self.num_kv_heads = self.total_num_kv_heads
+                # The disjoint token shards that keep this mode free of
+                # KV-cache duplication come from the uneven-DCP owner
+                # rule. Without DCP spanning the TP group the replicated
+                # kv heads would duplicate the whole cache on every rank
+                # -> fail fast with the fix. The NEXTN draft is exempt by
+                # design: its single-layer KV pool is non-DCP
+                # (full-context, tiny) and IS replicated intentionally.
+                if (
+                    not is_nextn
+                    and get_parallel().attn_dcp_size != self.attn_tp_size
+                ):
+                    raise ValueError(
+                        f"TP > num_kv_heads: layer {layer_id} has "
+                        f"{self.total_num_kv_heads} kv heads for "
+                        f"{self.attn_tp_size} ranks, which requires the "
+                        "REPLICATED-KV geometry with token-sharded KV "
+                        "(uneven DCP). Enable it with SGLANG_UNEVEN_DCP=1 "
+                        "(and SGLANG_UNEVEN_DCP_WEIGHTED=1 for the "
+                        "weighted owner rule) so dcp_size == tp_size."
+                    )
+                logger.info(
+                    "REPLICATED-KV geometry active for attention layer %d: "
+                    "kv_heads=%d < tp_size=%d; all kv heads on every rank, "
+                    "q heads split %s (units of %d).",
+                    layer_id,
+                    self.total_num_kv_heads,
+                    self.attn_tp_size,
+                    [
+                        tp_partition_size(
+                            self.total_num_heads,
+                            self.attn_tp_size,
+                            r,
+                            _q_units,
+                        )
+                        for r in range(self.attn_tp_size)
+                    ],
+                    self.total_num_kv_heads,
+                )
+            else:
+                self.num_kv_heads = tp_partition_size(
+                    self.total_num_kv_heads,
+                    self.attn_tp_size,
+                    self.attn_tp_rank,
+                    self.total_num_kv_heads,
+                )
             # The fallback head_dim must not depend on the per-rank head
             # count under uneven TP.
             self.head_dim = config.head_dim or (
                 self.hidden_size // self.total_num_heads
             )
         else:
+            self._kv_replicated = False
+            _q_units = self.total_num_kv_heads
             assert self.total_num_heads % self.attn_tp_size == 0
             self.num_heads = self.total_num_heads // self.attn_tp_size
             if self.total_num_kv_heads >= self.attn_tp_size:
@@ -700,6 +755,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 assert self.attn_tp_size % self.total_num_kv_heads == 0
             self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
             self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
+        self._attn_q_units = _q_units
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -743,6 +799,11 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
+            # REPLICATED-KV mode only: the q(+gate) block's unit COUNT.
+            # The fused q+gate slot count would halve the unit size, so
+            # the real q-head-based count is passed explicitly (ignored
+            # in normal mode).
+            q_shard_unit_count=self._attn_q_units,
         )
 
         self.o_proj = RowParallelLinear(
@@ -755,9 +816,10 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("o_proj", prefix),
             # Uneven TP: the o_proj input dim is partitioned like the q
-            # heads in qkv_proj (kv-head units). Ignored on the default
+            # heads in qkv_proj (kv-head units normally; kv_total-sized
+            # q-head units in REPLICATED-KV mode). Ignored on the default
             # path (no shard plan installed).
-            tp_units=self.total_num_kv_heads,
+            tp_units=self._attn_q_units,
         )
 
         self.attn = RadixAttention(

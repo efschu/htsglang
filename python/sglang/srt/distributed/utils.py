@@ -498,6 +498,84 @@ def tp_plan_active(tp_size: int, family: Optional[str] = None) -> bool:
     return bool(ratios) and len(ratios) == tp_size
 
 
+# ---------------------------------------------------------------------------
+# TP > num_kv_heads (task #62): REPLICATED-KV attention geometry.
+#
+# Under an uneven-TP plan the attention heads are normally split in whole
+# kv-head units (every rank >= 1 whole kv head + its GQA q group). When the
+# model has FEWER kv heads than ranks (e.g. Qwen3.6-35B-A3B global layers:
+# kv=2, TP=3; or Qwen3.6-27B kv=4 at TP=5) that scheme cannot hand each rank
+# a kv head. The affected attention layers then switch to REPLICATED-KV mode:
+#   - ALL kv heads live on EVERY rank (num_kv_local == total). K/V are
+#     RECOMPUTED per rank from byte-identical replicated projection weights
+#     and the identical post-allreduce hidden state — no broadcast, exactly
+#     the semantics of upstream's even tp%kv==0 replication path.
+#   - q heads keep splitting, but in units of kv_total heads (NOT whole GQA
+#     groups): flashinfer requires num_qo % num_kv == 0 per rank, and with
+#     num_kv_local == kv_total that means q_local must be a multiple of
+#     kv_total. E.g. A3B 16q/2kv over TP=3 -> units of 2 -> [6,6,4]
+#     (whole-8er-GQA-group units would force the degenerate [8,8,0]).
+#   - the KV cache is NOT duplicated: the uneven-DCP token-axis sharding
+#     (owner rule + graph-validated LSE merge) keeps per-rank token shards
+#     disjoint, so total capacity stays the sum. The DCP decode/extend paths
+#     already plan the paged wrappers with the FULL head counts, so this
+#     mode is comm-neutral (the per-layer kv-head all-gather in
+#     _dcp_masked_write even becomes a no-op and is skipped).
+# Layers whose kv-head count DOES cover the ranks (e.g. GDN linear-attention
+# heads, or kv>=tp full-attention layers) keep the normal head sharding —
+# geometry is derived per layer from (q_heads, kv_heads, tp_size) with no
+# model special-casing.
+# ---------------------------------------------------------------------------
+
+
+def attn_kv_replicated(tp_size: int, total_num_kv_heads: int) -> bool:
+    """True when attention layers with `total_num_kv_heads` kv heads must run
+    the REPLICATED-KV geometry under the installed uneven-TP plan: fewer kv
+    heads than ranks, so the whole-kv-head-unit split cannot give every rank
+    a kv head. False on the default path (no plan) and whenever kv >= tp
+    (the normal uneven unit split handles kv % tp != 0 fine)."""
+    return tp_plan_active(tp_size) and total_num_kv_heads < tp_size
+
+
+def attn_q_partition_units(
+    total_num_q_heads: int, total_num_kv_heads: int, tp_size: int
+) -> int:
+    """Unit count for partitioning the attention q heads (and everything
+    partitioned proportionally to them: qkv q-block, o_proj input) under an
+    uneven-TP plan.
+
+    Normal mode (kv >= tp): kv heads are the indivisible units — every rank
+    gets whole GQA groups. REPLICATED-KV mode (kv < tp): every rank holds
+    ALL kv heads, so q splits in units of kv_total heads (unit count =
+    q_total // kv_total = the GQA group size), keeping per-rank
+    num_qo % num_kv == 0 for the attention kernels.
+
+    `total_num_q_heads` must be the REAL q-head count (not a fused
+    q+gate slot count) — callers with fused projections pass the real count
+    and scale sizes themselves (the unit COUNT is fusion-invariant)."""
+    if not attn_kv_replicated(tp_size, total_num_kv_heads):
+        # Normal (or default-path) geometry: kv heads as the units. No
+        # divisibility demands here — the default even path never reaches
+        # unit-based partitioning at all.
+        return total_num_kv_heads
+    if total_num_q_heads % total_num_kv_heads != 0:
+        raise ValueError(
+            f"REPLICATED-KV geometry: total_num_q_heads "
+            f"({total_num_q_heads}) must be a multiple of "
+            f"total_num_kv_heads ({total_num_kv_heads})."
+        )
+    units = total_num_q_heads // total_num_kv_heads
+    if units < tp_size:
+        raise ValueError(
+            f"REPLICATED-KV geometry: cannot split {total_num_q_heads} q "
+            f"heads over {tp_size} ranks in units of {total_num_kv_heads} "
+            f"(= kv_total) heads: only {units} units (< {tp_size} ranks). "
+            f"tp_size must not exceed the GQA group size "
+            f"({total_num_q_heads}/{total_num_kv_heads}={units})."
+        )
+    return units
+
+
 def tp_loaded_shard_start(
     loaded_full: int,
     tp_size: Optional[int],

@@ -261,6 +261,8 @@ def _local_attn_head_counts(model_runner: "ModelRunner") -> tuple:
     the even ``total // tp_size`` and get_num_kv_heads(rank=...) to the even
     share, i.e. byte-identical to the previous behavior.
     """
+    from sglang.srt.distributed.utils import attn_q_partition_units
+
     mc = model_runner.model_config
     tp_size = get_parallel().attn_tp_size
     tp_rank = get_parallel().attn_tp_rank
@@ -268,7 +270,13 @@ def _local_attn_head_counts(model_runner: "ModelRunner") -> tuple:
         mc.num_attention_heads,
         tp_size,
         tp_rank,
-        mc.get_total_num_kv_heads(),  # kv heads = the indivisible GQA units
+        # Indivisible q units: the kv heads (whole GQA groups) normally;
+        # kv_total-sized q-head packets under the REPLICATED-KV geometry
+        # (TP > num_kv_heads, task #62), keeping num_qo % num_kv == 0 with
+        # num_kv_heads == kv_total on every rank.
+        attn_q_partition_units(
+            mc.num_attention_heads, mc.get_total_num_kv_heads(), tp_size
+        ),
     )
     num_kv_heads = mc.get_num_kv_heads(tp_size, rank=tp_rank)
     return num_qo_heads, num_kv_heads
@@ -437,6 +445,8 @@ class FlashInferAttnBackend(AttentionBackend):
         # group. See _local_attn_head_counts / cp_*_uneven. Off by default
         # (predicate False) -> stock flashinfer path is bit-identical.
         from sglang.srt.distributed.utils import (
+            attn_kv_replicated,
+            attn_q_partition_units,
             cp_token_prefix,
             tp_partition_sizes,
             uneven_dcp_active,
@@ -473,17 +483,54 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cp_lo = _cp_prefix[self.dcp_rank]
             self.cp_hi = _cp_prefix[self.dcp_rank + 1]
             self.cp_ratio = self.cp_hi - self.cp_lo
+        self.dcp_kv_replicated_heads = False
+        # Generic fail-fast for TP > num_kv_heads (task #62): the
+        # REPLICATED-KV geometry stays free of KV-cache duplication only
+        # because the uneven-DCP owner rule token-shards the pool. A target
+        # model that needs it without DCP spanning the TP group would
+        # silently duplicate the whole cache per rank — refuse instead.
+        # (The NEXTN/EAGLE draft worker is exempt by design: its 1-layer
+        # full-context pool is intentionally replicated.)
+        if (
+            attn_kv_replicated(
+                get_parallel().attn_tp_size,
+                model_runner.model_config.get_total_num_kv_heads(),
+            )
+            and not getattr(model_runner, "is_draft_worker", False)
+            and not self.uneven_dcp
+        ):
+            raise ValueError(
+                "TP > num_kv_heads requires the uneven-DCP token-sharded KV "
+                "pool: enable SGLANG_UNEVEN_DCP=1 (and "
+                "SGLANG_UNEVEN_DCP_WEIGHTED=1 for the weighted owner rule) "
+                "so dcp_size == tp_size."
+            )
         if self.uneven_dcp:
             mc = model_runner.model_config
             attn_tp_size = get_parallel().attn_tp_size
             total_kv = mc.get_total_num_kv_heads()
-            # Per-rank uneven head partitions (whole GQA groups per rank), e.g.
-            # 24 q over [2,1,1] kv units -> q [12,6,6], kv [2,1,1].
-            self.dcp_q_head_counts = tp_partition_sizes(
-                mc.num_attention_heads, attn_tp_size, units=total_kv
+            # REPLICATED-KV geometry (TP > num_kv_heads, task #62): every
+            # rank projects ALL kv heads itself (replicated k/v weights),
+            # so the per-layer kv-head all-gather in _dcp_masked_write is
+            # a no-op and is skipped; q splits in kv_total-sized units
+            # (e.g. A3B 16 q / 2 kv over TP=3 -> [6,6,4]).
+            self.dcp_kv_replicated_heads = attn_kv_replicated(
+                attn_tp_size, total_kv
             )
-            self.dcp_kv_head_counts = tp_partition_sizes(
-                total_kv, attn_tp_size, units=total_kv
+            # Per-rank uneven head partitions, e.g. 24 q over [2,1,1] kv
+            # units -> q [12,6,6], kv [2,1,1] (normal mode: whole GQA
+            # groups per rank).
+            self.dcp_q_head_counts = tp_partition_sizes(
+                mc.num_attention_heads,
+                attn_tp_size,
+                units=attn_q_partition_units(
+                    mc.num_attention_heads, total_kv, attn_tp_size
+                ),
+            )
+            self.dcp_kv_head_counts = (
+                [total_kv] * attn_tp_size
+                if self.dcp_kv_replicated_heads
+                else tp_partition_sizes(total_kv, attn_tp_size, units=total_kv)
             )
             # FULL gathered counts the paged wrappers are planned with.
             self.dcp_full_qo_heads = mc.num_attention_heads
@@ -1554,12 +1601,19 @@ class FlashInferAttnBackend(AttentionBackend):
     def _dcp_masked_write(self, layer, forward_batch, cache_loc, k, v):
         """Gather this rank's local kv-head shard [2,1,1] up to the FULL
         replicated kv-heads [4] and write only the token slots this rank OWNS
-        (even-modulo owner rule) at the compacted physical slot loc//dcp_size."""
+        (even-modulo owner rule) at the compacted physical slot loc//dcp_size.
+
+        REPLICATED-KV geometry (TP > num_kv_heads): every rank already
+        projects ALL kv heads itself (identical replicated k/v weights ->
+        identical K/V, deterministic recompute), so the gather is skipped."""
         group = get_parallel().dcp_group
         k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
         v = v.view(-1, layer.tp_v_head_num, layer.head_dim)
-        k_full = cp_all_gather_heads_uneven(k, group, self.dcp_kv_head_counts)
-        v_full = cp_all_gather_heads_uneven(v, group, self.dcp_kv_head_counts)
+        if self.dcp_kv_replicated_heads:
+            k_full, v_full = k, v
+        else:
+            k_full = cp_all_gather_heads_uneven(k, group, self.dcp_kv_head_counts)
+            v_full = cp_all_gather_heads_uneven(v, group, self.dcp_kv_head_counts)
         if self.uneven_dcp_weighted:
             # WEIGHTED owner rule: ownership + compact physical slot are derived
             # from the out_cache_loc itself (not the sequence position), so the
