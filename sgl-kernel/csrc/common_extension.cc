@@ -456,6 +456,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("ggml_moe_get_block_size(int type) -> int");
   m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
 
+  // Task #73: capability probe for the tuned K-quant batched MMVQ kernel.
+  // Returns 1 when the tuned kernel is compiled in and not disabled via
+  // SGLANG_GGUF_KQ_KERNEL=0. Old wheels lack this op entirely, so the
+  // python dispatch keeps its legacy MMVQ->MMQ crossover on them.
+  m.def("ggml_mmvq_kq_tuned() -> int");
+  m.impl("ggml_mmvq_kq_tuned", torch::kCUDA, &ggml_mmvq_kq_tuned);
+
   /*
    * From csrc/mamba
    */

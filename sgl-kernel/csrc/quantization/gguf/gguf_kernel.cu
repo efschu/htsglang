@@ -104,6 +104,13 @@ torch::Tensor ggml_dequantize(
   return DW;
 }
 
+// Task #73 marker (see sgl_kernel_ops.h): schema-detectable capability probe
+// for the tuned K-quant batched MMVQ kernel, resolving the runtime kill
+// switch SGLANG_GGUF_KQ_KERNEL.
+int64_t ggml_mmvq_kq_tuned() {
+  return sglang_gguf_kq_kernel_enabled() ? 1 : 0;
+}
+
 torch::Tensor ggml_mul_mat_vec_a8(
     torch::Tensor W,  // quant weight
     torch::Tensor X,  // input

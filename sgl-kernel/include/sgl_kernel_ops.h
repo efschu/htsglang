@@ -784,6 +784,12 @@ torch::Tensor ggml_moe_a8_vec(
 
 int64_t ggml_moe_get_block_size(int64_t type);
 
+// Task #73: 1 if the tuned llama.cpp-style K-quant batched MMVQ kernel is
+// compiled in AND not disabled via SGLANG_GGUF_KQ_KERNEL=0, else 0. Lets the
+// python-side dispatch retune MMVQ/MMQ crossovers only when the tuned kernel
+// is actually active (old wheels lack this op entirely -> old thresholds).
+int64_t ggml_mmvq_kq_tuned();
+
 /*
  * From csrc/spatial
  */
