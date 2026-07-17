@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "engine": "htsglang (sglang fork, GGUF plugin + uneven-TP capable) \u2014 TP=3 UNEVEN across 3 heterogeneous GPUs, weighted uneven-DCP token-axis KV sharding",
+    "engine": "htsglang (sglang fork, GGUF plugin + uneven-TP capable) — TP=3 UNEVEN across 3 heterogeneous GPUs, weighted uneven-DCP token-axis KV sharding",
     "repo": "/spinning/htsglang-gguf at HEAD 3e76cbbf1 (UNMODIFIED, local VM venv /spinning/htsglang-gpu/.venv, torch 2.11+cu130, NCCL 2.28.9)",
     "model": "Qwen3.6-27B (hybrid GDN/linear-attn + embedded MTP/NEXTN draft blk.64). Quants: original Qwen3.6-27B-FP8; AWQ-BF16-INT4 (compressed-tensors); unsloth UD-GGUF Q6_K_XL (+mmproj-BF16 vision tower). Q8_K_XL INFEASIBLE (see below).",
     "host": "VM local (NOT docker). HARDWARE (5090 re-installed, verified this phase): NVML/PCI idx 0=RTX3080(20480MiB,05:00.0), 1=RTX5090(32607MiB,0A:00.0), 2=RTX3080(20480MiB,0B:00.0). Fork resolves physical GPUs via NVML at runtime. Note: sglang launched WITHOUT CUDA_DEVICE_ORDER=PCI_BUS_ID, so CUDA FASTEST_FIRST places the 5090 at cuda:0 => rank0=5090, rank1/2=3080 (confirmed by derived budgets [29607,18280,18280]).",
@@ -28,7 +28,38 @@
       "V2 auto-performance is INFEASIBLE on GGUF at this HEAD: uneven_perf.py:531 PerfCostModel._load_config does open(model_path/'config.json'); for GGUF model_path is the .gguf FILE => NotADirectoryError. So GGUF V2 uses a PINNED-MLP approximation (--rank-tp-ratio auto + explicit --rank-mlp-ratio + --rank-vocab-ratio auto, which IS GGUF-safe: cached-hw-profile only). FP8/AWQ V2 use the real auto-performance optimizer.",
       "Q6/Q8 GGUF multimodal warmup OOM: sglang's built-in server warmup sends an IMAGE request; at the DCP-maximized KV pool (0.22 GB free) the vision path OOMs even though text serving is fine. Fix (text-only benchmark): --skip-server-warmup + reserve bumped to leave ~1.6 GB headroom. bench_measure sends only text/input_ids (no images), so the vision path is never exercised in measurement.",
       "Reserve calibration: FP8 V1 & all reserve-bumped GGUF cells use --rank-auto-reserve-mib 3000,2200,2200 (avoids the graph-capture / GGUF-dequant OOM that generic R=1500 hits; F2 lesson). AWQ V1 fits at R=1500."
-    ]
+    ],
+    "_audit_M28_2026-07-17": {
+      "scope": "maxKV-only audit vs vLLM cross-check; speed metrics untouched; GPUs verified 0 MiB",
+      "finding": "TP3 V1 max_total_num_tokens is ~half of the vLLM (shvllm) 'GPU KV cache size' numbers, but this is a config+accounting difference, NOT a broken/uncalibrated KV number.",
+      "token_vector_forensics": {
+        "awq_tp3_V1": "UNCALIBRATED: pinned the historical no-MTP vector 31,15,18; boot emitted hint 32,13,19 -> ~654144 (reported 566912).",
+        "fp8_tp3_V1": "CALIBRATED: boot logged 'converged (balanced)' [33,13,18], no divergent hint.",
+        "q6_tp3_V1": "CALIBRATED: clean 2-boot (cal1 31,15,18 -> hint 29,17,18; boot2 converged [29,17,18])."
+      },
+      "root_cause_of_2x_gap_vs_vllm": [
+        "auto-mamba pool sized by --max-running-requests 16 -> 100 mamba slots (ratio5*conc16*safety1.25); ~5.36GB on the 5090, carved BEFORE the token-KV pool. vLLM used --max-num-seqs 8.",
+        "reserve 3000/2200/2200 MiB (GGUF dequant/graph headroom) vs vLLM 1500 uniform.",
+        "vLLM 'GPU KV cache size' comes from the unified hybrid KV manager (mamba page padded to attn page, shared num_blocks) so it counts mamba blocks as token-equivalents; sglang max_total_num_tokens reports only the separate full-attn token pool -> the two numbers are not directly comparable."
+      ],
+      "measured_fp8_HEAD_3e76cbbf1": {
+        "original_V1": 530944,
+        "match_vllm_mrr8_reserve1500_autovec_30_17_18": 739840,
+        "match_vllm_converged_vec_32_15_17": 824896,
+        "vllm_fp8": 1046126,
+        "note": "config-match (mrr16->8, reserve->1500) + vector convergence: 530944 -> 824896 (+55%). Residual 824896 vs 1046126 (1.27x) = mamba-pool accounting + unused MLP-vector lever (SGLANG_UNEVEN_MLP_VECTOR=96,17,23)."
+      },
+      "decision_pending": "main/user to decide: re-measure TP3 cells at vLLM-comparable config (mrr8, reserve1500) OR keep own-config numbers + add 'not comparable to vLLM number' footnote. No destructive rewrite of maxKV_tokens applied by this audit.",
+      "raw_logs": [
+        "matrix_logs/AUDIT_fp8_match_vllm/server.log",
+        "matrix_logs/AUDIT_fp8_match_vllm_b2/server.log"
+      ],
+      "phase2_recalibration": {
+        "decision": "Option A (main): maxKV_tokens now carries the vLLM-comparable recalibrated value; the original V1-config boot value is preserved as maxkv_v1_config per cell.",
+        "semantics": "maxkv_v1_config = V1 matrix boot (mrr16 -> 100 mamba slots, reserve 3000/2200/2200 [AWQ 1500]); maxkv_vllm_comparable = mrr8 + reserve 1500 uniform, converged token vector. vLLM's number additionally counts mamba blocks in its unified pool -> residual ~1.27x accounting gap remains and is expected.",
+        "speed_metrics": "UNCHANGED - all tok/s / accept values are still from the original V1 matrix boots."
+      }
+    }
   },
   "fp8_tp3_V1": {
     "cell": "S4 TP=3 uneven, FP8 (original Qwen3.6-27B-FP8), V1 max-KV",
@@ -50,13 +81,23 @@
     "par8_prefill": 1125.7,
     "par8_decode_code": 354.9,
     "par8_decode_prose": 268.9,
-    "maxKV_tokens": 530944,
+    "maxKV_tokens": 824896,
     "accept_D1_code": 3.278688524590164,
     "accept_D1_prose": 2.6881720430107525,
     "accept_D8_code": 3.208,
     "accept_D8_prose": 2.61,
     "max_cached_tokens": 0,
-    "uncached_ok": true
+    "uncached_ok": true,
+    "maxkv_v1_config": 530944,
+    "maxkv_vllm_comparable": 824896,
+    "calibration_status": {
+      "old_value": 530944,
+      "new_value": 824896,
+      "vector": "32,15,17",
+      "boots": 2,
+      "config": "vLLM-comparable: --max-running-requests 8 (mamba 50 slots) + --rank-auto-reserve-mib 1500 uniform; measured 2026-07-17 at HEAD 3e76cbbf1",
+      "note": "boot1 auto [30,17,17] -> 739840 + hint 32,15,17; boot2 pinned -> converged (balanced) 824896. Sanity: Paris ok, 512-tok decode accept=2.65."
+    }
   },
   "fp8_tp3_V2": {
     "cell": "S4 TP=3 uneven, FP8, V2 max-perf (auto-performance)",
@@ -69,8 +110,8 @@
       "perf_evidence": "CHOSEN MLP vector 4,1,1 (materialized units [91,23,22]); --rank-vocab-ratio auto -> 13,6,6; VRAM-auto reference predicted ctx ~522533; floor check: predicted ctx of chosen vector 522533 >= floor 522533 (loose-ctx X=0) -- OK; predicted per-rank capacity [200928,137955,183649]. First V2 attempt (missing bf16 mamba) crashed rank0 (fp32 SSM doubled per-req 32->64 MiB); bf16 mamba fixed it."
     },
     "notes": [
-      "maxKV 299968 (>= 100k floor met) \u2014 lower than V1 530944, the MLP-concentration tradeoff.",
-      "Prefill +7% (P1 1202.7 vs 1123.7; P8 1207.8 vs 1125.7) but single-stream decode DROPPED (D1c 84.4 vs 98.4, D1p 61.3 vs 80.8) \u2014 decode-knee cost despite the guard rejecting 5/6/10,1,1; par8 ~flat (D8c 343.2 vs 354.9)."
+      "maxKV 299968 (>= 100k floor met) — lower than V1 530944, the MLP-concentration tradeoff.",
+      "Prefill +7% (P1 1202.7 vs 1123.7; P8 1207.8 vs 1125.7) but single-stream decode DROPPED (D1c 84.4 vs 98.4, D1p 61.3 vs 80.8) — decode-knee cost despite the guard rejecting 5/6/10,1,1; par8 ~flat (D8c 343.2 vs 354.9)."
     ],
     "prefill20k": 1202.7,
     "decode1k_code": 84.4,
@@ -106,13 +147,23 @@
     "par8_prefill": 1135.2,
     "par8_decode_code": 346.0,
     "par8_decode_prose": 299.2,
-    "maxKV_tokens": 566912,
+    "maxKV_tokens": 857408,
     "accept_D1_code": 3.1446540880503147,
     "accept_D1_prose": 2.857142857142857,
     "accept_D8_code": 3.216,
     "accept_D8_prose": 2.852,
     "max_cached_tokens": 0,
-    "uncached_ok": true
+    "uncached_ok": true,
+    "maxkv_v1_config": 566912,
+    "maxkv_vllm_comparable": 857408,
+    "calibration_status": {
+      "old_value": 566912,
+      "new_value": 857408,
+      "vector": "31,14,19",
+      "boots": 2,
+      "config": "vLLM-comparable: --max-running-requests 8 (mamba 50 slots) + --rank-auto-reserve-mib 1500 uniform; measured 2026-07-17 at HEAD 3e76cbbf1",
+      "note": "old pin was the no-MTP vector 31,15,18 (uncalibrated for MTP). boot1 auto [30,17,17] -> 731200 + hint 31,14,19; boot2 pinned -> converged (balanced) 857408. Sanity: Paris ok, 512-tok 88.5 tok/s accept=2.65."
+    }
   },
   "awq_tp3_V2": {
     "cell": "S4 TP=3 uneven, AWQ, V2 max-perf (auto-performance)",
@@ -154,9 +205,9 @@
       "evidence": "per-rank profiled capacity [249488,153615,153736]."
     },
     "notes": [
-      "maxKV 546560 is the STABLE-SERVING max at reserve 3000,2200,2200 (the reserve bump trades some KV \u2014 the raw pool would be ~618k \u2014 for the ~1.6 GB runtime headroom GGUF on-the-fly dequant + multimodal need).",
+      "maxKV 546560 is the STABLE-SERVING max at reserve 3000,2200,2200 (the reserve bump trades some KV — the raw pool would be ~618k — for the ~1.6 GB runtime headroom GGUF on-the-fly dequant + multimodal need).",
       "--skip-server-warmup used because sglang's built-in warmup sends an IMAGE that OOMs; the text-only benchmark never touches the vision path.",
-      "Decode slower than AWQ/FP8 (D1c 65.9, D8c 184.0) \u2014 GGUF on-the-fly dequant bandwidth."
+      "Decode slower than AWQ/FP8 (D1c 65.9, D8c 184.0) — GGUF on-the-fly dequant bandwidth."
     ],
     "prefill20k": 1102.7,
     "decode1k_code": 65.9,
@@ -164,13 +215,23 @@
     "par8_prefill": 1111.5,
     "par8_decode_code": 184.0,
     "par8_decode_prose": 157.0,
-    "maxKV_tokens": 546560,
+    "maxKV_tokens": 818880,
     "accept_D1_code": 3.194888178913738,
     "accept_D1_prose": 2.6595744680851063,
     "accept_D8_code": 3.001,
     "accept_D8_prose": 2.706,
     "max_cached_tokens": 0,
-    "uncached_ok": true
+    "uncached_ok": true,
+    "maxkv_v1_config": 546560,
+    "maxkv_vllm_comparable": 818880,
+    "calibration_status": {
+      "old_value": 546560,
+      "new_value": 818880,
+      "vector": "30,17,17",
+      "boots": 1,
+      "config": "vLLM-comparable: --max-running-requests 8 (mamba 50 slots) + --rank-auto-reserve-mib 1500 uniform; measured 2026-07-17 at HEAD 3e76cbbf1",
+      "note": "boot1 auto vector [30,17,17] converged (balanced) immediately -> 818880 (no divergent hint). --skip-server-warmup; available_gpu_mem 0.58 GB. Sanity: Paris ok, 512-tok 59.0 tok/s accept=2.78."
+    }
   },
   "q6_tp3_V2": {
     "cell": "S4 TP=3 uneven, GGUF Q6, V2 max-perf (PINNED-MLP APPROX; auto-performance INFEASIBLE on GGUF)",
@@ -183,8 +244,8 @@
       "perf_evidence": "AUTO-PERFORMANCE INFEASIBLE ON GGUF: --rank-tp-ratio auto-performance crashes at uneven_perf.py:531 PerfCostModel._load_config -> open(model_path/'config.json') NotADirectoryError (model_path is the .gguf file). Best-achievable V2 = --rank-tp-ratio auto + PINNED --rank-mlp-ratio 5,1,1 (matching AWQ V2 concentration) + --rank-vocab-ratio auto -> 13,6,6 (GGUF-safe: cached-hw-profile only)."
     },
     "notes": [
-      "NOT the spec auto-performance config \u2014 pinned-MLP approximation, no decode-knee guard.",
-      "With pinned MLP 5,1,1 the DCP token-vector optimum flipped (hint 13,25,26; MLP moved OFF ranks 1/2 so they hold more KV). Boot used 29,17,18 -> maxKV 241216 (>= 100k, valid); a 2nd calibration boot to 13,25,26 would raise maxKV to ~538k with ~same perf (not run \u2014 economy).",
+      "NOT the spec auto-performance config — pinned-MLP approximation, no decode-knee guard.",
+      "With pinned MLP 5,1,1 the DCP token-vector optimum flipped (hint 13,25,26; MLP moved OFF ranks 1/2 so they hold more KV). Boot used 29,17,18 -> maxKV 241216 (>= 100k, valid); a 2nd calibration boot to 13,25,26 would raise maxKV to ~538k with ~same perf (not run — economy).",
       "See maxKV/tps fields for the achieved numbers."
     ],
     "prefill20k": 1207.5,
@@ -222,7 +283,7 @@
     "quant": "unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q8_K_XL.gguf",
     "variant": "V2 max-perf",
     "status": "INFEASIBLE",
-    "error": "Same load failure as Q8 V1 \u2014 the model cannot load at all (mixed-dtype fused GDN qkvz), so no TP/DCP/perf config is reachable.",
+    "error": "Same load failure as Q8 V1 — the model cannot load at all (mixed-dtype fused GDN qkvz), so no TP/DCP/perf config is reachable.",
     "notes": [
       "Not booted (would fail identically at weight load, before any V2 config applies). User directed to skip Q8."
     ]
