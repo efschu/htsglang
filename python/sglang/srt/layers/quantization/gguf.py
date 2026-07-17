@@ -235,6 +235,78 @@ def _batched_mmvq_enabled() -> bool:
     return _dequant_supports_out()
 
 
+# ---------------------------------------------------------------------------
+# Shape-aware K-quant dispatch on consumer (sm < 9) devices (task #72, from
+# the t69/t72 microbenches on RTX 3080 at the REAL Qwen3.6-27B TP=2 shard
+# shapes, kernel_bench_3080.txt + t72_decision_bench.py):
+#
+# The batched-MMVQ ncols<=8 kernel amortizes the K-quant superblock decode
+# well only up to M~4. Beyond that, MMQ overtakes -- earliest on "wide-K"
+# shapes (row-parallel down_proj class: few output rows, long dot products,
+# so MMVQ's per-column K-loop cost dominates while MMQ's flat GEMM floor
+# does not move):
+#   Q6_K down TP2-shard (N=5120, K=8704):  M=4 MMVQ 0.153 vs MMQ 0.163 ms;
+#     M=5 0.219 vs 0.179 (MMQ 1.22x); M=6 0.297 vs 0.180; M=8 0.408 vs 0.180.
+#   Q6_K down FULL (N=5120, K=17408):      MMQ wins from M=4 (0.318 vs 0.383).
+#   At M=8 MMQ wins on EVERY measured K-quant shard shape, including
+#     narrow-K: gate TP2-shard 0.185 vs 0.225, down K=5120 0.111 vs 0.137.
+# Q8_0 shapes are NOT affected (their ncols kernel holds near-peak BW through
+# M=6, e.g. lm_head M=8: MMVQ 2.09 vs MMQ 2.23 ms) and the 5090 (sm120) is
+# NOT affected either (MMVQ wins everywhere there, e.g. down FULL M=4:
+# 0.072 vs 0.137 ms), hence the K-quant-only + sm<9 gating.
+#
+# Dispatch-only change: MMVQ and MMQ are both ~5e-3 (relmax) from an fp32
+# reference but differ from each other ~1e-4 (reduction order), so outputs
+# are NOT bit-identical at near-ties -- same class as the batched-MMVQ
+# default (see note above), quality proven via logprob-ID identity instead.
+#
+# SGLANG_GGUF_MMVQ_SAFE (explicit uniform cap) disables this routing;
+# SGLANG_GGUF_SHAPE_DISPATCH=0 is the dedicated kill switch.
+_WIDEK_MMQ_MIN_M = 5  # wide-K shapes: MMQ from M>=5 (measured crossover)
+_WIDEK_MIN_K = 8192  # "wide-K" = K >= 8192 elems (down shards: 8704/17408)
+_KQUANT_MMQ_ALL_MIN_M = 8  # any K-quant shape: MMQ at M>=8 (measured)
+_SHAPE_DISPATCH_ENV = os.environ.get("SGLANG_GGUF_SHAPE_DISPATCH")
+_sm_major_by_dev: dict = {}
+
+
+def _device_sm_major() -> int:
+    dev = torch.cuda.current_device()
+    v = _sm_major_by_dev.get(dev)
+    if v is None:
+        try:
+            v = torch.cuda.get_device_capability(dev)[0]
+        except Exception:
+            v = 0
+        _sm_major_by_dev[dev] = v
+    return v
+
+
+def _kquant_prefers_mmq(m: int, qweight: torch.Tensor, qweight_type: int) -> bool:
+    """Shape-aware MMVQ->MMQ rerouting for K-quants on sm<9 (see note above).
+
+    Only consulted for M <= mmvq_safe (larger M never reaches the MMVQ
+    branch), only in batched-MMVQ mode, and never when the user pinned an
+    explicit uniform cap via SGLANG_GGUF_MMVQ_SAFE.
+    """
+    if qweight_type not in KQUANT_TYPES:
+        return False
+    if _SHAPE_DISPATCH_ENV == "0" or not _is_cuda:
+        return False
+    if os.environ.get("SGLANG_GGUF_MMVQ_SAFE") is not None:
+        return False
+    if not _batched_mmvq_enabled():
+        return False
+    if _device_sm_major() >= 9:
+        return False
+    if m >= _KQUANT_MMQ_ALL_MIN_M:
+        return True
+    if m >= _WIDEK_MMQ_MIN_M:
+        block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+        k = qweight.shape[1] // type_size * block_size
+        return k >= _WIDEK_MIN_K
+    return False
+
+
 def _mmvq_safe_for_device() -> int:
     override = os.environ.get("SGLANG_GGUF_MMVQ_SAFE")
     if override is not None:
@@ -336,6 +408,53 @@ def _ggml_dequantize_ws(
     return ggml_dequantize(qweight, qweight_type, rows, cols, dtype)
 
 
+def _mul_mat_dequant_chunked(
+    x: torch.Tensor, qweight: torch.Tensor, qweight_type: int, rows: int, cols: int
+) -> torch.Tensor:
+    """#70: capture-safe over-cap dequant matmul (x @ dequant(qweight).T).
+
+    Row-chunks the dequant target through the persistent #63 workspace so a
+    CUDA-graph capture never materializes the full dequantized weight (which
+    for the Qwen3.6-27B lm_head shard is 1.19 GiB > the 512 MiB workspace
+    cap, and as a fresh allocation is retained per-graph in the capture's
+    private pool -> capture OOM without --max-running-requests caps).
+
+    Numerics: splitting along OUTPUT rows leaves every output element's
+    K-dot-product intact -- each chunk GEMM computes exactly the elements it
+    owns. (cuBLAS kernel selection may differ from the single big GEMM the
+    eager fallback runs, so this is dispatch-level equivalent, not
+    bit-identical to the eager path; the eager path itself is unchanged.)
+
+    Stream safety mirrors _ggml_dequantize_ws: dequant->GEMM pairs run
+    back-to-back on one stream, so chunk i's GEMM consumes the workspace
+    before chunk i+1's dequant overwrites it. The per-chunk GEMM outputs are
+    small (M x rows total) and land in the graph pool during capture.
+    """
+    key = (
+        qweight.device.index if qweight.device.type == "cuda" else qweight.device,
+        x.dtype,
+    )
+    buf = _DEQUANT_WS.get(key)
+    if buf is None or buf.numel() < cols:
+        # No (or too small a) workspace exists on this rank. Allocating up
+        # to the cap here is bounded and happens at most once; during
+        # capture it lands in the graph pool, which is still strictly
+        # smaller than the full-dequant fresh allocation this path replaces.
+        numel = max(_dequant_ws_cap_bytes() // x.dtype.itemsize, cols)
+        buf = torch.empty(numel, dtype=x.dtype, device=qweight.device)
+        _DEQUANT_WS[key] = buf
+    rows_per_chunk = max(buf.numel() // cols, 1)
+    outs = []
+    for r0 in range(0, rows, rows_per_chunk):
+        rn = min(rows_per_chunk, rows - r0)
+        out = buf.narrow(0, 0, rn * cols).view(rn, cols)
+        wchunk = torch.ops.sgl_kernel.ggml_dequantize.default(
+            qweight.narrow(0, r0, rn), qweight_type, rn, cols, x.dtype, out
+        )
+        outs.append(x @ wchunk.T)
+    return torch.cat(outs, dim=1) if len(outs) > 1 else outs[0]
+
+
 def fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
@@ -365,7 +484,13 @@ def fused_mul_mat_gguf(
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
     # enable MMVQ in contiguous batching with batch_size=1
-    if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
+    if (
+        x.shape[0] <= mmvq_safe
+        and qweight_type in MMVQ_QUANT_TYPES
+        # #72 shape-aware dispatch: reroute wide-K / M>=8 K-quant shapes to
+        # MMQ on sm<9 devices (see _kquant_prefers_mmq).
+        and not _kquant_prefers_mmq(x.shape[0], qweight, qweight_type)
+    ):
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     # MMQ (quantized GEMM) only for small batches (standard + k-quants): it is
     # weight-bandwidth-bound and does not scale with token count, so above
@@ -378,10 +503,25 @@ def fused_mul_mat_gguf(
     elif qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
-        # #63: dequantize into the persistent per-rank workspace (no
-        # per-forward scratch allocation); see _ggml_dequantize_ws.
-        weight = _ggml_dequantize_ws(qweight, qweight_type, *shape, x.dtype)
-        y = x @ weight.T
+        # #70: an over-cap dequant during CUDA-graph capture (draft-extend /
+        # verify at bs>=4 hits the lm_head shard at M=9..16: 1.19 GiB for
+        # Qwen3.6-27B) must not fresh-allocate -- the allocation is retained
+        # in the graph's private pool and OOMs the capture under a tightly
+        # sized KV budget (t69/boot4_oom.log). Chunk it through the
+        # persistent workspace instead; outside capture the fresh-allocation
+        # fallback stays byte-identical (e.g. large logprob prefills).
+        if (
+            _is_cuda
+            and shape[0] * shape[1] * x.dtype.itemsize > _dequant_ws_cap_bytes()
+            and _dequant_supports_out()
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            y = _mul_mat_dequant_chunked(x, qweight, qweight_type, *shape)
+        else:
+            # #63: dequantize into the persistent per-rank workspace (no
+            # per-forward scratch allocation); see _ggml_dequantize_ws.
+            weight = _ggml_dequantize_ws(qweight, qweight_type, *shape, x.dtype)
+            y = x @ weight.T
     else:
         # Raise an error if the quantization type is not supported.
         # Might be useful if llama.cpp adds a new quantization type.
@@ -842,6 +982,13 @@ class GGUFMoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
 
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        # Materialize the per-expert GGUF containers into the stacked
+        # w13/w2 qweights (and, under uneven-TP expert sharding, build the
+        # zero-pad expert + global->local topk remap).
+        if hasattr(layer, "materialize_gguf_weights"):
+            layer.materialize_gguf_weights()
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -851,9 +998,11 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        # fused_moe_gguf's act() supports both (gelu needed for Gemma4 MoE).
+        assert self.moe_runner_config.activation in (
+            "silu",
+            "gelu",
+        ), "Only SiLU/GELU activations are supported."
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

@@ -10,6 +10,11 @@ import numpy as np
 import torch
 
 from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.utils import (
+    tp_partition_offset,
+    tp_partition_size,
+    tp_plan_active,
+)
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.awq import AWQConfig
@@ -492,18 +497,66 @@ class MoeWNA16Method(FusedMoEMethodBase):
                     layer.group_size_div_factor, 1
                 )
 
+            # Uneven TP (--rank-tp-ratio): the checkpoint's qzeros must be
+            # sliced by the SAME shard plan (family "moe", group-aligned
+            # units) that shaped the params — the legacy
+            # view(moe_tp_size, -1)[tp_rank] even-views below cannot express
+            # per-rank sizes like [230, 141, 141]. qweight/scales already go
+            # through the plan-aware standard FusedMoE loader (else branch).
+            _uneven = tp_plan_active(
+                layer.moe_tp_size, getattr(layer, "moe_tp_family", None)
+            )
+
+            def _plan_slice(total: int, dim_units: int) -> tuple:
+                # (start, size) of this rank in a dimension of `total` rows
+                # or cols that maps 1:1 (already /pack or /group scaled) to
+                # the layer's intermediate units.
+                return (
+                    tp_partition_offset(
+                        total,
+                        layer.moe_tp_size,
+                        tp_rank,
+                        dim_units,
+                        getattr(layer, "moe_tp_family", None),
+                    ),
+                    tp_partition_size(
+                        total,
+                        layer.moe_tp_size,
+                        tp_rank,
+                        dim_units,
+                        getattr(layer, "moe_tp_family", None),
+                    ),
+                )
+
             if "w13_qzeros" in weight_name:
-                tensor = loaded_weight.view(
-                    layer.moe_tp_size, -1, loaded_weight.size(1)
-                )[tp_rank]
+                if _uneven:
+                    # dim0 = intermediate // bit8_pack_factor rows of one
+                    # w1/w3 half; unit granularity follows layer.moe_tp_units
+                    # (group-aligned, so row cuts stay pack-aligned).
+                    start, size = _plan_slice(
+                        loaded_weight.size(0), layer.moe_tp_units
+                    )
+                    tensor = loaded_weight.narrow(0, start, size)
+                else:
+                    tensor = loaded_weight.view(
+                        layer.moe_tp_size, -1, loaded_weight.size(1)
+                    )[tp_rank]
                 if shard_id == "w1":
                     param.data[expert_id, : shard_size // 2] = tensor
                 else:
                     param.data[expert_id, shard_size // 2 :] = tensor
             elif "w2_qzeros" in weight_name:
-                param.data[expert_id] = loaded_weight.view(
-                    loaded_weight.size(0), layer.moe_tp_size, -1
-                )[:, tp_rank]
+                if _uneven:
+                    # dim1 = intermediate // group_size cols (the quantized
+                    # input dim of down_proj).
+                    start, size = _plan_slice(
+                        loaded_weight.size(1), layer.moe_tp_units
+                    )
+                    param.data[expert_id] = loaded_weight.narrow(1, start, size)
+                else:
+                    param.data[expert_id] = loaded_weight.view(
+                        loaded_weight.size(0), layer.moe_tp_size, -1
+                    )[:, tp_rank]
             else:
                 weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
 

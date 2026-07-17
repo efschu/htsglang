@@ -1872,6 +1872,9 @@ class ModelRunnerKVCacheMixin:
             family_bytes += sum(
                 p.numel() * p.element_size()
                 for p in module.parameters(recurse=False)
+                # GGUF lazy params (UninitializedParameter) have no shape
+                # until materialize; skip them in this size estimate.
+                if not isinstance(p, torch.nn.parameter.UninitializedParameter)
             )
         if units_total <= 0 or family_bytes <= 0:
             return None
