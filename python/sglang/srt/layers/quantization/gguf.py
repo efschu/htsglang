@@ -37,7 +37,7 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 
 if _is_cuda:
-    from sgl_kernel import moe_align_block_size, moe_sum
+    from sgl_kernel import moe_sum
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -49,7 +49,7 @@ if _is_cuda:
 
     from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
 elif _is_musa:
-    from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -564,6 +564,30 @@ def fused_mul_mat_gguf(
     return y
 
 
+# ggml_moe_get_block_size(int type) -> int takes NO tensor argument and is
+# registered in sgl-kernel exclusively for the CUDA dispatch key, so torch has
+# no tensor from which to infer a device and cannot route the call -> it raises
+# "no dispatchable fallback" NotImplementedError. That aborts the MMQ MoE path
+# (large-M / prefill / needle), while the tensor-carrying MMVQ decode path is
+# unaffected. The kernel body is a pure compile-time lookup: it returns the MMQ
+# tile width MOE_X_Q* for the ggml type, which is 8 on ROCm and 4 on CUDA/others
+# for every supported quant type (see moe.cuh). Mirror that here so the op stays
+# usable WITHOUT a kernel rebuild, while still preferring the real op whenever it
+# is dispatchable (e.g. a future build that registers a CatchAll impl).
+# Supported ggml types: Q4_0=2 Q4_1=3 Q5_0=6 Q5_1=7 Q8_0=8 Q2_K=10 Q3_K=11
+# Q4_K=12 Q5_K=13 Q6_K=14.
+_GGML_MOE_MMQ_TYPES = frozenset({2, 3, 6, 7, 8, 10, 11, 12, 13, 14})
+
+
+def _ggml_moe_get_block_size(qtype: int) -> int:
+    try:
+        return ggml_moe_get_block_size(qtype)
+    except NotImplementedError:
+        if int(qtype) not in _GGML_MOE_MMQ_TYPES:
+            return 0
+        return 8 if _is_hip else 4
+
+
 def fused_moe_gguf(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -591,7 +615,15 @@ def fused_moe_gguf(
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
-        BLOCK_SIZE = ggml_moe_get_block_size(qweight_type)
+        BLOCK_SIZE = _ggml_moe_get_block_size(qweight_type)
+
+        # Use the Python wrapper (allocates the alignment buffers and returns
+        # the three tensors) rather than the raw sgl_kernel op, whose current
+        # signature takes pre-allocated output buffers in-place. Imported
+        # lazily to avoid a circular import at module load.
+        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+            moe_align_block_size,
+        )
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, BLOCK_SIZE, E
