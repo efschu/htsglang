@@ -258,7 +258,19 @@ def fused_moe_kernel_gptq_awq(
             mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
             other=0.0,
         )
-        b = tl.load(b_ptrs)
+        # Mask the weight (B) load along K when K is not a multiple of
+        # BLOCK_SIZE_K (uneven TP => per-rank down_proj K in {224,160,...}).
+        # Without this mask the packed int4/int8 weight load reads out of
+        # bounds on the final partial K-block -> illegal memory access.
+        # Mirrors the non-AWQ fused_moe_kernel (see `b = tl.load(b_ptrs, mask=
+        # offs_k[:, None] < K - k_start, ...)`). The masked rows are multiplied
+        # by the K-masked (zeroed) A rows, so the result is unchanged.
+        if even_Ks:
+            b = tl.load(b_ptrs)
+        else:
+            b = tl.load(
+                b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0
+            )
         if use_int4_w4a16:
             b = (b >> b_shifter) & 0xF
 
