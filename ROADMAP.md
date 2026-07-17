@@ -4,7 +4,39 @@ Planned and in-investigation features for this sglang fork.
 
 ## Tensor parallelism wider than the KV-head count (TP > num_kv_heads)
 
-Status: unimplemented, approach undecided.
+Status: unimplemented; ANALYSIS DONE (2026-07-17, task #62) - approach chosen.
+
+### Analysis outcome (2026-07-17)
+
+Full write-up: `/root/.claude/jobs/1481bb40/tmp/KV_LT_TP_ANALYSE.md`.
+Premise corrections (code-verified):
+- For Qwen3.6-35B-A3B only the kv=2 GLOBAL attention layers (~25% of
+  layers) are blocked; its GDN path (16/32 linear heads) shards fine -
+  the "same limit applies to GDN heads" note above does NOT apply there,
+  and no fp32 SSM-state duplication cost arises.
+- Upstream already replicates kv heads in the EVEN path when
+  tp % kv == 0 (linear.py), so even TP=4 @ kv=2 likely works today;
+  genuinely blocked are TP=3 (3%2!=0) and all UNEVEN splits.
+
+CHOSEN: Approach 2, in the token-sharded form - replicate ALL kv heads
+onto every rank, keep splitting q heads, shard the TOKENS over the
+existing weighted-DCP owner rule and merge with the graph-validated
+LSE all-gather. Consequences: no K/V broadcast (deterministic
+recompute, same as upstream replication), NO KV-cache duplication
+(disjoint token shards - capacity stays the sum), only ~24 MB/rank of
+replicated projection weights. Effort S-M; every needed primitive
+already exists in the fork. The NEXTN draft layer (also kv=2) must be
+replicated the same way.
+
+REJECTED: Approach 1 (head_dim split) - no flashinfer/FA kernel
+support, two collectives inside the softmax per layer per step, and no
+graph capture path.
+
+Open questions before implementation (OQ-1..4): falsify whether stock
+even TP=4 @ kv=2 already boots; confirm whether today's DCP decode is
+already token-sharded (then the solution is comm-neutral); recompute
+determinism of replicated K/V; forcing an even q-split where
+num_qo % num_kv == 0 is required.
 
 ### Goal
 
