@@ -1,0 +1,233 @@
+{
+  "_meta": {
+    "engine": "shvllm (vLLM fork, uneven-TP / rank-gpu-id)",
+    "image": "shvllm-qwen35-gguf:cu129-uneven (id 6ee0897f1157, repo HEAD f78ea433f, pip NCCL 2.30.7)",
+    "model": "Qwen3.6-27B (+ embedded MTP draft), quants: unsloth UD-GGUF Q6/Q8, AWQ-BF16-INT4, original Qwen3.6-27B-FP8",
+    "host": "proxmox (docker via ssh); host NVML order 0=RTX3080(20GB) 1=RTX5090(32GB) 2=RTX3080(20GB); CONTAINER CUDA order is FASTEST_FIRST -> cuda:0=5090",
+    "measured_by": "Phase 3b (M27b) 2026-07-16",
+    "harness": "bench_measure.py --api openai (/v1/completions, usage fields, wall-clock tps); dk_cell/dk_launch/dk_measure/dk_down; KV_PARSE=vllm ('GPU KV cache size: N tokens' boot line)",
+    "metric_defs": {
+      "prefill20k": "P1: single request, 20000 exact unique input_ids (token-id-list prompt), max_tokens=1 -> prompt_tokens/wall (tok/s), AFTER a discarded full-size warmup prefill",
+      "decode1k_code": "D1 CODE: single ~1000-token decode (max_tokens=1000, ignore_eos:true) -> completion_tokens/wall (tok/s)",
+      "decode1k_prose": "D1 PROSE: same, prose prompt",
+      "par8_prefill": "P8: 8 parallel x 6000 exact input_ids, max_tokens=1 -> total prompt_tokens / batch wall (aggregate tok/s)",
+      "par8_decode_code": "D8 CODE: 8 parallel x ~400-token decode (ignore_eos) -> total completion_tokens / wall (aggregate tok/s)",
+      "par8_decode_prose": "D8 PROSE: same, prose prompts",
+      "maxKV_tokens": "vLLM boot line 'GPU KV cache size: N tokens' at the cell's config (per MATRIX_READY: this IS the max-KV number, no bisection)"
+    },
+    "global_caveats": [
+      "fp8 KV everywhere: --kv-cache-dtype fp8 in the base command of every cell (verified in boot config: kv_cache_dtype=fp8).",
+      "MTP/spec ACTIVE on every decode: --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}'. The OpenAI /v1/completions surface does NOT expose spec accept length -> D*/accept = null; decode tok/s include the MTP speedup.",
+      "UNCACHED verified: unique-nonce token-id prompts; usage.prompt_tokens_details.cached_tokens == 0 on every request in every cell (uncached_ok=true, no llama.cpp-style field-semantics caveat).",
+      "tok/s are client wall-clock based (vLLM reports no server-side prefill/decode timings on this surface); one warmed battery per boot (no median-of-3).",
+      "3080 = SM86 Ampere: fp8 gemm emulated (marlin/W8A16 path) on the 3080 ranks of tp3auto/tp4 fp8 cells.",
+      "HARNESS/WRAPPER FIXES applied (M27b, all documented in-file): (1) shvllm_run.sh MODELPATH pointed at host-only path -> switched to VM-side models-cache (same class as M27a llamacpp F3; tokenizer for exact-length prefill loads on the VM). (2) bench_measure.py openai adapter now sends ignore_eos:true (a D1_prose stopped at comp=4 -> meaningless tps; vLLM sampling extra, mirrors M27a llamacpp fix). (3) bench_measure.py now issues a discarded full-size WARMUP-PREFILL before P1: the first request after boot pays a one-time lazy-compile (~60-90 s) and vLLM has no native prefill timing, so P1 was 4-5x too low (222 vs 1219 tok/s validated on fp8_tp3auto). (4) shvllm_run.sh tp4 used HOST-NVML indices for --rank-gpu-id; the fork resolves them in CONTAINER CUDA FASTEST_FIRST order (cuda:0=5090) -> old mapping co-located 2x14500 MiB on a 20480-MiB 3080 ('Physical impossibility' hard error, by design). Fixed to 0,0,1,2 (matches htsglang_dk_run.sh). (5) shvllm_run.sh made TOKVEC optional for tp3auto so the fork's 2-boot self-calibration (boot1 auto -> hint -> boot2 pinned) is usable.",
+      "MPS LESSON (critical): the documented check 'ls /tmp/nvidia-mps/' is a FALSE POSITIVE - stale sockets (Jul 10) survive daemon death. The daemon was NOT running; without it, co-located tp4 ranks only time-slice. Detected via 'echo get_default_active_thread_percentage | nvidia-cuda-mps-control' (-> 'Cannot find MPS control daemon process'). Restarted with CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps nvidia-cuda-mps-control -d and VERIFIED live: nvidia-cuda-mps-server pid spawned, 5090 showed MPS server + BOTH rank processes. A first fp8_tp4 battery run without live MPS was DISCARDED. All tp4 numbers below are with verified-live MPS. Check liveness via control-daemon response, never via ls.",
+      "Thermal gate (cooldown.sh, <=80C) fired before EVERY boot (12 boots, temps 44-74C, all GO). Teardown to 0 MiB between cells (tp4 cells: 138 MiB residual = MPS server's own contexts, cleared when MPS was stopped at sign-off)."
+    ]
+  },
+
+  "q6_tp2": {
+    "cell": "S2 TP=2, GGUF Q6 (UD-Q6_K_XL), 2x RTX3080",
+    "quant": "unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q6_K_XL.gguf (26.0 GB) via GGUF plugin",
+    "prefill20k": 1128.1,
+    "decode1k_code": 44.6,
+    "decode1k_prose": 36.3,
+    "par8_prefill": 1092.5,
+    "par8_decode_code": 70.7,
+    "par8_decode_prose": 65.0,
+    "maxKV_tokens": 25600,
+    "startup_args": {
+      "docker_run": "docker run -d --name shvbench --gpus all --ipc=host --shm-size=16gb --security-opt apparmor=unconfined -v <models-cache>:/models -v /tmp/nvidia-mps:/tmp/nvidia-mps -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e CUDA_VISIBLE_DEVICES=0,2 -p 8321:8000 shvllm-qwen35-gguf:cu129-uneven",
+      "server": "--model /models/unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q6_K_XL.gguf --tokenizer /models/unsloth/Qwen3.6-27B-MTP-GGUF --served-model-name Qwen3.6-27B --dtype bfloat16 --max-model-len -1 --kv-cache-dtype fp8 --trust-remote-code --enable-prefix-caching --enable-chunked-prefill --max-num-seqs 8 --max-num-batched-tokens 4096 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --mamba-cache-mode align --tensor-parallel-size 2 --gpu-memory-utilization 0.88 --port 8000",
+      "env": "DROP_CACHES=1 before boot (multi-GB GGUF load)"
+    },
+    "notes": [
+      "maxKV 25,600 is memory-bound and real: 26 GB Q6 weights across 2x20GB at GMU 0.88 leave ~1.2 GB/rank for KV. Q8 on TP=2 excluded by plan (does not fit at all).",
+      "D8 aggregate only ~1.6x D1: KV pool (25,600 tok) throttles 8-way batching."
+    ]
+  },
+
+  "awq_tp2": {
+    "cell": "S2 TP=2, AWQ-BF16-INT4 (compressed-tensors), 2x RTX3080",
+    "quant": "Qwen3.6-27B-AWQ-BF16-INT4 (~14 GB INT4)",
+    "prefill20k": 1153.6,
+    "decode1k_code": 75.5,
+    "decode1k_prose": 62.4,
+    "par8_prefill": 1121.9,
+    "par8_decode_code": 195.0,
+    "par8_decode_prose": 187.8,
+    "maxKV_tokens": 94400,
+    "startup_args": {
+      "docker_run": "docker run -d --name shvbench --gpus all --ipc=host --shm-size=16gb --security-opt apparmor=unconfined -v <models-cache>:/models -v /tmp/nvidia-mps:/tmp/nvidia-mps -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e CUDA_VISIBLE_DEVICES=0,2 -p 8321:8000 shvllm-qwen35-gguf:cu129-uneven",
+      "server": "--model /models/Qwen3.6-27B-AWQ-BF16-INT4 --quantization compressed-tensors --served-model-name Qwen3.6-27B --dtype bfloat16 --max-model-len -1 --kv-cache-dtype fp8 --trust-remote-code --enable-prefix-caching --enable-chunked-prefill --max-num-seqs 8 --max-num-batched-tokens 4096 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --mamba-cache-mode align --tensor-parallel-size 2 --gpu-memory-utilization 0.88 --port 8000"
+    },
+    "notes": [
+      "3.7x the KV pool of q6_tp2 (lighter INT4 weights) -> real 8-way decode scaling (2.6x D1)."
+    ]
+  },
+
+  "q6_tp3auto": {
+    "cell": "S4 TP=3 uneven auto (5090+2x3080), GGUF Q6, weighted DCP, calibrated token vector",
+    "quant": "Qwen3.6-27B-UD-Q6_K_XL.gguf via GGUF plugin",
+    "prefill20k": 1239.8,
+    "decode1k_code": 61.7,
+    "decode1k_prose": 46.2,
+    "par8_prefill": 1215.2,
+    "par8_decode_code": 180.3,
+    "par8_decode_prose": 155.3,
+    "maxKV_tokens": 1139318,
+    "startup_args": {
+      "docker_run": "docker run -d --name shvbench --gpus all --ipc=host --shm-size=16gb --security-opt apparmor=unconfined -v <models-cache>:/models -v /tmp/nvidia-mps:/tmp/nvidia-mps -e VLLM_UNEVEN_TOKEN_VECTOR=31,16,17 -p 8321:8000 shvllm-qwen35-gguf:cu129-uneven",
+      "server": "--model /models/unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q6_K_XL.gguf --tokenizer /models/unsloth/Qwen3.6-27B-MTP-GGUF --served-model-name Qwen3.6-27B --dtype bfloat16 --max-model-len -1 --kv-cache-dtype fp8 --trust-remote-code --enable-prefix-caching --enable-chunked-prefill --max-num-seqs 8 --max-num-batched-tokens 4096 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --mamba-cache-mode align --tensor-parallel-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto --rank-auto-reserve-mib 1500 --port 8000",
+      "calibration": "2-boot per plan G8: boot1 WITHOUT the env auto-derived vector [18,7,7] (KV=1,172,446) and logged the self-calibration hint 'per-worker KV block capacities [407, 540, 549] are imbalanced ... Restart with VLLM_UNEVEN_TOKEN_VECTOR=31,16,17'; boot2 (this row) pinned 31,16,17.",
+      "env": "DROP_CACHES=1 before boot"
+    },
+    "notes": [
+      "ANOMALY (benign, documented): calibrated boot2 KV (1,139,318) is ~3% LOWER than boot1's auto-vector KV (1,172,446) - the hint vector's larger sum (64 vs 32 units) coarsens virtual-block granularity; per-rank balance improved as intended (blocks were [407,540,549] pinned to 407). tok/s metrics are from the clean calibrated boot.",
+      "Derived budgets [31061,18980,18980] MiB from NVML totals (reserve 1500/GPU); rank0=5090 owns 31061/69021 of every sharded dimension; dcp=3 enabled automatically."
+    ]
+  },
+
+  "awq_tp3auto": {
+    "cell": "S4 TP=3 uneven auto (5090+2x3080), AWQ-BF16-INT4, weighted DCP, auto token vector",
+    "quant": "Qwen3.6-27B-AWQ-BF16-INT4 (compressed-tensors)",
+    "prefill20k": 1228.3,
+    "decode1k_code": 83.7,
+    "decode1k_prose": 62.7,
+    "par8_prefill": 1211.6,
+    "par8_decode_code": 288.1,
+    "par8_decode_prose": 266.2,
+    "maxKV_tokens": 1146573,
+    "startup_args": {
+      "docker_run": "docker run -d --name shvbench --gpus all --ipc=host --shm-size=16gb --security-opt apparmor=unconfined -v <models-cache>:/models -v /tmp/nvidia-mps:/tmp/nvidia-mps -p 8321:8000 shvllm-qwen35-gguf:cu129-uneven",
+      "server": "--model /models/Qwen3.6-27B-AWQ-BF16-INT4 --quantization compressed-tensors --served-model-name Qwen3.6-27B --dtype bfloat16 --max-model-len -1 --kv-cache-dtype fp8 --trust-remote-code --enable-prefix-caching --enable-chunked-prefill --max-num-seqs 8 --max-num-batched-tokens 4096 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --mamba-cache-mode align --tensor-parallel-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto --rank-auto-reserve-mib 1500 --port 8000",
+      "calibration": "1 boot: auto free-memory token vector; NO imbalance hint fired (per-rank KV blocks within 15%) -> auto vector already balanced, no VLLM_UNEVEN_TOKEN_VECTOR needed."
+    },
+    "notes": [
+      "Best single-stream decode of all measured shvllm TP=3 cells (83.7 code)."
+    ]
+  },
+
+  "fp8_tp3auto": {
+    "cell": "S4 TP=3 uneven auto (5090+2x3080), ORIGINAL Qwen3.6-27B-FP8, weighted DCP, auto token vector",
+    "quant": "Qwen3.6-27B-FP8 (layers-*.safetensors + mtp.safetensors layout - plan gap G7 VERIFIED: loads in shvllm, AEON fallback NOT needed)",
+    "prefill20k": 1218.7,
+    "decode1k_code": 73.9,
+    "decode1k_prose": 60.7,
+    "par8_prefill": 1223.5,
+    "par8_decode_code": 287.9,
+    "par8_decode_prose": 273.7,
+    "maxKV_tokens": 1046126,
+    "startup_args": {
+      "docker_run": "docker run -d --name shvbench --gpus all --ipc=host --shm-size=16gb --security-opt apparmor=unconfined -v <models-cache>:/models -v /tmp/nvidia-mps:/tmp/nvidia-mps -p 8321:8000 shvllm-qwen35-gguf:cu129-uneven",
+      "server": "--model /models/Qwen3.6-27B-FP8 --served-model-name Qwen3.6-27B --dtype bfloat16 --max-model-len -1 --kv-cache-dtype fp8 --trust-remote-code --enable-prefix-caching --enable-chunked-prefill --max-num-seqs 8 --max-num-batched-tokens 4096 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --mamba-cache-mode align --tensor-parallel-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto --rank-auto-reserve-mib 1500 --port 8000",
+      "calibration": "1 boot: auto token vector, NO imbalance hint fired (balanced). Reference: prior AEON smoke @ same config gave KV=1,095,907; original FP8 gives 1,046,126 (slightly larger checkpoint footprint)."
+    },
+    "notes": [
+      "fp8 gemm emulated on the two Ampere 3080 ranks (SM86).",
+      "This cell validated harness fixes 2+3: pre-fix P1 read 221.9-226.4 (cold compile absorbed); post-warmup 1218.7."
+    ]
+  },
+
+  "q8_tp3auto": {
+    "cell": "S4 TP=3 uneven auto, GGUF Q8 (UD-Q8_K_XL)",
+    "quant": "Qwen3.6-27B-UD-Q8_K_XL.gguf via GGUF plugin",
+    "prefill20k": null,
+    "decode1k_code": null,
+    "decode1k_prose": null,
+    "par8_prefill": null,
+    "par8_decode_code": null,
+    "par8_decode_prose": null,
+    "maxKV_tokens": null,
+    "status": "INFEASIBLE",
+    "startup_args": {
+      "attempted": "same base as q6_tp3auto with --model .../Qwen3.6-27B-UD-Q8_K_XL.gguf --tokenizer /models/unsloth/Qwen3.6-27B-MTP-GGUF; --tensor-parallel-size 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto --rank-auto-reserve-mib 1500"
+    },
+    "notes": [
+      "EXACT ERROR (worker load_model, all ranks): ValueError: Detected some but not all shards of language_model.model.layers.0.linear_attn.in_proj_qkvz are quantized. All shards of fused layers to have the same precision. (vllm_gguf_plugin/quantization/utils.py:34 is_layer_skipped_gguf, via MergedColumnParallelLinear for the GDN qkvz projection).",
+      "Root cause: unsloth UD-Q8_K_XL stores the fused in_proj_qkvz shards in MIXED precision (UD 'dynamic' quant keeps some sub-tensors unquantized/higher-precision); the image's GGUF-plugin fused-layer check rejects that. NOT an uneven-TP artifact: the even-split TP=4 cell fails with the IDENTICAL error at the same layer.",
+      "Q6 (UD-Q6_K_XL) loads fine in the same plugin -> Q8_K_XL-specific tensor layout. Fix would require patching vllm_gguf_plugin inside the image (out of measurement scope). 1 boot attempt (+1 for tp4), no fix attempts beyond diagnosis per discipline."
+    ]
+  },
+
+  "fp8_tp4": {
+    "cell": "S3 TP=4 co-located (2 ranks on 5090 + 1 per 3080), ORIGINAL FP8, 14500 MiB/rank, MPS live",
+    "quant": "Qwen3.6-27B-FP8",
+    "prefill20k": 1411.9,
+    "decode1k_code": 107.3,
+    "decode1k_prose": 82.2,
+    "par8_prefill": 1442.9,
+    "par8_decode_code": 323.4,
+    "par8_decode_prose": 308.0,
+    "maxKV_tokens": 429096,
+    "startup_args": {
+      "docker_run": "docker run -d --name shvbench --gpus all --ipc=host --shm-size=16gb --security-opt apparmor=unconfined -v <models-cache>:/models -v /tmp/nvidia-mps:/tmp/nvidia-mps -p 8321:8000 shvllm-qwen35-gguf:cu129-uneven",
+      "server": "--model /models/Qwen3.6-27B-FP8 --served-model-name Qwen3.6-27B --dtype bfloat16 --max-model-len -1 --kv-cache-dtype fp8 --trust-remote-code --enable-prefix-caching --enable-chunked-prefill --max-num-seqs 8 --max-num-batched-tokens 4096 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --mamba-cache-mode align --tensor-parallel-size 4 --rank-gpu-id 0,0,1,2 --rank-gpu-memory-mib 14500 --port 8000",
+      "mps": "nvidia-cuda-mps-control daemon VERIFIED live on host (server pid spawned; 5090 carried MPS server + both rank procs 14272+14304 MiB). rank-gpu-id indices are CONTAINER CUDA FASTEST_FIRST order: 0=5090."
+    },
+    "notes": [
+      "MATRIX_READY gap G-A resolved: shvllm tp4 @ 14500 MiB/rank FITS (unlike htsglang, which needed 13500) - vLLM's MiB budget covers total process usage incl. graphs.",
+      "A full first battery accidentally ran with the MPS daemon DEAD (stale sockets fooled the ls-check): KV=430,560, P1=796.6 - DISCARDED, run repeated with verified-live MPS.",
+      "Fastest shvllm cell overall (P1 1411.9, D1 107.3). ANOMALY (open, deferred to main thread): fp8 beats AWQ-INT4 at tp4 in single-stream decode despite larger weights - suspected INT4 marlin dequant overhead vs fp8 path; NOT investigated here per instruction."
+    ]
+  },
+
+  "awq_tp4": {
+    "cell": "S3 TP=4 co-located, AWQ-BF16-INT4, 14500 MiB/rank, MPS live",
+    "quant": "Qwen3.6-27B-AWQ-BF16-INT4 (compressed-tensors)",
+    "prefill20k": 1417.5,
+    "decode1k_code": 103.2,
+    "decode1k_prose": 72.8,
+    "par8_prefill": 1443.7,
+    "par8_decode_code": 306.9,
+    "par8_decode_prose": 296.9,
+    "maxKV_tokens": 514036,
+    "startup_args": {
+      "docker_run": "docker run -d --name shvbench --gpus all --ipc=host --shm-size=16gb --security-opt apparmor=unconfined -v <models-cache>:/models -v /tmp/nvidia-mps:/tmp/nvidia-mps -p 8321:8000 shvllm-qwen35-gguf:cu129-uneven",
+      "server": "--model /models/Qwen3.6-27B-AWQ-BF16-INT4 --quantization compressed-tensors --served-model-name Qwen3.6-27B --dtype bfloat16 --max-model-len -1 --kv-cache-dtype fp8 --trust-remote-code --enable-prefix-caching --enable-chunked-prefill --max-num-seqs 8 --max-num-batched-tokens 4096 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --mamba-cache-mode align --tensor-parallel-size 4 --rank-gpu-id 0,0,1,2 --rank-gpu-memory-mib 14500 --port 8000",
+      "mps": "verified live (see fp8_tp4)"
+    },
+    "notes": [
+      "Largest tp4 KV pool (514,036) thanks to smallest weights."
+    ]
+  },
+
+  "q6_tp4": {
+    "cell": "S3 TP=4 co-located, GGUF Q6, 14500 MiB/rank, MPS live",
+    "quant": "Qwen3.6-27B-UD-Q6_K_XL.gguf via GGUF plugin",
+    "prefill20k": 1384.0,
+    "decode1k_code": 62.6,
+    "decode1k_prose": 52.2,
+    "par8_prefill": 1424.4,
+    "par8_decode_code": 220.7,
+    "par8_decode_prose": 175.0,
+    "maxKV_tokens": 443740,
+    "startup_args": {
+      "docker_run": "docker run -d --name shvbench --gpus all --ipc=host --shm-size=16gb --security-opt apparmor=unconfined -v <models-cache>:/models -v /tmp/nvidia-mps:/tmp/nvidia-mps -p 8321:8000 shvllm-qwen35-gguf:cu129-uneven",
+      "server": "--model /models/unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q6_K_XL.gguf --tokenizer /models/unsloth/Qwen3.6-27B-MTP-GGUF --served-model-name Qwen3.6-27B --dtype bfloat16 --max-model-len -1 --kv-cache-dtype fp8 --trust-remote-code --enable-prefix-caching --enable-chunked-prefill --max-num-seqs 8 --max-num-batched-tokens 4096 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3}' --mamba-cache-mode align --tensor-parallel-size 4 --rank-gpu-id 0,0,1,2 --rank-gpu-memory-mib 14500 --port 8000",
+      "env": "DROP_CACHES=1 before boot; MPS verified live"
+    },
+    "notes": []
+  },
+
+  "q8_tp4": {
+    "cell": "S3 TP=4 co-located, GGUF Q8 (UD-Q8_K_XL), 14500 MiB/rank",
+    "quant": "Qwen3.6-27B-UD-Q8_K_XL.gguf via GGUF plugin",
+    "prefill20k": null,
+    "decode1k_code": null,
+    "decode1k_prose": null,
+    "par8_prefill": null,
+    "par8_decode_code": null,
+    "par8_decode_prose": null,
+    "maxKV_tokens": null,
+    "status": "INFEASIBLE",
+    "startup_args": {
+      "attempted": "same base as q6_tp4 with --model .../Qwen3.6-27B-UD-Q8_K_XL.gguf; --tensor-parallel-size 4 --rank-gpu-id 0,0,1,2 --rank-gpu-memory-mib 14500"
+    },
+    "notes": [
+      "IDENTICAL failure to q8_tp3auto (even split changes nothing): ValueError: Detected some but not all shards of language_model.model.layers.0.linear_attn.in_proj_qkvz are quantized. All shards of fused layers to have the same precision. (vllm_gguf_plugin is_layer_skipped_gguf, worker load_model, all 4 ranks).",
+      "Confirms root cause is the UD-Q8_K_XL mixed-precision fused qkvz layout vs the image's GGUF plugin, independent of the TP split mode. shvllm therefore has NO Q8 cells; llama.cpp/htsglang carry the Q8 comparison."
+    ]
+  }
+}

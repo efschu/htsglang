@@ -1,0 +1,230 @@
+{
+  "_meta": {
+    "engine": "htsglang (sglang fork, GGUF plugin + uneven-TP capable) \u2014 TP=3 UNEVEN across 3 heterogeneous GPUs, weighted uneven-DCP token-axis KV sharding",
+    "repo": "/spinning/htsglang-gguf at HEAD 3e76cbbf1 (UNMODIFIED, local VM venv /spinning/htsglang-gpu/.venv, torch 2.11+cu130, NCCL 2.28.9)",
+    "model": "Qwen3.6-27B (hybrid GDN/linear-attn + embedded MTP/NEXTN draft blk.64). Quants: original Qwen3.6-27B-FP8; AWQ-BF16-INT4 (compressed-tensors); unsloth UD-GGUF Q6_K_XL (+mmproj-BF16 vision tower). Q8_K_XL INFEASIBLE (see below).",
+    "host": "VM local (NOT docker). HARDWARE (5090 re-installed, verified this phase): NVML/PCI idx 0=RTX3080(20480MiB,05:00.0), 1=RTX5090(32607MiB,0A:00.0), 2=RTX3080(20480MiB,0B:00.0). Fork resolves physical GPUs via NVML at runtime. Note: sglang launched WITHOUT CUDA_DEVICE_ORDER=PCI_BUS_ID, so CUDA FASTEST_FIRST places the 5090 at cuda:0 => rank0=5090, rank1/2=3080 (confirmed by derived budgets [29607,18280,18280]).",
+    "measured_by": "Phase 3c PART2 (M27d) 2026-07-17, 05:07-05:44 CEST. cuInit driver warmup on all 3 GPUs before first boot (5090 re-install). Thermal gate <=80C before every boot.",
+    "harness": "bench_measure.py --api sglang (/generate meta_info; ignore_eos + warmup-prefill + warmup-decode); bench_run.sh via htsglang_local_run.sh; KV_PARSE=sglang (max_total_num_tokens boot line).",
+    "metric_defs": {
+      "prefill20k": "P1: single request, 20000 exact unique input_ids, max_new_tokens=1, tok/s (after discarded warmup prefill)",
+      "decode1k_code": "D1 CODE: single ~1000-tok decode (ignore_eos), tok/s",
+      "decode1k_prose": "D1 PROSE: same, prose prompt",
+      "par8_prefill": "P8: 8 parallel x 6000 exact input_ids, total prompt / batch wall (aggregate tok/s)",
+      "par8_decode_code": "D8 CODE: 8 parallel x ~400-tok decode (ignore_eos), aggregate tok/s",
+      "par8_decode_prose": "D8 PROSE: same, prose",
+      "maxKV_tokens": "sglang boot line max_total_num_tokens at the cell's config",
+      "accept_*": "MTP/NEXTN spec_accept_length (sglang-native), per decode group"
+    },
+    "variants": {
+      "V1": "max-KV: --rank-tp-ratio auto (VRAM-weighted uneven split) + SGLANG_UNEVEN_DCP=1 + _WEIGHTED=1 + calibrated SGLANG_UNEVEN_TOKEN_VECTOR + SGLANG_MAMBA_SSM_DTYPE=bfloat16 + calibrated --rank-auto-reserve-mib. No vocab-ratio (plain max-KV).",
+      "V2": "max-perf @ >=100k KV: --rank-tp-ratio auto-performance --rank-perf-tune both --rank-perf-loose-ctx-percent 0 + --rank-vocab-ratio auto (13,6,6) + DCP/WEIGHTED + bf16 mamba. Single boot applies the full perf stack AND emits the floor-check/PIN-HINT/VOCAB-HINT evidence."
+    },
+    "global_caveats": [
+      "fp8 KV everywhere (--kv-cache-dtype fp8_e4m3). MTP/NEXTN spec ACTIVE every decode (--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4).",
+      "CUDA graphs ON: decode + target-verify + draft graphs captured. GGUF Q6 is multimodal (mmproj vision tower auto-loaded) => sglang auto-disables the prefill CUDA graph ('Breakable CUDA graph is incompatible with multimodal model'); FP8/AWQ prefill graph also 'disabled' backend per boot config (chunked-prefill path). Decode graphs always on.",
+      "Concurrency NOT mamba-capped here (unlike the 2x3080 TP=2 cells): auto-mamba sized 100 slots (~admits ~20 reqs) with the 5090 in the mix, so par8 = REAL 8-way batching (D8 >> D1).",
+      "UNCACHED verified: unique-nonce token-id prompts; max_cached_tokens=0 every cell.",
+      "V2 auto-performance is INFEASIBLE on GGUF at this HEAD: uneven_perf.py:531 PerfCostModel._load_config does open(model_path/'config.json'); for GGUF model_path is the .gguf FILE => NotADirectoryError. So GGUF V2 uses a PINNED-MLP approximation (--rank-tp-ratio auto + explicit --rank-mlp-ratio + --rank-vocab-ratio auto, which IS GGUF-safe: cached-hw-profile only). FP8/AWQ V2 use the real auto-performance optimizer.",
+      "Q6/Q8 GGUF multimodal warmup OOM: sglang's built-in server warmup sends an IMAGE request; at the DCP-maximized KV pool (0.22 GB free) the vision path OOMs even though text serving is fine. Fix (text-only benchmark): --skip-server-warmup + reserve bumped to leave ~1.6 GB headroom. bench_measure sends only text/input_ids (no images), so the vision path is never exercised in measurement.",
+      "Reserve calibration: FP8 V1 & all reserve-bumped GGUF cells use --rank-auto-reserve-mib 3000,2200,2200 (avoids the graph-capture / GGUF-dequant OOM that generic R=1500 hits; F2 lesson). AWQ V1 fits at R=1500."
+    ]
+  },
+  "fp8_tp3_V1": {
+    "cell": "S4 TP=3 uneven, FP8 (original Qwen3.6-27B-FP8), V1 max-KV",
+    "quant": "Qwen3.6-27B-FP8",
+    "variant": "V1 max-KV",
+    "startup_args": {
+      "wrapper": "TOKVEC=33,13,18 RESERVE=3000,2200,2200 CONFIG=htsglang_fp8_tp3_V1 bash htsglang_local_run.sh fp8 tp3v1",
+      "env": "SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 SGLANG_UNEVEN_TOKEN_VECTOR=33,13,18 SGLANG_MAMBA_SSM_DTYPE=bfloat16",
+      "server": "sglang.launch_server --model-path .../Qwen3.6-27B-FP8 --tp 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto --rank-auto-reserve-mib 3000,2200,2200 --max-running-requests 16 --kv-cache-dtype fp8_e4m3 --context-length 32768 --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4",
+      "evidence": "Uneven DCP token vector converged (balanced): [33,13,18], per-rank profiled capacity [281939,113654,149328], available_gpu_mem 1.60 GB. Derived budgets [29607,18280,18280] (rank0=5090)."
+    },
+    "notes": [
+      "Reproduced the smoke calibration exactly (maxKV 530944) with the 5090 back at NVML idx 1.",
+      "Real 8-way batching: D8 354.9 vs D1 98.4."
+    ],
+    "prefill20k": 1123.7,
+    "decode1k_code": 98.4,
+    "decode1k_prose": 80.8,
+    "par8_prefill": 1125.7,
+    "par8_decode_code": 354.9,
+    "par8_decode_prose": 268.9,
+    "maxKV_tokens": 530944,
+    "accept_D1_code": 3.278688524590164,
+    "accept_D1_prose": 2.6881720430107525,
+    "accept_D8_code": 3.208,
+    "accept_D8_prose": 2.61,
+    "max_cached_tokens": 0,
+    "uncached_ok": true
+  },
+  "fp8_tp3_V2": {
+    "cell": "S4 TP=3 uneven, FP8, V2 max-perf (auto-performance)",
+    "quant": "Qwen3.6-27B-FP8",
+    "variant": "V2 max-perf",
+    "startup_args": {
+      "wrapper": "P=0 EXTRA_FLAGS='--rank-vocab-ratio auto --rank-auto-reserve-mib 3000,2200,2200 --max-running-requests 16' CONFIG=htsglang_fp8_tp3_V2 bash htsglang_local_run.sh fp8 tp3v2probe",
+      "env": "SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 SGLANG_MAMBA_SSM_DTYPE=bfloat16",
+      "server": "... --rank-tp-ratio auto-performance --rank-perf-tune both --rank-perf-loose-ctx-percent 0 --rank-vocab-ratio auto --rank-auto-reserve-mib 3000,2200,2200 --max-running-requests 16 ...",
+      "perf_evidence": "CHOSEN MLP vector 4,1,1 (materialized units [91,23,22]); --rank-vocab-ratio auto -> 13,6,6; VRAM-auto reference predicted ctx ~522533; floor check: predicted ctx of chosen vector 522533 >= floor 522533 (loose-ctx X=0) -- OK; predicted per-rank capacity [200928,137955,183649]. First V2 attempt (missing bf16 mamba) crashed rank0 (fp32 SSM doubled per-req 32->64 MiB); bf16 mamba fixed it."
+    },
+    "notes": [
+      "maxKV 299968 (>= 100k floor met) \u2014 lower than V1 530944, the MLP-concentration tradeoff.",
+      "Prefill +7% (P1 1202.7 vs 1123.7; P8 1207.8 vs 1125.7) but single-stream decode DROPPED (D1c 84.4 vs 98.4, D1p 61.3 vs 80.8) \u2014 decode-knee cost despite the guard rejecting 5/6/10,1,1; par8 ~flat (D8c 343.2 vs 354.9)."
+    ],
+    "prefill20k": 1202.7,
+    "decode1k_code": 84.4,
+    "decode1k_prose": 61.3,
+    "par8_prefill": 1207.8,
+    "par8_decode_code": 343.2,
+    "par8_decode_prose": 260.2,
+    "maxKV_tokens": 299968,
+    "accept_D1_code": 3.115264797507788,
+    "accept_D1_prose": 2.2522522522522523,
+    "accept_D8_code": 3.362,
+    "accept_D8_prose": 2.648,
+    "max_cached_tokens": 0,
+    "uncached_ok": true
+  },
+  "awq_tp3_V1": {
+    "cell": "S4 TP=3 uneven, AWQ-BF16-INT4 (compressed-tensors), V1 max-KV",
+    "quant": "Qwen3.6-27B-AWQ-BF16-INT4",
+    "variant": "V1 max-KV",
+    "startup_args": {
+      "wrapper": "CONFIG=htsglang_awq_tp3_V1 bash htsglang_local_run.sh awq tp3v1 (baked TOKVEC=31,15,18 R=1500)",
+      "env": "SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 SGLANG_UNEVEN_TOKEN_VECTOR=31,15,18 SGLANG_MAMBA_SSM_DTYPE=bfloat16",
+      "server": "... --quantization compressed-tensors --tp 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto --rank-auto-reserve-mib 1500 --max-running-requests 16 ...",
+      "evidence": "maxKV 566912, available_gpu_mem 2.94 GB. Fits at R=1500 (no reserve bump needed)."
+    },
+    "notes": [
+      "maxKV 566912 (MTP-reduced vs the historical no-MTP 886080-class).",
+      "Fastest single-stream decode of the non-perf cells (D1c 103.2)."
+    ],
+    "prefill20k": 1123.9,
+    "decode1k_code": 103.2,
+    "decode1k_prose": 93.1,
+    "par8_prefill": 1135.2,
+    "par8_decode_code": 346.0,
+    "par8_decode_prose": 299.2,
+    "maxKV_tokens": 566912,
+    "accept_D1_code": 3.1446540880503147,
+    "accept_D1_prose": 2.857142857142857,
+    "accept_D8_code": 3.216,
+    "accept_D8_prose": 2.852,
+    "max_cached_tokens": 0,
+    "uncached_ok": true
+  },
+  "awq_tp3_V2": {
+    "cell": "S4 TP=3 uneven, AWQ, V2 max-perf (auto-performance)",
+    "quant": "Qwen3.6-27B-AWQ-BF16-INT4",
+    "variant": "V2 max-perf",
+    "startup_args": {
+      "wrapper": "P=0 EXTRA_FLAGS='--rank-vocab-ratio auto --rank-auto-reserve-mib 3000,2200,2200 --max-running-requests 16' CONFIG=htsglang_awq_tp3_V2 bash htsglang_local_run.sh awq tp3v2probe",
+      "env": "SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 SGLANG_MAMBA_SSM_DTYPE=bfloat16",
+      "server": "... --rank-tp-ratio auto-performance --rank-perf-tune both --rank-perf-loose-ctx-percent 0 --rank-vocab-ratio auto --rank-auto-reserve-mib 3000,2200,2200 --max-running-requests 16 ...",
+      "perf_evidence": "CHOSEN MLP vector 5,1,1 (materialized units [388,78,78]); --rank-vocab-ratio auto -> 13,6,6; predicted ctx ~595779; floor check 595779 >= 595779 (100% of VRAM-auto) -- OK; predicted per-rank capacity [235938,158388,201452]."
+    },
+    "notes": [
+      "maxKV 441536 (>= 100k floor met; V1 566912, -22%).",
+      "GENUINE STRICT WIN unlike FP8 V2: prefill +11% (P1 1247.2, P8 1261.6) AND single-stream decode +12% (D1c 115.7 vs 103.2). par8 decode ~flat/slightly up (D8c 345.3, D8p 305.2 vs 299.2). AWQ has more MLP units (544) so the 5090 absorbs the concentration without a decode-knee penalty."
+    ],
+    "prefill20k": 1247.2,
+    "decode1k_code": 115.7,
+    "decode1k_prose": 94.8,
+    "par8_prefill": 1261.6,
+    "par8_decode_code": 345.3,
+    "par8_decode_prose": 305.2,
+    "maxKV_tokens": 441536,
+    "accept_D1_code": 3.401360544217687,
+    "accept_D1_prose": 2.793296089385475,
+    "accept_D8_code": 3.178,
+    "accept_D8_prose": 2.931,
+    "max_cached_tokens": 0,
+    "uncached_ok": true
+  },
+  "q6_tp3_V1": {
+    "cell": "S4 TP=3 uneven, GGUF Q6 (UD-Q6_K_XL + mmproj vision tower), V1 max-KV",
+    "quant": "unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q6_K_XL.gguf",
+    "variant": "V1 max-KV",
+    "startup_args": {
+      "wrapper": "TOKVEC=29,17,18 RESERVE=3000,2200,2200 EXTRA_FLAGS='--skip-server-warmup' CONFIG=htsglang_q6_tp3_V1 bash htsglang_local_run.sh q6 tp3v1",
+      "env": "SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 SGLANG_UNEVEN_TOKEN_VECTOR=29,17,18 SGLANG_MAMBA_SSM_DTYPE=bfloat16 + DROP_CACHES",
+      "server": "... --load-format gguf --quantization gguf --tokenizer-path <gguf-dir> --speculative-draft-model-path <same gguf> --tp 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto --rank-auto-reserve-mib 3000,2200,2200 --max-running-requests 16 --skip-server-warmup ...",
+      "calibration": "2-boot: cal1 guess 31,15,18 -> maxKV 601728 but multimodal-warmup OOM (0.22 GB free); emitted hint SGLANG_UNEVEN_TOKEN_VECTOR=29,17,18 (raise to ~618624). boot2 pinned 29,17,18 + reserve bump + skip-warmup => converged (balanced) [29,17,18], maxKV 546560, available_gpu_mem 1.64 GB.",
+      "evidence": "per-rank profiled capacity [249488,153615,153736]."
+    },
+    "notes": [
+      "maxKV 546560 is the STABLE-SERVING max at reserve 3000,2200,2200 (the reserve bump trades some KV \u2014 the raw pool would be ~618k \u2014 for the ~1.6 GB runtime headroom GGUF on-the-fly dequant + multimodal need).",
+      "--skip-server-warmup used because sglang's built-in warmup sends an IMAGE that OOMs; the text-only benchmark never touches the vision path.",
+      "Decode slower than AWQ/FP8 (D1c 65.9, D8c 184.0) \u2014 GGUF on-the-fly dequant bandwidth."
+    ],
+    "prefill20k": 1102.7,
+    "decode1k_code": 65.9,
+    "decode1k_prose": 54.6,
+    "par8_prefill": 1111.5,
+    "par8_decode_code": 184.0,
+    "par8_decode_prose": 157.0,
+    "maxKV_tokens": 546560,
+    "accept_D1_code": 3.194888178913738,
+    "accept_D1_prose": 2.6595744680851063,
+    "accept_D8_code": 3.001,
+    "accept_D8_prose": 2.706,
+    "max_cached_tokens": 0,
+    "uncached_ok": true
+  },
+  "q6_tp3_V2": {
+    "cell": "S4 TP=3 uneven, GGUF Q6, V2 max-perf (PINNED-MLP APPROX; auto-performance INFEASIBLE on GGUF)",
+    "quant": "unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q6_K_XL.gguf",
+    "variant": "V2 max-perf (pinned-MLP approximation)",
+    "startup_args": {
+      "wrapper": "TOKVEC=29,17,18 RESERVE=3000,2200,2200 EXTRA_FLAGS='--rank-mlp-ratio 5,1,1 --rank-vocab-ratio auto --skip-server-warmup' CONFIG=htsglang_q6_tp3_V2 bash htsglang_local_run.sh q6 tp3v1",
+      "env": "SGLANG_UNEVEN_DCP=1 SGLANG_UNEVEN_DCP_WEIGHTED=1 SGLANG_UNEVEN_TOKEN_VECTOR=29,17,18 SGLANG_MAMBA_SSM_DTYPE=bfloat16",
+      "server": "... --rank-tp-ratio auto --rank-mlp-ratio 5,1,1 --rank-vocab-ratio auto --rank-auto-reserve-mib 3000,2200,2200 --max-running-requests 16 --skip-server-warmup ...",
+      "perf_evidence": "AUTO-PERFORMANCE INFEASIBLE ON GGUF: --rank-tp-ratio auto-performance crashes at uneven_perf.py:531 PerfCostModel._load_config -> open(model_path/'config.json') NotADirectoryError (model_path is the .gguf file). Best-achievable V2 = --rank-tp-ratio auto + PINNED --rank-mlp-ratio 5,1,1 (matching AWQ V2 concentration) + --rank-vocab-ratio auto -> 13,6,6 (GGUF-safe: cached-hw-profile only)."
+    },
+    "notes": [
+      "NOT the spec auto-performance config \u2014 pinned-MLP approximation, no decode-knee guard.",
+      "With pinned MLP 5,1,1 the DCP token-vector optimum flipped (hint 13,25,26; MLP moved OFF ranks 1/2 so they hold more KV). Boot used 29,17,18 -> maxKV 241216 (>= 100k, valid); a 2nd calibration boot to 13,25,26 would raise maxKV to ~538k with ~same perf (not run \u2014 economy).",
+      "See maxKV/tps fields for the achieved numbers."
+    ],
+    "prefill20k": 1207.5,
+    "decode1k_code": 63.2,
+    "decode1k_prose": 54.2,
+    "par8_prefill": 1213.4,
+    "par8_decode_code": 221.7,
+    "par8_decode_prose": 164.1,
+    "maxKV_tokens": 241216,
+    "accept_D1_code": 2.9940119760479043,
+    "accept_D1_prose": 2.577319587628866,
+    "accept_D8_code": 3.243,
+    "accept_D8_prose": 2.565,
+    "max_cached_tokens": 0,
+    "uncached_ok": true
+  },
+  "q8_tp3_V1": {
+    "cell": "S4 TP=3 uneven, GGUF Q8 (UD-Q8_K_XL), V1 max-KV",
+    "quant": "unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q8_K_XL.gguf",
+    "variant": "V1 max-KV",
+    "status": "INFEASIBLE",
+    "error": "Loads FURTHER than shvllm (past is_layer_skipped shard-quantized check) but ALL 64 GDN layers log 'Parameter model.layers.N.linear_attn.in_proj_qkvz.qweight not found in params_dict', then the scheduler crashes at model init: model_loader/loader.py:2252 process_weights_after_loading -> layers/quantization/gguf.py:475 _create_padded_weight_param -> AssertionError: 'Data container has mixed dtypes: {torch.float16, torch.uint8}'.",
+    "startup_args": {
+      "wrapper": "TOKVEC=29,17,18 RESERVE=3000,2200,2200 EXTRA_FLAGS='--skip-server-warmup' CONFIG=htsglang_q8_tp3_V1_cal1 bash htsglang_local_run.sh q8 tp3v1",
+      "server": "... --load-format gguf --quantization gguf --tp 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto --rank-auto-reserve-mib 3000,2200,2200 ..."
+    },
+    "notes": [
+      "The qkv-shard-order fix in this fork is NOT sufficient for UD-Q8_K_XL: the fused GDN in_proj_qkvz is stored mixed-precision (fp16 + uint8/quantized) and the GGUF QuantMethod padding path assumes a single dtype.",
+      "Different failure MODE than shvllm (shvllm: 'Detected some but not all shards ... are quantized'), same ROOT CAUSE (mixed-precision fused qkvz). GPUs freed to 0 after crash.",
+      "1 boot; not a tunable issue -> INFEASIBLE (no fix attempts spent). User directed to skip further Q8 tests."
+    ]
+  },
+  "q8_tp3_V2": {
+    "cell": "S4 TP=3 uneven, GGUF Q8, V2 max-perf",
+    "quant": "unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q8_K_XL.gguf",
+    "variant": "V2 max-perf",
+    "status": "INFEASIBLE",
+    "error": "Same load failure as Q8 V1 \u2014 the model cannot load at all (mixed-dtype fused GDN qkvz), so no TP/DCP/perf config is reachable.",
+    "notes": [
+      "Not booted (would fail identically at weight load, before any V2 config applies). User directed to skip Q8."
+    ]
+  }
+}
