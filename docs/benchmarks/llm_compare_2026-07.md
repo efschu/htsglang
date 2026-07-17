@@ -204,6 +204,43 @@ die reine Fork-Kapazitaet OHNE MTP; die Matrix-Zellen zeigen den servenden Pool 
 
 ---
 
+## Nachtrag (2026-07-17): GGUF nach dem Performance-Overhaul (htsglang e25180447) -- VORLÄUFIG
+
+Nach dem GGUF-Perf-Overhaul (htsglang-Commit e25180447: Flat-Byte-Shard-Layout,
+persistenter Dequant-Workspace, quantisiert-residenter embed/lm_head + NEXTN-Modul-Sharing,
+batched-MMVQ ncols<=8) wurden die GGUF-Messpunkte in einer separaten Validierungs-Batterie
+neu erhoben. Diese Zahlen sind VORLÄUFIG und ersetzen NICHT die Matrix-Zellen oben (die
+bleiben unveraendert der Stand vor dem Overhaul).
+
+| Messpunkt | alt (vor Overhaul) | neu (e25180447) | Delta |
+|---|---|---|---|
+| Q6 TP=2, Dec1k code/prose | 54.5 / 48.7 | 66.0 / 54.0 | +21% code |
+| Q6 TP=3-uneven+DCP, Dec1k code/prose | 65.9 / 54.6 | 91.1 / 79.1 | +37% / +47% |
+| Q8_K_XL TP=3-uneven, Dec1k code/prose | INFEASIBLE | 91.1 / 82.3 | bootet + kohärent |
+| Q4_K_M TP=2, Dec1k code/prose | 45.4 / 45.1 | 47.6 / 47.3 | +5% Decode |
+| Q4_K_M TP=2, maxKV (uncapped) | 153172 | 207824 | +36% |
+| Q6 TP=2, Gewichte/Rank | 14.03 GB | 12.74 GB | -1.3 GB |
+
+- **Q8-Status-Wechsel:** UD-Q8_K_XL war zuvor auf BEIDEN Forks INFEASIBLE (mixed-precision
+  fused GDN `in_proj_qkvz`, Fussnote 8). Nach dem Overhaul (Flat-Byte-Shard-Layout traegt
+  gemischte dtypes) bootet htsglang Q8_K_XL TP=3-uneven kohärent -- damit ist htsglang die
+  einzige echte TP>1-Q8-Implementierung des Rigs neben dem llama.cpp-Single-Prozess-Layer-Split.
+- **Einordnung:** Q6 TP=3-uneven Decode (91.1 code) liegt jetzt ÜBER allen llama.cpp-Zellen
+  des Rigs (TP=2 `-sm tensor` 79.6, Layer-Split 74.5). Q6 TP=2 (66.0) bleibt hinter llama.cpp
+  TP=2 (79.6), holt den Rueckstand aber deutlich auf.
+- **Methodik-Hinweis (ehrlich):** Die Zahlen stammen aus der T66-Validierungs-Batterie
+  (`t66_decode_bench.py`, greedy, ignore_eos, 512 Tok), NICHT aus einem vollstaendigen
+  Matrix-Re-Run. Sie wurden gegen die Matrix-TP=3-Referenz kalibriert: der alt-Boot ergab
+  66.4 / 54.0 ≈ Matrix-Zelle 65.9 / 54.6 (Q6 TP=3), was die Vergleichbarkeit der internen
+  A/B-Delta stuetzt. Prefill (P1) und Par8 (P8/D8) wurden NICHT neu gemessen. MTP-Accept
+  bleibt unveraendert (~3.35, Q6 TP=2). Der Kill-Switch-Boot (Flat-Layout + Workspace, ohne
+  batched-MMVQ/quantisierten Vocab) ist byte-identisch zu HEAD (3x1024 Long-Forms +
+  Logprob-maxdelta 0.000000). Boot-Rezepte noetig, sonst frisst Auto-Sizing den Gewinn (M29):
+  TP=2 `--mem-fraction-static 0.80`; TP=3 `--rank-auto-reserve-mib 3500 --cuda-graph-max-bs-decode 8`;
+  `SGLANG_GGUF_BATCHED_MMVQ=1`.
+
+---
+
 ## 4. Fussnoten / Caveats (M27a-M27e)
 
 1. **llama.cpp q8_0-KV statt fp8** (M27a): llama.cpp hat kein fp8-KV. Alle Zellen nutzen
