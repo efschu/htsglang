@@ -1148,6 +1148,7 @@ class ModelConfig:
         engine-level callers (no group yet) get the smallest share as a
         conservative basis."""
         from sglang.srt.distributed.utils import (
+            attn_kv_replicated,
             get_tp_partition_ratios,
             partition_sizes,
             tp_plan_active,
@@ -1155,6 +1156,11 @@ class ModelConfig:
 
         if not tp_plan_active(tensor_parallel_size):
             return None
+        if attn_kv_replicated(tensor_parallel_size, total_num_kv_heads):
+            # TP > num_kv_heads (task #62): REPLICATED-KV geometry — every
+            # rank holds ALL kv heads (q heads split in kv_total-sized
+            # units instead). Rank-independent by construction.
+            return total_num_kv_heads
         sizes = partition_sizes(
             total_num_kv_heads,
             weights=get_tp_partition_ratios(),

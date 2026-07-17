@@ -58,7 +58,23 @@ ScalarType, scalar_types = get_scalar_types()
 
 
 def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
-    return any(module_name in prefix for module_name in modules_to_not_convert)
+    """Fused-aware skip check for AWQ `modules_to_not_convert`.
+
+    The naive substring check cannot skip FUSED runtime modules (qkv_proj,
+    gate_up_proj) when the checkpoint lists the unfused shard names
+    (q_proj/k_proj/v_proj, gate_proj/up_proj) — e.g. the A3B AWQ
+    checkpoints exclude every self_attn/shared_expert projection but only
+    the routed experts are quantized. Delegate to the generic
+    is_layer_skipped: dotted-path-boundary matching plus the fallback
+    fused-shard mapping (all shards skipped -> fused module skipped).
+    The original substring semantics are kept as a union so entries that
+    relied on loose matching (e.g. `attn.qkv` matching the renamed runtime
+    `attn.qkv_proj` in the vision tower) continue to skip."""
+    from sglang.srt.layers.quantization.utils import is_layer_skipped
+
+    if any(module_name in prefix for module_name in modules_to_not_convert):
+        return True
+    return is_layer_skipped(prefix, modules_to_not_convert)
 
 
 class AWQConfig(QuantizationConfig):

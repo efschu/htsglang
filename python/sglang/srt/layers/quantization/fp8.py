@@ -1012,6 +1012,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        # For GPUs that lack native FP8 compute (sm < 89, e.g. sm86), fall back
+        # to the Marlin W8A16 fused-MoE kernel — mirrors the dense
+        # Fp8LinearMethod.use_marlin path. NOTE: this decision is RANK-LOCAL
+        # (capability of the current device). Under mixed-arch TP (e.g. sm120 +
+        # sm86 ranks) some ranks run the native fp8 path while others run
+        # Marlin; that is numerically fine — expert shards are disjoint per
+        # rank and the TP all-reduce combines partial outputs, exactly like
+        # the existing dense hetero path. Shard geometry / weight loading is
+        # identical for both paths (Marlin conversion is post-load, in
+        # process_weights_after_loading).
+        self.use_marlin = False
+        if (
+            _is_cuda
+            and not self.use_mxfp8
+            and not self.is_fp4_expert
+            and (
+                get_moe_runner_backend().is_auto()
+                or get_moe_runner_backend().is_triton()
+            )
+        ):
+            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            self.use_marlin = force_marlin or can_auto_enable_marlin_fp8()
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -1050,6 +1072,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ):
         self.with_bias = with_bias
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        # Preserve the activation dtype before it is shadowed by the fp8
+        # storage dtype below; the Marlin fallback needs it for scale
+        # conversion (mirrors Fp8LinearMethod.create_weights).
+        layer.orig_dtype = params_dtype
 
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
@@ -2014,6 +2041,80 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
 
+        if self.use_marlin:
+            self._prepare_marlin_moe(layer)
+
+    def _prepare_marlin_moe(self, layer: Module) -> None:
+        """Convert the fp8 expert weights of this rank to Marlin W8A16 format.
+
+        Rank-local fallback for GPUs without native FP8 compute (sm < 89).
+        Runs after the standard fp8 post-load processing, so the weights are
+        already requantized to a single per-expert scale (non-block) or carry
+        their block scales. Shard geometry is untouched globally; if this
+        rank's expert intermediate shard is not Marlin-tile aligned (n % 64,
+        possible under uneven TP unit splits), the intermediate dimension is
+        zero-padded locally — padded gate/up channels produce silu(0)*0 = 0
+        and the padded w2 input columns are zero weights, so the result is
+        numerically identical.
+        """
+        from sglang.srt.layers.quantization.marlin_utils import (
+            check_moe_marlin_supports_layer,
+        )
+        from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+            prepare_moe_fp8_layer_for_marlin,
+        )
+
+        n = layer.intermediate_size_per_partition
+        pad_to = 64
+        n_pad = (n + pad_to - 1) // pad_to * pad_to
+        if n_pad != n:
+            if self.block_quant:
+                raise ValueError(
+                    "FP8 Marlin MoE fallback: block-quantized experts with a "
+                    f"non-tile-aligned intermediate shard ({n} % {pad_to} != 0) "
+                    "are not supported (padding would break block-scale "
+                    "alignment)."
+                )
+            e = layer.w13_weight.shape[0]
+            k = layer.w13_weight.shape[2]
+            w13 = layer.w13_weight.data.view(e, 2, n, k)
+            w13_padded = torch.zeros(
+                (e, 2, n_pad, k), dtype=w13.dtype, device=w13.device
+            )
+            w13_padded[:, :, :n, :] = w13
+            layer.w13_weight = torch.nn.Parameter(
+                w13_padded.view(e, 2 * n_pad, k), requires_grad=False
+            )
+            w2 = layer.w2_weight.data
+            w2_padded = torch.zeros(
+                (e, w2.shape[1], n_pad), dtype=w2.dtype, device=w2.device
+            )
+            w2_padded[:, :, :n] = w2
+            layer.w2_weight = torch.nn.Parameter(w2_padded, requires_grad=False)
+            layer.intermediate_size_per_partition = n_pad
+            logger.info(
+                "FP8 Marlin MoE fallback: zero-padded expert intermediate "
+                "shard %d -> %d for Marlin tile alignment.",
+                n,
+                n_pad,
+            )
+
+        group_size = (
+            -1 if self.weight_block_size is None else self.weight_block_size[1]
+        )
+        if not check_moe_marlin_supports_layer(layer, group_size):
+            raise ValueError(
+                "FP8 Marlin MoE fallback: layer does not satisfy Marlin "
+                f"constraints (hidden_size={layer.hidden_size}, "
+                f"intermediate_size_per_partition="
+                f"{layer.intermediate_size_per_partition}, "
+                f"group_size={group_size})."
+            )
+
+        # w13/w2 are stored (num_experts, size_n, size_k) -> size_k_first=False
+        prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
+        torch.cuda.empty_cache()
+
     def process_weights_hip_int4(self, layer: Module):
         # TODO: _use_aiter: add after triton kernel added
         # INT4-FP8 (INT4 MoE Weight, FP8 Compute)
@@ -2093,6 +2194,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
+        if self.use_marlin:
+            # Rank-local Marlin W8A16 fallback (no native FP8 compute).
+            # Import registers the "none"->"marlin" fused func before the
+            # FusedOpPool lookup inside MoeRunner.
+            from sglang.srt.layers.moe.moe_runner import marlin  # noqa: F401
+
+            self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+            return
+
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
@@ -2149,6 +2259,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
+
+        if self.use_marlin:
+            # Rank-local Marlin W8A16 fallback for GPUs without native FP8
+            # compute (see __init__). Weights were repacked in
+            # _prepare_marlin_moe.
+            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+            quant_info = MarlinMoeQuantInfo(
+                w13_qweight=layer.w13_weight,
+                w2_qweight=layer.w2_weight,
+                w13_scales=layer.w13_weight_scale,
+                w2_scales=layer.w2_weight_scale,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                weight_bits=8,
+                weight_is_fp8=True,
+                w13_bias=getattr(layer, "w13_bias", None),
+                w2_bias=getattr(layer, "w2_bias", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu

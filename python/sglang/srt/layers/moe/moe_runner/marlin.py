@@ -60,6 +60,10 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     w2_g_idx_sort_indices: Optional[torch.Tensor]
     weight_bits: int
 
+    # FP8 (e4m3) weight-only fallback for GPUs without native FP8 compute.
+    # Distinguishes 8-bit FP8 weights from 8-bit integer (uint8b128) weights.
+    weight_is_fp8: bool = False
+
     # GPTQ specific (Optional)
     w13_g_idx: Optional[torch.Tensor] = None
     w2_g_idx: Optional[torch.Tensor] = None
@@ -148,6 +152,7 @@ def fused_experts_none_to_marlin(
         w2_bias=quant_info.w2_bias,
         workspace=MARLIN_MOE_WORKSPACE,
         num_bits=quant_info.weight_bits,
+        is_fp8=quant_info.weight_is_fp8,
         is_k_full=quant_info.is_k_full,
         inplace=marlin_inplace,
         routed_scaling_factor=runner_config.routed_scaling_factor,
