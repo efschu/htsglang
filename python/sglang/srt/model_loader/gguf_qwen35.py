@@ -274,10 +274,19 @@ class Qwen35GGUFAdapter:
             emit(p + "mlp.gate_proj", "weight")
             emit(p + "mlp.up_proj", "weight")
             emit(p + "mlp.down_proj", "weight")
-            # MoE experts (fused single tensor -> expert 0; loader side-loads)
-            emit(p + "mlp.experts.0.gate_proj", "weight")
-            emit(p + "mlp.experts.0.up_proj", "weight")
-            emit(p + "mlp.experts.0.down_proj", "weight")
+            # MoE experts: llama.cpp stores ALL experts of a projection in
+            # ONE stacked 3D tensor (blk.N.ffn_{gate,up,down}_exps, shape
+            # [E, out, in]). Map them to collective HF names; the
+            # transform_stream splits them into per-expert 2D tensors
+            # (mlp.experts.{e}.*) for the FusedMoE per-expert GGUF loader.
+            emit(p + "mlp.experts.gate_proj", "weight")
+            emit(p + "mlp.experts.up_proj", "weight")
+            emit(p + "mlp.experts.down_proj", "weight")
+            # Shared expert (dense GGUF linears) + gates.
+            emit(p + "mlp.shared_expert.gate_proj", "weight")
+            emit(p + "mlp.shared_expert.up_proj", "weight")
+            emit(p + "mlp.shared_expert.down_proj", "weight")
+            emit(p + "mlp.shared_expert_gate", "weight")
             emit(p + "mlp.gate", "weight")
 
         # Report any file tensor we failed to map. Excluded: vision/mmproj
@@ -333,6 +342,18 @@ class Qwen35GGUFAdapter:
         "ffn_gate.weight": "mtp.layers.0.mlp.gate_proj.weight",
         "ffn_up.weight": "mtp.layers.0.mlp.up_proj.weight",
         "ffn_down.weight": "mtp.layers.0.mlp.down_proj.weight",
+        # MoE draft (e.g. Qwen3.6-35B-A3B "MTP-preserved" GGUF: blk.40 is a
+        # full MoE decoder layer). The stacked *_exps tensors go through the
+        # same collective-name expert split in transform_stream as the main
+        # model's (matcher: ".mlp.experts.").
+        "ffn_gate_exps.weight": "mtp.layers.0.mlp.experts.gate_proj.weight",
+        "ffn_up_exps.weight": "mtp.layers.0.mlp.experts.up_proj.weight",
+        "ffn_down_exps.weight": "mtp.layers.0.mlp.experts.down_proj.weight",
+        "ffn_gate_inp.weight": "mtp.layers.0.mlp.gate.weight",
+        "ffn_gate_shexp.weight": "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+        "ffn_up_shexp.weight": "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+        "ffn_down_shexp.weight": "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+        "ffn_gate_inp_shexp.weight": "mtp.layers.0.mlp.shared_expert_gate.weight",
     }
 
     def _build_mtp_name_map(self) -> Dict[str, str]:
@@ -697,6 +718,12 @@ class Qwen35GGUFAdapter:
                     continue
                 # already unquantized (.weight): fall through, passed as-is.
 
+            # --- stacked MoE experts (blk.N.ffn_*_exps): the generic GGUF
+            # iterator (weight_utils.gguf_quant_weights_iterator) already
+            # splits them per expert and emits hardcoded
+            # model.layers.{L}.mlp.experts.{e}.{proj}.qweight(_type) names —
+            # the collective map entries only satisfy the name-map audit.
+            # Per-expert names pass through untouched here (NO re-split).
             # --- track quant types so out_proj retiling can see them ---
             if name.endswith(".qweight_type"):
                 qtype = int(weight.item())
@@ -759,6 +786,11 @@ class Qwen35GGUFAdapter:
                 continue
             if name.endswith("linear_attn.dt_bias"):
                 yield name, self._undo_gdn_reorder(name, weight, qweight_types)
+                continue
+            if name.endswith("shared_expert_gate.weight") and weight.dim() == 1:
+                # GGUF stores ffn_gate_inp_shexp as a 1D [hidden] vector; the
+                # module is nn.Linear(hidden, 1) with weight [1, hidden].
+                yield name, weight.unsqueeze(0)
                 continue
             if name.endswith(_GEMMA_NORM_SUFFIXES) or name in _GEMMA_NORM_NAMES:
                 yield name, weight.float() - 1.0

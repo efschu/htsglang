@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import math
 from enum import Enum
 from functools import cached_property
 from typing import List, Optional, Tuple
@@ -251,18 +252,92 @@ class FusedMoE(torch.nn.Module):
         _group = getattr(quant_config, "group_size", None) if quant_config else None
         if _block and intermediate_size % _block[0] == 0:
             _moe_units = intermediate_size // _block[0]
-        elif _group and _group > 0 and intermediate_size % _group == 0:
+        elif _group and _group > 0:
             # Group-quantized MoE (AWQ/GPTQ wna16, e.g. A3B AWQ group=32):
             # shard cuts must land on group boundaries, exactly like the
             # FP8 block case above — element-granular units would hand
             # ranks non-group-aligned intermediate shards, which
             # MoeWNA16Method.create_weights rejects (group_size >= 32
-            # assert after halving). Even split and no-plan paths are
-            # untouched (units are only consulted under a shard plan).
-            _moe_units = intermediate_size // _group
+            # assert after halving). When the CONFIG group size does not
+            # divide the intermediate size (e.g. Gemma-4-26B-A4B: 704 with
+            # AWQ group 128), mirror MoeWNA16Method.create_weights' halving
+            # (128 -> 64 -> 32) so the unit granularity matches the
+            # effective runtime group size. Even split and no-plan paths
+            # are untouched (units are only consulted under a shard plan).
+            _g = _group
+            while _g >= 32 and intermediate_size % _g:
+                _g //= 2
+            if _g >= 32:
+                _moe_units = intermediate_size // _g
+        elif (_ct_map := getattr(quant_config, "target_scheme_map", None)):
+            # compressed-tensors group-quantized experts (e.g.
+            # Gemma-4-26B-A4B pack-quantized INT4 group 32): shard cuts
+            # must land on lcm(group sizes, 64) boundaries — 64 is the
+            # Marlin fused-MoE tile requirement (w13 n = 2*I and w2 k = I
+            # both need I % 64 == 0; the dense-path 128-K-tile coarsening
+            # of _group_size_block would be too coarse here, e.g.
+            # 704 % 128 != 0). No group-quantized scheme -> units stay
+            # element-granular (fp8/channel schemes have their own paths).
+            _gs = set()
+            for _scheme in _ct_map.values():
+                _w = _scheme.get("weights") if isinstance(_scheme, dict) else None
+                _g = getattr(_w, "group_size", None)
+                if _g and int(_g) > 0:
+                    _gs.add(int(_g))
+            if _gs:
+                _g = math.lcm(*_gs, 64)
+                if intermediate_size % _g == 0:
+                    _moe_units = intermediate_size // _g
         self.moe_tp_units = _moe_units
         self.moe_tp_family = "moe"
-        if tp_plan_active(self.moe_tp_size, self.moe_tp_family):
+        # GGUF MoE under an uneven plan: shard along the EXPERT dim instead
+        # of the intermediate dim. The intermediate dim of w2 is the ggml
+        # QUANTIZED dim, and typical expert ffn sizes (A3B 512, 26B-A4B 704)
+        # cannot be cut on ggml block boundaries for 3 ranks (e.g. 512 =
+        # two 256er K-blocks). Whole experts have NO quant constraint on
+        # dim 0: each rank owns a plan-proportional subset of complete
+        # experts (VRAM scales with the plan), foreign topk hits a zero
+        # padding expert (see forward_impl remap + materialize), and the
+        # existing reduce_results all-reduce combines the disjoint expert
+        # contributions. Even TP and no-plan paths are untouched.
+        self._gguf_expert_shard = (
+            quant_config is not None
+            and quant_config.get_name() == "gguf"
+            and tp_plan_active(self.moe_tp_size, self.moe_tp_family)
+        )
+        if self._gguf_expert_shard:
+            lo = tp_partition_offset(
+                self.num_experts,
+                self.moe_tp_size,
+                self.moe_tp_rank,
+                self.num_experts,
+                self.moe_tp_family,
+            )
+            n_local = tp_partition_size(
+                self.num_experts,
+                self.moe_tp_size,
+                self.moe_tp_rank,
+                self.num_experts,
+                self.moe_tp_family,
+            )
+            self._gguf_expert_range = (lo, lo + n_local)
+            self.intermediate_size_per_partition = intermediate_size
+            # The family's shard unit IS one expert here — expose that to
+            # the sizing/calibration machinery (_family_local_stats would
+            # otherwise partition the quant-block units (e.g. 512/256 = 2)
+            # over the ranks and raise for 2 units < 3 ranks).
+            self.moe_tp_units = self.num_experts
+            logging.getLogger(__name__).info(
+                "GGUF MoE uneven TP: expert-dim sharding active — rank %d "
+                "owns experts [%d, %d) of %d (full intermediate %d per "
+                "expert).",
+                self.moe_tp_rank,
+                lo,
+                lo + n_local,
+                self.num_experts,
+                intermediate_size,
+            )
+        elif tp_plan_active(self.moe_tp_size, self.moe_tp_family):
             self.intermediate_size_per_partition = tp_partition_size(
                 intermediate_size,
                 self.moe_tp_size,
@@ -923,7 +998,15 @@ class FusedMoE(torch.nn.Module):
 
         if is_gguf_weight:
             output_dim = getattr(param, "output_dim", None)
-            if self.moe_tp_size > 1:
+            if getattr(self, "_gguf_expert_shard", False):
+                # Uneven-TP expert-dim sharding: keep the FULL per-expert
+                # tensor, but only for experts this rank owns (see
+                # __init__); foreign experts are dropped here and served
+                # by their owner rank.
+                lo, hi = self._gguf_expert_range
+                if not (lo <= expert_id < hi):
+                    return True
+            elif self.moe_tp_size > 1:
                 if shard_id in ["w1", "w3", "w2"] and output_dim == 0:
                     shard_size = loaded_weight.size(0) // self.moe_tp_size
                     start_idx = tp_rank * shard_size
@@ -1317,6 +1400,18 @@ class FusedMoE(torch.nn.Module):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
+        if getattr(self, "_gguf_expert_shard", False):
+            # Uneven-TP GGUF MoE (expert-dim sharding): translate the
+            # GLOBAL topk expert ids to this rank's LOCAL ids; foreign
+            # experts map to the trailing all-zero padding expert, so their
+            # local contribution is exactly 0 and the TP all-reduce sums
+            # the true per-owner contributions. Routing (replicated router
+            # + identical softmax/topk) is byte-identical on every rank.
+            assert TopKOutputChecker.format_is_standard(topk_output)
+            topk_output = topk_output._replace(
+                topk_ids=self._gguf_topk_remap[topk_output.topk_ids.long()]
+            )
+
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
@@ -1499,6 +1594,8 @@ class FusedMoE(torch.nn.Module):
                         expert_weights[expert_id][shard_id] = weight
 
                     # Build the full tensor
+                    expert_shard = getattr(self, "_gguf_expert_shard", False)
+
                     if "w13" in name:
                         # w13 is gate+up fused
                         weight_list = []
@@ -1512,6 +1609,14 @@ class FusedMoE(torch.nn.Module):
                                     weight_list.append(fused)
 
                         if weight_list:
+                            if expert_shard:
+                                # trailing all-zero padding expert: target
+                                # of foreign topk ids (zero ggml bytes
+                                # decode to 0 for every block type — d/min
+                                # scales are zero).
+                                weight_list.append(
+                                    torch.zeros_like(weight_list[0])
+                                )
                             stacked = torch.stack(weight_list, dim=0)
                             param.materialize(stacked.shape, dtype=stacked.dtype)
                             param.data.copy_(stacked)
@@ -1524,9 +1629,37 @@ class FusedMoE(torch.nn.Module):
                                 weight_list.append(w2_weight)
 
                         if weight_list:
+                            if expert_shard:
+                                weight_list.append(
+                                    torch.zeros_like(weight_list[0])
+                                )
                             stacked = torch.stack(weight_list, dim=0)
                             param.materialize(stacked.shape, dtype=stacked.dtype)
                             param.data.copy_(stacked)
+
+        if getattr(self, "_gguf_expert_shard", False) and not hasattr(
+            self, "_gguf_topk_remap"
+        ):
+            # Global -> local expert id translation for forward_impl:
+            # owned experts map to their local slot (global order), all
+            # foreign experts map to the zero padding expert (index
+            # n_local). Lives on the weights' device; plain indexing, so
+            # CUDA-graph safe.
+            lo, hi = self._gguf_expert_range
+            n_local = hi - lo
+            device = next(
+                (
+                    p.device
+                    for p in self.parameters()
+                    if not isinstance(p, UninitializedParameter)
+                ),
+                torch.device("cuda"),
+            )
+            remap = torch.full(
+                (self.num_experts,), n_local, dtype=torch.int32, device=device
+            )
+            remap[lo:hi] = torch.arange(n_local, dtype=torch.int32, device=device)
+            self._gguf_topk_remap = remap
 
 
 @register_custom_op(out_shape="hidden_states")

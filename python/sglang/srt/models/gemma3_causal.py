@@ -87,6 +87,11 @@ class Gemma3MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            # Uneven TP (--rank-tp-ratio): intermediate size is the unit
+            # family — gate/up outputs and down input share the same
+            # per-rank partition. Inert without an installed shard plan.
+            tp_units=intermediate_size,
+            tp_family="mlp",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -94,6 +99,8 @@ class Gemma3MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
+            tp_units=intermediate_size,
+            tp_family="mlp",
         )
         if hidden_activation != "gelu_pytorch_tanh":
             raise ValueError(
