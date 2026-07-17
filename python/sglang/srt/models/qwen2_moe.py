@@ -236,6 +236,48 @@ class Qwen2MoeMLP(nn.Module):
         return x
 
 
+def _shared_expert_uneven_misaligned(
+    quant_config, tp_size: int, intermediate_size: int
+) -> bool:
+    """Whether the shared-expert MLP's per-rank split of ``intermediate_size``
+    under the uneven-TP plan (--rank-tp-ratio) would violate the quant / activation
+    alignment, so the expert must be built REPLICATED (tp_size=1, full aligned
+    dimension on every rank, rank-0-only contribution) instead of sharded.
+
+    Mirrors Qwen2MoeMLP's tp_units derivation and then checks each rank's shard
+    against the silu_and_mul / gelu_and_mul vector width (activation.cuh kVecSize
+    = 8) and the weight-quant group size. Block-quant schemes whose intermediate
+    splits into >= tp_size activation-aligned blocks (e.g. FP8 block 128: 512 ->
+    [256,128,128]) stay SHARDED unchanged; element-granular quants (GGUF ggml
+    blocks, AWQ/compressed-tensors groups) whose ratio split lands off-boundary
+    (e.g. 512 -> [229,141,141], 141 % 8 != 0) are replicated. Unquantized MLPs
+    and even TP are never affected.
+    """
+    if quant_config is None or not tp_plan_active(tp_size):
+        return False
+    from sglang.srt.distributed.utils import tp_partition_sizes
+    from sglang.srt.layers.linear import _quant_block_aligned_units
+
+    try:
+        units = _quant_block_aligned_units(
+            intermediate_size, intermediate_size, quant_config, 0
+        )
+        sizes = tp_partition_sizes(intermediate_size, tp_size, units)
+    except Exception:
+        # Cannot split into tp_size aligned units at all -> must replicate.
+        return True
+    group = getattr(quant_config, "group_size", None) or getattr(
+        quant_config, "weight_group_size", None
+    )
+    _act_vec = 8  # silu_and_mul / gelu_and_mul kVecSize (activation.cuh:168)
+    for s in sizes:
+        if s % _act_vec != 0:
+            return True
+        if group and s % int(group) != 0:
+            return True
+    return False
+
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -316,17 +358,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
         # double-count. If fusion is off (num_fused_shared_experts == 0), keep shared_expert.
-        # GGUF + uneven TP (--rank-tp-ratio): the shared expert ffn (e.g.
-        # A3B: 512) cannot be cut on ggml quant-block boundaries for the
-        # plan ranks (512 = two 256er K-blocks < 3 ranks), so build it
-        # REPLICATED (tp_size=1, full weights on every rank, a few MB per
-        # layer) and let ONLY rank 0 contribute its output (see
+        # Quantized + uneven TP (--rank-tp-ratio): the shared expert ffn (e.g.
+        # A3B: 512) cannot always be cut on the quant/activation alignment
+        # boundaries for the plan ranks — GGUF ggml blocks (512 = two 256er
+        # K-blocks < 3 ranks) and AWQ/compressed-tensors group quants (ratio
+        # split 512 -> [229,141,141], 141 % 8 != 0 crashes silu_and_mul at
+        # activation.cuh:168). In those cases build the shared expert
+        # REPLICATED (tp_size=1, full aligned weights on every rank, a few MB
+        # per layer) and let ONLY rank 0 contribute its output (see
         # _forward_shared_experts) — the block output is all-reduced, so a
-        # single full contribution is exact (no 1/tp rescaling).
-        self._gguf_uneven_shared_expert = (
-            quant_config is not None
-            and quant_config.get_name() == "gguf"
-            and tp_plan_active(get_parallel().tp_size)
+        # single full contribution is exact (no 1/tp rescaling). FP8 and other
+        # block-quant schemes whose intermediate splits into >= tp_size aligned
+        # blocks stay SHARDED unchanged.
+        self._replicated_uneven_shared_expert = _shared_expert_uneven_misaligned(
+            quant_config,
+            get_parallel().tp_size,
+            config.shared_expert_intermediate_size,
         )
         if (
             config.shared_expert_intermediate_size > 0
@@ -344,7 +391,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     if (
                         get_moe_a2a_backend().is_deepep()
                         or get_moe_a2a_backend().is_flashinfer()
-                        or self._gguf_uneven_shared_expert
+                        or self._replicated_uneven_shared_expert
                     )
                     else {}
                 ),
@@ -451,7 +498,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ):
         shared_output = None
         if (
-            getattr(self, "_gguf_uneven_shared_expert", False)
+            getattr(self, "_replicated_uneven_shared_expert", False)
             and get_parallel().tp_rank != 0
         ):
             # Replicated shared expert (GGUF + uneven TP): only rank 0
