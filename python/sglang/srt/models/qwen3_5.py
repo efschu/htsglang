@@ -676,7 +676,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 ),
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
-                support_shared_expert_fusion=not _disable_shared_experts_fusion(),
+                support_shared_expert_fusion=(
+                    not _disable_shared_experts_fusion()
+                    and (quant_config is None or quant_config.get_name() != "gguf")
+                ),
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -977,7 +980,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 ),
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
-                support_shared_expert_fusion=not _disable_shared_experts_fusion(),
+                # GGUF: the shared expert is NOT fusable as an extra MoE
+                # expert — the GGUF adapter/loader feed it as dense
+                # shared_expert.* linears, and the expert-dim uneven
+                # sharding (fused_moe_triton) only covers routed experts.
+                support_shared_expert_fusion=(
+                    not _disable_shared_experts_fusion()
+                    and (quant_config is None or quant_config.get_name() != "gguf")
+                ),
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True

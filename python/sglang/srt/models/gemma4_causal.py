@@ -27,6 +27,12 @@ from transformers import (
 from sglang.srt.distributed import (
     get_pp_group,
 )
+from sglang.srt.distributed.utils import (
+    attn_kv_replicated,
+    attn_q_partition_units,
+    tp_partition_size,
+    tp_plan_active,
+)
 from sglang.srt.layers.gemma4_fused_ops import (
     gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
@@ -298,8 +304,6 @@ class Gemma4Attention(nn.Module):
         )
 
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
 
         if layer_type == "sliding_attention":
             self.total_num_kv_heads = getattr(
@@ -308,12 +312,73 @@ class Gemma4Attention(nn.Module):
         else:
             self.total_num_kv_heads = config.num_key_value_heads
 
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
+        if tp_plan_active(tp_size):
+            # Uneven TP (--rank-tp-ratio): heads follow the shard plan,
+            # matching the split in QKVParallelLinear. Normal mode (kv >=
+            # tp, e.g. Gemma-4-26B sliding layers kv=8): kv heads as
+            # indivisible units, whole GQA groups per rank. REPLICATED-KV
+            # mode (kv < tp, task #62 geometry — e.g. 26B full-attention
+            # layers kv=2, E4B all layers kv=2): ALL kv heads on every
+            # rank, q split in kv_total-sized units.
+            self._kv_replicated = attn_kv_replicated(
+                tp_size, self.total_num_kv_heads
+            )
+            self._attn_q_units = attn_q_partition_units(
+                self.total_num_heads, self.total_num_kv_heads, tp_size
+            )
+            tp_rank = get_parallel().tp_rank
+            self.num_heads = tp_partition_size(
+                self.total_num_heads, tp_size, tp_rank, self._attn_q_units
+            )
+            if self._kv_replicated:
+                self.num_kv_heads = self.total_num_kv_heads
+                # No KV-cache duplication only under the uneven-DCP
+                # token-sharded pool (owner rule) — fail fast without it.
+                if get_parallel().attn_dcp_size != tp_size:
+                    raise ValueError(
+                        f"TP > num_kv_heads: gemma4 layer {layer_id} "
+                        f"({layer_type}) has {self.total_num_kv_heads} kv "
+                        f"heads for {tp_size} ranks, which requires the "
+                        "REPLICATED-KV geometry with token-sharded KV "
+                        "(uneven DCP). Enable it with SGLANG_UNEVEN_DCP=1 "
+                        "(and SGLANG_UNEVEN_DCP_WEIGHTED=1 for the "
+                        "weighted owner rule) so dcp_size == tp_size."
+                    )
+                logger.info(
+                    "REPLICATED-KV geometry active for gemma4 attention "
+                    "layer %d (%s): kv_heads=%d < tp_size=%d; all kv heads "
+                    "on every rank, q heads split %s (units of %d).",
+                    layer_id,
+                    layer_type,
+                    self.total_num_kv_heads,
+                    tp_size,
+                    [
+                        tp_partition_size(
+                            self.total_num_heads, tp_size, r, self._attn_q_units
+                        )
+                        for r in range(tp_size)
+                    ],
+                    self.total_num_kv_heads,
+                )
+            else:
+                self.num_kv_heads = tp_partition_size(
+                    self.total_num_kv_heads,
+                    tp_size,
+                    tp_rank,
+                    self.total_num_kv_heads,
+                )
         else:
-            assert tp_size % self.total_num_kv_heads == 0
+            self._kv_replicated = False
+            self._attn_q_units = self.total_num_kv_heads
+            assert self.total_num_heads % tp_size == 0
+            self.num_heads = self.total_num_heads // tp_size
+
+            self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+
+            if self.total_num_kv_heads >= tp_size:
+                assert self.total_num_kv_heads % tp_size == 0
+            else:
+                assert tp_size % self.total_num_kv_heads == 0
 
         hidden_size = config.hidden_size
         self.head_dim = head_dim
@@ -336,6 +401,11 @@ class Gemma4Attention(nn.Module):
             bias=config.attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
+            # Uneven TP: the o_proj input dim is partitioned like the q
+            # heads in qkv_proj (kv-head units normally; kv_total-sized
+            # q-head units in REPLICATED-KV mode). Ignored on the default
+            # path (no shard plan installed).
+            tp_units=self._attn_q_units,
         )
 
         self.q_norm = Gemma4RMSNorm(

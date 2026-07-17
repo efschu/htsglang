@@ -164,6 +164,19 @@ def _quant_block_aligned_units(
     """
     if units is None or quant_config is None:
         return units
+    # GGUF quantizes along the INPUT dim only: every output row is a whole
+    # sequence of input-dim ggml blocks, so OUTPUT-dim (block_idx == 0)
+    # sharding never splits a quant block and must NOT be coarsened. GGUFConfig
+    # reports a nominal weight_block_size of [256, 256], which would otherwise
+    # wrongly merge fine-grained GDN head units — e.g. in_proj_qkv's key_dim
+    # 2048 has 128-element k-head units (2048/16); coarsening them to the 256
+    # block yields 8 units instead of 16, so in_proj partitions heads [8,4,4]
+    # while the model's gdn_tp_units (value_dim basis, 256-elem units, no
+    # coarsening) and every other GDN tensor use 16 -> [7,5,4]. That mismatch
+    # misaligns per-rank q/k/v/z against A_log/conv/scan and collapses the
+    # linear-attention output on all but the last rank (uneven-TP GGUF garbage).
+    if block_idx == 0 and getattr(quant_config, "get_name", lambda: "")() == "gguf":
+        return units
     block = getattr(quant_config, "weight_block_size", None)
     if not block:
         return units
