@@ -91,6 +91,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.distributed.utils import tp_plan_active
 from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -181,6 +182,14 @@ class Qwen2MoeMLP(nn.Module):
         tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
+        # Replicated construction (tp_size=1, e.g. GGUF+uneven shared
+        # expert): drop the family tag/units — a replicated module must not
+        # contribute its quant-block-coarsened units (e.g. 512/256 = 2) to
+        # the "mlp" family stats (_family_local_stats would partition them
+        # over the real ranks and raise for 2 units < 3 ranks).
+        _replicated = tp_size == 1
+        _mlp_units = None if _replicated else intermediate_size
+        _mlp_family = None if _replicated else "mlp"
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -196,8 +205,8 @@ class Qwen2MoeMLP(nn.Module):
             # independently of the attention/KV base plan (self-
             # calibration lever for maximizing the KV pool); without an
             # installed mlp vector it falls back to the base plan.
-            tp_units=intermediate_size,
-            tp_family="mlp",
+            tp_units=_mlp_units,
+            tp_family=_mlp_family,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -208,8 +217,8 @@ class Qwen2MoeMLP(nn.Module):
             prefix=add_prefix("down_proj", prefix),
             tp_rank=tp_rank,
             tp_size=tp_size,
-            tp_units=intermediate_size,
-            tp_family="mlp",
+            tp_units=_mlp_units,
+            tp_family=_mlp_family,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -307,6 +316,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
         # double-count. If fusion is off (num_fused_shared_experts == 0), keep shared_expert.
+        # GGUF + uneven TP (--rank-tp-ratio): the shared expert ffn (e.g.
+        # A3B: 512) cannot be cut on ggml quant-block boundaries for the
+        # plan ranks (512 = two 256er K-blocks < 3 ranks), so build it
+        # REPLICATED (tp_size=1, full weights on every rank, a few MB per
+        # layer) and let ONLY rank 0 contribute its output (see
+        # _forward_shared_experts) — the block output is all-reduced, so a
+        # single full contribution is exact (no 1/tp rescaling).
+        self._gguf_uneven_shared_expert = (
+            quant_config is not None
+            and quant_config.get_name() == "gguf"
+            and tp_plan_active(get_parallel().tp_size)
+        )
         if (
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
@@ -323,6 +344,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     if (
                         get_moe_a2a_backend().is_deepep()
                         or get_moe_a2a_backend().is_flashinfer()
+                        or self._gguf_uneven_shared_expert
                     )
                     else {}
                 ),
@@ -428,6 +450,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor, apply_gate: bool = True
     ):
         shared_output = None
+        if (
+            getattr(self, "_gguf_uneven_shared_expert", False)
+            and get_parallel().tp_rank != 0
+        ):
+            # Replicated shared expert (GGUF + uneven TP): only rank 0
+            # contributes; the surrounding all-reduce sums it in exactly
+            # once. Rank-static branch — CUDA-graph safe.
+            return None
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None and apply_gate:
@@ -600,8 +630,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and not get_moe_a2a_backend().is_flashinfer()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-
-        # Debug removed - was causing issues during CUDA graph capture
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
