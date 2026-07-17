@@ -76,6 +76,19 @@ def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
 
 
 def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
+    # GGUF quantized-resident lm_head carries packed `qweight` (there is no
+    # `.weight` at all); GGUFEmbeddingMethod.apply computes the logits
+    # straight from the packed bytes (fused_mul_mat_gguf). Checked FIRST
+    # because the generic gate below requires a `.weight` attribute.
+    # Non-GGUF lm_heads never expose `qweight`, so this leaves every other
+    # path untouched.
+    if (
+        quant_method is not None
+        and type(quant_method).__name__ == "GGUFEmbeddingMethod"
+        and hasattr(lm_head, "qweight")
+        and callable(getattr(quant_method, "apply", None))
+    ):
+        return True
     if (
         quant_method is None
         or not hasattr(lm_head, "weight")

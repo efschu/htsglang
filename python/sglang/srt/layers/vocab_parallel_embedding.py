@@ -529,18 +529,45 @@ class VocabParallelEmbedding(torch.nn.Module):
             param.data.copy_(loaded_weight)
             param.weight_type = loaded_weight.item()
             return
+        elif getattr(param, "is_gguf_weight", False) and isinstance(
+            param, UninitializedParameter
+        ):
+            # Quantized-resident GGUF vocab weight (embed_tokens / lm_head):
+            # `loaded_weight` is the FULL packed matrix -- dim0 = org vocab
+            # rows, dim1 = packed quant bytes. GGUF packs along the HIDDEN
+            # dim only, so EVERY ggml type shards byte-cleanly at ROW
+            # granularity; the shard_indices below already carry the even OR
+            # ratio-weighted (--rank-vocab-ratio) boundaries, so both splits
+            # work identically. Padding rows are zero bytes => zero scales
+            # => dequantize/matvec to exact 0.0, matching the dense path's
+            # fill_(0) semantics.
+            assert output_dim == 0, "GGUF vocab weights shard along dim 0"
+            row_bytes = loaded_weight.shape[1]
+            param.materialize(
+                (self.num_embeddings_per_partition, row_bytes),
+                dtype=loaded_weight.dtype,
+            )
+            start_idx = self.shard_indices.org_vocab_start_index
+            end_idx = min(
+                self.shard_indices.org_vocab_end_index, loaded_weight.shape[0]
+            )
+            num_rows = max(end_idx - start_idx, 0)
+            if num_rows > 0:
+                param.data[:num_rows].copy_(
+                    loaded_weight.narrow(0, start_idx, num_rows)
+                )
+            param.data[num_rows:].fill_(0)
+            return
         elif isinstance(param, UninitializedParameter):
             shape = list(loaded_weight.shape)
             if output_dim is not None:
                 if self.vocab_partition_sizes is not None:
-                    # Ratio-weighted vocab sharding: lazily materialized
-                    # (GGUF-quantized) vocab weights would need uneven
-                    # byte-row offsets here; the supported GGUF path
-                    # dequantizes embed_tokens/lm_head to dense weights
-                    # before this loader runs (gguf_qwen35 transform_stream).
+                    # Ratio-weighted vocab sharding with a lazily
+                    # materialized NON-GGUF vocab weight (GGUF is handled
+                    # row-granularly in the branch above): unsupported.
                     raise NotImplementedError(
                         "--rank-vocab-ratio does not support lazily "
-                        "materialized (GGUF-quantized) vocab weights."
+                        "materialized non-GGUF vocab weights."
                     )
                 shape[output_dim] = shape[output_dim] // self.tp_size
             param.materialize(tuple(shape), dtype=loaded_weight.dtype)

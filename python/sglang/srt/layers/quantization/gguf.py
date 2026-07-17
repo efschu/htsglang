@@ -153,6 +153,15 @@ def is_layer_skipped_gguf(prefix: str, modules_to_not_convert: list[str]):
 
 
 UNQUANTIZED_TYPES = {WeightType.F32, WeightType.F16, WeightType.BF16}
+
+
+def _weight_type_for_dtype(dtype: torch.dtype) -> WeightType:
+    """ggml WeightType tag matching a torch floating dtype (dense tensors)."""
+    return {
+        torch.float32: WeightType.F32,
+        torch.float16: WeightType.F16,
+        torch.bfloat16: WeightType.BF16,
+    }[dtype]
 STANDARD_QUANT_TYPES = {
     WeightType.Q4_0,
     WeightType.Q4_1,
@@ -200,11 +209,38 @@ _MMQ_MAX_TOKENS = int(os.environ.get("SGLANG_GGUF_MMQ_MAX_TOKENS", "8"))
 # SGLANG_GGUF_MMVQ_SAFE. Cached by device index (each TP rank is its own process).
 _mmvq_safe_by_dev: dict = {}
 
+# Batched-MMVQ (ncols_dst<=8, llama.cpp-style column amortization in
+# sgl_kernel's mul_mat_vec_q): with the rebuilt kernel one weight stream
+# serves up to 8 activation columns, so MMVQ dominates MMQ for the whole
+# spec-decode verify range (M<=8) on EVERY device class.
+#
+# Default: ON iff the installed sgl_kernel is the batched build, detected
+# via the `ggml_dequantize(..., out=)` schema, which ships in the SAME
+# build as the ncols<=8 MMVQ dispatcher. Old wheels (per-column, linear-in-M
+# MMVQ) keep the measured per-device crossover -- batched dispatch there
+# would be a regression. Env override: SGLANG_GGUF_BATCHED_MMVQ=0|1;
+# SGLANG_GGUF_MMVQ_SAFE still wins over both.
+#
+# Numerics note: enabling this moves M=3..8 shapes from MMQ onto MMVQ on
+# consumer devices. Both kernels sit ~5e-3 (relmax) from an fp32 reference
+# but differ from EACH OTHER by ~1e-4 (different reduction order), so
+# greedy outputs are NOT bit-identical to the old dispatch at near-ties --
+# equally valid rounding, verified quality/accept-neutral (T66 stage 1c).
+_BATCHED_MMVQ_ENV = os.environ.get("SGLANG_GGUF_BATCHED_MMVQ")
+
+
+def _batched_mmvq_enabled() -> bool:
+    if _BATCHED_MMVQ_ENV is not None:
+        return _BATCHED_MMVQ_ENV == "1"
+    return _dequant_supports_out()
+
 
 def _mmvq_safe_for_device() -> int:
     override = os.environ.get("SGLANG_GGUF_MMVQ_SAFE")
     if override is not None:
         return int(override)
+    if _batched_mmvq_enabled():
+        return 8
     dev = torch.cuda.current_device()
     v = _mmvq_safe_by_dev.get(dev)
     if v is None:
@@ -218,6 +254,86 @@ def _mmvq_safe_for_device() -> int:
         v = 6 if major >= 9 else 2
         _mmvq_safe_by_dev[dev] = v
     return v
+
+
+# ---------------------------------------------------------------------------
+# #63: persistent dequant workspace.
+#
+# The large-batch (prefill) path below dequantizes each weight shard into a
+# fresh `torch.empty` every forward (e.g. 86 MiB for one ffn shard/rank of
+# Qwen3.6-27B at TP=2). Under a tightly sized KV pool that per-forward
+# allocation is exactly what OOMed first (M27c: server healthy, then
+# "Tried to allocate 86.00 MiB" inside ggml_dequantize on the first real
+# forward). Route it through one persistent, grow-only per-(device,dtype)
+# buffer instead: it is allocated during weight finalization, BEFORE the KV
+# budget is profiled, so the scratch is accounted for up front and the
+# runtime path performs zero allocations. Dequants larger than the cap
+# (default 512 MiB, e.g. a full lm_head logprob dequant) intentionally fall
+# back to a fresh allocation instead of pinning that much VRAM forever.
+#
+# Requires the sgl_kernel `ggml_dequantize(..., out=)` schema (rebuilt
+# in-tree kernel). With an older installed wheel this degrades byte-
+# identically to the previous fresh-allocation behavior.
+# ---------------------------------------------------------------------------
+_DEQUANT_WS: dict = {}  # (device_index, dtype) -> 1-D buffer
+_dequant_out_supported: bool | None = None
+
+
+def _dequant_ws_cap_bytes() -> int:
+    return int(os.environ.get("SGLANG_GGUF_DEQUANT_WS_CAP_MIB", "512")) * (1 << 20)
+
+
+def _dequant_supports_out() -> bool:
+    global _dequant_out_supported
+    if _dequant_out_supported is None:
+        try:
+            schema = str(torch.ops.sgl_kernel.ggml_dequantize.default._schema)
+            _dequant_out_supported = "out" in schema
+        except Exception:
+            _dequant_out_supported = False
+    return _dequant_out_supported
+
+
+def _reserve_dequant_workspace(numel: int, dtype: torch.dtype, device) -> None:
+    """Grow the persistent workspace (load time, pre-KV-profiling)."""
+    if not _dequant_supports_out():
+        # Old wheel: the runtime path cannot write into the workspace, so
+        # holding one would only STEAL headroom. Keep legacy behavior.
+        return
+    if numel * dtype.itemsize > _dequant_ws_cap_bytes():
+        return
+    key = (device.index if device.type == "cuda" else device, dtype)
+    buf = _DEQUANT_WS.get(key)
+    if buf is None or buf.numel() < numel:
+        _DEQUANT_WS[key] = torch.empty(numel, dtype=dtype, device=device)
+
+
+def _ggml_dequantize_ws(
+    qweight: torch.Tensor, qweight_type: int, rows: int, cols: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """ggml_dequantize into the persistent workspace when possible.
+
+    Sequential-stream safety: within one forward the dequant -> GEMM pairs run
+    back-to-back on the same CUDA stream, so a single reused buffer is safe
+    (each GEMM consumes the dequant before the next dequant overwrites it).
+    A static buffer is also strictly friendlier to CUDA-graph capture than a
+    per-replay allocation.
+    """
+    numel = rows * cols
+    if _dequant_supports_out() and numel * dtype.itemsize <= _dequant_ws_cap_bytes():
+        key = (
+            qweight.device.index if qweight.device.type == "cuda" else qweight.device,
+            dtype,
+        )
+        buf = _DEQUANT_WS.get(key)
+        if buf is None or buf.numel() < numel:
+            buf = torch.empty(numel, dtype=dtype, device=qweight.device)
+            _DEQUANT_WS[key] = buf
+        out = buf.narrow(0, 0, numel).view(rows, cols)
+        return torch.ops.sgl_kernel.ggml_dequantize.default(
+            qweight, qweight_type, rows, cols, dtype, out
+        )
+    return ggml_dequantize(qweight, qweight_type, rows, cols, dtype)
 
 
 def fused_mul_mat_gguf(
@@ -262,7 +378,9 @@ def fused_mul_mat_gguf(
     elif qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
-        weight = ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
+        # #63: dequantize into the persistent per-rank workspace (no
+        # per-forward scratch allocation); see _ggml_dequantize_ws.
+        weight = _ggml_dequantize_ws(qweight, qweight_type, *shape, x.dtype)
         y = x @ weight.T
     else:
         # Raise an error if the quantization type is not supported.
@@ -462,42 +580,143 @@ class GGUFLinearMethod(LinearMethodBase):
                 f"Unsupported GGUF quantization type {qweight_type} in layer {layer}."
             )
         # For MergedColumnParallelLinear and QKVParallelLinear, we need to
-        # materialize the padded weight parameter for CUDA Graph compatibility.
-        self._create_padded_weight_param(layer)
+        # materialize a single flat weight parameter (static storage for CUDA
+        # Graph compatibility) plus zero-copy per-shard views.
+        self._create_flat_weight_param(layer)
+        # UD checkpoints ship some tensors dense (F16) inside otherwise
+        # quantized families: normalize single dense qweights to params_dtype.
+        self._cast_dense_qweight(layer)
+        # #63: pre-size the persistent dequant workspace at LOAD time so the
+        # KV-budget profiling that runs afterwards accounts for it.
+        self._reserve_dequant_scratch(layer)
 
-    def _create_padded_weight_param(self, layer: torch.nn.Module):
-        """Create padded weight parameter for GGUF MergedLinear layer."""
+    def _create_flat_weight_param(self, layer: torch.nn.Module):
+        """Materialize merged GGUF shards into ONE flat byte buffer + views.
+
+        The previous layout concatenated the shards along dim0 and padded
+        dim1 to the widest shard's row-byte width. With MIXED quant types in
+        one merged module (e.g. unsloth UD's GDN in_proj_qkv=Q6_K next to
+        in_proj_z=Q8_0: 4200 vs 5440 bytes/row) every narrower shard's slice
+        `qweight[start:end, :size]` was non-contiguous, so apply() paid a
+        `.contiguous()` COPY of the shard's full quantized bytes on EVERY
+        forward -- including inside captured CUDA graphs (~0.96 GiB read +
+        0.96 GiB write per rank per target forward for the 48 GDN layers of
+        Qwen3.6-27B Q6 at TP=2). Storing the shards back-to-back in a flat
+        1-D BYTE buffer makes each shard a contiguous, statically-addressed
+        VIEW: zero per-forward copies, zero padding waste, unchanged
+        numerics. Graph-safe by construction (views are created once at load
+        time and alias the registered parameter's storage).
+
+        Mixed DTYPES are supported too (the UD-Q8_K_XL "mixed-dtype qkvz"
+        INFEASIBLE case, task #64): dense F16/BF16 shards (which the GGUF
+        iterator renames to `.qweight` next to genuinely packed siblings,
+        e.g. F16 in_proj_z beside Q8_0 in_proj_qkv, or F16 attn_q/k beside
+        Q8_0 attn_v) are cast ONCE to params_dtype here, their shard type is
+        updated accordingly, and each shard's view reinterprets the byte
+        buffer in its own dtype (offsets 16-byte aligned).
+        """
         qweight = layer.qweight
         shard_id_map = qweight.shard_id_map
         shard_id = qweight.shard_id
         if len(data_container := qweight.data_container) > 1:
-            dtype = {data.dtype for data in data_container}
-            assert len(dtype) == 1, ValueError(
-                f"Data container has mixed dtypes: {dtype}"
-            )
-            dtype = next(iter(dtype))
-            # concat dim0 and pad dim1
-            padded_side = max(x.size(1) for x in data_container)
-            concat_side = sum(x.size(0) for x in data_container)
-            # Pad the quantized weights to dense tensor, and create a map
-            # with the location of each shard in the padded tensor.
-            padded_data = torch.zeros(
-                (concat_side, padded_side), dtype=dtype, device=qweight.device
-            )
-            # (dim0_start, dim0_end, dim1_size)
-            shard_offset_map = dict[str, tuple[int, int, int]]()
+            params_dtype = getattr(self, "params_dtype", torch.get_default_dtype())
+            shard_types = layer.qweight_type.shard_weight_type
+            tensors = []
             for idx in shard_id:
-                id_in_container = shard_id_map[idx]
-                start = sum(x.size(0) for x in data_container[:id_in_container])
-                end = start + data_container[id_in_container].size(0)
-                size = data_container[id_in_container].size(1)
-                padded_data[start:end, :size] = data_container[id_in_container]
-                shard_offset_map[idx] = (start, end, size)
+                src = data_container[shard_id_map[idx]]
+                qtype = shard_types.get(idx)
+                if (
+                    qtype in UNQUANTIZED_TYPES
+                    and src.dtype != params_dtype
+                    and src.is_floating_point()
+                ):
+                    # Load-time normalization of dense shards: apply()'s
+                    # unquantized matmul must be dtype-clean against the
+                    # activations (mirrors transform_stream's `.to(dtype)`
+                    # for dense modules).
+                    src = src.to(params_dtype)
+                    shard_types[idx] = int(_weight_type_for_dtype(params_dtype))
+                tensors.append(src.contiguous())
+            align = 16  # byte alignment so typed views stay legal
+            offsets = []
+            total = 0
+            for t in tensors:
+                total = -(-total // align) * align
+                offsets.append(total)
+                total += t.numel() * t.element_size()
+            flat_data = torch.zeros(total, dtype=torch.uint8, device=qweight.device)
+            # (flat_byte_offset, rows, dim1_in_shard_dtype) per shard id.
+            shard_offset_map = dict[str, tuple[int, int, int]]()
+            for idx, t, off in zip(shard_id, tensors, offsets):
+                nbytes = t.numel() * t.element_size()
+                flat_data.narrow(0, off, nbytes).copy_(
+                    t.reshape(-1).view(torch.uint8)
+                )
+                shard_offset_map[idx] = (off, t.size(0), t.size(1))
             qweight.data_container.clear()
-            padded_param = Parameter(padded_data, requires_grad=False)
-            set_weight_attrs(padded_param, vars(qweight))
-            set_weight_attrs(padded_param, {"shard_offset_map": shard_offset_map})
-            layer.register_parameter("qweight", padded_param)
+            flat_param = Parameter(flat_data, requires_grad=False)
+            set_weight_attrs(flat_param, vars(qweight))
+            set_weight_attrs(flat_param, {"shard_offset_map": shard_offset_map})
+            layer.register_parameter("qweight", flat_param)
+            # Pre-built contiguous 2-D typed views into the flat parameter,
+            # used by apply() instead of slice+contiguous. Plain attribute on
+            # the layer (not a parameter): same storage, static pointers.
+            layer._gguf_shard_views = {
+                idx: flat_param.data.narrow(0, off, t.numel() * t.element_size())
+                .view(t.dtype)
+                .view(t.size(0), t.size(1))
+                for (idx, t, off) in zip(shard_id, tensors, offsets)
+            }
+
+    def _cast_dense_qweight(self, layer: torch.nn.Module):
+        """Single-tensor DENSE-typed `.qweight` (e.g. UD-Q8_K_XL ships 5
+        full F16 MLPs, an F16 down_proj, F16 token_embd/output): cast once
+        to params_dtype so the unquantized matmul/embedding path is
+        dtype-clean, and record the matching weight type."""
+        qweight = layer.qweight
+        if getattr(layer, "_gguf_shard_views", None) or isinstance(
+            qweight, UninitializedParameter
+        ):
+            return
+        params_dtype = getattr(self, "params_dtype", None)
+        if (
+            params_dtype is None
+            or not qweight.is_floating_point()
+            or qweight.dtype == params_dtype
+            or layer.qweight_type.weight_type not in UNQUANTIZED_TYPES
+        ):
+            return
+        new_param = Parameter(qweight.data.to(params_dtype), requires_grad=False)
+        set_weight_attrs(new_param, vars(qweight))
+        layer.register_parameter("qweight", new_param)
+        layer.qweight_type.weight_type = int(_weight_type_for_dtype(params_dtype))
+
+    def _reserve_dequant_scratch(self, layer: torch.nn.Module):
+        """Grow the #63 workspace to this layer's largest dequant target."""
+        import gguf as _gguf
+
+        params_dtype = getattr(self, "params_dtype", None)
+        if params_dtype is None:
+            return
+        if isinstance(layer.qweight, UninitializedParameter):
+            # Never-loaded module (e.g. the NEXTN draft's embed/lm_head,
+            # which are replaced by module-level sharing right after the
+            # loader finishes): nothing to size, and `.shape` would raise.
+            return
+        shard_views = getattr(layer, "_gguf_shard_views", None)
+        if shard_views:
+            items = [
+                (layer.qweight_type.shard_weight_type[idx], view.shape)
+                for idx, view in shard_views.items()
+            ]
+        else:
+            items = [(layer.qweight_type.weight_type, tuple(layer.qweight.shape))]
+        for qtype, shape in items:
+            if qtype in UNQUANTIZED_TYPES or qtype not in DEQUANT_TYPES:
+                continue
+            block_size, type_size = _gguf.GGML_QUANT_SIZES[qtype]
+            numel = shape[0] * (shape[1] // type_size * block_size)
+            _reserve_dequant_workspace(numel, params_dtype, layer.qweight.device)
 
     def apply(
         self,
@@ -523,16 +742,19 @@ class GGUFLinearMethod(LinearMethodBase):
                     shard_id,
                     key=lambda s: min(s) if isinstance(s, tuple) else s,
                 )
-            qweight = layer.qweight
+            # Zero-copy contiguous shard views (built once at load time by
+            # _create_flat_weight_param): no per-forward slice+contiguous.
+            shard_views = getattr(layer, "_gguf_shard_views", None)
+            if shard_views is None:
+                raise RuntimeError(
+                    "GGUF merged layer has shard ids but no finalized shard "
+                    "views; process_weights_after_loading did not run or the "
+                    "layer was loaded with fewer than 2 shards."
+                )
             result = []
             for idx in shard_id:
-                start, end, offset = layer.qweight.shard_offset_map[idx]
                 qweight_type = layer.qweight_type.shard_weight_type[idx]
-                result.append(
-                    fused_mul_mat_gguf(
-                        x, qweight[start:end, :offset].contiguous(), qweight_type
-                    )
-                )
+                result.append(fused_mul_mat_gguf(x, shard_views[idx], qweight_type))
             out = torch.cat(result, axis=1)
         else:
             qweight = layer.qweight

@@ -134,6 +134,27 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def set_embed_and_head_modules(self, embed_module, head_module):
+        """Share the target's embed_tokens/lm_head MODULES with the draft.
+
+        Used for GGUF quantized-resident vocab weights: a packed `qweight`
+        module has no `.weight` tensor to hand over via set_embed_and_head,
+        so the whole module object is shared instead (identical row layout by
+        construction -- even and --rank-vocab-ratio uneven sharding alike).
+        The draft's own never-loaded embed/lm_head modules are dropped and
+        their (uninitialized/empty) storage freed, mirroring the tensor-level
+        path's early-share semantics (KV profiling sees the released VRAM).
+        """
+        if embed_module is not None:
+            self.model.embed_tokens = embed_module
+        if head_module is not None and not self.config.tie_word_embeddings:
+            self.lm_head = head_module
+        if self.config.tie_word_embeddings:
+            # Keep the tie invariant pointing at the (possibly new) embed.
+            self.lm_head = self.model.embed_tokens
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
     def set_lm_head_from_target(self, target_lm_head):
         if self.config.tie_word_embeddings:
             return
