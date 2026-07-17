@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rig-Dashboard</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#171b21; --panel2:#1e242c; --line:#2b323c;
+    --fg:#e6e9ee; --muted:#8b94a3; --accent:#5aa9e6;
+    --c-weight:#4c78a8; --c-draft:#8f6fb0; --c-kv:#59a14f; --c-mamba:#e6a23c;
+    --c-free:#2b323c; --c-used:#e05a5a; --c-r0:#4c78a8; --c-r1:#f28e2b; --c-r2:#59a14f; --c-r3:#b07aa1;
+    --warn:#e05a5a;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f4f6f9; --panel:#fff; --panel2:#eef1f5; --line:#d6dbe2;
+      --fg:#1a1f26; --muted:#5b6470; --c-free:#e2e6ec; }
+  }
+  :root[data-theme=light]{ --bg:#f4f6f9; --panel:#fff; --panel2:#eef1f5; --line:#d6dbe2; --fg:#1a1f26; --muted:#5b6470; --c-free:#e2e6ec; }
+  :root[data-theme=dark]{ --bg:#0f1216; --panel:#171b21; --panel2:#1e242c; --line:#2b323c; --fg:#e6e9ee; --muted:#8b94a3; --c-free:#2b323c; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 system-ui,Segoe UI,Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+  h1{font-size:15px;margin:0;font-weight:600}
+  .pill{font-size:11px;padding:2px 8px;border-radius:10px;background:var(--panel2);color:var(--muted);border:1px solid var(--line)}
+  .pill.up{color:#7fd18a;border-color:#2f5d38}
+  .pill.down{color:var(--warn);border-color:#5d2f2f}
+  .grow{flex:1}
+  button{font:inherit;background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 10px;cursor:pointer}
+  main{padding:14px 16px;display:grid;gap:14px;grid-template-columns:1fr;max-width:1400px;margin:0 auto}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .panel h2{margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600}
+  .cards{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+  .metrics{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(120px,1fr))}
+  .metric{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+  .metric .k{color:var(--muted);font-size:11px}
+  .metric .v{font-size:18px;font-weight:600;margin-top:2px}
+  .metric .v small{font-size:11px;color:var(--muted);font-weight:400}
+  .legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-top:8px}
+  .legend span{display:inline-flex;align-items:center;gap:5px}
+  .sw{width:11px;height:11px;border-radius:2px;display:inline-block}
+  .gpu{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px}
+  .gpu .top{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+  .gpu .nm{font-weight:600}
+  .gpu .sub{color:var(--muted);font-size:11px}
+  .hot{color:var(--warn);font-weight:700}
+  .note{color:var(--muted);font-size:11px;margin-top:6px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  td,th{text-align:right;padding:3px 6px;border-bottom:1px solid var(--line)}
+  th:first-child,td:first-child{text-align:left}
+  svg text{fill:var(--fg)}
+  .tip{position:fixed;pointer-events:none;background:#000d;color:#fff;padding:4px 7px;border-radius:5px;font-size:11px;z-index:9;opacity:0;transition:opacity .1s;white-space:pre}
+</style>
+</head>
+<body>
+<header>
+  <h1>Rig-Dashboard</h1>
+  <span class="pill" id="model">-</span>
+  <span class="pill" id="srv">server ?</span>
+  <span class="pill" id="nvmlsrc">nvml ?</span>
+  <span class="grow"></span>
+  <span class="pill" id="ts">-</span>
+  <button id="theme">theme</button>
+</header>
+<main>
+  <section class="panel"><h2>Live numbers</h2><div class="metrics" id="nums"></div></section>
+
+  <section class="panel">
+    <h2>VRAM distribution per physical GPU</h2>
+    <div class="cards" id="gpus"></div>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--c-weight)"></i>weights</span>
+      <span><i class="sw" style="background:var(--c-draft)"></i>draft/MTP</span>
+      <span><i class="sw" style="background:var(--c-kv)"></i>KV pool (bright = live-filled)</span>
+      <span><i class="sw" style="background:var(--c-mamba)"></i>mamba pool</span>
+      <span><i class="sw" style="background:var(--c-free)"></i>free/unaccounted</span>
+      <span><i class="sw" style="background:var(--c-used);height:2px"></i>live NVML used</span>
+    </div>
+    <div class="note" id="gpunote"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Head / unit distribution across ranks</h2>
+    <div id="dist"></div>
+    <div class="legend" id="ranklegend"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Token owner (per 64-token block, DCP)</h2>
+    <div id="tokens"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Plan detail (from boot log)</h2>
+    <div id="plantable"></div>
+  </section>
+</main>
+<div class="tip" id="tip"></div>
+<script>
+const RC = ['var(--c-r0)','var(--c-r1)','var(--c-r2)','var(--c-r3)'];
+const tip = document.getElementById('tip');
+function showTip(e,t){tip.textContent=t;tip.style.opacity=1;tip.style.left=(e.clientX+12)+'px';tip.style.top=(e.clientY+12)+'px';}
+function hideTip(){tip.style.opacity=0;}
+function el(t,a,kids){const n=document.createElementNS(t==='svg'||t==='rect'||t==='text'||t==='line'||t==='g'?'http://www.w3.org/2000/svg':'http://www.w3.org/1999/xhtml',t);for(const k in(a||{}))n.setAttribute(k,a[k]);(kids||[]).forEach(c=>n.appendChild(c));return n;}
+function fmt(x,d=1){return x==null?'-':(+x).toFixed(d);}
+function esc(s){return (s==null?'':(''+s));}
+
+// ---- live numbers ----
+function renderNums(s){
+  const box=document.getElementById('nums'); box.innerHTML='';
+  const m=s.metrics||{}, pl=s.plan||{};
+  const add=(k,v,sub)=>{const d=el('div',{class:'metric'});d.innerHTML=`<div class="k">${k}</div><div class="v">${v}${sub?` <small>${sub}</small>`:''}</div>`;box.appendChild(d);};
+  add('tok/s', m.gen_throughput!=null?fmt(m.gen_throughput,1):'-');
+  add('running reqs', m.num_running_reqs!=null?m.num_running_reqs:'-', m.num_queue_reqs!=null?`+${m.num_queue_reqs} queued`:'');
+  add('accept len', m.spec_accept_length!=null?fmt(m.spec_accept_length,2):'-');
+  const mt=(s.server&&s.server.max_total_num_tokens)||m.max_total_num_tokens||pl.max_total_num_tokens;
+  add('max total tok', mt!=null?(+mt).toLocaleString():'-');
+  if(m.kv_used_tokens!=null) add('KV used tok', (+m.kv_used_tokens).toLocaleString(), m.token_usage!=null?`${fmt(m.token_usage*100,0)}%`:'');
+  if(m.cache_hit_rate!=null) add('cache hit', fmt(m.cache_hit_rate*100,1)+'%');
+  add('TP / DCP', `${pl.tp_size||s.server.tp_size||'-'} / ${pl.dcp_size||s.server.dcp_size||'-'}`);
+}
+
+// ---- VRAM per GPU ----
+function renderGPUs(s){
+  const box=document.getElementById('gpus'); box.innerHTML='';
+  const nvml=s.nvml||[], pl=s.plan||{}, m=s.metrics||{};
+  const ranks=(pl.available?pl.ranks:[])||[];
+  const kvFrac = (m.kv_used_tokens!=null && (m.max_total_num_tokens||pl.max_total_num_tokens))
+      ? Math.min(1, m.kv_used_tokens/(m.max_total_num_tokens||pl.max_total_num_tokens)) : null;
+  document.getElementById('gpunote').textContent = pl.available
+    ? 'Stacked segments are MEASURED GB from the boot log (converted to MiB); bar height = NVML total. Red line = current NVML used.'
+    : 'No boot-log plan loaded — showing live NVML used/total only.';
+
+  const gmap = s.gpu_map||{};
+  nvml.forEach(g=>{
+    // r.gpu is the BOOT-time GPU index; map to the live NVML index
+    const mine = ranks.filter(r=>((gmap[r.gpu]!=null?gmap[r.gpu]:r.gpu)===g.index));
+    const total=g.mem_total_mib||1;
+    const GB=1024;
+    const segs=[];
+    let wsum=0,dsum=0,kvsum=0,msum=0;
+    mine.forEach(r=>{wsum+=r.weight_gb*GB; dsum+=r.draft_gb*GB+ (r.draft_kv_gb||0)*GB; kvsum+=r.kv_gb*GB; msum+=r.mamba_gb*GB;});
+    if(mine.length){
+      segs.push(['weights','var(--c-weight)',wsum]);
+      if(dsum>0)segs.push(['draft/MTP','var(--c-draft)',dsum]);
+      segs.push(['KV pool','var(--c-kv)',kvsum]);
+      if(msum>0)segs.push(['mamba','var(--c-mamba)',msum]);
+    }
+    const acc=segs.reduce((a,x)=>a+x[2],0);
+    const free=Math.max(0,total-acc);
+    segs.push(['free/unacct','var(--c-free)',free]);
+
+    const H=150, pad=6, barW=52, x0=14;
+    const svg=el('svg',{viewBox:`0 0 ${230} ${H}`,width:'100%',height:H,preserveAspectRatio:'xMidYMid meet'});
+    const scale=(H-2*pad)/total;
+    let y=pad;
+    segs.forEach(([nm,col,mib])=>{
+      if(mib<=0)return;
+      const h=mib*scale;
+      const rc=el('rect',{x:x0,y:y.toFixed(1),width:barW,height:Math.max(0.5,h).toFixed(1),fill:col,rx:1});
+      rc.addEventListener('mousemove',e=>showTip(e,`${nm}: ${(mib/GB).toFixed(2)} GB (${(mib/total*100).toFixed(0)}%)`));
+      rc.addEventListener('mouseleave',hideTip);
+      svg.appendChild(rc);
+      // live KV fill overlay
+      if(nm==='KV pool' && kvFrac!=null){
+        svg.appendChild(el('rect',{x:x0,y:(y+h*(1-kvFrac)).toFixed(1),width:barW,height:(h*kvFrac).toFixed(1),fill:'var(--c-kv)',opacity:0.55,stroke:'#fff8',rx:1}));
+      }
+      y+=h;
+    });
+    // live NVML used marker line
+    if(g.mem_used_mib!=null){
+      const yl=pad+(total-g.mem_used_mib)*scale;
+      svg.appendChild(el('line',{x1:x0-3,x2:x0+barW+3,y1:yl.toFixed(1),y2:yl.toFixed(1),stroke:'var(--c-used)','stroke-width':2}));
+    }
+    // axis labels
+    svg.appendChild(el('text',{x:x0+barW+8,y:pad+8,'font-size':10,fill:'var(--muted)'},[document.createTextNode((total/GB).toFixed(0)+' GB')]));
+    svg.appendChild(el('text',{x:x0+barW+8,y:H-2,'font-size':10,fill:'var(--muted)'},[document.createTextNode('0')]));
+
+    const hot=g.temp_c!=null&&g.temp_c>=80;
+    const card=el('div',{class:'gpu'});
+    card.innerHTML=`<div class="top"><span class="nm">GPU ${g.index} · ${esc(g.name).replace('NVIDIA GeForce ','')}</span>
+      <span class="${hot?'hot':'sub'}">${g.temp_c!=null?g.temp_c+'°C':''}${hot?' ⚠':''}</span></div>
+      <div class="sub">${fmt(g.mem_used_mib/1024,1)}/${fmt(g.mem_total_mib/1024,1)} GB · ${g.util_pct!=null?g.util_pct+'% util':''} · ${g.power_w!=null?fmt(g.power_w,0)+'W':''} · PCIe ${g.pcie_gen||'?'}×${g.pcie_width||'?'}${mine.length?` · rank ${mine.map(r=>r.rank).join(',')}`:''}</div>`;
+    card.appendChild(svg);
+    box.appendChild(card);
+  });
+}
+
+// ---- head/unit distribution ----
+function stripe(title, total, per, colorFn, labelFn){
+  const wrap=el('div',{style:'margin:6px 0 12px'});
+  wrap.appendChild(el('div',{style:'font-size:11px;color:var(--muted);margin-bottom:3px'},[document.createTextNode(title)]));
+  const W=760,H=22,box=Math.min(24,(W-2)/Math.max(1,total));
+  const svg=el('svg',{viewBox:`0 0 ${W} ${H}`,width:'100%',height:H});
+  let x=0,rank=0,left=per[0]||0;
+  for(let i=0;i<total;i++){
+    while(left<=0 && rank<per.length-1){rank++;left=per[rank]||0;}
+    const rc=el('rect',{x:x.toFixed(1),y:2,width:(box-1).toFixed(1),height:H-4,fill:colorFn(rank),rx:1});
+    rc.addEventListener('mousemove',e=>showTip(e,labelFn(rank,i)));
+    rc.addEventListener('mouseleave',hideTip);
+    svg.appendChild(rc); x+=box; left--;
+  }
+  wrap.appendChild(svg); return wrap;
+}
+function barStripe(title, per, labelFn){
+  const wrap=el('div',{style:'margin:6px 0 12px'});
+  wrap.appendChild(el('div',{style:'font-size:11px;color:var(--muted);margin-bottom:3px'},[document.createTextNode(title)]));
+  const W=760,H=22,tot=per.reduce((a,b)=>a+(b||0),0)||1;
+  const svg=el('svg',{viewBox:`0 0 ${W} ${H}`,width:'100%',height:H});let x=0;
+  per.forEach((v,r)=>{const w=(v||0)/tot*W;const rc=el('rect',{x:x.toFixed(1),y:2,width:Math.max(0,w-1).toFixed(1),height:H-4,fill:RC[r%4],rx:1});
+    rc.addEventListener('mousemove',e=>showTip(e,labelFn(r,v)));rc.addEventListener('mouseleave',hideTip);svg.appendChild(rc);
+    if(w>26)svg.appendChild(el('text',{x:(x+w/2).toFixed(1),y:15,'font-size':10,'text-anchor':'middle',fill:'#fff'},[document.createTextNode(''+v)]));
+    x+=w;});
+  wrap.appendChild(svg);return wrap;
+}
+function renderDist(s){
+  const box=document.getElementById('dist');box.innerHTML='';
+  const leg=document.getElementById('ranklegend');leg.innerHTML='';
+  const pl=s.plan; if(!pl||!pl.available){box.innerHTML='<div class="note">No boot-log plan loaded.</div>';return;}
+  const tp=pl.tp_size, gpu=pl.rank_gpu_id||[];
+  for(let r=0;r<tp;r++){const sp=el('span');sp.innerHTML=`<i class="sw" style="background:${RC[r%4]}"></i>rank ${r} → GPU ${gpu[r]!=null?gpu[r]:'?'}`;leg.appendChild(sp);}
+  const h=pl.heads||{};
+  const qTot=h.q_total||pl.geometry.q_heads, kvTot=h.kv_total||pl.geometry.kv_heads;
+  const srcTag=h.source?` — ${h.source}`:'';
+  if(h.q_split) box.appendChild(stripe(`Q heads (${qTot}) → ${h.q_split.join('/')}${h.unit?` (units of ${h.unit})`:''}${srcTag}`, qTot, h.q_split, r=>RC[r%4], (r,i)=>`rank ${r}`));
+  if(h.kv_split) box.appendChild(stripe(`KV heads (${kvTot}) ${h.kv_mode==='replicated'?'[replicated on all ranks]':'→ '+h.kv_split.join('/')}`, kvTot, h.kv_mode==='replicated'?new Array(kvTot).fill(0).map(()=>0):h.kv_split, r=>h.kv_mode==='replicated'?'var(--muted)':RC[r%4], (r,i)=>h.kv_mode==='replicated'?'replicated on every rank':`rank ${r}`));
+  if(pl.gdn_v&&pl.gdn_v.length) box.appendChild(stripe(`GDN value units (${pl.geometry.gdn_v_heads}) → ${pl.gdn_v.join('/')}`, pl.geometry.gdn_v_heads, pl.gdn_v, r=>RC[r%4], (r,i)=>`rank ${r}`));
+  if(pl.moe&&pl.moe.counts) box.appendChild(barStripe(`MoE experts (${pl.moe.total}) → ${pl.moe.counts.map(c=>c==null?'?':c).join('/')} (materialized, expert-dim sharding)`, pl.moe.counts.map(c=>c||0), (r,v)=>{const rg=(pl.moe.ranges||[])[r];return `rank ${r}: ${v} experts${rg?` [${rg[0]}, ${rg[1]})`:''}`;}));
+  if(pl.mlp_units) box.appendChild(barStripe(`MLP units → ${pl.mlp_units.join('/')} (materialized, boot log)`, pl.mlp_units, (r,v)=>`rank ${r}: ${v} MLP units`));
+  if(pl.vocab_ratio) box.appendChild(barStripe(`Vocab split → ${pl.vocab_ratio.join('/')} (rank-vocab-ratio)`, pl.vocab_ratio, (r,v)=>`rank ${r}: vocab weight ${v}`));
+  box.appendChild(el('div',{class:'note'},[document.createTextNode('Q/KV/GDN splits are derived from the shard ratio + model geometry (defaults for Qwen3.6-27B, override via CLI). MLP/Vocab/Token splits are materialized values read from the boot log.')]));
+}
+
+// ---- token owner 64-block ----
+function renderTokens(s){
+  const box=document.getElementById('tokens');box.innerHTML='';
+  const pl=s.plan;
+  if(!pl||!pl.available||!pl.token_vector){box.innerHTML='<div class="note">No DCP token vector in the plan (single-owner or not logged).</div>';return;}
+  const vec=pl.token_vector, blk=pl.token_block||vec.reduce((a,b)=>a+b,0);
+  box.appendChild(stripe(`One ${blk}-token block, colored by owning rank → ${vec.join('/')}`, blk, vec, r=>RC[r%4], (r,i)=>`token ${i}: owned by rank ${r} (GPU ${(pl.rank_gpu_id||[])[r]})`));
+  box.appendChild(el('div',{class:'note'},[document.createTextNode(`This ownership pattern repeats every ${blk} tokens. Per-rank profiled capacity: ${(pl.profiled_capacity||[]).map(x=>x.toLocaleString()).join(' / ')||'-'}`)]));
+}
+
+// ---- plan table ----
+function renderTable(s){
+  const box=document.getElementById('plantable');box.innerHTML='';
+  const pl=s.plan; if(!pl||!pl.available){box.innerHTML='<div class="note">'+(pl&&pl.reason||'No plan')+'</div>';return;}
+  const rows=pl.ranks.map(r=>`<tr><td>rank ${r.rank}</td><td>${r.gpu}</td><td>${fmt(r.weight_gb,2)}</td><td>${fmt(r.draft_gb,2)}</td><td>${fmt(r.kv_gb,2)}</td><td>${(r.kv_tokens||0).toLocaleString()}</td><td>${fmt(r.mamba_gb,2)}</td><td>${r.free_gb_end!=null?fmt(r.free_gb_end,2):'-'}</td></tr>`).join('');
+  box.innerHTML=`<div class="note">${esc(pl.model)} · ${esc(pl.quant||'-')} · kv=${esc(pl.kv_cache_dtype||'-')} · spec=${esc(pl.spec_algorithm||'-')} · budgets ${(pl.memory_budgets_mib||[]).join('/')} MiB · MLP vec ${(pl.mlp_vector||[]).join(',')||'(pinned)'}</div>
+  <table><thead><tr><th>rank</th><th>GPU</th><th>weights GB</th><th>draft GB</th><th>KV GB</th><th>KV tok</th><th>mamba GB</th><th>free GB</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function tick(){
+  try{
+    const s=await (await fetch('/api/state')).json();
+    document.getElementById('model').textContent=(s.plan&&s.plan.model)||(s.server&&s.server.model)||'no model';
+    const srv=document.getElementById('srv');srv.textContent=s.server&&s.server.up?'server up':'server down';srv.className='pill '+(s.server&&s.server.up?'up':'down');
+    document.getElementById('nvmlsrc').textContent='nvml: '+(s.nvml_source||'?');
+    document.getElementById('ts').textContent=new Date(s.ts*1000).toLocaleTimeString();
+    renderNums(s);renderGPUs(s);renderDist(s);renderTokens(s);renderTable(s);
+  }catch(e){document.getElementById('ts').textContent='fetch error';}
+}
+document.getElementById('theme').onclick=()=>{const r=document.documentElement;const cur=r.getAttribute('data-theme')|| (matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');r.setAttribute('data-theme',cur==='dark'?'light':'dark');};
+tick();setInterval(tick,1000);
+</script>
+</body>
+</html>
