@@ -108,11 +108,11 @@ VRAM-gewichtete uneven-TP-Aufteilung, rank0 = 5090. htsglang mit BEIDEN Variante
 | shvllm AWQ-INT4 | 1228.3 | 83.7 | 62.7 | 1211.6 | 288.1 | 266.2 | 1146573 | n/a |
 | shvllm FP8 | 1218.7 | 73.9 | 60.7 | 1223.5 | 287.9 | 273.7 | 1046126 | n/a |
 | shvllm Q8 (GGUF) | INFEASIBLE: UD-Q8_K_XL mixed-precision fused qkvz, GGUF-Plugin lehnt fruh ab (Fussnote 8) | | | | | | | |
-| htsglang FP8 -- V1 max-KV | 1123.7 | 98.4 | 80.8 | 1125.7 | 354.9 | 268.9 | 530944 | 3.28 / 2.69 |
+| htsglang FP8 -- V1 max-KV | 1123.7 | 98.4 | 80.8 | 1125.7 | 354.9 | 268.9 | 824896 (*M28) | 3.28 / 2.69 |
 | htsglang FP8 -- V2 max-perf | 1202.7 | 84.4 | 61.3 | 1207.8 | 343.2 | 260.2 | 299968 | 3.12 / 2.25 |
-| htsglang AWQ -- V1 max-KV | 1123.9 | 103.2 | 93.1 | 1135.2 | 346.0 | 299.2 | 566912 | 3.14 / 2.86 |
+| htsglang AWQ -- V1 max-KV | 1123.9 | 103.2 | 93.1 | 1135.2 | 346.0 | 299.2 | 857408 (*M28) | 3.14 / 2.86 |
 | htsglang AWQ -- V2 max-perf | 1247.2 | 115.7 | 94.8 | 1261.6 | 345.3 | 305.2 | 441536 | 3.40 / 2.79 |
-| htsglang Q6 -- V1 max-KV | 1102.7 | 65.9 | 54.6 | 1111.5 | 184.0 | 157.0 | 546560 | 3.19 / 2.66 |
+| htsglang Q6 -- V1 max-KV | 1102.7 | 65.9 | 54.6 | 1111.5 | 184.0 | 157.0 | 818880 (*M28) | 3.19 / 2.66 |
 | htsglang Q6 -- V2 max-perf (pinned-MLP) | 1207.5 | 63.2 | 54.2 | 1213.4 | 221.7 | 164.1 | 241216 | 2.99 / 2.58 |
 | htsglang Q8 -- V1/V2 | INFEASIBLE: laedt weiter als shvllm, crasht dann an mixed-dtype padding (Fussnote 8) | | | | | | | |
 
@@ -121,6 +121,14 @@ Hinweis: Hier ist die Nebenlaeufigkeit NICHT mamba-gedeckelt (5090 im Mix, ~100 
 haengt am Quant (Fussnote 5): AWQ V2 = echter Doppel-Gewinn (Prefill +11% UND Single-Decode
 +12%), FP8 V2 = Prefill-Gewinn aber Single-Decode-Einbruch (Decode-Knee), GGUF V2 = nur
 Pinned-MLP-Approximation.
+
+(*M28) maxKV nachkalibriert + config-angeglichen 2026-07-17 (Audit M28): --max-running-requests 8
+(mamba-Pool 50 statt 100 Slots) + reserve 1500 uniform + konvergierter Token-Vektor
+(FP8 32,15,17; AWQ 31,14,19; Q6 auto 30,17,17), HEAD 3e76cbbf1. Die urspruenglichen
+V1-Boot-Werte mit mrr16/Reserve-Bump (FP8 530944, AWQ 566912 [no-MTP-Vektor, unkalibriert],
+Q6 546560) stehen im JSON als maxkv_v1_config. Die vLLM-Zahl enthaelt zusaetzlich
+Mamba-Block-Accounting im unified Pool -- der Rest-Gap (~1.27x, z.B. FP8 824896 vs 1046126)
+ist Accounting-Semantik, kein fehlender Speicher. Speed-Spalten unveraendert (V1-Boots).
 
 ### Szenario S3 -- TP=4 co-located (5090 x2 + 2x 3080, via MPS)
 
@@ -172,12 +180,18 @@ ermittelt -- getrennt nach MTP aus/an:
 | AWQ, no-MTP | 886080 | konvergierter uneven-DCP-Pool ohne Draft-KV (Vektor [31,15,18]) |
 | GGUF-Q6, no-MTP | 840896 | konvergierter uneven-DCP-Pool ohne Draft-KV |
 | FP8, no-MTP | 804416 | konvergierter uneven-DCP-Pool ohne Draft-KV (Vektor [32,15,17]) |
-| FP8, MTP aktiv | 530944 | mit Draft-KV; stabil servend (RESERVE 3000,2200,2200 + TOKVEC 33,13,18) |
-| GGUF-Q6, MTP aktiv | 532224 | mit Draft-KV; stabil servend (RESERVE 3000,2200,2200) |
+| FP8, MTP aktiv (V1-Boot-Config) | 530944 | mit Draft-KV; mrr16 + RESERVE 3000,2200,2200 + TOKVEC 33,13,18 |
+| GGUF-Q6, MTP aktiv (V1-Boot-Config) | 532224 | mit Draft-KV; mrr16 + RESERVE 3000,2200,2200 |
+| FP8, MTP aktiv (M28 nachkalibriert) | 824896 | mrr8 (mamba 50 Slots) + reserve 1500 + Vektor 32,15,17 |
+| AWQ, MTP aktiv (M28 nachkalibriert) | 857408 | mrr8 + reserve 1500 + Vektor 31,14,19 |
+| GGUF-Q6, MTP aktiv (M28 nachkalibriert) | 818880 | mrr8 + reserve 1500 + auto-Vektor 30,17,17 (--skip-server-warmup) |
 
-Der Sprung no-MTP -> MTP (z.B. FP8 804416 -> 530944, -34%) ist FUNDAMENTAL, kein Bug:
-der eingebettete Draft belegt eigenes KV-/Mamba-State-Budget. Die MTP-Zeilen der TP=3-V1-Tabelle
-(FP8 530944, Q6 546560) reproduzieren genau diese MTP-aktive Klasse.
+KORREKTUR (M28, 2026-07-17): Der frueher als FUNDAMENTAL beschriebene Sprung no-MTP -> MTP
+(FP8 804416 -> 530944, -34%) war ueberwiegend CONFIG, nicht Draft-KV: bei mrr8 + reserve 1500
+erreicht FP8 MIT MTP 824896 -- mehr als der no-MTP-Wert 804416. Der Draft kostet real nur
+wenig KV; der alte -34%-Einbruch kam aus dem ueberdimensionierten auto-mamba-Pool
+(mrr16 -> 100 Slots, ~5.4 GB auf der 5090) plus Reserve-Bump. Die alten MTP-Zeilen bleiben
+oben als V1-Boot-Config dokumentiert.
 
 **shvllm TP=3 (aus den Boot-Logs, MTP aktiv):** >1M-Klasse -- FP8 1046126, Q6 1139318,
 AWQ 1146573. Das ist der maximierte DCP-Pool, den vLLM in seiner Boot-Zeile ausweist;
