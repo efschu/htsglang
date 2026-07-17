@@ -1176,14 +1176,21 @@ class ServerArgs:
             help="Headroom (MiB) subtracted from the NVML total when "
             "--rank-tp-ratio auto derives the memory budgets itself. Either "
             "a single value applied to every GPU, or a comma-separated list "
-            "with one value per rank (aligned with --rank-gpu-id). When "
-            "several ranks share one physical GPU, the largest reserve "
-            "among them applies to that GPU. Covers the CUDA context plus "
+            "with one value per rank (aligned with --rank-gpu-id), or "
+            "'auto' (default): derive it as the stock runtime "
+            "activation/metadata reserve plus the CUDA-graph capture "
+            "demand (captured tokens across all graph families x the "
+            "stock 2 MiB/token coefficient; see "
+            "derived_rank_auto_reserve_mib). When several ranks share one "
+            "physical GPU, the largest reserve among them applies to that "
+            "GPU (the derived capture term additionally scales with the "
+            "number of co-located ranks). Covers the CUDA context plus "
             "allocations that appear lazily after KV sizing (NCCL buffers, "
-            "attention workspaces). Only valid with --rank-tp-ratio auto.",
+            "attention workspaces, captured graphs). Only valid with "
+            "--rank-tp-ratio auto.",
             type_parser=str,
         ),
-    ] = 2048
+    ] = "auto"
     rank_perf_loose_ctx_percent: A[
         float,
         Arg(
@@ -4093,10 +4100,12 @@ class ServerArgs:
         self.override("uneven_tp.rank_mem_fraction", mem_fraction_static=fraction)
         return fraction
 
-    #: Default NVML-total headroom (MiB) reserved per GPU when
-    #: --rank-tp-ratio auto derives the budgets itself (CUDA context,
-    #: fragmentation, lazily appearing NCCL/attention buffers).
-    AUTO_RANK_MEMORY_RESERVE_MIB = 2048
+    #: Default NVML-total headroom sentinel for --rank-tp-ratio auto:
+    #: 'auto' derives the reserve per GPU from the actual demand (stock
+    #: runtime activation/metadata reserve + captured-token graph demand,
+    #: see derived_rank_auto_reserve_mib, #68) instead of the former flat
+    #: 2048 MiB constant.
+    AUTO_RANK_MEMORY_RESERVE_MIB = "auto"
 
     def _check_perf_flags(self, ratio_was_perf: bool) -> None:
         """Fail fast on --rank-perf-* flags outside the auto-performance
@@ -4133,39 +4142,55 @@ class ServerArgs:
         if self.rank_gpu_memory_mib is None:
             from collections import Counter
 
-            # --rank-auto-reserve-mib: single value for every GPU, or one
-            # value per rank (aligned with --rank-gpu-id).
-            try:
-                reserve_per_rank = [
-                    int(part) for part in str(self.rank_auto_reserve_mib).split(",")
-                ]
-            except ValueError as e:
-                raise ValueError(
-                    "--rank-auto-reserve-mib must be an integer or a "
-                    "comma-separated list of integers, got "
-                    f"{self.rank_auto_reserve_mib!r}."
-                ) from e
-            if len(reserve_per_rank) == 1:
-                reserve_per_rank *= len(self.rank_gpu_id)
-            if len(reserve_per_rank) != len(self.rank_gpu_id):
-                raise ValueError(
-                    f"--rank-auto-reserve-mib has {len(reserve_per_rank)} "
-                    f"entries but --rank-gpu-id names "
-                    f"{len(self.rank_gpu_id)} ranks; pass one value or "
-                    "exactly one per rank."
-                )
-            if any(r < 0 for r in reserve_per_rank):
-                raise ValueError(
-                    "--rank-auto-reserve-mib values must be >= 0, got "
-                    f"{reserve_per_rank}."
-                )
-            # The reserve is a per-physical-GPU property: if co-located
-            # ranks disagree, the largest requested headroom wins.
-            reserve_per_gpu: Dict[int, int] = {}
-            for gpu_id, res in zip(self.rank_gpu_id, reserve_per_rank):
-                reserve_per_gpu[gpu_id] = max(reserve_per_gpu.get(gpu_id, 0), res)
-
             counts = Counter(self.rank_gpu_id)
+            if str(self.rank_auto_reserve_mib) == "auto":
+                # #68: derive the reserve from the actual demand (stock
+                # runtime reserve + captured-token graph demand; the
+                # capture term scales with the co-located rank count).
+                # See derived_rank_auto_reserve_mib for the formula.
+                gpu_mem = get_device_memory_capacity(self.device)
+                reserve_per_gpu: Dict[int, int] = {
+                    gpu_id: self.derived_rank_auto_reserve_mib(gpu_mem, cnt)
+                    for gpu_id, cnt in counts.items()
+                }
+                logger.info(
+                    "--rank-auto-reserve-mib auto: derived reserve per GPU "
+                    "%s MiB (runtime reserve + captured-token graph "
+                    "demand x co-located ranks; #68).",
+                    {g: r for g, r in sorted(reserve_per_gpu.items())},
+                )
+            else:
+                # --rank-auto-reserve-mib: single value for every GPU, or one
+                # value per rank (aligned with --rank-gpu-id).
+                try:
+                    reserve_per_rank = [
+                        int(part) for part in str(self.rank_auto_reserve_mib).split(",")
+                    ]
+                except ValueError as e:
+                    raise ValueError(
+                        "--rank-auto-reserve-mib must be 'auto', an integer "
+                        "or a comma-separated list of integers, got "
+                        f"{self.rank_auto_reserve_mib!r}."
+                    ) from e
+                if len(reserve_per_rank) == 1:
+                    reserve_per_rank *= len(self.rank_gpu_id)
+                if len(reserve_per_rank) != len(self.rank_gpu_id):
+                    raise ValueError(
+                        f"--rank-auto-reserve-mib has {len(reserve_per_rank)} "
+                        f"entries but --rank-gpu-id names "
+                        f"{len(self.rank_gpu_id)} ranks; pass one value or "
+                        "exactly one per rank."
+                    )
+                if any(r < 0 for r in reserve_per_rank):
+                    raise ValueError(
+                        "--rank-auto-reserve-mib values must be >= 0, got "
+                        f"{reserve_per_rank}."
+                    )
+                # The reserve is a per-physical-GPU property: if co-located
+                # ranks disagree, the largest requested headroom wins.
+                reserve_per_gpu = {}
+                for gpu_id, res in zip(self.rank_gpu_id, reserve_per_rank):
+                    reserve_per_gpu[gpu_id] = max(reserve_per_gpu.get(gpu_id, 0), res)
             mem_info = _query_rank_gpu_memory_mib(self.rank_gpu_id)
             budgets = []
             for gpu_id in self.rank_gpu_id:
@@ -4602,32 +4627,15 @@ class ServerArgs:
                     f"integers, got {vector}."
                 )
 
-    def _handle_gpu_memory_settings(self, gpu_mem):
-        """
-        Configure GPU memory-dependent settings including
-        chunked_prefill_size, cuda_graph_config[decode].max_bs, and mem_fraction_static.
+    def _apply_gpu_mem_capacity_defaults(self, gpu_mem):
+        """Set the GPU-capacity-tier defaults for chunked_prefill_size and
+        cuda_graph_config[decode].max_bs (extracted verbatim from
+        _handle_gpu_memory_settings; idempotent — only fills unset values).
 
-        Here are our heuristics:
-        - Set chunked_prefill_size and cuda_graph_config[decode].max_bs based on the GPU memory capacity.
-          This is because GPUs with more memory are generally more powerful, we need to use a larger
-          chunked_prefill_size and a larger decode max_bs to fully utilize the GPU.
-        - Then set mem_fraction_static based on chunked_prefill_size and decode max_bs.
-
-          GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
-
-          The argument mem_fraction_static is defined as (model weights + KV cache pool) / GPU memory capacity,
-          or equivalently, mem_fraction_static = (GPU memory capacity - activations - cuda graph buffers) / GPU memory capacity.
-
-          In order to compute mem_fraction_static, we need to estimate the size of activations and cuda graph buffers.
-          The activation memory is proportional to the chunked_prefill_size.
-          The cuda graph memory is proportional to the decode max_bs.
-          We use reserved_mem = chunked_prefill_size * 1.5 + max_bs * 2 to estimate the size of activations and cuda graph buffers in GB,
-          and set mem_fraction_static = (GPU memory capacity - reserved_mem) / GPU memory capacity.
-
-          The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
-        """
+        Also called from the uneven-TP auto-reserve derivation, which runs
+        BEFORE _handle_gpu_memory_settings and needs these defaults to
+        compute the capture/activation reserve (#68)."""
         decode_cuda_graph_config = self.cuda_graph_config.decode
-        prefill_cuda_graph_config = self.cuda_graph_config.prefill
 
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
@@ -4690,6 +4698,95 @@ class ServerArgs:
                 self.chunked_prefill_size = 4096
             if decode_cuda_graph_config.max_bs is None:
                 decode_cuda_graph_config.max_bs = 160
+
+    def speculative_capture_token_multiplier(self) -> int:
+        """Captured tokens per decode-graph batch-size unit, summed over the
+        CUDA-graph families a config actually captures (#68).
+
+        The stock mem_fraction heuristic charges graph capture as
+        `decode_max_bs * 2 MiB`, i.e. ONE captured token per batch-size
+        unit. With a draft-model speculative algorithm (EAGLE/NEXTN) three
+        graph families are captured per batch size:
+          * target-verify   at num_draft_tokens tokens per bs,
+          * draft-decode    at 1 token per bs,
+          * draft-extend    at num_draft_tokens tokens per bs,
+        so the captured-token demand per bs unit is 2*D + 1 (D=4 -> 9x the
+        stock estimate). Draft-model-less speculative algorithms (ngram
+        family) capture only target-verify -> D. Non-speculative -> 1."""
+        if self.speculative_algorithm is None:
+            return 1
+        d = self.speculative_num_draft_tokens or 1
+        if self.speculative_draft_model_path is not None:
+            return 2 * d + 1
+        return d
+
+    def derived_rank_auto_reserve_mib(self, gpu_mem, colocated_ranks: int = 1) -> int:
+        """--rank-auto-reserve-mib 'auto' (#68): derive the per-GPU headroom
+        from the actual demand instead of a flat constant.
+
+        The #56/M21 lesson: demand that the reserve does not carry
+        EXPLICITLY is silently subsidized by leftover slack and OOMs the
+        moment the slack disappears (fully converged budgets). The reserve
+        must therefore cover, per physical GPU:
+
+          reserve = runtime_reserve
+                  + capture_tokens * 2 MiB * colocated_ranks
+
+        where
+          * runtime_reserve = 512 + activation_tokens * 1.5 + tp*pp/8*1024
+            (MiB) is the stock activation/metadata heuristic — reused
+            verbatim via mamba_pre_capture_reserve_mb(), no new constants;
+          * capture_tokens = decode_max_bs * speculative_capture_token_multiplier()
+            is the total number of CAPTURED tokens across all graph
+            families (the #68 bug: graph memory scales with captured
+            tokens, not with the decode batch size alone);
+          * 2 MiB/captured-token is the stock per-token graph coefficient
+            from _handle_gpu_memory_settings;
+          * colocated_ranks scales the capture term when several ranks
+            share the physical GPU (each rank process captures its own
+            graphs; the runtime reserve stays shared per-GPU as before).
+        """
+        # Resolve the same capacity-tier defaults the stock path applies
+        # later (idempotent), so chunked_prefill_size / decode max_bs exist.
+        self._apply_gpu_mem_capacity_defaults(gpu_mem)
+        runtime_reserve = self.mamba_pre_capture_reserve_mb(gpu_mem)
+        decode_cfg = self.cuda_graph_config.decode
+        if self.disable_cuda_graph or decode_cfg.backend == Backend.DISABLED:
+            capture_tokens = 0
+        else:
+            capture_tokens = int(decode_cfg.max_bs or 0) * (
+                self.speculative_capture_token_multiplier()
+            )
+        return int(math.ceil(runtime_reserve + capture_tokens * 2 * colocated_ranks))
+
+    def _handle_gpu_memory_settings(self, gpu_mem):
+        """
+        Configure GPU memory-dependent settings including
+        chunked_prefill_size, cuda_graph_config[decode].max_bs, and mem_fraction_static.
+
+        Here are our heuristics:
+        - Set chunked_prefill_size and cuda_graph_config[decode].max_bs based on the GPU memory capacity.
+          This is because GPUs with more memory are generally more powerful, we need to use a larger
+          chunked_prefill_size and a larger decode max_bs to fully utilize the GPU.
+        - Then set mem_fraction_static based on chunked_prefill_size and decode max_bs.
+
+          GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
+
+          The argument mem_fraction_static is defined as (model weights + KV cache pool) / GPU memory capacity,
+          or equivalently, mem_fraction_static = (GPU memory capacity - activations - cuda graph buffers) / GPU memory capacity.
+
+          In order to compute mem_fraction_static, we need to estimate the size of activations and cuda graph buffers.
+          The activation memory is proportional to the chunked_prefill_size.
+          The cuda graph memory is proportional to the decode max_bs.
+          We use reserved_mem = chunked_prefill_size * 1.5 + max_bs * 2 to estimate the size of activations and cuda graph buffers in GB,
+          and set mem_fraction_static = (GPU memory capacity - reserved_mem) / GPU memory capacity.
+
+          The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
+        """
+        decode_cuda_graph_config = self.cuda_graph_config.decode
+        prefill_cuda_graph_config = self.cuda_graph_config.prefill
+
+        self._apply_gpu_mem_capacity_defaults(gpu_mem)
 
         # Set cuda graph batch sizes
         if self.device != "cpu":
@@ -4868,6 +4965,19 @@ class ServerArgs:
             self.disaggregation_mode != "prefill"
             and decode_cuda_graph_config.backend != Backend.DISABLED
         ):
+            # #68 note: with a draft-model speculative algorithm the TRUE
+            # capture demand scales with captured tokens across three graph
+            # families (decode_max_bs * (2*D+1), see
+            # speculative_capture_token_multiplier), not with max_bs alone.
+            # The stock per-bs term is deliberately KEPT here regardless:
+            # after the #70 fix (capture-safe chunked dequant) the real
+            # spec-capture footprint is small again, and inflating this
+            # reserve measurably regresses marginal fraction-path boots
+            # (t72 A/B: multimodal GGUF TP=2 on 20 GiB cards tipped the
+            # mamba pool from 5 to 4 slots -> "state cache too small").
+            # The uneven-TP absolute-reserve path, whose flat default DID
+            # OOM at capture, carries the full captured-token formula
+            # instead (derived_rank_auto_reserve_mib).
             reserved_mem += decode_cuda_graph_config.max_bs * 2
 
         if (
