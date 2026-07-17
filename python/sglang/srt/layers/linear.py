@@ -23,6 +23,8 @@ from sglang.srt.distributed import (
     tensor_model_parallel_quant_all_reduce,
 )
 from sglang.srt.distributed.utils import (
+    attn_kv_replicated,
+    attn_q_partition_units,
     tp_loaded_shard_start,
     tp_partition_size,
     tp_partition_sizes,
@@ -410,18 +412,43 @@ class ColumnParallelLinear(LinearBase):
         self.tp_units = _quant_block_aligned_units(
             _units_basis, self.tp_units, quant_config, 0
         )
-        self.output_size_per_partition = tp_partition_size(
-            self.output_size, tp_size, tp_rank, self.tp_units, self.tp_family
-        )
-        self.output_partition_sizes = [self.output_size_per_partition]
-        # If QKV or MergedColumn, use output size of each partition.
-        if hasattr(self, "output_sizes"):
+        if getattr(self, "kv_replicated_parts", None):
+            # REPLICATED-KV QKV mode (TP > num_kv_heads, task #62): the k/v
+            # output blocks are FULLY replicated on every rank (entry True)
+            # while the q block is partitioned by the shard plan in
+            # kv_total-sized q-head units (self.tp_units). The whole-output
+            # partition below cannot express this mix, so build the per-part
+            # sizes directly. Only QKVParallelLinear sets this attribute; the
+            # default path is untouched.
+            assert hasattr(self, "output_sizes") and len(
+                self.kv_replicated_parts
+            ) == len(self.output_sizes)
             self.output_partition_sizes = [
-                tp_partition_size(
-                    output_size, tp_size, tp_rank, self.tp_units, self.tp_family
+                (
+                    output_size
+                    if replicated
+                    else tp_partition_size(
+                        output_size, tp_size, tp_rank, self.tp_units, self.tp_family
+                    )
                 )
-                for output_size in self.output_sizes
+                for output_size, replicated in zip(
+                    self.output_sizes, self.kv_replicated_parts
+                )
             ]
+            self.output_size_per_partition = sum(self.output_partition_sizes)
+        else:
+            self.output_size_per_partition = tp_partition_size(
+                self.output_size, tp_size, tp_rank, self.tp_units, self.tp_family
+            )
+            self.output_partition_sizes = [self.output_size_per_partition]
+            # If QKV or MergedColumn, use output size of each partition.
+            if hasattr(self, "output_sizes"):
+                self.output_partition_sizes = [
+                    tp_partition_size(
+                        output_size, tp_size, tp_rank, self.tp_units, self.tp_family
+                    )
+                    for output_size in self.output_sizes
+                ]
 
         if output_sizes is None:
             output_sizes = [output_size]
@@ -1178,6 +1205,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         load_presharded_attn: bool = False,
         v_head_size: Optional[int] = None,
         skip_block_quant_check: bool = False,
+        q_shard_unit_count: Optional[int] = None,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -1193,19 +1221,6 @@ class QKVParallelLinear(ColumnParallelLinear):
             tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
         if tp_plan_active(tp_size):
-            # Uneven TP (--rank-tp-ratio): heads are distributed by the
-            # shard plan with the KV heads as indivisible units, so every
-            # rank owns whole GQA groups (its q heads are an exact
-            # multiple of its kv heads). KV-head replication is not
-            # supported in this mode: every rank must own at least one
-            # whole kv head.
-            if tp_size > self.total_num_kv_heads:
-                raise ValueError(
-                    f"--rank-tp-ratio: tp_size ({tp_size}) exceeds "
-                    f"total_num_kv_heads ({self.total_num_kv_heads}); "
-                    "kv-head replication is not supported with uneven TP. "
-                    "Every rank must own at least one whole kv head."
-                )
             if self.total_num_heads % self.total_num_kv_heads != 0:
                 raise ValueError(
                     f"--rank-tp-ratio: total_num_heads "
@@ -1213,14 +1228,48 @@ class QKVParallelLinear(ColumnParallelLinear):
                     f"total_num_kv_heads ({self.total_num_kv_heads}) to "
                     "distribute whole GQA groups per rank."
                 )
-            self.tp_units = self.total_num_kv_heads
-            self.num_heads = tp_partition_size(
-                self.total_num_heads, tp_size, tp_rank, self.tp_units
-            )
-            self.num_kv_heads = tp_partition_size(
-                self.total_num_kv_heads, tp_size, tp_rank, self.tp_units
-            )
-            self.num_kv_head_replicas = 1
+            if attn_kv_replicated(tp_size, self.total_num_kv_heads):
+                # TP > num_kv_heads (task #62): REPLICATED-KV mode. Every
+                # rank holds ALL kv heads (k/v projections fully replicated
+                # -> identical K/V recomputed per rank, upstream-replication
+                # semantics, no broadcast); the q heads split in units of
+                # kv_total heads so per-rank num_qo % num_kv == 0 holds for
+                # the attention kernels. `q_shard_unit_count` is the unit
+                # COUNT of the q block — callers with a fused q(+gate) block
+                # must pass the real q-head-based count
+                # (q_real // kv_total), since the fused slot count would
+                # halve the unit size.
+                self.tp_units = (
+                    q_shard_unit_count
+                    if q_shard_unit_count is not None
+                    else attn_q_partition_units(
+                        self.total_num_heads, self.total_num_kv_heads, tp_size
+                    )
+                )
+                self.num_heads = tp_partition_size(
+                    self.total_num_heads, tp_size, tp_rank, self.tp_units
+                )
+                self.num_kv_heads = self.total_num_kv_heads
+                # Marks the "every rank loads the full k/v checkpoint
+                # width" case for the qkv weight loaders (shard_id
+                # tp_rank // replicas == 0, full-width narrow).
+                self.num_kv_head_replicas = tp_size
+                # Base-class directive: partition q by the plan, keep k/v
+                # full on every rank (see ColumnParallelLinear.__init__).
+                self.kv_replicated_parts = [False, True, True]
+            else:
+                # Uneven TP (--rank-tp-ratio): heads are distributed by the
+                # shard plan with the KV heads as indivisible units, so
+                # every rank owns whole GQA groups (its q heads are an
+                # exact multiple of its kv heads).
+                self.tp_units = self.total_num_kv_heads
+                self.num_heads = tp_partition_size(
+                    self.total_num_heads, tp_size, tp_rank, self.tp_units
+                )
+                self.num_kv_heads = tp_partition_size(
+                    self.total_num_kv_heads, tp_size, tp_rank, self.tp_units
+                )
+                self.num_kv_head_replicas = 1
         else:
             self.tp_units = None
             self.num_heads = divide(self.total_num_heads, tp_size)
@@ -1436,19 +1485,29 @@ class QKVParallelLinear(ColumnParallelLinear):
         if is_gguf_weight:
             output_dim = getattr(param, "output_dim", None)
             total = loaded_weight.size(output_dim)
-            # Uneven TP: this rank's row (output) partition; reproduces even
-            # //tp_size with no plan. Rows are whole -> no quant-block concern.
-            shard_size = tp_partition_size(
-                total, self.tp_size, self.tp_rank, self.tp_units, self.tp_family
-            )
-            start_idx = tp_loaded_shard_start(
-                total,
-                self.tp_size,
-                self.tp_rank,
-                shard_size,
-                self.tp_units,
-                self.tp_family,
-            )
+            if self.num_kv_head_replicas == self.tp_size and loaded_shard_id in (
+                "k",
+                "v",
+            ):
+                # REPLICATED-KV mode (TP > num_kv_heads, task #62): every
+                # rank keeps the FULL k/v projection rows; only the q rows
+                # are partitioned (in kv_total-sized head units).
+                shard_size, start_idx = total, 0
+            else:
+                # Uneven TP: this rank's row (output) partition; reproduces
+                # even //tp_size with no plan. Rows are whole -> no
+                # quant-block concern.
+                shard_size = tp_partition_size(
+                    total, self.tp_size, self.tp_rank, self.tp_units, self.tp_family
+                )
+                start_idx = tp_loaded_shard_start(
+                    total,
+                    self.tp_size,
+                    self.tp_rank,
+                    shard_size,
+                    self.tp_units,
+                    self.tp_family,
+                )
 
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 

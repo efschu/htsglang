@@ -248,8 +248,18 @@ class FusedMoE(torch.nn.Module):
         # to before).
         _moe_units = intermediate_size
         _block = getattr(quant_config, "weight_block_size", None) if quant_config else None
+        _group = getattr(quant_config, "group_size", None) if quant_config else None
         if _block and intermediate_size % _block[0] == 0:
             _moe_units = intermediate_size // _block[0]
+        elif _group and _group > 0 and intermediate_size % _group == 0:
+            # Group-quantized MoE (AWQ/GPTQ wna16, e.g. A3B AWQ group=32):
+            # shard cuts must land on group boundaries, exactly like the
+            # FP8 block case above — element-granular units would hand
+            # ranks non-group-aligned intermediate shards, which
+            # MoeWNA16Method.create_weights rejects (group_size >= 32
+            # assert after halving). Even split and no-plan paths are
+            # untouched (units are only consulted under a shard plan).
+            _moe_units = intermediate_size // _group
         self.moe_tp_units = _moe_units
         self.moe_tp_family = "moe"
         if tp_plan_active(self.moe_tp_size, self.moe_tp_family):
