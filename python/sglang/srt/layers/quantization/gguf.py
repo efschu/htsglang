@@ -947,6 +947,11 @@ class GGUFMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: GGUFConfig):
         self.quant_config = quant_config
+        # GGUF MoE has no fused-experts override path; define the attribute so
+        # the `assert self.fused_experts is None` guard in apply() evaluates
+        # instead of raising AttributeError on the (previously untested) MoE
+        # forward.
+        self.fused_experts = None
 
     def create_weights(
         self,
@@ -1014,6 +1019,17 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        # Assemble the GGUF MoE UninitializedParameters from their loaded
+        # data_containers. On the CUDA path this is the ONLY hook that runs
+        # materialize_gguf_weights (the Ascend method has its own copy), and
+        # it is required for the uneven-TP expert-dim sharding path: it also
+        # appends the trailing zero-pad expert and registers the global->
+        # local topk remap buffer used by FusedMoE.forward_impl. Safe no-op
+        # for already-materialized / non-GGUF params.
+        if hasattr(layer, "materialize_gguf_weights"):
+            layer.materialize_gguf_weights()
 
     def apply(
         self,
