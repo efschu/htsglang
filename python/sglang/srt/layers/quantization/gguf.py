@@ -235,6 +235,32 @@ def _batched_mmvq_enabled() -> bool:
     return _dequant_supports_out()
 
 
+# Task #73: probe for the tuned K-quant batched MMVQ kernel. Returns True only
+# on a wheel that carries the ggml_mmvq_kq_tuned op (new build) AND with the
+# runtime kill switch SGLANG_GGUF_KQ_KERNEL != 0 (the C++ op consults it). Old
+# wheels lack the op -> False -> the legacy #72 crossover is kept unchanged.
+_kq_tuned_cached: bool | None = None
+
+
+def _kq_kernel_tuned() -> bool:
+    global _kq_tuned_cached
+    if _kq_tuned_cached is None:
+        # Detect via op EXISTENCE (hasattr), not by calling it: the probe takes
+        # no tensor args, so torch's dispatcher has no key to route .default()
+        # and raises NotImplementedError. Its mere registration already marks a
+        # tuned-kernel wheel (old wheels lack the op). The runtime kill switch
+        # SGLANG_GGUF_KQ_KERNEL is then mirrored here exactly as the C++ side
+        # reads it (unset or non-'0' == enabled), so disabling the kernel also
+        # restores the legacy #72 MMVQ->MMQ crossover.
+        try:
+            has_op = hasattr(torch.ops.sgl_kernel, "ggml_mmvq_kq_tuned")
+        except Exception:
+            has_op = False
+        env = os.environ.get("SGLANG_GGUF_KQ_KERNEL", "1")
+        _kq_tuned_cached = has_op and (len(env) == 0 or env[0] != "0")
+    return _kq_tuned_cached
+
+
 # ---------------------------------------------------------------------------
 # Shape-aware K-quant dispatch on consumer (sm < 9) devices (task #72, from
 # the t69/t72 microbenches on RTX 3080 at the REAL Qwen3.6-27B TP=2 shard
@@ -297,6 +323,13 @@ def _kquant_prefers_mmq(m: int, qweight: torch.Tensor, qweight_type: int) -> boo
     if not _batched_mmvq_enabled():
         return False
     if _device_sm_major() >= 9:
+        return False
+    # Task #73: with the tuned K-quant MMVQ kernel active, MMVQ beats MMQ at
+    # every measured M<=8 on sm86 (RTX 3080, t73_kq_bench: Q6_K gate TP2-shard
+    # M=8 = 367 vs MMQ 172 GB/s; Q6_K down TP2 M=8 = 371 vs 116; Q4_K down TP2
+    # M=8 = 223 vs 138). The #72 MMVQ->MMQ reroute was calibrated on the SLOW
+    # legacy kernel and is now a pessimization, so keep everything on MMVQ.
+    if _kq_kernel_tuned():
         return False
     if m >= _KQUANT_MMQ_ALL_MIN_M:
         return True
