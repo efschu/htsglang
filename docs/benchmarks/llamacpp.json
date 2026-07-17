@@ -1,0 +1,122 @@
+{
+  "_meta": {
+    "engine": "llama.cpp",
+    "image": "ghcr.io/ggml-org/llama.cpp:server-cuda (b10015 upstream, id 297b3e6a71e1)",
+    "model": "unsloth/Qwen3.6-27B-MTP-GGUF (embedded MTP draft)",
+    "host": "proxmox (docker via ssh); GPUs 0=RTX3080(20GB) 1=RTX5090(32GB) 2=RTX3080(20GB)",
+    "measured_by": "Phase 3a (M27a) 2026-07-16",
+    "harness": "bench_measure.py --api llamacpp (/completion, native timings.prompt_per_second/predicted_per_second); dk_cell/dk_launch/dk_measure/dk_down",
+    "metric_defs": {
+      "prefill20k": "P1: single request, 20000 exact unique input_ids, n_predict=1 -> server-native prompt_per_second (tok/s)",
+      "decode1k_code": "D1 CODE: single ~1000-token decode (n_predict=1000, ignore_eos) -> native predicted_per_second (tok/s)",
+      "decode1k_prose": "D1 PROSE: single ~1000-token decode (n_predict=1000, ignore_eos) -> native predicted_per_second (tok/s)",
+      "par8_prefill": "P8: 8 parallel requests x 6000 exact input_ids, n_predict=1 -> total_prompt_tokens / wall (aggregate tok/s)",
+      "par8_decode_code": "D8 CODE: 8 parallel x ~400-token decode -> total_completion_tokens / wall (aggregate tok/s)",
+      "par8_decode_prose": "D8 PROSE: 8 parallel x ~400-token decode -> aggregate tok/s",
+      "maxKV_tokens": "largest bootable+serving -c (total context) via cooldown-gated bisection; llama.cpp analog of sglang max_total_num_tokens"
+    },
+    "global_caveats": [
+      "q8_0 KV CAVEAT: llama.cpp has NO fp8 KV cache. All cells use 8-bit BLOCK-quant KV (-ctk/-ctv q8_0, +draft -ctkd/-ctvd q8_0, -fa on) as the closest analog to the other engines' --kv-cache-dtype fp8. q8_0 (block-quant) != fp8 (per-tensor).",
+      "MTP/spec ACTIVE on every decode: --spec-type draft-mtp --spec-draft-n-max 3 (embedded MTP draft). llama.cpp /completion does NOT expose the spec acceptance length, so D1/D8 accept = null; the decode tok/s already reflect the MTP speedup.",
+      "UNCACHED verified by construction: cache_prompt:false + unique per-request input_ids (random nonce/salt) + prompt_tokens ALWAYS == requested count (every token evaluated, no prefix reuse). NOTE the harness field 'uncached_ok' reports FALSE for llama.cpp because llama.cpp's response 'tokens_cached' = tokens resident in KV AFTER the prefill (not cross-request prefix-cache hits); it is a benign field-semantics mismatch, not real caching.",
+      "prefill/decode tok/s are server-native (timings.*_per_second), excluding HTTP roundtrip; single warmed sample per boot (bench_measure.py runs one warmed battery per invocation; it has no built-in median-of-3 loop). maxKV IS a bisection.",
+      "HARNESS FIXES applied (M27a, documented): (1) llamacpp_run.sh MODELPATH pointed at the VM-side GGUF dir (which ships a valid HF tokenizer) instead of the host mount path, so bench_measure's exact-length prefill tokenizer loads; (2) bench_measure.py llamacpp adapter now sends ignore_eos:true so decode length is deterministic (a prose decode had stopped at 4 tokens)."
+    ]
+  },
+
+  "q8_layersplit": {
+    "cell": "S1 layer-split, GGUF Q8 (UD-Q8_K_XL), 3 GPUs",
+    "quant": "Qwen3.6-27B-UD-Q8_K_XL.gguf (35.8 GB)",
+    "split": "-sm layer across all 3 GPUs (5090+2x3080=72GB); layer-split is the 3-card mode (TP cannot span 3 heterogeneous cards)",
+    "prefill20k": 1835.4,
+    "decode1k_code": 57.9,
+    "decode1k_prose": 45.0,
+    "par8_prefill": 1914.4,
+    "par8_decode_code": 150.1,
+    "par8_decode_prose": 156.8,
+    "maxKV_tokens": 355568,
+    "maxKV_detail": "355568 boots+serves; 360128 OOMs (memory-bound, real)",
+    "startup_args": {
+      "docker_run": "docker run -d --name llbench --gpus all --security-opt apparmor=unconfined -e CUDA_DEVICE_ORDER=PCI_BUS_ID -v <models-cache>:/models:ro -p 8020:8080 ghcr.io/ggml-org/llama.cpp:server-cuda",
+      "server_common": "--host 0.0.0.0 --port 8080 -m /models/unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q8_K_XL.gguf -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q8_0 --spec-type draft-mtp --spec-draft-n-max 3 --jinja -sm layer",
+      "bootA_prefill_decode": "-c 24576 -np 1 -b 4096 -ub 2048   (source of prefill20k, decode1k_code, decode1k_prose)",
+      "bootB_parallel": "-c 57344 -np 8   (source of par8_prefill, par8_decode_*)",
+      "bootC_maxkv": "-sm layer -c <bisected> -np 1 (SMOKE boot+serve check)"
+    },
+    "notes": [
+      "q8_0 block-quant KV (no fp8 in llama.cpp).",
+      "MTP draft active (--spec-type draft-mtp); accept-length not exposed by llama.cpp.",
+      "par8 decode ~2.6x single-stream decode (real 8-slot batching)."
+    ]
+  },
+
+  "q6_layersplit": {
+    "cell": "S1 layer-split, GGUF Q6 (UD-Q6_K_XL), 3 GPUs",
+    "quant": "Qwen3.6-27B-UD-Q6_K_XL.gguf (26.0 GB)",
+    "split": "-sm layer across all 3 GPUs (72GB)",
+    "prefill20k": 1688.9,
+    "decode1k_code": 74.5,
+    "decode1k_prose": 50.8,
+    "par8_prefill": 1741.5,
+    "par8_decode_code": 176.3,
+    "par8_decode_prose": 154.6,
+    "maxKV_tokens": 518096,
+    "maxKV_detail": "518096 boots+serves; 526752 OOMs (memory-bound, real)",
+    "startup_args": {
+      "docker_run": "docker run -d --name llbench --gpus all --security-opt apparmor=unconfined -e CUDA_DEVICE_ORDER=PCI_BUS_ID -v <models-cache>:/models:ro -p 8020:8080 ghcr.io/ggml-org/llama.cpp:server-cuda",
+      "server_common": "--host 0.0.0.0 --port 8080 -m /models/unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q6_K_XL.gguf -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q8_0 --spec-type draft-mtp --spec-draft-n-max 3 --jinja -sm layer",
+      "bootA_prefill_decode": "-c 24576 -np 1 -b 4096 -ub 2048",
+      "bootB_parallel": "-c 57344 -np 8",
+      "bootC_maxkv": "-sm layer -c <bisected> -np 1"
+    },
+    "notes": [
+      "q8_0 block-quant KV (no fp8 in llama.cpp).",
+      "MTP draft active; accept-length not exposed.",
+      "Faster decode & higher maxKV than Q8 (lighter weights leave more KV room)."
+    ]
+  },
+
+  "q6_tp2_tensor": {
+    "cell": "S2 TP=2, GGUF Q6, 2x RTX3080 (genuine tensor-parallel)",
+    "quant": "Qwen3.6-27B-UD-Q6_K_XL.gguf (26.0 GB)",
+    "split": "-sm tensor across the two RTX3080s (CUDA_VISIBLE_DEVICES=0,2). This is REAL tensor parallelism (splits weights AND KV, NCCL allreduce), the intended '2-card TP=2' cell. Replaces the originally-planned '-sm row' which is INFEASIBLE here (see notes).",
+    "prefill20k": 1089.8,
+    "decode1k_code": 79.6,
+    "decode1k_prose": 63.5,
+    "par8_prefill": 991.2,
+    "par8_decode_code": 149.5,
+    "par8_decode_prose": 130.8,
+    "maxKV_tokens": 266856,
+    "maxKV_detail": "266856 boots+serves; 271068 OOMs (memory-bound, real; only 2x20GB=40GB). Verified OOM at 393216 with nvidia-smi.",
+    "startup_args": {
+      "docker_run": "docker run -d --name llbench --gpus all --ipc=host --shm-size=4g --security-opt apparmor=unconfined -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e CUDA_VISIBLE_DEVICES=0,2 -e NCCL_P2P_DISABLE=1 -e NCCL_NVLS_ENABLE=0 -e NCCL_DEBUG=WARN -v <models-cache>:/models:ro -p 8020:8080 ghcr.io/ggml-org/llama.cpp:server-cuda",
+      "server_common": "--host 0.0.0.0 --port 8080 -m /models/unsloth/Qwen3.6-27B-MTP-GGUF/Qwen3.6-27B-UD-Q6_K_XL.gguf -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -ctkd q8_0 -ctvd q8_0 --spec-type draft-mtp --spec-draft-n-max 3 --jinja -sm tensor",
+      "bootA_prefill_decode": "-c 24576 -np 1 -b 4096 -ub 2048",
+      "bootB_parallel": "-c 57344 -np 8",
+      "bootC_maxkv": "-sm tensor -c <bisected> -np 1",
+      "NCCL_DOCKER_REQUIREMENT": "-sm tensor does cross-GPU allreduce over NCCL. Default docker (64MB /dev/shm, no IPC ns) makes NCCL abort with 'unhandled system error' at ncclGroupEnd(). REQUIRED: --ipc=host --shm-size=4g + NCCL_P2P_DISABLE=1 (no P2P on these GeForce cards) + NCCL_NVLS_ENABLE=0. With these it boots and serves."
+    },
+    "notes": [
+      "ORIGINAL '-sm row' cell is INFEASIBLE on this hardware: fails at model load with 'device CUDA0 does not support split buffers' — row-split needs GPU split-buffer/P2P support, and nvidia-smi -p2p r shows NS/CNS for ALL GPU pairs (PHB-only PCIe, no NVLink; GeForce P2P disabled). Switched to -sm tensor, the genuine TP mode, per user direction.",
+      "-sm tensor logs 'backend sampling not supported with SPLIT_MODE_TENSOR; using CPU' -> sampling runs on CPU in tensor mode (a llama.cpp limitation, not an error).",
+      "'llama_params_fit is not implemented for SPLIT_MODE_TENSOR' -> auto-fit disabled; -c is taken as requested (relevant for maxKV).",
+      "Prefill (P1 1089.8, P8 991.2) is LOWER than 3-GPU layer-split: NCCL allreduce over SHM transport (no P2P) adds cross-GPU sync cost per layer. Single-stream DECODE (79.6 code) is FASTER than layer-split (74.5) because tensor-parallel splits the decode compute across both GPUs instead of pipelining.",
+      "q8_0 block-quant KV; MTP draft active; accept-length not exposed."
+    ]
+  },
+
+  "_supplementary_q6_tp2_layersplit": {
+    "cell": "INTERIM 2-GPU layer-split (superseded by q6_tp2_tensor after user's TP correction; kept for reference only)",
+    "split": "-sm layer across the two RTX3080s (no P2P needed)",
+    "prefill20k": 1138.1,
+    "decode1k_code": 55.2,
+    "decode1k_prose": 47.1,
+    "par8_prefill": 1034.5,
+    "par8_decode_code": 50.7,
+    "par8_decode_prose": 34.5,
+    "maxKV_tokens": null,
+    "notes": [
+      "Not a matrix cell. Recorded before the user clarified that the 2-card cell must be genuine tensor-parallel (-sm tensor). Shows 2-GPU layer-split (pipelined) is much slower in parallel decode than 2-GPU tensor-parallel."
+    ]
+  }
+}
