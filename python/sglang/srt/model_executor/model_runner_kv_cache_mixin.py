@@ -1764,13 +1764,79 @@ class ModelRunnerKVCacheMixin:
                 "and --kv-cache-dtype != fp4_e2m1."
             )
 
+    def _hybrid_kv_token_cap(self: ModelRunner) -> Optional[int]:
+        """Physically reachable ceiling on max_total_num_tokens for hybrid
+        mamba/GDN + attention models (#79).
+
+        In a hybrid model only the (few) full-attention layers carry a KV
+        cache, so the per-token cell size is tiny and the profiling path's
+        ``available_bytes // cell_size`` inflates the token pool to a value
+        that can never be filled: serving concurrency is bounded by the mamba
+        state pool (one live sequence per state slot) and each sequence spans
+        at most ``context_len`` tokens. The most KV tokens ever in flight is
+        therefore ``max_running_requests * (context_len + per-request decode
+        headroom)``. Beyond that ceiling the KV pool holds slots that no mamba
+        state can ever index (wasted VRAM) and the reported number swings with
+        fragmentation across reboots (A3B-GGUF reported ~3.3M against a
+        16*32768=524288 true bound).
+
+        Returns ``None`` for non-hybrid models -- their pure-attention KV pools
+        legitimately exceed running*ctx to back the prefix/radix cache -- and
+        whenever concurrency or context length cannot be determined (no cap).
+        """
+        if self.mambaish_config is None:
+            return None
+        sa = self.server_args
+        # Number of distinct sequences the system can hold state for. Take the
+        # larger of the scheduler's admission limit and the mamba state pool's
+        # own capacity (state slots // mamba_ratio, which INCLUDES the radix
+        # cache's extra state buffer). Using the mamba capacity keeps the cap
+        # from hurting prefix-cache-heavy workloads where a long shared prefix
+        # occupies one mamba state but many KV tokens.
+        concurrency = 0
+        if sa.max_running_requests and sa.max_running_requests > 0:
+            concurrency = sa.max_running_requests
+        if sa.max_mamba_cache_size:
+            ratio = max(self._calculate_mamba_ratio(), 1)
+            concurrency = max(concurrency, sa.max_mamba_cache_size // ratio)
+        if concurrency <= 0:
+            return None
+        ctx = self.model_config.context_len
+        if not ctx or ctx <= 0:
+            return None
+        # Per-request decode/spec headroom beyond context_len, matching the
+        # req_to_token allocation width.
+        extra = get_req_to_token_extra_context_len(sa)
+        return int(concurrency) * (int(ctx) + int(extra))
+
+    def _apply_hybrid_kv_token_cap(
+        self: ModelRunner, token_capacity: int, cap: Optional[int]
+    ) -> int:
+        """Clamp a resolved token capacity to the hybrid physical ceiling and
+        log once when the cap actually binds."""
+        if cap is None or token_capacity <= cap:
+            return token_capacity
+        logger.info(
+            "Hybrid mamba/attention KV cap: max_total_num_tokens %d -> %d "
+            "(max_running_requests=%s x (context_len=%d + headroom); the "
+            "full-attention-only KV cell size otherwise overstates a "
+            "physically unreachable capacity).",
+            token_capacity,
+            cap,
+            self.server_args.max_running_requests,
+            self.model_config.context_len,
+        )
+        return cap
+
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
-        """Apply external constraints to token capacity: user cap, PP sync.
+        """Apply external constraints to token capacity: user cap, PP sync,
+        and the hybrid mamba/attention physical ceiling (#79).
 
         Page alignment is handled by the configurator, not here.
         If constraints change the value, the configurator re-runs and re-aligns.
         """
         user_limit = self.server_args.max_total_tokens
+        hybrid_cap = self._hybrid_kv_token_cap()
 
         # Apply user-specified upper bound
         if user_limit is not None:
@@ -1813,6 +1879,9 @@ class ModelRunnerKVCacheMixin:
             token_capacity = int(local_blocks.item()) * split_factor
             if user_limit is not None:
                 token_capacity = min(token_capacity, user_limit)
+            token_capacity = self._apply_hybrid_kv_token_cap(
+                token_capacity, hybrid_cap
+            )
             return token_capacity
 
         # Sync across PP ranks (each may have different layer counts) and
@@ -1834,6 +1903,7 @@ class ModelRunnerKVCacheMixin:
             )
             token_capacity = tensor.item()
 
+        token_capacity = self._apply_hybrid_kv_token_cap(token_capacity, hybrid_cap)
         return token_capacity
 
     #: Weight families the self-calibration can shift, mapped to the
