@@ -111,6 +111,23 @@ _PREDICT_LINK_ALPHA = 0.25
 #: knee-exact C6 vector 5,1,1 delivers at decode +0.8%). The guard is the
 #: trust region of the prefill model as much as a decode protection.
 _PREDICT_DECODE_KNEE_TOL = 0.02
+#: MLP unit grids finer than this land close to the continuous decode knee,
+#: so the strict byte-share test alone is trustworthy. Coarser grids (FP8
+#: dense ~136 units, GGUF K-quant ~68 units) can only realize the split in
+#: large steps, and the nearest representable vector can sit measurably ABOVE
+#: the knee even when its whole-model streamed-byte share still reads under
+#: the bandwidth share (M27d: FP8 4,1,1 = 51.5% bytes-share < 51.9% membw
+#: share, yet decode -14/-24% vs the auto split -- the per-layer lockstep
+#: bottleneck bites before the whole-model share crosses). For such coarse
+#: grids we require extra headroom below the knee (see below).
+_PREDICT_KNEE_COARSE_UNITS = 256
+#: On a coarse MLP grid, require this many unit-steps of streamed-byte-share
+#: headroom below a rank's bandwidth share before admitting a candidate, so
+#: the optimizer rounds DOWN to the last safe vector instead of the lumpy
+#: overshoot. Calibrated on the M27d rig (5090 + 2x3080, membw share 51.9%):
+#: this rejects the FP8 4,1,1 knee overshoot (picking the 3,1,1 class) while
+#: the fine AWQ 544-unit grid is unaffected and keeps its measured-win 5,1,1.
+_PREDICT_KNEE_COARSE_HEADROOM_UNITS = 2
 #: TP-degree recommendation: a GPU whose best pairwise link is below this
 #: fraction of the rig's best link is called out as a drop candidate.
 _TP_DROP_LINK_FRACTION = 0.7
@@ -460,6 +477,294 @@ class _Family:
         return self.params * self.bytes_per_param
 
 
+# ---------------------------------------------------------------------------
+# GGUF metadata reader (dependency-free; mirrors the header-only reader in
+# the fork's GGUF plugin). Needed because for a GGUF checkpoint the model
+# path is a single .gguf FILE, so the HF ``config.json`` the cost model would
+# otherwise open does not exist next to it (older builds crashed here with
+# NotADirectoryError). We read the fields the cost model needs straight from
+# the GGUF key/value header, and derive per-weight-family bytes/element from
+# the tensor-info block's ggml quant types so the family byte model is
+# roughly correct for quantized GGUF checkpoints (embed/lm_head, attention
+# and MLP are quantized here, unlike the "BF16-inside-INT4" safetensors
+# assumption). Duplicating ~30 lines of header parsing keeps this module
+# self-contained (no import from the model loader) and the scope clean.
+# ---------------------------------------------------------------------------
+
+#: ggml quant type -> (block_size, bytes_per_block). bytes/element =
+#: bytes_per_block / block_size. Covers the k-quant / legacy / IQ / float
+#: types that appear in Unsloth "UD-*_K_XL" and stock GGUF checkpoints; an
+#: unknown type falls back to 2 B/element (BF16-equivalent) with a warning.
+_GGML_TYPE_SIZE: Dict[int, Tuple[int, int]] = {
+    0: (1, 4),      # F32
+    1: (1, 2),      # F16
+    2: (32, 18),    # Q4_0
+    3: (32, 20),    # Q4_1
+    6: (32, 22),    # Q5_0
+    7: (32, 24),    # Q5_1
+    8: (32, 34),    # Q8_0
+    9: (32, 36),    # Q8_1
+    10: (256, 84),  # Q2_K
+    11: (256, 110), # Q3_K
+    12: (256, 144), # Q4_K
+    13: (256, 176), # Q5_K
+    14: (256, 210), # Q6_K
+    15: (256, 292), # Q8_K
+    16: (256, 66),  # IQ2_XXS
+    17: (256, 74),  # IQ2_XS
+    18: (256, 98),  # IQ3_XXS
+    19: (256, 50),  # IQ1_S
+    20: (32, 18),   # IQ4_NL
+    21: (256, 110), # IQ3_S
+    22: (256, 82),  # IQ2_S
+    23: (256, 136), # IQ4_XS
+    24: (1, 1),     # I8
+    25: (1, 2),     # I16
+    26: (1, 4),     # I32
+    30: (1, 2),     # BF16
+}
+
+#: GGUF metadata value-type enum (subset used by the header).
+_GGUF_T_UINT8, _GGUF_T_INT8, _GGUF_T_UINT16, _GGUF_T_INT16 = 0, 1, 2, 3
+_GGUF_T_UINT32, _GGUF_T_INT32, _GGUF_T_FLOAT32, _GGUF_T_BOOL = 4, 5, 6, 7
+_GGUF_T_STRING, _GGUF_T_ARRAY, _GGUF_T_UINT64, _GGUF_T_INT64 = 8, 9, 10, 11
+_GGUF_T_FLOAT64 = 12
+_GGUF_SCALAR_FMT = {
+    0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "B",
+    10: "Q", 11: "q", 12: "d",
+}
+
+
+def _is_gguf_model(model_path: Optional[str]) -> bool:
+    """A GGUF checkpoint is addressed by a single .gguf file rather than a
+    directory with config.json."""
+    if not model_path:
+        return False
+    p = str(model_path)
+    return p.lower().endswith(".gguf") or os.path.isfile(p)
+
+
+def _read_gguf_metadata(path: str) -> Tuple[Dict[str, object], Dict[str, int], List[dict]]:
+    """Return (scalar KV dict, array-length dict, tensor-info list) from a
+    GGUF file's header. Array values are NOT materialized (the token/merge
+    arrays hold ~250k entries); only their length is recorded, which is all
+    the cost model needs (vocab size). Tensor infos are
+    [{name, dims, ggml_type}]."""
+    import struct
+
+    def rd(f, fmt: str):
+        return struct.unpack("<" + fmt, f.read(struct.calcsize(fmt)))[0]
+
+    def rstr(f) -> str:
+        n = rd(f, "Q")
+        return f.read(n).decode("utf-8", "replace")
+
+    def skip_array(f) -> int:
+        et = rd(f, "I")
+        n = rd(f, "Q")
+        if et in _GGUF_SCALAR_FMT:
+            f.seek(struct.calcsize(_GGUF_SCALAR_FMT[et]) * n, os.SEEK_CUR)
+        elif et == _GGUF_T_STRING:
+            for _ in range(n):
+                f.seek(rd(f, "Q"), os.SEEK_CUR)
+        elif et == _GGUF_T_ARRAY:
+            for _ in range(n):
+                skip_array(f)
+        return n
+
+    def read_value(f, t: int):
+        if t in _GGUF_SCALAR_FMT:
+            return rd(f, _GGUF_SCALAR_FMT[t])
+        if t == _GGUF_T_STRING:
+            return rstr(f)
+        if t == _GGUF_T_ARRAY:
+            return None  # length captured separately
+        raise ValueError(f"unsupported GGUF value type {t}")
+
+    scalars: Dict[str, object] = {}
+    array_lens: Dict[str, int] = {}
+    tensors: List[dict] = []
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise ValueError(f"{path}: not a GGUF file")
+        rd(f, "I")  # version
+        n_tensors = rd(f, "Q")
+        n_kv = rd(f, "Q")
+        for _ in range(n_kv):
+            key = rstr(f)
+            t = rd(f, "I")
+            if t == _GGUF_T_ARRAY:
+                # Peek element type/count without consuming, then skip.
+                array_lens[key] = skip_array(f)
+            else:
+                scalars[key] = read_value(f, t)
+        for _ in range(n_tensors):
+            name = rstr(f)
+            nd = rd(f, "I")
+            dims = [rd(f, "Q") for _ in range(nd)]
+            gtype = rd(f, "I")
+            rd(f, "Q")  # data offset (unused)
+            tensors.append({"name": name, "dims": dims, "ggml_type": gtype})
+    return scalars, array_lens, tensors
+
+
+def _gguf_type_bytes_per_elem(gtype: int) -> float:
+    entry = _GGML_TYPE_SIZE.get(gtype)
+    if entry is None:
+        logger.warning(
+            "auto-performance: unknown ggml quant type %d in GGUF checkpoint; "
+            "assuming 2 B/element for the family byte model.",
+            gtype,
+        )
+        return 2.0
+    block, tbytes = entry
+    return tbytes / block
+
+
+def _gguf_family_of(name: str) -> Optional[str]:
+    """Map a GGUF tensor name onto the cost model's weight families. The GDN
+    (linear-attention) in_proj is stored under ``attn_qkv``/``attn_gate`` in
+    llama.cpp's qwen35 naming, so it is grouped with ``ssm_*`` into 'gdn';
+    only the full-attention q/k/v/o projections are 'attn'."""
+    if "nextn" in name or "mtp" in name:
+        return "draft"
+    if "ffn_" in name and "exp" not in name:
+        return "mlp"
+    if name in ("token_embd.weight", "output.weight"):
+        return "vocab"
+    if "attn_qkv" in name or "attn_gate" in name or "ssm" in name or "conv" in name:
+        return "gdn"
+    if any(s in name for s in ("attn_q.", "attn_k.", "attn_v.", "attn_output")):
+        return "attn"
+    return None  # norms / biases (negligible mass) -> ignored in the avg
+
+
+def _gguf_config_and_families(path: str) -> dict:
+    """Synthesize an HF-config-shaped dict for the perf cost model from a
+    GGUF header, plus measured per-family bytes/parameter and a few private
+    hint keys (prefixed ``__gguf_``). Raises a clear error if a required
+    field is missing instead of crashing later deep in the math."""
+    scalars, array_lens, tensors = _read_gguf_metadata(path)
+    arch = scalars.get("general.architecture")
+    if not arch:
+        raise ValueError(f"{path}: GGUF header lacks general.architecture")
+
+    def need(key: str):
+        full = f"{arch}.{key}"
+        if full not in scalars:
+            raise ValueError(
+                f"auto-performance: GGUF checkpoint {path} is missing the "
+                f"required metadata key '{full}'; cannot build the perf cost "
+                f"model. Pin --rank-mlp-ratio to skip the optimizer."
+            )
+        return scalars[full]
+
+    def opt(key: str, default):
+        return scalars.get(f"{arch}.{key}", default)
+
+    hidden = int(need("embedding_length"))
+    intermediate = int(need("feed_forward_length"))
+    q_heads = int(need("attention.head_count"))
+    kv_heads = int(need("attention.head_count_kv"))
+    head_dim = int(opt("attention.key_length", hidden // max(q_heads, 1)))
+    block_count = int(need("block_count"))
+    nextn = int(opt("nextn_predict_layers", 0) or 0)
+    n_layers = block_count - nextn  # nextn/MTP block is not a base layer
+    interval = int(opt("full_attention_interval", 0) or 0)
+    if interval > 0:
+        layer_types = [
+            "full_attention" if (i + 1) % interval == 0 else "linear_attention"
+            for i in range(n_layers)
+        ]
+    else:
+        layer_types = None  # __init__ falls back to all-full
+
+    # Vocab size = length of the token list (arrays are not materialized).
+    vocab = (
+        array_lens.get("tokenizer.ggml.tokens")
+        or array_lens.get("tokenizer.ggml.token_type")
+        or int(opt("vocab_size", 0) or 0)
+    )
+
+    # GDN / SSM geometry (llama.cpp ssm.* keys).
+    gdn_k_heads = int(opt("ssm.group_count", 0) or 0)
+    gdn_v_heads = int(opt("ssm.time_step_rank", 0) or 0)
+    gdn_k_dim = int(opt("ssm.state_size", 0) or 0)
+    ssm_inner = int(opt("ssm.inner_size", 0) or 0)
+    gdn_v_dim = (ssm_inner // gdn_v_heads) if gdn_v_heads else gdn_k_dim
+    conv_kernel = int(opt("ssm.conv_kernel", 4) or 4)
+
+    # Per-family bytes/element from the tensor quant types (element-weighted).
+    fam_bytes: Dict[str, float] = {}
+    fam_elems: Dict[str, float] = {}
+    attn_q_out = 0
+    has_draft_body = False
+    for t in tensors:
+        fam = _gguf_family_of(t["name"])
+        dims = t["dims"]
+        elems = 1
+        for d in dims:
+            elems *= d
+        if "attn_q." in t["name"] and len(dims) >= 2:
+            attn_q_out = max(attn_q_out, max(dims))
+        if "nextn" in t["name"] and any(
+            s in t["name"] for s in ("attn_q", "attn_k", "attn_v", "ffn_")
+        ):
+            has_draft_body = True
+        if fam is None:
+            continue
+        bpe = _gguf_type_bytes_per_elem(t["ggml_type"])
+        fam_bytes[fam] = fam_bytes.get(fam, 0.0) + elems * bpe
+        fam_elems[fam] = fam_elems.get(fam, 0.0) + elems
+    family_bpp = {
+        fam: (fam_bytes[fam] / fam_elems[fam]) for fam in fam_bytes if fam_elems[fam]
+    }
+    # Reasonable fallbacks if a family had no matched tensors.
+    family_bpp.setdefault("attn", 1.0)
+    family_bpp.setdefault("mlp", 0.75)
+    family_bpp.setdefault("gdn", 2.0)
+    family_bpp.setdefault("vocab", 1.0625)
+    family_bpp.setdefault("draft", 1.0625)
+
+    # attn_output_gate: the full-attention q projection emits q + output gate
+    # (2x q_heads*head_dim) when gating is on. Detect from the tensor shape;
+    # default False if no separate attn_q tensor was found.
+    attn_gate = bool(attn_q_out >= 2 * q_heads * head_dim and attn_q_out > 0)
+
+    # MLP shard granularity: the down-proj is quantized in blocks along the
+    # contracted (intermediate) axis, so the natural indivisible unit is the
+    # dominant MLP quant block (K-quants = 256, Q8_0 = 32).
+    mlp_types = [t["ggml_type"] for t in tensors if _gguf_family_of(t["name"]) == "mlp"]
+    if mlp_types:
+        dominant = max(set(mlp_types), key=mlp_types.count)
+        mlp_group = _GGML_TYPE_SIZE.get(dominant, (256, 0))[0]
+    else:
+        mlp_group = 256
+
+    return {
+        "text_config": {
+            "hidden_size": hidden,
+            "intermediate_size": intermediate,
+            "num_hidden_layers": n_layers,
+            "num_attention_heads": q_heads,
+            "num_key_value_heads": kv_heads,
+            "head_dim": head_dim,
+            "attn_output_gate": attn_gate,
+            "vocab_size": int(vocab),
+            "mtp_num_hidden_layers": nextn,
+            "linear_num_key_heads": gdn_k_heads,
+            "linear_num_value_heads": gdn_v_heads,
+            "linear_key_head_dim": gdn_k_dim,
+            "linear_value_head_dim": gdn_v_dim,
+            "linear_conv_kernel_dim": conv_kernel,
+            "layer_types": layer_types,
+        },
+        "quantization_config": {"group_size": mlp_group},
+        "__gguf_family_bpp__": family_bpp,
+        "__gguf_has_draft_body__": has_draft_body,
+    }
+
+
 class PerfCostModel:
     """Parse-time capacity/speed predictor for MLP-vector candidates.
 
@@ -528,6 +833,11 @@ class PerfCostModel:
 
     @staticmethod
     def _load_config(model_path: str) -> dict:
+        # GGUF checkpoints are a single .gguf FILE, not a directory with a
+        # config.json -- read the fields (and per-family quant bytes) from the
+        # GGUF header instead of crashing on open(model_path/'config.json').
+        if _is_gguf_model(model_path):
+            return _gguf_config_and_families(model_path)
         with open(os.path.join(model_path, "config.json")) as f:
             return json.load(f)
 
@@ -590,6 +900,29 @@ class PerfCostModel:
             "draft_mlp": _Family(draft_mlp, 2.0, "mlp"),
             "draft_repl": _Family(draft_repl, 2.0, "replicated"),
         }
+
+        # GGUF path: every family (embed/lm_head, attention, MLP, GDN) is
+        # quantized on its own ggml grid, so instead of the safetensors
+        # "BF16-inside-INT4" anchoring below we set each family's bytes/param
+        # directly from the measured per-family quant types (element-weighted
+        # bytes/element read from the tensor-info block). Assumptions: norms/
+        # biases are folded into their family's average (negligible mass); the
+        # GDN in_proj (llama.cpp ``attn_qkv``) is counted in 'gdn'; when the
+        # nextn/MTP block carries no own attn/ffn weights (module sharing) its
+        # draft_attn/draft_mlp mass is zeroed so it is not double-counted.
+        gguf_bpp = cfg.get("__gguf_family_bpp__")
+        if gguf_bpp is not None:
+            families["attn"].bytes_per_param = gguf_bpp["attn"]
+            families["mlp"].bytes_per_param = gguf_bpp["mlp"]
+            families["gdn"].bytes_per_param = gguf_bpp["gdn"]
+            families["vocab"].bytes_per_param = gguf_bpp["vocab"]
+            families["draft_repl"].bytes_per_param = gguf_bpp.get("draft", 2.0)
+            families["draft_attn"].bytes_per_param = gguf_bpp["attn"]
+            families["draft_mlp"].bytes_per_param = gguf_bpp["mlp"]
+            if not cfg.get("__gguf_has_draft_body__", False):
+                families["draft_attn"].params = 0.0
+                families["draft_mlp"].params = 0.0
+            return families
 
         # Anchor quantized-family bytes/param on the measured checkpoint
         # size: BF16 families (GDN, embed/lm_head, vision, draft fc -- the
@@ -742,6 +1075,14 @@ class PerfCostModel:
                 totals[r] += fam.bytes * fracs[r]
         return totals
 
+    def _mlp_unit_share(self, total_streamed: float) -> float:
+        """Streamed-byte-share contributed by ONE MLP unit (the granularity
+        of a single representable concentration step). Used to size the
+        coarse-grid headroom in the decode-knee guard."""
+        if total_streamed <= 0 or self.mlp_units <= 0:
+            return 0.0
+        return (self.families["mlp"].bytes / self.mlp_units) / total_streamed
+
     def decode_knee_ok(
         self,
         mlp_vector: List[int],
@@ -754,19 +1095,83 @@ class PerfCostModel:
         rank past that knee makes it the decode lockstep bottleneck (M23:
         16,1,2 = 56.5% bytes on the 51.9%-membw 5090 -> decode -4.8%) and
         the prefill model's extra predicted gain does NOT materialize
-        (measured +10.0%, identical to the knee-exact C6 vector). A
-        candidate is admissible when every rank that GAINS bytes vs the
-        base plan stays within (1+tol) of its bandwidth share."""
+        (measured +10.0%, identical to the knee-exact C6 vector).
+
+        The per-rank share is computed from the ACTUAL integer unit partition
+        (``mlp_unit_partition`` via ``streamed_bytes``), never from the wish
+        ratio, so a coarse grid's rounding is taken at face value. Because
+        coarse grids (FP8 dense ~136 units, GGUF K-quant ~68) realize the
+        split in large steps, the nearest representable vector can sit above
+        the measured knee while its whole-model share still reads just under
+        the bandwidth share (M27d: FP8 4,1,1 = 51.5% share < 51.9% membw, yet
+        decode -14/-24%). On such coarse grids we therefore require
+        ``_PREDICT_KNEE_COARSE_HEADROOM_UNITS`` unit-steps of headroom below
+        the knee and round DOWN to the last safe vector; fine grids keep the
+        exact bandwidth-share ceiling. A rank that only sheds/keeps bytes vs
+        the base plan can never become the knee and is skipped."""
+        ok, _ = self.decode_knee_detail(mlp_vector, membw_gbs)
+        return ok
+
+    def decode_knee_detail(
+        self, mlp_vector: List[int], membw_gbs: List[float]
+    ) -> Tuple[bool, Optional[str]]:
+        """Like ``decode_knee_ok`` but also returns a human-readable reason
+        for the first violating rank, naming the unit granularity (for the
+        optimizer's per-candidate log line)."""
         cand = self.streamed_bytes(mlp_vector)
         base = self.streamed_bytes(self.base_plan)
         total = sum(cand)
         bw_total = sum(membw_gbs)
+        coarse = self.mlp_units < _PREDICT_KNEE_COARSE_UNITS
+        unit_share = self._mlp_unit_share(total)
+        headroom = (
+            _PREDICT_KNEE_COARSE_HEADROOM_UNITS * unit_share if coarse else 0.0
+        )
         for r in range(self.tp_size):
             if cand[r] <= base[r] * (1.0 + 1e-6):
                 continue  # rank sheds or keeps bytes: cannot become the knee
-            if cand[r] / total > (membw_gbs[r] / bw_total) * (1.0 + tol):
-                return False
-        return True
+            achievable = cand[r] / total if total else 0.0
+            membw_share = membw_gbs[r] / bw_total if bw_total else 0.0
+            limit = membw_share - headroom
+            if achievable > limit:
+                # requested = share the wish ratio (continuous, no rounding)
+                # aimed for on this rank; achievable = the real partition's
+                # share; naming both makes the coarse-grid overshoot explicit.
+                requested = self._requested_mlp_share(mlp_vector, r, total)
+                grain = (
+                    f"coarse {self.mlp_units}-unit MLP grid, "
+                    f"{_PREDICT_KNEE_COARSE_HEADROOM_UNITS}-unit headroom"
+                    if coarse
+                    else f"fine {self.mlp_units}-unit MLP grid"
+                )
+                reason = (
+                    f"unit granularity ({grain}): rank {r} requested "
+                    f"{requested * 100:.1f}% -> achievable {achievable * 100:.1f}% "
+                    f"of streamed weight bytes exceeds membw share "
+                    f"{membw_share * 100:.1f}% (safe ceiling {limit * 100:.1f}%)"
+                )
+                return False, reason
+        return True, None
+
+    def _requested_mlp_share(
+        self, mlp_vector: List[int], rank: int, total_streamed: float
+    ) -> float:
+        """Whole-model streamed-byte share rank `rank` would have if the MLP
+        family used the CONTINUOUS wish fraction (no integer unit rounding).
+        Contrasted with the achievable (real-partition) share to expose the
+        coarse-grid overshoot in the log."""
+        if total_streamed <= 0:
+            return 0.0
+        wish = mlp_vector[rank] / sum(mlp_vector)
+        acc = 0.0
+        for name, fam in self.families.items():
+            if fam.params <= 0:
+                continue
+            if fam.shard == "mlp":
+                acc += fam.bytes * wish
+            else:
+                acc += fam.bytes * self._shard_fractions(fam.shard, mlp_vector)[rank]
+        return acc / total_streamed
 
     def prefill_time_model(
         self, mlp_vector: List[int], gemm_tflops: List[float], min_link_gbs: float
@@ -1084,13 +1489,15 @@ def apply_auto_performance(server_args) -> None:
             pred = model.predict_capacity(list(cand))
             t_cand = model.prefill_time_model(list(cand), enc_scores, min_link)
             gain = t_base / t_cand - 1.0
-            knee_ok = model.decode_knee_ok(list(cand), rank_scores_bw)
+            knee_ok, knee_reason = model.decode_knee_detail(
+                list(cand), rank_scores_bw
+            )
             floor_ok = pred["feasible"] and pred["ctx"] >= floor
-            results.append((cand, pred, gain, floor_ok, knee_ok))
+            results.append((cand, pred, gain, floor_ok, knee_ok, knee_reason))
             if floor_ok and knee_ok and gain > best_gain + 1e-9:
                 best_gain = gain
                 chosen = cand
-        for cand, pred, gain, floor_ok, knee_ok in sorted(
+        for cand, pred, gain, floor_ok, knee_ok, knee_reason in sorted(
             results, key=lambda x: -x[2]
         )[:6]:
             if not pred["feasible"]:
@@ -1098,7 +1505,7 @@ def apply_auto_performance(server_args) -> None:
             elif not floor_ok:
                 verdict = "REJECTED by floor"
             elif not knee_ok:
-                verdict = "REJECTED by decode-knee guard (bytes-share > membw-share)"
+                verdict = f"REJECTED by decode-knee guard -- {knee_reason}"
             else:
                 verdict = "floor OK, knee OK"
             lines.append(
