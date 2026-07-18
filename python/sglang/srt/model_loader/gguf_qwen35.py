@@ -718,6 +718,30 @@ class Qwen35GGUFAdapter:
                     continue
                 # already unquantized (.weight): fall through, passed as-is.
 
+            # --- NEXTN/MTP draft routed experts: the generic GGUF iterator
+            # (weight_utils.gguf_quant_weights_iterator) splits the MTP block's
+            # ffn_*_exps per expert and emits the MAIN-model hardcoded name
+            # model.layers.{N}.mlp.experts.{e}.{proj}.qweight(_type), where N is
+            # the MTP block index (== num_hidden_layers). Qwen3_5ForCausalLMMTP
+            # keeps only its single decoder layer under mtp.layers.0 and its
+            # load_weights drops every tensor whose name lacks "mtp" — so those
+            # experts were silently never loaded, leaving the draft's fused-MoE
+            # weights GGUFUninitialized and crashing draft-decode CUDA-graph
+            # capture at fused_moe_gguf (`expert_up = w1[ii]`). Rewrite them to
+            # the mtp.layers.0 names the draft loader expects (after its
+            # mtp.->model. rewrite these resolve to model.layers.0.mlp.experts.*,
+            # exactly like the main model's routed experts). Only the block-N
+            # experts are rewritten; blk.0..N-1 experts keep their main-model
+            # names and are dropped by the draft as before.
+            if self.is_draft:
+                _mtp_exp_prefix = f"model.layers.{self.num_layers}.mlp.experts."
+                if name.startswith(_mtp_exp_prefix):
+                    yield (
+                        "mtp.layers.0.mlp.experts." + name[len(_mtp_exp_prefix) :],
+                        weight,
+                    )
+                    continue
+
             # --- stacked MoE experts (blk.N.ffn_*_exps): the generic GGUF
             # iterator (weight_utils.gguf_quant_weights_iterator) already
             # splits them per expert and emits hardcoded
