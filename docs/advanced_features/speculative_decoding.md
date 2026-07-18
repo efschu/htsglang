@@ -588,3 +588,41 @@ draft head, TP=3 across mismatched GPUs (RTX 5090 + 2x RTX 3080), task #92:
   target-family-specific embed patching is needed for llama-style heads.
 - Acceptance quality remains a property of the head/target pairing: measure
   accept length against a no-spec baseline before assuming a speedup.
+
+## speculators-format EAGLE-3 heads (vLLM ecosystem)
+
+EAGLE-3 heads published in the vLLM "speculators" format (e.g.
+`RedHatAI/*-speculator.eagle3`, config `speculators_model_type: "eagle3"`)
+differ from SpecForge-format checkpoints in two conventions, both handled by
+`test/manual/spec/convert_speculators_eagle3.py`:
+
+1. **Aux layer ids are off by one.** Speculators/vLLM
+   `eagle_aux_hidden_state_layer_ids: [i, ...]` denote the hidden state at
+   the INPUT of decoder layer `i` (vLLM captures before the layer runs),
+   i.e. the output of layer `i-1`. SGLang's convention is "output of layer
+   `i`". The converter writes `i-1` into the SpecForge-style config.
+   Feeding the raw ids costs real acceptance: measured on
+   gemma-4-31B-it (task #101), draft/target top-1 overlap drops from 0.56
+   (translated) to 0.36 (raw).
+2. **`norm_before_residual`.** Speculators heads are trained with the input
+   layer's residual taken AFTER `hidden_norm` (vLLM `llama_eagle3.py`);
+   `LlamaForCausalLMEagle3` now honors a `norm_before_residual: true`
+   config flag (default `false` keeps SpecForge behavior byte-identical).
+
+Case study (task #101, same rig/battery as #92): the SpecForge-format
+`thoughtworks/Gemma-4-31B-Eagle3` head collapsed to 0.03–0.11 accept-rate
+per drafted token against the int4-AutoRound gemma-4-31B-**it** target.
+Offline feature-overlap analysis (target features captured through the
+fork's own ModelRunner, head run standalone) localized the cause to the
+head/target pairing, not the serving path: the head predicts the BASE
+gemma-4-31B well (overlap@1 0.61 on base bf16 self-generated text) but the
+IT model poorly (0.24 bf16-IT / 0.21 int4-IT — quantization itself costs
+only ~0.03). Swapping to the IT-trained
+`RedHatAI/gemma-4-31B-it-speculator.eagle3` head (converted as above)
+recovered acceptance end-to-end on TP=3 uneven: accept-len (incl. bonus)
+1.87–2.47 chain/tree vs 1.19–1.5 before; decode 66–84 tok/s on
+instruct-style prose/code/JSON workloads vs the 58.2 tok/s no-spec
+baseline (creative-fiction decode stays ~0.95x — hardest content for
+speculation on this NCCL-fallback hetero rig, where fixed per-verify
+overhead is high). Match the head's trained target variant (base vs -it)
+before suspecting the serving stack.

@@ -77,6 +77,12 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # speculators-format EAGLE3 heads (e.g. RedHatAI *-speculator.eagle3)
+        # are trained with the residual taken AFTER hidden_norm (see vllm
+        # llama_eagle3.py `norm_before_residual`). Default False keeps the
+        # SpecForge-trained behavior byte-identical.
+        self.norm_before_residual = getattr(config, "norm_before_residual", False)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -88,8 +94,13 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
 
         if self.is_input_layer:
             # Input layer consumes target hidden states; no carried residual to fuse.
-            residual = hidden_states
-            hidden_states = self.hidden_norm(hidden_states)
+            if self.norm_before_residual:
+                # speculators convention: residual is the NORMED hidden.
+                hidden_states = self.hidden_norm(hidden_states)
+                residual = hidden_states
+            else:
+                residual = hidden_states
+                hidden_states = self.hidden_norm(hidden_states)
             embeds = self.input_layernorm(embeds)
             hidden_states = torch.cat([embeds, hidden_states], dim=-1)
         else:
