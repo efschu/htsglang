@@ -418,6 +418,51 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
+def swa_pool_token_cap(mr: ModelRunner, num_reqs: int) -> int:
+    """Worst-case number of live SWA-pool tokens for ``num_reqs`` concurrent
+    requests: sliding window + eviction lag + decode over-allocation per
+    request, plus in-flight prefill chunks (or decode-disagg extra slots).
+
+    This is the single source of truth for the SWA pool's per-request
+    accounting, shared by SWAChunkCapPoolConfigurator (tight SWA pool sizing)
+    and the hybrid-SWA physical token ceiling (#90) in
+    ModelRunnerKVCacheMixin._swa_hybrid_kv_token_cap.
+    """
+    sa = mr.server_args
+    page_size = mr.page_size
+    window = mr.sliding_window_size
+    draft_tokens = sa.speculative_num_draft_tokens or 1
+    eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
+
+    """
+    __________[padding][eviction_interval][window]
+    Padding to make sure eviction point is page-aligned.
+    """
+    trailing_tokens = window + eviction_interval * draft_tokens + page_size
+    if sa.speculative_algorithm is None:
+        decode_alloc = page_size
+    elif sa.disable_overlap_schedule:
+        # spec-v1: new_tokens_required_next_decode per request.
+        decode_alloc = spec_decode_alloc_len_per_request(sa)
+    else:
+        # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
+        # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
+        decode_alloc = 2 * get_alloc_len_per_decode(sa)
+    per_request = trailing_tokens + decode_alloc
+
+    if sa.disaggregation_mode == "decode":
+        return (
+            per_request * num_reqs
+            + (window + page_size) * sa.disaggregation_decode_extra_slots
+        )
+    chunks_in_flight = 1 if sa.disable_overlap_schedule else 2
+    return (
+        per_request * num_reqs
+        + chunks_in_flight * (sa.chunked_prefill_size or 0)
+        + page_size
+    )
+
+
 class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     """Hybrid SWA configurator with the SWA pool sized from a fixed token cap.
 
@@ -432,40 +477,8 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         assert self._full_layers_num > 0
 
         sa = mr.server_args
-        page_size = mr.page_size
-        window = mr.sliding_window_size
-        draft_tokens = sa.speculative_num_draft_tokens or 1
-        eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
-
-        """
-        __________[padding][eviction_interval][window]
-        Padding to make sure eviction point is page-aligned.
-        """
-        trailing_tokens = window + eviction_interval * draft_tokens + page_size
-        if sa.speculative_algorithm is None:
-            decode_alloc = page_size
-        elif sa.disable_overlap_schedule:
-            # spec-v1: new_tokens_required_next_decode per request.
-            decode_alloc = spec_decode_alloc_len_per_request(sa)
-        else:
-            # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
-            # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
-            decode_alloc = 2 * get_alloc_len_per_decode(sa)
-        per_request = trailing_tokens + decode_alloc
-
         num_reqs = sa.max_running_requests // mr.dp_size
-        if sa.disaggregation_mode == "decode":
-            self._swa_cap = (
-                per_request * num_reqs
-                + (window + page_size) * sa.disaggregation_decode_extra_slots
-            )
-        else:
-            chunks_in_flight = 1 if sa.disable_overlap_schedule else 2
-            self._swa_cap = (
-                per_request * num_reqs
-                + chunks_in_flight * sa.chunked_prefill_size
-                + page_size
-            )
+        self._swa_cap = swa_pool_token_cap(mr, num_reqs)
 
     @staticmethod
     def is_applicable(mr: ModelRunner) -> bool:
