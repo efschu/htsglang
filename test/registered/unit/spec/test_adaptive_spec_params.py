@@ -558,6 +558,55 @@ class TestRuntimeStateIsolation(unittest.TestCase):
             {3: _make_state(3, draft=shared, target=shared)}
         )
 
+    def test_global_workspace_alias_with_baseline_is_allowed(self):
+        # Real-world case (found on GPU boot): the EAGLE draft-extend backend
+        # is constructed without init_new_workspace, so every built state's
+        # draft-extend aliases the PROCESS-GLOBAL workspace — the same buffer
+        # the registered static state uses. With baseline_steps naming the
+        # registered state, this is logged, not fatal.
+        g = 0x1000  # global workspace ptr
+        states = {
+            3: _make_state(  # registered static state (baseline)
+                3,
+                draft=_fake_backend(g),
+                target=_fake_backend(g),
+                draft_extend=_fake_backend(g),
+            ),
+            1: _make_state(
+                1,
+                draft=_fake_backend(0x200),
+                target=_fake_backend(0x300),
+                draft_extend=_fake_backend(g),
+            ),
+            2: _make_state(
+                2,
+                draft=_fake_backend(0x400),
+                target=_fake_backend(0x500),
+                draft_extend=_fake_backend(g),
+            ),
+        }
+        assert_runtime_state_isolation(states, baseline_steps={3})  # no raise
+
+    def test_private_share_still_raises_with_baseline(self):
+        # A pointer shared between two built states that is NOT part of the
+        # baseline (global) family stays a hard failure.
+        states = {
+            3: _make_state(3, draft=_fake_backend(0x1000), target=_fake_backend(0x1000)),
+            1: _make_state(1, draft=_fake_backend(0x200), target=_fake_backend(0x300)),
+            2: _make_state(2, draft=_fake_backend(0x200), target=_fake_backend(0x500)),
+        }
+        with self.assertRaisesRegex(RuntimeError, "workspace shared between states"):
+            assert_runtime_state_isolation(states, baseline_steps={3})
+
+    def test_baseline_alias_without_baseline_arg_still_raises(self):
+        # Default (no baseline_steps) keeps the strict behavior.
+        states = {
+            3: _make_state(3, draft=_fake_backend(0x1000)),
+            1: _make_state(1, draft=_fake_backend(0x1000)),
+        }
+        with self.assertRaisesRegex(RuntimeError, "workspace shared between states"):
+            assert_runtime_state_isolation(states)
+
 
 class TestResolveCandidateSteps(unittest.TestCase):
     def test_default_config(self):

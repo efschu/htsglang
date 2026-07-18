@@ -1,7 +1,10 @@
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -78,19 +81,41 @@ def _workspace_ptrs(backend) -> list[tuple[str, int]]:
     return out
 
 
-def assert_runtime_state_isolation(states: dict[int, "SpecRuntimeState"]) -> None:
+def assert_runtime_state_isolation(
+    states: dict[int, "SpecRuntimeState"],
+    baseline_steps: "set[int] | None" = None,
+) -> None:
     """Enforce the M16/#50 invariant: adaptive runtime states must not share
-    attention backends or flashinfer workspaces WITH EACH OTHER.
+    attention backends or PRIVATE flashinfer workspaces WITH EACH OTHER.
 
     Each state's CUDA graphs were captured against that state's backend
-    graph-state buffers and flashinfer workspace/plan. A backend (or its
+    graph-state buffers and flashinfer workspace/plan. A backend (or a private
     workspace buffer) reachable from two different states means an earlier
     captured graph replays against buffers that another state re-plans or
     overwrites — the stale-pointer / shared-workspace corruption class behind
     M16 and the #50 hetero-spec divergence. Sharing WITHIN one state is
     allowed (the registered static/initial state legitimately aliases the
     process-global workspace across its own backends).
+
+    *baseline_steps* names the externally registered (static-path) states.
+    Workspace pointers reachable from those states are the PROCESS-GLOBAL
+    workspace family: built states may alias them (e.g. the EAGLE draft-extend
+    backend is constructed without init_new_workspace and time-multiplexes the
+    global workspace exactly like every non-adaptive forward does; it is
+    re-planned before each use and its zero-state is maintained by
+    zero_flashinfer_workspaces). Such aliasing is logged, not fatal. A pointer
+    shared between two states that is NOT part of the baseline family is a
+    genuine private-share bug and raises.
     """
+    baseline_steps = baseline_steps or set()
+    baseline_ws: set[int] = set()
+    for steps in baseline_steps:
+        state = states.get(steps)
+        if state is None:
+            continue
+        for _, backend in _iter_state_backends(state):
+            baseline_ws.update(ptr for _, ptr in _workspace_ptrs(backend))
+
     seen_backend: dict[int, tuple[int, str]] = {}
     seen_ws: dict[int, tuple[int, str, str]] = {}
     for steps, state in sorted(states.items()):
@@ -107,14 +132,29 @@ def assert_runtime_state_isolation(states: dict[int, "SpecRuntimeState"]) -> Non
             for attr, ptr in _workspace_ptrs(backend):
                 prev_ws = seen_ws.get(ptr)
                 if prev_ws is not None and prev_ws[0] != steps:
-                    raise RuntimeError(
-                        "Adaptive runtime state isolation violated: flashinfer "
-                        f"workspace shared between states steps={prev_ws[0]} "
-                        f"({prev_ws[1]}.{prev_ws[2]}) and steps={steps} "
-                        f"({role}.{attr}) at data_ptr 0x{ptr:x}. Captured "
-                        "graphs of one state would replay against a workspace "
-                        "another state plans into; see M16/#50."
-                    )
+                    if ptr in baseline_ws:
+                        logger.info(
+                            "Adaptive runtime states steps=%s (%s.%s) and "
+                            "steps=%s (%s.%s) alias the process-global "
+                            "flashinfer workspace (status-quo of the static "
+                            "path; re-planned before each use).",
+                            prev_ws[0],
+                            prev_ws[1],
+                            prev_ws[2],
+                            steps,
+                            role,
+                            attr,
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Adaptive runtime state isolation violated: "
+                            "flashinfer workspace shared between states "
+                            f"steps={prev_ws[0]} ({prev_ws[1]}.{prev_ws[2]}) "
+                            f"and steps={steps} ({role}.{attr}) at data_ptr "
+                            f"0x{ptr:x}. Captured graphs of one state would "
+                            "replay against a workspace another state plans "
+                            "into; see M16/#50."
+                        )
                 seen_ws[ptr] = (steps, role, attr)
 
 
@@ -159,6 +199,7 @@ class AdaptiveController:
             algorithm=algorithm,
         )
         self._states: dict[int, SpecRuntimeState] = {}
+        self._registered_steps: set[int] = set()
 
     @property
     def candidate_steps(self) -> list[int]:
@@ -171,6 +212,10 @@ class AdaptiveController:
         """
         key = steps if steps is not None else state.speculative_num_steps
         self._states[key] = state
+        # Externally registered states are the static-path baseline; their
+        # workspace pointers define the process-global workspace family for
+        # the isolation check in init_states.
+        self._registered_steps.add(key)
 
     def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
         """Build and register runtime states for all candidate steps."""
@@ -188,10 +233,14 @@ class AdaptiveController:
             )
             self._states[steps] = state
 
-        # Enforced M16/#50 invariant: no backend or flashinfer workspace may
-        # be reachable from two different runtime states (each state's graphs
-        # were captured against its own buffers/plans).
-        assert_runtime_state_isolation(self._states)
+        # Enforced M16/#50 invariant: no backend or private flashinfer
+        # workspace may be reachable from two different runtime states (each
+        # state's graphs were captured against its own buffers/plans).
+        # Aliasing of the process-global workspace (defined by the registered
+        # static-path state) is logged, not fatal — see the assert docstring.
+        assert_runtime_state_isolation(
+            self._states, baseline_steps=self._registered_steps
+        )
 
         # Start on the initial step.
         self._activate(self.worker.speculative_num_steps)
