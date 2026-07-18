@@ -69,6 +69,43 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
+def _plan_aware_num_q_heads(model_config) -> int:
+    """This rank's q-attention-head count for workspace sizing.
+
+    Even TP (no --rank-tp-ratio plan): exactly total_q // tp_size — the
+    previous behavior, bit for bit. Uneven TP: q heads follow the shard
+    plan in whole-GQA-group units, so the per-rank count can EXCEED the
+    even split (e.g. 32 heads over 3 ranks -> [8,14,10], not 10/10/10);
+    sizing the decode attn_logits/attn_lse workspaces with the even split
+    makes the decode kernel write out of bounds on the bigger ranks and
+    silently corrupt neighboring allocations (this is the triton twin of
+    the flashinfer per-rank head-count fix). Hybrid SWA models partition
+    q differently per layer type (kv-head base 4 vs 16 -> different GQA
+    units), so take the max across the model's kv bases.
+    """
+    from sglang.srt.distributed.utils import (
+        attn_q_partition_units,
+        tp_partition_size,
+        tp_plan_active,
+    )
+
+    tp_size = get_parallel().attn_tp_size
+    total_q = model_config.num_attention_heads
+    if not tp_plan_active(tp_size):
+        return total_q // tp_size
+    rank = get_parallel().attn_tp_rank
+    kv_bases = {model_config.get_total_num_kv_heads()}
+    swa_kv = getattr(model_config.hf_text_config, "swa_num_key_value_heads", None)
+    if swa_kv:
+        kv_bases.add(swa_kv)
+    return max(
+        tp_partition_size(
+            total_q, tp_size, rank, attn_q_partition_units(total_q, kv, tp_size)
+        )
+        for kv in kv_bases
+    )
+
+
 def logit_capping_mod(logit_capping_method, logit_cap):
     # positive logit_cap -> tanh cap
     if logit_capping_method == "tanh":
@@ -168,8 +205,8 @@ class TritonAttnBackend(AttentionBackend):
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
         self.num_head = (
-            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
-        ) * self.dcp_size
+            _plan_aware_num_q_heads(model_runner.model_config) * self.dcp_size
+        )
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size
         )
@@ -1809,9 +1846,7 @@ class TritonMultiStepDraftBackend:
                 )
             )
         self.max_context_len = self.attn_backends[0].max_context_len
-        self.num_head = (
-            model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
-        )
+        self.num_head = _plan_aware_num_q_heads(model_runner.model_config)
         self.device = model_runner.device
         # Cached variables for generate_draft_decode_kv_indices
         self.req_to_token_pool = model_runner.req_to_token_pool
