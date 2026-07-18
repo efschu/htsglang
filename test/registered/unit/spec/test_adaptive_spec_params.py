@@ -477,7 +477,9 @@ def _fake_ws(ptr: int):
 
 
 def _fake_backend(ws_ptr: int | None = None, **extra):
-    ns = SimpleNamespace(**extra)
+    # init_forward_metadata marks this as a real attention backend for the
+    # wrapper-unwrap duck-type check in _iter_state_backends.
+    ns = SimpleNamespace(init_forward_metadata=lambda *a, **k: None, **extra)
     if ws_ptr is not None:
         ns.workspace_buffer = _fake_ws(ws_ptr)
     return ns
@@ -544,7 +546,11 @@ class TestRuntimeStateIsolation(unittest.TestCase):
         # A leaf backend hidden inside a hybrid prefill/decode wrapper of one
         # state must not alias another state's workspace.
         leaf = _fake_backend(0x500)
-        hybrid = SimpleNamespace(prefill_backend=leaf, decode_backend=_fake_backend(0x600))
+        hybrid = SimpleNamespace(
+            init_forward_metadata=lambda *a, **k: None,
+            prefill_backend=leaf,
+            decode_backend=_fake_backend(0x600),
+        )
         states = {
             1: _make_state(1, draft=hybrid, target=_fake_backend(0x700)),
             3: _make_state(3, draft=_fake_backend(0x500), target=_fake_backend(0x800)),
@@ -597,6 +603,20 @@ class TestRuntimeStateIsolation(unittest.TestCase):
         }
         with self.assertRaisesRegex(RuntimeError, "workspace shared between states"):
             assert_runtime_state_isolation(states, baseline_steps={3})
+
+    def test_string_backend_selector_attrs_are_not_unwrapped(self):
+        # Regression (found on GPU boot): FlashInferAttnBackend stores plain
+        # STRING kernel selectors in .prefill_backend/.decode_backend ("fa2").
+        # Interned strings alias across states — must not be treated as
+        # shared wrapped backends.
+        s1 = _fake_backend(0x100, prefill_backend="fa2", decode_backend="fa2")
+        s2 = _fake_backend(0x200, prefill_backend="fa2", decode_backend="fa2")
+        assert_runtime_state_isolation(
+            {
+                1: _make_state(1, draft=s1, target=_fake_backend(0x300)),
+                2: _make_state(2, draft=s2, target=_fake_backend(0x400)),
+            }
+        )  # must not raise
 
     def test_baseline_alias_without_baseline_arg_still_raises(self):
         # Default (no baseline_steps) keeps the strict behavior.

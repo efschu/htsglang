@@ -66,7 +66,12 @@ def _iter_state_backends(state: SpecRuntimeState):
         yield role, backend
         for attr in ("prefill_backend", "decode_backend"):
             inner = getattr(backend, attr, None)
-            if inner is not None:
+            # Only descend into actual wrapped backend objects (e.g.
+            # HybridAttnBackend children). FlashInferAttnBackend reuses these
+            # attribute names for plain STRING kernel selectors ("fa2"), and
+            # interned strings would alias across states and trip the
+            # object-identity check as a false positive.
+            if inner is not None and hasattr(inner, "init_forward_metadata"):
                 stack.append((f"{role}.{attr}", inner))
 
 
