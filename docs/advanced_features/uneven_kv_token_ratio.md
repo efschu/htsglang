@@ -1,6 +1,6 @@
 # Decoupled KV-token ownership ratio (`--rank-kv-ratio`) — design note (Task #88)
 
-Status: DESIGN (pre-implementation). Branch `feat/kv-split-ratio`, base `5e4fbed68`.
+Status: IMPLEMENTED + VALIDATED (see §9). Branch `feat/kv-split-ratio`, base `5e4fbed68`.
 
 ## 1. The idea
 
@@ -182,3 +182,30 @@ Results land in the commit body and
 
 Default-path guarantee: with `--rank-kv-ratio` unset, every new branch is
 behind `!= "coupled"` checks; no existing line's behavior changes.
+
+## 9. Measured results (2026-07-18, this rig)
+
+Capacity gain (`max_total_num_tokens`, KV pool budget):
+
+| Model | coupled | capacity | gain |
+|---|---|---|---|
+| Qwen3.6-27B-FP8 | 443,904 ([30,17,17]) | 563,456 ([33,13,18]) | **+26.9%** |
+| Qwen3.6-35B-A3B-FP8 | 1,911,488 pre-cap | 2,187,648 pre-cap | +14.4% |
+
+27B pool-end free memory: coupled 5.21/2.33/3.58 GB (stranded on the
+3080s) → capacity 2.71/2.46/2.33 GB (balanced). A3B: the #79 mamba
+ceiling (16 reqs × ctx = 655,440) binds first at these settings in both
+modes; the pool gain becomes usable with more requests or longer ctx.
+
+Cost (decode tok/s, bs=1): within noise (±1%) at shallow, 8k and 24k
+depth on both models — decode is weight-streaming-bound here, so the
+slider costs ~nothing at these depths on this rig.
+
+Correctness: needle retrieval (~7.1k and ~17.7k tokens) correct in every
+mode on both models; temp-0 outputs bit-identical vs the coupled oracle
+except at known near-tie loci (think/no-think flips) that flip across
+boots even on identical pre-feature code (endemic baseline
+nondeterminism, verified by double-booting the base commit); within-boot
+reruns bit-deterministic; zero rank divergence in any log. Coupled-path
+regression: sizing byte-identical pre/post feature, tok/s within noise.
+Full tables: T88_RESULTS.md (job tmp) and the feature commit bodies.
