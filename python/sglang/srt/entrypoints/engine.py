@@ -1417,6 +1417,38 @@ def _wait_for_scheduler_ready(
     return scheduler_infos
 
 
+def _mps_control_daemon_responsive(timeout_s: float = 5.0) -> bool:
+    """Return True iff the CUDA MPS control daemon actually answers.
+
+    The presence of the control-pipe DIRECTORY (CUDA_MPS_PIPE_DIRECTORY,
+    default /tmp/nvidia-mps) is NOT proof the daemon is alive: the directory
+    lingers after a crashed/killed daemon (seen live on this rig — a stale
+    /tmp/nvidia-mps outlived a wedged daemon), and a healthy daemon can use a
+    custom pipe dir. The only reliable liveness signal is a successful reply
+    from `nvidia-cuda-mps-control`, so probe it directly: pipe a read-only
+    query on stdin and treat a clean exit with non-empty output as
+    "responsive". Any failure mode (binary missing, no daemon, timeout, OS
+    error) -> not responsive. Pure subprocess/stdlib, so unit-testable on CPU
+    by patching shutil.which / subprocess.run.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("nvidia-cuda-mps-control") is None:
+        return False
+    try:
+        proc = subprocess.run(
+            ["nvidia-cuda-mps-control"],
+            input="get_default_active_thread_percentage\n",
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() != ""
+
+
 def _configure_nccl_env_for_colocation(server_args: ServerArgs) -> None:
     """Configure NCCL env vars when --rank-gpu-id co-locates ranks on one GPU.
 
@@ -1475,15 +1507,13 @@ def _configure_nccl_env_for_colocation(server_args: ServerArgs) -> None:
     # kernels never run concurrently, but NCCL collectives busy-spin
     # waiting for the peer rank. Measured impact on the vLLM sibling of
     # this feature: ~3 tok/s without MPS vs ~78 tok/s with MPS (>20x).
-    mps_pipe_dir = os.environ.get("CUDA_MPS_PIPE_DIRECTORY", "/tmp/nvidia-mps")
-    if not os.path.exists(mps_pipe_dir):
+    if not _mps_control_daemon_responsive():
         logger.warning(
             "Multiple ranks share a physical GPU but the CUDA MPS control "
-            "pipe (%s) was not found. Without MPS, co-located ranks are "
-            "time-sliced and NCCL collectives become extremely slow (>20x "
-            "slowdown). Start MPS with 'nvidia-cuda-mps-control -d' before "
-            "launching sglang.",
-            mps_pipe_dir,
+            "daemon did not respond (probed via nvidia-cuda-mps-control). "
+            "Without MPS, co-located ranks are time-sliced and NCCL "
+            "collectives become extremely slow (>20x slowdown). Start MPS "
+            "with 'nvidia-cuda-mps-control -d' before launching sglang."
         )
 
 
