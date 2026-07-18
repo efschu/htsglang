@@ -46,6 +46,48 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     },
 }
 
+# Frozen-KV MTP default. Differs from DEFAULT_ADAPTIVE_CONFIG in two ways:
+# 1. Every candidate step is >= 1: the frozen seed / draft-extend path has no
+#    step-0 (nospec) branch, and FrozenKVMTPWorkerV2._assert_adaptive_supported
+#    hard-rejects any config resolving to a step < 1. Using the generic default
+#    (which contains step 0 in the bs>=8 slots) would crash at init.
+# 2. The candidate ceiling is 3, not 7: at per-position accept p<=0.8 the
+#    expected accepted chain length gained by k=3 -> k=7 is < 1 token for 4
+#    extra draft forwards (net-negative), and each extra candidate costs a
+#    full pre-captured graph set of VRAM.
+FROZEN_MTP_DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
+    "1": {
+        "candidate_steps": [1, 2, 3],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": -0.25,
+        "ceiling_coeff": 0,
+    },
+    "8": {
+        "candidate_steps": [1, 2],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+    "32": {
+        "candidate_steps": [1],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+}
+
+
+def default_adaptive_config_for(algorithm: str | None) -> dict[str, dict]:
+    """Pick the built-in adaptive config for *algorithm*.
+
+    Used by every resolver call site (server_args buffer sizing, the
+    speculative-hook param init, and the workers) so they cannot disagree
+    about which default applies.
+    """
+    if algorithm == "FROZEN_KV_MTP":
+        return FROZEN_MTP_DEFAULT_ADAPTIVE_CONFIG
+    return DEFAULT_ADAPTIVE_CONFIG
+
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
@@ -89,16 +131,17 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
 
 def _load_adaptive_config(
     cfg_path: str | None,
+    algorithm: str | None = None,
 ) -> tuple[dict, dict[int, dict]]:
     """Load and validate adaptive config.
 
-    Uses ``DEFAULT_ADAPTIVE_CONFIG`` when *cfg_path* is ``None``.
+    Uses ``default_adaptive_config_for(algorithm)`` when *cfg_path* is ``None``.
     """
     if cfg_path is not None:
         with open(cfg_path) as f:
             cfg = json.load(f)
     else:
-        cfg = DEFAULT_ADAPTIVE_CONFIG
+        cfg = default_adaptive_config_for(algorithm)
 
     bs_entries: dict[int, dict] = {}
     for key, entry in cfg.items():
@@ -128,9 +171,10 @@ def _load_adaptive_config(
 
 def resolve_candidate_steps_from_config(
     cfg_path: str | None = None,
+    algorithm: str | None = None,
 ) -> list[int]:
     """Union of every BS slot's candidate steps; sizes the runtime buffers."""
-    _, bs_entries = _load_adaptive_config(cfg_path)
+    _, bs_entries = _load_adaptive_config(cfg_path, algorithm=algorithm)
     all_steps: set[int] = set()
     for entry in bs_entries.values():
         all_steps.update(entry["candidate_steps"])
@@ -269,8 +313,9 @@ class AdaptiveSpeculativeParams:
         self,
         initial_steps: int,
         cfg_path: str | None = None,
+        algorithm: str | None = None,
     ):
-        cfg, bs_entries = _load_adaptive_config(cfg_path)
+        cfg, bs_entries = _load_adaptive_config(cfg_path, algorithm=algorithm)
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, AdaptiveStepSlot] = {}
         self._cuda_graph_bs: list[int] | None = None

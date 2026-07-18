@@ -7954,6 +7954,7 @@ class ServerArgs:
 
         candidate_steps = resolve_candidate_steps_from_config(
             cfg_path=self.speculative_adaptive_config,
+            algorithm=self.speculative_algorithm,
         )
         # TODO: adaptive spec currently requires topk=1, so each runtime state
         # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.

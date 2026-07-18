@@ -741,6 +741,7 @@ def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
 
     candidate_steps = resolve_candidate_steps_from_config(
         cfg_path=server_args.speculative_adaptive_config,
+        algorithm=server_args.speculative_algorithm,
     )
 
     if server_args.speculative_eagle_topk is None:
