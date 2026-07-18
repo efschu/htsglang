@@ -250,7 +250,9 @@ def check_moe_marlin_supports_layer(
     # apply_router_weight_on_input is not supported for moe marlin
     supports_router_weight = not layer.moe_runner_config.apply_router_weight_on_input
     if layer.moe_runner_config.is_gated:
-        supports_activation = layer.moe_runner_config.activation == "silu"
+        # fused_marlin_moe applies the gated activation host-side between the
+        # two marlin gemms: silu_and_mul or gelu_and_mul (Gemma-family MoE).
+        supports_activation = layer.moe_runner_config.activation in {"silu", "gelu"}
     else:
         supports_activation = layer.moe_runner_config.activation in {
             "silu",
