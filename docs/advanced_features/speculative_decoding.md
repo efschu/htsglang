@@ -563,3 +563,28 @@ EAGLE process is as follows:
 This enhances drafting accuracy by operating on features instead of tokens for more regular inputs and by additionally passing tokens from the next timestep to reduce sampling randomness. For more details, see the [EAGLE-2](https://arxiv.org/abs/2406.16858) and [EAGLE-3](https://arxiv.org/abs/2503.01840) papers.
 
 For guidance on how to train your own EAGLE model please see the [EAGLE repo](https://github.com/SafeAILab/EAGLE/tree/main?tab=readme-ov-file#train). For EAGLE-3 training specifically, check out [SpecForge](https://github.com/sgl-project/SpecForge), the SGLang team's training framework designed for EAGLE-3 speculative decoding models with seamless porting to SGLang serving. See the [SpecForge documentation](https://docs.sglang.ai/SpecForge/) and [blog post](https://lmsys.org/blog/2025-07-25-spec-forge) for details.
+
+## EAGLE-3 under uneven TP (--rank-tp-ratio)
+
+Validated end-to-end on Gemma-4-31B (int4 AutoRound) + a llama-style EAGLE-3
+draft head, TP=3 across mismatched GPUs (RTX 5090 + 2x RTX 3080), task #92:
+
+- The draft head is SHARDED with the same uneven-TP machinery as the target:
+  QKV partitions whole GQA groups; the MLP intermediate partitions in
+  16-element units (`LlamaMLP` passes `tp_units`/`tp_family="mlp"`; the
+  16-element granularity keeps every rank's shard divisible by the jit
+  activation kernel's widest vector — 16 bf16 elements on Blackwell). Draft
+  picks are broadcast from TP rank 0 (#50) to guard hetero numerics.
+- Correctness gates observed green: temp-0 coherence probes byte-identical to
+  a no-spec oracle on the same commit, needle@8k found, no rank divergence,
+  deterministic across identical-cache-state repeat runs.
+- A draft head whose config carries a short `max_position_embeddings` is
+  extended to the server context via the standard override
+  (`SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`); if acceptance collapses
+  only at depth, cap the drafter with `--speculative-draft-window-size`.
+- Note: a uniform embedding scale on the draft input (e.g. gemma's
+  sqrt(hidden) target-side normalizer) is mathematically inert here — the
+  EAGLE-3 input layer RMSNorms the embeds before use — so no
+  target-family-specific embed patching is needed for llama-style heads.
+- Acceptance quality remains a property of the head/target pairing: measure
+  accept length against a no-spec baseline before assuming a speedup.
