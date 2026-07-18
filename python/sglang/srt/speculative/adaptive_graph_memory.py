@@ -186,7 +186,24 @@ pauseable:
 
 The boot reserve check consequently measures a state's footprint as the
 free-memory delta released by ``pause`` (covers noted tensors AND capture
-pool segments) instead of summing noted tensors.
+pool segments) instead of summing noted tensors, and additionally enforces
+a SERVING margin on top of the largest state's mapped footprint
+(``SGLANG_ADAPTIVE_SERVING_MARGIN_MIB``): forwards run while a state is
+mapped, and the eager paths (mamba chunked-prefill recompute etc.)
+allocate transients from the same free pool -- T102 measured 148 MiB of
+post-map free memory OOMing at a 24k deep prefill and 1367 MiB surviving.
+
+T102 GPU validation (rig: 5090 + 2x3080, Qwen3.6-27B-FP8 NEXTN TP=3
+uneven): per-state untagged residue 1.0-1.5 GB -> 0.18-0.22 GB (pauseable
+k5 footprint 960 MiB = scratch 424 + int-ws 184 + capture pool 352); the
+high-accept [1..5] profile boots at the STANDARD reserve with KV capacity
+identical to the static/default-set number (261120 vs 38848 at +2400 MiB
+reserve before); ~2315 forced swaps/rank with per-swap TP rank-sync
+asserts clean; 9/9 byte-identity vs Stage-1 offload at matched KV/DCP
+geometry, vs the pre-Stage-2 default-set artifact, and for the untouched
+adaptive-OFF path. Swap latency: organic avg 40-51 ms, max 85 ms (vs
+14 ms Stage-1 -- the price of remapping+zeroing ~1 GB per swap; ~0.5%
+overhead at the 0.1/s organic swap rate).
 
 Modes
 -----
