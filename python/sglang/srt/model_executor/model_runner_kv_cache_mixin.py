@@ -915,10 +915,11 @@ class ModelRunnerKVCacheMixin:
             # Asymmetric head dims between full and SWA (NPU compress path):
             # pull SWA-specific dims from the hf text config.
             v_head_dim = self.model_config.hf_text_config.v_head_dim
-            swa_head_num = max(
-                1,
-                self.model_config.hf_text_config.swa_num_key_value_heads
-                // get_parallel().attn_tp_size,
+            # Plan-aware per-rank SWA kv-head count (uneven TP via
+            # --rank-tp-ratio); identical to the classic
+            # max(1, swa_kv_heads // tp) without a plan.
+            swa_head_num = self.model_config.get_swa_num_kv_heads(
+                get_parallel().attn_tp_size
             )
             swa_head_dim = self.model_config.hf_text_config.swa_head_dim
             swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
@@ -1247,10 +1248,11 @@ class ModelRunnerKVCacheMixin:
                 kwargs = {}
                 if self.is_hybrid_swa_compress:
                     kwargs = {
-                        "swa_head_num": max(
-                            1,
-                            self.model_config.hf_text_config.swa_num_key_value_heads
-                            // get_parallel().attn_tp_size,
+                        # Plan-aware per-rank SWA kv-head count (uneven TP);
+                        # falls back to max(1, swa_kv_heads // tp) without a
+                        # plan.
+                        "swa_head_num": self.model_config.get_swa_num_kv_heads(
+                            get_parallel().attn_tp_size
                         ),
                         "swa_head_dim": self.model_config.swa_head_dim,
                         "swa_v_head_dim": self.model_config.swa_v_head_dim,
@@ -1385,10 +1387,11 @@ class ModelRunnerKVCacheMixin:
                 kwargs = {}
                 if self.is_hybrid_swa_compress:
                     kwargs = {
-                        "swa_head_num": max(
-                            1,
-                            self.model_config.hf_text_config.swa_num_key_value_heads
-                            // get_parallel().attn_tp_size,
+                        # Plan-aware per-rank SWA kv-head count (uneven TP);
+                        # falls back to max(1, swa_kv_heads // tp) without a
+                        # plan.
+                        "swa_head_num": self.model_config.get_swa_num_kv_heads(
+                            get_parallel().attn_tp_size
                         ),
                         "swa_head_dim": self.model_config.swa_head_dim,
                         "swa_v_head_dim": self.model_config.swa_v_head_dim,

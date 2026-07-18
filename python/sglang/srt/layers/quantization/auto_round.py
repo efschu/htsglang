@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import math
 import re
 from fractions import Fraction
 from typing import Any, Optional, Union
@@ -75,6 +76,18 @@ class AutoRoundConfig(QuantizationConfig):
         self.data_type = data_type
         self.backend = backend
         self.pack_factor = Fraction(32, weight_bits)
+        # Uneven-TP group alignment (--rank-tp-ratio): expose the effective
+        # shard block so _quant_block_aligned_units coarsens per-element unit
+        # families to group- AND marlin-tile-aligned boundaries. Mirrors
+        # CompressedTensorsConfig._group_size_block: the block is
+        # lcm(group_size, marlin min_thread_k=128) on BOTH dims — a
+        # column-parallel OUTPUT split (gate_up) and its coupled row-parallel
+        # INPUT split (down) partition the same intermediate dimension and
+        # must coarsen identically. Head-granular families whose unit size
+        # already divides the block (e.g. head_dim 256/512 attention units)
+        # pass through unchanged. Without a ratio plan this is inert.
+        block = math.lcm(group_size, 128) if group_size > 0 else 128
+        self.weight_block_size = [block, block]
 
     def __repr__(self) -> str:
         return (

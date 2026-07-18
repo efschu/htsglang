@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import Gemma4VisionConfig
 
+from sglang.srt.distributed.utils import tp_partition_size
 from sglang.srt.layers.attention.vision import QKV_BACKEND_IMPL
 from sglang.srt.layers.clippable_linear import (
     ClippableGateUpParallelLinear,
@@ -141,8 +142,22 @@ class Gemma4VisionAttention(nn.Module):
         self.head_dim = config.head_dim
 
         tp_size = get_parallel().attn_tp_size
-        self.num_heads_per_partition = config.num_attention_heads // tp_size
-        self.num_kv_heads_per_partition = config.num_key_value_heads // tp_size
+        tp_rank = get_parallel().attn_tp_rank
+        # Plan-aware per-rank head counts (uneven TP via --rank-tp-ratio
+        # distributes whole heads per rank, mirroring VisionAttention).
+        # Without a plan this is exactly num_heads // tp_size.
+        self.num_heads_per_partition = tp_partition_size(
+            config.num_attention_heads,
+            tp_size,
+            tp_rank,
+            units=config.num_key_value_heads,
+        )
+        self.num_kv_heads_per_partition = tp_partition_size(
+            config.num_key_value_heads,
+            tp_size,
+            tp_rank,
+            units=config.num_key_value_heads,
+        )
 
         self.qkv = ClippableQKVParallelLinear(
             hidden_size=config.hidden_size,
@@ -159,6 +174,8 @@ class Gemma4VisionAttention(nn.Module):
             bias=config.attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
+            # Input dim = attention heads; must match the qkv head plan.
+            tp_units=config.num_attention_heads,
         )
 
         self.q_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -279,6 +296,8 @@ class Gemma4VisionMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
+            # Per-element units, matching the gate_up plan (bf16 tower).
+            tp_units=config.intermediate_size,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

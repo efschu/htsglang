@@ -422,8 +422,21 @@ class ColumnParallelLinear(LinearBase):
             if hasattr(self, "output_sizes") and self.output_sizes
             else self.output_size
         )
+        # Quant-block alignment is a property of THIS layer's weights, not of
+        # the model-global quant config: layers the config skips (e.g. a bf16
+        # vision tower under `ignore` / block_name_to_quantize resolve to
+        # UnquantizedLinearMethod) carry no group/block constraint and must
+        # keep their raw units. Coarsening them can be fatal, not just
+        # wasteful — e.g. a vision o_proj with 16 heads of 72 elems under a
+        # 128-block config coarsens to lcm(72,128)=1152 -> ONE unit, which
+        # cannot be split across ranks.
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        _layer_quant_config = (
+            None if isinstance(self.quant_method, UnquantizedLinearMethod) else quant_config
+        )
         self.tp_units = _quant_block_aligned_units(
-            _units_basis, self.tp_units, quant_config, 0
+            _units_basis, self.tp_units, _layer_quant_config, 0
         )
         if getattr(self, "kv_replicated_parts", None):
             # REPLICATED-KV QKV mode (TP > num_kv_heads, task #62): the k/v
@@ -1791,8 +1804,16 @@ class RowParallelLinear(LinearBase):
         # optional family plan (must match the paired layer's family).
         # Without an installed ratio plan, tp_partition_size() reproduces
         # divide() exactly, so the default path is unchanged.
+        # See ColumnParallelLinear.__init__: only coarsen units when THIS
+        # layer's weights are actually quantized (ignored layers resolve to
+        # UnquantizedLinearMethod and keep their raw units).
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        _layer_quant_config = (
+            None if isinstance(self.quant_method, UnquantizedLinearMethod) else quant_config
+        )
         self.tp_units = _quant_block_aligned_units(
-            input_size, tp_units, quant_config, 1
+            input_size, tp_units, _layer_quant_config, 1
         )
         self.tp_family = tp_family
         self.input_size_per_partition = tp_partition_size(
