@@ -628,6 +628,33 @@ def fused_moe_gguf(
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, BLOCK_SIZE, E
         )
+        # #109: expert_ids is allocated with torch.empty and the align kernel
+        # only fills entries for blocks up to num_tokens_post_padded; the
+        # TRAILING entries are uninitialized garbage. The MMQ device kernel
+        # (sgl-kernel moe.cuh moe_q) guards them with a HARDCODED
+        # `exp_idx > 255 || exp_idx < 0` check — exact for a full 256-row
+        # expert table (garbage >= 256 is rejected), but under uneven-TP
+        # expert-dim sharding the LOCAL table has only n_local+1 rows
+        # (owned experts + the zero-pad expert), so garbage ids in
+        # [E, 255] pass the guard and the kernel reads
+        # `vx + exp_idx * exp_stride` BEYOND the weight tensor -> illegal
+        # memory access (seen live: Qwen3.6-35B-A3B GGUF, TP=3, any
+        # prefill > 64 tokens; the MMVQ decode path takes no expert_ids
+        # blocks and is unaffected). Same latent OOB exists for any GGUF
+        # MoE with < 256 experts even without sharding. Sanitize
+        # out-of-range block ids to -1, which the kernel's `exp_idx < 0`
+        # guard rejects; every VALID block id is < E by construction, so
+        # only garbage/trailing blocks are touched. Python-side on purpose:
+        # sgl_kernel ships prebuilt, and this mirrors the
+        # _ggml_moe_get_block_size fallback above (usable without a kernel
+        # rebuild); the durable fix belongs in moe.cuh (bound by nrows of
+        # W_local, not the hardcoded 255) -> backlog #112.
+        # masked_fill with a SCALAR is a device-only op: no host->device
+        # copy, so it is CUDA-graph-capture safe. (A torch.where against a
+        # freshly constructed host scalar -- e.g. expert_ids.new_tensor(-1)
+        # -- is NOT: it aborts MTP/NEXTN graph capture with "Cannot copy
+        # between CPU and CUDA tensors during CUDA graph capture".)
+        expert_ids = expert_ids.masked_fill(expert_ids >= E, -1)
         out = ggml_moe_a8(
             x,
             w1,
