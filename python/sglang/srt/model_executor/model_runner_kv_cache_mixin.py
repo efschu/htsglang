@@ -1864,6 +1864,15 @@ class ModelRunnerKVCacheMixin:
         # req_to_token allocation width.
         extra = get_req_to_token_extra_context_len(sa)
         full_need = concurrency * (int(ctx) + int(extra))
+        # --swa-pool-sizing cap (task #91 Stage A): the SWA pool is PINNED at
+        # its window-bounded worst case (SWAChunkCapPoolConfigurator) and no
+        # longer scales as ratio * max_total, so the ceil(swa_need / ratio)
+        # term below (which back-derives the max_total needed to make the
+        # ratio-sized swa pool big enough) does not apply: the reachability
+        # ceiling on max_total is the full-pool need alone. Ratio mode (the
+        # default) keeps the #90 formula byte-identical.
+        if sa.swa_pool_sizing == "cap":
+            return full_need
         # Local import avoids a pool_configurator import cycle.
         from sglang.srt.model_executor.pool_configurator import swa_pool_token_cap
 
