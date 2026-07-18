@@ -59,6 +59,14 @@ class FakeAdapter:
         self.calls.append(("region", tag))
         yield
 
+    @contextlib.contextmanager
+    def region_config(self, tag, enable_cpu_backup=False):
+        # The manager routes tagged allocations through per-tag MemPools and
+        # only uses the config (tag interception) part of the adapter.
+        self.region_tags.append(tag)
+        self.calls.append(("region_config", tag))
+        yield
+
     def pause(self, tag):
         self.calls.append(("pause", tag))
 
@@ -79,12 +87,18 @@ def _mock_cuda(free_bytes=1 << 40, snapshots=None):
         except StopIteration:
             return {}
 
+    @contextlib.contextmanager
+    def _fake_use_mem_pool(pool):
+        yield
+
     with (
         mock.patch.object(torch.cuda, "synchronize", lambda *a, **k: None),
         mock.patch.object(torch.cuda, "empty_cache", lambda *a, **k: None),
         mock.patch.object(
             torch.cuda, "mem_get_info", lambda *a, **k: (free_bytes, 1 << 41)
         ),
+        mock.patch.object(torch.cuda, "MemPool", lambda *a, **k: object()),
+        mock.patch.object(torch.cuda, "use_mem_pool", _fake_use_mem_pool),
         mock.patch.object(agm, "_snapshot_segment_addrs", _snap),
     ):
         yield
@@ -107,6 +121,7 @@ def _offload_init(self):
     # Mirrors the real __init__ minus the TorchMemorySaverAdapter creation.
     self.mode = "offload"
     self._states = {}
+    self._pools = {}
     self._paused = set()
     self._resumed_tag = None
     self._build_tag = None
@@ -191,15 +206,44 @@ class TestManagerOffloadGuard(unittest.TestCase):
 class TestManagerOffload(unittest.TestCase):
     def _build_two_states(self, mgr):
         tensors = {}
+        n = agm.MIN_TAGGED_BYTES // 4  # exactly at the tagging threshold
         with _mock_cuda():
             for steps in (2, 1):
                 with mgr.build_state(steps):
-                    with agm.tagged_state_alloc():
-                        t = torch.full((1024,), 7, dtype=torch.int32)
+                    with agm.tagged_state_alloc(nbytes=n * 4):
+                        t = torch.full((n,), 7, dtype=torch.int32)
                     agm.note_state_tensor(t)
                     tensors[steps] = t
                 mgr.pause_after_build(steps)
         return tensors
+
+    def test_size_gate_keeps_small_allocations_resident(self):
+        # Regression for the 5-state boot crash: a sub-2MiB allocation
+        # tagged into the TMS pool can be served from a paused tag's
+        # segment tail -> illegal access. The size gate must keep small
+        # allocations out of the tagged region AND out of the zero list.
+        mgr = _offload_manager()
+        with _mock_cuda():
+            with mgr.build_state(3):
+                with agm.tagged_state_alloc(nbytes=1024):
+                    small = torch.full((256,), 5, dtype=torch.int32)
+                agm.note_state_tensor(small)
+                big_nbytes = agm.MIN_TAGGED_BYTES
+                with agm.tagged_state_alloc(nbytes=big_nbytes):
+                    big = torch.full(
+                        (big_nbytes // 4,), 5, dtype=torch.int32
+                    )
+                agm.note_state_tensor(big)
+        rec = mgr._states["adaptive_state_k3"]
+        self.assertEqual(len(rec.tensors), 1)
+        self.assertIs(rec.tensors[0], big)
+        # Small tensor was never routed through the adapter region.
+        self.assertEqual(mgr._adapter.region_tags, ["adaptive_state_k3"])
+        with _mock_cuda():
+            mgr.finalize_boot(initial_steps=2)
+            mgr.ensure_active(3)
+        self.assertTrue(torch.all(big == 0))  # zeroed on resume
+        self.assertTrue(torch.all(small == 5))  # untouched, resident
 
     def test_build_tags_and_pause_after_build(self):
         mgr = _offload_manager()

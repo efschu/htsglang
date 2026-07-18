@@ -620,7 +620,9 @@ class FlashInferAttnBackend(AttentionBackend):
             # private workspace is tagged as pauseable per-state scratch: its
             # physical pages are unmapped while the state is inactive and it
             # is zeroed on every resume (restoring the #50 boot contract).
-            with adaptive_graph_memory.tagged_state_alloc():
+            with adaptive_graph_memory.tagged_state_alloc(
+                nbytes=envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+            ):
                 new_workspace_buffer = torch.empty(
                     envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                     dtype=torch.uint8,
@@ -1131,7 +1133,9 @@ class FlashInferAttnBackend(AttentionBackend):
         # pre-first-replay state). Static-path init is untouched: the tag
         # scope only exists during adaptive builds.
         if kv_indices_buf is None:
-            with adaptive_graph_memory.tagged_state_alloc():
+            with adaptive_graph_memory.tagged_state_alloc(
+                nbytes=max_num_tokens * self.max_context_len * 4
+            ):
                 cuda_graph_kv_indices = torch.zeros(
                     (max_num_tokens * self.max_context_len,),
                     dtype=torch.int32,
@@ -1143,7 +1147,10 @@ class FlashInferAttnBackend(AttentionBackend):
 
         extra_kv_indices = []
         for _ in range(self.num_wrappers - 1):
-            with adaptive_graph_memory.tagged_state_alloc():
+            with adaptive_graph_memory.tagged_state_alloc(
+                nbytes=cuda_graph_kv_indices.numel()
+                * cuda_graph_kv_indices.element_size()
+            ):
                 clone = cuda_graph_kv_indices.clone()
             adaptive_graph_memory.note_state_tensor(clone)
             extra_kv_indices.append(clone)
@@ -1164,7 +1171,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_kv_indices[i][0] = 0
 
         if not self.skip_prefill:
-            with adaptive_graph_memory.tagged_state_alloc():
+            with adaptive_graph_memory.tagged_state_alloc(
+                nbytes=max_num_tokens * self.max_context_len
+            ):
                 self.cuda_graph_custom_mask = torch.zeros(
                     (max_num_tokens * self.max_context_len),
                     dtype=torch.uint8,
@@ -2938,7 +2947,9 @@ class FlashInferMultiStepDraftBackend:
         # Tagged as pauseable per-state scratch during adaptive offload
         # builds; rewritten by generate_draft_decode_kv_indices before every
         # replay (see the single-backend init_cuda_graph_state for details).
-        with adaptive_graph_memory.tagged_state_alloc():
+        with adaptive_graph_memory.tagged_state_alloc(
+            nbytes=self.speculative_num_steps * kv_indices_width * 4
+        ):
             self.cuda_graph_kv_indices = torch.zeros(
                 (self.speculative_num_steps, kv_indices_width),
                 dtype=torch.int32,
