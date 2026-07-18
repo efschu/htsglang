@@ -336,26 +336,89 @@ wins outright at all measured lengths.
     (= 63,488/219,948 exactly), 200 OK in 5.13 s, pool fully released
     (second 16k warm starts at usage 0.07). This unblocks the eager-warm
     boot protocol required by Blocker 2.
-  * BLOCKER 2: prefill budget overshoot: AWQ/marlin load transients stay in
-    the torch cache (charged by the delta at profile time — fix:
-    `torch.cuda.empty_cache()` before profiling) and ~1.5-2.5 GB of
-    flashinfer/JIT buffers allocate lazily on the FIRST real request
-    (crashed a boot-time-coexistent pair — fix: eager warm via the
-    fake-bootstrap path, `bootstrap_host=2.2.2.2`, before decode boots).
+  * BLOCKER 2 — RESOLVED (follow-up session), ops-side, no code change:
+    (a) the planned `torch.cuda.empty_cache()`-before-profiling fix is
+    MOOT — `get_available_gpu_memory` already runs `empty_device_cache`
+    before every reading (utils/common.py:411), so the delta accounting is
+    exact for releasable memory. The residual overshoot is real resident
+    bytes: CUDA context, non-releasable AWQ/marlin load-transient
+    fragmentation (~3 GB pinned in partially-live segments), and lazy
+    flashinfer/JIT/workspace allocations on first use.
+    (b) `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on the PREFILL
+    process cuts the post-warm overshoot from ~1.5 GB to ~0.5 GB
+    (measured: budget 26,000 MiB → warmed 26,616; budget 25,600 →
+    warmed 26,136 with pool capped at 135k rows via `--max-total-tokens`).
+    (c) boot protocol (now REQUIRED): boot prefill → run the fake-bootstrap
+    warm suite (2k / 16k / 32k / 122,880 tokens — possible only after the
+    Blocker-1 fix) → THEN boot decode. Decode's delta-based profiling then
+    sees the prefill sibling at its true steady-state footprint and the
+    budget math closes: 5090 = prefill 26,136 + decode rank0 5,420 =
+    31,556 of 32,607 MiB, ~1 GB headroom, stable through 120k-token real
+    requests (the pre-fix crash scenario).
+    (d) decode ratio moved 1,2,2 → 1,3,3: rank0's AWQ shard at 1/5 is
+    4.51 GiB and did NOT fit beside the warmed prefill (load-time OOM,
+    measured); at 1/7 it fits. The decode-side cost is measured in the M3
+    table below.
+    (e) transport lesson: mooncake_tcp opens a TCP connection per transfer
+    op; on the LAN IP this exhausted ephemeral ports (82,910 TIME_WAITs →
+    "Cannot assign requested address" transfer failures + latency spikes).
+    `SGLANG_HOST_IP=127.0.0.1` pins all disagg endpoints to loopback,
+    where kernel tw_reuse recycles them — REQUIRED for this setup.
   * Fixed-cost accounting (5090, torch-visible 31.34 GiB): warmed prefill =
     19.7 weights + ~2.6 JIT/workspaces + pools + ~0.6 ctx; decode rank0
     ~6.4 → pool window ~1.4 GB, which Blocker 1 shrinks 4x. Fix Blocker 1
     first; then the 32k+ static table is straightforward.
   * Perf signal: the co-resident solo prefill sustains **~25,000 tok/s per
     2048-chunk** (fake-path warm, from the batch log).
-  * Remaining for follow-up: TTFT/perf table (target: beat 39.4 s/120k by
-    >2x; short-prompt TTFT gate per ruling 3a), contention measurement,
-    mamba-radix acceptance.
-- **M4** — regression: disagg OFF byte-identical on the reference launch
-  commands; teardown hygiene per ruling 3b — both servers stopped leaves
-  every GPU at 0 MiB, AND a hard-kill (SIGKILL) of the prefill server
-  mid-transfer must not orphan IPC handles / pinned buffers or wedge the
-  decode server; docs; push `feat/pd-disagg` to efschu/htsglang.
+  * M3 RESULTS (follow-up session, 2026-07-18; A3B-AWQ, fp8 KV, ctx
+    131,072 both sides, no cuda-graph, prefill chunked 2048 /
+    max_prefill 16,384, decode TP=3 uneven 1,3,3 + weighted DCP; disagg
+    numbers e2e through `local_proxy`, 2-3 runs each, spread <3%):
+
+    | prompt tokens | non-disagg TP=3 (auto, M0) | non-disagg TP=3 (1,3,3, matched) | disagg pair TTFT | speedup vs matched |
+    |---|---|---|---|---|
+    | 2,048 | ~0.5 s | 0.49 s | **0.15 s** | 3.3x |
+    | 8,192 | 2.04 s | 2.27 s | **0.46 s** | 4.9x |
+    | 32,768 | 8.81 s | 9.73 s | **3.44 s** | 2.8x |
+    | 122,880 | 39.4 s | 42.2 s | **18.9 s** | 2.2x |
+
+    Target "beat 39.4 s/120k by >2x" MET (18.9 s = 2.08x vs M0 auto,
+    2.2x vs matched). Short-prompt gate (ruling 3a) MET: disagg WINS at
+    2k (0.15 vs 0.49 s) — proxy/handoff overhead ≈ 40-60 ms; no routing
+    length threshold needed. Disagg TTFT decomposition at 120k: 14.9 s
+    solo prefill + ~4.0 s transfer/prealloc/handoff.
+    * Decode rate (bs=1, e2e-derived over 256 tokens): matched non-disagg
+      17.3 tok/s @2k / 17.7 @32k; disagg pair 15.0 @2k (−13%) /
+      17.3 @32k (−2%). The 2k dip is the co-resident (idle) prefill
+      sibling on the 5090; acceptable per design §5 option (a).
+    * SM contention (concurrent 32k prefill burst during a 512-token
+      decode): decode 29.27 s → 31.25 s (+6.7%); the prefill burst itself
+      3.44 → 3.54 s. No mitigation knobs needed.
+    * Correctness: needle retrieval at 28.6k tokens through the pair is
+      CORRECT ("483729."). Temp-0 outputs are NOT bit-identical to either
+      non-disagg reference — and cannot be: the two non-disagg references
+      themselves (ratio auto vs 1,3,3) differ on 4/4 oracle prompts at
+      temp 0 (A3B MoE reduction-order numerics). Bit-equality across TP
+      layouts is not a property of this stack for A3B; the rescatter
+      mechanism's exactness was proven by M2's bit-identical 2B oracle.
+- **M4** — DONE (follow-up session, 2026-07-18):
+  * (a) disagg-OFF regression: the exact M0 reference launch (TP=3 ratio
+    auto + rank-auto-reserve) on the final branch state reproduces the M0
+    oracle BYTE-IDENTICAL (4/4 incl. 32k needle) AND the pool sizing is
+    unchanged (max_total_num_tokens=2,621,520, avail 6.70 GB — identical
+    to the M0 boot log): the co-residency profiler fix altered nothing on
+    the non-disagg path.
+  * (b) hard-kill IPC-leak test: SIGKILL of the entire prefill process
+    tree at t=8 s into a 122,880-token request (mid-chunk-transfer):
+    client gets a clean 500 in 13.1 s (no hang), all 3 decode ranks log
+    `KVTransferError ... Lost connection with prefill instance` and
+    RELEASE the prealloc'd rows, decode stays healthy (200) with stable
+    VRAM, prefill's 26 GB fully returned. Recovery: a freshly booted
+    prefill re-registers against the SURVIVING decode and the pair serves
+    correctly — decode never restarted.
+  * (c) teardown: SIGTERM does not reap scheduler children — kill the
+    nvidia-smi compute-app PIDs explicitly; after full teardown all three
+    GPUs read 0 MiB (verified after every boot cycle this session).
 
 ## Appendix: measurement provenance
 
