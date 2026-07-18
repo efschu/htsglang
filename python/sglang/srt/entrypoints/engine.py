@@ -607,6 +607,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
         if server_args.dp_size == 1:
             from sglang.srt.speculative.adaptive_graph_memory import (
+                OFFLOAD_MODES,
                 resolve_adaptive_graph_memory_mode,
             )
 
@@ -618,7 +619,7 @@ class Engine(EngineScoreMixin, EngineBase):
             # regions, which the default path never enters).
             memory_saver_adapter = TorchMemorySaverAdapter.create(
                 enable=server_args.enable_memory_saver
-                or resolve_adaptive_graph_memory_mode(server_args) == "offload"
+                or resolve_adaptive_graph_memory_mode(server_args) in OFFLOAD_MODES
             )
             scheduler_pipe_readers = []
 

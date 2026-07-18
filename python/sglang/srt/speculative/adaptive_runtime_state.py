@@ -259,7 +259,7 @@ class AdaptiveController:
         # that finalize_boot verifies. Resident mode keeps the historical
         # ascending order (behavior-neutral there, and T75 measurements were
         # taken with it).
-        offload = self.graph_memory.mode == "offload"
+        offload = self.graph_memory.offload_enabled
         build_order = sorted(self.candidate_steps, reverse=offload)
         for steps in build_order:
             if steps in self._states:

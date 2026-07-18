@@ -146,20 +146,65 @@ additionally all-gathers (swap ordinal, target steps) across the TP CPU group
 on every swap and asserts equality (stress/debug tool; a diverged rank turns
 silent corruption into an immediate failure).
 
+Stage 2 (Task #102) -- capture pools and int workspaces
+-------------------------------------------------------
+Stage 1 (above) pauses only the explicitly noted scratch (float workspaces,
+kv_indices, custom_mask): ~0.4 GiB/state. Each state still left ~1-1.5 GiB
+of UNTAGGED residue: (a) the CUDA-graph capture-pool allocations (activation
+/ intermediate tensors the captured graphs reference at fixed VAs), (b) the
+flashinfer wrapper int workspaces (8 MiB each; graph-mode wrappers are
+created PER CAPTURED SHAPE, so a state carries dozens), (c) static IO
+buffers and driver-owned cudaGraphExec memory. Stage 2 makes (a) and (b)
+pauseable:
+
+* Capture pools: every state's graph captures run against a PRIVATE
+  ``torch.cuda.graph_pool_handle()`` (one per tag -- the same cross-tag
+  free-list-isolation argument as the Stage-1 per-tag MemPools) and the
+  capture body executes inside the torch_memory_saver region for that tag
+  (upstream precedent: ``TorchMemorySaver.cuda_graph``), so every segment
+  the caching allocator creates for capture-time allocations is tagged and
+  unmapped with the state. Replay rewrites every capture-pool tensor before
+  any kernel reads it (a replay re-executes the full captured DAG; graph
+  inputs are the static IO buffers, which stay resident); the graph is never
+  replayed while its pool is paused (only-active-state replay, enforced by
+  ``ensure_active`` running before the worker pointer swap).
+  ``SGLANG_ADAPTIVE_CAPTURE_CPU_BACKUP=1`` additionally round-trips the
+  capture-pool bytes through host RAM on pause/resume (exact content
+  restore -- fallback if garbage-on-resume ever falsifies the
+  rewrite-before-read property).
+* Int workspaces: flashinfer re-plans on every forward (host plan state ->
+  pinned buffer -> device int-workspace copy), so the int workspace carries
+  no state a forward does not rewrite, except its boot contract of
+  fresh-cudaMalloc zero pages (#50 note). Each wrapper built during a
+  Stage-2 state build gets a tagged replacement int workspace via the public
+  ``reset_workspace_buffer`` API, noted for zero-on-resume.
+* Still resident, documented: the shared logits buffer and the
+  process-wide-pooled IO buffers (cross-state ALIASED via
+  ``share_input_buffer``'s (name,numel,dtype,device) key -- tagging them
+  would unmap memory other states alias, KiB-to-few-MiB scale anyway) and
+  cudaGraphExec_t instantiation memory (driver-owned, not interceptable).
+
+The boot reserve check consequently measures a state's footprint as the
+free-memory delta released by ``pause`` (covers noted tensors AND capture
+pool segments) instead of summing noted tensors.
+
 Modes
 -----
-``--speculative-adaptive-graph-memory {auto,resident,offload}``:
+``--speculative-adaptive-graph-memory {auto,resident,offload,offload-scratch}``:
 
 * ``resident``: status quo -- all states fully materialized, ~us pointer
   swaps, sum-of-states reserve. First-class mode for rigs with VRAM to spare.
-* ``offload``: the tagged buffers of inactive states are unmapped -- ms-scale
-  swaps, max-state reserve, KV capacity recovered.
+* ``offload``: Stage 2 -- scratch + capture pools + int workspaces of
+  inactive states are unmapped; ms-scale swaps, max-state reserve.
+* ``offload-scratch``: Stage 1 exactly -- only the noted scratch is
+  unmapped, captures go to the shared global graph pool. Fallback knob.
 * ``auto`` (default): offload when the prerequisites hold (CUDA device,
   flashinfer attention backend, torch_memory_saver importable, no
-  expandable_segments), else resident. Offload is the intended default for
-  adaptive mode because idle graph states are pure VRAM waste on the rigs
-  adaptive mode targets; explicit ``offload`` with missing prerequisites is
-  a hard error, ``auto`` degrades to resident with a log line.
+  expandable_segments, decode cuda-graph backend 'full', no
+  SGLANG_MEMORY_SAVER_CUDA_GRAPH), degrading to offload-scratch when only
+  the Stage-2-specific prerequisites fail, else resident. Explicit
+  ``offload`` / ``offload-scratch`` with missing prerequisites is a hard
+  error, ``auto`` degrades with a log line.
 """
 
 from __future__ import annotations
@@ -184,7 +229,10 @@ if TYPE_CHECKING:
 # allocations would share segments across tags and stay resident instead.
 MIN_TAGGED_BYTES = 2 * 1024 * 1024
 
-_MODES = ("auto", "resident", "offload")
+_MODES = ("auto", "resident", "offload", "offload-scratch")
+
+# Modes in which inactive states are physically unmapped (either stage).
+OFFLOAD_MODES = ("offload", "offload-scratch")
 
 # Process-wide active manager. One scheduler process owns at most one
 # AdaptiveController and therefore one manager; the flashinfer wrap sites
@@ -193,8 +241,21 @@ _MODES = ("auto", "resident", "offload")
 _ACTIVE_MANAGER: Optional["AdaptiveGraphMemoryManager"] = None
 
 
+def _decode_graph_backend(server_args: "ServerArgs") -> str:
+    """The decode-phase cuda-graph backend selector, from server args only
+    (mirrors resolve_decode_backend without touching runtime flags, so it is
+    computable in the launcher process)."""
+    override = getattr(server_args, "cuda_graph_backend_decode", None)
+    if override:
+        return override
+    cfg = getattr(server_args, "cuda_graph_config", None)
+    decode = getattr(cfg, "decode", None)
+    return getattr(decode, "backend", None) or "full"
+
+
 def resolve_adaptive_graph_memory_mode(server_args: "ServerArgs") -> str:
-    """Resolve {auto,resident,offload} -> {resident,offload}.
+    """Resolve {auto,resident,offload,offload-scratch} ->
+    {resident,offload,offload-scratch}.
 
     Must be computable identically in the launcher process (which decides
     whether to spawn schedulers with the torch_memory_saver LD_PRELOAD hook)
@@ -213,11 +274,11 @@ def resolve_adaptive_graph_memory_mode(server_args: "ServerArgs") -> str:
         return "resident"
 
     def _fail_or_resident(reason: str) -> str:
-        if requested == "offload":
+        if requested in OFFLOAD_MODES:
             raise ValueError(
-                f"--speculative-adaptive-graph-memory offload is not usable: "
-                f"{reason}. Use 'resident' (all states stay materialized in "
-                "VRAM) or fix the prerequisite."
+                f"--speculative-adaptive-graph-memory {requested} is not "
+                f"usable: {reason}. Use 'resident' (all states stay "
+                "materialized in VRAM) or fix the prerequisite."
             )
         logger.info(
             "Adaptive graph memory: auto-resolving to 'resident' (%s).", reason
@@ -247,6 +308,38 @@ def resolve_adaptive_graph_memory_mode(server_args: "ServerArgs") -> str:
         import torch_memory_saver  # noqa: F401
     except ImportError as e:
         return _fail_or_resident(f"torch_memory_saver is not importable ({e})")
+    if requested == "offload-scratch":
+        return "offload-scratch"
+
+    # Stage-2 (capture-pool) prerequisites. When only these fail, 'auto'
+    # degrades to Stage-1 offload-scratch rather than resident.
+    def _fail_or_scratch(reason: str) -> str:
+        if requested == "offload":
+            raise ValueError(
+                "--speculative-adaptive-graph-memory offload (Stage 2, "
+                f"capture-pool offload) is not usable: {reason}. Use "
+                "'offload-scratch' (Stage 1: scratch-only offload) or "
+                "'resident', or fix the prerequisite."
+            )
+        logger.info(
+            "Adaptive graph memory: auto-resolving to 'offload-scratch' (%s).",
+            reason,
+        )
+        return "offload-scratch"
+
+    decode_backend = _decode_graph_backend(server_args)
+    if decode_backend not in ("full", "disabled"):
+        return _fail_or_scratch(
+            f"decode cuda-graph backend {decode_backend!r} has no per-state "
+            "capture-pool routing (backend 'full' required)"
+        )
+    from sglang.srt.utils import get_bool_env_var
+
+    if get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH"):
+        return _fail_or_scratch(
+            "SGLANG_MEMORY_SAVER_CUDA_GRAPH already routes captures through "
+            "its own memory-saver tag"
+        )
     return "offload"
 
 
@@ -255,13 +348,31 @@ class _StateRecord:
     tag: str
     steps: int
     tensors: list = field(default_factory=list)
+    # Parallel to `tensors`: what each noted tensor is ("scratch" Stage-1
+    # buffers, "int_ws" flashinfer int workspaces) -- for the itemized logs.
+    tensor_kinds: list = field(default_factory=list)
     # [start, end) virtual-address ranges of allocator segments that appeared
     # during this state's build window (for the finalize_boot audit).
     segment_ranges: list = field(default_factory=list)
+    # Free-memory delta released by pause_after_build (page-granular; covers
+    # noted tensors AND the state's private capture pool). 0 = not measured.
+    paused_bytes: int = 0
 
     @property
     def nbytes(self) -> int:
         return sum(t.untyped_storage().nbytes() for t in self.tensors)
+
+    def kind_nbytes(self, kind: str) -> int:
+        return sum(
+            t.untyped_storage().nbytes()
+            for t, k in zip(self.tensors, self.tensor_kinds)
+            if k == kind
+        )
+
+    @property
+    def footprint_bytes(self) -> int:
+        """Best-known pauseable footprint (measured when available)."""
+        return self.paused_bytes or self.nbytes
 
 
 def _snapshot_segment_addrs() -> dict[int, int]:
@@ -287,20 +398,26 @@ class AdaptiveGraphMemoryManager:
     """
 
     def __init__(self, mode: str, tp_cpu_group=None):
-        assert mode in ("resident", "offload"), mode
+        assert mode in ("resident",) + OFFLOAD_MODES, mode
         self.mode = mode
         self._states: dict[str, _StateRecord] = {}
         self._pools: dict[str, "torch.cuda.MemPool"] = {}
+        # Stage 2: per-tag PRIVATE cuda-graph capture pools (graph_pool_handle
+        # tokens). Private per tag for the same reason as the MemPools above:
+        # pause(tag) unmaps a tag's segments wholesale, so no other tag may
+        # ever be served from their free space.
+        self._capture_pools: dict[str, object] = {}
         self._paused: set[str] = set()
         self._resumed_tag: Optional[str] = None  # at most one built tag mapped
         self._build_tag: Optional[str] = None
+        self._in_capture_region = False
         self._pre_build_segments: Optional[dict[int, int]] = None
         self._finalized = False
         self._swap_ordinal = 0
         self.last_swap_ms: Optional[float] = None
         self._tp_cpu_group = tp_cpu_group
         self._adapter = None
-        if self.mode == "offload":
+        if self.offload_enabled:
             ld_preload = os.environ.get("LD_PRELOAD", "")
             if "torch_memory_saver" not in ld_preload:
                 raise RuntimeError(
@@ -321,6 +438,16 @@ class AdaptiveGraphMemoryManager:
         global _ACTIVE_MANAGER
         _ACTIVE_MANAGER = self
 
+    @property
+    def offload_enabled(self) -> bool:
+        """True for both offload stages (inactive states are unmapped)."""
+        return self.mode in OFFLOAD_MODES
+
+    @property
+    def capture_offload(self) -> bool:
+        """True when Stage 2 (per-state capture pools) is active."""
+        return self.mode == "offload"
+
     # ------------------------------------------------------------------
     # Build phase
     # ------------------------------------------------------------------
@@ -332,7 +459,7 @@ class AdaptiveGraphMemoryManager:
     def build_state(self, steps: int):
         """Scope one candidate state's build. Wrap sites tag allocations
         only while a build scope is active (static-path init never is)."""
-        if self.mode != "offload":
+        if not self.offload_enabled:
             yield
             return
         tag = self.tag_for_steps(steps)
@@ -363,7 +490,14 @@ class AdaptiveGraphMemoryManager:
 
     @contextmanager
     def _tagged_region(self):
-        if self.mode != "offload" or self._build_tag is None:
+        if not self.offload_enabled or self._build_tag is None:
+            yield
+            return
+        if self._in_capture_region:
+            # Already inside the capture-wide region_config for this tag
+            # (Stage 2): allocations are routed to the tag's capture pool and
+            # tagged by the ambient region; nesting region_config would trip
+            # its non-reentrancy assert.
             yield
             return
         # One private MemPool PER TAG -- a hard correctness requirement, not
@@ -387,25 +521,81 @@ class AdaptiveGraphMemoryManager:
             with self._adapter.region_config(tag=tag):
                 yield
 
-    def note_tensor(self, t: Optional[torch.Tensor]) -> None:
-        if self.mode != "offload" or self._build_tag is None or t is None:
+    def note_tensor(self, t: Optional[torch.Tensor], kind: str = "scratch") -> None:
+        if not self.offload_enabled or self._build_tag is None or t is None:
             return
         if os.environ.get("SGLANG_ADAPTIVE_ALIAS_DEBUG"):
             logger.info(
-                "AGM-DEBUG note %s ptr=0x%x nbytes=%d",
+                "AGM-DEBUG note %s ptr=0x%x nbytes=%d kind=%s",
                 self._build_tag,
                 t.data_ptr(),
                 t.untyped_storage().nbytes(),
+                kind,
             )
-        self._states[self._build_tag].tensors.append(t)
+        rec = self._states[self._build_tag]
+        rec.tensors.append(t)
+        rec.tensor_kinds.append(kind)
+
+    # ------------------------------------------------------------------
+    # Stage 2: per-state capture pools
+    # ------------------------------------------------------------------
+    def capture_pool_for_build(self):
+        """The private cuda-graph capture pool of the state being built, or
+        None outside a Stage-2 build scope. Consumed by the graph backend's
+        capture_session so every capture of this state's runners lands in the
+        state's own (pauseable) pool instead of the shared global pool."""
+        if not self.capture_offload or self._build_tag is None:
+            return None
+        tag = self._build_tag
+        pool = self._capture_pools.get(tag)
+        if pool is None:
+            pool = self._capture_pools[tag] = torch.cuda.graph_pool_handle()
+        return pool
+
+    @contextmanager
+    def capture_graph(self, default_graph_ctx, *, cuda_graph, pool, stream):
+        """Wrap one graph capture. Outside a Stage-2 build scope this defers
+        to *default_graph_ctx* untouched. Inside, the capture runs against
+        the state's private pool with the tag's torch_memory_saver region
+        active, so capture-time segment allocations (cudaMalloc from the
+        caching allocator growing the capture pool) become pauseable with
+        the state -- the same mechanism as TorchMemorySaver.cuda_graph.
+
+        NOTE (content contract): no re-init happens for capture-pool memory
+        on resume. A replay re-executes the full captured kernel DAG, so
+        every capture-pool tensor a kernel reads was written earlier in the
+        SAME replay (graph inputs live in the resident IO buffers, persistent
+        kernel workspaces in the tagged-and-zeroed float/int workspaces).
+        SGLANG_ADAPTIVE_CAPTURE_CPU_BACKUP=1 switches to exact byte
+        restoration through host RAM instead (fallback falsifier knob).
+        """
+        tag = self._build_tag
+        if not self.capture_offload or tag is None:
+            with default_graph_ctx(cuda_graph=cuda_graph, pool=pool, stream=stream):
+                yield
+            return
+        assert pool == self._capture_pools.get(tag), (
+            "Stage-2 capture must use the build tag's private pool "
+            "(capture_session did not pick up capture_pool_for_build)"
+        )
+        from sglang.srt.environ import envs
+
+        cpu_backup = envs.SGLANG_ADAPTIVE_CAPTURE_CPU_BACKUP.get()
+        with torch.cuda.graph(cuda_graph, pool=pool, stream=stream):
+            with self._adapter.region_config(tag=tag, enable_cpu_backup=cpu_backup):
+                self._in_capture_region = True
+                try:
+                    yield
+                finally:
+                    self._in_capture_region = False
 
     def pause_after_build(self, steps: int) -> None:
         """Pause a freshly built state so boot peak stays ~one state."""
-        if self.mode != "offload":
+        if not self.offload_enabled:
             return
         tag = self.tag_for_steps(steps)
         rec = self._states.get(tag)
-        if rec is None or not rec.tensors:
+        if rec is None or (not rec.tensors and tag not in self._capture_pools):
             return
         torch.cuda.synchronize()
         # Return freed temp segments to the driver between builds.
@@ -420,8 +610,26 @@ class AdaptiveGraphMemoryManager:
                     for t in rec.tensors
                 ],
             )
+        free_before, _ = torch.cuda.mem_get_info()
         self._adapter.pause(tag)
         self._paused.add(tag)
+        free_after, _ = torch.cuda.mem_get_info()
+        # Page-granular measured footprint of everything the tag unmaps
+        # (noted tensors AND the Stage-2 capture pool). Drives the boot
+        # reserve check and the itemized residue accounting.
+        rec.paused_bytes = max(0, free_after - free_before)
+        scratch = rec.kind_nbytes("scratch")
+        int_ws = rec.kind_nbytes("int_ws")
+        logger.info(
+            "Adaptive graph memory: paused %s, released %.1f MiB "
+            "(scratch %.1f MiB, int workspaces %.1f MiB, capture pool "
+            "~%.1f MiB)",
+            tag,
+            rec.paused_bytes / (1 << 20),
+            scratch / (1 << 20),
+            int_ws / (1 << 20),
+            max(0, rec.paused_bytes - scratch - int_ws) / (1 << 20),
+        )
 
     # ------------------------------------------------------------------
     # Boot finalize: audit + max-state reserve guarantee
@@ -429,26 +637,33 @@ class AdaptiveGraphMemoryManager:
     def finalize_boot(self, initial_steps: int) -> None:
         """Audit tag/segment isolation, verify the max-state reserve, and
         bring the initial state up. Idempotence not needed (called once)."""
-        if self.mode != "offload":
+        if not self.offload_enabled:
             return
         self._audit_segment_isolation()
 
         # Pause anything still mapped (defensive; builds already pause).
         for tag, rec in self._states.items():
-            if tag not in self._paused and rec.tensors:
+            if tag not in self._paused and (
+                rec.tensors or tag in self._capture_pools
+            ):
                 torch.cuda.synchronize()
                 self._adapter.pause(tag)
                 self._paused.add(tag)
 
-        sizes = {t: r.nbytes for t, r in self._states.items() if r.tensors}
+        sizes = {
+            t: r.footprint_bytes
+            for t, r in self._states.items()
+            if r.tensors or t in self._capture_pools
+        }
         max_tag, max_bytes = (
             max(sizes.items(), key=lambda kv: kv[1]) if sizes else (None, 0)
         )
         free_bytes, total_bytes = torch.cuda.mem_get_info()
         logger.info(
-            "Adaptive graph memory (offload): states=%s; reserve rule "
+            "Adaptive graph memory (%s): states=%s; reserve rule "
             "max(one state)=%.1f MiB (resident mode would keep the sum "
             "%.1f MiB mapped); free after pausing all states: %.1f MiB",
+            self.mode,
             {t: f"{b / (1 << 20):.1f} MiB" for t, b in sizes.items()},
             max_bytes / (1 << 20),
             sum(sizes.values()) / (1 << 20),
@@ -531,11 +746,18 @@ class AdaptiveGraphMemoryManager:
         mapped (including registered baseline states, which are never
         tagged and always resident).
         """
-        if self.mode != "offload":
+        if not self.offload_enabled:
             return
         tag = self.tag_for_steps(steps)
         rec = self._states.get(tag)
-        target = tag if (rec is not None and rec.tensors) else None
+        target = (
+            tag
+            if (
+                rec is not None
+                and (rec.tensors or tag in self._capture_pools)
+            )
+            else None
+        )
         if target == self._resumed_tag:
             return
 
@@ -606,7 +828,7 @@ class AdaptiveGraphMemoryManager:
     # Queries
     # ------------------------------------------------------------------
     def is_paused_tensor(self, t: torch.Tensor) -> bool:
-        if self.mode != "offload":
+        if not self.offload_enabled:
             return False
         for tag in self._paused:
             rec = self._states.get(tag)
@@ -646,7 +868,7 @@ def tagged_state_alloc(nbytes: Optional[int] = None):
     return mgr._tagged_region()
 
 
-def note_state_tensor(t: Optional[torch.Tensor]) -> None:
+def note_state_tensor(t: Optional[torch.Tensor], kind: str = "scratch") -> None:
     """Register *t* as pauseable scratch of the state currently being built
     (zeroed on every resume). Only call for tensors allocated inside
     ``tagged_state_alloc``. Sub-MIN_TAGGED_BYTES tensors are skipped (they
@@ -656,14 +878,44 @@ def note_state_tensor(t: Optional[torch.Tensor]) -> None:
     if mgr is not None and t is not None:
         if t.untyped_storage().nbytes() < MIN_TAGGED_BYTES:
             return
-        mgr.note_tensor(t)
+        mgr.note_tensor(t, kind=kind)
 
 
 def in_offload_build() -> bool:
     """True while an offload-mode adaptive state build scope is active."""
     mgr = _ACTIVE_MANAGER
     return (
-        mgr is not None and mgr.mode == "offload" and mgr._build_tag is not None
+        mgr is not None and mgr.offload_enabled and mgr._build_tag is not None
+    )
+
+
+def in_capture_offload_build() -> bool:
+    """True while a STAGE-2 (capture-pool) adaptive build scope is active
+    (gates the Stage-2-only wrap sites, e.g. int-workspace retagging)."""
+    mgr = _ACTIVE_MANAGER
+    return (
+        mgr is not None and mgr.capture_offload and mgr._build_tag is not None
+    )
+
+
+def capture_pool_override():
+    """Per-state capture pool for the build in progress, or None (use the
+    shared global graph pool). Called by the cuda-graph backend's
+    capture_session."""
+    mgr = _ACTIVE_MANAGER
+    if mgr is None:
+        return None
+    return mgr.capture_pool_for_build()
+
+
+def capture_graph_ctx(default_graph_ctx, *, cuda_graph, pool, stream):
+    """Context manager for one graph capture; defers to *default_graph_ctx*
+    outside a Stage-2 build scope. See AdaptiveGraphMemoryManager.capture_graph."""
+    mgr = _ACTIVE_MANAGER
+    if mgr is None:
+        return default_graph_ctx(cuda_graph=cuda_graph, pool=pool, stream=stream)
+    return mgr.capture_graph(
+        default_graph_ctx, cuda_graph=cuda_graph, pool=pool, stream=stream
     )
 
 
