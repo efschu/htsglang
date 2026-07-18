@@ -436,6 +436,23 @@ def _parse_rank_vocab_ratio(value: str) -> Union[str, List[int]]:
     return [int(part.strip()) for part in value.split(",")]
 
 
+def _parse_rank_kv_ratio(value: str) -> Union[str, List[int]]:
+    """Parse --rank-kv-ratio: 'coupled', 'capacity', 'auto' (alias of
+    'capacity'), or a comma-separated positive integer list."""
+    mode = value.strip()
+    if mode in ("coupled", "capacity"):
+        return mode
+    if mode == "auto":
+        return "capacity"
+    try:
+        return [int(part.strip()) for part in value.split(",")]
+    except ValueError as e:
+        raise ValueError(
+            "--rank-kv-ratio must be 'coupled', 'capacity', 'auto' or a "
+            f"comma-separated integer list, got {value!r}."
+        ) from e
+
+
 def _torch_to_nvml_gpu_index_mapping() -> Dict[int, int]:
     """CUDA device index -> NVML physical index, bridged via PCI bus IDs.
 
@@ -1277,6 +1294,35 @@ class ServerArgs:
             type_parser=_parse_int_list,
         ),
     ] = None
+    rank_kv_ratio: A[
+        Union[str, List[int]],
+        Arg(
+            help="Uneven-DCP KV-TOKEN ownership vector, DECOUPLED from the "
+            "projection/weight split: under weighted-DCP token-axis KV "
+            "sharding, moving a context token's home rank only moves where "
+            "that token's attention math runs (query broadcast + LSE merge "
+            "stay KB-sized per step), so token ownership is a free placement "
+            "knob. 'coupled' (default): exactly the previous behavior (the "
+            "SGLANG_UNEVEN_DCP/_WEIGHTED env-gated estimate vector plus the "
+            "restart-hint self-calibration). 'capacity' (alias 'auto'): "
+            "capacity-weighted ownership — after the post-weight-load memory "
+            "profiling, every rank installs the measured optimal vector "
+            "proportional to its actual free-VRAM-after-weights token "
+            "capacity (one-boot convergence; maximizes max_total_num_tokens; "
+            "the honest cost is that deep-context decode shifts attention "
+            "work to the cards holding more tokens). A comma-separated "
+            "positive integer list (one entry per rank) pins the ownership "
+            "vector explicitly — the capacity-vs-depth-speed slider. "
+            "Non-'coupled' values imply the weighted-DCP path (no "
+            "SGLANG_UNEVEN_DCP/_WEIGHTED env needed) and require "
+            "--rank-gpu-id with a non-uniform --rank-tp-ratio plan. The "
+            "environment variable SGLANG_UNEVEN_TOKEN_VECTOR (explicit "
+            "vector) takes precedence over this flag. The projection/GEMM "
+            "weight split (--rank-tp-ratio, --rank-mlp-ratio, ...) is never "
+            "affected by this flag.",
+            type_parser=_parse_rank_kv_ratio,
+        ),
+    ] = "coupled"
     random_seed: A[Optional[int], "The random seed."] = None
     watchdog_timeout: A[
         float,
@@ -3338,8 +3384,16 @@ class ServerArgs:
             # every other CUDA DCP+spec configuration, which is NOT made safe.
             uneven_weighted_dcp = (
                 self.speculative_algorithm is not None
-                and os.environ.get("SGLANG_UNEVEN_DCP", "0") == "1"
-                and os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0") == "1"
+                and (
+                    (
+                        os.environ.get("SGLANG_UNEVEN_DCP", "0") == "1"
+                        and os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0")
+                        == "1"
+                    )
+                    # --rank-kv-ratio != 'coupled' implies the weighted-DCP
+                    # path without the env pair.
+                    or self.uneven_kv_flag_active()
+                )
                 and self.rank_tp_ratio is not None
                 and len(set(self.rank_tp_ratio)) > 1
                 and self.dcp_size == self.tp_size
@@ -4083,6 +4137,28 @@ class ServerArgs:
         by min-reducing the derived TOKEN capacities instead."""
         return self.rank_gpu_memory_mib is not None
 
+    def uneven_kv_flag_active(self) -> bool:
+        """True when --rank-kv-ratio requests the DECOUPLED KV-token
+        ownership (a mode string other than 'coupled', or an explicit
+        vector). 'coupled' (the default) keeps the previous env-gated
+        behavior byte-identical."""
+        ratio = getattr(self, "rank_kv_ratio", "coupled")
+        return ratio != "coupled"
+
+    def uneven_kv_capacity_mode(self) -> bool:
+        """True for --rank-kv-ratio capacity/auto: install the MEASURED
+        capacity-optimal token vector after the post-weight-load memory
+        profiling (one-boot convergence)."""
+        return getattr(self, "rank_kv_ratio", "coupled") == "capacity"
+
+    def uneven_weighted_dcp_enabled(self) -> bool:
+        """True when the weighted-DCP token vector should be installed:
+        the classic env pair, or any non-'coupled' --rank-kv-ratio."""
+        return (
+            os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0") == "1"
+            or self.uneven_kv_flag_active()
+        )
+
     def apply_rank_memory_budget(self, tp_rank: int) -> Optional[float]:
         """Apply this rank's --rank-gpu-memory-mib budget as its
         mem_fraction_static (worker-process side).
@@ -4281,6 +4357,12 @@ class ServerArgs:
                     "--rank-auto-reserve-mib only applies with "
                     "--rank-tp-ratio auto."
                 )
+            if self.uneven_kv_flag_active():
+                raise ValueError(
+                    "--rank-kv-ratio (other than 'coupled') requires "
+                    "--rank-gpu-id with a non-uniform --rank-tp-ratio plan "
+                    "(the weighted-DCP token-axis KV sharding)."
+                )
             # Raises if an MLP-family vector is set without a base plan.
             self._handle_uneven_mlp_ratio()
             return
@@ -4351,6 +4433,48 @@ class ServerArgs:
                     "--rank-tp-ratio with identical entries is the even "
                     "split — omit the flag instead."
                 )
+
+        # Decoupled KV-token ownership (--rank-kv-ratio, task #88): requires
+        # the weighted-DCP token-axis sharding, i.e. a non-uniform base plan.
+        if self.uneven_kv_flag_active():
+            if self.rank_tp_ratio is None:
+                if isinstance(self.rank_kv_ratio, list):
+                    raise ValueError(
+                        "--rank-kv-ratio with an explicit vector requires a "
+                        "non-uniform --rank-tp-ratio plan (the token-axis KV "
+                        "sharding only exists under uneven TP), but the "
+                        "resolved plan is the even split."
+                    )
+                # 'capacity' degenerates gracefully: uniform budgets ->
+                # even split -> nothing to rebalance.
+                logger.warning(
+                    "--rank-kv-ratio capacity: the resolved --rank-tp-ratio "
+                    "plan is the even split (uniform budgets), so there is "
+                    "no token-axis KV sharding to rebalance — falling back "
+                    "to 'coupled' (no-op)."
+                )
+                self.rank_kv_ratio = "coupled"
+            elif isinstance(self.rank_kv_ratio, list):
+                if len(self.rank_kv_ratio) != self.tp_size:
+                    raise ValueError(
+                        f"--rank-kv-ratio length ({len(self.rank_kv_ratio)}) "
+                        f"must equal --tp-size ({self.tp_size})."
+                    )
+                if any(
+                    not isinstance(r, int) or r <= 0
+                    for r in self.rank_kv_ratio
+                ):
+                    raise ValueError(
+                        "--rank-kv-ratio entries must be positive integers, "
+                        f"got {self.rank_kv_ratio}."
+                    )
+                # gcd-reduce so the virtual owner block sum(ratios) (and the
+                # allocator granularity derived from it) stays as fine as
+                # possible. An ALL-EQUAL vector is legal and meaningful:
+                # uniform token ownership (the even-modulo owner rule) under
+                # uneven weights.
+                g = math.gcd(*self.rank_kv_ratio)
+                self.rank_kv_ratio = [v // g for v in self.rank_kv_ratio]
 
         # Per-rank MiB list checks.
         if isinstance(self.rank_gpu_memory_mib, list):
@@ -4479,18 +4603,34 @@ class ServerArgs:
         # Uneven DCP (M1): a non-uniform --rank-tp-ratio switches the
         # full-attention KV cache from head-sharding to TOKEN-sharding, so
         # the decode-context-parallel group must span the whole TP group
-        # (dcp_size == tp_size, every rank a DCP rank).
+        # (dcp_size == tp_size, every rank a DCP rank). A non-'coupled'
+        # --rank-kv-ratio implies this path without the SGLANG_UNEVEN_DCP
+        # env (task #88).
         if (
             uneven_plan
             and self.dcp_size == 1
-            and os.environ.get("SGLANG_UNEVEN_DCP", "0") == "1"
+            and (
+                os.environ.get("SGLANG_UNEVEN_DCP", "0") == "1"
+                or self.uneven_kv_flag_active()
+            )
         ):
             self.dcp_size = self.tp_size
             logger.info(
                 "Uneven DCP: auto-set dcp_size=%d (= tp_size) for token-axis "
-                "KV sharding under the non-uniform --rank-tp-ratio %s.",
+                "KV sharding under the non-uniform --rank-tp-ratio %s%s.",
                 self.dcp_size,
                 self.rank_tp_ratio,
+                (
+                    " (requested by --rank-kv-ratio "
+                    + (
+                        ",".join(map(str, self.rank_kv_ratio))
+                        if isinstance(self.rank_kv_ratio, list)
+                        else str(self.rank_kv_ratio)
+                    )
+                    + ")"
+                    if self.uneven_kv_flag_active()
+                    else ""
+                ),
             )
 
         self._handle_uneven_mlp_ratio()

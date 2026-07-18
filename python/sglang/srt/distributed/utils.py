@@ -289,6 +289,12 @@ def resolve_cp_token_ratios(server_args, checkpoint_size_mib: Optional[int] = No
     possible. When no per-rank byte budgets are available, falls back to the
     gcd-reduced --rank-tp-ratio weights (a simple weights-based split).
 
+    Precedence: SGLANG_UNEVEN_TOKEN_VECTOR (env) > --rank-kv-ratio a,b,c
+    (explicit pin) > budget estimate > weights fallback. --rank-kv-ratio
+    capacity keeps the estimate here (phase 1) and installs the MEASURED
+    optimal vector after the post-weight-load profiling instead (phase 2,
+    see ModelRunnerKVCacheMixin._maybe_suggest_dcp_token_vector).
+
     Deterministic pure function of the args so every rank computes the same
     vector (the pool pinning and owner rule must agree across ranks)."""
     weights = getattr(server_args, "rank_tp_ratio", None)
@@ -317,6 +323,18 @@ def resolve_cp_token_ratios(server_args, checkpoint_size_mib: Optional[int] = No
             return None
         g = math.gcd(*parsed)
         return [v // g for v in parsed]
+
+    # Explicit pin via --rank-kv-ratio a,b,c (task #88): the decoupled
+    # KV-token ownership vector, below the env override (family-flag
+    # convention) and above the derivations. Validated + gcd-reduced in
+    # ServerArgs._handle_uneven_tp; an all-equal pin means uniform token
+    # ownership = the even-modulo owner rule (return None).
+    kv_flag = getattr(server_args, "rank_kv_ratio", None)
+    if isinstance(kv_flag, list) and len(kv_flag) == dcp_size:
+        if len(set(kv_flag)) == 1:
+            return None
+        g = math.gcd(*kv_flag)
+        return [v // g for v in kv_flag]
 
     if checkpoint_size_mib is None:
         checkpoint_size_mib = _checkpoint_size_mib(
