@@ -84,6 +84,7 @@ def _plan_aware_num_q_heads(model_config) -> int:
     units), so take the max across the model's kv bases.
     """
     from sglang.srt.distributed.utils import (
+        attn_q_partition_groups,
         attn_q_partition_units,
         tp_partition_size,
         tp_plan_active,
@@ -100,7 +101,12 @@ def _plan_aware_num_q_heads(model_config) -> int:
         kv_bases.add(swa_kv)
     return max(
         tp_partition_size(
-            total_q, tp_size, rank, attn_q_partition_units(total_q, kv, tp_size)
+            total_q,
+            tp_size,
+            rank,
+            attn_q_partition_units(total_q, kv, tp_size),
+            # kv-boundary alignment (task #116): match the aligned qkv split.
+            groups=attn_q_partition_groups(kv, tp_size),
         )
         for kv in kv_bases
     )

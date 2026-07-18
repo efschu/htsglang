@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.utils import (
     attn_kv_replicated,
+    attn_q_partition_groups,
     attn_q_partition_units,
     tp_partition_size,
     tp_plan_active,
@@ -326,9 +327,17 @@ class Gemma4Attention(nn.Module):
             self._attn_q_units = attn_q_partition_units(
                 self.total_num_heads, self.total_num_kv_heads, tp_size
             )
+            # kv-boundary alignment (task #116): single source for qkv+o_proj.
+            self._attn_q_groups = attn_q_partition_groups(
+                self.total_num_kv_heads, tp_size
+            )
             tp_rank = get_parallel().tp_rank
             self.num_heads = tp_partition_size(
-                self.total_num_heads, tp_size, tp_rank, self._attn_q_units
+                self.total_num_heads,
+                tp_size,
+                tp_rank,
+                self._attn_q_units,
+                groups=self._attn_q_groups,
             )
             if self._kv_replicated:
                 self.num_kv_heads = self.total_num_kv_heads
@@ -354,7 +363,11 @@ class Gemma4Attention(nn.Module):
                     tp_size,
                     [
                         tp_partition_size(
-                            self.total_num_heads, tp_size, r, self._attn_q_units
+                            self.total_num_heads,
+                            tp_size,
+                            r,
+                            self._attn_q_units,
+                            groups=self._attn_q_groups,
                         )
                         for r in range(tp_size)
                     ],
@@ -370,6 +383,7 @@ class Gemma4Attention(nn.Module):
         else:
             self._kv_replicated = False
             self._attn_q_units = self.total_num_kv_heads
+            self._attn_q_groups = None
             assert self.total_num_heads % tp_size == 0
             self.num_heads = self.total_num_heads // tp_size
 
@@ -394,6 +408,8 @@ class Gemma4Attention(nn.Module):
             bias=config.attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
+            # kv-boundary alignment (task #116): same source as o_proj below.
+            q_shard_groups=self._attn_q_groups,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -406,6 +422,8 @@ class Gemma4Attention(nn.Module):
             # q-head units in REPLICATED-KV mode). Ignored on the default
             # path (no shard plan installed).
             tp_units=self._attn_q_units,
+            # kv-boundary alignment (task #116): SAME value as qkv q_shard_groups.
+            tp_q_groups=self._attn_q_groups,
         )
 
         self.q_norm = Gemma4RMSNorm(

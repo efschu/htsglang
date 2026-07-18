@@ -161,6 +161,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 shard_size,
                 getattr(self, "tp_units", None),
                 family=getattr(self, "tp_family", None),
+                groups=getattr(self, "tp_q_groups", None),
             )
 
             from sglang.srt.model_loader.weight_utils import (
@@ -213,6 +214,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             shard_size,
             getattr(self, "tp_units", None),
             family=getattr(self, "tp_family", None),
+            groups=getattr(self, "tp_q_groups", None),
         )
 
         from sglang.srt.model_loader.weight_utils import (
@@ -282,6 +284,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             shard_size,
             getattr(self, "tp_units", None),
             family=getattr(self, "tp_family", None),
+            groups=getattr(self, "tp_q_groups", None),
         )
 
         if _is_cpu:
@@ -343,6 +346,7 @@ class RowvLLMParameter(BasevLLMParameter):
                 shard_size,
                 getattr(self, "tp_units", None),
                 family=getattr(self, "tp_family", None),
+                groups=getattr(self, "tp_q_groups", None),
             )
 
             from sglang.srt.model_loader.weight_utils import (

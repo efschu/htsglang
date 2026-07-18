@@ -24,6 +24,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.utils import (
     attn_kv_replicated,
+    attn_q_partition_groups,
     attn_q_partition_units,
     tp_loaded_shard_start,
     tp_partition_size,
@@ -385,6 +386,7 @@ class ColumnParallelLinear(LinearBase):
         skip_block_quant_check: bool = False,
         tp_units: Optional[int] = None,
         tp_family: Optional[str] = None,
+        tp_q_groups: Optional[int] = None,
     ):
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
@@ -412,6 +414,12 @@ class ColumnParallelLinear(LinearBase):
         # changes behavior on its own.
         if not hasattr(self, "tp_family"):
             self.tp_family = tp_family
+        # kv-boundary alignment for the Q dimension (task #116): kv_total
+        # under REPLICATED-KV, else None. None on every non-q layer and the
+        # default path -> the split stays byte-identical. Only QKVParallelLinear
+        # sets a non-None value (in __init__, before this super() runs).
+        if not hasattr(self, "tp_q_groups"):
+            self.tp_q_groups = tp_q_groups
         assert self.quant_method is not None
         # tp_units is defined against the PER-PART output size (merged
         # layers partition each part independently), so quant-block
@@ -454,7 +462,12 @@ class ColumnParallelLinear(LinearBase):
                     output_size
                     if replicated
                     else tp_partition_size(
-                        output_size, tp_size, tp_rank, self.tp_units, self.tp_family
+                        output_size,
+                        tp_size,
+                        tp_rank,
+                        self.tp_units,
+                        self.tp_family,
+                        self.tp_q_groups,
                     )
                 )
                 for output_size, replicated in zip(
@@ -501,7 +514,12 @@ class ColumnParallelLinear(LinearBase):
             # the parameters). Not set on the default path.
             for p in self.parameters():
                 set_weight_attrs(
-                    p, {"tp_units": self.tp_units, "tp_family": self.tp_family}
+                    p,
+                    {
+                        "tp_units": self.tp_units,
+                        "tp_family": self.tp_family,
+                        "tp_q_groups": self.tp_q_groups,
+                    },
                 )
         if bias:
             self.bias = Parameter(
@@ -1232,6 +1250,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         v_head_size: Optional[int] = None,
         skip_block_quant_check: bool = False,
         q_shard_unit_count: Optional[int] = None,
+        q_shard_groups: Optional[int] = None,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -1272,8 +1291,33 @@ class QKVParallelLinear(ColumnParallelLinear):
                         self.total_num_heads, self.total_num_kv_heads, tp_size
                     )
                 )
+                # kv-boundary alignment (task #116): constrain the q split so
+                # no rank straddles a global kv-head group (the #105 ragged
+                # kernel cannot represent that). Derived from THE single source
+                # attn_q_partition_groups; cross-check the caller-supplied
+                # q_shard_groups (the o_proj gets the SAME value) so a future
+                # model wiring the two differently fails loudly at construction
+                # rather than silently mis-sharding o_proj.
+                self.tp_q_groups = attn_q_partition_groups(
+                    self.total_num_kv_heads, tp_size
+                )
+                if (
+                    q_shard_groups is not None
+                    and q_shard_groups != self.tp_q_groups
+                ):
+                    raise ValueError(
+                        f"QKV q_shard_groups {q_shard_groups} disagrees with "
+                        f"the kv-derived value {self.tp_q_groups} "
+                        f"(kv={self.total_num_kv_heads}, tp={tp_size}); the "
+                        "qkv q block and o_proj input must align to the same "
+                        "kv-group boundaries."
+                    )
                 self.num_heads = tp_partition_size(
-                    self.total_num_heads, tp_size, tp_rank, self.tp_units
+                    self.total_num_heads,
+                    tp_size,
+                    tp_rank,
+                    self.tp_units,
+                    groups=self.tp_q_groups,
                 )
                 self.num_kv_heads = self.total_num_kv_heads
                 # Marks the "every rank loads the full k/v checkpoint
@@ -1522,9 +1566,16 @@ class QKVParallelLinear(ColumnParallelLinear):
             else:
                 # Uneven TP: this rank's row (output) partition; reproduces
                 # even //tp_size with no plan. Rows are whole -> no
-                # quant-block concern.
+                # quant-block concern. groups (task #116): the q rows align to
+                # kv-head-group boundaries under REPLICATED-KV, matching the
+                # aligned num_heads used everywhere else (None -> unchanged).
                 shard_size = tp_partition_size(
-                    total, self.tp_size, self.tp_rank, self.tp_units, self.tp_family
+                    total,
+                    self.tp_size,
+                    self.tp_rank,
+                    self.tp_units,
+                    self.tp_family,
+                    self.tp_q_groups,
                 )
                 start_idx = tp_loaded_shard_start(
                     total,
@@ -1533,6 +1584,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                     shard_size,
                     self.tp_units,
                     self.tp_family,
+                    self.tp_q_groups,
                 )
 
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
@@ -1684,12 +1736,16 @@ class QKVParallelLinear(ColumnParallelLinear):
             # ranks onto the same checkpoint shard). Uneven TP: prefix-sum
             # offset by the shard plan (kv-head units; replication is
             # rejected in __init__, so shard_id == tp_rank here).
+            # groups (task #116): the q block aligns to kv-head-group
+            # boundaries under REPLICATED-KV; k/v are full-width so
+            # tp_loaded_shard_start early-returns 0 (groups unused there).
             start_idx = tp_loaded_shard_start(
                 loaded_weight.shape[output_dim],
                 self.tp_size,
                 shard_id,
                 shard_size,
                 self.tp_units,
+                groups=self.tp_q_groups,
             )
 
             if _is_cpu:
@@ -1783,6 +1839,7 @@ class RowParallelLinear(LinearBase):
         use_dp_attention_reduce: bool = False,
         tp_units: Optional[int] = None,
         tp_family: Optional[str] = None,
+        tp_q_groups: Optional[int] = None,
     ):
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
@@ -1816,8 +1873,17 @@ class RowParallelLinear(LinearBase):
             input_size, tp_units, _layer_quant_config, 1
         )
         self.tp_family = tp_family
+        # kv-boundary alignment for the o_proj INPUT dim (task #116): must be
+        # the SAME value the paired qkv q block used, so the per-rank q-head
+        # counts agree. None on every non-attention row-parallel layer.
+        self.tp_q_groups = tp_q_groups
         self.input_size_per_partition = tp_partition_size(
-            input_size, self.tp_size, self.tp_rank, self.tp_units, self.tp_family
+            input_size,
+            self.tp_size,
+            self.tp_rank,
+            self.tp_units,
+            self.tp_family,
+            self.tp_q_groups,
         )
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
@@ -1842,7 +1908,12 @@ class RowParallelLinear(LinearBase):
             # the default path.
             for p in self.parameters():
                 set_weight_attrs(
-                    p, {"tp_units": self.tp_units, "tp_family": self.tp_family}
+                    p,
+                    {
+                        "tp_units": self.tp_units,
+                        "tp_family": self.tp_family,
+                        "tp_q_groups": self.tp_q_groups,
+                    },
                 )
 
         if bias:
@@ -1889,6 +1960,7 @@ class RowParallelLinear(LinearBase):
                     self.tp_rank,
                     self.tp_units,
                     self.tp_family,
+                    self.tp_q_groups,
                 )
                 elem_start = tp_loaded_shard_start(
                     in_features,
@@ -1897,6 +1969,7 @@ class RowParallelLinear(LinearBase):
                     my_elems,
                     self.tp_units,
                     self.tp_family,
+                    self.tp_q_groups,
                 )
                 # my_elems / elem_start are whole-block multiples -> exact bytes
                 byte_start = elem_start // block_size * type_size
@@ -1931,6 +2004,7 @@ class RowParallelLinear(LinearBase):
                 shard_size,
                 self.tp_units,
                 self.tp_family,
+                self.tp_q_groups,
             )
 
             if _is_cpu:

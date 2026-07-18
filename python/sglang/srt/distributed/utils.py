@@ -349,14 +349,9 @@ _CP_TOKEN_UNITS = 64
 _CP_TOKEN_OVERHEAD_MIB = 1536
 
 
-def partition_units(units: int, weights: Sequence[int]) -> list:
-    """Split `units` indivisible units over ranks proportionally to
-    `weights` (largest-remainder rounding, every rank gets >= 1 unit).
-
-    Deterministic pure function of (units, weights) so every process
-    computes the identical partition. Ties in the fractional parts are
-    broken toward the lower rank index.
-    """
+def _partition_units_raw(units: int, weights: Sequence[int]) -> list:
+    """Largest-remainder split of `units` over ranks proportional to
+    `weights` (the classic behavior; every rank gets >= 1 unit)."""
     n = len(weights)
     if units < n:
         raise ValueError(
@@ -383,8 +378,114 @@ def partition_units(units: int, weights: Sequence[int]) -> list:
     return sizes
 
 
+def _balanced_group_lengths(weights: Sequence[int], groups: int, max_len: int) -> list:
+    """Partition the `len(weights)` ranks (in order) into `groups`
+    contiguous non-empty segments, each of length in [1, max_len],
+    minimizing imbalance of per-segment weight sums (each kv-group has
+    the SAME q capacity, so balancing weight sums keeps every rank's
+    q-share ~ its weight). Deterministic: ties break toward the flatter
+    then the lexicographically smaller length vector."""
+    n = len(weights)
+    prefix = [0]
+    for w in weights:
+        prefix.append(prefix[-1] + w)
+    best = [None]  # (key, lengths)
+
+    def rec(start: int, g_left: int, lengths: list) -> None:
+        remaining = n - start
+        if g_left == 0:
+            if remaining == 0:
+                sums, idx = [], 0
+                for L in lengths:
+                    sums.append(prefix[idx + L] - prefix[idx])
+                    idx += L
+                key = (max(sums), tuple(sorted(sums, reverse=True)), tuple(lengths))
+                if best[0] is None or key < best[0][0]:
+                    best[0] = (key, list(lengths))
+            return
+        # Leave >= 1 rank per remaining group and <= max_len each.
+        hi = min(max_len, remaining - (g_left - 1))
+        for L in range(1, hi + 1):
+            if remaining - L > (g_left - 1) * max_len:
+                continue
+            rec(start + L, g_left - 1, lengths + [L])
+
+    rec(0, groups, [])
+    if best[0] is None:
+        raise ValueError(
+            f"kv-aligned split infeasible: {n} ranks into {groups} groups of "
+            f"<= {max_len} units each."
+        )
+    return best[0][1]
+
+
+def _partition_units_kv_aligned(units: int, weights: Sequence[int], groups: int) -> list:
+    """kv-boundary-aware q-head split (task #116).
+
+    Under REPLICATED-KV geometry (TP > num_kv_heads) the q heads split in
+    `units` indivisible packets, and the global kv-head groups fall at unit
+    positions that are multiples of `units // groups`. The memory-proportional
+    auto planner (--rank-tp-ratio auto) can otherwise produce a raw split whose
+    per-rank q packets STRADDLE such a boundary, which the #105 current-chunk
+    ragged kernel cannot represent (it fails fast in
+    _replicated_kv_ragged_reindex). This constrains the split so every rank's
+    q packets map cleanly into a single kv-head group.
+
+    Returns the raw largest-remainder split UNCHANGED whenever it is already
+    boundary-aligned (so even splits, kv >= tp, and explicit kv-aligned ratios
+    stay byte-identical); otherwise repairs it by assigning contiguous rank
+    segments to whole kv-groups. When `groups` cannot tile `units` into equal
+    whole-unit blocks (kv**2 does not divide q), alignment is impossible and
+    the raw split is returned (the #105 guard then correctly rejects it)."""
+    sizes = _partition_units_raw(units, weights)
+    n = len(weights)
+    # Alignment only meaningful when the units tile into `groups` equal
+    # whole-unit blocks AND ranks outnumber groups (each rank fits in one
+    # group). Otherwise fall back to the raw split.
+    if groups < 2 or groups >= n or units % groups != 0:
+        return sizes
+    per = units // groups  # units per kv-group (== global GQA group / kv_total)
+    boundaries = [per * k for k in range(1, groups)]
+    seen, c = set(), 0
+    for s in sizes[:-1]:
+        c += s
+        seen.add(c)
+    if all(b in seen for b in boundaries):
+        return sizes  # already aligned -> byte-identical to the raw split
+    lengths = _balanced_group_lengths(weights, groups, per)
+    out, idx = [], 0
+    for L in lengths:
+        out.extend(_partition_units_raw(per, weights[idx : idx + L]))
+        idx += L
+    assert sum(out) == units and all(s >= 1 for s in out)
+    return out
+
+
+def partition_units(
+    units: int, weights: Sequence[int], groups: Optional[int] = None
+) -> list:
+    """Split `units` indivisible units over ranks proportionally to
+    `weights` (largest-remainder rounding, every rank gets >= 1 unit).
+
+    Deterministic pure function of (units, weights, groups) so every
+    process computes the identical partition. Ties in the fractional parts
+    are broken toward the lower rank index.
+
+    `groups` (task #116): when set (= num_kv_heads for the Q dimension under
+    the REPLICATED-KV geometry), the split is constrained so no rank's q
+    packets straddle a kv-head-group boundary. It is a NO-OP whenever the raw
+    split is already aligned, so all non-q dimensions (which pass groups=None)
+    and already-aligned q splits stay byte-identical."""
+    if groups:
+        return _partition_units_kv_aligned(units, weights, groups)
+    return _partition_units_raw(units, weights)
+
+
 def partition_sizes(
-    total: int, weights: Sequence[int], units: Optional[int] = None
+    total: int,
+    weights: Sequence[int],
+    units: Optional[int] = None,
+    groups: Optional[int] = None,
 ) -> list:
     """Per-rank sizes of a sharded dimension of `total` elements under the
     weight vector `weights`.
@@ -406,7 +507,12 @@ def partition_sizes(
                 f"unit count {units}."
             )
         scale = total // units
-        return [s * scale for s in partition_units(units, weights)]
+        return [s * scale for s in partition_units(units, weights, groups)]
+    if groups:
+        raise ValueError(
+            "partition_sizes: groups (kv-boundary alignment) requires a "
+            "unit count (the q-head packet count); got units=None."
+        )
     denom = sum(weights)
     if total % denom != 0:
         raise ValueError(
@@ -433,18 +539,21 @@ def tp_partition_sizes(
     tp_size: int,
     units: Optional[int] = None,
     family: Optional[str] = None,
+    groups: Optional[int] = None,
 ) -> list:
     """Per-rank sizes of a sharded dimension under the process-global
     shard plan. Without an installed ratio vector (or when this layer runs
     with its own tp_size, e.g. disable_tp layers use tp_size=1), this is
     the classic even split via divide(). `family` selects a named family
     plan (e.g. "mlp") and falls back to the base vector when that family
-    has no own vector installed."""
+    has no own vector installed. `groups` (task #116, Q dimension only)
+    constrains the split to kv-head-group boundaries; None keeps the plain
+    proportional split (byte-identical)."""
     ratios = get_tp_partition_ratios(family)
     if not ratios or len(ratios) != tp_size:
         ensure_divisibility(total, tp_size)
         return [total // tp_size] * tp_size
-    return partition_sizes(total, ratios, units)
+    return partition_sizes(total, ratios, units, groups)
 
 
 def tp_partition_size(
@@ -453,9 +562,10 @@ def tp_partition_size(
     rank: int,
     units: Optional[int] = None,
     family: Optional[str] = None,
+    groups: Optional[int] = None,
 ) -> int:
     """This rank's size of a sharded dimension under the global plan."""
-    return tp_partition_sizes(total, tp_size, units, family)[rank]
+    return tp_partition_sizes(total, tp_size, units, family, groups)[rank]
 
 
 def tp_partition_offset(
@@ -464,9 +574,10 @@ def tp_partition_offset(
     rank: int,
     units: Optional[int] = None,
     family: Optional[str] = None,
+    groups: Optional[int] = None,
 ) -> int:
     """This rank's start offset (prefix sum) in a sharded dimension."""
-    return sum(tp_partition_sizes(total, tp_size, units, family)[:rank])
+    return sum(tp_partition_sizes(total, tp_size, units, family, groups)[:rank])
 
 
 def tp_vocab_ratios(tp_size: int) -> Optional[list]:
@@ -617,6 +728,27 @@ def attn_q_partition_units(
     return units
 
 
+def attn_q_partition_groups(
+    total_num_kv_heads: int, tp_size: int
+) -> Optional[int]:
+    """kv-group count to pass as `groups` when partitioning the Q dimension
+    (task #116). Returns `total_num_kv_heads` under the REPLICATED-KV
+    geometry (kv < tp), so the q-head split is constrained to never straddle
+    a global kv-head-group boundary (the #105 ragged kernel cannot represent
+    a straddling split). Returns None otherwise — the default/even path and
+    the normal kv >= tp uneven split, where whole-kv-head units already keep
+    every rank inside whole GQA groups, so no alignment constraint applies
+    and the split stays byte-identical.
+
+    This is THE single source of the Q-dimension `groups` value; the QKV q
+    block, the o_proj input, and the attention backends must all derive their
+    `groups` from it so their shards agree (a mismatch would mis-shard
+    o_proj). It is cross-checked at layer construction (q_shard_groups)."""
+    if not attn_kv_replicated(tp_size, total_num_kv_heads):
+        return None
+    return total_num_kv_heads
+
+
 def tp_loaded_shard_start(
     loaded_full: int,
     tp_size: Optional[int],
@@ -624,6 +756,7 @@ def tp_loaded_shard_start(
     shard_size: int,
     units: Optional[int] = None,
     family: Optional[str] = None,
+    groups: Optional[int] = None,
 ) -> int:
     """Start offset when narrowing a full checkpoint dimension of
     `loaded_full` elements down to this rank's shard of `shard_size`.
@@ -649,13 +782,13 @@ def tp_loaded_shard_start(
         # Fully replicated component: every rank loads the whole
         # checkpoint dimension.
         return 0
-    sizes = partition_sizes(loaded_full, ratios, units)
+    sizes = partition_sizes(loaded_full, ratios, units, groups)
     if sizes[rank] != shard_size:
         raise ValueError(
             f"uneven-TP shard mismatch: expected size {sizes[rank]} for "
             f"rank {rank} of dimension {loaded_full} under weight vector "
-            f"{list(ratios)} (units={units}), but the parameter shard "
-            f"has {shard_size}."
+            f"{list(ratios)} (units={units}, groups={groups}), but the "
+            f"parameter shard has {shard_size}."
         )
     return sum(sizes[:rank])
 

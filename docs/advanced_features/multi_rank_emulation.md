@@ -126,6 +126,36 @@ coherent, retrieves a needle from a ~15k-token context, and is bit-identical
 across two boots. Decode throughput is intentionally **not** representative of
 a real 5-card deployment (three ranks time-slice one card via MPS).
 
+### MoE (Qwen3.6-35B-A3B) at TP=5 — kv-boundary-aware auto split (#116)
+
+The MoE A3B GGUF co-locates the same way (swap the dense model + tokenizer
+for the A3B `-MTP-GGUF` paths, keep `--rank-tp-ratio auto`):
+
+```bash
+  --tp 5 --rank-gpu-id 0,0,0,1,2 --rank-tp-ratio auto \
+  --rank-auto-reserve-mib 11500,11500,11500,3500,3500 \
+```
+
+A3B has `num_key_value_heads = 2` for `tp = 5`, so its full-attention layers
+run the **REPLICATED-KV** geometry (every rank holds all kv heads; the q heads
+split by the plan). Under `--rank-tp-ratio auto` the memory-proportional weight
+vector could previously derive a q-head split whose per-rank packets **straddle
+a global kv-head-group boundary** (e.g. q-heads `[2,2,2,6,4]`, rank 3 crossing
+the boundary at head 8) — which the current-chunk ragged attention kernel
+cannot represent, so it failed fast (#105 guard). The only workaround was an
+explicit kv-aligned `--rank-tp-ratio`, which is **mutually exclusive** with
+`--rank-auto-reserve-mib` (auto derives the budgets itself), so MoE TP=5
+co-location was effectively blocked.
+
+The auto planner is now **kv-boundary-aware** (#116): when `num_kv_heads < tp`,
+the Q-dimension split is constrained to whole kv-head groups (repairing the
+example to `[4,2,2,4,4]`), so `--rank-tp-ratio auto` composes with
+`--rank-auto-reserve-mib` and boots directly. The split stays byte-identical
+whenever the raw proportional split was already aligned (even TP, `kv >= tp`,
+and explicit kv-aligned ratios are unchanged), and the #105 guard no longer
+fires on any auto config — a general robustness win for **every** `kv < tp`
+auto split, not just MoE TP=5.
+
 ## Scope
 
 Single-node **pure Tensor Parallelism** only. Co-location is rejected in

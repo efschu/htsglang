@@ -261,11 +261,15 @@ def _local_attn_head_counts(model_runner: "ModelRunner") -> tuple:
     the even ``total // tp_size`` and get_num_kv_heads(rank=...) to the even
     share, i.e. byte-identical to the previous behavior.
     """
-    from sglang.srt.distributed.utils import attn_q_partition_units
+    from sglang.srt.distributed.utils import (
+        attn_q_partition_groups,
+        attn_q_partition_units,
+    )
 
     mc = model_runner.model_config
     tp_size = get_parallel().attn_tp_size
     tp_rank = get_parallel().attn_tp_rank
+    _total_kv = mc.get_total_num_kv_heads()
     num_qo_heads = tp_partition_size(
         mc.num_attention_heads,
         tp_size,
@@ -274,9 +278,10 @@ def _local_attn_head_counts(model_runner: "ModelRunner") -> tuple:
         # kv_total-sized q-head packets under the REPLICATED-KV geometry
         # (TP > num_kv_heads, task #62), keeping num_qo % num_kv == 0 with
         # num_kv_heads == kv_total on every rank.
-        attn_q_partition_units(
-            mc.num_attention_heads, mc.get_total_num_kv_heads(), tp_size
-        ),
+        attn_q_partition_units(mc.num_attention_heads, _total_kv, tp_size),
+        # kv-boundary alignment (task #116) so this rank's q-head count
+        # matches the aligned qkv/o_proj split.
+        groups=attn_q_partition_groups(_total_kv, tp_size),
     )
     num_kv_heads = mc.get_num_kv_heads(tp_size, rank=tp_rank)
     return num_qo_heads, num_kv_heads
@@ -446,6 +451,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # (predicate False) -> stock flashinfer path is bit-identical.
         from sglang.srt.distributed.utils import (
             attn_kv_replicated,
+            attn_q_partition_groups,
             attn_q_partition_units,
             cp_token_prefix,
             tp_partition_sizes,
@@ -526,6 +532,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 units=attn_q_partition_units(
                     mc.num_attention_heads, total_kv, attn_tp_size
                 ),
+                # kv-boundary alignment (task #116): the per-rank q-head
+                # counts (and the #105 straddle guard) follow the aligned
+                # split, matching qkv/o_proj.
+                groups=attn_q_partition_groups(total_kv, attn_tp_size),
             )
             self.dcp_kv_head_counts = (
                 [total_kv] * attn_tp_size
