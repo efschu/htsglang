@@ -3348,27 +3348,17 @@ class ServerArgs:
                     "SGLANG_UNEVEN_DCP_WEIGHTED=1 on a non-uniform "
                     "--rank-tp-ratio -- is the only supported spec+DCP config.)"
                 )
-            # The uneven-weighted DCP verify path attends draft->draft with plain
-            # CAUSAL masking (a linear chain), which is correct ONLY for
-            # --speculative-eagle-topk 1. A branching tree (topk>1) needs the
-            # draft->draft tree sub-mask sliced out of spec_info.custom_mask and
-            # fed to the ragged wrapper; that is NOT implemented, so a topk>1 tree
-            # would produce silently-wrong draft->draft attention. Hard-error
-            # instead of returning incorrect output.
-            if (
-                uneven_weighted_dcp
-                and self.speculative_eagle_topk is not None
-                and self.speculative_eagle_topk > 1
-            ):
-                raise ValueError(
-                    "Tree/branching speculative decoding "
-                    f"(--speculative-eagle-topk={self.speculative_eagle_topk} > 1) "
-                    "is not yet supported under uneven-hybrid weighted DCP "
-                    "(SGLANG_UNEVEN_DCP=1 + SGLANG_UNEVEN_DCP_WEIGHTED=1). The "
-                    "DCP verify path attends draft->draft with a plain causal "
-                    "chain mask, which is only correct for a linear draft chain. "
-                    "Use --speculative-eagle-topk 1."
-                )
+            # TREE-SPEC under uneven-weighted DCP (feat/tree-spec-dcp): topk > 1
+            # is now supported. The DCP verify path slices the draft->draft tree
+            # sub-mask out of the EAGLE FULL_MASK and plans it into the ragged
+            # verify wrapper (graph-safe: the per-bucket wrapper's custom_mask_buf
+            # is re-written on every replay). The tree mask is a draft-local,
+            # rank-uniform property (every rank holds all draft-token
+            # activations), orthogonal to the token-sharded, non-causal committed
+            # prefix -- so it is correct under DCP without cross-rank
+            # coordination. See flashinfer_backend.py (_build_dcp_ragged_tree_mask,
+            # _get_verify_ragged_cg_wrapper, call_begin_forward EAGLE_VERIFY).
+            # topk == 1 keeps the byte-identical plain-causal chain path.
         else:
             raise ValueError(
                 "Decode context parallel (--dcp-size / "

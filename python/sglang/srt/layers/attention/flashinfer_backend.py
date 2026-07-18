@@ -536,6 +536,25 @@ class FlashInferAttnBackend(AttentionBackend):
             self.dcp_full_qo_heads = mc.num_attention_heads
             self.dcp_full_kv_heads = total_kv
 
+        # Tree/branching speculative decoding (--speculative-eagle-topk > 1)
+        # under uneven-DCP. With topk == 1 the draft is a linear CHAIN and the
+        # ragged draft->draft verify attention is plain CAUSAL (no mask). With
+        # topk > 1 the draft forms a TREE, so the draft->draft block must carry
+        # the tree-topology mask. That mask acts ONLY on the local, replicated
+        # draft tokens (every rank holds all draft-token activations), so it is
+        # a rank-uniform local computation -- it never touches the token-sharded
+        # committed prefix (paged, non-causal, LSE-merged across ranks). See
+        # call_begin_forward (EAGLE_VERIFY) + _get_verify_ragged_cg_wrapper.
+        _sa = model_runner.server_args
+        self.dcp_tree_mask = bool(
+            self.uneven_dcp
+            and getattr(_sa, "speculative_eagle_topk", None) is not None
+            and _sa.speculative_eagle_topk > 1
+        )
+        self.dcp_draft_token_num = int(
+            getattr(_sa, "speculative_num_draft_tokens", 0) or 0
+        )
+
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -1009,8 +1028,21 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # Eager path: never use a graph-bucket ragged wrapper.
-        self._ragged_wrapper_override = None
+        # Eager path: never use a graph-bucket ragged wrapper. Tree-spec verify
+        # (topk > 1) still needs an override: it plans a draft->draft custom
+        # mask, and flashinfer's non-graph plan() does NOT reset _custom_mask_buf
+        # when a later plan passes no mask -> a subsequent maskless prefill on
+        # the SHARED ragged wrapper would silently run stale CUSTOM mode (an
+        # M16-class bug). Route eager tree verify through a dedicated wrapper so
+        # the shared prefill_wrapper_ragged is only ever planned maskless.
+        if (
+            self.uneven_dcp
+            and self.dcp_tree_mask
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            self._ragged_wrapper_override = self._get_eager_tree_verify_ragged_wrapper()
+        else:
+            self._ragged_wrapper_override = None
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             assert self._swa_kv_pool is not None
@@ -1307,6 +1339,26 @@ class FlashInferAttnBackend(AttentionBackend):
         _get_verify_ragged_cg_wrapper)."""
         return self._ragged_wrapper_override or self.prefill_wrapper_ragged
 
+    def _get_eager_tree_verify_ragged_wrapper(
+        self,
+    ) -> BatchPrefillWithRaggedKVCacheWrapper:
+        """Dedicated NON-graph ragged wrapper for eager uneven-DCP tree verify
+        (--speculative-eagle-topk > 1). Isolated from the shared
+        prefill_wrapper_ragged so the draft->draft custom mask this path plans
+        never leaks (as a stale _custom_mask_buf) onto a later maskless prefill.
+        Non-graph plan() sets/updates its mask buffers dynamically per call, and
+        this wrapper is only ever planned for verify (always masked), so no
+        stale-mask hazard exists on it."""
+        w = getattr(self, "_eager_tree_verify_ragged_wrapper", None)
+        if w is None:
+            w = BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=self._fmha_backend,
+            )
+            self._eager_tree_verify_ragged_wrapper = w
+        return w
+
     def _get_verify_ragged_cg_wrapper(
         self, bs: int
     ) -> BatchPrefillWithRaggedKVCacheWrapper:
@@ -1333,12 +1385,38 @@ class FlashInferAttnBackend(AttentionBackend):
         Buffers are tiny (bs+1 int32); each wrapper owns its 8 MiB int
         workspace, kept alive in verify_ragged_cg_wrappers for the process
         lifetime -- sized by what capture+replay actually needs, no heuristics.
+
+        TREE-SPEC (--speculative-eagle-topk > 1, self.dcp_tree_mask): the
+        wrapper ALSO gets FIXED custom_mask_buf + mask_indptr_buf. flashinfer
+        run() selects mask mode by BUFFER PRESENCE (`if self._custom_mask_buf
+        is not None: mask_mode = CUSTOM`), so a wrapper created WITH a mask
+        buffer runs CUSTOM every replay -- which is exactly what we want for
+        the tree topology, and is safe here ONLY because call_begin_forward
+        re-plans the draft->draft mask into the buffer on EVERY replay (the
+        M16 lesson: never leave a mask buffer unwritten). topk == 1 wrappers
+        are created WITHOUT the mask buffers -> mask mode falls back to the
+        `causal` flag forward_return_lse sets == CAUSAL, byte-identical to the
+        pre-tree-spec chain path.
         """
         wrapper = self.verify_ragged_cg_wrappers.get(bs)
         if wrapper is None:
             device = self.kv_last_page_len.device
             qo_indptr_buf = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             kv_indptr_buf = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+            mask_bufs = {}
+            if self.dcp_tree_mask:
+                d = self.dcp_draft_token_num
+                # Unpacked-sized uint8 buffer (bs * d * d bytes) is a safe upper
+                # bound on flashinfer's packed mask (ceil(bs*d*d / 8) bytes);
+                # plan() packs the fresh draft->draft mask into it each replay.
+                mask_bufs = {
+                    "custom_mask_buf": torch.zeros(
+                        (bs * d * d,), dtype=torch.uint8, device=device
+                    ),
+                    "mask_indptr_buf": torch.zeros(
+                        (bs + 1,), dtype=torch.int32, device=device
+                    ),
+                }
             wrapper = BatchPrefillWithRaggedKVCacheWrapper(
                 self.workspace_buffer,
                 "NHD",
@@ -1346,6 +1424,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 qo_indptr_buf=qo_indptr_buf,
                 kv_indptr_buf=kv_indptr_buf,
                 backend=self._fmha_backend,
+                **mask_bufs,
             )
             self.verify_ragged_cg_wrappers[bs] = wrapper
         return wrapper
@@ -1770,6 +1849,70 @@ class FlashInferAttnBackend(AttentionBackend):
             return layer.is_cross_attention
 
         raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")
+
+
+def _build_dcp_ragged_tree_mask(
+    full_mask: torch.Tensor,
+    seq_lens: torch.Tensor,
+    paged_kernel_lens_sum: int,
+    draft_num: int,
+    bs: int,
+) -> torch.Tensor:
+    """Slice the draft->draft tree sub-mask out of the EAGLE FULL_MASK for the
+    uneven-DCP ragged verify wrapper (--speculative-eagle-topk > 1).
+
+    ``full_mask`` is the flattened EAGLE verify mask (TreeMaskMode.FULL_MASK):
+    for request i it is ``draft_num`` query rows, each with
+    ``seq_lens[i] + draft_num`` columns (the first ``seq_lens[i]`` are the
+    committed prefix -- all visible -- and the last ``draft_num`` are the tree
+    topology over the draft tokens). The DCP verify splits attention into a
+    paged NON-causal prefix read (token-sharded, LSE-merged) and a ragged
+    draft->draft read (local heads); the tree mask affects ONLY the latter, so
+    we extract just the trailing draft_num x draft_num block per request and
+    hand it to the ragged wrapper. The prefix is never masked (correctness:
+    the mask is a draft-local, rank-uniform property; token-sharding of the
+    prefix is orthogonal to it).
+
+    Returns a flat bool mask of length ``bs * draft_num * draft_num``, laid out
+    per request row-major -- exactly flashinfer's ragged custom_mask layout for
+    qo_indptr == kv_indptr == [0, d, 2d, ...].
+    """
+    device = full_mask.device
+    d = draft_num
+    seq64 = seq_lens.to(torch.int64)
+    # Under CUDA-graph replay the batch is padded; the worker built full_mask
+    # for the real requests only. Pad the tail with True (padded requests are
+    # discarded) so every gather index below is in-bounds -- the exact pattern
+    # EagleVerifyInput.generate_attn_arg_prefill uses for the non-DCP path.
+    expected = paged_kernel_lens_sum * d + d * d * bs
+    if full_mask.numel() < expected:
+        # dtype follows full_mask: the worker's tree mask is bool, the
+        # capture-time dummy (buffers.custom_mask) is uint8; both are
+        # nonzero==visible for flashinfer's packbits.
+        full_mask = torch.cat(
+            [
+                full_mask,
+                torch.ones(
+                    expected - full_mask.numel(),
+                    dtype=full_mask.dtype,
+                    device=device,
+                ),
+            ]
+        )
+    klen = seq64 + d  # per-request kv_len (prefix + draft)
+    base = torch.zeros(bs, dtype=torch.int64, device=device)
+    if bs > 1:
+        base[1:] = torch.cumsum(d * klen, dim=0)[:-1]
+    r = torch.arange(d, device=device)
+    c = torch.arange(d, device=device)
+    # idx[i, r, c] = base_i + r * klen_i + seq_i + c   (trailing draft columns)
+    idx = (
+        base.view(bs, 1, 1)
+        + r.view(1, d, 1) * klen.view(bs, 1, 1)
+        + seq64.view(bs, 1, 1)
+        + c.view(1, 1, d)
+    ).reshape(-1)
+    return full_mask[idx]
 
 
 def _build_dcp_weighted_kv_indices(
@@ -2495,6 +2638,10 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
+        # Draft->draft tree mask for the uneven-DCP ragged verify wrapper
+        # (--speculative-eagle-topk > 1); stays None on every other path so the
+        # ragged plan keeps its default (causal chain / non-causal extend).
+        ragged_custom_mask = None
         if spec_info is None and self.attn_backend.uneven_dcp:
             # Uneven-DCP extend: the paged (prefix) wrapper reads only this
             # rank's OWNED prefix token slots (even-modulo owner rule), with the
@@ -2560,12 +2707,17 @@ class FlashInferIndicesUpdaterPrefill:
             # attending EACH OTHER (ragged, LOCAL heads). With
             # --speculative-eagle-topk 1 the draft is a linear CHAIN, so the
             # draft->draft mask is plain causal and the ragged wrapper needs no
-            # tree custom_mask (a branching topk>1 tree would require slicing the
-            # draft->draft block out of spec_info.custom_mask -- NOT handled
-            # here; see _forward_target_verify_dcp). The prefix read excludes the
-            # draft tokens (paged_kernel_lens == committed seq_lens); the draft
-            # KV is written to owned compact slots by _dcp_masked_write and
-            # attended only through the ragged wrapper.
+            # tree custom_mask. With topk > 1 the draft is a TREE: the
+            # draft->draft block carries the tree-topology mask, sliced out of
+            # spec_info.custom_mask (the EAGLE FULL_MASK) below and planned into
+            # the ragged wrapper. That mask is draft-vs-draft ONLY -- a local,
+            # rank-uniform property (every rank holds all draft-token
+            # activations), orthogonal to the token-sharded prefix -- so it is
+            # correct under DCP without any cross-rank coordination. The prefix
+            # read excludes the draft tokens (paged_kernel_lens == committed
+            # seq_lens) and stays NON-causal (never masked); the draft KV is
+            # written to owned compact slots by _dcp_masked_write and attended
+            # only through the ragged wrapper.
             use_ragged = True
             draft_num = spec_info.draft_token_num
             # Paged prefix (committed context) over this rank's OWNED slots.
@@ -2617,6 +2769,22 @@ class FlashInferIndicesUpdaterPrefill:
             # keys); the causal draft->draft masking is done by the ragged
             # wrapper in the forward.
             custom_mask = None
+            # Tree-spec (topk > 1): slice the draft_num x draft_num tree block
+            # out of the EAGLE FULL_MASK and hand it to the ragged wrapper so
+            # its draft->draft attention uses the tree topology instead of a
+            # plain causal chain. topk == 1 keeps ragged_custom_mask None (the
+            # forward's causal=True path, byte-identical to before).
+            if (
+                self.attn_backend.dcp_tree_mask
+                and getattr(spec_info, "custom_mask", None) is not None
+            ):
+                ragged_custom_mask = _build_dcp_ragged_tree_mask(
+                    spec_info.custom_mask,
+                    paged_kernel_lens,  # committed prefix lens (verify)
+                    paged_kernel_lens_sum,
+                    draft_num,
+                    bs,
+                )
         elif spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
@@ -2685,6 +2853,10 @@ class FlashInferIndicesUpdaterPrefill:
                 ragged_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
+                # Tree-spec only (topk > 1): flashinfer packs this bool mask into
+                # the per-bucket ragged wrapper's custom_mask_buf on every replay
+                # -> CUSTOM mask mode over the draft->draft block. None elsewhere.
+                custom_mask=ragged_custom_mask,
             )
 
         if use_sliding_window_kv_pool:
