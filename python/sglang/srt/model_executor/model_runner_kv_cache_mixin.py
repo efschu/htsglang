@@ -2179,8 +2179,13 @@ class ModelRunnerKVCacheMixin:
         restart with SGLANG_UNEVEN_TOKEN_VECTOR=a,b,c, which resolve_cp_token_
         ratios honors on the next boot so the pool converges to the optimum.
         Because P_r is independent of the active vector, this converges in one
-        feedback step. All gating conditions are rank-uniform, so every rank
-        reaches the collective or none does."""
+        feedback step. All gating conditions BEFORE the all_gather are
+        rank-uniform (server args / installed vector / world size), so every
+        rank reaches the collective or none does; the rank-LOCAL capacity
+        P_r is gathered unconditionally (clamped to >= 0) and degenerate
+        ranks are rejected by the uniform post-gather any(p <= 0) check —
+        an early return on the local value would let one rank skip the
+        collective the others entered (distributed hang)."""
         from sglang.srt.distributed.utils import (
             cp_token_split_factor,
             get_cp_token_ratios,
@@ -2203,11 +2208,20 @@ class ModelRunnerKVCacheMixin:
         )
 
         configurator = create_memory_pool_configurator(self)
-        local_p = configurator.calculate_pool_sizes(
-            budget_bytes, self.page_size
-        ).max_total_num_tokens
-        if local_p <= 0:
-            return
+        # NOT an early-return guard: local_p is rank-LOCAL, so bailing here
+        # would skip the collective below on this rank only while the other
+        # ranks enter it (distributed hang). Clamp and gather unconditionally;
+        # the uniform any(p <= 0) check after the gather rejects degenerate
+        # ranks on EVERY rank alike (same pattern as _maybe_suggest_mlp_
+        # rebalance's local_tokens handling).
+        local_p = max(
+            int(
+                configurator.calculate_pool_sizes(
+                    budget_bytes, self.page_size
+                ).max_total_num_tokens
+            ),
+            0,
+        )
 
         world = get_world_group().world_size
         payload = (int(get_parallel().attn_dcp_rank), int(local_p))
