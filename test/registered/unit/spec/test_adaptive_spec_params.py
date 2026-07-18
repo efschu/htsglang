@@ -1,7 +1,12 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 
+from sglang.srt.speculative.adaptive_runtime_state import (
+    SpecRuntimeState,
+    assert_runtime_state_isolation,
+)
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
@@ -465,6 +470,93 @@ class TestBsDebounce(unittest.TestCase):
             params.on_verify_complete([2, 2], batch_size=8)
         self.assertEqual(params._slots[8].ema_accept_len, ema_8_before)
         self.assertEqual(params.get_steps_for_batch(8), 5)  # still pending 1
+
+
+def _fake_ws(ptr: int):
+    return SimpleNamespace(data_ptr=lambda: ptr)
+
+
+def _fake_backend(ws_ptr: int | None = None, **extra):
+    ns = SimpleNamespace(**extra)
+    if ws_ptr is not None:
+        ns.workspace_buffer = _fake_ws(ws_ptr)
+    return ns
+
+
+def _make_state(steps, draft=None, target=None, draft_extend=None):
+    return SpecRuntimeState(
+        speculative_num_steps=steps,
+        speculative_num_draft_tokens=steps + 1,
+        draft_attn_backend=draft,
+        cuda_graph_runner=None,
+        target_attn_backend=target,
+        target_graph_runner=None,
+        draft_extend_attn_backend=draft_extend,
+        cuda_graph_runner_for_draft_extend=None,
+    )
+
+
+class TestRuntimeStateIsolation(unittest.TestCase):
+    """G4: the M16/#50 invariant — no backend / flashinfer workspace may be
+    reachable from two different adaptive runtime states."""
+
+    def test_distinct_states_pass(self):
+        states = {
+            1: _make_state(1, draft=_fake_backend(0x100), target=_fake_backend(0x200)),
+            3: _make_state(3, draft=_fake_backend(0x300), target=_fake_backend(0x400)),
+        }
+        assert_runtime_state_isolation(states)  # must not raise
+
+    def test_shared_backend_object_across_states_raises(self):
+        shared = _fake_backend(0x100)
+        states = {
+            1: _make_state(1, draft=shared, target=_fake_backend(0x200)),
+            3: _make_state(3, draft=shared, target=_fake_backend(0x400)),
+        }
+        with self.assertRaisesRegex(RuntimeError, "backend shared between states"):
+            assert_runtime_state_isolation(states)
+
+    def test_shared_workspace_across_states_raises(self):
+        # Distinct backend objects, but their flashinfer workspaces alias the
+        # same allocation (e.g. both fell back to the process-global buffer).
+        states = {
+            1: _make_state(1, draft=_fake_backend(0x100), target=_fake_backend(0x200)),
+            3: _make_state(3, draft=_fake_backend(0x100), target=_fake_backend(0x400)),
+        }
+        with self.assertRaisesRegex(RuntimeError, "workspace shared between states"):
+            assert_runtime_state_isolation(states)
+
+    def test_sharing_within_one_state_is_allowed(self):
+        # The registered static/initial state legitimately aliases the global
+        # workspace across its own draft/target/draft-extend backends.
+        states = {
+            1: _make_state(
+                1,
+                draft=_fake_backend(0x100),
+                target=_fake_backend(0x100),
+                draft_extend=_fake_backend(0x100),
+            ),
+            3: _make_state(3, draft=_fake_backend(0x300), target=_fake_backend(0x400)),
+        }
+        assert_runtime_state_isolation(states)  # must not raise
+
+    def test_hybrid_wrapper_leaves_are_checked(self):
+        # A leaf backend hidden inside a hybrid prefill/decode wrapper of one
+        # state must not alias another state's workspace.
+        leaf = _fake_backend(0x500)
+        hybrid = SimpleNamespace(prefill_backend=leaf, decode_backend=_fake_backend(0x600))
+        states = {
+            1: _make_state(1, draft=hybrid, target=_fake_backend(0x700)),
+            3: _make_state(3, draft=_fake_backend(0x500), target=_fake_backend(0x800)),
+        }
+        with self.assertRaisesRegex(RuntimeError, "workspace shared between states"):
+            assert_runtime_state_isolation(states)
+
+    def test_single_state_never_raises(self):
+        shared = _fake_backend(0x100)
+        assert_runtime_state_isolation(
+            {3: _make_state(3, draft=shared, target=shared)}
+        )
 
 
 class TestResolveCandidateSteps(unittest.TestCase):
