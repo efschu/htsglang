@@ -328,20 +328,24 @@ class TestQKVParallelLinear(UnevenTPTestCase):
         self.assertTrue(torch.equal(torch.cat(ks), full_bk))
         self.assertTrue(torch.equal(torch.cat(vs), full_bv))
 
-    def test_uneven_rejects_kv_replication(self):
-        # tp=3 > 2 kv heads: replication is refused under a plan.
+    def test_uneven_kv_replication_supported(self):
+        # tp=3 > 2 kv heads: REPLICATED-KV geometry (task #62) — construction
+        # is SUPPORTED (this used to be rejected pre-#62). Every rank holds
+        # ALL kv heads; the q heads split by the plan in kv_total-sized units.
         set_tp_partition_ratios(PLAN)
-        with self.assertRaisesRegex(ValueError, "replication is not supported"):
-            QKVParallelLinear(
+        for rank in range(TP):
+            layer = QKVParallelLinear(
                 self.HIDDEN,
                 self.HEAD,
                 6,
                 2,
                 bias=False,
                 params_dtype=FP,
-                tp_rank=0,
+                tp_rank=rank,
                 tp_size=TP,
             )
+            self.assertEqual(layer.num_kv_heads, 2)  # full kv on every rank
+            self.assertEqual(layer.num_kv_head_replicas, TP)
 
     def test_uneven_rejects_non_integral_gqa_groups(self):
         set_tp_partition_ratios(PLAN)
