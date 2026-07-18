@@ -47,6 +47,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import get_buffer
+from sglang.srt.speculative import adaptive_graph_memory
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -223,8 +224,16 @@ def zero_flashinfer_workspaces() -> int:
     residue remains, but it is a deterministic function of the request
     itself, so run-to-run bit-stability is unaffected.
     """
+    from sglang.srt.speculative.adaptive_graph_memory import is_paused_tensor
+
     n = 0
     for buf in list(_WORKSPACE_BUFFERS.values()):
+        # A workspace belonging to a paused adaptive runtime state is
+        # physically unmapped; touching it would fault. Its zero-contract is
+        # restored by the adaptive graph-memory manager at resume time
+        # instead (see adaptive_graph_memory.AdaptiveGraphMemoryManager).
+        if is_paused_tensor(buf):
+            continue
         buf.zero_()
         n += 1
     return n
@@ -607,12 +616,19 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         )
         if init_new_workspace:
-            self.workspace_buffer = register_flashinfer_workspace_buffer(
-                torch.empty(
+            # When built for an adaptive runtime state in offload mode, the
+            # private workspace is tagged as pauseable per-state scratch: its
+            # physical pages are unmapped while the state is inactive and it
+            # is zeroed on every resume (restoring the #50 boot contract).
+            with adaptive_graph_memory.tagged_state_alloc():
+                new_workspace_buffer = torch.empty(
                     envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                     dtype=torch.uint8,
                     device=model_runner.device,
                 )
+            adaptive_graph_memory.note_state_tensor(new_workspace_buffer)
+            self.workspace_buffer = register_flashinfer_workspace_buffer(
+                new_workspace_buffer
             )
         else:
             self.workspace_buffer = global_workspace_buffer
@@ -1107,18 +1123,31 @@ class FlashInferAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        # When called while an adaptive runtime state is being built in
+        # offload mode, the large graph-state buffers are tagged as pauseable
+        # per-state scratch (unmapped while the state is inactive, zeroed on
+        # resume; every replay rewrites the lanes its graph reads and zeros
+        # point at pool page 0, so the zeroed state equals the fresh-boot
+        # pre-first-replay state). Static-path init is untouched: the tag
+        # scope only exists during adaptive builds.
         if kv_indices_buf is None:
-            cuda_graph_kv_indices = torch.zeros(
-                (max_num_tokens * self.max_context_len,),
-                dtype=torch.int32,
-                device="cuda",
-            )
+            with adaptive_graph_memory.tagged_state_alloc():
+                cuda_graph_kv_indices = torch.zeros(
+                    (max_num_tokens * self.max_context_len,),
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+            adaptive_graph_memory.note_state_tensor(cuda_graph_kv_indices)
         else:
             cuda_graph_kv_indices = kv_indices_buf
 
-        self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
-            cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
-        ]
+        extra_kv_indices = []
+        for _ in range(self.num_wrappers - 1):
+            with adaptive_graph_memory.tagged_state_alloc():
+                clone = cuda_graph_kv_indices.clone()
+            adaptive_graph_memory.note_state_tensor(clone)
+            extra_kv_indices.append(clone)
+        self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + extra_kv_indices
 
         # SWA write-target buffer; refilled and bound onto forward_metadata in
         # init_forward_metadata_out_graph before each replay.
@@ -1135,11 +1164,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_kv_indices[i][0] = 0
 
         if not self.skip_prefill:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.uint8,
-                device="cuda",
-            )
+            with adaptive_graph_memory.tagged_state_alloc():
+                self.cuda_graph_custom_mask = torch.zeros(
+                    (max_num_tokens * self.max_context_len),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+            adaptive_graph_memory.note_state_tensor(self.cuda_graph_custom_mask)
+            # indptr clones are KiB-scale: below the tagging threshold, they
+            # stay resident (small allocations must not share tagged
+            # segments across states; see adaptive_graph_memory).
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
@@ -2901,11 +2935,16 @@ class FlashInferMultiStepDraftBackend:
         kv_indices_width = draft_kv_indices_buffer_width(
             max_bs, self.topk, self.max_context_len
         )
-        self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, kv_indices_width),
-            dtype=torch.int32,
-            device="cuda",
-        )
+        # Tagged as pauseable per-state scratch during adaptive offload
+        # builds; rewritten by generate_draft_decode_kv_indices before every
+        # replay (see the single-backend init_cuda_graph_state for details).
+        with adaptive_graph_memory.tagged_state_alloc():
+            self.cuda_graph_kv_indices = torch.zeros(
+                (self.speculative_num_steps, kv_indices_width),
+                dtype=torch.int32,
+                device="cuda",
+            )
+        adaptive_graph_memory.note_state_tensor(self.cuda_graph_kv_indices)
 
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(

@@ -606,9 +606,19 @@ class Engine(EngineScoreMixin, EngineBase):
         scheduler_procs = []
 
         if server_args.dp_size == 1:
-            # Launch tensor parallel scheduler processes
+            from sglang.srt.speculative.adaptive_graph_memory import (
+                resolve_adaptive_graph_memory_mode,
+            )
+
+            # Launch tensor parallel scheduler processes.
+            # Adaptive graph-memory offload needs the torch_memory_saver
+            # LD_PRELOAD hook active in the scheduler processes even when
+            # --enable-memory-saver is off (the hook alone changes nothing:
+            # it only intercepts allocations inside explicitly tagged
+            # regions, which the default path never enters).
             memory_saver_adapter = TorchMemorySaverAdapter.create(
                 enable=server_args.enable_memory_saver
+                or resolve_adaptive_graph_memory_mode(server_args) == "offload"
             )
             scheduler_pipe_readers = []
 

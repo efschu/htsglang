@@ -2059,8 +2059,25 @@ class ServerArgs:
     ] = False
     speculative_adaptive_config: A[
         Optional[str],
-        "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
+        "Path to a JSON config file for adaptive speculative decoding tuning "
+        "knobs, or the name of a built-in profile ('default', 'high-accept'). "
+        "'high-accept' adds k=4/5 ladder rungs with upward hysteresis for "
+        "workloads with per-position accept probability >~0.85.",
     ] = None
+    speculative_adaptive_graph_memory: A[
+        str,
+        Arg(
+            help="VRAM policy for the pre-built adaptive runtime states. "
+            "'resident': all candidate states stay fully materialized "
+            "(reserve = SUM of all states, ~us pointer swaps) -- for rigs "
+            "with VRAM to spare. 'offload': inactive states' scratch buffers "
+            "are physically unmapped via torch_memory_saver and remapped on "
+            "swap (reserve = MAX over states, ms-scale swaps, KV capacity "
+            "recovered); requires CUDA + flashinfer. 'auto' (default): "
+            "offload when prerequisites hold, else resident.",
+            choices=["auto", "resident", "offload"],
+        ),
+    ] = "auto"
 
     # Decoupled speculative decoding: draft and verify run as
     # separate engines, currently connected by a ZMQ IPC mesh.

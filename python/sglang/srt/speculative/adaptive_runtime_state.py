@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
+from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,16 @@ def assert_runtime_state_isolation(
     zero_flashinfer_workspaces). Such aliasing is logged, not fatal. A pointer
     shared between two states that is NOT part of the baseline family is a
     genuine private-share bug and raises.
+
+    Relation to adaptive graph-memory OFFLOAD (#93): the managed alias layer
+    (adaptive_graph_memory) multiplexes PHYSICAL pages under per-state
+    buffers whose VIRTUAL addresses stay distinct, so managed aliasing is
+    invisible to -- and intentionally exempt from -- this data_ptr-identity
+    check: it never produces equal pointers across states. Unmanaged private
+    sharing therefore remains exactly as fatal as before. The physical-level
+    counterpart of this invariant (pausing one state must not unmap memory
+    referenced by another) is enforced separately by
+    AdaptiveGraphMemoryManager.finalize_boot's segment-isolation audit.
     """
     baseline_steps = baseline_steps or set()
     baseline_ws: set[int] = set()
@@ -197,6 +208,11 @@ class AdaptiveController:
         config_path: str | None = None,
         algorithm: str | None = None,
     ):
+        from sglang.srt.speculative.adaptive_graph_memory import (
+            AdaptiveGraphMemoryManager,
+            resolve_adaptive_graph_memory_mode,
+        )
+
         self.worker = worker
         self.params = AdaptiveSpeculativeParams(
             initial_steps=worker.speculative_num_steps,
@@ -205,6 +221,17 @@ class AdaptiveController:
         )
         self._states: dict[int, SpecRuntimeState] = {}
         self._registered_steps: set[int] = set()
+        self._forced_swap_counter = 0
+        server_args = getattr(worker, "server_args", None)
+        mode = (
+            resolve_adaptive_graph_memory_mode(server_args)
+            if server_args is not None
+            else "resident"
+        )
+        self.graph_memory = AdaptiveGraphMemoryManager(mode=mode)
+        log_info_on_rank0(
+            logger, f"Adaptive graph memory mode: {self.graph_memory.mode}"
+        )
 
     @property
     def candidate_steps(self) -> list[int]:
@@ -226,17 +253,27 @@ class AdaptiveController:
         """Build and register runtime states for all candidate steps."""
         self.params.set_cuda_graph_bs(cuda_graph_bs)
 
-        for steps in self.candidate_steps:
+        # Offload mode builds LARGEST k first: its capture runs with maximum
+        # headroom (no other built state mapped yet, each state is paused as
+        # soon as it is built), and its footprint is the max-state reserve
+        # that finalize_boot verifies. Resident mode keeps the historical
+        # ascending order (behavior-neutral there, and T75 measurements were
+        # taken with it).
+        offload = self.graph_memory.mode == "offload"
+        build_order = sorted(self.candidate_steps, reverse=offload)
+        for steps in build_order:
             if steps in self._states:
                 continue
 
             pruned_bs = self.params.cuda_graph_bs_for_step(steps)
-            state = self.worker.build_adaptive_runtime_state(
-                speculative_num_steps=steps,
-                speculative_num_draft_tokens=steps + 1,
-                cuda_graph_bs=pruned_bs,
-            )
+            with self.graph_memory.build_state(steps):
+                state = self.worker.build_adaptive_runtime_state(
+                    speculative_num_steps=steps,
+                    speculative_num_draft_tokens=steps + 1,
+                    cuda_graph_bs=pruned_bs,
+                )
             self._states[steps] = state
+            self.graph_memory.pause_after_build(steps)
 
         # Enforced M16/#50 invariant: no backend or private flashinfer
         # workspace may be reachable from two different runtime states (each
@@ -246,6 +283,10 @@ class AdaptiveController:
         assert_runtime_state_isolation(
             self._states, baseline_steps=self._registered_steps
         )
+
+        # Offload mode: physical-isolation audit + max-state reserve check
+        # (the no-OOM-on-swap guarantee), then map the initial state.
+        self.graph_memory.finalize_boot(self.worker.speculative_num_steps)
 
         # Start on the initial step.
         self._activate(self.worker.speculative_num_steps)
@@ -269,11 +310,31 @@ class AdaptiveController:
         every TP/DCP rank swaps to the same graph on the same decode step.
         Guarded by the AST ratchet in test_draft_pick_rank_sync.py.
         """
+        if self._maybe_forced_swap():
+            return
         new_step = self.params.on_verify_complete(
             num_correct_drafts_per_req, batch_size
         )
         if new_step is not None:
             self._activate(new_step)
+
+    def _maybe_forced_swap(self) -> bool:
+        """TEST-ONLY stress hook (SGLANG_ADAPTIVE_FORCE_SWAP_INTERVAL=N):
+        cycle through the candidate steps every N verify completions,
+        overriding the EMA decision. Rank-deterministic: driven purely by
+        the verify-call counter, which is identical on all ranks."""
+        from sglang.srt.environ import envs
+
+        interval = envs.SGLANG_ADAPTIVE_FORCE_SWAP_INTERVAL.get()
+        if interval <= 0:
+            return False
+        self._forced_swap_counter += 1
+        if self._forced_swap_counter % interval == 0:
+            order = self.candidate_steps
+            cur = self.worker.speculative_num_steps
+            idx = (order.index(cur) + 1) % len(order) if cur in order else 0
+            self._activate(order[idx])
+        return True
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)
@@ -281,4 +342,8 @@ class AdaptiveController:
             raise ValueError(
                 f"Missing adaptive runtime state for steps={speculative_num_steps}"
             )
+        # Offload mode: map the target state's physical pages (and unmap the
+        # outgoing built state's) BEFORE the worker's pointer swap. No-op in
+        # resident mode / when the target is already mapped.
+        self.graph_memory.ensure_active(speculative_num_steps)
         self.worker.apply_runtime_state(state)
