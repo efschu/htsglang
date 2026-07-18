@@ -119,10 +119,17 @@ The new hazard class is PHYSICAL: pausing tag A must not unmap memory that
 another state (or the static path) still uses. Two structural guarantees plus
 one audit close it:
 
-* Only individually-noted, MiB-scale, never-freed allocations are tagged.
-  Each enters the allocator inside its own ``region(tag)`` window, and large
-  allocations get dedicated segments, so a tagged segment hosts exactly its
-  noted tensor. Small allocations are never tagged.
+* Every tag allocates from its own private ``torch.cuda.MemPool``. This is
+  the load-bearing guarantee: ``pause(tag)`` unmaps a tag's segments
+  wholesale INCLUDING their free tails, and the caching allocator both
+  packs 1-10 MiB allocations into shared 20 MiB segments (kLargeBuffer) and
+  serves any large-enough free block regardless of who created the segment
+  -- so with a shared pool, one tag's buffer can be placed into another
+  (paused) tag's segment tail and fault on first touch (observed live on
+  the 5-state boot). Per-tag pools confine a tag's free space to that tag,
+  whose allocations happen only during its own build. Additionally only
+  individually-noted, never-freed allocations >= MIN_TAGGED_BYTES are
+  tagged; smaller ones stay resident in the default pool.
 * Tags are only pausable through this manager, which enforces "at most one
   built state resumed".
 * ``finalize_boot`` audits via ``torch.cuda.memory_snapshot()`` that every
@@ -283,6 +290,7 @@ class AdaptiveGraphMemoryManager:
         assert mode in ("resident", "offload"), mode
         self.mode = mode
         self._states: dict[str, _StateRecord] = {}
+        self._pools: dict[str, "torch.cuda.MemPool"] = {}
         self._paused: set[str] = set()
         self._resumed_tag: Optional[str] = None  # at most one built tag mapped
         self._build_tag: Optional[str] = None
@@ -358,12 +366,37 @@ class AdaptiveGraphMemoryManager:
         if self.mode != "offload" or self._build_tag is None:
             yield
             return
-        with self._adapter.region(tag=self._build_tag):
-            yield
+        # One private MemPool PER TAG -- a hard correctness requirement, not
+        # an optimization. pause(tag) unmaps a tag's segments wholesale,
+        # including their free tails, and the caching allocator packs
+        # 1-10 MiB allocations into shared 20 MiB segments (kLargeBuffer)
+        # and serves any sufficiently large free block regardless of which
+        # region entry created the segment. With a single shared pool, one
+        # tag's allocation can land in another (already paused) tag's
+        # segment tail -> illegal memory access on first touch (observed
+        # live: state k2's multistep kv_indices landed in paused k4's 20 MiB
+        # segment at 0x208af00000). Per-tag pools make cross-tag free-list
+        # reuse structurally impossible: a tag's free space is only visible
+        # to allocations of that same tag, which happen only during its own
+        # build. The pools stay alive for the process lifetime.
+        tag = self._build_tag
+        pool = self._pools.get(tag)
+        if pool is None:
+            pool = self._pools[tag] = torch.cuda.MemPool()
+        with torch.cuda.use_mem_pool(pool):
+            with self._adapter.region_config(tag=tag):
+                yield
 
     def note_tensor(self, t: Optional[torch.Tensor]) -> None:
         if self.mode != "offload" or self._build_tag is None or t is None:
             return
+        if os.environ.get("SGLANG_ADAPTIVE_ALIAS_DEBUG"):
+            logger.info(
+                "AGM-DEBUG note %s ptr=0x%x nbytes=%d",
+                self._build_tag,
+                t.data_ptr(),
+                t.untyped_storage().nbytes(),
+            )
         self._states[self._build_tag].tensors.append(t)
 
     def pause_after_build(self, steps: int) -> None:
@@ -377,6 +410,16 @@ class AdaptiveGraphMemoryManager:
         torch.cuda.synchronize()
         # Return freed temp segments to the driver between builds.
         torch.cuda.empty_cache()
+        if os.environ.get("SGLANG_ADAPTIVE_ALIAS_DEBUG"):
+            logger.info(
+                "AGM-DEBUG pause %s segments=%s tensors=%s",
+                tag,
+                [(hex(lo), hex(hi)) for lo, hi in rec.segment_ranges],
+                [
+                    (hex(t.data_ptr()), t.untyped_storage().nbytes())
+                    for t in rec.tensors
+                ],
+            )
         self._adapter.pause(tag)
         self._paused.add(tag)
 
@@ -579,12 +622,26 @@ class AdaptiveGraphMemoryManager:
 # ----------------------------------------------------------------------
 # Module-level hooks for the (backend-side) wrap sites
 # ----------------------------------------------------------------------
-def tagged_state_alloc():
+def tagged_state_alloc(nbytes: Optional[int] = None):
     """Context manager: route the enclosed allocation to the current
     adaptive build tag's pauseable region. No-op outside a build scope
-    (static path) or in resident mode."""
+    (static path), in resident mode, or -- CRITICALLY -- when *nbytes*
+    is below MIN_TAGGED_BYTES.
+
+    The size gate is a correctness requirement, not an optimization: the
+    caching allocator SPLITS large blocks, so a tagged segment can carry a
+    free tail of up to ~2 MiB. A later sub-2MiB allocation in another tag's
+    region could be served from that tail -- and once the first tag is
+    paused, the tail is UNMAPPED, so first touch is an illegal memory
+    access (observed live on the 5-state high-accept boot: state k2's
+    ~1.5 MiB custom_mask landed in paused k5's segment tail). Allocations
+    >= MIN_TAGGED_BYTES always get their own segment, closing the hole;
+    smaller ones stay resident in the default pool.
+    """
     mgr = _ACTIVE_MANAGER
     if mgr is None:
+        return nullcontext()
+    if nbytes is not None and nbytes < MIN_TAGGED_BYTES:
         return nullcontext()
     return mgr._tagged_region()
 
@@ -592,9 +649,13 @@ def tagged_state_alloc():
 def note_state_tensor(t: Optional[torch.Tensor]) -> None:
     """Register *t* as pauseable scratch of the state currently being built
     (zeroed on every resume). Only call for tensors allocated inside
-    ``tagged_state_alloc`` and >= MIN_TAGGED_BYTES."""
+    ``tagged_state_alloc``. Sub-MIN_TAGGED_BYTES tensors are skipped (they
+    were allocated OUTSIDE the tagged region by the size gate above and
+    must stay resident)."""
     mgr = _ACTIVE_MANAGER
-    if mgr is not None:
+    if mgr is not None and t is not None:
+        if t.untyped_storage().nbytes() < MIN_TAGGED_BYTES:
+            return
         mgr.note_tensor(t)
 
 
