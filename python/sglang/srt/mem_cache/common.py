@@ -114,6 +114,20 @@ def free_swa_out_of_window_slots(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
+        # Fake-bootstrap (warmup) requests must never INSERT into the prefix
+        # cache -- but for a chunked prefill this call is ALSO the chunk ->
+        # prefix conversion: `req.prefix_indices` must advance over the chunk
+        # just computed, or `PrefillAdder.add_chunked_req` re-plans the SAME
+        # first chunk forever while every pass allocates fresh KV rows, until
+        # the token pool is exhausted (upstream bug, introduced by the
+        # decode-side-radix PR that added this flag; task #106). Perform the
+        # minimal ChunkCache-equivalent advance without touching the tree:
+        # the rows stay request-owned and are freed at completion via
+        # `cache_finished_req(is_insert=False)` (see `release_kv_cache`).
+        kv_indices = tree_cache.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : req.extend_range.end
+        ]
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)

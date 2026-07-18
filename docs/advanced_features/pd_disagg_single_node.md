@@ -313,10 +313,29 @@ wins outright at all measured lengths.
     `SGLANG_FLASHINFER_WORKSPACE_SIZE=134217728`. With both fixes the full
     pair reached coexistence on the 5090: 31.99/32.6 GB (prefill 25.6 +
     decode rank0 6.4), decode up, per-rank pools sized correctly.
-  * BLOCKER 1: the disagg-prefill scheduler admits only ~pool/4 tokens
-    (usage 1.00 at 32.7k of a 131,080-row pool; `#pending-token` never
-    decrements as chunks convert — the prompt is effectively
-    double-reserved, plus a further 2x). First item for the follow-up.
+  * BLOCKER 1 — RESOLVED (task #106, follow-up session): root cause is an
+    UPSTREAM bug (PR #19746, decode-side radix cache) affecting
+    fake-bootstrap (warmup) requests longer than `chunked_prefill_size`:
+    `Req.skip_radix_cache_insert` (set iff `bootstrap_host ==
+    FAKE_BOOTSTRAP_HOST`) made `maybe_cache_unfinished_req` skip
+    `cache_unfinished_req` entirely — but for a chunked prefill that call
+    is ALSO the chunk→prefix conversion (`prefix_indices` advance). With it
+    skipped, `PrefillAdder.add_chunked_req` re-plans the SAME first chunk
+    forever, each pass allocating fresh KV rows until the pool is exhausted
+    (fail-loud OOM crash). The "~pool/4" reading was an artifact of the
+    32,768-token warm filling the 131,072-row pool after 64 re-prefills of
+    chunk 1 — the multiplier is pool/chunk, not 4. Real-bootstrap requests
+    were never affected (flag False; M2 oracle bit-identical). Fix in
+    `mem_cache/common.py`: when the flag is set, perform the minimal
+    ChunkCache-equivalent `prefix_indices` advance without touching the
+    tree; rows stay request-owned and are freed at completion via
+    `cache_finished_req(is_insert=False)`. Falsified live on A3B
+    (ctx 65,536, pool 219,948): before — `#pending-token` frozen at
+    61,440, usage → 1.00 after 108 re-prefill batches, RuntimeError OOM;
+    after — pending 61,440 → 0 monotone, usage peaks at 0.29
+    (= 63,488/219,948 exactly), 200 OK in 5.13 s, pool fully released
+    (second 16k warm starts at usage 0.07). This unblocks the eager-warm
+    boot protocol required by Blocker 2.
   * BLOCKER 2: prefill budget overshoot: AWQ/marlin load transients stay in
     the torch cache (charged by the delta at profile time — fix:
     `torch.cuda.empty_cache()` before profiling) and ~1.5-2.5 GB of
