@@ -307,7 +307,7 @@ class TestManagerOffload(unittest.TestCase):
         self._build_two_states(mgr)
         # 1024 * int32 = 4096 bytes per state; free memory below that fails.
         with _mock_cuda(free_bytes=1024):
-            with self.assertRaisesRegex(RuntimeError, "k-swap could OOM"):
+            with self.assertRaisesRegex(RuntimeError, "Increase the graph/KV reserve"):
                 mgr.finalize_boot(initial_steps=3)
 
     def test_audit_detects_cross_tag_segment(self):
@@ -558,7 +558,7 @@ class TestStage2CapturePools(unittest.TestCase):
         # Reserve check now needs >= the MEASURED footprint, not just the
         # noted tensors.
         with _mock_cuda(free_bytes=32 << 20):
-            with self.assertRaisesRegex(RuntimeError, "k-swap could OOM"):
+            with self.assertRaisesRegex(RuntimeError, "Increase the graph/KV reserve"):
                 mgr.finalize_boot(initial_steps=3)
 
     def test_note_kinds_are_itemized(self):
@@ -615,6 +615,50 @@ class TestStage2IntWorkspaceTagging(unittest.TestCase):
                 tag_fn(w)
         self.assertEqual(w.resets, [])
         self.assertEqual(mgr._states["adaptive_state_k2"].tensors, [])
+
+    def test_share_key_reuses_one_buffer_across_buckets(self):
+        tag_fn = self._helper()
+        mgr = _offload_manager()
+        with _mock_cuda(), _mock_capture_graph():
+            with mgr.build_state(2):
+                w1 = tag_fn(_FakeWrapper(), share_key=("decode_cg", 1, 0))
+                w2 = tag_fn(_FakeWrapper(), share_key=("decode_cg", 1, 0))
+                w3 = tag_fn(_FakeWrapper(), share_key=("decode_cg", 2, 0))
+        # Same slot -> same physical workspace; different slot -> private.
+        self.assertEqual(
+            w1._int_workspace_buffer.data_ptr(),
+            w2._int_workspace_buffer.data_ptr(),
+        )
+        self.assertNotEqual(
+            w1._int_workspace_buffer.data_ptr(),
+            w3._int_workspace_buffer.data_ptr(),
+        )
+        rec = mgr._states["adaptive_state_k2"]
+        # Noted once per distinct buffer, not per wrapper.
+        self.assertEqual(rec.kind_nbytes("int_ws"), 2 * (8 << 20))
+        self.assertEqual(len(rec.tensors), 2)
+
+    def test_serving_margin_blocks_thin_configs(self):
+        mgr = _offload_manager()
+        n = agm.MIN_TAGGED_BYTES // 4
+        with _mock_cuda():
+            with mgr.build_state(2):
+                with agm.tagged_state_alloc(nbytes=n * 4):
+                    t = torch.zeros(n, dtype=torch.int32)
+                agm.note_state_tensor(t)
+            mgr.pause_after_build(2)
+        rec = mgr._states["adaptive_state_k2"]
+        rec.paused_bytes = 100 << 20
+        # Free covers the mapped state but NOT state + serving margin
+        # (default 512 MiB): must fail fast at boot, not OOM at runtime.
+        with _mock_cuda(free_bytes=200 << 20):
+            with self.assertRaisesRegex(
+                RuntimeError, "serving transient margin"
+            ):
+                mgr.finalize_boot(initial_steps=3)
+        # With margin honored it finalizes.
+        with _mock_cuda(free_bytes=(100 + 512 + 1) << 20):
+            mgr.finalize_boot(initial_steps=3)
 
     def test_small_int_workspace_stays_resident(self):
         tag_fn = self._helper()

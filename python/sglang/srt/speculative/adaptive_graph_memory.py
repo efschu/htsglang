@@ -357,6 +357,13 @@ class _StateRecord:
     # Free-memory delta released by pause_after_build (page-granular; covers
     # noted tensors AND the state's private capture pool). 0 = not measured.
     paused_bytes: int = 0
+    # Stage-2 shared int workspaces: {share_key: tensor}. Per-batch-bucket
+    # graph-mode flashinfer wrappers are mutually exclusive per forward (one
+    # bucket replays per forward, and its plan rewrites the workspace right
+    # before), so all buckets of one (backend, role, wrapper-slot) share ONE
+    # tagged buffer instead of 12 -- this cut k5's int-ws bytes ~4x, which
+    # is what makes the high-accept set fit the standard reserve.
+    shared_tensors: dict = field(default_factory=dict)
 
     @property
     def nbytes(self) -> int:
@@ -536,6 +543,18 @@ class AdaptiveGraphMemoryManager:
         rec.tensors.append(t)
         rec.tensor_kinds.append(kind)
 
+    def get_shared_state_tensor(self, share_key) -> Optional[torch.Tensor]:
+        """The already-allocated shared tensor for *share_key* in the state
+        being built, or None. See _StateRecord.shared_tensors."""
+        if not self.offload_enabled or self._build_tag is None:
+            return None
+        return self._states[self._build_tag].shared_tensors.get(share_key)
+
+    def put_shared_state_tensor(self, share_key, t: torch.Tensor) -> None:
+        if not self.offload_enabled or self._build_tag is None:
+            return
+        self._states[self._build_tag].shared_tensors[share_key] = t
+
     # ------------------------------------------------------------------
     # Stage 2: per-state capture pools
     # ------------------------------------------------------------------
@@ -669,19 +688,37 @@ class AdaptiveGraphMemoryManager:
             sum(sizes.values()) / (1 << 20),
             free_bytes / (1 << 20),
         )
-        # No-OOM-on-swap guarantee: with every built state unmapped, the
-        # driver must be able to back the largest one. Since at most one
-        # built state is ever resumed and pause precedes resume on every
-        # swap, this check at boot implies every future swap succeeds.
-        if free_bytes < max_bytes:
+        # No-OOM guarantee, two terms:
+        # 1. Swap term (max_bytes): with every built state unmapped, the
+        #    driver must be able to back the largest one. Since at most one
+        #    built state is ever resumed and pause precedes resume on every
+        #    swap, this at boot implies every future swap succeeds.
+        # 2. Serving-margin term: forwards run WHILE a state is mapped, and
+        #    the eager paths (mamba chunked-prefill recompute etc.) allocate
+        #    transient tensors from the same free pool. Measured on the T102
+        #    rig: 1367 MiB of post-map free memory survived KV-full deep
+        #    prefill (T93 stage-1), 148 MiB OOM'd in fla/wy_fast
+        #    recompute_w_u_fwd. Without this term the boot "succeeds" into a
+        #    guaranteed runtime OOM; with it, an under-reserved config fails
+        #    fast here with the measured numbers.
+        from sglang.srt.environ import envs
+
+        margin_bytes = envs.SGLANG_ADAPTIVE_SERVING_MARGIN_MIB.get() << 20
+        if free_bytes < max_bytes + margin_bytes:
             raise RuntimeError(
-                "Adaptive graph memory offload: free device memory "
-                f"({free_bytes / (1 << 20):.0f} MiB) is below the largest "
-                f"state's tagged footprint ({max_bytes / (1 << 20):.0f} MiB, "
-                f"{max_tag}) even with all candidate states paused. A k-swap "
-                "could OOM. Increase the graph/KV reserve so at least one "
-                "state fits, or use --speculative-adaptive-graph-memory "
-                "resident."
+                "Adaptive graph memory offload: free device memory with all "
+                f"candidate states paused ({free_bytes / (1 << 20):.0f} MiB) "
+                "is below the largest state's mapped footprint "
+                f"({max_bytes / (1 << 20):.0f} MiB, {max_tag}) plus the "
+                f"serving transient margin ({margin_bytes / (1 << 20):.0f} "
+                "MiB, SGLANG_ADAPTIVE_SERVING_MARGIN_MIB). Serving with that "
+                "state mapped would leave "
+                f"{max(0, free_bytes - max_bytes) / (1 << 20):.0f} MiB for "
+                "eager-forward transients -> late runtime OOM instead of "
+                "this early error. Increase the graph/KV reserve by at least "
+                f"{(max_bytes + margin_bytes - free_bytes) / (1 << 20):.0f} "
+                "MiB, shrink the candidate set, or use "
+                "--speculative-adaptive-graph-memory resident."
             )
         self._finalized = True
         # Map the initial state (a registered baseline has no tag and needs
