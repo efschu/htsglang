@@ -1,6 +1,12 @@
 # Single-Node PD-Disaggregation: Solo Prefill on the Big Card, Distributed Decode (Design)
 
-Task #99. Status: **Phase-1 design, awaiting ruling.** Branch `feat/pd-disagg`
+Task #99. Status: **design APPROVED (main ruling 2026-07-18); Phase 2 in
+progress (M0 done).** Ruling highlights: A3B-only v1, spec decode
+auto-disabled+warn in disagg mode, local ~100-line proxy instead of
+sglang_router (interface designed for later rig-dashboard folding: plain
+HTTP, health passthrough, per-phase metric counters), M3 must include a
+short-prompt TTFT check, M4 must prove 0-MiB teardown incl. hard-kill of
+the prefill server mid-transfer (IPC leak check). Branch `feat/pd-disagg`
 (worktree `/spinning/wt-pd-disagg`), based on `feat/gemma-draft-spec`
 (`e2228882f` — strict superset of `feat/gemma-bringup`, adds the #100
 uneven-TP MLP fix, #91 SWA pool sizing, #101 EAGLE3 head support).
@@ -16,18 +22,26 @@ the 5090 (A3B-AWQ ~19.2 GB weights in 32.6 GB), and MoE prefill activates
 nearly all experts, so solo prefill wins twice.
 
 **Measured (2026-07-18, this branch, zero code changes):** Qwen3.6-35B-A3B-AWQ,
-TP=1 on the 5090 alone, fp8 KV, chunked prefill 2048:
+fp8 KV, chunked prefill 2048, flashinfer, no cuda-graph. Both sides measured
+warm on the SAME branch/config (M0 correction: the historical "177 s / 120k"
+figure — ~680 tok/s — is stale; the current branch's TP=3+DCP baseline is
+much faster, and it is the honest comparison):
 
-| prompt tokens | solo 5090 latency | solo tok/s | TP=3 baseline tok/s | speedup |
-|---|---|---|---|---|
-| 8,192 (warm) | 0.41 s | 20,160 | 680–1,300 | ~15–30x |
-| 32,768 | 2.03 s | 16,100 | 680–1,300 | ~12–24x |
-| 81,920 | 7.79 s | 10,520 | 680–1,300 | ~8–15x |
-| 122,880 | **15.2 s** (2 runs: 15.18/15.19) | **8,090** | ~680 (177 s / 120k measured) | **~11.7x** |
+| prompt tokens | TP=3+DCP baseline (this branch) | solo 5090 TP=1 | speedup |
+|---|---|---|---|
+| 8,192 (warm) | 2.04 s (4,022 tok/s) | 0.41 s (20,160 tok/s) | **5.0x** |
+| 32,768 | 8.81 s (3,717 tok/s) | 2.03 s (16,100 tok/s) | **4.3x** |
+| 81,920 | — | 7.79 s (10,520 tok/s) | — |
+| 122,880 | 39.4 s (3,117 tok/s) | **15.2 s** (8,090 tok/s; runs 15.18/15.19) | **2.6x** |
+
+TP=3 decode baseline (same no-graph config, bs=1): 15.9 tok/s @2k ctx,
+15.6 tok/s @32k ctx — M3 decode comparisons stay config-matched.
 
 The KV that must then be rescattered to the decode layout is 10.1 KiB/token
 (fp8) for A3B — **1.2 GB for the whole 120k prompt**, i.e. ~0.2 s of PCIe
-time against 162 s of prefill saved. The math is not close. **GO** for A3B;
+time against 24 s of prefill saved at 120k (and ~1.6 s saved for ~30 ms of
+transfer at 8k). Net win at every measured length: inside the original 2–4x
+hypothesis band at long context, above it at short lengths. **GO** for A3B;
 27B is conditional (Section 8).
 
 ## 1. Rig and model facts (measured / from configs)
@@ -198,12 +212,12 @@ rank 0 share D2D ~instant; worst path is the x4 3080's share at 6.5 GB/s →
 **~8–25 ms per 10k tokens**, overlappable with the next chunk's compute).
 27B: 327 MB per 10k → ~50–100 ms. GDN state: one-shot 32/75 MB.
 
-| scenario | today (TP=3) | disagg (measured solo + est. overheads) | net |
+| scenario | today (TP=3+DCP, this branch, warm) | disagg (measured solo + est. overheads) | net |
 |---|---|---|---|
-| (i) A3B short prompt 2k | ~1.5–3 s TTFT | ~0.3–0.7 s prefill + ~30–80 ms transfer/handshake | **2–4x TTFT, GO** (wins at every length; no threshold routing needed) |
-| (i') A3B 32k | ~25–48 s | 2.0 s + ~0.1 s | **>12x, GO** |
-| (iii) A3B 120k deep prompt | **177 s** | **15.2 s + ~0.2 s + prealloc** ≈ 16 s | **~11x TTFT, GO — headline** |
-| (ii) 27B-int4 8k, no MTP | ~7 s TTFT (at 1,177 tok/s) | est. ~3–5 s (solo 27B **not yet measured**) + 0.1 s | ~1.5–2x TTFT, **but** v1 disables MTP (Section 7) → decode tok/s drops materially. **Conditional: NET LOSS for typical chat; only wins for very long prompts. Defer to v2.** |
+| (i) A3B short prompt 2k | ~0.5–1 s TTFT (at ~4k tok/s) | ~0.1–0.3 s prefill + ~30–80 ms transfer/handshake | **~2x TTFT, GO** — but M3 must verify proxy/handoff overhead doesn't eat it (ruling item 3a; fallback: length-threshold routing) |
+| (i') A3B 32k | 8.8 s | 2.0 s + ~0.1 s | **~4x, GO** |
+| (iii) A3B 120k deep prompt | **39.4 s** (historical stack: 177 s) | **15.2 s + ~0.2 s + prealloc** ≈ 16 s | **~2.5x TTFT, GO — headline** |
+| (ii) 27B-int4 8k, no MTP | ~7 s TTFT (at 1,177 tok/s, older figure) | est. ~3–5 s (solo 27B **not yet measured**) + 0.1 s | ~1.5–2x TTFT, **but** v1 disables MTP (Section 7) → decode tok/s drops materially. **Conditional: NET LOSS for typical chat; only wins for very long prompts. Defer to v2.** |
 
 Decode throughput: unchanged by design (same layout, same kernels); the only
 risk is SM contention during prefill bursts (below). **Recommendation: GO,
@@ -245,6 +259,9 @@ wins outright at all measured lengths.
 1. **CUDA IPC vs torch allocator:** pools must be plain cudaMalloc regions
    (no expandable segments; no `torch.cuda.MemPool`). Mitigation: assert at
    boot; allocate pools with explicit allocator config. (M1 proves this.)
+   Approved fallback (ruling 5): if IPC on allocator-owned memory proves
+   fragile, use a dedicated `cudaMalloc`'d transfer buffer per rank — one
+   extra D2D copy, still trivially cheap vs the seconds saved.
 2. **Decode prealloc under DCP** (V1, Section 4) — disagg prealloc path may
    assume full-seq_len rows; must use owned-count. Found early by M2 oracle.
 3. **MambaRadixCache on decode** receiving externally-produced state —
@@ -259,9 +276,12 @@ wins outright at all measured lengths.
 
 ## 9. Phase-2 plan (small commits, bugs-first, each step gated by an oracle)
 
-- **M0** — baselines on this branch: A3B TP=3 prefill/decode numbers, disagg
-  OFF reference outputs (temp-0 + needle) for the oracle; confirm the 177 s
-  figure's sglang-side analog.
+- **M0** — DONE (2026-07-18): A3B TP=3+DCP baseline on this branch measured
+  warm — prefill 4,022 / 3,717 / 3,117 tok/s at 8k / 32k / 120k (i.e. the
+  historical 177 s / 120k figure is stale; today's baseline is 39.4 s);
+  decode bs=1 15.9 tok/s @2k, 15.6 @32k (no-cuda-graph config). Temp-0
+  oracle references + 32k-needle (retrieved: 483729) captured to
+  `/tmp/pd99/oracle_tp3.json`; scripts in `/tmp/pd99/`.
 - **M1** — `TransferBackend.LOCAL`, same-layout smoke: prefill TP=1 →
   decode TP=1, both on the 5090 with split budgets. Proves bootstrap, IPC
   mapping, gather/scatter, metadata, GDN state (trivial slice). Oracle:
@@ -272,11 +292,16 @@ wins outright at all measured lengths.
   32k/80k; kv-canary if available.
 - **M3** — hybrid E2E hardening + perf: GDN uneven state slice, mamba-radix
   acceptance, coexistence budgets on the 5090, contention measurement.
-  Deliverable: TTFT/prefill table (2k/8k/32k/120k) vs baseline — target:
-  beat 177 s/120k by >5x (expectation ~11x); decode tok/s within noise of
-  non-disagg.
+  Deliverable: TTFT/prefill table (2k/8k/32k/120k) vs the M0 baseline —
+  target: beat 39.4 s/120k by >2x (expectation ~2.5x, i.e. ~16 s) and the
+  historical 177 s by >10x; short-prompt TTFT must NOT regress vs baseline
+  (ruling 3a — else add length-threshold routing); decode tok/s within
+  noise of non-disagg.
 - **M4** — regression: disagg OFF byte-identical on the reference launch
-  commands; docs; push `feat/pd-disagg` to efschu/htsglang.
+  commands; teardown hygiene per ruling 3b — both servers stopped leaves
+  every GPU at 0 MiB, AND a hard-kill (SIGKILL) of the prefill server
+  mid-transfer must not orphan IPC handles / pinned buffers or wedge the
+  decode server; docs; push `feat/pd-disagg` to efschu/htsglang.
 
 ## Appendix: measurement provenance
 
