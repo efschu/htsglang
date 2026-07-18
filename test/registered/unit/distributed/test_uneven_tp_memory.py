@@ -175,6 +175,16 @@ class TestTokenCapacitySync(UnevenTPTestCase):
                 uneven_memory_budgets_active=lambda: uneven,
             ),
             pp_size=1,
+            # Weighted-DCP C-min-reduce gate: no token vector installed in
+            # these tests, so dcp_size=1 keeps uneven_dcp_active() False and
+            # exercises the classic min-sync branch below it.
+            dcp_size=1,
+            # #79/#90 hybrid physical ceilings (mamba / SWA): inactive for
+            # this plain-MHA stub. _apply_hybrid_kv_token_cap with cap=None
+            # is the real no-op contract.
+            _hybrid_kv_token_cap=lambda: None,
+            _swa_hybrid_kv_token_cap=lambda: None,
+            _apply_hybrid_kv_token_cap=lambda tc, cap, kind="mamba": tc,
         )
         calls = []
 
