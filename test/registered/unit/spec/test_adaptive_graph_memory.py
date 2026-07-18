@@ -8,6 +8,7 @@ GPU-side behavior is exercised in the T93 GPU validation phase.
 """
 
 import contextlib
+import itertools
 import os
 import unittest
 from types import SimpleNamespace
@@ -104,27 +105,29 @@ def _mock_cuda(free_bytes=1 << 40, snapshots=None):
         yield
 
 
-def _offload_manager():
-    """Manager in offload mode with a FakeAdapter installed."""
+def _offload_manager(mode="offload"):
+    """Manager in an offload mode with a FakeAdapter installed."""
     with mock.patch.dict(
         os.environ, {"LD_PRELOAD": "/x/torch_memory_saver_hook_mode_preload.so"}
     ):
         with mock.patch.object(
             AdaptiveGraphMemoryManager,
             "__init__",
-            _offload_init,
+            lambda self: _offload_init(self, mode=mode),
         ):
             return AdaptiveGraphMemoryManager()
 
 
-def _offload_init(self):
+def _offload_init(self, mode="offload"):
     # Mirrors the real __init__ minus the TorchMemorySaverAdapter creation.
-    self.mode = "offload"
+    self.mode = mode
     self._states = {}
     self._pools = {}
+    self._capture_pools = {}
     self._paused = set()
     self._resumed_tag = None
     self._build_tag = None
+    self._in_capture_region = False
     self._pre_build_segments = None
     self._finalized = False
     self._swap_ordinal = 0
@@ -331,6 +334,297 @@ class TestManagerOffload(unittest.TestCase):
         mgr._states["adaptive_state_k1"].segment_ranges = []
         with _mock_cuda(snapshots=[{}]):
             mgr.finalize_boot(initial_steps=3)  # must not raise
+
+
+class _FakeWrapper:
+    """Mimics a flashinfer wrapper's int-workspace surface."""
+
+    def __init__(self, nbytes=8 << 20):
+        self._float_workspace_buffer = torch.zeros(16, dtype=torch.uint8)
+        self._int_workspace_buffer = torch.full(
+            (nbytes,), 7, dtype=torch.uint8
+        )
+        self.resets = []
+
+    def reset_workspace_buffer(self, float_ws, int_ws):
+        self.resets.append((float_ws, int_ws))
+        self._float_workspace_buffer = float_ws
+        self._int_workspace_buffer = int_ws
+
+
+@contextlib.contextmanager
+def _mock_capture_graph():
+    """Mock torch.cuda.graph + graph_pool_handle, recording capture calls."""
+    calls = []
+    counter = itertools.count()
+
+    @contextlib.contextmanager
+    def _fake_graph(cuda_graph, pool=None, stream=None, **kwargs):
+        calls.append(("graph", cuda_graph, pool, stream))
+        yield
+
+    with (
+        mock.patch.object(torch.cuda, "graph", _fake_graph),
+        mock.patch.object(
+            torch.cuda, "graph_pool_handle", lambda: ("pool", next(counter))
+        ),
+    ):
+        yield calls
+
+
+class TestStage2ModeResolution(unittest.TestCase):
+    def test_explicit_offload_scratch(self):
+        with mock.patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": ""}):
+            args = _server_args(
+                speculative_adaptive_graph_memory="offload-scratch"
+            )
+            self.assertEqual(
+                resolve_adaptive_graph_memory_mode(args), "offload-scratch"
+            )
+
+    def test_auto_degrades_to_scratch_on_non_full_decode_backend(self):
+        with mock.patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": ""}):
+            args = _server_args(cuda_graph_backend_decode="breakable")
+            self.assertEqual(
+                resolve_adaptive_graph_memory_mode(args), "offload-scratch"
+            )
+
+    def test_auto_degrades_to_scratch_on_memory_saver_cuda_graph(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PYTORCH_CUDA_ALLOC_CONF": "",
+                "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "1",
+            },
+        ):
+            self.assertEqual(
+                resolve_adaptive_graph_memory_mode(_server_args()),
+                "offload-scratch",
+            )
+
+    def test_explicit_offload_with_non_full_backend_raises(self):
+        with mock.patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": ""}):
+            args = _server_args(
+                speculative_adaptive_graph_memory="offload",
+                cuda_graph_backend_decode="breakable",
+            )
+            with self.assertRaisesRegex(ValueError, "offload-scratch"):
+                resolve_adaptive_graph_memory_mode(args)
+
+    def test_explicit_scratch_with_missing_base_prereq_raises(self):
+        args = _server_args(
+            speculative_adaptive_graph_memory="offload-scratch",
+            attention_backend="triton",
+        )
+        with self.assertRaisesRegex(ValueError, "flashinfer required"):
+            resolve_adaptive_graph_memory_mode(args)
+
+    def test_decode_backend_read_from_cuda_graph_config(self):
+        with mock.patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": ""}):
+            cfg = SimpleNamespace(decode=SimpleNamespace(backend="breakable"))
+            args = _server_args(cuda_graph_config=cfg)
+            self.assertEqual(
+                resolve_adaptive_graph_memory_mode(args), "offload-scratch"
+            )
+
+
+class TestStage2CapturePools(unittest.TestCase):
+    def test_pool_override_is_per_tag_and_scoped_to_builds(self):
+        mgr = _offload_manager()
+        with _mock_cuda(), _mock_capture_graph():
+            self.assertIsNone(agm.capture_pool_override())
+            with mgr.build_state(2):
+                p2 = agm.capture_pool_override()
+                self.assertIsNotNone(p2)
+                # Stable within the build.
+                self.assertEqual(agm.capture_pool_override(), p2)
+            with mgr.build_state(1):
+                p1 = agm.capture_pool_override()
+            self.assertNotEqual(p1, p2)
+            self.assertIsNone(agm.capture_pool_override())
+
+    def test_scratch_mode_has_no_pool_override(self):
+        mgr = _offload_manager(mode="offload-scratch")
+        with _mock_cuda(), _mock_capture_graph():
+            with mgr.build_state(2):
+                self.assertIsNone(agm.capture_pool_override())
+                self.assertFalse(agm.in_capture_offload_build())
+                self.assertTrue(agm.in_offload_build())
+
+    def test_capture_graph_routes_through_private_pool_and_region(self):
+        mgr = _offload_manager()
+        with _mock_cuda(), _mock_capture_graph() as calls:
+            with mgr.build_state(2):
+                pool = agm.capture_pool_override()
+                graph = object()
+                with agm.capture_graph_ctx(
+                    None, cuda_graph=graph, pool=pool, stream="s"
+                ):
+                    self.assertTrue(mgr._in_capture_region)
+                    # Wrap sites firing inside the capture must not nest
+                    # region_config (non-reentrant) -- passthrough instead.
+                    before = list(mgr._adapter.region_tags)
+                    with agm.tagged_state_alloc(nbytes=4 << 20):
+                        pass
+                    self.assertEqual(mgr._adapter.region_tags, before)
+                self.assertFalse(mgr._in_capture_region)
+            self.assertEqual(
+                [c for c in calls if c[0] == "graph"],
+                [("graph", graph, pool, "s")],
+            )
+            # The capture body ran inside the tag's region_config.
+            self.assertIn(
+                ("region_config", "adaptive_state_k2"), mgr._adapter.calls
+            )
+
+    def test_capture_graph_defers_to_default_ctx_outside_builds(self):
+        mgr = _offload_manager()
+        seen = []
+
+        @contextlib.contextmanager
+        def default_ctx(cuda_graph=None, pool=None, stream=None):
+            seen.append((cuda_graph, pool, stream))
+            yield
+
+        with _mock_cuda(), _mock_capture_graph() as calls:
+            with agm.capture_graph_ctx(
+                default_ctx, cuda_graph="g", pool="global", stream="s"
+            ):
+                pass
+        self.assertEqual(seen, [("g", "global", "s")])
+        self.assertEqual(calls, [])
+        self.assertEqual(mgr._adapter.calls, [])
+
+    def test_capture_graph_asserts_on_foreign_pool(self):
+        mgr = _offload_manager()
+        with _mock_cuda(), _mock_capture_graph():
+            with mgr.build_state(2):
+                agm.capture_pool_override()
+                with self.assertRaisesRegex(AssertionError, "private pool"):
+                    with agm.capture_graph_ctx(
+                        None, cuda_graph="g", pool="global", stream=None
+                    ):
+                        pass
+
+    def test_capture_pool_only_state_swaps_and_reserve_checks(self):
+        # A state whose entire footprint is the capture pool (no noted
+        # tensors) must still pause after build, count for the reserve
+        # check, and pause/resume on swaps.
+        mgr = _offload_manager()
+        with _mock_cuda(), _mock_capture_graph():
+            with mgr.build_state(2):
+                pool = agm.capture_pool_override()
+                with agm.capture_graph_ctx(
+                    None, cuda_graph="g", pool=pool, stream=None
+                ):
+                    pass
+            mgr.pause_after_build(2)
+            self.assertIn(
+                ("pause", "adaptive_state_k2"), mgr._adapter.calls
+            )
+            mgr.finalize_boot(initial_steps=3)
+            mgr._adapter.calls.clear()
+            mgr.ensure_active(2)
+            self.assertEqual(
+                mgr._adapter.calls, [("resume", "adaptive_state_k2")]
+            )
+            mgr._adapter.calls.clear()
+            mgr.ensure_active(3)
+            self.assertEqual(
+                mgr._adapter.calls, [("pause", "adaptive_state_k2")]
+            )
+
+    def test_paused_bytes_measured_and_drives_reserve_check(self):
+        mgr = _offload_manager()
+        n = agm.MIN_TAGGED_BYTES // 4
+        free_seq = iter(
+            [
+                (1 << 30, 1 << 41),  # before pause
+                ((1 << 30) + (64 << 20), 1 << 41),  # after: 64 MiB released
+            ]
+        )
+        with _mock_cuda(), _mock_capture_graph():
+            with mgr.build_state(2):
+                with agm.tagged_state_alloc(nbytes=n * 4):
+                    t = torch.zeros(n, dtype=torch.int32)
+                agm.note_state_tensor(t)
+            with mock.patch.object(
+                torch.cuda, "mem_get_info", lambda *a, **k: next(free_seq)
+            ):
+                mgr.pause_after_build(2)
+        rec = mgr._states["adaptive_state_k2"]
+        self.assertEqual(rec.paused_bytes, 64 << 20)
+        self.assertEqual(rec.footprint_bytes, 64 << 20)
+        # Reserve check now needs >= the MEASURED footprint, not just the
+        # noted tensors.
+        with _mock_cuda(free_bytes=32 << 20):
+            with self.assertRaisesRegex(RuntimeError, "k-swap could OOM"):
+                mgr.finalize_boot(initial_steps=3)
+
+    def test_note_kinds_are_itemized(self):
+        mgr = _offload_manager()
+        n = agm.MIN_TAGGED_BYTES
+        with _mock_cuda():
+            with mgr.build_state(2):
+                with agm.tagged_state_alloc(nbytes=n):
+                    a = torch.zeros(n, dtype=torch.uint8)
+                agm.note_state_tensor(a)
+                with agm.tagged_state_alloc(nbytes=2 * n):
+                    b = torch.zeros(2 * n, dtype=torch.uint8)
+                agm.note_state_tensor(b, kind="int_ws")
+        rec = mgr._states["adaptive_state_k2"]
+        self.assertEqual(rec.kind_nbytes("scratch"), n)
+        self.assertEqual(rec.kind_nbytes("int_ws"), 2 * n)
+
+
+class TestStage2IntWorkspaceTagging(unittest.TestCase):
+    def _helper(self):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            _tag_adaptive_int_workspace,
+        )
+
+        return _tag_adaptive_int_workspace
+
+    def test_retag_inside_stage2_build(self):
+        tag_fn = self._helper()
+        mgr = _offload_manager()
+        with _mock_cuda(), _mock_capture_graph():
+            with mgr.build_state(2):
+                w = _FakeWrapper()
+                old = w._int_workspace_buffer
+                self.assertIs(tag_fn(w), w)
+        self.assertEqual(len(w.resets), 1)
+        self.assertIsNot(w._int_workspace_buffer, old)
+        # Fresh int workspace starts zeroed (boot contract) and is noted
+        # for zero-on-resume.
+        self.assertTrue(torch.all(w._int_workspace_buffer == 0))
+        rec = mgr._states["adaptive_state_k2"]
+        self.assertEqual(rec.kind_nbytes("int_ws"), 8 << 20)
+
+    def test_noop_outside_build_and_in_scratch_mode(self):
+        tag_fn = self._helper()
+        # Outside any build scope.
+        mgr = _offload_manager()
+        w = _FakeWrapper()
+        tag_fn(w)
+        self.assertEqual(w.resets, [])
+        # Inside a Stage-1 (offload-scratch) build scope.
+        mgr = _offload_manager(mode="offload-scratch")
+        with _mock_cuda():
+            with mgr.build_state(2):
+                tag_fn(w)
+        self.assertEqual(w.resets, [])
+        self.assertEqual(mgr._states["adaptive_state_k2"].tensors, [])
+
+    def test_small_int_workspace_stays_resident(self):
+        tag_fn = self._helper()
+        mgr = _offload_manager()
+        with _mock_cuda(), _mock_capture_graph():
+            with mgr.build_state(2):
+                w = _FakeWrapper(nbytes=1 << 20)  # below MIN_TAGGED_BYTES
+                tag_fn(w)
+        self.assertEqual(w.resets, [])
+        self.assertEqual(mgr._states["adaptive_state_k2"].tensors, [])
 
 
 class _BuildRecordingWorker:

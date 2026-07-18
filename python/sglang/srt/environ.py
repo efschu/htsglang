@@ -841,6 +841,12 @@ class Envs:
     # driven by the verify-call counter, identical on all ranks). Overrides the
     # EMA decision; use to stress the offload swap path, never in production.
     SGLANG_ADAPTIVE_FORCE_SWAP_INTERVAL = EnvInt(0)
+    # Stage-2 graph-memory offload fallback: back the per-state CUDA-graph
+    # capture pools up to host RAM on pause and restore the exact bytes on
+    # resume, instead of relying on replay's rewrite-before-read property
+    # over undefined resume content. Costs ~capture-pool-size of host RAM per
+    # state and a PCIe round-trip per swap.
+    SGLANG_ADAPTIVE_CAPTURE_CPU_BACKUP = EnvBool(False)
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

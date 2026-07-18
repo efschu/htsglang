@@ -2070,12 +2070,17 @@ class ServerArgs:
             help="VRAM policy for the pre-built adaptive runtime states. "
             "'resident': all candidate states stay fully materialized "
             "(reserve = SUM of all states, ~us pointer swaps) -- for rigs "
-            "with VRAM to spare. 'offload': inactive states' scratch buffers "
-            "are physically unmapped via torch_memory_saver and remapped on "
-            "swap (reserve = MAX over states, ms-scale swaps, KV capacity "
-            "recovered); requires CUDA + flashinfer. 'auto' (default): "
-            "offload when prerequisites hold, else resident.",
-            choices=["auto", "resident", "offload"],
+            "with VRAM to spare. 'offload': inactive states' scratch "
+            "buffers, CUDA-graph capture pools, and flashinfer int "
+            "workspaces are physically unmapped via torch_memory_saver and "
+            "remapped on swap (reserve = MAX over states, ms-scale swaps, "
+            "KV capacity recovered); requires CUDA + flashinfer + the "
+            "'full' decode cuda-graph backend. 'offload-scratch': "
+            "scratch-buffers-only offload (the pre-Stage-2 behavior; "
+            "capture pools stay resident) -- fallback knob. 'auto' "
+            "(default): offload when prerequisites hold, degrading to "
+            "offload-scratch and then resident.",
+            choices=["auto", "resident", "offload", "offload-scratch"],
         ),
     ] = "auto"
 

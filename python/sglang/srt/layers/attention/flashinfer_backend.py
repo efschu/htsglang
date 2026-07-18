@@ -408,6 +408,36 @@ def fast_prefill_plan(
     self._plan_info = self._cached_module.plan(*args)
 
 
+def _tag_adaptive_int_workspace(wrapper):
+    """Stage-2 adaptive graph-memory offload: swap *wrapper*'s 8 MiB int
+    workspace for a state-private, pauseable one (via the public
+    ``reset_workspace_buffer`` API, before the wrapper's first plan).
+
+    Safe to pause because the int workspace carries no state a forward does
+    not rewrite: flashinfer re-plans on every forward (host plan state ->
+    pinned staging buffer -> device int-workspace copy), and its boot
+    contract is fresh-cudaMalloc zero pages (#50 note), which the
+    zero-on-resume of noted tensors restores exactly. The pinned host
+    staging buffer is untouched by pause/resume (host memory).
+
+    No-op outside a Stage-2 adaptive build scope, so the static path and
+    Stage-1 offload keep their historical resident int workspaces.
+    """
+    if not adaptive_graph_memory.in_capture_offload_build():
+        return wrapper
+    old = getattr(wrapper, "_int_workspace_buffer", None)
+    if old is None or not torch.is_tensor(old):
+        return wrapper
+    nbytes = old.untyped_storage().nbytes()
+    if nbytes < adaptive_graph_memory.MIN_TAGGED_BYTES:
+        return wrapper
+    with adaptive_graph_memory.tagged_state_alloc(nbytes=nbytes):
+        new_int = torch.zeros_like(old)
+    wrapper.reset_workspace_buffer(wrapper._float_workspace_buffer, new_int)
+    adaptive_graph_memory.note_state_tensor(new_int, kind="int_ws")
+    return wrapper
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -670,8 +700,10 @@ class FlashInferAttnBackend(AttentionBackend):
             # due to TMA descriptor initialization issues on SM100 GPUs.
             if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
                 fmha_backend = "cutlass"
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
+        self.prefill_wrapper_ragged = _tag_adaptive_int_workspace(
+            BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer, "NHD", backend=fmha_backend
+            )
         )
         self._fmha_backend = fmha_backend
 
@@ -683,25 +715,31 @@ class FlashInferAttnBackend(AttentionBackend):
         for _ in range(self.num_wrappers):
             if not skip_prefill:
                 self.prefill_wrappers_paged.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.prefill_backend,
+                    _tag_adaptive_int_workspace(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            backend=self.prefill_backend,
+                        )
                     )
                 )
                 self.prefill_wrappers_verify.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.prefill_backend,
+                    _tag_adaptive_int_workspace(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            backend=self.prefill_backend,
+                        )
                     )
                 )
             self.decode_wrappers.append(
-                BatchDecodeWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
-                    "NHD",
-                    backend=self.decode_backend,
-                    use_tensor_cores=self.decode_use_tensor_cores,
+                _tag_adaptive_int_workspace(
+                    BatchDecodeWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        backend=self.decode_backend,
+                        use_tensor_cores=self.decode_use_tensor_cores,
+                    )
                 )
             )
 
@@ -1188,15 +1226,17 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list:
         return [
-            BatchDecodeWithPagedKVCacheWrapper(
-                self.workspace_buffer,
-                "NHD",
-                backend=self.decode_backend,
-                use_cuda_graph=True,
-                use_tensor_cores=self.decode_use_tensor_cores,
-                paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
-                paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
+            _tag_adaptive_int_workspace(
+                BatchDecodeWithPagedKVCacheWrapper(
+                    self.workspace_buffer,
+                    "NHD",
+                    backend=self.decode_backend,
+                    use_cuda_graph=True,
+                    use_tensor_cores=self.decode_use_tensor_cores,
+                    paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
+                    paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
+                    paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
+                )
             )
             for i in range(self.num_wrappers)
         ]
@@ -1218,16 +1258,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 else {}
             )
             wrappers.append(
-                BatchPrefillWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
-                    "NHD",
-                    use_cuda_graph=True,
-                    backend=self.prefill_backend,
-                    qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                    paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                    paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                    paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                    **extra,
+                _tag_adaptive_int_workspace(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        use_cuda_graph=True,
+                        backend=self.prefill_backend,
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                        **extra,
+                    )
                 )
             )
         return wrappers
@@ -1329,15 +1371,17 @@ class FlashInferAttnBackend(AttentionBackend):
             for _ in range(self.num_wrappers)
         ]
         return [
-            BatchPrefillWithPagedKVCacheWrapper(
-                self.full_cg_prefill_workspace_buffer,
-                "NHD",
-                use_cuda_graph=True,
-                backend=self.prefill_backend,
-                qo_indptr_buf=self.full_cg_prefill_qo_indptr[i],
-                paged_kv_indptr_buf=self.full_cg_prefill_kv_indptr[i],
-                paged_kv_indices_buf=self.full_cg_prefill_kv_indices[i],
-                paged_kv_last_page_len_buf=self.kv_last_page_len[:num_slots],
+            _tag_adaptive_int_workspace(
+                BatchPrefillWithPagedKVCacheWrapper(
+                    self.full_cg_prefill_workspace_buffer,
+                    "NHD",
+                    use_cuda_graph=True,
+                    backend=self.prefill_backend,
+                    qo_indptr_buf=self.full_cg_prefill_qo_indptr[i],
+                    paged_kv_indptr_buf=self.full_cg_prefill_kv_indptr[i],
+                    paged_kv_indices_buf=self.full_cg_prefill_kv_indices[i],
+                    paged_kv_last_page_len_buf=self.kv_last_page_len[:num_slots],
+                )
             )
             for i in range(self.num_wrappers)
         ]
@@ -1382,13 +1426,15 @@ class FlashInferAttnBackend(AttentionBackend):
             device = self.kv_last_page_len.device
             qo_indptr_buf = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             kv_indptr_buf = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-            wrapper = BatchPrefillWithRaggedKVCacheWrapper(
-                self.workspace_buffer,
-                "NHD",
-                use_cuda_graph=True,
-                qo_indptr_buf=qo_indptr_buf,
-                kv_indptr_buf=kv_indptr_buf,
-                backend=self._fmha_backend,
+            wrapper = _tag_adaptive_int_workspace(
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.workspace_buffer,
+                    "NHD",
+                    use_cuda_graph=True,
+                    qo_indptr_buf=qo_indptr_buf,
+                    kv_indptr_buf=kv_indptr_buf,
+                    backend=self._fmha_backend,
+                )
             )
             self.verify_ragged_cg_wrappers[bs] = wrapper
         return wrapper
