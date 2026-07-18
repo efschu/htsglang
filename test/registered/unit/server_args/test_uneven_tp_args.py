@@ -64,7 +64,12 @@ class TestCliParsing(CustomTestCase):
         self.assertIsNone(parsed.rank_gpu_id)
         self.assertIsNone(parsed.rank_gpu_memory_mib)
         self.assertIsNone(parsed.rank_tp_ratio)
-        self.assertEqual(int(parsed.rank_auto_reserve_mib), 2048)
+        # #68: the default reserve is the demand-derived 'auto' sentinel,
+        # not the former flat 2048 MiB.
+        self.assertEqual(
+            parsed.rank_auto_reserve_mib,
+            ServerArgs.AUTO_RANK_MEMORY_RESERVE_MIB,
+        )
 
     def test_rank_gpu_id_list(self):
         parsed = self.parse("--rank-gpu-id", "0,0,1,2")
@@ -280,7 +285,15 @@ class TestPhysicalImpossibility(CustomTestCase):
 
 class TestAutoRatio(CustomTestCase):
     def test_auto_derives_budgets_and_weights(self):
-        args = make_args(tp_size=3, rank_gpu_id=[0, 1, 2], rank_tp_ratio="auto")
+        # An explicit flat reserve keeps the documented arithmetic exact
+        # and device-independent (the 'auto' default derives the reserve
+        # from the capacity tier; covered separately below).
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib="2048",
+        )
         run_handler(args)
         # budget = min(total - 2048, free - 1024) per GPU, one rank each:
         # GPU 0: min(30720, 28976) = 28976; GPU 1/2: min(18432, 17976) = 17976.
@@ -289,7 +302,12 @@ class TestAutoRatio(CustomTestCase):
         self.assertEqual(args.rank_tp_ratio, [3622, 2247, 2247])
 
     def test_auto_colocated_budget_split(self):
-        args = make_args(tp_size=4, rank_gpu_id=[0, 0, 1, 2], rank_tp_ratio="auto")
+        args = make_args(
+            tp_size=4,
+            rank_gpu_id=[0, 0, 1, 2],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib="2048",
+        )
         run_handler(args)
         # GPU 0 budget 28976 shared by two ranks -> 14488 each.
         self.assertEqual(
@@ -301,10 +319,48 @@ class TestAutoRatio(CustomTestCase):
         # Same card type for both ranks -> uniform budgets: the ratio must
         # collapse to None and the budget list to a single scalar
         # (vLLM bugfix 74cfec1a9).
-        args = make_args(tp_size=2, rank_gpu_id=[1, 2], rank_tp_ratio="auto")
+        args = make_args(
+            tp_size=2,
+            rank_gpu_id=[1, 2],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib="2048",
+        )
         run_handler(args)
         self.assertIsNone(args.rank_tp_ratio)
         self.assertEqual(args.rank_gpu_memory_mib, 17976)
+
+    def test_auto_reserve_auto_derives_from_demand(self):
+        # #68 default path ('auto' reserve): the short-circuited ServerArgs
+        # stub needs the pieces the derivation touches -- a real
+        # CudaGraphConfig and a mocked device capacity (the reserve is a
+        # function of the capacity tier, so the raw NVML totals must not
+        # leak in). Wiring-level assertion: the budgets follow
+        # min(total - derived_reserve, free - 1024) with the reserve from
+        # derived_rank_auto_reserve_mib.
+        from sglang.srt.model_executor.cuda_graph_config import (
+            default_cuda_graph_config,
+        )
+
+        args = make_args(
+            tp_size=2, rank_gpu_id=[1, 2], rank_tp_ratio="auto"
+        )
+        args.cuda_graph_config = default_cuda_graph_config()
+        args.disable_cuda_graph = True  # capture term off: runtime reserve only
+        gpu_mem = 20480.0
+        with patch.object(
+            server_args_module,
+            "get_device_memory_capacity",
+            return_value=gpu_mem,
+            create=True,
+        ):
+            expected_reserve = args.derived_rank_auto_reserve_mib(gpu_mem, 1)
+            run_handler(args)
+        total, free = FAKE_GPU_MEMORY[1]
+        expected_budget = min(total - expected_reserve, free - 1024)
+        self.assertGreater(expected_reserve, 0)
+        # Uniform cards -> collapse to the even split with a scalar budget.
+        self.assertIsNone(args.rank_tp_ratio)
+        self.assertEqual(args.rank_gpu_memory_mib, expected_budget)
 
     def test_auto_with_explicit_uniform_budget_list_collapses(self):
         args = make_args(
