@@ -71,11 +71,17 @@ class AdaptiveController:
       2. Call on_verify_complete(num_correct_drafts_per_req) after each decode verify.
     """
 
-    def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
+    def __init__(
+        self,
+        worker: AdaptiveSpecWorker,
+        config_path: str | None = None,
+        algorithm: str | None = None,
+    ):
         self.worker = worker
         self.params = AdaptiveSpeculativeParams(
             initial_steps=worker.speculative_num_steps,
             cfg_path=config_path,
+            algorithm=algorithm,
         )
         self._states: dict[int, SpecRuntimeState] = {}
 

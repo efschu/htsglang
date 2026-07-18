@@ -738,9 +738,18 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
             self._assert_adaptive_supported(server_args)
+            if server_args.speculative_adaptive_config is None:
+                log_info_on_rank0(
+                    logger,
+                    "Frozen-KV MTP adaptive: no --speculative-adaptive-config "
+                    "given; using the frozen-MTP default config (all candidate "
+                    "steps >= 1, ceiling 3) instead of the generic EAGLE default "
+                    "(which contains step 0 and is rejected by frozen MTP).",
+                )
             self.adaptive_controller = AdaptiveController(
                 self,
                 config_path=server_args.speculative_adaptive_config,
+                algorithm=server_args.speculative_algorithm,
             )
 
         # Some dummy tensors (parity with EAGLEWorkerV2 init).
@@ -865,6 +874,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
 
         candidate_steps = resolve_candidate_steps_from_config(
             cfg_path=server_args.speculative_adaptive_config,
+            algorithm=server_args.speculative_algorithm,
         )
         if any(s < 1 for s in candidate_steps):
             raise ValueError(
