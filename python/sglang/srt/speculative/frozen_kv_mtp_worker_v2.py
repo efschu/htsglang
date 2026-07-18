@@ -21,7 +21,9 @@ start of the next draft.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import time
 from typing import Optional
 
 import torch
@@ -32,7 +34,12 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+    cuda_graph_fully_disabled,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -40,7 +47,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+)
+from sglang.srt.speculative.adaptive_spec_params import adaptive_unsupported_reason
 from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
@@ -67,7 +80,12 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.utils import empty_context
+from sglang.srt.utils import (
+    empty_context,
+    get_available_gpu_memory,
+    is_npu,
+    log_info_on_rank0,
+)
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -75,6 +93,8 @@ from sglang.srt.utils.async_probe import (
 )
 
 logger = logging.getLogger(__name__)
+
+_is_npu = is_npu()
 
 
 class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
@@ -709,11 +729,19 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             target_worker,
         )
 
-        # Frozen MTP does not wire the adaptive controller yet.
-        assert (
-            not server_args.speculative_adaptive
-        ), "Frozen-KV MTP does not support adaptive speculative decoding yet."
-        self.adaptive_controller = None
+        # Adaptive speculative decoding: runtime-adaptive draft length. Each
+        # candidate step count is a fully pre-captured runtime state (own draft
+        # loop + target verify CUDA graphs); the controller swaps them per
+        # decode batch based on the EMA of accepted draft length. Default off
+        # (server_args.speculative_adaptive == False) -> byte-identical to the
+        # static path (adaptive_controller stays None, all adaptive hooks no-op).
+        self.adaptive_controller: Optional[AdaptiveController] = None
+        if server_args.speculative_adaptive:
+            self._assert_adaptive_supported(server_args)
+            self.adaptive_controller = AdaptiveController(
+                self,
+                config_path=server_args.speculative_adaptive_config,
+            )
 
         # Some dummy tensors (parity with EAGLEWorkerV2 init).
         self.num_new_pages_per_topk = torch.empty(
@@ -795,3 +823,237 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             return batch_output
+
+    # -- Adaptive speculative decoding --------------------------------------
+    #
+    # Frozen-KV MTP reuses the generic AdaptiveController / SpecRuntimeState /
+    # AdaptiveSpeculativeParams machinery (shared with EAGLE), but implements
+    # its own build/apply because the frozen draft owns no KV pool and runs no
+    # draft-extend forward: a runtime state is just {draft-loop graph, target
+    # verify graph} per candidate step, without EAGLE's draft-extend backend or
+    # topk>1 chain buffers.
+    #
+    # Design (why per-step pre-captured graph sets, not per-request steps):
+    #   * CUDA graphs bake in a FIXED spec geometry -- the frozen draft loop
+    #     graph captures exactly `speculative_num_steps` recurrent iterations
+    #     and the target verify graph captures a fixed `num_draft_tokens` tree
+    #     width. A single graph cannot run a variable number of steps.
+    #   * So dynamism is expressed as N fully pre-captured runtime states (one
+    #     per candidate step), swapped at runtime. All requests in one decode
+    #     batch must share a step count (they replay one graph), so the unit of
+    #     adaptation is the decode BATCH, not the individual request; the EMA of
+    #     accepted length is tracked per CUDA-graph batch-size slot.
+    #   * Each state needs its OWN attention-backend instances: the graph runner
+    #     allocates backend graph-state buffers in its ctor (init_cuda_graph_state
+    #     reallocates), so sharing one backend across states would leave earlier
+    #     captured graphs pointing at freed buffers.
+    #
+    # V1 scope: candidate steps >= 1 (topk == 1 only, enforced by the adaptive
+    # config resolver). Step 0 (nospec) is EAGLE-only for now -- the frozen seed
+    # / draft-extend path has no no-draft branch -- so it is rejected here with a
+    # clear message rather than silently mis-capturing.
+
+    def _assert_adaptive_supported(self, server_args: ServerArgs) -> None:
+        reason = adaptive_unsupported_reason(server_args)
+        if reason is not None:
+            raise ValueError(
+                f"Frozen-KV MTP cannot enable adaptive speculative decoding: {reason}"
+            )
+        from sglang.srt.speculative.adaptive_spec_params import (
+            resolve_candidate_steps_from_config,
+        )
+
+        candidate_steps = resolve_candidate_steps_from_config(
+            cfg_path=server_args.speculative_adaptive_config,
+        )
+        if any(s < 1 for s in candidate_steps):
+            raise ValueError(
+                "Frozen-KV MTP adaptive speculative decoding (V1) supports only "
+                f"candidate steps >= 1, but the config resolves to {candidate_steps}. "
+                "Step 0 (nospec) is not yet implemented for the frozen seed path; "
+                "pass --speculative-adaptive-config with candidate_steps >= 1 "
+                '(e.g. {"1": {"candidate_steps": [2, 3, 4]}}).'
+            )
+
+    @contextlib.contextmanager
+    def _override_worker_state(
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
+    ):
+        """Temporarily point server_args + worker/draft-worker at a target step
+        geometry so draft-loop / target graphs capture at that geometry. Restores
+        everything (including any draft backend / graph runner the build swapped
+        in) on exit. Frozen variant: no ``_rebuild_topk1_chain_buffers`` (frozen
+        draft worker has no topk>1 tree chain buffers)."""
+        sa = self.server_args
+        dw = self._draft_worker
+        backup = (
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            dw.speculative_num_steps,
+            dw.speculative_num_draft_tokens,
+            dw.draft_attn_backend,
+            dw.draft_model_runner.draft_attn_backend,
+            dw.draft_model_runner.attn_backend,
+            dw.cuda_graph_runner,
+            sa.speculative_num_steps,
+            sa.speculative_num_draft_tokens,
+            sa.cuda_graph_bs_decode,
+            sa.disable_cuda_graph,
+        )
+
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        dw.speculative_num_steps = speculative_num_steps
+        dw.speculative_num_draft_tokens = speculative_num_draft_tokens
+        sa.override(
+            "adaptive_spec.capture_override",
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
+        if cuda_graph_bs is not None:
+            # A step not used by any BS range prunes to an empty bs list -> turn
+            # graph capture off for that step (draft loop + target run eager).
+            sa.override(
+                "adaptive_spec.capture_override",
+                cuda_graph_bs_decode=cuda_graph_bs,
+                **({"disable_cuda_graph": True} if not cuda_graph_bs else {}),
+            )
+
+        try:
+            yield
+        finally:
+            (
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                dw.speculative_num_steps,
+                dw.speculative_num_draft_tokens,
+                dw.draft_attn_backend,
+                dw.draft_model_runner.draft_attn_backend,
+                dw.draft_model_runner.attn_backend,
+                dw.cuda_graph_runner,
+            ) = backup[:8]
+            sa.override(
+                "adaptive_spec.capture_restore",
+                speculative_num_steps=backup[8],
+                speculative_num_draft_tokens=backup[9],
+                cuda_graph_bs_decode=backup[10],
+                disable_cuda_graph=backup[11],
+            )
+
+    def build_adaptive_runtime_state(
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs=None,
+    ) -> SpecRuntimeState:
+        """Build a fully-captured runtime state for one candidate step count."""
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+
+        dw = self._draft_worker
+        with self._override_worker_state(
+            speculative_num_steps,
+            speculative_num_draft_tokens,
+            cuda_graph_bs=cuda_graph_bs,
+        ):
+            # Draft side: fresh attn backend (own graph-state buffers) + frozen
+            # draft-loop graph. topk == 1 (adaptive invariant): the frozen draft
+            # backend is the draft runner's decode backend, so rebuild a fresh
+            # instance the same way init did, with a new workspace.
+            fresh_draft_backend = dw.draft_model_runner._get_attention_backend(
+                init_new_workspace=True
+            )
+            dw.draft_attn_backend = fresh_draft_backend
+            dw.draft_model_runner.draft_attn_backend = fresh_draft_backend
+            dw.draft_model_runner.attn_backend = fresh_draft_backend
+            # _capture_cuda_graphs early-returns (leaving the attr untouched) for
+            # steps <= 1; null it first so a 1-step state runs the draft eagerly.
+            dw.cuda_graph_runner = None
+            dw._capture_cuda_graphs()
+
+            # Target side: fresh verify attn backend + decode graph runner sized
+            # to this step's tree width (num_draft_tokens).
+            target_model_runner = self._target_worker.model_runner
+            backup_init = target_model_runner.init_new_workspace
+            try:
+                target_attn_backend = target_model_runner._get_attention_backend(
+                    init_new_workspace=True
+                )
+            finally:
+                target_model_runner.init_new_workspace = backup_init
+
+            target_graph_runner = None
+            if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+                if _is_npu:
+                    from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import (
+                        NPUGraphRunner,
+                    )
+
+                    TargetGraphRunnerCls = NPUGraphRunner
+                else:
+                    TargetGraphRunnerCls = DecodeCudaGraphRunner
+                target_graph_runner = TargetGraphRunnerCls(
+                    target_model_runner,
+                    attn_backend=target_attn_backend,
+                    speculative_num_steps=speculative_num_steps,
+                    speculative_num_draft_tokens=speculative_num_draft_tokens,
+                )
+
+            state = SpecRuntimeState(
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                draft_attn_backend=fresh_draft_backend,
+                cuda_graph_runner=dw.cuda_graph_runner,
+                target_attn_backend=target_attn_backend,
+                target_graph_runner=target_graph_runner,
+                # Frozen draft has no draft-extend forward.
+                draft_extend_attn_backend=None,
+                cuda_graph_runner_for_draft_extend=None,
+            )
+
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        log_info_on_rank0(
+            logger,
+            f"Built frozen-KV MTP adaptive runtime state steps={speculative_num_steps}: "
+            f"elapsed={time.perf_counter() - tic:.2f}s, "
+            f"mem={(before_mem - after_mem):.2f}GB",
+        )
+        return state
+
+    def apply_runtime_state(self, state: SpecRuntimeState) -> None:
+        """Swap the active runtime state (draft-loop + target verify graphs)."""
+        if self.speculative_num_steps == state.speculative_num_steps:
+            return
+
+        log_info_on_rank0(
+            logger,
+            "Switch frozen-KV MTP adaptive runtime state: "
+            f"steps {self.speculative_num_steps} -> {state.speculative_num_steps}, "
+            f"draft_tokens {self.speculative_num_draft_tokens} -> "
+            f"{state.speculative_num_draft_tokens}",
+        )
+
+        self.speculative_num_steps = state.speculative_num_steps
+        self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+
+        dw = self._draft_worker
+        dw.speculative_num_steps = state.speculative_num_steps
+        dw.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        dw.draft_attn_backend = state.draft_attn_backend
+        dw.draft_model_runner.draft_attn_backend = state.draft_attn_backend
+        dw.draft_model_runner.attn_backend = state.draft_attn_backend
+        dw.cuda_graph_runner = state.cuda_graph_runner
+
+        self._target_worker.model_runner.attn_backend = state.target_attn_backend
+        self._target_worker.model_runner.decode_cuda_graph_runner = (
+            state.target_graph_runner
+        )
+
+        self.server_args.override(
+            "adaptive_spec.restore",
+            speculative_num_steps=state.speculative_num_steps,
+            speculative_num_draft_tokens=state.speculative_num_draft_tokens,
+        )

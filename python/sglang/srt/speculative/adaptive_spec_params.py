@@ -51,10 +51,10 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
     from sglang.srt.arg_groups.overrides import resolved_view
 
-    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3", "FROZEN_KV_MTP"):
         return (
             f"speculative_algorithm={server_args.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/FROZEN_KV_MTP are supported)"
         )
     if (
         server_args.speculative_eagle_topk is not None
