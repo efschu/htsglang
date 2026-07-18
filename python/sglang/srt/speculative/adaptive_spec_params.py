@@ -83,6 +83,49 @@ FROZEN_MTP_DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
 }
 
 
+# Built-in profile for high-predictability workloads (per-position accept
+# probability p >~ 0.85: code boilerplate, structured/tabular emission, ...).
+# Adds k=4/5 ladder rungs: with graph-memory OFFLOAD (#93) an extra rung
+# costs only its capture time at boot plus the max-state-sized alias pool --
+# inactive rungs hold no physical VRAM -- so exposing them is nearly free.
+# The rungs are climbed only on SUSTAINED high acceptance: up_hysteresis 0.25
+# (T75 recommendation) raises every rise threshold, because flapping into
+# k=4/5 wastes 4-5 serial draft forwards per rejected chain. No step-0 slots,
+# so the profile is valid for EAGLE and FROZEN_KV_MTP alike (high-accept
+# workloads keep drafting profitable even at bs 32). This profile is NOT the
+# default: at p <= 0.8 the expected extra accepted chain length from k=3 ->
+# k=5 is < 0.6 tokens for 2 extra serial draft forwards (net-negative, see
+# DEFAULT_ADAPTIVE_CONFIG's ceiling rationale) -- select it explicitly via
+# --speculative-adaptive-config high-accept.
+HIGH_ACCEPT_ADAPTIVE_CONFIG: dict[str, dict] = {
+    "1": {
+        "candidate_steps": [1, 2, 3, 4, 5],
+        "up_hysteresis": 0.25,
+        "down_hysteresis": -0.25,
+        "ceiling_coeff": 0,
+    },
+    "8": {
+        "candidate_steps": [1, 2, 3],
+        "up_hysteresis": 0.25,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+    "32": {
+        "candidate_steps": [1],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+}
+
+# --speculative-adaptive-config accepts these names instead of a JSON path.
+# "default" resolves to the per-algorithm built-in default.
+BUILTIN_ADAPTIVE_PROFILES: dict[str, dict[str, dict] | None] = {
+    "default": None,
+    "high-accept": HIGH_ACCEPT_ADAPTIVE_CONFIG,
+}
+
+
 def default_adaptive_config_for(algorithm: str | None) -> dict[str, dict]:
     """Pick the built-in adaptive config for *algorithm*.
 
@@ -141,11 +184,21 @@ def _load_adaptive_config(
 ) -> tuple[dict, dict[int, dict]]:
     """Load and validate adaptive config.
 
-    Uses ``default_adaptive_config_for(algorithm)`` when *cfg_path* is ``None``.
+    *cfg_path* may be a JSON file path or a built-in profile name
+    (``BUILTIN_ADAPTIVE_PROFILES``). Uses
+    ``default_adaptive_config_for(algorithm)`` when it is ``None``.
     """
     if cfg_path is not None:
-        with open(cfg_path) as f:
-            cfg = json.load(f)
+        if cfg_path in BUILTIN_ADAPTIVE_PROFILES:
+            profile = BUILTIN_ADAPTIVE_PROFILES[cfg_path]
+            cfg = (
+                profile
+                if profile is not None
+                else default_adaptive_config_for(algorithm)
+            )
+        else:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
     else:
         cfg = default_adaptive_config_for(algorithm)
 
