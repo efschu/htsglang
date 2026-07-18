@@ -386,11 +386,85 @@ class TestBatchSizeRouting(unittest.TestCase):
     def test_observe_verify_feeds_the_routed_slot(self):
         params = self._params()
         # Drive the bs=1 slot up with perfect acceptance; the bs=32 slot is
-        # untouched and stays at its single candidate step.
+        # untouched and stays at its own step.
         for _ in range(40):
-            params.on_verify_complete([7, 7, 7], batch_size=1)
+            params.on_verify_complete([3, 3, 3], batch_size=1)
         self.assertGreater(params.get_steps_for_batch(1), 1)
-        self.assertEqual(params.get_steps_for_batch(32), 1)
+        # The bs axis is debounced: reaching the bs=32 slot takes bs_debounce
+        # (default 3) consecutive decode steps routed there.
+        for _ in range(params._bs_debounce):
+            steps_32 = params.get_steps_for_batch(32)
+        self.assertEqual(steps_32, 1)
+
+
+class TestBsDebounce(unittest.TestCase):
+    """G3: the bs axis must not flap slots on a single boundary crossing."""
+
+    def _params(self, bs_debounce=None):
+        cfg = {
+            "1": {"candidate_steps": [5]},
+            "8": {"candidate_steps": [2]},
+        }
+        if bs_debounce is not None:
+            cfg["bs_debounce"] = bs_debounce
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(cfg, f)
+            f.flush()
+            return AdaptiveSpeculativeParams(initial_steps=5, cfg_path=f.name)
+
+    def test_default_debounce_value(self):
+        self.assertEqual(self._params()._bs_debounce, 3)
+
+    def test_invalid_debounce_raises(self):
+        with self.assertRaises(ValueError):
+            self._params(bs_debounce=0)
+
+    def test_boundary_flap_does_not_switch_slot(self):
+        params = self._params()
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+        # Alternating 8,1,8,1,... never accumulates 3 consecutive steps in the
+        # bs=8 slot, so the active slot stays bs=1 (no graph-swap thrash).
+        for _ in range(10):
+            self.assertEqual(params.get_steps_for_batch(8), 5)
+            self.assertEqual(params.get_steps_for_batch(1), 5)
+
+    def test_consecutive_occupancy_switches(self):
+        params = self._params()
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+        self.assertEqual(params.get_steps_for_batch(8), 5)  # pending 1
+        self.assertEqual(params.get_steps_for_batch(8), 5)  # pending 2
+        self.assertEqual(params.get_steps_for_batch(8), 2)  # switch on 3rd
+        # Switching back is debounced symmetrically.
+        self.assertEqual(params.get_steps_for_batch(1), 2)
+        self.assertEqual(params.get_steps_for_batch(1), 2)
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+
+    def test_return_to_active_slot_resets_pending_run(self):
+        params = self._params()
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+        params.get_steps_for_batch(8)  # pending 1
+        params.get_steps_for_batch(8)  # pending 2
+        params.get_steps_for_batch(1)  # reset
+        self.assertEqual(params.get_steps_for_batch(8), 5)  # pending 1 again
+        self.assertEqual(params.get_steps_for_batch(8), 5)  # pending 2
+        self.assertEqual(params.get_steps_for_batch(8), 2)  # pending 3: switch
+
+    def test_debounce_one_switches_immediately(self):
+        params = self._params(bs_debounce=1)
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+        self.assertEqual(params.get_steps_for_batch(8), 2)
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+
+    def test_verify_feed_reads_active_slot_without_advancing(self):
+        params = self._params()
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+        # Verify feeds at bs=8 must neither advance the debounce nor touch the
+        # bs=8 slot's EMA while the bs=1 slot is active.
+        ema_8_before = params._slots[8].ema_accept_len
+        for _ in range(10):
+            params.on_verify_complete([2, 2], batch_size=8)
+        self.assertEqual(params._slots[8].ema_accept_len, ema_8_before)
+        self.assertEqual(params.get_steps_for_batch(8), 5)  # still pending 1
 
 
 class TestResolveCandidateSteps(unittest.TestCase):

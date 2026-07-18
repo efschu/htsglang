@@ -326,6 +326,22 @@ class AdaptiveSpeculativeParams:
         self._slots: dict[int, AdaptiveStepSlot] = {}
         self._cuda_graph_bs: list[int] | None = None
 
+        # BS-axis debounce: the EMA axis has hysteresis, but without this the
+        # slot choice follows batch_size instantly, so a concurrency level
+        # oscillating across a slot boundary (e.g. 4 streams flapping around a
+        # CUDA-graph bs edge) would thrash graph swaps every decode step. A
+        # slot switch on the bs axis therefore requires `bs_debounce`
+        # CONSECUTIVE decode steps routed to the new slot; any step routed back
+        # to the active slot resets the run. Driven purely by the batch_size
+        # sequence (identical on all TP/DCP ranks), so it is rank-deterministic.
+        # bs_debounce=1 restores instant switching.
+        self._bs_debounce = int(cfg.get("bs_debounce", 3))
+        if self._bs_debounce < 1:
+            raise ValueError(f"bs_debounce must be >= 1, got {self._bs_debounce}")
+        self._active_slot_bs: int | None = None
+        self._pending_slot_bs: int | None = None
+        self._pending_slot_count = 0
+
         for bs, entry in sorted(bs_entries.items()):
             self._slots[bs] = AdaptiveStepSlot(
                 initial_steps=initial_steps,
@@ -349,16 +365,24 @@ class AdaptiveSpeculativeParams:
         self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
 
     def get_steps_for_batch(self, batch_size: int) -> int:
-        return self._route(batch_size).current_steps
+        """Step count for this decode batch; advances the bs-axis debounce."""
+        return self._slots[
+            self._debounced_slot_bs(batch_size, advance=True)
+        ].current_steps
 
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> int | None:
-        """Feed verify results to the matching BS slot's EMA.
+        """Feed verify results to the ACTIVE (debounced) BS slot's EMA.
+
+        Uses the debounced slot, not the raw-routed one: the batch actually ran
+        with the active slot's step count, so its accept lengths belong to that
+        slot's EMA. Does not advance the debounce (only the per-decode-step
+        activation in ``get_steps_for_batch`` does).
 
         Returns the new step if a switch is warranted, else ``None``.
         """
-        params = self._route(batch_size)
+        params = self._slots[self._debounced_slot_bs(batch_size, advance=False)]
         if params.update(num_correct_drafts_per_req):
             return params.current_steps
         return None
@@ -378,10 +402,46 @@ class AdaptiveSpeculativeParams:
         ]
 
     def _route(self, batch_size: int) -> AdaptiveStepSlot:
-        """Map *batch_size* → pad to CUDA-graph BS → closest slot."""
-        return self._slots[
-            self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
-        ]
+        """Raw (un-debounced) map: *batch_size* → pad to CUDA-graph BS → slot."""
+        return self._slots[self._slot_bs_for(batch_size)]
+
+    def _slot_bs_for(self, batch_size: int) -> int:
+        return self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
+
+    def _debounced_slot_bs(self, batch_size: int, advance: bool) -> int:
+        """Slot key for *batch_size* under the bs-axis debounce.
+
+        With ``advance=True`` (one call per decode step) a differing target
+        slot must be seen ``bs_debounce`` consecutive times before it becomes
+        active; ``advance=False`` only reads the currently active slot.
+        """
+        target = self._slot_bs_for(batch_size)
+        if self._active_slot_bs is None or self._bs_debounce <= 1:
+            self._active_slot_bs = target
+            return target
+        if target == self._active_slot_bs:
+            if advance:
+                # Any step back in the active slot resets the pending run.
+                self._pending_slot_bs = None
+                self._pending_slot_count = 0
+            return target
+        if advance:
+            if target == self._pending_slot_bs:
+                self._pending_slot_count += 1
+            else:
+                self._pending_slot_bs = target
+                self._pending_slot_count = 1
+            if self._pending_slot_count >= self._bs_debounce:
+                log_info_on_rank0(
+                    logger,
+                    f"Adaptive bs-slot switch: {self._active_slot_bs} -> {target} "
+                    f"after {self._pending_slot_count} consecutive decode steps",
+                )
+                self._active_slot_bs = target
+                self._pending_slot_bs = None
+                self._pending_slot_count = 0
+                return target
+        return self._active_slot_bs
 
     def _pad_to_cuda_graph_bs(self, batch_size: int) -> int:
         if self._cuda_graph_bs is None:
