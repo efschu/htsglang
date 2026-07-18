@@ -37,6 +37,7 @@ from sglang.srt.configs.qwen3_5 import (
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.utils import (
     attn_kv_replicated,
+    attn_q_partition_groups,
     attn_q_partition_units,
     tp_partition_size,
     tp_plan_active,
@@ -812,11 +813,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 self.total_num_kv_heads,
                 self.attn_tp_size,
             )
+            # kv-boundary alignment for the q split (task #116): THE single
+            # source shared by qkv_proj (q_shard_groups) and o_proj
+            # (tp_q_groups), so their per-rank q-head counts agree.
+            _q_groups = attn_q_partition_groups(
+                self.total_num_kv_heads, self.attn_tp_size
+            )
             self.num_heads = tp_partition_size(
                 self.total_num_heads,
                 self.attn_tp_size,
                 self.attn_tp_rank,
                 _q_units,
+                groups=_q_groups,
             )
             if self._kv_replicated:
                 self.num_kv_heads = self.total_num_kv_heads
@@ -851,6 +859,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                             self.attn_tp_size,
                             r,
                             _q_units,
+                            groups=_q_groups,
                         )
                         for r in range(self.attn_tp_size)
                     ],
@@ -871,6 +880,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             self._kv_replicated = False
             _q_units = self.total_num_kv_heads
+            _q_groups = None
             assert self.total_num_heads % self.attn_tp_size == 0
             self.num_heads = self.total_num_heads // self.attn_tp_size
             if self.total_num_kv_heads >= self.attn_tp_size:
@@ -880,6 +890,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
             self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
         self._attn_q_units = _q_units
+        self._attn_q_groups = _q_groups
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -929,6 +940,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             # the real q-head-based count is passed explicitly (ignored
             # in normal mode).
             q_shard_unit_count=self._attn_q_units,
+            # kv-boundary alignment (task #116): same source as o_proj below.
+            q_shard_groups=self._attn_q_groups,
         )
 
         self.o_proj = RowParallelLinear(
@@ -945,6 +958,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             # q-head units in REPLICATED-KV mode). Ignored on the default
             # path (no shard plan installed).
             tp_units=self._attn_q_units,
+            # kv-boundary alignment (task #116): SAME value as qkv q_shard_groups
+            # so the per-rank q-head split matches (mismatch mis-shards o_proj).
+            tp_q_groups=self._attn_q_groups,
         )
 
         self.attn = RadixAttention(

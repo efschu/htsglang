@@ -454,6 +454,141 @@ class TestRowParallelLinear(UnevenTPTestCase):
             )
 
 
+class TestReplicatedKvAlignedQKV(UnevenTPTestCase):
+    """REPLICATED-KV (TP > num_kv_heads) with a kv-boundary-aware q split
+    (task #116). Plan [1,1,1,3,2] raw-splits q=16/kv=2 into heads
+    [2,2,2,6,4] -- rank 3's 6 heads STRADDLE the global kv-group boundary
+    at head 8 (the #105 ragged kernel cannot represent it). The aligned
+    split repairs it to [4,2,2,4,4], and the qkv q block, o_proj input,
+    and their weight roundtrips must all agree on that split."""
+
+    HIDDEN = 8
+    HEAD = 4
+    Q_HEADS = 16
+    KV_HEADS = 2
+    TP5 = 5
+    PLAN5 = [1, 1, 1, 3, 2]  # raw q [2,2,2,6,4] straddles; aligned [4,2,2,4,4]
+    EXPECT_Q = [4, 2, 2, 4, 4]
+
+    def test_qkv_replicated_kv_aligned_roundtrip(self):
+        set_tp_partition_ratios(self.PLAN5)
+        full_q = _full(self.Q_HEADS * self.HEAD, self.HIDDEN)
+        full_k = _full(self.KV_HEADS * self.HEAD, self.HIDDEN, offset=10_000)
+        full_v = _full(self.KV_HEADS * self.HEAD, self.HIDDEN, offset=20_000)
+        qs, qheads = [], []
+        for rank in range(self.TP5):
+            layer = QKVParallelLinear(
+                self.HIDDEN,
+                self.HEAD,
+                self.Q_HEADS,
+                self.KV_HEADS,
+                bias=False,
+                params_dtype=FP,
+                tp_rank=rank,
+                tp_size=self.TP5,
+            )
+            # REPLICATED-KV: full kv on every rank, alignment engaged.
+            self.assertEqual(layer.num_kv_heads, self.KV_HEADS)
+            self.assertEqual(layer.tp_q_groups, self.KV_HEADS)
+            qheads.append(layer.num_heads)
+            layer.weight_loader(layer.weight, full_q, "q")
+            layer.weight_loader(layer.weight, full_k, "k")
+            layer.weight_loader(layer.weight, full_v, "v")
+            d = layer.weight.data
+            q_end = layer.num_heads * self.HEAD
+            k_end = q_end + layer.num_kv_heads * self.HEAD
+            qs.append(d[:q_end].clone())
+            # k/v are fully replicated -> each rank holds the WHOLE k/v.
+            self.assertTrue(torch.equal(d[q_end:k_end], full_k))
+            self.assertTrue(torch.equal(d[k_end:], full_v))
+        self.assertEqual(qheads, self.EXPECT_Q)  # repaired, NOT raw [2,2,2,6,4]
+        self.assertEqual(sum(qheads), self.Q_HEADS)
+        self.assertTrue(torch.equal(torch.cat(qs), full_q))
+
+    def test_o_proj_input_matches_qkv_q_split(self):
+        # Guardrail #2: the o_proj input width per rank must equal the qkv
+        # q width per rank (heads * head_dim), or o_proj is silently
+        # mis-sharded. Both derive groups from the SAME single source.
+        set_tp_partition_ratios(self.PLAN5)
+        in_dim = self.Q_HEADS * self.HEAD  # 64
+        full = _full(self.HIDDEN, in_dim)  # RowParallel shards along input (dim 1)
+        widths, parts = [], []
+        for rank in range(self.TP5):
+            layer = RowParallelLinear(
+                in_dim,
+                self.HIDDEN,
+                bias=False,
+                params_dtype=FP,
+                tp_rank=rank,
+                tp_size=self.TP5,
+                tp_units=self.Q_HEADS // self.KV_HEADS,  # 8
+                tp_q_groups=self.KV_HEADS,  # 2 (same source as qkv)
+            )
+            layer.weight_loader(layer.weight, full)
+            widths.append(layer.input_size_per_partition)
+            parts.append(layer.weight.data.clone())
+        self.assertEqual(widths, [h * self.HEAD for h in self.EXPECT_Q])
+        self.assertTrue(torch.equal(torch.cat(parts, dim=1), full))
+
+    def test_gguf_loader_q_shard_matches_aligned_init(self):
+        # Regression for the #116 GGUF bug: the QKV GGUF weight loader sizes
+        # the q rows via tp_partition_size(total_q_rows, tp, rank, tp_units,
+        # tp_family, tp_q_groups). If it omits groups it shards q with the RAW
+        # split while __init__ / the model forward use the ALIGNED split, so
+        # the materialized qkv width (raw) disagrees with the forward split
+        # (aligned) -> `qkv.split` sum mismatch at graph capture. Assert the
+        # loader's q-shard equals the aligned __init__ q block on every rank.
+        # Mirrors the fused q(+gate) block qwen3_5 builds (total_num_heads * 2).
+        from sglang.srt.distributed.utils import tp_partition_size
+
+        set_tp_partition_ratios(self.PLAN5)
+        gated_q_heads = self.Q_HEADS * 2  # attn_output_gate fuses q + gate
+        head_size = 8
+        q_rows = gated_q_heads * head_size  # total fused q_proj rows (all ranks)
+        for rank in range(self.TP5):
+            layer = QKVParallelLinear(
+                self.HIDDEN,
+                head_size,
+                gated_q_heads,
+                self.KV_HEADS,
+                bias=False,
+                params_dtype=FP,
+                tp_rank=rank,
+                tp_size=self.TP5,
+                q_shard_unit_count=self.Q_HEADS // self.KV_HEADS,  # 8 real q units
+                q_shard_groups=self.KV_HEADS,
+            )
+            gguf_q_shard = tp_partition_size(
+                q_rows,
+                self.TP5,
+                rank,
+                layer.tp_units,
+                layer.tp_family,
+                layer.tp_q_groups,
+            )
+            self.assertEqual(gguf_q_shard, layer.num_heads * layer.head_size)
+            # And it must be the ALIGNED width (rank order [4,2,2,4,4] real q
+            # -> fused-slot rows), never the raw [2,2,2,6,4].
+            self.assertEqual(gguf_q_shard, self.EXPECT_Q[rank] * 2 * head_size)
+
+    def test_guardrail_mismatched_q_shard_groups_raises(self):
+        # A future model wiring qkv/o_proj to DIFFERENT group values must
+        # fail loudly at construction (not silently mis-shard o_proj).
+        set_tp_partition_ratios(self.PLAN5)
+        with self.assertRaisesRegex(ValueError, "q_shard_groups"):
+            QKVParallelLinear(
+                self.HIDDEN,
+                self.HEAD,
+                self.Q_HEADS,
+                self.KV_HEADS,
+                bias=False,
+                params_dtype=FP,
+                tp_rank=0,
+                tp_size=self.TP5,
+                q_shard_groups=99,
+            )
+
+
 class TestParameterV2Loaders(UnevenTPTestCase):
     """Drive the parameter-class (weight_loader_v2) loaders directly."""
 
