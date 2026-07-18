@@ -841,6 +841,13 @@ class Envs:
     # driven by the verify-call counter, identical on all ranks). Overrides the
     # EMA decision; use to stress the offload swap path, never in production.
     SGLANG_ADAPTIVE_FORCE_SWAP_INTERVAL = EnvInt(0)
+    # Adaptive graph-memory offload: minimum free VRAM (MiB) that must remain
+    # AFTER mapping the largest candidate state, enforced at boot
+    # (finalize_boot). Covers eager-forward transient allocations (mamba
+    # chunked-prefill recompute etc.) that run while a state is mapped.
+    # Measured on the T102 rig: 148 MiB post-map free OOM'd at KV-full deep
+    # prefill, 1367 MiB survived; 512 is the enforced floor between them.
+    SGLANG_ADAPTIVE_SERVING_MARGIN_MIB = EnvInt(512)
     # Stage-2 graph-memory offload fallback: back the per-state CUDA-graph
     # capture pools up to host RAM on pause and restore the exact bytes on
     # resume, instead of relying on replay's rewrite-before-read property

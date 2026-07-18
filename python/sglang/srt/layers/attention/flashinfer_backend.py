@@ -408,7 +408,7 @@ def fast_prefill_plan(
     self._plan_info = self._cached_module.plan(*args)
 
 
-def _tag_adaptive_int_workspace(wrapper):
+def _tag_adaptive_int_workspace(wrapper, share_key=None):
     """Stage-2 adaptive graph-memory offload: swap *wrapper*'s 8 MiB int
     workspace for a state-private, pauseable one (via the public
     ``reset_workspace_buffer`` API, before the wrapper's first plan).
@@ -419,6 +419,19 @@ def _tag_adaptive_int_workspace(wrapper):
     contract is fresh-cudaMalloc zero pages (#50 note), which the
     zero-on-resume of noted tensors restores exactly. The pinned host
     staging buffer is untouched by pause/resume (host memory).
+
+    *share_key*: graph-mode wrappers are instantiated once PER CAPTURED
+    BATCH BUCKET, but within one (backend, role, wrapper-slot) only the
+    active bucket's wrapper is planned and replayed in any forward -- the
+    buckets are mutually exclusive, and each forward's plan rewrites the
+    workspace immediately before its graph reads it. All buckets of one
+    slot therefore share a single tagged workspace (keyed per state build),
+    cutting the per-state int-ws footprint ~4x (k5: 800 -> ~200 MiB), which
+    is what lets the high-accept set meet the serving-margin check at the
+    standard reserve. Wrappers that can be live in the same forward (init
+    wrappers of different roles, different draft steps = different backend
+    instances) must NOT share -- callers pass share_key=None or distinct
+    keys for those.
 
     No-op outside a Stage-2 adaptive build scope, so the static path and
     Stage-1 offload keep their historical resident int workspaces.
@@ -431,10 +444,20 @@ def _tag_adaptive_int_workspace(wrapper):
     nbytes = old.untyped_storage().nbytes()
     if nbytes < adaptive_graph_memory.MIN_TAGGED_BYTES:
         return wrapper
+    mgr = adaptive_graph_memory._ACTIVE_MANAGER
+    if share_key is not None:
+        shared = mgr.get_shared_state_tensor(share_key)
+        if shared is not None and shared.untyped_storage().nbytes() == nbytes:
+            wrapper.reset_workspace_buffer(
+                wrapper._float_workspace_buffer, shared
+            )
+            return wrapper
     with adaptive_graph_memory.tagged_state_alloc(nbytes=nbytes):
         new_int = torch.zeros_like(old)
     wrapper.reset_workspace_buffer(wrapper._float_workspace_buffer, new_int)
     adaptive_graph_memory.note_state_tensor(new_int, kind="int_ws")
+    if share_key is not None:
+        mgr.put_shared_state_tensor(share_key, new_int)
     return wrapper
 
 
@@ -1236,7 +1259,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
                     paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
                     paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
-                )
+                ),
+                share_key=("decode_cg", id(self), i),
             )
             for i in range(self.num_wrappers)
         ]
@@ -1269,7 +1293,8 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
                         **extra,
-                    )
+                    ),
+                    share_key=("prefill_cg", id(self), i, use_custom_mask),
                 )
             )
         return wrappers
@@ -1381,7 +1406,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     paged_kv_indptr_buf=self.full_cg_prefill_kv_indptr[i],
                     paged_kv_indices_buf=self.full_cg_prefill_kv_indices[i],
                     paged_kv_last_page_len_buf=self.kv_last_page_len[:num_slots],
-                )
+                ),
+                share_key=("full_cg_prefill", id(self), i),
             )
             for i in range(self.num_wrappers)
         ]
@@ -1434,7 +1460,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     qo_indptr_buf=qo_indptr_buf,
                     kv_indptr_buf=kv_indptr_buf,
                     backend=self._fmha_backend,
-                )
+                ),
+                share_key=("verify_ragged_cg", id(self)),
             )
             self.verify_ragged_cg_wrappers[bs] = wrapper
         return wrapper
