@@ -248,7 +248,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
     def test_default_config_loads(self):
         params = AdaptiveSpeculativeParams(initial_steps=3)
         self.assertEqual(params._bs_list, [1, 8, 32, 64])
-        self.assertEqual(params._slots[1].candidate_steps, [1, 3, 7])
+        self.assertEqual(params._slots[1].candidate_steps, [1, 2, 3])
         self.assertEqual(params._slots[8].candidate_steps, [0, 1, 3])
         self.assertEqual(params._slots[32].candidate_steps, [0, 1])
         self.assertEqual(params._slots[64].candidate_steps, [0])
@@ -343,14 +343,15 @@ class TestBatchSizeRouting(unittest.TestCase):
     """BS-aware routing: batch size selects the slot, CUDA-graph BS pads first."""
 
     def _params(self):
-        # Slots: bs=1 -> [1,3,7], bs=8 -> [1,3], bs=32 -> [1].
+        # Default slots: bs=1 -> [1,2,3], bs=8 -> [0,1,3], bs=32 -> [0,1],
+        # bs=64 -> [0].
         return AdaptiveSpeculativeParams(initial_steps=3)
 
     def test_routes_to_floor_slot_without_cuda_graph(self):
         params = self._params()
         # A batch maps to the largest slot BS <= batch (floor), capped at the top slot.
-        self.assertEqual(params._route(1).candidate_steps, [1, 3, 7])
-        self.assertEqual(params._route(7).candidate_steps, [1, 3, 7])
+        self.assertEqual(params._route(1).candidate_steps, [1, 2, 3])
+        self.assertEqual(params._route(7).candidate_steps, [1, 2, 3])
         self.assertEqual(params._route(8).candidate_steps, [0, 1, 3])
         self.assertEqual(params._route(31).candidate_steps, [0, 1, 3])
         self.assertEqual(params._route(32).candidate_steps, [0, 1])
@@ -373,14 +374,14 @@ class TestBatchSizeRouting(unittest.TestCase):
         self.assertEqual(params.cuda_graph_bs_for_step(1), [4, 8, 16, 32])
         # step=3 lives in the bs=1 and bs=8 slots: graphs 4,8,16 floor into them.
         self.assertEqual(params.cuda_graph_bs_for_step(3), [4, 8, 16])
-        # step=7 lives only in the bs=1 slot: only graph BS 4 floors into it.
-        self.assertEqual(params.cuda_graph_bs_for_step(7), [4])
+        # step=2 lives only in the bs=1 slot: only graph BS 4 floors into it.
+        self.assertEqual(params.cuda_graph_bs_for_step(2), [4])
 
     def test_cuda_graph_bs_for_step_returns_none_when_disabled(self):
         params = self._params()
-        self.assertIsNone(params.cuda_graph_bs_for_step(7))
+        self.assertIsNone(params.cuda_graph_bs_for_step(3))
         params.set_cuda_graph_bs(None)
-        self.assertIsNone(params.cuda_graph_bs_for_step(7))
+        self.assertIsNone(params.cuda_graph_bs_for_step(3))
 
     def test_observe_verify_feeds_the_routed_slot(self):
         params = self._params()
@@ -395,9 +396,9 @@ class TestBatchSizeRouting(unittest.TestCase):
 class TestResolveCandidateSteps(unittest.TestCase):
     def test_default_config(self):
         steps = resolve_candidate_steps_from_config()
-        self.assertIn(1, steps)
-        self.assertIn(3, steps)
-        self.assertIn(7, steps)
+        # Generic default union: step 0 (nospec, bs>=8 slots) plus the [1,2,3]
+        # ladder; the k=7 tier was removed (net-negative at accept p<=0.8).
+        self.assertEqual(steps, [0, 1, 2, 3])
 
     def test_config_file(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
