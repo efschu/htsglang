@@ -26,6 +26,25 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
         )
 
+    # Single-node hetero PD v1 (#99): speculative decoding is not supported in
+    # disaggregation mode on this fork -- the MTP/EAGLE draft KV pool is
+    # uneven-head-sharded (not DCP token-sharded), so its transfer would need
+    # general uneven head reslicing. Auto-disable with a warning rather than
+    # hard-erroring so shared launch configs keep working (design ruling).
+    if (
+        server_args.disaggregation_mode in ("prefill", "decode")
+        and server_args.speculative_algorithm is not None
+    ):
+        logger.warning(
+            "PD disaggregation: speculative decoding (--speculative-algorithm "
+            "%s) is not supported in disaggregation mode on this fork and has "
+            "been DISABLED for this server. Run without --disaggregation-mode "
+            "to use speculative decoding.",
+            server_args.speculative_algorithm,
+        )
+        server_args.speculative_algorithm = None
+        server_args.speculative_draft_model_path = None
+
     if server_args.disaggregation_mode == "decode":
         if server_args.disaggregation_decode_enable_radix_cache:
             if server_args.enable_hisparse:

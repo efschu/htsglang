@@ -1330,6 +1330,7 @@ class CommonKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
         decode_prefix_len: Optional[int] = None,
+        owned_ordinals: Optional[npt.NDArray[np.int32]] = None,
     ):
         raise NotImplementedError
 

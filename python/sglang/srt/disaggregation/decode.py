@@ -1093,6 +1093,45 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     .numpy()
                 )
 
+            # Fork DCP (uneven-TP replicated-kv + token-sharded pools): the
+            # allocator hands out GLOBAL logical slots, but this rank's KV pool
+            # only holds its COMPACT owned rows. Translate to owned-compact
+            # rows and record the owned ordinals so the prefill sender can
+            # filter each chunk's source rows (see TransferInfo.dst_owned_
+            # ordinals). Indexing the compact pool with raw global indices
+            # would corrupt other tokens' rows (cf. the HiCache translation).
+            owned_ordinals = None
+            from sglang.srt.distributed.utils import uneven_dcp_owner_bounds
+            from sglang.srt.runtime_context import get_parallel
+
+            _dcp_bounds = uneven_dcp_owner_bounds()
+            if _dcp_bounds is not None:
+                if self.scheduler.enable_hisparse:
+                    raise RuntimeError(
+                        "PD disaggregation with DCP token-sharded KV does not "
+                        "support hisparse."
+                    )
+                if page_size != 1:
+                    raise RuntimeError(
+                        "PD disaggregation with DCP token-sharded KV requires "
+                        f"page_size == 1, got {page_size}."
+                    )
+                _S, _lo, _hi = _dcp_bounds
+                _idx = kv_indices.astype(np.int64)
+                _mod = _idx % _S
+                _mask = (_mod >= _lo) & (_mod < _hi)
+                owned_ordinals = np.nonzero(_mask)[0].astype(np.int32)
+                kv_indices = (
+                    (_idx[_mask] // _S) * (_hi - _lo) + (_mod[_mask] - _lo)
+                ).astype(np.int32)
+            elif get_parallel().dcp_enabled:
+                raise RuntimeError(
+                    "PD disaggregation on a DCP decode server requires the "
+                    "uneven-TP replicated-KV layout (--rank-tp-ratio with "
+                    "dcp == tp). Stock head-sharded DCP receive is not "
+                    "supported."
+                )
+
             seq_len = origin_input_len
 
             def _mamba_payload():
@@ -1187,6 +1226,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.metadata_buffer_index,
                 state_indices,
                 decode_prefix_len=total_prefix_len,
+                owned_ordinals=owned_ordinals,
             )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(

@@ -4514,6 +4514,25 @@ class ServerArgs:
                 self.rank_tp_ratio,
             )
 
+        # PD disaggregation (#99): a decode server with an uneven-TP plan must
+        # run the DCP replicated-KV token-sharded layout (dcp == tp). Plain
+        # uneven head-sharded KV would need general uneven head reslicing in
+        # the transfer layer, which is not implemented. Checked here (not in
+        # the PD hook) because dcp_size is only final after the uneven-TP
+        # resolution above.
+        if (
+            self.disaggregation_mode == "decode"
+            and uneven_plan
+            and self.tp_size > 1
+            and self.dcp_size != self.tp_size
+        ):
+            raise ValueError(
+                "PD disaggregation on an uneven-TP decode server requires the "
+                "DCP replicated-KV layout: set SGLANG_UNEVEN_DCP=1 (or "
+                f"--dcp-size {self.tp_size}) so dcp_size == tp_size. Got "
+                f"dcp_size={self.dcp_size}, tp_size={self.tp_size}."
+            )
+
         self._handle_uneven_mlp_ratio()
 
     #: Shiftable weight families of the uneven-TP self-calibration:

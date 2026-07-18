@@ -76,6 +76,11 @@ class TransferInfo:
     required_dst_info_num: int
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
+    # Fork DCP (replicated kv-heads, token-sharded pools): the 0-based
+    # ordinals within the sent token range that this decode rank OWNS,
+    # parallel to dst_kv_indices (compact pool rows). None -> classic
+    # position-aligned full copy.
+    dst_owned_ordinals: Optional[npt.NDArray[np.int32]] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -104,6 +109,13 @@ class TransferInfo:
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),
+            # Flag byte b"O" disambiguates "ordinals mode with an EMPTY owned
+            # set" (b"O") from "no ordinals / legacy full copy" (b"").
+            dst_owned_ordinals=(
+                np.frombuffer(msg[9][1:], dtype=np.int32)
+                if len(msg) > 9 and msg[9][:1] == b"O"
+                else None
+            ),
         )
 
 
@@ -123,6 +135,10 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
+    # Uneven-TP (--rank-tp-ratio) mamba state: per-tensor slice START offsets
+    # (dim units) of the decode rank's shard, parallel to
+    # dst_state_dim_per_tensor. Empty -> uniform (rank * dim) legacy formula.
+    dst_state_dim_offsets: List[List[int]] = dataclasses.field(default_factory=list)
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -145,8 +161,11 @@ class KVArgsRegisterInfo:
             dst_state_dim_per_tensor=(
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
             ),
+            dst_state_dim_offsets=(
+                unpack_int_lists(msg[12], "I") if len(msg) > 12 else []
+            ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 12),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
         )
 
 
@@ -999,6 +1018,18 @@ class MooncakeKVManager(CommonKVManager):
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
                 ):
+                    dst_dim_offsets = (
+                        target_rank_registration_info.dst_state_dim_offsets[i]
+                        if i
+                        < len(
+                            getattr(
+                                target_rank_registration_info,
+                                "dst_state_dim_offsets",
+                                [],
+                            )
+                        )
+                        else []
+                    )
                     rc = (
                         self._send_mamba_state_slice(
                             req,
@@ -1012,6 +1043,7 @@ class MooncakeKVManager(CommonKVManager):
                             dst_dim_per_tensor,
                             target_rank_registration_info.dst_tp_rank,
                             target_rank_registration_info.dst_attn_tp_size,
+                            dst_state_dim_offsets=dst_dim_offsets,
                         )
                         or rc
                     )
@@ -1150,6 +1182,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_state_dim_per_tensor: list[int],
         dst_tp_rank: int,
         dst_attn_tp_size: int,
+        dst_state_dim_offsets: Optional[list] = None,
     ):
         """Transfer Mamba states with TP slice support.
 
@@ -1201,7 +1234,19 @@ class MooncakeKVManager(CommonKVManager):
                 dst_dim_start = local_writer_idx * src_dim
             else:
                 # 1 prefill rank sends to multiple decode ranks
-                src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
+                if dst_state_dim_offsets and i < len(dst_state_dim_offsets):
+                    # Uneven-TP (--rank-tp-ratio) shards: the decode rank's
+                    # slice starts at its registered prefix-sum offset, not at
+                    # rank * dim (which only holds for uniform shards).
+                    src_dim_start = int(dst_state_dim_offsets[i])
+                    if src_dim_start + dst_dim > src_dim:
+                        raise RuntimeError(
+                            "Uneven mamba state slice out of range: "
+                            f"offset={src_dim_start} + dst_dim={dst_dim} > "
+                            f"src_dim={src_dim} (tensor {i})"
+                        )
+                else:
+                    src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
                 num_dims_to_send = dst_dim
                 dst_dim_start = 0
 
@@ -1296,6 +1341,11 @@ class MooncakeKVManager(CommonKVManager):
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
+                # Snapshot before the per-req loop: the legacy page-size
+                # mismatch workaround trims kv_chunk.prefill_kv_indices
+                # IN-PLACE, which must not leak into other dst ranks'
+                # ordinal-filtered sends.
+                room_prefill_kv_indices = kv_chunk.prefill_kv_indices
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
@@ -1316,37 +1366,75 @@ class MooncakeKVManager(CommonKVManager):
                                 )
                                 break
 
-                        chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
-
-                        # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                        # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                        if len(chunked_dst_kv_indice) < len(
-                            kv_chunk.prefill_kv_indices
-                        ):
-                            logger.warning(
-                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
-                            )
-                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                : len(chunked_dst_kv_indice)
-                            ]
-
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        chunk_prefill_kv_indices = kv_chunk.prefill_kv_indices
+                        if req.dst_owned_ordinals is not None:
+                            # Fork DCP (replicated kv-heads, token-sharded
+                            # decode pools): the decode rank owns only a
+                            # subset of the token positions; dst_kv_indices
+                            # are its COMPACT pool rows, parallel to
+                            # dst_owned_ordinals. Filter this chunk's source
+                            # rows to the owned ordinals. Rows are
+                            # byte-identical on both sides (heads replicated),
+                            # so the equal-layout generic copy applies.
+                            if (
+                                self.kv_args.kv_item_lens
+                                and target_rank_registration_info.dst_kv_item_len
+                                != self.kv_args.kv_item_lens[0]
+                            ):
+                                raise RuntimeError(
+                                    "PD DCP token-sharded transfer requires "
+                                    "identical per-row KV layout on prefill and "
+                                    "decode (replicated kv-heads). Got prefill "
+                                    f"item_len={self.kv_args.kv_item_lens[0]}, "
+                                    f"decode item_len="
+                                    f"{target_rank_registration_info.dst_kv_item_len}."
+                                )
+                            s = kv_chunk.index_slice.start or 0
+                            e = kv_chunk.index_slice.stop
+                            ordinals = req.dst_owned_ordinals
+                            in_chunk = (ordinals >= s) & (ordinals < e)
+                            chunk_prefill_kv_indices = room_prefill_kv_indices[
+                                ordinals[in_chunk] - s
+                            ]
+                            chunked_dst_kv_indice = req.dst_kv_indices[in_chunk]
+                        else:
+                            chunked_dst_kv_indice = req.dst_kv_indices[
+                                kv_chunk.index_slice
+                            ]
+
+                            # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
+                            # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                            if len(chunked_dst_kv_indice) < len(
+                                kv_chunk.prefill_kv_indices
+                            ):
+                                logger.warning(
+                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                                )
+                                # Keep the historical in-place trim: the staging
+                                # path reads kv_chunk.prefill_kv_indices directly.
+                                kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
+                                    : len(chunked_dst_kv_indice)
+                                ]
+                                chunk_prefill_kv_indices = kv_chunk.prefill_kv_indices
+
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
-                        if len(kv_chunk.prefill_kv_indices) == 0 or skip_kv:
+                        if len(chunk_prefill_kv_indices) == 0 or skip_kv:
                             ret = 0
                         elif (
-                            self.is_mla_backend
+                            req.dst_owned_ordinals is not None
+                            or self.is_mla_backend
                             or self.is_hybrid_mla_backend
                             or self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
+                                chunk_prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 executor,
@@ -1373,7 +1461,7 @@ class MooncakeKVManager(CommonKVManager):
                         else:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
+                                chunk_prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
                                 target_rank_registration_info.dst_tp_rank,
@@ -1877,6 +1965,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_dim_per_tensor = pack_int_lists(
                 getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
             )
+            packed_state_dim_offsets = pack_int_lists(
+                getattr(self.kv_mgr.kv_args, "state_dim_offsets", []) or [], "I"
+            )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
@@ -1910,6 +2001,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_kv_item_len,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
+                        packed_state_dim_offsets,
                         packed_staging_base_ptr,
                         staging_total_size_str,
                     ]
@@ -1921,6 +2013,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        owned_ordinals: Optional[npt.NDArray[np.int32]] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -1959,6 +2052,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
                         str(decode_prefix_len or 0).encode("ascii"),
+                        (
+                            b"O" + owned_ordinals.astype(np.int32).tobytes()
+                            if not is_dummy and owned_ordinals is not None
+                            else b""
+                        ),
                     ]
                 )
         self.init_time = time.time()
