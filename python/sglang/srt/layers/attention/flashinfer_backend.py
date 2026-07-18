@@ -1668,6 +1668,51 @@ class FlashInferAttnBackend(AttentionBackend):
         o = cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
         return o.reshape(-1, layer.tp_q_head_num * layer.head_dim).to(q.dtype)
 
+    def _replicated_kv_ragged_reindex(self, local_q, local_kv, device):
+        """REPLICATED-KV geometry (#105): map each of this rank's LOCAL kv
+        slots to the GLOBAL kv head that its q group attends, so a uniform-GQA
+        ragged kernel (gqa_local = local_q // local_kv) reproduces the GLOBAL
+        q->kv mapping (gqa_global = total_q // total_kv).
+
+        Returns a LongTensor of length local_kv to gather k/v heads with, or
+        None when the mapping is already the identity [0,1,...] (no reindex
+        needed). Cached per (local_q, local_kv) -- constant across layers and
+        forwards for a given rank. Fails fast if this rank's q heads straddle a
+        global kv-head boundary within one local slot (the uniform-GQA kernel
+        cannot represent it -- pick a --rank-tp-ratio whose q-unit boundaries
+        align with kv-head boundaries)."""
+        cache = getattr(self, "_repl_kv_reindex_cache", None)
+        if cache is None:
+            cache = self._repl_kv_reindex_cache = {}
+        key = (local_q, local_kv)
+        if key in cache:
+            return cache[key]
+        q_off = sum(self.dcp_q_head_counts[: self.dcp_rank])
+        global_gqa = self.dcp_full_qo_heads // self.dcp_full_kv_heads
+        local_gqa = local_q // local_kv
+        idx = []
+        for m in range(local_kv):
+            lo = q_off + m * local_gqa
+            hi = q_off + (m + 1) * local_gqa - 1
+            g = lo // global_gqa
+            if hi // global_gqa != g:
+                raise ValueError(
+                    f"REPLICATED-KV current-chunk attention (#105): this rank's "
+                    f"q heads (offset {q_off}, {local_q} heads over {local_kv} "
+                    f"local kv slots) straddle a global kv-head boundary "
+                    f"(global GQA group size {global_gqa}); the uniform-GQA "
+                    f"ragged kernel cannot represent this split. Choose a "
+                    f"--rank-tp-ratio whose q-unit boundaries align with "
+                    f"kv-head boundaries."
+                )
+            idx.append(g)
+        if idx == list(range(local_kv)):
+            cache[key] = None
+            return None
+        t = torch.tensor(idx, device=device, dtype=torch.long)
+        cache[key] = t
+        return t
+
     def _forward_extend_dcp(
         self,
         q,
@@ -1699,10 +1744,30 @@ class FlashInferAttnBackend(AttentionBackend):
         #    active_ragged_wrapper: under a captured verify graph this is the
         #    per-bucket graph-mode wrapper (fixed indptr buffers) -- the shared
         #    non-graph wrapper's transient plan tensors are NOT replay-safe.
+        k_cur = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+        v_cur = v.view(-1, layer.tp_v_head_num, layer.head_dim)
+        # REPLICATED-KV (TP > num_kv_heads, #105): this rank holds only a q-head
+        # SLICE but ALL kv heads (replicated). flashinfer derives the ragged
+        # GQA grouping from the LOCAL counts (gqa_local = local_q // local_kv),
+        # which maps q heads to kv heads differently from the GLOBAL grouping
+        # (gqa_global = total_q // total_kv) whenever this rank does not hold
+        # every q head of its kv head(s). Re-index the local kv slots so each
+        # carries the GLOBAL kv head its q group actually attends. (8q/2kv over
+        # [4,2,2]: rank0 held q0-3 -- all -> kv0 globally -- but gqa_local=2 sent
+        # q2-3 to kv1, corrupting short-prompt / first-chunk generation while the
+        # gathered-q paged prefix/decode path stayed correct.) No-op reindex on
+        # the aligned single-kv-head-per-rank case reduces to identity.
+        if self.dcp_kv_replicated_heads:
+            _kv_idx = self._replicated_kv_ragged_reindex(
+                layer.tp_q_head_num, layer.tp_k_head_num, k.device
+            )
+            if _kv_idx is not None:
+                k_cur = k_cur[:, _kv_idx, :]
+                v_cur = v_cur[:, _kv_idx, :]
         o_cur, lse_cur = self.active_ragged_wrapper.forward_return_lse(
             q_local,
-            k.view(-1, layer.tp_k_head_num, layer.head_dim),
-            v.view(-1, layer.tp_v_head_num, layer.head_dim),
+            k_cur,
+            v_cur,
             causal=causal,
             sm_scale=layer.scaling,
             logits_soft_cap=logits_soft_cap,
