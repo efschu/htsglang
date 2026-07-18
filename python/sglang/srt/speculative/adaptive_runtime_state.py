@@ -43,6 +43,81 @@ class SpecRuntimeState:
     cuda_graph_runner_for_draft_extend: "EAGLEDraftExtendCudaGraphRunner | None"
 
 
+_WORKSPACE_ATTRS = ("workspace_buffer", "full_cg_prefill_workspace_buffer")
+
+
+def _iter_state_backends(state: SpecRuntimeState):
+    """Yield (role, backend) for every attention backend of *state*,
+    unwrapping hybrid prefill/decode wrappers into their leaf backends."""
+    stack = [
+        (role, backend)
+        for role, backend in (
+            ("draft", state.draft_attn_backend),
+            ("target", state.target_attn_backend),
+            ("draft_extend", state.draft_extend_attn_backend),
+        )
+        if backend is not None
+    ]
+    while stack:
+        role, backend = stack.pop()
+        yield role, backend
+        for attr in ("prefill_backend", "decode_backend"):
+            inner = getattr(backend, attr, None)
+            if inner is not None:
+                stack.append((f"{role}.{attr}", inner))
+
+
+def _workspace_ptrs(backend) -> list[tuple[str, int]]:
+    """(attr, data_ptr) of every flashinfer-style workspace buffer on *backend*."""
+    out = []
+    for attr in _WORKSPACE_ATTRS:
+        buf = getattr(backend, attr, None)
+        data_ptr = getattr(buf, "data_ptr", None)
+        if callable(data_ptr):
+            out.append((attr, data_ptr()))
+    return out
+
+
+def assert_runtime_state_isolation(states: dict[int, "SpecRuntimeState"]) -> None:
+    """Enforce the M16/#50 invariant: adaptive runtime states must not share
+    attention backends or flashinfer workspaces WITH EACH OTHER.
+
+    Each state's CUDA graphs were captured against that state's backend
+    graph-state buffers and flashinfer workspace/plan. A backend (or its
+    workspace buffer) reachable from two different states means an earlier
+    captured graph replays against buffers that another state re-plans or
+    overwrites — the stale-pointer / shared-workspace corruption class behind
+    M16 and the #50 hetero-spec divergence. Sharing WITHIN one state is
+    allowed (the registered static/initial state legitimately aliases the
+    process-global workspace across its own backends).
+    """
+    seen_backend: dict[int, tuple[int, str]] = {}
+    seen_ws: dict[int, tuple[int, str, str]] = {}
+    for steps, state in sorted(states.items()):
+        for role, backend in _iter_state_backends(state):
+            prev = seen_backend.get(id(backend))
+            if prev is not None and prev[0] != steps:
+                raise RuntimeError(
+                    "Adaptive runtime state isolation violated: attention "
+                    f"backend shared between states steps={prev[0]} ({prev[1]}) "
+                    f"and steps={steps} ({role}). Each state must build its own "
+                    "backends (init_new_workspace=True); see M16/#50."
+                )
+            seen_backend[id(backend)] = (steps, role)
+            for attr, ptr in _workspace_ptrs(backend):
+                prev_ws = seen_ws.get(ptr)
+                if prev_ws is not None and prev_ws[0] != steps:
+                    raise RuntimeError(
+                        "Adaptive runtime state isolation violated: flashinfer "
+                        f"workspace shared between states steps={prev_ws[0]} "
+                        f"({prev_ws[1]}.{prev_ws[2]}) and steps={steps} "
+                        f"({role}.{attr}) at data_ptr 0x{ptr:x}. Captured "
+                        "graphs of one state would replay against a workspace "
+                        "another state plans into; see M16/#50."
+                    )
+                seen_ws[ptr] = (steps, role, attr)
+
+
 class AdaptiveSpecWorker(Protocol):
     """Protocol that a worker must implement to use AdaptiveController."""
 
@@ -113,6 +188,11 @@ class AdaptiveController:
             )
             self._states[steps] = state
 
+        # Enforced M16/#50 invariant: no backend or flashinfer workspace may
+        # be reachable from two different runtime states (each state's graphs
+        # were captured against its own buffers/plans).
+        assert_runtime_state_isolation(self._states)
+
         # Start on the initial step.
         self._activate(self.worker.speculative_num_steps)
 
@@ -124,7 +204,17 @@ class AdaptiveController:
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> None:
-        """Feed verify results; switch runtime state if EMA warrants it."""
+        """Feed verify results; switch runtime state if EMA warrants it.
+
+        DETERMINISM INVARIANT (#50): *num_correct_drafts_per_req* MUST derive
+        from the rank-0-broadcast accept counts (``result.accept_lens``, whose
+        source tensor ``num_correct_drafts`` is broadcast from src=0 in
+        ``eagle_utils.eagle_sample``) — never from a locally computed per-rank
+        statistic. Together with *batch_size* (identical on all ranks) this
+        keeps the step decision a pure function of rank-invariant inputs, so
+        every TP/DCP rank swaps to the same graph on the same decode step.
+        Guarded by the AST ratchet in test_draft_pick_rank_sync.py.
+        """
         new_step = self.params.on_verify_complete(
             num_correct_drafts_per_req, batch_size
         )
