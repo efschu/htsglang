@@ -133,6 +133,7 @@ The config file is optional. Any omitted keys use defaults.
 | `warmup_batches` | `10` | Number of verify batches to observe before switching |
 | `down_hysteresis` | `-0.25` | Extra margin before moving to a smaller step |
 | `up_hysteresis` | `0.0` | Extra margin before moving to a larger step |
+| `bs_debounce` | `3` | Top-level key. Consecutive decode steps a batch size must route to a different BS slot before the slot switches (bs-axis anti-flapping; `1` = switch instantly) |
 
 The initial `--speculative-num-steps` is snapped to the nearest value in `candidate_steps`.
 
