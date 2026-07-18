@@ -376,6 +376,9 @@ class MambaPool:
         temporal_state_shape = cache_params.shape.temporal
         conv_dtype = cache_params.dtype.conv
         ssm_dtype = cache_params.dtype.temporal
+        # Kept for PD disaggregation: uneven-TP state slice offsets need the
+        # unsharded totals + the partition unit family (get_state_dim_offsets).
+        self.cache_params = cache_params
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -888,6 +891,59 @@ class MambaPool:
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
+
+    def get_state_dim_offsets(self):
+        """Per-tensor start offset (in dim-2 units) of THIS rank's slice within
+        the unsharded state, element-wise parallel to get_state_dim_per_tensor.
+
+        Needed by PD disaggregation when prefill and decode run different
+        attn_tp_size under an uneven-TP (--rank-tp-ratio) plan: the generic
+        `(rank * dim) % src_dim` formula in the transfer layer only holds for
+        uniform shards. Returns None when no uneven plan is active (the caller
+        then keeps the legacy uniform formula) or when the shape does not carry
+        the partition metadata (non-Mamba2 linear-state families).
+        """
+        from sglang.srt.distributed.utils import tp_partition_size, tp_plan_active
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        tp_size = parallel.attn_tp_size
+        if not tp_plan_active(tp_size):
+            return None
+        shape = getattr(self.cache_params, "shape", None)
+        units = getattr(shape, "partition_units", None)
+        conv_dim_total = getattr(shape, "conv_dim", None)
+        num_heads_total = getattr(shape, "num_heads", None)
+        if units is None or conv_dim_total is None or num_heads_total is None:
+            return None
+        rank = parallel.attn_tp_rank
+
+        def _offset(total: int) -> int:
+            return sum(
+                tp_partition_size(total, tp_size, r, units) for r in range(rank)
+            )
+
+        conv_offset = _offset(conv_dim_total)
+        temporal_offset = _offset(num_heads_total)
+
+        offsets = []
+        for field in vars(self.mamba_cache):
+            if field in (
+                "intermediate_ssm",
+                "intermediate_conv_window",
+                "replayssm_d",
+                "replayssm_k",
+                "replayssm_g",
+            ):
+                continue
+            value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
+            is_conv = "conv" in field
+            n_tensors = len(value) if isinstance(value, list) else 1
+            per_tensor = conv_offset if is_conv else temporal_offset
+            offsets += [per_tensor] * (n_tensors * self.num_mamba_layers)
+        return offsets
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -2751,6 +2807,11 @@ class HybridLinearKVPool(KVCache):
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_dim_offsets(self):
+        """Uneven-TP slice start offsets, parallel to get_state_dim_per_tensor
+        (None when no uneven plan is active). See MambaPool.get_state_dim_offsets."""
+        return self.mamba_pool.get_state_dim_offsets()
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()

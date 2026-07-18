@@ -644,6 +644,7 @@ def append_state_component(
     data_lens: List[int],
     item_lens: List[int],
     dim_per_tensor: Optional[List[int]] = None,
+    dim_offsets: Optional[List[int]] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
@@ -652,6 +653,11 @@ def append_state_component(
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
+    # Keep the offsets list parallel to state_types even when only some
+    # components carry offsets (uneven-TP mamba state slices, see KVArgs).
+    while len(kv_args.state_dim_offsets) < len(kv_args.state_types) - 1:
+        kv_args.state_dim_offsets.append([])
+    kv_args.state_dim_offsets.append(dim_offsets or [])
 
 
 def setup_state_kv_args(
@@ -680,6 +686,7 @@ def setup_state_kv_args(
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
+    kv_args.state_dim_offsets = []
     kv_args.is_hybrid_mla_backend = False
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
@@ -734,11 +741,22 @@ def setup_state_kv_args(
                 if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")
                 else None
             )
+            dim_offsets = (
+                token_to_kv_pool.get_state_dim_offsets()
+                if hasattr(token_to_kv_pool, "get_state_dim_offsets")
+                else None
+            )
             kv_args.is_hybrid_mla_backend = is_mla_backend(
                 token_to_kv_pool.full_kv_pool
             )
             append_state_component(
-                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+                kv_args,
+                StateType.MAMBA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                dim,
+                dim_offsets,
             )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
@@ -850,8 +868,19 @@ def setup_state_kv_args(
                 if hasattr(req_to_token_pool, "get_state_dim_per_tensor")
                 else None
             )
+            dim_offsets = (
+                req_to_token_pool.get_state_dim_offsets()
+                if hasattr(req_to_token_pool, "get_state_dim_offsets")
+                else None
+            )
             append_state_component(
-                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+                kv_args,
+                StateType.MAMBA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                dim,
+                dim_offsets,
             )
 
 

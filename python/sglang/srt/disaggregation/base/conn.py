@@ -49,6 +49,11 @@ class KVArgs:
     state_item_lens: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
+    # Per-tensor slice START offset (in dim units) of this rank's shard within
+    # the unsharded state. Only populated on decode under an uneven-TP
+    # (--rank-tp-ratio) plan, where `(rank * dim) % src_dim` is wrong; parallel
+    # to state_dim_per_tensor. Empty lists -> uniform legacy formula.
+    state_dim_offsets: List[List[int]]
     is_hybrid_mla_backend: bool
     ib_device: str
     ib_traffic_class: str
@@ -185,9 +190,16 @@ class BaseKVReceiver(ABC):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        owned_ordinals: Optional[npt.NDArray[np.int32]] = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.
+
+        ``owned_ordinals``: when the decode side token-shards its KV pool
+        (fork DCP with replicated kv-heads), the ordinals (0-based positions
+        within the sent token range) that THIS rank owns, parallel to
+        ``kv_indices`` (which are then this rank's compact pool rows). The
+        prefill sender uses them to filter each chunk's source rows.
         """
         ...
 

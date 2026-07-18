@@ -199,6 +199,11 @@ class Mamba2StateShape:
     # GDN kernels infer from `mixed_qkv`). Used by the GDN ReplaySSM ring
     # buffer (k_cache) to size/stride exactly like the kernel expects.
     num_k_heads_per_tp: int = 1
+    # Unit family the uneven-TP (--rank-tp-ratio) partition was computed in
+    # (see tp_partition_size); None on the classic even-divide path. Kept so
+    # PD disaggregation can recompute every rank's dim slice offsets
+    # (prefix sums over tp_partition_size) for uneven state transfer.
+    partition_units: Optional[int] = None
 
     @staticmethod
     def create(
@@ -250,6 +255,7 @@ class Mamba2StateShape:
                 state_size=state_size,
                 conv_kernel=conv_kernel,
                 num_k_heads_per_tp=num_k_heads_per_tp,
+                partition_units=units,
             )
         # The q/k projections are sharded by `num_k_heads // tp` heads (the
         # ORIGINAL n_groups, before the conv head-shard extension below), so the

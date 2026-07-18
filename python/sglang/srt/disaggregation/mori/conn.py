@@ -1694,7 +1694,13 @@ class MoriKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        owned_ordinals=None,
     ):
+        if owned_ordinals is not None:
+            raise NotImplementedError(
+                "DCP token-sharded PD transfer (owned_ordinals) is only "
+                "supported by the mooncake backend."
+            )
         if self.bootstrap_infos is None or self.bootstrap_room is None:
             return
 

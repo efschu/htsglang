@@ -2506,7 +2506,13 @@ class NixlKVReceiver(CommonKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
+        owned_ordinals=None,
     ):
+        if owned_ordinals is not None:
+            raise NotImplementedError(
+                "DCP token-sharded PD transfer (owned_ordinals) is only "
+                "supported by the mooncake backend."
+            )
         if self.bootstrap_infos is None:
             logger.error(
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
