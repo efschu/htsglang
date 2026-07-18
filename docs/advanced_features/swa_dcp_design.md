@@ -48,6 +48,23 @@ Touched files: `server_args.py` (flag + validation),
 `pool_configurator.py` (`is_applicable` cap route + factory no-effect
 warning), `model_runner_kv_cache_mixin.py` (#90 cap `full_need` branch).
 
+### Stage-A measured results (2026-07-18, full tables in job tmp t91/)
+
+Gemma4-31B TP=3 uneven, ctx 65536, 4 reqs: ratio (today) 42,856 total
+tokens (memory-limited, 47.6k-token input rejected) -> cap mode
+**262,160** (#90 reachability cap binds; profiled memory ceiling 388,157;
+5.22 GB min free) = **6.1x served capacity**; the estimate in section 5
+(~3.7-4x) was conservative — measured swa decoupling freed more than
+modeled. Needle at 50,168 prompt tokens retrieved on both cap boots
+(baseline rejects it); sizing deterministic line-for-line across 2 boots;
+temp-0 outputs bit-identical to the ratio oracle; shallow decode 19.4
+tok/s in both modes. Regressions byte-identical: gemma TP=3 ratio @8k
+(32784/26227 = #90 values), TP=1 fp8 (26767/21413), Qwen3.6-27B
+weighted-DCP (443,904, vector [30,17,17], hint 563,456 = T88 reference).
+The Stage-B descope criterion re-check: with the #90 cap now binding at
+4 x ctx and ~5 GB min free, the stranded-VRAM gap is SMALLER than the
+section-5 estimate — Stage B stays descoped.
+
 ## 1. Problem
 
 The fork's uneven DCP (weighted KV token-sharding: owner rule per virtual
