@@ -20,8 +20,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
+    # Candidate ceiling is 3 (not 7): with per-position accept p <= 0.8 the
+    # expected accepted chain length is sum_{i=1..k} p^i, so k=3 -> k=7 buys
+    # < 1 extra accepted token for 4 extra draft forwards (net-negative), and
+    # every extra candidate step costs a fully pre-captured graph set of VRAM.
+    # Users with p >~ 0.85 workloads can raise the ceiling via
+    # --speculative-adaptive-config.
     "1": {
-        "candidate_steps": [1, 3, 7],
+        "candidate_steps": [1, 2, 3],
         "up_hysteresis": 0.0,
         "down_hysteresis": -0.25,
         "ceiling_coeff": 0,
@@ -163,7 +169,7 @@ def _load_adaptive_config(
     if not bs_entries:
         raise ValueError(
             "speculative_adaptive_config must contain at least one integer-string "
-            'BS key, e.g. {"1": {"candidate_steps": [1,3,7]}}. '
+            'BS key, e.g. {"1": {"candidate_steps": [1,2,3]}}. '
             f"Got keys: {list(cfg.keys())}"
         )
     return cfg, bs_entries

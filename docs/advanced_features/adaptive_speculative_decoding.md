@@ -26,7 +26,7 @@ The adaptive mechanism has three pieces:
 - `SpecRuntimeState`: the per-tier runtime state bundle
 - `AdaptiveController`: the coordinator that chooses a tier and activates the matching runtime state
 
-At startup, SGLang pre-builds one runtime state per candidate tier. By default, the candidate tiers are `candidate_steps = [1, 3, 7]`.
+At startup, SGLang pre-builds one runtime state per candidate tier. By default, the candidate tiers are `candidate_steps = [1, 2, 3]` (bs=1 slot; the ceiling is 3 because at per-position accept p<=0.8, steps beyond 3 buy less than one extra accepted token for several extra draft forwards).
 
 ```text
 ┌──────────────────────────────────────────────────────────┐
@@ -77,7 +77,7 @@ The adaptive update happens after verify and affects the next round, not the cur
 
 ## How the policy decides
 
-After each verify pass, SGLang reads the accepted draft length per request, computes the batch average, smooths it with an exponential moving average (EMA), and switches among the pre-built candidate tiers `[1, 3, 7]` by default.
+After each verify pass, SGLang reads the accepted draft length per request, computes the batch average, smooths it with an exponential moving average (EMA), and switches among the pre-built candidate tiers `[1, 2, 3]` by default.
 
 The decision logic is intentionally conservative:
 
@@ -114,7 +114,7 @@ Example config:
 
 ```json
 {
-  "candidate_steps": [1, 3, 7],
+  "candidate_steps": [1, 2, 3],
   "ema_alpha": 0.2,
   "warmup_batches": 10,
   "update_interval": 5
@@ -127,7 +127,7 @@ The config file is optional. Any omitted keys use defaults.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `candidate_steps` | `[1, 3, 7]` | Discrete `speculative_num_steps` tiers that adaptive mode can switch between |
+| `candidate_steps` | `[1, 2, 3]` | Discrete `speculative_num_steps` tiers that adaptive mode can switch between |
 | `ema_alpha` | `0.2` | EMA smoothing factor for accepted draft length |
 | `update_interval` | `5` | Recompute interval, in verify batches, after warmup |
 | `warmup_batches` | `10` | Number of verify batches to observe before switching |
@@ -149,7 +149,7 @@ curl -s http://127.0.0.1:30000/server_info | jq '.internal_states[0] | {speculat
 
 ## Tuning tips
 
-- Start with the default candidate tiers `[1, 3, 7]`
+- Start with the default candidate tiers `[1, 2, 3]`
 - Use fewer tiers if you want lower startup and graph-memory overhead
 - Increase `ema_alpha` to react faster, or lower it for more stability
 - Increase `warmup_batches` or `update_interval` if tier switching is too noisy
