@@ -303,13 +303,35 @@ wins outright at all measured lengths.
   prealloc owned-count, staging pipeline to the 3080s. Prefill TP=1 →
   decode TP=3+DCP. Oracle: temp-0 == non-disagg TP=3+DCP oracle; needle at
   32k/80k; kv-canary if available.
-- **M3** — hybrid E2E hardening + perf: GDN uneven state slice, mamba-radix
-  acceptance, coexistence budgets on the 5090, contention measurement.
-  Deliverable: TTFT/prefill table (2k/8k/32k/120k) vs the M0 baseline —
-  target: beat 39.4 s/120k by >2x (expectation ~2.5x, i.e. ~16 s) and the
-  historical 177 s by >10x; short-prompt TTFT must NOT regress vs baseline
-  (ruling 3a — else add length-threshold routing); decode tok/s within
-  noise of non-disagg.
+- **M3** — PARTIAL (2026-07-18): two real fixes landed, two blockers filed.
+  * FIXED: the uneven-budget memory profiler double-charged co-resident
+    FOREIGN processes (`_profile_available_bytes`: the legacy
+    `pre_load*(1-frac)` slack assumes a fresh GPU). Now delta-based
+    absolute-budget accounting under `--rank-gpu-memory-mib` —
+    co-residency-proof (a static sibling cancels in the delta).
+  * FIXED (ops): decode rank0's fixed 384 MiB flashinfer workspace via
+    `SGLANG_FLASHINFER_WORKSPACE_SIZE=134217728`. With both fixes the full
+    pair reached coexistence on the 5090: 31.99/32.6 GB (prefill 25.6 +
+    decode rank0 6.4), decode up, per-rank pools sized correctly.
+  * BLOCKER 1: the disagg-prefill scheduler admits only ~pool/4 tokens
+    (usage 1.00 at 32.7k of a 131,080-row pool; `#pending-token` never
+    decrements as chunks convert — the prompt is effectively
+    double-reserved, plus a further 2x). First item for the follow-up.
+  * BLOCKER 2: prefill budget overshoot: AWQ/marlin load transients stay in
+    the torch cache (charged by the delta at profile time — fix:
+    `torch.cuda.empty_cache()` before profiling) and ~1.5-2.5 GB of
+    flashinfer/JIT buffers allocate lazily on the FIRST real request
+    (crashed a boot-time-coexistent pair — fix: eager warm via the
+    fake-bootstrap path, `bootstrap_host=2.2.2.2`, before decode boots).
+  * Fixed-cost accounting (5090, torch-visible 31.34 GiB): warmed prefill =
+    19.7 weights + ~2.6 JIT/workspaces + pools + ~0.6 ctx; decode rank0
+    ~6.4 → pool window ~1.4 GB, which Blocker 1 shrinks 4x. Fix Blocker 1
+    first; then the 32k+ static table is straightforward.
+  * Perf signal: the co-resident solo prefill sustains **~25,000 tok/s per
+    2048-chunk** (fake-path warm, from the batch log).
+  * Remaining for follow-up: TTFT/perf table (target: beat 39.4 s/120k by
+    >2x; short-prompt TTFT gate per ruling 3a), contention measurement,
+    mamba-radix acceptance.
 - **M4** — regression: disagg OFF byte-identical on the reference launch
   commands; teardown hygiene per ruling 3b — both servers stopped leaves
   every GPU at 0 MiB, AND a hard-kill (SIGKILL) of the prefill server

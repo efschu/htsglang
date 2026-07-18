@@ -167,17 +167,44 @@ class ModelRunnerKVCacheMixin:
         # default / even-TP / one-rank-per-GPU paths).
         available_gpu_memory += self._colocated_sibling_reserved_gb()
 
-        slack_gb = pre_model_load_memory * (1 - self.mem_fraction_static)
-        if self.mambaish_config is not None and self.post_capture_kv_active:
-            # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
-            slack_gb = max(
-                slack_gb,
-                self.server_args.mamba_pre_capture_reserve_mb(
-                    get_device_memory_capacity(self.device)
+        if uneven_memory:
+            # Absolute-budget accounting (PD disagg #99): --rank-gpu-memory-mib
+            # is an ABSOLUTE per-rank allowance, so the KV budget is simply
+            #   budget - (memory this rank consumed since the pre-load reading).
+            # The legacy formula below charges pre_model_load * (1 - fraction)
+            # as slack, which silently assumes pre_model_load ~= device total
+            # (a fresh GPU). With a co-resident FOREIGN process (single-node
+            # PD disaggregation: the prefill server shares the big GPU with a
+            # decode rank), pre-load free memory is already reduced by that
+            # process, and the slack double-charges it -- rest went several GB
+            # negative on a rank whose budget was fully available. The
+            # before/after DELTA is immune: a static co-resident process
+            # appears in both readings and cancels out.
+            mib = self.server_args.rank_gpu_memory_mib
+            budget_gb = (
+                mib if isinstance(mib, (int, float)) else mib[self.tp_rank]
+            ) / 1024.0
+            used_by_me_gb = pre_model_load_memory - available_gpu_memory
+            rest_memory = budget_gb - used_by_me_gb
+            if self.mambaish_config is not None and self.post_capture_kv_active:
+                rest_memory -= (
+                    self.server_args.mamba_pre_capture_reserve_mb(
+                        get_device_memory_capacity(self.device)
+                    )
+                    / 1024
                 )
-                / 1024,
-            )
-        rest_memory = available_gpu_memory - slack_gb
+        else:
+            slack_gb = pre_model_load_memory * (1 - self.mem_fraction_static)
+            if self.mambaish_config is not None and self.post_capture_kv_active:
+                # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
+                slack_gb = max(
+                    slack_gb,
+                    self.server_args.mamba_pre_capture_reserve_mb(
+                        get_device_memory_capacity(self.device)
+                    )
+                    / 1024,
+                )
+            rest_memory = available_gpu_memory - slack_gb
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
