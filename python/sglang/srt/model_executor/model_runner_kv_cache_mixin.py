@@ -1812,13 +1812,91 @@ class ModelRunnerKVCacheMixin:
         extra = get_req_to_token_extra_context_len(sa)
         return int(concurrency) * (int(ctx) + int(extra))
 
+    def _swa_hybrid_kv_token_cap(self: ModelRunner) -> Optional[int]:
+        """Physically reachable ceiling on max_total_num_tokens for hybrid
+        SWA + global-attention models (Gemma-style; #90, same disease class
+        as the mamba-hybrid cap above).
+
+        In a hybrid-SWA model the sliding-window layers carry a CONSTANT
+        per-request KV footprint (bounded by the window plus eviction lag),
+        while only the global-attention layers grow with the context length.
+        The profiling path's ``available_bytes // cell_size`` knows nothing of
+        either bound, so it inflates the pools to fragmentation-dependent,
+        physically unreachable sizes (Gemma4-31B TP=3 uneven: per-rank
+        capacities 103024/116951/85679 for a 4-req / 8192-ctx server whose
+        full-pool ceiling is 4*(8192+4); with weighted DCP the un-sharded SWA
+        pool was even sized at the global 249472 budget and OOM'd outright).
+
+        The ceiling follows the code's own pool accounting
+        (HybridSWAPoolConfigurator: full = max_total, swa = ratio * max_total):
+        - full pool need:  concurrency * (context_len + decode headroom)
+          -- the same growing-part formula as the mamba-hybrid cap;
+        - swa pool need:   swa_pool_token_cap() -- the SWAChunkCap
+          per-request worst case (window + eviction interval + decode
+          over-allocation, plus in-flight prefill chunks);
+        and since the split pins swa = ratio * max_total, the binding cap is
+          max(full_need, ceil(swa_need / ratio)).
+
+        Returns ``None`` (no cap) for non-SWA-hybrid models, DeepSeek-V4
+        (separate c4/c128 pool accounting), all-SWA models (max_total IS the
+        swa pool and the radix cache legitimately holds many in-window
+        prefixes), mamba hybrids (the #79 cap governs), and whenever
+        concurrency, context length, or window size cannot be determined --
+        so every other path is byte-for-byte unchanged.
+        """
+        if not self.is_hybrid_swa or is_deepseek_v4(self.model_config.hf_config):
+            return None
+        if self.mambaish_config is not None:
+            return None
+        if len(self.model_config.full_attention_layer_ids) == 0:
+            return None
+        sa = self.server_args
+        if not sa.max_running_requests or sa.max_running_requests <= 0:
+            return None
+        ctx = self.model_config.context_len
+        if not ctx or ctx <= 0:
+            return None
+        window = getattr(self, "sliding_window_size", None)
+        if not window or window <= 0:
+            return None
+        concurrency = int(sa.max_running_requests)
+        # Per-request decode/spec headroom beyond context_len, matching the
+        # req_to_token allocation width.
+        extra = get_req_to_token_extra_context_len(sa)
+        full_need = concurrency * (int(ctx) + int(extra))
+        # Local import avoids a pool_configurator import cycle.
+        from sglang.srt.model_executor.pool_configurator import swa_pool_token_cap
+
+        swa_need = int(swa_pool_token_cap(self, concurrency))
+        ratio = sa.swa_full_tokens_ratio
+        if ratio and ratio > 0:
+            return max(full_need, int(math.ceil(swa_need / ratio)))
+        return full_need
+
     def _apply_hybrid_kv_token_cap(
-        self: ModelRunner, token_capacity: int, cap: Optional[int]
+        self: ModelRunner,
+        token_capacity: int,
+        cap: Optional[int],
+        kind: str = "mamba",
     ) -> int:
         """Clamp a resolved token capacity to the hybrid physical ceiling and
         log once when the cap actually binds."""
         if cap is None or token_capacity <= cap:
             return token_capacity
+        if kind == "swa":
+            logger.info(
+                "Hybrid SWA/global-attention KV cap: max_total_num_tokens "
+                "%d -> %d (max_running_requests=%s x (context_len=%d + "
+                "headroom) for the global layers; sliding-window layers are "
+                "window-bounded (window=%s), so the profiled capacity is "
+                "physically unreachable).",
+                token_capacity,
+                cap,
+                self.server_args.max_running_requests,
+                self.model_config.context_len,
+                getattr(self, "sliding_window_size", None),
+            )
+            return cap
         logger.info(
             "Hybrid mamba/attention KV cap: max_total_num_tokens %d -> %d "
             "(max_running_requests=%s x (context_len=%d + headroom); the "
@@ -1840,6 +1918,11 @@ class ModelRunnerKVCacheMixin:
         """
         user_limit = self.server_args.max_total_tokens
         hybrid_cap = self._hybrid_kv_token_cap()
+        hybrid_cap_kind = "mamba"
+        if hybrid_cap is None:
+            swa_cap = self._swa_hybrid_kv_token_cap()
+            if swa_cap is not None:
+                hybrid_cap, hybrid_cap_kind = swa_cap, "swa"
 
         # Apply user-specified upper bound
         if user_limit is not None:
@@ -1883,7 +1966,7 @@ class ModelRunnerKVCacheMixin:
             if user_limit is not None:
                 token_capacity = min(token_capacity, user_limit)
             token_capacity = self._apply_hybrid_kv_token_cap(
-                token_capacity, hybrid_cap
+                token_capacity, hybrid_cap, hybrid_cap_kind
             )
             return token_capacity
 
@@ -1906,7 +1989,9 @@ class ModelRunnerKVCacheMixin:
             )
             token_capacity = tensor.item()
 
-        token_capacity = self._apply_hybrid_kv_token_cap(token_capacity, hybrid_cap)
+        token_capacity = self._apply_hybrid_kv_token_cap(
+            token_capacity, hybrid_cap, hybrid_cap_kind
+        )
         return token_capacity
 
     #: Weight families the self-calibration can shift, mapped to the
