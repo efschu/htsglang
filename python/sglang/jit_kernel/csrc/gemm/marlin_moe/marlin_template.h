@@ -710,16 +710,27 @@ __global__ void Marlin(
   bool s_sh_wr_pred = threadIdx.x < s_sh_stage;
 
   // Zero-points
+  // NOTE: like the scales above, a shared-memory stage holds zp_tb_groups
+  // (= s_tb_groups) quant groups when group_blocks < thread_k_blocks (e.g.
+  // group_size 32 with a 64/128-row k-tile). The global read index must
+  // then split threads across the group rows and the write predicate must
+  // cover the whole stage (zp_sh_stage), not a single group (zp_sh_stride).
+  // The read side (fetch_zp_to_registers) and the slice-advance code below
+  // already assume this layout; without it every group_blocks <
+  // thread_k_blocks configuration dequantized with the wrong zero-points.
   int zp_gl_rd;
   if constexpr (has_zp) {
     if constexpr (group_blocks == -1) {
       zp_gl_rd = zp_sh_stride * slice_col + threadIdx.x;
-    } else {
+    } else if constexpr (group_blocks >= thread_k_blocks) {
       zp_gl_rd = zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + zp_sh_stride * slice_col + threadIdx.x;
+    } else {
+      zp_gl_rd = zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks + threadIdx.x / zp_sh_stride) +
+                 zp_sh_stride * slice_col + threadIdx.x % zp_sh_stride;
     }
   }
   auto zp_sh_wr = threadIdx.x;
-  bool zp_sh_wr_pred = threadIdx.x < zp_sh_stride;
+  bool zp_sh_wr_pred = threadIdx.x < zp_sh_stage;
 
   // We use a different scale layout for grouped and column-wise quantization as
   // we scale a `half2` tile in column-major layout in the former and in
