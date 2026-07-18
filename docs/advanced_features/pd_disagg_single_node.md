@@ -131,12 +131,21 @@ are added; (b) divergent per-rank control flow inside one scheduler step is
 deep surgery in scheduler + model_runner, impossible to gate cleanly;
 (c) the two-process design reuses ~all existing disagg orchestration.
 
-**Rejected: mooncake/nixl transport.** No RDMA NIC; NVLink pools
-inapplicable; UCX intra-node is plausible but a large opaque dependency for
-what is, on this rig, "gather + memcpy + scatter". We add
-`TransferBackend.LOCAL` instead (registered in `get_kv_class`, implementing
-the `base/conn.py` interface, subclassing the `Common*` classes so
-bootstrap/registration/rank-mapping are inherited):
+**Transport: `mooncake_tcp` (M1 empirical revision).** The design draft
+proposed a custom `TransferBackend.LOCAL`; M1 found this unnecessary for
+correctness: sglang ships a `mooncake_tcp` backend alias (mooncake with
+`MC_FORCE_TCP=1`, `arg_groups/pd_disaggregation_hook.py:17-27`) that moves
+KV over TCP loopback with no RDMA/NVLink requirement, and the
+`mooncake-transfer-engine` wheel installs cleanly (0.3.11.post1, no dep
+conflicts). M1 validated the full pipeline with it: prefill TP=1 + decode
+TP=1 co-resident on the 5090 (17.0 GB combined, sequential boot required —
+concurrent boots race each other's memory profiling), local proxy in front,
+and **all four temp-0 oracle outputs bit-identical to a non-disagg server,
+including a 28k-token needle retrieval** (KV per-chunk transfer + hybrid
+GDN state transfer both correct). v1 therefore uses `mooncake_tcp` as the
+byte mover; a custom LOCAL backend (CUDA-IPC same-GPU gather-scatter,
+pinned-host staging cross-GPU, sketched below) is demoted to an M3+
+optimization if TCP-loopback throughput proves limiting for 120k prompts:
 
 - **Registration:** each decode rank exports its KV pool (and state pool)
   base allocation via `cudaIpcGetMemHandle` in the ZMQ registration payload
@@ -282,10 +291,14 @@ wins outright at all measured lengths.
   decode bs=1 15.9 tok/s @2k, 15.6 @32k (no-cuda-graph config). Temp-0
   oracle references + 32k-needle (retrieved: 483729) captured to
   `/tmp/pd99/oracle_tp3.json`; scripts in `/tmp/pd99/`.
-- **M1** — `TransferBackend.LOCAL`, same-layout smoke: prefill TP=1 →
-  decode TP=1, both on the 5090 with split budgets. Proves bootstrap, IPC
-  mapping, gather/scatter, metadata, GDN state (trivial slice). Oracle:
-  temp-0 output == non-disagg TP=1; needle-in-haystack at 32k.
+- **M1** — DONE (2026-07-18): same-layout smoke via `mooncake_tcp` (no new
+  transfer backend needed — see Section 3). Qwen3.5-2B (hybrid GDN
+  miniature of A3B: 24 layers, 6 full-attn, kv=2) prefill TP=1 + decode
+  TP=1 co-resident on the 5090, `local_proxy.py` in front. Oracle: 4/4
+  temp-0 outputs bit-identical to non-disagg (3 text prompts + 28k needle);
+  per-chunk KV transfer and StateType.MAMBA hybrid state transfer both
+  exercised. Lesson: boot the two servers sequentially (concurrent memory
+  profiling races); decode needs a distinct `--engine-info-bootstrap-port`.
 - **M2** — token-vector rescatter: sender filter (even + weighted), decode
   prealloc owned-count, staging pipeline to the 3080s. Prefill TP=1 →
   decode TP=3+DCP. Oracle: temp-0 == non-disagg TP=3+DCP oracle; needle at
