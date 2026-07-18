@@ -19,6 +19,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
+import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -82,6 +83,23 @@ class LlamaMLP(nn.Module):
         use_dp_attention_reduce: bool = False,
     ) -> None:
         super().__init__()
+        # Uneven TP (--rank-tp-ratio): intermediate size is the unit
+        # family — gate/up outputs and down input share the same per-rank
+        # partition. Inert without an installed shard plan (falls back to
+        # the classic even split). Without this, any uneven-TP run (e.g.
+        # a llama-style EAGLE3 draft head) fails at init when sum(ratio
+        # weights) does not divide intermediate_size.
+        # Units are ACT_VEC_ALIGN-element groups, not single elements
+        # (unlike the gemma3/4 MLPs): the jit activation kernel
+        # (elementwise/activation.cuh) vector-loads up to kMaxVecBytes=32
+        # bytes, i.e. 16 bf16 elements on Blackwell, and rejects per-rank
+        # intermediate sizes not divisible by its vector size. Element-
+        # granular units can yield odd shards under an uneven plan (seen
+        # live: 16384 over auto weights -> [4263, 7648, 4473]); 16-element
+        # units keep every rank's shard kernel-compatible. Block-quantized
+        # checkpoints are further coarsened by _quant_block_aligned_units
+        # in linear.py, which subsumes this alignment.
+        _mlp_units = intermediate_size // math.gcd(intermediate_size, 16)
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -90,6 +108,8 @@ class LlamaMLP(nn.Module):
             prefix=add_prefix("gate_up_proj", prefix),
             tp_rank=tp_rank,
             tp_size=tp_size,
+            tp_units=_mlp_units,
+            tp_family="mlp",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -101,6 +121,8 @@ class LlamaMLP(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
             use_dp_attention_reduce=use_dp_attention_reduce,
+            tp_units=_mlp_units,
+            tp_family="mlp",
         )
         if hidden_act != "silu":
             raise ValueError(
