@@ -11,7 +11,7 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.jit_kernel.activation import silu_and_mul
+    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
     from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
@@ -272,6 +272,13 @@ def fused_marlin_moe(
         )
     elif activation == "silu" and is_gated:
         silu_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
+    elif activation == "gelu" and is_gated:
+        # Gated GeLU (Gemma-family MoE). Mirrors the triton fused-moe
+        # runner's `gelu_and_mul` branch so both backends stay numerically
+        # aligned for the same checkpoint.
+        assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
+        assert clamp_limit is None, "clamp_limit is not supported for gelu"
+        gelu_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
     elif activation == "relu2" and not is_gated:

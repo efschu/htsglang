@@ -61,6 +61,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
 from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -130,6 +131,28 @@ class Gemma4MultimodalEmbedder(nn.Module):
 class Gemma4ForConditionalGeneration(PreTrainedModel):
     config_class = Gemma4Config
     """Gemma4 multimodal model for conditional generation."""
+
+    # Quant-config (e.g. compressed-tensors `ignore`) name normalization.
+    # The checkpoint names the vision/audio tower shard projections with the
+    # Clippable wrapper's inner module (`...q_proj.linear`,
+    # `...gate_proj.linear`), but `should_ignore_layer` expands the fused
+    # runtime modules (qkv_proj / gate_up_proj) to BARE shard names
+    # (`...q_proj`, `...gate_proj`). Without this mapping the bf16 vision
+    # tower resolves as quantized: its wNa16 scheme then marlin-repacks
+    # never-loaded weights and crashes on the fused gate_up
+    # (size_n = 2*4304 = 8608, not divisible by the marlin tile of 64).
+    # Only the five sharded projections are stripped — the unfused wrappers
+    # (o_proj/down_proj) keep their `.linear` inner-module name, which
+    # already matches the runtime prefix exactly.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_suffix={
+            ".q_proj.linear": ".q_proj",
+            ".k_proj.linear": ".k_proj",
+            ".v_proj.linear": ".v_proj",
+            ".gate_proj.linear": ".gate_proj",
+            ".up_proj.linear": ".up_proj",
+        }
+    )
 
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
