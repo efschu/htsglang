@@ -482,11 +482,27 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
 
     @staticmethod
     def is_applicable(mr: ModelRunner) -> bool:
-        """True when SWAChunkCache can be sized from explicit max requests."""
+        """True when SWAChunkCache can be sized from explicit max requests.
+
+        Two routes select this configurator:
+        - legacy auto route (conditions byte-identical): radix cache disabled,
+          so the SWA pool holds only active requests and the cap is exact;
+        - explicit ``--swa-pool-sizing cap`` (Stage A of task #91): the SWA
+          pool is pinned at the same window-bounded worst case with the radix
+          cache ALLOWED. Correctness holds because scheduler admission counts
+          swa_available + swa_evictable and eviction is demand-driven
+          (mem_cache/common.py evict_from_tree_cache), so cached in-window
+          prefixes are reclaimed under pressure; the pin only bounds SWA-side
+          cache RETENTION, trading swa prefix-cache hit rate for moving the
+          freed budget to the full-attention pool (the part that actually
+          grows with context length). Flag preconditions
+          (max_running_requests, chunked prefill) are enforced in
+          server_args._handle_cache_compatibility.
+        """
         sa = mr.server_args
         if sa.max_running_requests is None:
             return False
-        if not sa.disable_radix_cache:
+        if not sa.disable_radix_cache and sa.swa_pool_sizing != "cap":
             return False
         if sa.chunked_prefill_size is None:
             return False
@@ -809,10 +825,23 @@ def create_memory_pool_configurator(
 ) -> MemoryPoolConfigurator:
     """Factory: select the right configurator for the model architecture."""
     if is_deepseek_v4(mr.model_config.hf_config) and mr.is_hybrid_swa:
-        return DSV4PoolConfigurator(mr)
-    if mr.is_hybrid_swa:
+        configurator = DSV4PoolConfigurator(mr)
+    elif mr.is_hybrid_swa:
         if SWAChunkCapPoolConfigurator.is_applicable(mr):
-            return SWAChunkCapPoolConfigurator(mr)
-        return HybridSWAPoolConfigurator(mr)
-    # Future: MambaPoolConfigurator
-    return DefaultPoolConfigurator(mr)
+            configurator = SWAChunkCapPoolConfigurator(mr)
+        else:
+            configurator = HybridSWAPoolConfigurator(mr)
+    else:
+        # Future: MambaPoolConfigurator
+        configurator = DefaultPoolConfigurator(mr)
+    if mr.server_args.swa_pool_sizing == "cap" and not isinstance(
+        configurator, SWAChunkCapPoolConfigurator
+    ):
+        logger.warning(
+            "--swa-pool-sizing cap has no effect for this model/config "
+            "(selected configurator: %s). It applies only to hybrid "
+            "sliding-window models with global-attention layers (non-DSV4) "
+            "when the hybrid SWA memory pool is enabled.",
+            type(configurator).__name__,
+        )
+    return configurator

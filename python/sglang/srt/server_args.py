@@ -896,6 +896,27 @@ class ServerArgs:
         bool,
         Arg(help="Disable the hybrid SWA memory pool.", resolvable=True),
     ] = False
+    swa_pool_sizing: A[
+        str,
+        Arg(
+            help=(
+                "How the SWA pool of hybrid sliding-window models (Gemma-style) "
+                "is sized. 'ratio' (default): swa_tokens = swa-full-tokens-ratio "
+                "* full_tokens -- the SWA pool grows with the context budget. "
+                "'cap': the SWA pool is pinned at its window-bounded worst case "
+                "(sliding window + eviction lag + in-flight prefill chunks per "
+                "request) and the entire remaining KV budget goes to the "
+                "full-attention pool, which is what actually grows with context "
+                "length. This unlocks long-context capacity on hybrid-SWA "
+                "models whose SWA layers dominate KV bytes (e.g. Gemma4 31B: "
+                "50 SWA / 10 full layers). Requires --max-running-requests and "
+                "chunked prefill; works with the radix cache (SWA-side cache "
+                "retention is bounded by the pinned pool; eviction is "
+                "demand-driven)."
+            ),
+            choices=["ratio", "cap"],
+        ),
+    ] = "ratio"
     radix_eviction_policy: A[
         str,
         Arg(
@@ -7269,6 +7290,24 @@ class ServerArgs:
         # the user input before it ever takes effect.
         if not (0 < self._resolved().swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+
+        # --swa-pool-sizing cap pins the SWA pool at its per-request worst
+        # case, which is only well-defined with a known concurrency bound and
+        # bounded in-flight prefill (chunked prefill). Fail fast instead of
+        # silently falling back to ratio sizing.
+        if self.swa_pool_sizing == "cap":
+            if not self.max_running_requests or self.max_running_requests <= 0:
+                raise ValueError(
+                    "--swa-pool-sizing cap requires an explicit "
+                    "--max-running-requests (the SWA pool is sized from the "
+                    "per-request window-bounded worst case)."
+                )
+            if self.chunked_prefill_size is None or self.chunked_prefill_size <= 0:
+                raise ValueError(
+                    "--swa-pool-sizing cap requires chunked prefill "
+                    "(--chunked-prefill-size > 0) so in-flight prefill KV is "
+                    "bounded."
+                )
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
