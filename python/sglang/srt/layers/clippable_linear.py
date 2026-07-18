@@ -27,6 +27,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+from sglang.srt.distributed.utils import tp_partition_size
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -55,14 +56,22 @@ class ClippableRowParallelLinear(nn.Module):
         bias: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        tp_units: Optional[int] = None,
+        tp_family: Optional[str] = None,
     ):
         super().__init__()
+        # tp_units: unit count of the INPUT dimension for uneven-TP shard
+        # plans (--rank-tp-ratio). Must match the paired column-parallel
+        # layer's units (e.g. attention heads for o_proj). Without a plan
+        # this is inert (classic even split).
         self.linear = RowParallelLinear(
             input_size=input_size,
             output_size=output_size,
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear", prefix),
+            tp_units=tp_units,
+            tp_family=tp_family,
         )
         self.input_min = nn.parameter.Buffer(torch.tensor(-_INF), persistent=False)
         self.input_max = nn.parameter.Buffer(torch.tensor(_INF), persistent=False)
@@ -128,10 +137,6 @@ class ClippableQKVParallelLinear(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        tp_size = get_parallel().attn_tp_size
-        self.q_size = (total_num_heads // tp_size) * head_size
-        self.kv_size = (total_num_kv_heads // tp_size) * head_size
-
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
             head_size=head_size,
@@ -141,6 +146,11 @@ class ClippableQKVParallelLinear(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
+        # Per-rank split sizes come from the inner QKVParallelLinear, which
+        # is plan-aware (uneven TP via --rank-tp-ratio distributes whole
+        # kv-head units per rank; even TP reproduces total // tp_size).
+        self.q_size = self.qkv_proj.num_heads * head_size
+        self.kv_size = self.qkv_proj.num_kv_heads * head_size
         self.input_min = nn.parameter.Buffer(torch.tensor(-_INF), persistent=False)
         self.input_max = nn.parameter.Buffer(torch.tensor(_INF), persistent=False)
         self.q_output_min = nn.parameter.Buffer(torch.tensor(-_INF), persistent=False)
@@ -193,7 +203,13 @@ class ClippableGLUParallelLinear(nn.Module):
     ):
         super().__init__()
         tp_size = get_parallel().attn_tp_size
-        self.proj_size = hidden_size // tp_size
+        tp_rank = get_parallel().attn_tp_rank
+        # Uneven TP: per-element units of each GLU half. Value/gate stay
+        # correctly paired because both halves follow the identical plan.
+        # Without a plan this is exactly hidden_size // tp_size.
+        self.proj_size = tp_partition_size(
+            hidden_size, tp_size, tp_rank, units=hidden_size
+        )
 
         self.linear = MergedColumnParallelLinear(
             input_size=input_size,
@@ -201,6 +217,7 @@ class ClippableGLUParallelLinear(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("linear", prefix),
+            tp_units=hidden_size,
         )
 
         # The checkpoint has a single fused weight; MergedColumnParallelLinear
@@ -256,7 +273,14 @@ class ClippableGateUpParallelLinear(nn.Module):
     ):
         super().__init__()
         tp_size = get_parallel().attn_tp_size
-        self.proj_size = intermediate_size // tp_size
+        tp_rank = get_parallel().attn_tp_rank
+        # Uneven TP: per-element units of each projection (bf16 towers, no
+        # quant-block constraint). Gate/up stay correctly paired because
+        # both halves follow the identical plan. Without a plan this is
+        # exactly intermediate_size // tp_size.
+        self.proj_size = tp_partition_size(
+            intermediate_size, tp_size, tp_rank, units=intermediate_size
+        )
 
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=input_size,
@@ -264,6 +288,7 @@ class ClippableGateUpParallelLinear(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            tp_units=intermediate_size,
         )
         self.input_min = nn.parameter.Buffer(torch.tensor(-_INF), persistent=False)
         self.input_max = nn.parameter.Buffer(torch.tensor(_INF), persistent=False)
