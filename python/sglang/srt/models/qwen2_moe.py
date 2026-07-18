@@ -19,6 +19,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
+import math
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -55,6 +56,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    _quant_block_aligned_units,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
@@ -91,7 +93,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.distributed.utils import tp_plan_active
+from sglang.srt.distributed.utils import (
+    assert_activation_aligned_shards,
+    tp_plan_active,
+)
 from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -188,8 +193,36 @@ class Qwen2MoeMLP(nn.Module):
         # the "mlp" family stats (_family_local_stats would partition them
         # over the real ranks and raise for 2 units < 3 ranks).
         _replicated = tp_size == 1
-        _mlp_units = None if _replicated else intermediate_size
-        _mlp_family = None if _replicated else "mlp"
+        if _replicated:
+            _mlp_units = None
+            _mlp_family = None
+        else:
+            # Uneven TP (--rank-tp-ratio): units are 16-element groups, not
+            # single elements, mirroring LlamaMLP (task #100 / 1244d1b2e):
+            # an element-granular largest-remainder split yields odd
+            # per-rank shards which the jit activation kernel rejects at
+            # the first forward ("hidden size must be divisible by vector
+            # size", kMaxVecBytes=32 -> 16 bf16 elements on Blackwell).
+            # Seen live (task #82): Qwen3.6-27B GGUF, intermediate 17408
+            # over auto weights [29607, 18280, 18280] -> [7790, 4809, 4809].
+            _mlp_units = intermediate_size // math.gcd(intermediate_size, 16)
+            # Quant-block symmetry: partitioning is PER LAYER (there is no
+            # cross-layer reconciliation), and the layer-level
+            # _quant_block_aligned_units coarsens ONLY down_proj's INPUT
+            # dim for GGUF (ggml blocks lie along the input dim only;
+            # output-dim coarsening is deliberately skipped there to keep
+            # GDN head units intact). Left to the layer level, gate_up's
+            # output split and down_proj's input split of the SAME
+            # intermediate dimension DISAGREE under an uneven plan (seen
+            # with the crash above: gate [7790, 4809, 4809] vs down
+            # [7680, 4864, 4864]). Coarsen once HERE with the input-dim
+            # block (mirrors qwen3_5's model-level gdn_tp_units
+            # derivation) and hand the SAME units to both layers; the
+            # layer-level coarsening is then an idempotent pass-through.
+            _mlp_units = _quant_block_aligned_units(
+                intermediate_size, _mlp_units, quant_config, 1
+            )
+            _mlp_family = "mlp"
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -220,6 +253,30 @@ class Qwen2MoeMLP(nn.Module):
             tp_units=_mlp_units,
             tp_family=_mlp_family,
         )
+        if not _replicated:
+            # Fail at construction, not at the first forward (task #82).
+            # 1) The two layers must partition the shared intermediate dim
+            #    identically; the caller-side coarsening above makes the
+            #    layer-level quant coarsening a pass-through, so any
+            #    divergence here means an asymmetric weight-quant block
+            #    geometry this module cannot express.
+            if self.gate_up_proj.tp_units != self.down_proj.tp_units:
+                raise ValueError(
+                    "Qwen2MoeMLP gate_up/down partition units diverged "
+                    f"after quant-block coarsening (gate_up "
+                    f"{self.gate_up_proj.tp_units} vs down "
+                    f"{self.down_proj.tp_units} units for intermediate "
+                    f"{intermediate_size}); the uneven-TP splits of the "
+                    "shared intermediate dimension would disagree."
+                )
+            # 2) Every rank's shard must satisfy the jit activation
+            #    kernel's vector alignment (no-op without an uneven plan).
+            assert_activation_aligned_shards(
+                intermediate_size,
+                self.gate_up_proj.tp_size,
+                self.gate_up_proj.tp_units,
+                _mlp_family,
+            )
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."

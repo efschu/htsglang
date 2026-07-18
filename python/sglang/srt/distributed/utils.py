@@ -498,6 +498,47 @@ def tp_plan_active(tp_size: int, family: Optional[str] = None) -> bool:
     return bool(ratios) and len(ratios) == tp_size
 
 
+# Widest vector of the jit activation kernels (elementwise/activation.cuh):
+# kMaxVecBytes = 32 bytes on Blackwell -> 16 bf16 elements (the 16-byte
+# path on Ampere gives 8). Uneven shard plans align to the WIDEST vector so
+# one plan is valid on every arch of a potentially mixed rig; which rank
+# lands on which arch is not known at plan/construction time.
+ACTIVATION_VEC_ELEMS = 16
+
+
+def assert_activation_aligned_shards(
+    total: int,
+    tp_size: int,
+    units: Optional[int],
+    family: Optional[str] = "mlp",
+    what: str = "MLP intermediate",
+) -> None:
+    """Fail fast at PLAN time (module construction) when any rank's shard
+    of an activation-fed dimension (silu_and_mul / gelu_and_mul input)
+    would violate the jit activation kernel's vector alignment. The kernel
+    itself only raises at the FIRST FORWARD ("hidden size must be divisible
+    by vector size", activation.cuh:168) — long after weights loaded — so
+    an incompatible geometry must be rejected at boot instead (task #82).
+
+    Only active under an installed uneven plan; the classic even-split
+    path keeps its existing (per-arch, runtime) behavior untouched.
+    """
+    if not tp_plan_active(tp_size, family):
+        return
+    sizes = tp_partition_sizes(total, tp_size, units, family)
+    bad = [r for r, s in enumerate(sizes) if s % ACTIVATION_VEC_ELEMS]
+    if bad:
+        raise ValueError(
+            f"Uneven-TP shard plan for the {what} dimension of size {total} "
+            f"(tp_size={tp_size}, units={units}, family={family!r}) yields "
+            f"per-rank shards {sizes}; rank(s) {bad} are not divisible by "
+            f"the activation kernel's widest vector "
+            f"({ACTIVATION_VEC_ELEMS} elements). Pick a shard plan / unit "
+            f"granularity whose per-rank shards are multiples of "
+            f"{ACTIVATION_VEC_ELEMS}."
+        )
+
+
 # ---------------------------------------------------------------------------
 # TP > num_kv_heads (task #62): REPLICATED-KV attention geometry.
 #
