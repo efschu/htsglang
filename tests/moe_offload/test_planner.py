@@ -98,15 +98,31 @@ def test_warm_start_residency():
 
 
 def test_resolve_hit_no_fetch():
-    p = ExpertResidencyPlanner(num_local_experts=256, n_slots=64)
+    # LRU path (deterministic=False): experts already resident are not re-fetched.
+    p = ExpertResidencyPlanner(num_local_experts=256, n_slots=64, deterministic=False)
     slot_of, fetch = p.resolve([0, 1, 63])
     assert fetch == []
     assert slot_of == {0: 0, 1: 1, 63: 63}
     assert p.stats.fetches == 0
 
 
+def test_resolve_deterministic_sorted_slots():
+    # Deterministic path (default): needed experts -> slots [0,k) in sorted
+    # order, history-independent, all (re)fetched. Two calls with the same
+    # needed set give the identical layout regardless of intervening calls.
+    p = ExpertResidencyPlanner(num_local_experts=256, n_slots=64)
+    slot_a, fetch_a = p.resolve([63, 1, 0])
+    assert slot_a == {0: 0, 1: 1, 63: 2}
+    assert fetch_a == [(0, 0), (1, 1), (63, 2)]
+    p.resolve([200, 5, 9])  # intervening call changes nothing for the next
+    slot_b, fetch_b = p.resolve([63, 1, 0])
+    assert slot_b == slot_a and fetch_b == fetch_a  # byte-identical layout
+
+
 def test_resolve_miss_fetches_and_evicts_lru():
-    p = ExpertResidencyPlanner(num_local_experts=256, n_slots=4)
+    p = ExpertResidencyPlanner(
+        num_local_experts=256, n_slots=4, deterministic=False
+    )
     # resident {0,1,2,3}. Touch 0 so it's MRU, then miss 100 -> evict LRU (1).
     p.resolve([0])
     slot_of, fetch = p.resolve([100])

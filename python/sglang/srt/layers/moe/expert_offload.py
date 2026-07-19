@@ -165,6 +165,17 @@ class ExpertResidencyPlanner:
     _free_slots: List[int] = field(default_factory=list)
     _lru: "OrderedDict[int, None]" = field(default_factory=OrderedDict)
     stats: ResidencyStats = field(default_factory=ResidencyStats)
+    # Deterministic residency (default ON): assign each wave's needed experts to
+    # slots [0, k) in sorted expert-id order, independent of history. A served
+    # model MUST be self-deterministic at temp=0; the LRU path lets a request's
+    # resident layout depend on the PRIOR request's residency, which -- because
+    # the marlin-Int4 grouped-GEMM tiles by expert-count / slot order and is
+    # thus buffer-order-sensitive at the ~1e-2 level -- makes greedy output
+    # drift across requests (argmax flips at near-ties). Sorted-slot assignment
+    # makes the resident layout a pure function of the wave's needed set, so
+    # identical inputs -> identical tiling -> identical output. Trades cross-
+    # forward expert reuse for determinism (re-fetches each wave's experts).
+    deterministic: bool = True
 
     def __post_init__(self):
         if self.n_slots < 1:
@@ -209,6 +220,21 @@ class ExpertResidencyPlanner:
                 f"{self.n_slots} slots exist; caller must wave-split with "
                 f"plan_token_waves() first."
             )
+
+        if self.deterministic:
+            # History-independent layout: needed experts (already sorted at
+            # `needed_unique`) -> slots [0, k). All are (re)fetched, so the
+            # resident buffer + the expert->slot map depend ONLY on this wave's
+            # needed set -> byte-identical across requests. Sorted-expert-id
+            # order also preserves the marlin moe_align grouping order.
+            self.slot_of_expert = {e: i for i, e in enumerate(needed_unique)}
+            self._lru = OrderedDict((e, None) for e in needed_unique)
+            self._free_slots = list(range(len(needed_unique), self.n_slots))
+            self.stats.misses += len(needed_unique)
+            self.stats.fetches += len(needed_unique)
+            slot_of_needed = dict(self.slot_of_expert)
+            fetch_plan = [(e, i) for i, e in enumerate(needed_unique)]
+            return slot_of_needed, fetch_plan
 
         fetch_plan: List[Tuple[int, int]] = []
         misses = [e for e in needed_unique if e not in self.slot_of_expert]
@@ -278,13 +304,19 @@ class MoEExpertOffloadCache:
         "w13_weight_scale_inv",
         "w2_weight_scale_inv",
         # GPTQ-Int4 Marlin path (Variant-C B2b): the POST-repack marlin tensors.
-        # The apply kernel reads these; qzeros is unused (sym) and g_idx is empty
-        # (desc_act=False), so only these four are staged. All are expert-major
-        # (dim 0 == num_experts) and per-expert sliceable in the marlin layout.
+        # The apply kernel reads these; for GPTQ qzeros is unused (sym) and g_idx
+        # is empty (desc_act=False). All are expert-major (dim 0 == num_experts)
+        # and per-expert sliceable in the marlin layout.
         "w13_qweight",
         "w2_qweight",
         "w13_scales",
         "w2_scales",
+        # AWQ-Int4 Marlin path (same qwen3_5_moe fused_marlin_moe path, used for
+        # the small-model cross-fraction proof): AWQ is asymmetric, so the marlin
+        # apply ALSO reads the per-expert zero-points -> stage them too. Tensors
+        # absent for a given quant method are skipped by the shape check below.
+        "w13_qzeros",
+        "w2_qzeros",
     )
 
     def __init__(self, layer, fraction: float):
