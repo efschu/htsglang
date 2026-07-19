@@ -148,11 +148,18 @@ with zero cross-GPU communication while the slower cards handle distributed deco
   pre-captured graph states per k, rank-deterministic.
   *Impact: roughly matches the best fixed k on any given workload without hand-tuning; avoids the
   throughput cliff of a badly-chosen fixed k.*
-- **Graph-state offload (stages 1+2) ✅** — inactive k-states are physically unmapped
-  (pause/resume, private MemPools, capture-pools + int-workspaces tagged). Modes:
-  resident / offload / offload-scratch.
-  *Impact: **KV loss of adaptive mode: zero** — full context preserved at standard reserve,
-  so adaptivity costs no usable context. Correctness/enablement, no throughput claim.*
+- **Graph-state offload to system RAM (stages 1+2) ✅** — the core enabler for adaptive draft
+  length. Each draft length k needs its own pre-captured CUDA graph, and each such graph pins a
+  block of VRAM; keeping all of k∈{1,2,3} (and the high-accept k=4/5 rungs) resident at once would
+  multiply that cost and eat straight into the KV-cache / context budget. This feature keeps only
+  the **currently-active** k's graph resident on the GPU and **offloads the inactive k-states'
+  captured graph memory out to system RAM** (via pause/resume, private MemPools, and tagged
+  capture-pools + int-workspaces), paging it back on a switch. Modes: resident / offload /
+  offload-scratch.
+  *Impact: this is what makes adaptive (and high-k) spec **free in VRAM** — **KV loss of adaptive
+  mode: zero**, full context preserved at standard reserve, so having several k-graphs available
+  costs no usable context. Without it, multi-k spec would either not boot at standard reserve or
+  would have to give back context. Enablement, no throughput claim.*
 - **High-accept profile [1..5] ✅** — k=4/5 rungs for repetitive workloads; opt-in, boots at
   standard reserve thanks to the offload above.
   *Impact: ≈+8% (k=4) to ≈+16% (pinned k=5) decode on repetitive/structured loads vs k=3;
