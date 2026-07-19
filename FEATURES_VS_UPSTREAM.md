@@ -406,8 +406,9 @@ a lower resident fraction, and the streaming loader stays unbuilt. It remains a 
 correct fix for models larger than this, or for tighter multi-process TP aggregates — untouched for
 now, emphasis on "for now".
 
-The moral: a hardware addition resolved what was queued as a loader rewrite. The rewrite is deferred,
-not cancelled.
+The moral: a hardware addition resolved what was queued as a loader rewrite. The streaming loader we
+had lined up to build was, as a result, never built — it stays on the shelf, unbuilt, for now. The
+"for now" is doing real work in that sentence: a larger model may yet take it back off the shelf.
 
 ---
 
