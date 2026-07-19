@@ -230,10 +230,19 @@ adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4*
   misses + remaps slots on-device over the unchanged grouped-GEMM. Wave processing is done **over
   tokens, not experts**, which is the key to byte-identity (no cross-wave partial sums → no
   floating-point re-association).
-  *Impact: lets a MoE model run with a fraction of its experts resident in VRAM — enables models
-  that otherwise would not fit. **🔴 Honest cost: ≈-35% decode tok/s** on short prompts (PCIe H2D
-  traffic). Validated byte-identical (fraction 0.25 vs 1.0 → identical outputs). **Eager-only by
+  *Impact: lets a MoE model run with a fraction of its experts resident in VRAM — **🟢 enables models
+  that otherwise would not fit**. The cost is throughput only, not quality (see below). **Eager-only by
   design** (data-dependent routing is not graph-capturable → fail-fast guard if graphs are on).*
+  - *Quality — validated, no measurable loss (#120): on Qwen3.6-35B-A3B-FP8 (TP=3 uneven, eager,
+    temp=0, tiered fraction=0.5 → half the experts resident, half host-spilled) vs the fully-resident
+    baseline: **🟢 ≈+0.15% perplexity** (well inside FP8 reduction-order noise), **🟢 needle-in-haystack
+    100%** at 8k and 30k, **🟢 correctness batteries 15/15 identical**. Also byte-identical at
+    fraction 0.25 vs 1.0 (identical output IDs). Verdict: offloading experts does **not** degrade
+    quality — you pay in throughput, not accuracy.*
+  - *Throughput cost — 🔴 PCIe-bandwidth-limited, not compute-bound: the host↔GPU expert traffic is
+    the bottleneck. **🔴 Prefill ≈an order of magnitude slower** single-stream (the spill cache
+    fragments prefill into many tiny fetch-gated GEMMs); **🔴 decode only mildly slower (≈1.4×)**.
+    Levers that shrink this: a bigger spill cache, NVLink/P2P, or more PCIe lanes.*
   - *Robustness (non-obvious): a single forward can legitimately need more unique experts than
     fit in the resident slots (a prefill batch easily touches all of them) — not obvious up
     front. Waving over tokens keeps each token whole in one wave, so this overflow case stays
