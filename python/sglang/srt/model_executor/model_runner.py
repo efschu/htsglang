@@ -1441,6 +1441,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
             )
 
+    def _install_moe_expert_offload_eager(self):
+        """Variant-C B2b: eagerly install the per-expert MoE offload cache on
+        every FusedMoE layer right after weight load, so the resident experts
+        are on GPU before KV/mamba pool sizing. Gated: no-op unless the layer
+        has _moe_offload_enabled (SGLANG_MOE_RESIDENT_EXPERT_FRACTION<1.0). Each
+        layer self-guards and falls back to fully-resident on any failure."""
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        n = 0
+        for module in self.model.modules():
+            if (
+                isinstance(module, FusedMoE)
+                and getattr(module, "_moe_offload_enabled", False)
+                and getattr(module, "_expert_offload", None) is None
+                and not getattr(module, "_expert_offload_install_failed", False)
+            ):
+                module._install_expert_offload()
+                if module._expert_offload is not None:
+                    n += 1
+        if n:
+            logger.info(
+                "Variant-C B2b: eager MoE expert-offload installed on %d FusedMoE "
+                "layers (resident experts materialized before pool sizing).",
+                n,
+            )
+
     def _build_weightless_worker_meta_model(self):
         """B2a: build a weightless KV worker's model on the `meta` device with
         NO weight materialization (the VRAM win).
@@ -1642,6 +1668,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.is_draft_worker and not self.is_weightless_worker:
             # B2a: a weightless worker holds no offloadable weights (meta model).
             get_offloader().post_init()
+
+        # Per-expert MoE offload (Variant-C B2b): install the resident/spill
+        # cache EAGERLY here, right after load, so the n_slots resident experts
+        # are materialized on GPU BEFORE the KV/mamba memory pool is sized. The
+        # #77 cache otherwise installs lazily on the first forward, which is
+        # AFTER pool sizing -> the pool would over-allocate and the resident
+        # experts would OOM. No-op unless SGLANG_MOE_RESIDENT_EXPERT_FRACTION<1.
+        self._install_moe_expert_offload_eager()
 
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:

@@ -176,12 +176,32 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
 
         extra_weight_attrs.update({"quant_method": strategy, "is_transposed": True})
 
+        # Per-expert MoE offload (Variant-C B2b): when the resident-expert
+        # fraction < 1.0 the big expert-major tensors (w13/w2 qweight + scales)
+        # are built on CPU instead of the ambient cuda device. The standard load
+        # path then moves each FusedMoE module to GPU for the marlin repack via
+        # device_loading_context and copies the repacked result back to
+        # CPU-pinned on exit (loader.py), so the full [E,...] stack never sits on
+        # GPU at once (bounds the load-time OOM). The MoEExpertOffloadCache later
+        # keeps only n_slots experts resident on GPU and streams cold ones from
+        # the pinned host pool. The small/unused qzeros + (desc_act=False) empty
+        # g_idx stay on the default device. fraction>=1.0 -> _moe_dev is None
+        # (default cuda) -> byte-identical stock path.
+        from sglang.srt.environ import envs as _sgl_envs
+
+        _moe_dev = (
+            "cpu"
+            if _sgl_envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get() < 1.0
+            else None
+        )
+
         w13_qweight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 hidden_size // self.quant_config.pack_factor,
                 2 * intermediate_size_per_partition,
                 dtype=torch.int32,
+                device=_moe_dev,
             ),
             requires_grad=False,
         )
@@ -194,6 +214,7 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
                 intermediate_size_per_partition // self.quant_config.pack_factor,
                 hidden_size,
                 dtype=torch.int32,
+                device=_moe_dev,
             ),
             requires_grad=False,
         )
@@ -206,6 +227,7 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
                 scales_size13,
                 2 * intermediate_size_per_partition,
                 dtype=torch.half,
+                device=_moe_dev,
             ),
             requires_grad=False,
         )
@@ -213,7 +235,10 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
         set_weight_attrs(w13_scales, extra_weight_attrs)
 
         w2_scales = torch.nn.Parameter(
-            torch.empty(num_experts, scales_size2, hidden_size, dtype=torch.half),
+            torch.empty(
+                num_experts, scales_size2, hidden_size, dtype=torch.half,
+                device=_moe_dev,
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w2_scales", w2_scales)
