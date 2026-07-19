@@ -173,32 +173,57 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
         if self.quant_config.group_size != -1:
             scales_size13 = hidden_size // self.quant_config.group_size
             if self.quant_config.desc_act:
+                # act-order (desc_act=True): g_idx permutes groups, so w2 needs
+                # the FULL scales replicated per rank (full-width + load_full_w2).
+                # Untouched by this bugfix.
                 w2_scales_size = intermediate_size_per_partition
             else:
-                # Bugfix (even-TP, desc_act=False): the stock full-width
-                # allocation (intermediate_per_partition * moe_tp_size) with
-                # load_full_w2=False (below) made the EVEN-TP loader
-                # (_moe_src_start's shard_size*tp_rank branch) narrow a
-                # full-width w2_scales tensor at start=tp_rank*full_dim -> OOB
-                # ("start (K)+length (K) exceeds dimension size (K)"). w2 is the
+                # Bugfix (desc_act=False, TP>1 -- even AND uneven): the stock
+                # full-width allocation (intermediate_per_partition * moe_tp_size)
+                # with load_full_w2=False (below) made the loader narrow a
+                # full-width w2_scales at a per-rank offset -> OOB ("start (K) +
+                # length (K) exceeds dimension size (K)"): even TP via
+                # _moe_src_start's shard_size*tp_rank, uneven TP via
+                # tp_partition_offset over the coarse group grid. w2 is the
                 # down-proj (row-parallel, sharded along intermediate); with
                 # group quant along intermediate and desc_act=False the groups
                 # are contiguous, so each rank needs ONLY its intermediate-shard
-                # of the scales -- and the marlin w2 repack indexes size_k from
-                # w2_scales.shape[1]*group_size, so a sharded width keeps qweight
-                # (already sharded) and scales k-consistent. Loading full scales
-                # into each rank (flipping load_full_w2) would feed the wrong
-                # rows -> silent garbage; the correct fix is the sharded width.
-                # Strictly gated to EVEN TP: the uneven-TP path (tp_partition_
-                # offset) is left on the original full-width, untouched.
-                from sglang.srt.distributed.utils import tp_plan_active
-
-                if tp_plan_active(layer.moe_tp_size, layer.moe_tp_family):
-                    w2_scales_size = (
-                        intermediate_size_per_partition * layer.moe_tp_size
+                # of the scales. intermediate_size_per_partition IS that shard
+                # (even: /tp; uneven: *weight/sum), and the marlin w2 repack
+                # derives size_k from w2_scales.shape[1]*group_size, so the
+                # sharded width keeps qweight (already sharded) and scales
+                # k-consistent. Loading full scales per rank (flipping
+                # load_full_w2) would feed the wrong rows -> silent garbage.
+                # CORRECTNESS PRECONDITION (uneven TP): each rank's intermediate
+                # shard must be group-aligned, else a scale group straddles a
+                # rank boundary and the sharded scales are silently wrong. Assert
+                # it loudly here rather than let it pass a coherence glance.
+                gs = self.quant_config.group_size
+                if intermediate_size_per_partition % gs != 0:
+                    raise ValueError(
+                        "GPTQ MoE w2_scales group-alignment violated on "
+                        f"moe_tp_rank={getattr(layer, 'moe_tp_rank', '?')}: "
+                        f"intermediate_size_per_partition="
+                        f"{intermediate_size_per_partition} is not a multiple of "
+                        f"group_size={gs} (moe_tp_size={layer.moe_tp_size}). Under "
+                        "uneven TP the per-rank intermediate shard must align to "
+                        "group_size, not just the 16-unit; the shard boundaries "
+                        "need a group_size-aware coarsening -- this is a bigger "
+                        "fix than the scales width. STOP."
                     )
-                else:
-                    w2_scales_size = intermediate_size_per_partition
+                import logging as _logging
+
+                _logging.getLogger(__name__).info(
+                    "GPTQ MoE w2_scales sharded: moe_tp_rank=%s "
+                    "intermediate_per_partition=%d group_size=%d groups=%d "
+                    "(moe_tp_size=%d) -- group-aligned OK",
+                    getattr(layer, "moe_tp_rank", "?"),
+                    intermediate_size_per_partition,
+                    gs,
+                    intermediate_size_per_partition // gs,
+                    layer.moe_tp_size,
+                )
+                w2_scales_size = intermediate_size_per_partition
             scales_size2 = w2_scales_size // self.quant_config.group_size
             strategy = FusedMoeWeightScaleSupported.GROUP.value
         else:
