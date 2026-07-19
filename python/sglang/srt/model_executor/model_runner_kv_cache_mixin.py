@@ -21,6 +21,7 @@ from sglang.srt.distributed.utils import (
     tp_partition_size,
     tp_plan_active,
     uneven_dcp_active,
+    weightless_kv_active,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import (
@@ -1689,7 +1690,28 @@ class ModelRunnerKVCacheMixin:
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                         )
-                    elif self.server_args.rank_tp_ratio is not None:
+                    elif (
+                        self.server_args.rank_tp_ratio is not None
+                        or weightless_kv_active()
+                    ):
+                        # Weightless-KV fast lane (Option-B) reuses this
+                        # NATURAL-page_size DCP allocator branch. Without it,
+                        # weightless (rank_tp_ratio=None) would fall to the stock
+                        # even-DCP `else` branch which inflates page_size to
+                        # page_size*dcp_size (=3 here), and the paged allocator's
+                        # alloc_extend triton kernel does tl.arange(0, page_size)
+                        # which REQUIRES a power-of-2 length -> CompilationError
+                        # at dcp_size=3. This branch keeps page_size NATURAL (1)
+                        # and puts the token interleave in the index space +
+                        # owner rule instead, exactly as the uneven-DCP feature
+                        # does. For weightless even-modulo DCP (no token vector,
+                        # uneven_dcp_active=False) the index space is
+                        # max_total * cp_token_split_factor(dcp_size) and the
+                        # owner rule is loc // dcp_size -- the SAME split
+                        # _dcp_owner_write / _dcp_masked_write use, so the
+                        # allocator index space and the KV write compaction
+                        # agree (no #80-class right-token/wrong-slot corruption).
+                        #
                         # Uneven-DCP token-sharding (this feature): the
                         # allocator's index space is the GLOBAL token positions
                         # (max_total * split_factor); each rank physically stores

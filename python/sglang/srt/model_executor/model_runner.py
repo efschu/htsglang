@@ -1566,9 +1566,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # ranks. No-op on the default path.
             from sglang.srt.runtime_context import get_parallel
 
+            # Also pin the per-family RANKS to 0: at tp_size==1 the only shard
+            # is rank 0, but the real tp_rank is still 1/2 on the workers. Any
+            # rank-indexed partition (e.g. the VL vision tower's
+            # tp_partition_size(total, tp_size, rank)[rank]) would IndexError on
+            # the now length-1 partition list without this. The dcp geometry is
+            # set later at attention-backend init (NOT under this override), so
+            # it still uses the real rank for the KV token-shard.
             _wl_build_ctx = (
                 get_parallel().override(
-                    tp_size=1, moe_tp_size=1, attn_tp_size=1
+                    tp_size=1,
+                    tp_rank=0,
+                    moe_tp_size=1,
+                    moe_tp_rank=0,
+                    attn_tp_size=1,
+                    attn_tp_rank=0,
                 )
                 if (self.is_weightless_head or self.is_weightless_worker)
                 else contextlib.nullcontext()
