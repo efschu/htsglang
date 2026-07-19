@@ -76,12 +76,15 @@ its GPU, instead of an equal split.
 - **TP > num_kv_heads (replicated KV) ✅** — KV heads are replicated + token-sharded +
   LSE-merged so TP can exceed the KV-head count. Coherent across FP8 / GGUF / AWQ; includes
   a GQA re-grouping fix for small head counts (gqa=1 ranks).
-  *Impact: enables TP degrees that were structurally impossible before. Correctness fix,
-  no throughput claim.*
-  **Honest downside:** because TP exceeds `num_kv_heads`, the KV heads must be **replicated**
-  across the ranks that share a KV-head group instead of sharded, so this costs **extra KV-cache
-  VRAM** (more KV memory than a plain sharded layout) — the price of running TP > num_kv_heads,
-  not free.
+  *Impact: enables TP degrees that were structurally impossible before (applies under uneven-DCP
+  too). Correctness fix, no throughput claim.*
+  **The price is small:** because TP exceeds `num_kv_heads`, the few KV heads must be **replicated**
+  across the ranks that share a KV-head group instead of sharded. But under GQA there are only a
+  handful of KV heads to begin with (the query heads, which dominate, are still sharded normally),
+  and under uneven-DCP the KV *tokens* are still split across ranks — so what's duplicated is just a
+  small KV slice, not the bulk of the cache. In practice this is a **minor, roughly single-digit-%
+  KV overhead**, easily paid for by the extra context / higher TP degree it unlocks. It is a real
+  cost, but a small one — not a heavy tax.
 - **Rank-uniform collective guards ✅** — guards in front of `all_gather` that require
   rank-uniform shapes, converting a would-be NCCL hang into a clean, early error.
   *Impact: robustness — turns a silent distributed hang into a fail-fast error.*
