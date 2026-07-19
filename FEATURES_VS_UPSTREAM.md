@@ -134,10 +134,16 @@ with zero cross-GPU communication while the slower cards handle distributed deco
 
 ## 3. Speculative Decoding (MTP / NEXTN / EAGLE3)
 
-- **MTP/NEXTN under uneven-DCP ✅** — including heterogeneous-GPU determinism (verify-sync,
+- **MTP/NEXTN under uneven-DCP ✅** — including heterogeneous-GPU reproducibility (verify-sync,
   draft broadcast from rank 0, workspace zeroing).
-  *Impact: correctness — speculative decoding is bit-deterministic on mixed-arch GPUs (see
-  §8 for the determinism roots). No throughput claim beyond enabling spec at all under DCP.*
+  *Impact: correctness — the **emitted greedy token sequence** is reproducible on mixed-arch GPUs
+  (run-to-run, cold==warm, independent of which card holds which rank). This does **not** mean the
+  MTP heads' internal layers are bit-identical across archs — they aren't, and don't need to be:
+  spec decode is output-preserving (emitted tokens = the target model's argmax chain, so a
+  numerically "noisy" draft only changes how many tokens are accepted per step, not which tokens
+  come out), and the accept/argmax decision is taken once on rank 0 and broadcast so ranks can't
+  commit different tokens near a tie. See §8 for the three roots. No throughput claim beyond
+  enabling spec at all under DCP.*
 - **Adaptive draft length ✅** — EMA + hysteresis + debounce picks k∈{1,2,3} at runtime, with
   pre-captured graph states per k, rank-deterministic.
   *Impact: roughly matches the best fixed k on any given workload without hand-tuning; avoids the
@@ -228,9 +234,12 @@ with zero cross-GPU communication while the slower cards handle distributed deco
 
 ## 8. Determinism, Mamba/GDN & HiCache
 
-- **Robustness — bit-deterministic spec-decode across mismatched GPUs ✅** — NEXTN+GDN speculative
-  decoding stays bit-identical even when the ranks are physically different cards. This is worth
-  highlighting because the sources of non-determinism here are genuinely **not obvious**: they only
+- **Robustness — reproducible spec-decode output across mismatched GPUs ✅** — NEXTN+GDN speculative
+  decoding emits the **same greedy token sequence** even when the ranks are physically different
+  cards. (To be precise: it's the *emitted output* that is reproducible, not the intermediate
+  activations — different silicon produces different low-order bits, and spec decode tolerates that
+  because it is output-preserving and the accept decision is shared from rank 0; see §3.) Worth
+  highlighting because the sources of divergence here are genuinely **not obvious**: they only
   appear once ranks are different silicon (upstream never runs that way), and they hide in places
   you don't normally look — a greedy verify that silently relies on every rank's argmax matching,
   CUDA-graph pad rows leaking stale tokens into the MoE grouped-GEMM, and a flashinfer float
