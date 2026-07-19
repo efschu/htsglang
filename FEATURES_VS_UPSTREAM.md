@@ -185,16 +185,33 @@ with zero cross-GPU communication while the slower cards handle distributed deco
 
 ## 4. GGUF
 
-There are two kinds of GGUF work here: (1) **new architecture support** — a custom adapter for the
-Qwen3.5/3.6 hybrid-GDN family, which upstream cannot load at all; and (2) **architecture-general
-GGUF improvements** (uneven-TP sharding, the tuned K-quant kernel, the perf overhaul, the vec
-alignment below) that benefit **any** GGUF model, not only Qwen. Note that the *new-model* GGUF
-adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4**) are supported via
-**AutoRound-int4 / Marlin**, not GGUF (see §5 and §7), so they don't appear here.
+There are two kinds of GGUF work here: (1) **new architecture support** — bespoke loader adapters
+that run families upstream cannot load on its fast path, on the fork's own fast GGUF path rather than
+the slow generic transformers GGUF loader; and (2) **architecture-general GGUF improvements**
+(uneven-TP sharding, the tuned K-quant kernel, the perf overhaul, the vec alignment below) that
+benefit **any** GGUF model. The bespoke adapters are still one-per-family (currently Qwen3.5/3.6 and
+Gemma-4 dense); a registry/family-table generalization is on the roadmap. Note that Gemma-4 is also
+available via AutoRound-int4 / Marlin (see §5 and §7) — the GGUF path below is a separate, additional
+way to run it.
 
 - **Qwen3.5/3.6 hybrid-GDN GGUF** — including NEXTN/MTP head, unsloth UD-quants, mmproj vision.
   *Impact: enables GGUF for a model family/architecture upstream sglang could not load (hybrid-GDN).
   No throughput claim — enablement.*
+- **Gemma-4 dense GGUF (S1) [landed, unpushed on `feat/gemma4-gguf`]** — a bespoke GGUF loader adapter
+  for the Gemma-4 dense family (the second family beside the Qwen3.5 path), verified on the 31B-it
+  Q4_K_M. Runs Gemma-4 GGUF checkpoints on the fork's fast bespoke path, not the slow generic
+  transformers GGUF loader. Correctness of the norm handling is proven two independent ways: all norms
+  (including q/k-norm) load as **identity** — the unsloth export bakes no `+1` — confirmed both by
+  byte-identity of every norm gamma / layer_scalar against the bf16 safetensors and by coherent live
+  output; an env escape hatch exists for exports that *do* bake `+1`.
+  *Impact: capability-add — a new model family on the fast GGUF path; throughput comparable to the
+  existing bespoke GGUF path (single-GPU TP=1 in the tens-of-tok/s range for the 31B Q4). No effect on
+  existing paths — gated to the gemma4 GGUF arch, the Qwen3.5 GGUF path is untouched.*
+  **Scope / limits (plainly):** dense only; Q4_K_M is the verified quant, other quants are structurally
+  supported but unverified; MoE Gemma-4 (`_exps` tensors) is not yet supported and fails fast.
+  **Launch requirements (avoid the traps):** Gemma-4 requires `--attention-backend triton` (flashinfer
+  is rejected by the model); the default CUDA device order is fastest-first, so reaching a specific
+  physical GPU needs `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
 - **GGUF-MoE expert-dim sharding, uneven** — whole experts per rank + zero-pad + remap,
   with GDN block coarsening and an MMQ fallback for misaligned blocks; A3B TP=3 coherent.
   *Impact: enables uneven-TP GGUF-MoE. Correctness/enablement.*
@@ -439,6 +456,12 @@ Deliberately ordered by risk to output: **byte-identical speed/capacity gains fi
 - **122B-A10B-Int4 real run [planned]** — the MoE expert-offload mechanism is validated on 35B-A3B; the
   full 122B run is gated on a model download decision (Int4 only on this rig — an FP8 pinned pool
   would exceed host RAM).
+- **GGUF loader generalization (registry / family tables) [planned]** — replace the current
+  one-bespoke-adapter-per-family GGUF loaders (Qwen3.5/3.6, Gemma-4 dense) with a registry + family
+  descriptor tables, so new GGUF families need data, not a new adapter. Gated on a Qwen3.5 byte-identity
+  check (the generalization must not regress the existing path).
+- **MoE Gemma-4 GGUF [planned]** — extend the Gemma-4 GGUF adapter to the MoE variant (`_exps` tensors),
+  which the dense S1 loader currently rejects fail-fast.
 - **Upstream adaptive-spec PR review/port, tree-spec topk>1 on better interconnect, uneven-TP over
   nodes/RDMA [planned]** — longer-horizon items.
 - **Future — new-Mistral support (conditional, pending external release) [planned]** — support Mistral's
