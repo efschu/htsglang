@@ -365,6 +365,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        # Weightless-KV fast lane (Variant C Stage 1, Option-B). Derived from
+        # server_args (source of truth, independent of the module-global install
+        # ordering). The head rank holds the full weights and runs the model
+        # TP=1 + the attention dispatch; a weightless worker holds ONLY a KV
+        # token-shard, runs the stripped attention-only forward, and
+        # materializes no layer weights. These flags are COMPUTED here (B0) and
+        # consumed by the worker forward (B1) and the weightless loader (B2);
+        # they are no-ops on the default path (fast lane off).
+        _wl_fastlane = getattr(server_args, "weightless_kv_fastlane", False)
+        _wl_head = getattr(server_args, "weightless_kv_head_rank", 0)
+        self.is_weightless_head = _wl_fastlane and self.tp_rank == _wl_head
+        self.is_weightless_worker = _wl_fastlane and self.tp_rank != _wl_head
+        if self.is_weightless_worker:
+            logger.info(
+                "Weightless-KV fast lane: rank %d is a WEIGHTLESS KV worker "
+                "(KV-token-shard only; no layer weights).",
+                self.tp_rank,
+            )
+        elif self.is_weightless_head:
+            logger.info(
+                "Weightless-KV fast lane: rank %d is the HEAD rank (full "
+                "weights, TP=1 + attention dispatch).",
+                self.tp_rank,
+            )
         self.dcp_size = server_args.dcp_size
         self.dcp_rank = self.tp_rank % self.dcp_size
         self.moe_ep_rank = moe_ep_rank
@@ -1423,6 +1447,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+
+        # --- Weightless-KV fast lane, loader interception point (Option-B) ---
+        # B2 will make a weightless WORKER rank build the model on the `meta`
+        # device and materialize ONLY the KV pool + attention backend (no layer
+        # weights) -- the VRAM win. This is the SCAFFOLD (B0): it marks the
+        # intervention point and is INERT (workers still materialize weights
+        # here) until the worker forward carving (B1) lands, so that turning the
+        # flag on cannot leave meta weights that the still-symmetric forward
+        # would touch. No-op on the default path.
+        if self.is_weightless_worker:
+            # TODO(B2): build meta-model + skip load_weights on worker ranks
+            # once _forward_weightless_worker (B1) guarantees the model layers
+            # are never touched. For now, load normally (correctness first).
+            logger.info(
+                "Weightless-KV worker rank %d: loader-skip scaffolding present "
+                "but INERT (B0) -- loading weights normally until B1/B2.",
+                self.tp_rank,
+            )
 
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":

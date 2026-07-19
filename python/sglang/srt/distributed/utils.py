@@ -215,6 +215,22 @@ def weightless_kv_active() -> bool:
     return _WEIGHTLESS_KV_HEAD_RANK is not None
 
 
+def is_weightless_head_rank(rank: int) -> bool:
+    """True when the weightless-KV fast lane is active AND `rank` is the head
+    rank (holds the full weights, runs the model TP=1 + the attention dispatch).
+    False on the default path (fast lane off)."""
+    head_rank = _WEIGHTLESS_KV_HEAD_RANK
+    return head_rank is not None and rank == head_rank
+
+
+def weightless_worker_rank(rank: int) -> bool:
+    """True when the weightless-KV fast lane is active AND `rank` is a WEIGHTLESS
+    KV worker (holds ONLY a KV token-shard; runs the stripped attention-only
+    forward; materializes NO layer weights). False on the default path."""
+    head_rank = _WEIGHTLESS_KV_HEAD_RANK
+    return head_rank is not None and rank != head_rank
+
+
 def weightless_head_counts(total: int, world_size: int) -> list:
     """Per-rank head-count vector for the weightless-KV fast lane: `total` on
     the head rank, 0 on every weightless rank. E.g. total=24 heads, world=3,
