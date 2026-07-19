@@ -427,3 +427,13 @@ Deliberately ordered by risk to output: **byte-identical speed/capacity gains fi
   would exceed host RAM).
 - **Upstream adaptive-spec PR review/port, tree-spec topk>1 on better interconnect, uneven-TP over
   nodes/RDMA 📋** — longer-horizon items.
+- **Future — new-Mistral support (conditional, pending external release) 📋** — support Mistral's
+  next-generation "fat but sparse" MoE family (announced for July 2026 early access; open weights not
+  yet public) **once it ships publicly** and **only if it fits this class of rig** — i.e. its smallest
+  usable quant (Int4/Q4) must fit the VRAM + host-RAM-offload budget (roughly ≤65 GB via the
+  load-time expert offload in §6). **⚪ Conditional:** a ≈119B-scale sparse MoE at Int4 (≈60 GB) fits
+  tightly via offload; a 675B-class model does not. Foundation already exists (parked): the
+  config/format subsystem is complete, dense/Mixtral GGUF is already generic, plus three small
+  execution fixes (lazy MLA/Pixtral import decouple, LlamaMLP `tp_family` for uneven-TP, Mixtral
+  uneven-TP attention). Strictly forward-looking — current Mistral models were dropped as test targets
+  (too old; nothing newer from Europe than Gemma 4), so this is **not** a shipped feature.
