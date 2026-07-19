@@ -173,9 +173,16 @@ with zero cross-GPU communication while the slower cards handle distributed deco
 
 ## 4. GGUF
 
+There are two kinds of GGUF work here: (1) **new architecture support** — a custom adapter for the
+Qwen3.5/3.6 hybrid-GDN family, which upstream cannot load at all; and (2) **architecture-general
+GGUF improvements** (uneven-TP sharding, the tuned K-quant kernel, the perf overhaul, the vec
+alignment below) that benefit **any** GGUF model, not only Qwen. Note that the *new-model* GGUF
+adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4**) are supported via
+**AutoRound-int4 / Marlin**, not GGUF (see §5 and §7), so they don't appear here.
+
 - **Qwen3.5/3.6 hybrid-GDN GGUF ✅** — including NEXTN/MTP head, unsloth UD-quants, mmproj vision.
-  *Impact: enables GGUF for a model family/architecture upstream sglang could not load. No
-  throughput claim — enablement.*
+  *Impact: enables GGUF for a model family/architecture upstream sglang could not load (hybrid-GDN).
+  No throughput claim — enablement.*
 - **GGUF-MoE expert-dim sharding, uneven ✅** — whole experts per rank + zero-pad + remap,
   with GDN block coarsening and an MMQ fallback for misaligned blocks; A3B TP=3 coherent.
   *Impact: enables uneven-TP GGUF-MoE. Correctness/enablement.*
