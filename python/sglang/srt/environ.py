@@ -673,6 +673,16 @@ class Envs:
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
+    # MoE expert-offload (M-B/M-C, feat/moe-expert-offload). Fraction of each
+    # layer's local routed experts kept resident on GPU (1.0 = no offload =
+    # default, byte-identical). <1.0 activates the pinned-host pool + LRU
+    # H2D-fetch cache so the resident-fraction-vs-tok/s curve can be swept on a
+    # model that otherwise fully fits (A3B-FP8). Cold experts are FETCHED to
+    # GPU and computed on GPU (NOT CPU-computed — this AMD box has no AMX).
+    SGLANG_MOE_RESIDENT_EXPERT_FRACTION = EnvFloat(1.0)
+    # When set to a path, log per-layer routed expert IDs (topk_ids) to that
+    # file for offline routing-locality / cache-hit-rate simulation (M-C).
+    SGLANG_MOE_OFFLOAD_TRACE = EnvStr("")
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
