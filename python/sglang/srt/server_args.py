@@ -1170,6 +1170,31 @@ class ServerArgs:
             type_parser=_parse_mib_scalar_or_list,
         ),
     ] = None
+    weightless_kv_fastlane: A[
+        bool,
+        Arg(
+            help="EXPERIMENTAL (Variant C Stage 1): weightless-KV fast lane. "
+            "One 'head rank' (--weightless-kv-head-rank, default 0, the fast "
+            "weight-bearing card e.g. a 5090) holds the FULL model weights and "
+            "runs Q/O-proj + FFN + GDN as pure TP=1 (collective-free); the "
+            "other DCP ranks are WEIGHTLESS -- they hold ONLY a token-shard of "
+            "the KV cache and compute attention over it, so a large KV capacity "
+            "lives on the smaller cards while single-stream speed stays near "
+            "the head card's TP=1 rate. Requires --tp-size == --dcp-size and a "
+            "flashinfer attention backend. Stage 1 scope: decode + short "
+            "NON-chunked prefill only; speculative decoding and chunked prefill "
+            "are hard-rejected. Off by default -> every other path is "
+            "byte-identical.",
+        ),
+    ] = False
+    weightless_kv_head_rank: A[
+        int,
+        Arg(
+            help="The rank that holds all weights/heads under "
+            "--weightless-kv-fastlane (default 0). Every other rank is "
+            "weightless (KV-token-shard only).",
+        ),
+    ] = 0
     rank_tp_ratio: A[
         Optional[Union[List[int], str]],
         Arg(
@@ -3157,6 +3182,12 @@ class ServerArgs:
         # --mem-fraction-static is still distinguishable (None = unset).
         self._handle_uneven_tp()
 
+        # Weightless-KV fast lane (Variant C Stage 1): validate scope and
+        # hard-reject the out-of-scope modes (spec, chunked prefill) up front,
+        # so an unsupported config fails fast at arg-parse rather than
+        # desyncing the DCP collective sequence into a runtime NCCL hang.
+        self._handle_weightless_kv_fastlane()
+
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
 
@@ -3315,6 +3346,73 @@ class ServerArgs:
             logger.info(
                 f"Automatically turn off --chunked-prefill-size as it is not supported for "
                 f"{hf_config.model_type}"
+            )
+
+    def _handle_weightless_kv_fastlane(self):
+        """Validate the weightless-KV fast lane (Variant C Stage 1) and
+        hard-reject every out-of-scope mode up front.
+
+        The fast lane runs an ASYMMETRIC forward: the head rank runs the full
+        model while the weightless ranks run only the per-attention-layer DCP
+        dispatch. Any mode that adds or removes DCP-collective sites on only one
+        side (speculative decode, chunked prefill, PP/DP/EP) would desync the
+        collective sequence into a silent NCCL hang -- so they are rejected here
+        (fail fast), not hoped-around at runtime."""
+        if not self.weightless_kv_fastlane:
+            return
+
+        # Single-node pure TP + DCP only.
+        if self.pp_size > 1 or self.enable_dp_attention or self.ep_size > 1:
+            raise ValueError(
+                "--weightless-kv-fastlane supports pure single-node Tensor "
+                "Parallelism only; it cannot be combined with pipeline "
+                f"parallelism (pp_size={self.pp_size}), data-parallel attention, "
+                f"or expert parallelism (ep_size={self.ep_size})."
+            )
+        # DCP must span the whole TP group (one worker process per rank, the
+        # head rank + the weightless KV ranks).
+        if self.tp_size < 2:
+            raise ValueError(
+                "--weightless-kv-fastlane needs --tp-size >= 2 (one head rank "
+                f"plus >= 1 weightless KV rank); got tp_size={self.tp_size}."
+            )
+        if self.dcp_size != self.tp_size:
+            raise ValueError(
+                "--weightless-kv-fastlane requires --dcp-size == --tp-size "
+                "(the KV cache is token-sharded across the whole TP group); got "
+                f"dcp_size={self.dcp_size}, tp_size={self.tp_size}."
+            )
+        if not (0 <= self.weightless_kv_head_rank < self.tp_size):
+            raise ValueError(
+                f"--weightless-kv-head-rank={self.weightless_kv_head_rank} is "
+                f"out of range for tp_size={self.tp_size}."
+            )
+        # Stage 1 scope: NO speculative decoding (the MTP/NEXTN draft adds its
+        # own attention/DCP sites on the head rank that the weightless workers
+        # do not mirror).
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "--weightless-kv-fastlane (Stage 1) does not support "
+                "speculative decoding "
+                f"(--speculative-algorithm={self.speculative_algorithm}). Run "
+                "with speculative decoding OFF; the MTP draft dispatch is a "
+                "later stage."
+            )
+        # Stage 1 scope: NO chunked prefill (chunk boundaries change the
+        # per-forward attention-layer collective count).
+        if self.chunked_prefill_size is None or self.chunked_prefill_size > 0:
+            raise ValueError(
+                "--weightless-kv-fastlane (Stage 1) requires chunked prefill "
+                "DISABLED (--chunked-prefill-size -1); got "
+                f"{self.chunked_prefill_size}. Long chunked prefill is a later "
+                "stage."
+            )
+        # The [H,0,0] head-broadcast + LSE-merge dispatch is implemented in the
+        # flashinfer backend only.
+        if self.attention_backend not in (None, "flashinfer", "fa3"):
+            raise ValueError(
+                "--weightless-kv-fastlane requires a flashinfer attention "
+                f"backend; got --attention-backend={self.attention_backend}."
             )
 
     def _handle_model_source_paths(self):

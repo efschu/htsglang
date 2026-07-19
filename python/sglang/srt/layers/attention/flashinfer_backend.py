@@ -457,10 +457,20 @@ class FlashInferAttnBackend(AttentionBackend):
             tp_partition_sizes,
             uneven_dcp_active,
             uneven_dcp_kv_replicated,
+            weightless_head_counts,
+            weightless_kv_active,
         )
 
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
+        # Weightless-KV fast lane (Variant C Stage 1): one head rank holds ALL
+        # heads/weights, the other DCP ranks are weightless (0 heads, KV-token-
+        # shard only). It forces the DCP decode path (the Q all-gather becomes a
+        # broadcast from the head rank, the O merge slices back to the head rank
+        # only) even though no --rank-tp-ratio weight vector is installed.
+        self.weightless_kv = weightless_kv_active() and not getattr(
+            model_runner, "is_draft_worker", False
+        )
         # M4 (MTP+DCP): the DRAFT worker (EAGLE/NEXTN) does NOT token-shard its
         # tiny 1-layer KV pool. It runs as a plain uneven-TP model -- head-sharded
         # kv (whole GQA groups per rank, [2,1,1]) with the FULL token context
@@ -469,9 +479,9 @@ class FlashInferAttnBackend(AttentionBackend):
         # This is the coordinator's "keep the draft heads local, not DCP-split"
         # simplification (minimal variant: head-sharded across ranks, reusing the
         # existing uneven-TP weight loading, rather than whole-on-one-card).
-        self.uneven_dcp = uneven_dcp_kv_replicated(self.dcp_size) and not getattr(
-            model_runner, "is_draft_worker", False
-        )
+        self.uneven_dcp = (
+            uneven_dcp_kv_replicated(self.dcp_size) or self.weightless_kv
+        ) and not getattr(model_runner, "is_draft_worker", False)
         # WEIGHTED owner rule (SGLANG_UNEVEN_DCP_WEIGHTED): a non-uniform token
         # vector is installed, so this rank owns the contiguous virtual-block
         # offset range [cp_lo, cp_hi) of every block of cp_S slots (instead of
@@ -520,28 +530,45 @@ class FlashInferAttnBackend(AttentionBackend):
             # so the per-layer kv-head all-gather in _dcp_masked_write is
             # a no-op and is skipped; q splits in kv_total-sized units
             # (e.g. A3B 16 q / 2 kv over TP=3 -> [6,6,4]).
-            self.dcp_kv_replicated_heads = attn_kv_replicated(
-                attn_tp_size, total_kv
-            )
-            # Per-rank uneven head partitions, e.g. 24 q over [2,1,1] kv
-            # units -> q [12,6,6], kv [2,1,1] (normal mode: whole GQA
-            # groups per rank).
-            self.dcp_q_head_counts = tp_partition_sizes(
-                mc.num_attention_heads,
-                attn_tp_size,
-                units=attn_q_partition_units(
-                    mc.num_attention_heads, total_kv, attn_tp_size
-                ),
-                # kv-boundary alignment (task #116): the per-rank q-head
-                # counts (and the #105 straddle guard) follow the aligned
-                # split, matching qkv/o_proj.
-                groups=attn_q_partition_groups(total_kv, attn_tp_size),
-            )
-            self.dcp_kv_head_counts = (
-                [total_kv] * attn_tp_size
-                if self.dcp_kv_replicated_heads
-                else tp_partition_sizes(total_kv, attn_tp_size, units=total_kv)
-            )
+            if self.weightless_kv:
+                # Weightless-KV fast lane: ALL heads live on the head rank
+                # (full weights, TP=1); every other rank is weightless (0
+                # heads). kv-heads are NOT replicated here -- only the head
+                # rank projects K,V, so _dcp_masked_write broadcasts the new
+                # token's K,V from the head rank via the [total_kv,0,0]
+                # all-gather (the weightless ranks pass an empty [T,0,D] shard).
+                self.dcp_kv_replicated_heads = False
+                self.dcp_q_head_counts = weightless_head_counts(
+                    mc.num_attention_heads, attn_tp_size
+                )
+                self.dcp_kv_head_counts = weightless_head_counts(
+                    total_kv, attn_tp_size
+                )
+            else:
+                self.dcp_kv_replicated_heads = attn_kv_replicated(
+                    attn_tp_size, total_kv
+                )
+                # Per-rank uneven head partitions, e.g. 24 q over [2,1,1] kv
+                # units -> q [12,6,6], kv [2,1,1] (normal mode: whole GQA
+                # groups per rank).
+                self.dcp_q_head_counts = tp_partition_sizes(
+                    mc.num_attention_heads,
+                    attn_tp_size,
+                    units=attn_q_partition_units(
+                        mc.num_attention_heads, total_kv, attn_tp_size
+                    ),
+                    # kv-boundary alignment (task #116): the per-rank q-head
+                    # counts (and the #105 straddle guard) follow the aligned
+                    # split, matching qkv/o_proj.
+                    groups=attn_q_partition_groups(total_kv, attn_tp_size),
+                )
+                self.dcp_kv_head_counts = (
+                    [total_kv] * attn_tp_size
+                    if self.dcp_kv_replicated_heads
+                    else tp_partition_sizes(
+                        total_kv, attn_tp_size, units=total_kv
+                    )
+                )
             # FULL gathered counts the paged wrappers are planned with.
             self.dcp_full_qo_heads = mc.num_attention_heads
             self.dcp_full_kv_heads = total_kv
