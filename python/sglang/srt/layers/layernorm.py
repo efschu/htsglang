@@ -711,6 +711,14 @@ class GemmaRMSNorm(MultiPlatformOp):
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
+        # Device-safety: under CPU weight offload (--cpu-offload-gb / expert
+        # offload) the `weight` param is moved to CPU at construction, but
+        # `gemma_weight` is a non-persistent buffer created on the build device
+        # (cuda), so a raw `torch.add(cpu_param, out=cuda_buffer)` mismatches.
+        # Keep the precomputed buffer on the param's current device; when the
+        # module is later moved to GPU for a forward, both travel together.
+        if self.gemma_weight.device != param.data.device:
+            self.gemma_weight = torch.ones_like(param.data)
         # Keep storage stable for CUDA graphs or fused paths that capture this buffer.
         torch.add(param.data, 1.0, out=self.gemma_weight)
 
