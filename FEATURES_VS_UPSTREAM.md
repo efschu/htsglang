@@ -298,6 +298,23 @@ adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4*
   a reproducible container image, and env-gated falsifier probes used to hunt the determinism bugs
   above.
 
+## 10. Serving & Scheduling
+
+- **Fast-lane priority scheduling (Stage 0, `--enable-fast-lane`) ✅** — an opt-in fast lane built on
+  sglang's priority subsystem. Tag a request `lane="fast"` (or high priority) and, under heavy
+  concurrent load, it **preempts into the running batch** instead of being head-of-line-blocked
+  behind a full heavy batch. A **reserved-heavy-slots floor** plus **heavy-aging** guarantees the
+  heavy batch keeps making progress, so there is no starvation of the background load. Opt-in and
+  default OFF → the default scheduling path stays byte-identical.
+  *Impact: **🟢 interactive TTFT under saturated load dramatically better** — first token in
+  milliseconds instead of tens of seconds, i.e. near-unloaded responsiveness even while a heavy
+  batch runs; **🟢 heavy-batch throughput largely retained** under the fast preemption; **⚪ zero extra
+  VRAM**.*
+  **Honest scope (don't over-read it):** once admitted, the fast request **decodes at the shared
+  batched rate, not at solo speed**. Stage 0 fixes **responsiveness / TTFT** under load — it does
+  **not** give sustained **single-stream decode** speed under load. That needs a dedicated compute
+  lane (the weightless-KV / dual-lane work, still in progress), not just priority preemption.
+
 ---
 
 ## Guarded / descoped (kept, not shipped)
