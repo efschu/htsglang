@@ -386,6 +386,29 @@ way to run it.
   context limiter for big models (addressed by the load-time MoE offload in §6); **[neutral] TP-only,
   single-node** — PP/DP/EP/spec/chunked-prefill are rejected by design (hard fail-fast).
 
+## Aside — one bring-up note worth recording
+
+During the 122B-A10B expert-offload bring-up, the load path hit a host-RAM wall on the 80 GB,
+no-swap box. The root cause is worth recording: `create_weights` commits the full expert set upfront
+— `torch.empty` allocates all 48×256 experts on CPU, about 61 GB — *before* any marlin repack runs.
+That peak is therefore both fraction-independent and tensor-parallel-independent: sharding across
+ranks splits the allocation across processes but not the aggregate. Measured peak host-used was about
+75 GB, leaving a MemAvailable floor near 5 GB — close enough to a no-swap freeze that the boot was
+aborted.
+
+The queued software fix was a custom streaming/layered loader: meta-allocate the experts (zero
+upfront commit), then per decoder layer materialize → load → repack → presplit into GPU-resident +
+pinned-host spill → free, so the host never holds the full 61 GB at once.
+
+Instead, the operator downloaded 30 GB of RAM at precisely the right moment. The box went from 76 to
+108 GiB. The same ~75 GB peak now leaves a ~30 GB floor, so the 122B boots on the existing loader at
+a lower resident fraction, and the streaming loader stays unbuilt. It remains a follow-up — still the
+correct fix for models larger than this, or for tighter multi-process TP aggregates — untouched for
+now, emphasis on "for now".
+
+The moral: a hardware addition resolved what was queued as a loader rewrite. The rewrite is deferred,
+not cancelled.
+
 ---
 
 ## Guarded / descoped (kept, not shipped)
