@@ -540,9 +540,19 @@ class TpModelWorker(BaseTpWorker):
             # Weightless-KV fast lane (Option-B, B1): a weightless KV worker rank
             # produced no logits (its stripped forward only attends its KV
             # token-shard). It never samples -- only the head rank has the
-            # lm_head + valid hidden states and produces the tokens. Return the
-            # (logits-less) result; the head rank's tokens are authoritative.
+            # lm_head + valid hidden states and produces the authoritative
+            # tokens (only rank 0 emits output). Give this rank a DUMMY
+            # batch-sized next_token_ids (mirroring the prefill-only path below)
+            # so the scheduler's copy_to_cpu / result processing runs harmlessly
+            # on every rank. KV-slot decisions come from the rank-0 leader's
+            # broadcast batch, so the workers' dummy tokens don't affect KV
+            # correctness.
             if getattr(self.model_runner, "is_weightless_worker", False):
+                batch_result.next_token_ids = torch.zeros(
+                    len(forward_batch.seq_lens),
+                    dtype=torch.long,
+                    device=forward_batch.seq_lens.device,
+                )
                 return batch_result
 
             if is_verify:
