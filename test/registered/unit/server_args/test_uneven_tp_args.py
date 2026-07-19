@@ -3,6 +3,7 @@
 --rank-auto-reserve-mib) — CPU only, NVML mocked."""
 
 import argparse
+import os
 import unittest
 from unittest.mock import patch
 
@@ -626,6 +627,50 @@ class TestMoeRatio(CustomTestCase):
                 args = run_handler(self._valid_base())
         self.assertEqual(args.rank_mlp_ratio, [7, 4, 4])
         self.assertEqual(args.rank_moe_ratio, [9, 5, 5])
+
+
+class TestTreeSpecDcpGuard(CustomTestCase):
+    """#76 guard: tree/branching speculation (--speculative-eagle-topk > 1)
+    must HARD-ERROR under uneven-weighted DCP, because the tree-masked
+    draft->draft verify attention on that path produces tree-topology-dependent
+    verify logits -> non-deterministic, non-greedy output (proven on GPU vs a
+    topk=1 oracle at temp 0). topk == 1 (linear chain) stays allowed and is
+    bitwise-deterministic. CPU only; is_cuda()/is_hip() and the SGLANG_UNEVEN_DCP
+    env are mocked so the CUDA weighted-DCP branch is exercised off-GPU."""
+
+    def _run_guard(self, eagle_topk):
+        # Weighted uneven-DCP + spec: dcp_size==tp_size, non-uniform ratio, both
+        # env flags set -> uneven_weighted_dcp is True inside the handler.
+        args = make_args(
+            tp_size=3,
+            dcp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=[26000, 17000, 17000],
+            rank_tp_ratio=[2, 1, 1],
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=eagle_topk,
+        )
+        env = {
+            **os.environ,
+            "SGLANG_UNEVEN_DCP": "1",
+            "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
+        }
+        with patch.object(server_args_module, "is_hip", return_value=False), patch.object(
+            server_args_module, "is_cuda", return_value=True
+        ), patch.dict(os.environ, env, clear=True):
+            args._handle_dcp_validation()
+        return args
+
+    def test_topk_gt1_rejected(self):
+        # topk 2, 4, 8 must all fail fast at arg validation.
+        for topk in (2, 4, 8):
+            with self.subTest(topk=topk):
+                with self.assertRaisesRegex(ValueError, "eagle-topk"):
+                    self._run_guard(topk)
+
+    def test_topk1_chain_allowed(self):
+        # The correct, deterministic chain path must NOT be disturbed.
+        self._run_guard(1)  # must not raise
 
 
 if __name__ == "__main__":
