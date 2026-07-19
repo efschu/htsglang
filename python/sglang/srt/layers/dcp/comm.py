@@ -133,8 +133,13 @@ def cp_all_gather_heads_uneven(
     )
     max_heads = max(counts)
     if all(c == max_heads for c in counts):
-        # Equal split: the padded path is a no-op; use the plain collective.
-        return cp_group.all_gather(x, dim=1)
+        # Equal split (e.g. even TP DCP, #107 Variant A): the padded path is a
+        # no-op; use the plain collective. all_gather_into_tensor requires a
+        # CONTIGUOUS input, but the k/v tensor handed in from the attention
+        # forward is typically a non-contiguous head-sliced view -- the uneven
+        # branch below hides this because it copies into a fresh padded buffer.
+        # Force contiguity here so the equal-split fast path matches.
+        return cp_group.all_gather(x.contiguous(), dim=1)
     pad_shape = list(x.shape)
     pad_shape[1] = max_heads
     padded = x.new_zeros(pad_shape)

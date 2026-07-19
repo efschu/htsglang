@@ -749,6 +749,20 @@ def setup_state_kv_args(
             kv_args.is_hybrid_mla_backend = is_mla_backend(
                 token_to_kv_pool.full_kv_pool
             )
+            # Conv-state [query|key|value] sub-block transfer segments (GDN):
+            # the conv1d channels are three independently head-sharded
+            # sub-blocks, so a TP-mismatched PD transfer must move each
+            # separately rather than flat-slicing conv_dim. The DECODE computes
+            # its per-sub-block [src,len] slices here (with its own possibly
+            # weighted --rank-tp-ratio plan, which the prefill sender lacks) and
+            # registers them; the sender replays them (see
+            # KVManager._send_mamba_state_slice). None/empty -> legacy flat
+            # slice (correct for same-tp). Parallel to state_dim_per_tensor.
+            kv_args.state_conv_segments = (
+                token_to_kv_pool.get_conv_transfer_segments()
+                if hasattr(token_to_kv_pool, "get_conv_transfer_segments")
+                else None
+            ) or []
             append_state_component(
                 kv_args,
                 StateType.MAMBA,

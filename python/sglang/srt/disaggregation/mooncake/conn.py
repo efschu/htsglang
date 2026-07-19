@@ -139,6 +139,13 @@ class KVArgsRegisterInfo:
     # (dim units) of the decode rank's shard, parallel to
     # dst_state_dim_per_tensor. Empty -> uniform (rank * dim) legacy formula.
     dst_state_dim_offsets: List[List[int]] = dataclasses.field(default_factory=list)
+    # Conv-state [q|k|v] sub-block transfer segments: per-tensor flat
+    # [src0,len0,src1,len1,...] (source offset in the FULL conv tensor + length
+    # of this decode rank's shard of each sub-block), computed on the decode
+    # with ITS partition plan. Empty per-tensor entry -> legacy flat slice.
+    dst_state_conv_segments: List[List[int]] = dataclasses.field(
+        default_factory=list
+    )
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -163,6 +170,10 @@ class KVArgsRegisterInfo:
             ),
             dst_state_dim_offsets=(
                 unpack_int_lists(msg[12], "I") if len(msg) > 12 else []
+            ),
+            # Appended after the staging fields (13,14); older peers omit it.
+            dst_state_conv_segments=(
+                unpack_int_lists(msg[15], "I") if len(msg) > 15 else []
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
@@ -1030,6 +1041,14 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         else []
                     )
+                    # Conv sub-block segments are registered FLAT per mamba
+                    # tensor (not nested per state-type), parallel to the
+                    # tensors _send_mamba_state_slice iterates.
+                    dst_conv_segments = getattr(
+                        target_rank_registration_info,
+                        "dst_state_conv_segments",
+                        [],
+                    )
                     rc = (
                         self._send_mamba_state_slice(
                             req,
@@ -1044,6 +1063,7 @@ class MooncakeKVManager(CommonKVManager):
                             target_rank_registration_info.dst_tp_rank,
                             target_rank_registration_info.dst_attn_tp_size,
                             dst_state_dim_offsets=dst_dim_offsets,
+                            dst_state_conv_segments=dst_conv_segments,
                         )
                         or rc
                     )
@@ -1183,6 +1203,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_state_dim_offsets: Optional[list] = None,
+        dst_state_conv_segments: Optional[list] = None,
     ):
         """Transfer Mamba states with TP slice support.
 
@@ -1214,6 +1235,18 @@ class MooncakeKVManager(CommonKVManager):
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
 
+        # Conv-state [query|key|value] sub-block segments (GDN): each conv
+        # sub-block is head-sharded INDEPENDENTLY, so a decode rank's conv_state
+        # is [q_shard|k_shard|v_shard] concatenated -- NOT a contiguous slice of
+        # the full conv_dim. A TP-mismatched transfer must move each sub-block
+        # separately; a single flat slice delivers the wrong channels and
+        # corrupts the conv window (wrong next-token logits) while the pure
+        # per-head ssm/temporal state stays correct. The DECODE registered its
+        # per-sub-block [src,len] slices (computed with its own -- possibly
+        # weighted -- partition plan, which the prefill sender lacks); the
+        # sender just replays them. Empty entry -> legacy flat slice.
+        conv_segments = dst_state_conv_segments or []
+
         transfer_blocks = []
         for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
             src_item_len = src_state_item_lens[i]
@@ -1225,15 +1258,45 @@ class MooncakeKVManager(CommonKVManager):
             src_bytes_per_dim = src_item_len // src_dim
             dst_bytes_per_dim = dst_item_len // dst_dim
 
-            if self.attn_tp_size > dst_attn_tp_size:
-                # Multiple prefill ranks send to 1 decode rank
-                src_dim_start = 0
-                num_dims_to_send = src_dim
+            # Build (src_start_dim, dst_start_dim, num_dims) segments for this
+            # tensor. Usually ONE segment; a conv tensor under a 1->many
+            # transfer splits into one segment per [q|k|v] sub-block (from the
+            # decode's registered [src,len] pairs) so each lands on the channels
+            # the decode rank actually holds. dst offsets are the prefix sum of
+            # the segment lengths (the compact conv shard is the sub-blocks
+            # concatenated in order).
+            segments = []
+            tensor_conv_segs = (
+                conv_segments[i]
+                if self.attn_tp_size <= dst_attn_tp_size and i < len(conv_segments)
+                else None
+            )
+            if tensor_conv_segs:
+                dst_base = 0
+                if len(tensor_conv_segs) % 2 != 0:
+                    raise RuntimeError(
+                        f"Malformed conv segment list for tensor {i}: "
+                        f"{tensor_conv_segs} (expected [src,len] pairs)."
+                    )
+                for j in range(0, len(tensor_conv_segs), 2):
+                    seg_src = int(tensor_conv_segs[j])
+                    seg_len = int(tensor_conv_segs[j + 1])
+                    segments.append((seg_src, dst_base, seg_len))
+                    dst_base += seg_len
+                if dst_base != dst_dim:
+                    raise RuntimeError(
+                        "Conv sub-block slice mismatch: segments summed to "
+                        f"{dst_base} dims but decode registered dst_dim={dst_dim} "
+                        f"(segments={tensor_conv_segs}, tensor {i})."
+                    )
+            elif self.attn_tp_size > dst_attn_tp_size:
+                # Multiple prefill ranks send to 1 decode rank.
                 writers_per_decode = self.attn_tp_size // dst_attn_tp_size
                 local_writer_idx = local_tp_rank_in_group % writers_per_decode
-                dst_dim_start = local_writer_idx * src_dim
+                segments.append((0, local_writer_idx * src_dim, src_dim))
             else:
-                # 1 prefill rank sends to multiple decode ranks
+                # 1 prefill rank sends to multiple decode ranks (non-conv, or no
+                # conv sub-block spec): a single contiguous slice.
                 if dst_state_dim_offsets and i < len(dst_state_dim_offsets):
                     # Uneven-TP (--rank-tp-ratio) shards: the decode rank's
                     # slice starts at its registered prefix-sum offset, not at
@@ -1247,23 +1310,22 @@ class MooncakeKVManager(CommonKVManager):
                         )
                 else:
                     src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
-                num_dims_to_send = dst_dim
-                dst_dim_start = 0
+                segments.append((src_dim_start, 0, dst_dim))
 
-            src_dim_offset = src_dim_start * src_bytes_per_dim
-            dst_dim_offset = dst_dim_start * dst_bytes_per_dim
-            bytes_to_send = num_dims_to_send * src_bytes_per_dim
-
-            src_addr = (
-                src_state_data_ptrs[i]
-                + src_item_len * int(prefill_mamba_index[0])
-                + src_dim_offset
-            )
-            dst_addr = (
-                dst_state_ptr + dst_item_len * int(dst_mamba_index[0]) + dst_dim_offset
-            )
-
-            transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
+            for src_dim_start, dst_dim_start, num_dims_to_send in segments:
+                src_addr = (
+                    src_state_data_ptrs[i]
+                    + src_item_len * int(prefill_mamba_index[0])
+                    + src_dim_start * src_bytes_per_dim
+                )
+                dst_addr = (
+                    dst_state_ptr
+                    + dst_item_len * int(dst_mamba_index[0])
+                    + dst_dim_start * dst_bytes_per_dim
+                )
+                transfer_blocks.append(
+                    (src_addr, dst_addr, num_dims_to_send * src_bytes_per_dim)
+                )
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
@@ -1968,6 +2030,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_dim_offsets = pack_int_lists(
                 getattr(self.kv_mgr.kv_args, "state_dim_offsets", []) or [], "I"
             )
+            # Conv-state [q|k|v] sub-block transfer segments (this decode rank's
+            # per-sub-block [src,len] slices, computed with ITS partition plan).
+            # Appended LAST so older peers (which stop before this field) are
+            # unaffected. Parallel to state_dim_per_tensor; empty entry -> flat.
+            packed_state_conv_segments = pack_int_lists(
+                getattr(self.kv_mgr.kv_args, "state_conv_segments", []) or [], "I"
+            )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
@@ -2004,6 +2073,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         packed_state_dim_offsets,
                         packed_staging_base_ptr,
                         staging_total_size_str,
+                        packed_state_conv_segments,
                     ]
                 )
 
