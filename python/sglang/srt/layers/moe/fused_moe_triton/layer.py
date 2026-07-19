@@ -462,6 +462,7 @@ class FusedMoE(torch.nn.Module):
         self._expert_offload_fraction = (
             envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get()
         )
+        self._expert_offload_spill_slots = envs.SGLANG_MOE_SPILL_CACHE_SLOTS.get()
         self._moe_offload_trace_path = envs.SGLANG_MOE_OFFLOAD_TRACE.get()
         self._moe_offload_enabled = (
             self._expert_offload_fraction < 1.0
@@ -1563,7 +1564,11 @@ class FusedMoE(torch.nn.Module):
         from sglang.srt.layers.moe.expert_offload import MoEExpertOffloadCache
 
         try:
-            cache = MoEExpertOffloadCache(self, self._expert_offload_fraction)
+            cache = MoEExpertOffloadCache(
+                self,
+                self._expert_offload_fraction,
+                spill_slots=self._expert_offload_spill_slots,
+            )
             if cache.planner.fully_resident:
                 # ceil(fraction * num_local_experts) == num_local_experts:
                 # nothing to offload, keep the default path.
@@ -1572,11 +1577,15 @@ class FusedMoE(torch.nn.Module):
             cache.install()
             self._expert_offload = cache
             logging.getLogger(__name__).info(
-                "MoE expert-offload active on layer %s: %d/%d experts resident "
-                "(fraction=%.3f)",
+                "MoE expert-offload TIERED on layer %s: R=%d resident + C=%d "
+                "spill-cache (buffer=%d) of N=%d experts; host pool holds %d "
+                "spill experts (fraction=%.3f)",
                 self.layer_id,
+                cache.n_resident,
+                cache.n_spill_slots,
                 cache.n_slots,
                 cache.num_local_experts,
+                cache.host_pool_experts,
                 self._expert_offload_fraction,
             )
         except Exception as e:  # pragma: no cover - GPU-window failure path

@@ -679,7 +679,17 @@ class Envs:
     # H2D-fetch cache so the resident-fraction-vs-tok/s curve can be swept on a
     # model that otherwise fully fits (A3B-FP8). Cold experts are FETCHED to
     # GPU and computed on GPU (NOT CPU-computed — this AMD box has no AMX).
+    # TIERED RESIDENCY (feat/moe-expert-offload): f now means R = ceil(f*N)
+    # experts are PERMANENTLY resident on GPU (no host copy) and the remaining
+    # N-R experts spill to a pinned host pool, fetched on demand into a small
+    # GPU spill cache. RAM therefore holds ONLY the spill set (N-R), not all N
+    # -- this is what makes a large FP8 MoE feasible on limited RAM. f == 1.0 =
+    # R == N = no offload = default, byte-identical. Cold spill experts are
+    # FETCHED to GPU and computed on GPU (NOT CPU-computed — no AMX on this box).
     SGLANG_MOE_RESIDENT_EXPERT_FRACTION = EnvFloat(1.0)
+    # Spill-cache size C (GPU slots the spill experts wave through). 0 = auto =
+    # max(top_k, 8). Only used when SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0.
+    SGLANG_MOE_SPILL_CACHE_SLOTS = EnvInt(0)
     # When set to a path, log per-layer routed expert IDs (topk_ids) to that
     # file for offline routing-locality / cache-hit-rate simulation (M-C).
     SGLANG_MOE_OFFLOAD_TRACE = EnvStr("")
