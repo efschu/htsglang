@@ -945,6 +945,99 @@ class MambaPool:
             offsets += [per_tensor] * (n_tensors * self.num_mamba_layers)
         return offsets
 
+    def get_conv_subblock_spec(self):
+        """Conv-state sub-block structure, for TP-mismatched PD state transfer.
+
+        The GDN conv1d operates on the concatenation [query | key | value]
+        along conv_dim (qwen3_next Qwen3GatedDeltaNet: conv_dim =
+        key_dim*2 + value_dim; conv1d.weight is loaded by
+        mamba_v2_sharded_weight_loader with the sub-block spec
+        [query_key, query_key, value]). Each sub-block is sharded
+        INDEPENDENTLY by heads, so a rank's conv_state is
+        [q_shard | k_shard | v_shard] concatenated -- NOT a contiguous slice
+        of the full conv_dim. A PD transfer between different attn_tp_size must
+        therefore move each sub-block separately (see _send_mamba_state_slice);
+        a single flat slice delivers the wrong channels.
+
+        Returns (sub_block_full_sizes, units, conv_dim), or None when the shape
+        does not expose the GDN [q|k|v] conv structure -- then the caller keeps
+        the legacy single-slice path (correct for the same-tp case, where no
+        dim slicing happens at all).
+        """
+        shape = getattr(self.cache_params, "shape", None)
+        conv_dim = getattr(shape, "conv_dim", None)
+        num_heads = getattr(shape, "num_heads", None)
+        head_dim = getattr(shape, "head_dim", None)
+        units = getattr(shape, "partition_units", None)
+        if conv_dim is None or num_heads is None or head_dim is None:
+            return None
+        value_dim = num_heads * head_dim
+        key_dim = (conv_dim - value_dim) // 2
+        # Only the [query_key | query_key | value] GDN layout is handled; if the
+        # arithmetic does not reconstruct conv_dim, bail out and keep the legacy
+        # flat slice rather than risk mis-slicing an unknown conv layout.
+        if key_dim <= 0 or key_dim * 2 + value_dim != conv_dim:
+            return None
+        return ([key_dim, key_dim, value_dim], units, conv_dim)
+
+    def get_conv_transfer_segments(self):
+        """THIS rank's conv-state [q|k|v] sub-block segments for a
+        TP-mismatched PD transfer, computed with THIS rank's own (possibly
+        weighted --rank-tp-ratio) partition plan -- the prefill sender does NOT
+        have the decode's plan, so the decode must compute the slice itself.
+
+        Returns a list parallel to get_state_dim_per_tensor (one entry per
+        conv/temporal tensor x layer): each CONV tensor's entry is a flat
+        [src0, len0, src1, len1, ...] of per-sub-block (source offset in the
+        FULL/unsharded conv tensor, length) for this rank's head shard of each
+        sub-block; non-conv tensors get []. The destination layout is the
+        rank's COMPACT conv shard = the sub-blocks concatenated in order, so the
+        sender derives dst offsets by prefix-summing the lengths. Returns None
+        when the GDN conv structure is unavailable (caller keeps flat slice).
+        """
+        spec = self.get_conv_subblock_spec()
+        if spec is None:
+            return None
+        sub_sizes, units, _conv_dim = spec
+
+        from sglang.srt.distributed.utils import (
+            tp_partition_offset,
+            tp_partition_size,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        tp_size = parallel.attn_tp_size
+        rank = parallel.attn_tp_rank
+
+        # (src offset in full tensor, len) per sub-block, using this rank's plan.
+        pairs = []
+        src_base = 0
+        for sub_full in sub_sizes:
+            seg_len = tp_partition_size(sub_full, tp_size, rank, units)
+            seg_src = src_base + tp_partition_offset(sub_full, tp_size, rank, units)
+            pairs += [seg_src, seg_len]
+            src_base += sub_full
+
+        segments = []
+        for field in vars(self.mamba_cache):
+            if field in (
+                "intermediate_ssm",
+                "intermediate_conv_window",
+                "replayssm_d",
+                "replayssm_k",
+                "replayssm_g",
+            ):
+                continue
+            value = getattr(self.mamba_cache, field)
+            if value is None:
+                continue
+            is_conv = "conv" in field
+            n_tensors = len(value) if isinstance(value, list) else 1
+            entry = list(pairs) if is_conv else []
+            segments += [list(entry) for _ in range(n_tensors * self.num_mamba_layers)]
+        return segments
+
 
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
@@ -2812,6 +2905,16 @@ class HybridLinearKVPool(KVCache):
         """Uneven-TP slice start offsets, parallel to get_state_dim_per_tensor
         (None when no uneven plan is active). See MambaPool.get_state_dim_offsets."""
         return self.mamba_pool.get_state_dim_offsets()
+
+    def get_conv_subblock_spec(self):
+        """Conv-state [q|k|v] sub-block structure for TP-mismatched PD transfer.
+        See MambaPool.get_conv_subblock_spec."""
+        return self.mamba_pool.get_conv_subblock_spec()
+
+    def get_conv_transfer_segments(self):
+        """This rank's conv-state [q|k|v] sub-block transfer segments.
+        See MambaPool.get_conv_transfer_segments."""
+        return self.mamba_pool.get_conv_transfer_segments()
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
