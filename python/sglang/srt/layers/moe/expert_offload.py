@@ -107,39 +107,49 @@ class ResidencyStats:
 
 
 def plan_token_waves(
-    experts_per_token: Sequence[Sequence[int]], n_slots: int
+    experts_per_token: Sequence[Sequence[int]],
+    resident_count: int,
+    scratch: int,
 ) -> List[List[int]]:
-    """Greedily partition token indices into waves whose union of unique routed
-    experts is <= ``n_slots``.
+    """Greedily partition token indices into waves whose union of unique SPILL
+    experts (global id >= ``resident_count``) is <= ``scratch``.
+
+    Fixed-resident + scratch model: experts ``[0, resident_count)`` are always
+    resident on GPU (fixed slots, never fetched), so they impose NO wave budget.
+    Only the SPILL experts (``>= resident_count``) consume the ``scratch`` slots
+    and must be fetched, so a wave may include any number of resident experts
+    plus at most ``scratch`` unique spill experts.
 
     Pure-python, CPU-testable. ``experts_per_token[t]`` is the list of routed
     expert ids for token ``t`` (``-1`` padding allowed and ignored). Returns a
     list of waves; each wave is a list of token indices in original order.
-    Every token index appears in exactly one wave.
 
-    Raises ``ValueError`` if a single token needs more than ``n_slots`` unique
-    experts -- that means ``n_slots < top_k`` and offload cannot serve even one
-    token; the caller must fail fast rather than silently drop experts.
+    Raises ``ValueError`` if a single token needs more than ``scratch`` unique
+    spill experts -- offload cannot serve even one token; fail fast.
     """
-    if n_slots < 1:
-        raise ValueError("n_slots must be >= 1")
+    if scratch < 1:
+        raise ValueError("scratch must be >= 1")
     waves: List[List[int]] = []
     cur_rows: List[int] = []
-    cur_set: set = set()
+    cur_spill: set = set()
     for t, experts in enumerate(experts_per_token):
-        ex = {int(e) for e in experts if e is not None and e >= 0}
-        if len(ex) > n_slots:
+        spill = {
+            int(e)
+            for e in experts
+            if e is not None and int(e) >= resident_count
+        }
+        if len(spill) > scratch:
             raise ValueError(
-                f"token {t} routes to {len(ex)} unique experts but only "
-                f"n_slots={n_slots} resident slots are available "
-                f"(SGLANG_MOE_RESIDENT_EXPERT_FRACTION too small: a single "
-                f"token's top-k must fit in the resident buffer)."
+                f"token {t} routes to {len(spill)} spill experts but only "
+                f"scratch={scratch} scratch slots are available (a single "
+                f"token's spilled top-k must fit in the scratch region; raise "
+                f"the scratch size or the resident fraction)."
             )
-        if cur_rows and len(cur_set | ex) > n_slots:
+        if cur_rows and len(cur_spill | spill) > scratch:
             waves.append(cur_rows)
             cur_rows = []
-            cur_set = set()
-        cur_set |= ex
+            cur_spill = set()
+        cur_spill |= spill
         cur_rows.append(t)
     if cur_rows:
         waves.append(cur_rows)
@@ -148,50 +158,48 @@ def plan_token_waves(
 
 @dataclass
 class ExpertResidencyPlanner:
-    """Pure-python LRU residency bookkeeping for one MoE layer (CPU-testable).
+    """Pure-python FIXED-RESIDENT + SCRATCH residency for one MoE layer.
 
-    slot_of_expert maps a resident global expert id -> its slot index in the
-    resident buffer. `_lru` orders resident expert ids from least- to
-    most-recently used.
+    This is the host-capping, deterministic residency (Variant-C B2b):
+      * experts ``[0, resident_count)`` are ALWAYS resident on GPU at slot==id
+        (never fetched, never evicted). The host pinned pool therefore only
+        needs the SPILL experts ``[resident_count, num_local_experts)`` -> the
+        host footprint is ~spill, not the full expert set.
+      * a wave's SPILL experts (id >= resident_count), taken in SORTED order,
+        are fetched into the scratch region
+        ``[resident_count, resident_count + scratch)``.
+      * the GPU buffer size (``resident_count + scratch``) is FIXED, and the
+        per-wave layout is a pure function of the wave's needed set (fixed
+        resident slots + sorted scratch), so the marlin moe_align tiling is
+        deterministic -> greedy output is self-deterministic at temp=0 (no
+        cross-request drift). Resident experts are reused across waves without
+        re-fetching (throughput win vs the earlier refetch-all scheme).
 
-    A single ``resolve()`` call must be given at most ``n_slots`` unique
-    experts (guaranteed by ``plan_token_waves``); it never evicts an expert
-    that is needed within the same call.
+    A single ``resolve()`` must contain <= ``scratch`` unique spill experts
+    (guaranteed by ``plan_token_waves``).
     """
 
     num_local_experts: int
-    n_slots: int
-    slot_of_expert: Dict[int, int] = field(default_factory=dict)
-    _free_slots: List[int] = field(default_factory=list)
-    _lru: "OrderedDict[int, None]" = field(default_factory=OrderedDict)
+    resident_count: int
+    scratch: int
     stats: ResidencyStats = field(default_factory=ResidencyStats)
-    # Deterministic residency (default ON): assign each wave's needed experts to
-    # slots [0, k) in sorted expert-id order, independent of history. A served
-    # model MUST be self-deterministic at temp=0; the LRU path lets a request's
-    # resident layout depend on the PRIOR request's residency, which -- because
-    # the marlin-Int4 grouped-GEMM tiles by expert-count / slot order and is
-    # thus buffer-order-sensitive at the ~1e-2 level -- makes greedy output
-    # drift across requests (argmax flips at near-ties). Sorted-slot assignment
-    # makes the resident layout a pure function of the wave's needed set, so
-    # identical inputs -> identical tiling -> identical output. Trades cross-
-    # forward expert reuse for determinism (re-fetches each wave's experts).
-    deterministic: bool = True
 
     def __post_init__(self):
-        if self.n_slots < 1:
-            raise ValueError("n_slots must be >= 1")
-        if self.n_slots > self.num_local_experts:
-            self.n_slots = self.num_local_experts
-        # Pre-populate residency with experts [0, n_slots) as a deterministic
-        # warm start (matches how the pinned pool is laid out at load time).
-        self._free_slots = []
-        for e in range(self.n_slots):
-            self.slot_of_expert[e] = e
-            self._lru[e] = None
+        if self.scratch < 1:
+            raise ValueError("scratch must be >= 1")
+        if self.resident_count < 0:
+            raise ValueError("resident_count must be >= 0")
+        if self.resident_count > self.num_local_experts:
+            self.resident_count = self.num_local_experts
+
+    @property
+    def buffer_size(self) -> int:
+        """GPU buffer slot count = fixed resident + scratch (capped at E)."""
+        return min(self.resident_count + self.scratch, self.num_local_experts)
 
     @property
     def fully_resident(self) -> bool:
-        return self.n_slots >= self.num_local_experts
+        return self.resident_count >= self.num_local_experts
 
     def resolve(
         self, needed: Sequence[int]
@@ -199,13 +207,11 @@ class ExpertResidencyPlanner:
         """Return (slot_of_needed, fetch_plan) for one wave.
 
         slot_of_needed: expert_id -> slot for every needed expert.
-        fetch_plan: list of (expert_id, target_slot) to H2D-copy this wave.
-        Experts already resident are LRU-touched. Misses evict the LRU
-        residents that are not themselves needed this wave.
-
-        ``needed`` must contain at most ``n_slots`` unique experts; otherwise a
-        needed expert would have to be evicted (RuntimeError). Callers partition
-        forwards with ``plan_token_waves`` to guarantee this.
+        fetch_plan: list of (spill_expert_id, scratch_slot) to H2D-copy.
+        Resident experts (id < resident_count) map to slot==id and are NOT
+        fetched (already resident). Spill experts (id >= resident_count), sorted,
+        map to scratch slots [resident_count + i] and are fetched. The layout is
+        a pure function of ``needed`` (history-independent) -> deterministic.
         """
         self.stats.forwards += 1
         self.stats.waves += 1
@@ -214,72 +220,51 @@ class ExpertResidencyPlanner:
             self.stats.hits += len(needed_unique)
             return {e: e for e in needed_unique}, []
 
-        if len(needed_unique) > self.n_slots:
+        resident = [e for e in needed_unique if e < self.resident_count]
+        spill = [e for e in needed_unique if e >= self.resident_count]  # sorted
+        if len(spill) > self.scratch:
             raise RuntimeError(
-                f"resolve() got {len(needed_unique)} unique experts but only "
-                f"{self.n_slots} slots exist; caller must wave-split with "
-                f"plan_token_waves() first."
+                f"resolve() got {len(spill)} spill experts but only "
+                f"{self.scratch} scratch slots exist; caller must wave-split "
+                f"with plan_token_waves() first."
             )
+        self.stats.hits += len(resident)
+        self.stats.misses += len(spill)
+        self.stats.fetches += len(spill)
 
-        if self.deterministic:
-            # History-independent layout: needed experts (already sorted at
-            # `needed_unique`) -> slots [0, k). All are (re)fetched, so the
-            # resident buffer + the expert->slot map depend ONLY on this wave's
-            # needed set -> byte-identical across requests. Sorted-expert-id
-            # order also preserves the marlin moe_align grouping order.
-            self.slot_of_expert = {e: i for i, e in enumerate(needed_unique)}
-            self._lru = OrderedDict((e, None) for e in needed_unique)
-            self._free_slots = list(range(len(needed_unique), self.n_slots))
-            self.stats.misses += len(needed_unique)
-            self.stats.fetches += len(needed_unique)
-            slot_of_needed = dict(self.slot_of_expert)
-            fetch_plan = [(e, i) for i, e in enumerate(needed_unique)]
-            return slot_of_needed, fetch_plan
-
+        slot_of_needed: Dict[int, int] = {e: e for e in resident}
         fetch_plan: List[Tuple[int, int]] = []
-        misses = [e for e in needed_unique if e not in self.slot_of_expert]
-        hits = [e for e in needed_unique if e in self.slot_of_expert]
-        self.stats.hits += len(hits)
-        self.stats.misses += len(misses)
-
-        # Touch hits (most-recently-used) so they are not evicted below.
-        for e in hits:
-            self._lru.move_to_end(e)
-
-        needed_set = set(needed_unique)
-        for e in misses:
-            slot = self._acquire_slot(protect=needed_set)
-            self.slot_of_expert[e] = slot
-            self._lru[e] = None
-            self._lru.move_to_end(e)
+        for i, e in enumerate(spill):
+            slot = self.resident_count + i
+            slot_of_needed[e] = slot
             fetch_plan.append((e, slot))
-            self.stats.fetches += 1
-
-        slot_of_needed = {e: self.slot_of_expert[e] for e in needed_unique}
         return slot_of_needed, fetch_plan
-
-    def _acquire_slot(self, protect: set) -> int:
-        if self._free_slots:
-            return self._free_slots.pop()
-        # Evict least-recently-used expert that is not needed this wave. Because
-        # |needed| <= n_slots, a non-protected victim always exists.
-        for victim in list(self._lru.keys()):
-            if victim in protect:
-                continue
-            slot = self.slot_of_expert.pop(victim)
-            del self._lru[victim]
-            self.stats.evictions += 1
-            return slot
-        raise RuntimeError(
-            "no evictable slot: all resident experts are needed this wave "
-            "(should be unreachable when |needed| <= n_slots)."
-        )
 
 
 def resident_slot_count(num_local_experts: int, fraction: float) -> int:
-    """Slots to keep resident for a given fraction (>=1)."""
+    """Resident-expert count to keep on GPU for a given fraction (<1)."""
     n = int(math.ceil(fraction * num_local_experts))
     return max(1, min(num_local_experts, n))
+
+
+def scratch_slot_count(resident_count: int) -> int:
+    """Scratch slots C for the fixed-resident buffer (env-overridable).
+
+    The GPU buffer is (resident_count + C) slots; C bounds the unique SPILL
+    experts a single wave may fetch. Default C = max(8, resident_count // 4):
+    big enough to hold a decode step's spilled top-k, small enough to keep the
+    GPU buffer modest (buffer/E fraction determines resident-VRAM). Override via
+    SGLANG_MOE_SCRATCH_SLOTS.
+    """
+    import os
+
+    env = os.environ.get("SGLANG_MOE_SCRATCH_SLOTS", "")
+    if env.strip():
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    return max(8, resident_count // 4)
 
 
 class MoEExpertOffloadCache:
@@ -322,84 +307,122 @@ class MoEExpertOffloadCache:
     def __init__(self, layer, fraction: float):
         self.layer = layer
         self.fraction = fraction
-        self.num_local_experts = int(getattr(layer, "num_local_experts"))
-        self.n_slots = resident_slot_count(self.num_local_experts, fraction)
-        self.planner = ExpertResidencyPlanner(
-            num_local_experts=self.num_local_experts, n_slots=self.n_slots
+        # E: captured BEFORE install shrinks layer.num_local_experts. A prior
+        # load-time presplit stashes the real E on the layer; else read it now.
+        presplit = getattr(layer, "_moe_offload_presplit", None)
+        self.num_local_experts = int(
+            getattr(layer, "_moe_offload_full_experts", None)
+            or getattr(layer, "num_local_experts")
         )
-        self._pinned: Dict[str, "object"] = {}   # attr -> pinned CPU tensor [E,...]
-        self._resident: Dict[str, "object"] = {}  # attr -> GPU tensor [n_slots,...]
+        self.resident_count = resident_slot_count(self.num_local_experts, fraction)
+        self.scratch = scratch_slot_count(self.resident_count)
+        self.planner = ExpertResidencyPlanner(
+            num_local_experts=self.num_local_experts,
+            resident_count=self.resident_count,
+            scratch=self.scratch,
+        )
+        self._pinned: Dict[str, "object"] = {}    # attr -> pinned spill [E-R,...]
+        self._resident: Dict[str, "object"] = {}  # attr -> GPU buffer [R+C,...]
         self._stream = None
         self._installed = False
 
     # --- lifecycle (GPU window) --------------------------------------------
     def install(self):  # pragma: no cover - requires CUDA
-        """Move full expert tensors to a pinned host pool; allocate resident
-        GPU slots pre-filled with experts [0, n_slots). Idempotent."""
+        """Build the [R+C]-slot GPU buffer (fixed resident [0,R) + scratch) and
+        the [E-R]-slot pinned host spill pool. Idempotent.
+
+        Source is either (a) a load-time presplit stashed on the layer
+        (``_moe_offload_presplit``: attr -> (resident_buf[R+C], spill_pinned)),
+        which never let the full [E] stack sit on host -- the RAM-safe path; or
+        (b) the layer's full [E] tensor still present (GPU or CPU-pinned), which
+        we split here (used by the small-model proof where the full stack fits).
+        """
         import torch
 
         if self._installed or self.planner.fully_resident:
             return
         self._stream = torch.cuda.Stream()
         dev = torch.cuda.current_device()
+        R = self.resident_count
+        buf_slots = self.planner.buffer_size  # R + C
+        presplit = getattr(self.layer, "_moe_offload_presplit", None)
+
         for attr in self.EXPERT_TENSOR_ATTRS:
+            if presplit is not None:
+                if attr not in presplit:
+                    continue
+                resident_buf, spill = presplit[attr]  # buf[R+C] GPU, spill host
+                self._resident[attr] = resident_buf
+                self._pinned[attr] = spill
+                setattr(
+                    self.layer, attr,
+                    torch.nn.Parameter(resident_buf, requires_grad=False),
+                )
+                continue
+            # Split-here path (full [E] tensor present).
             full = getattr(self.layer, attr, None)
             if full is None:
                 continue
             full = full.data if hasattr(full, "data") else full
-            if full.shape[0] != self.num_local_experts:
+            if full.dim() == 0 or full.shape[0] != self.num_local_experts:
                 continue  # not an expert-major tensor
-            if full.is_cpu:
-                # Variant-C B2b load-time path: the weights already arrived on
-                # CPU-pinned (create_weights built the expert tensors on CPU,
-                # and device_loading_context copied the marlin-repacked result
-                # back to a pinned host buffer on load). The full stack NEVER
-                # sat on GPU -> use it directly as the pinned spill pool (no
-                # second 60 GB pinned copy) and materialize only n_slots experts
-                # on GPU.
-                pinned = full if full.is_pinned() else full.pin_memory()
-                self._pinned[attr] = pinned
-                resident = pinned[: self.n_slots].to(dev, non_blocking=False).contiguous()
+            # GPU buffer [R+C]: [0:R] = fixed resident experts, scratch left as-is.
+            buf = torch.empty(
+                (buf_slots,) + tuple(full.shape[1:]), dtype=full.dtype, device=dev
+            )
+            buf[:R].copy_(full[:R])
+            self._resident[attr] = buf
+            # Pinned host spill pool = experts [R:E].
+            spill_src = full[R:].contiguous()
+            if spill_src.is_cpu:
+                spill = spill_src if spill_src.is_pinned() else spill_src.pin_memory()
             else:
-                # Original M-B path: the full stack is resident on GPU; copy it
-                # down to a fresh pinned host pool, keep the first n_slots on GPU.
-                pinned = torch.empty_like(full, device="cpu").pin_memory()
-                pinned.copy_(full)
-                self._pinned[attr] = pinned
-                resident = full[: self.n_slots].contiguous()
-            self._resident[attr] = resident
-            setattr(self.layer, attr, torch.nn.Parameter(resident, requires_grad=False)
-                    if isinstance(getattr(self.layer, attr), torch.nn.Parameter)
-                    else resident)
-        # Shrink the layer's advertised local-expert count to the resident slot
-        # count so the grouped-GEMM / MoE runner size their per-expert loops to
-        # the resident buffer (topk_ids arriving at apply() are already slot
-        # ids). The planner keeps the *full* num_local_experts for id bookkeeping
-        # (captured in __init__ before this runs). Runner config mirrors it in
-        # case the kernel reads the config rather than the layer attribute.
+                spill = torch.empty_like(spill_src, device="cpu").pin_memory()
+                spill.copy_(spill_src)
+            self._pinned[attr] = spill
+            setattr(
+                self.layer, attr,
+                torch.nn.Parameter(buf, requires_grad=False)
+                if isinstance(getattr(self.layer, attr), torch.nn.Parameter)
+                else buf,
+            )
+
+        # The marlin apply reads E = w1.shape[0] = buffer size (R+C). Advertise
+        # it so moe_align / the runner size to the buffer; topk_ids arriving at
+        # apply() are already slot ids in [0, R+C).
         self._orig_num_local_experts = self.layer.num_local_experts
-        self.layer.num_local_experts = self.n_slots
+        self.layer.num_local_experts = buf_slots
         runner_cfg = getattr(self.layer, "moe_runner_config", None)
         if runner_cfg is not None and hasattr(runner_cfg, "num_local_experts"):
             try:
-                runner_cfg.num_local_experts = self.n_slots
+                runner_cfg.num_local_experts = buf_slots
             except Exception:
                 pass  # frozen/dataclass runner configs: kernel reads the layer attr
+        if presplit is not None:
+            # Release the layer's ref to the presplit dict (tensors now owned by
+            # self._resident / self._pinned).
+            try:
+                delattr(self.layer, "_moe_offload_presplit")
+            except Exception:
+                self.layer._moe_offload_presplit = None
         self._installed = True
 
     # --- fetch / remap helpers (GPU window) --------------------------------
     def _fetch(self, fetch_plan):  # pragma: no cover - requires CUDA
-        """Async H2D-copy the (expert_id -> slot) misses of one wave into the
-        resident buffers, then join the copy stream before compute reads them."""
+        """Async H2D-copy each wave's SPILL experts into their scratch slots,
+        then join the copy stream before compute reads them. ``fetch_plan`` is
+        (spill_expert_id, scratch_slot); the spill pool is indexed by
+        (expert_id - resident_count)."""
         import torch
 
         if not fetch_plan:
             return
+        R = self.resident_count
         with torch.cuda.stream(self._stream):
-            for attr, pinned in self._pinned.items():
+            for attr, spill in self._pinned.items():
                 dst = self._resident[attr]
                 for expert_id, slot in fetch_plan:
-                    dst[slot].copy_(pinned[expert_id], non_blocking=True)
+                    dst[slot].copy_(spill[expert_id - R], non_blocking=True)
         torch.cuda.current_stream().wait_stream(self._stream)
 
     def _build_lut(self, slot_of_needed, dtype, device):  # pragma: no cover
@@ -458,7 +481,7 @@ class MoEExpertOffloadCache:
             return apply_fn(dispatch_output)
 
         ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
-        waves = plan_token_waves(ids_list, self.n_slots)
+        waves = plan_token_waves(ids_list, self.resident_count, self.scratch)
 
         # Fast path: the whole forward fits in one wave (typical decode). Remap
         # the full batch and run a single apply -- no token slicing overhead.
@@ -525,3 +548,63 @@ class MoEExpertOffloadCache:
     @property
     def stats(self) -> ResidencyStats:
         return self.planner.stats
+
+
+def presplit_expert_offload_after_repack(layer) -> None:  # pragma: no cover - CUDA
+    """Variant-C B2b LOAD-TIME RAM cap: called right after a FusedMoE layer's
+    marlin repack (the repacked expert tensors are on GPU, inside
+    device_loading_context). Splits each expert-major tensor into a [R+C]-slot
+    GPU buffer (fixed resident [0,R) + scratch) plus an [E-R]-slot pinned host
+    SPILL pool, stashes them on the layer (``_moe_offload_presplit``), and
+    replaces the registered param with a 0-row GPU placeholder so
+    device_loading_context's exit copies ~nothing back to host. The full [E,...]
+    stack therefore NEVER sits in host RAM -> host peak ~= spill, not the full
+    expert set. The eager installer later wires the stash into a
+    MoEExpertOffloadCache. No-op unless SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.
+    """
+    import torch
+
+    from sglang.srt.environ import envs
+
+    frac = envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get()
+    if frac >= 1.0:
+        return
+    E = getattr(layer, "num_local_experts", None)
+    if not E:
+        return
+    R = resident_slot_count(int(E), frac)
+    if R >= int(E):
+        return
+    C = scratch_slot_count(R)
+    buf_slots = min(R + C, int(E))
+
+    presplit = {}
+    for attr in MoEExpertOffloadCache.EXPERT_TENSOR_ATTRS:
+        p = getattr(layer, attr, None)
+        if p is None:
+            continue
+        t = p.data if hasattr(p, "data") else p
+        if t.dim() == 0 or t.shape[0] != int(E):
+            continue  # not an expert-major tensor
+        # [R+C] GPU buffer: [0:R] fixed resident; scratch [R:R+C] left uninit.
+        buf = torch.empty(
+            (buf_slots,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device
+        )
+        buf[:R].copy_(t[:R])
+        # Spill [R:E] -> pinned host (contiguous copy; the GPU [E] is then freed).
+        spill = torch.empty(
+            (int(E) - R,) + tuple(t.shape[1:]), dtype=t.dtype, device="cpu"
+        ).pin_memory()
+        spill.copy_(t[R:])
+        presplit[attr] = (buf, spill)
+        # Replace the param with a 0-row placeholder so device_loading_context
+        # copies nothing back to host (the full [E] GPU tensor is dropped here).
+        empty = torch.empty((0,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device)
+        if isinstance(p, torch.nn.Parameter):
+            setattr(layer, attr, torch.nn.Parameter(empty, requires_grad=False))
+        else:
+            setattr(layer, attr, empty)
+
+    if presplit:
+        layer._moe_offload_presplit = presplit
+        layer._moe_offload_full_experts = int(E)

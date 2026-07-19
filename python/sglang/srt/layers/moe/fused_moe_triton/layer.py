@@ -1573,10 +1573,12 @@ class FusedMoE(torch.nn.Module):
             self._expert_offload = cache
             logging.getLogger(__name__).info(
                 "MoE expert-offload active on layer %s: %d/%d experts resident "
-                "(fraction=%.3f)",
+                "+ %d scratch (buffer=%d, fraction=%.3f)",
                 self.layer_id,
-                cache.n_slots,
+                cache.resident_count,
                 cache.num_local_experts,
+                cache.scratch,
+                cache.planner.buffer_size,
                 self._expert_offload_fraction,
             )
         except Exception as e:  # pragma: no cover - GPU-window failure path
