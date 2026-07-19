@@ -4473,7 +4473,13 @@ class ServerArgs:
 
         # Per-rank MiB list checks.
         if isinstance(self.rank_gpu_memory_mib, list):
-            if self.rank_tp_ratio is None:
+            # Weightless-KV fast lane (Option-B): the ranks are structurally
+            # UNEQUAL by design (the head rank holds the full model + big mamba/
+            # KV state; the weightless workers hold only a KV token-shard), so a
+            # per-rank budget list is appropriate here even without a
+            # --rank-tp-ratio weight vector (e.g. 28000,19000,19000 for a 5090
+            # head + two 3080 workers).
+            if self.rank_tp_ratio is None and not self.weightless_kv_fastlane:
                 raise ValueError(
                     "--rank-gpu-memory-mib as a list requires "
                     "--rank-tp-ratio (with even TP all ranks are "

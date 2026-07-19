@@ -291,12 +291,62 @@ class Qwen3NextConfig(PretrainedConfig):
             world_size = get_parallel().attn_tp_size
             adjust_tp_num_heads_if_necessary(self, world_size, False)
 
-        from sglang.srt.distributed.utils import tp_plan_active
+        from sglang.srt.distributed.utils import (
+            tp_plan_active,
+            weightless_kv_active,
+            weightless_worker_rank,
+        )
+
+        # Weightless-KV fast lane (Option-B) — PER-RANK mamba state sizing:
+        #  * WORKER ranks run the stripped attention-only forward and NEVER touch
+        #    GDN, so their mamba conv/ssm state pool is unused -> size it MINIMAL
+        #    (1-element) so it costs ~0 VRAM (the tight 3080 workers no longer
+        #    starve the pool). The worker's derived max_mamba_cache_size is then
+        #    huge, so the cross-rank MIN in _sync_uneven_mamba_cache_size
+        #    naturally yields the HEAD's capacity -> admission uses the head's
+        #    mamba budget, not the zero-cache workers'.
+        #  * The HEAD runs all 48 GDN layers FULL (built under the weight-TP=1
+        #    override, attn_tp_size=1), so its conv/ssm state must be FULL. This
+        #    property is read at POOL-INIT (OUTSIDE the override), where
+        #    get_parallel().attn_tp_size is the real 3; without forcing 1 the head
+        #    would size ÷3 while its mixed_qkv conv_dim is full -> causal_conv1d
+        #    asserts (dim != conv_states.shape[1]).
+        if weightless_kv_active() and weightless_worker_rank(
+            get_parallel().tp_rank
+        ):
+            import dataclasses
+
+            _full = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=self.linear_value_head_dim
+                * self.linear_num_value_heads,
+                n_groups=self.linear_num_key_heads,
+                num_heads=self.linear_num_value_heads,
+                head_dim=self.linear_value_head_dim,
+                state_size=self.linear_key_head_dim,
+                conv_kernel=self.linear_conv_kernel_dim,
+                tp_rank=None,
+                tp_units=getattr(self, "gdn_tp_units", None),
+            )
+            # Keep the descriptive fields (layers/dtype/etc.) but shrink the
+            # actual conv/temporal state tensors to 1 element -> ~0 VRAM.
+            _min_shape = dataclasses.replace(
+                _full,
+                conv=[(1, 1) for _ in _full.conv],
+                temporal=(1, 1, 1),
+            )
+            return Mamba2CacheParams(
+                shape=_min_shape,
+                layers=self.linear_layer_ids,
+                dtype=mamba2_state_dtype(self),
+            )
 
         # Uneven TP: the per-rank state shapes follow the k-head-unit
         # partition of the GDN layers; pass this rank. None on the
         # default path (create() then ignores it).
         attn_tp_size = get_parallel().attn_tp_size
+        if weightless_kv_active():
+            attn_tp_size = 1
         tp_rank = (
             get_parallel().attn_tp_rank if tp_plan_active(attn_tp_size) else None
         )
