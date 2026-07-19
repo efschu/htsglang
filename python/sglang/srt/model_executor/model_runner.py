@@ -3267,19 +3267,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         attend local shard, LSE-merge), then returns a sentinel output (no
         logits). Sampling is skipped on workers (tp_worker gates on
         is_weightless_worker)."""
-        if not forward_batch.forward_mode.is_decode():
-            # TODO(B1-prefill): the weightless PREFILL/EXTEND worker dispatch
-            # (ragged KV write across the token-shard) is a distinct, non-trivial
-            # net-new path. Decode is implemented first for the byte-identity
-            # gate; prefill is a named follow-up.
-            raise NotImplementedError(
-                "weightless-KV worker forward supports decode only (B1); "
-                "prefill/extend weightless dispatch is not yet implemented."
-            )
         self._prepare_eager_forward_batch(forward_batch)
-        self.attn_backend.init_forward_metadata(forward_batch)
+        # IDLE (padding) forward: the model's decoder layers skip attention when
+        # forward_mode.is_idle(), so the head issues NO DCP collective -> the
+        # worker must also issue none. Return without metadata/dispatch.
+        if forward_batch.forward_mode.is_idle():
+            return ModelRunnerOutput(logits_output=None, can_run_graph=False)
+        # Hybrid-GDN models wrap the flashinfer FULL-attention backend inside a
+        # HybridLinearAttnBackend (full_attn_backend + a GDN linear backend). The
+        # weightless worker only handles the full-attention KV dispatch (it never
+        # runs GDN), and the weightless_worker methods live on the flashinfer
+        # backend -> resolve to full_attn_backend when present.
+        attn = getattr(self.attn_backend, "full_attn_backend", self.attn_backend)
+        attn.init_forward_metadata(forward_batch)
+        if forward_batch.forward_mode.is_decode():
+            worker_dispatch = attn.forward_decode_weightless_worker
+        elif forward_batch.forward_mode.is_extend():
+            # PREFILL/EXTEND: mirror the head's _forward_extend_dcp per-layer
+            # dispatch (data-dependent 2-or-4 DCP collectives on the rank-uniform
+            # has_prefix). The worker writes the current chunk's KV to its owned
+            # token-shard and reads its owned prefix slots; it skips the
+            # head-local current-chunk ragged attention.
+            worker_dispatch = attn.forward_extend_weightless_worker
+        else:
+            raise NotImplementedError(
+                "weightless-KV worker forward: unsupported forward mode "
+                f"{forward_batch.forward_mode} (B1 supports decode + extend)."
+            )
         for layer in self._weightless_attn_layers():
-            self.attn_backend.forward_decode_weightless_worker(layer, forward_batch)
+            worker_dispatch(layer, forward_batch)
         return ModelRunnerOutput(logits_output=None, can_run_graph=False)
 
     def _forward_raw(

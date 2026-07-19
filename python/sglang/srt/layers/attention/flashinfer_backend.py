@@ -1764,6 +1764,60 @@ class FlashInferAttnBackend(AttentionBackend):
         # [T,0,D] slice (the merged output goes to the head rank only).
         cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
 
+    def forward_extend_weightless_worker(self, layer, forward_batch):
+        """Weightless-KV WORKER dispatch for one full-attention layer in
+        EXTEND/PREFILL (Option-B B1). Mirrors the head's _forward_extend_dcp DCP
+        collective sequence with this rank's empty [T,0,D] head slice + its KV
+        token-shard. The head's per-layer sequence is DATA-DEPENDENT:
+          * no prefix (first chunk): K all-gather, V all-gather               -> 2
+          * has prefix:              K, V, Q all-gather, LSE-merge            -> 4
+        `has_prefix` is a rank-uniform (global) property, so the head and this
+        worker take the identical branch -> the collective counts match. The
+        head's current-chunk RAGGED attention is LOCAL (no collective), so the
+        worker skips it entirely and contributes nothing there."""
+        assert self.weightless_kv and not self.dcp_kv_replicated_heads
+        group = get_parallel().dcp_group
+        cache_loc = forward_batch.out_cache_loc  # current-chunk slots (multi-tok)
+        T = cache_loc.shape[0]
+        hd = layer.head_dim
+        dev = cache_loc.device
+        zk = torch.zeros((T, 0, hd), dtype=self._wl_dtype, device=dev)
+        zv = torch.zeros((T, 0, hd), dtype=self._wl_dtype, device=dev)
+        zq = torch.zeros((T, 0, hd), dtype=self._wl_dtype, device=dev)
+        # (1) KV broadcast from the head (2 collectives) + multi-token owner
+        # write into this rank's owned prefix slots (shared owner rule, already
+        # multi-token). IDENTICAL to the head's _dcp_masked_write path.
+        k_full = cp_all_gather_heads_uneven(zk, group, self.dcp_kv_head_counts)
+        v_full = cp_all_gather_heads_uneven(zv, group, self.dcp_kv_head_counts)
+        self._dcp_owner_write(layer, forward_batch, cache_loc, k_full, v_full)
+        # (2) current-chunk ragged attention: head-LOCAL, NO collective -> skip.
+        # (3) has_prefix -- computed IDENTICALLY to the head (rank-uniform), so
+        # the Q/LSE collectives below stay balanced with the head.
+        if forward_batch.forward_mode.is_target_verify():
+            has_prefix = True
+        else:
+            prefix_cpu = forward_batch.extend_prefix_lens_cpu
+            has_prefix = prefix_cpu is not None and any(prefix_cpu)
+        if not has_prefix:
+            return
+        # (4) Q broadcast (1 collective) -> non-causal PAGED prefix read over this
+        # rank's OWNED prefix slots (LOCAL) -> LSE-merge (1 collective). The
+        # merged output slice is empty [T,0,D] for the worker and discarded.
+        q_full = cp_all_gather_heads_uneven(zq, group, self.dcp_q_head_counts)
+        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
+            self._get_wrapper_idx(layer)
+        ]
+        o_pre, lse_pre = prefill_wrapper_paged.forward_return_lse(
+            q_full,
+            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            causal=False,
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
+        cp_lse_ag_out_ar_mha_uneven(o_pre, lse_pre, group, self.dcp_q_head_counts)
+
     def _replicated_kv_ragged_reindex(self, local_q, local_kv, device):
         """REPLICATED-KV geometry (#105): map each of this rank's LOCAL kv
         slots to the GLOBAL kv head that its q group attends, so a uniform-GQA
