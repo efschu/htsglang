@@ -1441,6 +1441,40 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
             )
 
+    def _build_weightless_worker_meta_model(self):
+        """B2a: build a weightless KV worker's model on the `meta` device with
+        NO weight materialization (the VRAM win).
+
+        A weightless worker rank holds ONLY a DCP token-shard of the KV cache;
+        it never runs embed / GDN / FFN / proj / lm_head / sample. Its forward
+        (``_forward_weightless_worker``) loops the model's full-attention layer
+        ids and issues only the dcp-group attention-dispatch collectives, so the
+        model's weight Parameters are never read. We therefore build the module
+        graph on ``meta`` (0-byte weights) and skip weight loading entirely; the
+        real memory the worker needs -- the KV pool + flashinfer attention
+        backend -- is built later from ``model_config`` (not from weights).
+
+        Mirrors the meta-build in ``LayeredModelLoader`` (loader.py): create on
+        ``meta`` under the model dtype, do NOT call ``load_weights`` and never
+        ``.to(device)``. Runs inside the same weight-TP=1 override context as the
+        head build so partition geometry is consistent.
+        """
+        from sglang.srt.model_loader.loader import (
+            _get_quantization_config,
+            _initialize_model,
+            set_default_torch_dtype,
+        )
+
+        quant_config = _get_quantization_config(self.model_config, self.load_config)
+        with set_default_torch_dtype(self.model_config.dtype):
+            with torch.device("meta"):
+                model = _initialize_model(
+                    self.model_config,
+                    self.load_config,
+                    quant_config,
+                )
+        return model
+
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1449,20 +1483,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         # --- Weightless-KV fast lane, loader interception point (Option-B) ---
-        # B2 will make a weightless WORKER rank build the model on the `meta`
-        # device and materialize ONLY the KV pool + attention backend (no layer
-        # weights) -- the VRAM win. This is the SCAFFOLD (B0): it marks the
-        # intervention point and is INERT (workers still materialize weights
-        # here) until the worker forward carving (B1) lands, so that turning the
-        # flag on cannot leave meta weights that the still-symmetric forward
-        # would touch. No-op on the default path.
+        # B2a (ACTIVE): a weightless KV worker rank builds the model on the
+        # `meta` device and materializes ONLY the KV pool + attention backend
+        # (no layer weights) -- the VRAM win. This is safe because the B1 worker
+        # forward (_forward_weightless_worker) never calls any model layer (it
+        # loops full_attention_layer_ids issuing only dcp-group attention
+        # collectives), so the meta weights are never touched. The meta-build
+        # itself happens at the loader call below; here we just log. Weight-
+        # touching post-load steps (offloader.post_init, kv-cache scales, RoPE
+        # cache pre-expansion) are gated off for the worker further down. The
+        # load-time tp-group monitored_barrier at the end of load_model is NOT
+        # gated -- the meta-worker still participates. No-op on the default path.
         if self.is_weightless_worker:
-            # TODO(B2): build meta-model + skip load_weights on worker ranks
-            # once _forward_weightless_worker (B1) guarantees the model layers
-            # are never touched. For now, load normally (correctness first).
             logger.info(
-                "Weightless-KV worker rank %d: loader-skip scaffolding present "
-                "but INERT (B0) -- loading weights normally until B1/B2.",
+                "Weightless-KV worker rank %d: B2a meta-model -- building on "
+                "`meta`, skipping weight materialization (KV-pool-only).",
                 self.tp_rank,
             )
 
@@ -1586,10 +1621,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else contextlib.nullcontext()
             )
             with _wl_build_ctx:
-                self.model = self.loader.load_model(
-                    model_config=self.model_config,
-                    device_config=DeviceConfig(self.device, self.gpu_id),
-                )
+                if self.is_weightless_worker:
+                    # B2a: weightless worker -- meta-model, NO weight load.
+                    self.model = self._build_weightless_worker_meta_model()
+                else:
+                    self.model = self.loader.load_model(
+                        model_config=self.model_config,
+                        device_config=DeviceConfig(self.device, self.gpu_id),
+                    )
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
@@ -1600,7 +1639,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
-        if not self.is_draft_worker:
+        if not self.is_draft_worker and not self.is_weightless_worker:
+            # B2a: a weightless worker holds no offloadable weights (meta model).
             get_offloader().post_init()
 
         # Register model for layerwise NVTX profiling if enabled
@@ -1608,7 +1648,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             pyt_hooks = PytHooks()
             pyt_hooks.register_hooks(self.model, module_prefix="model")
 
-        if self.server_args.kv_cache_dtype == "fp8_e4m3":
+        if (
+            self.server_args.kv_cache_dtype == "fp8_e4m3"
+            and not self.is_weightless_worker
+        ):
+            # B2a: KV-cache scales load into model weights (meta on the worker);
+            # the worker's KV pool gets its scales via the head's dispatch path.
             if self.server_args.quantization_param_path is not None:
                 if callable(getattr(self.model, "load_kv_cache_scales", None)):
                     self.model.load_kv_cache_scales(
@@ -1702,13 +1747,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dumper.apply_source_patches()
             dumper.register_non_intrusive_dumper(self.model)
 
-        # Pre-expand RoPE cache before CUDA Graph capture
-        reserve_rope_cache_for_long_sequences(
-            self.model,
-            self.server_args,
-            self.model_config,
-            logger,
-        )
+        # Pre-expand RoPE cache before CUDA Graph capture.
+        # B2a: skip on a weightless worker -- its model layers are meta (RoPE
+        # cos/sin caches are meta buffers) and the worker forward never runs
+        # RoPE (it only issues the attention dispatch collectives).
+        if not self.is_weightless_worker:
+            reserve_rope_cache_for_long_sequences(
+                self.model,
+                self.server_args,
+                self.model_config,
+                logger,
+            )
 
         if self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
