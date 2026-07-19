@@ -470,25 +470,41 @@ class FusedMoE(torch.nn.Module):
         self._expert_offload = None  # MoEExpertOffloadCache, lazily installed
         self._expert_offload_install_failed = False
         self._moe_offload_trace_step = 0
-        # CUDA-graph guard (fail fast). Expert-offload and routing-trace both do
-        # a data-dependent device->host sync per forward (topk_ids.tolist()),
-        # which is illegal during CUDA-graph capture. There is no
-        # graph-capturable path because the set of experts to fetch is
-        # data-dependent per step. Require --disable-cuda-graph up front instead
-        # of failing deep inside capture. (Option (c): eager-only + clean guard.)
+        # CUDA-graph guard -> MODE SWITCH (Stage-3). The eager offload path
+        # (run_waves) does a data-dependent device->host sync per forward
+        # (topk_ids.tolist()) and is illegal during CUDA-graph capture. With
+        # SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1 (opt-in) decode instead takes the
+        # capturable path: frozen residency + on-device index math
+        # (prepare_capturable) + a captured UVA gather -- no host dependency,
+        # so the decode graph is allowed. Without the opt-in, keep the original
+        # fail-fast guard requiring --disable-cuda-graph.
+        self._moe_offload_graph_mode = (
+            self._expert_offload_fraction < 1.0
+            and envs.SGLANG_MOE_OFFLOAD_CUDA_GRAPH.get()
+        )
         if self._moe_offload_enabled:
             try:
                 _disable_cg = bool(get_server_args().disable_cuda_graph)
             except Exception:
                 _disable_cg = True  # server args not wired (unit/test context)
-            if not _disable_cg:
+            if not _disable_cg and not self._moe_offload_graph_mode:
                 raise RuntimeError(
                     "MoE expert-offload / routing-trace "
                     "(SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0 or "
                     "SGLANG_MOE_OFFLOAD_TRACE) requires --disable-cuda-graph: "
                     "the per-forward expert residency plan is data-dependent and "
                     "cannot be captured into a CUDA graph. Re-launch with "
-                    "--disable-cuda-graph."
+                    "--disable-cuda-graph, or opt in to the capturable offload "
+                    "decode path with SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1 "
+                    "(requires offload fraction < 1.0)."
+                )
+            if self._moe_offload_graph_mode and envs.SGLANG_MOE_HOT_RESIDENCY.get():
+                # §5 fail-fast: live calibration cannot be frozen pre-capture.
+                raise RuntimeError(
+                    "SGLANG_MOE_HOT_RESIDENCY (live hot calibration) cannot be "
+                    "combined with SGLANG_MOE_OFFLOAD_CUDA_GRAPH: the residency "
+                    "layout must be frozen BEFORE graph capture. Supply "
+                    "SGLANG_MOE_HOTSET_FILE or use static residency."
                 )
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
 
@@ -1528,8 +1544,14 @@ class FusedMoE(torch.nn.Module):
 
         topk_ids = topk_output.topk_ids
 
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
         # (a) M-C routing trace: log the *pre-remap* (real) routed expert ids.
-        if self._moe_offload_trace_path:
+        # Guarded off the capture path: .tolist() is a device->host sync and
+        # illegal inside graph capture (trace is measurement tooling only).
+        if self._moe_offload_trace_path and not get_is_capture_mode():
             from sglang.srt.layers.moe.expert_offload import write_routing_trace
 
             rank_tag = f"tp{self.moe_tp_rank}ep{self.moe_ep_rank}"
@@ -1551,10 +1573,44 @@ class FusedMoE(torch.nn.Module):
             if self._expert_offload is None:  # install declined / failed
                 return _apply(dispatch_output)
 
+        # Stage-3 captured decode: under graph capture (and the opt-in), take
+        # the host-sync-free capturable path -- on-device remap + captured UVA
+        # gather + a SINGLE-wave apply. Everything else (prefill, eager decode,
+        # buckets beyond the captured sizes) keeps run_waves.
+        if self._moe_offload_graph_mode and get_is_capture_mode():
+            return self._run_moe_core_offload_capturable(
+                dispatch_output, topk_output, topk_ids, _apply
+            )
+
         # run_waves handles both the single-wave decode fast path (one apply over
         # the full batch) and the multi-wave prefill-overflow path (disjoint
         # token subsets, each fully computed once -> byte-identical accumulation).
         return self._expert_offload.run_waves(dispatch_output, _apply)
+
+    def _run_moe_core_offload_capturable(
+        self, dispatch_output, topk_output, topk_ids, apply_fn
+    ):
+        """Captured-decode offload step (design §2): enforce the fixed-shape
+        single-wave invariant, remap on device, issue the captured gather, and
+        run ONE apply over the full (fixed-bs) batch. No host sync anywhere."""
+        cache = self._expert_offload
+        # §2 invariant: worst-case unique spill (== all routed slots) must fit
+        # the scratch region, or a captured step could silently drop spill
+        # experts (wrong output, not epsilon). Fail loudly at capture/warmup.
+        if topk_ids.numel() > cache.scratch:
+            raise RuntimeError(
+                f"MoE offload CUDA-graph capture: bucket needs up to "
+                f"{topk_ids.numel()} unique spill experts (tokens x top_k) but "
+                f"only {cache.scratch} scratch slots exist. Cap the captured "
+                f"decode batch sizes (SGLANG_MOE_OFFLOAD_MAX_GRAPH_BS or "
+                f"--cuda-graph-max-bs <= scratch // top_k) or raise "
+                f"SGLANG_MOE_SCRATCH_SLOTS."
+            )
+        remapped = cache.prepare_capturable(topk_ids)
+        sub = dispatch_output._replace(
+            topk_output=topk_output._replace(topk_ids=remapped)
+        )
+        return apply_fn(sub)
 
     def _install_expert_offload(self):
         """Lazily build the per-layer offload cache on first forward, once the
@@ -1589,6 +1645,18 @@ class FusedMoE(torch.nn.Module):
                 self.layer_id,
                 e,
             )
+            return
+
+        # Stage-3: freeze the residency layout (file-driven hot set, or static
+        # [0,R) when no SGLANG_MOE_HOTSET_FILE) and build the capturable
+        # buffers NOW -- this lazy install runs on the first (warmup) forward,
+        # which is eager and precedes DecodeCudaGraphRunner's stream capture
+        # (§5 ordering). Deliberately OUTSIDE the try/except above: a
+        # mis-configured capturable path must abort the boot, not silently
+        # change residency semantics.
+        if self._expert_offload is not None and self._moe_offload_graph_mode:
+            self._expert_offload.freeze_from_source()
+            self._expert_offload.install_capturable_buffers()
 
     @classmethod
     def make_expert_params_mapping(

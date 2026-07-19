@@ -272,6 +272,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
         )
+        # Stage-3 MoE-offload capturable decode: the captured scratch gather
+        # serves at most C spill experts per step (bs * top_k <= C invariant),
+        # so only small decode buckets are capture-eligible. The env caps the
+        # captured bucket list; larger decode batches fall back to the eager
+        # offload path (run_waves) via the normal can_run_graph bs check.
+        _moe_offload_graph_bs = envs.SGLANG_MOE_OFFLOAD_MAX_GRAPH_BS.get()
+        if _moe_offload_graph_bs > 0:
+            capped = [bs for bs in self.capture_bs if bs <= _moe_offload_graph_bs]
+            if not capped:
+                raise ValueError(
+                    f"SGLANG_MOE_OFFLOAD_MAX_GRAPH_BS={_moe_offload_graph_bs} "
+                    f"filters out every decode capture bucket {self.capture_bs}"
+                )
+            self.capture_bs = capped
+            self.compile_bs = [
+                bs for bs in self.compile_bs if bs <= _moe_offload_graph_bs
+            ]
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 

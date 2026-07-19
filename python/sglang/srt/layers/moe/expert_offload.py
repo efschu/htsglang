@@ -349,6 +349,49 @@ def build_capturable_luts(
     )
 
 
+class _PinnedDeviceViewHolder:
+    """Minimal ``__cuda_array_interface__`` producer used to alias PINNED host
+    memory as a CUDA tensor (UVA zero-copy). Under CUDA UVA every page-locked
+    allocation (torch ``pin_memory``) is device-addressable at the SAME virtual
+    address, so a CUDA gather kernel can read it directly across PCIe. Verified
+    empirically on this rig (torch 2.11/cu130): ``torch.as_tensor`` aliases the
+    pointer without copying, and a graph-captured ``index_select`` sourcing the
+    view honors post-capture host-content changes bit-identically."""
+
+    def __init__(self, ptr: int, nbytes: int):
+        self.__cuda_array_interface__ = {
+            "shape": (nbytes,),
+            "typestr": "|u1",
+            "data": (ptr, False),
+            "version": 3,
+            "strides": None,
+        }
+
+
+def device_view_of_pinned(pinned):  # pragma: no cover - requires CUDA
+    """Return a CUDA tensor aliasing ``pinned`` (no copy; UVA zero-copy view).
+
+    The view has the same shape/dtype and a stable device pointer (== the host
+    pointer), so it can be baked into a CUDA graph as the SOURCE of the scratch
+    gather (design §4). Caller must keep ``pinned`` alive for the view's life.
+    """
+    import torch
+
+    if not pinned.is_pinned():
+        raise RuntimeError("device_view_of_pinned: tensor is not page-locked")
+    if not pinned.is_contiguous():
+        raise RuntimeError("device_view_of_pinned: tensor must be contiguous")
+    nbytes = pinned.numel() * pinned.element_size()
+    holder = _PinnedDeviceViewHolder(pinned.data_ptr(), nbytes)
+    dev_bytes = torch.as_tensor(holder, device="cuda")
+    if dev_bytes.data_ptr() != pinned.data_ptr():
+        raise RuntimeError(
+            "device_view_of_pinned: torch.as_tensor copied instead of aliasing "
+            "(UVA zero-copy unavailable?); cannot build a capturable spill pool"
+        )
+    return dev_bytes.view(pinned.dtype).view(pinned.shape)
+
+
 def prepare_capturable_remap(
     topk_ids,
     resident_slot_lut,
@@ -489,6 +532,27 @@ class MoEExpertOffloadCache:
         self._hot_frozen = False
         self._spill_pool_index: Optional[Dict[int, int]] = None  # None => id-R
 
+        # --- Stage-3 CUDA-graph-capturable path ----------------------------
+        # Built by install_capturable_buffers() (after install(), and after any
+        # freeze_from_source() rearrange): frozen device LUTs + UVA device
+        # views of the pinned spill pool + stable scratch dest views.
+        self._graph_mode = bool(envs.SGLANG_MOE_OFFLOAD_CUDA_GRAPH.get())
+        if self._graph_mode and self._hot_enabled:
+            # §5: live calibration cannot be frozen before graph capture.
+            raise RuntimeError(
+                "SGLANG_MOE_HOT_RESIDENCY (live hot calibration) cannot be "
+                "combined with SGLANG_MOE_OFFLOAD_CUDA_GRAPH: the residency "
+                "layout must be frozen BEFORE graph capture. Supply "
+                "SGLANG_MOE_HOTSET_FILE or use static residency."
+            )
+        self._capturable_ready = False
+        self._cap_resident_slot_lut = None  # int32[E] device
+        self._cap_is_spill = None           # bool[E] device
+        self._cap_spill_pool_row_lut = None  # int32[E] device
+        self._cap_pool_dev: Dict[str, "object"] = {}     # attr -> UVA view [E-R,...]
+        self._cap_scratch_dst: Dict[str, "object"] = {}  # attr -> resident[R:R+C]
+        self._cap_view_holders: List["object"] = []      # keep pinned bases alive
+
     # --- lifecycle (GPU window) --------------------------------------------
     def install(self):  # pragma: no cover - requires CUDA
         """Build the [R+C]-slot GPU buffer (fixed resident [0,R) + scratch) and
@@ -626,6 +690,143 @@ class MoEExpertOffloadCache:
         lut = self._build_lut(slot_of_needed, topk_ids.dtype, topk_ids.device)
         return self._remap(topk_ids, lut)
 
+    # --- Stage-3 capturable path (GPU window) ------------------------------
+    def install_capturable_buffers(self):  # pragma: no cover - requires CUDA
+        """Build the frozen device LUTs (§3.1), the UVA device views of the
+        pinned spill pool, and the stable scratch destination views (§4).
+
+        MUST run after install() and after any freeze_from_source() rearrange
+        (the LUTs and pool views snapshot the FROZEN layout), and before graph
+        capture. In practice it runs on the first (warmup) forward, which is
+        eager and precedes DecodeCudaGraphRunner's stream capture (§5).
+        Idempotent.
+        """
+        import torch
+
+        if self._capturable_ready:
+            return
+        if not self._installed:
+            raise RuntimeError(
+                "install_capturable_buffers() requires install() first"
+            )
+        R, C = self.resident_count, self.scratch
+        if self.planner.buffer_size != R + C:
+            raise RuntimeError(
+                f"capturable offload requires buffer_size == R+C "
+                f"({self.planner.buffer_size} != {R}+{C}); the scratch region "
+                f"was capped by num_local_experts -- lower "
+                f"SGLANG_MOE_SCRATCH_SLOTS or the resident fraction."
+            )
+        if (self.planner.resident_slot is None) != (self._spill_pool_index is None):
+            raise RuntimeError(
+                "inconsistent frozen residency maps (resident_slot vs "
+                "spill_pool_index); freeze must install both or neither"
+            )
+        device = torch.device("cuda", torch.cuda.current_device())
+        (
+            self._cap_resident_slot_lut,
+            self._cap_is_spill,
+            self._cap_spill_pool_row_lut,
+        ) = build_capturable_luts(
+            self.num_local_experts,
+            R,
+            self.planner.resident_slot,
+            self._spill_pool_index,
+            device=device,
+        )
+        for attr, pinned in self._pinned.items():
+            self._cap_pool_dev[attr] = device_view_of_pinned(pinned)
+            self._cap_view_holders.append(pinned)
+            # Stable scratch sub-view of the resident buffer: fixed address,
+            # contiguous (slice of dim 0 of a contiguous [R+C,...] tensor).
+            self._cap_scratch_dst[attr] = self._resident[attr][R : R + C]
+        self._capturable_ready = True
+
+    def _issue_fetch_capturable(self, src_row):  # pragma: no cover - CUDA
+        """Captured scratch fetch (§4): one gather KERNEL per expert-tensor
+        attr, sourcing the UVA device view of the pinned pool and writing the
+        stable scratch region [R:R+C] in place. Stable in/out pointers; the
+        data-dependent part is only the CONTENT of ``src_row`` -> capturable.
+        Runs on the current stream, so program order guarantees the routed
+        apply (issued later on the same stream) reads a complete scratch (§7 R1).
+        """
+        import torch
+
+        for attr, pool_dev in self._cap_pool_dev.items():
+            torch.index_select(
+                pool_dev, 0, src_row, out=self._cap_scratch_dst[attr]
+            )
+
+    def prepare_capturable(self, topk_ids):  # pragma: no cover - requires CUDA
+        """Single-wave, host-sync-free prepare for the captured decode path:
+        on-device remap (bit-identical to resolve()+_build_lut+_remap, proven
+        on CPU) + the captured scratch gather. Returns remapped topk_ids.
+
+        Caller must guarantee the §2 invariant (worst-case unique spill <= C,
+        i.e. topk_ids.numel() <= C); enforced loudly in layer.py.
+        """
+        if not self._capturable_ready:
+            raise RuntimeError(
+                "prepare_capturable() before install_capturable_buffers()"
+            )
+        remapped, src_row, _num_spill = prepare_capturable_remap(
+            topk_ids,
+            self._cap_resident_slot_lut,
+            self._cap_is_spill,
+            self._cap_spill_pool_row_lut,
+            self.resident_count,
+            self.scratch,
+        )
+        self._issue_fetch_capturable(src_row)
+        return remapped
+
+    def freeze_from_source(self):  # pragma: no cover - requires CUDA
+        """§5 freeze-before-capture: load this layer's frozen hot set from
+        SGLANG_MOE_HOTSET_FILE and drive the existing _freeze_hotset physical
+        rearrange from it (instead of live calibration counts). No file =>
+        static [0,R) fallback (no-op). Runs before install_capturable_buffers.
+
+        File format (JSON): ``{"<layer_id>": [expert_id, ...], ...}`` with the
+        per-layer list ordered hottest-first (>= R entries; the first R are
+        taken). Produced offline from the M-C routing trace.
+        """
+        import logging
+
+        from sglang.srt.environ import envs
+
+        path = envs.SGLANG_MOE_HOTSET_FILE.get()
+        if not path:
+            return  # static [0,R) residency (F3)
+        if self._hot_frozen:
+            return
+        data = _load_hotset_file(path)
+        layer_id = getattr(self.layer, "layer_id", None)
+        key = str(layer_id)
+        if key not in data:
+            raise RuntimeError(
+                f"SGLANG_MOE_HOTSET_FILE {path!r} has no entry for layer "
+                f"{key!r} (keys: {sorted(data)[:8]}...)"
+            )
+        R, E = self.resident_count, self.num_local_experts
+        ids = [int(e) for e in data[key]]
+        if any(e < 0 or e >= E for e in ids):
+            raise RuntimeError(
+                f"SGLANG_MOE_HOTSET_FILE layer {key}: expert id out of [0,{E})"
+            )
+        hot = sorted(set(ids[:R]))
+        if len(hot) != R:
+            raise RuntimeError(
+                f"SGLANG_MOE_HOTSET_FILE layer {key}: need {R} unique hot "
+                f"experts, got {len(hot)} from the first {R} listed"
+            )
+        self._apply_hotset_freeze(hot)
+        logging.getLogger(__name__).info(
+            "MoE hot-residency FROZEN FROM FILE on layer %s: R=%d (source %s)",
+            key,
+            R,
+            path,
+        )
+
     def run_waves(self, dispatch_output, apply_fn):  # pragma: no cover - CUDA
         """Run the grouped-GEMM for one forward, wave-splitting when the forward
         needs more unique experts than there are resident slots.
@@ -745,8 +946,6 @@ class MoEExpertOffloadCache:
         """
         import logging
 
-        import torch
-
         R = self.resident_count
         E = self.num_local_experts
         counts = self._hot_counts
@@ -754,6 +953,39 @@ class MoEExpertOffloadCache:
         # Deterministic hot set: highest count first, ties broken by ascending id.
         ranked = sorted(range(E), key=lambda e: (-counts.get(e, 0), e))
         hot = sorted(ranked[:R])
+        self._apply_hotset_freeze(hot)
+        self._hot_counts = None  # release; never consulted again
+
+        total = sum(counts.values()) or 1
+        hot_mass = sum(counts.get(e, 0) for e in hot)
+        logging.getLogger(__name__).info(
+            "MoE hot-residency FROZEN on layer %s: R=%d hottest experts hold "
+            "%.1f%% of routed mass over %d calib forwards (static [0,R) held "
+            "%.1f%%); spill pool = %d cold experts.",
+            getattr(self.layer, "layer_id", "?"),
+            R,
+            100.0 * hot_mass / total,
+            self._hot_seen,
+            100.0 * sum(counts.get(e, 0) for e in range(R)) / total,
+            E - R,
+        )
+
+    def _apply_hotset_freeze(self, hot):  # pragma: no cover - requires CUDA
+        """Physically install ``hot`` (sorted list of R expert ids) as the
+        frozen resident set: in-place buffer rearrange + planner/cache map
+        install + freeze. Shared by live calibration (_freeze_hotset) and the
+        §5 file-driven freeze_from_source."""
+        import torch
+
+        R = self.resident_count
+        E = self.num_local_experts
+        if self._capturable_ready:
+            # The LUTs / pool device views snapshot the frozen layout; a
+            # rearrange after they were built would silently desync them.
+            raise RuntimeError(
+                "hot-set freeze after install_capturable_buffers(); the freeze "
+                "must happen before the capturable buffers are built"
+            )
         hot_set = set(hot)
         cold = [e for e in range(E) if e not in hot_set]  # ascending
         resident_slot = {e: i for i, e in enumerate(hot)}
@@ -797,25 +1029,29 @@ class MoEExpertOffloadCache:
         self.planner.resident_slot = resident_slot
         self._spill_pool_index = spill_pool_index
         self._hot_frozen = True
-        self._hot_counts = None  # release; never consulted again
-
-        total = sum(counts.values()) or 1
-        hot_mass = sum(counts.get(e, 0) for e in hot)
-        logging.getLogger(__name__).info(
-            "MoE hot-residency FROZEN on layer %s: R=%d hottest experts hold "
-            "%.1f%% of routed mass over %d calib forwards (static [0,R) held "
-            "%.1f%%); spill pool = %d cold experts.",
-            getattr(self.layer, "layer_id", "?"),
-            R,
-            100.0 * hot_mass / total,
-            self._hot_seen,
-            100.0 * sum(counts.get(e, 0) for e in range(R)) / total,
-            E - R,
-        )
 
     @property
     def stats(self) -> ResidencyStats:
         return self.planner.stats
+
+
+# Per-process cache for SGLANG_MOE_HOTSET_FILE: every MoE layer freezes from
+# the same small JSON, so parse it once.
+_HOTSET_FILE_CACHE: Dict[str, dict] = {}
+
+
+def _load_hotset_file(path: str) -> dict:
+    data = _HOTSET_FILE_CACHE.get(path)
+    if data is None:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"SGLANG_MOE_HOTSET_FILE {path!r}: expected a JSON object "
+                f'{{"<layer_id>": [expert ids hottest-first]}}'
+            )
+        _HOTSET_FILE_CACHE[path] = data
+    return data
 
 
 def presplit_expert_offload_after_repack(layer) -> None:  # pragma: no cover - CUDA
