@@ -1647,16 +1647,21 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        # Stage-3: freeze the residency layout (file-driven hot set, or static
-        # [0,R) when no SGLANG_MOE_HOTSET_FILE) and build the capturable
-        # buffers NOW -- this lazy install runs on the first (warmup) forward,
-        # which is eager and precedes DecodeCudaGraphRunner's stream capture
-        # (§5 ordering). Deliberately OUTSIDE the try/except above: a
-        # mis-configured capturable path must abort the boot, not silently
-        # change residency semantics.
-        if self._expert_offload is not None and self._moe_offload_graph_mode:
-            self._expert_offload.freeze_from_source()
-            self._expert_offload.install_capturable_buffers()
+        # Stage-3 residency freeze (file-driven). SGLANG_MOE_HOTSET_FILE freezes
+        # the resident set from the offline hot set in BOTH eager and graph
+        # mode -- the freeze is independent of graph capture, and running it
+        # eagerly too lets an eager server serve the SAME residency as a
+        # captured one (residency-matched A/B baselines). No file => static
+        # [0,R) (unchanged). Then, only under graph mode, build the capturable
+        # buffers so decode can be captured. This lazy install runs on the
+        # first (warmup) forward -- eager, before DecodeCudaGraphRunner's stream
+        # capture (§5 ordering). Deliberately OUTSIDE the silent-fallback
+        # try/except: a mis-configured capturable path must abort the boot.
+        if self._expert_offload is not None:
+            if envs.SGLANG_MOE_HOTSET_FILE.get():
+                self._expert_offload.freeze_from_source()
+            if self._moe_offload_graph_mode:
+                self._expert_offload.install_capturable_buffers()
 
     @classmethod
     def make_expert_params_mapping(
