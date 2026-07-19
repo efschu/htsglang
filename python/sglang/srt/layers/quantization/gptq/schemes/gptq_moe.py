@@ -175,7 +175,30 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
             if self.quant_config.desc_act:
                 w2_scales_size = intermediate_size_per_partition
             else:
-                w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
+                # Bugfix (even-TP, desc_act=False): the stock full-width
+                # allocation (intermediate_per_partition * moe_tp_size) with
+                # load_full_w2=False (below) made the EVEN-TP loader
+                # (_moe_src_start's shard_size*tp_rank branch) narrow a
+                # full-width w2_scales tensor at start=tp_rank*full_dim -> OOB
+                # ("start (K)+length (K) exceeds dimension size (K)"). w2 is the
+                # down-proj (row-parallel, sharded along intermediate); with
+                # group quant along intermediate and desc_act=False the groups
+                # are contiguous, so each rank needs ONLY its intermediate-shard
+                # of the scales -- and the marlin w2 repack indexes size_k from
+                # w2_scales.shape[1]*group_size, so a sharded width keeps qweight
+                # (already sharded) and scales k-consistent. Loading full scales
+                # into each rank (flipping load_full_w2) would feed the wrong
+                # rows -> silent garbage; the correct fix is the sharded width.
+                # Strictly gated to EVEN TP: the uneven-TP path (tp_partition_
+                # offset) is left on the original full-width, untouched.
+                from sglang.srt.distributed.utils import tp_plan_active
+
+                if tp_plan_active(layer.moe_tp_size, layer.moe_tp_family):
+                    w2_scales_size = (
+                        intermediate_size_per_partition * layer.moe_tp_size
+                    )
+                else:
+                    w2_scales_size = intermediate_size_per_partition
             scales_size2 = w2_scales_size // self.quant_config.group_size
             strategy = FusedMoeWeightScaleSupported.GROUP.value
         else:
