@@ -376,6 +376,45 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+
+        # --- MoE expert-offload (feat/moe-expert-offload, M-B/M-C) -----------
+        # Fully gated: unless SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0 (offload)
+        # or SGLANG_MOE_OFFLOAD_TRACE is set (routing trace for M-C), the only
+        # cost on the default path is a single bool read in run_moe_core -> the
+        # MoE math stays byte-identical. The offload cache itself is installed
+        # lazily on the first forward (weights must already be loaded and
+        # processed by then); see _apply_expert_offload / run_moe_core.
+        self._expert_offload_fraction = (
+            envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get()
+        )
+        self._moe_offload_trace_path = envs.SGLANG_MOE_OFFLOAD_TRACE.get()
+        self._moe_offload_enabled = (
+            self._expert_offload_fraction < 1.0
+            or bool(self._moe_offload_trace_path)
+        )
+        self._expert_offload = None  # MoEExpertOffloadCache, lazily installed
+        self._expert_offload_install_failed = False
+        self._moe_offload_trace_step = 0
+        # CUDA-graph guard (fail fast). Expert-offload and routing-trace both do
+        # a data-dependent device->host sync per forward (topk_ids.tolist()),
+        # which is illegal during CUDA-graph capture. There is no
+        # graph-capturable path because the set of experts to fetch is
+        # data-dependent per step. Require --disable-cuda-graph up front instead
+        # of failing deep inside capture. (Option (c): eager-only + clean guard.)
+        if self._moe_offload_enabled:
+            try:
+                _disable_cg = bool(get_server_args().disable_cuda_graph)
+            except Exception:
+                _disable_cg = True  # server args not wired (unit/test context)
+            if not _disable_cg:
+                raise RuntimeError(
+                    "MoE expert-offload / routing-trace "
+                    "(SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0 or "
+                    "SGLANG_MOE_OFFLOAD_TRACE) requires --disable-cuda-graph: "
+                    "the per-forward expert residency plan is data-dependent and "
+                    "cannot be captured into a CUDA graph. Re-launch with "
+                    "--disable-cuda-graph."
+                )
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
 
         if (
@@ -1359,10 +1398,100 @@ class FusedMoE(torch.nn.Module):
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
+        if getattr(self, "_moe_offload_enabled", False):
+            return self._run_moe_core_with_offload(dispatch_output)
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
         )
+
+    def _run_moe_core_with_offload(self, dispatch_output: DispatchOutput):
+        """Expert-offload + routing-trace hook (feat/moe-expert-offload).
+
+        Runs only when SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0 and/or
+        SGLANG_MOE_OFFLOAD_TRACE is set. It operates on the STANDARD dispatch
+        format (the pure-TP path used for the M-B/M-C measurement vehicle); any
+        other dispatch format is passed through untouched so unsupported
+        backends can never be silently corrupted.
+
+        When active it (a) optionally records the per-token routed expert ids
+        for the offline hit-rate simulator, and (b) fetches missing experts into
+        the resident GPU slot buffer and runs the grouped-GEMM over the small
+        resident buffer, WAVE-SPLITTING the forward when it needs more unique
+        experts than there are resident slots (the prefill overflow case). The
+        remap and per-token wave assignment are loss-free, so greedy outputs are
+        identical across fractions.
+        """
+        def _apply(disp):
+            return self.quant_method.apply(layer=self, dispatch_output=disp)
+
+        topk_output = dispatch_output.topk_output
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            # Only the standard (pure-TP) path is in V1 scope; leave EP / bypass
+            # / triton-kernels dispatch outputs exactly as-is.
+            return _apply(dispatch_output)
+
+        topk_ids = topk_output.topk_ids
+
+        # (a) M-C routing trace: log the *pre-remap* (real) routed expert ids.
+        if self._moe_offload_trace_path:
+            from sglang.srt.layers.moe.expert_offload import write_routing_trace
+
+            rank_tag = f"tp{self.moe_tp_rank}ep{self.moe_ep_rank}"
+            write_routing_trace(
+                self._moe_offload_trace_path,
+                rank_tag,
+                self.layer_id,
+                self._moe_offload_trace_step,
+                topk_ids.detach().to("cpu").tolist(),
+            )
+            self._moe_offload_trace_step += 1
+
+        # (b) Expert-offload remap (skipped entirely when fraction >= 1.0).
+        if self._expert_offload_fraction >= 1.0 or self._expert_offload_install_failed:
+            return _apply(dispatch_output)
+
+        if self._expert_offload is None:
+            self._install_expert_offload()
+            if self._expert_offload is None:  # install declined / failed
+                return _apply(dispatch_output)
+
+        # run_waves handles both the single-wave decode fast path (one apply over
+        # the full batch) and the multi-wave prefill-overflow path (disjoint
+        # token subsets, each fully computed once -> byte-identical accumulation).
+        return self._expert_offload.run_waves(dispatch_output, _apply)
+
+    def _install_expert_offload(self):
+        """Lazily build the per-layer offload cache on first forward, once the
+        expert weights are fully loaded/processed. On any error the layer falls
+        back to the resident (default) path and never retries."""
+        from sglang.srt.layers.moe.expert_offload import MoEExpertOffloadCache
+
+        try:
+            cache = MoEExpertOffloadCache(self, self._expert_offload_fraction)
+            if cache.planner.fully_resident:
+                # ceil(fraction * num_local_experts) == num_local_experts:
+                # nothing to offload, keep the default path.
+                self._expert_offload_install_failed = True
+                return
+            cache.install()
+            self._expert_offload = cache
+            logging.getLogger(__name__).info(
+                "MoE expert-offload active on layer %s: %d/%d experts resident "
+                "(fraction=%.3f)",
+                self.layer_id,
+                cache.n_slots,
+                cache.num_local_experts,
+                self._expert_offload_fraction,
+            )
+        except Exception as e:  # pragma: no cover - GPU-window failure path
+            self._expert_offload_install_failed = True
+            logging.getLogger(__name__).warning(
+                "MoE expert-offload install failed on layer %s (%s); falling "
+                "back to fully-resident experts.",
+                self.layer_id,
+                e,
+            )
 
     @classmethod
     def make_expert_params_mapping(
