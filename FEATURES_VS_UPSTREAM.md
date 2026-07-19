@@ -226,20 +226,24 @@ with zero cross-GPU communication while the slower cards handle distributed deco
 
 ## 8. Determinism, Mamba/GDN & HiCache
 
-- **Heterogeneous-GPU speculative determinism ✅** — three independent root causes fixed so
-  NEXTN+GDN on mixed-arch GPUs is bit-deterministic: (1) greedy verify without TP-rank sync
-  (per-rank argmax → near-tie flips → silent KV/GDN desync), (2) CUDA-graph pad-tails carrying
-  stale tokens into the MoE grouped-GEMM, (3) a persistent flashinfer float-workspace read of
-  regions the current forward did not write (this was the original "24-token multi-turn" bug).
-  *Impact: correctness — output was non-deterministic / corrupting on mixed GPUs before; now
-  bit-identical. Fix cost is sub-millisecond per step. No throughput claim.*
-- **Heterogeneous-TP sampling divergence fix ✅** — mixed archs (sm120/sm86) produce slightly
-  different reduction orders; upstream samples redundantly on every rank assuming bit-identical
-  logits, so ranks occasionally sampled different tokens (~1/1000) → silent state divergence →
-  word-salad then loops. Fixed by broadcasting sampled + draft token IDs from rank 0 when
-  heterogeneous TP is detected. Also fixed an AOT-compile cache that lacked GPU identity in its
-  hash (ranks loaded foreign-arch artifacts).
-  *Impact: correctness — eliminated a reproducible corruption/loop bug specific to mixed-GPU rigs.
+- **Robustness — heterogeneous-GPU speculative determinism ✅** — this is hardening the fork's own
+  mixed-GPU / uneven-TP path, not a fix over upstream: the defects only surface once you run
+  spec-decode across differently-sized cards (something upstream doesn't do), where upstream's
+  assumption of bit-identical logits across ranks no longer holds. Three independent roots were
+  made bit-deterministic: (1) greedy verify without TP-rank sync (per-rank argmax → near-tie flips
+  → silent KV/GDN desync), (2) CUDA-graph pad-tails carrying stale tokens into the MoE grouped-GEMM,
+  (3) a persistent flashinfer float-workspace read of regions the current forward did not write (the
+  original "24-token multi-turn" symptom).
+  *Impact: robustness — NEXTN+GDN output was non-deterministic / corrupting on mixed GPUs; now
+  bit-identical. Cost sub-millisecond per step. No throughput claim.*
+- **Robustness — heterogeneous-TP sampling divergence ✅** — again a mixed-GPU-only failure, not an
+  upstream bug an upstream user would hit: mixed archs (sm120/sm86) produce slightly different
+  reduction orders, and sampling redundantly on every rank (fine on identical GPUs) then picks
+  different tokens (~1/1000) → silent state divergence → word-salad then loops. Hardened by
+  broadcasting sampled + draft token IDs from rank 0 when heterogeneous TP is detected. Also
+  hardened the AOT-compile cache to include GPU identity in its hash (ranks were loading
+  foreign-arch artifacts).
+  *Impact: robustness — eliminated a reproducible corruption/loop specific to mixed-GPU rigs.
   Cost < 1 ms/step. No throughput claim.*
 - **Mamba/GDN determinism ✅** — checkpoint grid, deterministic resume/eviction, flush == fresh-boot,
   fp32 beta-gate.
