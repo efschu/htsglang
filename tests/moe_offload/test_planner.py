@@ -183,5 +183,54 @@ def test_fully_resident_passthrough():
     assert slot_of == {0: 0, 3: 3, 7: 7}
 
 
+# --------------------------------------------------------------------------- #
+# Stage-1 hot-expert residency (frozen non-contiguous resident set)
+# --------------------------------------------------------------------------- #
+def test_hot_residency_resolve_maps_to_assigned_slots():
+    # Frozen hot set {5, 40, 200} (R=3) at slots {5->0, 40->1, 200->2}. Cold
+    # experts spill into scratch [3, 3+C).
+    p = ExpertResidencyPlanner(
+        num_local_experts=256,
+        resident_count=3,
+        scratch=4,
+        resident_ids=frozenset({5, 40, 200}),
+        resident_slot={5: 0, 40: 1, 200: 2},
+    )
+    slot_of, fetch = p.resolve([200, 7, 40, 5, 9])
+    # resident experts -> their frozen slots (no fetch)
+    assert slot_of[5] == 0 and slot_of[40] == 1 and slot_of[200] == 2
+    # cold experts 7, 9 (sorted) -> scratch slots 3, 4, and are fetched
+    assert slot_of[7] == 3 and slot_of[9] == 4
+    assert fetch == [(7, 3), (9, 4)]
+
+
+def test_hot_residency_is_deterministic():
+    p = ExpertResidencyPlanner(
+        num_local_experts=64,
+        resident_count=2,
+        scratch=4,
+        resident_ids=frozenset({10, 30}),
+        resident_slot={10: 0, 30: 1},
+    )
+    a = p.resolve([50, 10, 20])
+    p.resolve([1, 2, 3])  # intervening
+    b = p.resolve([50, 10, 20])
+    assert a == b  # history-independent
+
+
+def test_hot_residency_wave_split_uses_resident_ids():
+    # Resident set {0, 100}; tokens routing to distinct COLD experts must still
+    # wave-split by scratch, while resident experts impose no budget.
+    resident = frozenset({0, 100})
+    experts = [[0, 10], [100, 11], [0, 12]]  # cold {10, 11, 12}
+    waves = plan_token_waves(experts, resident_count=2, scratch=2, resident_ids=resident)
+    for w in waves:
+        cold = {e for t in w for e in experts[t] if e not in resident}
+        assert len(cold) <= 2
+    # 3 unique cold > scratch 2 -> at least 2 waves; every token appears once.
+    assert len(waves) >= 2
+    assert sorted(_all_rows(waves)) == [0, 1, 2]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

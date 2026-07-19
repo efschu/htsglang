@@ -683,6 +683,24 @@ class Envs:
     # When set to a path, log per-layer routed expert IDs (topk_ids) to that
     # file for offline routing-locality / cache-hit-rate simulation (M-C).
     SGLANG_MOE_OFFLOAD_TRACE = EnvStr("")
+    # Stage-1 hot-expert residency (offload-speed bundle). When True (and offload
+    # is active, fraction<1.0), the resident GPU set is FROZEN to the R most-
+    # frequently-routed experts per layer -- observed over the first
+    # SGLANG_MOE_HOT_CALIB_STEPS forwards (a deterministic calibration pass), then
+    # never changed. Cuts H2D spill traffic (real MoE routing is heavily skewed;
+    # the default static [0,R) set captures only ~uniform R/E). BYTE-IDENTICAL to
+    # the static-residency path at the same fraction: residency only changes WHICH
+    # experts are physically resident vs fetched, not the per-token math (same
+    # GEMM, same buffer size R+C, per-expert token sets unchanged). Frozen-after-
+    # calibration => self-deterministic. Default False = static [0,R) (unchanged).
+    SGLANG_MOE_HOT_RESIDENCY = EnvBool(False)
+    # Number of offload forwards to observe (accumulating per-expert routing
+    # counts) before the hot-set is computed, physically installed, and FROZEN.
+    # Default 1: freeze right after the first forward (a prefill sees ~all prompt
+    # tokens => rich frequency signal in one shot). The freeze happens at the TOP
+    # of the triggering forward, so that forward's own output already uses the
+    # frozen hot-set (no intra-run residency drift => self-det holds).
+    SGLANG_MOE_HOT_CALIB_STEPS = EnvInt(1)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)

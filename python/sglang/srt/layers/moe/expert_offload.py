@@ -110,15 +110,24 @@ def plan_token_waves(
     experts_per_token: Sequence[Sequence[int]],
     resident_count: int,
     scratch: int,
+    resident_ids: Optional[frozenset] = None,
 ) -> List[List[int]]:
     """Greedily partition token indices into waves whose union of unique SPILL
-    experts (global id >= ``resident_count``) is <= ``scratch``.
+    experts is <= ``scratch``.
 
-    Fixed-resident + scratch model: experts ``[0, resident_count)`` are always
-    resident on GPU (fixed slots, never fetched), so they impose NO wave budget.
-    Only the SPILL experts (``>= resident_count``) consume the ``scratch`` slots
-    and must be fetched, so a wave may include any number of resident experts
-    plus at most ``scratch`` unique spill experts.
+    Fixed-resident + scratch model: the resident experts are always resident on
+    GPU (fixed slots, never fetched), so they impose NO wave budget. Only the
+    SPILL experts consume the ``scratch`` slots and must be fetched, so a wave
+    may include any number of resident experts plus at most ``scratch`` unique
+    spill experts.
+
+    Residency set: when ``resident_ids`` is None (default) the resident set is
+    the static ``[0, resident_count)`` (spill == global id >= resident_count).
+    When ``resident_ids`` is given (Stage-1 hot residency), the resident set is
+    exactly that frozen id set (spill == id not in resident_ids); its size still
+    equals ``resident_count`` so the scratch budget is unchanged. The wave split
+    is over TOKENS either way, so every token is still computed exactly once with
+    all its experts resident -> byte-identical regardless of which set is chosen.
 
     Pure-python, CPU-testable. ``experts_per_token[t]`` is the list of routed
     expert ids for token ``t`` (``-1`` padding allowed and ignored). Returns a
@@ -129,6 +138,10 @@ def plan_token_waves(
     """
     if scratch < 1:
         raise ValueError("scratch must be >= 1")
+
+    def _is_spill(e: int) -> bool:
+        return e not in resident_ids if resident_ids is not None else e >= resident_count
+
     waves: List[List[int]] = []
     cur_rows: List[int] = []
     cur_spill: set = set()
@@ -136,7 +149,7 @@ def plan_token_waves(
         spill = {
             int(e)
             for e in experts
-            if e is not None and int(e) >= resident_count
+            if e is not None and _is_spill(int(e))
         }
         if len(spill) > scratch:
             raise ValueError(
@@ -183,6 +196,12 @@ class ExpertResidencyPlanner:
     resident_count: int
     scratch: int
     stats: ResidencyStats = field(default_factory=ResidencyStats)
+    # Stage-1 hot residency: when set, the resident set is exactly ``resident_ids``
+    # (a frozen set of size resident_count) and ``resident_slot`` maps each
+    # resident expert id -> its GPU slot in [0, resident_count). When None
+    # (default) the resident set is the static [0, resident_count) at slot==id.
+    resident_ids: Optional[frozenset] = None
+    resident_slot: Optional[Dict[int, int]] = None
 
     def __post_init__(self):
         if self.scratch < 1:
@@ -220,8 +239,16 @@ class ExpertResidencyPlanner:
             self.stats.hits += len(needed_unique)
             return {e: e for e in needed_unique}, []
 
-        resident = [e for e in needed_unique if e < self.resident_count]
-        spill = [e for e in needed_unique if e >= self.resident_count]  # sorted
+        if self.resident_ids is None:
+            # Static residency: resident == [0, R) at slot==id.
+            resident = [e for e in needed_unique if e < self.resident_count]
+            spill = [e for e in needed_unique if e >= self.resident_count]  # sorted
+            resident_slot_of = {e: e for e in resident}
+        else:
+            # Hot residency: resident == frozen id set at its assigned slot.
+            resident = [e for e in needed_unique if e in self.resident_ids]
+            spill = [e for e in needed_unique if e not in self.resident_ids]  # sorted
+            resident_slot_of = {e: self.resident_slot[e] for e in resident}
         if len(spill) > self.scratch:
             raise RuntimeError(
                 f"resolve() got {len(spill)} spill experts but only "
@@ -232,7 +259,7 @@ class ExpertResidencyPlanner:
         self.stats.misses += len(spill)
         self.stats.fetches += len(spill)
 
-        slot_of_needed: Dict[int, int] = {e: e for e in resident}
+        slot_of_needed: Dict[int, int] = dict(resident_slot_of)
         fetch_plan: List[Tuple[int, int]] = []
         for i, e in enumerate(spill):
             slot = self.resident_count + i
@@ -326,6 +353,24 @@ class MoEExpertOffloadCache:
         self._stream = None
         self._installed = False
 
+        # --- Stage-1 hot-expert residency ----------------------------------
+        # When enabled, per-expert routing counts are accumulated over the first
+        # `_hot_calib_steps` forwards; then the R hottest experts are frozen as
+        # the resident set and the buffers are physically rearranged so those
+        # experts sit in [0,R) and the rest form the spill pool. `_spill_pool_index`
+        # maps a (cold) global expert id -> its row in the pinned spill pool
+        # (identity `id-R` in the static/default layout). See _freeze_hotset.
+        from collections import Counter as _Counter
+
+        from sglang.srt.environ import envs
+
+        self._hot_enabled = bool(envs.SGLANG_MOE_HOT_RESIDENCY.get())
+        self._hot_calib_steps = max(1, int(envs.SGLANG_MOE_HOT_CALIB_STEPS.get()))
+        self._hot_counts = _Counter()
+        self._hot_seen = 0
+        self._hot_frozen = False
+        self._spill_pool_index: Optional[Dict[int, int]] = None  # None => id-R
+
     # --- lifecycle (GPU window) --------------------------------------------
     def install(self):  # pragma: no cover - requires CUDA
         """Build the [R+C]-slot GPU buffer (fixed resident [0,R) + scratch) and
@@ -418,11 +463,13 @@ class MoEExpertOffloadCache:
         if not fetch_plan:
             return
         R = self.resident_count
+        pool_index = self._spill_pool_index  # None => static layout (id - R)
         with torch.cuda.stream(self._stream):
             for attr, spill in self._pinned.items():
                 dst = self._resident[attr]
                 for expert_id, slot in fetch_plan:
-                    dst[slot].copy_(spill[expert_id - R], non_blocking=True)
+                    row = pool_index[expert_id] if pool_index is not None else expert_id - R
+                    dst[slot].copy_(spill[row], non_blocking=True)
         torch.cuda.current_stream().wait_stream(self._stream)
 
     def _build_lut(self, slot_of_needed, dtype, device):  # pragma: no cover
@@ -481,7 +528,23 @@ class MoEExpertOffloadCache:
             return apply_fn(dispatch_output)
 
         ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
-        waves = plan_token_waves(ids_list, self.resident_count, self.scratch)
+
+        # Stage-1 hot residency: accumulate routing counts, then freeze the R
+        # hottest experts (physical rearrange) once calibration is complete. Done
+        # BEFORE this forward's resolve/fetch/apply so the triggering forward's
+        # own output already uses the frozen set (no intra-run drift).
+        if self._hot_enabled and not self._hot_frozen:
+            for row in ids_list:
+                for e in row:
+                    if e >= 0:
+                        self._hot_counts[e] += 1
+            self._hot_seen += 1
+            if self._hot_seen >= self._hot_calib_steps:
+                self._freeze_hotset()
+
+        waves = plan_token_waves(
+            ids_list, self.resident_count, self.scratch, self.planner.resident_ids
+        )
 
         # Fast path: the whole forward fits in one wave (typical decode). Remap
         # the full batch and run a single apply -- no token slicing overhead.
@@ -544,6 +607,93 @@ class MoEExpertOffloadCache:
 
         # Reuse the last wave's CombineInput type/fields, swapping in full output.
         return combine_out._replace(hidden_states=out_full)
+
+    # --- Stage-1 hot-set freeze (GPU window) -------------------------------
+    def _freeze_hotset(self):  # pragma: no cover - requires CUDA
+        """Compute the R most-frequently-routed experts (from accumulated
+        calibration counts), physically rearrange every expert tensor so those R
+        occupy the resident GPU slots [0,R) and the rest form the pinned spill
+        pool, install the id->slot / id->pool-row maps on the planner+cache, and
+        FREEZE. One-time, deterministic (tie-break by ascending expert id).
+
+        Byte-identity: this only permutes WHICH physical expert lives in WHICH
+        slot/pool-row. A token's MoE output depends only on its own routed
+        experts' weights and its top-k reduction order (unchanged); each expert's
+        per-block GEMM is independent of its slot. Buffer size (R+C) and every
+        expert's token set are unchanged, so the marlin moe_align tiling is
+        unchanged -> output is bit-identical to the static-[0,R) layout at the
+        same fraction. The win is purely a higher resident hit-rate => fewer H2D
+        fetches. Frozen after this call => residency never drifts => self-det.
+        """
+        import logging
+
+        import torch
+
+        R = self.resident_count
+        E = self.num_local_experts
+        counts = self._hot_counts
+
+        # Deterministic hot set: highest count first, ties broken by ascending id.
+        ranked = sorted(range(E), key=lambda e: (-counts.get(e, 0), e))
+        hot = sorted(ranked[:R])
+        hot_set = set(hot)
+        cold = [e for e in range(E) if e not in hot_set]  # ascending
+        resident_slot = {e: i for i, e in enumerate(hot)}
+        spill_pool_index = {e: j for j, e in enumerate(cold)}
+
+        # Rearrange with ZERO extra GPU memory: the co-located 3080 ranks sit at
+        # their full mem budget after load, so a transient second GPU buffer would
+        # OOM. Instead we snapshot the resident region to host, rebuild the spill
+        # pool on host, and overwrite the EXISTING resident buffer in place (H2D
+        # into buf[0:R]); no new GPU tensor is allocated. Per-attr host temp is
+        # one layer's expert set (~O(100 MB)), freed each iteration.
+        for attr in list(self._resident.keys()):
+            buf = self._resident[attr]         # [R+C,...]; slot i (i<R) == expert i
+            old_spill = self._pinned[attr]     # [E-R,...]; row (e-R) == expert e>=R
+            tail = tuple(buf.shape[1:])
+
+            # Host snapshot of the current resident experts [0,R) so overwriting
+            # buf[0:R] in place can never corrupt a not-yet-moved source.
+            resident_host = buf[:R].to("cpu")
+
+            def _src(e):  # current physical tensor for expert e (STATIC layout)
+                return resident_host[e] if e < R else old_spill[e - R]
+
+            # New spill pool (cold experts), pinned for async H2D fetches later.
+            new_spill = torch.empty(
+                (E - R,) + tail, dtype=old_spill.dtype, device="cpu"
+            ).pin_memory()
+            for j, e in enumerate(cold):
+                new_spill[j].copy_(_src(e))     # host<-host (snapshot or old_spill)
+
+            # Push hot experts into the existing resident slots, in place.
+            for i, e in enumerate(hot):
+                buf[i].copy_(_src(e))           # GPU<-host (H2D); no new GPU alloc
+
+            self._pinned[attr] = new_spill      # self._resident[attr] stays `buf`
+            del resident_host, old_spill
+
+        torch.cuda.synchronize()
+        # Install the frozen maps; from here resolve()/_fetch() use the hot set.
+        self.planner.resident_ids = frozenset(hot_set)
+        self.planner.resident_slot = resident_slot
+        self._spill_pool_index = spill_pool_index
+        self._hot_frozen = True
+        self._hot_counts = None  # release; never consulted again
+
+        total = sum(counts.values()) or 1
+        hot_mass = sum(counts.get(e, 0) for e in hot)
+        logging.getLogger(__name__).info(
+            "MoE hot-residency FROZEN on layer %s: R=%d hottest experts hold "
+            "%.1f%% of routed mass over %d calib forwards (static [0,R) held "
+            "%.1f%%); spill pool = %d cold experts.",
+            getattr(self.layer, "layer_id", "?"),
+            R,
+            100.0 * hot_mass / total,
+            self._hot_seen,
+            100.0 * sum(counts.get(e, 0) for e in range(R)) / total,
+            E - R,
+        )
 
     @property
     def stats(self) -> ResidencyStats:
