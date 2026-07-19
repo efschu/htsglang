@@ -55,6 +55,10 @@ _ENABLED: bool = True
 # Timeout for the end-of-forward monitored barrier. Generous vs a decode step
 # (~10s ms) yet finite, so a genuine divergence surfaces in seconds not never.
 _BARRIER_TIMEOUT = datetime.timedelta(seconds=30)
+# Bounded per-step presence timeout: a count divergence surfaces within this
+# window (loud, naming the culprit) instead of blocking on the gloo subgroup's
+# long default timeout. Generous vs a real decode step, short vs a hang.
+_STEP_TIMEOUT = datetime.timedelta(seconds=10)
 
 
 def set_guard_enabled(enabled: bool) -> None:
@@ -91,11 +95,32 @@ def guard_dcp_step(op_tag: str, cp_group: GroupCoordinator) -> None:
     if not _ENABLED or cp_group.world_size <= 1:
         _STEP += 1
         return
+    # PRESENCE check first, with a BOUNDED timeout. A COUNT divergence (a rank
+    # issues fewer DCP collectives and leaves the forward early) would otherwise
+    # block the other ranks' handshake collective indefinitely -- the gloo
+    # subgroup's default timeout is long (~30 min), so a plain all_gather is not
+    # a bounded backstop. monitored_barrier honors this timeout and names the
+    # missing rank, so a count divergence fails LOUD within _STEP_TIMEOUT rather
+    # than hanging. In the non-divergent case every rank reaches this barrier the
+    # same number of times, so it is just a cheap eager-only sync.
+    try:
+        torch.distributed.monitored_barrier(
+            group=cp_group.cpu_group, timeout=_STEP_TIMEOUT, wait_all_ranks=True
+        )
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "weightless-KV anti-hang guard: DCP collective COUNT divergence at "
+            f"step {_STEP} on rank {cp_group.rank_in_group} (op {op_tag!r}). A "
+            "rank issued a different NUMBER of DCP collectives (one side reached "
+            "this step, another did not) -- this would otherwise be a silent "
+            f"NCCL hang. Underlying: {e}"
+        ) from e
     sig = _op_signature(op_tag, _STEP)
     local = torch.tensor([sig], dtype=torch.int64)
     gathered = [torch.empty_like(local) for _ in range(cp_group.world_size)]
-    # Fixed shape [1] on every rank -> the collective itself cannot hang on a
-    # shape mismatch; it can only surface a VALUE mismatch, which we check.
+    # Fixed shape [1] on every rank (and presence already confirmed above) ->
+    # the collective cannot hang; it can only surface a VALUE mismatch, which we
+    # check to catch an ORDER/TYPE divergence.
     torch.distributed.all_gather(gathered, local, group=cp_group.cpu_group)
     vals = [int(t.item()) for t in gathered]
     if any(v != sig for v in vals):
