@@ -265,6 +265,11 @@ class GenerateReqInput:
 
     # Priority for the request
     priority: Optional[int] = None
+    # Fast-lane scheduling class (Variant C Stage 0): "fast" for interactive,
+    # low-latency requests; "heavy" (or None) for batchable requests. Only has
+    # effect when the server is launched with --enable-fast-lane; a "fast" lane
+    # seeds a high priority in the existing priority-scheduling path.
+    lane: Optional[str] = None
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -759,6 +764,7 @@ class GenerateReqInput:
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             priority=self.priority,
+            lane=self.lane,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
@@ -841,6 +847,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Priority for the request
     priority: Optional[int] = None
+
+    # Fast-lane scheduling class (Variant C Stage 0): "fast" | "heavy" | None.
+    lane: Optional[str] = None
 
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
