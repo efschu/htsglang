@@ -1553,10 +1553,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 load_config=self.load_config,
                 model_config=self.model_config,
             )
-            self.model = self.loader.load_model(
-                model_config=self.model_config,
-                device_config=DeviceConfig(self.device, self.gpu_id),
+            # Weightless-KV fast lane (Option-B, B1): build + load the model as
+            # weight-TP=1 (every family full, no sharding, no FFN/residual
+            # all-reduce). The head rank runs this full model TP=1; only the
+            # attention op dispatches across the dcp group (size 3) via the
+            # [H,0,0] weightless path. Linears cache self.tp_size at construction
+            # and RowParallelLinear gates its all-reduce on that cached value
+            # (linear.py:2103), so a construction-time override sticks through
+            # forward. attn_tp_size is already 1 under dcp==tp, so attention proj
+            # is full; the override makes FFN/embed/lm_head/GDN full too. The dcp
+            # group is NOT overridden, so the attention dispatch still spans 3
+            # ranks. No-op on the default path.
+            from sglang.srt.runtime_context import get_parallel
+
+            _wl_build_ctx = (
+                get_parallel().override(tp_size=1, moe_tp_size=1)
+                if (self.is_weightless_head or self.is_weightless_worker)
+                else contextlib.nullcontext()
             )
+            with _wl_build_ctx:
+                self.model = self.loader.load_model(
+                    model_config=self.model_config,
+                    device_config=DeviceConfig(self.device, self.gpu_id),
+                )
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
