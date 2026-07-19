@@ -6,6 +6,33 @@ S1; the neutral-seam registry extraction is a later stage gated on byte
 identity for qwen35). Dense Gemma-4 only — MoE / MTP / vision GGUF are
 deferred (S3) and fail fast below.
 
+Launch recipe (validated: Gemma-4-31B-it GGUF-Q4_K_M, TP=1 on an RTX 5090,
+coherent + self-deterministic + ~61 tok/s). Two non-obvious traps, neither of
+which is a code issue in this file but both of which block a naive launch:
+
+  * Attention backend: Gemma-4 REJECTS the flashinfer backend (it asserts
+    "only supports trtllm_mha, triton, or intel_xpu"). Launch with
+    ``--attention-backend triton``.
+  * Device identity (torch enumeration != NVML/nvidia-smi order): CUDA's
+    default ``FASTEST_FIRST`` puts a fast card (e.g. a 5090 among 3080s) at
+    ``cuda:0``, so an NVML index does NOT map to the same ``cuda:N``. To pin
+    an NVML-resolved physical GPU, set
+    ``CUDA_DEVICE_ORDER=PCI_BUS_ID`` so ``CUDA_VISIBLE_DEVICES=<nvml_idx>``
+    selects that exact card (without it, the wrong card is chosen -> OOM).
+
+  Full working invocation (this fork's worktree on PYTHONPATH):
+
+    PYTHONPATH=<worktree>/python \\
+    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<nvml_idx> \\
+    python -m sglang.launch_server \\
+      --model-path <gemma4>.gguf --load-format gguf --dtype bfloat16 \\
+      --tp-size 1 --attention-backend triton \\
+      --mem-fraction-static 0.85 --context-length 4096 --trust-remote-code
+
+Scope: only Q4_K_M GGUF is empirically verified. Other GGUF quant levels
+(and non-GGUF quants) use the same code paths and should work in principle
+but are not tested.
+
 Why the generic GGUF path cannot load Gemma-4:
 
 1. **Config.** transformers' GGUF metadata reader crashes on the gemma4
