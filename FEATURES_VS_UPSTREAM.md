@@ -311,9 +311,17 @@ adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4*
   fail-fast check that `(ranks on a GPU) × per-rank-MiB ≤ NVML total`.
   *Impact: enablement — multiple ranks per physical GPU (e.g. TP=4 on 3 cards), with early, clear
   errors for impossible mappings.*
-- **TP=5+ emulation via co-location 🟠** — 3+1+1 topology on 3 cards, MPS, Q4 GGUFs; validates the
-  >3-card code path on a 3-card rig.
-  *Impact: test-coverage enablement for higher TP degrees than the rig physically has.*
+- **Multi-rank GPU co-location — TP degree above the physical GPU count (#82) ✅** — run TP=N with
+  N greater than the number of physical GPUs by placing multiple TP ranks on the same physical GPU
+  (NCCL multi-rank; the co-location env is auto-set when duplicate rank→GPU mappings are detected).
+  On this rig this runs TP=5 on 3 physical cards: 2 ranks share the 5090, 1 rank on each 3080. So a
+  configuration is not limited to TP ≤ physical-GPU-count.
+  *Impact: **🟢 enables TP layouts that assume more shards than the machine has cards** — e.g. a TP=5
+  layout on a 3-GPU box, or finer-grained sharding to fit a model's per-shard size onto small cards.
+  Honest caveats: **⚪/🔴 co-located ranks share one piece of silicon**, so they contend for SMs and
+  add no memory bandwidth (they are the same GPU) — the gain is capability/flexibility (fitting or
+  emulating larger-TP layouts on limited or heterogeneous hardware), not raw throughput. Pairs with
+  the fork's uneven-TP so the co-located card can also carry a proportionally larger shard.*
 - **Rig dashboard, Docker image, falsifier levers ✅** — operational tooling: a live rig dashboard,
   a reproducible container image, and env-gated falsifier probes used to hunt the determinism bugs
   above.
