@@ -1495,7 +1495,18 @@ class ModelRunnerKVCacheMixin:
                 # DCP-token-sharded (see FlashInferAttnBackend.__init__ draft
                 # gate). Only the TARGET model replicates heads + token-shards.
                 _draft_non_dcp = self.is_draft_worker
-                if uneven_dcp_kv_replicated(self.dcp_size) and not _draft_non_dcp:
+                # Weightless-KV fast lane (Option-B): the head rank projects the
+                # FULL kv-heads (built under the weight-TP=1 override) and
+                # broadcasts them; every rank writes all total_num_kv_heads to
+                # its owned token slots. So the full-attention KV pool must store
+                # the FULL total_num_kv_heads, exactly like the uneven-DCP
+                # replicated-KV geometry -- not the ÷attn_tp_size per-rank share
+                # (which would mismatch the head's broadcast at the attention
+                # dispatch). weightless has rank_tp_ratio=None so
+                # uneven_dcp_kv_replicated() is False; add it explicitly.
+                if (
+                    uneven_dcp_kv_replicated(self.dcp_size) or weightless_kv_active()
+                ) and not _draft_non_dcp:
                     _hybrid_kv_head_num = self.model_config.get_total_num_kv_heads()
                 else:
                     _hybrid_kv_head_num = self.model_config.get_num_kv_heads(
