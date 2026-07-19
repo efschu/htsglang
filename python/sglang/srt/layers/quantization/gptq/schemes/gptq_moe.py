@@ -128,6 +128,15 @@ class GPTQMoEAscendScheme(GPTQMoESchemeBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
+        # Variant-C B2b: right after the marlin repack (repacked tensors on GPU),
+        # split into a fixed-resident GPU buffer + pinned-host spill so the full
+        # [E] expert stack never gets pinned back to host (load-time RAM cap).
+        # No-op unless SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0.
+        from sglang.srt.layers.moe.expert_offload import (
+            presplit_expert_offload_after_repack,
+        )
+
+        presplit_expert_offload_after_repack(layer)
 
     def apply_weights(
         self,
@@ -321,6 +330,15 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
+        # Variant-C B2b: right after the marlin repack (repacked tensors on GPU),
+        # split into a fixed-resident GPU buffer + pinned-host spill so the full
+        # [E] expert stack never gets pinned back to host (load-time RAM cap).
+        # No-op unless SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0.
+        from sglang.srt.layers.moe.expert_offload import (
+            presplit_expert_offload_after_repack,
+        )
+
+        presplit_expert_offload_after_repack(layer)
 
     def apply_weights(
         self,
