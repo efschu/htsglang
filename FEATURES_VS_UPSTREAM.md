@@ -68,6 +68,10 @@ its GPU, instead of an equal split.
   a GQA re-grouping fix for small head counts (gqa=1 ranks).
   *Impact: enables TP degrees that were structurally impossible before. Correctness fix,
   no throughput claim.*
+  **Honest downside:** because TP exceeds `num_kv_heads`, the KV heads must be **replicated**
+  across the ranks that share a KV-head group instead of sharded, so this costs **extra KV-cache
+  VRAM** (more KV memory than a plain sharded layout) — the price of running TP > num_kv_heads,
+  not free.
 - **Rank-uniform collective guards ✅** — guards in front of `all_gather` that require
   rank-uniform shapes, converting a would-be NCCL hang into a clean, early error.
   *Impact: robustness — turns a silent distributed hang into a fail-fast error.*
