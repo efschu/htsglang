@@ -294,6 +294,124 @@ def scratch_slot_count(resident_count: int) -> int:
     return max(8, resident_count // 4)
 
 
+# ===========================================================================
+# Stage-3: CUDA-graph-capturable routing math (host-sync-free).
+#
+# The eager offload path (run_waves) does per layer per step: topk_ids.tolist()
+# (D->H sync), Python set/sort/dict planning, and a per-(attr,expert) Python
+# copy loop -- none capturable. The functions below replace the single-wave
+# fast path with pure, fixed-shape tensor algebra over the 256-expert axis that
+# reproduces ExpertResidencyPlanner.resolve() + _build_lut + _remap BIT-FOR-BIT
+# (proven in tests/moe_offload/test_capturable_planner.py), plus the fetch
+# source indices for a single captured gather. All ops are scatter / cumsum /
+# gather over fixed axes (E, C) => no host sync, CUDA-graph capturable. They are
+# written to run identically on CPU tensors (for the unit test) and CUDA.
+# ===========================================================================
+
+
+def build_capturable_luts(
+    num_local_experts: int,
+    resident_count: int,
+    resident_slot: Optional[Dict[int, int]],
+    spill_pool_index: Optional[Dict[int, int]],
+    device="cpu",
+):
+    """Build the three frozen device-constant LUTs (int32[E]) the capturable
+    path gathers from. Pure derivation from the (already-frozen) residency maps.
+
+    resident_slot / spill_pool_index None => the static [0,R) layout
+    (resident e<R at slot==e; spill e>=R at pool row e-R). Otherwise the frozen
+    hot-set maps (from _freeze_hotset). Returns:
+      resident_slot_lut : int32[E]  slot in [0,R) for resident e, else -1
+      is_spill          : bool[E]   (resident_slot_lut < 0)
+      spill_pool_row_lut: int32[E]  pool row in [0,E-R) for spill e, else -1
+    """
+    import torch
+
+    E, R = int(num_local_experts), int(resident_count)
+    resident_slot_lut = torch.full((E,), -1, dtype=torch.int32)
+    spill_pool_row_lut = torch.full((E,), -1, dtype=torch.int32)
+    if resident_slot is None:
+        # Static [0,R): resident ids are exactly [0,R) at slot==id.
+        idx = torch.arange(R, dtype=torch.int32)
+        resident_slot_lut[:R] = idx
+        spill_pool_row_lut[R:E] = torch.arange(E - R, dtype=torch.int32)
+    else:
+        for e, s in resident_slot.items():
+            resident_slot_lut[int(e)] = int(s)
+        for e, r in spill_pool_index.items():
+            spill_pool_row_lut[int(e)] = int(r)
+    is_spill = resident_slot_lut < 0
+    return (
+        resident_slot_lut.to(device),
+        is_spill.to(device),
+        spill_pool_row_lut.to(device),
+    )
+
+
+def prepare_capturable_remap(
+    topk_ids,
+    resident_slot_lut,
+    is_spill,
+    spill_pool_row_lut,
+    resident_count: int,
+    scratch: int,
+):
+    """Fixed-shape, host-sync-free reproduction of resolve()+_build_lut+_remap
+    for the single-wave case. Returns (remapped_topk_ids, src_row, num_spill):
+
+      remapped_topk_ids : like topk_ids; global expert id -> resident/scratch
+                          slot (-1 padding preserved). Bit-identical to the
+                          eager _remap output.
+      src_row           : int32[C]; src_row[j] = pinned-pool row to gather into
+                          scratch slot j (global slot R+j). Unused slots => 0
+                          (harmless: no topk_id maps there).
+      num_spill         : int32 scalar (device); # unique spill experts routed.
+
+    Correctness (see test_capturable_planner.py): the cumsum-rank over the
+    ascending expert-id axis reproduces resolve()'s sorted(spill)->R+i loop
+    index i exactly, so scratch-slot assignment and remap match the eager path.
+    """
+    import torch
+
+    E = int(resident_slot_lut.shape[0])
+    R, C = int(resident_count), int(scratch)
+    device = topk_ids.device
+    idsf = topk_ids.reshape(-1)
+    valid = idsf >= 0
+    clamped = idsf.clamp(min=0).to(torch.long)
+
+    # (1) presence over experts via accumulate-scatter of 1s (padding adds 0).
+    presence = torch.zeros(E, dtype=torch.int32, device=device)
+    presence.index_put_((clamped,), valid.to(torch.int32), accumulate=True)
+    present = presence > 0
+    spill_present = present & is_spill  # bool[E]
+
+    # (2) sorted scratch-slot assignment via cumulative rank over ascending id.
+    rank = torch.cumsum(spill_present.to(torch.int32), dim=0) - 1  # int32[E]
+    num_spill = spill_present.to(torch.int32).sum()
+
+    # (3) fetch source rows: src_row[rank[e]] = pool_row(e) for present spill e.
+    #     Non-spill entries are routed to a trash slot C and discarded.
+    dst = torch.where(
+        spill_present,
+        rank.clamp(0, C - 1),
+        torch.full_like(rank, C),
+    ).to(torch.long)
+    src_row_ext = torch.zeros(C + 1, dtype=torch.int32, device=device)
+    src_row_ext.index_put_((dst,), spill_pool_row_lut, accumulate=False)
+    src_row = src_row_ext[:C].contiguous()
+
+    # (4) global-id -> slot LUT + remap (replaces _build_lut/_remap, no loop).
+    slot_of = torch.where(is_spill, R + rank, resident_slot_lut)  # int32[E]
+    remapped = torch.where(
+        topk_ids >= 0,
+        slot_of[topk_ids.clamp(min=0).to(torch.long)].to(topk_ids.dtype),
+        topk_ids,
+    )
+    return remapped, src_row, num_spill
+
+
 class MoEExpertOffloadCache:
     """Tensor-level wrapper around ExpertResidencyPlanner for a FusedMoE layer.
 

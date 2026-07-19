@@ -701,6 +701,21 @@ class Envs:
     # of the triggering forward, so that forward's own output already uses the
     # frozen hot-set (no intra-run residency drift => self-det holds).
     SGLANG_MOE_HOT_CALIB_STEPS = EnvInt(1)
+    # Stage-3 CUDA-graph-compatible offload. When True (opt-in), the decode MoE
+    # offload uses the on-device index math (prepare_capturable) + a captured
+    # gather instead of the per-layer topk_ids.tolist()+Python-planning path, so
+    # decode can be CUDA-graph captured (removing the launch-overhead that
+    # dominates single-token decode). Requires a residency layout frozen BEFORE
+    # capture (static [0,R) or SGLANG_MOE_HOTSET_FILE); live hot-calibration is
+    # rejected on this path. Default False = eager run_waves (unchanged).
+    SGLANG_MOE_OFFLOAD_CUDA_GRAPH = EnvBool(False)
+    # Path to a per-layer frozen hot-set file (produced offline from the M-C
+    # routing trace). Enables hot-residency under CUDA-graph capture by freezing
+    # the resident set from the file before capture, instead of live calibration.
+    SGLANG_MOE_HOTSET_FILE = EnvStr("")
+    # Max decode batch size eligible for the captured offload path. Buckets with
+    # bs*top_k > scratch (would need >1 wave) fall back to eager. 0 = no cap.
+    SGLANG_MOE_OFFLOAD_MAX_GRAPH_BS = EnvInt(0)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
