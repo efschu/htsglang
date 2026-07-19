@@ -29,6 +29,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.utils import weightless_kv_active
+from sglang.srt.layers.dcp.collective_guard import guard_dcp_step
 from sglang.srt.layers.dcp.kernels import CPTritonContext, correct_attn_out
 from sglang.srt.runtime_context import get_parallel
 
@@ -124,6 +126,11 @@ def cp_all_gather_heads_uneven(
     x: [ ..., local_heads, D ] with local_heads == head_counts[this_rank].
     Returns [ ..., sum(head_counts), D ].
     """
+    if weightless_kv_active():
+        # Anti-hang guard: the Q/K/V head all-gather is a per-attention-layer
+        # DCP step. Verify the head rank and the weightless workers agree on the
+        # step's identity before the real (uneven-shape) collective runs.
+        guard_dcp_step(f"ag_heads:{sum(head_counts)}", cp_group)
     counts = list(head_counts)
     local_heads = x.shape[1]
     rank = cp_group.rank_in_group
@@ -174,6 +181,10 @@ def cp_lse_ag_out_ar_mha_uneven(
     cp_attn_out: [ tokens, H_total, D ]  (H_total = sum(head_counts))
     cp_attn_lse: [ tokens, H_total ]
     """
+    if weightless_kv_active():
+        # Anti-hang guard: the LSE merge is the per-attention-layer combine
+        # step. Verify sequence agreement before the all-gather/all-reduce.
+        guard_dcp_step("lse_merge", cp_group)
     if cp_group.world_size == 1:
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
 

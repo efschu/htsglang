@@ -173,6 +173,64 @@ def get_cp_token_ratios() -> Optional[list]:
     return _CP_TOKEN_RATIOS
 
 
+# ---------------------------------------------------------------------------
+# Weightless-KV fast lane (Variant C Stage 1).
+#
+# The fast lane DECOUPLES the head/weight partition from the token/KV (DCP)
+# partition entirely. One rank (the "head rank", the fast weight-bearing card,
+# e.g. the 5090 at rank 0) holds ALL attention heads and runs Q/O-proj + FFN +
+# GDN as pure TP=1 (collective-free). The other ranks are WEIGHTLESS: they hold
+# ONLY a token-shard of the KV cache (via the existing _CP_TOKEN_RATIOS token
+# vector) and compute attention over it, contributing ZERO heads.
+#
+# So the per-rank HEAD-count vector is [total, 0, 0, ...] with `total` on the
+# head rank and 0 everywhere else. partition_units() cannot express this (it
+# forces every rank >= 1 unit, the correct rule when every rank bears weights),
+# so the weightless head plan is set DIRECTLY here, independently of
+# --rank-tp-ratio. The token vector stays free to be big on the weightless
+# cards. This separation is the whole point of the fast lane; see
+# variantC_architecture / the Stage-1 design.
+# ---------------------------------------------------------------------------
+
+_WEIGHTLESS_KV_HEAD_RANK: Optional[int] = None
+
+
+def set_weightless_kv_head_rank(head_rank: Optional[int]) -> None:
+    """Enable the weightless-KV fast lane for this process by naming the rank
+    that holds ALL attention heads / all weights (or None to disable, keeping
+    every other path byte-identical). All other DCP ranks are weightless (0
+    heads, KV-token-shard only)."""
+    global _WEIGHTLESS_KV_HEAD_RANK
+    _WEIGHTLESS_KV_HEAD_RANK = head_rank
+
+
+def get_weightless_kv_head_rank() -> Optional[int]:
+    """The rank holding all heads/weights under the weightless-KV fast lane, or
+    None when the fast lane is not active."""
+    return _WEIGHTLESS_KV_HEAD_RANK
+
+
+def weightless_kv_active() -> bool:
+    """True when the weightless-KV fast lane is installed for this process."""
+    return _WEIGHTLESS_KV_HEAD_RANK is not None
+
+
+def weightless_head_counts(total: int, world_size: int) -> list:
+    """Per-rank head-count vector for the weightless-KV fast lane: `total` on
+    the head rank, 0 on every weightless rank. E.g. total=24 heads, world=3,
+    head_rank=0 -> [24, 0, 0]. The uneven-DCP collectives already tolerate a
+    0-head shard (cp_all_gather_heads_uneven pads to max(counts); a 0-count
+    rank contributes an empty slice, so the Q all-gather becomes a broadcast
+    from the head rank and the O merge slices the merged output back to the
+    head rank only)."""
+    head_rank = _WEIGHTLESS_KV_HEAD_RANK
+    assert head_rank is not None, "weightless_head_counts() with fast lane off"
+    assert (
+        0 <= head_rank < world_size
+    ), f"weightless head_rank {head_rank} out of range for world {world_size}"
+    return [total if r == head_rank else 0 for r in range(world_size)]
+
+
 def uneven_dcp_active(dcp_size: Optional[int] = None) -> bool:
     """True when the uneven-DCP token-axis split is in force: a non-uniform
     token vector is installed. When `dcp_size` is given, the vector must also

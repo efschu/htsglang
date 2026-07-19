@@ -4522,6 +4522,22 @@ def configure_scheduler_process(
         if cp_vector is not None:
             logger.info("Uneven DCP token vector installed: %s", cp_vector)
 
+    # Weightless-KV fast lane (Variant C Stage 1): name the head rank that
+    # holds all weights/heads. The flashinfer backend then forces the DCP
+    # decode path with the [total,0,...,0] head vector (Q all-gather ->
+    # broadcast from head rank; O merge -> sliced back to head rank only),
+    # independently of --rank-tp-ratio. None keeps every other path
+    # byte-identical.
+    if getattr(server_args, "weightless_kv_fastlane", False):
+        from sglang.srt.distributed.utils import set_weightless_kv_head_rank
+
+        set_weightless_kv_head_rank(server_args.weightless_kv_head_rank)
+        logger.info(
+            "Weightless-KV fast lane active: head rank = %d (holds all "
+            "weights/heads); other ranks weightless (KV-token-shard only).",
+            server_args.weightless_kv_head_rank,
+        )
+
     # Apply this rank's --rank-gpu-memory-mib budget as its
     # mem_fraction_static (MiB -> fraction against the rank's physical
     # GPU NVML total, derived once at resolution time). The MiB value is
