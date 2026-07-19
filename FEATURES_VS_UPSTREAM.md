@@ -9,7 +9,9 @@ uniform, equal-shard split that upstream assumes.
 
 This document is a reference inventory of everything the fork adds or changes over
 vanilla sglang, grouped by area. Each entry gives a short description and a rough
-impact estimate.
+impact estimate. It tracks work on **two events** — when a feature *lands* (the numbered
+sections below) and when one is *accepted/planned* (the clearly-separated **Roadmap** section
+at the end) — so the "planned vs shipped" line is always explicit.
 
 ## About the impact figures
 
@@ -247,6 +249,15 @@ adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4*
     fit in the resident slots (a prefill batch easily touches all of them) — not obvious up
     front. Waving over tokens keeps each token whole in one wave, so this overflow case stays
     byte-identical instead of silently evicting a still-needed expert.*
+- **Head-rank load-time MoE offload (Variant C B2b) 🟠** — a *load-time-aware* extension of the
+  offload above, for models too big to fully load on any single GPU (e.g. a 122B-A10B). Instead of
+  today's path — materialize all experts on the GPU and *then* slice, which OOMs during load — it
+  materializes only the resident+cushion experts per layer on the GPU and **streams the cold spill
+  tier straight into host pinned RAM during load**. Pairs with the weightless fast lane (§10) where
+  the fast card holds the full model.
+  *Impact: **🟢 makes otherwise-unbootable big MoE models runnable** on constrained VRAM (boots what
+  used to OOM at load); **⚪ steady-state resident compute unchanged** (byte-identical); **🔴 throughput
+  stays PCIe-bandwidth-bound** — same cost profile as the expert-offload entry above.*
 
 ## 7. Model Support
 
@@ -322,7 +333,27 @@ adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4*
   **Honest scope (don't over-read it):** once admitted, the fast request **decodes at the shared
   batched rate, not at solo speed**. Stage 0 fixes **responsiveness / TTFT** under load — it does
   **not** give sustained **single-stream decode** speed under load. That needs a dedicated compute
-  lane (the weightless-KV / dual-lane work, still in progress), not just priority preemption.
+  lane, i.e. the Weightless-KV Fast Lane below (stages B1+B2a now landed), not just priority
+  preemption.
+
+- **Weightless-KV Fast Lane (Variant C, stages B1 + B2a) ✅** — a single-process asymmetric-TP mode
+  for heterogeneous GPUs. The **fast card** (here the 5090) holds the **full model as collective-free
+  TP=1** and is the sole Q/K/V producer + attention dispatcher; the **slow cards** (the 3080s) become
+  **"weightless KV workers"** — they hold **only a DCP token-shard of the attention KV cache** and run
+  a stripped attention-only forward, with **no layer weights at all**. This inverts the usual problem:
+  instead of the slow cards limiting capacity, they contribute pure KV headroom.
+  *Impact: **🟢 slow-card layer-weight VRAM drops to ≈0** — a worker materializes a meta-model, only
+  the KV pool + attention backend are real (here ≈14 GB freed per worker), so the workers stop being
+  the KV bottleneck and **🟢 context capacity lifts ≈4×** on the test model (hybrid-GDN 27B). **🟢
+  Correctness proven byte-identical** to a full-TP=1 baseline: the prefill/extend path is bit-identical
+  (Δ=0), and decode differs only by benign decode-kernel fp-order — smaller than the model's own
+  intrinsic decode-vs-extend kernel variance (the single observed trajectory flip lands on a perfect
+  50/50 tie); self-deterministic. **🟢 Built-in anti-hang guard** (bounded per-step handshake) —
+  asymmetric-rank collective divergences fail loud in seconds instead of a silent NCCL hang.*
+  **Honest downsides:** **🔴 eager-only today** (no CUDA-graph capture of the asymmetric forward yet);
+  **🔴 the fast card now holds the full weights**, so once the workers are freed **it** becomes the
+  context limiter for big models (addressed by the load-time MoE offload in §6); **⚪ TP-only,
+  single-node** — PP/DP/EP/spec/chunked-prefill are rejected by design (hard fail-fast).
 
 ---
 
@@ -348,7 +379,36 @@ dormant behind a guard for a possible future fix, not removed.
 
 ## Roadmap (planned / not yet built)
 
-Directional only — not part of the current feature surface.
+Planned, **not shipped** — listed here because the doc tracks features on two events: when they
+*land* and when they are *accepted/planned*. Everything below is 📋 planned.
+
+### Weightless fast-lane roadmap (accepted, ordered)
+
+Deliberately ordered by risk to output: **byte-identical speed/capacity gains first, quality-reducing
+(lossy) ones last** — and every lossy item ships behind its own quality gate.
+
+- **Byte-identical performance 📋** — hide the offload's cost without changing outputs: **🟢
+  double-buffered expert prefetch with compute-overlap** (hide the PCIe fetch behind compute; targets
+  the ≈order-of-magnitude prefill slowdown); **🟢 DCP-collective/compute overlap on the weightless
+  lane** (hide the PCIe attention collectives behind head compute); **🟢 bandwidth-aware DCP
+  token-split** (balance the LSE-merge barrier); **🟢 importance/frequency-based expert residency**
+  (fewer PCIe fetches under skewed routing). All lossless — no throughput claim beyond "reduces the
+  existing 🔴 costs".
+- **Spec-decode synergy 📋 (lossless)** — **🟢 speculative expert prefetch driven by the draft router**
+  (prefetch the experts the draft predicts the target will need); **🟢 draft model on the idle
+  weightless-worker cards** (put the slow cards' otherwise-idle compute to work on speculation).
+- **Determinism / byte-identity CI harness 📋 (seed committed)** — boots the weightless lane against a
+  full-TP baseline and asserts extend Δ==0 + benign decode fp-order; a regression guard, not a perf
+  feature.
+- **Quality-tradeoff features 📋 (planned LAST — each gated on its own quality check)** — these trade
+  some accuracy for capacity/bandwidth and are intentionally deferred behind the lossless work:
+  **fp8/int4 KV on the weightless workers** (🟢 ≈2-4× KV capacity on small cards, 🔴 lossy KV);
+  **harder-quantized cold-expert spill tier** (🟢 fewer PCIe bytes, 🔴 lossy cold experts);
+  **attention-sink + sliding-window KV eviction** (🟢 long context in a fixed budget, 🔴 drops
+  mid-context); **compressed/fp8 KV on the PD/HiCache transfer path** (🟢 ≈half the transfer bytes,
+  🔴 lossy transfer).
+
+### Other directional items
 
 - **PD v2 "lane scheduler" 📋** — mixed-mode decode server + routing matrix: length routing,
   overflow prefill, sticky fast-lane decode + lazy migration, cache-affinity scheduling; end state
