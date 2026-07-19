@@ -21,6 +21,11 @@ Correctness/enablement fixes carry **no throughput claim** — they make somethi
 or make it deterministic; they are labelled as such rather than given a fabricated
 percentage.
 
+**Direction tags.** Every ratio/percentage below is tagged right at the number so the sign's
+meaning is unambiguous at a glance: **🟢 better** (a win), **🔴 worse** (a real cost/regression),
+**⚪ neutral** (break-even / roughly unchanged). A single feature can carry both — e.g. more
+context (🟢) at a small decode cost (🔴).
+
 ## On "bugfixes" and robustness
 
 A **bugfix over upstream** here means a defect present in vanilla sglang (or in a
@@ -52,7 +57,7 @@ its GPU, instead of an equal split.
 - **`--rank-tp-ratio auto` ✅** — VRAM-optimal automatic split: fills every card,
   maximizing total usable context. Derives weights from NVML budgets (gcd-reduced),
   sets DCP = TP automatically.
-  *Impact: ≈+2.5-3x KV-cache context on the reference rig vs a naive equal split (the
+  *Impact: **🟢 ≈+2.5-3x KV-cache context** on the reference rig vs a naive equal split (the
   equal split is bounded by the smallest card).*
 - **`--rank-tp-ratio auto-performance` ✅** — measurement-based split that optimizes
   for throughput rather than maximum context.
@@ -69,13 +74,13 @@ its GPU, instead of an equal split.
 - **Uneven-DCP token sharding ✅** — KV-cache follows the **token axis** instead of the
   KV-head axis: proportional KV-token split with a weighted owner rule + LSE merge.
   Removes the `sum(ratios) ∈ {2,4}` KV-head constraint entirely.
-  *Impact: ≈+60-80% context over the first (head-axis) DCP version by decoupling KV
-  capacity from the weight split; ≈-10-25% decode throughput vs no-DCP baseline, the
+  *Impact: **🟢 ≈+60-80% context** over the first (head-axis) DCP version by decoupling KV
+  capacity from the weight split; **🔴 ≈-10-25% decode throughput** vs no-DCP baseline, the
   honest cost of the extra per-step collectives over PCIe.*
 - **`--rank-kv-ratio {coupled|capacity|auto|LIST}` ✅** — KV-token ownership **decoupled**
   from the weight split; `capacity` mode installs the measured optimal vector in a single
   boot (no iterate-and-reboot).
-  *Impact: ≈+25% context on 27B-FP8 at roughly break-even decode cost (≈±1%).*
+  *Impact: **🟢 ≈+25% context** on 27B-FP8 at **⚪ break-even decode** (≈±1%).*
 - **TP > num_kv_heads (replicated KV) ✅** — KV heads are replicated + token-sharded +
   LSE-merged so TP can exceed the KV-head count. Coherent across FP8 / GGUF / AWQ, including
   GQA re-grouping for small head counts (down to gqa=1 ranks).
@@ -85,9 +90,9 @@ its GPU, instead of an equal split.
   across the ranks that share a KV-head group instead of sharded. But under GQA there are only a
   handful of KV heads to begin with (the query heads, which dominate, are still sharded normally),
   and under uneven-DCP the KV *tokens* are still split across ranks — so what's duplicated is just a
-  small KV slice, not the bulk of the cache. In practice this is a **minor, roughly single-digit-%
-  KV overhead**, easily paid for by the extra context / higher TP degree it unlocks. It is a real
-  cost, but a small one — not a heavy tax.
+  small KV slice, not the bulk of the cache. In practice this is a **🔴 minor, roughly single-digit-%
+  KV overhead** (a real but small cost), easily paid for by the extra context / higher TP degree it
+  unlocks — not a heavy tax.
 - **Rank-uniform collective guards ✅** — guards in front of `all_gather` that require
   rank-uniform shapes, converting a would-be NCCL hang into a clean, early error.
   *Impact: robustness — turns a silent distributed hang into a fail-fast error.*
@@ -109,10 +114,10 @@ with zero cross-GPU communication while the slower cards handle distributed deco
 
 - **Solo-prefill on the fastest card ✅** — prefill runs TP=1 (zero inter-GPU comm), decode
   runs distributed TP=3 uneven+DCP.
-  *Impact: **≈2-5x faster TTFT** across context lengths (largest win in the mid-context range) —
+  *Impact: **🟢 ≈2-5x faster TTFT** across context lengths (largest win in the mid-context range) —
   because prefill now runs alone on the fast card with zero cross-GPU traffic. Decode is a
   separate story: it stays distributed TP=3+DCP (not on the solo card), so it is essentially
-  unchanged — a negligible ≈-2% at long context from the decode-side collectives, not a
+  unchanged — a **🔴 negligible ≈-2% at long context** from the decode-side collectives, not a
   regression worth worrying about. Net: a clear, honest win for time-to-first-token at no real
   decode cost.*
 - **Token-vector KV re-scatter ✅** — global→owned-compact translation + ordinal filter; one
@@ -148,25 +153,28 @@ with zero cross-GPU communication while the slower cards handle distributed deco
   pre-captured graph states per k, rank-deterministic.
   *Impact: roughly matches the best fixed k on any given workload without hand-tuning; avoids the
   throughput cliff of a badly-chosen fixed k.*
-- **Graph-state offload to system RAM (stages 1+2) ✅** — the core enabler for adaptive draft
-  length. Each draft length k needs its own pre-captured CUDA graph, and each such graph pins a
-  block of VRAM; keeping all of k∈{1,2,3} (and the high-accept k=4/5 rungs) resident at once would
-  multiply that cost and eat straight into the KV-cache / context budget. This feature keeps only
-  the **currently-active** k's graph resident on the GPU and **offloads the inactive k-states'
-  captured graph memory out to system RAM** (via pause/resume, private MemPools, and tagged
-  capture-pools + int-workspaces), paging it back on a switch. Modes: resident / offload /
+- **Graph-state offload to system RAM (offload mechanism, stages 1+2) ✅** — the core enabler for
+  adaptive / high-k speculation. Each draft length k needs its own pre-captured CUDA graph, and each
+  such graph pins a block of VRAM. "Stages 1+2" refers to the two implementation stages of the
+  *offload mechanism* — not the k values; the k range itself goes **up to 5**. That high end is where
+  the feature earns its keep: with k∈{1..5} only the **currently-active** k's graph stays resident on
+  the GPU, and the **other up to four k-graphs sit offloaded in system RAM**, streaming back onto the
+  card on demand when the runtime switches k. Without this, keeping five k-graphs resident at once
+  would multiply the graph VRAM and eat straight into the KV-cache / context budget. Mechanism:
+  pause/resume, private MemPools, tagged capture-pools + int-workspaces. Modes: resident / offload /
   offload-scratch.
-  *Impact: this is what makes adaptive (and high-k) spec **free in VRAM** — **KV loss of adaptive
-  mode: zero**, full context preserved at standard reserve, so having several k-graphs available
-  costs no usable context. Without it, multi-k spec would either not boot at standard reserve or
-  would have to give back context. Enablement, no throughput claim.*
+  *Impact: this is what makes adaptive **and** high-k (up to 5) spec **🟢 free in VRAM** — **🟢 KV loss:
+  zero**, full context preserved at standard reserve even with all five k-rungs available, because
+  four of them live in host RAM rather than on the card. Without it, multi-k (let alone k=5) spec
+  would either not boot at standard reserve or would have to give back context. Enablement, no
+  throughput claim.*
 - **High-accept profile [1..5] ✅** — k=4/5 rungs for repetitive workloads; opt-in, boots at
   standard reserve thanks to the offload above.
-  *Impact: ≈+8% (k=4) to ≈+16% (pinned k=5) decode on repetitive/structured loads vs k=3;
+  *Impact: **🟢 ≈+8% (k=4) to ≈+16% (pinned k=5) decode** on repetitive/structured loads vs k=3;
   workload-conditional — neutral-to-negative on diverse prose.*
 - **EAGLE3 for Gemma-4 ✅** — speculators / vLLM-format support (aux-id off-by-one translation,
   `norm_before_residual` flag, converter).
-  *Impact: ≈+15-45% decode on code/JSON with an instruction-tuned head vs the non-spec baseline;
+  *Impact: **🟢 ≈+15-45% decode** on code/JSON with an instruction-tuned head vs the non-spec baseline;
   recommendation documented as workload-conditional (weaker on free-form prose).*
 - **Draft embed / lm_head sharing, draft-extend replay, ratio-weighted draft vocab ✅** —
   *Impact: the draft path works correctly under uneven TP. No throughput claim.*
@@ -187,12 +195,12 @@ adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4*
   with GDN block coarsening and an MMQ fallback for misaligned blocks; A3B TP=3 coherent.
   *Impact: enables uneven-TP GGUF-MoE. Correctness/enablement.*
 - **Tuned K-quant MMVQ kernel ✅** — TP=2 beats llama.cpp on decode.
-  *Impact: faster than llama.cpp at TP=2 on this rig; a decode-throughput win for the GGUF path.*
+  *Impact: **🟢 faster than llama.cpp** at TP=2 on this rig; a decode-throughput win for the GGUF path.*
 - **GGUF perf overhaul ✅** — flat layout, batched MMVQ, Q8 lm_head, shape-aware dispatch,
   graph capture within budget. K-quant MMQ is now capped to small token counts, above which it
   dequantizes to cuBLAS.
-  *Impact: ≈5-8x prefill throughput on batched/long prompts vs the always-MMQ path (which was
-  flat/slow); decode is bandwidth-limited and roughly unchanged.*
+  *Impact: **🟢 ≈5-8x prefill throughput** on batched/long prompts vs the always-MMQ path (which was
+  flat/slow); **⚪ decode roughly unchanged** (bandwidth-limited).*
 - **GGUF uneven-TP vec alignment 🟠** — 16-element MLP units for indivisible intermediate sizes
   (e.g. 17408 at TP=3/5); unlocks dense GGUF under uneven TP (the last remaining old GGUF blocker).
   *Impact: enablement for dense GGUF under uneven TP. Correctness, no throughput claim.*
@@ -223,7 +231,7 @@ adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4*
   tokens, not experts**, which is the key to byte-identity (no cross-wave partial sums → no
   floating-point re-association).
   *Impact: lets a MoE model run with a fraction of its experts resident in VRAM — enables models
-  that otherwise would not fit. **Honest cost: ≈-35% decode tok/s** on short prompts (PCIe H2D
+  that otherwise would not fit. **🔴 Honest cost: ≈-35% decode tok/s** on short prompts (PCIe H2D
   traffic). Validated byte-identical (fraction 0.25 vs 1.0 → identical outputs). **Eager-only by
   design** (data-dependent routing is not graph-capturable → fail-fast guard if graphs are on).*
   - *Robustness (non-obvious): a single forward can legitimately need more unique experts than
@@ -239,9 +247,9 @@ adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4*
 - **Gemma-4 31B dense ✅** — int4-AutoRound, TP=1 and uneven TP=3 (plan-aware vision tower, Triton
   head fix); EAGLE3 speculation.
 - **Gemma-4 26B-A4B (MoE, SWA hybrid) ✅** — boots (vision-ignore mapper, gated-GeLU Marlin);
-  **`--swa-pool-sizing` cap: ≈6x long-context** (50k needle proven), using Stage-A rather than
+  **`--swa-pool-sizing` cap: 🟢 ≈6x long-context** (50k needle proven), using Stage-A rather than
   SWA-DCP.
-  *Impact: ≈6x more usable long-context for this SWA-hybrid model vs the un-capped default.*
+  *Impact: **🟢 ≈6x more usable long-context** for this SWA-hybrid model vs the un-capped default.*
 - **Small models under uneven-TP ✅** — the replicated-KV GQA handling protects mini geometries
   (2B models + future draft models).
   *Impact: enablement/correctness for small-head-count models under uneven TP.*
@@ -303,11 +311,12 @@ dormant behind a guard for a possible future fix, not removed.
   but topk=4 is non-deterministic within a single boot and diverges from the topk=1 oracle, violating
   the lossless-greedy invariant. Root cause: the tree-masked verify-attention under weighted-DCP
   produces tree-topology-dependent verify logits (a draft node does not see exactly
-  committed-prefix + true tree ancestors). **Also perf-negative on this rig** (≈-15% decode: tree
+  committed-prefix + true tree ancestors). **Also 🔴 perf-negative on this rig** (≈-15% decode: tree
   compute overhead > accept-length gain over PCIe x4, serial). Restored as a hard fail-fast guard at
   arg validation, with a CPU unit test. *Reactivation needs both an audit of the draft→draft ancestor
   semantics under DCP and hardware with a better interconnect that makes trees net-positive.*
-- **SWA-DCP Stage B 🔴 descoped** — evaluated at roughly +6-10% for a large implementation cost;
+- **SWA-DCP Stage B 🔴 descoped** — evaluated at only 🟢 ≈+6-10% (a modest win) for a large
+  implementation cost — not worth it;
   reactivation criteria documented. Gemma-4 SWA long-context is served by the Stage-A pool cap in §7
   instead.
 
