@@ -177,6 +177,17 @@ class SchedulerBatchResultProcessor:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def _is_weightless_worker(self) -> bool:
+        """Weightless-KV fast lane (Option-B): True on a weightless KV worker
+        rank. Such a rank runs no lm_head, so result.logits_output is None and
+        every logprob / hidden-state dereference must be skipped -- only the
+        head rank computes and streams logprobs. Always False on the default
+        path (predicate requires --weightless-kv-fastlane)."""
+        model_runner = getattr(self.model_worker, "model_runner", None)
+        return model_runner is not None and getattr(
+            model_runner, "is_weightless_worker", False
+        )
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -206,9 +217,15 @@ class SchedulerBatchResultProcessor:
                 result.extend_logprob_start_len_per_req,
             )
 
+            # Weightless-KV fast lane (Option-B): a weightless worker rank has
+            # logits_output=None (no lm_head); logprob / hidden-state
+            # processing is head-only, so skip it here on the workers.
+            wl_worker = self._is_weightless_worker() and logits_output is None
+
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
-            self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
+            if not wl_worker:
+                self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
 
             self._validate_pp_skip_output_comm(batch, result)
 
@@ -247,7 +264,7 @@ class SchedulerBatchResultProcessor:
 
                     self._maybe_collect_customized_info(i, req, logits_output)
 
-                    if batch.return_logprob:
+                    if batch.return_logprob and not wl_worker:
                         logprob_pt = self._apply_prefill_logprobs(
                             req=req,
                             i=i,
@@ -260,6 +277,7 @@ class SchedulerBatchResultProcessor:
 
                     if (
                         req.return_hidden_states
+                        and not wl_worker
                         and logits_output.hidden_states is not None
                     ):
                         hidden_state_offset = self._append_prefill_hidden_states(
@@ -282,7 +300,7 @@ class SchedulerBatchResultProcessor:
                     skip_stream_req = req
 
                     # Incrementally update input logprobs.
-                    if batch.return_logprob:
+                    if batch.return_logprob and not wl_worker:
                         logprob_pt = self._apply_chunked_prefill_logprobs(
                             req=req,
                             i=i,
@@ -665,11 +683,17 @@ class SchedulerBatchResultProcessor:
             result.can_run_cuda_graph,
         )
 
+        # Weightless-KV fast lane (Option-B): a weightless worker rank has
+        # logits_output=None (no lm_head); logprob / hidden-state processing
+        # is head-only, so skip it here on the workers.
+        wl_worker = self._is_weightless_worker() and logits_output is None
+
         next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
             batch=batch,
             result=result,
             logits_output=logits_output,
             next_token_ids=next_token_ids,
+            wl_worker=wl_worker,
         )
 
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
@@ -711,7 +735,7 @@ class SchedulerBatchResultProcessor:
 
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
-            if req.return_logprob:
+            if req.return_logprob and not wl_worker:
                 self._apply_decode_logprobs(
                     req=req,
                     i=i,
@@ -721,7 +745,11 @@ class SchedulerBatchResultProcessor:
                     logits_output=logits_output,
                 )
 
-            if req.return_hidden_states and logits_output.hidden_states is not None:
+            if (
+                req.return_hidden_states
+                and not wl_worker
+                and logits_output.hidden_states is not None
+            ):
                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
                 # token; stride = speculative_num_draft_tokens for spec, 1 for non-spec.
                 stride = result.speculative_num_draft_tokens or 1
@@ -759,6 +787,7 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         logits_output: LogitsProcessorOutput,
         next_token_ids: Union[torch.Tensor, List[int]],
+        wl_worker: bool = False,
     ) -> Tuple[Union[List[int], List[List[int]]], Optional[List[float]]]:
         next_token_logprobs = None
         # Normalize to a uniform per-req list of accepted tokens (List[List[int]]):
@@ -774,7 +803,9 @@ class SchedulerBatchResultProcessor:
             )
             next_token_ids = [[t] for t in ids]
 
-        if batch.return_logprob:
+        # Weightless-KV fast lane (Option-B): worker ranks have no
+        # logits_output; logprobs are head-only.
+        if batch.return_logprob and not wl_worker:
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
             if logits_output.next_token_top_logprobs_val:
                 logits_output.next_token_top_logprobs_val = [
