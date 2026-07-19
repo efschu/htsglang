@@ -144,8 +144,25 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
 
     if check_gguf_file(tokenizer_name):
         _ensure_gguf_version()
-        kwargs["gguf_file"] = tokenizer_name
-        tokenizer_name = Path(tokenizer_name).parent
+        # Gemma-4 GGUFs cannot go through transformers' GGUF tokenizer path:
+        # AutoTokenizer(..., gguf_file=...) re-synthesizes the gemma4 config
+        # from the GGUF metadata and crashes on the per-layer
+        # num_key_value_heads list (same failure as config.py; see
+        # _peek_bespoke_gguf_arch). These checkpoints ship a sibling
+        # tokenizer.json/tokenizer_config.json, so load from the parent dir
+        # directly (NO gguf_file). Gated on gemma4 only — qwen35's existing
+        # gguf_file tokenizer path is left untouched.
+        from .config import _peek_bespoke_gguf_arch
+
+        parent = Path(tokenizer_name).parent
+        if _peek_bespoke_gguf_arch(tokenizer_name) == "gemma4" and (
+            (parent / "tokenizer.json").exists()
+            or (parent / "tokenizer_config.json").exists()
+        ):
+            tokenizer_name = parent
+        else:
+            kwargs["gguf_file"] = tokenizer_name
+            tokenizer_name = parent
 
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
 
