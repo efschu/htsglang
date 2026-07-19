@@ -608,3 +608,21 @@ def presplit_expert_offload_after_repack(layer) -> None:  # pragma: no cover - C
     if presplit:
         layer._moe_offload_presplit = presplit
         layer._moe_offload_full_experts = int(E)
+        # Return freed host memory to the OS NOW. create_weights loaded the full
+        # [E] expert set to host CPU; the loader frees each layer's loaded tensor
+        # (via device_loading_context) as it is repacked, but glibc/torch retain
+        # the freed CPU buffers in the allocator pool -- so across the 48-layer
+        # repack the retained-but-unused buffers accumulate (~ the whole [E]
+        # set) and squeeze MemAvailable toward the no-swap floor. A per-layer
+        # gc + malloc_trim returns them so the host peak stays ~= spill, not the
+        # full loaded set. Cheap (runs once per MoE layer at load).
+        del t, buf, spill
+        import gc as _gc
+
+        _gc.collect()
+        try:
+            import ctypes as _ct
+
+            _ct.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
