@@ -24,9 +24,9 @@ or make it deterministic; they are labelled as such rather than given a fabricat
 percentage.
 
 **Direction tags.** Every ratio/percentage below is tagged right at the number so the sign's
-meaning is unambiguous at a glance: **🟢 better** (a win), **🔴 worse** (a real cost/regression),
-**⚪ neutral** (break-even / roughly unchanged). A single feature can carry both — e.g. more
-context (🟢) at a small decode cost (🔴).
+meaning is unambiguous at a glance: **[better]** (a win), **[worse]** (a real cost/regression),
+**[neutral]** (break-even / roughly unchanged). A single feature can carry both — e.g. more
+context (`[better]`) at a small decode cost (`[worse]`).
 
 ## On "bugfixes" and robustness
 
@@ -41,8 +41,10 @@ point. Robustness is only called out where the problem it solved was **not obvio
 have already handled. Those non-obvious robustness properties are noted at the relevant
 feature; routine "we implemented it correctly" fixes are not.
 
-Status legend: ✅ integrated + validated · 🟠 in progress · 🟡 code complete, untested
-· 🔴 guarded/descoped · 📋 planned
+Status convention: a shipped, integrated + validated feature carries **no marker** (that is the
+default for the numbered sections). Anything else is flagged inline: **[in progress]**, **[untested]**
+(code complete, not yet validated), **[guarded]** (implemented but gated off — see that section),
+**[planned]** (roadmap, not built).
 
 ---
 
@@ -51,39 +53,39 @@ Status legend: ✅ integrated + validated · 🟠 in progress · 🟡 code compl
 The foundational feature set: let each TP rank own a share of the model proportional to
 its GPU, instead of an equal split.
 
-- **`--rank-tp-ratio` ✅** — proportional TP weight shards across unequal GPUs.
+- **`--rank-tp-ratio`** — proportional TP weight shards across unequal GPUs.
   Attention / GDN are split in whole KV-head units per rank.
   *Impact: enables TP across mismatched GPUs that upstream cannot do at all (the big
   card would otherwise be capped to the small card's shard). No throughput claim —
   it's the enablement primitive everything else builds on.*
-- **`--rank-tp-ratio auto` ✅** — VRAM-optimal automatic split: fills every card,
+- **`--rank-tp-ratio auto`** — VRAM-optimal automatic split: fills every card,
   maximizing total usable context. Derives weights from NVML budgets (gcd-reduced),
   sets DCP = TP automatically.
-  *Impact: **🟢 ≈+2.5-3x KV-cache context** on the reference rig vs a naive equal split (the
+  *Impact: **[better] ≈+2.5-3x KV-cache context** on the reference rig vs a naive equal split (the
   equal split is bounded by the smallest card).*
-- **`--rank-tp-ratio auto-performance` ✅** — measurement-based split that optimizes
+- **`--rank-tp-ratio auto-performance`** — measurement-based split that optimizes
   for throughput rather than maximum context.
   *Impact: trades some context for decode throughput; workload-dependent.*
-- **`--rank-mlp-ratio` / `--rank-moe-ratio` / `--rank-vocab-ratio` ✅** — per-family
+- **`--rank-mlp-ratio` / `--rank-moe-ratio` / `--rank-vocab-ratio`** — per-family
   shard vectors for MLP, MoE expert-intermediate, and vocabulary, so each dimension can
   be split independently of the attention split.
   *Impact: correctness/flexibility feature — lets indivisible dimensions land cleanly
   per rank. No throughput claim.*
-- **Named-family shard plans + maximin solver ✅** — MLP and MoE units are jointly
+- **Named-family shard plans + maximin solver** — MLP and MoE units are jointly
   distributed across ranks by a solver rather than ad-hoc rounding.
   *Impact: correctness — guarantees valid, balanced partitions for every sharded
   dimension.*
-- **Uneven-DCP token sharding ✅** — KV-cache follows the **token axis** instead of the
+- **Uneven-DCP token sharding** — KV-cache follows the **token axis** instead of the
   KV-head axis: proportional KV-token split with a weighted owner rule + LSE merge.
   Removes the `sum(ratios) ∈ {2,4}` KV-head constraint entirely.
-  *Impact: **🟢 ≈+60-80% context** over the first (head-axis) DCP version by decoupling KV
-  capacity from the weight split; **🔴 ≈-10-25% decode throughput** vs no-DCP baseline, the
+  *Impact: **[better] ≈+60-80% context** over the first (head-axis) DCP version by decoupling KV
+  capacity from the weight split; **[worse] ≈-10-25% decode throughput** vs no-DCP baseline, the
   honest cost of the extra per-step collectives over PCIe.*
-- **`--rank-kv-ratio {coupled|capacity|auto|LIST}` ✅** — KV-token ownership **decoupled**
+- **`--rank-kv-ratio {coupled|capacity|auto|LIST}`** — KV-token ownership **decoupled**
   from the weight split; `capacity` mode installs the measured optimal vector in a single
   boot (no iterate-and-reboot).
-  *Impact: **🟢 ≈+25% context** on 27B-FP8 at **⚪ break-even decode** (≈±1%).*
-- **TP > num_kv_heads (replicated KV) ✅** — KV heads are replicated + token-sharded +
+  *Impact: **[better] ≈+25% context** on 27B-FP8 at **[neutral] break-even decode** (≈±1%).*
+- **TP > num_kv_heads (replicated KV)** — KV heads are replicated + token-sharded +
   LSE-merged so TP can exceed the KV-head count. Coherent across FP8 / GGUF / AWQ, including
   GQA re-grouping for small head counts (down to gqa=1 ranks).
   *Impact: enables TP degrees that were structurally impossible before (applies under uneven-DCP
@@ -92,21 +94,21 @@ its GPU, instead of an equal split.
   across the ranks that share a KV-head group instead of sharded. But under GQA there are only a
   handful of KV heads to begin with (the query heads, which dominate, are still sharded normally),
   and under uneven-DCP the KV *tokens* are still split across ranks — so what's duplicated is just a
-  small KV slice, not the bulk of the cache. In practice this is a **🔴 minor, roughly single-digit-%
+  small KV slice, not the bulk of the cache. In practice this is a **[worse] minor, roughly single-digit-%
   KV overhead** (a real but small cost), easily paid for by the extra context / higher TP degree it
   unlocks — not a heavy tax.
-- **Rank-uniform collective guards ✅** — guards in front of `all_gather` that require
+- **Rank-uniform collective guards** — guards in front of `all_gather` that require
   rank-uniform shapes, converting a would-be NCCL hang into a clean, early error.
   *Impact: robustness — turns a silent distributed hang into a fail-fast error.*
 - **Auto-sizing Mamba/GDN state pool, rank-aware GDN shapes, per-rank head counts
-  (flashinfer + triton) ✅** — including per-rank workspace sizing.
+  (flashinfer + triton)** — including per-rank workspace sizing.
   *Impact: correctness — hybrid (GDN) models run correctly under uneven TP. No throughput
   claim.*
-- **`max_total_num_tokens` caps ✅** — physically-reachable ceilings for GDN hybrids and
+- **`max_total_num_tokens` caps** — physically-reachable ceilings for GDN hybrids and
   SWA hybrids, computed deterministically so the pool never overshoots into OOM.
   *Impact: correctness/robustness — prevents deterministic-looking OOM from over-sized
   pools.*
-- **CPU unit tests ✅** — coverage for family plans, the solver, calibration, and
+- **CPU unit tests** — coverage for family plans, the solver, calibration, and
   partition invariants (fast, no GPU needed).
 
 ## 2. Prefill/Decode Disaggregation (Single-Node)
@@ -114,34 +116,34 @@ its GPU, instead of an equal split.
 Run prefill and decode as separate roles on the same box, so the fastest card does prefill
 with zero cross-GPU communication while the slower cards handle distributed decode.
 
-- **Solo-prefill on the fastest card ✅** — prefill runs TP=1 (zero inter-GPU comm), decode
+- **Solo-prefill on the fastest card** — prefill runs TP=1 (zero inter-GPU comm), decode
   runs distributed TP=3 uneven+DCP.
-  *Impact: **🟢 ≈2-5x faster TTFT** across context lengths (largest win in the mid-context range) —
+  *Impact: **[better] ≈2-5x faster TTFT** across context lengths (largest win in the mid-context range) —
   because prefill now runs alone on the fast card with zero cross-GPU traffic. Decode is a
   separate story: it stays distributed TP=3+DCP (not on the solo card), so it is essentially
-  unchanged — a **🔴 negligible ≈-2% at long context** from the decode-side collectives, not a
+  unchanged — a **[worse] negligible ≈-2% at long context** from the decode-side collectives, not a
   regression worth worrying about. Net: a clear, honest win for time-to-first-token at no real
   decode cost.*
-- **Token-vector KV re-scatter ✅** — global→owned-compact translation + ordinal filter; one
+- **Token-vector KV re-scatter** — global→owned-compact translation + ordinal filter; one
   rule-agnostic path serving both even and weighted DCP, with no head re-cutting (KV heads are
   replicated).
   *Impact: correctness/architecture — a single code path for the KV handoff instead of
   per-mode special cases.*
-- **GDN / hybrid state transfer ✅** — Mamba-state handoff from prefill to decode, validated
+- **GDN / hybrid state transfer** — Mamba-state handoff from prefill to decode, validated
   bit-identical.
   *Impact: correctness — hybrid models survive the prefill→decode handoff losslessly. No
   throughput claim.*
-- **`local_proxy` ✅** — a thin two-server front (health, `/metrics_summary`, dashboard-ready).
-- **`mooncake_tcp` loopback ✅** — reuses the existing transfer stack (no new transfer code);
+- **`local_proxy`** — a thin two-server front (health, `/metrics_summary`, dashboard-ready).
+- **`mooncake_tcp` loopback** — reuses the existing transfer stack (no new transfer code);
   prefill and decode ranks co-exist stably on one card via a budget protocol
   (`expandable_segments` + fake-warm).
-- **Crash robustness ✅** — hard-kill of the prefill mid-transfer: decode survives, re-registers
+- **Crash robustness** — hard-kill of the prefill mid-transfer: decode survives, re-registers
   cleanly, tears down to 0 MiB.
   *Impact: robustness — no orphaned VRAM or wedged decode after a prefill crash.*
 
 ## 3. Speculative Decoding (MTP / NEXTN / EAGLE3)
 
-- **MTP/NEXTN under uneven-DCP ✅** — including heterogeneous-GPU reproducibility (verify-sync,
+- **MTP/NEXTN under uneven-DCP** — including heterogeneous-GPU reproducibility (verify-sync,
   draft broadcast from rank 0, workspace zeroing).
   *Impact: correctness — the **emitted greedy token sequence** is reproducible on mixed-arch GPUs
   (run-to-run, cold==warm, independent of which card holds which rank). This does **not** mean the
@@ -151,11 +153,11 @@ with zero cross-GPU communication while the slower cards handle distributed deco
   come out), and the accept/argmax decision is taken once on rank 0 and broadcast so ranks can't
   commit different tokens near a tie. See §8 for the three roots. No throughput claim beyond
   enabling spec at all under DCP.*
-- **Adaptive draft length ✅** — EMA + hysteresis + debounce picks k∈{1,2,3} at runtime, with
+- **Adaptive draft length** — EMA + hysteresis + debounce picks k∈{1,2,3} at runtime, with
   pre-captured graph states per k, rank-deterministic.
   *Impact: roughly matches the best fixed k on any given workload without hand-tuning; avoids the
   throughput cliff of a badly-chosen fixed k.*
-- **Graph-state offload to system RAM (offload mechanism, stages 1+2) ✅** — the core enabler for
+- **Graph-state offload to system RAM (offload mechanism, stages 1+2)** — the core enabler for
   adaptive / high-k speculation. Each draft length k needs its own pre-captured CUDA graph, and each
   such graph pins a block of VRAM. "Stages 1+2" refers to the two implementation stages of the
   *offload mechanism* — not the k values; the k range itself goes **up to 5**. That high end is where
@@ -165,20 +167,20 @@ with zero cross-GPU communication while the slower cards handle distributed deco
   would multiply the graph VRAM and eat straight into the KV-cache / context budget. Mechanism:
   pause/resume, private MemPools, tagged capture-pools + int-workspaces. Modes: resident / offload /
   offload-scratch.
-  *Impact: this is what makes adaptive **and** high-k (up to 5) spec **🟢 free in VRAM** — **🟢 KV loss:
+  *Impact: this is what makes adaptive **and** high-k (up to 5) spec **[better] free in VRAM** — **[better] KV loss:
   zero**, full context preserved at standard reserve even with all five k-rungs available, because
   four of them live in host RAM rather than on the card. Without it, multi-k (let alone k=5) spec
   would either not boot at standard reserve or would have to give back context. Enablement, no
   throughput claim.*
-- **High-accept profile [1..5] ✅** — k=4/5 rungs for repetitive workloads; opt-in, boots at
+- **High-accept profile [1..5]** — k=4/5 rungs for repetitive workloads; opt-in, boots at
   standard reserve thanks to the offload above.
-  *Impact: **🟢 ≈+8% (k=4) to ≈+16% (pinned k=5) decode** on repetitive/structured loads vs k=3;
+  *Impact: **[better] ≈+8% (k=4) to ≈+16% (pinned k=5) decode** on repetitive/structured loads vs k=3;
   workload-conditional — neutral-to-negative on diverse prose.*
-- **EAGLE3 for Gemma-4 ✅** — speculators / vLLM-format support (aux-id off-by-one translation,
+- **EAGLE3 for Gemma-4** — speculators / vLLM-format support (aux-id off-by-one translation,
   `norm_before_residual` flag, converter).
-  *Impact: **🟢 ≈+15-45% decode** on code/JSON with an instruction-tuned head vs the non-spec baseline;
+  *Impact: **[better] ≈+15-45% decode** on code/JSON with an instruction-tuned head vs the non-spec baseline;
   recommendation documented as workload-conditional (weaker on free-form prose).*
-- **Draft embed / lm_head sharing, draft-extend replay, ratio-weighted draft vocab ✅** —
+- **Draft embed / lm_head sharing, draft-extend replay, ratio-weighted draft vocab** —
   *Impact: the draft path works correctly under uneven TP. No throughput claim.*
 
 ## 4. GGUF
@@ -190,20 +192,20 @@ alignment below) that benefit **any** GGUF model, not only Qwen. Note that the *
 adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4**) are supported via
 **AutoRound-int4 / Marlin**, not GGUF (see §5 and §7), so they don't appear here.
 
-- **Qwen3.5/3.6 hybrid-GDN GGUF ✅** — including NEXTN/MTP head, unsloth UD-quants, mmproj vision.
+- **Qwen3.5/3.6 hybrid-GDN GGUF** — including NEXTN/MTP head, unsloth UD-quants, mmproj vision.
   *Impact: enables GGUF for a model family/architecture upstream sglang could not load (hybrid-GDN).
   No throughput claim — enablement.*
-- **GGUF-MoE expert-dim sharding, uneven ✅** — whole experts per rank + zero-pad + remap,
+- **GGUF-MoE expert-dim sharding, uneven** — whole experts per rank + zero-pad + remap,
   with GDN block coarsening and an MMQ fallback for misaligned blocks; A3B TP=3 coherent.
   *Impact: enables uneven-TP GGUF-MoE. Correctness/enablement.*
-- **Tuned K-quant MMVQ kernel ✅** — TP=2 beats llama.cpp on decode.
-  *Impact: **🟢 faster than llama.cpp** at TP=2 on this rig; a decode-throughput win for the GGUF path.*
-- **GGUF perf overhaul ✅** — flat layout, batched MMVQ, Q8 lm_head, shape-aware dispatch,
+- **Tuned K-quant MMVQ kernel** — TP=2 beats llama.cpp on decode.
+  *Impact: **[better] faster than llama.cpp** at TP=2 on this rig; a decode-throughput win for the GGUF path.*
+- **GGUF perf overhaul** — flat layout, batched MMVQ, Q8 lm_head, shape-aware dispatch,
   graph capture within budget. K-quant MMQ is now capped to small token counts, above which it
   dequantizes to cuBLAS.
-  *Impact: **🟢 ≈5-8x prefill throughput** on batched/long prompts vs the always-MMQ path (which was
-  flat/slow); **⚪ decode roughly unchanged** (bandwidth-limited).*
-- **GGUF uneven-TP vec alignment 🟠** — 16-element MLP units for indivisible intermediate sizes
+  *Impact: **[better] ≈5-8x prefill throughput** on batched/long prompts vs the always-MMQ path (which was
+  flat/slow); **[neutral] decode roughly unchanged** (bandwidth-limited).*
+- **GGUF uneven-TP vec alignment [in progress]** — 16-element MLP units for indivisible intermediate sizes
   (e.g. 17408 at TP=3/5); unlocks dense GGUF under uneven TP (the last remaining old GGUF blocker).
   *Impact: enablement for dense GGUF under uneven TP. Correctness, no throughput claim.*
 
@@ -213,70 +215,70 @@ adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4*
 
 ## 5. Quantization
 
-- **AWQ / Marlin uneven-TP ✅** — group/tile alignment, K-mask in the MoE Triton kernel, and a
+- **AWQ / Marlin uneven-TP** — group/tile alignment, K-mask in the MoE Triton kernel, and a
   **Marlin zero-point staging fix for g=32** (a CUDA-kernel bug that affected every AWQ-g32 MoE).
   *Impact: correctness — AWQ-g32 MoE was silently wrong before; also unlocks AWQ under uneven TP.
   No throughput claim.*
-- **compressed-tensors uneven group alignment ✅** — quant-block-aligned units applied only to the
+- **compressed-tensors uneven group alignment** — quant-block-aligned units applied only to the
   layers that are actually quantized.
   *Impact: correctness/enablement under uneven TP.*
-- **AutoRound-int4 ✅** — `weight_block_size` convention + a Marlin repack fix (Gemma vision
+- **AutoRound-int4** — `weight_block_size` convention + a Marlin repack fix (Gemma vision
   geometry).
   *Impact: enables AutoRound-int4 (Gemma-4) that failed to load before. Enablement.*
 
 ## 6. MoE / Expert Offload
 
-- **MoE expert offload (pinned-host pool + wave prefetch) 🟠** — env-driven
+- **MoE expert offload (pinned-host pool + wave prefetch) [in progress]** — env-driven
   (`SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0`): all experts live in a pinned-RAM pool, the GPU
   keeps only `ceil(fraction · num_experts)` resident experts, and each forward LRU-prefetches the
   misses + remaps slots on-device over the unchanged grouped-GEMM. Wave processing is done **over
   tokens, not experts**, which is the key to byte-identity (no cross-wave partial sums → no
   floating-point re-association).
-  *Impact: lets a MoE model run with a fraction of its experts resident in VRAM — **🟢 enables models
+  *Impact: lets a MoE model run with a fraction of its experts resident in VRAM — **[better] enables models
   that otherwise would not fit**. The cost is throughput only, not quality (see below). **Eager-only by
   design** (data-dependent routing is not graph-capturable → fail-fast guard if graphs are on).*
   - *Quality — validated, no measurable loss (#120): on Qwen3.6-35B-A3B-FP8 (TP=3 uneven, eager,
     temp=0, tiered fraction=0.5 → half the experts resident, half host-spilled) vs the fully-resident
-    baseline: **🟢 ≈+0.15% perplexity** (well inside FP8 reduction-order noise), **🟢 needle-in-haystack
-    100%** at 8k and 30k, **🟢 correctness batteries 15/15 identical**. Also byte-identical at
+    baseline: **[better] ≈+0.15% perplexity** (well inside FP8 reduction-order noise), **[better] needle-in-haystack
+    100%** at 8k and 30k, **[better] correctness batteries 15/15 identical**. Also byte-identical at
     fraction 0.25 vs 1.0 (identical output IDs). Verdict: offloading experts does **not** degrade
     quality — you pay in throughput, not accuracy.*
-  - *Throughput cost — 🔴 PCIe-bandwidth-limited, not compute-bound: the host↔GPU expert traffic is
-    the bottleneck. **🔴 Prefill ≈an order of magnitude slower** single-stream (the spill cache
-    fragments prefill into many tiny fetch-gated GEMMs); **🔴 decode only mildly slower (≈1.4×)**.
+  - *Throughput cost — [worse] PCIe-bandwidth-limited, not compute-bound: the host↔GPU expert traffic is
+    the bottleneck. **[worse] Prefill ≈an order of magnitude slower** single-stream (the spill cache
+    fragments prefill into many tiny fetch-gated GEMMs); **[worse] decode only mildly slower (≈1.4×)**.
     Levers that shrink this: a bigger spill cache, NVLink/P2P, or more PCIe lanes.*
   - *Robustness (non-obvious): a single forward can legitimately need more unique experts than
     fit in the resident slots (a prefill batch easily touches all of them) — not obvious up
     front. Waving over tokens keeps each token whole in one wave, so this overflow case stays
     byte-identical instead of silently evicting a still-needed expert.*
-- **Head-rank load-time MoE offload (Variant C B2b) 🟠** — a *load-time-aware* extension of the
+- **Head-rank load-time MoE offload (Variant C B2b) [in progress]** — a *load-time-aware* extension of the
   offload above, for models too big to fully load on any single GPU (e.g. a 122B-A10B). Instead of
   today's path — materialize all experts on the GPU and *then* slice, which OOMs during load — it
   materializes only the resident+cushion experts per layer on the GPU and **streams the cold spill
   tier straight into host pinned RAM during load**. Pairs with the weightless fast lane (§10) where
   the fast card holds the full model.
-  *Impact: **🟢 makes otherwise-unbootable big MoE models runnable** on constrained VRAM (boots what
-  used to OOM at load); **⚪ steady-state resident compute unchanged** (byte-identical); **🔴 throughput
+  *Impact: **[better] makes otherwise-unbootable big MoE models runnable** on constrained VRAM (boots what
+  used to OOM at load); **[neutral] steady-state resident compute unchanged** (byte-identical); **[worse] throughput
   stays PCIe-bandwidth-bound** — same cost profile as the expert-offload entry above.*
 
 ## 7. Model Support
 
-- **Qwen3.6-27B hybrid-GDN ✅** — GGUF + AWQ-INT4 + FP8, uneven TP=3, MTP.
-- **Qwen3.6-35B-A3B (MoE) ✅** — FP8/GGUF/AWQ coherent under uneven TP=3; the vehicle for
+- **Qwen3.6-27B hybrid-GDN** — GGUF + AWQ-INT4 + FP8, uneven TP=3, MTP.
+- **Qwen3.6-35B-A3B (MoE)** — FP8/GGUF/AWQ coherent under uneven TP=3; the vehicle for
   PD-disaggregation testing.
-- **Gemma-4 31B dense ✅** — int4-AutoRound, TP=1 and uneven TP=3 (plan-aware vision tower, Triton
+- **Gemma-4 31B dense** — int4-AutoRound, TP=1 and uneven TP=3 (plan-aware vision tower, Triton
   head fix); EAGLE3 speculation.
-- **Gemma-4 26B-A4B (MoE, SWA hybrid) ✅** — boots (vision-ignore mapper, gated-GeLU Marlin);
-  **`--swa-pool-sizing` cap: 🟢 ≈6x long-context** (50k needle proven), using Stage-A rather than
+- **Gemma-4 26B-A4B (MoE, SWA hybrid)** — boots (vision-ignore mapper, gated-GeLU Marlin);
+  **`--swa-pool-sizing` cap: [better] ≈6x long-context** (50k needle proven), using Stage-A rather than
   SWA-DCP.
-  *Impact: **🟢 ≈6x more usable long-context** for this SWA-hybrid model vs the un-capped default.*
-- **Small models under uneven-TP ✅** — the replicated-KV GQA handling protects mini geometries
+  *Impact: **[better] ≈6x more usable long-context** for this SWA-hybrid model vs the un-capped default.*
+- **Small models under uneven-TP** — the replicated-KV GQA handling protects mini geometries
   (2B models + future draft models).
   *Impact: enablement/correctness for small-head-count models under uneven TP.*
 
 ## 8. Determinism, Mamba/GDN & HiCache
 
-- **Robustness — reproducible spec-decode output across mismatched GPUs ✅** — NEXTN+GDN speculative
+- **Robustness — reproducible spec-decode output across mismatched GPUs** — NEXTN+GDN speculative
   decoding emits the **same greedy token sequence** even when the ranks are physically different
   cards. (To be precise: it's the *emitted output* that is reproducible, not the intermediate
   activations — different silicon produces different low-order bits, and spec decode tolerates that
@@ -288,17 +290,17 @@ adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4*
   workspace that reads back regions the current forward never wrote (persistent across forwards, so
   the output became a function of request *order*). The feature is robust against all three.
   *Cost sub-millisecond per step. No throughput claim.*
-- **Robustness — stable sampling on mixed-arch TP ✅** — with ranks on different architectures
+- **Robustness — stable sampling on mixed-arch TP** — with ranks on different architectures
   (sm120/sm86) the per-rank reduction order differs slightly, so the common shortcut of sampling
   independently on every rank (safe on identical GPUs) can pick different tokens (≈1/1000) and
   silently diverge into word-salad/loops. Non-obvious because it looks correct on any homogeneous
   rig. The feature is robust to it by taking token IDs from a single rank, and by keying the
   compile cache on GPU identity so ranks never load a foreign-arch artifact.
   *Cost < 1 ms/step. No throughput claim.*
-- **Mamba/GDN determinism ✅** — checkpoint grid, deterministic resume/eviction, flush == fresh-boot,
+- **Mamba/GDN determinism** — checkpoint grid, deterministic resume/eviction, flush == fresh-boot,
   fp32 beta-gate.
   *Impact: correctness — resumed and freshly-booted state produce identical output.*
-- **HiCache under uneven-TP / DCP ✅** — index translation and layout normalization make the
+- **HiCache under uneven-TP / DCP** — index translation and layout normalization make the
   KV-offload cache safe under the fork's non-uniform layouts (upstream assumes uniform shards).
   *Impact: correctness/robustness. The non-uniform layouts also exercise the offload paths
   differently enough to surface two non-obvious concurrency hazards — an L3 write-back race and a
@@ -306,12 +308,12 @@ adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4*
 
 ## 9. Multi-rank-per-GPU & Tooling
 
-- **`--rank-gpu-id` (with duplicates) + NCCL auto-config + physical-impossibility check ✅** —
+- **`--rank-gpu-id` (with duplicates) + NCCL auto-config + physical-impossibility check** —
   explicit rank→physical-GPU placement, NCCL auto-configuration when co-location is detected, and a
   fail-fast check that `(ranks on a GPU) × per-rank-MiB ≤ NVML total`.
   *Impact: enablement — multiple ranks per physical GPU (e.g. TP=4 on 3 cards), with early, clear
   errors for impossible mappings.*
-- **Replicated-KV-head correctness for TP > num_kv_heads, proven at TP=5 (#62) ✅** — the replicated-KV
+- **Replicated-KV-head correctness for TP > num_kv_heads, proven at TP=5 (#62)** — the replicated-KV
   path (§1: when the tensor-parallel degree exceeds the model's KV-head count, the KV heads are
   replicated across the extra ranks and the KV is token-sharded) is validated to run correctly at
   **TP=5** — a TP degree above both the KV-head count and the physical GPU count. That 5-way
@@ -319,28 +321,28 @@ adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4*
   vehicle: 5 ranks emulated across 3 cards (2 ranks share the 5090, 1 on each 3080) via NCCL
   multi-rank, with the co-location env auto-set when duplicate rank→GPU mappings are detected. So the
   high-TP KV-head-copy behavior was proven without owning 5 GPUs.
-  *Impact: **🟢 confirms replicated-KV correctness at a TP degree above the card count** (correctness,
+  *Impact: **[better] confirms replicated-KV correctness at a TP degree above the card count** (correctness,
   no throughput claim). Multi-rank co-location — running TP=N with N above the physical GPU count — is
   the enabling method here, and is also usable on its own for finer-grained sharding. Honest caveat:
-  **⚪/🔴 co-located ranks share one piece of silicon**, so they contend for SMs and add no memory
+  **[neutral]/[worse] co-located ranks share one piece of silicon**, so they contend for SMs and add no memory
   bandwidth (they are the same GPU); co-location buys capability/flexibility (fitting or emulating
   larger-TP layouts on limited hardware), not raw throughput. Pairs with the fork's uneven-TP so the
   co-located card can also carry a proportionally larger shard.*
-- **Rig dashboard, Docker image, falsifier levers ✅** — operational tooling: a live rig dashboard,
+- **Rig dashboard, Docker image, falsifier levers** — operational tooling: a live rig dashboard,
   a reproducible container image, and env-gated falsifier probes used to hunt the determinism bugs
   above.
 
 ## 10. Serving & Scheduling
 
-- **Fast-lane priority scheduling (Stage 0, `--enable-fast-lane`) ✅** — an opt-in fast lane built on
+- **Fast-lane priority scheduling (Stage 0, `--enable-fast-lane`)** — an opt-in fast lane built on
   sglang's priority subsystem. Tag a request `lane="fast"` (or high priority) and, under heavy
   concurrent load, it **preempts into the running batch** instead of being head-of-line-blocked
   behind a full heavy batch. A **reserved-heavy-slots floor** plus **heavy-aging** guarantees the
   heavy batch keeps making progress, so there is no starvation of the background load. Opt-in and
   default OFF → the default scheduling path stays byte-identical.
-  *Impact: **🟢 interactive TTFT under saturated load dramatically better** — first token in
+  *Impact: **[better] interactive TTFT under saturated load dramatically better** — first token in
   milliseconds instead of tens of seconds, i.e. near-unloaded responsiveness even while a heavy
-  batch runs; **🟢 heavy-batch throughput largely retained** under the fast preemption; **⚪ zero extra
+  batch runs; **[better] heavy-batch throughput largely retained** under the fast preemption; **[neutral] zero extra
   VRAM**.*
   **Honest scope (don't over-read it):** once admitted, the fast request **decodes at the shared
   batched rate, not at solo speed**. Stage 0 fixes **responsiveness / TTFT** under load — it does
@@ -348,23 +350,23 @@ adapter is Qwen3.5/3.6-specific — other families in this fork (e.g. **Gemma-4*
   lane, i.e. the Weightless-KV Fast Lane below (stages B1+B2a now landed), not just priority
   preemption.
 
-- **Weightless-KV Fast Lane (Variant C, stages B1 + B2a) ✅** — a single-process asymmetric-TP mode
+- **Weightless-KV Fast Lane (Variant C, stages B1 + B2a)** — a single-process asymmetric-TP mode
   for heterogeneous GPUs. The **fast card** (here the 5090) holds the **full model as collective-free
   TP=1** and is the sole Q/K/V producer + attention dispatcher; the **slow cards** (the 3080s) become
   **"weightless KV workers"** — they hold **only a DCP token-shard of the attention KV cache** and run
   a stripped attention-only forward, with **no layer weights at all**. This inverts the usual problem:
   instead of the slow cards limiting capacity, they contribute pure KV headroom.
-  *Impact: **🟢 slow-card layer-weight VRAM drops to ≈0** — a worker materializes a meta-model, only
+  *Impact: **[better] slow-card layer-weight VRAM drops to ≈0** — a worker materializes a meta-model, only
   the KV pool + attention backend are real (here ≈14 GB freed per worker), so the workers stop being
-  the KV bottleneck and **🟢 context capacity lifts ≈4×** on the test model (hybrid-GDN 27B). **🟢
+  the KV bottleneck and **[better] context capacity lifts ≈4×** on the test model (hybrid-GDN 27B). **[better]
   Correctness proven byte-identical** to a full-TP=1 baseline: the prefill/extend path is bit-identical
   (Δ=0), and decode differs only by benign decode-kernel fp-order — smaller than the model's own
   intrinsic decode-vs-extend kernel variance (the single observed trajectory flip lands on a perfect
-  50/50 tie); self-deterministic. **🟢 Built-in anti-hang guard** (bounded per-step handshake) —
+  50/50 tie); self-deterministic. **[better] Built-in anti-hang guard** (bounded per-step handshake) —
   asymmetric-rank collective divergences fail loud in seconds instead of a silent NCCL hang.*
-  **Honest downsides:** **🔴 eager-only today** (no CUDA-graph capture of the asymmetric forward yet);
-  **🔴 the fast card now holds the full weights**, so once the workers are freed **it** becomes the
-  context limiter for big models (addressed by the load-time MoE offload in §6); **⚪ TP-only,
+  **Honest downsides:** **[worse] eager-only today** (no CUDA-graph capture of the asymmetric forward yet);
+  **[worse] the fast card now holds the full weights**, so once the workers are freed **it** becomes the
+  context limiter for big models (addressed by the load-time MoE offload in §6); **[neutral] TP-only,
   single-node** — PP/DP/EP/spec/chunked-prefill are rejected by design (hard fail-fast).
 
 ---
@@ -375,16 +377,16 @@ These were implemented and evaluated but deliberately gated off — either becau
 correctness invariant or because they are net-negative on this rig's interconnect. The code is kept
 dormant behind a guard for a possible future fix, not removed.
 
-- **Tree-spec `--speculative-eagle-topk > 1` under uneven-weighted-DCP 🔴 GUARDED (#76)** —
+- **Tree-spec `--speculative-eagle-topk > 1` under uneven-weighted-DCP [guarded] (#76)** —
   GPU-validated and found **silently wrong**: topk=1 (chain) is bit-deterministic and greedy-correct,
   but topk=4 is non-deterministic within a single boot and diverges from the topk=1 oracle, violating
   the lossless-greedy invariant. Root cause: the tree-masked verify-attention under weighted-DCP
   produces tree-topology-dependent verify logits (a draft node does not see exactly
-  committed-prefix + true tree ancestors). **Also 🔴 perf-negative on this rig** (≈-15% decode: tree
+  committed-prefix + true tree ancestors). **Also [worse] perf-negative on this rig** (≈-15% decode: tree
   compute overhead > accept-length gain over PCIe x4, serial). Restored as a hard fail-fast guard at
   arg validation, with a CPU unit test. *Reactivation needs both an audit of the draft→draft ancestor
   semantics under DCP and hardware with a better interconnect that makes trees net-positive.*
-- **SWA-DCP Stage B 🔴 descoped** — evaluated at only 🟢 ≈+6-10% (a modest win) for a large
+- **SWA-DCP Stage B [descoped]** — evaluated at only [better] ≈+6-10% (a modest win) for a large
   implementation cost — not worth it;
   reactivation criteria documented. Gemma-4 SWA long-context is served by the Stage-A pool cap in §7
   instead.
@@ -392,58 +394,58 @@ dormant behind a guard for a possible future fix, not removed.
 ## Roadmap (planned / not yet built)
 
 Planned, **not shipped** — listed here because the doc tracks features on two events: when they
-*land* and when they are *accepted/planned*. Everything below is 📋 planned.
+*land* and when they are *accepted/planned*. Everything below is planned only.
 
 ### Weightless fast-lane roadmap (accepted, ordered)
 
 Deliberately ordered by risk to output: **byte-identical speed/capacity gains first, quality-reducing
 (lossy) ones last** — and every lossy item ships behind its own quality gate.
 
-- **Byte-identical performance 📋** — hide the offload's cost without changing outputs: **🟢
+- **Byte-identical performance [planned]** — hide the offload's cost without changing outputs: **[better]
   double-buffered expert prefetch with compute-overlap** (hide the PCIe fetch behind compute; targets
-  the ≈order-of-magnitude prefill slowdown); **🟢 DCP-collective/compute overlap on the weightless
-  lane** (hide the PCIe attention collectives behind head compute); **🟢 bandwidth-aware DCP
-  token-split** (balance the LSE-merge barrier); **🟢 importance/frequency-based expert residency**
+  the ≈order-of-magnitude prefill slowdown); **[better] DCP-collective/compute overlap on the weightless
+  lane** (hide the PCIe attention collectives behind head compute); **[better] bandwidth-aware DCP
+  token-split** (balance the LSE-merge barrier); **[better] importance/frequency-based expert residency**
   (fewer PCIe fetches under skewed routing). All lossless — no throughput claim beyond "reduces the
-  existing 🔴 costs".
-- **Spec-decode synergy 📋 (lossless)** — **🟢 speculative expert prefetch driven by the draft router**
-  (prefetch the experts the draft predicts the target will need); **🟢 draft model on the idle
+  existing [worse] costs".
+- **Spec-decode synergy [planned] (lossless)** — **[better] speculative expert prefetch driven by the draft router**
+  (prefetch the experts the draft predicts the target will need); **[better] draft model on the idle
   weightless-worker cards** (put the slow cards' otherwise-idle compute to work on speculation).
-- **Determinism / byte-identity CI harness 📋 (seed committed)** — boots the weightless lane against a
+- **Determinism / byte-identity CI harness [planned] (seed committed)** — boots the weightless lane against a
   full-TP baseline and asserts extend Δ==0 + benign decode fp-order; a regression guard, not a perf
   feature.
-- **Quality-tradeoff features 📋 (planned LAST — each gated on its own quality check)** — these trade
+- **Quality-tradeoff features [planned] (deferred to LAST — each gated on its own quality check)** — these trade
   some accuracy for capacity/bandwidth and are intentionally deferred behind the lossless work:
-  **fp8/int4 KV on the weightless workers** (🟢 ≈2-4× KV capacity on small cards, 🔴 lossy KV);
-  **harder-quantized cold-expert spill tier** (🟢 fewer PCIe bytes, 🔴 lossy cold experts);
-  **attention-sink + sliding-window KV eviction** (🟢 long context in a fixed budget, 🔴 drops
-  mid-context); **compressed/fp8 KV on the PD/HiCache transfer path** (🟢 ≈half the transfer bytes,
-  🔴 lossy transfer).
+  **fp8/int4 KV on the weightless workers** ([better] ≈2-4× KV capacity on small cards, [worse] lossy KV);
+  **harder-quantized cold-expert spill tier** ([better] fewer PCIe bytes, [worse] lossy cold experts);
+  **attention-sink + sliding-window KV eviction** ([better] long context in a fixed budget, [worse] drops
+  mid-context); **compressed/fp8 KV on the PD/HiCache transfer path** ([better] ≈half the transfer bytes,
+  [worse] lossy transfer).
 
 ### Other directional items
 
-- **PD v2 "lane scheduler" 📋** — mixed-mode decode server + routing matrix: length routing,
+- **PD v2 "lane scheduler" [planned]** — mixed-mode decode server + routing matrix: length routing,
   overflow prefill, sticky fast-lane decode + lazy migration, cache-affinity scheduling; end state
   is HiCache as a session medium (sessions live in the RAM tier, engines check them in/out,
   cross-lane prefix caching).
-- **Draft-KV-pool DCP layout (`--draft-kv-layout`) 📋** — unlocks speculation in disaggregated
+- **Draft-KV-pool DCP layout (`--draft-kv-layout`) [planned]** — unlocks speculation in disaggregated
   operation + granular draft-VRAM control.
-- **Suspend-to-disk 📋** — persist VRAM state (weights + KV + GDN) to disk to free/reclaim GPUs in
+- **Suspend-to-disk [planned]** — persist VRAM state (weights + KV + GDN) to disk to free/reclaim GPUs in
   seconds without re-capture.
-- **GDN-state RAM offload 📋** — under investigation; converges with the HiCache session medium.
-- **Web frontend 📋** — HF repo in → quant selection with a VRAM preview, config proposal
+- **GDN-state RAM offload [planned]** — under investigation; converges with the HiCache session medium.
+- **Web frontend [planned]** — HF repo in → quant selection with a VRAM preview, config proposal
   (TP/DCP/PD/spec per model family), live max-KV estimator; hardware-generic (NVML profile, no rig
   constants).
-- **122B-A10B-Int4 real run 📋** — the MoE expert-offload mechanism is validated on 35B-A3B; the
+- **122B-A10B-Int4 real run [planned]** — the MoE expert-offload mechanism is validated on 35B-A3B; the
   full 122B run is gated on a model download decision (Int4 only on this rig — an FP8 pinned pool
   would exceed host RAM).
 - **Upstream adaptive-spec PR review/port, tree-spec topk>1 on better interconnect, uneven-TP over
-  nodes/RDMA 📋** — longer-horizon items.
-- **Future — new-Mistral support (conditional, pending external release) 📋** — support Mistral's
+  nodes/RDMA [planned]** — longer-horizon items.
+- **Future — new-Mistral support (conditional, pending external release) [planned]** — support Mistral's
   next-generation "fat but sparse" MoE family (announced for July 2026 early access; open weights not
   yet public) **once it ships publicly** and **only if it fits this class of rig** — i.e. its smallest
   usable quant (Int4/Q4) must fit the VRAM + host-RAM-offload budget (roughly ≤65 GB via the
-  load-time expert offload in §6). **⚪ Conditional:** a ≈119B-scale sparse MoE at Int4 (≈60 GB) fits
+  load-time expert offload in §6). **[neutral] Conditional:** a ≈119B-scale sparse MoE at Int4 (≈60 GB) fits
   tightly via offload; a 675B-class model does not. Foundation already exists (parked): the
   config/format subsystem is complete, dense/Mixtral GGUF is already generic, plus three small
   execution fixes (lazy MLA/Pixtral import decouple, LlamaMLP `tp_family` for uneven-TP, Mixtral
