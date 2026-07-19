@@ -1493,7 +1493,18 @@ class ModelRunnerKVCacheMixin:
                 # (LOCAL head-sharded kv, FULL token context) -- it is NOT
                 # DCP-token-sharded (see FlashInferAttnBackend.__init__ draft
                 # gate). Only the TARGET model replicates heads + token-shards.
-                _draft_non_dcp = self.is_draft_worker
+                #
+                # #108 (--draft-kv-layout dcp): opt in to token-sharding the
+                # draft pool exactly like the target -- replicate the kv heads
+                # (get_total_num_kv_heads below) and size the pool to this rank's
+                # owned share C*ratio_r/S (the uneven_dcp_active branch below).
+                # Gated OFF by default (replicated) so the default path is
+                # bit-identical.
+                _draft_dcp = (
+                    self.is_draft_worker
+                    and self.server_args.draft_kv_layout == "dcp"
+                )
+                _draft_non_dcp = self.is_draft_worker and not _draft_dcp
                 if uneven_dcp_kv_replicated(self.dcp_size) and not _draft_non_dcp:
                     _hybrid_kv_head_num = self.model_config.get_total_num_kv_heads()
                 else:

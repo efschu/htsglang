@@ -462,15 +462,28 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
         # M4 (MTP+DCP): the DRAFT worker (EAGLE/NEXTN) does NOT token-shard its
-        # tiny 1-layer KV pool. It runs as a plain uneven-TP model -- head-sharded
-        # kv (whole GQA groups per rank, [2,1,1]) with the FULL token context
-        # resident on every rank -- so its draft/verify KV indices never need the
-        # weighted DCP owner rule. Only the TARGET model uses DCP token-sharding.
-        # This is the coordinator's "keep the draft heads local, not DCP-split"
-        # simplification (minimal variant: head-sharded across ranks, reusing the
-        # existing uneven-TP weight loading, rather than whole-on-one-card).
-        self.uneven_dcp = uneven_dcp_kv_replicated(self.dcp_size) and not getattr(
-            model_runner, "is_draft_worker", False
+        # tiny 1-layer KV pool BY DEFAULT (--draft-kv-layout replicated). It runs
+        # as a plain uneven-TP model -- head-sharded kv (whole GQA groups per
+        # rank, [2,1,1]) with the FULL token context resident on every rank -- so
+        # its draft/verify KV indices never need the weighted DCP owner rule.
+        # Only the TARGET model uses DCP token-sharding.
+        #
+        # #108 (--draft-kv-layout dcp): opt in to token-sharding the DRAFT KV
+        # pool with the SAME weighted owner rule + replicated-kv-heads + LSE-merge
+        # as the target. When enabled the draft worker takes the identical
+        # uneven_dcp path below (owner-rule masked write, per-layer kv-head
+        # all-gather, cross-rank LSE-merge); the draft pool is sized per-rank and
+        # its heads replicated in model_runner_kv_cache_mixin. This is a lossless
+        # memory optimization: at temp=0 the verified output is byte-identical to
+        # 'replicated' (the target verify path is untouched). Gated OFF by
+        # default so the replicated path stays bit-identical.
+        _is_draft = getattr(model_runner, "is_draft_worker", False)
+        _draft_kv_layout = getattr(
+            getattr(model_runner, "server_args", None), "draft_kv_layout", "replicated"
+        )
+        _draft_replicated = _is_draft and _draft_kv_layout != "dcp"
+        self.uneven_dcp = (
+            uneven_dcp_kv_replicated(self.dcp_size) and not _draft_replicated
         )
         # WEIGHTED owner rule (SGLANG_UNEVEN_DCP_WEIGHTED): a non-uniform token
         # vector is installed, so this rank owns the contiguous virtual-block
