@@ -21,15 +21,18 @@ Correctness/enablement fixes carry **no throughput claim** — they make somethi
 or make it deterministic; they are labelled as such rather than given a fabricated
 percentage.
 
-## What counts as a "bugfix over upstream"
+## On "bugfixes" and robustness
 
-A **bugfix over upstream** here means a defect that is present in vanilla sglang (or in a
-kernel/library it uses) and that this fork fixes — it would bite an upstream user too.
-Bugs that exist **only because of this fork's own new code** (e.g. a sizing miscalc in the
-uneven-TP path, an eviction bug in the expert-offload wave loop) are **not** listed as
-fixes "over upstream" — they never existed upstream. Those are folded into the relevant
-feature as a **robustness** note, because they are part of hardening our own mechanism, not
-an advantage over sglang.
+A **bugfix over upstream** here means a defect present in vanilla sglang (or in a
+kernel/library it uses) that this fork fixes — it would bite an upstream user too. Those are
+listed on their own merit.
+
+This doc does **not** enumerate the fork's own development bugs — a feature that was wrong in
+an early revision and then corrected is just the feature working; the fix is not a selling
+point. Robustness is only called out where the problem it solved was **not obvious on first
+(or second) glance** — a subtle failure mode a careful reader wouldn't expect the feature to
+have already handled. Those non-obvious robustness properties are noted at the relevant
+feature; routine "we implemented it correctly" fixes are not.
 
 Status legend: ✅ integrated + validated · 🟠 in progress · 🟡 code complete, untested
 · 🔴 guarded/descoped · 📋 planned
@@ -74,10 +77,10 @@ its GPU, instead of an equal split.
   boot (no iterate-and-reboot).
   *Impact: ~+25% context on 27B-FP8 at roughly break-even decode cost (~±1%).*
 - **TP > num_kv_heads (replicated KV) ✅** — KV heads are replicated + token-sharded +
-  LSE-merged so TP can exceed the KV-head count. Coherent across FP8 / GGUF / AWQ; includes
-  a GQA re-grouping fix for small head counts (gqa=1 ranks).
+  LSE-merged so TP can exceed the KV-head count. Coherent across FP8 / GGUF / AWQ, including
+  GQA re-grouping for small head counts (down to gqa=1 ranks).
   *Impact: enables TP degrees that were structurally impossible before (applies under uneven-DCP
-  too). Correctness fix, no throughput claim.*
+  too). No throughput claim.*
   **The price is small:** because TP exceeds `num_kv_heads`, the few KV heads must be **replicated**
   across the ranks that share a KV-head group instead of sharded. But under GQA there are only a
   handful of KV heads to begin with (the query heads, which dominate, are still sharded normally),
@@ -89,13 +92,9 @@ its GPU, instead of an equal split.
   rank-uniform shapes, converting a would-be NCCL hang into a clean, early error.
   *Impact: robustness — turns a silent distributed hang into a fail-fast error.*
 - **Auto-sizing Mamba/GDN state pool, rank-aware GDN shapes, per-rank head counts
-  (flashinfer + triton) ✅** — including workspace sizing.
+  (flashinfer + triton) ✅** — including per-rank workspace sizing.
   *Impact: correctness — hybrid (GDN) models run correctly under uneven TP. No throughput
   claim.*
-  *Robustness (hardening our own path): an out-of-bounds-write class of bug in this fork's
-  per-rank workspace sizing was found and fixed twice. This did not exist upstream — it was
-  a defect in our uneven-sizing code — so it is a robustness note here, not a fix over
-  sglang.*
 - **`max_total_num_tokens` caps ✅** — physically-reachable ceilings for GDN hybrids and
   SWA hybrids, computed deterministically so the pool never overshoots into OOM.
   *Impact: correctness/robustness — prevents deterministic-looking OOM from over-sized
@@ -152,16 +151,16 @@ with zero cross-GPU communication while the slower cards handle distributed deco
   `norm_before_residual` flag, converter).
   *Impact: ~+15-45% decode on code/JSON with an instruction-tuned head vs the non-spec baseline;
   recommendation documented as workload-conditional (weaker on free-form prose).*
-- **Draft embed / lm_head sharing, draft-extend replay fix, ratio-weighted draft vocab ✅** —
-  *Impact: correctness fixes for the draft path under uneven TP. No throughput claim.*
+- **Draft embed / lm_head sharing, draft-extend replay, ratio-weighted draft vocab ✅** —
+  *Impact: the draft path works correctly under uneven TP. No throughput claim.*
 
 ## 4. GGUF
 
 - **Qwen3.5/3.6 hybrid-GDN GGUF ✅** — including NEXTN/MTP head, unsloth UD-quants, mmproj vision.
   *Impact: enables GGUF for a model family/architecture upstream sglang could not load. No
   throughput claim — enablement.*
-- **GGUF-MoE expert-dim sharding, uneven ✅** — whole experts per rank + zero-pad + remap;
-  A3B TP=3 coherent (GDN block-coarsen fix, MMQ fallback fix).
+- **GGUF-MoE expert-dim sharding, uneven ✅** — whole experts per rank + zero-pad + remap,
+  with GDN block coarsening and an MMQ fallback for misaligned blocks; A3B TP=3 coherent.
   *Impact: enables uneven-TP GGUF-MoE. Correctness/enablement.*
 - **Tuned K-quant MMVQ kernel ✅** — TP=2 beats llama.cpp on decode.
   *Impact: ~faster than llama.cpp at TP=2 on this rig; a decode-throughput win for the GGUF path.*
@@ -203,11 +202,10 @@ with zero cross-GPU communication while the slower cards handle distributed deco
   that otherwise would not fit. **Honest cost: ~-35% decode tok/s** on short prompts (PCIe H2D
   traffic). Validated byte-identical (fraction 0.25 vs 1.0 → identical outputs). **Eager-only by
   design** (data-dependent routing is not graph-capturable → fail-fast guard if graphs are on).*
-  - *Robustness (hardening our own path): a prefill-overflow bug in this fork's own wave loop
-    was fixed — forwards needing more unique experts than there are slots are now waved over
-    tokens so each token completes in one wave; an earlier version evicted a still-needed
-    expert (KeyError). This bug only existed because of the offload mechanism itself, so it is
-    robustness of the feature, not a fix over upstream sglang.*
+  - *Robustness (non-obvious): a single forward can legitimately need more unique experts than
+    fit in the resident slots (a prefill batch easily touches all of them) — not obvious up
+    front. Waving over tokens keeps each token whole in one wave, so this overflow case stays
+    byte-identical instead of silently evicting a still-needed expert.*
 
 ## 7. Model Support
 
@@ -220,38 +218,36 @@ with zero cross-GPU communication while the slower cards handle distributed deco
   **`--swa-pool-sizing` cap: ~6x long-context** (50k needle proven), using Stage-A rather than
   SWA-DCP.
   *Impact: ~6x more usable long-context for this SWA-hybrid model vs the un-capped default.*
-- **Small models under uneven-TP ✅** — the replicated-KV GQA fix protects mini geometries
+- **Small models under uneven-TP ✅** — the replicated-KV GQA handling protects mini geometries
   (2B models + future draft models).
   *Impact: enablement/correctness for small-head-count models under uneven TP.*
 
 ## 8. Determinism, Mamba/GDN & HiCache
 
-- **Robustness — heterogeneous-GPU speculative determinism ✅** — this is hardening the fork's own
-  mixed-GPU / uneven-TP path, not a fix over upstream: the defects only surface once you run
-  spec-decode across differently-sized cards (something upstream doesn't do), where upstream's
-  assumption of bit-identical logits across ranks no longer holds. Three independent roots were
-  made bit-deterministic: (1) greedy verify without TP-rank sync (per-rank argmax → near-tie flips
-  → silent KV/GDN desync), (2) CUDA-graph pad-tails carrying stale tokens into the MoE grouped-GEMM,
-  (3) a persistent flashinfer float-workspace read of regions the current forward did not write (the
-  original "24-token multi-turn" symptom).
-  *Impact: robustness — NEXTN+GDN output was non-deterministic / corrupting on mixed GPUs; now
-  bit-identical. Cost sub-millisecond per step. No throughput claim.*
-- **Robustness — heterogeneous-TP sampling divergence ✅** — again a mixed-GPU-only failure, not an
-  upstream bug an upstream user would hit: mixed archs (sm120/sm86) produce slightly different
-  reduction orders, and sampling redundantly on every rank (fine on identical GPUs) then picks
-  different tokens (~1/1000) → silent state divergence → word-salad then loops. Hardened by
-  broadcasting sampled + draft token IDs from rank 0 when heterogeneous TP is detected. Also
-  hardened the AOT-compile cache to include GPU identity in its hash (ranks were loading
-  foreign-arch artifacts).
-  *Impact: robustness — eliminated a reproducible corruption/loop specific to mixed-GPU rigs.
-  Cost < 1 ms/step. No throughput claim.*
+- **Robustness — bit-deterministic spec-decode across mismatched GPUs ✅** — NEXTN+GDN speculative
+  decoding stays bit-identical even when the ranks are physically different cards. This is worth
+  highlighting because the sources of non-determinism here are genuinely **not obvious**: they only
+  appear once ranks are different silicon (upstream never runs that way), and they hide in places
+  you don't normally look — a greedy verify that silently relies on every rank's argmax matching,
+  CUDA-graph pad rows leaking stale tokens into the MoE grouped-GEMM, and a flashinfer float
+  workspace that reads back regions the current forward never wrote (persistent across forwards, so
+  the output became a function of request *order*). The feature is robust against all three.
+  *Cost sub-millisecond per step. No throughput claim.*
+- **Robustness — stable sampling on mixed-arch TP ✅** — with ranks on different architectures
+  (sm120/sm86) the per-rank reduction order differs slightly, so the common shortcut of sampling
+  independently on every rank (safe on identical GPUs) can pick different tokens (~1/1000) and
+  silently diverge into word-salad/loops. Non-obvious because it looks correct on any homogeneous
+  rig. The feature is robust to it by taking token IDs from a single rank, and by keying the
+  compile cache on GPU identity so ranks never load a foreign-arch artifact.
+  *Cost < 1 ms/step. No throughput claim.*
 - **Mamba/GDN determinism ✅** — checkpoint grid, deterministic resume/eviction, flush == fresh-boot,
   fp32 beta-gate.
   *Impact: correctness — resumed and freshly-booted state produce identical output.*
-- **HiCache under uneven-TP / DCP ✅** — index translation, layout normalization, an L3 write-back
-  race fix, and a prefetch deadlock fix.
-  *Impact: correctness/robustness — makes the KV-offload cache safe under the fork's non-uniform
-  layouts (upstream assumes uniform shards). No throughput claim.*
+- **HiCache under uneven-TP / DCP ✅** — index translation and layout normalization make the
+  KV-offload cache safe under the fork's non-uniform layouts (upstream assumes uniform shards).
+  *Impact: correctness/robustness. The non-uniform layouts also exercise the offload paths
+  differently enough to surface two non-obvious concurrency hazards — an L3 write-back race and a
+  prefetch deadlock — that the feature is hardened against. No throughput claim.*
 
 ## 9. Multi-rank-per-GPU & Tooling
 
