@@ -142,7 +142,18 @@ class OffloaderV1(BaseOffloader):
                     k: v.to(device, non_blocking=True)
                     for k, v in module.state_dict().items()
                 }
-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
+                # tie_weights=False: models with tied parameters (e.g. a shared
+                # `dt_bias` aliased under two names in a hybrid linear-attention
+                # block) expose the SAME tensor under multiple state_dict keys.
+                # functional_call's default tie-detection then raises
+                # "multiple values for tied keys". Since device_state is derived
+                # from the module's own state_dict (identical aliasing), the
+                # reparametrization is consistent and tie handling is
+                # unnecessary; disable it so cpu-offload works for tied-param
+                # models.
+                output = functional_call(
+                    module, device_state, args=args, kwargs=kwargs, tie_weights=False
+                )
                 module.forward = forward
                 return output
 
