@@ -270,12 +270,21 @@ class MoEExpertOffloadCache:
 
     #: names of the stacked per-expert tensors to pool/fetch (dim 0 == expert).
     EXPERT_TENSOR_ATTRS = (
+        # FP8 / triton fused path (M-B original).
         "w13_weight",
         "w2_weight",
         "w13_weight_scale",
         "w2_weight_scale",
         "w13_weight_scale_inv",
         "w2_weight_scale_inv",
+        # GPTQ-Int4 Marlin path (Variant-C B2b): the POST-repack marlin tensors.
+        # The apply kernel reads these; qzeros is unused (sym) and g_idx is empty
+        # (desc_act=False), so only these four are staged. All are expert-major
+        # (dim 0 == num_experts) and per-expert sliceable in the marlin layout.
+        "w13_qweight",
+        "w2_qweight",
+        "w13_scales",
+        "w2_scales",
     )
 
     def __init__(self, layer, fraction: float):
@@ -300,6 +309,7 @@ class MoEExpertOffloadCache:
         if self._installed or self.planner.fully_resident:
             return
         self._stream = torch.cuda.Stream()
+        dev = torch.cuda.current_device()
         for attr in self.EXPERT_TENSOR_ATTRS:
             full = getattr(self.layer, attr, None)
             if full is None:
@@ -307,10 +317,24 @@ class MoEExpertOffloadCache:
             full = full.data if hasattr(full, "data") else full
             if full.shape[0] != self.num_local_experts:
                 continue  # not an expert-major tensor
-            pinned = torch.empty_like(full, device="cpu").pin_memory()
-            pinned.copy_(full)
-            self._pinned[attr] = pinned
-            resident = full[: self.n_slots].contiguous()
+            if full.is_cpu:
+                # Variant-C B2b load-time path: the weights already arrived on
+                # CPU-pinned (create_weights built the expert tensors on CPU,
+                # and device_loading_context copied the marlin-repacked result
+                # back to a pinned host buffer on load). The full stack NEVER
+                # sat on GPU -> use it directly as the pinned spill pool (no
+                # second 60 GB pinned copy) and materialize only n_slots experts
+                # on GPU.
+                pinned = full if full.is_pinned() else full.pin_memory()
+                self._pinned[attr] = pinned
+                resident = pinned[: self.n_slots].to(dev, non_blocking=False).contiguous()
+            else:
+                # Original M-B path: the full stack is resident on GPU; copy it
+                # down to a fresh pinned host pool, keep the first n_slots on GPU.
+                pinned = torch.empty_like(full, device="cpu").pin_memory()
+                pinned.copy_(full)
+                self._pinned[attr] = pinned
+                resident = full[: self.n_slots].contiguous()
             self._resident[attr] = resident
             setattr(self.layer, attr, torch.nn.Parameter(resident, requires_grad=False)
                     if isinstance(getattr(self.layer, attr), torch.nn.Parameter)
