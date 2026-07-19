@@ -21,6 +21,16 @@ Correctness/enablement fixes carry **no throughput claim** — they make somethi
 or make it deterministic; they are labelled as such rather than given a fabricated
 percentage.
 
+## What counts as a "bugfix over upstream"
+
+A **bugfix over upstream** here means a defect that is present in vanilla sglang (or in a
+kernel/library it uses) and that this fork fixes — it would bite an upstream user too.
+Bugs that exist **only because of this fork's own new code** (e.g. a sizing miscalc in the
+uneven-TP path, an eviction bug in the expert-offload wave loop) are **not** listed as
+fixes "over upstream" — they never existed upstream. Those are folded into the relevant
+feature as a **robustness** note, because they are part of hardening our own mechanism, not
+an advantage over sglang.
+
 Status legend: ✅ integrated + validated · 🟠 in progress · 🟡 code complete, untested
 · 🔴 guarded/descoped · 📋 planned
 
@@ -76,10 +86,13 @@ its GPU, instead of an equal split.
   rank-uniform shapes, converting a would-be NCCL hang into a clean, early error.
   *Impact: robustness — turns a silent distributed hang into a fail-fast error.*
 - **Auto-sizing Mamba/GDN state pool, rank-aware GDN shapes, per-rank head counts
-  (flashinfer + triton) ✅** — including workspace sizing. An out-of-bounds-write class of
-  bug here was fixed twice.
+  (flashinfer + triton) ✅** — including workspace sizing.
   *Impact: correctness — hybrid (GDN) models run correctly under uneven TP. No throughput
   claim.*
+  *Robustness (hardening our own path): an out-of-bounds-write class of bug in this fork's
+  per-rank workspace sizing was found and fixed twice. This did not exist upstream — it was
+  a defect in our uneven-sizing code — so it is a robustness note here, not a fix over
+  sglang.*
 - **`max_total_num_tokens` caps ✅** — physically-reachable ceilings for GDN hybrids and
   SWA hybrids, computed deterministically so the pool never overshoots into OOM.
   *Impact: correctness/robustness — prevents deterministic-looking OOM from over-sized
@@ -187,9 +200,11 @@ with zero cross-GPU communication while the slower cards handle distributed deco
   that otherwise would not fit. **Honest cost: ~-35% decode tok/s** on short prompts (PCIe H2D
   traffic). Validated byte-identical (fraction 0.25 vs 1.0 → identical outputs). **Eager-only by
   design** (data-dependent routing is not graph-capturable → fail-fast guard if graphs are on).*
-  - **Prefill-overflow bug fixed** — forwards needing more unique experts than there are slots
-    are now waved over tokens so each token completes in one wave; previously this evicted a
-    still-needed expert (KeyError). *Correctness fix.*
+  - *Robustness (hardening our own path): a prefill-overflow bug in this fork's own wave loop
+    was fixed — forwards needing more unique experts than there are slots are now waved over
+    tokens so each token completes in one wave; an earlier version evicted a still-needed
+    expert (KeyError). This bug only existed because of the offload mechanism itself, so it is
+    robustness of the feature, not a fix over upstream sglang.*
 
 ## 7. Model Support
 
