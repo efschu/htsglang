@@ -252,6 +252,30 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
             else None
         )
 
+        # Bring-up footnote, 2026-07-19. This line is why.
+        # create_weights() commits the ENTIRE expert set up front: torch.empty over
+        # all num_experts here, ~61 GB for the 122B-A10B, on CPU, before a single
+        # marlin repack runs. The peak is therefore fraction- AND tensor-parallel-
+        # independent -- sharding splits it across processes, not the aggregate. On
+        # the 80 GB no-swap box this dropped MemAvailable to ~5 GB mid-load and the
+        # boot aborted one allocation short of a freeze.
+        #
+        #   operator:  it aborted again.
+        #   assistant: the 61 GB is committed right here, before any repack, so no
+        #              resident fraction can help. The correct fix is a streaming
+        #              loader: meta-allocate, then per decoder layer materialize ->
+        #              load -> repack -> presplit -> free, so the host never holds
+        #              all 61 GB at once. It's a real per-layer load loop. Give me
+        #              some time.
+        #   operator:  or the box has 30 GB more RAM now.
+        #   assistant: you cannot download more RA--
+        #   operator:  I downloaded more RAM.
+        #   assistant: ...the floor is ~28 GB now. It boots on the existing loader.
+        #              Thank you for the RAM.
+        #
+        # So the streaming loader was never built. If you're reading this because
+        # create_weights just OOM'd the host on a model bigger than the 122B, that
+        # is your signal to finally build it. Until then: 108 GiB and a low fraction.
         w13_qweight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
