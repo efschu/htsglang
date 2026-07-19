@@ -7,6 +7,10 @@ The core idea: split **tensor-parallel weights, KV-cache, and MoE experts
 *proportionally* across differently-sized/differently-fast cards** instead of the
 uniform, equal-shard split that upstream assumes.
 
+See also: [TOPOLOGIES.md](TOPOLOGIES.md) — for each major capability below, the canonical
+multi-GPU constellation where it is the decisive advantage, with VRAM/host-RAM partition
+diagrams and the stock-sglang contrast.
+
 This document is a reference inventory of everything the fork adds or changes over
 vanilla sglang, grouped by area. Each entry gives a short description and a rough
 impact estimate. It tracks work on **two events** — when a feature *lands* (the numbered
