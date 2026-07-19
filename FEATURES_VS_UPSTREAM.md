@@ -386,13 +386,6 @@ way to run it.
   context limiter for big models (addressed by the load-time MoE offload in §6); **[neutral] TP-only,
   single-node** — PP/DP/EP/spec/chunked-prefill are rejected by design (hard fail-fast).
 
-## Aside — one bring-up note worth recording
-
-During the 122B-A10B expert-offload bring-up, the load path hit a host-RAM wall on the no-swap box —
-`create_weights` commits the full expert set (~61 GB) upfront before any repack. The fix would have
-been a streaming/layered loader, but the operator downloaded 30 GB of RAM at the right moment, so the
-streaming loader was never built — for now.
-
 ---
 
 ## Guarded / descoped (kept, not shipped)
