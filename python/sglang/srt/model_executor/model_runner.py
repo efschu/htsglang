@@ -1567,7 +1567,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.runtime_context import get_parallel
 
             _wl_build_ctx = (
-                get_parallel().override(tp_size=1, moe_tp_size=1)
+                get_parallel().override(
+                    tp_size=1, moe_tp_size=1, attn_tp_size=1
+                )
                 if (self.is_weightless_head or self.is_weightless_worker)
                 else contextlib.nullcontext()
             )
@@ -3227,6 +3229,47 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
+    def _weightless_attn_layers(self):
+        """The model's full-attention RadixAttention modules in layer order.
+        The weightless worker loops these (only) to issue the per-layer dcp
+        dispatch; GDN/linear-attention layers carry no KV and are skipped."""
+        cached = getattr(self, "_wl_attn_layers_cache", None)
+        if cached is not None:
+            return cached
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        layers = [
+            m for m in self.model.modules() if isinstance(m, RadixAttention)
+        ]
+        layers.sort(key=lambda a: a.layer_id)
+        self._wl_attn_layers_cache = layers
+        return layers
+
+    def _forward_weightless_worker(
+        self, forward_batch: ForwardBatch
+    ) -> ModelRunnerOutput:
+        """Stripped attention-only forward for a weightless KV worker rank
+        (Option-B B1). Runs NO model layers; per full-attention layer it
+        participates in the head rank's dcp dispatch with an empty [T,0,D] head
+        slice + its KV token-shard (KV-broadcast+owner-write, Q-broadcast,
+        attend local shard, LSE-merge), then returns a sentinel output (no
+        logits). Sampling is skipped on workers (tp_worker gates on
+        is_weightless_worker)."""
+        if not forward_batch.forward_mode.is_decode():
+            # TODO(B1-prefill): the weightless PREFILL/EXTEND worker dispatch
+            # (ragged KV write across the token-shard) is a distinct, non-trivial
+            # net-new path. Decode is implemented first for the byte-identity
+            # gate; prefill is a named follow-up.
+            raise NotImplementedError(
+                "weightless-KV worker forward supports decode only (B1); "
+                "prefill/extend weightless dispatch is not yet implemented."
+            )
+        self._prepare_eager_forward_batch(forward_batch)
+        self.attn_backend.init_forward_metadata(forward_batch)
+        for layer in self._weightless_attn_layers():
+            self.attn_backend.forward_decode_weightless_worker(layer, forward_batch)
+        return ModelRunnerOutput(logits_output=None, can_run_graph=False)
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -3239,6 +3282,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr:
+            # Weightless-KV fast lane (Option-B, B1): reset the per-forward
+            # anti-hang guard step counter on BOTH the head rank and the
+            # weightless workers at the same point, so their dcp-collective step
+            # counters stay aligned across the asymmetric forward. The worker
+            # then runs the stripped attention-only forward and returns early
+            # (no model layers, no logits); the head continues to model.forward.
+            if self.is_weightless_head or self.is_weightless_worker:
+                from sglang.srt.layers.dcp.collective_guard import (
+                    reset_forward_guard,
+                )
+
+                reset_forward_guard()
+            if self.is_weightless_worker:
+                return self._forward_weightless_worker(forward_batch)
+
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"

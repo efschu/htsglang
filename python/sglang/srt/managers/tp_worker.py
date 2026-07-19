@@ -537,6 +537,14 @@ class TpModelWorker(BaseTpWorker):
                 indexer_topk_output=out.indexer_topk_output,
             )
 
+            # Weightless-KV fast lane (Option-B, B1): a weightless KV worker rank
+            # produced no logits (its stripped forward only attends its KV
+            # token-shard). It never samples -- only the head rank has the
+            # lm_head + valid hidden states and produces the tokens. Return the
+            # (logits-less) result; the head rank's tokens are authoritative.
+            if getattr(self.model_runner, "is_weightless_worker", False):
+                return batch_result
+
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result

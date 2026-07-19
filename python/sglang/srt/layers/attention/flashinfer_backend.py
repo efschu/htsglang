@@ -544,6 +544,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.dcp_kv_head_counts = weightless_head_counts(
                     total_kv, attn_tp_size
                 )
+                # Compute dtype for the weightless worker's empty [T,0,D]
+                # contributions -- must match the head rank's projected Q/K/V
+                # dtype so the padded all-gather shapes/dtypes agree.
+                self._wl_dtype = mc.dtype
             else:
                 self.dcp_kv_replicated_heads = attn_kv_replicated(
                     attn_tp_size, total_kv
@@ -1651,6 +1655,15 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             k_full = cp_all_gather_heads_uneven(k, group, self.dcp_kv_head_counts)
             v_full = cp_all_gather_heads_uneven(v, group, self.dcp_kv_head_counts)
+        self._dcp_owner_write(layer, forward_batch, cache_loc, k_full, v_full)
+
+    def _dcp_owner_write(self, layer, forward_batch, cache_loc, k_full, v_full):
+        """Write the FULL (gathered/broadcast) replicated kv-heads to only the
+        token slots this rank OWNS, at the compacted physical slot. Shared by the
+        head-rank path (_dcp_masked_write, which projects + gathers k/v) and the
+        weightless KV-worker path (which receives k/v broadcast from the head
+        rank). The owner-rule + compact-slot mapping is identical for both, so it
+        lives here once (single source of truth)."""
         if self.uneven_dcp_weighted:
             # WEIGHTED owner rule: ownership + compact physical slot are derived
             # from the out_cache_loc itself (not the sequence position), so the
@@ -1704,6 +1717,52 @@ class FlashInferAttnBackend(AttentionBackend):
         # shards and slice back to this rank's [12/6/6] head shard.
         o = cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
         return o.reshape(-1, layer.tp_q_head_num * layer.head_dim).to(q.dtype)
+
+    def forward_decode_weightless_worker(self, layer, forward_batch):
+        """Weightless-KV WORKER dispatch for one full-attention layer (Option-B
+        B1). This rank holds NO layer weights and projects NOTHING; it owns only
+        a DCP token-shard of the KV. It contributes an empty [T,0,D] head slice
+        to every per-layer collective (so the head rank's Q/K/V broadcast and the
+        LSE-merge complete), writes the head's broadcast K,V into its owned KV
+        slots, and attends its local KV shard. The merged output is delivered to
+        the head rank only; this rank's slice is empty and discarded.
+
+        Issues the IDENTICAL dcp_group collective sequence as the head rank's
+        _forward_decode_dcp (KV all-gather x2, Q all-gather, LSE-merge) so the
+        two stay in lockstep; the anti-hang guard wraps each one."""
+        assert self.weightless_kv and not self.dcp_kv_replicated_heads
+        group = get_parallel().dcp_group
+        cache_loc = forward_batch.out_cache_loc
+        T = cache_loc.shape[0]
+        hd = layer.head_dim
+        dev = cache_loc.device
+        # 0-head local contributions (this worker projects nothing). Shapes are
+        # [T, 0, D] so the padded all-gather broadcasts the head rank's real Q/K/V.
+        zk = torch.zeros((T, 0, hd), dtype=self._wl_dtype, device=dev)
+        zv = torch.zeros((T, 0, hd), dtype=self._wl_dtype, device=dev)
+        zq = torch.zeros((T, 0, hd), dtype=self._wl_dtype, device=dev)
+        # (1)+(2) KV broadcast from the head rank -> full replicated kv-heads;
+        # then write only this rank's owned token slots (shared owner-rule).
+        k_full = cp_all_gather_heads_uneven(zk, group, self.dcp_kv_head_counts)
+        v_full = cp_all_gather_heads_uneven(zv, group, self.dcp_kv_head_counts)
+        self._dcp_owner_write(layer, forward_batch, cache_loc, k_full, v_full)
+        # (3) Q broadcast from the head rank -> q_full (all heads) on this rank.
+        q_full = cp_all_gather_heads_uneven(zq, group, self.dcp_q_head_counts)
+        # attend this rank's LOCAL KV token-shard -> partial o + lse (all heads).
+        decode_wrapper = self.forward_metadata.decode_wrappers[
+            self._get_wrapper_idx(layer)
+        ]
+        o, lse = decode_wrapper.forward_return_lse(
+            q_full,
+            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
+        # (4) LSE-merge: contribute this rank's partial; receive the empty
+        # [T,0,D] slice (the merged output goes to the head rank only).
+        cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
 
     def _replicated_kv_ragged_reindex(self, local_q, local_kv, device):
         """REPLICATED-KV geometry (#105): map each of this rank's LOCAL kv
