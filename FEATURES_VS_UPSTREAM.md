@@ -193,8 +193,9 @@ There are two kinds of GGUF work here: (1) **new architecture support** — besp
 that run families upstream cannot load on its fast path, on the fork's own fast GGUF path rather than
 the slow generic transformers GGUF loader; and (2) **architecture-general GGUF improvements**
 (uneven-TP sharding, the tuned K-quant kernel, the perf overhaul, the vec alignment below) that
-benefit **any** GGUF model. The bespoke adapters are still one-per-family (currently Qwen3.5/3.6 and
-Gemma-4 dense); a registry/family-table generalization is on the roadmap. Note that Gemma-4 is also
+benefit **any** GGUF model. The bespoke adapters (currently Qwen3.5/3.6 and Gemma-4 dense) have been
+generalized into a registry + per-family mapping tables (see the loader-generalization entry below),
+so a new family is now a small table module rather than a whole adapter. Note that Gemma-4 is also
 available via AutoRound-int4 / Marlin (see §5 and §7) — the GGUF path below is a separate, additional
 way to run it.
 
@@ -211,6 +212,18 @@ way to run it.
   *Impact: capability-add — a new model family on the fast GGUF path; throughput comparable to the
   existing bespoke GGUF path (single-GPU TP=1 in the tens-of-tok/s range for the 31B Q4). No effect on
   existing paths — gated to the gemma4 GGUF arch, the Qwen3.5 GGUF path is untouched.*
+- **GGUF loader generalization — registry + family tables (#129 S2) [landed, unpushed on `feat/gguf-loader-registry`]** —
+  an internal-architecture / extensibility change, not a perf or behavior change. The fast bespoke
+  loaders (Qwen3.5/3.6 + Gemma-4 dense) were refactored onto a shared `GGUFAdapterBase` that
+  generalizes only the quality/speed-neutral scaffolding — arch resolution, the tensor-name-map
+  skeleton, the F32 carve-out — while each family keeps its exact per-family transform body verbatim.
+  Adding a new GGUF family is now a small table+hooks module plus one registry line, instead of a whole
+  bespoke adapter.
+  *Impact: loader extensibility only — no capability or speed claim. Verified **byte-identical** for
+  both existing families (Qwen3.5/3.6 dense + Gemma-4): CPU exact (name-map + ordered transform-stream
+  digest unchanged) and GPU machine-zero (token / logprob identical to the pre-refactor loader).*
+  **Honest limit:** the base currently carries the trunk's older-style qwen35-MoE mapping; the
+  collective-stacked MoE variant re-applies later as a table edit, not a re-architecture.
   **Scope / limits (plainly):** dense only; Q4_K_M is the verified quant, other quants are structurally
   supported but unverified; MoE Gemma-4 (`_exps` tensors) is not yet supported and fails fast.
   **Launch requirements (avoid the traps):** Gemma-4 requires `--attention-backend triton` (flashinfer
@@ -479,10 +492,8 @@ Deliberately ordered by risk to output: **byte-identical speed/capacity gains fi
 - **122B-A10B-Int4 real run — done** — no longer roadmap: the 122B-A10B GPTQ-Int4 now runs on the
   3-card rig via the per-expert offload in §6 (composed with uneven-TP + uneven-DCP, CUDA-graph decode).
   Kept here only as a pointer to the shipped entry.
-- **GGUF loader generalization (registry / family tables) [planned]** — replace the current
-  one-bespoke-adapter-per-family GGUF loaders (Qwen3.5/3.6, Gemma-4 dense) with a registry + family
-  descriptor tables, so new GGUF families need data, not a new adapter. Gated on a Qwen3.5 byte-identity
-  check (the generalization must not regress the existing path).
+- **GGUF loader generalization (registry / family tables) — done** — no longer roadmap: shipped as
+  #129 S2 (see §4), byte-identity-verified for both existing families. Kept here only as a pointer.
 - **MoE Gemma-4 GGUF [planned]** — extend the Gemma-4 GGUF adapter to the MoE variant (`_exps` tensors),
   which the dense S1 loader currently rejects fail-fast.
 - **Upstream adaptive-spec PR review/port, tree-spec topk>1 on better interconnect, uneven-TP over
