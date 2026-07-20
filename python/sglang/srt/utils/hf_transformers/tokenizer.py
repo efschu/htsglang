@@ -144,18 +144,21 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
 
     if check_gguf_file(tokenizer_name):
         _ensure_gguf_version()
-        # Gemma-4 GGUFs cannot go through transformers' GGUF tokenizer path:
-        # AutoTokenizer(..., gguf_file=...) re-synthesizes the gemma4 config
-        # from the GGUF metadata and crashes on the per-layer
-        # num_key_value_heads list (same failure as config.py; see
-        # _peek_bespoke_gguf_arch). These checkpoints ship a sibling
-        # tokenizer.json/tokenizer_config.json, so load from the parent dir
-        # directly (NO gguf_file). Gated on gemma4 only — qwen35's existing
-        # gguf_file tokenizer path is left untouched.
+        # Bespoke-family GGUFs (qwen35/qwen35moe/gemma4) cannot go through
+        # transformers' GGUF tokenizer path: AutoTokenizer(..., gguf_file=...)
+        # re-synthesizes the config from the GGUF metadata and either rejects
+        # the arch outright (qwen35: "architecture qwen35 is not supported")
+        # or crashes on the per-layer num_key_value_heads list (gemma4) — the
+        # same failures config.py routes around via _peek_bespoke_gguf_arch.
+        # These checkpoints ship a sibling tokenizer.json/tokenizer_config.json,
+        # so load from the parent dir directly (NO gguf_file). Any bespoke arch
+        # WITH a sibling tokenizer uses this path; otherwise fall back to the
+        # transformers gguf_file path unchanged (non-bespoke GGUFs, or the rare
+        # bespoke export that ships no sibling tokenizer files).
         from .config import _peek_bespoke_gguf_arch
 
         parent = Path(tokenizer_name).parent
-        if _peek_bespoke_gguf_arch(tokenizer_name) == "gemma4" and (
+        if _peek_bespoke_gguf_arch(tokenizer_name) is not None and (
             (parent / "tokenizer.json").exists()
             or (parent / "tokenizer_config.json").exists()
         ):
