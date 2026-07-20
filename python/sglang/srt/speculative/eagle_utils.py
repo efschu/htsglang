@@ -763,13 +763,23 @@ def eagle_sample(
     # near-ties are common, and a single divergent accept desynchronizes
     # KV/recurrent state across ranks for the rest of the sequence.
     # Broadcast from rank 0 to ensure consistency.
-    tp_group = (
-        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
-    )
-    if tp_group.world_size > 1:
-        tp_group.broadcast(predict, src=0)
-        tp_group.broadcast(accept_index, src=0)
-        tp_group.broadcast(num_correct_drafts, src=0)
+    # #143 (D2): NOT on the weightless-KV fast lane -- eagle_sample runs on
+    # the HEAD rank only (the weightless workers bypass verify sampling), so
+    # this NCCL broadcast would hang against absent peers. There is exactly
+    # one sampling rank; the workers receive (accept_lens, accepted ids) over
+    # the lockstep gloo CPU channel in EAGLEWorkerV2 instead.
+    from sglang.srt.distributed.utils import weightless_kv_active
+
+    if not weightless_kv_active():
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement

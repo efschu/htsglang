@@ -1665,6 +1665,14 @@ class ModelRunnerKVCacheMixin:
                     uneven_dcp_kv_replicated(self.dcp_size) or weightless_kv_active()
                 ) and not _draft_non_dcp:
                     _hybrid_kv_head_num = self.model_config.get_total_num_kv_heads()
+                elif weightless_kv_active() and _draft_non_dcp:
+                    # #143: the lane's HEAD-LOCAL draft is built weight-TP=1
+                    # (full projections) and keeps its full-context replicated
+                    # pool -- so it stores ALL kv heads, not the ÷attn_tp_size
+                    # per-rank share (which fit the old uneven-TP head-sharded
+                    # draft, not this one). Head rank only; workers build no
+                    # draft pool.
+                    _hybrid_kv_head_num = self.model_config.get_total_num_kv_heads()
                 else:
                     _hybrid_kv_head_num = self.model_config.get_num_kv_heads(
                         get_parallel().attn_tp_size

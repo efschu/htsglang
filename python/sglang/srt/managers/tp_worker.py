@@ -307,12 +307,23 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
-        )[0]
+        if self.is_draft_worker and getattr(
+            server_args, "weightless_kv_fastlane", False
+        ):
+            # #143: the lane's DRAFT TpModelWorker exists on the head rank
+            # ONLY -- a cross-rank seed broadcast would hang (no worker-side
+            # counterpart). server_args.random_seed is resolved (randomized
+            # when unset) in ServerArgs before the schedulers fork, so every
+            # rank already holds the identical value the target's broadcast
+            # distributed.
+            self.random_seed = server_args.random_seed
+        else:
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                self.tp_size * self.pp_rank + tp_rank,
+                self.world_group.cpu_group,
+                src=self.world_group.ranks[0],
+            )[0]
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
@@ -555,6 +566,14 @@ class TpModelWorker(BaseTpWorker):
             # batch on the existing lockstep CPU channel; the head's matching
             # send is below. The per-layer NCCL collective count is untouched.
             if getattr(self.model_runner, "is_weightless_worker", False):
+                # #143 (D3): spec target-VERIFY forwards must NOT touch the
+                # per-forward B1 token broadcast -- the head's is_verify path
+                # returns before its matching send, so a worker-side recv here
+                # would block forever. The verify accept payload (accept_lens
+                # + accepted ids) travels over its own broadcast in the spec
+                # worker (EAGLEWorkerV2 _wl_worker_verify), AFTER this forward.
+                if is_verify:
+                    return batch_result
                 head_ids = broadcast_pyobj(
                     [],
                     self.tp_size * self.pp_rank + self.tp_rank,

@@ -1131,7 +1131,12 @@ class Scheduler(
             server_args=self.server_args,
         )
 
-        if self.spec_algorithm.carries_draft_hidden_states():
+        if (
+            self.spec_algorithm.carries_draft_hidden_states()
+            # #143 weightless-KV lane: a weightless worker rank has no draft
+            # (head-local draft) -> fall through to the minimal padding spec.
+            and getattr(self.draft_worker, "draft_worker", None) is not None
+        ):
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
             # worker, so a single accessor covers both shapes.
             draft_runner = self.draft_worker.draft_worker.draft_runner

@@ -184,6 +184,12 @@ class SchedulerBatchResultProcessor:
         head rank computes and streams logprobs. Always False on the default
         path (predicate requires --weightless-kv-fastlane)."""
         model_runner = getattr(self.model_worker, "model_runner", None)
+        if model_runner is None:
+            # #143: with chain spec on the lane, model_worker is the spec
+            # worker (EAGLEWorkerV2), which exposes the target through
+            # .target_worker instead of .model_runner.
+            target_worker = getattr(self.model_worker, "target_worker", None)
+            model_runner = getattr(target_worker, "model_runner", None)
         return model_runner is not None and getattr(
             model_runner, "is_weightless_worker", False
         )

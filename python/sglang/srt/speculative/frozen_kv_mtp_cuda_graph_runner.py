@@ -107,6 +107,10 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.enable_pdmux = False
         self.record_nolora_graph = False
         self.is_dllm = False
+        # Parent capture() reads this (#136a lane block-graph ladder);
+        # draft-side runners never take that path (#143: the lane's
+        # draft is head-local and not weightless-block-decoded).
+        self._wl_block_graph = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 

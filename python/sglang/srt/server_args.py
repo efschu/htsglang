@@ -3588,17 +3588,50 @@ class ServerArgs:
                 "Use --speculative-eagle-topk 1 (linear chain) if/when "
                 "speculative decoding is supported on the lane."
             )
-        # Stage 1 scope: NO speculative decoding (the MTP/NEXTN draft adds its
-        # own attention/DCP sites on the head rank that the weightless workers
-        # do not mirror).
+        # #143: CHAIN (topk == 1) speculative decoding IS supported on the
+        # lane for the EAGLE/NEXTN family. The draft is HEAD-LOCAL (built
+        # weight-TP=1 on the head rank only; workers build no draft), so the
+        # num_steps-1 draft forwards contribute ZERO cross-rank collectives;
+        # the only spec collective surface is the target-verify extend, which
+        # the workers already mirror (forward_extend_weightless_worker forces
+        # has_prefix=True for is_target_verify). Accept lengths + accepted
+        # token ids are synced to the workers over the lockstep gloo CPU
+        # channel (one broadcast per verify), never via NCCL.
+        # Everything OUTSIDE that validated surface stays hard-rejected:
+        # tree/branching (topk>1, rejected above), non-chain algorithms, and
+        # modes that change the draft/verify collective or scheduler surface.
         if self.speculative_algorithm is not None:
-            raise ValueError(
-                "--weightless-kv-fastlane (Stage 1) does not support "
-                "speculative decoding "
-                f"(--speculative-algorithm={self.speculative_algorithm}). Run "
-                "with speculative decoding OFF; the MTP draft dispatch is a "
-                "later stage."
-            )
+            # NEXTN resolves to EAGLE later (arg_groups/speculative_hook runs
+            # AFTER this handler), so accept the raw CLI spellings here.
+            _chain_algos = ("NEXTN", "EAGLE", "EAGLE3")
+            if self.speculative_algorithm.upper() not in _chain_algos:
+                raise ValueError(
+                    "--weightless-kv-fastlane supports chain speculative "
+                    "decoding only for the EAGLE/NEXTN family "
+                    f"(one of {_chain_algos}); got --speculative-algorithm="
+                    f"{self.speculative_algorithm}. NGRAM/STANDALONE/DFLASH/"
+                    "DSPARK and custom algorithms have draft/verify surfaces "
+                    "the weightless workers do not mirror."
+                )
+            if self.enable_multi_layer_eagle:
+                raise ValueError(
+                    "--weightless-kv-fastlane does not support "
+                    "--enable-multi-layer-eagle (per-step draft model runners "
+                    "are not part of the validated head-local draft path)."
+                )
+            if self.speculative_use_rejection_sampling:
+                raise ValueError(
+                    "--weightless-kv-fastlane does not support "
+                    "--speculative-use-rejection-sampling: the draft-probs "
+                    "relay is not mirrored on the weightless workers. Use "
+                    "the default target-only verify."
+                )
+            if self.speculative_adaptive:
+                raise ValueError(
+                    "--weightless-kv-fastlane does not support "
+                    "--speculative-adaptive (runtime step switching touches "
+                    "draft graph state that exists on the head rank only)."
+                )
         # Chunked prefill IS supported (#131): every chunk is a plain extend
         # forward mirrored by forward_extend_weightless_worker, branching on the
         # rank-uniform has_prefix (2 collectives for the first chunk, 4 for
@@ -3789,7 +3822,18 @@ class ServerArgs:
                     "1 (linear chain speculation), which is correct and "
                     "bitwise-deterministic under uneven-DCP."
                 )
-            if self.speculative_algorithm is not None and not uneven_weighted_dcp:
+            # #143: the weightless-KV fast lane supports CHAIN (topk == 1)
+            # EAGLE/NEXTN speculation -- the head-local draft adds zero DCP
+            # collectives and the target-verify extend is mirrored by the
+            # weightless workers. Its fine-grained checks (chain family only,
+            # no rejection sampling / adaptive / multi-layer) live in
+            # _handle_weightless_kv_fastlane, which runs right after this
+            # handler; topk > 1 stays rejected by the #76/#139 guard above.
+            if (
+                self.speculative_algorithm is not None
+                and not uneven_weighted_dcp
+                and not self.weightless_kv_fastlane
+            ):
                 raise ValueError(
                     "Decode context parallel (--dcp-size / "
                     "--decode-context-parallel-size > 1) on CUDA platform "
@@ -3798,7 +3842,9 @@ class ServerArgs:
                     "speculative decoding enabled. (The uneven-hybrid weighted "
                     "DCP path -- SGLANG_UNEVEN_DCP=1 + "
                     "SGLANG_UNEVEN_DCP_WEIGHTED=1 on a non-uniform "
-                    "--rank-tp-ratio -- is the only supported spec+DCP config.)"
+                    "--rank-tp-ratio -- and chain topk=1 EAGLE/NEXTN on "
+                    "--weightless-kv-fastlane are the only supported spec+DCP "
+                    "configs.)"
                 )
         else:
             raise ValueError(

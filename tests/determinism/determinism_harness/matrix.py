@@ -237,6 +237,60 @@ TEST_MATRIX: List[CaseSpec] = [
         ),
     ),
     CaseSpec(
+        case_id="weightless_chain_spec",
+        description=(
+            "Weightless lane with CHAIN (topk=1) NEXTN speculative decode "
+            "(#143: head-local draft, worker verify-mirror, gloo accept sync) "
+            "vs. the SAME lane without spec, greedy: the accepted-token "
+            "trajectory must be argmax-identical (0 flips) -- speculation is "
+            "lossless under greedy accept. The spec arm dumps the ACCEPTED "
+            "verify-logits rows (contextually identical to plain decode "
+            "forwards), so the standard DECODE_CLASS gate applies file-for-"
+            "file. Reference = lane-no-spec isolates spec from the lane's own "
+            "fp band (lane-vs-solo is covered by weightless_decode)."
+        ),
+        model_role="dense_lane",
+        test_config={
+            **_LANE_BASE,
+            "speculative_algorithm": "NEXTN",
+            "speculative_eagle_topk": 1,
+            "speculative_num_steps": 3,
+            "speculative_num_draft_tokens": 4,
+            # Bring-up bounds (see notes): explicit KV cap works around the
+            # spec x uneven-budget x hybrid-pool sizing overshoot; eager both
+            # arms until spec-verify-under-graphs is validated (separate
+            # capture surface, #143 follow-on).
+            "max_total_tokens": 32768,
+            "disable_cuda_graph": True,
+        },
+        test_env={},
+        reference_config={
+            **_LANE_BASE,
+            "max_total_tokens": 32768,
+            "disable_cuda_graph": True,
+        },
+        reference_env={},
+        expected_class=ByteIdentityClass.DECODE_CLASS,
+        num_decode_tokens=96,
+        band=24.0,
+        near_tie_margin=1.0,
+        needs_rerun=True,
+        quality_gate=(
+            "accept-rate > 0 (draft actually running head-local; from the "
+            "server accept-len log) + self-det 5/5 same-boot reruns"
+        ),
+        notes=(
+            "#143 chain-spec byte-gate. Band/margin inherited from the "
+            "weightless_decode calibration (same lane fp envelope; the "
+            "verify extend runs the same 3-collective/layer mirror as "
+            "decode). needs_rerun captures a same-boot rerun arm for the "
+            "run==run evidence (evaluated manually; DECODE_CLASS verdict "
+            "itself is ref-vs-test). KV pool capped via max_total_tokens: "
+            "unbounded sizing OOMs under spec x --rank-gpu-memory-mib on "
+            "this vehicle (sizing overshoot, open item)."
+        ),
+    ),
+    CaseSpec(
         case_id="fp8_offload",
         description=(
             "FP8-Triton MoE expert offload (token-wave processing, sorted-slot "

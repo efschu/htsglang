@@ -102,6 +102,22 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         kwargs=kwargs,
     )
 
+    # #143: the weightless-KV fast lane validates the raw CLI algorithm
+    # (NEXTN/EAGLE/EAGLE3) in _handle_weightless_kv_fastlane, which runs
+    # BEFORE this alias resolution. The Gemma4-assistant promotion
+    # (NEXTN/EAGLE -> FROZEN_KV_MTP) would silently swap in a worker class
+    # without the lane's head-local-draft path -- reject it here, after the
+    # promotion is known.
+    if (
+        getattr(server_args, "weightless_kv_fastlane", False)
+        and server_args.speculative_algorithm == "FROZEN_KV_MTP"
+    ):
+        raise ValueError(
+            "--weightless-kv-fastlane does not support FROZEN_KV_MTP "
+            "(Gemma4 assistant draft): only the EAGLE/NEXTN chain worker "
+            "has the head-local draft path on this lane."
+        )
+
     # Validate --speculative-draft-window-size once, regardless of algorithm.
     # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
     if server_args.speculative_draft_window_size is not None:

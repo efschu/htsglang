@@ -61,6 +61,11 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
+        # #143: rank-local captures (the lane's head-only draft graphs) skip
+        # the cross-rank warmup barrier in capture_one.
+        self._local_only_capture = bool(
+            getattr(cuda_graph_runner, "local_only_capture", False)
+        )
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -97,7 +102,15 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
         for _ in range(2):
             self._device_module.synchronize()
-            self._tp_group.barrier()
+            # #143 weightless-KV lane: the DRAFT graph capture runs on the
+            # head rank ONLY (the weightless workers build no draft), so the
+            # cross-rank warmup barrier has no counterpart and would hang the
+            # boot. Runners whose capture is rank-local set
+            # ``local_only_capture`` (default False -> unchanged pairing for
+            # every multi-rank capture, including the lane's symmetric
+            # target-verify capture).
+            if not self._local_only_capture:
+                self._tp_group.barrier()
             forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()

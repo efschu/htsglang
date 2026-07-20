@@ -273,9 +273,20 @@ def _local_attn_head_counts(model_runner: "ModelRunner") -> tuple:
     from sglang.srt.distributed.utils import (
         attn_q_partition_groups,
         attn_q_partition_units,
+        weightless_kv_active,
     )
 
     mc = model_runner.model_config
+
+    # #143 weightless-KV fast lane: the spec DRAFT is HEAD-LOCAL and built
+    # weight-TP=1 (full projections, no sharding), so its q/k/v tensors carry
+    # ALL heads regardless of the process-global attn_tp geometry. Plan the
+    # draft's wrappers (and its full-context replicated KV pool) with the
+    # full counts. Only ever reached on the head rank (workers build no
+    # draft); no-op on every other configuration.
+    if weightless_kv_active() and getattr(model_runner, "is_draft_worker", False):
+        return mc.num_attention_heads, mc.get_total_num_kv_heads()
+
     tp_size = get_parallel().attn_tp_size
     tp_rank = get_parallel().attn_tp_rank
     _total_kv = mc.get_total_num_kv_heads()

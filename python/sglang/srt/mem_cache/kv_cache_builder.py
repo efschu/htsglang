@@ -55,6 +55,11 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None
 
+    # #143 weightless-KV fast lane: a weightless worker rank builds NO draft
+    # (the draft is head-local); it has no draft KV pool.
+    if getattr(draft_worker, "draft_worker", None) is None:
+        return None
+
     # V2 workers nest the draft runner under `.draft_worker`.
     if server_args.enable_multi_layer_eagle:
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]

@@ -1151,7 +1151,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         (``init_forward_metadata_out_graph(in_capture=True)`` installs the decode
         cuda-graph wrappers onto ``forward_metadata``); the recorded body only
         runs the capturable per-layer dispatch. No logits, no sampling, no
-        capture-tail hooks, no autotune (the lane forbids speculative decode).
+        capture-tail hooks, no autotune.
+        #143 chain spec: with speculative decoding on the lane the capture
+        batches are TARGET_VERIFY-shaped (num_tokens_per_bs = draft tokens) on
+        EVERY rank, so the worker records the verify-extend mirror
+        (``forward_extend_weightless_worker``, has_prefix forced -> fused-KV +
+        Q + LSE-merge = 3 collectives/layer) to pair with the head's captured
+        verify forward; without spec it records the plain decode dispatch (4
+        collectives/layer) exactly as before.
         The guard is already disabled for the whole capture (see ``capture``)."""
         num_tokens = size * self.num_tokens_per_bs
         bs = size
@@ -1184,8 +1191,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     forward_batch.global_num_tokens_cpu,
                 )
                 set_is_extend_in_batch(False)
+                # #143: dispatch by capture mode -- TARGET_VERIFY (chain spec)
+                # records the verify-extend mirror, plain decode records the
+                # decode dispatch (see docstring).
+                if forward_batch.forward_mode.is_target_verify():
+                    wl_dispatch = wl_attn.forward_extend_weightless_worker
+                else:
+                    wl_dispatch = wl_attn.forward_decode_weightless_worker
                 for layer in model_runner._weightless_attn_layers():
-                    wl_attn.forward_decode_weightless_worker(layer, forward_batch)
+                    wl_dispatch(layer, forward_batch)
                 # Sentinel output: the worker produces no logits. The backend
                 # stores this (None) and returns it from replay; execute() maps
                 # a None replay output to a logits-free ModelRunnerOutput.

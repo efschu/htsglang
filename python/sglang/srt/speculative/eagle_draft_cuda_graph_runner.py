@@ -136,6 +136,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.enable_pdmux = False
         self.record_nolora_graph = False
         self.is_dllm = False
+        # Parent capture() reads this (#136a lane block-graph ladder);
+        # draft-side runners never take that path (#143: the lane's
+        # draft is head-local and not weightless-block-decoded).
+        self._wl_block_graph = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
@@ -260,6 +264,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.buffers.share_buffers()
 
+        # #143 weightless-KV lane: this draft runner exists on the head rank
+        # ONLY (workers build no draft) -- its capture must not join the
+        # cross-rank warmup barrier (full_cuda_graph_backend.capture_one).
+        from sglang.srt.distributed.utils import weightless_kv_active
+
+        self.local_only_capture = weightless_kv_active()
         self.backend = resolve_decode_backend(self)
 
         # Capture

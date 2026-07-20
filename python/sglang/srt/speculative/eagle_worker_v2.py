@@ -134,7 +134,17 @@ def _broadcast_draft_picks(*tensors: Optional[torch.Tensor]) -> None:
     eagle_utils.eagle_sample.
     """
     from sglang.srt.distributed import get_tp_group
+    from sglang.srt.distributed.utils import weightless_kv_active
     from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+    if weightless_kv_active():
+        # #143 (D2): on the weightless-KV fast lane the draft is HEAD-LOCAL
+        # (weight-TP=1 on the head rank; the weightless workers run no draft
+        # at all), so there is no second rank computing a divergent pick to
+        # sync -- and the workers never reach this call, so the head's NCCL
+        # broadcast would hang against absent peers. The verify accept result
+        # reaches the workers via the lockstep gloo CPU channel instead.
+        return
 
     tp_group = (
         get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
@@ -1185,17 +1195,30 @@ class EAGLEWorkerV2(BaseSpecWorker):
             context_length=target_worker.model_runner.model_config.context_len,
         )
 
-        self._draft_worker = EagleDraftWorker(
-            server_args,
-            gpu_id,
-            tp_rank,
-            dp_rank,
-            moe_ep_rank,
-            attn_cp_rank,
-            moe_dp_rank,
-            nccl_port,
-            target_worker,
-        )
+        # #143: weightless-KV fast lane chain-spec roles. The draft model is
+        # HEAD-LOCAL: the head rank builds it weight-TP=1 (full weights, zero
+        # draft-forward collectives); the weightless workers build NO draft at
+        # all and route every generation forward through the worker mirror
+        # (_wl_worker_verify / the extend stub) instead of draft()/verify().
+        _wl_lane = getattr(server_args, "weightless_kv_fastlane", False)
+        _wl_head_rank = getattr(server_args, "weightless_kv_head_rank", 0)
+        self._wl_is_head = _wl_lane and tp_rank == _wl_head_rank
+        self._wl_is_worker = _wl_lane and tp_rank != _wl_head_rank
+
+        if self._wl_is_worker:
+            self._draft_worker = None
+        else:
+            self._draft_worker = EagleDraftWorker(
+                server_args,
+                gpu_id,
+                tp_rank,
+                dp_rank,
+                moe_ep_rank,
+                attn_cp_rank,
+                moe_dp_rank,
+                nccl_port,
+                target_worker,
+            )
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -1218,12 +1241,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def war_fastpath_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
         # draft_extend, which runs on the draft runner.
+        if self._draft_worker is None:
+            # #143 weightless worker: no draft; the last shared-buffer-reading
+            # phase is the target-verify mirror on the target runner.
+            return self._target_worker.model_runner
         return self._draft_worker.draft_runner
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
+        if self._draft_worker is None:
+            # #143 weightless worker: only the target's verify mirror runs here.
+            return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
             self._draft_worker.draft_attn_backend,
@@ -1237,16 +1267,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        self._draft_worker.alloc_memory_pool(
-            memory_pool_config, req_to_token_pool, token_to_kv_pool_allocator
-        )
+        if self._draft_worker is not None:
+            self._draft_worker.alloc_memory_pool(
+                memory_pool_config, req_to_token_pool, token_to_kv_pool_allocator
+            )
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
     def init_attention_backends(self):
-        self._draft_worker.init_attention_backends()
+        if self._draft_worker is not None:
+            self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
+        if self._draft_worker is None:
+            # #143 weightless worker: no draft to capture.
+            return
         self._draft_worker.init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
@@ -1307,6 +1342,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
+            if self._wl_is_worker:
+                # #143 weightless worker: the target extend mirror above
+                # already ran (and received the head's sampled tokens over the
+                # B1 broadcast). There is no draft on this rank -- skip
+                # draft-extend and hand the scheduler a shape-valid stub
+                # draft input (its topk/hidden relay values are never read on
+                # this rank; the worker verify path builds its own synthetic
+                # chain verify input each step).
+                batch_output.next_draft_input = self._wl_stub_draft_input(
+                    batch_output.next_token_ids
+                )
+                return batch_output
+
             # Draft prefill
             with (
                 self.draft_worker.draft_tp_context(
@@ -1326,6 +1374,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
+            if self._wl_is_worker:
+                # #143 weightless worker: bypass draft entirely (0 collectives
+                # on the head's draft forwards -> nothing to mirror), run ONLY
+                # the target-verify mirror, then consume the head's
+                # (accept_lens, accepted ids) broadcast.
+                return self._wl_worker_verify(batch, on_publish)
+
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
             if batch.spec_info is None:
@@ -1382,6 +1437,159 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             return batch_output
+
+    # ------------------------------------------------------------------
+    # #143: weightless-KV fast lane, WORKER-side chain-spec mirror.
+    #
+    # The draft is head-local (0 collectives), so a weightless worker's whole
+    # spec step is: (1) mirror the target-verify extend (the ONLY cross-rank
+    # collective surface of the step -- identical per-layer sequence to the
+    # head via forward_extend_weightless_worker), then (2) consume the head's
+    # (accept_lens, accepted ids) gloo broadcast and advance scheduler state
+    # identically. Everything here must stay DETERMINISTIC and rank-uniform:
+    # the synthetic verify input below is a pure function of (bs, seq_lens,
+    # num_draft_tokens), so out_cache_loc / kv-owner writes match the head's
+    # slot-for-slot.
+    # ------------------------------------------------------------------
+
+    def _wl_stub_draft_input(self, next_token_ids: torch.Tensor) -> EagleDraftInput:
+        """Shape-valid EagleDraftInput stub for a weightless worker rank.
+
+        Only ``bonus_tokens`` carries real data (the head's sampled/accepted
+        tokens); topk_p / topk_index are zero placeholders sized for the
+        overlap FutureMap relay. No draft ever reads them on this rank -- the
+        worker verify path rebuilds its synthetic chain verify input from
+        scratch each step.
+        """
+        bs = int(next_token_ids.shape[0]) if next_token_ids is not None else 0
+        device = self.device
+        return EagleDraftInput(
+            bonus_tokens=next_token_ids.to(torch.int32),
+            topk_p=torch.zeros((bs, self.topk), dtype=torch.float32, device=device),
+            topk_index=torch.zeros((bs, self.topk), dtype=torch.int64, device=device),
+        )
+
+    def _wl_build_chain_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
+        """Synthetic topk=1 CHAIN EagleVerifyInput for the worker mirror.
+
+        The worker never embeds tokens, never samples, and its uneven-DCP
+        verify metadata path (call_begin_forward EAGLE_VERIFY branch) reads
+        only ``spec_input_type`` + ``draft_token_num`` -- token VALUES and the
+        retrieve_* topology are head-only concerns, so zeros / canonical chain
+        stubs are exact here. Positions mirror the head's chain layout
+        (seq_lens + [0..d)) for completeness (no RoPE runs on this rank).
+        """
+        d = self.speculative_num_draft_tokens
+        if batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                self.topk, self.speculative_num_steps, d, self.device
+            )
+        bs = batch.seq_lens.shape[0]
+        device = self.device
+        positions = (
+            batch.seq_lens.to(torch.int64).unsqueeze(1)
+            + torch.arange(d, dtype=torch.int64, device=device)
+        ).flatten()
+        retrieve_index = torch.arange(
+            bs * d, dtype=torch.long, device=device
+        ).view(bs, d)
+        chain_next = torch.arange(1, d + 1, dtype=torch.long, device=device)
+        chain_next[-1] = -1
+        retrieve_next_token = chain_next.unsqueeze(0).expand(bs, d).contiguous()
+        return EagleVerifyInput(
+            draft_token=torch.zeros((bs * d,), dtype=torch.int64, device=device),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
+            positions=positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=torch.full(
+                (bs, d), -1, dtype=torch.long, device=device
+            ),
+            retrieve_cum_len=None,
+            spec_steps=self.speculative_num_steps,
+            topk=self.topk,
+            draft_token_num=d,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            seq_lens_sum=None,
+            seq_lens_cpu=None,
+        )
+
+    def _wl_worker_verify(self, batch: ScheduleBatch, on_publish=None):
+        """Weightless worker generation step under chain spec (see banner)."""
+        from sglang.srt.utils.common import broadcast_pyobj
+
+        verify_input = self._wl_build_chain_verify_input(batch)
+        verify_input.num_tokens_per_req = self.speculative_num_steps + 1
+        batch.spec_info = verify_input
+
+        # Same allocator-free req_to_token reads + ForwardBatch build as the
+        # head (assign_extend_cache_locs is a pure function of shared state).
+        verify_forward_batch, _ = eagle_prepare_for_verify(
+            verify_input,
+            self.req_to_token_pool,
+            batch,
+            self.target_worker,
+        )
+
+        # The verify-extend mirror: per-layer fused-KV gather + Q gather +
+        # LSE-merge, in lockstep with the head's target-verify forward.
+        self.target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+        )
+
+        # Consume the head's verify result (sent in verify() right after
+        # eagle_sample). One gloo broadcast per generation batch.
+        accept_lens_list, predict_list = broadcast_pyobj(
+            [],
+            self.tp_rank,
+            self.target_worker.world_group.cpu_group,
+            src=self.target_worker.world_group.ranks[
+                self.server_args.weightless_kv_head_rank
+            ],
+        )
+
+        device = self.device
+        bs = len(accept_lens_list)
+        stride = self.speculative_num_draft_tokens
+        accept_lens = torch.tensor(
+            accept_lens_list, dtype=torch.int32, device=device
+        )
+        predict = torch.tensor(predict_list, dtype=torch.int32, device=device)
+        new_seq_lens = batch.seq_lens + accept_lens
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+
+        # Chain bonus token = last accepted token of each req's front chain
+        # (computed on CPU from the broadcast lists -- deterministic ints).
+        if bs > 0:
+            bonus_list = [
+                predict_list[i * stride + accept_lens_list[i] - 1]
+                for i in range(bs)
+            ]
+            bonus_tokens = torch.tensor(
+                bonus_list, dtype=torch.int32, device=device
+            )
+        else:
+            bonus_tokens = torch.empty((0,), dtype=torch.int32, device=device)
+
+        next_draft_input = EagleDraftInput(
+            bonus_tokens=bonus_tokens,
+            topk_p=torch.zeros((bs, self.topk), dtype=torch.float32, device=device),
+            topk_index=torch.zeros((bs, self.topk), dtype=torch.int64, device=device),
+        )
+
+        return GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=predict,
+            can_run_cuda_graph=False,
+            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            next_draft_input=next_draft_input,
+            accept_lens=accept_lens,
+            new_seq_lens=new_seq_lens,
+            extra_keep_alive_refs=[verify_forward_batch],
+        )
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.
@@ -1764,6 +1972,42 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
+
+        # #143 (weightless-KV fast lane, head rank): publish the verify result
+        # to the weightless workers over the lockstep gloo CPU channel -- ONE
+        # broadcast per generation batch, outside any NCCL collective. The
+        # workers block on this right after their target-verify mirror
+        # (_wl_worker_verify); without it a token-dependent finish (EOS/stop)
+        # or the per-req accept length would desync the lockstep schedulers
+        # into a permanent DCP hang. topk == 1 (chain) only: `predict` is
+        # already in its final front-chain layout here (the topk > 1
+        # compaction below never runs on the lane -- tree spec is rejected).
+        if self._wl_is_head:
+            from sglang.srt.utils.common import broadcast_pyobj
+
+            broadcast_pyobj(
+                [accept_lens.tolist(), predict.tolist()],
+                self.tp_rank,
+                self.target_worker.world_group.cpu_group,
+                src=self.target_worker.world_group.ranks[
+                    self.server_args.weightless_kv_head_rank
+                ],
+            )
+
+        # #124/#143 debug dump surface (default off): for a topk=1 chain,
+        # verify-logits row i is contextually identical to the i-th plain
+        # decode forward, so dumping the ACCEPTED rows aligns the spec run's
+        # trajectory file-for-file with a no-spec reference for the byte-gate.
+        if (
+            self.server_args.determinism_logits_dump_dir is not None
+            and self.topk == 1
+            and bs == 1
+            and not batch.forward_mode.is_idle()
+            and logits_output.next_token_logits is not None
+        ):
+            self.target_worker.model_runner.determinism_dump_accepted_verify_rows(
+                logits_output.next_token_logits, int(accept_lens[0].item())
+            )
         clear_unaccepted_c128 = getattr(
             self.token_to_kv_pool_allocator.get_kvcache(),
             "clear_unaccepted_c128_draft_states",

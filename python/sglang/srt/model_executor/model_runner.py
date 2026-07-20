@@ -375,8 +375,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # they are no-ops on the default path (fast lane off).
         _wl_fastlane = getattr(server_args, "weightless_kv_fastlane", False)
         _wl_head = getattr(server_args, "weightless_kv_head_rank", 0)
-        self.is_weightless_head = _wl_fastlane and self.tp_rank == _wl_head
-        self.is_weightless_worker = _wl_fastlane and self.tp_rank != _wl_head
+        # #143: the SPEC DRAFT runner on the lane is neither the weightless
+        # head nor a weightless worker -- it is a HEAD-LOCAL model (built
+        # weight-TP=1 on the head rank only; the weightless workers build no
+        # draft at all). Without this guard the draft runner would inherit
+        # is_weightless_worker on the workers (meta model + stripped forward
+        # asserting a weightless attn backend the draft does not have) and
+        # is_weightless_head head-side behaviors (B1 token broadcast, guard
+        # resets) it must not take part in. _wl_draft_head_full keeps exactly
+        # the two build-time behaviors the head draft DOES need: the
+        # weight-TP=1 full build override and skipping the load-time tp-group
+        # barrier (which the workers would never join).
+        self.is_weightless_head = (
+            _wl_fastlane and self.tp_rank == _wl_head and not is_draft_worker
+        )
+        self.is_weightless_worker = (
+            _wl_fastlane and self.tp_rank != _wl_head and not is_draft_worker
+        )
+        self._wl_draft_head_full = _wl_fastlane and is_draft_worker
         if self.is_weightless_worker:
             logger.info(
                 "Weightless-KV fast lane: rank %d is a WEIGHTLESS KV worker "
@@ -1380,7 +1396,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1 and not uneven_memory,
+            # #143: the lane's head-only draft runner must not join the
+            # cross-rank min-reduce (the workers build no draft to pair it).
+            distributed=get_world_group().world_size > 1
+            and not uneven_memory
+            and not self._wl_draft_head_full,
             cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()
@@ -1652,7 +1672,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     attn_tp_size=1,
                     attn_tp_rank=0,
                 )
-                if (self.is_weightless_head or self.is_weightless_worker)
+                if (
+                    self.is_weightless_head
+                    or self.is_weightless_worker
+                    # #143: the lane's head-local DRAFT builds full (TP=1)
+                    # exactly like the head's target model -- no weight
+                    # sharding, no FFN/residual all-reduce -> the draft
+                    # forwards issue ZERO collectives (kills desync axis D1).
+                    or self._wl_draft_head_full
+                )
                 else contextlib.nullcontext()
             )
             with _wl_build_ctx:
@@ -1802,7 +1830,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 logger,
             )
 
-        if self.server_args.elastic_ep_backend == "mooncake":
+        if self._wl_draft_head_full:
+            # #143: the lane's DRAFT loads on the head rank ONLY (the
+            # weightless workers construct no draft), so this tp-group barrier
+            # has no counterpart on the other ranks -- joining it would hang
+            # the boot. The draft load is head-local; nothing to synchronize.
+            pass
+        elif self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
             dist.barrier(group=get_tp_group().cpu_group)
         else:
@@ -3650,6 +3684,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             tmp_path,
         )
         os.replace(tmp_path, path)
+
+    def determinism_dump_accepted_verify_rows(
+        self,
+        next_token_logits: torch.Tensor,
+        accept_len: int,
+    ) -> None:
+        """#124 dump surface for CHAIN speculative decode (#143).
+
+        For a single-sequence topk=1 chain verify, row i of the verify logits
+        is the target's next-token distribution after the committed prefix +
+        the first i accepted tokens -- contextually IDENTICAL to the i-th
+        plain decode forward of a no-spec run. Dumping rows 0..accept_len-1
+        (one per emitted token, in emission order, mode='decode') therefore
+        aligns the spec run's trajectory file-for-file with a no-spec
+        reference, so the existing DECODE_CLASS gate (argmax-identity + fp
+        band) applies unchanged. Debug-only (dump dir default off).
+        """
+        if next_token_logits is None:
+            return
+        dump_dir = self.server_args.determinism_logits_dump_dir
+        for i in range(accept_len):
+            step = getattr(self, "_determinism_dump_counter", 0)
+            self._determinism_dump_counter = step + 1
+            path = os.path.join(
+                dump_dir, f"rank{self.tp_rank}_step{step:07d}.pt"
+            )
+            tmp_path = path + ".tmp"
+            torch.save(
+                {
+                    "step": step,
+                    "mode": "decode",
+                    "logits": next_token_logits[i].detach().to("cpu", copy=True),
+                },
+                tmp_path,
+            )
+            os.replace(tmp_path, path)
 
     def compute_logprobs_only(
         self,
