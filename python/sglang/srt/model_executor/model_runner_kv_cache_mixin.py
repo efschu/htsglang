@@ -2383,13 +2383,25 @@ class ModelRunnerKVCacheMixin:
             )
 
     def _maybe_suggest_dcp_token_vector(
-        self: ModelRunner, budget_bytes: int
+        self: ModelRunner, budget_bytes: int, allow_install: bool = False
     ) -> None:
         """Uneven-DCP token-vector self-calibration (analogue of vLLM's
         VLLM_UNEVEN_TOKEN_VECTOR): after the rank-local KV profiling, derive
         the OPTIMAL token-axis split vector from each rank's ACTUAL profiled
         token capacity P_r (not the rough pre-boot budget estimate) and, if it
         differs from the active vector, log a restart hint.
+
+        --rank-kv-ratio capacity (task #88, ``allow_install=True`` from the
+        pre-pool sizing path only): INSTALL the measured optimal vector
+        instead of hinting — one-boot convergence of the decoupled KV-token
+        ownership. Safe exactly here because nothing has snapshotted the
+        vector yet (pools, allocator, attention backends and CUDA graphs are
+        all built afterwards); the post-capture resize pass must stay
+        hint-only (the vector is frozen by then). Suppressed by an explicit
+        pin (SGLANG_UNEVEN_TOKEN_VECTOR env or a --rank-kv-ratio vector) and
+        for the draft worker. The install decision is rank-uniform (server
+        args + the all-gathered P_r), so every rank installs the identical
+        vector — the same determinism invariant as the hint path.
 
         Under the weighted owner rule the reported context budget is
         C = min_r(P_r // ratio_r) * sum(ratios); it is maximized when the
@@ -2473,6 +2485,45 @@ class ModelRunnerKVCacheMixin:
 
         c_active = _context_budget(active)
         c_optimal = _context_budget(optimal)
+
+        # --rank-kv-ratio capacity: install the measured vector (rank-uniform
+        # decision: server args + gathered P_r only). An explicit pin (env
+        # vector or flag list) and the draft worker keep hint-only semantics.
+        install = (
+            allow_install
+            and self.server_args.uneven_kv_capacity_mode()
+            and not envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()
+            and not self.is_draft_worker
+        )
+        if install:
+            from sglang.srt.distributed.utils import set_cp_token_ratios
+
+            if optimal != active and c_optimal > c_active:
+                set_cp_token_ratios(optimal)
+                if self.tp_rank == 0:
+                    logger.info(
+                        "Uneven DCP capacity mode (--rank-kv-ratio capacity): "
+                        "installed measured KV-token ownership vector %s "
+                        "(pre-boot estimate was %s), raising "
+                        "max_total_num_tokens from %d to ~%d (per-rank "
+                        "profiled capacity %s).",
+                        optimal,
+                        active,
+                        c_active,
+                        c_optimal,
+                        p_by_rank,
+                    )
+            elif self.tp_rank == 0:
+                logger.info(
+                    "Uneven DCP capacity mode (--rank-kv-ratio capacity): "
+                    "pre-boot estimate %s already capacity-optimal "
+                    "(max_total_num_tokens=%d, per-rank profiled capacity "
+                    "%s).",
+                    active,
+                    c_active,
+                    p_by_rank,
+                )
+            return
 
         if self.tp_rank == 0:
             if optimal == active or c_optimal <= c_active:
@@ -2601,7 +2652,18 @@ class ModelRunnerKVCacheMixin:
             # with post-capture sizing the (more accurate) post-capture
             # measurement runs it instead.
             self._maybe_suggest_mlp_rebalance(available_bytes)
-            self._maybe_suggest_dcp_token_vector(available_bytes)
+            self._maybe_suggest_dcp_token_vector(
+                available_bytes, allow_install=True
+            )
+        elif self.server_args.uneven_kv_capacity_mode():
+            # --rank-kv-ratio capacity with post-capture sizing planned: the
+            # token vector must be FINAL before pools/backends/graphs
+            # snapshot it, so the measured install runs on the pre-capture
+            # profiling here; the post-capture pass stays hint-only (any
+            # residual delta shows up as the usual restart hint).
+            self._maybe_suggest_dcp_token_vector(
+                available_bytes, allow_install=True
+            )
         config = self._config_from_budget(available_bytes)
         config.max_running_requests = self._resolve_max_num_reqs(
             config.max_total_num_tokens
