@@ -1701,8 +1701,21 @@ class FlashInferAttnBackend(AttentionBackend):
         if self.dcp_kv_replicated_heads:
             k_full, v_full = k, v
         else:
-            k_full = cp_all_gather_heads_uneven(k, group, self.dcp_kv_head_counts)
-            v_full = cp_all_gather_heads_uneven(v, group, self.dcp_kv_head_counts)
+            # #132 Fusion 1: gather the k and v head-shards in ONE all-gather
+            # instead of two. k and v share dcp_kv_head_counts, so stacking them
+            # along the row dim (dim 0) and gathering along the head dim (dim 1)
+            # produces per-tensor results IDENTICAL to two separate gathers --
+            # pure data movement, NO reduction -> BYTE-IDENTICAL -- while halving
+            # the kv all-gather launches on the latency-bound decode critical
+            # path (5 -> 4 collectives/attn-layer; Stage-0 measured collectives at
+            # ~64% of attention GPU time / ~38% of graph decode wall). Replicated-
+            # KV (e.g. 122B, 2<3) skips A entirely, so this path never runs there.
+            n = k.shape[0]
+            kv_full = cp_all_gather_heads_uneven(
+                torch.cat((k, v), dim=0), group, self.dcp_kv_head_counts
+            )
+            k_full = kv_full[:n]
+            v_full = kv_full[n:]
         if self.uneven_dcp_weighted:
             # WEIGHTED owner rule: ownership + compact physical slot are derived
             # from the out_cache_loc itself (not the sequence position), so the
