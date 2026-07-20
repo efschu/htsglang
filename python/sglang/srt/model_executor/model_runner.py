@@ -3595,6 +3595,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Returns:
             A list of next_token_ids
         """
+        if self.server_args.determinism_logits_dump_dir is not None:
+            self._determinism_dump_logits(logits_output, forward_batch)
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens
@@ -3613,6 +3615,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
         return next_token_ids
+
+    def _determinism_dump_logits(
+        self,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """DEBUG surface for the #124 determinism harness (tests/determinism).
+
+        Dumps this rank's next-token logits row for single-sequence batches as
+        a sequentially numbered ``torch.save`` file, with the dtype exactly as
+        served by the model / CUDA-graph output and captured BEFORE
+        ``_preprocess_logits`` (the machine-zero byte-identity classes are
+        dtype-strict). Guarded by ``--determinism-logits-dump-dir`` (default
+        off, so the default serving path is untouched). Files are written
+        atomically (tmp + rename) so a reader never sees a partial row.
+        """
+        logits = logits_output.next_token_logits
+        if logits is None or logits.shape[0] != 1:
+            return
+        dump_dir = self.server_args.determinism_logits_dump_dir
+        os.makedirs(dump_dir, exist_ok=True)
+        step = getattr(self, "_determinism_dump_counter", 0)
+        self._determinism_dump_counter = step + 1
+        mode = "decode" if forward_batch.forward_mode.is_decode() else "extend"
+        path = os.path.join(dump_dir, f"rank{self.tp_rank}_step{step:07d}.pt")
+        tmp_path = path + ".tmp"
+        torch.save(
+            {
+                "step": step,
+                "mode": mode,
+                "logits": logits[0].detach().to("cpu", copy=True),
+            },
+            tmp_path,
+        )
+        os.replace(tmp_path, path)
 
     def compute_logprobs_only(
         self,
