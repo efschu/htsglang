@@ -50,6 +50,7 @@ __all__ = [
     "plan_from_payload",
     "issue_from_payload",
     "matrix_from_payload",
+    "landscape_from_payload",
     "list_profiles",
     "serve",
 ]
@@ -460,6 +461,56 @@ def matrix_from_payload(payload: dict) -> dict:
     }
 
 
+def landscape_from_payload(payload: dict) -> dict:
+    """Build a Mode-A (model, quant) landscape (design §5B.3): measured store
+    rows (preferred) + planner feasibility rows for the composed rigs. The
+    measured perf/energy columns stay empty until the energy module (S2.5)."""
+    import dataclasses as _dc
+
+    from sglang.srt.planner.landscape import build_mode_a
+    from sglang.srt.planner.model import resolve_model_ref
+    from sglang.srt.planner.profiles import ProfileLibrary, compose_rig
+    from sglang.srt.planner.results_store import QuantDescriptor, ResultsStore
+
+    try:
+        model_path = resolve_model_ref(payload["model"])
+    except (ValueError, KeyError) as e:
+        return {"ok": False, "error": f"model: {e}"}
+    model_label = payload.get("model_label") or payload["model"].rstrip(
+        "/"
+    ).rsplit("/", 1)[-1]
+    quant = QuantDescriptor.parse(payload.get("quant", "bf16"))
+
+    store = ResultsStore()
+    store_path = payload.get("results_store")
+    if store_path:
+        try:
+            store = ResultsStore.load(store_path)
+        except Exception as e:
+            return {"ok": False, "error": f"results store: {e}"}
+
+    lib = ProfileLibrary()
+    planner_rigs = []
+    for r in payload.get("rigs", []):
+        try:
+            planner_rigs.append(
+                (model_path, compose_rig(r["profiles"], library=lib))
+            )
+        except (KeyError, ValueError) as e:
+            return {"ok": False, "error": f"rig {r.get('name')!r}: {e}"}
+
+    ls = build_mode_a(
+        model_label,
+        quant,
+        store=store,
+        planner_rigs=planner_rigs,
+        bucket=payload.get("bucket"),
+        similar=bool(payload.get("similar")),
+    )
+    out = _dc.asdict(ls)
+    return {"ok": True, "landscape": out}
+
+
 # ===========================================================================
 # HTTP server (stdlib only; same shape as the rig-dashboard).
 # ===========================================================================
@@ -515,6 +566,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/matrix"):
                 self._json(200, matrix_from_payload(payload))
+                return
+            if self.path.startswith("/api/landscape"):
+                self._json(200, landscape_from_payload(payload))
                 return
         except Exception as e:  # pragma: no cover - defensive
             self._json(500, {"error": str(e)})
@@ -608,6 +662,37 @@ INDEX_HTML = r"""<!doctype html>
 <div class="tabs">
   <button id="tab_plan" class="tab active" onclick="showTab('plan')">Plan a model</button>
   <button id="tab_explore" class="tab" onclick="showTab('explore')">Explore rigs (matrix)</button>
+  <button id="tab_landscape" class="tab" onclick="showTab('landscape')">Landscape (benchmark DB)</button>
+</div>
+
+<div id="view_landscape" style="display:none">
+  <div class="sub">Per (model, quant): measured cross-rig spread (Mode A).
+    <b>Measured</b> rows come from a results.jsonl of real runs; the rest are
+    planner/composed <b>feasibility estimates</b>. Perf/energy columns are
+    MEASURED-only &mdash; empty until the energy module (S2.5); no number is
+    invented.</div>
+  <div class="cols">
+    <div>
+      <fieldset>
+        <legend>model + quant</legend>
+        <label>Model (path / HF id)</label>
+        <input id="ls_model" placeholder="/path/to/Qwen3.6-27B-AWQ">
+        <label>quant descriptor</label>
+        <input id="ls_quant" placeholder="4b/AWQ/g128 | Q4_K_M | fp8">
+        <label>efficiency bucket (batch size)</label>
+        <input id="ls_bucket" placeholder="(optional, e.g. 16)">
+        <label>results.jsonl (measured; optional)</label>
+        <input id="ls_store" placeholder="(path to a measured store)">
+        <label><input type="checkbox" id="ls_similar" style="width:auto"> similar-quant (by bits — approximate)</label>
+      </fieldset>
+      <fieldset>
+        <legend>rigs to feasibility-check (NAME=profile,profile,...)</legend>
+        <textarea id="ls_rigs" rows="4" placeholder="hetero=RTX 5090,RTX 3080 20GB,RTX 3080 20GB&#10;4x4090=RTX 4090,RTX 4090,RTX 4090,RTX 4090"></textarea>
+      </fieldset>
+      <button onclick="doLandscape()">Build landscape</button>
+    </div>
+    <div><div id="ls_out"></div></div>
+  </div>
 </div>
 
 <div id="view_explore" style="display:none">
@@ -813,11 +898,11 @@ async function doIssue(kind) {
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
 function showTab(t) {
-  $('view_plan').style.display = t==='plan' ? '' : 'none';
-  $('view_explore').style.display = t==='explore' ? '' : 'none';
-  $('tab_plan').classList.toggle('active', t==='plan');
-  $('tab_explore').classList.toggle('active', t==='explore');
-  if (t==='explore' && !window._profLoaded) loadProfiles();
+  for (const v of ['plan','explore','landscape'])
+    $('view_'+v).style.display = t===v ? '' : 'none';
+  for (const v of ['plan','explore','landscape'])
+    $('tab_'+v).classList.toggle('active', t===v);
+  if ((t==='explore'||t==='landscape') && !window._profLoaded) loadProfiles();
 }
 
 async function loadProfiles() {
@@ -874,6 +959,45 @@ async function doMatrix() {
      + 'Solid = real rig (live NVML / declared).<br>&bull; capacity % is vs '
      + 'stock even-TP (ratio of two same-model estimates); no throughput is shown.</div>';
   $('mx_out').innerHTML = h;
+}
+
+async function doLandscape() {
+  $('ls_out').innerHTML = 'building…';
+  const rigs = $('ls_rigs').value.split('\n').map(s=>s.trim()).filter(Boolean).map(line=>{
+    const i=line.indexOf('='); const name=i>0?line.slice(0,i).trim():line;
+    const rest=i>0?line.slice(i+1):line;
+    return {name, profiles: rest.split(',').map(s=>s.trim()).filter(Boolean)};
+  });
+  const body = {model: $('ls_model').value.trim(), quant: $('ls_quant').value.trim(),
+    bucket: $('ls_bucket').value ? parseInt($('ls_bucket').value) : null,
+    results_store: $('ls_store').value.trim() || null,
+    similar: $('ls_similar').checked, rigs};
+  const r = await fetch('/api/landscape', {method:'POST', body: JSON.stringify(body)});
+  const d = await r.json();
+  if (!d.ok) { $('ls_out').innerHTML = '<p class="reasons">'+esc(d.error)+'</p>'; return; }
+  const L = d.landscape;
+  let h = '<h3 style="margin:.2rem 0">'+esc(L.model)+' @ '+esc(L.quant)
+    + (L.bucket? ' <span class="muted">(efficiency @ batch '+L.bucket+')</span>':'')+'</h3>';
+  h += '<table class="mx"><tr><th>rig</th><th>provenance</th><th>fit</th>'
+     + '<th>max ctx</th><th>J/dec-tok</th><th>peak dec tok/s</th></tr>';
+  for (const c of L.rows) {
+    const cls = c.is_measured ? '' : 'estcell ';
+    const provtag = c.is_measured ? '<span class="fitc">'+esc(c.provenance)+'</span>'
+                                  : '<span class="est">'+esc(c.provenance)+'*</span>';
+    const ctx = c.max_context ? '~'+Math.round(c.max_context.value/1000)+'k' : (c.fits?'':'—');
+    const jd = c.j_per_decode_token!=null ? c.j_per_decode_token
+             : (c.is_measured ? '(no data)' : '—');
+    const pd = c.peak_decode ? (c.peak_decode.value+' @ '+esc(c.peak_decode.at)) : '—';
+    h += '<tr><td style="text-align:left" title="'+esc((c.config||[]).join(' '))+'">'+esc(c.rig)
+       + (c.fits?'':' <span class="nofitc">(no fit)</span>')+'</td>'
+       + '<td class="'+cls+'">'+provtag+'</td><td>'+(c.fits?'yes':'NO')+'</td>'
+       + '<td>'+ctx+'</td><td>'+jd+'</td><td>'+pd+'</td></tr>';
+    if (c.config && c.config.length)
+      h += '<tr><td colspan="6" class="legend" style="text-align:left">reproduce: <code>'
+         + esc(c.config.join('  ')) + '</code></td></tr>';
+  }
+  h += '</table><div class="legend">'+esc(L.note)+'</div>';
+  $('ls_out').innerHTML = h;
 }
 
 loadKnobs();

@@ -189,6 +189,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the hardware-profile library and exit.",
     )
+    ls = p.add_argument_group("landscape / benchmark DB (S5)")
+    ls.add_argument(
+        "--landscape",
+        action="store_true",
+        help="Render the (model, quant) cross-rig landscape (Mode A): measured "
+        "store rows + planner feasibility rows for --rig, measured-vs-estimate "
+        "labelled. Perf/energy columns stay empty until the energy module. "
+        "Reuses --quant + --rig.",
+    )
+    ls.add_argument(
+        "--results-store",
+        default=None,
+        help="Path to a results.jsonl of MEASURED runs to overlay on the "
+        "landscape (measured rows are preferred over planner estimates).",
+    )
+    ls.add_argument(
+        "--bucket", type=int, default=None,
+        help="Efficiency operating point (batch-size bucket) for the "
+        "landscape; a rig with no data there is blank, never extrapolated.",
+    )
+    ls.add_argument(
+        "--similar-quant", action="store_true",
+        help="Group by nominal bits only (APPROXIMATE — scheme/group-size "
+        "shift efficiency and quality).",
+    )
     return p
 
 
@@ -390,6 +415,68 @@ def _run_matrix(args) -> int:
     return 0
 
 
+def _run_landscape(args) -> int:
+    from sglang.srt.planner.landscape import build_mode_a, render_mode_a_text
+    from sglang.srt.planner.model import resolve_model_ref
+    from sglang.srt.planner.profiles import ProfileLibrary, compose_rig
+    from sglang.srt.planner.results_store import QuantDescriptor, ResultsStore
+
+    if not args.model:
+        print("error: --landscape needs --model.", file=sys.stderr)
+        return 2
+    if not args.quant:
+        print("error: --landscape needs --quant (e.g. 4b/AWQ/g128).",
+              file=sys.stderr)
+        return 2
+    quant = QuantDescriptor.parse(args.quant)
+    model_label = args.model.rstrip("/").rsplit("/", 1)[-1]
+
+    store = (
+        ResultsStore.load(args.results_store) if args.results_store else ResultsStore()
+    )
+
+    lib = ProfileLibrary()
+    planner_rigs = []
+    try:
+        model_path = resolve_model_ref(args.model)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    for spec in args.rig or []:
+        if spec.strip().lower() == "live":
+            from sglang.srt.planner.hardware import (
+                HardwareUnavailable,
+                hardware_from_nvml,
+            )
+
+            try:
+                planner_rigs.append((model_path, hardware_from_nvml()))
+            except HardwareUnavailable as e:
+                print(f"warning: --rig live skipped: {e}", file=sys.stderr)
+            continue
+        _, _, profs = spec.partition("=")
+        names = [p.strip() for p in (profs or spec).split(",") if p.strip()]
+        try:
+            planner_rigs.append((model_path, compose_rig(names, library=lib)))
+        except (KeyError, ValueError) as e:
+            print(f"error: --rig {spec!r}: {e}", file=sys.stderr)
+            return 2
+
+    ls = build_mode_a(
+        model_label,
+        quant,
+        store=store,
+        planner_rigs=planner_rigs,
+        bucket=args.bucket,
+        similar=args.similar_quant,
+    )
+    if args.json:
+        print(json.dumps(dataclasses.asdict(ls), indent=1, default=str))
+    else:
+        print(render_mode_a_text(ls))
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -414,6 +501,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.matrix:
         return _run_matrix(args)
+
+    if args.landscape:
+        return _run_landscape(args)
 
     from sglang.srt.planner.feasibility import PlanRejected, plan
     from sglang.srt.planner.model import resolve_model_ref
