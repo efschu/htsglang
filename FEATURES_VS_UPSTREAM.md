@@ -426,12 +426,25 @@ way to run it.
   band (a 48/48 argmax-match decode trajectory with bounded, non-compounding delta), **not** bit-exact,
   exactly like decode. Rank-uniform collective lock-step verified on hardware (zero head-vs-worker
   mismatches across chunks, no NCCL hang).
-  **Honest downsides:** **[worse] prefill runs eager** — CUDA-graph capture on the weightless+GGUF path
-  is blocked by a pre-existing limitation (a GGUF lazy-init param not materialized before capture); this
-  is a tracked follow-up, not a chunked-prefill regression; **[worse] the fast card now holds the full
-  weights**, so once the workers are freed **it** becomes the context limiter for big models (addressed
-  by the load-time MoE offload in §6); **[neutral] TP-only, single-node** — PP/DP/EP/spec are rejected by
-  design (hard fail-fast).
+  **CUDA-graph decode (#133) [landed, unpushed on `feat/weightless-kv-chunked`]:** the lane now supports
+  CUDA-graph decode (prefill still runs eager by design — decode-graph-only scope). The earlier
+  suspected root cause (a GGUF lazy-init param) was wrong: the real issue is that the weightless
+  **workers** are meta-device models (no layer weights), so decode-graph capture ran the full
+  meta-forward on them and crashed on the uninitialized meta embedding. The fix captures each worker's
+  stripped KV+attention dispatch as its own decode graph, **symmetrically with the head** (the head
+  cannot capture alone — its capture-time DCP collectives require worker co-participation), and
+  completes the previously-unwired guard-in-graph path (the rank-uniform anti-hang guard is disabled
+  inside the captured region and kept on for eager prefill).
+  *Impact: on the reference rig (5090 + 2×3080, TP=3 DCP=3, Qwen3.6-27B Q3_K_M): **[better] ≈+380%
+  decode throughput** (roughly 5×) — the eager path paid a per-collective gloo guard-handshake that the
+  graph bakes out — sustained 512-token decode with no lock-step hang, self-deterministic 5/5.
+  Notably **[better] decode-graph vs eager-weightless is bit-identical** here (max |Δ| = 0, argmax-clean):
+  this path has no capture-gated dual-stream, so graph == eager exactly (unlike the general graph/marlin
+  floor elsewhere in the fork).*
+  **Honest downsides:** **[neutral] prefill still runs eager** by design (decode-graph-only scope);
+  **[worse] the fast card now holds the full weights**, so once the workers are freed **it** becomes the
+  context limiter for big models (addressed by the load-time MoE offload in §6); **[neutral] TP-only,
+  single-node** — PP/DP/EP/spec are rejected by design (hard fail-fast).
 
 ---
 
