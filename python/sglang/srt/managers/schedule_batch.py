@@ -830,6 +830,10 @@ class Req(ReqDllmMixin):
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
+        # Fast lane (Variant C Stage 0): set True for lane='fast' requests by the
+        # scheduler at admission. Used by the anti-starvation reserved-heavy-slots
+        # floor. Default False keeps the standard (heavy) path unchanged.
+        self.is_fast_lane = False
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
