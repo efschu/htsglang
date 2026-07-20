@@ -663,6 +663,14 @@ class FlashInferAttnBackend(AttentionBackend):
                     self._wl_dev_slots = int(model_runner._wl_spill_device_tokens)
                     self._wl_stage_base = self._wl_dev_slots
                     self._wl_stage_cap = int(model_runner._wl_spill_staging_tokens)
+                    # #136b: H2D prefetch/double-buffer is enabled iff the
+                    # model runner carved TWO block-sized staging regions plus
+                    # the owner-write scratch row (SGLANG_WL_H2D_PREFETCH; the
+                    # carve is the single source of truth -- a single-block
+                    # carve means the serial-copy #136a behavior everywhere).
+                    self._wl_prefetch = (
+                        self._wl_stage_cap >= 2 * self._wl_chunk_block_size + 1
+                    )
                     self._wl_host_slots = int(model_runner._wl_spill_host_tokens)
                     self._wl_host_pool = getattr(
                         model_runner, "wl_spill_host_pool", None
@@ -1113,6 +1121,31 @@ class FlashInferAttnBackend(AttentionBackend):
                 dim=0,
             ),
         )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """IN-graph hook, recorded at the START of every captured decode body
+        (run_once on the head runner and the weightless worker alike; a no-op
+        for the plain flashinfer decode). #136b: fork the H2D prefetch side
+        stream ONCE per step -- the side stream's copy pipeline for ALL layers
+        descends from this point, so a layer's host-block copies can run while
+        earlier layers still compute on the main stream (staging rows are
+        per-layer; the only cross edges are the per-layer ow_ev/run_ev waits
+        in `_wl_blockwise_decode_return_lse_graph`)."""
+        if getattr(self, "_wl_graph_capture_blocks", None) is None:
+            return
+        if not getattr(self, "_wl_spill_active", False):
+            return
+        st = self._wl_graph_state.get(self._wl_graph_active_bucket)
+        rung = self._wl_graph_capture_blocks
+        if (
+            st is None
+            or not getattr(st, "prefetch", False)
+            or not any(st.stage_cnt[j] > 0 for j in range(rung))
+        ):
+            return
+        st.ow_recorded = False
+        st.fork_ev.record(torch.cuda.current_stream())
+        st.copy_stream.wait_event(st.fork_ev)
 
     def init_forward_metadata_out_graph(
         self,
@@ -2543,6 +2576,15 @@ class FlashInferAttnBackend(AttentionBackend):
                     "--weightless-kv-host-spill-tokens by 1."
                 )
             self._wl_host_dump_slot = self._wl_host_slots
+        # #136b H2D prefetch/double-buffer: with a 2-block staging carve,
+        # block j uses staging region j % 2 (region bases B apart), so the
+        # captured side-stream copy of block j+1 can run while attention
+        # reads block j from the other region. Without the double carve both
+        # "regions" alias the single #136a staging region and the copies stay
+        # on the main stream (serial, byte-identical #136a behavior).
+        prefetch = spill and bool(getattr(self, "_wl_prefetch", False))
+        base0 = getattr(self, "_wl_stage_base", 0)
+        region_bases = [base0, base0 + (B if prefetch else 0)]
         st = types.SimpleNamespace(
             wrappers=[],
             indptr_dev=[],
@@ -2550,13 +2592,34 @@ class FlashInferAttnBackend(AttentionBackend):
             stage_ids=[],
             stage_dst=[],
             stage_cnt=[],
-            stage_slot_arange=torch.arange(
-                getattr(self, "_wl_stage_base", 0),
-                getattr(self, "_wl_stage_base", 0) + B,
-                dtype=torch.int32,
-                device=dev,
-            ),
+            prefetch=prefetch,
+            stage_slot_arange=[
+                torch.arange(rb, rb + B, dtype=torch.int32, device=dev)
+                for rb in region_bases
+            ],
         )
+        if prefetch:
+            # Side copy stream + events, persistent for the bucket and
+            # re-recorded per layer inside each rung's capture (event
+            # record/wait during capture become intra-graph edges; the
+            # objects are safely shared across layers and rung graphs).
+            # fork_ev: recorded ONCE per captured body execution
+            #   (init_forward_metadata_in_graph) -- the side stream's copy
+            #   pipeline then runs AHEAD across layers (staging rows are
+            #   per-layer, so layer L+1's copies never collide with layer L's)
+            #   subject only to the per-layer edges below.
+            # copy_ev[j]: side -> main, block j's staged bytes ready.
+            # run_ev[j]:  main -> side, block j's attention (the last reader
+            #   of staging region j % 2 in this layer) done; copy j+2 waits it.
+            # ow_ev: main -> side, this layer's owner-write D2H done; only the
+            #   LAST host block's copy waits it (its slot window contains the
+            #   current token's host slot, written this step).
+            st.copy_stream = torch.cuda.Stream()
+            st.fork_ev = torch.cuda.Event()
+            st.ow_ev = torch.cuda.Event()
+            st.ow_recorded = False
+            st.copy_ev = [torch.cuda.Event() for _ in range(max_blocks)]
+            st.run_ev = [torch.cuda.Event() for _ in range(max_blocks)]
         for j in range(max_blocks):
             indptr_buf = torch.zeros(bs + 1, dtype=torch.int32, device=dev)
             indices_buf = torch.zeros(bs * B, dtype=torch.int32, device=dev)
@@ -2588,8 +2651,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 st.stage_ids.append(torch.zeros(cnt, dtype=torch.int64, device=dev))
                 st.stage_dst.append(
                     torch.arange(
-                        self._wl_stage_base,
-                        self._wl_stage_base + cnt,
+                        region_bases[j % 2],
+                        region_bases[j % 2] + cnt,
                         dtype=torch.int64,
                         device=dev,
                     )
@@ -2599,12 +2662,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 st.stage_dst.append(None)
         logger.info(
             "Weightless-KV block-decode graph: built bs=%d bucket state -- "
-            "%d block wrappers (ladder %s), block size %d, spill=%s.",
+            "%d block wrappers (ladder %s), block size %d, spill=%s, "
+            "h2d_prefetch=%s.",
             bs,
             max_blocks,
             self._wl_graph_ladder,
             B,
             spill,
+            prefetch,
         )
         return st
 
@@ -2728,9 +2793,12 @@ class FlashInferAttnBackend(AttentionBackend):
                             non_blocking=True,
                         )
                         # Rewrite the staged tail of the block's indices to
-                        # the staging slots (order preserved).
+                        # the staging slots of block j's region (order
+                        # preserved; region j % 2 under #136b prefetch, the
+                        # single region otherwise).
                         w._paged_kv_indices_buf[ln - n_host : ln].copy_(
-                            st.stage_slot_arange[:n_host], non_blocking=True
+                            st.stage_slot_arange[j % 2][:n_host],
+                            non_blocking=True,
                         )
                     total = ln
                 indptr_cpu[1] = total
@@ -2782,16 +2850,60 @@ class FlashInferAttnBackend(AttentionBackend):
         spill = getattr(self, "_wl_spill_active", False)
         fl = self._wl_full_layer_idx(layer) if spill else None
         neg_inf = float("-inf")
+        # #136b H2D prefetch/double-buffer: every host-spill staging copy is
+        # recorded on the bucket's SIDE stream, whose whole per-step pipeline
+        # was forked from the capture stream ONCE in
+        # init_forward_metadata_in_graph. Because staging rows are PER-LAYER
+        # device-pool slots, a layer's copies can run while EARLIER layers
+        # still compute on the main stream (cross-layer prefetch); ordering
+        # is expressed purely by in-capture events (they become graph edges):
+        #   copy->run:    main waits copy_ev[j] before running block j;
+        #   region reuse: side waits run_ev[j-2] before copying block j
+        #                 (block j-2 was this layer's previous reader of
+        #                 region j % 2) -- only when j-2 actually staged;
+        #   owner-write:  the LAST host block's copy waits ow_ev (its slot
+        #                 window holds the current token's host slot, D2H-
+        #                 written by this layer's owner-write).
+        # The last copy_ev wait also rejoins the side stream before capture
+        # end. Copies are rank-local -- the collective count/order per layer
+        # (the lockstep lynchpin) is untouched. Without prefetch (single
+        # staging carve) the copies stay on the main stream: the exact #136a
+        # serial behavior.
+        prefetch = (
+            spill
+            and getattr(st, "prefetch", False)
+            and any(st.stage_cnt[j] > 0 for j in range(rung))
+        )
+        if prefetch:
+            main_stream = torch.cuda.current_stream()
+            side_stream = st.copy_stream
+            last_host = max(j for j in range(rung) if st.stage_cnt[j] > 0)
         o_acc = lse_acc = empty_acc = None
         for j in range(rung):
             if spill and st.stage_cnt[j] > 0:
-                self._wl_host_pool.load_to_device_per_layer(
-                    self._wl_full_pool,
-                    st.stage_ids[j],
-                    st.stage_dst[j],
-                    fl,
-                    io_backend="kernel",
-                )
+                if prefetch:
+                    with torch.cuda.stream(side_stream):
+                        if j >= 2 and st.stage_cnt[j - 2] > 0:
+                            side_stream.wait_event(st.run_ev[j - 2])
+                        if j == last_host and st.ow_recorded:
+                            side_stream.wait_event(st.ow_ev)
+                        self._wl_host_pool.load_to_device_per_layer(
+                            self._wl_full_pool,
+                            st.stage_ids[j],
+                            st.stage_dst[j],
+                            fl,
+                            io_backend="kernel",
+                        )
+                        st.copy_ev[j].record(side_stream)
+                    main_stream.wait_event(st.copy_ev[j])
+                else:
+                    self._wl_host_pool.load_to_device_per_layer(
+                        self._wl_full_pool,
+                        st.stage_ids[j],
+                        st.stage_dst[j],
+                        fl,
+                        io_backend="kernel",
+                    )
             o_b, lse_b = st.wrappers[j].forward_return_lse(
                 q_full,
                 kv_buffer,
@@ -2800,6 +2912,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
+            if prefetch and st.stage_cnt[j] > 0:
+                # Block j's attention was this layer's last reader of region
+                # j % 2; copy j+2 (same region) waits this.
+                st.run_ev[j].record(main_stream)
             lens = st.indptr_dev[j][1:] - st.indptr_dev[j][:-1]
             em = lens == 0
             lse_b = torch.where(
@@ -2850,9 +2966,26 @@ class FlashInferAttnBackend(AttentionBackend):
             dcp_kv_mask=dev_mask,
         )
         T = loc.numel()
+        # #136b: under prefetch the D2H staging scratch lives in the dedicated
+        # row(s) ABOVE both H2D regions (carve 2B + 1), so the side stream's
+        # early cross-layer block copies (which fill [base, base + 2B)) never
+        # collide with it. Without prefetch: the original base rows (#136a).
+        st = self._wl_graph_state.get(
+            getattr(self, "_wl_graph_active_bucket", None)
+        )
+        prefetch = st is not None and getattr(st, "prefetch", False)
+        scratch_base = self._wl_stage_base
+        if prefetch:
+            scratch_base += 2 * self._wl_chunk_block_size
+            if scratch_base + T > self._wl_stage_base + self._wl_stage_cap:
+                raise RuntimeError(
+                    "weightless-KV #136b: owner-write scratch overflows the "
+                    f"staging carve ({T} rows past slot {scratch_base}, cap "
+                    f"{self._wl_stage_cap}); the graph bucket must stay bs=1."
+                )
         stage_slots = torch.arange(
-            self._wl_stage_base,
-            self._wl_stage_base + T,
+            scratch_base,
+            scratch_base + T,
             dtype=torch.int64,
             device=loc.device,
         )
@@ -2881,6 +3014,13 @@ class FlashInferAttnBackend(AttentionBackend):
             dst_indices=host_dst,
             item_size=self._wl_host_pool.token_stride_size,
         )
+        if prefetch:
+            # #136b: this layer's LAST host-block copy (whose slot window
+            # holds the current token's host slot) waits this event on the
+            # side stream -- the only per-layer ordering the prefetch
+            # pipeline needs against the owner-write.
+            st.ow_ev.record(torch.cuda.current_stream())
+            st.ow_recorded = True
 
     def _wl_block_prefix_wrapper(self):
         """Persistent block PREFILL wrapper for the B1 streamed prefix read.

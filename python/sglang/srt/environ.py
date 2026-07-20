@@ -721,6 +721,13 @@ class Envs:
     # workspace per block), and the host-spill graph path only supports bs=1;
     # larger decode batches fall back to the eager block loop.
     SGLANG_WL_GRAPH_MAX_BS = EnvInt(1)
+    # Weightless-KV streaming H2D prefetch / double-buffer (#136b): carve TWO
+    # block-sized staging regions and, inside the captured block-decode graph,
+    # issue each block's host-spill H2D copy on a side stream so it overlaps
+    # the previous block's attention (PCIe transfer hidden behind compute).
+    # Rank-local only -- no collective is added or reordered. Set 0 to restore
+    # the single-buffer serial-copy #136a behavior (A/B knob).
+    SGLANG_WL_H2D_PREFETCH = EnvBool(True)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)

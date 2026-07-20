@@ -1074,6 +1074,17 @@ class ModelRunnerKVCacheMixin:
 
             if _wl_kv_active():
                 _wl_stage = int(self.server_args.weightless_kv_chunked_block_size)
+                # #136b H2D prefetch/double-buffer: carve TWO block-sized
+                # staging regions (block j uses region j % 2) so the captured
+                # side-stream copy pipeline can fill one region while
+                # attention reads the other, PLUS one scratch row for the
+                # graph-safe owner-write staging (moved out of the regions so
+                # early cross-layer prefetch copies never collide with it).
+                # The backend derives its prefetch enable purely from the
+                # carve size (staging >= 2 blocks + 1), so this is the single
+                # switch point.
+                if envs.SGLANG_WL_H2D_PREFETCH.get():
+                    _wl_stage = 2 * _wl_stage + 1
                 _wl_phys = int(self.max_total_num_tokens)
                 if _wl_phys <= 2 * _wl_stage:
                     raise ValueError(
