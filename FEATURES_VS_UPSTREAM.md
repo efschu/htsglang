@@ -177,6 +177,54 @@ correctness / reproducibility fixes all apply unchanged on matched cards. The fo
 genuinely valuable on homogeneous hardware too — just not for its unique heterogeneous
 reason. The honest summary: **don't oversell A on matched cards, don't undersell B.**
 
+## Performance-per-watt (theoretical, ~constant board power)
+
+### Why throughput gains ≈ perf/Watt gains
+
+A GPU under active inference draws **~constant board power**, close to its power envelope —
+it does *not* draw meaningfully fewer watts when the software computes "less efficiently".
+The direct consequence: a throughput gain of X% at ~constant power ≈ a **performance-per-watt
+gain of ~X%**. Adaptive MTP is the clean example — it costs no extra electricity and lifts
+throughput directly, so tokens/Watt rises deterministically. This is not an open measurement
+dispute; it is a first-order derivation.
+
+**Label it honestly.** These are **theoretical / first-order estimates** that assume
+~constant board power. Real per-kernel power varies — memory-bound kernels draw less than the
+envelope — so the actual figure differs from the nominal throughput ratio. The **measured
+Dashboard energy is the ground truth**; the numbers below are an analytical derivation, not a
+wattmeter reading. They are stated to keep the same measured-only discipline the Dashboard
+enforces: a derived quantity, clearly flagged as derived.
+
+### Applied to the throughput features
+
+Per feature, the theoretical perf/Watt gain ≈ the already-**measured** throughput gain (all at
+~constant board power; each baseline named precisely):
+
+| Feature | Measured throughput gain | Theoretical perf/Watt (prefill / decode) |
+|---|---|---|
+| Adaptive MTP / spec-decode (MTP, EAGLE3) — §3 | **net** decode gain (acceptance-adjusted): EAGLE3 ≈+15-45% (code/JSON), high-accept k=4 ≈+8% / k=5 ≈+16% vs k=3 | decode ≈ **net** gain (never above it — see split 2); workload-conditional |
+| GGUF K-quant kernel — batched MMVQ, Q8 lm_head — §4 | prefill ≈5-8× vs the always-MMQ path; TP=2 beats llama.cpp on decode | prefill ≈ +5-8× (same power, faster kernels); decode: up vs llama.cpp, ~neutral vs FP8 (bandwidth-bound) |
+| CUDA-graph decode #133 (weightless lane) — §10 | **≈+385% decode** vs the **eager-weightless** baseline | decode ≈ +385% — the eager path wasted power on the per-collective gloo guard-handshake / launch overhead; the graph does the same work with less waste |
+| MoE-offload Graph+Hotset — §6 | **≈+134% decode** vs the **eager-offload** baseline (TP=3, fraction=0.25) | decode ≈ +134% **within the offload path** — see split 1; this is *not* an absolute efficiency gain vs a fits-in-VRAM run |
+| Solo-prefill PD-disagg — §2 | ≈2-5× TTFT (prefill), decode ~unchanged | prefill ≈ +2-5× (prefill runs alone on the fast card, zero cross-GPU traffic); decode ~neutral |
+| `--rank-kv-ratio capacity` — §1 | break-even decode (≈±1%) at +25% context | decode ≈ neutral (a capacity win, not a perf/Watt win) |
+
+### Hard honesty splits (so this is not an overclaim)
+
+1. **This holds for *throughput* features at ~constant power.** **Capacity / enabling** features —
+   expert offload to run a model that does not fit VRAM (§6), host-tier KV-spill for long context
+   (§10, #134) — **add streaming overhead**, so their tokens/Watt can be **lower** than a
+   hypothetical fits-in-VRAM run. Their value is **"it runs at all"**, not "more tps/Watt". The
+   **+134% Graph+Hotset** figure is a perf gain **within the offload path, relative to the
+   eager-offload baseline** — not an absolute efficiency gain, and it must not be read as one.
+2. **Spec-decode perf/Watt is capped at the *net* throughput gain** (which already charges for the
+   draft's discarded work). At low acceptance the extra draft compute can even **lower** tps/Watt —
+   which is precisely why **adaptive MTP** is the good example: it adapts k to keep the net positive.
+   Never claim a spec-decode perf/Watt gain above the measured net decode gain.
+3. **All of the above is theoretical**, assumes ~constant board power, and is an analytical
+   derivation. The **Dashboard's measured energy is the ground truth**; per-kernel power varies
+   (memory-bound kernels draw below the envelope), so treat these as first-order estimates only.
+
 ---
 
 # Part A — Advantages specific to heterogeneous systems
