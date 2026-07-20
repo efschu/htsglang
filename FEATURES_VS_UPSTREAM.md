@@ -109,11 +109,11 @@ heterogeneous rig gets them too, but they are not the *reason* to run mismatched
   host → disk, graph-safe) to the fork's non-uniform layouts + hybrid-Mamba (GDN) state tiering.
   The base HiCache is **upstream**; the fork's slice is the uneven-layout safety + concurrency
   hardening — §8 (Part B).
-- **Speculative decoding under uneven-DCP + mixed-GPU reproducibility** — *extends* upstream
-  spec-decode (MTP/NEXTN, EAGLE, EAGLE3, **and** the adaptive draft-length controller — all
-  upstream) with the fork's rank-0-broadcast reproducibility across mismatched GPUs, uneven-DCP
-  correctness, and EAGLE3-for-Gemma-4. The spec engines and the adaptive controller themselves are
-  **upstream** — §3 (Part B).
+- **Speculative decoding: fork adaptive-draft machinery on an upstream base** — the spec engines
+  (MTP/NEXTN, EAGLE, EAGLE3) and the base adaptive **step-controller** are upstream; the fork adds
+  genuine machinery on top — **graph-memory offload for multi-k capture pools (#93/#102)**, the
+  **high-accept k=4/5 ladder (#93)**, frozen-MTP wiring, and **rank-0-broadcast reproducibility**
+  across mismatched GPUs + uneven-DCP correctness + EAGLE3-for-Gemma-4 — §3 (Part B).
 - **Prefill/Decode disaggregation, single-node hetero** — *extends* upstream sglang's
   PD-disaggregation (the mooncake transfer stack) into a single-node solo-prefill-on-the-fast-card +
   uneven-TP/DCP decode layout. The PD framework is **upstream**; the fork adds the single-node
@@ -487,14 +487,18 @@ with zero cross-GPU communication while the slower cards handle distributed deco
 **Benefits:** all hardware. The mixed-arch *reproducibility* work is heterogeneity-motivated
 correctness, but the speed of speculation itself is a win on any box.
 
-**Provenance:** the spec-decode engines (MTP/NEXTN, EAGLE, EAGLE3) **and** the adaptive
-draft-length controller (`--speculative-adaptive`, the EMA/hysteresis `AdaptiveStepSlot`, the
-method-agnostic runtime-state/param machinery, and its topk=1 / not-multi-layer-EAGLE /
-no-DP-attn-TBO-pdmux constraints) are **upstream sglang** — verified present at the fork's
-merge-base and untouched by any fork commit. This section covers the fork's *extensions* on top of
-that base: mixed-GPU reproducibility (rank-0 broadcast), uneven-DCP correctness, EAGLE3-for-Gemma-4,
-and draft-path uneven-TP. The speed/adaptivity of speculation is upstream's; the fork makes it
-*reproducible and correct under mismatched GPUs + uneven-DCP*.
+**Provenance (two honest halves):** the spec-decode engines (MTP/NEXTN, EAGLE, EAGLE3) and the
+**base** adaptive step-controller (`--speculative-adaptive`, the EMA `AdaptiveStepSlot` step-picking,
+`resolve_candidate_steps_from_config`, and the `adaptive_unsupported_reason` constraints: topk=1 /
+not-multi-layer-EAGLE / no-DP-attn-TBO-pdmux) are **upstream sglang** — verified present at the
+merge-base. **But the fork builds genuine adaptive machinery on top of that base** — a new
+`adaptive_graph_memory.py` plus real extensions to `adaptive_spec_params.py` /
+`adaptive_runtime_state.py`: graph-memory offload for the multi-k capture pools (#93/#102), the
+high-accept k=4/5 ladder (#93), frozen-MTP adaptive wiring, state-isolation + bs-axis debounce, and
+the rank-0 broadcast for mixed-GPU determinism. So the split is: the *step-picking controller* is
+upstream; the *graph-memory offload, the high-k ladder, the frozen-MTP wiring, and the
+hetero-reproducibility* are **fork-original**. Plus the usual fork extensions — uneven-DCP
+correctness, EAGLE3-for-Gemma-4, draft-path uneven-TP.
 
 - **MTP/NEXTN under uneven-DCP** — including heterogeneous-GPU reproducibility (verify-sync,
   draft broadcast from rank 0, workspace zeroing).
@@ -506,20 +510,24 @@ and draft-path uneven-TP. The speed/adaptivity of speculation is upstream's; the
   come out), and the accept/argmax decision is taken once on rank 0 and broadcast so ranks can't
   commit different tokens near a tie. See §8 for the three roots. No throughput claim beyond
   enabling spec at all under DCP.*
-- **Adaptive draft length (controller is UPSTREAM; the fork makes its picks rank-deterministic)** —
-  the adaptive-spec controller is **upstream sglang**, not a fork feature: `--speculative-adaptive`,
-  the EMA + hysteresis `AdaptiveStepSlot` that picks k∈{1,2,3} at runtime, the `candidate_steps`
-  config, and the **shared, method-agnostic** `AdaptiveController` / runtime-state / param machinery
-  that drives **EAGLE, EAGLE3, and NEXTN/MTP** (the `FROZEN_KV_MTP` worker) identically all exist at
-  the merge-base and were **not modified by the fork**. The fail-fast constraints — **topk=1 only**
-  (chain speculation; tree spec excluded), **not** the multi-layer-EAGLE worker, DP-attention /
-  two-batch-overlap / pdmux rejected — are likewise upstream (`adaptive_unsupported_reason`).
-  **The fork's contribution here is narrow:** the per-step draft picks are made **rank-deterministic**
-  (broadcast from rank 0, §8) so upstream's adaptive spec stays *reproducible* under the fork's
-  uneven-DCP + mismatched-GPU layouts. Pre-captured graph states per k are also upstream infra.
-  *Impact (upstream's, restated for context): roughly matches the best fixed k on any workload without
-  hand-tuning across EAGLE/EAGLE3/MTP alike. The fork adds no throughput here — only reproducibility
-  under mismatched GPUs. No fork throughput claim.*
+- **Adaptive draft length (base step-controller UPSTREAM; the fork's offload + high-k ladder + wiring + rank-determinism are FORK)** —
+  the **base** adaptive step-controller is **upstream sglang**: `--speculative-adaptive`, the EMA
+  `AdaptiveStepSlot` that picks k∈{1,2,3}, `resolve_candidate_steps_from_config`, and the
+  method-agnostic machinery that drives **EAGLE, EAGLE3, and NEXTN/MTP** (the `FROZEN_KV_MTP` worker)
+  with its fail-fast constraints — **topk=1 only** (chain spec; tree excluded), **not** the
+  multi-layer-EAGLE worker, DP-attention / two-batch-overlap / pdmux rejected
+  (`adaptive_unsupported_reason`) — all exist at the merge-base. **On top of that base the fork builds
+  real, fork-original machinery:** (1) **graph-memory offload** for the per-k capture pools
+  (`adaptive_graph_memory.py`, #93/#102 — pauseable capture pools + int workspaces, per-tag mempools
+  fixing cross-tag segment reuse, and the "reserve max(one state), not sum" sizing) so multi-k / high-k
+  spec boots without multiplying graph VRAM; (2) the **high-accept k=4/5 ladder** (#93); (3) **frozen-MTP
+  adaptive wiring** (fixes the DoA default-config crash); (4) **state-isolation + bs-axis debounce**
+  against slot flapping; (5) **rank-0 broadcast** of the per-step picks so the adaptive output stays
+  reproducible under the fork's uneven-DCP + mismatched-GPU layouts.
+  *Impact: the step-picking benefit (roughly matches the best fixed k without hand-tuning across
+  EAGLE/EAGLE3/MTP) is upstream's; the fork's on-top machinery is what makes multi-k/high-k spec
+  affordable in VRAM (the offload) and reproducible on mismatched GPUs (the broadcast). See the
+  graph-offload and high-accept bullets below for the fork slices in detail.*
 - **Graph-state offload to system RAM (offload mechanism, stages 1+2)** — the core enabler for
   adaptive / high-k speculation. Each draft length k needs its own pre-captured CUDA graph, and each
   such graph pins a block of VRAM. "Stages 1+2" refers to the two implementation stages of the
