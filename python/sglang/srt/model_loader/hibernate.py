@@ -273,6 +273,33 @@ def restore_gguf_attrs(model: nn.Module, snapshot: Dict[str, Any]) -> None:
             module._gguf_shard_views = views
 
 
+def _reserve_gguf_dequant_scratch(model: nn.Module) -> None:
+    """Mirror the cold path's #63 dequant-workspace reservation on the restored
+    GGUF layers so the subsequent KV-cache profiling accounts for it (skipped
+    otherwise because restore does not run process_weights_after_loading)."""
+    n = 0
+    for module in model.modules():
+        qm = getattr(module, "quant_method", None)
+        reserve = getattr(qm, "_reserve_dequant_scratch", None)
+        if reserve is not None and _is_gguf_layer(module):
+            try:
+                reserve(module)
+                n += 1
+            except Exception as e:  # best-effort; never block a valid restore
+                logger.warning(
+                    "#89 hibernate restore: dequant-scratch reserve skipped for "
+                    "%s (%s)",
+                    module.__class__.__name__,
+                    e,
+                )
+    if n:
+        logger.info(
+            "#89 hibernate restore: reserved #63 dequant scratch on %d GGUF "
+            "layers (KV-profiling parity with cold load).",
+            n,
+        )
+
+
 def _restore_buffers(model: nn.Module, static_state, target_device) -> None:
     modules = dict(model.named_modules())
     existing = dict(model.named_buffers())
@@ -568,6 +595,16 @@ def restore_model_from_disk(
     # the module default). Register the parked buffer, replacing the skeleton's,
     # preserving persistent-ness. Shape-matching buffers are copied in place.
     _restore_buffers(model, payload["static_state"], target_device)
+
+    # Re-run ONLY the process_weights side effect that sizes downstream memory:
+    # #63's persistent dequant scratch (_reserve_dequant_scratch), reserved at
+    # cold-load time BEFORE KV-cache profiling so the KV pool leaves room for
+    # it. The restore path skips the whole derive, so without this the KV pool
+    # over-sizes (more apparent free VRAM) and decode CUDA-graph capture OOMs on
+    # a tight rank (observed on the 3080 at TP=3). This reserves the SAME
+    # workspace on the restored params -- a module-global buffer, no effect on
+    # the byte-hash below.
+    _reserve_gguf_dequant_scratch(model)
 
     # Correctness gate: recompute the per-rank byte-hash and compare.
     restore_items = _sorted_param_items(model)
