@@ -124,6 +124,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--json", action="store_true", help="Machine-readable JSON output."
     )
+    issue = p.add_argument_group("issue-text generators (S2, opt-in — nothing sent)")
+    issue.add_argument(
+        "--emit-results",
+        action="store_true",
+        help="Emit a copy-paste RESULTS issue + a prefilled GitHub URL from "
+        "this plan (numbers labelled 'planner estimate'; measured "
+        "benchmark/energy fields stay absent).",
+    )
+    issue.add_argument(
+        "--emit-bug",
+        metavar="SYMPTOM",
+        default=None,
+        help="Emit a BUG report for the given symptom (e.g. 'OOM at load'); "
+        "the planner verdict becomes the 'expected' side.",
+    )
+    issue.add_argument(
+        "--bug-log",
+        default=None,
+        help="A boot/crash log file to excerpt (scrubbed, windowed around "
+        "the error) into the --emit-bug report.",
+    )
+    issue.add_argument("--quant", default=None, help="Quant descriptor for the issue text.")
+    issue.add_argument("--group-size", type=int, default=None)
+    issue.add_argument(
+        "--issue-repo",
+        default="efschu/htsglang",
+        help="owner/repo for the prefilled issue URL.",
+    )
     return p
 
 
@@ -330,7 +358,53 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(out, indent=1))
     else:
         _print_report(result, model_path)
+
+    if args.emit_results or args.emit_bug:
+        _emit_issue(args, result)
     return 0 if result.fits else 3
+
+
+def _emit_issue(args, result) -> None:
+    from sglang.srt.planner.issue_text import bug_from_plan, results_from_plan
+
+    log_text = None
+    if args.bug_log:
+        try:
+            with open(args.bug_log, "r", errors="replace") as f:
+                log_text = f.read()
+        except OSError as e:
+            print(f"warning: could not read --bug-log: {e}", file=sys.stderr)
+
+    if args.emit_bug:
+        issue = bug_from_plan(
+            result,
+            symptom=args.emit_bug,
+            log_text=log_text,
+            quant=args.quant,
+            group_size=args.group_size,
+            owner_repo=args.issue_repo,
+        )
+    else:
+        issue = results_from_plan(
+            result,
+            quant=args.quant,
+            group_size=args.group_size,
+            owner_repo=args.issue_repo,
+        )
+
+    print("\n" + "=" * 72)
+    print("ISSUE TEXT (opt-in — copy-paste; nothing is sent):")
+    print("=" * 72)
+    print(issue.markdown)
+    print("=" * 72)
+    if issue.url_within_budget:
+        print("Prefilled GitHub issue URL (one click):")
+        print(issue.url)
+    else:
+        print(
+            "(The prefilled URL exceeds the ~6 KB budget — use the "
+            "copy-paste block above and open a blank issue.)"
+        )
 
 
 if __name__ == "__main__":
