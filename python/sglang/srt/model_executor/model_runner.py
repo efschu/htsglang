@@ -2554,6 +2554,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def max_token_pool_size(self):
         """Return the max token pool size considering hybrid swa settings."""
+        # Weightless-KV host spill (B2): a single sequence is DCP-token-sharded,
+        # so it can span the GLOBAL tiered capacity (per-rank pool x dcp_size),
+        # not just this rank's pool. Expose that so max_req_len admits an
+        # over-VRAM sequence up to context_len (see the per-rank pool shrink in
+        # _init_pools). Only set on the spill lane; None/absent everywhere else.
+        _wl_global = getattr(self, "_wl_spill_global_capacity", 0)
+        if _wl_global:
+            return _wl_global
         if self.is_hybrid_swa:
             return self.full_max_total_num_tokens or self.swa_max_total_num_tokens
         else:
