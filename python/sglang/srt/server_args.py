@@ -3194,6 +3194,16 @@ class ServerArgs:
         Optional[str],
         "The input filename for dumping tensors",
     ] = None
+    determinism_logits_dump_dir: A[
+        Optional[str],
+        "DEBUG surface for the #124 determinism harness (tests/determinism): "
+        "directory into which every rank dumps its per-step next-token logits "
+        "row (single-sequence batches only, dtype exactly as served, captured "
+        "BEFORE sampling preprocessing) as sequentially numbered torch.save "
+        "files. Threaded through ServerArgs (not a worker-side env var) so it "
+        "reaches scheduler TP workers reliably. Default None = off; the "
+        "default serving path is untouched.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Misc runtime features

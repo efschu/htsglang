@@ -107,11 +107,19 @@ def test_evaluate_case_dispatch_on_synthetic_data():
     assert not evaluate_case(sd, ref=a, test=b, rerun=None).ok
 
 
-def test_runner_is_stubbed_with_explicit_seam():
-    """The GPU boot wiring is the ONLY stub, and it says so."""
-    with pytest.raises(NotImplementedError) as ei:
-        run_case_config(get_case("weightless_decode"), "test")
-    assert "r2" in str(ei.value)
+def test_runner_fails_fast_without_booting():
+    """The GPU wiring is live; these failure paths must trigger BEFORE any
+    server boot / GPU touch (cheap to assert in the CPU suite)."""
+    from determinism_harness import runner
+
+    # Unknown arm name is rejected before anything else.
+    with pytest.raises(ValueError):
+        run_case_config(get_case("weightless_decode"), "not-an-arm")
+    # A model role with no usable vehicle on this box reports, not guesses.
+    assert runner.MODEL_ROLES.get("moe_fp8") is None
+    with pytest.raises(RuntimeError) as ei:
+        run_case_config(get_case("fp8_offload"), "reference")
+    assert "vehicle" in str(ei.value)
 
 
 def test_trajectory_rejects_malformed_input():
