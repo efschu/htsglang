@@ -403,8 +403,8 @@ way to run it.
   lane, i.e. the Weightless-KV Fast Lane below (stages B1+B2a now landed), not just priority
   preemption.
 
-- **Weightless-KV Fast Lane (Variant C, stages B1 + B2a)** — a single-process asymmetric-TP mode
-  for heterogeneous GPUs. The **fast card** (here the 5090) holds the **full model as collective-free
+- **Weightless-KV Fast Lane (Variant C, stages B1 + B2a; + chunked prefill #131)** — a single-process
+  asymmetric-TP mode for heterogeneous GPUs. The **fast card** (here the 5090) holds the **full model as collective-free
   TP=1** and is the sole Q/K/V producer + attention dispatcher; the **slow cards** (the 3080s) become
   **"weightless KV workers"** — they hold **only a DCP token-shard of the attention KV cache** and run
   a stripped attention-only forward, with **no layer weights at all**. This inverts the usual problem:
@@ -417,10 +417,21 @@ way to run it.
   intrinsic decode-vs-extend kernel variance (the single observed trajectory flip lands on a perfect
   50/50 tie); self-deterministic. **[better] Built-in anti-hang guard** (bounded per-step handshake) —
   asymmetric-rank collective divergences fail loud in seconds instead of a silent NCCL hang.*
-  **Honest downsides:** **[worse] eager-only today** (no CUDA-graph capture of the asymmetric forward yet);
-  **[worse] the fast card now holds the full weights**, so once the workers are freed **it** becomes the
-  context limiter for big models (addressed by the load-time MoE offload in §6); **[neutral] TP-only,
-  single-node** — PP/DP/EP/spec/chunked-prefill are rejected by design (hard fail-fast).
+  **Chunked prefill / long prompts (#131) [landed, unpushed on `feat/weightless-kv-chunked`]:** the lane
+  now handles chunked prefill, not just single-shot prefill — lifting the previous short-prompt-only
+  limit. Correctness is stated at the lane's true two-class byte-identity bar (the honest framing):
+  **head-local paths** (single-shot prefill, empty prefix) are machine-zero vs the TP=1-solo baseline;
+  **cross-rank-merge paths** (decode, and now chunked prefill's sharded-prefix read via the LSE merge)
+  are decode-class — argmax-identical to solo with divergence only inside the intrinsic fp-reassociation
+  band (a 48/48 argmax-match decode trajectory with bounded, non-compounding delta), **not** bit-exact,
+  exactly like decode. Rank-uniform collective lock-step verified on hardware (zero head-vs-worker
+  mismatches across chunks, no NCCL hang).
+  **Honest downsides:** **[worse] prefill runs eager** — CUDA-graph capture on the weightless+GGUF path
+  is blocked by a pre-existing limitation (a GGUF lazy-init param not materialized before capture); this
+  is a tracked follow-up, not a chunked-prefill regression; **[worse] the fast card now holds the full
+  weights**, so once the workers are freed **it** becomes the context limiter for big models (addressed
+  by the load-time MoE offload in §6); **[neutral] TP-only, single-node** — PP/DP/EP/spec are rejected by
+  design (hard fail-fast).
 
 ---
 
