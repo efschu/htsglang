@@ -3714,13 +3714,25 @@ class ServerArgs:
                     "SGLANG_UNEVEN_DCP_WEIGHTED=1 on a non-uniform "
                     "--rank-tp-ratio -- is the only supported spec+DCP config.)"
                 )
-            # The uneven-weighted DCP verify path attends draft->draft with plain
-            # CAUSAL masking (a linear chain), which is correct ONLY for
-            # --speculative-eagle-topk 1. A branching tree (topk>1) needs the
-            # draft->draft tree sub-mask sliced out of spec_info.custom_mask and
-            # fed to the ragged wrapper; that is NOT implemented, so a topk>1 tree
-            # would produce silently-wrong draft->draft attention. Hard-error
-            # instead of returning incorrect output.
+            # TREE-SPEC GUARD (restored, #76): topk > 1 tree/branching speculation
+            # is NOT correct under uneven-weighted DCP. The tree-drafting feature
+            # (flashinfer_backend.py: _build_dcp_ragged_tree_mask + the ragged
+            # draft->draft custom-mask verify) was implemented and GPU-validated,
+            # and it FAILS the lossless-greedy invariant: at temp 0 a topk>1 tree
+            # produces NON-deterministic (run-to-run A != B) and NON-greedy output
+            # that diverges from the topk=1 chain oracle, whereas topk=1 is
+            # bitwise-deterministic. Root cause (for a future real fix): the DCP
+            # verify splits attention into a paged token-sharded prefix read and a
+            # ragged draft->draft read merged by LSE; the draft->draft tree
+            # sub-mask sliced from the EAGLE FULL_MASK does not reproduce each
+            # draft node's exact (committed-prefix + true tree ancestors) context,
+            # so per-node verify logits become tree-topology-dependent and the
+            # target argmax flips as the (run-to-run varying) draft tree changes.
+            # Reproduces with CUDA graphs OFF, so it is a mask/LSE-merge semantics
+            # bug, not a graph-capture artefact. Until the ancestor semantics in
+            # _build_dcp_ragged_tree_mask vs the paged/ragged LSE-merge are
+            # audited, hard-error instead of silently emitting wrong tokens.
+            # topk == 1 keeps the byte-identical, correct plain-causal chain path.
             if (
                 uneven_weighted_dcp
                 and self.speculative_eagle_topk is not None
@@ -3729,11 +3741,14 @@ class ServerArgs:
                 raise ValueError(
                     "Tree/branching speculative decoding "
                     f"(--speculative-eagle-topk={self.speculative_eagle_topk} > 1) "
-                    "is not yet supported under uneven-hybrid weighted DCP "
-                    "(SGLANG_UNEVEN_DCP=1 + SGLANG_UNEVEN_DCP_WEIGHTED=1). The "
-                    "DCP verify path attends draft->draft with a plain causal "
-                    "chain mask, which is only correct for a linear draft chain. "
-                    "Use --speculative-eagle-topk 1."
+                    "is not supported under uneven-hybrid weighted DCP "
+                    "(SGLANG_UNEVEN_DCP=1 + SGLANG_UNEVEN_DCP_WEIGHTED=1): the "
+                    "tree-masked draft->draft verify attention on this path "
+                    "produces tree-topology-dependent verify logits, giving "
+                    "non-deterministic and non-greedy output (verified against a "
+                    "topk=1 oracle at temp 0). Use --speculative-eagle-topk 1 "
+                    "(linear chain speculation), which is correct and "
+                    "bitwise-deterministic under uneven-DCP."
                 )
         else:
             raise ValueError(

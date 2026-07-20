@@ -705,6 +705,67 @@ class FlashInferAttnBackend(AttentionBackend):
             self.dcp_full_qo_heads = mc.num_attention_heads
             self.dcp_full_kv_heads = total_kv
 
+        # #128 DCP collective/compute overlap: issue the per-layer DCP
+        # collectives (kv-head gathers, q-head gather, LSE-merge) on a
+        # dedicated comm stream so the INDEPENDENT adjacent compute (the
+        # ragged current-chunk attention, the masked scatter-write, the
+        # elementwise merge prep) runs concurrently on the main stream.
+        # SCHEDULING-ONLY: the collective issue order (A_k, A_v, B, C, D per
+        # layer) and every reduction/merge is unchanged -> byte-identical to
+        # the sequential baseline (verified machine-zero in BOTH eager and
+        # captured-graph mode, plus self-determinism).
+        #
+        # DEFAULT-OFF (mode 0). The overlap is byte-identical but PERF-NEUTRAL
+        # on a compute/PCIe-saturated rig at small batch: the DCP collectives
+        # sit on the critical path and there is no spare independent compute to
+        # hide them behind, so side-streaming them cannot shorten a saturated
+        # critical path (measured: prefill + decode parity on 5090+2x3080, TP=3
+        # bs=1). A perf-neutral change must not alter the default execution
+        # path, so the default under uneven-DCP is the ORIGINAL sequential
+        # scheduling (mode 0). Set SGLANG_DCP_COMM_OVERLAP=1 to opt IN to the
+        # dual-stream overlap for regimes where the balance favors it (larger
+        # batch, faster interconnect, or a less-saturated / offloaded config
+        # where the hidden compute is comparable to the collective duration).
+        # The stream is leased HERE (init time, never inside cuda-graph capture
+        # -- stream creation is a driver call, see RuntimeContext.get_stream).
+        self.dcp_comm_stream = None
+        # Diagnostic mode "2": run the OVERLAP issue order but keep everything
+        # on the main stream (no side stream, no cross-stream edges). Isolates
+        # "reorder is not order-equivalent" from "stream mechanics" bugs.
+        self.dcp_overlap_reorder_only = False
+        # Diagnostic mode "3": baseline order with ONLY the scatter-write
+        # deferred past the paged prefix read + merge (single stream).
+        self.dcp_overlap_scatter_late = False
+        # Default "0" = original fully-sequential scheduling (unchanged default
+        # execution path). "1" = dual-stream overlap (opt-in). "2"/"3" diag.
+        _dcp_overlap_mode = os.environ.get("SGLANG_DCP_COMM_OVERLAP", "0")
+        if self.uneven_dcp and _dcp_overlap_mode in ("1", "2"):
+            from sglang.srt.runtime_context import get_stream as _get_named_stream
+
+            self.dcp_comm_stream = _get_named_stream("dcp_comm")
+            self.dcp_overlap_reorder_only = _dcp_overlap_mode == "2"
+        elif self.uneven_dcp and _dcp_overlap_mode == "3":
+            self.dcp_overlap_scatter_late = True
+
+        # Tree/branching speculative decoding (--speculative-eagle-topk > 1)
+        # under uneven-DCP. With topk == 1 the draft is a linear CHAIN and the
+        # ragged draft->draft verify attention is plain CAUSAL (no mask). With
+        # topk > 1 the draft forms a TREE, so the draft->draft block must carry
+        # the tree-topology mask. That mask acts ONLY on the local, replicated
+        # draft tokens (every rank holds all draft-token activations), so it is
+        # a rank-uniform local computation -- it never touches the token-sharded
+        # committed prefix (paged, non-causal, LSE-merged across ranks). See
+        # call_begin_forward (EAGLE_VERIFY) + _get_verify_ragged_cg_wrapper.
+        _sa = model_runner.server_args
+        self.dcp_tree_mask = bool(
+            self.uneven_dcp
+            and getattr(_sa, "speculative_eagle_topk", None) is not None
+            and _sa.speculative_eagle_topk > 1
+        )
+        self.dcp_draft_token_num = int(
+            getattr(_sa, "speculative_num_draft_tokens", 0) or 0
+        )
+
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -1210,8 +1271,21 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # Eager path: never use a graph-bucket ragged wrapper.
-        self._ragged_wrapper_override = None
+        # Eager path: never use a graph-bucket ragged wrapper. Tree-spec verify
+        # (topk > 1) still needs an override: it plans a draft->draft custom
+        # mask, and flashinfer's non-graph plan() does NOT reset _custom_mask_buf
+        # when a later plan passes no mask -> a subsequent maskless prefill on
+        # the SHARED ragged wrapper would silently run stale CUSTOM mode (an
+        # M16-class bug). Route eager tree verify through a dedicated wrapper so
+        # the shared prefill_wrapper_ragged is only ever planned maskless.
+        if (
+            self.uneven_dcp
+            and self.dcp_tree_mask
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            self._ragged_wrapper_override = self._get_eager_tree_verify_ragged_wrapper()
+        else:
+            self._ragged_wrapper_override = None
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             assert self._swa_kv_pool is not None
@@ -1542,6 +1616,26 @@ class FlashInferAttnBackend(AttentionBackend):
         _get_verify_ragged_cg_wrapper)."""
         return self._ragged_wrapper_override or self.prefill_wrapper_ragged
 
+    def _get_eager_tree_verify_ragged_wrapper(
+        self,
+    ) -> BatchPrefillWithRaggedKVCacheWrapper:
+        """Dedicated NON-graph ragged wrapper for eager uneven-DCP tree verify
+        (--speculative-eagle-topk > 1). Isolated from the shared
+        prefill_wrapper_ragged so the draft->draft custom mask this path plans
+        never leaks (as a stale _custom_mask_buf) onto a later maskless prefill.
+        Non-graph plan() sets/updates its mask buffers dynamically per call, and
+        this wrapper is only ever planned for verify (always masked), so no
+        stale-mask hazard exists on it."""
+        w = getattr(self, "_eager_tree_verify_ragged_wrapper", None)
+        if w is None:
+            w = BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=self._fmha_backend,
+            )
+            self._eager_tree_verify_ragged_wrapper = w
+        return w
+
     def _get_verify_ragged_cg_wrapper(
         self, bs: int
     ) -> BatchPrefillWithRaggedKVCacheWrapper:
@@ -1568,12 +1662,38 @@ class FlashInferAttnBackend(AttentionBackend):
         Buffers are tiny (bs+1 int32); each wrapper owns its 8 MiB int
         workspace, kept alive in verify_ragged_cg_wrappers for the process
         lifetime -- sized by what capture+replay actually needs, no heuristics.
+
+        TREE-SPEC (--speculative-eagle-topk > 1, self.dcp_tree_mask): the
+        wrapper ALSO gets FIXED custom_mask_buf + mask_indptr_buf. flashinfer
+        run() selects mask mode by BUFFER PRESENCE (`if self._custom_mask_buf
+        is not None: mask_mode = CUSTOM`), so a wrapper created WITH a mask
+        buffer runs CUSTOM every replay -- which is exactly what we want for
+        the tree topology, and is safe here ONLY because call_begin_forward
+        re-plans the draft->draft mask into the buffer on EVERY replay (the
+        M16 lesson: never leave a mask buffer unwritten). topk == 1 wrappers
+        are created WITHOUT the mask buffers -> mask mode falls back to the
+        `causal` flag forward_return_lse sets == CAUSAL, byte-identical to the
+        pre-tree-spec chain path.
         """
         wrapper = self.verify_ragged_cg_wrappers.get(bs)
         if wrapper is None:
             device = self.kv_last_page_len.device
             qo_indptr_buf = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             kv_indptr_buf = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+            mask_bufs = {}
+            if self.dcp_tree_mask:
+                d = self.dcp_draft_token_num
+                # Unpacked-sized uint8 buffer (bs * d * d bytes) is a safe upper
+                # bound on flashinfer's packed mask (ceil(bs*d*d / 8) bytes);
+                # plan() packs the fresh draft->draft mask into it each replay.
+                mask_bufs = {
+                    "custom_mask_buf": torch.zeros(
+                        (bs * d * d,), dtype=torch.uint8, device=device
+                    ),
+                    "mask_indptr_buf": torch.zeros(
+                        (bs + 1,), dtype=torch.int32, device=device
+                    ),
+                }
             wrapper = _tag_adaptive_int_workspace(
                 BatchPrefillWithRaggedKVCacheWrapper(
                     self.workspace_buffer,
@@ -1582,6 +1702,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     qo_indptr_buf=qo_indptr_buf,
                     kv_indptr_buf=kv_indptr_buf,
                     backend=self._fmha_backend,
+                    **mask_bufs,
                 ),
                 share_key=("verify_ragged_cg", id(self)),
             )
@@ -1845,10 +1966,10 @@ class FlashInferAttnBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
-    def _dcp_masked_write(self, layer, forward_batch, cache_loc, k, v):
-        """Gather this rank's local kv-head shard [2,1,1] up to the FULL
-        replicated kv-heads [4] and write only the token slots this rank OWNS
-        (even-modulo owner rule) at the compacted physical slot loc//dcp_size.
+    def _dcp_write_gather(self, layer, k, v):
+        """Collective half of the masked KV write: gather this rank's local
+        kv-head shard [2,1,1] up to the FULL replicated kv-heads [4]
+        (collectives A_k, A_v of the per-layer DCP sequence).
 
         REPLICATED-KV geometry (TP > num_kv_heads): every rank already
         projects ALL kv heads itself (identical replicated k/v weights ->
@@ -1857,19 +1978,33 @@ class FlashInferAttnBackend(AttentionBackend):
         k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
         v = v.view(-1, layer.tp_v_head_num, layer.head_dim)
         if self.dcp_kv_replicated_heads:
-            k_full, v_full = k, v
-        else:
-            k_full = cp_all_gather_heads_uneven(k, group, self.dcp_kv_head_counts)
-            v_full = cp_all_gather_heads_uneven(v, group, self.dcp_kv_head_counts)
-        self._dcp_owner_write(layer, forward_batch, cache_loc, k_full, v_full)
+            return k, v
+        k_full = cp_all_gather_heads_uneven(k, group, self.dcp_kv_head_counts)
+        v_full = cp_all_gather_heads_uneven(v, group, self.dcp_kv_head_counts)
+        return k_full, v_full
 
-    def _dcp_owner_write(self, layer, forward_batch, cache_loc, k_full, v_full):
-        """Write the FULL (gathered/broadcast) replicated kv-heads to only the
-        token slots this rank OWNS, at the compacted physical slot. Shared by the
-        head-rank path (_dcp_masked_write, which projects + gathers k/v) and the
-        weightless KV-worker path (which receives k/v broadcast from the head
-        rank). The owner-rule + compact-slot mapping is identical for both, so it
-        lives here once (single source of truth)."""
+    def _dcp_masked_write(self, layer, forward_batch, cache_loc, k, v):
+        """Gather this rank's local kv-head shard up to the FULL replicated
+        kv-heads and write only the token slots this rank OWNS (even-modulo
+        owner rule) at the compacted physical slot loc//dcp_size. Composition
+        of _dcp_write_gather + _dcp_write_scatter (kept as the single-call
+        form for the sequential/baseline paths)."""
+        k_full, v_full = self._dcp_write_gather(layer, k, v)
+        self._dcp_write_scatter(layer, forward_batch, cache_loc, k_full, v_full)
+
+    def _dcp_write_scatter(self, layer, forward_batch, cache_loc, k_full, v_full):
+        """Local half of the masked KV write (no collectives): compute this
+        rank's owner mask + compact slots and scatter k_full/v_full into the
+        token-sharded pool. Under #128 overlap this is deferred to run
+        concurrently with the LSE-merge collectives -- its target slots are
+        the current chunk's out_cache_loc, DISJOINT from the paged prefix
+        read, so deferral is order-equivalent (byte-identical cache state at
+        layer exit).
+
+        Also shared (as ``_dcp_owner_write``) by the weightless KV-worker path,
+        which receives k/v broadcast from the head rank: the owner-rule +
+        compact-slot mapping is identical for both, so it lives here once
+        (single source of truth)."""
         if self.uneven_dcp_weighted:
             # WEIGHTED owner rule: ownership + compact physical slot are derived
             # from the out_cache_loc itself (not the sequence position), so the
@@ -1907,6 +2042,10 @@ class FlashInferAttnBackend(AttentionBackend):
             layer.v_scale,
             dcp_kv_mask=dcp_kv_mask,
         )
+
+    # Historical name used by the weightless KV-worker (head-rank broadcast)
+    # call sites -- same function, single source of truth.
+    _dcp_owner_write = _dcp_write_scatter
 
     def _wl_spill_owner_write(self, layer, loc, dcp_kv_mask, k_full, v_full):
         """B1 owner-write over the tiered slot space. Device-region slots take
@@ -3053,10 +3192,7 @@ class FlashInferAttnBackend(AttentionBackend):
         force_prefix=False,
     ):
         group = get_parallel().dcp_group
-        # 1. Write the current chunk's KV (full replicated kv-heads) into this
-        #    rank's owned token slots (token-sharded cache).
-        if k is not None and save_kv_cache:
-            self._dcp_masked_write(layer, forward_batch, cache_loc, k, v)
+        do_write = k is not None and save_kv_cache
 
         causal = (
             not layer.is_cross_attention
@@ -3064,72 +3200,154 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         q_local = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
-        # 2. Current chunk: ragged LOCAL head-sharded attention (causal). k/v are
-        #    the freshly-projected bf16 current tokens, fully present on every
-        #    rank, so this is exact local GQA attention (no DCP gather needed).
-        #    active_ragged_wrapper: under a captured verify graph this is the
-        #    per-bucket graph-mode wrapper (fixed indptr buffers) -- the shared
-        #    non-graph wrapper's transient plan tensors are NOT replay-safe.
-        k_cur = k.view(-1, layer.tp_k_head_num, layer.head_dim)
-        v_cur = v.view(-1, layer.tp_v_head_num, layer.head_dim)
-        # REPLICATED-KV (TP > num_kv_heads, #105): this rank holds only a q-head
-        # SLICE but ALL kv heads (replicated). flashinfer derives the ragged
-        # GQA grouping from the LOCAL counts (gqa_local = local_q // local_kv),
-        # which maps q heads to kv heads differently from the GLOBAL grouping
-        # (gqa_global = total_q // total_kv) whenever this rank does not hold
-        # every q head of its kv head(s). Re-index the local kv slots so each
-        # carries the GLOBAL kv head its q group actually attends. (8q/2kv over
-        # [4,2,2]: rank0 held q0-3 -- all -> kv0 globally -- but gqa_local=2 sent
-        # q2-3 to kv1, corrupting short-prompt / first-chunk generation while the
-        # gathered-q paged prefix/decode path stayed correct.) No-op reindex on
-        # the aligned single-kv-head-per-rank case reduces to identity.
-        if self.dcp_kv_replicated_heads:
-            _kv_idx = self._replicated_kv_ragged_reindex(
-                layer.tp_q_head_num, layer.tp_k_head_num, k.device
-            )
-            if _kv_idx is not None:
-                k_cur = k_cur[:, _kv_idx, :]
-                v_cur = v_cur[:, _kv_idx, :]
-        o_cur, lse_cur = self.active_ragged_wrapper.forward_return_lse(
-            q_local,
-            k_cur,
-            v_cur,
-            causal=causal,
-            sm_scale=layer.scaling,
-            logits_soft_cap=logits_soft_cap,
-        )
-
         # has_prefix is a global (rank-uniform) property, so every rank takes the
         # same branch -> the DCP collectives below stay balanced (no deadlock).
         # target-VERIFY (force_prefix) always reads the committed prefix, whose
         # length is seq_lens (extend_prefix_lens is unset for verify).
+        # (CPU-side info, so it is hoisted above the kernels: the overlapped
+        # comm lane must know up front whether the q-gather B will be issued.)
         if force_prefix:
             has_prefix = True
         else:
             prefix_cpu = forward_batch.extend_prefix_lens_cpu
             has_prefix = prefix_cpu is not None and any(prefix_cpu)
+
+        comm_stream = self.dcp_comm_stream
+        if comm_stream is None:
+            # ================= SEQUENTIAL (legacy) SCHEDULING =================
+            # 1. Write the current chunk's KV (full replicated kv-heads) into
+            #    this rank's owned token slots (token-sharded cache).
+            _scatter_late = self.dcp_overlap_scatter_late
+            k_full_seq = v_full_seq = None
+            if do_write:
+                if _scatter_late:
+                    k_full_seq, v_full_seq = self._dcp_write_gather(layer, k, v)
+                else:
+                    self._dcp_masked_write(layer, forward_batch, cache_loc, k, v)
+            # 2. Current chunk: ragged LOCAL head-sharded attention (causal).
+            o_cur, lse_cur = self._dcp_ragged_current(
+                q_local, k, v, layer, causal, logits_soft_cap
+            )
+            if not has_prefix:
+                if do_write and _scatter_late:
+                    self._dcp_write_scatter(
+                        layer, forward_batch, cache_loc, k_full_seq, v_full_seq
+                    )
+                return o_cur.contiguous().view(
+                    -1, layer.tp_q_head_num * layer.head_dim
+                )
+            # 3. Prefix: paged DCP read over this rank's OWNED prefix slots with
+            #    the FULL gathered q-heads (non-causal: all prefix keys precede
+            #    every current query). Combine the per-rank partials across the
+            #    DCP group and slice back to this rank's local heads.
+            q_full = cp_all_gather_heads_uneven(
+                q_local, group, self.dcp_q_head_counts
+            )
+            if getattr(self, "_wl_spill_active", False) and getattr(
+                self, "_dcp_extend_has_host", False
+            ):
+                # Stage B1: part of this rank's owned prefix lives on host --
+                # stream it blockwise through the staging region. Rank-LOCAL
+                # branch (no collective inside the loop); the cp_lse below is
+                # reached identically either way.
+                o_pre_raw, lse_pre_raw = self._wl_blockwise_prefix_return_lse(
+                    q_full, layer, prefill_wrapper_paged, logits_soft_cap
+                )
+            else:
+                o_pre_raw, lse_pre_raw = prefill_wrapper_paged.forward_return_lse(
+                    q_full,
+                    self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=False,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+            o_pre, lse_pre = cp_lse_ag_out_ar_mha_uneven(
+                o_pre_raw, lse_pre_raw, group, self.dcp_q_head_counts,
+                return_lse=True,
+            )
+            if do_write and _scatter_late:
+                if os.environ.get("SGLANG_DCP_DEBUG") == "1" and layer.layer_id < 8:
+                    self._dcp_debug_overlap_probe(
+                        layer, forward_batch, cache_loc, force_prefix
+                    )
+                self._dcp_write_scatter(
+                    layer, forward_batch, cache_loc, k_full_seq, v_full_seq
+                )
+            return self._dcp_extend_final_merge(q, layer, o_cur, lse_cur, o_pre, lse_pre)
+
+        # ================= OVERLAPPED SCHEDULING (#128) =================
+        # Two-lane schedule. The per-layer collective ISSUE ORDER on the DCP
+        # communicator is exactly the sequential order (A_k, A_v, B, C, D) --
+        # only independent COMPUTE is moved to run concurrently on the other
+        # lane. Every kernel, reduction and merge is unchanged, so the result
+        # is byte-identical to the sequential scheduling.
+        #
+        #   comm lane:  A_k -> A_v -> B ......... (wait paged) C -> merge -> D
+        #   main lane:  ragged current-chunk attn  (wait B) paged  scatter-write
+        #
+        # Cross-lane edges (wait_stream) keep every same-communicator
+        # collective pair strictly ordered (never concurrent), and the next
+        # layer's fork doubles as the back-edge that makes cross-stream
+        # allocator reuse safe (comm-lane blocks are only reusable after the
+        # main lane's consumers are ordered behind them).
+        import contextlib
+
+        _reorder_only = self.dcp_overlap_reorder_only
+        _comm_ctx = (
+            contextlib.nullcontext()
+            if _reorder_only
+            else torch.cuda.stream(comm_stream)
+        )
+        cur_stream = torch.cuda.current_stream()
+        if not _reorder_only:
+            comm_stream.wait_stream(cur_stream)  # fork: q/k/v are ready
+        k_full = v_full = q_full = None
+        with _comm_ctx:
+            if do_write:
+                # A_k, A_v (no-op without collectives in replicated-KV mode)
+                k_full, v_full = self._dcp_write_gather(layer, k, v)
+            if has_prefix:
+                # B: q-head all-gather
+                q_full = cp_all_gather_heads_uneven(
+                    q_local, group, self.dcp_q_head_counts
+                )
+        # main lane: the ragged current-chunk attention is independent of
+        # A/B/C/D and of the paged prefix read -> overlaps A_k/A_v/B.
+        o_cur, lse_cur = self._dcp_ragged_current(
+            q_local, k, v, layer, causal, logits_soft_cap
+        )
         if not has_prefix:
+            # Join, then scatter the (gathered) kv into this rank's owned
+            # slots before returning -- same cache state as the sequential
+            # path at layer exit.
+            if not _reorder_only:
+                cur_stream.wait_stream(comm_stream)
+            if do_write:
+                self._dcp_write_scatter(
+                    layer, forward_batch, cache_loc, k_full, v_full
+                )
             return o_cur.contiguous().view(
                 -1, layer.tp_q_head_num * layer.head_dim
             )
 
-        # 3. Prefix: paged DCP read over this rank's OWNED prefix slots with the
-        #    FULL gathered q-heads (non-causal: all prefix keys precede every
-        #    current query). Combine the per-rank partials across the DCP group
-        #    and slice back to this rank's local heads.
-        q_full = cp_all_gather_heads_uneven(q_local, group, self.dcp_q_head_counts)
+        # main lane waits for B (and transitively A) before the paged read.
+        if not _reorder_only:
+            cur_stream.wait_stream(comm_stream)
         if getattr(self, "_wl_spill_active", False) and getattr(
             self, "_dcp_extend_has_host", False
         ):
-            # Stage B1: part of this rank's owned prefix lives on host --
-            # stream it blockwise through the staging region. Rank-LOCAL
-            # branch (no collective inside the loop); the cp_lse below is
-            # reached identically either way.
-            o_pre, lse_pre = self._wl_blockwise_prefix_return_lse(
+            # Stage B1 (weightless-KV): part of this rank's owned prefix lives
+            # on host -- stream it blockwise through the staging region.
+            # Rank-LOCAL main-lane compute (no collective inside the loop), so
+            # the two-lane schedule is unchanged: C still follows on the comm
+            # lane exactly as with the plain paged read.
+            o_pre_raw, lse_pre_raw = self._wl_blockwise_prefix_return_lse(
                 q_full, layer, prefill_wrapper_paged, logits_soft_cap
             )
         else:
-            o_pre, lse_pre = prefill_wrapper_paged.forward_return_lse(
+            o_pre_raw, lse_pre_raw = prefill_wrapper_paged.forward_return_lse(
                 q_full,
                 self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 causal=False,
@@ -3138,16 +3356,132 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
-        o_pre, lse_pre = cp_lse_ag_out_ar_mha_uneven(
-            o_pre, lse_pre, group, self.dcp_q_head_counts, return_lse=True
+        # comm lane: C (LSE all-gather) + merge math + D (out all-reduce) --
+        # unchanged function, unchanged reduction order, just issued on the
+        # comm stream so the main lane can scatter-write concurrently.
+        if not _reorder_only:
+            comm_stream.wait_stream(cur_stream)
+        _merge_ctx = (
+            contextlib.nullcontext()
+            if _reorder_only
+            else torch.cuda.stream(comm_stream)
+        )
+        with _merge_ctx:
+            o_pre, lse_pre = cp_lse_ag_out_ar_mha_uneven(
+                o_pre_raw, lse_pre_raw, group, self.dcp_q_head_counts,
+                return_lse=True,
+            )
+        # main lane: the masked scatter-write targets the current chunk's
+        # out_cache_loc slots, disjoint from the paged prefix read above and
+        # untouched by the merge -> overlaps C/merge/D.
+        if do_write:
+            self._dcp_write_scatter(
+                layer, forward_batch, cache_loc, k_full, v_full
+            )
+        # join: the merged prefix partials must be complete before the final
+        # local merge consumes them (the attention output is consumed by
+        # o_proj right after this returns).
+        if not _reorder_only:
+            cur_stream.wait_stream(comm_stream)
+        # NOTE (allocator safety, eager mode): o_pre_raw/lse_pre_raw are
+        # main-lane allocations read by the comm lane; they stay referenced
+        # until after this join, and any post-join reuse of their blocks is
+        # ordered behind the comm lane by the join itself. Comm-lane
+        # allocations (k_full/v_full/q_full/o_pre/lse_pre) are consumed by
+        # the main lane after joins; their blocks only become reusable for
+        # the comm lane at the NEXT fork, which waits on the main lane.
+        return self._dcp_extend_final_merge(q, layer, o_cur, lse_cur, o_pre, lse_pre)
+
+    def _dcp_debug_overlap_probe(self, layer, forward_batch, cache_loc, force_prefix):
+        """Diagnostic (#128): report any intersection between this layer's
+        paged PREFIX read slots and the current chunk's scatter-write slots."""
+        try:
+            req_to_token = self.indices_updater_prefill.req_to_token
+            reqs = forward_batch.req_pool_indices
+            if force_prefix:
+                prefix_lens = forward_batch.seq_lens
+            else:
+                prefix_lens = forward_batch.extend_prefix_lens
+            locs = []
+            for i in range(len(reqs)):
+                plen = int(prefix_lens[i].item())
+                if plen > 0:
+                    locs.append(req_to_token[reqs[i], :plen])
+            if not locs:
+                return
+            pre = torch.cat(locs).to(torch.int64)
+            off = pre % self.cp_S
+            owned = (off >= self.cp_lo) & (off < self.cp_hi)
+            pre_compact = (pre // self.cp_S) * self.cp_ratio + (off - self.cp_lo)
+            pre_set = pre_compact[owned]
+            wl = cache_loc.to(torch.int64)
+            woff = wl % self.cp_S
+            wowned = (woff >= self.cp_lo) & (woff < self.cp_hi)
+            w_compact = (wl // self.cp_S) * self.cp_ratio + (woff - self.cp_lo)
+            w_set = w_compact[wowned]
+            inter = torch.isin(w_set, pre_set)
+            n_inter = int(inter.sum().item())
+            mode = "VERIFY" if force_prefix else "EXTEND"
+            logger.info(
+                "[DCP-DEBUG] %s layer=%d prefix_owned=%d write_owned=%d "
+                "INTERSECT=%d pre_virt_minmax=(%d,%d) w_virt_minmax=(%d,%d)",
+                mode,
+                layer.layer_id,
+                int(pre_set.numel()),
+                int(w_set.numel()),
+                n_inter,
+                int(pre.min().item()),
+                int(pre.max().item()),
+                int(wl.min().item()) if wl.numel() else -1,
+                int(wl.max().item()) if wl.numel() else -1,
+            )
+        except Exception as e:  # diagnostic only -- never break the forward
+            logger.warning("[DCP-DEBUG] probe failed: %s", e)
+
+    def _dcp_ragged_current(self, q_local, k, v, layer, causal, logits_soft_cap):
+        """Current chunk: ragged LOCAL head-sharded attention (causal). k/v are
+        the freshly-projected bf16 current tokens, fully present on every
+        rank, so this is exact local GQA attention (no DCP gather needed).
+        active_ragged_wrapper: under a captured verify graph this is the
+        per-bucket graph-mode wrapper (fixed indptr buffers) -- the shared
+        non-graph wrapper's transient plan tensors are NOT replay-safe.
+
+        REPLICATED-KV (TP > num_kv_heads, #105): this rank holds only a q-head
+        SLICE but ALL kv heads (replicated). flashinfer derives the ragged
+        GQA grouping from the LOCAL counts (gqa_local = local_q // local_kv),
+        which maps q heads to kv heads differently from the GLOBAL grouping
+        (gqa_global = total_q // total_kv) whenever this rank does not hold
+        every q head of its kv head(s). Re-index the local kv slots so each
+        carries the GLOBAL kv head its q group actually attends. (8q/2kv over
+        [4,2,2]: rank0 held q0-3 -- all -> kv0 globally -- but gqa_local=2 sent
+        q2-3 to kv1, corrupting short-prompt / first-chunk generation while the
+        gathered-q paged prefix/decode path stayed correct.) No-op reindex on
+        the aligned single-kv-head-per-rank case reduces to identity."""
+        k_cur = k.view(-1, layer.tp_k_head_num, layer.head_dim)
+        v_cur = v.view(-1, layer.tp_v_head_num, layer.head_dim)
+        if self.dcp_kv_replicated_heads:
+            _kv_idx = self._replicated_kv_ragged_reindex(
+                layer.tp_q_head_num, layer.tp_k_head_num, k.device
+            )
+            if _kv_idx is not None:
+                k_cur = k_cur[:, _kv_idx, :]
+                v_cur = v_cur[:, _kv_idx, :]
+        return self.active_ragged_wrapper.forward_return_lse(
+            q_local,
+            k_cur,
+            v_cur,
+            causal=causal,
+            sm_scale=layer.scaling,
+            logits_soft_cap=logits_soft_cap,
         )
 
-        # 4. Merge current chunk with prefix (both in this rank's local-head
-        #    space) by natural-log LSE. lse_pre is a torch.logsumexp (natural
-        #    log) from the cross-rank combine, and flashinfer's ragged
-        #    forward_return_lse also returns natural-log LSE, so logaddexp mixes
-        #    them consistently. (flashinfer's merge_state uses a different
-        #    internal convention and must NOT be used across these two sources.)
+    def _dcp_extend_final_merge(self, q, layer, o_cur, lse_cur, o_pre, lse_pre):
+        """4. Merge current chunk with prefix (both in this rank's local-head
+        space) by natural-log LSE. lse_pre is a torch.logsumexp (natural
+        log) from the cross-rank combine, and flashinfer's ragged
+        forward_return_lse also returns natural-log LSE, so logaddexp mixes
+        them consistently. (flashinfer's merge_state uses a different
+        internal convention and must NOT be used across these two sources.)"""
         lse_cur = lse_cur.float()
         lse_pre = lse_pre.float()
         final_lse = torch.logaddexp(lse_cur, lse_pre)
@@ -3172,6 +3506,70 @@ class FlashInferAttnBackend(AttentionBackend):
             return layer.is_cross_attention
 
         raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")
+
+
+def _build_dcp_ragged_tree_mask(
+    full_mask: torch.Tensor,
+    seq_lens: torch.Tensor,
+    paged_kernel_lens_sum: int,
+    draft_num: int,
+    bs: int,
+) -> torch.Tensor:
+    """Slice the draft->draft tree sub-mask out of the EAGLE FULL_MASK for the
+    uneven-DCP ragged verify wrapper (--speculative-eagle-topk > 1).
+
+    ``full_mask`` is the flattened EAGLE verify mask (TreeMaskMode.FULL_MASK):
+    for request i it is ``draft_num`` query rows, each with
+    ``seq_lens[i] + draft_num`` columns (the first ``seq_lens[i]`` are the
+    committed prefix -- all visible -- and the last ``draft_num`` are the tree
+    topology over the draft tokens). The DCP verify splits attention into a
+    paged NON-causal prefix read (token-sharded, LSE-merged) and a ragged
+    draft->draft read (local heads); the tree mask affects ONLY the latter, so
+    we extract just the trailing draft_num x draft_num block per request and
+    hand it to the ragged wrapper. The prefix is never masked (correctness:
+    the mask is a draft-local, rank-uniform property; token-sharding of the
+    prefix is orthogonal to it).
+
+    Returns a flat bool mask of length ``bs * draft_num * draft_num``, laid out
+    per request row-major -- exactly flashinfer's ragged custom_mask layout for
+    qo_indptr == kv_indptr == [0, d, 2d, ...].
+    """
+    device = full_mask.device
+    d = draft_num
+    seq64 = seq_lens.to(torch.int64)
+    # Under CUDA-graph replay the batch is padded; the worker built full_mask
+    # for the real requests only. Pad the tail with True (padded requests are
+    # discarded) so every gather index below is in-bounds -- the exact pattern
+    # EagleVerifyInput.generate_attn_arg_prefill uses for the non-DCP path.
+    expected = paged_kernel_lens_sum * d + d * d * bs
+    if full_mask.numel() < expected:
+        # dtype follows full_mask: the worker's tree mask is bool, the
+        # capture-time dummy (buffers.custom_mask) is uint8; both are
+        # nonzero==visible for flashinfer's packbits.
+        full_mask = torch.cat(
+            [
+                full_mask,
+                torch.ones(
+                    expected - full_mask.numel(),
+                    dtype=full_mask.dtype,
+                    device=device,
+                ),
+            ]
+        )
+    klen = seq64 + d  # per-request kv_len (prefix + draft)
+    base = torch.zeros(bs, dtype=torch.int64, device=device)
+    if bs > 1:
+        base[1:] = torch.cumsum(d * klen, dim=0)[:-1]
+    r = torch.arange(d, device=device)
+    c = torch.arange(d, device=device)
+    # idx[i, r, c] = base_i + r * klen_i + seq_i + c   (trailing draft columns)
+    idx = (
+        base.view(bs, 1, 1)
+        + r.view(1, d, 1) * klen.view(bs, 1, 1)
+        + seq64.view(bs, 1, 1)
+        + c.view(1, 1, d)
+    ).reshape(-1)
+    return full_mask[idx]
 
 
 def _build_dcp_weighted_kv_indices(
@@ -3910,6 +4308,10 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
+        # Draft->draft tree mask for the uneven-DCP ragged verify wrapper
+        # (--speculative-eagle-topk > 1); stays None on every other path so the
+        # ragged plan keeps its default (causal chain / non-causal extend).
+        ragged_custom_mask = None
         if spec_info is None and self.attn_backend.uneven_dcp:
             # Uneven-DCP extend: the paged (prefix) wrapper reads only this
             # rank's OWNED prefix token slots (even-modulo owner rule), with the
@@ -3991,12 +4393,17 @@ class FlashInferIndicesUpdaterPrefill:
             # attending EACH OTHER (ragged, LOCAL heads). With
             # --speculative-eagle-topk 1 the draft is a linear CHAIN, so the
             # draft->draft mask is plain causal and the ragged wrapper needs no
-            # tree custom_mask (a branching topk>1 tree would require slicing the
-            # draft->draft block out of spec_info.custom_mask -- NOT handled
-            # here; see _forward_target_verify_dcp). The prefix read excludes the
-            # draft tokens (paged_kernel_lens == committed seq_lens); the draft
-            # KV is written to owned compact slots by _dcp_masked_write and
-            # attended only through the ragged wrapper.
+            # tree custom_mask. With topk > 1 the draft is a TREE: the
+            # draft->draft block carries the tree-topology mask, sliced out of
+            # spec_info.custom_mask (the EAGLE FULL_MASK) below and planned into
+            # the ragged wrapper. That mask is draft-vs-draft ONLY -- a local,
+            # rank-uniform property (every rank holds all draft-token
+            # activations), orthogonal to the token-sharded prefix -- so it is
+            # correct under DCP without any cross-rank coordination. The prefix
+            # read excludes the draft tokens (paged_kernel_lens == committed
+            # seq_lens) and stays NON-causal (never masked); the draft KV is
+            # written to owned compact slots by _dcp_masked_write and attended
+            # only through the ragged wrapper.
             use_ragged = True
             draft_num = spec_info.draft_token_num
             # Paged prefix (committed context) over this rank's OWNED slots.
@@ -4048,6 +4455,22 @@ class FlashInferIndicesUpdaterPrefill:
             # keys); the causal draft->draft masking is done by the ragged
             # wrapper in the forward.
             custom_mask = None
+            # Tree-spec (topk > 1): slice the draft_num x draft_num tree block
+            # out of the EAGLE FULL_MASK and hand it to the ragged wrapper so
+            # its draft->draft attention uses the tree topology instead of a
+            # plain causal chain. topk == 1 keeps ragged_custom_mask None (the
+            # forward's causal=True path, byte-identical to before).
+            if (
+                self.attn_backend.dcp_tree_mask
+                and getattr(spec_info, "custom_mask", None) is not None
+            ):
+                ragged_custom_mask = _build_dcp_ragged_tree_mask(
+                    spec_info.custom_mask,
+                    paged_kernel_lens,  # committed prefix lens (verify)
+                    paged_kernel_lens_sum,
+                    draft_num,
+                    bs,
+                )
         elif spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
@@ -4116,6 +4539,10 @@ class FlashInferIndicesUpdaterPrefill:
                 ragged_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
+                # Tree-spec only (topk > 1): flashinfer packs this bool mask into
+                # the per-bucket ragged wrapper's custom_mask_buf on every replay
+                # -> CUSTOM mask mode over the draft->draft block. None elsewhere.
+                custom_mask=ragged_custom_mask,
             )
 
         if use_sliding_window_kv_pool:
