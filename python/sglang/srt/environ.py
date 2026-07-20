@@ -879,6 +879,29 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Debug/stress: on every swap of an adaptive graph-memory state, all-gather
+    # (swap ordinal, target steps) over the TP CPU group and assert equality.
+    # Turns a rank-divergent swap (a #50-class bug) into an immediate failure
+    # instead of silent corruption. Costs one gloo collective per swap (~0.1/s).
+    SGLANG_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC = EnvBool(False)
+    # TEST-ONLY: force an adaptive runtime-state swap every N verify
+    # completions, cycling through the candidate steps (rank-deterministic:
+    # driven by the verify-call counter, identical on all ranks). Overrides the
+    # EMA decision; use to stress the offload swap path, never in production.
+    SGLANG_ADAPTIVE_FORCE_SWAP_INTERVAL = EnvInt(0)
+    # Adaptive graph-memory offload: minimum free VRAM (MiB) that must remain
+    # AFTER mapping the largest candidate state, enforced at boot
+    # (finalize_boot). Covers eager-forward transient allocations (mamba
+    # chunked-prefill recompute etc.) that run while a state is mapped.
+    # Measured on the T102 rig: 148 MiB post-map free OOM'd at KV-full deep
+    # prefill, 1367 MiB survived; 512 is the enforced floor between them.
+    SGLANG_ADAPTIVE_SERVING_MARGIN_MIB = EnvInt(512)
+    # Stage-2 graph-memory offload fallback: back the per-state CUDA-graph
+    # capture pools up to host RAM on pause and restore the exact bytes on
+    # resume, instead of relying on replay's rewrite-before-read property
+    # over undefined resume content. Costs ~capture-pool-size of host RAM per
+    # state and a PCIe round-trip per swap.
+    SGLANG_ADAPTIVE_CAPTURE_CPU_BACKUP = EnvBool(False)
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

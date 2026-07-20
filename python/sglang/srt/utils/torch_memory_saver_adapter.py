@@ -67,6 +67,19 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def region(self, tag: str, enable_cpu_backup: bool = False):
         return _memory_saver.region(tag=tag, enable_cpu_backup=enable_cpu_backup)
 
+    def region_config(self, tag: str, enable_cpu_backup: bool = False):
+        """Tag-interception config ONLY (no mempool routing), for callers
+        that route allocations into their own torch.cuda.MemPool. Needed by
+        adaptive_graph_memory's per-tag pools: pause(tagA) unmaps whole
+        segments including their free tails, so tags must never share a
+        pool's free lists -- region() would route every tag into the single
+        TMS primary pool, where the caching allocator packs 1-10 MiB
+        allocations of different tags into shared 20 MiB segments."""
+        _memory_saver._ensure_initialized()
+        return _memory_saver._impl._with_region_config(
+            tag=tag, enable_cpu_backup=enable_cpu_backup
+        )
+
     def cuda_graph(self, **kwargs):
         return _memory_saver.cuda_graph(**kwargs)
 
@@ -91,6 +104,10 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
 
     @contextmanager
     def region(self, tag: str, enable_cpu_backup: bool = False):
+        yield
+
+    @contextmanager
+    def region_config(self, tag: str, enable_cpu_backup: bool = False):
         yield
 
     @contextmanager

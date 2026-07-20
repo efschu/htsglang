@@ -20,8 +20,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
+    # Candidate ceiling is 3 (not 7): with per-position accept p <= 0.8 the
+    # expected accepted chain length is sum_{i=1..k} p^i, so k=3 -> k=7 buys
+    # < 1 extra accepted token for 4 extra draft forwards (net-negative), and
+    # every extra candidate step costs a fully pre-captured graph set of VRAM.
+    # Users with p >~ 0.85 workloads can raise the ceiling via
+    # --speculative-adaptive-config.
     "1": {
-        "candidate_steps": [1, 3, 7],
+        "candidate_steps": [1, 2, 3],
         "up_hysteresis": 0.0,
         "down_hysteresis": -0.25,
         "ceiling_coeff": 0,
@@ -46,15 +52,100 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     },
 }
 
+# Frozen-KV MTP default. Differs from DEFAULT_ADAPTIVE_CONFIG in two ways:
+# 1. Every candidate step is >= 1: the frozen seed / draft-extend path has no
+#    step-0 (nospec) branch, and FrozenKVMTPWorkerV2._assert_adaptive_supported
+#    hard-rejects any config resolving to a step < 1. Using the generic default
+#    (which contains step 0 in the bs>=8 slots) would crash at init.
+# 2. The candidate ceiling is 3, not 7: at per-position accept p<=0.8 the
+#    expected accepted chain length gained by k=3 -> k=7 is < 1 token for 4
+#    extra draft forwards (net-negative), and each extra candidate costs a
+#    full pre-captured graph set of VRAM.
+FROZEN_MTP_DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
+    "1": {
+        "candidate_steps": [1, 2, 3],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": -0.25,
+        "ceiling_coeff": 0,
+    },
+    "8": {
+        "candidate_steps": [1, 2],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+    "32": {
+        "candidate_steps": [1],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+}
+
+
+# Built-in profile for high-predictability workloads (per-position accept
+# probability p >~ 0.85: code boilerplate, structured/tabular emission, ...).
+# Adds k=4/5 ladder rungs: with graph-memory OFFLOAD (#93) an extra rung
+# costs only its capture time at boot plus the max-state-sized alias pool --
+# inactive rungs hold no physical VRAM -- so exposing them is nearly free.
+# The rungs are climbed only on SUSTAINED high acceptance: up_hysteresis 0.25
+# (T75 recommendation) raises every rise threshold, because flapping into
+# k=4/5 wastes 4-5 serial draft forwards per rejected chain. No step-0 slots,
+# so the profile is valid for EAGLE and FROZEN_KV_MTP alike (high-accept
+# workloads keep drafting profitable even at bs 32). This profile is NOT the
+# default: at p <= 0.8 the expected extra accepted chain length from k=3 ->
+# k=5 is < 0.6 tokens for 2 extra serial draft forwards (net-negative, see
+# DEFAULT_ADAPTIVE_CONFIG's ceiling rationale) -- select it explicitly via
+# --speculative-adaptive-config high-accept.
+HIGH_ACCEPT_ADAPTIVE_CONFIG: dict[str, dict] = {
+    "1": {
+        "candidate_steps": [1, 2, 3, 4, 5],
+        "up_hysteresis": 0.25,
+        "down_hysteresis": -0.25,
+        "ceiling_coeff": 0,
+    },
+    "8": {
+        "candidate_steps": [1, 2, 3],
+        "up_hysteresis": 0.25,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+    "32": {
+        "candidate_steps": [1],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+}
+
+# --speculative-adaptive-config accepts these names instead of a JSON path.
+# "default" resolves to the per-algorithm built-in default.
+BUILTIN_ADAPTIVE_PROFILES: dict[str, dict[str, dict] | None] = {
+    "default": None,
+    "high-accept": HIGH_ACCEPT_ADAPTIVE_CONFIG,
+}
+
+
+def default_adaptive_config_for(algorithm: str | None) -> dict[str, dict]:
+    """Pick the built-in adaptive config for *algorithm*.
+
+    Used by every resolver call site (server_args buffer sizing, the
+    speculative-hook param init, and the workers) so they cannot disagree
+    about which default applies.
+    """
+    if algorithm == "FROZEN_KV_MTP":
+        return FROZEN_MTP_DEFAULT_ADAPTIVE_CONFIG
+    return DEFAULT_ADAPTIVE_CONFIG
+
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
     from sglang.srt.arg_groups.overrides import resolved_view
 
-    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3", "FROZEN_KV_MTP"):
         return (
             f"speculative_algorithm={server_args.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/FROZEN_KV_MTP are supported)"
         )
     if (
         server_args.speculative_eagle_topk is not None
@@ -89,16 +180,27 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
 
 def _load_adaptive_config(
     cfg_path: str | None,
+    algorithm: str | None = None,
 ) -> tuple[dict, dict[int, dict]]:
     """Load and validate adaptive config.
 
-    Uses ``DEFAULT_ADAPTIVE_CONFIG`` when *cfg_path* is ``None``.
+    *cfg_path* may be a JSON file path or a built-in profile name
+    (``BUILTIN_ADAPTIVE_PROFILES``). Uses
+    ``default_adaptive_config_for(algorithm)`` when it is ``None``.
     """
     if cfg_path is not None:
-        with open(cfg_path) as f:
-            cfg = json.load(f)
+        if cfg_path in BUILTIN_ADAPTIVE_PROFILES:
+            profile = BUILTIN_ADAPTIVE_PROFILES[cfg_path]
+            cfg = (
+                profile
+                if profile is not None
+                else default_adaptive_config_for(algorithm)
+            )
+        else:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
     else:
-        cfg = DEFAULT_ADAPTIVE_CONFIG
+        cfg = default_adaptive_config_for(algorithm)
 
     bs_entries: dict[int, dict] = {}
     for key, entry in cfg.items():
@@ -120,7 +222,7 @@ def _load_adaptive_config(
     if not bs_entries:
         raise ValueError(
             "speculative_adaptive_config must contain at least one integer-string "
-            'BS key, e.g. {"1": {"candidate_steps": [1,3,7]}}. '
+            'BS key, e.g. {"1": {"candidate_steps": [1,2,3]}}. '
             f"Got keys: {list(cfg.keys())}"
         )
     return cfg, bs_entries
@@ -128,9 +230,10 @@ def _load_adaptive_config(
 
 def resolve_candidate_steps_from_config(
     cfg_path: str | None = None,
+    algorithm: str | None = None,
 ) -> list[int]:
     """Union of every BS slot's candidate steps; sizes the runtime buffers."""
-    _, bs_entries = _load_adaptive_config(cfg_path)
+    _, bs_entries = _load_adaptive_config(cfg_path, algorithm=algorithm)
     all_steps: set[int] = set()
     for entry in bs_entries.values():
         all_steps.update(entry["candidate_steps"])
@@ -269,11 +372,28 @@ class AdaptiveSpeculativeParams:
         self,
         initial_steps: int,
         cfg_path: str | None = None,
+        algorithm: str | None = None,
     ):
-        cfg, bs_entries = _load_adaptive_config(cfg_path)
+        cfg, bs_entries = _load_adaptive_config(cfg_path, algorithm=algorithm)
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, AdaptiveStepSlot] = {}
         self._cuda_graph_bs: list[int] | None = None
+
+        # BS-axis debounce: the EMA axis has hysteresis, but without this the
+        # slot choice follows batch_size instantly, so a concurrency level
+        # oscillating across a slot boundary (e.g. 4 streams flapping around a
+        # CUDA-graph bs edge) would thrash graph swaps every decode step. A
+        # slot switch on the bs axis therefore requires `bs_debounce`
+        # CONSECUTIVE decode steps routed to the new slot; any step routed back
+        # to the active slot resets the run. Driven purely by the batch_size
+        # sequence (identical on all TP/DCP ranks), so it is rank-deterministic.
+        # bs_debounce=1 restores instant switching.
+        self._bs_debounce = int(cfg.get("bs_debounce", 3))
+        if self._bs_debounce < 1:
+            raise ValueError(f"bs_debounce must be >= 1, got {self._bs_debounce}")
+        self._active_slot_bs: int | None = None
+        self._pending_slot_bs: int | None = None
+        self._pending_slot_count = 0
 
         for bs, entry in sorted(bs_entries.items()):
             self._slots[bs] = AdaptiveStepSlot(
@@ -298,16 +418,24 @@ class AdaptiveSpeculativeParams:
         self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
 
     def get_steps_for_batch(self, batch_size: int) -> int:
-        return self._route(batch_size).current_steps
+        """Step count for this decode batch; advances the bs-axis debounce."""
+        return self._slots[
+            self._debounced_slot_bs(batch_size, advance=True)
+        ].current_steps
 
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> int | None:
-        """Feed verify results to the matching BS slot's EMA.
+        """Feed verify results to the ACTIVE (debounced) BS slot's EMA.
+
+        Uses the debounced slot, not the raw-routed one: the batch actually ran
+        with the active slot's step count, so its accept lengths belong to that
+        slot's EMA. Does not advance the debounce (only the per-decode-step
+        activation in ``get_steps_for_batch`` does).
 
         Returns the new step if a switch is warranted, else ``None``.
         """
-        params = self._route(batch_size)
+        params = self._slots[self._debounced_slot_bs(batch_size, advance=False)]
         if params.update(num_correct_drafts_per_req):
             return params.current_steps
         return None
@@ -327,10 +455,46 @@ class AdaptiveSpeculativeParams:
         ]
 
     def _route(self, batch_size: int) -> AdaptiveStepSlot:
-        """Map *batch_size* → pad to CUDA-graph BS → closest slot."""
-        return self._slots[
-            self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
-        ]
+        """Raw (un-debounced) map: *batch_size* → pad to CUDA-graph BS → slot."""
+        return self._slots[self._slot_bs_for(batch_size)]
+
+    def _slot_bs_for(self, batch_size: int) -> int:
+        return self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
+
+    def _debounced_slot_bs(self, batch_size: int, advance: bool) -> int:
+        """Slot key for *batch_size* under the bs-axis debounce.
+
+        With ``advance=True`` (one call per decode step) a differing target
+        slot must be seen ``bs_debounce`` consecutive times before it becomes
+        active; ``advance=False`` only reads the currently active slot.
+        """
+        target = self._slot_bs_for(batch_size)
+        if self._active_slot_bs is None or self._bs_debounce <= 1:
+            self._active_slot_bs = target
+            return target
+        if target == self._active_slot_bs:
+            if advance:
+                # Any step back in the active slot resets the pending run.
+                self._pending_slot_bs = None
+                self._pending_slot_count = 0
+            return target
+        if advance:
+            if target == self._pending_slot_bs:
+                self._pending_slot_count += 1
+            else:
+                self._pending_slot_bs = target
+                self._pending_slot_count = 1
+            if self._pending_slot_count >= self._bs_debounce:
+                log_info_on_rank0(
+                    logger,
+                    f"Adaptive bs-slot switch: {self._active_slot_bs} -> {target} "
+                    f"after {self._pending_slot_count} consecutive decode steps",
+                )
+                self._active_slot_bs = target
+                self._pending_slot_bs = None
+                self._pending_slot_count = 0
+                return target
+        return self._active_slot_bs
 
     def _pad_to_cuda_graph_bs(self, batch_size: int) -> int:
         if self._cuda_graph_bs is None:
