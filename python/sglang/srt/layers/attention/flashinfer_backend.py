@@ -564,6 +564,23 @@ class FlashInferAttnBackend(AttentionBackend):
                 # workspace so re-planning per block never clobbers the main
                 # decode/prefill wrappers' scheduling metadata).
                 self._wl_block_wrapper = None
+                # --- #136a: CUDA-graph streaming block-decode state ----------
+                # _wl_graph_ladder: sorted list of captured block-count rungs
+                #   (set by the decode graph runner before capture).
+                # _wl_graph_capture_blocks: rung currently being CAPTURED (the
+                #   forward dispatch routes to the fixed-count graph block loop
+                #   iff this is not None).
+                # _wl_graph_replay_blocks: rung chosen for the CURRENT replay
+                #   step (set by wl_graph_can_replay, consumed by the
+                #   out-of-graph prep + the runner's graph key).
+                # _wl_graph_state: bs bucket -> per-bucket persistent wrappers
+                #   and fixed index/staging buffers (shared by all rungs).
+                self._wl_graph_ladder = []
+                self._wl_graph_capture_blocks = None
+                self._wl_graph_replay_blocks = None
+                self._wl_graph_state = {}
+                self._wl_graph_fallback_logged = False
+                self._wl_graph_loc_offset = 0
                 # Stage B1: host-spill tier. Static slot->tier map: compacted
                 # slot s < _wl_dev_slots is device-resident (identity);
                 # s >= _wl_dev_slots lives on host at s - _wl_dev_slots and is
@@ -1068,6 +1085,21 @@ class FlashInferAttnBackend(AttentionBackend):
             for w in self.decode_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_decode_plan, w)
 
+        # #136a: weightless streaming block-decode -- per-step OUT-of-graph
+        # prep (block kv indices + staging map into fixed buffers, per-block
+        # plan/fast-plan). No-op unless the lane's block-decode graph path is
+        # active for this capture/replay.
+        if (
+            forward_mode.is_decode_or_idle()
+            and getattr(self, "weightless_kv", False)
+            and getattr(self, "_wl_chunk_block_size", 0)
+            and (
+                (in_capture and self._wl_graph_capture_blocks is not None)
+                or (not in_capture and self._wl_graph_replay_blocks is not None)
+            )
+        ):
+            self._wl_graph_prepare_blocks(bs, in_capture=in_capture)
+
         if (
             in_capture
             and forward_mode.is_draft_extend_v2()
@@ -1448,8 +1480,17 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
     ) -> None:
         if forward_mode.is_decode_or_idle():
-            decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
-            self.decode_cuda_graph_metadata[bs] = decode_wrappers
+            if (
+                getattr(self, "_wl_chunk_block_size", 0)
+                and bs in self.decode_cuda_graph_metadata
+            ):
+                # #136a rung-ladder captures revisit the same bs bucket
+                # multiple times; reuse the bucket's wrappers instead of
+                # leaking a fresh set (8 MB int workspace each) per rung.
+                decode_wrappers = self.decode_cuda_graph_metadata[bs]
+            else:
+                decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
+                self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
         elif forward_mode.is_target_verify() or forward_mode.is_dllm_extend():
             use_custom_mask = (
@@ -1760,6 +1801,13 @@ class FlashInferAttnBackend(AttentionBackend):
         the pinned host tier for this layer -- a lossless byte move on the
         current stream. No mapping tables, no alloc state: host slot id =
         compacted slot - device_slots (the static tier map)."""
+        # #136a: inside CUDA-graph capture the dynamic-shape split below
+        # (.any()/.nonzero()/host chunking) is unrecordable -- route to the
+        # fixed-shape graph-safe variant.
+        if getattr(self, "_wl_graph_capture_blocks", None) is not None:
+            return self._wl_spill_owner_write_graph(
+                layer, loc, dcp_kv_mask, k_full, v_full
+            )
         pool = self.token_to_kv_pool
         dev_limit = self._wl_dev_slots
         host_rows = dcp_kv_mask & (loc >= dev_limit)
@@ -2072,6 +2120,502 @@ class FlashInferAttnBackend(AttentionBackend):
         out[hmask] = stage_slots.to(blk_indices.dtype)
         return out
 
+    # ------------------------------------------------------------------
+    # #136a: CUDA-graph integration of the streaming block-decode.
+    #
+    # The eager B0/B1 block loop (`_wl_blockwise_decode_return_lse`) plans a
+    # flashinfer wrapper PER BLOCK PER LAYER on the host -- unrecordable. The
+    # graph path restructures this into the de-risked mechanism
+    # (b2_graph_derisk.py, byte-identical max|d|=0):
+    #   * a POOL of persistent cuda-graph-mode block wrappers per bs bucket
+    #     (fixed indptr/indices buffers), shared by every rung,
+    #   * all `.plan()` + index/staging-map construction hoisted OUT of the
+    #     graph into `init_forward_metadata_out_graph` (once per step, instead
+    #     of per layer x block on the eager path),
+    #   * a captured FIXED-count block loop per rung: {H2D staging copy from
+    #     live pinned host bytes + wrapper.run + merge_state} x R, no
+    #     `.plan()`, no host sync inside,
+    #   * a bucketed capture LADDER over the block count R = ceil(seq /
+    #     (B * dcp_size)) (graphs cannot branch on the block count); replay
+    #     picks the smallest captured rung covering the current seq len and
+    #     plans the trailing blocks EMPTY (sanitized to the o=0/lse=-inf
+    #     empty-attention contract, which merge_state folds in as identity).
+    # Head + workers capture/replay SYMMETRICALLY (#133): both derive the
+    # rung from the shared global seq len, so the per-layer DCP collectives
+    # (4/layer) pair up by construction. Above the largest rung (or on any
+    # admission miss) BOTH ranks fall back to the eager block loop, which is
+    # guard-free for decode under graphs-enabled per the #133 rule.
+    # ------------------------------------------------------------------
+
+    def wl_block_graph_supported(self) -> bool:
+        return bool(
+            getattr(self, "weightless_kv", False)
+            and getattr(self, "_wl_chunk_block_size", 0)
+        )
+
+    def _wl_blocks_needed(self, max_seq_len: int) -> int:
+        per_block_global = self._wl_chunk_block_size * self.dcp_size
+        return max(1, -(-int(max_seq_len) // per_block_global))
+
+    def wl_build_graph_ladder(self) -> list:
+        """Ladder of block-count rungs covering the model's full context
+        length: dense (step 1) up to 8 blocks, then ~x1.5 geometric to R_max.
+        Replay picks the smallest covering rung; every block beyond the
+        current seq len is a captured no-op that still pays its fixed H2D
+        copy + kernel launches, so a dense low range keeps the common rungs
+        EXACT (measured: one wasted trailing block region can halve the
+        streaming-decode rate). Capture cost is ~1 s/rung. Called by the
+        decode graph runner before capture; stored so replay admission
+        (wl_graph_can_replay) and the capture loop agree on the rungs."""
+        r_max = self._wl_blocks_needed(self.max_context_len)
+        ladder = set()
+        r = 1
+        while r < r_max:
+            ladder.add(r)
+            r = r + 1 if r < 8 else max(r + 1, int(r * 1.5))
+        ladder.add(r_max)
+        self._wl_graph_ladder = sorted(ladder)
+        return self._wl_graph_ladder
+
+    def _wl_graph_log_fallback(self, reason: str) -> bool:
+        if not self._wl_graph_fallback_logged:
+            self._wl_graph_fallback_logged = True
+            logger.info(
+                "Weightless-KV block-decode graph: falling back to the eager "
+                "block loop (%s). Logged once; later fallbacks are silent.",
+                reason,
+            )
+        return False
+
+    def wl_graph_can_replay(self, forward_batch) -> bool:
+        """Replay admission for the streaming block-decode graphs. Sets
+        `_wl_graph_replay_blocks` (the chosen rung) on success.
+
+        Rank-uniform by construction: every input (seq lens, batch size,
+        req_to_token content, ladder, spill config) is identical on the head
+        and every weightless worker, so all ranks take the same graph/eager
+        decision -- the lockstep collective count is preserved either way
+        (eager decode under graphs-enabled is also guard-free, #133 rule)."""
+        self._wl_graph_replay_blocks = None
+        if not self._wl_graph_ladder:
+            return False
+        if not forward_batch.forward_mode.is_decode():
+            return False
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is None:
+            return self._wl_graph_log_fallback("no host seq lens")
+        max_seq = int(seq_lens_cpu.max().item())
+        if getattr(self, "_wl_spill_active", False):
+            # The captured H2D staging copies have a FIXED per-block element
+            # count, templated on the static tier map with graph blocks
+            # anchored to SLOT WINDOWS (block j covers owned slot values
+            # [jB, (j+1)B)). The template is exact whenever the request's loc
+            # layout is OFFSET-LINEAR (loc(pos) = O + pos, i.e. one contiguous
+            # allocation -- the canonical single over-VRAM request, including
+            # radix-cached prefix reuse). Verify it; otherwise run eager
+            # (correct, just slower).
+            if forward_batch.batch_size != 1:
+                return self._wl_graph_log_fallback(
+                    f"spill-graph supports bs=1, got bs={forward_batch.batch_size}"
+                )
+            req = forward_batch.req_pool_indices[0]
+            row = self.indices_updater_decode.req_to_token[req, :max_seq]
+            loc_offset = int(row[0].item())
+            ident = torch.arange(
+                loc_offset,
+                loc_offset + max_seq,
+                device=row.device,
+                dtype=row.dtype,
+            )
+            if not bool(torch.equal(row, ident)):
+                return self._wl_graph_log_fallback(
+                    "non-contiguous KV slot layout (allocator reuse/"
+                    "fragmentation)"
+                )
+            self._wl_graph_loc_offset = loc_offset
+            # Rank-uniform rung covering every rank's LAST owned slot
+            # ((O + seq - 1) // dcp is an upper bound across the +-1 skew).
+            needed = (
+                ((loc_offset + max_seq - 1) // self.dcp_size)
+                // self._wl_chunk_block_size
+            ) + 1
+        else:
+            needed = self._wl_blocks_needed(max_seq)
+        rung = next((r for r in self._wl_graph_ladder if r >= needed), None)
+        if rung is None:
+            return self._wl_graph_log_fallback(
+                f"seq len {max_seq} needs {needed} blocks > captured max "
+                f"{self._wl_graph_ladder[-1]}"
+            )
+        self._wl_graph_replay_blocks = rung
+        return True
+
+    def _wl_graph_bucket_state(self, bs: int):
+        """Create the per-bs-bucket persistent block-wrapper pool + fixed
+        buffers, shared by every ladder rung (rung R uses wrappers[0..R-1])."""
+        import types
+
+        B = self._wl_chunk_block_size
+        max_blocks = max(self._wl_graph_ladder)
+        dev = self.kv_last_page_len.device
+        spill = getattr(self, "_wl_spill_active", False)
+        if spill:
+            if bs != 1:
+                raise ValueError(
+                    "weightless-KV block-decode graph with host spill supports "
+                    f"only the bs=1 capture bucket, got bs={bs} "
+                    "(SGLANG_WL_GRAPH_MAX_BS must stay 1 with spill)."
+                )
+            # The graph-safe owner-write redirects NON-host rows' D2H copy to a
+            # dump slot one past the logical host tier; require the physical
+            # pool (sized in whole GB) to actually have that spare slot.
+            if self._wl_host_pool.size <= self._wl_host_slots:
+                raise ValueError(
+                    "weightless-KV block-decode graph: host tier has no spare "
+                    f"slot for the in-graph write dump (pool {self._wl_host_pool.size} "
+                    f"== logical {self._wl_host_slots}). Lower "
+                    "--weightless-kv-host-spill-tokens by 1."
+                )
+            self._wl_host_dump_slot = self._wl_host_slots
+        st = types.SimpleNamespace(
+            wrappers=[],
+            indptr_dev=[],
+            indptr_host=[],
+            stage_ids=[],
+            stage_dst=[],
+            stage_cnt=[],
+            stage_slot_arange=torch.arange(
+                getattr(self, "_wl_stage_base", 0),
+                getattr(self, "_wl_stage_base", 0) + B,
+                dtype=torch.int32,
+                device=dev,
+            ),
+        )
+        for j in range(max_blocks):
+            indptr_buf = torch.zeros(bs + 1, dtype=torch.int32, device=dev)
+            indices_buf = torch.zeros(bs * B, dtype=torch.int32, device=dev)
+            w = BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=self.decode_backend,
+                use_cuda_graph=True,
+                use_tensor_cores=self.decode_use_tensor_cores,
+                paged_kv_indptr_buffer=indptr_buf,
+                paged_kv_indices_buffer=indices_buf,
+                paged_kv_last_page_len_buffer=self.kv_last_page_len[:bs],
+            )
+            st.wrappers.append(w)
+            st.indptr_dev.append(indptr_buf)
+            st.indptr_host.append(torch.zeros(bs + 1, dtype=torch.int32))
+            if spill:
+                # Static per-block host-copy template under the linear slot
+                # model: block j covers owned slots [jB, (j+1)B); its host
+                # part is the tail above _wl_dev_slots. The captured copy has
+                # this FIXED count; replay fills the first n_host entries with
+                # real host ids (shortfall keeps stale-but-valid ids whose dst
+                # staging slots are never referenced by the block's indices).
+                cnt = min(B, max(0, (j + 1) * B - self._wl_dev_slots))
+            else:
+                cnt = 0
+            st.stage_cnt.append(cnt)
+            if cnt > 0:
+                st.stage_ids.append(torch.zeros(cnt, dtype=torch.int64, device=dev))
+                st.stage_dst.append(
+                    torch.arange(
+                        self._wl_stage_base,
+                        self._wl_stage_base + cnt,
+                        dtype=torch.int64,
+                        device=dev,
+                    )
+                )
+            else:
+                st.stage_ids.append(None)
+                st.stage_dst.append(None)
+        logger.info(
+            "Weightless-KV block-decode graph: built bs=%d bucket state -- "
+            "%d block wrappers (ladder %s), block size %d, spill=%s.",
+            bs,
+            max_blocks,
+            self._wl_graph_ladder,
+            B,
+            spill,
+        )
+        return st
+
+    def _wl_graph_prepare_blocks(self, bs: int, in_capture: bool):
+        """OUT-of-graph per-step prep for the captured block loop: build every
+        block's kv indices + staging map into the FIXED buffers and (fast-)plan
+        the block wrappers. This is the hoisted `.plan()` the de-risk proved
+        graph-compatible -- it runs ONCE per decode step (vs per layer x block
+        on the eager path)."""
+        iu = self.indices_updater_decode
+        num_qo_heads = sum(self.dcp_q_head_counts)
+        num_kv_heads = iu.num_kv_heads
+        head_dim = iu.head_dim
+        last_page = self.kv_last_page_len[:bs]
+        B = self._wl_chunk_block_size
+
+        st = self._wl_graph_state.get(bs)
+        if in_capture:
+            rung = self._wl_graph_capture_blocks
+            assert rung is not None, (
+                "weightless block-decode capture without a rung set -- the "
+                "decode graph runner must set _wl_graph_capture_blocks"
+            )
+            if st is None:
+                st = self._wl_graph_bucket_state(bs)
+                self._wl_graph_state[bs] = st
+            self._wl_graph_active_bucket = bs
+            # Synthetic worst-case plan (every block FULL: B slots/request) so
+            # the frozen launch config covers any replay content; replay
+            # re-plans shorter/empty blocks via fast_decode_plan (the same
+            # capture-at-max / replay-below contract as the monolithic decode
+            # graph wrapper). Indices point at slot 0 -- values are irrelevant
+            # at capture, only shapes/launch configs are recorded.
+            synth_indptr = torch.arange(
+                0, bs * B + 1, B, dtype=torch.int32, device=last_page.device
+            )
+            synth_indices = torch.zeros(
+                bs * B, dtype=torch.int32, device=last_page.device
+            )
+            for j in range(rung):
+                w = st.wrappers[j]
+                w.plan(
+                    synth_indptr,
+                    synth_indices,
+                    last_page,
+                    num_qo_heads,
+                    num_kv_heads,
+                    head_dim,
+                    1,  # page_size
+                    q_data_type=iu.q_data_type,
+                    kv_data_type=iu.data_type,
+                )
+                w.begin_forward = partial(fast_decode_plan, w)
+            return
+
+        rung = self._wl_graph_replay_blocks
+        assert rung is not None and st is not None, (
+            "weightless block-decode graph replay prep without admission "
+            "(wl_graph_can_replay must run first)"
+        )
+        self._wl_graph_active_bucket = bs
+        indptr_host = getattr(self, "_dcp_decode_owned_kv_indptr_host", None)
+        assert indptr_host is not None, (
+            "weightless block-decode graph replay: missing host owned-indptr "
+            "(monolithic decode wrapper not in fast_decode_plan mode?)"
+        )
+        kv_indices = self._dcp_decode_owned_kv_indices
+        spill = getattr(self, "_wl_spill_active", False)
+        dev_limit = self._wl_dev_slots if spill else 0
+        if spill:
+            # bs == 1 + offset-linear layout (verified by wl_graph_can_replay):
+            # this rank's owned slots are CONTIGUOUS [s0, s0 + owned).
+            owned = int(indptr_host[1])
+            s0 = (
+                self._wl_graph_loc_offset + self.dcp_rank
+            ) // self.dcp_size
+            if s0 + owned > dev_limit + self._wl_host_slots:
+                raise RuntimeError(
+                    "weightless-KV block-decode graph: owned shard "
+                    f"([{s0}, {s0 + owned}) slots) exceeds device+host "
+                    f"capacity ({dev_limit}+{self._wl_host_slots}) on "
+                    f"dcp_rank {self.dcp_rank}; refusing out-of-range host "
+                    "access."
+                )
+        for j in range(rung):
+            w = st.wrappers[j]
+            indptr_cpu = st.indptr_host[j]
+            total = 0
+            if spill:
+                # SLOT-WINDOW anchored block: block j covers owned slot VALUES
+                # [jB, (j+1)B) -- the host/device split per block is then the
+                # exact static template the captured fixed-count H2D copies
+                # were built from, for ANY allocation offset. Leading blocks
+                # below s0 (radix-cached predecessors) plan empty.
+                lo = max(j * B, s0)
+                hi = min((j + 1) * B, s0 + owned)
+                ln = hi - lo if hi > lo else 0
+                if ln > 0:
+                    ls = lo - s0
+                    w._paged_kv_indices_buf[:ln].copy_(
+                        kv_indices[ls : ls + ln], non_blocking=True
+                    )
+                    # Host part = the block tail above dev_limit (slots
+                    # ascend). Always <= the captured template count by
+                    # construction of the slot window.
+                    n_host = min(ln, max(0, hi - max(lo, dev_limit)))
+                    assert n_host <= st.stage_cnt[j], (
+                        j,
+                        n_host,
+                        st.stage_cnt[j],
+                    )
+                    if n_host > 0:
+                        hs = max(lo, dev_limit) - dev_limit
+                        st.stage_ids[j][:n_host].copy_(
+                            torch.arange(
+                                hs,
+                                hs + n_host,
+                                dtype=torch.int64,
+                                device=st.stage_ids[j].device,
+                            ),
+                            non_blocking=True,
+                        )
+                        # Rewrite the staged tail of the block's indices to
+                        # the staging slots (order preserved).
+                        w._paged_kv_indices_buf[ln - n_host : ln].copy_(
+                            st.stage_slot_arange[:n_host], non_blocking=True
+                        )
+                    total = ln
+                indptr_cpu[1] = total
+            else:
+                # All-resident (B0): owned-LIST-position blocks, identical to
+                # the eager loop's partition (arbitrary slot values, bs >= 1).
+                for i in range(bs):
+                    s = int(indptr_host[i])
+                    e = int(indptr_host[i + 1])
+                    bstart = s + j * B
+                    bend = min(s + (j + 1) * B, e)
+                    ln = bend - bstart if bend > bstart else 0
+                    if ln > 0:
+                        w._paged_kv_indices_buf[total : total + ln].copy_(
+                            kv_indices[bstart:bend], non_blocking=True
+                        )
+                        total += ln
+                    indptr_cpu[i + 1] = total
+            st.indptr_dev[j].copy_(indptr_cpu, non_blocking=True)
+            w.begin_forward(
+                st.indptr_dev[j],
+                w._paged_kv_indices_buf[:total],
+                last_page,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,
+                data_type=iu.data_type,
+                q_data_type=iu.q_data_type,
+                non_blocking=True,
+                fixed_split_size=None,
+                disable_split_kv=self.disable_cuda_graph_kv_split,
+                global_override_indptr_cpu=indptr_cpu,
+            )
+
+    def _wl_blockwise_decode_return_lse_graph(self, q_full, layer):
+        """Graph-recordable fixed-count variant of
+        `_wl_blockwise_decode_return_lse`: iterate EXACTLY the capture rung's
+        block count; per block {H2D staging copy (live pinned-host read) +
+        pre-planned wrapper run + merge}. NO `.plan()`, NO `.item()`/host sync
+        inside. Empty blocks (planned with zero-length indptr at replay) are
+        sanitized to the (o=0, lse=-inf) empty-attention contract IN-graph from
+        the live device indptr, so merge_state folds them in as identity --
+        matching the eager loop's `continue` semantics exactly."""
+        bs = self._wl_graph_active_bucket
+        rung = self._wl_graph_capture_blocks
+        st = self._wl_graph_state[bs]
+        kv_buffer = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        spill = getattr(self, "_wl_spill_active", False)
+        fl = self._wl_full_layer_idx(layer) if spill else None
+        neg_inf = float("-inf")
+        o_acc = lse_acc = empty_acc = None
+        for j in range(rung):
+            if spill and st.stage_cnt[j] > 0:
+                self._wl_host_pool.load_to_device_per_layer(
+                    self._wl_full_pool,
+                    st.stage_ids[j],
+                    st.stage_dst[j],
+                    fl,
+                    io_backend="kernel",
+                )
+            o_b, lse_b = st.wrappers[j].forward_return_lse(
+                q_full,
+                kv_buffer,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+            lens = st.indptr_dev[j][1:] - st.indptr_dev[j][:-1]
+            em = lens == 0
+            lse_b = torch.where(
+                em.unsqueeze(1), torch.full_like(lse_b, neg_inf), lse_b
+            )
+            o_b = torch.where(em.view(-1, 1, 1), torch.zeros_like(o_b), o_b)
+            if o_acc is None:
+                o_acc, lse_acc, empty_acc = o_b, lse_b, em
+            else:
+                o_acc, lse_acc = _safe_merge_state(o_acc, lse_acc, o_b, lse_b)
+                # Requests empty in EVERY block so far must stay exactly at
+                # the (0, -inf) contract (merge of two -inf partials is
+                # undefined); re-pin them after each merge.
+                empty_acc = empty_acc & em
+                lse_acc = torch.where(
+                    empty_acc.unsqueeze(1),
+                    torch.full_like(lse_acc, neg_inf),
+                    lse_acc,
+                )
+                o_acc = torch.where(
+                    empty_acc.view(-1, 1, 1), torch.zeros_like(o_acc), o_acc
+                )
+        return o_acc, lse_acc
+
+    def _wl_spill_owner_write_graph(self, layer, loc, dcp_kv_mask, k_full, v_full):
+        """Graph-recordable owner-write over the tiered slot space (the eager
+        `_wl_spill_owner_write` uses .any()/.nonzero()/host chunking -- none
+        recordable). Fixed-shape formulation: masked device write of the
+        device-region rows, then an UNCONDITIONAL stage of all T rows into the
+        staging region followed by a fixed-count D2H gather whose destination
+        is the real host slot for host-region rows and a reserved DUMP slot
+        (one past the logical host tier, never read) for everything else.
+        Byte-identical to the eager split for every real slot."""
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer
+
+        pool = self.token_to_kv_pool
+        dev_limit = self._wl_dev_slots
+        host_rows = dcp_kv_mask & (loc >= dev_limit)
+        dev_mask = dcp_kv_mask & ~host_rows
+        safe_loc = torch.where(loc < dev_limit, loc, torch.zeros_like(loc))
+        pool.set_kv_buffer(
+            layer,
+            safe_loc,
+            k_full.clone(),
+            v_full.clone(),
+            layer.k_scale,
+            layer.v_scale,
+            dcp_kv_mask=dev_mask,
+        )
+        T = loc.numel()
+        stage_slots = torch.arange(
+            self._wl_stage_base,
+            self._wl_stage_base + T,
+            dtype=torch.int64,
+            device=loc.device,
+        )
+        # Same write kernel/dtype path as a device-resident slot; the staging
+        # region is scratch (the block loop below re-streams over it).
+        pool.set_kv_buffer(
+            layer,
+            stage_slots.to(loc.dtype),
+            k_full.clone(),
+            v_full.clone(),
+            layer.k_scale,
+            layer.v_scale,
+        )
+        host_dst = torch.where(
+            host_rows,
+            loc.to(torch.int64) - dev_limit,
+            torch.full_like(loc, self._wl_host_dump_slot, dtype=torch.int64),
+        )
+        fl = self._wl_full_layer_idx(layer)
+        transfer_kv_per_layer(
+            src_k=self._wl_full_pool.k_buffer[fl],
+            dst_k=self._wl_host_pool.k_data_refs[fl],
+            src_v=self._wl_full_pool.v_buffer[fl],
+            dst_v=self._wl_host_pool.v_data_refs[fl],
+            src_indices=stage_slots,
+            dst_indices=host_dst,
+            item_size=self._wl_host_pool.token_stride_size,
+        )
+
     def _wl_block_prefix_wrapper(self):
         """Persistent block PREFILL wrapper for the B1 streamed prefix read.
         Lazily created; re-planned per block. Shares the backend workspace --
@@ -2191,8 +2735,13 @@ class FlashInferAttnBackend(AttentionBackend):
         if self.weightless_kv and getattr(self, "_wl_chunk_block_size", 0):
             # Stage B0: block-decode the owned shard (byte-identical up to fp
             # reassociation). Strictly the weightless lane; rank-uniform with the
-            # workers' forward_decode_weightless_worker block loop.
-            o, lse = self._wl_blockwise_decode_return_lse(q_full, layer)
+            # workers' forward_decode_weightless_worker block loop. Under CUDA-
+            # graph CAPTURE (#136a) record the fixed-count graph variant instead
+            # (plans hoisted out-of-graph); replay never re-enters this Python.
+            if self._wl_graph_capture_blocks is not None:
+                o, lse = self._wl_blockwise_decode_return_lse_graph(q_full, layer)
+            else:
+                o, lse = self._wl_blockwise_decode_return_lse(q_full, layer)
         else:
             o, lse = decode_wrapper.forward_return_lse(
                 q_full,
@@ -2242,8 +2791,13 @@ class FlashInferAttnBackend(AttentionBackend):
             # Stage B0: block-decode the owned shard, online-merged (byte-
             # identical up to fp reassociation). Rank-uniform with the head's
             # _forward_decode_dcp block loop -- SAME block count (derived from the
-            # shared global seq_len), NO cross-rank collective added.
-            o, lse = self._wl_blockwise_decode_return_lse(q_full, layer)
+            # shared global seq_len), NO cross-rank collective added. Under
+            # CUDA-graph CAPTURE (#136a) record the fixed-count graph variant
+            # (symmetric with the head's captured block loop).
+            if self._wl_graph_capture_blocks is not None:
+                o, lse = self._wl_blockwise_decode_return_lse_graph(q_full, layer)
+            else:
+                o, lse = self._wl_blockwise_decode_return_lse(q_full, layer)
         else:
             decode_wrapper = self.forward_metadata.decode_wrappers[
                 self._get_wrapper_idx(layer)
@@ -2839,6 +3393,11 @@ class FlashInferIndicesUpdaterDecode:
                 self.attn_backend._dcp_decode_owned_kv_indptr = kv_indptr
                 self.attn_backend._dcp_decode_owned_kv_indices = kv_indices
                 self.attn_backend._dcp_decode_global_seq_lens = paged_kernel_lens
+                # #136a graph replay prep consumes the host-side owned indptr
+                # (None on the eager path, where the prep never runs).
+                self.attn_backend._dcp_decode_owned_kv_indptr_host = (
+                    dcp_graph_indptr_host
+                )
         elif spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
