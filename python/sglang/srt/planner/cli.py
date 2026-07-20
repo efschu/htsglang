@@ -161,6 +161,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", type=int, default=8780)
+    mx = p.add_argument_group("combination explorer (S4)")
+    mx.add_argument(
+        "--matrix",
+        action="store_true",
+        help="Render a model x rig capacity/feasibility matrix instead of a "
+        "single plan (uses --matrix-model + --rig; composed rigs are "
+        "labelled 'estimate').",
+    )
+    mx.add_argument(
+        "--matrix-model",
+        action="append",
+        metavar="LABEL=PATH",
+        help="A model for the matrix rows (repeatable). 'LABEL=' is optional; "
+        "falls back to --model when omitted.",
+    )
+    mx.add_argument(
+        "--rig",
+        action="append",
+        metavar="NAME=prof1,prof2,...",
+        help="A composed rig for the matrix columns (repeatable): library "
+        "profile names, e.g. --rig 'hetero=RTX 5090,RTX 3080 20GB,RTX 3080 20GB'. "
+        "Use --rig live to include the live-NVML rig.",
+    )
+    mx.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="Print the hardware-profile library and exit.",
+    )
     return p
 
 
@@ -294,6 +322,74 @@ def _print_report(result, model_path: str) -> None:
             )
 
 
+def _run_matrix(args) -> int:
+    from sglang.srt.planner.explorer import plan_matrix, render_matrix_text
+    from sglang.srt.planner.model import resolve_model_ref
+    from sglang.srt.planner.profiles import ProfileLibrary, compose_rig
+
+    lib = ProfileLibrary()
+
+    # Models: --matrix-model (LABEL=PATH) entries, falling back to --model.
+    raw_models = list(args.matrix_model or [])
+    if args.model:
+        raw_models.append(args.model)
+    if not raw_models:
+        print("error: --matrix needs --matrix-model or --model.", file=sys.stderr)
+        return 2
+    models = []
+    for item in raw_models:
+        label, sep, path = item.partition("=")
+        if not sep:
+            label, path = item.rsplit("/", 1)[-1], item
+        try:
+            models.append((label, resolve_model_ref(path)))
+        except ValueError as e:
+            print(f"error: model {item!r}: {e}", file=sys.stderr)
+            return 2
+
+    # Rigs: --rig NAME=prof1,prof2,...  ('live' = live NVML).
+    rigs = []
+    for spec in args.rig or []:
+        if spec.strip().lower() == "live":
+            from sglang.srt.planner.hardware import (
+                HardwareUnavailable,
+                hardware_from_nvml,
+            )
+
+            try:
+                rigs.append(hardware_from_nvml())
+            except HardwareUnavailable as e:
+                print(f"warning: --rig live skipped: {e}", file=sys.stderr)
+            continue
+        _, _, profs = spec.partition("=")
+        profs = profs or spec
+        names = [p.strip() for p in profs.split(",") if p.strip()]
+        try:
+            rigs.append(compose_rig(names, library=lib))
+        except (KeyError, ValueError) as e:
+            print(f"error: --rig {spec!r}: {e}", file=sys.stderr)
+            return 2
+    if not rigs:
+        print("error: --matrix needs at least one --rig.", file=sys.stderr)
+        return 2
+
+    matrix = plan_matrix(models, rigs)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "models": matrix.models,
+                    "rigs": matrix.rigs,
+                    "cells": [dataclasses.asdict(c) for c in matrix.cells],
+                },
+                indent=1,
+            )
+        )
+    else:
+        print(render_matrix_text(matrix))
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -302,6 +398,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         serve(host=args.host, port=args.port)
         return 0
+
+    if args.list_profiles:
+        from sglang.srt.planner.profiles import ProfileLibrary
+
+        lib = ProfileLibrary()
+        for name in lib.names():
+            p = lib.get(name)
+            print(
+                f"{name:16s} {p.total_mib:>7d} MiB  {p.sm_arch or '-':7s} "
+                f"{'NVLink' if p.nvlink else 'PCIe':6s} "
+                f"{(str(p.tdp_w) + 'W') if p.tdp_w else '-'}"
+            )
+        return 0
+
+    if args.matrix:
+        return _run_matrix(args)
 
     from sglang.srt.planner.feasibility import PlanRejected, plan
     from sglang.srt.planner.model import resolve_model_ref

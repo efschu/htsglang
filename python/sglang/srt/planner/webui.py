@@ -45,7 +45,14 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 
-__all__ = ["discover_knobs", "plan_from_payload", "issue_from_payload", "serve"]
+__all__ = [
+    "discover_knobs",
+    "plan_from_payload",
+    "issue_from_payload",
+    "matrix_from_payload",
+    "list_profiles",
+    "serve",
+]
 
 
 # ===========================================================================
@@ -384,6 +391,76 @@ def issue_from_payload(payload: dict) -> dict:
 
 
 # ===========================================================================
+# S4 explorer: profile library + model x rig matrix.
+# ===========================================================================
+
+
+def list_profiles() -> dict:
+    """The hardware-profile library (design §2.7), for the explorer's rig
+    composer."""
+    from sglang.srt.planner.profiles import ProfileLibrary
+
+    lib = ProfileLibrary()
+    return {
+        "profiles": [
+            {
+                "name": lib.get(n).name,
+                "total_mib": lib.get(n).total_mib,
+                "sm_arch": lib.get(n).sm_arch,
+                "nvlink": lib.get(n).nvlink,
+                "tdp_w": lib.get(n).tdp_w,
+            }
+            for n in lib.names()
+        ]
+    }
+
+
+def matrix_from_payload(payload: dict) -> dict:
+    """Build a model x rig matrix (design §2.7). ``models`` = [{label, model}];
+    ``rigs`` = [{name, profiles: [profile-name,...]}] (composed from the
+    library) or [{name, source:"nvml"}] for the live rig. Composed rigs are
+    stamped as estimates (design §8)."""
+    from sglang.srt.planner.explorer import plan_matrix
+    from sglang.srt.planner.hardware import (
+        HardwareUnavailable,
+        hardware_from_nvml,
+    )
+    from sglang.srt.planner.model import resolve_model_ref
+    from sglang.srt.planner.profiles import ProfileLibrary, compose_rig
+
+    lib = ProfileLibrary()
+    models = []
+    for m in payload.get("models", []):
+        label = m.get("label") or m["model"]
+        try:
+            models.append((label, resolve_model_ref(m["model"])))
+        except (ValueError, KeyError) as e:
+            return {"ok": False, "error": f"model {m.get('model')!r}: {e}"}
+    rigs = []
+    for r in payload.get("rigs", []):
+        if r.get("source") == "nvml":
+            try:
+                rigs.append(hardware_from_nvml())
+            except HardwareUnavailable as e:
+                return {"ok": False, "error": f"live rig: {e}"}
+            continue
+        try:
+            rigs.append(compose_rig(r["profiles"], library=lib))
+        except (KeyError, ValueError) as e:
+            return {"ok": False, "error": f"rig {r.get('name')!r}: {e}"}
+    if not models or not rigs:
+        return {"ok": False, "error": "need at least one model and one rig"}
+
+    matrix = plan_matrix(models, rigs)
+    return {
+        "ok": True,
+        "models": matrix.models,
+        "rigs": matrix.rigs,
+        "cells": [dataclasses.asdict(c) for c in matrix.cells],
+    }
+
+
+# ===========================================================================
 # HTTP server (stdlib only; same shape as the rig-dashboard).
 # ===========================================================================
 
@@ -415,6 +492,12 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"error": str(e)})
             return
+        if self.path.startswith("/api/profiles"):
+            try:
+                self._json(200, list_profiles())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"error": str(e)})
+            return
         self._send(404, "not found", "text/plain")
 
     def do_POST(self):
@@ -429,6 +512,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/issue"):
                 self._json(200, issue_from_payload(payload))
+                return
+            if self.path.startswith("/api/matrix"):
+                self._json(200, matrix_from_payload(payload))
                 return
         except Exception as e:  # pragma: no cover - defensive
             self._json(500, {"error": str(e)})
@@ -505,6 +591,13 @@ INDEX_HTML = r"""<!doctype html>
           font-size: .66rem; }
   .actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .3rem; }
   a { color: #58a6ff; }
+  .tabs { display: flex; gap: .4rem; margin-bottom: .8rem; }
+  .tab { background: #21262d; color: #9aa6b4; }
+  .tab.active { background: #1f6feb; color: #fff; }
+  .mx td, .mx th { text-align: center; }
+  .mx .estcell { outline: 1px dashed #6e5417; }
+  .mx .fitc { color: #56d364; } .mx .nofitc { color: #ff7b72; }
+  .legend { color: #8b96a5; font-size: .68rem; margin-top: .5rem; }
 </style>
 </head>
 <body>
@@ -512,6 +605,33 @@ INDEX_HTML = r"""<!doctype html>
 <div class="sub">capacity / feasibility / split &mdash; never estimated throughput.
   Every edit re-runs the same planner the server runs. No GPU touched.</div>
 
+<div class="tabs">
+  <button id="tab_plan" class="tab active" onclick="showTab('plan')">Plan a model</button>
+  <button id="tab_explore" class="tab" onclick="showTab('explore')">Explore rigs (matrix)</button>
+</div>
+
+<div id="view_explore" style="display:none">
+  <div class="sub">Compose rigs from the hardware-profile library (or add the
+    live one) and see which models fit on each. <b>Composed rigs are
+    ESTIMATES</b> &mdash; no measured free-VRAM or interconnect (§8).</div>
+  <div class="cols">
+    <div>
+      <fieldset>
+        <legend>models (one per line: LABEL=path, or just a path)</legend>
+        <textarea id="mx_models" rows="4" placeholder="27B-AWQ=/path/to/Qwen3.6-27B-AWQ&#10;35B-A3B=/path/to/model"></textarea>
+      </fieldset>
+      <fieldset>
+        <legend>rigs (one per line: NAME=profile,profile,... — or 'live')</legend>
+        <textarea id="mx_rigs" rows="4" placeholder="hetero=RTX 5090,RTX 3080 20GB,RTX 3080 20GB&#10;4x4090=RTX 4090,RTX 4090,RTX 4090,RTX 4090"></textarea>
+        <div id="mx_profiles" class="knoblist" style="margin-top:.5rem"></div>
+      </fieldset>
+      <button onclick="doMatrix()">Build matrix</button>
+    </div>
+    <div><div id="mx_out"></div></div>
+  </div>
+</div>
+
+<div id="view_plan">
 <div class="cols">
   <div>
     <fieldset>
@@ -554,6 +674,7 @@ INDEX_HTML = r"""<!doctype html>
     <div id="flags"></div>
     <div id="issue"></div>
   </div>
+</div>
 </div>
 
 <script>
@@ -690,6 +811,71 @@ async function doIssue(kind) {
 }
 
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+
+function showTab(t) {
+  $('view_plan').style.display = t==='plan' ? '' : 'none';
+  $('view_explore').style.display = t==='explore' ? '' : 'none';
+  $('tab_plan').classList.toggle('active', t==='plan');
+  $('tab_explore').classList.toggle('active', t==='explore');
+  if (t==='explore' && !window._profLoaded) loadProfiles();
+}
+
+async function loadProfiles() {
+  window._profLoaded = true;
+  const r = await fetch('/api/profiles'); const d = await r.json();
+  $('mx_profiles').innerHTML = '<b>library:</b> ' +
+    d.profiles.map(p=>'<span class="pill">'+esc(p.name)+' '+Math.round(p.total_mib/1024)+'GB</span>').join('');
+}
+
+function parseMxModels() {
+  return $('mx_models').value.split('\n').map(s=>s.trim()).filter(Boolean).map(line=>{
+    const i = line.indexOf('=');
+    return i>0 ? {label:line.slice(0,i).trim(), model:line.slice(i+1).trim()}
+               : {model:line};
+  });
+}
+function parseMxRigs() {
+  return $('mx_rigs').value.split('\n').map(s=>s.trim()).filter(Boolean).map(line=>{
+    if (line.toLowerCase()==='live') return {name:'live', source:'nvml'};
+    const i = line.indexOf('=');
+    const name = i>0 ? line.slice(0,i).trim() : line;
+    const rest = i>0 ? line.slice(i+1) : line;
+    return {name, profiles: rest.split(',').map(s=>s.trim()).filter(Boolean)};
+  });
+}
+
+async function doMatrix() {
+  $('mx_out').innerHTML = 'planning…';
+  const body = {models: parseMxModels(), rigs: parseMxRigs()};
+  const r = await fetch('/api/matrix', {method:'POST', body: JSON.stringify(body)});
+  const d = await r.json();
+  if (!d.ok) { $('mx_out').innerHTML = '<p class="reasons">'+esc(d.error)+'</p>'; return; }
+  const cellOf = (m,rig)=>d.cells.find(c=>c.model===m && c.rig===rig);
+  let h = '<table class="mx"><tr><th>model \\ rig</th>' +
+    d.rigs.map(r=>'<th>'+esc(r)+'</th>').join('') + '</tr>';
+  for (const m of d.models) {
+    h += '<tr><td style="text-align:left">'+esc(m)+'</td>';
+    for (const rig of d.rigs) {
+      const c = cellOf(m,rig); let inner, cls = c.estimate ? 'estcell ' : '';
+      if (!c.fits) { inner = '<span class="nofitc">no fit</span>'; }
+      else {
+        const ctx = c.max_context_tokens ? '~'+Math.round(c.max_context_tokens/1000)+'k' : '';
+        let pct = '';
+        if (c.capacity_pct_range) { const [lo,hi]=c.capacity_pct_range; pct = '<br>'+(lo>=0?'+':'')+lo+'..'+hi+'%'; }
+        inner = '<span class="fitc">fit'+(c.estimate?'*':'')+'</span> '+ctx+pct;
+      }
+      h += '<td class="'+cls+'" title="'+esc(c.estimate_note||c.provenance)+'">'+inner+'</td>';
+    }
+    h += '</tr>';
+  }
+  h += '</table>';
+  h += '<div class="legend">&bull; <b>*</b> / dashed = COMPOSED rig &rarr; '
+     + 'ESTIMATE (assumes pcie/nvlink topology; not measured, §8). '
+     + 'Solid = real rig (live NVML / declared).<br>&bull; capacity % is vs '
+     + 'stock even-TP (ratio of two same-model estimates); no throughput is shown.</div>';
+  $('mx_out').innerHTML = h;
+}
+
 loadKnobs();
 </script>
 </body>
