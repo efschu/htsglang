@@ -770,6 +770,25 @@ class FlashInferAttnBackend(AttentionBackend):
             and getattr(_sa, "speculative_eagle_topk", None) is not None
             and _sa.speculative_eagle_topk > 1
         )
+        # #76/#139 defensive check: every server_args configuration that can
+        # make self.uneven_dcp True here (--rank-tp-ratio uneven DCP, even-
+        # modulo or weighted, and --weightless-kv-fastlane) hard-errors on
+        # topk > 1 at arg-validation time (ServerArgs._handle_dcp_validation +
+        # _handle_weightless_kv_fastlane), because the tree-mask verify below
+        # is unvalidated (non-deterministic, non-greedy vs the topk=1 oracle).
+        # If a FUTURE DCP variant flips uneven_dcp on without adding a matching
+        # server_args guard, refuse here instead of silently emitting wrong
+        # tokens. Remove this together with those guards only after
+        # _build_dcp_ragged_tree_mask's ancestor semantics are audited (#76).
+        if self.dcp_tree_mask:
+            raise RuntimeError(
+                "#76 guard hole: --speculative-eagle-topk="
+                f"{_sa.speculative_eagle_topk} > 1 reached the DCP tree-mask "
+                "activation (uneven_dcp=True) without being rejected by the "
+                "server_args guards. This uneven-DCP variant must add a "
+                "matching topk>1 hard error in ServerArgs; the tree-masked "
+                "draft->draft verify is unvalidated on any uneven-DCP path."
+            )
         self.dcp_draft_token_num = int(
             getattr(_sa, "speculative_num_draft_tokens", 0) or 0
         )

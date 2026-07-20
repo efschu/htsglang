@@ -3566,6 +3566,28 @@ class ServerArgs:
                 f"--weightless-kv-head-rank={self.weightless_kv_head_rank} is "
                 f"out of range for tp_size={self.tp_size}."
             )
+        # #139 (defensive, distinct from the blanket spec reject below):
+        # tree/branching speculation (--speculative-eagle-topk > 1) must stay
+        # hard-rejected on the lane INDEPENDENTLY. The lane sets
+        # flashinfer_backend.uneven_dcp = True, and topk > 1 under uneven_dcp
+        # activates the #76 dcp_tree_mask path, whose draft->draft verify
+        # masking is unvalidated (non-deterministic, non-greedy under
+        # uneven-weighted DCP; never validated on the lane). Keep this check
+        # even when chain speculation (topk == 1) is eventually enabled on the
+        # lane and the blanket reject below is relaxed: topk > 1 remains
+        # rejected until the tree mask is proven on this path.
+        if (
+            self.speculative_eagle_topk is not None
+            and self.speculative_eagle_topk > 1
+        ):
+            raise ValueError(
+                "--weightless-kv-fastlane does not support tree/branching "
+                "speculative decoding (--speculative-eagle-topk="
+                f"{self.speculative_eagle_topk} > 1): the lane's DCP dispatch "
+                "would activate the unvalidated #76 DCP tree-mask verify path. "
+                "Use --speculative-eagle-topk 1 (linear chain) if/when "
+                "speculative decoding is supported on the lane."
+            )
         # Stage 1 scope: NO speculative decoding (the MTP/NEXTN draft adds its
         # own attention/DCP sites on the head rank that the weightless workers
         # do not mirror).
@@ -3713,19 +3735,20 @@ class ServerArgs:
                 and len(set(self.rank_tp_ratio)) > 1
                 and self.dcp_size == self.tp_size
             )
-            if self.speculative_algorithm is not None and not uneven_weighted_dcp:
-                raise ValueError(
-                    "Decode context parallel (--dcp-size / "
-                    "--decode-context-parallel-size > 1) on CUDA platform "
-                    "does not support any speculative algorithm, but got "
-                    f"dcp_size={self.dcp_size} on a CUDA platform with "
-                    "speculative decoding enabled. (The uneven-hybrid weighted "
-                    "DCP path -- SGLANG_UNEVEN_DCP=1 + "
-                    "SGLANG_UNEVEN_DCP_WEIGHTED=1 on a non-uniform "
-                    "--rank-tp-ratio -- is the only supported spec+DCP config.)"
-                )
-            # TREE-SPEC GUARD (restored, #76): topk > 1 tree/branching speculation
-            # is NOT correct under uneven-weighted DCP. The tree-drafting feature
+            # TREE-SPEC GUARD (restored, #76; broadened, #139): topk > 1
+            # tree/branching speculation is NOT correct under uneven-weighted
+            # DCP -- and the runtime machinery it would activate keys off the
+            # SUPERSET condition. flashinfer_backend.py sets
+            #   uneven_dcp = uneven_dcp_kv_replicated(dcp_size) or weightless_kv
+            #   dcp_tree_mask = uneven_dcp and speculative_eagle_topk > 1
+            # i.e. ANY cross-rank uneven-DCP variant (a --rank-tp-ratio plan
+            # with dcp_size > 1, even-modulo OR weighted) and the weightless-KV
+            # fast lane would all enable the unvalidated tree mask. Guard the
+            # whole superset here so no DCP variant can reach the tree mask
+            # without an explicit, audited un-guarding (see the root-cause note
+            # below). This check is intentionally independent of
+            # --speculative-algorithm: it mirrors the activation condition at
+            # flashinfer_backend.dcp_tree_mask exactly. The tree-drafting feature
             # (flashinfer_backend.py: _build_dcp_ragged_tree_mask + the ragged
             # draft->draft custom-mask verify) was implemented and GPU-validated,
             # and it FAILS the lossless-greedy invariant: at temp 0 a topk>1 tree
@@ -3744,21 +3767,38 @@ class ServerArgs:
             # audited, hard-error instead of silently emitting wrong tokens.
             # topk == 1 keeps the byte-identical, correct plain-causal chain path.
             if (
-                uneven_weighted_dcp
+                (
+                    uneven_weighted_dcp
+                    or self.rank_tp_ratio is not None
+                    or self.weightless_kv_fastlane
+                )
                 and self.speculative_eagle_topk is not None
                 and self.speculative_eagle_topk > 1
             ):
                 raise ValueError(
                     "Tree/branching speculative decoding "
                     f"(--speculative-eagle-topk={self.speculative_eagle_topk} > 1) "
-                    "is not supported under uneven-hybrid weighted DCP "
-                    "(SGLANG_UNEVEN_DCP=1 + SGLANG_UNEVEN_DCP_WEIGHTED=1): the "
-                    "tree-masked draft->draft verify attention on this path "
-                    "produces tree-topology-dependent verify logits, giving "
+                    "is not supported under any cross-rank DCP variant that "
+                    "activates the DCP tree mask (uneven-hybrid DCP via "
+                    "--rank-tp-ratio -- even-modulo or weighted -- or the "
+                    "--weightless-kv-fastlane): the tree-masked draft->draft "
+                    "verify attention on this path produces "
+                    "tree-topology-dependent verify logits, giving "
                     "non-deterministic and non-greedy output (verified against a "
-                    "topk=1 oracle at temp 0). Use --speculative-eagle-topk 1 "
-                    "(linear chain speculation), which is correct and "
+                    "topk=1 oracle at temp 0, #76). Use --speculative-eagle-topk "
+                    "1 (linear chain speculation), which is correct and "
                     "bitwise-deterministic under uneven-DCP."
+                )
+            if self.speculative_algorithm is not None and not uneven_weighted_dcp:
+                raise ValueError(
+                    "Decode context parallel (--dcp-size / "
+                    "--decode-context-parallel-size > 1) on CUDA platform "
+                    "does not support any speculative algorithm, but got "
+                    f"dcp_size={self.dcp_size} on a CUDA platform with "
+                    "speculative decoding enabled. (The uneven-hybrid weighted "
+                    "DCP path -- SGLANG_UNEVEN_DCP=1 + "
+                    "SGLANG_UNEVEN_DCP_WEIGHTED=1 on a non-uniform "
+                    "--rank-tp-ratio -- is the only supported spec+DCP config.)"
                 )
         else:
             raise ValueError(
