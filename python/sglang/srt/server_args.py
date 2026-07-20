@@ -1181,10 +1181,10 @@ class ServerArgs:
             "the KV cache and compute attention over it, so a large KV capacity "
             "lives on the smaller cards while single-stream speed stays near "
             "the head card's TP=1 rate. Requires --tp-size == --dcp-size and a "
-            "flashinfer attention backend. Stage 1 scope: decode + short "
-            "NON-chunked prefill only; speculative decoding and chunked prefill "
-            "are hard-rejected. Off by default -> every other path is "
-            "byte-identical.",
+            "flashinfer attention backend. Scope: decode + prefill/extend, "
+            "including CHUNKED prefill (--chunked-prefill-size); speculative "
+            "decoding and --enable-mixed-chunk are hard-rejected (later "
+            "slices). Off by default -> every other path is byte-identical.",
         ),
     ] = False
     weightless_kv_head_rank: A[
@@ -3355,9 +3355,11 @@ class ServerArgs:
         The fast lane runs an ASYMMETRIC forward: the head rank runs the full
         model while the weightless ranks run only the per-attention-layer DCP
         dispatch. Any mode that adds or removes DCP-collective sites on only one
-        side (speculative decode, chunked prefill, PP/DP/EP) would desync the
-        collective sequence into a silent NCCL hang -- so they are rejected here
-        (fail fast), not hoped-around at runtime."""
+        side (speculative decode, mixed prefill+decode chunks, PP/DP/EP) would
+        desync the collective sequence into a silent NCCL hang -- so they are
+        rejected here (fail fast), not hoped-around at runtime. Chunked prefill
+        (WITHOUT mixing) is supported: each chunk is a plain extend forward the
+        workers mirror with the rank-uniform has_prefix branch."""
         if not self.weightless_kv_fastlane:
             return
 
@@ -3398,14 +3400,18 @@ class ServerArgs:
                 "with speculative decoding OFF; the MTP draft dispatch is a "
                 "later stage."
             )
-        # Stage 1 scope: NO chunked prefill (chunk boundaries change the
-        # per-forward attention-layer collective count).
-        if self.chunked_prefill_size is None or self.chunked_prefill_size > 0:
+        # Chunked prefill IS supported (#131): every chunk is a plain extend
+        # forward mirrored by forward_extend_weightless_worker, branching on the
+        # rank-uniform has_prefix (2 collectives for the first chunk, 4 for
+        # chunks with a committed prefix) -- head and workers stay in lockstep.
+        # MIXED chunks (decode reqs folded into a chunked-prefill batch) are a
+        # distinct, larger collective surface the workers do not mirror yet.
+        if self.enable_mixed_chunk:
             raise ValueError(
-                "--weightless-kv-fastlane (Stage 1) requires chunked prefill "
-                "DISABLED (--chunked-prefill-size -1); got "
-                f"{self.chunked_prefill_size}. Long chunked prefill is a later "
-                "stage."
+                "--weightless-kv-fastlane does not yet support "
+                "--enable-mixed-chunk (mixing decode into a chunked-prefill "
+                "batch). Chunked prefill without mixing is supported; "
+                "mixed-chunk is a later slice."
             )
         # The [H,0,0] head-broadcast + LSE-merge dispatch is implemented in the
         # flashinfer backend only.
