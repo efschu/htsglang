@@ -61,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--model",
-        required=True,
+        default=None,
         help="Checkpoint dir (config.json), .gguf file, or HF hub id "
         "(config.json is fetched; weights are never downloaded/loaded).",
     )
@@ -152,6 +152,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="efschu/htsglang",
         help="owner/repo for the prefilled issue URL.",
     )
+    web = p.add_argument_group("web UI (S3)")
+    web.add_argument(
+        "--serve",
+        action="store_true",
+        help="Serve the thin web UI (stdlib HTTP, no CDN) instead of a "
+        "one-shot plan; --model becomes optional.",
+    )
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8780)
     return p
 
 
@@ -288,9 +297,19 @@ def _print_report(result, model_path: str) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
+    if args.serve:
+        from sglang.srt.planner.webui import serve
+
+        serve(host=args.host, port=args.port)
+        return 0
+
     from sglang.srt.planner.feasibility import PlanRejected, plan
     from sglang.srt.planner.model import resolve_model_ref
 
+    if not args.model:
+        print("error: --model is required (or use --serve for the web UI).",
+              file=sys.stderr)
+        return 2
     try:
         model_path = resolve_model_ref(args.model)
     except ValueError as e:
