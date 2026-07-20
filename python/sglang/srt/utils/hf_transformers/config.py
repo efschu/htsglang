@@ -46,18 +46,27 @@ def _set_architectures(config, arch_name):
     config.update({"architectures": [arch_name]})
 
 
-def _peek_qwen35_gguf_arch(gguf_path: str) -> Optional[str]:
-    """Return "qwen35"/"qwen35moe" if the GGUF's ``general.architecture`` is a
-    Qwen3.5/3.6 hybrid, else None. Reads only the GGUF header (cheap)."""
+def _peek_bespoke_gguf_arch(gguf_path: str) -> Optional[str]:
+    """Return the GGUF ``general.architecture`` if it is one of the bespoke
+    families that need the sibling-config.json workaround (Qwen3.5/3.6
+    hybrids, Gemma-4), else None. Reads only the GGUF header (cheap).
+
+    The set of bespoke GGUF archs is the single source of truth in
+    ``model_loader.gguf_registry`` (transformers' GGUF reader rejects
+    qwen35/qwen35moe outright and crashes on gemma4: it derives a per-layer
+    num_key_value_heads LIST that the strict Gemma4TextConfig rejects). Imported
+    lazily so this early-config path stays cheap and cycle-free."""
     try:
         import gguf
+
+        from sglang.srt.model_loader.gguf_registry import sibling_config_gguf_archs
 
         reader = gguf.GGUFReader(gguf_path)
         field = reader.fields.get("general.architecture")
         if field is None:
             return None
         arch = str(field.contents())
-        return arch if arch in ("qwen35", "qwen35moe") else None
+        return arch if arch in sibling_config_gguf_archs() else None
     except Exception:
         return None
 
@@ -240,7 +249,7 @@ def get_config(
     **kwargs,
 ):
     is_gguf = check_gguf_file(model)
-    gguf_qwen35_arch = None
+    gguf_bespoke_arch = None
     if is_gguf:
         if model_config_parser not in ("auto", "hf"):
             raise ValueError(
@@ -248,13 +257,14 @@ def get_config(
                 "with GGUF inputs; only 'hf' (or 'auto') is supported."
             )
         _ensure_gguf_version()
-        # Qwen3.5/3.6 (hybrid GDN) GGUFs use arch "qwen35"/"qwen35moe", which
-        # transformers' GGUF metadata reader rejects ("architecture qwen35 is
-        # not supported yet"). These checkpoints ship a sibling config.json, so
-        # we read that directly (NO gguf_file kwarg) and route to the text-only
-        # causal-LM class below. See model_loader/gguf_qwen35.py.
-        gguf_qwen35_arch = _peek_qwen35_gguf_arch(model)
-        if gguf_qwen35_arch is None:
+        # Qwen3.5/3.6 hybrids (arch "qwen35"/"qwen35moe") and Gemma-4 (arch
+        # "gemma4") cannot use transformers' GGUF metadata reader (rejected
+        # arch / crashing gemma4 config synthesis, see
+        # _SIBLING_CONFIG_GGUF_ARCHS). These checkpoints ship a sibling
+        # config.json, so we read that directly (NO gguf_file kwarg). See
+        # model_loader/gguf_qwen35.py and model_loader/gguf_gemma4.py.
+        gguf_bespoke_arch = _peek_bespoke_gguf_arch(model)
+        if gguf_bespoke_arch is None:
             kwargs["gguf_file"] = model
         model = Path(model).parent
         # Skip auto-resolution for GGUF: the name-based Mistral heuristic
@@ -281,13 +291,15 @@ def get_config(
         config.update(model_override_args)
 
     if is_gguf:
-        if gguf_qwen35_arch is not None:
-            # Hybrid GDN qwen35: config.json was read directly (no gguf_file), so
-            # it already carries the correct architecture
-            # (Qwen3_5[Moe]ForConditionalGeneration, whose ``self.model`` gives the
-            # "model.layers.*" / "lm_head" param names the GGUF name map targets).
-            # The MODEL_FOR_CAUSAL_LM check below rejects conditional-generation
-            # model_types, so return here.
+        if gguf_bespoke_arch is not None:
+            # Bespoke families (qwen35 hybrids, gemma4): config.json was read
+            # directly (no gguf_file), so it already carries the correct
+            # architecture (Qwen3_5[Moe]ForConditionalGeneration /
+            # Gemma4ForConditionalGeneration, whose language-model subtree
+            # gives the param names the GGUF name map targets). The
+            # MODEL_FOR_CAUSAL_LM check below rejects conditional-generation
+            # model_types, so return here. (For GGUF, the multimodal wrapper
+            # stays text-only via the model_config.py force-off gate.)
             return config
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
