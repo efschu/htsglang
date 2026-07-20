@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """GGUF loading support for the Gemma-4 family (GGUF arch ``gemma4``).
 
-Second bespoke family entry beside ``gguf_qwen35.py`` (design: bespoke-first,
-S1; the neutral-seam registry extraction is a later stage gated on byte
-identity for qwen35). Dense Gemma-4 only — MoE / MTP / vision GGUF are
-deferred (S3) and fail fast below.
+Second bespoke family entry beside ``gguf_qwen35.py``.  Dense Gemma-4 only —
+MoE / MTP / vision GGUF are deferred (S3) and fail fast below.
+
+Structure (#129 S2): the quality/speed-neutral scaffolding (arch resolution,
+file-tensor probe, the emit/audit ``build_name_map`` skeleton, the F32-carve-out
+``unquantized_module_prefixes`` skeleton) lives in ``GGUFAdapterBase``; this
+module supplies the gemma4 emit *tables* + the irreducible per-family hooks
+(checkpoint-name rewrite, MoE fail-fast, dropped-tensor audit, module-prefix
+spelling) and the verbatim ``transform_stream`` (embed dequant + identity
+norms).
 
 Launch recipe (validated: Gemma-4-31B-it GGUF-Q4_K_M, TP=1 on an RTX 5090,
 coherent + self-deterministic + ~61 tok/s). Two non-obvious traps, neither of
@@ -80,9 +86,11 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import torch
+
+from sglang.srt.model_loader.gguf_adapter_base import GGUFAdapterBase
 
 logger = logging.getLogger(__name__)
 
@@ -122,43 +130,55 @@ def _unbake_norms() -> bool:
     return os.environ.get("SGLANG_GGUF_GEMMA4_NORM_UNBAKE", "0") == "1"
 
 
-class Gemma4GGUFAdapter:
+class Gemma4GGUFAdapter(GGUFAdapterBase):
     """Builds the GGUF<->HF name map and load-time transforms for one dense
-    Gemma-4 checkpoint.  Mirrors ``Qwen35GGUFAdapter``'s interface
-    (``build_name_map`` / ``unquantized_module_prefixes`` /
-    ``transform_stream`` / ``mmproj_path``)."""
+    Gemma-4 checkpoint.  Tables + hooks over ``GGUFAdapterBase``; the verbatim
+    ``transform_stream`` (embed dequant + identity norms) is the irreducible
+    per-family bit."""
 
-    # Vision is deferred (S3); the model_config.py GGUF text-only force-off
-    # guards the uninitialized vision tower.  Kept as an attribute so the
-    # loader can treat qwen35/gemma4 adapters uniformly.
-    mmproj_path = None
+    FAMILY = "gemma4"
+    MODEL_TYPE_TO_ARCH = _MODEL_TYPE_TO_GGUF_ARCH
 
-    def __init__(self, config, gguf_file: str):
-        # ``config`` is the multimodal wrapper (Gemma4Config) or the text
-        # config; layer count etc. live on the text config.
-        text_config = (
-            config.get_text_config() if hasattr(config, "get_text_config") else config
-        )
-        self.config = text_config
-        self.gguf_file = gguf_file
-        model_type = getattr(config, "model_type", None)
-        if not is_gemma4_gguf_arch(model_type):
-            model_type = text_config.model_type
-        self.arch = _MODEL_TYPE_TO_GGUF_ARCH[model_type]
-        self.num_layers = int(text_config.num_hidden_layers)
-        self._file_tensor_names = None  # set lazily
+    # ``lm_head`` (GGUF ``output``) is absent from tied exports; present-in-file
+    # filtering keeps the map honest either way.
+    GLOBAL_ENTRIES = (
+        ("model.embed_tokens", "weight"),
+        ("lm_head", "weight"),
+        ("model.norm", "weight"),
+    )
+    LAYER_ENTRIES = (
+        ("input_layernorm", "weight"),
+        ("post_attention_layernorm", "weight"),
+        ("pre_feedforward_layernorm", "weight"),
+        ("post_feedforward_layernorm", "weight"),
+        # attention (attn_v omitted by the export on k_eq_v layers; the
+        # model's should_dup_k_to_v fills the v shard from k)
+        ("self_attn.q_proj", "weight"),
+        ("self_attn.k_proj", "weight"),
+        ("self_attn.v_proj", "weight"),
+        ("self_attn.o_proj", "weight"),
+        ("self_attn.q_norm", "weight"),
+        ("self_attn.k_norm", "weight"),
+        # dense MLP (gelu gate-up; gate/up fuse via stacked_params_mapping)
+        ("mlp.gate_proj", "weight"),
+        ("mlp.up_proj", "weight"),
+        ("mlp.down_proj", "weight"),
+        # learned per-layer residual scalar: GGUF blk.N.layer_output_scale
+        # .weight -> bare HF buffer model.language_model.layers.N.layer_scalar
+        ("layer_scalar", "weight", ""),
+    )
+    # Split projections -> fused module for the F32 carve-out fold.
+    FUSE_MAP = {
+        "self_attn.q_proj": "self_attn.qkv_proj",
+        "self_attn.k_proj": "self_attn.qkv_proj",
+        "self_attn.v_proj": "self_attn.qkv_proj",
+        "mlp.gate_proj": "mlp.gate_up_proj",
+        "mlp.up_proj": "mlp.gate_up_proj",
+    }
 
     # ------------------------------------------------------------------
-    # Name mapping
+    # Name-map hooks
     # ------------------------------------------------------------------
-
-    def _file_tensors(self) -> set:
-        if self._file_tensor_names is None:
-            import gguf
-
-            reader = gguf.GGUFReader(self.gguf_file)
-            self._file_tensor_names = {t.name for t in reader.tensors}
-        return self._file_tensor_names
 
     @staticmethod
     def _to_checkpoint_name(hf_base: str) -> str:
@@ -175,22 +195,10 @@ class Gemma4GGUFAdapter:
             return "model.language_model." + hf_base[len("model.") :]
         return hf_base
 
-    def build_name_map(self) -> Dict[str, str]:
-        """Return ``{gguf_tensor_name: hf_param_name}`` for every tensor
-        present in the file.  Presence filtering auto-handles the
-        ``attention_k_eq_v`` layers (no ``attn_v`` in the export)."""
-        import gguf
+    def _map_base_to_hf(self, map_base: str) -> str:
+        return self._to_checkpoint_name(map_base)
 
-        arch_enum = None
-        for key, value in gguf.MODEL_ARCH_NAMES.items():
-            if value == self.arch:
-                arch_enum = key
-                break
-        if arch_enum is None:
-            raise RuntimeError(f"gguf-py has no arch {self.arch!r}")
-        name_map = gguf.get_tensor_name_map(arch_enum, self.num_layers)
-        file_tensors = self._file_tensors()
-
+    def _pre_map_hook(self, file_tensors: set) -> None:
         # Dense-only (S1): a MoE Gemma-4 GGUF needs the stacked-experts
         # split re-prefixed for the wrapper's param tree (S3); fail fast
         # instead of silently skipping expert weights (NaN hazard).
@@ -203,135 +211,14 @@ class Gemma4GGUFAdapter:
                 f"expert tensors, e.g. {sorted(moe_tensors)[:4]}"
             )
 
-        gguf_to_hf: Dict[str, str] = {}
+    def _is_unmapped_ignorable(self, name: str) -> bool:
+        return name.startswith(("v.", "mm.")) or name in _DROPPED_TENSORS
 
-        def emit(map_base: str, suffix: str, hf_suffix: Optional[str] = None) -> None:
-            """``map_base`` uses the gguf-py spelling; ``suffix`` is the GGUF
-            tensor suffix; ``hf_suffix`` (default: same) the HF param suffix
-            ("" == bare param, e.g. ``layer_scalar``)."""
-            gguf_base = name_map.get_name(map_base)
-            if gguf_base is None:
-                return
-            gguf_full = gguf_base + ("." + suffix if suffix else "")
-            if gguf_full not in file_tensors:
-                return
-            if hf_suffix is None:
-                hf_suffix = suffix
-            hf_base = self._to_checkpoint_name(map_base)
-            gguf_to_hf[gguf_full] = hf_base + ("." + hf_suffix if hf_suffix else "")
-
-        # Global tensors. ``lm_head`` (GGUF ``output``) is absent from tied
-        # exports; presence filtering keeps the map honest either way.
-        emit("model.embed_tokens", "weight")
-        emit("lm_head", "weight")
-        emit("model.norm", "weight")
-
-        for i in range(self.num_layers):
-            p = f"model.layers.{i}."
-            emit(p + "input_layernorm", "weight")
-            emit(p + "post_attention_layernorm", "weight")
-            emit(p + "pre_feedforward_layernorm", "weight")
-            emit(p + "post_feedforward_layernorm", "weight")
-            # attention (attn_v omitted by the export on k_eq_v layers; the
-            # model's should_dup_k_to_v fills the v shard from k)
-            emit(p + "self_attn.q_proj", "weight")
-            emit(p + "self_attn.k_proj", "weight")
-            emit(p + "self_attn.v_proj", "weight")
-            emit(p + "self_attn.o_proj", "weight")
-            emit(p + "self_attn.q_norm", "weight")
-            emit(p + "self_attn.k_norm", "weight")
-            # dense MLP (gelu gate-up; gate/up fuse via stacked_params_mapping)
-            emit(p + "mlp.gate_proj", "weight")
-            emit(p + "mlp.up_proj", "weight")
-            emit(p + "mlp.down_proj", "weight")
-            # learned per-layer residual scalar: GGUF blk.N.layer_output_scale
-            # .weight -> bare HF buffer model.language_model.layers.N.layer_scalar
-            emit(p + "layer_scalar", "weight", hf_suffix="")
-
-        unmapped = [
-            n
-            for n in file_tensors
-            if n not in gguf_to_hf
-            and n not in _DROPPED_TENSORS
-            and not n.startswith(("v.", "mm."))
-        ]
-        if unmapped:
-            raise RuntimeError(
-                f"gemma4 GGUF: {len(unmapped)} tensors not mapped: "
-                f"{sorted(unmapped)[:12]}"
-            )
-        logger.info(
-            "gemma4 GGUF name map: %d tensors for %d layers (arch %s)",
-            len(gguf_to_hf),
-            self.num_layers,
-            self.arch,
-        )
-        return gguf_to_hf
-
-    # ------------------------------------------------------------------
-    # Unquantized-module carve-out
-    # ------------------------------------------------------------------
-
-    def unquantized_module_prefixes(self) -> List[str]:
-        """Linear modules whose GGUF tensors are stored F32 and must be built
-        with UnquantizedLinearMethod (the GGUF iterator keeps F32 as plain
-        ``.weight``, which cannot load into a GGUF-quantized layer).  Dense
-        F16/BF16 projections stay quantized-resident (mixed-dtype shards,
-        task #64), exactly as in the qwen35 adapter.
-
-        Empty for the verified Q4_K_M export (its only F32 tensors are norms
-        and layer_scalar); implemented generically for other quant levels.
-        Prefixes are emitted in module spelling (leading ``model.`` stripped,
-        split projections folded into their fused module) for
-        ``is_layer_skipped_gguf``'s substring match.
-        """
-        import gguf
-
-        reader = gguf.GGUFReader(self.gguf_file)
-        types = {t.name: t.tensor_type for t in reader.tensors}
-        unq_types = {
-            gguf.GGMLQuantizationType.F32,
-            gguf.GGMLQuantizationType.F16,
-            gguf.GGMLQuantizationType.BF16,
-        }
-        f32_type = gguf.GGMLQuantizationType.F32
-        fuse = {
-            "self_attn.q_proj": "self_attn.qkv_proj",
-            "self_attn.k_proj": "self_attn.qkv_proj",
-            "self_attn.v_proj": "self_attn.qkv_proj",
-            "mlp.gate_proj": "mlp.gate_up_proj",
-            "mlp.up_proj": "mlp.gate_up_proj",
-        }
-        name_map = self.build_name_map()
-        prefixes = set()
-        module_split_types: Dict[str, set] = {}
-        for gname, hf in name_map.items():
-            if not hf.endswith(".weight"):
-                continue
-            base = hf[: -len(".weight")]
-            if "proj" not in base:
-                continue
-            for split, fused in fuse.items():
-                if base.endswith(split):
-                    base = base[: -len(split)] + fused
-                    break
-            # module prefixes lack the checkpoint's leading "model."
-            if base.startswith("model."):
-                base = base[len("model.") :]
-            module_split_types.setdefault(base, set()).add(types.get(gname))
-            if types.get(gname) == f32_type:
-                prefixes.add(base)
-        for base in sorted(prefixes):
-            tset = module_split_types.get(base, set())
-            if any(t is not None and t not in unq_types for t in tset):
-                raise RuntimeError(
-                    f"gemma4 GGUF: module {base!r} mixes an F32 split with a "
-                    f"quantized sibling "
-                    f"({sorted(t.name for t in tset if t is not None)}); "
-                    "this cannot be loaded either dense or quantized. "
-                    "Re-quantize the F32 tensor (e.g. to Q8_0/F16)."
-                )
-        return sorted(prefixes)
+    def _module_prefix_spelling(self, base: str) -> str:
+        # module prefixes lack the checkpoint's leading "model."
+        if base.startswith("model."):
+            return base[len("model.") :]
+        return base
 
     # ------------------------------------------------------------------
     # Weight-value transforms

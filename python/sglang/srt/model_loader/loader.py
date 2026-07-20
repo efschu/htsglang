@@ -2194,27 +2194,18 @@ class GGUFModelLoader(BaseModelLoader):
 
         local_model_path = self._prepare_weights(model_config.model_path)
 
-        # Bespoke family adapters: Qwen3.5/3.6 (hybrid GDN) and Gemma-4 need
-        # a bespoke name map + llama.cpp inverse weight transforms that the
-        # generic path cannot express. Both expose the same interface
-        # (build_name_map / unquantized_module_prefixes / transform_stream /
-        # mmproj_path); model types outside these families keep the generic
-        # HF-state_dict path unchanged.
-        from sglang.srt.model_loader.gguf_gemma4 import (
-            Gemma4GGUFAdapter,
-            is_gemma4_gguf_arch,
-        )
-        from sglang.srt.model_loader.gguf_qwen35 import (
-            Qwen35GGUFAdapter,
-            is_qwen35_gguf_arch,
-        )
+        # Bespoke family adapters (Qwen3.5/3.6 hybrid GDN, Gemma-4, ...) need a
+        # bespoke name map + llama.cpp inverse weight transforms that the generic
+        # path cannot express. The registry maps model_type -> adapter; all
+        # adapters expose the same interface (build_name_map /
+        # unquantized_module_prefixes / transform_stream / mmproj_path). Model
+        # types outside the registry keep the generic HF-state_dict path
+        # unchanged (create_gguf_adapter returns None).
+        from sglang.srt.model_loader.gguf_registry import create_gguf_adapter
 
-        model_type = getattr(model_config.hf_config, "model_type", None)
-        gguf_adapter = None
-        if is_qwen35_gguf_arch(model_type):
-            gguf_adapter = Qwen35GGUFAdapter(model_config.hf_config, local_model_path)
-        elif is_gemma4_gguf_arch(model_type):
-            gguf_adapter = Gemma4GGUFAdapter(model_config.hf_config, local_model_path)
+        gguf_adapter = create_gguf_adapter(
+            model_config.hf_config, local_model_path
+        )
         if gguf_adapter is not None:
             gguf_weights_map = gguf_adapter.build_name_map()
         else:
