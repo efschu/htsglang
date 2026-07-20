@@ -1214,6 +1214,44 @@ class ServerArgs:
             "on the head and every worker. Requires --weightless-kv-fastlane.",
         ),
     ] = 0
+    weightless_kv_host_spill_tokens: A[
+        int,
+        Arg(
+            help="EXPERIMENTAL (Variant C Stage B1): PER-RANK host KV overflow "
+            "slot count for the weightless-KV lane. 0 (default) = OFF -> the "
+            "full-attention KV shard stays entirely device-resident (Stage B0 "
+            "behavior). >0 attaches a pinned-host overflow tier of this many "
+            "compacted token slots to every rank's full-attention KV pool: the "
+            "profiled device pool D is split into (D - block_size) allocatable "
+            "device slots + a block_size staging region, and this many HOST "
+            "slots are appended to the logical slot space (slot s >= "
+            "D - block_size lives on host at s - (D - block_size); a STATIC, "
+            "deterministic, rank-uniform mapping). The Stage B0 block-decode "
+            "loop streams host-resident blocks H2D through the staging region "
+            "per step (and per prefill chunk for the committed prefix), "
+            "online-LSE-merged -- so a single sequence's KV can EXCEED the "
+            "rank's VRAM. All moves are rank-local memcpys; the cross-rank "
+            "collective count is unchanged. Each rank's addressable KV becomes "
+            "(D - block_size) + this value; a request of N tokens is admitted "
+            "when N < min(context_len, that sum). Requires "
+            "--weightless-kv-fastlane and --weightless-kv-chunked-block-size "
+            "> 0 (eager-only, like B0). Streaming is PCIe-bound: correctness "
+            "first, throughput is a later slice.",
+        ),
+    ] = 0
+    weightless_kv_spill_device_cap: A[
+        int,
+        Arg(
+            help="DEBUG/TEST knob for --weightless-kv-host-spill-tokens: cap "
+            "the ALLOCATABLE device-resident KV slots per rank to this many "
+            "tokens (0 = no cap). Slots past the cap live on the host tier "
+            "even though VRAM could hold them -- this FORCES the host-"
+            "streaming path at small contexts (the byte-parity gate: all-"
+            "resident vs streamed must match). Must be a server arg (not an "
+            "env var) so every rank sees the identical slot->tier map. Also "
+            "usable to deliberately keep device KV small.",
+        ),
+    ] = 0
     rank_tp_ratio: A[
         Optional[Union[List[int], str]],
         Arg(
@@ -3386,6 +3424,12 @@ class ServerArgs:
                     "--weightless-kv-fastlane (it restructures the weightless "
                     "lane decode attention)."
                 )
+            if self.weightless_kv_host_spill_tokens:
+                raise ValueError(
+                    "--weightless-kv-host-spill-tokens requires "
+                    "--weightless-kv-fastlane (it tiers the weightless lane's "
+                    "full-attention KV shard)."
+                )
             return
 
         # Single-node pure TP + DCP only.
@@ -3470,6 +3514,49 @@ class ServerArgs:
                 "--disable-cuda-graph) to run the block-decode path. Capturing "
                 "the variable block count is a later slice."
             )
+        # Stage B1 host spill: needs the B0 block loop (the streaming READ path
+        # IS the block loop) and clashes with anything that re-interprets KV
+        # slot identity or adds its own host tier. Fail fast, never silently
+        # coexist (a host slot read as a device slot = out-of-bounds KV).
+        if self.weightless_kv_host_spill_tokens:
+            if self.weightless_kv_host_spill_tokens < 0:
+                raise ValueError(
+                    "--weightless-kv-host-spill-tokens must be >= 0; got "
+                    f"{self.weightless_kv_host_spill_tokens}."
+                )
+            if not self.weightless_kv_chunked_block_size:
+                raise ValueError(
+                    "--weightless-kv-host-spill-tokens (Stage B1) requires "
+                    "--weightless-kv-chunked-block-size > 0: host-resident KV "
+                    "blocks are streamed through the B0 block-decode staging "
+                    "loop; without it the monolithic attention would read "
+                    "host slot ids as (out-of-bounds) device slots."
+                )
+            if self.page_size not in (None, 1):
+                # None = not yet resolved -> defaults to 1 for this lane.
+                raise ValueError(
+                    "--weightless-kv-host-spill-tokens requires page_size == 1 "
+                    f"(the lane's natural page size); got {self.page_size}."
+                )
+            if self.enable_hierarchical_cache or self.enable_unified_memory:
+                raise ValueError(
+                    "--weightless-kv-host-spill-tokens is its own host tier "
+                    "for the weightless lane; it cannot be combined with "
+                    "--enable-hierarchical-cache or --enable-unified-memory."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--weightless-kv-host-spill-tokens does not support "
+                    "PD disaggregation "
+                    f"(disaggregation_mode={self.disaggregation_mode})."
+                )
+            if self.rank_tp_ratio is not None:
+                raise ValueError(
+                    "--weightless-kv-host-spill-tokens supports the even-"
+                    "modulo DCP owner rule only (no --rank-tp-ratio / "
+                    "weighted token vector); the static slot->tier map is "
+                    "defined on the even compaction loc // dcp_size."
+                )
 
     def _handle_model_source_paths(self):
         """Resolve model/tokenizer paths backed by remote object stores."""

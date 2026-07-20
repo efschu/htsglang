@@ -564,6 +564,39 @@ class FlashInferAttnBackend(AttentionBackend):
                 # workspace so re-planning per block never clobbers the main
                 # decode/prefill wrappers' scheduling metadata).
                 self._wl_block_wrapper = None
+                # Stage B1: host-spill tier. Static slot->tier map: compacted
+                # slot s < _wl_dev_slots is device-resident (identity);
+                # s >= _wl_dev_slots lives on host at s - _wl_dev_slots and is
+                # streamed H2D through the staging region
+                # [_wl_stage_base, _wl_stage_base + _wl_stage_cap) of the
+                # device pool by _wl_stage_block. Deterministic + rank-uniform
+                # by construction (a pure function of the broadcast slot ids);
+                # all moves are rank-local memcpys on the current stream -- the
+                # cross-rank collective count is untouched.
+                self._wl_spill_active = bool(
+                    getattr(model_runner, "_wl_spill_phys_tokens", 0)
+                ) and not model_runner.is_draft_worker
+                if self._wl_spill_active:
+                    assert self._wl_chunk_block_size > 0, (
+                        "weightless-KV host spill requires the B0 block loop "
+                        "(--weightless-kv-chunked-block-size > 0)"
+                    )
+                    self._wl_dev_slots = int(model_runner._wl_spill_device_tokens)
+                    self._wl_stage_base = self._wl_dev_slots
+                    self._wl_stage_cap = int(model_runner._wl_spill_staging_tokens)
+                    self._wl_host_slots = int(model_runner._wl_spill_host_tokens)
+                    self._wl_host_pool = getattr(
+                        model_runner, "wl_spill_host_pool", None
+                    )
+                    assert self._wl_host_pool is not None, (
+                        "weightless-KV host spill active but no host tier was "
+                        "attached to the full-attention KV pool"
+                    )
+                    self._wl_full_pool = model_runner.token_to_kv_pool.full_kv_pool
+                    # Lazily-created persistent block PREFILL wrapper for the
+                    # streamed committed-prefix attention in extend (mirrors
+                    # _wl_block_wrapper for decode).
+                    self._wl_block_prefill_wrapper = None
             else:
                 self.dcp_kv_replicated_heads = attn_kv_replicated(
                     attn_tp_size, total_kv
@@ -1702,6 +1735,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 dcp_kv_mask = positions % self.dcp_size == self.dcp_rank
             else:
                 dcp_kv_mask = forward_batch.dcp_kv_mask
+        if getattr(self, "_wl_spill_active", False):
+            # Stage B1: owned slots may land in the HOST region of the logical
+            # slot space; split the write (device part unchanged, host part
+            # staged then copied D2H). Strictly the spill lane.
+            self._wl_spill_owner_write(layer, loc, dcp_kv_mask, k_full, v_full)
+            return
         self.token_to_kv_pool.set_kv_buffer(
             layer,
             loc,
@@ -1711,6 +1750,102 @@ class FlashInferAttnBackend(AttentionBackend):
             layer.v_scale,
             dcp_kv_mask=dcp_kv_mask,
         )
+
+    def _wl_spill_owner_write(self, layer, loc, dcp_kv_mask, k_full, v_full):
+        """B1 owner-write over the tiered slot space. Device-region slots take
+        the EXACT existing masked set_kv_buffer path. Host-region slots are
+        first written into the staging region with the SAME set_kv_buffer
+        semantics (identical dtype/scale handling -> the bytes are identical
+        to what a device write would have produced) and then copied D2H into
+        the pinned host tier for this layer -- a lossless byte move on the
+        current stream. No mapping tables, no alloc state: host slot id =
+        compacted slot - device_slots (the static tier map)."""
+        pool = self.token_to_kv_pool
+        dev_limit = self._wl_dev_slots
+        host_rows = dcp_kv_mask & (loc >= dev_limit)
+        if not bool(host_rows.any().item()):
+            pool.set_kv_buffer(
+                layer,
+                loc,
+                k_full.clone(),
+                v_full.clone(),
+                layer.k_scale,
+                layer.v_scale,
+                dcp_kv_mask=dcp_kv_mask,
+            )
+            return
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer
+
+        dev_mask = dcp_kv_mask & ~host_rows
+        # Device part: identical masked write; host-region loc values are
+        # masked OFF but clamp them anyway so no out-of-range slot id ever
+        # reaches the device-pool scatter.
+        safe_loc = torch.where(loc < dev_limit, loc, torch.zeros_like(loc))
+        pool.set_kv_buffer(
+            layer,
+            safe_loc,
+            k_full.clone(),
+            v_full.clone(),
+            layer.k_scale,
+            layer.v_scale,
+            dcp_kv_mask=dev_mask,
+        )
+        # Host part: stage -> D2H, chunked to the staging capacity.
+        if not getattr(self, "_wl_spill_write_logged", False):
+            self._wl_spill_write_logged = True
+            logger.info(
+                "Weightless-KV host spill: first D2H owner-write into the "
+                "host tier (dcp_rank %d, layer %d).",
+                self.dcp_rank,
+                layer.layer_id,
+            )
+        idx = host_rows.nonzero(as_tuple=False).flatten()
+        host_ids_all = loc[idx].to(torch.int64) - dev_limit
+        n_miss = int((host_ids_all >= self._wl_host_slots).sum().item())
+        if n_miss:
+            raise RuntimeError(
+                "weightless-KV host spill: owner-write beyond the host tier "
+                f"({n_miss} slot(s) past {self._wl_host_slots} tokens, "
+                f"dcp_rank {self.dcp_rank}, layer {layer.layer_id}). The "
+                "allocator and the host tier disagree; refusing a silent "
+                "out-of-range KV write."
+            )
+        fl = self._wl_full_layer_idx(layer)
+        full_pool = self._wl_full_pool
+        host_pool = self._wl_host_pool
+        k_sel = k_full[idx]
+        v_sel = v_full[idx]
+        total = idx.numel()
+        cap = self._wl_stage_cap
+        for off in range(0, total, cap):
+            end = min(off + cap, total)
+            n = end - off
+            stage_slots = torch.arange(
+                self._wl_stage_base,
+                self._wl_stage_base + n,
+                dtype=torch.int64,
+                device=loc.device,
+            )
+            # Same write kernel/dtype path as a device-resident slot.
+            pool.set_kv_buffer(
+                layer,
+                stage_slots.to(loc.dtype),
+                k_sel[off:end],
+                v_sel[off:end],
+                layer.k_scale,
+                layer.v_scale,
+            )
+            # Lossless D2H byte copy of the staged rows into the host tier
+            # (device kernel writing pinned host memory, current stream).
+            transfer_kv_per_layer(
+                src_k=full_pool.k_buffer[fl],
+                dst_k=host_pool.k_data_refs[fl],
+                src_v=full_pool.v_buffer[fl],
+                dst_v=host_pool.v_data_refs[fl],
+                src_indices=stage_slots,
+                dst_indices=host_ids_all[off:end],
+                item_size=host_pool.token_stride_size,
+            )
 
     def _wl_block_decode_wrapper(self):
         """Persistent block decode wrapper for the Stage B0 block loop. Lazily
@@ -1778,7 +1913,7 @@ class FlashInferAttnBackend(AttentionBackend):
         lse_acc = None
         for j in range(num_blocks):
             blk_indices, blk_indptr = self._wl_stage_block(
-                kv_indices, indptr_host, bs, j, B
+                kv_indices, indptr_host, bs, j, B, layer
             )
             if blk_indices is None:
                 # Entirely empty block on this rank (kept in the rank-uniform
@@ -1835,14 +1970,16 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         return o_acc, lse_acc
 
-    def _wl_stage_block(self, kv_indices, indptr_host, bs, j, B):
+    def _wl_stage_block(self, kv_indices, indptr_host, bs, j, B, layer):
         """Stage block ``j`` of the owned KV shard into the (bounded) device
-        region the block wrapper reads. B0: the slots are already resident, so
-        this is a pure index slice of ``kv_indices`` (no data move). B1 will
-        replace the body with a host->device copy of the block's KV into a fixed
-        staging buffer and return indices INTO that buffer -- the caller's merge
-        loop is unchanged. Returns (block_kv_indices, block_kv_indptr), or
-        (None, None) when the block is empty on this rank."""
+        region the block wrapper reads. B0 (all-resident): a pure index slice
+        of ``kv_indices`` (no data move). B1 (host spill active): slots in the
+        HOST region (compacted slot >= _wl_dev_slots) are streamed H2D for
+        ``layer`` into the staging slots and their indices rewritten IN PLACE
+        (order preserved) to point at the staged copies -- the caller's merge
+        loop is unchanged, so the byte class is unchanged. Returns
+        (block_kv_indices, block_kv_indptr), or (None, None) when the block is
+        empty on this rank."""
         seg_list = []
         blk_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=kv_indices.device)
         for i in range(bs):
@@ -1857,7 +1994,190 @@ class FlashInferAttnBackend(AttentionBackend):
         if not seg_list:
             return None, None
         blk_indices = torch.cat(seg_list).contiguous()
+        if getattr(self, "_wl_spill_active", False):
+            blk_indices = self._wl_stage_host_slots(blk_indices, layer)
         return blk_indices, blk_indptr
+
+    def _wl_full_layer_idx(self, layer):
+        """Raw index of ``layer`` into the full-attention sub-pool's per-layer
+        k/v buffer lists (the HybridLinearKVPool translation, minus the sub-
+        pool's own start_layer offset). Both the host tier's transfer methods
+        and the raw D2H spill write index the buffers with this."""
+        mapped = self.token_to_kv_pool._transfer_full_attention_id(layer.layer_id)
+        return mapped - getattr(self._wl_full_pool, "start_layer", 0)
+
+    def _wl_stage_host_slots(self, blk_indices, layer):
+        """B1 block SOURCE swap: for every HOST-resident slot in this block,
+        stream its KV for ``layer`` H2D into the bounded staging region and
+        return the block's indices with those entries rewritten to the staging
+        slots (order preserved -> the partial attention consumes byte-identical
+        values in the identical layout). Device-resident slots pass through
+        untouched, so an all-resident block is byte-for-byte the B0 path.
+
+        FAIL LOUD on any slot that cannot be staged (staging overflow / host
+        range miss): a silently skipped block would feed garbage KV into the
+        merge -- wrong output, not a hang (the collective count would still
+        match)."""
+        hmask = blk_indices >= self._wl_dev_slots
+        n_host = int(hmask.sum().item())
+        if n_host == 0:
+            return blk_indices
+        if n_host > self._wl_stage_cap:
+            raise RuntimeError(
+                "weightless-KV host spill: block demands "
+                f"{n_host} staged host slots but the staging region holds only "
+                f"{self._wl_stage_cap} (dcp_rank {self.dcp_rank}, layer "
+                f"{layer.layer_id}). This happens when multiple concurrently "
+                "running requests are simultaneously past the device-resident "
+                "capacity; B1 supports one spilled request per block "
+                "iteration. Lower concurrency or raise "
+                "--weightless-kv-chunked-block-size."
+            )
+        host_ids = (blk_indices[hmask].to(torch.int64)) - self._wl_dev_slots
+        n_miss = int((host_ids >= self._wl_host_slots).sum().item())
+        if n_miss:
+            raise RuntimeError(
+                "weightless-KV host spill: HOST MISS -- "
+                f"{n_miss} required slot(s) beyond the {self._wl_host_slots}-"
+                f"token host tier (dcp_rank {self.dcp_rank}, layer "
+                f"{layer.layer_id}). The logical slot space and the host tier "
+                "disagree; refusing to attend garbage KV."
+            )
+        stage_slots = torch.arange(
+            self._wl_stage_base,
+            self._wl_stage_base + n_host,
+            dtype=torch.int64,
+            device=blk_indices.device,
+        )
+        if not getattr(self, "_wl_spill_read_logged", False):
+            self._wl_spill_read_logged = True
+            logger.info(
+                "Weightless-KV host spill: first H2D block stream engaged "
+                "(dcp_rank %d, layer %d, %d host slot(s) staged).",
+                self.dcp_rank,
+                layer.layer_id,
+                n_host,
+            )
+        # Lossless pinned-host -> device byte copy for THIS layer, on the
+        # current stream (stream order alone guarantees the partial attention
+        # below reads the staged bytes -- no extra sync needed).
+        self._wl_host_pool.load_to_device_per_layer(
+            self._wl_full_pool,
+            host_ids,
+            stage_slots,
+            self._wl_full_layer_idx(layer),
+            io_backend="kernel",
+        )
+        out = blk_indices.clone()
+        out[hmask] = stage_slots.to(blk_indices.dtype)
+        return out
+
+    def _wl_block_prefix_wrapper(self):
+        """Persistent block PREFILL wrapper for the B1 streamed prefix read.
+        Lazily created; re-planned per block. Shares the backend workspace --
+        safe because whenever this loop runs, the MAIN paged prefix wrapper is
+        never .run() for that batch (this loop replaces it entirely), and the
+        ragged current-chunk wrapper's run precedes the loop on the same
+        stream."""
+        if self._wl_block_prefill_wrapper is None:
+            self._wl_block_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=self.prefill_backend,
+            )
+        return self._wl_block_prefill_wrapper
+
+    def _wl_blockwise_prefix_return_lse(
+        self, q_full, layer, fallback_wrapper, logits_soft_cap=None
+    ):
+        """Stage B1: blockwise NON-CAUSAL paged read of this rank's OWNED
+        committed-prefix slots for one extend chunk, streaming HOST-resident
+        blocks through the staging region -- the extend twin of
+        _wl_blockwise_decode_return_lse. Partials are online-merged with the
+        SAME _safe_merge_state operator (both partials come from the same
+        flashinfer paged-wrapper family), so the byte class matches the B0
+        block loop. Returns (o, lse) in the same shape/space as the monolithic
+        ``prefill_wrapper_paged.forward_return_lse`` so the existing cross-rank
+        cp_lse merge and the ragged/prefix logaddexp combine are UNCHANGED.
+
+        The loop is intra-rank (no collective inside); the cross-rank
+        collective count of the extend layer forward is identical to the
+        monolithic path by construction."""
+        kv_indptr = self._dcp_extend_owned_kv_indptr
+        kv_indices = self._dcp_extend_owned_kv_indices
+        qo_indptr = self._dcp_extend_qo_indptr
+        prefix_lens = self._dcp_extend_global_prefix_lens
+        B = self._wl_chunk_block_size
+        bs = kv_indptr.numel() - 1
+        kv_buffer = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        num_qo_heads = q_full.shape[1]
+        iu = self.indices_updater_prefill
+        num_kv_heads = iu.num_kv_heads
+        head_dim = q_full.shape[2]
+
+        if logits_soft_cap is None:
+            logits_soft_cap = layer.logit_cap
+
+        # Rank-uniform block count from the GLOBAL prefix length (same nested-
+        # ceiling identity as the decode loop: a global window of B * dcp_size
+        # positions holds ~B owned slots on every rank and covers all of them).
+        global_max = int(prefix_lens.max().item())
+        per_block_global = B * self.dcp_size
+        num_blocks = max(1, (global_max + per_block_global - 1) // per_block_global)
+
+        indptr_host = kv_indptr.to("cpu")
+        wrapper = self._wl_block_prefix_wrapper()
+        last_page = self.kv_last_page_len
+
+        o_acc = None
+        lse_acc = None
+        for j in range(num_blocks):
+            blk_indices, blk_indptr = self._wl_stage_block(
+                kv_indices, indptr_host, bs, j, B, layer
+            )
+            if blk_indices is None:
+                continue
+            wrapper.plan(
+                qo_indptr,
+                blk_indptr,
+                blk_indices,
+                last_page[:bs],
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,  # page_size
+                causal=False,
+                q_data_type=iu.q_data_type,
+                kv_data_type=iu.data_type,
+            )
+            o_b, lse_b = wrapper.forward_return_lse(
+                q_full,
+                kv_buffer,
+                causal=False,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+            if o_acc is None:
+                o_acc, lse_acc = o_b, lse_b
+            else:
+                o_acc, lse_acc = _safe_merge_state(o_acc, lse_acc, o_b, lse_b)
+        if o_acc is None:
+            # This rank owns ZERO prefix slots (only possible for tiny global
+            # prefixes -- necessarily all device-resident, so the monolithic
+            # wrapper is safe). Reproduce the monolithic empty-attention
+            # contract (o=0, lse=-inf) exactly as the baseline does.
+            o_acc, lse_acc = fallback_wrapper.forward_return_lse(
+                q_full,
+                kv_buffer,
+                causal=False,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+        return o_acc, lse_acc
 
     def _forward_decode_dcp(
         self, q, k, v, layer, forward_batch, decode_wrapper, cache_loc, save_kv_cache
@@ -1983,15 +2303,25 @@ class FlashInferAttnBackend(AttentionBackend):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
-        o_pre, lse_pre = prefill_wrapper_paged.forward_return_lse(
-            q_full,
-            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            causal=False,
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        if getattr(self, "_wl_spill_active", False) and getattr(
+            self, "_dcp_extend_has_host", False
+        ):
+            # Stage B1: stream this rank's host-resident owned prefix blocks
+            # (rank-LOCAL loop, collective count unchanged -- mirrors the
+            # head's _forward_extend_dcp branch).
+            o_pre, lse_pre = self._wl_blockwise_prefix_return_lse(
+                q_full, layer, prefill_wrapper_paged
+            )
+        else:
+            o_pre, lse_pre = prefill_wrapper_paged.forward_return_lse(
+                q_full,
+                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                causal=False,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
         cp_lse_ag_out_ar_mha_uneven(o_pre, lse_pre, group, self.dcp_q_head_counts)
 
     def _replicated_kv_ragged_reindex(self, local_q, local_kv, device):
@@ -2118,15 +2448,26 @@ class FlashInferAttnBackend(AttentionBackend):
         #    current query). Combine the per-rank partials across the DCP group
         #    and slice back to this rank's local heads.
         q_full = cp_all_gather_heads_uneven(q_local, group, self.dcp_q_head_counts)
-        o_pre, lse_pre = prefill_wrapper_paged.forward_return_lse(
-            q_full,
-            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            causal=False,
-            sm_scale=layer.scaling,
-            logits_soft_cap=logits_soft_cap,
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        if getattr(self, "_wl_spill_active", False) and getattr(
+            self, "_dcp_extend_has_host", False
+        ):
+            # Stage B1: part of this rank's owned prefix lives on host --
+            # stream it blockwise through the staging region. Rank-LOCAL
+            # branch (no collective inside the loop); the cp_lse below is
+            # reached identically either way.
+            o_pre, lse_pre = self._wl_blockwise_prefix_return_lse(
+                q_full, layer, prefill_wrapper_paged, logits_soft_cap
+            )
+        else:
+            o_pre, lse_pre = prefill_wrapper_paged.forward_return_lse(
+                q_full,
+                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                causal=False,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
         o_pre, lse_pre = cp_lse_ag_out_ar_mha_uneven(
             o_pre, lse_pre, group, self.dcp_q_head_counts, return_lse=True
         )
@@ -2946,6 +3287,22 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = cross_attention_custom_mask
+            # Stage B1 (weightless host spill): stash THIS rank's owned prefix
+            # layout + whether any owned prefix slot is HOST-resident, so the
+            # per-layer forward can stream the committed prefix blockwise
+            # (_wl_blockwise_prefix_return_lse) instead of the monolithic paged
+            # read (which would deref host slot ids as device slots). Reference
+            # assignment only; dead when spill is off (default).
+            if getattr(self.attn_backend, "_wl_spill_active", False):
+                ab = self.attn_backend
+                n_owned = int(kv_indptr[-1].item())
+                ab._dcp_extend_owned_kv_indptr = kv_indptr
+                ab._dcp_extend_owned_kv_indices = kv_indices
+                ab._dcp_extend_qo_indptr = qo_indptr
+                ab._dcp_extend_global_prefix_lens = prefix_lens
+                ab._dcp_extend_has_host = bool(
+                    (kv_indices[:n_owned] >= ab._wl_dev_slots).any().item()
+                )
         elif (
             self.attn_backend.uneven_dcp
             and spec_info is not None
