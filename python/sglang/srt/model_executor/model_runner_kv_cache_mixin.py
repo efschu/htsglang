@@ -998,9 +998,134 @@ class ModelRunnerKVCacheMixin:
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = bundle.unified_memory_pool
 
+    def _wl_attach_spill_host_pool(self: ModelRunner):
+        """Weightless-KV Stage B1: attach the pinned-host overflow tier to the
+        full-attention KV pool (`HybridLinearKVPool.full_kv_pool`).
+
+        The tier is a stock ``MHATokenToKVPoolHost`` (the de-risked lossless
+        byte substrate). Its constructor sizes in whole GB, so we request the
+        smallest GB budget covering ``_wl_spill_host_tokens`` and simply use
+        host slots [0, H); the static slot->tier map (compacted slot s ->
+        host slot s - device_tokens) replaces the HostKVCache alloc/free state
+        machine entirely -- no radix/HiCache controller is involved. The
+        GDN/linear-attention state (mamba pool) keeps its small resident state
+        and is NOT tiered."""
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+        full_pool = self.token_to_kv_pool.full_kv_pool
+        per_token_bytes = (
+            full_pool.head_num
+            * full_pool.head_dim
+            * full_pool.layer_num
+            * full_pool.store_dtype.itemsize
+            * 2  # K + V
+        )
+        need_bytes = self._wl_spill_host_tokens * per_token_bytes
+        host_size_gb = max(1, -(-need_bytes // 10**9))  # ceil to whole GB
+        host_pool = MHATokenToKVPoolHost(
+            device_pool=full_pool,
+            host_to_device_ratio=0.0,
+            host_size=host_size_gb,
+            page_size=self.page_size,
+            layout="layer_first",
+            pin_memory=True,
+        )
+        if host_pool.size < self._wl_spill_host_tokens:
+            raise ValueError(
+                "weightless-KV host spill: allocated host tier holds "
+                f"{host_pool.size} tokens < requested "
+                f"{self._wl_spill_host_tokens}."
+            )
+        self.wl_spill_host_pool = host_pool
+        logger.info(
+            "Weightless-KV host spill (B1): attached %d-token pinned host "
+            "tier (%.2f GB) to the full-attention KV pool.",
+            self._wl_spill_host_tokens,
+            need_bytes / 1e9,
+        )
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+
+        # ---- Weightless-KV Stage B1: host-spill pool split -----------------
+        # Split the PROFILED per-rank pool D (what actually fits in VRAM) into
+        #   [0, D - B)   allocatable DEVICE slots,
+        #   [D - B, D)   the bounded STAGING region (B = the B0 block size;
+        #                never handed out by the allocator -- the block loop
+        #                streams host-resident blocks H2D into it), and append
+        #   H = weightless_kv_host_spill_tokens HOST slots to the LOGICAL
+        # compacted slot space: max_total_num_tokens becomes (D - B) + H, so
+        # the DCP allocator index space ((D-B+H) * dcp_size) and scheduler
+        # admission grow past VRAM while the device tensors stay exactly the
+        # profiled size D. The slot->tier map is STATIC and rank-uniform by
+        # construction: compacted slot s >= D - B lives on host at s - (D - B).
+        self._wl_spill_phys_tokens = 0
+        _wl_spill = int(
+            getattr(self.server_args, "weightless_kv_host_spill_tokens", 0) or 0
+        )
+        if _wl_spill > 0 and not self.is_draft_worker:
+            # Alias the import: a bare local import would SHADOW the module-
+            # level `weightless_kv_active` for this whole function scope
+            # (UnboundLocalError on the default path).
+            from sglang.srt.distributed.utils import (
+                weightless_kv_active as _wl_kv_active,
+            )
+
+            if _wl_kv_active():
+                _wl_stage = int(self.server_args.weightless_kv_chunked_block_size)
+                _wl_phys = int(self.max_total_num_tokens)
+                if _wl_phys <= 2 * _wl_stage:
+                    raise ValueError(
+                        "weightless-KV host spill: the profiled device pool "
+                        f"({_wl_phys} tokens/rank) is too small to carve out a "
+                        f"{_wl_stage}-slot staging region (need > "
+                        f"{2 * _wl_stage}). Lower "
+                        "--weightless-kv-chunked-block-size or free VRAM."
+                    )
+                self._wl_spill_phys_tokens = _wl_phys
+                self._wl_spill_staging_tokens = _wl_stage
+                self._wl_spill_device_tokens = _wl_phys - _wl_stage
+                _wl_cap = int(
+                    getattr(
+                        self.server_args, "weightless_kv_spill_device_cap", 0
+                    )
+                    or 0
+                )
+                if 0 < _wl_cap < self._wl_spill_device_tokens:
+                    # Cap the device-resident KV even though VRAM could hold
+                    # more (identical on every rank -- this is a server arg,
+                    # so the static slot->tier map stays rank-uniform). The
+                    # PHYSICAL pool shrinks to cap + staging as well, so the
+                    # VRAM actually saved is real (forces host streaming for
+                    # any context past the cap; also the byte-parity test
+                    # knob).
+                    logger.warning(
+                        "Weightless-KV host spill: DEVICE-CAP active -- "
+                        "allocatable device slots clamped %d -> %d, physical "
+                        "pool %d -> %d tokens (forces host streaming).",
+                        self._wl_spill_device_tokens,
+                        _wl_cap,
+                        self._wl_spill_phys_tokens,
+                        _wl_cap + _wl_stage,
+                    )
+                    self._wl_spill_device_tokens = _wl_cap
+                    self._wl_spill_phys_tokens = _wl_cap + _wl_stage
+                self._wl_spill_host_tokens = _wl_spill
+                self.max_total_num_tokens = (
+                    self._wl_spill_device_tokens + _wl_spill
+                )
+                logger.info(
+                    "Weightless-KV host spill (B1): profiled device pool %d "
+                    "tokens/rank -> %d allocatable device slots + %d staging "
+                    "slots + %d HOST slots; logical per-rank KV capacity %d "
+                    "tokens (x dcp_size for the global allocator space).",
+                    _wl_phys,
+                    self._wl_spill_device_tokens,
+                    _wl_stage,
+                    _wl_spill,
+                    self.max_total_num_tokens,
+                )
 
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
         # from one byte buffer, then return. Gated to the target worker
@@ -1523,6 +1648,13 @@ class ModelRunnerKVCacheMixin:
                     _S = cp_token_split_factor(self.dcp_size)
                     _ratio_r = _ratios[get_parallel().attn_dcp_rank]
                     _hybrid_pool_size = (self.max_total_num_tokens // _S) * _ratio_r
+                elif getattr(self, "_wl_spill_phys_tokens", 0):
+                    # Weightless-KV B1 host spill: the DEVICE tensors are sized
+                    # to the PROFILED capacity D (device slots + staging), NOT
+                    # to the enlarged logical slot space (device + HOST slots).
+                    # Host-region slots never reach the device scatter -- the
+                    # owner-write / block-stage paths redirect them.
+                    _hybrid_pool_size = self._wl_spill_phys_tokens
                 else:
                     _hybrid_pool_size = self.max_total_num_tokens
                 self.token_to_kv_pool = HybridLinearKVPool(
@@ -1553,6 +1685,8 @@ class ModelRunnerKVCacheMixin:
                     post_capture_active=self.post_capture_kv_active,
                     **extra_args,
                 )
+                if getattr(self, "_wl_spill_phys_tokens", 0):
+                    self._wl_attach_spill_host_pool()
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     assert (

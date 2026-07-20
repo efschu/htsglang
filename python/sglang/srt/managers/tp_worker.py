@@ -541,15 +541,30 @@ class TpModelWorker(BaseTpWorker):
             # produced no logits (its stripped forward only attends its KV
             # token-shard). It never samples -- only the head rank has the
             # lm_head + valid hidden states and produces the authoritative
-            # tokens (only rank 0 emits output). Give this rank a DUMMY
-            # batch-sized next_token_ids (mirroring the prefill-only path below)
-            # so the scheduler's copy_to_cpu / result processing runs harmlessly
-            # on every rank. KV-slot decisions come from the rank-0 leader's
-            # broadcast batch, so the workers' dummy tokens don't affect KV
-            # correctness.
+            # tokens (only rank 0 emits output).
+            #
+            # EOS-desync fix: this rank's next_token_ids must be the HEAD'S
+            # REAL sampled tokens, not dummies. The lockstep schedulers derive
+            # req.output_ids -> update_finish_state() from them; with dummy
+            # zeros a token-dependent finish (EOS / stop token / stop string)
+            # fires on the head only, the head drops the request while this
+            # rank keeps decoding phantom steps, and the per-layer DCP
+            # collectives desync into a permanent hang (observed: workers
+            # blocked in guard_dcp_step's monitored_barrier as group rank > 0,
+            # which never times out). One tiny gloo broadcast per generation
+            # batch on the existing lockstep CPU channel; the head's matching
+            # send is below. The per-layer NCCL collective count is untouched.
             if getattr(self.model_runner, "is_weightless_worker", False):
-                batch_result.next_token_ids = torch.zeros(
-                    len(forward_batch.seq_lens),
+                head_ids = broadcast_pyobj(
+                    [],
+                    self.tp_size * self.pp_rank + self.tp_rank,
+                    self.world_group.cpu_group,
+                    src=self.world_group.ranks[
+                        self.server_args.weightless_kv_head_rank
+                    ],
+                )
+                batch_result.next_token_ids = torch.tensor(
+                    head_ids,
                     dtype=torch.long,
                     device=forward_batch.seq_lens.device,
                 )
@@ -564,6 +579,17 @@ class TpModelWorker(BaseTpWorker):
                 and not self.enable_spec
                 and forward_batch.sampling_info.grammars is not None
             ):
+                if getattr(self.model_runner, "is_weightless_head", False):
+                    # The weightless workers block on the head's token
+                    # broadcast right after their stripped forward; a delayed
+                    # (grammar) sample would leave them waiting on a send that
+                    # never comes at this point -- a silent hang. Fail loud.
+                    raise RuntimeError(
+                        "--weightless-kv-fastlane does not support delayed "
+                        "(grammar/structured-output) sampling: the weightless "
+                        "workers require the head's sampled tokens at the end "
+                        "of every generation forward."
+                    )
 
                 def sample_batch_func():
                     batch_result.next_token_ids = self.model_runner.sample(
@@ -595,6 +621,24 @@ class TpModelWorker(BaseTpWorker):
                     self.model_runner.compute_logprobs_only(
                         logits_output, forward_batch
                     )
+
+            # Weightless-KV fast lane: send the authoritative sampled tokens to
+            # the weightless workers (they block on this right after their
+            # stripped forward -- see the is_weightless_worker branch above).
+            # Keeps every rank's scheduler state (output_ids -> finish state ->
+            # radix keys) identical to the head's; with dummy tokens a
+            # token-dependent finish (EOS/stop) desyncs the lockstep loop into
+            # a permanent DCP hang. One tiny gloo broadcast per generation
+            # batch; per-layer NCCL collective count untouched.
+            if getattr(self.model_runner, "is_weightless_head", False):
+                broadcast_pyobj(
+                    batch_result.next_token_ids.tolist(),
+                    self.tp_size * self.pp_rank + self.tp_rank,
+                    self.world_group.cpu_group,
+                    src=self.world_group.ranks[
+                        self.server_args.weightless_kv_head_rank
+                    ],
+                )
 
             return batch_result
         else:
