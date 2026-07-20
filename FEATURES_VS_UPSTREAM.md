@@ -405,6 +405,30 @@ hardware-agnostic (Category B) — it improves interactive TTFT under load on an
   context limiter for big models (addressed by the load-time MoE offload in §6); **[neutral] TP-only,
   single-node** — PP/DP/EP/spec are rejected by design (hard fail-fast).
 
+- **Streaming-block decode + latency-hiding on the cross-rank KV path (#128 / #132 / #136a / #136b)** —
+  the weightless lane's decode now runs as a CUDA-graph-captured **streaming block-decode** (#136a,
+  `da30c7a41`) with the standard latency-hiding techniques applied to the fork's cross-rank path:
+  **DCP-collective/compute overlap** (#128 — hide the per-step Q-broadcast + LSE-merge behind the head's
+  GDN/FFN compute; default-OFF, opt-in, proven-safe), **DCP comm-fusion** (#132 — fuse the per-layer
+  k+v head all-gathers into one collective, behind its own byte-identity gate; mirrored on the
+  weightless workers), and an **in-graph H2D double-buffer / prefetch** (#136b, `517012fdc` — overlap
+  the host→device KV-shard copies with compute inside the captured graph).
+  *The techniques themselves (double-buffering, prefetch, comm/compute overlap, collective fusion) are
+  textbook and **not fork-invented** — what is fork-original is that there is no upstream equivalent to
+  apply them to: the streaming-block attention, the 4-collective lock-step head↔worker mirror, the
+  in-graph side-stream prefetch, and the fusion over the uneven-DCP cross-rank KV stream are net-new
+  fork code (absent at the merge-base).*
+  *Impact: on the weightless lane (5090 + 2×3080, TP=3 DCP=3, over-VRAM 27B context) **[better] ≈+173%
+  decode** from the streaming-block CUDA-graph (eager ≈9 → graph ≈24.7-26.1 tok/s, #136a), then a
+  further **[better] ≈+14-15%** in copy-heavy (deep) regimes from the #136b H2D double-buffer, which
+  hides the host→device transfers essentially fully. **Honest wall:** these lift the decode **floor** —
+  they do **not** beat the PCIe wall. Post-#136b the H2D is hidden, so the residual floor is the
+  per-layer cross-rank collectives + block-attention compute on the slow cards; decode stays
+  collective-latency-bound over PCIe. And **MTP/spec is not yet wired onto this lane**, so that
+  multiplier is still pending. Plainly: this is the fork's streaming machinery that makes an over-VRAM
+  context **servable at all**, with standard latency-hiding applied to the cross-rank path — not a claim
+  that decode is now "fast".*
+
 - **Tiered-KV fabric toward long context (Variant C next slice, #134 B1/B2) [in progress]** — the next
   step for the weightless lane: spill the DCP KV token-shards to a **host-RAM tier** so total usable
   context exceeds the combined VRAM of the rig (the ~262k target on the 27B hybrid). Same principle as
@@ -812,13 +836,15 @@ Planned, **not shipped** — listed here because the doc tracks features on two 
 Deliberately ordered by risk to output: **byte-identical speed/capacity gains first, quality-reducing
 (lossy) ones last** — and every lossy item ships behind its own quality gate.
 
-- **Byte-identical performance [planned]** — hide the offload's cost without changing outputs: **[better]
-  double-buffered expert prefetch with compute-overlap** (hide the PCIe fetch behind compute; targets
-  the ≈order-of-magnitude prefill slowdown); **[better] DCP-collective/compute overlap on the weightless
-  lane** (hide the PCIe attention collectives behind head compute); **[better] bandwidth-aware DCP
-  token-split** (balance the LSE-merge barrier); **[better] importance/frequency-based expert residency**
-  (fewer PCIe fetches under skewed routing). All lossless — no throughput claim beyond "reduces the
-  existing [worse] costs".
+- **Byte-identical performance [partly landed]** — hide the streaming cost without changing outputs.
+  **Landed** (now in §10, credited there): **DCP-collective/compute overlap on the weightless lane**
+  (#128), **DCP comm-fusion** (#132), and the **in-graph H2D double-buffer** for the streaming
+  block-decode (#136b). **Still planned:** **[better] double-buffered *expert* prefetch with
+  compute-overlap** on the MoE-offload **prefill** path (hide the PCIe fetch behind compute; targets the
+  ≈order-of-magnitude *prefill* slowdown — the decode-side H2D is already hidden by #136b, this is the
+  remaining prefill case); **[better] bandwidth-aware DCP token-split** (balance the LSE-merge barrier);
+  **[better] importance/frequency-based expert residency** (fewer PCIe fetches under skewed routing).
+  All lossless — no throughput claim beyond "reduces the existing [worse] costs".
 - **Spec-decode synergy [planned] (lossless)** — **[better] speculative expert prefetch driven by the draft router**
   (prefetch the experts the draft predicts the target will need); **[better] draft model on the idle
   weightless-worker cards** (put the slow cards' otherwise-idle compute to work on speculation).
