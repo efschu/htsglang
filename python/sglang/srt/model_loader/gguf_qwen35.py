@@ -24,6 +24,12 @@ be loaded by sglang's generic GGUF path for three reasons:
    layers (``ssm_*`` tensors) with periodic full-attention layers
    (``attn_q/k/v`` tensors).  We classify each layer from the tensors actually
    present in the file rather than from config metadata.
+
+Structure (#129 S2): the quality/speed-neutral scaffolding (arch resolution,
+file-tensor probe, the emit/audit ``build_name_map`` skeleton, the F32-carve-out
+``unquantized_module_prefixes`` skeleton) lives in ``GGUFAdapterBase``; this
+module supplies the qwen35 emit *tables* + the irreducible per-family hooks and
+the verbatim GDN / vision / MTP transforms.
 """
 
 from __future__ import annotations
@@ -34,6 +40,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
+
+from sglang.srt.model_loader.gguf_adapter_base import GGUFAdapterBase
 
 logger = logging.getLogger(__name__)
 
@@ -150,21 +158,67 @@ _GEMMA_NORM_NAMES = (
 )
 
 
-class Qwen35GGUFAdapter:
+class Qwen35GGUFAdapter(GGUFAdapterBase):
     """Builds the GGUF<->HF name map and applies llama.cpp inverse transforms
     for one qwen35/qwen35moe checkpoint."""
 
-    def __init__(self, config, gguf_file: str):
-        # ``config`` may be the multimodal wrapper (Qwen3_5Config) or the text
-        # config directly; the GDN dims + num_hidden_layers live on the text
-        # config.
-        text_config = (
-            config.get_text_config() if hasattr(config, "get_text_config") else config
-        )
-        self.config = text_config
-        self.gguf_file = gguf_file
-        self.arch = _MODEL_TYPE_TO_GGUF_ARCH[text_config.model_type]
-        self.num_layers = int(text_config.num_hidden_layers)
+    FAMILY = "qwen35"
+    MODEL_TYPE_TO_ARCH = _MODEL_TYPE_TO_GGUF_ARCH
+
+    # Emit tables (see GGUFAdapterBase). Both GDN and full-attn per-layer bases
+    # are generated; present-in-file filtering keeps only those whose GGUF
+    # tensor actually exists, which auto-classifies each layer.
+    GLOBAL_ENTRIES = (
+        ("model.embed_tokens", "weight"),
+        ("lm_head", "weight"),
+        ("model.norm", "weight"),
+    )
+    LAYER_ENTRIES = (
+        # shared by both layer kinds
+        ("input_layernorm", "weight"),
+        ("post_attention_layernorm", "weight"),
+        # GDN linear-attention layer
+        ("linear_attn.in_proj_qkv", "weight"),
+        ("linear_attn.in_proj_z", "weight"),
+        ("linear_attn.in_proj_b", "weight"),
+        ("linear_attn.in_proj_a", "weight"),
+        ("linear_attn.A_log", ""),
+        ("linear_attn.dt_bias", ""),
+        ("linear_attn.conv1d", "weight"),
+        ("linear_attn.out_proj", "weight"),
+        ("linear_attn.norm", "weight"),
+        # full-attention layer
+        ("self_attn.q_proj", "weight"),
+        ("self_attn.k_proj", "weight"),
+        ("self_attn.v_proj", "weight"),
+        ("self_attn.o_proj", "weight"),
+        ("self_attn.q_norm", "weight"),
+        ("self_attn.k_norm", "weight"),
+        # MLP (dense)
+        ("mlp.gate_proj", "weight"),
+        ("mlp.up_proj", "weight"),
+        ("mlp.down_proj", "weight"),
+        # MoE experts (fused single tensor -> expert 0; loader side-loads)
+        ("mlp.experts.0.gate_proj", "weight"),
+        ("mlp.experts.0.up_proj", "weight"),
+        ("mlp.experts.0.down_proj", "weight"),
+        ("mlp.gate", "weight"),
+    )
+    # Split GDN spellings -> the fused module built by the model, for the
+    # F32-carve-out fold (in_proj_ba is F32 in qwen35).
+    FUSE_MAP = {
+        "linear_attn.in_proj_b": "linear_attn.in_proj_ba",
+        "linear_attn.in_proj_a": "linear_attn.in_proj_ba",
+        "linear_attn.in_proj_qkv": "linear_attn.in_proj_qkvz",
+        "linear_attn.in_proj_z": "linear_attn.in_proj_qkvz",
+    }
+
+    def _resolve_arch(self, config, text_config) -> str:
+        # qwen35's GDN dims + type live on the text config; the wrapper's
+        # model_type ("qwen3_5") and the text config's both map to "qwen35".
+        return self.MODEL_TYPE_TO_ARCH[text_config.model_type]
+
+    def _post_init(self, config) -> None:
         # NEXTN/MTP draft: the model loader rewrites the draft ModelConfig's
         # architecture to "Qwen3_5ForCausalLMMTP" (model_type stays qwen3_5), so
         # the same adapter is reused but must emit the MTP-block name map. The
@@ -183,135 +237,43 @@ class Qwen35GGUFAdapter:
             and self.vision_config is not None
             and any("ForConditionalGeneration" in a for a in archs)
         ):
-            self.mmproj_path = detect_gguf_multimodal(gguf_file)
-        self.num_k = int(getattr(text_config, "linear_num_key_heads", 0) or 0)
-        self.num_v = int(getattr(text_config, "linear_num_value_heads", 0) or 0)
-        self.head_k_dim = int(getattr(text_config, "linear_key_head_dim", 0) or 0)
-        self.head_v_dim = int(getattr(text_config, "linear_value_head_dim", 0) or 0)
-        self._file_tensor_names = None  # set lazily
+            self.mmproj_path = detect_gguf_multimodal(self.gguf_file)
+        self.num_k = int(getattr(self.config, "linear_num_key_heads", 0) or 0)
+        self.num_v = int(getattr(self.config, "linear_num_value_heads", 0) or 0)
+        self.head_k_dim = int(getattr(self.config, "linear_key_head_dim", 0) or 0)
+        self.head_v_dim = int(getattr(self.config, "linear_value_head_dim", 0) or 0)
 
     # ------------------------------------------------------------------
-    # Name mapping
+    # Name-map hooks
     # ------------------------------------------------------------------
 
-    def _file_tensors(self) -> set:
-        if self._file_tensor_names is None:
-            import gguf
-
-            reader = gguf.GGUFReader(self.gguf_file)
-            self._file_tensor_names = {t.name for t in reader.tensors}
-        return self._file_tensor_names
-
-    def build_name_map(self) -> Dict[str, str]:
-        """Return ``{gguf_tensor_name: hf_param_name}`` for every tensor present
-        in the file.  HF names use the split GDN spelling
-        (``in_proj_qkv/z/b/a``); the model's ``stacked_params_mapping`` fuses
-        them into ``in_proj_qkvz`` / ``in_proj_ba`` at load time."""
-        if self.is_draft:
-            return self._build_mtp_name_map()
-        import gguf
-
-        arch_enum = None
-        for key, value in gguf.MODEL_ARCH_NAMES.items():
-            if value == self.arch:
-                arch_enum = key
-                break
-        if arch_enum is None:
-            raise RuntimeError(f"gguf-py has no arch {self.arch!r}")
-        name_map = gguf.get_tensor_name_map(arch_enum, self.num_layers)
-        file_tensors = self._file_tensors()
-
-        # (hf_base, hf_suffix) candidates. hf_suffix "" == bare param (A_log,
-        # dt_bias). Both GDN and full-attn per-layer bases are generated; only
-        # those whose GGUF tensor actually exists in the file are kept, which
-        # auto-classifies each layer.
-        gguf_to_hf: Dict[str, str] = {}
-
-        def emit(hf_base: str, suffix: str) -> None:
-            gguf_base = name_map.get_name(hf_base)
-            if gguf_base is None:
-                # gguf-py knows ``dt_proj`` but not the ``dt_bias`` spelling.
-                if hf_base.endswith("linear_attn.dt_bias"):
-                    layer = hf_base.split(".layers.")[1].split(".")[0]
-                    gguf_full = f"blk.{layer}.ssm_dt.bias"
-                    if gguf_full in file_tensors:
-                        gguf_to_hf[gguf_full] = hf_base  # bare param
-                return
-            gguf_full = gguf_base + ("." + suffix if suffix else "")
+    def _emit_fallback(
+        self, map_base: str, gguf_suffix: str, file_tensors: set, out: Dict[str, str]
+    ) -> None:
+        # gguf-py knows ``dt_proj`` but not the ``dt_bias`` spelling.
+        if map_base.endswith("linear_attn.dt_bias"):
+            layer = map_base.split(".layers.")[1].split(".")[0]
+            gguf_full = f"blk.{layer}.ssm_dt.bias"
             if gguf_full in file_tensors:
-                gguf_to_hf[gguf_full] = (
-                    hf_base + ("." + suffix if suffix else "")
-                )
+                out[gguf_full] = map_base  # bare param
 
-        # Global tensors.
-        emit("model.embed_tokens", "weight")
-        emit("lm_head", "weight")
-        emit("model.norm", "weight")
+    @staticmethod
+    def _blk_index(n: str):
+        if n.startswith("blk."):
+            try:
+                return int(n.split(".")[1])
+            except (IndexError, ValueError):
+                return None
+        return None
 
-        for i in range(self.num_layers):
-            p = f"model.layers.{i}."
-            # shared by both layer kinds
-            emit(p + "input_layernorm", "weight")
-            emit(p + "post_attention_layernorm", "weight")
-            # GDN linear-attention layer
-            emit(p + "linear_attn.in_proj_qkv", "weight")
-            emit(p + "linear_attn.in_proj_z", "weight")
-            emit(p + "linear_attn.in_proj_b", "weight")
-            emit(p + "linear_attn.in_proj_a", "weight")
-            emit(p + "linear_attn.A_log", "")
-            emit(p + "linear_attn.dt_bias", "")
-            emit(p + "linear_attn.conv1d", "weight")
-            emit(p + "linear_attn.out_proj", "weight")
-            emit(p + "linear_attn.norm", "weight")
-            # full-attention layer
-            emit(p + "self_attn.q_proj", "weight")
-            emit(p + "self_attn.k_proj", "weight")
-            emit(p + "self_attn.v_proj", "weight")
-            emit(p + "self_attn.o_proj", "weight")
-            emit(p + "self_attn.q_norm", "weight")
-            emit(p + "self_attn.k_norm", "weight")
-            # MLP (dense)
-            emit(p + "mlp.gate_proj", "weight")
-            emit(p + "mlp.up_proj", "weight")
-            emit(p + "mlp.down_proj", "weight")
-            # MoE experts (fused single tensor -> expert 0; loader side-loads)
-            emit(p + "mlp.experts.0.gate_proj", "weight")
-            emit(p + "mlp.experts.0.up_proj", "weight")
-            emit(p + "mlp.experts.0.down_proj", "weight")
-            emit(p + "mlp.gate", "weight")
-
-        # Report any file tensor we failed to map. Excluded: vision/mmproj
-        # (v./mm.) and the extra MTP/NEXTN block(s) at blk.>=num_hidden_layers
-        # (loaded separately by the NEXTN draft; see _build_mtp_name_map).
-        def _blk_index(n: str):
-            if n.startswith("blk."):
-                try:
-                    return int(n.split(".")[1])
-                except (IndexError, ValueError):
-                    return None
-            return None
-
-        unmapped = [
-            n
-            for n in file_tensors
-            if n not in gguf_to_hf
-            and not n.startswith(("v.", "mm."))
-            and not (
-                (bi := _blk_index(n)) is not None and bi >= self.num_layers
-            )
-        ]
-        if unmapped:
-            raise RuntimeError(
-                f"qwen35 GGUF: {len(unmapped)} tensors not mapped: "
-                f"{sorted(unmapped)[:12]}"
-            )
-        logger.info(
-            "qwen35 GGUF name map: %d tensors for %d layers (arch %s)",
-            len(gguf_to_hf),
-            self.num_layers,
-            self.arch,
-        )
-        return gguf_to_hf
+    def _is_unmapped_ignorable(self, name: str) -> bool:
+        # Excluded from the unmapped audit: vision/mmproj (v./mm.) and the extra
+        # MTP/NEXTN block(s) at blk.>=num_hidden_layers (loaded separately by the
+        # NEXTN draft; see _build_draft_name_map).
+        if name.startswith(("v.", "mm.")):
+            return True
+        bi = self._blk_index(name)
+        return bi is not None and bi >= self.num_layers
 
     # GGUF MTP-block tensor suffix -> HF (checkpoint-style) name that
     # Qwen3_5ForCausalLMMTP.load_weights expects. token_embd/output are NOT
@@ -335,7 +297,7 @@ class Qwen35GGUFAdapter:
         "ffn_down.weight": "mtp.layers.0.mlp.down_proj.weight",
     }
 
-    def _build_mtp_name_map(self) -> Dict[str, str]:
+    def _build_draft_name_map(self) -> Dict[str, str]:
         """Name map for the NEXTN/MTP draft: the single extra block at
         ``blk.<num_hidden_layers>`` -> ``mtp.*`` params of Qwen3_5ForCausalLMMTP."""
         n = self.num_layers
@@ -446,76 +408,20 @@ class Qwen35GGUFAdapter:
             self.mmproj_path,
         )
 
-    def unquantized_module_prefixes(self) -> List[str]:
-        """Linear modules whose GGUF tensors are stored unquantized (F32/F16/
-        BF16) and must therefore be built with UnquantizedLinearMethod instead
-        of GGUFLinearMethod.
+    # ------------------------------------------------------------------
+    # Unquantized-module carve-out (family-specific extension)
+    # ------------------------------------------------------------------
 
-        In qwen35 the GDN ``in_proj_ba`` (b/a projections, GGUF ``ssm_alpha`` /
-        ``ssm_beta``) is F32 while every other projection is quantized; feeding
-        an F32 ``.weight`` into a GGUF-quantized layer (which expects
-        ``qweight``) would fail. Detected from the file so other unquantized
-        projections (if any) are also covered. Returned as substrings for
-        ``is_layer_skipped_gguf`` (which does a substring match on the prefix).
-        """
+    def _extend_unquantized_prefixes(
+        self, prefixes: set, name_map: Dict[str, str], types: Dict[str, object]
+    ) -> None:
         import gguf
 
-        reader = gguf.GGUFReader(self.gguf_file)
-        types = {t.name: t.tensor_type for t in reader.tensors}
         unq_types = {
             gguf.GGMLQuantizationType.F32,
             gguf.GGMLQuantizationType.F16,
             gguf.GGMLQuantizationType.BF16,
         }
-        # Map split GDN spellings back to the fused module built by the model.
-        fuse = {
-            "linear_attn.in_proj_b": "linear_attn.in_proj_ba",
-            "linear_attn.in_proj_a": "linear_attn.in_proj_ba",
-            "linear_attn.in_proj_qkv": "linear_attn.in_proj_qkvz",
-            "linear_attn.in_proj_z": "linear_attn.in_proj_qkvz",
-        }
-        prefixes = set()
-        name_map = self.build_name_map()
-        # Only F32 tensors force an UNQUANTIZED module: the GGUF iterator
-        # keeps F32 as plain `.weight` (never renamed to `.qweight`), so an
-        # F32 projection cannot load into a GGUF-quantized layer. Dense
-        # F16/BF16 tensors DO arrive as `.qweight` (+`.qweight_type`) and
-        # stay inside quantized modules as dense-typed shards; the quant
-        # method casts them to params_dtype at weight finalize
-        # (GGUFLinearMethod._create_flat_weight_param/_cast_dense_qweight).
-        # This is what makes UD-Q8_K_XL loadable (task #64 "mixed-dtype
-        # qkvz": F16 in_proj_z beside Q8_0 in_proj_qkv, F16 attn_q/k beside
-        # Q8_0 attn_v, and 5 fully-F16 MLP layers).
-        f32_type = gguf.GGMLQuantizationType.F32
-        # fused/base module -> set of ggml types of its split tensors, to
-        # fail fast on the unsupportable mix "F32 split + quantized sibling"
-        # (the F32 half needs a dense module, the quantized half a qweight).
-        module_split_types: Dict[str, set] = {}
-        for gname, hf in name_map.items():
-            if not hf.endswith(".weight"):
-                continue
-            base = hf[: -len(".weight")]
-            # Only Linear projections matter (norms/conv1d are not GGUF-quantized
-            # linears); key off "proj".
-            if "proj" not in base:
-                continue
-            for split, fused in fuse.items():
-                if base.endswith(split):
-                    base = base[: -len(split)] + fused
-                    break
-            module_split_types.setdefault(base, set()).add(types.get(gname))
-            if types.get(gname) == f32_type:
-                prefixes.add(base)
-        for base in sorted(prefixes):
-            tset = module_split_types.get(base, set())
-            if any(t is not None and t not in unq_types for t in tset):
-                raise RuntimeError(
-                    f"qwen35 GGUF: module {base!r} mixes an F32 split with a "
-                    f"quantized sibling ({sorted(t.name for t in tset if t is not None)}); "
-                    "this cannot be loaded either dense or quantized. "
-                    "Re-quantize the F32 tensor (e.g. to Q8_0/F16)."
-                )
-
         # GDN out_proj whose value head is NOT a multiple of the ggml block
         # (e.g. K-quant block 256 with head_v_dim 128) is dequantized on the fly
         # in transform_stream (the raw-byte column permutation would corrupt it),
@@ -540,7 +446,6 @@ class Qwen35GGUFAdapter:
         # lm_head (paired with tensor-level get/set_embed_and_head sharing).
         if gguf_dense_vocab():
             prefixes.add("lm_head")
-        return sorted(prefixes)
 
     # ------------------------------------------------------------------
     # Weight-value transforms

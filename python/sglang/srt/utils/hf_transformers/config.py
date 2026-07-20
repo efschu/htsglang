@@ -46,26 +46,27 @@ def _set_architectures(config, arch_name):
     config.update({"architectures": [arch_name]})
 
 
-# GGUF archs whose config must be read from the sibling config.json instead
-# of the GGUF metadata (transformers' GGUF reader rejects qwen35/qwen35moe
-# outright and crashes on gemma4: it derives a per-layer num_key_value_heads
-# LIST, which the strict Gemma4TextConfig validation rejects).
-_SIBLING_CONFIG_GGUF_ARCHS = ("qwen35", "qwen35moe", "gemma4")
-
-
 def _peek_bespoke_gguf_arch(gguf_path: str) -> Optional[str]:
     """Return the GGUF ``general.architecture`` if it is one of the bespoke
     families that need the sibling-config.json workaround (Qwen3.5/3.6
-    hybrids, Gemma-4), else None. Reads only the GGUF header (cheap)."""
+    hybrids, Gemma-4), else None. Reads only the GGUF header (cheap).
+
+    The set of bespoke GGUF archs is the single source of truth in
+    ``model_loader.gguf_registry`` (transformers' GGUF reader rejects
+    qwen35/qwen35moe outright and crashes on gemma4: it derives a per-layer
+    num_key_value_heads LIST that the strict Gemma4TextConfig rejects). Imported
+    lazily so this early-config path stays cheap and cycle-free."""
     try:
         import gguf
+
+        from sglang.srt.model_loader.gguf_registry import sibling_config_gguf_archs
 
         reader = gguf.GGUFReader(gguf_path)
         field = reader.fields.get("general.architecture")
         if field is None:
             return None
         arch = str(field.contents())
-        return arch if arch in _SIBLING_CONFIG_GGUF_ARCHS else None
+        return arch if arch in sibling_config_gguf_archs() else None
     except Exception:
         return None
 
