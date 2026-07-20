@@ -292,6 +292,38 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
+        # Weightless-KV streaming block-decode graphs (#136a): when the lane's
+        # B0/B1 block loop is active, decode graphs are captured as a bucketed
+        # LADDER over the block count (see FlashInferAttnBackend
+        # wl_build_graph_ladder). Cap the bs buckets (each carries a persistent
+        # block-wrapper pool; the host-spill path only supports bs=1) and build
+        # the ladder the capture loop + replay admission share. Larger batches
+        # / over-ladder seq lens fall back to the eager block loop via
+        # can_run_graph (guard-free for decode under graphs-enabled, #133).
+        self._wl_block_graph = False
+        _wl_ab = getattr(self.attn_backend, "full_attn_backend", self.attn_backend)
+        if (
+            (model_runner.is_weightless_head or model_runner.is_weightless_worker)
+            and not model_runner.is_draft_worker
+            and getattr(_wl_ab, "_wl_chunk_block_size", 0)
+        ):
+            self._wl_block_graph = True
+            self._wl_attn = _wl_ab
+            _wl_max_bs = envs.SGLANG_WL_GRAPH_MAX_BS.get()
+            if getattr(_wl_ab, "_wl_spill_active", False):
+                # The captured H2D staging template is bs=1-only.
+                _wl_max_bs = 1
+            capped = [bs for bs in self.capture_bs if bs <= _wl_max_bs]
+            if not capped:
+                raise ValueError(
+                    f"SGLANG_WL_GRAPH_MAX_BS={_wl_max_bs} filters out every "
+                    f"decode capture bucket {self.capture_bs} for the "
+                    "weightless block-decode graph ladder."
+                )
+            self.capture_bs = capped
+            self.compile_bs = [bs for bs in self.compile_bs if bs <= _wl_max_bs]
+            _wl_ab.wl_build_graph_ladder()
+
         self.ragged_verify_mode = (
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
             and (self.capture_forward_mode == ForwardMode.TARGET_VERIFY)
@@ -509,9 +541,30 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             grid=self.capture_num_tokens,
         )
 
+    def _wl_variant_label(self, default):
+        """#136a: replay graph-key variant for the weightless block-decode
+        ladder -- the rung chosen by wl_graph_can_replay (which every replay
+        passes through via can_run_graph before load_batch)."""
+        if self._wl_block_graph:
+            rung = self._wl_attn._wl_graph_replay_blocks
+            assert rung is not None, (
+                "weightless block-decode graph replay without a rung "
+                "(can_run_graph admission must precede load_batch)"
+            )
+            return f"wlblk{rung}"
+        return default
+
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
+            return False
+
+        # Weightless streaming block-decode (#136a): rung availability +
+        # (under host spill) linear-slot-layout admission. Rank-uniform
+        # inputs -> head and workers decide identically.
+        if self._wl_block_graph and not self._wl_attn.wl_graph_can_replay(
+            forward_batch
+        ):
             return False
 
         ragged_layout = (
@@ -925,6 +978,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
+            if self._wl_block_graph:
+                # #136a rung ladder: one graph per block-count rung, captured
+                # largest-first (memory-pool reuse, same rationale as the bs
+                # order). Head + every weightless worker iterate the IDENTICAL
+                # (bs, rung) sequence -- the capture-time DCP collectives of
+                # each graph require symmetric co-participation (#133).
+                try:
+                    for rung in sorted(self._wl_attn._wl_graph_ladder, reverse=True):
+                        self._wl_attn._wl_graph_capture_blocks = rung
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.num_tokens_per_bs,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            self.capture_one_shape(
+                                bs, forward, stream_idx, f"wlblk{rung}"
+                            )
+                finally:
+                    self._wl_attn._wl_graph_capture_blocks = None
+                continue
+
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
                 with torch_compile_decoration.patch_model(
@@ -1201,7 +1276,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
-            variant_label = self._resolve_lora_variant(forward_batch)
+            variant_label = self._wl_variant_label(
+                self._resolve_lora_variant(forward_batch)
+            )
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
                 graph_size_key, stream_idx, variant_label
@@ -1302,7 +1379,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
-        variant_label = self._resolve_lora_variant(forward_batch)
+        variant_label = self._wl_variant_label(
+            self._resolve_lora_variant(forward_batch)
+        )
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label

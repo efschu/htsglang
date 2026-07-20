@@ -716,6 +716,11 @@ class Envs:
     # Max decode batch size eligible for the captured offload path. Buckets with
     # bs*top_k > scratch (would need >1 wave) fall back to eager. 0 = no cap.
     SGLANG_MOE_OFFLOAD_MAX_GRAPH_BS = EnvInt(0)
+    # Weightless-KV streaming block-decode graphs (#136a): max decode capture
+    # bucket. Each bucket carries a full ladder block-wrapper pool (~8 MB int
+    # workspace per block), and the host-spill graph path only supports bs=1;
+    # larger decode batches fall back to the eager block loop.
+    SGLANG_WL_GRAPH_MAX_BS = EnvInt(1)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)

@@ -3496,24 +3496,15 @@ class ServerArgs:
                 "monolithic byte-identical path); got "
                 f"{self.weightless_kv_chunked_block_size}."
             )
-        # B0 chunked decode is EAGER-only: the per-block flashinfer .plan() is
-        # host-side scheduling work that cannot be captured into a CUDA graph.
-        # Capturing the (context-dependent) block count is a later slice
-        # (B1/B2: per-length/bucketed capture or eager fallback for over-VRAM
-        # lengths). Fail fast here rather than crash mid graph-capture. The
-        # monolithic path (block size 0) keeps full decode-graph capture (#133).
-        if (
-            self.weightless_kv_chunked_block_size
-            and self.cuda_graph_config is not None
-            and self.cuda_graph_config.decode.backend != Backend.DISABLED
-        ):
-            raise ValueError(
-                "--weightless-kv-chunked-block-size (Stage B0) is eager-only: "
-                "the per-block attention plan cannot be CUDA-graph-captured "
-                "yet. Pass --cuda-graph-backend-decode=disabled (or the legacy "
-                "--disable-cuda-graph) to run the block-decode path. Capturing "
-                "the variable block count is a later slice."
-            )
+        # #136a: chunked block-decode is CUDA-graph-capable. Decode graphs are
+        # captured as a bucketed LADDER over the block count (the per-block
+        # .plan() is hoisted OUT of the graph into the per-step replay prep;
+        # see FlashInferAttnBackend._wl_graph_prepare_blocks). Seq lens above
+        # the largest captured rung -- and any admission miss (bs > 1 under
+        # spill, non-linear slot layout) -- fall back to the eager block loop,
+        # which stays guard-free for decode under graphs-enabled (#133 rule).
+        # The previous hard "eager-only" gate (B0) is lifted; passing
+        # --disable-cuda-graph still selects the pure eager path unchanged.
         # Stage B1 host spill: needs the B0 block loop (the streaming READ path
         # IS the block loop) and clashes with anything that re-interprets KV
         # slot identity or adds its own host tier. Fail fast, never silently
