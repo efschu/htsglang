@@ -1714,6 +1714,11 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
     tags: Optional[List[str]] = None
+    # #89 hibernate: where the released WEIGHTS go. "gpu"/None = the existing
+    # memory_saver pause (default, unchanged). "disk" = park the FINAL post-
+    # transform tensors to hibernate_dir (suspend-to-disk) before pausing.
+    destination: Optional[str] = None
+    hibernate_dir: Optional[str] = None
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):

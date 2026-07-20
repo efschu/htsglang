@@ -3220,6 +3220,24 @@ class ServerArgs:
         bool,
         "Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",
     ] = False
+    enable_weights_disk_backup: A[
+        bool,
+        "#89 hibernate (suspend-to-disk), GGUF-scoped. When set, the /hibernate "
+        "endpoint parks each rank's FINAL post-process_weights_after_loading "
+        "GPU tensors to --hibernate-dir. A subsequent boot with a matching "
+        "--hibernate-dir manifest auto-selects LoadFormat.HIBERNATE and restores "
+        "them via a raw byte copy, skipping the GGUFReader parse + weight-name "
+        "map + flat-assembly derive (measured ~44s on Qwen3.6-27B Q3_K_M). The "
+        "default serving path is untouched unless this flag is set.",
+    ] = False
+    hibernate_dir: A[
+        Optional[str],
+        "#89: directory for hibernate (suspend-to-disk) per-rank weight shards "
+        "and manifest. Required whenever --enable-weights-disk-backup is set. On "
+        "boot, a valid manifest here that matches the launch args (model, quant, "
+        "tp/dcp/ratio, rank-gpu-id, per-rank NVML UUID) triggers a fast restore; "
+        "any mismatch is a hard error (no silent fallback to a cold load).",
+    ] = None
     enable_custom_logit_processor: A[
         bool,
         "Enable users to pass custom logit processors to the server (disabled by default for security)",
@@ -7460,6 +7478,46 @@ class ServerArgs:
             self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):
             self.load_format = "gguf"
+
+        # #89 hibernate: mutual-requirement + auto-detect. A valid manifest in
+        # --hibernate-dir that coarse-matches the launch args (model, quant,
+        # tp/dcp/ratio, rank-gpu-id) selects the fast restore path. No manifest
+        # (first run, which will park) or a mismatch falls back to a normal cold
+        # load; the per-rank NVML-UUID check (which server_args cannot do -- it
+        # needs a live CUDA/NVML context in the worker) is re-validated hard in
+        # HibernateModelLoader. The default path is untouched when the flag is
+        # off.
+        if self.enable_weights_disk_backup or self.hibernate_dir is not None:
+            if self.enable_weights_disk_backup and self.hibernate_dir is None:
+                raise ValueError(
+                    "--enable-weights-disk-backup requires --hibernate-dir."
+                )
+            if self.hibernate_dir is not None and not self.enable_weights_disk_backup:
+                raise ValueError(
+                    "--hibernate-dir requires --enable-weights-disk-backup."
+                )
+            from sglang.srt.model_loader.hibernate import (
+                hibernate_manifest_matches,
+            )
+
+            if self.load_format != "gguf":
+                raise ValueError(
+                    "#89 hibernate (--enable-weights-disk-backup) is scoped to "
+                    f"GGUF checkpoints in V1; got load_format={self.load_format!r}."
+                )
+            if hibernate_manifest_matches(self):
+                self.load_format = "hibernate"
+                logger.info(
+                    "#89 hibernate: matching manifest found in %s -> "
+                    "load_format='hibernate' (fast restore).",
+                    self.hibernate_dir,
+                )
+            else:
+                logger.info(
+                    "#89 hibernate: no matching manifest in %s -> cold load; "
+                    "this run will park weights on /hibernate.",
+                    self.hibernate_dir,
+                )
 
         if self.load_format == "auto" and self._is_mistral_native_format():
             self.load_format = "mistral"

@@ -2192,6 +2192,14 @@ class GGUFModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
 
+        # #89 hibernate STEP-0 phase timers: split the GGUF cold-boot load into
+        # (a) GGUFReader parse + name-map, (b) weights-iterator producer time
+        # (disk page-in + CPU inverse transforms), (c) load_weights consumer
+        # time (weight_loader bookkeeping + H2D), (d) process_weights_after_
+        # loading (flat-assembly). Hibernate can only skip (a)+(b)+(d); (c)-ish
+        # H2D and everything outside this function repeats on every restart.
+        _t_phase0 = time.perf_counter()
+
         local_model_path = self._prepare_weights(model_config.model_path)
 
         # Bespoke family adapters (Qwen3.5/3.6 hybrid GDN, Gemma-4, ...) need a
@@ -2218,15 +2226,37 @@ class GGUFModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
+        # #89 hibernate: record the unquantized-module prefixes so a later
+        # hibernate restore can rebuild the identical skeleton WITHOUT opening
+        # the GGUF (create_gguf_adapter would re-parse it). Parked in the
+        # manifest by the write path.
+        _gguf_unquantized_prefixes: List[str] = []
         if gguf_adapter is not None and quant_config is not None:
             # GDN in_proj_ba (and any other F32-in-GGUF projection) must be built
             # unquantized so the plain-`weight` tensor loads (see adapter).
             for prefix in gguf_adapter.unquantized_module_prefixes():
+                _gguf_unquantized_prefixes.append(prefix)
                 if prefix not in quant_config.modules_to_not_convert:
                     quant_config.modules_to_not_convert.append(prefix)
+        # #89 STEP-0: name-map (meta-model + gguf<->hf map) is CPU-only work
+        # that hibernate could skip (it is subsumed by the parked manifest).
+        _t_namemap = time.perf_counter() - _t_phase0
+        logger.info(
+            "[#89 STEP-0] gguf name-map (rank %s) done. elapsed=%.2f s",
+            self.load_config.tp_rank,
+            _t_namemap,
+        )
         with set_default_torch_dtype(model_config.dtype):
+            _t_struct0 = time.perf_counter()
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
+            _t_struct = time.perf_counter() - _t_struct0
+            logger.info(
+                "[#89 STEP-0] structure alloc (_initialize_model, rank %s) done. "
+                "elapsed=%.2f s (NOT skippable: repeats on hibernate restore)",
+                self.load_config.tp_rank,
+                _t_struct,
+            )
             weights_iterator = self._get_weights_iterator(
                 local_model_path, gguf_weights_map
             )
@@ -2246,14 +2276,154 @@ class GGUFModelLoader(BaseModelLoader):
                         weights_iterator,
                         gguf_adapter.vision_weights_iterator(),
                     )
-            model.load_weights(weights_iterator)
+            # #89 STEP-0: wrap the iterator so we can split the load_weights
+            # wall time into producer (GGUFReader parse + disk page-in + CPU
+            # inverse-transforms + flat name-map lookups -> the SKIPPABLE slice,
+            # minus the disk read which repeats) vs consumer (weight_loader
+            # bookkeeping + H2D copy into GPU params -> NOT skippable, repeats
+            # on hibernate restore as copy_ of parked bytes).
+            _produce = {"t": 0.0, "n": 0}
 
+            def _timed(it):
+                while True:
+                    _p0 = time.perf_counter()
+                    try:
+                        item = next(it)
+                    except StopIteration:
+                        _produce["t"] += time.perf_counter() - _p0
+                        return
+                    _produce["t"] += time.perf_counter() - _p0
+                    _produce["n"] += 1
+                    yield item
+
+            _t_lw0 = time.perf_counter()
+            model.load_weights(_timed(iter(weights_iterator)))
+            _t_lw = time.perf_counter() - _t_lw0
+            logger.info(
+                "[#89 STEP-0] load_weights (rank %s) done. elapsed=%.2f s "
+                "(producer parse+disk+transform=%.2f s over %d tensors | "
+                "consumer H2D+copy=%.2f s). Producer minus disk-read = skippable.",
+                self.load_config.tp_rank,
+                _t_lw,
+                _produce["t"],
+                _produce["n"],
+                _t_lw - _produce["t"],
+            )
+
+            _t_pw0 = time.perf_counter()
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
                     with device_loading_context(module, target_device):
                         quant_method.process_weights_after_loading(module)
+            _t_pw = time.perf_counter() - _t_pw0
+            logger.info(
+                "[#89 STEP-0] process_weights_after_loading (flat-assembly, "
+                "rank %s) done. elapsed=%.2f s (SKIPPABLE derive slice)",
+                self.load_config.tp_rank,
+                _t_pw,
+            )
+            logger.info(
+                "[#89 STEP-0] SUMMARY rank %s: namemap=%.2f struct=%.2f "
+                "load_weights=%.2f (producer=%.2f) process_weights=%.2f | "
+                "candidate-skippable(namemap+producer+process_weights)=%.2f s",
+                self.load_config.tp_rank,
+                _t_namemap,
+                _t_struct,
+                _t_lw,
+                _produce["t"],
+                _t_pw,
+                _t_namemap + _produce["t"] + _t_pw,
+            )
+        # #89 hibernate: stash the info a restore needs to rebuild this exact
+        # skeleton without re-reading the GGUF (parked into the manifest).
+        model._gguf_unquantized_prefixes = _gguf_unquantized_prefixes
+        model._gguf_tie_word_embeddings = bool(
+            getattr(model_config.hf_config, "tie_word_embeddings", False)
+        )
         return model
+
+
+class HibernateModelLoader(BaseModelLoader):
+    """#89: restore FINAL post-transform GGUF tensors parked to disk.
+
+    Builds the structure-only skeleton (``_initialize_model`` + GGUF
+    ``create_weights``) exactly as the cold GGUF path would -- but WITHOUT
+    opening the GGUF (tie_word_embeddings + unquantized prefixes come from the
+    parked manifest, not a GGUFReader re-parse) -- then registers the parked
+    final params directly (skipping the flat-assembly derive), reattaches the
+    gguf runtime attrs, rebuilds the shard views, and verifies the byte-hash.
+    """
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        if load_config.model_loader_extra_config:
+            raise ValueError(
+                f"Model loader extra config is not supported for "
+                f"load format {load_config.load_format}"
+            )
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        pass  # nothing to download; weights come from the parked shard.
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        from sglang.srt.managers.scheduler_components.weight_updater import (
+            _export_static_state,
+            _import_static_state,
+        )
+        from sglang.srt.model_loader.hibernate import (
+            load_manifest,
+            restore_model_from_disk,
+        )
+
+        hibernate_dir = self.load_config.hibernate_dir
+        tp_rank = self.load_config.tp_rank or 0
+        manifest = load_manifest(hibernate_dir)
+        if manifest is None:
+            raise RuntimeError(
+                f"#89 hibernate: load_format=hibernate but no manifest in "
+                f"{hibernate_dir!r}."
+            )
+
+        _t0 = time.perf_counter()
+        # Apply the parked structural knobs BEFORE building the skeleton so the
+        # module tree matches the parked param set byte-for-byte.
+        if manifest.get("tie_word_embeddings"):
+            model_config.hf_config.update({"tie_word_embeddings": True})
+
+        target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        if quant_config is not None:
+            for prefix in manifest.get("gguf_unquantized_prefixes", []):
+                if prefix not in quant_config.modules_to_not_convert:
+                    quant_config.modules_to_not_convert.append(prefix)
+
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(model_config, self.load_config, quant_config)
+            _t_struct = time.perf_counter() - _t0
+            restore_model_from_disk(
+                model=model,
+                hibernate_dir=hibernate_dir,
+                tp_rank=tp_rank,
+                target_device=target_device,
+                import_static_state=_import_static_state,
+            )
+        _t_total = time.perf_counter() - _t0
+        logger.info(
+            "[#89 hibernate] rank %s restored from disk. skeleton=%.2f s, "
+            "total=%.2f s (vs cold GGUF load; the GGUFReader parse + name-map + "
+            "flat-assembly derive were skipped).",
+            tp_rank,
+            _t_struct,
+            _t_total,
+        )
+        return model.eval()
 
 
 class RemoteInstanceModelLoader(BaseModelLoader):
@@ -3317,6 +3487,9 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.GGUF:
         return GGUFModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.HIBERNATE:
+        return HibernateModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.LAYERED:
         return LayeredModelLoader(load_config)
