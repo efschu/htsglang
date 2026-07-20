@@ -54,8 +54,9 @@ auto` resolved to **[28,19,19]**. Measured: per-rank GPU **25.5 / 16.6 / 15.4 GB
 
 > Correctness bar for this GPTQ-Int4 (marlin) path is **coherence + self-determinism +
 > divergence only at near-ties** — a ~1e-2 argmax delta is intrinsic to marlin-Int4 tiling and
-> is not a regression (the FP8 path in §6 is separately byte-identical; the Int4/marlin path is
-> not, by design). No bit-identity is claimed here.
+> is not a regression. The FP8 path in §6 shares the same *class* (self-deterministic, near-tie
+> divergence only) but at a far smaller, sub-ULP magnitude; neither offload path is bit-identical to
+> the no-offload run. No bit-identity is claimed here.
 
 ## 1.1 The model both stacks run
 
@@ -208,8 +209,10 @@ so the extra card cannot join.
 <img src="topologies/04-moe-expert-offload.svg" alt="Resident experts on-GPU, cold experts spilled to pinned host RAM, fetched per token-wave" width="100%">
 
 The general form of 1.5: a resident fraction on-GPU, the rest in pinned host RAM, prefetched per
-token-wave (§6 **[in progress]**). The FP8 path is byte-identical (#120: ≈+0.15% ppl, 15/15
-batteries); the cost is throughput (decode ≈1.4×), not quality. Stock offers only generic
+token-wave (§6 **[in progress]**). The FP8 path is quality-neutral (#120: ≈+0.15% ppl within FP8
+reduction-order noise, 15/15 batteries, needle 100%) and self-deterministic — not bit-identical to the
+no-offload run, but diverging only at near-ties (sub-ULP); the cost is throughput (decode ≈1.4×), not
+quality. Stock offers only generic
 `--cpu-offload-gb` or Expert Parallelism (experts must fit aggregate VRAM).
 
 ## 2.5 Model too big for any single card — load-time offload to host RAM
@@ -264,8 +267,10 @@ excludes it) and has none of the token-KV / weightless / offload paths.
 - The 122B TP=3 numbers (per-rank GB, host floor, 6.97 tok/s, self-det 5/5) are the measured
   end-state run of the per-expert offload path, which is itself §6 **[in progress]**; this is a
   bring-up/validation run of an in-progress feature, not a shipped production mode.
-- The GPTQ-Int4/marlin path is **not** bit-identical (~1e-2 argmax delta is intrinsic to marlin
-  tiling); the byte-identity claim in §6 is for the FP8 path specifically.
+- Neither offload path is bit-identical to the no-offload run: the GPTQ-Int4/marlin path carries a
+  ~1e-2 argmax delta intrinsic to marlin tiling, and the FP8 path a sub-ULP reduction-order delta
+  from the compacted slot layout. Both are self-deterministic with divergence only at near-ties; §6
+  states the FP8 path as quality-neutral, not byte-identical.
 - Impact figures are the parent doc's rounded, directional numbers on the PCIe reference rig (no
   NVLink). A better interconnect changes the cost side of every cross-GPU feature.
 - `[in progress]` (expert offload, load-time MoE offload) and `[planned]` (graph-capture for the

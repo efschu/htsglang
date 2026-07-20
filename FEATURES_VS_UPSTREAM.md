@@ -607,7 +607,9 @@ uneven-DCP) is the heterogeneous showcase (Category A) and is the concrete numbe
   env-driven (`SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0`): all experts live in a pinned-RAM pool, the
   GPU keeps only `ceil(fraction · num_experts)` resident experts, and each forward LRU-prefetches the
   misses + remaps slots on-device over the unchanged grouped-GEMM. Wave processing is done **over
-  tokens, not experts** (no cross-wave partial sums → no floating-point re-association). It composes
+  tokens, not experts** — each token is computed whole in a single wave, so there is no *cross-wave*
+  partial-sum accumulation (the remaining within-wave slot-remap reduction-order effect is covered
+  under *Correctness* below). It composes
   with **uneven-TP + uneven-DCP** and is now **CUDA-graph compatible** — a decode-graph + eager-prefill
   hybrid. On this rig it runs the **122B-A10B GPTQ-Int4** (~61 GB of experts) across the 3 mismatched
   cards (5090 32 GB + 2×3080 20 GB, no NVLink) — a model that does not otherwise fit.
@@ -622,15 +624,23 @@ uneven-DCP) is the heterogeneous showcase (Category A) and is the concrete numbe
   - *Quality — validated, no measurable loss (#120): on Qwen3.6-35B-A3B-FP8 (TP=3 uneven, eager,
     temp=0, tiered fraction=0.5 → half the experts resident, half host-spilled) vs the fully-resident
     baseline: **[better] ≈+0.15% perplexity** (well inside FP8 reduction-order noise), **[better] needle-in-haystack
-    100%** at 8k and 30k, **[better] correctness batteries 15/15 identical**. Also byte-identical at
-    fraction 0.25 vs 1.0 (identical output IDs). Verdict: offloading experts does **not** degrade
-    quality — you pay in throughput, not accuracy.*
-  - *Correctness of the Int4 path (stated precisely, no overclaim): the FP8-triton offload is
-    byte-identical. The GPTQ/AWQ-marlin-Int4 path is coherent, self-deterministic and argmax-identical
-    within marlin's intrinsic ≈1e-2 reduction floor (near-ties only) — **not** bit-exact. The
+    100%** at 8k and 30k, **[better] correctness batteries 15/15 identical**. Run-to-run it is
+    **self-deterministic** (byte-identical across repeats at the same fraction, verified at 96 and 256
+    tokens); cross-config (fraction 0.25 vs 1.0) it agrees on confident tokens and diverges only at
+    near-ties — the compacted resident+scratch slot layout re-associates the FP reduction vs the full-N
+    layout, a sub-ULP effect (same class as the marlin floor below, far smaller magnitude), which is
+    also what the +0.15% perplexity registers. Verdict: offloading experts does **not** measurably
+    degrade quality — you pay in throughput, not accuracy.*
+  - *Correctness of both quant paths (stated precisely, no overclaim): **neither offload path is
+    bit-identical to the no-offload run** — both are coherent, self-deterministic and argmax-identical
+    with divergence only at near-ties. They differ only in magnitude: the **FP8-triton** path's
+    reduction-order delta is sub-ULP (agrees with the no-offload run on all but the tightest ties),
+    while the **GPTQ/AWQ-marlin-Int4** path sits at marlin's intrinsic ≈1e-2 tiling floor. Both stay
+    within their format's normal reduction-order noise — not a correctness bug. The
     CUDA-graph path adds nothing on top of the platform's normal capture-vs-eager floor that every
     graph path in the fork already carries. In short: the offload adds zero on top of the existing
-    graph/marlin floor — this is not a claim that graph == eager bit-exact.*
+    graph/marlin floor — this is not a claim that graph == eager bit-exact, nor that offload == no-offload
+    bit-exact.*
   - *Throughput cost — [worse] still PCIe-bandwidth-bound, not compute-bound: **[worse] prefill ≈an order
     of magnitude slower** single-stream (eager; the spill cache fragments prefill into many tiny
     fetch-gated GEMMs). Decode used to be the other soft spot but is now much closer to resident after
@@ -638,8 +648,9 @@ uneven-DCP) is the heterogeneous showcase (Category A) and is the concrete numbe
     tuning, NVLink/P2P, more PCIe lanes.*
   - *Robustness (non-obvious): a single forward can legitimately need more unique experts than
     fit in the resident slots (a prefill batch easily touches all of them) — not obvious up
-    front. Waving over tokens keeps each token whole in one wave, so this overflow case stays
-    byte-identical instead of silently evicting a still-needed expert.*
+    front. Waving over tokens keeps each token whole in one wave, so this overflow case is **computed
+    correctly (each token exactly once, with all its experts resident)** instead of silently evicting a
+    still-needed expert.*
   - *Honest follow-ups (not built, listed for completeness): a **load-time streaming loader** —
     materialize only resident+cushion experts per layer during load and stream the cold tier straight
     into pinned host RAM, so the host never holds the full ~61 GB expert set at once — is **unbuilt**;
