@@ -1443,6 +1443,28 @@ def apply_auto_performance(server_args) -> None:
         return
 
     base_plan = list(server_args.rank_tp_ratio)
+    # Decoupled KV-token ownership (--rank-kv-ratio, task #88): the
+    # capacity predictions below (predict_capacity's ctx = min(sum P,
+    # 64*min P)) always assume the CONVERGED capacity-optimal token
+    # vector. Under 'capacity' that assumption is realized on the first
+    # boot (measured install after profiling); under 'coupled' it needs
+    # the SGLANG_UNEVEN_TOKEN_VECTOR restart hint. Either way the KV
+    # ownership vector is chosen independently of the MLP/GEMM vector
+    # this optimizer picks.
+    if server_args.uneven_kv_flag_active():
+        kv_mode = server_args.rank_kv_ratio
+        lines.append(
+            "KV-token ownership decoupled (--rank-kv-ratio "
+            f"{','.join(map(str, kv_mode)) if isinstance(kv_mode, list) else kv_mode}): "
+            "the context floor below is evaluated against the converged "
+            "weighted-DCP optimum, which this mode "
+            + (
+                "realizes on the first boot (measured install after "
+                "profiling)."
+                if server_args.uneven_kv_capacity_mode()
+                else "pins explicitly."
+            )
+        )
     budgets = server_args.rank_gpu_memory_mib
     budgets = (
         list(budgets)

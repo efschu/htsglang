@@ -4531,14 +4531,20 @@ def configure_scheduler_process(
         set_cp_token_ratios,
     )
 
-    # The weighted owner rule (SGLANG_UNEVEN_DCP_WEIGHTED=1) installs the token
-    # vector so cp_token_split_factor()=sum(ratios); without it, DCP uses the
-    # even modulo owner rule (split_factor=dcp_size). Staged so the allocator
-    # size factor always matches the divisor the DCP kernels use.
+    # The weighted owner rule (SGLANG_UNEVEN_DCP_WEIGHTED=1, or any
+    # non-'coupled' --rank-kv-ratio, which implies it without the env pair)
+    # installs the token vector so cp_token_split_factor()=sum(ratios);
+    # without it, DCP uses the even modulo owner rule
+    # (split_factor=dcp_size). Staged so the allocator size factor always
+    # matches the divisor the DCP kernels use. Under --rank-kv-ratio
+    # capacity this pre-boot vector is the phase-1 ESTIMATE; the measured
+    # capacity-optimal vector replaces it after the post-weight-load
+    # profiling, before any pool/backend snapshots it (see
+    # _maybe_suggest_dcp_token_vector).
     if (
         getattr(server_args, "dcp_size", 1) > 1
         and base_plan is not None
-        and os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0") == "1"
+        and server_args.uneven_weighted_dcp_enabled()
     ):
         cp_vector = resolve_cp_token_ratios(server_args)
         set_cp_token_ratios(cp_vector)
