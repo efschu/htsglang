@@ -495,8 +495,16 @@ class DataParallelController:
         if not server_args.enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
 
+        from sglang.srt.speculative.adaptive_graph_memory import (
+            OFFLOAD_MODES,
+            resolve_adaptive_graph_memory_mode,
+        )
+
+        # See engine._launch_subprocesses: adaptive graph-memory offload needs
+        # the torch_memory_saver LD_PRELOAD hook in the scheduler processes.
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
+            or resolve_adaptive_graph_memory_mode(server_args) in OFFLOAD_MODES
         )
 
         scheduler_pipe_readers = []

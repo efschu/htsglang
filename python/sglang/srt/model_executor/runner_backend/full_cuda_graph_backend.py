@@ -33,6 +33,7 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
 )
+from sglang.srt.speculative import adaptive_graph_memory
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -68,7 +69,15 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
     @contextmanager
     def capture_session(self, stream: torch.cuda.Stream):
-        if self._pool is None:
+        # Adaptive graph-memory offload (Stage 2): a state build in progress
+        # supplies its own private, pauseable capture pool; the shared global
+        # pool is neither created nor touched. Backend instances are
+        # per-runner, and adaptive runners are per-state, so caching the
+        # override on self._pool is safe.
+        pool_override = adaptive_graph_memory.capture_pool_override()
+        if pool_override is not None:
+            self._pool = pool_override
+        elif self._pool is None:
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
@@ -107,7 +116,15 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = self._device_module.graph
 
-        with graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream):
+        # Stage-2 adaptive offload routes the capture through the build tag's
+        # torch_memory_saver region (pauseable capture pool); a no-op
+        # passthrough to graph_ctx otherwise.
+        with adaptive_graph_memory.capture_graph_ctx(
+            graph_ctx,
+            cuda_graph=graph,
+            pool=self._pool,
+            stream=self._capture_stream,
+        ):
             out = forward_fn()
 
         self._graphs[shape_key] = graph

@@ -880,8 +880,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return dllm_config.block_size if dllm_config is not None else 1
 
     def max_decode_logits_rows(self) -> int:
-        """Rows the shared logits buffer needs."""
-        num_tokens_per_bs = self.decode_num_tokens_per_bs()
+        """Rows the shared logits buffer needs.
+
+        Size with ``max_speculative_num_draft_tokens``: under adaptive
+        speculative decoding the per-step runtime states capture verify /
+        draft-extend graphs up to ``max(candidate_steps) + 1`` draft tokens,
+        which exceeds the static ``speculative_num_draft_tokens``. Non-adaptive
+        (and non-speculative) configs resolve to the same value as before.
+        """
+        num_tokens_per_bs = self.decode_num_tokens_per_bs(
+            num_draft_tokens=self.server_args.max_speculative_num_draft_tokens
+        )
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_bs)
         return max(capture_bs) * num_tokens_per_bs
 

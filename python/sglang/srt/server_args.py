@@ -2199,8 +2199,30 @@ class ServerArgs:
     ] = False
     speculative_adaptive_config: A[
         Optional[str],
-        "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
+        "Path to a JSON config file for adaptive speculative decoding tuning "
+        "knobs, or the name of a built-in profile ('default', 'high-accept'). "
+        "'high-accept' adds k=4/5 ladder rungs with upward hysteresis for "
+        "workloads with per-position accept probability >~0.85.",
     ] = None
+    speculative_adaptive_graph_memory: A[
+        str,
+        Arg(
+            help="VRAM policy for the pre-built adaptive runtime states. "
+            "'resident': all candidate states stay fully materialized "
+            "(reserve = SUM of all states, ~us pointer swaps) -- for rigs "
+            "with VRAM to spare. 'offload': inactive states' scratch "
+            "buffers, CUDA-graph capture pools, and flashinfer int "
+            "workspaces are physically unmapped via torch_memory_saver and "
+            "remapped on swap (reserve = MAX over states, ms-scale swaps, "
+            "KV capacity recovered); requires CUDA + flashinfer + the "
+            "'full' decode cuda-graph backend. 'offload-scratch': "
+            "scratch-buffers-only offload (the pre-Stage-2 behavior; "
+            "capture pools stay resident) -- fallback knob. 'auto' "
+            "(default): offload when prerequisites hold, degrading to "
+            "offload-scratch and then resident.",
+            choices=["auto", "resident", "offload", "offload-scratch"],
+        ),
+    ] = "auto"
 
     # Decoupled speculative decoding: draft and verify run as
     # separate engines, currently connected by a ZMQ IPC mesh.
@@ -8390,6 +8412,7 @@ class ServerArgs:
 
         candidate_steps = resolve_candidate_steps_from_config(
             cfg_path=self.speculative_adaptive_config,
+            algorithm=self.speculative_algorithm,
         )
         # TODO: adaptive spec currently requires topk=1, so each runtime state
         # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.

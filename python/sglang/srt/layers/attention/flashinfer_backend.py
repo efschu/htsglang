@@ -47,6 +47,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import get_buffer
+from sglang.srt.speculative import adaptive_graph_memory
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -223,8 +224,16 @@ def zero_flashinfer_workspaces() -> int:
     residue remains, but it is a deterministic function of the request
     itself, so run-to-run bit-stability is unaffected.
     """
+    from sglang.srt.speculative.adaptive_graph_memory import is_paused_tensor
+
     n = 0
     for buf in list(_WORKSPACE_BUFFERS.values()):
+        # A workspace belonging to a paused adaptive runtime state is
+        # physically unmapped; touching it would fault. Its zero-contract is
+        # restored by the adaptive graph-memory manager at resume time
+        # instead (see adaptive_graph_memory.AdaptiveGraphMemoryManager).
+        if is_paused_tensor(buf):
+            continue
         buf.zero_()
         n += 1
     return n
@@ -402,6 +411,59 @@ def fast_prefill_plan(
         0,  # num_colocated_ctas
     ]
     self._plan_info = self._cached_module.plan(*args)
+
+
+def _tag_adaptive_int_workspace(wrapper, share_key=None):
+    """Stage-2 adaptive graph-memory offload: swap *wrapper*'s 8 MiB int
+    workspace for a state-private, pauseable one (via the public
+    ``reset_workspace_buffer`` API, before the wrapper's first plan).
+
+    Safe to pause because the int workspace carries no state a forward does
+    not rewrite: flashinfer re-plans on every forward (host plan state ->
+    pinned staging buffer -> device int-workspace copy), and its boot
+    contract is fresh-cudaMalloc zero pages (#50 note), which the
+    zero-on-resume of noted tensors restores exactly. The pinned host
+    staging buffer is untouched by pause/resume (host memory).
+
+    *share_key*: graph-mode wrappers are instantiated once PER CAPTURED
+    BATCH BUCKET, but within one (backend, role, wrapper-slot) only the
+    active bucket's wrapper is planned and replayed in any forward -- the
+    buckets are mutually exclusive, and each forward's plan rewrites the
+    workspace immediately before its graph reads it. All buckets of one
+    slot therefore share a single tagged workspace (keyed per state build),
+    cutting the per-state int-ws footprint ~4x (k5: 800 -> ~200 MiB), which
+    is what lets the high-accept set meet the serving-margin check at the
+    standard reserve. Wrappers that can be live in the same forward (init
+    wrappers of different roles, different draft steps = different backend
+    instances) must NOT share -- callers pass share_key=None or distinct
+    keys for those.
+
+    No-op outside a Stage-2 adaptive build scope, so the static path and
+    Stage-1 offload keep their historical resident int workspaces.
+    """
+    if not adaptive_graph_memory.in_capture_offload_build():
+        return wrapper
+    old = getattr(wrapper, "_int_workspace_buffer", None)
+    if old is None or not torch.is_tensor(old):
+        return wrapper
+    nbytes = old.untyped_storage().nbytes()
+    if nbytes < adaptive_graph_memory.MIN_TAGGED_BYTES:
+        return wrapper
+    mgr = adaptive_graph_memory._ACTIVE_MANAGER
+    if share_key is not None:
+        shared = mgr.get_shared_state_tensor(share_key)
+        if shared is not None and shared.untyped_storage().nbytes() == nbytes:
+            wrapper.reset_workspace_buffer(
+                wrapper._float_workspace_buffer, shared
+            )
+            return wrapper
+    with adaptive_graph_memory.tagged_state_alloc(nbytes=nbytes):
+        new_int = torch.zeros_like(old)
+    wrapper.reset_workspace_buffer(wrapper._float_workspace_buffer, new_int)
+    adaptive_graph_memory.note_state_tensor(new_int, kind="int_ws")
+    if share_key is not None:
+        mgr.put_shared_state_tensor(share_key, new_int)
+    return wrapper
 
 
 class FlashInferAttnBackend(AttentionBackend):
@@ -714,12 +776,21 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         )
         if init_new_workspace:
-            self.workspace_buffer = register_flashinfer_workspace_buffer(
-                torch.empty(
+            # When built for an adaptive runtime state in offload mode, the
+            # private workspace is tagged as pauseable per-state scratch: its
+            # physical pages are unmapped while the state is inactive and it
+            # is zeroed on every resume (restoring the #50 boot contract).
+            with adaptive_graph_memory.tagged_state_alloc(
+                nbytes=envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+            ):
+                new_workspace_buffer = torch.empty(
                     envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
                     dtype=torch.uint8,
                     device=model_runner.device,
                 )
+            adaptive_graph_memory.note_state_tensor(new_workspace_buffer)
+            self.workspace_buffer = register_flashinfer_workspace_buffer(
+                new_workspace_buffer
             )
         else:
             self.workspace_buffer = global_workspace_buffer
@@ -759,8 +830,10 @@ class FlashInferAttnBackend(AttentionBackend):
             # due to TMA descriptor initialization issues on SM100 GPUs.
             if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
                 fmha_backend = "cutlass"
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
+        self.prefill_wrapper_ragged = _tag_adaptive_int_workspace(
+            BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer, "NHD", backend=fmha_backend
+            )
         )
         self._fmha_backend = fmha_backend
 
@@ -772,25 +845,31 @@ class FlashInferAttnBackend(AttentionBackend):
         for _ in range(self.num_wrappers):
             if not skip_prefill:
                 self.prefill_wrappers_paged.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.prefill_backend,
+                    _tag_adaptive_int_workspace(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            backend=self.prefill_backend,
+                        )
                     )
                 )
                 self.prefill_wrappers_verify.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.prefill_backend,
+                    _tag_adaptive_int_workspace(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            backend=self.prefill_backend,
+                        )
                     )
                 )
             self.decode_wrappers.append(
-                BatchDecodeWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
-                    "NHD",
-                    backend=self.decode_backend,
-                    use_tensor_cores=self.decode_use_tensor_cores,
+                _tag_adaptive_int_workspace(
+                    BatchDecodeWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        backend=self.decode_backend,
+                        use_tensor_cores=self.decode_use_tensor_cores,
+                    )
                 )
             )
 
@@ -1229,18 +1308,36 @@ class FlashInferAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        # When called while an adaptive runtime state is being built in
+        # offload mode, the large graph-state buffers are tagged as pauseable
+        # per-state scratch (unmapped while the state is inactive, zeroed on
+        # resume; every replay rewrites the lanes its graph reads and zeros
+        # point at pool page 0, so the zeroed state equals the fresh-boot
+        # pre-first-replay state). Static-path init is untouched: the tag
+        # scope only exists during adaptive builds.
         if kv_indices_buf is None:
-            cuda_graph_kv_indices = torch.zeros(
-                (max_num_tokens * self.max_context_len,),
-                dtype=torch.int32,
-                device="cuda",
-            )
+            with adaptive_graph_memory.tagged_state_alloc(
+                nbytes=max_num_tokens * self.max_context_len * 4
+            ):
+                cuda_graph_kv_indices = torch.zeros(
+                    (max_num_tokens * self.max_context_len,),
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+            adaptive_graph_memory.note_state_tensor(cuda_graph_kv_indices)
         else:
             cuda_graph_kv_indices = kv_indices_buf
 
-        self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
-            cuda_graph_kv_indices.clone() for _ in range(self.num_wrappers - 1)
-        ]
+        extra_kv_indices = []
+        for _ in range(self.num_wrappers - 1):
+            with adaptive_graph_memory.tagged_state_alloc(
+                nbytes=cuda_graph_kv_indices.numel()
+                * cuda_graph_kv_indices.element_size()
+            ):
+                clone = cuda_graph_kv_indices.clone()
+            adaptive_graph_memory.note_state_tensor(clone)
+            extra_kv_indices.append(clone)
+        self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + extra_kv_indices
 
         # SWA write-target buffer; refilled and bound onto forward_metadata in
         # init_forward_metadata_out_graph before each replay.
@@ -1257,25 +1354,35 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_kv_indices[i][0] = 0
 
         if not self.skip_prefill:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.uint8,
-                device="cuda",
-            )
+            with adaptive_graph_memory.tagged_state_alloc(
+                nbytes=max_num_tokens * self.max_context_len
+            ):
+                self.cuda_graph_custom_mask = torch.zeros(
+                    (max_num_tokens * self.max_context_len),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+            adaptive_graph_memory.note_state_tensor(self.cuda_graph_custom_mask)
+            # indptr clones are KiB-scale: below the tagging threshold, they
+            # stay resident (small allocations must not share tagged
+            # segments across states; see adaptive_graph_memory).
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
     def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list:
         return [
-            BatchDecodeWithPagedKVCacheWrapper(
-                self.workspace_buffer,
-                "NHD",
-                backend=self.decode_backend,
-                use_cuda_graph=True,
-                use_tensor_cores=self.decode_use_tensor_cores,
-                paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
-                paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
+            _tag_adaptive_int_workspace(
+                BatchDecodeWithPagedKVCacheWrapper(
+                    self.workspace_buffer,
+                    "NHD",
+                    backend=self.decode_backend,
+                    use_cuda_graph=True,
+                    use_tensor_cores=self.decode_use_tensor_cores,
+                    paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
+                    paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
+                    paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
+                ),
+                share_key=("decode_cg", id(self), i),
             )
             for i in range(self.num_wrappers)
         ]
@@ -1297,16 +1404,19 @@ class FlashInferAttnBackend(AttentionBackend):
                 else {}
             )
             wrappers.append(
-                BatchPrefillWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
-                    "NHD",
-                    use_cuda_graph=True,
-                    backend=self.prefill_backend,
-                    qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                    paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                    paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                    paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                    **extra,
+                _tag_adaptive_int_workspace(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        use_cuda_graph=True,
+                        backend=self.prefill_backend,
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                        **extra,
+                    ),
+                    share_key=("prefill_cg", id(self), i, use_custom_mask),
                 )
             )
         return wrappers
@@ -1408,15 +1518,18 @@ class FlashInferAttnBackend(AttentionBackend):
             for _ in range(self.num_wrappers)
         ]
         return [
-            BatchPrefillWithPagedKVCacheWrapper(
-                self.full_cg_prefill_workspace_buffer,
-                "NHD",
-                use_cuda_graph=True,
-                backend=self.prefill_backend,
-                qo_indptr_buf=self.full_cg_prefill_qo_indptr[i],
-                paged_kv_indptr_buf=self.full_cg_prefill_kv_indptr[i],
-                paged_kv_indices_buf=self.full_cg_prefill_kv_indices[i],
-                paged_kv_last_page_len_buf=self.kv_last_page_len[:num_slots],
+            _tag_adaptive_int_workspace(
+                BatchPrefillWithPagedKVCacheWrapper(
+                    self.full_cg_prefill_workspace_buffer,
+                    "NHD",
+                    use_cuda_graph=True,
+                    backend=self.prefill_backend,
+                    qo_indptr_buf=self.full_cg_prefill_qo_indptr[i],
+                    paged_kv_indptr_buf=self.full_cg_prefill_kv_indptr[i],
+                    paged_kv_indices_buf=self.full_cg_prefill_kv_indices[i],
+                    paged_kv_last_page_len_buf=self.kv_last_page_len[:num_slots],
+                ),
+                share_key=("full_cg_prefill", id(self), i),
             )
             for i in range(self.num_wrappers)
         ]
@@ -1461,13 +1574,16 @@ class FlashInferAttnBackend(AttentionBackend):
             device = self.kv_last_page_len.device
             qo_indptr_buf = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
             kv_indptr_buf = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-            wrapper = BatchPrefillWithRaggedKVCacheWrapper(
-                self.workspace_buffer,
-                "NHD",
-                use_cuda_graph=True,
-                qo_indptr_buf=qo_indptr_buf,
-                kv_indptr_buf=kv_indptr_buf,
-                backend=self._fmha_backend,
+            wrapper = _tag_adaptive_int_workspace(
+                BatchPrefillWithRaggedKVCacheWrapper(
+                    self.workspace_buffer,
+                    "NHD",
+                    use_cuda_graph=True,
+                    qo_indptr_buf=qo_indptr_buf,
+                    kv_indptr_buf=kv_indptr_buf,
+                    backend=self._fmha_backend,
+                ),
+                share_key=("verify_ragged_cg", id(self)),
             )
             self.verify_ragged_cg_wrappers[bs] = wrapper
         return wrapper
@@ -4216,11 +4332,18 @@ class FlashInferMultiStepDraftBackend:
         kv_indices_width = draft_kv_indices_buffer_width(
             max_bs, self.topk, self.max_context_len
         )
-        self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, kv_indices_width),
-            dtype=torch.int32,
-            device="cuda",
-        )
+        # Tagged as pauseable per-state scratch during adaptive offload
+        # builds; rewritten by generate_draft_decode_kv_indices before every
+        # replay (see the single-backend init_cuda_graph_state for details).
+        with adaptive_graph_memory.tagged_state_alloc(
+            nbytes=self.speculative_num_steps * kv_indices_width * 4
+        ):
+            self.cuda_graph_kv_indices = torch.zeros(
+                (self.speculative_num_steps, kv_indices_width),
+                dtype=torch.int32,
+                device="cuda",
+            )
+        adaptive_graph_memory.note_state_tensor(self.cuda_graph_kv_indices)
 
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(

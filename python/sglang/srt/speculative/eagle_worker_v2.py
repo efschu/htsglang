@@ -1203,6 +1203,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self.adaptive_controller = AdaptiveController(
                 self,
                 config_path=server_args.speculative_adaptive_config,
+                algorithm=server_args.speculative_algorithm,
             )
 
         # Some dummy tensors

@@ -1,7 +1,12 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 
+from sglang.srt.speculative.adaptive_runtime_state import (
+    SpecRuntimeState,
+    assert_runtime_state_isolation,
+)
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
@@ -248,7 +253,7 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
     def test_default_config_loads(self):
         params = AdaptiveSpeculativeParams(initial_steps=3)
         self.assertEqual(params._bs_list, [1, 8, 32, 64])
-        self.assertEqual(params._slots[1].candidate_steps, [1, 3, 7])
+        self.assertEqual(params._slots[1].candidate_steps, [1, 2, 3])
         self.assertEqual(params._slots[8].candidate_steps, [0, 1, 3])
         self.assertEqual(params._slots[32].candidate_steps, [0, 1])
         self.assertEqual(params._slots[64].candidate_steps, [0])
@@ -343,14 +348,15 @@ class TestBatchSizeRouting(unittest.TestCase):
     """BS-aware routing: batch size selects the slot, CUDA-graph BS pads first."""
 
     def _params(self):
-        # Slots: bs=1 -> [1,3,7], bs=8 -> [1,3], bs=32 -> [1].
+        # Default slots: bs=1 -> [1,2,3], bs=8 -> [0,1,3], bs=32 -> [0,1],
+        # bs=64 -> [0].
         return AdaptiveSpeculativeParams(initial_steps=3)
 
     def test_routes_to_floor_slot_without_cuda_graph(self):
         params = self._params()
         # A batch maps to the largest slot BS <= batch (floor), capped at the top slot.
-        self.assertEqual(params._route(1).candidate_steps, [1, 3, 7])
-        self.assertEqual(params._route(7).candidate_steps, [1, 3, 7])
+        self.assertEqual(params._route(1).candidate_steps, [1, 2, 3])
+        self.assertEqual(params._route(7).candidate_steps, [1, 2, 3])
         self.assertEqual(params._route(8).candidate_steps, [0, 1, 3])
         self.assertEqual(params._route(31).candidate_steps, [0, 1, 3])
         self.assertEqual(params._route(32).candidate_steps, [0, 1])
@@ -373,31 +379,261 @@ class TestBatchSizeRouting(unittest.TestCase):
         self.assertEqual(params.cuda_graph_bs_for_step(1), [4, 8, 16, 32])
         # step=3 lives in the bs=1 and bs=8 slots: graphs 4,8,16 floor into them.
         self.assertEqual(params.cuda_graph_bs_for_step(3), [4, 8, 16])
-        # step=7 lives only in the bs=1 slot: only graph BS 4 floors into it.
-        self.assertEqual(params.cuda_graph_bs_for_step(7), [4])
+        # step=2 lives only in the bs=1 slot: only graph BS 4 floors into it.
+        self.assertEqual(params.cuda_graph_bs_for_step(2), [4])
 
     def test_cuda_graph_bs_for_step_returns_none_when_disabled(self):
         params = self._params()
-        self.assertIsNone(params.cuda_graph_bs_for_step(7))
+        self.assertIsNone(params.cuda_graph_bs_for_step(3))
         params.set_cuda_graph_bs(None)
-        self.assertIsNone(params.cuda_graph_bs_for_step(7))
+        self.assertIsNone(params.cuda_graph_bs_for_step(3))
 
     def test_observe_verify_feeds_the_routed_slot(self):
         params = self._params()
         # Drive the bs=1 slot up with perfect acceptance; the bs=32 slot is
-        # untouched and stays at its single candidate step.
+        # untouched and stays at its own step.
         for _ in range(40):
-            params.on_verify_complete([7, 7, 7], batch_size=1)
+            params.on_verify_complete([3, 3, 3], batch_size=1)
         self.assertGreater(params.get_steps_for_batch(1), 1)
-        self.assertEqual(params.get_steps_for_batch(32), 1)
+        # The bs axis is debounced: reaching the bs=32 slot takes bs_debounce
+        # (default 3) consecutive decode steps routed there.
+        for _ in range(params._bs_debounce):
+            steps_32 = params.get_steps_for_batch(32)
+        self.assertEqual(steps_32, 1)
+
+
+class TestBsDebounce(unittest.TestCase):
+    """G3: the bs axis must not flap slots on a single boundary crossing."""
+
+    def _params(self, bs_debounce=None):
+        cfg = {
+            "1": {"candidate_steps": [5]},
+            "8": {"candidate_steps": [2]},
+        }
+        if bs_debounce is not None:
+            cfg["bs_debounce"] = bs_debounce
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(cfg, f)
+            f.flush()
+            return AdaptiveSpeculativeParams(initial_steps=5, cfg_path=f.name)
+
+    def test_default_debounce_value(self):
+        self.assertEqual(self._params()._bs_debounce, 3)
+
+    def test_invalid_debounce_raises(self):
+        with self.assertRaises(ValueError):
+            self._params(bs_debounce=0)
+
+    def test_boundary_flap_does_not_switch_slot(self):
+        params = self._params()
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+        # Alternating 8,1,8,1,... never accumulates 3 consecutive steps in the
+        # bs=8 slot, so the active slot stays bs=1 (no graph-swap thrash).
+        for _ in range(10):
+            self.assertEqual(params.get_steps_for_batch(8), 5)
+            self.assertEqual(params.get_steps_for_batch(1), 5)
+
+    def test_consecutive_occupancy_switches(self):
+        params = self._params()
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+        self.assertEqual(params.get_steps_for_batch(8), 5)  # pending 1
+        self.assertEqual(params.get_steps_for_batch(8), 5)  # pending 2
+        self.assertEqual(params.get_steps_for_batch(8), 2)  # switch on 3rd
+        # Switching back is debounced symmetrically.
+        self.assertEqual(params.get_steps_for_batch(1), 2)
+        self.assertEqual(params.get_steps_for_batch(1), 2)
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+
+    def test_return_to_active_slot_resets_pending_run(self):
+        params = self._params()
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+        params.get_steps_for_batch(8)  # pending 1
+        params.get_steps_for_batch(8)  # pending 2
+        params.get_steps_for_batch(1)  # reset
+        self.assertEqual(params.get_steps_for_batch(8), 5)  # pending 1 again
+        self.assertEqual(params.get_steps_for_batch(8), 5)  # pending 2
+        self.assertEqual(params.get_steps_for_batch(8), 2)  # pending 3: switch
+
+    def test_debounce_one_switches_immediately(self):
+        params = self._params(bs_debounce=1)
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+        self.assertEqual(params.get_steps_for_batch(8), 2)
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+
+    def test_verify_feed_reads_active_slot_without_advancing(self):
+        params = self._params()
+        self.assertEqual(params.get_steps_for_batch(1), 5)
+        # Verify feeds at bs=8 must neither advance the debounce nor touch the
+        # bs=8 slot's EMA while the bs=1 slot is active.
+        ema_8_before = params._slots[8].ema_accept_len
+        for _ in range(10):
+            params.on_verify_complete([2, 2], batch_size=8)
+        self.assertEqual(params._slots[8].ema_accept_len, ema_8_before)
+        self.assertEqual(params.get_steps_for_batch(8), 5)  # still pending 1
+
+
+def _fake_ws(ptr: int):
+    return SimpleNamespace(data_ptr=lambda: ptr)
+
+
+def _fake_backend(ws_ptr: int | None = None, **extra):
+    # init_forward_metadata marks this as a real attention backend for the
+    # wrapper-unwrap duck-type check in _iter_state_backends.
+    ns = SimpleNamespace(init_forward_metadata=lambda *a, **k: None, **extra)
+    if ws_ptr is not None:
+        ns.workspace_buffer = _fake_ws(ws_ptr)
+    return ns
+
+
+def _make_state(steps, draft=None, target=None, draft_extend=None):
+    return SpecRuntimeState(
+        speculative_num_steps=steps,
+        speculative_num_draft_tokens=steps + 1,
+        draft_attn_backend=draft,
+        cuda_graph_runner=None,
+        target_attn_backend=target,
+        target_graph_runner=None,
+        draft_extend_attn_backend=draft_extend,
+        cuda_graph_runner_for_draft_extend=None,
+    )
+
+
+class TestRuntimeStateIsolation(unittest.TestCase):
+    """G4: the M16/#50 invariant — no backend / flashinfer workspace may be
+    reachable from two different adaptive runtime states."""
+
+    def test_distinct_states_pass(self):
+        states = {
+            1: _make_state(1, draft=_fake_backend(0x100), target=_fake_backend(0x200)),
+            3: _make_state(3, draft=_fake_backend(0x300), target=_fake_backend(0x400)),
+        }
+        assert_runtime_state_isolation(states)  # must not raise
+
+    def test_shared_backend_object_across_states_raises(self):
+        shared = _fake_backend(0x100)
+        states = {
+            1: _make_state(1, draft=shared, target=_fake_backend(0x200)),
+            3: _make_state(3, draft=shared, target=_fake_backend(0x400)),
+        }
+        with self.assertRaisesRegex(RuntimeError, "backend shared between states"):
+            assert_runtime_state_isolation(states)
+
+    def test_shared_workspace_across_states_raises(self):
+        # Distinct backend objects, but their flashinfer workspaces alias the
+        # same allocation (e.g. both fell back to the process-global buffer).
+        states = {
+            1: _make_state(1, draft=_fake_backend(0x100), target=_fake_backend(0x200)),
+            3: _make_state(3, draft=_fake_backend(0x100), target=_fake_backend(0x400)),
+        }
+        with self.assertRaisesRegex(RuntimeError, "workspace shared between states"):
+            assert_runtime_state_isolation(states)
+
+    def test_sharing_within_one_state_is_allowed(self):
+        # The registered static/initial state legitimately aliases the global
+        # workspace across its own draft/target/draft-extend backends.
+        states = {
+            1: _make_state(
+                1,
+                draft=_fake_backend(0x100),
+                target=_fake_backend(0x100),
+                draft_extend=_fake_backend(0x100),
+            ),
+            3: _make_state(3, draft=_fake_backend(0x300), target=_fake_backend(0x400)),
+        }
+        assert_runtime_state_isolation(states)  # must not raise
+
+    def test_hybrid_wrapper_leaves_are_checked(self):
+        # A leaf backend hidden inside a hybrid prefill/decode wrapper of one
+        # state must not alias another state's workspace.
+        leaf = _fake_backend(0x500)
+        hybrid = SimpleNamespace(
+            init_forward_metadata=lambda *a, **k: None,
+            prefill_backend=leaf,
+            decode_backend=_fake_backend(0x600),
+        )
+        states = {
+            1: _make_state(1, draft=hybrid, target=_fake_backend(0x700)),
+            3: _make_state(3, draft=_fake_backend(0x500), target=_fake_backend(0x800)),
+        }
+        with self.assertRaisesRegex(RuntimeError, "workspace shared between states"):
+            assert_runtime_state_isolation(states)
+
+    def test_single_state_never_raises(self):
+        shared = _fake_backend(0x100)
+        assert_runtime_state_isolation(
+            {3: _make_state(3, draft=shared, target=shared)}
+        )
+
+    def test_global_workspace_alias_with_baseline_is_allowed(self):
+        # Real-world case (found on GPU boot): the EAGLE draft-extend backend
+        # is constructed without init_new_workspace, so every built state's
+        # draft-extend aliases the PROCESS-GLOBAL workspace — the same buffer
+        # the registered static state uses. With baseline_steps naming the
+        # registered state, this is logged, not fatal.
+        g = 0x1000  # global workspace ptr
+        states = {
+            3: _make_state(  # registered static state (baseline)
+                3,
+                draft=_fake_backend(g),
+                target=_fake_backend(g),
+                draft_extend=_fake_backend(g),
+            ),
+            1: _make_state(
+                1,
+                draft=_fake_backend(0x200),
+                target=_fake_backend(0x300),
+                draft_extend=_fake_backend(g),
+            ),
+            2: _make_state(
+                2,
+                draft=_fake_backend(0x400),
+                target=_fake_backend(0x500),
+                draft_extend=_fake_backend(g),
+            ),
+        }
+        assert_runtime_state_isolation(states, baseline_steps={3})  # no raise
+
+    def test_private_share_still_raises_with_baseline(self):
+        # A pointer shared between two built states that is NOT part of the
+        # baseline (global) family stays a hard failure.
+        states = {
+            3: _make_state(3, draft=_fake_backend(0x1000), target=_fake_backend(0x1000)),
+            1: _make_state(1, draft=_fake_backend(0x200), target=_fake_backend(0x300)),
+            2: _make_state(2, draft=_fake_backend(0x200), target=_fake_backend(0x500)),
+        }
+        with self.assertRaisesRegex(RuntimeError, "workspace shared between states"):
+            assert_runtime_state_isolation(states, baseline_steps={3})
+
+    def test_string_backend_selector_attrs_are_not_unwrapped(self):
+        # Regression (found on GPU boot): FlashInferAttnBackend stores plain
+        # STRING kernel selectors in .prefill_backend/.decode_backend ("fa2").
+        # Interned strings alias across states — must not be treated as
+        # shared wrapped backends.
+        s1 = _fake_backend(0x100, prefill_backend="fa2", decode_backend="fa2")
+        s2 = _fake_backend(0x200, prefill_backend="fa2", decode_backend="fa2")
+        assert_runtime_state_isolation(
+            {
+                1: _make_state(1, draft=s1, target=_fake_backend(0x300)),
+                2: _make_state(2, draft=s2, target=_fake_backend(0x400)),
+            }
+        )  # must not raise
+
+    def test_baseline_alias_without_baseline_arg_still_raises(self):
+        # Default (no baseline_steps) keeps the strict behavior.
+        states = {
+            3: _make_state(3, draft=_fake_backend(0x1000)),
+            1: _make_state(1, draft=_fake_backend(0x1000)),
+        }
+        with self.assertRaisesRegex(RuntimeError, "workspace shared between states"):
+            assert_runtime_state_isolation(states)
 
 
 class TestResolveCandidateSteps(unittest.TestCase):
     def test_default_config(self):
         steps = resolve_candidate_steps_from_config()
-        self.assertIn(1, steps)
-        self.assertIn(3, steps)
-        self.assertIn(7, steps)
+        # Generic default union: step 0 (nospec, bs>=8 slots) plus the [1,2,3]
+        # ladder; the k=7 tier was removed (net-negative at accept p<=0.8).
+        self.assertEqual(steps, [0, 1, 2, 3])
 
     def test_config_file(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
