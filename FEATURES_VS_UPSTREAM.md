@@ -98,26 +98,19 @@ section).
 Hardware-agnostic wins. A matched, homogeneous server gets every one of these in full; the
 heterogeneous rig gets them too, but they are not the *reason* to run mismatched cards.
 
-- **GGUF new-arch adapters + K-quant kernel perf overhaul** — on top of upstream sglang's GGUF
-  loader + MMVQ/MMQ K-quant kernels: bespoke hybrid-GDN adapters, uneven-TP GGUF sharding, the MMQ
-  token-cutoff perf overhaul, Q8 lm_head (TP=2 beats llama.cpp on decode). The GGUF loader and the
-  base kernels are **upstream**; the adapters, uneven-TP sharding + tuning are the fork's — §4
-  (Part B).
-- **MoE expert-offload** — run models larger than VRAM on any box; CUDA-graph compatible,
-  hot-set residency, quality-validated — §6 (Part B).
-- **HiCache under uneven-TP/DCP** — *extends* upstream sglang's hierarchical KV caching (GPU →
-  host → disk, graph-safe) to the fork's non-uniform layouts + hybrid-Mamba (GDN) state tiering.
-  The base HiCache is **upstream**; the fork's slice is the uneven-layout safety + concurrency
-  hardening — §8 (Part B).
-- **Speculative decoding: fork adaptive-draft machinery on an upstream base** — the spec engines
-  (MTP/NEXTN, EAGLE, EAGLE3) and the base adaptive **step-controller** are upstream; the fork adds
-  genuine machinery on top — **graph-memory offload for multi-k capture pools (#93/#102)**, the
-  **high-accept k=4/5 ladder (#93)**, frozen-MTP wiring, and **rank-0-broadcast reproducibility**
-  across mismatched GPUs + uneven-DCP correctness + EAGLE3-for-Gemma-4 — §3 (Part B).
-- **Prefill/Decode disaggregation, single-node hetero** — *extends* upstream sglang's
-  PD-disaggregation (the mooncake transfer stack) into a single-node solo-prefill-on-the-fast-card +
-  uneven-TP/DCP decode layout. The PD framework is **upstream**; the fork adds the single-node
-  hetero role split + GDN-state handoff — §2 (Part B).
+- **GGUF new-arch adapters + K-quant perf overhaul** *(adapts upstream GGUF)* — hybrid-GDN &
+  Gemma-4 adapters, uneven-TP GGUF sharding, MMQ-token-cutoff / batched-MMVQ / Q8 lm_head (TP=2
+  beats llama.cpp on decode) — §4 (Part B).
+- **MoE expert-offload** — pinned-host expert pool + wave prefetch to run models larger than VRAM;
+  CUDA-graph compatible, hot-set residency, quality-validated — §6 (Part B).
+- **HiCache uneven-TP/DCP compat + hybrid-GDN tiering + L3-writeback-race fix** *(adapts upstream
+  HiCache)* — §8 (Part B).
+- **Adaptive-draft fork machinery** *(on upstream spec engines + step-controller)* — graph-memory
+  offload for multi-k capture pools (#93/#102), high-accept k=4/5 ladder (#93), frozen-MTP wiring,
+  rank-0-broadcast reproducibility across mismatched GPUs, uneven-DCP correctness, EAGLE3-for-Gemma-4
+  — §3 (Part B).
+- **PD-disaggregation, single-node hetero split** *(adapts upstream PD / mooncake)* — solo-prefill
+  on the fast card + uneven-TP/DCP decode + GDN-state handoff — §2 (Part B).
 - **TP > num_kv_heads** (replicated + token-sharded KV) — §1 / §9.
 - **Quantization correctness** (AWQ/Marlin g32 MoE fix, GPTQ-MoE TP>1 upstream bugfix,
   compressed-tensors, AutoRound-int4) — §5 (Part B).
@@ -185,9 +178,10 @@ bandwidth/latency-bound (the PCIe wall), which is exactly why the raw tok/s numb
 modest even where the capability is decisive.
 
 **3. Flip side, stated fairly: a homogeneous user still gets *all* of Category B in full.**
-GGUF + tuned K-quant kernels (TP=2 beats llama.cpp), MoE offload to run models larger than
-VRAM on any box, HiCache, speculative decoding, PD-disaggregation, and the CUDA-graph
-correctness / reproducibility fixes all apply unchanged on matched cards. The fork is
+the fork's GGUF adapters + K-quant perf overhaul (TP=2 beats llama.cpp), MoE expert-offload (run
+models larger than VRAM on any box), the HiCache uneven-compat + concurrency fixes, the adaptive-draft
+machinery + spec-decode determinism, the single-node PD split, and the CUDA-graph correctness /
+reproducibility fixes all apply unchanged on matched cards. The fork is
 genuinely valuable on homogeneous hardware too — just not for its unique heterogeneous
 reason. The honest summary: **don't oversell A on matched cards, don't undersell B.**
 
@@ -444,15 +438,14 @@ TP is the differentiator it targets — this is not a shipped htsglang capabilit
 These sections are hardware-agnostic. A matched, homogeneous server gets every one of them in
 full; the heterogeneous rig benefits too, but not for a heterogeneity-specific reason.
 
-## 2. Prefill/Decode Disaggregation (Single-Node)
+## 2. Prefill/Decode Disaggregation — single-node hetero split (adapts upstream PD)
 
 **Benefits:** all hardware. On a heterogeneous rig it lets the fastest card do prefill solo; on a
 homogeneous rig it still separates prefill and decode roles to protect TTFT under load.
 
-**Provenance:** PD-disaggregation itself — the role split and the mooncake transfer stack — is
-**upstream sglang**. This section is the fork's *extension* of it: solo-prefill on the fastest card,
-distributed uneven-TP+DCP decode, the single-node `mooncake_tcp` loopback, and the GDN/hybrid-state
-handoff. The transfer code is reused, not re-authored (see the `mooncake_tcp` entry).
+*Base: upstream sglang PD-disaggregation + the mooncake transfer stack. Everything below is the
+fork's delta on top of that base — solo-prefill on the fast card, uneven-TP/DCP decode, single-node
+loopback, GDN-state handoff.*
 
 Run prefill and decode as separate roles on the same box, so the fastest card does prefill
 with zero cross-GPU communication while the slower cards handle distributed decode.
@@ -482,23 +475,14 @@ with zero cross-GPU communication while the slower cards handle distributed deco
   cleanly, tears down to 0 MiB.
   *Impact: robustness — no orphaned VRAM or wedged decode after a prefill crash.*
 
-## 3. Speculative Decoding (MTP / NEXTN / EAGLE / EAGLE3)
+## 3. Speculative Decoding — fork adaptive-draft machinery + hetero-determinism (on upstream engines)
 
 **Benefits:** all hardware. The mixed-arch *reproducibility* work is heterogeneity-motivated
 correctness, but the speed of speculation itself is a win on any box.
 
-**Provenance (two honest halves):** the spec-decode engines (MTP/NEXTN, EAGLE, EAGLE3) and the
-**base** adaptive step-controller (`--speculative-adaptive`, the EMA `AdaptiveStepSlot` step-picking,
-`resolve_candidate_steps_from_config`, and the `adaptive_unsupported_reason` constraints: topk=1 /
-not-multi-layer-EAGLE / no-DP-attn-TBO-pdmux) are **upstream sglang** — verified present at the
-merge-base. **But the fork builds genuine adaptive machinery on top of that base** — a new
-`adaptive_graph_memory.py` plus real extensions to `adaptive_spec_params.py` /
-`adaptive_runtime_state.py`: graph-memory offload for the multi-k capture pools (#93/#102), the
-high-accept k=4/5 ladder (#93), frozen-MTP adaptive wiring, state-isolation + bs-axis debounce, and
-the rank-0 broadcast for mixed-GPU determinism. So the split is: the *step-picking controller* is
-upstream; the *graph-memory offload, the high-k ladder, the frozen-MTP wiring, and the
-hetero-reproducibility* are **fork-original**. Plus the usual fork extensions — uneven-DCP
-correctness, EAGLE3-for-Gemma-4, draft-path uneven-TP.
+*Base: upstream sglang provides the spec engines (MTP/NEXTN, EAGLE, EAGLE3) and the adaptive EMA
+step-controller (`--speculative-adaptive` + its topk=1 / not-multi-layer-EAGLE / no-DP-attn-TBO-pdmux
+constraints). Everything below is the fork's delta on top of that base.*
 
 - **MTP/NEXTN under uneven-DCP** — including heterogeneous-GPU reproducibility (verify-sync,
   draft broadcast from rank 0, workspace zeroing).
@@ -510,24 +494,19 @@ correctness, EAGLE3-for-Gemma-4, draft-path uneven-TP.
   come out), and the accept/argmax decision is taken once on rank 0 and broadcast so ranks can't
   commit different tokens near a tie. See §8 for the three roots. No throughput claim beyond
   enabling spec at all under DCP.*
-- **Adaptive draft length (base step-controller UPSTREAM; the fork's offload + high-k ladder + wiring + rank-determinism are FORK)** —
-  the **base** adaptive step-controller is **upstream sglang**: `--speculative-adaptive`, the EMA
-  `AdaptiveStepSlot` that picks k∈{1,2,3}, `resolve_candidate_steps_from_config`, and the
-  method-agnostic machinery that drives **EAGLE, EAGLE3, and NEXTN/MTP** (the `FROZEN_KV_MTP` worker)
-  with its fail-fast constraints — **topk=1 only** (chain spec; tree excluded), **not** the
-  multi-layer-EAGLE worker, DP-attention / two-batch-overlap / pdmux rejected
-  (`adaptive_unsupported_reason`) — all exist at the merge-base. **On top of that base the fork builds
-  real, fork-original machinery:** (1) **graph-memory offload** for the per-k capture pools
-  (`adaptive_graph_memory.py`, #93/#102 — pauseable capture pools + int workspaces, per-tag mempools
-  fixing cross-tag segment reuse, and the "reserve max(one state), not sum" sizing) so multi-k / high-k
-  spec boots without multiplying graph VRAM; (2) the **high-accept k=4/5 ladder** (#93); (3) **frozen-MTP
-  adaptive wiring** (fixes the DoA default-config crash); (4) **state-isolation + bs-axis debounce**
-  against slot flapping; (5) **rank-0 broadcast** of the per-step picks so the adaptive output stays
-  reproducible under the fork's uneven-DCP + mismatched-GPU layouts.
-  *Impact: the step-picking benefit (roughly matches the best fixed k without hand-tuning across
-  EAGLE/EAGLE3/MTP) is upstream's; the fork's on-top machinery is what makes multi-k/high-k spec
-  affordable in VRAM (the offload) and reproducible on mismatched GPUs (the broadcast). See the
-  graph-offload and high-accept bullets below for the fork slices in detail.*
+- **Adaptive-draft fork machinery (graph-memory offload + high-k ladder + wiring + rank-determinism)** —
+  on top of upstream's EMA step-controller, the fork builds: (1) **graph-memory offload** for the
+  per-k capture pools (`adaptive_graph_memory.py`, #93/#102 — pauseable capture pools + int
+  workspaces, per-tag mempools fixing cross-tag segment reuse, and the "reserve max(one state), not
+  sum" sizing) so multi-k / high-k spec boots without multiplying graph VRAM; (2) the **high-accept
+  k=4/5 ladder** (#93); (3) **frozen-MTP adaptive wiring** (fixes the DoA default-config crash);
+  (4) **state-isolation + bs-axis debounce** against slot flapping; (5) **rank-0 broadcast** of the
+  per-step picks so the adaptive output stays reproducible under the fork's uneven-DCP +
+  mismatched-GPU layouts.
+  *Impact: the fork's machinery makes multi-k / high-k spec affordable in VRAM (the offload) and
+  reproducible on mismatched GPUs (the broadcast); the underlying step-picking benefit — roughly
+  matches the best fixed k without hand-tuning — is upstream's. See the graph-offload and high-accept
+  bullets below for detail.*
 - **Graph-state offload to system RAM (offload mechanism, stages 1+2)** — the core enabler for
   adaptive / high-k speculation. Each draft length k needs its own pre-captured CUDA graph, and each
   such graph pins a block of VRAM. "Stages 1+2" refers to the two implementation stages of the
@@ -554,17 +533,14 @@ correctness, EAGLE3-for-Gemma-4, draft-path uneven-TP.
 - **Draft embed / lm_head sharing, draft-extend replay, ratio-weighted draft vocab** —
   *Impact: the draft path works correctly under uneven TP. No throughput claim.*
 
-## 4. GGUF
+## 4. GGUF — new-arch adapters + K-quant perf overhaul (on upstream GGUF)
 
 **Benefits:** all hardware. The tuned K-quant kernel and perf overhaul help any GGUF model on any
 box; the uneven-TP GGUF sharding is the heterogeneous slice within it.
 
-**Provenance:** GGUF loading itself and the base K-quant kernels (`gguf_kernel.cu`, `mmvq.cuh`,
-`mmq.cuh`, `layers/quantization/gguf.py`) are **upstream sglang** — present at the merge-base. The
-fork's contribution is *on top of* that base: the bespoke new-architecture adapters (Qwen3.5/3.6
-hybrid-GDN, Gemma-4 dense), uneven-TP GGUF sharding, and the MMQ-token-cutoff / batched-MMVQ / Q8
-lm_head perf overhaul. "GGUF support" as such is not a fork addition; the adapters + uneven-TP +
-kernel tuning are.
+*Base: upstream sglang's GGUF loader + MMVQ/MMQ K-quant kernels (`gguf_kernel.cu`, `mmvq.cuh`,
+`mmq.cuh`, `layers/quantization/gguf.py`). The fork's delta below: bespoke new-arch adapters,
+uneven-TP GGUF sharding, and the MMQ-cutoff / batched-MMVQ / Q8-lm_head perf overhaul.*
 
 There are two kinds of GGUF work here: (1) **new architecture support** — bespoke loader adapters
 that run families upstream cannot load on its fast path, on the fork's own fast GGUF path rather than
