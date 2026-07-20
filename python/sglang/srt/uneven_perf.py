@@ -462,6 +462,87 @@ def vocab_ratio_from_membw(membw_gbs: Sequence[float], base: int = 6) -> List[in
 
 
 @dataclasses.dataclass
+class PlanInputs:
+    """The small, boot-free input contract of the parse-time cost model.
+
+    ``PerfCostModel`` (and the offline planner, ``sglang.srt.planner``)
+    consume this dataclass instead of a full ``ServerArgs`` object, so the
+    capacity math is callable as a pure library — the design-#97 "single
+    source of truth" guarantee: the boot path builds a ``PlanInputs`` from
+    itself (``from_server_args``) and the offline planner builds one from
+    CLI/manual inputs, and both run the IDENTICAL sizing code.
+
+    Only stdlib types; importing/constructing this never touches torch,
+    CUDA, or NVML.
+    """
+
+    # -- model + speculative config (what PerfCostModel reads) --------------
+    tp_size: int
+    model_path: str
+    kv_cache_dtype: str = "auto"
+    speculative_algorithm: Optional[str] = None
+    speculative_num_draft_tokens: Optional[int] = None
+    speculative_draft_model_path: Optional[str] = None
+    max_running_requests: Optional[int] = None
+    disable_cuda_graph: bool = False
+
+    # -- placement + per-card budget (design §2.5) ---------------------------
+    #: rank -> physical GPU index (duplicates = co-located ranks).
+    rank_gpu_id: Optional[List[int]] = None
+    #: Per-rank absolute byte budget ceiling in MiB. This is the BUDGETED
+    #: value (NVML total minus the user's free-reserve minus the auto
+    #: reserve), not the physical maximum — every capacity number derived
+    #: from it is "max possible under your set budget".
+    effective_vram_mib: Optional[List[int]] = None
+
+    # -- manual overrides (design §2.6); None => auto-derive that knob -------
+    rank_tp_ratio: Optional[List[int]] = None
+    rank_mlp_ratio: Optional[List[int]] = None
+    rank_moe_ratio: Optional[List[int]] = None
+    rank_vocab_ratio: Optional[List[int]] = None
+    dcp_size: Optional[int] = None
+    kv_token_vector: Optional[List[int]] = None
+
+    @property
+    def rank_gpu_memory_mib(self):
+        """Alias so functions that duck-type a ``ServerArgs`` (e.g.
+        ``resolve_cp_token_ratios``) accept a ``PlanInputs`` unchanged."""
+        return self.effective_vram_mib
+
+    @classmethod
+    def from_server_args(cls, server_args) -> "PlanInputs":
+        """Build the cost-model inputs from a (post-validation) ServerArgs.
+
+        Called on the boot path right before ``PerfCostModel`` is
+        constructed, so server and offline planner share one input shape.
+        """
+        budgets = getattr(server_args, "rank_gpu_memory_mib", None)
+        if isinstance(budgets, int):
+            budgets = [budgets] * server_args.tp_size
+        ratio = getattr(server_args, "rank_tp_ratio", None)
+        return cls(
+            tp_size=server_args.tp_size,
+            model_path=server_args.model_path,
+            kv_cache_dtype=str(server_args.kv_cache_dtype or "auto"),
+            speculative_algorithm=server_args.speculative_algorithm,
+            speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+            speculative_draft_model_path=server_args.speculative_draft_model_path,
+            max_running_requests=server_args.max_running_requests,
+            disable_cuda_graph=bool(
+                getattr(server_args, "disable_cuda_graph", False)
+            ),
+            rank_gpu_id=(
+                list(server_args.rank_gpu_id)
+                if getattr(server_args, "rank_gpu_id", None)
+                else None
+            ),
+            effective_vram_mib=list(budgets) if budgets else None,
+            rank_tp_ratio=list(ratio) if isinstance(ratio, list) else None,
+            dcp_size=getattr(server_args, "dcp_size", None),
+        )
+
+
+@dataclasses.dataclass
 class _Family:
     """One weight family: total parameter count, bytes per parameter, and
     how it shards across ranks ('attn'/'gdn' follow the base plan on their
@@ -775,13 +856,16 @@ class PerfCostModel:
     (MLP bytes per unit) is exact.
     """
 
-    def __init__(self, server_args, base_plan: List[int], budgets_mib: List[int]):
-        self.tp_size = server_args.tp_size
+    def __init__(self, plan_inputs, base_plan: List[int], budgets_mib: List[int]):
+        # ``plan_inputs`` is a PlanInputs dataclass (see above). The boot
+        # path builds it via PlanInputs.from_server_args so the server and
+        # the offline planner (sglang.srt.planner) run identical sizing.
+        self.tp_size = plan_inputs.tp_size
         self.base_plan = list(base_plan)
         self.budgets_mib = list(budgets_mib)
-        self.server_args = server_args
+        self.plan_inputs = plan_inputs
 
-        cfg = self._load_config(server_args.model_path)
+        cfg = self._load_config(plan_inputs.model_path)
         text = cfg.get("text_config", cfg)
         self.hidden = int(text["hidden_size"])
         self.intermediate = int(text["intermediate_size"])
@@ -818,9 +902,9 @@ class PerfCostModel:
         else:
             self.mlp_units = math.gcd(self.intermediate, 512) or 1
 
-        self.spec_active = server_args.speculative_algorithm is not None
-        self.spec_draft_tokens = int(server_args.speculative_num_draft_tokens or 0)
-        kv_dtype = str(server_args.kv_cache_dtype or "auto")
+        self.spec_active = plan_inputs.speculative_algorithm is not None
+        self.spec_draft_tokens = int(plan_inputs.speculative_num_draft_tokens or 0)
+        kv_dtype = str(plan_inputs.kv_cache_dtype or "auto")
         self.kv_cell_bytes_per_layer = (
             2 * self.kv_heads * self.head_dim * (1 if "fp8" in kv_dtype else 2)
         )
@@ -931,7 +1015,7 @@ class PerfCostModel:
         # (attn + MLP + draft layer) proportionally to their param counts.
         from sglang.srt.distributed.utils import _checkpoint_size_mib
 
-        ckpt_bytes = _checkpoint_size_mib(self.server_args.model_path) * 2**20
+        ckpt_bytes = _checkpoint_size_mib(self.plan_inputs.model_path) * 2**20
         quant_names = ("attn", "mlp", "draft_attn", "draft_mlp")
         bf16_bytes = sum(
             fam.bytes for name, fam in families.items() if name not in quant_names
@@ -1012,7 +1096,7 @@ class PerfCostModel:
             state_per_unit_layer + conv_per_unit_layer
         )
 
-        target = self.server_args.max_running_requests or 16
+        target = self.plan_inputs.max_running_requests or 16
         target = min(target, 48)
         ratio = 5  # MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO(3) + overlap(2)
         slots = math.ceil(target * ratio * 1.25)
@@ -1424,7 +1508,9 @@ def apply_auto_performance(server_args) -> None:
             )
         )
 
-    model = PerfCostModel(server_args, base_plan, budgets)
+    model = PerfCostModel(
+        PlanInputs.from_server_args(server_args), base_plan, budgets
+    )
     base_pred = model.predict_capacity(base_plan)
     floor = (1.0 - loose / 100.0) * base_pred["ctx"]
     lines.append(
