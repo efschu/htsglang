@@ -213,6 +213,12 @@ class SchedulerWeightUpdaterManager:
             self.flush_cache()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
+            # #89 hibernate: destination="disk" parks the FINAL post-transform
+            # weights to hibernate_dir before the normal release/pause, so a
+            # later boot can restore them fast (LoadFormat.HIBERNATE). The
+            # default path (destination None/"gpu") is unchanged.
+            if getattr(recv_req, "destination", None) == "disk":
+                self._hibernate_park_weights(recv_req)
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
             )
@@ -314,6 +320,38 @@ class SchedulerWeightUpdaterManager:
             path=params["path"],
             pattern=params["pattern"],
             max_size=params["max_size"],
+        )
+
+
+    def _hibernate_park_weights(self, recv_req):
+        """#89: park this rank's FINAL post-transform weights to disk."""
+        from sglang.srt.model_loader.hibernate import park_weights_to_disk
+
+        model_runner = self.tp_worker.model_runner
+        server_args = model_runner.server_args
+        model = model_runner.model
+        hibernate_dir = (
+            getattr(recv_req, "hibernate_dir", None) or server_args.hibernate_dir
+        )
+        if hibernate_dir is None:
+            raise ValueError(
+                "#89 hibernate: /hibernate requires --hibernate-dir (or a "
+                "hibernate_dir in the request)."
+            )
+        tp_rank = model_runner.tp_rank
+        park_weights_to_disk(
+            model=model,
+            server_args=server_args,
+            hibernate_dir=hibernate_dir,
+            tp_rank=tp_rank,
+            tp_cpu_group=self.tp_cpu_group,
+            export_static_state=_export_static_state,
+            tie_word_embeddings=bool(
+                getattr(model, "_gguf_tie_word_embeddings", False)
+            ),
+            unquantized_prefixes=list(
+                getattr(model, "_gguf_unquantized_prefixes", [])
+            ),
         )
 
 

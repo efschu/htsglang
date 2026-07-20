@@ -1419,6 +1419,27 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
+@app.api_route("/hibernate", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def hibernate(
+    obj: Annotated[Optional[ReleaseMemoryOccupationReqInput], Body()] = None,
+    request: Request = None,
+):
+    """#89 hibernate (suspend-to-disk): park each rank's FINAL post-transform
+    weights to --hibernate-dir, then release. A later boot with a matching
+    manifest restores them fast (LoadFormat.HIBERNATE). Requires the server to
+    be fully idle (mirrors /release_memory_occupation)."""
+    try:
+        if obj is None:
+            obj = ReleaseMemoryOccupationReqInput()
+        obj.destination = "disk"
+        obj.tags = ["weights"]
+        await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
+        return ORJSONResponse({"message": "hibernate: weights parked to disk."})
+    except Exception as e:
+        return _create_error_response(e)
+
+
 @app.api_route("/weights_checker", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def check_weights(

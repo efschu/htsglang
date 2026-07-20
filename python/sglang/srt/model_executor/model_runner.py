@@ -1584,6 +1584,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
+            hibernate_dir=self.server_args.hibernate_dir,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(

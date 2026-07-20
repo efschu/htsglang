@@ -34,6 +34,10 @@ class LoadFormat(str, enum.Enum):
     FASTSAFETENSORS = "fastsafetensors"
     PRIVATE = "private"
     RUNAI_STREAMER = "runai_streamer"
+    # #89: suspend-to-disk restore. Loads per-rank FINAL post-
+    # process_weights_after_loading tensors parked by --enable-weights-disk-
+    # backup, skipping the GGUFReader parse + name-map + flat-assembly derive.
+    HIBERNATE = "hibernate"
 
 
 @dataclass
@@ -74,6 +78,8 @@ class LoadConfig:
     decryption_key_file: Optional[str] = None
     decrypt_max_concurrency: int = -1
     tp_rank: Optional[int] = None
+    # #89 hibernate: directory holding parked per-rank shards + manifest.
+    hibernate_dir: Optional[str] = None
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
