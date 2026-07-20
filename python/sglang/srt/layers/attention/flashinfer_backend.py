@@ -553,11 +553,22 @@ class FlashInferAttnBackend(AttentionBackend):
         # elementwise merge prep) runs concurrently on the main stream.
         # SCHEDULING-ONLY: the collective issue order (A_k, A_v, B, C, D per
         # layer) and every reduction/merge is unchanged -> byte-identical to
-        # the sequential baseline. Kill-switch SGLANG_DCP_COMM_OVERLAP=0
-        # restores the exact legacy (fully sequential) scheduling for
-        # same-build A/B comparison. The stream is leased HERE (init time,
-        # never inside cuda-graph capture -- stream creation is a driver
-        # call, see RuntimeContext.get_stream).
+        # the sequential baseline (verified machine-zero in BOTH eager and
+        # captured-graph mode, plus self-determinism).
+        #
+        # DEFAULT-OFF (mode 0). The overlap is byte-identical but PERF-NEUTRAL
+        # on a compute/PCIe-saturated rig at small batch: the DCP collectives
+        # sit on the critical path and there is no spare independent compute to
+        # hide them behind, so side-streaming them cannot shorten a saturated
+        # critical path (measured: prefill + decode parity on 5090+2x3080, TP=3
+        # bs=1). A perf-neutral change must not alter the default execution
+        # path, so the default under uneven-DCP is the ORIGINAL sequential
+        # scheduling (mode 0). Set SGLANG_DCP_COMM_OVERLAP=1 to opt IN to the
+        # dual-stream overlap for regimes where the balance favors it (larger
+        # batch, faster interconnect, or a less-saturated / offloaded config
+        # where the hidden compute is comparable to the collective duration).
+        # The stream is leased HERE (init time, never inside cuda-graph capture
+        # -- stream creation is a driver call, see RuntimeContext.get_stream).
         self.dcp_comm_stream = None
         # Diagnostic mode "2": run the OVERLAP issue order but keep everything
         # on the main stream (no side stream, no cross-stream edges). Isolates
@@ -566,7 +577,9 @@ class FlashInferAttnBackend(AttentionBackend):
         # Diagnostic mode "3": baseline order with ONLY the scatter-write
         # deferred past the paged prefix read + merge (single stream).
         self.dcp_overlap_scatter_late = False
-        _dcp_overlap_mode = os.environ.get("SGLANG_DCP_COMM_OVERLAP", "1")
+        # Default "0" = original fully-sequential scheduling (unchanged default
+        # execution path). "1" = dual-stream overlap (opt-in). "2"/"3" diag.
+        _dcp_overlap_mode = os.environ.get("SGLANG_DCP_COMM_OVERLAP", "0")
         if self.uneven_dcp and _dcp_overlap_mode in ("1", "2"):
             from sglang.srt.runtime_context import get_stream as _get_named_stream
 
