@@ -103,13 +103,15 @@ heterogeneous rig gets them too, but they are not the *reason* to run mismatched
 - **MoE expert-offload** — run models larger than VRAM on any box; CUDA-graph compatible,
   hot-set residency, quality-validated — §6 (Part B).
 - **HiCache hierarchical KV caching** (GPU → host → disk, graph-safe) — §8 (Part B).
-- **Speculative decoding** — MTP with adaptive draft-length, EAGLE3, draft-model spec — §3 (Part B).
+- **Speculative decoding** — MTP/NEXTN, EAGLE, EAGLE3 (adaptive draft-length runs across all three),
+  plus draft-model spec — §3 (Part B).
 - **Prefill/Decode disaggregation** (single-node) — §2 (Part B).
 - **TP > num_kv_heads** (replicated + token-sharded KV) — §1 / §9.
 - **Quantization correctness** (AWQ/Marlin g32 MoE fix, GPTQ-MoE TP>1 upstream bugfix,
   compressed-tensors, AutoRound-int4) — §5 (Part B).
-- **Correctness under CUDA graphs** (graph-replay / numeric-corruption fixes →
-  reproducibility) and Mamba/GDN determinism — §8 (Part B).
+- **Spec-decode reproducibility across mismatched GPUs, CUDA-graph / uneven-DCP correctness fixes,
+  and Mamba/GDN self-determinism** — three *distinct* properties, kept separate (not lumped under one
+  loose "determinism") — §8 (Part B).
 - **Vision / multimodal GGUF and broad model support** — §7 (Part B).
 - **Long-context KV-spill** **[in progress]** — §10 (Part A, but the underlying spill
   mechanism is hardware-agnostic).
@@ -202,7 +204,7 @@ Per feature, the theoretical perf/Watt gain ≈ the already-**measured** through
 
 | Feature | Measured throughput gain | Theoretical perf/Watt (prefill / decode) |
 |---|---|---|
-| Adaptive MTP / spec-decode (MTP, EAGLE3) — §3 | **net** decode gain (acceptance-adjusted): EAGLE3 ≈+15-45% (code/JSON), high-accept k=4 ≈+8% / k=5 ≈+16% vs k=3 | decode ≈ **net** gain (never above it — see split 2); workload-conditional |
+| Adaptive MTP / spec-decode (EAGLE/EAGLE3/MTP) — §3 | **net** decode gain (acceptance-adjusted): EAGLE3 ≈+15-45% (code/JSON), high-accept k=4 ≈+8% / k=5 ≈+16% vs k=3 | decode ≈ **net** gain (never above it — see split 2); workload-conditional |
 | GGUF K-quant kernel — batched MMVQ, Q8 lm_head — §4 | prefill ≈5-8× vs the always-MMQ path; TP=2 beats llama.cpp on decode | prefill ≈ +5-8× (same power, faster kernels); decode: up vs llama.cpp, ~neutral vs FP8 (bandwidth-bound) |
 | CUDA-graph decode #133 (weightless lane) — §10 | **≈+385% decode** vs the **eager-weightless** baseline | decode ≈ +385% — the eager path wasted power on the per-collective gloo guard-handshake / launch overhead; the graph does the same work with less waste |
 | MoE-offload Graph+Hotset — §6 | **≈+134% decode** vs the **eager-offload** baseline (TP=3, fraction=0.25) | decode ≈ +134% **within the offload path** — see split 1; this is *not* an absolute efficiency gain vs a fits-in-VRAM run |
@@ -463,7 +465,7 @@ with zero cross-GPU communication while the slower cards handle distributed deco
   cleanly, tears down to 0 MiB.
   *Impact: robustness — no orphaned VRAM or wedged decode after a prefill crash.*
 
-## 3. Speculative Decoding (MTP / NEXTN / EAGLE3)
+## 3. Speculative Decoding (MTP / NEXTN / EAGLE / EAGLE3)
 
 **Benefits:** all hardware. The mixed-arch *reproducibility* work is heterogeneity-motivated
 correctness, but the speed of speculation itself is a win on any box.
@@ -478,10 +480,15 @@ correctness, but the speed of speculation itself is a win on any box.
   come out), and the accept/argmax decision is taken once on rank 0 and broadcast so ranks can't
   commit different tokens near a tie. See §8 for the three roots. No throughput claim beyond
   enabling spec at all under DCP.*
-- **Adaptive draft length** — EMA + hysteresis + debounce picks k∈{1,2,3} at runtime, with
-  pre-captured graph states per k, rank-deterministic.
-  *Impact: roughly matches the best fixed k on any given workload without hand-tuning; avoids the
-  throughput cliff of a badly-chosen fixed k.*
+- **Adaptive draft length** — EMA + hysteresis + debounce picks k∈{1,2,3} at runtime (up to k=5
+  under the opt-in high-accept profile), with pre-captured graph states per k, rank-deterministic.
+  The controller is a **shared, method-agnostic** mechanism: the same `AdaptiveController` /
+  runtime-state / param machinery drives **EAGLE, EAGLE3, and NEXTN/MTP** (the `FROZEN_KV_MTP`
+  worker) identically — it is not MTP-only. Constraints, enforced fail-fast at arg validation:
+  **topk=1 only** (chain speculation; tree spec is excluded), **not** the multi-layer-EAGLE worker
+  (which does not implement it), and DP-attention / two-batch-overlap / pdmux are likewise rejected.
+  *Impact: roughly matches the best fixed k on any given workload without hand-tuning across
+  EAGLE/EAGLE3/MTP alike; avoids the throughput cliff of a badly-chosen fixed k.*
 - **Graph-state offload to system RAM (offload mechanism, stages 1+2)** — the core enabler for
   adaptive / high-k speculation. Each draft length k needs its own pre-captured CUDA graph, and each
   such graph pins a block of VRAM. "Stages 1+2" refers to the two implementation stages of the
@@ -677,33 +684,72 @@ heterogeneous slice.
   (2B models + future draft models).
   *Impact: enablement/correctness for small-head-count models under uneven TP.*
 
-## 8. Determinism, Mamba/GDN & HiCache
+## 8. Reproducibility, CUDA-Graph Correctness, Mamba/GDN & HiCache
 
-**Benefits:** all hardware. The mixed-arch determinism work is heterogeneity-motivated, but the
+**Benefits:** all hardware. The mixed-arch reproducibility work is heterogeneity-motivated, but the
 CUDA-graph correctness fixes and HiCache safety are wins on any box.
 
-- **Robustness — reproducible spec-decode output across mismatched GPUs** — NEXTN+GDN speculative
-  decoding emits the **same greedy token sequence** even when the ranks are physically different
-  cards. (To be precise: it's the *emitted output* that is reproducible, not the intermediate
-  activations — different silicon produces different low-order bits, and spec decode tolerates that
-  because it is output-preserving and the accept decision is shared from rank 0; see §3.) Worth
-  highlighting because the sources of divergence here are genuinely **not obvious**: they only
-  appear once ranks are different silicon (upstream never runs that way), and they hide in places
-  you don't normally look — a greedy verify that silently relies on every rank's argmax matching,
-  CUDA-graph pad rows leaking stale tokens into the MoE grouped-GEMM, and a flashinfer float
-  workspace that reads back regions the current forward never wrote (persistent across forwards, so
-  the output became a function of request *order*). The feature is robust against all three.
+Three **distinct** properties live in this section — kept separate rather than lumped under one loose
+word "determinism", because they mean different things:
+
+1. **Self-determinism** — run == run at a *fixed* config: the emitted output is byte-identical across
+   repeats on the same GPUs with the same flags. It is a per-config property; it does **not** imply
+   equality across different GPUs, TP degrees, or offload fractions.
+2. **Reproducibility across mismatched GPUs** (spec-decode) — the *emitted* token sequence is
+   identical regardless of which physical card holds which rank. This is **output-preserving
+   reproducibility, not bit-determinism of the activations**: different silicon produces different
+   low-order bits, and spec decode tolerates that because it is output-preserving (emitted tokens =
+   the target model's argmax chain) and the accept/token decision is taken **once on rank 0 and
+   broadcast**, so a numerically "noisy" draft only changes *how many* tokens accept, not *which*
+   ones come out.
+3. **CUDA-graph / uneven-DCP correctness fixes** — crash- and silent-corruption fixes for the
+   captured-graph × uneven-DCP combination. These are correctness/robustness, not "determinism".
+
+- **Reproducible spec-decode output across mismatched GPUs (property 2)** — NEXTN/MTP + EAGLE/EAGLE3
+  speculative decoding emits the **same greedy token sequence** even when the ranks are physically
+  different cards (run-to-run, cold == warm, independent of which card holds which rank). It is the
+  *emitted output* that is reproducible, not the intermediate activations. Worth highlighting because
+  the sources of divergence are genuinely **not obvious** — they only appear once ranks are different
+  silicon (upstream never runs that way) and hide in three independent places, all fixed:
+  (a) a greedy verify that silently relied on every rank's argmax matching — the verify result **and**
+  every per-step draft pick are now **broadcast from rank 0** to cover the greedy branch, not just the
+  sampling branch, so a near-tie can't make ranks accept different tokens and desync KV/recurrent
+  state; (b) CUDA-graph pad/tail rows leaking stale tokens from a prior replay into the MoE
+  grouped-GEMM on draft-extend replay — the input_ids / hidden_states tails are reset before replay;
+  (c) a shared, wrapper-persistent flashinfer float workspace whose split-KV path reads regions the
+  current forward never wrote — which made the output a pure function of request *order* — now zeroed
+  at request boundaries (≈0.5 ms/step, env opt-out `SGLANG_FLASHINFER_ZERO_WORKSPACE_PER_REQUEST=0`).
   *Cost sub-millisecond per step. No throughput claim.*
-- **Robustness — stable sampling on mixed-arch TP** — with ranks on different architectures
-  (sm120/sm86) the per-rank reduction order differs slightly, so the common shortcut of sampling
-  independently on every rank (safe on identical GPUs) can pick different tokens (≈1/1000) and
-  silently diverge into word-salad/loops. Non-obvious because it looks correct on any homogeneous
-  rig. The feature is robust to it by taking token IDs from a single rank, and by keying the
-  compile cache on GPU identity so ranks never load a foreign-arch artifact.
-  *Cost < 1 ms/step. No throughput claim.*
-- **Mamba/GDN determinism** — checkpoint grid, deterministic resume/eviction, flush == fresh-boot,
-  fp32 beta-gate.
-  *Impact: correctness — resumed and freshly-booted state produce identical output.*
+- **Mixed-arch sampling divergence — precise scope, no overclaim** — the same near-tie hazard exists
+  for *any* redundant per-rank sampling on different architectures (sm120 vs sm86 reduce in slightly
+  different order, so an independent per-rank argmax can flip ≈1/1000 and silently diverge into
+  word-salad / loops). In this fork it is the **spec-decode** path that closes it, via the rank-0
+  broadcast above. For the **non-speculative** path there is **no fork-specific fix and none is
+  claimed**: stock sglang already provides an env-gated token-id TP sync (an `all_reduce(MIN)`,
+  default off) that a mixed-arch rig can turn on, and torch/inductor already keys its compiled
+  artifacts on device properties (including compute capability), so there is no foreign-arch-artifact
+  trap to fix in this codebase. Stated explicitly so this fork is **not** credited with a
+  general-sampling or compile-cache fix it does not contain (that AOT-cache-keying work lives in a
+  different codebase, not here).
+- **CUDA-graph correctness under uneven-DCP (property 3, non-obvious robustness)** — the captured-graph
+  × uneven-DCP combination surfaced two failure modes that stock sglang never hits (its verify path is
+  pure paged and it has no DCP-in-graph), both fixed: (a) an MTP verify graph that ran the draft-chain
+  attention through a **ragged flashinfer wrapper whose plan() froze a raw pointer to a transient
+  qo_indptr** — the tensor was freed and its block reused, so replaying any bs>1 bucket read garbage
+  indptr → illegal memory access (crashed hard at bs>1, while bs=1 survived only by allocator luck);
+  and (b) captured decode/verify wrappers that **read fixed capture-time buffers the post-capture
+  fast-decode plan skips writing** — so replay silently corrupted long outputs for **all**
+  quantizations (first ~5-15 tokens correct, then repetition loops / token-id-0 garbage) while short
+  probes passed. These are the "graph-replay / numeric-corruption fixes" the Category-B index refers
+  to.
+  *Impact: correctness/robustness — the CUDA-graph decode path is safe under the fork's uneven-DCP
+  layouts. No throughput claim.*
+- **Mamba/GDN self-determinism (property 1)** — checkpoint grid (`--mamba-checkpoint-interval`),
+  deterministic resume/eviction on that grid, the flush == fresh-boot invariant, and an fp32 beta-gate
+  in the fused GDN decode kernel.
+  *Impact: correctness (self-determinism) — a resumed recurrent state and a freshly-booted one produce
+  identical output. This is run-to-run stability of the GDN state cache at a fixed config, a **distinct**
+  property from the cross-GPU reproducibility of property 2, not the same thing under a shared word.*
 - **HiCache under uneven-TP / DCP** — index translation and layout normalization make the
   KV-offload cache safe under the fork's non-uniform layouts (upstream assumes uniform shards).
   *Impact: correctness/robustness. The non-uniform layouts also exercise the offload paths
