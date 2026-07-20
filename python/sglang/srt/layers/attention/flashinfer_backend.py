@@ -1979,9 +1979,20 @@ class FlashInferAttnBackend(AttentionBackend):
         v = v.view(-1, layer.tp_v_head_num, layer.head_dim)
         if self.dcp_kv_replicated_heads:
             return k, v
-        k_full = cp_all_gather_heads_uneven(k, group, self.dcp_kv_head_counts)
-        v_full = cp_all_gather_heads_uneven(v, group, self.dcp_kv_head_counts)
-        return k_full, v_full
+        # #132 Fusion 1: gather the k and v head-shards in ONE all-gather
+        # instead of two. k and v share dcp_kv_head_counts, so stacking them
+        # along the row dim (dim 0) and gathering along the head dim (dim 1)
+        # produces per-tensor results IDENTICAL to two separate gathers --
+        # pure data movement, NO reduction -> BYTE-IDENTICAL -- while halving
+        # the kv all-gather launches on the latency-bound decode critical
+        # path (5 -> 4 collectives/attn-layer; Stage-0 measured collectives at
+        # ~64% of attention GPU time / ~38% of graph decode wall). Replicated-
+        # KV (e.g. 122B, 2<3) skips A entirely, so this path never runs there.
+        n = k.shape[0]
+        kv_full = cp_all_gather_heads_uneven(
+            torch.cat((k, v), dim=0), group, self.dcp_kv_head_counts
+        )
+        return kv_full[:n], kv_full[n:]
 
     def _dcp_masked_write(self, layer, forward_batch, cache_loc, k, v):
         """Gather this rank's local kv-head shard up to the FULL replicated
