@@ -1115,16 +1115,37 @@ class ModelRunnerKVCacheMixin:
                 self.max_total_num_tokens = (
                     self._wl_spill_device_tokens + _wl_spill
                 )
+                # ---- Stage B2: per-rank pool shrink -------------------------
+                # Under the even-modulo DCP owner rule a single global sequence
+                # of length L occupies only L // dcp_size PER-RANK slots (each
+                # rank owns 1/dcp_size of the tokens). The GLOBAL addressable
+                # KV is therefore max_total_num_tokens * dcp_size -- the
+                # allocator index space is already built at that size
+                # (dcp_alloc_size = max_total * cp_token_split_factor). But the
+                # single-request admission cap (max_req_len = min(context_len,
+                # max_token_pool_size)) reads the PER-RANK pool, so stock
+                # weightless caps one sequence at max_total (1/dcp_size of what
+                # physically fits) -- a dcp_size x under-utilization. Expose the
+                # GLOBAL capacity for that cap so a single over-VRAM sequence
+                # can span the whole tiered pool: to serve context C the per-
+                # rank host tier only needs ~C/dcp_size slots, not C (this is
+                # the "cheap 3x win" -- for 262144 on dcp=3, H drops from ~222k
+                # to ~47k tokens/rank). See max_token_pool_size.
+                self._wl_spill_global_capacity = (
+                    self.max_total_num_tokens * self.dcp_size
+                )
                 logger.info(
-                    "Weightless-KV host spill (B1): profiled device pool %d "
+                    "Weightless-KV host spill (B1/B2): profiled device pool %d "
                     "tokens/rank -> %d allocatable device slots + %d staging "
-                    "slots + %d HOST slots; logical per-rank KV capacity %d "
-                    "tokens (x dcp_size for the global allocator space).",
+                    "slots + %d HOST slots; per-rank KV pool %d tokens, GLOBAL "
+                    "single-sequence capacity %d tokens (x dcp_size=%d).",
                     _wl_phys,
                     self._wl_spill_device_tokens,
                     _wl_stage,
                     _wl_spill,
                     self.max_total_num_tokens,
+                    self._wl_spill_global_capacity,
+                    self.dcp_size,
                 )
 
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator

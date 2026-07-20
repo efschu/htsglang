@@ -1947,6 +1947,21 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
+        # Weightless-KV host spill (B2): input_len is a GLOBAL token count, but
+        # a DCP-token-sharded sequence only consumes input_len // dcp_size slots
+        # PER RANK, and the allocator index space is the GLOBAL capacity
+        # (per-rank pool x dcp_size). Using the per-rank pool here would clamp
+        # the generation budget to 0 whenever the GLOBAL input exceeds the
+        # per-rank pool (e.g. an over-VRAM 259k sequence on a 104k per-rank
+        # pool) even though it fits globally. Compare against the GLOBAL
+        # capacity so the tiered pool's full span is usable. Spill lane only;
+        # None/absent -> the per-rank max_total, byte-identical elsewhere.
+        _wl_global = getattr(
+            getattr(self.tp_worker, "model_runner", None),
+            "_wl_spill_global_capacity",
+            0,
+        )
+        _pool_cap = _wl_global if _wl_global else self.max_total_num_tokens
         req.sampling_params.max_new_tokens = max(
             0,
             min(
@@ -1956,7 +1971,7 @@ class Scheduler(
                     else 1 << 30
                 ),
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens - paged_input_len - self.page_size - 1,
+                _pool_cap - paged_input_len - self.page_size - 1,
             ),
         )
 
