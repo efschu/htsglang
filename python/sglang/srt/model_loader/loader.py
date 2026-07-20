@@ -2194,17 +2194,20 @@ class GGUFModelLoader(BaseModelLoader):
 
         local_model_path = self._prepare_weights(model_config.model_path)
 
-        # Qwen3.5/3.6 (hybrid GDN) need a bespoke name map + llama.cpp inverse
-        # weight transforms that the generic path cannot express.
-        from sglang.srt.model_loader.gguf_qwen35 import (
-            Qwen35GGUFAdapter,
-            is_qwen35_gguf_arch,
-        )
+        # Bespoke family adapters (Qwen3.5/3.6 hybrid GDN, Gemma-4, ...) need a
+        # bespoke name map + llama.cpp inverse weight transforms that the generic
+        # path cannot express. The registry maps model_type -> adapter; all
+        # adapters expose the same interface (build_name_map /
+        # unquantized_module_prefixes / transform_stream / mmproj_path). Model
+        # types outside the registry keep the generic HF-state_dict path
+        # unchanged (create_gguf_adapter returns None).
+        from sglang.srt.model_loader.gguf_registry import create_gguf_adapter
 
-        qwen35_adapter = None
-        if is_qwen35_gguf_arch(getattr(model_config.hf_config, "model_type", None)):
-            qwen35_adapter = Qwen35GGUFAdapter(model_config.hf_config, local_model_path)
-            gguf_weights_map = qwen35_adapter.build_name_map()
+        gguf_adapter = create_gguf_adapter(
+            model_config.hf_config, local_model_path
+        )
+        if gguf_adapter is not None:
+            gguf_weights_map = gguf_adapter.build_name_map()
         else:
             gguf_weights_map = self._get_gguf_weights_map(model_config)
         # we can only know if tie word embeddings after mapping weights
@@ -2215,10 +2218,10 @@ class GGUFModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
-        if qwen35_adapter is not None and quant_config is not None:
+        if gguf_adapter is not None and quant_config is not None:
             # GDN in_proj_ba (and any other F32-in-GGUF projection) must be built
             # unquantized so the plain-`weight` tensor loads (see adapter).
-            for prefix in qwen35_adapter.unquantized_module_prefixes():
+            for prefix in gguf_adapter.unquantized_module_prefixes():
                 if prefix not in quant_config.modules_to_not_convert:
                     quant_config.modules_to_not_convert.append(prefix)
         with set_default_torch_dtype(model_config.dtype):
@@ -2227,9 +2230,9 @@ class GGUFModelLoader(BaseModelLoader):
             weights_iterator = self._get_weights_iterator(
                 local_model_path, gguf_weights_map
             )
-            if qwen35_adapter is not None:
-                weights_iterator = qwen35_adapter.transform_stream(weights_iterator)
-                if qwen35_adapter.mmproj_path is not None:
+            if gguf_adapter is not None:
+                weights_iterator = gguf_adapter.transform_stream(weights_iterator)
+                if gguf_adapter.mmproj_path is not None:
                     # Multimodal GGUF: the vision tower lives in the mmproj
                     # file next to the backbone (llama.cpp convention). Chain
                     # its dense weights so the wrapper's visual modules are
@@ -2237,11 +2240,11 @@ class GGUFModelLoader(BaseModelLoader):
                     # see model_config.py GGUF multimodal gate).
                     logger.info(
                         "qwen35 GGUF: loading vision encoder from %s",
-                        qwen35_adapter.mmproj_path,
+                        gguf_adapter.mmproj_path,
                     )
                     weights_iterator = itertools.chain(
                         weights_iterator,
-                        qwen35_adapter.vision_weights_iterator(),
+                        gguf_adapter.vision_weights_iterator(),
                     )
             model.load_weights(weights_iterator)
 
