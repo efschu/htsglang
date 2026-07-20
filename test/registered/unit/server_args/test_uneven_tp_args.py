@@ -673,5 +673,88 @@ class TestTreeSpecDcpGuard(CustomTestCase):
         self._run_guard(1)  # must not raise
 
 
+class TestTreeSpecDcpGuardBroadened(CustomTestCase):
+    """#139: the #76 topk>1 guard must cover the whole set of conditions that
+    activate the flashinfer dcp_tree_mask (uneven_dcp = kv-replicated uneven
+    DCP OR weightless_kv), not only the uneven-WEIGHTED subset. Otherwise a
+    future loosening of the blanket DCP+spec gates would let topk>1 flow onto
+    the weightless-KV lane (or even-modulo uneven DCP) unguarded."""
+
+    def _dcp_validate(self, args, env_extra=None):
+        env = {**os.environ, **(env_extra or {})}
+        with patch.object(
+            server_args_module, "is_hip", return_value=False
+        ), patch.object(
+            server_args_module, "is_cuda", return_value=True
+        ), patch.dict(os.environ, env, clear=True):
+            args._handle_dcp_validation()
+        return args
+
+    def test_weightless_lane_topk_gt1_rejected_in_dcp_validation(self):
+        # Fastlane + dcp>1 + topk>1 must hard-error even WITHOUT a
+        # --speculative-algorithm and without any --rank-tp-ratio (this is the
+        # exact hole: the old guard keyed off uneven_weighted_dcp, which can
+        # never be True on the lane).
+        for topk in (2, 8):
+            with self.subTest(topk=topk):
+                args = make_args(
+                    tp_size=2,
+                    dcp_size=2,
+                    weightless_kv_fastlane=True,
+                    speculative_eagle_topk=topk,
+                )
+                with self.assertRaisesRegex(ValueError, "eagle-topk"):
+                    self._dcp_validate(args)
+
+    def test_even_modulo_uneven_dcp_topk_gt1_rejected(self):
+        # A --rank-tp-ratio plan with dcp>1 but NO weighted env pair and NO
+        # spec algorithm = even-modulo uneven_dcp (kv-replicated). The
+        # dcp_tree_mask keys off exactly this superset -> must hard-error.
+        args = make_args(
+            tp_size=3,
+            dcp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=[26000, 17000, 17000],
+            rank_tp_ratio=[2, 1, 1],
+            speculative_eagle_topk=2,
+        )
+        with self.assertRaisesRegex(ValueError, "eagle-topk"):
+            self._dcp_validate(args)
+
+    def test_weightless_lane_topk1_not_rejected_by_dcp_validation(self):
+        # topk=1 (chain) on the lane must NOT trip the tree-mask guard.
+        args = make_args(
+            tp_size=2,
+            dcp_size=2,
+            weightless_kv_fastlane=True,
+            speculative_eagle_topk=1,
+        )
+        self._dcp_validate(args)  # must not raise
+
+    def test_fastlane_handler_topk_gt1_rejected_independently(self):
+        # The lane's own handler must reject topk>1 as a distinct guard --
+        # even with NO --speculative-algorithm set -- so it survives a future
+        # relaxation of the lane's blanket all-spec reject.
+        args = make_args(
+            tp_size=2,
+            dcp_size=2,
+            weightless_kv_fastlane=True,
+            speculative_eagle_topk=2,
+        )
+        with self.assertRaisesRegex(ValueError, "eagle-topk"):
+            args._handle_weightless_kv_fastlane()
+
+    def test_fastlane_handler_topk1_passes(self):
+        # topk=1 without a spec algorithm must pass the lane handler (the
+        # blanket reject only fires on an actual --speculative-algorithm).
+        args = make_args(
+            tp_size=2,
+            dcp_size=2,
+            weightless_kv_fastlane=True,
+            speculative_eagle_topk=1,
+        )
+        args._handle_weightless_kv_fastlane()  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()
