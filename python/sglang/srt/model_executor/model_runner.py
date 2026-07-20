@@ -2879,6 +2879,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Initialize prefill CUDA graph runner."""
         self.prefill_cuda_graph_runner = None
 
+        # Weightless-KV fast lane (#133): only the DECODE phase is captured, as
+        # symmetric head+worker decode graphs. PREFILL/EXTEND stays EAGER (with
+        # the anti-hang guard ON) — the weightless workers hold a meta model and
+        # cannot record model.forward, and the extend collective sequence is
+        # data-dependent (has_prefix) and validated eagerly by the guard. Both
+        # the head and the workers route prefill to the EagerRunner so the two
+        # sides stay rank-uniform (both eager on extend).
+        if self.is_weightless_head or self.is_weightless_worker:
+            if not self.is_draft_worker:
+                self.prefill_cuda_graph_runner = self.eager_runner
+            return
+
         if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
             logger.info(
                 "Disable prefill CUDA graph because cuda_graph_config "
@@ -3402,10 +3414,50 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.is_weightless_head or self.is_weightless_worker:
                 from sglang.srt.layers.dcp.collective_guard import (
                     reset_forward_guard,
+                    set_guard_enabled,
                 )
 
                 reset_forward_guard()
+                # Rank-uniform guard rule for the graph regime (#133): a captured
+                # decode graph replays its DCP collectives with NO gloo handshake
+                # (the guard's per-step host-sync is not capturable and was baked
+                # out at capture time). So when decode CUDA graphs are enabled,
+                # the DCP guard must be OFF for DECODE on BOTH the head and the
+                # workers — including any eager-decode bucket-miss fallback —
+                # otherwise one side runs a guard-free graph while the other
+                # blocks on the gloo handshake (a desync/hang). PREFILL/EXTEND
+                # stays eager and GUARDED. `disable_cuda_graph` and the forward
+                # mode are rank-uniform, so head and workers decide identically.
+                _wl_decode_graphs = (
+                    not self.server_args.disable_cuda_graph
+                    and forward_batch.forward_mode.is_decode_or_idle()
+                )
+                set_guard_enabled(not _wl_decode_graphs)
             if self.is_weightless_worker:
+                # Worker decode-graph replay (#133): mirror the head's decode
+                # graph. When the batch is graph-eligible, replay the captured
+                # weightless-worker decode graph — its recorded DCP collectives
+                # pair up with the head's decode-graph replay in lockstep.
+                # Otherwise fall back to the eager per-layer dispatch (guard-free
+                # for decode per the rule above; guarded for extend).
+                mode_check = (
+                    forward_batch.forward_mode.is_cpu_graph
+                    if self.device == "cpu"
+                    else forward_batch.forward_mode.is_cuda_graph
+                )
+                worker_can_run_graph = bool(
+                    mode_check()
+                    and self.decode_cuda_graph_runner
+                    and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
+                )
+                if worker_can_run_graph:
+                    self.decode_cuda_graph_runner.execute(
+                        forward_batch,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                    )
+                    return ModelRunnerOutput(
+                        logits_output=None, can_run_graph=True
+                    )
                 return self._forward_weightless_worker(forward_batch)
 
             mode_check = (

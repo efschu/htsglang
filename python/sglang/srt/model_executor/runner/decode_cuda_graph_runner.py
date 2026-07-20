@@ -847,28 +847,52 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.buffers.seq_lens.fill_(self.seq_len_fill_value)
         self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
 
-        # Trigger CUDA graph capture for specific shapes.
-        # Capture the large shapes first so that the smaller shapes
-        # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            if not self.enable_pdmux:
-                with graph_capture() as graph_capture_context, profile_context as prof:
-                    self.stream = graph_capture_context.stream
-                    with self.backend.capture_session(self.stream):
-                        self._capture_one_stream()
-            else:
-                set_pdmux_status(False)
-                for i, sg in enumerate(self.stream_groups):
-                    with (
-                        graph_capture(stream=sg[1]) as graph_capture_context,
-                        profile_context as prof,
-                    ):
+        # Weightless-KV fast lane (#133): the anti-hang guard's per-step gloo
+        # handshake is a host-sync that CANNOT be recorded into a CUDA graph.
+        # Head + worker capture a SYMMETRIC DCP-collective sequence here (the
+        # head's model.forward and the worker's stripped per-layer dispatch), so
+        # the captured sequence is fixed by construction and the guard is
+        # unnecessary inside the captured region. Disable it for the whole
+        # capture (the 2 eager warmup forwards + the recorded pass); it is
+        # re-enabled for eager prefill/extend. Rank-uniform: every rank in the
+        # lane (head + weightless workers) builds a decode graph runner and hits
+        # this toggle at the same point.
+        _wl_lane = (
+            self.model_runner.is_weightless_head
+            or self.model_runner.is_weightless_worker
+        )
+        if _wl_lane:
+            from sglang.srt.layers.dcp.collective_guard import set_guard_enabled
+
+            set_guard_enabled(False)
+
+        try:
+            # Trigger CUDA graph capture for specific shapes.
+            # Capture the large shapes first so that the smaller shapes
+            # can reuse the memory pool allocated for the large shapes.
+            with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+                if not self.enable_pdmux:
+                    with graph_capture() as graph_capture_context, profile_context as prof:
                         self.stream = graph_capture_context.stream
                         with self.backend.capture_session(self.stream):
-                            self._capture_one_stream(i)
+                            self._capture_one_stream()
+                else:
+                    set_pdmux_status(False)
+                    for i, sg in enumerate(self.stream_groups):
+                        with (
+                            graph_capture(stream=sg[1]) as graph_capture_context,
+                            profile_context as prof,
+                        ):
+                            self.stream = graph_capture_context.stream
+                            with self.backend.capture_session(self.stream):
+                                self._capture_one_stream(i)
 
-        if self.enable_profile_cuda_graph:
-            self._post_process_after_profile(prof)
+            if self.enable_profile_cuda_graph:
+                self._post_process_after_profile(prof)
+        finally:
+            if _wl_lane:
+                # Restore the guard for the eager prefill/extend path.
+                set_guard_enabled(True)
 
         # No pool-side pin to clear: the captured full-physical write loc rides the
         # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
@@ -918,6 +942,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
     ):
+        # Weightless-KV WORKER (#133): the worker holds a meta model (zero
+        # weights) and must NOT run model.forward. It captures the stripped
+        # per-full-attention-layer DCP dispatch as its own decode graph so that
+        # head + worker BOTH replay graphs, keeping their capture-time DCP
+        # collectives in lockstep. Head-only / normal paths fall through
+        # unchanged.
+        if self.model_runner.is_weightless_worker:
+            return self._capture_one_shape_weightless(size, stream_idx, variant_label)
+
         num_tokens = size * self.num_tokens_per_bs
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
@@ -1022,6 +1055,78 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     dummies=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+
+    def _capture_one_shape_weightless(
+        self,
+        size: int,
+        stream_idx: Optional[int] = None,
+        variant_label: Optional[str] = None,
+    ):
+        """Weightless-KV WORKER decode-graph capture (#133).
+
+        Symmetric counterpart of the head's capture_one_shape: instead of
+        recording model.forward (impossible — the worker's model is on the meta
+        device), record the stripped per-full-attention-layer DCP dispatch
+        (``ModelRunner._forward_weightless_worker``'s decode loop). The recorded
+        graph issues the IDENTICAL DCP-group collective sequence as the head's
+        decode graph (KV all-gather x2, Q all-gather, LSE-merge per layer), so
+        the two graphs' NCCL ops pair up on replay.
+
+        Attention metadata is prepped OUT of the graph
+        (``init_forward_metadata_out_graph(in_capture=True)`` installs the decode
+        cuda-graph wrappers onto ``forward_metadata``); the recorded body only
+        runs the capturable per-layer dispatch. No logits, no sampling, no
+        capture-tail hooks, no autotune (the lane forbids speculative decode).
+        The guard is already disabled for the whole capture (see ``capture``)."""
+        num_tokens = size * self.num_tokens_per_bs
+        bs = size
+
+        forward_batch, attn_backend, _pp_proxy_tensors = self.capture_prepare(
+            bs, stream_idx=stream_idx, num_tokens=num_tokens
+        )
+        model_runner = self.model_runner
+        # Hybrid-GDN models nest the flashinfer FULL-attention backend inside a
+        # HybridLinearAttnBackend; the weightless_worker dispatch lives on the
+        # flashinfer backend (mirrors _forward_weightless_worker).
+        wl_attn = getattr(attn_backend, "full_attn_backend", attn_backend)
+
+        with forward_context(ForwardContext(attn_backend=attn_backend)):
+            # Out-of-graph metadata prep: installs the decode cuda-graph wrappers
+            # onto attn_backend.forward_metadata (read by the dispatch below).
+            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+
+            def run_once():
+                # Graph-recordable metadata-prep hook (no-op for flashinfer decode
+                # — everything static was prepped out-of-graph above).
+                attn_backend.init_forward_metadata_in_graph(forward_batch)
+                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
+                    None
+                )
+                set_dp_buffer_len(
+                    forward_batch.global_dp_buffer_len,
+                    num_tokens,
+                    forward_batch.dp_padding_mode.is_max_len(),
+                    forward_batch.global_num_tokens_cpu,
+                )
+                set_is_extend_in_batch(False)
+                for layer in model_runner._weightless_attn_layers():
+                    wl_attn.forward_decode_weightless_worker(layer, forward_batch)
+                # Sentinel output: the worker produces no logits. The backend
+                # stores this (None) and returns it from replay; execute() maps
+                # a None replay output to a logits-free ModelRunnerOutput.
+                return None
+
+            shape_key = self._make_graph_key(
+                self._capture_graph_size(bs=bs, num_tokens=num_tokens),
+                stream_idx,
+                variant_label,
+            )
+            self.backend.capture_one(
+                shape_key,
+                run_once,
+                dummies=None,
+                post_warmup_hook=None,
+            )
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
 
@@ -1260,6 +1365,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
+
+        if output is None:
+            # Weightless-KV WORKER decode graph (#133): the captured dispatch
+            # produces no logits — the stored/replayed sentinel is None. Nothing
+            # to slice; the caller wraps a logits-free ModelRunnerOutput.
+            return None
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
