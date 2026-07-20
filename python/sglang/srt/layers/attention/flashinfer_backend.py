@@ -548,6 +548,22 @@ class FlashInferAttnBackend(AttentionBackend):
                 # contributions -- must match the head rank's projected Q/K/V
                 # dtype so the padded all-gather shapes/dtypes agree.
                 self._wl_dtype = mc.dtype
+                # Stage B0: block-decode staging size (0 = OFF = monolithic,
+                # byte-identical). >0 restructures this rank's intra-shard decode
+                # attention into a block loop online-merged with merge_state,
+                # BEFORE the cross-rank cp_lse. All KV resident in B0. See
+                # _blockwise_decode_return_lse. Strictly scoped to this lane.
+                self._wl_chunk_block_size = int(
+                    getattr(
+                        model_runner.server_args,
+                        "weightless_kv_chunked_block_size",
+                        0,
+                    )
+                )
+                # Lazily-created persistent block decode wrapper (its own
+                # workspace so re-planning per block never clobbers the main
+                # decode/prefill wrappers' scheduling metadata).
+                self._wl_block_wrapper = None
             else:
                 self.dcp_kv_replicated_heads = attn_kv_replicated(
                     attn_tp_size, total_kv
@@ -1696,6 +1712,153 @@ class FlashInferAttnBackend(AttentionBackend):
             dcp_kv_mask=dcp_kv_mask,
         )
 
+    def _wl_block_decode_wrapper(self):
+        """Persistent block decode wrapper for the Stage B0 block loop. Lazily
+        created; re-planned per block. Shares the backend workspace -- safe
+        because under block-decode the MAIN decode wrapper is never .run()
+        (this loop replaces it entirely for the weightless full-attn layers)."""
+        if self._wl_block_wrapper is None:
+            self._wl_block_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=self.decode_backend,
+                use_tensor_cores=self.decode_use_tensor_cores,
+            )
+        return self._wl_block_wrapper
+
+    def _wl_blockwise_decode_return_lse(self, q_full, layer):
+        """Stage B0: block-decode this rank's OWNED KV token-shard.
+
+        Replaces the single monolithic ``decode_wrapper.forward_return_lse`` over
+        the owned shard with a BLOCK LOOP: the owned kv_indices are sliced into
+        blocks of ``self._wl_chunk_block_size`` slots that pass through a bounded
+        device staging region; each block runs a flashinfer split-KV PARTIAL
+        decode (returns partial output + LSE); the partials are ONLINE-MERGED via
+        the flashinfer LSE operator (``_safe_merge_state``) into a running
+        accumulator. Byte-identical to the monolithic call up to fp
+        reassociation (the merge is mathematically exact; it only reassociates).
+
+        B0 keeps ALL KV RESIDENT -- "streaming" is just iterating resident slots
+        in blocks. The block SOURCE is isolated to ``_wl_stage_block`` so B1 can
+        swap it to a host->device copy WITHOUT touching this merge logic.
+
+        Rank-uniform: the block COUNT is derived from the SHARED global seq_len
+        (identical on the head + every worker), NOT from local owned length. The
+        loop is intra-rank and issues NO cross-rank collective -- the lynchpin
+        4-collectives/layer is unperturbed. Returns (o, lse) in the SAME
+        shape/space as ``forward_return_lse`` so the existing cross-rank
+        ``cp_lse_ag_out_ar_mha_uneven`` consumes it unchanged."""
+        kv_indptr = self._dcp_decode_owned_kv_indptr  # int32 [bs+1] owned cumsum
+        kv_indices = self._dcp_decode_owned_kv_indices  # int32 owned slots
+        seq_lens = self._dcp_decode_global_seq_lens  # [bs] GLOBAL per-req lens
+        B = self._wl_chunk_block_size
+        kv_buffer = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        bs = kv_indptr.numel() - 1
+        num_qo_heads = q_full.shape[1]
+        num_kv_heads = self.indices_updater_decode.num_kv_heads
+        head_dim = q_full.shape[2]
+
+        # Rank-uniform block count from the SHARED global seq_len: under the
+        # even-modulo owner rule each rank owns ~1/dcp_size of the tokens, so a
+        # global window of (B * dcp_size) positions holds ~B owned slots on every
+        # rank. Deriving the count from the max global seq_len keeps head +
+        # workers on the SAME iteration count regardless of the +-1 owned skew;
+        # the nested-ceiling identity guarantees it covers every owned slot.
+        global_max = int(seq_lens.max().item())
+        per_block_global = B * self.dcp_size
+        num_blocks = max(1, (global_max + per_block_global - 1) // per_block_global)
+
+        indptr_host = kv_indptr.to("cpu")
+        wrapper = self._wl_block_decode_wrapper()
+        last_page = self.kv_last_page_len
+        iu = self.indices_updater_decode
+
+        o_acc = None
+        lse_acc = None
+        for j in range(num_blocks):
+            blk_indices, blk_indptr = self._wl_stage_block(
+                kv_indices, indptr_host, bs, j, B
+            )
+            if blk_indices is None:
+                # Entirely empty block on this rank (kept in the rank-uniform
+                # loop count; no attention, no merge -> no divergence).
+                continue
+            wrapper.plan(
+                blk_indptr,
+                blk_indices,
+                last_page[:bs],
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,  # page_size
+                q_data_type=iu.q_data_type,
+                kv_data_type=iu.data_type,
+            )
+            o_b, lse_b = wrapper.forward_return_lse(
+                q_full,
+                kv_buffer,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+            if o_acc is None:
+                o_acc, lse_acc = o_b, lse_b
+            else:
+                o_acc, lse_acc = _safe_merge_state(o_acc, lse_acc, o_b, lse_b)
+        if o_acc is None:
+            # Degenerate: this rank owns ZERO slots in every block (e.g. a very
+            # short sequence where the even-modulo split leaves this rank with no
+            # tokens). The monolithic forward_return_lse still returns a shaped
+            # empty-attention (o=0, lse=-inf) tensor -- reproduce that here so the
+            # cross-rank cp_lse merge stays balanced (same contract as baseline;
+            # the block loop must never return None or a rank desyncs the merge).
+            wrapper.plan(
+                kv_indptr,
+                kv_indices,
+                last_page[:bs],
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,
+                q_data_type=iu.q_data_type,
+                kv_data_type=iu.data_type,
+            )
+            o_acc, lse_acc = wrapper.forward_return_lse(
+                q_full,
+                kv_buffer,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+        return o_acc, lse_acc
+
+    def _wl_stage_block(self, kv_indices, indptr_host, bs, j, B):
+        """Stage block ``j`` of the owned KV shard into the (bounded) device
+        region the block wrapper reads. B0: the slots are already resident, so
+        this is a pure index slice of ``kv_indices`` (no data move). B1 will
+        replace the body with a host->device copy of the block's KV into a fixed
+        staging buffer and return indices INTO that buffer -- the caller's merge
+        loop is unchanged. Returns (block_kv_indices, block_kv_indptr), or
+        (None, None) when the block is empty on this rank."""
+        seg_list = []
+        blk_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=kv_indices.device)
+        for i in range(bs):
+            start = int(indptr_host[i])
+            end = int(indptr_host[i + 1])
+            bstart = start + j * B
+            bend = min(start + (j + 1) * B, end)
+            blk_len = bend - bstart if bend > bstart else 0
+            if blk_len > 0:
+                seg_list.append(kv_indices[bstart:bend])
+            blk_indptr[i + 1] = blk_indptr[i] + blk_len
+        if not seg_list:
+            return None, None
+        blk_indices = torch.cat(seg_list).contiguous()
+        return blk_indices, blk_indptr
+
     def _forward_decode_dcp(
         self, q, k, v, layer, forward_batch, decode_wrapper, cache_loc, save_kv_cache
     ):
@@ -1705,14 +1868,20 @@ class FlashInferAttnBackend(AttentionBackend):
 
         q_local = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         q_full = cp_all_gather_heads_uneven(q_local, group, self.dcp_q_head_counts)
-        o, lse = decode_wrapper.forward_return_lse(
-            q_full,
-            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        if self.weightless_kv and getattr(self, "_wl_chunk_block_size", 0):
+            # Stage B0: block-decode the owned shard (byte-identical up to fp
+            # reassociation). Strictly the weightless lane; rank-uniform with the
+            # workers' forward_decode_weightless_worker block loop.
+            o, lse = self._wl_blockwise_decode_return_lse(q_full, layer)
+        else:
+            o, lse = decode_wrapper.forward_return_lse(
+                q_full,
+                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
         # o: [tokens, 24, D], lse: [tokens, 24]; combine across the DCP token
         # shards and slice back to this rank's [12/6/6] head shard.
         o = cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
@@ -1749,17 +1918,24 @@ class FlashInferAttnBackend(AttentionBackend):
         # (3) Q broadcast from the head rank -> q_full (all heads) on this rank.
         q_full = cp_all_gather_heads_uneven(zq, group, self.dcp_q_head_counts)
         # attend this rank's LOCAL KV token-shard -> partial o + lse (all heads).
-        decode_wrapper = self.forward_metadata.decode_wrappers[
-            self._get_wrapper_idx(layer)
-        ]
-        o, lse = decode_wrapper.forward_return_lse(
-            q_full,
-            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        if getattr(self, "_wl_chunk_block_size", 0):
+            # Stage B0: block-decode the owned shard, online-merged (byte-
+            # identical up to fp reassociation). Rank-uniform with the head's
+            # _forward_decode_dcp block loop -- SAME block count (derived from the
+            # shared global seq_len), NO cross-rank collective added.
+            o, lse = self._wl_blockwise_decode_return_lse(q_full, layer)
+        else:
+            decode_wrapper = self.forward_metadata.decode_wrappers[
+                self._get_wrapper_idx(layer)
+            ]
+            o, lse = decode_wrapper.forward_return_lse(
+                q_full,
+                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
         # (4) LSE-merge: contribute this rank's partial; receive the empty
         # [T,0,D] slice (the merged output goes to the head rank only).
         cp_lse_ag_out_ar_mha_uneven(o, lse, group, self.dcp_q_head_counts)
@@ -2314,6 +2490,14 @@ class FlashInferIndicesUpdaterDecode:
                 # Blocking D2H of (bs+1) int32 once per decode step, outside
                 # the graph -- negligible against the replay itself.
                 dcp_graph_indptr_host = kv_indptr.to("cpu")
+            # Stage B0 (weightless block-decode): stash THIS rank's owned kv
+            # layout so the per-layer block loop can slice the owned shard into
+            # staging blocks. Reference assignment only; a no-op when the block
+            # feature is off (default), so the monolithic path is untouched.
+            if getattr(self.attn_backend, "_wl_chunk_block_size", 0):
+                self.attn_backend._dcp_decode_owned_kv_indptr = kv_indptr
+                self.attn_backend._dcp_decode_owned_kv_indices = kv_indices
+                self.attn_backend._dcp_decode_global_seq_lens = paged_kernel_lens
         elif spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
             bs = len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)

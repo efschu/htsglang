@@ -1195,6 +1195,25 @@ class ServerArgs:
             "weightless (KV-token-shard only).",
         ),
     ] = 0
+    weightless_kv_chunked_block_size: A[
+        int,
+        Arg(
+            help="EXPERIMENTAL (Variant C Stage B0): block-decode staging size "
+            "for the weightless-KV lane. 0 (default) = OFF -> the per-rank "
+            "intra-shard decode attention is the single monolithic flashinfer "
+            "call (byte-identical to before). >0 restructures that call into a "
+            "BLOCK LOOP: this rank's OWNED KV token-shard is iterated in blocks "
+            "of this many slots through a bounded device staging region, each "
+            "block runs a flashinfer split-KV partial decode, and the partials "
+            "are online-merged (merge_state / LSE) into a running accumulator "
+            "BEFORE the existing cross-rank cp_lse merge. All KV stays RESIDENT "
+            "in B0 (no host streaming yet -- that is B1); a tiny value forces "
+            "many blocks (the stress case), a large value ~ monolithic. The "
+            "block loop is intra-rank and adds NO cross-rank collective; block "
+            "count is derived from the shared global seq_len so it is identical "
+            "on the head and every worker. Requires --weightless-kv-fastlane.",
+        ),
+    ] = 0
     rank_tp_ratio: A[
         Optional[Union[List[int], str]],
         Arg(
@@ -3361,6 +3380,12 @@ class ServerArgs:
         (WITHOUT mixing) is supported: each chunk is a plain extend forward the
         workers mirror with the rank-uniform has_prefix branch."""
         if not self.weightless_kv_fastlane:
+            if self.weightless_kv_chunked_block_size:
+                raise ValueError(
+                    "--weightless-kv-chunked-block-size requires "
+                    "--weightless-kv-fastlane (it restructures the weightless "
+                    "lane decode attention)."
+                )
             return
 
         # Single-node pure TP + DCP only.
@@ -3419,6 +3444,31 @@ class ServerArgs:
             raise ValueError(
                 "--weightless-kv-fastlane requires a flashinfer attention "
                 f"backend; got --attention-backend={self.attention_backend}."
+            )
+        # Stage B0 block-decode staging size: non-negative; 0 = monolithic.
+        if self.weightless_kv_chunked_block_size < 0:
+            raise ValueError(
+                "--weightless-kv-chunked-block-size must be >= 0 (0 = off, the "
+                "monolithic byte-identical path); got "
+                f"{self.weightless_kv_chunked_block_size}."
+            )
+        # B0 chunked decode is EAGER-only: the per-block flashinfer .plan() is
+        # host-side scheduling work that cannot be captured into a CUDA graph.
+        # Capturing the (context-dependent) block count is a later slice
+        # (B1/B2: per-length/bucketed capture or eager fallback for over-VRAM
+        # lengths). Fail fast here rather than crash mid graph-capture. The
+        # monolithic path (block size 0) keeps full decode-graph capture (#133).
+        if (
+            self.weightless_kv_chunked_block_size
+            and self.cuda_graph_config is not None
+            and self.cuda_graph_config.decode.backend != Backend.DISABLED
+        ):
+            raise ValueError(
+                "--weightless-kv-chunked-block-size (Stage B0) is eager-only: "
+                "the per-block attention plan cannot be CUDA-graph-captured "
+                "yet. Pass --cuda-graph-backend-decode=disabled (or the legacy "
+                "--disable-cuda-graph) to run the block-decode path. Capturing "
+                "the variable block count is a later slice."
             )
 
     def _handle_model_source_paths(self):
