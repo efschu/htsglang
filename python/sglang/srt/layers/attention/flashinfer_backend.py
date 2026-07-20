@@ -3032,8 +3032,9 @@ class FlashInferAttnBackend(AttentionBackend):
         the head rank only; this rank's slice is empty and discarded.
 
         Issues the IDENTICAL dcp_group collective sequence as the head rank's
-        _forward_decode_dcp (KV all-gather x2, Q all-gather, LSE-merge) so the
-        two stay in lockstep; the anti-hang guard wraps each one."""
+        _forward_decode_dcp (fused KV all-gather [#132], Q all-gather,
+        LSE-merge) so the two stay in lockstep; the anti-hang guard wraps each
+        one."""
         assert self.weightless_kv and not self.dcp_kv_replicated_heads
         group = get_parallel().dcp_group
         cache_loc = forward_batch.out_cache_loc
@@ -3045,10 +3046,16 @@ class FlashInferAttnBackend(AttentionBackend):
         zk = torch.zeros((T, 0, hd), dtype=self._wl_dtype, device=dev)
         zv = torch.zeros((T, 0, hd), dtype=self._wl_dtype, device=dev)
         zq = torch.zeros((T, 0, hd), dtype=self._wl_dtype, device=dev)
-        # (1)+(2) KV broadcast from the head rank -> full replicated kv-heads;
+        # (1) KV broadcast from the head rank -> full replicated kv-heads;
         # then write only this rank's owned token slots (shared owner-rule).
-        k_full = cp_all_gather_heads_uneven(zk, group, self.dcp_kv_head_counts)
-        v_full = cp_all_gather_heads_uneven(zv, group, self.dcp_kv_head_counts)
+        # #132 Fusion 1: the head fuses its k+v gathers into ONE stacked
+        # collective (_dcp_write_gather: cat along dim 0, split at T) -- this
+        # worker MUST mirror it 1:1 (lockstep lynchpin: identical collective
+        # count + order per layer, else NCCL pairs mismatched calls -> hang).
+        kv_full = cp_all_gather_heads_uneven(
+            torch.cat((zk, zv), dim=0), group, self.dcp_kv_head_counts
+        )
+        k_full, v_full = kv_full[:T], kv_full[T:]
         self._dcp_owner_write(layer, forward_batch, cache_loc, k_full, v_full)
         # (3) Q broadcast from the head rank -> q_full (all heads) on this rank.
         q_full = cp_all_gather_heads_uneven(zq, group, self.dcp_q_head_counts)
@@ -3085,8 +3092,8 @@ class FlashInferAttnBackend(AttentionBackend):
         EXTEND/PREFILL (Option-B B1). Mirrors the head's _forward_extend_dcp DCP
         collective sequence with this rank's empty [T,0,D] head slice + its KV
         token-shard. The head's per-layer sequence is DATA-DEPENDENT:
-          * no prefix (first chunk): K all-gather, V all-gather               -> 2
-          * has prefix:              K, V, Q all-gather, LSE-merge            -> 4
+          * no prefix (first chunk): fused K+V all-gather (#132)             -> 1
+          * has prefix:              fused K+V, Q all-gather, LSE-merge       -> 3
         `has_prefix` is a rank-uniform (global) property, so the head and this
         worker take the identical branch -> the collective counts match. The
         head's current-chunk RAGGED attention is LOCAL (no collective), so the
@@ -3100,11 +3107,15 @@ class FlashInferAttnBackend(AttentionBackend):
         zk = torch.zeros((T, 0, hd), dtype=self._wl_dtype, device=dev)
         zv = torch.zeros((T, 0, hd), dtype=self._wl_dtype, device=dev)
         zq = torch.zeros((T, 0, hd), dtype=self._wl_dtype, device=dev)
-        # (1) KV broadcast from the head (2 collectives) + multi-token owner
+        # (1) KV broadcast from the head (ONE fused collective, #132: the head's
+        # _dcp_write_gather stacks k+v along dim 0 into a single all-gather;
+        # this worker mirrors it 1:1 -- lockstep lynchpin) + multi-token owner
         # write into this rank's owned prefix slots (shared owner rule, already
         # multi-token). IDENTICAL to the head's _dcp_masked_write path.
-        k_full = cp_all_gather_heads_uneven(zk, group, self.dcp_kv_head_counts)
-        v_full = cp_all_gather_heads_uneven(zv, group, self.dcp_kv_head_counts)
+        kv_full = cp_all_gather_heads_uneven(
+            torch.cat((zk, zv), dim=0), group, self.dcp_kv_head_counts
+        )
+        k_full, v_full = kv_full[:T], kv_full[T:]
         self._dcp_owner_write(layer, forward_batch, cache_loc, k_full, v_full)
         # (2) current-chunk ragged attention: head-LOCAL, NO collective -> skip.
         # (3) has_prefix -- computed IDENTICALLY to the head (rank-uniform), so
