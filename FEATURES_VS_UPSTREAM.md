@@ -246,41 +246,60 @@ way to run it.
 - **AutoRound-int4** — `weight_block_size` convention + a Marlin repack fix (Gemma vision
   geometry).
   *Impact: enables AutoRound-int4 (Gemma-4) that failed to load before. Enablement.*
+- **Upstream bugfix — GPTQ-MoE does not load at TP>1 (stock sglang defect)** — in stock sglang, a
+  GPTQ MoE model fails to load under **either even or uneven** tensor parallelism: `create_weights`
+  allocates `w2_scales` at full width for the `desc_act=False` case, but the TP loader then shards it,
+  producing an out-of-bounds narrow. The offending lines are from a pre-fork upstream commit, so this
+  hits **anyone** running GPTQ MoE at TP>1 — a genuine upstream defect, not a fork-only issue, and a
+  real upstream contribution candidate. Fix: shard `w2_scales` to `intermediate_size_per_partition`
+  (the `desc_act=True` path is untouched) plus a per-rank group-alignment guard.
+  *Impact: correctness — GPTQ MoE at TP>1 loads at all where stock sglang errored out. No throughput
+  claim.*
 
 ## 6. MoE / Expert Offload
 
-- **MoE expert offload (pinned-host pool + wave prefetch) [in progress]** — env-driven
-  (`SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0`): all experts live in a pinned-RAM pool, the GPU
-  keeps only `ceil(fraction · num_experts)` resident experts, and each forward LRU-prefetches the
+- **Per-expert MoE offload (pinned-host pool + wave prefetch) [landed, unpushed on `feat/weightless-kv-fastlane`]** —
+  env-driven (`SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0`): all experts live in a pinned-RAM pool, the
+  GPU keeps only `ceil(fraction · num_experts)` resident experts, and each forward LRU-prefetches the
   misses + remaps slots on-device over the unchanged grouped-GEMM. Wave processing is done **over
-  tokens, not experts**, which is the key to byte-identity (no cross-wave partial sums → no
-  floating-point re-association).
-  *Impact: lets a MoE model run with a fraction of its experts resident in VRAM — **[better] enables models
-  that otherwise would not fit**. The cost is throughput only, not quality (see below). **Eager-only by
-  design** (data-dependent routing is not graph-capturable → fail-fast guard if graphs are on).*
+  tokens, not experts** (no cross-wave partial sums → no floating-point re-association). It composes
+  with **uneven-TP + uneven-DCP** and is now **CUDA-graph compatible** — a decode-graph + eager-prefill
+  hybrid. On this rig it runs the **122B-A10B GPTQ-Int4** (~61 GB of experts) across the 3 mismatched
+  cards (5090 32 GB + 2×3080 20 GB, no NVLink) — a model that does not otherwise fit.
+  *Impact: **[better] enables models that otherwise would not fit**; **[better] single-stream decode more
+  than doubled** vs eager — CUDA-graph capture adds ≈+50% and hot-expert residency adds more on top,
+  roughly ≈2.3× over eager overall (TP=3, fraction=0.25). The win is launch-overhead elimination: the
+  offload decode was launch-bound. The cost is throughput only, not quality (see below). Env levers:
+  `SGLANG_MOE_HOT_RESIDENCY`, `SGLANG_MOE_OFFLOAD_CUDA_GRAPH`, `SGLANG_MOE_HOTSET_FILE`; default path
+  unchanged.*
   - *Quality — validated, no measurable loss (#120): on Qwen3.6-35B-A3B-FP8 (TP=3 uneven, eager,
     temp=0, tiered fraction=0.5 → half the experts resident, half host-spilled) vs the fully-resident
     baseline: **[better] ≈+0.15% perplexity** (well inside FP8 reduction-order noise), **[better] needle-in-haystack
     100%** at 8k and 30k, **[better] correctness batteries 15/15 identical**. Also byte-identical at
     fraction 0.25 vs 1.0 (identical output IDs). Verdict: offloading experts does **not** degrade
     quality — you pay in throughput, not accuracy.*
-  - *Throughput cost — [worse] PCIe-bandwidth-limited, not compute-bound: the host↔GPU expert traffic is
-    the bottleneck. **[worse] Prefill ≈an order of magnitude slower** single-stream (the spill cache
-    fragments prefill into many tiny fetch-gated GEMMs); **[worse] decode only mildly slower (≈1.4×)**.
-    Levers that shrink this: a bigger spill cache, NVLink/P2P, or more PCIe lanes.*
+  - *Correctness of the Int4 path (stated precisely, no overclaim): the FP8-triton offload is
+    byte-identical. The GPTQ/AWQ-marlin-Int4 path is coherent, self-deterministic and argmax-identical
+    within marlin's intrinsic ≈1e-2 reduction floor (near-ties only) — **not** bit-exact. The
+    CUDA-graph path adds nothing on top of the platform's normal capture-vs-eager floor that every
+    graph path in the fork already carries. In short: the offload adds zero on top of the existing
+    graph/marlin floor — this is not a claim that graph == eager bit-exact.*
+  - *Throughput cost — [worse] still PCIe-bandwidth-bound, not compute-bound: **[worse] prefill ≈an order
+    of magnitude slower** single-stream (eager; the spill cache fragments prefill into many tiny
+    fetch-gated GEMMs). Decode used to be the other soft spot but is now much closer to resident after
+    the CUDA-graph + hot-residency work above. Levers that shrink the rest: bigger spill cache, hot-set
+    tuning, NVLink/P2P, more PCIe lanes.*
   - *Robustness (non-obvious): a single forward can legitimately need more unique experts than
     fit in the resident slots (a prefill batch easily touches all of them) — not obvious up
     front. Waving over tokens keeps each token whole in one wave, so this overflow case stays
     byte-identical instead of silently evicting a still-needed expert.*
-- **Head-rank load-time MoE offload (Variant C B2b) [in progress]** — a *load-time-aware* extension of the
-  offload above, for models too big to fully load on any single GPU (e.g. a 122B-A10B). Instead of
-  today's path — materialize all experts on the GPU and *then* slice, which OOMs during load — it
-  materializes only the resident+cushion experts per layer on the GPU and **streams the cold spill
-  tier straight into host pinned RAM during load**. Pairs with the weightless fast lane (§10) where
-  the fast card holds the full model.
-  *Impact: **[better] makes otherwise-unbootable big MoE models runnable** on constrained VRAM (boots what
-  used to OOM at load); **[neutral] steady-state resident compute unchanged** (byte-identical); **[worse] throughput
-  stays PCIe-bandwidth-bound** — same cost profile as the expert-offload entry above.*
+  - *Honest follow-ups (not built, listed for completeness): a **load-time streaming loader** —
+    materialize only resident+cushion experts per layer during load and stream the cold tier straight
+    into pinned host RAM, so the host never holds the full ~61 GB expert set at once — is **unbuilt**;
+    it was not needed once the box had 108 GB of host RAM, and it remains the correct fix only for
+    models larger than this (or tighter multi-process TP aggregates). **Per-rank offload sizing** (a
+    different fraction per card) is **low value** here — the big card fills at the same fraction-pace,
+    so a single global fraction is already near-optimal on this rig.*
 
 ## 7. Model Support
 
@@ -457,9 +476,9 @@ Deliberately ordered by risk to output: **byte-identical speed/capacity gains fi
 - **Web frontend [planned]** — HF repo in → quant selection with a VRAM preview, config proposal
   (TP/DCP/PD/spec per model family), live max-KV estimator; hardware-generic (NVML profile, no rig
   constants).
-- **122B-A10B-Int4 real run [planned]** — the MoE expert-offload mechanism is validated on 35B-A3B; the
-  full 122B run is gated on a model download decision (Int4 only on this rig — an FP8 pinned pool
-  would exceed host RAM).
+- **122B-A10B-Int4 real run — done** — no longer roadmap: the 122B-A10B GPTQ-Int4 now runs on the
+  3-card rig via the per-expert offload in §6 (composed with uneven-TP + uneven-DCP, CUDA-graph decode).
+  Kept here only as a pointer to the shipped entry.
 - **GGUF loader generalization (registry / family tables) [planned]** — replace the current
   one-bespoke-adapter-per-family GGUF loaders (Qwen3.5/3.6, Gemma-4 dense) with a registry + family
   descriptor tables, so new GGUF families need data, not a new adapter. Gated on a Qwen3.5 byte-identity
