@@ -859,6 +859,36 @@ class ServerArgs:
         int,
         "Minimum difference in priorities for an incoming request to have to preempt running request(s).",
     ] = 10
+    # Variant C Stage 0: a latency-priority "fast lane" scheduling class on the
+    # shared engine. Opt-in; default path unchanged. Implemented ON TOP of the
+    # existing priority-scheduling subsystem (no parallel mechanism): enabling it
+    # turns on priority scheduling in a two-tier fast/heavy mode.
+    enable_fast_lane: A[
+        bool,
+        "Enable the fast-lane (latency-priority) scheduling class on the shared engine. "
+        "Requests tagged lane='fast' are seeded with a high priority so they preempt / "
+        "outrank batched lane='heavy' (default) requests, keeping single interactive "
+        "requests low-latency without a second model residency. Opt-in; implies "
+        "--enable-priority-scheduling in a two-tier mode. Default path is unchanged.",
+    ] = False
+    fast_lane_priority: A[
+        int,
+        "Priority value seeded for lane='fast' requests (higher = scheduled first). "
+        "Only used with --enable-fast-lane.",
+    ] = 1_000_000
+    fast_lane_reserved_heavy_slots: A[
+        int,
+        "Anti-starvation floor: the minimum number of running lane='heavy' requests "
+        "that fast-lane preemption will never drop below, guaranteeing heavy forward "
+        "progress. Only used with --enable-fast-lane.",
+    ] = 1
+    fast_lane_heavy_aging_ms: A[
+        float,
+        "Anti-starvation aging: a lane='heavy' request that has waited in the queue "
+        "longer than this many milliseconds is promoted ahead of the fast tier for one "
+        "admission, so sustained fast-lane load cannot starve an individual heavy "
+        "request. 0 disables aging. Only used with --enable-fast-lane.",
+    ] = 10_000.0
     retraction_policy: A[
         str,
         Arg(
@@ -8499,6 +8529,35 @@ class ServerArgs:
         self.validate_buckets_rule(
             "--generation-tokens-buckets", self.generation_tokens_buckets
         )
+
+        # Fast lane (Variant C Stage 0): resolve the opt-in flag into the existing
+        # priority-scheduling subsystem BEFORE the priority checks below. Enabling
+        # the fast lane turns on priority scheduling in a two-tier (fast > heavy)
+        # mode; lane='fast' requests are seeded with fast_lane_priority and heavy
+        # requests default to default_priority_value. This keeps the default path
+        # (flag off) byte-identical.
+        if self.enable_fast_lane:
+            if self.enable_priority_scheduling and self.schedule_low_priority_values_first:
+                raise ValueError(
+                    "--enable-fast-lane requires higher-value-is-higher-priority and is "
+                    "incompatible with --schedule-low-priority-values-first."
+                )
+            if self.fast_lane_reserved_heavy_slots < 0:
+                raise ValueError("--fast-lane-reserved-heavy-slots must be >= 0.")
+            if self.fast_lane_heavy_aging_ms < 0:
+                raise ValueError("--fast-lane-heavy-aging-ms must be >= 0.")
+            self.enable_priority_scheduling = True
+            self.schedule_low_priority_values_first = False
+            # Give heavy (default) requests a concrete low-tier priority so the
+            # two-tier gap (fast_lane_priority - default) is well-defined and
+            # exceeds the preemption threshold.
+            if self.default_priority_value is None:
+                self.default_priority_value = 0
+            if self.fast_lane_priority <= self.default_priority_value:
+                raise ValueError(
+                    "--fast-lane-priority must be greater than the heavy-tier "
+                    f"default priority ({self.default_priority_value})."
+                )
 
         # Check scheduling policy
         if self.enable_priority_scheduling:

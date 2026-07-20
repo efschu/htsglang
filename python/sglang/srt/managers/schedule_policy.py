@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from array import array
 
 from sglang.srt.environ import envs
@@ -170,6 +171,9 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        enable_fast_lane: bool = False,
+        fast_lane_priority: int = 0,
+        fast_lane_heavy_aging_ms: float = 0.0,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -177,6 +181,10 @@ class SchedulePolicy:
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+        # Fast lane (Variant C Stage 0) anti-starvation aging config.
+        self.enable_fast_lane = enable_fast_lane
+        self.fast_lane_priority = fast_lane_priority
+        self.fast_lane_heavy_aging_ms = fast_lane_heavy_aging_ms
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -201,7 +209,11 @@ class SchedulePolicy:
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
-                    waiting_queue, self.priority_sign
+                    waiting_queue,
+                    self.priority_sign,
+                    enable_fast_lane=self.enable_fast_lane,
+                    fast_lane_priority=self.fast_lane_priority,
+                    heavy_aging_ms=self.fast_lane_heavy_aging_ms,
                 )
             return
 
@@ -367,12 +379,53 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_priority_and_fcfs(
-        waiting_queue: List[Req], priority_sign: int
+        waiting_queue: List[Req],
+        priority_sign: int,
+        enable_fast_lane: bool = False,
+        fast_lane_priority: int = 0,
+        heavy_aging_ms: float = 0.0,
     ) -> None:
-        """Sorts the waiting queue based on the request priority then received titmestamp."""
+        """Sorts the waiting queue based on the request priority then received titmestamp.
+
+        Fast lane (Variant C Stage 0) anti-starvation: when enabled with a
+        positive aging window, a heavy request that has waited longer than
+        ``heavy_aging_ms`` is promoted just BELOW the fast tier (effective
+        priority ``fast_lane_priority - 1``) — ahead of un-aged heavy requests
+        but still behind fast requests. This lets an aged heavy request win the
+        next freed slot ahead of fresh heavy work, without ever outranking a
+        fast request (which must stay first so its preemption path fires; a
+        heavy req cannot preempt, so promoting it ABOVE fast would only wedge
+        the admission loop and starve the fast lane). Ordering within a promoted
+        set stays FCFS. When aging is off, behavior is byte-identical to before.
+        """
+        aging_active = (
+            enable_fast_lane and heavy_aging_ms > 0 and priority_sign == -1
+        )
+        if not aging_active:
+            waiting_queue.sort(
+                key=lambda x: (
+                    x.priority * priority_sign,
+                    x.time_stats.wait_queue_entry_time,
+                )
+            )
+            return
+
+        now = time.time()
+        promote_before = now - (heavy_aging_ms / 1000.0)
+
+        def _effective_priority(x: Req) -> int:
+            # Only heavy requests age; a heavy request whose queue-entry time is
+            # older than the aging window jumps ahead of the fast tier.
+            if not getattr(x, "is_fast_lane", False) and (
+                x.time_stats.wait_queue_entry_time <= promote_before
+            ):
+                return fast_lane_priority - 1
+            return x.priority
+
+        # priority_sign == -1 here (higher value = higher priority).
         waiting_queue.sort(
             key=lambda x: (
-                x.priority * priority_sign,
+                _effective_priority(x) * priority_sign,
                 x.time_stats.wait_queue_entry_time,
             )
         )
@@ -1183,12 +1236,38 @@ class PrefillAdder:
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
             - self.rem_total_tokens
         )
+
+        # Fast lane (Variant C Stage 0) anti-starvation: never preempt heavy
+        # ('is_fast_lane' False) requests below the reserved floor, so at least
+        # --fast-lane-reserved-heavy-slots heavy requests keep running and make
+        # forward progress even under sustained fast-lane load. Disabled (no
+        # cap) when the fast lane is off, preserving the default behavior.
+        max_heavy_preemptible = None
+        if getattr(server_args, "enable_fast_lane", False):
+            num_heavy_running = sum(
+                1 for r in sorted_valid_running_reqs if not getattr(r, "is_fast_lane", False)
+            )
+            max_heavy_preemptible = max(
+                0, num_heavy_running - server_args.fast_lane_reserved_heavy_slots
+            )
+        heavy_preempted = 0
+
         for running_req in sorted_valid_running_reqs:
             # Priority difference needs to meet the threshold to be preemptible.
             priority_diff = (req.priority - running_req.priority) * (-priority_sign)
 
             if priority_diff > self.priority_scheduling_preemption_threshold:
+                is_heavy = not getattr(running_req, "is_fast_lane", False)
+                if (
+                    max_heavy_preemptible is not None
+                    and is_heavy
+                    and heavy_preempted >= max_heavy_preemptible
+                ):
+                    # Reserved-heavy-slots floor reached: stop preempting.
+                    break
                 preemptible_reqs.append(running_req)
+                if is_heavy:
+                    heavy_preempted += 1
                 min_tokens_to_remove -= self._get_running_request_total_token_offset(
                     running_req
                 )

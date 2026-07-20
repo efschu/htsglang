@@ -329,6 +329,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.max_req_input_len = None  # Will be set later in engine.py
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.default_priority_value = server_args.default_priority_value
+        self.enable_fast_lane = server_args.enable_fast_lane
+        self.fast_lane_priority = server_args.fast_lane_priority
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -1195,6 +1197,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
+                lane=obj.lane,
                 extra_key=obj.extra_key,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
@@ -3083,6 +3086,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def _set_default_priority(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         """Set the default priority value."""
+        # Fast lane (Variant C Stage 0): a lane='fast' request with no explicit
+        # priority is seeded with the high fast-lane priority so it outranks /
+        # preempts heavy requests via the existing priority-scheduling path. An
+        # explicit priority always wins (raw priority still works).
+        if (
+            self.enable_fast_lane
+            and obj.priority is None
+            and getattr(obj, "lane", None) == "fast"
+        ):
+            obj.priority = self.fast_lane_priority
+            return
         if (
             self.enable_priority_scheduling
             and obj.priority is None

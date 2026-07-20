@@ -1042,6 +1042,9 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            enable_fast_lane=self.server_args.enable_fast_lane,
+            fast_lane_priority=self.server_args.fast_lane_priority,
+            fast_lane_heavy_aging_ms=self.server_args.fast_lane_heavy_aging_ms,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.max_prefill_bs: int = 0
@@ -2167,6 +2170,11 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+            # Fast lane (Variant C Stage 0): tag the request's lane so the
+            # anti-starvation reserved-heavy-slots floor can distinguish fast
+            # from heavy requests during preemption. Only meaningful when the
+            # server was launched with --enable-fast-lane.
+            req.is_fast_lane = getattr(recv_req, "lane", None) == "fast"
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
