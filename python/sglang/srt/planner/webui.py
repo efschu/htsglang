@@ -3307,7 +3307,7 @@ function showTab(t) {
   for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
   if ((t==='explore'||t==='landscape') && !window._profLoaded) loadProfiles();
   if (t==='energy' && !window._energyInit) { window._energyInit=true; loadPowerProfile(); }
-  if (t==='quality' && !window._qualityInit) { window._qualityInit=true; loadShots(); }
+  if (t==='quality') { autofillQuality(); if(!window._qualityInit){window._qualityInit=true; loadShots();} }
   if (t==='runner' && !window._runnerInit) {
     window._runnerInit=true; loadKnobs(); detectGPUs(); loadModels();
     loadFlagCatalog(); refreshServerStatus();
@@ -4076,7 +4076,19 @@ async function measurePower() {
 function verdictClass(v) {
   return v==='correct' ? 'fit' : (v==='wrong-position'||v==='broken' ? 'nofit' : 'offload');
 }
+async function autofillQuality() {
+  // Use the currently running managed server (endpoint + served model) so the
+  // Quality run targets whatever is loaded, without retyping it.
+  try {
+    const s = (await (await fetch('/api/server_status')).json()).status || {};
+    if (s.state === 'ready' && s.port) {
+      $('q_endpoint').value = '127.0.0.1:' + s.port;
+      if (s.served_model_name) $('q_model').value = s.served_model_name;
+    }
+  } catch(e) {}
+}
 async function qualityRun() {
+  if (!$('q_endpoint').value.trim() || !$('q_model').value.trim()) await autofillQuality();
   const endpoint = $('q_endpoint').value.trim();
   const model = $('q_model').value.trim();
   if (!endpoint || !model) { $('q_status').innerHTML = '<span class="reasons">endpoint + model required</span>'; return; }
