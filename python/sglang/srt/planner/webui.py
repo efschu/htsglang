@@ -2783,6 +2783,27 @@ INDEX_HTML = r"""<!doctype html>
   .chip.error:before { background: #ff7b72; }
   /* hardware: per-card VRAM bar spanning the row */
   .cardrow .cardbar { grid-column: 1 / -1; }
+  /* landing top strip: ONE full-width row of live metric tiles (label, big
+     value, secondary line, 60s sparkline). Normal flow -- the strip pushes
+     the rest of the page down, nothing overlaps; tiles wrap to a second row
+     on narrow screens instead of overflowing. */
+  .mstrip { display: flex; flex-wrap: wrap; gap: .45rem; width: 100%;
+            margin: .2rem 0 .7rem; }
+  .mtile { flex: 1 1 168px; min-width: 168px; background: #12171e;
+           border: 1px solid #263041; border-radius: 8px;
+           padding: .38rem .55rem .45rem; }
+  .mtile .mt-l { font-size: .62rem; color: #7f8b99; text-transform: uppercase;
+                 letter-spacing: .03em; white-space: nowrap; overflow: hidden;
+                 text-overflow: ellipsis; }
+  .mtile .mt-v { font-size: 1.2rem; font-weight: 700; color: #e6edf3;
+                 line-height: 1.3; white-space: nowrap; }
+  .mtile .mt-v small { font-size: .64rem; font-weight: 400; color: #8b96a5; }
+  .mtile .mt-s { font-size: .62rem; color: #8b96a5; line-height: 1.35;
+                 min-height: 1.7em; }
+  /* fixed-pixel sparkline: sized in JS as samples*px so ONE sample = ONE
+     pixel bucket; never stretched by CSS (stretching would alias samples). */
+  .mtile svg.spk { display: block; margin-top: .25rem; background: #0d1117;
+                   border-radius: 3px; max-width: 100%; }
 </style>
 </head>
 <body>
@@ -2822,16 +2843,17 @@ INDEX_HTML = r"""<!doctype html>
     <b>detect</b>, or launch a server in the Runner tab.
     <span id="landing_none_status" class="muted"></span></div>
   <div id="landing_live" style="display:none">
+    <!-- full-width top strip: the live headline metrics (throughput / spec /
+         cache / energy / cost) with 60s freeze-at-zero activity graphs. This
+         REPLACES the former "throughput / spec / cache" block below -- the
+         strip is the only place these numbers appear on the landing page. -->
+    <div id="landing_strip" class="mstrip"><span class="muted">waiting for first snapshot&hellip;</span></div>
     <fieldset>
       <legend>running model + start config</legend>
       <div id="landing_config" class="muted">waiting for first snapshot&hellip;</div>
     </fieldset>
     <div class="cols">
       <div>
-        <fieldset>
-          <legend>throughput / spec / cache (live + 60s)</legend>
-          <div id="landing_rates" class="muted">waiting&hellip;</div>
-        </fieldset>
         <fieldset>
           <legend>per-card GPU (live + 60s)</legend>
           <div id="landing_gpus" class="muted">waiting&hellip;</div>
@@ -4163,12 +4185,52 @@ function renderPlacement(pl){
 // ===========================================================================
 window._landTimer=null; window._ring={};
 const RING_SECONDS=60;
+//: settable resolution hook: the landing poll cadence IS the strip sample
+//: resolution (one sample per poll; one pixel bucket per sample below).
+const LAND_POLL_MS=2000;
 function pushRing(key,t,v){
   if(v==null||isNaN(v)) return;
   const a=window._ring[key]||(window._ring[key]=[]);
   a.push({t,v});
   const cutoff=t-RING_SECONDS;
   while(a.length && a[0].t<cutoff) a.shift();
+}
+// -- top-strip ring semantics: FREEZE at zero -------------------------------
+// A strip graph shows the last 60s of ACTIVITY. When a stream goes idle the
+// curve drops to 0 ONCE (a zero sample is accepted only within the grace
+// window after the last nonzero sample) and then the buffer FREEZES -- no
+// eternally scrolling flatline of zeros. New activity resumes appending; the
+// wall-time gap is allowed (pushRing's cutoff then drops pre-gap history).
+const STRIP_FREEZE_GRACE_S=2;  // grace after the last nonzero sample
+window._stripActive={};        // ring key -> t of the last NONZERO sample
+function stripPush(key,t,v){
+  if(v==null||isNaN(v)) return;
+  if(v>0) window._stripActive[key]=t;
+  else if(window._stripActive[key]==null
+          || (t-window._stripActive[key])>STRIP_FREEZE_GRACE_S)
+    return;  // FROZEN: the drop-to-zero was already recorded (or never active)
+  pushRing(key,t,v);
+}
+// -- top-strip sparkline: one pixel bucket per sample, NO smoothing ---------
+// Sample i occupies one fixed STRIP_PX_PER_SAMPLE-wide x bucket (newest at
+// the right edge); the SVG is sized samples*px so nothing is interpolated,
+// stretched, or aliased -- the graph never invents data between polls.
+const STRIP_PX_PER_SAMPLE=5;
+const STRIP_SAMPLES=Math.round(RING_SECONDS*1000/LAND_POLL_MS);
+const STRIP_W=STRIP_SAMPLES*STRIP_PX_PER_SAMPLE;
+const STRIP_H=26;
+function stripSpark(key){
+  const a=(window._ring[key]||[]).slice(-STRIP_SAMPLES);
+  let inner='';
+  if(a.length>=2){
+    let mx=-Infinity; for(const p of a) if(p.v>mx) mx=p.v;
+    if(mx<=0) mx=1;  // baseline is always 0 (activity graph)
+    const x0=STRIP_W-a.length*STRIP_PX_PER_SAMPLE+STRIP_PX_PER_SAMPLE/2;
+    const pts=a.map((p,i)=>(x0+i*STRIP_PX_PER_SAMPLE)+','
+      +(1+(STRIP_H-2)*(1-Math.max(0,p.v)/mx)).toFixed(1)).join(' ');
+    inner='<polyline fill="none" stroke="#1f6feb" stroke-width="1.5" points="'+pts+'"/>';
+  }
+  return '<svg class="spk" width="'+STRIP_W+'" height="'+STRIP_H+'">'+inner+'</svg>';
 }
 function sparkline(key,w,hh){
   const a=window._ring[key]||[]; if(a.length<2) return '';
@@ -4183,13 +4245,16 @@ function sparkline(key,w,hh){
 function landingEndpoint(){
   try{ return (localStorage.getItem('land_endpoint')||'').trim(); }catch(e){ return ''; }
 }
+function resetLandingRings(){
+  window._ring={}; window._stripActive={}; window._stripHit=null;
+}
 function setLandingEndpoint(){
   try{ localStorage.setItem('land_endpoint', $('land_endpoint').value.trim()); }catch(e){}
-  window._ring={}; landingPoll();
+  resetLandingRings(); landingPoll();
 }
 function clearLandingEndpoint(){
   try{ localStorage.removeItem('land_endpoint'); }catch(e){}
-  $('land_endpoint').value=''; window._ring={}; landingPoll();
+  $('land_endpoint').value=''; resetLandingRings(); landingPoll();
 }
 async function detectLandingEndpoint(){
   $('land_target_note').textContent='probing the common local ports…';
@@ -4207,7 +4272,7 @@ async function startLanding(){
   if(window._landTimer) return;
   if(!$('land_endpoint').value) $('land_endpoint').value=landingEndpoint();
   await landingPoll();
-  window._landTimer=setInterval(landingPoll, 2000);
+  window._landTimer=setInterval(landingPoll, LAND_POLL_MS);
 }
 function stopLanding(){ if(window._landTimer){ clearInterval(window._landTimer); window._landTimer=null; } }
 async function landingPoll(){
@@ -4326,27 +4391,143 @@ function renderLanding(s, tgt){
   }
   $('landing_gpus').innerHTML = gh||'<span class="muted">no NVML cards'+(s.nvml_error?' ('+esc(s.nvml_error)+')':'')+'</span>';
 
-  let rh=''; const rates=s.rates;
-  if(rates){
-    window._lastRates=rates;
-    pushRing('dec',s.t,rates.decode_tok_s); pushRing('pfx',s.t,rates.prefill_tok_s);
-    rh+='<div>decode <b>'+(rates.decode_tok_s!=null?rates.decode_tok_s.toFixed(1):'—')+'</b> tok/s '+sparkline('dec',120,20)+'</div>'
-      +'<div>prefill (non-cached) <b>'+(rates.prefill_tok_s!=null?rates.prefill_tok_s.toFixed(1):'—')+'</b> tok/s '+sparkline('pfx',120,20)+'</div>';
-  } else { rh+='<div class="muted">(rates on next tick)</div>'; }
-  if(s.spec){
-    pushRing('acc',s.t,(s.spec.accept_rate!=null?s.spec.accept_rate*100:null));
-    rh+='<div>MTP accept <b>'+((s.spec.accept_rate||0)*100).toFixed(1)+'%</b> '+sparkline('acc',120,20)
-      +' &nbsp; adaptive-k '+(s.spec.adaptive_k!=null?s.spec.adaptive_k:'—')+'</div>';
-  }
-  if(s.cache_hit_rates)
-    rh+='<div class="legend">cache-hit per tier: '+Object.keys(s.cache_hit_rates)
-      .map(k=>k+' '+((s.cache_hit_rates[k]||0)*100).toFixed(0)+'%').join(' · ')+'</div>';
-  if(s.hicache)
-    rh+='<div class="legend">HiCache host RAM: '+(s.hicache.host_used_tokens||0).toFixed(0)+'/'
-      +(s.hicache.host_total_tokens||0).toFixed(0)+' tok ('+((s.hicache.host_used_frac||0)*100).toFixed(0)+'%)</div>';
-  $('landing_rates').innerHTML=rh;
+  if(s.rates) window._lastRates=s.rates;
+  renderLandingStrip(s);
 
   renderLandingPlacement(s);
+}
+// ===========================================================================
+// Landing TOP STRIP: full-width headline tiles + 60s freeze-at-zero activity
+// graphs. Data: /api/live_snapshot only, plus the #147 /api/hicache_saved
+// accumulator (throttled) for the SAVED tile. The former lower
+// "throughput / spec / cache" block moved INTO this strip -- nothing is
+// rendered twice on the landing page.
+// ===========================================================================
+const STRIP_DASH='<span class="muted">--</span>';
+function stripTile(id,label,value,sub,sparkKey,tip){
+  return '<div class="mtile" id="'+id+'"'+(tip?' title="'+esc(tip)+'"':'')+'>'
+    +'<div class="mt-l">'+label+'</div>'
+    +'<div class="mt-v">'+value+'</div>'
+    +'<div class="mt-s">'+(sub||'&nbsp;')+'</div>'
+    +(sparkKey?stripSpark(sparkKey)
+      :'<svg class="spk" width="'+STRIP_W+'" height="'+STRIP_H+'"></svg>')
+    +'</div>';
+}
+function stripFetchSaved(){  // throttled read of the #147 savings accumulator
+  const now=Date.now();
+  if(window._stripSavedT && now-window._stripSavedT<10000) return;
+  window._stripSavedT=now;
+  fetch('/api/hicache_saved?price_ct_per_kwh='+getKwhPriceCt())
+    .then(r=>r.json()).then(d=>{ window._stripSaved=d; }).catch(e=>{});
+}
+function renderLandingStrip(s){
+  const t=s.t, EPS=0.05;   // tok/s below EPS counts as "phase not active"
+  const noMetrics=!!s.metrics_error;
+  const hint='token metrics unavailable &mdash; needs --enable-metrics on the server';
+  const rates=s.rates||null, spec=s.spec||null;
+  const dec=rates?rates.decode_tok_s:null, pfx=rates?rates.prefill_tok_s:null;
+  const num=(v,dgt)=>(v==null?STRIP_DASH:Number(v).toFixed(dgt==null?1:dgt));
+  const sub=(txt)=>noMetrics?('<span class="est">'+hint+'</span>'):txt;
+  // throughput streams: freeze-at-zero ring pushes (drop to 0 once, then hold)
+  stripPush('st_dec',t,dec); stripPush('st_pfx',t,pfx);
+  // live board power: per-card NVML watts summed (works without /metrics)
+  let watts=null;
+  for(const g of (s.gpus||[])) if(g.power_watts!=null) watts=(watts||0)+g.power_watts;
+  // spec accept is a GAUGE (holds its last value while idle) -- sample it only
+  // while decode is active so the graph freezes instead of scrolling a stale
+  // flat line; no fake zero is invented for a gauge.
+  if(spec&&spec.accept_rate!=null&&dec!=null&&dec>EPS)
+    stripPush('st_acc',t,spec.accept_rate*100);
+  // per-tier cache hit: fresh only within a prompt window; keep the last known
+  // numbers on display, but push samples only when a fresh window exists.
+  if(s.cache_hit_rates) window._stripHit=s.cache_hit_rates;
+  const hit=window._stripHit||null;
+  if(s.cache_hit_rates&&s.cache_hit_rates.overall!=null)
+    stripPush('st_hit',t,s.cache_hit_rates.overall*100);
+  let hitBig=STRIP_DASH, tierTxt='no prompt window yet';
+  if(hit){
+    hitBig=((hit.overall||0)*100).toFixed(0)+'<small>%</small>';
+    tierTxt=Object.keys(hit).filter(k=>k!=='overall')
+      .map(k=>esc(k)+' <b>'+((hit[k]||0)*100).toFixed(0)+'%</b>').join(' &middot; ')
+      ||'no per-tier counters';
+  }
+  if(s.hicache)
+    tierTxt+=' &middot; host pool '+((s.hicache.host_used_frac||0)*100).toFixed(0)+'% used';
+  // live energy: J/token = summed NVML watts / active-phase tok/s. The phase
+  // is whichever rate is active (decode wins when both run, chunked prefill).
+  // Undefined while idle -> '--' and a FROZEN graph (no divide-by-zero junk).
+  let phase=null, tokS=null;
+  if(dec!=null&&dec>EPS){phase='decode';tokS=dec;}
+  else if(pfx!=null&&pfx>EPS){phase='prefill';tokS=pfx;}
+  const jtok=(watts!=null&&tokS)?watts/tokS:null;
+  const tokKwh=jtok?3.6e6/jtok:null;
+  if(jtok!=null) stripPush('st_j',t,jtok);
+  // live cost per phase (ct / 1M tok at the shared kWh price)
+  const priceCt=getKwhPriceCt();
+  const decCt=(watts!=null&&dec!=null&&dec>EPS)?jPerTokToCtPer1M(watts/dec,priceCt):null;
+  const pfxCt=(watts!=null&&pfx!=null&&pfx>EPS)?jPerTokToCtPer1M(watts/pfx,priceCt):null;
+  if(decCt!=null) stripPush('st_cost',t,decCt);
+  // SAVED tile: #147 accumulator = host-RAM + disk tiers ONLY (the pipeline
+  // already excludes the device/VRAM hot tier). Activity graph = tok/s served
+  // from the non-device tiers (per-tier hit fraction x gross prompt rate).
+  stripFetchSaved();
+  if(s.cache_hit_rates&&rates&&rates.prefill_tok_s_gross!=null){
+    let f=0;
+    for(const k of Object.keys(s.cache_hit_rates))
+      if(k!=='overall'&&k!=='device'&&s.cache_hit_rates[k]!=null)
+        f+=s.cache_hit_rates[k];
+    stripPush('st_saved',t,f*rates.prefill_tok_s_gross);
+  }
+  const sd=window._stripSaved||null;
+  const sgt=(sd&&sd.grand_total)||null;
+  let savedVal=STRIP_DASH, savedSub='no savings recorded yet (#147 accumulator)';
+  if(sgt&&sgt.saved_kwh_band){
+    const cb=kwhBandToCt(sgt.saved_kwh_band,priceCt);
+    savedVal=_f2(cb[0])+'&ndash;'+_f2(cb[1])+'<small> ct</small>';
+    savedSub=_f1(sgt.recovered_prefill_tokens)
+      +' tok recovered &middot; TOTAL across sessions';
+  }
+  $('landing_strip').innerHTML=
+    stripTile('strip_decode','decode tok/s',
+      noMetrics?STRIP_DASH:num(dec)+'<small> tok/s</small>',
+      sub(rates?('server gauge '+num(rates.gen_throughput_server)+' tok/s')
+               :'(rates on next tick)'),
+      'st_dec')
+   +stripTile('strip_prefill','prefill tok/s (non-cached)',
+      noMetrics?STRIP_DASH:num(pfx)+'<small> tok/s</small>',
+      sub(rates?('gross incl. cache-served: '+num(rates.prefill_tok_s_gross)+' tok/s')
+               :'(rates on next tick)'),
+      'st_pfx',
+      'REAL computed prefill only: cache-served tokens are subtracted. '
+      +'The gross figure incl. cached tokens is the small line, never the headline.')
+   +stripTile('strip_spec','MTP accept',
+      (noMetrics||!spec)?STRIP_DASH:((spec.accept_rate||0)*100).toFixed(1)+'<small>%</small>',
+      sub(spec?('adaptive-k <b>'+(spec.adaptive_k!=null?spec.adaptive_k:'--')
+        +'</b> &middot; ema accept-len '
+        +(spec.ema_accept_len!=null?Number(spec.ema_accept_len).toFixed(2):'--'))
+        :'spec decode off / no data'),
+      'st_acc')
+   +stripTile('strip_cache','cache hit per tier',
+      noMetrics?STRIP_DASH:hitBig, sub(tierTxt), 'st_hit',
+      'Per-tier hit rate over the last prompt window: device = VRAM hot tier, '
+      +'host = system RAM, storage = disk. Headline = overall across tiers.')
+   +stripTile('strip_energy','energy now',
+      noMetrics?STRIP_DASH
+        :(jtok!=null?num(jtok)+'<small> J/tok ('+phase+')</small>':STRIP_DASH),
+      sub((tokKwh!=null?_f1(tokKwh):'--')+' tok/kWh &middot; '
+        +(watts!=null?Math.round(watts)+' W (NVML sum)':'-- W')),
+      'st_j')
+   +stripTile('strip_cost','cost now (ct/1M tok)',
+      noMetrics?STRIP_DASH
+        :(decCt!=null?num(decCt,2)+'<small> ct/1M decode</small>':STRIP_DASH),
+      sub('prefill '+(pfxCt!=null?Number(pfxCt).toFixed(2):'--')
+        +' ct/1M &middot; @'+priceCt+' ct/kWh'),
+      'st_cost')
+   +stripTile('strip_saved','saved by RAM+disk cache',
+      savedVal, savedSub, 'st_saved',
+      'Avoided prefill recompute cost from the HiCache host-RAM + disk tiers '
+      +'ONLY -- the device/VRAM hot tier is explicitly excluded (#147). '
+      +'Cumulative total across sessions at the current kWh price.');
 }
 async function renderLandingPlacement(s){
   const n=normalizeStartConfig(s);
