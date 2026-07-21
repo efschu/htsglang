@@ -122,7 +122,9 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
-def _broadcast_draft_picks(*tensors: Optional[torch.Tensor]) -> None:
+def _broadcast_draft_picks(
+    *tensors: Optional[torch.Tensor], solo_single_rank: bool = False
+) -> None:
     """Sync per-rank draft decisions from TP rank 0.
 
     Per-rank logits differ in the last bits (especially on heterogeneous
@@ -132,7 +134,16 @@ def _broadcast_draft_picks(*tensors: Optional[torch.Tensor]) -> None:
     pick silently desynchronizes the KV / recurrent state across ranks for
     the rest of the sequence. Mirrors the verify-result sync in
     eagle_utils.eagle_sample.
+
+    ``solo_single_rank``: under draft-solo placement
+    (--speculative-draft-placement solo) exactly ONE rank runs the draft
+    forward, so its picks are inherently rank-consistent — and the other
+    ranks never reach this code path, so a broadcast here would hang
+    (no matching participants). The one-per-round token-id broadcast
+    happens in ``EagleDraftWorker.draft`` instead.
     """
+    if solo_single_rank:
+        return
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
@@ -144,6 +155,58 @@ def _broadcast_draft_picks(*tensors: Optional[torch.Tensor]) -> None:
     for t in tensors:
         if t is not None:
             tp_group.broadcast(t, src=0)
+
+
+def _solo_gather_full_vocab_rows(
+    tp_group,
+    shard: torch.Tensor,
+    valid_rows: int,
+    out_rows: int,
+    keep: bool,
+) -> Optional[torch.Tensor]:
+    """Collectively assemble a FULL vocab-dim tensor (embed_tokens / lm_head)
+    from the per-rank vocab shards of the target model.
+
+    COLLECTIVE: every rank of ``tp_group`` must call this at the same point.
+    Rank ``r`` broadcasts its shard's first ``valid_rows`` rows (the
+    non-padding org-vocab rows sit at the shard start); the shards are
+    concatenated in rank order and trimmed to ``out_rows``. Handles uneven
+    vocab shards (--rank-vocab-ratio) naturally since each source announces
+    its own shape. Returns the full tensor on ranks with ``keep=True`` and
+    None elsewhere (recv buffers are dropped immediately so the transient
+    footprint on non-keeping ranks is one shard, not the full table).
+
+    If the shard already spans ``out_rows`` (replicated embedding, tp=1),
+    the caller should NOT call this — there is nothing to gather.
+    """
+    world = tp_group.world_size
+    my_rank = tp_group.rank_in_group
+    pieces: List[Optional[torch.Tensor]] = []
+    for src in range(world):
+        if src == my_rank:
+            piece = shard[:valid_rows].contiguous()
+            tp_group.broadcast_object(list(piece.shape), src=src)
+            tp_group.broadcast(piece, src=src)
+        else:
+            shape = tp_group.broadcast_object(None, src=src)
+            piece = torch.empty(
+                tuple(shape), dtype=shard.dtype, device=shard.device
+            )
+            tp_group.broadcast(piece, src=src)
+        if keep:
+            pieces.append(piece)
+        del piece
+    if not keep:
+        return None
+    full = torch.cat(pieces, dim=0)
+    if full.shape[0] < out_rows:
+        raise RuntimeError(
+            "draft-solo vocab gather assembled only "
+            f"{full.shape[0]} rows but the full table needs {out_rows}; "
+            "the target's vocab shards do not cover the vocabulary "
+            "(unexpected shard layout)."
+        )
+    return full[:out_rows].contiguous()
 
 
 def _get_plan_stream(
@@ -192,6 +255,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             server_args.speculative_algorithm
         )
 
+        # Draft-solo placement (--speculative-draft-placement solo): the
+        # draft runs UNSHARDED on one rank; every other rank is a "shadow"
+        # that skips the draft forward and waits on one token-id broadcast
+        # per round. Class-level defaults (split path) live on
+        # EagleDraftWorkerBase (#136a: variants bypass this __init__).
+        if (
+            getattr(server_args, "speculative_draft_placement", "split") == "solo"
+        ):
+            self._spec_solo_active = True
+            self._spec_solo_rank = server_args.speculative_draft_solo_rank()
+            self._spec_solo_is_host = tp_rank == self._spec_solo_rank
+            # server_args validation guarantees these; assert defensively
+            # because topk/num_steps defaulting runs after validation.
+            assert self.topk == 1, (
+                "draft-solo placement requires topk == 1 (chain drafts); "
+                f"got topk={self.topk} after defaulting."
+            )
+            assert not server_args.speculative_use_rejection_sampling
+
         # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
@@ -236,7 +318,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # keeps the original late-share timing in alloc_memory_pool() —
         # zero behavior change there and for non-spec configs.
         self._embed_head_shared_early = False
-        if not self.speculative_algorithm.is_eagle3():
+        if self._spec_solo_active:
+            # Solo: the target's embed/lm_head are TP-sharded, but the solo
+            # rank's UNSHARDED draft needs the FULL tables. Assemble them via
+            # an init-time all-rank gather (COLLECTIVE — every rank calls
+            # this at the same point, shadows contribute their shards and
+            # keep nothing). Done EARLY for the same M21 profiling reason as
+            # the non-EAGLE3 early share below, for ALL algorithms: the
+            # EAGLE3 late-share point (alloc_memory_pool) is skipped on
+            # shadow ranks and would desync the collective.
+            self.init_token_map()
+            self._solo_init_lm_head()
+            self._embed_head_shared_early = True
+        elif not self.speculative_algorithm.is_eagle3():
             self.init_token_map()
             self.init_lm_head()
             self._embed_head_shared_early = True
@@ -260,11 +354,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Allocate draft KV cache pools (called by scheduler)."""
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.draft_worker.alloc_memory_pool(
-            memory_pool_config=memory_pool_config,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        )
+        if self._spec_solo_active and not self._spec_solo_is_host:
+            # Shadow rank: NO draft KV pool at all (the draft never runs
+            # here; the solo rank holds the whole draft KV). Pure VRAM win.
+            # Embed/head were gathered early (_solo_init_lm_head), so the
+            # late-share branch below has nothing to do either.
+            return
+        # Solo host: allocate the draft pool under the weight-TP=1 override
+        # so get_num_kv_heads(attn_tp_size) yields the FULL head count — the
+        # unsharded draft projects ALL kv heads. Token capacity is already
+        # full-context for draft pools (they are not DCP-token-sharded, see
+        # the M4 note in model_runner_kv_cache_mixin). nullcontext on split.
+        with self._solo_build_ctx():
+            self.draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
         if not self._embed_head_shared_early:
             # EAGLE3 path: original timing (share/keep-dedicated decided here).
             self.init_token_map()
@@ -287,6 +393,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
 
     def init_attention_backends(self):
+        if self._spec_solo_active and not self._spec_solo_is_host:
+            # Shadow rank: the draft forward never runs here, so no draft
+            # attention backends (skips their flashinfer workspaces too).
+            self.draft_attn_backend = None
+            self.draft_extend_attn_backend = None
+            return
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
@@ -296,6 +408,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.init_attention_backend()
 
     def init_cuda_graphs(self):
+        if self._spec_solo_active and not self._spec_solo_is_host:
+            # Shadow rank: capture NO draft graphs (sets both runners to
+            # None) — the VRAM win on the non-solo cards. The solo rank's
+            # capture below is purely rank-local (the draft model was built
+            # weight-TP=1, so its forward has no collectives to desync).
+            self._capture_cuda_graphs()
+            return
         with (
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
@@ -455,25 +574,210 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
 
+    # ------------------------------------------------------------------
+    # Draft-solo placement helpers (--speculative-draft-placement solo)
+    # ------------------------------------------------------------------
+
+    def _solo_build_ctx(self):
+        """Weight-TP=1 parallel-context override for solo-host build phases
+        (draft KV pool sizing, draft attention-backend init) so head/vocab
+        geometry reads match the unsharded draft model. nullcontext on the
+        split path and on shadow ranks."""
+        if self._spec_solo_active and self._spec_solo_is_host:
+            return get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+            )
+        return contextlib.nullcontext()
+
+    def _solo_init_lm_head(self):
+        """Solo variant of ``init_lm_head``: assemble FULL (unsharded)
+        embed_tokens / lm_head tables for the solo rank's draft from the
+        target's TP vocab shards.
+
+        COLLECTIVE: every TP rank must call this at the same init point
+        (shadows contribute their shards and keep nothing). The split path's
+        tensor share cannot work here: the solo draft was built weight-TP=1
+        and runs collective-free, so a shared vocab SHARD would compute
+        logits/embeddings for a fraction of the vocabulary only.
+        """
+        from sglang.srt.distributed import get_tp_group
+
+        target_model = self.target_worker.model_runner.model
+        target_lm_head = getattr(target_model, "lm_head", None)
+        if (
+            target_lm_head is not None
+            and not hasattr(target_lm_head, "weight")
+            and hasattr(target_lm_head, "qweight")
+        ):
+            raise NotImplementedError(
+                "--speculative-draft-placement solo does not support the "
+                "GGUF quantized-resident vocab path (module-shared packed "
+                "lm_head): the solo rank needs FULL dense embed/lm_head "
+                "tables assembled from the target's vocab shards. Set "
+                "SGLANG_GGUF_DENSE_VOCAB=1 to restore the dense vocab path, "
+                "or use --speculative-draft-placement split."
+            )
+
+        embed, head = target_model.get_embed_and_head()
+        tp_group = get_tp_group()
+        vocab_size = self.target_worker.model_config.vocab_size
+        keep = self._spec_solo_is_host
+        draft_model = self.draft_runner.model
+
+        # Rank-uniform decisions (shapes/attrs identical on every rank —
+        # a divergent branch here would desync the gather collectives).
+        embed_module = getattr(
+            getattr(target_model, "model", None), "embed_tokens", None
+        )
+        if self.speculative_algorithm.is_eagle3():
+            need_head = bool(getattr(draft_model, "load_lm_head_from_target", False))
+        else:
+            need_head = True
+
+        full_embed = self._solo_gather_or_local(
+            tp_group, embed, embed_module, vocab_size, keep
+        )
+        full_head = (
+            self._solo_gather_or_local(
+                tp_group, head, target_lm_head, vocab_size, keep
+            )
+            if need_head
+            else None
+        )
+        if not keep:
+            # Drop the transient recv buffers BEFORE the scheduler's KV
+            # profiling reads free VRAM (same M21 reasoning as the early
+            # share; set_embed_and_head performs the same empty_cache on
+            # the host side).
+            if _is_cuda:
+                torch.cuda.empty_cache()
+            return
+
+        if self.speculative_algorithm.is_eagle3():
+            if need_head:
+                draft_model.set_embed_and_head(full_embed, full_head)
+            else:
+                draft_model.set_embed(full_embed)
+            # NOTE: no set_lm_head_from_target here — the target's lm_head
+            # module is TP-sharded and must not leak into the solo draft.
+            if draft_model.hot_token_id is not None:
+                self.hot_token_id = draft_model.hot_token_id.to(full_embed.device)
+        else:
+            if self.hot_token_id is not None:
+                self.hot_token_id = self.hot_token_id.to(full_head.device)
+                full_head = full_head[self.hot_token_id].contiguous()
+            draft_model.set_embed_and_head(full_embed, full_head)
+
+    def _solo_gather_or_local(self, tp_group, shard, module, out_rows, keep):
+        """Gather the full vocab-dim tensor, or reuse ``shard`` when it is
+        already full (replicated embedding / tp_size==1). The replicated
+        check is rank-uniform (all ranks hold the same layout), so the
+        collective stays symmetric."""
+        if shard.shape[0] >= out_rows:
+            return shard[:out_rows] if keep else None
+        idx = getattr(module, "shard_indices", None)
+        if idx is not None:
+            if idx.num_added_elements > 0:
+                raise NotImplementedError(
+                    "--speculative-draft-placement solo does not support "
+                    "added-vocab shard layouts (per-shard org/added regions); "
+                    "gathering them needs region-aware reassembly."
+                )
+            valid_rows = idx.num_org_elements
+        else:
+            valid_rows = shard.shape[0]
+        return _solo_gather_full_vocab_rows(
+            tp_group, shard, valid_rows, out_rows, keep
+        )
+
+    def _solo_tp_group(self):
+        from sglang.srt.distributed import get_tp_group
+
+        return get_tp_group()
+
+    def _solo_send_draft_tokens(
+        self, draft_tokens: torch.Tensor, bs: int
+    ) -> None:
+        """Solo host: broadcast this round's k chain token ids — the ONE
+        cross-rank transfer of the whole draft phase."""
+        group = self._solo_tp_group()
+        if group.world_size == 1:
+            return
+        payload = (
+            draft_tokens.reshape(bs, self.speculative_num_steps)
+            .to(torch.int64)
+            .contiguous()
+        )
+        group.broadcast(payload, src=self._spec_solo_rank)
+
+    def _solo_recv_draft_tokens(self, bs: int) -> torch.Tensor:
+        """Shadow rank: receive the solo rank's k chain token ids."""
+        group = self._solo_tp_group()
+        payload = torch.empty(
+            (bs, self.speculative_num_steps), dtype=torch.int64, device=self.device
+        )
+        group.broadcast(payload, src=self._spec_solo_rank)
+        return payload
+
+    def _topk1_chain_meta(self, bs: int):
+        """(parent_list, top_scores_index) for a topk=1 chain — runtime
+        invariants; the preallocated buffers when bs fits, else fresh ones
+        (mirrors the slow-path organize_draft_results result for chains)."""
+        assert self.topk == 1
+        if (
+            self._topk1_parents_prealloc is not None
+            and bs <= self._topk1_parents_prealloc.shape[0]
+        ):
+            return (
+                self._topk1_parents_prealloc[:bs],
+                self._topk1_score_indices_prealloc[:bs],
+            )
+        num_steps = self.speculative_num_steps
+        parent_width = num_steps if num_steps > 1 else 0
+        parents = torch.arange(
+            -1, parent_width - 1, dtype=torch.long, device=self.device
+        ).repeat(bs, 1)
+        score_idx = torch.arange(
+            num_steps, dtype=torch.long, device=self.device
+        ).repeat(bs, 1)
+        return parents, score_idx
+
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
 
         self.draft_extend_attn_backend = None
 
-        draft_backend_factory = DraftBackendFactory(
-            self.server_args,
-            self.draft_runner,
-            self.topk,
-            self.speculative_num_steps,
-        )
+        if self._spec_solo_active and not self._spec_solo_is_host:
+            # Shadow rank: no draft forward -> no draft backends. Also hit
+            # by build_adaptive_runtime_state, so every adaptive rung keeps
+            # its draft slots empty (None) on shadow ranks.
+            self.draft_attn_backend = None
+            self.draft_runner.draft_attn_backend = None
+            return
 
-        # Initialize decode attention backend
-        self.draft_attn_backend = draft_backend_factory.create_decode_backend()
+        # Solo host: backend init under the weight-TP=1 override so any
+        # get_parallel()-derived head geometry matches the unsharded draft
+        # model (nullcontext on the split path).
+        with self._solo_build_ctx():
+            draft_backend_factory = DraftBackendFactory(
+                self.server_args,
+                self.draft_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
 
-        # Initialize draft extend attention backend (respects speculative_attention_mode setting)
-        self.draft_extend_attn_backend = (
-            draft_backend_factory.create_draft_extend_backend()
-        )
+            # Initialize decode attention backend
+            self.draft_attn_backend = draft_backend_factory.create_decode_backend()
+
+            # Initialize draft extend attention backend (respects speculative_attention_mode setting)
+            self.draft_extend_attn_backend = (
+                draft_backend_factory.create_draft_extend_backend()
+            )
 
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
@@ -484,6 +788,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
+
+        if self._spec_solo_active and not self._spec_solo_is_host:
+            # Shadow rank: no draft graphs at all (incl. every adaptive
+            # ladder rung — build_adaptive_runtime_state routes through
+            # here). The solo rank captures its rungs rank-locally.
+            return
 
         if _is_cpu or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
@@ -602,6 +912,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
+        if self._spec_solo_active and not self._spec_solo_is_host:
+            # Shadow rank: no draft forward at all; wait for the solo
+            # rank's token-id broadcast and rebuild the chain tree locally.
+            return self._draft_solo_shadow(batch, draft_input)
         forward_batch, can_cuda_graph = self.prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
@@ -649,6 +963,53 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.device,
             )
 
+        if self._spec_solo_active:
+            # Solo host: ONE broadcast of the k chain token ids per round —
+            # the entire cross-rank traffic of the draft phase. The shadows
+            # are blocked in _draft_solo_shadow on the matching broadcast.
+            self._solo_send_draft_tokens(draft_tokens, batch.seq_lens.shape[0])
+
+        return self._finish_draft_tree(
+            batch, draft_input, parent_list, top_scores_index, draft_tokens, draft_probs
+        )
+
+    def _draft_solo_shadow(self, batch: ScheduleBatch, draft_input: "EagleDraftInput"):
+        """Shadow rank's draft phase under solo placement.
+
+        Skips prepare_for_draft + draft_forward entirely (the shadow's draft
+        model is meta, it has no draft KV pool, backends, or graphs) and
+        instead receives the solo rank's k chain token ids, then rebuilds
+        the (runtime-invariant, topk=1) chain tree metadata locally so the
+        verify phase runs on every rank exactly as in split mode.
+        """
+        if batch.forward_mode.is_idle():
+            # Rank-uniform (single scheduler cohort, DP rejected): the solo
+            # rank takes its own idle return and skips the broadcast too.
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                self.device,
+            )
+        bs = batch.seq_lens.shape[0]
+        draft_tokens = self._solo_recv_draft_tokens(bs)
+        parent_list, top_scores_index = self._topk1_chain_meta(bs)
+        return self._finish_draft_tree(
+            batch, draft_input, parent_list, top_scores_index, draft_tokens, None
+        )
+
+    def _finish_draft_tree(
+        self,
+        batch: ScheduleBatch,
+        draft_input: "EagleDraftInput",
+        parent_list: torch.Tensor,
+        top_scores_index: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        draft_probs: Optional[torch.Tensor],
+    ):
+        """Build the verify tree mask + EagleVerifyInput from the draft
+        results (extracted verbatim from ``draft``; shared by the split
+        path, the solo host, and the solo shadow)."""
         # Build tree mask
         # Directly write to cuda graph buffers for verify attn
         tree_mask_buf, position_buf = (
@@ -818,6 +1179,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     if self.server_args.speculative_use_rejection_sampling
                     else None
                 ),
+                solo_single_rank=self._spec_solo_active,
             )
             maybe_detect_oob(
                 topk_index,
@@ -970,7 +1332,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # The step-0 pick of the first draft round after prefill: must be
         # rank-consistent like every other pick (see _broadcast_draft_picks).
         _broadcast_draft_picks(
-            topk_index, topk_p, probs if use_rejection_sampling else None
+            topk_index,
+            topk_p,
+            probs if use_rejection_sampling else None,
+            solo_single_rank=self._spec_solo_active,
         )
         return EagleDraftInput(
             topk_p=topk_p,
@@ -1132,7 +1497,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # iteration, outside any cuda graph — "selected-row topk is owned by
         # the worker"): the per-rank argmax/topk/sample here was the last
         # unsynced decision point after the in-loop and verify syncs.
-        _broadcast_draft_picks(ret_topk_index, ret_topk_p, ret_draft_probs)
+        _broadcast_draft_picks(
+            ret_topk_index,
+            ret_topk_p,
+            ret_draft_probs,
+            solo_single_rank=self._spec_solo_active,
+        )
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
@@ -1197,6 +1567,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             target_worker,
         )
 
+        # Draft-solo placement: mirror the draft worker's resolved role
+        # (class-level defaults on BaseSpecWorker cover the split path).
+        self._spec_solo_active = self._draft_worker._spec_solo_active
+        self._spec_solo_is_host = self._draft_worker._spec_solo_is_host
+        self._spec_solo_rank = self._draft_worker._spec_solo_rank
+
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
@@ -1218,6 +1594,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def war_fastpath_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
         # draft_extend, which runs on the draft runner.
+        if self._spec_solo_active and not self._spec_solo_is_host:
+            # Solo shadow: draft_extend never runs here, so the last
+            # shared-buffer-reading phase is the target verify. (If the
+            # target runner records no event the scheduler falls back to
+            # the conservative wait_stream — still correct.)
+            return self._target_worker.model_runner
         return self._draft_worker.draft_runner
 
     @property
@@ -1307,7 +1689,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
-            # Draft prefill
+            # Draft prefill.
+            #
+            # Draft-input replication note (why solo needs no extra input
+            # comm): the NEXTN/EAGLE draft consumes the TARGET's hidden
+            # states (logits_output.hidden_states), and the target's
+            # residual stream is REPLICATED on every TP rank — each decoder
+            # layer ends in a RowParallel all_reduce, so the captured
+            # hidden states (FULL here, LAST in decode) are already
+            # identical bytes on all ranks when this point is reached. The
+            # solo rank therefore drafts from purely local inputs; the
+            # shadows only need the k token ids it broadcasts per round.
+            if self._spec_solo_active and not self._spec_solo_is_host:
+                # Shadow rank: skip the draft prefill forward entirely. The
+                # draft KV for the prefill positions is written ONLY on the
+                # solo rank (hidden states for all prefill positions are
+                # locally available there post-target-forward).
+                batch_output.next_draft_input = self._solo_stub_draft_input(
+                    batch, batch_output.next_token_ids
+                )
+                return batch_output
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
@@ -1365,7 +1766,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
-            if (
+            if self._spec_solo_active and not self._spec_solo_is_host:
+                # Shadow rank: no draft-extend forward. verify already set
+                # bonus_tokens (the only next-round field a shadow reads —
+                # its next draft round is the broadcast recv); topk/hidden
+                # get shape-valid stubs for the overlap FutureMap.
+                self._stub_skipped_draft_extend(batch, batch_output)
+            elif (
                 self.speculative_num_steps == 0
                 and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
             ):
@@ -1469,6 +1876,39 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dtype=hidden_dtype,
                 device=device,
             )
+
+    def _solo_stub_draft_input(
+        self, batch: ScheduleBatch, next_token_ids: torch.Tensor
+    ) -> EagleDraftInput:
+        """Shadow rank's stand-in for ``_draft_extend_for_prefill``'s return.
+
+        ``bonus_tokens`` (the verify-tree root, identical on every rank) is
+        the only field the shadow's later rounds actually read; topk_p /
+        topk_index / hidden_states are shape-valid zero stubs so the overlap
+        FutureMap can stash them (mirrors ``_stub_skipped_draft_extend``).
+        They are never consumed: the shadow's draft phase is the broadcast
+        recv, never a forward from this state.
+        """
+        bs = batch.seq_lens.shape[0]
+        device = self.device
+        topk_p = torch.zeros((bs, self.topk), dtype=torch.float32, device=device)
+        topk_index = torch.zeros((bs, self.topk), dtype=torch.int64, device=device)
+        hidden_states = None
+        hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+            self.draft_worker.draft_runner
+        )
+        if hidden_size is not None:
+            hidden_states = torch.zeros(
+                (bs, hidden_size), dtype=hidden_dtype, device=device
+            )
+        return EagleDraftInput(
+            topk_p=topk_p,
+            topk_index=topk_index,
+            hidden_states=hidden_states,
+            bonus_tokens=next_token_ids,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0

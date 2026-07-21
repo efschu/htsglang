@@ -308,6 +308,27 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
     return model.model
 
 
+def compute_draft_solo_role(server_args, is_draft_worker, tp_rank):
+    """Draft-solo placement (--speculative-draft-placement solo) role of one
+    ModelRunner: returns ``(is_draft_solo_host, is_draft_solo_shadow)``.
+
+    * host: the DRAFT runner on the solo rank -- loads the draft UNSHARDED
+      (built under a weight-TP=1 override, like the weightless-KV head).
+    * shadow: the DRAFT runner on every other rank -- builds the draft on the
+      ``meta`` device (no weights, no draft KV, no draft graphs) and never
+      runs a draft forward; it waits on the solo rank's token-id broadcast.
+
+    TARGET runners are never host nor shadow: the target path is unchanged.
+    Split placement (the default) returns (False, False) everywhere.
+    """
+    if not is_draft_worker:
+        return False, False
+    if getattr(server_args, "speculative_draft_placement", "split") != "solo":
+        return False, False
+    solo_rank = server_args.speculative_draft_solo_rank()
+    return tp_rank == solo_rank, tp_rank != solo_rank
+
+
 class RankZeroFilter(logging.Filter):
     """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
 
@@ -387,6 +408,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.info(
                 "Weightless-KV fast lane: rank %d is the HEAD rank (full "
                 "weights, TP=1 + attention dispatch).",
+                self.tp_rank,
+            )
+        # Draft-solo placement (--speculative-draft-placement solo): computed
+        # here for the same reason as the weightless flags above (single init
+        # path, consumed by load_model). No-ops on the default 'split' path
+        # and for every TARGET runner.
+        self.is_draft_solo_host, self.is_draft_solo_shadow = compute_draft_solo_role(
+            server_args, is_draft_worker, tp_rank
+        )
+        if self.is_draft_solo_host:
+            logger.info(
+                "Draft-solo placement: rank %d HOSTS the unsharded solo "
+                "draft (weight-TP=1 build).",
+                self.tp_rank,
+            )
+        elif self.is_draft_solo_shadow:
+            logger.info(
+                "Draft-solo placement: rank %d is a draft SHADOW (meta-device "
+                "draft, no draft weights/KV/graphs; waits on the solo rank's "
+                "draft-token broadcast).",
                 self.tp_rank,
             )
         self.dcp_size = server_args.dcp_size
@@ -1493,6 +1534,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ``meta`` under the model dtype, do NOT call ``load_weights`` and never
         ``.to(device)``. Runs inside the same weight-TP=1 override context as the
         head build so partition geometry is consistent.
+
+        Also reused by a draft-solo SHADOW rank (--speculative-draft-placement
+        solo): its draft model exists only so config-derived reads
+        (hidden-state spec, layer counts) keep working; the shadow never runs
+        a draft forward and never touches these meta parameters.
         """
         from sglang.srt.model_loader.loader import (
             _get_quantization_config,
@@ -1644,6 +1690,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # the now length-1 partition list without this. The dcp geometry is
             # set later at attention-backend init (NOT under this override), so
             # it still uses the real rank for the KV token-shard.
+            # Draft-solo placement reuses the exact same construction-time
+            # override: BOTH the solo host and the shadows build the draft
+            # module graph as weight-TP=1 (full families, no sharding, no
+            # draft-internal all-reduce -- linears cache tp_size at
+            # construction), and rank pinned to 0 so rank-indexed partition
+            # lists stay valid. The host then LOADS the full weights; a
+            # shadow builds on `meta` (no weights) exactly like a weightless
+            # KV worker -- its draft forward is never called.
             _wl_build_ctx = (
                 get_parallel().override(
                     tp_size=1,
@@ -1653,12 +1707,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     attn_tp_size=1,
                     attn_tp_rank=0,
                 )
-                if (self.is_weightless_head or self.is_weightless_worker)
+                if (
+                    self.is_weightless_head
+                    or self.is_weightless_worker
+                    or self.is_draft_solo_host
+                    or self.is_draft_solo_shadow
+                )
                 else contextlib.nullcontext()
             )
             with _wl_build_ctx:
-                if self.is_weightless_worker:
-                    # B2a: weightless worker -- meta-model, NO weight load.
+                if self.is_weightless_worker or self.is_draft_solo_shadow:
+                    # B2a / draft-solo shadow: meta-model, NO weight load.
                     self.model = self._build_weightless_worker_meta_model()
                 else:
                     self.model = self.loader.load_model(
@@ -1685,7 +1744,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # #77 cache otherwise installs lazily on the first forward, which is
         # AFTER pool sizing -> the pool would over-allocate and the resident
         # experts would OOM. No-op unless SGLANG_MOE_RESIDENT_EXPERT_FRACTION<1.
-        self._install_moe_expert_offload_eager()
+        # Draft-solo shadow: meta draft holds no expert weights to offload.
+        if not self.is_draft_solo_shadow:
+            self._install_moe_expert_offload_eager()
 
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:
@@ -1695,6 +1756,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if (
             self.server_args.kv_cache_dtype == "fp8_e4m3"
             and not self.is_weightless_worker
+            # Draft-solo shadow: meta model, no weights to load scales into.
+            and not self.is_draft_solo_shadow
         ):
             # B2a: KV-cache scales load into model weights (meta on the worker);
             # the worker's KV pool gets its scales via the head's dispatch path.
@@ -1794,8 +1857,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Pre-expand RoPE cache before CUDA Graph capture.
         # B2a: skip on a weightless worker -- its model layers are meta (RoPE
         # cos/sin caches are meta buffers) and the worker forward never runs
-        # RoPE (it only issues the attention dispatch collectives).
-        if not self.is_weightless_worker:
+        # RoPE (it only issues the attention dispatch collectives). Same for
+        # a draft-solo shadow (meta draft, forward never called).
+        if not self.is_weightless_worker and not self.is_draft_solo_shadow:
             reserve_rope_cache_for_long_sequences(
                 self.model,
                 self.server_args,
