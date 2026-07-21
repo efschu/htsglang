@@ -642,6 +642,46 @@ class TestDashboardV2Index(CustomTestCase):
         self.assertIn("measurePower", webui.INDEX_HTML)
 
 
+class TestLandingTopStrip(CustomTestCase):
+    """Full-width live metrics strip at the top of the Landing page: headline
+    tiles with 60s freeze-at-zero activity graphs."""
+
+    def test_strip_container_and_tile_ids_present(self):
+        for token in (
+            "landing_strip", "strip_decode", "strip_prefill", "strip_spec",
+            "strip_cache", "strip_energy", "strip_cost", "strip_saved",
+            "renderLandingStrip", "stripTile",
+        ):
+            self.assertIn(token, webui.INDEX_HTML, token)
+
+    def test_old_lower_rates_block_is_gone(self):
+        # The former "throughput / spec / cache" block MOVED into the strip --
+        # its container id and legend must no longer exist (no duplication).
+        self.assertNotIn("landing_rates", webui.INDEX_HTML)
+        self.assertNotIn("throughput / spec / cache (live + 60s)",
+                         webui.INDEX_HTML)
+
+    def test_freeze_at_zero_semantics_markers(self):
+        # Drop-to-zero-once + FREEZE ring: the grace constant and the
+        # freeze-aware push helper must both be part of the page JS.
+        self.assertIn("STRIP_FREEZE_GRACE_S", webui.INDEX_HTML)
+        self.assertIn("stripPush", webui.INDEX_HTML)
+        self.assertIn("FROZEN", webui.INDEX_HTML)
+
+    def test_one_pixel_bucket_per_sample_markers(self):
+        # Resolution rule: fixed px-per-sample SVG sized samples*px (no
+        # smoothing / CSS stretching that would alias samples).
+        self.assertIn("STRIP_PX_PER_SAMPLE", webui.INDEX_HTML)
+        self.assertIn("STRIP_SAMPLES", webui.INDEX_HTML)
+        self.assertIn("LAND_POLL_MS", webui.INDEX_HTML)
+
+    def test_saved_tile_reuses_147_pipeline(self):
+        # SAVED tile = host-RAM + disk tiers ONLY via /api/hicache_saved; the
+        # device/VRAM hot tier is excluded by the #147 pipeline it reuses.
+        self.assertIn("stripFetchSaved", webui.INDEX_HTML)
+        self.assertIn("/api/hicache_saved", webui.INDEX_HTML)
+
+
 class TestPlacementRoute(CustomTestCase):
     def test_placement_from_model_cfg_running_and_prospective(self):
         # ONE renderer, two data sources: identical route for both the landing
