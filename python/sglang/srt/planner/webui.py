@@ -804,6 +804,114 @@ def landscape_from_payload(payload: dict) -> dict:
 # ===========================================================================
 
 
+# ===========================================================================
+# #149 / #150 — energy live-monitoring + scenario-builder route payloads.
+# These are thin adapters over sglang.srt.planner.energy; the heavy logic
+# (tagging schema, sweep restore, delta-rate math, scenario expansion, the
+# cache-flush gate) lives there and is unit-tested without a GPU.
+# ===========================================================================
+
+
+def gpu_state_payload() -> dict:
+    """Live per-card power-state tags (#149 Ebene-4 refresh button)."""
+    from sglang.srt.planner.energy import read_gpu_power_states
+
+    states = read_gpu_power_states()
+    return {"ok": True, "cards": [s.to_json() for s in states]}
+
+
+def live_snapshot_payload(payload: dict) -> dict:
+    """One /metrics scrape of a RUNNING target server (#149 live widget /
+    'measure against a running server'). The client polls this at its chosen
+    resolution and computes delta rates locally — the token counters are
+    already Prometheus counters, so prefill/s + decode/s are pure client deltas.
+
+    Also echoes the CLAMPED resolution so the widget cannot poll below the
+    ~30ms floor."""
+    from sglang.srt.planner.energy import (
+        clamp_live_resolution_ms,
+        fetch_live_snapshot,
+    )
+
+    target = (payload.get("target") or "").strip()
+    if not target:
+        return {"ok": False, "error": "no target server (host:port) given"}
+    if not target.startswith("http"):
+        target = "http://" + target
+    resolution_ms = clamp_live_resolution_ms(
+        payload.get("resolution_ms", 250.0))
+    try:
+        snap = fetch_live_snapshot(target)
+    except Exception as e:
+        return {"ok": False, "error": f"scrape of {target}/metrics failed: {e}"}
+    return {
+        "ok": True,
+        "resolution_ms": resolution_ms,
+        "snapshot": {
+            "t": snap.t,
+            "prompt_tokens_total": snap.prompt_tokens_total,
+            "generation_tokens_total": snap.generation_tokens_total,
+            "spec_accept_rate": snap.spec_accept_rate,
+            "spec_num_steps": snap.spec_num_steps,
+            "spec_ema_accept_len": snap.spec_ema_accept_len,
+            "gen_throughput": snap.gen_throughput,
+        },
+    }
+
+
+def scenario_payload(payload: dict) -> dict:
+    """Expand a scenario-builder config (#150) into the concrete list of
+    phase/behavior run units, and attach the cache-flush warning gate so the UI
+    can require confirmation BEFORE a cold-prefill flush."""
+    from sglang.srt.planner.energy import ScenarioConfig, cache_flush_warning
+
+    fields = {
+        k: payload[k]
+        for k in (
+            "scale", "phases", "concurrency", "behaviors", "prefill_tokens",
+            "decode_tokens", "duration_s", "multiturn", "turns",
+            "turn_growth_tokens", "cold_prefill",
+        )
+        if k in payload and payload[k] is not None
+    }
+    try:
+        cfg = ScenarioConfig(**fields)
+    except (TypeError, ValueError) as e:
+        return {"ok": False, "error": str(e)}
+    units = cfg.expand()
+    will_flush = any(u.get("cold") for u in units)
+    warning = cache_flush_warning(
+        will_flush=will_flush,
+        target_running_server=bool(payload.get("target_running_server")),
+    )
+    return {
+        "ok": True,
+        "units": units,
+        "cache_flush_warning": warning,
+        "summary": {
+            "prefill_tokens": cfg.scaled_prefill_tokens(),
+            "decode_tokens": cfg.scaled_decode_tokens(),
+            "concurrency": cfg.concurrency,
+            "n_units": len(units),
+        },
+    }
+
+
+def cache_flush_warning_payload(payload: dict) -> dict:
+    """Standalone cache-flush gate (#150) — the UI calls this before ANY flush
+    (cold-prefill or benchmark) against a target to know whether a blocking
+    confirmation is mandatory."""
+    from sglang.srt.planner.energy import cache_flush_warning
+
+    return {
+        "ok": True,
+        **cache_flush_warning(
+            will_flush=bool(payload.get("will_flush", True)),
+            target_running_server=bool(payload.get("target_running_server")),
+        ),
+    }
+
+
 class _Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype):
         data = body.encode() if isinstance(body, str) else body
@@ -843,6 +951,12 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
+        if self.path.startswith("/api/gpu_state"):
+            try:
+                self._json(200, gpu_state_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
         self._send(404, "not found", "text/plain")
 
     def do_POST(self):
@@ -866,6 +980,15 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/landscape"):
                 self._json(200, landscape_from_payload(payload))
+                return
+            if self.path.startswith("/api/live"):
+                self._json(200, live_snapshot_payload(payload))
+                return
+            if self.path.startswith("/api/scenario"):
+                self._json(200, scenario_payload(payload))
+                return
+            if self.path.startswith("/api/cache_flush_warning"):
+                self._json(200, cache_flush_warning_payload(payload))
                 return
         except Exception as e:  # pragma: no cover - defensive
             self._json(500, {"error": str(e)})
@@ -1017,6 +1140,7 @@ INDEX_HTML = r"""<!doctype html>
   <button id="tab_plan" class="tab active" onclick="showTab('plan')">Plan a model</button>
   <button id="tab_explore" class="tab" onclick="showTab('explore')">Explore rigs (matrix)</button>
   <button id="tab_landscape" class="tab" onclick="showTab('landscape')">Landscape (benchmark DB)</button>
+  <button id="tab_energy" class="tab" onclick="showTab('energy')">Energy &amp; live</button>
 </div>
 
 <div id="view_landscape" style="display:none">
@@ -1046,6 +1170,65 @@ INDEX_HTML = r"""<!doctype html>
       <button onclick="doLandscape()">Build landscape</button>
     </div>
     <div><div id="ls_out"></div></div>
+  </div>
+</div>
+
+<div id="view_energy" style="display:none">
+  <div class="sub">Live GPU power-state tags (#149), a live throughput/MTP
+    widget that measures against a <b>running</b> server (no boot/teardown),
+    and a configurable measurement <b>scenario</b> builder (#150). Efficiency
+    (J/token) is only comparable at the <b>same</b> power-limit context &mdash;
+    the tags below make that context explicit.</div>
+  <div class="cols">
+    <div>
+      <fieldset>
+        <legend>GPU power state
+          <button class="secondary mini" onclick="refreshGpuState()" title="re-query NVML live">refresh</button></legend>
+        <div id="gpu_state_out" class="muted">click refresh…</div>
+      </fieldset>
+      <fieldset>
+        <legend>live monitor (measure against a running server)</legend>
+        <label>target server (host:port)</label>
+        <input id="live_target" placeholder="127.0.0.1:31000">
+        <label>resolution (ms) &mdash; floor ~30ms</label>
+        <input id="live_res" value="250">
+        <div style="margin-top:.5rem">
+          <button onclick="toggleLive()" id="live_btn">start live</button>
+          <button class="secondary" onclick="remeasureNow()" title="single immediate scrape">re-measure now</button>
+        </div>
+        <div id="live_out" class="muted" style="margin-top:.6rem">idle.</div>
+      </fieldset>
+    </div>
+    <div>
+      <fieldset>
+        <legend>scenario builder (#150)</legend>
+        <div class="cols" style="grid-template-columns:1fr 1fr;gap:.6rem">
+          <div>
+            <label>scale (1.0 = 10k prefill / 1k decode)</label>
+            <input id="sc_scale" value="1.0">
+            <label>phases</label>
+            <select id="sc_phases"><option value="both">both</option>
+              <option value="prefill">prefill-only</option>
+              <option value="decode">decode-only</option></select>
+            <label>concurrency</label>
+            <input id="sc_conc" value="1">
+          </div>
+          <div>
+            <label>behaviors (decode split)</label>
+            <select id="sc_behav"><option value="code,prose">code + prose</option>
+              <option value="code">code only</option>
+              <option value="prose">prose only</option></select>
+            <label><input type="checkbox" id="sc_multi" style="width:auto"> multiturn (growing context)</label>
+            <label>turns (multiturn)</label>
+            <input id="sc_turns" value="3">
+            <label><input type="checkbox" id="sc_cold" checked style="width:auto"> cold prefill (flush + fresh prompt)</label>
+            <label><input type="checkbox" id="sc_running" style="width:auto"> target is a RUNNING (production) server</label>
+          </div>
+        </div>
+        <div style="margin-top:.5rem"><button onclick="previewScenario()">preview scenario</button></div>
+        <div id="sc_out" class="muted" style="margin-top:.6rem"></div>
+      </fieldset>
+    </div>
   </div>
 </div>
 
@@ -1640,11 +1823,12 @@ async function doIssue(kind) {
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
 function showTab(t) {
-  for (const v of ['plan','explore','landscape'])
+  for (const v of ['plan','explore','landscape','energy'])
     $('view_'+v).style.display = t===v ? '' : 'none';
-  for (const v of ['plan','explore','landscape'])
+  for (const v of ['plan','explore','landscape','energy'])
     $('tab_'+v).classList.toggle('active', t===v);
   if ((t==='explore'||t==='landscape') && !window._profLoaded) loadProfiles();
+  if (t==='energy' && !window._energyInit) { window._energyInit=true; refreshGpuState(); }
 }
 
 async function loadProfiles() {
@@ -1740,6 +1924,111 @@ async function doLandscape() {
   }
   h += '</table><div class="legend">'+esc(L.note)+'</div>';
   $('ls_out').innerHTML = h;
+}
+
+// ---- #149 GPU power-state tags ----
+async function refreshGpuState() {
+  $('gpu_state_out').innerHTML = 'querying NVML…';
+  try {
+    const r = await fetch('/api/gpu_state'); const d = await r.json();
+    if (!d.ok) { $('gpu_state_out').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; return; }
+    let h = '<table class="mx"><tr><th>#</th><th>card</th><th>W now</th><th>limit</th>'
+          + '<th>%TDP</th><th>SM/MEM MHz</th><th>°C</th><th>state</th></tr>';
+    for (const c of d.cards) {
+      const tag = c.oc_uv==='stock' ? c.oc_uv
+                : '<b style="color:#e3a008">'+esc(c.oc_uv)+'</b>';
+      h += '<tr><td>'+c.nvml_index+'</td><td style="text-align:left">'+esc(c.name)+'</td>'
+        + '<td>'+c.power_watts.toFixed(0)+'</td>'
+        + '<td>'+c.power_limit_w.toFixed(0)+'/'+c.default_limit_w.toFixed(0)+'</td>'
+        + '<td>'+(c.limit_pct_of_default*100).toFixed(0)+'%</td>'
+        + '<td>'+c.sm_clock_mhz+'/'+c.mem_clock_mhz+'</td>'
+        + '<td>'+c.temperature_c+'</td><td>'+tag+'</td></tr>';
+    }
+    h += '</table><div class="legend">non-"stock" = efficiency not directly '
+       + 'comparable to a stock card without normalizing the power-limit axis.</div>';
+    $('gpu_state_out').innerHTML = h;
+  } catch(e) { $('gpu_state_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
+}
+
+// ---- #149 live widget (client-side delta rates off /metrics) ----
+window._liveTimer = null; window._livePrev = null;
+async function liveScrape() {
+  const target = $('live_target').value.trim();
+  const res = parseFloat($('live_res').value) || 250;
+  const r = await fetch('/api/live', {method:'POST', body: JSON.stringify({target, resolution_ms:res})});
+  const d = await r.json();
+  if (!d.ok) { $('live_out').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; return d; }
+  const s = d.snapshot; let rates = null;
+  if (window._livePrev) {
+    const dt = s.t - window._livePrev.t;
+    const pfx = dt>0 ? Math.max(0, s.prompt_tokens_total - window._livePrev.prompt_tokens_total)/dt : 0;
+    const dec = dt>0 ? Math.max(0, s.generation_tokens_total - window._livePrev.generation_tokens_total)/dt : 0;
+    rates = {dt, pfx, dec};
+  }
+  window._livePrev = s;
+  let h = '<b>resolution:</b> '+d.resolution_ms+'ms (floor 30ms)<br>';
+  if (rates) {
+    h += '<b>prefill:</b> '+rates.pfx.toFixed(1)+' tok/s &nbsp; '
+       + '<b>decode:</b> '+rates.dec.toFixed(1)+' tok/s<br>';
+  } else { h += '<span class="muted">(first sample — rates on next tick)</span><br>'; }
+  h += '<b>MTP accept rate:</b> '+(s.spec_accept_rate*100).toFixed(1)+'% &nbsp; '
+     + '<b>adaptive-k:</b> '+s.spec_num_steps+' &nbsp; '
+     + '<b>ema accept len:</b> '+s.spec_ema_accept_len.toFixed(2);
+  $('live_out').innerHTML = h;
+  return d;
+}
+async function toggleLive() {
+  if (window._liveTimer) {
+    clearInterval(window._liveTimer); window._liveTimer=null; window._livePrev=null;
+    $('live_btn').textContent = 'start live'; return;
+  }
+  const res = Math.max(30, parseFloat($('live_res').value) || 250);
+  window._livePrev = null;
+  $('live_btn').textContent = 'stop live';
+  await liveScrape();
+  window._liveTimer = setInterval(liveScrape, res);
+}
+async function remeasureNow() { window._livePrev = null; await liveScrape(); }
+
+// ---- #150 scenario builder + cache-flush confirm gate ----
+async function previewScenario() {
+  $('sc_out').innerHTML = 'expanding…';
+  const body = {
+    scale: parseFloat($('sc_scale').value)||1.0,
+    phases: $('sc_phases').value,
+    concurrency: parseInt($('sc_conc').value)||1,
+    behaviors: $('sc_behav').value.split(','),
+    multiturn: $('sc_multi').checked,
+    turns: parseInt($('sc_turns').value)||1,
+    cold_prefill: $('sc_cold').checked,
+    target_running_server: $('sc_running').checked,
+  };
+  const r = await fetch('/api/scenario', {method:'POST', body: JSON.stringify(body)});
+  const d = await r.json();
+  if (!d.ok) { $('sc_out').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; return; }
+  const w = d.cache_flush_warning;
+  let h = '';
+  if (w.warn) {
+    const cls = w.mandatory ? 'reasons' : 'muted';
+    h += '<div class="'+cls+'" style="border:1px solid #e3a008;padding:.4rem;border-radius:6px;margin-bottom:.5rem">'
+       + '⚠ '+esc(w.message)
+       + (w.mandatory ? '<br><button class="mini" onclick="confirmFlush(true)">Continue (clear cache)</button> '
+                       + '<button class="mini secondary" onclick="confirmFlush(false)">Cancel</button>' : '')
+       + '</div>';
+  }
+  h += '<b>'+d.summary.n_units+' run units</b> — prefill '+d.summary.prefill_tokens
+     + ' tok / decode '+d.summary.decode_tokens+' tok / conc '+d.summary.concurrency;
+  h += '<table class="mx" style="margin-top:.4rem"><tr><th>#</th><th>phase</th><th>behavior</th>'
+     + '<th>prompt tok</th><th>decode tok</th><th>turn</th><th>cold</th></tr>';
+  d.units.forEach((u,i)=>{ h += '<tr><td>'+(i+1)+'</td><td>'+esc(u.phase)+'</td><td>'+esc(u.behavior)+'</td>'
+     + '<td>'+u.prompt_tokens+'</td><td>'+u.decode_tokens+'</td><td>'+u.turn+'</td>'
+     + '<td>'+(u.cold?'yes':'—')+'</td></tr>'; });
+  h += '</table>';
+  $('sc_out').innerHTML = h;
+}
+function confirmFlush(ok) {
+  alert(ok ? 'Confirmed — a real run would now flush the cache and measure.'
+           : 'Cancelled — cache preserved, no run started.');
 }
 
 loadKnobs();

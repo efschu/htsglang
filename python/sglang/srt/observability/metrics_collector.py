@@ -114,6 +114,9 @@ class SchedulerStats:
     # Adaptive speculative decoding (currently active tier).
     spec_num_steps: int = 0
     spec_num_draft_tokens: int = 0
+    # Adaptive controller's smoothed accept-length EMA (the signal that drives
+    # the active-tier decision). 0.0 for static / non-adaptive spec configs.
+    spec_ema_accept_len: float = 0.0
 
     # Retract
     num_retracted_reqs: int = 0
@@ -439,7 +442,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         self.spec_num_steps = Gauge(
             name="sglang:spec_num_steps",
-            documentation="Currently active speculative_num_steps.",
+            documentation="Currently active speculative_num_steps (a.k.a. current adaptive-k).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.spec_ema_accept_len = Gauge(
+            name="sglang:spec_ema_accept_len",
+            documentation="Adaptive controller's smoothed accept-length EMA driving the active tier (0 for static spec).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1304,6 +1313,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(self.spec_cap_length, stats.spec_cap_length)
         self._log_gauge(self.spec_block_accept_length, stats.spec_block_accept_length)
         self._log_gauge(self.spec_num_steps, stats.spec_num_steps)
+        self._log_gauge(self.spec_ema_accept_len, stats.spec_ema_accept_len)
         self._log_gauge(self.spec_num_draft_tokens, stats.spec_num_draft_tokens)
 
         # Retract

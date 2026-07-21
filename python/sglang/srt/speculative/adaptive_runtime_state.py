@@ -237,6 +237,11 @@ class AdaptiveController:
     def candidate_steps(self) -> list[int]:
         return self.params.candidate_steps
 
+    @property
+    def ema_accept_len(self) -> float:
+        """Smoothed accept length of the active BS slot (observability only)."""
+        return self.params.current_ema_accept_len()
+
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
         """Register a pre-built runtime state.
 
