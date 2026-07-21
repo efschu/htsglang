@@ -120,6 +120,33 @@ class TestPlanAPI(WebUIFixture):
         # honest advantage: stock cannot shard 4 KV heads across 3.
         self.assertFalse(d["advantage"]["stock"]["runs"])
 
+    def test_concurrency_table_matches_headline_context(self):
+        # Regression: the KV-vs-concurrency table must report the AGGREGATE
+        # context (== the headline max_context_tokens and == the per-rank sum),
+        # not the min per-rank capacity (which understated it ~4x and read as a
+        # contradiction, e.g. 97k in the table vs 408k in the header).
+        d = webui.plan_from_payload(self._payload())
+        self.assertTrue(d["fits"], d.get("infeasible_reasons"))
+        headline = d["capacity"]["max_context_tokens"]
+        per_rank_sum = sum(rc["kv_tokens"] for rc in d["capacity"]["per_rank"])
+        self.assertAlmostEqual(headline, per_rank_sum, delta=max(2, headline * 0.001))
+        row1 = next(r for r in d["kv_by_concurrency"] if r["concurrency"] == 1)
+        self.assertAlmostEqual(
+            row1["kv_tokens"], headline, delta=max(2, headline * 0.001)
+        )
+
+    def test_fp8_kv_roughly_doubles_context(self):
+        # KV-cache quantization must flow into sizing: fp8 (1 B/cell) yields
+        # ~2x the max context of auto (~2 B/cell) for the same VRAM.
+        auto = webui.plan_from_payload(self._payload(kv_cache_dtype="auto"))
+        fp8 = webui.plan_from_payload(self._payload(kv_cache_dtype="fp8_e4m3"))
+        if not (auto["fits"] and fp8["fits"]):
+            self.skipTest("model does not fit on the test rig")
+        self.assertGreater(
+            fp8["capacity"]["max_context_tokens"],
+            1.7 * auto["capacity"]["max_context_tokens"],
+        )
+
     def test_manual_edit_reject_carries_reason(self):
         d = webui.plan_from_payload(
             self._payload(
