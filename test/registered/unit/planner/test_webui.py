@@ -1381,6 +1381,116 @@ class TestV3IndexMarkers(CustomTestCase):
             webui.INDEX_HTML.count("renderPlacement(d.placement)"), 2)
 
 
+class TestRunnerLmStudioLayout(CustomTestCase):
+    """LM-Studio-style runner restructure: fixed collapsible sections in a
+    learnable order, one advanced toggle, labeled rows with slider/toggle/
+    dropdown controls, preset dropdown bar, sticky action bar, per-card
+    hardware bars. The flag catalog stays the single source of truth; the
+    sections are client-side VIEWS onto it (each flag rendered exactly once).
+    """
+
+    def test_section_structure_fixed_order(self):
+        html = webui.INDEX_HTML
+        order = ["sec_context", "sec_gpu", "sec_speculative", "sec_cache",
+                 "sec_serving", "sec_advanced"]
+        idx = [html.index('id="%s"' % s) for s in order]
+        self.assertEqual(idx, sorted(idx), "sections out of order")
+        # each section exists exactly once, and the per-section flag
+        # containers the renderer fills are present.
+        for s in order:
+            self.assertEqual(html.count('id="%s"' % s), 1, s)
+        for c in ("secflags_context", "secflags_gpu", "secflags_speculative",
+                  "secflags_cache", "secflags_serving"):
+            self.assertEqual(html.count('id="%s"' % c), 1, c)
+        # context rows live IN the Context section; serving identity rows in
+        # the Serving section (ids unchanged: sv_ctx / max_running_requests /
+        # sv_served / sv_host / sv_port).
+        self.assertLess(html.index('id="sv_ctx"'), html.index('id="sec_gpu"'))
+        self.assertGreater(
+            html.index('id="sv_served"'), html.index('id="sec_serving"'))
+
+    def test_advanced_behind_one_toggle(self):
+        html = webui.INDEX_HTML
+        self.assertEqual(html.count('id="advanced_toggle"'), 1)
+        self.assertIn("Show advanced settings", html)
+        self.assertIn("toggleAdvanced", html)
+        # advanced starts hidden; the search filter can reveal it.
+        self.assertIn('id="sec_advanced" style="display:none', html)
+
+    def test_no_duplicate_flag_rendering(self):
+        html = webui.INDEX_HTML
+        # ONE row builder, ONE render site, and a first-match-wins section
+        # classifier -> a catalog flag can only ever render once.
+        self.assertEqual(html.count("function flagRowHtml"), 1)
+        self.assertEqual(html.count("flagRowHtml).join"), 2)  # sections + adv
+        self.assertEqual(html.count("function flagSection"), 1)
+        self.assertEqual(html.count("function renderFlagSurface"), 1)
+
+    def test_lmstudio_controls_present(self):
+        html = webui.INDEX_HTML
+        # slider+numeric pairs (context clamps to the plan capacity max).
+        for token in ('id="sv_ctx_slider"', 'id="mrr_slider"',
+                      "setCtxCap", "cap.max_context_tokens"):
+            self.assertIn(token, html, token)
+        # toggle switches (pure CSS) + "?" hover + changed-from-preset dot.
+        for token in ('class="switch"', 'class="track"', 'class="qmark"',
+                      "changed from preset", "markPresetDrift",
+                      "presetSnapshot"):
+            self.assertIn(token, html, token)
+
+    def test_preset_bar_action_bar_hardware_model_search(self):
+        html = webui.INDEX_HTML
+        # preset dropdown + save above the settings panel.
+        self.assertIn("profile_select", html)
+        self.assertIn("applyProfileSel", html)
+        self.assertLess(html.index('id="profile_pick"'),
+                        html.index('id="flag_search"'))
+        # sticky action bar: Load / Eject / Restart + status chip + boot log.
+        for token in ('id="action_bar"', 'id="status_chip"', ">Eject<",
+                      ">Load model<", 'id="boot_log"', "updateStatusChip",
+                      "pollStatusUntilSettled"):
+            self.assertIn(token, html, token)
+        # hardware rows carry a VRAM bar; model picker searches as you type.
+        for token in ("cardbar", 'id="model_search"', "renderModelOptions"):
+            self.assertIn(token, html, token)
+
+    def test_single_gpu_selector_writes_base_gpu_id(self):
+        # tp=1: a compact GPU dropdown (index + name + VRAM) defaulting to the
+        # preset's rule pick, writing the stock --base-gpu-id flag field.
+        html = webui.INDEX_HTML
+        self.assertEqual(html.count('id="gpu_pick_select"'), 1)
+        self.assertEqual(html.count('id="row_gpu_pick"'), 1)
+        self.assertGreater(html.index('id="row_gpu_pick"'),
+                           html.index('id="sec_gpu"'))
+        self.assertLess(html.index('id="row_gpu_pick"'),
+                        html.index('id="sec_speculative"'))
+        for token in ("updateGpuPick", "gpuPickChanged", "fl_base_gpu_id",
+                      "_effectiveTp"):
+            self.assertIn(token, html, token)
+
+    def test_section_map_covers_catalog(self):
+        """The JS classifier's section ids reference REAL catalog flags: the
+        curated section id lists must stay in sync with the catalog (a
+        renamed/removed flag would silently fall through to advanced)."""
+        import re
+
+        from sglang.srt.planner import flags as flagsmod
+
+        cat = flagsmod.catalog()
+        html = webui.INDEX_HTML
+        for const in ("SEC_CACHE_IDS", "SEC_SERVING_IDS", "SEC_GPU_IDS"):
+            m = re.search(const + r"=\{([^}]*)\}", html)
+            self.assertIsNotNone(m, const)
+            ids = re.findall(r"(\w+):1", m.group(1))
+            self.assertTrue(ids, const)
+            for fid in ids:
+                self.assertIn(fid, cat, "%s names unknown flag %s"
+                              % (const, fid))
+        # the pinned single-flag routes exist too.
+        self.assertIn("kv_cache_dtype", cat)
+        self.assertIn("base_gpu_id", cat)
+
+
 if __name__ == "__main__":
     unittest.main()
 

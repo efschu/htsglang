@@ -2692,6 +2692,68 @@ INDEX_HTML = r"""<!doctype html>
   .cfgrow { margin: .15rem 0; }
   .cfgrow .cfgk { display: inline-block; width: 7.5rem; color: #8b96a5;
                   font-size: .72rem; vertical-align: top; }
+  /* -- LM-Studio-style settings rows: label left, control right, ? at end -- */
+  .setrow { display: flex; align-items: center; gap: .45rem; margin: .28rem 0;
+            font-size: .74rem; }
+  .setrow .lbl { flex: 1; min-width: 0; color: #b6c2d0; display: flex;
+                 align-items: center; gap: .25rem; overflow: hidden;
+                 white-space: nowrap; text-overflow: ellipsis; }
+  .setrow input[type=text], .setrow input[type=number], .setrow select {
+    width: auto; max-width: 42%; padding: .22rem .4rem; font-size: .74rem; }
+  .setrow input[type=number].num { width: 6.2rem; }
+  .setrow input[type=range] { flex: 1.2; width: auto; max-width: none;
+    padding: 0; accent-color: #1f6feb; background: transparent; border: 0; }
+  .qmark { flex: none; width: 15px; height: 15px; border-radius: 50%;
+           border: 1px solid #465362; color: #8b96a5;
+           font-size: .62rem; line-height: 1; display: inline-flex;
+           align-items: center; justify-content: center; cursor: help;
+           user-select: none; }
+  .chg { display: none; width: 6px; height: 6px; border-radius: 50%;
+         background: #e3a008; flex: none; }
+  .setrow.changed .chg { display: inline-block; }
+  /* toggle switch (pure CSS; the real input stays a hidden checkbox) */
+  .switch { position: relative; display: inline-block; width: 34px;
+            height: 18px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; position: absolute;
+                  margin: 0; padding: 0; border: 0; }
+  .switch .track { position: absolute; inset: 0; background: #30363d;
+    border-radius: 10px; transition: .15s; cursor: pointer;
+    border: 1px solid #3a4552; }
+  .switch .track:before { content: ""; position: absolute; width: 12px;
+    height: 12px; left: 2px; top: 2px; background: #8b96a5;
+    border-radius: 50%; transition: .15s; }
+  .switch input:checked + .track { background: #1f6feb; border-color: #1f6feb; }
+  .switch input:checked + .track:before { transform: translateX(16px);
+    background: #fff; }
+  .switch input:disabled + .track { opacity: .45; cursor: default; }
+  /* collapsible config sections in a fixed order */
+  .cfg-section { border: 1px solid #263041; border-radius: 7px;
+                 margin: .35rem 0; background: #10151c; }
+  .cfg-section > summary { cursor: pointer; padding: .4rem .55rem;
+    font-size: .76rem; color: #c8d3df; list-style-position: inside; }
+  .cfg-section > summary b { color: #dbe4ee; }
+  .cfg-section .sec-sum { color: #7f8b99; font-size: .66rem;
+                          margin-left: .35rem; }
+  .cfg-section .sec-body { padding: .15rem .6rem .5rem; }
+  .advrow { border: 1px dashed #3a4552; border-radius: 7px; margin: .45rem 0;
+            padding: .35rem .55rem; }
+  /* sticky action bar (load / eject / restart + status chip) */
+  .actionbar { position: sticky; bottom: 0; z-index: 5; background: #0e1116;
+    border: 1px solid #2a323d; border-radius: 8px; padding: .55rem .7rem;
+    margin: .6rem 0 .9rem; box-shadow: 0 -8px 16px rgba(0,0,0,.4); }
+  .chip { display: inline-flex; align-items: center; gap: .3rem;
+    border-radius: 10px; padding: .12rem .55rem; font-size: .7rem;
+    border: 1px solid #30363d; background: #161b22; color: #8b96a5; }
+  .chip:before { content: ""; width: 7px; height: 7px; border-radius: 50%;
+                 background: #6e7681; }
+  .chip.ready { color: #56d364; border-color: #1c6b34; }
+  .chip.ready:before { background: #56d364; }
+  .chip.loading { color: #e3b341; border-color: #7a5c14; }
+  .chip.loading:before { background: #e3b341; }
+  .chip.error { color: #ff7b72; border-color: #7d2a2a; }
+  .chip.error:before { background: #ff7b72; }
+  /* hardware: per-card VRAM bar spanning the row */
+  .cardrow .cardbar { grid-column: 1 / -1; }
 </style>
 </head>
 <body>
@@ -2991,6 +3053,8 @@ INDEX_HTML = r"""<!doctype html>
   <div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-start">
     <div style="flex:2;min-width:280px">
       <label>discovered local models</label>
+      <input id="model_search" placeholder="search models (name / format / quant)&hellip;"
+        oninput="renderModelOptions()" style="margin-bottom:.3rem">
       <div id="models_out" class="muted">scanning&hellip;</div>
     </div>
     <div style="flex:2;min-width:280px">
@@ -3011,76 +3075,138 @@ INDEX_HTML = r"""<!doctype html>
 
 <div class="cols runner">
   <div>
+    <!-- preset bar: dropdown + save, directly above the settings panel -->
     <fieldset>
-      <legend>config profile (preset) &mdash; fills the flag surface below;
-        adaptive MTP is always on when the checkpoint has draft layers</legend>
-      <div id="profile_pick" class="muted">select a model to list profiles&hellip;</div>
-      <div style="margin-top:.4rem">
-        <input id="profile_save_name" placeholder="name to save current settings as" style="max-width:60%">
-        <button class="secondary mini" onclick="saveProfile()">save current as profile</button>
+      <legend>preset &mdash; fills the settings rows below; adaptive MTP is
+        always on when the checkpoint has draft layers</legend>
+      <div id="profile_pick" class="muted">select a model to list presets&hellip;</div>
+      <div style="display:flex;gap:.4rem;margin-top:.4rem;align-items:center">
+        <input id="profile_save_name" placeholder="save current settings as&hellip;" style="max-width:60%">
+        <button class="secondary mini" onclick="saveProfile()">save preset</button>
       </div>
       <div id="profile_msg" class="muted" style="margin-top:.3rem"></div>
       <div id="profile_env_box" style="margin-top:.3rem"></div>
     </fieldset>
 
+    <!-- load settings: labeled rows in fixed, collapsible sections -->
     <fieldset>
-      <legend>serving &mdash; AUTHORITATIVE identity (always wins over a
-        profile's argv on launch)</legend>
-      <div style="display:flex;gap:.6rem;flex-wrap:wrap">
-        <div style="flex:2;min-width:130px">
-          <label>served-model-name</label>
-          <input id="sv_served" placeholder="(default: model)">
-        </div>
-        <div style="flex:1;min-width:90px">
-          <label>host</label>
-          <input id="sv_host" placeholder="127.0.0.1">
-        </div>
-        <div style="flex:1;min-width:70px">
-          <label>port</label>
-          <input id="sv_port" value="30000">
-        </div>
-        <div style="flex:1;min-width:90px">
-          <label>context-length</label>
-          <input id="sv_ctx" value="8192" onchange="refreshRunnerPlacement()">
-        </div>
-        <div style="flex:1;min-width:120px">
-          <label>max-running-requests</label>
-          <input id="max_running_requests" placeholder="(blank: plan 1, launch 16)"
-            onchange="doPlan(); refreshRunnerPlacement()">
-        </div>
-      </div>
-      <div class="muted" style="margin-top:.3rem">These five fields own the
-        serving identity &mdash; an applied profile keeps its tuning flags but
-        never overrides them. 1 concurrent request = single-user = largest KV;
-        raising it grows the GDN/mamba pool and shrinks max context (see the
-        KV-vs-concurrency table in the result).</div>
-    </fieldset>
-
-    <fieldset>
-      <legend>flags &mdash; the ONE flag surface
+      <legend>load settings
         (<span id="flag_counts" class="muted"></span>)</legend>
-      <input id="flag_search" placeholder="search flags (name / help)&hellip;" oninput="filterFlags()">
+      <input id="flag_search" placeholder="search all settings (name / help)&hellip;" oninput="filterFlags()">
       <div class="muted" style="margin:.3rem 0 .4rem">Every sglang + fork flag,
-        grouped and collapsed. Each field re-resolves on change: greyed +
-        hover-? when excluded / incompatible / auto-set; dropdowns self-update;
-        incompatible values blocked. Model + serving identity are set above,
-        not here.</div>
+        in fixed sections; a dot marks a row changed from the applied preset.
+        Each field re-resolves on change: greyed + hover-? when excluded /
+        incompatible / auto-set. Model identity is set above, not here.</div>
       <div id="flag_warnings"></div>
-      <div id="flag_surface" class="muted">select a model to populate&hellip;</div>
+      <div id="flag_surface">
+
+      <details class="cfg-section" id="sec_context">
+        <summary><b>Context</b><span class="sec-sum" id="sum_context"></span></summary>
+        <div class="sec-body">
+          <div class="setrow" id="row_sv_ctx" data-hay="context-length context length tokens kv max">
+            <span class="lbl">context-length
+              <span class="chg" title="changed from preset"></span></span>
+            <input type="range" id="sv_ctx_slider" min="512" max="262144" step="512"
+              value="8192" oninput="ctxFromSlider()">
+            <input type="number" id="sv_ctx" class="num" value="8192" onchange="ctxFromNum()">
+            <span class="muted" id="sv_ctx_max" style="flex:none;font-size:.64rem"></span>
+            <span class="qmark" title="Max tokens per request (prompt + output). The slider is capped at the plan's computed KV capacity for the current config; the numeric field is free.">?</span>
+          </div>
+          <div class="setrow" id="row_mrr" data-hay="max-running-requests max running requests concurrency seqs">
+            <span class="lbl">max-running-requests
+              <span class="chg" title="changed from preset"></span></span>
+            <input type="range" id="mrr_slider" min="1" max="64" step="1" value="1"
+              oninput="mrrFromSlider()">
+            <input type="number" id="max_running_requests" class="num"
+              placeholder="auto" onchange="mrrFromNum()">
+            <span class="qmark" title="Concurrent request slots. 1 = single-user = largest KV; raising it grows the GDN/mamba pool and shrinks max context (see the KV-vs-concurrency table in the plan result). Blank: plan 1, launch 16.">?</span>
+          </div>
+          <div id="secflags_context"></div>
+        </div>
+      </details>
+
+      <details class="cfg-section" id="sec_gpu">
+        <summary><b>GPU offload / split</b><span class="sec-sum" id="sum_gpu"></span></summary>
+        <div class="sec-body">
+          <div id="gpu_placement" class="muted" style="margin:.25rem 0 .4rem">
+            plan a model to see the prospective placement&hellip;</div>
+          <div class="setrow" id="row_gpu_pick" style="display:none"
+            data-hay="gpu card select base-gpu-id single-gpu pick">
+            <span class="lbl">GPU (single-card run)
+              <span class="chg" title="changed from preset"></span></span>
+            <select id="gpu_pick_select" onchange="gpuPickChanged()"></select>
+            <span class="qmark" title="Which physical card a single-GPU (tp=1) run uses. Default = the preset's rule pick (largest VRAM, then higher FLOPs, then first index); writes the stock --base-gpu-id flag. Hidden for tp > 1, where rank-gpu-id owns the placement.">?</span>
+          </div>
+          <div id="secflags_gpu"></div>
+        </div>
+      </details>
+
+      <details class="cfg-section" id="sec_speculative">
+        <summary><b>Speculative decoding</b><span class="sec-sum" id="sum_speculative"></span></summary>
+        <div class="sec-body"><div id="secflags_speculative"></div></div>
+      </details>
+
+      <details class="cfg-section" id="sec_cache">
+        <summary><b>Cache</b><span class="sec-sum" id="sum_cache"></span></summary>
+        <div class="sec-body"><div id="secflags_cache"></div></div>
+      </details>
+
+      <details class="cfg-section" id="sec_serving">
+        <summary><b>Serving</b><span class="sec-sum" id="sum_serving"></span></summary>
+        <div class="sec-body">
+          <div class="muted" style="margin:.2rem 0 .3rem">AUTHORITATIVE
+            serving identity &mdash; always wins over a preset's argv on
+            launch.</div>
+          <div class="setrow" id="row_sv_served" data-hay="served-model-name served model name">
+            <span class="lbl">served-model-name
+              <span class="chg" title="changed from preset"></span></span>
+            <input id="sv_served" placeholder="(default: model)" onchange="onServingEdit()">
+            <span class="qmark" title="The name the OpenAI API serves this model under.">?</span>
+          </div>
+          <div class="setrow" id="row_sv_host" data-hay="host bind address">
+            <span class="lbl">host
+              <span class="chg" title="changed from preset"></span></span>
+            <input id="sv_host" placeholder="127.0.0.1" onchange="onServingEdit()">
+            <span class="qmark" title="Bind address of the HTTP server.">?</span>
+          </div>
+          <div class="setrow" id="row_sv_port" data-hay="port">
+            <span class="lbl">port
+              <span class="chg" title="changed from preset"></span></span>
+            <input id="sv_port" value="30000" onchange="onServingEdit()">
+            <span class="qmark" title="TCP port of the HTTP server.">?</span>
+          </div>
+          <div id="secflags_serving"></div>
+        </div>
+      </details>
+
+      <div class="advrow">
+        <div class="setrow" style="margin:0" id="row_advanced">
+          <span class="lbl">Show advanced settings
+            <span class="muted" id="adv_count"></span></span>
+          <label class="switch"><input type="checkbox" id="advanced_toggle"
+            onchange="toggleAdvanced()"><span class="track"></span></label>
+        </div>
+        <div id="sec_advanced" style="display:none;margin-top:.3rem"></div>
+      </div>
+
+      </div>
     </fieldset>
 
-    <fieldset>
-      <legend>actions &mdash; plan / launch / status (Launch and Restart
-        REPLACE the single managed server)</legend>
-      <div class="actions">
-        <button onclick="doPlan()">Plan / re-validate</button>
-        <button onclick="serverStart()">Launch</button>
+    <!-- sticky action bar: load / eject / restart + status chip + boot log -->
+    <div class="actionbar" id="action_bar">
+      <div class="actions" style="margin-top:0;align-items:center">
+        <button onclick="serverStart()">Load model</button>
+        <button class="secondary" onclick="serverStop()">Eject</button>
         <button class="secondary" onclick="serverRestart()">Restart (replace)</button>
-        <button class="secondary" onclick="serverStop()">Stop</button>
+        <span class="chip" id="status_chip">stopped</span>
+        <button class="secondary mini" onclick="doPlan()">Plan / re-validate</button>
         <button class="secondary mini" onclick="refreshServerStatus()">status</button>
       </div>
-      <div id="sv_out" class="muted" style="margin-top:.6rem"></div>
-      <details style="margin-top:.5rem">
+      <details id="boot_log" style="margin-top:.4rem">
+        <summary class="muted" style="cursor:pointer">boot log / status detail</summary>
+        <div id="sv_out" class="muted" style="margin-top:.3rem"></div>
+      </details>
+      <details style="margin-top:.3rem">
         <summary class="muted" style="cursor:pointer">GitHub issue &mdash; submit results / report bug</summary>
         <label>quant descriptor (for the issue text)</label>
         <input id="quant" placeholder="compressed-tensors / Q4_K_M / fp8">
@@ -3089,7 +3215,7 @@ INDEX_HTML = r"""<!doctype html>
           <button class="secondary" onclick="doIssue('bug')">Report bug</button>
         </div>
       </details>
-    </fieldset>
+    </div>
 
     <details style="margin-top:.6rem">
       <summary style="cursor:pointer"><b>hardware</b> <span class="muted">&mdash;
@@ -3190,7 +3316,8 @@ async function detectGPUs() {
     CARDS = CARDS.filter(c => c.virtual);
     for (const g of d.gpus) CARDS.unshift({
       name: g.name, total_mib: g.total_mib, include: true,
-      reserve_gb: 0, virtual: false, free_mib: g.free_mib });
+      reserve_gb: 0, virtual: false, free_mib: g.free_mib,
+      nvml_index: g.index });
     $('detect_note').textContent = 'detected '+d.gpus.length+' GPU(s) via '+(d.source||'nvml');
   } else {
     $('detect_note').textContent = 'no GPU detected'+(d.error?' ('+d.error+')':'')
@@ -3238,12 +3365,30 @@ function renderCards() {
     resWrap.appendChild(document.createTextNode('keep '));
     const res = document.createElement('input');
     res.type = 'text'; res.className = 'resv'; res.value = c.reserve_gb;
-    res.onchange = () => { c.reserve_gb = parseFloat(res.value) || 0; };
+    res.onchange = () => { c.reserve_gb = parseFloat(res.value) || 0; renderCards(); };
     resWrap.appendChild(res); resWrap.appendChild(document.createTextNode(' G'));
     row.appendChild(cb); row.appendChild(nameWrap);
     row.appendChild(vramWrap); row.appendChild(resWrap);
+    // per-card VRAM bar (LM-Studio hardware rows): used (detected) /
+    // reserve (kept free on purpose) / free, proportional to the total.
+    const total = Math.max(1, c.total_mib||1);
+    const usedMib = (c.free_mib!=null && !c.virtual)
+      ? Math.max(0, c.total_mib - c.free_mib) : 0;
+    const resvMib = Math.min(total, (c.reserve_gb||0)*1024);
+    const barWrap = document.createElement('div');
+    barWrap.className = 'cardbar';
+    barWrap.innerHTML = '<div class="segbar" style="height:8px" title="'
+      +(usedMib? 'in use '+fmtMib(usedMib)+' / ':'')
+      +(resvMib? 'kept free '+fmtMib(resvMib)+' / ':'')
+      +'free '+fmtMib(Math.max(0, total-usedMib-resvMib))
+      +' of '+fmtMib(total)+'">'
+      +(usedMib? '<span style="width:'+(usedMib/total*100).toFixed(1)+'%;background:#2f81f7"></span>':'')
+      +(resvMib? '<span style="width:'+(resvMib/total*100).toFixed(1)+'%;background:#e3a008"></span>':'')
+      +'</div>';
+    row.appendChild(barWrap);
     box.appendChild(row);
   });
+  updateGpuPick();
 }
 
 // The ONE model selector's state: the free-text field is the reference; the
@@ -3358,10 +3503,13 @@ function render(d) {
       d.reasons.map(x=>'<li>'+esc(x)+'</li>').join('') + '</ul>';
     $('cards').innerHTML = $('advantage').innerHTML = $('flags').innerHTML = '';
     $('roofline').innerHTML = '';
+    setCtxCap(null);
     return;
   }
   const cap = d.capacity;
   const off = d.offload;
+  // context-length slider: clamp to the plan's capacity max when known.
+  setCtxCap(cap ? cap.max_context_tokens : null);
   // Three honest states: fits-in-VRAM (fast) / fits-with-RAM-offload (slower,
   // PCIe-bound) / genuinely cannot fit (design §PART 4).
   if (d.fits) {
@@ -3816,7 +3964,7 @@ async function doIssue(kind) {
   $('issue').innerHTML = h;
 }
 
-function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
 function showTab(t) {
   const TABS = ['landing','runner','bench','explore','landscape','energy','quality'];
@@ -4139,6 +4287,7 @@ async function renderLandingPlacement(s){
 // live prospective placement (shared renderer).
 // ===========================================================================
 window._flagCat=null; window._flagSettings={}; window._profiles=[];
+window._flagSection={};   // catalog id -> section key (built at render time)
 async function loadFlagCatalog(){
   try{
     const r=await fetch('/api/flag_catalog'); const d=await r.json();
@@ -4153,56 +4302,158 @@ function _surfaceSpecs(g){
   // the surface -- hiding them here keeps every fact in exactly one place.
   return window._flagCat.groups[g].filter(f=>!SERVING_OWNED[f.id]);
 }
+// ---- LM-Studio-style section map: the catalog stays the single source of
+// truth; these are VIEWS onto it. Every flag lands in EXACTLY ONE section
+// (first matching rule wins); everything unmatched goes behind the ONE
+// "Show advanced settings" toggle.
+const SECTION_KEYS=['context','gpu','speculative','cache','serving','advanced'];
+const SEC_CACHE_IDS={disable_radix_cache:1, radix_cache_backend:1,
+  radix_eviction_policy:1, enable_session_radix_cache:1,
+  enable_hierarchical_cache:1, enable_lmcache:1, lmcache_config_file:1,
+  enable_flexkv:1, flexkv_config_file:1, page_size:1,
+  enable_page_major_kv_layout:1, disable_chunked_prefix_cache:1,
+  hibernate_dir:1};
+const SEC_SERVING_IDS={chat_template:1, hf_chat_template_name:1,
+  completion_template:1, tool_call_parser:1, reasoning_parser:1};
+const SEC_GPU_IDS={mem_fraction_static:1, cpu_offload_gb:1};
+const SEC_GPU_GROUPS={'uneven-tp':1, parallelism:1, device:1, offload:1};
+function flagSection(f){
+  if(f.id==='kv_cache_dtype') return 'context';
+  if(SEC_GPU_GROUPS[f.group] || SEC_GPU_IDS[f.id]) return 'gpu';
+  if(f.group==='speculative' || f.id.indexOf('speculative_')===0) return 'speculative';
+  if(SEC_CACHE_IDS[f.id] || f.id.indexOf('hicache_')===0) return 'cache';
+  if(SEC_SERVING_IDS[f.id]) return 'serving';
+  return 'advanced';
+}
+// One labeled row per flag: label left, LM-Studio-like control right (toggle
+// switch for bool / compact dropdown for enum / numeric or text input), a
+// pure-CSS "?" hover at the row end. Ids flrow_/fl_/flq_/flh_ are unchanged
+// so resolve()-driven greying, auto-set notes and profiles keep working.
+function flagRowHtml(f){
+  const src=f.source!=='upstream'? ' <span class="pill">'+esc(f.source)+'</span>':'';
+  let h='<div class="setrow" id="flrow_'+f.id+'">'
+    +'<span class="lbl" title="'+esc(f.hover||f.help||'')+'">'+esc(f.name)+src
+    +' <span class="flag-q" id="flq_'+f.id+'" style="color:#e3a008"></span>'
+    +'<span class="chg" title="changed from preset"></span></span>';
+  if(f.type==='bool')
+    h+='<label class="switch"><input type="checkbox" id="fl_'+f.id
+      +'" onchange="onFlagChange(\''+f.id+'\')"><span class="track"></span></label>';
+  else if(f.allowed)
+    h+='<select id="fl_'+f.id+'" onchange="onFlagChange(\''+f.id+'\')"><option value="">(default)</option>'
+      +f.allowed.map(a=>'<option value="'+esc(String(a))+'">'+esc(String(a))+'</option>').join('')+'</select>';
+  else if(f.type==='int'||f.type==='float')
+    h+='<input type="number" class="num" id="fl_'+f.id+'" placeholder="'
+      +(f.default!=null?esc(String(f.default)):'auto')+'" '
+      +(f.type==='float'?'step="any" ':'')+'onchange="onFlagChange(\''+f.id+'\')">';
+  else
+    h+='<input type="text" id="fl_'+f.id+'" placeholder="'
+      +(f.default!=null?esc(String(f.default)):'default')+'" onchange="onFlagChange(\''+f.id+'\')">';
+  h+='<span class="qmark" title="'+esc(f.help||f.hover||'')+'">?</span></div>'
+    +'<div class="knob-help" id="flh_'+f.id+'"></div>';
+  return h;
+}
 function renderFlagSurface(){
   const d=window._flagCat; if(!d) return;
-  let h=''; let gi=0;
-  for(const g of Object.keys(d.groups)){
-    const specs=_surfaceSpecs(g);
-    if(!specs.length) continue;
-    h+='<details id="flgrp_'+(gi++)+'" style="margin:.2rem 0"><summary style="cursor:pointer"><b>'+esc(g)
-      +'</b> <span class="muted">('+specs.length+')</span></summary>';
-    for(const f of specs){
-      const src=f.source!=='upstream'? ' <span class="pill">'+esc(f.source)+'</span>':'';
-      h+='<div class="flagrow" id="flrow_'+f.id+'" style="margin:.15rem 0">'
-        +'<label style="display:flex;align-items:center;gap:.3rem" title="'+esc(f.hover||f.help||'')+'">'
-        +'<span style="flex:1;min-width:0">'+esc(f.name)+src
-        +' <span class="flag-q" id="flq_'+f.id+'" style="color:#e3a008"></span></span>';
-      if(f.type==='bool')
-        h+='<input type="checkbox" id="fl_'+f.id+'" style="width:auto" onchange="onFlagChange(\''+f.id+'\')">';
-      else if(f.allowed)
-        h+='<select id="fl_'+f.id+'" style="max-width:45%" onchange="onFlagChange(\''+f.id+'\')"><option value="">(default)</option>'
-          +f.allowed.map(a=>'<option value="'+esc(String(a))+'">'+esc(String(a))+'</option>').join('')+'</select>';
-      else
-        h+='<input id="fl_'+f.id+'" style="max-width:45%" placeholder="'
-          +(f.default!=null?esc(String(f.default)):'default')+'" onchange="onFlagChange(\''+f.id+'\')">';
-      h+='</label><div class="knob-help" id="flh_'+f.id+'"></div></div>';
+  window._flagSection={};
+  const bySec={context:[],gpu:[],speculative:[],cache:[],serving:[],advanced:[]};
+  for(const g of Object.keys(d.groups))
+    for(const f of _surfaceSpecs(g)){
+      const sec=flagSection(f);
+      window._flagSection[f.id]=sec;
+      bySec[sec].push(f);
     }
-    h+='</details>';
+  // in-section order: fork/env flags after upstream, then by id (stable).
+  for(const sec of SECTION_KEYS)
+    bySec[sec].sort((a,b)=>(a.source!=='upstream')-(b.source!=='upstream')
+      || (a.id<b.id?-1:1));
+  for(const sec of ['context','gpu','speculative','cache','serving'])
+    $('secflags_'+sec).innerHTML=bySec[sec].map(flagRowHtml).join('');
+  // advanced: everything else, still grouped by catalog group for
+  // navigability, all behind the ONE toggle.
+  const byGrp={};
+  for(const f of bySec.advanced) (byGrp[f.group]=byGrp[f.group]||[]).push(f);
+  let ah=''; let gi=0;
+  for(const g of Object.keys(byGrp).sort()){
+    ah+='<details id="flgrp_'+(gi++)+'" style="margin:.2rem 0"><summary style="cursor:pointer"><b>'
+      +esc(g)+'</b> <span class="muted">('+byGrp[g].length+')</span></summary>'
+      +byGrp[g].map(flagRowHtml).join('')+'</details>';
   }
-  $('flag_surface').innerHTML=h;
+  $('sec_advanced').innerHTML=ah;
+  $('adv_count').textContent='('+bySec.advanced.length+' more flags)';
   filterFlags();
+  updateSectionSummaries();
+  markPresetDrift();
 }
-// Search/filter over the ONE flag surface: matching rows stay, matching
-// groups auto-open while a query is active; an empty query re-collapses.
+function toggleAdvanced(){
+  const q=($('flag_search').value||'').trim();
+  if(!q) $('sec_advanced').style.display=$('advanced_toggle').checked?'':'none';
+}
+// Search/filter across ALL sections (static rows included): matching rows
+// stay, sections with hits auto-open, the advanced block is revealed while a
+// query has hits there; an empty query restores the collapsed default.
 function filterFlags(){
   const d=window._flagCat; if(!d) return;
-  const box=$('flag_search');
-  const q=(box?box.value:'').trim().toLowerCase();
-  let gi=0;
+  const q=($('flag_search').value||'').trim().toLowerCase();
+  const secHits={context:0,gpu:0,speculative:0,cache:0,serving:0,advanced:0};
+  // static (serving-owned) rows carry their haystack in data-hay.
+  for(const rid of ['row_sv_ctx','row_mrr','row_sv_served','row_sv_host','row_sv_port']){
+    const row=$(rid); if(!row) continue;
+    const hit=!q || (row.getAttribute('data-hay')||'').indexOf(q)>=0;
+    row.style.display=hit?'':'none';
+    if(hit) secHits[rid==='row_sv_ctx'||rid==='row_mrr'?'context':'serving']++;
+  }
   for(const g of Object.keys(d.groups)){
-    const specs=_surfaceSpecs(g);
-    if(!specs.length) continue;
-    const det=$('flgrp_'+(gi++)); if(!det) continue;
-    let vis=0;
-    for(const f of specs){
+    for(const f of _surfaceSpecs(g)){
       const row=$('flrow_'+f.id); if(!row) continue;
       const hay=(f.name+' '+f.id+' '+(f.help||'')+' '+(f.hover||'')).toLowerCase();
       const hit=!q || hay.indexOf(q)>=0;
       row.style.display=hit?'':'none';
-      if(hit) vis++;
+      const hlp=$('flh_'+f.id); if(hlp) hlp.style.display=hit?'':'none';
+      if(hit) secHits[window._flagSection[f.id]||'advanced']++;
     }
+  }
+  for(const sec of ['context','gpu','speculative','cache','serving']){
+    const det=$('sec_'+sec); if(!det) continue;
+    if(q){ det.style.display=secHits[sec]?'':'none'; det.open=secHits[sec]>0; }
+    else { det.style.display=''; det.open=false; }
+  }
+  // advanced groups: show only those with hits while searching.
+  let gi=0; let det;
+  while((det=$('flgrp_'+(gi++)))){
+    let vis=0;
+    for(const row of det.querySelectorAll('.setrow'))
+      if(row.style.display!=='none') vis++;
     det.style.display=vis?'':'none';
     det.open=!!q && vis>0;
+  }
+  $('sec_advanced').style.display =
+    q? (secHits.advanced?'':'none') : ($('advanced_toggle').checked?'':'none');
+}
+// Collapsed-section summary line: the effective (non-default) values.
+function _sumPush(list, name, v){
+  if(v==null||v===''||v===false) return;
+  list.push(name+'='+String(Array.isArray(v)?v.join(','):v));
+}
+function updateSectionSummaries(){
+  const s=window._flagSettings||{};
+  const by={context:[],gpu:[],speculative:[],cache:[],serving:[],advanced:[]};
+  const ctx=$('sv_ctx').value;
+  if(ctx) by.context.push('ctx '+parseInt(ctx).toLocaleString()
+    +(window._ctxCap?' / max '+window._ctxCap.toLocaleString():''));
+  _sumPush(by.context,'reqs',$('max_running_requests').value);
+  const host=$('sv_host').value||'127.0.0.1', port=$('sv_port').value;
+  if(port) by.serving.push(host+':'+port);
+  _sumPush(by.serving,'served',$('sv_served').value);
+  for(const id of Object.keys(s)){
+    const sec=window._flagSection[id]||'advanced';
+    _sumPush(by[sec], id, s[id]);
+  }
+  for(const sec of ['context','gpu','speculative','cache','serving']){
+    const el=$('sum_'+sec); if(!el) continue;
+    const items=by[sec];
+    el.textContent=items.length
+      ? '— '+items.slice(0,3).join(' · ')+(items.length>3?' +'+(items.length-3):'')
+      : '';
   }
 }
 function _flagSpec(id){
@@ -4218,7 +4469,97 @@ function onFlagChange(id){
   // A manual edit invalidates the applied profile's EXACT argv (the launch
   // then falls back to the form fields; the profile env stays applied).
   if(window._profileArgv){ window._profileArgv=null; window._profileDirty=true; renderProfileLaunch(); }
+  markPresetDrift(); updateSectionSummaries(); updateGpuPick();
   resolveFlags(); refreshRunnerPlacement(); schedulePlan();
+}
+// ---- context-length / max-running-requests: slider+numeric pairs ----------
+// The numeric field (sv_ctx / max_running_requests) stays authoritative --
+// every existing reader keeps its id. The slider clamps to the plan's
+// computed KV-capacity max when a plan result exists; the numeric is free.
+window._ctxCap=null;
+function setCtxCap(cap){
+  window._ctxCap=cap? Math.round(cap):null;
+  const sl=$('sv_ctx_slider'); if(!sl) return;
+  sl.max=window._ctxCap||262144;
+  $('sv_ctx_max').textContent=window._ctxCap
+    ? 'max '+window._ctxCap.toLocaleString():'';
+  const v=parseInt($('sv_ctx').value)||0;
+  sl.value=Math.min(v||8192, parseInt(sl.max));
+  updateSectionSummaries();
+}
+function ctxFromSlider(){
+  $('sv_ctx').value=$('sv_ctx_slider').value;
+  onServingEdit(); refreshRunnerPlacement();
+}
+function ctxFromNum(){
+  const sl=$('sv_ctx_slider');
+  sl.value=Math.min(parseInt($('sv_ctx').value)||8192, parseInt(sl.max));
+  onServingEdit(); refreshRunnerPlacement();
+}
+function mrrFromSlider(){
+  $('max_running_requests').value=$('mrr_slider').value;
+  onServingEdit(); doPlan(); refreshRunnerPlacement();
+}
+function mrrFromNum(){
+  const v=parseInt($('max_running_requests').value);
+  if(v) $('mrr_slider').value=Math.min(v, 64);
+  onServingEdit(); doPlan(); refreshRunnerPlacement();
+}
+function onServingEdit(){ markPresetDrift(); updateSectionSummaries(); }
+// ---- single-GPU card selector (tp=1): writes the stock --base-gpu-id ------
+function _effectiveTp(){
+  const s=window._flagSettings||{};
+  return (s.tp_size? parseInt(s.tp_size):null)
+    || (CARDS.filter(c=>c.include).length||1);
+}
+function updateGpuPick(){
+  const row=$('row_gpu_pick'); if(!row) return;
+  // Only DETECTED cards carry a real device index --base-gpu-id can address
+  // (CARDS order is display order, NOT the NVML order; virtual cards have no
+  // physical index at all).
+  const detected=CARDS.filter(c=>c.nvml_index!=null)
+    .sort((a,b)=>a.nvml_index-b.nvml_index);
+  const show=_effectiveTp()===1 && detected.length>0;
+  row.style.display=show?'':'none';
+  if(!show) return;
+  const s=window._flagSettings||{};
+  const sel=$('gpu_pick_select');
+  sel.innerHTML=detected.map(c=>'<option value="'+c.nvml_index+'">GPU '
+    +c.nvml_index+' &mdash; '+esc(c.name)+' ('+(c.total_mib/1024).toFixed(0)
+    +'G)</option>').join('');
+  const cur=(s.base_gpu_id!=null && s.base_gpu_id!=='')? String(s.base_gpu_id):'0';
+  sel.value=cur;
+  if(sel.selectedIndex<0) sel.selectedIndex=0;
+}
+function gpuPickChanged(){
+  const el=$('fl_base_gpu_id');
+  if(el){ el.value=$('gpu_pick_select').value; onFlagChange('base_gpu_id'); }
+}
+// ---- changed-from-preset markers ------------------------------------------
+// Snapshot every row's value when a preset is applied; a differing row gets
+// the subtle amber dot. No preset applied -> no markers.
+const _STATIC_ROWS={sv_ctx:'row_sv_ctx', max_running_requests:'row_mrr',
+  sv_served:'row_sv_served', sv_host:'row_sv_host', sv_port:'row_sv_port'};
+function _rowValue(el){
+  if(!el) return '';
+  return el.type==='checkbox'? (el.checked?'1':'') : String(el.value||'');
+}
+function presetSnapshot(){
+  const snap={};
+  for(const fid of Object.keys(_STATIC_ROWS)) snap[fid]=_rowValue($(fid));
+  for(const id of Object.keys(window._flagSection))
+    snap['fl_'+id]=_rowValue($('fl_'+id));
+  return snap;
+}
+function markPresetDrift(){
+  const base=window._presetBase;
+  const mark=(rowId, changed)=>{
+    const row=$(rowId); if(row) row.classList.toggle('changed', !!changed);
+  };
+  for(const fid of Object.keys(_STATIC_ROWS))
+    mark(_STATIC_ROWS[fid], base && _rowValue($(fid))!==base[fid]);
+  for(const id of Object.keys(window._flagSection))
+    mark('flrow_'+id, base && _rowValue($('fl_'+id))!==base['fl_'+id]);
 }
 function collectFlagSettings(){
   // The flag surface IS the flag truth; only the single model selector and
@@ -4307,8 +4648,12 @@ async function refreshRunnerPlacement(){
       {model, gguf_choice: ($('gguf_pick').style.display!=='none'?$('gguf_choice').value:null),
        flags: runnerFlags()})});
     const d=await r.json();
-    $('runner_placement').innerHTML = d.ok? renderPlacement(d.placement)
+    const html = d.ok? renderPlacement(d.placement)
       : '<span class="reasons">'+esc(d.error)+'</span>';
+    // ONE renderer, mirrored: the right-column overview AND the GPU
+    // offload/split section (config + its effect live together).
+    $('runner_placement').innerHTML = html;
+    const gp=$('gpu_placement'); if(gp) gp.innerHTML=html;
   }catch(e){ $('runner_placement').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
 }
 async function loadConfigProfiles(){
@@ -4317,11 +4662,16 @@ async function loadConfigProfiles(){
     const q=model? ('?model='+encodeURIComponent(model)):'';
     const r=await fetch('/api/config_profiles'+q); const d=await r.json();
     if(!d.ok){ $('profile_pick').innerHTML='<span class="reasons">'+esc(d.error||'error')+'</span>'; return; }
+    const nGen=(d.generated||[]).length;
     window._profiles=(d.generated||[]).concat(d.saved||[]);
-    let h='<b>profiles:</b> '+window._profiles.map((p,i)=>'<button class="mini secondary" onclick="applyProfile('
-      +i+')" title="'+esc((p.info||[]).join(' | '))+'">'+esc(p.name)+'</button>').join(' ');
-    if(d.saved && d.saved.length)
-      h+=' <span class="muted">(saved: '+d.saved.map(p=>esc(p.name)).join(', ')+')</span>';
+    // LM-Studio-style preset DROPDOWN: generated presets first, user-saved
+    // after (marked); picking one applies it and fills the settings rows.
+    let h='<select id="profile_select" onchange="applyProfileSel()" style="max-width:70%">'
+      +'<option value="">&mdash; apply a preset &mdash;</option>'
+      +window._profiles.map((p,i)=>'<option value="'+i+'" title="'
+        +esc((p.info||[]).join(' | '))+'">'+esc(p.name)
+        +(i>=nGen?' (saved)':'')+'</option>').join('')
+      +'</select>';
     $('profile_pick').innerHTML=h;
   }catch(e){ $('profile_pick').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
 }
@@ -4337,9 +4687,19 @@ function applyServingValue(id, v){
   el.value=String(v);
   if(id==='model_path') onModelChange();
 }
+function applyProfileSel(){
+  const v=$('profile_select').value;
+  if(v!=='') applyProfile(parseInt(v));
+}
 function applyProfile(i){
   const p=window._profiles[i]; if(!p) return;
   window._flagSettings={};
+  // Reset every rendered flag control first so a previously-applied preset's
+  // leftovers don't linger in rows this preset does not set.
+  for(const id of Object.keys(window._flagSection)){
+    const el=$('fl_'+id); if(!el) continue;
+    if(el.type==='checkbox') el.checked=false; else el.value='';
+  }
   for(const id of Object.keys(p.settings)){
     const v=p.settings[id];
     if(SERVING_OWNED[id]){ applyServingValue(id, v); continue; }
@@ -4360,6 +4720,15 @@ function applyProfile(i){
   renderProfileLaunch();
   $('profile_msg').innerHTML='<span class="muted">applied <b>'+esc(p.name)+'</b>'
     +((p.info&&p.info.length)?' — '+esc(p.info.join(' | ')):'')+'</span>';
+  // Sync the slider pairs to the applied values, then snapshot for the
+  // changed-from-preset markers (the snapshot IS the applied state).
+  const sl=$('sv_ctx_slider');
+  sl.value=Math.min(parseInt($('sv_ctx').value)||8192, parseInt(sl.max));
+  const mv=parseInt($('max_running_requests').value);
+  if(mv) $('mrr_slider').value=Math.min(mv, 64);
+  updateGpuPick();
+  window._presetBase=presetSnapshot();
+  markPresetDrift(); updateSectionSummaries();
   resolveFlags(); refreshRunnerPlacement(); doPlan();
 }
 // DISPLAY the applied profile's launch env + exact argv (not just the CLI
@@ -4605,17 +4974,33 @@ async function loadModels() {
     const r = await fetch('/api/models'); const d = await r.json();
     if (!d.ok) { $('models_out').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; return; }
     window._models = d.models;
-    const opts = d.models.map((m,i)=>{
-      const q = (m.quant_method && m.quant_method!=='None') ? ' · '+esc(m.quant_method) : '';
-      const vv = (m.gguf_variants && m.gguf_variants.length>1) ? ' · '+m.gguf_variants.length+' quants' : '';
-      const err = m.error ? ' · (err)' : '';
-      return '<option value="'+i+'">'+esc(m.name)+'  ['+esc(m.format)+q+' · '+m.size_gib+'G]'+vv+err+'</option>';
-    }).join('');
-    $('models_out').innerHTML =
-      '<select id="model_select" style="width:100%;max-width:100%" onchange="pickFromDropdown()">'
-      + '<option value="">— select a model —</option>' + opts + '</select>'
-      + '<div class="muted" style="margin-top:.3rem">'+d.models.length+' models · '+esc(d.roots.join(', '))+'</div>';
+    window._modelRoots = d.roots;
+    renderModelOptions();
   } catch(e) { $('models_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
+}
+// Search-as-you-type over the discovered models (name / format / quant); the
+// option value stays the ORIGINAL index into window._models, so filtering
+// never changes what pickFromDropdown() resolves.
+function renderModelOptions() {
+  const models = window._models; if (!models) return;
+  const q = ($('model_search').value||'').trim().toLowerCase();
+  const cur = $('model').value.trim();
+  let shown = 0;
+  const opts = models.map((m,i)=>{
+    const quant = (m.quant_method && m.quant_method!=='None') ? m.quant_method : '';
+    if (q && (m.name+' '+m.format+' '+quant).toLowerCase().indexOf(q)<0) return '';
+    shown++;
+    const qb = quant ? ' · '+esc(quant) : '';
+    const vv = (m.gguf_variants && m.gguf_variants.length>1) ? ' · '+m.gguf_variants.length+' quants' : '';
+    const err = m.error ? ' · (err)' : '';
+    return '<option value="'+i+'"'+(cur && m.path===cur?' selected':'')+'>'
+      +esc(m.name)+'  ['+esc(m.format)+qb+' · '+m.size_gib+'G]'+vv+err+'</option>';
+  }).join('');
+  $('models_out').innerHTML =
+    '<select id="model_select" style="width:100%;max-width:100%" onchange="pickFromDropdown()">'
+    + '<option value="">— select a model —</option>' + opts + '</select>'
+    + '<div class="muted" style="margin-top:.3rem">'+shown+'/'+models.length
+    + ' models · '+esc((window._modelRoots||[]).join(', '))+'</div>';
 }
 function pickFromDropdown() {
   const i = $('model_select').value;
@@ -4666,8 +5051,37 @@ function serverSettings() {
     vision: $('include_vision').checked,
   };
 }
+// Sticky-bar status chip: stopped (grey) / loading (amber, while booting) /
+// ready (green) / error (red). Fed by every status render below.
+function updateStatusChip(state) {
+  const chip=$('status_chip'); if(!chip) return;
+  const s=String(state||'stopped');
+  if(s==='ready'){ chip.className='chip ready'; chip.textContent='ready'; }
+  else if(s==='booting'){ chip.className='chip loading'; chip.textContent='loading…'; }
+  else if(s==='error'){ chip.className='chip error'; chip.textContent='error'; }
+  else { chip.className='chip'; chip.textContent=s; }
+}
+// While the managed server boots, poll status until it settles so the chip
+// flips loading -> ready/error without manual refreshes (bounded, 2s tick).
+function pollStatusUntilSettled(){
+  if(window._bootPoll) clearInterval(window._bootPoll);
+  let left=90;  // up to 3 minutes of boot-watching
+  window._bootPoll=setInterval(async ()=>{
+    if(--left<0){ clearInterval(window._bootPoll); window._bootPoll=null; return; }
+    try{
+      const d=await (await fetch('/api/server_status')).json();
+      $('sv_out').innerHTML=renderServerStatus(d);
+      const st=(d.status&&d.status.state)||d.state;
+      if(st!=='booting'){ clearInterval(window._bootPoll); window._bootPoll=null; }
+    }catch(e){}
+  }, 2000);
+}
 function renderServerStatus(d) {
   if (!d) return '';
+  const st=(d.status&&d.status.state)||d.state;
+  updateStatusChip(st);
+  const bl=$('boot_log');
+  if(bl && (st==='error'||st==='booting')) bl.open=true;
   if (!d.ok && d.error) {
     let h = '<div class="reasons">'+esc(d.error)+'</div>';
     if (d.busy) h += '<div class="muted">restart is guarded while a live job is in-flight.</div>';
@@ -4707,10 +5121,16 @@ function launchBody() {
   if (window._profileArgv) body.profile_argv = window._profileArgv;
   return body;
 }
-function serverStart() { serverPost('/api/server_start', launchBody()); }
+function serverStart() {
+  updateStatusChip('booting');
+  serverPost('/api/server_start', launchBody());
+  pollStatusUntilSettled();
+}
 function serverRestart() {
   if (!confirm('Restart REPLACES the single managed instance (stops the running model). Continue?')) return;
+  updateStatusChip('booting');
   serverPost('/api/server_restart', launchBody());
+  pollStatusUntilSettled();
 }
 function serverStop() { serverPost('/api/server_stop', {}); }
 async function refreshServerStatus() {
