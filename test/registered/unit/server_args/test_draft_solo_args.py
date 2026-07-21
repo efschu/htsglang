@@ -141,11 +141,26 @@ class TestSoloValidation(CustomTestCase):
             )._handle_speculative_draft_placement()
 
     def test_solo_other_algorithms_rejected(self):
-        for algo in ("DFLASH", "STANDALONE", "NGRAM", "DSPARK"):
+        # DFLASH is now supported (self-drafting block model, weight-TP=1 host);
+        # the remaining non-EAGLE algorithms stay rejected.
+        for algo in ("STANDALONE", "NGRAM", "DSPARK"):
             with self.assertRaises(ValueError, msg=algo):
                 solo_args(
                     speculative_algorithm=algo
                 )._handle_speculative_draft_placement()
+
+    def test_solo_dflash_accepted(self):
+        # DFLASH goes solo; it must pass placement validation (block model is
+        # non-adaptive, so no topk/rejection-sampling guards apply).
+        solo_args(
+            speculative_algorithm="DFLASH"
+        )._handle_speculative_draft_placement()
+
+    def test_solo_dflash_rejects_adaptive(self):
+        with self.assertRaisesRegex(ValueError, "adaptive"):
+            solo_args(
+                speculative_algorithm="DFLASH", speculative_adaptive=True
+            )._handle_speculative_draft_placement()
 
     def test_solo_multi_layer_eagle_rejected(self):
         with self.assertRaisesRegex(ValueError, "multi-layer"):
