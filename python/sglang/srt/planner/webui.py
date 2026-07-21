@@ -503,13 +503,17 @@ def _kv_by_concurrency(
         except (PlanRejected, ValueError):
             continue
         cap = r.capacity
-        kv = int(min((rc.kv_tokens for rc in cap.per_rank), default=0)) if (
-            cap and r.fits
-        ) else 0
+        # The AGGREGATE context (max_context_tokens), NOT the min per-rank cap:
+        # under uneven DCP the token axis is split across ranks, so the servable
+        # context is the sum the converged optimum reports (== the headline
+        # "max context (KV)"). Reporting min per-rank here understated it ~4x
+        # and contradicted the headline (e.g. showed 97k while the header and
+        # the per-rank column summed to 408k).
+        ctx = int(cap.max_context_tokens) if (cap and r.fits) else 0
         mamba = max((rc.mamba_gib for rc in cap.per_rank), default=0.0) if cap else 0.0
         rows.append({
             "concurrency": c,
-            "kv_tokens": max(kv, 0),
+            "kv_tokens": max(ctx, 0),
             "mamba_gib": round(mamba, 2),
             "fits": bool(r.fits),
         })
@@ -981,8 +985,16 @@ INDEX_HTML = r"""<!doctype html>
       <label><input type="checkbox" id="include_vision" onchange="doPlan()">
         include vision tower <span class="muted">(VL models; off = text-only,
         frees VRAM for KV)</span></label>
-      <label style="margin-top:.5rem">kv-cache-dtype</label>
-      <input id="kv_cache_dtype" placeholder="auto | fp8_e4m3">
+      <label style="margin-top:.5rem"><b>KV-cache quantization</b>
+        &mdash; halves/doubles the KV budget</label>
+      <select id="kv_cache_dtype" onchange="doPlan()">
+        <option value="auto">auto (model dtype, ~2 B/cell)</option>
+        <option value="fp8_e4m3">fp8_e4m3 (1 B/cell &rarr; ~2x context)</option>
+        <option value="fp8_e5m2">fp8_e5m2 (1 B/cell &rarr; ~2x context)</option>
+      </select>
+      <div class="muted" style="margin:.2rem 0 .4rem">fp8 KV halves the
+        per-token cell &rarr; ~2x the max context for the same VRAM. Match this
+        to your launch <code>--kv-cache-dtype</code>.</div>
       <label>quant descriptor (for the issue text)</label>
       <input id="quant" placeholder="compressed-tensors / Q4_K_M / fp8">
     </fieldset>
@@ -1155,10 +1167,11 @@ function concurrencyTable(d) {
     +'<td>'+(r.fits? r.kv_tokens.toLocaleString() : '&mdash;')+'</td>'
     +'<td>'+r.mamba_gib.toFixed(1)+'</td>'
     +'<td>'+(r.fits?'&check;':'no fit')+'</td></tr>').join('');
-  return '<p class="muted" style="margin:.6rem 0 .2rem">max KV tokens vs. '
-    +'concurrency <span class="est">(GDN/mamba pool grows with parallel '
-    +'slots &rarr; KV shrinks; ESTIMATE)</span></p>'
-    +'<table><tr><th>max concurrent</th><th>max KV tok</th>'
+  return '<p class="muted" style="margin:.6rem 0 .2rem">max context (KV) vs. '
+    +'concurrency <span class="est">(aggregate servable context across the '
+    +'uneven-DCP ranks; GDN/mamba pool grows with parallel slots &rarr; context '
+    +'shrinks; ESTIMATE)</span></p>'
+    +'<table><tr><th>max concurrent</th><th>max context (KV)</th>'
     +'<th>mamba GiB</th><th>fits</th></tr>'+body+'</table>';
 }
 
