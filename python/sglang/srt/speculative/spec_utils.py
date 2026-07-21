@@ -85,6 +85,45 @@ if _is_cpu:
 logger = logging.getLogger(__name__)
 
 
+def capture_safe_tp_broadcast(tp_group, tensors, src: int = 0) -> None:
+    """Broadcast device tensors over the TP group, preferring the pynccl
+    communicator; ``None`` entries in ``tensors`` are skipped.
+
+    Why not GroupCoordinator.broadcast (hard c10d)? Two failure modes on
+    the speculative decode path:
+
+    * The c10d NCCL communicator initializes LAZILY on first use. The pick
+      / verify-result syncs first run inside the CUDA-graph capture phase
+      (including its warmup iterations), and communicator init there is
+      ncclInvalidUsage.
+    * With ranks co-located on one physical GPU (tp > cards, MPS), torch's
+      bundled NCCL rejects communicator creation outright ("Duplicate GPU
+      detected"), capture or not — c10d can NEVER work on such rigs. The
+      pynccl communicator loads the side-loaded system NCCL, which
+      supports co-located ranks, and is the graph-capturable path the rest
+      of the capture pipeline already uses (graph_capture()/all_reduce;
+      DFLASH runs pynccl-only for the same reason).
+
+    pynccl enqueues on the CURRENT stream, so ordering w.r.t. producers /
+    consumers on the forward stream is preserved; the payload semantics
+    are identical to the c10d broadcast (same NCCL broadcast, same bytes).
+    Falls back to c10d only when pynccl is absent/unavailable (non-CUDA
+    platforms, world_size 1 comms).
+    """
+    pynccl_comm = getattr(tp_group, "pynccl_comm", None)
+    if pynccl_comm is not None and getattr(pynccl_comm, "available", False):
+        with pynccl_comm.change_state(enable=True):
+            for t in tensors:
+                if t is not None:
+                    # pynccl `src` is the rank in the group, same as
+                    # GroupCoordinator.broadcast's local-rank `src`.
+                    pynccl_comm.broadcast(t, src=src)
+    else:
+        for t in tensors:
+            if t is not None:
+                tp_group.broadcast(t, src=src)
+
+
 def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     sample_index = torch.multinomial(probs, num_samples=num_samples)
     sample_p = probs.gather(1, sample_index)

@@ -17,10 +17,14 @@ Covered contracts:
   short-circuit without collectives. Row counts travel via device-tensor
   all_gather — broadcast_object is forbidden (mq broadcaster is src=0
   only; the old per-source object broadcast crashed every solo boot).
-* Capture safety: _broadcast_draft_picks routes through the pynccl
-  communicator inside CUDA-graph capture (c10d NCCL broadcast there is
-  ncclInvalidUsage, and fails outright for co-located ranks) and keeps
-  the c10d path byte-identical outside capture.
+* Capture / co-location safety: _broadcast_draft_picks routes through the
+  pynccl communicator whenever it is available — warmup, capture, and
+  eager alike (c10d's lazy NCCL comm init inside the capture phase is
+  ncclInvalidUsage, and torch's bundled NCCL rejects co-located ranks
+  outright); c10d is only the non-CUDA fallback.
+* Shadow draft-runner surface: install_shadow_draft_runner_surface gives
+  shadow ranks' runners explicit None attributes for everything a
+  never-running draft lacks, and loud solo-mode AttributeErrors otherwise.
 * Init gating: shadow ranks build no draft attention backends, capture no
   draft CUDA graphs (incl. adaptive ladder rungs, which route through the
   same methods), and allocate no draft KV pool.
@@ -235,13 +239,16 @@ class _FakePyNccl:
 
 
 class TestBroadcastDraftPicksCaptureSafe(CustomTestCase):
-    """Boot regression (co-located tp>cards NEXTN): a c10d NCCL broadcast
-    inside draft CUDA-graph capture is ncclInvalidUsage (lazy comm init in
-    the capture region; duplicate-GPU rejection for co-located ranks).
-    Under capture the pick broadcast must use the pynccl communicator; the
-    c10d path stays byte-identical outside capture."""
+    """Boot regression (co-located tp>cards NEXTN): GroupCoordinator's hard
+    c10d broadcast can never serve the pick sync — its NCCL communicator
+    initializes lazily on first use, which lands in the draft graph-capture
+    phase (warmup included -> ncclInvalidUsage), and torch's bundled NCCL
+    rejects co-located ranks outright ("Duplicate GPU detected"). The pick
+    broadcast must therefore use the pynccl communicator WHENEVER it is
+    available — warmup, capture, and eager alike (the DFLASH pynccl-only
+    pattern) — with c10d only as the non-CUDA fallback."""
 
-    def _run(self, capturing, pynccl_comm):
+    def _run(self, pynccl_comm):
         c10d_calls = []
         fake_group = SimpleNamespace(
             world_size=3,
@@ -256,39 +263,42 @@ class TestBroadcastDraftPicksCaptureSafe(CustomTestCase):
                 "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
                 return_value=False,
             ),
-            patch(
-                "torch.cuda.is_current_stream_capturing",
-                return_value=capturing,
-            ),
         ):
             _broadcast_draft_picks(torch.zeros(2, 1), None, torch.ones(2, 1))
         return c10d_calls
 
-    def test_capture_routes_through_pynccl(self):
+    def test_available_pynccl_is_always_used(self):
         pynccl = _FakePyNccl(available=True)
-        c10d_calls = self._run(capturing=True, pynccl_comm=pynccl)
+        c10d_calls = self._run(pynccl_comm=pynccl)
         self.assertEqual(c10d_calls, [])
         self.assertEqual(len(pynccl.broadcasts), 2)  # None arg skipped
         for _, src, disabled_at_call in pynccl.broadcasts:
             self.assertEqual(src, 0)
             self.assertFalse(disabled_at_call)  # enabled via change_state
-        self.assertEqual(pynccl.change_state_enables, [True, True])
-
-    def test_outside_capture_keeps_c10d(self):
-        pynccl = _FakePyNccl(available=True)
-        c10d_calls = self._run(capturing=False, pynccl_comm=pynccl)
-        self.assertEqual(c10d_calls, [0, 0])
-        self.assertEqual(pynccl.broadcasts, [])
+        self.assertEqual(pynccl.change_state_enables, [True])
 
     def test_unavailable_pynccl_falls_back_to_c10d(self):
         pynccl = _FakePyNccl(available=False)
-        c10d_calls = self._run(capturing=True, pynccl_comm=pynccl)
+        c10d_calls = self._run(pynccl_comm=pynccl)
         self.assertEqual(c10d_calls, [0, 0])
         self.assertEqual(pynccl.broadcasts, [])
 
     def test_missing_pynccl_attr_falls_back_to_c10d(self):
-        c10d_calls = self._run(capturing=True, pynccl_comm=None)
+        c10d_calls = self._run(pynccl_comm=None)
         self.assertEqual(c10d_calls, [0, 0])
+
+    def test_helper_src_passthrough_and_none_skip(self):
+        from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+
+        pynccl = _FakePyNccl(available=True)
+        group = SimpleNamespace(pynccl_comm=pynccl)
+        payload = torch.arange(4).reshape(2, 2)
+        capture_safe_tp_broadcast(group, (None, payload), src=2)
+        self.assertEqual(len(pynccl.broadcasts), 1)
+        sent, src, disabled_at_call = pynccl.broadcasts[0]
+        self.assertTrue(torch.equal(sent, payload))
+        self.assertEqual(src, 2)
+        self.assertFalse(disabled_at_call)
 
 
 class TestTokenBroadcastContract(CustomTestCase):
@@ -513,6 +523,161 @@ class TestVocabGather(CustomTestCase):
                 out_rows=10,
                 keep=True,
             )
+
+
+class TestShadowDraftRunnerSurface(CustomTestCase):
+    """Boot regressions (solo shadows): generic init/serve paths dereference
+    draft_runner attributes that shadows never build — the adaptive
+    _override_worker_state backup (draft_runner.draft_attn_backend) and the
+    disaggregation KV builder (draft_runner.token_to_kv_pool, reached even
+    with disaggregation_mode "null"). The shadow surface must expose these
+    as None and make everything else fail with a loud solo-mode message."""
+
+    class _FakeRunner:
+        def __init__(self):
+            self.attn_backend = None  # pre-set by ModelRunner.initialize()
+            self.model_config = SimpleNamespace()
+
+    def _installed(self):
+        from sglang.srt.speculative.eagle_worker_v2 import (
+            install_shadow_draft_runner_surface,
+        )
+
+        runner = self._FakeRunner()
+        install_shadow_draft_runner_surface(runner)
+        return runner
+
+    def test_commonly_dereferenced_attrs_are_none(self):
+        runner = self._installed()
+        for attr in (
+            "attn_backend",
+            "draft_attn_backend",
+            "token_to_kv_pool",
+            "token_to_kv_pool_allocator",
+            "req_to_token_pool",
+            "decode_cuda_graph_runner",
+        ):
+            self.assertIsNone(getattr(runner, attr), attr)
+
+    def test_preexisting_attrs_not_clobbered(self):
+        from sglang.srt.speculative.eagle_worker_v2 import (
+            install_shadow_draft_runner_surface,
+        )
+
+        runner = self._FakeRunner()
+        sentinel = object()
+        runner.token_to_kv_pool = sentinel
+        install_shadow_draft_runner_surface(runner)
+        self.assertIs(runner.token_to_kv_pool, sentinel)
+
+    def test_missing_attr_raises_loud_solo_error(self):
+        runner = self._installed()
+        with self.assertRaisesRegex(
+            AttributeError, "speculative-draft-placement"
+        ):
+            runner.definitely_not_an_attribute
+
+    def test_hasattr_and_getattr_default_probes_unchanged(self):
+        runner = self._installed()
+        self.assertFalse(hasattr(runner, "nonexistent"))
+        self.assertIsNone(getattr(runner, "nonexistent", None))
+        self.assertTrue(isinstance(runner, self._FakeRunner))
+
+    def test_idempotent_no_class_chain_growth(self):
+        from sglang.srt.speculative.eagle_worker_v2 import (
+            install_shadow_draft_runner_surface,
+        )
+
+        runner = self._installed()
+        cls_after_first = type(runner)
+        install_shadow_draft_runner_surface(runner)
+        self.assertIs(type(runner), cls_after_first)
+
+    def test_disagg_kv_builder_returns_none_for_shadow(self):
+        from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool
+
+        runner = self._installed()
+        draft_worker = SimpleNamespace(
+            draft_worker=SimpleNamespace(draft_runner=runner)
+        )
+        pool = get_draft_kv_pool(
+            draft_worker=draft_worker,
+            spec_algorithm=SimpleNamespace(is_ngram=lambda: False),
+            server_args=SimpleNamespace(enable_multi_layer_eagle=False),
+        )
+        self.assertIsNone(pool)
+
+
+class TestSoloHostRankLocalCaptureBarrier(CustomTestCase):
+    """Boot deadlock regression: the solo HOST captures its draft graphs
+    rank-locally (weight-TP=1, collective-free forward) while shadows skip
+    draft capture — so the capture backends' per-warmup TP barrier waited
+    on ranks that never enter it. Runners flagged spec_solo_rank_local_graphs
+    must skip that barrier; unflagged runners keep it."""
+
+    def _backend(self, flagged):
+        from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+            FullCudaGraphBackend,
+        )
+
+        barrier_calls = []
+        runner = SimpleNamespace(
+            tp_group=SimpleNamespace(barrier=lambda: barrier_calls.append(1)),
+        )
+        if flagged:
+            runner.spec_solo_rank_local_graphs = True
+        fake_cgr = SimpleNamespace(
+            model_runner=runner,
+            device_module=SimpleNamespace(synchronize=lambda: None),
+        )
+        backend = object.__new__(FullCudaGraphBackend)
+        # Mirror only the __init__ lines under test.
+        backend._tp_group = fake_cgr.model_runner.tp_group
+        backend._skip_warmup_barrier = getattr(
+            fake_cgr.model_runner, "spec_solo_rank_local_graphs", False
+        )
+        return backend, barrier_calls
+
+    def test_flagged_runner_skips_barrier(self):
+        backend, calls = self._backend(flagged=True)
+        self.assertTrue(backend._skip_warmup_barrier)
+        if not backend._skip_warmup_barrier:
+            backend._tp_group.barrier()
+        self.assertEqual(calls, [])
+
+    def test_unflagged_runner_keeps_barrier(self):
+        backend, calls = self._backend(flagged=False)
+        self.assertFalse(backend._skip_warmup_barrier)
+        if not backend._skip_warmup_barrier:
+            backend._tp_group.barrier()
+        self.assertEqual(calls, [1])
+
+    def test_all_capture_backends_gate_the_barrier(self):
+        """Source-level check: every runner-backend warmup barrier is gated
+        by _skip_warmup_barrier (a new backend copying the old unguarded
+        pattern would reintroduce the solo deadlock)."""
+        import sglang.srt.model_executor.runner_backend as rb_pkg
+
+        rb_dir = Path(list(rb_pkg.__path__)[0])
+        offenders = []
+        for path in sorted(rb_dir.glob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            for m in re.finditer(r"^(\s*)self\._tp_group\.barrier\(\)", text, re.M):
+                # The barrier line must sit under an
+                # `if not self._skip_warmup_barrier:` guard.
+                before = text[: m.start()].rsplit("\n", 3)
+                guarded = any(
+                    "_skip_warmup_barrier" in line for line in before[-3:]
+                )
+                if not guarded:
+                    line_no = text.count("\n", 0, m.start()) + 1
+                    offenders.append(f"{path.name}:{line_no}")
+        self.assertEqual(
+            offenders,
+            [],
+            "Unguarded capture-warmup TP barrier(s) (solo-host draft capture "
+            f"would deadlock): {offenders}",
+        )
 
 
 class TestNoNonzeroSrcBroadcastObject(CustomTestCase):

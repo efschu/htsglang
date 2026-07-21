@@ -60,7 +60,13 @@ def get_draft_kv_pool(
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]
     else:
         draft_runner = draft_worker.draft_worker.draft_runner
-    return draft_runner.token_to_kv_pool
+    # Solo-shadow guard (--speculative-draft-placement solo): shadow ranks
+    # never allocate a draft KV pool (the draft runs only on the solo host),
+    # so their runner exposes token_to_kv_pool as None — and this builder is
+    # reached even with disaggregation_mode "null" (scheduler
+    # init_disaggregation calls it before checking the mode). "No draft KV
+    # pool" is the correct answer for a shadow, not an error.
+    return getattr(draft_runner, "token_to_kv_pool", None)
 
 
 def maybe_register_hicache_draft(

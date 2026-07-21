@@ -767,9 +767,16 @@ def eagle_sample(
         get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
     )
     if tp_group.world_size > 1:
-        tp_group.broadcast(predict, src=0)
-        tp_group.broadcast(accept_index, src=0)
-        tp_group.broadcast(num_correct_drafts, src=0)
+        # capture_safe_tp_broadcast, NOT tp_group.broadcast (hard c10d):
+        # torch's bundled NCCL cannot create a communicator for co-located
+        # ranks (tp > cards, "Duplicate GPU detected"), and lazy comm init
+        # inside a capture phase is ncclInvalidUsage — same reasoning as
+        # the draft-pick sync in eagle_worker_v2._broadcast_draft_picks.
+        from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+
+        capture_safe_tp_broadcast(
+            tp_group, (predict, accept_index, num_correct_drafts), src=0
+        )
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
