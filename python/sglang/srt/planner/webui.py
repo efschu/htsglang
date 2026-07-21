@@ -54,6 +54,8 @@ __all__ = [
     "matrix_from_payload",
     "landscape_from_payload",
     "list_profiles",
+    "hicache_saved_read",
+    "hicache_saved_record",
     "serve",
 ]
 
@@ -912,6 +914,158 @@ def cache_flush_warning_payload(payload: dict) -> dict:
     }
 
 
+# ===========================================================================
+# #147 — persistent "HiCache energy-saved" accumulator (RAM/disk prefix cache).
+# ===========================================================================
+#
+# The HiCache serves prefill tokens from RAM/disk instead of recomputing them.
+# Every such token is an avoided prefill recompute -> energy saved. We accumulate
+# the recovered-token counter per (model, config_label) and convert the running
+# total into a kWh / €-ct saving BAND (von–bis over the measured J/prefill-token
+# buckets). The recovery costs NOTHING extra (RAM/disk power is sunk cost), so
+# nothing is ever deducted — the saving is the pure avoided recompute.
+
+
+def _price_ct(payload: dict) -> float:
+    try:
+        p = float(payload.get("price_ct_per_kwh", 30.0))
+        return p if p >= 0 else 30.0
+    except (TypeError, ValueError):
+        return 30.0
+
+
+def _hicache_store_path(payload: dict) -> str:
+    from sglang.srt.planner.hicache_savings import DEFAULT_HICACHE_STORE
+
+    return payload.get("hicache_store") or DEFAULT_HICACHE_STORE
+
+
+def _measured_prefill_band(model: str, config_label: str, results_store_path):
+    """(lo, hi) measured J/prefill-token band for a (model, config_label), read
+    from the measured results store — MIN/MAX across buckets. None when no
+    matching MEASURED entry exists (never fabricated). Matching mirrors the
+    measured-panel lookup: normalized-alnum model substring + config_label."""
+    from sglang.srt.planner.hicache_savings import band_from_buckets
+    from sglang.srt.planner.results_store import ResultsStore
+
+    try:
+        from sglang.srt.planner.energy import DEFAULT_RESULTS_STORE
+    except Exception:
+        DEFAULT_RESULTS_STORE = None
+    path = results_store_path or DEFAULT_RESULTS_STORE
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        store = ResultsStore.load(path)
+    except Exception:
+        return None
+
+    def _norm(s):
+        return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+    nm = _norm(str(model).split("/")[-1])
+    merged: dict = {}
+    for e in store.entries():
+        if not e.has_measured_perf() or not e.j_per_prefill_token_by_bucket:
+            continue
+        ne = _norm(str(e.model).split("/")[-1])
+        if not (ne and nm and (ne in nm or nm in ne)):
+            continue
+        if config_label and (e.config_label or "measured") != config_label:
+            continue
+        merged.update(e.j_per_prefill_token_by_bucket)
+    return band_from_buckets(merged)
+
+
+def hicache_saved_read(payload: Optional[dict] = None) -> dict:
+    """GET side of ``/api/hicache_saved``: read the persisted accumulator and
+    return every (model, config_label) record with its derived kWh/ct saving
+    band plus the grand total. Pure read — never boots a server."""
+    from sglang.srt.planner.hicache_savings import HiCacheSavingsStore
+
+    payload = payload or {}
+    path = _hicache_store_path(payload)
+    price = _price_ct(payload)
+    store = HiCacheSavingsStore.load(path)
+    return {"ok": True, "store_path": path, **store.to_view(price)}
+
+
+def hicache_saved_record(payload: dict) -> dict:
+    """POST side of ``/api/hicache_saved``: record newly-recovered prefill tokens
+    for a (model, config_label) and persist the grown total.
+
+    Two input modes (both accumulate, neither resets):
+      * ``target``: scrape the running server's ``/metrics`` and record the
+        ABSOLUTE ``sglang:cached_tokens_total`` (HiCache RAM/disk tiers only) as a
+        counter snapshot — the store adds only the DELTA since the last snapshot.
+      * ``recovered_tokens``: a manual delta to add directly (no server).
+
+    The measured J/prefill-token band is (re)attached from the measured results
+    store when available; a measured band is never overwritten by an estimate."""
+    from sglang.srt.planner.hicache_savings import (
+        HiCacheSavingsStore,
+        hicache_recovered_from_metrics,
+    )
+
+    model = (payload.get("model") or "").strip()
+    config_label = (payload.get("config_label") or "measured").strip()
+    if not model:
+        return {"ok": False, "error": "model is required to key the saving record"}
+
+    path = _hicache_store_path(payload)
+    price = _price_ct(payload)
+    store = HiCacheSavingsStore.load(path)
+    rec = store.get_or_create(model, config_label)
+
+    # (Re)attach the measured J/prefill-token band (provenance-guarded inside).
+    band = _measured_prefill_band(
+        model, config_label, payload.get("results_store")
+    )
+    if band is not None:
+        rec.set_band(band[0], band[1], provenance="measured")
+
+    delta = None
+    target = (payload.get("target") or "").strip()
+    if target:
+        if not target.startswith("http"):
+            target = "http://" + target
+        url = target.rstrip("/") + "/metrics"
+        try:
+            import urllib.request
+
+            with urllib.request.urlopen(url, timeout=5.0) as r:
+                text = r.read().decode("utf-8", "replace")
+        except Exception as e:
+            return {"ok": False, "error": f"scrape of {url} failed: {e}"}
+        total = hicache_recovered_from_metrics(text)
+        delta = rec.record_counter_snapshot(total)
+    elif payload.get("recovered_tokens") is not None:
+        try:
+            n = float(payload["recovered_tokens"])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "recovered_tokens must be a number"}
+        try:
+            rec.add_tokens(n)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        delta = n
+    else:
+        return {
+            "ok": False,
+            "error": "provide either 'target' (server host:port to scrape) or "
+            "'recovered_tokens' (manual delta)",
+        }
+
+    store.save(path)
+    return {
+        "ok": True,
+        "store_path": path,
+        "recorded_delta_tokens": delta,
+        "record": rec.to_view(price),
+        **store.to_view(price),
+    }
+
+
 class _Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype):
         data = body.encode() if isinstance(body, str) else body
@@ -957,6 +1111,15 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
+        if self.path.startswith("/api/hicache_saved"):
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, hicache_saved_read(q))
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
         self._send(404, "not found", "text/plain")
 
     def do_POST(self):
@@ -989,6 +1152,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/cache_flush_warning"):
                 self._json(200, cache_flush_warning_payload(payload))
+                return
+            if self.path.startswith("/api/hicache_saved"):
+                self._json(200, hicache_saved_record(payload))
                 return
         except Exception as e:  # pragma: no cover - defensive
             self._json(500, {"error": str(e)})
@@ -1328,12 +1494,14 @@ INDEX_HTML = r"""<!doctype html>
     <div id="pricebar" class="pricebar">
       energy price
       <input id="kwh_price" type="number" step="1" min="0" value="30"
-             oninput="if (window.__lastMeasured !== undefined) renderMeasured(window.__lastMeasured)">
+             oninput="if (window.__lastMeasured !== undefined) renderMeasured(window.__lastMeasured); if (window.__lastHicache !== undefined) renderHicacheSaved(window.__lastHicache)">
       <span class="muted">ct/kWh (&euro;-cent; currency-agnostic &mdash; just a
-      multiplier). Costs below are in <b>ct</b>. Applies to the measured cost
-      and, later, to HiCache kWh-saved (#147) and virtual-rig estimate (#148).</span>
+      multiplier). Costs below are in <b>ct</b>. Applies to the measured cost,
+      the HiCache kWh-saved band (#147) and, later, the virtual-rig estimate
+      (#148).</span>
     </div>
     <div id="measured"></div>
+    <div id="hicache_saved"></div>
     <div id="roofline"></div>
     <div id="flags"></div>
     <div id="issue"></div>
@@ -1598,6 +1766,8 @@ function render(d) {
   $('advantage').innerHTML = av;
   // MEASURED perf/energy (S2.5 energy module) — preferred over the roofline
   renderMeasured(d.measured);
+  // #147 persistent HiCache energy-saved accumulator (read-only here)
+  loadHicacheSaved();
   // roofline throughput ESTIMATE — loudly labelled rough ballpark, NOT measured
   renderRoofline(d.roofline_estimate);
   // launch flags
@@ -1677,20 +1847,30 @@ function perCardPhase(w, bs, priceCt, phase) {
                    : pce.decode_j_per_token_by_bucket)||{})[b]||[];
   const totW = wl.reduce((a,x)=>a+(x||0), 0);
   const totJ = jl.reduce((a,x)=>a+(x||0), 0);
+  // work-normalized efficiency: (compute-share / J-per-token), rescaled so the
+  // LEAST efficient card = 1.0x. Raw per-card J/tok is ~uniform across cards
+  // (lockstep: every card sees the SAME tokens), so it is NOT efficiency — only
+  // dividing by each card's actual uneven-DCP work-share reveals the hetero gap.
+  const effs = names.map((_,i) => (share[i]!=null && jl[i]) ? share[i]/jl[i] : null);
+  const effMin = Math.min(...effs.filter(x=>x!=null && x>0));
   let h = '<p class="muted" style="margin:.3rem 0 .1rem">per-card @ bs=' + b
-    + ' (own NVML power, not total/N; compute-share vs power-share = efficiency)</p>';
+    + ' (own NVML power, not total/N). <b>J/tok is RAW</b> (lockstep &mdash; same '
+    + 'tokens on every card, NOT efficiency); <b>wpw(rel)</b> = work-per-watt '
+    + 'normalized by uneven-DCP compute-share = the real hetero-efficiency.</p>';
   h += '<table><tr><th>card</th><th>compute</th><th>power</th><th>W</th>'
-    + '<th>J/tok</th><th>kWh/1M</th><th>ct/1M</th></tr>';
+    + '<th>J/tok (raw)</th><th>wpw(rel)</th><th>kWh/1M</th><th>ct/1M</th></tr>';
   for (let i = 0; i < names.length; i++) {
     const pw = totW > 0 ? (wl[i]||0)/totW : null;
+    const rel = (effs[i]!=null && effMin>0) ? (effs[i]/effMin) : null;
     h += '<tr><td style="text-align:left">' + esc(names[i]) + '</td><td>'
       + (share[i]!=null ? Math.round(share[i]*100)+'%' : '—') + '</td><td>'
       + (pw!=null ? Math.round(pw*100)+'%' : '—') + '</td><td>' + _f1(wl[i])
-      + '</td><td>' + _f3(jl[i]) + '</td><td>' + _f2(jl[i]!=null?jl[i]/3.6:null)
+      + '</td><td>' + _f3(jl[i]) + '</td><td>' + (rel!=null ? rel.toFixed(2)+'&times;' : '—')
+      + '</td><td>' + _f2(jl[i]!=null?jl[i]/3.6:null)
       + '</td><td>' + _fct(jPerTokToCtPer1M(jl[i], priceCt)) + '</td></tr>';
   }
   h += '<tr><td style="text-align:left"><b>TOTAL</b></td><td>100%</td><td>100%</td>'
-    + '<td>' + _f1(totW) + '</td><td>' + _f3(totJ) + '</td><td>' + _f2(totJ/3.6)
+    + '<td>' + _f1(totW) + '</td><td>' + _f3(totJ) + '</td><td>&mdash;</td><td>' + _f2(totJ/3.6)
     + '</td><td>' + _fct(jPerTokToCtPer1M(totJ, priceCt)) + '</td></tr></table>';
   return h;
 }
@@ -1760,6 +1940,74 @@ function renderMeasured(mz) {
   }
   h += '<p class="muted">source: ' + esc(mz.store_path) + '</p></div>';
   $('measured').innerHTML = h;
+}
+
+// -- #147 persistent HiCache energy-saved band -------------------------------
+// The HiCache serves prefill tokens from RAM/disk instead of recomputing them;
+// every recovered token is an avoided prefill recompute -> energy saved. The
+// saving is a von–bis BAND (J/prefill-token varies by bucket) and NOTHING is
+// deducted for the fetch (RAM/disk power is sunk cost). Read-only view of the
+// persisted per-(model,config) accumulator + grand total.
+async function loadHicacheSaved() {
+  try {
+    const r = await fetch('/api/hicache_saved?price_ct_per_kwh=' + getKwhPriceCt());
+    const d = await r.json();
+    renderHicacheSaved(d);
+  } catch (e) { /* offline / no store yet -> leave the block empty */ }
+}
+
+function _kwhBand(b) {   // [lo,hi] kWh -> "lo–hi kWh" (or em-dash if absent)
+  if (!b) return '<span class="muted">no measured J/prefill-token band yet</span>';
+  return _f3(b[0]) + '&ndash;' + _f3(b[1]) + ' kWh';
+}
+function _ctBand(b) {    // [lo,hi] ct -> "lo–hi ct"
+  if (!b) return '&mdash;';
+  return _f2(b[0]) + '&ndash;' + _f2(b[1]) + ' ct';
+}
+
+function renderHicacheSaved(d) {
+  window.__lastHicache = d;   // cached so a price edit re-renders in place
+  const el = $('hicache_saved');
+  if (!el) return;
+  // Re-derive the ct band client-side from the kWh band at the CURRENT price so
+  // editing the price bar updates instantly without a refetch.
+  const priceCt = getKwhPriceCt();
+  const recs = (d && d.records) || [];
+  if (!recs.length) { el.innerHTML = ''; return; }
+  const ctOf = kwhB => (kwhB ? kwhBandToCt(kwhB, priceCt) : null);
+
+  let h = '<div class="measured"><div class="ms-title">HiCache energy SAVED '
+    + '&mdash; cumulative, per model/config (#147)</div>'
+    + '<p class="ms-note">Prefill tokens served from the RAM/disk prefix cache '
+    + 'instead of being recomputed. Each is an <b>avoided prefill recompute</b> '
+    + '&rarr; energy saved = recovered&nbsp;tokens &times; J/prefill-token. The '
+    + 'fetch itself costs <b>nothing extra</b> (RAM/disk draw is sunk cost), so '
+    + 'nothing is deducted. Shown as a <b>von&ndash;bis band</b> (J/prefill-token '
+    + 'varies by batch bucket: band = min&ndash;max measured bucket). Accumulates '
+    + 'across sessions. kWh = J &divide; 3.6e6; ct = kWh &times; ' + priceCt
+    + '&nbsp;ct/kWh.</p>';
+  h += '<table><tr><th>model</th><th>config</th><th>recovered prefill tok</th>'
+    + '<th>J/prefill-token (band)</th><th>kWh saved (band)</th>'
+    + '<th>ct saved (band)</th></tr>';
+  for (const r of recs) {
+    const jb = r.j_per_prefill_token_band;
+    h += '<tr><td style="text-align:left">' + esc(r.model) + '</td>'
+      + '<td style="text-align:left">' + esc(r.config_label) + '</td>'
+      + '<td>' + _f1(r.recovered_prefill_tokens) + '</td>'
+      + '<td>' + (jb ? _f3(jb[0]) + '&ndash;' + _f3(jb[1]) : '<span class="muted">&mdash;</span>')
+      + (jb && r.band_provenance ? ' <span class="muted">(' + esc(r.band_provenance) + ')</span>' : '')
+      + '</td>'
+      + '<td>' + _kwhBand(r.saved_kwh_band) + '</td>'
+      + '<td>' + _ctBand(ctOf(r.saved_kwh_band)) + '</td></tr>';
+  }
+  const gt = (d && d.grand_total) || {};
+  h += '<tr><td style="text-align:left"><b>GRAND TOTAL</b></td><td>&mdash;</td>'
+    + '<td><b>' + _f1(gt.recovered_prefill_tokens) + '</b></td><td>&mdash;</td>'
+    + '<td><b>' + _kwhBand(gt.saved_kwh_band) + '</b></td>'
+    + '<td><b>' + _ctBand(ctOf(gt.saved_kwh_band)) + '</b></td></tr>';
+  h += '</table><p class="muted">source: ' + esc(d.store_path || '')
+    + ' &mdash; persistent, appends across sessions.</p></div>';
+  el.innerHTML = h;
 }
 
 function renderRoofline(rf) {
