@@ -341,6 +341,23 @@ class TestProfiles(CustomTestCase):
         kinds = {p.kind for p in profs}
         self.assertEqual(kinds, {"single", "normal-tp"})
 
+    def test_every_preset_enables_adaptive_mtp_when_checkpoint_has_mtp(self):
+        # User rule: EVERY generated preset (single-gpu and normal-TP
+        # included, not only the fork profiles) boots with the validated
+        # adaptive-MTP shape whenever the checkpoint ships MTP draft layers.
+        # A checkpoint without draft layers cannot run NEXTN, so there the
+        # presets keep spec off (they must stay launchable).
+        for p in flags.profiles(_REF_CFG, _REF_RIG):
+            self.assertEqual(
+                p.settings["speculative_algorithm"], "NEXTN", p.kind
+            )
+            self.assertTrue(p.settings["speculative_adaptive"], p.kind)
+            self.assertEqual(p.settings["speculative_num_steps"], 3, p.kind)
+        for p in flags.profiles(_MOE_CFG, _HETERO_GPUS):
+            self.assertFalse(
+                p.settings.get("speculative_adaptive"), p.kind
+            )
+
     def test_max_perf_coincidence_note_on_homogeneous(self):
         # Force fork profiles via a non-dividing card count on identical cards.
         cfg = dict(_MOE_CFG, num_key_value_heads=8)

@@ -1636,11 +1636,30 @@ def profiles(
                 "compressed-tensors checkpoint: set --quantization "
                 "compressed-tensors explicitly (validated launch shape)."
             )
+        # Speculative decoding: EVERY generated preset ships the validated
+        # adaptive-MTP shape (NEXTN chain, adaptive) whenever the checkpoint
+        # actually carries MTP draft layers -- including the stock single-gpu
+        # and normal-TP presets, not only the fork profiles. A checkpoint
+        # without draft layers cannot run NEXTN, so it stays off there
+        # (enabling it would make the preset unlaunchable).
+        if model_has_mtp(model_cfg) and not s.get("speculative_algorithm"):
+            s.update(
+                speculative_algorithm="NEXTN",
+                speculative_num_steps=3,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=4,
+                speculative_adaptive=True,
+            )
+            info.append(
+                "speculative decoding: NEXTN chain, steps 3, topk 1, draft "
+                "4, adaptive (the validated shape; topk stays 1 -- tree "
+                "spec is rejected under uneven DCP)."
+            )
         return s
 
     def _apply_fork_rules(s: Dict[str, Any], info: List[str]) -> None:
         """Rules for the fork (co-location / uneven) profiles: sm86-safe fp8
-        KV dtype, validated NEXTN spec shape, hybrid SSM dtype."""
+        KV dtype, hybrid SSM dtype (spec/MTP is preset-wide, set in _mk)."""
         # KV dtype: fp8 KV maximizes capacity; sm86 (RTX 3080-class) cannot
         # do fp8_e4m3 -> e5m2 whenever ANY sm86 card is in the rig.
         cur = s.get("kv_cache_dtype")
@@ -1661,21 +1680,6 @@ def profiles(
             info.append(
                 "overrode kv-cache-dtype fp8_e4m3 -> fp8_e5m2: an sm86 "
                 "(RTX 3080-class) card is in the rig and cannot run e4m3 KV."
-            )
-        # Speculative decoding: the validated fork shape, only when the
-        # checkpoint actually ships MTP draft layers.
-        if model_has_mtp(model_cfg):
-            s.update(
-                speculative_algorithm="NEXTN",
-                speculative_num_steps=3,
-                speculative_eagle_topk=1,
-                speculative_num_draft_tokens=4,
-                speculative_adaptive=True,
-            )
-            info.append(
-                "speculative decoding: NEXTN chain, steps 3, topk 1, draft "
-                "4, adaptive (the validated shape; topk stays 1 -- tree "
-                "spec is rejected under uneven DCP)."
             )
         # Hybrid models: bfloat16 SSM state (validated; halves mamba state).
         if hybrid:
