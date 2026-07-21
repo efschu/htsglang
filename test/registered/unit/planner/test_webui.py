@@ -699,7 +699,7 @@ class TestMergedCardTelemetry(CustomTestCase):
         # CUDA-keyed card via the device-map-bridged gpus[] rows.
         for token in (
             "cardLiveHtml", "_liveGpuForCard", "cardlive",
-            "renderPlacement(d.placement, s.gpus)",
+            "renderPlacement(d.placement, s.gpus",
         ):
             self.assertIn(token, webui.INDEX_HTML, token)
 
@@ -1541,8 +1541,9 @@ class TestV3IndexMarkers(CustomTestCase):
             webui.INDEX_HTML.count("function renderPlacement"), 1)
         self.assertGreaterEqual(
             webui.INDEX_HTML.count("renderPlacement(d.placement)"), 1)
+        # landing passes the live gpus[] plus the live graph-capture opts.
         self.assertGreaterEqual(
-            webui.INDEX_HTML.count("renderPlacement(d.placement, s.gpus)"), 1)
+            webui.INDEX_HTML.count("renderPlacement(d.placement, s.gpus"), 1)
 
 
 class TestRunnerLmStudioLayout(CustomTestCase):
@@ -1816,3 +1817,136 @@ class TestDeviceIndexSpaces(CustomTestCase):
         self.assertIn("a.cuda_index!=null?a.cuda_index:1e9", html)
         # heuristic mappings are surfaced, not silent.
         self.assertIn("FASTEST_FIRST emulation", html)
+
+
+class TestGranularVramView(CustomTestCase):
+    """Fine-grained VRAM segments + CUDA-graph line + KV-replication marking
+    + side-by-side normal-TP: renderer markers and payload wiring."""
+
+    def test_renderer_markers_present(self):
+        for token in (
+            "segBarHtml", "graphMemHtml", "class=\"hatch\"",
+            "repltag", "replicated x", "SEG_COLORS",
+            "attn_q", "kv_draft", "graphs", "flagsAreForkish",
+            "stock_compare", "sxs-h", "graphCapture",
+        ):
+            self.assertIn(token, webui.INDEX_HTML, token)
+        # tiny-segment collapse into ONE neutral "other" sliver.
+        self.assertIn("other (", webui.INDEX_HTML)
+        # the old coarse four-lump bar title is gone from the renderer.
+        self.assertNotIn("title=\"weights '+fmtMib", webui.INDEX_HTML)
+
+    def test_neutral_stock_wording(self):
+        self.assertNotIn("DOES NOT RUN", webui.INDEX_HTML)
+        self.assertIn("not expressible", webui.INDEX_HTML)
+
+    def test_placement_payload_carries_segments_and_graph_mem(self):
+        d = webui.placement_payload(
+            {"model_cfg": _V2_CONFIG,
+             "flags": {"tp_size": 3, "rank_gpu_id": [0, 1, 2],
+                       "rank_gpu_memory_mib": [16000, 16000, 16000],
+                       "context_length": 8192}}
+        )
+        self.assertTrue(d["ok"], d.get("error"))
+        pl = d["placement"]
+        self.assertIn("graph_mem", pl)
+        self.assertIn("kv_replication", pl)
+        segs = pl["cards"][0]["segments"]
+        self.assertTrue(segs)
+        for s in segs:
+            self.assertIn("detail", s)
+            self.assertIn("replicated", s)
+
+    def test_stock_compare_side_by_side_payload(self):
+        # _V2_CONFIG: q=24, kv=4 -> tp=3 is NOT stock-legal, tp=2 is; the
+        # comparison picks tp=2 on the identical-VRAM pair and renders a
+        # full second placement with stock semantics.
+        d = webui.placement_payload(
+            {"model_cfg": _V2_CONFIG,
+             "stock_compare": True,
+             "flags": {"tp_size": 3, "rank_tp_ratio": [4, 2, 2],
+                       "dcp_size": 3,
+                       "rank_gpu_memory_mib": [28000, 16000, 16000],
+                       "card_total_mib": {"0": 32607, "1": 20480,
+                                          "2": 20480},
+                       "context_length": 8192}}
+        )
+        self.assertTrue(d["ok"], d.get("error"))
+        st = d["stock"]
+        self.assertTrue(st["legal"])
+        self.assertEqual(st["tp"], 2)
+        self.assertIsNotNone(st["placement"])
+        self.assertEqual(st["placement"]["tp_size"], 2)
+        self.assertEqual(len(st["placement"]["cards"]), 2)
+        # neutral wording: a fact-shaped note, no verdict.
+        self.assertNotIn("DOES NOT RUN", st["note"])
+
+    def test_stock_compare_states_rule_when_inexpressible(self):
+        # kv=5, q=25 on 3 cards: no tp in {3,2} is stock-legal -> no numbers,
+        # just the neutral rule statement.
+        cfg = dict(_V2_CONFIG, num_attention_heads=25,
+                   num_key_value_heads=5, head_dim=128)
+        d = webui.placement_payload(
+            {"model_cfg": cfg,
+             "stock_compare": True,
+             "flags": {"tp_size": 3, "rank_tp_ratio": [4, 2, 2],
+                       "card_total_mib": {"0": 32607, "1": 20480,
+                                          "2": 20480},
+                       "context_length": 8192}}
+        )
+        self.assertTrue(d["ok"], d.get("error"))
+        st = d["stock"]
+        self.assertFalse(st["legal"])
+        self.assertIsNone(st["placement"])
+        self.assertIn("stock requires", st["note"])
+
+    def test_replication_marker_in_payload(self):
+        d = webui.placement_payload(
+            {"model_cfg": _V2_CONFIG,
+             "flags": {"tp_size": 3, "rank_tp_ratio": [4, 2, 2],
+                       "dcp_size": 3,
+                       "rank_gpu_memory_mib": [16000] * 3,
+                       "context_length": 8192}}
+        )
+        kr = d["placement"]["kv_replication"]
+        self.assertTrue(kr["replicated"])
+        self.assertEqual(kr["source"], "fork-uneven-dcp")
+
+
+class TestLiveGraphCapture(CustomTestCase):
+    """LIVE CUDA-graph memory source resolution: managed boot log first,
+    conventional /tmp log for detected servers, server_info fallback, and an
+    honest n/a."""
+
+    _LINES = (
+        "[2026-07-21 13:35:33 TP0] Capture target decode CUDA graph end. "
+        "elapsed=4.83 s, mem usage=0.24 GB, avail mem=7.28 GB.\n"
+    )
+
+    def test_managed_boot_log_parse(self):
+        tmp = tempfile.mkdtemp()
+        log = os.path.join(tmp, "sglang_boot_30000.log")
+        with open(log, "w") as f:
+            f.write(self._LINES)
+
+        class _Sup:
+            _log_path = log
+
+        gc = webui._live_graph_capture(_Sup(), "http://127.0.0.1:30000", {})
+        self.assertEqual(gc["source"], "boot-log")
+        self.assertAlmostEqual(
+            gc["summary"]["per_rank_mib"][0], 0.24 * 1024, places=2
+        )
+
+    def test_server_info_fallback(self):
+        snap = {"server_info": {"server_info": {
+            "internal_states": [{"memory_usage": {"graph": 0.5}}]}}}
+        gc = webui._live_graph_capture(None, "http://10.0.0.9:12345", snap)
+        self.assertEqual(gc["source"], "server_info")
+        self.assertAlmostEqual(gc["total_mib"], 512.0, places=2)
+        self.assertIn("rank 0", gc["note"])
+
+    def test_honest_na_without_any_source(self):
+        gc = webui._live_graph_capture(None, "http://10.0.0.9:12345", {})
+        self.assertIsNone(gc["source"])
+        self.assertIn("n/a", gc["reason"])

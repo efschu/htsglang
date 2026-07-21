@@ -1289,3 +1289,98 @@ class TestSingleGpuPick(unittest.TestCase):
         ]
         prof = [p for p in flags.profiles(_REF_CFG, g) if p.kind == "single"][0]
         self.assertIn(prof.settings.get("base_gpu_id"), (None, 0))
+
+
+class TestStockTpRule(CustomTestCase):
+    """The VERIFIED stock TP rule (QKVParallelLinear): q % tp == 0 AND
+    (kv % tp == 0 when tp <= kv, else tp % kv == 0). Presets must never emit
+    a stock preset outside it -- non-divisible combos fall to the fork."""
+
+    def test_head_shard_and_replication_cases(self):
+        cfg = {"num_attention_heads": 32, "num_key_value_heads": 4}
+        self.assertTrue(flags.stock_tp_legal(cfg, 2)[0])   # 4 % 2 == 0
+        self.assertTrue(flags.stock_tp_legal(cfg, 4)[0])   # tp == kv
+        self.assertTrue(flags.stock_tp_legal(cfg, 8)[0])   # 8 % 4 == 0 (repl)
+        # q divides (24 % 3 == 0) but kv does not: the kv-rule reason names
+        # the fork path neutrally.
+        cfg3 = {"num_attention_heads": 24, "num_key_value_heads": 4}
+        ok, reason = flags.stock_tp_legal(cfg3, 3)         # 4 % 3, 3 % 4 != 0
+        self.assertFalse(ok)
+        self.assertIn("fork path", reason)
+
+    def test_q_head_divisibility_required(self):
+        cfg = {"num_attention_heads": 30, "num_key_value_heads": 4}
+        ok, reason = flags.stock_tp_legal(cfg, 4)
+        self.assertFalse(ok)
+        self.assertIn("q_heads", reason)
+
+    def test_unknown_heads_are_permissive(self):
+        self.assertTrue(flags.stock_tp_legal(None, 3)[0])
+        self.assertTrue(flags.stock_tp_legal({}, 2)[0])
+
+
+class TestStockSubsetPresets(CustomTestCase):
+    """Stock normal-TP subset presets: tp=2 on the best pair, tp=4 ONLY when
+    4 cards exist (never fabricate a card), always inside the stock rule."""
+
+    def test_pair_preset_on_three_card_rig_no_quad(self):
+        # The reference 3-card rig (5090 + 2x 3080): a tp=2 stock preset on
+        # the identical-VRAM 3080 pair appears; NO 4-card preset exists on a
+        # 3-card box.
+        profs = {p.kind: p for p in flags.profiles(_REF_CFG, _REF_RIG)}
+        self.assertIn("normal-tp-2", profs)
+        self.assertNotIn("normal-tp-4", profs)
+        pair = profs["normal-tp-2"]
+        self.assertEqual(pair.settings["tp_size"], 2)
+        # stock-only shape: no fork flags active.
+        self.assertFalse(pair.settings.get("rank_gpu_id"))
+        self.assertFalse(pair.settings.get("rank_tp_ratio"))
+        self.assertFalse(pair.settings.get("SGLANG_UNEVEN_DCP"))
+        # the identical-VRAM 3080 pair is picked, named in the info.
+        self.assertTrue(any("Identical-VRAM" in i for i in pair.info))
+        # kv=4 (_REF_CFG): tp=2 divides -> legal by the stock rule.
+        self.assertTrue(
+            flags.stock_tp_legal(_REF_CFG, pair.settings["tp_size"])[0]
+        )
+
+    def test_no_pair_preset_when_stock_rule_fails(self):
+        # q=9 heads: tp=2 fails q % tp == 0 -> the pair preset must NOT be
+        # emitted (the fork profiles cover the rig instead).
+        cfg = {
+            "num_attention_heads": 9,
+            "num_key_value_heads": 3,
+            "num_hidden_layers": 16,
+        }
+        kinds = {p.kind for p in flags.profiles(cfg, _REF_RIG)}
+        self.assertNotIn("normal-tp-2", kinds)
+        self.assertNotIn("normal-tp-4", kinds)
+
+    def test_quad_preset_only_with_four_cards(self):
+        # 4-card heterogeneous rig: tp=4 stock preset appears (kv=4 divides);
+        # plus the tp=2 pair on the identical pair.
+        rig4 = [
+            {"name": "RTX 3080", "total_mib": 20480, "cuda_index": 1},
+            {"name": "RTX 5090", "total_mib": 32607, "cuda_index": 0},
+            {"name": "RTX 3080", "total_mib": 20480, "cuda_index": 2},
+            {"name": "RTX 4090", "total_mib": 24564, "cuda_index": 3},
+        ]
+        profs = {p.kind: p for p in flags.profiles(_REF_CFG, rig4)}
+        self.assertIn("normal-tp-2", profs)
+        self.assertIn("normal-tp-4", profs)
+        self.assertEqual(profs["normal-tp-4"].settings["tp_size"], 4)
+
+    def test_two_card_rig_unchanged(self):
+        # On a 2-card rig the plain normal-TP preset already IS the pair;
+        # no duplicate subset preset appears (guarded by ngpu > 2).
+        kinds = {p.kind for p in flags.profiles(_MOE_CFG, _HOMO_GPUS)}
+        self.assertEqual(kinds, {"single", "normal-tp"})
+
+    def test_limited_normal_tp_wording_is_neutral(self):
+        # The all-cards normal-TP entry on a non-divisible rig states the
+        # stock rule as a fact -- no scare wording.
+        profs = [p for p in flags.profiles(_REF_CFG, _REF_RIG)
+                 if p.kind == "normal-tp"]
+        info = " ".join(profs[0].info)
+        self.assertNotIn("imperfect", info)
+        self.assertNotIn("DOES NOT RUN", info)
+        self.assertIn("stock requires", info)
