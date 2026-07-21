@@ -137,6 +137,18 @@ fastokens = [
   "fastokens>=0.1.1,<0.2.0",
 ]
 
+# Offline config-planner dashboard + its "Quality benchmark" chess-SVG
+# validator (sglang.srt.planner.quality_chess). CPU-only, no GPU: python-chess
+# builds the ground-truth board and a reference SVG, cairosvg is the render
+# smoke-test, and defusedxml hardens SVG parsing against XXE (the model's SVG
+# is untrusted input). defusedxml is also pulled in transitively by cairosvg,
+# but the planner uses it directly, so it is pinned here explicitly.
+planner = [
+  "chess>=1.11.0",
+  "cairosvg>=2.7.0",
+  "defusedxml>=0.7.1",
+]
+
 test = [
   "accelerate",
   "addict",
@@ -163,6 +175,7 @@ test = [
   "pytest-cov",
   "sentence_transformers",
   "sglang[fastokens]",
+  "sglang[planner]",
   "tabulate",
 ]
 
@@ -171,6 +184,7 @@ dev = ["sglang[test]"]
 all = [
   "sglang[diffusion]",
   "sglang[http2]",
+  "sglang[planner]",
   "sglang[tracing]",
 ]
 
