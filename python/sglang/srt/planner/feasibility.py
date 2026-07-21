@@ -249,6 +249,7 @@ def plan(
     max_running_requests: Optional[int] = None,
     disable_cuda_graph: bool = False,
     host_ram_mib: Optional[int] = None,
+    include_vision: bool = True,
     with_advantage: bool = True,
 ) -> PlanResult:
     """Plan ``model_path`` on ``hardware``.
@@ -288,6 +289,7 @@ def plan(
         speculative_draft_model_path=speculative_draft_model_path,
         max_running_requests=max_running_requests,
         disable_cuda_graph=disable_cuda_graph,
+        include_vision=include_vision,
         rank_gpu_id=list(rank_gpu_id),
         effective_vram_mib=(
             [int(b) for b in rank_gpu_memory_mib]
