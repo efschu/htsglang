@@ -386,6 +386,11 @@ def _plan_to_dict(result, model_path: str) -> dict:
             if getattr(result, "roofline", None) is not None
             else None
         ),
+        "roofline_energy": (
+            dataclasses.asdict(result.roofline_energy)
+            if getattr(result, "roofline_energy", None) is not None
+            else None
+        ),
     }
 
 
@@ -469,6 +474,9 @@ def plan_from_payload(payload: dict) -> dict:
     if out["measured"] and out.get("roofline_estimate"):
         # A MEASURED entry exists -> the roofline renders as secondary.
         out["roofline_estimate"]["measured_available"] = True
+    if out["measured"] and out.get("roofline_energy"):
+        # Likewise the estimated energy yields to a measured energy entry.
+        out["roofline_energy"]["measured_available"] = True
     out["concurrency"] = concurrency
     out["include_vision"] = include_vision
     out["kv_by_concurrency"] = _kv_by_concurrency(
@@ -1275,6 +1283,8 @@ INDEX_HTML = r"""<!doctype html>
   .rf-caveats { margin: .5rem 0 0; padding-left: 1.1rem; font-size: .68rem;
                 color: #8b949e; }
   .rf-caveats li { margin: .15rem 0; }
+  .rf-energy { margin-top: .8rem; padding-top: .6rem;
+               border-top: 1px dashed #7a5c14; }
   pre { background: #161b22; border: 1px solid #232b35; border-radius: 6px;
         padding: .6rem; overflow-x: auto; font-size: .74rem; white-space: pre-wrap;
         word-break: break-word; }
@@ -1494,7 +1504,7 @@ INDEX_HTML = r"""<!doctype html>
     <div id="pricebar" class="pricebar">
       energy price
       <input id="kwh_price" type="number" step="1" min="0" value="30"
-             oninput="if (window.__lastMeasured !== undefined) renderMeasured(window.__lastMeasured); if (window.__lastHicache !== undefined) renderHicacheSaved(window.__lastHicache)">
+             oninput="if (window.__lastMeasured !== undefined) renderMeasured(window.__lastMeasured); if (window.__lastHicache !== undefined) renderHicacheSaved(window.__lastHicache); if (window.__lastRoofline !== undefined) renderRoofline(window.__lastRoofline, window.__lastRooflineEnergy)">
       <span class="muted">ct/kWh (&euro;-cent; currency-agnostic &mdash; just a
       multiplier). Costs below are in <b>ct</b>. Applies to the measured cost,
       the HiCache kWh-saved band (#147) and, later, the virtual-rig estimate
@@ -1769,7 +1779,7 @@ function render(d) {
   // #147 persistent HiCache energy-saved accumulator (read-only here)
   loadHicacheSaved();
   // roofline throughput ESTIMATE — loudly labelled rough ballpark, NOT measured
-  renderRoofline(d.roofline_estimate);
+  renderRoofline(d.roofline_estimate, d.roofline_energy);
   // launch flags
   $('flags').innerHTML = (d.launch_flags && d.launch_flags.length)
     ? '<p class="muted">launch flags (copy into your command):</p><pre>'
@@ -2010,7 +2020,9 @@ function renderHicacheSaved(d) {
   el.innerHTML = h;
 }
 
-function renderRoofline(rf) {
+function renderRoofline(rf, re) {
+  window.__lastRoofline = rf;         // cached so a price edit re-renders energy
+  window.__lastRooflineEnergy = re;
   if (!rf) { $('roofline').innerHTML = ''; return; }
   const fmt = x => Math.round(x).toLocaleString();
   let h = '<div class="roofline"><div class="rf-title">Roofline estimate '
@@ -2050,8 +2062,76 @@ function renderRoofline(rf) {
       + '</td></tr>';
   }
   h += '</table><ul class="rf-caveats">'
-    + rf.caveats.map(c => '<li>' + esc(c) + '</li>').join('') + '</ul></div>';
+    + rf.caveats.map(c => '<li>' + esc(c) + '</li>').join('') + '</ul>';
+  h += rooflineEnergyHtml(re);
+  h += '</div>';
   $('roofline').innerHTML = h;
+}
+
+// -- #148 estimated J/token (total + per card) for a VIRTUAL / planned rig ----
+// The ENERGY sibling of the throughput roofline: predicts the heterogeneous
+// efficiency gap (a virtual 5090 vs 3080) from TDP + compute + membw + the
+// uneven-DCP compute-share, BEFORE any measurement. Mirrors the MEASURED
+// per-card table layout (raw J/tok + wpw(rel)) so estimated vs measured read on
+// the same scale — but is styled as an ESTIMATE (amber, planner-estimate), NOT
+// the measured green panel. Respects the kWh-price bar for estimated ct/1M.
+function rooflineEnergyHtml(re) {
+  if (!re) return '';
+  const priceCt = getKwhPriceCt();
+  let h = '<div class="rf-energy"><div class="rf-title">Estimated energy '
+    + '(J/token) &mdash; ESTIMATE, planner-estimate provenance, NOT measured</div>'
+    + '<p class="est">Predicted from each card\'s TDP + compute + membw and its '
+    + 'uneven-DCP compute-share (shared lockstep step-time from the roofline '
+    + 'above). This PREDICTS the hetero efficiency gap before any run &mdash; a '
+    + 'faster card that finishes its shard early and waits draws less, so its '
+    + 'work-per-watt is higher. kWh/1M = J/token &divide; 3.6; cost = kWh &times; '
+    + priceCt + '&nbsp;ct/kWh.</p>';
+  if (re.measured_available)
+    h += '<p class="est"><b>A measured energy entry exists for this config '
+      + '(shown above) &mdash; this estimate is secondary.</b></p>';
+  h += rfEnergyPhase(re, 'prefill', priceCt);
+  h += rfEnergyPhase(re, 'decode', priceCt);
+  h += '<p class="est">idle floor = ' + Math.round(re.idle_fraction_of_tdp*100)
+    + '% of TDP (heuristic). ' + esc(re.caveats[re.caveats.length-1]) + '</p>';
+  h += '</div>';
+  return h;
+}
+
+// One phase (PREFILL or DECODE) of the estimated per-card energy table, laid
+// out to MATCH the measured perCardPhase: card | compute | W | J/tok (raw) |
+// wpw(rel) | kWh/1M | ct/1M, with a TOTAL row. wpw(rel) = compute-share /
+// J-per-token, rescaled so the LEAST efficient card = 1.0x (same as measured).
+function rfEnergyPhase(re, phase, priceCt) {
+  const cards = phase === 'prefill' ? re.prefill : re.decode;
+  if (!cards || !cards.length) return '';
+  const totJ = phase === 'prefill' ? re.j_per_prefill_token_total
+                                    : re.j_per_decode_token_total;
+  const t = phase === 'prefill' ? re.t_prefill_token_s : re.t_decode_token_s;
+  const effs = cards.map(c => (c.compute_share > 0 && c.j_per_token > 0)
+    ? c.compute_share / c.j_per_token : null);
+  const effMin = Math.min(...effs.filter(x => x != null && x > 0));
+  let h = '<p class="muted" style="margin:.4rem 0 .1rem"><b>' + phase.toUpperCase()
+    + '</b> &mdash; est. per card @ shared ' + (t*1000).toFixed(2)
+    + ' ms/token. <b>J/tok is RAW</b> (lockstep &mdash; same tokens on every '
+    + 'card, NOT efficiency); <b>wpw(rel)</b> = work-per-watt normalized by '
+    + 'compute-share = the predicted hetero-efficiency (least efficient = 1.0&times;).</p>';
+  h += '<table><tr><th>card</th><th>compute</th><th>util</th><th>W (est)</th>'
+    + '<th>J/tok (raw)</th><th>wpw(rel)</th><th>kWh/1M</th><th>ct/1M</th></tr>';
+  for (let i = 0; i < cards.length; i++) {
+    const c = cards[i];
+    const rel = (effs[i] != null && effMin > 0) ? (effs[i]/effMin) : null;
+    h += '<tr><td style="text-align:left">GPU ' + c.gpu_index + ' ' + esc(c.gpu_name)
+      + '</td><td>' + Math.round(c.compute_share*100) + '%</td><td>'
+      + Math.round(c.util*100) + '%</td><td>' + _f1(c.watts) + '</td><td>'
+      + _f3(c.j_per_token) + '</td><td>' + (rel != null ? rel.toFixed(2)+'&times;' : '—')
+      + '</td><td>' + _f2(c.j_per_token/3.6) + '</td><td>'
+      + _fct(jPerTokToCtPer1M(c.j_per_token, priceCt)) + '</td></tr>';
+  }
+  h += '<tr><td style="text-align:left"><b>TOTAL</b></td><td>&mdash;</td><td>&mdash;</td>'
+    + '<td>&mdash;</td><td><b>' + _f3(totJ) + '</b></td><td>&mdash;</td><td>'
+    + _f2(totJ/3.6) + '</td><td>' + _fct(jPerTokToCtPer1M(totJ, priceCt))
+    + '</td></tr></table>';
+  return h;
 }
 
 async function doIssue(kind) {

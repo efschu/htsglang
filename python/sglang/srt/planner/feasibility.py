@@ -115,6 +115,12 @@ class PlanResult:
     #: measured number). None when it cannot be sized (unknown card peaks). Typed
     #: loosely to avoid an import cycle (sglang.srt.planner.roofline).
     roofline: Optional[object] = None
+    #: Roofline ENERGY ESTIMATE (design #148) — estimated J/token total + per
+    #: physical card (from TDP + compute + membw + compute_share, reusing the
+    #: throughput roofline for the shared wall time). Same "planner-estimate"
+    #: provenance, never a measured number. None when it cannot be sized (no
+    #: throughput estimate, or a card missing a catalog TDP). Typed loosely.
+    roofline_energy: Optional[object] = None
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +434,17 @@ def plan(
             result = dataclasses.replace(result, roofline=roofline)
         except Exception:
             result = dataclasses.replace(result, roofline=None)
+
+        # Roofline ENERGY estimate (#148) — additive, same guarded discipline:
+        # estimated J/token total + per card, reusing the throughput roofline
+        # just built. Degrades to absent on any failure (unknown TDP, etc.).
+        try:
+            from sglang.srt.planner.roofline import roofline_energy
+
+            energy = roofline_energy(getattr(result, "roofline", None), inputs, hardware)
+            result = dataclasses.replace(result, roofline_energy=energy)
+        except Exception:
+            result = dataclasses.replace(result, roofline_energy=None)
     return result
 
 

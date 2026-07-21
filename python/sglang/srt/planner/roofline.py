@@ -97,8 +97,12 @@ __all__ = [
     "RankRoofline",
     "RooflineEstimate",
     "estimate_roofline",
+    "CardEnergy",
+    "RooflineEnergyEstimate",
+    "roofline_energy",
     "EFF_DECODE",
     "EFF_PREFILL",
+    "IDLE_FRACTION_OF_TDP",
     "ROOFLINE_PROVENANCE",
 ]
 
@@ -113,6 +117,21 @@ ROOFLINE_PROVENANCE = "planner-estimate"
 #: norm, and imperfect GEMM tiling (~0.5-0.7). We take the middle of each band.
 EFF_DECODE = 0.75
 EFF_PREFILL = 0.60
+
+#: Idle-power floor as a fraction of each card's TDP, for the ENERGY estimate
+#: (roofline_energy). A GPU that is powered and holding a CUDA context never
+#: drops to 0 W; under a live server process its floor sits well above the
+#: desktop-idle few-watts. We model P_idle = IDLE_FRACTION_OF_TDP * TDP and let
+#: the operating power ride between that floor and TDP with utilization
+#: (P_op = P_idle + (TDP - P_idle) * util). This is a CRUDE, documented constant
+#: — the single knob most worth calibrating against measured board power. See
+#: the calibration note in roofline_energy(). Calibrated loosely against the
+#: measured #146 board power: at 0.10 the PACE-SETTING (bottleneck) card lands
+#: within ~10% and the rig-total watts within a few %; a fixed FRACTION of TDP
+#: over-charges idle for a very-high-TDP card that a memory-bound decode never
+#: loads (the RTX 5090's absolute watts come out ~30% high), which is the
+#: dominant residual error and the reason this is flagged as a rough estimate.
+IDLE_FRACTION_OF_TDP = 0.10
 
 #: Mild extra decode discount for GGUF/marlin: weights are dequantized on the
 #: fly, so decode is pushed part-way toward compute-bound (the pure-bandwidth
@@ -232,6 +251,240 @@ class RooflineEstimate:
     #: the caller renders this estimate as SECONDARY). Default False on this rig
     #: (the measured store is empty) — the estimate then stands alone, labelled.
     measured_available: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Energy estimate (design #148) — J/token total + per-card, from TDP + compute
+# + membw + compute_share, reusing the throughput roofline for the wall time.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class CardEnergy:
+    """Per-PHYSICAL-CARD estimated energy for one phase. Ranks co-located on the
+    same physical GPU are aggregated (their memory/compute activity adds on the
+    one board that draws the power). ``compute_share`` is the uneven-DCP work
+    weight (fraction of the model on this card) — the SAME weight the measured
+    wpw column normalizes by, so measured and estimated read consistently."""
+
+    gpu_index: int
+    gpu_name: str
+    #: Fraction of the model's work on this card (aggregated rank tp-ratio).
+    compute_share: float
+    #: Estimated average board power during the op (W), between idle and TDP.
+    watts: float
+    #: Estimated energy for one token on this card (J) = watts * shared t/token.
+    j_per_token: float
+    #: Utilization heuristic that set the power (busy fraction, in [0, 1]).
+    util: float
+    tdp_w: float
+    idle_w: float
+
+
+@dataclasses.dataclass(frozen=True)
+class RooflineEnergyEstimate:
+    """A rough, explicitly-labelled per-card + total J/token ENERGY estimate
+    (design #148), the energy sibling of ``RooflineEstimate``. Same
+    ``provenance == "planner-estimate"`` discipline — a render-time derivation,
+    NEVER a measured entry, NEVER admissible into the measured results store.
+
+    The physics (all order-of-magnitude, documented in ``roofline_energy``):
+        J_per_token[card] = P_op[card] * t_per_token
+      * ``t_per_token`` is the SHARED lockstep wall time = 1 / (rig roofline
+        throughput of that phase, WITH the interconnect discount) — identical
+        for every card (all ranks step together).
+      * ``P_op[card]`` rides between an idle floor and TDP with a utilization
+        heuristic (decode ~ membw utilization, prefill ~ FLOPS utilization);
+        a fast card that finishes its shard early and waits on the slowest rank
+        draws less -> its per-work energy (J / compute_share) is lower -> the
+        heterogeneous efficiency gap is PREDICTED, not just measured."""
+
+    provenance: str
+    #: Totals (Σ over cards) — the rig J for one token of each phase.
+    j_per_prefill_token_total: float
+    j_per_decode_token_total: float
+    #: Shared lockstep wall time per token (s) for each phase (1 / rig tok/s).
+    t_prefill_token_s: float
+    t_decode_token_s: float
+    prefill: List[CardEnergy]
+    decode: List[CardEnergy]
+    idle_fraction_of_tdp: float
+    caveats: List[str]
+    #: Mirror of the throughput estimate: True only when a MEASURED energy entry
+    #: exists for this config (then the caller renders this as SECONDARY).
+    measured_available: bool = False
+
+
+def _compute_share_by_card(inputs, per_rank) -> Dict[int, float]:
+    """{gpu_index: fraction of the model's work on that card}, from the uneven
+    -TP ratio aggregated per PHYSICAL card (co-located ranks add). Even/no-ratio
+    -> each rank weighs 1/tp. This mirrors energy._compute_share_by_nvml (the
+    measured wpw normalizer) so measured vs estimated efficiency read the same
+    scale."""
+    tp = inputs.tp_size
+    ratio = inputs.rank_tp_ratio or [1] * tp
+    total = float(sum(ratio)) or 1.0
+    share: Dict[int, float] = {}
+    for r in range(tp):
+        gid = per_rank[r].gpu_index
+        share[gid] = share.get(gid, 0.0) + ratio[r] / total
+    return share
+
+
+def _phase_cards(per_rank, share_by_card, tdp_by_card, activity, eff, t_wall,
+                 idle_fraction) -> List[CardEnergy]:
+    """Build the per-physical-card energy list for one phase.
+
+    ``activity[r]`` is rank r's operation time at its OWN roofline (memory time
+    for decode, compute time for prefill) — the *undiscounted* activity time.
+    The busy fraction (utilization) is relative to the pace-setter:
+
+        util[rank] = eff * activity[rank] / max_rank(activity)      (in [0, 1])
+
+    so the SLOWEST (pace-setting) rank runs at ``eff`` (a real kernel reaches
+    only a fraction of nameplate even flat-out) and a faster co-rank that
+    finishes early and waits draws proportionally less. Deliberately does NOT
+    fold the interconnect discount into utilization: during collective waits a
+    card is blocked, near idle — that lost time lengthens ``t_wall`` (and hence
+    the energy) but should not raise the busy-power. Co-located ranks share one
+    board, so their utilizations add before the idle->TDP interpolation, then
+    the board is clamped at its TDP.
+
+        P_op[card] = P_idle[card] + (TDP[card] - P_idle[card]) * util_card
+        J_per_token[card] = P_op[card] * t_wall           (shared lockstep time)
+    """
+    max_act = max(activity) if activity else 0.0
+    # Aggregate per physical card.
+    util_by_card: Dict[int, float] = {}
+    name_by_card: Dict[int, str] = {}
+    for r, pr in enumerate(per_rank):
+        gid = pr.gpu_index
+        u = (eff * activity[r] / max_act) if max_act > 0 else 0.0
+        util_by_card[gid] = util_by_card.get(gid, 0.0) + u
+        name_by_card[gid] = pr.gpu_name
+
+    out: List[CardEnergy] = []
+    for gid in sorted(util_by_card):
+        tdp = float(tdp_by_card[gid])
+        idle = idle_fraction * tdp
+        util = min(util_by_card[gid], 1.0)  # bounded [idle, TDP]
+        watts = idle + (tdp - idle) * util
+        out.append(
+            CardEnergy(
+                gpu_index=gid,
+                gpu_name=name_by_card[gid],
+                compute_share=share_by_card.get(gid, 0.0),
+                watts=watts,
+                j_per_token=watts * t_wall,
+                util=util,
+                tdp_w=tdp,
+                idle_w=idle,
+            )
+        )
+    return out
+
+
+def roofline_energy(
+    estimate: Optional[RooflineEstimate],
+    inputs,
+    hardware,
+    *,
+    library=None,
+    measured_available: bool = False,
+) -> Optional[RooflineEnergyEstimate]:
+    """Estimated J/token (total + per physical card) for a planned config, the
+    ENERGY sibling of ``estimate_roofline``. Returns None when it cannot be sized
+    (no throughput estimate, or a card missing a TDP in the profile library).
+    NEVER raises into the plan flow — callers guard it.
+
+    Reuses ``estimate`` (the throughput roofline) for BOTH the shared per-token
+    wall time (1 / tok_s, WITH all discounts) and the per-rank activity terms
+    (bytes streamed / FLOPs per token, and the peak membw / FLOPS that were
+    used) — it does not re-derive throughput. TDP comes from the ``GpuProfile``
+    catalog (``tdp_w``); ``compute_share`` from the uneven-TP ratio."""
+    from sglang.srt.planner.profiles import ProfileLibrary
+
+    if estimate is None:
+        return None
+    library = library or ProfileLibrary()
+    per_rank = estimate.per_rank
+    tp = inputs.tp_size
+    if not per_rank or len(per_rank) != tp:
+        return None
+
+    # TDP per physical card (from the catalog). A card without a known TDP means
+    # no energy estimate for this config (like an unknown peak drops throughput).
+    tdp_by_card: Dict[int, float] = {}
+    for pr in per_rank:
+        if pr.gpu_index in tdp_by_card:
+            continue
+        prof = _profile_for(library, pr.gpu_name)
+        if prof is None or not getattr(prof, "tdp_w", None):
+            return None
+        tdp_by_card[pr.gpu_index] = float(prof.tdp_w)
+
+    share_by_card = _compute_share_by_card(inputs, per_rank)
+
+    # -- per-rank UNDISCOUNTED activity time (s) at its own roofline ----------
+    # decode: memory time = VRAM bytes streamed / peak membw (resident weights +
+    #   KV at the reference context; the offloaded PCIe slice is not a membw
+    #   term). prefill: compute time = per-token FLOPs / peak FLOPS.
+    decode_act: List[float] = []
+    prefill_act: List[float] = []
+    for pr in per_rank:
+        vram_bytes = (pr.resident_active_weight_gib + pr.kv_bytes_per_token_gib) * 2**30
+        membw = pr.peak_membw_gbs * 1e9
+        decode_act.append(vram_bytes / membw if membw > 0 else 0.0)
+        per_tok_flops = 2.0 * pr.active_gparams * 1e9
+        flops = pr.peak_flops_tflops * 1e12
+        prefill_act.append(per_tok_flops / flops if flops > 0 else 0.0)
+
+    # Shared lockstep wall time per token = 1 / rig throughput, WITH every
+    # discount (interconnect, efficiency) already baked into the roofline tok/s.
+    # Decode uses the at-reference-context (low) rate to match the KV-included
+    # activity above. A zero rate (un-sizable) -> no energy estimate.
+    if estimate.decode_tok_s_low <= 0 or estimate.prefill_tok_s <= 0:
+        return None
+    t_decode = 1.0 / estimate.decode_tok_s_low
+    t_prefill = 1.0 / estimate.prefill_tok_s
+
+    decode_cards = _phase_cards(
+        per_rank, share_by_card, tdp_by_card, decode_act,
+        estimate.eff_decode, t_decode, IDLE_FRACTION_OF_TDP,
+    )
+    prefill_cards = _phase_cards(
+        per_rank, share_by_card, tdp_by_card, prefill_act,
+        estimate.eff_prefill, t_prefill, IDLE_FRACTION_OF_TDP,
+    )
+
+    caveats = [
+        "ROUGH ENERGY BALLPARK, NOT measured — board power is estimated from "
+        "TDP and a utilization heuristic, not read from NVML. Treat J/token as "
+        "order-of-magnitude; the runtime energy module measures the real value.",
+        f"power model: P_op = idle + (TDP - idle) x util, idle = "
+        f"{IDLE_FRACTION_OF_TDP:.0%} of TDP; the pace-setting (slowest) card "
+        f"runs at util = eff (decode x{estimate.eff_decode}, prefill "
+        f"x{estimate.eff_prefill}), a faster co-rank that waits draws less.",
+        "decode util ~ membw utilization (memory-bound); prefill util ~ FLOPS "
+        "utilization (compute-bound). Utilization is bounded to [idle, TDP].",
+        "CALIBRATION vs measured #146: the bottleneck card lands within ~10% "
+        "and rig-total watts within a few %, but a fixed idle-FRACTION of TDP "
+        "over-charges idle on a very-high-TDP card a memory-bound decode never "
+        "loads (RTX 5090 absolute watts ~30% high) — the dominant residual.",
+    ]
+
+    return RooflineEnergyEstimate(
+        provenance=ROOFLINE_PROVENANCE,
+        j_per_prefill_token_total=sum(c.j_per_token for c in prefill_cards),
+        j_per_decode_token_total=sum(c.j_per_token for c in decode_cards),
+        t_prefill_token_s=t_prefill,
+        t_decode_token_s=t_decode,
+        prefill=prefill_cards,
+        decode=decode_cards,
+        idle_fraction_of_tdp=IDLE_FRACTION_OF_TDP,
+        caveats=caveats,
+        measured_available=measured_available,
+    )
 
 
 # ---------------------------------------------------------------------------
