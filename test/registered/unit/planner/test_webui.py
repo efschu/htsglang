@@ -174,14 +174,24 @@ class TestPlanAPI(WebUIFixture):
         self.assertTrue(d["fits"])
 
     def test_no_estimated_throughput_field_in_response(self):
-        # Honesty (design §3.4): the JSON the UI renders carries no
-        # throughput/tok-s field; only KV/capacity (a memory quantity).
+        # Honesty (design §3.4, refined by #145): the capacity + advantage
+        # sections carry NO throughput/tok-s field (they are memory quantities).
+        # A throughput ESTIMATE exists ONLY in the separate, clearly-labelled
+        # roofline_estimate block, which is provenance-tagged planner-estimate
+        # and never admissible into the measured store.
         d = webui.plan_from_payload(self._payload())
-        blob = json.dumps(d).lower()
-        for bad in ("tok_s", "tokps", "throughput", "decode_tok", "tok/s"):
-            self.assertNotIn(bad, blob)
+        for section in ("capacity", "advantage", "offload"):
+            blob = json.dumps(d[section]).lower()
+            for bad in ("tok_s", "tokps", "throughput", "decode_tok", "tok/s"):
+                self.assertNotIn(bad, blob)
         # measured perf is absent (manual hardware, no cached profile).
         self.assertIsNone(d["advantage"]["measured"])
+        # The roofline estimate IS present, and structurally separate/labelled.
+        rf = d["roofline_estimate"]
+        self.assertIsNotNone(rf)
+        self.assertEqual(rf["provenance"], "planner-estimate")
+        self.assertIn("decode_tok_s_low", rf)
+        self.assertFalse(rf["measured_available"])
 
 
 class TestIssueAPI(WebUIFixture):

@@ -71,9 +71,27 @@ class GpuProfile:
     pcie_width: Optional[int] = None
     nvlink: bool = False
     tdp_w: Optional[int] = None
-    #: Measured-only; None unless a submission supplied a cached probe.
+    #: Measured-only; None unless a submission supplied a cached probe. These
+    #: are the MEASURED micro-probe scores (uneven_perf's on-device GEMM /
+    #: membw benchmark) — they WIN over the nameplate peaks below when present.
     gemm_tflops: Optional[float] = None
     membw_gbs: Optional[float] = None
+    #: NAMEPLATE peak specs (public datasheet numbers), used ONLY by the
+    #: roofline throughput ESTIMATE (roofline.py) as the fallback when no
+    #: measured probe exists. Deliberately distinct from the measured
+    #: ``gemm_tflops`` / ``membw_gbs`` above — a peak is a theoretical ceiling
+    #: the hardware never actually reaches, so the roofline that consumes it is
+    #: labelled a rough ballpark, never a measured number.
+    #:   * ``peak_membw_gbs``          — HBM/GDDR peak bandwidth (GB/s).
+    #:   * ``peak_gemm_tflops_fp16``   — dense fp16/bf16 tensor-core peak
+    #:     (no 2:4 sparsity), fp32/fp16 accumulate.
+    #:   * ``peak_gemm_tflops_fp8``    — dense fp8 (E4M3) tensor-core peak;
+    #:     None on pre-Ada archs that have NO fp8 tensor cores (Ampere: an fp8
+    #:     model up-casts to the fp16 tensor path, so the roofline falls back
+    #:     to ``peak_gemm_tflops_fp16`` there).
+    peak_membw_gbs: Optional[float] = None
+    peak_gemm_tflops_fp16: Optional[float] = None
+    peak_gemm_tflops_fp8: Optional[float] = None
 
     def to_descriptor(self, index: int) -> GpuDescriptor:
         """Map to the S1 planner card. ``free_mib`` stays None — a composed /
@@ -93,28 +111,56 @@ class GpuProfile:
 #: from this system's inventory (MEMORY: hardware rig). Common consumer +
 #: datacenter cards round out the library so the explorer can compose rigs the
 #: user does not physically own.
+#: Peak specs below are NAMEPLATE datasheet numbers (dense tensor peak, no 2:4
+#: sparsity; peak GDDR/HBM bandwidth) — theoretical ceilings, ~ballpark, used
+#: only by the roofline estimate. fp8 peak is None on Ampere (sm8x: no fp8
+#: tensor cores).
 SEED_PROFILES: Dict[str, GpuProfile] = {
     p.name: p
     for p in [
         # -- this system's rig (MEMORY) ------------------------------------
-        GpuProfile("RTX 5090", 32607, "sm120", 5, 16, False, 575),
-        GpuProfile("RTX 3080 20GB", 20480, "sm86", 4, 16, False, 320),
+        GpuProfile("RTX 5090", 32607, "sm120", 5, 16, False, 575,
+                   peak_membw_gbs=1792.0, peak_gemm_tflops_fp16=419.0,
+                   peak_gemm_tflops_fp8=838.0),
+        GpuProfile("RTX 3080 20GB", 20480, "sm86", 4, 16, False, 320,
+                   peak_membw_gbs=760.0, peak_gemm_tflops_fp16=119.0),
         # -- common consumer -----------------------------------------------
-        GpuProfile("RTX 5080", 16303, "sm120", 5, 16, False, 360),
-        GpuProfile("RTX 4090", 24564, "sm89", 4, 16, False, 450),
-        GpuProfile("RTX 4080", 16376, "sm89", 4, 16, False, 320),
-        GpuProfile("RTX 3090", 24576, "sm86", 4, 16, True, 350),
-        GpuProfile("RTX 3090 Ti", 24564, "sm86", 4, 16, True, 450),
-        GpuProfile("RTX 3080", 10240, "sm86", 4, 16, False, 320),
-        GpuProfile("RTX 3060", 12288, "sm86", 4, 16, False, 170),
+        GpuProfile("RTX 5080", 16303, "sm120", 5, 16, False, 360,
+                   peak_membw_gbs=960.0, peak_gemm_tflops_fp16=225.0,
+                   peak_gemm_tflops_fp8=450.0),
+        GpuProfile("RTX 4090", 24564, "sm89", 4, 16, False, 450,
+                   peak_membw_gbs=1008.0, peak_gemm_tflops_fp16=330.0,
+                   peak_gemm_tflops_fp8=660.0),
+        GpuProfile("RTX 4080", 16376, "sm89", 4, 16, False, 320,
+                   peak_membw_gbs=717.0, peak_gemm_tflops_fp16=195.0,
+                   peak_gemm_tflops_fp8=390.0),
+        GpuProfile("RTX 3090", 24576, "sm86", 4, 16, True, 350,
+                   peak_membw_gbs=936.0, peak_gemm_tflops_fp16=142.0),
+        GpuProfile("RTX 3090 Ti", 24564, "sm86", 4, 16, True, 450,
+                   peak_membw_gbs=1008.0, peak_gemm_tflops_fp16=160.0),
+        GpuProfile("RTX 3080", 10240, "sm86", 4, 16, False, 320,
+                   peak_membw_gbs=760.0, peak_gemm_tflops_fp16=119.0),
+        GpuProfile("RTX 3060", 12288, "sm86", 4, 16, False, 170,
+                   peak_membw_gbs=360.0, peak_gemm_tflops_fp16=51.0),
         # -- workstation / datacenter --------------------------------------
-        GpuProfile("RTX A6000", 49140, "sm86", 4, 16, True, 300),
-        GpuProfile("L40S", 46068, "sm89", 4, 16, False, 350),
-        GpuProfile("A100 40GB", 40960, "sm80", 4, 16, True, 400),
-        GpuProfile("A100 80GB", 81920, "sm80", 4, 16, True, 400),
-        GpuProfile("H100 80GB", 81559, "sm90", 5, 16, True, 700),
-        GpuProfile("H200", 143771, "sm90", 5, 16, True, 700),
-        GpuProfile("MI300X", 196608, "cdna3", 5, 16, True, 750),
+        GpuProfile("RTX A6000", 49140, "sm86", 4, 16, True, 300,
+                   peak_membw_gbs=768.0, peak_gemm_tflops_fp16=155.0),
+        GpuProfile("L40S", 46068, "sm89", 4, 16, False, 350,
+                   peak_membw_gbs=864.0, peak_gemm_tflops_fp16=362.0,
+                   peak_gemm_tflops_fp8=733.0),
+        GpuProfile("A100 40GB", 40960, "sm80", 4, 16, True, 400,
+                   peak_membw_gbs=1555.0, peak_gemm_tflops_fp16=312.0),
+        GpuProfile("A100 80GB", 81920, "sm80", 4, 16, True, 400,
+                   peak_membw_gbs=2039.0, peak_gemm_tflops_fp16=312.0),
+        GpuProfile("H100 80GB", 81559, "sm90", 5, 16, True, 700,
+                   peak_membw_gbs=3350.0, peak_gemm_tflops_fp16=989.0,
+                   peak_gemm_tflops_fp8=1979.0),
+        GpuProfile("H200", 143771, "sm90", 5, 16, True, 700,
+                   peak_membw_gbs=4800.0, peak_gemm_tflops_fp16=989.0,
+                   peak_gemm_tflops_fp8=1979.0),
+        GpuProfile("MI300X", 196608, "cdna3", 5, 16, True, 750,
+                   peak_membw_gbs=5300.0, peak_gemm_tflops_fp16=1307.0,
+                   peak_gemm_tflops_fp8=2614.0),
     ]
 }
 
