@@ -279,6 +279,16 @@ class CardEnergy:
     util: float
     tdp_w: float
     idle_w: float
+    #: Where the idle/active power ANCHORS came from. ``"estimate-tdp"`` (the
+    #: default): idle = IDLE_FRACTION_OF_TDP x TDP and the dynamic ceiling is
+    #: TDP — the crude heuristic, for a VIRTUAL / unmeasured card. ``"measured"``:
+    #: the anchors are this exact physical card's NVML-measured board power
+    #: (power_calibration), so the estimate is exact for the real rig and only
+    #: VIRTUAL cards stay estimated (measured-overrides-estimate).
+    power_source: str = "estimate-tdp"
+    #: Upper power anchor the util rides toward (W): TDP for the heuristic, or
+    #: the measured membw/gemm active draw for a measured card.
+    active_anchor_w: Optional[float] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -332,7 +342,7 @@ def _compute_share_by_card(inputs, per_rank) -> Dict[int, float]:
 
 
 def _phase_cards(per_rank, share_by_card, tdp_by_card, activity, eff, t_wall,
-                 idle_fraction) -> List[CardEnergy]:
+                 idle_fraction, anchors_by_card=None) -> List[CardEnergy]:
     """Build the per-physical-card energy list for one phase.
 
     ``activity[r]`` is rank r's operation time at its OWN roofline (memory time
@@ -347,12 +357,20 @@ def _phase_cards(per_rank, share_by_card, tdp_by_card, activity, eff, t_wall,
     fold the interconnect discount into utilization: during collective waits a
     card is blocked, near idle — that lost time lengthens ``t_wall`` (and hence
     the energy) but should not raise the busy-power. Co-located ranks share one
-    board, so their utilizations add before the idle->TDP interpolation, then
-    the board is clamped at its TDP.
+    board, so their utilizations add before the idle->active interpolation, then
+    the board is clamped at its active ceiling.
 
-        P_op[card] = P_idle[card] + (TDP[card] - P_idle[card]) * util_card
+        P_op[card] = P_idle[card] + (P_active[card] - P_idle[card]) * util_card
         J_per_token[card] = P_op[card] * t_wall           (shared lockstep time)
+
+    ``anchors_by_card[gid] = (idle_w, active_w, source)`` supplies the two power
+    ANCHORS per physical card. When a card was MEASURED (power_calibration),
+    ``idle_w`` / ``active_w`` are its NVML-measured idle and membw/gemm active
+    draw — so the real rig reads exact. When absent, the anchors fall back to the
+    crude heuristic ``idle = idle_fraction x TDP`` and ``active = TDP`` — the
+    estimate for a VIRTUAL / unmeasured card (measured-overrides-estimate).
     """
+    anchors_by_card = anchors_by_card or {}
     max_act = max(activity) if activity else 0.0
     # Aggregate per physical card.
     util_by_card: Dict[int, float] = {}
@@ -366,9 +384,14 @@ def _phase_cards(per_rank, share_by_card, tdp_by_card, activity, eff, t_wall,
     out: List[CardEnergy] = []
     for gid in sorted(util_by_card):
         tdp = float(tdp_by_card[gid])
-        idle = idle_fraction * tdp
-        util = min(util_by_card[gid], 1.0)  # bounded [idle, TDP]
-        watts = idle + (tdp - idle) * util
+        anchor = anchors_by_card.get(gid)
+        if anchor is not None:
+            idle, active, source = anchor
+        else:
+            # Heuristic fallback for a virtual / unmeasured card.
+            idle, active, source = idle_fraction * tdp, tdp, "estimate-tdp"
+        util = min(util_by_card[gid], 1.0)  # bounded [idle, active]
+        watts = idle + (active - idle) * util
         out.append(
             CardEnergy(
                 gpu_index=gid,
@@ -379,8 +402,67 @@ def _phase_cards(per_rank, share_by_card, tdp_by_card, activity, eff, t_wall,
                 util=util,
                 tdp_w=tdp,
                 idle_w=idle,
+                power_source=source,
+                active_anchor_w=active,
             )
         )
+    return out
+
+
+#: Sentinel: roofline_energy auto-loads the MEASURED power table from the
+#: default persisted path. Pass ``power_profile=None`` (or an explicit dict) to
+#: override — tests pass ``{}`` to force the heuristic hermetically.
+_AUTO_POWER = object()
+
+#: Hardware sources that describe a LIVE, physically-present rig — only then is
+#: an arch-level (not UUID-exact) power match allowed. A ``manual`` / ``json``
+#: spec (virtual rig, unit tests) never picks up a measured entry by arch, so
+#: the heuristic path stays hermetic regardless of what is cached on disk.
+_LIVE_HW_SOURCES = ("pynvml", "nvml", "nvidia-smi")
+
+
+def _measured_power_by_card(hardware, per_rank, library, power_profile, phase):
+    """{gpu_index: (idle_w, active_w, "measured")} for cards that have a MEASURED
+    power row, matched by NVML UUID (always) or, on a live rig, by sm-arch. The
+    active anchor is the phase-relevant measured draw: membw (decode) / gemm
+    (prefill). Cards with no measurement are simply absent -> the caller keeps
+    the heuristic for them. Never raises."""
+    if not power_profile:
+        return {}
+    try:
+        from sglang.srt.planner.power_calibration import (
+            _norm_uuid,
+            power_profile_by_arch,
+        )
+    except Exception:
+        return {}
+
+    by_uuid = {_norm_uuid(u): m for u, m in power_profile.items()}
+    use_arch = getattr(hardware, "source", None) in _LIVE_HW_SOURCES
+    by_arch = power_profile_by_arch(power_profile) if use_arch else {}
+
+    out: Dict[int, tuple] = {}
+    for pr in per_rank:
+        gid = pr.gpu_index
+        if gid in out:
+            continue
+        try:
+            card = hardware.gpu(gid)
+        except Exception:
+            continue
+        m = None
+        uu = getattr(card, "uuid", None)
+        if uu:
+            m = by_uuid.get(_norm_uuid(uu))
+        if m is None and by_arch:
+            prof = _profile_for(library, card.name)
+            arch = getattr(prof, "sm_arch", None) if prof else None
+            if arch:
+                m = by_arch.get(arch)
+        if m is None:
+            continue
+        active = m.p_gemm_w if phase == "prefill" else m.p_membw_w
+        out[gid] = (float(m.p_idle_w), float(active), "measured")
     return out
 
 
@@ -391,6 +473,7 @@ def roofline_energy(
     *,
     library=None,
     measured_available: bool = False,
+    power_profile=_AUTO_POWER,
 ) -> Optional[RooflineEnergyEstimate]:
     """Estimated J/token (total + per physical card) for a planned config, the
     ENERGY sibling of ``estimate_roofline``. Returns None when it cannot be sized
@@ -411,6 +494,18 @@ def roofline_energy(
     tp = inputs.tp_size
     if not per_rank or len(per_rank) != tp:
         return None
+
+    # MEASURED power table (power_calibration): auto-load from disk unless the
+    # caller supplied one (tests pass {} to force the heuristic hermetically).
+    # It OVERRIDES the TDP heuristic for the cards it recognises (by UUID/arch);
+    # every other card keeps the estimate. Best-effort — never fatal.
+    if power_profile is _AUTO_POWER:
+        try:
+            from sglang.srt.planner.power_calibration import load_power_profile
+
+            power_profile = load_power_profile()
+        except Exception:
+            power_profile = {}
 
     # TDP per physical card (from the catalog). A card without a known TDP means
     # no energy estimate for this config (like an unknown peak drops throughput).
@@ -448,13 +543,21 @@ def roofline_energy(
     t_decode = 1.0 / estimate.decode_tok_s_low
     t_prefill = 1.0 / estimate.prefill_tok_s
 
+    decode_anchors = _measured_power_by_card(
+        hardware, per_rank, library, power_profile, "decode")
+    prefill_anchors = _measured_power_by_card(
+        hardware, per_rank, library, power_profile, "prefill")
+    any_measured = bool(decode_anchors or prefill_anchors)
+
     decode_cards = _phase_cards(
         per_rank, share_by_card, tdp_by_card, decode_act,
         estimate.eff_decode, t_decode, IDLE_FRACTION_OF_TDP,
+        anchors_by_card=decode_anchors,
     )
     prefill_cards = _phase_cards(
         per_rank, share_by_card, tdp_by_card, prefill_act,
         estimate.eff_prefill, t_prefill, IDLE_FRACTION_OF_TDP,
+        anchors_by_card=prefill_anchors,
     )
 
     caveats = [
@@ -472,6 +575,17 @@ def roofline_energy(
         "over-charges idle on a very-high-TDP card a memory-bound decode never "
         "loads (RTX 5090 absolute watts ~30% high) — the dominant residual.",
     ]
+    if any_measured:
+        measured_gids = sorted(set(decode_anchors) | set(prefill_anchors))
+        caveats.insert(0, (
+            "MEASURED power anchors in use for card(s) "
+            f"{measured_gids}: their idle / active watts are NVML board-power "
+            "measurements (power_calibration), NOT the TDP heuristic — the "
+            "power for these physical cards is exact (measured-overrides"
+            "-estimate); any remaining card still uses the TDP estimate. The "
+            "wall-time (tok/s) is still a roofline estimate, so J/token remains "
+            "an estimate, but a far tighter one on the measured cards."
+        ))
 
     return RooflineEnergyEstimate(
         provenance=ROOFLINE_PROVENANCE,
