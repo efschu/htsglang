@@ -3104,33 +3104,47 @@ async function loadModels() {
   try {
     const r = await fetch('/api/models'); const d = await r.json();
     if (!d.ok) { $('models_out').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; return; }
-    let h = '<div class="muted" style="margin-bottom:.4rem">'+d.models.length+' models in '+esc(d.roots.join(', '))+'</div>';
-    h += '<table class="mx"><tr><th>name</th><th>fmt</th><th>quant</th><th>vision</th><th>size</th><th></th></tr>';
-    for (const m of d.models) {
-      const err = m.error ? ' <span class="nofitc" title="'+esc(m.error)+'">(err)</span>' : '';
-      let pick = '';
-      if (m.gguf_variants && m.gguf_variants.length>1) {
-        pick = '<select style="font-size:.7rem" onchange="pickModel('+"'"+esc(m.path)+"'"+',this.value,'+"'gguf'"+')">'
-             + m.gguf_variants.map(v=>'<option value="'+esc(v.filename)+'">'+esc(v.quant)+' ('+v.size_gib+'G)</option>').join('')
-             + '</select>';
-      }
-      const useBtn = '<button class="mini secondary" onclick="pickModel('+"'"+esc(m.path)+"'"+','
-             + (m.gguf_variants&&m.gguf_variants.length===1?"'"+esc(m.gguf_variants[0].filename)+"'":'null')+','
-             + "'"+esc(m.format)+"'"+')">use</button>';
-      h += '<tr><td style="text-align:left" title="'+esc(m.path)+'">'+esc(m.name)+err+'</td>'
-         + '<td>'+esc(m.format)+'</td><td>'+esc(m.quant_method)+'</td>'
-         + '<td>'+(m.vision?'yes':'—')+'</td><td>'+m.size_gib+'G</td>'
-         + '<td style="text-align:left">'+pick+' '+useBtn+'</td></tr>';
-    }
-    h += '</table>';
-    $('models_out').innerHTML = h;
+    window._models = d.models;
+    const opts = d.models.map((m,i)=>{
+      const q = (m.quant_method && m.quant_method!=='None') ? ' · '+esc(m.quant_method) : '';
+      const vv = (m.gguf_variants && m.gguf_variants.length>1) ? ' · '+m.gguf_variants.length+' quants' : '';
+      const err = m.error ? ' · (err)' : '';
+      return '<option value="'+i+'">'+esc(m.name)+'  ['+esc(m.format)+q+' · '+m.size_gib+'G]'+vv+err+'</option>';
+    }).join('');
+    $('models_out').innerHTML =
+      '<div class="muted" style="margin-bottom:.3rem">'+d.models.length+' models · '+esc(d.roots.join(', '))+'</div>'
+      + '<select id="model_select" style="width:100%;max-width:100%" onchange="pickFromDropdown()">'
+      + '<option value="">— select a model —</option>' + opts + '</select>'
+      + '<div id="model_variant_wrap" style="display:none;margin-top:.4rem">'
+      + '<label>GGUF quant</label>'
+      + '<select id="model_variant_select" style="width:100%;max-width:100%" onchange="applyVariant()"></select></div>'
+      + '<div id="model_info" class="muted" style="margin-top:.4rem;word-break:break-all"></div>';
   } catch(e) { $('models_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
 }
-function pickModel(path, variant, fmt) {
-  $('sv_model').value = path;
-  $('sv_format').value = fmt;
-  $('sv_variant').value = variant && variant!=='null' ? variant : '';
-  $('sv_out').innerHTML = 'selected <b>'+esc(path)+'</b>'+(variant&&variant!=='null'?' / '+esc(variant):'');
+function pickFromDropdown() {
+  const i = $('model_select').value;
+  const wrap = $('model_variant_wrap');
+  if (i==='') { wrap.style.display='none'; $('model_info').innerHTML=''; return; }
+  const m = window._models[+i];
+  $('sv_model').value = m.path;
+  $('sv_format').value = m.format;
+  if (m.gguf_variants && m.gguf_variants.length>1) {
+    $('model_variant_select').innerHTML = m.gguf_variants
+      .map(v=>'<option value="'+esc(v.filename)+'">'+esc(v.quant)+' ('+v.size_gib+'G)</option>').join('');
+    wrap.style.display=''; applyVariant();
+  } else {
+    wrap.style.display='none';
+    $('sv_variant').value = (m.gguf_variants && m.gguf_variants.length===1) ? m.gguf_variants[0].filename : '';
+  }
+  const info = [];
+  if (m.quant_method && m.quant_method!=='None') info.push('quant '+esc(m.quant_method));
+  info.push(m.size_gib+' GiB'); if (m.vision) info.push('vision');
+  if (m.error) info.push('<span class="nofitc" title="'+esc(m.error)+'">error</span>');
+  $('model_info').innerHTML = '<b>'+esc(m.name)+'</b> — '+info.join(' · ')+'<br>'+esc(m.path);
+}
+function applyVariant() {
+  $('sv_variant').value = $('model_variant_select').value || '';
+  $('sv_format').value = 'gguf';
 }
 function serverSettings() {
   return {
