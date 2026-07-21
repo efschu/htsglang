@@ -817,8 +817,39 @@ def _gguf_config_and_families(path: str) -> dict:
     else:
         intermediate = int(need("feed_forward_length"))
     q_heads = int(need("attention.head_count"))
-    kv_heads = int(need("attention.head_count_kv"))
-    head_dim = int(opt("attention.key_length", hidden // max(q_heads, 1)))
+    # Head geometry: prefer the ACTUAL attention projection tensors (ground
+    # truth) over the header scalars, which some arches report inconsistently.
+    # Gemma4 GGUFs omit head_count_kv entirely AND report a key_length (512)
+    # that disagrees with the real attn_q width (4096 for head_count=16, i.e.
+    # head_dim 256, not 512). Trusting the scalars would require a missing key
+    # (hard error) and, if defaulted naively, 4x the KV-cache size + 2x the
+    # q-proj mass. The weight tensors settle it unambiguously.
+    def _blk0_out(sub: str):
+        for t in tensors:
+            n = t["name"]
+            if n.startswith("blk.0.") and f"{sub}." in n and n.endswith(".weight"):
+                d = t.get("dims") or []
+                return int(d[-1]) if d else None  # GGML weight dims = [in, out]
+        return None
+
+    q_out = _blk0_out("attn_q")
+    if q_out and q_heads and q_out % q_heads == 0:
+        head_dim = q_out // q_heads
+    else:
+        head_dim = int(opt("attention.key_length", hidden // max(q_heads, 1)))
+    kv_meta = scalars.get(f"{arch}.attention.head_count_kv")
+    if kv_meta is not None:
+        kv_heads = int(kv_meta)
+    else:
+        # head_count_kv absent (Gemma4 etc.): derive the GQA group count from
+        # the real attn_k projection width; fall back to MHA (== q_heads) only
+        # if the tensor is unavailable (fused QKV / unusual naming).
+        k_out = _blk0_out("attn_k")
+        kv_heads = (
+            k_out // head_dim
+            if (k_out and head_dim and k_out % head_dim == 0)
+            else q_heads
+        )
     block_count = int(need("block_count"))
     nextn = int(opt("nextn_predict_layers", 0) or 0)
     n_layers = block_count - nextn  # nextn/MTP block is not a base layer
