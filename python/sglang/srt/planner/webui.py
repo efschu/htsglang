@@ -3274,6 +3274,17 @@ INDEX_HTML = r"""<!doctype html>
 
 
 <div id="view_quality" style="display:none">
+  <!-- User-facing reminder (self-note, intentionally prominent): the test
+       design stems from the linked reddit thread; before making this
+       feature public, ask there whether using the test is OK. -->
+  <div id="quality_permission_note" style="border:1px solid #e3a008;
+       background:#241a06; color:#e3b341; border-radius:8px;
+       padding:.5rem .7rem; margin:.2rem 0 .6rem; font-size:.8rem">
+    <b>ERINNERUNG:</b> Vor Veroeffentlichung im
+    <a href="https://www.reddit.com/r/LocalLLaMA/comments/1t53dhp/quality_comparison_between_qwen_36_27b/"
+       target="_blank">Reddit-Beitrag</a> nachfragen, ob die Nutzung dieses
+    Tests ok ist.
+  </div>
   <div class="sub">ONESHOT chess-SVG quality benchmark (<a href="https://www.reddit.com/r/LocalLLaMA/comments/1t53dhp/quality_comparison_between_qwen_36_27b/" target="_blank">reddit reference</a>).
     The model is asked to render the position after <code>7. h4</code> as SVG,
     highlighting the last move. The model is called <b>backend-side</b> (never
