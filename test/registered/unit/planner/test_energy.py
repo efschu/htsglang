@@ -136,5 +136,57 @@ class TestConfig(unittest.TestCase):
         self.assertFalse(cfg.disable_cuda_graph)
 
 
+class TestMtpConfig(unittest.TestCase):
+    def test_mtp_launch_command_has_spec_stack(self):
+        from sglang.srt.planner.energy import mtp_config
+
+        joined = " ".join(mtp_config().launch_command())
+        self.assertIn("--speculative-algorithm NEXTN", joined)
+        self.assertIn("--speculative-num-steps 5", joined)   # ceiling k=5
+        self.assertIn("--speculative-eagle-topk 1", joined)  # chain
+        self.assertIn("--speculative-num-draft-tokens 6", joined)  # steps+1
+        self.assertIn("--speculative-adaptive", joined)
+        self.assertIn("--speculative-adaptive-config high-accept", joined)
+        self.assertNotIn("--disable-cuda-graph", joined)     # graphs ON
+        self.assertEqual(mtp_config().label, "MTP+adaptive")
+
+    def test_spec_entry_carries_label_and_accept(self):
+        from sglang.srt.planner.energy import mtp_config
+
+        cfg = mtp_config()
+        bm = _bm("code", 1, 0.5, 6.8)
+        bm.accept_length = 3.1
+        bm.accept_rate = 0.72
+        r = MeasurementResult(
+            config=cfg,
+            hardware_cards=[(1, "RTX 5090", 32607), (2, "RTX 3080", 20480)],
+            gpu_names_sampled=["RTX 5090", "RTX 3080", "RTX 3080"],
+            measurements=[bm], idle_watts=330.0,
+            launch_flags=cfg.launch_command()[3:],
+            label="MTP+adaptive",
+            server_avg_accept_length=3.34,
+            compute_share_by_card=[0.46, 0.27, 0.27],
+        )
+        e = r.result_entries()[0]
+        store = ResultsStore()
+        self.assertIsNone(store.try_ingest(e))  # passes the guard
+        self.assertEqual(e.config_label, "MTP+adaptive")
+        self.assertEqual(e.spec_accept_length_by_bucket, {1: 3.1})
+
+    def test_compare_summary_reports_multiplier(self):
+        from sglang.srt.planner.energy import compare_summary, validation_config
+
+        def result(label, dec):
+            bm = _bm("code", 1, 0.4, 4.0)
+            bm.decode_tok_s = dec
+            return MeasurementResult(
+                config=validation_config(), hardware_cards=[(1, "X", 1)],
+                gpu_names_sampled=["a", "b", "c"], measurements=[bm],
+                idle_watts=1.0, launch_flags=[], label=label)
+        txt = compare_summary(result("no-MTP baseline", 40.0),
+                              result("MTP+adaptive", 100.0))
+        self.assertIn("2.50x", txt)
+
+
 if __name__ == "__main__":
     unittest.main()

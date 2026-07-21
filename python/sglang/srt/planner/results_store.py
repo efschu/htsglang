@@ -204,6 +204,12 @@ class ResultEntry:
     #: decode is content-independent, so code≈prose here; the label exists so a
     #: future MTP-on run (spec accepts code better -> faster) can be compared.
     workload: Optional[str] = None
+    #: config label distinguishing sibling rows for the SAME model/hardware
+    #: (e.g. "no-MTP baseline" vs "MTP+adaptive"); the dashboard groups by it.
+    config_label: Optional[str] = None
+    #: MTP/spec accept length per bucket (output tokens per target forward = the
+    #: measured multiplier). None for a non-speculative row.
+    spec_accept_length_by_bucket: Optional[Dict[int, float]] = None
     #: per-batch-size-bucket throughput curves {bucket: tok/s}; NOT a scalar.
     prefill_tok_s_by_bucket: Optional[Dict[int, float]] = None
     decode_tok_s_by_bucket: Optional[Dict[int, float]] = None

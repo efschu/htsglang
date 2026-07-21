@@ -149,6 +149,18 @@ class MeasurementConfig:
     context_length: int = 8192
     max_running_requests: int = 16
     quant_label: str = "fp8"  # for the results-store QuantDescriptor
+    #: human label distinguishing this row from siblings (e.g. "no-MTP
+    #: baseline" vs "MTP+adaptive"). Stored on every ResultEntry as config_label
+    #: so the dashboard shows both rows side by side.
+    label: str = "baseline"
+    # -- speculative decoding (MTP / adaptive draft) ---------------------
+    speculative_algorithm: Optional[str] = None  # e.g. "NEXTN"
+    speculative_num_steps: Optional[int] = None
+    speculative_eagle_topk: Optional[int] = None
+    speculative_num_draft_tokens: Optional[int] = None
+    speculative_adaptive: bool = False
+    speculative_adaptive_config: Optional[str] = None  # "high-accept"
+    speculative_adaptive_graph_memory: Optional[str] = None  # "auto" default
     #: batch buckets to sweep (concurrent request counts).
     buckets: Sequence[int] = (1, 4, 16)
     workloads: Sequence[Workload] = (CODE_WORKLOAD, PROSE_WORKLOAD)
@@ -189,6 +201,22 @@ class MeasurementConfig:
             c += ["--disable-custom-all-reduce"]
         if self.disable_cuda_graph:
             c += ["--disable-cuda-graph"]
+        if self.speculative_algorithm:
+            c += ["--speculative-algorithm", self.speculative_algorithm]
+        if self.speculative_num_steps is not None:
+            c += ["--speculative-num-steps", str(self.speculative_num_steps)]
+        if self.speculative_eagle_topk is not None:
+            c += ["--speculative-eagle-topk", str(self.speculative_eagle_topk)]
+        if self.speculative_num_draft_tokens is not None:
+            c += ["--speculative-num-draft-tokens",
+                  str(self.speculative_num_draft_tokens)]
+        if self.speculative_adaptive:
+            c += ["--speculative-adaptive"]
+        if self.speculative_adaptive_config:
+            c += ["--speculative-adaptive-config", self.speculative_adaptive_config]
+        if self.speculative_adaptive_graph_memory:
+            c += ["--speculative-adaptive-graph-memory",
+                  self.speculative_adaptive_graph_memory]
         c += list(self.extra_flags)
         return c
 
@@ -225,6 +253,12 @@ class BucketMeasurement:
     per_card_j_per_decode_token: List[float] = dataclasses.field(default_factory=list)
     per_card_avg_prefill_watts: List[float] = dataclasses.field(default_factory=list)
     per_card_avg_decode_watts: List[float] = dataclasses.field(default_factory=list)
+    #: MTP/spec: avg verify forwards per request and the resulting accept length
+    #: (output tokens per target forward = the measured MTP multiplier). None
+    #: when speculative decoding is off.
+    spec_verify_ct: Optional[float] = None
+    accept_length: Optional[float] = None
+    accept_rate: Optional[float] = None  # correct drafts / proposed (no bonus)
 
     def kwh_per_1m_prefill(self) -> float:
         return self.j_per_prefill_token / 3.6
@@ -241,6 +275,13 @@ class MeasurementResult:
     measurements: List[BucketMeasurement]
     idle_watts: float
     launch_flags: List[str]
+    label: str = "baseline"
+    #: Server-reported cumulative avg_spec_accept_length (authoritative, from
+    #: /server_info) — output tokens accepted per target forward. None w/o spec.
+    server_avg_accept_length: Optional[float] = None
+    #: Adaptive controller's settled step (k) trajectory, parsed from the boot
+    #: log: {k: times_switched_to_it}. Shows which depth the controller picks.
+    adaptive_step_hist: Optional[Dict[int, int]] = None
     #: Per-NVML-card compute/weight share from the uneven-TP ratio (fraction of
     #: the model each physical card holds+computes), aligned to
     #: gpu_names_sampled. Lets the reader see whether a card draws more power
@@ -270,6 +311,8 @@ class MeasurementResult:
             decode_tps = {m.bucket: m.decode_tok_s for m in ms}
             j_pre = {m.bucket: m.j_per_prefill_token for m in ms}
             j_dec = {m.bucket: m.j_per_decode_token for m in ms}
+            accept = {m.bucket: m.accept_length for m in ms
+                      if m.accept_length is not None} or None
             gpu_names = ms[0].gpu_names if ms else self.gpu_names_sampled
             per_card_energy = {
                 "gpu_names": list(gpu_names),
@@ -300,6 +343,8 @@ class MeasurementResult:
                 j_per_prefill_token_by_bucket=j_pre,
                 j_per_decode_token_by_bucket=j_dec,
                 per_card_energy=per_card_energy,
+                config_label=self.label,
+                spec_accept_length_by_bucket=accept,
                 kv_cache_dtype=self.config.kv_cache_dtype,
             ))
         return entries
@@ -403,6 +448,27 @@ def _nvml_name(name) -> str:
     return name.decode() if isinstance(name, bytes) else str(name)
 
 
+def _venv_cuda_lib_dirs(python_exe: str) -> List[str]:
+    """The venv's bundled NVIDIA/torch shared-lib dirs (libcudart.so.13,
+    libnvrtc.so.13, ...), so a RE-EXEC'd worker python finds them at interpreter
+    startup (before torch's rpath is set up). Globs
+    ``<venv>/lib/python*/site-packages/{nvidia/*/lib,torch/lib}``."""
+    import glob
+
+    base = os.path.dirname(os.path.dirname(os.path.abspath(python_exe)))  # venv/
+    dirs = []
+    for pat in ("lib/python*/site-packages/nvidia/*/lib",
+                "lib/python*/site-packages/torch/lib"):
+        dirs += sorted(glob.glob(os.path.join(base, pat)))
+    # De-dup, keep existing order, only real dirs.
+    seen, out = set(), []
+    for d in dirs:
+        if d not in seen and os.path.isdir(d):
+            seen.add(d)
+            out.append(d)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # The harness.
 # ---------------------------------------------------------------------------
@@ -426,6 +492,19 @@ class EnergyHarness:
     def boot(self):
         env = dict(os.environ)
         env.setdefault("PYTHONPATH", "/spinning/wt-integration-r2/python")
+        # --rank-gpu-id forces SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS, which
+        # RE-EXECs each scheduler (and, under spec decoding, extra draft
+        # workers) as a fresh python. A fresh interpreter loads libcudart before
+        # torch sets up its rpath, so it dies with exit 127 ("error while
+        # loading shared libraries: libcudart.so.13") unless the venv's bundled
+        # CUDA libs are on LD_LIBRARY_PATH. Inject them so the re-exec'd workers
+        # find them (the baseline sometimes forks and survives; the spec path
+        # re-execs and does not).
+        ld = _venv_cuda_lib_dirs(self.cfg.python_exe)
+        if ld:
+            existing = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(
+                ld + ([existing] if existing else []))
         env.update({k: str(v) for k, v in self.cfg.extra_env.items()})
         cmd = self.cfg.launch_command()
         self._log_file = open(self._log_path, "w")
@@ -541,6 +620,9 @@ class EnergyHarness:
         t_first = None
         prompt_tokens = 0
         completion_tokens = 0
+        spec_verify_ct = 0
+        spec_correct = 0
+        spec_proposed = 0
         with urllib.request.urlopen(req, timeout=600) as resp:
             for raw in resp:
                 line = raw.decode("utf-8", "replace").strip()
@@ -561,12 +643,20 @@ class EnergyHarness:
                     completion_tokens = ct
                 if meta.get("prompt_tokens"):
                     prompt_tokens = meta["prompt_tokens"]
+                if meta.get("spec_verify_ct"):
+                    spec_verify_ct = meta["spec_verify_ct"]
+                if meta.get("spec_num_correct_drafts") is not None:
+                    spec_correct = meta["spec_num_correct_drafts"]
+                if meta.get("spec_num_proposed_drafts") is not None:
+                    spec_proposed = meta["spec_num_proposed_drafts"]
         t_done = time.time()
         if t_first is None:
             t_first = t_done
         return {
             "t_send": t_send, "t_first": t_first, "t_done": t_done,
             "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "spec_verify_ct": spec_verify_ct,
+            "spec_correct": spec_correct, "spec_proposed": spec_proposed,
         }
 
     def _run_concurrent(self, prompt: str, max_new: int, n: int) -> List[dict]:
@@ -610,13 +700,15 @@ class EnergyHarness:
             for bucket in self.cfg.buckets:
                 bm = self._measure_point(wl, bucket)
                 measurements.append(bm)
+                acc = (f" accept={bm.accept_length:.2f}"
+                       if bm.accept_length is not None else "")
                 print(
                     f"[energy] {wl.name:5s} bs={bucket:<3d} "
                     f"prefill {bm.prefill_tok_s:8.1f} tok/s "
                     f"{bm.j_per_prefill_token:6.3f} J/tok | "
                     f"decode {bm.decode_tok_s:7.1f} tok/s "
                     f"{bm.j_per_decode_token:6.3f} J/tok "
-                    f"({bm.avg_decode_watts:.0f} W)", flush=True)
+                    f"({bm.avg_decode_watts:.0f} W){acc}", flush=True)
 
         self.sampler.stop()
         hardware_cards = _hardware_cards()
@@ -628,9 +720,52 @@ class EnergyHarness:
             measurements=measurements,
             idle_watts=idle_watts,
             launch_flags=self.cfg.launch_command()[3:],  # drop python -m module
+            label=self.cfg.label,
+            server_avg_accept_length=self._query_server_accept(),
+            adaptive_step_hist=self._parse_adaptive_steps(),
             compute_share_by_card=share,
             notes=self.notes,
         )
+
+    def _query_server_accept(self) -> Optional[float]:
+        """Cumulative avg_spec_accept_length from /server_info (authoritative
+        server-side counter). None when spec is off / unavailable."""
+        try:
+            with urllib.request.urlopen(self.base_url + "/server_info",
+                                        timeout=10) as r:
+                info = json.loads(r.read())
+            states = info.get("internal_states") or []
+            vals = [s.get("avg_spec_accept_length") for s in states
+                    if s.get("avg_spec_accept_length") is not None]
+            return sum(vals) / len(vals) if vals else None
+        except Exception as e:
+            self.notes.append(f"server accept-length query failed: {e}")
+            return None
+
+    def _parse_adaptive_steps(self) -> Optional[Dict[int, int]]:
+        """Parse the boot log for the adaptive controller's step (k) picks:
+        'Adaptive spec params updated: steps X -> Y (...)'. Returns {k: count of
+        switches INTO k} so the report shows which depth it settles on."""
+        if not self.cfg.speculative_adaptive:
+            return None
+        import re
+        hist: Dict[int, int] = {}
+        try:
+            with open(self._log_path) as f:
+                for line in f:
+                    m = re.search(r"Adaptive spec params updated: steps \d+ -> "
+                                  r"(\d+)", line)
+                    if m:
+                        k = int(m.group(1))
+                        hist[k] = hist.get(k, 0) + 1
+                    mi = re.search(r"AdaptiveSpeculativeParams initialized: "
+                                   r"steps=(\d+)", line)
+                    if mi:
+                        k = int(mi.group(1))
+                        hist.setdefault(k, 0)
+        except Exception:
+            pass
+        return hist or None
 
     def _measure_point(self, wl: Workload, bucket: int) -> BucketMeasurement:
         # brief settle so the previous bucket's power tail does not bleed in.
@@ -647,6 +782,20 @@ class EnergyHarness:
         decode_tokens = int(round(
             sum(r["completion_tokens"] for r in res) / len(res)))
         n = len(res)
+
+        # MTP/spec: accept length = output tokens per target-model verify
+        # forward (= the measured multiplier); accept rate = correct drafts /
+        # proposed drafts (strict, no bonus). None when spec is off.
+        spec_verify_ct = accept_length = accept_rate = None
+        total_verify = sum(r.get("spec_verify_ct") or 0 for r in res)
+        if total_verify > 0:
+            total_out = sum(r["completion_tokens"] for r in res)
+            total_correct = sum(r.get("spec_correct") or 0 for r in res)
+            total_proposed = sum(r.get("spec_proposed") or 0 for r in res)
+            spec_verify_ct = total_verify / n
+            accept_length = total_out / total_verify
+            accept_rate = (total_correct / total_proposed
+                           if total_proposed > 0 else None)
 
         prefill_time = max(t_prefill_end - t_send, 1e-6)
         decode_time = max(t_done - t_prefill_end, 1e-6)
@@ -676,6 +825,8 @@ class EnergyHarness:
             per_card_j_per_decode_token=_per_tok(pc_dec_j, total_decode),
             per_card_avg_prefill_watts=list(pc_pre_w),
             per_card_avg_decode_watts=list(pc_dec_w),
+            spec_verify_ct=spec_verify_ct, accept_length=accept_length,
+            accept_rate=accept_rate,
         )
 
 
@@ -767,12 +918,22 @@ def run_measurement(config: MeasurementConfig) -> MeasurementResult:
 # ---------------------------------------------------------------------------
 
 
-def summarize(result: MeasurementResult) -> str:
+def summarize(result: MeasurementResult, price_ct_per_kwh: float = 30.0) -> str:
+    """Full results view. PREFILL and DECODE are shown as SEPARATE, self-
+    contained blocks (each with tok/s + J/tok + kWh/1M + ct/1M) — never summed
+    into one number, because prefill (compute, amortized over the prompt) and
+    decode (memory-bound, per output token) have very different per-token cost.
+    ``price_ct_per_kwh`` converts kWh/1M -> ct/1M."""
+    def ct1m(j):  # J/token -> ct per 1M tokens
+        return (j / 3.6) * price_ct_per_kwh
+
     lines = []
-    lines.append("=" * 78)
-    lines.append("MEASURED energy + throughput (CUDA graphs ON, temp 0)")
+    lines.append("=" * 88)
+    lines.append(f"MEASURED energy + throughput — [{result.label}] "
+                 f"(CUDA graphs ON, temp 0)")
     lines.append(f"  rig: {', '.join(f'{c}x {n}' for c, n, m in result.hardware_cards)}")
-    lines.append(f"  idle whole-rig: {result.idle_watts:.0f} W")
+    lines.append(f"  idle whole-rig: {result.idle_watts:.0f} W  |  price: "
+                 f"{price_ct_per_kwh:.0f} ct/kWh")
     lines.append("  energy = GPU (NVML) board power only, summed across cards — "
                  "EXCLUDES CPU/RAM/PSU losses (NOT wall-socket power).")
     if result.compute_share_by_card:
@@ -780,44 +941,125 @@ def summarize(result: MeasurementResult) -> str:
             f"{n} {s*100:.0f}%" for n, s in
             zip(result.gpu_names_sampled, result.compute_share_by_card))
         lines.append(f"  uneven-TP compute share (from ratio): {shares}")
-    lines.append("=" * 78)
-    header = (f"{'workload':8s} {'bs':>3s} {'prefill tok/s':>13s} "
-              f"{'J/pretok':>9s} {'kWh/1M':>8s} | {'decode tok/s':>12s} "
-              f"{'J/dectok':>9s} {'kWh/1M':>8s} {'dec W':>7s}")
-    lines.append(header)
-    lines.append("-" * len(header))
-    for m in result.measurements:
-        lines.append(
-            f"{m.workload:8s} {m.bucket:3d} {m.prefill_tok_s:13.1f} "
-            f"{m.j_per_prefill_token:9.3f} {m.kwh_per_1m_prefill():8.2f} | "
-            f"{m.decode_tok_s:12.1f} {m.j_per_decode_token:9.3f} "
-            f"{m.kwh_per_1m_decode():8.2f} {m.avg_decode_watts:7.0f}")
-    # -- PER-CARD decode breakdown (each card's OWN measured power) ----------
+    if result.server_avg_accept_length is not None:
+        lines.append(f"  MTP avg accept length (server /server_info): "
+                     f"{result.server_avg_accept_length:.2f} output tok / target "
+                     "forward")
+    if result.adaptive_step_hist:
+        hist = ", ".join(f"k={k} (x{c})" for k, c in
+                         sorted(result.adaptive_step_hist.items()))
+        lines.append(f"  adaptive draft depth picks (ceiling k=5): {hist}")
+    lines.append("=" * 88)
+
+    def phase_block(title, tok_s, jtok, accept=False):
+        b = [title]
+        hdr = (f"{'workload':8s} {'bs':>3s} {'tok/s':>10s} {'J/tok':>9s} "
+               f"{'kWh/1M':>9s} {'ct/1M':>9s}")
+        if accept:
+            hdr += f" {'acc-len':>7s} {'acc-rate':>8s}"
+        b.append(hdr)
+        b.append("-" * len(hdr))
+        for m in result.measurements:
+            ts, jt = tok_s(m), jtok(m)
+            row = (f"{m.workload:8s} {m.bucket:3d} {ts:10.1f} {jt:9.3f} "
+                   f"{jt/3.6:9.3f} {ct1m(jt):9.3f}")
+            if accept:
+                row += (f" {m.accept_length:7.2f}" if m.accept_length is not None
+                        else f" {'—':>7s}")
+                row += (f" {m.accept_rate*100:7.1f}%" if m.accept_rate is not None
+                        else f" {'—':>8s}")
+            b.append(row)
+        return b
+
+    # -- TWO separate self-contained blocks: PREFILL and DECODE --------------
+    lines += phase_block(
+        "PREFILL — its own operation (compute-bound, amortized over the prompt):",
+        lambda m: m.prefill_tok_s, lambda m: m.j_per_prefill_token)
     lines.append("")
-    lines.append("PER-CARD decode energy (each card's own NVML power, NOT total/N):")
+    lines += phase_block(
+        "DECODE — its own operation (memory-bound, per OUTPUT token):",
+        lambda m: m.decode_tok_s, lambda m: m.j_per_decode_token, accept=True)
+
+    # -- PER-CARD: also separated into prefill + decode ----------------------
     names = result.gpu_names_sampled
     shares = result.compute_share_by_card or [None] * len(names)
-    pch = (f"{'workload':8s} {'bs':>3s} {'card':22s} {'share':>6s} "
-           f"{'dec W':>7s} {'J/dectok':>9s} {'kWh/1M':>8s}")
-    lines.append(pch)
-    lines.append("-" * len(pch))
-    for m in result.measurements:
-        for i, name in enumerate(m.gpu_names or names):
-            sh = shares[i] if i < len(shares) and shares[i] is not None else None
-            jd = m.per_card_j_per_decode_token[i] if i < len(m.per_card_j_per_decode_token) else 0.0
-            w = m.per_card_avg_decode_watts[i] if i < len(m.per_card_avg_decode_watts) else 0.0
-            lines.append(
-                f"{m.workload:8s} {m.bucket:3d} {name[:22]:22s} "
-                f"{(f'{sh*100:.0f}%' if sh is not None else '  —'):>6s} "
-                f"{w:7.0f} {jd:9.3f} {jd/3.6:8.2f}")
-        lines.append(
-            f"{m.workload:8s} {m.bucket:3d} {'TOTAL (rig)':22s} {'100%':>6s} "
-            f"{m.avg_decode_watts:7.0f} {m.j_per_decode_token:9.3f} "
-            f"{m.kwh_per_1m_decode():8.2f}")
+
+    def per_card_block(title, jtok_list, watt_list):
+        b = ["", title]
+        pch = (f"{'workload':8s} {'bs':>3s} {'card':22s} {'share':>6s} "
+               f"{'W':>6s} {'J/tok':>9s} {'kWh/1M':>9s} {'ct/1M':>9s}")
+        b.append(pch)
+        b.append("-" * len(pch))
+        for m in result.measurements:
+            jl, wl2 = jtok_list(m), watt_list(m)
+            for i, name in enumerate(m.gpu_names or names):
+                sh = shares[i] if i < len(shares) and shares[i] is not None else None
+                jt = jl[i] if i < len(jl) else 0.0
+                w = wl2[i] if i < len(wl2) else 0.0
+                b.append(
+                    f"{m.workload:8s} {m.bucket:3d} {name[:22]:22s} "
+                    f"{(f'{sh*100:.0f}%' if sh is not None else '  —'):>6s} "
+                    f"{w:6.0f} {jt:9.3f} {jt/3.6:9.3f} {ct1m(jt):9.3f}")
+            tot_j = (sum(m.per_card_j_per_prefill_token) if 'PREFILL' in title
+                     else sum(m.per_card_j_per_decode_token))
+            tot_w = (m.avg_prefill_watts if 'PREFILL' in title else m.avg_decode_watts)
+            b.append(
+                f"{m.workload:8s} {m.bucket:3d} {'TOTAL (rig)':22s} {'100%':>6s} "
+                f"{tot_w:6.0f} {tot_j:9.3f} {tot_j/3.6:9.3f} {ct1m(tot_j):9.3f}")
+        return b
+
+    lines += per_card_block(
+        "PER-CARD PREFILL energy (each card's own NVML power, NOT total/N):",
+        lambda m: m.per_card_j_per_prefill_token,
+        lambda m: m.per_card_avg_prefill_watts)
+    lines += per_card_block(
+        "PER-CARD DECODE energy (each card's own NVML power, NOT total/N):",
+        lambda m: m.per_card_j_per_decode_token,
+        lambda m: m.per_card_avg_decode_watts)
+
     if result.notes:
         lines.append("notes:")
         for n in result.notes:
             lines.append(f"  - {n}")
+    return "\n".join(lines)
+
+
+def compare_summary(baseline: MeasurementResult, mtp: MeasurementResult,
+                    price_ct_per_kwh: float = 30.0) -> str:
+    """Side-by-side: no-MTP baseline vs MTP+adaptive, with the measured
+    multiplier (decode tok/s ratio) and the energy/cost delta per output token.
+    PREFILL and DECODE kept separate."""
+    def ct1m(j):
+        return (j / 3.6) * price_ct_per_kwh
+
+    def dmap(r):
+        return {(m.workload, m.bucket): m for m in r.measurements}
+    B, M = dmap(baseline), dmap(mtp)
+    lines = ["", "=" * 96,
+             "BASELINE (no-MTP) vs MTP+adaptive — decode multiplier + energy/cost per OUTPUT token",
+             "=" * 96]
+    if mtp.server_avg_accept_length is not None:
+        lines.append(f"  server avg accept length: {mtp.server_avg_accept_length:.2f}")
+    if mtp.adaptive_step_hist:
+        lines.append("  adaptive depth picks (ceiling k=5): " +
+                     ", ".join(f"k={k}(x{c})" for k, c in
+                               sorted(mtp.adaptive_step_hist.items())))
+    hdr = (f"{'workload':8s} {'bs':>3s} | {'base dec':>9s} {'mtp dec':>9s} "
+           f"{'x':>5s} {'accept':>7s} | {'base J':>8s} {'mtp J':>8s} "
+           f"{'base ct/1M':>10s} {'mtp ct/1M':>10s}")
+    lines.append(hdr)
+    lines.append("-" * len(hdr))
+    for key in sorted(B.keys() & M.keys()):
+        b, m = B[key], M[key]
+        mult = m.decode_tok_s / b.decode_tok_s if b.decode_tok_s else 0.0
+        acc = f"{m.accept_length:.2f}" if m.accept_length is not None else "—"
+        lines.append(
+            f"{key[0]:8s} {key[1]:3d} | {b.decode_tok_s:9.1f} {m.decode_tok_s:9.1f} "
+            f"{mult:4.2f}x {acc:>7s} | {b.j_per_decode_token:8.3f} "
+            f"{m.j_per_decode_token:8.3f} {ct1m(b.j_per_decode_token):10.3f} "
+            f"{ct1m(m.j_per_decode_token):10.3f}")
+    lines.append("(MTP decode is faster AND cheaper per output token: the target "
+                 "forward is amortized across accepted tokens.)")
     return "\n".join(lines)
 
 
@@ -831,6 +1073,7 @@ DEFAULT_RESULTS_STORE = os.path.join(
 
 
 def validation_config(**overrides) -> MeasurementConfig:
+    """The no-MTP BASELINE config (Qwen3.6-27B-FP8, TP=3 uneven-DCP)."""
     cfg = MeasurementConfig(
         model_path=VALIDATION_MODEL,
         served_model_name="Qwen3.6-27B",
@@ -842,9 +1085,40 @@ def validation_config(**overrides) -> MeasurementConfig:
         context_length=8192,
         max_running_requests=32,
         quant_label="fp8",
+        label="no-MTP baseline",
         buckets=(1, 4, 16),
         extra_env={"SGLANG_UNEVEN_DCP": "1"},
         port=31000,
+    )
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def mtp_config(**overrides) -> MeasurementConfig:
+    """The FASTEST config: NEXTN MTP + adaptive draft (high-accept, ceiling
+    k=5, chain topk=1). Same base as the baseline, plus the spec stack."""
+    cfg = validation_config(
+        label="MTP+adaptive",
+        speculative_algorithm="NEXTN",
+        speculative_num_steps=5,            # high-accept k=4/5 ladder ceiling
+        speculative_eagle_topk=1,           # chain, not tree
+        speculative_num_draft_tokens=6,     # num_steps + 1 for the chain
+        speculative_adaptive=True,
+        speculative_adaptive_config="high-accept",
+        # Force OFFLOAD (#93): inactive adaptive states' capture pools are
+        # physically unmapped (reserve = MAX over states, not SUM), which is
+        # what lets the 5-rung high-accept ladder fit the tight 3080 budget
+        # (16464 MiB). 'auto' did NOT engage offload here and OOM'd on the 3080.
+        speculative_adaptive_graph_memory="offload",
+        # Our top bucket is 16; cap the decode graph ladder there so the
+        # per-state capture pools stay small (default followed max_running_reqs
+        # up to bs=24, extra pools the 3080 has no room for under 5 states).
+        # --enable-memory-saver installs the torch_memory_saver LD_PRELOAD hook
+        # that OFFLOAD needs to PHYSICALLY unmap inactive states' capture pools
+        # (without it, offload silently keeps all 5 states resident and OOMs the
+        # 3080).
+        extra_flags=["--cuda-graph-max-bs-decode", "16", "--enable-memory-saver"],
     )
     for k, v in overrides.items():
         setattr(cfg, k, v)
@@ -861,6 +1135,9 @@ def main(argv=None) -> int:
     p.add_argument("--buckets", default="1,4,16")
     p.add_argument("--decode-tokens", type=int, default=128)
     p.add_argument("--store", default=DEFAULT_RESULTS_STORE)
+    p.add_argument("--price-ct-per-kwh", type=float, default=30.0)
+    p.add_argument("--config", choices=["baseline", "mtp", "both"],
+                   default="both", help="which config(s) to measure")
     p.add_argument("--no-ingest", action="store_true")
     args = p.parse_args(argv)
 
@@ -869,21 +1146,37 @@ def main(argv=None) -> int:
         dataclasses.replace(CODE_WORKLOAD, decode_tokens=args.decode_tokens),
         dataclasses.replace(PROSE_WORKLOAD, decode_tokens=args.decode_tokens),
     )
-    cfg = validation_config(
-        kv_cache_dtype=args.kv_cache_dtype, port=args.port,
-        context_length=args.context_length, buckets=buckets, workloads=wls)
+    common = dict(kv_cache_dtype=args.kv_cache_dtype, port=args.port,
+                  context_length=args.context_length, buckets=buckets,
+                  workloads=wls)
 
-    result = run_measurement(cfg)
-    print(summarize(result))
+    todo = []
+    if args.config in ("baseline", "both"):
+        todo.append(("baseline", validation_config(**common)))
+    if args.config in ("mtp", "both"):
+        todo.append(("mtp", mtp_config(**common)))
+
+    results = {}
+    entries = []
+    for name, cfg in todo:
+        print(f"\n########## measuring [{cfg.label}] ##########", flush=True)
+        r = run_measurement(cfg)
+        results[name] = r
+        print(summarize(r, args.price_ct_per_kwh))
+        entries.extend(r.result_entries())
+
+    if "baseline" in results and "mtp" in results:
+        print(compare_summary(results["baseline"], results["mtp"],
+                              args.price_ct_per_kwh))
 
     if not args.no_ingest:
         from sglang.srt.planner.results_store import ResultsStore
         store = ResultsStore.load(args.store)
-        for entry in result.result_entries():
+        for entry in entries:
             store.ingest(entry)
         store.save(args.store)
-        print(f"\n[energy] ingested {len(result.result_entries())} measured "
-              f"rows -> {args.store} (total {len(store)} rows).")
+        print(f"\n[energy] ingested {len(entries)} measured rows -> "
+              f"{args.store} (total {len(store)} rows).")
     return 0
 
 

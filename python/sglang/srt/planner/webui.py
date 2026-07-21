@@ -510,7 +510,9 @@ def _measured_for_plan(payload, model_path, result) -> Optional[dict]:
     def _kwh_1m(d):
         return {int(k): (float(v) / 3.6) for k, v in (d or {}).items()}
 
-    workloads = []
+    # Group by config_label (e.g. "no-MTP baseline" vs "MTP+adaptive") so the
+    # dashboard shows every sibling row for this model/hardware side by side.
+    groups: dict = {}
     for e in store.entries():
         if not e.has_measured_perf():
             continue
@@ -521,11 +523,14 @@ def _measured_for_plan(payload, model_path, result) -> Optional[dict]:
         ne = _norm(str(e.model).split("/")[-1])
         if not (ne and (ne in nb or nb in ne)):
             continue
-        workloads.append({
+        label = e.config_label or "measured"
+        groups.setdefault(label, []).append({
             "workload": e.workload or "default",
             "tp_config": e.tp_config,
             "kv_cache_dtype": e.kv_cache_dtype,
             "provenance": e.provenance,
+            "config_label": label,
+            "spec_accept_length_by_bucket": e.spec_accept_length_by_bucket or {},
             "prefill_tok_s_by_bucket": e.prefill_tok_s_by_bucket or {},
             "decode_tok_s_by_bucket": e.decode_tok_s_by_bucket or {},
             "peak_prefill_tok_s": e.peak_prefill_tok_s,
@@ -536,9 +541,15 @@ def _measured_for_plan(payload, model_path, result) -> Optional[dict]:
             "kwh_per_1m_decode_by_bucket": _kwh_1m(e.j_per_decode_token_by_bucket),
             "per_card_energy": e.per_card_energy,
         })
-    if not workloads:
+    if not groups:
         return None
-    return {"store_path": store_path, "workloads": workloads}
+    # Baseline first, then the rest (MTP etc.), so the multiplier reads left->right.
+    def _order(lbl):
+        return (0 if "baseline" in lbl.lower() or "no-mtp" in lbl.lower() else 1, lbl)
+    rows = [{"config_label": lbl, "workloads": groups[lbl]}
+            for lbl in sorted(groups, key=_order)]
+    return {"store_path": store_path, "rows": rows,
+            "workloads": rows[0]["workloads"]}  # back-compat: first row
 
 
 #: Concurrency ladder shown so the user SEES the KV<->concurrency<->mamba
@@ -939,10 +950,26 @@ INDEX_HTML = r"""<!doctype html>
               text-transform: uppercase; letter-spacing: .02em; }
   .ms-note { font-size: .72rem; color: #9fb0a4; margin: .35rem 0 .5rem; }
   .ms-wl { margin: .5rem 0; }
-  .ms-wl table { border-collapse: collapse; margin: .3rem 0; font-size: .72rem; }
-  .ms-wl th, .ms-wl td { border: 1px solid #21402b; padding: .18rem .5rem;
-                         text-align: right; }
-  .ms-wl th { color: #7f8b99; font-weight: 600; }
+  .ms-mult { font-size: .8rem; color: #d2f7dd; background: #10251a;
+             border: 1px solid #2ea043; border-radius: 6px; padding: .4rem .6rem;
+             margin: .4rem 0; }
+  .ms-row { border-top: 1px solid #21402b; margin-top: .6rem; padding-top: .4rem; }
+  .ms-row-h { font-size: .8rem; color: #adbac7; }
+  .ms-wl-h { font-size: .74rem; color: #8b98a5; margin-top: .35rem; }
+  .ms-phases { display: flex; gap: 1rem; flex-wrap: wrap; }
+  .ms-phase { flex: 1 1 320px; min-width: 300px; border-radius: 6px;
+              padding: .35rem .5rem; }
+  .ms-prefill { background: #0d1a22; border: 1px solid #1f3a4d; }
+  .ms-decode  { background: #10251a; border: 1px solid #235c34; }
+  .ms-ph-h { font-weight: 700; font-size: .74rem; letter-spacing: .02em;
+             margin-bottom: .2rem; }
+  .ms-prefill .ms-ph-h { color: #6cb6ff; }
+  .ms-decode .ms-ph-h { color: #56d364; }
+  .ms-phase table, .ms-wl table { border-collapse: collapse; margin: .3rem 0;
+                                  font-size: .7rem; width: 100%; }
+  .ms-phase th, .ms-phase td, .ms-wl th, .ms-wl td {
+      border: 1px solid #21402b; padding: .16rem .45rem; text-align: right; }
+  .ms-phase th, .ms-wl th { color: #7f8b99; font-weight: 600; }
   .roofline { margin-top: .9rem; background: #191410; border: 1px dashed #7a5c14;
               border-radius: 8px; padding: .7rem .8rem; }
   .rf-title { font-weight: 700; color: #e3b341; font-size: .9rem;
@@ -1419,94 +1446,133 @@ function kwhBandToCt(band, priceCt) {
   return band.map(x => kwhToCt(x, priceCt));
 }
 
-function renderPerCard(w, bs, priceCt) {
+const _f1 = x => (x==null ? '—' : Math.round(x).toLocaleString());
+const _f2 = x => (x==null ? '—' : Number(x).toFixed(2));
+const _f3 = x => (x==null ? '—' : Number(x).toFixed(3));
+const _fct = x => (x==null ? '—' : Number(x).toFixed(3) + ' ct');
+
+// One self-contained PHASE table (PREFILL or DECODE): tok/s + J/tok + kWh/1M +
+// ct/1M per bucket. Prefill and decode are NEVER combined — two separate blocks.
+function phaseTable(w, bs, priceCt, phase) {
+  const isP = phase === 'prefill';
+  const tps = isP ? (w.prefill_tok_s_by_bucket||{}) : (w.decode_tok_s_by_bucket||{});
+  const jb  = isP ? (w.j_per_prefill_token_by_bucket||{})
+                  : (w.j_per_decode_token_by_bucket||{});
+  const kwh = isP ? (w.kwh_per_1m_prefill_by_bucket||{})
+                  : (w.kwh_per_1m_decode_by_bucket||{});
+  const acc = w.spec_accept_length_by_bucket || {};
+  const hasAcc = !isP && Object.keys(acc).length > 0;
+  const label = isP ? 'PREFILL' : 'DECODE';
+  const sub = isP ? 'compute-bound, amortized over the prompt'
+                  : 'memory-bound, per OUTPUT token';
+  let h = '<div class="ms-phase ms-' + phase + '"><div class="ms-ph-h">' + label
+    + ' <span class="muted">&mdash; ' + sub + '</span></div>';
+  h += '<table><tr><th>bs</th><th>tok/s</th><th>J/tok</th><th>kWh/1M</th>'
+    + '<th>ct/1M</th>' + (hasAcc ? '<th>accept-len</th>' : '') + '</tr>';
+  for (const b of bs) {
+    const jt = jb[b];
+    h += '<tr><td>' + b + '</td><td>' + _f1(tps[b]) + '</td><td>' + _f3(jt)
+      + '</td><td>' + _f2(kwh[b]) + '</td><td>' + _fct(jPerTokToCtPer1M(jt, priceCt))
+      + '</td>' + (hasAcc ? '<td>' + _f2(acc[b]) + '</td>' : '') + '</tr>';
+  }
+  h += '</table><p class="muted">peak ' + label.toLowerCase() + ' <b>'
+    + _f1(isP ? w.peak_prefill_tok_s : w.peak_decode_tok_s) + '</b> tok/s</p>';
+  h += perCardPhase(w, bs, priceCt, phase);
+  h += '</div>';
+  return h;
+}
+
+// Per-card energy for ONE phase @ the largest bucket: each card's OWN NVML power.
+function perCardPhase(w, bs, priceCt, phase) {
   const pce = w.per_card_energy;
   if (!pce || !pce.gpu_names || !pce.gpu_names.length) return '';
-  const f0 = x => (x==null ? '—' : Math.round(x).toLocaleString());
-  const f2 = x => (x==null ? '—' : Number(x).toFixed(2));
-  const f3 = x => (x==null ? '—' : Number(x).toFixed(3));
-  const names = pce.gpu_names;
-  const share = pce.compute_share || [];
-  // Pick the largest bucket for the per-card view (steady-state, amortized).
+  const isP = phase === 'prefill';
   const b = bs[bs.length - 1];
-  const decW = (pce.decode_watts_by_bucket||{})[b] || [];
-  const decJ = (pce.decode_j_per_token_by_bucket||{})[b] || [];
-  const totW = decW.reduce((a,x)=>a+(x||0), 0);
-  let h = '<p class="muted" style="margin:.4rem 0 .1rem">per-card decode energy '
-    + '@ bs=' + b + ' &mdash; each card\'s OWN measured NVML power (not total/N). '
-    + 'Compute-share is from the uneven-TP ratio; power-share is measured &mdash; '
-    + 'the divergence is the honest efficiency picture.</p>';
-  const fct = x => (x==null ? '—' : Number(x).toFixed(3) + ' ct');
-  h += '<table><tr><th>card</th><th>compute-share</th><th>power-share</th>'
-    + '<th>avg W</th><th>J/dec-tok</th><th>kWh/1M</th><th>ct/1M</th>'
-    + '<th>J/tok &divide; compute-share</th></tr>';
+  const names = pce.gpu_names, share = pce.compute_share || [];
+  const wl = ((isP ? pce.prefill_watts_by_bucket : pce.decode_watts_by_bucket)||{})[b]||[];
+  const jl = ((isP ? pce.prefill_j_per_token_by_bucket
+                   : pce.decode_j_per_token_by_bucket)||{})[b]||[];
+  const totW = wl.reduce((a,x)=>a+(x||0), 0);
+  const totJ = jl.reduce((a,x)=>a+(x||0), 0);
+  let h = '<p class="muted" style="margin:.3rem 0 .1rem">per-card @ bs=' + b
+    + ' (own NVML power, not total/N; compute-share vs power-share = efficiency)</p>';
+  h += '<table><tr><th>card</th><th>compute</th><th>power</th><th>W</th>'
+    + '<th>J/tok</th><th>kWh/1M</th><th>ct/1M</th></tr>';
   for (let i = 0; i < names.length; i++) {
-    const sh = share[i];
-    const pw = totW > 0 ? (decW[i]||0)/totW : null;
-    const perShare = (sh && sh>0 && decJ[i]!=null) ? decJ[i]/sh : null;
+    const pw = totW > 0 ? (wl[i]||0)/totW : null;
     h += '<tr><td style="text-align:left">' + esc(names[i]) + '</td><td>'
-      + (sh!=null ? Math.round(sh*100)+'%' : '—') + '</td><td>'
-      + (pw!=null ? Math.round(pw*100)+'%' : '—') + '</td><td>' + f0(decW[i])
-      + '</td><td>' + f3(decJ[i]) + '</td><td>' + f2(decJ[i]!=null?decJ[i]/3.6:null)
-      + '</td><td>' + fct(jPerTokToCtPer1M(decJ[i], priceCt))
-      + '</td><td>' + f3(perShare) + '</td></tr>';
+      + (share[i]!=null ? Math.round(share[i]*100)+'%' : '—') + '</td><td>'
+      + (pw!=null ? Math.round(pw*100)+'%' : '—') + '</td><td>' + _f1(wl[i])
+      + '</td><td>' + _f3(jl[i]) + '</td><td>' + _f2(jl[i]!=null?jl[i]/3.6:null)
+      + '</td><td>' + _fct(jPerTokToCtPer1M(jl[i], priceCt)) + '</td></tr>';
   }
-  const totJ = decJ.reduce((a,x)=>a+(x||0),0);
-  h += '<tr><td style="text-align:left"><b>TOTAL (rig)</b></td><td>100%</td>'
-    + '<td>100%</td><td>' + f0(totW) + '</td><td>' + f3(totJ) + '</td><td>'
-    + f2(totJ/3.6) + '</td><td>' + fct(jPerTokToCtPer1M(totJ, priceCt))
-    + '</td><td>&mdash;</td></tr>';
-  h += '</table>';
-  if (pce.source)
-    h += '<p class="muted" style="font-size:.62rem">' + esc(pce.source) + '</p>';
+  h += '<tr><td style="text-align:left"><b>TOTAL</b></td><td>100%</td><td>100%</td>'
+    + '<td>' + _f1(totW) + '</td><td>' + _f3(totJ) + '</td><td>' + _f2(totJ/3.6)
+    + '</td><td>' + _fct(jPerTokToCtPer1M(totJ, priceCt)) + '</td></tr></table>';
   return h;
+}
+
+function _bucketsOf(workloads) {
+  const s = new Set();
+  for (const w of workloads)
+    for (const k of Object.keys(w.decode_tok_s_by_bucket||{})) s.add(+k);
+  return [...s].sort((a,b)=>a-b);
+}
+
+// Peak decode tok/s of a config row (max over workloads/buckets) — for the mult.
+function _peakDecode(row) {
+  let mx = null;
+  for (const w of row.workloads) {
+    const v = w.peak_decode_tok_s;
+    if (v != null && (mx == null || v > mx)) mx = v;
+  }
+  return mx;
 }
 
 function renderMeasured(mz) {
   window.__lastMeasured = mz;  // cached so a price edit re-renders in place
-  if (!mz || !mz.workloads || !mz.workloads.length) {
-    $('measured').innerHTML = ''; return;
-  }
+  // back-compat: older payload had {workloads}; normalize to {rows:[{...}]}.
+  let rows = mz && mz.rows;
+  if (!rows && mz && mz.workloads)
+    rows = [{config_label: 'measured', workloads: mz.workloads}];
+  if (!rows || !rows.length) { $('measured').innerHTML = ''; return; }
   const priceCt = getKwhPriceCt();
-  const f1 = x => (x==null ? '—' : Math.round(x).toLocaleString());
-  const f2 = x => (x==null ? '—' : Number(x).toFixed(2));
-  const fct = x => (x==null ? '—' : Number(x).toFixed(3) + ' ct');
-  const buckets = new Set();
-  for (const w of mz.workloads) {
-    for (const k of Object.keys(w.decode_tok_s_by_bucket||{})) buckets.add(+k);
-  }
-  const bs = [...buckets].sort((a,b)=>a-b);
-  const f3 = x => (x==null ? '—' : Number(x).toFixed(3));
+
   let h = '<div class="measured"><div class="ms-title">MEASURED throughput '
     + '&amp; energy &mdash; real run, CUDA graphs ON (S2.5 energy module)</div>'
     + '<p class="ms-note">MEASURED (whole-rig NVML board power integrated over '
     + 'the prefill vs decode window, temp 0). OVERRIDES the roofline below. '
-    + 'kWh/1M&nbsp;tok = J/token &divide; 3.6; cost = kWh &times; ' + priceCt
+    + 'PREFILL and DECODE are shown as SEPARATE operations (never summed) &mdash; '
+    + 'prefill is cheap/compute-amortized, decode is the expensive per-token cost. '
+    + 'kWh/1M = J/token &divide; 3.6; cost = kWh &times; ' + priceCt
     + '&nbsp;ct/kWh. <b>Energy = GPU (NVML) power only, summed across cards '
     + '&mdash; EXCLUDES CPU/RAM/PSU losses; NOT wall-socket power.</b></p>';
-  for (const w of mz.workloads) {
-    h += '<div class="ms-wl"><b>workload: ' + esc(w.workload) + '</b> '
-      + '<span class="muted">' + esc(w.tp_config||'') + ' &middot; kv '
-      + esc(w.kv_cache_dtype||'') + '</span>';
-    h += '<table><tr><th>bs</th><th>prefill tok/s</th><th>J/prefill-tok</th>'
-      + '<th>kWh/1M</th><th>ct/1M</th><th>decode tok/s</th><th>J/decode-tok</th>'
-      + '<th>kWh/1M</th><th>ct/1M</th></tr>';
-    for (const b of bs) {
-      const pt = (w.prefill_tok_s_by_bucket||{})[b];
-      const dt = (w.decode_tok_s_by_bucket||{})[b];
-      const jp = (w.j_per_prefill_token_by_bucket||{})[b];
-      const jd = (w.j_per_decode_token_by_bucket||{})[b];
-      h += '<tr><td>' + b + '</td><td>' + f1(pt) + '</td><td>' + f3(jp)
-        + '</td><td>' + f2((w.kwh_per_1m_prefill_by_bucket||{})[b]) + '</td><td>'
-        + fct(jPerTokToCtPer1M(jp, priceCt)) + '</td><td>' + f1(dt) + '</td><td>'
-        + f3(jd) + '</td><td>' + f2((w.kwh_per_1m_decode_by_bucket||{})[b])
-        + '</td><td>' + fct(jPerTokToCtPer1M(jd, priceCt)) + '</td></tr>';
+
+  // MTP multiplier: fastest non-baseline row's peak decode vs baseline's.
+  const base = rows.find(r => /baseline|no-mtp/i.test(r.config_label));
+  const spec = rows.find(r => !/baseline|no-mtp/i.test(r.config_label));
+  if (base && spec) {
+    const pb = _peakDecode(base), ps = _peakDecode(spec);
+    if (pb && ps)
+      h += '<p class="ms-mult"><b>MTP multiplier:</b> peak decode ' + _f1(ps)
+        + ' vs ' + _f1(pb) + ' tok/s &rarr; <b>' + (ps/pb).toFixed(2)
+        + '&times;</b> (MTP is faster AND cheaper per output token &mdash; the '
+        + 'target forward is amortized across accepted tokens).</p>';
+  }
+
+  for (const row of rows) {
+    const bs = _bucketsOf(row.workloads);
+    h += '<div class="ms-row"><div class="ms-row-h">config: <b>'
+      + esc(row.config_label) + '</b> <span class="muted">'
+      + esc((row.workloads[0]||{}).tp_config||'') + ' &middot; kv '
+      + esc((row.workloads[0]||{}).kv_cache_dtype||'') + '</span></div>';
+    for (const w of row.workloads) {
+      h += '<div class="ms-wl"><div class="ms-wl-h">workload: <b>'
+        + esc(w.workload) + '</b></div><div class="ms-phases">';
+      h += phaseTable(w, bs, priceCt, 'prefill');
+      h += phaseTable(w, bs, priceCt, 'decode');
+      h += '</div></div>';
     }
-    h += '</table>';
-    h += '<p class="muted">peak prefill <b>' + f1(w.peak_prefill_tok_s)
-      + '</b> tok/s &middot; peak decode <b>' + f1(w.peak_decode_tok_s)
-      + '</b> tok/s</p>';
-    h += renderPerCard(w, bs, priceCt);
     h += '</div>';
   }
   h += '<p class="muted">source: ' + esc(mz.store_path) + '</p></div>';
