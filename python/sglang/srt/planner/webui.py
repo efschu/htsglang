@@ -85,9 +85,16 @@ __all__ = [
 
 def detect_hardware() -> dict:
     """Auto-detect the local GPUs (NVML/nvidia-smi) for the selectable card
-    list. Returns ``{ok, gpus:[{index,name,total_mib,free_mib}], host_ram_mib,
-    source}`` or ``{ok:False, error}`` on a GPU-less host — the UI then shows
-    only the manual/virtual add-card path (still fully usable offline)."""
+    list. Returns ``{ok, gpus:[{index,name,total_mib,free_mib,cuda_index}],
+    host_ram_mib, source, cuda_index_source}`` or ``{ok:False, error}`` on a
+    GPU-less host — the UI then shows only the manual/virtual add-card path
+    (still fully usable offline).
+
+    ``index`` is the NVML/PCI-bus index (telemetry space); ``cuda_index`` is
+    the SAME card's CUDA-order index — the space every engine flag
+    (--rank-gpu-id / --base-gpu-id) is interpreted in. ``cuda_index_source``
+    is "torch" (exact UUID bridge) or "heuristic" (FASTEST_FIRST emulation;
+    the UI must say so), or None when unbridged."""
     from sglang.srt.planner import hardware as hwmod
 
     try:
@@ -102,6 +109,7 @@ def detect_hardware() -> dict:
     return {
         "ok": True,
         "source": spec.source,
+        "cuda_index_source": spec.cuda_index_source,
         "host_ram_mib": spec.host_ram_mib,
         "gpus": [
             {
@@ -109,6 +117,7 @@ def detect_hardware() -> dict:
                 "name": g.name,
                 "total_mib": g.total_mib,
                 "free_mib": g.free_mib,
+                "cuda_index": g.cuda_index,
             }
             for g in spec.gpus
         ],
@@ -304,10 +313,12 @@ def _cards_hardware_and_reserve(hw):
     """Build a HardwareSpec + per-card free-reserve (MiB) from the structured
     card list the UI posts (design §PART 2/§PART 3). Each entry:
     ``{name, total_mib, include, reserve_gb, virtual}``. Only INCLUDED cards
-    are planned; they are re-indexed 0..k-1 (physical ids the --rank-gpu-id map
-    refers to). ``virtual`` cards (hypothetical/future GPUs the user typed) are
-    treated identically — the whole point of an offline planner. Returns
-    ``(HardwareSpec, reserve_mib_list_or_None)``."""
+    are planned; they are re-indexed 0..k-1 -- and those positions ARE the
+    ``--rank-gpu-id`` space, i.e. CUDA enumeration order, NOT NVML/nvidia-smi
+    order (the client posts detected cards sorted by their bridged
+    cuda_index; see planner.device_map). ``virtual`` cards (hypothetical/
+    future GPUs the user typed) are treated identically — the whole point of
+    an offline planner. Returns ``(HardwareSpec, reserve_mib_list_or_None)``."""
     from sglang.srt.planner import hardware as hwmod
 
     cards = [c for c in hw.get("cards", []) if c.get("include", True)]
@@ -855,11 +866,23 @@ def landscape_from_payload(payload: dict) -> dict:
 
 
 def gpu_state_payload() -> dict:
-    """Live per-card power-state tags (#149 Ebene-4 refresh button)."""
+    """Live per-card power-state tags (#149 Ebene-4 refresh button). Cards
+    are NVML-sampled (nvml_index); each row is additionally annotated with
+    the card's CUDA-order index via the device_map bridge so the UI can
+    label both spaces."""
     from sglang.srt.planner.energy import read_gpu_power_states
 
     states = read_gpu_power_states()
-    return {"ok": True, "cards": [s.to_json() for s in states]}
+    cards = [s.to_json() for s in states]
+    try:
+        from sglang.srt.planner.device_map import device_map
+
+        n2c = device_map().nvml_to_cuda()
+        for c in cards:
+            c["cuda_index"] = n2c.get(c.get("nvml_index"))
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return {"ok": True, "cards": cards}
 
 
 def live_snapshot_payload(payload: dict) -> dict:
@@ -3141,7 +3164,7 @@ INDEX_HTML = r"""<!doctype html>
             <span class="lbl">GPU (single-card run)
               <span class="chg" title="changed from preset"></span></span>
             <select id="gpu_pick_select" onchange="gpuPickChanged()"></select>
-            <span class="qmark" title="Which physical card a single-GPU (tp=1) run uses. Default = the preset's rule pick (largest VRAM, then higher FLOPs, then first index); writes the stock --base-gpu-id flag. Hidden for tp > 1, where rank-gpu-id owns the placement.">?</span>
+            <span class="qmark" title="Which physical card a single-GPU (tp=1) run uses. Default = the preset's rule pick (largest VRAM, then higher FLOPs, then first index); writes the stock --base-gpu-id flag, a CUDA-order index (FASTEST_FIRST) -- NOT the nvidia-smi/NVML index; both are labeled. Hidden for tp > 1, where rank-gpu-id owns the placement.">?</span>
           </div>
           <div id="secflags_gpu"></div>
         </div>
@@ -3309,8 +3332,32 @@ function schedulePlan() {
 }
 
 // ---- hardware card list (detect + select + per-card reserve + virtual) ----
-let CARDS = [];          // {name,total_mib,include,reserve_gb,virtual,free_mib}
+// {name,total_mib,include,reserve_gb,virtual,free_mib,nvml_index,cuda_index}
+// TWO index spaces per detected card: nvml_index (NVML/PCI, telemetry) and
+// cuda_index (CUDA/FASTEST_FIRST -- the space --rank-gpu-id/--base-gpu-id
+// are interpreted in). They diverge on mixed rigs; card rows label BOTH.
+let CARDS = [];
 let HOST_RAM_MIB = null;
+// cuda_index -> nvml_index (for dual labels wherever only cuda is known),
+// maintained from the detect payload and the live snapshot.
+window._cudaNvml = {};
+window._cudaMapHeuristic = false;
+function noteCudaMap(gpus, source){
+  for (const g of (gpus||[]))
+    if (g.cuda_index != null)
+      window._cudaNvml[g.cuda_index] = (g.nvml_index != null ? g.nvml_index : g.index);
+  if (source === 'heuristic') window._cudaMapHeuristic = true;
+}
+// Dual-space device label: 'cuda:0 / nvml:1' (either half degrades alone).
+function devLabel(cudaIdx, nvmlIdx){
+  if (cudaIdx == null && nvmlIdx == null) return '';
+  if (cudaIdx != null && nvmlIdx == null && window._cudaNvml[cudaIdx] != null)
+    nvmlIdx = window._cudaNvml[cudaIdx];
+  const parts = [];
+  if (cudaIdx != null) parts.push('cuda:'+cudaIdx+(window._cudaMapHeuristic?'?':''));
+  if (nvmlIdx != null) parts.push('nvml:'+nvmlIdx);
+  return parts.join(' / ');
+}
 
 async function detectGPUs() {
   const r = await fetch('/api/detect'); const d = await r.json();
@@ -3319,12 +3366,21 @@ async function detectGPUs() {
       '(detected '+(d.host_ram_mib/1024).toFixed(0)+' GiB; override to plan another host)'; }
   if (d.ok && d.gpus && d.gpus.length) {
     // Replace any previously-detected rows; keep user-added virtual cards.
-    CARDS = CARDS.filter(c => c.virtual);
-    for (const g of d.gpus) CARDS.unshift({
+    // Detected rows are ordered by CUDA index (the --rank-gpu-id space) so
+    // list position == cuda index wherever the bridge resolved; the old
+    // per-item unshift additionally REVERSED the detect order.
+    const det = d.gpus.map(g => ({
       name: g.name, total_mib: g.total_mib, include: true,
       reserve_gb: 0, virtual: false, free_mib: g.free_mib,
-      nvml_index: g.index });
-    $('detect_note').textContent = 'detected '+d.gpus.length+' GPU(s) via '+(d.source||'nvml');
+      nvml_index: g.index, cuda_index: (g.cuda_index!=null?g.cuda_index:null) }))
+      .sort((a,b)=>((a.cuda_index!=null?a.cuda_index:1e9)
+                   -(b.cuda_index!=null?b.cuda_index:1e9)) || (a.nvml_index-b.nvml_index));
+    CARDS = det.concat(CARDS.filter(c => c.virtual));
+    noteCudaMap(d.gpus, d.cuda_index_source);
+    $('detect_note').textContent = 'detected '+d.gpus.length+' GPU(s) via '+(d.source||'nvml')
+      +(d.cuda_index_source==='heuristic'
+        ? ' — cuda indices are a FASTEST_FIRST emulation (no torch bridge), marked "?"'
+        : '');
   } else {
     $('detect_note').textContent = 'no GPU detected'+(d.error?' ('+d.error+')':'')
       + ' — add cards (real or hypothetical) below.';
@@ -3359,6 +3415,16 @@ function renderCards() {
     tag.textContent = c.virtual ? ' virtual'
       : (c.free_mib != null ? ' ' + (c.free_mib/1024).toFixed(1) + 'G free' : '');
     nameWrap.appendChild(tag);
+    // Detected cards: label BOTH index spaces so a number is never ambiguous
+    // (cuda = the --rank-gpu-id/--base-gpu-id space, nvml = telemetry space).
+    const idxLbl = devLabel(c.cuda_index, c.nvml_index);
+    if (idxLbl) {
+      const idxTag = document.createElement('span'); idxTag.className = 'cap';
+      idxTag.title = 'cuda: CUDA enumeration order (FASTEST_FIRST) — the space '
+        + '--rank-gpu-id/--base-gpu-id use; nvml: NVML/PCI-bus order (nvidia-smi, telemetry)';
+      idxTag.textContent = ' [' + idxLbl + ']';
+      nameWrap.appendChild(idxTag);
+    }
     // VRAM (MiB)
     const vramWrap = document.createElement('span'); vramWrap.title = 'total VRAM (MiB)';
     const vram = document.createElement('input');
@@ -3438,7 +3504,15 @@ const PLAN_FLAG_KEYS = ['rank_gpu_id','rank_gpu_memory_mib','rank_tp_ratio',
   'rank_mlp_ratio','rank_moe_ratio','rank_vocab_ratio','dcp_size'];
 function payload() {
   const s = window._flagSettings || {};
-  const cards = CARDS.map(c => ({ name: c.name, total_mib: c.total_mib,
+  // The posted card list is POSITIONAL: the backend re-indexes included
+  // cards 0..k-1 and those positions ARE the --rank-gpu-id space (CUDA
+  // order). Post detected cards sorted by cuda_index (detectGPUs already
+  // orders CARDS that way; the sort keeps it true after manual edits),
+  // virtual cards after.
+  const cards = CARDS.slice()
+    .sort((a,b)=>((a.cuda_index!=null?a.cuda_index:1e9)
+                 -(b.cuda_index!=null?b.cuda_index:1e9)))
+    .map(c => ({ name: c.name, total_mib: c.total_mib,
     include: c.include, reserve_gb: c.reserve_gb, virtual: c.virtual }));
   const hostGb = $('host_ram_gb').value.trim();
   const host_ram_mib = hostGb ? Math.round(parseFloat(hostGb)*1024) : HOST_RAM_MIB;
@@ -4026,8 +4100,11 @@ function renderPlacement(pl){
     bar+='</div>';
     const over=c.physical_overcommit
       ? ' <b class="nofitc">EXCEEDS CARD (physically impossible)</b>' : '';
+    // c.gpu_index is CUDA-space (== the rank_gpu_id space); label the nvml
+    // index too via the bridge map so the number is never misread as the
+    // nvidia-smi index.
     h+='<div class="cardblock">'
-      +'<div><b>GPU'+c.gpu_index+'</b> '+esc(c.card_name||'')
+      +'<div><b>'+(devLabel(c.gpu_index, null)||('GPU'+c.gpu_index))+'</b> '+esc(c.card_name||'')
       +' <span class="muted">'
       +(c.card_total_mib?fmtMib(c.card_total_mib)+' total · ':'')
       +'ranks ['+c.ranks.join(',')+']'
@@ -4239,7 +4316,8 @@ function renderLanding(s, tgt){
     pushRing(key+'_util',s.t,g.utilization_pct); pushRing(key+'_pow',s.t,g.power_watts);
     pushRing(key+'_temp',s.t,g.temperature_c); pushRing(key+'_mem',s.t,g.mem_used_mib);
     gh+='<div style="margin:.3rem 0;border-bottom:1px solid #21262d;padding-bottom:.3rem">'
-      +'<b>'+esc(g.name)+'</b> <span class="muted">#'+g.nvml_index+'</span><br>'
+      +'<b>'+esc(g.name)+'</b> <span class="muted" title="cuda: CUDA/FASTEST_FIRST order (the --rank-gpu-id/--base-gpu-id space); nvml: NVML/PCI order (nvidia-smi). Telemetry is NVML-sampled.">'
+      +(devLabel(g.cuda_index, g.nvml_index)||('#'+g.nvml_index))+'</span><br>'
       +'util '+g.utilization_pct+'% '+sparkline(key+'_util',80,18)+' &nbsp; '
       +'pow '+g.power_watts.toFixed(0)+'/'+g.power_limit_w.toFixed(0)+'W '+sparkline(key+'_pow',80,18)+'<br>'
       +'SM/mem '+g.sm_clock_mhz+'/'+g.mem_clock_mhz+'MHz &nbsp; temp '+g.temperature_c+'C '+sparkline(key+'_temp',60,18)+' &nbsp; '
@@ -4280,8 +4358,17 @@ async function renderLandingPlacement(s){
     context_length: cfg.context_length||null, max_running_requests: cfg.max_num_seqs||null,
     speculative_algorithm: (cfg.spec_mode&&cfg.spec_mode!=='off')?cfg.spec_mode:null,
   };
+  // Card inventory keyed in CUDA space: rank_gpu_id (and the default
+  // rank i -> gpu i identity when it is unset, e.g. an external server
+  // without the flag) is CUDA-order, while s.gpus is NVML-sampled. Keying
+  // by nvml_index attributed rank 0 (= cuda:0, the 5090 on this rig) to
+  // the 3080 sitting at nvml:0. cuda_index comes from the snapshot's
+  // device_map bridge; an unbridged card falls back to nvml_index (labeled
+  // ambiguity beats a dropped card).
+  noteCudaMap(s.gpus, (s.gpus||[]).some(g=>g.cuda_index_source==='heuristic')?'heuristic':null);
   const ct={},cn={};
-  (s.gpus||[]).forEach(g=>{ ct[g.nvml_index]=g.mem_total_mib; cn[g.nvml_index]=g.name; });
+  (s.gpus||[]).forEach(g=>{ const k=(g.cuda_index!=null?g.cuda_index:g.nvml_index);
+    ct[k]=g.mem_total_mib; cn[k]=g.name; });
   flags.card_total_mib=ct; flags.card_name=cn;
   try{
     const r=await fetch('/api/placement',{method:'POST',body:JSON.stringify(
@@ -4524,17 +4611,23 @@ function _effectiveTp(){
 function updateGpuPick(){
   const row=$('row_gpu_pick'); if(!row) return;
   // Only DETECTED cards carry a real device index --base-gpu-id can address
-  // (CARDS order is display order, NOT the NVML order; virtual cards have no
-  // physical index at all).
-  const detected=CARDS.filter(c=>c.nvml_index!=null)
-    .sort((a,b)=>a.nvml_index-b.nvml_index);
+  // (CARDS order is display order; virtual cards have no physical index).
+  // --base-gpu-id is a CUDA-ORDER index (it lands in CUDA_VISIBLE_DEVICES),
+  // so the option VALUES are cuda indices, never nvml indices -- on this
+  // rig cuda:0 is the 5090 even though it sits at nvml:1.
+  const detected=CARDS.filter(c=>c.cuda_index!=null || c.nvml_index!=null)
+    .map(c=>({card:c, cuda:(c.cuda_index!=null?c.cuda_index:c.nvml_index),
+              exact:c.cuda_index!=null}))
+    .sort((a,b)=>a.cuda-b.cuda);
   const show=_effectiveTp()===1 && detected.length>0;
   row.style.display=show?'':'none';
   if(!show) return;
   const s=window._flagSettings||{};
   const sel=$('gpu_pick_select');
-  sel.innerHTML=detected.map(c=>'<option value="'+c.nvml_index+'">GPU '
-    +c.nvml_index+' &mdash; '+esc(c.name)+' ('+(c.total_mib/1024).toFixed(0)
+  sel.innerHTML=detected.map(d=>'<option value="'+d.cuda+'">'
+    +(d.exact? devLabel(d.cuda, d.card.nvml_index)
+             : ('gpu '+d.cuda+' (unbridged index!)'))
+    +' &mdash; '+esc(d.card.name)+' ('+(d.card.total_mib/1024).toFixed(0)
     +'G)</option>').join('');
   const cur=(s.base_gpu_id!=null && s.base_gpu_id!=='')? String(s.base_gpu_id):'0';
   sel.value=cur;
@@ -4639,8 +4732,20 @@ function runnerFlags(){
     max_running_requests: $('max_running_requests').value? parseInt($('max_running_requests').value):null,
     include_vision: $('include_vision').checked,
   };
+  // Card inventory for the placement view, keyed in CUDA space (the space
+  // rank_gpu_id / the default rank i -> gpu i identity live in). Detected
+  // cards use their bridged cuda_index; undetected/virtual cards fill the
+  // lowest unused keys (offline planning, where indices are abstract).
   const ct={},cn={};
-  CARDS.forEach((c,i)=>{ ct[i]=c.total_mib; cn[i]=c.name; });
+  const used={};
+  const incl2=CARDS.filter(c=>c.include);
+  incl2.forEach(c=>{ if(c.cuda_index!=null) used[c.cuda_index]=1; });
+  let nextFree=0;
+  incl2.forEach(c=>{
+    let k=c.cuda_index;
+    if(k==null){ while(used[nextFree]) nextFree++; k=nextFree; used[k]=1; }
+    ct[k]=c.total_mib; cn[k]=c.name;
+  });
   f.card_total_mib=ct; f.card_name=cn;
   for(const k of ['rank_mlp_ratio','rank_moe_ratio','rank_vocab_ratio','dcp_size',
     'rank_gpu_memory_mib','rank_kv_ratio','speculative_algorithm',
@@ -4877,12 +4982,13 @@ async function refreshGpuState() {
   try {
     const r = await fetch('/api/gpu_state'); const d = await r.json();
     if (!d.ok) { $('gpu_state_out').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; return; }
-    let h = '<table class="mx"><tr><th>#</th><th>card</th><th>W now</th><th>limit</th>'
+    noteCudaMap(d.cards, null);
+    let h = '<table class="mx"><tr><th>cuda/nvml</th><th>card</th><th>W now</th><th>limit</th>'
           + '<th>%TDP</th><th>SM/MEM MHz</th><th>°C</th><th>state</th></tr>';
     for (const c of d.cards) {
       const tag = c.oc_uv==='stock' ? c.oc_uv
                 : '<b style="color:#e3a008">'+esc(c.oc_uv)+'</b>';
-      h += '<tr><td>'+c.nvml_index+'</td><td style="text-align:left">'+esc(c.name)+'</td>'
+      h += '<tr><td>'+(devLabel(c.cuda_index, c.nvml_index)||c.nvml_index)+'</td><td style="text-align:left">'+esc(c.name)+'</td>'
         + '<td>'+c.power_watts.toFixed(0)+'</td>'
         + '<td>'+c.power_limit_w.toFixed(0)+'/'+c.default_limit_w.toFixed(0)+'</td>'
         + '<td>'+(c.limit_pct_of_default*100).toFixed(0)+'%</td>'

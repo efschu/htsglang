@@ -181,6 +181,23 @@ class TestNvmlPerCard(unittest.TestCase):
         read_gpu_live(nvml=rig)
         self.assertEqual(rig.shutdown_calls, 0)  # caller owns injected nvml
 
+    def test_cuda_index_bridged_and_marked(self):
+        # Every card carries its CUDA-order index (the --rank-gpu-id /
+        # --base-gpu-id space) next to the NVML index. The fake rig's UUIDs
+        # can never match the real torch enumeration, so this exercises the
+        # documented FASTEST_FIRST emulation: the 5090 (nvml:1, the fastest
+        # card) is cuda:0, the 3080 (nvml:0) is cuda:1 -- and the mapping is
+        # honestly marked "heuristic" for the UI.
+        cards = read_gpu_live(nvml=_rig())
+        by_name = {c.name: c for c in cards}
+        self.assertEqual(by_name["RTX 5090"].cuda_index, 0)
+        self.assertEqual(by_name["RTX 3080"].cuda_index, 1)
+        for c in cards:
+            self.assertEqual(c.cuda_index_source, "heuristic")
+            j = c.to_json()
+            self.assertIn("cuda_index", j)
+            self.assertIn("cuda_index_source", j)
+
 
 class TestPrefillSubtractsCache(unittest.TestCase):
     def test_noncached_prefill_excludes_cache_served(self):

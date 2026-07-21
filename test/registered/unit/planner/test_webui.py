@@ -1547,3 +1547,108 @@ class TestProfileArgvMerge(unittest.TestCase):
             ["--a", "1", "--keep", "2", "--flagonly", "--b", "3"],
             {"--a", "--flagonly"})
         self.assertEqual(out, ["--keep", "2", "--b", "3"])
+
+
+class TestDeviceIndexSpaces(CustomTestCase):
+    """CUDA-order vs NVML-order bridging through the dashboard: the detect
+    payload names BOTH indices per card, gpu_state rows gain the cuda index,
+    and the JS keys every rank->card inventory in CUDA space (the space
+    rank_gpu_id / base_gpu_id live in), never in NVML order."""
+
+    def _spec(self):
+        from sglang.srt.planner.hardware import GpuDescriptor, HardwareSpec
+
+        # THE reference box: NVML order [3080, 5090, 3080]; the bridge puts
+        # the 5090 at cuda:0.
+        return HardwareSpec(
+            gpus=(
+                GpuDescriptor(index=0, name="NVIDIA GeForce RTX 3080",
+                              total_mib=20480, free_mib=15000,
+                              cuda_index=1),
+                GpuDescriptor(index=1, name="NVIDIA GeForce RTX 5090",
+                              total_mib=32607, free_mib=30000,
+                              cuda_index=0),
+                GpuDescriptor(index=2, name="NVIDIA GeForce RTX 3080",
+                              total_mib=20480, free_mib=15000,
+                              cuda_index=2),
+            ),
+            source="nvml",
+            host_ram_mib=64000,
+            cuda_index_source="torch",
+        )
+
+    def test_detect_payload_carries_both_indices(self):
+        with mock.patch(
+            "sglang.srt.planner.hardware.hardware_from_nvml",
+            return_value=self._spec(),
+        ):
+            d = webui.detect_hardware()
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["cuda_index_source"], "torch")
+        by_nvml = {g["index"]: g for g in d["gpus"]}
+        self.assertEqual(by_nvml[1]["cuda_index"], 0)   # 5090: nvml:1=cuda:0
+        self.assertEqual(by_nvml[1]["total_mib"], 32607)
+        self.assertEqual(by_nvml[0]["cuda_index"], 1)
+        self.assertEqual(by_nvml[2]["cuda_index"], 2)
+
+    def test_gpu_state_rows_annotated_with_cuda_index(self):
+        from sglang.srt.planner import device_map as dmod
+        from sglang.srt.planner.energy import GpuPowerState
+
+        def _st(i, name):
+            return GpuPowerState(
+                nvml_index=i, name=name, power_watts=100.0,
+                power_limit_w=320.0, default_limit_w=320.0,
+                min_limit_w=100.0, max_limit_w=350.0,
+                limit_pct_of_default=1.0, sm_clock_mhz=1000,
+                mem_clock_mhz=1000, temperature_c=50, oc_uv="stock",
+                clock_offset_mhz=None,
+            )
+
+        dm = dmod.DeviceMap(
+            entries=(
+                dmod.DeviceMapEntry(nvml_index=0, cuda_index=1,
+                                    name="RTX 3080", total_mib=20480,
+                                    uuid="aaaa"),
+                dmod.DeviceMapEntry(nvml_index=1, cuda_index=0,
+                                    name="RTX 5090", total_mib=32607,
+                                    uuid="bbbb"),
+            ),
+            source="torch",
+        )
+        with mock.patch(
+            "sglang.srt.planner.energy.read_gpu_power_states",
+            return_value=[_st(0, "RTX 3080"), _st(1, "RTX 5090")],
+        ), mock.patch.object(dmod, "device_map", return_value=dm):
+            d = webui.gpu_state_payload()
+        self.assertTrue(d["ok"])
+        by_nvml = {c["nvml_index"]: c for c in d["cards"]}
+        self.assertEqual(by_nvml[1]["cuda_index"], 0)
+        self.assertEqual(by_nvml[0]["cuda_index"], 1)
+
+    def test_js_keys_placement_inventory_in_cuda_space(self):
+        html = webui.INDEX_HTML
+        # the shared dual-label helper + the heuristic marker plumbing.
+        for token in ("function devLabel", "function noteCudaMap",
+                      "_cudaNvml", "_cudaMapHeuristic"):
+            self.assertIn(token, html, token)
+        # landing placement inventory: keyed by cuda_index (nvml only as a
+        # labeled fallback), NEVER plainly by nvml_index (the old bug that
+        # attributed rank0 = cuda:0 = the 5090 to the 3080 at nvml:0).
+        self.assertIn("g.cuda_index!=null?g.cuda_index:g.nvml_index", html)
+        self.assertNotIn("ct[g.nvml_index]=g.mem_total_mib", html)
+        # runner placement inventory: detected cards keyed by cuda_index.
+        self.assertIn("c.cuda_index", html)
+        # single-GPU pick: option VALUES are cuda indices with a dual label.
+        self.assertIn("'<option value=\"'+d.cuda", html)
+        # placement card blocks + live telemetry rows use the dual label.
+        self.assertIn("devLabel(c.gpu_index", html)
+        self.assertIn("devLabel(g.cuda_index, g.nvml_index)", html)
+        # detect stores the cuda index on each card row.
+        self.assertIn("cuda_index: (g.cuda_index!=null?g.cuda_index:null)",
+                      html)
+        # the positional plan payload posts detected cards in CUDA order
+        # (backend re-index positions == the --rank-gpu-id space).
+        self.assertIn("a.cuda_index!=null?a.cuda_index:1e9", html)
+        # heuristic mappings are surfaced, not silent.
+        self.assertIn("FASTEST_FIRST emulation", html)

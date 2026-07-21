@@ -56,8 +56,15 @@ class HardwareUnavailable(RuntimeError):
 
 @dataclasses.dataclass(frozen=True)
 class GpuDescriptor:
-    """One physical card. ``index`` is the physical enumeration index the
-    ``--rank-gpu-id`` mapping refers to."""
+    """One physical card.
+
+    INDEX SPACES (the device-order trap): ``index`` is the NVML/PCI-bus
+    enumeration index for source="nvml" specs (list position for manual/json
+    specs). The ENGINE flags (``--rank-gpu-id`` / ``--base-gpu-id``) live in
+    CUDA enumeration order (FASTEST_FIRST) instead, which diverges from NVML
+    order on mixed rigs -- that is ``cuda_index``, bridged per UUID/heuristic
+    by ``planner.device_map`` (None when no bridge is available, e.g. manual
+    specs for another host)."""
 
     index: int
     name: str
@@ -67,6 +74,9 @@ class GpuDescriptor:
     uuid: Optional[str] = None
     pcie_gen: Optional[int] = None
     pcie_width: Optional[int] = None
+    #: CUDA-order index of this card (the --rank-gpu-id/--base-gpu-id space);
+    #: None when unbridged. See planner.device_map.
+    cuda_index: Optional[int] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,6 +86,10 @@ class HardwareSpec:
     source: str
     host_ram_mib: Optional[int] = None
     driver: Optional[str] = None
+    #: How the per-gpu ``cuda_index`` values were resolved: "torch" (exact,
+    #: UUID-bridged) | "heuristic" (FASTEST_FIRST emulation -- surface this
+    #: to the user) | None (no bridge / not a live spec).
+    cuda_index_source: Optional[str] = None
 
     def gpu(self, index: int) -> GpuDescriptor:
         for g in self.gpus:
@@ -202,9 +216,36 @@ def hardware_from_nvml() -> HardwareSpec:
             "The NVML/nvidia-smi inventory returned zero GPUs. Declare the "
             "hardware manually (--gpu 'NAME:TOTAL_MIB' per card)."
         )
+    gpus, cuda_src = _annotate_cuda_indices(gpus)
     return HardwareSpec(
-        gpus=tuple(gpus), source=source, host_ram_mib=_host_ram_mib()
+        gpus=tuple(gpus),
+        source=source,
+        host_ram_mib=_host_ram_mib(),
+        cuda_index_source=cuda_src,
     )
+
+
+def _annotate_cuda_indices(gpus):
+    """Attach each live card's CUDA-order index (the --rank-gpu-id /
+    --base-gpu-id space) via the planner's device_map bridge: by UUID when
+    the card carries one, else by NVML index. Returns ``(gpus, source)``;
+    on any failure the descriptors pass through unbridged (never crashes)."""
+    try:
+        from sglang.srt.planner.device_map import device_map, norm_uuid
+
+        dm = device_map()
+    except Exception:  # pragma: no cover - defensive
+        return gpus, None
+    if not dm.entries:
+        return gpus, None
+    n2c = dm.nvml_to_cuda()
+    out = []
+    for g in gpus:
+        cu = dm.cuda_for_uuid(norm_uuid(g.uuid)) if g.uuid else None
+        if cu is None:
+            cu = n2c.get(g.index)
+        out.append(dataclasses.replace(g, cuda_index=cu))
+    return out, dm.source
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +303,11 @@ def hardware_from_json(path: str) -> HardwareSpec:
                 uuid=g.get("uuid"),
                 pcie_gen=g.get("pcie_gen"),
                 pcie_width=g.get("pcie_width"),
+                cuda_index=(
+                    int(g["cuda_index"])
+                    if g.get("cuda_index") is not None
+                    else None
+                ),
             )
         )
     return HardwareSpec(

@@ -1543,11 +1543,46 @@ def _gpu_flops(g) -> float:
     return 0.0
 
 
+def _cuda_index_at(gpus: Sequence, pos: int) -> Tuple[int, str]:
+    """The CUDA-order index (the space --base-gpu-id / --rank-gpu-id /
+    CUDA_VISIBLE_DEVICES are interpreted in) of the card at LIST position
+    ``pos``, plus how it was resolved.
+
+    The inventory list itself is NVML/detect-ordered (PCI bus), which
+    DIVERGES from CUDA's FASTEST_FIRST order on mixed rigs -- list positions
+    must never be written into cuda-space flags. Resolution:
+      1. an explicit ``cuda_index`` on the descriptor (the detect_hardware
+         payload carries it, bridged by planner.device_map) -> "bridged";
+      2. else the FASTEST_FIRST emulation over the given list (stable sort
+         by SEED fp16 peak, descending) -> "heuristic";
+      3. else the list position itself -> "identity" (last resort, offline).
+    """
+
+    def _cu(g):
+        v = g.get("cuda_index") if isinstance(g, dict) else getattr(
+            g, "cuda_index", None
+        )
+        return int(v) if v is not None else None
+
+    v = _cu(gpus[pos])
+    if v is not None:
+        return v, "bridged"
+    try:
+        from sglang.srt.planner.device_map import emulate_cuda_order
+
+        return emulate_cuda_order(_gpu_names(gpus))[pos], "heuristic"
+    except Exception:  # pragma: no cover - defensive
+        return pos, "identity"
+
+
 def _pick_single_gpu(gpus: Sequence):
-    """Default card for the single-gpu preset: (index, reason) or None.
+    """Default card for the single-gpu preset:
+    ``(list_pos, cuda_index, reason)`` or None.
 
     Rule: largest total VRAM; VRAM tie -> higher FLOPs; full tie -> first.
-    """
+    ``list_pos`` indexes the given inventory list (for sizing against that
+    card); ``cuda_index`` is what --base-gpu-id must pin -- the two are
+    DIFFERENT spaces (list = NVML/detect order, flag = CUDA order)."""
     if not gpus:
         return None
 
@@ -1565,12 +1600,21 @@ def _pick_single_gpu(gpus: Sequence):
         elif _mib(gpus[i]) == _mib(gpus[best]) and _gpu_flops(gpus[i]) > _gpu_flops(gpus[best]):
             best = i
         # full tie: keep the earlier index
+    cuda_idx, cuda_src = _cuda_index_at(gpus, best)
     why = (
-        f"GPU pick: index {best} ({_name(gpus[best])}, {_mib(gpus[best])} MiB) "
-        "-- largest VRAM, ties broken by FLOPs, then first index. "
-        "Selectable in the UI; pinned via the stock --base-gpu-id flag."
+        f"GPU pick: {_name(gpus[best])} ({_mib(gpus[best])} MiB) at "
+        f"cuda:{cuda_idx} -- largest VRAM, ties broken by FLOPs, then first. "
+        "Selectable in the UI; pinned via the stock --base-gpu-id flag, "
+        "which is a CUDA-order index (FASTEST_FIRST), NOT the NVML/"
+        "nvidia-smi index."
+        + (
+            " (cuda index from a FASTEST_FIRST emulation -- heuristic, no "
+            "torch/UUID bridge available)"
+            if cuda_src == "heuristic"
+            else ""
+        )
     )
-    return best, why
+    return best, cuda_idx, why
 
 
 def _hardware_spec(gpus: Sequence):
@@ -1780,26 +1824,35 @@ def _apply_capacity_rules(
 
 # ---------------------------------------------------------------------------
 # Rig calibrations: measured, battery-stable per-quant values for known rigs
-# (matrix/htsglang_local_run.sh, MATRIX_PLAN 3.3). Order-sensitive: the vectors
-# are per-RANK with rank i on physical GPU i (--rank-gpu-id 0,1,2), so they only
-# apply to the enumeration they were MEASURED on. That box enumerates (NVML /
-# nvidia-smi order) as [3080, 5090, 3080] -- the 5090 sits at index 1, NOT 0.
-# Hence tokvec 33,13,18 gives the middle rank (the 5090) the SMALLEST KV share:
-# it carries the largest weight/compute shard, so it has the least room for KV.
-# Any other enumeration gets no calibration (the caller falls back to a derived
-# estimate and says so) -- never remap measured per-rank vectors onto a rig we
-# did not measure.
+# (matrix/htsglang_local_run.sh, MATRIX_PLAN 3.3).
+#
+# INDEX SPACES: the vectors are per-RANK, i.e. in RANK space == CUDA
+# enumeration order. The validated reference launches with --rank-gpu-id
+# 0,1,2 and no CUDA_DEVICE_ORDER, so rank i = cuda:i, and CUDA's default
+# FASTEST_FIRST puts the RTX 5090 at cuda:0 on the reference box -- rank 0
+# IS the 5090. Hence fp8 tokvec 33,13,18 / reserve 3000,2200,2200: rank 0
+# (the 5090, most free VRAM) owns the LARGEST KV share (33) and the biggest
+# reserve (3000); ranks 1/2 are the two 3080s. The NVML/nvidia-smi inventory
+# order ([3080, 5090, 3080] on that box) has NO bearing on rank order, which
+# is why the gate below matches the rig by NAME MULTISET, order-insensitive:
+# any listing order of exactly one 5090 + two 3080s is the same physical rig
+# and gets the same rank-space vectors. Any other rig gets no calibration
+# (the caller falls back to a derived estimate and says so) -- never remap
+# measured per-rank vectors onto a rig we did not measure.
 # ---------------------------------------------------------------------------
 
 def _match_calibration(gpus: Sequence, quant: Optional[str]) -> Optional[dict]:
     """A measured calibration for this exact rig shape + checkpoint quant, or
-    None (callers must then fall back to a derived estimate AND say so)."""
+    None (callers must then fall back to a derived estimate AND say so).
+
+    The gate is ORDER-INSENSITIVE (exact name multiset: one 5090 + two
+    3080s): inventory listing order is NVML/detect order, while the vectors
+    are rank-space (cuda order) -- see the block comment above."""
     names = [n.lower() for n in _gpu_names(gpus)]
     if (
         len(names) == 3
-        and "3080" in names[0]
-        and "5090" in names[1]
-        and "3080" in names[2]
+        and sum(1 for n in names if "5090" in n) == 1
+        and sum(1 for n in names if "3080" in n) == 2
     ):
         if quant == "fp8":
             return {
@@ -2031,16 +2084,20 @@ def profiles(
     # higher-FLOPs card wins; on a full tie the first (lowest index) wins.
     # The pick is a DEFAULT -- the UI offers a selector; base_gpu_id is the
     # stock upstream flag for pinning the card, so this preset stays stock.
+    # base_gpu_id is a CUDA-ORDER index (it lands in CUDA_VISIBLE_DEVICES),
+    # NOT the position in the NVML-ordered inventory list -- the pick emits
+    # the chosen card's cuda_index (on the reference box the 5090 is list
+    # position 1 but cuda:0).
     pick = _pick_single_gpu(gpus)
     info = list(base_notes) + ["Single GPU, no tensor parallelism."]
     overrides: Dict[str, Any] = {"tp_size": 1}
     if pick is not None:
-        idx, why = pick
-        if idx != 0:
-            overrides["base_gpu_id"] = idx
+        _pos, cuda_idx, why = pick
+        if cuda_idx != 0:
+            overrides["base_gpu_id"] = cuda_idx
         info.append(why)
     s = _mk(overrides, info)
-    # Size against the CHOSEN card only, not gpus[0].
+    # Size against the CHOSEN card only (by list position), not gpus[0].
     cap_gpus = [gpus[pick[0]]] if pick is not None else gpus
     _apply_capacity_rules(s, info, model_cfg, cap_gpus, stock_even=True)
     out.append(Profile("single-gpu", "single", s, info=info))
@@ -2098,10 +2155,17 @@ def profiles(
 
     # --- co-location / TP > card-count (MPS required) ---------------------
     # Add ranks beyond the physical card count OR when tp>kv-heads is the point:
-    # place two ranks on the largest card.
-    largest = totals.index(max(totals)) if totals else 0
+    # place two ranks on the largest card. rank_gpu_id entries are CUDA-ORDER
+    # indices (the space CUDA_VISIBLE_DEVICES uses): list(range(ngpu)) covers
+    # every card regardless of inventory order, and the duplicated entry must
+    # be the largest card's cuda_index, NOT its position in the NVML-ordered
+    # inventory list (on the reference box the 5090 is list position 1 but
+    # cuda:0).
+    largest_pos = totals.index(max(totals)) if totals else 0
+    largest_cuda, largest_cuda_src = _cuda_index_at(gpus, largest_pos)
     colo_tp = ngpu + 1
-    rank_gpu = list(range(ngpu)) + [largest]  # extra rank co-locates on largest
+    # extra rank co-locates on the largest card (cuda-space id).
+    rank_gpu = list(range(ngpu)) + [largest_cuda]
     # even budget: the scalar must fit BOTH the smallest solo card (minus a
     # context allowance) and half of the shared largest card (minus a shared
     # 2 GiB allowance) -- otherwise the co-located pair is physically
@@ -2111,11 +2175,17 @@ def profiles(
     )
     info = list(base_notes) + [
         f"tp_size={colo_tp} on {ngpu} cards: rank {colo_tp - 1} "
-        f"co-locates with rank {largest} on physical GPU {largest}. "
+        f"co-locates with rank {largest_cuda} on the largest card "
+        f"({_gpu_names(gpus)[largest_pos]}, cuda:{largest_cuda}). "
         "REQUIRES CUDA MPS (two ranks share one card). "
         f"Uniform per-rank budget {per_rank} MiB; ensure "
-        f"2 x {per_rank} MiB fits GPU {largest}'s total "
-        f"({max(totals)} MiB) -- headroom is the user's responsibility.",
+        f"2 x {per_rank} MiB fits that card's total "
+        f"({max(totals)} MiB) -- headroom is the user's responsibility."
+        + (
+            " (cuda index from a FASTEST_FIRST emulation -- heuristic)"
+            if largest_cuda_src == "heuristic"
+            else ""
+        ),
         "Stock sglang cannot do this; it is a fork capability.",
     ] + list(launch_env_notes)
     s = _mk(
@@ -2139,6 +2209,9 @@ def profiles(
     )
 
     # --- uneven full-split: max-tokens (VRAM-auto) ------------------------
+    # rank_gpu_id list(range(ngpu)) is CUDA-space identity: rank i on cuda:i,
+    # covering every card whatever the NVML inventory order (the validated
+    # reference command's 0,1,2 shape).
     info = list(base_notes) + [
         "Uneven TP with VRAM-proportional shards (--rank-tp-ratio auto) "
         "and weighted uneven-DCP KV-token sharding (SGLANG_UNEVEN_DCP env "
