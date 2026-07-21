@@ -47,6 +47,8 @@ from typing import List, Optional
 
 __all__ = [
     "discover_knobs",
+    "detect_hardware",
+    "gguf_options_for",
     "plan_from_payload",
     "issue_from_payload",
     "matrix_from_payload",
@@ -54,6 +56,58 @@ __all__ = [
     "list_profiles",
     "serve",
 ]
+
+
+# ===========================================================================
+# Hardware auto-detect + GGUF quant picker (design §PART 2 / §PART 1a).
+# ===========================================================================
+
+
+def detect_hardware() -> dict:
+    """Auto-detect the local GPUs (NVML/nvidia-smi) for the selectable card
+    list. Returns ``{ok, gpus:[{index,name,total_mib,free_mib}], host_ram_mib,
+    source}`` or ``{ok:False, error}`` on a GPU-less host — the UI then shows
+    only the manual/virtual add-card path (still fully usable offline)."""
+    from sglang.srt.planner import hardware as hwmod
+
+    try:
+        spec = hwmod.hardware_from_nvml()
+    except hwmod.HardwareUnavailable as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "gpus": [],
+            "host_ram_mib": hwmod._host_ram_mib(),
+        }
+    return {
+        "ok": True,
+        "source": spec.source,
+        "host_ram_mib": spec.host_ram_mib,
+        "gpus": [
+            {
+                "index": g.index,
+                "name": g.name,
+                "total_mib": g.total_mib,
+                "free_mib": g.free_mib,
+            }
+            for g in spec.gpus
+        ],
+    }
+
+
+def gguf_options_for(payload: dict) -> dict:
+    """List the selectable ``.gguf`` checkpoints in a model directory (an
+    Unsloth-style multi-quant export), for the quant dropdown. Empty list for
+    a single-file / safetensors / HF-id model."""
+    from sglang.srt.planner.model import list_gguf_options
+
+    ref = (payload or {}).get("model", "").strip()
+    if not ref:
+        return {"ok": True, "options": []}
+    try:
+        return {"ok": True, "options": list_gguf_options(ref)}
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e), "options": []}
 
 
 # ===========================================================================
@@ -211,10 +265,79 @@ def _float_list(v):
     return [float(x) for x in str(v).replace(" ", "").split(",") if x != ""]
 
 
+def _cards_hardware_and_reserve(hw):
+    """Build a HardwareSpec + per-card free-reserve (MiB) from the structured
+    card list the UI posts (design §PART 2/§PART 3). Each entry:
+    ``{name, total_mib, include, reserve_gb, virtual}``. Only INCLUDED cards
+    are planned; they are re-indexed 0..k-1 (physical ids the --rank-gpu-id map
+    refers to). ``virtual`` cards (hypothetical/future GPUs the user typed) are
+    treated identically — the whole point of an offline planner. Returns
+    ``(HardwareSpec, reserve_mib_list_or_None)``."""
+    from sglang.srt.planner import hardware as hwmod
+
+    cards = [c for c in hw.get("cards", []) if c.get("include", True)]
+    if not cards:
+        raise ValueError(
+            "No cards selected — tick at least one detected GPU or add a "
+            "card (real or hypothetical) to plan against."
+        )
+    gpus = []
+    reserve_mib = []
+    any_reserve = False
+    for i, c in enumerate(cards):
+        total = int(c["total_mib"])
+        if total <= 0:
+            raise ValueError(f"card {c.get('name', i)!r}: VRAM must be positive.")
+        gpus.append(
+            hwmod.GpuDescriptor(
+                index=i,
+                name=str(c.get("name") or f"gpu{i}"),
+                total_mib=total,
+                # Plan against the declared total (offline semantics); a
+                # detected free_mib is not carried so virtual/future cards and
+                # real ones are handled identically.
+            )
+        )
+        r = float(c.get("reserve_gb") or 0)
+        if r < 0:
+            raise ValueError(f"card {c.get('name', i)!r}: reserve must be >= 0.")
+        if r > 0:
+            any_reserve = True
+        reserve_mib.append(int(r * 1024))
+    host_ram = hw.get("host_ram_mib")
+    spec = hwmod.HardwareSpec(
+        gpus=tuple(gpus),
+        source="manual",
+        host_ram_mib=int(host_ram) if host_ram else hwmod._host_ram_mib(),
+    )
+    return spec, (reserve_mib if any_reserve else None)
+
+
+def _hardware_and_reserve(payload):
+    """Resolve (HardwareSpec, per-card free-reserve MiB) from a plan payload,
+    supporting BOTH the new structured card list (source="cards", per-card
+    reserve — design §PART 2/3) and the legacy modes (manual "NAME:MIB" list /
+    nvml / json_inline, with the top-level ``plan_free_reserve_gb`` knob). The
+    legacy path is untouched so existing CLI/test payloads keep working."""
+    hw = payload.get("hardware", {}) or {}
+    if hw.get("source") == "cards":
+        return _cards_hardware_and_reserve(hw)
+    hardware = _load_hardware_from_payload(hw)
+    reserve = _float_list(payload.get("plan_free_reserve_gb"))
+    reserve_mib = None
+    if reserve is not None:
+        if len(reserve) == 1:
+            reserve = reserve * len(hardware.gpus)
+        reserve_mib = [int(v * 1024) for v in reserve]
+    return hardware, reserve_mib
+
+
 def _load_hardware_from_payload(hw):
     from sglang.srt.planner import hardware as hwmod
 
     source = (hw or {}).get("source", "manual")
+    if source == "cards":
+        return _cards_hardware_and_reserve(hw)[0]
     if source == "nvml":
         return hwmod.hardware_from_nvml()
     if source == "json_inline":
@@ -250,6 +373,11 @@ def _plan_to_dict(result, model_path: str) -> dict:
         "inputs": dataclasses.asdict(result.inputs),
         "capacity": dataclasses.asdict(cap) if cap is not None else None,
         "advantage": dataclasses.asdict(adv) if adv is not None else None,
+        "offload": (
+            dataclasses.asdict(result.offload)
+            if result.offload is not None
+            else None
+        ),
     }
 
 
@@ -260,11 +388,17 @@ def plan_from_payload(payload: dict) -> dict:
     from sglang.srt.planner.model import resolve_model_ref
 
     try:
-        model_path = resolve_model_ref(payload["model"])
+        model_path = resolve_model_ref(
+            payload["model"], gguf_choice=payload.get("gguf_choice") or None
+        )
     except (ValueError, KeyError) as e:
         return {"valid": False, "reasons": [f"model: {e}"]}
 
-    hardware = _load_hardware_from_payload(payload.get("hardware", {}))
+    hw_payload = payload.get("hardware", {})
+    try:
+        hardware, reserve_mib = _hardware_and_reserve(payload)
+    except (ValueError, KeyError) as e:
+        return {"valid": False, "reasons": [f"hardware: {e}"]}
 
     mem = _int_list(payload.get("rank_gpu_memory_mib"))
     rank_gpu_id = _int_list(payload.get("rank_gpu_id"))
@@ -276,13 +410,7 @@ def plan_from_payload(payload: dict) -> dict:
         )
         mem = mem * int(tp_guess)
 
-    reserve = _float_list(payload.get("plan_free_reserve_gb"))
-    reserve_mib = None
-    if reserve is not None:
-        if len(reserve) == 1:
-            reserve = reserve * len(hardware.gpus)
-        reserve_mib = [int(v * 1024) for v in reserve]
-
+    host_ram_mib = payload.get("host_ram_mib") or hw_payload.get("host_ram_mib")
     try:
         result = plan(
             model_path,
@@ -308,6 +436,7 @@ def plan_from_payload(payload: dict) -> dict:
             )
             or None,
             max_running_requests=payload.get("max_running_requests") or None,
+            host_ram_mib=int(host_ram_mib) if host_ram_mib else None,
         )
     except PlanRejected as e:
         return {"valid": False, "reasons": e.reasons}
@@ -549,6 +678,12 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"error": str(e)})
             return
+        if self.path.startswith("/api/detect"):
+            try:
+                self._json(200, detect_hardware())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
         self._send(404, "not found", "text/plain")
 
     def do_POST(self):
@@ -558,6 +693,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": f"bad json: {e}"})
             return
         try:
+            if self.path.startswith("/api/gguf_options"):
+                self._json(200, gguf_options_for(payload))
+                return
             if self.path.startswith("/api/plan"):
                 self._json(200, plan_from_payload(payload))
                 return
@@ -623,6 +761,18 @@ INDEX_HTML = r"""<!doctype html>
   button { background: #1f6feb; color: #fff; border: 0; border-radius: 6px;
            padding: .5rem .9rem; font: inherit; font-size: .8rem; cursor: pointer; }
   button.secondary { background: #30363d; }
+  button.mini { padding: .18rem .5rem; font-size: .68rem; }
+  .cardlist { display: flex; flex-direction: column; gap: .35rem; }
+  .cardrow { display: grid; grid-template-columns: auto 1fr auto auto;
+             gap: .4rem; align-items: center; background: #12171e;
+             border: 1px solid #263041; border-radius: 6px; padding: .3rem .45rem; }
+  .cardrow input[type=text] { padding: .2rem .35rem; font-size: .74rem; }
+  .cardrow .vram { width: 5.2rem; text-align: right; }
+  .cardrow .resv { width: 4rem; text-align: right; }
+  .cardrow .cap { font-size: .64rem; color: #7f8b99; }
+  .cardrow.excluded { opacity: .45; }
+  .cardrow input[type=checkbox] { width: auto; }
+  .verdict.offload { background: #33280f; color: #e3b341; border: 1px solid #7a5c14; }
   .verdict { font-size: 1rem; font-weight: 700; padding: .55rem .7rem;
              border-radius: 7px; margin-bottom: .8rem; }
   .fit { background: #10331d; color: #56d364; border: 1px solid #1c6b34; }
@@ -720,23 +870,39 @@ INDEX_HTML = r"""<!doctype html>
 <div class="cols">
   <div>
     <fieldset>
-      <legend>model + hardware</legend>
-      <label>Model (config.json dir, .gguf file, or HF id)</label>
-      <input id="model" placeholder="/path/to/Qwen3.6-27B-AWQ or org/model">
-      <label>Hardware</label>
-      <select id="hw_source">
-        <option value="manual">manual (declare cards)</option>
-        <option value="nvml">live NVML / nvidia-smi</option>
-      </select>
-      <label>Cards (one per line: NAME:TOTAL_MIB, or 20g for GiB)</label>
-      <textarea id="gpus" rows="3" placeholder="RTX 5090:32607&#10;RTX 3080:20480&#10;RTX 3080:20480"></textarea>
+      <legend>model</legend>
+      <label>Model (config.json dir, .gguf file, GGUF dir, or HF id)</label>
+      <input id="model" placeholder="/path/to/Qwen3.6-27B-AWQ or org/model" onchange="onModelChange()">
+      <div id="gguf_pick" style="display:none">
+        <label>GGUF quant (this dir holds several &mdash; pick one)</label>
+        <select id="gguf_choice"></select>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>hardware &mdash; tick the cards to plan on
+        <button class="secondary mini" onclick="detectGPUs()" title="re-query NVML">detect</button></legend>
+      <div id="detect_note" class="muted" style="margin-bottom:.4rem">detecting local GPUs…</div>
+      <div id="cardlist" class="cardlist"></div>
+      <div class="actions" style="margin-top:.4rem">
+        <button class="secondary mini" onclick="addCard(false)">+ add card</button>
+        <button class="secondary mini" onclick="addCard(true)" title="a hypothetical GPU you don't own yet">+ add future GPU</button>
+      </div>
+      <div class="muted" style="margin-top:.4rem">Tick = include in the plan.
+        &ldquo;keep free&rdquo; is per-card headroom (a display / another
+        process) carved off before sizing. Add real or hypothetical cards to
+        see what a future rig could run.</div>
+      <label style="margin-top:.5rem">Host RAM total (GiB) &mdash; for RAM-offload fit</label>
+      <input id="host_ram_gb" placeholder="(auto-detected; override to plan another host)">
     </fieldset>
 
     <fieldset>
       <legend>plan &mdash; blank = auto-derive</legend>
       <div id="knobs"></div>
       <label>tp-size</label>
-      <input id="tp_size" placeholder="(= #cards, or set)">
+      <input id="tp_size" placeholder="(= #included cards, or set)">
+      <label>max concurrent requests (mamba/SSM pool scales with this)</label>
+      <input id="max_running_requests" placeholder="(auto; e.g. 1 for single-user)">
       <label>kv-cache-dtype</label>
       <input id="kv_cache_dtype" placeholder="auto | fp8_e4m3">
       <label>quant descriptor (for the issue text)</label>
@@ -768,7 +934,10 @@ let KNOBS = [];
 
 async function loadKnobs() {
   const r = await fetch('/api/knobs'); const d = await r.json();
-  KNOBS = d.knobs;
+  // plan_free_reserve_gb is now a PER-CARD input in the hardware panel
+  // (design §PART 3), so drop it from the generic knob list to avoid two
+  // places to set the same thing.
+  KNOBS = d.knobs.filter(k => k.id !== 'plan_free_reserve_gb');
   const box = $('knobs'); box.innerHTML = '';
   for (const k of KNOBS) {
     if (k.id === 'kv_token_vector' && k.env) k.label += ' (env ' + k.env + ')';
@@ -785,15 +954,103 @@ async function loadKnobs() {
     + d.detected_fields.map(f => '<span class="pill">'+f+'</span>').join('') + '</span>';
 }
 
+// ---- hardware card list (detect + select + per-card reserve + virtual) ----
+let CARDS = [];          // {name,total_mib,include,reserve_gb,virtual,free_mib}
+let HOST_RAM_MIB = null;
+
+async function detectGPUs() {
+  const r = await fetch('/api/detect'); const d = await r.json();
+  if (d.host_ram_mib) { HOST_RAM_MIB = d.host_ram_mib;
+    if (!$('host_ram_gb').value) $('host_ram_gb').placeholder =
+      '(detected '+(d.host_ram_mib/1024).toFixed(0)+' GiB; override to plan another host)'; }
+  if (d.ok && d.gpus && d.gpus.length) {
+    // Replace any previously-detected rows; keep user-added virtual cards.
+    CARDS = CARDS.filter(c => c.virtual);
+    for (const g of d.gpus) CARDS.unshift({
+      name: g.name, total_mib: g.total_mib, include: true,
+      reserve_gb: 0, virtual: false, free_mib: g.free_mib });
+    $('detect_note').textContent = 'detected '+d.gpus.length+' GPU(s) via '+(d.source||'nvml');
+  } else {
+    $('detect_note').textContent = 'no GPU detected'+(d.error?' ('+d.error+')':'')
+      + ' — add cards (real or hypothetical) below.';
+    if (!CARDS.length) addCard(false);
+  }
+  renderCards();
+}
+
+function addCard(virtual) {
+  CARDS.push({ name: virtual ? 'Future GPU' : 'RTX ????',
+    total_mib: virtual ? 32768 : 16384, include: true, reserve_gb: 0,
+    virtual: !!virtual, free_mib: null });
+  renderCards();
+}
+
+function renderCards() {
+  const box = $('cardlist'); box.innerHTML = '';
+  CARDS.forEach((c, i) => {
+    const row = document.createElement('div');
+    row.className = 'cardrow' + (c.include ? '' : ' excluded');
+    // checkbox (include)
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = c.include;
+    cb.onchange = () => { c.include = cb.checked; renderCards(); };
+    // name + capability tag
+    const nameWrap = document.createElement('span');
+    const name = document.createElement('input');
+    name.type = 'text'; name.value = c.name;
+    name.onchange = () => { c.name = name.value; };
+    nameWrap.appendChild(name);
+    const tag = document.createElement('span'); tag.className = 'cap';
+    tag.textContent = c.virtual ? ' virtual'
+      : (c.free_mib != null ? ' ' + (c.free_mib/1024).toFixed(1) + 'G free' : '');
+    nameWrap.appendChild(tag);
+    // VRAM (MiB)
+    const vramWrap = document.createElement('span'); vramWrap.title = 'total VRAM (MiB)';
+    const vram = document.createElement('input');
+    vram.type = 'text'; vram.className = 'vram'; vram.value = c.total_mib;
+    vram.onchange = () => { c.total_mib = parseInt(vram.value) || 0; };
+    vramWrap.appendChild(vram); vramWrap.appendChild(document.createTextNode(' MiB'));
+    // per-card reserve (keep N GiB free)
+    const resWrap = document.createElement('span');
+    resWrap.title = 'keep this many GiB free on this card';
+    resWrap.appendChild(document.createTextNode('keep '));
+    const res = document.createElement('input');
+    res.type = 'text'; res.className = 'resv'; res.value = c.reserve_gb;
+    res.onchange = () => { c.reserve_gb = parseFloat(res.value) || 0; };
+    resWrap.appendChild(res); resWrap.appendChild(document.createTextNode(' G'));
+    row.appendChild(cb); row.appendChild(nameWrap);
+    row.appendChild(vramWrap); row.appendChild(resWrap);
+    box.appendChild(row);
+  });
+}
+
+async function onModelChange() {
+  const m = $('model').value.trim();
+  $('gguf_pick').style.display = 'none';
+  if (!m) return;
+  const r = await fetch('/api/gguf_options', {method:'POST', body: JSON.stringify({model:m})});
+  const d = await r.json();
+  if (d.ok && d.options && d.options.length > 1) {
+    const sel = $('gguf_choice');
+    sel.innerHTML = d.options.map(o=>'<option value="'+esc(o)+'">'+esc(o)+'</option>').join('');
+    $('gguf_pick').style.display = '';
+  }
+}
+
 function payload() {
+  const cards = CARDS.map(c => ({ name: c.name, total_mib: c.total_mib,
+    include: c.include, reserve_gb: c.reserve_gb, virtual: c.virtual }));
+  const hostGb = $('host_ram_gb').value.trim();
+  const host_ram_mib = hostGb ? Math.round(parseFloat(hostGb)*1024) : HOST_RAM_MIB;
   const p = {
     model: $('model').value.trim(),
-    hardware: { source: $('hw_source').value,
-      gpus: $('gpus').value.split('\n').map(s=>s.trim()).filter(Boolean) },
+    hardware: { source: 'cards', cards, host_ram_mib },
     tp_size: $('tp_size').value ? parseInt($('tp_size').value) : null,
+    max_running_requests: $('max_running_requests').value ? parseInt($('max_running_requests').value) : null,
     kv_cache_dtype: $('kv_cache_dtype').value.trim(),
     quant: $('quant').value.trim(),
   };
+  if ($('gguf_pick').style.display !== 'none') p.gguf_choice = $('gguf_choice').value;
   for (const k of KNOBS) {
     const v = $('knob_' + k.id).value.trim();
     if (v !== '') p[k.id] = v;
@@ -822,12 +1079,39 @@ function render(d) {
     return;
   }
   const cap = d.capacity;
-  $('verdict').innerHTML = d.fits
-    ? '<div class="verdict fit">FITS &check; <span class="est">(estimate &mdash; the runtime measures real free bytes)</span></div>'
-    : '<div class="verdict nofit">DOES NOT FIT</div>';
-  if (!d.fits) {
-    $('split').innerHTML = '<ul class="reasons">' +
+  const off = d.offload;
+  // Three honest states: fits-in-VRAM (fast) / fits-with-RAM-offload (slower,
+  // PCIe-bound) / genuinely cannot fit (design §PART 4).
+  if (d.fits) {
+    $('verdict').innerHTML = '<div class="verdict fit">FITS IN VRAM &check; '
+      + '<span class="est">(estimate &mdash; the runtime measures real free bytes)</span></div>';
+  } else if (off && off.status === 'ram_offload') {
+    $('verdict').innerHTML = '<div class="verdict offload">FITS WITH ~'
+      + off.offloaded_gib.toFixed(1) + ' GiB ON HOST RAM &mdash; slower (PCIe-bound)</div>';
+  } else {
+    $('verdict').innerHTML = '<div class="verdict nofit">DOES NOT FIT</div>';
+  }
+  // offload detail line
+  let offHtml = '';
+  if (off && off.status !== 'vram') {
+    offHtml = '<div class="adv"><b>RAM-offload:</b> ' + esc(off.note);
+    if (off.per_rank_offloaded_gib && off.offloaded_gib > 0)
+      offHtml += '<br><span class="muted">per-rank to host: ['
+        + off.per_rank_offloaded_gib.map(x=>x.toFixed(1)).join(', ') + '] GiB'
+        + (off.host_ram_total_mib ? ' · host total '+(off.host_ram_total_mib/1024).toFixed(0)+' GiB' : '')
+        + '</span>';
+    offHtml += '</div>';
+  }
+  if (!d.fits && off && off.status === 'ram_offload') {
+    // Show capacity as usual (it fits with offload) plus the offload note.
+    $('split').innerHTML = offHtml +
+      '<ul class="reasons"><li>Does not fit in VRAM alone:</li>' +
       (d.infeasible_reasons||[]).map(x=>'<li>'+esc(x)+'</li>').join('') + '</ul>';
+  } else if (!d.fits) {
+    $('split').innerHTML = offHtml + '<ul class="reasons">' +
+      (d.infeasible_reasons||[]).map(x=>'<li>'+esc(x)+'</li>').join('') + '</ul>';
+  } else if (offHtml) {
+    $('split').innerHTML = offHtml;
   } else {
     let s = '';
     if (cap) {
@@ -1001,6 +1285,7 @@ async function doLandscape() {
 }
 
 loadKnobs();
+detectGPUs();
 </script>
 </body>
 </html>

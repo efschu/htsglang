@@ -25,42 +25,80 @@ from __future__ import annotations
 
 import glob
 import os
+from typing import List, Optional
 
-__all__ = ["resolve_model_ref"]
+__all__ = ["resolve_model_ref", "list_gguf_options"]
 
 
-def resolve_model_ref(model_ref: str) -> str:
+def _is_sidecar_gguf(basename: str) -> bool:
+    """A .gguf that is NOT a checkpoint to serve: the importance-matrix file
+    (``imatrix``/``*_imatrix*``) and the vision projector (``mmproj-*``) that
+    ships beside a multimodal GGUF. Neither is a text checkpoint the planner
+    sizes, so both are excluded from the selectable list."""
+    b = basename.lower()
+    return "imatrix" in b or b.startswith("mmproj") or "mmproj" in b
+
+
+def list_gguf_options(model_ref: str) -> List[str]:
+    """The selectable checkpoint ``.gguf`` files in a directory (sidecars
+    excluded), as bare filenames sorted for a stable dropdown. Empty when
+    ``model_ref`` is not a directory or holds no checkpoint .gguf. Used by the
+    web UI to offer a quant picker for an Unsloth-style multi-gguf export."""
+    if not os.path.isdir(model_ref):
+        return []
+    ggufs = sorted(
+        os.path.basename(g) for g in glob.glob(os.path.join(model_ref, "*.gguf"))
+    )
+    return [g for g in ggufs if not _is_sidecar_gguf(g)]
+
+
+def resolve_model_ref(model_ref: str, gguf_choice: Optional[str] = None) -> str:
     """Resolve a model reference to the path the cost model consumes.
 
     Accepted forms:
       * a directory containing ``config.json``  (HF checkpoint layout);
       * a ``.gguf`` file path;
-      * a directory containing exactly one ``*.gguf`` and no ``config.json``
-        -> resolved to that file (a bare GGUF download dir);
+      * a directory containing ``*.gguf`` files (a GGUF download dir, with or
+        WITHOUT a config.json beside them) -> resolved to a .gguf file: the
+        single checkpoint if there is exactly one, or the ``gguf_choice`` the
+        caller selected when there are several;
       * an HF hub id -> ``config.json`` is fetched into the HF cache
         (config only; no weights, no tokenizer).
 
-    Note: a GGUF dir that ALSO carries a config.json (e.g. Unsloth exports)
-    resolves to the ``.gguf`` file, matching how the server is launched on a
-    GGUF checkpoint (the byte model must come from the ggml tensor types,
-    not from the BF16-shaped config.json).
+    A GGUF dir that ALSO carries a config.json (e.g. Unsloth exports) resolves
+    to the ``.gguf`` file, NOT the directory: the config.json in those exports
+    is the BF16-shaped source config (hidden_size/num_layers of the unquantized
+    model), so sizing from it would over-count the weights ~4x ("no space" when
+    there is space). The real quant bytes must come from the ggml tensor types
+    in the GGUF header, exactly as the server loads it.
+
+    ``gguf_choice`` (bare filename) selects one file from a multi-gguf dir;
+    sidecar files (``imatrix``, ``mmproj-*``) are never selectable.
     """
     if os.path.isfile(model_ref):
         return model_ref
 
     if os.path.isdir(model_ref):
-        ggufs = sorted(glob.glob(os.path.join(model_ref, "*.gguf")))
-        # Exclude importance-matrix side files which are not checkpoints.
-        ggufs = [g for g in ggufs if "imatrix" not in os.path.basename(g).lower()]
-        if ggufs:
-            if len(ggufs) > 1:
-                raise ValueError(
-                    f"{model_ref} contains {len(ggufs)} .gguf files "
-                    f"({[os.path.basename(g) for g in ggufs]}); point --model "
-                    "at the specific .gguf file to plan."
-                )
-            return ggufs[0]
-        if os.path.isfile(os.path.join(model_ref, "config.json")):
+        options = list_gguf_options(model_ref)
+        has_config = os.path.isfile(os.path.join(model_ref, "config.json"))
+        if options:
+            if gguf_choice is not None:
+                choice = os.path.basename(gguf_choice)
+                if choice not in options:
+                    raise ValueError(
+                        f"gguf_choice {gguf_choice!r} is not one of the "
+                        f"checkpoint .gguf files in {model_ref}: {options}."
+                    )
+                return os.path.join(model_ref, choice)
+            if len(options) == 1:
+                return os.path.join(model_ref, options[0])
+            raise ValueError(
+                f"{model_ref} contains {len(options)} .gguf checkpoints "
+                f"({options}); pick one (--model <dir>/<file.gguf>, or use the "
+                "quant dropdown in the web UI)."
+            )
+        # No .gguf checkpoint -> a plain HF/safetensors dir.
+        if has_config:
             return model_ref
         raise ValueError(
             f"{model_ref} is a directory with neither config.json nor a "

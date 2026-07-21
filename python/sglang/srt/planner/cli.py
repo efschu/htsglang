@@ -121,6 +121,15 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--speculative-draft-model-path", default=None)
     m.add_argument("--max-running-requests", type=int, default=None)
     m.add_argument("--disable-cuda-graph", action="store_true")
+    m.add_argument(
+        "--host-ram-gb",
+        type=float,
+        default=None,
+        help="Host RAM total (GiB) for the RAM-offload fit check. When a model "
+        "does not fit in VRAM, the planner reports whether it fits with MoE "
+        "routed experts tiered to host RAM (slower, PCIe-bound). Default: "
+        "auto-detected from the local host.",
+    )
     p.add_argument(
         "--json", action="store_true", help="Machine-readable JSON output."
     )
@@ -276,12 +285,23 @@ def _print_report(result, model_path: str) -> None:
         print(f"  {f}")
     print()
 
-    if not result.fits:
+    off = result.offload
+    if result.fits:
+        print("FITS: yes in VRAM (estimate — the runtime measures real free bytes)")
+    elif off is not None and off.status == "ram_offload":
+        print(
+            f"FITS: with ~{off.offloaded_gib:.1f} GiB offloaded to HOST RAM "
+            "(SLOWER — PCIe-bound MoE expert-offload)"
+        )
+        for r in result.infeasible_reasons:
+            print(f"  ✗ (VRAM alone) {r}")
+        print(f"  → {off.note}")
+    else:
         print("FITS: NO")
         for r in result.infeasible_reasons:
             print(f"  ✗ {r}")
-    else:
-        print("FITS: yes (estimate — the runtime measures real free bytes)")
+        if off is not None and off.status == "cannot_fit":
+            print(f"  → {off.note}")
     if cap is not None:
         if cap.feasible:
             print(
@@ -548,6 +568,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             speculative_draft_model_path=args.speculative_draft_model_path,
             max_running_requests=args.max_running_requests,
             disable_cuda_graph=args.disable_cuda_graph,
+            host_ram_mib=(
+                int(args.host_ram_gb * 1024)
+                if args.host_ram_gb is not None
+                else None
+            ),
         )
     except PlanRejected as e:
         if args.json:
@@ -573,6 +598,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             "advantage": (
                 dataclasses.asdict(result.advantage)
                 if result.advantage is not None
+                else None
+            ),
+            "offload": (
+                dataclasses.asdict(result.offload)
+                if result.offload is not None
                 else None
             ),
         }
