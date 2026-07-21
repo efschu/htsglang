@@ -2269,6 +2269,33 @@ class ServerArgs:
             choices=["auto", "resident", "offload", "offload-scratch"],
         ),
     ] = "auto"
+    speculative_draft_placement: A[
+        str,
+        Arg(
+            help="Where the speculative draft model runs. 'split' (default): "
+            "the draft is tensor-parallel-sharded across all TP ranks exactly "
+            "like today -- byte-identical behavior whether this flag is "
+            "omitted or set to 'split'. 'solo': the draft runs UNSHARDED on "
+            "ONE designated rank (see --speculative-draft-gpu) and broadcasts "
+            "its k draft-token ids to the other ranks once per round; the "
+            "other ranks build the draft model on the meta device (no draft "
+            "weights, no draft KV pool, no draft CUDA graphs) and skip the "
+            "draft forward entirely. On no-P2P rigs this replaces the k "
+            "per-round host-staged draft all-reduces with one small "
+            "broadcast. Solo scope (v1): EAGLE/EAGLE3/NEXTN family, "
+            "topk == 1, no rejection sampling, pure single-node TP.",
+            choices=["split", "solo"],
+        ),
+    ] = "split"
+    speculative_draft_gpu: A[
+        Optional[int],
+        "CUDA device index (torch.cuda order, same space as --rank-gpu-id) "
+        "whose TP rank hosts the solo draft under --speculative-draft-placement "
+        "solo. The hosting RANK is resolved from this device index via the "
+        "rank -> GPU mapping (--rank-gpu-id or the base-gpu-id/gpu-id-step "
+        "formula). Default: unset -> TP rank 0 hosts the draft. Only valid "
+        "with --speculative-draft-placement solo.",
+    ] = None
 
     # Decoupled speculative decoding: draft and verify run as
     # separate engines, currently connected by a ZMQ IPC mesh.
@@ -3437,6 +3464,16 @@ class ServerArgs:
 
         handle_speculative_decoding(self)
 
+        # Draft-solo placement (--speculative-draft-placement solo): validate
+        # scope and hard-reject out-of-scope modes (topk > 1, rejection
+        # sampling, DP/PP/EP, non-EAGLE-family algorithms) up front, so an
+        # unsupported config fails at arg-parse rather than desyncing the
+        # solo broadcast contract into a runtime NCCL hang. Runs AFTER
+        # handle_speculative_decoding so the algorithm alias is resolved
+        # (NEXTN -> EAGLE, Gemma4 assistant draft -> FROZEN_KV_MTP) and the
+        # speculative defaults (topk, num_steps) are final.
+        self._handle_speculative_draft_placement()
+
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
 
@@ -3696,6 +3733,159 @@ class ServerArgs:
                     "weighted token vector); the static slot->tier map is "
                     "defined on the even compaction loc // dcp_size."
                 )
+
+    def speculative_draft_solo_active(self) -> bool:
+        """True when the draft-solo placement is requested
+        (--speculative-draft-placement solo)."""
+        return self.speculative_draft_placement == "solo"
+
+    def speculative_draft_solo_rank(self) -> int:
+        """The TP rank that hosts the UNSHARDED solo draft.
+
+        Resolved from --speculative-draft-gpu (a CUDA device index) via the
+        same rank -> GPU mapping the schedulers use (gpu_id_for_tp_rank:
+        --rank-gpu-id wins, else base_gpu_id/gpu_id_step). Unset -> rank 0.
+        With --rank-gpu-id co-location (several ranks on one device) the
+        FIRST rank mapped to the device hosts the draft. Only meaningful
+        after _handle_speculative_draft_placement validated the config.
+        """
+        if self.speculative_draft_gpu is None:
+            return 0
+        for tp_rank in range(self.tp_size):
+            if (
+                self.gpu_id_for_rank(0, tp_rank, 1, self.tp_size)
+                == self.speculative_draft_gpu
+            ):
+                return tp_rank
+        raise ValueError(
+            f"--speculative-draft-gpu={self.speculative_draft_gpu} does not "
+            "match any TP rank's device. Rank -> device mapping: "
+            + ", ".join(
+                f"rank {r} -> cuda:{self.gpu_id_for_rank(0, r, 1, self.tp_size)}"
+                for r in range(self.tp_size)
+            )
+        )
+
+    def _handle_speculative_draft_placement(self):
+        """Validate the draft-solo placement (--speculative-draft-placement
+        solo) and hard-reject every out-of-scope mode up front.
+
+        Solo runs an ASYMMETRIC draft phase: the solo rank drafts with an
+        unsharded draft model while the other ranks wait on one token-id
+        broadcast. Any mode that (a) needs more than the k token ids from the
+        draft (rejection sampling wants draft probs), (b) reshapes the draft
+        round (topk > 1 trees), or (c) multiplies scheduler instances with
+        divergent batches (DP/PP) would desync the broadcast contract into a
+        silent NCCL hang -- so they are rejected here (fail fast), mirroring
+        _handle_weightless_kv_fastlane."""
+        if self.speculative_draft_placement == "split":
+            if self.speculative_draft_gpu is not None:
+                raise ValueError(
+                    "--speculative-draft-gpu is only meaningful with "
+                    "--speculative-draft-placement solo (it picks the rank "
+                    "hosting the unsharded solo draft)."
+                )
+            return
+
+        if self.speculative_algorithm is None:
+            raise ValueError(
+                "--speculative-draft-placement solo requires a speculative "
+                "algorithm (--speculative-algorithm EAGLE/EAGLE3/NEXTN)."
+            )
+
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        algo = SpeculativeAlgorithm.from_string(self.speculative_algorithm)
+        # v1 scope: only the EagleDraftWorker family (EAGLE / EAGLE3 / NEXTN).
+        # FROZEN_KV_MTP is is_eagle() but architecturally CANNOT go solo: its
+        # draft attends over the TARGET's KV pool in place, and under TP/DCP
+        # the solo rank holds only its head/token shard of that pool -- the
+        # full target KV a solo frozen draft would need does not exist on any
+        # single rank.
+        if algo.is_frozen_kv_mtp():
+            raise ValueError(
+                "--speculative-draft-placement solo does not support "
+                "FROZEN_KV_MTP: the frozen draft reads the target KV cache in "
+                "place, and no single rank holds the full target KV under "
+                "TP/DCP. Use placement 'split' for FROZEN_KV_MTP."
+            )
+        if not algo.is_eagle():
+            raise ValueError(
+                "--speculative-draft-placement solo supports the EAGLE-family "
+                "v2 worker only (EAGLE / EAGLE3 / NEXTN); got "
+                f"--speculative-algorithm={self.speculative_algorithm} "
+                "(DFLASH / STANDALONE / NGRAM / DSPARK are not yet supported)."
+            )
+        if self.enable_multi_layer_eagle:
+            raise ValueError(
+                "--speculative-draft-placement solo does not support "
+                "--enable-multi-layer-eagle (its draft worker variant does "
+                "not implement the solo broadcast contract)."
+            )
+        if self.speculative_eagle_topk is not None and self.speculative_eagle_topk > 1:
+            raise ValueError(
+                "--speculative-draft-placement solo requires "
+                "--speculative-eagle-topk 1 (linear draft chain): solo "
+                "broadcasts ONLY the k chain token ids; a topk > 1 tree "
+                f"would need scores/parents too. Got topk="
+                f"{self.speculative_eagle_topk}."
+            )
+        if self.speculative_use_rejection_sampling:
+            raise ValueError(
+                "--speculative-draft-placement solo does not support "
+                "--speculative-use-rejection-sampling: solo broadcasts ONLY "
+                "the draft token ids, while rejection sampling needs the "
+                "per-step draft PROBABILITIES on every verifying rank. Use "
+                "threshold acceptance, or placement 'split'."
+            )
+        # Pure single-node TP only.
+        if self.dp_size > 1 or self.enable_dp_attention:
+            raise ValueError(
+                "--speculative-draft-placement solo supports pure "
+                "single-node Tensor Parallelism only; it cannot be combined "
+                f"with data parallelism (dp_size={self.dp_size}, "
+                f"enable_dp_attention={self.enable_dp_attention})."
+            )
+        if self.pp_size > 1:
+            raise ValueError(
+                "--speculative-draft-placement solo supports pure "
+                "single-node Tensor Parallelism only; it cannot be combined "
+                f"with pipeline parallelism (pp_size={self.pp_size})."
+            )
+        if self.ep_size > 1:
+            raise ValueError(
+                "--speculative-draft-placement solo supports pure "
+                "single-node Tensor Parallelism only; it cannot be combined "
+                f"with expert parallelism (ep_size={self.ep_size}): a MoE "
+                "draft's EP dispatch would add collectives the non-solo "
+                "ranks do not mirror."
+            )
+        if self.nnodes > 1:
+            raise ValueError(
+                "--speculative-draft-placement solo is single-node only; got "
+                f"nnodes={self.nnodes}."
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "--speculative-draft-placement solo does not support PD "
+                "disaggregation (the disagg KV transfer assumes the split "
+                "draft-KV topology); got disaggregation_mode="
+                f"{self.disaggregation_mode}."
+            )
+        if self.tp_size < 2:
+            raise ValueError(
+                "--speculative-draft-placement solo needs --tp-size >= 2: "
+                "with tp_size=1 the draft already runs whole on one rank -- "
+                "use the default placement 'split'."
+            )
+        # Resolves --speculative-draft-gpu against the rank -> device mapping
+        # and raises with the full mapping when the device hosts no rank.
+        solo_rank = self.speculative_draft_solo_rank()
+        if not (0 <= solo_rank < self.tp_size):
+            raise ValueError(
+                f"resolved solo draft rank {solo_rank} is out of range for "
+                f"tp_size={self.tp_size}."
+            )
 
     def _handle_model_source_paths(self):
         """Resolve model/tokenizer paths backed by remote object stores."""

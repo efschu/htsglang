@@ -74,6 +74,17 @@ def duplicate_prefix_tail_to_draft_branches(
 
 
 class EagleDraftWorkerBase(ABC):
+    # Draft-solo placement (--speculative-draft-placement solo) flags.
+    # CLASS-LEVEL defaults on purpose (#136a lesson): several draft worker
+    # variants (StandaloneDraftWorker, FrozenKVMTPDraftWorker,
+    # MultiLayerEagleDraftWorker) bypass EagleDraftWorker.__init__, so any
+    # flag read by shared base-class code paths must exist on every variant
+    # without relying on a particular __init__ chain. The defaults encode
+    # the split path: solo off, and (vacuously) "this rank hosts the draft".
+    _spec_solo_active: bool = False
+    _spec_solo_is_host: bool = True
+    _spec_solo_rank: int = 0
+
     @abstractmethod
     def draft():
         pass
@@ -290,6 +301,12 @@ class EagleDraftWorkerBase(ABC):
 
 
 class BaseSpecWorker(ABC):
+    # Draft-solo placement flags; class-level defaults for the same #136a
+    # reason as on EagleDraftWorkerBase (worker variants skip parent inits).
+    _spec_solo_active: bool = False
+    _spec_solo_is_host: bool = True
+    _spec_solo_rank: int = 0
+
     @property
     @abstractmethod
     def target_worker(self) -> TpModelWorker:
