@@ -61,6 +61,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -485,6 +486,14 @@ class PlanInputs:
     speculative_draft_model_path: Optional[str] = None
     max_running_requests: Optional[int] = None
     disable_cuda_graph: bool = False
+    #: Include the vision tower in the resident weight budget. These are VL
+    #: checkpoints; when a rig serves them TEXT-ONLY the vision encoder (the
+    #: ``model.visual.*`` blocks + patch-merger for an HF checkpoint, or the
+    #: ``mmproj-*.gguf`` sidecar for GGUF) is not loaded, so its bytes free up
+    #: for KV cache. Default True = size the full multimodal footprint (matches
+    #: the on-disk checkpoint, which ships the vision weights); False sizes the
+    #: text-only resident set (smaller weights -> more KV tokens).
+    include_vision: bool = True
 
     # -- placement + per-card budget (design §2.5) ---------------------------
     #: rank -> physical GPU index (duplicates = co-located ranks).
@@ -623,6 +632,26 @@ def _is_gguf_model(model_path: Optional[str]) -> bool:
         return False
     p = str(model_path)
     return p.lower().endswith(".gguf") or os.path.isfile(p)
+
+
+def _gguf_mmproj_bytes(model_path: Optional[str]) -> int:
+    """On-disk bytes of the ``mmproj-*.gguf`` vision-encoder sidecar that ships
+    beside a GGUF text checkpoint (0 when none). Added to the resident weight
+    budget only when the plan includes the vision tower; text-only serving does
+    not load it."""
+    import glob as _glob
+
+    if not model_path:
+        return 0
+    d = model_path if os.path.isdir(model_path) else os.path.dirname(model_path)
+    if not d:
+        return 0
+    best = 0
+    for f in _glob.glob(os.path.join(d, "*.gguf")):
+        b = os.path.basename(f).lower()
+        if "mmproj" in b:
+            best = max(best, os.path.getsize(f))
+    return best
 
 
 def _read_gguf_metadata(path: str) -> Tuple[Dict[str, object], Dict[str, int], List[dict]]:
@@ -864,6 +893,178 @@ def _gguf_config_and_families(path: str) -> dict:
     }
 
 
+#: The weight families a linear-layer quantization scheme actually quantizes
+#: (attention q/k/v/o, dense-or-MoE MLP, and the MTP/draft body). Embeddings/
+#: lm_head (``vocab``), the SSM/GDN state (``gdn``), the vision tower
+#: (``vision``) and the draft fc (``draft_repl``) stay at their native dtype
+#: in every AWQ/GPTQ/FP8/compressed-tensors checkpoint we size, exactly as the
+#: on-disk anchoring path treats them -- so the two paths agree.
+_QUANTIZABLE_FAMILIES = ("attn", "mlp", "draft_attn", "draft_mlp")
+
+#: Representative tensor path per quantizable family, matched against a
+#: scheme's per-module exclusion patterns (gptq ``dynamic`` ``-:<regex>``,
+#: compressed-tensors ``ignore``, ``modules_to_not_convert``) to decide
+#: whether the family is quantized or kept at its native dtype.
+_FAMILY_REP_NAMES = {
+    "attn": "model.language_model.layers.0.self_attn.q_proj.weight",
+    "mlp_dense": "model.language_model.layers.0.mlp.gate_proj.weight",
+    "mlp_moe": "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+    "gdn": "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+    "draft_attn": "model.model.mtp.layers.0.self_attn.q_proj.weight",
+    "draft_mlp": "model.model.mtp.layers.0.mlp.gate_proj.weight",
+}
+
+
+
+def _int_quant_bpp(bits: float, group_size: Optional[int], symmetric: bool) -> float:
+    """Bytes/param for a grouped integer quant (AWQ/GPTQ/compressed-tensors):
+    ``bits/8`` packed weight + an fp16 scale per group per output channel
+    (``2/group``) + an int4 zero-point per group when asymmetric
+    (``0.5/group``). Ungrouped (per-channel) scales are negligible per param."""
+    bpp = bits / 8.0
+    if group_size and group_size > 0:
+        bpp += 2.0 / group_size  # fp16 group scale
+        if not symmetric:
+            bpp += 0.5 / group_size  # packed int4 zero-point
+    return bpp
+
+
+def _family_broadly_excluded(rep_name: str, regex_pats: List[str]) -> bool:
+    """True when a WHOLE weight family is kept at native dtype by a scheme's
+    broad, family-level exclusion -- a ``dynamic`` ``-:<regex>`` (gptq) or a
+    compressed-tensors ``re:<regex>``. These are the only authoritative
+    family-wide signals; the Qwen MoE GPTQ configs use them to keep all of
+    attention / mtp / shared_expert in higher precision.
+
+    Fine-grained LITERAL lists (``modules_to_not_convert`` / ``ignore``) are
+    deliberately NOT consulted here: in these checkpoints they mix precision
+    WITHIN a family and across a SUBSET of layers (routed experts INT4 but the
+    shared-expert + router + a per-layer selection of self_attn/linear_attn
+    kept BF16). Mapping such a partial, intra-family list onto a single
+    per-family bytes/param would mis-size the dominant mass far worse than
+    treating the family at its nominal scheme width; the routed/dense bulk is
+    what the scheme width describes, and the BF16 remainder is a few percent
+    that stays within the sizing tolerance. The measured on-disk anchor (used
+    whenever the weight shards are present) captures the exact mix regardless."""
+    for pat in regex_pats:
+        try:
+            if re.search(pat, rep_name):
+                return True
+        except re.error:
+            if pat and pat in rep_name:
+                return True
+    return False
+
+
+def _config_quant_bpp(cfg: dict, is_moe: bool) -> Optional[Dict[str, float]]:
+    """Config-AUTHORITATIVE bytes/param for the quantized weight families,
+    read from the checkpoint's own ``quantization_config`` -- never inferred
+    from the repo/path name.
+
+    Returns ``{family_name: bytes_per_param}`` for the families the scheme
+    quantizes, or ``None`` when the config declares no quantization (a plain
+    bf16/fp16 checkpoint, where every family stays 2 B/param).
+
+    This is what lets a config-only HF-hub snapshot (a hash-named dir with the
+    weight shards absent) size IDENTICALLY to the same repo given as a local
+    directory: the byte model no longer silently falls back to BF16 when the
+    .safetensors files are not on disk. When the shards ARE present the
+    measured checkpoint size still wins in ``_build_families`` (it captures
+    every ``modules_to_not_convert`` exception exactly); this is the
+    no-weights path.
+
+    Honors, generically:
+      * ``quant_method``: fp8 (1 B/weight + a negligible block/channel scale),
+        awq / gptq / compressed-tensors int (``bits/8`` + fp16 group scales +
+        int zero-points when asymmetric);
+      * broad family-level exclusions -- gptq ``dynamic`` ``-:<regex>`` and
+        compressed-tensors ``re:<regex>`` -- so a family the scheme keeps in
+        higher precision (attn / mtp in the Qwen MoE GPTQ configs) stays at
+        2 B/param. MIXED-precision checkpoints that keep only a SUBSET
+        (shared-expert, router, or a per-layer selection of GDN/attention) at
+        BF16 via literal ``modules_to_not_convert`` / ``ignore`` lists are sized
+        at the routed/dense scheme width (the mass), with the small BF16
+        remainder inside the sizing tolerance; the on-disk anchor sizes the
+        exact mix whenever the weight shards are present.
+    """
+    qc = cfg.get("quantization_config")
+    if not qc:
+        text = cfg.get("text_config")
+        if isinstance(text, dict):
+            qc = text.get("quantization_config")
+    if not qc:
+        return None
+
+    method = str(qc.get("quant_method") or "").lower()
+    fmt = str(qc.get("format") or qc.get("fmt") or "").lower()
+
+    # Broad family-level exclusion regexes (see _family_broadly_excluded).
+    regex_pats: List[str] = []
+    for entry in (qc.get("ignore") or []):
+        s = str(entry)
+        if s.startswith("re:"):
+            regex_pats.append(s[3:])
+    dynamic = qc.get("dynamic") or {}
+    for key in dynamic:
+        if str(key).startswith("-:"):
+            regex_pats.append(str(key)[2:])
+
+    # Bytes/param for the quantized (non-excluded) families.
+    fp8_like = (
+        method == "fp8" or "float" in fmt or "fp8" in fmt or "float8" in method
+    )
+    if fp8_like:
+        # e4m3/e5m2 weights are 1 B; block (weight_block_size) or per-channel
+        # fp32 scales add a negligible per-param overhead.
+        quant_bpp = 1.0
+    else:
+        # Grouped integer schemes: awq / gptq / compressed-tensors.
+        bits = qc.get("bits")
+        symmetric = qc.get("sym")
+        group = qc.get("group_size")
+        groups = qc.get("config_groups") or {}
+        if groups:
+            w = (next(iter(groups.values())) or {}).get("weights") or {}
+            bits = bits if bits is not None else w.get("num_bits")
+            group = group if group is not None else w.get("group_size")
+            if symmetric is None:
+                symmetric = w.get("symmetric")
+        if bits is None:
+            bits = 4.0 if method in ("awq", "gptq") else None
+        if bits is None:
+            # Unknown scheme with no bit width -> cannot size authoritatively.
+            return None
+        # AutoGPTQ/GPTQModel + AWQ always materialize a packed zero-point tensor
+        # (``qzeros``) on disk regardless of the ``sym`` flag; only
+        # compressed-tensors genuinely drops zeros when symmetric. So the
+        # zero-point storage term is present unless it is symmetric
+        # compressed-tensors.
+        symmetric_storage = bool(symmetric) and method not in ("awq", "gptq")
+        quant_bpp = _int_quant_bpp(float(bits), group, symmetric_storage)
+
+    # FP8 block/channel quantization targets EVERY Linear, so the GDN/linear-
+    # attention in_proj + out_proj are fp8 too (only the vision tower is in
+    # modules_to_not_convert). Grouped-integer AWQ/GPTQ, by contrast, leaves
+    # the SSM/GDN mixer at its native dtype -- so ``gdn`` is a quantized family
+    # only under fp8-like schemes. (The gdn family also folds in small bf16
+    # conv/norm/A/dt tensors; those are a few % of its mass, well within the
+    # sizing tolerance.)
+    families = list(_QUANTIZABLE_FAMILIES)
+    if fp8_like:
+        families.append("gdn")
+
+    rep_for = {
+        "mlp": _FAMILY_REP_NAMES["mlp_moe" if is_moe else "mlp_dense"],
+    }
+    out: Dict[str, float] = {}
+    for fam in families:
+        rep = rep_for.get(fam, _FAMILY_REP_NAMES.get(fam, fam))
+        if _family_broadly_excluded(rep, regex_pats):
+            continue  # kept at native dtype -> caller leaves it at 2 B/param
+        out[fam] = quant_bpp
+    return out or None
+
+
 class PerfCostModel:
     """Parse-time capacity/speed predictor for MLP-vector candidates.
 
@@ -1010,13 +1211,35 @@ class PerfCostModel:
 
         vocab_params = 2.0 * self.vocab * H  # embed + lm_head (untied worst case)
 
+        # Vision tower (VL checkpoints). Counted in the resident weight budget
+        # only when the rig serves the model WITH vision. Text-only serving does
+        # not load the encoder, so those bytes free up for KV cache -> more
+        # tokens. The vision-off toggle flows in via ``include_vision``.
+        # ``vision_disk_bytes`` is the tower's on-disk footprint -- subtracted
+        # from the checkpoint anchor below when vision is off (an HF VL
+        # checkpoint bundles the encoder into its .safetensors, so the anchor
+        # must shed those bytes, not merely redistribute them).
+        include_vision = getattr(self.plan_inputs, "include_vision", True)
         vision_params = 0.0
+        vision_bpp = 2.0
+        vision_disk_bytes = 0.0
         vcfg = cfg.get("vision_config")
         if vcfg and not cfg.get("language_model_only", False):
             vh = int(vcfg.get("hidden_size", 0) or 0)
             vi = int(vcfg.get("intermediate_size", 0) or 0)
             vd = int(vcfg.get("depth", 0) or 0)
-            vision_params = vd * (4 * vh * vh + 2 * vh * vi)
+            full_vision = vd * (4 * vh * vh + 2 * vh * vi)
+            vision_disk_bytes = full_vision * 2.0  # unquantized (bf16) encoder
+            if include_vision:
+                vision_params = full_vision
+        elif cfg.get("__gguf_family_bpp__") is not None:
+            # GGUF: the vision encoder is a separate ``mmproj-*.gguf`` sidecar
+            # beside the text checkpoint (NOT part of the sized .gguf), so it is
+            # additive when on and simply omitted when off.
+            mmproj_bytes = _gguf_mmproj_bytes(self.plan_inputs.model_path)
+            if include_vision and mmproj_bytes > 0:
+                vision_params = float(mmproj_bytes)
+                vision_bpp = 1.0
 
         draft_attn = draft_mlp = draft_repl = 0.0
         if self.spec_active and self.mtp_layers:
@@ -1032,7 +1255,7 @@ class PerfCostModel:
             "gdn": _Family(self.gdn_layers * gdn_layer, 2.0, "gdn"),
             "mlp": _Family(self.n_layers * mlp_layer, 2.0, "mlp"),
             "vocab": _Family(vocab_params, 2.0, "even"),
-            "vision": _Family(vision_params, 2.0, "gdn_base"),
+            "vision": _Family(vision_params, vision_bpp, "gdn_base"),
             "draft_attn": _Family(draft_attn, 2.0, "attn"),
             "draft_mlp": _Family(draft_mlp, 2.0, "mlp"),
             "draft_repl": _Family(draft_repl, 2.0, "replicated"),
@@ -1069,6 +1292,11 @@ class PerfCostModel:
         from sglang.srt.distributed.utils import _checkpoint_size_mib
 
         ckpt_bytes = _checkpoint_size_mib(self.plan_inputs.model_path) * 2**20
+        # Text-only serving: shed the vision tower's bytes from the anchor (an
+        # HF VL checkpoint bundles the unquantized encoder into its shards, so
+        # its bytes must LEAVE the total, not be redistributed onto attn/MLP).
+        if not include_vision and vision_disk_bytes > 0 and ckpt_bytes > 0:
+            ckpt_bytes = max(ckpt_bytes - vision_disk_bytes, 0.0)
         quant_names = ("attn", "mlp", "draft_attn", "draft_mlp")
         bf16_bytes = sum(
             fam.bytes for name, fam in families.items() if name not in quant_names
@@ -1078,6 +1306,20 @@ class PerfCostModel:
             bpp = (ckpt_bytes - bf16_bytes) / quant_params
             bpp = min(max(bpp, 0.5), 2.25)  # int4+scales ... bf16 bounds
             for name in quant_names:
+                families[name].bytes_per_param = bpp
+            return families
+
+        # No weight files on disk (an HF-hub id resolves to a config-only
+        # snapshot -- a hash-named dir with just config.json). The measured
+        # checkpoint size is unavailable, so instead of silently leaving every
+        # family at 2 B/param (BF16 -- which double-counts an FP8/INT4
+        # checkpoint and produces a spurious "does not fit / 0 KV"), derive the
+        # quantized-family bytes/param AUTHORITATIVELY from the checkpoint's own
+        # quantization_config. This makes a hash-named snapshot size IDENTICALLY
+        # to the same repo given as a local path.
+        cfg_bpp = _config_quant_bpp(cfg, is_moe=self.num_experts > 0)
+        if cfg_bpp:
+            for name, bpp in cfg_bpp.items():
                 families[name].bytes_per_param = bpp
         return families
 

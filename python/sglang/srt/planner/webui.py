@@ -96,16 +96,17 @@ def detect_hardware() -> dict:
 
 
 def gguf_options_for(payload: dict) -> dict:
-    """List the selectable ``.gguf`` checkpoints in a model directory (an
-    Unsloth-style multi-quant export), for the quant dropdown. Empty list for
-    a single-file / safetensors / HF-id model."""
-    from sglang.srt.planner.model import list_gguf_options
+    """List the selectable ``.gguf`` checkpoints for the quant dropdown, for a
+    LOCAL multi-quant export directory OR an HF-hub GGUF repo id (metadata-only
+    file listing, no weight download). Empty list for a single-file /
+    safetensors model."""
+    from sglang.srt.planner.model import list_gguf_options_any
 
     ref = (payload or {}).get("model", "").strip()
     if not ref:
         return {"ok": True, "options": []}
     try:
-        return {"ok": True, "options": list_gguf_options(ref)}
+        return {"ok": True, "options": list_gguf_options_any(ref)}
     except Exception as e:  # pragma: no cover - defensive
         return {"ok": False, "error": str(e), "options": []}
 
@@ -411,6 +412,18 @@ def plan_from_payload(payload: dict) -> dict:
         mem = mem * int(tp_guess)
 
     host_ram_mib = payload.get("host_ram_mib") or hw_payload.get("host_ram_mib")
+    # Concurrency default = 1 (single-user), matching how these models are
+    # actually launched (--max-num-seqs 1 in the reference command). A blank
+    # field therefore shows the honest single-user KV capacity instead of an
+    # arbitrary many-slot default that inflates the GDN/mamba pool and makes a
+    # single-user config look infeasible. The user can raise it and SEE the KV
+    # shrink (kv_by_concurrency below).
+    concurrency = payload.get("max_running_requests") or 1
+    # Vision tower toggle: default OFF (text-only) so the sized footprint is the
+    # text-serving resident set most rigs actually run; ticking it adds the
+    # vision encoder (HF: the unquantized visual blocks; GGUF: the mmproj
+    # sidecar) back into the budget.
+    include_vision = bool(payload.get("include_vision", False))
     try:
         result = plan(
             model_path,
@@ -435,7 +448,8 @@ def plan_from_payload(payload: dict) -> dict:
                 "speculative_draft_model_path"
             )
             or None,
-            max_running_requests=payload.get("max_running_requests") or None,
+            max_running_requests=concurrency,
+            include_vision=include_vision,
             host_ram_mib=int(host_ram_mib) if host_ram_mib else None,
         )
     except PlanRejected as e:
@@ -443,7 +457,63 @@ def plan_from_payload(payload: dict) -> dict:
     except ValueError as e:
         return {"valid": False, "reasons": [str(e)]}
 
-    return _plan_to_dict(result, model_path)
+    out = _plan_to_dict(result, model_path)
+    out["concurrency"] = concurrency
+    out["include_vision"] = include_vision
+    out["kv_by_concurrency"] = _kv_by_concurrency(
+        model_path, hardware, payload, mem, rank_gpu_id, reserve_mib,
+        host_ram_mib, include_vision,
+    )
+    return out
+
+
+#: Concurrency ladder shown so the user SEES the KV<->concurrency<->mamba
+#: tradeoff. 1 = single-user (huge KV); higher = parallel (mamba pool grows,
+#: KV shrinks). The GDN/mamba pool genuinely scales with concurrency -- this
+#: surfaces it honestly instead of hiding it behind one default.
+_CONCURRENCY_LADDER = (1, 4, 16, 32, 64)
+
+
+def _kv_by_concurrency(
+    model_path, hardware, payload, mem, rank_gpu_id, reserve_mib,
+    host_ram_mib, include_vision,
+):
+    """Max-KV-tokens (and mamba pool, fit) at a ladder of concurrencies, so the
+    UI can show how ``max_running_requests`` trades KV cache for parallel
+    slots. Cheap re-plans; failures degrade to an absent row."""
+    from sglang.srt.planner.feasibility import plan as _plan
+
+    rows = []
+    for c in _CONCURRENCY_LADDER:
+        try:
+            r = _plan(
+                model_path, hardware,
+                tp_size=payload.get("tp_size"),
+                rank_gpu_id=rank_gpu_id,
+                rank_gpu_memory_mib=mem,
+                rank_tp_ratio=_int_list(payload.get("rank_tp_ratio")),
+                dcp_size=payload.get("dcp_size") or None,
+                user_free_reserve_mib=reserve_mib,
+                kv_cache_dtype=payload.get("kv_cache_dtype") or "auto",
+                max_running_requests=c,
+                include_vision=include_vision,
+                host_ram_mib=int(host_ram_mib) if host_ram_mib else None,
+                with_advantage=False,
+            )
+        except (PlanRejected, ValueError):
+            continue
+        cap = r.capacity
+        kv = int(min((rc.kv_tokens for rc in cap.per_rank), default=0)) if (
+            cap and r.fits
+        ) else 0
+        mamba = max((rc.mamba_gib for rc in cap.per_rank), default=0.0) if cap else 0.0
+        rows.append({
+            "concurrency": c,
+            "kv_tokens": max(kv, 0),
+            "mamba_gib": round(mamba, 2),
+            "fits": bool(r.fits),
+        })
+    return rows
 
 
 def issue_from_payload(payload: dict) -> dict:
@@ -874,8 +944,8 @@ INDEX_HTML = r"""<!doctype html>
       <label>Model (config.json dir, .gguf file, GGUF dir, or HF id)</label>
       <input id="model" placeholder="/path/to/Qwen3.6-27B-AWQ or org/model" onchange="onModelChange()">
       <div id="gguf_pick" style="display:none">
-        <label>GGUF quant (this dir holds several &mdash; pick one)</label>
-        <select id="gguf_choice"></select>
+        <label>GGUF quant (several available &mdash; pick one)</label>
+        <select id="gguf_choice" onchange="doPlan()"></select>
       </div>
     </fieldset>
 
@@ -901,9 +971,17 @@ INDEX_HTML = r"""<!doctype html>
       <div id="knobs"></div>
       <label>tp-size</label>
       <input id="tp_size" placeholder="(= #included cards, or set)">
-      <label>max concurrent requests (mamba/SSM pool scales with this)</label>
-      <input id="max_running_requests" placeholder="(auto; e.g. 1 for single-user)">
-      <label>kv-cache-dtype</label>
+      <label style="margin-top:.6rem"><b>max concurrent requests</b>
+        &mdash; drives max KV cache &amp; the GDN/mamba pool</label>
+      <input id="max_running_requests" placeholder="(default 1 = single-user &rarr; largest KV)"
+        onchange="doPlan()">
+      <div class="muted" style="margin:.2rem 0 .4rem">1 = single-user (biggest KV);
+        raise it for parallel requests &mdash; the mamba/SSM pool grows and max
+        KV shrinks. See the KV-vs-concurrency table in the result.</div>
+      <label><input type="checkbox" id="include_vision" onchange="doPlan()">
+        include vision tower <span class="muted">(VL models; off = text-only,
+        frees VRAM for KV)</span></label>
+      <label style="margin-top:.5rem">kv-cache-dtype</label>
       <input id="kv_cache_dtype" placeholder="auto | fp8_e4m3">
       <label>quant descriptor (for the issue text)</label>
       <input id="quant" placeholder="compressed-tensors / Q4_K_M / fp8">
@@ -1047,6 +1125,7 @@ function payload() {
     hardware: { source: 'cards', cards, host_ram_mib },
     tp_size: $('tp_size').value ? parseInt($('tp_size').value) : null,
     max_running_requests: $('max_running_requests').value ? parseInt($('max_running_requests').value) : null,
+    include_vision: $('include_vision').checked,
     kv_cache_dtype: $('kv_cache_dtype').value.trim(),
     quant: $('quant').value.trim(),
   };
@@ -1061,6 +1140,26 @@ function payload() {
 function bar(pct) {
   const c = Math.max(0, Math.min(100, pct));
   return '<div class="bar"><span style="width:'+c+'%"></span></div>';
+}
+
+// KV<->concurrency<->mamba tradeoff: the honest picture that the GDN/mamba
+// pool grows with parallel slots, shrinking max KV. The chosen concurrency
+// row is highlighted so single-user (1) vs parallel is obvious.
+function concurrencyTable(d) {
+  const rows = d.kv_by_concurrency;
+  if (!rows || !rows.length) return '';
+  const cur = d.concurrency;
+  let body = rows.map(r =>
+    '<tr'+(r.concurrency===cur?' style="font-weight:600;background:rgba(80,160,255,.12)"':'')+'>'
+    +'<td>'+r.concurrency+(r.concurrency===cur?' &#9664;':'')+'</td>'
+    +'<td>'+(r.fits? r.kv_tokens.toLocaleString() : '&mdash;')+'</td>'
+    +'<td>'+r.mamba_gib.toFixed(1)+'</td>'
+    +'<td>'+(r.fits?'&check;':'no fit')+'</td></tr>').join('');
+  return '<p class="muted" style="margin:.6rem 0 .2rem">max KV tokens vs. '
+    +'concurrency <span class="est">(GDN/mamba pool grows with parallel '
+    +'slots &rarr; KV shrinks; ESTIMATE)</span></p>'
+    +'<table><tr><th>max concurrent</th><th>max KV tok</th>'
+    +'<th>mamba GiB</th><th>fits</th></tr>'+body+'</table>';
 }
 
 async function doPlan() {
@@ -1133,6 +1232,7 @@ function render(d) {
       '<table><tr><th>rank</th><th>budget MiB</th><th>weights GiB</th>'
       +'<th>mamba GiB</th><th>KV tok</th><th>budget used</th></tr>'+rows+'</table>'
       +(cap.mlp_units ? '<p class="muted">MLP unit partition: ['+cap.mlp_units.join(', ')+']</p>' : '');
+    $('cards').innerHTML += concurrencyTable(d);
   } else { $('cards').innerHTML = ''; }
   // advantage (honest: feasibility + capacity-% + measured-only scores)
   const a = d.advantage; let av='';

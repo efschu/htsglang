@@ -27,7 +27,7 @@ import glob
 import os
 from typing import List, Optional
 
-__all__ = ["resolve_model_ref", "list_gguf_options"]
+__all__ = ["resolve_model_ref", "list_gguf_options", "list_gguf_options_any"]
 
 
 def _is_sidecar_gguf(basename: str) -> bool:
@@ -48,6 +48,32 @@ def list_gguf_options(model_ref: str) -> List[str]:
         return []
     ggufs = sorted(
         os.path.basename(g) for g in glob.glob(os.path.join(model_ref, "*.gguf"))
+    )
+    return [g for g in ggufs if not _is_sidecar_gguf(g)]
+
+
+def list_gguf_options_any(model_ref: str) -> List[str]:
+    """Selectable ``.gguf`` checkpoint filenames for the quant dropdown, for a
+    LOCAL directory OR an HF-hub GGUF repo id.
+
+    Local dirs go through :func:`list_gguf_options`. For anything that is not a
+    local path we ask the HF hub for the repo's file list (``list_repo_files``
+    — metadata only, NO weight download) and keep the checkpoint ``.gguf``
+    files, excluding the ``mmproj-*`` / ``imatrix`` sidecars. Returns an empty
+    list (never raises) when the ref is neither a multi-gguf dir nor a
+    resolvable GGUF repo, so the UI simply shows no dropdown."""
+    if os.path.isdir(model_ref):
+        return list_gguf_options(model_ref)
+    if os.path.isfile(model_ref):
+        return []
+    try:
+        from huggingface_hub import list_repo_files
+
+        files = list_repo_files(model_ref)
+    except Exception:
+        return []
+    ggufs = sorted(
+        os.path.basename(f) for f in files if f.lower().endswith(".gguf")
     )
     return [g for g in ggufs if not _is_sidecar_gguf(g)]
 
@@ -105,7 +131,7 @@ def resolve_model_ref(model_ref: str, gguf_choice: Optional[str] = None) -> str:
             ".gguf file — not a checkpoint the planner can size."
         )
 
-    # Not a local path: treat as an HF hub id and fetch ONLY config.json.
+    # Not a local path: treat as an HF hub id.
     try:
         from huggingface_hub import hf_hub_download
     except ImportError as e:
@@ -114,6 +140,33 @@ def resolve_model_ref(model_ref: str, gguf_choice: Optional[str] = None) -> str:
             "is not installed to resolve it as a hub id. Pass a local "
             "checkpoint directory or .gguf file."
         ) from e
+
+    # A GGUF repo id: the caller picked one quant from the dropdown (an
+    # unpicked multi-gguf repo is reported so the UI can prompt). Sizing a GGUF
+    # needs its header, so the CHOSEN .gguf is fetched (only that shard, not the
+    # whole repo); config-only is not enough for GGUF sizing.
+    if gguf_choice is not None:
+        try:
+            return hf_hub_download(
+                repo_id=model_ref, filename=os.path.basename(gguf_choice)
+            )
+        except Exception as e:
+            raise ValueError(
+                f"Could not fetch GGUF {gguf_choice!r} from repo "
+                f"{model_ref!r}: {e}."
+            ) from e
+    hub_ggufs = list_gguf_options_any(model_ref)
+    if len(hub_ggufs) == 1:
+        return hf_hub_download(repo_id=model_ref, filename=hub_ggufs[0])
+    if len(hub_ggufs) > 1:
+        raise ValueError(
+            f"{model_ref} (HF repo) holds {len(hub_ggufs)} .gguf checkpoints "
+            f"({hub_ggufs}); pick one (quant dropdown in the web UI, or "
+            "--model <repo>/<file.gguf>)."
+        )
+
+    # A safetensors repo: fetch ONLY config.json (config-authoritative sizing
+    # kicks in when the weight shards are absent -- see PerfCostModel).
     try:
         cfg_path = hf_hub_download(repo_id=model_ref, filename="config.json")
     except Exception as e:
