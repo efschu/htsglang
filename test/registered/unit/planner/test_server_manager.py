@@ -1,0 +1,599 @@
+# Copyright 2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Unit tests for the dashboard server-manager control-plane.
+
+NO GPU boot and NO real sglang server: the supervisor lifecycle is exercised
+with a FAKE child process (a trivial ``python3 -c "... time.sleep"``), and every
+NVML / huggingface_hub touch is injected/mocked so the suite is hermetic and
+network-free.
+"""
+
+import json
+import os
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from unittest import mock
+
+from sglang.srt.planner.server_manager import (
+    DEFAULT_MODEL_ROOTS,
+    DownloadInfo,
+    GgufVariant,
+    LaunchSettings,
+    SglangSupervisor,
+    SupervisorBusyError,
+    available_downloads,
+    discover_models,
+    download_model,
+    model_root_writable,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers to build a fake model tree + a minimal real GGUF file.
+# ---------------------------------------------------------------------------
+def _write_config(path, cfg):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(cfg, f)
+
+
+# GGUF value-type enums (subset) mirrored from the header spec.
+_T_UINT32, _T_STRING = 4, 8
+
+
+def _write_min_gguf(path, arch="qwen35", file_type=15):
+    """Write a minimal but VALID GGUF header with general.architecture (string)
+    and general.file_type (uint32) so the config-authoritative reader resolves
+    the quant from the header, not the file name."""
+    def kv_string(key, val):
+        b = b""
+        b += struct.pack("<Q", len(key)) + key.encode()
+        b += struct.pack("<I", _T_STRING)
+        b += struct.pack("<Q", len(val)) + val.encode()
+        return b
+
+    def kv_u32(key, val):
+        b = b""
+        b += struct.pack("<Q", len(key)) + key.encode()
+        b += struct.pack("<I", _T_UINT32)
+        b += struct.pack("<I", val)
+        return b
+
+    kvs = [
+        kv_string("general.architecture", arch),
+        kv_u32("general.file_type", file_type),
+    ]
+    body = b"".join(kvs)
+    header = b"GGUF"
+    header += struct.pack("<I", 3)          # version
+    header += struct.pack("<Q", 0)          # tensor count
+    header += struct.pack("<Q", len(kvs))   # kv count
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(header + body)
+
+
+# ===========================================================================
+# Discovery.
+# ===========================================================================
+class TestDiscovery(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="disco_")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_hf_hub_snapshot_config_authoritative(self):
+        # Dir name LIES ("bf16-fp16"); config.json says fp8 -> config wins.
+        snap = os.path.join(
+            self.tmp, "models--org--Model-bf16-fp16", "snapshots", "deadbeef")
+        _write_config(os.path.join(snap, "config.json"), {
+            "architectures": ["Qwen3ForCausalLM"],
+            "quantization_config": {"quant_method": "fp8", "fmt": "e4m3"},
+        })
+        ms = discover_models(roots=[self.tmp])
+        self.assertEqual(len(ms), 1)
+        m = ms[0]
+        self.assertEqual(m.format, "hf")
+        self.assertEqual(m.quant_method, "fp8")  # NOT inferred from the name
+        self.assertEqual(m.name, "org/Model-bf16-fp16")
+        self.assertFalse(m.vision)
+
+    def test_hf_vision_and_bf16(self):
+        d = os.path.join(self.tmp, "vlm-model")
+        _write_config(os.path.join(d, "config.json"), {
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "vision_config": {"depth": 24},
+        })
+        ms = discover_models(roots=[self.tmp])
+        self.assertEqual(len(ms), 1)
+        self.assertEqual(ms[0].quant_method, "bf16")  # no quant config
+        self.assertTrue(ms[0].vision)
+
+    def test_gguf_variants_header_authoritative(self):
+        d = os.path.join(self.tmp, "MyModel-Q2-lie-GGUF")
+        # File names claim Q2; headers say Q4_K_M (15) and Q6_K (18).
+        _write_min_gguf(os.path.join(d, "MyModel-Q2-a.gguf"), file_type=15)
+        _write_min_gguf(os.path.join(d, "MyModel-Q2-b.gguf"), file_type=18)
+        # sidecars must NOT become selectable variants.
+        _write_min_gguf(os.path.join(d, "mmproj-BF16.gguf"), file_type=32)
+        _write_min_gguf(os.path.join(d, "mtp-MyModel.gguf"), file_type=15)
+        ms = discover_models(roots=[self.tmp])
+        self.assertEqual(len(ms), 1)
+        m = ms[0]
+        self.assertEqual(m.format, "gguf")
+        quants = sorted(v.quant for v in m.gguf_variants)
+        self.assertEqual(quants, ["Q4_K_M", "Q6_K"])  # header, not name; no sidecars
+        self.assertTrue(m.vision)  # mmproj sidecar -> multimodal
+        self.assertEqual(m.quant_method, "gguf")  # multi-variant label
+
+    def test_single_gguf_quant_label(self):
+        d = os.path.join(self.tmp, "Solo-GGUF")
+        _write_min_gguf(os.path.join(d, "solo.gguf"), file_type=12)  # Q3_K_M
+        ms = discover_models(roots=[self.tmp])
+        self.assertEqual(ms[0].quant_method, "Q3_K_M")
+
+    def test_bad_model_tagged_not_thrown(self):
+        # One dir with unreadable JSON, one good dir -> good still found, bad
+        # tagged with .error (never raised).
+        bad = os.path.join(self.tmp, "broken")
+        os.makedirs(bad)
+        with open(os.path.join(bad, "config.json"), "w") as f:
+            f.write("{ this is not json ")
+        good = os.path.join(self.tmp, "good")
+        _write_config(os.path.join(good, "config.json"), {
+            "architectures": ["Qwen3ForCausalLM"]})
+        ms = discover_models(roots=[self.tmp])
+        by_name = {m.name: m for m in ms}
+        self.assertIn("good", by_name)
+        self.assertIn("broken", by_name)
+        self.assertIsNotNone(by_name["broken"].error)
+        self.assertIsNone(by_name["good"].error)
+
+    def test_missing_root_is_robust(self):
+        # Non-existent roots must not throw.
+        ms = discover_models(roots=["/no/such/dir/at/all"])
+        self.assertEqual(ms, [])
+
+    def test_org_subdir_recursion(self):
+        # An org dir containing a model one level down is still found.
+        d = os.path.join(self.tmp, "unsloth", "Some-Model")
+        _write_config(os.path.join(d, "config.json"), {
+            "architectures": ["Qwen3ForCausalLM"]})
+        ms = discover_models(roots=[self.tmp])
+        self.assertEqual(len(ms), 1)
+        self.assertEqual(ms[0].name, "Some-Model")
+
+    def test_default_roots_constant(self):
+        # The documented default roots are what a no-arg call scans.
+        self.assertIn(
+            "/spinning/llm_stuff/club-3090/models-cache", DEFAULT_MODEL_ROOTS)
+
+
+# ===========================================================================
+# LaunchSettings validation + argv.
+# ===========================================================================
+class TestLaunchSettings(unittest.TestCase):
+    def test_rank_gpu_id_length_mismatch_rejected(self):
+        with self.assertRaises(ValueError):
+            LaunchSettings(model_path="/m", tp_size=4,
+                           rank_gpu_id=[0, 1]).validate()
+
+    def test_rank_tp_ratio_length_checked(self):
+        with self.assertRaises(ValueError):
+            LaunchSettings(model_path="/m", tp_size=2,
+                           rank_tp_ratio=[1, 1, 1]).validate()
+
+    def test_valid_matches(self):
+        LaunchSettings(model_path="/m", tp_size=4,
+                       rank_gpu_id=[0, 1, 1, 2]).validate()  # no raise
+
+    def test_bad_spec_mode(self):
+        with self.assertRaises(ValueError):
+            LaunchSettings(model_path="/m", spec_mode="turbo").validate()
+
+    def test_argv_contains_expected_flags(self):
+        s = LaunchSettings(
+            model_path="/m", tp_size=2, rank_gpu_id=[0, 1],
+            rank_gpu_memory_mib=[16000, 16000], kv_cache_dtype="fp8",
+            spec_mode="mtp", speculative_num_steps=3, port=8100,
+            served_model_name="Qwen", mem_fraction_static=0.82,
+            chat_template="/tpl.jinja", tool_call_parser="qwen")
+        cmd = s.launch_command()
+        j = " ".join(cmd)
+        self.assertIn("--model-path /m", j)
+        self.assertIn("--tp-size 2", j)
+        self.assertIn("--rank-gpu-id 0,1", j)
+        self.assertIn("--rank-gpu-memory-mib 16000,16000", j)
+        self.assertIn("--kv-cache-dtype fp8", j)
+        self.assertIn("--speculative-algorithm NEXTN", j)
+        self.assertIn("--speculative-num-steps 3", j)
+        self.assertIn("--port 8100", j)
+        self.assertIn("--served-model-name Qwen", j)
+        self.assertIn("--mem-fraction-static 0.82", j)
+        self.assertIn("--chat-template /tpl.jinja", j)
+        self.assertIn("--tool-call-parser qwen", j)
+
+    def test_gguf_variant_path_resolution(self):
+        s = LaunchSettings(
+            model_path="/models/Repo-GGUF", format="gguf",
+            gguf_variant="model-Q4_K_M.gguf")
+        self.assertEqual(
+            s.resolved_model_path(), "/models/Repo-GGUF/model-Q4_K_M.gguf")
+
+
+# ===========================================================================
+# Supervisor lifecycle with a FAKE child (never a real sglang boot).
+# ===========================================================================
+def _fake_child_settings(port):
+    # A harmless real LaunchSettings; the actual argv is overridden in start().
+    return LaunchSettings(model_path="/fake/model", port=port)
+
+
+def _sleep_argv(seconds=300):
+    # A child that itself spawns a grandchild in the SAME process group, so we
+    # can prove killpg reaps the whole group (not just the direct child).
+    code = (
+        "import subprocess, time, sys;"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(%d)']);"
+        "time.sleep(%d)" % (seconds, seconds)
+    )
+    return [sys.executable, "-c", code]
+
+
+def _pgid_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+class TestSupervisorLifecycle(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sup_")
+        self.sup = SglangSupervisor(log_dir=self.tmp)
+        self._siblings = []
+
+    def tearDown(self):
+        try:
+            if self.sup.is_running():
+                self.sup.stop(wait_vram=False)
+        except Exception:
+            pass
+        for p in self._siblings:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except Exception:
+                pass
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _spawn_sibling(self):
+        # An UNRELATED process in its OWN group -> must survive supervisor stop.
+        p = subprocess.Popen(_sleep_argv(), start_new_session=True)
+        self._siblings.append(p)
+        return p
+
+    def test_start_running_then_stop_kills_group(self):
+        st = self.sup.start(
+            _fake_child_settings(39001), argv=_sleep_argv(), wait_ready=False)
+        self.assertEqual(st["state"], "booting")
+        self.assertTrue(self.sup.is_running())
+        pgid = self.sup._pgid
+        self.assertTrue(_pgid_alive(pgid))
+        rep = self.sup.stop(wait_vram=False)
+        self.assertFalse(self.sup.is_running())
+        self.assertTrue(rep["group_gone"])
+        # The whole process group (child + grandchild) is gone.
+        self.assertFalse(_pgid_alive(pgid))
+        self.assertEqual(self.sup.state, "stopped")
+
+    def test_stop_does_not_kill_unrelated_sibling(self):
+        sibling = self._spawn_sibling()
+        sibling_pgid = os.getpgid(sibling.pid)
+        self.sup.start(
+            _fake_child_settings(39002), argv=_sleep_argv(), wait_ready=False)
+        managed_pgid = self.sup._pgid
+        self.assertNotEqual(sibling_pgid, managed_pgid)
+        self.sup.stop(wait_vram=False)
+        # NO broad kill: the sibling's group is untouched.
+        self.assertFalse(_pgid_alive(managed_pgid))
+        self.assertTrue(_pgid_alive(sibling_pgid))
+        self.assertIsNone(sibling.poll())  # still alive
+
+    def test_restart_gives_new_pid(self):
+        self.sup.start(
+            _fake_child_settings(39003), argv=_sleep_argv(), wait_ready=False)
+        pid1 = self.sup.proc.pid
+        pgid1 = self.sup._pgid
+        self.sup.restart(
+            _fake_child_settings(39003), argv=_sleep_argv(), wait_ready=False)
+        pid2 = self.sup.proc.pid
+        self.assertNotEqual(pid1, pid2)
+        self.assertTrue(self.sup.is_running())
+        # Old group is gone; new group is alive.
+        self.assertFalse(_pgid_alive(pgid1))
+        self.assertTrue(_pgid_alive(self.sup._pgid))
+
+    def test_is_busy_guard_refuses_restart(self):
+        self.sup.start(
+            _fake_child_settings(39004), argv=_sleep_argv(), wait_ready=False)
+        pid1 = self.sup.proc.pid
+        self.sup.set_busy(True)
+        with self.assertRaises(SupervisorBusyError):
+            self.sup.restart(_fake_child_settings(39004), argv=_sleep_argv(),
+                             wait_ready=False)
+        # The running child is untouched by the refused restart.
+        self.assertTrue(self.sup.is_running())
+        self.assertEqual(self.sup.proc.pid, pid1)
+        self.sup.set_busy(False)
+
+    def test_start_rejects_double_start(self):
+        self.sup.start(
+            _fake_child_settings(39005), argv=_sleep_argv(), wait_ready=False)
+        with self.assertRaises(RuntimeError):
+            self.sup.start(_fake_child_settings(39005), argv=_sleep_argv(),
+                           wait_ready=False)
+
+    def test_child_death_surfaces_as_error(self):
+        # A child that exits immediately -> status() reports error, no wedge.
+        self.sup.start(
+            _fake_child_settings(39006),
+            argv=[sys.executable, "-c", "import sys; sys.exit(3)"],
+            wait_ready=False)
+        # Give it a moment to exit.
+        for _ in range(50):
+            if self.sup.proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        st = self.sup.status()
+        self.assertEqual(st["state"], "error")
+        self.assertIsNotNone(st["error"])
+
+    def test_stop_when_never_started_is_safe(self):
+        rep = self.sup.stop(wait_vram=False)
+        self.assertEqual(self.sup.state, "stopped")
+        self.assertIsInstance(rep, dict)
+
+
+# ===========================================================================
+# VRAM-free guard with a MOCK nvml (no GPU).
+# ===========================================================================
+class _FakeMem:
+    def __init__(self, free_mib):
+        self.free = free_mib * 2 ** 20
+
+
+class _FakeNvml:
+    """Deterministic pynvml-like: free memory recovers after N polls."""
+
+    def __init__(self, baseline_free_mib, recover_after=2):
+        self.baseline = baseline_free_mib
+        self.recover_after = recover_after
+        self._calls = 0
+
+    def nvmlDeviceGetCount(self):
+        return 1
+
+    def nvmlDeviceGetHandleByIndex(self, i):
+        return i
+
+    def nvmlDeviceGetMemoryInfo(self, h):
+        # First call = baseline (captured at start). After boot the child
+        # "used" 4 GiB; it recovers to baseline after recover_after polls.
+        self._calls += 1
+        if self._calls == 1:
+            return _FakeMem(self.baseline)
+        if self._calls <= 1 + self.recover_after:
+            return _FakeMem(self.baseline - 4096)
+        return _FakeMem(self.baseline)
+
+
+class TestVramGuard(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="vram_")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_vram_recovers_true(self):
+        nvml = _FakeNvml(baseline_free_mib=20000, recover_after=1)
+        sup = SglangSupervisor(log_dir=self.tmp, nvml=nvml)
+        s = LaunchSettings(model_path="/fake", tp_size=1, rank_gpu_id=[0],
+                           port=39100)
+        sup.start(s, argv=_sleep_argv(), wait_ready=False)
+        # baseline captured at start (call 1).
+        rep = sup.stop(wait_vram=True, vram_timeout_s=5)
+        self.assertTrue(rep["vram_recovered"])
+
+    def test_vram_no_indices_returns_none(self):
+        # No rank_gpu_id -> nothing to poll -> None (can't judge).
+        nvml = _FakeNvml(baseline_free_mib=20000)
+        sup = SglangSupervisor(log_dir=self.tmp, nvml=nvml)
+        s = LaunchSettings(model_path="/fake", tp_size=1, port=39101)
+        sup.start(s, argv=_sleep_argv(), wait_ready=False)
+        rep = sup.stop(wait_vram=True, vram_timeout_s=2)
+        self.assertIsNone(rep["vram_recovered"])
+
+
+# ===========================================================================
+# Download layer (writability + gated download + quant->file mapping).
+# ===========================================================================
+class TestWritability(unittest.TestCase):
+    def test_rw_dir_true(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(model_root_writable(d))
+
+    def test_readonly_dir_false(self):
+        d = tempfile.mkdtemp()
+        try:
+            os.chmod(d, 0o500)  # r-x, no write
+            # (running as non-root this is a hard denial; guard for root.)
+            if os.geteuid() != 0:
+                self.assertFalse(model_root_writable(d))
+            else:
+                # As root, os.access/W_OK is bypassed; the temp-file probe is
+                # the real signal but root can write anywhere. Assert the probe
+                # at least does not throw.
+                self.assertIsInstance(model_root_writable(d), bool)
+        finally:
+            os.chmod(d, 0o700)
+            os.rmdir(d)
+
+    def test_missing_dir_false(self):
+        self.assertFalse(model_root_writable("/no/such/dir"))
+
+
+class _FakeHfApi:
+    def __init__(self, files):
+        self._files = files
+        self.calls = []
+
+    def list_repo_files(self, repo_id):
+        self.calls.append(repo_id)
+        return self._files
+
+
+class TestDownloads(unittest.TestCase):
+    def test_available_downloads_parses_gguf_variants(self):
+        api = _FakeHfApi([
+            "README.md",
+            "Model-Q3_K_M.gguf",
+            "Model-Q4_K_M.gguf",
+            "Model-Q6_K.gguf",
+            "mmproj-BF16.gguf",  # sidecar, excluded
+        ])
+        info = available_downloads("org/Model-GGUF", hf_api=api)
+        self.assertIsInstance(info, DownloadInfo)
+        self.assertTrue(info.is_gguf)
+        quants = sorted(v.quant for v in info.gguf_variants)
+        self.assertEqual(quants, ["Q3_K_M", "Q4_K_M", "Q6_K"])
+
+    def test_available_downloads_non_gguf(self):
+        api = _FakeHfApi(["config.json", "model.safetensors"])
+        info = available_downloads("org/HF-Model", hf_api=api)
+        self.assertFalse(info.is_gguf)
+        self.assertEqual(info.gguf_variants, [])
+
+    def test_download_refuses_on_readonly_root(self):
+        if os.geteuid() == 0:
+            self.skipTest("running as root: W_OK/chmod probe is bypassed")
+        d = tempfile.mkdtemp()
+        try:
+            os.chmod(d, 0o500)
+            called = {"n": 0}
+
+            def fake_dl(**kw):
+                called["n"] += 1
+                return "/x"
+
+            with self.assertRaises(PermissionError):
+                download_model("org/Repo", quant="Q4_K_M", root=d,
+                               hf_hub_download=fake_dl)
+            self.assertEqual(called["n"], 0)  # never reached the network
+        finally:
+            os.chmod(d, 0o700)
+            os.rmdir(d)
+
+    def test_download_refuses_when_probe_says_readonly(self):
+        # uid-independent: patch the writability probe to False and assert the
+        # gate refuses BEFORE any network call (covers the refusal path even
+        # when the suite runs as root, where chmod cannot restrict writes).
+        called = {"n": 0}
+
+        def fake_dl(**kw):
+            called["n"] += 1
+            return "/x"
+
+        with mock.patch(
+            "sglang.srt.planner.server_manager.model_root_writable",
+            return_value=False,
+        ):
+            with self.assertRaises(PermissionError):
+                download_model("org/Repo", quant="Q4_K_M", root="/some/mount",
+                               hf_hub_download=fake_dl,
+                               hf_api=_FakeHfApi(["Model-Q4_K_M.gguf"]))
+        self.assertEqual(called["n"], 0)
+
+    def test_gguf_quant_maps_to_single_file(self):
+        api = _FakeHfApi([
+            "Model-Q3_K_M.gguf",
+            "Model-Q4_K_M.gguf",
+            "Model-Q6_K.gguf",
+        ])
+        with tempfile.TemporaryDirectory() as d:
+            recorded = {}
+
+            def fake_hub_download(**kw):
+                recorded.update(kw)
+                out = os.path.join(kw["local_dir"], kw["filename"])
+                return out
+
+            path = download_model(
+                "org/Model-GGUF", quant="Q4_K_M", root=d,
+                hf_api=api, hf_hub_download=fake_hub_download)
+            # Only the chosen quant file is fetched (no whole-repo pull).
+            self.assertEqual(recorded["filename"], "Model-Q4_K_M.gguf")
+            self.assertEqual(recorded["repo_id"], "org/Model-GGUF")
+            self.assertEqual(recorded["local_dir"], d)
+            self.assertTrue(path.endswith("Model-Q4_K_M.gguf"))
+
+    def test_full_hf_snapshot_download(self):
+        with tempfile.TemporaryDirectory() as d:
+            recorded = {}
+
+            def fake_snapshot(**kw):
+                recorded.update(kw)
+                return os.path.join(kw["local_dir"], "snap")
+
+            path = download_model(
+                "org/HF-Model", quant=None, root=d,
+                snapshot_download=fake_snapshot)
+            self.assertEqual(recorded["repo_id"], "org/HF-Model")
+            self.assertEqual(recorded["local_dir"], d)
+            self.assertTrue(path.endswith("snap"))
+
+    def test_progress_callback_invoked(self):
+        api = _FakeHfApi(["Model-Q4_K_M.gguf"])
+        with tempfile.TemporaryDirectory() as d:
+            events = []
+            download_model(
+                "org/Model-GGUF", quant="Q4_K_M", root=d, hf_api=api,
+                hf_hub_download=lambda **kw: "/x",
+                progress_cb=events.append)
+            stages = [e["stage"] for e in events]
+            self.assertIn("start", stages)
+            self.assertIn("done", stages)
+
+
+class TestHfHubImportable(unittest.TestCase):
+    def test_huggingface_hub_present(self):
+        import huggingface_hub  # sglang dependency; download layer needs it
+
+        self.assertTrue(hasattr(huggingface_hub, "hf_hub_download"))
+
+
+if __name__ == "__main__":
+    unittest.main()
