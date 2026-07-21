@@ -56,6 +56,18 @@ __all__ = [
     "list_profiles",
     "hicache_saved_read",
     "hicache_saved_record",
+    "list_models_payload",
+    "server_start_payload",
+    "server_stop_payload",
+    "server_restart_payload",
+    "server_status_payload",
+    "download_targets_payload",
+    "model_download_payload",
+    "power_profile_payload",
+    "measure_power_payload",
+    "quality_run_payload",
+    "quality_save_payload",
+    "quality_shots_payload",
     "serve",
 ]
 
@@ -1074,6 +1086,527 @@ def hicache_saved_record(payload: dict) -> dict:
     }
 
 
+# ===========================================================================
+# Model-Manager tab (#S3 model manager) — discover / supervise / download.
+#
+# These wire the already-committed control-plane core (server_manager.py). The
+# UI is a THIN client: it never builds the sglang argv itself, it POSTs the
+# launch knobs and the backend maps them onto ``LaunchSettings`` (which reuses
+# the proven ``energy.MeasurementConfig`` argv builder). The supervisor owns
+# exactly ONE managed sglang child; a "launch / restart" REPLACES it (the box
+# is VRAM-bound). Restart is guarded while a live job is in-flight (is_busy).
+# ===========================================================================
+
+#: The single long-lived supervisor the dashboard drives. Lazily created so the
+#: module imports GPU-free; tests replace it with a fake via ``_set_supervisor``.
+_SUPERVISOR = None
+
+
+def _supervisor():
+    global _SUPERVISOR
+    if _SUPERVISOR is None:
+        from sglang.srt.planner.server_manager import SglangSupervisor
+
+        _SUPERVISOR = SglangSupervisor()
+    return _SUPERVISOR
+
+
+def _set_supervisor(sup) -> None:
+    """Test seam: inject a fake supervisor (never boots a real server)."""
+    global _SUPERVISOR
+    _SUPERVISOR = sup
+
+
+def _model_to_json(m) -> dict:
+    return {
+        "name": m.name,
+        "path": m.path,
+        "format": m.format,
+        "quant_method": m.quant_method,
+        "vision": bool(m.vision),
+        "size_bytes": int(m.size_bytes or 0),
+        "size_gib": round((m.size_bytes or 0) / 2**30, 1),
+        "error": m.error,
+        "gguf_variants": [
+            {
+                "quant": v.quant,
+                "filename": v.filename,
+                "path": v.path,
+                "size_bytes": int(v.size_bytes or 0),
+                "size_gib": round((v.size_bytes or 0) / 2**30, 1),
+            }
+            for v in (m.gguf_variants or [])
+        ],
+    }
+
+
+def list_models_payload(payload: Optional[dict] = None) -> dict:
+    """Enumerate every local model the dashboard can serve (config-authoritative
+    quant, gguf variants, vision-capable, size). Pure discovery — no GPU."""
+    from sglang.srt.planner.server_manager import (
+        DEFAULT_MODEL_ROOTS,
+        discover_models,
+    )
+
+    payload = payload or {}
+    extra = payload.get("extra_roots") or None
+    try:
+        models = discover_models(extra_roots=extra)
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e)}
+    return {
+        "ok": True,
+        "roots": list(DEFAULT_MODEL_ROOTS),
+        "models": [_model_to_json(m) for m in models],
+    }
+
+
+def _launch_settings_from_payload(payload: dict):
+    """Map the UI launch knobs onto a validated ``LaunchSettings``."""
+    from sglang.srt.planner.server_manager import LaunchSettings
+
+    def _ints(v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, str):
+            return [int(x) for x in v.replace(",", " ").split()]
+        return [int(x) for x in v]
+
+    ls = LaunchSettings(
+        model_path=(payload.get("model_path") or payload.get("model") or "").strip(),
+        format=payload.get("format", "hf"),
+        gguf_variant=payload.get("gguf_variant") or None,
+        served_model_name=(payload.get("served_model_name") or "model").strip(),
+        tp_size=int(payload.get("tp_size") or 1),
+        rank_gpu_id=_ints(payload.get("rank_gpu_id")),
+        rank_tp_ratio=_ints(payload.get("rank_tp_ratio")),
+        rank_gpu_memory_mib=_ints(payload.get("rank_gpu_memory_mib")),
+        kv_cache_dtype=payload.get("kv_cache_dtype", "auto"),
+        context_length=int(payload.get("context_length") or 8192),
+        max_num_seqs=(
+            int(payload["max_num_seqs"])
+            if payload.get("max_num_seqs") not in (None, "")
+            else None
+        ),
+        spec_mode=payload.get("spec_mode", "off"),
+        chat_template=payload.get("chat_template") or None,
+        tool_call_parser=payload.get("tool_call_parser") or None,
+        reasoning_parser=payload.get("reasoning_parser") or None,
+        vision=bool(payload.get("vision")),
+        port=int(payload.get("port") or 30000),
+    )
+    return ls.validate()
+
+
+def server_start_payload(payload: dict) -> dict:
+    """Boot the managed sglang server from the UI launch knobs. Builds a
+    ``LaunchSettings`` (fail-fast validated) and hands it to the supervisor.
+    ``wait_ready`` defaults False so the UI stays responsive and tails the boot
+    log; the client polls ``/api/server_status`` for readiness."""
+    try:
+        settings = _launch_settings_from_payload(payload)
+    except (ValueError, TypeError) as e:
+        return {"ok": False, "error": str(e)}
+    sup = _supervisor()
+    if sup.is_running():
+        return {
+            "ok": False,
+            "error": "a server is already running; stop or restart it (a restart "
+            "REPLACES the single managed instance).",
+            "status": sup.status(),
+        }
+    try:
+        status = sup.start(
+            settings,
+            wait_ready=bool(payload.get("wait_ready", False)),
+            argv=payload.get("argv"),
+        )
+    except Exception as e:
+        return {"ok": False, "error": str(e), "status": sup.status()}
+    return {"ok": True, "launch_command": settings.launch_command(), "status": status}
+
+
+def server_stop_payload(payload: Optional[dict] = None) -> dict:
+    sup = _supervisor()
+    try:
+        report = sup.stop(wait_vram=bool((payload or {}).get("wait_vram", True)))
+    except Exception as e:
+        return {"ok": False, "error": str(e), "status": sup.status()}
+    return {"ok": True, "report": report, "status": sup.status()}
+
+
+def server_restart_payload(payload: dict) -> dict:
+    """Guarded restart: REPLACES the single managed instance. Refused while a
+    live job is in-flight (the supervisor's ``is_busy`` guard)."""
+    from sglang.srt.planner.server_manager import SupervisorBusyError
+
+    try:
+        settings = _launch_settings_from_payload(payload)
+    except (ValueError, TypeError) as e:
+        return {"ok": False, "error": str(e)}
+    sup = _supervisor()
+    try:
+        status = sup.restart(
+            settings, wait_ready=bool(payload.get("wait_ready", False))
+        )
+    except SupervisorBusyError as e:
+        return {"ok": False, "busy": True, "error": str(e), "status": sup.status()}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "status": sup.status()}
+    return {"ok": True, "launch_command": settings.launch_command(), "status": status}
+
+
+def server_status_payload(payload: Optional[dict] = None) -> dict:
+    sup = _supervisor()
+    try:
+        return {"ok": True, "running": sup.is_running(), "status": sup.status()}
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e)}
+
+
+def download_targets_payload(payload: dict) -> dict:
+    """Writability probe + (optional) HF repo variant listing for the download
+    control. The button is GATED on ``model_root_writable`` — a read-only mount
+    disables it. When a ``repo_id`` is given its GGUF quant variants are listed
+    for the quant dropdown (no file bytes fetched)."""
+    from sglang.srt.planner.server_manager import (
+        DEFAULT_MODEL_ROOTS,
+        available_downloads,
+        model_root_writable,
+    )
+
+    payload = payload or {}
+    root = (payload.get("root") or "").strip() or os.path.expanduser(
+        DEFAULT_MODEL_ROOTS[0]
+    )
+    writable = model_root_writable(root)
+    out = {
+        "ok": True,
+        "root": root,
+        "writable": writable,
+        "note": None
+        if writable
+        else "mount read-only — remount rw to enable downloads (not forced).",
+    }
+    repo_id = (payload.get("repo_id") or "").strip()
+    if repo_id:
+        try:
+            info = available_downloads(repo_id)
+            out["repo_id"] = repo_id
+            out["is_gguf"] = info.is_gguf
+            out["gguf_variants"] = [
+                {"quant": v.quant, "filename": v.filename} for v in info.gguf_variants
+            ]
+            out["files"] = info.files
+        except Exception as e:
+            out["repo_error"] = str(e)
+    return out
+
+
+def model_download_payload(payload: dict) -> dict:
+    """Pull a model into the mounted model root — ONLY when the root is writable
+    (hard PermissionError otherwise). For a GGUF ``quant`` only the one chosen
+    quant file is fetched. This hits an EXTERNAL service (Hugging Face); the UI
+    must PREVIEW (size) + CONFIRM before calling this."""
+    from sglang.srt.planner.server_manager import (
+        DEFAULT_MODEL_ROOTS,
+        download_model,
+    )
+
+    repo_id = (payload.get("repo_id") or "").strip()
+    if not repo_id:
+        return {"ok": False, "error": "repo_id is required"}
+    root = (payload.get("root") or "").strip() or os.path.expanduser(
+        DEFAULT_MODEL_ROOTS[0]
+    )
+    quant = payload.get("quant") or None
+    try:
+        local = download_model(repo_id, quant=quant, root=root)
+    except PermissionError as e:
+        return {"ok": False, "writable": False, "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "path": local, "repo_id": repo_id, "quant": quant}
+
+
+# ===========================================================================
+# Power-measurement button (#S3 power calibration).
+#
+# One click -> ``measure_all_cards()`` (each card in its own
+# CUDA_VISIBLE_DEVICES=<uuid> subprocess; busy cards are SKIPPED, never
+# contended; the result is persisted automatically). WARN before running: it
+# briefly loads each free GPU with short micro-benchmarks.
+# ===========================================================================
+
+
+def _card_power_to_json(c) -> dict:
+    return {
+        "uuid": c.uuid,
+        "name": c.name,
+        "arch": c.arch,
+        "total_mib": c.total_mib,
+        "p_idle_w": c.p_idle_w,
+        "p_membw_w": c.p_membw_w,
+        "p_gemm_w": c.p_gemm_w,
+        "membw_gbs": c.membw_gbs,
+        "gemm_tflops": c.gemm_tflops,
+        "provenance": c.provenance,
+        "driver": c.driver,
+        "measured_at": c.measured_at,
+    }
+
+
+def power_profile_payload(payload: Optional[dict] = None) -> dict:
+    """GET side: the currently-loaded PERSISTED power profile (if any), with its
+    provenance/driver — shown before/without a fresh measurement."""
+    from sglang.srt.planner import power_calibration
+
+    payload = payload or {}
+    path = payload.get("path") or power_calibration.DEFAULT_POWER_PROFILE_PATH
+    try:
+        profile = power_calibration.load_power_profile(path)
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e)}
+    cards = [_card_power_to_json(c) for c in profile.values()]
+    return {
+        "ok": True,
+        "path": path,
+        "loaded": bool(cards),
+        "cards": cards,
+        "driver": next((c["driver"] for c in cards if c["driver"]), None),
+    }
+
+
+def measure_power_payload(payload: Optional[dict] = None) -> dict:
+    """Run the per-card power calibration (``measure_all_cards``) and return the
+    measured table + any skipped-because-busy notes. Persists automatically.
+    This TOUCHES the GPUs (short micro-benchmarks); busy cards are skipped by
+    the backend, never contended."""
+    from sglang.srt.planner import power_calibration
+
+    payload = payload or {}
+    kwargs = {}
+    if payload.get("path"):
+        kwargs["path"] = payload["path"]
+    if payload.get("only_uuids"):
+        kwargs["only_uuids"] = payload["only_uuids"]
+    try:
+        result = power_calibration.measure_all_cards(**kwargs)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {
+        "ok": True,
+        "driver": result.driver,
+        "created": result.created,
+        "cards": [_card_power_to_json(c) for c in result.cards],
+        "skipped": list(result.skipped),
+    }
+
+
+# ===========================================================================
+# Quality tab (#S3 chess-SVG quality benchmark).
+#
+# ONESHOT. The model is called BACKEND-SIDE (never from the browser — CORS + we
+# want the raw response's token usage), the SVG is extracted, and
+# ``quality_chess.validate`` grades it deterministically. Saving a shot is
+# OPTIONAL (a JSONL history the right-hand slider reads).
+#
+# sglang thinking control (verified against this build's OpenAI protocol):
+#   * thinking on/off -> ``chat_template_kwargs`` carries BOTH ``enable_thinking``
+#     (qwen3/glm45/nemotron/interns1) and ``thinking`` (deepseek-v3/kimi_k2);
+#     different chat templates read different keys, so we set both.
+#   * thinking budget -> an INTEGER in the request's ``custom_params`` under
+#     ``thinking_budget`` (grammar_manager caps ``grammar.max_think_tokens`` to
+#     it). NOTE/uncertainty: the budget is only honored by templates/grammars
+#     that expose a </think> stop and is a soft cap; models without a thinking
+#     grammar ignore it silently.
+# ===========================================================================
+
+#: Where saved quality shots accumulate (JSONL, keyed by model+quant+timestamp).
+QUALITY_SHOTS_PATH = os.path.expanduser("~/.cache/sglang/quality_shots.jsonl")
+
+_SVG_EXTRACT_RE = None
+
+
+def _extract_svg(text: str) -> Optional[str]:
+    """Pull the first ``<svg>…</svg>`` block out of a chat response (handles a
+    fenced ```svg / ```xml code block or a bare inline SVG)."""
+    import re
+
+    global _SVG_EXTRACT_RE
+    if _SVG_EXTRACT_RE is None:
+        _SVG_EXTRACT_RE = re.compile(r"<svg\b.*?</svg>", re.IGNORECASE | re.DOTALL)
+    if not text:
+        return None
+    m = _SVG_EXTRACT_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _chat_completion(
+    endpoint: str,
+    model: str,
+    prompt: str,
+    thinking: bool,
+    thinking_budget: Optional[int],
+    timeout_s: float = 300.0,
+) -> dict:
+    """Backend-side OpenAI-compatible chat completion (NEVER called from the
+    browser). Returns the parsed JSON response. Factored out so tests inject a
+    fake and no network/model is touched."""
+    import urllib.request
+
+    base = endpoint.strip().rstrip("/")
+    if not base.startswith("http"):
+        base = "http://" + base
+    if not base.endswith("/chat/completions"):
+        base = base + ("/v1/chat/completions" if "/v1" not in base else "/chat/completions")
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        # sglang thinking control (see module comment above).
+        "chat_template_kwargs": {"enable_thinking": thinking, "thinking": thinking},
+    }
+    if thinking and thinking_budget:
+        body["custom_params"] = {"thinking_budget": int(thinking_budget)}
+    req = urllib.request.Request(
+        base,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as r:
+        return json.loads(r.read())
+
+
+def quality_run_payload(payload: dict) -> dict:
+    """ONESHOT quality run: send ``CHESS_PROMPT`` to the target server BACKEND-
+    SIDE, extract the SVG, grade it with ``quality_chess.validate``, and capture
+    the token usage. The model is NEVER called from the browser."""
+    from sglang.srt.planner import quality_chess
+
+    endpoint = (payload.get("endpoint") or "").strip()
+    model = (payload.get("model") or "").strip()
+    if not endpoint:
+        return {"ok": False, "error": "endpoint (OpenAI-compatible base URL) required"}
+    if not model:
+        return {"ok": False, "error": "model name required"}
+    thinking = bool(payload.get("thinking"))
+    budget = payload.get("thinking_budget")
+    try:
+        budget = int(budget) if budget not in (None, "") else None
+    except (TypeError, ValueError):
+        budget = None
+    try:
+        resp = _chat_completion(
+            endpoint, model, quality_chess.CHESS_PROMPT, thinking, budget
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"chat completion failed: {e}"}
+
+    try:
+        content = resp["choices"][0]["message"]["content"] or ""
+    except Exception:
+        content = ""
+    usage = resp.get("usage") or {}
+    tokens = {
+        "prompt": usage.get("prompt_tokens"),
+        "completion": usage.get("completion_tokens"),
+        "total": usage.get("total_tokens"),
+    }
+
+    svg = _extract_svg(content)
+    if not svg:
+        return {
+            "ok": True,
+            "svg": None,
+            "raw": content,
+            "verdict": "broken",
+            "report": "No <svg>…</svg> block found in the model response.",
+            "piece_diff": [],
+            "offer_download": True,
+            "tokens": tokens,
+            "representation": "unparseable",
+        }
+
+    res = quality_chess.validate(svg).as_dict()
+    return {
+        "ok": True,
+        "svg": svg,
+        "raw": content,
+        "verdict": res["verdict"],
+        "report": res["report"],
+        "piece_diff": res["piece_diff"],
+        "highlight_squares": res["highlight_squares"],
+        "offer_download": res["offer_download"],
+        "representation": res["representation"],
+        "render_error": res.get("render_error"),
+        "tokens": tokens,
+    }
+
+
+def _quality_shots_path(payload: Optional[dict]) -> str:
+    return (payload or {}).get("path") or QUALITY_SHOTS_PATH
+
+
+def quality_save_payload(payload: dict) -> dict:
+    """Append ONE shot to the JSONL history (keyed by model+quant+timestamp).
+    Optional — only called when the user toggles 'save this shot'."""
+    import time
+
+    path = _quality_shots_path(payload)
+    if not (payload.get("save", True)):
+        return {"ok": True, "saved": False, "note": "save toggle off"}
+    record = {
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "model": payload.get("model"),
+        "quant": payload.get("quant"),
+        "verdict": payload.get("verdict"),
+        "tokens": payload.get("tokens"),
+        "svg": payload.get("svg"),
+        "report": payload.get("report"),
+        "config": payload.get("config"),
+        "prompt": payload.get("prompt"),
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "saved": True, "path": path}
+
+
+def quality_shots_payload(payload: Optional[dict] = None) -> dict:
+    """Read the saved-shot history for the right-hand slider (newest last)."""
+    path = _quality_shots_path(payload)
+    shots = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    shots.append(json.loads(line))
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "path": path, "shots": shots}
+
+
+def _reference_png_bytes() -> Optional[bytes]:
+    """The chess ground-truth reference image, served as a static asset."""
+    p = os.path.join(os.path.dirname(__file__), "assets", "quality_chess_reference.png")
+    try:
+        with open(p, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
 class _Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype):
         data = body.encode() if isinstance(body, str) else body
@@ -1128,6 +1661,39 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
+        if self.path.startswith("/api/models"):
+            try:
+                self._json(200, list_models_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/server_status"):
+            try:
+                self._json(200, server_status_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/power_profile"):
+            try:
+                self._json(200, power_profile_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/quality_shots"):
+            try:
+                self._json(200, quality_shots_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/assets/"):
+            name = self.path[len("/assets/"):].split("?", 1)[0]
+            if name == "quality_chess_reference.png":
+                data = _reference_png_bytes()
+                if data is not None:
+                    self._send(200, data, "image/png")
+                    return
+            self._send(404, "not found", "text/plain")
+            return
         self._send(404, "not found", "text/plain")
 
     def do_POST(self):
@@ -1163,6 +1729,30 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/hicache_saved"):
                 self._json(200, hicache_saved_record(payload))
+                return
+            if self.path.startswith("/api/server_start"):
+                self._json(200, server_start_payload(payload))
+                return
+            if self.path.startswith("/api/server_stop"):
+                self._json(200, server_stop_payload(payload))
+                return
+            if self.path.startswith("/api/server_restart"):
+                self._json(200, server_restart_payload(payload))
+                return
+            if self.path.startswith("/api/download_targets"):
+                self._json(200, download_targets_payload(payload))
+                return
+            if self.path.startswith("/api/model_download"):
+                self._json(200, model_download_payload(payload))
+                return
+            if self.path.startswith("/api/measure_power"):
+                self._json(200, measure_power_payload(payload))
+                return
+            if self.path.startswith("/api/quality_run"):
+                self._json(200, quality_run_payload(payload))
+                return
+            if self.path.startswith("/api/quality_save"):
+                self._json(200, quality_save_payload(payload))
                 return
         except Exception as e:  # pragma: no cover - defensive
             self._json(500, {"error": str(e)})
@@ -1317,6 +1907,8 @@ INDEX_HTML = r"""<!doctype html>
   <button id="tab_explore" class="tab" onclick="showTab('explore')">Explore rigs (matrix)</button>
   <button id="tab_landscape" class="tab" onclick="showTab('landscape')">Landscape (benchmark DB)</button>
   <button id="tab_energy" class="tab" onclick="showTab('energy')">Energy &amp; live</button>
+  <button id="tab_models" class="tab" onclick="showTab('models')">Models</button>
+  <button id="tab_quality" class="tab" onclick="showTab('quality')">Quality</button>
 </div>
 
 <div id="view_landscape" style="display:none">
@@ -1363,6 +1955,16 @@ INDEX_HTML = r"""<!doctype html>
         <div id="gpu_state_out" class="muted">click refresh…</div>
       </fieldset>
       <fieldset>
+        <legend>per-card power calibration (measured)</legend>
+        <div class="muted" style="margin-bottom:.4rem">Measures each free card's
+          board power at idle / membw / GEMM (short micro-benchmarks that briefly
+          load the GPU). <b>Do not run against a busy card</b> — the backend
+          SKIPS any card another process owns and reports it. Result is persisted
+          and overrides the energy model's power heuristic.</div>
+        <button onclick="measurePower()" id="pw_btn">Measure per-card power</button>
+        <div id="pw_out" class="muted" style="margin-top:.6rem"></div>
+      </fieldset>
+      <fieldset>
         <legend>live monitor (measure against a running server)</legend>
         <label>target server (host:port)</label>
         <input id="live_target" placeholder="127.0.0.1:31000">
@@ -1404,6 +2006,132 @@ INDEX_HTML = r"""<!doctype html>
         <div style="margin-top:.5rem"><button onclick="previewScenario()">preview scenario</button></div>
         <div id="sc_out" class="muted" style="margin-top:.6rem"></div>
       </fieldset>
+    </div>
+  </div>
+</div>
+
+<div id="view_models" style="display:none">
+  <div class="sub">Local models the dashboard can serve (config-authoritative
+    quant, never the dir name), plus the single managed sglang instance.
+    <b>Launch / restart REPLACES</b> the one running model (the box is
+    VRAM-bound). Download is gated on a writable model mount.</div>
+  <div class="cols">
+    <div>
+      <fieldset>
+        <legend>discovered models
+          <button class="secondary mini" onclick="loadModels()" title="re-scan roots">rescan</button></legend>
+        <div id="models_out" class="muted">scanning…</div>
+      </fieldset>
+      <fieldset>
+        <legend>download a model (external HF fetch)</legend>
+        <label>repo id (org/name)</label>
+        <input id="dl_repo" placeholder="unsloth/Qwen3.6-27B-GGUF" onchange="dlTargets()">
+        <label>model root (mount)</label>
+        <input id="dl_root" placeholder="(default first root)" onchange="dlTargets()">
+        <div id="dl_variants" style="display:none">
+          <label>GGUF quant</label>
+          <select id="dl_quant"></select>
+        </div>
+        <div style="margin-top:.5rem">
+          <button onclick="dlPreview()" id="dl_btn">Preview + download</button>
+        </div>
+        <div id="dl_out" class="muted" style="margin-top:.5rem"></div>
+      </fieldset>
+    </div>
+    <div>
+      <fieldset>
+        <legend>launch / restart the managed server (REPLACES the running model)</legend>
+        <div class="cols" style="grid-template-columns:1fr 1fr;gap:.6rem">
+          <div>
+            <label>model (path)</label>
+            <input id="sv_model" placeholder="/path/to/model or .gguf dir">
+            <label>gguf variant (basename, if GGUF)</label>
+            <input id="sv_variant" placeholder="(blank = hf format)">
+            <label>format</label>
+            <select id="sv_format"><option value="hf">hf</option><option value="gguf">gguf</option></select>
+            <label>tp-size</label>
+            <input id="sv_tp" value="1">
+            <label>rank-gpu-id (csv)</label>
+            <input id="sv_rgi" placeholder="(optional, e.g. 0,1)">
+            <label>rank-tp-ratio (csv)</label>
+            <input id="sv_rtr" placeholder="(optional)">
+            <label>kv-cache-dtype</label>
+            <select id="sv_kv"><option value="auto">auto</option>
+              <option value="fp8_e4m3">fp8_e4m3</option><option value="fp8_e5m2">fp8_e5m2</option></select>
+          </div>
+          <div>
+            <label>spec decode</label>
+            <select id="sv_spec"><option value="off">off</option>
+              <option value="mtp">mtp (fixed)</option><option value="adaptive">adaptive</option></select>
+            <label>chat-template</label>
+            <input id="sv_ct" placeholder="(optional)">
+            <label>tool-call-parser</label>
+            <input id="sv_tool" placeholder="(optional, e.g. qwen25)">
+            <label>reasoning-parser</label>
+            <input id="sv_reason" placeholder="(optional, e.g. qwen3)">
+            <label>port</label>
+            <input id="sv_port" value="30000">
+            <label>max-num-seqs</label>
+            <input id="sv_seqs" placeholder="(optional)">
+            <label>context-length</label>
+            <input id="sv_ctx" value="8192">
+            <label><input type="checkbox" id="sv_vision" style="width:auto"> vision on</label>
+          </div>
+        </div>
+        <div style="margin-top:.5rem">
+          <button onclick="serverStart()">Launch</button>
+          <button class="secondary" onclick="serverRestart()">Restart (replace)</button>
+          <button class="secondary" onclick="serverStop()">Stop</button>
+          <button class="secondary mini" onclick="refreshServerStatus()">status</button>
+        </div>
+        <div id="sv_out" class="muted" style="margin-top:.6rem"></div>
+      </fieldset>
+    </div>
+  </div>
+</div>
+
+<div id="view_quality" style="display:none">
+  <div class="sub">ONESHOT chess-SVG quality benchmark (<a href="https://www.reddit.com/r/LocalLLaMA/comments/1t53dhp/quality_comparison_between_qwen_36_27b/" target="_blank">reddit reference</a>).
+    The model is asked to render the position after <code>7. h4</code> as SVG,
+    highlighting the last move. The model is called <b>backend-side</b> (never
+    from the browser); the SVG is graded deterministically against the true
+    position. Verdict is honest: an unverifiable-but-rendering board is
+    <b>renders-unverifiable</b>, never correct.</div>
+  <div class="cols">
+    <div>
+      <fieldset>
+        <legend>run config</legend>
+        <label>server endpoint (OpenAI-compatible base URL)</label>
+        <input id="q_endpoint" placeholder="127.0.0.1:30000">
+        <label>model name</label>
+        <input id="q_model" placeholder="served-model-name">
+        <label>quant (for the saved-shot key)</label>
+        <input id="q_quant" placeholder="Q4_K_M / AWQ / fp8">
+        <label><input type="checkbox" id="q_think" style="width:auto"> thinking on</label>
+        <label>thinking budget (tokens; blank = unbounded)</label>
+        <input id="q_budget" placeholder="(optional int)">
+        <label><input type="checkbox" id="q_save" style="width:auto"> save this shot</label>
+        <div style="margin-top:.5rem"><button onclick="qualityRun()" id="q_btn">Run quality check</button></div>
+        <div id="q_status" class="muted" style="margin-top:.5rem"></div>
+      </fieldset>
+    </div>
+    <div>
+      <div class="cols" style="grid-template-columns:1fr 1fr 1fr;gap:.6rem">
+        <fieldset>
+          <legend>reference (ground truth)</legend>
+          <img src="/assets/quality_chess_reference.png" alt="reference board" style="max-width:100%;border-radius:6px">
+        </fieldset>
+        <fieldset>
+          <legend>generated SVG</legend>
+          <div id="q_svg" class="muted">run a check…</div>
+        </fieldset>
+        <fieldset>
+          <legend>history <span id="q_slide_lbl" class="muted"></span></legend>
+          <input type="range" id="q_slider" min="0" max="0" value="0" style="width:100%" oninput="showShot()">
+          <div id="q_shot" class="muted" style="margin-top:.4rem">no saved shots.</div>
+        </fieldset>
+      </div>
+      <div id="q_result" style="margin-top:.6rem"></div>
     </div>
   </div>
 </div>
@@ -2161,12 +2889,13 @@ async function doIssue(kind) {
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
 function showTab(t) {
-  for (const v of ['plan','explore','landscape','energy'])
-    $('view_'+v).style.display = t===v ? '' : 'none';
-  for (const v of ['plan','explore','landscape','energy'])
-    $('tab_'+v).classList.toggle('active', t===v);
+  const TABS = ['plan','explore','landscape','energy','models','quality'];
+  for (const v of TABS) $('view_'+v).style.display = t===v ? '' : 'none';
+  for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
   if ((t==='explore'||t==='landscape') && !window._profLoaded) loadProfiles();
-  if (t==='energy' && !window._energyInit) { window._energyInit=true; refreshGpuState(); }
+  if (t==='energy' && !window._energyInit) { window._energyInit=true; refreshGpuState(); loadPowerProfile(); }
+  if (t==='models' && !window._modelsInit) { window._modelsInit=true; loadModels(); refreshServerStatus(); }
+  if (t==='quality' && !window._qualityInit) { window._qualityInit=true; loadShots(); }
 }
 
 async function loadProfiles() {
@@ -2367,6 +3096,238 @@ async function previewScenario() {
 function confirmFlush(ok) {
   alert(ok ? 'Confirmed — a real run would now flush the cache and measure.'
            : 'Cancelled — cache preserved, no run started.');
+}
+
+// ---- Models tab ----
+async function loadModels() {
+  $('models_out').innerHTML = 'scanning…';
+  try {
+    const r = await fetch('/api/models'); const d = await r.json();
+    if (!d.ok) { $('models_out').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; return; }
+    let h = '<div class="muted" style="margin-bottom:.4rem">'+d.models.length+' models in '+esc(d.roots.join(', '))+'</div>';
+    h += '<table class="mx"><tr><th>name</th><th>fmt</th><th>quant</th><th>vision</th><th>size</th><th></th></tr>';
+    for (const m of d.models) {
+      const err = m.error ? ' <span class="nofitc" title="'+esc(m.error)+'">(err)</span>' : '';
+      let pick = '';
+      if (m.gguf_variants && m.gguf_variants.length>1) {
+        pick = '<select style="font-size:.7rem" onchange="pickModel('+"'"+esc(m.path)+"'"+',this.value,'+"'gguf'"+')">'
+             + m.gguf_variants.map(v=>'<option value="'+esc(v.filename)+'">'+esc(v.quant)+' ('+v.size_gib+'G)</option>').join('')
+             + '</select>';
+      }
+      const useBtn = '<button class="mini secondary" onclick="pickModel('+"'"+esc(m.path)+"'"+','
+             + (m.gguf_variants&&m.gguf_variants.length===1?"'"+esc(m.gguf_variants[0].filename)+"'":'null')+','
+             + "'"+esc(m.format)+"'"+')">use</button>';
+      h += '<tr><td style="text-align:left" title="'+esc(m.path)+'">'+esc(m.name)+err+'</td>'
+         + '<td>'+esc(m.format)+'</td><td>'+esc(m.quant_method)+'</td>'
+         + '<td>'+(m.vision?'yes':'—')+'</td><td>'+m.size_gib+'G</td>'
+         + '<td style="text-align:left">'+pick+' '+useBtn+'</td></tr>';
+    }
+    h += '</table>';
+    $('models_out').innerHTML = h;
+  } catch(e) { $('models_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
+}
+function pickModel(path, variant, fmt) {
+  $('sv_model').value = path;
+  $('sv_format').value = fmt;
+  $('sv_variant').value = variant && variant!=='null' ? variant : '';
+  $('sv_out').innerHTML = 'selected <b>'+esc(path)+'</b>'+(variant&&variant!=='null'?' / '+esc(variant):'');
+}
+function serverSettings() {
+  return {
+    model_path: $('sv_model').value.trim(),
+    format: $('sv_format').value,
+    gguf_variant: $('sv_variant').value.trim() || null,
+    tp_size: parseInt($('sv_tp').value)||1,
+    rank_gpu_id: $('sv_rgi').value.trim() || null,
+    rank_tp_ratio: $('sv_rtr').value.trim() || null,
+    kv_cache_dtype: $('sv_kv').value,
+    spec_mode: $('sv_spec').value,
+    chat_template: $('sv_ct').value.trim() || null,
+    tool_call_parser: $('sv_tool').value.trim() || null,
+    reasoning_parser: $('sv_reason').value.trim() || null,
+    port: parseInt($('sv_port').value)||30000,
+    max_num_seqs: $('sv_seqs').value.trim() || null,
+    context_length: parseInt($('sv_ctx').value)||8192,
+    vision: $('sv_vision').checked,
+  };
+}
+function renderServerStatus(d) {
+  if (!d) return '';
+  if (!d.ok && d.error) {
+    let h = '<div class="reasons">'+esc(d.error)+'</div>';
+    if (d.busy) h += '<div class="muted">restart is guarded while a live job is in-flight.</div>';
+    if (d.status) h += renderStatusBox(d.status);
+    return h;
+  }
+  let h = '';
+  if (d.launch_command) h += '<div class="legend">launch: <code>'+esc(d.launch_command.join(' '))+'</code></div>';
+  h += renderStatusBox(d.status || d);
+  return h;
+}
+function renderStatusBox(s) {
+  if (!s) return '';
+  let h = '<div style="margin-top:.4rem"><b>state:</b> '+esc(s.state||'?')
+        + (s.pid?' pid '+s.pid:'') + (s.busy?' <b style="color:#e3a008">BUSY</b>':'')
+        + (s.port?' :'+s.port:'') + (s.uptime_s?' up '+s.uptime_s.toFixed(0)+'s':'') + '</div>';
+  if (s.error) h += '<div class="reasons">'+esc(s.error)+'</div>';
+  if (s.log_tail) h += '<pre style="white-space:pre-wrap;font-size:.66rem;max-height:200px;overflow:auto;background:#0d1117;padding:.4rem;border-radius:6px">'+esc(s.log_tail)+'</pre>';
+  return h;
+}
+async function serverPost(path, body) {
+  $('sv_out').innerHTML = 'working…';
+  try {
+    const r = await fetch(path, {method:'POST', body: JSON.stringify(body||{})});
+    const d = await r.json();
+    $('sv_out').innerHTML = renderServerStatus(d);
+  } catch(e) { $('sv_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
+}
+function serverStart() { serverPost('/api/server_start', serverSettings()); }
+function serverRestart() {
+  if (!confirm('Restart REPLACES the single managed instance (stops the running model). Continue?')) return;
+  serverPost('/api/server_restart', serverSettings());
+}
+function serverStop() { serverPost('/api/server_stop', {}); }
+async function refreshServerStatus() {
+  try {
+    const r = await fetch('/api/server_status'); const d = await r.json();
+    $('sv_out').innerHTML = renderServerStatus(d);
+  } catch(e) { $('sv_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
+}
+async function dlTargets() {
+  const repo = $('dl_repo').value.trim(); if (!repo) return;
+  try {
+    const r = await fetch('/api/download_targets', {method:'POST',
+      body: JSON.stringify({repo_id:repo, root:$('dl_root').value.trim()||null})});
+    const d = await r.json();
+    window._dlTargets = d;
+    let note = 'root <b>'+esc(d.root)+'</b> — '+(d.writable?'<span class="fitc">writable</span>':'<span class="nofitc">'+esc(d.note||'read-only')+'</span>');
+    $('dl_btn').disabled = !d.writable;
+    if (d.gguf_variants && d.gguf_variants.length) {
+      $('dl_variants').style.display='';
+      $('dl_quant').innerHTML = d.gguf_variants.map(v=>'<option value="'+esc(v.quant)+'">'+esc(v.quant)+' ('+esc(v.filename)+')</option>').join('');
+    } else { $('dl_variants').style.display='none'; }
+    if (d.repo_error) note += '<br><span class="reasons">'+esc(d.repo_error)+'</span>';
+    $('dl_out').innerHTML = note;
+  } catch(e) { $('dl_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
+}
+async function dlPreview() {
+  const t = window._dlTargets;
+  if (!t || !t.writable) { $('dl_out').innerHTML = '<span class="reasons">model root not writable — remount rw.</span>'; return; }
+  const quant = ($('dl_variants').style.display!=='none') ? $('dl_quant').value : null;
+  if (!confirm('Download '+t.repo_id+(quant?' ['+quant+']':'')+' from Hugging Face into '+t.root+'? This fetches from an EXTERNAL service.')) return;
+  $('dl_out').innerHTML = 'downloading… (external HF fetch, may take a while)';
+  try {
+    const r = await fetch('/api/model_download', {method:'POST',
+      body: JSON.stringify({repo_id:t.repo_id, root:t.root, quant:quant})});
+    const d = await r.json();
+    $('dl_out').innerHTML = d.ok ? '<span class="fitc">downloaded to '+esc(d.path)+'</span>'
+                                 : '<span class="reasons">'+esc(d.error)+'</span>';
+    if (d.ok) loadModels();
+  } catch(e) { $('dl_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
+}
+
+// ---- power measurement (Energy tab) ----
+async function loadPowerProfile() {
+  try {
+    const r = await fetch('/api/power_profile'); const d = await r.json();
+    if (d.ok && d.loaded) $('pw_out').innerHTML = 'persisted profile ('+esc(d.driver||'?')+'):'+powerTable(d.cards, []);
+  } catch(e) {}
+}
+function powerTable(cards, skipped) {
+  let h = '<table class="mx"><tr><th>card</th><th>arch</th><th>idle W</th><th>membw W</th>'
+        + '<th>gemm W</th><th>GB/s</th><th>TFLOP/s</th></tr>';
+  for (const c of cards) {
+    h += '<tr><td style="text-align:left" title="'+esc(c.uuid)+'">'+esc(c.name)+'</td>'
+       + '<td>'+esc(c.arch)+'</td><td>'+c.p_idle_w+'</td><td>'+c.p_membw_w+'</td>'
+       + '<td>'+c.p_gemm_w+'</td><td>'+c.membw_gbs+'</td><td>'+c.gemm_tflops+'</td></tr>';
+  }
+  h += '</table>';
+  for (const s of (skipped||[]))
+    h += '<div class="muted">SKIPPED '+esc(s.name||'?')+' ('+esc(s.reason)+'): '+esc(s.detail||'')+'</div>';
+  return h;
+}
+async function measurePower() {
+  if (!confirm('This briefly LOADS each free GPU with short micro-benchmarks to measure board power. Busy cards are skipped automatically. Continue?')) return;
+  $('pw_btn').disabled = true;
+  $('pw_out').innerHTML = 'measuring (each card in its own subprocess)…';
+  try {
+    const r = await fetch('/api/measure_power', {method:'POST', body: '{}'});
+    const d = await r.json();
+    if (!d.ok) { $('pw_out').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; }
+    else $('pw_out').innerHTML = 'measured '+esc(d.created||'')+' ('+esc(d.driver||'?')+'):'+powerTable(d.cards, d.skipped);
+  } catch(e) { $('pw_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
+  finally { $('pw_btn').disabled = false; }
+}
+
+// ---- Quality tab ----
+function verdictClass(v) {
+  return v==='correct' ? 'fit' : (v==='wrong-position'||v==='broken' ? 'nofit' : 'offload');
+}
+async function qualityRun() {
+  const endpoint = $('q_endpoint').value.trim();
+  const model = $('q_model').value.trim();
+  if (!endpoint || !model) { $('q_status').innerHTML = '<span class="reasons">endpoint + model required</span>'; return; }
+  $('q_btn').disabled = true; $('q_status').innerHTML = 'calling the model (backend-side)…';
+  const budget = $('q_budget').value.trim();
+  try {
+    const r = await fetch('/api/quality_run', {method:'POST', body: JSON.stringify({
+      endpoint, model, thinking: $('q_think').checked,
+      thinking_budget: budget!==''?parseInt(budget):null})});
+    const d = await r.json();
+    if (!d.ok) { $('q_status').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; return; }
+    window._lastQuality = d;
+    $('q_svg').innerHTML = d.svg ? d.svg : '<span class="muted">no SVG extracted</span>';
+    const tk = d.tokens||{};
+    let h = '<div class="verdict '+verdictClass(d.verdict)+'">'+esc(d.verdict)+'</div>';
+    h += '<div class="legend"><b>tokens:</b> prompt '+(tk.prompt??'?')+' / completion '+(tk.completion??'?')+' / total '+(tk.total??'?')
+       + ' &nbsp; <b>representation:</b> '+esc(d.representation||'?')+'</div>';
+    h += '<div style="margin:.4rem 0">'+esc(d.report||'')+'</div>';
+    if (d.offer_download && d.svg)
+      h += '<button class="mini secondary" onclick="dlSvg()">download raw SVG</button>';
+    else if (d.offer_download && d.raw)
+      h += '<button class="mini secondary" onclick="dlRaw()">download raw answer</button>';
+    $('q_result').innerHTML = h;
+    $('q_status').innerHTML = 'done.';
+    if ($('q_save').checked) await saveShot(d);
+  } catch(e) { $('q_status').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
+  finally { $('q_btn').disabled = false; }
+}
+function dlSvg() { const d=window._lastQuality; if(d&&d.svg) dlBlob(d.svg, 'chess.svg', 'image/svg+xml'); }
+function dlRaw() { const d=window._lastQuality; if(d&&d.raw) dlBlob(d.raw, 'chess_answer.txt', 'text/plain'); }
+function dlBlob(text, name, mime) {
+  const b = new Blob([text], {type: mime}); const u = URL.createObjectURL(b);
+  const a = document.createElement('a'); a.href = u; a.download = name; a.click(); URL.revokeObjectURL(u);
+}
+async function saveShot(d) {
+  try {
+    await fetch('/api/quality_save', {method:'POST', body: JSON.stringify({
+      save: true, model: $('q_model').value.trim(), quant: $('q_quant').value.trim(),
+      verdict: d.verdict, tokens: d.tokens, svg: d.svg, report: d.report,
+      prompt: 'chess', config: {thinking: $('q_think').checked, budget: $('q_budget').value.trim()||null}})});
+    loadShots();
+  } catch(e) {}
+}
+async function loadShots() {
+  try {
+    const r = await fetch('/api/quality_shots'); const d = await r.json();
+    window._shots = (d.ok && d.shots) ? d.shots : [];
+    const sl = $('q_slider'); sl.max = Math.max(0, window._shots.length-1);
+    sl.value = sl.max;
+    showShot();
+  } catch(e) {}
+}
+function showShot() {
+  const shots = window._shots || [];
+  if (!shots.length) { $('q_shot').innerHTML = 'no saved shots.'; $('q_slide_lbl').textContent=''; return; }
+  const i = Math.min(parseInt($('q_slider').value)||0, shots.length-1);
+  const s = shots[i];
+  $('q_slide_lbl').textContent = '('+(i+1)+'/'+shots.length+')';
+  const tk = s.tokens||{};
+  let h = '<div class="legend">'+esc(s.ts||'')+' — '+esc(s.model||'?')+' '+esc(s.quant||'')+'</div>';
+  h += '<div class="verdict '+verdictClass(s.verdict)+'" style="font-size:.8rem">'+esc(s.verdict||'?')+'</div>';
+  h += '<div class="legend">tokens total '+(tk.total??'?')+'</div>';
+  if (s.svg) h += '<div style="max-width:100%;overflow:auto">'+s.svg+'</div>';
+  $('q_shot').innerHTML = h;
 }
 
 loadKnobs();

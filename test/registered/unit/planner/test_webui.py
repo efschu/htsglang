@@ -14,6 +14,7 @@ import threading
 import unittest
 import urllib.request
 from http.server import ThreadingHTTPServer
+from unittest import mock
 
 from sglang.srt.planner import webui
 from sglang.srt.planner.hardware import hardware_from_manual  # noqa: F401
@@ -284,6 +285,332 @@ class TestEnergyRoutePayloads(CustomTestCase):
         self.assertIn("view_energy", webui.INDEX_HTML)
         self.assertIn("/api/gpu_state", webui.INDEX_HTML)
         self.assertIn("previewScenario", webui.INDEX_HTML)
+
+
+class _FakeSupervisor:
+    """A GPU-less stand-in for SglangSupervisor (no real sglang boot)."""
+
+    def __init__(self):
+        self.started = None
+        self.stopped = False
+        self.restarted = None
+        self._running = False
+        self.busy = False
+
+    def is_running(self):
+        return self._running
+
+    def start(self, settings, wait_ready=False, argv=None):
+        self.started = settings
+        self._running = True
+        return {"state": "booting", "pid": 4242, "port": settings.port}
+
+    def stop(self, wait_vram=True):
+        self.stopped = True
+        self._running = False
+        return {"vram_recovered": True, "group_gone": True}
+
+    def restart(self, settings, wait_ready=False):
+        if self.busy:
+            from sglang.srt.planner.server_manager import SupervisorBusyError
+
+            raise SupervisorBusyError("refusing restart: a live job is in-flight")
+        self.restarted = settings
+        self._running = True
+        return {"state": "booting", "pid": 99, "port": settings.port}
+
+    def status(self):
+        return {
+            "state": "ready" if self._running else "stopped",
+            "pid": 4242 if self._running else None,
+            "busy": self.busy,
+            "port": self.started.port if self.started else None,
+            "log_tail": "boot log line 1\nboot log line 2\n",
+        }
+
+
+class TestModelManagerRoutes(CustomTestCase):
+    def setUp(self):
+        self.fake = _FakeSupervisor()
+        webui._set_supervisor(self.fake)
+
+    def tearDown(self):
+        webui._set_supervisor(None)
+
+    def test_list_models_serializes(self):
+        from sglang.srt.planner.server_manager import DiscoveredModel, GgufVariant
+
+        fake_models = [
+            DiscoveredModel(
+                name="Qwen3.6-27B", path="/models/q", format="hf",
+                quant_method="compressed-tensors", vision=False,
+                size_bytes=14 * 2**30,
+            ),
+            DiscoveredModel(
+                name="repo-gguf", path="/models/g", format="gguf",
+                quant_method="gguf",
+                gguf_variants=[
+                    GgufVariant("Q4_K_M", "a.gguf", "/models/g/a.gguf", 2**30),
+                    GgufVariant("Q6_K", "b.gguf", "/models/g/b.gguf", 2 * 2**30),
+                ],
+            ),
+        ]
+        with mock.patch(
+            "sglang.srt.planner.server_manager.discover_models",
+            return_value=fake_models,
+        ):
+            d = webui.list_models_payload()
+        self.assertTrue(d["ok"])
+        self.assertEqual(len(d["models"]), 2)
+        gguf = d["models"][1]
+        self.assertEqual(len(gguf["gguf_variants"]), 2)
+        self.assertEqual(gguf["gguf_variants"][0]["quant"], "Q4_K_M")
+
+    def test_server_start_builds_settings_and_calls_supervisor(self):
+        d = webui.server_start_payload(
+            {"model_path": "/models/q", "tp_size": 2, "rank_gpu_id": "0,1",
+             "port": 31000, "spec_mode": "mtp"}
+        )
+        self.assertTrue(d["ok"], d.get("error"))
+        self.assertIsNotNone(self.fake.started)
+        self.assertEqual(self.fake.started.tp_size, 2)
+        self.assertEqual(self.fake.started.rank_gpu_id, [0, 1])
+        self.assertIn("launch_command", d)
+
+    def test_server_start_validation_error_is_carried(self):
+        # rank_gpu_id length != tp_size -> fail fast, no supervisor call.
+        d = webui.server_start_payload(
+            {"model_path": "/m", "tp_size": 4, "rank_gpu_id": "0,1"}
+        )
+        self.assertFalse(d["ok"])
+        self.assertIn("rank-gpu-id length", d["error"])
+        self.assertIsNone(self.fake.started)
+
+    def test_restart_while_busy_is_refused(self):
+        self.fake.busy = True
+        d = webui.server_restart_payload({"model_path": "/m", "tp_size": 1})
+        self.assertFalse(d["ok"])
+        self.assertTrue(d["busy"])
+        self.assertIsNone(self.fake.restarted)
+
+    def test_stop_and_status(self):
+        webui.server_start_payload({"model_path": "/m", "tp_size": 1})
+        st = webui.server_status_payload()
+        self.assertTrue(st["running"])
+        d = webui.server_stop_payload({})
+        self.assertTrue(d["ok"])
+        self.assertTrue(self.fake.stopped)
+
+    def test_download_gated_on_writability(self):
+        with tempfile.TemporaryDirectory() as ro:
+            # Writable temp dir -> button enabled.
+            d = webui.download_targets_payload({"root": ro})
+            self.assertTrue(d["writable"])
+            self.assertIsNone(d["note"])
+        # Nonexistent root -> not writable, note surfaced.
+        d = webui.download_targets_payload({"root": "/no/such/mount"})
+        self.assertFalse(d["writable"])
+        self.assertIn("read-only", d["note"])
+
+    def test_download_refused_when_not_writable(self):
+        d = webui.model_download_payload(
+            {"repo_id": "org/model", "root": "/no/such/mount"}
+        )
+        self.assertFalse(d["ok"])
+        self.assertFalse(d.get("writable", True))
+
+
+class TestPowerRoute(CustomTestCase):
+    def test_measure_power_serializes_result(self):
+        from sglang.srt.planner.power_calibration import (
+            CardPowerMeasurement,
+            PowerCalibrationResult,
+        )
+
+        result = PowerCalibrationResult(
+            cards=[
+                CardPowerMeasurement(
+                    uuid="GPU-abc", name="RTX 5090", arch="sm120",
+                    total_mib=32607, p_idle_w=25.0, p_membw_w=300.0,
+                    p_gemm_w=450.0, membw_gbs=1400.0, gemm_tflops=180.0,
+                    driver="580.00",
+                )
+            ],
+            skipped=[{"name": "RTX 3080", "reason": "busy", "detail": "pid=123"}],
+            driver="580.00", created="2026-07-21 10:00:00",
+        )
+        with mock.patch(
+            "sglang.srt.planner.power_calibration.measure_all_cards",
+            return_value=result,
+        ) as m:
+            d = webui.measure_power_payload({})
+        self.assertTrue(m.called)
+        self.assertTrue(d["ok"])
+        self.assertEqual(len(d["cards"]), 1)
+        self.assertEqual(d["cards"][0]["arch"], "sm120")
+        self.assertEqual(len(d["skipped"]), 1)
+
+    def test_power_profile_read(self):
+        with mock.patch(
+            "sglang.srt.planner.power_calibration.load_power_profile",
+            return_value={},
+        ):
+            d = webui.power_profile_payload({})
+        self.assertTrue(d["ok"])
+        self.assertFalse(d["loaded"])
+
+
+class TestQualityRoutes(CustomTestCase):
+    _FAKE_SVG = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8">'
+        '<text x="0.5" y="0.5">K</text></svg>'
+    )
+
+    def _fake_resp(self, content):
+        return {
+            "choices": [{"message": {"content": content}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 200,
+                      "total_tokens": 300},
+        }
+
+    def test_quality_run_calls_model_backend_side_only(self):
+        # The model call goes through the backend _chat_completion seam; the
+        # browser path (INDEX_HTML JS) must never POST to /chat/completions.
+        self.assertNotIn("chat/completions", webui.INDEX_HTML)
+        self.assertIn("/api/quality_run", webui.INDEX_HTML)
+
+        captured = {}
+
+        def fake_chat(endpoint, model, prompt, thinking, budget, **kw):
+            captured["endpoint"] = endpoint
+            captured["thinking"] = thinking
+            captured["budget"] = budget
+            return self._fake_resp("here:\n```svg\n" + self._FAKE_SVG + "\n```")
+
+        with mock.patch.object(webui, "_chat_completion", side_effect=fake_chat), \
+            mock.patch(
+                "sglang.srt.planner.quality_chess.validate"
+            ) as v:
+            v.return_value.as_dict.return_value = {
+                "verdict": "wrong-position", "report": "R", "piece_diff": [],
+                "highlight_squares": ["h4"], "offer_download": False,
+                "representation": "text-letter", "render_error": None,
+            }
+            d = webui.quality_run_payload(
+                {"endpoint": "127.0.0.1:30000", "model": "m",
+                 "thinking": True, "thinking_budget": 512}
+            )
+        self.assertTrue(d["ok"])
+        self.assertTrue(v.called)  # graded by quality_chess.validate
+        self.assertEqual(captured["thinking"], True)
+        self.assertEqual(captured["budget"], 512)
+        self.assertEqual(d["verdict"], "wrong-position")
+        self.assertEqual(d["tokens"]["total"], 300)
+        self.assertIn("<svg", d["svg"])
+
+    def test_quality_run_no_svg_is_broken(self):
+        with mock.patch.object(
+            webui, "_chat_completion",
+            return_value=self._fake_resp("I cannot draw that."),
+        ):
+            d = webui.quality_run_payload(
+                {"endpoint": "e", "model": "m"}
+            )
+        self.assertTrue(d["ok"])
+        self.assertIsNone(d["svg"])
+        self.assertEqual(d["verdict"], "broken")
+        self.assertTrue(d["offer_download"])
+
+    def test_quality_run_requires_endpoint_and_model(self):
+        self.assertFalse(webui.quality_run_payload({"model": "m"})["ok"])
+        self.assertFalse(webui.quality_run_payload({"endpoint": "e"})["ok"])
+
+    def test_quality_save_honors_toggle_and_shots_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "shots.jsonl")
+            # save toggle off -> nothing written.
+            d = webui.quality_save_payload(
+                {"save": False, "model": "m", "path": path, "verdict": "correct"}
+            )
+            self.assertFalse(d["saved"])
+            self.assertFalse(os.path.exists(path))
+            # save on -> appended.
+            d = webui.quality_save_payload(
+                {"save": True, "model": "m", "quant": "Q4_K_M", "path": path,
+                 "verdict": "correct", "tokens": {"total": 5}, "svg": "<svg/>"}
+            )
+            self.assertTrue(d["saved"])
+            shots = webui.quality_shots_payload({"path": path})
+            self.assertTrue(shots["ok"])
+            self.assertEqual(len(shots["shots"]), 1)
+            self.assertEqual(shots["shots"][0]["verdict"], "correct")
+
+    def test_quality_shots_missing_file_is_empty(self):
+        d = webui.quality_shots_payload({"path": "/no/such/shots.jsonl"})
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["shots"], [])
+
+
+class TestNewTabsInIndex(CustomTestCase):
+    def test_index_has_new_tabs_and_routes(self):
+        for token in (
+            "view_models", "view_quality", "/api/models", "/api/server_start",
+            "/api/measure_power", "/api/quality_run", "/api/quality_shots",
+            "/assets/quality_chess_reference.png",
+            "1t53dhp",  # reddit reference link
+        ):
+            self.assertIn(token, webui.INDEX_HTML, token)
+
+
+class TestNewHttpRoutes(WebUIFixture):
+    """The new routes over a real in-process HTTP round-trip."""
+
+    def setUp(self):
+        self.fake = _FakeSupervisor()
+        webui._set_supervisor(self.fake)
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
+        self.port = self.srv.server_address[1]
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        webui._set_supervisor(None)
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.thread.join(timeout=5)
+
+    def _get(self, path):
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{self.port}{path}", timeout=10
+        ) as r:
+            return r.read(), r.headers.get("Content-Type")
+
+    def _post(self, path, obj):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(obj).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def test_server_status_route(self):
+        body, ctype = self._get("/api/server_status")
+        d = json.loads(body)
+        self.assertTrue(d["ok"])
+        self.assertFalse(d["running"])
+
+    def test_reference_png_static_route(self):
+        body, ctype = self._get("/assets/quality_chess_reference.png")
+        self.assertEqual(ctype, "image/png")
+        self.assertTrue(len(body) > 1000)
+        self.assertEqual(body[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_server_start_over_http(self):
+        d = self._post("/api/server_start",
+                       {"model_path": "/m", "tp_size": 1, "port": 31234})
+        self.assertTrue(d["ok"], d.get("error"))
+        self.assertIsNotNone(self.fake.started)
 
 
 if __name__ == "__main__":
