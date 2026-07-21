@@ -187,12 +187,15 @@ class TestPlacementTokensAndExperts(CustomTestCase):
             ),
         )
         toks = p.kv_tokens
-        # Exhaustive, disjoint cover of [0, context): start_0 = 0, end_n = ctx,
-        # each start == previous end, total owned == context.
-        self.assertEqual(toks[0].pos_start, 0)
-        self.assertEqual(toks[-1].pos_end, context)
+        # CYCLIC owner rule (matches distributed/utils.py): the within-cycle
+        # prefix ranges partition [0, cycle_len) exactly, and the per-rank
+        # totals over the interleaved cycles cover the whole context.
+        cycle = toks[0].cycle_len
+        self.assertEqual(cycle, sum([3, 1, 1]))
+        self.assertEqual(toks[0].cycle_start, 0)
+        self.assertEqual(toks[-1].cycle_end, cycle)
         for prev, cur in zip(toks, toks[1:]):
-            self.assertEqual(cur.pos_start, prev.pos_end)
+            self.assertEqual(cur.cycle_start, prev.cycle_end)
         self.assertEqual(sum(t.tokens_owned for t in toks), context)
         # 3:1:1 ownership -> rank 0 owns strictly more positions.
         self.assertGreater(toks[0].tokens_owned, toks[1].tokens_owned)
@@ -213,10 +216,12 @@ class TestPlacementTokensAndExperts(CustomTestCase):
             ),
         )
         toks = p.kv_tokens
-        self.assertEqual(toks[0].pos_start, 0)
-        self.assertEqual(toks[-1].pos_end, context)
+        cycle = toks[0].cycle_len
+        self.assertGreater(cycle, 0)
+        self.assertEqual(toks[0].cycle_start, 0)
+        self.assertEqual(toks[-1].cycle_end, cycle)
         for prev, cur in zip(toks, toks[1:]):
-            self.assertEqual(cur.pos_start, prev.pos_end)
+            self.assertEqual(cur.cycle_start, prev.cycle_end)
         self.assertEqual(sum(t.tokens_owned for t in toks), context)
 
     def test_explicit_token_vector_wins(self):
