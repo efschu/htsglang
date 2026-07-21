@@ -211,28 +211,54 @@ def _bench_gemm_tflops(dev) -> float:
     return flops / (ms / 1e3) / 1e12
 
 
-def _bench_membw_gbs(dev) -> float:
+def _time_best_gbs(dev, fn, moved_bytes: float, iters: int = 40) -> float:
+    """Effective GB/s for a bandwidth-bound kernel: the BEST (min-time) of a few
+    iters (best-of rejects scheduling/clock-warmup noise better than a mean for
+    a memory microbenchmark). ``moved_bytes`` is the DRAM traffic per call."""
     import torch
 
-    x = torch.randn(1, _PROBE_GEMV_K, dtype=torch.bfloat16, device=dev)
-    w = torch.randn(_PROBE_GEMV_ROWS, _PROBE_GEMV_K, dtype=torch.bfloat16, device=dev)
-    fn = lambda: torch.nn.functional.linear(x, w)
-    for _ in range(10):
+    for _ in range(8):
         fn()
     torch.cuda.synchronize(dev)
-    s = torch.cuda.Event(enable_timing=True)
-    e = torch.cuda.Event(enable_timing=True)
-    iters = 50
-    s.record(torch.cuda.current_stream(dev))
+    best_ms = float("inf")
     for _ in range(iters):
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record(torch.cuda.current_stream(dev))
         fn()
-    e.record(torch.cuda.current_stream(dev))
-    torch.cuda.synchronize(dev)
-    ms = s.elapsed_time(e) / iters
-    gb = _PROBE_GEMV_ROWS * _PROBE_GEMV_K * 2 / 1e9
-    del x, w
+        e.record(torch.cuda.current_stream(dev))
+        torch.cuda.synchronize(dev)
+        best_ms = min(best_ms, s.elapsed_time(e))
+    return moved_bytes / 1e9 / (best_ms / 1e3)
+
+
+def _bench_membw_gbs(dev) -> float:
+    """MEASURED effective device memory bandwidth (GB/s) — a genuine
+    bandwidth-bound probe, NOT a nameplate spec. Runs three kernels whose
+    working sets sit well past L2 (a read-only reduction, a copy, and the decode
+    -shaped GEMV weight read) and returns the BEST effective GB/s achieved. The
+    GEMV is what a bs=1 decode actually does (stream the weights once), so this
+    number is the right divisor for the decode roofline; the reduction/copy
+    guard against a GEMV kernel that fails to saturate on some arch. Effective
+    bandwidth lands BELOW the nameplate peak (measured ~1.56 TB/s on a 5090 vs
+    ~1.79 nameplate, ~0.72 TB/s on a 3080 vs ~0.76) — expected, and exactly why
+    the roofline prefers this probe over the reference table for cards on-box."""
+    import torch
+
+    n = _PROBE_GEMV_ROWS * _PROBE_GEMV_K  # ~0.67 G elems -> ~1.34 GB bf16
+    a = torch.randn(n, dtype=torch.bfloat16, device=dev)
+    b = torch.empty(n, dtype=torch.bfloat16, device=dev)
+    x = torch.randn(1, _PROBE_GEMV_K, dtype=torch.bfloat16, device=dev)
+    w = a.view(_PROBE_GEMV_ROWS, _PROBE_GEMV_K)
+    nbytes = n * 2
+    best = max(
+        _time_best_gbs(dev, lambda: a.sum(), nbytes),          # read-only
+        _time_best_gbs(dev, lambda: b.copy_(a), nbytes * 2),   # read + write
+        _time_best_gbs(dev, lambda: torch.nn.functional.linear(x, w), nbytes),  # decode GEMV
+    )
+    del a, b, x, w
     torch.cuda.empty_cache()
-    return gb / (ms / 1e3)
+    return best
 
 
 def _link_worker(rank: int, world: int, results) -> None:
@@ -783,6 +809,7 @@ def _gguf_config_and_families(path: str) -> dict:
     # cost model is well-defined; the MoE param count is rebuilt from these in
     # _build_families.
     expert_count = int(opt("expert_count", 0) or 0)
+    expert_used = int(opt("expert_used_count", 0) or 0)  # top-k active experts
     expert_ffn = int(opt("expert_feed_forward_length", 0) or 0)
     shared_ffn = int(opt("expert_shared_feed_forward_length", 0) or 0)
     if expert_count > 0:
@@ -877,6 +904,7 @@ def _gguf_config_and_families(path: str) -> dict:
             "attn_output_gate": attn_gate,
             "vocab_size": int(vocab),
             "num_experts": expert_count,
+            "num_experts_per_tok": expert_used if expert_count else 0,
             "moe_intermediate_size": expert_ffn if expert_count else 0,
             "shared_expert_intermediate_size": shared_ffn if expert_count else 0,
             "mtp_num_hidden_layers": nextn,
@@ -1098,6 +1126,22 @@ class PerfCostModel:
         self.num_experts = int(
             text.get("num_experts", text.get("n_routed_experts", 0)) or 0
         )
+        # Active (routed) experts per token — the MoE sparsity factor the
+        # roofline estimate needs to size "active bytes/params per token"
+        # (decode streams only the top-k experts, not all of them). HF configs
+        # name it ``num_experts_per_tok`` (some ``num_activated_experts``); the
+        # GGUF synthesizer maps ``expert_used_count`` to the same key. Falls
+        # back to 8 (the common Qwen/Mixtral default) if a MoE checkpoint omits
+        # it, and is clamped to [1, num_experts].
+        self.num_experts_per_tok = int(
+            text.get("num_experts_per_tok")
+            or text.get("num_activated_experts")
+            or (8 if self.num_experts > 0 else 0)
+        )
+        if self.num_experts > 0:
+            self.num_experts_per_tok = max(
+                1, min(self.num_experts_per_tok, self.num_experts)
+            )
         self.moe_intermediate = int(text.get("moe_intermediate_size", 0) or 0)
         self.shared_expert_intermediate = int(
             text.get("shared_expert_intermediate_size", 0) or 0

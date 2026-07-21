@@ -379,6 +379,11 @@ def _plan_to_dict(result, model_path: str) -> dict:
             if result.offload is not None
             else None
         ),
+        "roofline_estimate": (
+            dataclasses.asdict(result.roofline)
+            if getattr(result, "roofline", None) is not None
+            else None
+        ),
     }
 
 
@@ -856,6 +861,22 @@ INDEX_HTML = r"""<!doctype html>
   th:first-child, td:first-child { text-align: left; }
   .bar { height: 9px; background: #232b35; border-radius: 4px; overflow: hidden; }
   .bar > span { display: block; height: 100%; background: #2f81f7; }
+  .roofline { margin-top: .9rem; background: #191410; border: 1px dashed #7a5c14;
+              border-radius: 8px; padding: .7rem .8rem; }
+  .rf-title { font-weight: 700; color: #e3b341; font-size: .9rem;
+              text-transform: uppercase; letter-spacing: .02em; }
+  .rf-nums { display: flex; gap: 1.2rem; margin: .5rem 0; flex-wrap: wrap; }
+  .rf-num { background: #12171e; border: 1px solid #263041; border-radius: 6px;
+            padding: .4rem .7rem; }
+  .rf-num span { display: block; font-size: .66rem; color: #7f8b99;
+                 text-transform: uppercase; }
+  .rf-num b { font-size: 1.15rem; color: #e6edf3; }
+  .rf-num small { display: block; font-size: .62rem; color: #7f8b99; }
+  .rf-meas { color: #56d364; font-weight: 600; }
+  .rf-name { color: #d29922; }
+  .rf-caveats { margin: .5rem 0 0; padding-left: 1.1rem; font-size: .68rem;
+                color: #8b949e; }
+  .rf-caveats li { margin: .15rem 0; }
   pre { background: #161b22; border: 1px solid #232b35; border-radius: 6px;
         padding: .6rem; overflow-x: auto; font-size: .74rem; white-space: pre-wrap;
         word-break: break-word; }
@@ -1012,6 +1033,7 @@ INDEX_HTML = r"""<!doctype html>
     <div id="split"></div>
     <div id="cards"></div>
     <div id="advantage"></div>
+    <div id="roofline"></div>
     <div id="flags"></div>
     <div id="issue"></div>
   </div>
@@ -1188,6 +1210,7 @@ function render(d) {
     $('split').innerHTML = '<ul class="reasons">' +
       d.reasons.map(x=>'<li>'+esc(x)+'</li>').join('') + '</ul>';
     $('cards').innerHTML = $('advantage').innerHTML = $('flags').innerHTML = '';
+    $('roofline').innerHTML = '';
     return;
   }
   const cap = d.capacity;
@@ -1272,10 +1295,56 @@ function render(d) {
     av += '</div>';
   }
   $('advantage').innerHTML = av;
+  // roofline throughput ESTIMATE — loudly labelled rough ballpark, NOT measured
+  renderRoofline(d.roofline_estimate);
   // launch flags
   $('flags').innerHTML = (d.launch_flags && d.launch_flags.length)
     ? '<p class="muted">launch flags (copy into your command):</p><pre>'
       + d.launch_flags.map(esc).join('\n') + '</pre>' : '';
+}
+
+function renderRoofline(rf) {
+  if (!rf) { $('roofline').innerHTML = ''; return; }
+  const fmt = x => Math.round(x).toLocaleString();
+  let h = '<div class="roofline"><div class="rf-title">Roofline estimate '
+    + '(no MTP) &mdash; ROUGH BALLPARK, NOT measured</div>'
+    + '<p class="est">The runtime measures the real number; this is an '
+    + 'order-of-magnitude ceiling with a large error bar.</p>';
+  if (rf.measured_available)
+    h += '<p class="est"><b>A measured entry exists for this config (shown '
+      + 'above) &mdash; this roofline is secondary.</b></p>';
+  h += '<div class="rf-nums">'
+    + '<div class="rf-num"><span>prefill</span><b>~' + fmt(rf.prefill_tok_s)
+    + '</b> tok/s<small>compute-bound, cold cache</small></div>'
+    + '<div class="rf-num"><span>decode</span><b>~' + fmt(rf.decode_tok_s_low)
+    + '&ndash;' + fmt(rf.decode_tok_s_high) + '</b> tok/s<small>at '
+    + rf.reference_context_tokens.toLocaleString() + '-tok ctx .. short-ctx '
+    + 'ceiling</small></div></div>';
+  h += '<p class="muted">derivation: compute dtype <b>' + esc(rf.compute_dtype)
+    + '</b>; eff decode &times;' + rf.eff_decode + ', prefill &times;'
+    + rf.eff_prefill + '; interconnect <b>' + esc(rf.interconnect) + ' &times;'
+    + rf.interconnect_discount.toFixed(2) + '</b><br><span class="est">'
+    + esc(rf.interconnect_note) + '</span></p>';
+  if (rf.offload_note)
+    h += '<p class="muted">MoE offload: <span class="est">'
+      + esc(rf.offload_note) + '</span></p>';
+  h += '<table><tr><th>rank</th><th>GPU</th><th>membw</th><th>FLOPS</th>'
+    + '<th>active weight/token</th></tr>';
+  for (const pr of rf.per_rank) {
+    const src = s => '<span class="'
+      + (s === 'measured' ? 'rf-meas' : 'rf-name') + '">' + esc(s) + '</span>';
+    h += '<tr><td>' + pr.rank + '</td><td>GPU ' + pr.gpu_index + ' '
+      + esc(pr.gpu_name) + '</td><td>' + fmt(pr.peak_membw_gbs) + ' GB/s '
+      + src(pr.membw_source) + '</td><td>' + fmt(pr.peak_flops_tflops)
+      + ' TFLOPS ' + src(pr.flops_source) + '</td><td>'
+      + pr.resident_active_weight_gib.toFixed(2) + ' GiB'
+      + (pr.offloaded_active_weight_gib > 0
+          ? ' + ' + pr.offloaded_active_weight_gib.toFixed(2) + ' via PCIe' : '')
+      + '</td></tr>';
+  }
+  h += '</table><ul class="rf-caveats">'
+    + rf.caveats.map(c => '<li>' + esc(c) + '</li>').join('') + '</ul></div>';
+  $('roofline').innerHTML = h;
 }
 
 async function doIssue(kind) {

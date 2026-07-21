@@ -109,6 +109,12 @@ class PlanResult:
     #: fits-with-RAM-offload from genuinely-cannot-fit. None only when capacity
     #: could not be sized at all.
     offload: Optional[OffloadAssessment] = None
+    #: Roofline throughput ESTIMATE (design #145) — a rough, clearly-labelled
+    #: prefill+decode tok/s ballpark carrying ``provenance="planner-estimate"``,
+    #: ADDITIVE and separate from the capacity/feasibility answer (never a
+    #: measured number). None when it cannot be sized (unknown card peaks). Typed
+    #: loosely to avoid an import cycle (sglang.srt.planner.roofline).
+    roofline: Optional[object] = None
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +257,7 @@ def plan(
     host_ram_mib: Optional[int] = None,
     include_vision: bool = True,
     with_advantage: bool = True,
+    roofline_context_tokens: int = 4096,
 ) -> PlanResult:
     """Plan ``model_path`` on ``hardware``.
 
@@ -395,6 +402,32 @@ def plan(
                 inputs, hardware, capacity, user_free_reserve_mib
             ),
         )
+
+    # Roofline throughput ESTIMATE (design #145) — additive, explicitly separate
+    # from the capacity/feasibility answer. Guarded: a failure here (unknown card
+    # peaks, an un-shardable geometry) must never break the plan, so it degrades
+    # to an absent estimate. Sized whenever capacity exists (fits in VRAM OR
+    # fits with RAM-offload — the offloaded MoE case is exactly where the PCIe
+    # -fetch term matters). Measured micro-probe scores (advantage) win over the
+    # nameplate peaks inside the estimator.
+    if capacity is not None:
+        try:
+            from sglang.srt.planner.roofline import estimate_roofline
+
+            measured_scores = None
+            if result.advantage is not None:
+                measured_scores = getattr(result.advantage, "measured", None)
+            roofline = estimate_roofline(
+                inputs,
+                hardware,
+                capacity,
+                offload,
+                measured_scores=measured_scores,
+                context_tokens=roofline_context_tokens,
+            )
+            result = dataclasses.replace(result, roofline=roofline)
+        except Exception:
+            result = dataclasses.replace(result, roofline=None)
     return result
 
 

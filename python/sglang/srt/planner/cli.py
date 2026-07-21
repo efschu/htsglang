@@ -365,6 +365,50 @@ def _print_report(result, model_path: str) -> None:
                     else "EXCEEDED (expect a decode regression)"
                 )
             )
+    _print_roofline(getattr(result, "roofline", None))
+
+
+def _print_roofline(rf) -> None:
+    """The roofline throughput ESTIMATE block — loudly labelled as a rough
+    ballpark, NOT a measurement, with the derivation inputs shown."""
+    if rf is None:
+        return
+    print()
+    print("Roofline estimate (no MTP) — ROUGH BALLPARK, NOT measured; the")
+    print("runtime measures the real number. Expect a large error bar.")
+    if rf.measured_available:
+        print("  (a MEASURED entry exists for this config — see above; this")
+        print("   roofline is SECONDARY.)")
+    print(
+        f"  PREFILL ~{rf.prefill_tok_s:,.0f} tok/s (compute-bound, cold cache)"
+    )
+    print(
+        f"  DECODE  ~{rf.decode_tok_s_low:,.0f}-{rf.decode_tok_s_high:,.0f} "
+        f"tok/s (at {rf.reference_context_tokens:,}-tok ctx .. short-ctx "
+        "ceiling; drops as context fills)"
+    )
+    print(
+        f"  derivation: compute dtype {rf.compute_dtype}; "
+        f"eff decode x{rf.eff_decode}, prefill x{rf.eff_prefill}; "
+        f"interconnect {rf.interconnect} x{rf.interconnect_discount:.2f}"
+    )
+    print(f"    {rf.interconnect_note}")
+    if rf.offload_note:
+        print(f"    MoE offload: {rf.offload_note}")
+    for pr in rf.per_rank:
+        print(
+            f"    rank {pr.rank} GPU {pr.gpu_index} ({pr.gpu_name}): membw "
+            f"{pr.peak_membw_gbs:,.0f} GB/s ({pr.membw_source}), FLOPS "
+            f"{pr.peak_flops_tflops:,.0f} TFLOPS ({pr.flops_source}); active "
+            f"weight {pr.resident_active_weight_gib:.2f} GiB"
+            + (
+                f" + {pr.offloaded_active_weight_gib:.2f} GiB via PCIe"
+                if pr.offloaded_active_weight_gib > 0
+                else ""
+            )
+        )
+    for c in rf.caveats:
+        print(f"    - {c}")
 
 
 def _run_matrix(args) -> int:
@@ -603,6 +647,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             "offload": (
                 dataclasses.asdict(result.offload)
                 if result.offload is not None
+                else None
+            ),
+            "roofline_estimate": (
+                dataclasses.asdict(result.roofline)
+                if getattr(result, "roofline", None) is not None
                 else None
             ),
         }
