@@ -682,6 +682,60 @@ class TestLandingTopStrip(CustomTestCase):
         self.assertIn("/api/hicache_saved", webui.INDEX_HTML)
 
 
+class TestMergedCardTelemetry(CustomTestCase):
+    """The landing's standalone per-GPU 60s chart grid is MERGED into the
+    per-card VRAM-placement blocks: one place per card explains BOTH what
+    occupies its VRAM and how it is doing live."""
+
+    def test_old_per_gpu_chart_grid_is_gone(self):
+        # container id + legend of the removed standalone grid: no
+        # duplication, the card blocks are the only per-GPU live view.
+        self.assertNotIn("landing_gpus", webui.INDEX_HTML)
+        self.assertNotIn("per-card GPU (live + 60s)", webui.INDEX_HTML)
+
+    def test_placement_card_blocks_carry_live_telemetry(self):
+        # compact live line inside renderPlacement's card blocks: current
+        # util/clock/power/temp + 60s util/power sparklines; matched to the
+        # CUDA-keyed card via the device-map-bridged gpus[] rows.
+        for token in (
+            "cardLiveHtml", "_liveGpuForCard", "cardlive",
+            "renderPlacement(d.placement, s.gpus)",
+        ):
+            self.assertIn(token, webui.INDEX_HTML, token)
+
+    def test_util_ring_reuses_freeze_at_zero_power_stays_plain(self):
+        # util is an activity stream -> strip freeze-at-zero semantics;
+        # power idles at a nonzero wattage -> plain ring.
+        self.assertIn("stripPush(key+'_util'", webui.INDEX_HTML)
+        self.assertIn("pushRing(key+'_pow'", webui.INDEX_HTML)
+
+    def test_top_strip_untouched(self):
+        for token in ("landing_strip", "strip_decode", "renderLandingStrip"):
+            self.assertIn(token, webui.INDEX_HTML, token)
+
+
+class TestSpecDraftSelectorUi(CustomTestCase):
+    """Runner Speculative section: local draft-model selector (drives the
+    authoritative speculative_draft_model_path field) + the muted amber
+    no-MTP-head hint."""
+
+    def test_selector_and_hint_ids_present(self):
+        for token in (
+            "draft_model_select", "spec_draft_hint", "row_draft_pick",
+            "renderDraftPick", "draftPickChanged", "updateSpecDraftHint",
+            "fl_speculative_draft_model_path",
+        ):
+            self.assertIn(token, webui.INDEX_HTML, token)
+
+    def test_hint_wordings_present(self):
+        self.assertIn(
+            "this model has no MTP head - pick a draft model",
+            webui.INDEX_HTML,
+        )
+        self.assertIn("none matching found locally", webui.INDEX_HTML)
+        self.assertIn("suggestion: ", webui.INDEX_HTML)
+
+
 class TestPlacementRoute(CustomTestCase):
     def test_placement_from_model_cfg_running_and_prospective(self):
         # ONE renderer, two data sources: identical route for both the landing
@@ -859,6 +913,73 @@ class TestConfigProfilesRoutes(CustomTestCase):
     def test_save_requires_name(self):
         d = webui.config_profiles_save({"settings": {"tp_size": 2}})
         self.assertFalse(d["ok"])
+
+    def test_draft_candidates_feed_presets_for_no_mtp_model(self):
+        # _V2_CONFIG has no MTP layers: with a matching local draft model the
+        # generated presets enable spec via --speculative-draft-model-path,
+        # and the candidates + MTP fact reach the UI payload (they feed the
+        # Speculative section's selector + hint).
+        from types import SimpleNamespace
+
+        drafts = [SimpleNamespace(
+            name="Gemma-4-31B-Eagle3", path="/m/ge3", error=None)]
+        with mock.patch(
+            "sglang.srt.planner.server_manager.discover_models",
+            return_value=drafts,
+        ):
+            d = webui.config_profiles_get(
+                {"model": "/m/gemma-4-31B-it", "model_cfg": _V2_CONFIG,
+                 "gpus": [{"name": "A", "total_mib": 32607},
+                          {"name": "B", "total_mib": 20480}]}
+            )
+        self.assertTrue(d["ok"])
+        self.assertIs(d["model_has_mtp"], False)
+        self.assertEqual(len(d["draft_candidates"]), 1)
+        self.assertEqual(d["draft_candidates"][0]["path"], "/m/ge3")
+        self.assertEqual(d["draft_candidates"][0]["algorithm"], "EAGLE3")
+        self.assertGreater(len(d["generated"]), 0)
+        for p in d["generated"]:
+            self.assertEqual(
+                p["settings"]["speculative_algorithm"], "EAGLE3", p["name"]
+            )
+            self.assertEqual(
+                p["settings"]["speculative_draft_model_path"], "/m/ge3",
+                p["name"],
+            )
+            self.assertIn("--speculative-draft-model-path", p["argv"])
+            self.assertTrue(
+                any("Gemma-4-31B-Eagle3" in i for i in p["info"]), p["info"]
+            )
+
+    def test_no_matching_draft_keeps_spec_off_with_note(self):
+        from types import SimpleNamespace
+
+        drafts = [SimpleNamespace(
+            name="Gemma-4-31B-Eagle3", path="/m/ge3", error=None)]
+        with mock.patch(
+            "sglang.srt.planner.server_manager.discover_models",
+            return_value=drafts,
+        ):
+            d = webui.config_profiles_get(
+                {"model": "/m/Qwen3.6-27B-AWQ", "model_cfg": _V2_CONFIG,
+                 "gpus": [{"name": "A", "total_mib": 32607},
+                          {"name": "B", "total_mib": 20480}]}
+            )
+        self.assertTrue(d["ok"])
+        self.assertIs(d["model_has_mtp"], False)
+        self.assertEqual(d["draft_candidates"], [])
+        for p in d["generated"]:
+            self.assertFalse(
+                p["settings"].get("speculative_algorithm"), p["name"]
+            )
+            self.assertTrue(
+                any(
+                    "no MTP head and no matching local draft model found"
+                    in i
+                    for i in p["info"]
+                ),
+                p["info"],
+            )
 
 
 class TestDashboardV2HttpRoutes(WebUIFixture):
@@ -1413,12 +1534,15 @@ class TestV3IndexMarkers(CustomTestCase):
             self.assertIn(kept, html, kept)
 
     def test_one_placement_renderer_two_callers(self):
-        # ONE renderer feeds both the landing (running) and the runner
-        # (prospective) placement views.
+        # ONE renderer feeds both the landing (running, WITH the live gpus[]
+        # for the merged telemetry line) and the runner (prospective, without)
+        # placement views.
         self.assertEqual(
             webui.INDEX_HTML.count("function renderPlacement"), 1)
         self.assertGreaterEqual(
-            webui.INDEX_HTML.count("renderPlacement(d.placement)"), 2)
+            webui.INDEX_HTML.count("renderPlacement(d.placement)"), 1)
+        self.assertGreaterEqual(
+            webui.INDEX_HTML.count("renderPlacement(d.placement, s.gpus)"), 1)
 
 
 class TestRunnerLmStudioLayout(CustomTestCase):

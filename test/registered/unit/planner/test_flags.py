@@ -421,6 +421,184 @@ class TestProfiles(CustomTestCase):
         )
 
 
+# The three REAL local draft-model naming shapes on the reference box (plain
+# dir, sglang-suffixed dir, HF-cache snapshot resolved to org/name) plus
+# non-draft distractors of the same family.
+def _dm(name, path=None, error=None):
+    return SimpleNamespace(name=name, path=path or "/models/" + name,
+                           error=error)
+
+
+_GEMMA_DRAFTS = [
+    _dm("Gemma-4-31B-Eagle3"),
+    _dm("gemma-4-31B-it-Eagle3-sglang"),
+    _dm(
+        "RedHatAI/gemma-4-31B-it-speculator.eagle3",
+        path="/hf/models--RedHatAI--gemma-4-31B-it-speculator.eagle3/"
+        "snapshots/abc123",
+    ),
+]
+_GEMMA_NON_DRAFTS = [
+    _dm("gemma-4-31B-it"),          # the base checkpoint itself
+    _dm("gemma-4-31B-AWQ-INT4"),    # a quant variant, not a draft head
+]
+
+
+class TestDraftModelMatcher(CustomTestCase):
+    """find_draft_models: local draft/speculator heads for a base model
+    WITHOUT its own MTP head. Conservative name-family matching -- a wrong
+    draft is worse than none."""
+
+    def test_gemma_base_finds_all_three_real_naming_shapes(self):
+        models = _GEMMA_NON_DRAFTS + _GEMMA_DRAFTS
+        got = flags.find_draft_models("/x/y/gemma-4-31B-it", models)
+        self.assertEqual(len(got), 3, got)
+        self.assertEqual({c["algorithm"] for c in got}, {"EAGLE3"})
+        names = {c["name"] for c in got}
+        for d in _GEMMA_DRAFTS:
+            self.assertIn(d.name, names)
+        # non-draft family members are never offered as drafts.
+        for d in _GEMMA_NON_DRAFTS:
+            self.assertNotIn(d.name, names)
+
+    def test_quant_noise_in_base_name_is_ignored(self):
+        # AWQ/BF16/INT4 tokens must not be REQUIRED of the draft name.
+        got = flags.find_draft_models(
+            "/m/Qwen3.6-27B-AWQ-BF16-INT4",
+            [_dm("Qwen3.6-27B-Eagle3")] + _GEMMA_DRAFTS,
+        )
+        self.assertEqual([c["name"] for c in got], ["Qwen3.6-27B-Eagle3"])
+
+    def test_gemma_drafts_never_offered_for_qwen_base(self):
+        got = flags.find_draft_models(
+            "/m/Qwen3.6-27B-AWQ-BF16-INT4", _GEMMA_DRAFTS
+        )
+        self.assertEqual(got, [])
+
+    def test_version_token_must_match_exactly(self):
+        # a 'qwen3' base must NOT match a 'qwen3.6' draft (and vice versa):
+        # '.'-versions stay one token, matching is exact.
+        self.assertEqual(
+            flags.find_draft_models("Qwen3-27B", [_dm("Qwen3.6-27B-Eagle3")]),
+            [],
+        )
+        self.assertEqual(
+            flags.find_draft_models("Qwen3.6-27B", [_dm("Qwen3-27B-Eagle3")]),
+            [],
+        )
+
+    def test_no_candidates_is_empty_never_raises(self):
+        self.assertEqual(flags.find_draft_models("gemma-4-31B", []), [])
+        self.assertEqual(flags.find_draft_models(None, _GEMMA_DRAFTS), [])
+        self.assertEqual(flags.find_draft_models("", _GEMMA_DRAFTS), [])
+
+    def test_broken_model_is_skipped(self):
+        got = flags.find_draft_models(
+            "gemma-4-31B",
+            [_dm("Gemma-4-31B-Eagle3", error="unreadable config.json")],
+        )
+        self.assertEqual(got, [])
+
+    def test_kind_from_name_eagle_vs_eagle3_vs_standalone(self):
+        got = flags.find_draft_models(
+            "gemma-4-31B",
+            [
+                _dm("gemma-4-31B-eagle-head"),
+                _dm("gemma-4-31B-draft"),
+                _dm("Gemma-4-31B-Eagle3"),
+            ],
+        )
+        by = {c["name"]: c["algorithm"] for c in got}
+        self.assertEqual(by["gemma-4-31B-eagle-head"], "EAGLE")
+        self.assertEqual(by["Gemma-4-31B-Eagle3"], "EAGLE3")
+        self.assertEqual(by["gemma-4-31B-draft"], "STANDALONE")
+        # EAGLE3 candidates rank first (they feed the preset suggestion).
+        self.assertEqual(got[0]["algorithm"], "EAGLE3")
+
+    def test_dict_entries_accepted(self):
+        got = flags.find_draft_models(
+            "gemma-4-31B",
+            [{"name": "Gemma-4-31B-Eagle3", "path": "/m/ge3"}],
+        )
+        self.assertEqual(got, [{"name": "Gemma-4-31B-Eagle3",
+                                "path": "/m/ge3",
+                                "algorithm": "EAGLE3"}])
+
+
+class TestDraftModelPresets(CustomTestCase):
+    """profiles() with draft_models: a checkpoint WITHOUT MTP layers gets the
+    conservative speculative shape via the matched local draft model; without
+    a match, spec stays off with the explicit info note."""
+
+    _CANDS = [{"name": "Gemma-4-31B-Eagle3", "path": "/m/ge3",
+               "algorithm": "EAGLE3"}]
+
+    def test_every_preset_uses_the_draft_when_no_mtp(self):
+        profs = flags.profiles(
+            _MOE_CFG, _HETERO_GPUS, draft_models=self._CANDS
+        )
+        self.assertGreater(len(profs), 0)
+        for p in profs:
+            s = p.settings
+            self.assertEqual(s["speculative_algorithm"], "EAGLE3", p.kind)
+            self.assertEqual(
+                s["speculative_draft_model_path"], "/m/ge3", p.kind
+            )
+            self.assertEqual(s["speculative_num_steps"], 3, p.kind)
+            self.assertEqual(s["speculative_eagle_topk"], 1, p.kind)
+            self.assertEqual(s["speculative_num_draft_tokens"], 4, p.kind)
+            # adaptive spec is legal for EAGLE/EAGLE3 (verified against
+            # adaptive_spec_params.adaptive_unsupported_reason).
+            self.assertTrue(s["speculative_adaptive"], p.kind)
+            self.assertTrue(
+                any("Gemma-4-31B-Eagle3" in i for i in p.info), p.info
+            )
+            # the argv actually carries the draft-model flag.
+            argv = flags.profile_argv(p)
+            self.assertIn("--speculative-draft-model-path", argv)
+            self.assertIn("/m/ge3", argv)
+
+    def test_standalone_draft_keeps_adaptive_off(self):
+        cands = [{"name": "gemma-4-31B-draft", "path": "/m/gd",
+                  "algorithm": "STANDALONE"}]
+        for p in flags.profiles(_MOE_CFG, _HETERO_GPUS, draft_models=cands):
+            self.assertEqual(
+                p.settings["speculative_algorithm"], "STANDALONE", p.kind
+            )
+            self.assertFalse(p.settings["speculative_adaptive"], p.kind)
+            self.assertTrue(
+                any("adaptive OFF" in i for i in p.info), p.info
+            )
+
+    def test_no_mtp_and_no_draft_notes_unavailable(self):
+        for p in flags.profiles(_MOE_CFG, _HETERO_GPUS):
+            self.assertFalse(p.settings.get("speculative_algorithm"), p.kind)
+            self.assertFalse(
+                p.settings.get("speculative_draft_model_path"), p.kind
+            )
+            self.assertTrue(
+                any(
+                    "no MTP head and no matching local draft model found"
+                    in i
+                    for i in p.info
+                ),
+                p.info,
+            )
+
+    def test_own_mtp_head_wins_over_draft_candidates(self):
+        # a checkpoint WITH MTP layers keeps the validated NEXTN shape even
+        # when draft candidates exist -- the draft path stays unset.
+        for p in flags.profiles(
+            _REF_CFG, _REF_RIG, draft_models=self._CANDS
+        ):
+            self.assertEqual(
+                p.settings["speculative_algorithm"], "NEXTN", p.kind
+            )
+            self.assertFalse(
+                p.settings.get("speculative_draft_model_path"), p.kind
+            )
+
+
 class TestProfileStore(CustomTestCase):
     def test_save_load_roundtrip(self):
         profs = flags.profiles(_MOE_CFG, _HETERO_GPUS)

@@ -51,6 +51,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import typing
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -75,6 +76,7 @@ __all__ = [
     "model_quant_kind",
     "model_max_context",
     "rig_has_sm86",
+    "find_draft_models",
 ]
 
 
@@ -231,6 +233,133 @@ def rig_has_sm86(gpus: Sequence) -> bool:
         if any(f in low for f in _SM86_NAME_FRAGMENTS):
             return True
     return False
+
+
+# ===========================================================================
+# Draft-model matcher: speculative decoding for checkpoints WITHOUT an MTP
+# head via a separate local EAGLE/EAGLE3 draft model
+# (--speculative-algorithm + --speculative-draft-model-path).
+# ===========================================================================
+
+#: a model name that carries one of these markers is a draft/speculator head,
+#: never a base model (case-insensitive substring match on the full name).
+_DRAFT_MARKER_RE = re.compile(r"eagle|speculator|draft", re.IGNORECASE)
+
+#: tokens that carry NO family identity (quant tags, format/role suffixes,
+#: vendor prefixes): dropped from the BASE tokens so "Qwen3.6-27B-AWQ" still
+#: requires only {qwen3.6, 27b} of a draft name -- and never REQUIRED of the
+#: draft (a draft is allowed to carry any of them).
+_FAMILY_NOISE_TOKENS = frozenset({
+    "it", "instruct", "chat", "base", "hf", "sglang", "gguf", "awq", "gptq",
+    "bnb", "bf16", "fp16", "fp8", "f16", "f32", "int2", "int4", "int8",
+    "nvfp4", "mxfp4", "4bit", "8bit", "dynamic", "quantized", "compressed",
+    "tensors", "unsloth", "ud", "vl", "eagle", "eagle3", "speculator",
+    "draft", "mtp", "spec", "head",
+})
+#: quant-shaped tokens (Q4_K_M splits into q4/k/m on the '_' separator) --
+#: also noise, matched by shape instead of enumeration.
+_QUANT_TOKEN_RE = re.compile(
+    r"^(i?q\d\w*|w\d+a\d+\w*|k|m|s|l|xl|xs|xxs)$", re.IGNORECASE
+)
+
+
+def _name_tokens(name: str) -> List[str]:
+    """Lowercase identity tokens of a model name: split on separators but NOT
+    on '.' (Qwen3.6 must stay one token; a version-truncated 'qwen3' must
+    never match a 'qwen3.6' draft)."""
+    return [t for t in re.split(r"[\s/\\_,+-]+", str(name or "").lower()) if t]
+
+
+def _family_tokens(name: str) -> List[str]:
+    """The tokens a DRAFT model's name must contain to count as the same
+    family: the base name's tokens minus quant/format/role noise."""
+    base = os.path.basename(str(name or "").rstrip("/"))
+    return [
+        t
+        for t in _name_tokens(base)
+        if t not in _FAMILY_NOISE_TOKENS and not _QUANT_TOKEN_RE.match(t)
+    ]
+
+
+def _draft_config_arch(path: str) -> str:
+    """Lowercased ``architectures`` string of a candidate's config.json (empty
+    when unreadable) -- used to detect a draft head whose NAME lacks a marker
+    and to refine the EAGLE vs EAGLE3 kind."""
+    try:
+        with open(os.path.join(path, "config.json")) as f:
+            cfg = json.load(f)
+        archs = cfg.get("architectures")
+        if isinstance(archs, list):
+            return " ".join(str(a) for a in archs).lower()
+    except Exception:
+        pass
+    return ""
+
+
+def find_draft_models(
+    base_ref: Optional[str], models: Sequence
+) -> List[Dict[str, str]]:
+    """Find local DRAFT-model candidates for ``base_ref`` among ``models``
+    (``server_manager.DiscoveredModel``-likes or dicts with name/path).
+
+    A candidate must (a) be a draft/speculator head -- its name contains
+    eagle/eagle3/speculator/draft, or its config architectures contain Eagle
+    -- AND (b) match the base model's family: EVERY non-noise token of the
+    base name (quant tags like AWQ/BF16/INT4 dropped) appears verbatim in the
+    candidate's name tokens. Deliberately conservative: a wrong draft is
+    worse than none, so token matching is exact (a 'qwen3' base never matches
+    a 'qwen3.6' draft and a gemma draft is never offered for a Qwen base).
+
+    Returns ``[{"name", "path", "algorithm"}]`` with algorithm EAGLE3 / EAGLE
+    (from the name/config kind markers) or STANDALONE when the candidate is a
+    draft by name only, EAGLE3 candidates first."""
+    required = _family_tokens(base_ref or "")
+    if not required or not models:
+        return []
+    base_real = os.path.realpath(str(base_ref)) if base_ref else None
+    out: List[Dict[str, str]] = []
+    for m in models:
+        if isinstance(m, dict):
+            name = str(m.get("name") or "")
+            path = str(m.get("path") or "")
+            broken = m.get("error")
+        else:
+            name = str(getattr(m, "name", "") or "")
+            path = str(getattr(m, "path", "") or "")
+            broken = getattr(m, "error", None)
+        if broken:
+            continue  # a broken draft is worse than none
+        if not name and path:
+            name = os.path.basename(path.rstrip("/"))
+        if not name:
+            continue
+        if base_real and path and os.path.realpath(path) == base_real:
+            continue  # the base model itself is never its own draft
+        toks = set(_name_tokens(name))
+        if path:
+            toks |= set(_name_tokens(os.path.basename(path.rstrip("/"))))
+        if not all(t in toks for t in required):
+            continue
+        hay = name.lower()
+        if not _DRAFT_MARKER_RE.search(hay):
+            arch = _draft_config_arch(path)
+            if "eagle" not in arch:
+                continue  # neither name nor config marks it as a draft head
+            hay += " " + arch
+        # kind: eagle3 > eagle from the name; a bare draft/speculator marker
+        # falls back to the config architectures, else STANDALONE.
+        if "eagle" not in hay:
+            hay += " " + _draft_config_arch(path)
+        if "eagle3" in hay:
+            algo = "EAGLE3"
+        elif "eagle" in hay:
+            algo = "EAGLE"
+        else:
+            algo = "STANDALONE"
+        out.append({"name": name, "path": path or name, "algorithm": algo})
+    rank = {"EAGLE3": 0, "EAGLE": 1, "STANDALONE": 2}
+    out.sort(key=lambda c: (rank.get(c["algorithm"], 9), c["name"].lower()))
+    return out
 
 
 # ===========================================================================
@@ -1427,6 +1556,7 @@ _ARGV_ORDER = (
     "context_length",
     "max_running_requests",
     "speculative_algorithm",
+    "speculative_draft_model_path",
     "speculative_num_steps",
     "speculative_eagle_topk",
     "speculative_num_draft_tokens",
@@ -1913,6 +2043,7 @@ def profiles(
     gpus: Sequence,
     base: Optional[dict] = None,
     python_exe: Optional[str] = None,
+    draft_models: Optional[Sequence[Dict[str, str]]] = None,
 ) -> List[Profile]:
     """Generate LAUNCHABLE profiles for ``gpus`` (a list of ``{name,
     total_mib}`` dicts or GpuDescriptor-like objects), each with ALL fields
@@ -1933,7 +2064,10 @@ def profiles(
     supported on that path), the measured per-quant calibration when this
     rig/quant is calibrated (fallbacks are called out in ``info``, never
     silently invented), the sm86-safe fp8 KV dtype, and the validated NEXTN
-    speculative shape when the checkpoint has MTP layers.
+    speculative shape when the checkpoint has MTP layers. A checkpoint
+    WITHOUT MTP layers gets the same conservative speculative shape via a
+    matching local draft model when ``draft_models`` (find_draft_models
+    output) is non-empty; otherwise spec stays off with an explicit note.
 
     Every preset additionally runs the CAPACITY RULES
     (:func:`_apply_capacity_rules`): context_length = min(model native max,
@@ -1951,6 +2085,9 @@ def profiles(
     quant = model_quant_kind(model_cfg)
     sm86 = rig_has_sm86(gpus)
     cat = catalog()
+    # first (best-ranked) matching local draft model, for checkpoints WITHOUT
+    # their own MTP head (find_draft_models output; EAGLE3 candidates first).
+    draft = dict(draft_models[0]) if draft_models else None
 
     base = dict(base or {})
     base.pop("python_exe", None)
@@ -1991,21 +2128,54 @@ def profiles(
         # adaptive-MTP shape (NEXTN chain, adaptive) whenever the checkpoint
         # actually carries MTP draft layers -- including the stock single-gpu
         # and normal-TP presets, not only the fork profiles. A checkpoint
-        # without draft layers cannot run NEXTN, so it stays off there
-        # (enabling it would make the preset unlaunchable).
-        if model_has_mtp(model_cfg) and not s.get("speculative_algorithm"):
-            s.update(
-                speculative_algorithm="NEXTN",
-                speculative_num_steps=3,
-                speculative_eagle_topk=1,
-                speculative_num_draft_tokens=4,
-                speculative_adaptive=True,
-            )
-            info.append(
-                "speculative decoding: NEXTN chain, steps 3, topk 1, draft "
-                "4, adaptive (the validated shape; topk stays 1 -- tree "
-                "spec is rejected under uneven DCP)."
-            )
+        # without draft layers cannot run NEXTN; there a MATCHING local
+        # draft model (find_draft_models) enables spec via
+        # --speculative-draft-model-path instead, in the same conservative
+        # shape. Without either, spec stays off with an explicit note.
+        if not s.get("speculative_algorithm"):
+            if model_has_mtp(model_cfg):
+                s.update(
+                    speculative_algorithm="NEXTN",
+                    speculative_num_steps=3,
+                    speculative_eagle_topk=1,
+                    speculative_num_draft_tokens=4,
+                    speculative_adaptive=True,
+                )
+                info.append(
+                    "speculative decoding: NEXTN chain, steps 3, topk 1, "
+                    "draft 4, adaptive (the validated shape; topk stays 1 "
+                    "-- tree spec is rejected under uneven DCP)."
+                )
+            elif draft is not None:
+                algo = str(draft.get("algorithm") or "EAGLE3")
+                # adaptive spec is VERIFIED legal only for EAGLE/EAGLE3 (+
+                # FROZEN_KV_MTP): adaptive_spec_params.
+                # adaptive_unsupported_reason rejects every other algorithm,
+                # so a STANDALONE draft keeps adaptive off.
+                adaptive = algo in ("EAGLE", "EAGLE3")
+                s.update(
+                    speculative_algorithm=algo,
+                    speculative_draft_model_path=draft.get("path"),
+                    speculative_num_steps=3,
+                    speculative_eagle_topk=1,
+                    speculative_num_draft_tokens=4,
+                    speculative_adaptive=adaptive,
+                )
+                info.append(
+                    "no MTP head: speculative decoding via the local draft "
+                    "model " + str(draft.get("name") or draft.get("path"))
+                    + " (" + algo + ", steps 3, topk 1, draft 4, "
+                    + ("adaptive" if adaptive else
+                       "adaptive OFF -- adaptive spec supports only "
+                       "EAGLE/EAGLE3")
+                    + "; topk stays 1 -- tree spec is rejected under "
+                    "uneven DCP)."
+                )
+            elif model_cfg:
+                info.append(
+                    "no MTP head and no matching local draft model found - "
+                    "speculative decoding unavailable."
+                )
         # KV dtype (capacity rule 2): fp8 KV ALWAYS, for EVERY preset (stock
         # single-gpu / normal-TP included) -- fp8 KV maximizes KV capacity.
         # sm86 (RTX 3080-class) cannot do fp8_e4m3 -> e5m2 whenever ANY sm86
