@@ -121,6 +121,47 @@ def model_kv_heads(model_cfg: Optional[dict]) -> Optional[int]:
         return None
 
 
+def model_q_heads(model_cfg: Optional[dict]) -> Optional[int]:
+    v = _cfg_get(model_cfg, "num_attention_heads")
+    try:
+        return int(v) if v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def stock_tp_legal(model_cfg: Optional[dict], tp: int) -> Tuple[bool, str]:
+    """VERIFIED stock-sglang TP rule (QKVParallelLinear): a tp value is
+    expressible in stock exactly when
+
+      * q_heads % tp == 0 (Q heads shard evenly), AND
+      * kv_heads % tp == 0 when tp <= kv_heads (head sharding), OR
+        tp % kv_heads == 0 when tp > kv_heads (kv replication,
+        num_kv_head_replicas = divide(tp, kv)).
+
+    Non-divisible combinations are NOT a stock option -- they need the fork's
+    uneven path (KV replicate + token-shard). Returns ``(ok, reason)`` with a
+    NEUTRAL reason string (a fact about stock's rule, not a verdict). Unknown
+    head counts (no config) are treated as legal."""
+    if tp <= 1:
+        return True, ""
+    q = model_q_heads(model_cfg)
+    kv = model_kv_heads(model_cfg)
+    if q is not None and q % tp != 0:
+        return False, (
+            f"stock requires q_heads % tp == 0 (q_heads={q}, tp={tp})"
+        )
+    if kv is None:
+        return True, ""
+    if tp <= kv and kv % tp == 0:
+        return True, ""
+    if tp > kv and tp % kv == 0:
+        return True, ""
+    return False, (
+        f"stock requires kv_heads % tp == 0 or tp % kv_heads == 0 "
+        f"(kv_heads={kv}, tp={tp}); this combination needs the fork path"
+    )
+
+
 def model_is_hybrid(model_cfg: Optional[dict]) -> bool:
     """True for a hybrid attention/linear-attention (GDN/mamba) model, e.g.
     Qwen3.5/3.6: ``layer_types`` contains 'linear_attention', or the config
@@ -1705,6 +1746,33 @@ def _cuda_index_at(gpus: Sequence, pos: int) -> Tuple[int, str]:
         return pos, "identity"
 
 
+def _pick_stock_subset(gpus: Sequence, totals: Sequence[int], n: int):
+    """Pick ``n`` cards for a stock normal-TP subset preset. Preference:
+    a set of IDENTICAL-VRAM cards (the stock even split fits them cleanly;
+    largest such total wins -- on the reference box the two 3080s), else the
+    ``n`` largest cards. Returns ``(list_positions, cuda_indices, why)`` or
+    None when the rig has fewer than ``n`` cards."""
+    if len(totals) < n:
+        return None
+    by_total: Dict[int, List[int]] = {}
+    for pos, t in enumerate(totals):
+        by_total.setdefault(int(t), []).append(pos)
+    identical = [t for t, ps in by_total.items() if len(ps) >= n]
+    if identical:
+        t = max(identical)
+        positions = by_total[t][:n]
+        why = f"Identical-VRAM pick ({t} MiB each): the even split fits cleanly."
+    else:
+        order = sorted(range(len(totals)), key=lambda p: -int(totals[p]))
+        positions = sorted(order[:n])
+        why = (
+            "No identical-VRAM set of this size; picked the largest cards "
+            "(the even split is sized by the smallest of them)."
+        )
+    cuda_idx = [_cuda_index_at(gpus, p)[0] for p in positions]
+    return positions, cuda_idx, why
+
+
 def _pick_single_gpu(gpus: Sequence):
     """Default card for the single-gpu preset:
     ``(list_pos, cuda_index, reason)`` or None.
@@ -2275,9 +2343,10 @@ def profiles(
     if ngpu <= 1:
         return out
 
-    # normal (stock) TP is representable only when tp_size divides the KV-head
-    # count (the stock even-split rule) and there is one rank per card.
-    stock_tp_ok = kvh is None or (kvh % ngpu == 0)
+    # normal (stock) TP is representable only under the verified stock rule
+    # (q % tp == 0 and kv % tp == 0 / tp % kv == 0 -- head-shard or
+    # kv-replication) and with one rank per card.
+    stock_tp_ok, stock_tp_reason = stock_tp_legal(model_cfg, ngpu)
     # The fork-only profiles (co-location, uneven split) are offered exactly
     # when the GPU set EXCEEDS the stock TP/kv-head rule: heterogeneous VRAM,
     # tp does not divide the KV heads, or more ranks than KV heads are wanted.
@@ -2297,25 +2366,85 @@ def profiles(
         _apply_capacity_rules(s, info, model_cfg, gpus, stock_even=True)
         out.append(Profile("normal-TP", "normal-tp", s, info=info))
     else:
+        # NEUTRAL framing (no scare wording): state plain facts about what
+        # stock's rule allows here; the fork profiles below are alternatives
+        # with their own numbers, not a verdict on this one.
         reason = []
         if heterogeneous:
-            reason.append("GPUs have different VRAM totals")
-        if not stock_tp_ok:
             reason.append(
-                f"tp_size={ngpu} does not divide the model's KV-head count "
-                f"({kvh})"
+                "the cards have different VRAM totals, so the stock even "
+                "split is sized by the smallest card"
             )
-        # still offer a normal-TP entry, but flagged that stock cannot run it
-        # cleanly (the fork's uneven path is the intended route).
+        if not stock_tp_ok:
+            reason.append(stock_tp_reason)
         info = list(base_notes) + [
-            "Stock even TP is imperfect here: " + "; ".join(reason)
-            + ". The fork's uneven-TP profiles below handle it "
-            "properly (KV replicate + token-shard).",
+            f"Plain even tensor parallelism across all {ngpu} cards, stock "
+            "sglang options only. " + "; ".join(reason) + ".",
         ]
         s = _mk({"tp_size": ngpu}, info)
         _apply_capacity_rules(s, info, model_cfg, gpus, stock_even=True)
         out.append(
             Profile("normal-TP (stock, limited)", "normal-tp", s, info=info)
+        )
+
+    # --- stock normal-TP subset presets: 2 cards (and 4 when 4 exist) -----
+    # Sensible plain-TP options on a bigger/mixed rig: tp=2 on the best pair
+    # and tp=4 on the best quad -- ONLY for card counts the rig actually has
+    # (never fabricate a card) and ONLY for tp values stock can express
+    # (stock_tp_legal); a non-divisible tp is not emitted at all (the fork
+    # profiles cover that space).
+    for n_sub, kind_sub in ((2, "normal-tp-2"), (4, "normal-tp-4")):
+        if ngpu <= 2 or ngpu < n_sub:
+            continue  # subset must be a real subset of existing cards
+        if n_sub == ngpu and stock_tp_ok and not heterogeneous:
+            continue  # identical to the plain normal-TP preset above
+        legal, why_not = stock_tp_legal(model_cfg, n_sub)
+        if not legal:
+            continue  # falls to the fork profiles; never emit illegal stock
+        pick = _pick_stock_subset(gpus, totals, n_sub)
+        if pick is None:
+            continue
+        positions, cuda_idx, why = pick
+        info = list(base_notes) + [
+            f"Plain stock tensor parallelism, tp={n_sub}, on "
+            f"{n_sub} of the {ngpu} cards: "
+            + ", ".join(
+                f"{_gpu_names(gpus)[p]} (cuda:{c})"
+                for p, c in zip(positions, cuda_idx)
+            )
+            + f". {why} Stock sglang options only (no fork flags).",
+        ]
+        overrides_sub: Dict[str, Any] = {"tp_size": n_sub}
+        env_sub: Dict[str, str] = {}
+        lo = min(cuda_idx)
+        if sorted(cuda_idx) == list(range(lo, lo + n_sub)):
+            # contiguous in CUDA order: the stock --base-gpu-id pin suffices.
+            if lo != 0:
+                overrides_sub["base_gpu_id"] = lo
+        else:
+            # non-contiguous pick: restrict visibility instead (stock-
+            # compatible; base_gpu_id stays 0 inside the restricted set).
+            env_sub["CUDA_VISIBLE_DEVICES"] = ",".join(
+                str(c) for c in sorted(cuda_idx)
+            )
+            info.append(
+                "cards are not contiguous in CUDA order: pinned via "
+                "CUDA_VISIBLE_DEVICES="
+                + env_sub["CUDA_VISIBLE_DEVICES"] + "."
+            )
+        s = _mk(overrides_sub, info)
+        cap_gpus_sub = [gpus[p] for p in positions]
+        _apply_capacity_rules(
+            s, info, model_cfg, cap_gpus_sub, stock_even=True
+        )
+        out.append(
+            Profile(
+                f"normal-TP-{n_sub} (stock subset)",
+                kind_sub,
+                s,
+                info=info,
+                env=env_sub,
+            )
         )
 
     if not needs_fork:

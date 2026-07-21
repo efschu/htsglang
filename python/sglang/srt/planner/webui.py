@@ -42,6 +42,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional
 
@@ -1813,7 +1814,19 @@ def placement_payload(payload: dict) -> dict:
 
     ONE granular renderer feeds BOTH the landing page (the RUNNING config's
     placement) and the runner tab (the PROSPECTIVE placement) -- the caller
-    supplies the flag dict from either source; the geometry is identical."""
+    supplies the flag dict from either source; the geometry is identical.
+
+    Extras handled here (webui resolves references; placement stays pure):
+      * ``flags.speculative_draft_model_path`` -> resolved to the draft
+        model's config dict (external-draft weights segment);
+      * CUDA-graph memory: an explicit ``flags.graph_mem_override`` (the
+        landing page's LIVE boot-log parse) wins; else the measured-anchor
+        store (graphmem, self-populated from the boot logs on disk); else
+        placement falls back to the calibrated heuristic;
+      * ``stock_compare: true`` -> a SECOND, plain normal-TP placement for
+        the side-by-side view (neutral framing; when stock cannot express
+        any tp on these cards, the reason is stated instead of numbers).
+    """
     from sglang.srt.planner import placement as placementmod
 
     model_cfg, err = _resolve_model_cfg_from_payload(payload)
@@ -1821,12 +1834,157 @@ def placement_payload(payload: dict) -> dict:
         return {"ok": False, "error": err}
     if not model_cfg:
         return {"ok": False, "error": "no model or model_cfg given"}
-    flags_dict = payload.get("flags") or {}
+    flags_dict = dict(payload.get("flags") or {})
+
+    # external draft model reference -> config dict for the draft segment.
+    draft_ref = flags_dict.get("speculative_draft_model_path")
+    if draft_ref and not flags_dict.get("speculative_draft_model_cfg"):
+        try:
+            dcfg, _ = _model_cfg_from_ref(str(draft_ref))
+            flags_dict["speculative_draft_model_cfg"] = dcfg
+        except (ValueError, KeyError, OSError):
+            pass  # unsizable draft ref: placement notes the absence
+
+    # measured-anchor graph memory (measured-overrides-estimate): only when
+    # the caller did not already inject a live parse.
+    if not flags_dict.get("graph_mem_override") and payload.get("model"):
+        try:
+            from sglang.srt.planner import graphmem
+
+            est = graphmem.estimate(
+                {
+                    "tp_size": flags_dict.get("tp_size") or 1,
+                    "max_running_requests": flags_dict.get(
+                        "max_running_requests"
+                    ),
+                },
+                {
+                    "speculative_algorithm": flags_dict.get(
+                        "speculative_algorithm"
+                    ),
+                    "speculative_num_steps": flags_dict.get(
+                        "speculative_num_steps"
+                    ),
+                    "speculative_num_draft_tokens": flags_dict.get(
+                        "speculative_num_draft_tokens"
+                    ),
+                    "speculative_adaptive": flags_dict.get(
+                        "speculative_adaptive"
+                    ),
+                },
+                model_path=str(payload.get("model")),
+                kv_cache_dtype=flags_dict.get("kv_cache_dtype"),
+            )
+            if est.get("provenance") == "measured":
+                est["provenance"] = "measured (boot-log anchor)"
+                flags_dict["graph_mem_override"] = est
+        except Exception:
+            pass  # anchor store is an enhancement, never a blocker
+
     try:
         result = placementmod.compute_placement(model_cfg, flags_dict)
     except Exception as e:  # pragma: no cover - defensive
         return {"ok": False, "error": str(e)}
-    return {"ok": True, "placement": result}
+    out = {"ok": True, "placement": result}
+
+    if payload.get("stock_compare"):
+        out["stock"] = _stock_comparison(model_cfg, flags_dict, placementmod)
+    return out
+
+
+def _stock_comparison(model_cfg, flags_dict, placementmod) -> dict:
+    """Side-by-side plain normal-TP configuration next to a planned (fork)
+    one -- SAME granular card view, its own honest numbers, NEUTRAL wording.
+    Picks the largest stock-legal tp <= card count (stock_tp_legal: q % tp
+    == 0 and kv % tp == 0 / tp % kv == 0); when none exists, only the rule
+    is stated ("stock requires ..."), phrased as a fact, not a verdict."""
+    from sglang.srt.planner import flags as flagsmod
+
+    ct = flags_dict.get("card_total_mib") or {}
+    cards = sorted((int(k), int(v)) for k, v in ct.items())
+    ncards = len(cards) or int(flags_dict.get("tp_size") or 1)
+    tried = []
+    tp_stock = None
+    # candidates: all cards, else the 4- / 2-card subsets. tp=1 is NOT a
+    # candidate -- a single-GPU run is not a normal-TP comparison.
+    for n in sorted({ncards, 4, 2}, reverse=True):
+        if n < 2 or n > ncards:
+            continue
+        ok, reason = flagsmod.stock_tp_legal(model_cfg, n)
+        if ok:
+            tp_stock = n
+            break
+        tried.append(reason)
+    if tp_stock is None:
+        return {
+            "legal": False,
+            "tp": None,
+            "placement": None,
+            "note": (
+                "no stock-expressible tp on these cards: "
+                + "; ".join(dict.fromkeys(tried))
+            ),
+        }
+    # Largest cards first (identical-VRAM preference mirrors the preset
+    # picker); rank i lands on the chosen card's cuda index so the card
+    # blocks attribute correctly.
+    totals = [t for _, t in cards]
+    pick = flagsmod._pick_stock_subset(
+        [{"name": "", "total_mib": t, "cuda_index": i} for i, t in cards],
+        totals,
+        tp_stock,
+    ) if cards else None
+    if pick is not None:
+        positions, cuda_idx, _why = pick
+        chosen = [cards[p] for p in positions]
+    else:
+        cuda_idx = list(range(tp_stock))
+        chosen = [(i, 0) for i in cuda_idx]
+    chosen_totals = [t for _, t in chosen if t]
+    even_budget = min(chosen_totals) if chosen_totals else None
+    stock_flags = {
+        "tp_size": tp_stock,
+        "rank_gpu_id": list(cuda_idx),
+        "stock_semantics": True,
+        "kv_cache_dtype": flags_dict.get("kv_cache_dtype", "auto"),
+        "context_length": flags_dict.get("context_length"),
+        "max_running_requests": flags_dict.get("max_running_requests"),
+        "speculative_algorithm": flags_dict.get("speculative_algorithm"),
+        "speculative_num_draft_tokens": flags_dict.get(
+            "speculative_num_draft_tokens"
+        ),
+        "speculative_num_steps": flags_dict.get("speculative_num_steps"),
+        "speculative_adaptive": flags_dict.get("speculative_adaptive"),
+        "include_vision": flags_dict.get("include_vision", True),
+        "card_total_mib": {str(i): t for i, t in chosen},
+    }
+    names = flags_dict.get("card_name") or {}
+    cn = {
+        str(i): names.get(str(i)) or names.get(i)
+        for i, _ in chosen
+        if (names.get(str(i)) or names.get(i))
+    }
+    if cn:
+        stock_flags["card_name"] = cn
+    if even_budget:
+        # Stock's even split is sized by the smallest chosen card (same
+        # mem fraction everywhere) -- a fact of the even split, not a flaw.
+        stock_flags["rank_gpu_memory_mib"] = [even_budget] * tp_stock
+    try:
+        pl = placementmod.compute_placement(model_cfg, stock_flags)
+    except Exception as e:  # pragma: no cover - defensive
+        return {"legal": True, "tp": tp_stock, "placement": None,
+                "note": f"stock placement failed: {e}"}
+    return {
+        "legal": True,
+        "tp": tp_stock,
+        "placement": pl,
+        "note": (
+            f"plain stock normal-TP, tp={tp_stock}, even split "
+            "(sized by the smallest card used); same granular view, its "
+            "own numbers."
+        ),
+    }
 
 
 def resolve_flags_payload(payload: dict) -> dict:
@@ -2042,6 +2200,67 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
         "snapshot": snap,
         "target": target_info,
         "status": status,
+        # LIVE CUDA-graph memory of the running server: managed boot-log
+        # parse first (per-kind + per-ladder-rung itemization), then the
+        # orchestrator's conventional /tmp log for detected servers, then
+        # /get_server_info's memory_usage.graph; honest null otherwise.
+        "graph_capture": _live_graph_capture(
+            sup if kind == "managed" else None, label, snap
+        ),
+    }
+
+
+def _live_graph_capture(sup, label, snap) -> dict:
+    """Measured CUDA-graph MiB of the RUNNING server, best source first:
+
+      1. managed supervisor boot log (full per-capture lines: target
+         decode / prefill / verify + every draft ladder rung separately);
+      2. the orchestrator's conventional ``/tmp/sglang_boot_<port>.log``
+         for a detected external server (same parse);
+      3. ``/get_server_info`` ``internal_states[].memory_usage.graph``
+         (rank-0 target graphs only, GB -- coarser but external-safe);
+      4. none of those -> ``source: None`` with the honest reason.
+    """
+    from sglang.srt.planner import graphmem
+
+    log_path = None
+    if sup is not None:
+        log_path = getattr(sup, "_log_path", None)
+    if not log_path and label:
+        m = re.search(r":(\d+)$", str(label).rstrip("/"))
+        if m:
+            cand = f"/tmp/sglang_boot_{m.group(1)}.log"
+            if os.path.exists(cand):
+                log_path = cand
+    if log_path and os.path.exists(log_path):
+        try:
+            with open(log_path, errors="replace") as f:
+                text = f.read()
+            entries = graphmem.parse_capture_lines(text)
+            if entries:
+                summary = graphmem.summarize_captures(entries)
+                return {
+                    "source": "boot-log",
+                    "log_path": log_path,
+                    "summary": summary,
+                }
+        except OSError:
+            pass
+    si = ((snap or {}).get("server_info") or {}).get("server_info") or {}
+    states = si.get("internal_states") or []
+    for st in states:
+        mu = (st or {}).get("memory_usage") or {}
+        if mu.get("graph") is not None:
+            return {
+                "source": "server_info",
+                "total_mib": float(mu["graph"]) * 1024.0,
+                "note": "target graphs, scheduler rank 0 "
+                "(/get_server_info memory_usage.graph)",
+            }
+    return {
+        "source": None,
+        "reason": "n/a (external server without a boot log or "
+        "/get_server_info graph memory)",
     }
 
 
@@ -2732,7 +2951,21 @@ INDEX_HTML = r"""<!doctype html>
   .segbar { display: flex; height: 14px; border-radius: 4px; overflow: hidden;
             background: #0d1117; border: 1px solid #263041; margin: .25rem 0; }
   .segbar span { display: block; height: 100%; }
+  /* replicated segments (KV heads synced/duplicated): hatched overlay so the
+     not-the-normal case is unmissable in the bar itself. */
+  .segbar span.hatch { background-image: repeating-linear-gradient(
+      45deg, rgba(255,255,255,.28) 0 3px, transparent 3px 7px); }
   .seglegend { font-size: .66rem; color: #8b96a5; margin: .1rem 0; }
+  .repltag { font-size: .6rem; color: #e3a008; border: 1px solid #7a5c14;
+             border-radius: 4px; padding: 0 .25rem; margin-left: .25rem; }
+  .graphline { font-size: .68rem; color: #8b96a5; margin: .1rem 0; }
+  /* side-by-side planned vs plain normal-TP (runner): two equal columns,
+     stacking on narrow screens. */
+  .sxs { display: grid; grid-template-columns: repeat(auto-fit,
+         minmax(340px, 1fr)); gap: .7rem; align-items: start; }
+  .sxs-h { font-size: .72rem; font-weight: 700; color: #adbac7;
+           margin-bottom: .2rem; text-transform: uppercase;
+           letter-spacing: .03em; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px;
          margin-right: .25rem; }
   .rankline { color: #8b96a5; font-size: .68rem; margin: .12rem 0 0 .2rem; }
@@ -3697,18 +3930,21 @@ function render(d) {
   // advantage (honest: feasibility + capacity-% + measured-only scores)
   const a = d.advantage; let av='';
   if (a) {
-    av += '<div class="adv"><b>vs stock even-TP</b> (capacity/feasibility &mdash; no throughput guess)<br>';
+    // NEUTRAL side-by-side framing: when stock runs, its numbers stand next
+    // to the planned config without a verdict; when stock genuinely cannot
+    // express the shape, the divisibility rule is stated as a fact.
+    av += '<div class="adv"><b>alongside: stock even-TP</b> (capacity/feasibility &mdash; no throughput guess)<br>';
     if (a.stock.runs) {
-      av += 'stock runs; max context ~'+Math.round(a.stock.max_context_tokens).toLocaleString()+' tokens.';
+      av += 'stock even-TP runs here; max context ~'+Math.round(a.stock.max_context_tokens).toLocaleString()+' tokens.';
       if (a.capacity_pct_range) {
         const [lo,hi]=a.capacity_pct_range;
         av += '<br>capacity: <b>'+(lo>=0?'+':'')+lo+'% .. '+(hi>=0?'+':'')+hi+'%</b> KV/context '
           +'<span class="est">(ratio of two same-model estimates)</span>';
       }
     } else {
-      av += 'stock even-TP <b>DOES NOT RUN</b>:<ul class="reasons">'
+      av += 'stock even-TP is not expressible for this shape:<ul class="reasons">'
         + a.stock.reasons.map(x=>'<li>'+esc(x)+'</li>').join('')
-        + '</ul>' + (d.fits ? '&rArr; the advantage is feasibility itself.' : '');
+        + '</ul>' + (d.fits ? 'This configuration uses the fork path.' : '');
     }
     if (a.measured) {
       av += '<br><span class="muted">measured card scores (cached profile, not estimated): '
@@ -4125,7 +4361,15 @@ function fmtMib(x){ return (x==null)? '—' : (x>=1024? (x/1024).toFixed(2)+'G' 
 // its CURRENT telemetry (util/clock/power/temp + 60s util/power sparklines)
 // -- one place per card explains BOTH what occupies its VRAM and how it is
 // doing live.
-const SEG_COLORS = {weights:'#2f81f7', kv:'#2ea043', mamba:'#a371f7', ovh:'#6e7681'};
+// Fine-grained segment palette (dark, one distinct hue per family; tiny
+// segments below 1% of the card collapse into the neutral "other" sliver).
+const SEG_COLORS = {
+  attn_q:'#1f6feb', attn_kv:'#58a6ff', mlp:'#8957e5', experts:'#bc8cff',
+  vocab:'#db6d28', gdn_w:'#9e6a03', vision:'#484f58', draft_w:'#f778ba',
+  kv:'#2ea043', kv_draft:'#56d364', mamba:'#e3b341', graphs:'#ff7b72',
+  ovh:'#6e7681', other:'#30363d',
+  // legacy lump ids (fallback when a placement has no segments list)
+  weights:'#2f81f7'};
 // The live gpus[] row for a placement card: cards are CUDA-keyed
 // (c.gpu_index == the rank_gpu_id space); gpus[] rows are NVML-sampled and
 // carry the UUID-resolved device-map bridge cuda_index -- match on that
@@ -4152,13 +4396,109 @@ function cardLiveHtml(g){
     +' &nbsp; mem '+(g.mem_used_mib/1024).toFixed(1)+'/'+(g.mem_total_mib/1024).toFixed(1)+'G live'
     +'</div>';
 }
-function renderPlacement(pl, liveGpus){
+// One card's fine-grained segment bar + legend. Segments come READY-MADE from
+// the placement JSON (id/label/mib/detail/replicated) -- the hover tooltip is
+// the segment's own detail string (title attr: no layout shift), replicated
+// segments get the hatched overlay + "replicated xN" tag, and segments under
+// 1% of the card collapse into ONE neutral "other" sliver whose hover lists
+// them, so the bar stays readable.
+function segBarHtml(c, total, free){
+  const segs=c.segments && c.segments.length ? c.segments
+    // legacy fallback (older placement payloads): the coarse lumps.
+    : [{id:'weights',label:'weights',mib:c.weight_mib,detail:''},
+       {id:'kv',label:'KV',mib:c.kv_mib,detail:''},
+       {id:'mamba',label:'mamba',mib:c.mamba_mib,detail:''},
+       {id:'ovh',label:'overhead',mib:c.overhead_mib,detail:''}];
+  const main=[], tiny=[];
+  for(const sg of segs){
+    if(!(sg.mib>0)) continue;
+    ((sg.mib/total*100) < 1 ? tiny : main).push(sg);
+  }
+  let bar='<div class="segbar">';
+  for(const sg of main){
+    const pct=Math.min(100, sg.mib/total*100);
+    bar+='<span '+(sg.replicated?'class="hatch" ':'')
+      +'style="width:'+pct.toFixed(2)+'%;background:'+(SEG_COLORS[sg.id]||'#30363d')+'" '
+      +'title="'+esc(sg.label+' '+fmtMib(sg.mib)
+        +(sg.replicated?' [replicated x'+sg.replication_factor+']':'')
+        +' — '+(sg.detail||''))+'"></span>';
+  }
+  const tinySum=tiny.reduce((a,s)=>a+s.mib,0);
+  if(tinySum>0)
+    bar+='<span style="width:'+Math.max(tinySum/total*100,0.6).toFixed(2)
+      +'%;background:'+SEG_COLORS.other+'" title="'
+      +esc('other ('+fmtMib(tinySum)+'): '
+        +tiny.map(s=>s.label+' '+fmtMib(s.mib)).join(' · '))+'"></span>';
+  bar+='</div>';
+  let leg='<div class="seglegend">';
+  for(const sg of main)
+    leg+='<span class="dot" style="background:'+(SEG_COLORS[sg.id]||'#30363d')
+      +'" title="'+esc(sg.detail||'')+'"></span>'
+      +esc(sg.label)+' '+fmtMib(sg.mib)
+      +(sg.replicated?('<span class="repltag" title="'
+        +esc(sg.replication_reason||'')+'">replicated x'
+        +sg.replication_factor+'</span>'):'')
+      +' &nbsp;';
+  if(tinySum>0)
+    leg+='<span class="dot" style="background:'+SEG_COLORS.other+'"></span>'
+      +'other '+fmtMib(tinySum)+' &nbsp;';
+  leg+='<span class="dot" style="background:#0d1117;border:1px solid #30363d"></span>'
+    +'free '+fmtMib(free)+' &nbsp;·&nbsp; used <b>'+fmtMib(c.total_mib)+'</b></div>';
+  return bar+leg;
+}
+// The CUDA-graph line under a placement: the placement's own graph_mem block
+// (estimate or anchor, with provenance + error band), plus -- landing only --
+// the LIVE measured capture totals (opts.graphCapture from the boot-log
+// parse / server_info; honest n/a when neither exists).
+function graphMemHtml(pl, opts){
+  let h='';
+  const gm=pl.graph_mem;
+  if(gm){
+    const items=(gm.items||[]).map(i=>i.label+' '+fmtMib(i.mib)).join(' · ');
+    h+='<div class="graphline" title="'+esc((gm.formula||'')+(items?(' — '+items):''))+'">'
+      +'CUDA graphs: <b>'+fmtMib(gm.per_rank_mib)+'</b>/rank '
+      +'<span class="muted">('+esc(gm.provenance||'heuristic')
+      +(gm.provenance==='heuristic'?(', estimate &plusmn;'+(gm.error_band_pct||30)+'%'):'')
+      +')</span>'
+      +(items?(' <span class="muted">— '+esc(items)+'</span>'):'')
+      +'</div>';
+  }
+  const gc=opts && opts.graphCapture;
+  if(gc){
+    if(gc.source==='boot-log' && gc.summary){
+      const s=gc.summary;
+      const per=Object.entries(s.per_rank_mib||{}).map(([r,v])=>'TP'+r+' '+fmtMib(v)).join(' · ');
+      h+='<div class="graphline" title="'
+        +esc((s.items||[]).map(i=>i.label+' '+fmtMib(i.total_mib)).join(' · '))+'">'
+        +'CUDA graphs (LIVE, measured): <b>'+fmtMib(s.total_mib)+'</b> total'
+        +(per?(' <span class="muted">('+per+')</span>'):'')
+        +' <span class="muted">— boot-log capture lines ('+s.n_captures+' graphs)</span></div>';
+    } else if(gc.source==='server_info'){
+      h+='<div class="graphline">CUDA graphs (LIVE, measured): <b>'
+        +fmtMib(gc.total_mib)+'</b> <span class="muted">— '+esc(gc.note||'server_info')+'</span></div>';
+    } else {
+      h+='<div class="graphline muted">CUDA graphs (live): '
+        +esc(gc.reason||'n/a')+'</div>';
+    }
+  }
+  return h;
+}
+function renderPlacement(pl, liveGpus, opts){
+  opts=opts||{};
   if(!pl) return '<span class="muted">no placement.</span>';
   const m=pl.model||{}; let h='';
   h+='<div class="legend" style="margin-top:0">TP '+pl.tp_size+' · DCP '+pl.dcp_size
     +' · heads Q'+m.num_attention_heads+'/KV'+m.num_key_value_heads
     +' · layers '+m.num_hidden_layers
     +(m.num_experts?(' · experts '+m.num_experts):'')+'</div>';
+  // Explicit KV-replication banner (fork uneven-DCP or stock replication):
+  // the hatched segment marks it in the bar; this names the WHY once.
+  if(pl.kv_replication && pl.kv_replication.replicated)
+    h+='<div class="graphline" title="'+esc(pl.kv_replication.reason||'')+'">'
+      +'KV heads <span class="repltag">replicated x'+pl.kv_replication.factor+'</span> '
+      +'<span class="muted">('+esc(pl.kv_replication.source||'')
+      +(pl.kv_replication.cache_duplicated?', KV cache duplicated per rank':', cache token-sharded, not duplicated')
+      +')</span></div>';
   const byRank={};
   const put=(list,f)=>{ for(const x of (list||[])) (byRank[x.rank]=byRank[x.rank]||{})[f]=x; };
   put(pl.attn_heads,'attn'); put(pl.gdn_heads,'gdn');
@@ -4169,14 +4509,6 @@ function renderPlacement(pl, liveGpus){
   for(const c of (pl.cards||[])){
     const total=c.card_total_mib || Math.max(c.total_mib, c.budget_mib||0) || 1;
     const free=Math.max(0, total-c.total_mib);
-    const segs=[['weights',c.weight_mib],['kv',c.kv_mib],['mamba',c.mamba_mib],['ovh',c.overhead_mib]];
-    let bar='<div class="segbar" title="weights '+fmtMib(c.weight_mib)+' / KV '+fmtMib(c.kv_mib)
-      +' / mamba '+fmtMib(c.mamba_mib)+' / overhead '+fmtMib(c.overhead_mib)+' / free '+fmtMib(free)+'">';
-    for(const [k,v] of segs){
-      const pct=Math.min(100, v/total*100);
-      if(pct>0.3) bar+='<span style="width:'+pct.toFixed(1)+'%;background:'+SEG_COLORS[k]+'"></span>';
-    }
-    bar+='</div>';
     const over=c.physical_overcommit
       ? ' <b class="nofitc">EXCEEDS CARD (physically impossible)</b>' : '';
     // c.gpu_index is CUDA-space (== the rank_gpu_id space); label the nvml
@@ -4189,14 +4521,7 @@ function renderPlacement(pl, liveGpus){
       +'ranks ['+c.ranks.join(',')+']'
       +(c.budget_mib!=null?' · budget '+fmtMib(c.budget_mib):'')
       +'</span>'+over+'</div>'
-      +bar
-      +'<div class="seglegend">'
-      +'<span class="dot" style="background:'+SEG_COLORS.weights+'"></span>weights '+fmtMib(c.weight_mib)+' &nbsp;'
-      +'<span class="dot" style="background:'+SEG_COLORS.kv+'"></span>KV '+fmtMib(c.kv_mib)+' &nbsp;'
-      +(c.mamba_mib>0?('<span class="dot" style="background:'+SEG_COLORS.mamba+'"></span>mamba '+fmtMib(c.mamba_mib)+' &nbsp;'):'')
-      +'<span class="dot" style="background:'+SEG_COLORS.ovh+'"></span>overhead '+fmtMib(c.overhead_mib)+' &nbsp;'
-      +'<span class="dot" style="background:#0d1117;border:1px solid #30363d"></span>free '+fmtMib(free)
-      +' &nbsp;·&nbsp; used <b>'+fmtMib(c.total_mib)+'</b></div>';
+      +segBarHtml(c, total, free);
     const lg=_liveGpuForCard(liveGpus, c.gpu_index);
     if(lg) h+=cardLiveHtml(lg);
     for(const r of c.ranks){
@@ -4223,6 +4548,7 @@ function renderPlacement(pl, liveGpus){
     }
     h+='</div>';
   }
+  h+=graphMemHtml(pl, opts);
   h+='<div class="legend">KV token vector ['+pl.token_vector.join(',')
     +'] ('+esc(pl.token_vector_source)+')'
     +(pl.mtp&&pl.mtp.present?(' · MTP layers ['+pl.mtp.layer_start+'..'+pl.mtp.layer_end+')'):'')+'</div>';
@@ -4356,6 +4682,9 @@ async function landingPoll(){
     return;
   }
   $('landing_none').style.display='none'; $('landing_live').style.display='';
+  // LIVE CUDA-graph capture info (boot-log parse / server_info; may be an
+  // honest n/a) -- consumed by renderLandingPlacement below.
+  window._lastGraphCapture = d.graph_capture || null;
   renderLanding(d.snapshot, d.target);
 }
 // Normalize the start config from EITHER source: the managed LaunchSettings
@@ -4381,6 +4710,7 @@ function normalizeStartConfig(s){
     speculative_num_steps: si.speculative_num_steps,
     speculative_num_draft_tokens: si.speculative_num_draft_tokens,
     speculative_eagle_topk: si.speculative_eagle_topk,
+    speculative_adaptive: si.speculative_adaptive,
     tool_call_parser: si.tool_call_parser, reasoning_parser: si.reasoning_parser,
     chat_template: si.chat_template, port: si.port, gguf_variant: null,
   }};
@@ -4603,7 +4933,23 @@ async function renderLandingPlacement(s){
     rank_gpu_memory_mib: cfg.rank_gpu_memory_mib||null, kv_cache_dtype: cfg.kv_cache_dtype||'auto',
     context_length: cfg.context_length||null, max_running_requests: cfg.max_num_seqs||null,
     speculative_algorithm: (cfg.spec_mode&&cfg.spec_mode!=='off')?cfg.spec_mode:null,
+    speculative_num_steps: cfg.speculative_num_steps||null,
+    speculative_num_draft_tokens: cfg.speculative_num_draft_tokens||null,
+    speculative_adaptive: cfg.spec_mode==='adaptive' || !!cfg.speculative_adaptive,
   };
+  // LIVE measured CUDA-graph memory (boot-log capture parse) overrides the
+  // planner estimate in the placement's graph segment -- measured wins.
+  const gcap=window._lastGraphCapture;
+  if(gcap && gcap.source==='boot-log' && gcap.summary && gcap.summary.per_rank_mib){
+    const s=gcap.summary;
+    flags.graph_mem_override={provenance:'measured (live boot log)',
+      per_rank_map:s.per_rank_mib,
+      per_rank_mib:Math.max.apply(null,Object.values(s.per_rank_mib)),
+      items:(s.items||[]).map(i=>({label:i.label,mib:i.total_mib,
+        formula:'measured capture line (live boot log)'})),
+      error_band_pct:0,
+      formula:'measured capture lines from the running server boot log'};
+  }
   // Card inventory keyed in CUDA space: rank_gpu_id (and the default
   // rank i -> gpu i identity when it is unset, e.g. an external server
   // without the flag) is CUDA-order, while s.gpus is NVML-sampled. Keying
@@ -4620,7 +4966,8 @@ async function renderLandingPlacement(s){
     const r=await fetch('/api/placement',{method:'POST',body:JSON.stringify(
       {model, gguf_choice: cfg.gguf_variant||null, flags})});
     const d=await r.json();
-    $('landing_placement').innerHTML = d.ok? renderPlacement(d.placement, s.gpus)
+    $('landing_placement').innerHTML = d.ok
+      ? renderPlacement(d.placement, s.gpus, {graphCapture: window._lastGraphCapture})
       : '<span class="reasons">'+esc(d.error)+'</span>'
         +((s.gpus&&s.gpus.length)?'':(s.nvml_error?'<div class="muted">no NVML cards ('+esc(s.nvml_error)+')</div>':''));
   }catch(e){ $('landing_placement').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
@@ -5032,21 +5379,59 @@ function runnerFlags(){
   f.card_total_mib=ct; f.card_name=cn;
   for(const k of ['rank_mlp_ratio','rank_moe_ratio','rank_vocab_ratio','dcp_size',
     'rank_gpu_memory_mib','rank_kv_ratio','speculative_algorithm',
-    'speculative_num_draft_tokens','moe_resident_expert_fraction'])
+    'speculative_num_draft_tokens','speculative_num_steps',
+    'speculative_adaptive','speculative_draft_model_path',
+    'moe_resident_expert_fraction'])
     if(s[k]!=null && s[k]!=='') f[k]=s[k];
   if(s.SGLANG_UNEVEN_TOKEN_VECTOR!=null && s.SGLANG_UNEVEN_TOKEN_VECTOR!=='')
     f.kv_token_vector=s.SGLANG_UNEVEN_TOKEN_VECTOR;
   return f;
 }
+// A config is "fork-shaped" when it uses the uneven/fork levers -- exactly
+// then the prospective view shows a SECOND, plain normal-TP configuration
+// NEXT TO it (side by side, same granular card view, neutral wording).
+function flagsAreForkish(f){
+  const rtr=f.rank_tp_ratio;
+  const nonuniform = !!rtr && (typeof rtr==='string'
+    ? true
+    : new Set(String(rtr).split(',').map(x=>x.trim()).filter(x=>x)).size>1);
+  let dup=false;
+  if(f.rank_gpu_id){
+    const a=String(f.rank_gpu_id).split(',').map(x=>x.trim()).filter(x=>x);
+    dup=new Set(a).size!==a.length;
+  }
+  return !!(nonuniform || dup || f.dcp_size || f.kv_token_vector || f.rank_kv_ratio);
+}
 async function refreshRunnerPlacement(){
   const model=$('model').value.trim(); if(!model) return;
   try{
+    const flags=runnerFlags();
+    const wantStock=flagsAreForkish(flags);
     const r=await fetch('/api/placement',{method:'POST',body:JSON.stringify(
       {model, gguf_choice: ($('gguf_pick').style.display!=='none'?$('gguf_choice').value:null),
-       flags: runnerFlags()})});
+       flags, stock_compare: wantStock})});
     const d=await r.json();
-    const html = d.ok? renderPlacement(d.placement)
-      : '<span class="reasons">'+esc(d.error)+'</span>';
+    let html;
+    if(d.ok){
+      const mainH=renderPlacement(d.placement);
+      const stock=d.stock;
+      if(stock){
+        // Side-by-side: the planned (fork) config and a plain normal-TP one,
+        // each with its own honest numbers. Neutral wording throughout: when
+        // stock cannot express any tp here, the divisibility rule is stated
+        // as a fact ("stock requires tp % kv == 0 ..."), not a verdict.
+        let stockH;
+        if(stock.legal && stock.placement)
+          stockH='<div class="sxs-h">plain normal-TP (stock, tp='+stock.tp+')</div>'
+            +'<div class="muted" style="font-size:.68rem;margin-bottom:.2rem">'+esc(stock.note||'')+'</div>'
+            +renderPlacement(stock.placement);
+        else
+          stockH='<div class="sxs-h">plain normal-TP (stock)</div>'
+            +'<div class="muted" style="font-size:.7rem">'+esc(stock.note||'')+'</div>';
+        html='<div class="sxs"><div><div class="sxs-h">planned config</div>'+mainH+'</div>'
+          +'<div>'+stockH+'</div></div>';
+      } else html=mainH;
+    } else html='<span class="reasons">'+esc(d.error)+'</span>';
     // ONE renderer, mirrored: the right-column overview AND the GPU
     // offload/split section (config + its effect live together).
     $('runner_placement').innerHTML = html;

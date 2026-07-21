@@ -114,6 +114,22 @@ class PlacementFlags:
     max_running_requests: Optional[int] = None
     speculative_algorithm: Optional[str] = None
     speculative_num_draft_tokens: Optional[int] = None
+    #: Ladder shape for the CUDA-graph segment (adaptive = the #93/#102
+    #: high-accept ladder: one draft-graph pair PER RUNG, itemized).
+    speculative_num_steps: Optional[int] = None
+    speculative_adaptive: bool = False
+    #: Config dict of an EXTERNAL --speculative-draft-model (checkpoints
+    #: without their own MTP head): sized into the draft-weights segment.
+    #: The webui resolves the path to this config; placement stays pure.
+    speculative_draft_model_cfg: Optional[dict] = None
+    #: Precomputed CUDA-graph memory (measured live parse or boot-log
+    #: anchor, graphmem shapes). None -> the calibrated heuristic.
+    graph_mem_override: Optional[dict] = None
+    #: Render with STOCK sglang semantics (the side-by-side normal-TP
+    #: column): KV replication under tp >= kv_heads is stock head
+    #: replication (num_kv_head_replicas = tp/kv, KV cache duplicated),
+    #: not the fork's token-split.
+    stock_semantics: bool = False
     include_vision: bool = True
     #: Fraction of routed experts adaptive keeps GPU-resident (the hot set);
     #: the remaining tail spills to host RAM. ``None`` -> read the env, else
@@ -199,6 +215,23 @@ class PlacementFlags:
                 if d.get("speculative_num_draft_tokens")
                 else None
             ),
+            speculative_num_steps=(
+                int(d["speculative_num_steps"])
+                if d.get("speculative_num_steps")
+                else None
+            ),
+            speculative_adaptive=bool(d.get("speculative_adaptive")),
+            speculative_draft_model_cfg=(
+                d.get("speculative_draft_model_cfg")
+                if isinstance(d.get("speculative_draft_model_cfg"), dict)
+                else None
+            ),
+            graph_mem_override=(
+                d.get("graph_mem_override")
+                if isinstance(d.get("graph_mem_override"), dict)
+                else None
+            ),
+            stock_semantics=bool(d.get("stock_semantics")),
             include_vision=bool(d.get("include_vision", True)),
             moe_resident_expert_fraction=(
                 float(d["moe_resident_expert_fraction"])
@@ -368,6 +401,30 @@ class RankBreakdown:
     mamba_mib: float
     overhead_mib: float
     total_mib: float
+    # -- fine-grained sub-segments (sums reconcile with the lumps above) --
+    #: attn family split by parameter proportion: q(+gate) vs k+v+o.
+    #: attn_q_mib + attn_kv_mib == attn_mib byte-exact.
+    attn_q_mib: float = 0.0
+    attn_kv_mib: float = 0.0
+    #: mlp family split: dense MLP (+ always-on shared expert) vs routed
+    #: experts. mlp_dense_mib + experts_mib == ffn_experts_mib.
+    mlp_dense_mib: float = 0.0
+    experts_mib: float = 0.0
+    #: Draft/speculative weights: the checkpoint's own MTP layers
+    #: (== mtp_mib) OR an external --speculative-draft-model's shard.
+    draft_w_mib: float = 0.0
+    draft_w_source: Optional[str] = None
+    #: KV cache split: target layers vs draft/MTP layers (the cost model's
+    #: cell spans full+mtp layers when spec is on). Sums to kv_mib.
+    kv_target_mib: float = 0.0
+    kv_draft_mib: float = 0.0
+    #: GDN/mamba STATE pool: per-session state x session slots == mamba_mib.
+    mamba_per_session_mib: float = 0.0
+    mamba_sessions: int = 0
+    #: Overhead split: CUDA-graph share (estimate or measured; clamped into
+    #: the overhead reserve) + the workspace/context rest.
+    graphs_mib: float = 0.0
+    overhead_rest_mib: float = 0.0
 
 
 @dataclasses.dataclass
@@ -394,6 +451,14 @@ class CardBreakdown:
     #: Physical-impossibility flag: sum of co-located rank budgets exceeds the
     #: card's NVML total (only checked when card_total_mib is supplied).
     physical_overcommit: Optional[bool]
+    #: Fine-grained bar segments for the renderer: ordered
+    #: [{id, label, mib, detail, replicated, replication_factor,
+    #:   replication_reason}] -- ONE source of truth for the segment bar AND
+    #: its hover tooltips (webui renders, never re-derives). Segment MiB sums
+    #: to total_mib.
+    segments: List[dict] = dataclasses.field(default_factory=list)
+    graphs_mib: float = 0.0
+    overhead_rest_mib: float = 0.0
 
 
 @dataclasses.dataclass
@@ -414,6 +479,16 @@ class Placement:
     ranks: List[RankBreakdown]
     cards: List[CardBreakdown]
     notes: List[str]
+    #: CUDA-graph memory block: {provenance: "measured"|"heuristic",
+    #: per_rank_mib, items: [{label, mib, formula}...], error_band_pct,
+    #: formula} -- itemized per graph kind AND ladder rung.
+    graph_mem: Optional[dict] = None
+    #: Explicit KV-replication marker: {replicated, factor, source:
+    #: "fork-uneven-dcp"|"stock-replication", reason, cache_duplicated}.
+    kv_replication: Optional[dict] = None
+    #: Draft/speculative summary: {weights_source: "mtp"|"external"|None,
+    #: per_rank_mib, kv_draft_per_rank_mib, note}.
+    draft: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +674,13 @@ def compute_placement_struct(model_cfg: dict, flags) -> Placement:
         model, flags, rank_gpu, token_vector, capacity, tp, notes
     )
 
+    # ---- KV-replication marker + draft weights + CUDA-graph estimate ----
+    kv_replication = _kv_replication_info(model, flags, base_plan, attn_heads)
+    draft_source, draft_w, draft_note = _draft_weights(
+        model, flags, mtp, base_plan, tp, notes
+    )
+    graph_mem = _graph_mem(model, flags, tp)
+
     # ---- per-rank + per-card MiB breakdown -------------------------------
     ranks, cards = _compute_breakdown(
         model,
@@ -610,6 +692,12 @@ def compute_placement_struct(model_cfg: dict, flags) -> Placement:
         budgets if have_budgets else None,
         kv_tokens,
         tp,
+        attn_heads=attn_heads,
+        experts=experts,
+        kv_replication=kv_replication,
+        draft_source=draft_source,
+        draft_w=draft_w,
+        graph_mem=graph_mem,
     )
 
     # ---- offload rule ----------------------------------------------------
@@ -655,6 +743,18 @@ def compute_placement_struct(model_cfg: dict, flags) -> Placement:
         ranks=ranks,
         cards=cards,
         notes=notes,
+        graph_mem=graph_mem,
+        kv_replication=kv_replication,
+        draft=(
+            {
+                "weights_source": draft_source,
+                "per_rank_mib": list(draft_w),
+                "kv_draft_per_rank_mib": [r.kv_draft_mib for r in ranks],
+                "note": draft_note,
+            }
+            if draft_source
+            else None
+        ),
     )
 
 
@@ -969,11 +1069,186 @@ def _compute_kv_tokens(model, flags, rank_gpu, token_vector, capacity, tp, notes
     return out
 
 
+def _kv_replication_info(model, flags, base_plan, attn_heads):
+    """Explicit KV-replication marker for the VRAM display. Two roots:
+
+      * fork path: uneven DCP in force, or TP > kv_heads -- every rank keeps
+        the FULL kv-head set, the KV CACHE is sharded on the token axis
+        (weights replicated, cache NOT duplicated);
+      * stock path (``stock_semantics``): tp >= kv with tp % kv == 0 --
+        QKVParallelLinear replicates each kv head tp/kv times
+        (num_kv_head_replicas) AND each rank keeps the KV cache for its
+        replicated head (weights + cache duplicated).
+    """
+    tp = model.tp_size
+    kv = model.kv_heads
+    replicated = bool(attn_heads and attn_heads[0].kv_replicated)
+    if not replicated:
+        return {
+            "replicated": False,
+            "factor": 1,
+            "source": None,
+            "cache_duplicated": False,
+            "reason": (
+                f"KV heads sharded normally (kv_heads={kv} >= TP={tp}, "
+                "uniform plan; every head lives on exactly one rank)."
+            ),
+        }
+    if flags.stock_semantics and kv and tp >= kv and tp % kv == 0:
+        factor = tp // kv
+        return {
+            "replicated": True,
+            "factor": factor,
+            "source": "stock-replication",
+            "cache_duplicated": True,
+            "reason": (
+                f"stock KV-head replication: tp={tp} >= kv_heads={kv} with "
+                f"tp % kv == 0 -> num_kv_head_replicas={factor} "
+                "(QKVParallelLinear); the replicated heads' KV WEIGHTS AND "
+                "KV CACHE are duplicated on every rank of a replica group."
+            ),
+        }
+    why = (
+        f"TP={tp} > num_key_value_heads={kv}"
+        if kv < tp
+        else "uneven DCP in force (non-uniform rank ratio)"
+    )
+    return {
+        "replicated": True,
+        "factor": tp,
+        "source": "fork-uneven-dcp",
+        "cache_duplicated": False,
+        "reason": (
+            f"fork uneven-DCP token-split: {why} -> every rank keeps the "
+            f"FULL kv-head set ({kv} heads, KV weights replicated x{tp}); "
+            "the KV CACHE is sharded on the token axis instead of the head "
+            "axis, so cache tokens are NOT duplicated."
+        ),
+    }
+
+
+def _draft_weights(model, flags, mtp, base_plan, tp, notes):
+    """Draft-weight segment source + per-rank MiB: the checkpoint's own MTP
+    layers (already in the family model), or an EXTERNAL
+    --speculative-draft-model config sized through the same cost model
+    (tp=1 total, sharded by the base plan -- an estimate, noted)."""
+    if mtp.present:
+        return "mtp", list(mtp.per_rank_mib), (
+            f"draft = the checkpoint's own {mtp.num_layers} MTP/nextn "
+            f"layer(s), appended at layers [{mtp.layer_start}.."
+            f"{mtp.layer_end})."
+        )
+    if flags.speculative_algorithm and flags.speculative_draft_model_cfg:
+        try:
+            draft_flags = PlacementFlags(
+                tp_size=1,
+                kv_cache_dtype=flags.kv_cache_dtype,
+                include_vision=False,
+            )
+            dm = _build_cost_model(
+                flags.speculative_draft_model_cfg, draft_flags, [1], [1]
+            )
+            total = float(dm.per_rank_weight_bytes([1])[0])
+        except Exception as e:  # pragma: no cover - defensive
+            notes.append(f"external draft model could not be sized: {e}")
+            return None, [0.0] * tp, ""
+        sw = sum(base_plan) or tp
+        per_rank = [total * w / sw / _MIB for w in base_plan]
+        notes.append(
+            "draft weights are an EXTERNAL --speculative-draft-model sized "
+            "from its config and sharded by the base plan (estimate)."
+        )
+        return "external", per_rank, (
+            "draft = external --speculative-draft-model "
+            f"({total / _GIB:.2f} GiB total), sharded by the base TP plan "
+            "(estimate)."
+        )
+    return None, [0.0] * tp, ""
+
+
+def _graph_mem(model, flags, tp):
+    """CUDA-graph memory block: the caller-supplied override (measured live
+    parse or boot-log anchor) wins; else the calibrated heuristic
+    (graphmem) -- ladder-aware, so changing k/adaptive changes the number."""
+    if flags.graph_mem_override:
+        d = dict(flags.graph_mem_override)
+        d.setdefault("provenance", "measured")
+        return d
+    from sglang.srt.planner import graphmem
+
+    geom = {
+        "hidden_size": model.hidden,
+        "num_hidden_layers": model.n_layers,
+        "tp_size": tp,
+        "max_running_requests": flags.max_running_requests or 16,
+    }
+    spec = {
+        "speculative_algorithm": flags.speculative_algorithm,
+        "speculative_num_steps": flags.speculative_num_steps,
+        "speculative_num_draft_tokens": flags.speculative_num_draft_tokens,
+        "speculative_adaptive": flags.speculative_adaptive,
+    }
+    return graphmem.heuristic_estimate(geom, spec)
+
+
+def _graph_mib_for_rank(graph_mem, r):
+    """Per-rank graph MiB from a graph_mem block: an explicit per-rank map
+    (measured parses carry one; draft graphs may sit on rank 0 only) wins
+    over the uniform per_rank_mib scalar."""
+    if not graph_mem:
+        return 0.0
+    m = graph_mem.get("per_rank_map")
+    if m:
+        return float(m.get(str(r), m.get(r, 0.0)))
+    return float(graph_mem.get("per_rank_mib") or 0.0)
+
+
+def _mamba_sessions(model, flags):
+    """Session-slot count behind the mamba pool. MIRRORS the sizing in
+    ``PerfCostModel._mamba_pool_bytes`` (slots = ceil(min(target,48) * 5 *
+    1.25) + spec pad) so per_session * sessions == pool byte-exact -- keep
+    the two in sync."""
+    target = min(flags.max_running_requests or 16, 48)
+    ratio = 5
+    slots = math.ceil(target * ratio * 1.25)
+    d = model.spec_draft_tokens if model.spec_active else 0
+    return slots + min(target, slots // ratio) * d
+
+
 def _compute_breakdown(
-    model, flags, rank_gpu, ranks_per_gpu, fam_r, capacity, budgets, kv_tokens, tp
+    model,
+    flags,
+    rank_gpu,
+    ranks_per_gpu,
+    fam_r,
+    capacity,
+    budgets,
+    kv_tokens,
+    tp,
+    attn_heads=None,
+    experts=None,
+    kv_replication=None,
+    draft_source=None,
+    draft_w=None,
+    graph_mem=None,
 ):
     overhead_mib = _overhead_mib()
     cell = model.kv_cell_bytes
+    kv_repl = kv_replication or {}
+    draft_w = draft_w or [0.0] * tp
+
+    # KV cell layer split: with spec on, the cell spans full + MTP layers --
+    # the MTP share IS the draft-KV/verify footprint per token.
+    cell_layers = model.full_layers + (
+        model.mtp_layers if model.spec_active else 0
+    )
+    draft_layer_frac = (
+        model.mtp_layers / cell_layers
+        if (model.spec_active and model.mtp_layers and cell_layers)
+        else 0.0
+    )
+
+    sessions = _mamba_sessions(model, flags)
 
     ranks = []
     for r in range(tp):
@@ -986,11 +1261,51 @@ def _compute_breakdown(
             fam_r("draft_attn", r) + fam_r("draft_mlp", r) + fam_r("draft_repl", r)
         ) / _MIB
         weight = attn + ffn + vocab + gdn + vision + mtp
+
+        # attn family sub-split: q(+gate) vs k+v+o, scaled onto the family
+        # share so attn_q + attn_kv == attn byte-exact (in the symmetric GQA
+        # case the scale is 1.0 and the granular numbers match unscaled).
+        ah = attn_heads[r] if attn_heads else None
+        if ah is not None:
+            raw_q = ah.q_mib
+            raw_kvo = ah.k_mib + ah.v_mib + ah.o_mib
+            raw = raw_q + raw_kvo
+            scale = (attn / raw) if raw > 0 else 0.0
+            attn_q = raw_q * scale
+            attn_kv = raw_kvo * scale
+        else:
+            attn_q, attn_kv = attn, 0.0
+
+        # mlp family sub-split: routed experts vs dense (+ shared expert).
+        ex = experts[r] if experts else None
+        experts_mib = min(ex.routed_mib, ffn) if ex else 0.0
+        mlp_dense = max(ffn - experts_mib, 0.0)
+
+        # external draft weights add ON TOP of the family model (the cost
+        # model only carries the checkpoint's own MTP families).
+        draft_mib = draft_w[r] if draft_source else 0.0
+        if draft_source == "external":
+            weight += draft_mib
+        elif draft_source == "mtp":
+            draft_mib = mtp
+
         if capacity and capacity["p"][r] > 0:
             kv = capacity["p"][r] * cell / _MIB
         else:
             kv = 0.0
+        kv_draft = kv * draft_layer_frac
+        kv_target = kv - kv_draft
+
         mamba = model.mamba_pool_bytes[r] / _MIB
+        per_session = mamba / sessions if sessions else 0.0
+
+        graphs = _graph_mib_for_rank(graph_mem, r)
+        # The graph share is displayed INSIDE the fixed overhead reserve
+        # (the capacity math already budgets it there); the raw estimate
+        # stays un-clamped in the graph_mem block.
+        graphs_shown = min(graphs, float(overhead_mib))
+        rest = float(overhead_mib) - graphs_shown
+
         budget = int(budgets[r]) if budgets else None
         ranks.append(
             RankBreakdown(
@@ -1008,6 +1323,18 @@ def _compute_breakdown(
                 mamba_mib=mamba,
                 overhead_mib=float(overhead_mib),
                 total_mib=weight + kv + mamba + overhead_mib,
+                attn_q_mib=attn_q,
+                attn_kv_mib=attn_kv,
+                mlp_dense_mib=mlp_dense,
+                experts_mib=experts_mib,
+                draft_w_mib=draft_mib,
+                draft_w_source=draft_source,
+                kv_target_mib=kv_target,
+                kv_draft_mib=kv_draft,
+                mamba_per_session_mib=per_session,
+                mamba_sessions=sessions,
+                graphs_mib=graphs_shown,
+                overhead_rest_mib=rest,
             )
         )
 
@@ -1028,6 +1355,8 @@ def _compute_breakdown(
                 "mamba_mib",
                 "overhead_mib",
                 "total_mib",
+                "graphs_mib",
+                "overhead_rest_mib",
             )
         }
         card_total = None
@@ -1042,6 +1371,9 @@ def _compute_breakdown(
         overcommit = None
         if card_total is not None and budget is not None:
             overcommit = budget > card_total
+        segments = _card_segments(
+            model, flags, ranks, rs, kv_repl, graph_mem, sessions
+        )
         cards.append(
             CardBreakdown(
                 gpu_index=gpu_index,
@@ -1050,10 +1382,175 @@ def _compute_breakdown(
                 ranks=list(rs),
                 budget_mib=budget,
                 physical_overcommit=overcommit,
+                segments=segments,
                 **agg,
             )
         )
     return ranks, cards
+
+
+def _card_segments(model, flags, ranks, rs, kv_repl, graph_mem, sessions):
+    """Ordered fine-grained segment list for one card (sum of the co-located
+    ranks). Every segment carries its hover ``detail`` (the deeper numbers /
+    formula) so the renderer never re-derives math. Sums to the card total.
+    """
+
+    def s(field):
+        return sum(getattr(ranks[r], field) for r in rs)
+
+    m = model
+    tp = m.tp_size
+    q_heads_txt = (
+        f"{m.q_heads} Q heads x {m.head_dim} head_dim x {m.hidden} hidden "
+        f"x {m.full_layers} attn layers (q_proj+o_proj q-sharded)"
+    )
+    kv_heads_txt = (
+        f"{m.kv_heads} KV heads x {m.head_dim} head_dim x {m.hidden} hidden "
+        f"x {m.full_layers} attn layers (k_proj+v_proj)"
+    )
+    repl = bool(kv_repl.get("replicated"))
+    cache_dup = bool(kv_repl.get("cache_duplicated"))
+    factor = int(kv_repl.get("factor") or 1)
+    reason = kv_repl.get("reason") or ""
+
+    def seg(id_, label, mib, detail, replicated=False):
+        return {
+            "id": id_,
+            "label": label,
+            "mib": mib,
+            "detail": detail,
+            "replicated": replicated,
+            "replication_factor": factor if replicated else 1,
+            "replication_reason": reason if replicated else None,
+        }
+
+    kv_cell = m.kv_cell_bytes
+    draft_src = ranks[rs[0]].draft_w_source if rs else None
+    per_session = ranks[rs[0]].mamba_per_session_mib if rs else 0.0
+    gm = graph_mem or {}
+    graph_items = gm.get("items") or []
+    graph_detail = (
+        f"CUDA graphs ({gm.get('provenance', 'heuristic')}"
+        + (
+            f", +-{gm.get('error_band_pct')}%"
+            if gm.get("provenance") == "heuristic"
+            else ""
+        )
+        + "): "
+        + "; ".join(
+            f"{it['label']} {it['mib']:.0f} MiB" for it in graph_items
+        )
+        + (". " + str(gm.get("formula") or "") if gm.get("formula") else "")
+    )
+
+    out = [
+        seg("attn_q", "attn Q", s("attn_q_mib"), q_heads_txt),
+        seg(
+            "attn_kv",
+            "attn KV",
+            s("attn_kv_mib"),
+            kv_heads_txt
+            + (f"; REPLICATED x{factor}: {reason}" if repl else ""),
+            replicated=repl,
+        ),
+        seg(
+            "mlp",
+            "MLP",
+            s("mlp_dense_mib"),
+            f"dense MLP (gate/up/down, intermediate {m.intermediate}) "
+            f"x {m.n_layers} layers"
+            + (
+                f" + shared expert (intermediate "
+                f"{m.shared_expert_intermediate})"
+                if m.shared_expert_intermediate
+                else ""
+            ),
+        ),
+        seg(
+            "experts",
+            "experts",
+            s("experts_mib"),
+            f"routed MoE experts: per-expert 3 x {m.hidden} x "
+            f"{m.moe_intermediate or m.intermediate} x layers",
+        ),
+        seg(
+            "vocab",
+            "vocab",
+            s("vocab_mib"),
+            f"embedding + lm_head, vocab {m.vocab} x hidden {m.hidden}",
+        ),
+        seg(
+            "gdn_w",
+            "GDN wts",
+            s("gdn_mib"),
+            f"linear-attention (GDN/SSM) weights: {m.gdn_k_heads}K/"
+            f"{m.gdn_v_heads}V heads x {m.gdn_layers} layers",
+        ),
+        seg("vision", "vision", s("vision_mib"), "vision tower (replicated)"),
+        seg(
+            "draft_w",
+            "draft wts",
+            s("draft_w_mib"),
+            (
+                f"draft weights ({draft_src}): "
+                + (
+                    f"{m.mtp_layers} MTP/nextn layer(s) appended after "
+                    f"layer {m.n_layers}"
+                    if draft_src == "mtp"
+                    else "external --speculative-draft-model (estimate)"
+                )
+            )
+            if draft_src
+            else "no draft weights",
+        ),
+        seg(
+            "kv",
+            "KV cache",
+            s("kv_target_mib"),
+            f"target KV: {kv_cell:.0f} B/token cell "
+            f"({m.kv_cell_bytes_per_layer:.0f} B/layer x layers), "
+            "tokens = predicted per-rank capacity"
+            + (
+                f"; CACHE DUPLICATED x{factor}: {reason}"
+                if cache_dup
+                else (
+                    "; token-sharded across ranks (uneven DCP), not "
+                    "duplicated" if repl else ""
+                )
+            ),
+            replicated=cache_dup,
+        ),
+        seg(
+            "kv_draft",
+            "draft KV",
+            s("kv_draft_mib"),
+            (
+                f"draft/MTP KV + verify share: {m.mtp_layers} MTP layer(s) "
+                f"of the {m.full_layers + m.mtp_layers}-layer KV cell; "
+                "scales with speculative_num_draft_tokens "
+                f"({flags.speculative_num_draft_tokens or 0})"
+            ),
+        ),
+        seg(
+            "mamba",
+            "GDN state",
+            s("mamba_mib"),
+            f"GDN/mamba state pool: {per_session:.1f} MiB per session slot "
+            f"x {sessions} slots (grows with concurrent sessions; "
+            f"max_running_requests {flags.max_running_requests or 16} + "
+            "overlap/spec pad)",
+        ),
+        seg("graphs", "CUDA graphs", s("graphs_mib"), graph_detail),
+        seg(
+            "ovh",
+            "overhead",
+            s("overhead_rest_mib"),
+            "workspace / CUDA context / allocator rest of the fixed "
+            "overhead reserve (total reserve "
+            f"{_overhead_mib()} MiB per rank, minus the graph share)",
+        ),
+    ]
+    return [x for x in out if x["mib"] > 0.005 or x["id"] in ("kv", "ovh")]
 
 
 def _compute_offload(

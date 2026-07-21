@@ -476,5 +476,243 @@ class TestPlacementMisc(CustomTestCase):
         self.assertEqual(f.rank_gpu_memory_mib, [12000, 12000, 12000])
 
 
+class TestFineGrainedSegments(CustomTestCase):
+    """Fine-grained per-card VRAM segments: sub-segment sums reconcile with
+    the family lumps, GDN state reports per-session x sessions, the segment
+    list carries the hover payload, and CUDA-graph memory is itemized."""
+
+    def _hybrid_flags(self, **kw):
+        base = dict(
+            tp_size=3,
+            rank_tp_ratio=[4, 2, 2],
+            rank_gpu_memory_mib=[16000] * 3,
+            dcp_size=3,
+            context_length=8192,
+            max_running_requests=8,
+            speculative_algorithm="NEXTN",
+            speculative_num_draft_tokens=4,
+            speculative_num_steps=3,
+            speculative_adaptive=True,
+        )
+        base.update(kw)
+        return base
+
+    def _hybrid_cfg(self, **kw):
+        base = dict(
+            q_heads=16, kv_heads=8, gdn_k_heads=8, gdn_v_heads=24,
+            mtp_layers=1,
+            layer_types=["linear_attention"] * 18 + ["full_attention"] * 6,
+        )
+        base.update(kw)
+        return _cfg(**base)
+
+    def test_subsegments_reconcile_with_family_totals(self):
+        cfg = self._hybrid_cfg(num_experts=64)
+        d = compute_placement(cfg, self._hybrid_flags())
+        for r in d["ranks"]:
+            self.assertAlmostEqual(
+                r["attn_q_mib"] + r["attn_kv_mib"], r["attn_mib"], places=6
+            )
+            self.assertAlmostEqual(
+                r["mlp_dense_mib"] + r["experts_mib"],
+                r["ffn_experts_mib"],
+                places=6,
+            )
+            self.assertAlmostEqual(
+                r["kv_target_mib"] + r["kv_draft_mib"], r["kv_mib"], places=6
+            )
+            self.assertAlmostEqual(
+                r["graphs_mib"] + r["overhead_rest_mib"],
+                r["overhead_mib"],
+                places=6,
+            )
+        # segment list sums to the card total (bar = the whole card story).
+        for c in d["cards"]:
+            self.assertAlmostEqual(
+                sum(s["mib"] for s in c["segments"]),
+                c["total_mib"],
+                places=4,
+            )
+
+    def test_gdn_state_per_session_times_sessions(self):
+        d = compute_placement(cfg := self._hybrid_cfg(), self._hybrid_flags())
+        for r in d["ranks"]:
+            self.assertGreater(r["mamba_mib"], 0.0)
+            self.assertGreater(r["mamba_sessions"], 0)
+            self.assertAlmostEqual(
+                r["mamba_per_session_mib"] * r["mamba_sessions"],
+                r["mamba_mib"],
+                places=6,
+            )
+        # more concurrent sessions -> a larger state pool (per-session cost).
+        d2 = compute_placement(
+            cfg, self._hybrid_flags(max_running_requests=32)
+        )
+        self.assertGreater(
+            d2["ranks"][0]["mamba_mib"], d["ranks"][0]["mamba_mib"]
+        )
+
+    def test_segment_hover_payload_present(self):
+        d = compute_placement(self._hybrid_cfg(), self._hybrid_flags())
+        for c in d["cards"]:
+            for s in c["segments"]:
+                self.assertTrue(s["label"], s["id"])
+                self.assertTrue(s["detail"], s["id"])
+        ids = {s["id"] for s in d["cards"][0]["segments"]}
+        # the old single "weights" lump is replaced by the fine segments.
+        self.assertNotIn("weights", ids)
+        for expected in ("attn_q", "attn_kv", "kv", "mamba", "graphs", "ovh"):
+            self.assertIn(expected, ids)
+        # GDN-state hover names the per-session cost and the slot count.
+        mamba = next(
+            s for s in d["cards"][0]["segments"] if s["id"] == "mamba"
+        )
+        self.assertIn("per session", mamba["detail"])
+
+    def test_graph_itemization_ladder_aware(self):
+        cfg = self._hybrid_cfg()
+        d = compute_placement(cfg, self._hybrid_flags())
+        gm = d["graph_mem"]
+        self.assertEqual(gm["provenance"], "heuristic")
+        labels = " ".join(i["label"] for i in gm["items"])
+        self.assertIn("k=4", labels)  # each ladder rung itemized
+        self.assertIn("k=2", labels)
+        # adaptive off -> single rung -> visibly smaller prediction.
+        d2 = compute_placement(
+            cfg, self._hybrid_flags(speculative_adaptive=False)
+        )
+        self.assertLess(
+            d2["graph_mem"]["per_rank_mib"], gm["per_rank_mib"]
+        )
+
+    def test_graph_override_wins_and_splits_overhead(self):
+        override = {
+            "provenance": "measured (live boot log)",
+            "per_rank_map": {"0": 500.0, "1": 400.0, "2": 300.0},
+            "per_rank_mib": 500.0,
+            "items": [{"label": "target decode", "mib": 500.0}],
+            "error_band_pct": 0,
+        }
+        d = compute_placement(
+            self._hybrid_cfg(),
+            self._hybrid_flags(graph_mem_override=override),
+        )
+        self.assertEqual(
+            d["graph_mem"]["provenance"], "measured (live boot log)"
+        )
+        r0 = d["ranks"][0]
+        self.assertAlmostEqual(r0["graphs_mib"], 500.0, places=6)
+        self.assertAlmostEqual(
+            r0["overhead_rest_mib"], r0["overhead_mib"] - 500.0, places=6
+        )
+        self.assertAlmostEqual(d["ranks"][2]["graphs_mib"], 300.0, places=6)
+
+
+class TestReplicationMarking(CustomTestCase):
+    """KV replication must be marked EXPLICITLY (segment flag + reason) for
+    both roots: the fork's uneven-DCP token-split and stock-style
+    num_kv_head_replicas replication."""
+
+    def test_fork_uneven_dcp_marks_weights_not_cache(self):
+        cfg = _cfg(q_heads=16, kv_heads=8)
+        d = compute_placement(
+            cfg,
+            dict(
+                tp_size=3, rank_tp_ratio=[4, 2, 2], dcp_size=3,
+                rank_gpu_memory_mib=[16000] * 3, context_length=8192,
+            ),
+        )
+        kr = d["kv_replication"]
+        self.assertTrue(kr["replicated"])
+        self.assertEqual(kr["source"], "fork-uneven-dcp")
+        self.assertEqual(kr["factor"], 3)
+        self.assertFalse(kr["cache_duplicated"])
+        self.assertIn("token axis", kr["reason"])
+        segs = {s["id"]: s for s in d["cards"][0]["segments"]}
+        self.assertTrue(segs["attn_kv"]["replicated"])
+        self.assertIn("REPLICATED", segs["attn_kv"]["detail"])
+        # cache is token-sharded, NOT duplicated -> no hatch on the KV cache.
+        self.assertFalse(segs["kv"]["replicated"])
+        self.assertIn("token-sharded", segs["kv"]["detail"])
+
+    def test_stock_replication_marks_weights_and_cache(self):
+        cfg = _cfg(q_heads=16, kv_heads=4)
+        d = compute_placement(
+            cfg,
+            dict(
+                tp_size=8, stock_semantics=True,
+                rank_gpu_memory_mib=[8000] * 8, context_length=4096,
+            ),
+        )
+        kr = d["kv_replication"]
+        self.assertTrue(kr["replicated"])
+        self.assertEqual(kr["source"], "stock-replication")
+        self.assertEqual(kr["factor"], 2)  # num_kv_head_replicas = 8/4
+        self.assertTrue(kr["cache_duplicated"])
+        self.assertIn("num_kv_head_replicas", kr["reason"])
+        segs = {s["id"]: s for s in d["cards"][0]["segments"]}
+        self.assertTrue(segs["attn_kv"]["replicated"])
+        self.assertTrue(segs["kv"]["replicated"])
+
+    def test_no_replication_when_sharded_normally(self):
+        cfg = _cfg(q_heads=16, kv_heads=8)
+        d = compute_placement(
+            cfg, dict(tp_size=4, rank_gpu_memory_mib=[16000] * 4)
+        )
+        kr = d["kv_replication"]
+        self.assertFalse(kr["replicated"])
+        self.assertIn("sharded normally", kr["reason"])
+        segs = {s["id"]: s for s in d["cards"][0]["segments"]}
+        self.assertFalse(segs["attn_kv"]["replicated"])
+
+
+class TestDraftSegments(CustomTestCase):
+    def test_own_mtp_layers_are_the_draft_segment(self):
+        cfg = _cfg(mtp_layers=1)
+        d = compute_placement(
+            cfg,
+            dict(
+                tp_size=2, rank_gpu_memory_mib=[16000] * 2,
+                speculative_algorithm="NEXTN",
+                speculative_num_draft_tokens=4,
+            ),
+        )
+        self.assertEqual(d["draft"]["weights_source"], "mtp")
+        for r in d["ranks"]:
+            self.assertAlmostEqual(
+                r["draft_w_mib"], r["mtp_mib"], places=6
+            )
+            self.assertGreater(r["kv_draft_mib"], 0.0)
+        segs = {s["id"] for s in d["cards"][0]["segments"]}
+        self.assertIn("draft_w", segs)
+        self.assertIn("kv_draft", segs)
+
+    def test_external_draft_model_sized_from_its_config(self):
+        cfg = _cfg(mtp_layers=0)
+        draft_cfg = _cfg(
+            hidden=1024, intermediate=3072, layers=2, q_heads=8, kv_heads=4,
+            vocab=32000,
+        )
+        base = dict(
+            tp_size=2, rank_gpu_memory_mib=[16000] * 2,
+            speculative_algorithm="EAGLE3",
+            speculative_num_draft_tokens=4,
+        )
+        d0 = compute_placement(cfg, base)
+        self.assertIsNone(d0["draft"])  # no MTP head, no external draft
+        d = compute_placement(
+            cfg, dict(base, speculative_draft_model_cfg=draft_cfg)
+        )
+        self.assertEqual(d["draft"]["weights_source"], "external")
+        self.assertGreater(sum(d["draft"]["per_rank_mib"]), 0.0)
+        # the external draft ADDS to the weight footprint.
+        self.assertGreater(
+            d["ranks"][0]["weight_mib"], d0["ranks"][0]["weight_mib"]
+        )
+        segs = {s["id"]: s for s in d["cards"][0]["segments"]}
+        self.assertIn("draft_w", segs)
+        self.assertIn("external", segs["draft_w"]["detail"])
+
+
 if __name__ == "__main__":
     unittest.main()
