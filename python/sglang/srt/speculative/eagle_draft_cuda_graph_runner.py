@@ -106,6 +106,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Fields the parent's capture() reads:
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
+        # Weightless-KV block-decode graphs (#136a) are captured only on the
+        # target head/worker, never on a draft runner (DecodeCudaGraphRunner
+        # gates that path with `and not model_runner.is_draft_worker`). Since
+        # EAGLE bypasses the base __init__ that would set this, initialize it
+        # here so the shared _capture_one_stream()'s `if self._wl_block_graph`
+        # guard is defined (always False for the draft runner).
+        self._wl_block_graph = False
         self.tp_size = model_runner.tp_size
         self.dp_size = model_runner.dp_size
         self.pp_size = model_runner.server_args.pp_size
