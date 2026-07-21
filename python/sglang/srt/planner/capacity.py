@@ -35,6 +35,11 @@ class RankCapacity:
     gpu_index: Optional[int]
     budget_mib: int
     weight_gib: float
+    #: The portion of ``weight_gib`` the fork can serve from host RAM (MoE
+    #: routed experts, #77); 0.0 for dense checkpoints. Feeds the RAM-offload
+    #: fit assessment (§PART 4) so "no VRAM space" can become "fits with N GiB
+    #: on host RAM" only where the runtime actually supports it.
+    offloadable_weight_gib: float
     mamba_gib: float
     #: Predicted KV token capacity P_r (estimate; may be negative when the
     #: rank does not fit — kept raw so fail-loud messages can show by how
@@ -69,6 +74,7 @@ def predict_capacity(plan_inputs, base_plan, budgets_mib) -> CapacityReport:
     model = PerfCostModel(plan_inputs, list(base_plan), list(budgets_mib))
     mlp_vector = plan_inputs.rank_mlp_ratio or list(base_plan)
     pred = model.predict_capacity(mlp_vector)
+    offloadable = model.per_rank_offloadable_weight_bytes(mlp_vector)
 
     overhead_mib = int(
         uneven_perf._PREDICT_OVERHEAD_MIB
@@ -93,6 +99,7 @@ def predict_capacity(plan_inputs, base_plan, budgets_mib) -> CapacityReport:
                 ),
                 budget_mib=int(budgets_mib[r]),
                 weight_gib=pred["weights_gib"][r],
+                offloadable_weight_gib=offloadable[r] / 2**30,
                 mamba_gib=mamba_b / 2**30,
                 kv_tokens=kv_tokens,
                 budget_used_pct=100.0 * used / budget_bytes,

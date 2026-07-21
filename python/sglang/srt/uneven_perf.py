@@ -709,7 +709,11 @@ def _gguf_family_of(name: str) -> Optional[str]:
     only the full-attention q/k/v/o projections are 'attn'."""
     if "nextn" in name or "mtp" in name:
         return "draft"
-    if "ffn_" in name and "exp" not in name:
+    # All FFN tensors -> 'mlp', INCLUDING the MoE expert stacks
+    # (ffn_{gate,up,down}_exps) and the router (ffn_gate_inp). Excluding
+    # ``exp`` here previously dropped the entire MoE expert mass -- the bulk
+    # of a sparse-MoE GGUF -- from the family byte model.
+    if "ffn_" in name:
         return "mlp"
     if name in ("token_embd.weight", "output.weight"):
         return "vocab"
@@ -744,7 +748,18 @@ def _gguf_config_and_families(path: str) -> dict:
         return scalars.get(f"{arch}.{key}", default)
 
     hidden = int(need("embedding_length"))
-    intermediate = int(need("feed_forward_length"))
+    # MoE GGUF (qwen35moe, ...) carries no dense ``feed_forward_length`` -- the
+    # FFN mass is in ``expert_count`` experts of ``expert_feed_forward_length``
+    # (plus an optional shared expert). Fall back to the expert width so the
+    # cost model is well-defined; the MoE param count is rebuilt from these in
+    # _build_families.
+    expert_count = int(opt("expert_count", 0) or 0)
+    expert_ffn = int(opt("expert_feed_forward_length", 0) or 0)
+    shared_ffn = int(opt("expert_shared_feed_forward_length", 0) or 0)
+    if expert_count > 0:
+        intermediate = expert_ffn or int(opt("feed_forward_length", 0) or 0)
+    else:
+        intermediate = int(need("feed_forward_length"))
     q_heads = int(need("attention.head_count"))
     kv_heads = int(need("attention.head_count_kv"))
     head_dim = int(opt("attention.key_length", hidden // max(q_heads, 1)))
@@ -832,6 +847,9 @@ def _gguf_config_and_families(path: str) -> dict:
             "head_dim": head_dim,
             "attn_output_gate": attn_gate,
             "vocab_size": int(vocab),
+            "num_experts": expert_count,
+            "moe_intermediate_size": expert_ffn if expert_count else 0,
+            "shared_expert_intermediate_size": shared_ffn if expert_count else 0,
             "mtp_num_hidden_layers": nextn,
             "linear_num_key_heads": gdn_k_heads,
             "linear_num_value_heads": gdn_v_heads,
@@ -868,7 +886,26 @@ class PerfCostModel:
         cfg = self._load_config(plan_inputs.model_path)
         text = cfg.get("text_config", cfg)
         self.hidden = int(text["hidden_size"])
-        self.intermediate = int(text["intermediate_size"])
+        # MoE geometry: a sparse-MoE checkpoint (Qwen3.5-MoE, DeepSeek, ...)
+        # carries no dense ``intermediate_size`` -- the FFN mass lives in
+        # ``num_experts`` routed experts of width ``moe_intermediate_size``
+        # (plus an optional shared expert). Reading ``intermediate_size``
+        # unconditionally KeyError'd on these; and even when a dense
+        # intermediate existed, ignoring the experts undercounted the weights
+        # by ~10x. Fall back to the MoE width so the unit grid + sizing below
+        # are well-defined for both dense and MoE checkpoints.
+        self.num_experts = int(
+            text.get("num_experts", text.get("n_routed_experts", 0)) or 0
+        )
+        self.moe_intermediate = int(text.get("moe_intermediate_size", 0) or 0)
+        self.shared_expert_intermediate = int(
+            text.get("shared_expert_intermediate_size", 0) or 0
+        )
+        self.intermediate = int(
+            text.get("intermediate_size")
+            or self.moe_intermediate
+            or 0
+        )
         layer_types = text.get("layer_types")
         n_layers = int(text["num_hidden_layers"])
         if layer_types:
@@ -895,7 +932,12 @@ class PerfCostModel:
         self.gdn_units = max(self.gdn_k_heads, 1)
         quant_cfg = cfg.get("quantization_config") or {}
         group = self._quant_group_size(quant_cfg)
-        if group and self.intermediate % group == 0:
+        if self.num_experts > 0:
+            # MoE shards whole experts across ranks (the fork's --rank-moe-ratio
+            # granularity), so the natural indivisible unit is one expert, not
+            # a quant-group column of the (tiny) expert intermediate.
+            self.mlp_units = self.num_experts
+        elif group and self.intermediate % group == 0:
             self.mlp_units = self.intermediate // group
         elif self.intermediate % 128 == 0:
             self.mlp_units = self.intermediate // 128
@@ -941,7 +983,18 @@ class PerfCostModel:
         q_size = self.q_heads * self.head_dim * (2 if self.attn_gate else 1)
         kv_size = self.kv_heads * self.head_dim
         attn_layer = H * (q_size + 2 * kv_size) + (self.q_heads * self.head_dim) * H
-        mlp_layer = 3 * H * I
+        if self.num_experts > 0:
+            # MoE FFN mass: num_experts routed experts (gate+up+down = 3 H*Wi)
+            # of width moe_intermediate, plus an optional always-on shared
+            # expert. The router gate (H*num_experts) is negligible. This is
+            # the bulk of a sparse-MoE checkpoint -- omitting it undercounted
+            # weights ~10x and produced spurious "fits" / mis-sized budgets.
+            moe_i = self.moe_intermediate or I
+            mlp_layer = self.num_experts * 3 * H * moe_i
+            if self.shared_expert_intermediate > 0:
+                mlp_layer += 3 * H * self.shared_expert_intermediate
+        else:
+            mlp_layer = 3 * H * I
 
         gdn_layer = 0.0
         if self.gdn_layers:
@@ -1037,8 +1090,21 @@ class PerfCostModel:
         if shard == "replicated":
             return [1.0] * n
         if shard == "attn":
-            units = partition_units(self.attn_units, self.base_plan)
-            return [u / self.attn_units for u in units]
+            grid = self.attn_units
+            if grid < n:
+                # Replicated-KV regime (#116 / uneven-TP head geometry): fewer
+                # KV heads than ranks. Stock even-TP caps TP at the KV-head
+                # count, but the fork REPLICATES the KV heads across ranks and
+                # shards the token axis (uneven DCP), so >kv_heads ranks are
+                # valid. The Q/O projections still shard on the q-head grid
+                # (which dominates attn weight; K/V is the small replicated
+                # remainder), so we size the shard on the q-head units here
+                # instead of crashing in partition_units on 2 KV heads / 3
+                # ranks. Only reached when attn_units < tp -- the classic
+                # kv_heads>=tp path is untouched (byte-identical).
+                grid = max(self.q_heads, n)
+            units = partition_units(grid, self.base_plan)
+            return [u / grid for u in units]
         if shard in ("gdn", "gdn_base"):
             # vision ("gdn_base") has no own family vector; it follows the
             # base plan on a fine grid -> approximate with exact proportion.
@@ -1073,6 +1139,31 @@ class PerfCostModel:
             for r in range(self.tp_size):
                 totals[r] += fam.bytes * fracs[r]
         return totals
+
+    def per_rank_offloadable_weight_bytes(
+        self, mlp_vector: List[int]
+    ) -> List[float]:
+        """Per-rank weight bytes the fork can serve FROM HOST RAM at runtime:
+        the MoE ROUTED-expert stack (expert-offload, #77 — a hot subset stays
+        resident, the rest live in a pinned host pool). Deliberately EXCLUDES
+        everything that must stay on the GPU to serve: dense MLP, attention,
+        embeddings/lm_head, GDN/SSM state, and the always-on shared expert
+        (it runs on every token). Returns all-zeros for a dense checkpoint, so
+        the offload assessment never claims host-offload for a weight class the
+        runtime cannot actually tier."""
+        if self.num_experts <= 0:
+            return [0.0] * self.tp_size
+        fam = self.families.get("mlp")
+        if fam is None or fam.params <= 0:
+            return [0.0] * self.tp_size
+        # Routed-expert share of the mlp family mass (the family also carries
+        # the small always-resident shared expert, which does NOT offload).
+        moe_i = self.moe_intermediate or self.intermediate
+        routed = self.num_experts * 3 * self.hidden * moe_i
+        shared = 3 * self.hidden * self.shared_expert_intermediate
+        routed_frac = routed / (routed + shared) if (routed + shared) else 1.0
+        fracs = self._shard_fractions(fam.shard, mlp_vector)
+        return [fam.bytes * fracs[r] * routed_frac for r in range(self.tp_size)]
 
     def _mamba_pool_bytes(self) -> List[float]:
         """Per-rank mamba/SSM pool bytes (state pool + spec-decode

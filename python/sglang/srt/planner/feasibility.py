@@ -38,7 +38,13 @@ from sglang.srt.planner.hardware import HardwareSpec
 from sglang.srt.planner.plan import AutoPlan, derive_auto_plan
 from sglang.srt.uneven_perf import PlanInputs
 
-__all__ = ["PlanResult", "PlanRejected", "plan", "validate_plan_inputs"]
+__all__ = [
+    "PlanResult",
+    "PlanRejected",
+    "OffloadAssessment",
+    "plan",
+    "validate_plan_inputs",
+]
 
 
 class PlanRejected(ValueError):
@@ -49,6 +55,35 @@ class PlanRejected(ValueError):
     def __init__(self, reasons: Sequence[str]):
         self.reasons = list(reasons)
         super().__init__("\n".join(self.reasons))
+
+
+@dataclasses.dataclass(frozen=True)
+class OffloadAssessment:
+    """Whether a plan that does NOT fit purely in VRAM can still run by tiering
+    weights to host RAM (design §PART 4). Three honest states:
+
+      * ``"vram"``        — fits entirely in VRAM (fast; no host tier needed).
+      * ``"ram_offload"`` — does not fit in VRAM, but moving ``offloaded_gib``
+        of MoE routed experts to a pinned host pool makes the resident set fit
+        AND the host has the RAM. SLOWER: those experts are fetched over PCIe
+        on demand (bandwidth-bound), so this is a capacity win, not a speed
+        one — stated plainly, never sugar-coated.
+      * ``"cannot_fit"``  — even offloading every offloadable byte (or the host
+        lacks the RAM) leaves the plan infeasible. The non-offloadable floor
+        (attention + dense/shared MLP + embeddings + GDN state + min KV)
+        already exceeds VRAM, or there is no host RAM headroom.
+    """
+
+    status: str  # "vram" | "ram_offload" | "cannot_fit"
+    #: Weight GiB that must move to host RAM to fit (0.0 for "vram").
+    offloaded_gib: float
+    #: Host RAM the offloaded experts need, and what is available.
+    host_ram_needed_mib: int
+    host_ram_total_mib: Optional[int]
+    #: Per-rank offloaded GiB (which rank sheds how much).
+    per_rank_offloaded_gib: List[float]
+    #: Human note (the honest tradeoff / why it cannot fit).
+    note: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -70,6 +105,10 @@ class PlanResult:
     #: sglang.srt.planner.advantage). Optional import cycle avoidance: typed
     #: loosely.
     advantage: Optional[object] = None
+    #: Host-RAM-offload assessment (§PART 4): distinguishes fits-in-VRAM from
+    #: fits-with-RAM-offload from genuinely-cannot-fit. None only when capacity
+    #: could not be sized at all.
+    offload: Optional[OffloadAssessment] = None
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +248,7 @@ def plan(
     speculative_draft_model_path: Optional[str] = None,
     max_running_requests: Optional[int] = None,
     disable_cuda_graph: bool = False,
+    host_ram_mib: Optional[int] = None,
     with_advantage: bool = True,
 ) -> PlanResult:
     """Plan ``model_path`` on ``hardware``.
@@ -331,6 +371,9 @@ def plan(
                 "(cost-model estimate)."
             )
 
+    offload = _assess_offload(
+        inputs, hardware, capacity, host_ram_mib=host_ram_mib
+    )
     result = PlanResult(
         fits=capacity.feasible,
         infeasible_reasons=reasons,
@@ -339,6 +382,7 @@ def plan(
         auto_plan=auto,
         capacity=capacity,
         launch_flags=_launch_flags(inputs),
+        offload=offload,
     )
     if with_advantage:
         from sglang.srt.planner.advantage import compute_advantage
@@ -350,6 +394,122 @@ def plan(
             ),
         )
     return result
+
+
+def _assess_offload(
+    inputs: PlanInputs,
+    hardware: HardwareSpec,
+    capacity: Optional[CapacityReport],
+    host_ram_mib: Optional[int] = None,
+) -> Optional[OffloadAssessment]:
+    """Decide fits-in-VRAM vs fits-with-RAM-offload vs cannot-fit (§PART 4).
+
+    Only the MoE routed-expert bytes are treated as host-offloadable (the
+    fork's #77 expert-offload); everything else — attention, dense/shared MLP,
+    embeddings, GDN state, and a minimum viable KV slice — must stay resident.
+    We move as few experts to host as needed for the resident set to fit, and
+    only call it feasible when the host actually has that much RAM. No safety
+    margin is invented on top; the honest PCIe-bandwidth caveat is in the note.
+    """
+    if capacity is None:
+        return None
+    host_total = host_ram_mib if host_ram_mib is not None else hardware.host_ram_mib
+
+    if capacity.feasible:
+        return OffloadAssessment(
+            status="vram",
+            offloaded_gib=0.0,
+            host_ram_needed_mib=0,
+            host_ram_total_mib=host_total,
+            per_rank_offloaded_gib=[0.0] * len(capacity.per_rank),
+            note="Fits entirely in VRAM — no host-RAM tier needed (fastest).",
+        )
+
+    from sglang.srt.uneven_perf import _PREDICT_MIN_RANK_TOKENS
+
+    kv_cell = _kv_cell_bytes(inputs)
+    min_kv_bytes = _PREDICT_MIN_RANK_TOKENS * kv_cell
+    overhead_bytes = capacity.overhead_mib * 2**20
+
+    per_rank_off_gib: List[float] = []
+    total_off_bytes = 0.0
+    total_offloadable = 0.0
+    hard_floor_exceeds = False
+    for rc in capacity.per_rank:
+        budget = rc.budget_mib * 2**20
+        offloadable = rc.offloadable_weight_gib * 2**30
+        total_offloadable += offloadable
+        full_resident = (
+            rc.weight_gib * 2**30
+            + rc.mamba_gib * 2**30
+            + overhead_bytes
+            + min_kv_bytes
+        )
+        need = full_resident - budget  # bytes that must leave this rank
+        if need <= 0:
+            per_rank_off_gib.append(0.0)
+            continue
+        if need > offloadable + 1:  # even shedding all experts is not enough
+            hard_floor_exceeds = True
+            per_rank_off_gib.append(offloadable / 2**30)
+            total_off_bytes += offloadable
+        else:
+            per_rank_off_gib.append(need / 2**30)
+            total_off_bytes += need
+
+    host_needed_mib = int(total_off_bytes / 2**20)
+
+    if hard_floor_exceeds or total_offloadable <= 0:
+        why = (
+            "no host-offloadable weight class here (a dense checkpoint — only "
+            "MoE routed experts can tier to host RAM)"
+            if total_offloadable <= 0
+            else "the non-offloadable floor (attention + dense/shared MLP + "
+            "embeddings + GDN state + minimum KV) already exceeds VRAM even "
+            "with every expert on host"
+        )
+        return OffloadAssessment(
+            status="cannot_fit",
+            offloaded_gib=total_off_bytes / 2**30,
+            host_ram_needed_mib=host_needed_mib,
+            host_ram_total_mib=host_total,
+            per_rank_offloaded_gib=per_rank_off_gib,
+            note=f"Cannot fit: {why}.",
+        )
+
+    if host_total is not None and host_needed_mib > host_total:
+        return OffloadAssessment(
+            status="cannot_fit",
+            offloaded_gib=total_off_bytes / 2**30,
+            host_ram_needed_mib=host_needed_mib,
+            host_ram_total_mib=host_total,
+            per_rank_offloaded_gib=per_rank_off_gib,
+            note=(
+                f"Would fit with ~{total_off_bytes / 2**30:.1f} GiB of experts "
+                f"on host RAM, but the host has only "
+                f"{host_total / 1024:.1f} GiB total — not enough headroom."
+            ),
+        )
+
+    host_note = (
+        f" (host has {host_total / 1024:.1f} GiB)"
+        if host_total is not None
+        else " (host RAM total unknown — pass one to confirm)"
+    )
+    return OffloadAssessment(
+        status="ram_offload",
+        offloaded_gib=total_off_bytes / 2**30,
+        host_ram_needed_mib=host_needed_mib,
+        host_ram_total_mib=host_total,
+        per_rank_offloaded_gib=per_rank_off_gib,
+        note=(
+            f"Fits with ~{total_off_bytes / 2**30:.1f} GiB of MoE routed "
+            f"experts offloaded to host RAM{host_note}. SLOWER than a pure-VRAM "
+            "fit: offloaded experts are fetched over PCIe on demand "
+            "(bandwidth-bound) — requires SGLANG_MOE_RESIDENT_EXPERT_FRACTION "
+            "< 1 and --disable-cuda-graph."
+        ),
+    )
 
 
 def _kv_cell_bytes(inputs: PlanInputs) -> int:
