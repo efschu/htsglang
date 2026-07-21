@@ -423,6 +423,20 @@ class AdaptiveSpeculativeParams:
             self._debounced_slot_bs(batch_size, advance=True)
         ].current_steps
 
+    def current_ema_accept_len(self) -> float:
+        """EMA accept length of the currently ACTIVE (debounced) BS slot.
+
+        This is the smoothed per-step signal the controller actually uses to
+        decide when to raise/lower ``num_steps`` (see AdaptiveStepSlot.update).
+        Exposed read-only for observability (``spec_ema_accept_len`` gauge / the
+        live monitoring widget); it never advances the debounce or mutates
+        state, so reading it is side-effect free and safe from any thread.
+        """
+        bs = self._active_slot_bs
+        if bs is None or bs not in self._slots:
+            bs = self._bs_list[0]
+        return float(self._slots[bs].ema_accept_len)
+
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> int | None:

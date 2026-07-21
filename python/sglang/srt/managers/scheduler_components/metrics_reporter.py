@@ -345,9 +345,20 @@ class SchedulerMetricsReporter:
             server_args.speculative_num_draft_tokens,
         )
 
+        # Adaptive controllers expose the smoothed accept-length EMA that drives
+        # their step decision. Read-only; absent (0.0) for static spec configs.
+        ema_accept_len = 0.0
+        controller = getattr(draft_worker, "adaptive_controller", None)
+        if controller is not None:
+            try:
+                ema_accept_len = float(controller.ema_accept_len)
+            except Exception:
+                ema_accept_len = 0.0
+
         return {
             "num_steps": num_steps or 0,
             "num_draft_tokens": num_draft_tokens or 0,
+            "ema_accept_len": ema_accept_len,
         }
 
     def update_spec_metrics(
@@ -744,6 +755,7 @@ class SchedulerMetricsReporter:
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0
+        spec_ema_accept_len = 0.0
         if self.scheduler.spec_algorithm.is_none():
             spec_accept_length = 0
             spec_accept_rate = 0
@@ -799,6 +811,7 @@ class SchedulerMetricsReporter:
                 spec_snapshot = self._active_spec_config_snapshot()
                 spec_num_steps = spec_snapshot["num_steps"]
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
+                spec_ema_accept_len = spec_snapshot.get("ema_accept_len", 0.0)
 
         cache_hit_rate = 0.0
 
@@ -872,6 +885,7 @@ class SchedulerMetricsReporter:
             self.stats.spec_cap_length = spec_cap_length
             self.stats.spec_block_accept_length = spec_block_accept_length
             self.stats.spec_num_steps = spec_num_steps
+            self.stats.spec_ema_accept_len = spec_ema_accept_len
             self.stats.spec_num_draft_tokens = spec_num_draft_tokens
 
             # Retract

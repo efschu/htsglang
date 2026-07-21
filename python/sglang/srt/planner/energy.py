@@ -79,6 +79,24 @@ __all__ = [
     "run_measurement",
     "CODE_WORKLOAD",
     "PROSE_WORKLOAD",
+    # #149 — power-state tagging + efficiency sweep + live monitoring
+    "GpuPowerState",
+    "read_gpu_power_states",
+    "PowerLimitController",
+    "SweepPoint",
+    "SweepResult",
+    "power_limit_sweep",
+    "LiveSnapshot",
+    "parse_prometheus_metrics",
+    "compute_live_rates",
+    "clamp_live_resolution_ms",
+    "fetch_live_snapshot",
+    "LIVE_MIN_RESOLUTION_MS",
+    "LIVE_DEFAULT_RESOLUTION_MS",
+    # #150 — configurable scenario builder + cache-flush safety gate
+    "ScenarioConfig",
+    "cache_flush_warning",
+    "CACHE_FLUSH_ENDPOINTS",
 ]
 
 
@@ -903,6 +921,563 @@ def _hardware_cards() -> List[tuple]:
         return []
 
 
+# ===========================================================================
+# #149 — power-state TAGGING, power-limit efficiency SWEEP, LIVE monitoring.
+# ===========================================================================
+#
+# Every NVML-touching class/function here takes an injectable ``nvml`` object
+# (defaulting to the real ``pynvml`` module) so the pure logic — the tagging
+# schema, the ALWAYS-restore-limit guarantee, the physical-impossibility of a
+# limit outside the card's constraints, the live delta-rate math — is unit
+# testable on a box with no GPU (see test_energy.py).
+
+
+def _import_pynvml():
+    import pynvml
+
+    pynvml.nvmlInit()
+    return pynvml
+
+
+def _resolve_handles(nvml, gpu_indices: Optional[Sequence[int]]):
+    n = nvml.nvmlDeviceGetCount()
+    idx = list(gpu_indices) if gpu_indices is not None else list(range(n))
+    return idx, [nvml.nvmlDeviceGetHandleByIndex(i) for i in idx]
+
+
+@dataclasses.dataclass
+class GpuPowerState:
+    """A point-in-time POWER-STATE TAG for one physical card. Everything the
+    reader needs to judge whether two efficiency numbers are comparable: the
+    actual draw, the *limit context* it was drawn under, the clocks, the temp,
+    and whether the card is running stock / over- / under-clocked-or-limited.
+    Efficiency (J/token) is only comparable across cards/runs at the SAME
+    power-limit context — this tag makes that context explicit."""
+
+    nvml_index: int
+    name: str
+    power_watts: float            # measured actual board draw right now
+    power_limit_w: float          # current ENFORCED management limit
+    default_limit_w: float        # factory/stock TDP
+    min_limit_w: float
+    max_limit_w: float
+    limit_pct_of_default: float   # current limit / stock TDP (the sweep x-axis)
+    sm_clock_mhz: int
+    mem_clock_mhz: int
+    temperature_c: int
+    #: "stock" | "power-limited" (limit < default) | "power-raised"
+    #: (limit > default) | "clock-OC" | "clock-UV" (graphics-clock offset, when
+    #: NVML exposes it). A non-"stock" tag means this card's efficiency number
+    #: is NOT directly comparable to a stock card without normalizing the axis.
+    oc_uv: str = "stock"
+    clock_offset_mhz: Optional[int] = None
+
+    def to_json(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+def _classify_oc_uv(limit_w, default_w, offset_mhz) -> str:
+    if offset_mhz is not None and offset_mhz != 0:
+        return "clock-OC" if offset_mhz > 0 else "clock-UV"
+    if default_w > 0:
+        if limit_w < default_w - 1.0:
+            return "power-limited"
+        if limit_w > default_w + 1.0:
+            return "power-raised"
+    return "stock"
+
+
+def read_gpu_power_states(
+    gpu_indices: Optional[Sequence[int]] = None, nvml=None
+) -> List[GpuPowerState]:
+    """Tag every selected card's current power state (see GpuPowerState)."""
+    own = nvml is None
+    nvml = nvml or _import_pynvml()
+    try:
+        idx, handles = _resolve_handles(nvml, gpu_indices)
+        out: List[GpuPowerState] = []
+        for i, h in zip(idx, handles):
+            limit = nvml.nvmlDeviceGetPowerManagementLimit(h) / 1000.0
+            default = nvml.nvmlDeviceGetPowerManagementDefaultLimit(h) / 1000.0
+            try:
+                mn, mx = nvml.nvmlDeviceGetPowerManagementLimitConstraints(h)
+                mn, mx = mn / 1000.0, mx / 1000.0
+            except Exception:
+                mn, mx = default, default
+            offset = None
+            try:
+                offset = int(nvml.nvmlDeviceGetGpcClkVfOffset(h))
+            except Exception:
+                offset = None
+            out.append(GpuPowerState(
+                nvml_index=i,
+                name=_nvml_name(nvml.nvmlDeviceGetName(h)),
+                power_watts=nvml.nvmlDeviceGetPowerUsage(h) / 1000.0,
+                power_limit_w=limit,
+                default_limit_w=default,
+                min_limit_w=mn,
+                max_limit_w=mx,
+                limit_pct_of_default=(limit / default if default else 1.0),
+                sm_clock_mhz=_nvml_clock(nvml, h, "SM"),
+                mem_clock_mhz=_nvml_clock(nvml, h, "MEM"),
+                temperature_c=_nvml_temp(nvml, h),
+                oc_uv=_classify_oc_uv(limit, default, offset),
+                clock_offset_mhz=offset,
+            ))
+        return out
+    finally:
+        if own:
+            try:
+                nvml.nvmlShutdown()
+            except Exception:
+                pass
+
+
+def _nvml_clock(nvml, h, which) -> int:
+    try:
+        clk = getattr(nvml, "NVML_CLOCK_SM", 1) if which == "SM" else \
+            getattr(nvml, "NVML_CLOCK_MEM", 2)
+        return int(nvml.nvmlDeviceGetClockInfo(h, clk))
+    except Exception:
+        return 0
+
+
+def _nvml_temp(nvml, h) -> int:
+    try:
+        sensor = getattr(nvml, "NVML_TEMPERATURE_GPU", 0)
+        return int(nvml.nvmlDeviceGetTemperature(h, sensor))
+    except Exception:
+        return 0
+
+
+class PowerLimitController:
+    """Sets per-card NVML power-management limits and — via the context-manager
+    protocol AND explicit ``restore()`` — ALWAYS restores the original limits,
+    on clean exit and on error alike. The efficiency sweep never leaves a card
+    clamped: even if a measurement raises mid-sweep, ``__exit__`` restores.
+
+    A requested limit is clamped to the card's ``[min, max]`` constraints and
+    the *physically applied* value is returned, so the caller records the real
+    limit each point was measured at (not the requested one)."""
+
+    def __init__(self, gpu_indices: Optional[Sequence[int]] = None, nvml=None):
+        self._own = nvml is None
+        self._nvml = nvml or _import_pynvml()
+        self._idx, self._handles = _resolve_handles(self._nvml, gpu_indices)
+        # Snapshot the ORIGINAL enforced limits up front (mW) — the restore set.
+        self._original_mw: List[int] = [
+            int(self._nvml.nvmlDeviceGetPowerManagementLimit(h))
+            for h in self._handles
+        ]
+        self._default_mw: List[int] = [
+            int(self._nvml.nvmlDeviceGetPowerManagementDefaultLimit(h))
+            for h in self._handles
+        ]
+        self._constraints: List[Tuple[int, int]] = []
+        for h in self._handles:
+            try:
+                mn, mx = self._nvml.nvmlDeviceGetPowerManagementLimitConstraints(h)
+            except Exception:
+                d = int(self._nvml.nvmlDeviceGetPowerManagementDefaultLimit(h))
+                mn, mx = d, d
+            self._constraints.append((int(mn), int(mx)))
+        self._restored = False
+
+    @property
+    def default_watts(self) -> List[float]:
+        return [d / 1000.0 for d in self._default_mw]
+
+    def _clamp_mw(self, card: int, want_mw: int) -> int:
+        mn, mx = self._constraints[card]
+        return max(mn, min(mx, int(want_mw)))
+
+    def set_limit_pct(self, pct: float) -> List[float]:
+        """Set every card to *pct* of its OWN stock TDP; return applied W."""
+        applied = []
+        for card, h in enumerate(self._handles):
+            want = self._clamp_mw(card, round(self._default_mw[card] * pct))
+            self._nvml.nvmlDeviceSetPowerManagementLimit(h, want)
+            applied.append(want / 1000.0)
+        return applied
+
+    def set_limit_watts(self, watts: float) -> List[float]:
+        """Set every card to *watts* absolute (clamped); return applied W."""
+        applied = []
+        for card, h in enumerate(self._handles):
+            want = self._clamp_mw(card, round(watts * 1000.0))
+            self._nvml.nvmlDeviceSetPowerManagementLimit(h, want)
+            applied.append(want / 1000.0)
+        return applied
+
+    def restore(self) -> None:
+        """Restore every card to the limit it had when this controller was
+        constructed. Idempotent; best-effort per card so one failure does not
+        strand the others."""
+        if self._restored:
+            return
+        for h, mw in zip(self._handles, self._original_mw):
+            try:
+                self._nvml.nvmlDeviceSetPowerManagementLimit(h, mw)
+            except Exception:
+                pass
+        self._restored = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.restore()
+        if self._own:
+            try:
+                self._nvml.nvmlShutdown()
+            except Exception:
+                pass
+
+
+@dataclasses.dataclass
+class SweepPoint:
+    """One power-limit rung of the efficiency sweep."""
+
+    limit_pct: float                 # requested fraction of stock TDP
+    applied_watts: List[float]       # actual per-card limit applied (clamped)
+    total_applied_watts: float       # whole-rig limit sum (abs-W x-axis)
+    decode_tok_s: float
+    j_per_decode_token: float
+    avg_decode_watts: float
+    prefill_tok_s: float = 0.0
+    j_per_prefill_token: float = 0.0
+
+
+@dataclasses.dataclass
+class SweepResult:
+    """A full 60-100% power-limit efficiency sweep, plus the three comparison
+    baselines the UI can plot the x-axis against."""
+
+    points: List[SweepPoint]
+    stock_total_watts: float         # sum of per-card stock TDP (100% baseline)
+    gpu_names: List[str]
+
+    def x_axis(self, mode: str = "pct_tdp") -> List[float]:
+        """X values for each point. ``mode``:
+          * ``"pct_tdp"`` — limit as a fraction of stock TDP (0-1),
+          * ``"abs_w"``   — absolute whole-rig limit in Watts,
+          * ``"stock"``   — same as pct_tdp but 1.0 marks the stock baseline."""
+        if mode in ("pct_tdp", "stock"):
+            return [p.limit_pct for p in self.points]
+        if mode == "abs_w":
+            return [p.total_applied_watts for p in self.points]
+        raise ValueError(f"unknown x-axis mode: {mode!r}")
+
+    def most_efficient(self) -> Optional[SweepPoint]:
+        """The rung with the lowest decode J/token (best energy efficiency)."""
+        valid = [p for p in self.points if p.j_per_decode_token > 0]
+        return min(valid, key=lambda p: p.j_per_decode_token) if valid else None
+
+    def to_json(self) -> dict:
+        return {
+            "gpu_names": list(self.gpu_names),
+            "stock_total_watts": self.stock_total_watts,
+            "points": [dataclasses.asdict(p) for p in self.points],
+        }
+
+
+def power_limit_sweep(
+    measure_fn,
+    pcts: Sequence[float] = (1.0, 0.9, 0.8, 0.7, 0.6),
+    gpu_indices: Optional[Sequence[int]] = None,
+    nvml=None,
+    settle_s: float = 2.0,
+    sleep_fn=time.sleep,
+) -> SweepResult:
+    """Set each power-limit rung in *pcts* (fraction of stock TDP), run
+    *measure_fn()* -> ``BucketMeasurement``-like object (needs ``decode_tok_s``,
+    ``j_per_decode_token``, ``avg_decode_watts``; prefill fields optional), and
+    record an efficiency point. The original limits are ALWAYS restored via the
+    ``PowerLimitController`` context manager — clean exit AND any exception."""
+    ctrl = PowerLimitController(gpu_indices, nvml=nvml)
+    names = [_nvml_name(ctrl._nvml.nvmlDeviceGetName(h)) for h in ctrl._handles]
+    stock_total = sum(ctrl.default_watts)
+    points: List[SweepPoint] = []
+    with ctrl:
+        for pct in pcts:
+            applied = ctrl.set_limit_pct(pct)
+            if settle_s:
+                sleep_fn(settle_s)  # let clocks settle at the new cap
+            m = measure_fn()
+            points.append(SweepPoint(
+                limit_pct=pct,
+                applied_watts=applied,
+                total_applied_watts=sum(applied),
+                decode_tok_s=getattr(m, "decode_tok_s", 0.0),
+                j_per_decode_token=getattr(m, "j_per_decode_token", 0.0),
+                avg_decode_watts=getattr(m, "avg_decode_watts", 0.0),
+                prefill_tok_s=getattr(m, "prefill_tok_s", 0.0),
+                j_per_prefill_token=getattr(m, "j_per_prefill_token", 0.0),
+            ))
+    return SweepResult(points=points, stock_total_watts=stock_total,
+                       gpu_names=names)
+
+
+# ---------------------------------------------------------------------------
+# LIVE monitoring: poll a RUNNING server's Prometheus /metrics, compute
+# client-side delta rates. Token counters (sglang:prompt_tokens_total /
+# sglang:generation_tokens_total) are ALREADY Prometheus Counters, so
+# prefill/s + decode/s are pure client-side deltas of the raw counters — far
+# finer-grained than scheduler.last_gen_throughput (a ~1s server-side average).
+# The spec signals (accept rate, active adaptive-k, and the newly-exposed
+# ema_accept_len) are gauges read straight off the same scrape.
+# ---------------------------------------------------------------------------
+
+#: floor resolution — polling faster than this is pointless (scrape + parse
+#: latency dominates) and hammers the server.
+LIVE_MIN_RESOLUTION_MS = 30.0
+LIVE_DEFAULT_RESOLUTION_MS = 250.0
+
+
+def parse_prometheus_metrics(text: str) -> Dict[str, float]:
+    """Parse Prometheus text-exposition into ``{metric_name: summed_value}``,
+    summing across all label sets of the same metric (e.g. per-worker token
+    counters collapse to a rig-wide total). Comments (# HELP/# TYPE) skipped."""
+    out: Dict[str, float] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        brace = line.find("{")
+        if brace >= 0:
+            name = line[:brace]
+            rest = line[line.find("}", brace) + 1:].strip()
+        else:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name, rest = parts[0], parts[1]
+        val = rest.split()[0] if rest else ""
+        try:
+            out[name] = out.get(name, 0.0) + float(val)
+        except ValueError:
+            continue
+    return out
+
+
+@dataclasses.dataclass
+class LiveSnapshot:
+    """One /metrics scrape, timestamped, with the fields the live widget needs."""
+
+    t: float
+    prompt_tokens_total: float
+    generation_tokens_total: float
+    spec_accept_rate: float
+    spec_num_steps: float          # current adaptive-k
+    spec_ema_accept_len: float
+    gen_throughput: float          # server-side ~1s avg (coarse; for reference)
+
+    @classmethod
+    def from_metrics(cls, metrics: Dict[str, float], t: Optional[float] = None):
+        g = metrics.get
+        return cls(
+            t=t if t is not None else time.time(),
+            prompt_tokens_total=g("sglang:prompt_tokens_total", 0.0),
+            generation_tokens_total=g("sglang:generation_tokens_total", 0.0),
+            spec_accept_rate=g("sglang:spec_accept_rate", 0.0),
+            spec_num_steps=g("sglang:spec_num_steps", 0.0),
+            spec_ema_accept_len=g("sglang:spec_ema_accept_len", 0.0),
+            gen_throughput=g("sglang:gen_throughput", 0.0),
+        )
+
+
+def compute_live_rates(prev: LiveSnapshot, cur: LiveSnapshot) -> Dict[str, float]:
+    """Client-side delta rates between two scrapes. ``prefill_tok_s`` and
+    ``decode_tok_s`` come from the RAW counter deltas over the wall-clock gap
+    (not the server's coarse average). Spec gauges are point-in-time reads.
+    A non-positive dt (clock jitter / duplicate scrape) yields zero rates
+    rather than a divide-by-zero blow-up."""
+    dt = cur.t - prev.t
+    if dt <= 0:
+        prefill = decode = 0.0
+    else:
+        prefill = max(0.0, cur.prompt_tokens_total - prev.prompt_tokens_total) / dt
+        decode = max(0.0, cur.generation_tokens_total - prev.generation_tokens_total) / dt
+    return {
+        "dt": dt,
+        "prefill_tok_s": prefill,
+        "decode_tok_s": decode,
+        "accept_rate": cur.spec_accept_rate,
+        "adaptive_k": cur.spec_num_steps,
+        "ema_accept_len": cur.spec_ema_accept_len,
+        "gen_throughput_server": cur.gen_throughput,
+    }
+
+
+def clamp_live_resolution_ms(ms: float) -> float:
+    """Clamp a requested widget resolution to the ~30ms floor."""
+    try:
+        ms = float(ms)
+    except (TypeError, ValueError):
+        return LIVE_DEFAULT_RESOLUTION_MS
+    return max(LIVE_MIN_RESOLUTION_MS, ms)
+
+
+def fetch_live_snapshot(base_url: str, timeout: float = 5.0) -> LiveSnapshot:
+    """Scrape ``{base_url}/metrics`` once and return a LiveSnapshot. Used by the
+    'measure against a running server' live mode — no boot, no teardown."""
+    url = base_url.rstrip("/") + "/metrics"
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        text = r.read().decode("utf-8", "replace")
+    return LiveSnapshot.from_metrics(parse_prometheus_metrics(text))
+
+
+# ===========================================================================
+# #150 — configurable SCENARIO builder + cache-flush safety gate.
+# ===========================================================================
+#
+# CORRECTED METHODOLOGY (the user's point): PREFILL cost is content-independent
+# (prompt tokens go through the same dense forward regardless of whether they
+# are code or prose), so prefill is measured ONCE — no code/prose split. DECODE
+# is what diverges (MTP accepts code drafts more often than prose), so decode is
+# measured per behavior. COLD prefill flushes the caches + uses a FRESH random
+# prompt each run so no prefix-cache hit shortcuts the measured prefill.
+
+
+CODE_BEHAVIOR = "code"
+PROSE_BEHAVIOR = "prose"
+
+
+@dataclasses.dataclass
+class ScenarioConfig:
+    """A user-configurable measurement scenario (#150). Fully declarative — the
+    UI builds one of these and ``expand()`` turns it into the concrete list of
+    phase/behavior runs the harness executes."""
+
+    #: linear scale on the token lengths (0.1 = quick smoke, 1.0 = short-test
+    #: default of 10k prefill / 1k decode, >1 = bigger).
+    scale: float = 1.0
+    #: "prefill" (prefill-only), "decode" (decode-only), "both".
+    phases: str = "both"
+    #: concurrent request count for this scenario (1 = single, N = batched).
+    concurrency: int = 1
+    #: which decode behaviors to split on. Prefill ignores this (content-
+    #: independent). Default measures both code and prose decode.
+    behaviors: Sequence[str] = (CODE_BEHAVIOR, PROSE_BEHAVIOR)
+    #: base short-test lengths (scaled by ``scale``).
+    prefill_tokens: int = 10_000
+    decode_tokens: int = 1_000
+    #: approximate wall-clock budget per phase run (seconds); the short-test
+    #: default is ~10s.
+    duration_s: float = 10.0
+    #: MULTITURN: model a conversation whose context GROWS each turn and is
+    #: re-prefilled. ``turns`` turns, each adding ``turn_growth_tokens`` of
+    #: context. single-shot when False.
+    multiturn: bool = False
+    turns: int = 1
+    turn_growth_tokens: int = 2_000
+    #: COLD prefill: flush KV + hicache and use a fresh randomized prompt before
+    #: each prefill run so no prefix-cache hit shortcuts the measured prefill.
+    cold_prefill: bool = True
+
+    def __post_init__(self):
+        if self.phases not in ("prefill", "decode", "both"):
+            raise ValueError(
+                f"phases must be prefill|decode|both, got {self.phases!r}")
+        if self.concurrency < 1:
+            raise ValueError(f"concurrency must be >= 1, got {self.concurrency}")
+        if self.scale <= 0:
+            raise ValueError(f"scale must be > 0, got {self.scale}")
+        bad = [b for b in self.behaviors if b not in (CODE_BEHAVIOR, PROSE_BEHAVIOR)]
+        if bad:
+            raise ValueError(f"unknown behaviors: {bad}")
+        if self.multiturn and self.turns < 1:
+            raise ValueError(f"multiturn turns must be >= 1, got {self.turns}")
+
+    def scaled_prefill_tokens(self) -> int:
+        return max(1, int(round(self.prefill_tokens * self.scale)))
+
+    def scaled_decode_tokens(self) -> int:
+        return max(1, int(round(self.decode_tokens * self.scale)))
+
+    def expand(self) -> List[dict]:
+        """Concrete ordered list of run units. Each unit is a dict:
+          {phase: "prefill"|"decode", behavior, prompt_tokens, decode_tokens,
+           concurrency, cold, turn (multiturn only)}.
+        PREFILL emits ONE unit (behavior "any" — content-independent); DECODE
+        emits one unit per behavior. Multiturn expands into ``turns`` units with
+        growing prefill context, each preceded by a re-prefill."""
+        prefill_tok = self.scaled_prefill_tokens()
+        decode_tok = self.scaled_decode_tokens()
+        units: List[dict] = []
+
+        def _turns_iter():
+            if not self.multiturn:
+                yield 0, prefill_tok
+                return
+            ctx = prefill_tok
+            for turn in range(self.turns):
+                yield turn, ctx
+                ctx += self.turn_growth_tokens  # context GROWS -> re-prefill
+
+        if self.phases in ("prefill", "both"):
+            for turn, ctx in _turns_iter():
+                units.append({
+                    "phase": "prefill",
+                    "behavior": "any",          # content-independent
+                    "prompt_tokens": ctx,
+                    "decode_tokens": 0,
+                    "concurrency": self.concurrency,
+                    "cold": self.cold_prefill,
+                    "turn": turn,
+                })
+        if self.phases in ("decode", "both"):
+            for behavior in self.behaviors:
+                for turn, ctx in _turns_iter():
+                    units.append({
+                        "phase": "decode",
+                        "behavior": behavior,
+                        "prompt_tokens": ctx,
+                        "decode_tokens": decode_tok,
+                        "concurrency": self.concurrency,
+                        # decode re-prefills its growing context each turn but
+                        # the measured window is decode; only prefill units are
+                        # marked cold (they own the flush).
+                        "cold": self.cold_prefill and self.phases == "decode",
+                        "turn": turn,
+                    })
+        return units
+
+
+#: The endpoints a cold-prefill / benchmark flush hits on the target server.
+CACHE_FLUSH_ENDPOINTS = ("/flush_cache", "/clear_hicache_storage_backend")
+
+
+def cache_flush_warning(
+    will_flush: bool, target_running_server: bool
+) -> dict:
+    """Decide whether the UI must warn before a cache flush, and whether the
+    confirmation is MANDATORY (#150, the user's latest point).
+
+    A flush wipes KV + hierarchical cache — any context a user wanted to keep
+    is lost. So:
+      * targeting a RUNNING (production) server -> confirmation is MANDATORY
+        (a blocking confirm the user must accept),
+      * a FRESH measurement server we spawned -> informative warning only
+        (nothing precious to lose), non-blocking.
+      * not flushing at all -> no warning.
+
+    Returns ``{"warn", "mandatory", "message", "endpoints"}``; the UI enforces
+    the gate (blocks the action until confirmed when ``mandatory``)."""
+    if not will_flush:
+        return {"warn": False, "mandatory": False, "message": "",
+                "endpoints": []}
+    if target_running_server:
+        msg = ("Cache will be cleared — context you may want to keep is lost. "
+               "This targets a RUNNING server. Continue?")
+        return {"warn": True, "mandatory": True, "message": msg,
+                "endpoints": list(CACHE_FLUSH_ENDPOINTS)}
+    msg = ("Cache will be cleared on this fresh measurement server before the "
+           "cold-prefill run (nothing in production is affected).")
+    return {"warn": True, "mandatory": False, "message": msg,
+            "endpoints": list(CACHE_FLUSH_ENDPOINTS)}
+
+
 def run_measurement(config: MeasurementConfig) -> MeasurementResult:
     """Boot -> measure -> teardown. The reusable one-call entry point."""
     harness = EnergyHarness(config)
@@ -916,6 +1491,40 @@ def run_measurement(config: MeasurementConfig) -> MeasurementResult:
 # ---------------------------------------------------------------------------
 # Reporting helpers.
 # ---------------------------------------------------------------------------
+
+
+def _work_per_watt_rel(
+    shares: Sequence[Optional[float]], j_per_token: Sequence[float]
+) -> List[Optional[float]]:
+    """RELATIVE work-per-watt efficiency per card (the coordinator's column).
+
+    Under pure TP every card contributes to every token at similar wattage, so
+    raw J/token hides which card is the efficient workhorse. Normalizing by the
+    WORK each card does — its compute-share from ``--rank-tp-ratio`` — exposes
+    it:
+
+        efficiency_i = compute_share_i / j_per_token_i     (work per energy)
+
+    Within one (workload, bucket) row every card shares the same decode window
+    and total-token count, so ``j_per_token_i`` is proportional to that card's
+    average watts; hence ``share / j_per_token`` and ``share / watts`` give the
+    IDENTICAL relative ordering (the coordinator's "or equivalently J/tok ÷
+    share"). The result is scaled so the LEAST-efficient card reads ``1.0x``
+    and more-efficient cards read higher (e.g. the 5090 ~2.49x in prefill,
+    ~1.78x in decode vs the 3080s on this rig). Cards without a known share
+    (even/single-card configs) return ``None``."""
+    eff: List[Optional[float]] = []
+    for i, jt in enumerate(j_per_token):
+        sh = shares[i] if i < len(shares) else None
+        if sh is None or jt <= 0:
+            eff.append(None)
+        else:
+            eff.append(sh / jt)
+    valid = [e for e in eff if e is not None and e > 0]
+    if not valid:
+        return [None] * len(j_per_token)
+    base = min(valid)  # least-efficient card -> 1.0x
+    return [(e / base if e is not None and base > 0 else None) for e in eff]
 
 
 def summarize(result: MeasurementResult, price_ct_per_kwh: float = 30.0) -> str:
@@ -986,26 +1595,39 @@ def summarize(result: MeasurementResult, price_ct_per_kwh: float = 30.0) -> str:
 
     def per_card_block(title, jtok_list, watt_list):
         b = ["", title]
+        b.append("  raw J/tok is the honest per-TOTAL-token number, but it HIDES "
+                 "efficiency: under TP every card")
+        b.append("  contributes to every token at similar wattage, so a big fast "
+                 "card and an old slow one look equal.")
+        b.append("  wpw(rel) = (compute_share / J-per-token) normalized so the "
+                 "LEAST-efficient card = 1.0x — it")
+        b.append("  divides each card's energy by the WORK it actually does "
+                 "(its --rank-tp-ratio share).")
         pch = (f"{'workload':8s} {'bs':>3s} {'card':22s} {'share':>6s} "
-               f"{'W':>6s} {'J/tok':>9s} {'kWh/1M':>9s} {'ct/1M':>9s}")
+               f"{'W':>6s} {'J/tok':>9s} {'kWh/1M':>9s} {'ct/1M':>9s} "
+               f"{'wpw(rel)':>9s}")
         b.append(pch)
         b.append("-" * len(pch))
         for m in result.measurements:
             jl, wl2 = jtok_list(m), watt_list(m)
+            rel = _work_per_watt_rel(shares, jl)
             for i, name in enumerate(m.gpu_names or names):
                 sh = shares[i] if i < len(shares) and shares[i] is not None else None
                 jt = jl[i] if i < len(jl) else 0.0
                 w = wl2[i] if i < len(wl2) else 0.0
+                rl = rel[i] if i < len(rel) else None
                 b.append(
                     f"{m.workload:8s} {m.bucket:3d} {name[:22]:22s} "
                     f"{(f'{sh*100:.0f}%' if sh is not None else '  —'):>6s} "
-                    f"{w:6.0f} {jt:9.3f} {jt/3.6:9.3f} {ct1m(jt):9.3f}")
+                    f"{w:6.0f} {jt:9.3f} {jt/3.6:9.3f} {ct1m(jt):9.3f} "
+                    f"{(f'{rl:.2f}x' if rl is not None else '  —'):>9s}")
             tot_j = (sum(m.per_card_j_per_prefill_token) if 'PREFILL' in title
                      else sum(m.per_card_j_per_decode_token))
             tot_w = (m.avg_prefill_watts if 'PREFILL' in title else m.avg_decode_watts)
             b.append(
                 f"{m.workload:8s} {m.bucket:3d} {'TOTAL (rig)':22s} {'100%':>6s} "
-                f"{tot_w:6.0f} {tot_j:9.3f} {tot_j/3.6:9.3f} {ct1m(tot_j):9.3f}")
+                f"{tot_w:6.0f} {tot_j:9.3f} {tot_j/3.6:9.3f} {ct1m(tot_j):9.3f} "
+                f"{'—':>9s}")
         return b
 
     lines += per_card_block(

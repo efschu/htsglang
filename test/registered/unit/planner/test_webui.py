@@ -254,6 +254,37 @@ class TestHttpRoundTrip(WebUIFixture):
         issue = self._post("/api/issue", self._payload(kind="results"))
         self.assertTrue(issue["ok"])
 
+    def test_scenario_and_flush_routes(self):
+        # #150 scenario expansion + cache-flush gate over real HTTP.
+        d = self._post("/api/scenario", {
+            "phases": "both", "concurrency": 2, "cold_prefill": True,
+            "target_running_server": True})
+        self.assertTrue(d["ok"])
+        self.assertTrue(d["cache_flush_warning"]["mandatory"])  # running server
+        self.assertEqual(d["summary"]["concurrency"], 2)
+        w = self._post("/api/cache_flush_warning", {
+            "will_flush": True, "target_running_server": False})
+        self.assertTrue(w["warn"])
+        self.assertFalse(w["mandatory"])            # fresh server = informative
+        # live scrape of a nonexistent target fails gracefully (no raise).
+        live = self._post("/api/live", {"target": "127.0.0.1:1"})
+        self.assertFalse(live["ok"])
+        self.assertIn("error", live)
+
+
+class TestEnergyRoutePayloads(CustomTestCase):
+    """The energy route adapters, called directly (no HTTP)."""
+
+    def test_scenario_validation_error_is_carried(self):
+        d = webui.scenario_payload({"phases": "nonsense"})
+        self.assertFalse(d["ok"])
+        self.assertIn("phases", d["error"])
+
+    def test_index_has_energy_tab(self):
+        self.assertIn("view_energy", webui.INDEX_HTML)
+        self.assertIn("/api/gpu_state", webui.INDEX_HTML)
+        self.assertIn("previewScenario", webui.INDEX_HTML)
+
 
 if __name__ == "__main__":
     unittest.main()
