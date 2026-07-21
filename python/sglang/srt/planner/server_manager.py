@@ -537,6 +537,7 @@ class SglangSupervisor:
         self.state: str = _STATE_STOPPED
         self._pgid: Optional[int] = None
         self._start_time: Optional[float] = None
+        self._boot_deadline: Optional[float] = None
         self._log_path: Optional[str] = None
         self._log_file = None
         self._busy: bool = False
@@ -650,10 +651,37 @@ class SglangSupervisor:
         self._start_time = time.time()
         self.state = _STATE_BOOTING
         self._error_detail = None
+        # Deadline for the PASSIVE (poll-driven) readiness path below, so a boot
+        # that never comes up eventually flips to error instead of BOOTING
+        # forever when wait_ready=False.
+        self._boot_deadline = time.time() + ready_timeout_s
 
         if wait_ready:
             self._wait_ready(ready_timeout_s, poll_interval_s)
         return self.status()
+
+    def _poll_ready_if_booting(self) -> None:
+        """Passive readiness probe for the poll-driven UI. ``start(wait_ready=
+        False)`` returns immediately in BOOTING so the dashboard stays
+        responsive; each ``status()`` poll then cheaply probes the server and
+        flips BOOTING -> READY once it answers. Without this the state would
+        never leave BOOTING even though the server is up and serving."""
+        if self.state != _STATE_BOOTING or not self.is_running() or self.settings is None:
+            return
+        try:
+            with urllib.request.urlopen(
+                self._base_url() + self._readiness_path, timeout=1
+            ) as r:
+                if r.status == 200:
+                    self.state = _STATE_READY
+                    return
+        except Exception:
+            pass
+        if self._boot_deadline is not None and time.time() > self._boot_deadline:
+            self.state = _STATE_ERROR
+            self._error_detail = (
+                "server did not become ready before the boot deadline "
+                f"({self._readiness_path} never returned 200); see log tail")
 
     def _base_url(self) -> str:
         s = self.settings
@@ -806,6 +834,7 @@ class SglangSupervisor:
 
     def status(self) -> dict:
         self._refresh_state()
+        self._poll_ready_if_booting()
         pid = self.proc.pid if self.proc is not None else None
         uptime = (time.time() - self._start_time
                   if self._start_time is not None and self.is_running() else None)
