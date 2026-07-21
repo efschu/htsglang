@@ -408,6 +408,11 @@ class LaunchSettings:
     port: int = 30000
     trust_remote_code: bool = True
     extra_flags: List[str] = dataclasses.field(default_factory=list)
+    #: Extra LAUNCH environment variables applied ON TOP of the supervisor's
+    #: defaults (a profile's ``flags.profile_env`` mapping: SGLANG_UNEVEN_*,
+    #: LD_LIBRARY_PATH, ...). Profile values WIN over the defaults so a
+    #: launched profile matches its reference command exactly.
+    extra_env: Dict[str, str] = dataclasses.field(default_factory=dict)
     python_exe: str = sys.executable
 
     # -- validation ------------------------------------------------------
@@ -580,6 +585,11 @@ class SglangSupervisor:
             existing = env.get("LD_LIBRARY_PATH", "")
             env["LD_LIBRARY_PATH"] = os.pathsep.join(
                 ld + ([existing] if existing else []))
+        # Profile-carried launch env LAST so it wins over the defaults (the
+        # generated profiles pin LD_LIBRARY_PATH / PYTHONPATH / SGLANG_UNEVEN_*
+        # exactly as the validated reference command does).
+        for k, v in (getattr(settings, "extra_env", None) or {}).items():
+            env[str(k)] = str(v)
         return env
 
     # -- NVML helpers (injectable) --------------------------------------

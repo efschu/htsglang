@@ -239,6 +239,28 @@ class TestLaunchSettings(unittest.TestCase):
         self.assertEqual(
             s.resolved_model_path(), "/models/Repo-GGUF/model-Q4_K_M.gguf")
 
+    def test_extra_env_wins_over_supervisor_defaults(self):
+        # A profile's launch env (flags.profile_env) must override the
+        # supervisor defaults so a launched profile matches its reference
+        # command exactly (PYTHONPATH / LD_LIBRARY_PATH / SGLANG_UNEVEN_*).
+        from sglang.srt.planner.server_manager import SglangSupervisor
+
+        sup = SglangSupervisor(nvml=object())
+        s = LaunchSettings(
+            model_path="/m",
+            extra_env={"SGLANG_UNEVEN_DCP": "1", "PYTHONPATH": "/custom"},
+        )
+        env = sup._build_env(s)
+        self.assertEqual(env["SGLANG_UNEVEN_DCP"], "1")
+        self.assertEqual(env["PYTHONPATH"], "/custom")
+
+    def test_no_extra_env_keeps_default_behavior(self):
+        from sglang.srt.planner.server_manager import SglangSupervisor
+
+        sup = SglangSupervisor(nvml=object())
+        env = sup._build_env(LaunchSettings(model_path="/m"))
+        self.assertIn("PYTHONPATH", env)
+
 
 # ===========================================================================
 # Supervisor lifecycle with a FAKE child (never a real sglang boot).

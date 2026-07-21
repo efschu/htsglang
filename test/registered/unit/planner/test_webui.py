@@ -739,19 +739,33 @@ class _RunningFakeSupervisor(_FakeSupervisor):
         self.settings = self._S()
 
 
+def _reset_landing_state():
+    webui._LANDING_SNAPSHOT_STATE = None
+    webui._LANDING_TARGET_KEY = None
+    webui._DETECTED_ENDPOINT = None
+
+
 class TestLandingSnapshotRoute(CustomTestCase):
     def setUp(self):
         self.fake = _FakeSupervisor()
         webui._set_supervisor(self.fake)
+        _reset_landing_state()
 
     def tearDown(self):
         webui._set_supervisor(None)
+        _reset_landing_state()
 
     def test_no_server_is_graceful(self):
-        d = webui.landing_snapshot_payload()
+        # Detection mocked out: this box may genuinely have a hand-started
+        # server on :30000 and the test must not depend on it.
+        with mock.patch.object(
+            webui, "_detect_external_endpoint", return_value=None
+        ):
+            d = webui.landing_snapshot_payload()
         self.assertTrue(d["ok"])            # NOT an error
         self.assertFalse(d["running"])
         self.assertIsNone(d["snapshot"])
+        self.assertIsNone(d["target"])
 
     def test_running_server_returns_snapshot(self):
         webui._set_supervisor(_RunningFakeSupervisor())
@@ -763,6 +777,7 @@ class TestLandingSnapshotRoute(CustomTestCase):
         self.assertTrue(d["ok"])
         self.assertTrue(d["running"])
         self.assertIn("gpus", d["snapshot"])
+        self.assertEqual(d["target"]["kind"], "managed")
         m.assert_called_once()
 
 
@@ -845,7 +860,10 @@ class TestDashboardV2HttpRoutes(WebUIFixture):
             return json.loads(r.read())
 
     def test_live_snapshot_no_server(self):
-        d = self._get("/api/live_snapshot")
+        with mock.patch.object(
+            webui, "_detect_external_endpoint", return_value=None
+        ):
+            d = self._get("/api/live_snapshot")
         self.assertTrue(d["ok"])
         self.assertFalse(d["running"])
 
@@ -876,6 +894,461 @@ class TestDashboardV2HttpRoutes(WebUIFixture):
         self.assertIn("http-cfg", [p["name"] for p in got["saved"]])
         rm = self._req("DELETE", "/api/config_profiles", {"name": "http-cfg"})
         self.assertTrue(rm["deleted"])
+
+
+# ===========================================================================
+# Dashboard v3: monitor-target resolution (the TPS-bug regression suite),
+# profile env/argv launch wiring, benchmark suite (#151) + GitHub share
+# (#152) routes. Everything mocked -- no GPU, no server boot, no network.
+# ===========================================================================
+
+
+class TestMonitorTargetResolution(CustomTestCase):
+    """Regression suite for the never-rendering-TPS bug: the landing snapshot
+    previously gated on ``sup.is_running()`` and returned ``running: False``
+    for every hand-started server. It must now attach to ANY reachable
+    server: explicit endpoint > managed instance > auto-detected."""
+
+    def setUp(self):
+        self.fake = _FakeSupervisor()
+        webui._set_supervisor(self.fake)
+        _reset_landing_state()
+
+    def tearDown(self):
+        webui._set_supervisor(None)
+        _reset_landing_state()
+
+    def _snap(self, rates=None):
+        return (
+            {"ok": True, "gpus": [], "rates": rates, "launch_config": None,
+             "server_info": {"server_info": {"model_path": "/m"}}},
+            {"t": 1.0, "counters": {}},
+        )
+
+    def test_external_hand_started_server_yields_rates(self):
+        # THE TPS regression test: supervisor NOT running, a hand-started
+        # server is auto-detected -> a snapshot WITH rates comes back
+        # (previously: running False / snapshot None on every poll).
+        rates = {"decode_tok_s": 51.0, "prefill_tok_s": 12.5}
+        with mock.patch.object(
+            webui, "_detect_external_endpoint",
+            return_value="http://127.0.0.1:30000",
+        ), mock.patch(
+            "sglang.srt.planner.live_metrics.snapshot",
+            return_value=self._snap(rates),
+        ) as m:
+            d = webui.landing_snapshot_payload()
+        self.assertTrue(d["ok"])
+        self.assertTrue(d["running"])
+        self.assertEqual(d["snapshot"]["rates"]["decode_tok_s"], 51.0)
+        self.assertEqual(d["snapshot"]["rates"]["prefill_tok_s"], 12.5)
+        self.assertEqual(d["target"]["kind"], "detected")
+        self.assertFalse(d["target"]["managed"])
+        # the URL string (not the supervisor) was handed to live_metrics.
+        self.assertEqual(m.call_args[0][0], "http://127.0.0.1:30000")
+
+    def test_explicit_endpoint_beats_managed(self):
+        webui._set_supervisor(_RunningFakeSupervisor())
+        with mock.patch(
+            "sglang.srt.planner.live_metrics.snapshot",
+            return_value=self._snap(),
+        ) as m:
+            d = webui.landing_snapshot_payload({"endpoint": "127.0.0.1:30100"})
+        self.assertEqual(d["target"]["kind"], "explicit")
+        self.assertEqual(m.call_args[0][0], "http://127.0.0.1:30100")
+
+    def test_managed_beats_detected(self):
+        sup = _RunningFakeSupervisor()
+        webui._set_supervisor(sup)
+        with mock.patch.object(
+            webui, "_detect_external_endpoint"
+        ) as det, mock.patch(
+            "sglang.srt.planner.live_metrics.snapshot",
+            return_value=self._snap(),
+        ) as m:
+            d = webui.landing_snapshot_payload()
+        det.assert_not_called()
+        self.assertEqual(d["target"]["kind"], "managed")
+        self.assertTrue(d["target"]["managed"])
+        self.assertIs(m.call_args[0][0], sup)
+
+    def test_nothing_reachable_is_clean_placeholder(self):
+        with mock.patch.object(
+            webui, "_detect_external_endpoint", return_value=None
+        ):
+            d = webui.landing_snapshot_payload()
+        self.assertTrue(d["ok"])
+        self.assertFalse(d["running"])
+        self.assertIsNone(d["snapshot"])
+        self.assertIsNone(d["target"])
+
+    def test_target_switch_resets_delta_state(self):
+        # Counters from two different servers must never be subtracted: the
+        # second (switched) poll must start with prev_state=None.
+        with mock.patch(
+            "sglang.srt.planner.live_metrics.snapshot",
+            return_value=self._snap(),
+        ) as m:
+            webui.landing_snapshot_payload({"endpoint": "127.0.0.1:30000"})
+            self.assertIsNotNone(webui._LANDING_SNAPSHOT_STATE)
+            webui.landing_snapshot_payload({"endpoint": "127.0.0.1:30100"})
+        self.assertIsNone(m.call_args_list[1].kwargs["prev_state"])
+
+    def test_detect_endpoint_payload_probes_ports(self):
+        with mock.patch.object(
+            webui, "_probe_sglang",
+            side_effect=lambda u, timeout=0.8: u.endswith(":30100"),
+        ):
+            d = webui.detect_endpoint_payload()
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["endpoint"], "http://127.0.0.1:30100")
+        self.assertIn(30100, d["probed"])
+
+
+class TestProfileLaunchWiring(CustomTestCase):
+    """flags.py env carriage through the launch path: a launched profile must
+    match the reference command exactly (argv AND env)."""
+
+    def setUp(self):
+        self.fake = _FakeSupervisor()
+        webui._set_supervisor(self.fake)
+
+    def tearDown(self):
+        webui._set_supervisor(None)
+
+    def test_env_and_profile_argv_reach_the_supervisor(self):
+        d = webui.server_start_payload({
+            "model_path": "/m", "tp_size": 1, "port": 31000,
+            "env": {"SGLANG_UNEVEN_DCP": "1", "HF_TOKEN": "supersecret"},
+            "profile_argv": ["--model-path", "/m", "--tp-size", "1"],
+        })
+        self.assertTrue(d["ok"], d.get("error"))
+        st = self.fake.started
+        self.assertEqual(st.extra_env["SGLANG_UNEVEN_DCP"], "1")
+        self.assertEqual(st.extra_env["HF_TOKEN"], "supersecret")
+        # exact profile argv: interpreter -m sglang.launch_server + flag list.
+        self.assertEqual(d["launch_command"][1:3], ["-m", "sglang.launch_server"])
+        self.assertIn("--model-path", d["launch_command"])
+        # the echoed env redacts credential-suffixed names, keeps knobs exact.
+        self.assertEqual(d["env_applied"]["HF_TOKEN"], "<redacted>")
+        self.assertEqual(d["env_applied"]["SGLANG_UNEVEN_DCP"], "1")
+        self.assertNotIn("supersecret", json.dumps(d))
+
+    def test_launch_without_env_stays_default(self):
+        d = webui.server_start_payload({"model_path": "/m", "tp_size": 1})
+        self.assertTrue(d["ok"], d.get("error"))
+        self.assertEqual(self.fake.started.extra_env, {})
+        self.assertEqual(d["env_applied"], {})
+
+    def test_generated_profiles_carry_argv_and_launch_env(self):
+        d = webui.config_profiles_get({
+            "model_cfg": _V2_CONFIG,
+            "gpus": [
+                {"name": "NVIDIA GeForce RTX 5090", "total_mib": 32607},
+                {"name": "NVIDIA GeForce RTX 3080", "total_mib": 20480},
+                {"name": "NVIDIA GeForce RTX 3080", "total_mib": 20480},
+            ],
+        })
+        self.assertTrue(d["ok"])
+        self.assertGreater(len(d["generated"]), 0)
+        for p in d["generated"]:
+            self.assertIsInstance(p["argv"], list, p["name"])
+            self.assertIsInstance(p["launch_env"], dict, p["name"])
+        uneven = [p for p in d["generated"] if "uneven" in p["kind"]]
+        self.assertTrue(uneven, [p["kind"] for p in d["generated"]])
+        # spec+DCP is only supported with the env pair -- it must be carried.
+        self.assertEqual(uneven[0]["launch_env"].get("SGLANG_UNEVEN_DCP"), "1")
+
+
+class TestBenchRoutes(CustomTestCase):
+    """#151 -- probe/gating + the streaming run route (bench_suite mocked)."""
+
+    def _caps(self, **kw):
+        from sglang.srt.planner import bench_suite
+
+        d = dict(chat_template_basic=True, tool_parser=None,
+                 reasoning_parser="qwen3", streaming=True, spec_decode=False,
+                 spec_mode="off", max_model_len=32768, model="m")
+        d.update(kw)
+        return bench_suite.Capabilities(**d)
+
+    def test_probe_reports_capabilities_and_gates(self):
+        with mock.patch(
+            "sglang.srt.planner.bench_suite.probe_capabilities",
+            return_value=self._caps(),
+        ) as m:
+            d = webui.bench_probe_payload({"endpoint": "127.0.0.1:30000"})
+        self.assertTrue(d["ok"])
+        m.assert_called_once()
+        self.assertEqual(m.call_args[0][0], "http://127.0.0.1:30000")
+        by_id = {t["test_id"]: t for t in d["tests"]}
+        self.assertIsNone(by_id[1]["gate_status"])            # runnable
+        self.assertEqual(by_id[2]["gate_status"], "blocked")  # no tool parser
+        self.assertEqual(by_id[7]["gate_status"], "skip")     # spec off
+        self.assertIn("functional", d["presets"])
+        self.assertEqual(d["capabilities"]["model"], "m")
+
+    def test_probe_without_endpoint_returns_catalog_only(self):
+        with mock.patch(
+            "sglang.srt.planner.bench_suite.probe_capabilities"
+        ) as m:
+            d = webui.bench_probe_payload({})
+        m.assert_not_called()
+        self.assertTrue(d["ok"])
+        self.assertIsNone(d["capabilities"])
+        self.assertEqual(len(d["tests"]), 16)
+
+    def test_run_events_stream_per_test(self):
+        results = [
+            {"test_id": 1, "label": "Basic", "status": "pass",
+             "metric": {"name": "latency", "value": 1.2, "unit": "s"},
+             "detail": {}, "deps": {}},
+            {"test_id": 2, "label": "Tool", "status": "blocked",
+             "metric": {"name": "none", "value": None}, "detail": {},
+             "deps": {}, "reason": "no tool parser"},
+        ]
+
+        def fake_run(endpoint, model, selected=None, capabilities=None,
+                     preset=None, force=False):
+            yield from results
+
+        with mock.patch(
+            "sglang.srt.planner.bench_suite.run_suite", side_effect=fake_run
+        ):
+            evs = list(webui.bench_run_events(
+                {"endpoint": "127.0.0.1:30000", "model": "m",
+                 "selected": [1, 2]}))
+        self.assertEqual(evs[0]["event"], "start")
+        got = [e["result"]["test_id"] for e in evs if e["event"] == "result"]
+        self.assertEqual(got, [1, 2])
+        self.assertEqual(evs[-1]["event"], "done")
+        self.assertEqual(evs[-1]["counts"], {"pass": 1, "blocked": 1})
+
+    def test_run_requires_endpoint(self):
+        evs = list(webui.bench_run_events({"model": "m"}))
+        self.assertEqual(evs[0]["event"], "error")
+
+    def test_run_passes_capabilities_and_force_through(self):
+        # Gating input: client-side probed capabilities are handed to
+        # run_suite (no re-probe), and the force flag reaches it.
+        captured = {}
+
+        def fake_run(endpoint, model, selected=None, capabilities=None,
+                     preset=None, force=False):
+            captured["caps"] = capabilities
+            captured["force"] = force
+            return iter(())
+
+        with mock.patch(
+            "sglang.srt.planner.bench_suite.run_suite", side_effect=fake_run
+        ):
+            list(webui.bench_run_events({
+                "endpoint": "e", "model": "m", "selected": [1],
+                "capabilities": self._caps(
+                    tool_parser="qwen3_coder").to_json(),
+                "force": True,
+            }))
+        self.assertEqual(captured["caps"].tool_parser, "qwen3_coder")
+        self.assertTrue(captured["force"])
+
+    def test_browser_never_calls_the_model(self):
+        # Backend-driven by design: the page never POSTs to the model API.
+        self.assertNotIn("chat/completions", webui.INDEX_HTML)
+        self.assertIn("/api/bench_run", webui.INDEX_HTML)
+
+
+class TestShareRoutes(CustomTestCase):
+    """#152 -- preview-then-confirm; the PAT never persists, never echoes."""
+
+    TOKEN = "ghp_TESTSECRETTOKEN123"
+
+    def test_preview_renders_exact_markdown(self):
+        d = webui.share_preview_payload({"payload": {
+            "model": "Qwen3.6-27B",
+            "command": {
+                "argv": ["python", "-m", "sglang.launch_server", "--tp", "3"],
+                "env": {"SGLANG_UNEVEN_DCP": "1", "HF_TOKEN": "hfsecret"},
+            },
+            "metrics": {"decode_tok_s": 51.0},
+        }})
+        self.assertTrue(d["ok"])
+        self.assertIn("Start command (exact)", d["report"])
+        self.assertIn("SGLANG_UNEVEN_DCP=1", d["report"])   # knob stays exact
+        self.assertNotIn("hfsecret", d["report"])           # credential redacted
+        self.assertTrue(d["default_repo"])
+
+    def test_submit_refused_without_confirmation_no_network(self):
+        api = mock.Mock()
+        with mock.patch(
+            "sglang.srt.planner.github_share._default_api", api
+        ):
+            d = webui.share_submit_payload(
+                {"report": "r", "token": self.TOKEN, "confirmed": False})
+        self.assertFalse(d["ok"])
+        self.assertIn("confirm", d["error"].lower())
+        api.assert_not_called()
+        self.assertNotIn(self.TOKEN, json.dumps(d))
+
+    def test_submit_confirmed_calls_github_never_echoes_pat(self):
+        with mock.patch(
+            "sglang.srt.planner.github_share.submit",
+            return_value={"action": "created", "number": 7,
+                          "url": "https://github.com/x/y/issues/7"},
+        ) as m:
+            d = webui.share_submit_payload({
+                "report": "r", "token": self.TOKEN, "confirmed": True,
+                "repo": "user/repo", "existing_issue": "",
+            })
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["number"], 7)
+        self.assertEqual(d["action"], "created")
+        self.assertTrue(m.call_args.kwargs["confirmed"])
+        self.assertEqual(m.call_args.kwargs["repo"], "user/repo")
+        self.assertNotIn(self.TOKEN, json.dumps(d))
+
+    def test_submit_error_stays_redacted(self):
+        from sglang.srt.planner.github_share import GitHubShareError
+
+        with mock.patch(
+            "sglang.srt.planner.github_share.submit",
+            side_effect=GitHubShareError("HTTP 401 <redacted-token>"),
+        ):
+            d = webui.share_submit_payload(
+                {"report": "r", "token": self.TOKEN, "confirmed": True})
+        self.assertFalse(d["ok"])
+        self.assertNotIn(self.TOKEN, d["error"])
+
+    def test_submit_requires_report(self):
+        d = webui.share_submit_payload(
+            {"token": self.TOKEN, "confirmed": True})
+        self.assertFalse(d["ok"])
+        self.assertNotIn(self.TOKEN, json.dumps(d))
+
+
+class TestV3HttpRoutes(WebUIFixture):
+    """The v3 routes over a real in-process HTTP round-trip, including the
+    SSE stream of /api/bench_run."""
+
+    def setUp(self):
+        self.fake = _FakeSupervisor()
+        webui._set_supervisor(self.fake)
+        _reset_landing_state()
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
+        self.port = self.srv.server_address[1]
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        webui._set_supervisor(None)
+        _reset_landing_state()
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.thread.join(timeout=5)
+
+    def _post_raw(self, path, obj):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(obj).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(req, timeout=30)
+
+    def test_bench_run_streams_sse(self):
+        results = [
+            {"test_id": 1, "label": "Basic", "status": "pass",
+             "metric": {"name": "none", "value": None}, "detail": {},
+             "deps": {}},
+            {"test_id": 3, "label": "Streaming", "status": "skip",
+             "metric": {"name": "none", "value": None}, "detail": {},
+             "deps": {}, "reason": "gated"},
+        ]
+
+        def fake_run(endpoint, model, selected=None, capabilities=None,
+                     preset=None, force=False):
+            yield from results
+
+        with mock.patch(
+            "sglang.srt.planner.bench_suite.run_suite", side_effect=fake_run
+        ):
+            with self._post_raw(
+                "/api/bench_run",
+                {"endpoint": "127.0.0.1:30000", "model": "m",
+                 "selected": [1, 3]},
+            ) as r:
+                ctype = r.headers.get("Content-Type")
+                body = r.read().decode()
+        self.assertEqual(ctype, "text/event-stream")
+        frames = [
+            json.loads(f[len("data: "):])
+            for f in body.split("\n\n") if f.startswith("data: ")
+        ]
+        events = [f["event"] for f in frames]
+        self.assertEqual(events, ["start", "result", "result", "done"])
+        self.assertEqual(frames[1]["result"]["status"], "pass")
+        self.assertEqual(frames[2]["result"]["status"], "skip")
+
+    def test_bench_probe_route(self):
+        with self._post_raw("/api/bench_probe", {}) as r:
+            d = json.loads(r.read())
+        self.assertTrue(d["ok"])
+        self.assertEqual(len(d["tests"]), 16)
+
+    def test_share_preview_route(self):
+        with self._post_raw(
+            "/api/share_preview",
+            {"payload": {"model": "M", "metrics": {"decode_tok_s": 1.0}}},
+        ) as r:
+            d = json.loads(r.read())
+        self.assertTrue(d["ok"])
+        self.assertIn("Measured metrics", d["report"])
+
+    def test_detect_endpoint_route(self):
+        with mock.patch.object(webui, "_probe_sglang", return_value=False):
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/api/detect_endpoint", timeout=10
+            ) as r:
+                d = json.loads(r.read())
+        self.assertTrue(d["ok"])
+        self.assertIsNone(d["endpoint"])
+
+    def test_live_snapshot_route_accepts_endpoint_query(self):
+        fake_snap = (
+            {"ok": True, "gpus": [], "rates": {"decode_tok_s": 42.0}},
+            {"t": 1.0},
+        )
+        with mock.patch(
+            "sglang.srt.planner.live_metrics.snapshot", return_value=fake_snap
+        ) as m:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/api/live_snapshot"
+                "?endpoint=127.0.0.1:30777",
+                timeout=10,
+            ) as r:
+                d = json.loads(r.read())
+        self.assertTrue(d["running"])
+        self.assertEqual(d["target"]["kind"], "explicit")
+        self.assertEqual(d["snapshot"]["rates"]["decode_tok_s"], 42.0)
+        self.assertEqual(m.call_args[0][0], "http://127.0.0.1:30777")
+
+
+class TestV3IndexMarkers(CustomTestCase):
+    def test_new_ui_markers_present(self):
+        for token in (
+            "view_bench", "/api/bench_probe", "/api/bench_run",
+            "/api/share_preview", "/api/share_submit", "/api/detect_endpoint",
+            "land_endpoint", "detectLandingEndpoint", "segbar",
+            "renderStartConfig", "normalizeStartConfig", "profile_env_box",
+            "renderProfileLaunch", "never persisted, never logged",
+        ):
+            self.assertIn(token, webui.INDEX_HTML, token)
+
+    def test_one_placement_renderer_two_callers(self):
+        # ONE renderer feeds both the landing (running) and the runner
+        # (prospective) placement views.
+        self.assertEqual(
+            webui.INDEX_HTML.count("function renderPlacement"), 1)
+        self.assertGreaterEqual(
+            webui.INDEX_HTML.count("renderPlacement(d.placement)"), 2)
 
 
 if __name__ == "__main__":

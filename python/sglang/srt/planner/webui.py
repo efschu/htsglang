@@ -68,6 +68,12 @@ __all__ = [
     "quality_run_payload",
     "quality_save_payload",
     "quality_shots_payload",
+    "landing_snapshot_payload",
+    "detect_endpoint_payload",
+    "bench_probe_payload",
+    "bench_run_events",
+    "share_preview_payload",
+    "share_submit_payload",
     "serve",
 ]
 
@@ -1205,7 +1211,38 @@ def _launch_settings_from_payload(payload: dict):
         vision=bool(payload.get("vision")),
         port=int(payload.get("port") or 30000),
     )
+    extra_env = payload.get("env")
+    if isinstance(extra_env, dict) and extra_env:
+        # Profile launch env (flags.profile_env): SGLANG_UNEVEN_* pair,
+        # LD_LIBRARY_PATH, PYTHONPATH, ... -- applied by the supervisor ON TOP
+        # of its defaults so a launched profile matches the reference command.
+        ls.extra_env = {str(k): str(v) for k, v in extra_env.items()}
     return ls.validate()
+
+
+def _display_env(settings) -> dict:
+    """The launch env echoed back for DISPLAY, with credential-looking values
+    redacted (a launch env sometimes carries HF_TOKEN)."""
+    from sglang.srt.planner.github_share import _redact_env_value
+
+    env = getattr(settings, "extra_env", None) or {}
+    return {k: _redact_env_value(k, str(v)) for k, v in env.items()}
+
+
+def _argv_from_payload(payload: dict, settings) -> Optional[list]:
+    """The optional argv override: an explicit full ``argv`` wins (test seam);
+    else a ``profile_argv`` flag list (flags.profile_argv) is prefixed with
+    the interpreter so the launched command IS the profile's exact argv."""
+    argv = payload.get("argv")
+    if argv is not None:
+        return list(argv)
+    profile_argv = payload.get("profile_argv")
+    if profile_argv:
+        return [
+            settings.python_exe, "-m", "sglang.launch_server",
+            *[str(a) for a in profile_argv],
+        ]
+    return None
 
 
 def server_start_payload(payload: dict) -> dict:
@@ -1225,15 +1262,21 @@ def server_start_payload(payload: dict) -> dict:
             "REPLACES the single managed instance).",
             "status": sup.status(),
         }
+    argv = _argv_from_payload(payload, settings)
     try:
         status = sup.start(
             settings,
             wait_ready=bool(payload.get("wait_ready", False)),
-            argv=payload.get("argv"),
+            argv=argv,
         )
     except Exception as e:
         return {"ok": False, "error": str(e), "status": sup.status()}
-    return {"ok": True, "launch_command": settings.launch_command(), "status": status}
+    return {
+        "ok": True,
+        "launch_command": argv if argv is not None else settings.launch_command(),
+        "env_applied": _display_env(settings),
+        "status": status,
+    }
 
 
 def server_stop_payload(payload: Optional[dict] = None) -> dict:
@@ -1255,15 +1298,22 @@ def server_restart_payload(payload: dict) -> dict:
     except (ValueError, TypeError) as e:
         return {"ok": False, "error": str(e)}
     sup = _supervisor()
+    argv = _argv_from_payload(payload, settings)
+    kwargs = {"wait_ready": bool(payload.get("wait_ready", False))}
+    if argv is not None:
+        kwargs["argv"] = argv
     try:
-        status = sup.restart(
-            settings, wait_ready=bool(payload.get("wait_ready", False))
-        )
+        status = sup.restart(settings, **kwargs)
     except SupervisorBusyError as e:
         return {"ok": False, "busy": True, "error": str(e), "status": sup.status()}
     except Exception as e:
         return {"ok": False, "error": str(e), "status": sup.status()}
-    return {"ok": True, "launch_command": settings.launch_command(), "status": status}
+    return {
+        "ok": True,
+        "launch_command": argv if argv is not None else settings.launch_command(),
+        "env_applied": _display_env(settings),
+        "status": status,
+    }
 
 
 def server_status_payload(payload: Optional[dict] = None) -> dict:
@@ -1634,8 +1684,18 @@ def _reference_png_bytes() -> Optional[bytes]:
 #: and the client owns the 60s ring buffers.
 _LANDING_SNAPSHOT_STATE = None
 
-#: flashinfer-family attention backends the fork's weightless-KV lane accepts.
-_FLASHINFER_BACKENDS = ("flashinfer", "fa3", "fa4")
+#: Which monitor target the delta state belongs to -- switching targets resets
+#: the delta math (counters from different servers must never be subtracted).
+_LANDING_TARGET_KEY = None
+
+#: Ports probed for a reachable sglang server when neither an explicit
+#: endpoint nor a managed instance exists (the user launches servers BY HAND;
+#: the landing page must attach to them regardless of who started them).
+_MONITOR_DETECT_PORTS = (30000, 30100, 8000)
+
+#: Cache of the last auto-detected endpoint (re-verified first on each poll so
+#: a stable hand-started server is one cheap probe, not a port sweep).
+_DETECTED_ENDPOINT = None
 
 
 def _model_cfg_from_ref(model_ref: str, gguf_choice: Optional[str] = None):
@@ -1688,83 +1748,16 @@ def placement_payload(payload: dict) -> dict:
     return {"ok": True, "placement": result}
 
 
-def _is_uniform_ratio(rtr) -> bool:
-    """True when a rank_tp_ratio value is (or reduces to) an EVEN split. The
-    ``auto`` / ``auto-performance`` / ``capacity`` sentinels may be non-uniform
-    on heterogeneous cards, so they are NOT treated as uniform (no warning)."""
-    if rtr in (None, ""):
-        return True
-    if isinstance(rtr, str):
-        s = rtr.strip()
-        if s in ("auto", "auto-performance", "capacity", "coupled"):
-            return False
-        parts = [p for p in s.replace(" ", "").split(",") if p]
-        try:
-            vals = [int(p) for p in parts]
-        except ValueError:
-            return False
-    elif isinstance(rtr, (list, tuple)):
-        try:
-            vals = [int(x) for x in rtr]
-        except (TypeError, ValueError):
-            return False
-    else:
-        return False
-    return len(set(vals)) <= 1
-
-
-def _cross_field_warnings(settings: dict) -> List[dict]:
-    """The richer cross-field constraints ``flags.resolve`` cannot model on its
-    own (flags.py caveats 1,2,5), surfaced as UI hover warnings. Each item is
-    ``{id, level, message}`` (level: 'error' blocks, 'warn' advises)."""
-    settings = dict(settings or {})
-    out: List[dict] = []
-
-    # (1) weightless-KV fast lane needs a flashinfer backend AND tp == dcp.
-    if settings.get("weightless_kv_fastlane"):
-        ab = str(settings.get("attention_backend") or "").strip()
-        if ab not in _FLASHINFER_BACKENDS:
-            out.append({
-                "id": "weightless_kv_fastlane",
-                "level": "error",
-                "message": "weightless-KV fast lane requires a flashinfer "
-                "attention backend (attention_backend = flashinfer / fa3 / "
-                "fa4); current: " + (ab or "unset") + ".",
-            })
-        tp = int(settings.get("tp_size") or 1)
-        dcp = settings.get("dcp_size")
-        dcp = int(dcp) if dcp else tp
-        if dcp != tp:
-            out.append({
-                "id": "weightless_kv_fastlane",
-                "level": "error",
-                "message": "weightless-KV fast lane requires tp_size == "
-                "dcp_size (got tp_size=" + str(tp) + ", dcp_size="
-                + str(dcp) + ").",
-            })
-
-    # (2/5) rank_kv_ratio only decouples KV ownership under a NON-uniform
-    # rank_tp_ratio; with an even split it is a no-op.
-    rkv = settings.get("rank_kv_ratio")
-    if rkv not in (None, "", "coupled") and _is_uniform_ratio(
-        settings.get("rank_tp_ratio")
-    ):
-        out.append({
-            "id": "rank_kv_ratio",
-            "level": "warn",
-            "message": "rank_kv_ratio only decouples KV-token ownership when "
-            "rank_tp_ratio is NON-uniform; with a uniform / auto-even weight "
-            "split it is a no-op.",
-        })
-    return out
-
-
 def resolve_flags_payload(payload: dict) -> dict:
     """POST /api/resolve_flags {settings, model} -> per-field state JSON.
 
     Wraps ``flags.resolve`` (model-compat greying, mutual-exclusion disable,
-    dependency auto-set, tuple-length errors) and adds the cross-field hover
-    warnings the resolver cannot model."""
+    dependency auto-set, tuple-length errors, and the MACHINE-ENFORCED
+    cross-field constraints -- weightless-backend, dcp+spec, rank-gpu-id
+    budget rule, hicache hybrid layout, ...). The cross-field violations land
+    both on the field (``fields[id].error``) and in a flat ``warnings``
+    summary list so the UI can render them as blocking banners, not hover
+    text."""
     from sglang.srt.planner import flags as flagsmod
 
     settings = payload.get("settings")
@@ -1776,10 +1769,15 @@ def resolve_flags_payload(payload: dict) -> dict:
         fields = flagsmod.resolve(settings, model_cfg)
     except Exception as e:  # pragma: no cover - defensive
         return {"ok": False, "error": str(e)}
+    warnings = [
+        {"id": cid, "level": "error", "message": st["error"]}
+        for cid, st in fields.items()
+        if st.get("error")
+    ]
     return {
         "ok": True,
         "fields": fields,
-        "warnings": _cross_field_warnings(settings),
+        "warnings": warnings,
     }
 
 
@@ -1817,36 +1815,153 @@ def flag_catalog_payload(payload: Optional[dict] = None) -> dict:
     }
 
 
+def _probe_sglang(base_url: str, timeout: float = 0.8) -> bool:
+    """True when ``base_url`` answers 200 on /get_model_info or /metrics --
+    the cheap 'is this an sglang server?' reachability probe (read-only)."""
+    import urllib.request
+
+    for path in ("/get_model_info", "/metrics"):
+        try:
+            with urllib.request.urlopen(
+                base_url.rstrip("/") + path, timeout=timeout
+            ) as r:
+                if r.getcode() == 200:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _detect_external_endpoint(
+    ports=None, host: str = "127.0.0.1", timeout: float = 0.8
+) -> Optional[str]:
+    """Auto-detect a reachable sglang server on the common local ports. The
+    last hit is cached and re-verified FIRST, so a stable hand-started server
+    costs one probe per poll instead of a sweep. Returns a base URL or None."""
+    global _DETECTED_ENDPOINT
+    candidates: List[str] = []
+    if _DETECTED_ENDPOINT:
+        candidates.append(_DETECTED_ENDPOINT)
+    for p in ports or _MONITOR_DETECT_PORTS:
+        url = f"http://{host}:{p}"
+        if url not in candidates:
+            candidates.append(url)
+    for url in candidates:
+        if _probe_sglang(url, timeout=timeout):
+            _DETECTED_ENDPOINT = url
+            return url
+    _DETECTED_ENDPOINT = None
+    return None
+
+
+def detect_endpoint_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/detect_endpoint -> fresh sweep of the common ports (the
+    landing page's 'detect' button). Read-only probes; never boots anything."""
+    ports = list((payload or {}).get("ports") or _MONITOR_DETECT_PORTS)
+    reachable = []
+    for p in ports:
+        url = f"http://127.0.0.1:{p}"
+        if _probe_sglang(url):
+            reachable.append(url)
+    global _DETECTED_ENDPOINT
+    _DETECTED_ENDPOINT = reachable[0] if reachable else None
+    return {
+        "ok": True,
+        "endpoint": reachable[0] if reachable else None,
+        "reachable": reachable,
+        "probed": ports,
+    }
+
+
 def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
-    """GET /api/live_snapshot -> one live_metrics.snapshot of the MANAGED
-    server + local NVML. When no managed server runs, returns a clean
-    ``running: False`` state (no error) so the landing page can show the
-    'start one in the Runner tab' placeholder. The delta ``state`` is kept
-    module-side only (never persisted)."""
+    """GET /api/live_snapshot[?endpoint=...] -> one live_metrics.snapshot of
+    the resolved MONITOR TARGET + local NVML.
+
+    Target resolution (the landing page is DECOUPLED from the supervisor --
+    the user usually launches servers by hand):
+
+      1. an explicit user-entered ``endpoint`` (query param) -- always wins;
+      2. the supervisor-managed instance, when one is running;
+      3. an auto-detected reachable sglang server on the common local ports.
+
+    Only when NONE of the three exists does the page get the clean
+    ``running: False`` placeholder. The response names WHICH target is being
+    monitored and whether it is managed or external; an external target has
+    no LaunchSettings, so live_metrics falls back to /get_server_info for the
+    start config. The delta ``state`` is kept module-side only (never
+    persisted) and is reset whenever the target changes."""
     from sglang.srt.planner import live_metrics
 
-    global _LANDING_SNAPSHOT_STATE
+    global _LANDING_SNAPSHOT_STATE, _LANDING_TARGET_KEY
+    payload = payload or {}
+    explicit = (payload.get("endpoint") or "").strip()
+
     sup = _supervisor()
     try:
-        running = sup.is_running()
+        running_managed = sup.is_running()
     except Exception:
-        running = False
+        running_managed = False
     settings = getattr(sup, "settings", None)
-    if not running or settings is None:
-        _LANDING_SNAPSHOT_STATE = None  # reset delta math for the next boot
-        try:
-            status = sup.status()
-        except Exception:
-            status = None
-        return {"ok": True, "running": False, "snapshot": None, "status": status}
+    try:
+        status = sup.status()
+    except Exception:
+        status = None
+
+    target = None
+    kind = None
+    label = None
+    if explicit:
+        label = explicit if explicit.startswith("http") else "http://" + explicit
+        target = label
+        kind = "explicit"
+    elif running_managed and settings is not None:
+        target = sup
+        kind = "managed"
+        host = getattr(settings, "host", "127.0.0.1") or "127.0.0.1"
+        label = f"http://{host}:{getattr(settings, 'port', '')}"
+    else:
+        det = _detect_external_endpoint()
+        if det:
+            target = det
+            kind = "detected"
+            label = det
+
+    if target is None:
+        _LANDING_SNAPSHOT_STATE = None  # reset delta math for the next target
+        _LANDING_TARGET_KEY = None
+        return {
+            "ok": True,
+            "running": False,
+            "snapshot": None,
+            "target": None,
+            "status": status,
+        }
+
+    key = (kind, label)
+    if key != _LANDING_TARGET_KEY:
+        # Never subtract counters from two different servers.
+        _LANDING_SNAPSHOT_STATE = None
+        _LANDING_TARGET_KEY = key
+    target_info = {
+        "endpoint": label,
+        "kind": kind,
+        "managed": kind == "managed",
+    }
     try:
         snap, new_state = live_metrics.snapshot(
-            sup, prev_state=_LANDING_SNAPSHOT_STATE
+            target, prev_state=_LANDING_SNAPSHOT_STATE
         )
         _LANDING_SNAPSHOT_STATE = new_state
     except Exception as e:  # pragma: no cover - defensive
-        return {"ok": False, "running": True, "error": str(e)}
-    return {"ok": True, "running": True, "snapshot": snap}
+        return {"ok": False, "running": True, "error": str(e),
+                "target": target_info}
+    return {
+        "ok": True,
+        "running": True,
+        "snapshot": snap,
+        "target": target_info,
+        "status": status,
+    }
 
 
 def _profile_store():
@@ -1872,16 +1987,33 @@ def config_profiles_get(payload: Optional[dict] = None) -> dict:
     if not gpus:
         det = detect_hardware()
         gpus = det.get("gpus") or []
+
+    def _prof_json(p) -> dict:
+        # Enrich every profile with its EXACT launch surface: the argv
+        # (flags.profile_argv) and the COMPLETE env mapping (flags.profile_env
+        # = active env-typed settings + the profile's extra env). The runner
+        # tab displays both and passes them through the launch path.
+        d = p.to_json()
+        try:
+            d["argv"] = flagsmod.profile_argv(p)
+        except Exception:  # pragma: no cover - defensive
+            d["argv"] = None
+        try:
+            d["launch_env"] = flagsmod.profile_env(p)
+        except Exception:  # pragma: no cover - defensive
+            d["launch_env"] = dict(p.env or {})
+        return d
+
     generated: List[dict] = []
     try:
-        generated = [p.to_json() for p in flagsmod.profiles(model_cfg, gpus)]
+        generated = [_prof_json(p) for p in flagsmod.profiles(model_cfg, gpus)]
     except Exception as e:  # pragma: no cover - defensive
         generated = []
         gen_error = str(e)
     else:
         gen_error = None
     try:
-        saved = [p.to_json() for p in _profile_store().load_all()]
+        saved = [_prof_json(p) for p in _profile_store().load_all()]
     except Exception:
         saved = []
     return {
@@ -1905,11 +2037,17 @@ def config_profiles_save(payload: dict) -> dict:
     settings = payload.get("settings")
     if not isinstance(settings, dict) or not settings:
         return {"ok": False, "error": "a non-empty settings dict is required"}
+    env = payload.get("env")
     prof = flagsmod.Profile(
         name=name,
         kind=payload.get("kind", "custom"),
         settings=settings,
         info=list(payload.get("info") or []),
+        env=(
+            {str(k): str(v) for k, v in env.items()}
+            if isinstance(env, dict)
+            else {}
+        ),
     )
     try:
         _profile_store().save(prof, overwrite=bool(payload.get("overwrite", True)))
@@ -1928,6 +2066,170 @@ def config_profiles_delete(payload: dict) -> dict:
     except Exception as e:  # pragma: no cover - defensive
         return {"ok": False, "error": str(e)}
     return {"ok": deleted, "name": name, "deleted": deleted}
+
+
+# ===========================================================================
+# #151 -- Benchmark/quality suite routes (thin adapters over bench_suite.py).
+# BACKEND-DRIVEN by design: every model request runs server-side (CORS + the
+# raw responses are needed for the verifiers); the browser only renders the
+# streamed per-test results. This layer never boots or restarts a server.
+# ===========================================================================
+
+
+def _norm_endpoint(v: Optional[str]) -> str:
+    v = (v or "").strip()
+    if v and not v.startswith("http"):
+        v = "http://" + v
+    return v
+
+
+def bench_probe_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/bench_probe {endpoint?, force?} -> the capability/gating
+    state + the full test catalog with each test's gate decision. Without an
+    endpoint only the catalog + presets are returned (nothing probed)."""
+    from sglang.srt.planner import bench_suite
+
+    payload = payload or {}
+    endpoint = _norm_endpoint(payload.get("endpoint"))
+    caps = None
+    probe_error = None
+    if endpoint:
+        try:
+            caps = bench_suite.probe_capabilities(endpoint)
+        except Exception as e:  # pragma: no cover - defensive
+            probe_error = str(e)
+    tests = []
+    for tid in sorted(bench_suite.TEST_CATALOG):
+        spec = bench_suite.TEST_CATALOG[tid]
+        gd = bench_suite.gate_test(spec, caps, force=bool(payload.get("force")))
+        tests.append({
+            "test_id": tid,
+            "key": spec.key,
+            "label": spec.label,
+            "optional": spec.optional,
+            "crash_prone": spec.crash_prone,
+            "deps": spec.deps_json(),
+            "gate_status": gd.status,      # None -> runnable
+            "gate_reason": gd.reason,
+            "expected_fail_note": gd.expected_fail_note,
+            "rungs": gd.rungs,
+        })
+    return {
+        "ok": True,
+        "endpoint": endpoint or None,
+        "probe_error": probe_error,
+        "capabilities": caps.to_json() if caps else None,
+        "tests": tests,
+        "presets": {k: list(v) for k, v in bench_suite.PRESETS.items()},
+    }
+
+
+def bench_run_events(payload: dict):
+    """Iterator of SSE event dicts for one suite run: ``start``, one
+    ``result`` per finished test (bench_suite.run_suite is itself an
+    iterator), then ``done`` with the status counts. The HTTP handler streams
+    each event the moment it exists."""
+    from sglang.srt.planner import bench_suite
+
+    payload = payload or {}
+    endpoint = _norm_endpoint(payload.get("endpoint"))
+    model = (payload.get("model") or "").strip()
+    if not endpoint:
+        yield {"event": "error", "error": "endpoint is required"}
+        return
+    caps = None
+    if isinstance(payload.get("capabilities"), dict):
+        try:
+            caps = bench_suite.Capabilities(**payload["capabilities"])
+        except TypeError as e:
+            yield {"event": "error", "error": f"bad capabilities: {e}"}
+            return
+    selected = payload.get("selected")
+    preset = payload.get("preset")
+    yield {
+        "event": "start",
+        "endpoint": endpoint,
+        "model": model or None,
+        "selected": list(selected) if selected else None,
+        "preset": preset,
+    }
+    counts: dict = {}
+    try:
+        for res in bench_suite.run_suite(
+            endpoint,
+            model,
+            selected=selected,
+            capabilities=caps,
+            preset=preset,
+            force=bool(payload.get("force")),
+        ):
+            counts[res.get("status")] = counts.get(res.get("status"), 0) + 1
+            yield {"event": "result", "result": res}
+    except Exception as e:  # pragma: no cover - defensive
+        yield {"event": "error", "error": str(e)}
+        return
+    yield {"event": "done", "counts": counts}
+
+
+# ===========================================================================
+# #152 -- GitHub results sharing (thin adapters over github_share.py).
+# Preview-first + explicit confirm; the PAT is per-use, never persisted,
+# never logged, never echoed, and redacted from every error message.
+# ===========================================================================
+
+
+def share_preview_payload(payload: dict) -> dict:
+    """POST /api/share_preview -> the EXACT markdown that would be posted
+    (github_share.build_report). Pure render; sends nothing."""
+    from sglang.srt.planner import github_share
+
+    payload = payload or {}
+    body = payload.get("payload")
+    if not isinstance(body, dict):
+        body = payload
+    try:
+        report = github_share.build_report(body or {})
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e)}
+    return {
+        "ok": True,
+        "report": report,
+        "default_repo": github_share.DEFAULT_REPO,
+    }
+
+
+def share_submit_payload(payload: dict) -> dict:
+    """POST /api/share_submit {report, token, repo?, existing_issue?,
+    confirmed} -> create-or-update the user's share issue. Refuses without
+    ``confirmed`` (github_share.submit performs no network call in that
+    case). The token is never stored and never appears in any response --
+    every error string has passed github_share.redact."""
+    from sglang.srt.planner import github_share
+
+    payload = payload or {}
+    token = payload.get("token") or ""
+    report = payload.get("report") or ""
+    if not report.strip():
+        return {"ok": False,
+                "error": "no report: build + confirm the preview first"}
+    existing = payload.get("existing_issue")
+    try:
+        existing = int(existing) if existing not in (None, "") else None
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "existing_issue must be an issue number"}
+    try:
+        out = github_share.submit(
+            report,
+            token,
+            repo=(payload.get("repo") or "").strip() or github_share.DEFAULT_REPO,
+            existing_issue=existing,
+            confirmed=bool(payload.get("confirmed")),
+        )
+    except github_share.GitHubShareError as e:
+        return {"ok": False, "error": str(e)}  # message is token-redacted
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": github_share.redact(str(e), token)}
+    return {"ok": True, **out}
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1963,6 +2265,13 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"error": str(e)})
             return
+        if self.path.startswith("/api/detect_endpoint"):
+            # MUST precede the /api/detect prefix check below.
+            try:
+                self._json(200, detect_endpoint_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
         if self.path.startswith("/api/detect"):
             try:
                 self._json(200, detect_hardware())
@@ -1992,7 +2301,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/api/live_snapshot"):
             try:
-                self._json(200, landing_snapshot_payload())
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, landing_snapshot_payload(q))
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
@@ -2040,11 +2352,38 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._send(404, "not found", "text/plain")
 
+    def _sse_stream(self, events) -> None:
+        """Stream an iterator of event dicts as Server-Sent Events (one
+        ``data:`` frame per event, flushed immediately)."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        try:
+            for ev in events:
+                self.wfile.write(
+                    ("data: " + json.dumps(ev) + "\n\n").encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client went away mid-run; the suite iterator stops with us
+        except Exception as e:  # pragma: no cover - defensive
+            try:
+                self.wfile.write(
+                    ("data: " + json.dumps(
+                        {"event": "error", "error": str(e)}) + "\n\n").encode())
+                self.wfile.flush()
+            except Exception:
+                pass
+
     def do_POST(self):
         try:
             payload = self._read_json()
         except Exception as e:
             self._json(400, {"error": f"bad json: {e}"})
+            return
+        if self.path.startswith("/api/bench_run"):
+            # streamed (SSE), not a one-shot JSON body.
+            self._sse_stream(bench_run_events(payload))
             return
         try:
             if self.path.startswith("/api/gguf_options"):
@@ -2106,6 +2445,15 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/config_profiles"):
                 self._json(200, config_profiles_save(payload))
+                return
+            if self.path.startswith("/api/bench_probe"):
+                self._json(200, bench_probe_payload(payload))
+                return
+            if self.path.startswith("/api/share_preview"):
+                self._json(200, share_preview_payload(payload))
+                return
+            if self.path.startswith("/api/share_submit"):
+                self._json(200, share_submit_payload(payload))
                 return
         except Exception as e:  # pragma: no cover - defensive
             self._json(500, {"error": str(e)})
@@ -2266,6 +2614,21 @@ INDEX_HTML = r"""<!doctype html>
   .mx .estcell { outline: 1px dashed #6e5417; }
   .mx .fitc { color: #56d364; } .mx .nofitc { color: #ff7b72; }
   .legend { color: #8b96a5; font-size: .68rem; margin-top: .5rem; }
+  .cardblock { border: 1px solid #263041; border-radius: 8px;
+               padding: .45rem .6rem; margin: .4rem 0; background: #12171e; }
+  .segbar { display: flex; height: 14px; border-radius: 4px; overflow: hidden;
+            background: #0d1117; border: 1px solid #263041; margin: .25rem 0; }
+  .segbar span { display: block; height: 100%; }
+  .seglegend { font-size: .66rem; color: #8b96a5; margin: .1rem 0; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px;
+         margin-right: .25rem; }
+  .rankline { color: #8b96a5; font-size: .68rem; margin: .12rem 0 0 .2rem; }
+  .st-pass { color: #56d364; } .st-warn { color: #e3a008; }
+  .st-fail { color: #ff7b72; } .st-skip { color: #8b96a5; }
+  .st-blocked { color: #8b96a5; }
+  .cfgrow { margin: .15rem 0; }
+  .cfgrow .cfgk { display: inline-block; width: 7.5rem; color: #8b96a5;
+                  font-size: .72rem; vertical-align: top; }
 </style>
 </head>
 <body>
@@ -2276,6 +2639,7 @@ INDEX_HTML = r"""<!doctype html>
 <div class="tabs">
   <button id="tab_landing" class="tab active" onclick="showTab('landing')">Landing (live monitor)</button>
   <button id="tab_runner" class="tab" onclick="showTab('runner')">Runner (models + planner)</button>
+  <button id="tab_bench" class="tab" onclick="showTab('bench')">Benchmark</button>
   <button id="tab_explore" class="tab" onclick="showTab('explore')">Explore rigs (matrix)</button>
   <button id="tab_landscape" class="tab" onclick="showTab('landscape')">Landscape (benchmark DB)</button>
   <button id="tab_energy" class="tab" onclick="showTab('energy')">Energy (calibration)</button>
@@ -2283,13 +2647,25 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 
 <div id="view_landing">
-  <div class="sub">Live monitor of the single MANAGED server (polls
-    <code>/api/live_snapshot</code>). Per-card GPU charts + real throughput
-    keep a client-side 60s ring buffer &mdash; <b>nothing is persisted</b>.
-    Placement is the RUNNING config's computed layout. No server running?
-    Launch one in the Runner tab.</div>
+  <div class="sub">Live monitor. Attaches to ANY reachable sglang server:
+    an explicit endpoint wins, else the managed instance, else a server
+    auto-detected on the common local ports &mdash; hand-started servers are
+    monitored exactly like managed ones. Charts keep a client-side 60s ring
+    buffer; <b>nothing is persisted</b>.</div>
+  <fieldset>
+    <legend>monitor target</legend>
+    <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap">
+      <input id="land_endpoint" placeholder="host:port (blank = managed instance, else auto-detect)" style="max-width:22rem">
+      <button class="mini" onclick="setLandingEndpoint()">use</button>
+      <button class="mini secondary" onclick="clearLandingEndpoint()" title="clear the explicit endpoint; fall back to managed / auto-detect">auto</button>
+      <button class="mini secondary" onclick="detectLandingEndpoint()" title="probe the common local ports for a reachable sglang server">detect</button>
+      <span id="land_target_note" class="muted">resolving&hellip;</span>
+    </div>
+  </fieldset>
   <div id="landing_none" class="muted" style="display:none;padding:1rem;border:1px solid #30363d;border-radius:8px">
-    No managed server is running &mdash; <b>start one in the Runner tab</b>.
+    No reachable sglang server: no explicit endpoint, no managed instance,
+    nothing detected on the common ports. Enter an endpoint above, hit
+    <b>detect</b>, or launch a server in the Runner tab.
     <span id="landing_none_status" class="muted"></span></div>
   <div id="landing_live" style="display:none">
     <fieldset>
@@ -2299,17 +2675,17 @@ INDEX_HTML = r"""<!doctype html>
     <div class="cols">
       <div>
         <fieldset>
-          <legend>per-card GPU (live + 60s)</legend>
-          <div id="landing_gpus" class="muted">waiting&hellip;</div>
-        </fieldset>
-        <fieldset>
           <legend>throughput / spec / cache (live + 60s)</legend>
           <div id="landing_rates" class="muted">waiting&hellip;</div>
+        </fieldset>
+        <fieldset>
+          <legend>per-card GPU (live + 60s)</legend>
+          <div id="landing_gpus" class="muted">waiting&hellip;</div>
         </fieldset>
       </div>
       <div>
         <fieldset>
-          <legend>placement of the RUNNING config</legend>
+          <legend>where it sits on the cards (RUNNING config placement)</legend>
           <div id="landing_placement" class="muted">computing&hellip;</div>
         </fieldset>
       </div>
@@ -2321,6 +2697,71 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <div id="gpu_state_out" class="muted">click refresh&hellip;</div>
     </fieldset>
+  </div>
+</div>
+
+<div id="view_bench" style="display:none">
+  <div class="sub">club-3090 behavioral benchmark / quality suite (#151).
+    Every probe runs <b>backend-side</b> against the target's OpenAI API
+    &mdash; the browser never calls the model. Chat-template / parser /
+    spec-decode gating decides which tests can run; crash-prone long-context
+    tests always run LAST. Results stream in per test.</div>
+  <div class="cols">
+    <div>
+      <fieldset>
+        <legend>target + capabilities</legend>
+        <label>endpoint (OpenAI-compatible base URL)</label>
+        <div style="display:flex;gap:.4rem">
+          <input id="bn_endpoint" placeholder="127.0.0.1:30000">
+          <button class="mini secondary" onclick="benchUseMonitor()" title="copy the landing monitor target">monitor</button>
+        </div>
+        <label>model (blank = probed from /v1/models)</label>
+        <input id="bn_model" placeholder="(auto)">
+        <div style="margin-top:.5rem"><button onclick="benchProbe(false)" id="bn_probe_btn">Probe capabilities</button></div>
+        <div id="bn_caps" class="muted" style="margin-top:.5rem">probe to see the gating state&hellip;</div>
+      </fieldset>
+      <fieldset>
+        <legend>tests &mdash; presets + per-test selection</legend>
+        <div class="actions" id="bn_presets"></div>
+        <label style="margin:.4rem 0"><input type="checkbox" id="bn_force" style="width:auto" onchange="benchReGate()">
+          force-run tool tests despite a missing tool parser
+          <span class="muted">(deliberately surfaces the tool-call cascade)</span></label>
+        <div id="bn_tests" class="muted">loading test catalog&hellip;</div>
+        <div style="margin-top:.5rem"><button onclick="benchRun()" id="bn_run_btn">Run selected</button></div>
+      </fieldset>
+      <fieldset>
+        <legend>share results on GitHub (#152)</legend>
+        <div class="muted" style="margin-bottom:.4rem">Builds the EXACT
+          markdown to post as a preview &mdash; nothing is sent until you
+          confirm. One issue per user, updated in place on re-submit. The PAT
+          is entered per-use only: <b>never persisted, never logged</b>, and
+          redacted from every error message.</div>
+        <label><input type="checkbox" id="sh_inc_metrics" checked style="width:auto"> measured rates + per-card power (landing monitor)</label>
+        <label><input type="checkbox" id="sh_inc_bench" checked style="width:auto"> benchmark results (last run)</label>
+        <label><input type="checkbox" id="sh_inc_quality" style="width:auto"> quality shot (SVG + verdict + tokens, Quality tab)</label>
+        <label>notes (optional)</label>
+        <textarea id="sh_notes" rows="2"></textarea>
+        <div style="margin-top:.4rem"><button class="secondary" onclick="sharePreview()">Build preview</button></div>
+        <div id="sh_preview_wrap" style="display:none;margin-top:.5rem">
+          <div class="muted">this exact markdown will be posted:</div>
+          <pre id="sh_preview" style="max-height:280px;overflow:auto"></pre>
+          <label>GitHub PAT <span class="muted">(used once for this submit; never stored)</span></label>
+          <input id="sh_token" type="password" autocomplete="off">
+          <label>repository</label>
+          <input id="sh_repo">
+          <label>existing issue number <span class="muted">(blank = find-or-create your issue)</span></label>
+          <input id="sh_issue" placeholder="(optional)">
+          <div style="margin-top:.4rem"><button onclick="shareSubmit()" id="sh_btn">Confirm + submit to GitHub</button></div>
+        </div>
+        <div id="sh_out" class="muted" style="margin-top:.4rem"></div>
+      </fieldset>
+    </div>
+    <div>
+      <fieldset>
+        <legend>results (streamed per test)</legend>
+        <div id="bn_out" class="muted">no run yet.</div>
+      </fieldset>
+    </div>
   </div>
 </div>
 
@@ -2502,6 +2943,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="secondary mini" onclick="saveProfile()">save current as profile</button>
       </div>
       <div id="profile_msg" class="muted" style="margin-top:.3rem"></div>
+      <div id="profile_env_box" style="margin-top:.3rem"></div>
     </fieldset>
 
     <fieldset>
@@ -3302,7 +3744,7 @@ async function doIssue(kind) {
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
 function showTab(t) {
-  const TABS = ['landing','runner','explore','landscape','energy','quality'];
+  const TABS = ['landing','runner','bench','explore','landscape','energy','quality'];
   for (const v of TABS) $('view_'+v).style.display = t===v ? '' : 'none';
   for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
   if ((t==='explore'||t==='landscape') && !window._profLoaded) loadProfiles();
@@ -3312,6 +3754,7 @@ function showTab(t) {
     window._runnerInit=true; loadKnobs(); detectGPUs(); loadModels();
     loadFlagCatalog(); refreshServerStatus();
   }
+  if (t==='bench' && !window._benchInit) { window._benchInit=true; benchInit(); }
   // The landing page live-poll runs only while its tab is visible.
   if (t==='landing') startLanding(); else stopLanding();
 }
@@ -3321,82 +3764,88 @@ function showTab(t) {
 // view and the runner prospective view -- ONE renderer, two data sources).
 // ===========================================================================
 function fmtMib(x){ return (x==null)? '—' : (x>=1024? (x/1024).toFixed(2)+'G' : x.toFixed(0)+'M'); }
+// One row/block per PHYSICAL CARD: name + total VRAM, a proportional bar of
+// what occupies it (weights / KV / mamba / overhead / free), the co-located
+// ranks, and the granular per-rank detail (head/token/expert index ranges,
+// MTP, host-RAM offload) as compact secondary lines. Used UNCHANGED by both
+// the landing (running config) and the runner (prospective config).
+const SEG_COLORS = {weights:'#2f81f7', kv:'#2ea043', mamba:'#a371f7', ovh:'#6e7681'};
 function renderPlacement(pl){
   if(!pl) return '<span class="muted">no placement.</span>';
   const m=pl.model||{}; let h='';
-  h+='<div class="legend">TP '+pl.tp_size+' · DCP '+pl.dcp_size+' · heads Q'+m.num_attention_heads
-    +'/KV'+m.num_key_value_heads+' · layers '+m.num_hidden_layers
+  h+='<div class="legend" style="margin-top:0">TP '+pl.tp_size+' · DCP '+pl.dcp_size
+    +' · heads Q'+m.num_attention_heads+'/KV'+m.num_key_value_heads
+    +' · layers '+m.num_hidden_layers
     +(m.num_experts?(' · experts '+m.num_experts):'')+'</div>';
-  const rpg=pl.ranks_per_gpu||{};
-  h+='<div style="margin:.3rem 0"><b>ranks / GPU:</b> '
-    +Object.keys(rpg).map(g=>'GPU'+g+'→['+rpg[g].join(',')+']').join('  ')+'</div>';
-  h+='<div><b>per-card fit (weights / KV / mamba / overhead):</b></div>';
-  h+='<table class="mx"><tr><th>GPU</th><th>card</th><th>ranks</th><th>weights</th><th>KV</th>'
-    +'<th>mamba</th><th>ovh</th><th>total</th><th>budget</th></tr>';
+  const byRank={};
+  const put=(list,f)=>{ for(const x of (list||[])) (byRank[x.rank]=byRank[x.rank]||{})[f]=x; };
+  put(pl.attn_heads,'attn'); put(pl.gdn_heads,'gdn');
+  put(pl.kv_tokens,'kv'); put(pl.experts,'ex');
+  const offByRank={};
+  if(pl.offload && pl.offload.per_rank)
+    for(const r of pl.offload.per_rank) offByRank[r.rank]=r;
   for(const c of (pl.cards||[])){
-    const over=c.physical_overcommit? ' <span class="nofitc">OVER</span>':'';
-    h+='<tr><td>'+c.gpu_index+'</td><td style="text-align:left">'+esc(c.card_name||'—')+'</td>'
-      +'<td>'+c.ranks.join(',')+'</td><td>'+fmtMib(c.weight_mib)+'</td><td>'+fmtMib(c.kv_mib)+'</td>'
-      +'<td>'+fmtMib(c.mamba_mib)+'</td><td>'+fmtMib(c.overhead_mib)+'</td><td><b>'+fmtMib(c.total_mib)+'</b></td>'
-      +'<td>'+(c.budget_mib!=null?fmtMib(c.budget_mib):'—')+over+'</td></tr>';
+    const total=c.card_total_mib || Math.max(c.total_mib, c.budget_mib||0) || 1;
+    const free=Math.max(0, total-c.total_mib);
+    const segs=[['weights',c.weight_mib],['kv',c.kv_mib],['mamba',c.mamba_mib],['ovh',c.overhead_mib]];
+    let bar='<div class="segbar" title="weights '+fmtMib(c.weight_mib)+' / KV '+fmtMib(c.kv_mib)
+      +' / mamba '+fmtMib(c.mamba_mib)+' / overhead '+fmtMib(c.overhead_mib)+' / free '+fmtMib(free)+'">';
+    for(const [k,v] of segs){
+      const pct=Math.min(100, v/total*100);
+      if(pct>0.3) bar+='<span style="width:'+pct.toFixed(1)+'%;background:'+SEG_COLORS[k]+'"></span>';
+    }
+    bar+='</div>';
+    const over=c.physical_overcommit
+      ? ' <b class="nofitc">EXCEEDS CARD (physically impossible)</b>' : '';
+    h+='<div class="cardblock">'
+      +'<div><b>GPU'+c.gpu_index+'</b> '+esc(c.card_name||'')
+      +' <span class="muted">'
+      +(c.card_total_mib?fmtMib(c.card_total_mib)+' total · ':'')
+      +'ranks ['+c.ranks.join(',')+']'
+      +(c.budget_mib!=null?' · budget '+fmtMib(c.budget_mib):'')
+      +'</span>'+over+'</div>'
+      +bar
+      +'<div class="seglegend">'
+      +'<span class="dot" style="background:'+SEG_COLORS.weights+'"></span>weights '+fmtMib(c.weight_mib)+' &nbsp;'
+      +'<span class="dot" style="background:'+SEG_COLORS.kv+'"></span>KV '+fmtMib(c.kv_mib)+' &nbsp;'
+      +(c.mamba_mib>0?('<span class="dot" style="background:'+SEG_COLORS.mamba+'"></span>mamba '+fmtMib(c.mamba_mib)+' &nbsp;'):'')
+      +'<span class="dot" style="background:'+SEG_COLORS.ovh+'"></span>overhead '+fmtMib(c.overhead_mib)+' &nbsp;'
+      +'<span class="dot" style="background:#0d1117;border:1px solid #30363d"></span>free '+fmtMib(free)
+      +' &nbsp;·&nbsp; used <b>'+fmtMib(c.total_mib)+'</b></div>';
+    for(const r of c.ranks){
+      const d=byRank[r]||{}; const bits=[];
+      if(d.attn) bits.push('Q['+d.attn.q_head_start+'..'+d.attn.q_head_end+') '
+        +'K['+d.attn.k_head_start+'..'+d.attn.k_head_end+')'+(d.attn.kv_replicated?' repl':'')
+        +' V['+d.attn.v_head_start+'..'+d.attn.v_head_end+') '
+        +fmtMib(d.attn.q_mib+d.attn.k_mib+d.attn.v_mib+d.attn.o_mib));
+      if(d.gdn) bits.push('GDN K['+d.gdn.k_head_start+'..'+d.gdn.k_head_end
+        +') V['+d.gdn.v_head_start+'..'+d.gdn.v_head_end+')');
+      if(d.kv) bits.push('KV tok ['+d.kv.pos_start+'..'+d.kv.pos_end+') '+d.kv.tokens_owned
+        +(d.kv.kv_token_capacity!=null?(' (cap '+Math.round(d.kv.kv_token_capacity)+')'):''));
+      if(d.ex) bits.push('experts ['+d.ex.expert_start+'..'+d.ex.expert_end+') '+d.ex.num_experts);
+      if(pl.mtp && pl.mtp.present && pl.mtp.per_rank_mib && pl.mtp.per_rank_mib[r]!=null)
+        bits.push('MTP '+fmtMib(pl.mtp.per_rank_mib[r]));
+      const off=offByRank[r];
+      if(off && off.host_expert_start!=null)
+        bits.push('host-RAM experts ['+off.host_expert_start+'..'+off.host_expert_end
+          +') '+fmtMib(off.host_mib));
+      h+='<div class="rankline">rank '+r+': '+(bits.join(' · ')||'(no detail)')+'</div>';
+    }
+    h+='</div>';
   }
-  h+='</table>';
-  h+='<div style="margin-top:.4rem"><b>attention heads (Q/K/V index ranges, MiB):</b></div>';
-  h+='<table class="mx"><tr><th>rank</th><th>GPU</th><th>Q heads</th><th>K</th><th>V</th><th>attn MiB</th></tr>';
-  for(const a of (pl.attn_heads||[])){
-    h+='<tr><td>'+a.rank+'</td><td>'+a.gpu_index+'</td>'
-      +'<td>['+a.q_head_start+'..'+a.q_head_end+') '+a.q_heads+'</td>'
-      +'<td>['+a.k_head_start+'..'+a.k_head_end+') '+a.k_heads+(a.kv_replicated?' repl':'')+'</td>'
-      +'<td>['+a.v_head_start+'..'+a.v_head_end+') '+a.v_heads+'</td>'
-      +'<td>'+fmtMib(a.q_mib+a.k_mib+a.v_mib+a.o_mib)+'</td></tr>';
-  }
-  h+='</table>';
-  if(pl.gdn_heads){
-    h+='<div style="margin-top:.4rem"><b>linear (GDN) heads:</b></div>'
-      +'<table class="mx"><tr><th>rank</th><th>K heads</th><th>V heads</th><th>MiB</th></tr>';
-    for(const g of pl.gdn_heads)
-      h+='<tr><td>'+g.rank+'</td><td>['+g.k_head_start+'..'+g.k_head_end+') '+g.k_heads
-        +'</td><td>['+g.v_head_start+'..'+g.v_head_end+') '+g.v_heads+'</td><td>'+fmtMib(g.mib)+'</td></tr>';
-    h+='</table>';
-  }
-  h+='<div style="margin-top:.4rem"><b>KV token placement</b> <span class="muted">('
-    +esc(pl.token_vector_source)+', vector ['+pl.token_vector.join(',')+']):</span></div>';
-  h+='<table class="mx"><tr><th>rank</th><th>GPU</th><th>positions</th><th>tokens</th>'
-    +'<th>KV MiB owned</th><th>capacity tok</th></tr>';
-  for(const k of (pl.kv_tokens||[]))
-    h+='<tr><td>'+k.rank+'</td><td>'+k.gpu_index+'</td><td>['+k.pos_start+'..'+k.pos_end+')</td>'
-      +'<td>'+k.tokens_owned+'</td><td>'+fmtMib(k.kv_mib_owned)+'</td>'
-      +'<td>'+(k.kv_token_capacity!=null?Math.round(k.kv_token_capacity):'—')+'</td></tr>';
-  h+='</table>';
-  if(pl.experts){
-    h+='<div style="margin-top:.4rem"><b>MoE experts per rank (index ranges):</b></div>'
-      +'<table class="mx"><tr><th>rank</th><th>GPU</th><th>expert idx</th><th>#</th>'
-      +'<th>routed MiB</th><th>shared MiB</th></tr>';
-    for(const e of pl.experts)
-      h+='<tr><td>'+e.rank+'</td><td>'+e.gpu_index+'</td><td>['+e.expert_start+'..'+e.expert_end+')</td>'
-        +'<td>'+e.num_experts+'</td><td>'+fmtMib(e.routed_mib)+'</td><td>'+fmtMib(e.shared_mib)+'</td></tr>';
-    h+='</table>';
-  }
-  if(pl.mtp && pl.mtp.present)
-    h+='<div style="margin-top:.4rem"><b>MTP / nextn:</b> layers ['+pl.mtp.layer_start+'..'
-      +pl.mtp.layer_end+'), per-rank MiB ['+pl.mtp.per_rank_mib.map(x=>fmtMib(x)).join(', ')+']</div>';
+  h+='<div class="legend">KV token vector ['+pl.token_vector.join(',')
+    +'] ('+esc(pl.token_vector_source)+')'
+    +(pl.mtp&&pl.mtp.present?(' · MTP layers ['+pl.mtp.layer_start+'..'+pl.mtp.layer_end+')'):'')+'</div>';
   if(pl.offload){
     const o=pl.offload;
-    h+='<div style="margin-top:.4rem"><b>host-RAM OFFLOAD rule</b> <span class="muted">('+esc(o.offloadable_class)
-      +'):</span> offloadable '+fmtMib(o.total_offloadable_mib)+', host-held '+fmtMib(o.total_host_mib)
-      +(o.resident_fraction!=null?(' (resident frac '+o.resident_fraction.toFixed(2)+')'):'')+'</div>';
-    if(o.resident_fraction!=null){
-      h+='<table class="mx"><tr><th>rank</th><th>host experts</th><th>host MiB</th><th>resident</th></tr>';
-      for(const r of o.per_rank)
-        h+='<tr><td>'+r.rank+'</td><td>'+(r.host_expert_start!=null?('['+r.host_expert_start+'..'
-          +r.host_expert_end+') '+r.host_expert_count):'—')+'</td><td>'+fmtMib(r.host_mib)
-          +'</td><td>'+r.resident_expert_count+'</td></tr>';
-      h+='</table>';
-    }
-    h+='<div class="muted" style="font-size:.66rem">'+esc(o.note)+'</div>';
+    h+='<div class="legend"><b>host-RAM offload rule</b> ('+esc(o.offloadable_class)
+      +'): offloadable '+fmtMib(o.total_offloadable_mib)
+      +', host-held '+fmtMib(o.total_host_mib)
+      +(o.resident_fraction!=null?(', resident frac '+o.resident_fraction.toFixed(2)):'')
+      +' &mdash; '+esc(o.note)+'</div>';
   }
   if(pl.notes && pl.notes.length)
-    h+='<div class="legend" style="margin-top:.3rem">'+pl.notes.map(n=>'• '+esc(n)).join('<br>')+'</div>';
+    h+='<div class="legend">'+pl.notes.map(n=>'&bull; '+esc(n)).join('<br>')+'</div>';
   return h;
 }
 
@@ -3422,37 +3871,135 @@ function sparkline(key,w,hh){
   return '<svg width="'+w+'" height="'+hh+'" style="vertical-align:middle;background:#0d1117;border-radius:3px">'
     +'<polyline fill="none" stroke="#1f6feb" stroke-width="1.5" points="'+pts+'"/></svg>';
 }
+function landingEndpoint(){
+  try{ return (localStorage.getItem('land_endpoint')||'').trim(); }catch(e){ return ''; }
+}
+function setLandingEndpoint(){
+  try{ localStorage.setItem('land_endpoint', $('land_endpoint').value.trim()); }catch(e){}
+  window._ring={}; landingPoll();
+}
+function clearLandingEndpoint(){
+  try{ localStorage.removeItem('land_endpoint'); }catch(e){}
+  $('land_endpoint').value=''; window._ring={}; landingPoll();
+}
+async function detectLandingEndpoint(){
+  $('land_target_note').textContent='probing the common local ports…';
+  try{
+    const d=await (await fetch('/api/detect_endpoint')).json();
+    if(d.endpoint){
+      $('land_endpoint').value=d.endpoint.replace(/^https?:\/\//,'');
+      setLandingEndpoint();
+    } else {
+      $('land_target_note').textContent='nothing reachable on ports '+(d.probed||[]).join(', ');
+    }
+  }catch(e){ $('land_target_note').textContent=''+e; }
+}
 async function startLanding(){
   if(window._landTimer) return;
+  if(!$('land_endpoint').value) $('land_endpoint').value=landingEndpoint();
   await landingPoll();
   window._landTimer=setInterval(landingPoll, 2000);
 }
 function stopLanding(){ if(window._landTimer){ clearInterval(window._landTimer); window._landTimer=null; } }
 async function landingPoll(){
   let d;
-  try{ const r=await fetch('/api/live_snapshot'); d=await r.json(); }catch(e){ return; }
-  if(!d || (!d.ok && !d.running) || !d.running || !d.snapshot){
+  const ep=landingEndpoint();
+  try{
+    const r=await fetch('/api/live_snapshot'+(ep?('?endpoint='+encodeURIComponent(ep)):''));
+    d=await r.json();
+  }catch(e){ return; }
+  window._lastTarget=d && d.target;
+  if(d && d.target){
+    $('land_target_note').innerHTML='monitoring <b>'+esc(d.target.endpoint)+'</b> ('
+      +(d.target.managed?'managed instance':esc(d.target.kind)+' / external')+')';
+  } else {
+    $('land_target_note').textContent='no target';
+  }
+  if(!d || !d.running || !d.snapshot){
     $('landing_none').style.display=''; $('landing_live').style.display='none';
     const st=d && d.status;
     $('landing_none_status').textContent = (d && d.error)? ' ('+d.error+')'
-      : (st && st.state? ' (server state: '+st.state+')':'');
+      : (st && st.state && st.state!=='stopped'? ' (managed server state: '+st.state+')':'');
     return;
   }
   $('landing_none').style.display='none'; $('landing_live').style.display='';
-  renderLanding(d.snapshot);
+  renderLanding(d.snapshot, d.target);
 }
-function renderLanding(s){
-  const cfg=s.launch_config||{};
-  let cfgh='<table class="mx" style="text-align:left"><tr><th>flag</th><th>value</th></tr>';
-  const keys=['model_path','served_model_name','format','gguf_variant','tp_size','rank_gpu_id',
-    'rank_tp_ratio','rank_gpu_memory_mib','kv_cache_dtype','context_length','max_num_seqs','spec_mode','port'];
-  let any=false;
-  for(const k of keys){ if(cfg[k]!=null && cfg[k]!==''){ any=true;
-    cfgh+='<tr><td class="muted">'+k+'</td><td>'+esc(String(Array.isArray(cfg[k])?cfg[k].join(','):cfg[k]))+'</td></tr>'; } }
-  cfgh+='</table>';
-  if(!any && s.server_info) cfgh='<pre style="white-space:pre-wrap;font-size:.66rem">'+esc(JSON.stringify(s.server_info,null,1))+'</pre>';
-  if(cfg.launch_argv) cfgh+='<div class="legend">launch: <code>'+esc(cfg.launch_argv.join(' '))+'</code></div>';
-  $('landing_config').innerHTML=cfgh;
+// Normalize the start config from EITHER source: the managed LaunchSettings
+// (exact dashboard flags) or, for an external/hand-started server, its own
+// /get_server_info + /get_model_info view.
+function normalizeStartConfig(s){
+  const cfg=s.launch_config;
+  if(cfg && cfg.model_path)
+    return {src:'managed launch settings', cfg:cfg, argv:cfg.launch_argv||null,
+            env:cfg.extra_env||null, raw:null};
+  const w=s.server_info||{};
+  const si=w.server_info||{};
+  const mi=w.model_info||{};
+  if(!Object.keys(si).length && !Object.keys(mi).length) return null;
+  return {src:'/get_server_info (external server)', raw:s.server_info, argv:null, env:null, cfg:{
+    model_path: si.model_path||mi.model_path,
+    served_model_name: si.served_model_name,
+    tp_size: si.tp_size, rank_gpu_id: si.rank_gpu_id,
+    rank_tp_ratio: si.rank_tp_ratio, rank_gpu_memory_mib: si.rank_gpu_memory_mib,
+    kv_cache_dtype: si.kv_cache_dtype, context_length: si.context_length,
+    max_num_seqs: si.max_running_requests,
+    spec_mode: si.speculative_algorithm||null,
+    speculative_num_steps: si.speculative_num_steps,
+    speculative_num_draft_tokens: si.speculative_num_draft_tokens,
+    speculative_eagle_topk: si.speculative_eagle_topk,
+    tool_call_parser: si.tool_call_parser, reasoning_parser: si.reasoning_parser,
+    chat_template: si.chat_template, port: si.port, gguf_variant: null,
+  }};
+}
+// Compact, grouped start-config summary: what is running + the key flags,
+// with the full argv/env and raw server_info COLLAPSED (no wall of text).
+function renderStartConfig(s, tgt){
+  const n=normalizeStartConfig(s);
+  if(!n) return '<span class="muted">no start config available (neither launch settings nor /get_server_info).</span>';
+  const c=n.cfg;
+  const pill=(k,v)=>{
+    if(v==null||v===''||v===false) return '';
+    return '<span class="pill"><span class="muted">'+esc(k)+'</span> '
+      +esc(String(Array.isArray(v)?v.join(','):v))+'</span> ';
+  };
+  const modelName=(c.served_model_name&&c.served_model_name!=='model')
+    ? c.served_model_name : String(c.model_path||'').split('/').pop();
+  let h='<div style="font-size:1rem;margin-bottom:.35rem"><b>'+esc(modelName||'unknown model')+'</b>'
+    +(tgt?' <span class="muted">@ '+esc(tgt.endpoint)+' ('+(tgt.managed?'managed':'external')+')</span>':'')
+    +'</div>';
+  const groups=[
+    ['model', pill('path',c.model_path)+pill('gguf',c.gguf_variant)+pill('served-as',c.served_model_name)],
+    ['parallelism', pill('tp',c.tp_size)+pill('rank-gpu-id',c.rank_gpu_id)
+      +pill('rank-tp-ratio',c.rank_tp_ratio)+pill('rank-mem-mib',c.rank_gpu_memory_mib)],
+    ['memory / KV', pill('kv-dtype',c.kv_cache_dtype)+pill('context',c.context_length)+pill('max-seqs',c.max_num_seqs)],
+    ['speculative', (c.spec_mode&&c.spec_mode!=='off')
+      ? pill('algo',c.spec_mode)+pill('steps',c.speculative_num_steps)
+        +pill('draft-tokens',c.speculative_num_draft_tokens)+pill('topk',c.speculative_eagle_topk)
+      : '<span class="pill muted">off</span>'],
+    ['serving', pill('port',c.port)+pill('tool-parser',c.tool_call_parser)
+      +pill('reasoning-parser',c.reasoning_parser)
+      +pill('chat-template', c.chat_template?String(c.chat_template).split('/').pop():null)],
+  ];
+  for(const [name,row] of groups)
+    if(row.trim()) h+='<div class="cfgrow"><span class="cfgk">'+esc(name)+'</span>'+row+'</div>';
+  h+='<div class="legend" style="margin-top:.25rem">source: '+esc(n.src)+'</div>';
+  if(n.argv||n.env){
+    h+='<details style="margin-top:.3rem"><summary class="muted" style="cursor:pointer">full launch command + env</summary><pre>';
+    if(n.env) for(const k of Object.keys(n.env)) h+=esc(k+'='+n.env[k])+'\n';
+    if(n.argv) h+=esc(n.argv.join(' '));
+    h+='</pre></details>';
+  }
+  if(n.raw)
+    h+='<details style="margin-top:.3rem"><summary class="muted" style="cursor:pointer">raw server_info</summary>'
+      +'<pre style="max-height:260px;overflow:auto">'+esc(JSON.stringify(n.raw,null,1))+'</pre></details>';
+  return h;
+}
+function renderLanding(s, tgt){
+  window._lastSnapshot=s;
+  $('landing_config').innerHTML=renderStartConfig(s, tgt)
+    +(s.metrics_error?'<div class="reasons" style="margin-top:.3rem">'+esc(s.metrics_error)
+      +' &mdash; token rates need --enable-metrics on the server.</div>':'');
 
   let gh='';
   for(const g of (s.gpus||[])){
@@ -3471,6 +4018,7 @@ function renderLanding(s){
 
   let rh=''; const rates=s.rates;
   if(rates){
+    window._lastRates=rates;
     pushRing('dec',s.t,rates.decode_tok_s); pushRing('pfx',s.t,rates.prefill_tok_s);
     rh+='<div>decode <b>'+(rates.decode_tok_s!=null?rates.decode_tok_s.toFixed(1):'—')+'</b> tok/s '+sparkline('dec',120,20)+'</div>'
       +'<div>prefill (non-cached) <b>'+(rates.prefill_tok_s!=null?rates.prefill_tok_s.toFixed(1):'—')+'</b> tok/s '+sparkline('pfx',120,20)+'</div>';
@@ -3491,8 +4039,9 @@ function renderLanding(s){
   renderLandingPlacement(s);
 }
 async function renderLandingPlacement(s){
-  const cfg=s.launch_config||{}; const model=cfg.model_path;
-  if(!model){ $('landing_placement').innerHTML='<span class="muted">no launch config for placement.</span>'; return; }
+  const n=normalizeStartConfig(s);
+  const cfg=(n&&n.cfg)||{}; const model=cfg.model_path;
+  if(!model){ $('landing_placement').innerHTML='<span class="muted">no start config for placement (external server without /get_server_info).</span>'; return; }
   const flags={
     tp_size: cfg.tp_size||1, rank_gpu_id: cfg.rank_gpu_id||null, rank_tp_ratio: cfg.rank_tp_ratio||null,
     rank_gpu_memory_mib: cfg.rank_gpu_memory_mib||null, kv_cache_dtype: cfg.kv_cache_dtype||'auto',
@@ -3560,6 +4109,9 @@ function onFlagChange(id){
   const v = spec.type==='bool'? el.checked : el.value.trim();
   if(v===''||v===false) delete window._flagSettings[id];
   else window._flagSettings[id]=v;
+  // A manual edit invalidates the applied profile's EXACT argv (the launch
+  // then falls back to the form fields; the profile env stays applied).
+  if(window._profileArgv){ window._profileArgv=null; window._profileDirty=true; renderProfileLaunch(); }
   resolveFlags(); refreshRunnerPlacement();
 }
 function collectFlagSettings(){
@@ -3676,9 +4228,50 @@ function applyProfile(i){
   // budgets) and MUST land in the field -- dropping them leaves rank_gpu_id
   // orphaned, which the fork rejects at launch.
   if(rtr) $('sv_rtr').value=Array.isArray(rtr)?rtr.join(','):rtr;
+  // Mirror the profile's serving identity into the launch form so Launch
+  // boots WHAT WAS APPLIED, not stale form values.
+  if(p.settings.model_path) $('sv_model').value=p.settings.model_path;
+  if(p.settings.port) $('sv_port').value=p.settings.port;
+  if(p.settings.context_length) $('sv_ctx').value=p.settings.context_length;
+  if(p.settings.kv_cache_dtype) $('sv_kv').value=p.settings.kv_cache_dtype;
+  if(p.settings.max_running_requests) $('sv_seqs').value=p.settings.max_running_requests;
+  if(p.settings.tool_call_parser) $('sv_tool').value=p.settings.tool_call_parser;
+  if(p.settings.reasoning_parser) $('sv_reason').value=p.settings.reasoning_parser;
+  if(p.settings.chat_template) $('sv_ct').value=p.settings.chat_template;
+  if(p.settings.speculative_algorithm)
+    $('sv_spec').value=p.settings.speculative_adaptive?'adaptive':'mtp';
+  // The profile's EXACT launch surface: env (applied to the server process)
+  // and argv (used verbatim on Launch until a flag is edited manually).
+  window._profileEnv=p.launch_env||p.env||null;
+  window._profileArgv=p.argv||null;
+  window._profileDirty=false;
+  renderProfileLaunch();
   $('profile_msg').innerHTML='<span class="muted">applied <b>'+esc(p.name)+'</b>'
     +((p.info&&p.info.length)?' — '+esc(p.info.join(' | ')):'')+'</span>';
   resolveFlags(); refreshRunnerPlacement(); doPlan();
+}
+// DISPLAY the applied profile's launch env + exact argv (not just the CLI
+// flags): a launched profile must match the reference command exactly, and
+// the env half (SGLANG_UNEVEN_* pair, LD_LIBRARY_PATH, PYTHONPATH) is as
+// load-bearing as the argv half.
+function renderProfileLaunch(){
+  const box=$('profile_env_box'); if(!box) return;
+  const env=window._profileEnv, argv=window._profileArgv;
+  if(!env && !argv && !window._profileDirty){ box.innerHTML=''; return; }
+  let h='';
+  if(env && Object.keys(env).length){
+    h+='<div class="muted"><b>launch env</b> (applied to the server process on Launch):</div>'
+      +'<pre style="margin:.2rem 0">'+Object.keys(env).map(k=>esc(k+'='+env[k])).join('\n')+'</pre>';
+  }
+  if(argv){
+    h+='<details><summary class="muted" style="cursor:pointer">exact profile argv (used verbatim on Launch)</summary>'
+      +'<pre style="margin:.2rem 0">'+esc('python -m sglang.launch_server '+argv.join(' '))+'</pre></details>';
+  } else if(window._profileDirty){
+    h+='<div class="muted" style="color:#e3a008">flags edited after applying the profile — '
+      +'the exact profile argv is no longer used; Launch builds the command from the form fields '
+      +'(the profile env above still applies).</div>';
+  }
+  box.innerHTML=h;
 }
 async function saveProfile(){
   const name=$('profile_save_name').value.trim();
@@ -3973,6 +4566,9 @@ function renderServerStatus(d) {
     return h;
   }
   let h = '';
+  if (d.env_applied && Object.keys(d.env_applied).length)
+    h += '<div class="legend">env: <code>'
+      +esc(Object.keys(d.env_applied).map(k=>k+'='+d.env_applied[k]).join(' '))+'</code></div>';
   if (d.launch_command) h += '<div class="legend">launch: <code>'+esc(d.launch_command.join(' '))+'</code></div>';
   h += renderStatusBox(d.status || d);
   return h;
@@ -3994,10 +4590,18 @@ async function serverPost(path, body) {
     $('sv_out').innerHTML = renderServerStatus(d);
   } catch(e) { $('sv_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
 }
-function serverStart() { serverPost('/api/server_start', serverSettings()); }
+function launchBody() {
+  // Launch settings + the applied profile's env (always) and exact argv
+  // (until a manual flag edit invalidated it).
+  const body = serverSettings();
+  if (window._profileEnv && Object.keys(window._profileEnv).length) body.env = window._profileEnv;
+  if (window._profileArgv) body.profile_argv = window._profileArgv;
+  return body;
+}
+function serverStart() { serverPost('/api/server_start', launchBody()); }
 function serverRestart() {
   if (!confirm('Restart REPLACES the single managed instance (stops the running model). Continue?')) return;
-  serverPost('/api/server_restart', serverSettings());
+  serverPost('/api/server_restart', launchBody());
 }
 function serverStop() { serverPost('/api/server_stop', {}); }
 async function refreshServerStatus() {
@@ -4155,7 +4759,191 @@ function showShot() {
   $('q_shot').innerHTML = h;
 }
 
-// Landing is the default view (live monitor of the managed server).
+// ---- Benchmark tab (#151) -- backend-driven suite, streamed results ----
+window._benchCatalog=null; window._benchResults=null;
+function benchInit(){
+  const t=window._lastTarget;
+  if(t && t.endpoint && !$('bn_endpoint').value.trim())
+    $('bn_endpoint').value=t.endpoint.replace(/^https?:\/\//,'');
+  benchProbe(true);  // catalog + presets only; nothing probed without endpoint
+}
+function benchUseMonitor(){
+  const t=window._lastTarget;
+  if(t && t.endpoint) $('bn_endpoint').value=t.endpoint.replace(/^https?:\/\//,'');
+}
+function benchReGate(){ if($('bn_endpoint').value.trim()) benchProbe(false); }
+async function benchProbe(catalogOnly){
+  const endpoint=catalogOnly? '' : $('bn_endpoint').value.trim();
+  if(!catalogOnly) $('bn_caps').innerHTML='probing (backend-side)&hellip;';
+  try{
+    const r=await fetch('/api/bench_probe',{method:'POST',
+      body:JSON.stringify({endpoint, force:$('bn_force').checked})});
+    const d=await r.json();
+    if(!d.ok){ $('bn_caps').innerHTML='<span class="reasons">'+esc(d.error||'probe failed')+'</span>'; return; }
+    window._benchCatalog=d;
+    if(d.capabilities){
+      const c=d.capabilities;
+      if(c.model && !$('bn_model').value.trim()) $('bn_model').value=c.model;
+      const chip=(ok,txt)=>'<span class="pill" style="border-color:'+(ok?'#2ea043':'#7d2a2a')
+        +'">'+(ok?'OK ':'NO ')+esc(txt)+'</span> ';
+      $('bn_caps').innerHTML=
+        chip(c.chat_template_basic,'basic chat template')
+        +chip(!!c.tool_parser,'tool parser'+(c.tool_parser?' ('+c.tool_parser+')':''))
+        +chip(!!c.reasoning_parser,'reasoning parser'+(c.reasoning_parser?' ('+c.reasoning_parser+')':''))
+        +chip(c.spec_decode,'spec decode ('+c.spec_mode+')')
+        +(c.max_model_len?'<span class="pill">ctx '+c.max_model_len+'</span>':'')
+        +(d.probe_error?'<div class="reasons">'+esc(d.probe_error)+'</div>':'');
+    } else if(!catalogOnly){
+      $('bn_caps').innerHTML='<span class="reasons">'+esc(d.probe_error||'no endpoint given')+'</span>';
+    }
+    renderBenchTests();
+  }catch(e){ $('bn_caps').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
+}
+function renderBenchTests(){
+  const d=window._benchCatalog; if(!d) return;
+  $('bn_presets').innerHTML='<span class="muted">presets:</span> '
+    +Object.keys(d.presets).map(p=>'<button class="mini secondary" onclick="benchPreset(\''+p+'\')">'+esc(p)+'</button>').join(' ');
+  let h='';
+  for(const t of d.tests){
+    const gated=t.gate_status!=null;  // blocked / skip: greyed with the reason
+    h+='<div style="margin:.12rem 0;opacity:'+(gated?'.45':'1')+'" title="'
+      +esc(t.gate_reason||t.expected_fail_note||'')+'">'
+      +'<label style="display:flex;gap:.35rem;align-items:flex-start;margin:0">'
+      +'<input type="checkbox" id="bnt_'+t.test_id+'" style="width:auto;margin-top:.15rem" '+(gated?'disabled':'')+'>'
+      +'<span>'+t.test_id+'. '+esc(t.label)
+      +(t.optional?' <span class="muted">(opt)</span>':'')
+      +(t.crash_prone?' <span style="color:#e3a008">(crash-prone, runs last)</span>':'')
+      +(gated?' <span class="muted">['+esc(t.gate_status)+': '+esc(t.gate_reason||'')+']</span>':'')
+      +(!gated&&t.expected_fail_note?' <span style="color:#e3a008">[expected-fail: '+esc(t.expected_fail_note)+']</span>':'')
+      +'</span></label></div>';
+  }
+  $('bn_tests').innerHTML=h;
+}
+function benchPreset(p){
+  const d=window._benchCatalog; if(!d) return;
+  const ids=d.presets[p]||[];
+  for(const t of d.tests){
+    const el=$('bnt_'+t.test_id);
+    if(el && !el.disabled) el.checked=ids.includes(t.test_id);
+  }
+}
+async function benchRun(){
+  const d=window._benchCatalog;
+  const endpoint=$('bn_endpoint').value.trim();
+  if(!endpoint){ $('bn_out').innerHTML='<span class="reasons">endpoint required</span>'; return; }
+  const selected=[];
+  if(d) for(const t of d.tests){ const el=$('bnt_'+t.test_id); if(el&&el.checked) selected.push(t.test_id); }
+  if(!selected.length){ $('bn_out').innerHTML='<span class="reasons">select at least one test (or a preset).</span>'; return; }
+  window._benchResults=[];
+  $('bn_run_btn').disabled=true;
+  $('bn_out').innerHTML='<table class="mx" id="bn_table"><tr><th>#</th><th>test</th><th>status</th>'
+    +'<th>metric</th><th>note</th></tr></table><div id="bn_done" class="muted">running&hellip;</div>';
+  try{
+    const body={endpoint, model:$('bn_model').value.trim(), selected, force:$('bn_force').checked};
+    if(d && d.capabilities) body.capabilities=d.capabilities;
+    const resp=await fetch('/api/bench_run',{method:'POST',body:JSON.stringify(body)});
+    const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf='';
+    while(true){
+      const {done,value}=await reader.read(); if(done) break;
+      buf+=dec.decode(value,{stream:true});
+      let i;
+      while((i=buf.indexOf('\n\n'))>=0){
+        const line=buf.slice(0,i).trim(); buf=buf.slice(i+2);
+        if(line.startsWith('data:')) benchEvent(JSON.parse(line.slice(5)));
+      }
+    }
+  }catch(e){ const el=$('bn_done'); if(el) el.innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
+  finally{ $('bn_run_btn').disabled=false; }
+}
+function benchEvent(ev){
+  if(ev.event==='result' && ev.result){
+    const r=ev.result; window._benchResults.push(r);
+    const m=r.metric||{};
+    const mtxt=(m.name && m.name!=='none' && m.value!=null)
+      ? (m.name+'='+m.value+(m.unit?' '+m.unit:'')) : '';
+    const cls={pass:'st-pass',warn:'st-warn',fail:'st-fail',skip:'st-skip',blocked:'st-blocked'}[r.status]||'';
+    const row=document.createElement('tr');
+    row.innerHTML='<td>'+r.test_id+'</td><td style="text-align:left">'+esc(r.label||'')+'</td>'
+      +'<td class="'+cls+'"><b>'+esc(r.status)+'</b></td><td>'+esc(mtxt)+'</td>'
+      +'<td style="text-align:left" class="muted">'
+      +esc(r.reason||(r.detail&&r.detail.http_code!=null?('http '+r.detail.http_code):'')||'')+'</td>';
+    const tb=$('bn_table'); if(tb) tb.appendChild(row);
+  } else if(ev.event==='done'){
+    const el=$('bn_done');
+    if(el) el.innerHTML='done &mdash; '+Object.keys(ev.counts||{})
+      .map(k=>k+' '+ev.counts[k]).join(' · ');
+  } else if(ev.event==='error'){
+    const el=$('bn_done');
+    if(el) el.innerHTML='<span class="reasons">'+esc(ev.error)+'</span>';
+  }
+}
+
+// ---- GitHub share (#152) -- preview first, explicit confirm, PAT per-use ----
+function shareCollect(){
+  const s=window._lastSnapshot||null;
+  const n=s? normalizeStartConfig(s) : null;
+  const c=(n&&n.cfg)||{};
+  const payload={};
+  payload.model=c.served_model_name||c.model_path||$('bn_model').value.trim()||null;
+  const gpus=(s&&s.gpus)||[];
+  if(gpus.length) payload.hardware=gpus.map(g=>g.name).join(' + ');
+  if(n) payload.command={argv:n.argv||[], env:n.env||{}};
+  if($('sh_inc_metrics').checked){
+    const mset={};
+    const r=window._lastRates;
+    if(r){
+      if(r.decode_tok_s!=null) mset.decode_tok_s=r.decode_tok_s;
+      if(r.prefill_tok_s!=null) mset.prefill_tok_s=r.prefill_tok_s;
+    }
+    const pc={};
+    gpus.forEach(g=>{ pc[g.name+' #'+g.nvml_index]={
+      power_w:g.power_watts, util_pct:g.utilization_pct, mem_used_mib:g.mem_used_mib}; });
+    if(Object.keys(pc).length) mset.per_card=pc;
+    if(Object.keys(mset).length) payload.metrics=mset;
+  }
+  if($('sh_inc_bench').checked && window._benchResults && window._benchResults.length)
+    payload.bench_results=window._benchResults;
+  if($('sh_inc_quality').checked && window._lastQuality){
+    const q=window._lastQuality;
+    payload.quality={svg:q.svg, verdict:q.verdict, tokens:q.tokens, report:q.report};
+  }
+  const notes=$('sh_notes').value.trim(); if(notes) payload.notes=notes;
+  return payload;
+}
+async function sharePreview(){
+  $('sh_out').textContent='building preview…';
+  try{
+    const r=await fetch('/api/share_preview',{method:'POST',
+      body:JSON.stringify({payload:shareCollect()})});
+    const d=await r.json();
+    if(!d.ok){ $('sh_out').innerHTML='<span class="reasons">'+esc(d.error)+'</span>'; return; }
+    window._shareReport=d.report;
+    $('sh_preview').textContent=d.report;
+    if(!$('sh_repo').value.trim()) $('sh_repo').value=d.default_repo||'';
+    $('sh_preview_wrap').style.display='';
+    $('sh_out').textContent='review the preview, then confirm to post.';
+  }catch(e){ $('sh_out').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
+}
+async function shareSubmit(){
+  const token=$('sh_token').value;
+  if(!token){ $('sh_out').innerHTML='<span class="reasons">enter the PAT (used once, never stored).</span>'; return; }
+  if(!window._shareReport){ $('sh_out').innerHTML='<span class="reasons">build the preview first.</span>'; return; }
+  if(!confirm('Post the previewed report to GitHub now? This sends data to an EXTERNAL service.')) return;
+  $('sh_btn').disabled=true; $('sh_out').textContent='submitting…';
+  try{
+    const r=await fetch('/api/share_submit',{method:'POST',body:JSON.stringify({
+      report:window._shareReport, token, repo:$('sh_repo').value.trim(),
+      existing_issue:$('sh_issue').value.trim()||null, confirmed:true})});
+    const d=await r.json();
+    $('sh_out').innerHTML=d.ok
+      ?('<span class="fitc">'+esc(d.action)+' issue #'+d.number+'</span> — '
+        +'<a href="'+esc(d.url||'#')+'" target="_blank">'+esc(d.url||'')+'</a>')
+      :'<span class="reasons">'+esc(d.error)+'</span>';
+  }catch(e){ $('sh_out').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
+  finally{ $('sh_btn').disabled=false; $('sh_token').value=''; }
+}
+
+// Landing is the default view (live monitor of any reachable server).
 showTab('landing');
 </script>
 </body>
