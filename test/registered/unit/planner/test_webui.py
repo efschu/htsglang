@@ -1342,6 +1342,36 @@ class TestV3IndexMarkers(CustomTestCase):
         ):
             self.assertIn(token, webui.INDEX_HTML, token)
 
+    def test_runner_left_column_single_flow(self):
+        """Runner redesign: EXACTLY one model selector (dropdown fills the one
+        free-text field + one GGUF sub-dropdown); the old duplicate launch
+        form (sv_*), plan-knob list and second variant dropdown are gone; the
+        SERVING identity group and the flag-surface search exist."""
+        html = webui.INDEX_HTML
+        # the one model selector: one free-text field, one gguf sub-dropdown.
+        self.assertEqual(html.count('id="model"'), 1)
+        self.assertEqual(html.count('id="gguf_choice"'), 1)
+        self.assertEqual(html.count('id="gguf_pick"'), 1)
+        # every removed duplicate input / mechanism is really gone.
+        for removed in (
+            'id="sv_model"', 'id="sv_variant"', 'id="sv_format"',
+            'id="sv_tp"', 'id="sv_rgi"', 'id="sv_rtr"', 'id="sv_kv"',
+            'id="sv_spec"', 'id="sv_ct"', 'id="sv_tool"', 'id="sv_reason"',
+            'id="sv_seqs"', 'id="sv_vision"', 'id="model_variant_select"',
+            "model_variant_wrap", "applyVariant", 'id="tp_size"',
+            'id="kv_cache_dtype"', 'id="knobs"', "loadKnobs", "knob_",
+            'id="notexpr"',
+        ):
+            self.assertNotIn(removed, html, removed)
+        # the new single-source structure is present.
+        for kept in (
+            'id="model_select"', 'id="sv_served"', 'id="sv_host"',
+            'id="sv_port"', 'id="sv_ctx"', 'id="max_running_requests"',
+            'id="flag_search"', "filterFlags", "SERVING_OWNED",
+            "modelState", "schedulePlan",
+        ):
+            self.assertIn(kept, html, kept)
+
     def test_one_placement_renderer_two_callers(self):
         # ONE renderer feeds both the landing (running) and the runner
         # (prospective) placement views.
