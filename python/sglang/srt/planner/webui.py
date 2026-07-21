@@ -280,7 +280,13 @@ def _int_list(v):
     if v is None or v == "":
         return None
     if isinstance(v, str) and v.strip() in _RATIO_SENTINELS:
-        return v.strip()
+        # PLAN path: "auto"/"auto-performance" means "derive the split" -- and
+        # deriving splits is exactly what the planner does, so pass None. Never
+        # forward the bare string: feasibility.plan() len()s the ratio, and
+        # len("auto")==4 / len("auto-performance")==16 produced the absurd
+        # '--rank-tp-ratio length (16) must equal --tp-size (3)' rejection.
+        # (The LAUNCH path keeps the sentinel via _launch_settings_from_payload.)
+        return None
     if isinstance(v, list):
         return [int(x) for x in v]
     return [int(x) for x in str(v).replace(" ", "").split(",") if x != ""]
@@ -4043,7 +4049,10 @@ function renderPlacement(pl){
         +fmtMib(d.attn.q_mib+d.attn.k_mib+d.attn.v_mib+d.attn.o_mib));
       if(d.gdn) bits.push('GDN K['+d.gdn.k_head_start+'..'+d.gdn.k_head_end
         +') V['+d.gdn.v_head_start+'..'+d.gdn.v_head_end+')');
-      if(d.kv) bits.push('KV tok ['+d.kv.pos_start+'..'+d.kv.pos_end+') '+d.kv.tokens_owned
+      // Cyclic owner rule: positions [lo..hi) of EVERY cycle_len-token block
+      // (interleaved across the whole context), never one contiguous range.
+      if(d.kv) bits.push('KV pos ['+d.kv.cycle_start+'..'+d.kv.cycle_end+') of every '
+        +d.kv.cycle_len+'-tok block, '+d.kv.tokens_owned
         +(d.kv.kv_token_capacity!=null?(' (cap '+Math.round(d.kv.kv_token_capacity)+')'):''));
       if(d.ex) bits.push('experts ['+d.ex.expert_start+'..'+d.ex.expert_end+') '+d.ex.num_experts);
       if(pl.mtp && pl.mtp.present && pl.mtp.per_rank_mib && pl.mtp.per_rank_mib[r]!=null)

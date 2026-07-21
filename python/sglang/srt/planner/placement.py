@@ -259,13 +259,19 @@ class GdnHeadPlacement:
 
 @dataclasses.dataclass
 class KvTokenPlacement:
-    """Where a slice of the SEQUENCE lives under uneven DCP: rank ``rank`` owns
-    context positions [pos_start, pos_end) of every request."""
+    """Where the SEQUENCE's KV lives under uneven DCP. The owner rule is
+    CYCLIC, not linear (distributed/utils.py, weighted prefix-range rule):
+    global slot L belongs to rank ``rank`` iff ``L % cycle_len`` falls in
+    [cycle_start, cycle_end). With token vector [33,13,18] (cycle 64), rank 0
+    owns positions 0..32 of EVERY 64-token block, interleaved across the whole
+    context -- NOT one contiguous range. ``tokens_owned`` is the rank's total
+    over the full context under that rule."""
 
     rank: int
     gpu_index: Optional[int]
-    pos_start: int
-    pos_end: int
+    cycle_len: int          # S = sum(token vector); 0 when no vector/context
+    cycle_start: int        # lo of this rank's within-cycle prefix range
+    cycle_end: int          # hi (exclusive)
     tokens_owned: int
     #: KV bytes for the owned positions at full context (owned_tokens * cell).
     kv_mib_owned: float
@@ -561,7 +567,9 @@ def compute_placement_struct(model_cfg: dict, flags) -> Placement:
         return fam_bytes.get(name, [0.0] * tp)[r]
 
     # ---- attention head placement ---------------------------------------
-    attn_heads = _compute_attn_heads(model, base_plan, rank_gpu, fam_bytes, notes)
+    attn_heads = _compute_attn_heads(
+        model, base_plan, rank_gpu, fam_bytes, notes, flags=flags
+    )
 
     # ---- GDN / linear-attention head placement ---------------------------
     gdn_heads = _compute_gdn_heads(model, base_plan, rank_gpu, fam_bytes, notes)
@@ -644,7 +652,26 @@ def compute_placement_struct(model_cfg: dict, flags) -> Placement:
 # ---------------------------------------------------------------------------
 # Sub-computations.
 # ---------------------------------------------------------------------------
-def _compute_attn_heads(model, base_plan, rank_gpu, fam_bytes, notes):
+def _uneven_dcp_active(flags, base_plan) -> bool:
+    """Mirror of the runtime's ``uneven_dcp_kv_replicated`` condition
+    (distributed/utils.py): the KV-replication + token-split path is in force
+    when DCP spans the TP group AND a NON-UNIFORM rank ratio plan is installed
+    -- regardless of kv_heads vs tp. Signals available at plan time: an
+    explicit dcp_size > 1, an explicit kv_token_vector, or the
+    SGLANG_UNEVEN_DCP env pair (auto-sets dcp_size at launch)."""
+    non_uniform = base_plan is not None and len(set(base_plan)) > 1
+    if not non_uniform:
+        return False
+    if flags is None:
+        return False
+    if (getattr(flags, "dcp_size", None) or 0) > 1:
+        return True
+    if getattr(flags, "kv_token_vector", None):
+        return True
+    return False
+
+
+def _compute_attn_heads(model, base_plan, rank_gpu, fam_bytes, notes, flags=None):
     from sglang.srt.distributed.utils import partition_units
 
     tp = model.tp_size
@@ -663,9 +690,17 @@ def _compute_attn_heads(model, base_plan, rank_gpu, fam_bytes, notes):
 
     attn_family = fam_bytes.get("attn", [0.0] * tp)
 
-    replicated = kv_heads < tp
+    # KV heads are replicated on TWO paths (matching the runtime's
+    # uneven_dcp_kv_replicated): (a) TP > kv_heads (head-sharding impossible),
+    # and (b) uneven DCP in force (dcp spans the TP group with a non-uniform
+    # ratio) -- there the KV cache is split on the TOKEN axis and every rank
+    # keeps the FULL kv-head set, EVEN when kv_heads >= tp. Showing 4:2:2
+    # head-sharded KV for the reference uneven-DCP config was wrong.
+    dcp_replicated = _uneven_dcp_active(flags, base_plan)
+    replicated = kv_heads < tp or dcp_replicated
     if not replicated:
-        # GQA / MHA: shard the KV-head grid; Q heads follow at the group size.
+        # GQA / MHA (coupled head-sharding, no DCP): shard the KV-head grid;
+        # Q heads follow at the group size.
         kv_units = partition_units(kv_heads, base_plan)
         group = max(q_heads // kv_heads, 1)
         q_per = [u * group for u in kv_units]
@@ -675,10 +710,15 @@ def _compute_attn_heads(model, base_plan, rank_gpu, fam_bytes, notes):
         k_ranges = _prefix_ranges(k_per)
         v_ranges = k_ranges
     else:
-        # TP > kv_heads: replicate the KV heads on every rank, shard the Q
-        # heads on the q-head grid (kv-group aligned, matching the runtime).
+        # Replicate the KV heads on every rank, shard the Q heads on the
+        # q-head grid (kv-group aligned, matching the runtime).
+        reason = (
+            f"TP={tp} > num_key_value_heads={kv_heads}"
+            if kv_heads < tp
+            else f"uneven DCP in force (non-uniform ratio, kv_heads={kv_heads} >= TP={tp})"
+        )
         notes.append(
-            f"TP={tp} > num_key_value_heads={kv_heads}: KV heads are REPLICATED "
+            f"{reason}: KV heads are REPLICATED "
             "on every rank and the token axis is sharded (uneven DCP). Granular "
             "K/V MiB counts the full replicated heads per rank, so it exceeds "
             "the cost model's lumped attn share (which approximates K/V as "
@@ -879,29 +919,38 @@ def _resolve_token_vector(model, flags, base_plan, have_budgets, notes):
 
 
 def _compute_kv_tokens(model, flags, rank_gpu, token_vector, capacity, tp, notes):
-    context = flags.context_length
+    """CYCLIC weighted prefix-range owner rule, mirroring the runtime
+    (distributed/utils.py): S = sum(token_vector); rank r owns the within-cycle
+    prefix range [lo_r, hi_r); global slot L belongs to r iff L % S in
+    [lo_r, hi_r). tokens_owned counts that rule exactly over the context --
+    the earlier linear "rank r owns tokens a..b" rendering was WRONG."""
+    context = flags.context_length or 0
     cell = model.kv_cell_bytes
-    if context and context > 0:
-        owned = _largest_remainder(context, token_vector)
-    else:
-        owned = [0] * tp
-        if not context:
-            notes.append(
-                "context_length not supplied: KV token-range placement reports "
-                "the ownership vector only (no absolute position ranges)."
-            )
-    ranges = _prefix_ranges(owned)
+    cycle = sum(token_vector) if token_vector else 0
+    ranges = _prefix_ranges(list(token_vector)) if token_vector else [(0, 0)] * tp
+    if not context:
+        notes.append(
+            "context_length not supplied: KV token placement reports the "
+            "within-cycle ownership ranges only (no absolute totals)."
+        )
     out = []
     for r in range(tp):
+        lo, hi = ranges[r]
+        if context and cycle:
+            full, rem = divmod(context, cycle)
+            owned = full * (hi - lo) + max(0, min(rem, hi) - lo)
+        else:
+            owned = 0
         cap = capacity["p"][r] if capacity else None
         out.append(
             KvTokenPlacement(
                 rank=r,
                 gpu_index=rank_gpu[r],
-                pos_start=ranges[r][0],
-                pos_end=ranges[r][1],
-                tokens_owned=owned[r],
-                kv_mib_owned=owned[r] * cell / _MIB,
+                cycle_len=cycle,
+                cycle_start=lo,
+                cycle_end=hi,
+                tokens_owned=owned,
+                kv_mib_owned=owned * cell / _MIB,
                 kv_token_capacity=(float(cap) if cap is not None else None),
                 kv_mib_capacity=(
                     float(cap) * cell / _MIB if cap is not None else None
