@@ -369,7 +369,9 @@ class TestProfiles(CustomTestCase):
         # card's CUDA index. Without an explicit bridge the FASTEST_FIRST
         # emulation puts the 5090 at cuda:0 (it sits at LIST position 1 in
         # the NVML-ordered _HETERO_GPUS -- the old bug duplicated that 1).
-        self.assertEqual(rg, [0, 1, 2, 0])
+        # CANONICAL counts order (ascending cuda, each index repeated its
+        # count) -- exactly what the Runner's rank steppers derive.
+        self.assertEqual(rg, [0, 0, 1, 2])
 
     def test_colocation_duplicates_bridged_cuda_index(self):
         # Explicitly bridged detect payload: the co-located entry must be
@@ -1384,3 +1386,86 @@ class TestStockSubsetPresets(CustomTestCase):
         self.assertNotIn("imperfect", info)
         self.assertNotIn("DOES NOT RUN", info)
         self.assertIn("stock requires", info)
+
+
+class TestColocationRankHelpers(CustomTestCase):
+    """Shared rank-distribution helpers behind the Runner's co-location
+    controls (per-card rank steppers): default distribution, canonical
+    rank_gpu_id derivation, and the reverse mapping for manual edits."""
+
+    _REF_CARDS = [(0, 32607), (1, 20480), (2, 20480)]  # cuda-space, 5090 first
+
+    def test_default_counts_proportional_largest_first(self):
+        # tp=4 on the reference box: VRAM-proportional floors 1/1/1, the
+        # extra rank goes to the largest card (the 5090 at cuda:0) -> 2/1/1.
+        self.assertEqual(
+            flags.colocation_rank_counts(4, self._REF_CARDS),
+            [(0, 2), (1, 1), (2, 1)],
+        )
+        # tp=5: extras keep going to the largest card first.
+        self.assertEqual(
+            flags.colocation_rank_counts(5, self._REF_CARDS),
+            [(0, 3), (1, 1), (2, 1)],
+        )
+        # tie on VRAM: lowest cuda index wins the extra.
+        self.assertEqual(
+            flags.colocation_rank_counts(3, [(0, 20480), (1, 20480)]),
+            [(0, 2), (1, 1)],
+        )
+
+    def test_rank_gpu_id_from_counts_canonical_order(self):
+        # 2 ranks on cuda:0 + 1 each on cuda:1/2 -> 0,0,1,2 (cards ascending
+        # in cuda order, each card's index repeated its count).
+        self.assertEqual(
+            flags.rank_gpu_id_from_counts({0: 2, 1: 1, 2: 1}), [0, 0, 1, 2]
+        )
+        # input order does not matter; pair sequences work too.
+        self.assertEqual(
+            flags.rank_gpu_id_from_counts([(2, 1), (0, 2), (1, 1)]),
+            [0, 0, 1, 2],
+        )
+
+    def test_reverse_populate_from_manual_rank_gpu_id(self):
+        # parseable comma string / int list -> per-card counts for the
+        # steppers (any rank order maps to the same counts).
+        self.assertEqual(
+            flags.rank_counts_from_gpu_id("0,0,1,2", (0, 1, 2)),
+            {0: 2, 1: 1, 2: 1},
+        )
+        self.assertEqual(
+            flags.rank_counts_from_gpu_id([0, 1, 2, 0], (0, 1, 2)),
+            {0: 2, 1: 1, 2: 1},
+        )
+        # NOT parseable -> None (the UI greys the steppers with the
+        # 'manual rank_gpu_id active' note): unknown card id, non-integer,
+        # or empty.
+        self.assertIsNone(flags.rank_counts_from_gpu_id("0,3", (0, 1, 2)))
+        self.assertIsNone(flags.rank_counts_from_gpu_id("a,b", (0, 1, 2)))
+        self.assertIsNone(flags.rank_counts_from_gpu_id("", (0, 1, 2)))
+        self.assertIsNone(flags.rank_counts_from_gpu_id(None, (0, 1, 2)))
+
+    def test_colocation_preset_round_trips_onto_steppers(self):
+        # The colocation PRESET prefills the controls: its rank_gpu_id maps
+        # back onto per-card counts, and re-deriving from those counts
+        # reproduces the preset's flag EXACTLY (canonical order), so preset
+        # -> steppers -> flag is loss-free.
+        profs = {p.kind: p for p in flags.profiles(_MOE_CFG, _HETERO_GPUS)}
+        colo = profs["colocation"]
+        rg = colo.settings["rank_gpu_id"]
+        tp = colo.settings["tp_size"]
+        counts = flags.rank_counts_from_gpu_id(rg, (0, 1, 2))
+        self.assertIsNotNone(counts)
+        self.assertEqual(sum(counts.values()), tp)
+        self.assertEqual(counts, {0: 2, 1: 1, 2: 1})  # 5090 (cuda:0) hosts 2
+        self.assertEqual(flags.rank_gpu_id_from_counts(counts), rg)
+
+    def test_sum_constraint_surfaces_as_resolve_error(self):
+        # The UI blocks Launch/Plan while the stepper sum != tp_size; the
+        # same broken state (rank_gpu_id length != tp) is also rejected by
+        # resolve()'s tuple-length rule -- enforced in BOTH layers.
+        res = flags.resolve(
+            {"tp_size": 4, "rank_gpu_id": [0, 1], "rank_gpu_memory_mib": 8000},
+            _MOE_CFG,
+        )
+        self.assertIsNotNone(res["rank_gpu_id"]["error"])
+        self.assertIn("4 entries", res["rank_gpu_id"]["error"])

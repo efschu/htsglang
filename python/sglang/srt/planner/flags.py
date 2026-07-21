@@ -1815,6 +1815,72 @@ def _pick_single_gpu(gpus: Sequence):
     return best, cuda_idx, why
 
 
+# ---------------------------------------------------------------------------
+# Co-location rank-distribution helpers: shared between the colocation
+# preset below and the Runner's per-card rank steppers (webui.py mirrors
+# coloDefaultCounts / coloRankGpuIdFromCounts / coloParseRankGpuId in JS --
+# keep the two sides in sync). All indices are CUDA-order (the --rank-gpu-id
+# space), never NVML/inventory positions.
+# ---------------------------------------------------------------------------
+
+
+def colocation_rank_counts(
+    tp: int, cards: Sequence[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
+    """Default per-card rank counts when ``tp`` ranks land on ``cards``
+    (sequence of ``(cuda_index, total_mib)``): VRAM-proportional floor
+    allocation, then the remaining ranks go to the LARGEST card first
+    (descending VRAM, tie: lowest cuda index, cycling). On the reference box
+    (5090 + 2x3080) tp=4 puts the extra rank on the 5090: 2/1/1.
+
+    Returns ``[(cuda_index, count)]`` ascending by cuda index. Deterministic
+    by construction -- the UI re-derives the same distribution on every
+    tp_size change."""
+    cards = sorted(((int(c), max(0, int(t or 0))) for c, t in cards))
+    if tp <= 0 or not cards:
+        return [(c, 0) for c, _t in cards]
+    total = sum(t for _c, t in cards) or 1
+    counts = {c: (tp * t) // total for c, t in cards}
+    assigned = sum(counts.values())
+    order = sorted(cards, key=lambda ct: (-ct[1], ct[0]))
+    i = 0
+    while assigned < tp:
+        counts[order[i % len(order)][0]] += 1
+        assigned += 1
+        i += 1
+    return [(c, counts[c]) for c, _t in cards]
+
+
+def rank_gpu_id_from_counts(counts) -> List[int]:
+    """Canonical ``--rank-gpu-id`` list from per-card rank counts (a dict
+    ``{cuda_index: count}`` or a sequence of ``(cuda_index, count)`` in any
+    order): cards ascending by CUDA index, each card's index repeated its
+    count -- 2 ranks on cuda:0 + 1 each on cuda:1/2 -> ``[0, 0, 1, 2]``."""
+    pairs = counts.items() if isinstance(counts, dict) else counts
+    out: List[int] = []
+    for cuda, count in sorted((int(c), int(n)) for c, n in pairs):
+        out.extend([cuda] * max(0, count))
+    return out
+
+
+def rank_counts_from_gpu_id(v, enabled_cuda) -> Optional[Dict[int, int]]:
+    """Reverse mapping for the UI steppers: parse a ``--rank-gpu-id`` value
+    (int list or comma string) into ``{cuda_index: rank count}``. Returns
+    None when the value is empty, any entry is not an integer, or an entry
+    names a card outside ``enabled_cuda`` -- the UI then greys the steppers
+    ('manual rank_gpu_id active') instead of guessing."""
+    lst = _as_int_list(v)
+    if not lst:
+        return None
+    legal = {int(c) for c in enabled_cuda}
+    counts: Dict[int, int] = {}
+    for g in lst:
+        if g not in legal:
+            return None
+        counts[g] = counts.get(g, 0) + 1
+    return counts
+
+
 def _hardware_spec(gpus: Sequence):
     """A manual :class:`HardwareSpec` from the profile generator's GPU list
     (dicts or GpuDescriptor-likes), for the capacity sizing below."""
@@ -2463,8 +2529,15 @@ def profiles(
     largest_pos = totals.index(max(totals)) if totals else 0
     largest_cuda, largest_cuda_src = _cuda_index_at(gpus, largest_pos)
     colo_tp = ngpu + 1
-    # extra rank co-locates on the largest card (cuda-space id).
-    rank_gpu = list(range(ngpu)) + [largest_cuda]
+    # One rank per card + the extra rank on the largest card (cuda-space
+    # ids), emitted in the CANONICAL counts order (rank_gpu_id_from_counts:
+    # ascending cuda index, each index repeated its count) -- exactly what
+    # the Runner's per-card rank steppers derive, so applying this preset
+    # and then touching a stepper round-trips without rewriting the flag.
+    colo_counts = {c: 1 for c in range(ngpu)}
+    colo_counts[largest_cuda] = colo_counts.get(largest_cuda, 0) + 1
+    rank_gpu = rank_gpu_id_from_counts(colo_counts)
+    colo_ranks = [i for i, g in enumerate(rank_gpu) if g == largest_cuda]
     # even budget: the scalar must fit BOTH the smallest solo card (minus a
     # context allowance) and half of the shared largest card (minus a shared
     # 2 GiB allowance) -- otherwise the co-located pair is physically
@@ -2473,8 +2546,9 @@ def profiles(
         1024, min(min(totals) - 1024, (max(totals) - 2048) // 2)
     )
     info = list(base_notes) + [
-        f"tp_size={colo_tp} on {ngpu} cards: rank {colo_tp - 1} "
-        f"co-locates with rank {largest_cuda} on the largest card "
+        f"tp_size={colo_tp} on {ngpu} cards: ranks "
+        + "+".join(str(r) for r in colo_ranks)
+        + " co-locate on the largest card "
         f"({_gpu_names(gpus)[largest_pos]}, cuda:{largest_cuda}). "
         "REQUIRES CUDA MPS (two ranks share one card). "
         f"Uniform per-rank budget {per_rank} MiB; ensure "
