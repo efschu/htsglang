@@ -971,3 +971,46 @@ class TestParseThroughServerArgs(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSingleGpuPick(unittest.TestCase):
+    """Single-gpu preset GPU selection: largest VRAM wins, VRAM tie -> higher
+    FLOPs, full tie -> first index. Default only -- the UI offers a selector;
+    the pin uses the stock --base-gpu-id flag."""
+
+    def test_hetero_picks_largest_vram(self):
+        idx, why = flags._pick_single_gpu(_HETERO_GPUS)
+        self.assertEqual(idx, 1)  # the 5090 sits at index 1 on this box
+        self.assertIn("5090", why)
+
+    def test_vram_tie_broken_by_flops(self):
+        g = [
+            {"name": "RTX 3080 20GB", "total_mib": 24564},
+            {"name": "RTX 4090", "total_mib": 24564},  # more FLOPs, same VRAM
+        ]
+        self.assertEqual(flags._pick_single_gpu(g)[0], 1)
+
+    def test_full_tie_first_index(self):
+        g = [
+            {"name": "RTX 3080", "total_mib": 20480},
+            {"name": "RTX 3080", "total_mib": 20480},
+        ]
+        self.assertEqual(flags._pick_single_gpu(g)[0], 0)
+
+    def test_single_preset_pins_base_gpu_id_and_sizes_that_card(self):
+        prof = [
+            p for p in flags.profiles(_REF_CFG, _HETERO_GPUS)
+            if p.kind == "single"
+        ][0]
+        self.assertEqual(prof.settings.get("base_gpu_id"), 1)
+        self.assertTrue(any("GPU pick" in n for n in prof.info))
+
+    def test_index_zero_pick_needs_no_pin(self):
+        # Homogeneous rig: pick is index 0 -> base_gpu_id stays at the stock
+        # default (0 / absent), no explicit pin required.
+        g = [
+            {"name": "RTX 3080", "total_mib": 20480},
+            {"name": "RTX 3080", "total_mib": 20480},
+        ]
+        prof = [p for p in flags.profiles(_REF_CFG, g) if p.kind == "single"][0]
+        self.assertIn(prof.settings.get("base_gpu_id"), (None, 0))
