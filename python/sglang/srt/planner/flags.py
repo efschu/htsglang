@@ -1522,6 +1522,57 @@ def _gpu_names(gpus: Sequence) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
+def _gpu_flops(g) -> float:
+    """Best-effort FLOPs for the single-GPU tiebreak: a measured/explicit value
+    on the descriptor wins; else the SEED_PROFILES peak table matched by name;
+    else 0 (unknown cards tie and fall through to first-index)."""
+    name = str((g.get("name") if isinstance(g, dict) else getattr(g, "name", "")) or "")
+    for key in ("gemm_tflops", "tflops", "peak_gemm_tflops_fp16"):
+        v = g.get(key) if isinstance(g, dict) else getattr(g, key, None)
+        if v:
+            return float(v)
+    try:
+        from sglang.srt.planner.profiles import SEED_PROFILES
+
+        low = name.lower()
+        for p in SEED_PROFILES.values():
+            if p.name.lower() in low or low in p.name.lower():
+                return float(p.peak_gemm_tflops_fp16 or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _pick_single_gpu(gpus: Sequence):
+    """Default card for the single-gpu preset: (index, reason) or None.
+
+    Rule: largest total VRAM; VRAM tie -> higher FLOPs; full tie -> first.
+    """
+    if not gpus:
+        return None
+
+    def _mib(g) -> int:
+        v = g.get("total_mib") if isinstance(g, dict) else getattr(g, "total_mib", 0)
+        return int(v or 0)
+
+    def _name(g) -> str:
+        return str((g.get("name") if isinstance(g, dict) else getattr(g, "name", "")) or "?")
+
+    best = 0
+    for i in range(1, len(gpus)):
+        if _mib(gpus[i]) > _mib(gpus[best]):
+            best = i
+        elif _mib(gpus[i]) == _mib(gpus[best]) and _gpu_flops(gpus[i]) > _gpu_flops(gpus[best]):
+            best = i
+        # full tie: keep the earlier index
+    why = (
+        f"GPU pick: index {best} ({_name(gpus[best])}, {_mib(gpus[best])} MiB) "
+        "-- largest VRAM, ties broken by FLOPs, then first index. "
+        "Selectable in the UI; pinned via the stock --base-gpu-id flag."
+    )
+    return best, why
+
+
 def _hardware_spec(gpus: Sequence):
     """A manual :class:`HardwareSpec` from the profile generator's GPU list
     (dicts or GpuDescriptor-likes), for the capacity sizing below."""
@@ -1976,9 +2027,22 @@ def profiles(
     fork_env = _fork_launch_env(python_exe, launch_env_notes)
 
     # --- single-gpu -------------------------------------------------------
+    # GPU pick rule (user-mandated): largest VRAM wins; on a VRAM tie the
+    # higher-FLOPs card wins; on a full tie the first (lowest index) wins.
+    # The pick is a DEFAULT -- the UI offers a selector; base_gpu_id is the
+    # stock upstream flag for pinning the card, so this preset stays stock.
+    pick = _pick_single_gpu(gpus)
     info = list(base_notes) + ["Single GPU, no tensor parallelism."]
-    s = _mk({"tp_size": 1}, info)
-    _apply_capacity_rules(s, info, model_cfg, gpus, stock_even=True)
+    overrides: Dict[str, Any] = {"tp_size": 1}
+    if pick is not None:
+        idx, why = pick
+        if idx != 0:
+            overrides["base_gpu_id"] = idx
+        info.append(why)
+    s = _mk(overrides, info)
+    # Size against the CHOSEN card only, not gpus[0].
+    cap_gpus = [gpus[pick[0]]] if pick is not None else gpus
+    _apply_capacity_rules(s, info, model_cfg, cap_gpus, stock_even=True)
     out.append(Profile("single-gpu", "single", s, info=info))
 
     if ngpu <= 1:
