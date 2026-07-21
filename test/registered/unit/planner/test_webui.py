@@ -1961,3 +1961,131 @@ class TestQualityPermissionNote(CustomTestCase):
         qi = webui.INDEX_HTML.index('id="view_quality"')
         ni = webui.INDEX_HTML.index("quality_permission_note")
         self.assertGreater(ni, qi)
+
+
+class TestColocationControls(CustomTestCase):
+    """Explicit co-location controls in the Runner's GPU offload/split
+    section: tp chooser, per-card rank steppers (sum == tp enforced),
+    even/uneven selector, preset prefill, and the Launch/Plan gate."""
+
+    def test_new_ids_and_mps_note_present(self):
+        html = webui.INDEX_HTML
+        for token in (
+            'id="row_tp_count"', 'id="tp_count"', 'id="colo_box"',
+            'id="colo_note"', 'id="colo_rows"', 'id="colo_sum"',
+            'id="colo_err"', 'id="colo_manual_note"',
+            'id="row_split_mode"', 'id="split_mode_select"',
+        ):
+            self.assertEqual(html.count(token), 1, token)
+        # tp chooser sits at the TOP of the GPU offload/split section,
+        # above the prospective placement and the single-GPU pick.
+        self.assertGreater(html.index('id="row_tp_count"'),
+                           html.index('id="sec_gpu"'))
+        self.assertLess(html.index('id="row_tp_count"'),
+                        html.index('id="gpu_placement"'))
+        self.assertLess(html.index('id="colo_box"'),
+                        html.index('id="row_gpu_pick"'))
+        # MPS-required + fork-only notes.
+        self.assertIn("REQUIRES CUDA MPS", html)
+        self.assertIn("fork-only capability", html)
+        self.assertIn("cannot co-locate ranks at all", html)
+
+    def test_derivation_and_reverse_populate_js_present(self):
+        html = webui.INDEX_HTML
+        # canonical derivation (mirrors flags.rank_gpu_id_from_counts) +
+        # default distribution (mirrors flags.colocation_rank_counts) +
+        # reverse mapping (mirrors flags.rank_counts_from_gpu_id).
+        for token in (
+            "function coloCards", "function coloDefaultCounts",
+            "function coloRankGpuIdFromCounts", "function coloParseRankGpuId",
+            "function updateColoUI", "flags.colocation_rank_counts",
+            "flags.rank_counts_from_gpu_id",
+            "rank_gpu_id 0,0,1,2",  # the documented 2/1/1 -> 0,0,1,2 rule
+        ):
+            self.assertIn(token, html, token)
+        # manual rank_gpu_id mode: steppers grey out with the note.
+        self.assertIn("manual rank_gpu_id active", html)
+        self.assertIn("_coloManual", html)
+
+    def test_controls_write_authoritative_fields_and_replan(self):
+        html = webui.INDEX_HTML
+        # every control routes through the ONE flag surface + onFlagChange,
+        # which drives the SAME debounced re-resolve/re-plan path
+        # (resolveFlags + refreshRunnerPlacement + schedulePlan).
+        self.assertIn("function tpCountChanged", html)
+        self.assertIn("onFlagChange('tp_size')", html)
+        self.assertIn("function coloRanksChanged", html)
+        self.assertIn("onFlagChange('rank_gpu_id')", html)
+        self.assertIn("function splitModeChanged", html)
+        self.assertIn("onFlagChange('rank_tp_ratio')", html)
+        self.assertIn("fl_tp_size", html)
+        self.assertIn("fl_rank_gpu_id", html)
+        self.assertIn("fl_rank_tp_ratio", html)
+        # updateColoUI is wired into flag edits, preset apply and card list.
+        self.assertGreaterEqual(html.count("updateColoUI()"), 3)
+
+    def test_split_mode_selector_values(self):
+        html = webui.INDEX_HTML
+        # three-way + custom: even clears the ratio (uniform split), the two
+        # uneven modes write the enum sentinels, custom leaves the free-text
+        # rank-tp-ratio field authoritative.
+        for token in (
+            '<option value="even">', '<option value="auto">',
+            '<option value="auto-performance">', '<option value="custom">',
+            "el.value=(v==='even')? '' : v",
+            "if(v==='custom') return;",
+        ):
+            self.assertIn(token, html, token)
+
+    def test_launch_and_plan_gated_on_rank_sum(self):
+        html = webui.INDEX_HTML
+        self.assertIn("function coloBlockError", html)
+        self.assertIn("sum must equal tp", html)
+        # Plan gate: doPlan refuses with the inline reason.
+        self.assertIn("PLAN BLOCKED", html)
+        # Launch/Restart gate: both go through launchGate().
+        self.assertIn("function launchGate", html)
+        self.assertEqual(html.count("if (!launchGate()) return;"), 2)
+
+    def test_placement_reacts_to_colocation_flags_with_overcommit(self):
+        # The prospective placement consumed by the section must carry the
+        # physical-impossibility flag for the co-located card: 2 x 18000 MiB
+        # on a 32607 MiB card exceeds it -> EXCEEDS CARD; 2 x 15000 fits.
+        d = webui.placement_payload(
+            {"model_cfg": _V2_CONFIG,
+             "flags": {"tp_size": 4, "rank_gpu_id": [0, 0, 1, 2],
+                       "rank_gpu_memory_mib": [18000] * 4,
+                       "card_total_mib": {"0": 32607, "1": 20480,
+                                          "2": 20480},
+                       "context_length": 8192}}
+        )
+        self.assertTrue(d["ok"], d.get("error"))
+        cards = {c["gpu_index"]: c for c in d["placement"]["cards"]}
+        self.assertEqual(cards[0]["ranks"], [0, 1])
+        self.assertTrue(cards[0]["physical_overcommit"])
+        self.assertFalse(cards[1]["physical_overcommit"])
+        d2 = webui.placement_payload(
+            {"model_cfg": _V2_CONFIG,
+             "flags": {"tp_size": 4, "rank_gpu_id": [0, 0, 1, 2],
+                       "rank_gpu_memory_mib": [15000] * 4,
+                       "card_total_mib": {"0": 32607, "1": 20480,
+                                          "2": 20480},
+                       "context_length": 8192}}
+        )
+        self.assertTrue(d2["ok"], d2.get("error"))
+        cards2 = {c["gpu_index"]: c for c in d2["placement"]["cards"]}
+        self.assertFalse(cards2[0]["physical_overcommit"])
+        # the renderer shows the flag as the EXCEEDS CARD marker.
+        self.assertIn("EXCEEDS CARD", webui.INDEX_HTML)
+
+    def test_preset_prefill_maps_onto_steppers(self):
+        # applyProfile refreshes the co-location controls (reverse-populate,
+        # never redistribute) right after filling the flag surface.
+        html = webui.INDEX_HTML
+        i_apply = html.index("function applyProfile(")
+        i_snap = html.index("window._presetBase=presetSnapshot()")
+        i_colo = html.index("updateColoUI()", i_apply)
+        self.assertLess(i_apply, i_colo)
+        self.assertLess(i_colo, i_snap)
+        self.assertIn("window._coloRedistribute=false;\n  updateGpuPick(); updateColoUI();",
+                      html)

@@ -3438,6 +3438,44 @@ INDEX_HTML = r"""<!doctype html>
       <details class="cfg-section" id="sec_gpu">
         <summary><b>GPU offload / split</b><span class="sec-sum" id="sum_gpu"></span></summary>
         <div class="sec-body">
+          <div class="setrow" id="row_tp_count"
+            data-hay="tensor parallel tp size rank count co-location colocation">
+            <span class="lbl">tensor-parallel ranks (tp)
+              <span class="chg" title="changed from preset"></span></span>
+            <input type="number" class="num" id="tp_count" min="1" step="1"
+              onchange="tpCountChanged()">
+            <span class="qmark" title="Rank count for tensor parallelism (mirrors --tp-size; the tp-size row below stays the authoritative field). More ranks than enabled cards is allowed: the extra ranks then CO-LOCATE -- several ranks share one physical card. That needs CUDA MPS and is a fork-only capability; the per-card assignment controls appear below when tp exceeds the enabled card count.">?</span>
+          </div>
+          <div id="colo_box" style="display:none">
+            <div class="muted" id="colo_note" style="margin:.2rem 0 .3rem;color:#e3a008">
+              tp exceeds the enabled card count &mdash; the extra ranks
+              CO-LOCATE (share a physical card). REQUIRES CUDA MPS on the
+              shared card(s); co-location is a fork-only capability (stock
+              sglang cannot co-locate ranks at all). Set how many ranks each
+              card hosts; the sum must equal tp. The derived --rank-gpu-id
+              (below) stays the authoritative flag.</div>
+            <div id="colo_rows"></div>
+            <div id="colo_sum" class="muted" style="margin:.15rem 0"></div>
+            <div id="colo_err" class="reasons" style="display:none;margin:.15rem 0"></div>
+            <div id="colo_manual_note" class="muted"
+              style="display:none;color:#e3a008;margin:.15rem 0">
+              manual rank_gpu_id active &mdash; the free-text rank-gpu-id
+              field holds a value these steppers cannot represent (non-integer
+              or an id outside the enabled cards); edit or clear it there to
+              re-enable the steppers.</div>
+          </div>
+          <div class="setrow" id="row_split_mode" style="display:none"
+            data-hay="even uneven sharding split rank-tp-ratio auto performance">
+            <span class="lbl">shard split across ranks
+              <span class="chg" title="changed from preset"></span></span>
+            <select id="split_mode_select" onchange="splitModeChanged()">
+              <option value="even">even (uniform shards)</option>
+              <option value="auto">uneven auto (max KV)</option>
+              <option value="auto-performance">uneven auto-performance</option>
+              <option value="custom">custom vector (rank-tp-ratio field)</option>
+            </select>
+            <span class="qmark" title="even: uniform equal-size shards on every rank (clears --rank-tp-ratio). With --rank-gpu-id set this still runs the FORK path, just with a uniform split -- stock sglang cannot co-locate ranks at all. uneven auto: VRAM-proportional shards (--rank-tp-ratio auto, budgets from NVML totals minus --rank-auto-reserve-mib). uneven auto-performance: the VRAM split plus a measured MLP-family shift toward the compute-strong card. custom: an explicit per-rank integer vector typed into the rank-tp-ratio field below, which stays authoritative.">?</span>
+          </div>
           <div id="gpu_placement" class="muted" style="margin:.25rem 0 .4rem">
             plan a model to see the prospective placement&hellip;</div>
           <div class="setrow" id="row_gpu_pick" style="display:none"
@@ -3753,7 +3791,7 @@ function renderCards() {
     row.appendChild(barWrap);
     box.appendChild(row);
   });
-  updateGpuPick();
+  updateGpuPick(); updateColoUI();
 }
 
 // The ONE model selector's state: the free-text field is the reference; the
@@ -3854,6 +3892,14 @@ function concurrencyTable(d) {
 
 async function doPlan() {
   $('issue').innerHTML = '';
+  // Co-location gate: an incomplete per-card rank assignment (sum != tp)
+  // blocks planning with the same inline error the section shows.
+  const coloErr = coloBlockError();
+  if (coloErr) {
+    $('verdict').innerHTML = '<div class="verdict nofit">PLAN BLOCKED</div>';
+    $('split').innerHTML = '<ul class="reasons"><li>' + esc(coloErr) + '</li></ul>';
+    return;
+  }
   // Clear any prior verdict immediately so a slow sizing (e.g. a first-time
   // GGUF header fetch) never leaves a stale REJECTED on screen — the exact
   // "re-validate does nothing" confusion.
@@ -5098,11 +5144,15 @@ function filterFlags(){
   const q=($('flag_search').value||'').trim().toLowerCase();
   const secHits={context:0,gpu:0,speculative:0,cache:0,serving:0,advanced:0};
   // static (serving-owned) rows carry their haystack in data-hay.
-  for(const rid of ['row_sv_ctx','row_mrr','row_sv_served','row_sv_host','row_sv_port']){
+  // row_split_mode / row_gpu_pick / colo_box are STATE-driven (updateColoUI /
+  // updateGpuPick own their visibility) and stay out of the search filter.
+  const _staticSec={row_sv_ctx:'context', row_mrr:'context', row_tp_count:'gpu',
+    row_sv_served:'serving', row_sv_host:'serving', row_sv_port:'serving'};
+  for(const rid of Object.keys(_staticSec)){
     const row=$(rid); if(!row) continue;
     const hit=!q || (row.getAttribute('data-hay')||'').indexOf(q)>=0;
     row.style.display=hit?'':'none';
-    if(hit) secHits[rid==='row_sv_ctx'||rid==='row_mrr'?'context':'serving']++;
+    if(hit) secHits[_staticSec[rid]]++;
   }
   for(const g of Object.keys(d.groups)){
     for(const f of _surfaceSpecs(g)){
@@ -5172,7 +5222,11 @@ function onFlagChange(id){
   // then falls back to the form fields; the profile env stays applied).
   if(window._profileArgv){ window._profileArgv=null; window._profileDirty=true; renderProfileLaunch(); }
   if(id==='speculative_draft_model_path'){ renderDraftPick(); updateSpecDraftHint(); }
-  markPresetDrift(); updateSectionSummaries(); updateGpuPick();
+  // tp_size change -> the co-location steppers re-derive the DEFAULT
+  // VRAM-proportional distribution (spec'd behavior; a manual-unparseable
+  // rank_gpu_id is never overwritten).
+  if(id==='tp_size') window._coloRedistribute=true;
+  updateGpuPick(); updateColoUI(); markPresetDrift(); updateSectionSummaries();
   resolveFlags(); refreshRunnerPlacement(); schedulePlan();
 }
 // ---- context-length / max-running-requests: slider+numeric pairs ----------
@@ -5244,6 +5298,167 @@ function gpuPickChanged(){
   const el=$('fl_base_gpu_id');
   if(el){ el.value=$('gpu_pick_select').value; onFlagChange('base_gpu_id'); }
 }
+// ---- co-location controls (GPU offload/split section) ---------------------
+// tp_count mirrors fl_tp_size (authoritative). When tp exceeds the enabled
+// card count the per-card rank steppers activate: one row per enabled card
+// (CUDA order, dual cuda/nvml label). Derivation rule (canonical, mirrors
+// flags.rank_gpu_id_from_counts): cards ascending by cuda index, each card's
+// index repeated its rank count -- 2 on cuda:0 + 1 each on cuda:1/2 ->
+// rank_gpu_id 0,0,1,2. fl_rank_gpu_id stays THE authoritative field; manual
+// edits there reverse-populate the steppers when parseable, else the
+// steppers grey out with the 'manual rank_gpu_id active' note.
+function coloCards(){
+  // Enabled cards keyed in CUDA space: detected cards use the bridged
+  // cuda_index; virtual/undetected cards fill the lowest unused keys (the
+  // exact rule the plan payload / runnerFlags inventory uses).
+  const incl=CARDS.filter(c=>c.include);
+  const used={};
+  incl.forEach(c=>{ if(c.cuda_index!=null) used[c.cuda_index]=1; });
+  let nextFree=0;
+  const out=incl.map(c=>{
+    let k=c.cuda_index;
+    if(k==null){ while(used[nextFree]) nextFree++; k=nextFree; used[k]=1; }
+    return {cuda:k, nvml:c.nvml_index, name:c.name, total_mib:c.total_mib||0};
+  });
+  out.sort((a,b)=>a.cuda-b.cuda);
+  return out;
+}
+function coloDefaultCounts(tp, cards){
+  // Default distribution: VRAM-proportional floor allocation, remaining
+  // ranks to the LARGEST card first (descending VRAM, tie: lowest cuda,
+  // cycling) -- on the reference box tp=4 puts the extra rank on the 5090
+  // (2/1/1). Mirrors flags.colocation_rank_counts; keep the two in sync.
+  const sum=cards.reduce((a,c)=>a+Math.max(0,c.total_mib),0)||1;
+  const counts={}; let assigned=0;
+  for(const c of cards){
+    const n=Math.floor(tp*Math.max(0,c.total_mib)/sum);
+    counts[c.cuda]=n; assigned+=n;
+  }
+  const order=cards.slice().sort((a,b)=>(b.total_mib-a.total_mib)||(a.cuda-b.cuda));
+  let i=0;
+  while(assigned<tp && order.length){ counts[order[i%order.length].cuda]++; assigned++; i++; }
+  return counts;
+}
+function coloRankGpuIdFromCounts(counts, cards){
+  // canonical order: ascending cuda, each index repeated its count.
+  const out=[];
+  for(const c of cards) for(let i=0;i<(counts[c.cuda]||0);i++) out.push(c.cuda);
+  return out.join(',');
+}
+function coloParseRankGpuId(v, cards){
+  // -> {cuda: count} when every entry is an integer naming an enabled card,
+  // else null (manual mode). Mirrors flags.rank_counts_from_gpu_id.
+  const toks=String(v==null?'':v).replace(/[\s\[\]]/g,'').split(',').filter(x=>x!=='');
+  if(!toks.length) return null;
+  const legal={}; cards.forEach(c=>{legal[c.cuda]=1;});
+  const counts={};
+  for(const t of toks){
+    if(!/^\d+$/.test(t)) return null;
+    const k=parseInt(t);
+    if(!legal[k]) return null;
+    counts[k]=(counts[k]||0)+1;
+  }
+  return counts;
+}
+function tpCountChanged(){
+  const el=$('fl_tp_size'); if(!el) return;
+  el.value=$('tp_count').value.trim();
+  onFlagChange('tp_size');  // sets _coloRedistribute (default spread on tp change)
+}
+function coloRanksChanged(){
+  // Self-updating by construction: the changed stepper stands, the sum /
+  // free-remainder line updates, and the canonical rank_gpu_id is written
+  // to the authoritative field (a wrong sum surfaces as the inline error +
+  // resolve()'s tuple-length error and blocks Launch/Plan).
+  const cards=coloCards(); const counts={};
+  for(const c of cards){
+    const el=$('colo_ranks_'+c.cuda);
+    counts[c.cuda]=el? Math.max(0, parseInt(el.value)||0) : 0;
+  }
+  const el=$('fl_rank_gpu_id');
+  if(el){ el.value=coloRankGpuIdFromCounts(counts, cards); onFlagChange('rank_gpu_id'); }
+}
+function splitModeChanged(){
+  const v=$('split_mode_select').value;
+  if(v==='custom') return;  // the free-text rank-tp-ratio field is authoritative
+  const el=$('fl_rank_tp_ratio'); if(!el) return;
+  el.value=(v==='even')? '' : v;   // even = uniform split: ratio cleared
+  onFlagChange('rank_tp_ratio');
+}
+function coloBlockError(){
+  // The Launch/Plan gate: while the co-location steppers are active their
+  // sum must equal tp_size (manual rank_gpu_id mode gates via resolve()).
+  const box=$('colo_box');
+  if(!box || box.style.display==='none' || window._coloManual) return null;
+  const tp=_effectiveTp(); const cards=coloCards();
+  let sum=0;
+  for(const c of cards){
+    const el=$('colo_ranks_'+c.cuda); sum+=el? (parseInt(el.value)||0):0;
+  }
+  if(sum===tp) return null;
+  return 'co-location rank assignment: '+sum+' of '+tp+' ranks placed ('
+    +(sum<tp? (tp-sum)+' still free' : (sum-tp)+' too many')
+    +') -- the per-card sum must equal tp before Launch/Plan.';
+}
+function updateColoUI(){
+  const box=$('colo_box'); if(!box) return;
+  const s=window._flagSettings||{};
+  const cards=coloCards();
+  const tp=_effectiveTp();
+  // tp mirror (authoritative field: fl_tp_size).
+  const tpc=$('tp_count');
+  if(tpc){
+    tpc.value=(s.tp_size!=null && s.tp_size!=='')? String(s.tp_size):'';
+    tpc.placeholder='(cards: '+(cards.length||1)+')';
+  }
+  // even/uneven selector state from the authoritative fl_rank_tp_ratio.
+  const smRow=$('row_split_mode');
+  if(smRow){
+    smRow.style.display=(tp>1)?'':'none';
+    const rtr=(s.rank_tp_ratio!=null && s.rank_tp_ratio!=='')? String(s.rank_tp_ratio):'';
+    const sel=$('split_mode_select');
+    sel.value=(rtr==='')?'even':(rtr==='auto'||rtr==='auto-performance')?rtr:'custom';
+  }
+  const active=tp>cards.length && cards.length>0;
+  box.style.display=active?'':'none';
+  if(!active){ window._coloRedistribute=false; window._coloManual=false; return; }
+  const raw=s.rank_gpu_id;
+  const has=(raw!=null && String(raw)!=='');
+  let counts=has? coloParseRankGpuId(raw, cards):null;
+  let manual=has && counts==null;
+  if((!has || (window._coloRedistribute && !manual))){
+    // no mapping yet, or tp_size changed: apply the default VRAM-
+    // proportional distribution and write the derived canonical
+    // rank_gpu_id into the authoritative field (no onFlagChange recursion:
+    // the caller's resolve/replan pass picks the new value up).
+    counts=coloDefaultCounts(tp, cards);
+    const v=coloRankGpuIdFromCounts(counts, cards);
+    const el=$('fl_rank_gpu_id'); if(el) el.value=v;
+    window._flagSettings=window._flagSettings||{};
+    if(v==='') delete window._flagSettings.rank_gpu_id;
+    else window._flagSettings.rank_gpu_id=v;
+    manual=false;
+  }
+  window._coloRedistribute=false;
+  window._coloManual=manual;
+  // one stepper row per enabled card, CUDA-ordered, dual cuda/nvml label.
+  $('colo_rows').innerHTML=cards.map(c=>
+    '<div class="setrow" id="colorow_'+c.cuda+'">'
+    +'<span class="lbl">ranks on ['+ (devLabel(c.cuda, c.nvml)||('gpu '+c.cuda)) +'] '
+    +esc(c.name)+' <span class="muted">('+(c.total_mib/1024).toFixed(0)+'G)</span></span>'
+    +'<input type="number" class="num" id="colo_ranks_'+c.cuda+'" min="0" step="1"'
+    +(manual?' disabled':'')+' value="'+((counts&&counts[c.cuda])||0)+'"'
+    +' onchange="coloRanksChanged()">'
+    +'</div>').join('');
+  $('colo_rows').style.opacity=manual?'0.45':'1';
+  $('colo_manual_note').style.display=manual?'':'none';
+  let sum=0; if(counts) for(const k of Object.keys(counts)) sum+=counts[k];
+  $('colo_sum').textContent=manual? ''
+    : 'assigned '+sum+' of '+tp+' ranks -- free: '+(tp-sum);
+  const err=coloBlockError();
+  $('colo_err').style.display=err?'':'none';
+  $('colo_err').textContent=err||'';
+}
 // ---- draft-model selector (Speculative section): matching LOCAL draft
 // heads for the selected base model; picking one writes the authoritative
 // fl_speculative_draft_model_path free-text field. -------------------------
@@ -5282,6 +5497,7 @@ function updateSpecDraftHint(){
 // Snapshot every row's value when a preset is applied; a differing row gets
 // the subtle amber dot. No preset applied -> no markers.
 const _STATIC_ROWS={sv_ctx:'row_sv_ctx', max_running_requests:'row_mrr',
+  tp_count:'row_tp_count',
   sv_served:'row_sv_served', sv_host:'row_sv_host', sv_port:'row_sv_port'};
 function _rowValue(el){
   if(!el) return '';
@@ -5524,7 +5740,11 @@ function applyProfile(i){
   sl.value=Math.min(parseInt($('sv_ctx').value)||8192, parseInt(sl.max));
   const mv=parseInt($('max_running_requests').value);
   if(mv) $('mrr_slider').value=Math.min(mv, 64);
-  updateGpuPick(); renderDraftPick(); updateSpecDraftHint();
+  // Preset prefill reaches the co-location controls too: the profile's
+  // tp_size / rank_gpu_id map back onto the tp mirror + per-card steppers
+  // (reverse-populated, never redistributed).
+  window._coloRedistribute=false;
+  updateGpuPick(); updateColoUI(); renderDraftPick(); updateSpecDraftHint();
   window._presetBase=presetSnapshot();
   markPresetDrift(); updateSectionSummaries();
   resolveFlags(); refreshRunnerPlacement(); doPlan();
@@ -5920,12 +6140,23 @@ function launchBody() {
   if (window._profileArgv) body.profile_argv = window._profileArgv;
   return body;
 }
+// Co-location gate for Launch/Restart: refuse while the per-card rank
+// assignment does not sum to tp (the section shows the same inline error).
+function launchGate() {
+  const coloErr = coloBlockError();
+  if (!coloErr) return true;
+  $('sv_out').innerHTML = '<div class="reasons">' + esc(coloErr) + '</div>';
+  updateColoUI();
+  return false;
+}
 function serverStart() {
+  if (!launchGate()) return;
   updateStatusChip('booting');
   serverPost('/api/server_start', launchBody());
   pollStatusUntilSettled();
 }
 function serverRestart() {
+  if (!launchGate()) return;
   if (!confirm('Restart REPLACES the single managed instance (stops the running model). Continue?')) return;
   updateStatusChip('booting');
   serverPost('/api/server_restart', launchBody());
