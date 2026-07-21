@@ -1678,9 +1678,19 @@ function concurrencyTable(d) {
 
 async function doPlan() {
   $('issue').innerHTML = '';
-  const r = await fetch('/api/plan', {method:'POST', body: JSON.stringify(payload())});
-  const d = await r.json();
-  render(d);
+  // Clear any prior verdict immediately so a slow sizing (e.g. a first-time
+  // GGUF header fetch) never leaves a stale REJECTED on screen — the exact
+  // "re-validate does nothing" confusion.
+  $('verdict').innerHTML = '<div class="verdict">sizing…</div>';
+  $('split').innerHTML = '';
+  try {
+    const r = await fetch('/api/plan', {method:'POST', body: JSON.stringify(payload())});
+    const d = await r.json();
+    render(d);
+  } catch (e) {
+    $('verdict').innerHTML = '<div class="verdict nofit">PLAN ERROR</div>';
+    $('split').innerHTML = '<ul class="reasons"><li>' + esc(String(e)) + '</li></ul>';
+  }
 }
 
 function render(d) {
