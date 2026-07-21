@@ -61,12 +61,19 @@ __all__ = [
     "upstream_count",
     "fork_count",
     "resolve",
+    "cross_field_errors",
     "profiles",
+    "profile_argv",
+    "profile_env",
     "validate_profile",
     "ProfileStore",
     "DEFAULT_STORE_PATH",
     "model_is_moe",
     "model_kv_heads",
+    "model_is_hybrid",
+    "model_has_mtp",
+    "model_quant_kind",
+    "rig_has_sm86",
 ]
 
 
@@ -109,6 +116,96 @@ def model_kv_heads(model_cfg: Optional[dict]) -> Optional[int]:
         return int(v) if v is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def model_is_hybrid(model_cfg: Optional[dict]) -> bool:
+    """True for a hybrid attention/linear-attention (GDN/mamba) model, e.g.
+    Qwen3.5/3.6: ``layer_types`` contains 'linear_attention', or the config
+    carries ``linear_num_value_heads`` / ``mamba_*`` keys. Hybrid models need
+    ``--hicache-mem-layout page_first_direct`` under the hierarchical cache
+    (MambaPoolHost rejects every other layout) and honor the
+    ``SGLANG_MAMBA_SSM_DTYPE`` env var."""
+    lt = _cfg_get(model_cfg, "layer_types")
+    if isinstance(lt, (list, tuple)) and "linear_attention" in lt:
+        return True
+    if _cfg_get(model_cfg, "linear_num_value_heads") is not None:
+        return True
+    if _cfg_get(model_cfg, "mamba_ssm_dtype") is not None or _cfg_get(
+        model_cfg, "mamba_d_state"
+    ):
+        return True
+    return False
+
+
+def model_has_mtp(model_cfg: Optional[dict]) -> bool:
+    """True when the checkpoint ships MTP draft layers (NEXTN speculative
+    decoding is possible): ``mtp_num_hidden_layers`` or
+    ``num_nextn_predict_layers`` > 0."""
+    v = _cfg_get(model_cfg, "mtp_num_hidden_layers")
+    if v is None:
+        v = _cfg_get(model_cfg, "num_nextn_predict_layers")
+    try:
+        return v is not None and int(v) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def model_quant_kind(model_cfg: Optional[dict]) -> Optional[str]:
+    """Coarse checkpoint-quant classification for the calibration table:
+    'fp8' (self-declaring fp8 quant_method), 'awq' (compressed-tensors / awq
+    quant_method — on this rig the compressed-tensors checkpoint IS the AWQ
+    one), or None when the config does not self-declare."""
+    qc = _cfg_get(model_cfg, "quantization_config")
+    if not isinstance(qc, dict):
+        return None
+    method = str(qc.get("quant_method") or "").lower()
+    if method == "fp8":
+        return "fp8"
+    if method in ("compressed-tensors", "awq"):
+        return "awq"
+    return None
+
+
+#: GPU-name fragments that identify sm86 (Ampere GA10x) cards. fp8_e4m3 KV is
+#: NOT supported on sm86 — any hit forces kv-cache-dtype fp8_e5m2.
+_SM86_NAME_FRAGMENTS = (
+    "rtx 30",
+    "rtx30",
+    "a10",
+    "a16",
+    "a40",
+    "a2 ",
+    "rtx a2000",
+    "rtx a4000",
+    "rtx a4500",
+    "rtx a5000",
+    "rtx a5500",
+    "rtx a6000",
+)
+
+
+def rig_has_sm86(gpus: Sequence) -> bool:
+    """True when any GPU in the rig is (or looks like) an sm86 card. Uses an
+    explicit ``sm`` / ``compute_capability`` field when present, else a
+    conservative name match (RTX 30xx / Ampere workstation cards)."""
+    for g in gpus or ():
+        if isinstance(g, dict):
+            sm = g.get("sm") or g.get("compute_capability")
+            name = str(g.get("name") or "")
+        else:
+            sm = getattr(g, "sm", None) or getattr(g, "compute_capability", None)
+            name = str(getattr(g, "name", "") or "")
+        if sm is not None:
+            try:
+                if int(float(str(sm).replace("sm_", "").replace("8.6", "86"))) == 86:
+                    return True
+                continue
+            except (TypeError, ValueError):
+                pass
+        low = name.lower()
+        if any(f in low for f in _SM86_NAME_FRAGMENTS):
+            return True
+    return False
 
 
 # ===========================================================================
@@ -574,6 +671,30 @@ _ENV_FLAGS: List[FlagSpec] = [
         "token vector. Superseded by --rank-kv-ratio.",
     ),
     FlagSpec(
+        id="SGLANG_MAMBA_SSM_DTYPE",
+        name="SGLANG_MAMBA_SSM_DTYPE",
+        type="enum",
+        default=None,
+        allowed=("bfloat16", "float32"),
+        source="env",
+        is_env=True,
+        group="memory",
+        help="Dtype of the mamba/GDN SSM state on hybrid models.",
+        hover="Overrides the hybrid (GDN/mamba) SSM-state dtype. 'bfloat16' "
+        "halves the per-request mamba state vs float32 and is the validated "
+        "setting for Qwen3.5/3.6-class hybrids on this fork. Only meaningful "
+        "on a hybrid/linear-attention model.",
+        _compat=lambda cfg: (
+            (True, "")
+            if cfg is None or model_is_hybrid(cfg)
+            else (
+                False,
+                "SGLANG_MAMBA_SSM_DTYPE only affects hybrid GDN/mamba models; "
+                "this model has no linear-attention layers.",
+            )
+        ),
+    ),
+    FlagSpec(
         id="SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
         name="SGLANG_MOE_RESIDENT_EXPERT_FRACTION",
         type="float",
@@ -775,6 +896,228 @@ def fork_count() -> int:
 
 
 # ===========================================================================
+# Cross-field constraints: the richer predicates a flat requires/exclusion
+# graph cannot express (numeric equality, enum-value membership, vector
+# NON-uniformity). Machine-enforced through resolve()/validate_profile(),
+# not just hover text. Every rule below was verified against
+# server_args.py __post_init__ (_handle_weightless_kv_fastlane,
+# _handle_dcp_validation, _handle_uneven_tp) or MambaPoolHost.
+# ===========================================================================
+
+#: attention backends the weightless-KV lane accepts (server_args:
+#: ``attention_backend not in (None, "flashinfer", "fa3")`` is rejected).
+_FLASHINFER_BACKENDS = (None, "", "flashinfer", "fa3")
+
+
+def _int_or(v, default: int) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ratio_vector(v) -> Optional[List[int]]:
+    """An explicit integer vector from a ratio value, or None for unset /
+    'auto' / 'auto-performance' / other sentinels."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, str) and not v.replace(" ", "").replace(",", "").isdigit():
+        return None  # sentinel ('auto', 'auto-performance', 'coupled', ...)
+    return _as_int_list(v)
+
+
+def _uniform_explicit_ratio(v) -> bool:
+    """True when ``v`` is an EXPLICIT vector with all-identical entries (the
+    even split). Sentinels/unset return False (runtime-resolved)."""
+    lst = _ratio_vector(v)
+    return lst is not None and len(set(lst)) <= 1
+
+
+def _c_weightless_backend(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
+    # enum-value predicate: fastlane -> flashinfer attention backend.
+    if not values.get("weightless_kv_fastlane"):
+        return None
+    ab = values.get("attention_backend")
+    if (ab or None) in _FLASHINFER_BACKENDS:
+        return None
+    return (
+        "weightless_kv_fastlane",
+        "--weightless-kv-fastlane requires a flashinfer attention backend "
+        f"(--attention-backend flashinfer or fa3), got {ab!r} "
+        "(hard-rejected by ServerArgs).",
+    )
+
+
+def _c_weightless_tp_eq_dcp(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
+    # numeric-equality predicate: fastlane -> tp_size == dcp_size.
+    if not values.get("weightless_kv_fastlane"):
+        return None
+    tp = _int_or(values.get("tp_size"), 1)
+    dcp = _int_or(values.get("dcp_size"), 1)
+    if dcp == tp:
+        return None
+    return (
+        "weightless_kv_fastlane",
+        "--weightless-kv-fastlane requires --dcp-size == --tp-size (the KV "
+        f"cache is token-sharded across the whole TP group); got tp_size={tp}, "
+        f"dcp_size={dcp} (hard-rejected by ServerArgs).",
+    )
+
+
+def _c_dcp_spec(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
+    # An EXPLICIT --dcp-size > 1 together with a speculative algorithm is
+    # hard-rejected on CUDA unless the full uneven-weighted-DCP condition
+    # holds (env pair or non-'coupled' rank_kv_ratio, non-uniform
+    # rank_tp_ratio, dcp == tp). Uneven DCP is env-driven: never pass
+    # --dcp-size > 1 with speculation; ServerArgs auto-sets dcp_size itself.
+    dcp = _int_or(values.get("dcp_size"), 1)
+    if dcp <= 1 or not values.get("speculative_algorithm"):
+        return None
+    tp = _int_or(values.get("tp_size"), 1)
+    rtr = values.get("rank_tp_ratio")
+    weighted = (
+        bool(values.get("SGLANG_UNEVEN_DCP"))
+        and bool(values.get("SGLANG_UNEVEN_DCP_WEIGHTED"))
+    ) or values.get("rank_kv_ratio") not in (None, "", "coupled")
+    non_uniform = _is_active(catalog()["rank_tp_ratio"], rtr) and not (
+        _uniform_explicit_ratio(rtr)
+    )
+    if weighted and non_uniform and dcp == tp:
+        return None
+    return (
+        "dcp_size",
+        "--decode-context-parallel-size/--dcp-size > 1 together with a "
+        "speculative algorithm is hard-rejected on CUDA. Do not pass the "
+        "flag: enable uneven DCP via SGLANG_UNEVEN_DCP=1 + "
+        "SGLANG_UNEVEN_DCP_WEIGHTED=1 on a non-uniform --rank-tp-ratio plan "
+        "(ServerArgs then auto-sets dcp_size = tp_size itself).",
+    )
+
+
+def _c_kv_ratio_non_uniform(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
+    # non-uniformity predicate: a decoupled KV-token ownership only exists
+    # under a NON-uniform rank_tp_ratio plan.
+    rkv = values.get("rank_kv_ratio")
+    if rkv in (None, "", "coupled"):
+        return None
+    rtr = values.get("rank_tp_ratio")
+    if rtr in (None, "") or _uniform_explicit_ratio(rtr):
+        return (
+            "rank_kv_ratio",
+            "--rank-kv-ratio (other than 'coupled') requires --rank-gpu-id "
+            "with a NON-uniform --rank-tp-ratio plan: the token-axis KV "
+            "sharding it rebalances only exists under uneven TP "
+            "(ServerArgs rejects an explicit vector on the even split).",
+        )
+    return None
+
+
+def _c_uniform_tp_ratio(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
+    # ServerArgs rejects an explicit all-identical --rank-tp-ratio vector.
+    if _uniform_explicit_ratio(values.get("rank_tp_ratio")):
+        return (
+            "rank_tp_ratio",
+            "--rank-tp-ratio with identical entries is the even split — "
+            "omit the flag instead (hard-rejected by ServerArgs).",
+        )
+    return None
+
+
+def _c_weighted_needs_dcp_env(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
+    if values.get("SGLANG_UNEVEN_DCP_WEIGHTED") and not values.get(
+        "SGLANG_UNEVEN_DCP"
+    ):
+        return (
+            "SGLANG_UNEVEN_DCP_WEIGHTED",
+            "SGLANG_UNEVEN_DCP_WEIGHTED=1 requires SGLANG_UNEVEN_DCP=1 (the "
+            "weighted vector refines the uneven-DCP token sharding; alone it "
+            "is dead).",
+        )
+    return None
+
+
+def _c_adaptive_needs_spec(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
+    if values.get("speculative_adaptive") and not values.get(
+        "speculative_algorithm"
+    ):
+        return (
+            "speculative_adaptive",
+            "--speculative-adaptive requires a --speculative-algorithm (it "
+            "adapts the draft length of an active speculative run).",
+        )
+    return None
+
+
+def _c_rank_gpu_id_budget(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
+    # --rank-gpu-id needs --rank-gpu-memory-mib OR --rank-tp-ratio auto* (the
+    # auto modes derive the budgets from NVML totals). An explicit ratio
+    # VECTOR does not derive budgets.
+    if not _is_active(catalog()["rank_gpu_id"], values.get("rank_gpu_id")):
+        return None
+    if _is_active(
+        catalog()["rank_gpu_memory_mib"], values.get("rank_gpu_memory_mib")
+    ):
+        return None
+    if values.get("rank_tp_ratio") in ("auto", "auto-performance"):
+        return None
+    return (
+        "rank_gpu_id",
+        "--rank-gpu-id requires --rank-gpu-memory-mib, or --rank-tp-ratio "
+        "auto / auto-performance (which derive the budgets from NVML totals, "
+        "optionally minus --rank-auto-reserve-mib). An explicit ratio vector "
+        "does not supply budgets (hard-rejected by ServerArgs).",
+    )
+
+
+def _c_hicache_hybrid_layout(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
+    # MambaPoolHost (hybrid/mamba models) only supports page_first_direct.
+    if not values.get("enable_hierarchical_cache"):
+        return None
+    if not model_is_hybrid(model_cfg):
+        return None
+    if values.get("hicache_mem_layout") == "page_first_direct":
+        return None
+    return (
+        "hicache_mem_layout",
+        "the hierarchical cache on a hybrid/mamba model requires "
+        "--hicache-mem-layout page_first_direct: MambaPoolHost rejects every "
+        f"other layout (got {values.get('hicache_mem_layout')!r}).",
+    )
+
+
+#: All cross-field constraints, applied by :func:`resolve` (on the
+#: post-auto-set value map) and :func:`validate_profile` (also on the RAW
+#: profile settings, so an auto-set cannot mask a broken saved profile).
+_CROSS_CONSTRAINTS: Tuple[
+    Callable[[dict, Optional[dict]], Optional[Tuple[str, str]]], ...
+] = (
+    _c_weightless_backend,
+    _c_weightless_tp_eq_dcp,
+    _c_dcp_spec,
+    _c_kv_ratio_non_uniform,
+    _c_uniform_tp_ratio,
+    _c_weighted_needs_dcp_env,
+    _c_adaptive_needs_spec,
+    _c_rank_gpu_id_budget,
+    _c_hicache_hybrid_layout,
+)
+
+
+def cross_field_errors(
+    settings: Optional[dict], model_cfg: Optional[dict] = None
+) -> List[Tuple[str, str]]:
+    """Evaluate every cross-field constraint against a raw ``settings`` dict
+    (no auto-set applied). Returns ``[(flag_id, error), ...]``."""
+    values = dict(settings or {})
+    out: List[Tuple[str, str]] = []
+    for check in _CROSS_CONSTRAINTS:
+        hit = check(values, model_cfg)
+        if hit is not None:
+            out.append(hit)
+    return out
+
+
+# ===========================================================================
 # resolve(): per-field {enabled, options, value, disabled_reason, error}.
 # ===========================================================================
 
@@ -959,6 +1302,16 @@ def resolve(
                 f"{lst})."
             )
 
+    # -- 5. cross-field constraints (numeric-equality / enum-value /
+    #       non-uniformity predicates), evaluated on the RESOLVED value map
+    #       (auto-set applied) so they are machine-enforced, not hover text --
+    for cid, msg in cross_field_errors(values, model_cfg):
+        if cid not in out:
+            continue
+        out[cid]["error"] = (
+            msg if not out[cid]["error"] else out[cid]["error"] + " " + msg
+        )
+
     return out
 
 
@@ -970,12 +1323,20 @@ def resolve(
 @dataclasses.dataclass
 class Profile:
     """A fully-populated named configuration: ``settings`` sets EVERY catalog
-    flag. ``info`` carries UI notes (e.g. an MPS-required flag)."""
+    flag. ``info`` carries UI notes (e.g. an MPS-required flag).
+
+    ``env`` carries LAUNCH environment variables that are NOT catalog flags
+    (LD_LIBRARY_PATH so the re-exec'd NEXTN draft worker finds
+    libnvrtc.so.13, PYTHONPATH, ...). Env vars that ARE catalog entries
+    (``SGLANG_UNEVEN_DCP`` ...) live in ``settings`` like every other flag;
+    :func:`profile_env` merges both into the mapping the launcher must apply
+    to the server process."""
 
     name: str
     kind: str  # single | normal-tp | colocation | uneven-max-tokens | uneven-max-perf
     settings: Dict[str, Any]
     info: List[str] = dataclasses.field(default_factory=list)
+    env: Dict[str, str] = dataclasses.field(default_factory=dict)
 
     def to_json(self) -> dict:
         return {
@@ -983,6 +1344,7 @@ class Profile:
             "kind": self.kind,
             "settings": self.settings,
             "info": self.info,
+            "env": self.env,
         }
 
     @classmethod
@@ -992,7 +1354,114 @@ class Profile:
             kind=d.get("kind", "custom"),
             settings=dict(d.get("settings", {})),
             info=list(d.get("info", [])),
+            env={str(k): str(v) for k, v in (d.get("env") or {}).items()},
         )
+
+
+def profile_env(profile: Profile) -> Dict[str, str]:
+    """The COMPLETE environment mapping the launcher must apply for this
+    profile: every ACTIVE env-typed catalog flag from ``settings`` (bools
+    render as '1', vectors comma-join), overlaid with the profile's extra
+    ``env`` entries (LD_LIBRARY_PATH, PYTHONPATH, ...). Without the
+    SGLANG_UNEVEN_DCP pair a spec+DCP boot is hard-rejected; without
+    LD_LIBRARY_PATH the NEXTN draft worker dies importing deep_gemm
+    (libnvrtc.so.13)."""
+    cat = catalog()
+    env: Dict[str, str] = {}
+    for cid, spec in cat.items():
+        if not spec.is_env:
+            continue
+        v = profile.settings.get(cid, spec.default)
+        if not _is_active(spec, v):
+            continue
+        if spec.type == "bool":
+            env[spec.name] = "1"
+        elif isinstance(v, (list, tuple)):
+            env[spec.name] = ",".join(str(x) for x in v)
+        else:
+            env[spec.name] = str(v)
+    env.update(profile.env)
+    return env
+
+
+#: argv emission order for the flags the reference profile pins; everything
+#: else follows in catalog order. Purely cosmetic (argparse is order-free),
+#: but keeps generated commands diffable against the validated reference.
+_ARGV_ORDER = (
+    "model_path",
+    "tokenizer_path",
+    "served_model_name",
+    "load_format",
+    "quantization",
+    "tp_size",
+    "rank_gpu_id",
+    "rank_tp_ratio",
+    "rank_auto_reserve_mib",
+    "rank_gpu_memory_mib",
+    "kv_cache_dtype",
+    "context_length",
+    "max_running_requests",
+    "speculative_algorithm",
+    "speculative_num_steps",
+    "speculative_eagle_topk",
+    "speculative_num_draft_tokens",
+    "speculative_adaptive",
+    "reasoning_parser",
+    "tool_call_parser",
+    "chat_template",
+    "trust_remote_code",
+    "enable_metrics",
+    "host",
+    "port",
+    "enable_hierarchical_cache",
+    "hicache_size",
+    "hicache_storage_backend",
+    "hicache_mem_layout",
+)
+
+#: serving-identity flags emitted even when they equal the catalog default
+#: (a saved profile must pin its port/host, not inherit a future default).
+_ARGV_ALWAYS_EMIT = ("host", "port")
+
+
+def profile_argv(profile: Profile) -> List[str]:
+    """Build the ``sglang.launch_server`` CLI argv for a profile: every ACTIVE
+    non-env setting as ``--flag [value]`` using the CANONICAL flag spelling
+    (``--`` + field name, which argparse always registers; aliases like
+    ``--tp`` parse to the same dest). Bool True (store_true) emits the bare
+    flag; vectors comma-join. Env-typed entries are excluded — apply
+    :func:`profile_env` to the process environment instead."""
+    cat = catalog()
+    ordered = [cid for cid in _ARGV_ORDER if cid in cat]
+    rest = [cid for cid in cat if cid not in _ARGV_ORDER]
+    argv: List[str] = []
+    for cid in ordered + rest:
+        spec = cat[cid]
+        if spec.is_env:
+            continue
+        v = profile.settings.get(cid, spec.default)
+        if v is None:
+            continue
+        # emit only what DIFFERS from the deployed default (a default-True
+        # bool like dllm_fdfo is "active" per _is_active but needs no flag),
+        # plus the pinned serving-identity flags.
+        if v == spec.default and cid not in _ARGV_ALWAYS_EMIT:
+            continue
+        if not _is_active(spec, v) and cid not in _ARGV_ALWAYS_EMIT:
+            continue
+        name = "--" + cid.replace("_", "-")
+        if spec.type == "bool" or isinstance(v, bool):
+            if v and not spec.default:
+                argv.append(name)
+            # False (or a default-True bool) cannot be expressed as a bare
+            # store_true flag; the default applies by omission.
+            continue
+        argv.append(name)
+        if isinstance(v, (list, tuple)):
+            argv.append(",".join(str(x) for x in v))
+        else:
+            argv.append(str(v))
+    return argv
 
 
 def _base_settings() -> Dict[str, Any]:
@@ -1010,33 +1479,247 @@ def _gpu_totals(gpus: Sequence) -> List[int]:
     return out
 
 
-def profiles(model_cfg: Optional[dict], gpus: Sequence) -> List[Profile]:
-    """Generate ready-to-run profiles for ``gpus`` (a list of ``{name,
-    total_mib}`` dicts or GpuDescriptor-like objects), each with ALL fields set.
+def _gpu_names(gpus: Sequence) -> List[str]:
+    out = []
+    for g in gpus:
+        if isinstance(g, dict):
+            out.append(str(g.get("name") or ""))
+        else:
+            out.append(str(getattr(g, "name", "") or ""))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rig calibrations: measured, battery-stable per-quant values for known rigs
+# (matrix/htsglang_local_run.sh, MATRIX_PLAN 3.3). Order-sensitive: the
+# vectors are per-RANK with rank i on physical GPU i (--rank-gpu-id 0,1,2),
+# so they only apply when the rig enumerates as [5090, 3080, 3080] exactly.
+# ---------------------------------------------------------------------------
+
+def _match_calibration(gpus: Sequence, quant: Optional[str]) -> Optional[dict]:
+    """A measured calibration for this exact rig shape + checkpoint quant, or
+    None (callers must then fall back to a derived estimate AND say so)."""
+    names = [n.lower() for n in _gpu_names(gpus)]
+    if (
+        len(names) == 3
+        and "5090" in names[0]
+        and "3080" in names[1]
+        and "3080" in names[2]
+    ):
+        if quant == "fp8":
+            return {
+                "tokvec": [33, 13, 18],
+                "reserve": "3000,2200,2200",
+                "label": "fp8 (MATRIX_PLAN 3.3, battery-stable to 530944 ctx)",
+            }
+        if quant == "awq":
+            return {
+                "tokvec": [31, 15, 18],
+                "reserve": "1500",
+                "label": "awq (MATRIX_PLAN 3.3, 886080 ctx)",
+            }
+    return None
+
+
+def _cuda_lib_dirs(python_exe: str) -> List[str]:
+    """The interpreter venv's bundled NVIDIA/torch shared-lib dirs (energy.py
+    helper): libnvrtc.so.13 lives in nvidia/cu13/lib and the re-exec'd NEXTN
+    draft worker needs it on LD_LIBRARY_PATH at interpreter startup."""
+    try:
+        from sglang.srt.planner.energy import _venv_cuda_lib_dirs
+
+        return _venv_cuda_lib_dirs(python_exe)
+    except Exception:  # pragma: no cover - defensive
+        return []
+
+
+def _fork_launch_env(python_exe: Optional[str], info: List[str]) -> Dict[str, str]:
+    """LD_LIBRARY_PATH + PYTHONPATH for the fork profiles (rank-gpu-id
+    re-exec'd workers + the NEXTN draft worker's deep_gemm import)."""
+    import sys
+
+    env: Dict[str, str] = {}
+    exe = python_exe or sys.executable
+    dirs = _cuda_lib_dirs(exe)
+    if dirs:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(dirs)
+    else:
+        info.append(
+            "WARNING: no bundled nvidia/torch lib dirs found for "
+            f"{exe!r} -- set LD_LIBRARY_PATH so the NEXTN draft worker "
+            "finds libnvrtc.so.13 (deep_gemm import dies without it)."
+        )
+    try:
+        import sglang
+
+        env["PYTHONPATH"] = os.path.dirname(
+            os.path.dirname(os.path.abspath(sglang.__file__))
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return env
+
+
+def profiles(
+    model_cfg: Optional[dict],
+    gpus: Sequence,
+    base: Optional[dict] = None,
+    python_exe: Optional[str] = None,
+) -> List[Profile]:
+    """Generate LAUNCHABLE profiles for ``gpus`` (a list of ``{name,
+    total_mib}`` dicts or GpuDescriptor-like objects), each with ALL fields
+    set, plus the launch env (:func:`profile_env`) and argv
+    (:func:`profile_argv`).
+
+    ``base`` merges user identity settings (model_path, port, context_length,
+    hicache toggles, ...) into every profile before the profile-specific
+    correctness rules run, so the rules can react to them (e.g. hicache on a
+    hybrid model is forced to the only layout MambaPoolHost accepts).
 
     Always: single-gpu, and (for >1 GPU) normal-TP using ONLY stock upstream
-    options. When the GPU set exceeds the stock TP/kv-head rule (more GPUs than
-    KV heads, or heterogeneous VRAM, or a co-location request), additionally:
-    a co-location / TP>card-count profile (MPS-required, flagged in ``info``)
-    and two full uneven-split profiles (max-tokens, max-perf) -- noting when
-    the two coincide (homogeneous cards)."""
+    options. When the GPU set exceeds the stock TP/kv-head rule (more GPUs
+    than KV heads, or heterogeneous VRAM, or a co-location request),
+    additionally: a co-location / TP>card-count profile (MPS-required,
+    flagged in ``info``) and two full uneven-split profiles (max-tokens,
+    max-perf) -- carrying the SGLANG_UNEVEN_DCP env pair (spec+DCP is ONLY
+    supported on that path), the measured per-quant calibration when this
+    rig/quant is calibrated (fallbacks are called out in ``info``, never
+    silently invented), the sm86-safe fp8 KV dtype, and the validated NEXTN
+    speculative shape when the checkpoint has MTP layers."""
     totals = _gpu_totals(gpus)
     ngpu = len(totals)
     kvh = model_kv_heads(model_cfg)
     heterogeneous = len(set(totals)) > 1
+    hybrid = model_is_hybrid(model_cfg)
+    quant = model_quant_kind(model_cfg)
+    sm86 = rig_has_sm86(gpus)
+    cat = catalog()
+
+    base = dict(base or {})
+    base.pop("python_exe", None)
+    dropped = sorted(k for k in base if k not in cat)
+    base_clean = {k: v for k, v in base.items() if k in cat}
+    base_notes: List[str] = []
+    if dropped:
+        base_notes.append(
+            "ignored unknown base settings: " + ", ".join(dropped) + "."
+        )
+
+    def _mk(overrides: Dict[str, Any], info: List[str]) -> Dict[str, Any]:
+        """base settings + user base + profile overrides, then the
+        model-level correctness rules every profile must obey."""
+        s = _base_settings()
+        s.update(base_clean)
+        s.update(overrides)
+        # hicache on a hybrid/mamba model: MambaPoolHost accepts ONLY the
+        # page_first_direct host layout -- force it (verified rule).
+        if s.get("enable_hierarchical_cache") and hybrid:
+            if s.get("hicache_mem_layout") != "page_first_direct":
+                s["hicache_mem_layout"] = "page_first_direct"
+                info.append(
+                    "hicache on a hybrid/mamba model: forced "
+                    "--hicache-mem-layout page_first_direct (MambaPoolHost "
+                    "rejects every other layout)."
+                )
+        # compressed-tensors checkpoints boot with the explicit
+        # --quantization compressed-tensors (the validated matrix flag);
+        # fp8 checkpoints self-declare and need no flag.
+        if quant == "awq" and not s.get("quantization"):
+            s["quantization"] = "compressed-tensors"
+            info.append(
+                "compressed-tensors checkpoint: set --quantization "
+                "compressed-tensors explicitly (validated launch shape)."
+            )
+        return s
+
+    def _apply_fork_rules(s: Dict[str, Any], info: List[str]) -> None:
+        """Rules for the fork (co-location / uneven) profiles: sm86-safe fp8
+        KV dtype, validated NEXTN spec shape, hybrid SSM dtype."""
+        # KV dtype: fp8 KV maximizes capacity; sm86 (RTX 3080-class) cannot
+        # do fp8_e4m3 -> e5m2 whenever ANY sm86 card is in the rig.
+        cur = s.get("kv_cache_dtype")
+        if cur in (None, "auto"):
+            s["kv_cache_dtype"] = "fp8_e5m2" if sm86 else "fp8_e4m3"
+            info.append(
+                "KV cache dtype "
+                + s["kv_cache_dtype"]
+                + (
+                    " (sm86/RTX-3080-class card present: e4m3 KV is "
+                    "unsupported on sm86)."
+                    if sm86
+                    else " (no sm86 card detected)."
+                )
+            )
+        elif sm86 and cur == "fp8_e4m3":
+            s["kv_cache_dtype"] = "fp8_e5m2"
+            info.append(
+                "overrode kv-cache-dtype fp8_e4m3 -> fp8_e5m2: an sm86 "
+                "(RTX 3080-class) card is in the rig and cannot run e4m3 KV."
+            )
+        # Speculative decoding: the validated fork shape, only when the
+        # checkpoint actually ships MTP draft layers.
+        if model_has_mtp(model_cfg):
+            s.update(
+                speculative_algorithm="NEXTN",
+                speculative_num_steps=3,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=4,
+                speculative_adaptive=True,
+            )
+            info.append(
+                "speculative decoding: NEXTN chain, steps 3, topk 1, draft "
+                "4, adaptive (the validated shape; topk stays 1 -- tree "
+                "spec is rejected under uneven DCP)."
+            )
+        # Hybrid models: bfloat16 SSM state (validated; halves mamba state).
+        if hybrid:
+            s["SGLANG_MAMBA_SSM_DTYPE"] = "bfloat16"
+            info.append(
+                "hybrid GDN/mamba model: SGLANG_MAMBA_SSM_DTYPE=bfloat16 "
+                "(validated reference setting)."
+            )
+
+    def _apply_uneven_env(
+        s: Dict[str, Any], info: List[str], max_tokens: bool
+    ) -> None:
+        """The uneven-DCP env pair + per-quant calibration for the uneven
+        profiles. spec+DCP is ONLY supported on the uneven-WEIGHTED path, so
+        the env pair is mandatory here."""
+        s["SGLANG_UNEVEN_DCP"] = True
+        s["SGLANG_UNEVEN_DCP_WEIGHTED"] = True
+        cal = _match_calibration(gpus, quant)
+        if cal is not None:
+            s["SGLANG_UNEVEN_TOKEN_VECTOR"] = list(cal["tokvec"])
+            s["rank_auto_reserve_mib"] = cal["reserve"]
+            info.append(
+                "calibrated for this rig/quant: SGLANG_UNEVEN_TOKEN_VECTOR="
+                + ",".join(str(x) for x in cal["tokvec"])
+                + ", --rank-auto-reserve-mib "
+                + cal["reserve"]
+                + " -- "
+                + cal["label"]
+                + "."
+            )
+        else:
+            info.append(
+                "NO measured calibration for this rig/quant combination: "
+                "token vector and reserve are runtime-derived ESTIMATES, "
+                "not calibrated values. Run a calibration boot, read the "
+                "TOKVEC hint line, then pin SGLANG_UNEVEN_TOKEN_VECTOR + "
+                "--rank-auto-reserve-mib."
+            )
+            if max_tokens:
+                # one-boot measured convergence toward the capacity optimum.
+                s["rank_kv_ratio"] = "capacity"
+
     out: List[Profile] = []
+    launch_env_notes: List[str] = []
+    fork_env = _fork_launch_env(python_exe, launch_env_notes)
 
     # --- single-gpu -------------------------------------------------------
-    s = _base_settings()
-    s["tp_size"] = 1
-    out.append(
-        Profile(
-            "single-gpu",
-            "single",
-            s,
-            info=["Single GPU, no tensor parallelism."],
-        )
-    )
+    info = list(base_notes) + ["Single GPU, no tensor parallelism."]
+    s = _mk({"tp_size": 1}, info)
+    out.append(Profile("single-gpu", "single", s, info=info))
 
     if ngpu <= 1:
         return out
@@ -1055,19 +1738,12 @@ def profiles(model_cfg: Optional[dict], gpus: Sequence) -> List[Profile]:
 
     # --- normal-TP (stock sglang, only upstream options) ------------------
     if stock_tp_ok and not heterogeneous:
-        s = _base_settings()
-        s["tp_size"] = ngpu
-        out.append(
-            Profile(
-                "normal-TP",
-                "normal-tp",
-                s,
-                info=[
-                    f"Even tensor parallelism across {ngpu} identical GPUs, "
-                    "the stock sglang way (no fork flags).",
-                ],
-            )
-        )
+        info = list(base_notes) + [
+            f"Even tensor parallelism across {ngpu} identical GPUs, "
+            "the stock sglang way (no fork flags).",
+        ]
+        s = _mk({"tp_size": ngpu}, info)
+        out.append(Profile("normal-TP", "normal-tp", s, info=info))
     else:
         reason = []
         if heterogeneous:
@@ -1079,19 +1755,14 @@ def profiles(model_cfg: Optional[dict], gpus: Sequence) -> List[Profile]:
             )
         # still offer a normal-TP entry, but flagged that stock cannot run it
         # cleanly (the fork's uneven path is the intended route).
-        s = _base_settings()
-        s["tp_size"] = ngpu
+        info = list(base_notes) + [
+            "Stock even TP is imperfect here: " + "; ".join(reason)
+            + ". The fork's uneven-TP profiles below handle it "
+            "properly (KV replicate + token-shard).",
+        ]
+        s = _mk({"tp_size": ngpu}, info)
         out.append(
-            Profile(
-                "normal-TP (stock, limited)",
-                "normal-tp",
-                s,
-                info=[
-                    "Stock even TP is imperfect here: " + "; ".join(reason)
-                    + ". The fork's uneven-TP profiles below handle it "
-                    "properly (KV replicate + token-shard).",
-                ],
-            )
+            Profile("normal-TP (stock, limited)", "normal-tp", s, info=info)
         )
 
     if not needs_fork:
@@ -1105,67 +1776,98 @@ def profiles(model_cfg: Optional[dict], gpus: Sequence) -> List[Profile]:
     largest = totals.index(max(totals)) if totals else 0
     colo_tp = ngpu + 1
     rank_gpu = list(range(ngpu)) + [largest]  # extra rank co-locates on largest
-    s = _base_settings()
-    s["tp_size"] = colo_tp
-    s["rank_gpu_id"] = rank_gpu
-    # even budget derived from the largest card shared by two ranks; use a
-    # conservative half-of-largest for the shared card, full for the rest.
-    per_rank = max(1024, (min(totals) - 1024))
-    s["rank_gpu_memory_mib"] = per_rank
+    # even budget: the scalar must fit BOTH the smallest solo card (minus a
+    # context allowance) and half of the shared largest card (minus a shared
+    # 2 GiB allowance) -- otherwise the co-located pair is physically
+    # impossible on the big card.
+    per_rank = max(
+        1024, min(min(totals) - 1024, (max(totals) - 2048) // 2)
+    )
+    info = list(base_notes) + [
+        f"tp_size={colo_tp} on {ngpu} cards: rank {colo_tp - 1} "
+        f"co-locates with rank {largest} on physical GPU {largest}. "
+        "REQUIRES CUDA MPS (two ranks share one card). "
+        f"Uniform per-rank budget {per_rank} MiB; ensure "
+        f"2 x {per_rank} MiB fits GPU {largest}'s total "
+        f"({max(totals)} MiB) -- headroom is the user's responsibility.",
+        "Stock sglang cannot do this; it is a fork capability.",
+    ] + list(launch_env_notes)
+    s = _mk(
+        {
+            "tp_size": colo_tp,
+            "rank_gpu_id": rank_gpu,
+            "rank_gpu_memory_mib": per_rank,
+        },
+        info,
+    )
+    _apply_fork_rules(s, info)
     out.append(
         Profile(
             "co-location (TP>cards, MPS)",
             "colocation",
             s,
-            info=[
-                f"tp_size={colo_tp} on {ngpu} cards: rank {colo_tp - 1} "
-                f"co-locates with rank {largest} on physical GPU {largest}. "
-                "REQUIRES CUDA MPS (two ranks share one card). "
-                f"Uniform per-rank budget {per_rank} MiB; ensure "
-                f"2 x {per_rank} MiB fits GPU {largest}'s total "
-                f"({max(totals)} MiB) -- headroom is the user's responsibility.",
-                "Stock sglang cannot do this; it is a fork capability.",
-            ],
+            info=info,
+            env=dict(fork_env),
         )
     )
 
     # --- uneven full-split: max-tokens (VRAM-auto) ------------------------
-    s = _base_settings()
-    s["tp_size"] = ngpu
-    s["rank_gpu_id"] = list(range(ngpu))
-    s["rank_tp_ratio"] = "auto"
-    s["rank_kv_ratio"] = "capacity"  # capacity-weighted ownership => most tokens
+    info = list(base_notes) + [
+        "Uneven TP with VRAM-proportional shards (--rank-tp-ratio auto) "
+        "and weighted uneven-DCP KV-token sharding (SGLANG_UNEVEN_DCP env "
+        "pair) to MAXIMIZE total KV tokens / context.",
+    ] + list(launch_env_notes)
+    s = _mk(
+        {
+            "tp_size": ngpu,
+            "rank_gpu_id": list(range(ngpu)),
+            "rank_tp_ratio": "auto",
+        },
+        info,
+    )
+    _apply_fork_rules(s, info)
+    _apply_uneven_env(s, info, max_tokens=True)
     out.append(
         Profile(
             "uneven-max-tokens",
             "uneven-max-tokens",
             s,
-            info=[
-                "Uneven TP with VRAM-proportional shards (--rank-tp-ratio "
-                "auto) and capacity-weighted KV ownership (--rank-kv-ratio "
-                "capacity) to MAXIMIZE total KV tokens / context.",
-            ],
+            info=info,
+            env=dict(fork_env),
         )
     )
 
     # --- uneven full-split: max-perf (auto-performance) ------------------
-    s = _base_settings()
-    s["tp_size"] = ngpu
-    s["rank_gpu_id"] = list(range(ngpu))
-    s["rank_tp_ratio"] = "auto-performance"
-    s["rank_perf_tune"] = "both"
     coincide = not heterogeneous
-    info = [
+    info = list(base_notes) + [
         "Uneven TP tuned for throughput (--rank-tp-ratio auto-performance): "
         "VRAM-auto split plus a measured MLP-family shift toward the "
         "compute-strong card.",
-    ]
+    ] + list(launch_env_notes)
     if coincide:
         info.append(
             "NOTE: on these homogeneous cards max-perf and max-tokens "
             "coincide (the even split is already optimal for both)."
         )
-    out.append(Profile("uneven-max-perf", "uneven-max-perf", s, info=info))
+    s = _mk(
+        {
+            "tp_size": ngpu,
+            "rank_gpu_id": list(range(ngpu)),
+            "rank_tp_ratio": "auto-performance",
+        },
+        info,
+    )
+    _apply_fork_rules(s, info)
+    _apply_uneven_env(s, info, max_tokens=False)
+    out.append(
+        Profile(
+            "uneven-max-perf",
+            "uneven-max-perf",
+            s,
+            info=info,
+            env=dict(fork_env),
+        )
+    )
 
     return out
 
@@ -1174,8 +1876,11 @@ def validate_profile(
     profile: Profile, model_cfg: Optional[dict] = None
 ) -> Tuple[bool, List[str]]:
     """Validate a profile: every catalog flag must be present in ``settings``,
-    and :func:`resolve` must report no conflict / compat / length error among
-    the flags the profile actively sets. Returns ``(ok, errors)``."""
+    :func:`resolve` must report no conflict / compat / length error among the
+    flags the profile actively sets, and the cross-field constraints must hold
+    on the RAW settings (a saved profile launches as-is -- resolve()'s
+    dependency auto-set must not mask a missing requirement).
+    Returns ``(ok, errors)``."""
     cat = catalog()
     errors: List[str] = []
     for cid in cat:
@@ -1191,6 +1896,12 @@ def validate_profile(
             errors.append(f"{cid}: {r['disabled_reason']}")
         if r["error"]:
             errors.append(f"{cid}: {r['error']}")
+    seen = set(errors)
+    for cid, msg in cross_field_errors(profile.settings, model_cfg):
+        e = f"{cid}: {msg}"
+        if e not in seen:
+            errors.append(e)
+            seen.add(e)
     return (len(errors) == 0, errors)
 
 
