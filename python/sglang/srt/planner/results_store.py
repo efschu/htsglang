@@ -200,6 +200,10 @@ class ResultEntry:
     # -- MEASURED perf (from S2.5; absent until then) --------------------
     batch: Optional[int] = None
     concurrency: Optional[int] = None
+    #: content class of the driven workload ("code" | "prose" | None). Base
+    #: decode is content-independent, so code≈prose here; the label exists so a
+    #: future MTP-on run (spec accepts code better -> faster) can be compared.
+    workload: Optional[str] = None
     #: per-batch-size-bucket throughput curves {bucket: tok/s}; NOT a scalar.
     prefill_tok_s_by_bucket: Optional[Dict[int, float]] = None
     decode_tok_s_by_bucket: Optional[Dict[int, float]] = None
@@ -212,6 +216,13 @@ class ResultEntry:
     batch_size_distribution: Optional[Dict[int, float]] = None
     attribution_coverage: Optional[float] = None
     per_card_efficiency: Optional[Dict[str, float]] = None
+    #: PER-CARD energy breakdown (S2.5). Whole-rig j_per_*_token dicts above are
+    #: the SUM across cards; this keeps the split (heterogeneous rig: the 5090
+    #: and the two 3080s draw very different power). GPU (NVML) power only —
+    #: excludes CPU/RAM/PSU losses, NOT wall-socket power. Shape:
+    #: {"gpu_names": [...], "source": "...", "<phase>_j_per_token_by_bucket":
+    #:  {bucket: [per-card...]}, "<phase>_watts_by_bucket": {bucket: [...]}}.
+    per_card_energy: Optional[Dict] = None
     #: bands, never scalars.
     kwh_saved: Optional[Band] = None
     prefill_seconds_saved: Optional[Band] = None
