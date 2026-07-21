@@ -2056,9 +2056,17 @@ def config_profiles_get(payload: Optional[dict] = None) -> dict:
             d["launch_env"] = dict(p.env or {})
         return d
 
+    # The generator's capacity rules (context_length / max_running_requests)
+    # size KV via feasibility.plan and need the checkpoint path -- pass the
+    # selected model ref through as the base model_path (the rules degrade
+    # to the form defaults, with an info note, when it cannot be sized).
+    base = {"model_path": payload["model"]} if payload.get("model") else None
     generated: List[dict] = []
     try:
-        generated = [_prof_json(p) for p in flagsmod.profiles(model_cfg, gpus)]
+        generated = [
+            _prof_json(p)
+            for p in flagsmod.profiles(model_cfg, gpus, base=base)
+        ]
     except Exception as e:  # pragma: no cover - defensive
         generated = []
         gen_error = str(e)
