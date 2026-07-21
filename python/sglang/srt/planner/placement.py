@@ -70,6 +70,23 @@ _MIB = 2 ** 20
 _GIB = 2 ** 30
 
 
+def _auto_tp_ratio(rank_gpu_id, budgets, card_total_mib, tp):
+    """Reproduce the PARSE-TIME proportional split that ``--rank-tp-ratio auto``
+    derives from per-card VRAM. Returns per-rank integer weights (the raw MiB
+    budgets -- ``partition_units`` only needs relative weights and splits exactly
+    as the runtime would) or ``None`` when no budget info is available, in which
+    case the caller falls back to an even split.
+    """
+    per_rank = None
+    if budgets and len(budgets) == tp:
+        per_rank = list(budgets)
+    elif card_total_mib and rank_gpu_id and len(rank_gpu_id) == tp:
+        per_rank = [card_total_mib.get(g) for g in rank_gpu_id]
+    if not per_rank or any(x is None or int(x) <= 0 for x in per_rank):
+        return None
+    return [int(x) for x in per_rank]
+
+
 # ---------------------------------------------------------------------------
 # Flags contract (a thin, JSON-able mirror of the plan()/ServerArgs knobs).
 # ---------------------------------------------------------------------------
@@ -113,6 +130,8 @@ class PlacementFlags:
     def _as_int_list(v) -> Optional[List[int]]:
         if v is None:
             return None
+        if isinstance(v, str) and v.strip() in ("auto", "auto-performance"):
+            return None  # string sentinel: resolved to a split by from_dict
         if isinstance(v, (list, tuple)):
             return [int(x) for x in v]
         # scalar -> single-element (broadcast handled by the caller)
@@ -126,11 +145,27 @@ class PlacementFlags:
         budgets = cls._as_int_list(budgets)
         if budgets is not None and len(budgets) == 1 and tp > 1:
             budgets = budgets * tp  # scalar broadcast, per the fork's semantics
+        rgi = cls._as_int_list(d.get("rank_gpu_id"))
+        ctm = (
+            {int(k): int(v) for k, v in d["card_total_mib"].items()}
+            if d.get("card_total_mib")
+            else None
+        )
+        # rank_tp_ratio "auto"/"auto-performance": reproduce the parse-time
+        # PROPORTIONAL split from per-rank VRAM budget (rank_gpu_memory_mib, else
+        # the card each rank lands on) -- so an uneven-auto config renders uneven,
+        # not even. The runtime installs the EXACT vector after profiling (same
+        # caveat as the DCP token vector); this is the estimate.
+        raw_rtr = d.get("rank_tp_ratio")
+        if isinstance(raw_rtr, str) and raw_rtr.strip() in ("auto", "auto-performance"):
+            rtr = _auto_tp_ratio(rgi, budgets, ctm, tp)
+        else:
+            rtr = cls._as_int_list(raw_rtr)
         return cls(
             tp_size=tp,
-            rank_gpu_id=cls._as_int_list(d.get("rank_gpu_id")),
+            rank_gpu_id=rgi,
             rank_gpu_memory_mib=budgets,
-            rank_tp_ratio=cls._as_int_list(d.get("rank_tp_ratio")),
+            rank_tp_ratio=rtr,
             rank_mlp_ratio=cls._as_int_list(d.get("rank_mlp_ratio")),
             rank_moe_ratio=cls._as_int_list(d.get("rank_moe_ratio")),
             rank_vocab_ratio=cls._as_int_list(d.get("rank_vocab_ratio")),
@@ -161,11 +196,7 @@ class PlacementFlags:
                 if d.get("moe_resident_expert_fraction") is not None
                 else None
             ),
-            card_total_mib=(
-                {int(k): int(v) for k, v in d["card_total_mib"].items()}
-                if d.get("card_total_mib")
-                else None
-            ),
+            card_total_mib=ctm,
             card_name=(
                 {int(k): str(v) for k, v in d["card_name"].items()}
                 if d.get("card_name")

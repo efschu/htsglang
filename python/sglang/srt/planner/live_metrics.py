@@ -429,6 +429,7 @@ def snapshot(
         launch_config = resolved_launch
 
     # --- Prometheus scrape (delta-based rates) ---------------------------
+    metrics_error = None
     if metrics_text is None:
         if not base_url:
             return (
@@ -439,11 +440,12 @@ def snapshot(
         try:
             metrics_text = _fetch_metrics_text(base_url, timeout)
         except Exception as e:
-            return (
-                {"ok": False, "error": f"scrape of {base_url}/metrics failed: {e}",
-                 "t": t_cur},
-                prev_state or {},
-            )
+            # /metrics absent (server booted without --enable-metrics) is NOT
+            # fatal: still return NVML GPU telemetry + the launch config so the
+            # landing page renders. Only the token-rate / spec / cache-hit
+            # metrics drop out; metrics_error tells the UI why.
+            metrics_error = f"scrape of {base_url}/metrics failed: {e}"
+            metrics_text = ""
 
     cur = _parse_counters(metrics_text)
     prev_counters = (prev_state or {}).get("counters")
@@ -482,6 +484,7 @@ def snapshot(
         },
         "gpus": gpus,
         "nvml_error": nvml_error,
+        "metrics_error": metrics_error,   # set when /metrics was unreachable
         "launch_config": launch_config,   # exact dashboard LaunchSettings, or None
         "server_info": server_info,       # /get_server_info + /get_model_info, or None
     }
