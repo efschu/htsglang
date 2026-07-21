@@ -141,6 +141,18 @@ def _broadcast_draft_picks(
     ranks never reach this code path, so a broadcast here would hang
     (no matching participants). The one-per-round token-id broadcast
     happens in ``EagleDraftWorker.draft`` instead.
+
+    CAPTURE SAFETY: this helper runs inside the draft CUDA-graph capture
+    region (draft_forward is captured). A c10d NCCL broadcast there is
+    ncclInvalidUsage: the c10d communicator initializes lazily on first
+    use, and communicator init inside a capture region is illegal (it also
+    hard-fails with "Duplicate GPU detected" when ranks are co-located on
+    one physical GPU, which torch's bundled NCCL rejects). Under capture we
+    therefore route through the TP group's pynccl communicator — the
+    graph-capturable path the rest of the capture pipeline uses (same
+    pattern as graph_capture()/all_reduce in parallel_state; DFLASH avoids
+    the c10d path the same way). Outside capture the original c10d
+    tp_group.broadcast is kept byte-identical.
     """
     if solo_single_rank:
         return
@@ -152,9 +164,21 @@ def _broadcast_draft_picks(
     )
     if tp_group.world_size == 1:
         return
+    pynccl_comm = getattr(tp_group, "pynccl_comm", None)
+    use_pynccl = (
+        pynccl_comm is not None
+        and getattr(pynccl_comm, "available", False)
+        and torch.cuda.is_current_stream_capturing()
+    )
     for t in tensors:
         if t is not None:
-            tp_group.broadcast(t, src=0)
+            if use_pynccl:
+                with pynccl_comm.change_state(enable=True):
+                    # pynccl `src` is the rank in the group, same as
+                    # GroupCoordinator.broadcast's local-rank `src`.
+                    pynccl_comm.broadcast(t, src=0)
+            else:
+                tp_group.broadcast(t, src=0)
 
 
 def _solo_gather_full_vocab_rows(
@@ -172,33 +196,47 @@ def _solo_gather_full_vocab_rows(
     non-padding org-vocab rows sit at the shard start); the shards are
     concatenated in rank order and trimmed to ``out_rows``. Handles uneven
     vocab shards (--rank-vocab-ratio) naturally since each source announces
-    its own shape. Returns the full tensor on ranks with ``keep=True`` and
-    None elsewhere (recv buffers are dropped immediately so the transient
-    footprint on non-keeping ranks is one shard, not the full table).
+    its own row count. Returns the full tensor on ranks with ``keep=True``
+    and None elsewhere (recv buffers are dropped immediately so the
+    transient footprint on non-keeping ranks is one shard, not the full
+    table).
+
+    DEVICE-TENSOR COLLECTIVES ONLY: the row-count exchange is a tiny int64
+    all_gather over the DEVICE group, NOT broadcast_object. With the
+    shared-memory mq broadcaster attached to the TP group,
+    ``GroupCoordinator.broadcast_object`` asserts ``src == 0``, so the
+    per-source object broadcasts this used to do crash at init on every
+    multi-rank boot. No object pickling is needed anyway: only the row
+    count varies per rank — the non-row dims and dtype are rank-uniform.
+    One-time init cost; all temporaries are freed here or by the caller's
+    empty_cache (M21 discipline).
 
     If the shard already spans ``out_rows`` (replicated embedding, tp=1),
     the caller should NOT call this — there is nothing to gather.
     """
     world = tp_group.world_size
     my_rank = tp_group.rank_in_group
+    rows_t = torch.tensor([valid_rows], dtype=torch.int64, device=shard.device)
+    all_rows = tp_group.all_gather(rows_t, dim=0)
+    sizes = [int(r) for r in all_rows.tolist()]
+    del rows_t, all_rows
+    tail_shape = tuple(shard.shape[1:])
     pieces: List[Optional[torch.Tensor]] = []
     for src in range(world):
         if src == my_rank:
             piece = shard[:valid_rows].contiguous()
-            tp_group.broadcast_object(list(piece.shape), src=src)
-            tp_group.broadcast(piece, src=src)
         else:
-            shape = tp_group.broadcast_object(None, src=src)
             piece = torch.empty(
-                tuple(shape), dtype=shard.dtype, device=shard.device
+                (sizes[src],) + tail_shape, dtype=shard.dtype, device=shard.device
             )
-            tp_group.broadcast(piece, src=src)
+        tp_group.broadcast(piece, src=src)
         if keep:
             pieces.append(piece)
         del piece
     if not keep:
         return None
     full = torch.cat(pieces, dim=0)
+    del pieces
     if full.shape[0] < out_rows:
         raise RuntimeError(
             "draft-solo vocab gather assembled only "
