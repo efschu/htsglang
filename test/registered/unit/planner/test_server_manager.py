@@ -308,6 +308,42 @@ class TestSupervisorLifecycle(unittest.TestCase):
         self.assertFalse(_pgid_alive(pgid))
         self.assertEqual(self.sup.state, "stopped")
 
+    def test_status_flips_booting_to_ready_when_server_answers(self):
+        # start(wait_ready=False) returns in BOOTING so the dashboard stays
+        # responsive; the poll-driven status() must flip to READY once the
+        # server answers. The real-boot bug was status() sitting on BOOTING
+        # forever while the server was up and serving.
+        self.sup.start(
+            _fake_child_settings(39010), argv=_sleep_argv(), wait_ready=False)
+        self.assertEqual(self.sup.state, "booting")
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        with mock.patch("urllib.request.urlopen", return_value=_Resp()):
+            st = self.sup.status()
+        self.assertEqual(st["state"], "ready")
+
+    def test_status_flips_booting_to_error_past_deadline(self):
+        # A boot that never comes up must not stay BOOTING forever.
+        self.sup.start(
+            _fake_child_settings(39011), argv=_sleep_argv(), wait_ready=False)
+        self.sup._boot_deadline = time.time() - 1  # already elapsed
+
+        def _boom(*a, **k):
+            raise OSError("connection refused")
+
+        with mock.patch("urllib.request.urlopen", side_effect=_boom):
+            st = self.sup.status()
+        self.assertEqual(st["state"], "error")
+        self.assertIn("boot deadline", st["error"])
+
     def test_stop_does_not_kill_unrelated_sibling(self):
         sibling = self._spawn_sibling()
         sibling_pgid = os.getpgid(sibling.pid)
