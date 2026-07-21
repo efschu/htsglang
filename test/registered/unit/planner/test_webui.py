@@ -1353,3 +1353,57 @@ class TestV3IndexMarkers(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProfileArgvMerge(unittest.TestCase):
+    """A profile's argv is a FLAG SET; the serving identity lives in the launch
+    form. Live boots exposed both halves of this: using the profile argv alone
+    produced a command sglang rejects ("--model-path required"), and letting the
+    profile's placeholder --max-running-requests win OOM'd CUDA-graph capture.
+    """
+
+    def _settings(self, **kw):
+        from sglang.srt.planner.server_manager import LaunchSettings
+
+        base = dict(
+            model_path="/models/M", served_model_name="M", tp_size=3,
+            context_length=262144, max_running_requests=2, host="0.0.0.0",
+            port=30000,
+        )
+        base.update(kw)
+        return LaunchSettings(**base).validate()
+
+    def test_merge_keeps_serving_identity_and_profile_flags(self):
+        from sglang.srt.planner import webui
+
+        prof = [
+            "--tp-size", "3", "--rank-tp-ratio", "auto-performance",
+            "--rank-auto-reserve-mib", "3000,2200,2200",
+            "--speculative-adaptive",
+            # profile placeholders that MUST NOT win over the form:
+            "--host", "127.0.0.1", "--max-running-requests", "16",
+        ]
+        argv = webui._argv_from_payload(
+            {"profile_argv": prof}, self._settings())
+        cmd = " ".join(argv)
+        # the profile's own tuning flags survive
+        self.assertIn("--rank-tp-ratio auto-performance", cmd)
+        self.assertIn("--rank-auto-reserve-mib 3000,2200,2200", cmd)
+        self.assertIn("--speculative-adaptive", cmd)
+        # serving identity comes from the form, exactly once
+        self.assertIn("--model-path /models/M", cmd)
+        self.assertIn("--context-length 262144", cmd)
+        self.assertIn("--max-running-requests 2", cmd)
+        self.assertNotIn("--max-running-requests 16", cmd)
+        self.assertIn("--host 0.0.0.0", cmd)
+        self.assertNotIn("--host 127.0.0.1", cmd)
+        for flag in ("--model-path", "--max-running-requests", "--host"):
+            self.assertEqual(argv.count(flag), 1, flag)
+
+    def test_drop_flags_removes_flag_and_value(self):
+        from sglang.srt.planner import webui
+
+        out = webui._drop_flags(
+            ["--a", "1", "--keep", "2", "--flagonly", "--b", "3"],
+            {"--a", "--flagonly"})
+        self.assertEqual(out, ["--keep", "2", "--b", "3"])

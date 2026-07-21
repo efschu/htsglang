@@ -1199,6 +1199,8 @@ def _launch_settings_from_payload(payload: dict):
         rank_gpu_memory_mib=_ints(payload.get("rank_gpu_memory_mib")),
         kv_cache_dtype=payload.get("kv_cache_dtype", "auto"),
         context_length=int(payload.get("context_length") or 8192),
+        max_running_requests=int(payload.get("max_running_requests") or 16),
+        host=str(payload.get("host") or "127.0.0.1"),
         max_num_seqs=(
             int(payload["max_num_seqs"])
             if payload.get("max_num_seqs") not in (None, "")
@@ -1229,6 +1231,25 @@ def _display_env(settings) -> dict:
     return {k: _redact_env_value(k, str(v)) for k, v in env.items()}
 
 
+def _drop_flags(argv: List[str], drop: set) -> List[str]:
+    """Remove ``drop`` flags (and their values) from a flag list."""
+    out: List[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if not tok.startswith("--"):
+            out.append(tok)
+            i += 1
+            continue
+        has_value = i + 1 < len(argv) and not argv[i + 1].startswith("--")
+        if tok not in drop:
+            out.append(tok)
+            if has_value:
+                out.append(argv[i + 1])
+        i += 2 if has_value else 1
+    return out
+
+
 def _argv_from_payload(payload: dict, settings) -> Optional[list]:
     """The optional argv override: an explicit full ``argv`` wins (test seam);
     else a ``profile_argv`` flag list (flags.profile_argv) is prefixed with
@@ -1237,12 +1258,43 @@ def _argv_from_payload(payload: dict, settings) -> Optional[list]:
     if argv is not None:
         return list(argv)
     profile_argv = payload.get("profile_argv")
-    if profile_argv:
-        return [
-            settings.python_exe, "-m", "sglang.launch_server",
-            *[str(a) for a in profile_argv],
-        ]
-    return None
+    if not profile_argv:
+        return None
+    # A profile's argv is a FLAG SET from the catalog; it carries no serving
+    # identity (--model-path, --served-model-name, --context-length, ...),
+    # which lives in the launch form. Using it alone produced a command sglang
+    # rejects outright ("the following arguments are required: --model-path").
+    # MERGE: profile flags first (they win on conflict), then every flag from
+    # the LaunchSettings command the profile does not already set.
+    # SERVING IDENTITY belongs to the launch form, not the profile: a profile
+    # pins placeholder values (e.g. --host 127.0.0.1, a default port) and would
+    # otherwise silently override what the user typed. A too-large
+    # --max-running-requests here is not cosmetic: it OOMs during CUDA-graph
+    # capture. So the form wins for these, the profile wins for everything else.
+    identity = {
+        "--model-path", "--model", "--served-model-name", "--context-length",
+        "--max-running-requests", "--host", "--port", "--tokenizer-path",
+    }
+    prof = [
+        str(a) for a in _drop_flags([str(a) for a in profile_argv], identity)
+    ]
+    prof_flags = {a for a in prof if a.startswith("--")}
+    base = list(settings.launch_command())
+    head, rest = base[:3], base[3:]  # [python, -m, sglang.launch_server]
+    extra: List[str] = []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if not tok.startswith("--"):  # stray value, keep position-safe
+            i += 1
+            continue
+        has_value = i + 1 < len(rest) and not rest[i + 1].startswith("--")
+        if tok not in prof_flags:
+            extra.append(tok)
+            if has_value:
+                extra.append(rest[i + 1])
+        i += 2 if has_value else 1
+    return [*head, *prof, *extra]
 
 
 def server_start_payload(payload: dict) -> dict:
