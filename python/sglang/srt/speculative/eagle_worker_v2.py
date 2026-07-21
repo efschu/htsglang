@@ -78,6 +78,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    capture_safe_tp_broadcast,
     commit_mamba_states_after_verify,
     draft_tp_context,
     fast_sample,
@@ -142,17 +143,17 @@ def _broadcast_draft_picks(
     (no matching participants). The one-per-round token-id broadcast
     happens in ``EagleDraftWorker.draft`` instead.
 
-    CAPTURE SAFETY: this helper runs inside the draft CUDA-graph capture
-    region (draft_forward is captured). A c10d NCCL broadcast there is
-    ncclInvalidUsage: the c10d communicator initializes lazily on first
-    use, and communicator init inside a capture region is illegal (it also
-    hard-fails with "Duplicate GPU detected" when ranks are co-located on
-    one physical GPU, which torch's bundled NCCL rejects). Under capture we
-    therefore route through the TP group's pynccl communicator — the
-    graph-capturable path the rest of the capture pipeline uses (same
-    pattern as graph_capture()/all_reduce in parallel_state; DFLASH avoids
-    the c10d path the same way). Outside capture the original c10d
-    tp_group.broadcast is kept byte-identical.
+    CAPTURE / CO-LOCATION SAFETY: this helper first runs inside the draft
+    CUDA-graph capture PHASE — whose first executions are the WARMUP
+    iterations, which run on a normal (non-capturing) stream, so a
+    "currently capturing?" predicate does NOT cover them — and c10d's lazy
+    NCCL communicator init there is ncclInvalidUsage. Worse, torch's
+    bundled NCCL rejects co-located ranks outright ("Duplicate GPU
+    detected"), so c10d can never serve tp>cards rigs at all, capture or
+    eager. The broadcast therefore goes through capture_safe_tp_broadcast:
+    pynccl whenever available (warmup, capture, and eager alike — the
+    DFLASH pynccl-only pattern), c10d only as the non-CUDA fallback.
+    Payload semantics are identical (same NCCL broadcast, same bytes).
     """
     if solo_single_rank:
         return
@@ -164,21 +165,7 @@ def _broadcast_draft_picks(
     )
     if tp_group.world_size == 1:
         return
-    pynccl_comm = getattr(tp_group, "pynccl_comm", None)
-    use_pynccl = (
-        pynccl_comm is not None
-        and getattr(pynccl_comm, "available", False)
-        and torch.cuda.is_current_stream_capturing()
-    )
-    for t in tensors:
-        if t is not None:
-            if use_pynccl:
-                with pynccl_comm.change_state(enable=True):
-                    # pynccl `src` is the rank in the group, same as
-                    # GroupCoordinator.broadcast's local-rank `src`.
-                    pynccl_comm.broadcast(t, src=0)
-            else:
-                tp_group.broadcast(t, src=0)
+    capture_safe_tp_broadcast(tp_group, tensors, src=0)
 
 
 def _solo_gather_full_vocab_rows(
@@ -245,6 +232,76 @@ def _solo_gather_full_vocab_rows(
             "(unexpected shard layout)."
         )
     return full[:out_rows].contiguous()
+
+
+#: Attributes a solo-shadow draft ModelRunner legitimately lacks (its
+#: backends / pools / graphs are never built) but which generic init/serve
+#: paths dereference. Explicitly set to None on shadow ranks so those paths
+#: see "no backend / no pool" instead of AttributeError. Consumers audited:
+#: - draft_attn_backend / attn_backend: adaptive _override_worker_state
+#:   backup+restore, apply_runtime_state, spec_v2_attn_backends
+#: - token_to_kv_pool (+allocator, req_to_token_pool):
+#:   kv_cache_builder.get_draft_kv_pool via scheduler.init_disaggregation
+#:   (reached even with disaggregation_mode "null") and hicache register
+#: - decode_cuda_graph_runner: generic runner-graph probes
+_SHADOW_DRAFT_RUNNER_NONE_ATTRS = (
+    "attn_backend",
+    "draft_attn_backend",
+    "token_to_kv_pool",
+    "token_to_kv_pool_allocator",
+    "req_to_token_pool",
+    "decode_cuda_graph_runner",
+)
+
+
+def install_shadow_draft_runner_surface(draft_runner) -> None:
+    """Give a solo-SHADOW rank's draft ModelRunner an explicit attribute
+    surface (--speculative-draft-placement solo).
+
+    Shadow ranks skip the draft's memory pool, attention backends, and CUDA
+    graphs — the draft forward never runs there — but generic init/serve
+    paths still dereference ``draft_runner.<attr>``. Two boot-crash classes
+    this prevents:
+    * adaptive: _override_worker_state backs up
+      ``draft_runner.draft_attn_backend`` before init_attention_backend
+      ever ran on the shadow;
+    * disaggregation KV builder: scheduler.init_disaggregation calls
+      get_draft_kv_pool -> ``draft_runner.token_to_kv_pool`` even with
+      disaggregation_mode "null".
+
+    Every commonly-dereferenced attribute a shadow legitimately lacks is
+    set to None (only if genuinely absent — pre-initialized attributes are
+    never clobbered). Anything else that is missing raises a LOUD
+    AttributeError naming solo mode instead of a bare
+    "'ModelRunner' object has no attribute" puzzler.
+    """
+    for attr in _SHADOW_DRAFT_RUNNER_NONE_ATTRS:
+        if not hasattr(draft_runner, attr):
+            setattr(draft_runner, attr, None)
+
+    cls = type(draft_runner)
+    if getattr(cls, "_is_shadow_draft_runner_cls", False):
+        return
+
+    def _shadow_getattr(self, name):
+        raise AttributeError(
+            f"'{cls.__name__}' object has no attribute {name!r}: this is a "
+            "SHADOW rank's draft runner under --speculative-draft-placement "
+            "solo (the draft runs only on the solo host rank; shadows build "
+            "no draft backends, pools, or graphs). If a generic code path "
+            "needs this attribute, either guard it for shadow ranks or add "
+            "the attribute to _SHADOW_DRAFT_RUNNER_NONE_ATTRS in "
+            "eagle_worker_v2."
+        )
+
+    # Subclass swap (isinstance-preserving): only upgrades the error message
+    # for genuinely missing attributes — __getattr__ fires only after normal
+    # lookup fails, so hasattr()/getattr(..., default) probes are unchanged.
+    draft_runner.__class__ = type(
+        f"Shadow{cls.__name__}",
+        (cls,),
+        {"__getattr__": _shadow_getattr, "_is_shadow_draft_runner_cls": True},
+    )
 
 
 def _get_plan_stream(
@@ -340,6 +397,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+
+        if self._spec_solo_active and not self._spec_solo_is_host:
+            # Shadow rank: explicit None surface + loud-AttributeError class
+            # for everything the never-running draft legitimately lacks.
+            install_shadow_draft_runner_surface(self.draft_runner)
+        elif self._spec_solo_active:
+            # Solo HOST: its draft graphs (decode, draft-extend, prefill,
+            # every adaptive rung) are captured rank-LOCALLY — the draft is
+            # a weight-TP=1 build with a collective-free forward, and the
+            # shadow ranks skip draft capture entirely. The capture
+            # backends' per-warmup TP barrier would therefore wait on ranks
+            # that never enter it (boot deadlock: host parked in
+            # tp_group.barrier while shadows spin ahead in the next
+            # collective phase). This flag makes the backends skip that
+            # barrier for captures against THIS runner only; the target
+            # runner's captures keep their barriers.
+            self.draft_runner.spec_solo_rank_local_graphs = True
 
         # NEXTN/EAGLE (non-EAGLE3) drafts ALWAYS share embed_tokens + lm_head
         # with the target (init_lm_head -> set_embed_and_head). Do the sharing

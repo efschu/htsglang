@@ -71,6 +71,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
+        # Draft-solo placement: solo-host draft graphs capture rank-locally
+        # (shadows never enter the matching barrier — see
+        # full_cuda_graph_backend for the deadlock this avoids).
+        self._skip_warmup_barrier = getattr(
+            cuda_graph_runner.model_runner, "spec_solo_rank_local_graphs", False
+        )
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
         self._shared_output_buffer: Optional[Any] = None
@@ -113,7 +119,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         warmup_out = None
         for _ in range(2):
             self._device_module.synchronize()
-            self._tp_group.barrier()
+            if not self._skip_warmup_barrier:
+                self._tp_group.barrier()
             warmup_out = forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()

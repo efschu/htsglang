@@ -194,15 +194,35 @@ class TestAdaptiveAcceptFeedRatchet(CustomTestCase):
         class V(_FuncScopedVisitor):
             found = False
 
+            @staticmethod
+            def _arg_names(node):
+                # Flatten tuple/list literals so both call shapes count:
+                #   tp_group.broadcast(num_correct_drafts, src=0)
+                #   capture_safe_tp_broadcast(g, (predict, ..., num_correct_drafts), src=0)
+                names = []
+                for a in node.args:
+                    if isinstance(a, (ast.Tuple, ast.List)):
+                        names.extend(
+                            e.id for e in a.elts if isinstance(e, ast.Name)
+                        )
+                    elif isinstance(a, ast.Name):
+                        names.append(a.id)
+                return names
+
             def visit_Call(self, node):
+                is_broadcast_call = (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "broadcast"
+                ) or (
+                    # Capture/co-location-safe variant (pynccl-preferred);
+                    # see spec_utils.capture_safe_tp_broadcast.
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "capture_safe_tp_broadcast"
+                )
                 if (
                     "eagle_sample" in self.func_stack
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "broadcast"
-                    and any(
-                        isinstance(a, ast.Name) and a.id == "num_correct_drafts"
-                        for a in node.args
-                    )
+                    and is_broadcast_call
+                    and "num_correct_drafts" in self._arg_names(node)
                 ):
                     self.found = True
                 self.generic_visit(node)

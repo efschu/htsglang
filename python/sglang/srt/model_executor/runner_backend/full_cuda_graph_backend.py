@@ -61,6 +61,13 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
+        # Draft-solo placement: the solo host's DRAFT graphs are captured
+        # rank-LOCALLY (weight-TP=1 model, collective-free forward) while the
+        # shadow ranks skip draft capture entirely — a TP-group barrier here
+        # would wait on ranks that never enter it and deadlock the boot.
+        self._skip_warmup_barrier = getattr(
+            cuda_graph_runner.model_runner, "spec_solo_rank_local_graphs", False
+        )
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -97,7 +104,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
         for _ in range(2):
             self._device_module.synchronize()
-            self._tp_group.barrier()
+            if not self._skip_warmup_barrier:
+                self._tp_group.barrier()
             forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()
