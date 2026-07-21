@@ -420,7 +420,10 @@ class LaunchSettings:
             raise ValueError(
                 f"--rank-gpu-id length {len(self.rank_gpu_id)} != tp_size "
                 f"{self.tp_size}")
-        if (self.rank_tp_ratio is not None
+        # rank_tp_ratio may be an explicit int tuple OR a string sentinel
+        # ("auto" / "auto-performance" -> budgets derived from NVML); only the
+        # explicit-tuple form is length-checked against tp_size.
+        if (isinstance(self.rank_tp_ratio, (list, tuple))
                 and len(self.rank_tp_ratio) != self.tp_size):
             raise ValueError(
                 f"--rank-tp-ratio length {len(self.rank_tp_ratio)} != tp_size "
