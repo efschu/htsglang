@@ -2085,6 +2085,22 @@ def config_profiles_get(payload: Optional[dict] = None) -> dict:
             d["launch_env"] = dict(p.env or {})
         return d
 
+    # Draft-model candidates for the selected base model (speculative
+    # decoding WITHOUT an own MTP head): matched against the local model
+    # inventory. Also returned to the UI, which feeds the Speculative
+    # section's draft selector + no-MTP hint from them.
+    has_mtp = flagsmod.model_has_mtp(model_cfg) if model_cfg else None
+    draft_candidates: List[dict] = []
+    if payload.get("model"):
+        try:
+            from sglang.srt.planner.server_manager import discover_models
+
+            draft_candidates = flagsmod.find_draft_models(
+                payload["model"], discover_models()
+            )
+        except Exception:  # pragma: no cover - defensive
+            draft_candidates = []
+
     # The generator's capacity rules (context_length / max_running_requests)
     # size KV via feasibility.plan and need the checkpoint path -- pass the
     # selected model ref through as the base model_path (the rules degrade
@@ -2094,7 +2110,10 @@ def config_profiles_get(payload: Optional[dict] = None) -> dict:
     try:
         generated = [
             _prof_json(p)
-            for p in flagsmod.profiles(model_cfg, gpus, base=base)
+            for p in flagsmod.profiles(
+                model_cfg, gpus, base=base,
+                draft_models=draft_candidates or None,
+            )
         ]
     except Exception as e:  # pragma: no cover - defensive
         generated = []
@@ -2112,6 +2131,8 @@ def config_profiles_get(payload: Optional[dict] = None) -> dict:
         "gen_error": gen_error,
         "upstream_count": flagsmod.upstream_count(),
         "fork_count": flagsmod.fork_count(),
+        "model_has_mtp": has_mtp,
+        "draft_candidates": draft_candidates,
     }
 
 
@@ -2852,20 +2873,14 @@ INDEX_HTML = r"""<!doctype html>
       <legend>running model + start config</legend>
       <div id="landing_config" class="muted">waiting for first snapshot&hellip;</div>
     </fieldset>
-    <div class="cols">
-      <div>
-        <fieldset>
-          <legend>per-card GPU (live + 60s)</legend>
-          <div id="landing_gpus" class="muted">waiting&hellip;</div>
-        </fieldset>
-      </div>
-      <div>
-        <fieldset>
-          <legend>where it sits on the cards (RUNNING config placement)</legend>
-          <div id="landing_placement" class="muted">computing&hellip;</div>
-        </fieldset>
-      </div>
-    </div>
+    <!-- ONE block per physical card: what occupies its VRAM (placement bar)
+         AND how it is doing live (compact telemetry line + 60s util/power
+         sparklines). The former separate standalone per-GPU chart grid is
+         MERGED into these card blocks -- nothing is rendered twice. -->
+    <fieldset>
+      <legend>per-card VRAM placement + live telemetry (RUNNING config, 60s)</legend>
+      <div id="landing_placement" class="muted">computing&hellip;</div>
+    </fieldset>
     <fieldset>
       <legend>energy &mdash; live GPU power state (per-card power CALIBRATION lives in the Energy tab)</legend>
       <div style="margin-bottom:.4rem">
@@ -3194,7 +3209,19 @@ INDEX_HTML = r"""<!doctype html>
 
       <details class="cfg-section" id="sec_speculative">
         <summary><b>Speculative decoding</b><span class="sec-sum" id="sum_speculative"></span></summary>
-        <div class="sec-body"><div id="secflags_speculative"></div></div>
+        <div class="sec-body">
+          <div id="spec_draft_hint" class="muted"
+            style="display:none;color:#e3a008;margin:.2rem 0 .3rem"></div>
+          <div class="setrow" id="row_draft_pick"
+            data-hay="draft model eagle eagle3 speculator speculative-draft-model local">
+            <span class="lbl">draft model (local)
+              <span class="chg" title="changed from preset"></span></span>
+            <select id="draft_model_select" onchange="draftPickChanged()">
+              <option value="">(none)</option></select>
+            <span class="qmark" title="Matching LOCAL draft/speculator models for the selected base model (name-family match, EAGLE3/EAGLE heads). Picking one fills --speculative-draft-model-path below; the free-text field stays authoritative and accepts any path. Needed for speculative decoding when the checkpoint has no MTP head of its own.">?</span>
+          </div>
+          <div id="secflags_speculative"></div>
+        </div>
       </details>
 
       <details class="cfg-section" id="sec_cache">
@@ -4092,10 +4119,40 @@ function fmtMib(x){ return (x==null)? '—' : (x>=1024? (x/1024).toFixed(2)+'G' 
 // One row/block per PHYSICAL CARD: name + total VRAM, a proportional bar of
 // what occupies it (weights / KV / mamba / overhead / free), the co-located
 // ranks, and the granular per-rank detail (head/token/expert index ranges,
-// MTP, host-RAM offload) as compact secondary lines. Used UNCHANGED by both
-// the landing (running config) and the runner (prospective config).
+// MTP, host-RAM offload) as compact secondary lines. Used by both the
+// landing (running config) and the runner (prospective config); the landing
+// additionally passes the live snapshot's gpus[] so each card block carries
+// its CURRENT telemetry (util/clock/power/temp + 60s util/power sparklines)
+// -- one place per card explains BOTH what occupies its VRAM and how it is
+// doing live.
 const SEG_COLORS = {weights:'#2f81f7', kv:'#2ea043', mamba:'#a371f7', ovh:'#6e7681'};
-function renderPlacement(pl){
+// The live gpus[] row for a placement card: cards are CUDA-keyed
+// (c.gpu_index == the rank_gpu_id space); gpus[] rows are NVML-sampled and
+// carry the UUID-resolved device-map bridge cuda_index -- match on that
+// (nvml_index only as the unbridged fallback, same degradation as devLabel).
+function _liveGpuForCard(liveGpus, cudaIdx){
+  for(const g of (liveGpus||[])){
+    const k=(g.cuda_index!=null? g.cuda_index : g.nvml_index);
+    if(k===cudaIdx) return g;
+  }
+  return null;
+}
+// Compact per-card live line: current numbers + ONE small sparkline row
+// (60s util + power; ring keys are nvml-keyed, pushed by renderLanding).
+// mem stays a live used/total text -- the placement bar above already shows
+// the VRAM breakdown.
+function cardLiveHtml(g){
+  const key='gpu'+g.nvml_index;
+  return '<div class="cardlive" style="margin:.15rem 0;font-size:.72rem" '
+    +'title="live NVML telemetry (60s rings; util freezes at zero like the top strip)">'
+    +'util <b>'+g.utilization_pct+'%</b> '+sparkline(key+'_util',80,18)
+    +' &nbsp; pow <b>'+g.power_watts.toFixed(0)+'</b>/'+g.power_limit_w.toFixed(0)+'W '
+    +sparkline(key+'_pow',80,18)
+    +' &nbsp; SM '+g.sm_clock_mhz+'MHz &nbsp; '+g.temperature_c+'C'
+    +' &nbsp; mem '+(g.mem_used_mib/1024).toFixed(1)+'/'+(g.mem_total_mib/1024).toFixed(1)+'G live'
+    +'</div>';
+}
+function renderPlacement(pl, liveGpus){
   if(!pl) return '<span class="muted">no placement.</span>';
   const m=pl.model||{}; let h='';
   h+='<div class="legend" style="margin-top:0">TP '+pl.tp_size+' · DCP '+pl.dcp_size
@@ -4140,6 +4197,8 @@ function renderPlacement(pl){
       +'<span class="dot" style="background:'+SEG_COLORS.ovh+'"></span>overhead '+fmtMib(c.overhead_mib)+' &nbsp;'
       +'<span class="dot" style="background:#0d1117;border:1px solid #30363d"></span>free '+fmtMib(free)
       +' &nbsp;·&nbsp; used <b>'+fmtMib(c.total_mib)+'</b></div>';
+    const lg=_liveGpuForCard(liveGpus, c.gpu_index);
+    if(lg) h+=cardLiveHtml(lg);
     for(const r of c.ranks){
       const d=byRank[r]||{}; const bits=[];
       if(d.attn) bits.push('Q['+d.attn.q_head_start+'..'+d.attn.q_head_end+') '
@@ -4375,21 +4434,15 @@ function renderLanding(s, tgt){
     +(s.metrics_error?'<div class="reasons" style="margin-top:.3rem">'+esc(s.metrics_error)
       +' &mdash; token rates need --enable-metrics on the server.</div>':'');
 
-  let gh='';
+  // Per-card 60s telemetry rings (rendered INSIDE the placement card blocks,
+  // renderPlacement's live line -- the old standalone per-GPU chart grid is
+  // gone). util is an ACTIVITY stream -> strip freeze-at-zero semantics;
+  // power idles at a nonzero wattage -> plain ring.
   for(const g of (s.gpus||[])){
     const key='gpu'+g.nvml_index;
-    pushRing(key+'_util',s.t,g.utilization_pct); pushRing(key+'_pow',s.t,g.power_watts);
-    pushRing(key+'_temp',s.t,g.temperature_c); pushRing(key+'_mem',s.t,g.mem_used_mib);
-    gh+='<div style="margin:.3rem 0;border-bottom:1px solid #21262d;padding-bottom:.3rem">'
-      +'<b>'+esc(g.name)+'</b> <span class="muted" title="cuda: CUDA/FASTEST_FIRST order (the --rank-gpu-id/--base-gpu-id space); nvml: NVML/PCI order (nvidia-smi). Telemetry is NVML-sampled.">'
-      +(devLabel(g.cuda_index, g.nvml_index)||('#'+g.nvml_index))+'</span><br>'
-      +'util '+g.utilization_pct+'% '+sparkline(key+'_util',80,18)+' &nbsp; '
-      +'pow '+g.power_watts.toFixed(0)+'/'+g.power_limit_w.toFixed(0)+'W '+sparkline(key+'_pow',80,18)+'<br>'
-      +'SM/mem '+g.sm_clock_mhz+'/'+g.mem_clock_mhz+'MHz &nbsp; temp '+g.temperature_c+'C '+sparkline(key+'_temp',60,18)+' &nbsp; '
-      +'mem '+(g.mem_used_mib/1024).toFixed(1)+'/'+(g.mem_total_mib/1024).toFixed(1)+'G '+sparkline(key+'_mem',60,18)
-      +'</div>';
+    stripPush(key+'_util',s.t,g.utilization_pct);
+    pushRing(key+'_pow',s.t,g.power_watts);
   }
-  $('landing_gpus').innerHTML = gh||'<span class="muted">no NVML cards'+(s.nvml_error?' ('+esc(s.nvml_error)+')':'')+'</span>';
 
   if(s.rates) window._lastRates=s.rates;
   renderLandingStrip(s);
@@ -4532,7 +4585,19 @@ function renderLandingStrip(s){
 async function renderLandingPlacement(s){
   const n=normalizeStartConfig(s);
   const cfg=(n&&n.cfg)||{}; const model=cfg.model_path;
-  if(!model){ $('landing_placement').innerHTML='<span class="muted">no start config for placement (external server without /get_server_info).</span>'; return; }
+  if(!model){
+    // No placement computable (external server without /get_server_info):
+    // still show the per-card LIVE telemetry blocks -- the merged card view
+    // degrades to telemetry-only, never to nothing.
+    let gh='';
+    for(const g of (s.gpus||[]))
+      gh+='<div class="cardblock"><div><b>'
+        +(devLabel(g.cuda_index, g.nvml_index)||('#'+g.nvml_index))+'</b> '
+        +esc(g.name)+'</div>'+cardLiveHtml(g)+'</div>';
+    $('landing_placement').innerHTML=
+      '<span class="muted">no start config for placement (external server without /get_server_info).</span>'+gh;
+    return;
+  }
   const flags={
     tp_size: cfg.tp_size||1, rank_gpu_id: cfg.rank_gpu_id||null, rank_tp_ratio: cfg.rank_tp_ratio||null,
     rank_gpu_memory_mib: cfg.rank_gpu_memory_mib||null, kv_cache_dtype: cfg.kv_cache_dtype||'auto',
@@ -4555,7 +4620,9 @@ async function renderLandingPlacement(s){
     const r=await fetch('/api/placement',{method:'POST',body:JSON.stringify(
       {model, gguf_choice: cfg.gguf_variant||null, flags})});
     const d=await r.json();
-    $('landing_placement').innerHTML = d.ok? renderPlacement(d.placement) : '<span class="reasons">'+esc(d.error)+'</span>';
+    $('landing_placement').innerHTML = d.ok? renderPlacement(d.placement, s.gpus)
+      : '<span class="reasons">'+esc(d.error)+'</span>'
+        +((s.gpus&&s.gpus.length)?'':(s.nvml_error?'<div class="muted">no NVML cards ('+esc(s.nvml_error)+')</div>':''));
   }catch(e){ $('landing_placement').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
 }
 
@@ -4746,6 +4813,7 @@ function onFlagChange(id){
   // A manual edit invalidates the applied profile's EXACT argv (the launch
   // then falls back to the form fields; the profile env stays applied).
   if(window._profileArgv){ window._profileArgv=null; window._profileDirty=true; renderProfileLaunch(); }
+  if(id==='speculative_draft_model_path'){ renderDraftPick(); updateSpecDraftHint(); }
   markPresetDrift(); updateSectionSummaries(); updateGpuPick();
   resolveFlags(); refreshRunnerPlacement(); schedulePlan();
 }
@@ -4817,6 +4885,40 @@ function updateGpuPick(){
 function gpuPickChanged(){
   const el=$('fl_base_gpu_id');
   if(el){ el.value=$('gpu_pick_select').value; onFlagChange('base_gpu_id'); }
+}
+// ---- draft-model selector (Speculative section): matching LOCAL draft
+// heads for the selected base model; picking one writes the authoritative
+// fl_speculative_draft_model_path free-text field. -------------------------
+function renderDraftPick(){
+  const sel=$('draft_model_select'); if(!sel) return;
+  const cands=window._draftCandidates||[];
+  const cur=((window._flagSettings||{}).speculative_draft_model_path)||'';
+  sel.innerHTML='<option value="">(none)</option>'
+    +cands.map(c=>'<option value="'+esc(c.path)+'">'+esc(c.name)
+      +' ['+esc(c.algorithm)+']</option>').join('');
+  sel.value=cands.some(c=>c.path===cur)? cur : '';
+}
+function draftPickChanged(){
+  const el=$('fl_speculative_draft_model_path');
+  if(el){ el.value=$('draft_model_select').value;
+    onFlagChange('speculative_draft_model_path'); }
+  updateSpecDraftHint();
+}
+// Subtle amber hint (not a blocking banner): the selected base model has NO
+// MTP head and no draft model is chosen -> spec needs a draft model; name
+// the best local suggestion when one matched, else say none was found.
+function updateSpecDraftHint(){
+  const el=$('spec_draft_hint'); if(!el) return;
+  const chosen=((window._flagSettings||{}).speculative_draft_model_path)
+    || ($('fl_speculative_draft_model_path')&&$('fl_speculative_draft_model_path').value.trim());
+  const cands=window._draftCandidates||[];
+  if(window._modelHasMtp===false && !chosen){
+    el.style.display='';
+    el.textContent='this model has no MTP head - pick a draft model for '
+      +'speculative decoding '
+      +(cands.length? '(suggestion: '+cands[0].name+')'
+                    : '(none matching found locally)');
+  } else { el.style.display='none'; el.textContent=''; }
 }
 // ---- changed-from-preset markers ------------------------------------------
 // Snapshot every row's value when a preset is applied; a differing row gets
@@ -4957,6 +5059,11 @@ async function loadConfigProfiles(){
     const q=model? ('?model='+encodeURIComponent(model)):'';
     const r=await fetch('/api/config_profiles'+q); const d=await r.json();
     if(!d.ok){ $('profile_pick').innerHTML='<span class="reasons">'+esc(d.error||'error')+'</span>'; return; }
+    // Draft-model candidates + MTP-head fact for the Speculative section's
+    // selector and no-MTP hint (matched server-side per selected model).
+    window._draftCandidates=d.draft_candidates||[];
+    window._modelHasMtp=(d.model_has_mtp===undefined?null:d.model_has_mtp);
+    renderDraftPick(); updateSpecDraftHint();
     const nGen=(d.generated||[]).length;
     window._profiles=(d.generated||[]).concat(d.saved||[]);
     // LM-Studio-style preset DROPDOWN: generated presets first, user-saved
@@ -5021,7 +5128,7 @@ function applyProfile(i){
   sl.value=Math.min(parseInt($('sv_ctx').value)||8192, parseInt(sl.max));
   const mv=parseInt($('max_running_requests').value);
   if(mv) $('mrr_slider').value=Math.min(mv, 64);
-  updateGpuPick();
+  updateGpuPick(); renderDraftPick(); updateSpecDraftHint();
   window._presetBase=presetSnapshot();
   markPresetDrift(); updateSectionSummaries();
   resolveFlags(); refreshRunnerPlacement(); doPlan();
