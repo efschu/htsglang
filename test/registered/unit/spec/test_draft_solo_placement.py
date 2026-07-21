@@ -14,7 +14,13 @@ Covered contracts:
   top_scores_index) equal the host's preallocated topk=1 constants.
 * Vocab gather: _solo_gather_full_vocab_rows reassembles the full table
   from (uneven) shards; only keep=True ranks retain it; replicated tables
-  short-circuit without collectives.
+  short-circuit without collectives. Row counts travel via device-tensor
+  all_gather — broadcast_object is forbidden (mq broadcaster is src=0
+  only; the old per-source object broadcast crashed every solo boot).
+* Capture safety: _broadcast_draft_picks routes through the pynccl
+  communicator inside CUDA-graph capture (c10d NCCL broadcast there is
+  ncclInvalidUsage, and fails outright for co-located ranks) and keeps
+  the c10d path byte-identical outside capture.
 * Init gating: shadow ranks build no draft attention backends, capture no
   draft CUDA graphs (incl. adaptive ladder rungs, which route through the
   same methods), and allocate no draft KV pool.
@@ -22,7 +28,9 @@ Covered contracts:
 """
 
 import contextlib
+import re
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -83,15 +91,18 @@ def _make_worker(
 
 
 class _RecordingGroup:
-    """Fake GroupCoordinator: records broadcasts; recv side is fed from a
-    payload table (src -> tensor)."""
+    """Fake GroupCoordinator: records collectives; recv side is fed from a
+    payload table (src -> tensor). broadcast_object is POISONED: the real
+    group's mq broadcaster only supports src=0, so the vocab gather must
+    never touch the object path (boot regression: per-source
+    broadcast_object crashed every multi-rank solo boot at init)."""
 
     def __init__(self, world_size=3, rank_in_group=0, payloads=None):
         self.world_size = world_size
         self.rank_in_group = rank_in_group
         self.payloads = payloads or {}
         self.sent = []  # (tensor_clone, src)
-        self.object_log = []
+        self.gathered = []  # (tensor_clone, dim)
 
     def broadcast(self, tensor, src=0):
         if src == self.rank_in_group:
@@ -100,11 +111,25 @@ class _RecordingGroup:
             tensor.copy_(self.payloads[src].to(tensor.dtype))
         return tensor
 
+    def all_gather(self, tensor, dim=0):
+        """Device-tensor all_gather: each remote rank contributes its
+        payload's row count (mirrors the real row-count announcement)."""
+        self.gathered.append((tensor.clone(), dim))
+        parts = []
+        for r in range(self.world_size):
+            if r == self.rank_in_group:
+                parts.append(tensor)
+            else:
+                parts.append(
+                    torch.tensor([self.payloads[r].shape[0]], dtype=tensor.dtype)
+                )
+        return torch.cat(parts, dim=dim)
+
     def broadcast_object(self, obj=None, src=0):
-        if src == self.rank_in_group:
-            self.object_log.append((obj, src))
-            return obj
-        return list(self.payloads[src].shape)
+        raise AssertionError(
+            "broadcast_object must not be used: the mq broadcaster only "
+            "supports src=0 (parallel_state.GroupCoordinator.broadcast_object)"
+        )
 
 
 class TestClassDefaults(CustomTestCase):
@@ -183,6 +208,87 @@ class TestBroadcastDraftPicksSoloGate(CustomTestCase):
         ):
             _broadcast_draft_picks(torch.zeros(2, 1), None)
         self.assertEqual(calls, [0])
+
+
+class _FakePyNccl:
+    """Fake PyNcclCommunicator: records broadcasts and whether the comm was
+    enabled (change_state) at call time."""
+
+    def __init__(self, available=True):
+        self.available = available
+        self.disabled = True
+        self.broadcasts = []  # (tensor_clone, src, disabled_at_call)
+        self.change_state_enables = []
+
+    @contextlib.contextmanager
+    def change_state(self, enable=None):
+        self.change_state_enables.append(enable)
+        old_disabled = self.disabled
+        self.disabled = not enable
+        try:
+            yield
+        finally:
+            self.disabled = old_disabled
+
+    def broadcast(self, tensor, src):
+        self.broadcasts.append((tensor.clone(), src, self.disabled))
+
+
+class TestBroadcastDraftPicksCaptureSafe(CustomTestCase):
+    """Boot regression (co-located tp>cards NEXTN): a c10d NCCL broadcast
+    inside draft CUDA-graph capture is ncclInvalidUsage (lazy comm init in
+    the capture region; duplicate-GPU rejection for co-located ranks).
+    Under capture the pick broadcast must use the pynccl communicator; the
+    c10d path stays byte-identical outside capture."""
+
+    def _run(self, capturing, pynccl_comm):
+        c10d_calls = []
+        fake_group = SimpleNamespace(
+            world_size=3,
+            broadcast=lambda t, src: c10d_calls.append(src),
+            pynccl_comm=pynccl_comm,
+        )
+        with (
+            patch(
+                "sglang.srt.distributed.get_tp_group", return_value=fake_group
+            ),
+            patch(
+                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch(
+                "torch.cuda.is_current_stream_capturing",
+                return_value=capturing,
+            ),
+        ):
+            _broadcast_draft_picks(torch.zeros(2, 1), None, torch.ones(2, 1))
+        return c10d_calls
+
+    def test_capture_routes_through_pynccl(self):
+        pynccl = _FakePyNccl(available=True)
+        c10d_calls = self._run(capturing=True, pynccl_comm=pynccl)
+        self.assertEqual(c10d_calls, [])
+        self.assertEqual(len(pynccl.broadcasts), 2)  # None arg skipped
+        for _, src, disabled_at_call in pynccl.broadcasts:
+            self.assertEqual(src, 0)
+            self.assertFalse(disabled_at_call)  # enabled via change_state
+        self.assertEqual(pynccl.change_state_enables, [True, True])
+
+    def test_outside_capture_keeps_c10d(self):
+        pynccl = _FakePyNccl(available=True)
+        c10d_calls = self._run(capturing=False, pynccl_comm=pynccl)
+        self.assertEqual(c10d_calls, [0, 0])
+        self.assertEqual(pynccl.broadcasts, [])
+
+    def test_unavailable_pynccl_falls_back_to_c10d(self):
+        pynccl = _FakePyNccl(available=False)
+        c10d_calls = self._run(capturing=True, pynccl_comm=pynccl)
+        self.assertEqual(c10d_calls, [0, 0])
+        self.assertEqual(pynccl.broadcasts, [])
+
+    def test_missing_pynccl_attr_falls_back_to_c10d(self):
+        c10d_calls = self._run(capturing=True, pynccl_comm=None)
+        self.assertEqual(c10d_calls, [0, 0])
 
 
 class TestTokenBroadcastContract(CustomTestCase):
@@ -340,6 +446,17 @@ class TestVocabGather(CustomTestCase):
         self.assertTrue(torch.equal(result, full))
         # The host broadcast its own VALID rows only (padding stripped).
         self.assertEqual(group.sent[0][0].shape, (4, 4))
+        # Row counts announced via ONE device-tensor all_gather (int64),
+        # never via broadcast_object (poisoned in _RecordingGroup).
+        self.assertEqual(len(group.gathered), 1)
+        rows_t, dim = group.gathered[0]
+        self.assertEqual(rows_t.dtype, torch.int64)
+        self.assertEqual(rows_t.tolist(), [4])
+        self.assertEqual(dim, 0)
+        # The assembled table owns its storage (no view into the shard —
+        # the shard temporaries must be freeable afterwards).
+        self.assertNotEqual(result.data_ptr(), shards[0].data_ptr())
+        self.assertTrue(result.is_contiguous())
 
     def test_shadow_contributes_and_keeps_nothing(self):
         full, valid_payloads, shards = self._shards()
@@ -351,6 +468,7 @@ class TestVocabGather(CustomTestCase):
         )
         self.assertIsNone(result)
         self.assertEqual(len(group.sent), 1)  # its own shard broadcast
+        self.assertEqual(len(group.gathered), 1)  # row-count announcement
 
     def test_short_assembly_raises(self):
         _, valid_payloads, shards = self._shards()
@@ -395,6 +513,51 @@ class TestVocabGather(CustomTestCase):
                 out_rows=10,
                 keep=True,
             )
+
+
+class TestNoNonzeroSrcBroadcastObject(CustomTestCase):
+    """Source-level regression guard: GroupCoordinator.broadcast_object
+    asserts src == 0 when the mq broadcaster is attached (the normal TP
+    setup), so ANY broadcast_object call with a non-zero src crashes at
+    runtime. The solo vocab gather used to do exactly that (src=1, src=2)
+    and broke every multi-rank solo boot."""
+
+    @staticmethod
+    def _call_args_text(text, start):
+        """Text of a call's argument list, from just past the open paren to
+        its matching close paren (handles nested parens)."""
+        depth = 1
+        i = start
+        while i < len(text) and depth > 0:
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+            i += 1
+        return text[start : i - 1]
+
+    def test_speculative_sources_use_only_src0_broadcast_object(self):
+        import sglang.srt.speculative.eagle_worker_v2 as eagle_mod
+
+        spec_dir = Path(eagle_mod.__file__).resolve().parent
+        offenders = []
+        for path in sorted(spec_dir.rglob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            for m in re.finditer(r"\.broadcast_object\s*\(", text):
+                args = self._call_args_text(text, m.end())
+                src_match = re.search(r"\bsrc\s*=\s*([^,)\s]+)", args)
+                if src_match and src_match.group(1) != "0":
+                    line = text.count("\n", 0, m.start()) + 1
+                    offenders.append(
+                        f"{path.relative_to(spec_dir)}:{line}: "
+                        f"broadcast_object(..., src={src_match.group(1)})"
+                    )
+        self.assertEqual(
+            offenders,
+            [],
+            "broadcast_object only supports src=0 under the mq broadcaster; "
+            "use device-tensor collectives instead: " + "; ".join(offenders),
+        )
 
 
 class TestShadowInitGating(CustomTestCase):
