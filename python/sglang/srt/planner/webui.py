@@ -264,9 +264,17 @@ def discover_knobs() -> dict:
 # ===========================================================================
 
 
+#: rank_tp_ratio (and the other rank_*_ratio flags) accept the string sentinels
+#: "auto" / "auto-performance" as well as an explicit int tuple; pass those
+#: through verbatim instead of int-parsing them into "a,u,t,o".
+_RATIO_SENTINELS = ("auto", "auto-performance")
+
+
 def _int_list(v):
     if v is None or v == "":
         return None
+    if isinstance(v, str) and v.strip() in _RATIO_SENTINELS:
+        return v.strip()
     if isinstance(v, list):
         return [int(x) for x in v]
     return [int(x) for x in str(v).replace(" ", "").split(",") if x != ""]
@@ -1169,6 +1177,8 @@ def _launch_settings_from_payload(payload: dict):
         if v is None or v == "":
             return None
         if isinstance(v, str):
+            if v.strip() in _RATIO_SENTINELS:
+                return v.strip()
             return [int(x) for x in v.replace(",", " ").split()]
         return [int(x) for x in v]
 
@@ -3662,7 +3672,10 @@ function applyProfile(i){
   if(p.settings.tp_size) $('sv_tp').value=p.settings.tp_size;
   if(p.settings.rank_gpu_id) $('sv_rgi').value=Array.isArray(p.settings.rank_gpu_id)?p.settings.rank_gpu_id.join(','):p.settings.rank_gpu_id;
   const rtr=p.settings.rank_tp_ratio;
-  if(rtr && rtr!=='auto' && rtr!=='auto-performance') $('sv_rtr').value=Array.isArray(rtr)?rtr.join(','):rtr;
+  // "auto" / "auto-performance" are valid rank_tp_ratio values (NVML-derived
+  // budgets) and MUST land in the field -- dropping them leaves rank_gpu_id
+  // orphaned, which the fork rejects at launch.
+  if(rtr) $('sv_rtr').value=Array.isArray(rtr)?rtr.join(','):rtr;
   $('profile_msg').innerHTML='<span class="muted">applied <b>'+esc(p.name)+'</b>'
     +((p.info&&p.info.length)?' — '+esc(p.info.join(' | ')):'')+'</span>';
   resolveFlags(); refreshRunnerPlacement(); doPlan();

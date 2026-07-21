@@ -209,7 +209,12 @@ class MeasurementConfig:
         if self.rank_gpu_id is not None:
             c += ["--rank-gpu-id", ",".join(map(str, self.rank_gpu_id))]
         if self.rank_tp_ratio is not None:
-            c += ["--rank-tp-ratio", ",".join(map(str, self.rank_tp_ratio))]
+            # string sentinel ("auto"/"auto-performance") passes through as-is;
+            # an explicit tuple is comma-joined. Never str() a bare string (that
+            # would emit "a,u,t,o").
+            rtr = self.rank_tp_ratio
+            c += ["--rank-tp-ratio",
+                  rtr if isinstance(rtr, str) else ",".join(map(str, rtr))]
         if self.rank_gpu_memory_mib is not None:
             c += ["--rank-gpu-memory-mib",
                   ",".join(map(str, self.rank_gpu_memory_mib))]
