@@ -45,9 +45,10 @@ _DENSE_CFG = {
     "head_dim": 128,
 }
 
+# NVML/nvidia-smi enumeration of THE reference box: the 5090 sits at index 1.
 _HETERO_GPUS = [
-    {"name": "RTX 5090", "total_mib": 32607},
     {"name": "RTX 3080", "total_mib": 20480},
+    {"name": "RTX 5090", "total_mib": 32607},
     {"name": "RTX 3080", "total_mib": 20480},
 ]
 _HOMO_GPUS = [
@@ -72,9 +73,11 @@ _REF_CFG = {
         "mtp_num_hidden_layers": 1,
     },
 }
+# The reference box as NVML enumerates it (3080, 5090, 3080) -- the order the
+# MATRIX_PLAN 3.3 per-rank calibration vectors were measured on.
 _REF_RIG = [
-    {"name": "NVIDIA GeForce RTX 5090", "total_mib": 32607},
     {"name": "NVIDIA GeForce RTX 3080", "total_mib": 20480},
+    {"name": "NVIDIA GeForce RTX 5090", "total_mib": 32607},
     {"name": "NVIDIA GeForce RTX 3080", "total_mib": 20480},
 ]
 #: serving-identity inputs of the reference (model, endpoint, parsers,
