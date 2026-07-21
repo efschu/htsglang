@@ -222,6 +222,10 @@ class MeasurementConfig:
             c += ["--trust-remote-code"]
         if self.disable_custom_all_reduce:
             c += ["--disable-custom-all-reduce"]
+        # Always expose Prometheus /metrics: the energy harness scrapes it for
+        # live rates, and the dashboard landing page needs it for live decode/
+        # prefill tok/s, MTP acceptance and per-tier cache-hit.
+        c += ["--enable-metrics"]
         if self.disable_cuda_graph:
             c += ["--disable-cuda-graph"]
         if self.speculative_algorithm:
