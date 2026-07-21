@@ -73,6 +73,7 @@ __all__ = [
     "model_is_hybrid",
     "model_has_mtp",
     "model_quant_kind",
+    "model_max_context",
     "rig_has_sm86",
 ]
 
@@ -148,6 +149,30 @@ def model_has_mtp(model_cfg: Optional[dict]) -> bool:
         return v is not None and int(v) > 0
     except (TypeError, ValueError):
         return False
+
+
+def model_max_context(model_cfg: Optional[dict]) -> Optional[int]:
+    """The model's OWN maximum context length (native positional limit, e.g.
+    ``max_position_embeddings``), or None when the config does not declare
+    one. The capacity rules never set ``--context-length`` above this."""
+    for key in (
+        "max_position_embeddings",
+        "max_seq_len",
+        "max_sequence_length",
+        "n_ctx",
+        "seq_length",
+        "model_max_length",
+    ):
+        v = _cfg_get(model_cfg, key)
+        if v is None:
+            continue
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            continue
+        if iv > 0:
+            return iv
+    return None
 
 
 def model_quant_kind(model_cfg: Optional[dict]) -> Optional[str]:
@@ -1490,6 +1515,219 @@ def _gpu_names(gpus: Sequence) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Capacity rules: every generated preset picks --context-length and
+# --max-running-requests from the planner's EXISTING sizing path
+# (feasibility.plan -> the server's own PerfCostModel) instead of leaving
+# them to the form defaults. No new sizing math lives here.
+# ---------------------------------------------------------------------------
+
+
+def _hardware_spec(gpus: Sequence):
+    """A manual :class:`HardwareSpec` from the profile generator's GPU list
+    (dicts or GpuDescriptor-likes), for the capacity sizing below."""
+    from sglang.srt.planner.hardware import GpuDescriptor, HardwareSpec
+
+    descs = []
+    for i, g in enumerate(gpus):
+        if isinstance(g, dict):
+            idx = g.get("index", i)
+            name = str(g.get("name") or f"GPU{i}")
+            total = int(g.get("total_mib") or 0)
+        else:
+            idx = getattr(g, "index", i)
+            name = str(getattr(g, "name", "") or f"GPU{i}")
+            total = int(getattr(g, "total_mib", 0) or 0)
+        descs.append(
+            GpuDescriptor(index=int(idx), name=name, total_mib=total)
+        )
+    return HardwareSpec(gpus=tuple(descs), source="manual")
+
+
+def _capacity_plan(model_path: str, hardware, **kwargs):
+    """Monkeypatchable seam: run the planner's existing sizing path
+    (``feasibility.plan`` -> the server's own ``PerfCostModel``) for one
+    preset's flag set. NOT a new sizing model — the capacity numbers the
+    presets use are exactly the ones the plan tab / CLI show."""
+    from sglang.srt.planner.feasibility import plan
+    from sglang.srt.planner.model import resolve_model_ref
+
+    try:
+        model_path = resolve_model_ref(model_path)
+    except Exception:
+        pass  # use the path as given; plan() fails loudly if unusable.
+    return plan(model_path, hardware, with_advantage=False, **kwargs)
+
+
+def _apply_capacity_rules(
+    s: Dict[str, Any],
+    info: List[str],
+    model_cfg: Optional[dict],
+    gpus: Sequence,
+    stock_even: bool = False,
+) -> None:
+    """CAPACITY RULES for a generated preset — pick ``context_length`` and
+    ``max_running_requests`` from the preset's actual KV capacity:
+
+      1. context_length = min(model native max, what this preset's KV
+         capacity actually fits) — never above the model's own limit.
+      2. (KV dtype: always fp8 — chosen in ``_mk`` for every preset, with
+         the sm86 e5m2 rule intact.)
+      3. max_running_requests = the largest N such that EVERY session still
+         gets the full context: N x context_length <= the CONCURRENCY-AWARE
+         capacity at N. The GDN/mamba pool grows with N and SHRINKS KV, so
+         each candidate N is re-planned (naive division would overshoot on
+         hybrids). If not even one full-context session fits, context_length
+         falls back to the one-session fit and N = 1.
+      4. A preset that only fits by offloading MoE experts to host RAM
+         (offload.status == 'ram_offload') pins context_length = the model's
+         native max and N = 1, always.
+
+    The numbers come from :func:`_capacity_plan` (``feasibility.plan`` ->
+    the server's own cost model). A preset whose capacity computation fails
+    keeps the form defaults and says so in ``info`` — profile generation
+    never crashes on an unsizable model. ``stock_even`` passes an explicit
+    even --rank-tp-ratio so the stock-TP presets are sized as the even split
+    (not the fork's VRAM-proportional auto split).
+    """
+    model_path = s.get("model_path")
+    if not model_path:
+        info.append(
+            "capacity rules skipped: no model path in the base settings, "
+            "so the KV capacity cannot be sized -- context_length / "
+            "max_running_requests keep the form defaults."
+        )
+        return
+    model_max = model_max_context(model_cfg)
+    try:
+        hardware = _hardware_spec(gpus)
+        tp = int(s.get("tp_size") or 1)
+        budgets = s.get("rank_gpu_memory_mib")
+        if budgets is not None and not isinstance(budgets, (list, tuple)):
+            budgets = [int(budgets)] * tp
+        ratio = s.get("rank_tp_ratio")
+        if isinstance(ratio, (list, tuple)):
+            ratio = list(ratio)
+        elif stock_even and tp > 1:
+            ratio = [1] * tp  # size the stock preset as the even split.
+        else:
+            # sentinels ('auto', 'auto-performance') -> None: plan() then
+            # derives the VRAM-proportional auto split itself.
+            ratio = None
+        kwargs = dict(
+            tp_size=tp,
+            rank_gpu_id=(
+                list(s["rank_gpu_id"]) if s.get("rank_gpu_id") else None
+            ),
+            rank_gpu_memory_mib=budgets,
+            rank_tp_ratio=ratio,
+            kv_cache_dtype=s.get("kv_cache_dtype") or "auto",
+            speculative_algorithm=s.get("speculative_algorithm") or None,
+            speculative_num_draft_tokens=(
+                s.get("speculative_num_draft_tokens") or None
+            ),
+        )
+
+        def _cap_at(n: int):
+            r = _capacity_plan(
+                model_path, hardware, max_running_requests=n, **kwargs
+            )
+            cap = getattr(r, "capacity", None)
+            tokens = (
+                float(getattr(cap, "max_context_tokens", 0.0) or 0.0)
+                if cap is not None
+                else 0.0
+            )
+            return r, tokens
+
+        r1, cap1 = _cap_at(1)
+    except Exception as e:
+        info.append(
+            "capacity rules skipped (the cost model cannot size this "
+            f"preset): {e} -- context_length / max_running_requests keep "
+            "the form defaults."
+        )
+        return
+
+    offload = getattr(r1, "offload", None)
+    if getattr(offload, "status", None) == "ram_offload":
+        # Rule 4: expert-offload preset -> full native context, N = 1.
+        s["max_running_requests"] = 1
+        if model_max:
+            s["context_length"] = int(model_max)
+        off_gib = float(getattr(offload, "offloaded_gib", 0.0) or 0.0)
+        info.append(
+            "capacity rule (expert-offload): the model only fits by "
+            f"offloading ~{off_gib:.1f} GiB of MoE experts to host RAM -> "
+            "context_length "
+            + (
+                str(int(model_max))
+                if model_max
+                else "left unset (the server derives the model's native max)"
+            )
+            + " (= the model's own maximum), max_running_requests 1."
+        )
+        return
+
+    if not getattr(r1, "fits", False) or cap1 <= 0:
+        reasons = list(getattr(r1, "infeasible_reasons", []) or [])
+        info.append(
+            "capacity rules skipped: this preset does not fit (no KV "
+            "capacity to distribute)"
+            + ((": " + reasons[0]) if reasons else "")
+            + " -- context_length / max_running_requests keep the form "
+            "defaults."
+        )
+        return
+
+    cap1_i = int(cap1)
+    if model_max is not None and model_max <= cap1_i:
+        # Rule 1, model-max branch: the capacity holds at least one session
+        # at the model's own maximum context. Rule 3: binary-search the
+        # largest N whose N x ctx still fits the capacity AT that N —
+        # cap(n) - n*ctx is monotone-decreasing in n (the mamba/GDN pool
+        # grows with n, so cap(n) never grows), so the search is sound.
+        ctx = int(model_max)
+        cap_n = cap1_i
+        lo, hi = 1, max(cap1_i // ctx, 1)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            try:
+                rm, capm = _cap_at(mid)
+                ok = bool(getattr(rm, "fits", False)) and capm >= mid * ctx
+            except Exception:
+                ok = False
+            if ok:
+                lo = mid
+                cap_n = int(capm)
+            else:
+                hi = mid - 1
+        n = lo
+        s["context_length"] = ctx
+        s["max_running_requests"] = n
+        info.append(
+            f"capacity rule (model-max): KV capacity ~{cap1_i} tokens at "
+            f"N=1 covers the model's native max ({ctx}) -> context_length "
+            f"{ctx}; max_running_requests {n} = the largest N with "
+            f"N x {ctx} <= the concurrency-aware capacity (~{cap_n} tokens "
+            f"at N={n}; the mamba/GDN pool grows with N)."
+        )
+    else:
+        # Rule 1 capacity-cap branch == rule 3's N=1 fallback: the capacity
+        # is below the model's own max, so ONE full-capacity session is the
+        # optimum (N=2 would need twice the one-session capacity, which a
+        # non-growing cap(n) can never supply).
+        s["context_length"] = cap1_i
+        s["max_running_requests"] = 1
+        info.append(
+            f"capacity rule (capacity-cap): KV capacity ~{cap1_i} tokens "
+            "at N=1 is below the model's native max ("
+            + (str(model_max) if model_max is not None else "not declared")
+            + f") -> context_length {cap1_i} (the one-session fit), "
+            "max_running_requests 1."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Rig calibrations: measured, battery-stable per-quant values for known rigs
 # (matrix/htsglang_local_run.sh, MATRIX_PLAN 3.3). Order-sensitive: the vectors
 # are per-RANK with rank i on physical GPU i (--rank-gpu-id 0,1,2), so they only
@@ -1591,7 +1829,16 @@ def profiles(
     supported on that path), the measured per-quant calibration when this
     rig/quant is calibrated (fallbacks are called out in ``info``, never
     silently invented), the sm86-safe fp8 KV dtype, and the validated NEXTN
-    speculative shape when the checkpoint has MTP layers."""
+    speculative shape when the checkpoint has MTP layers.
+
+    Every preset additionally runs the CAPACITY RULES
+    (:func:`_apply_capacity_rules`): context_length = min(model native max,
+    what the preset's KV capacity actually fits), fp8 KV always,
+    max_running_requests = the largest N whose N x context still fits the
+    concurrency-aware capacity (expert-offload presets pin the native max +
+    N=1). The numbers come from ``feasibility.plan`` and need
+    ``base['model_path']``; without it (or when the cost model cannot size
+    the preset) the form defaults are kept and ``info`` says so."""
     totals = _gpu_totals(gpus)
     ngpu = len(totals)
     kvh = model_kv_heads(model_cfg)
@@ -1655,13 +1902,10 @@ def profiles(
                 "4, adaptive (the validated shape; topk stays 1 -- tree "
                 "spec is rejected under uneven DCP)."
             )
-        return s
-
-    def _apply_fork_rules(s: Dict[str, Any], info: List[str]) -> None:
-        """Rules for the fork (co-location / uneven) profiles: sm86-safe fp8
-        KV dtype, hybrid SSM dtype (spec/MTP is preset-wide, set in _mk)."""
-        # KV dtype: fp8 KV maximizes capacity; sm86 (RTX 3080-class) cannot
-        # do fp8_e4m3 -> e5m2 whenever ANY sm86 card is in the rig.
+        # KV dtype (capacity rule 2): fp8 KV ALWAYS, for EVERY preset (stock
+        # single-gpu / normal-TP included) -- fp8 KV maximizes KV capacity.
+        # sm86 (RTX 3080-class) cannot do fp8_e4m3 -> e5m2 whenever ANY sm86
+        # card is in the rig; e4m3 only on an sm86-free rig.
         cur = s.get("kv_cache_dtype")
         if cur in (None, "auto"):
             s["kv_cache_dtype"] = "fp8_e5m2" if sm86 else "fp8_e4m3"
@@ -1681,6 +1925,11 @@ def profiles(
                 "overrode kv-cache-dtype fp8_e4m3 -> fp8_e5m2: an sm86 "
                 "(RTX 3080-class) card is in the rig and cannot run e4m3 KV."
             )
+        return s
+
+    def _apply_fork_rules(s: Dict[str, Any], info: List[str]) -> None:
+        """Rules for the fork (co-location / uneven) profiles: hybrid SSM
+        dtype (KV dtype and spec/MTP are preset-wide, set in _mk)."""
         # Hybrid models: bfloat16 SSM state (validated; halves mamba state).
         if hybrid:
             s["SGLANG_MAMBA_SSM_DTYPE"] = "bfloat16"
@@ -1729,6 +1978,7 @@ def profiles(
     # --- single-gpu -------------------------------------------------------
     info = list(base_notes) + ["Single GPU, no tensor parallelism."]
     s = _mk({"tp_size": 1}, info)
+    _apply_capacity_rules(s, info, model_cfg, gpus, stock_even=True)
     out.append(Profile("single-gpu", "single", s, info=info))
 
     if ngpu <= 1:
@@ -1753,6 +2003,7 @@ def profiles(
             "the stock sglang way (no fork flags).",
         ]
         s = _mk({"tp_size": ngpu}, info)
+        _apply_capacity_rules(s, info, model_cfg, gpus, stock_even=True)
         out.append(Profile("normal-TP", "normal-tp", s, info=info))
     else:
         reason = []
@@ -1771,6 +2022,7 @@ def profiles(
             "properly (KV replicate + token-shard).",
         ]
         s = _mk({"tp_size": ngpu}, info)
+        _apply_capacity_rules(s, info, model_cfg, gpus, stock_even=True)
         out.append(
             Profile("normal-TP (stock, limited)", "normal-tp", s, info=info)
         )
@@ -1811,6 +2063,7 @@ def profiles(
         info,
     )
     _apply_fork_rules(s, info)
+    _apply_capacity_rules(s, info, model_cfg, gpus)
     out.append(
         Profile(
             "co-location (TP>cards, MPS)",
@@ -1837,6 +2090,7 @@ def profiles(
     )
     _apply_fork_rules(s, info)
     _apply_uneven_env(s, info, max_tokens=True)
+    _apply_capacity_rules(s, info, model_cfg, gpus)
     out.append(
         Profile(
             "uneven-max-tokens",
@@ -1869,6 +2123,7 @@ def profiles(
     )
     _apply_fork_rules(s, info)
     _apply_uneven_env(s, info, max_tokens=False)
+    _apply_capacity_rules(s, info, model_cfg, gpus)
     out.append(
         Profile(
             "uneven-max-perf",

@@ -12,6 +12,8 @@ import argparse
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 from sglang.srt.planner import flags
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -71,6 +73,7 @@ _REF_CFG = {
         "layer_types": ["linear_attention", "linear_attention", "full_attention"],
         "linear_num_value_heads": 16,
         "mtp_num_hidden_layers": 1,
+        "max_position_embeddings": 262144,
     },
 }
 # The reference box as NVML enumerates it (3080, 5090, 3080) -- the order the
@@ -127,6 +130,35 @@ _REF_ARGV = [
     "--hicache-storage-backend", "file",
     "--hicache-mem-layout", "page_first_direct",
 ]
+
+
+def _fake_capacity_plan(cap_by_n, status="vram", offloaded_gib=0.0, fits=None):
+    """A deterministic stand-in for flags._capacity_plan (feasibility.plan):
+    KV capacity as a function of the concurrency N (the mamba/GDN pool grows
+    with N, so cap(N) shrinks on hybrids), plus the offload status the
+    capacity rules dispatch on. Pure math, no checkpoint, no GPU."""
+
+    def _fn(model_path, hardware, max_running_requests=1, **kwargs):
+        n = int(max_running_requests or 1)
+        cap = float(cap_by_n(n))
+        f = (cap > 0) if fits is None else fits
+        return SimpleNamespace(
+            fits=f,
+            infeasible_reasons=[] if f else ["fake: does not fit"],
+            capacity=SimpleNamespace(max_context_tokens=cap),
+            offload=SimpleNamespace(
+                status=status, offloaded_gib=offloaded_gib
+            ),
+        )
+
+    return _fn
+
+
+#: The reference-rig capacity fake: ~531k KV tokens at N=1 (the measured
+#: battery-stable e5m2 order of magnitude), gently shrinking with N (hybrid
+#: mamba pool). Yields ctx=262144 (model max) and N=2 -- exactly the
+#: validated reference command's values, now generator-DERIVED.
+_REF_CAP_FAKE = _fake_capacity_plan(lambda n: 531000 - 5000 * (n - 1))
 
 
 def _fake_venv(tmpdir: str):
@@ -579,12 +611,17 @@ class TestReferenceProfile(CustomTestCase):
 
     def _gen(self, tmpdir):
         exe, libdirs = _fake_venv(tmpdir)
-        profs = {
-            p.kind: p
-            for p in flags.profiles(
-                _REF_CFG, _REF_RIG, base=_REF_BASE, python_exe=exe
-            )
-        }
+        # The capacity seam is mocked deterministically: the real cost model
+        # would read the checkpoint from disk (machine-dependent), and the
+        # fake reproduces the reference's measured ~531k-token capacity so
+        # the rules DERIVE the pinned ctx=262144 / N=2 of the reference.
+        with mock.patch.object(flags, "_capacity_plan", _REF_CAP_FAKE):
+            profs = {
+                p.kind: p
+                for p in flags.profiles(
+                    _REF_CFG, _REF_RIG, base=_REF_BASE, python_exe=exe
+                )
+            }
         return profs, libdirs
 
     def test_reference_argv_exact(self):
@@ -599,6 +636,14 @@ class TestReferenceProfile(CustomTestCase):
                 self.assertNotIn(bad, joined)
             ok, errs = flags.validate_profile(prof, _REF_CFG)
             self.assertTrue(ok, errs)
+            # ctx/N are now capacity-rule DERIVED (model-max branch), no
+            # longer merely inherited from the base form values.
+            self.assertTrue(
+                any("capacity rule (model-max)" in i for i in prof.info),
+                prof.info,
+            )
+            self.assertEqual(prof.settings["context_length"], 262144)
+            self.assertEqual(prof.settings["max_running_requests"], 2)
 
     def test_reference_env_exact(self):
         import sglang
@@ -688,6 +733,167 @@ class TestReferenceProfile(CustomTestCase):
                 profs["uneven-max-perf"].settings["kv_cache_dtype"],
                 "fp8_e4m3",
             )
+
+
+class TestCapacityRules(CustomTestCase):
+    """The four preset capacity rules (context_length / KV dtype /
+    max_running_requests), with the feasibility.plan seam mocked so the
+    numbers are deterministic (no checkpoint read, no GPU)."""
+
+    _BASE = {"model_path": "/fake/model"}
+
+    def _profs(self, cfg, gpus, fake, base=None):
+        with mock.patch.object(flags, "_capacity_plan", fake):
+            return {
+                p.kind: p
+                for p in flags.profiles(
+                    cfg, gpus, base=dict(base or self._BASE)
+                )
+            }
+
+    def test_rule1_capacity_caps_ctx_on_small_rig(self):
+        # KV capacity (100k) below the model max (262144) -> ctx = the
+        # one-session fit, N = 1 (rule 3's fallback branch).
+        cfg = dict(_DENSE_CFG, max_position_embeddings=262144)
+        fake = _fake_capacity_plan(lambda n: 100000)
+        profs = self._profs(cfg, _HETERO_GPUS, fake)
+        for kind in ("single", "uneven-max-tokens", "colocation"):
+            p = profs[kind]
+            self.assertEqual(p.settings["context_length"], 100000, kind)
+            self.assertEqual(p.settings["max_running_requests"], 1, kind)
+            self.assertTrue(
+                any("capacity rule (capacity-cap)" in i for i in p.info),
+                (kind, p.info),
+            )
+
+    def test_rule1_model_max_caps_ctx_on_huge_rig(self):
+        # Capacity (10M tokens) far above the model max (32768): ctx is
+        # capped at the MODEL max, never above; N = floor(10M/32768) = 305
+        # (capacity is N-flat here -- no mamba pool).
+        cfg = dict(_DENSE_CFG, max_position_embeddings=32768)
+        fake = _fake_capacity_plan(lambda n: 10_000_000)
+        profs = self._profs(cfg, _HETERO_GPUS, fake)
+        p = profs["uneven-max-tokens"]
+        self.assertEqual(p.settings["context_length"], 32768)
+        self.assertEqual(p.settings["max_running_requests"], 305)
+        self.assertTrue(
+            any("capacity rule (model-max)" in i for i in p.info), p.info
+        )
+
+    def test_rule2_fp8_kv_always_all_presets(self):
+        # sm86 (3080) present -> e5m2 on EVERY preset, the stock single-gpu
+        # and normal-TP presets included; an sm86-free rig -> e4m3.
+        profs = self._profs(
+            dict(_DENSE_CFG, max_position_embeddings=32768),
+            _HETERO_GPUS,
+            _fake_capacity_plan(lambda n: 100000),
+        )
+        for kind, p in profs.items():
+            self.assertEqual(
+                p.settings["kv_cache_dtype"], "fp8_e5m2", kind
+            )
+        modern = [
+            {"name": "NVIDIA GeForce RTX 4090", "total_mib": 24000},
+            {"name": "NVIDIA GeForce RTX 4090", "total_mib": 24000},
+        ]
+        profs = self._profs(
+            _MOE_CFG, modern, _fake_capacity_plan(lambda n: 100000)
+        )
+        self.assertEqual(set(profs), {"single", "normal-tp"})
+        for kind, p in profs.items():
+            self.assertEqual(
+                p.settings["kv_cache_dtype"], "fp8_e4m3", kind
+            )
+
+    def test_rule3_concurrency_aware_n(self):
+        # cap(n) = 140000 - 20000*(n-1): naive floor(140000/32768) = 4, but
+        # 4 x 32768 = 131072 > cap(4) = 80000 -- the mamba pool has eaten
+        # the KV. The concurrency-aware pick is N = 3
+        # (3 x 32768 = 98304 <= cap(3) = 100000).
+        cfg = dict(_DENSE_CFG, max_position_embeddings=32768)
+        fake = _fake_capacity_plan(lambda n: 140000 - 20000 * (n - 1))
+        profs = self._profs(cfg, _HETERO_GPUS, fake)
+        p = profs["uneven-max-tokens"]
+        self.assertEqual(p.settings["context_length"], 32768)
+        self.assertEqual(p.settings["max_running_requests"], 3)
+        note = next(i for i in p.info if "capacity rule (model-max)" in i)
+        # the note must carry the numbers: capacity, chosen ctx, chosen N.
+        self.assertIn("~140000", note)
+        self.assertIn("32768", note)
+        self.assertIn("max_running_requests 3", note)
+
+    def test_rule4_expert_offload_pins_native_max(self):
+        # A MoE model that only fits with experts on host RAM: ctx = the
+        # model's OWN maximum and N = 1, regardless of the KV numbers.
+        cfg = dict(_MOE_CFG, max_position_embeddings=131072)
+        fake = _fake_capacity_plan(
+            lambda n: 50000,
+            status="ram_offload",
+            offloaded_gib=22.5,
+            fits=False,
+        )
+        gpus = [{"name": "A", "total_mib": 24000}] * 3  # 8 % 3: fork kinds
+        profs = self._profs(cfg, gpus, fake)
+        p = profs["uneven-max-tokens"]
+        self.assertEqual(p.settings["context_length"], 131072)
+        self.assertEqual(p.settings["max_running_requests"], 1)
+        note = next(
+            i for i in p.info if "capacity rule (expert-offload)" in i
+        )
+        self.assertIn("22.5", note)
+        self.assertIn("131072", note)
+
+    def test_capacity_failure_keeps_form_defaults(self):
+        # The cost model blowing up must never crash generation: the preset
+        # keeps the base/form ctx + N and says the rules were skipped.
+        def _boom(*a, **k):
+            raise RuntimeError("boom: unsizable")
+
+        base = dict(
+            self._BASE, context_length=8192, max_running_requests=7
+        )
+        profs = self._profs(_DENSE_CFG, _HETERO_GPUS, _boom, base=base)
+        p = profs["uneven-max-tokens"]
+        self.assertEqual(p.settings["context_length"], 8192)
+        self.assertEqual(p.settings["max_running_requests"], 7)
+        self.assertTrue(
+            any(
+                "capacity rules skipped (the cost model cannot size" in i
+                for i in p.info
+            ),
+            p.info,
+        )
+
+    def test_no_model_path_skips_with_note(self):
+        # No base model path -> nothing to size against; explicit note, and
+        # the seam is never invoked (a mock would record any call).
+        with mock.patch.object(
+            flags,
+            "_capacity_plan",
+            mock.MagicMock(side_effect=AssertionError("must not be called")),
+        ) as m:
+            profs = {
+                p.kind: p for p in flags.profiles(_DENSE_CFG, _HETERO_GPUS)
+            }
+            self.assertEqual(m.call_count, 0)
+        p = profs["uneven-max-tokens"]
+        self.assertTrue(
+            any("capacity rules skipped: no model path" in i for i in p.info),
+            p.info,
+        )
+
+    def test_infeasible_plan_skips_with_note(self):
+        # fits=False without an offload story: rules skipped, note names it.
+        fake = _fake_capacity_plan(lambda n: 0, fits=False)
+        profs = self._profs(_DENSE_CFG, _HETERO_GPUS, fake)
+        p = profs["single"]
+        self.assertTrue(
+            any(
+                "capacity rules skipped: this preset does not fit" in i
+                for i in p.info
+            ),
+            p.info,
+        )
 
 
 @unittest.skipUnless(
