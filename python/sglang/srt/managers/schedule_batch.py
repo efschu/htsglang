@@ -1675,7 +1675,16 @@ def set_mamba_track_indices_from_reqs(batch):
     ]  # (bs, ping_pong_size), int64, on device
     idx = (
         torch.tensor(
-            [req.mamba_next_track_idx for req in batch.reqs],
+            # A req retracted mid-flight under overlap scheduling has its mamba
+            # ping-pong track nulled (see release-for-retract: mamba_pool_idx /
+            # mamba_ping_pong_track_buffer / mamba_next_track_idx -> None) while
+            # still present in this in-flight verify batch. Its verify result is
+            # discarded, so column 0 is a harmless placeholder; legitimate reqs
+            # always carry a real index, so this default never masks a real bug.
+            [
+                (req.mamba_next_track_idx if req.mamba_next_track_idx is not None else 0)
+                for req in batch.reqs
+            ],
             dtype=torch.int64,
             pin_memory=True,
         )
