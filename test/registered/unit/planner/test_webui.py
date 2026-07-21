@@ -1950,3 +1950,14 @@ class TestLiveGraphCapture(CustomTestCase):
         gc = webui._live_graph_capture(None, "http://10.0.0.9:12345", {})
         self.assertIsNone(gc["source"])
         self.assertIn("n/a", gc["reason"])
+
+
+class TestQualityPermissionNote(CustomTestCase):
+    def test_reminder_banner_at_top_of_quality_tab(self):
+        # User self-reminder: ask in the source reddit thread before making
+        # the chess test public. Must sit inside the quality tab.
+        self.assertIn("quality_permission_note", webui.INDEX_HTML)
+        self.assertIn("ERINNERUNG", webui.INDEX_HTML)
+        qi = webui.INDEX_HTML.index('id="view_quality"')
+        ni = webui.INDEX_HTML.index("quality_permission_note")
+        self.assertGreater(ni, qi)
