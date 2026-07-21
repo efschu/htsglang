@@ -1491,9 +1491,15 @@ def _gpu_names(gpus: Sequence) -> List[str]:
 
 # ---------------------------------------------------------------------------
 # Rig calibrations: measured, battery-stable per-quant values for known rigs
-# (matrix/htsglang_local_run.sh, MATRIX_PLAN 3.3). Order-sensitive: the
-# vectors are per-RANK with rank i on physical GPU i (--rank-gpu-id 0,1,2),
-# so they only apply when the rig enumerates as [5090, 3080, 3080] exactly.
+# (matrix/htsglang_local_run.sh, MATRIX_PLAN 3.3). Order-sensitive: the vectors
+# are per-RANK with rank i on physical GPU i (--rank-gpu-id 0,1,2), so they only
+# apply to the enumeration they were MEASURED on. That box enumerates (NVML /
+# nvidia-smi order) as [3080, 5090, 3080] -- the 5090 sits at index 1, NOT 0.
+# Hence tokvec 33,13,18 gives the middle rank (the 5090) the SMALLEST KV share:
+# it carries the largest weight/compute shard, so it has the least room for KV.
+# Any other enumeration gets no calibration (the caller falls back to a derived
+# estimate and says so) -- never remap measured per-rank vectors onto a rig we
+# did not measure.
 # ---------------------------------------------------------------------------
 
 def _match_calibration(gpus: Sequence, quant: Optional[str]) -> Optional[dict]:
@@ -1502,8 +1508,8 @@ def _match_calibration(gpus: Sequence, quant: Optional[str]) -> Optional[dict]:
     names = [n.lower() for n in _gpu_names(gpus)]
     if (
         len(names) == 3
-        and "5090" in names[0]
-        and "3080" in names[1]
+        and "3080" in names[0]
+        and "5090" in names[1]
         and "3080" in names[2]
     ):
         if quant == "fp8":
