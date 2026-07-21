@@ -1607,6 +1607,319 @@ def _reference_png_bytes() -> Optional[bytes]:
         return None
 
 
+# ===========================================================================
+# Dashboard v2 (PHASE 2) — Landing live-monitor + Runner (models+planner).
+#
+# THIN adapters over the three committed backend modules:
+#   * placement.py     -> granular per-card placement (running + prospective).
+#   * flags.py         -> full flag catalog, resolve (greying/auto-set),
+#                         profiles + user ProfileStore.
+#   * live_metrics.py  -> running-server + NVML live snapshot for the landing.
+# Every heavy computation lives in those modules; these functions only resolve
+# the model reference, forward the call, and JSON-shape the result.
+# ===========================================================================
+
+#: The delta ``state`` live_metrics.snapshot returns between polls. Kept ONLY
+#: module-side for delta math (rates / cache-hit); nothing is persisted to disk
+#: and the client owns the 60s ring buffers.
+_LANDING_SNAPSHOT_STATE = None
+
+#: flashinfer-family attention backends the fork's weightless-KV lane accepts.
+_FLASHINFER_BACKENDS = ("flashinfer", "fa3", "fa4")
+
+
+def _model_cfg_from_ref(model_ref: str, gguf_choice: Optional[str] = None):
+    """Resolve a model reference to (model_cfg_dict, model_path) the SAME way
+    the plan path does: ``resolve_model_ref`` -> the cost-model config dict
+    (``PerfCostModel._load_config``: config.json for HF, GGUF header for GGUF).
+    Pure config read -- no checkpoint bytes, no GPU."""
+    from sglang.srt.planner.model import resolve_model_ref
+    from sglang.srt.uneven_perf import PerfCostModel
+
+    model_path = resolve_model_ref(model_ref, gguf_choice=gguf_choice or None)
+    cfg = PerfCostModel._load_config(model_path)
+    return cfg, model_path
+
+
+def _resolve_model_cfg_from_payload(payload: dict):
+    """Return (model_cfg or None, error or None). Accepts an explicit
+    ``model_cfg`` dict, else a ``model`` reference resolved to its config."""
+    model_cfg = payload.get("model_cfg")
+    if isinstance(model_cfg, dict) and model_cfg:
+        return model_cfg, None
+    ref = payload.get("model")
+    if not ref:
+        return None, None
+    try:
+        cfg, _ = _model_cfg_from_ref(ref, payload.get("gguf_choice"))
+    except (ValueError, KeyError, OSError) as e:
+        return None, f"model: {e}"
+    return cfg, None
+
+
+def placement_payload(payload: dict) -> dict:
+    """POST /api/placement {model|model_cfg, flags} -> compute_placement.
+
+    ONE granular renderer feeds BOTH the landing page (the RUNNING config's
+    placement) and the runner tab (the PROSPECTIVE placement) -- the caller
+    supplies the flag dict from either source; the geometry is identical."""
+    from sglang.srt.planner import placement as placementmod
+
+    model_cfg, err = _resolve_model_cfg_from_payload(payload)
+    if err:
+        return {"ok": False, "error": err}
+    if not model_cfg:
+        return {"ok": False, "error": "no model or model_cfg given"}
+    flags_dict = payload.get("flags") or {}
+    try:
+        result = placementmod.compute_placement(model_cfg, flags_dict)
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "placement": result}
+
+
+def _is_uniform_ratio(rtr) -> bool:
+    """True when a rank_tp_ratio value is (or reduces to) an EVEN split. The
+    ``auto`` / ``auto-performance`` / ``capacity`` sentinels may be non-uniform
+    on heterogeneous cards, so they are NOT treated as uniform (no warning)."""
+    if rtr in (None, ""):
+        return True
+    if isinstance(rtr, str):
+        s = rtr.strip()
+        if s in ("auto", "auto-performance", "capacity", "coupled"):
+            return False
+        parts = [p for p in s.replace(" ", "").split(",") if p]
+        try:
+            vals = [int(p) for p in parts]
+        except ValueError:
+            return False
+    elif isinstance(rtr, (list, tuple)):
+        try:
+            vals = [int(x) for x in rtr]
+        except (TypeError, ValueError):
+            return False
+    else:
+        return False
+    return len(set(vals)) <= 1
+
+
+def _cross_field_warnings(settings: dict) -> List[dict]:
+    """The richer cross-field constraints ``flags.resolve`` cannot model on its
+    own (flags.py caveats 1,2,5), surfaced as UI hover warnings. Each item is
+    ``{id, level, message}`` (level: 'error' blocks, 'warn' advises)."""
+    settings = dict(settings or {})
+    out: List[dict] = []
+
+    # (1) weightless-KV fast lane needs a flashinfer backend AND tp == dcp.
+    if settings.get("weightless_kv_fastlane"):
+        ab = str(settings.get("attention_backend") or "").strip()
+        if ab not in _FLASHINFER_BACKENDS:
+            out.append({
+                "id": "weightless_kv_fastlane",
+                "level": "error",
+                "message": "weightless-KV fast lane requires a flashinfer "
+                "attention backend (attention_backend = flashinfer / fa3 / "
+                "fa4); current: " + (ab or "unset") + ".",
+            })
+        tp = int(settings.get("tp_size") or 1)
+        dcp = settings.get("dcp_size")
+        dcp = int(dcp) if dcp else tp
+        if dcp != tp:
+            out.append({
+                "id": "weightless_kv_fastlane",
+                "level": "error",
+                "message": "weightless-KV fast lane requires tp_size == "
+                "dcp_size (got tp_size=" + str(tp) + ", dcp_size="
+                + str(dcp) + ").",
+            })
+
+    # (2/5) rank_kv_ratio only decouples KV ownership under a NON-uniform
+    # rank_tp_ratio; with an even split it is a no-op.
+    rkv = settings.get("rank_kv_ratio")
+    if rkv not in (None, "", "coupled") and _is_uniform_ratio(
+        settings.get("rank_tp_ratio")
+    ):
+        out.append({
+            "id": "rank_kv_ratio",
+            "level": "warn",
+            "message": "rank_kv_ratio only decouples KV-token ownership when "
+            "rank_tp_ratio is NON-uniform; with a uniform / auto-even weight "
+            "split it is a no-op.",
+        })
+    return out
+
+
+def resolve_flags_payload(payload: dict) -> dict:
+    """POST /api/resolve_flags {settings, model} -> per-field state JSON.
+
+    Wraps ``flags.resolve`` (model-compat greying, mutual-exclusion disable,
+    dependency auto-set, tuple-length errors) and adds the cross-field hover
+    warnings the resolver cannot model."""
+    from sglang.srt.planner import flags as flagsmod
+
+    settings = payload.get("settings")
+    if settings is None:
+        settings = payload.get("flags")  # tolerate either key
+    settings = settings or {}
+    model_cfg, _ = _resolve_model_cfg_from_payload(payload)
+    try:
+        fields = flagsmod.resolve(settings, model_cfg)
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e)}
+    return {
+        "ok": True,
+        "fields": fields,
+        "warnings": _cross_field_warnings(settings),
+    }
+
+
+def flag_catalog_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/flag_catalog -> the full flag catalog metadata, grouped, for
+    rendering the runner-tab flag surface (help / hover / dropdown options)."""
+    from sglang.srt.planner import flags as flagsmod
+
+    cat = flagsmod.catalog()
+    groups: Dict[str, List[dict]] = {}
+    for cid, spec in cat.items():
+        groups.setdefault(spec.group, []).append({
+            "id": spec.id,
+            "name": spec.name,
+            "type": spec.type,
+            "default": spec.default,
+            "allowed": list(spec.allowed) if spec.allowed else None,
+            "group": spec.group,
+            "help": spec.help,
+            "hover": spec.hover,
+            "source": spec.source,
+            "is_env": spec.is_env,
+            "tuple_len_flag": spec.tuple_len_flag,
+            "mutually_exclusive_with": list(spec.mutually_exclusive_with),
+            "requires": list(spec.requires),
+        })
+    for g in groups:
+        groups[g].sort(key=lambda f: (f["source"] != "upstream", f["id"]))
+    ordered = {g: groups[g] for g in sorted(groups)}
+    return {
+        "ok": True,
+        "groups": ordered,
+        "upstream_count": flagsmod.upstream_count(),
+        "fork_count": flagsmod.fork_count(),
+    }
+
+
+def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/live_snapshot -> one live_metrics.snapshot of the MANAGED
+    server + local NVML. When no managed server runs, returns a clean
+    ``running: False`` state (no error) so the landing page can show the
+    'start one in the Runner tab' placeholder. The delta ``state`` is kept
+    module-side only (never persisted)."""
+    from sglang.srt.planner import live_metrics
+
+    global _LANDING_SNAPSHOT_STATE
+    sup = _supervisor()
+    try:
+        running = sup.is_running()
+    except Exception:
+        running = False
+    settings = getattr(sup, "settings", None)
+    if not running or settings is None:
+        _LANDING_SNAPSHOT_STATE = None  # reset delta math for the next boot
+        try:
+            status = sup.status()
+        except Exception:
+            status = None
+        return {"ok": True, "running": False, "snapshot": None, "status": status}
+    try:
+        snap, new_state = live_metrics.snapshot(
+            sup, prev_state=_LANDING_SNAPSHOT_STATE
+        )
+        _LANDING_SNAPSHOT_STATE = new_state
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "running": True, "error": str(e)}
+    return {"ok": True, "running": True, "snapshot": snap}
+
+
+def _profile_store():
+    """The user ProfileStore, honoring an env override so tests can point it at
+    a temp file (the default is ~/.cache/sglang/planner_profiles.json)."""
+    from sglang.srt.planner import flags as flagsmod
+
+    path = os.environ.get("SGLANG_PLANNER_PROFILES") or flagsmod.DEFAULT_STORE_PATH
+    return flagsmod.ProfileStore(path)
+
+
+def config_profiles_get(payload: Optional[dict] = None) -> dict:
+    """GET /api/config_profiles -> generated (flags.profiles) + user-saved
+    (ProfileStore) config profiles for the runner-tab picker.
+
+    NOTE: distinct from ``/api/profiles`` (the hardware-rig library the
+    explore/landscape tabs use) -- these are full flag-set config profiles."""
+    from sglang.srt.planner import flags as flagsmod
+
+    payload = payload or {}
+    model_cfg, _ = _resolve_model_cfg_from_payload(payload)
+    gpus = payload.get("gpus")
+    if not gpus:
+        det = detect_hardware()
+        gpus = det.get("gpus") or []
+    generated: List[dict] = []
+    try:
+        generated = [p.to_json() for p in flagsmod.profiles(model_cfg, gpus)]
+    except Exception as e:  # pragma: no cover - defensive
+        generated = []
+        gen_error = str(e)
+    else:
+        gen_error = None
+    try:
+        saved = [p.to_json() for p in _profile_store().load_all()]
+    except Exception:
+        saved = []
+    return {
+        "ok": True,
+        "generated": generated,
+        "saved": saved,
+        "gen_error": gen_error,
+        "upstream_count": flagsmod.upstream_count(),
+        "fork_count": flagsmod.fork_count(),
+    }
+
+
+def config_profiles_save(payload: dict) -> dict:
+    """POST /api/config_profiles -> save the current settings as a named user
+    profile (ProfileStore)."""
+    from sglang.srt.planner import flags as flagsmod
+
+    name = (payload.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "a profile name is required"}
+    settings = payload.get("settings")
+    if not isinstance(settings, dict) or not settings:
+        return {"ok": False, "error": "a non-empty settings dict is required"}
+    prof = flagsmod.Profile(
+        name=name,
+        kind=payload.get("kind", "custom"),
+        settings=settings,
+        info=list(payload.get("info") or []),
+    )
+    try:
+        _profile_store().save(prof, overwrite=bool(payload.get("overwrite", True)))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "name": name}
+
+
+def config_profiles_delete(payload: dict) -> dict:
+    """DELETE /api/config_profiles -> remove a user-saved profile by name."""
+    name = (payload.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "a profile name is required"}
+    try:
+        deleted = _profile_store().delete(name)
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e)}
+    return {"ok": deleted, "name": name, "deleted": deleted}
+
+
 class _Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype):
         data = body.encode() if isinstance(body, str) else body
@@ -1664,6 +1977,27 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/models"):
             try:
                 self._json(200, list_models_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/live_snapshot"):
+            try:
+                self._json(200, landing_snapshot_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/flag_catalog"):
+            try:
+                self._json(200, flag_catalog_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/config_profiles"):
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, config_profiles_get(q))
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
@@ -1753,6 +2087,33 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/quality_save"):
                 self._json(200, quality_save_payload(payload))
+                return
+            if self.path.startswith("/api/placement"):
+                self._json(200, placement_payload(payload))
+                return
+            if self.path.startswith("/api/resolve_flags"):
+                self._json(200, resolve_flags_payload(payload))
+                return
+            if self.path.startswith("/api/config_profiles"):
+                self._json(200, config_profiles_save(payload))
+                return
+        except Exception as e:  # pragma: no cover - defensive
+            self._json(500, {"error": str(e)})
+            return
+        self._json(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        try:
+            payload = self._read_json()
+        except Exception:
+            payload = {}
+        try:
+            if self.path.startswith("/api/config_profiles"):
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                q.update(payload or {})
+                self._json(200, config_profiles_delete(q))
                 return
         except Exception as e:  # pragma: no cover - defensive
             self._json(500, {"error": str(e)})
@@ -1903,12 +2264,54 @@ INDEX_HTML = r"""<!doctype html>
   Every edit re-runs the same planner the server runs. No GPU touched.</div>
 
 <div class="tabs">
-  <button id="tab_plan" class="tab active" onclick="showTab('plan')">Plan a model</button>
+  <button id="tab_landing" class="tab active" onclick="showTab('landing')">Landing (live monitor)</button>
+  <button id="tab_runner" class="tab" onclick="showTab('runner')">Runner (models + planner)</button>
   <button id="tab_explore" class="tab" onclick="showTab('explore')">Explore rigs (matrix)</button>
   <button id="tab_landscape" class="tab" onclick="showTab('landscape')">Landscape (benchmark DB)</button>
-  <button id="tab_energy" class="tab" onclick="showTab('energy')">Energy &amp; live</button>
-  <button id="tab_models" class="tab" onclick="showTab('models')">Models</button>
+  <button id="tab_energy" class="tab" onclick="showTab('energy')">Energy (calibration)</button>
   <button id="tab_quality" class="tab" onclick="showTab('quality')">Quality</button>
+</div>
+
+<div id="view_landing">
+  <div class="sub">Live monitor of the single MANAGED server (polls
+    <code>/api/live_snapshot</code>). Per-card GPU charts + real throughput
+    keep a client-side 60s ring buffer &mdash; <b>nothing is persisted</b>.
+    Placement is the RUNNING config's computed layout. No server running?
+    Launch one in the Runner tab.</div>
+  <div id="landing_none" class="muted" style="display:none;padding:1rem;border:1px solid #30363d;border-radius:8px">
+    No managed server is running &mdash; <b>start one in the Runner tab</b>.
+    <span id="landing_none_status" class="muted"></span></div>
+  <div id="landing_live" style="display:none">
+    <fieldset>
+      <legend>running model + start config</legend>
+      <div id="landing_config" class="muted">waiting for first snapshot&hellip;</div>
+    </fieldset>
+    <div class="cols">
+      <div>
+        <fieldset>
+          <legend>per-card GPU (live + 60s)</legend>
+          <div id="landing_gpus" class="muted">waiting&hellip;</div>
+        </fieldset>
+        <fieldset>
+          <legend>throughput / spec / cache (live + 60s)</legend>
+          <div id="landing_rates" class="muted">waiting&hellip;</div>
+        </fieldset>
+      </div>
+      <div>
+        <fieldset>
+          <legend>placement of the RUNNING config</legend>
+          <div id="landing_placement" class="muted">computing&hellip;</div>
+        </fieldset>
+      </div>
+    </div>
+    <fieldset>
+      <legend>energy &mdash; live GPU power state (per-card power CALIBRATION lives in the Energy tab)</legend>
+      <div style="margin-bottom:.4rem">
+        <button class="secondary mini" onclick="refreshGpuState()" title="re-query NVML live">refresh power state</button>
+      </div>
+      <div id="gpu_state_out" class="muted">click refresh&hellip;</div>
+    </fieldset>
+  </div>
 </div>
 
 <div id="view_landscape" style="display:none">
@@ -1950,31 +2353,15 @@ INDEX_HTML = r"""<!doctype html>
   <div class="cols">
     <div>
       <fieldset>
-        <legend>GPU power state
-          <button class="secondary mini" onclick="refreshGpuState()" title="re-query NVML live">refresh</button></legend>
-        <div id="gpu_state_out" class="muted">click refresh…</div>
-      </fieldset>
-      <fieldset>
         <legend>per-card power calibration (measured)</legend>
         <div class="muted" style="margin-bottom:.4rem">Measures each free card's
           board power at idle / membw / GEMM (short micro-benchmarks that briefly
           load the GPU). <b>Do not run against a busy card</b> — the backend
           SKIPS any card another process owns and reports it. Result is persisted
-          and overrides the energy model's power heuristic.</div>
+          and overrides the energy model's power heuristic. Live GPU power-state
+          + throughput monitoring moved to the Landing tab.</div>
         <button onclick="measurePower()" id="pw_btn">Measure per-card power</button>
         <div id="pw_out" class="muted" style="margin-top:.6rem"></div>
-      </fieldset>
-      <fieldset>
-        <legend>live monitor (measure against a running server)</legend>
-        <label>target server (host:port)</label>
-        <input id="live_target" placeholder="127.0.0.1:31000">
-        <label>resolution (ms) &mdash; floor ~30ms</label>
-        <input id="live_res" value="250">
-        <div style="margin-top:.5rem">
-          <button onclick="toggleLive()" id="live_btn">start live</button>
-          <button class="secondary" onclick="remeasureNow()" title="single immediate scrape">re-measure now</button>
-        </div>
-        <div id="live_out" class="muted" style="margin-top:.6rem">idle.</div>
       </fieldset>
     </div>
     <div>
@@ -2010,85 +2397,6 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </div>
 
-<div id="view_models" style="display:none">
-  <div class="sub">Local models the dashboard can serve (config-authoritative
-    quant, never the dir name), plus the single managed sglang instance.
-    <b>Launch / restart REPLACES</b> the one running model (the box is
-    VRAM-bound). Download is gated on a writable model mount.</div>
-  <div class="cols">
-    <div>
-      <fieldset>
-        <legend>discovered models
-          <button class="secondary mini" onclick="loadModels()" title="re-scan roots">rescan</button></legend>
-        <div id="models_out" class="muted">scanning…</div>
-      </fieldset>
-      <fieldset>
-        <legend>download a model (external HF fetch)</legend>
-        <label>repo id (org/name)</label>
-        <input id="dl_repo" placeholder="unsloth/Qwen3.6-27B-GGUF" onchange="dlTargets()">
-        <label>model root (mount)</label>
-        <input id="dl_root" placeholder="(default first root)" onchange="dlTargets()">
-        <div id="dl_variants" style="display:none">
-          <label>GGUF quant</label>
-          <select id="dl_quant"></select>
-        </div>
-        <div style="margin-top:.5rem">
-          <button onclick="dlPreview()" id="dl_btn">Preview + download</button>
-        </div>
-        <div id="dl_out" class="muted" style="margin-top:.5rem"></div>
-      </fieldset>
-    </div>
-    <div>
-      <fieldset>
-        <legend>launch / restart the managed server (REPLACES the running model)</legend>
-        <div class="cols" style="grid-template-columns:1fr 1fr;gap:.6rem">
-          <div>
-            <label>model (path)</label>
-            <input id="sv_model" placeholder="/path/to/model or .gguf dir">
-            <label>gguf variant (basename, if GGUF)</label>
-            <input id="sv_variant" placeholder="(blank = hf format)">
-            <label>format</label>
-            <select id="sv_format"><option value="hf">hf</option><option value="gguf">gguf</option></select>
-            <label>tp-size</label>
-            <input id="sv_tp" value="1">
-            <label>rank-gpu-id (csv)</label>
-            <input id="sv_rgi" placeholder="(optional, e.g. 0,1)">
-            <label>rank-tp-ratio (csv)</label>
-            <input id="sv_rtr" placeholder="(optional)">
-            <label>kv-cache-dtype</label>
-            <select id="sv_kv"><option value="auto">auto</option>
-              <option value="fp8_e4m3">fp8_e4m3</option><option value="fp8_e5m2">fp8_e5m2</option></select>
-          </div>
-          <div>
-            <label>spec decode</label>
-            <select id="sv_spec"><option value="off">off</option>
-              <option value="mtp">mtp (fixed)</option><option value="adaptive">adaptive</option></select>
-            <label>chat-template</label>
-            <input id="sv_ct" placeholder="(optional)">
-            <label>tool-call-parser</label>
-            <input id="sv_tool" placeholder="(optional, e.g. qwen25)">
-            <label>reasoning-parser</label>
-            <input id="sv_reason" placeholder="(optional, e.g. qwen3)">
-            <label>port</label>
-            <input id="sv_port" value="30000">
-            <label>max-num-seqs</label>
-            <input id="sv_seqs" placeholder="(optional)">
-            <label>context-length</label>
-            <input id="sv_ctx" value="8192">
-            <label><input type="checkbox" id="sv_vision" style="width:auto"> vision on</label>
-          </div>
-        </div>
-        <div style="margin-top:.5rem">
-          <button onclick="serverStart()">Launch</button>
-          <button class="secondary" onclick="serverRestart()">Restart (replace)</button>
-          <button class="secondary" onclick="serverStop()">Stop</button>
-          <button class="secondary mini" onclick="refreshServerStatus()">status</button>
-        </div>
-        <div id="sv_out" class="muted" style="margin-top:.6rem"></div>
-      </fieldset>
-    </div>
-  </div>
-</div>
 
 <div id="view_quality" style="display:none">
   <div class="sub">ONESHOT chess-SVG quality benchmark (<a href="https://www.reddit.com/r/LocalLLaMA/comments/1t53dhp/quality_comparison_between_qwen_36_27b/" target="_blank">reddit reference</a>).
@@ -2157,17 +2465,33 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </div>
 
-<div id="view_plan">
+<div id="view_runner" style="display:none">
+<div class="sub">Models + planner, merged. Pick a model &rarr; the planner
+  AUTO-SETS every field (profile + plan). Edit any flag &rarr; the field states
+  re-resolve (greyed/auto-set/blocked) and the PROSPECTIVE placement + fit
+  update live. Launch / restart / stop the one managed server from here.</div>
 <div class="cols">
   <div>
     <fieldset>
-      <legend>model</legend>
-      <label>Model (config.json dir, .gguf file, GGUF dir, or HF id)</label>
-      <input id="model" placeholder="/path/to/Qwen3.6-27B-AWQ or org/model" onchange="onModelChange()">
+      <legend>model &mdash; pick from discovered, or type a path
+        <button class="secondary mini" onclick="loadModels()" title="re-scan roots">rescan</button></legend>
+      <div id="models_out" class="muted">scanning&hellip;</div>
+      <label style="margin-top:.5rem">Model (config.json dir, .gguf file, GGUF dir, or HF id)</label>
+      <input id="model" placeholder="/path/to/Qwen3.6-27B-AWQ or org/model" onchange="onModelChange(); onRunnerModel()">
       <div id="gguf_pick" style="display:none">
         <label>GGUF quant (several available &mdash; pick one)</label>
-        <select id="gguf_choice" onchange="doPlan()"></select>
+        <select id="gguf_choice" onchange="doPlan(); onRunnerModel()"></select>
       </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>config profile &mdash; auto-populates every field</legend>
+      <div id="profile_pick" class="muted">select a model to list profiles&hellip;</div>
+      <div style="margin-top:.4rem">
+        <input id="profile_save_name" placeholder="name to save current settings as" style="max-width:60%">
+        <button class="secondary mini" onclick="saveProfile()">save current as profile</button>
+      </div>
+      <div id="profile_msg" class="muted" style="margin-top:.3rem"></div>
     </fieldset>
 
     <fieldset>
@@ -2222,9 +2546,88 @@ INDEX_HTML = r"""<!doctype html>
       <button class="secondary" onclick="doIssue('bug')">Report bug</button>
     </div>
     <div id="notexpr" class="knoblist" style="margin-top:.8rem"></div>
+
+    <fieldset style="margin-top:.8rem">
+      <legend>full flag surface (every sglang + fork flag) &mdash;
+        <span id="flag_counts" class="muted"></span></legend>
+      <div class="muted" style="margin-bottom:.4rem">Each field re-resolves on
+        change: greyed + hover-? when excluded / incompatible / auto-set;
+        self-updating dropdown when options exist; incompatible values blocked.
+        The prospective placement + fit update as you edit.</div>
+      <div id="flag_warnings"></div>
+      <div id="flag_surface" class="muted">select a model to populate&hellip;</div>
+    </fieldset>
+
+    <fieldset style="margin-top:.8rem">
+      <legend>launch / restart the managed server (REPLACES the running model)</legend>
+      <div class="cols" style="grid-template-columns:1fr 1fr;gap:.6rem">
+        <div>
+          <label>model (path)</label>
+          <input id="sv_model" placeholder="/path/to/model or .gguf dir">
+          <label>gguf variant (basename, if GGUF)</label>
+          <input id="sv_variant" placeholder="(blank = hf format)">
+          <label>format</label>
+          <select id="sv_format"><option value="hf">hf</option><option value="gguf">gguf</option></select>
+          <label>tp-size</label>
+          <input id="sv_tp" value="1">
+          <label>rank-gpu-id (csv)</label>
+          <input id="sv_rgi" placeholder="(optional, e.g. 0,1)">
+          <label>rank-tp-ratio (csv)</label>
+          <input id="sv_rtr" placeholder="(optional)">
+          <label>kv-cache-dtype</label>
+          <select id="sv_kv"><option value="auto">auto</option>
+            <option value="fp8_e4m3">fp8_e4m3</option><option value="fp8_e5m2">fp8_e5m2</option></select>
+        </div>
+        <div>
+          <label>spec decode</label>
+          <select id="sv_spec"><option value="off">off</option>
+            <option value="mtp">mtp (fixed)</option><option value="adaptive">adaptive</option></select>
+          <label>chat-template</label>
+          <input id="sv_ct" placeholder="(optional)">
+          <label>tool-call-parser</label>
+          <input id="sv_tool" placeholder="(optional, e.g. qwen25)">
+          <label>reasoning-parser</label>
+          <input id="sv_reason" placeholder="(optional, e.g. qwen3)">
+          <label>port</label>
+          <input id="sv_port" value="30000">
+          <label>max-num-seqs</label>
+          <input id="sv_seqs" placeholder="(optional)">
+          <label>context-length</label>
+          <input id="sv_ctx" value="8192">
+          <label><input type="checkbox" id="sv_vision" style="width:auto"> vision on</label>
+        </div>
+      </div>
+      <div style="margin-top:.5rem">
+        <button onclick="serverStart()">Launch</button>
+        <button class="secondary" onclick="serverRestart()">Restart (replace)</button>
+        <button class="secondary" onclick="serverStop()">Stop</button>
+        <button class="secondary mini" onclick="refreshServerStatus()">status</button>
+      </div>
+      <div id="sv_out" class="muted" style="margin-top:.6rem"></div>
+    </fieldset>
+
+    <fieldset style="margin-top:.8rem">
+      <legend>download a model (external HF fetch)</legend>
+      <label>repo id (org/name)</label>
+      <input id="dl_repo" placeholder="unsloth/Qwen3.6-27B-GGUF" onchange="dlTargets()">
+      <label>model root (mount)</label>
+      <input id="dl_root" placeholder="(default first root)" onchange="dlTargets()">
+      <div id="dl_variants" style="display:none">
+        <label>GGUF quant</label>
+        <select id="dl_quant"></select>
+      </div>
+      <div style="margin-top:.5rem">
+        <button onclick="dlPreview()" id="dl_btn">Preview + download</button>
+      </div>
+      <div id="dl_out" class="muted" style="margin-top:.5rem"></div>
+    </fieldset>
   </div>
 
   <div>
+    <fieldset>
+      <legend>prospective placement + per-card fit (updates as flags change)</legend>
+      <div id="runner_placement" class="muted">plan a model to see the granular placement&hellip;</div>
+    </fieldset>
     <div id="verdict"></div>
     <div id="split"></div>
     <div id="cards"></div>
@@ -2889,13 +3292,392 @@ async function doIssue(kind) {
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 
 function showTab(t) {
-  const TABS = ['plan','explore','landscape','energy','models','quality'];
+  const TABS = ['landing','runner','explore','landscape','energy','quality'];
   for (const v of TABS) $('view_'+v).style.display = t===v ? '' : 'none';
   for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
   if ((t==='explore'||t==='landscape') && !window._profLoaded) loadProfiles();
-  if (t==='energy' && !window._energyInit) { window._energyInit=true; refreshGpuState(); loadPowerProfile(); }
-  if (t==='models' && !window._modelsInit) { window._modelsInit=true; loadModels(); refreshServerStatus(); }
+  if (t==='energy' && !window._energyInit) { window._energyInit=true; loadPowerProfile(); }
   if (t==='quality' && !window._qualityInit) { window._qualityInit=true; loadShots(); }
+  if (t==='runner' && !window._runnerInit) {
+    window._runnerInit=true; loadKnobs(); detectGPUs(); loadModels();
+    loadFlagCatalog(); refreshServerStatus();
+  }
+  // The landing page live-poll runs only while its tab is visible.
+  if (t==='landing') startLanding(); else stopLanding();
+}
+
+// ===========================================================================
+// Shared granular placement renderer (used by BOTH the landing running-config
+// view and the runner prospective view -- ONE renderer, two data sources).
+// ===========================================================================
+function fmtMib(x){ return (x==null)? '—' : (x>=1024? (x/1024).toFixed(2)+'G' : x.toFixed(0)+'M'); }
+function renderPlacement(pl){
+  if(!pl) return '<span class="muted">no placement.</span>';
+  const m=pl.model||{}; let h='';
+  h+='<div class="legend">TP '+pl.tp_size+' · DCP '+pl.dcp_size+' · heads Q'+m.num_attention_heads
+    +'/KV'+m.num_key_value_heads+' · layers '+m.num_hidden_layers
+    +(m.num_experts?(' · experts '+m.num_experts):'')+'</div>';
+  const rpg=pl.ranks_per_gpu||{};
+  h+='<div style="margin:.3rem 0"><b>ranks / GPU:</b> '
+    +Object.keys(rpg).map(g=>'GPU'+g+'→['+rpg[g].join(',')+']').join('  ')+'</div>';
+  h+='<div><b>per-card fit (weights / KV / mamba / overhead):</b></div>';
+  h+='<table class="mx"><tr><th>GPU</th><th>card</th><th>ranks</th><th>weights</th><th>KV</th>'
+    +'<th>mamba</th><th>ovh</th><th>total</th><th>budget</th></tr>';
+  for(const c of (pl.cards||[])){
+    const over=c.physical_overcommit? ' <span class="nofitc">OVER</span>':'';
+    h+='<tr><td>'+c.gpu_index+'</td><td style="text-align:left">'+esc(c.card_name||'—')+'</td>'
+      +'<td>'+c.ranks.join(',')+'</td><td>'+fmtMib(c.weight_mib)+'</td><td>'+fmtMib(c.kv_mib)+'</td>'
+      +'<td>'+fmtMib(c.mamba_mib)+'</td><td>'+fmtMib(c.overhead_mib)+'</td><td><b>'+fmtMib(c.total_mib)+'</b></td>'
+      +'<td>'+(c.budget_mib!=null?fmtMib(c.budget_mib):'—')+over+'</td></tr>';
+  }
+  h+='</table>';
+  h+='<div style="margin-top:.4rem"><b>attention heads (Q/K/V index ranges, MiB):</b></div>';
+  h+='<table class="mx"><tr><th>rank</th><th>GPU</th><th>Q heads</th><th>K</th><th>V</th><th>attn MiB</th></tr>';
+  for(const a of (pl.attn_heads||[])){
+    h+='<tr><td>'+a.rank+'</td><td>'+a.gpu_index+'</td>'
+      +'<td>['+a.q_head_start+'..'+a.q_head_end+') '+a.q_heads+'</td>'
+      +'<td>['+a.k_head_start+'..'+a.k_head_end+') '+a.k_heads+(a.kv_replicated?' repl':'')+'</td>'
+      +'<td>['+a.v_head_start+'..'+a.v_head_end+') '+a.v_heads+'</td>'
+      +'<td>'+fmtMib(a.q_mib+a.k_mib+a.v_mib+a.o_mib)+'</td></tr>';
+  }
+  h+='</table>';
+  if(pl.gdn_heads){
+    h+='<div style="margin-top:.4rem"><b>linear (GDN) heads:</b></div>'
+      +'<table class="mx"><tr><th>rank</th><th>K heads</th><th>V heads</th><th>MiB</th></tr>';
+    for(const g of pl.gdn_heads)
+      h+='<tr><td>'+g.rank+'</td><td>['+g.k_head_start+'..'+g.k_head_end+') '+g.k_heads
+        +'</td><td>['+g.v_head_start+'..'+g.v_head_end+') '+g.v_heads+'</td><td>'+fmtMib(g.mib)+'</td></tr>';
+    h+='</table>';
+  }
+  h+='<div style="margin-top:.4rem"><b>KV token placement</b> <span class="muted">('
+    +esc(pl.token_vector_source)+', vector ['+pl.token_vector.join(',')+']):</span></div>';
+  h+='<table class="mx"><tr><th>rank</th><th>GPU</th><th>positions</th><th>tokens</th>'
+    +'<th>KV MiB owned</th><th>capacity tok</th></tr>';
+  for(const k of (pl.kv_tokens||[]))
+    h+='<tr><td>'+k.rank+'</td><td>'+k.gpu_index+'</td><td>['+k.pos_start+'..'+k.pos_end+')</td>'
+      +'<td>'+k.tokens_owned+'</td><td>'+fmtMib(k.kv_mib_owned)+'</td>'
+      +'<td>'+(k.kv_token_capacity!=null?Math.round(k.kv_token_capacity):'—')+'</td></tr>';
+  h+='</table>';
+  if(pl.experts){
+    h+='<div style="margin-top:.4rem"><b>MoE experts per rank (index ranges):</b></div>'
+      +'<table class="mx"><tr><th>rank</th><th>GPU</th><th>expert idx</th><th>#</th>'
+      +'<th>routed MiB</th><th>shared MiB</th></tr>';
+    for(const e of pl.experts)
+      h+='<tr><td>'+e.rank+'</td><td>'+e.gpu_index+'</td><td>['+e.expert_start+'..'+e.expert_end+')</td>'
+        +'<td>'+e.num_experts+'</td><td>'+fmtMib(e.routed_mib)+'</td><td>'+fmtMib(e.shared_mib)+'</td></tr>';
+    h+='</table>';
+  }
+  if(pl.mtp && pl.mtp.present)
+    h+='<div style="margin-top:.4rem"><b>MTP / nextn:</b> layers ['+pl.mtp.layer_start+'..'
+      +pl.mtp.layer_end+'), per-rank MiB ['+pl.mtp.per_rank_mib.map(x=>fmtMib(x)).join(', ')+']</div>';
+  if(pl.offload){
+    const o=pl.offload;
+    h+='<div style="margin-top:.4rem"><b>host-RAM OFFLOAD rule</b> <span class="muted">('+esc(o.offloadable_class)
+      +'):</span> offloadable '+fmtMib(o.total_offloadable_mib)+', host-held '+fmtMib(o.total_host_mib)
+      +(o.resident_fraction!=null?(' (resident frac '+o.resident_fraction.toFixed(2)+')'):'')+'</div>';
+    if(o.resident_fraction!=null){
+      h+='<table class="mx"><tr><th>rank</th><th>host experts</th><th>host MiB</th><th>resident</th></tr>';
+      for(const r of o.per_rank)
+        h+='<tr><td>'+r.rank+'</td><td>'+(r.host_expert_start!=null?('['+r.host_expert_start+'..'
+          +r.host_expert_end+') '+r.host_expert_count):'—')+'</td><td>'+fmtMib(r.host_mib)
+          +'</td><td>'+r.resident_expert_count+'</td></tr>';
+      h+='</table>';
+    }
+    h+='<div class="muted" style="font-size:.66rem">'+esc(o.note)+'</div>';
+  }
+  if(pl.notes && pl.notes.length)
+    h+='<div class="legend" style="margin-top:.3rem">'+pl.notes.map(n=>'• '+esc(n)).join('<br>')+'</div>';
+  return h;
+}
+
+// ===========================================================================
+// Landing page: live monitor of the managed server (client 60s ring buffers).
+// ===========================================================================
+window._landTimer=null; window._ring={};
+const RING_SECONDS=60;
+function pushRing(key,t,v){
+  if(v==null||isNaN(v)) return;
+  const a=window._ring[key]||(window._ring[key]=[]);
+  a.push({t,v});
+  const cutoff=t-RING_SECONDS;
+  while(a.length && a[0].t<cutoff) a.shift();
+}
+function sparkline(key,w,hh){
+  const a=window._ring[key]||[]; if(a.length<2) return '';
+  let mn=Infinity,mx=-Infinity;
+  for(const p of a){ if(p.v<mn)mn=p.v; if(p.v>mx)mx=p.v; }
+  if(mx<=mn) mx=mn+1;
+  const t0=a[0].t, t1=a[a.length-1].t, span=(t1-t0)||1;
+  const pts=a.map(p=>((p.t-t0)/span*w).toFixed(1)+','+(hh-((p.v-mn)/(mx-mn))*hh).toFixed(1)).join(' ');
+  return '<svg width="'+w+'" height="'+hh+'" style="vertical-align:middle;background:#0d1117;border-radius:3px">'
+    +'<polyline fill="none" stroke="#1f6feb" stroke-width="1.5" points="'+pts+'"/></svg>';
+}
+async function startLanding(){
+  if(window._landTimer) return;
+  await landingPoll();
+  window._landTimer=setInterval(landingPoll, 2000);
+}
+function stopLanding(){ if(window._landTimer){ clearInterval(window._landTimer); window._landTimer=null; } }
+async function landingPoll(){
+  let d;
+  try{ const r=await fetch('/api/live_snapshot'); d=await r.json(); }catch(e){ return; }
+  if(!d || (!d.ok && !d.running) || !d.running || !d.snapshot){
+    $('landing_none').style.display=''; $('landing_live').style.display='none';
+    const st=d && d.status;
+    $('landing_none_status').textContent = (d && d.error)? ' ('+d.error+')'
+      : (st && st.state? ' (server state: '+st.state+')':'');
+    return;
+  }
+  $('landing_none').style.display='none'; $('landing_live').style.display='';
+  renderLanding(d.snapshot);
+}
+function renderLanding(s){
+  const cfg=s.launch_config||{};
+  let cfgh='<table class="mx" style="text-align:left"><tr><th>flag</th><th>value</th></tr>';
+  const keys=['model_path','served_model_name','format','gguf_variant','tp_size','rank_gpu_id',
+    'rank_tp_ratio','rank_gpu_memory_mib','kv_cache_dtype','context_length','max_num_seqs','spec_mode','port'];
+  let any=false;
+  for(const k of keys){ if(cfg[k]!=null && cfg[k]!==''){ any=true;
+    cfgh+='<tr><td class="muted">'+k+'</td><td>'+esc(String(Array.isArray(cfg[k])?cfg[k].join(','):cfg[k]))+'</td></tr>'; } }
+  cfgh+='</table>';
+  if(!any && s.server_info) cfgh='<pre style="white-space:pre-wrap;font-size:.66rem">'+esc(JSON.stringify(s.server_info,null,1))+'</pre>';
+  if(cfg.launch_argv) cfgh+='<div class="legend">launch: <code>'+esc(cfg.launch_argv.join(' '))+'</code></div>';
+  $('landing_config').innerHTML=cfgh;
+
+  let gh='';
+  for(const g of (s.gpus||[])){
+    const key='gpu'+g.nvml_index;
+    pushRing(key+'_util',s.t,g.utilization_pct); pushRing(key+'_pow',s.t,g.power_watts);
+    pushRing(key+'_temp',s.t,g.temperature_c); pushRing(key+'_mem',s.t,g.mem_used_mib);
+    gh+='<div style="margin:.3rem 0;border-bottom:1px solid #21262d;padding-bottom:.3rem">'
+      +'<b>'+esc(g.name)+'</b> <span class="muted">#'+g.nvml_index+'</span><br>'
+      +'util '+g.utilization_pct+'% '+sparkline(key+'_util',80,18)+' &nbsp; '
+      +'pow '+g.power_watts.toFixed(0)+'/'+g.power_limit_w.toFixed(0)+'W '+sparkline(key+'_pow',80,18)+'<br>'
+      +'SM/mem '+g.sm_clock_mhz+'/'+g.mem_clock_mhz+'MHz &nbsp; temp '+g.temperature_c+'C '+sparkline(key+'_temp',60,18)+' &nbsp; '
+      +'mem '+(g.mem_used_mib/1024).toFixed(1)+'/'+(g.mem_total_mib/1024).toFixed(1)+'G '+sparkline(key+'_mem',60,18)
+      +'</div>';
+  }
+  $('landing_gpus').innerHTML = gh||'<span class="muted">no NVML cards'+(s.nvml_error?' ('+esc(s.nvml_error)+')':'')+'</span>';
+
+  let rh=''; const rates=s.rates;
+  if(rates){
+    pushRing('dec',s.t,rates.decode_tok_s); pushRing('pfx',s.t,rates.prefill_tok_s);
+    rh+='<div>decode <b>'+(rates.decode_tok_s!=null?rates.decode_tok_s.toFixed(1):'—')+'</b> tok/s '+sparkline('dec',120,20)+'</div>'
+      +'<div>prefill (non-cached) <b>'+(rates.prefill_tok_s!=null?rates.prefill_tok_s.toFixed(1):'—')+'</b> tok/s '+sparkline('pfx',120,20)+'</div>';
+  } else { rh+='<div class="muted">(rates on next tick)</div>'; }
+  if(s.spec){
+    pushRing('acc',s.t,(s.spec.accept_rate!=null?s.spec.accept_rate*100:null));
+    rh+='<div>MTP accept <b>'+((s.spec.accept_rate||0)*100).toFixed(1)+'%</b> '+sparkline('acc',120,20)
+      +' &nbsp; adaptive-k '+(s.spec.adaptive_k!=null?s.spec.adaptive_k:'—')+'</div>';
+  }
+  if(s.cache_hit_rates)
+    rh+='<div class="legend">cache-hit per tier: '+Object.keys(s.cache_hit_rates)
+      .map(k=>k+' '+((s.cache_hit_rates[k]||0)*100).toFixed(0)+'%').join(' · ')+'</div>';
+  if(s.hicache)
+    rh+='<div class="legend">HiCache host RAM: '+(s.hicache.host_used_tokens||0).toFixed(0)+'/'
+      +(s.hicache.host_total_tokens||0).toFixed(0)+' tok ('+((s.hicache.host_used_frac||0)*100).toFixed(0)+'%)</div>';
+  $('landing_rates').innerHTML=rh;
+
+  renderLandingPlacement(s);
+}
+async function renderLandingPlacement(s){
+  const cfg=s.launch_config||{}; const model=cfg.model_path;
+  if(!model){ $('landing_placement').innerHTML='<span class="muted">no launch config for placement.</span>'; return; }
+  const flags={
+    tp_size: cfg.tp_size||1, rank_gpu_id: cfg.rank_gpu_id||null, rank_tp_ratio: cfg.rank_tp_ratio||null,
+    rank_gpu_memory_mib: cfg.rank_gpu_memory_mib||null, kv_cache_dtype: cfg.kv_cache_dtype||'auto',
+    context_length: cfg.context_length||null, max_running_requests: cfg.max_num_seqs||null,
+    speculative_algorithm: (cfg.spec_mode&&cfg.spec_mode!=='off')?cfg.spec_mode:null,
+  };
+  const ct={},cn={};
+  (s.gpus||[]).forEach(g=>{ ct[g.nvml_index]=g.mem_total_mib; cn[g.nvml_index]=g.name; });
+  flags.card_total_mib=ct; flags.card_name=cn;
+  try{
+    const r=await fetch('/api/placement',{method:'POST',body:JSON.stringify(
+      {model, gguf_choice: cfg.gguf_variant||null, flags})});
+    const d=await r.json();
+    $('landing_placement').innerHTML = d.ok? renderPlacement(d.placement) : '<span class="reasons">'+esc(d.error)+'</span>';
+  }catch(e){ $('landing_placement').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
+}
+
+// ===========================================================================
+// Runner tab: full flag surface (resolve greying/auto-set) + config profiles +
+// live prospective placement (shared renderer).
+// ===========================================================================
+window._flagCat=null; window._flagSettings={}; window._profiles=[];
+async function loadFlagCatalog(){
+  try{
+    const r=await fetch('/api/flag_catalog'); const d=await r.json();
+    if(!d.ok) return;
+    window._flagCat=d;
+    $('flag_counts').textContent=d.upstream_count+' upstream + '+d.fork_count+' fork';
+    renderFlagSurface();
+  }catch(e){}
+}
+function renderFlagSurface(){
+  const d=window._flagCat; if(!d) return;
+  let h='';
+  for(const g of Object.keys(d.groups)){
+    h+='<details style="margin:.2rem 0"><summary style="cursor:pointer"><b>'+esc(g)
+      +'</b> <span class="muted">('+d.groups[g].length+')</span></summary>';
+    for(const f of d.groups[g]){
+      const src=f.source!=='upstream'? ' <span class="pill">'+esc(f.source)+'</span>':'';
+      h+='<div class="flagrow" id="flrow_'+f.id+'" style="margin:.15rem 0">'
+        +'<label style="display:flex;align-items:center;gap:.3rem" title="'+esc(f.hover||f.help||'')+'">'
+        +'<span style="flex:1;min-width:0">'+esc(f.name)+src
+        +' <span class="flag-q" id="flq_'+f.id+'" style="color:#e3a008"></span></span>';
+      if(f.type==='bool')
+        h+='<input type="checkbox" id="fl_'+f.id+'" style="width:auto" onchange="onFlagChange(\''+f.id+'\')">';
+      else if(f.allowed)
+        h+='<select id="fl_'+f.id+'" style="max-width:45%" onchange="onFlagChange(\''+f.id+'\')"><option value="">(default)</option>'
+          +f.allowed.map(a=>'<option value="'+esc(String(a))+'">'+esc(String(a))+'</option>').join('')+'</select>';
+      else
+        h+='<input id="fl_'+f.id+'" style="max-width:45%" placeholder="'
+          +(f.default!=null?esc(String(f.default)):'default')+'" onchange="onFlagChange(\''+f.id+'\')">';
+      h+='</label><div class="knob-help" id="flh_'+f.id+'"></div></div>';
+    }
+    h+='</details>';
+  }
+  $('flag_surface').innerHTML=h;
+}
+function _flagSpec(id){
+  const d=window._flagCat; if(!d) return null;
+  for(const g of Object.keys(d.groups)){ const f=d.groups[g].find(x=>x.id===id); if(f) return f; }
+  return null;
+}
+function onFlagChange(id){
+  const el=$('fl_'+id); const spec=_flagSpec(id); if(!el||!spec) return;
+  const v = spec.type==='bool'? el.checked : el.value.trim();
+  if(v===''||v===false) delete window._flagSettings[id];
+  else window._flagSettings[id]=v;
+  resolveFlags(); refreshRunnerPlacement();
+}
+function collectFlagSettings(){
+  const s=Object.assign({}, window._flagSettings);
+  if($('sv_tp') && $('sv_tp').value) s.tp_size=parseInt($('sv_tp').value)||1;
+  if($('sv_rgi') && $('sv_rgi').value.trim()) s.rank_gpu_id=$('sv_rgi').value.trim();
+  if($('sv_rtr') && $('sv_rtr').value.trim()) s.rank_tp_ratio=$('sv_rtr').value.trim();
+  return s;
+}
+async function resolveFlags(){
+  if(!window._flagCat) return;
+  const model=$('model').value.trim();
+  try{
+    const r=await fetch('/api/resolve_flags',{method:'POST',
+      body:JSON.stringify({settings:collectFlagSettings(), model})});
+    const d=await r.json(); if(!d.ok) return;
+    applyFieldStates(d.fields); renderFlagWarnings(d.warnings);
+  }catch(e){}
+}
+function applyFieldStates(fields){
+  for(const id of Object.keys(fields)){
+    const st=fields[id]; const el=$('fl_'+id); if(!el) continue;
+    el.disabled=!st.enabled;
+    const row=$('flrow_'+id); if(row) row.style.opacity=st.enabled?'1':'0.45';
+    const q=$('flq_'+id); if(q){ q.textContent=st.disabled_reason?'(?)':''; q.title=st.disabled_reason||''; }
+    const help=$('flh_'+id);
+    if(help){
+      let parts=[];
+      if(st.auto_set) parts.push('auto-set: '+JSON.stringify(st.value));
+      if(st.disabled_reason) parts.push(st.disabled_reason);
+      if(st.error) parts.push(st.error);
+      help.innerHTML = parts.length? '<span class="'+(st.error?'nofitc':'muted')+'">'+esc(parts.join(' · '))+'</span>':'';
+    }
+    if(st.options && el.tagName==='SELECT'){
+      const cur=el.value;
+      el.innerHTML='<option value="">(default)</option>'
+        +st.options.map(a=>'<option value="'+esc(String(a))+'">'+esc(String(a))+'</option>').join('');
+      el.value=cur;
+    }
+  }
+}
+function renderFlagWarnings(ws){
+  const box=$('flag_warnings'); if(!box) return;
+  if(!ws||!ws.length){ box.innerHTML=''; return; }
+  box.innerHTML=ws.map(w=>'<div class="'+(w.level==='error'?'reasons':'muted')
+    +'" style="border:1px solid #e3a008;padding:.3rem;border-radius:6px;margin:.2rem 0">'
+    +(w.level==='error'?'BLOCK: ':'NOTE: ')+esc(w.message)+'</div>').join('');
+}
+async function onRunnerModel(){
+  const model=$('model').value.trim(); if(!model) return;
+  if(!$('sv_model').value.trim()) $('sv_model').value=model;
+  loadConfigProfiles(); resolveFlags(); refreshRunnerPlacement();
+}
+function runnerFlags(){
+  const s=Object.assign({}, window._flagSettings);
+  const incl=CARDS.filter(c=>c.include);
+  const f={
+    tp_size: ($('sv_tp').value? parseInt($('sv_tp').value):null)
+      || ($('tp_size').value? parseInt($('tp_size').value):null) || (incl.length||1),
+    rank_gpu_id: $('sv_rgi').value.trim()||s.rank_gpu_id||null,
+    rank_tp_ratio: $('sv_rtr').value.trim()||s.rank_tp_ratio||null,
+    kv_cache_dtype: $('kv_cache_dtype').value||s.kv_cache_dtype||'auto',
+    context_length: $('sv_ctx').value? parseInt($('sv_ctx').value):null,
+    max_running_requests: $('max_running_requests').value? parseInt($('max_running_requests').value):null,
+    include_vision: $('include_vision').checked,
+  };
+  const ct={},cn={};
+  CARDS.forEach((c,i)=>{ ct[i]=c.total_mib; cn[i]=c.name; });
+  f.card_total_mib=ct; f.card_name=cn;
+  for(const k of ['rank_mlp_ratio','rank_moe_ratio','rank_vocab_ratio','dcp_size',
+    'rank_gpu_memory_mib','kv_token_vector','rank_kv_ratio','speculative_algorithm',
+    'speculative_num_draft_tokens','moe_resident_expert_fraction'])
+    if(s[k]!=null && s[k]!=='') f[k]=s[k];
+  return f;
+}
+async function refreshRunnerPlacement(){
+  const model=$('model').value.trim(); if(!model) return;
+  try{
+    const r=await fetch('/api/placement',{method:'POST',body:JSON.stringify(
+      {model, gguf_choice: ($('gguf_pick').style.display!=='none'?$('gguf_choice').value:null),
+       flags: runnerFlags()})});
+    const d=await r.json();
+    $('runner_placement').innerHTML = d.ok? renderPlacement(d.placement)
+      : '<span class="reasons">'+esc(d.error)+'</span>';
+  }catch(e){ $('runner_placement').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
+}
+async function loadConfigProfiles(){
+  const model=$('model').value.trim();
+  try{
+    const q=model? ('?model='+encodeURIComponent(model)):'';
+    const r=await fetch('/api/config_profiles'+q); const d=await r.json();
+    if(!d.ok){ $('profile_pick').innerHTML='<span class="reasons">'+esc(d.error||'error')+'</span>'; return; }
+    window._profiles=(d.generated||[]).concat(d.saved||[]);
+    let h='<b>profiles:</b> '+window._profiles.map((p,i)=>'<button class="mini secondary" onclick="applyProfile('
+      +i+')" title="'+esc((p.info||[]).join(' | '))+'">'+esc(p.name)+'</button>').join(' ');
+    if(d.saved && d.saved.length)
+      h+=' <span class="muted">(saved: '+d.saved.map(p=>esc(p.name)).join(', ')+')</span>';
+    $('profile_pick').innerHTML=h;
+  }catch(e){ $('profile_pick').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
+}
+function applyProfile(i){
+  const p=window._profiles[i]; if(!p) return;
+  window._flagSettings={};
+  for(const id of Object.keys(p.settings)){
+    const v=p.settings[id]; const el=$('fl_'+id);
+    if(el){ if(el.type==='checkbox') el.checked=!!v; else el.value=(v==null?'':String(Array.isArray(v)?v.join(','):v)); }
+    if(v!=null && v!=='' && v!==false){ const spec=_flagSpec(id);
+      if(!spec || v!==spec.default) window._flagSettings[id]=v; }
+  }
+  if(p.settings.tp_size) $('sv_tp').value=p.settings.tp_size;
+  if(p.settings.rank_gpu_id) $('sv_rgi').value=Array.isArray(p.settings.rank_gpu_id)?p.settings.rank_gpu_id.join(','):p.settings.rank_gpu_id;
+  const rtr=p.settings.rank_tp_ratio;
+  if(rtr && rtr!=='auto' && rtr!=='auto-performance') $('sv_rtr').value=Array.isArray(rtr)?rtr.join(','):rtr;
+  $('profile_msg').innerHTML='<span class="muted">applied <b>'+esc(p.name)+'</b>'
+    +((p.info&&p.info.length)?' — '+esc(p.info.join(' | ')):'')+'</span>';
+  resolveFlags(); refreshRunnerPlacement(); doPlan();
+}
+async function saveProfile(){
+  const name=$('profile_save_name').value.trim();
+  if(!name){ $('profile_msg').innerHTML='<span class="reasons">enter a name</span>'; return; }
+  try{
+    const r=await fetch('/api/config_profiles',{method:'POST',
+      body:JSON.stringify({name, settings:collectFlagSettings(), kind:'custom'})});
+    const d=await r.json();
+    $('profile_msg').innerHTML=d.ok?'<span class="fitc">saved '+esc(name)+'</span>'
+      :'<span class="reasons">'+esc(d.error)+'</span>';
+    if(d.ok) loadConfigProfiles();
+  }catch(e){ $('profile_msg').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
 }
 
 async function loadProfiles() {
@@ -3141,6 +3923,10 @@ function pickFromDropdown() {
   info.push(m.size_gib+' GiB'); if (m.vision) info.push('vision');
   if (m.error) info.push('<span class="nofitc" title="'+esc(m.error)+'">error</span>');
   $('model_info').innerHTML = '<b>'+esc(m.name)+'</b> — '+info.join(' · ')+'<br>'+esc(m.path);
+  // Merged Runner tab: the dropdown also drives the planner's model field.
+  $('model').value = m.path;
+  if (m.gguf_variants && m.gguf_variants.length>1) $('sv_variant').value = '';
+  onModelChange(); onRunnerModel();
 }
 function applyVariant() {
   $('sv_variant').value = $('model_variant_select').value || '';
@@ -3344,8 +4130,8 @@ function showShot() {
   $('q_shot').innerHTML = h;
 }
 
-loadKnobs();
-detectGPUs();
+// Landing is the default view (live monitor of the managed server).
+showTab('landing');
 </script>
 </body>
 </html>

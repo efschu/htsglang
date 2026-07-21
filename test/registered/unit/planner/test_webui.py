@@ -553,8 +553,10 @@ class TestQualityRoutes(CustomTestCase):
 
 class TestNewTabsInIndex(CustomTestCase):
     def test_index_has_new_tabs_and_routes(self):
+        # PHASE 2 reorg: the Models tab is MERGED into the Runner tab, so its
+        # controls (model dropdown / server launch) now live under view_runner.
         for token in (
-            "view_models", "view_quality", "/api/models", "/api/server_start",
+            "view_runner", "view_quality", "/api/models", "/api/server_start",
             "/api/measure_power", "/api/quality_run", "/api/quality_shots",
             "/assets/quality_chess_reference.png",
             "1t53dhp",  # reddit reference link
@@ -611,6 +613,269 @@ class TestNewHttpRoutes(WebUIFixture):
                        {"model_path": "/m", "tp_size": 1, "port": 31234})
         self.assertTrue(d["ok"], d.get("error"))
         self.assertIsNotNone(self.fake.started)
+
+
+# ===========================================================================
+# Dashboard v2 (PHASE 2): Landing live-monitor + Runner tab route wiring.
+# The three backend modules are exercised through the thin webui adapters; a
+# couple of tests mock the module to prove the route only wires (parse + shape),
+# the rest run the real modules on an injected model_cfg (no disk / GPU).
+# ===========================================================================
+
+_V2_CONFIG = dict(_CONFIG)  # the Qwen3-Next hybrid config above
+
+
+class TestDashboardV2Index(CustomTestCase):
+    def test_landing_and_runner_markers_present(self):
+        for token in (
+            "view_landing", "view_runner", "/api/live_snapshot",
+            "/api/placement", "/api/resolve_flags", "/api/flag_catalog",
+            "/api/config_profiles", "renderPlacement", "landingPoll",
+            "loadFlagCatalog", "flag_surface",
+        ):
+            self.assertIn(token, webui.INDEX_HTML, token)
+
+    def test_energy_tab_kept_for_calibration(self):
+        # per-card power CALIBRATION stays in the Energy tab; the live monitor
+        # moved to Landing.
+        self.assertIn("view_energy", webui.INDEX_HTML)
+        self.assertIn("measurePower", webui.INDEX_HTML)
+
+
+class TestPlacementRoute(CustomTestCase):
+    def test_placement_from_model_cfg_running_and_prospective(self):
+        # ONE renderer, two data sources: identical route for both the landing
+        # RUNNING config and the runner PROSPECTIVE config.
+        d = webui.placement_payload(
+            {"model_cfg": _V2_CONFIG,
+             "flags": {"tp_size": 3, "rank_gpu_id": [0, 1, 2],
+                       "context_length": 8192}}
+        )
+        self.assertTrue(d["ok"], d.get("error"))
+        pl = d["placement"]
+        for key in ("model", "ranks_per_gpu", "attn_heads", "kv_tokens",
+                    "cards", "mtp", "notes", "token_vector"):
+            self.assertIn(key, pl)
+        self.assertEqual(len(pl["cards"]), 3)
+        self.assertEqual(len(pl["attn_heads"]), 3)
+
+    def test_placement_route_wires_module(self):
+        with mock.patch(
+            "sglang.srt.planner.placement.compute_placement",
+            return_value={"cards": [], "sentinel": True},
+        ) as m:
+            d = webui.placement_payload({"model_cfg": _V2_CONFIG, "flags": {}})
+        self.assertTrue(d["ok"])
+        self.assertTrue(d["placement"]["sentinel"])
+        m.assert_called_once()
+
+    def test_placement_missing_model_is_error(self):
+        d = webui.placement_payload({"flags": {}})
+        self.assertFalse(d["ok"])
+        self.assertIn("model", d["error"])
+
+
+class TestResolveFlagsRoute(CustomTestCase):
+    def test_resolve_greying_reaches_field_state_json(self):
+        d = webui.resolve_flags_payload(
+            {"settings": {"tp_size": 3, "rank_gpu_id": [0, 1, 2]},
+             "model_cfg": _V2_CONFIG}
+        )
+        self.assertTrue(d["ok"])
+        fields = d["fields"]
+        # rank_gpu_id excludes the global gpu-memory-utilization / mem-fraction:
+        # some field must be disabled with a reason, and a dependency auto-set.
+        self.assertTrue(
+            any(v.get("disabled_reason") for v in fields.values()),
+            "expected at least one greyed field with a reason",
+        )
+        self.assertTrue(
+            any(v.get("auto_set") for v in fields.values()),
+            "expected at least one auto-set dependency",
+        )
+
+    def test_cross_field_warning_weightless_needs_flashinfer(self):
+        d = webui.resolve_flags_payload(
+            {"settings": {"weightless_kv_fastlane": True,
+                          "attention_backend": "triton", "tp_size": 2},
+             "model_cfg": _V2_CONFIG}
+        )
+        self.assertTrue(d["ok"])
+        msgs = " ".join(w["message"] for w in d["warnings"])
+        self.assertIn("flashinfer", msgs)
+
+    def test_cross_field_warning_rank_kv_ratio_needs_nonuniform(self):
+        d = webui.resolve_flags_payload(
+            {"settings": {"rank_kv_ratio": "capacity", "rank_tp_ratio": [1, 1]},
+             "model_cfg": _V2_CONFIG}
+        )
+        ids = [w["id"] for w in d["warnings"]]
+        self.assertIn("rank_kv_ratio", ids)
+
+
+class TestFlagCatalogRoute(CustomTestCase):
+    def test_catalog_groups_and_counts(self):
+        d = webui.flag_catalog_payload()
+        self.assertTrue(d["ok"])
+        self.assertGreater(d["upstream_count"], 0)
+        self.assertGreater(d["fork_count"], 0)
+        # grouped, each entry carries the render metadata.
+        some = next(iter(d["groups"].values()))[0]
+        for k in ("id", "name", "type", "help", "hover", "source"):
+            self.assertIn(k, some)
+
+
+class _RunningFakeSupervisor(_FakeSupervisor):
+    """A fake supervisor that reports running with a LaunchSettings-like
+    ``settings`` object, for the landing snapshot path."""
+
+    class _S:
+        host = "127.0.0.1"
+        port = 31000
+
+    def __init__(self):
+        super().__init__()
+        self._running = True
+        self.settings = self._S()
+
+
+class TestLandingSnapshotRoute(CustomTestCase):
+    def setUp(self):
+        self.fake = _FakeSupervisor()
+        webui._set_supervisor(self.fake)
+
+    def tearDown(self):
+        webui._set_supervisor(None)
+
+    def test_no_server_is_graceful(self):
+        d = webui.landing_snapshot_payload()
+        self.assertTrue(d["ok"])            # NOT an error
+        self.assertFalse(d["running"])
+        self.assertIsNone(d["snapshot"])
+
+    def test_running_server_returns_snapshot(self):
+        webui._set_supervisor(_RunningFakeSupervisor())
+        fake_snap = ({"ok": True, "gpus": [], "rates": None}, {"t": 1.0})
+        with mock.patch(
+            "sglang.srt.planner.live_metrics.snapshot", return_value=fake_snap
+        ) as m:
+            d = webui.landing_snapshot_payload()
+        self.assertTrue(d["ok"])
+        self.assertTrue(d["running"])
+        self.assertIn("gpus", d["snapshot"])
+        m.assert_called_once()
+
+
+class TestConfigProfilesRoutes(CustomTestCase):
+    def setUp(self):
+        self._tf = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        self._tf.close()
+        self._prev = os.environ.get("SGLANG_PLANNER_PROFILES")
+        os.environ["SGLANG_PLANNER_PROFILES"] = self._tf.name
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("SGLANG_PLANNER_PROFILES", None)
+        else:
+            os.environ["SGLANG_PLANNER_PROFILES"] = self._prev
+        os.unlink(self._tf.name)
+
+    def test_generated_profiles_listed(self):
+        d = webui.config_profiles_get(
+            {"model_cfg": _V2_CONFIG,
+             "gpus": [{"name": "A", "total_mib": 32607},
+                      {"name": "B", "total_mib": 20480}]}
+        )
+        self.assertTrue(d["ok"])
+        self.assertGreater(len(d["generated"]), 0)
+
+    def test_save_list_delete_roundtrip(self):
+        sv = webui.config_profiles_save(
+            {"name": "my-cfg", "settings": {"tp_size": 2}, "kind": "custom"}
+        )
+        self.assertTrue(sv["ok"])
+        got = webui.config_profiles_get({})
+        self.assertIn("my-cfg", [p["name"] for p in got["saved"]])
+        rm = webui.config_profiles_delete({"name": "my-cfg"})
+        self.assertTrue(rm["deleted"])
+        got2 = webui.config_profiles_get({})
+        self.assertNotIn("my-cfg", [p["name"] for p in got2["saved"]])
+
+    def test_save_requires_name(self):
+        d = webui.config_profiles_save({"settings": {"tp_size": 2}})
+        self.assertFalse(d["ok"])
+
+
+class TestDashboardV2HttpRoutes(WebUIFixture):
+    """The new v2 routes over a real in-process HTTP round-trip."""
+
+    def setUp(self):
+        self.fake = _FakeSupervisor()
+        webui._set_supervisor(self.fake)
+        self._tf = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        self._tf.close()
+        os.environ["SGLANG_PLANNER_PROFILES"] = self._tf.name
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
+        self.port = self.srv.server_address[1]
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        webui._set_supervisor(None)
+        os.environ.pop("SGLANG_PLANNER_PROFILES", None)
+        os.unlink(self._tf.name)
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.thread.join(timeout=5)
+
+    def _get(self, path):
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{self.port}{path}", timeout=10
+        ) as r:
+            return json.loads(r.read())
+
+    def _req(self, method, path, obj=None):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(obj or {}).encode(),
+            headers={"Content-Type": "application/json"},
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def test_live_snapshot_no_server(self):
+        d = self._get("/api/live_snapshot")
+        self.assertTrue(d["ok"])
+        self.assertFalse(d["running"])
+
+    def test_flag_catalog_route(self):
+        d = self._get("/api/flag_catalog")
+        self.assertTrue(d["ok"])
+        self.assertIn("groups", d)
+
+    def test_placement_route_http(self):
+        d = self._req("POST", "/api/placement",
+                      {"model_cfg": _V2_CONFIG,
+                       "flags": {"tp_size": 3, "rank_gpu_id": [0, 1, 2]}})
+        self.assertTrue(d["ok"], d.get("error"))
+        self.assertEqual(len(d["placement"]["cards"]), 3)
+
+    def test_resolve_flags_route_http(self):
+        d = self._req("POST", "/api/resolve_flags",
+                      {"settings": {"tp_size": 2}, "model_cfg": _V2_CONFIG})
+        self.assertTrue(d["ok"])
+        self.assertIn("fields", d)
+        self.assertIn("warnings", d)
+
+    def test_config_profiles_crud_http(self):
+        saved = self._req("POST", "/api/config_profiles",
+                          {"name": "http-cfg", "settings": {"tp_size": 2}})
+        self.assertTrue(saved["ok"])
+        got = self._get("/api/config_profiles")
+        self.assertIn("http-cfg", [p["name"] for p in got["saved"]])
+        rm = self._req("DELETE", "/api/config_profiles", {"name": "http-cfg"})
+        self.assertTrue(rm["deleted"])
 
 
 if __name__ == "__main__":
