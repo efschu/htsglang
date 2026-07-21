@@ -463,6 +463,10 @@ def plan_from_payload(payload: dict) -> dict:
         return {"valid": False, "reasons": [str(e)]}
 
     out = _plan_to_dict(result, model_path)
+    out["measured"] = _measured_for_plan(payload, model_path, result)
+    if out["measured"] and out.get("roofline_estimate"):
+        # A MEASURED entry exists -> the roofline renders as secondary.
+        out["roofline_estimate"]["measured_available"] = True
     out["concurrency"] = concurrency
     out["include_vision"] = include_vision
     out["kv_by_concurrency"] = _kv_by_concurrency(
@@ -470,6 +474,71 @@ def plan_from_payload(payload: dict) -> dict:
         host_ram_mib, include_vision,
     )
     return out
+
+
+def _measured_for_plan(payload, model_path, result) -> Optional[dict]:
+    """Look up MEASURED perf/energy (S2.5 energy module) for this config and
+    return it for the UI, or None. Prefers the results.jsonl path in the
+    payload, falling back to the energy module's default store. Matches on
+    quant bits + tp_size (+ model basename when it lines up) so the measured
+    numbers surface next to (and preferred over) the roofline estimate.
+
+    kWh-per-1M-token is derived here (J/token / 3.6) — a pure render-time
+    conversion of the measured J/token, never stored as a measured input."""
+    from sglang.srt.planner.results_store import ResultsStore
+
+    try:
+        from sglang.srt.planner.energy import DEFAULT_RESULTS_STORE
+    except Exception:
+        DEFAULT_RESULTS_STORE = None
+    store_path = payload.get("results_store") or DEFAULT_RESULTS_STORE
+    if not store_path or not os.path.exists(store_path):
+        return None
+    try:
+        store = ResultsStore.load(store_path)
+    except Exception:
+        return None
+
+    tp_size = result.inputs.tp_size
+    base = os.path.basename(str(model_path).rstrip("/"))
+
+    def _norm(s):
+        return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+    nb = _norm(base)
+
+    def _kwh_1m(d):
+        return {int(k): (float(v) / 3.6) for k, v in (d or {}).items()}
+
+    workloads = []
+    for e in store.entries():
+        if not e.has_measured_perf():
+            continue
+        if e.tp_config and not e.tp_config.startswith(f"tp{tp_size}"):
+            continue
+        # Model match: normalized-alnum substring either way (served name vs
+        # checkpoint basename), e.g. "Qwen3.6-27B" <-> "Qwen3.6-27B-FP8".
+        ne = _norm(str(e.model).split("/")[-1])
+        if not (ne and (ne in nb or nb in ne)):
+            continue
+        workloads.append({
+            "workload": e.workload or "default",
+            "tp_config": e.tp_config,
+            "kv_cache_dtype": e.kv_cache_dtype,
+            "provenance": e.provenance,
+            "prefill_tok_s_by_bucket": e.prefill_tok_s_by_bucket or {},
+            "decode_tok_s_by_bucket": e.decode_tok_s_by_bucket or {},
+            "peak_prefill_tok_s": e.peak_prefill_tok_s,
+            "peak_decode_tok_s": e.peak_decode_tok_s,
+            "j_per_prefill_token_by_bucket": e.j_per_prefill_token_by_bucket or {},
+            "j_per_decode_token_by_bucket": e.j_per_decode_token_by_bucket or {},
+            "kwh_per_1m_prefill_by_bucket": _kwh_1m(e.j_per_prefill_token_by_bucket),
+            "kwh_per_1m_decode_by_bucket": _kwh_1m(e.j_per_decode_token_by_bucket),
+            "per_card_energy": e.per_card_energy,
+        })
+    if not workloads:
+        return None
+    return {"store_path": store_path, "workloads": workloads}
 
 
 #: Concurrency ladder shown so the user SEES the KV<->concurrency<->mamba
@@ -861,6 +930,19 @@ INDEX_HTML = r"""<!doctype html>
   th:first-child, td:first-child { text-align: left; }
   .bar { height: 9px; background: #232b35; border-radius: 4px; overflow: hidden; }
   .bar > span { display: block; height: 100%; background: #2f81f7; }
+  .pricebar { margin-top: .9rem; font-size: .78rem; color: #adbac7; }
+  .pricebar input { width: 5rem; padding: .2rem .4rem; background: #0d1117;
+                    color: #e6edf3; border: 1px solid #30363d; border-radius: 5px; }
+  .measured { margin-top: .9rem; background: #0f1a12; border: 1px solid #2ea043;
+              border-radius: 8px; padding: .7rem .8rem; }
+  .ms-title { font-weight: 700; color: #56d364; font-size: .9rem;
+              text-transform: uppercase; letter-spacing: .02em; }
+  .ms-note { font-size: .72rem; color: #9fb0a4; margin: .35rem 0 .5rem; }
+  .ms-wl { margin: .5rem 0; }
+  .ms-wl table { border-collapse: collapse; margin: .3rem 0; font-size: .72rem; }
+  .ms-wl th, .ms-wl td { border: 1px solid #21402b; padding: .18rem .5rem;
+                         text-align: right; }
+  .ms-wl th { color: #7f8b99; font-weight: 600; }
   .roofline { margin-top: .9rem; background: #191410; border: 1px dashed #7a5c14;
               border-radius: 8px; padding: .7rem .8rem; }
   .rf-title { font-weight: 700; color: #e3b341; font-size: .9rem;
@@ -1033,6 +1115,15 @@ INDEX_HTML = r"""<!doctype html>
     <div id="split"></div>
     <div id="cards"></div>
     <div id="advantage"></div>
+    <div id="pricebar" class="pricebar">
+      energy price
+      <input id="kwh_price" type="number" step="1" min="0" value="30"
+             oninput="if (window.__lastMeasured !== undefined) renderMeasured(window.__lastMeasured)">
+      <span class="muted">ct/kWh (&euro;-cent; currency-agnostic &mdash; just a
+      multiplier). Costs below are in <b>ct</b>. Applies to the measured cost
+      and, later, to HiCache kWh-saved (#147) and virtual-rig estimate (#148).</span>
+    </div>
+    <div id="measured"></div>
     <div id="roofline"></div>
     <div id="flags"></div>
     <div id="issue"></div>
@@ -1295,12 +1386,131 @@ function render(d) {
     av += '</div>';
   }
   $('advantage').innerHTML = av;
+  // MEASURED perf/energy (S2.5 energy module) — preferred over the roofline
+  renderMeasured(d.measured);
   // roofline throughput ESTIMATE — loudly labelled rough ballpark, NOT measured
   renderRoofline(d.roofline_estimate);
   // launch flags
   $('flags').innerHTML = (d.launch_flags && d.launch_flags.length)
     ? '<p class="muted">launch flags (copy into your command):</p><pre>'
       + d.launch_flags.map(esc).join('\n') + '</pre>' : '';
+}
+
+// -- SHARED energy->money layer (ct/kWh) --------------------------------------
+// Reused by the measured cost below AND (later) the HiCache kWh-saved band
+// (#147 -> money saved) and the virtual-rig estimate (#148 -> estimated cost).
+// Keep the conversion here, not buried per-metric, so those hooks plug in.
+function getKwhPriceCt() {  // ct per kWh, default 30
+  const el = $('kwh_price');
+  const v = el ? parseFloat(el.value) : NaN;
+  return isFinite(v) && v >= 0 ? v : 30;
+}
+function kwhToCt(kwh, priceCt) {          // kWh * (ct/kWh) -> ct
+  if (kwh == null || priceCt == null) return null;
+  return kwh * priceCt;
+}
+function jPerTokToCtPer1M(jPerTok, priceCt) {  // J/token -> ct per 1M tokens
+  if (jPerTok == null) return null;
+  return kwhToCt(jPerTok / 3.6, priceCt);      // kWh/1M = J/tok / 3.6
+}
+// Hook for #147 (kWh-saved is a [lo,hi] band): band of kWh -> band of ct.
+function kwhBandToCt(band, priceCt) {
+  if (!band) return null;
+  return band.map(x => kwhToCt(x, priceCt));
+}
+
+function renderPerCard(w, bs, priceCt) {
+  const pce = w.per_card_energy;
+  if (!pce || !pce.gpu_names || !pce.gpu_names.length) return '';
+  const f0 = x => (x==null ? '—' : Math.round(x).toLocaleString());
+  const f2 = x => (x==null ? '—' : Number(x).toFixed(2));
+  const f3 = x => (x==null ? '—' : Number(x).toFixed(3));
+  const names = pce.gpu_names;
+  const share = pce.compute_share || [];
+  // Pick the largest bucket for the per-card view (steady-state, amortized).
+  const b = bs[bs.length - 1];
+  const decW = (pce.decode_watts_by_bucket||{})[b] || [];
+  const decJ = (pce.decode_j_per_token_by_bucket||{})[b] || [];
+  const totW = decW.reduce((a,x)=>a+(x||0), 0);
+  let h = '<p class="muted" style="margin:.4rem 0 .1rem">per-card decode energy '
+    + '@ bs=' + b + ' &mdash; each card\'s OWN measured NVML power (not total/N). '
+    + 'Compute-share is from the uneven-TP ratio; power-share is measured &mdash; '
+    + 'the divergence is the honest efficiency picture.</p>';
+  const fct = x => (x==null ? '—' : Number(x).toFixed(3) + ' ct');
+  h += '<table><tr><th>card</th><th>compute-share</th><th>power-share</th>'
+    + '<th>avg W</th><th>J/dec-tok</th><th>kWh/1M</th><th>ct/1M</th>'
+    + '<th>J/tok &divide; compute-share</th></tr>';
+  for (let i = 0; i < names.length; i++) {
+    const sh = share[i];
+    const pw = totW > 0 ? (decW[i]||0)/totW : null;
+    const perShare = (sh && sh>0 && decJ[i]!=null) ? decJ[i]/sh : null;
+    h += '<tr><td style="text-align:left">' + esc(names[i]) + '</td><td>'
+      + (sh!=null ? Math.round(sh*100)+'%' : '—') + '</td><td>'
+      + (pw!=null ? Math.round(pw*100)+'%' : '—') + '</td><td>' + f0(decW[i])
+      + '</td><td>' + f3(decJ[i]) + '</td><td>' + f2(decJ[i]!=null?decJ[i]/3.6:null)
+      + '</td><td>' + fct(jPerTokToCtPer1M(decJ[i], priceCt))
+      + '</td><td>' + f3(perShare) + '</td></tr>';
+  }
+  const totJ = decJ.reduce((a,x)=>a+(x||0),0);
+  h += '<tr><td style="text-align:left"><b>TOTAL (rig)</b></td><td>100%</td>'
+    + '<td>100%</td><td>' + f0(totW) + '</td><td>' + f3(totJ) + '</td><td>'
+    + f2(totJ/3.6) + '</td><td>' + fct(jPerTokToCtPer1M(totJ, priceCt))
+    + '</td><td>&mdash;</td></tr>';
+  h += '</table>';
+  if (pce.source)
+    h += '<p class="muted" style="font-size:.62rem">' + esc(pce.source) + '</p>';
+  return h;
+}
+
+function renderMeasured(mz) {
+  window.__lastMeasured = mz;  // cached so a price edit re-renders in place
+  if (!mz || !mz.workloads || !mz.workloads.length) {
+    $('measured').innerHTML = ''; return;
+  }
+  const priceCt = getKwhPriceCt();
+  const f1 = x => (x==null ? '—' : Math.round(x).toLocaleString());
+  const f2 = x => (x==null ? '—' : Number(x).toFixed(2));
+  const fct = x => (x==null ? '—' : Number(x).toFixed(3) + ' ct');
+  const buckets = new Set();
+  for (const w of mz.workloads) {
+    for (const k of Object.keys(w.decode_tok_s_by_bucket||{})) buckets.add(+k);
+  }
+  const bs = [...buckets].sort((a,b)=>a-b);
+  const f3 = x => (x==null ? '—' : Number(x).toFixed(3));
+  let h = '<div class="measured"><div class="ms-title">MEASURED throughput '
+    + '&amp; energy &mdash; real run, CUDA graphs ON (S2.5 energy module)</div>'
+    + '<p class="ms-note">MEASURED (whole-rig NVML board power integrated over '
+    + 'the prefill vs decode window, temp 0). OVERRIDES the roofline below. '
+    + 'kWh/1M&nbsp;tok = J/token &divide; 3.6; cost = kWh &times; ' + priceCt
+    + '&nbsp;ct/kWh. <b>Energy = GPU (NVML) power only, summed across cards '
+    + '&mdash; EXCLUDES CPU/RAM/PSU losses; NOT wall-socket power.</b></p>';
+  for (const w of mz.workloads) {
+    h += '<div class="ms-wl"><b>workload: ' + esc(w.workload) + '</b> '
+      + '<span class="muted">' + esc(w.tp_config||'') + ' &middot; kv '
+      + esc(w.kv_cache_dtype||'') + '</span>';
+    h += '<table><tr><th>bs</th><th>prefill tok/s</th><th>J/prefill-tok</th>'
+      + '<th>kWh/1M</th><th>ct/1M</th><th>decode tok/s</th><th>J/decode-tok</th>'
+      + '<th>kWh/1M</th><th>ct/1M</th></tr>';
+    for (const b of bs) {
+      const pt = (w.prefill_tok_s_by_bucket||{})[b];
+      const dt = (w.decode_tok_s_by_bucket||{})[b];
+      const jp = (w.j_per_prefill_token_by_bucket||{})[b];
+      const jd = (w.j_per_decode_token_by_bucket||{})[b];
+      h += '<tr><td>' + b + '</td><td>' + f1(pt) + '</td><td>' + f3(jp)
+        + '</td><td>' + f2((w.kwh_per_1m_prefill_by_bucket||{})[b]) + '</td><td>'
+        + fct(jPerTokToCtPer1M(jp, priceCt)) + '</td><td>' + f1(dt) + '</td><td>'
+        + f3(jd) + '</td><td>' + f2((w.kwh_per_1m_decode_by_bucket||{})[b])
+        + '</td><td>' + fct(jPerTokToCtPer1M(jd, priceCt)) + '</td></tr>';
+    }
+    h += '</table>';
+    h += '<p class="muted">peak prefill <b>' + f1(w.peak_prefill_tok_s)
+      + '</b> tok/s &middot; peak decode <b>' + f1(w.peak_decode_tok_s)
+      + '</b> tok/s</p>';
+    h += renderPerCard(w, bs, priceCt);
+    h += '</div>';
+  }
+  h += '<p class="muted">source: ' + esc(mz.store_path) + '</p></div>';
+  $('measured').innerHTML = h;
 }
 
 function renderRoofline(rf) {
