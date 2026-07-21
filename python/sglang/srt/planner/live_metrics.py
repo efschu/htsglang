@@ -122,6 +122,13 @@ class GpuLive:
     """One physical card's live telemetry sample. Keyed by ``uuid`` because
     NVML's enumeration order (PCI bus) diverges from torch.cuda's (FASTEST_FIRST)
     on mixed rigs -- the client maps a rank onto a card by UUID, never by index.
+
+    ``cuda_index`` is the same card's CUDA-order index (the space
+    ``--rank-gpu-id`` / ``--base-gpu-id`` / CUDA_VISIBLE_DEVICES use),
+    bridged via planner.device_map so the UI can label both spaces and key
+    rank->card attribution correctly; ``cuda_index_source`` is "torch"
+    (exact UUID bridge) or "heuristic" (FASTEST_FIRST emulation -- the UI
+    should say so), or None when unbridged.
     """
 
     nvml_index: int
@@ -137,6 +144,8 @@ class GpuLive:
     mem_used_mib: int
     mem_total_mib: int
     mem_used_frac: float           # used / total, 0.0-1.0
+    cuda_index: Optional[int] = None
+    cuda_index_source: Optional[str] = None
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -193,6 +202,7 @@ def read_gpu_live(nvml=None) -> List[GpuLive]:
                 mem_total_mib=total_mib,
                 mem_used_frac=(used_mib / total_mib if total_mib else 0.0),
             ))
+        _annotate_cuda_indices(out, nvml=nvml, injected=not own)
         return out
     finally:
         if own:
@@ -200,6 +210,30 @@ def read_gpu_live(nvml=None) -> List[GpuLive]:
                 nvml.nvmlShutdown()
             except Exception:
                 pass
+
+
+def _annotate_cuda_indices(cards: List[GpuLive], nvml, injected: bool) -> None:
+    """Fill each card's ``cuda_index`` via the device_map bridge (by UUID,
+    NVML index as fallback). An injected test ``nvml`` builds a fresh map
+    from that same fake rig (its UUIDs will not match the real torch
+    enumeration, so it deterministically exercises the documented
+    FASTEST_FIRST-emulation path); the real path uses the cached host map.
+    Best-effort: cards stay unbridged (None) on any failure."""
+    try:
+        from sglang.srt.planner import device_map as _dm
+
+        dm = _dm.build_device_map(nvml=nvml) if injected else _dm.device_map()
+    except Exception:
+        return
+    if not dm.entries:
+        return
+    n2c = dm.nvml_to_cuda()
+    for g in cards:
+        cu = dm.cuda_for_uuid(g.uuid)
+        if cu is None:
+            cu = n2c.get(g.nvml_index)
+        g.cuda_index = cu
+        g.cuda_index_source = dm.source if cu is not None else None
 
 
 # ===========================================================================

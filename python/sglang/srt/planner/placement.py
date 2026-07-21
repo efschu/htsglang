@@ -123,6 +123,15 @@ class PlacementFlags:
     #: Optional physical-card inventory {gpu_index: total_mib} (or name) so the
     #: per-card breakdown can show the card name + a physical-fit check. Purely
     #: informational; never required.
+    #:
+    #: INDEX SPACE: keys are CUDA-ORDER indices -- the same space as
+    #: ``rank_gpu_id`` (whose values land in CUDA_VISIBLE_DEVICES) and as the
+    #: default identity map ``rank i -> gpu i``. NVML/nvidia-smi enumeration
+    #: order DIVERGES from CUDA order on mixed rigs; callers must translate
+    #: NVML-sampled inventories through planner.device_map before keying
+    #: these dicts (an NVML-keyed inventory attributes ranks to the WRONG
+    #: cards -- on the reference box rank 0 = cuda:0 is the 32 GiB 5090, not
+    #: the 20 GiB 3080 that sits at nvml:0).
     card_total_mib: Optional[Dict[int, int]] = None
     card_name: Optional[Dict[int, str]] = None
 

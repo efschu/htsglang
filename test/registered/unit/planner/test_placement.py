@@ -309,6 +309,31 @@ class TestPlacementCards(CustomTestCase):
         # 2 x 15000 = 30000 <= 32760 -> no physical overcommit on the 5090.
         self.assertFalse(shared_card.physical_overcommit)
 
+    def test_rank_to_card_attribution_is_cuda_space(self):
+        # THE reference-box scenario for the landing view: rank_gpu_id 0,1,2
+        # is CUDA-space (rank 0 = cuda:0 = the 32607 MiB 5090), so the card
+        # inventory MUST be keyed by cuda index too -- cuda:0 -> 5090. An
+        # NVML-keyed inventory ({0: 3080, 1: 5090, 2: 3080}) would attribute
+        # rank 0 to a 20 GiB 3080 (the dashboard bug this pins down).
+        cfg = _cfg()
+        p = compute_placement_struct(
+            cfg,
+            PlacementFlags(
+                tp_size=3,
+                rank_gpu_id=[0, 1, 2],
+                rank_gpu_memory_mib=[15000, 15000, 15000],
+                card_total_mib={0: 32607, 1: 20480, 2: 20480},
+                card_name={0: "RTX 5090", 1: "RTX 3080", 2: "RTX 3080"},
+            ),
+        )
+        cards = {c.gpu_index: c for c in p.cards}
+        # rank 0 lands on gpu_index 0, which the cuda-keyed inventory
+        # correctly names as the 32607 MiB 5090.
+        self.assertEqual(cards[0].ranks, [0])
+        self.assertEqual(cards[0].card_total_mib, 32607)
+        self.assertEqual(cards[0].card_name, "RTX 5090")
+        self.assertEqual(cards[1].card_total_mib, 20480)
+
     def test_physical_overcommit_flagged(self):
         cfg = _cfg()
         p = compute_placement_struct(

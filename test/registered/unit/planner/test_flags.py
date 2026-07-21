@@ -365,6 +365,26 @@ class TestProfiles(CustomTestCase):
         # duplicate physical id => co-location.
         rg = colo.settings["rank_gpu_id"]
         self.assertLess(len(set(rg)), len(rg))
+        # rank_gpu_id is CUDA-space: the duplicated entry is the largest
+        # card's CUDA index. Without an explicit bridge the FASTEST_FIRST
+        # emulation puts the 5090 at cuda:0 (it sits at LIST position 1 in
+        # the NVML-ordered _HETERO_GPUS -- the old bug duplicated that 1).
+        self.assertEqual(rg, [0, 1, 2, 0])
+
+    def test_colocation_duplicates_bridged_cuda_index(self):
+        # Explicitly bridged detect payload: the co-located entry must be
+        # the largest card's cuda_index, wherever it sits in the list.
+        rig = [
+            {"name": "RTX 3080", "total_mib": 20480, "cuda_index": 0},
+            {"name": "RTX 3080", "total_mib": 20480, "cuda_index": 1},
+            {"name": "RTX 5090", "total_mib": 32607, "cuda_index": 2},
+        ]
+        profs = {p.kind: p for p in flags.profiles(_MOE_CFG, rig)}
+        rg = profs["colocation"].settings["rank_gpu_id"]
+        self.assertEqual(rg, [0, 1, 2, 2])
+        self.assertTrue(
+            any("cuda:2" in i for i in profs["colocation"].info)
+        )
 
     def test_homogeneous_divisible_gets_only_stock(self):
         # 2 identical cards, kv_heads divisible by 2 -> stock even TP is right;
@@ -695,21 +715,57 @@ class TestReferenceProfile(CustomTestCase):
                 prof.info,
             )
 
-    def test_reference_calibration_needs_exact_rig_order(self):
-        # the measured vectors are per-RANK (rank i on GPU i): a rig that
-        # enumerates 3080-first must NOT silently receive them.
-        rig = [_REF_RIG[1], _REF_RIG[2], _REF_RIG[0]]
-        with tempfile.TemporaryDirectory() as d:
-            exe, _ = _fake_venv(d)
-            profs = {
-                p.kind: p
-                for p in flags.profiles(_REF_CFG, rig, python_exe=exe)
-            }
-            prof = profs["uneven-max-perf"]
-            self.assertIsNone(prof.settings["SGLANG_UNEVEN_TOKEN_VECTOR"])
-            self.assertTrue(
-                any("NO measured calibration" in i for i in prof.info)
-            )
+    def test_reference_calibration_gate_is_order_insensitive(self):
+        # The measured vectors are per-RANK in CUDA order (rank i = cuda:i;
+        # cuda:0 = the 5090 under FASTEST_FIRST), NOT in inventory-list
+        # order: the NVML/detect listing order has no bearing on rank order,
+        # so ANY permutation of the one-5090 + two-3080 rig is the same
+        # physical box and must receive the same rank-space vectors.
+        import itertools
+
+        for perm in itertools.permutations(_REF_RIG):
+            with tempfile.TemporaryDirectory() as d:
+                exe, _ = _fake_venv(d)
+                profs = {
+                    p.kind: p
+                    for p in flags.profiles(
+                        _REF_CFG, list(perm), python_exe=exe
+                    )
+                }
+                s = profs["uneven-max-perf"].settings
+                self.assertEqual(
+                    s["SGLANG_UNEVEN_TOKEN_VECTOR"], [33, 13, 18], perm
+                )
+                self.assertEqual(
+                    s["rank_auto_reserve_mib"], "3000,2200,2200", perm
+                )
+
+    def test_reference_calibration_needs_exact_name_multiset(self):
+        # A DIFFERENT rig (wrong multiset: card swapped, card missing, card
+        # added) is not the measured box and must NOT receive the vectors.
+        g5090 = _REF_RIG[1]
+        g3080 = _REF_RIG[0]
+        wrong_rigs = [
+            [g5090, g5090, g3080],          # two 5090s
+            [g3080, g3080, g3080],          # no 5090
+            [g3080, g5090],                 # card missing
+            _REF_RIG + [g3080],             # extra card
+        ]
+        for rig in wrong_rigs:
+            with tempfile.TemporaryDirectory() as d:
+                exe, _ = _fake_venv(d)
+                profs = {
+                    p.kind: p
+                    for p in flags.profiles(_REF_CFG, rig, python_exe=exe)
+                }
+                prof = profs["uneven-max-perf"]
+                self.assertIsNone(
+                    prof.settings["SGLANG_UNEVEN_TOKEN_VECTOR"], rig
+                )
+                self.assertTrue(
+                    any("NO measured calibration" in i for i in prof.info),
+                    rig,
+                )
 
     def test_sm86_forces_e5m2(self):
         # 3080s in the rig -> e5m2; an all-modern rig may use e4m3.
@@ -976,12 +1032,35 @@ if __name__ == "__main__":
 class TestSingleGpuPick(unittest.TestCase):
     """Single-gpu preset GPU selection: largest VRAM wins, VRAM tie -> higher
     FLOPs, full tie -> first index. Default only -- the UI offers a selector;
-    the pin uses the stock --base-gpu-id flag."""
+    the pin uses the stock --base-gpu-id flag, which is a CUDA-ORDER index
+    (FASTEST_FIRST -- the space CUDA_VISIBLE_DEVICES uses), NOT the position
+    in the NVML-ordered inventory list: on the reference box the 5090 is
+    list position 1 (nvml:1) but cuda:0."""
 
-    def test_hetero_picks_largest_vram(self):
-        idx, why = flags._pick_single_gpu(_HETERO_GPUS)
-        self.assertEqual(idx, 1)  # the 5090 sits at index 1 on this box
+    def test_hetero_picks_largest_vram_and_emits_cuda_index(self):
+        pos, cuda_idx, why = flags._pick_single_gpu(_HETERO_GPUS)
+        self.assertEqual(pos, 1)  # the 5090 sits at LIST position 1 (NVML)
+        # no explicit cuda_index on the dicts -> FASTEST_FIRST emulation:
+        # the 5090 is the fastest card -> cuda:0, and the why says heuristic.
+        self.assertEqual(cuda_idx, 0)
         self.assertIn("5090", why)
+        self.assertIn("cuda:0", why)
+        self.assertIn("heuristic", why)
+
+    def test_bridged_cuda_index_wins_over_emulation(self):
+        # The detect_hardware payload shape of THE reference box: NVML order
+        # [3080, 5090, 3080] with the torch/UUID-bridged cuda indices
+        # [1, 0, 2]. The pick must emit the 5090's CUDA index 0, not its
+        # NVML index / list position 1.
+        rig = [
+            {"name": "RTX 3080", "total_mib": 20480, "cuda_index": 1},
+            {"name": "RTX 5090", "total_mib": 32607, "cuda_index": 0},
+            {"name": "RTX 3080", "total_mib": 20480, "cuda_index": 2},
+        ]
+        pos, cuda_idx, why = flags._pick_single_gpu(rig)
+        self.assertEqual(pos, 1)
+        self.assertEqual(cuda_idx, 0)
+        self.assertNotIn("heuristic", why)  # bridged, not emulated
 
     def test_vram_tie_broken_by_flops(self):
         g = [
@@ -995,18 +1074,36 @@ class TestSingleGpuPick(unittest.TestCase):
             {"name": "RTX 3080", "total_mib": 20480},
             {"name": "RTX 3080", "total_mib": 20480},
         ]
-        self.assertEqual(flags._pick_single_gpu(g)[0], 0)
+        pos, cuda_idx, _why = flags._pick_single_gpu(g)
+        self.assertEqual(pos, 0)
+        self.assertEqual(cuda_idx, 0)  # identical cards: emulation keeps order
 
-    def test_single_preset_pins_base_gpu_id_and_sizes_that_card(self):
+    def test_single_preset_pin_is_cuda_space_and_sizes_that_card(self):
+        # Box scenario: the pick names the 5090 -> base_gpu_id is its CUDA
+        # index 0 (i.e. NO explicit pin needed; the stock default already
+        # addresses cuda:0), NOT the old NVML-position pin of 1.
         prof = [
             p for p in flags.profiles(_REF_CFG, _HETERO_GPUS)
             if p.kind == "single"
         ][0]
-        self.assertEqual(prof.settings.get("base_gpu_id"), 1)
+        self.assertIn(prof.settings.get("base_gpu_id"), (None, 0))
         self.assertTrue(any("GPU pick" in n for n in prof.info))
+        self.assertTrue(any("5090" in n for n in prof.info))
+
+    def test_single_preset_pins_nonzero_cuda_index(self):
+        # A rig whose largest card is NOT cuda:0 (explicitly bridged): the
+        # pin must be its cuda_index, not its list position.
+        rig = [
+            {"name": "RTX 5090", "total_mib": 32607, "cuda_index": 2},
+            {"name": "RTX 3080", "total_mib": 20480, "cuda_index": 0},
+            {"name": "RTX 3080", "total_mib": 20480, "cuda_index": 1},
+        ]
+        prof = [p for p in flags.profiles(_REF_CFG, rig)
+                if p.kind == "single"][0]
+        self.assertEqual(prof.settings.get("base_gpu_id"), 2)
 
     def test_index_zero_pick_needs_no_pin(self):
-        # Homogeneous rig: pick is index 0 -> base_gpu_id stays at the stock
+        # Homogeneous rig: pick is cuda:0 -> base_gpu_id stays at the stock
         # default (0 / absent), no explicit pin required.
         g = [
             {"name": "RTX 3080", "total_mib": 20480},
