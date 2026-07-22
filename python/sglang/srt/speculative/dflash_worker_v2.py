@@ -285,6 +285,93 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._spec_solo_active:
             self._solo_setup_vocab_broadcast()
 
+        # === DFLASH AUDIT INSTRUMENTATION (temporary, env-gated, remove-safe) ===
+        # SGLANG_DFLASH_AUDIT_DUMP=<path>: per verify round append one JSON line
+        #   (rank 0 only) with accept lens, per-position match bits, and the
+        #   drafted block -- powers per-position accept histograms and draft
+        #   block identity A/B across topologies.
+        # SGLANG_DFLASH_PHASE_TIMING=<path>: cuda-event phase decomposition of
+        #   each round (per rank file), flushed every 200 rounds.
+        # Both default OFF; the default path only pays two attribute reads.
+        import os as _os
+
+        _dump = _os.environ.get("SGLANG_DFLASH_AUDIT_DUMP")
+        self._audit_dump_path = (
+            f"{_dump}.rank{self.tp_rank}" if _dump and self.tp_rank == 0 else None
+        )
+        _timing = _os.environ.get("SGLANG_DFLASH_PHASE_TIMING")
+        self._audit_timing_path = f"{_timing}.rank{self.tp_rank}" if _timing else None
+        self._audit_round_events: list = []
+        self._audit_pending_rounds: list = []
+        self._audit_timing_flush_every = 200
+        # === END DFLASH AUDIT INSTRUMENTATION ===
+
+    # === DFLASH AUDIT INSTRUMENTATION (temporary, env-gated, remove-safe) ===
+    def _audit_mark(self, label: str) -> None:
+        if self._audit_timing_path is None:
+            return
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        self._audit_round_events.append((label, ev))
+
+    def _audit_round_end(self) -> None:
+        if self._audit_timing_path is None or not self._audit_round_events:
+            return
+        self._audit_pending_rounds.append(self._audit_round_events)
+        self._audit_round_events = []
+        if len(self._audit_pending_rounds) < self._audit_timing_flush_every:
+            return
+        torch.cuda.synchronize()
+        sums: dict = {}
+        n = 0
+        for round_events in self._audit_pending_rounds:
+            prev_label, prev_ev = round_events[0]
+            for label, ev in round_events[1:]:
+                key = f"{prev_label}->{label}"
+                sums[key] = sums.get(key, 0.0) + prev_ev.elapsed_time(ev)
+                prev_label, prev_ev = label, ev
+            total_key = "TOTAL"
+            sums[total_key] = sums.get(total_key, 0.0) + round_events[0][
+                1
+            ].elapsed_time(round_events[-1][1])
+            n += 1
+        self._audit_pending_rounds = []
+        import json as _json
+
+        with open(self._audit_timing_path, "a") as f:
+            f.write(
+                _json.dumps({"rounds": n, "ms_avg": {k: v / n for k, v in sums.items()}})
+                + "\n"
+            )
+
+    def _audit_dump_round(
+        self,
+        *,
+        candidates: torch.Tensor,
+        target_predict: Optional[torch.Tensor],
+        commit_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+    ) -> None:
+        if self._audit_dump_path is None:
+            return
+        import json as _json
+        import time as _time
+
+        rec = {
+            "ts": _time.monotonic(),
+            "prefix_lens": prefix_lens.tolist(),
+            "commit_lens": commit_lens.tolist(),
+            "draft": candidates.tolist(),
+        }
+        if target_predict is not None:
+            matches = (candidates[:, 1:] == target_predict[:, :-1]).to(torch.int32)
+            rec["match_bits"] = matches.tolist()
+            rec["target"] = target_predict.tolist()
+        with open(self._audit_dump_path, "a") as f:
+            f.write(_json.dumps(rec) + "\n")
+
+    # === END DFLASH AUDIT INSTRUMENTATION ===
+
     def _solo_setup_vocab_broadcast(self) -> None:
         """Solo: record the geometry the per-round hidden-state broadcast needs
         and give shadow ranks their stub draft-runner surface.
@@ -1547,6 +1634,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         block_size = int(self.block_size)
+        self._audit_mark("t0")  # DFLASH AUDIT (env-gated)
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
@@ -1615,6 +1703,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
+        self._audit_mark("prep")  # DFLASH AUDIT (env-gated)
         # positions + verify cache locs are pure functions of batch state and
         # are needed on EVERY rank for the target verify below (identical bytes
         # on all ranks), so compute them outside the host-only draft region.
@@ -1642,19 +1731,24 @@ class DFlashWorkerV2(BaseSpecWorker):
             #   4. the per-round draft-block broadcast, which remains the
             #      single source of truth for the proposed token ids.
             embed_module(block_ids)
+            self._audit_mark("embed")  # DFLASH AUDIT (env-gated)
             recv_hs = self._solo_broadcast_draft_hidden(num_sample_tokens, None)
+            self._audit_mark("hs_bcast")  # DFLASH AUDIT (env-gated)
             self._greedy_sample_from_vocab_parallel_head(
                 hidden_states=recv_hs,
                 lm_head=lm_head,
             )
+            self._audit_mark("greedy")  # DFLASH AUDIT (env-gated)
             # Column 0 (the seeded bonus) is already rank-consistent.
             self._solo_broadcast_draft_block(draft_tokens)
+            self._audit_mark("blk_bcast")  # DFLASH AUDIT (env-gated)
         else:
             # HOST / split path: draft-block forward + greedy sampling.
             # Under solo this is the same vocab-parallel embedding call the
             # split path makes: the shadows join its all_reduce (see above),
             # so no unsharded embed table is needed on the host.
             noise_embedding = embed_module(block_ids)
+            self._audit_mark("embed")  # DFLASH AUDIT (env-gated)
             input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
             seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
@@ -1731,6 +1825,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             with torch.inference_mode():
                 draft_out = self.draft_model_runner.forward(forward_batch)
+            self._audit_mark("draft_fwd")  # DFLASH AUDIT (env-gated)
             draft_logits_output = draft_out.logits_output
 
             if (
@@ -1761,16 +1856,19 @@ class DFlashWorkerV2(BaseSpecWorker):
                     sample_hs = self._solo_broadcast_draft_hidden(
                         num_sample_tokens, sample_hs
                     )
+                self._audit_mark("hs_bcast")  # DFLASH AUDIT (env-gated)
                 draft_next = self._greedy_sample_from_vocab_parallel_head(
                     hidden_states=sample_hs,
                     lm_head=lm_head,
                 ).view(bs, int(self.block_size) - 1)
+            self._audit_mark("greedy")  # DFLASH AUDIT (env-gated)
 
             draft_tokens[:, 1:].copy_(draft_next)
             if self._spec_solo_active:
                 # Solo host: publish the drafted block to the shadow ranks
                 # (one broadcast per round, eager, never inside capture).
                 self._solo_broadcast_draft_block(draft_tokens)
+            self._audit_mark("blk_bcast")  # DFLASH AUDIT (env-gated)
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
@@ -1807,6 +1905,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
+        self._audit_mark("verify_prep")  # DFLASH AUDIT (env-gated)
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
@@ -1816,6 +1915,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+        self._audit_mark("verify")  # DFLASH AUDIT (env-gated)
 
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
@@ -1826,6 +1926,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         candidates = draft_tokens
         new_seq_lens = None
+        target_predict = None  # DFLASH AUDIT (env-gated dump below)
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
@@ -1909,6 +2010,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
+        # === DFLASH AUDIT (env-gated) ===
+        self._audit_mark("accept")
+        if self._audit_dump_path is not None:
+            self._audit_dump_round(
+                candidates=candidates,
+                target_predict=target_predict,
+                commit_lens=commit_lens,
+                prefix_lens=prefix_lens,
+            )
+        # === END DFLASH AUDIT ===
+
         if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
@@ -1943,6 +2055,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
+
+        # === DFLASH AUDIT (env-gated) ===
+        self._audit_mark("kv_commit")
+        self._audit_round_end()
+        # === END DFLASH AUDIT ===
 
         next_draft_input = self._make_next_draft_input_decode(
             bonus_tokens=bonus,
