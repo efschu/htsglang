@@ -2287,7 +2287,12 @@ class ServerArgs:
             "EMA[accepted tokens/verify round] / EMA[round seconds] and "
             "switches to the argmax at round boundaries (rank 0 decides, "
             "the rung id is broadcast; dwell/deadzone/burn-in/probing guard "
-            "against flapping -- tunables via SGLANG_CROSS_BANDIT_*).",
+            "against flapping -- tunables via SGLANG_CROSS_BANDIT_*). "
+            "'policy': deterministic context-threshold drafter policy -- the "
+            "active rung is a pure lookup of the batch context in the "
+            "ordered stage table from --speculative-drafter-policy (no "
+            "bandit, no probing); the ctx gate stays active as a safety "
+            "filter.",
         ),
     ] = None
     speculative_cross_algorithm_ctx_gate: A[
@@ -2312,9 +2317,34 @@ class ServerArgs:
             "behavior). Requests near the threshold whose remaining "
             "max_new_tokens budget can cross it are pre-empted at decode "
             "start (nearness via SGLANG_CROSS_CTX_GATE_NEAR_FRAC, default "
-            "0.8). Ignored outside force=auto.",
+            "0.8). Ignored outside force=auto|policy (under force=policy it "
+            "acts as a safety filter on top of the policy table).",
         ),
     ] = "auto"
+    speculative_drafter_policy: A[
+        Optional[str],
+        Arg(
+            help="Deterministic drafter-policy table for "
+            "--speculative-cross-algorithm-force policy: an ordered, "
+            "comma-separated list of 'start_ctx:family:value' stages, e.g. "
+            "'0:dflash:16,4096:nextn:3' (arbitrary stage count; family "
+            "nextn|dflash; nextn value = k, dflash value = block size). The "
+            "active rung is the stage covering the batch's max context -- "
+            "a pure rank-uniform lookup at round boundaries, no bandit, no "
+            "probing. Stages must reference configured arms (NEXTN k from "
+            "the adaptive-config candidate set + the boot k; the resident "
+            "DFLASH block size), start contexts strictly ascending, first "
+            "stage at 0. 'auto'/unset: two derived stages -- DFLASH from "
+            "ctx 0, the boot NEXTN k from the drafter's TRAINING context "
+            "(2 x its sliding window, factor via "
+            "SGLANG_CROSS_POLICY_CTX_FACTOR; deliberately BELOW the ctx "
+            "gate's 4 x window: the gate is an eligibility bound for the "
+            "self-correcting bandit, the policy forces the drafter with no "
+            "corrective). The ctx gate stays active as a safety filter: a "
+            "gate-ineligible DFLASH stage falls back to the next stage "
+            "above.",
+        ),
+    ] = None
     speculative_adaptive_graph_memory: A[
         str,
         Arg(

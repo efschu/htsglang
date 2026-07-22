@@ -125,12 +125,13 @@ def cross_schedule_interval(server_args) -> Optional[int]:
     return int(shapes["schedule_interval"])
 
 
-# The per-batch-switching modes (stage 3 schedule + stage 4 auto). Everything
-# these modes share -- dual hidden capture, dual prefill, per-round
-# warm-keeping, the scheduler pre-decode switch hook, DFLASH request
-# validation for every request -- gates on membership here; the static
-# force=nextn|dflash modes keep their stage-2 behavior untouched.
-SWITCHING_MODES = ("schedule", "auto")
+# The per-batch-switching modes (stage 3 schedule + stage 4 auto + the
+# deterministic drafter policy). Everything these modes share -- dual hidden
+# capture, dual prefill, per-round warm-keeping, the scheduler pre-decode
+# switch hook, DFLASH request validation for every request -- gates on
+# membership here; the static force=nextn|dflash modes keep their stage-2
+# behavior untouched.
+SWITCHING_MODES = ("schedule", "auto", "policy")
 
 
 def cross_switching_active(server_args) -> bool:
@@ -143,7 +144,7 @@ def cross_switching_active(server_args) -> bool:
 
 def parse_cross_force(force: Optional[str]) -> tuple[str, Optional[int]]:
     """Parse --speculative-cross-algorithm-force into (mode, interval)."""
-    if force in ("nextn", "dflash", "auto"):
+    if force in ("nextn", "dflash", "auto", "policy"):
         return force, None
     if isinstance(force, str) and force.startswith("schedule:"):
         try:
@@ -158,8 +159,9 @@ def parse_cross_force(force: Optional[str]) -> tuple[str, Optional[int]]:
         return "schedule", interval
     _fail(
         "--speculative-cross-algorithm-force must be 'nextn', 'dflash', "
-        "'schedule:N' (switch every N verify rounds), or 'auto' (stage-4 "
-        f"acceptance-driven bandit); got {force!r}."
+        "'schedule:N' (switch every N verify rounds), 'auto' (stage-4 "
+        "acceptance-driven bandit), or 'policy' (deterministic ctx-threshold "
+        f"drafter policy, see --speculative-drafter-policy); got {force!r}."
     )
 
 
@@ -211,6 +213,26 @@ def parse_ctx_gate_value(raw: Optional[str]):
     return tokens
 
 
+def _read_drafter_ctx_fields(
+    draft_model_path: str,
+) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    """Read (max_position_embeddings, effective sliding_window, error) from
+    the drafter's config.json. ``sliding_window`` is None when SWA is
+    declared disabled. Shared by the ctx-gate and drafter-policy
+    derivations."""
+    cfg_path = os.path.join(str(draft_model_path), "config.json")
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as e:
+        return None, None, f"drafter config unreadable ({cfg_path}: {e})"
+    mpe = cfg.get("max_position_embeddings")
+    sliding = cfg.get("sliding_window")
+    if cfg.get("use_sliding_window") is False:
+        sliding = None
+    return mpe, sliding, None
+
+
 def derive_ctx_gate_threshold(
     draft_model_path: str,
 ) -> Tuple[Optional[int], str]:
@@ -240,16 +262,9 @@ def derive_ctx_gate_threshold(
 
     The factor is configurable via SGLANG_CROSS_CTX_GATE_FACTOR.
     """
-    cfg_path = os.path.join(str(draft_model_path), "config.json")
-    try:
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-    except (OSError, ValueError) as e:
-        return None, f"drafter config unreadable ({cfg_path}: {e}); gate disabled"
-    mpe = cfg.get("max_position_embeddings")
-    sliding = cfg.get("sliding_window")
-    if cfg.get("use_sliding_window") is False:
-        sliding = None
+    mpe, sliding, err = _read_drafter_ctx_fields(draft_model_path)
+    if err is not None:
+        return None, f"{err}; gate disabled"
     factor = float(
         os.environ.get(CTX_GATE_FACTOR_ENV, DEFAULT_CTX_GATE_FACTOR)
     )
@@ -265,8 +280,8 @@ def derive_ctx_gate_threshold(
     if mpe:
         return int(mpe), "max_position_embeddings (no sliding window declared)"
     return None, (
-        f"drafter config {cfg_path} declares neither sliding_window nor "
-        "max_position_embeddings; gate disabled"
+        f"drafter config under {draft_model_path} declares neither "
+        "sliding_window nor max_position_embeddings; gate disabled"
     )
 
 
@@ -331,6 +346,224 @@ def ctx_gate_eligible(
         ):
             eligible = False
     return eligible, max_ctx
+
+
+# ---------------------------------------------------------------------------
+# Deterministic drafter policy (force=policy, T156 follow-up).
+#
+# A GENERIC ordered table of (start_ctx -> rung): the active rung is a pure
+# lookup of the batch's max context in the table -- no bandit, no probing, no
+# dwell. Configured via --speculative-drafter-policy
+# ("0:dflash:16,4096:nextn:3", arbitrary stage count) or derived ("auto").
+#
+# The ctx GATE stays active on top as a SAFETY filter: a policy-chosen but
+# gate-ineligible DFLASH stage falls back to the next stage above.
+# ---------------------------------------------------------------------------
+
+POLICY_CTX_FACTOR_ENV = "SGLANG_CROSS_POLICY_CTX_FACTOR"
+# Default policy switch point = factor * sliding_window = the drafter's
+# TRAINING context (z-lab recipe: trained at ctx = 2 * window).
+DEFAULT_POLICY_CTX_FACTOR = 2.0
+
+
+def derive_policy_switch_ctx(
+    draft_model_path: str,
+) -> Tuple[Optional[int], str]:
+    """DFLASH->NEXTN switch point of the DEFAULT drafter-policy table.
+
+    DELIBERATELY DIFFERENT from derive_ctx_gate_threshold (4 * window),
+    although both read the same drafter config: the ctx GATE is an
+    eligibility UPPER BOUND for the self-correcting bandit -- generosity is
+    cheap there, because below the gate the bandit still measures live and
+    walks away from a losing DFLASH rung. The POLICY *forces* the drafter
+    with no corrective, so its switch point must sit at the PROVEN
+    win-region boundary: the drafter's TRAINING context, 2 * sliding_window
+    under the z-lab recipe (window 2048 trained at ctx 4096). The measured
+    regime map backs this: paired-2k DFLASH wins 4/4, 10k it loses clearly,
+    and 4-8k is unmeasured -- forcing DFLASH past its training context
+    would be a bet, not a policy.
+
+    Returns (switch_ctx or None, derivation source). SWA drafter:
+    factor * sliding_window (factor via SGLANG_CROSS_POLICY_CTX_FACTOR,
+    default 2.0), capped at max_position_embeddings. No SWA declared:
+    max_position_embeddings (a genuine long-context drafter needs no early
+    switch point). Neither: None.
+    """
+    mpe, sliding, err = _read_drafter_ctx_fields(draft_model_path)
+    if err is not None:
+        return None, err
+    factor = float(
+        os.environ.get(POLICY_CTX_FACTOR_ENV, DEFAULT_POLICY_CTX_FACTOR)
+    )
+    if factor <= 0:
+        _fail(f"{POLICY_CTX_FACTOR_ENV} must be > 0; got {factor}.")
+    if sliding:
+        switch_ctx = int(factor * int(sliding))
+        source = (
+            f"{factor:g} * sliding_window {int(sliding)} "
+            "(drafter training context)"
+        )
+        if mpe:
+            switch_ctx = min(switch_ctx, int(mpe))
+            source += f" (cap max_position_embeddings {int(mpe)})"
+        return switch_ctx, source
+    if mpe:
+        return int(mpe), "max_position_embeddings (no sliding window declared)"
+    return None, (
+        f"drafter config under {draft_model_path} declares neither "
+        "sliding_window nor max_position_embeddings"
+    )
+
+
+# A policy table: list of (start_ctx, rung) stages, start_ctx strictly
+# ascending, stage 0 at ctx 0. rung = ("nextn", k) | ("dflash", block).
+PolicyTable = List[Tuple[int, Tuple[str, int]]]
+
+
+def resolve_drafter_policy_table(
+    raw: Optional[str],
+    *,
+    arm_ks,
+    dflash_block: int,
+    primary_k: int,
+    draft_model_path: str,
+) -> Tuple[PolicyTable, str]:
+    """Resolve --speculative-drafter-policy into a validated table.
+
+    ``raw`` None or 'auto': the derived two-stage default -- the gate-gated
+    rung (DFLASH) from ctx 0, the primary NEXTN rung from the drafter's
+    training context (derive_policy_switch_ctx). Explicit: comma-separated
+    'start_ctx:family:value' stages; every referenced rung must exist in
+    the configured arm set (NEXTN k in *arm_ks*, DFLASH block ==
+    *dflash_block*), stage starts strictly ascending, first stage at 0.
+    Hard errors, no silent fallback.
+    """
+    if raw is None or str(raw).strip().lower() == "auto":
+        switch_ctx, source = derive_policy_switch_ctx(draft_model_path)
+        if switch_ctx is None:
+            _fail(
+                "force=policy: cannot derive the default policy switch "
+                f"point ({source}); pass an explicit "
+                "--speculative-drafter-policy table."
+            )
+        return (
+            [
+                (0, ("dflash", int(dflash_block))),
+                (int(switch_ctx), ("nextn", int(primary_k))),
+            ],
+            f"auto: {source}",
+        )
+    entries = [e.strip() for e in str(raw).split(",") if e.strip()]
+    if not entries:
+        _fail("--speculative-drafter-policy: empty table.")
+    table: PolicyTable = []
+    for entry in entries:
+        parts = entry.split(":")
+        if len(parts) != 3:
+            _fail(
+                f"--speculative-drafter-policy entry {entry!r}: expected "
+                "'start_ctx:family:value', e.g. '0:dflash:16' or "
+                "'4096:nextn:3'."
+            )
+        try:
+            start = int(parts[0])
+            val = int(parts[2])
+        except ValueError:
+            _fail(
+                f"--speculative-drafter-policy entry {entry!r}: start_ctx "
+                "and value must be integers."
+            )
+        family = parts[1].strip().lower()
+        if family not in ("nextn", "dflash"):
+            _fail(
+                f"--speculative-drafter-policy entry {entry!r}: family must "
+                "be 'nextn' or 'dflash'."
+            )
+        if start < 0:
+            _fail(
+                f"--speculative-drafter-policy entry {entry!r}: start_ctx "
+                "must be >= 0."
+            )
+        if family == "dflash" and val != int(dflash_block):
+            _fail(
+                f"--speculative-drafter-policy entry {entry!r}: the resident "
+                f"DFLASH rung has block size {dflash_block}; dflash:{val} "
+                "is not a configured arm."
+            )
+        if family == "nextn" and val not in arm_ks:
+            _fail(
+                f"--speculative-drafter-policy entry {entry!r}: nextn k={val} "
+                f"is not in the configured arm set {sorted(arm_ks)} "
+                "(adaptive-config candidate steps + the boot k; widen via "
+                "--speculative-adaptive-config)."
+            )
+        table.append((start, (family, val)))
+    if table[0][0] != 0:
+        _fail(
+            "--speculative-drafter-policy: the first stage must start at "
+            f"ctx 0; got {table[0][0]}."
+        )
+    for (a, _ra), (b, _rb) in zip(table, table[1:]):
+        if b <= a:
+            _fail(
+                "--speculative-drafter-policy: stage start contexts must be "
+                f"strictly ascending; got {a} followed by {b}."
+            )
+    return table, "explicit --speculative-drafter-policy"
+
+
+def policy_lookup_index(table: PolicyTable, max_ctx: int) -> int:
+    """Index of the table stage covering *max_ctx* (last start <= ctx)."""
+    idx = 0
+    for i, (start, _rung) in enumerate(table):
+        if max_ctx >= start:
+            idx = i
+        else:
+            break
+    return idx
+
+
+def policy_select(
+    table: PolicyTable,
+    ctx_and_remaining: List[Tuple[int, Optional[int]]],
+    gate_threshold: Optional[int],
+    near_frac: float,
+    fallback_rung: Tuple[str, int],
+) -> Tuple[Tuple[str, int], int, bool]:
+    """Deterministic drafter-policy selection for one round boundary.
+
+    Pure function of rank-uniform inputs (CPU seq lens / budgets + the
+    static table), so every rank computes the same verdict locally -- no
+    broadcast, unlike the bandit. Returns (rung, max_ctx, gate_fell_back).
+
+    Table lookup on the batch max context; the ctx GATE is applied on top
+    as a SAFETY filter: when the looked-up stage is DFLASH but the gate
+    (threshold/near-preemption over *all* requests) says ineligible, the
+    selection falls back to the next non-DFLASH stage above, or
+    *fallback_rung* (the primary NEXTN rung) when the table has none.
+    """
+    max_ctx = 0
+    for ctx, _remaining in ctx_and_remaining:
+        if int(ctx) > max_ctx:
+            max_ctx = int(ctx)
+    idx = policy_lookup_index(table, max_ctx)
+    rung = tuple(table[idx][1])
+    fell_back = False
+    if rung[0] == "dflash" and gate_threshold is not None:
+        eligible, _ = ctx_gate_eligible(
+            ctx_and_remaining, gate_threshold, near_frac
+        )
+        if not eligible:
+            fell_back = True
+            rung = None
+            for j in range(idx + 1, len(table)):
+                cand = tuple(table[j][1])
+                if cand[0] != "dflash":
+                    rung = cand
+                    break
+            if rung is None:
+                rung = tuple(fallback_rung)
+    return rung, max_ctx, fell_back
 
 
 def get_cross_shapes(server_args) -> Dict[str, Dict[str, Any]]:
@@ -507,12 +740,23 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
             ),
         )
 
+    drafter_policy_raw = getattr(server_args, "speculative_drafter_policy", None)
+    if drafter_policy_raw is not None and force != "policy":
+        _fail(
+            "--speculative-drafter-policy is only meaningful with "
+            f"--speculative-cross-algorithm-force policy; got force={force!r}."
+        )
+
     # auto mode (stage 4): the NEXTN k rungs are bandit ARMS. The k set comes
     # from the user's --speculative-adaptive-config (positive candidate steps
     # union; the built-in default yields [1, 2, 3], the high-accept profile
-    # [1..5]); the boot k (primary rung) is always included.
+    # [1..5]); the boot k (primary rung) is always included. policy mode
+    # reuses the same set as the ARM SET a policy table may reference, then
+    # restricts the built states to the ks the table actually uses.
     bandit_ks: Optional[list] = None
-    if force == "auto":
+    policy_table: Optional[PolicyTable] = None
+    policy_source = ""
+    if force in ("auto", "policy"):
         from sglang.srt.speculative.adaptive_spec_params import (
             resolve_candidate_steps_from_config,
         )
@@ -528,6 +772,21 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
             | {eagle_steps}
         )
         dflash_tokens = int(dflash_shape["speculative_num_draft_tokens"])
+        if force == "policy":
+            policy_table, policy_source = resolve_drafter_policy_table(
+                drafter_policy_raw,
+                arm_ks=set(bandit_ks),
+                dflash_block=dflash_tokens,
+                primary_k=eagle_steps,
+                draft_model_path=dflash_draft_path,
+            )
+            # Build only the NEXTN k states the table references (+ the boot
+            # k, always the resident baseline) -- unreferenced candidate ks
+            # would cost boot time and VRAM for nothing.
+            bandit_ks = sorted(
+                {eagle_steps}
+                | {v for _s, (fam, v) in policy_table if fam == "nextn"}
+            )
         if any(k + 1 == dflash_tokens for k in bandit_ks):
             _fail(
                 f"bandit k set {bandit_ks} contains k={dflash_tokens - 1}, "
@@ -567,8 +826,9 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
             stash["schedule_interval"] = schedule_interval
         else:
             stash["bandit_ks"] = bandit_ks
-            # DFLASH context gate (auto mode only): resolved once here, at
-            # argument time, from the DRAFTER's config.json.
+            # DFLASH context gate (auto: eligibility; policy: safety
+            # filter): resolved once here, at argument time, from the
+            # DRAFTER's config.json.
             gate = resolve_ctx_gate(server_args, dflash_draft_path)
             stash["ctx_gate"] = gate
             if gate["threshold"] is not None:
@@ -581,6 +841,16 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
                 )
             else:
                 logger.info("Cross-algo ctx gate: disabled (%s).", gate["source"])
+            if force == "policy":
+                stash["policy_table"] = policy_table
+                logger.info(
+                    "Cross-algo drafter policy (%s): %s.",
+                    policy_source,
+                    ", ".join(
+                        f"ctx>={start}: {fam}:{val}"
+                        for start, (fam, val) in policy_table
+                    ),
+                )
     object.__setattr__(server_args, CROSS_SHAPES_ATTR, stash)
     logger.info(
         "Cross-algorithm speculative decoding: force=%s%s; primary rung=%s; "
@@ -590,7 +860,15 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
         (
             f" (switch every {schedule_interval} verify rounds)"
             if force == "schedule"
-            else (f" (bandit arms: NEXTN k={bandit_ks} + DFLASH)" if force == "auto" else "")
+            else (
+                f" (bandit arms: NEXTN k={bandit_ks} + DFLASH)"
+                if force == "auto"
+                else (
+                    f" (policy stages: {policy_table})"
+                    if force == "policy"
+                    else ""
+                )
+            )
         ),
         "nextn" if force != "dflash" else "dflash",
         other_name,

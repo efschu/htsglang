@@ -219,19 +219,50 @@ class CrossAlgoWorker(BaseSpecWorker):
                 self._trace_path = f"{trace}.rank{tp_rank}"
 
         # ------------------------------------------------------------------
-        # Stage-4 auto mode: the rung bandit (design 4b/4c).
+        # Stage-4 auto mode (rung bandit, design 4b/4c) and the
+        # deterministic drafter-policy mode share the NEXTN k arm set and
+        # the ctx-gate bookkeeping.
         # ------------------------------------------------------------------
+        if self._force in ("auto", "policy"):
+            self._bandit_ks = [int(k) for k in shapes["bandit_ks"]]
+            assert self._primary_k in self._bandit_ks
+            self._rungs = [("nextn", k) for k in self._bandit_ks] + [
+                ("dflash", self._dflash_block_size)
+            ]
+            # Context gate for the DFLASH rung (resolved at argument time
+            # from the drafter's config.json; see cross_algo_utils). auto:
+            # while the batch context is at/above the threshold, the DFLASH
+            # rung is ineligible -- never selected, never probed. policy:
+            # safety filter over the table lookup.
+            gate = shapes.get("ctx_gate") or {}
+            self._ctx_gate_threshold = gate.get("threshold")
+            self._ctx_gate_near_frac = float(gate.get("near_frac", 0.8))
+            self._ctx_gate_last_ctx = 0
+
+        if self._force == "policy":
+            # Deterministic ctx->rung table (T156 follow-up): no bandit, no
+            # probing, no broadcast -- see _maybe_policy_switch.
+            self._policy_table = [
+                (int(start), (str(r[0]), int(r[1])))
+                for start, r in shapes["policy_table"]
+            ]
+            self._policy_fallback_logged = False
+            log_info_on_rank0(
+                logger,
+                "Cross-algo drafter policy (force=policy): "
+                + ", ".join(
+                    f"ctx>={start}: {fam}:{val}"
+                    for start, (fam, val) in self._policy_table
+                )
+                + f"; ctx gate as safety filter: {self._ctx_gate_threshold}.",
+            )
+
         if self._force == "auto":
             import os
 
             from sglang.srt.distributed import get_tp_group
             from sglang.srt.speculative.cross_algo_bandit import CrossAlgoBandit
 
-            self._bandit_ks = [int(k) for k in shapes["bandit_ks"]]
-            assert self._primary_k in self._bandit_ks
-            self._rungs = [("nextn", k) for k in self._bandit_ks] + [
-                ("dflash", self._dflash_block_size)
-            ]
             trace = os.environ.get("SGLANG_CROSS_BANDIT_TRACE")
             self._bandit = CrossAlgoBandit(
                 rungs=self._rungs,
@@ -239,14 +270,6 @@ class CrossAlgoWorker(BaseSpecWorker):
                 trace_path=(trace if (trace and tp_rank == 0) else None),
             )
             self._last_decide_round = 0
-            # Context gate for the DFLASH rung (resolved at argument time
-            # from the drafter's config.json; see cross_algo_utils). While
-            # the batch context is at/above the threshold, the DFLASH rung
-            # is ineligible: never selected, never probed.
-            gate = shapes.get("ctx_gate") or {}
-            self._ctx_gate_threshold = gate.get("threshold")
-            self._ctx_gate_near_frac = float(gate.get("near_frac", 0.8))
-            self._ctx_gate_last_ctx = 0
             # Rank-0-decides + broadcast (design 4c): the objective's round-
             # duration term is rank-local WALL CLOCK, so -- unlike the
             # stage-1 k-ladder and the stage-3 schedule plan -- the decision
@@ -434,7 +457,7 @@ class CrossAlgoWorker(BaseSpecWorker):
             ) = self._nextn_sub.build_catchup_extend_state(
                 self._dflash_block_size
             )
-            if self._force == "auto":
+            if self._force in ("auto", "policy"):
                 self._init_bandit_k_states()
                 # M16/#50 isolation across the NEXTN k states (the DFLASH
                 # rung's resources are isolated by construction, stage 2).
@@ -677,6 +700,8 @@ class CrossAlgoWorker(BaseSpecWorker):
                         else ("nextn", self._primary_k)
                     ),
                 )
+        elif self._force == "policy":
+            self._maybe_policy_switch(batch)
         else:
             self._maybe_bandit_switch(batch)
         # Re-stamp unconditionally: freshly (re)built running batches carry
@@ -744,16 +769,12 @@ class CrossAlgoWorker(BaseSpecWorker):
         if new_rung != self._active_rung:
             self._apply_rung(batch, new_rung)
 
-    def _dflash_ctx_eligible(self, batch) -> bool:
-        """Context-gate eligibility of the DFLASH rung for this batch.
-
-        CPU-only (req.seqlen / sampling params; no device sync) and
-        rank-uniform by construction. bs>1: the max over the requests is the
-        context the verify attention pays for; any single request violating
-        the gate makes the rung ineligible. The turn-start pre-emption
-        criterion lives in cross_algo_utils.ctx_gate_eligible."""
-        from sglang.srt.speculative.cross_algo_utils import ctx_gate_eligible
-
+    @staticmethod
+    def _batch_ctx_and_remaining(batch) -> list:
+        """Per request: (current context length, remaining max_new_tokens
+        budget or None). CPU-only (req.seqlen / sampling params; no device
+        sync) and rank-uniform by construction (all ranks run the same batch
+        sequence; accept counts are broadcast, #50)."""
         ctx_and_remaining = []
         for req in batch.reqs:
             mnt = getattr(req.sampling_params, "max_new_tokens", None)
@@ -761,13 +782,69 @@ class CrossAlgoWorker(BaseSpecWorker):
                 None if mnt is None else max(0, int(mnt) - len(req.output_ids))
             )
             ctx_and_remaining.append((req.seqlen, remaining))
+        return ctx_and_remaining
+
+    def _dflash_ctx_eligible(self, batch) -> bool:
+        """Context-gate eligibility of the DFLASH rung for this batch.
+
+        bs>1: the max over the requests is the context the verify attention
+        pays for; any single request violating the gate makes the rung
+        ineligible. The turn-start pre-emption criterion lives in
+        cross_algo_utils.ctx_gate_eligible."""
+        from sglang.srt.speculative.cross_algo_utils import ctx_gate_eligible
+
         eligible, max_ctx = ctx_gate_eligible(
-            ctx_and_remaining,
+            self._batch_ctx_and_remaining(batch),
             self._ctx_gate_threshold,
             self._ctx_gate_near_frac,
         )
         self._ctx_gate_last_ctx = max_ctx
         return eligible
+
+    def _maybe_policy_switch(self, batch) -> None:
+        """force=policy (T156 follow-up): deterministic ctx -> rung lookup
+        in the drafter-policy table at every round boundary. No bandit, no
+        probing, no dwell: the active rung is a pure function of the batch's
+        CPU-side max context over a static table, both rank-uniform -- so,
+        like schedule mode and unlike the bandit, every rank computes the
+        same verdict locally and NO decision broadcast is needed. Switches
+        only happen when the context crosses a stage boundary (or the batch
+        mix changes the max), so the per-round cost is a few comparisons.
+
+        The ctx GATE stays active as a SAFETY filter on top of the table
+        (policy_select): a policy-chosen but gate-ineligible DFLASH stage
+        falls back to the next stage above, logged once per contiguous
+        fallback phase. Gate threshold (4 * window: eligibility upper bound
+        for the self-correcting bandit) and the default policy switch point
+        (2 * window = drafter training ctx: forced assignment without a
+        corrective) are deliberately different -- see
+        cross_algo_utils.derive_policy_switch_ctx."""
+        from sglang.srt.speculative.cross_algo_utils import policy_select
+
+        ctx_and_remaining = self._batch_ctx_and_remaining(batch)
+        target, max_ctx, fell_back = policy_select(
+            self._policy_table,
+            ctx_and_remaining,
+            self._ctx_gate_threshold,
+            self._ctx_gate_near_frac,
+            ("nextn", self._primary_k),
+        )
+        self._ctx_gate_last_ctx = max_ctx
+        if fell_back:
+            if not self._policy_fallback_logged:
+                self._policy_fallback_logged = True
+                logger.info(
+                    "Cross-algo policy: DFLASH stage gate-ineligible "
+                    "(ctx %d vs gate %s); falling back to %s:%d.",
+                    max_ctx,
+                    self._ctx_gate_threshold,
+                    target[0],
+                    target[1],
+                )
+        else:
+            self._policy_fallback_logged = False
+        if target != self._active_rung:
+            self._apply_rung(batch, target)
 
     def _apply_rung(self, batch, new_rung: tuple) -> None:
         old_rung = self._active_rung
