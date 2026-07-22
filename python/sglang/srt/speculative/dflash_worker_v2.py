@@ -153,6 +153,34 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+
+        # Draft-solo placement (--speculative-draft-placement solo): the DFLASH
+        # draft is a self-drafting block model built weight-TP=1 on the solo
+        # HOST rank; every other rank is a SHADOW (meta draft, no draft
+        # weights / KV / graphs) that skips the draft forward and receives the
+        # host's block token ids via one broadcast per round. The model-build
+        # layer (ModelRunner.compute_draft_solo_role) already gave the host a
+        # full unsharded draft and the shadows a meta draft; the role flags
+        # live on the draft model runner.
+        self._spec_solo_active = bool(
+            getattr(self.draft_model_runner, "is_draft_solo_host", False)
+            or getattr(self.draft_model_runner, "is_draft_solo_shadow", False)
+        )
+        self._spec_solo_is_host = bool(
+            getattr(self.draft_model_runner, "is_draft_solo_host", False)
+        )
+        self._spec_solo_rank = (
+            server_args.speculative_draft_solo_rank()
+            if self._spec_solo_active
+            else 0
+        )
+        if self._spec_solo_active and self.use_compact_draft_cache:
+            raise ValueError(
+                "--speculative-draft-placement solo does not support the "
+                "DFLASH compact draft cache (--speculative-draft-window-size): "
+                "the draft KV lives only on the solo host, so the shadow ranks "
+                "have no compact req->token table to maintain."
+            )
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -240,6 +268,115 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
 
+        # Solo: full (unsharded) target embed + lm_head, assembled from the TP
+        # vocab shards. The host embeds block ids and samples the draft block
+        # LOCALLY against these full tables (no vocab-parallel all_gather /
+        # all_reduce, which the absent shadow ranks could not join).
+        self._solo_full_embed_weight: Optional[torch.Tensor] = None
+        self._solo_full_lm_head_weight: Optional[torch.Tensor] = None
+        self._draft_block_recv_buf: Optional[torch.Tensor] = None
+        if self._spec_solo_active:
+            self._solo_setup_full_vocab()
+
+    def _solo_setup_full_vocab(self) -> None:
+        """Collectively assemble the FULL target embed + lm_head tables on the
+        solo HOST and drop the transient recv buffers on shadows.
+
+        COLLECTIVE: every TP rank calls this at the same init point (shadows
+        contribute their vocab shard and keep nothing). Mirrors
+        EagleDraftWorker._solo_init_lm_head — DFLASH samples the draft block
+        against the TARGET's embed/lm_head, which are vocab-parallel; the solo
+        host must hold the full tables to sample locally, so the per-round
+        greedy path needs no cross-rank all_gather the shadows can't join.
+        """
+        from sglang.srt.speculative.eagle_worker_v2 import (
+            _solo_gather_full_vocab_rows,
+            install_shadow_draft_runner_surface,
+        )
+
+        target_model = self._target_worker.model_runner.model
+        embed_module = target_model.get_input_embeddings()
+        lm_head = getattr(target_model, "lm_head", None)
+        if lm_head is None or not hasattr(lm_head, "weight"):
+            raise NotImplementedError(
+                "--speculative-draft-placement solo with DFLASH requires the "
+                "target to expose a dense lm_head.weight (the solo host samples "
+                "the draft block against the full unsharded lm_head)."
+            )
+        vocab_size = int(self._target_worker.model_config.vocab_size)
+        keep = self._spec_solo_is_host
+        tp_group = get_tp_group()
+
+        def _gather(module) -> Optional[torch.Tensor]:
+            shard = module.weight
+            if shard.shape[0] >= vocab_size:
+                # Replicated table (tp=1-ish); reuse directly on the host.
+                return shard[:vocab_size].contiguous() if keep else None
+            idx = getattr(module, "shard_indices", None)
+            if idx is not None and int(getattr(idx, "num_added_elements", 0)) > 0:
+                raise NotImplementedError(
+                    "--speculative-draft-placement solo with DFLASH does not "
+                    "support added-vocab shard layouts."
+                )
+            valid_rows = (
+                int(idx.num_org_elements) if idx is not None else int(shard.shape[0])
+            )
+            return _solo_gather_full_vocab_rows(
+                tp_group, shard, valid_rows, vocab_size, keep
+            )
+
+        full_embed = _gather(embed_module)
+        full_head = _gather(lm_head)
+        if keep:
+            self._solo_full_embed_weight = full_embed.contiguous()
+            self._solo_full_lm_head_weight = full_head.contiguous()
+        else:
+            # Shadow: drop recv buffers before KV profiling reads free VRAM
+            # (same M21 reasoning as the EAGLE solo gather), then expose the
+            # loud-AttributeError / None surface on the meta draft runner.
+            self._solo_full_embed_weight = None
+            self._solo_full_lm_head_weight = None
+            if is_cuda():
+                torch.cuda.empty_cache()
+            install_shadow_draft_runner_surface(self.draft_model_runner)
+
+    @property
+    def _solo_is_shadow(self) -> bool:
+        return self._spec_solo_active and not self._spec_solo_is_host
+
+    def _solo_greedy_sample_full(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Solo host: greedy argmax of draft hidden states against the FULL
+        (unsharded) target lm_head, chunked to bound peak logits memory. No
+        cross-rank collective — the whole vocabulary is local."""
+        weight = self._solo_full_lm_head_weight
+        weight_dtype = weight.dtype
+        num_tokens = int(hidden_states.shape[0])
+        out_tokens = torch.empty(
+            (num_tokens,), dtype=torch.long, device=hidden_states.device
+        )
+        chunk = 1024
+        for start in range(0, num_tokens, chunk):
+            end = min(num_tokens, start + chunk)
+            hs = hidden_states[start:end]
+            if hs.dtype != weight_dtype:
+                hs = hs.to(weight_dtype)
+            logits = torch.matmul(hs, weight.T)
+            out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
+        return out_tokens
+
+    def _solo_broadcast_draft_block(self, draft_tokens: torch.Tensor) -> None:
+        """One broadcast per round: the host's [bs, block_size] draft block to
+        the shadow ranks. Eager (never inside a captured region); capture-safe
+        primitive so co-located rigs work too."""
+        from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+
+        tp_group = get_tp_group()
+        if tp_group.world_size == 1:
+            return
+        capture_safe_tp_broadcast(
+            tp_group, (draft_tokens,), src=self._spec_solo_rank
+        )
+
     @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
@@ -271,6 +408,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         # enabled, the draft worker keeps a private compact req->token table
         # over the same global KV index space, so radix-cache/prefix-hit KV
         # remains reusable while draft attention sees only the recent window.
+        if self._solo_is_shadow:
+            # Shadow rank: NO draft KV pool (the draft never runs here; the
+            # solo host holds the whole draft KV). Pure VRAM win.
+            return
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=(
@@ -280,7 +421,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
-        self._draft_worker.init_attention_backends()
+        # The mamba-verify-commit flag is a TARGET-pool property (read on every
+        # rank), so resolve it before any shadow short-circuit.
         self._need_mamba_verify_commit = (
             self.model_runner.mambaish_config is not None
             and hasattr(
@@ -288,8 +430,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "update_mamba_state_after_mtp_verify",
             )
         )
+        if self._solo_is_shadow:
+            # Shadow rank: the draft forward never runs here -> no draft
+            # attention backend (skips its flashinfer workspace too).
+            return
+        self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
+        if self._solo_is_shadow:
+            # Shadow rank: capture NO draft graphs (the draft forward never
+            # runs here).
+            return
+        if self._spec_solo_is_host:
+            # Solo host: the draft graphs capture rank-locally (weight-TP=1,
+            # collective-free forward) while shadows skip draft capture, so the
+            # capture backends must not issue their per-warmup TP barrier
+            # against this runner (it would deadlock on the absent shadows).
+            self.draft_model_runner.spec_solo_rank_local_graphs = True
         capture_decode_cuda_graph = (
             self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
         )
@@ -1265,27 +1422,33 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
-            device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
-
-            if batch.out_cache_loc is None:
-                raise RuntimeError(
-                    "DFLASH prefill expected out_cache_loc, but got None."
+            # Solo shadow: no draft KV pool here -> skip (the solo host writes
+            # the draft prefill KV; next_token_ids is replicated on every rank
+            # via the target forward, so the next-draft-input still matches).
+            if not self._solo_is_shadow:
+                device = next_token_ids.device
+                ctx_lens = torch.tensor(
+                    batch.extend_lens, dtype=torch.int32, device=device
                 )
-            positions, _ = compute_position(
-                self.model_runner.server_args.attention_backend,
-                draft_seq_lens,
-                ctx_lens,
-                int(sum(batch.extend_lens)),
-            )
-            self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
-            )
+                draft_seq_lens = torch.tensor(
+                    batch.prefix_lens, dtype=torch.int32, device=device
+                )
+
+                if batch.out_cache_loc is None:
+                    raise RuntimeError(
+                        "DFLASH prefill expected out_cache_loc, but got None."
+                    )
+                positions, _ = compute_position(
+                    self.model_runner.server_args.attention_backend,
+                    draft_seq_lens,
+                    ctx_lens,
+                    int(sum(batch.extend_lens)),
+                )
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=logits_output.hidden_states,
+                    cache_loc=batch.out_cache_loc,
+                    positions=positions,
+                )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
@@ -1412,105 +1575,138 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        noise_embedding = embed_module(block_ids)
-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
-
+        # positions + verify cache locs are pure functions of batch state and
+        # are needed on EVERY rank for the target verify below (identical bytes
+        # on all ranks), so compute them outside the host-only draft region.
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
-        seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
-        if self.use_compact_draft_cache:
-            # Rebuild the draft-local sliding-window view from committed target state.
-            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
-            seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
-
-            suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
-                torch.int64
-            )
-            suffix_cache_loc = self._gather_req_to_token_segments(
-                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                req_pool_indices=batch.req_pool_indices,
-                start=suffix_start,
-                lengths=draft_prefix_lens,
-            )
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
-                self.draft_model_runner.req_to_token_pool.req_to_token,
-                torch.zeros_like(draft_prefix_lens),
-                draft_prefix_lens,
-                suffix_cache_loc,
-                bs,
-            )
-
-            block_end = self._draft_block_end_buf[:bs]
-            torch.add(draft_prefix_lens, block_size, out=block_end)
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
-                self.draft_model_runner.req_to_token_pool.req_to_token,
-                draft_prefix_lens,
-                block_end,
-                verify_out_cache_loc,
-                bs,
-            )
-            draft_seq_lens = draft_prefix_lens
-            draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
-        else:
-            # Non-windowed path uses the shared overallocated mapping directly.
-            # Backend planning only needs a safe upper bound for the committed
-            # prefix lengths, not the full allocator reservation length.
-            draft_seq_lens = prefix_lens
-            if batch.seq_lens_cpu is not None:
-                # Host bound = committed prefix + one verify block.
-                seq_lens_cpu.copy_(batch.seq_lens_cpu)
-                seq_lens_cpu.add_(block_size)
-                draft_seq_lens_sum = int(seq_lens_cpu.sum())
-            elif draft_input.reserved_seq_lens_cpu is not None:
-                # GPU-only backend: reserved is a safe over-estimate.
-                seq_lens_cpu.copy_(draft_input.reserved_seq_lens_cpu)
-                draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
-            else:
-                seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
-                draft_seq_lens_sum = int(prefix_lens.sum().item())
-
-        forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            batch_size=bs,
-            input_ids=block_ids.flatten(),
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc,
-            seq_lens_sum=draft_seq_lens_sum,
-            seq_lens_cpu=seq_lens_cpu,
-            positions=positions,
-            input_embeds=input_embeds,
-            spec_algorithm=SpeculativeAlgorithm.DFLASH,
-            spec_info=self._draft_block_spec_info,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-        )
-
-        with torch.inference_mode():
-            draft_out = self.draft_model_runner.forward(forward_batch)
-        draft_logits_output = draft_out.logits_output
-
-        if self._draft_sampler is not None and draft_out.can_run_graph:
-            draft_next = self._draft_sampler.out[
-                : bs * (int(self.block_size) - 1)
-            ].view(bs, int(self.block_size) - 1)
-        else:
-            draft_hidden = draft_logits_output.hidden_states
-            if draft_hidden is None:
-                raise RuntimeError("DFLASH draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            draft_next = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(
-                    -1, draft_hidden.shape[-1]
-                ),
-                lm_head=lm_head,
-            ).view(bs, int(self.block_size) - 1)
-
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+
+        if self._solo_is_shadow:
+            # Shadow rank: skip the draft forward + sampling entirely; the
+            # block's proposed token ids arrive from the solo host's broadcast.
+            # Column 0 (the seeded bonus) is already rank-consistent.
+            self._solo_broadcast_draft_block(draft_tokens)
+        else:
+            # HOST / split path: draft-block forward + greedy sampling.
+            if self._spec_solo_active:
+                # Solo host: embed against the FULL local table (the sharded
+                # target embed's all_reduce has no shadow ranks to join).
+                noise_embedding = torch.nn.functional.embedding(
+                    block_ids, self._solo_full_embed_weight
+                )
+            else:
+                noise_embedding = embed_module(block_ids)
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+
+            seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+            if self.use_compact_draft_cache:
+                # Rebuild the draft-local sliding-window view from committed target state.
+                draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
+                seq_lens_cpu.copy_(
+                    draft_prefix_lens.to(device="cpu", dtype=torch.int32)
+                )
+
+                suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
+                    torch.int64
+                )
+                suffix_cache_loc = self._gather_req_to_token_segments(
+                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                    req_pool_indices=batch.req_pool_indices,
+                    start=suffix_start,
+                    lengths=draft_prefix_lens,
+                )
+                assign_req_to_token_pool_func(
+                    batch.req_pool_indices,
+                    self.draft_model_runner.req_to_token_pool.req_to_token,
+                    torch.zeros_like(draft_prefix_lens),
+                    draft_prefix_lens,
+                    suffix_cache_loc,
+                    bs,
+                )
+
+                block_end = self._draft_block_end_buf[:bs]
+                torch.add(draft_prefix_lens, block_size, out=block_end)
+                assign_req_to_token_pool_func(
+                    batch.req_pool_indices,
+                    self.draft_model_runner.req_to_token_pool.req_to_token,
+                    draft_prefix_lens,
+                    block_end,
+                    verify_out_cache_loc,
+                    bs,
+                )
+                draft_seq_lens = draft_prefix_lens
+                draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
+            else:
+                # Non-windowed path uses the shared overallocated mapping directly.
+                # Backend planning only needs a safe upper bound for the committed
+                # prefix lengths, not the full allocator reservation length.
+                draft_seq_lens = prefix_lens
+                if batch.seq_lens_cpu is not None:
+                    # Host bound = committed prefix + one verify block.
+                    seq_lens_cpu.copy_(batch.seq_lens_cpu)
+                    seq_lens_cpu.add_(block_size)
+                    draft_seq_lens_sum = int(seq_lens_cpu.sum())
+                elif draft_input.reserved_seq_lens_cpu is not None:
+                    # GPU-only backend: reserved is a safe over-estimate.
+                    seq_lens_cpu.copy_(draft_input.reserved_seq_lens_cpu)
+                    draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+                else:
+                    seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
+                    draft_seq_lens_sum = int(prefix_lens.sum().item())
+
+            forward_batch = ForwardBatch(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                batch_size=bs,
+                input_ids=block_ids.flatten(),
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=draft_seq_lens,
+                out_cache_loc=verify_out_cache_loc,
+                seq_lens_sum=draft_seq_lens_sum,
+                seq_lens_cpu=seq_lens_cpu,
+                positions=positions,
+                input_embeds=input_embeds,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                spec_info=self._draft_block_spec_info,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+            )
+
+            with torch.inference_mode():
+                draft_out = self.draft_model_runner.forward(forward_batch)
+            draft_logits_output = draft_out.logits_output
+
+            if self._draft_sampler is not None and draft_out.can_run_graph:
+                draft_next = self._draft_sampler.out[
+                    : bs * (int(self.block_size) - 1)
+                ].view(bs, int(self.block_size) - 1)
+            else:
+                draft_hidden = draft_logits_output.hidden_states
+                if draft_hidden is None:
+                    raise RuntimeError(
+                        "DFLASH draft model returned no hidden states."
+                    )
+                draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+                sample_hs = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
+                if self._spec_solo_active:
+                    # Solo host: local full-vocab argmax against the gathered
+                    # lm_head (no vocab-parallel all_gather for the absent
+                    # shadow ranks).
+                    draft_next = self._solo_greedy_sample_full(sample_hs).view(
+                        bs, int(self.block_size) - 1
+                    )
+                else:
+                    draft_next = self._greedy_sample_from_vocab_parallel_head(
+                        hidden_states=sample_hs,
+                        lm_head=lm_head,
+                    ).view(bs, int(self.block_size) - 1)
+
+            draft_tokens[:, 1:].copy_(draft_next)
+            if self._spec_solo_active:
+                # Solo host: publish the drafted block to the shadow ranks
+                # (one broadcast per round, eager, never inside capture).
+                self._solo_broadcast_draft_block(draft_tokens)
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
@@ -1663,20 +1859,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             on_publish(new_seq_lens)
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
+        # Solo shadow: no draft KV pool here (the solo host owns the whole draft
+        # KV), so skip the write. Every rank still ran the target verify and
+        # holds identical accept/bonus/out_tokens.
         hidden = logits_output.hidden_states
         if hidden is None:
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
             )
-        hidden = hidden.view(bs, int(self.block_size), -1)
-
-        self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
-            positions=positions,
-            commit_lens=commit_lens,
-        )
+        if not self._solo_is_shadow:
+            hidden = hidden.view(bs, int(self.block_size), -1)
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+                cache_loc=verify_out_cache_loc,
+                cache_loc_2d=verify_out_cache_loc_2d,
+                positions=positions,
+                commit_lens=commit_lens,
+            )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None

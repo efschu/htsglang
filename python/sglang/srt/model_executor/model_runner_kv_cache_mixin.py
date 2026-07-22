@@ -1044,6 +1044,27 @@ class ModelRunnerKVCacheMixin:
             need_bytes / 1e9,
         )
 
+    def _pool_kv_head_num(self: ModelRunner) -> int:
+        """The kv-head count this rank's KV pool must be shaped for.
+
+        Normally this rank's own shard, ``get_num_kv_heads(attn_tp_size)``.
+
+        EXCEPTION -- draft-solo placement (``--speculative-draft-placement
+        solo``): the SOLO HOST builds its draft model under a weight-TP=1
+        override (same mechanism as the weightless-KV head rank), so the draft
+        attention projects the FULL ``total_num_kv_heads``. The draft KV pool
+        must be shaped the same way, otherwise ``set_kv_buffer``'s
+        ``view(-1, pool_heads, head_dim)`` reinterprets the surplus heads as
+        surplus TOKENS and the store kernel rejects the loc/kv batch mismatch
+        ("expected 64 but got 32") during the draft cuda-graph capture.
+
+        Shadow ranks build no draft pool at all, and every TARGET pool plus the
+        whole split-placement path keeps the per-rank shard -> byte-identical.
+        """
+        if self.is_draft_worker and getattr(self, "is_draft_solo_host", False):
+            return self.model_config.get_total_num_kv_heads()
+        return self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
@@ -1412,9 +1433,7 @@ class ModelRunnerKVCacheMixin:
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_parallel().attn_tp_size
-                    ),
+                    head_num=self._pool_kv_head_num(),
                     head_dim=self.model_config.head_dim,
                     layer_num=self.num_effective_layers,
                     device=self.device,
@@ -1449,9 +1468,7 @@ class ModelRunnerKVCacheMixin:
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     post_capture_active=self.post_capture_kv_active,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_parallel().attn_tp_size
-                    ),
+                    head_num=self._pool_kv_head_num(),
                     head_dim=self.model_config.head_dim,
                     swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
@@ -1488,9 +1505,7 @@ class ModelRunnerKVCacheMixin:
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_parallel().attn_tp_size
-                    ),
+                    head_num=self._pool_kv_head_num(),
                     head_dim=self.model_config.head_dim,
                     layer_num=self.num_effective_layers,
                     device=self.device,
@@ -1587,9 +1602,7 @@ class ModelRunnerKVCacheMixin:
                     size_swa=self.swa_max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_parallel().attn_tp_size
-                    ),
+                    head_num=self._pool_kv_head_num(),
                     head_dim=self.model_config.head_dim,
                     swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
@@ -1614,9 +1627,7 @@ class ModelRunnerKVCacheMixin:
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     index_dtype=self.dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_parallel().attn_tp_size
-                    ),
+                    head_num=self._pool_kv_head_num(),
                     head_dim=self.model_config.head_dim,
                     idx_head_dim=sparse_cfg["sparse_index_dim"],
                     dense_layer_ids=dense_layer_ids,
@@ -1666,9 +1677,7 @@ class ModelRunnerKVCacheMixin:
                 ) and not _draft_non_dcp:
                     _hybrid_kv_head_num = self.model_config.get_total_num_kv_heads()
                 else:
-                    _hybrid_kv_head_num = self.model_config.get_num_kv_heads(
-                        get_parallel().attn_tp_size
-                    )
+                    _hybrid_kv_head_num = self._pool_kv_head_num()
                 # WEIGHTED uneven-DCP: max_total_num_tokens is the shared CONTEXT
                 # budget C; this rank physically stores only its owned share
                 # C * ratio_r / S (ratio-proportional -- the 5090 holds more than
@@ -1728,9 +1737,7 @@ class ModelRunnerKVCacheMixin:
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_parallel().attn_tp_size
-                        ),
+                        head_num=self._pool_kv_head_num(),
                         head_dim=self.model_config.head_dim,
                         v_head_dim=self.model_config.v_head_dim,
                         layer_num=self.num_effective_layers,
@@ -1753,9 +1760,7 @@ class ModelRunnerKVCacheMixin:
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_parallel().attn_tp_size
-                        ),
+                        head_num=self._pool_kv_head_num(),
                         head_dim=self.model_config.head_dim,
                         v_head_dim=self.model_config.v_head_dim,
                         layer_num=self.num_effective_layers,

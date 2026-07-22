@@ -3809,20 +3809,34 @@ class ServerArgs:
                 "place, and no single rank holds the full target KV under "
                 "TP/DCP. Use placement 'split' for FROZEN_KV_MTP."
             )
-        if not algo.is_eagle():
+        # v2 scope: the EagleDraftWorker family (EAGLE / EAGLE3 / NEXTN) and
+        # DFLASH. DFLASH goes solo cleanly because its draft is a self-drafting
+        # block model built weight-TP=1 on the host (heads%tp never binds at
+        # tp=1) whose per-round output is a fixed block of token ids -- exactly
+        # the one-broadcast-per-round contract. STANDALONE / NGRAM / DSPARK are
+        # still unsupported.
+        if not (algo.is_eagle() or algo.is_dflash()):
             raise ValueError(
                 "--speculative-draft-placement solo supports the EAGLE-family "
-                "v2 worker only (EAGLE / EAGLE3 / NEXTN); got "
+                "v2 worker (EAGLE / EAGLE3 / NEXTN) and DFLASH only; got "
                 f"--speculative-algorithm={self.speculative_algorithm} "
-                "(DFLASH / STANDALONE / NGRAM / DSPARK are not yet supported)."
+                "(STANDALONE / NGRAM / DSPARK are not yet supported)."
             )
-        if self.enable_multi_layer_eagle:
+        # DFLASH is inherently greedy-block and non-adaptive; the EAGLE-only
+        # guards below (topk trees, rejection sampling, multi-layer eagle) do
+        # not apply to it, so return after the pure-TP / single-node checks.
+        _algo_is_dflash = algo.is_dflash()
+        if not _algo_is_dflash and self.enable_multi_layer_eagle:
             raise ValueError(
                 "--speculative-draft-placement solo does not support "
                 "--enable-multi-layer-eagle (its draft worker variant does "
                 "not implement the solo broadcast contract)."
             )
-        if self.speculative_eagle_topk is not None and self.speculative_eagle_topk > 1:
+        if (
+            not _algo_is_dflash
+            and self.speculative_eagle_topk is not None
+            and self.speculative_eagle_topk > 1
+        ):
             raise ValueError(
                 "--speculative-draft-placement solo requires "
                 "--speculative-eagle-topk 1 (linear draft chain): solo "
@@ -3830,13 +3844,21 @@ class ServerArgs:
                 f"would need scores/parents too. Got topk="
                 f"{self.speculative_eagle_topk}."
             )
-        if self.speculative_use_rejection_sampling:
+        if not _algo_is_dflash and self.speculative_use_rejection_sampling:
             raise ValueError(
                 "--speculative-draft-placement solo does not support "
                 "--speculative-use-rejection-sampling: solo broadcasts ONLY "
                 "the draft token ids, while rejection sampling needs the "
                 "per-step draft PROBABILITIES on every verifying rank. Use "
                 "threshold acceptance, or placement 'split'."
+            )
+        # DFLASH is non-adaptive by construction; reject the combination
+        # up front rather than silently ignoring the adaptive controller.
+        if _algo_is_dflash and getattr(self, "speculative_adaptive", False):
+            raise ValueError(
+                "--speculative-draft-placement solo with DFLASH does not "
+                "support --speculative-adaptive (DFLASH drafts a fixed block; "
+                "adaptive step control is EAGLE-only)."
             )
         # Pure single-node TP only.
         if self.dp_size > 1 or self.enable_dp_attention:
