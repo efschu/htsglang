@@ -46,8 +46,30 @@ class _StubConfigurator:
         return _StubConfig(self._tokens)
 
 
-def _capacity_server_args(capacity: bool):
-    return SimpleNamespace(uneven_kv_capacity_mode=lambda: capacity)
+class _SoloHostConfigurator:
+    """Draft-solo host: its capacity DEPENDS on the installed token vector,
+    because the draft KV pool spans the GLOBAL context. Mirrors
+    pool_configurator's cell = t_target + (S / ratio_host) * t_draft."""
+
+    def __init__(self, avail_bytes: int, t_target: int, t_draft: int, dcp_rank: int):
+        self._avail = avail_bytes
+        self._t_target = t_target
+        self._t_draft = t_draft
+        self._dcp_rank = dcp_rank
+
+    def calculate_pool_sizes(self, budget_bytes, page_size):
+        ratios = get_cp_token_ratios()
+        g = sum(ratios) / ratios[self._dcp_rank]
+        cell = self._t_target + g * self._t_draft
+        return _StubConfig(int(self._avail // cell))
+
+
+def _capacity_server_args(capacity: bool, solo_rank=None):
+    return SimpleNamespace(
+        uneven_kv_capacity_mode=lambda: capacity,
+        speculative_draft_solo_active=lambda: solo_rank is not None,
+        speculative_draft_solo_rank=lambda: solo_rank,
+    )
 
 
 def _run_ranks(
@@ -57,28 +79,75 @@ def _run_ranks(
     capacity_mode=False,
     allow_install=False,
     draft_worker=False,
+    solo_rank=None,
+    solo_avail=None,
+    solo_cells=(1000, 200),
 ):
     """Invoke the method once per simulated DCP rank. Returns
-    (ranks_that_reached_the_collective, vector_installed_after_run)."""
+    (ranks_that_reached_the_collective, vector_installed_after_run).
+
+    ``solo_rank``: simulate the draft-solo placement with that rank as the
+    host (vector-dependent capacity, see _SoloHostConfigurator)."""
     dcp_size = len(per_rank_tokens)
     collective_calls = []
+    curves = {}
+
+    def _configurator_for(rank):
+        if solo_rank is not None and rank == solo_rank:
+            return _SoloHostConfigurator(
+                solo_avail, solo_cells[0], solo_cells[1], rank
+            )
+        return _StubConfigurator(per_rank_tokens[rank])
+
+    def _local_tokens(rank):
+        return int(
+            _configurator_for(rank)
+            .calculate_pool_sizes(1 << 30, 1)
+            .max_total_num_tokens
+        )
 
     def fake_all_gather_object(gathered, payload, group=None):
         collective_calls.append(payload)
+        curves[payload[0]] = payload[2]
         full = [
-            (r, max(int(per_rank_tokens[r]), 0)) for r in range(dcp_size)
+            (
+                r,
+                max(_local_tokens(r), 0),
+                curves.get(r) if r == solo_rank else None,
+            )
+            for r in range(dcp_size)
         ]
         gathered[: len(full)] = full
 
+    # The host is simulated first so the later ranks see the curve it
+    # contributes to the collective (in a real run every rank receives it
+    # from the same all_gather).
+    order = [r for r in range(dcp_size) if r == solo_rank] + [
+        r for r in range(dcp_size) if r != solo_rank
+    ]
+    per_rank_installed = []
     set_cp_token_ratios(list(active))
     try:
-        for rank in range(dcp_size):
+        for rank in order:
             stub = SimpleNamespace(
                 dcp_size=dcp_size,
                 page_size=1,
                 tp_rank=rank,
-                server_args=_capacity_server_args(capacity_mode),
+                server_args=_capacity_server_args(capacity_mode, solo_rank),
                 is_draft_worker=draft_worker,
+            )
+            # The stub is not a ModelRunner, so bind the mixin helpers the
+            # method calls on ``self`` explicitly.
+            stub._is_solo_draft_kv_host = (
+                lambda s=stub: ModelRunnerKVCacheMixin._is_solo_draft_kv_host(s)
+            )
+            stub._solo_host_capacity_curve = (
+                lambda *a, s=stub: ModelRunnerKVCacheMixin._solo_host_capacity_curve(
+                    s, *a
+                )
+            )
+            stub._solo_fixed_point_capacity = (
+                ModelRunnerKVCacheMixin._solo_fixed_point_capacity
             )
             world_group = mock.Mock(world_size=dcp_size, cpu_group=None)
             parallel = mock.Mock(attn_dcp_rank=rank)
@@ -93,7 +162,7 @@ def _run_ranks(
             ), mock.patch(
                 "sglang.srt.model_executor.pool_configurator"
                 ".create_memory_pool_configurator",
-                return_value=_StubConfigurator(per_rank_tokens[rank]),
+                side_effect=lambda mr: _configurator_for(mr.tp_rank),
             ), mock.patch(
                 "torch.distributed.all_gather_object",
                 side_effect=fake_all_gather_object,
@@ -101,9 +170,13 @@ def _run_ranks(
                 ModelRunnerKVCacheMixin._maybe_suggest_dcp_token_vector(
                     stub, budget_bytes=1 << 30, allow_install=allow_install
                 )
+            per_rank_installed.append(get_cp_token_ratios())
         installed = get_cp_token_ratios()
     finally:
         set_cp_token_ratios(None)
+    assert all(
+        v == per_rank_installed[0] for v in per_rank_installed
+    ), f"ranks disagreed on the installed vector: {per_rank_installed}"
     return len(collective_calls), installed
 
 
@@ -196,6 +269,121 @@ class TestCapacityInstall(CustomTestCase):
             draft_worker=True,
         )
         self.assertEqual(installed, ESTIMATE)
+
+
+# Mirrors the measured 27B-FP8 TP=3 NEXTN draft-solo boot: rank 0 hosts the
+# unsharded draft + a globally-sized draft KV pool, so its profiled capacity
+# (108341 tokens under the seeded vector [16,23,25]) is a FUNCTION of its
+# ownership share, while the shadows' is not. Pre-fix the boot stalled at
+# max_total_num_tokens=433344 and only logged the un-actioned
+# "restart with SGLANG_UNEVEN_TOKEN_VECTOR=5,13,14" hint.
+SOLO_ACTIVE = [16, 23, 25]
+SOLO_SHADOWS = [0, 290465, 312551]
+SOLO_T_TARGET, SOLO_T_DRAFT = 1000, 200
+SOLO_AVAIL = 108341 * (SOLO_T_TARGET + 4 * SOLO_T_DRAFT)
+# What the optimizer would pick from the RAW measured capacities (the naive,
+# vector-unaware install).
+SOLO_NAIVE = [5, 13, 14]
+
+
+def _solo_capacity(vector, rank):
+    """Actual per-rank capacity once ``vector`` is installed."""
+    if rank == 0:
+        cell = SOLO_T_TARGET + (sum(vector) / vector[0]) * SOLO_T_DRAFT
+        return int(SOLO_AVAIL // cell)
+    return SOLO_SHADOWS[rank]
+
+
+def _solo_achieved_context(vector):
+    """max_total_num_tokens the owner rule delivers for ``vector``:
+    min_r(P_r(vector) // ratio_r) * sum(ratios)."""
+    return min(
+        _solo_capacity(vector, r) // vector[r] for r in range(len(vector))
+    ) * sum(vector)
+
+
+class TestDraftSoloCapacityInstall(CustomTestCase):
+    """--rank-kv-ratio capacity on the DRAFT-SOLO path (the bug): the
+    post-profiling measured install must run there too, and it must use the
+    host's self-consistent (vector-corrected) capacity."""
+
+    def _install(self, **kwargs):
+        return _run_ranks(
+            list(SOLO_SHADOWS),
+            active=SOLO_ACTIVE,
+            capacity_mode=True,
+            allow_install=True,
+            solo_rank=0,
+            solo_avail=SOLO_AVAIL,
+            solo_cells=(SOLO_T_TARGET, SOLO_T_DRAFT),
+            **kwargs,
+        )
+
+    def test_solo_installs_a_measured_vector(self):
+        reached, installed = self._install()
+        self.assertEqual(reached, 3)
+        self.assertNotEqual(
+            installed,
+            SOLO_ACTIVE,
+            "draft-solo stopped at the pre-boot prediction: the measured "
+            "install never ran (ranks 1/2 stay idle)",
+        )
+
+    def test_solo_install_raises_the_pool(self):
+        _, installed = self._install()
+        self.assertGreater(
+            _solo_achieved_context(installed),
+            _solo_achieved_context(SOLO_ACTIVE),
+        )
+
+    def test_solo_beats_the_vector_unaware_optimum(self):
+        """Installing partition_units over the RAW measured capacities hands
+        the host a share it can no longer fund (its draft pool grows with the
+        global context), so the min-rule claws the pool back. The corrected
+        fixed point must do strictly better."""
+        _, installed = self._install()
+        self.assertGreater(
+            _solo_achieved_context(installed),
+            _solo_achieved_context(SOLO_NAIVE),
+        )
+
+    def test_solo_shrinks_the_hosts_share(self):
+        _, installed = self._install()
+        host_share = installed[0] / sum(installed)
+        self.assertLess(host_share, SOLO_ACTIVE[0] / sum(SOLO_ACTIVE))
+
+    def test_solo_hint_only_without_allow_install(self):
+        _, installed = _run_ranks(
+            list(SOLO_SHADOWS),
+            active=SOLO_ACTIVE,
+            capacity_mode=True,
+            allow_install=False,
+            solo_rank=0,
+            solo_avail=SOLO_AVAIL,
+            solo_cells=(SOLO_T_TARGET, SOLO_T_DRAFT),
+        )
+        self.assertEqual(installed, SOLO_ACTIVE)
+
+    def test_solo_coupled_mode_never_installs(self):
+        _, installed = _run_ranks(
+            list(SOLO_SHADOWS),
+            active=SOLO_ACTIVE,
+            capacity_mode=False,
+            allow_install=True,
+            solo_rank=0,
+            solo_avail=SOLO_AVAIL,
+            solo_cells=(SOLO_T_TARGET, SOLO_T_DRAFT),
+        )
+        self.assertEqual(installed, SOLO_ACTIVE)
+
+    def test_non_solo_install_is_unchanged(self):
+        """Same capacities, no solo host: the plain measured optimum (no
+        correction, no extra collective payload semantics)."""
+        reached, installed = _run_ranks(
+            MEASURED_P, active=ESTIMATE, capacity_mode=True, allow_install=True
+        )
+        self.assertEqual(reached, 3)
+        self.assertEqual(installed, OPTIMAL)
 
 
 if __name__ == "__main__":

@@ -234,6 +234,69 @@ class TestResolvePrecedence(KvRatioTestCase):
             resolve_cp_token_ratios(args, checkpoint_size_mib=0), [2, 1, 1]
         )
 
+    def test_capacity_seed_beats_estimate(self):
+        # Draft-solo phase-1 seed: used INSTEAD of the budget/weights
+        # estimate, but the mode string stays 'capacity' so the measured
+        # phase-2 install still runs.
+        args = self._args(rank_kv_ratio="capacity", rank_kv_capacity_seed=[16, 23, 25])
+        self.assertEqual(
+            resolve_cp_token_ratios(args, checkpoint_size_mib=0), [16, 23, 25]
+        )
+
+    def test_explicit_vector_beats_capacity_seed(self):
+        args = self._args(
+            rank_kv_ratio=[6, 4, 4], rank_kv_capacity_seed=[16, 23, 25]
+        )
+        self.assertEqual(
+            resolve_cp_token_ratios(args, checkpoint_size_mib=0), [3, 2, 2]
+        )
+
+    def test_env_beats_capacity_seed(self):
+        args = self._args(
+            rank_kv_ratio="capacity", rank_kv_capacity_seed=[16, 23, 25]
+        )
+        with patch.dict(os.environ, {"SGLANG_UNEVEN_TOKEN_VECTOR": "5,3,3"}):
+            self.assertEqual(
+                resolve_cp_token_ratios(args, checkpoint_size_mib=0), [5, 3, 3]
+            )
+
+    def test_capacity_seed_is_gcd_reduced(self):
+        args = self._args(rank_kv_ratio="capacity", rank_kv_capacity_seed=[8, 12, 16])
+        self.assertEqual(
+            resolve_cp_token_ratios(args, checkpoint_size_mib=0), [2, 3, 4]
+        )
+
+
+class TestSoloPlannerSeed(KvRatioTestCase):
+    """The draft-solo planner seed must not downgrade 'capacity' to a pin.
+
+    Writing the predicted vector into ``rank_kv_ratio`` itself made
+    ``uneven_kv_capacity_mode()`` False, which cancelled the post-profiling
+    measured install (the boot then only logged the un-actioned
+    'restart with SGLANG_UNEVEN_TOKEN_VECTOR=...' hint)."""
+
+    def test_capacity_mode_survives_the_seed(self):
+        args = make_args(rank_kv_ratio="capacity")
+        # What the planner does on the solo path.
+        if args.uneven_kv_capacity_mode():
+            args.rank_kv_capacity_seed = [16, 23, 25]
+        else:  # pragma: no cover - guarded below
+            args.rank_kv_ratio = [16, 23, 25]
+        self.assertEqual(args.rank_kv_ratio, "capacity")
+        self.assertTrue(args.uneven_kv_capacity_mode())
+        self.assertTrue(args.uneven_kv_flag_active())
+        self.assertEqual(args.rank_kv_capacity_seed, [16, 23, 25])
+
+    def test_coupled_mode_seed_path_unchanged(self):
+        args = make_args(rank_kv_ratio="coupled")
+        self.assertFalse(args.uneven_kv_capacity_mode())
+        args.rank_kv_ratio = [16, 23, 25]
+        self.assertIsNone(args.rank_kv_capacity_seed)
+        self.assertEqual(args.rank_kv_ratio, [16, 23, 25])
+
+    def test_seed_defaults_to_none(self):
+        self.assertIsNone(make_args().rank_kv_capacity_seed)
+
 
 if __name__ == "__main__":
     unittest.main()

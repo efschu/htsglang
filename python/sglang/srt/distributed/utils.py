@@ -410,6 +410,19 @@ def resolve_cp_token_ratios(server_args, checkpoint_size_mib: Optional[int] = No
         g = math.gcd(*kv_flag)
         return [v // g for v in kv_flag]
 
+    # Draft-solo phase-1 SEED (--rank-kv-ratio capacity only): the planner's
+    # predicted per-rank capacity vector. Below the explicit pin and the env
+    # override, above the budget estimate -- which under solo placement does
+    # not model the host's unsharded draft weights + globally-sized draft KV
+    # pool. Purely the starting vector: the measured phase-2 install
+    # (_maybe_suggest_dcp_token_vector) replaces it after profiling.
+    seed = getattr(server_args, "rank_kv_capacity_seed", None)
+    if isinstance(seed, list) and len(seed) == dcp_size and all(v > 0 for v in seed):
+        if len(set(seed)) == 1:
+            return None
+        g = math.gcd(*seed)
+        return [v // g for v in seed]
+
     if checkpoint_size_mib is None:
         checkpoint_size_mib = _checkpoint_size_mib(
             getattr(server_args, "model_path", None)

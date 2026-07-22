@@ -1456,6 +1456,13 @@ class ServerArgs:
             type_parser=_parse_rank_kv_ratio,
         ),
     ] = "coupled"
+    # Internal (no CLI flag): the draft-solo planner's PREDICTED KV-token
+    # vector. Used as the phase-1 estimate in resolve_cp_token_ratios when
+    # --rank-kv-ratio is a MODE string ('capacity'), so seeding a start
+    # vector does not silently downgrade the mode to an explicit pin and
+    # cancel the phase-2 measured install. An explicit --rank-kv-ratio
+    # vector or SGLANG_UNEVEN_TOKEN_VECTOR still wins over this seed.
+    rank_kv_capacity_seed: Optional[List[int]] = None
     random_seed: A[Optional[int], "The random seed."] = None
     watchdog_timeout: A[
         float,

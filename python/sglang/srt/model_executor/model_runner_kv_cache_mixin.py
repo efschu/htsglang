@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -2398,6 +2398,113 @@ class ModelRunnerKVCacheMixin:
                 projected,
             )
 
+    def _is_solo_draft_kv_host(self: ModelRunner) -> bool:
+        """True on the TARGET runner of the draft-solo host rank — the only
+        rank that allocates a draft KV pool sized to the GLOBAL context.
+        Mirrors pool_configurator.solo_draft_kv_cell_factor's conditions."""
+        server_args = self.server_args
+        if self.is_draft_worker:
+            return False
+        if not getattr(server_args, "speculative_draft_solo_active", None):
+            return False
+        if not server_args.speculative_draft_solo_active():
+            return False
+        return self.tp_rank == server_args.speculative_draft_solo_rank()
+
+    def _solo_host_capacity_curve(
+        self: ModelRunner, budget_bytes: int, active: list
+    ) -> Optional[Tuple[float, float]]:
+        """Draft-solo host only: the (alpha, beta) of its capacity curve
+
+            1 / P(g) = alpha + beta * g,   g = sum(ratios) / ratio_host
+
+        Returns None on every other rank / placement (non-solo stays untouched).
+
+        WHY this exists: for a normal rank the profiled token capacity P_r is
+        INDEPENDENT of the token-ownership vector, which is what lets
+        _maybe_suggest_dcp_token_vector feed the measured P_r straight into
+        partition_units. On the draft-solo host it is not: its draft KV pool
+        spans the GLOBAL context C, so the per-token cell carries a draft term
+        scaled by g = C / n_host = S / ratio_host (see
+        pool_configurator.solo_draft_kv_cell_factor). Shrinking the host's
+        ownership share therefore SHRINKS its own capacity too — installing
+        partition_units(64, [P_measured...]) raw would hand the host a share it
+        can no longer fund, and the min-rule would claw the global pool back.
+
+        The cell is affine in g, so 1/P is affine in g and two evaluations of
+        the real configurator pin it down exactly — no duplicated cell-size
+        math, and every architecture-specific configurator (Default, HybridSWA,
+        DSV4, ...) is covered by construction."""
+        if not self._is_solo_draft_kv_host():
+            return None
+        from sglang.srt.distributed.utils import (
+            get_cp_token_ratios,
+            set_cp_token_ratios,
+        )
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        dcp_rank = int(get_parallel().attn_dcp_rank)
+        if not (0 <= dcp_rank < len(active)):
+            return None
+
+        def probe(vector: list) -> Tuple[float, float]:
+            saved = get_cp_token_ratios()
+            try:
+                set_cp_token_ratios(list(vector))
+                conf = create_memory_pool_configurator(self)
+                p = int(
+                    conf.calculate_pool_sizes(
+                        budget_bytes, self.page_size
+                    ).max_total_num_tokens
+                )
+            finally:
+                set_cp_token_ratios(saved)
+            return float(p), float(sum(vector)) / float(vector[dcp_rank])
+
+        # Two points on the curve: the active vector, and a synthetic one that
+        # squeezes the host's share to the minimum (large g). Purely arithmetic
+        # probes — nothing is allocated and the installed vector is restored.
+        probe_vec = [1 if r == dcp_rank else 8 for r in range(len(active))]
+        p1, g1 = probe(list(active))
+        p2, g2 = probe(probe_vec)
+        if p1 <= 0 or p2 <= 0 or g1 == g2:
+            return None
+        beta = (1.0 / p2 - 1.0 / p1) / (g2 - g1)
+        alpha = 1.0 / p1 - beta * g1
+        if not (beta > 0.0) or not (alpha + beta > 0.0):
+            # No draft-KV term (beta == 0) or a degenerate fit: the capacity is
+            # vector-independent after all, so the raw measurement is correct.
+            return None
+        return (alpha, beta)
+
+    @staticmethod
+    def _solo_fixed_point_capacity(
+        curve: Tuple[float, float], q_tokens: int
+    ) -> Optional[int]:
+        """Solve the draft-solo host's self-consistent capacity.
+
+        With capacity-proportional ownership the host's share satisfies
+        ``ratio_host / S = p_h / (p_h + Q)`` (Q = the shadows' total capacity,
+        which IS vector-independent), i.e. ``g = (p_h + Q) / p_h``. Substituted
+        into the curve ``1/p_h = alpha + beta * g``:
+
+            p_h = (1 - beta * Q) / (alpha + beta)
+
+        which is the measured-quantity twin of the planner's predicted
+        ``_solo_rank_token_capacity`` closed form. Clamped to >= 1 (the vector
+        cannot give a rank zero units); the pool sizing's min-rule remains the
+        binding safety net either way."""
+        alpha, beta = curve
+        denom = alpha + beta
+        if denom <= 0.0:
+            return None
+        p_h = (1.0 - beta * float(q_tokens)) / denom
+        if not math.isfinite(p_h):
+            return None
+        return max(int(p_h), 1)
+
     def _maybe_suggest_dcp_token_vector(
         self: ModelRunner, budget_bytes: int, allow_install: bool = False
     ) -> None:
@@ -2475,8 +2582,15 @@ class ModelRunnerKVCacheMixin:
             0,
         )
 
+        # Draft-solo host: its measured capacity is a FUNCTION of the active
+        # vector (its draft KV pool spans the GLOBAL context), so it cannot be
+        # fed into the optimizer raw — see _solo_host_capacity_curve. The curve
+        # is gathered with the capacities so every rank re-derives the identical
+        # corrected value (rank-uniform decision). None on every non-solo path.
+        curve = self._solo_host_capacity_curve(budget_bytes, active)
+
         world = get_world_group().world_size
-        payload = (int(get_parallel().attn_dcp_rank), int(local_p))
+        payload = (int(get_parallel().attn_dcp_rank), int(local_p), curve)
         gathered: list = [None] * world
         torch.distributed.all_gather_object(
             gathered, payload, group=get_world_group().cpu_group
@@ -2484,23 +2598,56 @@ class ModelRunnerKVCacheMixin:
         # Order the capacities by DCP rank (the token vector is indexed by
         # attn_dcp_rank, which need not equal the global rank).
         p_by_rank = [0] * self.dcp_size
-        for dcp_rank, p_val in gathered:
+        solo_host_rank, solo_curve = None, None
+        for dcp_rank, p_val, rank_curve in gathered:
             if 0 <= dcp_rank < self.dcp_size:
                 p_by_rank[dcp_rank] = p_val
+                if rank_curve is not None:
+                    solo_host_rank, solo_curve = dcp_rank, rank_curve
         if any(p <= 0 for p in p_by_rank):
             return
+
+        # ``p_measured`` is the truth UNDER THE ACTIVE VECTOR (what the pools
+        # would be sized to right now); ``p_by_rank`` is what each rank can hold
+        # under a capacity-proportional vector. They differ only on the solo
+        # host.
+        p_measured = list(p_by_rank)
+        if solo_curve is not None:
+            corrected = self._solo_fixed_point_capacity(
+                solo_curve,
+                q_tokens=sum(
+                    p_by_rank[r]
+                    for r in range(self.dcp_size)
+                    if r != solo_host_rank
+                ),
+            )
+            if corrected is not None:
+                if self.tp_rank == 0:
+                    logger.info(
+                        "Draft-solo KV planning: solo host (DCP rank %d) "
+                        "capacity under the ACTIVE vector %s is %d tokens, but "
+                        "%d under a capacity-proportional vector (its draft KV "
+                        "pool is sized to the GLOBAL context, so its capacity "
+                        "shrinks as its ownership share shrinks) — optimizing "
+                        "with the corrected value.",
+                        solo_host_rank,
+                        active,
+                        p_by_rank[solo_host_rank],
+                        corrected,
+                    )
+                p_by_rank[solo_host_rank] = corrected
 
         optimal = partition_units(64, p_by_rank)
         g = math.gcd(*optimal)
         optimal = [v // g for v in optimal]
 
-        def _context_budget(vector: list) -> int:
-            return min(p_by_rank[r] // vector[r] for r in range(self.dcp_size)) * sum(
-                vector
-            )
+        def _context_budget(vector: list, capacities: list) -> int:
+            return min(
+                capacities[r] // vector[r] for r in range(self.dcp_size)
+            ) * sum(vector)
 
-        c_active = _context_budget(active)
-        c_optimal = _context_budget(optimal)
+        c_active = _context_budget(active, p_measured)
+        c_optimal = _context_budget(optimal, p_by_rank)
 
         # --rank-kv-ratio capacity: install the measured vector (rank-uniform
         # decision: server args + gathered P_r only). An explicit pin (env

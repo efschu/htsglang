@@ -2320,11 +2320,25 @@ def apply_auto_performance(server_args) -> None:
                     g = math.gcd(*tok_vec)
                     tok_vec = [v // g for v in tok_vec]
                     if len(set(tok_vec)) > 1:
-                        server_args.rank_kv_ratio = tok_vec
+                        # 'capacity' mode: keep the MODE STRING intact and park
+                        # the prediction in the dedicated seed field. Writing
+                        # the vector into rank_kv_ratio itself would turn the
+                        # mode into an explicit PIN
+                        # (uneven_kv_capacity_mode() -> False), which cancels
+                        # the phase-2 measured install after profiling and
+                        # leaves the boot stuck on this pre-boot prediction.
+                        # For every other value ('coupled', unset) the previous
+                        # behavior is kept byte-identical.
+                        if server_args.uneven_kv_capacity_mode():
+                            server_args.rank_kv_capacity_seed = tok_vec
+                            seeded_as = "phase-1 seed; the measured install after profiling still runs"
+                        else:
+                            server_args.rank_kv_ratio = tok_vec
+                            seeded_as = "explicit vector"
                         lines.append(
                             "draft-solo: seeded the DCP token vector from the "
                             f"predicted per-rank capacity -> {','.join(map(str, tok_vec))} "
-                            "(the budget-estimate fallback does not model the "
+                            f"({seeded_as}; the budget-estimate fallback does not model the "
                             "solo host's draft weights + global draft KV pool, "
                             "which would leave the shadow ranks half empty)."
                         )
