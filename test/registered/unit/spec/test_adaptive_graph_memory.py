@@ -796,7 +796,9 @@ class TestHighAcceptProfile(unittest.TestCase):
             initial_steps=3, cfg={**HIGH_ACCEPT_ADAPTIVE_CONFIG["1"]}
         )
         reached = set()
-        for _ in range(60):
+        # Stage-1 anti-flap: each rung is held >= min_dwell_rounds (default 64)
+        # before the next climb, so reaching 5 takes warmup + two dwells.
+        for _ in range(2 * slot.min_dwell_rounds + slot.warmup_batches + 20):
             slot.update([slot.current_steps])  # every draft fully accepted
             reached.add(slot.current_steps)
         self.assertEqual(slot.current_steps, 5)

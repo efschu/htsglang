@@ -9,6 +9,8 @@ import bisect
 import json
 import logging
 import math
+import time
+from collections import deque
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -241,16 +243,43 @@ def resolve_candidate_steps_from_config(
 
 
 class AdaptiveStepSlot:
-    """Tracks acceptance rate via EMA and adapts num_steps accordingly.
+    """Tracks acceptance over a short trailing window and adapts num_steps.
 
     The core idea: if drafts are consistently accepted, try more steps;
     if drafts are consistently rejected early, reduce steps to avoid waste.
 
-    Formula: target_steps = clamp(round(ema_accept_len) + 1, min_steps, max_steps)
-    - Probes one step beyond observed acceptance
-    - EMA smoothing prevents oscillation
-    - Only updates every `update_interval` batches for stability
-    - num_steps can be selected from different candidate sets on different batch_sizes
+    DECISION SIGNAL (T156 stage-1 controller repair): decisions read the MEAN
+    of a short trailing WINDOW of per-round batch-average accept counts, not
+    the server-lifetime EMA. The 2026-07-22 flap incident (12 switches / 18 s,
+    median dwell 1.0 s, perfect 3<->2 alternation) showed the lifetime EMA is
+    the wrong granularity: it averages code bursts (accept ~3.0-3.5) and prose
+    lulls (~1.0) into a mid value (observed 0.93-1.80) that swings WIDER than
+    the 0.25 hysteresis band on every update. A short window tracks the
+    within-generation modality that actually drives throughput (r=0.901) and
+    has a defined spread, which feeds the noise-scaled deadzone below.
+    ``ema_accept_len`` is still maintained, but only as the observability
+    gauge (``spec_ema_accept_len``); it no longer drives decisions.
+
+    ANTI-FLAP GUARDS (both mandatory; each alone was insufficient):
+    - Minimum dwell: after any applied switch, at least ``min_dwell_rounds``
+      verify rounds must pass before the next switch is considered. Counted
+      in ROUNDS, not wall-clock seconds: every rank replays this decision
+      independently from the rank-0-broadcast accept counts (#50 invariant),
+      and wall time is NOT rank-uniform — a seconds-based dwell would let
+      ranks switch on different rounds and desynchronize CUDA graphs.
+    - Noise-scaled deadzone: a switch must clear its threshold by
+      ``deadzone_sigma`` standard errors of the window mean, on top of the
+      configured up/down hysteresis. A noisy estimator (mixed workload)
+      widens the effective deadzone automatically; a stable estimator keeps
+      the controller responsive.
+
+    The window is cleared on every applied switch: accept counts are capped
+    by the active step count, so samples from the previous rung would bias
+    the next decision. Refilling to ``window_size // 2`` before the next
+    decision acts as a second, data-driven dwell.
+
+    Only updates every `update_interval` batches; num_steps can be selected
+    from different candidate sets on different batch_sizes.
     """
 
     def __init__(self, initial_steps: int, cfg: dict):
@@ -265,17 +294,42 @@ class AdaptiveStepSlot:
         self.up_hysteresis = cfg.get("up_hysteresis", 0.0)
         self.ceiling_coeff = cfg.get("ceiling_coeff", 0)
 
+        # Stage-1 anti-flap knobs (see class docstring). window_size=16 is
+        # ~0.5 s of bs=1 decode rounds: long enough to smooth single-round
+        # noise, short enough to follow a code<->prose modality change.
+        # min_dwell_rounds=64 is ~2 s at the observed ~30 rounds/s, i.e. the
+        # design target dwell, expressed rank-uniformly in rounds.
+        self.window_size = int(cfg.get("window_size", 16))
+        self.min_dwell_rounds = int(cfg.get("min_dwell_rounds", 64))
+        self.deadzone_sigma = float(cfg.get("deadzone_sigma", 1.0))
+        if self.window_size < 1:
+            raise ValueError(f"window_size must be >= 1, got {self.window_size}")
+        if self.min_dwell_rounds < 0:
+            raise ValueError(
+                f"min_dwell_rounds must be >= 0, got {self.min_dwell_rounds}"
+            )
+        if self.deadzone_sigma < 0:
+            raise ValueError(
+                f"deadzone_sigma must be >= 0, got {self.deadzone_sigma}"
+            )
+
         if initial_steps in self.candidate_steps:
             self.current_steps = initial_steps
         else:
             self.current_steps = self.candidate_steps[len(self.candidate_steps) // 2]
 
-        # Initialize EMA at current steps - 1 (neutral starting point)
+        # Observability gauge only (spec_ema_accept_len); not a decision input.
+        # Initialize at current steps - 1 (neutral starting point).
         self.ema_accept_len = float(self.current_steps - 1)
         self._batch_count = 0
+        # Per-round batch-average accept counts; the decision estimator.
+        self._accept_window: deque[float] = deque(maxlen=self.window_size)
+        # Start dwell "expired" so the first decision after warmup is not
+        # additionally delayed (warmup_batches already covers startup).
+        self._rounds_since_switch = self.min_dwell_rounds
 
     def update(self, num_correct_drafts_per_req: list[int]) -> bool:
-        """Update EMA with observed accept lengths. Returns True if params changed.
+        """Feed observed accept lengths. Returns True if params changed.
 
         Args:
             num_correct_drafts_per_req: Per-request accepted draft token counts from last verify.
@@ -290,18 +344,52 @@ class AdaptiveStepSlot:
             self.ema_accept_len = (
                 1 - self.ema_alpha
             ) * self.ema_accept_len + self.ema_alpha * batch_avg
+            self._accept_window.append(batch_avg)
 
         self._batch_count += 1
+        self._rounds_since_switch += 1
         if self._batch_count <= self.warmup_batches:
             return False
 
         if (self._batch_count - self.warmup_batches) % self.update_interval != 0:
             return False
 
+        # Minimum dwell: hard rank-uniform flap limiter (class docstring).
+        if self._rounds_since_switch < self.min_dwell_rounds:
+            return False
+
+        # After a switch (window cleared) require the window to be at least
+        # half full again, so the decision rests on data from the ACTIVE rung.
+        # Zero-step intervals collect no accept data; the probe path below
+        # must stay reachable, so the fill gate only applies while drafting.
+        if self.current_steps > 0 and len(self._accept_window) < max(
+            1, self.window_size // 2
+        ):
+            return False
+
         return self._recompute_params()
 
+    def _window_mean_and_margin(self) -> tuple[float, float]:
+        """Window mean and the noise margin the deadzone scales with.
+
+        The margin is ``deadzone_sigma`` standard errors of the window mean:
+        switch thresholds must be cleared by more than the estimator's own
+        statistical noise, otherwise a mixed workload whose per-round accept
+        counts straddle a threshold (the observed 3<->2 flap) re-crosses it
+        on every update. Pure Python on rank-uniform inputs in identical
+        order -> bit-identical on every rank.
+        """
+        window = self._accept_window
+        n = len(window)
+        mean = sum(window) / n
+        if n < 2 or self.deadzone_sigma == 0.0:
+            return mean, 0.0
+        var = sum((x - mean) ** 2 for x in window) / (n - 1)
+        stderr = math.sqrt(var / n)
+        return mean, self.deadzone_sigma * stderr
+
     def _recompute_params(self) -> bool:
-        """Recompute steps from EMA. Returns True if params changed."""
+        """Recompute steps from the windowed estimator. Returns True if changed."""
         old_steps = self.current_steps
         current_idx = self.candidate_steps.index(old_steps)
         old_idx = current_idx
@@ -316,14 +404,16 @@ class AdaptiveStepSlot:
                 self.ema_accept_len = float(target - 1)
             return self._apply_target_steps(old_steps, target)
 
+        accept_est, noise_margin = self._window_mean_and_margin()
+
         # TODO: Consider limiting step changes to avoid overshooting.
         while current_idx > 0:
             prev_step = self.candidate_steps[current_idx - 1]
             # A zero-step candidate disables drafting. Treat zero accepted drafts
             # as low enough to reach it when it is the floor candidate.
             drop_threshold = 0.5 if prev_step == 0 else prev_step - 0.5
-            drop_threshold += self.down_hysteresis
-            if self.ema_accept_len <= drop_threshold:
+            drop_threshold += self.down_hysteresis - noise_margin
+            if accept_est <= drop_threshold:
                 current_idx -= 1
             else:
                 break
@@ -332,17 +422,17 @@ class AdaptiveStepSlot:
         if not moved_down:
             while current_idx < len(self.candidate_steps) - 1:
                 current_step = self.candidate_steps[current_idx]
-                rise_threshold = current_step - 0.5 + self.up_hysteresis
-                if self.ema_accept_len > rise_threshold:
+                rise_threshold = current_step - 0.5 + self.up_hysteresis + noise_margin
+                if accept_est > rise_threshold:
                     current_idx += 1
                 else:
                     break
 
         target = self.candidate_steps[current_idx]
-        # EMA ceiling: only caps downward — never blocks step-ups, so the
-        # system can explore higher steps and let the EMA catch up.
+        # Estimator ceiling: only caps downward — never blocks step-ups, so
+        # the system can explore higher steps and let the estimator catch up.
         if self.ceiling_coeff > 0:
-            ceiling = max(1, math.ceil(self.ema_accept_len * self.ceiling_coeff))
+            ceiling = max(1, math.ceil(accept_est * self.ceiling_coeff))
             if target > ceiling and target <= old_steps:
                 while current_idx > 0 and self.candidate_steps[current_idx] > ceiling:
                     current_idx -= 1
@@ -353,13 +443,115 @@ class AdaptiveStepSlot:
     def _apply_target_steps(self, old_steps: int, target: int) -> bool:
         if target != old_steps:
             self.current_steps = target
+            window_repr = (
+                f"window_mean={sum(self._accept_window) / len(self._accept_window):.2f} "
+                f"(n={len(self._accept_window)})"
+                if self._accept_window
+                else "window empty"
+            )
             log_info_on_rank0(
                 logger,
                 f"Adaptive spec params updated: steps {old_steps} -> {target} "
-                f"(ema_accept_len={self.ema_accept_len:.2f})",
+                f"({window_repr}, ema_accept_len={self.ema_accept_len:.2f}, "
+                f"dwell={self._rounds_since_switch} rounds)",
             )
+            # Accept counts are capped by the step count, so samples from the
+            # outgoing rung would bias the next decision — start fresh.
+            self._accept_window.clear()
+            self._rounds_since_switch = 0
             return True
         return False
+
+
+class RungMetrics:
+    """Live per-rung reward measurements (T156 stage-4 preparation).
+
+    Tracks, per candidate step count ("rung"), an EMA of
+    - accepted tokens per verify round (accept_len incl. the bonus token), and
+    - decode-round wall time attributed to that rung,
+    i.e. the two factors of the stage-4 bandit objective
+    ``reward(r) = E[accepted_tokens_per_verify(r)] / E[round_seconds(r)]``.
+
+    DETERMINISM WARNING (#50): ``round_s_ema`` is per-rank WALL CLOCK and is
+    NOT rank-uniform. In stage 1 it is OBSERVABILITY-ONLY and must never feed
+    the step decision — every rank recomputes that decision independently
+    from the rank-0-broadcast accept counts, and a timing-dependent input
+    would make the argmax diverge across ranks (graph desync -> NCCL hang).
+    Before any timing term enters the decision (stage 4), the decision must
+    move to rank 0 + broadcast of the chosen rung id (see t156 design 4c).
+    """
+
+    # Slow EMA: rung residence is dwell-limited (>= ~2 s), so per-rung samples
+    # arrive in bursts; a small alpha keeps the estimate stable across visits.
+    EMA_ALPHA = 0.05
+    # Deltas above this are scheduler idle gaps (decode rounds are ~10-50 ms),
+    # not round cost; feeding them would poison the duration estimate.
+    IDLE_CUTOFF_S = 1.0
+    # Rank-0 INFO snapshot every N observed rounds (~1 min at 30 rounds/s).
+    LOG_EVERY_ROUNDS = 2000
+
+    def __init__(self):
+        # steps -> [accept_len_ema, accept_samples, round_s_ema, time_samples]
+        self._per_rung: dict[int, list] = {}
+        self._last_ts: float | None = None
+        self._last_batch_size: int | None = None
+        self._round_count = 0
+
+    def observe(
+        self,
+        steps: int,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        now: float | None = None,
+    ) -> None:
+        """Attribute one verify result (and its round duration) to *steps*.
+
+        *steps* must be the step count that PRODUCED the result (the caller
+        derives it from the result's draft-token stride), not the currently
+        active one: under overlap scheduling the result is processed after
+        the worker may already have switched rungs.
+        """
+        if not num_correct_drafts_per_req:
+            return
+        now = time.monotonic() if now is None else now
+        m = self._per_rung.setdefault(steps, [0.0, 0, 0.0, 0])
+
+        accept_len = 1.0 + sum(num_correct_drafts_per_req) / len(
+            num_correct_drafts_per_req
+        )
+        m[0] = accept_len if m[1] == 0 else (
+            (1 - self.EMA_ALPHA) * m[0] + self.EMA_ALPHA * accept_len
+        )
+        m[1] += 1
+
+        # Round duration = gap to the previous verify completion on this rank.
+        # Only comparable when the batch size did not change in between, and
+        # only meaningful when decode rounds are back-to-back (idle cutoff).
+        if self._last_ts is not None and batch_size == self._last_batch_size:
+            dt = now - self._last_ts
+            if 0.0 < dt < self.IDLE_CUTOFF_S:
+                m[2] = dt if m[3] == 0 else (
+                    (1 - self.EMA_ALPHA) * m[2] + self.EMA_ALPHA * dt
+                )
+                m[3] += 1
+        self._last_ts = now
+        self._last_batch_size = batch_size
+
+        self._round_count += 1
+        if self._round_count % self.LOG_EVERY_ROUNDS == 0:
+            log_info_on_rank0(logger, f"Adaptive rung metrics: {self.snapshot()}")
+
+    def snapshot(self) -> dict[int, dict[str, float | int]]:
+        """Per-rung metric snapshot for logging / the stage-4 objective."""
+        return {
+            steps: {
+                "accept_len_ema": round(m[0], 3),
+                "accept_samples": m[1],
+                "round_s_ema": round(m[2], 5),
+                "time_samples": m[3],
+            }
+            for steps, m in sorted(self._per_rung.items())
+        }
 
 
 class AdaptiveSpeculativeParams:
@@ -394,6 +586,10 @@ class AdaptiveSpeculativeParams:
         self._active_slot_bs: int | None = None
         self._pending_slot_bs: int | None = None
         self._pending_slot_count = 0
+
+        # Per-rung reward measurement (stage-4 bandit preparation).
+        # Observability-only in stage 1 — see the RungMetrics docstring.
+        self.rung_metrics = RungMetrics()
 
         for bs, entry in sorted(bs_entries.items()):
             self._slots[bs] = AdaptiveStepSlot(
@@ -453,6 +649,20 @@ class AdaptiveSpeculativeParams:
         if params.update(num_correct_drafts_per_req):
             return params.current_steps
         return None
+
+    def note_verify_observation(
+        self,
+        steps: int,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+    ) -> None:
+        """Record per-rung reward measurements (accept length + round time).
+
+        Observability / stage-4 preparation only: never consulted by the step
+        decision in stage 1 (its duration term is rank-local wall clock — see
+        the RungMetrics determinism warning).
+        """
+        self.rung_metrics.observe(steps, num_correct_drafts_per_req, batch_size)
 
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None:
         """Return cuda_graph_bs values that can reach *step* at runtime.

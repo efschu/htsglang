@@ -302,9 +302,12 @@ class AdaptiveController:
             self._activate(target)
 
     def on_verify_complete(
-        self, num_correct_drafts_per_req: list[int], batch_size: int
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        result_steps: int | None = None,
     ) -> None:
-        """Feed verify results; switch runtime state if EMA warrants it.
+        """Feed verify results; switch runtime state if the estimator warrants it.
 
         DETERMINISM INVARIANT (#50): *num_correct_drafts_per_req* MUST derive
         from the rank-0-broadcast accept counts (``result.accept_lens``, whose
@@ -314,7 +317,24 @@ class AdaptiveController:
         keeps the step decision a pure function of rank-invariant inputs, so
         every TP/DCP rank swaps to the same graph on the same decode step.
         Guarded by the AST ratchet in test_draft_pick_rank_sync.py.
+
+        *result_steps* is the step count that PRODUCED this (possibly delayed,
+        under overlap) result; it only attributes the per-rung reward
+        measurement (stage-4 preparation) and never enters the step decision.
         """
+        # Rung metrics first: pure measurement, wanted even for rounds the
+        # forced-swap test hook consumes. Falls back to the currently active
+        # step count when the caller cannot recover the producing rung.
+        if num_correct_drafts_per_req:
+            self.params.note_verify_observation(
+                (
+                    result_steps
+                    if result_steps is not None
+                    else self.worker.speculative_num_steps
+                ),
+                num_correct_drafts_per_req,
+                batch_size,
+            )
         if self._maybe_forced_swap():
             return
         new_step = self.params.on_verify_complete(

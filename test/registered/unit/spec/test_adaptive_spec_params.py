@@ -10,6 +10,7 @@ from sglang.srt.speculative.adaptive_runtime_state import (
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
+    RungMetrics,
     resolve_candidate_steps_from_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
@@ -17,10 +18,22 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
+# Disables the T156 stage-1 anti-flap guards (windowed estimator inertia,
+# minimum dwell, noise-scaled deadzone) so the threshold/hysteresis tests
+# below keep pinning that logic in isolation. The guards have their own
+# test classes (TestStage1AntiFlap, TestRungMetrics).
+_STAGE1_GUARDS_OFF = {
+    "window_size": 1,
+    "min_dwell_rounds": 0,
+    "deadzone_sigma": 0.0,
+}
+
 
 class TestAdaptiveStepSlot(unittest.TestCase):
     def _make_params_from_config(self, initial_steps: int, config: dict):
-        return AdaptiveStepSlot(initial_steps=initial_steps, cfg=config)
+        return AdaptiveStepSlot(
+            initial_steps=initial_steps, cfg={**_STAGE1_GUARDS_OFF, **config}
+        )
 
     def test_initial_steps_snaps_to_middle_when_missing(self):
         params = self._make_params_from_config(2, {"candidate_steps": [1, 3, 7]})
@@ -175,6 +188,9 @@ class TestAdaptiveStepSlot(unittest.TestCase):
         self.assertEqual(params.current_steps, 3)
 
     def test_multi_batch_sequence_can_ramp_up_then_back_down(self):
+        # window_size=2 shows the windowed estimator's inertia: a single bad
+        # round after a good one averages to the middle, so descent from 7 is
+        # gradual (one rung per decision), mirroring the old EMA behavior.
         params = self._make_params_from_config(
             3,
             {
@@ -184,24 +200,27 @@ class TestAdaptiveStepSlot(unittest.TestCase):
                 "update_interval": 1,
                 "up_hysteresis": 0.0,
                 "down_hysteresis": 0.0,
+                "window_size": 2,
             },
         )
 
         self.assertTrue(params.update([4, 4]))
         self.assertEqual(params.current_steps, 7)
+        # ema_accept_len is the observability gauge; it keeps EMA smoothing.
         self.assertEqual(params.ema_accept_len, 3.0)
 
+        # Window was cleared on the switch: this decision sees only [4.0]
+        # (post-switch round), so 7 holds.
+        self.assertFalse(params.update([4, 4]))
+        self.assertEqual(params.current_steps, 7)
+
+        # Window [4.0, 0.0] -> mean 2.0: down exactly one rung, not to floor.
         self.assertTrue(params.update([0, 0]))
         self.assertEqual(params.current_steps, 3)
-        self.assertEqual(params.ema_accept_len, 1.5)
 
-        self.assertFalse(params.update([0, 0]))
-        self.assertEqual(params.current_steps, 3)
-        self.assertEqual(params.ema_accept_len, 0.75)
-
+        # Fresh window [0.0] after the switch -> mean 0.0: down to the floor.
         self.assertTrue(params.update([0, 0]))
         self.assertEqual(params.current_steps, 1)
-        self.assertEqual(params.ema_accept_len, 0.375)
 
     def test_zero_step_mixed_slot_drops_probes_and_rechecks(self):
         params = self._make_params_from_config(
@@ -470,6 +489,148 @@ class TestBsDebounce(unittest.TestCase):
             params.on_verify_complete([2, 2], batch_size=8)
         self.assertEqual(params._slots[8].ema_accept_len, ema_8_before)
         self.assertEqual(params.get_steps_for_batch(8), 5)  # still pending 1
+
+
+class TestStage1AntiFlap(unittest.TestCase):
+    """T156 stage 1: controller repair against the 2026-07-22 flap incident
+    (12 switches in 18 s, median dwell 1.0 s, perfect 3<->2 alternation on
+    an input signal that swings wider than the 0.25 hysteresis band)."""
+
+    def _run(self, cfg: dict, seq: list[list[int]]) -> int:
+        slot = AdaptiveStepSlot(
+            initial_steps=3, cfg={"candidate_steps": [1, 2, 3], **cfg}
+        )
+        return sum(1 for r in seq if slot.update(r))
+
+    def test_flapping_sequence_is_dwell_limited(self):
+        # Synthetic bs=1 regime of the incident: alternating 5-round bursts
+        # of full acceptance (code) and full rejection (prose), whose overall
+        # mean (1.5) sits exactly on the 2->3 rise threshold.
+        rounds = 600
+        seq = [[3] if (i // 5) % 2 == 0 else [0] for i in range(rounds)]
+
+        # Guard-free configuration (the pre-stage-1 behavior): every decision
+        # point samples one phase or the other and flips -> mass flapping.
+        old_switches = self._run(
+            {"warmup_batches": 0, "update_interval": 5, **_STAGE1_GUARDS_OFF},
+            seq,
+        )
+        # Stage-1 defaults (window 16, min_dwell_rounds 64, deadzone_sigma 1):
+        # the window straddles multiple phases, its mean stays inside the
+        # noise-widened deadzone, and any switch is dwell-limited.
+        new_switches = self._run(
+            {"warmup_batches": 0, "update_interval": 5}, seq
+        )
+
+        self.assertGreater(old_switches, 20, "flap reproduction is dead")
+        slot_dwell = AdaptiveStepSlot(
+            initial_steps=3, cfg={"candidate_steps": [1, 2, 3]}
+        ).min_dwell_rounds
+        self.assertLessEqual(new_switches, rounds // slot_dwell + 1)
+        self.assertLess(new_switches, old_switches / 4)
+
+    def test_min_dwell_blocks_consecutive_switches(self):
+        cfg = {
+            "candidate_steps": [1, 2, 3],
+            "warmup_batches": 0,
+            "update_interval": 1,
+            "window_size": 1,
+            "deadzone_sigma": 0.0,
+            "min_dwell_rounds": 10,
+        }
+        slot = AdaptiveStepSlot(initial_steps=3, cfg=cfg)
+        switch_rounds = []
+        for i in range(100):
+            # Alternates faster than the dwell: would switch on nearly every
+            # update without the guard.
+            if slot.update([3] if (i // 2) % 2 else [0]):
+                switch_rounds.append(i)
+        self.assertGreaterEqual(len(switch_rounds), 2)
+        gaps = [b - a for a, b in zip(switch_rounds, switch_rounds[1:])]
+        self.assertTrue(all(g >= 10 for g in gaps), gaps)
+
+    def test_noise_scaled_deadzone_blocks_noisy_threshold_straddle(self):
+        cfg = {
+            "candidate_steps": [2, 3],
+            "warmup_batches": 0,
+            "update_interval": 1,
+            "window_size": 8,
+            "min_dwell_rounds": 0,
+            "deadzone_sigma": 2.0,
+            "down_hysteresis": 0.0,
+        }
+        slot = AdaptiveStepSlot(initial_steps=3, cfg=cfg)
+        # Noisy accepts around the 3->2 drop threshold (1.5): the window mean
+        # stays ~1.5 but its spread widens the deadzone -> no switch, ever.
+        for i in range(200):
+            self.assertFalse(slot.update([0] if i % 2 else [3]))
+        self.assertEqual(slot.current_steps, 3)
+        # A stable low regime (spread -> 0) still drops promptly.
+        switched_after = None
+        for i in range(20):
+            if slot.update([1]):
+                switched_after = i
+                break
+        self.assertIsNotNone(switched_after)
+        self.assertEqual(slot.current_steps, 2)
+
+    def test_window_reset_on_switch_requires_fresh_data(self):
+        cfg = {
+            "candidate_steps": [1, 3],
+            "warmup_batches": 0,
+            "update_interval": 1,
+            "window_size": 8,
+            "min_dwell_rounds": 0,
+            "deadzone_sigma": 0.0,
+        }
+        slot = AdaptiveStepSlot(initial_steps=1, cfg=cfg)
+        switch_round = None
+        for i in range(4):
+            if slot.update([3]):
+                switch_round = i
+        # Decisions wait for the window to half-fill (8 // 2 = 4 rounds).
+        self.assertEqual(switch_round, 3)
+        self.assertEqual(slot.current_steps, 3)
+        # The switch cleared the window: dropping back needs 4 FRESH rounds
+        # measured at the new rung, even though the signal is unambiguous.
+        results = [slot.update([0]) for _ in range(4)]
+        self.assertEqual(results, [False, False, False, True])
+        self.assertEqual(slot.current_steps, 1)
+
+
+class TestRungMetrics(unittest.TestCase):
+    """Stage-4 preparation: per-rung reward measurement (observability-only
+    in stage 1; wall-clock term must never feed the rank-replicated step
+    decision — see the RungMetrics determinism warning)."""
+
+    def test_accept_and_duration_ema(self):
+        m = RungMetrics()
+        m.observe(3, [2, 3], batch_size=1, now=10.0)
+        snap = m.snapshot()
+        self.assertEqual(snap[3]["accept_len_ema"], 3.5)  # mean 2.5 + bonus
+        self.assertEqual(snap[3]["time_samples"], 0)  # no previous round yet
+        m.observe(3, [3, 3], batch_size=1, now=10.05)
+        snap = m.snapshot()
+        self.assertEqual(snap[3]["time_samples"], 1)
+        self.assertAlmostEqual(snap[3]["round_s_ema"], 0.05, places=5)
+
+    def test_idle_gaps_and_bs_changes_do_not_pollute_duration(self):
+        m = RungMetrics()
+        m.observe(3, [1], batch_size=1, now=10.0)
+        m.observe(3, [1], batch_size=2, now=10.05)  # bs changed: not comparable
+        m.observe(3, [1], batch_size=2, now=15.0)  # idle gap: not round cost
+        self.assertEqual(m.snapshot()[3]["time_samples"], 0)
+        self.assertEqual(m.snapshot()[3]["accept_samples"], 3)
+
+    def test_attribution_by_producing_rung(self):
+        # Delayed overlap results must land on the rung that produced them,
+        # not the currently active one — hence separate per-steps buckets.
+        m = RungMetrics()
+        m.observe(2, [2], batch_size=1, now=1.0)
+        m.observe(3, [3], batch_size=1, now=1.02)
+        snap = m.snapshot()
+        self.assertEqual(snap[2]["accept_samples"], 1)
+        self.assertEqual(snap[3]["accept_samples"], 1)
 
 
 def _fake_ws(ptr: int):

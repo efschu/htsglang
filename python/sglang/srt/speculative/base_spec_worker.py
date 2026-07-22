@@ -346,12 +346,18 @@ class BaseSpecWorker(ABC):
         pass
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        steps: int | None = None,
     ) -> None:
         """Hook called after verify finishes and accept counts are on CPU.
 
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.
+        *steps* is the speculative step count that produced the result
+        (derived from the result's draft-token stride; the worker may already
+        have switched by the time a delayed overlap result is processed).
         """
         pass
 

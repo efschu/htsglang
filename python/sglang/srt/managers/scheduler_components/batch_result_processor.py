@@ -576,8 +576,18 @@ class SchedulerBatchResultProcessor:
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
+        # steps: the rung that PRODUCED this result (worker state may already
+        # have switched when a delayed overlap result lands here); recovered
+        # from the recorded draft-token stride, used only to attribute the
+        # per-rung reward measurement.
         self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+            result.num_correct_drafts_per_req_cpu,
+            batch_size=len(batch.reqs),
+            steps=(
+                result.speculative_num_draft_tokens - 1
+                if result.speculative_num_draft_tokens is not None
+                else None
+            ),
         )
 
         predict_tokens = []
