@@ -136,6 +136,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
+        # Small solo draft-KV pool (T156 task D): set in alloc_memory_pool
+        # on the solo HOST when a policy/gate context cap bounds the DFLASH
+        # rung; None = full global-mirror pool (default, byte-identical).
+        self._solo_pool_mapper = None
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
@@ -540,6 +544,39 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Shadow rank: NO draft KV pool (the draft never runs here; the
             # solo host holds the whole draft KV). Pure VRAM win.
             return
+        self._solo_pool_mapper = self._maybe_init_solo_small_pool(
+            memory_pool_config, token_to_kv_pool_allocator
+        )
+        if self._solo_pool_mapper is not None:
+            # Task D: the draft pool holds only num_draft_slots slots; every
+            # draft-KV address is translated global->draft slot (mapper) and
+            # the draft attention runs over a PRIVATE req_to_token table in
+            # draft-slot space (maintained per decode round). The global
+            # allocator's config is cloned with the small token count so the
+            # standard pool construction sizes the buffers.
+            import dataclasses
+
+            small_cfg = dataclasses.replace(
+                memory_pool_config,
+                max_total_num_tokens=self._solo_pool_mapper.num_draft_slots,
+            )
+            self._draft_worker.alloc_memory_pool(
+                memory_pool_config=small_cfg,
+                req_to_token_pool=None,  # private table in draft-slot space
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
+            pool = self.draft_model_runner.token_to_kv_pool
+            pool_size = int(getattr(pool, "size", -1))
+            if pool_size != self._solo_pool_mapper.num_draft_slots:
+                raise RuntimeError(
+                    "DFLASH small solo pool: the draft KV pool was built "
+                    f"with {pool_size} slots instead of the requested "
+                    f"{self._solo_pool_mapper.num_draft_slots} "
+                    f"({type(pool).__name__}); the pool class does not obey "
+                    "max_total_num_tokens -- disable via "
+                    "SGLANG_DFLASH_SOLO_POOL_CAP=off."
+                )
+            return
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=(
@@ -547,6 +584,117 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+
+    def _maybe_init_solo_small_pool(
+        self, memory_pool_config, token_to_kv_pool_allocator
+    ):
+        """Resolve whether the small solo draft pool (task D) applies and
+        build its slot mapper. Returns None (full mirror pool) unless every
+        precondition holds; each decision is logged."""
+        import os
+
+        from sglang.srt.mem_cache.allocator.paged import (
+            PagedTokenToKVPoolAllocator,
+        )
+        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+        from sglang.srt.speculative.dflash_solo_pool import (
+            DEFAULT_SOLO_POOL_FACTOR,
+            SOLO_POOL_FACTOR_ENV,
+            DraftKVSlotMapper,
+            resolve_dflash_solo_pool_cap,
+        )
+
+        if not (self._spec_solo_active and self._spec_solo_is_host):
+            return None
+        if self.use_compact_draft_cache:
+            return None
+        cap, source = resolve_dflash_solo_pool_cap(self.server_args)
+        if cap is None:
+            logger.info(
+                "DFLASH solo draft pool: full global-mirror pool (%s).", source
+            )
+            return None
+        if memory_pool_config is None or token_to_kv_pool_allocator is None:
+            logger.warning(
+                "DFLASH solo draft pool: cap %d resolved (%s) but no memory "
+                "pool config / allocator was provided; keeping the full "
+                "mirror pool.",
+                cap,
+                source,
+            )
+            return None
+        # Slot lifetimes are mirrored through the allocator's free listener;
+        # wired + verified for the two token-granular allocators (page 1).
+        # The uneven-DCP rig uses PagedTokenToKVPoolAllocator with the
+        # NATURAL page_size 1 and size = the GLOBAL virtual index space.
+        alloc_ok = type(token_to_kv_pool_allocator) is TokenToKVPoolAllocator or (
+            type(token_to_kv_pool_allocator) is PagedTokenToKVPoolAllocator
+            and int(token_to_kv_pool_allocator.page_size) == 1
+        )
+        if not alloc_ok:
+            logger.warning(
+                "DFLASH solo draft pool: allocator %s (page_size=%s) is not "
+                "a wired token-granular allocator; free-listener coverage "
+                "unverified -- keeping the full mirror pool.",
+                type(token_to_kv_pool_allocator).__name__,
+                getattr(token_to_kv_pool_allocator, "page_size", "?"),
+            )
+            return None
+        factor = float(
+            os.environ.get(SOLO_POOL_FACTOR_ENV, DEFAULT_SOLO_POOL_FACTOR)
+        )
+        if factor < 1.0:
+            raise ValueError(
+                f"{SOLO_POOL_FACTOR_ENV} must be >= 1.0; got {factor}."
+            )
+        # The GLOBAL slot index space: the allocator's size (under even DCP
+        # it exceeds the per-rank token count; cache locs index into it).
+        num_global = max(
+            int(memory_pool_config.max_total_num_tokens),
+            int(getattr(token_to_kv_pool_allocator, "size", 0)),
+        )
+        mrr = int(
+            memory_pool_config.max_running_requests
+            or self.server_args.max_running_requests
+            or 1
+        )
+        block = int(self.block_size)
+        # Sizing: live sub-cap requests need at most (cap + block) tokens
+        # each; the factor is the safety margin for radix-retained sub-cap
+        # prefixes (they keep their draft KV for later reuse). +1: draft
+        # slot 0 is the reserved zero-KV hole slot.
+        num_draft_slots = 1 + int((cap + block) * mrr * factor)
+        if num_draft_slots >= num_global:
+            logger.info(
+                "DFLASH solo draft pool: sized cap pool (%d slots) would not "
+                "beat the global pool (%d slots); keeping the mirror pool.",
+                num_draft_slots,
+                num_global,
+            )
+            return None
+        mapper = DraftKVSlotMapper(
+            num_global_slots=num_global,
+            num_draft_slots=num_draft_slots,
+            ctx_cap=int(cap),
+            device=self.device,
+        )
+        token_to_kv_pool_allocator.register_free_listener(
+            mapper.on_global_free, mapper.on_global_clear
+        )
+        logger.info(
+            "DFLASH small solo draft pool ACTIVE: ctx cap %d (%s), "
+            "%d draft slots (= 1 + (cap %d + block %d) x max_running %d x "
+            "factor %g) instead of %d global slots.",
+            cap,
+            source,
+            num_draft_slots,
+            cap,
+            block,
+            mrr,
+            factor,
+            num_global,
+        )
+        return mapper
 
     def init_attention_backends(self):
         # The mamba-verify-commit flag is a TARGET-pool property (read on every
@@ -1160,6 +1308,77 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
+    def _solo_pool_prepare_decode(
+        self, batch, prefix_lens, verify_out_cache_loc, bs: int
+    ) -> torch.Tensor:
+        """Task D per-round prep on the solo host (small pool active):
+
+        1. GUARD (readable error, never a silent OOB): the drafter policy /
+           ctx gate must have evicted DFLASH before any request reaches the
+           ctx cap; a violation here is a routing bug.
+        2. Gather the requests' committed prefix cache locations from the
+           TARGET (global) req_to_token table, translate them to draft
+           slots (unmapped -> zero-KV hole slot, counted) and materialize
+           them into the draft's private req_to_token rows.
+        3. Translate the verify block's cache locations (allocating draft
+           slots) for rows [prefix, prefix+block) and return them as the
+           draft forward's out_cache_loc.
+        """
+        from sglang.srt.speculative.dflash_solo_pool import SOLO_POOL_CAP_ENV
+
+        mapper = self._solo_pool_mapper
+        mapper.begin_round()
+        if bs > 0:
+            if batch.seq_lens_cpu is not None:
+                max_ctx = int(batch.seq_lens_cpu.max().item())
+            else:
+                max_ctx = int(prefix_lens.max().item())
+            # Overlap decision lag: the policy/gate decides at round
+            # boundaries on seq_lens that trail the in-flight round by up
+            # to one verify block, so a request legitimately crosses the
+            # cap DURING its last DFLASH round and one more round may run
+            # before the switch lands (measured 2026-07-22: ctx 4097 at
+            # cap 4096 on the transition prompt). The pool sizing factor
+            # already budgets (cap + block) per request; only a crossing
+            # BEYOND the lag window is a genuine routing bug.
+            if max_ctx >= mapper.ctx_cap + 2 * int(self.block_size):
+                raise RuntimeError(
+                    "DFLASH small solo pool: a request with context "
+                    f"{max_ctx} reached the DFLASH decode path, beyond the "
+                    f"ctx cap {mapper.ctx_cap} plus the one-round overlap "
+                    f"decision lag (2 x block {int(self.block_size)}). The "
+                    "drafter policy / ctx gate must evict the DFLASH rung "
+                    "at the cap; this is a routing bug (or the cap is "
+                    f"misconfigured -- {SOLO_POOL_CAP_ENV})."
+                )
+        prefix_loc_global = self._gather_req_to_token_segments(
+            req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+            req_pool_indices=batch.req_pool_indices,
+            start=None,
+            lengths=prefix_lens,
+        )
+        prefix_loc_draft = mapper.translate_read(prefix_loc_global)
+        draft_table = self.draft_model_runner.req_to_token_pool.req_to_token
+        zeros = torch.zeros_like(prefix_lens)
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            draft_table,
+            zeros,
+            prefix_lens,
+            prefix_loc_draft,
+            bs,
+        )
+        block_loc_draft = mapper.translate_write(verify_out_cache_loc)
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            draft_table,
+            prefix_lens,
+            prefix_lens + int(self.block_size),
+            block_loc_draft,
+            bs,
+        )
+        return block_loc_draft
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -1242,6 +1461,27 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens = commit_lens.to(device, non_blocking=True)
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
+
+        if self._solo_pool_mapper is not None:
+            # Task D (small solo pool): translate the write addressing from
+            # global to draft-slot space, allocating draft slots for fresh
+            # globals. Prefix-valid (2d) writes: rows at/after a request's
+            # commit length are never touched by the writer, so they map to
+            # the hole slot WITHOUT allocating -- this is also what keeps
+            # gated (zero-commit) requests out of the pool entirely.
+            mapper = self._solo_pool_mapper
+            if cache_loc_2d is not None:
+                width = int(cache_loc_2d.shape[1])
+                valid = (
+                    torch.arange(
+                        width, device=cache_loc_2d.device
+                    ).unsqueeze(0)
+                    < commit_lens.unsqueeze(1)
+                )
+                cache_loc_2d = mapper.translate_write(cache_loc_2d, valid=valid)
+                cache_loc = cache_loc_2d.reshape(-1)
+            else:
+                cache_loc = mapper.translate_write(cache_loc)
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
@@ -1589,11 +1829,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
-            self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=target_hidden,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
-            )
+            prefill_hidden = target_hidden
+            prefill_cache_loc = batch.out_cache_loc
+            prefill_positions = positions
+            if self._solo_pool_mapper is not None:
+                (
+                    prefill_hidden,
+                    prefill_cache_loc,
+                    prefill_positions,
+                ) = self._solo_pool_filter_prefill(
+                    batch, target_hidden, batch.out_cache_loc, positions
+                )
+            if prefill_cache_loc is not None and prefill_cache_loc.numel() > 0:
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=prefill_hidden,
+                    cache_loc=prefill_cache_loc,
+                    positions=prefill_positions,
+                )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         self._release_target_context_hidden(logits_output)
@@ -1602,6 +1854,35 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus_tokens=next_token_ids,
             seq_lens=batch.seq_lens,
         )
+
+    def _solo_pool_filter_prefill(
+        self, batch, target_hidden, cache_loc, positions
+    ):
+        """Task D: drop draft-KV prefill materialization for requests that
+        can never be served by the DFLASH rung under the ctx cap (their
+        TOTAL prompt already reaches it -- checked against the full
+        origin_input_ids, so chunked prefills of a long prompt are skipped
+        from the FIRST chunk on, not just the crossing one). Their tokens
+        would only flood the small pool; the policy/gate routes them to the
+        NEXTN rung anyway. Sub-cap requests keep the exact stock behavior.
+
+        Returns (hidden, cache_loc, positions) filtered to the kept
+        requests' extend tokens; (None, None, None) when nothing is kept.
+        """
+        cap = self._solo_pool_mapper.ctx_cap
+        keep_flags = []
+        for req, pl, el in zip(batch.reqs, batch.prefix_lens, batch.extend_lens):
+            total = max(len(req.origin_input_ids), int(pl) + int(el))
+            keep_flags.append(total < cap)
+        if all(keep_flags):
+            return target_hidden, cache_loc, positions
+        if not any(keep_flags):
+            return None, None, None
+        mask = torch.repeat_interleave(
+            torch.tensor(keep_flags, dtype=torch.bool),
+            torch.tensor([int(el) for el in batch.extend_lens]),
+        ).to(cache_loc.device)
+        return target_hidden[mask], cache_loc[mask], positions[mask]
 
     def forward_batch_generation(
         self,
@@ -1831,6 +2112,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
                 draft_seq_lens = draft_prefix_lens
                 draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
+                draft_out_cache_loc = verify_out_cache_loc
             else:
                 # Non-windowed path uses the shared overallocated mapping directly.
                 # Backend planning only needs a safe upper bound for the committed
@@ -1849,13 +2131,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                     seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
                     draft_seq_lens_sum = int(prefix_lens.sum().item())
 
+                draft_out_cache_loc = verify_out_cache_loc
+                if self._solo_pool_mapper is not None:
+                    # Task D (small solo pool): rebuild the draft's PRIVATE
+                    # req_to_token rows in draft-slot space and translate
+                    # this round's block cache locs; the draft forward (incl.
+                    # its graphs) never sees a global slot id.
+                    draft_out_cache_loc = self._solo_pool_prepare_decode(
+                        batch, prefix_lens, verify_out_cache_loc, bs
+                    )
+
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 batch_size=bs,
                 input_ids=block_ids.flatten(),
                 req_pool_indices=batch.req_pool_indices,
                 seq_lens=draft_seq_lens,
-                out_cache_loc=verify_out_cache_loc,
+                out_cache_loc=draft_out_cache_loc,
                 seq_lens_sum=draft_seq_lens_sum,
                 seq_lens_cpu=seq_lens_cpu,
                 positions=positions,

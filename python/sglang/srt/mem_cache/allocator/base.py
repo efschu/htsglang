@@ -46,6 +46,30 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        # Free/clear listeners (T156 task D: the DFLASH small solo draft
+        # pool mirrors global slot LIFETIMES through these). Subclasses that
+        # implement free()/clear() should call _notify_free/_notify_clear;
+        # consumers must verify their allocator class does (the token
+        # allocator is wired; see register_free_listener callers).
+        self._free_listeners = []
+
+    def register_free_listener(self, on_free, on_clear=None) -> None:
+        """Subscribe to slot lifetime events: ``on_free(free_index)`` after
+        indices return to the free set, ``on_clear()`` on a full reset.
+        Listeners must be cheap and thread-tolerant (free runs on the
+        scheduler thread)."""
+        self._free_listeners.append((on_free, on_clear))
+
+    def _notify_free(self, free_index) -> None:
+        # getattr: subclasses may clear() from __init__ before the base
+        # __init__ ran (defensive; the token allocator initializes in order).
+        for on_free, _on_clear in getattr(self, "_free_listeners", ()):
+            on_free(free_index)
+
+    def _notify_clear(self) -> None:
+        for _on_free, on_clear in getattr(self, "_free_listeners", ()):
+            if on_clear is not None:
+                on_clear()
 
     @property
     def size_full(self):

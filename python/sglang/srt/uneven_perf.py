@@ -506,7 +506,7 @@ def vocab_ratio_from_membw(membw_gbs: Sequence[float], base: int = 6) -> List[in
 
 def measured_kv_budget_fingerprint_fields(server_args) -> dict:
     sa = server_args
-    return {
+    fields = {
         "model_path": sa.model_path,
         "tp_size": sa.tp_size,
         "rank_gpu_id": getattr(sa, "rank_gpu_id", None),
@@ -529,12 +529,6 @@ def measured_kv_budget_fingerprint_fields(server_args) -> dict:
         ),
         "spec_adaptive": sa.speculative_adaptive,
         "spec_adaptive_config": sa.speculative_adaptive_config,
-        # force=policy: the drafter-policy table decides WHICH NEXTN k
-        # states get built (only table-referenced ks), so different tables
-        # have different boot footprints -- corrections are not
-        # transferable between them (same role spec_adaptive_config plays
-        # for the auto mode's bandit k set).
-        "spec_drafter_policy": getattr(sa, "speculative_drafter_policy", None),
         # RAW draft-token count, deliberately NOT max_speculative_num_draft_
         # tokens: that is a cached_property which resolves the cross-rung
         # shapes — evaluating it at parse time (before the speculative hook
@@ -548,6 +542,18 @@ def measured_kv_budget_fingerprint_fields(server_args) -> dict:
             sa.cuda_graph_config.decode, "max_bs", None
         ),
     }
+    # force=policy: an EXPLICIT drafter-policy table decides which NEXTN k
+    # states get built (and, via the T156-D ctx cap, the DFLASH solo pool
+    # size), so different tables have different boot footprints and their
+    # corrections are not transferable (the role spec_adaptive_config plays
+    # for the auto mode). Included ONLY when set: the unset/auto default is
+    # a pure function of already-fingerprinted fields (drafter config +
+    # force), and omitting it keeps every pre-existing registry digest
+    # valid (adding the key unconditionally would orphan all of them).
+    drafter_policy = getattr(sa, "speculative_drafter_policy", None)
+    if drafter_policy is not None:
+        fields["spec_drafter_policy"] = drafter_policy
+    return fields
 
 
 def measured_kv_budget_cache_path(server_args) -> str:

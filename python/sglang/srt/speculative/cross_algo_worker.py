@@ -1192,20 +1192,41 @@ class CrossAlgoWorker(BaseSpecWorker):
                 f"({None if cache_loc is None else cache_loc.numel()} vs "
                 f"{bs}*{width})"
             )
-            # Chain verify (topk == 1): verify row r of request i sits at
-            # position seq_lens[i] + r (spec_v2: batch.seq_lens is the
-            # pre-round length).
-            positions = (
-                batch.seq_lens.to(torch.int64).unsqueeze(1)
-                + self._nextn_pos_offsets(width)
-            ).reshape(-1)
-            dsub._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=aux,
-                cache_loc=cache_loc,
-                cache_loc_2d=cache_loc.view(bs, width),
-                positions=positions,
-                commit_lens=batch_output.accept_lens,
-            )
+            commit_lens = batch_output.accept_lens
+            skip_all = False
+            mapper = getattr(dsub, "_solo_pool_mapper", None)
+            if mapper is not None:
+                # Task D (small solo pool): keep only sub-cap requests'
+                # DFLASH draft KV warm. Over-cap requests can never be
+                # served by the DFLASH rung again (policy stage bound / ctx
+                # gate + eviction), so their appends would only flood the
+                # small pool -- and skipping them is a straight compute win.
+                # Zeroed commit lengths make the prefix-valid writer (and
+                # the mapper's allocation) skip those requests' rows.
+                keep = batch.seq_lens < mapper.ctx_cap
+                commit_lens = torch.where(
+                    keep, commit_lens, torch.zeros_like(commit_lens)
+                )
+                if batch.seq_lens_cpu is not None:
+                    # CPU-side skip decision (no device sync).
+                    skip_all = not bool(
+                        (batch.seq_lens_cpu < mapper.ctx_cap).any()
+                    )
+            if not skip_all:
+                # Chain verify (topk == 1): verify row r of request i sits at
+                # position seq_lens[i] + r (spec_v2: batch.seq_lens is the
+                # pre-round length).
+                positions = (
+                    batch.seq_lens.to(torch.int64).unsqueeze(1)
+                    + self._nextn_pos_offsets(width)
+                ).reshape(-1)
+                dsub._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=aux,
+                    cache_loc=cache_loc,
+                    cache_loc_2d=cache_loc.view(bs, width),
+                    positions=positions,
+                    commit_lens=commit_lens,
+                )
         logits_output.cross_aux_hidden_states = None
 
     def _nextn_pos_offsets(self, width: int) -> torch.Tensor:

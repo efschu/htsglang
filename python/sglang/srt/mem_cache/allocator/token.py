@@ -47,6 +47,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._notify_clear()
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
@@ -72,6 +73,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:
                 self.free_pages = torch.cat((self.free_pages, free_index))
+            # Grouped frees (the else branch) are notified once, when
+            # free_group_end re-enters here with the concatenated indices.
+            self._notify_free(free_index)
         else:
             self.free_group.append(free_index)
 

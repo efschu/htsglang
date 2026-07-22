@@ -268,6 +268,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
                 self.free_pages = torch.cat((free_page_indices, self.free_pages))
+            # Token-index semantics for listeners (grouped frees are
+            # notified once, via free_group_end re-entering here).
+            self._notify_free(free_index)
         else:
             self.free_group.append(free_index)
 
@@ -282,6 +285,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._notify_clear()
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
