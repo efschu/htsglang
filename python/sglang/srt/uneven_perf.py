@@ -90,6 +90,17 @@ _PROBE_GEMV_ROWS, _PROBE_GEMV_K = 131072, 5120
 _PREDICT_OVERHEAD_MIB = 1280
 #: The auto-mamba activation reserve (MAMBA_AUTO_ACTIVATION_RESERVE_MIB).
 _PREDICT_MAMBA_ACT_RESERVE_MIB = 1024
+#: EXTRA budget charged to the solo draft HOST only
+#: (--speculative-draft-placement solo), on top of the draft weights and the
+#: globally-sized draft KV pool that the families / KV cell already cover:
+#: the draft's own attention workspace (flashinfer scratch, roughly fixed) and
+#: its decode CUDA graphs (which scale with the captured batch sizes, hence
+#: with max_running_requests). Calibrated on the reference rig, where the host
+#: allocated 634 MiB past its budget at max_running_requests=2 and 2266 MiB at
+#: 4; the values below bound both with margin, because under-reserving here
+#: OOMs the card mid-decode while over-reserving only costs some KV.
+_SOLO_HOST_WORKSPACE_MIB = 512
+_SOLO_HOST_GRAPH_MIB_PER_REQ = 512
 #: Minimum viable per-rank token capacity: below this the weighted-DCP owner
 #: rule degenerates (a rank must own >= 1 of every virtual block; M22 C3b
 #: measured the resulting context collapse).
@@ -510,6 +521,14 @@ class PlanInputs:
     speculative_algorithm: Optional[str] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_draft_model_path: Optional[str] = None
+    #: --speculative-draft-placement. "split" (default) puts a draft SHARD on
+    #: every rank; "solo" puts the WHOLE unsharded draft -- weights, a
+    #: globally-sized draft KV pool, and the draft graphs -- on one rank and
+    #: nothing on the others. The weight planner must know which, because the
+    #: two placements have opposite per-rank cost profiles.
+    speculative_draft_placement: str = "split"
+    #: Rank hosting the solo draft (ignored unless placement == "solo").
+    speculative_draft_solo_rank: int = 0
     max_running_requests: Optional[int] = None
     disable_cuda_graph: bool = False
     #: Include the vision tower in the resident weight budget. These are VL
@@ -562,6 +581,17 @@ class PlanInputs:
             speculative_algorithm=server_args.speculative_algorithm,
             speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
             speculative_draft_model_path=server_args.speculative_draft_model_path,
+            speculative_draft_placement=str(
+                getattr(server_args, "speculative_draft_placement", "split")
+                or "split"
+            ),
+            speculative_draft_solo_rank=(
+                server_args.speculative_draft_solo_rank()
+                if getattr(server_args, "speculative_draft_placement", "split")
+                == "solo"
+                and hasattr(server_args, "speculative_draft_solo_rank")
+                else 0
+            ),
             max_running_requests=server_args.max_running_requests,
             disable_cuda_graph=bool(
                 getattr(server_args, "disable_cuda_graph", False)
@@ -649,6 +679,68 @@ _GGUF_SCALAR_FMT = {
     0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "B",
     10: "Q", 11: "q", 12: "d",
 }
+
+
+#: Layer-type names that own a paged KV cache. Linear/mamba/GDN layers keep a
+#: fixed-size recurrent STATE instead (sized by the mamba pool, not per token),
+#: so they must not be counted here.
+_KV_BEARING_LAYER_TYPES = ("full_attention", "sliding_attention", "attention")
+
+
+def _kv_cell_bytes_from_config(cfg: dict, kv_cache_dtype: Optional[str]) -> Optional[float]:
+    """KV bytes per token for ANY model config -- used to size an external
+    speculative draft's KV pool from the DRAFT's own layout rather than
+    assuming it matches the target's.
+
+    Deliberately layout-generic, because a draft may be:
+
+    * dense MHA/GQA -> 2 (K and V) * kv_heads * head_dim per layer;
+    * MLA / DeepSeek-style -> ONE latent vector per token
+      (kv_lora_rank + qk_rope_head_dim), not a K/V pair;
+    * hybrid (GDN / mamba / linear attention mixed with attention) -> only the
+      attention layers own a paged KV cache; the recurrent layers hold a
+      fixed-size state that does not scale with context;
+    * GGUF -> ``_load_config`` already synthesizes the same keys from the
+      header, so this works unchanged.
+
+    Returns None when the config does not describe a KV cache the caller can
+    size, so callers keep their previous fallback rather than guessing.
+    """
+    if not isinstance(cfg, dict):
+        return None
+    text = cfg.get("text_config", cfg)
+    elem = 1 if "fp8" in str(kv_cache_dtype or "") else 2
+
+    # KV-bearing layer count: honour layer_types when present (hybrid models),
+    # else assume every layer is an attention layer.
+    layer_types = text.get("layer_types")
+    if layer_types:
+        layers = sum(1 for t in layer_types if str(t) in _KV_BEARING_LAYER_TYPES)
+    else:
+        layers = int(text.get("num_hidden_layers", 0) or 0)
+    if layers <= 0:
+        return None
+
+    # MLA: a single compressed latent per token, so no factor 2 and no kv_heads.
+    kv_lora_rank = int(text.get("kv_lora_rank", 0) or 0)
+    if kv_lora_rank > 0:
+        rope_dim = int(text.get("qk_rope_head_dim", 0) or 0)
+        return float((kv_lora_rank + rope_dim) * elem * layers)
+
+    # Dense MHA / GQA.
+    kv_heads = int(
+        text.get("num_key_value_heads")
+        or text.get("num_attention_heads")
+        or 0
+    )
+    head_dim = int(text.get("head_dim", 0) or 0)
+    if head_dim <= 0:
+        hidden = int(text.get("hidden_size", 0) or 0)
+        q_heads = int(text.get("num_attention_heads", 0) or 0)
+        head_dim = hidden // q_heads if hidden > 0 and q_heads > 0 else 0
+    if kv_heads <= 0 or head_dim <= 0:
+        return None
+    return float(2 * kv_heads * head_dim * elem * layers)
 
 
 def _is_gguf_model(model_path: Optional[str]) -> bool:
@@ -1222,6 +1314,59 @@ class PerfCostModel:
 
         self.spec_active = plan_inputs.speculative_algorithm is not None
         self.spec_draft_tokens = int(plan_inputs.speculative_num_draft_tokens or 0)
+        # -- draft PLACEMENT (--speculative-draft-placement) -----------------
+        # Split (default): every rank carries ~1/tp of the draft, which is what
+        # the draft_* families below encode. Solo: ONE rank carries the whole
+        # unsharded draft and the others carry none -- the exact opposite
+        # profile. Charging the split cost under solo hands the solo host
+        # (usually the fastest card, so the one the optimizer already wants to
+        # load) a weight shard it has no room for, collapsing its KV capacity
+        # and -- because the global context is min_r(P_r/ratio_r)*sum(ratios)
+        # -- throttling every other rank too. Mirrors the token planner's
+        # pool_configurator.solo_draft_kv_cell_factor.
+        self.solo_active = bool(
+            self.spec_active
+            and str(getattr(plan_inputs, "speculative_draft_placement", "split"))
+            == "solo"
+            and self.tp_size >= 2
+        )
+        self.solo_rank = (
+            int(getattr(plan_inputs, "speculative_draft_solo_rank", 0) or 0)
+            if self.solo_active
+            else 0
+        )
+        if not (0 <= self.solo_rank < self.tp_size):
+            self.solo_rank = 0
+        # External draft checkpoint (DFLASH / any --speculative-draft-model):
+        # its bytes live in a SEPARATE checkpoint, so the target-config-derived
+        # draft_attn/draft_mlp mass above does not describe it at all. Only
+        # counted under solo, where it is unambiguously one rank's resident
+        # cost; the split path keeps its historical (unmodelled) behaviour so
+        # non-solo planning stays byte-identical.
+        self.solo_draft_ckpt_bytes = 0.0
+        #: Draft-KV bytes per token on the solo host. ``None`` = fall back to
+        #: the target's mtp_layers-derived term.
+        self.solo_draft_kv_cell_bytes = None
+        if self.solo_active and plan_inputs.speculative_draft_model_path:
+            from sglang.srt.distributed.utils import _checkpoint_size_mib
+
+            self.solo_draft_ckpt_bytes = float(
+                _checkpoint_size_mib(plan_inputs.speculative_draft_model_path)
+            ) * 2**20
+            # An EXTERNAL draft (DFLASH) has its own depth and KV geometry, so
+            # the target's ``mtp_num_hidden_layers`` describes a different model
+            # entirely. Concretely on the reference rig the DFLASH draft is
+            # 5 layers x 8 kv heads while the target's MTP term is 1 layer x
+            # 4 kv heads -- a 10x under-count of a pool that is sized to the
+            # GLOBAL context, i.e. multiple GB on the host. Read the draft's
+            # own config instead; fall back silently if it is unreadable.
+            try:
+                self.solo_draft_kv_cell_bytes = _kv_cell_bytes_from_config(
+                    self._load_config(plan_inputs.speculative_draft_model_path),
+                    plan_inputs.kv_cache_dtype,
+                )
+            except Exception:  # pragma: no cover - defensive, config optional
+                self.solo_draft_kv_cell_bytes = None
         kv_dtype = str(plan_inputs.kv_cache_dtype or "auto")
         self.kv_cell_bytes_per_layer = (
             2 * self.kv_heads * self.head_dim * (1 if "fp8" in kv_dtype else 2)
@@ -1336,6 +1481,20 @@ class PerfCostModel:
             "draft_repl": _Family(draft_repl, 2.0, "replicated"),
         }
 
+        # Solo placement: the draft is not sharded, it is RESIDENT ON ONE RANK.
+        # Re-point every draft family at that rank (shadows drop to zero) and
+        # add the external draft checkpoint, which the target-config-derived
+        # mass above cannot describe. Guarded on solo_active so the split cost
+        # model -- families, shards and bytes_per_param anchoring alike -- is
+        # untouched.
+        if self.solo_active:
+            for _name in ("draft_attn", "draft_mlp", "draft_repl"):
+                families[_name].shard = "solo_host"
+            if self.solo_draft_ckpt_bytes > 0:
+                families["draft_solo_ckpt"] = _Family(
+                    self.solo_draft_ckpt_bytes, 1.0, "solo_host"
+                )
+
         # GGUF path: every family (embed/lm_head, attention, MLP, GDN) is
         # quantized on its own ggml grid, so instead of the safetensors
         # "BF16-inside-INT4" anchoring below we set each family's bytes/param
@@ -1373,8 +1532,15 @@ class PerfCostModel:
         if not include_vision and vision_disk_bytes > 0 and ckpt_bytes > 0:
             ckpt_bytes = max(ckpt_bytes - vision_disk_bytes, 0.0)
         quant_names = ("attn", "mlp", "draft_attn", "draft_mlp")
+        # ``draft_solo_ckpt`` holds bytes from a SEPARATE checkpoint, so it must
+        # not enter the anchoring that spreads THIS checkpoint's remaining bytes
+        # over the quantized families -- counting it would deflate their
+        # bytes/param. (Absent unless solo_active, so the split path is
+        # unaffected.)
         bf16_bytes = sum(
-            fam.bytes for name, fam in families.items() if name not in quant_names
+            fam.bytes
+            for name, fam in families.items()
+            if name not in quant_names and name != "draft_solo_ckpt"
         )
         quant_params = sum(families[name].params for name in quant_names)
         if ckpt_bytes > 0 and quant_params > 0:
@@ -1406,6 +1572,11 @@ class PerfCostModel:
             return [1.0 / n] * n
         if shard == "replicated":
             return [1.0] * n
+        if shard == "solo_host":
+            # Whole family resident on the solo draft host, nothing anywhere
+            # else. Only produced when solo_active (see _build_families), so
+            # the split path never reaches this branch.
+            return [1.0 if r == self.solo_rank else 0.0 for r in range(n)]
         if shard == "attn":
             grid = self.attn_units
             if grid < n:
@@ -1516,6 +1687,54 @@ class PerfCostModel:
 
     # -- capacity prediction ------------------------------------------------
 
+    def _solo_rank_token_capacity(self, free_bytes: List[float]) -> List[float]:
+        """Per-rank TARGET-KV token capacity under solo draft placement.
+
+        The split model gives every rank a per-token cell of
+        ``t_tgt + t_drf`` (target KV + its draft-KV slice). Under solo that is
+        wrong on both kinds of rank:
+
+        * SHADOW ranks hold NO draft KV at all -> their cell is ``t_tgt``, so
+          they can hold strictly more target tokens than the split model says.
+        * The HOST's draft pool is sized to the GLOBAL context C, not to its
+          own token share, because the unsharded draft must attend the whole
+          sequence. So its draft-KV cost scales with C, not with ``p_host``.
+
+        With the converged token vector (ratios proportional to capacity) the
+        host obeys ``free_h = p_h * t_tgt + C * t_drf`` and ``C = sum(p)``.
+        Substituting ``Q = sum of the shadows' p`` gives the closed form
+
+            C   = (free_h + Q * t_tgt) / (t_tgt + t_drf)
+            p_h = C - Q
+
+        which reduces to the split expression when the draft KV is zero. This
+        is the predictor-side mirror of
+        ``pool_configurator.solo_draft_kv_cell_factor``.
+        """
+        per_layer = self.kv_cell_bytes_per_layer
+        t_tgt = per_layer * self.full_layers
+        if self.solo_draft_kv_cell_bytes is not None:
+            # External draft: its own depth/KV geometry (see __init__).
+            t_drf = self.solo_draft_kv_cell_bytes
+        else:
+            t_drf = self.kv_cell_bytes - t_tgt  # target-MTP draft-KV term
+        if t_tgt <= 0:
+            return [f / self.kv_cell_bytes for f in free_bytes]
+        p = [0.0] * self.tp_size
+        q = 0.0
+        for r in range(self.tp_size):
+            if r == self.solo_rank:
+                continue
+            p[r] = free_bytes[r] / t_tgt
+            q += p[r]
+        free_h = free_bytes[self.solo_rank]
+        if t_drf <= 0:
+            p[self.solo_rank] = free_h / t_tgt
+            return p
+        ctx = (free_h + q * t_tgt) / (t_tgt + t_drf)
+        p[self.solo_rank] = ctx - q
+        return p
+
     def predict_capacity(self, mlp_vector: List[int]) -> dict:
         """Predicted per-rank KV token capacity P_r and max context for a
         candidate MLP vector (the base plan's attention/GDN/DCP splits are
@@ -1530,11 +1749,32 @@ class PerfCostModel:
         overhead = (
             _PREDICT_OVERHEAD_MIB + _PREDICT_MAMBA_ACT_RESERVE_MIB
         ) * 2**20
-        p = []
+        # Solo host only: the draft's CUDA graphs and its own attention
+        # workspace live on top of the draft weights and draft KV pool, and
+        # neither the generic per-rank overhead above nor the weight families
+        # cover them. Left out, the host allocates PAST its budget -- measured
+        # +634 MiB at max_running_requests=2 and +2266 MiB at 4 on the
+        # reference rig, i.e. it grows with the captured decode batch sizes --
+        # which leaves the card with a few hundred MiB free and OOMs during
+        # decode. Charged deliberately conservatively: over-reserving costs a
+        # little KV, under-reserving costs the whole server.
+        solo_overhead = 0.0
+        if self.solo_active:
+            mrr = int(self.plan_inputs.max_running_requests or 1)
+            solo_overhead = (
+                _SOLO_HOST_WORKSPACE_MIB + _SOLO_HOST_GRAPH_MIB_PER_REQ * max(mrr, 1)
+            ) * 2**20
+        free_bytes = []
         for r in range(self.tp_size):
             budget = self.budgets_mib[r] * 2**20
-            free = budget - weights[r] - self.mamba_pool_bytes[r] - overhead
-            p.append(free / self.kv_cell_bytes)
+            extra = solo_overhead if (self.solo_active and r == self.solo_rank) else 0.0
+            free_bytes.append(
+                budget - weights[r] - self.mamba_pool_bytes[r] - overhead - extra
+            )
+        if self.solo_active:
+            p = self._solo_rank_token_capacity(free_bytes)
+        else:
+            p = [f / self.kv_cell_bytes for f in free_bytes]
         feasible = all(x >= _PREDICT_MIN_RANK_TOKENS for x in p)
         if feasible:
             ctx = min(sum(p), _PREDICT_TOKEN_UNITS * min(p))
@@ -2058,6 +2298,36 @@ def apply_auto_performance(server_args) -> None:
             f"--rank-tp-ratio auto --rank-mlp-ratio "
             f"{','.join(map(str, chosen))}"
         )
+        # Solo placement: seed the DCP token vector from the PREDICTED per-rank
+        # capacity instead of letting resolve_cp_token_ratios fall back to its
+        # budget estimate. That estimate splits tokens proportionally to raw
+        # VRAM budget minus a weight-share term, which under solo is wrong on
+        # the host by two large, unmodelled costs: the whole unsharded draft and
+        # a draft KV pool sized to the GLOBAL context. The host therefore gets a
+        # token share it cannot fund, the global pool is
+        # min_r(P_r * S / ratio_r) -- so the host binds it -- and the other
+        # cards sit half empty. The predicted vector already accounts for both
+        # (see _solo_rank_token_capacity).
+        #
+        # Precedence is respected: SGLANG_UNEVEN_TOKEN_VECTOR and an explicit
+        # --rank-kv-ratio pin both still win, because this only fills in the
+        # unpinned default. Guarded on solo so non-solo planning is untouched.
+        if model.solo_active and pred.get("token_vector"):
+            existing_kv = getattr(server_args, "rank_kv_ratio", None)
+            if not isinstance(existing_kv, list):
+                tok_vec = [int(v) for v in pred["token_vector"]]
+                if len(tok_vec) == model.tp_size and all(v > 0 for v in tok_vec):
+                    g = math.gcd(*tok_vec)
+                    tok_vec = [v // g for v in tok_vec]
+                    if len(set(tok_vec)) > 1:
+                        server_args.rank_kv_ratio = tok_vec
+                        lines.append(
+                            "draft-solo: seeded the DCP token vector from the "
+                            f"predicted per-rank capacity -> {','.join(map(str, tok_vec))} "
+                            "(the budget-estimate fallback does not model the "
+                            "solo host's draft weights + global draft KV pool, "
+                            "which would leave the shadow ranks half empty)."
+                        )
     else:
         lines.append(
             "CHOSEN: keep plain VRAM-auto split (no MLP vector override)."

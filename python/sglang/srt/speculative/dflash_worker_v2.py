@@ -40,7 +40,10 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    capture_safe_tp_broadcast,
+)
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
 _is_npu = is_npu()
@@ -268,108 +271,140 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
 
-        # Solo: full (unsharded) target embed + lm_head, assembled from the TP
-        # vocab shards. The host embeds block ids and samples the draft block
-        # LOCALLY against these full tables (no vocab-parallel all_gather /
-        # all_reduce, which the absent shadow ranks could not join).
-        self._solo_full_embed_weight: Optional[torch.Tensor] = None
-        self._solo_full_lm_head_weight: Optional[torch.Tensor] = None
+        # Solo: the vocab tables STAY SHARDED where they already are. Rather
+        # than moving ~5 GB of embed + lm_head rows onto the host, the host
+        # moves the ACTIVATIONS to the tables: it broadcasts the draft trunk's
+        # hidden states once per round and every rank computes the logits for
+        # ITS OWN vocab shard through the target's vocab-parallel lm_head,
+        # reusing the existing greedy cross-rank reduction.
+        self._solo_hidden_dim: int = 0
+        self._solo_hs_dtype: Optional[torch.dtype] = None
+        self._solo_hs_buf: Optional[torch.Tensor] = None
+        self._solo_hs_cap: int = 0
         self._draft_block_recv_buf: Optional[torch.Tensor] = None
         if self._spec_solo_active:
-            self._solo_setup_full_vocab()
+            self._solo_setup_vocab_broadcast()
 
-    def _solo_setup_full_vocab(self) -> None:
-        """Collectively assemble the FULL target embed + lm_head tables on the
-        solo HOST and drop the transient recv buffers on shadows.
+    def _solo_setup_vocab_broadcast(self) -> None:
+        """Solo: record the geometry the per-round hidden-state broadcast needs
+        and give shadow ranks their stub draft-runner surface.
 
-        COLLECTIVE: every TP rank calls this at the same init point (shadows
-        contribute their vocab shard and keep nothing). Mirrors
-        EagleDraftWorker._solo_init_lm_head — DFLASH samples the draft block
-        against the TARGET's embed/lm_head, which are vocab-parallel; the solo
-        host must hold the full tables to sample locally, so the per-round
-        greedy path needs no cross-rank all_gather the shadows can't join.
+        NO COLLECTIVE and NO vocab gather. The earlier solo implementation
+        assembled the FULL unsharded embed + lm_head on the host (~5 GB at a
+        ~150k vocab in bf16) purely so the host could embed and sample without
+        a collective the absent shadows could not join. That inverted the cost:
+        the tables are huge and static, the activations are tiny and per-step.
+
+        The broadcast scheme instead keeps both tables sharded exactly where
+        the target already put them:
+
+        * embedding — every rank calls the target's vocab-parallel
+          ``embed_tokens`` on the (rank-uniform) block ids; the module's own
+          masked-lookup + all_reduce reconstructs the full embedding on every
+          rank, so the host gets a bit-identical result to the old local
+          ``F.embedding`` against the gathered table (the all_reduce adds
+          exact zeros from the non-owning ranks).
+        * sampling — the host broadcasts the draft trunk's hidden states and
+          every rank runs the EXISTING vocab-parallel greedy reduction
+          (``_greedy_sample_from_vocab_parallel_head``) over its own lm_head
+          shard. That is the same code path, and the same collective, the
+          split placement already uses.
+
+        Shadow ranks therefore DO participate in the draft phase now — as
+        vocab-shard logit providers — even though they still run no draft
+        forward and hold no draft weights / KV / graphs.
         """
         from sglang.srt.speculative.eagle_worker_v2 import (
-            _solo_gather_full_vocab_rows,
             install_shadow_draft_runner_surface,
         )
 
         target_model = self._target_worker.model_runner.model
-        embed_module = target_model.get_input_embeddings()
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None or not hasattr(lm_head, "weight"):
             raise NotImplementedError(
                 "--speculative-draft-placement solo with DFLASH requires the "
-                "target to expose a dense lm_head.weight (the solo host samples "
-                "the draft block against the full unsharded lm_head)."
+                "target to expose a dense lm_head.weight (every rank samples "
+                "the draft block against its own vocab shard of it)."
             )
-        vocab_size = int(self._target_worker.model_config.vocab_size)
-        keep = self._spec_solo_is_host
-        tp_group = get_tp_group()
-
-        def _gather(module) -> Optional[torch.Tensor]:
-            shard = module.weight
-            if shard.shape[0] >= vocab_size:
-                # Replicated table (tp=1-ish); reuse directly on the host.
-                return shard[:vocab_size].contiguous() if keep else None
-            idx = getattr(module, "shard_indices", None)
-            if idx is not None and int(getattr(idx, "num_added_elements", 0)) > 0:
-                raise NotImplementedError(
-                    "--speculative-draft-placement solo with DFLASH does not "
-                    "support added-vocab shard layouts."
-                )
-            valid_rows = (
-                int(idx.num_org_elements) if idx is not None else int(shard.shape[0])
+        weight = lm_head.weight
+        if not torch.is_floating_point(weight):
+            raise NotImplementedError(
+                "--speculative-draft-placement solo with DFLASH requires an "
+                "unquantized target lm_head.weight; got dtype "
+                f"{weight.dtype}."
             )
-            return _solo_gather_full_vocab_rows(
-                tp_group, shard, valid_rows, vocab_size, keep
-            )
-
-        full_embed = _gather(embed_module)
-        full_head = _gather(lm_head)
-        if keep:
-            self._solo_full_embed_weight = full_embed.contiguous()
-            self._solo_full_lm_head_weight = full_head.contiguous()
-        else:
-            # Shadow: drop recv buffers before KV profiling reads free VRAM
-            # (same M21 reasoning as the EAGLE solo gather), then expose the
-            # loud-AttributeError / None surface on the meta draft runner.
-            self._solo_full_embed_weight = None
-            self._solo_full_lm_head_weight = None
-            if is_cuda():
-                torch.cuda.empty_cache()
+        # Rank-uniform geometry: the hidden dim is the lm_head's input dim and
+        # the broadcast dtype is the weight dtype the greedy matmul casts to
+        # anyway, so the payload needs no extra cast on the receiving side.
+        self._solo_hidden_dim = int(weight.shape[1])
+        self._solo_hs_dtype = weight.dtype
+        if not self._spec_solo_is_host:
+            # Shadow: expose the loud-AttributeError / None surface on the meta
+            # draft runner. No recv buffers to drop — nothing was gathered.
             install_shadow_draft_runner_surface(self.draft_model_runner)
 
     @property
     def _solo_is_shadow(self) -> bool:
         return self._spec_solo_active and not self._spec_solo_is_host
 
-    def _solo_greedy_sample_full(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Solo host: greedy argmax of draft hidden states against the FULL
-        (unsharded) target lm_head, chunked to bound peak logits memory. No
-        cross-rank collective — the whole vocabulary is local."""
-        weight = self._solo_full_lm_head_weight
-        weight_dtype = weight.dtype
-        num_tokens = int(hidden_states.shape[0])
-        out_tokens = torch.empty(
-            (num_tokens,), dtype=torch.long, device=hidden_states.device
-        )
-        chunk = 1024
-        for start in range(0, num_tokens, chunk):
-            end = min(num_tokens, start + chunk)
-            hs = hidden_states[start:end]
-            if hs.dtype != weight_dtype:
-                hs = hs.to(weight_dtype)
-            logits = torch.matmul(hs, weight.T)
-            out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
-        return out_tokens
+    def _solo_hidden_broadcast_buf(self, num_tokens: int) -> torch.Tensor:
+        """Grow-only [num_tokens, hidden] staging buffer for the per-round
+        hidden-state broadcast. Rank-uniform shape/dtype by construction."""
+        # NOTE: no device comparison here. ``self.device`` is an INDEXLESS
+        # string ("cuda") while an allocated tensor reports "cuda:0", so a
+        # device check would miss on every call and reallocate the buffer each
+        # round. The worker never migrates devices, so creation on
+        # ``self.device`` once is enough.
+        if self._solo_hs_buf is None or self._solo_hs_cap < num_tokens:
+            cap = max(int(num_tokens), 1)
+            self._solo_hs_buf = torch.empty(
+                (cap, self._solo_hidden_dim),
+                dtype=self._solo_hs_dtype,
+                device=self.device,
+            )
+            self._solo_hs_cap = cap
+        return self._solo_hs_buf[:num_tokens]
+
+    def _solo_broadcast_draft_hidden(
+        self, num_tokens: int, hidden_states: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Publish the solo host's draft hidden states to every rank.
+
+        This is THE transfer that replaces the full-vocab gather: one
+        ``[num_tokens, hidden]`` tensor per draft round (num_tokens =
+        bs * (block_size - 1)) instead of ~5 GB of vocab rows held forever.
+
+        CAPTURE SAFETY: called from the eager draft loop only, AFTER the draft
+        graph replay has returned — never from inside a captured region. A
+        collective captured on the host would have no matching shadow
+        participant (the shadows capture no draft graphs at all) and would
+        deadlock the round.
+        """
+        buf = self._solo_hidden_broadcast_buf(num_tokens)
+        tp_group = get_tp_group()
+        if tp_group.world_size == 1 or num_tokens == 0:
+            # Nothing to publish (or nobody to publish to). num_tokens is
+            # rank-uniform, so skipping stays symmetric.
+            return hidden_states if hidden_states is not None else buf
+        if hidden_states is not None:
+            if int(hidden_states.shape[-1]) != self._solo_hidden_dim:
+                raise RuntimeError(
+                    "--speculative-draft-placement solo with DFLASH needs the "
+                    "draft trunk's hidden width to match the target lm_head's "
+                    f"input width, but got {int(hidden_states.shape[-1])} vs "
+                    f"{self._solo_hidden_dim}. The draft cannot be sampled "
+                    "against the target's vocab shards."
+                )
+            # Host: stage into the rank-uniform buffer (this is also the cast
+            # to the lm_head weight dtype the greedy matmul would do anyway).
+            buf.copy_(hidden_states)
+        capture_safe_tp_broadcast(tp_group, (buf,), src=self._spec_solo_rank)
+        return buf
 
     def _solo_broadcast_draft_block(self, draft_tokens: torch.Tensor) -> None:
         """One broadcast per round: the host's [bs, block_size] draft block to
         the shadow ranks. Eager (never inside a captured region); capture-safe
         primitive so co-located rigs work too."""
-        from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
-
         tp_group = get_tp_group()
         if tp_group.world_size == 1:
             return
@@ -478,6 +513,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if get_tp_group().world_size != 1:
             return _eager("tp>1")
+        if self._spec_solo_active:
+            # Solo samples through the vocab-parallel greedy reduction, which
+            # is a TP collective and must stay eager (outside the replayed
+            # region) so the shadow ranks can join it.
+            return _eager("draft-solo")
         if self.block_size <= 1:
             return _eager("block_size<=1")
         target_model = self._target_worker.model_runner.model
@@ -1584,21 +1624,37 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
 
+        # Number of hidden-state rows the draft samples this round. Pure
+        # function of rank-uniform state (bs, block_size), so the solo shadows
+        # can size the broadcast buffer without hearing from the host.
+        num_sample_tokens = bs * (int(self.block_size) - 1)
+
         if self._solo_is_shadow:
-            # Shadow rank: skip the draft forward + sampling entirely; the
-            # block's proposed token ids arrive from the solo host's broadcast.
+            # Shadow rank: runs NO draft forward, but is a vocab-shard logit
+            # provider for the host's draft sampling. It must therefore join,
+            # in this exact order, every collective the host issues below:
+            #   1. the vocab-parallel embedding all_reduce (block_ids are
+            #      already rank-uniform — filled + seeded above on every rank),
+            #   2. the host's hidden-state broadcast,
+            #   3. the vocab-parallel greedy reduction over its own lm_head
+            #      shard (result discarded here; the host's block is
+            #      authoritative),
+            #   4. the per-round draft-block broadcast, which remains the
+            #      single source of truth for the proposed token ids.
+            embed_module(block_ids)
+            recv_hs = self._solo_broadcast_draft_hidden(num_sample_tokens, None)
+            self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=recv_hs,
+                lm_head=lm_head,
+            )
             # Column 0 (the seeded bonus) is already rank-consistent.
             self._solo_broadcast_draft_block(draft_tokens)
         else:
             # HOST / split path: draft-block forward + greedy sampling.
-            if self._spec_solo_active:
-                # Solo host: embed against the FULL local table (the sharded
-                # target embed's all_reduce has no shadow ranks to join).
-                noise_embedding = torch.nn.functional.embedding(
-                    block_ids, self._solo_full_embed_weight
-                )
-            else:
-                noise_embedding = embed_module(block_ids)
+            # Under solo this is the same vocab-parallel embedding call the
+            # split path makes: the shadows join its all_reduce (see above),
+            # so no unsharded embed table is needed on the host.
+            noise_embedding = embed_module(block_ids)
             input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
             seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
@@ -1677,7 +1733,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_out = self.draft_model_runner.forward(forward_batch)
             draft_logits_output = draft_out.logits_output
 
-            if self._draft_sampler is not None and draft_out.can_run_graph:
+            if (
+                self._draft_sampler is not None
+                and draft_out.can_run_graph
+                and not self._spec_solo_active
+            ):
+                # Graph-folded greedy head. Never taken under solo: the solo
+                # sampling reduction is a TP collective and must stay eager,
+                # outside the replayed region, so the shadows can join it.
                 draft_next = self._draft_sampler.out[
                     : bs * (int(self.block_size) - 1)
                 ].view(bs, int(self.block_size) - 1)
@@ -1690,17 +1753,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
                 sample_hs = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
                 if self._spec_solo_active:
-                    # Solo host: local full-vocab argmax against the gathered
-                    # lm_head (no vocab-parallel all_gather for the absent
-                    # shadow ranks).
-                    draft_next = self._solo_greedy_sample_full(sample_hs).view(
-                        bs, int(self.block_size) - 1
+                    # Solo host: publish the trunk's hidden states (EAGER —
+                    # the graph replay above has already returned) and then run
+                    # the SAME vocab-parallel greedy reduction the split path
+                    # uses. Each rank contributes the argmax over its own
+                    # lm_head shard; the reduction picks the global winner.
+                    sample_hs = self._solo_broadcast_draft_hidden(
+                        num_sample_tokens, sample_hs
                     )
-                else:
-                    draft_next = self._greedy_sample_from_vocab_parallel_head(
-                        hidden_states=sample_hs,
-                        lm_head=lm_head,
-                    ).view(bs, int(self.block_size) - 1)
+                draft_next = self._greedy_sample_from_vocab_parallel_head(
+                    hidden_states=sample_hs,
+                    lm_head=lm_head,
+                ).view(bs, int(self.block_size) - 1)
 
             draft_tokens[:, 1:].copy_(draft_next)
             if self._spec_solo_active:
