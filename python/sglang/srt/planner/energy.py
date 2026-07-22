@@ -475,6 +475,19 @@ def _nvml_name(name) -> str:
     return name.decode() if isinstance(name, bytes) else str(name)
 
 
+def _default_pythonpath() -> str:
+    """PYTHONPATH default for spawned server / worker processes: the
+    ``python/`` directory of the RUNNING sglang tree (derived from
+    ``sglang.__file__``), so a checkout-launched planner boots servers from the
+    same code it runs itself. Override with ``SGLANG_PLANNER_PYTHONPATH``."""
+    override = os.environ.get("SGLANG_PLANNER_PYTHONPATH")
+    if override:
+        return override
+    import sglang
+
+    return os.path.dirname(os.path.dirname(os.path.abspath(sglang.__file__)))
+
+
 def _venv_cuda_lib_dirs(python_exe: str) -> List[str]:
     """The venv's bundled NVIDIA/torch shared-lib dirs (libcudart.so.13,
     libnvrtc.so.13, ...), so a RE-EXEC'd worker python finds them at interpreter
@@ -518,7 +531,7 @@ class EnergyHarness:
 
     def boot(self):
         env = dict(os.environ)
-        env.setdefault("PYTHONPATH", "/spinning/wt-integration-r2/python")
+        env.setdefault("PYTHONPATH", _default_pythonpath())
         # --rank-gpu-id forces SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS, which
         # RE-EXECs each scheduler (and, under spec decoding, extra draft
         # workers) as a fresh python. A fresh interpreter loads libcudart before
@@ -1698,7 +1711,12 @@ def compare_summary(baseline: MeasurementResult, mtp: MeasurementResult,
 # Validation run (Qwen3.6-27B-FP8, TP=3 uneven-DCP).
 # ---------------------------------------------------------------------------
 
-VALIDATION_MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8"
+# The checkpoint for the LIVE validation run. Machine-specific, so it comes
+# from the environment; when unset the live run disables itself with a clear
+# message (the config builders below still work for unit tests -- they only
+# format flags and never touch the path).
+VALIDATION_MODEL = os.environ.get("SGLANG_PLANNER_VALIDATION_MODEL") or None
+_VALIDATION_MODEL_PLACEHOLDER = "<set SGLANG_PLANNER_VALIDATION_MODEL>"
 DEFAULT_RESULTS_STORE = os.path.join(
     os.path.dirname(__file__), "measured_results.jsonl")
 
@@ -1706,7 +1724,7 @@ DEFAULT_RESULTS_STORE = os.path.join(
 def validation_config(**overrides) -> MeasurementConfig:
     """The no-MTP BASELINE config (Qwen3.6-27B-FP8, TP=3 uneven-DCP)."""
     cfg = MeasurementConfig(
-        model_path=VALIDATION_MODEL,
+        model_path=VALIDATION_MODEL or _VALIDATION_MODEL_PLACEHOLDER,
         served_model_name="Qwen3.6-27B",
         tp_size=3,
         rank_gpu_id=[0, 1, 2],                     # cuda:0 = 5090 (torch order)
@@ -1771,6 +1789,12 @@ def main(argv=None) -> int:
                    default="both", help="which config(s) to measure")
     p.add_argument("--no-ingest", action="store_true")
     args = p.parse_args(argv)
+
+    if VALIDATION_MODEL is None:
+        print("[energy] SGLANG_PLANNER_VALIDATION_MODEL is not set -- the "
+              "live validation run needs a local checkpoint path; skipping "
+              "(nothing measured, nothing ingested).", flush=True)
+        return 0
 
     buckets = tuple(int(x) for x in args.buckets.split(","))
     wls = (

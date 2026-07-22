@@ -103,7 +103,10 @@ requires_gpu = pytest.mark.skipif(
 # 5090 really is cuda:0 in a throwaway subprocess before any boot.
 # ===========================================================================
 
-_MODELS_ROOT = "/spinning/llm_stuff/club-3090/models-cache"
+# Local model-zoo root (machine-specific): HTSGLANG_TEST_MODEL_DIR must point
+# at the populated cache; without it the per-row boots fail with a clear
+# missing-path message instead of guessing.
+_MODELS_ROOT = os.environ.get("HTSGLANG_TEST_MODEL_DIR", "/models")
 
 #: model_role -> boot bindings. ``None`` = no usable vehicle on this box (the
 #: runner fails that row's boot with a clear message instead of guessing).

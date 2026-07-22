@@ -43,7 +43,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 
-_CACHE = "/spinning/llm_stuff/club-3090/models-cache"
+# Local model-zoo root (machine-specific). These tests size REAL checkpoints
+# on disk, so they only run where HTSGLANG_TEST_MODEL_DIR points at a
+# populated cache; everywhere else they skip cleanly.
+_CACHE = os.environ.get("HTSGLANG_TEST_MODEL_DIR", "")
 
 #: The reference rig (5090 32 GiB + 2x 3080 20 GiB), hand-declared.
 _RIG3 = ("RTX 5090:32760", "RTX 3080:20480", "RTX 3080:20480")
@@ -101,7 +104,8 @@ def _sized_gib(resolved, tp=3, **kw):
 
 
 @unittest.skipUnless(
-    os.path.isdir(_CACHE), f"local model cache {_CACHE} not present"
+    _CACHE and os.path.isdir(_CACHE),
+    "HTSGLANG_TEST_MODEL_DIR not set or not a directory",
 )
 class TestGenericSizing(CustomTestCase):
     # -- quant is read from the CONFIG, not the path name ------------------

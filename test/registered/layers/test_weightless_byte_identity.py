@@ -34,13 +34,16 @@ weightless decode Δ is the same order as intrinsic decode-kernel fp-order.
 
 REQUIRES 3 visible GPUs (one >=28 GB for the head + two >=19 GB) AND the GGUF.
 Run only inside an explicitly granted GPU window:
-    /spinning/htsglang-gpu/.venv/bin/python -m pytest -s \
+    .venv/bin/python -m pytest -s \
         test/registered/layers/test_weightless_byte_identity.py
   or directly:
-    /spinning/htsglang-gpu/.venv/bin/python \
-        test/registered/layers/test_weightless_byte_identity.py
+    .venv/bin/python test/registered/layers/test_weightless_byte_identity.py
 
-Override the model via env: WL_MODEL_PATH, WL_TOKENIZER_PATH.
+Env knobs: WL_MODEL_PATH (REQUIRED -- the test skips without it),
+WL_TOKENIZER_PATH (default: the model's directory), HTSGLANG_TEST_VENV
+(python used to boot the servers; default: this interpreter),
+HTSGLANG_TEST_REPO_PY (PYTHONPATH for the servers; default: the ``python/``
+dir of the checkout containing this test).
 """
 
 from __future__ import annotations
@@ -58,17 +61,16 @@ import pytest
 # --------------------------------------------------------------------------
 # Config (overridable by env)
 # --------------------------------------------------------------------------
-REPO_PY = "/spinning/wt-weightless-kv/python"
-VENV_PY = "/spinning/htsglang-gpu/.venv/bin/python"
-MODEL_PATH = os.environ.get(
-    "WL_MODEL_PATH",
-    "/spinning/llm_stuff/club-3090/models-cache/"
-    "Qwen3.6-27B-MTP-Q3_K_M-GGUF/Qwen3.6-27B-Q3_K_M.gguf",
+REPO_PY = os.environ.get(
+    "HTSGLANG_TEST_REPO_PY",
+    os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "..", "..", "python")),
 )
+VENV_PY = os.environ.get("HTSGLANG_TEST_VENV", sys.executable)
+MODEL_PATH = os.environ.get("WL_MODEL_PATH", "")
 TOKENIZER_PATH = os.environ.get(
-    "WL_TOKENIZER_PATH",
-    "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-MTP-Q3_K_M-GGUF",
-)
+    "WL_TOKENIZER_PATH", os.path.dirname(MODEL_PATH) if MODEL_PATH else "")
 WL_PORT = int(os.environ.get("WL_PORT", "31800"))
 BASE_PORT = int(os.environ.get("WL_BASE_PORT", "31801"))
 
@@ -321,6 +323,8 @@ def _require_env():
         pytest.skip("torch unavailable")
     if not torch.cuda.is_available() or torch.cuda.device_count() < 3:
         pytest.skip("need >= 3 visible GPUs")
+    if not MODEL_PATH:
+        pytest.skip("WL_MODEL_PATH not set (path to the dense GGUF)")
     if not os.path.exists(MODEL_PATH):
         pytest.skip(f"model GGUF not found: {MODEL_PATH}")
 

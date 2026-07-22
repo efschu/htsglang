@@ -24,11 +24,10 @@ WHAT IT PROVES
           infinite NCCL hang.
 
 REQUIRES 3 visible GPUs. Run (only inside an explicitly granted GPU window):
-    /spinning/htsglang-gpu/.venv/bin/python -m pytest -s \
+    .venv/bin/python -m pytest -s \
         test/registered/layers/test_weightless_kv_dcp.py
   or directly:
-    /spinning/htsglang-gpu/.venv/bin/python \
-        test/registered/layers/test_weightless_kv_dcp.py
+    .venv/bin/python test/registered/layers/test_weightless_kv_dcp.py
 """
 
 from __future__ import annotations

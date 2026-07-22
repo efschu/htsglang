@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import re
 import time
@@ -392,6 +393,11 @@ class ResultsStore:
         ``strict`` a bad line raises; otherwise it is skipped."""
         store = cls()
         if not os.path.exists(path):
+            # A missing store is a normal state (fresh checkout / first run --
+            # the seed jsonl is a local artifact, not shipped in git): start
+            # empty, say so once, and let the next save() create the file.
+            logging.getLogger(__name__).info(
+                "results store %s not found -- starting empty", path)
             return store
         with open(path) as f:
             for i, line in enumerate(f):

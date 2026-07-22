@@ -86,16 +86,25 @@ import urllib.request
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 # --- reuse the proven launcher / GGUF-reader plumbing ----------------------
-from sglang.srt.planner.energy import MeasurementConfig, _venv_cuda_lib_dirs
+from sglang.srt.planner.energy import (
+    MeasurementConfig,
+    _default_pythonpath,
+    _venv_cuda_lib_dirs,
+)
 from sglang.srt.uneven_perf import _read_gguf_metadata
 
 # ---------------------------------------------------------------------------
-# Default model roots scanned by discover_models().
+# Default model roots scanned by discover_models(). ``SGLANG_MODEL_ROOTS``
+# (colon-separated directories) overrides the generic defaults.
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL_ROOTS: Tuple[str, ...] = (
-    "/spinning/llm_stuff/club-3090/models-cache",
-    "~/.cache/huggingface/hub",
-)
+def _model_roots_from_env() -> Tuple[str, ...]:
+    env = os.environ.get("SGLANG_MODEL_ROOTS")
+    if env:
+        return tuple(p for p in env.split(os.pathsep) if p)
+    return ("~/.cache/huggingface/hub", "./models")
+
+
+DEFAULT_MODEL_ROOTS: Tuple[str, ...] = _model_roots_from_env()
 
 #: llama.cpp ``LLAMA_FTYPE`` enum -> human quant tag (config-authoritative GGUF
 #: quant, read from the GGUF header ``general.file_type``, NOT the file name).
@@ -579,7 +588,7 @@ class SglangSupervisor:
     # -- env (LD_LIBRARY_PATH fix reused from energy) --------------------
     def _build_env(self, settings: LaunchSettings) -> Dict[str, str]:
         env = dict(os.environ)
-        env.setdefault("PYTHONPATH", "/spinning/wt-integration-r2/python")
+        env.setdefault("PYTHONPATH", _default_pythonpath())
         ld = _venv_cuda_lib_dirs(settings.python_exe)
         if ld:
             existing = env.get("LD_LIBRARY_PATH", "")

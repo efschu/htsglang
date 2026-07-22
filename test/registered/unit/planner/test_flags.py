@@ -61,7 +61,13 @@ _HOMO_GPUS = [
 # The FP8-27B hybrid (GDN/mamba) MTP checkpoint + the 5090/2x3080 rig of THE
 # REFERENCE PROFILE (design_v3_fixes.md): the generated uneven-max-perf
 # profile must reproduce the validated reference command exactly.
-_REF_MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8"
+# The reference model / chat-template PATHS are symbolic fixture strings (the
+# capacity seam is mocked; nothing here reads them from disk). Env overrides
+# let this rig's real locations flow through when set.
+_TEST_MODEL_DIR = os.environ.get("HTSGLANG_TEST_MODEL_DIR", "/models")
+_REF_MODEL = f"{_TEST_MODEL_DIR}/Qwen3.6-27B-FP8"
+_REF_CHAT_TEMPLATE = os.environ.get(
+    "HTSGLANG_TEST_CHAT_TEMPLATE", f"{_TEST_MODEL_DIR}/chat_template.jinja")
 _REF_CFG = {
     "architectures": ["Qwen3_5ForConditionalGeneration"],
     "quantization_config": {"quant_method": "fp8", "fmt": "e4m3"},
@@ -92,7 +98,7 @@ _REF_BASE = {
     "max_running_requests": 2,
     "reasoning_parser": "qwen3",
     "tool_call_parser": "qwen3_coder",
-    "chat_template": "/spinning/llm_stuff/chat_template.jinja",
+    "chat_template": _REF_CHAT_TEMPLATE,
     "trust_remote_code": True,
     "enable_metrics": True,
     "host": "0.0.0.0",
@@ -120,7 +126,7 @@ _REF_ARGV = [
     "--speculative-adaptive",
     "--reasoning-parser", "qwen3",
     "--tool-call-parser", "qwen3_coder",
-    "--chat-template", "/spinning/llm_stuff/chat_template.jinja",
+    "--chat-template", _REF_CHAT_TEMPLATE,
     "--trust-remote-code",
     "--enable-metrics",
     "--host", "0.0.0.0",

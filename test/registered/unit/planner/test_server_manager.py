@@ -183,9 +183,23 @@ class TestDiscovery(unittest.TestCase):
         self.assertEqual(ms[0].name, "Some-Model")
 
     def test_default_roots_constant(self):
-        # The documented default roots are what a no-arg call scans.
-        self.assertIn(
-            "/spinning/llm_stuff/club-3090/models-cache", DEFAULT_MODEL_ROOTS)
+        # Without SGLANG_MODEL_ROOTS the defaults are the generic locations.
+        from sglang.srt.planner.server_manager import _model_roots_from_env
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_MODEL_ROOTS", None)
+            self.assertEqual(
+                _model_roots_from_env(),
+                ("~/.cache/huggingface/hub", "./models"))
+
+    def test_model_roots_env_override(self):
+        # SGLANG_MODEL_ROOTS (colon-separated) replaces the generic defaults.
+        from sglang.srt.planner.server_manager import _model_roots_from_env
+
+        with mock.patch.dict(
+            os.environ, {"SGLANG_MODEL_ROOTS": "/a/models:/b/cache"}
+        ):
+            self.assertEqual(_model_roots_from_env(), ("/a/models", "/b/cache"))
 
 
 # ===========================================================================

@@ -283,3 +283,6 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+
+# Locally measured planner results (machine-specific seed, not shipped)
+python/sglang/srt/planner/measured_results.jsonl

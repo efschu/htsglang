@@ -503,9 +503,11 @@ def _measure_one_in_subprocess(
     """Spawn ``python -m sglang.srt.planner.power_calibration --measure-one
     <uuid>`` with ``CUDA_VISIBLE_DEVICES=<uuid>`` so exactly this one physical
     card is visible to torch. Parses the JSON row it prints on the last line."""
+    from sglang.srt.planner.energy import _default_pythonpath
+
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = uuid  # UUID form -> one physical GPU visible
-    env.setdefault("PYTHONPATH", "/spinning/wt-integration-r2/python")
+    env.setdefault("PYTHONPATH", _default_pythonpath())
     ld = _venv_cuda_ld_path(python_exe)
     if ld:
         existing = env.get("LD_LIBRARY_PATH", "")
