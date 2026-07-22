@@ -1,4 +1,4 @@
-# htsglang Fork Features — Upstream Availability Matrix
+# htsglang Fork Features
 
 Comparison as of 2026-07-22; upstream SGLang and vLLM main branches. Fork status reflects the
 htsglang integration branch (`integration/r2`).
