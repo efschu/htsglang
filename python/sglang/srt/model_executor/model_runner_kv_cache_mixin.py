@@ -291,46 +291,39 @@ class ModelRunnerKVCacheMixin:
     # default path stays byte-identical).
     # ------------------------------------------------------------------
     def _measured_kv_budget_cache_path(self: ModelRunner) -> str:
-        import hashlib
-        import json
-        import os
+        # Fingerprint shared with the pre-boot weight planner (which READS
+        # this registry to place weights): single source of truth in
+        # uneven_perf so writer and reader can never drift apart.
+        from sglang.srt.uneven_perf import measured_kv_budget_cache_path
 
-        from sglang.srt.uneven_perf import PROFILE_CACHE_DIR
+        return measured_kv_budget_cache_path(self.server_args)
 
+    def _measured_safety_mib(self: ModelRunner) -> int:
+        """This rank's configured safety margin (MiB). Scalar env value, or a
+        comma list with one value per TP rank (roles differ: the draft-solo
+        host carries the dual-prefill / draft-append serving transients,
+        which scale with prompt length — measured 2026-07-22: 10k prefill
+        needs ~1 GiB, 50k ~2-3.5 GiB on the host, while shadow ranks served
+        everything with ~1.6 GiB)."""
+        raw_safety = str(envs.SGLANG_MEASURED_KV_BUDGET_SAFETY_MIB.get())
+        parts = [p for p in raw_safety.split(",") if p.strip()]
+        if len(parts) > 1:
+            try:
+                return int(parts[self.tp_rank])
+            except (IndexError, ValueError):
+                return int(parts[0])
+        return int(parts[0]) if parts else 400
+
+    def _resolved_mlp_vector(self: ModelRunner) -> list:
+        """The weight (MLP family) vector this boot actually shards with —
+        the registry key that decides whether a stored budget correction is
+        transferable. Falls back to the base plan when no override is set."""
         sa = self.server_args
-        fields = {
-            "model_path": sa.model_path,
-            "tp_size": sa.tp_size,
-            "rank_gpu_id": getattr(sa, "rank_gpu_id", None),
-            "rank_tp_ratio": getattr(sa, "rank_tp_ratio", None),
-            "rank_kv_ratio": getattr(sa, "rank_kv_ratio", None),
-            "rank_auto_reserve_mib": getattr(sa, "rank_auto_reserve_mib", None),
-            "rank_gpu_memory_mib": getattr(sa, "rank_gpu_memory_mib", None),
-            "mem_fraction_static": sa.mem_fraction_static,
-            "kv_cache_dtype": sa.kv_cache_dtype,
-            "context_length": sa.context_length,
-            "page_size": sa.page_size,
-            "quantization": sa.quantization,
-            "max_running_requests": sa.max_running_requests,
-            "chunked_prefill_size": sa.chunked_prefill_size,
-            "spec_algorithm": sa.speculative_algorithm,
-            "spec_draft_model": sa.speculative_draft_model_path,
-            "spec_cross": getattr(sa, "speculative_cross_algorithm", False),
-            "spec_cross_force": getattr(
-                sa, "speculative_cross_algorithm_force", None
-            ),
-            "spec_adaptive": sa.speculative_adaptive,
-            "spec_adaptive_config": sa.speculative_adaptive_config,
-            "spec_max_draft_tokens": sa.max_speculative_num_draft_tokens,
-            "cuda_graph_max_bs": getattr(
-                sa.cuda_graph_config.decode, "max_bs", None
-            ),
-        }
-        digest = hashlib.sha1(
-            json.dumps(fields, sort_keys=True, default=str).encode()
-        ).hexdigest()[:12]
-        os.makedirs(PROFILE_CACHE_DIR, exist_ok=True)
-        return os.path.join(PROFILE_CACHE_DIR, f"kv_budget-{digest}.json")
+        vec = getattr(sa, "rank_mlp_ratio", None)
+        if not isinstance(vec, list):
+            base = getattr(sa, "rank_tp_ratio", None)
+            vec = list(base) if isinstance(base, list) else [1] * sa.tp_size
+        return [int(v) for v in vec]
 
     def _measured_kv_budget_correction_bytes(self: ModelRunner) -> int:
         if not envs.SGLANG_MEASURED_KV_BUDGET.get():
@@ -349,6 +342,54 @@ class ModelRunnerKVCacheMixin:
                 "Measured KV-budget cache %s is malformed; ignoring.", path
             )
             return 0
+        # Corrections are VECTOR-SPECIFIC: they encode the previous boot's
+        # leftover under that boot's weight distribution. The registry
+        # fingerprint deliberately survives weight-vector changes (the
+        # planner needs the component balance across vectors), so guard
+        # here instead: a changed vector invalidates the correction (a
+        # 6,1,1-measured +3.4 GiB applied to a 2,1,1 boot over-booked the
+        # shadow pools ~2.5 GiB past the card and OOMed the DFLASH capture,
+        # measured 2026-07-22). Components stay valid; the correction
+        # re-converges from zero under the new vector (one extra boot).
+        stored_vec = data.get("mlp_vector")
+        current_vec = self._resolved_mlp_vector()
+        if stored_vec != current_vec:
+            if self.tp_rank == 0:
+                logger.info(
+                    "Measured KV-budget: stored correction was measured "
+                    "under weight vector %s, this boot shards %s — "
+                    "correction reset to 0 (re-measuring under the new "
+                    "vector).",
+                    stored_vec,
+                    current_vec,
+                )
+            return 0
+        # Same epoch rule for the SAFETY margin: the correction encodes
+        # "leftover minus the safety of that epoch", and the consumption
+        # gate deliberately freezes unconsumed growth — so after a safety
+        # change the correction can never re-target the new required-free
+        # level (measured 2026-07-22: shadows stuck at the old 1350 MiB
+        # target + granularity slack, flapping over the corridor bound).
+        # A changed per-rank safety therefore restarts the correction from
+        # zero, exactly like a changed weight vector.
+        stored_safety = None
+        comps = data.get("components")
+        if isinstance(comps, list) and len(comps) > self.tp_rank:
+            try:
+                stored_safety = int(comps[self.tp_rank].get("safety_mib"))
+            except (TypeError, ValueError):
+                stored_safety = None
+        current_safety = self._measured_safety_mib()
+        if stored_safety is not None and stored_safety != current_safety:
+            logger.info(
+                "Measured KV-budget (rank %d): stored correction was "
+                "measured under safety %d MiB, this boot uses %d MiB — "
+                "correction reset to 0 (re-measuring under the new safety).",
+                self.tp_rank,
+                stored_safety,
+                current_safety,
+            )
+            return 0
         return int(vec[self.tp_rank])
 
     def _ranks_on_my_gpu(self: ModelRunner) -> int:
@@ -361,33 +402,29 @@ class ModelRunnerKVCacheMixin:
         except (IndexError, TypeError):
             return 1
 
-    def note_post_capture_leftover(self: ModelRunner) -> None:
+    def note_post_capture_leftover(
+        self: ModelRunner, draft_solo_pool_bytes: int = 0
+    ) -> None:
         """Measure this boot's actual per-rank leftover and persist the
         accumulated budget correction for the next boot (see the section
         comment above). Must be called on every rank (collective gather);
-        rank 0 writes the cache."""
+        rank 0 writes the cache.
+
+        ``draft_solo_pool_bytes``: measured size of a solo-resident draft KV
+        pool on THIS rank (the cross gate's DFLASH pool on rank 0; 0
+        elsewhere), passed in by the scheduler which owns the draft worker.
+        Recorded as its own registry post — it scales with the global token
+        count, so the weight planner must model it as the per-token solo
+        cell, NOT as fixed graph residency."""
         if not envs.SGLANG_MEASURED_KV_BUDGET.get():
             return
         import json
         import time as _time
 
         torch.cuda.synchronize()
-        free_b, _total_b = torch.cuda.mem_get_info(self.gpu_id)
+        free_b, total_b = torch.cuda.mem_get_info(self.gpu_id)
 
-        # Safety margin: scalar MiB, or a comma list with one value per TP
-        # rank (roles differ: the draft-solo host carries the dual-prefill /
-        # draft-append serving transients, which scale with prompt length —
-        # measured 2026-07-22: 10k prefill needs ~1 GiB, 50k ~2-3.5 GiB on
-        # the host, while shadow ranks served everything with ~1.6 GiB).
-        raw_safety = str(envs.SGLANG_MEASURED_KV_BUDGET_SAFETY_MIB.get())
-        parts = [p for p in raw_safety.split(",") if p.strip()]
-        if len(parts) > 1:
-            try:
-                safety_mib = int(parts[self.tp_rank])
-            except (IndexError, ValueError):
-                safety_mib = int(parts[0])
-        else:
-            safety_mib = int(parts[0]) if parts else 400
+        safety_mib = self._measured_safety_mib()
         safety_b = safety_mib << 20
 
         # Component balance (rank-local, exact allocator/driver numbers):
@@ -440,14 +477,23 @@ class ModelRunnerKVCacheMixin:
         )
         # Co-located ranks share the device's free memory: each may claim
         # only its share, or the next boot double-books the same bytes.
-        free_b = int(free_b) // self._ranks_on_my_gpu()
+        ranks_on_gpu = self._ranks_on_my_gpu()
+        free_b = int(free_b) // ranks_on_gpu
 
         # Explicit measured post: the largest PAUSED adaptive/rung graph tag.
         # ensure_active must be able to map it back at any switch, so that
         # many bytes must stay physically free on top of the safety margin
         # (measured 2026-07-22: cu_mem_create OOM inside torch_memory_saver
         # when a switch mapped the DFLASH tag during a long-prompt request).
+        # Alongside the max, record EVERY rung tag as its own registry post,
+        # virtual vs physical separated: ``noted_tensor_bytes`` is the
+        # virtual footprint of the tag's noted tensors (address reservation,
+        # survives a pause), ``paused_physical_bytes`` the measured physical
+        # pages the tag frees when paused (noted tensors + its private
+        # capture pool). The weight planner and any future balance audit
+        # read these instead of re-deriving them from logs.
         max_tag_b = 0
+        rung_tags: dict = {}
         try:
             from sglang.srt.speculative.adaptive_graph_memory import (
                 get_active_manager,
@@ -455,15 +501,117 @@ class ModelRunnerKVCacheMixin:
 
             mgr = get_active_manager()
             if mgr is not None:
-                max_tag_b = max(
-                    (
-                        int(getattr(rec, "paused_bytes", 0) or 0)
-                        for rec in getattr(mgr, "_states", {}).values()
-                    ),
-                    default=0,
-                )
+                for key, rec in getattr(mgr, "_states", {}).items():
+                    paused = int(getattr(rec, "paused_bytes", 0) or 0)
+                    try:
+                        noted = int(rec.nbytes)
+                    except Exception:
+                        noted = 0
+                    rung_tags[str(getattr(rec, "tag", key))] = {
+                        "noted_tensor_bytes": noted,
+                        "paused_physical_bytes": paused,
+                    }
+                    max_tag_b = max(max_tag_b, paused)
         except Exception:  # never break boot for the balance
             max_tag_b = 0
+
+        # Component balance as machine-readable registry posts (per rank).
+        # KV-vs-mamba split inside the pool post: the KV pool reports its own
+        # tensor bytes; the remainder of the pool checkpoint delta is the
+        # mamba/SSM state pool plus small aux pools (req_to_token etc.),
+        # labeled as such rather than silently folded together. The solo
+        # draft pool (passed in) is carved OUT of the graphs/workspaces
+        # delta: it scales with the global token count (a per-token cell),
+        # everything else in that delta is token-independent residency.
+        kv_pool_b = 0
+        try:
+            v = self.token_to_kv_pool.get_kv_size_bytes()
+            kv_pool_b = (
+                int(sum(v)) if isinstance(v, (tuple, list)) else int(v)
+            )
+        except Exception:
+            kv_pool_b = 0
+        pools_b = max(0, ckpt_p[0] - ckpt_w[0])
+        graphs_ws_b = max(0, alloc_now - ckpt_p[0])
+        draft_pool_b = max(0, int(draft_solo_pool_bytes or 0))
+        # CUDA context + any co-resident consumer on this device: what the
+        # driver reports used beyond this process's allocator reservation.
+        # Split evenly among co-located ranks (assumption, exact for the
+        # 1-rank-per-card case).
+        # (total/ranks - free/ranks) is this rank's share of the device's
+        # used bytes; reserved_now is per-process (this rank's allocator
+        # reservation alone), so the difference is context + non-allocator
+        # residue attributable to this rank. Display-only: paused
+        # memory-saver tags inflate ``reserved`` (allocated-but-unmapped),
+        # so this can clamp to 0 — the planner consumes the driver-derived
+        # residual post below instead.
+        used_share_b = max(0, int(total_b) // ranks_on_gpu - free_b)
+        ctx_overhead_b = max(0, used_share_b - int(reserved_now))
+        # THE planner-facing catch-all: every physically resident byte on
+        # this rank that is neither weights, nor a sized pool, nor the solo
+        # draft pool — CUDA context, NCCL buffers, CUDA graphs, attention
+        # workspaces, allocator fragmentation, memory-saver pools. Derived
+        # purely from the DRIVER's used bytes, so paused rung tags (virtual
+        # reservation, no physical pages) are correctly excluded; their
+        # remap requirement is carried by required_free_bytes instead.
+        residual_residency_b = max(
+            0,
+            used_share_b
+            - int(ckpt_w[0])
+            - max(0, ckpt_p[0] - ckpt_w[0])
+            - max(0, int(draft_solo_pool_bytes or 0)),
+        )
+        my_component = {
+            "device_total_bytes": int(total_b),
+            "ranks_on_gpu": int(ranks_on_gpu),
+            "residual_residency_bytes": int(residual_residency_b),
+            "ctx_overhead_bytes": int(ctx_overhead_b),
+            "weights_alloc_bytes": int(ckpt_w[0]),
+            "weights_param_bytes": int(param_bytes),
+            "pools_bytes": int(pools_b),
+            "kv_pool_bytes": int(kv_pool_b),
+            "kv_pool_tokens": int(
+                getattr(self.token_to_kv_pool, "size", 0) or 0
+            ),
+            "mamba_aux_pool_bytes": int(max(0, pools_b - kv_pool_b)),
+            "graphs_ws_bytes": int(graphs_ws_b),
+            "draft_solo_pool_bytes": int(draft_pool_b),
+            "graphs_ws_excl_draft_pool_bytes": int(
+                max(0, graphs_ws_b - draft_pool_b)
+            ),
+            "rung_tags": rung_tags,
+            "frag_bytes": int(frag_b),
+            "boot_transient_bytes": int(transient_b),
+            "safety_mib": int(safety_mib),
+            "max_paused_tag_bytes": int(max_tag_b),
+            "required_free_bytes": int(safety_b + max_tag_b),
+            "free_bytes_at_measure": int(free_b),
+            "max_total_num_tokens": int(
+                getattr(self, "max_total_num_tokens", 0) or 0
+            ),
+        }
+        logger.info(
+            "Measured KV-budget components (rank %d): kv-pool %.2f GiB, "
+            "mamba/aux pools %.2f GiB, draft-solo pool %.2f GiB, graphs/ws "
+            "excl draft pool %.2f GiB, ctx overhead %.2f GiB, required free "
+            "%.2f GiB (safety %d MiB + max paused tag %.0f MiB); rung tags: "
+            "%s.",
+            self.tp_rank,
+            kv_pool_b / gib,
+            max(0, pools_b - kv_pool_b) / gib,
+            draft_pool_b / gib,
+            max(0, graphs_ws_b - draft_pool_b) / gib,
+            ctx_overhead_b / gib,
+            (safety_b + max_tag_b) / gib,
+            safety_mib,
+            max_tag_b / (1 << 20),
+            {
+                k: f"{v['paused_physical_bytes'] / (1 << 20):.0f}MiB-phys/"
+                f"{v['noted_tensor_bytes'] / (1 << 20):.0f}MiB-noted"
+                for k, v in rung_tags.items()
+            }
+            or "none",
+        )
 
         delta_b = free_b - safety_b - max_tag_b
         prev_b = self._measured_kv_budget_correction_bytes()
@@ -494,19 +642,27 @@ class ModelRunnerKVCacheMixin:
         my_correction = prev_b + delta_b
 
         world = get_world_group().world_size
-        payload = (self.tp_rank, int(my_correction), int(free_b))
+        payload = (self.tp_rank, int(my_correction), int(free_b), my_component)
         gathered: list = [None] * world
         torch.distributed.all_gather_object(
             gathered, payload, group=get_world_group().cpu_group
         )
         corrections = [0] * self.server_args.tp_size
         leftovers = [0] * self.server_args.tp_size
-        for rank, corr, left in gathered:
+        components: list = [{}] * self.server_args.tp_size
+        for rank, corr, left, comp in gathered:
             if 0 <= rank < self.server_args.tp_size:
                 corrections[rank] = corr
                 leftovers[rank] = left
+                components[rank] = comp
         path = self._measured_kv_budget_cache_path()
         if self.tp_rank == 0:
+            # The weight vector this balance was measured under — the weight
+            # planner anchors its family model's absolute bytes against
+            # ``weights_alloc_bytes`` AT this vector before predicting other
+            # vectors, and the correction reader invalidates corrections
+            # measured under a DIFFERENT vector.
+            mlp_vec = self._resolved_mlp_vector()
             with open(path, "w") as f:
                 json.dump(
                     {
@@ -516,6 +672,8 @@ class ModelRunnerKVCacheMixin:
                         ],
                         "safety_mib": safety_b >> 20,
                         "max_paused_tag_mib_rank0": max_tag_b >> 20,
+                        "mlp_vector": [int(v) for v in mlp_vec],
+                        "components": components,
                         "ts": _time.strftime("%Y-%m-%d %H:%M:%S"),
                     },
                     f,

@@ -490,6 +490,127 @@ def vocab_ratio_from_membw(membw_gbs: Sequence[float], base: int = 6) -> List[in
 
 
 # ---------------------------------------------------------------------------
+# Measured KV-budget registry (shared fingerprint).
+#
+# The registry file (written post-capture by
+# model_runner_kv_cache_mixin.note_post_capture_leftover, read pre-boot by
+# apply_auto_performance) is keyed by a config fingerprint. Writer and reader
+# MUST agree on the fields byte-for-byte, so the fingerprint lives here (a
+# stdlib-only module both can import; the mixin pulls torch). Deliberately
+# EXCLUDED from the fields: rank_mlp_ratio / the chosen weight vector — the
+# whole point of the pre-boot weight planner is to move weights BETWEEN boots
+# of the same configuration, and re-keying on the vector would discard the
+# measured residency the planner needs to choose it.
+# ---------------------------------------------------------------------------
+
+
+def measured_kv_budget_fingerprint_fields(server_args) -> dict:
+    sa = server_args
+    return {
+        "model_path": sa.model_path,
+        "tp_size": sa.tp_size,
+        "rank_gpu_id": getattr(sa, "rank_gpu_id", None),
+        "rank_tp_ratio": getattr(sa, "rank_tp_ratio", None),
+        "rank_kv_ratio": getattr(sa, "rank_kv_ratio", None),
+        "rank_auto_reserve_mib": getattr(sa, "rank_auto_reserve_mib", None),
+        "rank_gpu_memory_mib": getattr(sa, "rank_gpu_memory_mib", None),
+        "mem_fraction_static": sa.mem_fraction_static,
+        "kv_cache_dtype": sa.kv_cache_dtype,
+        "context_length": sa.context_length,
+        "page_size": sa.page_size,
+        "quantization": sa.quantization,
+        "max_running_requests": sa.max_running_requests,
+        "chunked_prefill_size": sa.chunked_prefill_size,
+        "spec_algorithm": sa.speculative_algorithm,
+        "spec_draft_model": sa.speculative_draft_model_path,
+        "spec_cross": getattr(sa, "speculative_cross_algorithm", False),
+        "spec_cross_force": getattr(
+            sa, "speculative_cross_algorithm_force", None
+        ),
+        "spec_adaptive": sa.speculative_adaptive,
+        "spec_adaptive_config": sa.speculative_adaptive_config,
+        # RAW draft-token count, deliberately NOT max_speculative_num_draft_
+        # tokens: that is a cached_property which resolves the cross-rung
+        # shapes — evaluating it at parse time (before the speculative hook
+        # runs) caches the WRONG value (4 instead of 16 on the T156 rig) and
+        # under-sizes the shared logits buffer at graph capture (measured
+        # 2026-07-22: assert 'holds 8 rows but caller needs 32'). The raw
+        # field + spec_adaptive_config + spec_cross_force carry the same
+        # config identity.
+        "spec_max_draft_tokens": sa.speculative_num_draft_tokens,
+        "cuda_graph_max_bs": getattr(
+            sa.cuda_graph_config.decode, "max_bs", None
+        ),
+    }
+
+
+def measured_kv_budget_cache_path(server_args) -> str:
+    # Timing subtlety: the pre-boot weight planner runs EARLY in ServerArgs
+    # __post_init__ (before e.g. mem_fraction_static is defaulted), the
+    # registry writer runs at boot on the fully resolved args — the same
+    # fields would hash differently. The planner therefore stashes its
+    # computed path on the args object (pickled through to the scheduler
+    # processes), and every later call returns the stash: reader and writer
+    # agree by construction, and the stash is boot-stable because parse-time
+    # resolution is a pure function of the CLI.
+    stashed = getattr(server_args, "_measured_kv_budget_registry_path", None)
+    if stashed:
+        return stashed
+    fields = measured_kv_budget_fingerprint_fields(server_args)
+    digest = hashlib.sha1(
+        json.dumps(fields, sort_keys=True, default=str).encode()
+    ).hexdigest()[:12]
+    os.makedirs(PROFILE_CACHE_DIR, exist_ok=True)
+    return os.path.join(PROFILE_CACHE_DIR, f"kv_budget-{digest}.json")
+
+
+def load_measured_registry(server_args) -> Optional[dict]:
+    """The measured KV-budget registry with a complete component balance.
+
+    Returns the registry dict (keys: ``components`` — one dict per TP rank,
+    see note_post_capture_leftover for the schema — and ``mlp_vector``, the
+    weight vector the measurement was taken under) when the file exists,
+    every rank's balance is complete, and the measured-budget mode is
+    enabled; else None. The planner treats an incomplete registry exactly
+    like a first boot: fall back to the static heuristics, measure, converge
+    on the next boot."""
+    try:
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_MEASURED_KV_BUDGET.get():
+            return None
+    except Exception:  # pragma: no cover - envs import is boot-critical only
+        return None
+    try:
+        with open(measured_kv_budget_cache_path(server_args)) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    comps = data.get("components")
+    if (
+        not isinstance(comps, list)
+        or len(comps) != server_args.tp_size
+        or not all(isinstance(c, dict) and c for c in comps)
+    ):
+        return None
+    required = (
+        "device_total_bytes",
+        "ranks_on_gpu",
+        "residual_residency_bytes",
+        "weights_alloc_bytes",
+        "required_free_bytes",
+        "mamba_aux_pool_bytes",
+    )
+    for c in comps:
+        if any(k not in c for k in required):
+            return None
+    vec = data.get("mlp_vector")
+    if not isinstance(vec, list) or len(vec) != server_args.tp_size:
+        return None
+    return data
+
+
+# ---------------------------------------------------------------------------
 # Cost model: per-rank weight bytes + capacity prediction from the model
 # config, mirroring the terms the real pool sizing pays (M22 cost-model
 # musts: SSM pool moves with GDN units x concurrency, BF16 families inside
@@ -529,6 +650,16 @@ class PlanInputs:
     speculative_draft_placement: str = "split"
     #: Rank hosting the solo draft (ignored unless placement == "solo").
     speculative_draft_solo_rank: int = 0
+    #: --speculative-cross-algorithm (T156). Under the cross gate the GLOBAL
+    #: placement stays "split" (the NEXTN/MTP rung is split), but the DFLASH
+    #: rung's draft — weights, a draft KV pool sized to the GLOBAL context,
+    #: and its graph set — is ALWAYS solo-resident on rank 0. The weight
+    #: planner must know this: blind to it, it predicted rank 0's capacity
+    #: vector-independent (231k tokens vs ~25k real on the T156 rig) and
+    #: concentrated the MLP mass on the one rank that structurally cannot
+    #: hold it. Mirrors pool_configurator.solo_draft_kv_cell_factor's cross
+    #: clause and the mixin's _is_solo_draft_kv_host.
+    speculative_cross_algorithm: bool = False
     max_running_requests: Optional[int] = None
     disable_cuda_graph: bool = False
     #: Include the vision tower in the resident weight budget. These are VL
@@ -591,6 +722,9 @@ class PlanInputs:
                 == "solo"
                 and hasattr(server_args, "speculative_draft_solo_rank")
                 else 0
+            ),
+            speculative_cross_algorithm=bool(
+                getattr(server_args, "speculative_cross_algorithm", False)
             ),
             max_running_requests=server_args.max_running_requests,
             disable_cuda_graph=bool(
@@ -1226,14 +1360,39 @@ class PerfCostModel:
     (MLP bytes per unit) is exact.
     """
 
-    def __init__(self, plan_inputs, base_plan: List[int], budgets_mib: List[int]):
+    def __init__(
+        self,
+        plan_inputs,
+        base_plan: List[int],
+        budgets_mib: List[int],
+        measured: Optional[List[dict]] = None,
+        measured_mlp_vector: Optional[List[int]] = None,
+    ):
         # ``plan_inputs`` is a PlanInputs dataclass (see above). The boot
         # path builds it via PlanInputs.from_server_args so the server and
         # the offline planner (sglang.srt.planner) run identical sizing.
+        #
+        # ``measured``: optional per-rank residency posts from the measured
+        # KV-budget registry (load_measured_components). When present,
+        # predict_capacity switches from the static-heuristic budget model to
+        # the measured one (see there); ``measured_mlp_vector`` is the weight
+        # vector the measurement was taken under, used to anchor the family
+        # model's absolute weight bytes against the measured allocator value.
         self.tp_size = plan_inputs.tp_size
         self.base_plan = list(base_plan)
         self.budgets_mib = list(budgets_mib)
         self.plan_inputs = plan_inputs
+        self.measured = (
+            list(measured)
+            if measured is not None and len(measured) == self.tp_size
+            else None
+        )
+        self.measured_mlp_vector = (
+            [int(v) for v in measured_mlp_vector]
+            if measured_mlp_vector is not None
+            and len(measured_mlp_vector) == self.tp_size
+            else None
+        )
 
         cfg = self._load_config(plan_inputs.model_path)
         text = cfg.get("text_config", cfg)
@@ -1324,15 +1483,29 @@ class PerfCostModel:
         # and -- because the global context is min_r(P_r/ratio_r)*sum(ratios)
         # -- throttling every other rank too. Mirrors the token planner's
         # pool_configurator.solo_draft_kv_cell_factor.
-        self.solo_active = bool(
+        # Cross-algorithm gate (T156): the GLOBAL placement stays "split"
+        # (NEXTN/MTP rung), but the DFLASH rung's draft — its whole external
+        # checkpoint plus a draft KV pool sized to the GLOBAL context — is
+        # always solo-resident on rank 0. For the capacity math that is the
+        # solo profile (solo ckpt bytes + global-context draft cell on the
+        # host), so solo_active covers it; the draft_* family re-pointing
+        # below must NOT happen though, because those families model the
+        # target-derived MTP/NEXTN draft, which stays split under cross.
+        self.cross_active = bool(
+            self.spec_active
+            and getattr(plan_inputs, "speculative_cross_algorithm", False)
+            and self.tp_size >= 2
+        )
+        self._placement_solo = bool(
             self.spec_active
             and str(getattr(plan_inputs, "speculative_draft_placement", "split"))
             == "solo"
             and self.tp_size >= 2
         )
+        self.solo_active = self._placement_solo or self.cross_active
         self.solo_rank = (
             int(getattr(plan_inputs, "speculative_draft_solo_rank", 0) or 0)
-            if self.solo_active
+            if self._placement_solo
             else 0
         )
         if not (0 <= self.solo_rank < self.tp_size):
@@ -1377,6 +1550,46 @@ class PerfCostModel:
 
         self.families = self._build_families(cfg)
         self.mamba_pool_bytes = self._mamba_pool_bytes()
+
+        # -- measured-registry refinements (all None/0 without a registry) ---
+        #: Per-rank additive correction anchoring the family model's ABSOLUTE
+        #: weight bytes to the measured post-weights allocator value at the
+        #: vector the measurement was taken under. The family model's DELTAS
+        #: between vectors stay model-derived (exact for the dominant MLP
+        #: term); the bias removes its absolute error (buffers, fused/aux
+        #: tensors, quant scale layouts the config-level model cannot see).
+        self.measured_weight_bias = [0.0] * self.tp_size
+        if self.measured is not None and self.measured_mlp_vector is not None:
+            model_w = self.per_rank_weight_bytes(self.measured_mlp_vector)
+            for r in range(self.tp_size):
+                w_meas = float(
+                    self.measured[r].get("weights_alloc_bytes", 0) or 0
+                )
+                if w_meas > 0:
+                    self.measured_weight_bias[r] = w_meas - model_w[r]
+        # Measured solo-draft KV cell (bytes per GLOBAL token): the host's
+        # DFLASH pool size divided by the global token count it was sized to.
+        # Preferred over the config-derived cell — it reflects the pool's
+        # real page/layout overheads.
+        if self.measured is not None and self.solo_active:
+            host = self.measured[self.solo_rank]
+            pool_b = float(host.get("draft_solo_pool_bytes", 0) or 0)
+            tokens = float(host.get("max_total_num_tokens", 0) or 0)
+            if pool_b > 0 and tokens > 0:
+                self.solo_draft_kv_cell_bytes = pool_b / tokens
+        # Measured TARGET-KV cell (bytes per pool token): pool bytes over
+        # pool token slots, identical across ranks (each holds its token
+        # share at the same cell). Removes the config-model's layer-count
+        # bias (measured 2026-07-22: model 34816 vs real 32768 B/token on
+        # the reference rig, a 6% capacity skew). Measured mode only — the
+        # heuristic fallback keeps the config-derived cell byte-identically.
+        if self.measured is not None:
+            for c in self.measured:
+                b = float(c.get("kv_pool_bytes", 0) or 0)
+                t = float(c.get("kv_pool_tokens", 0) or 0)
+                if b > 0 and t > 0:
+                    self.kv_cell_bytes = b / t
+                    break
 
     @staticmethod
     def _load_config(model_path: str) -> dict:
@@ -1488,8 +1701,13 @@ class PerfCostModel:
         # model -- families, shards and bytes_per_param anchoring alike -- is
         # untouched.
         if self.solo_active:
-            for _name in ("draft_attn", "draft_mlp", "draft_repl"):
-                families[_name].shard = "solo_host"
+            # Placement-solo: the target-derived draft families (MTP/NEXTN
+            # mass) move to the host too. Cross gate: they STAY split (the
+            # NEXTN rung shards as usual); only the external DFLASH
+            # checkpoint below is host-resident.
+            if self._placement_solo:
+                for _name in ("draft_attn", "draft_mlp", "draft_repl"):
+                    families[_name].shard = "solo_host"
             if self.solo_draft_ckpt_bytes > 0:
                 families["draft_solo_ckpt"] = _Family(
                     self.solo_draft_ckpt_bytes, 1.0, "solo_host"
@@ -1712,7 +1930,13 @@ class PerfCostModel:
         ``pool_configurator.solo_draft_kv_cell_factor``.
         """
         per_layer = self.kv_cell_bytes_per_layer
-        t_tgt = per_layer * self.full_layers
+        if self.cross_active:
+            # Cross gate: the NEXTN/MTP rung's KV stays in the SHARED target
+            # pool on every rank (split placement), so it belongs to t_tgt;
+            # only the DFLASH rung's pool is the C-scaled host term.
+            t_tgt = self.kv_cell_bytes
+        else:
+            t_tgt = per_layer * self.full_layers
         if self.solo_draft_kv_cell_bytes is not None:
             # External draft: its own depth/KV geometry (see __init__).
             t_drf = self.solo_draft_kv_cell_bytes
@@ -1746,31 +1970,93 @@ class PerfCostModel:
         from sglang.srt.distributed.utils import partition_units
 
         weights = self.per_rank_weight_bytes(mlp_vector)
-        overhead = (
-            _PREDICT_OVERHEAD_MIB + _PREDICT_MAMBA_ACT_RESERVE_MIB
-        ) * 2**20
-        # Solo host only: the draft's CUDA graphs and its own attention
-        # workspace live on top of the draft weights and draft KV pool, and
-        # neither the generic per-rank overhead above nor the weight families
-        # cover them. Left out, the host allocates PAST its budget -- measured
-        # +634 MiB at max_running_requests=2 and +2266 MiB at 4 on the
-        # reference rig, i.e. it grows with the captured decode batch sizes --
-        # which leaves the card with a few hundred MiB free and OOMs during
-        # decode. Charged deliberately conservatively: over-reserving costs a
-        # little KV, under-reserving costs the whole server.
-        solo_overhead = 0.0
-        if self.solo_active:
-            mrr = int(self.plan_inputs.max_running_requests or 1)
-            solo_overhead = (
-                _SOLO_HOST_WORKSPACE_MIB + _SOLO_HOST_GRAPH_MIB_PER_REQ * max(mrr, 1)
+        if self.measured is not None:
+            # MEASURED budget model (registry-backed, cross/solo planning):
+            # every non-weight post is a measured value from the previous
+            # boot of this same configuration, not a heuristic constant. Per
+            # rank r the bytes fundable for KV (target pool + the host's
+            # C-scaled draft cell) are
+            #
+            #   free_r = device_total/ranks_on_gpu     (physical share, NVML)
+            #          - residual_residency_r          (driver-measured
+            #                                           catch-all: CUDA ctx,
+            #                                           NCCL, graphs,
+            #                                           workspaces, frag —
+            #                                           everything resident
+            #                                           that is not weights,
+            #                                           pools, or the draft
+            #                                           pool; paused rung
+            #                                           tags are correctly
+            #                                           absent, their remap
+            #                                           need is in
+            #                                           required_free)
+            #          - (model_weights_r(vec) + bias) (family model, anchored
+            #                                           to the measured
+            #                                           allocator bytes at the
+            #                                           measured vector)
+            #          - mamba_aux_pool_r              (measured; the mamba/aux
+            #                                           pool follows the BASE
+            #                                           plan, which is fixed
+            #                                           across MLP candidates)
+            #          - required_free_r               (configured safety +
+            #                                           measured max paused
+            #                                           rung tag)
+            #
+            # The physical total (NOT budgets_mib) is deliberate: under the
+            # measured-budget mode the boot converges its pools onto the real
+            # leftover regardless of the heuristic budget/reserve knobs, so
+            # the planner must model that converged end state. ASSUMPTION
+            # (co-location): a card's total and residency split evenly among
+            # co-located ranks; exact for the 1-rank-per-card case.
+            free_bytes = []
+            for r in range(self.tp_size):
+                c = self.measured[r]
+                total_share = float(c["device_total_bytes"]) / max(
+                    int(c["ranks_on_gpu"]), 1
+                )
+                free_bytes.append(
+                    total_share
+                    - float(c["residual_residency_bytes"])
+                    - (weights[r] + self.measured_weight_bias[r])
+                    - float(c["mamba_aux_pool_bytes"])
+                    - float(c["required_free_bytes"])
+                )
+        else:
+            overhead = (
+                _PREDICT_OVERHEAD_MIB + _PREDICT_MAMBA_ACT_RESERVE_MIB
             ) * 2**20
-        free_bytes = []
-        for r in range(self.tp_size):
-            budget = self.budgets_mib[r] * 2**20
-            extra = solo_overhead if (self.solo_active and r == self.solo_rank) else 0.0
-            free_bytes.append(
-                budget - weights[r] - self.mamba_pool_bytes[r] - overhead - extra
-            )
+            # Solo host only: the draft's CUDA graphs and its own attention
+            # workspace live on top of the draft weights and draft KV pool,
+            # and neither the generic per-rank overhead above nor the weight
+            # families cover them. Left out, the host allocates PAST its
+            # budget -- measured +634 MiB at max_running_requests=2 and
+            # +2266 MiB at 4 on the reference rig, i.e. it grows with the
+            # captured decode batch sizes -- which leaves the card with a few
+            # hundred MiB free and OOMs during decode. Charged deliberately
+            # conservatively: over-reserving costs a little KV,
+            # under-reserving costs the whole server.
+            solo_overhead = 0.0
+            if self.solo_active:
+                mrr = int(self.plan_inputs.max_running_requests or 1)
+                solo_overhead = (
+                    _SOLO_HOST_WORKSPACE_MIB
+                    + _SOLO_HOST_GRAPH_MIB_PER_REQ * max(mrr, 1)
+                ) * 2**20
+            free_bytes = []
+            for r in range(self.tp_size):
+                budget = self.budgets_mib[r] * 2**20
+                extra = (
+                    solo_overhead
+                    if (self.solo_active and r == self.solo_rank)
+                    else 0.0
+                )
+                free_bytes.append(
+                    budget
+                    - weights[r]
+                    - self.mamba_pool_bytes[r]
+                    - overhead
+                    - extra
+                )
         if self.solo_active:
             p = self._solo_rank_token_capacity(free_bytes)
         else:
@@ -2075,6 +2361,12 @@ def apply_auto_performance(server_args) -> None:
     """
     lines: List[str] = ["auto-performance (--rank-tp-ratio auto-performance):"]
 
+    # Pin the measured-registry path NOW (parse-time field state) and stash
+    # it for the boot-time writer — see measured_kv_budget_cache_path.
+    server_args._measured_kv_budget_registry_path = (
+        measured_kv_budget_cache_path(server_args)
+    )
+
     def emit():
         logger.info("\n  ".join(lines))
 
@@ -2178,8 +2470,22 @@ def apply_auto_performance(server_args) -> None:
             )
         )
 
+    # Measured KV-budget registry (previous boot of this exact config): when
+    # complete, the capacity model runs on MEASURED residency posts instead
+    # of the static heuristics, and the optimizer switches to the capacity
+    # objective below. Consumed under the cross-algorithm gate ONLY — every
+    # other configuration plans byte-identically with or without a registry.
+    registry = (
+        load_measured_registry(server_args)
+        if getattr(server_args, "speculative_cross_algorithm", False)
+        else None
+    )
     model = PerfCostModel(
-        PlanInputs.from_server_args(server_args), base_plan, budgets
+        PlanInputs.from_server_args(server_args),
+        base_plan,
+        budgets,
+        measured=(registry or {}).get("components"),
+        measured_mlp_vector=(registry or {}).get("mlp_vector"),
     )
     base_pred = model.predict_capacity(base_plan)
     floor = (1.0 - loose / 100.0) * base_pred["ctx"]
@@ -2199,7 +2505,128 @@ def apply_auto_performance(server_args) -> None:
     # Tuning target (per M22: decode is flat across representable splits;
     # prefill/aggregate is the lever, and 'both' rides the same lever).
     chosen: Optional[Tuple[int, ...]] = None
-    if tune == "dec":
+    # Capacity-directed planning (T156 option 1): under the cross gate the
+    # solo host's non-weight posts (global-context DFLASH draft cell,
+    # measured graph/workspace residency) make the GLOBAL capacity a steep
+    # function of the host's weight share — the speed objective below, blind
+    # to that, parked the MLP mass on the host and left the shadow cards
+    # ~5 GiB idle while C was host-bound. With a complete measured registry
+    # the capacity model is trustworthy in ABSOLUTE terms, so the objective
+    # flips: maximize predicted context, tie-break by prefill speed among
+    # near-optimal (>=99%) candidates. The decode-knee guard is LOGGED but
+    # not binding here — trading decode round time for capacity is the
+    # user's explicit decision for this mode; the measured delta is reported
+    # after boot. Gated on cross_active + registry + capacity KV mode, so
+    # every other configuration keeps the speed objective byte-identically.
+    capacity_directed = bool(
+        model.cross_active
+        and model.measured is not None
+        and server_args.uneven_kv_capacity_mode()
+    )
+    if capacity_directed:
+        import itertools
+
+        lines.append(
+            "capacity-directed planning ACTIVE (cross-algorithm gate + "
+            "complete measured registry): objective = predicted max context "
+            "on the measured capacity model; prefill speed breaks ties "
+            "within 1%; decode-knee guard is advisory (logged only)."
+        )
+        enc_scores = list(rank_scores_gemm)
+        # Candidate space: exhaustive small-integer vectors (the capacity
+        # optimum usually DRAINS the solo host, a direction the
+        # score-proportional ladders never propose). 6^tp stays trivial for
+        # tp<=4; larger groups fall back to the ladders + the even vector.
+        if 6 ** model.tp_size <= 1296 * 6:
+            cand_set = {
+                _gcd_reduce(v)
+                for v in itertools.product(
+                    range(1, 7), repeat=model.tp_size
+                )
+            }
+        else:
+            cand_set = set(_mlp_candidates(model, enc_scores, base_plan))
+            cand_set.add(tuple([1] * model.tp_size))
+        cand_set.add(_gcd_reduce(base_plan))
+
+        scored = []
+        for cand in sorted(cand_set):
+            pred = model.predict_capacity(list(cand))
+            if not pred["feasible"]:
+                continue
+            t_cand = model.prefill_time_model(list(cand), enc_scores, min_link)
+            scored.append((cand, pred, t_cand))
+        if scored:
+            best_ctx = max(p["ctx"] for _, p, _ in scored)
+            near = [x for x in scored if x[1]["ctx"] >= 0.99 * best_ctx]
+            # HYSTERESIS: prefer the INCUMBENT (the vector the registry was
+            # measured under) whenever it is itself near-optimal. Without
+            # this the choice oscillates around the host's feasibility edge
+            # (measured 2026-07-22: 2,1,1 <-> 3,1,1 flip every boot, because
+            # the bias anchor is exact only AT the measured vector), and
+            # since budget corrections are vector-specific, every flip
+            # resets them and the fill never converges. Switching still
+            # happens the moment the incumbent falls out of the 1% window
+            # (a real capacity gain).
+            incumbent = None
+            if model.measured_mlp_vector is not None:
+                inc_vec = _gcd_reduce(model.measured_mlp_vector)
+                for x in near:
+                    if x[0] == inc_vec:
+                        incumbent = x
+                        break
+            if incumbent is not None:
+                cand, pred, t_cand = incumbent
+                lines.append(
+                    f"capacity objective: incumbent vector "
+                    f"{','.join(map(str, cand))} (measured registry vector) "
+                    "is within 1% of the optimum -- kept for correction "
+                    "convergence (hysteresis)."
+                )
+            else:
+                cand, pred, t_cand = min(near, key=lambda x: x[2])
+            # Decode round-time proxy: bs=1 decode is weight-streaming bound,
+            # time ~ max_r(streamed_bytes_r / membw_r). Reported vs base.
+            def _dec_proxy(vec):
+                streamed = model.streamed_bytes(list(vec))
+                return max(
+                    s / max(bw, 1e-9) * 1e-9
+                    for s, bw in zip(streamed, rank_scores_bw)
+                )
+
+            dec_delta = (_dec_proxy(cand) / _dec_proxy(base_plan) - 1.0) * 100
+            knee_ok, knee_reason = model.decode_knee_detail(
+                list(cand), rank_scores_bw
+            )
+            t_base = model.prefill_time_model(base_plan, enc_scores, min_link)
+            for c2, p2, t2 in sorted(scored, key=lambda x: -x[1]["ctx"])[:6]:
+                lines.append(
+                    f"capacity candidate {','.join(map(str, c2))}: predicted "
+                    f"ctx ~{int(p2['ctx'])}, per-rank weights "
+                    f"{[round(w, 2) for w in p2['weights_gib']]} GiB, "
+                    f"prefill {t_base / t2 - 1.0:+.1%} vs base"
+                )
+            lines.append(
+                f"capacity objective: best predicted ctx ~{int(best_ctx)}; "
+                f"chosen {','.join(map(str, cand))} (within 1%, fastest "
+                f"prefill); predicted decode round-time delta {dec_delta:+.1f}% "
+                f"(streamed-bytes/membw proxy; ADVISORY decode-knee: "
+                f"{'ok' if knee_ok else knee_reason})"
+            )
+            if _gcd_reduce(cand) != _gcd_reduce(base_plan):
+                chosen = cand
+            else:
+                lines.append(
+                    "capacity optimum IS the VRAM-auto base split -- no MLP "
+                    "override needed."
+                )
+        else:
+            lines.append(
+                "capacity-directed planning: no feasible candidate on the "
+                "measured model -- keeping plain auto (registry stale? "
+                "budgets shrank?)."
+            )
+    elif tune == "dec":
         lines.append(
             "tune=dec: M22 measured decode as FLAT (+-2%) across all "
             "representable splits -- the VRAM-auto split already sits near "

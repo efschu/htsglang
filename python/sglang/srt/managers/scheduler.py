@@ -839,6 +839,49 @@ class Scheduler(
                 token_to_kv_pool_allocator=allocator,
             )
 
+    def _solo_draft_kv_pool_bytes(self) -> int:
+        """Measured bytes of solo-resident draft KV pools on THIS rank.
+
+        Walks the draft worker (including the cross-algorithm meta-worker's
+        sub-workers) for draft model runners flagged as the solo host and
+        sums their private KV pools. 0 on shadow ranks, on split placement,
+        and without speculative decoding. Best-effort: sizing the balance
+        post must never break boot."""
+        total = 0
+        try:
+            roots = []
+            dw = self.draft_worker
+            if dw is not None:
+                for attr in ("_primary", "_secondary"):
+                    sub = getattr(dw, attr, None)
+                    if sub is not None:
+                        roots.append(sub)
+                if not roots:
+                    roots.append(dw)
+            seen = set()
+            for w in roots:
+                dmr = getattr(w, "draft_model_runner", None)
+                if (
+                    dmr is None
+                    or id(dmr) in seen
+                    or not getattr(dmr, "is_draft_solo_host", False)
+                ):
+                    continue
+                seen.add(id(dmr))
+                pool = getattr(dmr, "token_to_kv_pool", None)
+                if pool is None:
+                    continue
+                try:
+                    v = pool.get_kv_size_bytes()
+                    total += (
+                        int(sum(v)) if isinstance(v, (tuple, list)) else int(v)
+                    )
+                except Exception:
+                    continue
+        except Exception:
+            return 0
+        return total
+
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""
         self.tp_worker.init_attention_backends()
@@ -868,8 +911,14 @@ class Scheduler(
         # Measured KV-budget correction (two-boot convergence, env-gated):
         # everything permanent is resident here (weights, pools, graphs,
         # workspaces; paused offload tags hold no pages) — measure the real
-        # leftover and persist it for the next boot's budget.
-        model_runner.note_post_capture_leftover()
+        # leftover and persist it for the next boot's budget. The scheduler
+        # owns the draft worker, so it contributes the solo draft-KV pool
+        # size (the cross gate's DFLASH pool on rank 0) as its own registry
+        # post — the weight planner models it as a per-global-token cell,
+        # not as fixed residency.
+        model_runner.note_post_capture_leftover(
+            draft_solo_pool_bytes=self._solo_draft_kv_pool_bytes()
+        )
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
