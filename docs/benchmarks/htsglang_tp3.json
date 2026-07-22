@@ -1,7 +1,7 @@
 {
   "_meta": {
     "engine": "htsglang (sglang fork, GGUF plugin + uneven-TP capable) — TP=3 UNEVEN across 3 heterogeneous GPUs, weighted uneven-DCP token-axis KV sharding",
-    "repo": "/spinning/htsglang-gguf at HEAD 3e76cbbf1 (UNMODIFIED, local VM venv /spinning/htsglang-gpu/.venv, torch 2.11+cu130, NCCL 2.28.9)",
+    "repo": "htsglang at HEAD 3e76cbbf1 (UNMODIFIED, local venv, torch 2.11+cu130, NCCL 2.28.9)",
     "model": "Qwen3.6-27B (hybrid GDN/linear-attn + embedded MTP/NEXTN draft blk.64). Quants: original Qwen3.6-27B-FP8; AWQ-BF16-INT4 (compressed-tensors); unsloth UD-GGUF Q6_K_XL (+mmproj-BF16 vision tower). Q8_K_XL INFEASIBLE (see below).",
     "host": "VM local (NOT docker). HARDWARE (5090 re-installed, verified this phase): NVML/PCI idx 0=RTX3080(20480MiB,05:00.0), 1=RTX5090(32607MiB,0A:00.0), 2=RTX3080(20480MiB,0B:00.0). Fork resolves physical GPUs via NVML at runtime. Note: sglang launched WITHOUT CUDA_DEVICE_ORDER=PCI_BUS_ID, so CUDA FASTEST_FIRST places the 5090 at cuda:0 => rank0=5090, rank1/2=3080 (confirmed by derived budgets [29607,18280,18280]).",
     "measured_by": "Phase 3c PART2 (M27d) 2026-07-17, 05:07-05:44 CEST. cuInit driver warmup on all 3 GPUs before first boot (5090 re-install). Thermal gate <=80C before every boot.",

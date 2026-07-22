@@ -2,9 +2,8 @@
 """The byte-identity CLASS registry -- the enforceable contract of #124.
 
 Three classes, each with exact assertion semantics, distilled from the
-fork's manually-validated gates (memory files ``weightless-kv-lane`` --
-explicitly "auch die #124-Harness-Spec" --, ``moe-expert-offload``,
-``marlin-offload-nicht-bit-identisch``, ``hetero-spec-determinismus``):
+fork's manually-validated determinism gates (the weightless-KV lane, MoE
+and marlin expert offload, and heterogeneous-spec determinism):
 
 MACHINE_ZERO
     Bit-exact: identical token trajectory AND ``torch.equal`` logits
@@ -90,8 +89,8 @@ CLASS_SPECS = {
         needs_near_tie_margin=False,
         gpu_evidence=None,
         provenance=(
-            "memory weightless-kv-lane: head-local single-shot prefill == TP=1 solo; "
-            "graph-weightless == eager-weightless (#133 'Byte maschinen-null', "
+            "weightless-KV lane: head-local single-shot prefill == TP=1 solo; "
+            "graph-weightless == eager-weightless (#133 'byte machine-zero', "
             "B2 part-2 captured streaming max|d|=0)"
         ),
     ),
@@ -111,7 +110,7 @@ CLASS_SPECS = {
         needs_near_tie_margin=True,
         gpu_evidence=None,
         provenance=(
-            "memory weightless-kv-lane: cross-rank-merge paths (decode + chunked "
+            "weightless-KV lane: cross-rank-merge paths (decode + chunked "
             "prefill with prefix via cp_lse LSE merge) are argmax-identical to solo "
             "but not bit-exact (fp reassociation); B0 block=64 control 0 flips, "
             "B1 streaming-vs-resident 96/96 argmax-identical"
@@ -135,7 +134,7 @@ CLASS_SPECS = {
             "coherence; self-det 5/5 across repeated boots"
         ),
         provenance=(
-            "memory marlin-offload-nicht-bit-identisch + moe-expert-offload: BOTH "
+            "marlin and MoE expert-offload paths: BOTH "
             "offload paths (FP8 sub-ULP, marlin ~1e-2) are self-deterministic with "
             "near-tie-only divergence; 'FP8 byte-identical' retracted by author "
             "0fb3d8007 (256-token rerun 118/256, fork at token 115 near-tie)"

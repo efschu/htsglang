@@ -167,8 +167,7 @@ Models: Qwen3.6-27B-FP8 (dense) and Qwen3.6-35B-A3B-FP8 (MoE).
 4. **Regression**: default (coupled) boot on the feature branch vs base commit:
    byte-identical sizing lines + tok/s within noise.
 
-Results land in the commit body and
-`/root/.claude/jobs/1481bb40/tmp/t88/T88_RESULTS.md`.
+Results land in the commit body and the accompanying results notes.
 
 ## 8. Touch list (small, gated)
 

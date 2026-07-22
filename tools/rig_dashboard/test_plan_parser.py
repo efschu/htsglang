@@ -8,7 +8,9 @@ import os
 
 from plan_parser import derive_head_split, largest_remainder, parse_plan, parse_plan_file
 
-LOGDIR = "/root/.claude/jobs/1481bb40/tmp/matrix_logs"
+# Directory holding the captured boot logs. Override with PLAN_PARSER_LOGDIR
+# to point at wherever the M38 battery logs live on your machine.
+LOGDIR = os.environ.get("PLAN_PARSER_LOGDIR", "matrix_logs")
 
 
 def _log(name):
@@ -139,7 +141,7 @@ def test_replicated_kv_and_moe_expert_lines():
 
 def test_live_a3b_boot10_end_to_end():
     # the actual live-battery log, if still present (skip silently if rotated)
-    path = "/root/.claude/jobs/1481bb40/tmp/m33_a3b_gguf_boot10.log"
+    path = os.path.join(LOGDIR, "m33_a3b_gguf_boot10.log")
     if not os.path.exists(path):
         return
     p = parse_plan_file(path)

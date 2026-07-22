@@ -6,8 +6,8 @@ auto-disabled+warn in disagg mode, local ~100-line proxy instead of
 sglang_router (interface designed for later rig-dashboard folding: plain
 HTTP, health passthrough, per-phase metric counters), M3 must include a
 short-prompt TTFT check, M4 must prove 0-MiB teardown incl. hard-kill of
-the prefill server mid-transfer (IPC leak check). Branch `feat/pd-disagg`
-(worktree `/spinning/wt-pd-disagg`), based on `feat/gemma-draft-spec`
+the prefill server mid-transfer (IPC leak check). Branch `feat/pd-disagg`,
+based on `feat/gemma-draft-spec`
 (`e2228882f` — strict superset of `feat/gemma-bringup`, adds the #100
 uneven-TP MLP fix, #91 SWA pool sizing, #101 EAGLE3 head support).
 

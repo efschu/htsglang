@@ -1,7 +1,7 @@
 {
   "_meta": {
     "engine": "htsglang (sglang fork, GGUF plugin + uneven-TP capable; TP=2 even split here)",
-    "repo": "/spinning/htsglang-gguf at HEAD 3e76cbbf1 (UNMODIFIED, local VM venv /spinning/htsglang-gpu/.venv, NCCL 2.28.9)",
+    "repo": "htsglang at HEAD 3e76cbbf1 (UNMODIFIED, local venv, NCCL 2.28.9)",
     "model": "Qwen3.6-27B (+ embedded MTP/NEXTN draft), quants: unsloth UD-GGUF Q6 (+mmproj vision tower), AWQ-BF16-INT4 (compressed-tensors)",
     "host": "VM local (NOT docker). HARDWARE STATE: RTX 5090 PHYSICALLY REMOVED for this phase -> only 2x RTX 3080 20GB, NVML/PCI indices 0 and 1 (enumeration SHIFTED vs all earlier notes). 5090 returned to the system immediately AFTER the last measurement (new order 0=3080, 1=5090, 2=3080).",
     "measured_by": "Phase 3c PART 1 (M27c) 2026-07-16 21:02-21:39 CEST",

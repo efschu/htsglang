@@ -1,84 +1,84 @@
-# Qwen3.6-27B - Engine-Vergleichsmatrix (Final)
+# Qwen3.6-27B - Engine comparison matrix (final)
 
-Stand: 2026-07-17. Alle Zahlen sind gemessen (Phase 3a-3c, M27a-M27e); keine
-geschaetzten oder interpolierten Werte. Fehlende Zellen sind explizit als
-INFEASIBLE (mit Kurzgrund) oder n/a markiert.
+As of 2026-07-17. All numbers are measured (phase 3a-3c, M27a-M27e); no
+estimated or interpolated values. Missing cells are explicitly marked
+INFEASIBLE (with a short reason) or n/a.
 
-## 1. Kopf: Hardware, Modell, Engines, gemeinsame Settings
+## 1. Header: hardware, model, engines, common settings
 
-### Hardware (dieses System)
+### Hardware (this system)
 - 1x NVIDIA RTX 5090, 32 GB VRAM (NVML 32607 MiB)
-- 2x NVIDIA RTX 3080, 20 GB VRAM je (NVML 20480 MiB)
-- Eine der 3080 haengt an PCIe Gen4 x4 (schmalere Anbindung). Kein NVLink,
-  kein GPU-P2P (GeForce, nvidia-smi -p2p zeigt NS/CNS fuer alle Paare -> PHB-only).
-- NVML/PCI-Enumeration schwankt zwischen Boots/Treiberzustaenden; physische
-  GPU-IDs werden zur Laufzeit ueber NVML aufgeloest (5090 nicht hart verdrahtet).
-  Container-CUDA-Ordnung ist FASTEST_FIRST -> cuda:0 = 5090.
+- 2x NVIDIA RTX 3080, 20 GB VRAM each (NVML 20480 MiB)
+- One of the 3080s is attached to PCIe Gen4 x4 (narrower link). No NVLink,
+  no GPU P2P (GeForce, `nvidia-smi -p2p` shows NS/CNS for all pairs -> PHB-only).
+- NVML/PCI enumeration varies between boots/driver states; physical
+  GPU IDs are resolved at runtime via NVML (the 5090 is not hard-wired).
+  Container CUDA order is FASTEST_FIRST -> cuda:0 = 5090.
 
-### Modell
-Qwen3.6-27B-Familie (hybrid GDN / Linear-Attention + eingebetteter MTP/NEXTN-Draft,
-blk.64). Quant-Varianten:
+### Model
+Qwen3.6-27B family (hybrid GDN / linear attention + embedded MTP/NEXTN draft,
+blk.64). Quant variants:
 - Original Qwen3.6-27B-FP8 (layers-*.safetensors + mtp.safetensors)
 - Qwen3.6-27B-AWQ-BF16-INT4 (compressed-tensors, ~14 GB)
-- unsloth UD-GGUF Q6_K_XL (26.0 GB, + mmproj-BF16 Vision-Tower)
-- unsloth UD-GGUF Q8_K_XL (35.8 GB) -- auf beiden Forks INFEASIBLE (siehe Fussnote 8)
+- unsloth UD-GGUF Q6_K_XL (26.0 GB, + mmproj-BF16 vision tower)
+- unsloth UD-GGUF Q8_K_XL (35.8 GB) -- INFEASIBLE on both forks (see footnote 8)
 
-### Engines (exakte Versionen / Images / Commits)
-- llama.cpp: `ghcr.io/ggml-org/llama.cpp:server-cuda`, Upstream b10015 (id 297b3e6a71e1),
-  Modell unsloth Qwen3.6-27B-MTP-GGUF (eingebetteter MTP-Draft).
-- shvllm (vLLM-Fork, uneven-TP / rank-gpu-id): Image `shvllm-qwen35-gguf:cu129-uneven`
-  (id 6ee0897f1157), Repo-HEAD f78ea433f, pip NCCL 2.30.7.
-- htsglang (sglang-Fork, GGUF-Plugin + uneven-TP): Repo-HEAD 3e76cbbf1 (UNMODIFIED).
-  TP=2/TP=3 als VM-lokale venv (torch 2.11+cu130, NCCL 2.28.9); TP=4 co-located als
-  Docker-Image `htsglang-qwen35-gguf:cu130-3e76cbbf1` (NCCL 2.30.7 gebacken -- co-located
-  TP=4 braucht NCCL >= 2.30, daher docker-only).
+### Engines (exact versions / images / commits)
+- llama.cpp: `ghcr.io/ggml-org/llama.cpp:server-cuda`, upstream b10015 (id 297b3e6a71e1),
+  model unsloth Qwen3.6-27B-MTP-GGUF (embedded MTP draft).
+- shvllm (vLLM fork, uneven-TP / rank-gpu-id): image `shvllm-qwen35-gguf:cu129-uneven`
+  (id 6ee0897f1157), repo HEAD f78ea433f, pip NCCL 2.30.7.
+- htsglang (sglang fork, GGUF plugin + uneven-TP): repo HEAD 3e76cbbf1 (UNMODIFIED).
+  TP=2/TP=3 as a local venv (torch 2.11+cu130, NCCL 2.28.9); TP=4 co-located as
+  Docker image `htsglang-qwen35-gguf:cu130-3e76cbbf1` (NCCL 2.30.7 baked in -- co-located
+  TP=4 requires NCCL >= 2.30, hence docker-only).
 
-### Gemeinsame Settings (alle Zellen)
-- MTP / Spekulatives Decoding UEBERALL AKTIV:
+### Common settings (all cells)
+- MTP / speculative decoding ACTIVE EVERYWHERE:
   - vLLM/shvllm: `--speculative-config '{"method":"mtp","num_speculative_tokens":3}'`
   - sglang/htsglang: `--speculative-algorithm NEXTN --speculative-num-steps 3
     --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`
   - llama.cpp: `--spec-type draft-mtp --spec-draft-n-max 3`
-- KV-Cache-dtype fp8 (shvllm `--kv-cache-dtype fp8`, htsglang `fp8_e4m3`);
-  llama.cpp hat KEIN fp8-KV -> naechster Analog q8_0 Block-Quant (Fussnote 1).
-- UNCACHED per Konstruktion: unique-Nonce token-id-Prompts, cached_tokens == 0 in
-  jeder Anfrage jeder Zelle (bei llama.cpp benigne Feld-Semantik, siehe JSON-Caveat).
-- Thermal-Gate <= 80 C vor jedem Boot (cooldown.sh, feuerte bei jedem Boot).
-- Ein aufgewaermter Battery-Durchlauf pro Boot (kein Median-of-3); maxKV bei
-  llama.cpp per Bisektion, bei den Forks aus der Boot-Zeile.
+- KV-cache dtype fp8 (shvllm `--kv-cache-dtype fp8`, htsglang `fp8_e4m3`);
+  llama.cpp has NO fp8 KV -> nearest analog q8_0 block-quant (footnote 1).
+- UNCACHED by construction: unique-nonce token-id prompts, cached_tokens == 0 in
+  every request of every cell (for llama.cpp benign field semantics, see JSON caveat).
+- Thermal gate <= 80 C before every boot (cooldown.sh, fired on every boot).
+- One warmed-up battery run per boot (no median-of-3); maxKV for
+  llama.cpp by bisection, for the forks from the boot line.
 
-### Metrik-Definitionen (Spalten)
-- **Prefill20k** (P1): 1 Request, 20000 exakte unique input_ids, 1 Output-Token -> tok/s.
-- **Dec1k code / prose** (D1): 1 Request, ~1000-Token-Decode (ignore_eos) -> tok/s.
-- **Par8-Prefill** (P8): 8 parallele Requests x 6000 input_ids -> aggregierte tok/s.
-- **Par8-Dec code / prose** (D8): 8 parallele Requests x ~400-Token-Decode -> aggregierte tok/s.
-- **maxKV**: groesster bootbarer+servender KV-Pool an der Zell-Config (config-gebunden,
-  siehe Kontext-Sektion 3 zur Abgrenzung gegen den kalibrierten Maximalkontext).
-- **Accept**: MTP/NEXTN spec_accept_length (D1 code / D1 prose). Nur sglang/htsglang
-  exponiert das; vLLM- und llama.cpp-Oberflaechen nicht -> dort n/a. Der MTP-Speedup
-  steckt bei allen Engines bereits in den tok/s.
+### Metric definitions (columns)
+- **Prefill20k** (P1): 1 request, 20000 exact unique input_ids, 1 output token -> tok/s.
+- **Dec1k code / prose** (D1): 1 request, ~1000-token decode (ignore_eos) -> tok/s.
+- **Par8-Prefill** (P8): 8 parallel requests x 6000 input_ids -> aggregated tok/s.
+- **Par8-Dec code / prose** (D8): 8 parallel requests x ~400-token decode -> aggregated tok/s.
+- **maxKV**: largest bootable+serving KV pool at the cell config (config-bound,
+  see context section 3 for the distinction from the calibrated maximum context).
+- **Accept**: MTP/NEXTN spec_accept_length (D1 code / D1 prose). Only sglang/htsglang
+  exposes it; the vLLM and llama.cpp surfaces do not -> n/a there. The MTP speedup
+  is already baked into the tok/s for all engines.
 
 ---
 
-## 2. Haupttabellen pro Szenario
+## 2. Main tables per scenario
 
-Alle tok/s in Tokens/Sekunde, maxKV in Tokens.
+All tok/s in tokens/second, maxKV in tokens.
 
-### Szenario S1 -- Layer-Split (3 GPUs, 5090 + 2x 3080, 72 GB)
+### Scenario S1 -- Layer-split (3 GPUs, 5090 + 2x 3080, 72 GB)
 
-Nur llama.cpp: echte TP kann die 3 heterogenen Karten nicht spannen, daher
-`-sm layer` (Pipeline ueber alle 3 GPUs). Die Forks fahren dieses Szenario nicht.
+llama.cpp only: true TP cannot span the 3 heterogeneous cards, hence
+`-sm layer` (pipeline across all 3 GPUs). The forks do not run this scenario.
 
 | Engine x Quant | Prefill20k | Dec1k code | Dec1k prose | Par8-Prefill | Par8-Dec code | Par8-Dec prose | maxKV | Accept c/p |
 |---|---|---|---|---|---|---|---|---|
 | llama.cpp Q8 (UD-Q8_K_XL) | 1835.4 | 57.9 | 45.0 | 1914.4 | 150.1 | 156.8 | 355568 | n/a |
 | llama.cpp Q6 (UD-Q6_K_XL) | 1688.9 | 74.5 | 50.8 | 1741.5 | 176.3 | 154.6 | 518096 | n/a |
 
-### Szenario S2 -- TP=2 (2x RTX 3080, 5090 nicht beteiligt)
+### Scenario S2 -- TP=2 (2x RTX 3080, 5090 not involved)
 
-Echte Tensor-Parallelitaet ueber die beiden 3080. htsglang TP=2 wurde bei
-PHYSISCH ENTFERNTER 5090 gemessen (reine 2x3080), shvllm mit CUDA_VISIBLE_DEVICES=0,2,
-llama.cpp mit `-sm tensor` (das geplante `-sm row` ist hier INFEASIBLE, Fussnote 2).
+True tensor parallelism across the two 3080s. htsglang TP=2 was measured with
+the 5090 PHYSICALLY REMOVED (pure 2x3080), shvllm with CUDA_VISIBLE_DEVICES=0,2,
+llama.cpp with `-sm tensor` (the planned `-sm row` is INFEASIBLE here, footnote 2).
 
 | Engine x Quant | Prefill20k | Dec1k code | Dec1k prose | Par8-Prefill | Par8-Dec code | Par8-Dec prose | maxKV | Accept c/p |
 |---|---|---|---|---|---|---|---|---|
@@ -87,256 +87,256 @@ llama.cpp mit `-sm tensor` (das geplante `-sm row` ist hier INFEASIBLE, Fussnote
 | shvllm AWQ-INT4 | 1153.6 | 75.5 | 62.4 | 1121.9 | 195.0 | 187.8 | 94400 | n/a |
 | htsglang Q6 (GGUF) | 1126.1 | 54.5 | 48.7 | 1098.7 | 65.5 | 49.8 | 32768 | 3.36 / 3.04 |
 | htsglang AWQ-INT4 | 1169.2 | 86.5 | 63.9 | 1157.2 | 136.5 | 119.7 | 148864 | 3.22 / 2.38 |
-| Q8 (jede Engine) | INFEASIBLE: passt nicht auf 2x20 GB (Q8=35.8 GB, per Plan ausgeschlossen); zusaetzlich GGUF-Q8-Loaderbug (Fussnote 8) | | | | | | | |
+| Q8 (any engine) | INFEASIBLE: does not fit on 2x20 GB (Q8=35.8 GB, excluded by plan); additionally a GGUF-Q8 loader bug (footnote 8) | | | | | | | |
 
-Hinweis: Bei htsglang TP=2 ist die Nebenlaeufigkeit hart auf 2 gedeckelt (Mamba-State-Cache
-ist der Engpass, nicht KV-Tokens) -> die Par8-Spalten sind Durchsatz bei 2-at-a-time
-gequeuten Requests, KEIN 8-Wege-Batching (Fussnote 4). shvllm laesst echtes 8-Wege-Batching
-zu (D8 ~2.6x D1 bei AWQ). maxKV-Effizienz Q6: shvllm serviert 25600 @ GMU 0.88 unaided,
-htsglang braucht manuelles KV-Cap 32768 (Fussnote 7 / #63).
+Note: For htsglang TP=2 concurrency is hard-capped at 2 (the Mamba-state cache
+is the bottleneck, not KV tokens) -> the Par8 columns are throughput with requests
+queued 2-at-a-time, NOT 8-way batching (footnote 4). shvllm allows true 8-way batching
+(D8 ~2.6x D1 for AWQ). maxKV efficiency Q6: shvllm serves 25600 @ GMU 0.88 unaided,
+htsglang needs a manual KV cap of 32768 (footnote 7 / #63).
 
-### Szenario S4 -- TP=3 uneven-auto (5090 + 2x 3080, gewichtetes uneven-DCP)
+### Scenario S4 -- TP=3 uneven-auto (5090 + 2x 3080, weighted uneven-DCP)
 
-VRAM-gewichtete uneven-TP-Aufteilung, rank0 = 5090. htsglang mit BEIDEN Varianten:
-- **V1 = max-KV** (`--rank-tp-ratio auto`, kalibrierter Token-Vektor, reiner Pool-Maximum).
-- **V2 = max-perf @ >= 100k KV** (`auto-performance` mit MLP-Konzentration auf die 5090;
-  GGUF nutzt eine PINNED-MLP-Approximation, da auto-performance auf GGUF INFEASIBLE ist, Fussnote 5).
+VRAM-weighted uneven-TP split, rank0 = 5090. htsglang with BOTH variants:
+- **V1 = max-KV** (`--rank-tp-ratio auto`, calibrated token vector, pure pool maximum).
+- **V2 = max-perf @ >= 100k KV** (`auto-performance` with MLP concentration on the 5090;
+  GGUF uses a PINNED-MLP approximation, since auto-performance is INFEASIBLE on GGUF, footnote 5).
 
 | Engine x Quant | Prefill20k | Dec1k code | Dec1k prose | Par8-Prefill | Par8-Dec code | Par8-Dec prose | maxKV | Accept c/p |
 |---|---|---|---|---|---|---|---|---|
 | shvllm Q6 (GGUF) | 1239.8 | 61.7 | 46.2 | 1215.2 | 180.3 | 155.3 | 1139318 | n/a |
 | shvllm AWQ-INT4 | 1228.3 | 83.7 | 62.7 | 1211.6 | 288.1 | 266.2 | 1146573 | n/a |
 | shvllm FP8 | 1218.7 | 73.9 | 60.7 | 1223.5 | 287.9 | 273.7 | 1046126 | n/a |
-| shvllm Q8 (GGUF) | INFEASIBLE: UD-Q8_K_XL mixed-precision fused qkvz, GGUF-Plugin lehnt fruh ab (Fussnote 8) | | | | | | | |
+| shvllm Q8 (GGUF) | INFEASIBLE: UD-Q8_K_XL mixed-precision fused qkvz, GGUF plugin rejects early (footnote 8) | | | | | | | |
 | htsglang FP8 -- V1 max-KV | 1123.7 | 98.4 | 80.8 | 1125.7 | 354.9 | 268.9 | 824896 (*M28) | 3.28 / 2.69 |
 | htsglang FP8 -- V2 max-perf | 1202.7 | 84.4 | 61.3 | 1207.8 | 343.2 | 260.2 | 299968 | 3.12 / 2.25 |
 | htsglang AWQ -- V1 max-KV | 1123.9 | 103.2 | 93.1 | 1135.2 | 346.0 | 299.2 | 857408 (*M28) | 3.14 / 2.86 |
 | htsglang AWQ -- V2 max-perf | 1247.2 | 115.7 | 94.8 | 1261.6 | 345.3 | 305.2 | 441536 | 3.40 / 2.79 |
 | htsglang Q6 -- V1 max-KV | 1102.7 | 65.9 | 54.6 | 1111.5 | 184.0 | 157.0 | 818880 (*M28) | 3.19 / 2.66 |
 | htsglang Q6 -- V2 max-perf (pinned-MLP) | 1207.5 | 63.2 | 54.2 | 1213.4 | 221.7 | 164.1 | 241216 | 2.99 / 2.58 |
-| htsglang Q8 -- V1/V2 | INFEASIBLE: laedt weiter als shvllm, crasht dann an mixed-dtype padding (Fussnote 8) | | | | | | | |
+| htsglang Q8 -- V1/V2 | INFEASIBLE: loads further than shvllm, then crashes on mixed-dtype padding (footnote 8) | | | | | | | |
 
-Hinweis: Hier ist die Nebenlaeufigkeit NICHT mamba-gedeckelt (5090 im Mix, ~100 Mamba-Slots)
--> die htsglang-Par8-Spalten sind echtes 8-Wege-Batching (D8 >> D1). Die V2-Wirkung
-haengt am Quant (Fussnote 5): AWQ V2 = echter Doppel-Gewinn (Prefill +11% UND Single-Decode
-+12%), FP8 V2 = Prefill-Gewinn aber Single-Decode-Einbruch (Decode-Knee), GGUF V2 = nur
-Pinned-MLP-Approximation.
+Note: Here concurrency is NOT mamba-capped (5090 in the mix, ~100 Mamba slots)
+-> the htsglang Par8 columns are true 8-way batching (D8 >> D1). The V2 effect
+depends on the quant (footnote 5): AWQ V2 = true double win (prefill +11% AND single-decode
++12%), FP8 V2 = prefill gain but single-decode drop (decode knee), GGUF V2 = only
+a pinned-MLP approximation.
 
-(*M28) maxKV nachkalibriert + config-angeglichen 2026-07-17 (Audit M28): --max-running-requests 8
-(mamba-Pool 50 statt 100 Slots) + reserve 1500 uniform + konvergierter Token-Vektor
-(FP8 32,15,17; AWQ 31,14,19; Q6 auto 30,17,17), HEAD 3e76cbbf1. Die urspruenglichen
-V1-Boot-Werte mit mrr16/Reserve-Bump (FP8 530944, AWQ 566912 [no-MTP-Vektor, unkalibriert],
-Q6 546560) stehen im JSON als maxkv_v1_config. Die vLLM-Zahl enthaelt zusaetzlich
-Mamba-Block-Accounting im unified Pool -- der Rest-Gap (~1.27x, z.B. FP8 824896 vs 1046126)
-ist Accounting-Semantik, kein fehlender Speicher. Speed-Spalten unveraendert (V1-Boots).
+(*M28) maxKV recalibrated + config-aligned 2026-07-17 (audit M28): --max-running-requests 8
+(mamba pool 50 instead of 100 slots) + reserve 1500 uniform + converged token vector
+(FP8 32,15,17; AWQ 31,14,19; Q6 auto 30,17,17), HEAD 3e76cbbf1. The original
+V1 boot values with mrr16/reserve bump (FP8 530944, AWQ 566912 [no-MTP vector, uncalibrated],
+Q6 546560) are stored in the JSON as maxkv_v1_config. The vLLM number additionally includes
+Mamba-block accounting in the unified pool -- the remaining gap (~1.27x, e.g. FP8 824896 vs 1046126)
+is accounting semantics, not missing memory. Speed columns unchanged (V1 boots).
 
-### Szenario S3 -- TP=4 co-located (5090 x2 + 2x 3080, via MPS)
+### Scenario S3 -- TP=4 co-located (5090 x2 + 2x 3080, via MPS)
 
-4 gleich grosse Ranks auf 3 physischen GPUs; die beiden Ranks 0+1 teilen sich die 5090
-ueber NVIDIA MPS. Absolutes Per-Rank-Budget (kein uneven-Ratio, kein DCP -> V1/V2 n/a).
-shvllm @ 14500 MiB/Rank, htsglang @ 13500 MiB/Rank (Engine-Differenz, Fussnote 3).
+4 equally sized ranks on 3 physical GPUs; ranks 0+1 share the 5090
+via NVIDIA MPS. Absolute per-rank budget (no uneven ratio, no DCP -> V1/V2 n/a).
+shvllm @ 14500 MiB/rank, htsglang @ 13500 MiB/rank (engine difference, footnote 3).
 
 | Engine x Quant | Prefill20k | Dec1k code | Dec1k prose | Par8-Prefill | Par8-Dec code | Par8-Dec prose | maxKV | Accept c/p |
 |---|---|---|---|---|---|---|---|---|
 | shvllm FP8 (@14500) | 1411.9 | 107.3 | 82.2 | 1442.9 | 323.4 | 308.0 | 429096 | n/a |
 | shvllm AWQ-INT4 (@14500) | 1417.5 | 103.2 | 72.8 | 1443.7 | 306.9 | 296.9 | 514036 | n/a |
 | shvllm Q6 (GGUF, @14500) | 1384.0 | 62.6 | 52.2 | 1424.4 | 220.7 | 175.0 | 443740 | n/a |
-| shvllm Q8 (GGUF) | INFEASIBLE: identisch zu shvllm-Q8-TP=3 (mixed-precision fused qkvz, Fussnote 8) | | | | | | | |
+| shvllm Q8 (GGUF) | INFEASIBLE: identical to shvllm-Q8-TP=3 (mixed-precision fused qkvz, footnote 8) | | | | | | | |
 | htsglang FP8 (@13500) | 1326.3 | 92.1 | 91.5 | 1341.4 | 244.6 | 244.6 | 330818 | 2.79 / 2.75 |
 | htsglang AWQ-INT4 (@13500) | 1330.7 | 115.3 | 103.5 | 1351.9 | 259.0 | 216.2 | 345064 | 3.18 / 2.84 |
 | htsglang Q6 (GGUF, @13500) | 1282.3 | 76.4 | 65.6 | 1311.9 | 166.0 | 164.3 | 322174 | 3.45 / 2.98 |
-| htsglang Q8 (GGUF) | INFEASIBLE: kein Boot versucht, bekannter Loaderbug (Fussnote 8) | | | | | | | |
+| htsglang Q8 (GGUF) | INFEASIBLE: no boot attempted, known loader bug (footnote 8) | | | | | | | |
 
-Anomalie (offen, an Main verwiesen): Bei shvllm TP=4 schlaegt FP8 die AWQ-INT4 im
-Single-Decode (107.3 vs 103.2), bei htsglang ist es umgekehrt (AWQ 115.3 vs FP8 92.1) --
-Engine-abhaengige INT4-Dequant-/fp8-Pfad-Kosten.
+Anomaly (open, escalated to the maintainer): For shvllm TP=4, FP8 beats AWQ-INT4 in
+single-decode (107.3 vs 103.2); for htsglang it is the other way around (AWQ 115.3 vs FP8 92.1) --
+engine-dependent INT4-dequant / fp8-path costs.
 
 ---
 
-## 3. Kontext-Sektion: config-gebundene maxKV vs kalibrierte Maximalkontexte
+## 3. Context section: config-bound maxKV vs calibrated maximum contexts
 
-Die maxKV-Werte der Tabellen oben sind CONFIG-GEBUNDENE Pool-Groessen an der jeweiligen
-Benchmark-Config (Kontextlaenge, Reserve, MTP aktiv). Sie duerfen NICHT direkt als
-"maximaler Kontext der Engine" gelesen werden -- und schon gar nicht 1:1 zwischen den
-Engines verglichen werden, weil sie aus unterschiedlichen Boot-Zeilen mit unterschiedlicher
-Semantik stammen:
+The maxKV values in the tables above are CONFIG-BOUND pool sizes at the respective
+benchmark config (context length, reserve, MTP active). They must NOT be read directly
+as the "engine's maximum context" -- and certainly not compared 1:1 between the
+engines, because they come from different boot lines with different
+semantics:
 
-- **shvllm-maxKV** = vLLM-Boot-Zeile "GPU KV cache size: N tokens".
-- **htsglang-maxKV** = sglang-Boot-Zeile "max_total_num_tokens".
-- **llama.cpp-maxKV** = groesstes servendes `-c` via Bisektion.
+- **shvllm-maxKV** = vLLM boot line "GPU KV cache size: N tokens".
+- **htsglang-maxKV** = sglang boot line "max_total_num_tokens".
+- **llama.cpp-maxKV** = largest serving `-c` via bisection.
 
-Das ist der Grund, warum shvllm TP=3 (>1M) und htsglang TP=3 (~530k) trotz gleicher
-MTP-Aktivierung so weit auseinanderliegen: verschiedene Engines zaehlen den DCP-Pool
-unterschiedlich, KEIN Aequivalenz-Beweis (Aepfel/Birnen).
+This is why shvllm TP=3 (>1M) and htsglang TP=3 (~530k) lie so far apart despite
+the same MTP activation: different engines count the DCP pool
+differently, NO equivalence proof (apples/oranges).
 
-### Kalibrierte Maximalkontexte (aus HANDOFF, was jeweils gemessen wurde)
+### Calibrated maximum contexts (from HANDOFF, what was measured in each case)
 
-**htsglang uneven-DCP-Kalibrierung (single-node, VRAM-gewichtet, konvergierte Token-Vektoren):**
-Das sind die tatsaechlichen KV-Ceilings des Forks pro Quant, per Selbst-Kalibrierung
-ermittelt -- getrennt nach MTP aus/an:
+**htsglang uneven-DCP calibration (single-node, VRAM-weighted, converged token vectors):**
+These are the fork's actual KV ceilings per quant, determined by self-calibration
+-- separated by MTP off/on:
 
-| Kontext-Klasse | Wert (Tokens) | Was gemessen |
+| Context class | Value (tokens) | What was measured |
 |---|---|---|
-| AWQ, no-MTP | 886080 | konvergierter uneven-DCP-Pool ohne Draft-KV (Vektor [31,15,18]) |
-| GGUF-Q6, no-MTP | 840896 | konvergierter uneven-DCP-Pool ohne Draft-KV |
-| FP8, no-MTP | 804416 | konvergierter uneven-DCP-Pool ohne Draft-KV (Vektor [32,15,17]) |
-| FP8, MTP aktiv (V1-Boot-Config) | 530944 | mit Draft-KV; mrr16 + RESERVE 3000,2200,2200 + TOKVEC 33,13,18 |
-| GGUF-Q6, MTP aktiv (V1-Boot-Config) | 532224 | mit Draft-KV; mrr16 + RESERVE 3000,2200,2200 |
-| FP8, MTP aktiv (M28 nachkalibriert) | 824896 | mrr8 (mamba 50 Slots) + reserve 1500 + Vektor 32,15,17 |
-| AWQ, MTP aktiv (M28 nachkalibriert) | 857408 | mrr8 + reserve 1500 + Vektor 31,14,19 |
-| GGUF-Q6, MTP aktiv (M28 nachkalibriert) | 818880 | mrr8 + reserve 1500 + auto-Vektor 30,17,17 (--skip-server-warmup) |
+| AWQ, no-MTP | 886080 | converged uneven-DCP pool without draft KV (vector [31,15,18]) |
+| GGUF-Q6, no-MTP | 840896 | converged uneven-DCP pool without draft KV |
+| FP8, no-MTP | 804416 | converged uneven-DCP pool without draft KV (vector [32,15,17]) |
+| FP8, MTP active (V1 boot config) | 530944 | with draft KV; mrr16 + RESERVE 3000,2200,2200 + TOKVEC 33,13,18 |
+| GGUF-Q6, MTP active (V1 boot config) | 532224 | with draft KV; mrr16 + RESERVE 3000,2200,2200 |
+| FP8, MTP active (M28 recalibrated) | 824896 | mrr8 (mamba 50 slots) + reserve 1500 + vector 32,15,17 |
+| AWQ, MTP active (M28 recalibrated) | 857408 | mrr8 + reserve 1500 + vector 31,14,19 |
+| GGUF-Q6, MTP active (M28 recalibrated) | 818880 | mrr8 + reserve 1500 + auto vector 30,17,17 (--skip-server-warmup) |
 
-KORREKTUR (M28, 2026-07-17): Der frueher als FUNDAMENTAL beschriebene Sprung no-MTP -> MTP
-(FP8 804416 -> 530944, -34%) war ueberwiegend CONFIG, nicht Draft-KV: bei mrr8 + reserve 1500
-erreicht FP8 MIT MTP 824896 -- mehr als der no-MTP-Wert 804416. Der Draft kostet real nur
-wenig KV; der alte -34%-Einbruch kam aus dem ueberdimensionierten auto-mamba-Pool
-(mrr16 -> 100 Slots, ~5.4 GB auf der 5090) plus Reserve-Bump. Die alten MTP-Zeilen bleiben
-oben als V1-Boot-Config dokumentiert.
+CORRECTION (M28, 2026-07-17): The jump previously described as FUNDAMENTAL, no-MTP -> MTP
+(FP8 804416 -> 530944, -34%), was predominantly CONFIG, not draft KV: at mrr8 + reserve 1500,
+FP8 WITH MTP reaches 824896 -- more than the no-MTP value 804416. The draft actually costs only
+a little KV; the old -34% drop came from the oversized auto-mamba pool
+(mrr16 -> 100 slots, ~5.4 GB on the 5090) plus the reserve bump. The old MTP rows remain
+documented above as V1 boot config.
 
-**shvllm TP=3 (aus den Boot-Logs, MTP aktiv):** >1M-Klasse -- FP8 1046126, Q6 1139318,
-AWQ 1146573. Das ist der maximierte DCP-Pool, den vLLM in seiner Boot-Zeile ausweist;
-er ist wegen der abweichenden Zaehl-Semantik NICHT direkt gegen die htsglang-max_total_num_tokens
-aufzurechnen.
+**shvllm TP=3 (from the boot logs, MTP active):** >1M class -- FP8 1046126, Q6 1139318,
+AWQ 1146573. This is the maximized DCP pool that vLLM reports in its boot line;
+because of the differing counting semantics it is NOT to be directly reconciled against
+htsglang's max_total_num_tokens.
 
-Fazit der Sektion: Innerhalb einer Engine sind maxKV-Werte vergleichbar; ueber Engines
-hinweg nur qualitativ. Die kalibrierten htsglang-Zahlen (886080 / 840896 / 804416) zeigen
-die reine Fork-Kapazitaet OHNE MTP; die Matrix-Zellen zeigen den servenden Pool MIT MTP.
+Section conclusion: Within one engine, maxKV values are comparable; across engines
+only qualitatively. The calibrated htsglang numbers (886080 / 840896 / 804416) show
+the pure fork capacity WITHOUT MTP; the matrix cells show the serving pool WITH MTP.
 
 ---
 
-## Nachtrag (2026-07-17): GGUF nach dem Performance-Overhaul (htsglang e25180447) -- VORLÄUFIG
+## Addendum (2026-07-17): GGUF after the performance overhaul (htsglang e25180447) -- PRELIMINARY
 
-Nach dem GGUF-Perf-Overhaul (htsglang-Commit e25180447: Flat-Byte-Shard-Layout,
-persistenter Dequant-Workspace, quantisiert-residenter embed/lm_head + NEXTN-Modul-Sharing,
-batched-MMVQ ncols<=8) wurden die GGUF-Messpunkte in einer separaten Validierungs-Batterie
-neu erhoben. Diese Zahlen sind VORLÄUFIG und ersetzen NICHT die Matrix-Zellen oben (die
-bleiben unveraendert der Stand vor dem Overhaul).
+After the GGUF perf overhaul (htsglang commit e25180447: flat-byte-shard layout,
+persistent dequant workspace, quantized-resident embed/lm_head + NEXTN module sharing,
+batched-MMVQ ncols<=8) the GGUF data points were re-collected in a separate
+validation battery. These numbers are PRELIMINARY and do NOT replace the matrix cells
+above (those remain unchanged, the state before the overhaul).
 
-| Messpunkt | alt (vor Overhaul) | neu (e25180447) | Delta |
+| Data point | old (before overhaul) | new (e25180447) | Delta |
 |---|---|---|---|
 | Q6 TP=2, Dec1k code/prose | 54.5 / 48.7 | 66.0 / 54.0 | +21% code |
 | Q6 TP=3-uneven+DCP, Dec1k code/prose | 65.9 / 54.6 | 91.1 / 79.1 | +37% / +47% |
-| Q8_K_XL TP=3-uneven, Dec1k code/prose | INFEASIBLE | 91.1 / 82.3 | bootet + kohärent |
-| Q4_K_M TP=2, Dec1k code/prose | 45.4 / 45.1 | 47.6 / 47.3 | +5% Decode |
+| Q8_K_XL TP=3-uneven, Dec1k code/prose | INFEASIBLE | 91.1 / 82.3 | boots + coherent |
+| Q4_K_M TP=2, Dec1k code/prose | 45.4 / 45.1 | 47.6 / 47.3 | +5% decode |
 | Q4_K_M TP=2, maxKV (uncapped) | 153172 | 207824 | +36% |
-| Q6 TP=2, Gewichte/Rank | 14.03 GB | 12.74 GB | -1.3 GB |
+| Q6 TP=2, weights/rank | 14.03 GB | 12.74 GB | -1.3 GB |
 
-- **Q8-Status-Wechsel:** UD-Q8_K_XL war zuvor auf BEIDEN Forks INFEASIBLE (mixed-precision
-  fused GDN `in_proj_qkvz`, Fussnote 8). Nach dem Overhaul (Flat-Byte-Shard-Layout traegt
-  gemischte dtypes) bootet htsglang Q8_K_XL TP=3-uneven kohärent -- damit ist htsglang die
-  einzige echte TP>1-Q8-Implementierung des Rigs neben dem llama.cpp-Single-Prozess-Layer-Split.
-- **Einordnung:** Q6 TP=3-uneven Decode (91.1 code) liegt jetzt ÜBER allen llama.cpp-Zellen
-  des Rigs (TP=2 `-sm tensor` 79.6, Layer-Split 74.5). Q6 TP=2 (66.0) bleibt hinter llama.cpp
-  TP=2 (79.6), holt den Rueckstand aber deutlich auf.
-- **Methodik-Hinweis (ehrlich):** Die Zahlen stammen aus der T66-Validierungs-Batterie
-  (`t66_decode_bench.py`, greedy, ignore_eos, 512 Tok), NICHT aus einem vollstaendigen
-  Matrix-Re-Run. Sie wurden gegen die Matrix-TP=3-Referenz kalibriert: der alt-Boot ergab
-  66.4 / 54.0 ≈ Matrix-Zelle 65.9 / 54.6 (Q6 TP=3), was die Vergleichbarkeit der internen
-  A/B-Delta stuetzt. Prefill (P1) und Par8 (P8/D8) wurden NICHT neu gemessen. MTP-Accept
-  bleibt unveraendert (~3.35, Q6 TP=2). Der Kill-Switch-Boot (Flat-Layout + Workspace, ohne
-  batched-MMVQ/quantisierten Vocab) ist byte-identisch zu HEAD (3x1024 Long-Forms +
-  Logprob-maxdelta 0.000000). Boot-Rezepte noetig, sonst frisst Auto-Sizing den Gewinn (M29):
+- **Q8 status change:** UD-Q8_K_XL was previously INFEASIBLE on BOTH forks (mixed-precision
+  fused GDN `in_proj_qkvz`, footnote 8). After the overhaul (flat-byte-shard layout carries
+  mixed dtypes) htsglang boots Q8_K_XL TP=3-uneven coherently -- making htsglang the
+  only true TP>1 Q8 implementation on the rig besides the llama.cpp single-process layer-split.
+- **Assessment:** Q6 TP=3-uneven decode (91.1 code) now sits ABOVE all llama.cpp cells
+  on the rig (TP=2 `-sm tensor` 79.6, layer-split 74.5). Q6 TP=2 (66.0) stays behind llama.cpp
+  TP=2 (79.6) but closes the gap substantially.
+- **Methodology note (honest):** The numbers come from the T66 validation battery
+  (`t66_decode_bench.py`, greedy, ignore_eos, 512 tok), NOT from a full
+  matrix re-run. They were calibrated against the matrix TP=3 reference: the old boot yielded
+  66.4 / 54.0 ≈ matrix cell 65.9 / 54.6 (Q6 TP=3), which supports the comparability of the internal
+  A/B delta. Prefill (P1) and Par8 (P8/D8) were NOT remeasured. MTP accept
+  remains unchanged (~3.35, Q6 TP=2). The kill-switch boot (flat layout + workspace, without
+  batched-MMVQ/quantized vocab) is byte-identical to HEAD (3x1024 long-forms +
+  logprob maxdelta 0.000000). Boot recipes needed, otherwise auto-sizing eats the gain (M29):
   TP=2 `--mem-fraction-static 0.80`; TP=3 `--rank-auto-reserve-mib 3500 --cuda-graph-max-bs-decode 8`;
   `SGLANG_GGUF_BATCHED_MMVQ=1`.
 
 ---
 
-## 4. Fussnoten / Caveats (M27a-M27e)
+## 4. Footnotes / caveats (M27a-M27e)
 
-1. **llama.cpp q8_0-KV statt fp8** (M27a): llama.cpp hat kein fp8-KV. Alle Zellen nutzen
-   8-bit BLOCK-Quant KV (`-ctk/-ctv q8_0`, + Draft `-ctkd/-ctvd q8_0`, `-fa on`) als naechsten
-   Analog zu `--kv-cache-dtype fp8` der anderen Engines. q8_0 (Block-Quant) != fp8 (per-Tensor).
+1. **llama.cpp q8_0 KV instead of fp8** (M27a): llama.cpp has no fp8 KV. All cells use
+   8-bit BLOCK-quant KV (`-ctk/-ctv q8_0`, + draft `-ctkd/-ctvd q8_0`, `-fa on`) as the nearest
+   analog to `--kv-cache-dtype fp8` on the other engines. q8_0 (block-quant) != fp8 (per-tensor).
 
-2. **llama.cpp -sm tensor CPU-Sampling + -sm row INFEASIBLE** (M27a): Das urspruenglich geplante
-   `-sm row` scheitert am Modell-Load ("device CUDA0 does not support split buffers" -- braucht
-   P2P/Split-Buffer, auf diesen GeForce-Karten nicht vorhanden). Ersetzt durch `-sm tensor`
-   (echte TP). Dabei loggt llama.cpp "backend sampling not supported with SPLIT_MODE_TENSOR;
-   using CPU" -> Sampling laeuft auf der CPU (Limitierung, kein Fehler). NCCL braucht
+2. **llama.cpp -sm tensor CPU-sampling + -sm row INFEASIBLE** (M27a): The originally planned
+   `-sm row` fails at model load ("device CUDA0 does not support split buffers" -- needs
+   P2P/split buffers, not present on these GeForce cards). Replaced by `-sm tensor`
+   (true TP). In doing so llama.cpp logs "backend sampling not supported with SPLIT_MODE_TENSOR;
+   using CPU" -> sampling runs on the CPU (limitation, not an error). NCCL needs
    `--ipc=host --shm-size + NCCL_P2P_DISABLE=1 + NCCL_NVLS_ENABLE=0`.
 
-3. **RANK_MIB 13500 statt 14500 (htsglang TP=4)** (M27e F1): 14500 MiB/Rank OOMt bei der
-   Draft-CUDA-Graph-Capture auf der 5090 (beide co-located Ranks erreichen ~15.5 GiB = Budget
-   + ~1 GiB non-KV-Overhead). 13500 bootet sauber. shvllm passt bei 14500 (vLLMs MiB-Budget
-   deckt Gesamt-Prozessnutzung inkl. Graphs) -- Engine-Differenz, relevant fuer jeden
-   Cross-Engine-maxKV-Vergleich in S3.
+3. **RANK_MIB 13500 instead of 14500 (htsglang TP=4)** (M27e F1): 14500 MiB/rank OOMs at
+   draft CUDA-graph capture on the 5090 (both co-located ranks reach ~15.5 GiB = budget
+   + ~1 GiB non-KV overhead). 13500 boots cleanly. shvllm fits at 14500 (vLLM's MiB budget
+   covers total process usage incl. graphs) -- an engine difference, relevant to every
+   cross-engine maxKV comparison in S3.
 
-4. **htsglang TP=2 Mamba-Concurrency-Deckel = 2 + manuelles Q6-Tuning** (M27c): Auf 2x20 GB
-   ist der Mamba/Linear-Attn-State-Cache (73-75 MiB/Slot/Rank) der Engpass, nicht KV -> sglang
-   reduziert max_running_requests automatisch 16 -> 2. Alle TP=2-Par8-Werte sind daher 2-at-a-time
-   gequeuter Durchsatz, kein 8-Wege-Batching. Beide Quants brauchten `--mem-fraction-static 0.90`
-   (Default 0.749 -> Mamba-Pool 0 Slots -> Boot-RuntimeError). Q6 zusaetzlich manuelles KV-Cap
-   32768 (bei 0.90 uncapped bootet 102328, OOMt aber beim ersten Forward im GGUF-Dequant-Scratch).
+4. **htsglang TP=2 Mamba concurrency cap = 2 + manual Q6 tuning** (M27c): On 2x20 GB
+   the Mamba/linear-attn state cache (73-75 MiB/slot/rank) is the bottleneck, not KV -> sglang
+   automatically reduces max_running_requests 16 -> 2. All TP=2 Par8 values are therefore 2-at-a-time
+   queued throughput, not 8-way batching. Both quants needed `--mem-fraction-static 0.90`
+   (default 0.749 -> Mamba pool 0 slots -> boot RuntimeError). Q6 additionally a manual KV cap of
+   32768 (at 0.90 uncapped it boots 102328, but OOMs on the first forward in the GGUF dequant scratch).
 
-5. **V2-Quant-Abhaengigkeit** (M27d): AWQ V2 = echter STRICT WIN (Prefill +11%, Single-Decode +12%,
-   maxKV 441536) -- AWQ hat mehr MLP-Units (544), die 5090 absorbiert die Konzentration ohne
-   Decode-Knee. FP8 V2 = Prefill +7% ABER Single-Decode-Drop (D1c 84.4 vs V1 98.4, Decode-Knee),
+5. **V2 quant dependency** (M27d): AWQ V2 = true STRICT WIN (prefill +11%, single-decode +12%,
+   maxKV 441536) -- AWQ has more MLP units (544), the 5090 absorbs the concentration without a
+   decode knee. FP8 V2 = prefill +7% BUT single-decode drop (D1c 84.4 vs V1 98.4, decode knee),
    maxKV 299968. GGUF V2 = auto-performance INFEASIBLE (uneven_perf.py:531 open(model_path/'config.json')
-   -> NotADirectoryError, weil model_path bei GGUF die .gguf-DATEI ist); daher Pinned-MLP-Approximation
-   (`--rank-mlp-ratio 5,1,1`), kein Decode-Knee-Guard.
+   -> NotADirectoryError, because model_path for GGUF is the .gguf FILE); hence pinned-MLP approximation
+   (`--rank-mlp-ratio 5,1,1`), no decode-knee guard.
 
-6. **MPS-Neustart-Lektion** (M27b/M27e): Der dokumentierte Check `ls /tmp/nvidia-mps/` ist ein
-   FALSE POSITIVE -- veraltete Sockets ueberleben den Daemon-Tod. Der MPS-Daemon war tatsaechlich
-   TOT; co-located Ranks time-slicen dann nur. Liveness NUR ueber die Control-Daemon-Antwort
-   pruefen (`echo get_default_active_thread_percentage | nvidia-cuda-mps-control` -> 100.0),
-   nie ueber ls. Eine erste shvllm-tp4-Battery ohne live MPS wurde verworfen und neu gefahren.
+6. **MPS restart lesson** (M27b/M27e): The documented check `ls /tmp/nvidia-mps/` is a
+   FALSE POSITIVE -- stale sockets survive the daemon's death. The MPS daemon was actually
+   DEAD; co-located ranks then merely time-slice. Check liveness ONLY via the control-daemon response
+   (`echo get_default_active_thread_percentage | nvidia-cuda-mps-control` -> 100.0),
+   never via ls. An initial shvllm-tp4 battery without live MPS was discarded and rerun.
 
-7. **Q6-TP=2-Speichereffizienz-Frage (#63)**: shvllm serviert q6_tp2 mit maxKV 25600 @ GMU 0.88
-   ohne Sondertuning; htsglang braucht bei gleicher HW manuelles KV-Cap (32768) + mem-fraction 0.90,
-   und selbst der natuerliche Pool (102328) servt nicht. Ursachenverdacht: GGUF-On-the-fly-Dequant-Scratch,
-   Mamba-Slots, mmproj-Last. Offenes Untersuchungs-Item an Main.
+7. **Q6 TP=2 memory-efficiency question (#63)**: shvllm serves q6_tp2 with maxKV 25600 @ GMU 0.88
+   without special tuning; htsglang needs, on the same HW, a manual KV cap (32768) + mem-fraction 0.90,
+   and even the natural pool (102328) does not serve. Suspected cause: GGUF on-the-fly dequant scratch,
+   Mamba slots, mmproj load. Open investigation item for the maintainer.
 
-8. **Q8 auf beiden Forks INFEASIBLE (unterschiedliche Fehlertiefen)**: Gemeinsame Root-Cause --
-   unsloth UD-Q8_K_XL speichert den fused GDN `in_proj_qkvz` in MIXED precision (fp16 + uint8).
-   - shvllm lehnt FRUEH ab: `ValueError: Detected some but not all shards of ...in_proj_qkvz are
-     quantized` (is_layer_skipped_gguf fused-shard-Check), identisch bei TP=3 und TP=4.
-   - htsglang laedt WEITER (past shard-check), crasht dann bei model init:
+8. **Q8 INFEASIBLE on both forks (different failure depths)**: Common root cause --
+   unsloth UD-Q8_K_XL stores the fused GDN `in_proj_qkvz` in MIXED precision (fp16 + uint8).
+   - shvllm rejects EARLY: `ValueError: Detected some but not all shards of ...in_proj_qkvz are
+     quantized` (is_layer_skipped_gguf fused-shard check), identical for TP=3 and TP=4.
+   - htsglang loads FURTHER (past the shard check), then crashes at model init:
      `AssertionError: Data container has mixed dtypes: {torch.float16, torch.uint8}`
-     (gguf.py:475 _create_padded_weight_param). Q6_K_XL laedt in beiden Plugins sauber ->
-     Q8_K_XL-spezifisches Layout. Fix (mixed-dtype GGUF-Layer) an Main als TODO (#64), ausserhalb
-     Messumfang. Q8 wird daher nur von llama.cpp getragen (S1 Layer-Split).
+     (gguf.py:475 _create_padded_weight_param). Q6_K_XL loads cleanly in both plugins ->
+     Q8_K_XL-specific layout. Fix (mixed-dtype GGUF layer) filed to the maintainer as a TODO (#64), outside
+     the measurement scope. Q8 is therefore only carried by llama.cpp (S1 layer-split).
 
 ---
 
-## 5. Fazit (ehrlich, pro Disziplin)
+## 5. Conclusion (honest, per discipline)
 
-**Single-Stream-Decode (D1):** htsglang gewinnt klar, getrieben von MTP/NEXTN + immer-an
-Decode-Graphs. Spitzenwerte: AWQ V2 TP=3 (D1c 115.7) und AWQ TP=4 co-located (D1c 115.3);
-AWQ V1 TP=3 (103.2). Die vLLM-Seite (shvllm) toppt nur im TP=4-FP8-Fall (107.3). llama.cpp
-liegt strukturell darunter (bestes Q6 TP=2 -sm tensor: 79.6). -> **htsglang holt die
-Single-Decode-Krone via MTP + Graphs.**
+**Single-stream decode (D1):** htsglang wins clearly, driven by MTP/NEXTN + always-on
+decode graphs. Peak values: AWQ V2 TP=3 (D1c 115.7) and AWQ TP=4 co-located (D1c 115.3);
+AWQ V1 TP=3 (103.2). The vLLM side (shvllm) only tops in the TP=4 FP8 case (107.3). llama.cpp
+sits structurally below (best Q6 TP=2 -sm tensor: 79.6). -> **htsglang takes the
+single-decode crown via MTP + graphs.**
 
-**Par8 / 8-Wege-Durchsatz (D8):** shvllm dominiert dort, wo es echtes 8-Wege-Batching zulaesst:
-TP=3 AWQ 288.1 und FP8 287.9 code. htsglang TP=3 ist gleichauf im code-Peak (FP8 V1 354.9 --
-hier sogar hoeher) aber inhomogener; entscheidend ist, dass htsglang TP=2 hart mamba-gedeckelt
-ist (D8c nur 65.5-136.5). -> **Bei genuinem 8-Wege-Batching liefern shvllm-TP=3 und htsglang-TP=3
-die hoechsten Aggregate; htsglang-TP=2 faellt wegen Mamba-Cap zurueck.**
+**Par8 / 8-way throughput (D8):** shvllm dominates where it allows true 8-way batching:
+TP=3 AWQ 288.1 and FP8 287.9 code. htsglang TP=3 is on par at the code peak (FP8 V1 354.9 --
+even higher here) but more inhomogeneous; the decisive point is that htsglang TP=2 is hard
+mamba-capped (D8c only 65.5-136.5). -> **With genuine 8-way batching, shvllm-TP=3 and htsglang-TP=3
+deliver the highest aggregates; htsglang-TP=2 falls behind due to the Mamba cap.**
 
-**Prefill (P1/P8):** TP=4 co-located gewinnt eindeutig -- shvllm FP8/AWQ liegen bei 1411-1443 tok/s
-(P1/P8), htsglang TP=4 bei 1282-1352. Zwei Ranks auf der 5090 + je einer auf den 3080 maximieren
-den Prefill-Compute. Layer-Split (llama.cpp S1) ist im Single-Prefill nominal hoch (Q8 1835,
-Q6 1689), aber das ist server-native Timing (ohne HTTP) und nicht 1:1 mit den wall-clock-Zahlen
-der Forks vergleichbar. -> **TP=4 co-located = Prefill-Krone (unter den vergleichbaren
-wall-clock-Messungen).**
+**Prefill (P1/P8):** TP=4 co-located wins clearly -- shvllm FP8/AWQ are at 1411-1443 tok/s
+(P1/P8), htsglang TP=4 at 1282-1352. Two ranks on the 5090 + one each on the 3080s maximize
+the prefill compute. Layer-split (llama.cpp S1) is nominally high in single-prefill (Q8 1835,
+Q6 1689), but that is server-native timing (without HTTP) and not 1:1 comparable with the wall-clock
+numbers of the forks. -> **TP=4 co-located = prefill crown (among the comparable
+wall-clock measurements).**
 
-**Max Kontext (config-maxKV):** shvllm haelt bei TP=3 uneven-auto die groessten servenden Pools
-(>1M: AWQ 1146573, Q6 1139318, FP8 1046126). htsglang-TP=3 liegt per Boot-Zeile bei ~530-567k
-(MTP-aktive Klasse), was aber wegen abweichender Zaehl-Semantik NICHT als "halb so viel Kontext"
-gelesen werden darf. -> **shvllm haelt die groessten config-maxKV bei TP=3.**
+**Max context (config-maxKV):** shvllm holds the largest serving pools at TP=3 uneven-auto
+(>1M: AWQ 1146573, Q6 1139318, FP8 1046126). htsglang-TP=3 is at ~530-567k per boot line
+(MTP-active class), which, because of the differing counting semantics, must NOT be read as
+"half as much context". -> **shvllm holds the largest config-maxKV at TP=3.**
 
-### Die 2-3 klarsten Gesamtaussagen
-1. **htsglang gewinnt Single-Stream-Decode** (MTP/NEXTN + Decode-Graphs), am staerksten mit AWQ.
-2. **shvllm haelt die groessten config-maxKV bei TP=3 uneven-auto** (>1M-Klasse) und liefert
-   das robusteste echte 8-Wege-Batching (TP=3 AWQ/FP8 ~288 D8c).
-3. **TP=4 co-located ist die Prefill-Krone** (shvllm FP8/AWQ ~1410-1443 tok/s), erkauft mit
-   MPS-Aufwand und knapperem KV-Budget (13500/14500 MiB/Rank).
-4. **llama.cpp** ist der pragmatische 3-Karten-Allrounder (einzige Q8-faehige Engine hier, hoher
-   Layer-Split-Prefill), verliert aber im Decode und muss q8_0-KV statt fp8 nutzen; echtes TP
-   ist auf diesen GeForce-Karten nur ueber `-sm tensor` (mit CPU-Sampling) moeglich, nicht `-sm row`.
+### The 2-3 clearest overall statements
+1. **htsglang wins single-stream decode** (MTP/NEXTN + decode graphs), strongest with AWQ.
+2. **shvllm holds the largest config-maxKV at TP=3 uneven-auto** (>1M class) and delivers
+   the most robust true 8-way batching (TP=3 AWQ/FP8 ~288 D8c).
+3. **TP=4 co-located is the prefill crown** (shvllm FP8/AWQ ~1410-1443 tok/s), bought with
+   MPS overhead and a tighter KV budget (13500/14500 MiB/rank).
+4. **llama.cpp** is the pragmatic 3-card all-rounder (the only Q8-capable engine here, high
+   layer-split prefill), but loses in decode and must use q8_0 KV instead of fp8; true TP
+   on these GeForce cards is only possible via `-sm tensor` (with CPU sampling), not `-sm row`.
 
 ---
 
-*Verifikation: Alle uebertragenen Zahlen wurden gegen matrix_results/*.json (llamacpp,
-shvllm, htsglang_tp2/tp3/tp4) rueckgeprueft; kalibrierte Kontextwerte gegen HANDOFF.md
-(Zeilen 620/623/1213/1242/1304). Stichproben bestaetigt u.a.: shvllm awq_tp3 D8c 288.1,
+*Verification: All transcribed numbers were cross-checked against matrix_results/*.json (llamacpp,
+shvllm, htsglang_tp2/tp3/tp4); calibrated context values against HANDOFF.md
+(lines 620/623/1213/1242/1304). Spot checks confirmed, among others: shvllm awq_tp3 D8c 288.1,
 htsglang awq_tp3_V2 D1c 115.7, htsglang fp8_tp4 maxKV 330818, llama.cpp q6_layersplit
 maxKV 518096, shvllm fp8_tp4 D1c 107.3.*
