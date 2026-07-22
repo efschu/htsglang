@@ -57,7 +57,7 @@ These were built and evaluated in code, then gated off — listed for completene
 
 ## Scope note
 
-This matrix lists only capabilities with landed code (verified against `integration/r2`). Internal-roadmap items that are planned or only partially prototyped — e.g. cross-vendor HTCCL AMD bring-up, a host-RAM tiered-KV fabric for the weightless lane, and a draft-KV-pool DCP layout — are intentionally excluded until they land.
+This matrix lists only capabilities with landed code (verified against `integration/r2`). Internal-roadmap items that are planned or only partially prototyped — e.g. cross-vendor HTCCL AMD bring-up, a host-RAM tiered-KV fabric for the weightless lane, downloading VRAM and a draft-KV-pool DCP layout — are intentionally excluded until they land.
 
 ## Sources
 
