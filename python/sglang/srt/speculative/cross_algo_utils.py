@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -39,6 +39,51 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CROSS_SHAPES_ATTR = "speculative_cross_shapes"
+
+# ---------------------------------------------------------------------------
+# Dual hidden-state capture (stage 3, schedule mode only).
+#
+# Under per-batch switching BOTH rungs must stay warm on every verify round:
+# the NEXTN/MTP draft-extend consumes the target's FINAL hidden states, the
+# DFLASH draft-KV append consumes the concatenated AUX layer hidden states.
+# With this process-local flag on, LogitsProcessor stores the final hidden
+# states in `hidden_states` (the EAGLE convention -- every EAGLE consumer
+# stays untouched) and the aux concat in the separate
+# `cross_aux_hidden_states` field (read by the DFLASH rung under the cross
+# gate). Off (default, incl. the stage-2 force modes and every single-algo
+# server): behavior is byte-identical to before.
+# ---------------------------------------------------------------------------
+_DUAL_CAPTURE_ACTIVE = False
+
+
+def set_dual_capture_active(enabled: bool) -> None:
+    global _DUAL_CAPTURE_ACTIVE
+    _DUAL_CAPTURE_ACTIVE = bool(enabled)
+
+
+def dual_capture_active() -> bool:
+    return _DUAL_CAPTURE_ACTIVE
+
+
+# Numeric shape fields swapped onto the REAL ServerArgs on every rung switch
+# (schedule mode). Audited runtime readers that must see the ACTIVE rung's
+# value: dflash_info_v2.prepare_for_decode (block size), the eager verify
+# sizing fallback, metrics. The algorithm STRING and every boot-sizing
+# consumer (max_speculative_num_draft_tokens & friends) stay fixed.
+RUNTIME_SHAPE_FIELDS = (
+    "speculative_num_steps",
+    "speculative_eagle_topk",
+    "speculative_num_draft_tokens",
+    "speculative_dflash_block_size",
+)
+
+
+def apply_runtime_shape(server_args, shape: Dict[str, Any], reason: str) -> None:
+    """Atomically point the REAL ServerArgs' numeric spec-shape fields at the
+    active rung's values (single override call, single stamp point)."""
+    server_args.override(
+        reason, **{f: shape[f] for f in RUNTIME_SHAPE_FIELDS}
+    )
 
 # Fields a rung shape may override on the deep-copied ServerArgs of the
 # secondary sub-worker (and that the forced shape writes on the real one).
@@ -62,6 +107,42 @@ _SHAPE_FIELDS = (
 
 def cross_algo_enabled(server_args) -> bool:
     return bool(getattr(server_args, "speculative_cross_algorithm", False))
+
+
+def cross_schedule_interval(server_args) -> Optional[int]:
+    """Verify-round switch interval under force=schedule:N, else None.
+
+    Non-None is THE gate for every stage-3 per-batch-switching code path
+    (scheduler pre-decode hook, dual capture, per-round warm-keeping); the
+    static force=nextn|dflash modes keep their stage-2 behavior untouched.
+    """
+    if not cross_algo_enabled(server_args):
+        return None
+    shapes = getattr(server_args, CROSS_SHAPES_ATTR, None)
+    if shapes is None or shapes.get("force") != "schedule":
+        return None
+    return int(shapes["schedule_interval"])
+
+
+def parse_cross_force(force: Optional[str]) -> tuple[str, Optional[int]]:
+    """Parse --speculative-cross-algorithm-force into (mode, interval)."""
+    if force in ("nextn", "dflash"):
+        return force, None
+    if isinstance(force, str) and force.startswith("schedule:"):
+        try:
+            interval = int(force.split(":", 1)[1])
+        except ValueError:
+            interval = -1
+        if interval < 1:
+            _fail(
+                "force=schedule:N needs a positive integer switch interval "
+                f"(verify rounds); got {force!r}."
+            )
+        return "schedule", interval
+    _fail(
+        "--speculative-cross-algorithm-force must be 'nextn', 'dflash', or "
+        f"'schedule:N' (switch every N verify rounds); got {force!r}."
+    )
 
 
 def get_cross_shapes(server_args) -> Dict[str, Dict[str, Any]]:
@@ -89,13 +170,9 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
     """
     from sglang.srt.arg_groups.speculative_hook import _handle_dflash
 
-    force = server_args.speculative_cross_algorithm_force
-    if force not in ("nextn", "dflash"):
-        _fail(
-            "stage 2 requires --speculative-cross-algorithm-force nextn|dflash "
-            "(the active rung is statically pinned until per-batch switching "
-            f"lands in stage 3); got {force!r}."
-        )
+    force, schedule_interval = parse_cross_force(
+        server_args.speculative_cross_algorithm_force
+    )
     if server_args.speculative_algorithm != "EAGLE":
         _fail(
             "requires --speculative-algorithm NEXTN (or EAGLE) as the MTP "
@@ -216,7 +293,11 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
         # attention backend / decode graph runner on activation, and the
         # launcher decided the torch_memory_saver LD_PRELOAD hook from the
         # GLOBAL (dflash-shaped, adaptive-off) args, so an offload-mode
-        # controller in the copy could not initialize. Stage 3 revisits this.
+        # controller in the copy could not initialize. The schedule mode
+        # (stage 3) ALSO builds the NEXTN rung without adaptive: the
+        # k-controller's _activate would pause the mapped DFLASH rung tag
+        # mid-segment (use-after-unmap), and the stage-4 bandit replaces the
+        # k-controller with the rung objective anyway (design 4b).
         "speculative_adaptive": user_adaptive if force == "nextn" else False,
         "speculative_adaptive_config": (
             user_adaptive_config if force == "nextn" else None
@@ -224,14 +305,21 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
         "speculative_draft_window_size": None,
         "speculative_use_rejection_sampling": False,
     }
-    if force == "dflash" and user_adaptive:
+    if force != "nextn" and user_adaptive:
         logger.info(
-            "--speculative-cross-algorithm force=dflash: the secondary NEXTN "
-            "rung is built without --speculative-adaptive (single k=%d state); "
-            "see cross_algo_utils for the rationale.",
+            "--speculative-cross-algorithm force=%s: the NEXTN rung is built "
+            "without --speculative-adaptive (single k=%d state); see "
+            "cross_algo_utils for the rationale.",
+            force,
             eagle_steps,
         )
 
+    # schedule mode: the NEXTN shape is the PRIMARY (global) shape. This is
+    # load-bearing, not a taste choice: scheduler.spec_algorithm and the
+    # FutureMap relay type derive from the global speculative_algorithm, and
+    # only the EAGLE type relays topk/hidden draft seeds -- the union both
+    # rungs need. The numeric shape fields are re-pointed at the active rung
+    # on every switch (CrossAlgoWorker), the algorithm STRING never moves.
     forced_shape = dflash_shape if force == "dflash" else eagle_shape
     other_name = "nextn" if force == "dflash" else "dflash"
     other_shape = eagle_shape if force == "dflash" else dflash_shape
@@ -246,16 +334,25 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
     # (not a dataclass field) on purpose: it is derived state, survives
     # pickling to the scheduler processes via __dict__, and stays off the
     # CLI surface. get_cross_shapes() raises loudly if it went missing.
-    object.__setattr__(
-        server_args,
-        CROSS_SHAPES_ATTR,
-        {other_name: other_shape, "force": force},
-    )
+    # schedule mode additionally stashes BOTH shapes + the interval so the
+    # meta-worker can swap the numeric fields per switch.
+    stash: Dict[str, Any] = {other_name: other_shape, "force": force}
+    if force == "schedule":
+        stash["nextn"] = eagle_shape
+        stash["dflash"] = dflash_shape
+        stash["schedule_interval"] = schedule_interval
+    object.__setattr__(server_args, CROSS_SHAPES_ATTR, stash)
     logger.info(
-        "Cross-algorithm speculative decoding (stage 2): forced rung=%s; "
+        "Cross-algorithm speculative decoding: force=%s%s; primary rung=%s; "
         "secondary rung=%s resident (algorithm=%s, draft_tokens=%s, "
         "placement=%s).",
         force,
+        (
+            f" (switch every {schedule_interval} verify rounds)"
+            if force == "schedule"
+            else ""
+        ),
+        "nextn" if force != "dflash" else "dflash",
         other_name,
         other_shape["speculative_algorithm"],
         other_shape["speculative_num_draft_tokens"],

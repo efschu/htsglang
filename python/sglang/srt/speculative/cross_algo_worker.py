@@ -38,22 +38,33 @@ Resource isolation of the secondary rung:
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import contextmanager, nullcontext
 from typing import Optional
 
+import torch
+
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
 )
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context, get_server_args
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.cross_algo_utils import (
+    apply_runtime_shape,
     apply_shape_to_args_copy,
     get_cross_shapes,
+    set_dual_capture_active,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import spec_stage_span
 from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -85,6 +96,19 @@ class CrossAlgoWorker(BaseSpecWorker):
         self._forced_algo = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # Stage 3 schedule mode: switch the active rung every N verify rounds.
+        # The NEXTN rung is the primary (global shape); interval None => the
+        # stage-2 static force modes, byte-identical behavior.
+        self._schedule_interval: Optional[int] = (
+            int(shapes["schedule_interval"]) if self._force == "schedule" else None
+        )
+        if self._schedule_interval is not None:
+            # Dual hidden-state capture must be active BEFORE any target graph
+            # capture (the scheduler captures target graphs right after worker
+            # construction); process-local, scheduler process only.
+            set_dual_capture_active(True)
+            self._nextn_shape = shapes["nextn"]
+            self._dflash_shape = shapes["dflash"]
         self._secondary_name = "nextn" if self._force == "dflash" else "dflash"
         self._secondary_shape = shapes[self._secondary_name]
         self._secondary_algo = SpeculativeAlgorithm.from_string(
@@ -139,6 +163,46 @@ class CrossAlgoWorker(BaseSpecWorker):
         # Secondary target-verify resources; filled in init_cuda_graphs.
         self._secondary_target_attn_backend = None
         self._secondary_target_graph_runner = None
+
+        # ------------------------------------------------------------------
+        # Stage-3 schedule-mode runtime state.
+        # ------------------------------------------------------------------
+        if self._schedule_interval is not None:
+            # Under schedule mode the primary is ALWAYS the NEXTN rung and the
+            # secondary the DFLASH rung (cross_algo_utils guarantees it).
+            assert self._force == "schedule" and self._secondary_name == "dflash"
+            self._dflash_sub = self._secondary
+            self._nextn_sub = self._primary
+            # DFLASH reads its context features from the dual-capture aux
+            # field; the final hidden states stay for the NEXTN catch-up.
+            self._dflash_sub._cross_dual_capture = True
+            self._dflash_block_size = int(
+                self._dflash_shape["speculative_num_draft_tokens"]
+            )
+            # Rung bookkeeping. The NEXTN rung is the graph-memory BASELINE
+            # (untagged, always resident); only the DFLASH tag is
+            # paused/resumed across switches. Its key must have NO built tag,
+            # so ensure_active(nextn) pauses dflash and maps nothing.
+            self._nextn_rung_key = (
+                "EAGLE",
+                int(self._nextn_shape["speculative_num_draft_tokens"]),
+            )
+            self._active_name = "nextn"
+            self._rounds_total = 0
+            self._rounds_at_switch = 0
+            self._switch_count = 0
+            # Primary-rung target pointers; captured after init_cuda_graphs.
+            self._primary_target_attn_backend = None
+            self._primary_target_graph_runner = None
+            # Warm-keeping cost accounting (reported at each switch).
+            self._warmkeep_ms_since_switch = 0.0
+            self._warmkeep_rounds_since_switch = 0
+            self._trace_path = None
+            import os
+
+            trace = os.environ.get("SGLANG_CROSS_ALGO_TRACE")
+            if trace:
+                self._trace_path = f"{trace}.rank{tp_rank}"
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -253,8 +317,15 @@ class CrossAlgoWorker(BaseSpecWorker):
         # the dflash planning fields are set (under the cross gate they
         # always are, via init_aux_hidden_state_capture). Leave the RUNTIME
         # setting to the forced rung; the secondary's graph build below
-        # toggles it temporarily.
-        self._set_target_aux_capture(enabled=self._force == "dflash")
+        # toggles it temporarily. Schedule mode: aux capture stays ON at all
+        # times (dual capture separates final and aux fields), so both graph
+        # sets are captured -- and every runtime round runs -- in one mode
+        # and no runtime toggle exists.
+        self._set_target_aux_capture(enabled=self._runtime_aux_enabled())
+
+    def _runtime_aux_enabled(self) -> bool:
+        """The target model's steady-state aux-capture setting."""
+        return self._schedule_interval is not None or self._force == "dflash"
 
     def init_cuda_graphs(self):
         # Secondary rung FIRST: when the primary is NEXTN+adaptive, its
@@ -262,6 +333,22 @@ class CrossAlgoWorker(BaseSpecWorker):
         # then runs AFTER the secondary rung exists and accounts for it.
         self._init_secondary_cuda_graphs()
         self._primary.init_cuda_graphs()
+        if self._schedule_interval is not None:
+            # The primary (NEXTN) rung's target-verify pointers are whatever
+            # the boot pipeline installed on the shared model runner; keep
+            # them so switches can swap back.
+            mr = self._target_worker.model_runner
+            self._primary_target_attn_backend = mr.attn_backend
+            self._primary_target_graph_runner = mr.decode_cuda_graph_runner
+            # Dedicated draft-extend graph at the DFLASH width for the
+            # per-round NEXTN warm-keeping catch-up (kept RESIDENT: it runs
+            # while the DFLASH rung is mapped). Eager fallback if None.
+            (
+                self._catchup_extend_backend,
+                self._catchup_extend_runner,
+            ) = self._nextn_sub.build_catchup_extend_state(
+                self._dflash_block_size
+            )
 
     def _init_secondary_cuda_graphs(self):
         import time
@@ -278,7 +365,10 @@ class CrossAlgoWorker(BaseSpecWorker):
             else nullcontext()
         )
         with self._secondary_ctx(), build_scope:
-            self._set_target_aux_capture(enabled=self._secondary_algo.is_dflash())
+            self._set_target_aux_capture(
+                enabled=self._secondary_algo.is_dflash()
+                or self._runtime_aux_enabled()
+            )
             try:
                 (
                     self._secondary_target_attn_backend,
@@ -286,7 +376,7 @@ class CrossAlgoWorker(BaseSpecWorker):
                 ) = self._build_secondary_target_rung()
                 self._secondary.init_cuda_graphs()
             finally:
-                self._set_target_aux_capture(enabled=self._force == "dflash")
+                self._set_target_aux_capture(enabled=self._runtime_aux_enabled())
         if mgr is not None:
             mgr.pause_after_build(self._secondary_rung_key)
 
@@ -361,33 +451,370 @@ class CrossAlgoWorker(BaseSpecWorker):
             )
 
     # ------------------------------------------------------------------
-    # BaseSpecWorker interface -- runtime (routes to the forced rung)
+    # BaseSpecWorker interface -- runtime (routes to the ACTIVE rung; under
+    # the stage-2 static force modes the active rung is always the primary)
     # ------------------------------------------------------------------
+    @property
+    def _active_sub(self):
+        if self._schedule_interval is None or self._active_name == "nextn":
+            return self._primary
+        return self._dflash_sub
+
+    @property
+    def _active_algo(self) -> SpeculativeAlgorithm:
+        if self._schedule_interval is None:
+            return self._forced_algo
+        return (
+            SpeculativeAlgorithm.DFLASH
+            if self._active_name == "dflash"
+            else self._forced_algo
+        )
+
     @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
 
     @property
     def draft_worker(self):
-        return self._primary.draft_worker
+        return self._active_sub.draft_worker
 
     @property
     def war_fastpath_runner(self):
-        return self._primary.war_fastpath_runner
+        return self._active_sub.war_fastpath_runner
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
-        return self._primary.spec_v2_attn_backends
+        if self._schedule_interval is None:
+            return self._primary.spec_v2_attn_backends
+        # Consulted once at boot (needs_cpu_seq_lens is an OR over backends):
+        # both rungs run, so declare the union.
+        return tuple(self._primary.spec_v2_attn_backends) + tuple(
+            self._secondary.spec_v2_attn_backends
+        )
 
     def clear_cache_pool(self):
         self._primary.clear_cache_pool()
         self._secondary.clear_cache_pool()
 
+    # ------------------------------------------------------------------
+    # Stage 3: per-batch switching (schedule mode)
+    # ------------------------------------------------------------------
+    def maybe_switch_rung(self, batch) -> None:
+        """Scheduler pre-decode hook (schedule mode; called BEFORE
+        ScheduleBatch.prepare_for_decode so the algorithm-dispatching prep and
+        the KV headroom reservation already run under the incoming rung).
+
+        Rank uniformity: the decision is a pure function of the executed
+        verify-round counter, which is identical on every TP rank -- all
+        ranks' schedulers run the same batch sequence (the accept counts that
+        advance seq_lens are broadcast from rank 0, #50), so no decision
+        broadcast is needed. The stage-4 bandit, whose objective includes
+        per-rank wall time, WILL need rank-0-decides + broadcast (design 4c).
+        """
+        if self._schedule_interval is None:
+            return
+        if (
+            self._rounds_total - self._rounds_at_switch
+        ) >= self._schedule_interval:
+            self._switch_rung(batch)
+        # Re-stamp unconditionally: freshly (re)built running batches carry
+        # the scheduler's boot-time stamp (the primary algorithm).
+        batch.spec_algorithm = self._active_algo
+
+    def _switch_rung(self, batch) -> None:
+        old_name = self._active_name
+        new_name = "dflash" if old_name == "nextn" else "nextn"
+        mr = self._target_worker.model_runner
+        tic = time.perf_counter()
+
+        # 1) Graph memory: map the incoming rung's paused buffers and pause
+        #    the outgoing rung's, BEFORE any pointer swap (synchronizes the
+        #    device, so the outgoing rung's in-flight round is quiesced).
+        #    The NEXTN rung is the untagged baseline: activating it maps
+        #    nothing and just pauses the DFLASH tag.
+        ensure_ms = 0.0
+        # Only the manager the BOOT created (states built/paused in it); never
+        # create one at runtime -- a fresh manager would know no rung tags.
+        from sglang.srt.speculative.adaptive_graph_memory import get_active_manager
+
+        mgr = get_active_manager()
+        if mgr is not None:
+            mgr.ensure_active(
+                self._secondary_rung_key
+                if new_name == "dflash"
+                else self._nextn_rung_key
+            )
+            ensure_ms = mgr.last_swap_ms or 0.0
+        else:
+            # Resident mode: still quiesce the outgoing rung's round before
+            # re-pointing the target's verify resources.
+            torch.cuda.synchronize()
+
+        # 2) Target-verify resource pointer swap (the adaptive-k pattern).
+        if new_name == "dflash":
+            mr.attn_backend = self._secondary_target_attn_backend
+            mr.decode_cuda_graph_runner = self._secondary_target_graph_runner
+            mr.spec_algorithm = self._secondary_algo
+            new_shape = self._dflash_shape
+        else:
+            mr.attn_backend = self._primary_target_attn_backend
+            mr.decode_cuda_graph_runner = self._primary_target_graph_runner
+            mr.spec_algorithm = self._forced_algo
+            new_shape = self._nextn_shape
+
+        # 3) Atomically re-point the REAL server args' numeric spec-shape
+        #    fields (runtime readers: dflash decode prep block size, eager
+        #    verify sizing, metrics). The algorithm STRING and every
+        #    max_...-based boot sizing stay fixed.
+        apply_runtime_shape(
+            self.server_args, new_shape, f"cross_algo.switch_to_{new_name}"
+        )
+
+        # 4) Convert the carried draft input to the incoming rung's type.
+        #    Only at round boundaries: the batch is BETWEEN verify rounds
+        #    here (the outgoing round's commit is complete; prep for the
+        #    incoming round has not run).
+        self._convert_spec_info(batch, new_name)
+
+        self._active_name = new_name
+        self._rounds_at_switch = self._rounds_total
+        self._switch_count += 1
+        total_ms = (time.perf_counter() - tic) * 1e3
+        wk_ms = self._warmkeep_ms_since_switch
+        wk_rounds = self._warmkeep_rounds_since_switch
+        self._warmkeep_ms_since_switch = 0.0
+        self._warmkeep_rounds_since_switch = 0
+        logger.info(
+            "Cross-algo switch #%d @round %d: %s -> %s "
+            "(ensure_active %.2f ms, total %.2f ms; warm-keep in closing "
+            "segment: %.2f ms over %d rounds).",
+            self._switch_count,
+            self._rounds_total,
+            old_name,
+            new_name,
+            ensure_ms,
+            total_ms,
+            wk_ms,
+            wk_rounds,
+        )
+
+    def _convert_spec_info(self, batch, new_name: str) -> None:
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        si = batch.spec_info
+        if si is None:
+            return
+        if new_name == "dflash":
+            assert isinstance(si, EagleDraftInput), (
+                "cross-algo switch to dflash expected an EagleDraftInput at "
+                f"the round boundary, got {type(si).__name__}"
+            )
+            new = DFlashDraftInputV2(
+                topk_p=si.topk_p,
+                topk_index=si.topk_index,
+                bonus_tokens=si.bonus_tokens,
+                new_seq_lens=batch.seq_lens,
+                hidden_states=si.hidden_states,
+            )
+        else:
+            assert isinstance(si, DFlashDraftInputV2), (
+                "cross-algo switch to nextn expected a DFlashDraftInputV2 at "
+                f"the round boundary, got {type(si).__name__}"
+            )
+            # The per-round NEXTN warm-keeping catch-up attached fresh draft
+            # seeds (topk/hidden) to every DFLASH round's draft input (and
+            # stashed them into the FutureMap under overlap), so the first
+            # NEXTN round drafts at full k immediately.
+            new = EagleDraftInput(
+                topk_p=si.topk_p,
+                topk_index=si.topk_index,
+                hidden_states=si.hidden_states,
+                bonus_tokens=si.bonus_tokens,
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+            )
+        new.future_indices = si.future_indices
+        if new.future_indices is not None:
+            assert new.future_indices.shape[0] == batch.batch_size(), (
+                "cross-algo switch: future_indices/batch size mismatch "
+                f"({new.future_indices.shape[0]} vs {batch.batch_size()})"
+            )
+        batch.spec_info = new
+
+    # ------------------------------------------------------------------
+    # Stage 3: per-round warm-keeping of the INACTIVE rung (schedule mode).
+    #
+    # Neither draft is stateless in this topology: the NEXTN/MTP draft owns a
+    # 1-layer draft KV pool fed by its draft-extend, the solo DFLASH draft
+    # (no compact cache) owns a pool fed with the target's aux hidden states.
+    # Without warm-keeping, every switch would leave a permanent gap in the
+    # inactive draft's KV for the tokens committed during the segment,
+    # degrading its accept rate forever after switching back. Dual capture
+    # provides both hidden variants on every verify round; the idle rung's
+    # KV write is then cheap (DFLASH: pure append; NEXTN: an eager 1-layer
+    # MTP extend, also yielding the next-round draft seeds).
+    # ------------------------------------------------------------------
+    def _warmkeep_nextn_after_dflash_round(self, batch, batch_output) -> None:
+        logits_output = batch_output.logits_output
+        hidden_final = logits_output.hidden_states
+        assert hidden_final is not None, (
+            "cross-algo dual capture: DFLASH verify returned no final hidden "
+            "states for the NEXTN warm-keeping catch-up"
+        )
+        nx = self._nextn_sub
+        dw = nx.draft_worker
+        with (
+            dw.draft_tp_context(dw.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("cross_warmkeep_nextn"),
+        ):
+            topk_p, topk_index, hidden = dw.draft_extend_catchup(
+                batch,
+                hidden_final,
+                batch_output.next_token_ids,
+                batch_output.accept_lens,
+                self._dflash_block_size,
+                cuda_graph_runner=self._catchup_extend_runner,
+            )
+        # Attach the seeds to the DFLASH draft input: the overlap scheduler
+        # relays them through the FutureMap (the DFlash input already carries
+        # these eagle-shaped fields), the sync scheduler carries the object.
+        ndi = batch_output.next_draft_input
+        ndi.topk_p = topk_p
+        ndi.topk_index = topk_index
+        ndi.hidden_states = hidden
+        logits_output.hidden_states = None
+
+    def _warmkeep_dflash_after_nextn_round(self, batch, batch_output) -> None:
+        logits_output = batch_output.logits_output
+        aux = logits_output.cross_aux_hidden_states
+        assert aux is not None, (
+            "cross-algo dual capture: NEXTN verify returned no aux hidden "
+            "states for the DFLASH warm-keeping append"
+        )
+        dsub = self._dflash_sub
+        if not dsub._solo_is_shadow:
+            bs = batch.batch_size()
+            width = int(self._nextn_shape["speculative_num_draft_tokens"])
+            cache_loc = batch.out_cache_loc
+            assert (
+                cache_loc is not None and cache_loc.numel() == bs * width
+            ), (
+                "cross-algo warm-keep: unexpected verify cache-loc layout "
+                f"({None if cache_loc is None else cache_loc.numel()} vs "
+                f"{bs}*{width})"
+            )
+            # Chain verify (topk == 1): verify row r of request i sits at
+            # position seq_lens[i] + r (spec_v2: batch.seq_lens is the
+            # pre-round length).
+            positions = (
+                batch.seq_lens.to(torch.int64).unsqueeze(1)
+                + self._nextn_pos_offsets(width)
+            ).reshape(-1)
+            dsub._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=aux,
+                cache_loc=cache_loc,
+                cache_loc_2d=cache_loc.view(bs, width),
+                positions=positions,
+                commit_lens=batch_output.accept_lens,
+            )
+        logits_output.cross_aux_hidden_states = None
+
+    def _nextn_pos_offsets(self, width: int) -> torch.Tensor:
+        buf = getattr(self, "_nextn_pos_offsets_buf", None)
+        if buf is None or buf.numel() != width:
+            buf = torch.arange(width, dtype=torch.int64, device=self.device)
+            self._nextn_pos_offsets_buf = buf
+        return buf
+
+    def _trace_round(self, batch, batch_output) -> None:
+        if self._trace_path is None:
+            return
+        import json
+
+        accepts = batch_output.accept_lens
+        rec = {
+            "round": self._rounds_total,
+            "algo": self._active_name,
+            "bs": batch.batch_size(),
+            "rounds_since_switch": self._rounds_total - self._rounds_at_switch,
+            "switch_count": self._switch_count,
+            "accept_lens": (
+                accepts.tolist() if accepts is not None else None
+            ),
+        }
+        with open(self._trace_path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def _dual_prefill(self, batch, on_publish=None):
+        """One shared target prefill forward feeding BOTH rungs' draft-prefill
+        paths, so every request is warm in both drafts from birth and can be
+        served by either rung after any later switch."""
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch_output = self._target_worker.forward_batch_generation(batch)
+        batch_output.new_seq_lens = batch.seq_lens
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+
+        # DFLASH first: it reads batch.extend_lens/prefix_lens/out_cache_loc,
+        # which the NEXTN draft-extend below partially rewrites.
+        dflash_input = self._dflash_sub.prefill_after_target(batch, batch_output)
+
+        nx = self._nextn_sub
+        dw = nx.draft_worker
+        with (
+            dw.draft_tp_context(dw.draft_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("draft_extend"),
+        ):
+            eagle_input = dw._draft_extend_for_prefill(
+                batch,
+                batch_output.logits_output.hidden_states,
+                batch_output.next_token_ids,
+                batch_output.logits_output.mm_input_embeds,
+            )
+
+        if self._active_name == "dflash":
+            # Serve the DFLASH rung, but carry the NEXTN seeds along (relayed
+            # through the FutureMap / the object itself) for a later switch.
+            dflash_input.topk_p = eagle_input.topk_p
+            dflash_input.topk_index = eagle_input.topk_index
+            dflash_input.hidden_states = eagle_input.hidden_states
+            batch_output.next_draft_input = dflash_input
+        else:
+            batch_output.next_draft_input = eagle_input
+        return batch_output
+
     def forward_batch_generation(self, batch, *args, **kwargs):
-        # THE stamp point (stage-2: constant == the scheduler's stamp; stage 3
-        # changes only the SOURCE of this value to the per-batch active rung).
-        batch.spec_algorithm = self._forced_algo
-        return self._primary.forward_batch_generation(batch, *args, **kwargs)
+        # THE stamp point: under the stage-2 static force modes the value is
+        # the constant forced algorithm; under schedule mode it is the active
+        # rung (already stamped by the scheduler's maybe_switch_rung hook for
+        # decode batches -- re-stamped here so the invariant holds for every
+        # batch that reaches a worker).
+        batch.spec_algorithm = self._active_algo
+        if self._schedule_interval is None:
+            return self._primary.forward_batch_generation(batch, *args, **kwargs)
+
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            return self._dual_prefill(batch, *args, **kwargs)
+
+        self._rounds_total += 1
+        batch_output = self._active_sub.forward_batch_generation(
+            batch, *args, **kwargs
+        )
+        # Keep the INACTIVE rung warm (see the section comment above).
+        tic = time.perf_counter()
+        if self._active_name == "dflash":
+            self._warmkeep_nextn_after_dflash_round(batch, batch_output)
+        else:
+            self._warmkeep_dflash_after_nextn_round(batch, batch_output)
+        self._warmkeep_ms_since_switch += (time.perf_counter() - tic) * 1e3
+        self._warmkeep_rounds_since_switch += 1
+        self._trace_round(batch, batch_output)
+        return batch_output
 
     def on_verify_complete_cpu(
         self,

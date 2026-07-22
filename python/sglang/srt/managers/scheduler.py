@@ -350,6 +350,15 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # T156 stage 3: per-batch cross-algorithm switching (schedule mode).
+        # True => decode batches consult the meta-worker's switch hook before
+        # prepare_for_decode, and DFLASH request validation applies (any
+        # request may hit a DFLASH segment).
+        from sglang.srt.speculative.cross_algo_utils import cross_schedule_interval
+
+        self._cross_schedule_mode = (
+            cross_schedule_interval(server_args) is not None
+        )
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
@@ -2236,7 +2245,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm.is_dflash_family():
+        if self.spec_algorithm.is_dflash_family() or self._cross_schedule_mode:
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
@@ -3083,6 +3092,8 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             running_batch.filter_batch()
             if not running_batch.is_empty():
+                if self._cross_schedule_mode:
+                    self.draft_worker.maybe_switch_rung(running_batch)
                 running_batch.prepare_for_decode()
                 new_batch.mix_with_running(running_batch)
                 new_batch.decoding_reqs = running_batch.reqs
@@ -3207,6 +3218,14 @@ class Scheduler(
 
         if batch.is_empty():
             return batch
+
+        # T156 stage 3 (cross-algorithm schedule mode): decide the active rung
+        # BEFORE prepare_for_decode -- the prep dispatches on
+        # batch.spec_algorithm and reserves the incoming rung's KV headroom,
+        # and switches are legal only here, at the round boundary after the
+        # previous round's commit.
+        if self._cross_schedule_mode:
+            self.draft_worker.maybe_switch_rung(batch)
 
         # Update batch tensors
         batch.prepare_for_decode()

@@ -308,26 +308,17 @@ class FutureMap:
             and payload.hidden_states is not None
         )
 
+        # Buf allocation is per-field lazy (see _ensure_topk_bufs /
+        # _ensure_hidden_buf): under cross-algorithm switching (T156 stage 3)
+        # a payload may legitimately carry only a subset of the spec extras,
+        # so shapes are peeked from the first payload that HAS the field.
+        self.topk_p_buf = None
+        self.topk_index_buf = None
+        self.hidden_states_buf = None
         if self.need_topk:
-            topk_p0 = payload.topk_p[0]
-            topk_index0 = payload.topk_index[0]
-            self.topk_p_buf = torch.empty(
-                (self.req_pool_size, *topk_p0.shape),
-                dtype=topk_p0.dtype,
-                device=self.device,
-            )
-            self.topk_index_buf = torch.empty(
-                (self.req_pool_size, *topk_index0.shape),
-                dtype=topk_index0.dtype,
-                device=self.device,
-            )
+            self._ensure_topk_bufs(payload)
         if self.need_hidden_states:
-            hidden_states0 = payload.hidden_states[0]
-            self.hidden_states_buf = torch.empty(
-                (self.req_pool_size, *hidden_states0.shape),
-                dtype=hidden_states0.dtype,
-                device=self.device,
-            )
+            self._ensure_hidden_buf(payload)
 
         self.draft_probs_buf = None
         if payload.draft_probs is not None:
@@ -346,6 +337,38 @@ class FutureMap:
                 dtype=payload.dsa_topk_indices.dtype,
                 device=self.device,
             )
+
+    def _ensure_topk_bufs(self, payload: RelayPayload) -> bool:
+        if self.topk_p_buf is not None:
+            return True
+        if payload.topk_p is None or payload.topk_index is None:
+            return False
+        topk_p0 = payload.topk_p[0]
+        topk_index0 = payload.topk_index[0]
+        self.topk_p_buf = torch.empty(
+            (self.req_pool_size, *topk_p0.shape),
+            dtype=topk_p0.dtype,
+            device=self.device,
+        )
+        self.topk_index_buf = torch.empty(
+            (self.req_pool_size, *topk_index0.shape),
+            dtype=topk_index0.dtype,
+            device=self.device,
+        )
+        return True
+
+    def _ensure_hidden_buf(self, payload: RelayPayload) -> bool:
+        if self.hidden_states_buf is not None:
+            return True
+        if payload.hidden_states is None:
+            return False
+        hidden_states0 = payload.hidden_states[0]
+        self.hidden_states_buf = torch.empty(
+            (self.req_pool_size, *hidden_states0.shape),
+            dtype=hidden_states0.dtype,
+            device=self.device,
+        )
+        return True
 
     def resolve_confidence_cpu(
         self, batch: ScheduleBatch
@@ -372,7 +395,7 @@ class FutureMap:
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
         indices.record_stream(torch.get_device_module(self.device).current_stream())
-        if self.need_topk:
+        if self.need_topk and self.topk_p_buf is not None:
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
             )
@@ -395,7 +418,11 @@ class FutureMap:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
         else:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
-        if self.need_hidden_states and not self.need_topk:
+        if (
+            self.need_hidden_states
+            and not (self.need_topk and self.topk_p_buf is not None)
+            and self.hidden_states_buf is not None
+        ):
             draft_input.hidden_states = self.hidden_states_buf[indices]
         if self.dsa_topk_indices_buf is not None:
             draft_input.dsa_topk_indices = self.dsa_topk_indices_buf[indices]
@@ -507,15 +534,21 @@ class FutureMap:
             self.output_tokens_buf.dtype
         )
 
-        if self.need_topk:
-            self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
-            self.topk_index_buf[indices] = payload.topk_index.to(
-                self.topk_index_buf.dtype
-            )
-        if self.need_hidden_states:
-            self.hidden_states_buf[indices] = payload.hidden_states.to(
-                self.hidden_states_buf.dtype
-            )
+        # None-tolerant per field (cross-algorithm switching may stash
+        # bonus-only payloads); an absent field simply keeps the previous
+        # relayed value, and the consumer contract guarantees a round that
+        # READS a field was preceded by a round that stashed it.
+        if self.need_topk and payload.topk_p is not None:
+            if self._ensure_topk_bufs(payload):
+                self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
+                self.topk_index_buf[indices] = payload.topk_index.to(
+                    self.topk_index_buf.dtype
+                )
+        if self.need_hidden_states and payload.hidden_states is not None:
+            if self._ensure_hidden_buf(payload):
+                self.hidden_states_buf[indices] = payload.hidden_states.to(
+                    self.hidden_states_buf.dtype
+                )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
         if (

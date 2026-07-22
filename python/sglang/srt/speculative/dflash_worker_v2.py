@@ -139,6 +139,12 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+        # T156 stage 3 (cross-algorithm schedule mode, set by CrossAlgoWorker):
+        # the target captures the FINAL hidden states in
+        # logits_output.hidden_states (for the co-resident NEXTN/MTP rung) and
+        # the DFLASH aux concat in logits_output.cross_aux_hidden_states --
+        # this worker then reads its context features from the latter.
+        self._cross_dual_capture = False
 
         bundle = build_draft_tp_worker(
             server_args=server_args,
@@ -1511,6 +1517,92 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    def _target_context_hidden(self, logits_output) -> Optional[torch.Tensor]:
+        """The target hidden rows that feed the DFLASH draft KV (aux concat).
+
+        Dual capture (cross-algorithm schedule mode) stores them in
+        `cross_aux_hidden_states` (with the FINAL hidden states left in
+        `hidden_states` for the NEXTN/MTP rung); single mode stores them in
+        `hidden_states` as before.
+        """
+        if self._cross_dual_capture:
+            return logits_output.cross_aux_hidden_states
+        return logits_output.hidden_states
+
+    def _release_target_context_hidden(self, logits_output) -> None:
+        """Drop the consumed context rows (avoid overlap D2H of big buffers).
+
+        Dual capture releases only the aux field: the final hidden states are
+        still consumed afterwards by the meta-worker's NEXTN warm-keeping
+        catch-up, which nulls them when done.
+        """
+        if self._cross_dual_capture:
+            logits_output.cross_aux_hidden_states = None
+        else:
+            logits_output.hidden_states = None
+
+    def prefill_after_target(
+        self, batch: ScheduleBatch, batch_output: GenerationBatchResult
+    ) -> DFlashDraftInputV2:
+        """DFLASH's post-target prefill work: materialize the prompt tokens'
+        context features into the draft KV cache and build the next draft
+        input. Split out of forward_batch_generation so the cross-algorithm
+        meta-worker can run it against ONE shared target prefill forward."""
+        logits_output, next_token_ids = (
+            batch_output.logits_output,
+            batch_output.next_token_ids,
+        )
+        target_hidden = self._target_context_hidden(logits_output)
+        if target_hidden is None:
+            raise RuntimeError(
+                "DFLASH requires target aux hidden capture for prefill, but got None. "
+                "Make sure the target model has DFlash layers-to-capture configured."
+            )
+
+        if batch.extend_lens is None or batch.prefix_lens is None:
+            raise RuntimeError(
+                "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
+                "but got None."
+            )
+
+        # Materialize prompt tokens into the draft KV cache immediately. This is required
+        # for radix cache safety (the scheduler may update radix after prefill returns).
+        # Solo shadow: no draft KV pool here -> skip (the solo host writes
+        # the draft prefill KV; next_token_ids is replicated on every rank
+        # via the target forward, so the next-draft-input still matches).
+        if not self._solo_is_shadow:
+            device = next_token_ids.device
+            ctx_lens = torch.tensor(
+                batch.extend_lens, dtype=torch.int32, device=device
+            )
+            draft_seq_lens = torch.tensor(
+                batch.prefix_lens, dtype=torch.int32, device=device
+            )
+
+            if batch.out_cache_loc is None:
+                raise RuntimeError(
+                    "DFLASH prefill expected out_cache_loc, but got None."
+                )
+            positions, _ = compute_position(
+                self.model_runner.server_args.attention_backend,
+                draft_seq_lens,
+                ctx_lens,
+                int(sum(batch.extend_lens)),
+            )
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=target_hidden,
+                cache_loc=batch.out_cache_loc,
+                positions=positions,
+            )
+
+        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
+        self._release_target_context_hidden(logits_output)
+
+        return self._make_next_draft_input_prefill(
+            bonus_tokens=next_token_ids,
+            seq_lens=batch.seq_lens,
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -1527,62 +1619,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.capture_hidden_mode = CaptureHiddenMode.FULL
             batch_output = self.target_worker.forward_batch_generation(batch)
 
-            logits_output, next_token_ids = (
-                batch_output.logits_output,
-                batch_output.next_token_ids,
-            )
             batch_output.new_seq_lens = batch.seq_lens
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
-            if logits_output.hidden_states is None:
-                raise RuntimeError(
-                    "DFLASH requires target aux hidden capture for prefill, but got None. "
-                    "Make sure the target model has DFlash layers-to-capture configured."
-                )
-
-            if batch.extend_lens is None or batch.prefix_lens is None:
-                raise RuntimeError(
-                    "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
-                    "but got None."
-                )
-
-            # Materialize prompt tokens into the draft KV cache immediately. This is required
-            # for radix cache safety (the scheduler may update radix after prefill returns).
-            # Solo shadow: no draft KV pool here -> skip (the solo host writes
-            # the draft prefill KV; next_token_ids is replicated on every rank
-            # via the target forward, so the next-draft-input still matches).
-            if not self._solo_is_shadow:
-                device = next_token_ids.device
-                ctx_lens = torch.tensor(
-                    batch.extend_lens, dtype=torch.int32, device=device
-                )
-                draft_seq_lens = torch.tensor(
-                    batch.prefix_lens, dtype=torch.int32, device=device
-                )
-
-                if batch.out_cache_loc is None:
-                    raise RuntimeError(
-                        "DFLASH prefill expected out_cache_loc, but got None."
-                    )
-                positions, _ = compute_position(
-                    self.model_runner.server_args.attention_backend,
-                    draft_seq_lens,
-                    ctx_lens,
-                    int(sum(batch.extend_lens)),
-                )
-                self._append_target_hidden_to_draft_kv_by_loc(
-                    target_hidden=logits_output.hidden_states,
-                    cache_loc=batch.out_cache_loc,
-                    positions=positions,
-                )
-
-            # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
-            logits_output.hidden_states = None
-
-            batch_output.next_draft_input = self._make_next_draft_input_prefill(
-                bonus_tokens=next_token_ids,
-                seq_lens=batch.seq_lens,
+            batch_output.next_draft_input = self.prefill_after_target(
+                batch, batch_output
             )
             return batch_output
 
@@ -2038,7 +2080,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Solo shadow: no draft KV pool here (the solo host owns the whole draft
         # KV), so skip the write. Every rank still ran the target verify and
         # holds identical accept/bonus/out_tokens.
-        hidden = logits_output.hidden_states
+        hidden = self._target_context_hidden(logits_output)
         if hidden is None:
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
@@ -2054,7 +2096,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
-        logits_output.hidden_states = None
+        # (Dual capture keeps the FINAL hidden states for the meta-worker's
+        # NEXTN warm-keeping catch-up, which nulls them when done.)
+        self._release_target_context_hidden(logits_output)
 
         # === DFLASH AUDIT (env-gated) ===
         self._audit_mark("kv_commit")

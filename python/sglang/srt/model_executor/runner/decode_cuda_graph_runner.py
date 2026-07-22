@@ -1475,6 +1475,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.hidden_states is not None
                     else None
                 ),
+                # T156 stage 3 dual capture: aux concat captured alongside the
+                # final hidden states (cross-algorithm schedule mode only).
+                cross_aux_hidden_states=(
+                    output.cross_aux_hidden_states[: self.raw_num_token]
+                    if output.cross_aux_hidden_states is not None
+                    else None
+                ),
                 customized_info=output.customized_info,
             )
         else:

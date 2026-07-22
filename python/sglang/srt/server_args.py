@@ -2275,12 +2275,14 @@ class ServerArgs:
     speculative_cross_algorithm_force: A[
         Optional[str],
         Arg(
-            help="Which rung serves ALL batches under "
-            "--speculative-cross-algorithm (stage 2 is statically forced; "
-            "required while per-batch switching does not exist yet). "
-            "'nextn': the MTP/EAGLE rung is active, the DFLASH rung stays "
-            "resident but idle. 'dflash': vice versa.",
-            choices=["nextn", "dflash"],
+            help="Active-rung policy under --speculative-cross-algorithm "
+            "(required). 'nextn': the MTP/EAGLE rung serves ALL batches, the "
+            "DFLASH rung stays resident but idle. 'dflash': vice versa. "
+            "'schedule:N' (T156 stage 3 debug policy): start on the NEXTN "
+            "rung and switch the active rung every N verify rounds, at round "
+            "boundaries only -- exercises the per-batch switching mechanics "
+            "with a deterministic, rank-uniform plan (the stage-4 bandit "
+            "replaces the fixed plan with a reward objective).",
         ),
     ] = None
     speculative_adaptive_graph_memory: A[

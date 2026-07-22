@@ -52,6 +52,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.speculative.cross_algo_utils import (
+    dual_capture_active as _cross_dual_capture_active,
+)
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -176,6 +179,11 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # T156 stage 3 (cross-algorithm dual capture only): the concatenated
+    # DFLASH aux-layer hidden states, captured ALONGSIDE the final hidden
+    # states above so the NEXTN/MTP and DFLASH rungs can both stay warm on
+    # every verify round. None unless cross_algo_utils.dual_capture_active().
+    cross_aux_hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -461,6 +469,26 @@ class LogitsProcessor(nn.Module):
             logits_metadata,
         )
 
+        # T156 stage 3 dual capture (cross-algorithm schedule mode): store the
+        # aux concat in its own field and let the regular path below store the
+        # FINAL hidden states (nulling aux here routes it into the final-hidden
+        # branch of _get_hidden_states_to_store). Off => byte-identical.
+        cross_aux_to_store = None
+        if aux_hidden_states is not None and _cross_dual_capture_active():
+            capture_mode = logits_metadata.capture_hidden_mode
+            if capture_mode.need_capture():
+                if capture_mode.is_full():
+                    cross_aux_to_store = torch.cat(aux_hidden_states, dim=-1)
+                elif capture_mode.is_last():
+                    aux_cat = torch.cat(aux_pruned_states, dim=-1)
+                    cross_aux_to_store = (
+                        aux_cat[sample_indices]
+                        if sample_indices is not None
+                        else aux_cat
+                    )
+            aux_hidden_states = None
+            aux_pruned_states = None
+
         hidden_states_to_store = self._get_hidden_states_to_store(
             hidden_states,
             hidden_states_before_norm,
@@ -484,6 +512,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                cross_aux_hidden_states=cross_aux_to_store,
                 # FIXME: These fields are not logits-related but are passed through here as a
                 # workaround since ForwardBatch is local to forward_batch_generation().
                 # They should be moved to GenerationBatchResult to keep this class clean.
@@ -525,6 +554,7 @@ class LogitsProcessor(nn.Module):
         return LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
+            cross_aux_hidden_states=cross_aux_to_store,
             input_token_logprobs=logprobs_result.input_token_logprobs,
             input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,

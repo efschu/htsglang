@@ -420,7 +420,9 @@ class ModelRunnerKVCacheMixin:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
                     * capped_reqs
-                    * server_args.speculative_num_draft_tokens
+                    # Max width: adaptive k-ladder rungs / the cross-algorithm
+                    # secondary rung can exceed the boot shape's draft tokens.
+                    * server_args.max_speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif self._auto_mamba_demand_active():
@@ -434,7 +436,7 @@ class ModelRunnerKVCacheMixin:
             per_req = config.mamba2_cache_params.mamba_cache_per_req
             assert per_req > 0
             ratio = self._calculate_mamba_ratio()
-            D = server_args.speculative_num_draft_tokens if has_spec_dec else 0
+            D = server_args.max_speculative_num_draft_tokens if has_spec_dec else 0
             demand_size = self._auto_mamba_demand_size(ratio)
             # Never exceed what the post-weights budget can physically hold
             # (main state + spec-decode intermediate state per admitted req).
@@ -515,7 +517,7 @@ class ModelRunnerKVCacheMixin:
             # ratio is 1 with the radix cache disabled; D/ratio mirrors the
             # joint solve of the radix-enabled branch.
             ratio = self._calculate_mamba_ratio()
-            D = server_args.speculative_num_draft_tokens if has_spec_dec else 0
+            D = server_args.max_speculative_num_draft_tokens if has_spec_dec else 0
             budget_size = int(mamba_budget_bytes // (per_req * (1 + D / ratio)))
             size = min(requested_size, budget_size)
             if size < requested_size:
@@ -541,7 +543,7 @@ class ModelRunnerKVCacheMixin:
                 intermediate_size = (
                     per_req
                     * server_args.max_mamba_cache_size
-                    * server_args.speculative_num_draft_tokens
+                    * server_args.max_speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -563,7 +565,7 @@ class ModelRunnerKVCacheMixin:
 
             if has_spec_dec:
                 ratio = self._calculate_mamba_ratio()
-                D = server_args.speculative_num_draft_tokens
+                D = server_args.max_speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
                 server_args.override(
                     "mamba_pool.memory_budget_spec",
@@ -862,9 +864,13 @@ class ModelRunnerKVCacheMixin:
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
         # Mirror the non-shared path's extra_max_context_len computation.
+        # Max width (not the boot shape's): adaptive k-ladder rungs and the
+        # cross-algorithm secondary rung reserve up to max_... slots per
+        # decode; mem_cache/common.get_req_to_token_extra_context_len already
+        # uses the max on the classic path.
         extra_max_context_len = 4
-        if self.server_args.speculative_num_draft_tokens is not None:
-            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+        if self.server_args.max_speculative_num_draft_tokens is not None:
+            extra_max_context_len += self.server_args.max_speculative_num_draft_tokens
 
         mamba_layer_ids = [
             i
@@ -897,7 +903,11 @@ class ModelRunnerKVCacheMixin:
             max_num_reqs=max_num_reqs,
             enable_memory_saver=self.server_args.enable_memory_saver,
             enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-            speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+            # Max width: the intermediate SSM/conv verify caches are indexed
+            # by draft-token step; adaptive rungs (k4/k5 -> 5/6 tokens) and
+            # the cross-algorithm DFLASH rung (16 tokens) exceed the boot
+            # shape's value -- sizing with it would OOB the step axis.
+            speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
             mamba_full_memory_ratio=self.server_args.mamba_full_memory_ratio,

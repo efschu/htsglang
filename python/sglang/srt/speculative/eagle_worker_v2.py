@@ -1633,6 +1633,142 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
 
+    def draft_extend_catchup(
+        self,
+        batch: ScheduleBatch,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        accept_lens: torch.Tensor,
+        num_draft_tokens: int,
+        cuda_graph_runner=None,
+    ):
+        """T156 stage 3 warm-keeping: draft-extend over ANOTHER algorithm's
+        verify block (cross-algorithm schedule mode).
+
+        While the DFLASH rung serves the decode rounds, this runs the MTP
+        draft-extend over the round's verify block (width = the DFLASH block
+        size, NOT this worker's num_draft_tokens) so that (a) the MTP draft KV
+        stays gap-free for the committed positions and (b) fresh next-round
+        draft seeds (topk_p / topk_index / recurrent hidden) exist, making a
+        later switch back to NEXTN full-speed from its first round.
+
+        Distilled from ``_draft_extend_for_decode``: no plan stream, no DSA
+        index seeding (cross-algo is validated topk==1, non-DSA). Runs the
+        dedicated catch-up graph when *cuda_graph_runner* (built by
+        ``EAGLEWorkerV2.build_catchup_extend_state`` at the FOREIGN width) can
+        take the batch, else falls back to the eager path -- the eager
+        flashinfer plan blocks the CPU on the in-flight round's GPU work
+        (~40 ms measured), which is exactly the stall the graph avoids.
+
+        Inputs mirror the DFLASH round's commit view: *target_hidden_states*
+        = the target's FINAL hidden states of all ``bs * num_draft_tokens``
+        verify rows (dual capture), *next_token_ids* = the per-row committed/
+        predicted token ids (DFLASH ``out_tokens``), *accept_lens* = committed
+        tokens per request incl. the root (DFLASH ``commit_lens``); rejected
+        rows' draft KV lands in slots the scheduler frees afterwards, exactly
+        like the native EAGLE extend.
+
+        Returns ``(topk_p, topk_index, hidden_states)`` seeds for the last
+        accepted position of each request.
+        """
+        import os as _os
+
+        _timing = _os.environ.get("SGLANG_CROSS_WARMKEEP_TIMING")
+
+        def _mark(label, tic):
+            if not _timing:
+                return time.perf_counter()
+            torch.cuda.synchronize()
+            now = time.perf_counter()
+            logger.info(
+                "cross_warmkeep timing %s: %.2f ms", label, (now - tic) * 1e3
+            )
+            return now
+
+        tic = time.perf_counter()
+        draft_extend_input = EagleDraftExtendInput(
+            hidden_states=target_hidden_states,
+            num_correct_drafts=accept_lens - 1,
+            num_accept_tokens=accept_lens,
+            num_tokens_per_req=num_draft_tokens,
+            num_tokens_for_logprob_per_req=num_draft_tokens,
+        )
+        select_index = (
+            torch.arange(
+                0,
+                len(batch.seq_lens) * num_draft_tokens,
+                num_draft_tokens,
+                device=self.device,
+            )
+            + accept_lens
+            - 1
+        )
+        next_token_ids = next_token_ids.to(torch.int64)
+
+        forward_batch = self.prepare_for_draft_extend(
+            draft_extend_input,
+            batch,
+            next_token_ids,
+            num_draft_tokens,
+            self.draft_runner,
+            cuda_graph_runner,
+        )
+        tic = _mark("prepare", tic)
+
+        can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+            forward_batch
+        )
+        canary_ctx = (
+            context_tuple(
+                c.with_ops_outside_graph(
+                    single_forward_indices=[0],
+                    maybe_inaccurate_forward_batch=forward_batch,
+                ),
+                c.with_active_single_forward_manager(0),
+            )
+            if (c := self.draft_runner.canary_manager) is not None
+            else contextlib.nullcontext()
+        )
+        with canary_ctx:
+            if can_cuda_graph:
+                draft_logits_output = cuda_graph_runner.execute(forward_batch)
+            else:
+                draft_logits_output = self.draft_runner.forward(
+                    forward_batch
+                ).logits_output
+        tic = _mark(f"forward(graph={bool(can_cuda_graph)})", tic)
+
+        maybe_detect_nan(
+            draft_logits_output.next_token_logits, "draft_extend_catchup"
+        )
+        maybe_detect_inf(
+            draft_logits_output.next_token_logits, "draft_extend_catchup"
+        )
+
+        selected_logits = draft_logits_output.next_token_logits[select_index]
+        ret_hidden_states = None
+        if draft_logits_output.hidden_states is not None:
+            ret_hidden_states = draft_logits_output.hidden_states[select_index]
+
+        if self.topk == 1 and not _is_hip:
+            ret_topk_index = torch.argmax(selected_logits, dim=-1, keepdim=True)
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+        else:
+            probs = renorm_draft_probs(
+                selected_logits, batch.sampling_info, False
+            )
+            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+        # Same rank-sync obligation as the native extend paths (#50): the
+        # step-0 pick of the next NEXTN round must be identical on all ranks.
+        _broadcast_draft_picks(
+            ret_topk_index,
+            ret_topk_p,
+            None,
+            solo_single_rank=self._spec_solo_active,
+        )
+        _mark("select_topk_broadcast", tic)
+        return ret_topk_p, ret_topk_index, ret_hidden_states
+
 
 class EAGLEWorkerV2(BaseSpecWorker):
     def __init__(
@@ -2148,6 +2284,56 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_steps=state.speculative_num_steps,
             speculative_num_draft_tokens=state.speculative_num_draft_tokens,
         )
+
+    def build_catchup_extend_state(self, num_draft_tokens: int):
+        """T156 stage 3: draft-extend resources at a FOREIGN width.
+
+        The cross-algorithm warm-keeping catch-up runs this worker's
+        draft-extend over the DFLASH rung's verify block (width = the DFLASH
+        block size). The eager extend's flashinfer plan blocks the CPU on the
+        in-flight round's GPU work (~40 ms/round measured), so capture a
+        dedicated extend CUDA graph at that width, with its own extend
+        attention backend (per-state backend isolation exactly like the
+        adaptive ladder's non-initial rungs). Returns (backend, runner);
+        (None, None) when graphs are unavailable -- the catch-up then runs
+        eager (correct, slower).
+        """
+        dw = self._draft_worker
+        if (
+            _is_cpu
+            or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+            or envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get()
+            or (self._spec_solo_active and not self._spec_solo_is_host)
+        ):
+            return None, None
+        if not isinstance(
+            dw.draft_extend_attn_backend,
+            (FlashInferAttnBackend, TritonAttnBackend),
+        ):
+            return None, None
+
+        tic = time.perf_counter()
+        with self._override_worker_state(
+            num_draft_tokens - 1, num_draft_tokens
+        ):
+            with dw._solo_build_ctx():
+                factory = DraftBackendFactory(
+                    dw.server_args,
+                    dw.draft_runner,
+                    dw.topk,
+                    dw.speculative_num_steps,
+                )
+                backend = factory.create_draft_extend_backend()
+            if backend is None:
+                return None, None
+            dw.draft_extend_attn_backend = backend  # restored by the override
+            runner = EAGLEDraftExtendCudaGraphRunner(dw)
+        log_info_on_rank0(
+            logger,
+            f"Built cross-algo catch-up draft-extend state (width="
+            f"{num_draft_tokens}): elapsed={time.perf_counter() - tic:.2f}s",
+        )
+        return backend, runner
 
     @contextlib.contextmanager
     def _override_worker_state(

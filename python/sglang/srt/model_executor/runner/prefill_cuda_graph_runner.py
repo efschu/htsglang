@@ -1159,6 +1159,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         if output.hidden_states is not None
                         else None
                     ),
+                    # T156 stage 3 dual capture (cross-algorithm schedule
+                    # mode): aux concat alongside the final hidden states.
+                    cross_aux_hidden_states=(
+                        output.cross_aux_hidden_states[: self.raw_num_tokens]
+                        if output.cross_aux_hidden_states is not None
+                        else None
+                    ),
                     input_token_logprobs=output.input_token_logprobs,
                     input_top_logprobs_val=output.input_top_logprobs_val,
                     input_top_logprobs_idx=output.input_top_logprobs_idx,
