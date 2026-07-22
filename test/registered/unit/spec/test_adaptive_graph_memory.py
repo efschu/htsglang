@@ -317,6 +317,79 @@ class TestManagerOffload(unittest.TestCase):
             self.assertEqual(mgr._adapter.calls, [("pause", "adaptive_state_k1")])
             self.assertEqual(mgr.swap_count, 3)
 
+    def test_resume_reclaims_allocator_cache_when_driver_free_is_short(self):
+        # Regression for the 2026-07-22 tp3 crash: serving transients
+        # (10k-prefill peaks) stay cached in the torch allocator, driver-free
+        # erodes below the incoming tag's footprint, and a baseline->rung
+        # pure resume dies in cu_mem_create. ensure_active must empty_cache
+        # and proceed when the reclaim yields enough driver-free memory.
+        mgr = _offload_manager()
+        self._build_two_states(mgr)
+        with _mock_cuda():
+            mgr.finalize_boot(initial_steps=3)  # baseline: nothing mapped
+            mgr._adapter.calls.clear()
+        empty_calls = []
+        # Driver-free: short before reclaim, plentiful after empty_cache.
+        frees = iter([1 << 20, 1 << 30])
+        with (
+            mock.patch.object(torch.cuda, "synchronize", lambda *a, **k: None),
+            mock.patch.object(
+                torch.cuda,
+                "empty_cache",
+                lambda *a, **k: empty_calls.append(1),
+            ),
+            mock.patch.object(
+                torch.cuda, "mem_get_info", lambda *a, **k: (next(frees), 1 << 41)
+            ),
+        ):
+            mgr.ensure_active(2)
+        self.assertEqual(empty_calls, [1])
+        self.assertIn(("resume", "adaptive_state_k2"), mgr._adapter.calls)
+
+    def test_resume_raises_readably_when_reclaim_is_not_enough(self):
+        # Genuine shortfall even after empty_cache: fail with a diagnosable
+        # error naming the tag instead of the native cu_mem_create abort.
+        mgr = _offload_manager()
+        self._build_two_states(mgr)
+        with _mock_cuda():
+            mgr.finalize_boot(initial_steps=3)
+            mgr._adapter.calls.clear()
+        frees = iter([16, 16])  # bytes; far below the 4096-byte footprint
+        with (
+            mock.patch.object(torch.cuda, "synchronize", lambda *a, **k: None),
+            mock.patch.object(torch.cuda, "empty_cache", lambda *a, **k: None),
+            mock.patch.object(
+                torch.cuda, "mem_get_info", lambda *a, **k: (next(frees), 1 << 41)
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "adaptive_state_k2.*after reclaiming"
+            ):
+                mgr.ensure_active(2)
+        self.assertNotIn(("resume", "adaptive_state_k2"), mgr._adapter.calls)
+
+    def test_resume_skips_reclaim_when_driver_free_is_plentiful(self):
+        mgr = _offload_manager()
+        self._build_two_states(mgr)
+        with _mock_cuda():
+            mgr.finalize_boot(initial_steps=3)
+            mgr._adapter.calls.clear()
+        empty_calls = []
+        with (
+            mock.patch.object(torch.cuda, "synchronize", lambda *a, **k: None),
+            mock.patch.object(
+                torch.cuda,
+                "empty_cache",
+                lambda *a, **k: empty_calls.append(1),
+            ),
+            mock.patch.object(
+                torch.cuda, "mem_get_info", lambda *a, **k: (1 << 40, 1 << 41)
+            ),
+        ):
+            mgr.ensure_active(2)
+        self.assertEqual(empty_calls, [])
+        self.assertIn(("resume", "adaptive_state_k2"), mgr._adapter.calls)
+
     def test_ensure_active_is_idempotent(self):
         mgr = _offload_manager()
         self._build_two_states(mgr)

@@ -110,6 +110,12 @@ Reserve rule and the no-OOM-on-swap guarantee
   physical pool is max-state-sized from boot onward: no lazy growth, no
   swap-time allocation beyond what pause just released. A failed check is a
   fatal, actionable error (raise the graph reserve or use resident mode).
+  One erosion channel remains at runtime: resume() maps FRESH physical
+  pages, and serving transients (deep chunked-prefill peaks) leave
+  freed-but-cached segments in the torch caching allocator that the driver
+  cannot see -- so ``ensure_active`` reclaims those (empty_cache) whenever
+  driver-free is short of the incoming tag's measured footprint, before
+  resuming (``_reclaim_driver_free_for_resume``).
 
 Isolation / audit (G4 evolution)
 --------------------------------
@@ -245,6 +251,12 @@ if TYPE_CHECKING:
 # pause/resume safe (a tagged segment hosts exactly one noted tensor); small
 # allocations would share segments across tags and stay resident instead.
 MIN_TAGGED_BYTES = 2 * 1024 * 1024
+
+# Headroom on top of a tag's measured physical footprint when deciding
+# whether a resume must reclaim allocator-cached segments first (covers
+# cu_mem 2 MiB granularity and mem_get_info jitter; NOT a tuning knob for
+# transient budgets -- those are the registered safety/tag posts).
+_RESUME_RECLAIM_HEADROOM_BYTES = 32 * (1 << 20)
 
 _MODES = ("auto", "resident", "offload", "offload-scratch")
 
@@ -725,9 +737,13 @@ class AdaptiveGraphMemoryManager:
         )
         # No-OOM guarantee, two terms:
         # 1. Swap term (max_bytes): with every built state unmapped, the
-        #    driver must be able to back the largest one. Since at most one
-        #    built state is ever resumed and pause precedes resume on every
-        #    swap, this at boot implies every future swap succeeds.
+        #    driver must be able to back the largest one. At most one built
+        #    state is ever resumed and pause precedes resume on every swap;
+        #    additionally ensure_active reclaims allocator-cached transient
+        #    segments before each resume (_reclaim_driver_free_for_resume)
+        #    -- without that reclaim, serving transients retained by the
+        #    caching allocator erode driver-free below this boot-time level
+        #    and a later resume dies in cu_mem_create.
         # 2. Serving-margin term: forwards run WHILE a state is mapped, and
         #    the eager paths (mamba chunked-prefill recompute etc.) allocate
         #    transient tensors from the same free pool. Measured on the T102
@@ -845,6 +861,7 @@ class AdaptiveGraphMemoryManager:
             self._paused.add(self._resumed_tag)
             self._resumed_tag = None
         if target is not None:
+            self._reclaim_driver_free_for_resume(rec)
             self._adapter.resume(target)
             self._paused.discard(target)
             self._resumed_tag = target
@@ -864,6 +881,64 @@ class AdaptiveGraphMemoryManager:
             self.last_swap_ms,
         )
         self._maybe_verify_rank_sync(steps)
+
+    def _reclaim_driver_free_for_resume(self, rec: "_StateRecord") -> None:
+        """Guarantee DRIVER-visible free memory for resume's cu_mem_create.
+
+        ``resume(tag)`` backs the tag with fresh physical pages, so it draws
+        exclusively on driver-free memory. Serving transients (deep
+        chunked-prefill activation peaks in particular) leave freed-but-
+        cached segments behind in the torch caching allocator; the allocator
+        never returns them to the driver on its own, so driver-free memory
+        decays over serving time even though Python-side memory looks fine.
+        cu_mem_create cannot recruit those cached bytes -- it dies with a
+        native "CUresult error: 2" abort (exit 1, no Python traceback).
+        Measured 2026-07-22 on the tp3 uneven rig: after one 10k-prefill
+        turn a 3080 shadow rank had retained >430 MiB of cached prefill
+        transients, and the next baseline->rung switch -- a PURE resume of
+        the 634 MiB EAGLE_k3 tag, with nothing paused before it because the
+        baseline is untagged -- killed the rank.
+
+        The swap path's peak demand IS a registered post (the measured
+        max-paused-tag bytes in the KV-budget registry / finalize_boot
+        reserve check); what erodes is its driver-level backing. So when
+        driver-free is short of the incoming tag's measured footprint,
+        return the allocator's cached free blocks to the driver (the same
+        empty_cache the boot flow runs between builds) and re-check. Tag
+        MemPools hold no cached free blocks at swap time (runtime never
+        allocates into them), so this only touches default-pool transient
+        segments; CUDA-graph capture pools are pinned by their graphs and
+        unaffected. If memory is genuinely short even after reclaim, raise
+        a diagnosable error instead of the native abort."""
+        needed = rec.footprint_bytes
+        free, _ = torch.cuda.mem_get_info()
+        if free >= needed + _RESUME_RECLAIM_HEADROOM_BYTES:
+            return
+        torch.cuda.empty_cache()
+        free_after, _ = torch.cuda.mem_get_info()
+        logger.info(
+            "Adaptive graph memory: reclaimed %.1f MiB of allocator-cached "
+            "transient segments before resuming %s (driver-free %.1f -> "
+            "%.1f MiB, tag footprint %.1f MiB).",
+            (free_after - free) / (1 << 20),
+            rec.tag,
+            free / (1 << 20),
+            free_after / (1 << 20),
+            needed / (1 << 20),
+        )
+        if free_after < needed:
+            raise RuntimeError(
+                "Adaptive graph memory: resuming "
+                f"{rec.tag} needs {needed / (1 << 20):.0f} MiB of "
+                "driver-free memory but only "
+                f"{free_after / (1 << 20):.0f} MiB remain after reclaiming "
+                "allocator caches. Live allocations are holding device "
+                "memory beyond the registered serving-transient safety "
+                "post; raise SGLANG_MEASURED_KV_BUDGET_SAFETY_MIB for this "
+                "rank (or shrink the rung candidate set). Failing the swap "
+                "with a readable error instead of the native cu_mem_create "
+                "abort."
+            )
 
     def _maybe_verify_rank_sync(self, steps) -> None:
         from sglang.srt.environ import envs
