@@ -68,6 +68,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Target-VERIFY spec inputs that take the uneven-DCP verify split in
+# call_begin_forward: the committed prefix is read paged over this rank's OWNED
+# token slots (non-causal, cross-rank LSE-merged) and the draft tokens attend
+# EACH OTHER through the ragged wrapper on this rank's LOCAL heads. Both member
+# types present a uniform draft_token_num query block per request and a linear
+# (non-tree) draft chain, which is exactly what the split assumes.
+_DCP_VERIFY_SPEC_INPUT_TYPES = frozenset(
+    {SpecInputType.EAGLE_VERIFY, SpecInputType.DFLASH_VERIFY}
+)
+
 
 def _cuda_graph_capture_max_bs(server_args, max_bs: int) -> int:
     """Pad max_bs to the alignment cuda-graph capture uses (see get_batch_sizes_to_capture)."""
@@ -4565,7 +4575,7 @@ class FlashInferIndicesUpdaterPrefill:
             self.attn_backend.uneven_dcp
             and spec_info is not None
             and getattr(spec_info, "spec_input_type", None)
-            == SpecInputType.EAGLE_VERIFY
+            in _DCP_VERIFY_SPEC_INPUT_TYPES
         ):
             # M4 (MTP+DCP): target-VERIFY under uneven-weighted DCP. Split the
             # verify into (a) the draft tokens attending the committed PREFIX
@@ -4586,6 +4596,27 @@ class FlashInferIndicesUpdaterPrefill:
             # written to owned compact slots by _dcp_masked_write and attended
             # only through the ragged wrapper.
             use_ragged = True
+            # DFLASH_VERIFY takes the SAME split as EAGLE/MTP verify. A DFLASH
+            # draft block is a linear CHAIN (topk is fixed to 1, no tree), so
+            # the draft->draft attention is plain causal ragged -- structurally
+            # identical to the EAGLE topk==1 case, and the committed prefix is
+            # read exactly the same way. Before this branch covered DFLASH, a
+            # DFLASH verify under uneven DCP fell through to the generic spec
+            # branch below, which leaves use_ragged False: the ragged wrapper is
+            # then never planned, while _forward_extend_dcp unconditionally runs
+            # the current-chunk ragged attention -> AttributeError
+            # '_cached_q_data_type' on EVERY rank (the solo host merely lost the
+            # race and was sigquit'd before it got there, which made this look
+            # shadow-rank-specific).
+            if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
+                assert (
+                    getattr(spec_info, "ragged_verify_layout", None) is None
+                ), (
+                    "uneven DCP + DFLASH target-verify does not support the "
+                    "ragged-verify layout (variable per-request verify lens); "
+                    "the DCP split assumes a uniform draft_token_num per "
+                    "request. Disable SGLANG_RAGGED_VERIFY_MODE."
+                )
             draft_num = spec_info.draft_token_num
             # Paged prefix (committed context) over this rank's OWNED slots.
             if self.attn_backend.uneven_dcp_weighted:

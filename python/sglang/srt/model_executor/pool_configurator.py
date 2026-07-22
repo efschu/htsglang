@@ -89,6 +89,114 @@ def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     )
 
 
+def solo_draft_kv_cell_factor(mr: ModelRunner) -> float:
+    """Multiplier for the DRAFT-KV part of a TARGET rank's per-token cell under
+    ``--speculative-draft-placement solo``.  1.0 = unchanged.
+
+    Why this is needed at all.  The configurator charges the draft KV pool by
+    inflating the per-token cell: ``P_r = A_r / (t_target + t_draft)``, i.e. the
+    draft is charged once per LOCAL physical token of this rank.  That is right
+    under split placement, where every rank owns a draft-KV slice in the same
+    proportion as its target-KV slice.  Under solo placement it is wrong on both
+    kinds of rank:
+
+    * SHADOW ranks allocate NO draft KV pool at all (the draft is a meta-device
+      stub there), yet they are charged for a full one -> factor 0.0.
+    * The solo HOST allocates ONE draft KV pool sized to the GLOBAL
+      ``max_total_num_tokens`` C, because the draft runner inherits the target's
+      MemoryPoolConfig unsharded.  Its target pool, however, holds only its own
+      token share ``n_host = C * ratio_host / S`` under uneven-DCP token
+      sharding (or ``C / dcp_size`` under the even owner rule).  Charging the
+      draft once per LOCAL token therefore under-counts it by exactly
+      ``S / ratio_host`` -> that is the factor.  Additionally the solo draft is
+      built weight-TP=1, so it keeps ALL kv heads; when the target cell was
+      computed with this rank's head SHARD (no DCP kv replication) the draft
+      term needs the head ratio on top.
+
+    The correct invariant is ``n_r * t_target + [host] * C * t_draft <= A_r``,
+    which is exactly what ``P_r = A_r / (t_target + factor * t_draft)`` encodes
+    once ``P_r`` is interpreted as ``C * ratio_r / S`` -- the definition
+    ``_apply_token_constraints`` already uses.
+
+    KNOWN, DELIBERATELY UNFIXED (split placement): the same "draft KV is sized
+    to the GLOBAL token count, not this rank's share" mismatch exists for SPLIT
+    placement under token-sharded DCP too, where it under-charges the draft on
+    every rank.  It is left alone here on purpose -- fixing it would shrink the
+    KV pool of every validated non-solo uneven-DCP arm, and the reference
+    topology has enough slack to absorb it.  See the handoff note.
+    """
+    server_args = mr.server_args
+    if not getattr(server_args, "speculative_draft_solo_active", None):
+        return 1.0
+    if not server_args.speculative_draft_solo_active():
+        return 1.0
+    if mr.is_draft_worker:
+        # The draft runner does not size anything (it is handed the target's
+        # MemoryPoolConfig); leave its own cell computation untouched.
+        return 1.0
+    if mr.tp_rank != server_args.speculative_draft_solo_rank():
+        return 0.0  # shadow rank: no draft KV pool exists here
+
+    from sglang.srt.distributed.utils import (
+        cp_token_split_factor,
+        get_cp_token_ratios,
+        uneven_dcp_active,
+        uneven_dcp_kv_replicated,
+    )
+
+    dcp_size = int(getattr(mr, "dcp_size", 1) or 1)
+    factor = 1.0
+    # (a) token-axis share: the host's draft pool spans ALL C tokens.
+    if uneven_dcp_active(dcp_size):
+        ratios = get_cp_token_ratios()
+        if ratios and len(ratios) == dcp_size:
+            dcp_rank = int(get_parallel().attn_dcp_rank)
+            ratio_r = int(ratios[dcp_rank])
+            if ratio_r > 0:
+                factor *= cp_token_split_factor(dcp_size) / ratio_r
+    elif dcp_size > 1:
+        factor *= float(dcp_size)
+    # (b) head-axis share: the solo draft keeps all kv heads. When the target
+    # cell already used the FULL kv-head count (uneven-DCP kv replication) the
+    # draft term is on the same footing and no head correction applies.
+    if not uneven_dcp_kv_replicated(get_parallel().attn_dcp_size):
+        model_config = mr.model_config
+        tp_size = get_parallel().attn_tp_size
+        local_kv_heads = int(model_config.get_num_kv_heads(tp_size))
+        total_kv_heads = int(model_config.get_total_num_kv_heads())
+        if local_kv_heads > 0 and total_kv_heads > local_kv_heads:
+            factor *= total_kv_heads / local_kv_heads
+    return factor
+
+
+def apply_solo_draft_kv_cell_factor(
+    mr: ModelRunner, target_cell_size: int, cell_size_with_draft: int
+) -> int:
+    """Re-scale the draft-KV component of ``cell_size_with_draft`` (the part
+    above ``target_cell_size``) by :func:`solo_draft_kv_cell_factor`.
+
+    Returns ``cell_size_with_draft`` unchanged whenever the factor is 1.0, so
+    every split-placement / non-speculative path stays byte-identical."""
+    draft_part = int(cell_size_with_draft) - int(target_cell_size)
+    if draft_part <= 0:
+        return int(cell_size_with_draft)
+    factor = solo_draft_kv_cell_factor(mr)
+    if factor == 1.0:
+        return int(cell_size_with_draft)
+    scaled = int(target_cell_size) + int(round(draft_part * factor))
+    logger.info(
+        "Draft-solo KV planning: rank %d draft-KV cell term %d -> %d B/token "
+        "(factor %.3f); per-token cell %d -> %d B.",
+        mr.tp_rank,
+        draft_part,
+        scaled - int(target_cell_size),
+        factor,
+        int(cell_size_with_draft),
+        scaled,
+    )
+    return max(int(target_cell_size), scaled)
+
+
 class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
@@ -134,7 +242,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = mr.num_effective_layers
 
-        self._cell_size = self._compute_cell_size(mr, num_layers)
+        target_cell_size = self._compute_cell_size(mr, num_layers)
+        self._cell_size = target_cell_size
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
@@ -171,6 +280,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers),
                 )
+
+        # Draft-solo placement: re-scale ONLY the draft-KV part of the cell.
+        # No-op (factor 1.0, byte-identical) on every split-placement path.
+        self._cell_size = apply_solo_draft_kv_cell_factor(
+            mr, target_cell_size, self._cell_size
+        )
 
     def _compute_cell_size(self, mr: ModelRunner, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
