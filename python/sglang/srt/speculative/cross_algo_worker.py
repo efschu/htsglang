@@ -1,4 +1,13 @@
-"""Cross-algorithm speculative meta-worker (T156 stage 2).
+"""Cross-algorithm speculative meta-worker (T156 stages 2-4).
+
+Stage 4 (``--speculative-cross-algorithm-force auto``): the active rung is
+chosen at runtime by an acceptance-driven bandit (cross_algo_bandit) over
+{NEXTN k in the adaptive-config candidate set, DFLASH}. The NEXTN k rungs are
+bandit ARMS with their own pre-built runtime states (the stage-1 k-ladder
+controller stays deliberately unconstructed here -- see cross_algo_utils);
+rank 0 decides, the rung id is broadcast over the TP CPU group at a
+rank-uniform round boundary (design 4c), and switches land through the same
+stage-3 round-boundary mechanics as schedule mode.
 
 Hosts BOTH speculative rungs over one shared target TpModelWorker:
 
@@ -58,6 +67,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context, get_server_args
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.cross_algo_utils import (
+    SWITCHING_MODES,
     apply_runtime_shape,
     apply_shape_to_args_copy,
     get_cross_shapes,
@@ -96,13 +106,15 @@ class CrossAlgoWorker(BaseSpecWorker):
         self._forced_algo = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        # Stage 3 schedule mode: switch the active rung every N verify rounds.
-        # The NEXTN rung is the primary (global shape); interval None => the
-        # stage-2 static force modes, byte-identical behavior.
+        # Runtime-switching modes: stage-3 'schedule' (fixed round plan) and
+        # stage-4 'auto' (bandit). The NEXTN rung is the primary (global
+        # shape) in both; _switching False => the stage-2 static force modes,
+        # byte-identical behavior.
+        self._switching: bool = self._force in SWITCHING_MODES
         self._schedule_interval: Optional[int] = (
             int(shapes["schedule_interval"]) if self._force == "schedule" else None
         )
-        if self._schedule_interval is not None:
+        if self._switching:
             # Dual hidden-state capture must be active BEFORE any target graph
             # capture (the scheduler captures target graphs right after worker
             # construction); process-local, scheduler process only.
@@ -165,12 +177,13 @@ class CrossAlgoWorker(BaseSpecWorker):
         self._secondary_target_graph_runner = None
 
         # ------------------------------------------------------------------
-        # Stage-3 schedule-mode runtime state.
+        # Stage-3/4 switching-mode runtime state.
         # ------------------------------------------------------------------
-        if self._schedule_interval is not None:
-            # Under schedule mode the primary is ALWAYS the NEXTN rung and the
-            # secondary the DFLASH rung (cross_algo_utils guarantees it).
-            assert self._force == "schedule" and self._secondary_name == "dflash"
+        if self._switching:
+            # Under the switching modes the primary is ALWAYS the NEXTN rung
+            # and the secondary the DFLASH rung (cross_algo_utils guarantees
+            # it).
+            assert self._secondary_name == "dflash"
             self._dflash_sub = self._secondary
             self._nextn_sub = self._primary
             # DFLASH reads its context features from the dual-capture aux
@@ -179,21 +192,22 @@ class CrossAlgoWorker(BaseSpecWorker):
             self._dflash_block_size = int(
                 self._dflash_shape["speculative_num_draft_tokens"]
             )
-            # Rung bookkeeping. The NEXTN rung is the graph-memory BASELINE
-            # (untagged, always resident); only the DFLASH tag is
-            # paused/resumed across switches. Its key must have NO built tag,
-            # so ensure_active(nextn) pauses dflash and maps nothing.
-            self._nextn_rung_key = (
-                "EAGLE",
-                int(self._nextn_shape["speculative_num_draft_tokens"]),
-            )
+            # Rung bookkeeping. The boot-k NEXTN rung is the graph-memory
+            # BASELINE (untagged, always resident); the DFLASH tag -- and in
+            # auto mode the non-primary NEXTN k tags -- are paused/resumed
+            # across switches. The primary key must have NO built tag, so
+            # ensure_active(("EAGLE", primary_k + 1)) pauses the mapped tag
+            # and maps nothing.
+            self._primary_k = int(self._nextn_shape["speculative_num_steps"])
             self._active_name = "nextn"
+            self._active_k = self._primary_k
             self._rounds_total = 0
             self._rounds_at_switch = 0
             self._switch_count = 0
-            # Primary-rung target pointers; captured after init_cuda_graphs.
-            self._primary_target_attn_backend = None
-            self._primary_target_graph_runner = None
+            # NEXTN k -> SpecRuntimeState; filled in init_cuda_graphs (the
+            # primary k from the boot pointers, further ks -- auto mode's
+            # bandit arms -- via build_adaptive_runtime_state).
+            self._nextn_states = {}
             # Warm-keeping cost accounting (reported at each switch).
             self._warmkeep_ms_since_switch = 0.0
             self._warmkeep_rounds_since_switch = 0
@@ -203,6 +217,44 @@ class CrossAlgoWorker(BaseSpecWorker):
             trace = os.environ.get("SGLANG_CROSS_ALGO_TRACE")
             if trace:
                 self._trace_path = f"{trace}.rank{tp_rank}"
+
+        # ------------------------------------------------------------------
+        # Stage-4 auto mode: the rung bandit (design 4b/4c).
+        # ------------------------------------------------------------------
+        if self._force == "auto":
+            import os
+
+            from sglang.srt.distributed import get_tp_group
+            from sglang.srt.speculative.cross_algo_bandit import CrossAlgoBandit
+
+            self._bandit_ks = [int(k) for k in shapes["bandit_ks"]]
+            assert self._primary_k in self._bandit_ks
+            self._rungs = [("nextn", k) for k in self._bandit_ks] + [
+                ("dflash", self._dflash_block_size)
+            ]
+            trace = os.environ.get("SGLANG_CROSS_BANDIT_TRACE")
+            self._bandit = CrossAlgoBandit(
+                rungs=self._rungs,
+                initial=("nextn", self._primary_k),
+                trace_path=(trace if (trace and tp_rank == 0) else None),
+            )
+            self._last_decide_round = 0
+            # Rank-0-decides + broadcast (design 4c): the objective's round-
+            # duration term is rank-local WALL CLOCK, so -- unlike the
+            # stage-1 k-ladder and the stage-3 schedule plan -- the decision
+            # CANNOT be recomputed identically per rank. One int64 over the
+            # TP CPU (gloo) group at a rank-uniform round boundary, in eager
+            # scheduler code (never inside a graph-capture region).
+            coord = get_tp_group()
+            self._decision_cpu_group = coord.cpu_group
+            # Pure single-node TP is enforced by normalize_cross_algorithm_
+            # args, so the group's first GLOBAL rank is TP rank 0.
+            self._decision_src = coord.ranks[0]
+            log_info_on_rank0(
+                logger,
+                f"Cross-algo bandit (stage 4): rungs={self._rungs}, "
+                f"config={self._bandit.cfg}.",
+            )
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -325,7 +377,7 @@ class CrossAlgoWorker(BaseSpecWorker):
 
     def _runtime_aux_enabled(self) -> bool:
         """The target model's steady-state aux-capture setting."""
-        return self._schedule_interval is not None or self._force == "dflash"
+        return self._switching or self._force == "dflash"
 
     def init_cuda_graphs(self):
         # Secondary rung FIRST: when the primary is NEXTN+adaptive, its
@@ -333,13 +385,30 @@ class CrossAlgoWorker(BaseSpecWorker):
         # then runs AFTER the secondary rung exists and accounts for it.
         self._init_secondary_cuda_graphs()
         self._primary.init_cuda_graphs()
-        if self._schedule_interval is not None:
-            # The primary (NEXTN) rung's target-verify pointers are whatever
-            # the boot pipeline installed on the shared model runner; keep
-            # them so switches can swap back.
+        if self._switching:
+            from sglang.srt.speculative.adaptive_runtime_state import (
+                SpecRuntimeState,
+                assert_runtime_state_isolation,
+            )
+
+            # The primary (NEXTN, boot-k) rung's resources are whatever the
+            # boot pipeline installed on the shared model runner / draft
+            # worker; wrap them in a SpecRuntimeState so rung switches treat
+            # every NEXTN k uniformly.
             mr = self._target_worker.model_runner
-            self._primary_target_attn_backend = mr.attn_backend
-            self._primary_target_graph_runner = mr.decode_cuda_graph_runner
+            dw = self._nextn_sub.draft_worker
+            self._nextn_states[self._primary_k] = SpecRuntimeState(
+                speculative_num_steps=self._primary_k,
+                speculative_num_draft_tokens=self._primary_k + 1,
+                draft_attn_backend=dw.draft_attn_backend,
+                cuda_graph_runner=dw.cuda_graph_runner,
+                target_attn_backend=mr.attn_backend,
+                target_graph_runner=mr.decode_cuda_graph_runner,
+                draft_extend_attn_backend=dw.draft_extend_attn_backend,
+                cuda_graph_runner_for_draft_extend=(
+                    dw.cuda_graph_runner_for_draft_extend
+                ),
+            )
             # Dedicated draft-extend graph at the DFLASH width for the
             # per-round NEXTN warm-keeping catch-up (kept RESIDENT: it runs
             # while the DFLASH rung is mapped). Eager fallback if None.
@@ -348,6 +417,65 @@ class CrossAlgoWorker(BaseSpecWorker):
                 self._catchup_extend_runner,
             ) = self._nextn_sub.build_catchup_extend_state(
                 self._dflash_block_size
+            )
+            if self._force == "auto":
+                self._init_bandit_k_states()
+                # M16/#50 isolation across the NEXTN k states (the DFLASH
+                # rung's resources are isolated by construction, stage 2).
+                # The boot-k state is the registered baseline whose global
+                # workspace the others may alias (logged, not fatal).
+                assert_runtime_state_isolation(
+                    dict(self._nextn_states),
+                    baseline_steps={self._primary_k},
+                )
+
+    def _init_bandit_k_states(self):
+        """Build the non-primary NEXTN k rungs (bandit arms): draft backends
+        + draft graphs + a private target-verify backend/graph set per k, via
+        the k-ladder's build_adaptive_runtime_state -- inside a graph-memory
+        build scope keyed ("EAGLE", k+1) and paused after build, so inactive
+        k rungs hold no physical VRAM under offload. Mirrors
+        AdaptiveController.init_states; the controller itself is deliberately
+        NOT constructed in cross-auto mode (its _activate would pause the
+        mapped DFLASH tag mid-segment -- the bandit owns activation)."""
+        from sglang.srt.utils.common import get_available_gpu_memory
+
+        mgr = self._graph_memory_manager()
+        dw = self._nextn_sub.draft_worker
+        extra_ks = [k for k in self._bandit_ks if k != self._primary_k]
+        # Largest k first: under offload its capture runs with maximum
+        # headroom (same rationale as AdaptiveController.init_states).
+        for k in sorted(extra_ks, reverse=True):
+            tic = time.perf_counter()
+            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            key = ("EAGLE", k + 1)
+            build_scope = (
+                mgr.build_state(key) if mgr is not None else nullcontext()
+            )
+            with (
+                dw.draft_tp_context(dw.draft_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                build_scope,
+            ):
+                state = self._nextn_sub.build_adaptive_runtime_state(
+                    speculative_num_steps=k,
+                    speculative_num_draft_tokens=k + 1,
+                )
+            self._nextn_states[k] = state
+            if mgr is not None:
+                mgr.pause_after_build(key)
+            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            log_info_on_rank0(
+                logger,
+                f"Cross-algo bandit rung ('nextn', {k}) built: "
+                f"elapsed={time.perf_counter() - tic:.2f}s, "
+                f"mem={(before_mem - after_mem):.2f}GB"
+                + (
+                    " (paused via graph-memory manager)"
+                    if mgr is not None and mgr.offload_enabled
+                    else " (resident)"
+                ),
             )
 
     def _init_secondary_cuda_graphs(self):
@@ -456,19 +584,25 @@ class CrossAlgoWorker(BaseSpecWorker):
     # ------------------------------------------------------------------
     @property
     def _active_sub(self):
-        if self._schedule_interval is None or self._active_name == "nextn":
+        if not self._switching or self._active_name == "nextn":
             return self._primary
         return self._dflash_sub
 
     @property
     def _active_algo(self) -> SpeculativeAlgorithm:
-        if self._schedule_interval is None:
+        if not self._switching:
             return self._forced_algo
         return (
             SpeculativeAlgorithm.DFLASH
             if self._active_name == "dflash"
             else self._forced_algo
         )
+
+    @property
+    def _active_rung(self) -> tuple:
+        if self._active_name == "dflash":
+            return ("dflash", self._dflash_block_size)
+        return ("nextn", self._active_k)
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -484,10 +618,11 @@ class CrossAlgoWorker(BaseSpecWorker):
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
-        if self._schedule_interval is None:
+        if not self._switching:
             return self._primary.spec_v2_attn_backends
         # Consulted once at boot (needs_cpu_seq_lens is an OR over backends):
-        # both rungs run, so declare the union.
+        # both rungs run, so declare the union. (The auto-mode k states use
+        # the same backend class as the primary; no new union members.)
         return tuple(self._primary.spec_v2_attn_backends) + tuple(
             self._secondary.spec_v2_attn_backends
         )
@@ -500,38 +635,81 @@ class CrossAlgoWorker(BaseSpecWorker):
     # Stage 3: per-batch switching (schedule mode)
     # ------------------------------------------------------------------
     def maybe_switch_rung(self, batch) -> None:
-        """Scheduler pre-decode hook (schedule mode; called BEFORE
+        """Scheduler pre-decode hook (switching modes; called BEFORE
         ScheduleBatch.prepare_for_decode so the algorithm-dispatching prep and
         the KV headroom reservation already run under the incoming rung).
 
-        Rank uniformity: the decision is a pure function of the executed
-        verify-round counter, which is identical on every TP rank -- all
-        ranks' schedulers run the same batch sequence (the accept counts that
-        advance seq_lens are broadcast from rank 0, #50), so no decision
-        broadcast is needed. The stage-4 bandit, whose objective includes
-        per-rank wall time, WILL need rank-0-decides + broadcast (design 4c).
+        Rank uniformity: under SCHEDULE mode the decision is a pure function
+        of the executed verify-round counter, which is identical on every TP
+        rank -- all ranks' schedulers run the same batch sequence (the accept
+        counts that advance seq_lens are broadcast from rank 0, #50), so no
+        decision broadcast is needed. Under AUTO mode the bandit objective
+        includes per-rank wall time, so rank 0 decides and broadcasts the
+        rung id (design 4c, see _maybe_bandit_switch).
         """
-        if self._schedule_interval is None:
+        if not self._switching:
             return
-        if (
-            self._rounds_total - self._rounds_at_switch
-        ) >= self._schedule_interval:
-            self._switch_rung(batch)
+        if self._schedule_interval is not None:
+            if (
+                self._rounds_total - self._rounds_at_switch
+            ) >= self._schedule_interval:
+                self._apply_rung(
+                    batch,
+                    (
+                        ("dflash", self._dflash_block_size)
+                        if self._active_name == "nextn"
+                        else ("nextn", self._primary_k)
+                    ),
+                )
+        else:
+            self._maybe_bandit_switch(batch)
         # Re-stamp unconditionally: freshly (re)built running batches carry
         # the scheduler's boot-time stamp (the primary algorithm).
         batch.spec_algorithm = self._active_algo
 
-    def _switch_rung(self, batch) -> None:
-        old_name = self._active_name
-        new_name = "dflash" if old_name == "nextn" else "nextn"
+    def _maybe_bandit_switch(self, batch) -> None:
+        """Auto mode: every decide_interval executed verify rounds, rank 0
+        runs the bandit and ALL ranks receive the target rung index over the
+        TP CPU (gloo) group.
+
+        The cadence counter (_rounds_total) advances once per executed decode
+        round on every rank identically, so all ranks reach this collective
+        at the same round boundary -- rank uniformity of the CALL. The
+        broadcast VALUE is rank 0's decision; broadcasting the (unchanged)
+        current rung is the explicit no-decision case, so ranks never have to
+        infer "no news" from a missing message. Eager scheduler code, far
+        from any graph-capture region (the stage-3 deadlock lesson)."""
+        if (
+            self._rounds_total - self._last_decide_round
+        ) < self._bandit.cfg.decide_interval_rounds:
+            return
+        self._last_decide_round = self._rounds_total
+        if self.tp_rank == 0:
+            idx = self._rungs.index(self._bandit.decide(self._rounds_total))
+        else:
+            idx = 0  # placeholder; overwritten by the broadcast
+        t = torch.tensor([idx], dtype=torch.int64)
+        torch.distributed.broadcast(
+            t, src=self._decision_src, group=self._decision_cpu_group
+        )
+        new_rung = self._rungs[int(t.item())]
+        if new_rung != self._active_rung:
+            self._apply_rung(batch, new_rung)
+
+    def _apply_rung(self, batch, new_rung: tuple) -> None:
+        old_rung = self._active_rung
+        if new_rung == old_rung:
+            return
+        new_name, new_val = new_rung
+        family_change = new_name != self._active_name
         mr = self._target_worker.model_runner
         tic = time.perf_counter()
 
         # 1) Graph memory: map the incoming rung's paused buffers and pause
         #    the outgoing rung's, BEFORE any pointer swap (synchronizes the
         #    device, so the outgoing rung's in-flight round is quiesced).
-        #    The NEXTN rung is the untagged baseline: activating it maps
-        #    nothing and just pauses the DFLASH tag.
+        #    The boot-k NEXTN rung is the untagged baseline: activating it
+        #    maps nothing and just pauses the outgoing tag.
         ensure_ms = 0.0
         # Only the manager the BOOT created (states built/paused in it); never
         # create one at runtime -- a fresh manager would know no rung tags.
@@ -542,7 +720,7 @@ class CrossAlgoWorker(BaseSpecWorker):
             mgr.ensure_active(
                 self._secondary_rung_key
                 if new_name == "dflash"
-                else self._nextn_rung_key
+                else ("EAGLE", new_val + 1)
             )
             ensure_ms = mgr.last_swap_ms or 0.0
         else:
@@ -552,31 +730,60 @@ class CrossAlgoWorker(BaseSpecWorker):
 
         # 2) Target-verify resource pointer swap (the adaptive-k pattern).
         if new_name == "dflash":
+            # Park the NEXTN draft side on the PRIMARY (untagged, always-
+            # resident) k state FIRST: the dual-prefill draft-extend and the
+            # per-round warm-keeping catch-up run during DFLASH segments too,
+            # and a non-primary k-state's extend backend plans into flash-
+            # infer int-workspaces that belong to that k's now-PAUSED tag
+            # (measured 2026-07-22: BatchPrefillWithKVCachePlan segfault on
+            # the first prefill after a nextn:2 -> dflash switch). The
+            # primary state's resources are permanently mapped -- the exact
+            # stage-3 invariant.
+            if self._active_k != self._primary_k:
+                self._nextn_sub.apply_runtime_state(
+                    self._nextn_states[self._primary_k]
+                )
+                self._active_k = self._primary_k
             mr.attn_backend = self._secondary_target_attn_backend
             mr.decode_cuda_graph_runner = self._secondary_target_graph_runner
             mr.spec_algorithm = self._secondary_algo
             new_shape = self._dflash_shape
         else:
-            mr.attn_backend = self._primary_target_attn_backend
-            mr.decode_cuda_graph_runner = self._primary_target_graph_runner
+            state = self._nextn_states[new_val]
+            # Draft-side + numeric swap through the k-ladder path; no-op when
+            # the worker already runs this k (i.e. on every family switch
+            # back at an unchanged k).
+            self._nextn_sub.apply_runtime_state(state)
+            # Target-side pointers explicitly: apply_runtime_state early-
+            # returns on an unchanged k, and after a DFLASH segment the
+            # target pointers are the DFLASH rung's regardless of k.
+            mr.attn_backend = state.target_attn_backend
+            mr.decode_cuda_graph_runner = state.target_graph_runner
             mr.spec_algorithm = self._forced_algo
-            new_shape = self._nextn_shape
+            new_shape = self._nextn_shape_for_k(new_val)
 
         # 3) Atomically re-point the REAL server args' numeric spec-shape
         #    fields (runtime readers: dflash decode prep block size, eager
         #    verify sizing, metrics). The algorithm STRING and every
         #    max_...-based boot sizing stay fixed.
         apply_runtime_shape(
-            self.server_args, new_shape, f"cross_algo.switch_to_{new_name}"
+            self.server_args,
+            new_shape,
+            f"cross_algo.switch_to_{new_name}_{new_val}",
         )
 
         # 4) Convert the carried draft input to the incoming rung's type.
+        #    Family switches only (within the NEXTN family the
+        #    EagleDraftInput is k-independent: one seed row per request).
         #    Only at round boundaries: the batch is BETWEEN verify rounds
         #    here (the outgoing round's commit is complete; prep for the
         #    incoming round has not run).
-        self._convert_spec_info(batch, new_name)
+        if family_change:
+            self._convert_spec_info(batch, new_name)
 
         self._active_name = new_name
+        if new_name == "nextn":
+            self._active_k = new_val
         self._rounds_at_switch = self._rounds_total
         self._switch_count += 1
         total_ms = (time.perf_counter() - tic) * 1e3
@@ -585,18 +792,28 @@ class CrossAlgoWorker(BaseSpecWorker):
         self._warmkeep_ms_since_switch = 0.0
         self._warmkeep_rounds_since_switch = 0
         logger.info(
-            "Cross-algo switch #%d @round %d: %s -> %s "
+            "Cross-algo switch #%d @round %d: %s:%d -> %s:%d "
             "(ensure_active %.2f ms, total %.2f ms; warm-keep in closing "
             "segment: %.2f ms over %d rounds).",
             self._switch_count,
             self._rounds_total,
-            old_name,
+            old_rung[0],
+            old_rung[1],
             new_name,
+            new_val,
             ensure_ms,
             total_ms,
             wk_ms,
             wk_rounds,
         )
+
+    def _nextn_shape_for_k(self, k: int) -> dict:
+        if k == self._primary_k:
+            return self._nextn_shape
+        shape = dict(self._nextn_shape)
+        shape["speculative_num_steps"] = k
+        shape["speculative_num_draft_tokens"] = k + 1
+        return shape
 
     def _convert_spec_info(self, batch, new_name: str) -> None:
         from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -697,7 +914,10 @@ class CrossAlgoWorker(BaseSpecWorker):
         dsub = self._dflash_sub
         if not dsub._solo_is_shadow:
             bs = batch.batch_size()
-            width = int(self._nextn_shape["speculative_num_draft_tokens"])
+            # Verify width of the round that JUST ran = the active NEXTN k+1
+            # (switches land only at round boundaries before prep, so the
+            # active rung cannot have changed since this batch was prepared).
+            width = self._active_k + 1
             cache_loc = batch.out_cache_loc
             assert (
                 cache_loc is not None and cache_loc.numel() == bs * width
@@ -738,6 +958,7 @@ class CrossAlgoWorker(BaseSpecWorker):
         rec = {
             "round": self._rounds_total,
             "algo": self._active_name,
+            "k": self._active_rung[1],
             "bs": batch.batch_size(),
             "rounds_since_switch": self._rounds_total - self._rounds_at_switch,
             "switch_count": self._switch_count,
@@ -795,7 +1016,7 @@ class CrossAlgoWorker(BaseSpecWorker):
         # decode batches -- re-stamped here so the invariant holds for every
         # batch that reaches a worker).
         batch.spec_algorithm = self._active_algo
-        if self._schedule_interval is None:
+        if not self._switching:
             return self._primary.forward_batch_generation(batch, *args, **kwargs)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -822,6 +1043,25 @@ class CrossAlgoWorker(BaseSpecWorker):
         batch_size: int = 0,
         steps: Optional[int] = None,
     ) -> None:
+        if (
+            self._force == "auto"
+            and steps is not None
+            and num_correct_drafts_per_req
+        ):
+            # Feed the bandit estimator. Attribution by draft-token stride
+            # (steps == stride - 1, recovered by the result processor): the
+            # DFLASH rung's stride is its block size, every other stride is
+            # a NEXTN k rung (collision excluded at argument time). Correct
+            # under overlap: a delayed result is attributed to the rung that
+            # PRODUCED it, not the currently active one.
+            rung = (
+                ("dflash", self._dflash_block_size)
+                if steps + 1 == self._dflash_block_size
+                else ("nextn", int(steps))
+            )
+            self._bandit.observe_result(
+                rung, num_correct_drafts_per_req, batch_size
+            )
         self._primary.on_verify_complete_cpu(
             num_correct_drafts_per_req, batch_size=batch_size, steps=steps
         )

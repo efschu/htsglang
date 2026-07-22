@@ -112,9 +112,8 @@ def cross_algo_enabled(server_args) -> bool:
 def cross_schedule_interval(server_args) -> Optional[int]:
     """Verify-round switch interval under force=schedule:N, else None.
 
-    Non-None is THE gate for every stage-3 per-batch-switching code path
-    (scheduler pre-decode hook, dual capture, per-round warm-keeping); the
-    static force=nextn|dflash modes keep their stage-2 behavior untouched.
+    Stage-3 debug policy only; the runtime-switching code paths themselves
+    are gated by ``cross_switching_active`` (schedule AND auto).
     """
     if not cross_algo_enabled(server_args):
         return None
@@ -124,9 +123,25 @@ def cross_schedule_interval(server_args) -> Optional[int]:
     return int(shapes["schedule_interval"])
 
 
+# The per-batch-switching modes (stage 3 schedule + stage 4 auto). Everything
+# these modes share -- dual hidden capture, dual prefill, per-round
+# warm-keeping, the scheduler pre-decode switch hook, DFLASH request
+# validation for every request -- gates on membership here; the static
+# force=nextn|dflash modes keep their stage-2 behavior untouched.
+SWITCHING_MODES = ("schedule", "auto")
+
+
+def cross_switching_active(server_args) -> bool:
+    """True when the active-rung policy switches rungs at runtime."""
+    if not cross_algo_enabled(server_args):
+        return False
+    shapes = getattr(server_args, CROSS_SHAPES_ATTR, None)
+    return shapes is not None and shapes.get("force") in SWITCHING_MODES
+
+
 def parse_cross_force(force: Optional[str]) -> tuple[str, Optional[int]]:
     """Parse --speculative-cross-algorithm-force into (mode, interval)."""
-    if force in ("nextn", "dflash"):
+    if force in ("nextn", "dflash", "auto"):
         return force, None
     if isinstance(force, str) and force.startswith("schedule:"):
         try:
@@ -140,8 +155,9 @@ def parse_cross_force(force: Optional[str]) -> tuple[str, Optional[int]]:
             )
         return "schedule", interval
     _fail(
-        "--speculative-cross-algorithm-force must be 'nextn', 'dflash', or "
-        f"'schedule:N' (switch every N verify rounds); got {force!r}."
+        "--speculative-cross-algorithm-force must be 'nextn', 'dflash', "
+        "'schedule:N' (switch every N verify rounds), or 'auto' (stage-4 "
+        f"acceptance-driven bandit); got {force!r}."
     )
 
 
@@ -296,8 +312,9 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
         # controller in the copy could not initialize. The schedule mode
         # (stage 3) ALSO builds the NEXTN rung without adaptive: the
         # k-controller's _activate would pause the mapped DFLASH rung tag
-        # mid-segment (use-after-unmap), and the stage-4 bandit replaces the
-        # k-controller with the rung objective anyway (design 4b).
+        # mid-segment (use-after-unmap). The auto mode (stage 4) replaces
+        # the k-controller entirely: the bandit runs the NEXTN k rungs as
+        # its own arms (design 4b), so adaptive stays off there too.
         "speculative_adaptive": user_adaptive if force == "nextn" else False,
         "speculative_adaptive_config": (
             user_adaptive_config if force == "nextn" else None
@@ -308,14 +325,47 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
     if force != "nextn" and user_adaptive:
         logger.info(
             "--speculative-cross-algorithm force=%s: the NEXTN rung is built "
-            "without --speculative-adaptive (single k=%d state); see "
-            "cross_algo_utils for the rationale.",
+            "without --speculative-adaptive (%s); see cross_algo_utils for "
+            "the rationale.",
             force,
-            eagle_steps,
+            (
+                "the stage-4 bandit owns the k rungs"
+                if force == "auto"
+                else f"single k={eagle_steps} state"
+            ),
         )
 
-    # schedule mode: the NEXTN shape is the PRIMARY (global) shape. This is
-    # load-bearing, not a taste choice: scheduler.spec_algorithm and the
+    # auto mode (stage 4): the NEXTN k rungs are bandit ARMS. The k set comes
+    # from the user's --speculative-adaptive-config (positive candidate steps
+    # union; the built-in default yields [1, 2, 3], the high-accept profile
+    # [1..5]); the boot k (primary rung) is always included.
+    bandit_ks: Optional[list] = None
+    if force == "auto":
+        from sglang.srt.speculative.adaptive_spec_params import (
+            resolve_candidate_steps_from_config,
+        )
+
+        bandit_ks = sorted(
+            {
+                s
+                for s in resolve_candidate_steps_from_config(
+                    cfg_path=user_adaptive_config, algorithm="EAGLE"
+                )
+                if s >= 1
+            }
+            | {eagle_steps}
+        )
+        dflash_tokens = int(dflash_shape["speculative_num_draft_tokens"])
+        if any(k + 1 == dflash_tokens for k in bandit_ks):
+            _fail(
+                f"bandit k set {bandit_ks} contains k={dflash_tokens - 1}, "
+                "whose draft-token stride collides with the DFLASH block "
+                f"size {dflash_tokens}; verify results could not be "
+                "attributed to a unique rung."
+            )
+
+    # schedule/auto mode: the NEXTN shape is the PRIMARY (global) shape. This
+    # is load-bearing, not a taste choice: scheduler.spec_algorithm and the
     # FutureMap relay type derive from the global speculative_algorithm, and
     # only the EAGLE type relays topk/hidden draft seeds -- the union both
     # rungs need. The numeric shape fields are re-pointed at the active rung
@@ -334,13 +384,17 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
     # (not a dataclass field) on purpose: it is derived state, survives
     # pickling to the scheduler processes via __dict__, and stays off the
     # CLI surface. get_cross_shapes() raises loudly if it went missing.
-    # schedule mode additionally stashes BOTH shapes + the interval so the
-    # meta-worker can swap the numeric fields per switch.
+    # schedule/auto mode additionally stashes BOTH shapes (+ the interval /
+    # the bandit k set) so the meta-worker can swap the numeric fields per
+    # switch.
     stash: Dict[str, Any] = {other_name: other_shape, "force": force}
-    if force == "schedule":
+    if force in SWITCHING_MODES:
         stash["nextn"] = eagle_shape
         stash["dflash"] = dflash_shape
-        stash["schedule_interval"] = schedule_interval
+        if force == "schedule":
+            stash["schedule_interval"] = schedule_interval
+        else:
+            stash["bandit_ks"] = bandit_ks
     object.__setattr__(server_args, CROSS_SHAPES_ATTR, stash)
     logger.info(
         "Cross-algorithm speculative decoding: force=%s%s; primary rung=%s; "
@@ -350,7 +404,7 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
         (
             f" (switch every {schedule_interval} verify rounds)"
             if force == "schedule"
-            else ""
+            else (f" (bandit arms: NEXTN k={bandit_ks} + DFLASH)" if force == "auto" else "")
         ),
         "nextn" if force != "dflash" else "dflash",
         other_name,

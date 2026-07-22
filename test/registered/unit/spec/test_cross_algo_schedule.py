@@ -33,9 +33,13 @@ class TestParseCrossForce(CustomTestCase):
         self.assertEqual(parse_cross_force("schedule:64"), ("schedule", 64))
         self.assertEqual(parse_cross_force("schedule:1"), ("schedule", 1))
 
+    def test_auto_mode(self):
+        self.assertEqual(parse_cross_force("auto"), ("auto", None))
+
     def test_invalid_values_raise(self):
         for bad in [None, "", "foo", "schedule", "schedule:", "schedule:0",
-                    "schedule:-3", "schedule:x", "SCHEDULE:4"]:
+                    "schedule:-3", "schedule:x", "SCHEDULE:4", "AUTO",
+                    "auto:1"]:
             with self.subTest(force=bad):
                 with self.assertRaises(ValueError):
                     parse_cross_force(bad)
@@ -98,8 +102,12 @@ def _bare_worker():
     from sglang.srt.speculative.cross_algo_worker import CrossAlgoWorker
 
     w = object.__new__(CrossAlgoWorker)
+    w._switching = True
     w._schedule_interval = 4
     w._active_name = "nextn"
+    w._primary_k = 3
+    w._active_k = 3
+    w._dflash_block_size = 16
     w._rounds_total = 0
     w._rounds_at_switch = 0
     w._switch_count = 0
@@ -113,21 +121,29 @@ class TestScheduleDecision(CustomTestCase):
         w = _bare_worker()
         switches = []
 
-        def fake_switch(batch):
-            switches.append(w._rounds_total)
-            w._active_name = "dflash" if w._active_name == "nextn" else "nextn"
+        def fake_switch(batch, rung):
+            switches.append((w._rounds_total, rung))
+            w._active_name = rung[0]
             w._rounds_at_switch = w._rounds_total
 
-        w._switch_rung = fake_switch
+        w._apply_rung = fake_switch
         batch = SimpleNamespace(spec_algorithm=None)
         for _ in range(20):
             w.maybe_switch_rung(batch)  # scheduler hook (pre-round)
             w._rounds_total += 1  # worker forward (the round runs)
-        self.assertEqual(switches, [4, 8, 12, 16])
+        self.assertEqual(
+            switches,
+            [
+                (4, ("dflash", 16)),
+                (8, ("nextn", 3)),
+                (12, ("dflash", 16)),
+                (16, ("nextn", 3)),
+            ],
+        )
 
     def test_restamps_active_algorithm_every_call(self):
         w = _bare_worker()
-        w._switch_rung = lambda batch: None
+        w._apply_rung = lambda batch, rung: None
         batch = SimpleNamespace(spec_algorithm=None)
         w.maybe_switch_rung(batch)
         self.assertEqual(batch.spec_algorithm, SpeculativeAlgorithm.EAGLE)
@@ -137,17 +153,32 @@ class TestScheduleDecision(CustomTestCase):
 
     def test_static_force_mode_is_inert(self):
         w = _bare_worker()
+        w._switching = False
         w._schedule_interval = None
         w._rounds_total = 100
 
-        def boom(batch):
+        def boom(batch, rung):
             raise AssertionError("must not switch in static force mode")
 
-        w._switch_rung = boom
+        w._apply_rung = boom
         batch = SimpleNamespace(spec_algorithm="sentinel")
         w.maybe_switch_rung(batch)
         # Static mode: no switch AND no restamp (stage-2 path untouched).
         self.assertEqual(batch.spec_algorithm, "sentinel")
+
+    def test_apply_rung_same_rung_is_a_no_op(self):
+        """Broadcast fallback: receiving one's own current rung id (rank 0
+        had no new decision) must not touch any switch mechanics."""
+        w = _bare_worker()
+
+        def boom(*a, **k):
+            raise AssertionError("no switch mechanics may run")
+
+        w._convert_spec_info = boom
+        # _apply_rung must return before touching graph memory / pointers.
+        w._apply_rung(SimpleNamespace(), ("nextn", 3))
+        self.assertEqual(w._switch_count, 0)
+        self.assertEqual(w._active_name, "nextn")
 
 
 class TestConvertSpecInfo(CustomTestCase):

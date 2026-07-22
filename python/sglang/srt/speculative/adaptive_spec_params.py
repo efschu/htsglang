@@ -464,21 +464,25 @@ class AdaptiveStepSlot:
 
 
 class RungMetrics:
-    """Live per-rung reward measurements (T156 stage-4 preparation).
+    """Live per-rung reward measurements (T156 stage 4).
 
-    Tracks, per candidate step count ("rung"), an EMA of
+    Tracks, per rung key, an EMA of
     - accepted tokens per verify round (accept_len incl. the bonus token), and
     - decode-round wall time attributed to that rung,
     i.e. the two factors of the stage-4 bandit objective
     ``reward(r) = E[accepted_tokens_per_verify(r)] / E[round_seconds(r)]``.
 
+    The rung key is any hashable: the stage-1 k-ladder feeds plain step ints,
+    the stage-4 cross-algorithm bandit feeds ``(algo, k)`` tuples. Keys must
+    be homogeneous per instance (snapshot() sorts them).
+
     DETERMINISM WARNING (#50): ``round_s_ema`` is per-rank WALL CLOCK and is
-    NOT rank-uniform. In stage 1 it is OBSERVABILITY-ONLY and must never feed
-    the step decision — every rank recomputes that decision independently
-    from the rank-0-broadcast accept counts, and a timing-dependent input
-    would make the argmax diverge across ranks (graph desync -> NCCL hang).
-    Before any timing term enters the decision (stage 4), the decision must
-    move to rank 0 + broadcast of the chosen rung id (see t156 design 4c).
+    NOT rank-uniform. In the stage-1 k-ladder it is OBSERVABILITY-ONLY and
+    must never feed the step decision — every rank recomputes that decision
+    independently from the rank-0-broadcast accept counts, and a
+    timing-dependent input would make the argmax diverge across ranks (graph
+    desync -> NCCL hang). The stage-4 bandit consumes ``reward()`` on RANK 0
+    ONLY and broadcasts the chosen rung id (design 4c, cross_algo_worker).
     """
 
     # Slow EMA: rung residence is dwell-limited (>= ~2 s), so per-rung samples
@@ -491,29 +495,39 @@ class RungMetrics:
     LOG_EVERY_ROUNDS = 2000
 
     def __init__(self):
-        # steps -> [accept_len_ema, accept_samples, round_s_ema, time_samples]
-        self._per_rung: dict[int, list] = {}
+        # rung key -> [accept_len_ema, accept_samples, round_s_ema, time_samples]
+        self._per_rung: dict = {}
         self._last_ts: float | None = None
         self._last_batch_size: int | None = None
         self._round_count = 0
 
     def observe(
         self,
-        steps: int,
+        steps,
         num_correct_drafts_per_req: list[int],
         batch_size: int,
         now: float | None = None,
+        record: bool = True,
     ) -> None:
         """Attribute one verify result (and its round duration) to *steps*.
 
-        *steps* must be the step count that PRODUCED the result (the caller
-        derives it from the result's draft-token stride), not the currently
-        active one: under overlap scheduling the result is processed after
-        the worker may already have switched rungs.
+        *steps* must be the rung that PRODUCED the result (the caller derives
+        it from the result's draft-token stride), not the currently active
+        one: under overlap scheduling the result is processed after the
+        worker may already have switched rungs.
+
+        ``record=False`` (stage-4 burn-in: the first rounds after a rung
+        switch are systematically atypical) advances the round-duration
+        timestamp chain WITHOUT updating any EMA — skipping the call entirely
+        would make the next recorded duration span multiple rounds.
         """
         if not num_correct_drafts_per_req:
             return
         now = time.monotonic() if now is None else now
+        if not record:
+            self._last_ts = now
+            self._last_batch_size = batch_size
+            return
         m = self._per_rung.setdefault(steps, [0.0, 0, 0.0, 0])
 
         accept_len = 1.0 + sum(num_correct_drafts_per_req) / len(
@@ -541,7 +555,20 @@ class RungMetrics:
         if self._round_count % self.LOG_EVERY_ROUNDS == 0:
             log_info_on_rank0(logger, f"Adaptive rung metrics: {self.snapshot()}")
 
-    def snapshot(self) -> dict[int, dict[str, float | int]]:
+    def reward(self, steps, min_time_samples: int = 3) -> float | None:
+        """The stage-4 objective for one rung:
+        EMA[accepted tokens per verify round] / EMA[round seconds].
+
+        None until the rung has accept data AND at least *min_time_samples*
+        round-duration samples (a single dt gap is too noisy to rank on).
+        RANK-LOCAL wall clock — consume on rank 0 only (see class docstring).
+        """
+        m = self._per_rung.get(steps)
+        if m is None or m[1] == 0 or m[3] < min_time_samples or m[2] <= 0.0:
+            return None
+        return m[0] / m[2]
+
+    def snapshot(self) -> dict:
         """Per-rung metric snapshot for logging / the stage-4 objective."""
         return {
             steps: {

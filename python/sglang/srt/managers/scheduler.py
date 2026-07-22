@@ -350,15 +350,13 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        # T156 stage 3: per-batch cross-algorithm switching (schedule mode).
-        # True => decode batches consult the meta-worker's switch hook before
-        # prepare_for_decode, and DFLASH request validation applies (any
-        # request may hit a DFLASH segment).
-        from sglang.srt.speculative.cross_algo_utils import cross_schedule_interval
+        # T156 stage 3/4: per-batch cross-algorithm switching (schedule and
+        # auto/bandit modes). True => decode batches consult the meta-worker's
+        # switch hook before prepare_for_decode, and DFLASH request validation
+        # applies (any request may hit a DFLASH segment).
+        from sglang.srt.speculative.cross_algo_utils import cross_switching_active
 
-        self._cross_schedule_mode = (
-            cross_schedule_interval(server_args) is not None
-        )
+        self._cross_schedule_mode = cross_switching_active(server_args)
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None

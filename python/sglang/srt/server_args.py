@@ -2281,8 +2281,13 @@ class ServerArgs:
             "'schedule:N' (T156 stage 3 debug policy): start on the NEXTN "
             "rung and switch the active rung every N verify rounds, at round "
             "boundaries only -- exercises the per-batch switching mechanics "
-            "with a deterministic, rank-uniform plan (the stage-4 bandit "
-            "replaces the fixed plan with a reward objective).",
+            "with a deterministic, rank-uniform plan. 'auto' (T156 stage 4): "
+            "acceptance-driven bandit over the rungs {NEXTN k in the "
+            "adaptive-config candidate set, DFLASH}: per rung it tracks "
+            "EMA[accepted tokens/verify round] / EMA[round seconds] and "
+            "switches to the argmax at round boundaries (rank 0 decides, "
+            "the rung id is broadcast; dwell/deadzone/burn-in/probing guard "
+            "against flapping -- tunables via SGLANG_CROSS_BANDIT_*).",
         ),
     ] = None
     speculative_adaptive_graph_memory: A[
