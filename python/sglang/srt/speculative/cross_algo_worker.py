@@ -238,29 +238,69 @@ class CrossAlgoWorker(BaseSpecWorker):
             self._ctx_gate_threshold = gate.get("threshold")
             self._ctx_gate_near_frac = float(gate.get("near_frac", 0.8))
             self._ctx_gate_last_ctx = 0
+            self._policy_has_auto = False
 
         if self._force == "policy":
-            # Deterministic ctx->rung table (T156 follow-up): no bandit, no
-            # probing, no broadcast -- see _maybe_policy_switch.
+            from sglang.srt.speculative.cross_algo_utils import (
+                POLICY_K_AUTO,
+                policy_rung_str,
+            )
+
+            # Deterministic ctx->rung table (T156 follow-up): no bandit
+            # DECISIONS, no probing -- see _maybe_policy_switch. A
+            # 'nextn:auto' stage resolves its k at runtime via the task-A
+            # analytic model (rank 0 + broadcast, wall-clock input); pinned
+            # stages stay broadcast-free.
             self._policy_table = [
                 (int(start), (str(r[0]), int(r[1])))
                 for start, r in shapes["policy_table"]
             ]
             self._policy_fallback_logged = False
+            self._policy_has_auto = any(
+                fam == "nextn" and val == POLICY_K_AUTO
+                for _s, (fam, val) in self._policy_table
+            )
+            if self._policy_has_auto:
+                from sglang.srt.speculative.cross_algo_bandit import (
+                    CrossAlgoBandit,
+                )
+
+                # Estimator container ONLY (accept model + rung metrics fed
+                # via on_verify_complete_cpu); decide() is never called --
+                # the table owns the family, _policy_pick_k owns the k.
+                self._bandit = CrossAlgoBandit(
+                    rungs=self._rungs,
+                    initial=("nextn", self._primary_k),
+                    trace_path=None,
+                )
+                self._policy_last_k_decide = 0
+                self._policy_last_k_change = 0
             log_info_on_rank0(
                 logger,
                 "Cross-algo drafter policy (force=policy): "
                 + ", ".join(
-                    f"ctx>={start}: {fam}:{val}"
-                    for start, (fam, val) in self._policy_table
+                    f"ctx>={start}: {policy_rung_str(rung)}"
+                    for start, rung in self._policy_table
                 )
                 + f"; ctx gate as safety filter: {self._ctx_gate_threshold}.",
             )
 
+        if self._force == "auto" or (
+            self._force == "policy" and self._policy_has_auto
+        ):
+            # Rank-0-decides + broadcast infrastructure (design 4c) --
+            # needed by the bandit (auto) and by the analytic-k resolution
+            # of 'nextn:auto' policy stages (rank-local wall clock either
+            # way). Pinned-k policy tables never reach it.
+            from sglang.srt.distributed import get_tp_group
+
+            coord = get_tp_group()
+            self._decision_cpu_group = coord.cpu_group
+            self._decision_src = coord.ranks[0]
+
         if self._force == "auto":
             import os
 
-            from sglang.srt.distributed import get_tp_group
             from sglang.srt.speculative.cross_algo_bandit import CrossAlgoBandit
 
             trace = os.environ.get("SGLANG_CROSS_BANDIT_TRACE")
@@ -270,17 +310,12 @@ class CrossAlgoWorker(BaseSpecWorker):
                 trace_path=(trace if (trace and tp_rank == 0) else None),
             )
             self._last_decide_round = 0
-            # Rank-0-decides + broadcast (design 4c): the objective's round-
-            # duration term is rank-local WALL CLOCK, so -- unlike the
-            # stage-1 k-ladder and the stage-3 schedule plan -- the decision
-            # CANNOT be recomputed identically per rank. One int64 over the
-            # TP CPU (gloo) group at a rank-uniform round boundary, in eager
-            # scheduler code (never inside a graph-capture region).
-            coord = get_tp_group()
-            self._decision_cpu_group = coord.cpu_group
-            # Pure single-node TP is enforced by normalize_cross_algorithm_
-            # args, so the group's first GLOBAL rank is TP rank 0.
-            self._decision_src = coord.ranks[0]
+            # Task B: set on every rank when a prefill (new request) runs;
+            # consumed at the next round boundary -- pulls the decision
+            # point forward and requests a boundary burst from the bandit.
+            # Rank-uniform: prefill batches are part of the identical batch
+            # sequence every rank executes.
+            self._boundary_pending = False
             log_info_on_rank0(
                 logger,
                 f"Cross-algo bandit (stage 4): rungs={self._rungs}, "
@@ -734,14 +769,21 @@ class CrossAlgoWorker(BaseSpecWorker):
         dflash_eligible = True
         if gate_on:
             dflash_eligible = self._dflash_ctx_eligible(batch)
+        # Task B: a request boundary pulls the decision point forward (the
+        # flag is rank-uniform, so the collective call stays rank-uniform)
+        # and is passed into decide() as the burst trigger.
+        boundary = self._boundary_pending and bool(
+            self._bandit.cfg.boundary_burst
+        )
         due = (
             self._rounds_total - self._last_decide_round
         ) >= self._bandit.cfg.decide_interval_rounds
         gate_evict_now = (
             gate_on and not dflash_eligible and self._active_name == "dflash"
         )
-        if not due and not gate_evict_now:
+        if not due and not gate_evict_now and not boundary:
             return
+        self._boundary_pending = False
         self._last_decide_round = self._rounds_total
         if self.tp_rank == 0:
             eligible = None
@@ -756,7 +798,10 @@ class CrossAlgoWorker(BaseSpecWorker):
                 )
             idx = self._rungs.index(
                 self._bandit.decide(
-                    self._rounds_total, eligible=eligible, gate_note=gate_note
+                    self._rounds_total,
+                    eligible=eligible,
+                    gate_note=gate_note,
+                    request_boundary=boundary,
                 )
             )
         else:
@@ -818,8 +863,18 @@ class CrossAlgoWorker(BaseSpecWorker):
         for the self-correcting bandit) and the default policy switch point
         (2 * window = drafter training ctx: forced assignment without a
         corrective) are deliberately different -- see
-        cross_algo_utils.derive_policy_switch_ctx."""
-        from sglang.srt.speculative.cross_algo_utils import policy_select
+        cross_algo_utils.derive_policy_switch_ctx.
+
+        'nextn:auto' stages (task A x C): the FAMILY is still the
+        deterministic table verdict, but the k inside the family comes
+        from the analytic accept model, whose round-time input is
+        rank-local wall clock -- that single sub-decision runs rank-0 +
+        broadcast (_policy_auto_k_switch); the pinned-stage path stays
+        collective-free."""
+        from sglang.srt.speculative.cross_algo_utils import (
+            POLICY_K_AUTO,
+            policy_select,
+        )
 
         ctx_and_remaining = self._batch_ctx_and_remaining(batch)
         target, max_ctx, fell_back = policy_select(
@@ -843,8 +898,69 @@ class CrossAlgoWorker(BaseSpecWorker):
                 )
         else:
             self._policy_fallback_logged = False
+        if target[0] == "nextn" and target[1] == POLICY_K_AUTO:
+            self._policy_auto_k_switch(batch)
+            return
         if target != self._active_rung:
             self._apply_rung(batch, target)
+
+    def _policy_auto_k_switch(self, batch) -> None:
+        """Resolve a 'nextn:auto' policy stage to a concrete k and apply it.
+
+        Family membership is already decided (deterministically) by the
+        table; only WHICH k runs is open. k* comes from the task-A analytic
+        model over the shared accept stream -- its round-time term is
+        rank-local WALL CLOCK, so rank 0 resolves and the rung id is
+        broadcast over the TP CPU group (the auto-mode collective pattern,
+        design 4c). Cadence is rank-uniform: on ENTERING the stage (family
+        change pending) and every decide_interval rounds within it; the
+        task-A k dwell + margin govern k changes (rank-0 state, consistent
+        because every applied change is broadcast)."""
+        entering = self._active_name != "nextn"
+        cfg = self._bandit.cfg
+        due = (
+            self._rounds_total - self._policy_last_k_decide
+        ) >= cfg.decide_interval_rounds
+        if not entering and not due:
+            return
+        self._policy_last_k_decide = self._rounds_total
+        if self.tp_rank == 0:
+            idx = self._rungs.index(("nextn", self._policy_pick_k()))
+        else:
+            idx = 0  # placeholder; overwritten by the broadcast
+        t = torch.tensor([idx], dtype=torch.int64)
+        torch.distributed.broadcast(
+            t, src=self._decision_src, group=self._decision_cpu_group
+        )
+        new_rung = self._rungs[int(t.item())]
+        if new_rung != self._active_rung:
+            if not entering:
+                self._policy_last_k_change = self._rounds_total
+            self._apply_rung(batch, new_rung)
+
+    def _policy_pick_k(self) -> int:
+        """Rank 0 only: the k for the active 'nextn:auto' stage -- k* under
+        the task-A dwell + margin governance; the boot k until the model
+        has both accept and round-time data."""
+        cfg = self._bandit.cfg
+        model = self._bandit.accept_model
+        cur_k = self._active_k if self._active_name == "nextn" else None
+        k_star, k_scores = (
+            model.k_star(self._bandit.metrics, cfg.min_time_samples)
+            if model is not None
+            else (None, {})
+        )
+        if k_star is None:
+            return cur_k if cur_k is not None else self._primary_k
+        if cur_k is None or cur_k not in k_scores:
+            return k_star
+        if (
+            self._rounds_total - self._policy_last_k_change
+        ) < cfg.k_dwell_rounds:
+            return cur_k
+        if k_scores[k_star] > k_scores[cur_k] * (1.0 + cfg.k_switch_margin):
+            return k_star
+        return cur_k
 
     def _apply_rung(self, batch, new_rung: tuple) -> None:
         old_rung = self._active_rung
@@ -1170,6 +1286,10 @@ class CrossAlgoWorker(BaseSpecWorker):
             return self._primary.forward_batch_generation(batch, *args, **kwargs)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if self._force == "auto":
+                # Task B: note the request boundary; consumed at the next
+                # round boundary by _maybe_bandit_switch.
+                self._boundary_pending = True
             return self._dual_prefill(batch, *args, **kwargs)
 
         self._rounds_total += 1
@@ -1194,7 +1314,10 @@ class CrossAlgoWorker(BaseSpecWorker):
         steps: Optional[int] = None,
     ) -> None:
         if (
-            self._force == "auto"
+            (
+                self._force == "auto"
+                or (self._force == "policy" and self._policy_has_auto)
+            )
             and steps is not None
             and num_correct_drafts_per_req
         ):

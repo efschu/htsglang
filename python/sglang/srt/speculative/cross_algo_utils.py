@@ -364,6 +364,11 @@ POLICY_CTX_FACTOR_ENV = "SGLANG_CROSS_POLICY_CTX_FACTOR"
 # Default policy switch point = factor * sliding_window = the drafter's
 # TRAINING context (z-lab recipe: trained at ctx = 2 * window).
 DEFAULT_POLICY_CTX_FACTOR = 2.0
+# Sentinel k of a 'nextn:auto' policy stage: the k is resolved at runtime
+# by the task-A analytic model (NextnAcceptModel k*), falling back to the
+# boot k until the model has data. 0 is safe as a sentinel: real k arms
+# are >= 1 (enforced at table validation).
+POLICY_K_AUTO = 0
 
 
 def derive_policy_switch_ctx(
@@ -431,10 +436,11 @@ def resolve_drafter_policy_table(
     """Resolve --speculative-drafter-policy into a validated table.
 
     ``raw`` None or 'auto': the derived two-stage default -- the gate-gated
-    rung (DFLASH) from ctx 0, the primary NEXTN rung from the drafter's
+    rung (DFLASH) from ctx 0, NEXTN with the ANALYTIC k (task A;
+    'nextn:auto', boot k until the model has data) from the drafter's
     training context (derive_policy_switch_ctx). Explicit: comma-separated
     'start_ctx:family:value' stages; every referenced rung must exist in
-    the configured arm set (NEXTN k in *arm_ks*, DFLASH block ==
+    the configured arm set (NEXTN k in *arm_ks* or 'auto', DFLASH block ==
     *dflash_block*), stage starts strictly ascending, first stage at 0.
     Hard errors, no silent fallback.
     """
@@ -449,7 +455,7 @@ def resolve_drafter_policy_table(
         return (
             [
                 (0, ("dflash", int(dflash_block))),
-                (int(switch_ctx), ("nextn", int(primary_k))),
+                (int(switch_ctx), ("nextn", POLICY_K_AUTO)),
             ],
             f"auto: {source}",
         )
@@ -462,18 +468,20 @@ def resolve_drafter_policy_table(
         if len(parts) != 3:
             _fail(
                 f"--speculative-drafter-policy entry {entry!r}: expected "
-                "'start_ctx:family:value', e.g. '0:dflash:16' or "
-                "'4096:nextn:3'."
+                "'start_ctx:family:value', e.g. '0:dflash:16', "
+                "'4096:nextn:3' or '4096:nextn:auto'."
             )
+        family = parts[1].strip().lower()
+        raw_val = parts[2].strip().lower()
+        nextn_auto = family == "nextn" and raw_val == "auto"
         try:
             start = int(parts[0])
-            val = int(parts[2])
+            val = POLICY_K_AUTO if nextn_auto else int(parts[2])
         except ValueError:
             _fail(
                 f"--speculative-drafter-policy entry {entry!r}: start_ctx "
-                "and value must be integers."
+                "and value must be integers ('auto' only as a nextn k)."
             )
-        family = parts[1].strip().lower()
         if family not in ("nextn", "dflash"):
             _fail(
                 f"--speculative-drafter-policy entry {entry!r}: family must "
@@ -490,7 +498,7 @@ def resolve_drafter_policy_table(
                 f"DFLASH rung has block size {dflash_block}; dflash:{val} "
                 "is not a configured arm."
             )
-        if family == "nextn" and val not in arm_ks:
+        if family == "nextn" and not nextn_auto and val not in arm_ks:
             _fail(
                 f"--speculative-drafter-policy entry {entry!r}: nextn k={val} "
                 f"is not in the configured arm set {sorted(arm_ks)} "
@@ -510,6 +518,13 @@ def resolve_drafter_policy_table(
                 f"strictly ascending; got {a} followed by {b}."
             )
     return table, "explicit --speculative-drafter-policy"
+
+
+def policy_rung_str(rung) -> str:
+    fam, val = rung
+    if fam == "nextn" and val == POLICY_K_AUTO:
+        return "nextn:auto"
+    return f"{fam}:{val}"
 
 
 def policy_lookup_index(table: PolicyTable, max_ctx: int) -> int:
@@ -782,11 +797,18 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
             )
             # Build only the NEXTN k states the table references (+ the boot
             # k, always the resident baseline) -- unreferenced candidate ks
-            # would cost boot time and VRAM for nothing.
-            bandit_ks = sorted(
-                {eagle_steps}
-                | {v for _s, (fam, v) in policy_table if fam == "nextn"}
+            # would cost boot time and VRAM for nothing. A 'nextn:auto'
+            # stage needs the FULL candidate set: the analytic k* roams
+            # over all of it.
+            has_auto_stage = any(
+                fam == "nextn" and v == POLICY_K_AUTO
+                for _s, (fam, v) in policy_table
             )
+            if not has_auto_stage:
+                bandit_ks = sorted(
+                    {eagle_steps}
+                    | {v for _s, (fam, v) in policy_table if fam == "nextn"}
+                )
         if any(k + 1 == dflash_tokens for k in bandit_ks):
             _fail(
                 f"bandit k set {bandit_ks} contains k={dflash_tokens - 1}, "
@@ -847,8 +869,8 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
                     "Cross-algo drafter policy (%s): %s.",
                     policy_source,
                     ", ".join(
-                        f"ctx>={start}: {fam}:{val}"
-                        for start, (fam, val) in policy_table
+                        f"ctx>={start}: {policy_rung_str(rung)}"
+                        for start, rung in policy_table
                     ),
                 )
     object.__setattr__(server_args, CROSS_SHAPES_ATTR, stash)

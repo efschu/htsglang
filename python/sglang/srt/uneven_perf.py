@@ -529,6 +529,12 @@ def measured_kv_budget_fingerprint_fields(server_args) -> dict:
         ),
         "spec_adaptive": sa.speculative_adaptive,
         "spec_adaptive_config": sa.speculative_adaptive_config,
+        # force=policy: the drafter-policy table decides WHICH NEXTN k
+        # states get built (only table-referenced ks), so different tables
+        # have different boot footprints -- corrections are not
+        # transferable between them (same role spec_adaptive_config plays
+        # for the auto mode's bandit k set).
+        "spec_drafter_policy": getattr(sa, "speculative_drafter_policy", None),
         # RAW draft-token count, deliberately NOT max_speculative_num_draft_
         # tokens: that is a cached_property which resolves the cross-rung
         # shapes — evaluating it at parse time (before the speculative hook

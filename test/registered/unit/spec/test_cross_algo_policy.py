@@ -99,13 +99,31 @@ class TestSwitchCtxDerivation(CustomTestCase):
 
 class TestTableResolution(CustomTestCase):
     def test_auto_default_two_stages(self):
+        # The derived default: DFLASH below the training ctx, nextn:auto
+        # (task-A analytic k, sentinel 0) above.
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "config.json"), "w") as f:
                 json.dump({"sliding_window": 2048}, f)
             for raw in (None, "auto", " AUTO "):
                 table, source = _resolve(raw, draft_model_path=d)
-                self.assertEqual(table, TWO_STAGE)
+                self.assertEqual(
+                    table, [(0, DFLASH16), (4096, ("nextn", 0))]
+                )
                 self.assertIn("auto", source)
+
+    def test_explicit_nextn_auto_stage(self):
+        table, _ = _resolve("0:dflash:16,4096:nextn:auto")
+        self.assertEqual(table, [(0, DFLASH16), (4096, ("nextn", 0))])
+        # 'auto' is a nextn-only value.
+        with self.assertRaises(ValueError):
+            _resolve("0:dflash:auto,4096:nextn:3")
+
+    def test_policy_select_passes_auto_stage_through(self):
+        from sglang.srt.speculative.cross_algo_utils import policy_select
+
+        table = [(0, DFLASH16), (4096, ("nextn", 0))]
+        rung, _, _ = policy_select(table, [(5000, 64)], 8192, 0.8, NEXTN3)
+        self.assertEqual(rung, ("nextn", 0))  # resolved later by the worker
 
     def test_auto_without_derivable_switch_point_fails(self):
         with self.assertRaises(ValueError):

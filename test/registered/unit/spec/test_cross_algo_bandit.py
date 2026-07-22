@@ -13,10 +13,12 @@ import os
 import tempfile
 import unittest
 
+from sglang.srt.speculative.adaptive_spec_params import RungMetrics
 from sglang.srt.speculative.cross_algo_bandit import (
     ENV_PREFIX,
     CrossAlgoBandit,
     CrossBanditConfig,
+    NextnAcceptModel,
 )
 from sglang.srt.speculative.cross_algo_utils import (
     ctx_gate_eligible,
@@ -272,7 +274,10 @@ class TestCtxGateDecide(CustomTestCase):
         self.assertIsNotNone(b._probe_until)
 
     def test_ineligible_stale_rung_not_probed(self):
-        b = _bandit(rungs=RUNGS)
+        # Legacy (analytic_k=0) config: with the task-A analytic model on,
+        # nextn arms are never probe candidates, so the "eligible stale
+        # rung inherits the probe slot" scenario needs the legacy mode.
+        b = _bandit(rungs=RUNGS, cfg=_cfg(analytic_k=0))
         _feed(b, NEXTN3, accept=3, rounds=10, dt=0.040)
         _feed(b, NEXTN1, accept=3, rounds=10, dt=0.041, t0=100.0)
         _feed(b, DFLASH, accept=3, rounds=10, dt=0.041, t0=200.0)
@@ -468,6 +473,223 @@ class TestCtxGateDerivation(CustomTestCase):
         for bad in ("0", "-5", "5.5", "on", ""):
             with self.assertRaises(ValueError):
                 parse_ctx_gate_value(bad)
+
+
+class TestNextnAcceptModel(CustomTestCase):
+    """Task A: the p_i estimator math against synthetic accept sequences,
+    the round-time model, and k* selection."""
+
+    def _metrics(self, per_k_dt):
+        """RungMetrics with a constant round duration per nextn k."""
+        m = RungMetrics()
+        for k, dt in per_k_dt.items():
+            t = 0.0
+            for _ in range(6):
+                t += dt
+                m.observe(("nextn", k), [1], 1, now=t)
+        return m
+
+    def test_prefix_updates_success_failure_unobserved(self):
+        # alpha=1 -> the estimate IS the last sample; min_samples=1.
+        mdl = NextnAcceptModel([1, 3, 5], p_ema_alpha=1.0, p_min_samples=1)
+        # One verify under k=3 with a=2: pos 1,2 success, pos 3 failure.
+        mdl.observe(3, [2])
+        self.assertEqual(mdl._p[1], [1.0, 1])
+        self.assertEqual(mdl._p[2], [1.0, 1])
+        self.assertEqual(mdl._p[3], [0.0, 1])
+        # a=0: only position 1 observed (failure); deeper positions
+        # untouched (the chain broke at 1).
+        mdl.observe(3, [0])
+        self.assertEqual(mdl._p[1], [0.0, 2])
+        self.assertEqual(mdl._p[2][1], 1)
+        # a == k: all k positions success, NO failure observation.
+        mdl.observe(3, [3])
+        self.assertEqual(mdl._p[3], [1.0, 2])
+        self.assertNotIn(4, mdl._p)
+
+    def test_e_accept_formula_and_extrapolation(self):
+        mdl = NextnAcceptModel([1, 2, 3, 5], p_ema_alpha=1.0, p_min_samples=1)
+        mdl.observe(3, [2])  # p = [1, 1, 0]
+        # E(k) = 1 + sum prod: E(1)=2, E(2)=3, E(3)=3 (third position never
+        # accepted), E(5)=3 (p4=p5 extrapolate p3=0).
+        self.assertAlmostEqual(mdl.e_accept(1), 2.0)
+        self.assertAlmostEqual(mdl.e_accept(2), 3.0)
+        self.assertAlmostEqual(mdl.e_accept(3), 3.0)
+        self.assertAlmostEqual(mdl.e_accept(5), 3.0)
+
+    def test_e_accept_geometric_prefix(self):
+        # p = [1, 0.5] via alternating a=1 / a=2 under k=2 with alpha=1?
+        # Deterministic instead: feed the EMA to exactly 0.5 with alpha=1
+        # is impossible, so use two models... simpler: closed form with
+        # p_min_samples=1 and crafted samples: a=2 then a=1 with alpha=0.5
+        # -> p2 = 0.5 after [1.0, then 0.5*1+0.5*0].
+        mdl = NextnAcceptModel([1, 2, 4], p_ema_alpha=0.5, p_min_samples=1)
+        mdl.observe(2, [2])  # p1=1, p2=1
+        mdl.observe(2, [1])  # p1=1 (still), p2 -> 0.5
+        self.assertAlmostEqual(mdl._p[2][0], 0.5)
+        # E(2) = 1 + 1 + 0.5 = 2.5; E(4) = 1 + 1 + .5 + .25 + .125 = 2.875.
+        self.assertAlmostEqual(mdl.e_accept(2), 2.5)
+        self.assertAlmostEqual(mdl.e_accept(4), 2.875)
+
+    def test_none_until_position_one_trusted(self):
+        mdl = NextnAcceptModel([1, 3], p_min_samples=4)
+        self.assertIsNone(mdl.e_accept(3))
+        mdl.observe(3, [3, 3, 3])  # 3 samples < 4
+        self.assertIsNone(mdl.e_accept(1))
+        mdl.observe(3, [3])
+        self.assertIsNotNone(mdl.e_accept(3))
+
+    def test_round_time_measured_exact(self):
+        mdl = NextnAcceptModel([1, 3])
+        m = self._metrics({3: 0.040})
+        self.assertAlmostEqual(mdl.round_s(3, m), 0.040, places=6)
+
+    def test_round_time_single_point_fallback_slope(self):
+        mdl = NextnAcceptModel([1, 3, 5], k_time_slope_frac=0.03)
+        m = self._metrics({3: 0.040})
+        # k=5: 0.040 * (1 + 0.03 * (5-3)) = 0.0424; k=1: 0.0376.
+        self.assertAlmostEqual(mdl.round_s(5, m), 0.0424, places=6)
+        self.assertAlmostEqual(mdl.round_s(1, m), 0.0376, places=6)
+
+    def test_round_time_two_point_fit(self):
+        mdl = NextnAcceptModel([1, 2, 3, 5])
+        m = self._metrics({1: 0.030, 3: 0.040})
+        # LSQ through (1,.03),(3,.04): b=0.005, a=0.025.
+        self.assertAlmostEqual(mdl.round_s(2, m), 0.035, places=6)
+        self.assertAlmostEqual(mdl.round_s(5, m), 0.050, places=6)
+
+    def test_negative_fit_slope_clamped(self):
+        mdl = NextnAcceptModel([1, 3, 5])
+        m = self._metrics({1: 0.040, 3: 0.030})  # noise: bigger k faster
+        # Clamped slope 0 -> flat at the mean.
+        self.assertAlmostEqual(mdl.round_s(5, m), 0.035, places=6)
+
+    def test_k_star_argmax(self):
+        mdl = NextnAcceptModel([1, 3, 5], p_ema_alpha=1.0, p_min_samples=1)
+        mdl.observe(5, [5])  # p == 1 everywhere -> E(k) = k+1
+        m = self._metrics({1: 0.030, 3: 0.040})
+        k, smap = mdl.k_star(m)
+        # scores: k1 2/.03=66.7, k3 4/.04=100, k5 6/.05=120.
+        self.assertEqual(k, 5)
+        self.assertAlmostEqual(smap[5], 120.0, places=1)
+        # Weak chain: p2..pk = 0 -> E flattens at 2, small k wins on time.
+        mdl2 = NextnAcceptModel([1, 3, 5], p_ema_alpha=1.0, p_min_samples=1)
+        mdl2.observe(5, [1])  # p1=1, p2=0
+        k2, _ = mdl2.k_star(m)
+        self.assertEqual(k2, 1)
+
+    def test_k_star_none_without_time_data(self):
+        mdl = NextnAcceptModel([1, 3], p_ema_alpha=1.0, p_min_samples=1)
+        mdl.observe(3, [3])
+        k, smap = mdl.k_star(RungMetrics())
+        self.assertIsNone(k)
+        self.assertEqual(smap, {})
+
+
+class TestAnalyticKDecide(CustomTestCase):
+    """Task A wired into decide(): k moves without probe windows, nextn
+    arms excluded from probing, family decision intact."""
+
+    def test_k_step_replaces_probe(self):
+        b = _bandit(rungs=RUNGS)  # analytic_k=1 default
+        # Weak chain content: a=1 under k=3 -> p1=1, p2=0 -> E(1)=E(3)=2;
+        # the modeled round time of k=1 is smaller -> k* = 1.
+        _feed(b, NEXTN3, accept=1, rounds=12, dt=0.040)
+        target = b.decide(64)
+        self.assertEqual(target, NEXTN1)
+        self.assertEqual(b.active, NEXTN1)
+        # A k move, not a probe: no probe window opened.
+        self.assertIsNone(b._probe_until)
+
+    def test_k_step_respects_k_dwell_and_margin(self):
+        # No DFLASH arm: isolates the k-dwell (otherwise the cold-start
+        # DFLASH probe fires in the k-dwell-hold round).
+        b = _bandit(rungs=[NEXTN1, NEXTN3], cfg=_cfg(k_dwell_rounds=16))
+        _feed(b, NEXTN3, accept=1, rounds=12, dt=0.040)
+        b._last_k_switch_round = 60
+        self.assertEqual(b.decide(64), NEXTN3)  # dwell (64-60 < 16) holds
+        self.assertEqual(b.decide(76), NEXTN1)  # expired -> k move
+
+    def test_k_step_does_not_reset_family_dwell(self):
+        b = _bandit(rungs=RUNGS)
+        _feed(b, NEXTN3, accept=1, rounds=12, dt=0.040)
+        b._last_switch_round = 40
+        self.assertEqual(b.decide(64), NEXTN1)
+        self.assertEqual(b._last_switch_round, 40)
+
+    def test_nextn_arms_never_probed_analytic(self):
+        b = _bandit(rungs=RUNGS)
+        # Strong chain: k* == active k == 3, nothing to move to; NEXTN1
+        # must NOT be cold-start probed (task A), DFLASH must.
+        _feed(b, NEXTN3, accept=3, rounds=12, dt=0.040)
+        target = b.decide(64)
+        self.assertEqual(target, DFLASH)  # cold-start probe of dflash
+        self.assertIsNotNone(b._probe_until)
+        # NEXTN1 stays unprobed forever after (DFLASH measured now, its
+        # staleness age below the probe interval -> plain hold).
+        _feed(b, DFLASH, accept=1, rounds=10, dt=0.040, t0=100.0)
+        b._probe_until = None
+        b._pre_probe_rung = None
+        b.active = NEXTN3
+        b._last_active_round[DFLASH] = 10_000
+        self.assertEqual(b.decide(10_064), NEXTN3)  # hold; no NEXTN1 probe
+
+    def test_family_switch_to_dflash_still_works(self):
+        b = _bandit(rungs=[NEXTN3, DFLASH])
+        _feed(b, NEXTN3, accept=3, rounds=10, dt=0.060)
+        _feed(b, DFLASH, accept=3, rounds=10, dt=0.040, t0=100.0)
+        b._last_active_round[DFLASH] = 999
+        self.assertEqual(b.decide(1000), DFLASH)
+
+    def test_gate_eviction_unchanged_with_analytic(self):
+        b = _bandit(rungs=RUNGS, initial=NEXTN3)
+        _feed(b, NEXTN3, accept=3, rounds=10, dt=0.040)
+        _feed(b, DFLASH, accept=8, rounds=10, dt=0.040, t0=100.0)
+        b.active = DFLASH
+        self.assertEqual(b.decide(1000, eligible=NO_DFLASH), NEXTN3)
+
+
+class TestBoundaryBurst(CustomTestCase):
+    """Task B: request boundaries waive the dwell once and relax the probe
+    gates so DFLASH is tested early on fresh content."""
+
+    def _measured(self, cfg=None):
+        b = _bandit(rungs=[NEXTN3, DFLASH], cfg=cfg)
+        _feed(b, NEXTN3, accept=3, rounds=10, dt=0.040)
+        _feed(b, DFLASH, accept=1, rounds=10, dt=0.040, t0=100.0)  # inferior
+        return b
+
+    def test_boundary_probes_inferior_dflash(self):
+        b = self._measured(_cfg(probe_inferior_factor=1.2,
+                                boundary_min_age_rounds=64))
+        b._last_active_round[DFLASH] = 936  # age 64 at round 1000
+        b._last_switch_round = 999  # family dwell far from expired
+        # Without a boundary: dwell holds.
+        self.assertEqual(b.decide(1000), NEXTN3)
+        # With a boundary: dwell waived, inferior gate bypassed, staleness
+        # age relaxed to boundary_min_age_rounds -> probe starts.
+        self.assertEqual(b.decide(1000, request_boundary=True), DFLASH)
+        self.assertIsNotNone(b._probe_until)
+
+    def test_boundary_respects_min_age(self):
+        b = self._measured(_cfg(boundary_min_age_rounds=64))
+        b._last_switch_round = 0
+        b._last_active_round[DFLASH] = 990  # probed 10 rounds ago
+        self.assertEqual(b.decide(1000, request_boundary=True), NEXTN3)
+
+    def test_boundary_burst_disabled(self):
+        b = self._measured(_cfg(boundary_burst=0,
+                                probe_inferior_factor=1.2))
+        b._last_active_round[DFLASH] = 0
+        b._last_switch_round = 999
+        self.assertEqual(b.decide(1000, request_boundary=True), NEXTN3)
+
+    def test_boundary_does_not_abort_running_probe(self):
+        b = _bandit(rungs=[NEXTN3, DFLASH])
+        _feed(b, NEXTN3, accept=3, rounds=10, dt=0.040)
+        self.assertEqual(b.decide(64), DFLASH)  # probe_start
+        self.assertEqual(b.decide(70, request_boundary=True), DFLASH)
+        self.assertIsNotNone(b._probe_until)  # probe_hold, not restarted
 
 
 class TestConfig(CustomTestCase):

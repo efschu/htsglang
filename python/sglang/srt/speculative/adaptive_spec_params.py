@@ -568,6 +568,14 @@ class RungMetrics:
             return None
         return m[0] / m[2]
 
+    def round_s(self, steps, min_time_samples: int = 1) -> float | None:
+        """EMA round duration of one rung, or None below *min_time_samples*.
+        RANK-LOCAL wall clock -- same consumption rule as reward()."""
+        m = self._per_rung.get(steps)
+        if m is None or m[3] < min_time_samples or m[2] <= 0.0:
+            return None
+        return m[2]
+
     def snapshot(self) -> dict:
         """Per-rung metric snapshot for logging / the stage-4 objective."""
         return {
