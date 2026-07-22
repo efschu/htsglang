@@ -2257,6 +2257,32 @@ class ServerArgs:
         "'high-accept' adds k=4/5 ladder rungs with upward hysteresis for "
         "workloads with per-position accept probability >~0.85.",
     ] = None
+    speculative_cross_algorithm: A[
+        bool,
+        Arg(
+            help="T156 stage 2: co-resident cross-algorithm speculative "
+            "decoding (NEXTN/MTP + DFLASH on one server). Both draft models "
+            "are loaded and both CUDA-graph sets are captured at boot; the "
+            "ACTIVE algorithm is statically pinned via "
+            "--speculative-cross-algorithm-force (per-batch runtime "
+            "switching lands in stage 3). Requires --speculative-algorithm "
+            "NEXTN (the MTP rung) plus --speculative-draft-model pointing at "
+            "the DFLASH draft checkpoint. Placement is fixed per rung: the "
+            "NEXTN draft runs split (TP-sharded), the DFLASH draft runs solo "
+            "on TP rank 0. Default off -> no new code path is reached.",
+        ),
+    ] = False
+    speculative_cross_algorithm_force: A[
+        Optional[str],
+        Arg(
+            help="Which rung serves ALL batches under "
+            "--speculative-cross-algorithm (stage 2 is statically forced; "
+            "required while per-batch switching does not exist yet). "
+            "'nextn': the MTP/EAGLE rung is active, the DFLASH rung stays "
+            "resident but idle. 'dflash': vice versa.",
+            choices=["nextn", "dflash"],
+        ),
+    ] = None
     speculative_adaptive_graph_memory: A[
         str,
         Arg(
@@ -8886,19 +8912,33 @@ class ServerArgs:
         if self.speculative_num_draft_tokens is None:
             return None
         if not self.speculative_adaptive:
-            return self.speculative_num_draft_tokens
+            result = self.speculative_num_draft_tokens
+        else:
+            from sglang.srt.speculative.adaptive_spec_params import (
+                resolve_candidate_steps_from_config,
+            )
 
-        from sglang.srt.speculative.adaptive_spec_params import (
-            resolve_candidate_steps_from_config,
-        )
+            candidate_steps = resolve_candidate_steps_from_config(
+                cfg_path=self.speculative_adaptive_config,
+                algorithm=self.speculative_algorithm,
+            )
+            # TODO: adaptive spec currently requires topk=1, so each runtime
+            # state needs steps + 1 draft-token slots. Revisit this if topk>1
+            # is supported.
+            result = max(candidate_steps) + 1
 
-        candidate_steps = resolve_candidate_steps_from_config(
-            cfg_path=self.speculative_adaptive_config,
-            algorithm=self.speculative_algorithm,
-        )
-        # TODO: adaptive spec currently requires topk=1, so each runtime state
-        # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
-        return max(candidate_steps) + 1
+        # T156 stage 2 (--speculative-cross-algorithm): the SECONDARY rung
+        # captures verify graphs with its own draft-token width against the
+        # shared logits buffer, so the buffer must span both rungs (e.g.
+        # NEXTN forced: primary 4 tokens/req, resident DFLASH rung 16).
+        if getattr(self, "speculative_cross_algorithm", False):
+            shapes = getattr(self, "speculative_cross_shapes", None) or {}
+            for shape in shapes.values():
+                if isinstance(shape, dict) and shape.get(
+                    "speculative_num_draft_tokens"
+                ):
+                    result = max(result, int(shape["speculative_num_draft_tokens"]))
+        return result
 
     @property
     def mamba_cache_chunk_size(self) -> int:

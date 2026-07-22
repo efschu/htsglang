@@ -102,6 +102,23 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         kwargs=kwargs,
     )
 
+    if getattr(server_args, "speculative_cross_algorithm", False):
+        # T156 stage 2: validate the dual-rung request, resolve both rung
+        # shapes, apply the FORCED rung's shape to server_args (so the rest
+        # of this function and the whole boot pipeline behave like the
+        # corresponding single-algorithm server) and stash the other shape
+        # for CrossAlgoWorker.
+        from sglang.srt.speculative.cross_algo_utils import (
+            normalize_cross_algorithm_args,
+        )
+
+        normalize_cross_algorithm_args(server_args)
+    elif getattr(server_args, "speculative_cross_algorithm_force", None) is not None:
+        raise ValueError(
+            "--speculative-cross-algorithm-force requires "
+            "--speculative-cross-algorithm."
+        )
+
     # Validate --speculative-draft-window-size once, regardless of algorithm.
     # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
     if server_args.speculative_draft_window_size is not None:

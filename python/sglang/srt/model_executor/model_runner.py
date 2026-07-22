@@ -530,14 +530,43 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     # if there is no aux layer, set to None
                     self.eagle_aux_hidden_state_layer_ids = None
 
-        if self.spec_algorithm.is_dflash_family() and not self.is_draft_worker:
+        # T156 stage 2 (--speculative-cross-algorithm): when the FORCED rung is
+        # NEXTN, spec_algorithm is EAGLE but a DFLASH rung is co-resident; the
+        # target still needs the DFLASH planning fields (draft layer count for
+        # KV-cell sizing, capture layer ids). Its draft path lives in the
+        # stashed dflash shape, not in speculative_draft_model_path (that one
+        # is None, matching the plain NEXTN server). Whether the target model
+        # ACTUALLY captures aux hidden states at runtime is toggled by
+        # CrossAlgoWorker per forced rung (NEXTN needs the final hidden state,
+        # DFLASH the concatenated aux layers).
+        _cross_dflash_shape = None
+        if (
+            not self.is_draft_worker
+            and getattr(server_args, "speculative_cross_algorithm", False)
+            and not self.spec_algorithm.is_dflash_family()
+        ):
+            from sglang.srt.speculative.cross_algo_utils import get_cross_shapes
+
+            _cross_dflash_shape = get_cross_shapes(server_args).get("dflash")
+
+        if (
+            self.spec_algorithm.is_dflash_family() or _cross_dflash_shape is not None
+        ) and not self.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
             # Select target layers to capture for building draft context features.
             draft_model_config = self._build_model_config(
                 server_args,
-                model_path=(server_args.speculative_draft_model_path),
-                model_revision=server_args.speculative_draft_model_revision,
+                model_path=(
+                    _cross_dflash_shape["speculative_draft_model_path"]
+                    if _cross_dflash_shape is not None
+                    else server_args.speculative_draft_model_path
+                ),
+                model_revision=(
+                    _cross_dflash_shape["speculative_draft_model_revision"]
+                    if _cross_dflash_shape is not None
+                    else server_args.speculative_draft_model_revision
+                ),
                 is_draft_model=True,
             )
             dflash_draft_config = parse_dflash_draft_config(

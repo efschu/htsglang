@@ -229,6 +229,14 @@ class SpeculativeAlgorithm(Enum):
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
 
+        if getattr(server_args, "speculative_cross_algorithm", False):
+            # T156 stage 2: one meta-worker hosts both the NEXTN/MTP and the
+            # DFLASH sub-worker; `self` is the FORCED rung's algorithm (the
+            # normalized server args carry its shape).
+            from sglang.srt.speculative.cross_algo_worker import CrossAlgoWorker
+
+            return CrossAlgoWorker
+
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
             # synchronously when overlap is disabled), same as EAGLE.

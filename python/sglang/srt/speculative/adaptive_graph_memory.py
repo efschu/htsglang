@@ -285,7 +285,14 @@ def resolve_adaptive_graph_memory_mode(server_args: "ServerArgs") -> str:
             f"speculative_adaptive_graph_memory must be one of {_MODES}, "
             f"got {requested!r}"
         )
-    if not server_args.speculative_adaptive:
+    # T156 stage 2: --speculative-cross-algorithm keeps an INACTIVE algorithm
+    # rung resident; its graph set is offloadable through the same manager
+    # even when the k-ladder controller (speculative_adaptive) is off, so the
+    # cross gate is offload-eligible on its own. The launcher uses this same
+    # resolution to decide the torch_memory_saver LD_PRELOAD hook.
+    if not server_args.speculative_adaptive and not getattr(
+        server_args, "speculative_cross_algorithm", False
+    ):
         return "resident"
     if requested == "resident":
         return "resident"
@@ -363,7 +370,7 @@ def resolve_adaptive_graph_memory_mode(server_args: "ServerArgs") -> str:
 @dataclass
 class _StateRecord:
     tag: str
-    steps: int
+    steps: "int | tuple"  # rung key: k-ladder int or (algorithm, k) tuple
     tensors: list = field(default_factory=list)
     # Parallel to `tensors`: what each noted tensor is ("scratch" Stage-1
     # buffers, "int_ws" flashinfer int workspaces) -- for the itemized logs.
@@ -476,11 +483,22 @@ class AdaptiveGraphMemoryManager:
     # Build phase
     # ------------------------------------------------------------------
     @staticmethod
-    def tag_for_steps(steps: int) -> str:
+    def tag_for_steps(steps) -> str:
+        """Tag for a rung key.
+
+        The key is an ``int`` for the classic k-ladder (tag unchanged:
+        ``adaptive_state_k<k>``) or a ``(algorithm, k)`` tuple for a
+        cross-algorithm rung (T156 stage 2), e.g. ``("DFLASH", 16)`` ->
+        ``adaptive_state_DFLASH_k16``. Kept under the historical name so the
+        existing k-ladder call sites and tests stay untouched.
+        """
+        if isinstance(steps, tuple):
+            algo, k = steps
+            return f"adaptive_state_{algo}_k{k}"
         return f"adaptive_state_k{steps}"
 
     @contextmanager
-    def build_state(self, steps: int):
+    def build_state(self, steps):
         """Scope one candidate state's build. Wrap sites tag allocations
         only while a build scope is active (static-path init never is)."""
         if not self.offload_enabled:
@@ -625,7 +643,7 @@ class AdaptiveGraphMemoryManager:
                 finally:
                     self._in_capture_region = False
 
-    def pause_after_build(self, steps: int) -> None:
+    def pause_after_build(self, steps) -> None:
         """Pause a freshly built state so boot peak stays ~one state."""
         if not self.offload_enabled:
             return
@@ -792,7 +810,7 @@ class AdaptiveGraphMemoryManager:
     # ------------------------------------------------------------------
     # Swap path
     # ------------------------------------------------------------------
-    def ensure_active(self, steps: int) -> None:
+    def ensure_active(self, steps) -> None:
         """Make the state for *steps* the (only) mapped built state.
 
         Called on every runtime-state activation, BEFORE the worker's
@@ -847,7 +865,7 @@ class AdaptiveGraphMemoryManager:
         )
         self._maybe_verify_rank_sync(steps)
 
-    def _maybe_verify_rank_sync(self, steps: int) -> None:
+    def _maybe_verify_rank_sync(self, steps) -> None:
         from sglang.srt.environ import envs
 
         if not envs.SGLANG_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC.get():
@@ -898,6 +916,13 @@ class AdaptiveGraphMemoryManager:
 # ----------------------------------------------------------------------
 # Module-level hooks for the (backend-side) wrap sites
 # ----------------------------------------------------------------------
+def get_active_manager() -> Optional["AdaptiveGraphMemoryManager"]:
+    """The process-wide manager, if one exists (created by the first
+    AdaptiveController). CrossAlgoWorker uses it to build the inactive
+    algorithm rung's resources as a pauseable state (T156 stage 2)."""
+    return _ACTIVE_MANAGER
+
+
 def tagged_state_alloc(nbytes: Optional[int] = None):
     """Context manager: route the enclosed allocation to the current
     adaptive build tag's pauseable region. No-op outside a build scope

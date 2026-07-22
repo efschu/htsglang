@@ -183,6 +183,32 @@ class TestModeResolution(unittest.TestCase):
         with self.assertRaises(ValueError):
             resolve_adaptive_graph_memory_mode(args)
 
+    def test_cross_algorithm_is_offload_eligible_without_adaptive(self):
+        # T156 stage 2: the co-resident secondary rung is offloadable even
+        # when the k-ladder controller is off.
+        args = _server_args(speculative_adaptive=False)
+        args.speculative_cross_algorithm = True
+        with mock.patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": ""}):
+            self.assertEqual(resolve_adaptive_graph_memory_mode(args), "offload")
+
+
+class TestRungKeyTags(unittest.TestCase):
+    def test_int_key_tag_unchanged(self):
+        self.assertEqual(
+            AdaptiveGraphMemoryManager.tag_for_steps(3), "adaptive_state_k3"
+        )
+
+    def test_tuple_key_tag(self):
+        # T156 stage 2 cross-algorithm rung key: (algorithm, draft_tokens).
+        self.assertEqual(
+            AdaptiveGraphMemoryManager.tag_for_steps(("DFLASH", 16)),
+            "adaptive_state_DFLASH_k16",
+        )
+        self.assertEqual(
+            AdaptiveGraphMemoryManager.tag_for_steps(("EAGLE", 4)),
+            "adaptive_state_EAGLE_k4",
+        )
+
 
 class TestManagerResident(unittest.TestCase):
     def test_everything_is_a_noop(self):

@@ -128,7 +128,13 @@ def solo_draft_kv_cell_factor(mr: ModelRunner) -> float:
     server_args = mr.server_args
     if not getattr(server_args, "speculative_draft_solo_active", None):
         return 1.0
-    if not server_args.speculative_draft_solo_active():
+    # T156 stage 2: under --speculative-cross-algorithm the draft-KV part of
+    # the target cell is exclusively the DFLASH rung's pool, and that rung is
+    # ALWAYS solo on rank 0 -- even when the forced (global) placement is
+    # 'split' because NEXTN is the active rung. The NEXTN/MTP pool stays
+    # uncharged either way, matching the plain NEXTN server.
+    _cross_algo = getattr(server_args, "speculative_cross_algorithm", False)
+    if not server_args.speculative_draft_solo_active() and not _cross_algo:
         return 1.0
     if mr.is_draft_worker:
         # The draft runner does not size anything (it is handed the target's
@@ -263,8 +269,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * (1 + int(eagle_draft_num_layers) / int(num_layers))
                 )
 
-        # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
-        if mr.spec_algorithm.is_dflash_family() and not mr.is_draft_worker:
+        # DFLASH/DSPARK: scale cell_size to account for draft model KV cache.
+        # Under --speculative-cross-algorithm (T156 stage 2) the DFLASH draft
+        # pool is resident even when the forced rung is NEXTN
+        # (spec_algorithm == EAGLE), so the inflation applies there too; the
+        # planning fields were filled by ModelRunner from the stashed dflash
+        # shape.
+        _cross_algo = (not mr.is_draft_worker) and getattr(
+            mr.server_args, "speculative_cross_algorithm", False
+        )
+        if (
+            mr.spec_algorithm.is_dflash_family() or _cross_algo
+        ) and not mr.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )

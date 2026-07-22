@@ -1,0 +1,272 @@
+"""Cross-algorithm speculative decoding (T156 stage 2) -- argument shaping.
+
+Under ``--speculative-cross-algorithm`` ONE server hosts TWO co-resident
+speculative rungs over the SAME target model:
+
+* the NEXTN/MTP rung (EAGLEWorkerV2, draft = the target checkpoint's MTP
+  head, placement SPLIT -- TP-sharded exactly like a plain NEXTN server), and
+* the DFLASH rung (DFlashWorkerV2, draft = a separate DFLASH checkpoint,
+  placement SOLO on TP rank 0 -- forced, because DFlashAttention requires
+  heads % tp == 0, which is unsatisfiable under uneven tp3).
+
+The two rungs need DIFFERENT values in the same ``speculative_*`` server-args
+fields (algorithm, draft path, num_steps, num_draft_tokens, placement, ...).
+This module resolves both value sets ("shapes") once at argument-handling
+time:
+
+* the FORCED rung's shape (``--speculative-cross-algorithm-force``) is applied
+  to the real ServerArgs, so the whole boot pipeline (scheduler, target model
+  runner, pool sizing, graph capture, batch stamping) behaves exactly like the
+  corresponding single-algorithm server -- that is the stage-2 contract, and
+  it is what makes the forced arm comparable to its single-algo control;
+* the OTHER rung's shape is stashed on the ServerArgs instance
+  (``speculative_cross_shapes``) and consumed by CrossAlgoWorker to build the
+  secondary sub-worker from a deep-copied, re-shaped ServerArgs.
+
+Stage 3 (per-batch switching) only changes who stamps
+``batch.spec_algorithm``; the shapes and the dual resource build stay.
+"""
+
+from __future__ import annotations
+
+import copy
+import logging
+from typing import TYPE_CHECKING, Any, Dict
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
+
+CROSS_SHAPES_ATTR = "speculative_cross_shapes"
+
+# Fields a rung shape may override on the deep-copied ServerArgs of the
+# secondary sub-worker (and that the forced shape writes on the real one).
+_SHAPE_FIELDS = (
+    "speculative_algorithm",
+    "speculative_draft_model_path",
+    "speculative_draft_model_revision",
+    "speculative_num_steps",
+    "speculative_eagle_topk",
+    "speculative_num_draft_tokens",
+    "speculative_dflash_block_size",
+    "speculative_draft_attention_backend",
+    "speculative_draft_placement",
+    "speculative_draft_gpu",
+    "speculative_adaptive",
+    "speculative_adaptive_config",
+    "speculative_draft_window_size",
+    "speculative_use_rejection_sampling",
+)
+
+
+def cross_algo_enabled(server_args) -> bool:
+    return bool(getattr(server_args, "speculative_cross_algorithm", False))
+
+
+def get_cross_shapes(server_args) -> Dict[str, Dict[str, Any]]:
+    shapes = getattr(server_args, CROSS_SHAPES_ATTR, None)
+    if shapes is None:
+        raise RuntimeError(
+            "--speculative-cross-algorithm is set but the rung shapes were "
+            "not resolved (normalize_cross_algorithm_args did not run in "
+            "this process; the stash did not survive the process boundary?)."
+        )
+    return shapes
+
+
+def _fail(msg: str) -> None:
+    raise ValueError(f"--speculative-cross-algorithm: {msg}")
+
+
+def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
+    """Validate the cross-algorithm request, resolve both rung shapes, apply
+    the forced shape to *server_args* and stash the other shape.
+
+    Must run inside ``handle_speculative_decoding`` AFTER the NEXTN->EAGLE
+    alias resolution and BEFORE the per-algorithm handler dispatch, so the
+    dispatch sees the forced shape.
+    """
+    from sglang.srt.arg_groups.speculative_hook import _handle_dflash
+
+    force = server_args.speculative_cross_algorithm_force
+    if force not in ("nextn", "dflash"):
+        _fail(
+            "stage 2 requires --speculative-cross-algorithm-force nextn|dflash "
+            "(the active rung is statically pinned until per-batch switching "
+            f"lands in stage 3); got {force!r}."
+        )
+    if server_args.speculative_algorithm != "EAGLE":
+        _fail(
+            "requires --speculative-algorithm NEXTN (or EAGLE) as the MTP "
+            f"rung; got {server_args.speculative_algorithm!r}."
+        )
+    if server_args.speculative_draft_model_path is None:
+        _fail(
+            "requires --speculative-draft-model pointing at the DFLASH draft "
+            "checkpoint (the MTP rung drafts from the target checkpoint and "
+            "needs no path)."
+        )
+    if server_args.device != "cuda":
+        _fail(f"only supports CUDA; got device={server_args.device!r}.")
+    if server_args.pp_size != 1 or server_args.dp_size != 1:
+        _fail(
+            "supports pure single-node TP only; got "
+            f"pp_size={server_args.pp_size}, dp_size={server_args.dp_size}."
+        )
+    if server_args.enable_dp_attention:
+        _fail("does not support --enable-dp-attention.")
+    if server_args.ep_size != 1:
+        _fail(f"does not support expert parallelism (ep_size={server_args.ep_size}).")
+    if server_args.nnodes != 1:
+        _fail(f"is single-node only (nnodes={server_args.nnodes}).")
+    if server_args.disaggregation_mode != "null":
+        _fail(
+            "does not support PD disaggregation "
+            f"(disaggregation_mode={server_args.disaggregation_mode!r})."
+        )
+    if server_args.enable_multi_layer_eagle:
+        _fail("does not support --enable-multi-layer-eagle.")
+    if server_args.speculative_use_rejection_sampling:
+        _fail("does not support --speculative-use-rejection-sampling.")
+    if (
+        server_args.speculative_eagle_topk is not None
+        and int(server_args.speculative_eagle_topk) != 1
+    ):
+        _fail(
+            "requires topk == 1 (linear MTP chain); got "
+            f"--speculative-eagle-topk {server_args.speculative_eagle_topk}."
+        )
+    if server_args.speculative_draft_window_size is not None:
+        _fail(
+            "does not support --speculative-draft-window-size: the DFLASH "
+            "rung runs draft-solo on rank 0, and solo placement has no "
+            "compact draft cache."
+        )
+    if server_args.speculative_draft_placement != "split":
+        _fail(
+            "owns the draft placement (NEXTN rung: split, DFLASH rung: solo "
+            "on rank 0); leave --speculative-draft-placement unset."
+        )
+    if server_args.speculative_draft_gpu is not None:
+        _fail("owns the solo rank (rank 0); leave --speculative-draft-gpu unset.")
+
+    user_steps = server_args.speculative_num_steps
+    user_adaptive = bool(server_args.speculative_adaptive)
+    user_adaptive_config = server_args.speculative_adaptive_config
+    dflash_draft_path = server_args.speculative_draft_model_path
+    dflash_draft_revision = server_args.speculative_draft_model_revision
+
+    # ------------------------------------------------------------------
+    # Resolve the DFLASH shape on a probe copy: _handle_dflash performs the
+    # full validation + block-size inference + draft-attention-backend
+    # resolution; reusing it verbatim keeps the cross path in lockstep with
+    # the single-algorithm DFLASH path.
+    # ------------------------------------------------------------------
+    probe = copy.deepcopy(server_args)
+    probe.speculative_algorithm = "DFLASH"
+    probe.speculative_num_steps = None
+    probe.speculative_eagle_topk = None
+    probe.speculative_num_draft_tokens = None
+    probe.speculative_adaptive = False
+    probe.speculative_adaptive_config = None
+    probe.speculative_draft_placement = "solo"
+    _handle_dflash(probe)
+
+    dflash_shape: Dict[str, Any] = {
+        "speculative_algorithm": "DFLASH",
+        "speculative_draft_model_path": dflash_draft_path,
+        "speculative_draft_model_revision": dflash_draft_revision,
+        "speculative_num_steps": 1,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": int(probe.speculative_num_draft_tokens),
+        "speculative_dflash_block_size": int(probe.speculative_num_draft_tokens),
+        "speculative_draft_attention_backend": (
+            probe.speculative_draft_attention_backend
+        ),
+        # DFLASH rung placement is SOLO on rank 0 by requirement:
+        # DFlashAttention needs heads % tp == 0, unsatisfiable under uneven
+        # tp3; measured 2026-07-22 on bdc1714551.
+        "speculative_draft_placement": "solo",
+        "speculative_draft_gpu": None,
+        "speculative_adaptive": False,
+        "speculative_adaptive_config": None,
+        "speculative_draft_window_size": None,
+        "speculative_use_rejection_sampling": False,
+    }
+
+    eagle_steps = int(user_steps) if user_steps is not None else 3
+    eagle_shape: Dict[str, Any] = {
+        "speculative_algorithm": "EAGLE",
+        # The MTP rung drafts from the TARGET checkpoint (ModelConfig swaps
+        # the arch to the *MTP variant when is_draft_model=True and the path
+        # falls back to model_path) -- exactly the plain NEXTN server shape.
+        "speculative_draft_model_path": None,
+        "speculative_draft_model_revision": None,
+        "speculative_num_steps": eagle_steps,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": eagle_steps + 1,
+        "speculative_dflash_block_size": None,
+        "speculative_draft_attention_backend": None,
+        "speculative_draft_placement": "split",
+        "speculative_draft_gpu": None,
+        # Adaptive k-laddering is an EAGLE-side feature. When DFLASH is the
+        # forced primary, the secondary EAGLE rung is built WITHOUT adaptive:
+        # its controller would otherwise clobber the target's active
+        # attention backend / decode graph runner on activation, and the
+        # launcher decided the torch_memory_saver LD_PRELOAD hook from the
+        # GLOBAL (dflash-shaped, adaptive-off) args, so an offload-mode
+        # controller in the copy could not initialize. Stage 3 revisits this.
+        "speculative_adaptive": user_adaptive if force == "nextn" else False,
+        "speculative_adaptive_config": (
+            user_adaptive_config if force == "nextn" else None
+        ),
+        "speculative_draft_window_size": None,
+        "speculative_use_rejection_sampling": False,
+    }
+    if force == "dflash" and user_adaptive:
+        logger.info(
+            "--speculative-cross-algorithm force=dflash: the secondary NEXTN "
+            "rung is built without --speculative-adaptive (single k=%d state); "
+            "see cross_algo_utils for the rationale.",
+            eagle_steps,
+        )
+
+    forced_shape = dflash_shape if force == "dflash" else eagle_shape
+    other_name = "nextn" if force == "dflash" else "dflash"
+    other_shape = eagle_shape if force == "dflash" else dflash_shape
+
+    # Apply the forced shape to the REAL args. handle_speculative_decoding is
+    # still inside ServerArgs.__post_init__, so plain assignment is the
+    # correct mutation style here (mirrors _handle_dflash & co).
+    for field in _SHAPE_FIELDS:
+        setattr(server_args, field, forced_shape[field])
+
+    # Stash the other rung's shape for CrossAlgoWorker. Instance attribute
+    # (not a dataclass field) on purpose: it is derived state, survives
+    # pickling to the scheduler processes via __dict__, and stays off the
+    # CLI surface. get_cross_shapes() raises loudly if it went missing.
+    object.__setattr__(
+        server_args,
+        CROSS_SHAPES_ATTR,
+        {other_name: other_shape, "force": force},
+    )
+    logger.info(
+        "Cross-algorithm speculative decoding (stage 2): forced rung=%s; "
+        "secondary rung=%s resident (algorithm=%s, draft_tokens=%s, "
+        "placement=%s).",
+        force,
+        other_name,
+        other_shape["speculative_algorithm"],
+        other_shape["speculative_num_draft_tokens"],
+        other_shape["speculative_draft_placement"],
+    )
+
+
+def apply_shape_to_args_copy(server_args: "ServerArgs", shape: Dict[str, Any]):
+    """Deep-copy *server_args* and apply a rung *shape* to the copy (via the
+    audited post-resolution mutation point). The copy is what the secondary
+    sub-worker keeps as ``self.server_args`` for its whole lifetime."""
+    args_copy = copy.deepcopy(server_args)
+    args_copy.override("cross_algo.secondary_shape", **shape)
+    return args_copy
