@@ -30,8 +30,10 @@ Stage 3 (per-batch switching) only changes who stamps
 from __future__ import annotations
 
 import copy
+import json
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional
+import os
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -159,6 +161,176 @@ def parse_cross_force(force: Optional[str]) -> tuple[str, Optional[int]]:
         "'schedule:N' (switch every N verify rounds), or 'auto' (stage-4 "
         f"acceptance-driven bandit); got {force!r}."
     )
+
+
+# ---------------------------------------------------------------------------
+# Context gate for the DFLASH rung (auto mode).
+#
+# The z-lab DFLASH drafter is a SHORT-CONTEXT model: trained at ctx 4096 with
+# an interleaved-SWA stack in which 4 of its 5 layers physically see only the
+# last `sliding_window` (2048) tokens. The measured regime map
+# (dflash_verdict.md, 2026-07-22 fixed-bench data) shows its acceptance
+# ADVANTAGE over NEXTN evaporates past ~10k context; its only win region is
+# short/mid-context code. Without a gate the bandit discovers this only
+# reactively, through probe cycles that each cost a probe window on the wrong
+# rung (97% of observed switches were probes; DFLASH kept being probed at 50k
+# where it cannot win).
+#
+# The gate makes context an ELIGIBILITY criterion: while the batch context is
+# at/above the threshold, the DFLASH rung is (a) never selectable as the
+# active rung and (b) never probed -- (b) is the actual overhead killer.
+# ---------------------------------------------------------------------------
+
+CTX_GATE_FACTOR_ENV = "SGLANG_CROSS_CTX_GATE_FACTOR"
+CTX_GATE_NEAR_ENV = "SGLANG_CROSS_CTX_GATE_NEAR_FRAC"
+# Threshold = factor * sliding_window for SWA drafters (see
+# derive_ctx_gate_threshold for the formula rationale).
+DEFAULT_CTX_GATE_FACTOR = 4.0
+# Turn-start pre-emption nearness: a request whose max_new_tokens budget can
+# carry it past the threshold makes DFLASH ineligible from its decode start
+# ONLY when the context is already this close to the threshold.
+DEFAULT_CTX_GATE_NEAR_FRAC = 0.8
+
+
+def parse_ctx_gate_value(raw: Optional[str]):
+    """Parse --speculative-cross-algorithm-ctx-gate: 'auto' | 'off' | int."""
+    if raw is None:
+        return "auto"
+    val = str(raw).strip().lower()
+    if val in ("auto", "off"):
+        return val
+    try:
+        tokens = int(val)
+    except ValueError:
+        tokens = -1
+    if tokens < 1:
+        _fail(
+            "--speculative-cross-algorithm-ctx-gate must be 'auto', 'off', "
+            f"or a positive token count; got {raw!r}."
+        )
+    return tokens
+
+
+def derive_ctx_gate_threshold(
+    draft_model_path: str,
+) -> Tuple[Optional[int], str]:
+    """Derive the DFLASH context-gate threshold from the DRAFTER's config.json.
+
+    Returns (threshold_tokens or None, human-readable derivation source).
+
+    Formula (auto mode):
+
+    * SWA drafter (``sliding_window`` declared, not disabled):
+          threshold = CTX_GATE_FACTOR * sliding_window   (capped at
+          max_position_embeddings when declared)
+      Rationale: ``max_position_embeddings`` is routinely inherited from the
+      TARGET (the z-lab Qwen3.6-27B drafter declares 262144) and says nothing
+      about the drafter's usable range; the sliding window is the drafter's
+      OWN structural horizon -- beyond it, most of its layers are blind to
+      the prompt. The default factor 4.0 puts the z-lab drafter
+      (window 2048, trained at ctx 4096 = 2 * window) at 4 * 2048 = 8192:
+      2x its training context, comfortably above its measured win region
+      (short/mid-context code, paired wins at ~2-4k, code parity ~21k is
+      acceptance-peak noise on its own outputs) and below the ~10k point
+      where the regime map shows its acceptance edge fully evaporated.
+    * No SWA declared: threshold = max_position_embeddings -- a genuine
+      long-context drafter lifts (effectively removes) the gate
+      automatically.
+    * Neither field / config unreadable: no gate (None), logged.
+
+    The factor is configurable via SGLANG_CROSS_CTX_GATE_FACTOR.
+    """
+    cfg_path = os.path.join(str(draft_model_path), "config.json")
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as e:
+        return None, f"drafter config unreadable ({cfg_path}: {e}); gate disabled"
+    mpe = cfg.get("max_position_embeddings")
+    sliding = cfg.get("sliding_window")
+    if cfg.get("use_sliding_window") is False:
+        sliding = None
+    factor = float(
+        os.environ.get(CTX_GATE_FACTOR_ENV, DEFAULT_CTX_GATE_FACTOR)
+    )
+    if factor <= 0:
+        _fail(f"{CTX_GATE_FACTOR_ENV} must be > 0; got {factor}.")
+    if sliding:
+        threshold = int(factor * int(sliding))
+        source = f"{factor:g} * sliding_window {int(sliding)}"
+        if mpe:
+            threshold = min(threshold, int(mpe))
+            source += f" (cap max_position_embeddings {int(mpe)})"
+        return threshold, source
+    if mpe:
+        return int(mpe), "max_position_embeddings (no sliding window declared)"
+    return None, (
+        f"drafter config {cfg_path} declares neither sliding_window nor "
+        "max_position_embeddings; gate disabled"
+    )
+
+
+def resolve_ctx_gate(server_args, dflash_draft_path: str) -> Dict[str, Any]:
+    """Resolve the ctx-gate stash entry at argument time (rank-uniform by
+    construction: runs once in the launcher process, travels to every
+    scheduler process inside the pickled shapes stash)."""
+    parsed = parse_ctx_gate_value(
+        getattr(server_args, "speculative_cross_algorithm_ctx_gate", "auto")
+    )
+    near_frac = float(
+        os.environ.get(CTX_GATE_NEAR_ENV, DEFAULT_CTX_GATE_NEAR_FRAC)
+    )
+    if not (0.0 < near_frac <= 1.0):
+        _fail(f"{CTX_GATE_NEAR_ENV} must be in (0, 1]; got {near_frac}.")
+    if parsed == "off":
+        return {"threshold": None, "near_frac": near_frac, "source": "off"}
+    if parsed == "auto":
+        threshold, source = derive_ctx_gate_threshold(dflash_draft_path)
+        return {"threshold": threshold, "near_frac": near_frac, "source": source}
+    return {
+        "threshold": int(parsed),
+        "near_frac": near_frac,
+        "source": "explicit --speculative-cross-algorithm-ctx-gate",
+    }
+
+
+def ctx_gate_eligible(
+    ctx_and_remaining: List[Tuple[int, Optional[int]]],
+    threshold: int,
+    near_frac: float,
+) -> Tuple[bool, int]:
+    """Pure eligibility predicate for the DFLASH rung.
+
+    ``ctx_and_remaining``: per request, (current context length, remaining
+    max_new_tokens budget or None for unbounded). Returns
+    (eligible, max_ctx).
+
+    Ineligible when ANY request either
+    * already sits at/above the threshold (bs>1: the max over requests is
+      what the batch pays in verify-attention cost), or
+    * TURN-START PRE-EMPTION: is already NEAR the threshold
+      (ctx > near_frac * threshold) and its remaining new-token budget can
+      carry it past -- then DFLASH is not selected from the start instead of
+      switching away mid-stream shortly after. Requests far below the
+      threshold are NOT pre-empted on budget alone (no answer-length
+      estimator: a 2k-ctx request with a 16k budget usually stops early).
+      A genuine mid-stream crossing is handled by the per-round-boundary
+      eligibility check (switch cost ~1 round; no special path).
+    """
+    eligible = True
+    max_ctx = 0
+    for ctx, remaining in ctx_and_remaining:
+        ctx = int(ctx)
+        if ctx > max_ctx:
+            max_ctx = ctx
+        if ctx >= threshold:
+            eligible = False
+            continue
+        if ctx > near_frac * threshold and (
+            remaining is None or ctx + int(remaining) > threshold
+        ):
+            eligible = False
+    return eligible, max_ctx
 
 
 def get_cross_shapes(server_args) -> Dict[str, Dict[str, Any]]:
@@ -395,6 +567,20 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
             stash["schedule_interval"] = schedule_interval
         else:
             stash["bandit_ks"] = bandit_ks
+            # DFLASH context gate (auto mode only): resolved once here, at
+            # argument time, from the DRAFTER's config.json.
+            gate = resolve_ctx_gate(server_args, dflash_draft_path)
+            stash["ctx_gate"] = gate
+            if gate["threshold"] is not None:
+                logger.info(
+                    "Cross-algo ctx gate: DFLASH rung eligible below %d "
+                    "tokens (%s; near_frac=%.2f).",
+                    gate["threshold"],
+                    gate["source"],
+                    gate["near_frac"],
+                )
+            else:
+                logger.info("Cross-algo ctx gate: disabled (%s).", gate["source"])
     object.__setattr__(server_args, CROSS_SHAPES_ATTR, stash)
     logger.info(
         "Cross-algorithm speculative decoding: force=%s%s; primary rung=%s; "

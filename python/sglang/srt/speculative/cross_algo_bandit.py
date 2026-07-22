@@ -28,6 +28,13 @@ Anti-flap guards (all mandatory, stage-1 lessons):
   rungs whose stale score is clearly inferior
   (``score * probe_inferior_factor < score(active)``) are left alone.
 
+CONTEXT GATE (--speculative-cross-algorithm-ctx-gate): the caller may pass an
+``eligible`` rung set into ``decide``; ineligible rungs (the short-context
+DFLASH drafter above its context threshold) are never selected, never probed
+(logged "skipped: ctx gate"), and the active rung is evicted when it becomes
+ineligible (overriding dwell). ``eligible=None`` == gate off == pre-gate
+behavior.
+
 RANK UNIFORMITY (design 4c): the round-duration term is per-rank WALL CLOCK
 and NOT rank-uniform, so -- unlike the stage-1 k-ladder, which every rank
 recomputes identically -- ``decide()`` runs on RANK 0 ONLY and the chosen
@@ -157,6 +164,7 @@ class CrossAlgoBandit:
         self.cfg = cfg if cfg is not None else CrossBanditConfig.from_env()
         self.rungs = list(rungs)
         self.metrics = RungMetrics()
+        self.initial: Rung = initial
         self.active: Rung = initial
         self.switch_count = 0
         self._last_switch_round = 0
@@ -173,6 +181,12 @@ class CrossAlgoBandit:
         self._attr_count = 0
         # Decayed best-ever score per rung (the optimistic probe gate).
         self._best_score: dict = {}
+        # Context-gate bookkeeping: rungs whose probe suppression was already
+        # logged in the CURRENT contiguous ineligible phase (reset when the
+        # rung becomes eligible again), and the eligibility set of the last
+        # decide (trace only).
+        self._gate_logged: set = set()
+        self._gated_rungs: tuple = ()
         self._trace_path = trace_path
         self._t0 = time.monotonic()
 
@@ -211,17 +225,40 @@ class CrossAlgoBandit:
     # ------------------------------------------------------------------
     # Decision (rank 0 only)
     # ------------------------------------------------------------------
-    def decide(self, round_idx: int) -> Rung:
+    def decide(
+        self,
+        round_idx: int,
+        eligible: Optional[frozenset] = None,
+        gate_note: str = "",
+    ) -> Rung:
         """Return the rung to run from the next round boundary on.
 
         Pure control flow over the rank-local metrics; returns the CURRENT
         rung when nothing warrants a change (the caller broadcasts the
         returned id unconditionally -- receiving one's own current rung is
         the no-decision case on every rank).
+
+        ``eligible`` (context gate, T156): when given, rungs OUTSIDE the set
+        are (a) never selected by the exploit argmax, (b) never probed --
+        the probe suppression is the actual overhead saving -- and (c) the
+        active rung is EVICTED when it falls out of the set, to the initial
+        (boot) rung when that is eligible (overriding dwell: the gate is a
+        hard eligibility criterion, not a preference). ``None`` (gate off)
+        is byte-identical
+        to the pre-gate behavior. ``gate_note`` is appended to gate log
+        lines (the caller knows the context length; this class does not).
         """
         scores = self.scores()
         active = self.active
         self._last_active_round[active] = round_idx
+        if eligible is not None:
+            self._gate_logged &= {r for r in self.rungs if r not in eligible}
+            self._gated_rungs = tuple(
+                rung_str(r) for r in self.rungs if r not in eligible
+            )
+        else:
+            self._gate_logged.clear()
+            self._gated_rungs = ()
         # Maintain the decayed best-ever scores (probe gate; see config).
         for r, s in scores.items():
             best = self._best_score.get(r)
@@ -242,20 +279,83 @@ class CrossAlgoBandit:
         #    rung by 0.4 points (measured 2026-07-22, probe 78 vs incumbent
         #    74 with deadzone bar 78.4).
         if self._probe_until is not None:
-            if round_idx < self._probe_until:
+            if eligible is not None and active not in eligible:
+                # The probe rung fell out of eligibility mid-window (context
+                # crossed the gate threshold): abort the probe and return to
+                # the incumbent immediately -- its partial estimate is kept.
+                incumbent = self._pre_probe_rung
+                self._probe_until = None
+                self._pre_probe_rung = None
+                if incumbent is not None and (
+                    eligible is None or incumbent in eligible
+                ):
+                    self._switch(incumbent, round_idx)
+                    logger.info(
+                        "cross bandit: probe of %s aborted: ctx gate%s; "
+                        "returning to %s.",
+                        rung_str(active),
+                        gate_note,
+                        rung_str(incumbent),
+                    )
+                    return self._emit(
+                        round_idx, "probe_abort_gate", scores, incumbent
+                    )
+                # No usable incumbent: the probe state is cleared and the
+                # (ineligible) probe rung stays active -- the gate-eviction
+                # step below relocates it.
+            elif round_idx < self._probe_until:
                 return self._emit(round_idx, "probe_hold", scores, active)
-            incumbent = self._pre_probe_rung
-            self._probe_until = None
-            self._pre_probe_rung = None
-            probe_s = scores.get(active)
-            inc_s = scores.get(incumbent)
-            if probe_s is not None and (inc_s is None or probe_s > inc_s):
-                # Probe won; it is already active. Restart the dwell clock so
-                # the adoption is not immediately re-contested.
-                self._last_switch_round = round_idx
-                return self._emit(round_idx, "probe_adopt", scores, active)
-            self._switch(incumbent, round_idx)
-            return self._emit(round_idx, "probe_return", scores, incumbent)
+            else:
+                incumbent = self._pre_probe_rung
+                self._probe_until = None
+                self._pre_probe_rung = None
+                probe_s = scores.get(active)
+                inc_s = scores.get(incumbent)
+                if probe_s is not None and (inc_s is None or probe_s > inc_s):
+                    # Probe won; it is already active. Restart the dwell
+                    # clock so the adoption is not immediately re-contested.
+                    self._last_switch_round = round_idx
+                    return self._emit(round_idx, "probe_adopt", scores, active)
+                self._switch(incumbent, round_idx)
+                return self._emit(round_idx, "probe_return", scores, incumbent)
+
+        # 1b) Context-gate eviction: the ACTIVE rung is no longer eligible.
+        #     Deliberately OVERRIDES the minimum dwell -- eligibility is a
+        #     hard criterion (the drafter cannot usefully run past the gate),
+        #     not a preference the anti-flap guards may defer.
+        if eligible is not None and active not in eligible:
+            elig = [r for r in self.rungs if r in eligible]
+            if elig:
+                # Eviction target: the INITIAL (boot/primary) rung, not the
+                # frozen-score argmax. At eviction time every eligible rung's
+                # score is FROZEN from the pre-crossing (short-context)
+                # regime and predicts nothing about the regime the batch just
+                # entered; argmax over those is arbitrary, and the optimistic
+                # probe gate can then lock the arbitrary pick in (measured
+                # 2026-07-22: frozen-argmax eviction landed on nextn:2 and
+                # held it through the whole 10k/50k battery segment at
+                # -12..-15% vs the nextn:3 control). Falling back to the
+                # boot rung matches the single-algorithm default; argmax and
+                # probing re-explore from there on FRESH measurements.
+                if self.initial in eligible:
+                    target = self.initial
+                else:
+                    measured = {
+                        r: scores[r] for r in elig if scores[r] is not None
+                    }
+                    target = (
+                        max(measured, key=measured.get) if measured else elig[0]
+                    )
+                self._switch(target, round_idx)
+                logger.info(
+                    "cross bandit: active rung %s evicted: ctx gate%s; -> %s.",
+                    rung_str(active),
+                    gate_note,
+                    rung_str(target),
+                )
+                return self._emit(round_idx, "gate_evict", scores, target)
+            # No eligible rung at all (misconfiguration): hold.
+            return self._emit(round_idx, "gate_hold", scores, active)
 
         # 2) Minimum dwell.
         if round_idx - self._last_switch_round < self.cfg.min_dwell_rounds:
@@ -263,8 +363,12 @@ class CrossAlgoBandit:
 
         cur_s = scores.get(active)
 
-        # 3) Exploit: argmax over measured rungs, deadzone-guarded.
-        measured = {r: s for r, s in scores.items() if s is not None}
+        # 3) Exploit: argmax over measured ELIGIBLE rungs, deadzone-guarded.
+        measured = {
+            r: s
+            for r, s in scores.items()
+            if s is not None and (eligible is None or r in eligible)
+        }
         if measured and cur_s is not None:
             best = max(measured, key=measured.get)
             if best != active and measured[best] > cur_s * (
@@ -274,7 +378,7 @@ class CrossAlgoBandit:
                 return self._emit(round_idx, "switch", scores, best)
 
         # 4) Explore: probe the best stale / never-measured inactive rung.
-        cand = self._probe_candidate(scores, round_idx)
+        cand = self._probe_candidate(scores, round_idx, eligible, gate_note)
         if cand is not None:
             self._pre_probe_rung = active
             self._probe_until = round_idx + self.cfg.probe_window_rounds
@@ -283,21 +387,40 @@ class CrossAlgoBandit:
 
         return self._emit(round_idx, "hold", scores, active)
 
-    def _probe_candidate(self, scores: dict, round_idx: int) -> Optional[Rung]:
+    def _probe_candidate(
+        self,
+        scores: dict,
+        round_idx: int,
+        eligible: Optional[frozenset] = None,
+        gate_note: str = "",
+    ) -> Optional[Rung]:
         cur_s = scores.get(self.active)
         unmeasured = []
         stale = []
         for r in self.rungs:
             if r == self.active:
                 continue
+            gated = eligible is not None and r not in eligible
             s = scores.get(r)
             if s is None:
                 # Cold start: gather data as soon as the dwell allows.
+                if gated:
+                    self._log_gate_skip(r, gate_note)
+                    continue
                 unmeasured.append(r)
                 continue
             if (
                 round_idx - self._last_active_round[r]
             ) < self.cfg.probe_interval_rounds:
+                continue
+            if gated:
+                # Context gate: an ineligible rung is NEVER probed -- this
+                # suppression (not the selection filter) is the overhead
+                # saving: pre-gate, the stale DFLASH rung was probed
+                # pointlessly on 50k contexts every probe interval. Logged
+                # once per contiguous ineligible phase (only when the rung
+                # would otherwise be a probe candidate: stale or unmeasured).
+                self._log_gate_skip(r, gate_note)
                 continue
             # Optimistic gate + priority key: the decayed best-ever score
             # (falls back to the frozen current score before any best is
@@ -315,6 +438,16 @@ class CrossAlgoBandit:
         if stale:
             return max(stale, key=lambda t: t[0])[1]
         return None
+
+    def _log_gate_skip(self, rung: Rung, gate_note: str) -> None:
+        if rung in self._gate_logged:
+            return
+        self._gate_logged.add(rung)
+        logger.info(
+            "cross bandit: probe of %s skipped: ctx gate%s.",
+            rung_str(rung),
+            gate_note,
+        )
 
     def _switch(self, target: Rung, round_idx: int) -> None:
         self.active = target
@@ -340,6 +473,8 @@ class CrossAlgoBandit:
                     for r, b in self._best_score.items()
                 },
             }
+            if self._gated_rungs:
+                rec["gated"] = list(self._gated_rungs)
             try:
                 with open(self._trace_path, "a") as f:
                     f.write(json.dumps(rec) + "\n")

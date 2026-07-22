@@ -2290,6 +2290,31 @@ class ServerArgs:
             "against flapping -- tunables via SGLANG_CROSS_BANDIT_*).",
         ),
     ] = None
+    speculative_cross_algorithm_ctx_gate: A[
+        str,
+        Arg(
+            help="Context gate for the DFLASH rung under "
+            "--speculative-cross-algorithm-force auto. While the batch "
+            "context (max sequence length over the running requests) is at "
+            "or above the threshold, the DFLASH rung is INELIGIBLE: never "
+            "selected as the active rung and never probed (staleness "
+            "probing on long contexts is the dominant switching overhead -- "
+            "the drafter is short-context-trained and cannot win there). "
+            "'auto' (default): derive the threshold from the DFLASH "
+            "drafter's config.json -- factor x its declared sliding-window "
+            "size, capped at max_position_embeddings (factor via "
+            "SGLANG_CROSS_CTX_GATE_FACTOR, default 4.0 -> 8192 for the "
+            "z-lab Qwen3.6 drafter with SWA window 2048 trained at ctx "
+            "4096); drafters without a sliding window use "
+            "max_position_embeddings directly, so a genuine long-context "
+            "drafter lifts the gate automatically. An integer sets the "
+            "threshold in tokens. 'off': no gate (pre-gate auto-mode "
+            "behavior). Requests near the threshold whose remaining "
+            "max_new_tokens budget can cross it are pre-empted at decode "
+            "start (nearness via SGLANG_CROSS_CTX_GATE_NEAR_FRAC, default "
+            "0.8). Ignored outside force=auto.",
+        ),
+    ] = "auto"
     speculative_adaptive_graph_memory: A[
         str,
         Arg(

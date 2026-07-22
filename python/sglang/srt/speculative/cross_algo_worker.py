@@ -239,6 +239,14 @@ class CrossAlgoWorker(BaseSpecWorker):
                 trace_path=(trace if (trace and tp_rank == 0) else None),
             )
             self._last_decide_round = 0
+            # Context gate for the DFLASH rung (resolved at argument time
+            # from the drafter's config.json; see cross_algo_utils). While
+            # the batch context is at/above the threshold, the DFLASH rung
+            # is ineligible: never selected, never probed.
+            gate = shapes.get("ctx_gate") or {}
+            self._ctx_gate_threshold = gate.get("threshold")
+            self._ctx_gate_near_frac = float(gate.get("near_frac", 0.8))
+            self._ctx_gate_last_ctx = 0
             # Rank-0-decides + broadcast (design 4c): the objective's round-
             # duration term is rank-local WALL CLOCK, so -- unlike the
             # stage-1 k-ladder and the stage-3 schedule plan -- the decision
@@ -253,7 +261,15 @@ class CrossAlgoWorker(BaseSpecWorker):
             log_info_on_rank0(
                 logger,
                 f"Cross-algo bandit (stage 4): rungs={self._rungs}, "
-                f"config={self._bandit.cfg}.",
+                f"config={self._bandit.cfg}, ctx_gate="
+                + (
+                    f"{self._ctx_gate_threshold} tokens "
+                    f"(near_frac={self._ctx_gate_near_frac}, "
+                    f"source={gate.get('source')!r})"
+                    if self._ctx_gate_threshold is not None
+                    else f"off ({gate.get('source')!r})"
+                )
+                + ".",
             )
 
     # ------------------------------------------------------------------
@@ -678,14 +694,46 @@ class CrossAlgoWorker(BaseSpecWorker):
         broadcast VALUE is rank 0's decision; broadcasting the (unchanged)
         current rung is the explicit no-decision case, so ranks never have to
         infer "no news" from a missing message. Eager scheduler code, far
-        from any graph-capture region (the stage-3 deadlock lesson)."""
-        if (
+        from any graph-capture region (the stage-3 deadlock lesson).
+
+        CONTEXT GATE: eligibility is computed LOCALLY on every rank from the
+        batch's CPU-side sequence lengths -- rank-uniform inputs (all ranks
+        run the same batch sequence; accept counts are broadcast, #50), so
+        every rank derives the same verdict without communication. The
+        DECISION stays rank-0 + broadcast, unchanged. When the ACTIVE rung
+        falls out of eligibility (context crossed the threshold mid-stream),
+        the decision point is PULLED FORWARD to this round boundary instead
+        of waiting out the decide interval -- the trigger is rank-uniform,
+        so the collective call stays rank-uniform."""
+        gate_on = self._ctx_gate_threshold is not None
+        dflash_eligible = True
+        if gate_on:
+            dflash_eligible = self._dflash_ctx_eligible(batch)
+        due = (
             self._rounds_total - self._last_decide_round
-        ) < self._bandit.cfg.decide_interval_rounds:
+        ) >= self._bandit.cfg.decide_interval_rounds
+        gate_evict_now = (
+            gate_on and not dflash_eligible and self._active_name == "dflash"
+        )
+        if not due and not gate_evict_now:
             return
         self._last_decide_round = self._rounds_total
         if self.tp_rank == 0:
-            idx = self._rungs.index(self._bandit.decide(self._rounds_total))
+            eligible = None
+            gate_note = ""
+            if gate_on and not dflash_eligible:
+                eligible = frozenset(
+                    r for r in self._rungs if r[0] != "dflash"
+                )
+                gate_note = (
+                    f" (ctx {self._ctx_gate_last_ctx} vs threshold "
+                    f"{self._ctx_gate_threshold})"
+                )
+            idx = self._rungs.index(
+                self._bandit.decide(
+                    self._rounds_total, eligible=eligible, gate_note=gate_note
+                )
+            )
         else:
             idx = 0  # placeholder; overwritten by the broadcast
         t = torch.tensor([idx], dtype=torch.int64)
@@ -695,6 +743,31 @@ class CrossAlgoWorker(BaseSpecWorker):
         new_rung = self._rungs[int(t.item())]
         if new_rung != self._active_rung:
             self._apply_rung(batch, new_rung)
+
+    def _dflash_ctx_eligible(self, batch) -> bool:
+        """Context-gate eligibility of the DFLASH rung for this batch.
+
+        CPU-only (req.seqlen / sampling params; no device sync) and
+        rank-uniform by construction. bs>1: the max over the requests is the
+        context the verify attention pays for; any single request violating
+        the gate makes the rung ineligible. The turn-start pre-emption
+        criterion lives in cross_algo_utils.ctx_gate_eligible."""
+        from sglang.srt.speculative.cross_algo_utils import ctx_gate_eligible
+
+        ctx_and_remaining = []
+        for req in batch.reqs:
+            mnt = getattr(req.sampling_params, "max_new_tokens", None)
+            remaining = (
+                None if mnt is None else max(0, int(mnt) - len(req.output_ids))
+            )
+            ctx_and_remaining.append((req.seqlen, remaining))
+        eligible, max_ctx = ctx_gate_eligible(
+            ctx_and_remaining,
+            self._ctx_gate_threshold,
+            self._ctx_gate_near_frac,
+        )
+        self._ctx_gate_last_ctx = max_ctx
+        return eligible
 
     def _apply_rung(self, batch, new_rung: tuple) -> None:
         old_rung = self._active_rung
