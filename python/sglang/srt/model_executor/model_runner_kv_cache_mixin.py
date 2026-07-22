@@ -209,6 +209,23 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
+        # Measured KV-budget correction (two-boot convergence): replace the
+        # blind part of the slack heuristic with the PREVIOUS boot's measured
+        # leftover (see note_post_capture_leftover). Applied on both budget
+        # paths; 0 unless SGLANG_MEASURED_KV_BUDGET is set and a matching
+        # fingerprinted measurement exists.
+        correction_gb = self._measured_kv_budget_correction_bytes() / (1 << 30)
+        if correction_gb:
+            logger.info(
+                "Measured KV-budget correction (rank %d): %+.2f GiB on top "
+                "of the heuristic budget %.2f GiB (previous boot's measured "
+                "leftover minus safety; SGLANG_MEASURED_KV_BUDGET).",
+                self.tp_rank,
+                correction_gb,
+                rest_memory,
+            )
+            rest_memory += correction_gb
+
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
             minimum_mem_fraction_static = (
@@ -241,7 +258,280 @@ class ModelRunnerKVCacheMixin:
                 f"decoding, draft weights are now counted."
             )
 
+        # Component-balance checkpoint "post-weights" (weights + CUDA context
+        # are resident; pools/graphs are not): exact allocator numbers for
+        # the balance log in note_post_capture_leftover.
+        self._mem_ckpt_post_weights = (
+            torch.cuda.memory_allocated(),
+            torch.cuda.memory_reserved(),
+        )
+
         return int(rest_memory * (1 << 30))  # return in bytes
+
+    # ------------------------------------------------------------------
+    # Measured KV-budget correction (two-boot convergence).
+    #
+    # The heuristic KV budget (mem-fraction slack) is decided BEFORE the
+    # post-pool consumers exist (CUDA graphs, attention workspaces, adaptive
+    # rung tags, draft-solo graph sets, ...), so it can only GUESS their
+    # cost and systematically over- or under-reserves (measured 2026-07-22:
+    # 5.5-6.5 GiB idle per shadow card on the cross-auto tp3 boot). Instead
+    # of guessing better constants: after load + pools + capture, every rank
+    # MEASURES its actual leftover (driver free memory of its device, split
+    # among co-located ranks) and persists ``leftover - safety`` in a
+    # config-fingerprinted cache next to the hardware profile; the next boot
+    # of the SAME configuration adds the stored correction to its heuristic
+    # budget. Fixed point: the leftover converges to the configured safety
+    # margin (SGLANG_MEASURED_KV_BUDGET_SAFETY_MIB, default 400 MiB) within
+    # one or two boots; overshoot self-corrects with a negative delta. The
+    # measurement is offload-aware by construction: paused adaptive rung
+    # tags hold no physical pages at the measurement point. Every value is
+    # read from the driver or the cache — the only ASSUMED number left is
+    # the safety margin itself. Opt-in via SGLANG_MEASURED_KV_BUDGET (the
+    # default path stays byte-identical).
+    # ------------------------------------------------------------------
+    def _measured_kv_budget_cache_path(self: ModelRunner) -> str:
+        import hashlib
+        import json
+        import os
+
+        from sglang.srt.uneven_perf import PROFILE_CACHE_DIR
+
+        sa = self.server_args
+        fields = {
+            "model_path": sa.model_path,
+            "tp_size": sa.tp_size,
+            "rank_gpu_id": getattr(sa, "rank_gpu_id", None),
+            "rank_tp_ratio": getattr(sa, "rank_tp_ratio", None),
+            "rank_kv_ratio": getattr(sa, "rank_kv_ratio", None),
+            "rank_auto_reserve_mib": getattr(sa, "rank_auto_reserve_mib", None),
+            "rank_gpu_memory_mib": getattr(sa, "rank_gpu_memory_mib", None),
+            "mem_fraction_static": sa.mem_fraction_static,
+            "kv_cache_dtype": sa.kv_cache_dtype,
+            "context_length": sa.context_length,
+            "page_size": sa.page_size,
+            "quantization": sa.quantization,
+            "max_running_requests": sa.max_running_requests,
+            "chunked_prefill_size": sa.chunked_prefill_size,
+            "spec_algorithm": sa.speculative_algorithm,
+            "spec_draft_model": sa.speculative_draft_model_path,
+            "spec_cross": getattr(sa, "speculative_cross_algorithm", False),
+            "spec_cross_force": getattr(
+                sa, "speculative_cross_algorithm_force", None
+            ),
+            "spec_adaptive": sa.speculative_adaptive,
+            "spec_adaptive_config": sa.speculative_adaptive_config,
+            "spec_max_draft_tokens": sa.max_speculative_num_draft_tokens,
+            "cuda_graph_max_bs": getattr(
+                sa.cuda_graph_config.decode, "max_bs", None
+            ),
+        }
+        digest = hashlib.sha1(
+            json.dumps(fields, sort_keys=True, default=str).encode()
+        ).hexdigest()[:12]
+        os.makedirs(PROFILE_CACHE_DIR, exist_ok=True)
+        return os.path.join(PROFILE_CACHE_DIR, f"kv_budget-{digest}.json")
+
+    def _measured_kv_budget_correction_bytes(self: ModelRunner) -> int:
+        if not envs.SGLANG_MEASURED_KV_BUDGET.get():
+            return 0
+        import json
+
+        path = self._measured_kv_budget_cache_path()
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return 0
+        vec = data.get("correction_bytes")
+        if not isinstance(vec, list) or len(vec) != self.server_args.tp_size:
+            logger.warning(
+                "Measured KV-budget cache %s is malformed; ignoring.", path
+            )
+            return 0
+        return int(vec[self.tp_rank])
+
+    def _ranks_on_my_gpu(self: ModelRunner) -> int:
+        """How many TP ranks share this rank's physical device (>= 1)."""
+        rank_gpu_id = getattr(self.server_args, "rank_gpu_id", None)
+        if not rank_gpu_id:
+            return 1
+        try:
+            return max(1, list(rank_gpu_id).count(rank_gpu_id[self.tp_rank]))
+        except (IndexError, TypeError):
+            return 1
+
+    def note_post_capture_leftover(self: ModelRunner) -> None:
+        """Measure this boot's actual per-rank leftover and persist the
+        accumulated budget correction for the next boot (see the section
+        comment above). Must be called on every rank (collective gather);
+        rank 0 writes the cache."""
+        if not envs.SGLANG_MEASURED_KV_BUDGET.get():
+            return
+        import json
+        import time as _time
+
+        torch.cuda.synchronize()
+        free_b, _total_b = torch.cuda.mem_get_info(self.gpu_id)
+
+        # Safety margin: scalar MiB, or a comma list with one value per TP
+        # rank (roles differ: the draft-solo host carries the dual-prefill /
+        # draft-append serving transients, which scale with prompt length —
+        # measured 2026-07-22: 10k prefill needs ~1 GiB, 50k ~2-3.5 GiB on
+        # the host, while shadow ranks served everything with ~1.6 GiB).
+        raw_safety = str(envs.SGLANG_MEASURED_KV_BUDGET_SAFETY_MIB.get())
+        parts = [p for p in raw_safety.split(",") if p.strip()]
+        if len(parts) > 1:
+            try:
+                safety_mib = int(parts[self.tp_rank])
+            except (IndexError, ValueError):
+                safety_mib = int(parts[0])
+        else:
+            safety_mib = int(parts[0]) if parts else 400
+        safety_b = safety_mib << 20
+
+        # Component balance (rank-local, exact allocator/driver numbers):
+        # every future misallocation should name the component that moved,
+        # not just "card is not full". Weights double-checked against the
+        # parameter/buffer tensor bytes.
+        alloc_now = torch.cuda.memory_allocated()
+        reserved_now = torch.cuda.memory_reserved()
+        ckpt_w = getattr(self, "_mem_ckpt_post_weights", (0, 0))
+        ckpt_p = getattr(self, "_mem_ckpt_post_pools", (0, 0))
+        try:
+            param_bytes = sum(
+                t.nbytes
+                for t in list(self.model.parameters())
+                + list(self.model.buffers())
+                if t.device.type == "cuda"
+            )
+        except Exception:  # balance log must never break boot
+            param_bytes = 0
+        gib = 1 << 30
+        # Honest residual posts (never silently folded into the safety
+        # margin): allocator fragmentation (reserved - allocated) and the
+        # transient peak beyond the steady state (allocator peak stats over
+        # this boot's own forwards: capture warmups + profiling). Serving
+        # transients of REAL requests are NOT covered by this boot-time
+        # peak — measured 2026-07-22: a rank left with 705 MiB free OOMed on
+        # the first request while 961 MiB survived, so the configured safety
+        # must exceed the serving transient (report, not hidden).
+        stats = torch.cuda.memory_stats()
+        peak_alloc = int(stats.get("allocated_bytes.all.peak", alloc_now))
+        frag_b = max(0, reserved_now - alloc_now)
+        transient_b = max(0, peak_alloc - alloc_now)
+        logger.info(
+            "Measured KV-budget balance (rank %d): post-weights alloc "
+            "%.2f/res %.2f GiB (param+buffer tensors %.2f GiB), pools "
+            "+%.2f GiB, graphs/workspaces +%.2f GiB, now alloc %.2f/res "
+            "%.2f GiB; residual posts: fragmentation %.2f GiB, boot-time "
+            "transient peak %.2f GiB; driver free %.2f GiB.",
+            self.tp_rank,
+            ckpt_w[0] / gib,
+            ckpt_w[1] / gib,
+            param_bytes / gib,
+            (ckpt_p[0] - ckpt_w[0]) / gib,
+            (alloc_now - ckpt_p[0]) / gib,
+            alloc_now / gib,
+            reserved_now / gib,
+            frag_b / gib,
+            transient_b / gib,
+            free_b / gib,
+        )
+        # Co-located ranks share the device's free memory: each may claim
+        # only its share, or the next boot double-books the same bytes.
+        free_b = int(free_b) // self._ranks_on_my_gpu()
+
+        # Explicit measured post: the largest PAUSED adaptive/rung graph tag.
+        # ensure_active must be able to map it back at any switch, so that
+        # many bytes must stay physically free on top of the safety margin
+        # (measured 2026-07-22: cu_mem_create OOM inside torch_memory_saver
+        # when a switch mapped the DFLASH tag during a long-prompt request).
+        max_tag_b = 0
+        try:
+            from sglang.srt.speculative.adaptive_graph_memory import (
+                get_active_manager,
+            )
+
+            mgr = get_active_manager()
+            if mgr is not None:
+                max_tag_b = max(
+                    (
+                        int(getattr(rec, "paused_bytes", 0) or 0)
+                        for rec in getattr(mgr, "_states", {}).values()
+                    ),
+                    default=0,
+                )
+        except Exception:  # never break boot for the balance
+            max_tag_b = 0
+
+        delta_b = free_b - safety_b - max_tag_b
+        prev_b = self._measured_kv_budget_correction_bytes()
+        # Consumption-gated growth: only grow the correction if the PREVIOUS
+        # growth was actually consumed (leftover shrank). A rank that is not
+        # the global binder (its pool is capped by another rank or by the
+        # physical hybrid ceiling) keeps a stable correction instead of
+        # accumulating fantasy budget boot over boot; negative deltas
+        # (overshoot rollback) always apply.
+        prev_leftover_b = None
+        try:
+            import json as _json
+
+            with open(self._measured_kv_budget_cache_path()) as f:
+                _prev = _json.load(f)
+            vec = _prev.get("leftover_mib_at_measure")
+            if isinstance(vec, list) and len(vec) > self.tp_rank:
+                prev_leftover_b = int(vec[self.tp_rank]) << 20
+        except (OSError, ValueError):
+            prev_leftover_b = None
+        if (
+            delta_b > 0
+            and prev_b > 0
+            and prev_leftover_b is not None
+            and free_b >= prev_leftover_b - (128 << 20)
+        ):
+            delta_b = 0
+        my_correction = prev_b + delta_b
+
+        world = get_world_group().world_size
+        payload = (self.tp_rank, int(my_correction), int(free_b))
+        gathered: list = [None] * world
+        torch.distributed.all_gather_object(
+            gathered, payload, group=get_world_group().cpu_group
+        )
+        corrections = [0] * self.server_args.tp_size
+        leftovers = [0] * self.server_args.tp_size
+        for rank, corr, left in gathered:
+            if 0 <= rank < self.server_args.tp_size:
+                corrections[rank] = corr
+                leftovers[rank] = left
+        path = self._measured_kv_budget_cache_path()
+        if self.tp_rank == 0:
+            with open(path, "w") as f:
+                json.dump(
+                    {
+                        "correction_bytes": corrections,
+                        "leftover_mib_at_measure": [
+                            v >> 20 for v in leftovers
+                        ],
+                        "safety_mib": safety_b >> 20,
+                        "max_paused_tag_mib_rank0": max_tag_b >> 20,
+                        "ts": _time.strftime("%Y-%m-%d %H:%M:%S"),
+                    },
+                    f,
+                    indent=1,
+                )
+            logger.info(
+                "Measured KV-budget: per-rank leftover %s MiB at the "
+                "post-capture point; required free = safety %d MiB + max "
+                "paused rung tag %d MiB (this rank); persisted corrections "
+                "%s MiB for the next boot (%s).",
+                [v >> 20 for v in leftovers],
+                safety_b >> 20,
+                max_tag_b >> 20,
+                [v >> 20 for v in corrections],
+                path,
+            )
 
     def _colocated_sibling_reserved_gb(self: ModelRunner) -> float:
         """GiB of GPU memory reserved by TP siblings that SHARE this rank's
@@ -2204,15 +2494,30 @@ class ModelRunnerKVCacheMixin:
             ratios = get_cp_token_ratios()
             split_factor = cp_token_split_factor(self.dcp_size)
             ratio_r = ratios[get_parallel().attn_dcp_rank]
-            local_blocks = torch.tensor(
-                int(token_capacity) // int(ratio_r), dtype=torch.int64
-            )
+            local_unit = int(token_capacity) // int(ratio_r)
+            local_blocks = torch.tensor(local_unit, dtype=torch.int64)
             torch.distributed.all_reduce(
                 local_blocks,
                 op=torch.distributed.ReduceOp.MIN,
                 group=get_world_group().cpu_group,
             )
             token_capacity = int(local_blocks.item()) * split_factor
+            # Sizing-chain evidence log (T156 VRAM underfill diagnosis): which
+            # rank binds the unit, and whether the hybrid cap clamps after it.
+            logger.info(
+                "Uneven-DCP token sizing: rank %d local capacity %d tokens / "
+                "ratio %d = unit %d; min-reduced unit %d -> global "
+                "max_total_num_tokens %d (vector %s, hybrid %s cap %s).",
+                self.tp_rank,
+                int(token_capacity) if False else local_unit * int(ratio_r),
+                int(ratio_r),
+                local_unit,
+                int(local_blocks.item()),
+                token_capacity,
+                ratios,
+                hybrid_cap_kind,
+                hybrid_cap,
+            )
             if user_limit is not None:
                 token_capacity = min(token_capacity, user_limit)
             token_capacity = self._apply_hybrid_kv_token_cap(
@@ -2411,13 +2716,27 @@ class ModelRunnerKVCacheMixin:
     def _is_solo_draft_kv_host(self: ModelRunner) -> bool:
         """True on the TARGET runner of the draft-solo host rank — the only
         rank that allocates a draft KV pool sized to the GLOBAL context.
-        Mirrors pool_configurator.solo_draft_kv_cell_factor's conditions."""
+        Mirrors pool_configurator.solo_draft_kv_cell_factor's conditions.
+
+        T156 VRAM-underfill fix (2026-07-22): under
+        --speculative-cross-algorithm the DFLASH rung's draft pool is ALWAYS
+        solo on the solo rank even when the GLOBAL placement is 'split'
+        (NEXTN is the primary shape) — solo_draft_kv_cell_factor already
+        knew this, but this detector did not, so the capacity-mode install
+        skipped the solo fixed-point correction, treated the host's profiled
+        capacity as vector-independent, overshot the host's ownership share
+        (its cell inflates with sum(ratios)/ratio_host), and the min-rule
+        clawed max_total_num_tokens back from the predicted ~628k to 215k
+        while the shadow ranks idled at 13.4/20.5 GiB (measured on the
+        tp3-uneven cross-auto boot; evidence: 'Uneven-DCP token sizing'
+        rank-0 unit 3367 vs rank-1/2 units 10143/10493)."""
         server_args = self.server_args
         if self.is_draft_worker:
             return False
         if not getattr(server_args, "speculative_draft_solo_active", None):
             return False
-        if not server_args.speculative_draft_solo_active():
+        cross_algo = getattr(server_args, "speculative_cross_algorithm", False)
+        if not server_args.speculative_draft_solo_active() and not cross_algo:
             return False
         return self.tp_rank == server_args.speculative_draft_solo_rank()
 
@@ -2483,6 +2802,18 @@ class ModelRunnerKVCacheMixin:
             return None
         beta = (1.0 / p2 - 1.0 / p1) / (g2 - g1)
         alpha = 1.0 / p1 - beta * g1
+        # Sizing-chain evidence log (T156 VRAM underfill diagnosis).
+        logger.info(
+            "Draft-solo capacity curve: P(g=%.3f)=%d, P(g=%.3f)=%d -> "
+            "alpha=%.3e beta=%.3e (budget %.2f GB).",
+            g1,
+            int(p1),
+            g2,
+            int(p2),
+            alpha,
+            beta,
+            budget_bytes / (1 << 30),
+        )
         if not (beta > 0.0) or not (alpha + beta > 0.0):
             # No draft-KV term (beta == 0) or a degenerate fit: the capacity is
             # vector-independent after all, so the raw measurement is correct.
@@ -2618,38 +2949,21 @@ class ModelRunnerKVCacheMixin:
             return
 
         # ``p_measured`` is the truth UNDER THE ACTIVE VECTOR (what the pools
-        # would be sized to right now); ``p_by_rank`` is what each rank can hold
-        # under a capacity-proportional vector. They differ only on the solo
-        # host.
+        # would be sized to right now). On the draft-solo host the capacity is
+        # a FUNCTION of the vector (affine cell in g = S / ratio_host), so the
+        # optimal vector cannot come from proportional partitioning of static
+        # capacities — that assumption degenerates exactly when the host is
+        # budget-poor (fixed point p_h <= 0 -> "capacity 1" -> c_optimal 64 ->
+        # install skipped -> the shadows idle; measured 2026-07-22 on the
+        # cross-auto tp3 boot). Instead, search the host share directly: for
+        # every v_host in [1, S), the host holds P_h(g = S/v_host) tokens per
+        # the measured curve, the other ranks split the remaining units
+        # proportionally to their (vector-independent) capacities, and
+        # C(v) = min_r(P_r // v_r) * S. S=64 matches partition_units'
+        # granularity; the argmax is exact within it. All inputs are the
+        # all-gathered capacities + curve, so every rank computes the same
+        # argmax (rank-uniform install decision, unchanged invariant).
         p_measured = list(p_by_rank)
-        if solo_curve is not None:
-            corrected = self._solo_fixed_point_capacity(
-                solo_curve,
-                q_tokens=sum(
-                    p_by_rank[r]
-                    for r in range(self.dcp_size)
-                    if r != solo_host_rank
-                ),
-            )
-            if corrected is not None:
-                if self.tp_rank == 0:
-                    logger.info(
-                        "Draft-solo KV planning: solo host (DCP rank %d) "
-                        "capacity under the ACTIVE vector %s is %d tokens, but "
-                        "%d under a capacity-proportional vector (its draft KV "
-                        "pool is sized to the GLOBAL context, so its capacity "
-                        "shrinks as its ownership share shrinks) — optimizing "
-                        "with the corrected value.",
-                        solo_host_rank,
-                        active,
-                        p_by_rank[solo_host_rank],
-                        corrected,
-                    )
-                p_by_rank[solo_host_rank] = corrected
-
-        optimal = partition_units(64, p_by_rank)
-        g = math.gcd(*optimal)
-        optimal = [v // g for v in optimal]
 
         def _context_budget(vector: list, capacities: list) -> int:
             return min(
@@ -2657,7 +2971,65 @@ class ModelRunnerKVCacheMixin:
             ) * sum(vector)
 
         c_active = _context_budget(active, p_measured)
-        c_optimal = _context_budget(optimal, p_by_rank)
+
+        if solo_curve is not None:
+            alpha, beta = solo_curve
+            grain = 64
+            other_ranks = [
+                r for r in range(self.dcp_size) if r != solo_host_rank
+            ]
+            best_vec, best_c, best_ph = None, -1, 0
+            # Every non-host rank needs >= 1 unit of the remaining grain.
+            for v_host in range(1, grain - len(other_ranks) + 1):
+                denom = alpha + beta * (float(grain) / v_host)
+                if denom <= 0.0:
+                    continue
+                p_host = int(1.0 / denom)
+                if p_host < v_host:
+                    continue
+                rest = partition_units(
+                    grain - v_host, [p_by_rank[r] for r in other_ranks]
+                )
+                vec = [0] * self.dcp_size
+                vec[solo_host_rank] = v_host
+                for r, units in zip(other_ranks, rest):
+                    vec[r] = units
+                if any(u <= 0 for u in vec):
+                    continue
+                caps = list(p_by_rank)
+                caps[solo_host_rank] = p_host
+                c = _context_budget(vec, caps)
+                if c > best_c:
+                    best_vec, best_c, best_ph = vec, c, p_host
+            if best_vec is not None:
+                if self.tp_rank == 0:
+                    logger.info(
+                        "Draft-solo KV planning: solo host (DCP rank %d) "
+                        "capacity is vector-dependent (measured curve "
+                        "alpha=%.3e beta=%.3e); direct share search -> "
+                        "vector %s (host holds %d tokens, predicted "
+                        "max_total_num_tokens ~%d vs %d under the active "
+                        "vector %s).",
+                        solo_host_rank,
+                        alpha,
+                        beta,
+                        best_vec,
+                        best_ph,
+                        best_c,
+                        c_active,
+                        active,
+                    )
+                g = math.gcd(*best_vec)
+                optimal = [v // g for v in best_vec]
+                c_optimal = best_c
+            else:
+                optimal = list(active)
+                c_optimal = c_active
+        else:
+            optimal = partition_units(64, p_by_rank)
+            g = math.gcd(*optimal)
+            optimal = [v // g for v in optimal]
+            c_optimal = _context_budget(optimal, p_by_rank)
 
         # --rank-kv-ratio capacity: install the measured vector (rank-uniform
         # decision: server args + gathered P_r only). An explicit pin (env
@@ -2857,6 +3229,12 @@ class ModelRunnerKVCacheMixin:
             )
 
         self._apply_memory_pool_config(self.memory_pool_config)
+        # Component-balance checkpoint "post-pools" (KV/mamba/aux pools now
+        # allocated on top of weights; graphs/workspaces still missing).
+        self._mem_ckpt_post_pools = (
+            torch.cuda.memory_allocated(),
+            torch.cuda.memory_reserved(),
+        )
 
         logger.info(
             f"Memory pool end. "

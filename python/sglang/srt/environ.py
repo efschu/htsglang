@@ -309,6 +309,17 @@ class Envs:
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 
+    # Measured KV-budget correction (two-boot convergence): after load +
+    # capture each rank measures its ACTUAL leftover GPU memory and persists
+    # `leftover - safety` per rank (config-fingerprinted cache); the next
+    # boot adds that correction to the heuristic KV budget, replacing the
+    # blind mem-fraction slack with a measured remainder. Fixed-point: once
+    # leftover ~= safety the correction stops moving.
+    SGLANG_MEASURED_KV_BUDGET = EnvBool(False)
+    # Scalar MiB or a comma list with one value per TP rank (roles differ:
+    # the draft-solo host carries prompt-length-scaled serving transients).
+    SGLANG_MEASURED_KV_BUDGET_SAFETY_MIB = EnvStr("400")
+
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)

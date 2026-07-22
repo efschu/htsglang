@@ -865,6 +865,11 @@ class Scheduler(
         model_runner = self.tp_worker.model_runner
         if model_runner.token_to_kv_pool.post_capture_active:
             model_runner.post_capture_resize_kv_pool()
+        # Measured KV-budget correction (two-boot convergence, env-gated):
+        # everything permanent is resident here (weights, pools, graphs,
+        # workspaces; paused offload tags hold no pages) — measure the real
+        # leftover and persist it for the next boot's budget.
+        model_runner.note_post_capture_leftover()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
