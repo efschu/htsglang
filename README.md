@@ -351,10 +351,7 @@ mismatch is a hard error (no silent cold-load fallback). *Required whenever*
 
 ### Diagnostics
 
-**`--determinism-logits-dump-dir <path>`** (**debug**) — Directory into which
-every rank dumps its per-step next-token logits row (single-sequence batches
-only, dtype as served, captured before sampling) as numbered `torch.save` files,
-for the determinism harness. Default off; the default serving path is untouched.
+**`--determinism-logits-dump-dir <path>`** (**debug**) — Exports each TP rank's raw next-token logits row (single-sequence batches only, in the exact served dtype, captured before logit post-processing and sampling) to sequentially numbered, atomically written `torch.save` files tagged by rank and decode step. This is the capture surface for the determinism harness (`tests/determinism`), which compares these rows across repeated runs and across execution configurations to confirm that the fork's heterogeneous execution paths — uneven TP/DCP token/weight sharding, mixed GPU architectures (differing floating-point reduction order), speculative-decode verify, and CUDA-graph replay — leave the emitted token identical, and to localize any divergence to a specific rank and step. Default off; the default serving path is untouched.
 
 ---
 
