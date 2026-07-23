@@ -744,6 +744,13 @@ class Req(ReqDllmMixin):
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
+        # kv-session-offload (S1): FCFS arrival order (monotonic counter,
+        # assigned once at scheduler admission -- identical on every TP rank)
+        # and the spill tier ("host" while the session's full-attention KV
+        # lives in the pinned host pool; None on the default path).
+        self.kv_arrival_seq: Optional[int] = None
+        self.kv_spill_state: Optional[str] = None
+
         # for cross-encoder model
         self.token_type_ids = token_type_ids
 
@@ -1910,6 +1917,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # kv-session-offload (S1): True only on the separate, eager bs=1 decode
+    # batch of a host-spilled session ("spill tick"). Gates the sentinel
+    # decode allocation, disables CUDA-graph replay, and routes the
+    # flashinfer decode to the host-streamed block-attention path.
+    kv_session_spill_tick: bool = False
+
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
 
@@ -2891,7 +2904,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
         # the allocator, triggered from mem_cache/common.py.)
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        if self.kv_session_spill_tick:
+            # kv-session-offload spill tick: the session's KV lives on host;
+            # no device allocation -- the manager assigns the next sentinel
+            # slot and writes the req_to_token row. Counter/seq_lens updates
+            # below are shared with the default path.
+            from sglang.srt.managers.kv_session_offload import (
+                get_kv_session_offload_manager,
+            )
+
+            self.out_cache_loc = get_kv_session_offload_manager().spill_decode_alloc(
+                self
+            )
+        else:
+            self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
         # Update req-level memory management fields
         for req in self.reqs:
@@ -3112,6 +3138,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
+            kv_session_spill_tick=self.kv_session_spill_tick,
         )
 
     def maybe_evict_swa(self):

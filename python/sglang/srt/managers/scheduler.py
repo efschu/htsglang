@@ -323,6 +323,10 @@ class Scheduler(
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
+        # kv-session-offload defaults BEFORE any watchdog thread can touch
+        # is_fully_idle(); the manager itself is created late in __init__.
+        self.kv_session_offload = None
+        self._kv_arrival_ct = 0
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -561,6 +565,16 @@ class Scheduler(
         self.init_load_inquirer()
 
         self.init_output_streamer()
+
+        # kv-session-offload (S1): FCFS host-spill of the youngest session
+        # under KV pressure. Must init before the batch-result processor
+        # (frozen dataclass takes the manager ref at construction).
+        if self.server_args.enable_kv_session_offload:
+            from sglang.srt.managers.kv_session_offload import (
+                KVSessionOffloadManager,
+            )
+
+            self.kv_session_offload = KVSessionOffloadManager(self)
 
         self.init_batch_result_processor()
 
@@ -2001,6 +2015,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            kv_session_offload=self.kv_session_offload,
         )
 
     def init_req_max_new_tokens(self, req):
@@ -2438,6 +2453,12 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        # kv-session-offload: FCFS arrival order. Assigned once (a retracted
+        # re-queue keeps its original arrival position). The admission order
+        # is identical on every TP rank, so the counter is rank-uniform.
+        if req.kv_arrival_seq is None:
+            req.kv_arrival_seq = self._kv_arrival_ct
+            self._kv_arrival_ct += 1
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
@@ -2821,6 +2842,14 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+        # kv-session-offload (S1): cleanup of a finished spilled session +
+        # FIFO restore with hysteresis (merges the restored session back
+        # into running_batch BEFORE batch selection / prepare_for_decode).
+        if self.kv_session_offload is not None:
+            running_batch = self.kv_session_offload.pre_schedule(
+                running_batch, last_batch
+            )
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         else:
@@ -2844,6 +2873,21 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+        elif (
+            self.kv_session_offload is not None
+            and (
+                spill_tick_batch := self.kv_session_offload.maybe_take_tick(
+                    running_batch
+                )
+            )
+            is not None
+        ):
+            # kv-session-offload (S1): run the spilled session's eager
+            # decode tick INSTEAD of the device decode batch this iteration
+            # (cadence-gated; the device batch was not prepared, so nothing
+            # is lost). Never mixed into the device batch -> the device
+            # graph lockstep stays untouched.
+            ret = spill_tick_batch
         else:
             # Run decode (skip for prefill-only batches)
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
@@ -3199,8 +3243,25 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.flush_write_through_acks()
 
-        # Check if decode out of memory
-        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+        # Check if decode out of memory.
+        # kv-session-offload (S1): on OOM, first try to SPILL a session to
+        # host (FCFS, youngest-sufficient victim) -- it keeps decoding from
+        # host instead of being discarded + re-prefilled -- then re-check.
+        # Zero-overhead invariant: in the fits-case this is exactly ONE
+        # check_decode_mem call, identical to the stock path; the extra
+        # re-check runs only on an actual spill event. If one spill is not
+        # enough (or the slot is taken), the stock retraction runs below.
+        kv_full_retract_flag = not batch.check_decode_mem()
+        if (
+            kv_full_retract_flag
+            and self.kv_session_offload is not None
+            and self.kv_session_offload.try_spill(batch)
+        ):
+            if batch.is_empty():
+                batch.batch_is_full = False
+                return batch
+            kv_full_retract_flag = not batch.check_decode_mem()
+        if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
@@ -3780,6 +3841,13 @@ class Scheduler(
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
+            # kv-session-offload: a host-spilled session is still running
+            # (its req slot + mamba state are live; pool checks would flag
+            # a "leak" and health would look idle mid-decode).
+            and (
+                self.kv_session_offload is None
+                or not self.kv_session_offload.has_spilled()
+            )
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
@@ -4262,6 +4330,10 @@ class Scheduler(
             inflight_batches = [self.running_batch, self.last_batch]
         else:
             inflight_batches = [*self.running_mbs, *self.mbs]
+        if self.kv_session_offload is not None:
+            # A host-spilled session is running too (it decodes via the
+            # spill tick, outside running_batch) -- abort must reach it.
+            inflight_batches.extend(self.kv_session_offload.inflight_batches())
 
         inflight_reqs = {r for b in inflight_batches if b is not None for r in b.reqs}
         for req in inflight_reqs:

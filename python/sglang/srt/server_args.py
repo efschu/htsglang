@@ -1299,6 +1299,67 @@ class ServerArgs:
             "usable to deliberately keep device KV small.",
         ),
     ] = 0
+    enable_kv_session_offload: A[
+        bool,
+        Arg(
+            help="EXPERIMENTAL (S1): per-session KV offload to host RAM with "
+            "FCFS eviction. When the decode batch runs out of KV memory "
+            "(after tree eviction), the YOUNGEST running session is spilled: "
+            "its full-attention KV shard is backed up per rank into a pinned "
+            "host pool and it KEEPS DECODING from host via a separate, "
+            "eager bs=1 tick interleaved between device-batch iterations "
+            "(GDN/Mamba state stays resident). The oldest session is never "
+            "evicted. FIFO restore with hysteresis once device KV frees up. "
+            "S1 scope: exactly ONE spilled session at a time (further "
+            "pressure falls back to stock retraction), eager spill tick (no "
+            "CUDA graph, no H2D/compute overlap), no speculative decoding, "
+            "page_size 1, flashinfer backend, single node. The spilled "
+            "session's decode is PCIe-bound (every step streams its whole "
+            "context H2D); with token-sharded uneven DCP the volume is split "
+            "across ranks, without it the single-link stream is SLOW. "
+            "Default OFF -> every other path is byte-identical.",
+        ),
+    ] = False
+    kv_session_offload_block_size: A[
+        int,
+        Arg(
+            help="kv-session-offload: streamed-block size in per-rank token "
+            "slots. Each spill-tick attention layer pulls the session's "
+            "host-resident KV shard H2D through a staging buffer of this "
+            "many slots per block, runs a partial flashinfer decode, and "
+            "online-LSE-merges the partials (same mechanism as the "
+            "weightless-KV B0/B1 block loop). Also sizes the staging "
+            "buffer (block_size * 2 * kv_heads * head_dim bytes).",
+        ),
+    ] = 8192
+    kv_session_offload_tick_interval: A[
+        int,
+        Arg(
+            help="kv-session-offload: minimum number of scheduler iterations "
+            "between two spill ticks while device sessions are running "
+            "(1 = alternate device tick / spill tick). Larger values keep "
+            "more device throughput and slow the spilled session. When no "
+            "device batch is running the spilled session ticks every "
+            "iteration regardless.",
+        ),
+    ] = 1
+    kv_session_offload_restore_margin_tokens: A[
+        int,
+        Arg(
+            help="kv-session-offload: restore the spilled session only when "
+            "the allocator has (session tokens + this margin) free slots "
+            "(anti-flutter headroom so the restored session does not "
+            "immediately re-trigger a spill).",
+        ),
+    ] = 4096
+    kv_session_offload_restore_hysteresis_steps: A[
+        int,
+        Arg(
+            help="kv-session-offload: the restore memory condition must hold "
+            "for this many consecutive scheduler iterations before the "
+            "spilled session is copied back to device.",
+        ),
+    ] = 4
     rank_tp_ratio: A[
         Optional[Union[List[int], str]],
         Arg(
@@ -3493,6 +3554,10 @@ class ServerArgs:
         # desyncing the DCP collective sequence into a runtime NCCL hang.
         self._handle_weightless_kv_fastlane()
 
+        # kv-session-offload (S1): validate scope, hard-reject the
+        # out-of-scope modes up front (same fail-fast rationale as above).
+        self._handle_kv_session_offload()
+
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
 
@@ -3828,6 +3893,84 @@ class ServerArgs:
                     "weighted token vector); the static slot->tier map is "
                     "defined on the even compaction loc // dcp_size."
                 )
+
+    def _handle_kv_session_offload(self):
+        """kv-session-offload (S1) scope validation: fail fast at arg-parse
+        for every out-of-scope mode instead of desyncing the DCP collective
+        sequence into a runtime NCCL hang or corrupting slot identity."""
+        if not self.enable_kv_session_offload:
+            return
+        if self.kv_session_offload_block_size <= 0:
+            raise ValueError(
+                "--kv-session-offload-block-size must be > 0; got "
+                f"{self.kv_session_offload_block_size}."
+            )
+        if self.kv_session_offload_tick_interval < 1:
+            raise ValueError(
+                "--kv-session-offload-tick-interval must be >= 1; got "
+                f"{self.kv_session_offload_tick_interval}."
+            )
+        if self.kv_session_offload_restore_hysteresis_steps < 1:
+            raise ValueError(
+                "--kv-session-offload-restore-hysteresis-steps must be >= 1."
+            )
+        if self.kv_session_offload_restore_margin_tokens < 0:
+            raise ValueError(
+                "--kv-session-offload-restore-margin-tokens must be >= 0."
+            )
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "--enable-kv-session-offload (S1) does not support "
+                "speculative decoding (--speculative-algorithm="
+                f"{self.speculative_algorithm}). The spill tick is a plain "
+                "eager decode; the draft/verify dispatch is a later stage."
+            )
+        if self.attention_backend not in (None, "flashinfer"):
+            raise ValueError(
+                "--enable-kv-session-offload requires the flashinfer "
+                f"attention backend; got --attention-backend="
+                f"{self.attention_backend}."
+            )
+        if self.page_size not in (None, 1):
+            raise ValueError(
+                "--enable-kv-session-offload requires page_size == 1 "
+                f"(sentinel slot encoding + owner-matched restore); got "
+                f"{self.page_size}."
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "--enable-kv-session-offload does not support PD "
+                f"disaggregation (disaggregation_mode="
+                f"{self.disaggregation_mode})."
+            )
+        if self.weightless_kv_fastlane:
+            raise ValueError(
+                "--enable-kv-session-offload cannot be combined with "
+                "--weightless-kv-fastlane: both re-interpret KV slot "
+                "identity (static tier map vs per-session sentinels)."
+            )
+        if self.enable_hierarchical_cache or self.enable_unified_memory:
+            raise ValueError(
+                "--enable-kv-session-offload is its own host tier; it cannot "
+                "be combined with --enable-hierarchical-cache or "
+                "--enable-unified-memory."
+            )
+        if self.enable_hisparse:
+            raise ValueError(
+                "--enable-kv-session-offload cannot be combined with "
+                "--enable-hisparse (S1)."
+            )
+        if self.pp_size > 1 or self.dp_size > 1:
+            raise ValueError(
+                "--enable-kv-session-offload (S1) supports single-node pure "
+                f"TP/DCP only (pp_size={self.pp_size}, dp_size={self.dp_size})."
+            )
+        if self.enable_mixed_chunk:
+            raise ValueError(
+                "--enable-kv-session-offload does not support "
+                "--enable-mixed-chunk (the spill tick must never be folded "
+                "into a mixed batch)."
+            )
 
     def speculative_draft_solo_active(self) -> bool:
         """True when the draft-solo placement is requested

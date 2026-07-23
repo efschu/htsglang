@@ -998,6 +998,16 @@ class FlashInferAttnBackend(AttentionBackend):
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
 
+        # ---- kv-session-offload (S1) ------------------------------------
+        # Per-step state of the spill tick (None on every other forward --
+        # the ONLY dispatch key; unset means every path below is untouched).
+        self._sess_spill = None
+        self._sess_enabled = bool(
+            getattr(model_runner.server_args, "enable_kv_session_offload", False)
+        ) and not getattr(model_runner, "is_draft_worker", False)
+        if self._sess_enabled:
+            self._sess_wire(model_runner)
+
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[BaseSWAKVPool]:
         """Return the SWA KV pool to translate against, or None for non-SWA models.
@@ -1353,6 +1363,17 @@ class FlashInferAttnBackend(AttentionBackend):
             assert self._swa_kv_pool is not None
             swa_out_cache_loc = self._swa_kv_pool.translate_loc_from_full_to_swa(
                 forward_batch.out_cache_loc
+            )
+
+        # kv-session-offload (S1): (re)derive the spill-tick state for THIS
+        # forward; None on every other batch so all paths stay untouched.
+        # Set unconditionally -- a stale state from a previous spill tick
+        # must never leak into a regular batch.
+        if getattr(self, "_sess_enabled", False):
+            self._sess_spill = (
+                self._sess_prepare_step(forward_batch)
+                if getattr(forward_batch, "kv_session_spill_tick", False)
+                else None
             )
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -2003,6 +2024,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, decode_wrapper, cache_loc, save_kv_cache
             )
 
+        if self._sess_spill is not None:
+            # kv-session-offload spill tick without DCP: host-streamed block
+            # decode over this rank's kv-head slice of the whole session.
+            return self._sess_forward_decode_plain(q, k, v, layer, save_kv_cache)
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -2078,6 +2104,13 @@ class FlashInferAttnBackend(AttentionBackend):
         which receives k/v broadcast from the head rank: the owner-rule +
         compact-slot mapping is identical for both, so it lives here once
         (single source of truth)."""
+        if self._sess_spill is not None:
+            # kv-session-offload spill tick: the new token's slot is a HOST
+            # sentinel -- never scatter it into the device pool. Route the
+            # (gathered, replicated-head) K/V through the scratch-row D2H
+            # owner-write instead. Strictly the spill-tick lane.
+            self._sess_owner_write(layer, k_full, v_full)
+            return
         if self.uneven_dcp_weighted:
             # WEIGHTED owner rule: ownership + compact physical slot are derived
             # from the out_cache_loc itself (not the sequence position), so the
@@ -2447,6 +2480,343 @@ class FlashInferAttnBackend(AttentionBackend):
         out = blk_indices.clone()
         out[hmask] = stage_slots.to(blk_indices.dtype)
         return out
+
+    # ------------------------------------------------------------------
+    # kv-session-offload (S1): host-streamed decode of ONE spilled session.
+    #
+    # A spilled session's whole full-attention KV shard lives in a pinned
+    # host pool, in per-rank OWNED-POSITION order (host row i = this rank's
+    # i-th owned token). The spill tick is a separate eager bs=1 decode
+    # batch; per full-attention layer it
+    #   * owner-writes the new token's K/V through ONE device scratch row
+    #     (stock set_kv_buffer quantization -> byte-identical to a device
+    #     write) and D2H-appends it to the host pool, then
+    #   * streams the shard blockwise H2D through a bounded staging buffer,
+    #     runs flashinfer partial decodes and online-LSE-merges them --
+    #     the exact _wl_blockwise mechanism, but with a per-session dynamic
+    #     row space instead of B1's static slot->tier map.
+    # The per-layer DCP collective sequence (kv gather / q gather /
+    # LSE-merge) is UNCHANGED; the block count is rank-uniform (max over
+    # every rank's owned count, all derived from the replicated
+    # req_to_token sentinels), so no rank can desync the lockstep.
+    # ------------------------------------------------------------------
+
+    def _sess_wire(self, model_runner):
+        """One-time wiring of the session-offload state (flag-gated)."""
+        from sglang.srt.distributed.utils import (
+            cp_token_prefix,
+            cp_token_split_factor,
+        )
+        from sglang.srt.managers.kv_session_offload import sentinel_base
+
+        dcp = int(getattr(self, "dcp_size", 1) or 1)
+        if dcp > 1:
+            assert self.uneven_dcp, (
+                "kv-session-offload: DCP without the uneven-DCP owner rule "
+                "is out of S1 scope (should have failed at pool init)"
+            )
+            self._sess_mode = "weighted" if self.uneven_dcp_weighted else "even"
+            self._sess_S = cp_token_split_factor(dcp)
+            self._sess_prefix = (
+                cp_token_prefix(dcp)
+                if self.uneven_dcp_weighted
+                else list(range(dcp + 1))
+            )
+        else:
+            self._sess_mode = "plain"
+            self._sess_S = 1
+            self._sess_prefix = [0, 1]
+        pool = model_runner.token_to_kv_pool
+        self._sess_pool = pool
+        self._sess_full_pool = getattr(pool, "full_kv_pool", pool)
+        self._sess_host_pool = model_runner.kv_sess_host_pool
+        self._sess_req_pool = model_runner.req_to_token_pool
+        self._sess_block_size = int(
+            model_runner.server_args.kv_session_offload_block_size
+        )
+        self._sess_host_base = sentinel_base(
+            model_runner.token_to_kv_pool_allocator.size, self._sess_S
+        )
+        scratch = getattr(model_runner, "_kv_sess_scratch_slot", None)
+        assert scratch is not None, (
+            "kv-session-offload: scratch row missing from the KV pool"
+        )
+        dev = self._sess_full_pool.k_buffer[0].device
+        self._sess_scratch_loc = torch.tensor(
+            [scratch], dtype=torch.int64, device=dev
+        )
+        proto = self._sess_full_pool.k_buffer[0]
+        self._sess_staging_k = proto.new_empty(
+            (self._sess_block_size,) + tuple(proto.shape[1:])
+        )
+        self._sess_staging_v = proto.new_empty(
+            (self._sess_block_size,) + tuple(proto.shape[1:])
+        )
+        # The wrapper must see the pool's LOGICAL dtype (e.g. an fp8 view of
+        # the uint8 store), exactly like get_kv_buffer() -- a raw uint8
+        # tensor would be misread as an NVFP4 cache.
+        fp = self._sess_full_pool
+        if getattr(fp, "store_dtype", None) is not None and fp.store_dtype != fp.dtype:
+            self._sess_staging_kv = (
+                self._sess_staging_k.view(fp.dtype),
+                self._sess_staging_v.view(fp.dtype),
+            )
+        else:
+            self._sess_staging_kv = (self._sess_staging_k, self._sess_staging_v)
+        self._sess_block_wrapper = None
+        logger.info(
+            "kv-session-offload backend wired: mode=%s S=%d prefix=%s "
+            "host_base=%d scratch_slot=%d block=%d staging=%.1f MB",
+            self._sess_mode,
+            self._sess_S,
+            self._sess_prefix,
+            self._sess_host_base,
+            scratch,
+            self._sess_block_size,
+            2 * self._sess_staging_k.numel() * proto.element_size() / 1e6,
+        )
+
+    def _sess_full_layer_idx(self, layer):
+        """Index of ``layer`` into the full-attention pool's per-layer k/v
+        buffer lists (and the host pool's parallel k_data_refs)."""
+        pool = self._sess_pool
+        if hasattr(pool, "_transfer_full_attention_id"):
+            return pool._transfer_full_attention_id(layer.layer_id) - getattr(
+                self._sess_full_pool, "start_layer", 0
+            )
+        return layer.layer_id - getattr(self._sess_full_pool, "start_layer", 0)
+
+    def _sess_prepare_step(self, forward_batch):
+        """Derive the per-step spill state from replicated inputs only:
+        seq len + the sentinel req_to_token row. Sets owned counts per rank
+        and the RANK-UNIFORM block count. Called from init_forward_metadata
+        for a kv_session_spill_tick decode batch."""
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.kv_session_offload import (
+            new_token_residue,
+            num_blocks_rank_uniform,
+            owned_counts_even,
+            owned_counts_weighted,
+        )
+
+        assert forward_batch.forward_mode.is_decode(), (
+            "kv-session-offload: spill tick must be a decode batch"
+        )
+        assert forward_batch.batch_size == 1, (
+            "kv-session-offload (S1): exactly one spilled session per tick"
+        )
+        L = int(forward_batch.seq_lens_cpu[0].item())
+        rank = self.dcp_rank if self._sess_mode != "plain" else 0
+        dcp = len(self._sess_prefix) - 1
+        row = self._sess_req_pool.req_to_token[
+            forward_batch.req_pool_indices[0], :L
+        ]
+        if self._sess_mode == "weighted":
+            assert int(row.min().item()) >= self._sess_host_base, (
+                "kv-session-offload: non-sentinel slot id in a spill-tick "
+                "row -- slot space corrupted, refusing to attend garbage KV"
+            )
+            residues = row.to(torch.int64) % self._sess_S
+            counts = owned_counts_weighted(residues, self._sess_prefix)
+            assert sum(counts) == L, (
+                f"kv-session-offload: owned counts {counts} do not cover "
+                f"L={L}"
+            )
+            res_cur = new_token_residue(L - 1, self._sess_S)
+            cur_owned = (
+                self._sess_prefix[rank] <= res_cur < self._sess_prefix[rank + 1]
+            )
+        elif self._sess_mode == "even":
+            counts = owned_counts_even(L, dcp)
+            cur_owned = (L - 1) % dcp == rank
+        else:
+            counts = [L]
+            cur_owned = True
+        n_own = counts[rank]
+        num_blocks = num_blocks_rank_uniform(counts, self._sess_block_size)
+        assert n_own <= self._sess_host_pool.size, (
+            f"kv-session-offload: owned shard {n_own} exceeds the host pool "
+            f"({self._sess_host_pool.size} tokens)"
+        )
+        return SimpleNamespace(
+            L=L,
+            n_own=n_own,
+            counts=counts,
+            num_blocks=num_blocks,
+            cur_owned=cur_owned,
+            cur_host_row=n_own - 1 if cur_owned else -1,
+            device=row.device,
+        )
+
+    def _sess_owner_write(self, layer, k_full, v_full):
+        """Spill-tick owner-write for one full-attention layer: quantize the
+        new token's K/V through the device scratch row (stock set_kv_buffer
+        byte path) and D2H-copy it to this rank's next host row. Rank-local;
+        no collectives."""
+        st = self._sess_spill
+        if not st.cur_owned:
+            return
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer
+
+        self._sess_pool.set_kv_buffer(
+            layer,
+            self._sess_scratch_loc,
+            k_full.clone(),
+            v_full.clone(),
+            layer.k_scale,
+            layer.v_scale,
+        )
+        fl = self._sess_full_layer_idx(layer)
+        host = self._sess_host_pool
+        dst_row = torch.tensor(
+            [st.cur_host_row], dtype=torch.int64, device=st.device
+        )
+        transfer_kv_per_layer(
+            src_k=self._sess_full_pool.k_buffer[fl],
+            dst_k=host.k_data_refs[fl],
+            src_v=self._sess_full_pool.v_buffer[fl],
+            dst_v=host.v_data_refs[fl],
+            src_indices=self._sess_scratch_loc,
+            dst_indices=dst_row,
+            item_size=host.token_stride_size,
+        )
+
+    def _sess_block_wrapper_get(self):
+        """Persistent block-decode wrapper for the spill tick. Shares the
+        backend workspace: safe because on a spill-tick step the MAIN decode
+        wrapper is never .run() for the full-attention layers (this loop
+        replaces it), mirroring _wl_block_decode_wrapper."""
+        if self._sess_block_wrapper is None:
+            self._sess_block_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=self.decode_backend,
+                use_tensor_cores=self.decode_use_tensor_cores,
+            )
+        return self._sess_block_wrapper
+
+    def _sess_stage_block(self, layer, s: int, e: int):
+        """Stream this rank's host rows [s, e) of the spilled session H2D
+        into the staging buffers for ``layer``. Returns the staged slot ids
+        (into the staging buffers) in row order."""
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer
+
+        st = self._sess_spill
+        host = self._sess_host_pool
+        fl = self._sess_full_layer_idx(layer)
+        n = e - s
+        host_ids = torch.arange(s, e, dtype=torch.int64, device=st.device)
+        stage_ids = torch.arange(0, n, dtype=torch.int64, device=st.device)
+        transfer_kv_per_layer(
+            src_k=host.k_data_refs[fl],
+            dst_k=self._sess_staging_k,
+            src_v=host.v_data_refs[fl],
+            dst_v=self._sess_staging_v,
+            src_indices=host_ids,
+            dst_indices=stage_ids,
+            item_size=host.token_stride_size,
+        )
+        return stage_ids
+
+    def _sess_blockwise_decode_return_lse(self, q_full, layer):
+        """Spill-tick decode attention over the host-resident shard (DCP
+        form): block loop with H2D staging + flashinfer partial decodes +
+        online LSE merge. Returns (o, lse) in the same shape/space as
+        ``forward_return_lse`` so the cross-rank cp_lse merge consumes it
+        unchanged. Loop count is rank-uniform; empty local blocks are
+        skipped WITHOUT any collective (none is issued inside the loop)."""
+        st = self._sess_spill
+        B = self._sess_block_size
+        n = st.n_own
+        bs = 1
+        num_qo_heads = q_full.shape[1]
+        num_kv_heads = self.indices_updater_decode.num_kv_heads
+        head_dim = q_full.shape[2]
+        iu = self.indices_updater_decode
+        wrapper = self._sess_block_wrapper_get()
+        kv = self._sess_staging_kv
+        last_page = self.kv_last_page_len
+
+        o_acc = None
+        lse_acc = None
+        for j in range(st.num_blocks):
+            s_row = j * B
+            e_row = min((j + 1) * B, n)
+            if s_row >= e_row:
+                # Rank-uniform loop count; nothing owned in this window on
+                # this rank -> no attention, no merge, no divergence.
+                continue
+            stage_ids = self._sess_stage_block(layer, s_row, e_row)
+            cnt = e_row - s_row
+            blk_indptr = torch.tensor(
+                [0, cnt], dtype=torch.int32, device=st.device
+            )
+            wrapper.plan(
+                blk_indptr,
+                stage_ids.to(torch.int32),
+                last_page[:bs],
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,  # page_size
+                q_data_type=iu.q_data_type,
+                kv_data_type=iu.data_type,
+            )
+            o_b, lse_b = wrapper.forward_return_lse(
+                q_full,
+                kv,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+            if o_acc is None:
+                o_acc, lse_acc = o_b, lse_b
+            else:
+                o_acc, lse_acc = _safe_merge_state(o_acc, lse_acc, o_b, lse_b)
+        if o_acc is None:
+            # This rank owns ZERO tokens of the session: reproduce the
+            # shaped empty-attention (o=0, lse=-inf) contract so the
+            # cross-rank cp_lse merge stays balanced (same as the _wl loop).
+            empty_indptr = torch.zeros(2, dtype=torch.int32, device=st.device)
+            empty_ids = torch.zeros(0, dtype=torch.int32, device=st.device)
+            wrapper.plan(
+                empty_indptr,
+                empty_ids,
+                last_page[:bs],
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,
+                q_data_type=iu.q_data_type,
+                kv_data_type=iu.data_type,
+            )
+            o_acc, lse_acc = wrapper.forward_return_lse(
+                q_full,
+                kv,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+        return o_acc, lse_acc
+
+    def _sess_forward_decode_plain(self, q, k, v, layer, save_kv_cache):
+        """Spill-tick decode for plain TP (no DCP): every rank streams the
+        WHOLE session shard (its kv-head slice) from host; the block-merged
+        output needs no cross-rank LSE step (heads are sharded, exactly like
+        the monolithic non-DCP decode)."""
+        if k is not None and save_kv_cache:
+            assert v is not None
+            self._sess_owner_write(
+                layer,
+                k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                v.view(-1, layer.tp_v_head_num, layer.head_dim),
+            )
+        q_local = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        o, _ = self._sess_blockwise_decode_return_lse(q_local, layer)
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     # ------------------------------------------------------------------
     # #136a: CUDA-graph integration of the streaming block-decode.
@@ -3167,7 +3537,13 @@ class FlashInferAttnBackend(AttentionBackend):
 
         q_local = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         q_full = cp_all_gather_heads_uneven(q_local, group, self.dcp_q_head_counts)
-        if self.weightless_kv and getattr(self, "_wl_chunk_block_size", 0):
+        if self._sess_spill is not None:
+            # kv-session-offload spill tick: attend the host-resident shard
+            # via the streamed block loop. Same (o, lse) contract and the
+            # SAME per-layer collective count as the monolithic path -- the
+            # cross-rank cp_lse merge below is untouched.
+            o, lse = self._sess_blockwise_decode_return_lse(q_full, layer)
+        elif self.weightless_kv and getattr(self, "_wl_chunk_block_size", 0):
             # Stage B0: block-decode the owned shard (byte-identical up to fp
             # reassociation). Strictly the weightless lane; rank-uniform with the
             # workers' forward_decode_weightless_worker block loop. Under CUDA-

@@ -559,6 +559,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        # kv-session-offload (S1): the spill tick streams host-resident KV
+        # blockwise with per-block host-side plans -- structurally eager.
+        # The flag is replicated scheduler state, so every rank decides
+        # identically (no collective-count divergence).
+        if getattr(forward_batch, "kv_session_spill_tick", False):
+            return False
+
         # Weightless streaming block-decode (#136a): rung availability +
         # (under host spill) linear-slot-layout admission. Rank-uniform
         # inputs -> head and workers decide identically.

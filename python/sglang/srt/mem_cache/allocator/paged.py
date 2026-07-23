@@ -258,6 +258,38 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
+    def alloc_owner_matched_classes(self, mod, class_bounds, class_needs):
+        """kv-session-offload (S1) restore: allocate slots whose residue
+        ``slot % mod`` falls into per-class bounds ``[lo, hi)`` -- one class
+        per DCP rank under the weighted owner rule, so each restored token
+        lands on the rank that holds its host-backup row.
+
+        page_size must be 1 (the uneven-DCP allocator keeps the natural page
+        size, so page id == slot id). Deterministic: picks the FIRST n free
+        slots of each class in current free-list order, identical on every
+        rank (the free list is replicated scheduler state). Returns a list
+        of int64 slot tensors (one per class, ascending pick order) and
+        removes them from the free list, or None (state unchanged) when any
+        class has too few free slots. Never called on the default path."""
+        assert self.page_size == 1, (
+            "alloc_owner_matched_classes requires page_size == 1"
+        )
+        if len(self.release_pages) > 0:
+            self.merge_and_sort_free()
+        pages = self.free_pages
+        res = pages % mod
+        take_mask = torch.zeros_like(pages, dtype=torch.bool)
+        picks = []
+        for (lo, hi), need in zip(class_bounds, class_needs):
+            m = (res >= lo) & (res < hi)
+            idxs = m.nonzero(as_tuple=False).flatten()[:need]
+            if idxs.numel() < need:
+                return None
+            take_mask[idxs] = True
+            picks.append(pages[idxs].to(torch.int64))
+        self.free_pages = pages[~take_mask]
+        return picks
+
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return

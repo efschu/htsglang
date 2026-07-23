@@ -80,6 +80,9 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    # kv-session-offload (S1): manager for host-spilled sessions; None when
+    # the feature is off (default) -> the finish path below is untouched.
+    kv_session_offload: Optional[object] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -905,7 +908,14 @@ class SchedulerBatchResultProcessor:
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
 
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            if getattr(req, "kv_spill_state", None) == "host":
+                # kv-session-offload: the request finished WHILE spilled --
+                # its req_to_token row holds host sentinels, not allocator
+                # slots. Release Mamba state + req slot only; the stock
+                # release below would free sentinel ids into the allocator
+                # (slot-space corruption) and insert garbage into the tree.
+                self.kv_session_offload.release_finished_spilled_req(req)
+            elif self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
