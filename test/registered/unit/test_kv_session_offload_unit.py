@@ -488,6 +488,103 @@ def test_wave_back_converges_against_concurrent_append():
     assert seq_len - boundary > 500  # host tail grew, wave-back fell behind
 
 
+# ---------------------------------------------------------------------------
+# S4 multi-spill: the established victim ordering, now over N victims
+# ---------------------------------------------------------------------------
+
+
+def _iterated_spill_order(reqs, *, fast_pressure, max_victims=99):
+    """Mirror the manager: spill one victim at a time, removing each spilled
+    session from the candidate set (filter_batch), until no victim remains."""
+    remaining = list(reqs)
+    order = []
+    while len(order) < max_victims:
+        vi = select_spill_victim(remaining, fast_pressure=fast_pressure)
+        if vi is None:
+            break
+        order.append(remaining[vi].kv_arrival_seq)
+        remaining.pop(vi)
+    return order
+
+
+def test_multi_spill_iterated_order_is_youngest_first_oldest_tabu():
+    # normals arrival 0(oldest)..4(youngest); no fast pressure
+    reqs = [_FakeReq(s) for s in (0, 1, 2, 3, 4)]
+    order = _iterated_spill_order(reqs, fast_pressure=False)
+    # youngest-first; the OLDEST normal (0) is never spilled (tabu)
+    assert order == [4, 3, 2, 1]
+    assert 0 not in order
+
+
+def test_multi_spill_fast_pressure_can_drain_all_normals_incl_oldest():
+    reqs = [_FakeReq(s) for s in (0, 1, 2, 3, 4)]
+    order = _iterated_spill_order(reqs, fast_pressure=True)
+    # under fast pressure even the oldest normal is eligible -> all, youngest first
+    assert order == [4, 3, 2, 1, 0]
+
+
+def test_multi_spill_fast_lane_reqs_never_victims_across_iterations():
+    reqs = [
+        _FakeReq(0, fast=True),
+        _FakeReq(1),
+        _FakeReq(5, fast=True),
+        _FakeReq(2),
+        _FakeReq(3),
+    ]
+    order = _iterated_spill_order(reqs, fast_pressure=True)
+    # only the normals (arrival 1,2,3) spill, youngest first; fast never
+    assert order == [3, 2, 1]
+
+
+def _simulate_fastlane_multi_eviction(reqs, sizes, need, have0, chunk, max_regions):
+    """Model of _maybe_spill_for_fast_lane: loop the single-victim partial
+    spill until the fast request fits, no region is free, or no eligible
+    victim remains. Each partial spill frees min(chunk_ceil(residual), the
+    victim's spillable suffix)."""
+    have = have0
+    remaining = list(range(len(reqs)))
+    victims = []
+    regions = max_regions
+    while regions > 0 and have < need:
+        shortfall = need - have
+        sub = [reqs[i] for i in remaining]
+        sub_sizes = [sizes[i] for i in remaining]
+        vi = select_spill_victim(
+            sub, sizes=sub_sizes, need=shortfall, fast_pressure=True
+        )
+        if vi is None:
+            break
+        gi = remaining.pop(vi)
+        freed = min(chunk_ceil(shortfall, chunk), sizes[gi])
+        victims.append(gi)
+        have += freed
+        regions -= 1
+    return victims, have
+
+
+def test_fastlane_multi_eviction_covers_large_need():
+    # one victim cannot cover; several partial spills together do
+    reqs = [_FakeReq(s) for s in (0, 1, 2, 3)]
+    sizes = [400, 400, 400, 400]
+    victims, have = _simulate_fastlane_multi_eviction(
+        reqs, sizes, need=1000, have0=0, chunk=128, max_regions=4
+    )
+    assert have >= 1000  # fast request now fits
+    # youngest-first eviction; oldest allowed under fast pressure
+    assert victims == [3, 2, 1]  # 3x(<=400) covers 1000, stops early
+
+
+def test_fastlane_multi_eviction_capped_by_free_regions():
+    reqs = [_FakeReq(s) for s in (0, 1, 2, 3)]
+    sizes = [100, 100, 100, 100]
+    victims, have = _simulate_fastlane_multi_eviction(
+        reqs, sizes, need=1000, have0=0, chunk=128, max_regions=2
+    )
+    # only 2 regions -> at most 2 victims spilled; need NOT fully covered
+    assert len(victims) == 2 and have < 1000
+    assert victims == [3, 2]  # still youngest-first
+
+
 def test_restore_hysteresis():
     h = RestoreHysteresis(3)
     assert not h.update(True)

@@ -2600,16 +2600,19 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         self._sess_scratch_i = int(scratch)
         self._sess_wrappers = {}
-        self._sess_count_cache = None
-        # S1b: (boundary, dev_head_idx int32, n_head_own) of the current
-        # spill's device-resident head. Reset on clear AND whenever wave-back
-        # (S3) grows the head, so the next tick re-derives the split.
-        self._sess_head = None
-        # S3 wave-back: this rank's count of host-tail rows already migrated
-        # back to device -- the active tail owns host rows [base, host_next).
-        # The dedicated wave event lets the next tick's device-head read wait
-        # the (copy-stream) H2D and lets the scheduler throttle on inflight.
-        self._sess_host_row_base = 0
+        # S4: persistent per-SESSION state, keyed by req_pool_idx. Each entry:
+        #   .region_base  -- first host row of this session's host-pool region
+        #   .host_row_base -- S3 wave-back drain (rows [region_base,
+        #                     region_base+host_row_base) already migrated back)
+        #   .head         -- S1b (boundary, dev_head_idx int32, n_head_own),
+        #                    reset when the head grows (spill / wave-back)
+        #   .count_cache  -- S2 incremental tail owned-count cache (L, counts)
+        # Only these are per-session; the ticks are serialized so the staging
+        # buffers, copy stream and wave event stay singular.
+        self._sess_slots = {}
+        self._sess_region_tokens = int(
+            getattr(model_runner, "kv_sess_region_tokens", self._sess_host_pool.size)
+        )
         # A never-recorded CUDA event reports .query() == True (no pending
         # work), so wave-back throttling starts in the "idle/complete" state.
         self._sess_wave_done = torch.cuda.Event()
@@ -2624,6 +2627,31 @@ class FlashInferAttnBackend(AttentionBackend):
             self._sess_block_size,
             2 * self._sess_staging_k.numel() * proto.element_size() / 1e6,
         )
+
+    def _sess_open_slot(self, rpi: int, region_base: int):
+        """Register a newly spilled session's per-session state (S4). Called
+        by the manager at spill time; region_base is the first host row of
+        this session's host-pool region."""
+        from types import SimpleNamespace
+
+        self._sess_slots[int(rpi)] = SimpleNamespace(
+            region_base=int(region_base),
+            host_row_base=0,
+            head=None,
+            count_cache=None,
+        )
+
+    def _sess_close_slot(self, rpi: int):
+        """Drop a session's per-session state on restore/finish (S4)."""
+        self._sess_slots.pop(int(rpi), None)
+
+    def _sess_slot_reset_head(self, rpi: int):
+        """Force re-derivation of the head/tail split + tail counts on the
+        next tick (after a spill or a wave-back grew the device head)."""
+        slot = self._sess_slots.get(int(rpi))
+        if slot is not None:
+            slot.head = None
+            slot.count_cache = None
 
     def _sess_full_layer_idx(self, layer):
         """Index of ``layer`` into the full-attention pool's per-layer k/v
@@ -2675,16 +2703,20 @@ class FlashInferAttnBackend(AttentionBackend):
         lo = self._sess_prefix[rank]
         hi = self._sess_prefix[rank + 1]
 
+        # S4: this tick's session (rpi) -> its persistent per-session slot.
+        rpi = int(forward_batch.req_pool_indices[0].item())
+        slot = self._sess_slots[rpi]
+
         # S1b: head/tail split. The device-resident head [0, boundary) keeps
         # real slot ids; the host tail [boundary, L) carries sentinels. The
-        # boundary (leading non-sentinel run) is CONSTANT for the life of a
-        # spill -- new tokens append to the host tail -- so it, and this
-        # rank's owned head indices, are derived from the row ONCE and cached
-        # (`_sess_head`, reset by _clear_spill_state). All downstream counts
-        # (blocks, host rows, cur_host_row) are TAIL counts; the head is
-        # attended separately in _sess_blockwise_decode_return_lse.
+        # boundary (leading non-sentinel run) is CONSTANT between wave-backs
+        # -- new tokens append to the host tail -- so it, and this rank's
+        # owned head indices, are derived from the row ONCE and cached on the
+        # slot (reset on spill / wave-back). All downstream counts (blocks,
+        # host rows, cur_host_row) are TAIL counts; the head is attended
+        # separately in _sess_blockwise_decode_return_lse.
         row = None
-        head = self._sess_head
+        head = slot.head
         if head is None:
             row = self._sess_req_pool.req_to_token[
                 forward_batch.req_pool_indices[0], :L
@@ -2704,12 +2736,12 @@ class FlashInferAttnBackend(AttentionBackend):
             else:
                 dev_head_idx = None
             n_head_own = 0 if dev_head_idx is None else int(dev_head_idx.numel())
-            self._sess_head = (boundary, dev_head_idx, n_head_own)
+            slot.head = (boundary, dev_head_idx, n_head_own)
         else:
             boundary, dev_head_idx, n_head_own = head
 
         if self._sess_mode == "weighted":
-            cache = self._sess_count_cache
+            cache = slot.count_cache
             if cache is not None and cache[0] == L:
                 counts = list(cache[1])
             elif cache is not None and cache[0] == L - 1:
@@ -2739,7 +2771,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     f"kv-session-offload: tail owned counts {counts} do not "
                     f"cover L-boundary={L - boundary}"
                 )
-            self._sess_count_cache = (L, tuple(counts))
+            slot.count_cache = (L, tuple(counts))
             res_cur = new_token_residue(L - 1, self._sess_S)
             cur_owned = (
                 self._sess_prefix[rank] <= res_cur < self._sess_prefix[rank + 1]
@@ -2754,14 +2786,16 @@ class FlashInferAttnBackend(AttentionBackend):
             cur_owned = True
         n_own = counts[rank]
         num_blocks = num_blocks_rank_uniform(counts, self._sess_block_size)
-        # S3: the active tail owns host rows [base, base + n_own); earlier
-        # wave-back steps drained rows [0, base). host_next = base + n_own is
-        # the high-water mark against the pool size.
-        base = self._sess_host_row_base
-        assert base + n_own <= self._sess_host_pool.size, (
-            f"kv-session-offload: host high-water {base + n_own} exceeds the "
-            f"host pool ({self._sess_host_pool.size} tokens)"
+        # S3/S4: within this session's region, the active tail owns local host
+        # rows [drain, drain + n_own); wave-back drained [0, drain). The
+        # absolute host row is region_base + local. host_next = drain + n_own
+        # is the high-water against the REGION capacity.
+        drain = slot.host_row_base
+        assert drain + n_own <= self._sess_region_tokens, (
+            f"kv-session-offload: region high-water {drain + n_own} exceeds "
+            f"the per-session region ({self._sess_region_tokens} tokens)"
         )
+        base = slot.region_base + drain
 
         # Flattened layer-major streamed-block schedule. Every full-attn
         # layer streams the same k_local non-empty local blocks; regions

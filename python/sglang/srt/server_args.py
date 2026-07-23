@@ -1360,6 +1360,21 @@ class ServerArgs:
             "spilled session is copied back to device.",
         ),
     ] = 4
+    kv_session_offload_max_spills: A[
+        int,
+        Arg(
+            help="kv-session-offload (S4): maximum number of sessions spilled "
+            "to host CONCURRENTLY. The pinned host pool is partitioned into "
+            "this many equal per-session regions; each region holds one "
+            "max-context session's owned KV shard. >1 lifts the S1 "
+            "one-spill-slot limit: a second decode-OOM spills a second "
+            "session, and a fast-lane request may evict SEVERAL normal "
+            "sessions to fit. The spill ticks still run one session at a time "
+            "(round-robin), so raising this trades host RAM for admission "
+            "headroom, not per-session decode speed. Sizes the host pool "
+            "linearly (N x one-session budget).",
+        ),
+    ] = 1
     rank_tp_ratio: A[
         Optional[Union[List[int], str]],
         Arg(
@@ -3913,6 +3928,11 @@ class ServerArgs:
         if self.kv_session_offload_restore_hysteresis_steps < 1:
             raise ValueError(
                 "--kv-session-offload-restore-hysteresis-steps must be >= 1."
+            )
+        if self.kv_session_offload_max_spills < 1:
+            raise ValueError(
+                "--kv-session-offload-max-spills must be >= 1; got "
+                f"{self.kv_session_offload_max_spills}."
             )
         if self.kv_session_offload_restore_margin_tokens < 0:
             raise ValueError(

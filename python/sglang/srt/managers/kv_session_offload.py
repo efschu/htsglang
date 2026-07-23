@@ -415,11 +415,44 @@ class WaveBackController:
 # ---------------------------------------------------------------------------
 
 
+class SpillSlot:
+    """One CONCURRENTLY spilled session's scheduling state (S4).
+
+    Each spilled session owns a distinct host-pool REGION (index ``region``,
+    host rows ``[region * region_tokens, ...)``) and its own wave-back /
+    restore-hysteresis gates. The ticks of all slots are still serialized
+    (one spill tick per scheduler iteration, round-robin by
+    ``last_tick_iter``), so the transient per-tick backend state (staging,
+    copy stream, wave event) stays singular; only this persistent per-session
+    state is multiplied. The pure victim ORDERING is unchanged -- multi-spill
+    just repeats the single-victim selection over free regions."""
+
+    __slots__ = (
+        "req",
+        "batch",
+        "region",
+        "spill_iter",
+        "last_tick_iter",
+        "wave",
+        "hysteresis",
+    )
+
+    def __init__(self, req, region, spill_iter, wave, hysteresis):
+        self.req = req
+        self.batch = None  # bs=1 decode batch, built lazily at the first tick
+        self.region = region
+        self.spill_iter = spill_iter
+        self.last_tick_iter = -(1 << 30)
+        self.wave = wave
+        self.hysteresis = hysteresis
+
+
 class KVSessionOffloadManager:
-    """Owns the S1 spill/restore state machine inside one scheduler process.
+    """Owns the spill/restore state machine inside one scheduler process.
 
     All decisions are functions of replicated scheduler state; the manager
-    performs only rank-local GPU<->host copies (no collectives).
+    performs only rank-local GPU<->host copies (no collectives). S4: up to
+    ``max_spills`` sessions may be spilled at once, one per host-pool region.
     """
 
     def __init__(self, scheduler):
@@ -428,19 +461,9 @@ class KVSessionOffloadManager:
         self.block_size = int(sa.kv_session_offload_block_size)
         self.tick_interval = max(1, int(sa.kv_session_offload_tick_interval))
         self.restore_margin_tokens = int(sa.kv_session_offload_restore_margin_tokens)
-        self.hysteresis = RestoreHysteresis(
+        self._hysteresis_steps = int(
             sa.kv_session_offload_restore_hysteresis_steps
         )
-        # S3 wave-back: the generic block unit is the streamed owner-block
-        # (block_size); the warmup gate reuses the restore hysteresis. The
-        # host-tail front migrates back one block per free window.
-        self.wave = WaveBackController(
-            self.block_size, sa.kv_session_offload_restore_hysteresis_steps
-        )
-        # Per-rank count of this rank's owned tail tokens already waved back
-        # (host rows [0, base) are drained; the active tail owns rows
-        # [base, host_next)). Reset with every spill.
-        self._host_row_base = 0
 
         mr = scheduler.tp_worker.model_runner
         self.model_runner = mr
@@ -468,12 +491,25 @@ class KVSessionOffloadManager:
         self.allocator = scheduler.token_to_kv_pool_allocator
         self.tree_cache = scheduler.tree_cache
 
-        # S1 state: at most one spilled session.
-        self.spilled_req: Optional["Req"] = None
-        self.spilled_batch: Optional["ScheduleBatch"] = None
+        # S4 multi-spill: the host pool is partitioned into `max_spills` equal
+        # regions of `region_tokens` rows each; region r owns host rows
+        # [r * region_tokens, (r+1) * region_tokens). At most one session per
+        # region is spilled at a time.
+        self.max_spills = max(1, int(sa.kv_session_offload_max_spills))
+        self.region_tokens = int(
+            getattr(mr, "kv_sess_region_tokens", self.host_pool.size)
+        )
+        assert self.region_tokens * self.max_spills <= self.host_pool.size, (
+            "kv-session-offload: host pool too small for "
+            f"{self.max_spills} x {self.region_tokens} regions"
+        )
+        self._free_regions = list(range(self.max_spills))
+        # Active spilled sessions, keyed by req_pool_idx (rpi). Insertion
+        # order is preserved (FCFS-ish tick fairness fallback).
+        self.spills: dict[int, SpillSlot] = {}
+
         self._iter_ct = 0  # incremented once per pre_schedule call
-        self._spill_iter = -1
-        self._last_tick_iter = -(1 << 30)
+        self._last_tick_iter = -(1 << 30)  # AGGREGATE cadence across slots
         self._fast_queue_logged_rid = None
         self._fast_lane_enabled = bool(getattr(sa, "enable_fast_lane", False))
 
@@ -481,9 +517,9 @@ class KVSessionOffloadManager:
         _MANAGER = self
 
         logger.info(
-            "kv-session-offload (S1) armed: mode=%s S=%d prefix=%s rank=%d "
+            "kv-session-offload (S4) armed: mode=%s S=%d prefix=%s rank=%d "
             "block=%d tick_interval=%d restore_margin=%d hysteresis=%d "
-            "host_pool=%d tokens/rank",
+            "host_pool=%d tokens/rank max_spills=%d region=%d tokens",
             self.mode,
             self.S,
             self.cp_prefix,
@@ -491,9 +527,16 @@ class KVSessionOffloadManager:
             self.block_size,
             self.tick_interval,
             self.restore_margin_tokens,
-            self.hysteresis.steps,
+            self._hysteresis_steps,
             self.host_pool.size,
+            self.max_spills,
+            self.region_tokens,
         )
+
+    # -- slot bookkeeping -------------------------------------------------
+
+    def _slot_of(self, req) -> Optional["SpillSlot"]:
+        return self.spills.get(req.req_pool_idx)
 
     # -- helpers ----------------------------------------------------------
 
@@ -513,7 +556,7 @@ class KVSessionOffloadManager:
             torch.cuda.current_stream().wait_stream(fs)
 
     def has_spilled(self) -> bool:
-        return self.spilled_req is not None
+        return len(self.spills) > 0
 
     # -- spill ------------------------------------------------------------
 
@@ -550,13 +593,14 @@ class KVSessionOffloadManager:
         ``need`` (token shortfall to free) is computed from the batch's next
         decode step when not given; the fast-lane trigger passes the waiting
         request's shortfall explicitly. If a single victim's exclusive
-        suffix cannot cover ``need`` the whole suffix spills and the caller
-        re-checks (multi-eviction across sessions is an S4 extension).
+        suffix cannot cover ``need`` the whole suffix spills; the caller
+        (decode-OOM re-check, or the fast-lane loop) spills further victims
+        into further free regions.
 
-        S1 limit: ONE spill slot. If a fast-lane request needs MORE room
-        than one eviction frees, it stays cleanly queued (multi-eviction is
-        an S4 extension) -- never an inconsistent partial spill."""
-        if self.spilled_req is not None:
+        S4: spills ONE victim into ONE free host region per call. Returns
+        False when no region is free (falls back to stock retraction) --
+        never an inconsistent partial spill."""
+        if not self._free_regions:
             return False
         if fast_pressure is None:
             fast_pressure = self._fast_lane_pressure(batch.reqs)
@@ -628,15 +672,19 @@ class KVSessionOffloadManager:
             pos_offset=boundary,  # even-mode ownership keys on absolute position
         )
         n_own = int(dev_idx.numel())
-        if n_own > self.host_pool.size:
+        if n_own > self.region_tokens:
             logger.warning(
                 "kv-session-offload: session rid=%s tail needs %d host rows > "
-                "pool %d; falling back to stock retraction.",
+                "region %d; falling back to stock retraction.",
                 req.rid,
                 n_own,
-                self.host_pool.size,
+                self.region_tokens,
             )
             return False
+
+        # Claim a free host region for this session (S4).
+        region = self._free_regions.pop(0)
+        region_base = region * self.region_tokens
 
         # Owner residues of the TAIL SEGMENT, before the row is overwritten.
         # Weighted rule: ownership is a function of the slot id -> preserve
@@ -651,21 +699,22 @@ class KVSessionOffloadManager:
                 % self.S
             )
 
+        # Register the session's backend slot (region base, fresh head/count
+        # caches, drain=0). The tick sources its per-session state from here.
+        self.backend._sess_open_slot(req.req_pool_idx, region_base)
+
         # 1. Order after any in-flight forward that still writes this
         #    session's last KV row (overlap mode), then D2H-backup the tail's
-        #    owned slots (all full-attention layers) into host rows [0, n).
-        #    Also quiesce the streamed-prefetch copy stream: a previous
-        #    spill's queued H2D reads of these host rows must complete before
-        #    we overwrite them (S2 double-buffer pipeline).
+        #    owned slots (all full-attention layers) into this region's host
+        #    rows [region_base, region_base + n). Also quiesce the streamed-
+        #    prefetch copy stream: a previous spill's queued H2D reads of these
+        #    host rows must complete before we overwrite them (double buffer).
         self._wait_forward_stream()
         torch.cuda.current_stream().wait_stream(self.backend._sess_copy_stream)
-        self.backend._sess_count_cache = None
-        self.backend._sess_head = None  # new spill: re-derive head/tail split
-        self._host_row_base = 0
-        self.backend._sess_host_row_base = 0
-        self.wave.reset()
         if n_own > 0:
-            host_ids = torch.arange(n_own, dtype=torch.int64, device=row.device)
+            host_ids = torch.arange(
+                region_base, region_base + n_own, dtype=torch.int64, device=row.device
+            )
             self.host_pool.backup_from_device_all_layer(
                 self.full_pool, host_ids, dev_idx, io_backend="kernel"
             )
@@ -691,10 +740,14 @@ class KVSessionOffloadManager:
 
         req.kv_spill_state = "host"
         req.kv_spill_boundary = boundary
-        self.spilled_req = req
-        self.spilled_batch = None  # built lazily at the first tick
-        self._spill_iter = self._iter_ct
-        self.hysteresis.reset()
+        slot = SpillSlot(
+            req=req,
+            region=region,
+            spill_iter=self._iter_ct,
+            wave=WaveBackController(self.block_size, self._hysteresis_steps),
+            hysteresis=RestoreHysteresis(self._hysteresis_steps),
+        )
+        self.spills[req.req_pool_idx] = slot
 
         keep = [i for i in range(len(batch.reqs)) if i != idx]
         batch.filter_batch(keep_indices=keep)
@@ -703,8 +756,8 @@ class KVSessionOffloadManager:
         self._log(
             "kv-session-offload SPILL(partial): rid=%s arrival_seq=%s L=%d "
             "boundary=%d device_head=%d host_tail=%d owned_tail=%d (rank %d) "
-            "protected_prefix=%d; need=%d freed=%d over-eviction margin=%d "
-            "tokens; device batch bs=%d",
+            "region=%d protected_prefix=%d; need=%d freed=%d over-eviction "
+            "margin=%d tokens; device batch bs=%d spills=%d/%d",
             req.rid,
             getattr(req, "kv_arrival_seq", None),
             L,
@@ -713,18 +766,21 @@ class KVSessionOffloadManager:
             spill_count,
             n_own,
             self.dcp_rank,
+            region,
             protected,
             need,
             spill_count,
             spill_margin,
             len(batch.reqs),
+            len(self.spills),
+            self.max_spills,
         )
         return True
 
     # -- spill tick -------------------------------------------------------
 
-    def _build_spill_batch(self) -> "ScheduleBatch":
-        """Decode ScheduleBatch for the spilled session (persistent across
+    def _build_spill_batch(self, req: "Req") -> "ScheduleBatch":
+        """Decode ScheduleBatch for a spilled session (persistent across
         ticks, exactly like running_batch). Mirrors the hisparse
         staging->decode builder: the last sampled token is stashed into the
         future map so resolve_forward_inputs picks it up."""
@@ -733,7 +789,6 @@ class KVSessionOffloadManager:
         from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
         sch = self.scheduler
-        req = self.spilled_req
         device = sch.device
 
         batch = ScheduleBatch.init_new(
@@ -797,31 +852,40 @@ class KVSessionOffloadManager:
 
     def pre_schedule(self, running_batch, last_batch):
         """Early hook in get_next_batch_to_run (before prefill/decode batch
-        selection): cleanup of a finished spilled session, fast-lane
-        admission pressure, and FIFO restore with hysteresis. Returns the
-        (possibly merged) running_batch."""
+        selection): cleanup of finished spilled sessions, fast-lane admission
+        pressure, and incremental wave-back / FIFO restore of each spilled
+        session. Returns the (possibly merged) running_batch."""
         self._iter_ct += 1
 
-        if self.spilled_req is None:
+        # 1. Reap sessions that finished on host (release ran in the result
+        #    processor and already freed the region + backend slot).
+        for rpi, slot in list(self.spills.items()):
+            if slot.req.finished():
+                if slot.batch is not None:
+                    slot.batch.filter_batch()
+                self._close_slot(rpi, "finished on host")
+
+        if not self.spills:
             self._maybe_spill_for_fast_lane(running_batch)
             return running_batch
 
-        # Finished while spilled? (Release ran in the result processor.)
-        if self.spilled_req.finished():
-            if self.spilled_batch is not None:
-                self.spilled_batch.filter_batch()
-            self._clear_spill_state("finished on host")
-            return running_batch
+        # 2. Fast-lane admission may still evict more sessions (into further
+        #    free regions) even while some are already spilled.
+        self._maybe_spill_for_fast_lane(running_batch)
 
-        return self._maybe_restore_flow(running_batch, last_batch)
+        # 3. Restore / wave-back each spilled session independently. A
+        #    completed restore merges that session back into running_batch.
+        for rpi, slot in list(self.spills.items()):
+            running_batch = self._maybe_restore_flow(slot, running_batch, last_batch)
+        return running_batch
 
     def _maybe_spill_for_fast_lane(self, running_batch):
-        """Fast-lane admission trigger: a WAITING fast-lane request that
-        does not fit into (free + tree-evictable) KV evicts the youngest
-        running normal session -- under fast pressure even the oldest
-        (select_spill_victim fast_pressure=True). S1 limit: one spill slot;
-        if a single eviction is not enough, the fast request stays cleanly
-        queued (multi-eviction is S2)."""
+        """Fast-lane admission trigger: a WAITING fast-lane request that does
+        not fit into (free + tree-evictable) KV evicts the youngest running
+        normal session -- under fast pressure even the oldest
+        (select_spill_victim fast_pressure=True). S4: MULTIPLE normal sessions
+        may be evicted (one per free region) until the fast request fits or no
+        region/victim remains -- lifting the S1 single-eviction limit."""
         sch = self.scheduler
         # Zero-overhead invariant: without --enable-fast-lane no request can
         # be fast-lane -> skip the queue scan entirely.
@@ -845,29 +909,36 @@ class KVSessionOffloadManager:
         )
         max_new = getattr(fr.sampling_params, "max_new_tokens", 0) or 0
         need = len(fr.origin_input_ids) + int(max_new * ratio) + 1
-        have = self.allocator.available_size() + self._tree_evictable_size()
-        if have >= need:
-            return  # normal admission will take it
-        # Free exactly the fast request's shortfall (block-rounded inside
-        # try_spill) -- a partial tail spill, not the whole victim.
-        if self.try_spill(running_batch, fast_pressure=True, need=need - have):
+
+        spilled_any = 0
+        while self._free_regions:
+            have = self.allocator.available_size() + self._tree_evictable_size()
+            if have >= need:
+                break  # normal admission will take it now
+            # Free the residual shortfall (block-rounded inside try_spill);
+            # each victim is a partial tail spill into its own region.
+            if not self.try_spill(
+                running_batch, fast_pressure=True, need=need - have
+            ):
+                break  # no eligible victim in the batch
+            spilled_any += 1
+
+        if spilled_any:
             self._log(
-                "kv-session-offload: spilled for FAST-LANE request rid=%s "
-                "(need %d tokens, had %d)",
+                "kv-session-offload: spilled %d session(s) for FAST-LANE "
+                "request rid=%s (need %d tokens)",
+                spilled_any,
                 fr.rid,
                 need,
-                have,
             )
         elif self._fast_queue_logged_rid != fr.rid:
             self._fast_queue_logged_rid = fr.rid
             self._log(
-                "kv-session-offload (S1): fast-lane request rid=%s needs %d "
-                "tokens, %d available and the single spill slot cannot free "
-                "enough -- request stays queued (multi-eviction is an S2 "
-                "extension).",
+                "kv-session-offload (S4): fast-lane request rid=%s needs %d "
+                "tokens but no free region / no eligible victim can free "
+                "enough -- request stays queued.",
                 fr.rid,
                 need,
-                have,
             )
 
     def _tree_evictable_size(self) -> int:
@@ -884,7 +955,7 @@ class KVSessionOffloadManager:
                 continue
         return 0
 
-    def _maybe_restore_flow(self, running_batch, last_batch):
+    def _maybe_restore_flow(self, slot, running_batch, last_batch):
         # While a fast-lane request is waiting for admission, the freed
         # device space belongs to IT (fast beats FCFS): restoring now would
         # only re-trigger the fast-pressure spill (spill<->restore thrash,
@@ -894,33 +965,30 @@ class KVSessionOffloadManager:
             getattr(r, "is_fast_lane", False)
             for r in getattr(self.scheduler, "waiting_queue", ())
         ):
-            self.hysteresis.reset()
+            slot.hysteresis.reset()
             return running_batch
 
-        # Restore only when the spilled session is quiescent: it was not
-        # the batch launched last iteration (its result must be processed so
+        req = slot.req
+        # Restore only when this session is quiescent: it was not the batch
+        # launched last iteration (its result must be processed so
         # seq_lens/output_ids are settled), and memory holds.
-        if self.spilled_batch is not None:
-            if last_batch is self.spilled_batch:
+        if slot.batch is not None:
+            if last_batch is slot.batch:
                 return running_batch
-            L = int(self.spilled_batch.seq_lens_cpu[0].item())
+            L = int(slot.batch.seq_lens_cpu[0].item())
         else:
             # Spilled but never ticked yet: restorable once the victim's
             # last device result has been processed (>= one iteration).
-            if self._iter_ct <= self._spill_iter:
+            if self._iter_ct <= slot.spill_iter:
                 return running_batch
-            L = len(self.spilled_req.origin_input_ids) + len(
-                self.spilled_req.output_ids
-            ) - 1
+            L = len(req.origin_input_ids) + len(req.output_ids) - 1
 
-        row = self.req_to_token_pool.req_to_token[
-            self.spilled_req.req_pool_idx, :L
-        ]
+        row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :L]
         boundary = int((row < self.host_base).sum().item())
         if boundary >= L:
             # Tail fully drained by earlier wave-back steps -- nothing left on
             # host; just rejoin the device batch (no H2D remains).
-            return self._finalize_restore(running_batch, L)
+            return self._finalize_restore(slot, running_batch, L)
 
         remaining = L - boundary
         avail = self.allocator.available_size()
@@ -929,10 +997,10 @@ class KVSessionOffloadManager:
         # stop-restore (S1/S2 path; faster than nibbling when space is
         # abundant, e.g. the pressure that caused the spill is fully gone).
         if avail >= remaining + self.restore_margin_tokens:
-            if self.hysteresis.update(self._restore_memory_ok(L)):
-                return self._restore(running_batch, L)
+            if slot.hysteresis.update(self._restore_memory_ok(req, L)):
+                return self._restore(slot, running_batch, L)
             return running_batch
-        self.hysteresis.reset()
+        slot.hysteresis.reset()
 
         # PRIMARY path: opportunistic incremental wave-back of one owner-block
         # from the host-tail front. H2D on the copy stream -> other device
@@ -941,7 +1009,7 @@ class KVSessionOffloadManager:
         # inside _wave_back is the hard gate; `remaining_cap` keeps the step
         # from ever asking for more slots than are free.
         copy_inflight = not self.backend._sess_wave_done.query()
-        advance = self.wave.plan(
+        advance = slot.wave.plan(
             boundary,
             L,
             space_ok=avail > 0,
@@ -949,25 +1017,34 @@ class KVSessionOffloadManager:
             remaining_cap=avail,
         )
         if advance > 0:
-            self._wave_back(L, boundary, advance)
+            self._wave_back(slot, L, boundary, advance)
         return running_batch
 
+    def _pick_tick_slot(self, running_batch):
+        """Round-robin the spill tick over the active slots: among the slots
+        that are DUE (past their spill iteration, not finished), pick the one
+        that ticked least recently (fairness). Rank-uniform (all inputs are
+        replicated: iter counters + finished flags)."""
+        due = [
+            slot
+            for slot in self.spills.values()
+            if not slot.req.finished() and self._iter_ct > slot.spill_iter
+        ]
+        if not due:
+            return None
+        return min(due, key=lambda s: s.last_tick_iter)
+
     def maybe_take_tick(self, running_batch) -> Optional["ScheduleBatch"]:
-        """Late hook: decide whether THIS iteration runs the spill tick
-        instead of the device decode batch. Must be called BEFORE
-        update_running_batch so the device batch is not prepared and then
-        dropped."""
-        if self.spilled_req is None:
-            return None
-        if self.spilled_req.finished():
-            return None
-        # First tick strictly after the spill iteration (the victim's last
-        # device result must be processed so output_ids is current).
-        if self._iter_ct <= self._spill_iter:
+        """Late hook: decide whether THIS iteration runs a spill tick instead
+        of the device decode batch, and for WHICH spilled session (round-
+        robin). Must be called BEFORE update_running_batch so the device batch
+        is not prepared and then dropped."""
+        if not self.spills:
             return None
         # Cadence: with device work present, leave at least tick_interval
-        # device iterations between two spill ticks (interval=1 ->
-        # alternate). Without device work the session ticks every iteration.
+        # device iterations between two spill ticks (AGGREGATE across all
+        # spilled sessions -- they share one tick slot). Without device work
+        # a spilled session ticks every iteration.
         device_has_work = running_batch is not None and not running_batch.is_empty()
         if (
             device_has_work
@@ -975,31 +1052,35 @@ class KVSessionOffloadManager:
         ):
             return None
 
-        if self.spilled_batch is None:
-            self.spilled_batch = self._build_spill_batch()
+        slot = self._pick_tick_slot(running_batch)
+        if slot is None:
+            return None
+
+        if slot.batch is None:
+            slot.batch = self._build_spill_batch(slot.req)
             self._log(
                 "kv-session-offload: first spill tick for rid=%s (L=%d)",
-                self.spilled_req.rid,
-                int(self.spilled_batch.seq_lens_cpu[0].item()),
+                slot.req.rid,
+                int(slot.batch.seq_lens_cpu[0].item()),
             )
-        batch = self.spilled_batch
+        batch = slot.batch
         batch.filter_batch()
         if batch.is_empty():
-            self._clear_spill_state("finished on host")
+            self._close_slot(slot.req.req_pool_idx, "finished on host")
             return None
         batch.prepare_for_decode()
+        slot.last_tick_iter = self._iter_ct
         self._last_tick_iter = self._iter_ct
         return batch
 
     # -- restore ------------------------------------------------------------
 
-    def _restore_memory_ok(self, L: int) -> bool:
+    def _restore_memory_ok(self, req, L: int) -> bool:
         from sglang.srt.mem_cache.common import evict_from_tree_cache
 
         # Only the HOST TAIL needs fresh device slots; the head [0, boundary)
         # kept its slots throughout the (partial) spill. boundary is derived
         # from the replicated row (leading non-sentinel run).
-        req = self.spilled_req
         row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :L]
         boundary = int((row < self.host_base).sum().item())
         tail = L - boundary
@@ -1022,8 +1103,9 @@ class KVSessionOffloadManager:
                     return False
         return True
 
-    def _restore(self, running_batch, L: int):
-        req = self.spilled_req
+    def _restore(self, slot, running_batch, L: int):
+        req = slot.req
+        bslot = self.backend._sess_slots[req.req_pool_idx]
         row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :L]
         # Wave back ONLY the host tail [boundary, L); the head kept its slots.
         boundary = int((row < self.host_base).sum().item())
@@ -1044,7 +1126,7 @@ class KVSessionOffloadManager:
                 self.S, bounds, counts
             )
             if class_slots is None:
-                self.hysteresis.reset()
+                slot.hysteresis.reset()
                 return running_batch
             new_locs = assign_owner_matched_slots(
                 residues, self.cp_prefix, class_slots
@@ -1052,7 +1134,7 @@ class KVSessionOffloadManager:
         else:
             new_locs = self.allocator.alloc(tail)
             if new_locs is None:
-                self.hysteresis.reset()
+                slot.hysteresis.reset()
                 return running_batch
             new_locs = new_locs.to(torch.int64)
 
@@ -1074,9 +1156,9 @@ class KVSessionOffloadManager:
             )
 
         self._wait_forward_stream()
-        # The active tail owns host rows [base, base + n_own): earlier
-        # wave-back steps (if any) already drained rows [0, base).
-        base = self._host_row_base
+        # Within this session's region, the active tail owns host rows
+        # [region_base + drain, ... + n_own): wave-back drained [.., drain).
+        base = bslot.region_base + bslot.host_row_base
         host_ids = torch.arange(
             base, base + n_own, dtype=torch.int64, device=row.device
         )
@@ -1090,18 +1172,19 @@ class KVSessionOffloadManager:
         )
         self._log(
             "kv-session-offload RESTORE(stop): rid=%s L=%d boundary=%d "
-            "tail=%d owned_tail=%d host_base=%d (rank %d) H2D complete",
+            "tail=%d owned_tail=%d region=%d host_base=%d (rank %d) H2D complete",
             req.rid,
             L,
             boundary,
             tail,
             n_own,
+            slot.region,
             base,
             self.dcp_rank,
         )
-        return self._finalize_restore(running_batch, L)
+        return self._finalize_restore(slot, running_batch, L)
 
-    def _wave_back(self, L: int, boundary: int, advance: int) -> bool:
+    def _wave_back(self, slot, L: int, boundary: int, advance: int) -> bool:
         """Migrate the host-tail FRONT block ``[boundary, boundary+advance)``
         back to the device head on the COPY stream (S3 incremental restore).
 
@@ -1115,7 +1198,8 @@ class KVSessionOffloadManager:
         Returns True when a block was moved, False when the owner-matched
         allocation could not be satisfied right now (wave stalls, retried
         next window; the stock full-restore stays available as fallback)."""
-        req = self.spilled_req
+        req = slot.req
+        bslot = self.backend._sess_slots[req.req_pool_idx]
         hi_pos = min(boundary + advance, L)
         row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :L]
         block = row[boundary:hi_pos]
@@ -1160,7 +1244,7 @@ class KVSessionOffloadManager:
         # [base, base+blk_own) into the new device slots. Order after any
         # in-flight forward, record the wave event so the next tick's device-
         # head read (and the next wave's copy_inflight check) can wait it.
-        base = self._host_row_base
+        base = bslot.region_base + bslot.host_row_base
         host_ids = torch.arange(
             base, base + blk_own, dtype=torch.int64, device=row.device
         )
@@ -1176,49 +1260,48 @@ class KVSessionOffloadManager:
             self.backend._sess_wave_done.record(cs)
 
         # Rewrite the block's row with the real device slots; advance the
-        # boundary (implicitly, via the now-non-sentinel entries) and the
-        # per-rank host-row base. Force re-derivation of the head split +
+        # boundary (implicitly, via the now-non-sentinel entries) and this
+        # session's host-row drain. Force re-derivation of the head split +
         # tail counts on the next tick.
         self.req_to_token_pool.req_to_token[req.req_pool_idx, boundary:hi_pos] = (
             new_locs.to(torch.int32)
         )
-        self._host_row_base = base + blk_own
-        self.backend._sess_host_row_base = self._host_row_base
-        self.backend._sess_head = None
-        self.backend._sess_count_cache = None
+        bslot.host_row_base += blk_own
+        self.backend._sess_slot_reset_head(req.req_pool_idx)
         # Head grew to [0, hi_pos): keep the finish-path free bound current.
         req.kv_spill_boundary = hi_pos
         self._log(
             "kv-session-offload WAVE-BACK: rid=%s boundary %d->%d (+%d) "
-            "owned_block=%d host_base->%d tail_left=%d (rank %d)",
+            "owned_block=%d region=%d drain->%d tail_left=%d (rank %d)",
             req.rid,
             boundary,
             hi_pos,
             hi_pos - boundary,
             blk_own,
-            self._host_row_base,
+            slot.region,
+            bslot.host_row_base,
             L - hi_pos,
             self.dcp_rank,
         )
         return True
 
-    def _finalize_restore(self, running_batch, L: int):
+    def _finalize_restore(self, slot, running_batch, L: int):
         """Common rejoin tail shared by the one-shot stop-restore and a
         completed wave-back (host tail empty): flip the session back to the
-        device decode path, clear the spill slot, and merge it into the
-        running batch."""
-        req = self.spilled_req
+        device decode path, free its region, and merge it into the running
+        batch."""
+        req = slot.req
         req.kv_spill_state = None
         req.kv_spill_boundary = 0
-        if self.spilled_batch is None:
+        if slot.batch is None:
             # Never ticked while spilled: build the decode batch now so the
             # session can be merged back like any resumed decode request.
-            self.spilled_batch = self._build_spill_batch()
-        batch = self.spilled_batch
+            slot.batch = self._build_spill_batch(req)
+        batch = slot.batch
         # Back on device: this batch (or its reqs inside running_batch) must
         # take the normal decode path again.
         batch.kv_session_spill_tick = False
-        self._clear_spill_state("restored to device")
+        self._close_slot(req.req_pool_idx, "restored to device")
         self._log(
             "kv-session-offload RESTORE complete: rid=%s L=%d (rank %d) "
             "rejoining device batch",
@@ -1260,39 +1343,52 @@ class KVSessionOffloadManager:
         pool.free(req)
         req.kv_spill_state = None
         req.kv_spill_boundary = 0
+        # Free this session's host region + backend slot immediately (before
+        # its req_pool_idx can be reused); filter its tick batch. The
+        # pre_schedule reap loop is then a no-op for this slot.
+        slot = self.spills.get(req.req_pool_idx)
+        region = slot.region if slot is not None else -1
+        if slot is not None and slot.batch is not None:
+            slot.batch.filter_batch()
+        self._close_slot(req.req_pool_idx, "finished on host")
         self._log(
             "kv-session-offload: spilled session rid=%s finished on host; "
             "released device head=%d (boundary=%d protected=%d) + tree lock "
-            "+ mamba + req slot (no radix insert)",
+            "+ mamba + req slot + region %d (no radix insert)",
             req.rid,
             head_freed,
             boundary,
             protected,
+            region,
         )
-        # State is cleared in pre_schedule (spilled_req.finished()).
 
-    def _clear_spill_state(self, why: str):
-        rid = self.spilled_req.rid if self.spilled_req is not None else "?"
-        self.spilled_req = None
-        self.spilled_batch = None
-        self.hysteresis.reset()
-        # S2: the backend's incremental owned-count cache + head/tail split
-        # belong to THIS session; a later spill must recompute from its own
-        # sentinel row.
-        self.backend._sess_count_cache = None
-        self.backend._sess_head = None
-        self._host_row_base = 0
-        self.backend._sess_host_row_base = 0
-        self.wave.reset()
-        logger.debug("kv-session-offload: spill slot cleared (%s, rid=%s)", why, rid)
+    def _close_slot(self, rpi: int, why: str):
+        """Retire one spilled session: return its host region to the free
+        pool, drop its backend per-session state, and remove it from the
+        active set. Idempotent (safe if already closed)."""
+        slot = self.spills.pop(rpi, None)
+        if slot is None:
+            return
+        self._free_regions.append(slot.region)
+        # The backend's per-session head/tail split + owned-count cache belong
+        # to THIS session; a later spill re-derives from its own sentinel row.
+        self.backend._sess_close_slot(rpi)
+        logger.debug(
+            "kv-session-offload: spill slot closed (%s, rpi=%d, region=%d)",
+            why,
+            rpi,
+            slot.region,
+        )
 
     def inflight_batches(self):
-        """For abort scanning: the spilled session is running too (also in
+        """For abort scanning: every spilled session is running too (also in
         the window between spill and first tick, before a batch exists)."""
         from types import SimpleNamespace
 
-        if self.spilled_batch is not None:
-            return [self.spilled_batch]
-        if self.spilled_req is not None:
-            return [SimpleNamespace(reqs=[self.spilled_req])]
-        return []
+        out = []
+        for slot in self.spills.values():
+            if slot.batch is not None:
+                out.append(slot.batch)
+            else:
+                out.append(SimpleNamespace(reqs=[slot.req]))
+        return out
