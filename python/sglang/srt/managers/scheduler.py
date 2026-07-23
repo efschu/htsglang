@@ -1367,11 +1367,49 @@ class Scheduler(
             self.copy_stream
         )
 
+        # DECOUPLE S4b (kv-session-offload, gated SGLANG_KVSO_DECOUPLE, default
+        # OFF -> byte-identical): a SECOND forward stream for the concurrent
+        # spill lane. The device decode forward keeps forward_stream (comm A);
+        # a due spill tick is issued on spill_stream (comm B, routed via the
+        # spill batch's kv_session_spill_tick flag inside the attention
+        # backend). Both descend from schedule_stream each iteration so their
+        # GPU kernels overlap while the SM-idle H2D of the spill lane hides
+        # behind the device compute. The stash + the spill lane's own depth-1
+        # overlap result queue live here so the two result streams never
+        # cross-contaminate (device tokens -> device reqs, spill tokens ->
+        # spilled reqs). Allocated once at init (never inside graph capture),
+        # mirroring the _sess_copy_stream lease. None/empty when the flag is
+        # OFF so nothing extra is reserved and the default path is untouched.
+        self._pending_spill_batch: Optional[ScheduleBatch] = None
+        self._spill_result_queue: Deque = deque()
+        self.spill_stream: Optional[CudaStream] = None
+        self.spill_stream_ctx: Optional[CudaStreamContext] = None
+        from sglang.srt.managers.kv_session_offload import spill_decouple_enabled
+
+        if spill_decouple_enabled():
+            self.spill_stream = self.device_module.Stream()
+            self.spill_stream_ctx = self.device_module.stream(self.spill_stream)
+            logger.info(
+                "kv-session-offload DECOUPLE: second forward stream "
+                "'spill_stream' leased for the concurrent spill lane (S4b)."
+            )
+
         if not self.enable_overlap:
             return
 
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+        # DECOUPLE S4b: the 2-slot keep-alive ring assumes ONE forward per
+        # iteration (2 slots cover the 1-iteration result-processing offset).
+        # The concurrent spill lane adds a SECOND forward per iteration, which
+        # would advance the shared ring twice and evict the device batch's
+        # snapshot a full iteration early (GPU-tensor use-after-free during
+        # result processing). Give the spill lane its OWN ring, swapped in
+        # around the spill run_batch (_dispatch_concurrent_spill), so the two
+        # lanes never share this mutable resource. Allocated only under overlap
+        # (the ring is an overlap-only asset); harmless when decoupling is off.
+        self._spill_record_buf = [None] * 2
+        self._spill_record_ct = 0
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
@@ -1665,6 +1703,14 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
 
+            # DECOUPLE S4b: dispatch a due spill tick concurrently on
+            # spill_stream / comm B (non-overlap: run + process synchronously).
+            # No-op unless decoupling is on and a tick is due.
+            if self._pending_spill_batch is not None:
+                spill_batch = self._pending_spill_batch
+                self._pending_spill_batch = None
+                self._dispatch_concurrent_spill(spill_batch)
+
             # Update last_batch
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -1724,6 +1770,17 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+
+            # DECOUPLE S4b: dispatch a due spill tick CONCURRENTLY on
+            # spill_stream / comm B, overlapping the device forward just
+            # enqueued on forward_stream / comm A. No-op (stash is None) unless
+            # decoupling is on and a tick is due, so the default path is
+            # untouched. Issued after the device forward so each communicator
+            # sees a rank-uniform, ordered op stream (device ops then spill ops).
+            if self._pending_spill_batch is not None:
+                spill_batch = self._pending_spill_batch
+                self._pending_spill_batch = None
+                self._dispatch_concurrent_spill(spill_batch)
 
             # Process the last batch
             if self.last_batch:
@@ -2870,9 +2927,39 @@ class Scheduler(
             new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
+        # DECOUPLE S4b: default the concurrent-spill stash to empty every
+        # iteration (rank-uniform; set only in the decouple branch below).
+        self._pending_spill_batch = None
+
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+        elif (
+            self.kv_session_offload is not None
+            and self.kv_session_offload.decouple
+        ):
+            # kv-session-offload DECOUPLE S4b: run the DEVICE decode batch AND a
+            # due spill tick CONCURRENTLY this iteration (not instead-of).
+            # Select the device decode batch exactly as the default branch
+            # does, then STASH a due spill tick for concurrent dispatch on
+            # spill_stream / comm B in the event loop. The spill tick no longer
+            # steals the device iteration -> the device lane stops waiting on
+            # the spill's PCIe H2D. Rank-uniform: both the device-batch
+            # emptiness and the tick decision derive from replicated state, so
+            # every rank either dispatches the same pair or neither. Only
+            # reached when the flag is ON, so the default path is byte-identical.
+            if not running_batch.is_empty() and not running_batch.is_prefill_only:
+                running_batch = self.update_running_batch(running_batch)
+                ret = running_batch if not running_batch.is_empty() else None
+            else:
+                ret = None
+            # maybe_take_tick keeps its cadence gate, now read as PCIe
+            # backpressure (how often the spill lane advances) rather than
+            # device protection. Pass the post-update running_batch so
+            # device_has_work reflects the actual device dispatch.
+            self._pending_spill_batch = self.kv_session_offload.maybe_take_tick(
+                running_batch
+            )
         elif (
             self.kv_session_offload is not None
             and (
@@ -2882,11 +2969,11 @@ class Scheduler(
             )
             is not None
         ):
-            # kv-session-offload (S1): run the spilled session's eager
-            # decode tick INSTEAD of the device decode batch this iteration
-            # (cadence-gated; the device batch was not prepared, so nothing
-            # is lost). Never mixed into the device batch -> the device
-            # graph lockstep stays untouched.
+            # kv-session-offload (S1, flag OFF / serial): run the spilled
+            # session's eager decode tick INSTEAD of the device decode batch
+            # this iteration (cadence-gated; the device batch was not prepared,
+            # so nothing is lost). Never mixed into the device batch -> the
+            # device graph lockstep stays untouched.
             ret = spill_tick_batch
         else:
             # Run decode (skip for prefill-only batches)
@@ -3603,6 +3690,82 @@ class Scheduler(
         self._maybe_report_active_ranks()
 
         return ret
+
+    def _dispatch_concurrent_spill(self, spill_batch: ScheduleBatch) -> None:
+        """DECOUPLE S4b: issue a due spill tick CONCURRENTLY with the device
+        forward that was just enqueued on forward_stream (comm A).
+
+        The device forward is already in flight (run_batch returns after an
+        async launch), so issuing the spill forward now on a SECOND stream
+        makes their GPU kernels overlap: the device compute fills the SMs while
+        the spill lane's PCIe H2D (on _sess_copy_stream, a child of
+        spill_stream) drains -- the whole point of decoupling.
+
+        Isolation (verified disjoint, no cross-lane mutable sharing):
+          * stream: run_batch is routed onto spill_stream by a temporary swap of
+            forward_stream / forward_stream_ctx; `with self.forward_stream_ctx`
+            then enqueues the entire spill forward -- and, via current_stream(),
+            the _sess_copy_stream fork -- on spill_stream. Restored in finally so
+            an exception can never leak the swap into the device lane.
+          * communicator: the spill batch carries kv_session_spill_tick=True, so
+            the attention backend routes its DCP collectives to comm B (S3);
+            the device forward stays on comm A. (Only the DCP collective is
+            duplicated today -- the model's TP / MoE all-reduces still share
+            their communicators; that shared-comm concurrency is the S4b
+            hang-risk the boot measurement exists to falsify.)
+          * keep-alive ring: swap in the spill lane's private
+            batch_record_buf/ct so the shared 2-slot device ring is not advanced
+            twice per iteration (would evict the device snapshot a full
+            iteration early).
+          * result: committed to the SPILLED request via a depth-1 overlap
+            queue -- device tokens -> device reqs, spill tokens -> spilled reqs,
+            never mixed.
+
+        Python issues device-then-spill sequentially, so each communicator sees
+        a rank-uniform, ordered op stream; every rank runs this identically
+        (the stash is set from replicated state)."""
+        if spill_batch is None:
+            return
+
+        prev_fs = self.forward_stream
+        prev_ctx = self.forward_stream_ctx
+        self.forward_stream = self.spill_stream
+        self.forward_stream_ctx = self.spill_stream_ctx
+        # The keep-alive ring is an overlap-only asset (record_batch_in_overlap
+        # runs only under overlap). Swap it in only then.
+        swap_ring = self.enable_overlap
+        if swap_ring:
+            prev_brb = self.batch_record_buf
+            prev_brc = self.batch_record_ct
+            self.batch_record_buf = self._spill_record_buf
+            self.batch_record_ct = self._spill_record_ct
+        try:
+            spill_result = self.run_batch(spill_batch)
+            # Delay-sample (spec V2) must run on the spill stream too; a no-op
+            # for non-spec (delay_sample_func is None). Kept inside the swap so
+            # forward_stream_ctx is still spill_stream.
+            if self.is_generation:
+                self.launch_batch_sample_if_needed(spill_result, spill_batch)
+        finally:
+            if swap_ring:
+                # Persist the spill ring's advance; restore the device ring.
+                self._spill_record_buf = self.batch_record_buf
+                self._spill_record_ct = self.batch_record_ct
+                self.batch_record_buf = prev_brb
+                self.batch_record_ct = prev_brc
+            self.forward_stream = prev_fs
+            self.forward_stream_ctx = prev_ctx
+
+        if self.enable_overlap:
+            # Depth-1 overlap mirror of the device result_queue: process the
+            # PREVIOUS spill result while this one runs, so token commit stays
+            # off the scheduler's critical path without ever mixing lanes.
+            self._spill_result_queue.append((spill_batch.copy(), spill_result))
+            if len(self._spill_result_queue) > 1:
+                b, r = self._spill_result_queue.popleft()
+                self.process_batch_result(b, r)
+        else:
+            self.process_batch_result(spill_batch, spill_result)
 
     def _maybe_report_active_ranks(self) -> None:
         if not (
@@ -4366,6 +4529,14 @@ class Scheduler(
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+
+        # DECOUPLE S4b: drain the concurrent spill lane's depth-1 result queue
+        # so a paused spilled request's last token is committed (never left
+        # orphaned across the pause). No-op when decoupling is off.
+        spill_rq = getattr(self, "_spill_result_queue", None)
+        while spill_rq:
+            b, r = spill_rq.popleft()
+            self.process_batch_result(b, r)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             chunked_req_to_exclude = set()

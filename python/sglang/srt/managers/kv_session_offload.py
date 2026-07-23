@@ -610,6 +610,16 @@ class KVSessionOffloadManager:
         sa = scheduler.server_args
         self.block_size = int(sa.kv_session_offload_block_size)
         self.tick_interval = max(1, int(sa.kv_session_offload_tick_interval))
+        # DECOUPLE S4b: master gate for the concurrent spill lane. When ON the
+        # scheduler dispatches the device decode batch AND a due spill tick in
+        # the SAME iteration on two streams (device -> forward_stream/comm A,
+        # spill -> spill_stream/comm B) instead of taking the tick INSTEAD-OF
+        # the device batch. OFF -> the tick stays serial and this attr is
+        # unused (byte-identical). tick_interval keeps its meaning but its ROLE
+        # shifts from "protect the device lane" (serial) to a PCIe-backpressure
+        # knob (how often the spill lane advances) since the lanes no longer
+        # steal each other's iterations.
+        self.decouple = bool(spill_decouple_enabled())
         self.restore_margin_tokens = int(sa.kv_session_offload_restore_margin_tokens)
         self._hysteresis_steps = int(
             sa.kv_session_offload_restore_hysteresis_steps
@@ -700,10 +710,24 @@ class KVSessionOffloadManager:
 
     def _wait_forward_stream(self):
         """Order our schedule-stream copies after any in-flight forward
-        (overlap mode). Event-based; no host sync."""
+        (overlap mode). Event-based; no host sync.
+
+        DECOUPLE S4b: with the concurrent spill lane there are TWO in-flight
+        forwards (device on forward_stream, spill on spill_stream). A wave-back
+        / restore H2D into freshly allocated device slots must be ordered after
+        BOTH, so also wait spill_stream when decoupling is on. Cheap (an event
+        wait on the schedule stream); no host sync. The spill forward never
+        writes the device KV pool (its output token lands in a host sentinel
+        slot), so this is conservative, but keeping the barrier symmetric
+        avoids any reader/writer edge being missed."""
+        cur = torch.cuda.current_stream()
         fs = getattr(self.scheduler, "forward_stream", None)
         if fs is not None:
-            torch.cuda.current_stream().wait_stream(fs)
+            cur.wait_stream(fs)
+        if self.decouple:
+            ss = getattr(self.scheduler, "spill_stream", None)
+            if ss is not None:
+                cur.wait_stream(ss)
 
     def has_spilled(self) -> bool:
         return len(self.spills) > 0
