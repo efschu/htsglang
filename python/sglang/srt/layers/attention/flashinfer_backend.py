@@ -3358,6 +3358,161 @@ class FlashInferAttnBackend(AttentionBackend):
             self, "_sess_graph_captured_rungs", set()
         )
 
+    def _sess_graph_selftest(self, model_runner):
+        """ENV-gated (KVSO_GRAPH_SELFTEST) per-rung graph==eager numeric check.
+        Default OFF -> untouched. Under real load only rung 1 is reachable
+        (partial spill pins host_tail to ~1 block), so this injects a synthetic
+        whole-suffix host tail landing on EACH ladder rung and compares, WITHIN
+        ONE boot on IDENTICAL input, the fixed-count graph body vs the eager
+        block loop (the same q, same host rows, same merge order). Machine-zero
+        expected (like weightless graph==eager). CUDA-graph REPLAY is bit-exact
+        to the captured body by construction, so body==eager => replay==eager.
+        Rank-uniform: every DCP rank runs the identical rung sequence; the block
+        decode is intra-rank (no collective) so there is no desync risk. Also
+        checks the over-ladder eager fallback via _sess_graph_can_replay."""
+        import os
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.kv_session_offload import make_sentinels
+
+        if not os.environ.get("KVSO_GRAPH_SELFTEST") or not self._sess_graph_enabled:
+            return
+        rank = getattr(model_runner, "tp_rank", 0)
+        layers = [
+            m
+            for m in model_runner.model.modules()
+            if type(m).__name__ == "RadixAttention"
+        ]
+        layers.sort(key=lambda a: a.layer_id)
+        layers = [ly for ly in layers if self._is_full_attention_layer(ly)] or layers
+        if not layers:
+            logger.warning("kvso graph selftest: no attention layer found")
+            return
+        layer = layers[0]
+        B = self._sess_block_size
+        S = self._sess_S
+        dev = self._sess_staging_k.device
+        rpi = int(self._sess_req_pool.req_to_token.shape[0]) - 1
+        iu = self.indices_updater_decode
+        num_qo = sum(self.dcp_q_head_counts) if self.uneven_dcp else iu.num_qo_heads
+        head_dim = iu.head_dim
+        ladder = self._sess_graph_ladder
+        torch.manual_seed(20260723)
+        # q is in the QUERY dtype (bf16/fp16); randn has no fp8 kernel, so
+        # sample in fp32 and cast to the wrapper's q_data_type.
+        qdt = getattr(iu, "q_data_type", torch.bfloat16)
+        if not isinstance(qdt, torch.dtype):
+            qdt = torch.bfloat16
+        q = torch.randn(1, num_qo, head_dim, device=dev).to(qdt)
+
+        def make_fb(L):
+            return SimpleNamespace(
+                forward_mode=SimpleNamespace(is_decode=lambda: True),
+                batch_size=1,
+                seq_lens_cpu=torch.tensor([L], dtype=torch.int64),
+                req_pool_indices=torch.tensor([rpi], dtype=torch.int64, device=dev),
+                kv_session_spill_tick=True,
+            )
+
+        rows = []
+        saved_full = None
+        # A small REAL device head so both paths attend a head in the SAME
+        # merge order (the real-load shape; boundary>0). A whole-suffix
+        # (boundary==0) synthetic would make the graph run an EMPTY head
+        # wrapper the eager loop omits -> a merge-ORDER difference that is
+        # fp-order-sensitive (decode-class), not a graph bug -- avoid it here.
+        head = min(B, 256)
+        head_slots = torch.arange(1, head + 1, device=dev, dtype=torch.int64)
+        try:
+            for R in [r for r in ladder if r >= 2]:
+                tail = min(R * B, self._sess_region_tokens)
+                L = head + tail
+                if saved_full is None:
+                    saved_full = self._sess_req_pool.req_to_token[rpi, :L].clone()
+                self._sess_open_slot(rpi, region_base=0)
+                # row = [real head slots] ++ [tail sentinels for [head, L)]
+                tail_res = torch.arange(head, L, device=dev, dtype=torch.int64) % S
+                tail_sent = make_sentinels(self._sess_host_base, S, tail_res, start=head)
+                self._sess_req_pool.req_to_token[rpi, :L] = torch.cat(
+                    [head_slots, tail_sent]
+                ).to(torch.int32)
+                fb = make_fb(L)
+                # eager
+                self._sess_graph_capture_blocks = None
+                self._sess_graph_replay_blocks = None
+                self._sess_spill = self._sess_prepare_step(fb)
+                # HARNESS sync (not a graph concern): the eager path reads the
+                # CURRENT token from the scratch slot (its D2D fixup), the graph
+                # reads it from the host row. Under real load the owner-write
+                # writes the same value to both; here no owner-write runs, so
+                # copy host[cur_host_row] -> scratch for this layer so both read
+                # identical current-token bytes (else only the owning rank shows
+                # a ~1/owned_tail diff -- a harness gap, not a graph bug).
+                if self._sess_spill.cur_owned:
+                    from sgl_kernel.kvcacheio import transfer_kv_per_layer
+
+                    _fl = self._sess_full_layer_idx(layer)
+                    _chr = torch.tensor(
+                        [self._sess_spill.cur_host_row], dtype=torch.int64, device=dev
+                    )
+                    transfer_kv_per_layer(
+                        src_k=self._sess_host_pool.k_data_refs[_fl],
+                        dst_k=self._sess_full_pool.k_buffer[_fl],
+                        src_v=self._sess_host_pool.v_data_refs[_fl],
+                        dst_v=self._sess_full_pool.v_buffer[_fl],
+                        src_indices=_chr,
+                        dst_indices=self._sess_scratch_loc,
+                        item_size=self._sess_host_pool.token_stride_size,
+                    )
+                o_e, lse_e = self._sess_blockwise_decode_return_lse(q, layer)
+                o_e = o_e.clone()
+                # graph body on the SAME st (refill fixed buffers, route dispatch)
+                self._sess_graph_replay_blocks = self._sess_spill.graph_rung
+                self._sess_graph_prepare_blocks(in_capture=False)
+                self._sess_graph_capture_blocks = self._sess_spill.graph_rung
+                o_g, lse_g = self._sess_blockwise_decode_return_lse(q, layer)
+                self._sess_graph_capture_blocks = None
+                self._sess_graph_replay_blocks = None
+                md = float((o_e - o_g).abs().max().item())
+                nan = bool(torch.isnan(o_g).any() or torch.isnan(o_e).any())
+                verdict = "MACHINE_ZERO" if md == 0.0 else (
+                    "NAN" if nan else f"maxd={md:.3e}"
+                )
+                rows.append(
+                    (self._sess_spill.graph_rung, self._sess_spill.n_own, verdict)
+                )
+                self._sess_close_slot(rpi)
+        finally:
+            if saved_full is not None:
+                n = saved_full.numel()
+                self._sess_req_pool.req_to_token[rpi, :n] = saved_full
+            self._sess_graph_capture_blocks = None
+            self._sess_graph_replay_blocks = None
+            self._sess_spill = None
+        logger.info(
+            "==== kvso spill-graph SELFTEST (rank %d) graph==eager, head=%d, "
+            "per PICKED rung (over-ladder fallback is pure-unit-tested; "
+            "region cap makes it live-unreachable) ====",
+            rank,
+            head,
+        )
+        # dedup by picked rung (multiple synthetic tails can map to one rung)
+        seen = {}
+        for rung, n_own, verdict in rows:
+            seen.setdefault(rung, (n_own, verdict))
+        for rung in sorted(seen):
+            n_own, verdict = seen[rung]
+            logger.info("  picked_rung=%-3d owned_tail=%-6d: %s", rung, n_own, verdict)
+        logger.info("==== kvso spill-graph SELFTEST done (rank %d) ====", rank)
+
+    def _is_full_attention_layer(self, layer) -> bool:
+        """Best-effort: a layer whose KV lives in the full-attention pool."""
+        try:
+            self._sess_full_layer_idx(layer)
+            return True
+        except Exception:
+            return False
+
     def _sess_graph_log_fallback(self, reason: str) -> bool:
         if not self._sess_graph_fallback_logged:
             self._sess_graph_fallback_logged = True

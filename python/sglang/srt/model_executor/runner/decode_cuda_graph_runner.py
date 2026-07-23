@@ -996,6 +996,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # No pool-side pin to clear: the captured full-physical write loc rides the
         # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
 
+        # S5: ENV-gated per-rung graph==eager selftest (KVSO_GRAPH_SELFTEST),
+        # run OUTSIDE the capture context now that all rungs are recorded.
+        # Default OFF -> no-op. Covers rungs 2-28 (unreachable under real load).
+        if self._sess_block_graph:
+            sess_selftest = getattr(self._sess_attn, "_sess_graph_selftest", None)
+            if sess_selftest is not None:
+                try:
+                    sess_selftest(self.model_runner)
+                except Exception as _sess_e:
+                    # Diagnostic only -- never fail the boot on the selftest.
+                    logger.warning(
+                        "kvso spill-graph selftest raised (ignored): %r", _sess_e
+                    )
+
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
             self.model_runner.device,
