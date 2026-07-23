@@ -1553,6 +1553,64 @@ class ModelRunnerKVCacheMixin:
             need_bytes / 1e9,
         )
 
+    def _kv_sess_attach_host_pool(self: ModelRunner):
+        """kv-session-offload (S1): pinned host pool for ONE spilled
+        session's full-attention KV shard on this rank.
+
+        Sized for the worst case: a max-context session whose owned share is
+        the LARGEST rank's share (rank-uniform GB request -> the host pool's
+        cross-rank min-sync is a no-op). Host rows are used positionally
+        [0, n) per spilled session -- the HostKVCache alloc/free state
+        machine is not used. GDN/Mamba state is never tiered."""
+        from sglang.srt.distributed.utils import (
+            cp_token_prefix,
+            cp_token_split_factor,
+        )
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+        full_pool = self.token_to_kv_pool.full_kv_pool
+        dcp = int(getattr(self, "dcp_size", 1) or 1)
+        if dcp > 1:
+            prefix = cp_token_prefix(dcp)
+            S = cp_token_split_factor(dcp)
+            max_ratio = max(
+                prefix[r + 1] - prefix[r] for r in range(len(prefix) - 1)
+            )
+        else:
+            S, max_ratio = 1, 1
+        ctx = int(self.model_config.context_len)
+        need_tokens = (ctx // S + 2) * max_ratio
+        per_token_bytes = (
+            full_pool.head_num
+            * full_pool.head_dim
+            * full_pool.layer_num
+            * full_pool.store_dtype.itemsize
+            * 2  # K + V
+        )
+        host_size_gb = max(1, -(-(need_tokens * per_token_bytes) // 10**9))
+        host_pool = MHATokenToKVPoolHost(
+            device_pool=full_pool,
+            host_to_device_ratio=0.0,
+            host_size=host_size_gb,
+            page_size=self.page_size,
+            layout="layer_first",
+            pin_memory=True,
+        )
+        if host_pool.size < need_tokens:
+            raise ValueError(
+                "kv-session-offload: allocated host pool holds "
+                f"{host_pool.size} tokens < required {need_tokens} "
+                f"(context_len {ctx}, S {S}, max_ratio {max_ratio})."
+            )
+        self.kv_sess_host_pool = host_pool
+        logger.info(
+            "kv-session-offload: attached %d-token pinned host pool "
+            "(%.2f GB, %d full-attention layers) for the spill session.",
+            host_pool.size,
+            need_tokens * per_token_bytes / 1e9,
+            full_pool.layer_num,
+        )
+
     def _pool_kv_head_num(self: ModelRunner) -> int:
         """The kv-head count this rank's KV pool must be shaped for.
 
@@ -1577,6 +1635,39 @@ class ModelRunnerKVCacheMixin:
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+
+        # ---- kv-session-offload (S1): scope fail-fast ----------------------
+        self._kv_sess_scratch_slot = None
+        if self.server_args.enable_kv_session_offload and not self.is_draft_worker:
+            if self.mambaish_config is None:
+                raise ValueError(
+                    "--enable-kv-session-offload (S1) supports hybrid "
+                    "Mamba/GDN models only (full-attention KV spilled, GDN "
+                    "state resident); this model has no mamba config."
+                )
+            if self.post_capture_kv_active:
+                raise ValueError(
+                    "--enable-kv-session-offload cannot be combined with "
+                    "post-capture KV sizing "
+                    "(SGLANG_ENABLE_POST_CAPTURE_KV_SIZING=1): the backing "
+                    "finalize would leave the appended scratch row unbacked."
+                )
+            _dcp = int(getattr(self, "dcp_size", 1) or 1)
+            if _dcp > 1 and self.server_args.rank_tp_ratio is None:
+                raise ValueError(
+                    "--enable-kv-session-offload with DCP requires the "
+                    "natural-page uneven-DCP allocator (--rank-tp-ratio); "
+                    "the stock even-DCP inflated-page layout re-interprets "
+                    "slot identity and is out of S1 scope."
+                )
+            if _dcp <= 1:
+                logger.warning(
+                    "kv-session-offload: no token-sharded DCP active -- the "
+                    "spilled session streams its WHOLE context over a single "
+                    "PCIe link every decode step and will be very slow at "
+                    "long contexts. Uneven DCP (SGLANG_UNEVEN_DCP=1 + "
+                    "--rank-tp-ratio) splits the stream across ranks."
+                )
 
         # ---- Weightless-KV Stage B1: host-spill pool split -----------------
         # Split the PROFILED per-rank pool D (what actually fits in VRAM) into
@@ -2197,7 +2288,19 @@ class ModelRunnerKVCacheMixin:
                     _ratios = get_cp_token_ratios()
                     _S = cp_token_split_factor(self.dcp_size)
                     _ratio_r = _ratios[get_parallel().attn_dcp_rank]
-                    _hybrid_pool_size = (self.max_total_num_tokens // _S) * _ratio_r
+                    # CEIL to a whole owner block: allocator slot ids reach
+                    # max_total_num_tokens itself, and any slot in a trailing
+                    # PARTIAL block (max_total % S != 0, e.g. an explicit,
+                    # unaligned --max-total-tokens) compacts to
+                    # (max_total // S) * ratio + off -- one block PAST the
+                    # floored sizing. Flooring let those top slots scatter
+                    # out of bounds once free-list churn handed them out
+                    # (async illegal-memory-access, found by the
+                    # kv-session-offload S1 test with --max-total-tokens
+                    # 3000 on S=64). Costs < one block of rows per rank.
+                    _hybrid_pool_size = (
+                        self.max_total_num_tokens // _S + 1
+                    ) * _ratio_r
                 elif getattr(self, "_wl_spill_phys_tokens", 0):
                     # Weightless-KV B1 host spill: the DEVICE tensors are sized
                     # to the PROFILED capacity D (device slots + staging), NOT
@@ -2207,6 +2310,24 @@ class ModelRunnerKVCacheMixin:
                     _hybrid_pool_size = self._wl_spill_phys_tokens
                 else:
                     _hybrid_pool_size = self.max_total_num_tokens
+                # kv-session-offload (S1): append ONE scratch row to the
+                # physical full-attention pool (never handed out by the
+                # allocator). The spill tick's owner-write quantizes the new
+                # token's K/V into this row via the stock set_kv_buffer path
+                # (byte-identical to a device write) and then D2H-copies it
+                # into the session host pool. A few KB of VRAM; flag-gated.
+                if (
+                    self.server_args.enable_kv_session_offload
+                    and not self.is_draft_worker
+                ):
+                    # Pool rows = size + page_size, and slot ids can reach
+                    # `size` (page 0 is the dummy): with size inflated by 1
+                    # the very last row (old_size + 1) is reachable by
+                    # NEITHER the allocator (<= old_size) nor the DCP
+                    # compaction (< physical share) -- that row is the
+                    # scratch.
+                    self._kv_sess_scratch_slot = _hybrid_pool_size + 1
+                    _hybrid_pool_size += 1
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=_hybrid_pool_size,
@@ -2237,6 +2358,8 @@ class ModelRunnerKVCacheMixin:
                 )
                 if getattr(self, "_wl_spill_phys_tokens", 0):
                     self._wl_attach_spill_host_pool()
+                if getattr(self, "_kv_sess_scratch_slot", None) is not None:
+                    self._kv_sess_attach_host_pool()
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     assert (
