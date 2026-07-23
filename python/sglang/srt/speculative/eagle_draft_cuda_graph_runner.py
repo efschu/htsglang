@@ -113,6 +113,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # here so the shared _capture_one_stream()'s `if self._wl_block_graph`
         # guard is defined (always False for the draft runner).
         self._wl_block_graph = False
+        # kv-session-offload spill graph: draft runners bypass the base
+        # DecodeCudaGraphRunner __init__ where _sess_block_graph is set; the
+        # shared _capture_one_stream/can_run_graph guard on `if
+        # self._sess_block_graph` -> init False here (drafts never spill).
+        self._sess_block_graph = False
         self.tp_size = model_runner.tp_size
         self.dp_size = model_runner.dp_size
         self.pp_size = model_runner.server_args.pp_size

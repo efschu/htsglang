@@ -3973,12 +3973,21 @@ class ServerArgs:
             raise ValueError(
                 "--kv-session-offload-restore-margin-tokens must be >= 0."
             )
-        if self.speculative_algorithm is not None:
+        if self.speculative_algorithm is not None and (
+            os.environ.get("KVSO_ALLOW_SPEC", "0") != "1"
+        ):
+            # The S1 "no speculative decoding" limit. Being LIFTED (spill +
+            # MTP): the spill tick is a plain bs=1 decode while device sessions
+            # run draft/verify, and MTP carries its own 1-layer draft KV that
+            # a spilled session must co-handle (the bundle_spillable_sizes seam
+            # reserves the draft share). Gated by KVSO_ALLOW_SPEC=1 during
+            # bring-up so the default path stays rejected (byte-identical);
+            # the gate is removed once spill+MTP is validated.
             raise ValueError(
-                "--enable-kv-session-offload (S1) does not support "
+                "--enable-kv-session-offload does not yet support "
                 "speculative decoding (--speculative-algorithm="
-                f"{self.speculative_algorithm}). The spill tick is a plain "
-                "eager decode; the draft/verify dispatch is a later stage."
+                f"{self.speculative_algorithm}). Set KVSO_ALLOW_SPEC=1 to "
+                "opt into the spill+MTP bring-up path."
             )
         if self.attention_backend not in (None, "flashinfer"):
             raise ValueError(
