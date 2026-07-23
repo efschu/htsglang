@@ -770,6 +770,19 @@ class CrossAlgoBandit:
             gate_note,
         )
 
+    def note_switch_rejected(self, target: Rung, actual: Rung) -> None:
+        """The worker refused to APPLY a decided switch (pre-swap OOM
+        guard, first-boot convergence). Roll the decision state back to
+        *actual* so future decisions reason from the rung that is really
+        running; retry suppression lives in the worker. A probe window
+        whose probe rung never physically started is cancelled."""
+        if self.active != target:
+            return
+        self.active = actual
+        if self._probe_until is not None and self._pre_probe_rung == actual:
+            self._probe_until = None
+            self._pre_probe_rung = None
+
     def _switch(self, target: Rung, round_idx: int) -> None:
         self.active = target
         self.switch_count += 1

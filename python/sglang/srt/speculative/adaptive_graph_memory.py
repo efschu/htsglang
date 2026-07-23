@@ -940,6 +940,42 @@ class AdaptiveGraphMemoryManager:
                 "abort."
             )
 
+    def resume_shortfall_bytes(self, steps) -> int:
+        """Driver-free shortfall a swap to *steps* would face, or 0 when it
+        fits (also 0 for guaranteed no-ops: resident mode, already-mapped
+        target, untagged baseline -- those only PAUSE, which frees memory).
+
+        Pre-swap probe for the first-boot swap guard (cross_algo_worker):
+        on a fresh configuration the measured-KV registry has no
+        corrections yet, the blind sizing can leave less driver-free than
+        the incoming tag's footprint, and the resume would die in
+        _reclaim_driver_free_for_resume's readable error (or worse, the
+        native cu_mem_create abort). The guard asks first and REFUSES the
+        switch instead. Runs the same allocator-cache reclaim the real
+        resume would (idempotent; skipped when free already suffices)."""
+        if not self.offload_enabled:
+            return 0
+        tag = self.tag_for_steps(steps)
+        rec = self._states.get(tag)
+        if rec is None or not (rec.tensors or tag in self._capture_pools):
+            return 0
+        if tag == self._resumed_tag:
+            return 0
+        needed = rec.footprint_bytes
+        # The outgoing tag is paused (physically released) before the
+        # resume, so its footprint counts as available.
+        outgoing = 0
+        if self._resumed_tag is not None:
+            out_rec = self._states.get(self._resumed_tag)
+            if out_rec is not None:
+                outgoing = int(out_rec.footprint_bytes)
+        free, _ = torch.cuda.mem_get_info()
+        if free + outgoing >= needed:
+            return 0
+        torch.cuda.empty_cache()
+        free, _ = torch.cuda.mem_get_info()
+        return max(0, int(needed) - (int(free) + outgoing))
+
     def _maybe_verify_rank_sync(self, steps) -> None:
         from sglang.srt.environ import envs
 

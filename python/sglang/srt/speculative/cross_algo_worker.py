@@ -204,6 +204,12 @@ class CrossAlgoWorker(BaseSpecWorker):
             self._rounds_total = 0
             self._rounds_at_switch = 0
             self._switch_count = 0
+            # First-boot swap guard bookkeeping: after a rank-uniform NO-GO
+            # (incoming rung's tag would OOM the resume), retries of that
+            # rung are suppressed for a window instead of re-probing (and
+            # re-warning) every round boundary.
+            self._swap_reject_rung = None
+            self._swap_reject_until = 0
             # NEXTN k -> SpecRuntimeState; filled in init_cuda_graphs (the
             # primary k from the boot pointers, further ks -- auto mode's
             # bandit arms -- via build_adaptive_runtime_state).
@@ -982,12 +988,15 @@ class CrossAlgoWorker(BaseSpecWorker):
         from sglang.srt.speculative.adaptive_graph_memory import get_active_manager
 
         mgr = get_active_manager()
+        rung_key = (
+            self._secondary_rung_key
+            if new_name == "dflash"
+            else ("EAGLE", new_val + 1)
+        )
+        if mgr is not None and not self._swap_guard_allows(mgr, new_rung, rung_key):
+            return
         if mgr is not None:
-            mgr.ensure_active(
-                self._secondary_rung_key
-                if new_name == "dflash"
-                else ("EAGLE", new_val + 1)
-            )
+            mgr.ensure_active(rung_key)
             ensure_ms = mgr.last_swap_ms or 0.0
         else:
             # Resident mode: still quiesce the outgoing rung's round before
@@ -1072,6 +1081,83 @@ class CrossAlgoWorker(BaseSpecWorker):
             wk_ms,
             wk_rounds,
         )
+
+    # Rounds a guard-rejected rung is not retried for. ~ the probe interval:
+    # long enough that a converging first boot does not spam warnings every
+    # boundary, short enough that a transient shortfall (deep prefill
+    # transients pre-reclaim) clears within a request or two.
+    SWAP_REJECT_WINDOW_ROUNDS = 512
+
+    def _swap_guard_allows(self, mgr, new_rung: tuple, rung_key) -> bool:
+        """First-boot swap guard: rank-uniform GO/NO-GO before ensure_active.
+
+        On a FRESH configuration the measured-KV registry has no
+        corrections yet; the blind boot sizing can leave less driver-free
+        than the incoming rung's paused tag needs, and the resume would
+        kill the rank (readable RuntimeError since the swap-time reclaim
+        fix, native cu_mem_create abort before it) at the FIRST switch --
+        the whole server dies for a performance-optional rung change.
+        Instead: probe the shortfall on every rank, take the collective
+        MAX over the TP CPU group (the verdict MUST be rank-uniform -- a
+        per-rank refusal would run different rungs on different ranks and
+        desync the graphs), and on NO-GO keep the current rung, warn with
+        the convergence hint, and suppress retries for a window. Switches
+        to the untagged baseline (evictions to the boot NEXTN rung) probe
+        as 0 by construction and always pass -- mandatory evictions are
+        never blocked.
+
+        The collective runs only when a switch is actually applied (rare)
+        and in eager round-boundary code -- the same place the decision
+        broadcast lives."""
+        if (
+            new_rung == self._swap_reject_rung
+            and self._rounds_total < self._swap_reject_until
+        ):
+            return False
+        shortfall = int(mgr.resume_shortfall_bytes(rung_key))
+        from sglang.srt.distributed import get_tp_group
+
+        coord = get_tp_group()
+        if coord.world_size > 1:
+            t = torch.tensor([shortfall], dtype=torch.int64)
+            torch.distributed.all_reduce(
+                t,
+                op=torch.distributed.ReduceOp.MAX,
+                group=coord.cpu_group,
+            )
+            max_shortfall = int(t.item())
+        else:
+            max_shortfall = shortfall
+        if max_shortfall <= 0:
+            self._swap_reject_rung = None
+            self._swap_reject_until = 0
+            return True
+        self._swap_reject_rung = new_rung
+        self._swap_reject_until = (
+            self._rounds_total + self.SWAP_REJECT_WINDOW_ROUNDS
+        )
+        logger.warning(
+            "Cross-algo swap guard: switch to %s:%d REFUSED -- resuming its "
+            "graph tag needs %d MiB more driver-free memory than available "
+            "on the tightest rank (local shortfall %d MiB). Keeping %s:%d; "
+            "retry suppressed for %d rounds. Typical on the FIRST boot of a "
+            "new configuration before the measured-KV registry converges: "
+            "the next boot sizes the KV pool with this boot's measurements "
+            "and the swap fits.",
+            new_rung[0],
+            new_rung[1],
+            max_shortfall >> 20,
+            shortfall >> 20,
+            self._active_rung[0],
+            self._active_rung[1],
+            self.SWAP_REJECT_WINDOW_ROUNDS,
+        )
+        # Keep the bandit's decision state on the rung that actually runs
+        # (it already committed to the target in decide()).
+        bandit = getattr(self, "_bandit", None)
+        if bandit is not None:
+            bandit.note_switch_rejected(new_rung, self._active_rung)
+        return False
 
     def _nextn_shape_for_k(self, k: int) -> dict:
         if k == self._primary_k:

@@ -157,6 +157,49 @@ class _Args:
             self.speculative_cross_shapes = shapes
 
 
+class TestConsumptionGate(CustomTestCase):
+    """The measured-KV consumption gate's pure verdict, incl. the T156-D
+    component-shift bypass (a structural pool release must not freeze the
+    correction as 'unconsumed fantasy growth')."""
+
+    @staticmethod
+    def _frozen(**kw):
+        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+            ModelRunnerKVCacheMixin,
+        )
+
+        base = dict(
+            delta_b=1 << 30,
+            prev_b=291 << 20,
+            prev_leftover_b=4 << 30,
+            free_b=8 << 30,
+            component_shift=False,
+        )
+        base.update(kw)
+        return ModelRunnerKVCacheMixin.correction_growth_frozen(**base)
+
+    def test_unconsumed_growth_frozen(self):
+        # Leftover did not shrink -> freeze (the stock rule).
+        self.assertTrue(self._frozen())
+
+    def test_consumed_growth_passes(self):
+        # Leftover shrank by > 128 MiB -> previous growth consumed.
+        self.assertFalse(self._frozen(free_b=3 << 30, prev_leftover_b=4 << 30))
+
+    def test_component_shift_bypasses_freeze(self):
+        # The T156-D case: pool released GiBs, leftover grew structurally.
+        self.assertFalse(self._frozen(component_shift=True))
+
+    def test_negative_delta_always_applies(self):
+        self.assertFalse(self._frozen(delta_b=-(1 << 30)))
+
+    def test_no_previous_correction_passes(self):
+        self.assertFalse(self._frozen(prev_b=0))
+
+    def test_no_previous_leftover_passes(self):
+        self.assertFalse(self._frozen(prev_leftover_b=None))
+
+
 class TestCapResolution(CustomTestCase):
     def test_env_off_and_explicit(self):
         os.environ[SOLO_POOL_CAP_ENV] = "off"

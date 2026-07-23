@@ -402,6 +402,36 @@ class ModelRunnerKVCacheMixin:
         except (IndexError, TypeError):
             return 1
 
+    @staticmethod
+    def correction_growth_frozen(
+        delta_b: int,
+        prev_b: int,
+        prev_leftover_b,
+        free_b: int,
+        component_shift: bool,
+    ) -> bool:
+        """Pure consumption-gate verdict (unit-tested; see the call site).
+
+        Growth (positive delta on top of a positive stored correction) is
+        frozen when the previous boot's leftover did NOT shrink -- a rank
+        that is not the global binder must not accumulate fantasy budget.
+        EXCEPTION (T156-D): ``component_shift`` -- a measured component of
+        THIS rank changed materially between boots (e.g. the DFLASH solo
+        pool releasing 4.6 GiB), so the leftover baseline moved for a
+        structural reason the "did it shrink" test cannot see; the gate
+        opens for this boot and the next boot's consumption re-arms it
+        (measured 2026-07-22: rank 0 stuck at +291 MiB with 8.3 GiB
+        leftover after the pool shrink, while a fresh registry consumed
+        the same bytes immediately). Negative deltas (overshoot rollback)
+        always apply."""
+        return (
+            delta_b > 0
+            and prev_b > 0
+            and not component_shift
+            and prev_leftover_b is not None
+            and free_b >= prev_leftover_b - (128 << 20)
+        )
+
     def note_post_capture_leftover(
         self: ModelRunner, draft_solo_pool_bytes: int = 0
     ) -> None:
@@ -622,6 +652,7 @@ class ModelRunnerKVCacheMixin:
         # accumulating fantasy budget boot over boot; negative deltas
         # (overshoot rollback) always apply.
         prev_leftover_b = None
+        prev_draft_pool_b = None
         try:
             import json as _json
 
@@ -630,15 +661,35 @@ class ModelRunnerKVCacheMixin:
             vec = _prev.get("leftover_mib_at_measure")
             if isinstance(vec, list) and len(vec) > self.tp_rank:
                 prev_leftover_b = int(vec[self.tp_rank]) << 20
-        except (OSError, ValueError):
+            comps_prev = _prev.get("components")
+            if isinstance(comps_prev, list) and len(comps_prev) > self.tp_rank:
+                raw = comps_prev[self.tp_rank].get("draft_solo_pool_bytes")
+                if raw is not None:
+                    prev_draft_pool_b = int(raw)
+        except (OSError, ValueError, TypeError):
             prev_leftover_b = None
-        if (
-            delta_b > 0
-            and prev_b > 0
-            and prev_leftover_b is not None
-            and free_b >= prev_leftover_b - (128 << 20)
+        # Structural component shift of THIS rank's balance (T156-D: the
+        # small DFLASH solo pool changes draft_solo_pool_bytes by GiBs when
+        # toggled/resized) -- see correction_growth_frozen.
+        component_shift = (
+            prev_draft_pool_b is not None
+            and abs(int(draft_pool_b) - prev_draft_pool_b) > (256 << 20)
+        )
+        if self.correction_growth_frozen(
+            delta_b, prev_b, prev_leftover_b, free_b, component_shift
         ):
             delta_b = 0
+        elif component_shift and delta_b > 0:
+            logger.info(
+                "Measured KV-budget (rank %d): draft-solo pool component "
+                "shifted %.2f -> %.2f GiB since the stored balance; "
+                "consumption gate bypassed for this boot (+%.2f GiB "
+                "correction growth).",
+                self.tp_rank,
+                prev_draft_pool_b / (1 << 30),
+                draft_pool_b / (1 << 30),
+                delta_b / (1 << 30),
+            )
         my_correction = prev_b + delta_b
 
         world = get_world_group().world_size

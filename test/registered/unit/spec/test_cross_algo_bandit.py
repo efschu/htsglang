@@ -692,6 +692,37 @@ class TestBoundaryBurst(CustomTestCase):
         self.assertIsNotNone(b._probe_until)  # probe_hold, not restarted
 
 
+class TestSwapGuardRejection(CustomTestCase):
+    """First-boot swap guard: the worker may refuse to APPLY a decided
+    switch; note_switch_rejected must roll the bandit's decision state back
+    to the rung that actually runs."""
+
+    def test_rejected_switch_rolls_back_active(self):
+        b = _bandit(rungs=[NEXTN3, DFLASH])
+        _feed(b, NEXTN3, accept=3, rounds=10, dt=0.060)
+        _feed(b, DFLASH, accept=3, rounds=10, dt=0.040, t0=100.0)
+        b._last_active_round[DFLASH] = 999
+        self.assertEqual(b.decide(1000), DFLASH)  # exploit switch decided
+        b.note_switch_rejected(DFLASH, NEXTN3)
+        self.assertEqual(b.active, NEXTN3)
+
+    def test_rejected_probe_cancels_probe_window(self):
+        b = _bandit(rungs=[NEXTN3, DFLASH])
+        _feed(b, NEXTN3, accept=3, rounds=10, dt=0.040)
+        self.assertEqual(b.decide(64), DFLASH)  # cold-start probe decided
+        self.assertIsNotNone(b._probe_until)
+        b.note_switch_rejected(DFLASH, NEXTN3)
+        self.assertEqual(b.active, NEXTN3)
+        self.assertIsNone(b._probe_until)
+        self.assertIsNone(b._pre_probe_rung)
+
+    def test_noop_when_decision_state_moved_on(self):
+        b = _bandit(rungs=[NEXTN3, DFLASH])
+        b.active = NEXTN3
+        b.note_switch_rejected(DFLASH, NEXTN3)  # active != target
+        self.assertEqual(b.active, NEXTN3)
+
+
 class TestConfig(CustomTestCase):
     def test_env_overrides(self):
         os.environ[ENV_PREFIX + "MIN_DWELL_ROUNDS"] = "128"
