@@ -43,7 +43,9 @@ spill-tick forward is identical to a device decode step.
 from __future__ import annotations
 
 import logging
+import math
 import os
+from collections import deque
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -597,6 +599,147 @@ class SpillSlot:
         self.hysteresis = hysteresis
 
 
+class SpillTickController:
+    """Adaptive spill-tick cadence regulator (QoS: device fast, spill best
+    effort). Turns the STATIC ``tick_interval`` gate in ``maybe_take_tick``
+    into a DYNAMIC one driven by device demand.
+
+    Semantics
+    ---------
+    The spill tick runs *instead of* the device decode batch on the iterations
+    it fires (serial S1 path), so each tick costs the device one iteration.
+    The lever is therefore purely the CADENCE:
+
+      * device under demand (running decode-batch occupied)  -> effective
+        interval RISES  -> spill fires less often -> the device lane stays
+        near its no-spill baseline;
+      * device light / idle                                  -> effective
+        interval FALLS toward 1 -> the spilled session ticks more often and
+        advances faster.
+
+    Signal
+    ------
+    The demand sample is the DEVICE running decode-batch occupancy
+    (``len(running_batch.reqs)``) observed once per scheduler iteration. It is
+    the cheapest robust demand proxy available at the decision site and,
+    crucially, it is a REPLICATED scheduler quantity: every DCP rank builds the
+    same schedule batch (the #50 rank-uniform-scheduling invariant this whole
+    module rests on), so the sample -- and hence every controller decision --
+    is bit-identical on every rank with NO broadcast. A spill tick is a
+    rank-uniform collective event; deriving the cadence from rank-uniform
+    integers keeps every rank in lock-step over whether a tick fires. Wall
+    clock / device decode RATE is deliberately NOT used: it is not rank-uniform
+    and would desync the collective (same discipline as the cross-algo
+    k-controller, bdc1714551).
+
+    Anti-flap (mirrors the k-controller)
+    ------------------------------------
+      * trailing WINDOW of demand samples (``window_size``); decisions read the
+        window mean, not an instantaneous sample;
+      * minimum DWELL (``min_dwell_iters`` scheduler iterations, rank-uniform --
+        counted in iterations, never seconds) between two interval changes;
+      * noise-scaled DEADZONE: the demand mean must clear ``deadzone_sigma``
+        standard errors of the window mean (widened in interval units) before a
+        step is taken, so a demand that straddles a rung boundary does not
+        oscillate;
+      * one interval unit per decision (rate-limited, anti-overshoot);
+      * bounds ``[1, max_interval]``.
+
+    All arithmetic is pure Python over rank-uniform integer inputs in identical
+    order -> bit-identical across ranks.
+    """
+
+    def __init__(
+        self,
+        initial_interval: int,
+        max_interval: int,
+        pressure_ref: float = 2.0,
+        window_size: int = 16,
+        min_dwell_iters: int = 64,
+        deadzone_sigma: float = 1.0,
+    ):
+        self.min_interval = 1
+        self.max_interval = max(1, int(max_interval))
+        # Occupancy at (or above) which the device is treated as fully loaded
+        # -> effective interval saturates at max_interval. 2 concurrent device
+        # decodes already means every spill tick steals a real device step.
+        self.pressure_ref = max(1e-6, float(pressure_ref))
+        self.window_size = max(1, int(window_size))
+        self.min_dwell_iters = max(0, int(min_dwell_iters))
+        self.deadzone_sigma = max(0.0, float(deadzone_sigma))
+
+        self._window: deque[float] = deque(maxlen=self.window_size)
+        self._effective = min(self.max_interval, max(self.min_interval, int(initial_interval)))
+        # Start dwell "expired" so the first post-warmup decision is not
+        # additionally delayed.
+        self._iters_since_change = self.min_dwell_iters
+        # Flap accounting (observability only; never a decision input).
+        self.n_changes = 0
+
+    # -- per-iteration sampling ------------------------------------------
+    def observe(self, demand: int) -> None:
+        """Feed one rank-uniform demand sample (device occupancy) and advance
+        the dwell clock. Called once per scheduler iteration."""
+        self._window.append(float(max(0, int(demand))))
+        self._iters_since_change += 1
+
+    def _mean_and_margin(self) -> Tuple[float, float]:
+        w = self._window
+        n = len(w)
+        mean = sum(w) / n
+        if n < 2 or self.deadzone_sigma == 0.0:
+            return mean, 0.0
+        var = sum((x - mean) ** 2 for x in w) / (n - 1)
+        stderr = math.sqrt(var / n)
+        return mean, self.deadzone_sigma * stderr
+
+    def _desired(self, mean: float) -> float:
+        """Continuous target interval for a given mean demand (before the
+        one-step rate limit / deadzone are applied)."""
+        pressure = min(1.0, mean / self.pressure_ref)
+        span = self.max_interval - self.min_interval
+        return self.min_interval + span * pressure
+
+    def maybe_update(self) -> bool:
+        """Recompute the effective interval under dwell + deadzone. At most one
+        interval unit changes per call. Returns True on a change."""
+        if len(self._window) < max(1, self.window_size // 2):
+            return False
+        if self._iters_since_change < self.min_dwell_iters:
+            return False
+        mean, margin = self._mean_and_margin()
+        desired = self._desired(mean)
+        span = max(1e-6, float(self.max_interval - self.min_interval))
+        # deadzone expressed in interval units (stderr of demand mean scaled by
+        # the demand->interval slope span/pressure_ref).
+        margin_iv = margin * span / self.pressure_ref
+        changed = False
+        if (
+            desired > self._effective + 0.5 + margin_iv
+            and self._effective < self.max_interval
+        ):
+            self._effective += 1
+            changed = True
+        elif (
+            desired < self._effective - 0.5 - margin_iv
+            and self._effective > self.min_interval
+        ):
+            self._effective -= 1
+            changed = True
+        if changed:
+            self._iters_since_change = 0
+            self.n_changes += 1
+        return changed
+
+    def effective_interval(self, fast_pressure: bool) -> int:
+        """The cadence gate value for this iteration. Fast-lane pressure hard-
+        pins to the maximum (device fully protected) without disturbing the
+        regulator state -- fast > FCFS, always."""
+        if fast_pressure:
+            return self.max_interval
+        return self._effective
+
+
 class KVSessionOffloadManager:
     """Owns the spill/restore state machine inside one scheduler process.
 
@@ -673,6 +816,16 @@ class KVSessionOffloadManager:
         self._fast_queue_logged_rid = None
         self._fast_lane_enabled = bool(getattr(sa, "enable_fast_lane", False))
 
+        # Adaptive spill-tick cadence regulator (default OFF -> the cadence gate
+        # below reads the STATIC self.tick_interval, byte-identical). When ON,
+        # maybe_take_tick reads tick_controller.effective_interval() instead.
+        self.tick_controller = None
+        if bool(getattr(sa, "kv_session_offload_tick_adaptive", False)):
+            self.tick_controller = SpillTickController(
+                initial_interval=self.tick_interval,
+                max_interval=int(sa.kv_session_offload_tick_adaptive_max),
+            )
+
         global _MANAGER
         _MANAGER = self
 
@@ -692,6 +845,19 @@ class KVSessionOffloadManager:
             self.max_spills,
             self.region_tokens,
         )
+        if self.tick_controller is not None:
+            logger.info(
+                "kv-session-offload: ADAPTIVE spill-tick cadence armed "
+                "(start_interval=%d, bounds=[1,%d], pressure_ref=%.1f, "
+                "window=%d, dwell=%d iters, sigma=%.1f) -- effective interval "
+                "tracks device demand, rank-uniform, no broadcast",
+                self.tick_controller._effective,
+                self.tick_controller.max_interval,
+                self.tick_controller.pressure_ref,
+                self.tick_controller.window_size,
+                self.tick_controller.min_dwell_iters,
+                self.tick_controller.deadzone_sigma,
+            )
 
     # -- slot bookkeeping -------------------------------------------------
 
@@ -1031,6 +1197,30 @@ class KVSessionOffloadManager:
         session. Returns the (possibly merged) running_batch."""
         self._iter_ct += 1
 
+        # Adaptive cadence: sample device demand every iteration (rank-uniform
+        # device decode-batch occupancy) and advance the regulator. Done here,
+        # before any early return, so the window stays continuous even across
+        # prefill / no-spill iterations and is warm when a spill starts. No-op
+        # when the regulator is off (flag OFF -> byte-identical).
+        if self.tick_controller is not None:
+            demand = (
+                len(running_batch.reqs)
+                if running_batch is not None and not running_batch.is_empty()
+                else 0
+            )
+            self.tick_controller.observe(demand)
+            if self.tick_controller.maybe_update():
+                tc = self.tick_controller
+                mean, _ = tc._mean_and_margin()
+                self._log(
+                    "kv-session-offload: adaptive tick interval -> %d "
+                    "(demand_mean=%.2f, spilled=%d, changes=%d)",
+                    tc._effective,
+                    mean,
+                    len(self.spills),
+                    tc.n_changes,
+                )
+
         # 1. Reap sessions that finished on host (release ran in the result
         #    processor and already freed the region + backend slot).
         reaped = False
@@ -1229,9 +1419,21 @@ class KVSessionOffloadManager:
         # spilled sessions -- they share one tick slot). Without device work
         # a spilled session ticks every iteration.
         device_has_work = running_batch is not None and not running_batch.is_empty()
+        # Cadence gate value. STATIC self.tick_interval by default (byte-
+        # identical). Adaptive regulator overrides it with a demand-driven,
+        # rank-uniform effective interval; fast-lane pressure hard-pins to the
+        # regulator maximum (device fully protected).
+        interval = self.tick_interval
+        if self.tick_controller is not None:
+            fast_pressure = (
+                self._fast_lane_pressure(running_batch.reqs)
+                if device_has_work
+                else False
+            )
+            interval = self.tick_controller.effective_interval(fast_pressure)
         if (
             device_has_work
-            and (self._iter_ct - self._last_tick_iter) <= self.tick_interval
+            and (self._iter_ct - self._last_tick_iter) <= interval
         ):
             return None
 

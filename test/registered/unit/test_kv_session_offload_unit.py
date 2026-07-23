@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.managers.kv_session_offload import (
     RestoreHysteresis,
+    SpillTickController,
     assign_owner_matched_slots,
     bundle_spillable_sizes,
     chunk_ceil,
@@ -664,6 +665,7 @@ def _bare_manager():
     )
     mgr._fast_lane_enabled = False
     mgr._iter_ct = 0
+    mgr.tick_controller = None  # adaptive cadence regulator off in this fixture
     mgr._log = lambda *a, **k: None
     return mgr
 
@@ -991,6 +993,119 @@ def test_alloc_owner_matched_classes_cpu():
     before = alloc.available_size()
     assert alloc.alloc_owner_matched_classes(S, bounds, [3, 0, 0]) is None
     assert alloc.available_size() == before
+
+
+# ---------------------------------------------------------------------------
+# Adaptive spill-tick cadence regulator (SpillTickController)
+# ---------------------------------------------------------------------------
+
+
+def _drive(ctrl, demand_seq):
+    """Feed a per-iteration demand sequence; return the effective interval
+    (fast_pressure=False) sampled after each iteration."""
+    out = []
+    for d in demand_seq:
+        ctrl.observe(d)
+        ctrl.maybe_update()
+        out.append(ctrl.effective_interval(False))
+    return out
+
+
+def test_spill_tick_controller_characteristic_up_and_down():
+    # Sustained HIGH device demand -> interval climbs toward the max; then
+    # demand drops to idle -> interval falls back toward 1.
+    ctrl = SpillTickController(
+        initial_interval=1, max_interval=8, min_dwell_iters=4, window_size=8
+    )
+    hi = _drive(ctrl, [3] * 200)
+    assert hi[-1] == 8, f"high demand should saturate at max, got {hi[-1]}"
+    lo = _drive(ctrl, [0] * 200)
+    assert lo[-1] == 1, f"idle demand should fall to min, got {lo[-1]}"
+    # Monotone climb and monotone descent (one step per dwell, no overshoot).
+    climb = [h for h in hi if True]
+    assert all(b >= a for a, b in zip(climb, climb[1:])), "interval must not dip while demand high"
+    assert all(b <= a for a, b in zip(lo, lo[1:])), "interval must not rise while idle"
+
+
+def test_spill_tick_controller_intermediate_demand_lands_between():
+    # Demand == pressure_ref/2 -> steady interval strictly between 1 and max.
+    ctrl = SpillTickController(
+        initial_interval=1, max_interval=8, pressure_ref=2.0,
+        min_dwell_iters=4, window_size=8, deadzone_sigma=0.0,
+    )
+    out = _drive(ctrl, [1] * 300)
+    final = out[-1]
+    assert 1 < final < 8, f"mid demand should settle strictly inside bounds, got {final}"
+    # desired = 1 + 7 * (1/2) = 4.5 -> rounds to 4 or 5 under the 0.5 band.
+    assert final in (4, 5), f"expected ~4-5 for demand=1, got {final}"
+
+
+def test_spill_tick_controller_dwell_blocks_rapid_change():
+    ctrl = SpillTickController(
+        initial_interval=1, max_interval=8, min_dwell_iters=32, window_size=8
+    )
+    out = _drive(ctrl, [3] * 200)
+    # Consecutive interval changes must be at least min_dwell_iters apart.
+    change_iters = [i for i in range(1, len(out)) if out[i] != out[i - 1]]
+    gaps = [b - a for a, b in zip(change_iters, change_iters[1:])]
+    assert all(g >= 32 for g in gaps), f"dwell violated: gaps={gaps}"
+
+
+def test_spill_tick_controller_deadzone_suppresses_flap():
+    # Demand oscillating around the pressure_ref/2 boundary must NOT flap once
+    # settled: the noise-scaled deadzone absorbs the straddle.
+    ctrl = SpillTickController(
+        initial_interval=4, max_interval=8, pressure_ref=2.0,
+        min_dwell_iters=8, window_size=16, deadzone_sigma=1.0,
+    )
+    seq = [0, 2] * 400  # mean ~1.0 == pressure_ref/2, high variance
+    out = _drive(ctrl, seq)
+    tail = out[len(out) // 2 :]
+    changes = sum(1 for a, b in zip(tail, tail[1:]) if a != b)
+    assert changes == 0, f"deadzone must eliminate flap on a straddling signal, got {changes}"
+
+
+def test_spill_tick_controller_stable_demand_zero_flap():
+    ctrl = SpillTickController(
+        initial_interval=1, max_interval=8, min_dwell_iters=8, window_size=8
+    )
+    out = _drive(ctrl, [2] * 500)
+    tail = out[len(out) // 2 :]
+    changes = sum(1 for a, b in zip(tail, tail[1:]) if a != b)
+    assert changes == 0, f"stable demand -> zero flap once settled, got {changes}"
+
+
+def test_spill_tick_controller_fast_pressure_pins_max():
+    ctrl = SpillTickController(initial_interval=1, max_interval=8, min_dwell_iters=4)
+    ctrl.observe(0)
+    assert ctrl.effective_interval(True) == 8
+    # Fast pressure does not disturb regulator state (still at start interval).
+    assert ctrl._effective == 1
+
+
+def test_spill_tick_controller_rank_uniform_determinism():
+    # Two independent instances (two 'ranks') fed the identical rank-uniform
+    # demand sequence must produce bit-identical effective intervals at EVERY
+    # step -- the property that keeps the collective spill tick in lock-step.
+    import random
+
+    rng = random.Random(1234)
+    seq = [rng.randint(0, 3) for _ in range(2000)]
+    a = SpillTickController(initial_interval=2, max_interval=8)
+    b = SpillTickController(initial_interval=2, max_interval=8)
+    oa = _drive(a, seq)
+    ob = _drive(b, seq)
+    assert oa == ob, "controller output diverged between ranks on identical input"
+    assert a.n_changes == b.n_changes
+
+
+def test_spill_tick_controller_bounds_respected():
+    ctrl = SpillTickController(initial_interval=99, max_interval=8)
+    assert ctrl._effective == 8  # clamped at construction
+    ctrl2 = SpillTickController(initial_interval=0, max_interval=8)
+    assert ctrl2._effective == 1
+    out = _drive(ctrl2, [3] * 500 + [0] * 500)
+    assert min(out) >= 1 and max(out) <= 8
 
 
 if __name__ == "__main__":

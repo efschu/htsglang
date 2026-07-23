@@ -1343,6 +1343,36 @@ class ServerArgs:
             "iteration regardless.",
         ),
     ] = 1
+    kv_session_offload_tick_adaptive: A[
+        bool,
+        Arg(
+            help="kv-session-offload: ADAPTIVE spill-tick cadence (QoS "
+            "regulator). Default OFF -> the tick cadence is the STATIC "
+            "--kv-session-offload-tick-interval (byte-identical). When ON, the "
+            "minimum device-iterations between two spill ticks is driven by a "
+            "rank-uniform control loop off device demand (running device "
+            "decode-batch occupancy): under device pressure the effective "
+            "interval RISES (spill less often -> protect the device lane near "
+            "its no-spill baseline); when the device goes light/idle the "
+            "interval FALLS toward 1 (spill more often -> the spilled session "
+            "advances faster). Fast-lane pressure hard-pins the interval to the "
+            "adaptive maximum. The static --kv-session-offload-tick-interval is "
+            "used only as the starting interval in this mode. The decision is a "
+            "pure function of replicated scheduler state, so it is identical on "
+            "every DCP rank (a spill tick is a rank-uniform collective event); "
+            "no broadcast/communicator is added.",
+        ),
+    ] = False
+    kv_session_offload_tick_adaptive_max: A[
+        int,
+        Arg(
+            help="kv-session-offload: upper bound for the adaptive spill-tick "
+            "interval (only used with --kv-session-offload-tick-adaptive). The "
+            "regulator clamps the effective interval to [1, this]. Larger -> "
+            "the device lane can be protected harder (spill starved more) when "
+            "device demand is high. Default 8.",
+        ),
+    ] = 8
     kv_session_offload_restore_margin_tokens: A[
         int,
         Arg(
@@ -3924,6 +3954,11 @@ class ServerArgs:
             raise ValueError(
                 "--kv-session-offload-tick-interval must be >= 1; got "
                 f"{self.kv_session_offload_tick_interval}."
+            )
+        if self.kv_session_offload_tick_adaptive_max < 1:
+            raise ValueError(
+                "--kv-session-offload-tick-adaptive-max must be >= 1; got "
+                f"{self.kv_session_offload_tick_adaptive_max}."
             )
         if self.kv_session_offload_restore_hysteresis_steps < 1:
             raise ValueError(
