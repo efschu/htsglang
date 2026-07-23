@@ -217,6 +217,25 @@ below. *Only used with* `--enable-fast-lane`.
 has waited longer than this is promoted ahead of the fast tier for one
 admission (`0` disables aging). *Only used with* `--enable-fast-lane`.
 
+**Request-side usage.** The lane is enabled server-side with `--enable-fast-lane`
+but selected **per request** via the top-level `"lane"` field on the native
+`/generate` request (`GenerateReqInput.lane`; the scheduler tags the request
+when `recv_req.lane == "fast"`). Set `"lane": "fast"` for an interactive request;
+omitting it (or `"heavy"`) keeps the default batchable class.
+
+```bash
+curl http://HOST:PORT/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "...", "sampling_params": {"max_new_tokens": 128}, "lane": "fast"}'
+```
+
+Fast-lane requests are admitted with the configured `--fast-lane-priority`
+(default `1000000`) in the priority-scheduling path;
+`--fast-lane-reserved-heavy-slots` keeps slots for regular requests and
+`--fast-lane-heavy-aging-ms` prevents starvation of aged heavy requests. The
+`"lane"` field is honored on the **native `/generate` endpoint only** — the
+OpenAI-compatible endpoints do not forward it.
+
 ### Offloading and the weightless-KV lane
 
 MoE expert offloading is env-only (see the environment-variable table). The
