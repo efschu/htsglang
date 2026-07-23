@@ -1399,11 +1399,20 @@ class FlashInferAttnBackend(AttentionBackend):
         # Set unconditionally -- a stale state from a previous spill tick
         # must never leak into a regular batch.
         if getattr(self, "_sess_enabled", False):
+            is_spill = bool(getattr(forward_batch, "kv_session_spill_tick", False))
             self._sess_spill = (
-                self._sess_prepare_step(forward_batch)
-                if getattr(forward_batch, "kv_session_spill_tick", False)
-                else None
+                self._sess_prepare_step(forward_batch) if is_spill else None
             )
+            # DECOUPLE S3: route THIS forward's DCP collectives to comm B when
+            # it is a spill forward (serial per-forward flag; no-op unless the
+            # second comm was built). Set unconditionally so a device forward
+            # always resets to comm A. Rank-uniform (is_spill is replicated).
+            if getattr(self, "_sess_decouple", False):
+                from sglang.srt.distributed.parallel_state import (
+                    set_dcp_spill_active,
+                )
+
+                set_dcp_spill_active(is_spill)
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
