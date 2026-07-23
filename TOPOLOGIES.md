@@ -74,16 +74,19 @@ earlier 68 / 97 tok/s decode figures used a contaminated bench and are withdrawn
 
 ## 3 — Adaptive drafter routing (NEXTN ↔ DFLASH)
 
-<img src="topologies/03-adaptive-drafter.svg" alt="Cross-algo drafter registry (measured): solo-draft pool 4.58 GiB on rank0, rung tags DFLASH_k16 662 / EAGLE_k3 634 / EAGLE_k2 554 MiB, graphs 7.44 GiB, versus a single-drafter upstream card (estimated ~0.65 GiB draft head)" width="100%">
+<img src="topologies/03-adaptive-drafter.svg" alt="Fork TP=3 uneven cross-algo drafter registry (measured): solo-draft pool 4.58 GiB on rank0, rung tags DFLASH_k16 662 / EAGLE_k3 634 / EAGLE_k2 554 MiB, graphs 7.44 GiB, versus a homogeneous upstream 2x identical 24 GB even-TP=2 running one fixed drafter (NEXTN k=3, single residence, estimated)" width="100%">
 
-Both draft algorithms are kept resident behind `--speculative-cross-algorithm`. Measured on the rig:
-the **solo-draft pool costs 4.58 GiB on rank0**, the per-k rungs are itemised **DFLASH_k16 662 /
-EAGLE_k3 634 / EAGLE_k2 554 MiB**, and draft graphs push rank0's graph pool to 7.44 GiB; the KV
-budget cost of the cross-gate is ~282k vs ~524k tokens without it. Upstream runs **one** drafter
-(NEXTN/EAGLE with adaptive k) — one draft head + its k-ladder (~0.6–0.7 GiB), ~4.6 GiB less draft
-VRAM — but it cannot switch draft *algorithm* on a regime change. The honest claim is
-**robustness / no-regret on mixed streams, not a peak speedup**: switching costs ~+5.7% systemic vs a
-single static drafter. The routing *mechanism* is diagram 11.
+Both draft algorithms are kept resident behind `--speculative-cross-algorithm`. Measured on the rig
+(TP=3 uneven): the **solo-draft pool costs 4.58 GiB on rank0**, the per-k rungs are itemised
+**DFLASH_k16 662 / EAGLE_k3 634 / EAGLE_k2 554 MiB**, and draft graphs push rank0's graph pool to
+7.44 GiB; the KV budget cost of the cross-gate is ~282k vs ~524k tokens without it. The homogeneous
+upstream reference is **2 identical 24 GB cards at even TP=2** running **one fixed drafter** (e.g.
+NEXTN k=3) — a single draft residence, **no per-k rung tags, no dual-residence and no runtime routing**
+(upstream cannot switch draft *algorithm*). That side holds **less draft VRAM** but has **no runtime
+choice**. The honest read is a **capability / VRAM trade-off, not a verdict** — the fork spends more
+draft VRAM to be runtime-adaptive (robustness / no-regret on mixed streams, not a peak speedup;
+switching costs ~+5.7% systemic), upstream spends less and stays fixed. The routing *mechanism* is
+diagram 11.
 
 ## 4 — Session KV spill: overflow the newest session to host RAM
 

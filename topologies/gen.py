@@ -533,17 +533,18 @@ FEATURES = [
     {
         "name": "03-adaptive-drafter.svg",
         "title": "3 — Adaptive drafter routing (NEXTN ↔ DFLASH): dual residence, itemised per-rung cost",
-        "subtitle": "Fork on the rig vs a homogeneous upstream single-drafter config.",
+        "subtitle": "Fork on the rig (TP=3 uneven) vs a homogeneous upstream TP=2 running one fixed drafter.",
         "sentences": [
             ("Left (measured): both drafters resident behind --speculative-cross-algorithm. The solo-draft "
              "pool costs 4.58 GiB on rank0 (5090); the per-k rung graphs/state are itemised "
              "DFLASH_k16 662 / EAGLE_k3 634 / EAGLE_k2 554 MiB. Draft graphs push rank0 graphs to 7.44 GiB.", "#333"),
-            ("Right (illustrative): upstream runs ONE drafter (NEXTN/EAGLE) with adaptive k — one draft "
-             "head + its k-ladder (~0.6–0.7 GiB), on a single card (TP=1) or 2 identical cards. ~4.6 GiB "
-             "less draft VRAM, but it cannot switch draft algorithm on a regime change.", "#555"),
+            ("Right (illustrative): the homogeneous upstream reference is 2 identical 24 GB cards at even "
+             "TP=2 running ONE FIXED drafter (e.g. NEXTN k=3) — a single draft residence, no per-k rung "
+             "tags, no dual-residence and no runtime routing (upstream cannot switch draft algorithm). Less "
+             "draft VRAM, but no runtime choice.", "#555"),
         ],
-        "left_label": "htsglang — cross-algo drafter resident (measured registry)",
-        "right_label": "upstream — single drafter, adaptive k (TP=1)",
+        "left_label": "htsglang — TP=3 uneven, cross-algo drafter resident (measured)",
+        "right_label": "upstream — 2x identical 24 GB, even TP=2, one fixed drafter",
         "left_cw": 132,
         "right_cw": 150,
         "left_cards": [
@@ -565,11 +566,15 @@ FEATURES = [
                 ("free", 2.48, "graphs", M)]),
         ],
         "right_cards": [
-            ("identical card", "TP=1 · one drafter", 24, [
-                ("weights", 13.0, "weights", E),
-                ("mtp", 0.65, "1 draft head + k-ladder", E),
-                ("kv", 7.5, "KV", E),
-                ("ctx", 1.2, "", E)]),
+            ("identical 24 GB", "rank0 · even TP=2", 24, [
+                ("weights", 12.5, "weights ½", E),
+                ("mtp", 0.5, "1 fixed drafter (NEXTN k=3)", E),
+                ("kv", 9.0, "KV", E),
+                ("ctx", 1.3, "", E)]),
+            ("identical 24 GB", "rank1 · even TP=2", 24, [
+                ("weights", 12.5, "weights ½", E),
+                ("kv", 9.5, "KV", E),
+                ("ctx", 1.3, "", E)]),
         ],
         "host": ("Host RAM (DDR) — solo-draft placement",
                  [("hostkv", 0.28, "~2–3 GB draft (embed/lm_head + draft KV)", M),
@@ -581,11 +586,13 @@ FEATURES = [
              "~+5.7% systemic vs a single static drafter (MEASURED).", "#333"),
         ],
         "right_notes": [
-            ("One resident drafter, no cross-algo pool. Assumed card; not measured.", "#4a5568"),
+            ("One fixed drafter, single residence — no cross-algo pool, no rung tags, no runtime routing. "
+             "Assumed 24 GB card; whole upstream side estimated (not measured).", "#4a5568"),
         ],
-        "core": ("the fork keeps two draft algorithms resident and routes per round (~4.6 GiB on rank0 plus a "
-                 "KV-budget cost) to stay no-regret across mixed streams; upstream runs one drafter (less VRAM) "
-                 "tuned to one regime — an observability / robustness trade, not a peak-speed win."),
+        "core": ("the fork holds BOTH drafters resident plus the routing machinery (solo-draft pool 4.58 GiB + "
+                 "per-k rung tags) — more draft VRAM, but runtime-adaptive; homogeneous upstream TP=2 holds ONE "
+                 "fixed drafter — less draft VRAM, but no runtime choice. A capability / VRAM trade-off, not a "
+                 "verdict (upstream is not worse, just fixed)."),
         "legend_keys": ["weights", "kv", "gdn", "mtp", "hostkv", "free"],
     },
     # -- 4. Session KV spill ----------------------------------------------
