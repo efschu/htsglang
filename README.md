@@ -413,20 +413,37 @@ speculative decoding both work under the uneven layout.
 
 ## Docker
 
-Two prebuilt runtime images on GitHub Packages, both CUDA 13.0, built for
-**sm75–sm120** (Turing … Blackwell / RTX 5090), **NCCL 2.30.7** (baked in for
-multi-rank-per-GPU), HiCache file backend, ENV-driven entrypoint:
+> **Image status.** The previously published GHCR runtime images were built from
+> **an earlier snapshot of this fork** and do **not** contain the full set of
+> flags documented in this README — in particular the later cross-algorithm
+> speculative-decoding, drafter-policy, and VRAM/measured-budget changes on
+> `integration/r2` are absent. Their concrete tags have been removed below so
+> they are not copied as the current path. **Updated images will follow;** until
+> then the supported way to run the current fork is a **source build**.
 
-- [**`ghcr.io/efschu/htsglang:cu130-nccl2307`**](https://github.com/users/efschu/packages/container/package/htsglang)
-  — the base heterogeneous-TP image (FP8 / safetensors).
-- [**`ghcr.io/efschu/htsglang-qwen35-gguf`**](https://github.com/efschu?tab=packages)
-  — the base image **+ the Qwen3.5/3.6 GGUF adapter + ffmpeg** (thin overlay).
-  Use this one for GGUF models.
+**Source build (supported path).** Follow the standard sglang from-source
+install (see `docs/get_started/install.md`, "Method 2: From source"), but clone
+this fork and check out the feature branch before installing into your venv:
+
+```bash
+git clone https://github.com/efschu/htsglang.git
+cd htsglang && git checkout integration/r2
+pip install -e "python"
+```
+
+**Runtime container (reference; rebuild required).** The image is CUDA 13.0,
+built for **sm75–sm120** (Turing … Blackwell / RTX 5090), with **NCCL 2.30.7**
+baked in (required for multi-rank-per-GPU), a HiCache file backend, and an
+ENV-driven entrypoint. Two overlays exist: a base heterogeneous-TP image
+(FP8 / safetensors) and a thin overlay adding the Qwen3.5/3.6 GGUF adapter +
+ffmpeg (use the latter for GGUF models). Build them from the Dockerfiles in
+[`docker/`](./docker/) (`htsglang.Dockerfile`, `htsglang-qwen35-gguf.Dockerfile`)
+and publish under your own registry path; the tags below are placeholders.
 
 Pull and run the GGUF image (GGUF + uneven TP=3 + MTP):
 
 ```bash
-docker pull ghcr.io/efschu/htsglang-qwen35-gguf:cu130
+docker pull ghcr.io/<owner>/<gguf-image>:<tag>
 
 GD=/models-cache/Qwen3.6-27B-...-GGUF
 docker run --rm --gpus all --ipc=host --shm-size=16g \
@@ -439,7 +456,7 @@ docker run --rm --gpus all --ipc=host --shm-size=16g \
   -e SPECULATIVE_DRAFT_MODEL_PATH=$GD/Qwen3.6-27B-...-Q6_K.gguf \
   -e DISABLE_CUSTOM_ALL_REDUCE=1 \
   -e TP_SIZE=3 -e RANK_GPU_ID=0,1,2 -e RANK_TP_RATIO=auto \
-  ghcr.io/efschu/htsglang-qwen35-gguf:cu130
+  ghcr.io/<owner>/<gguf-image>:<tag>
 ```
 
 Empty ENV ⇒ the flag is omitted, so the same image also serves the plain
