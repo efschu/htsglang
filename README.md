@@ -1,7 +1,5 @@
 # htsglang: heterogeneous, tier-aware sglang — uneven compute + VRAM pooling, session KV spill to system RAM, adaptive drafter routing, and improved GGUF support
 
-Adaptive drafter routing switches the speculative draft model at runtime — by context length (policy mode) or measured acceptance (bandit mode).
-
 **htsglang** ("split heterogeneous sglang") is a fork of
 [sgl-project/sglang](https://github.com/sgl-project/sglang) that makes a
 **single tensor-parallel group run well on mismatched GPUs** — cards with
@@ -136,6 +134,8 @@ single-node TP; no PD disaggregation. DFLASH+solo additionally rejects
 **`--speculative-draft-gpu <int>`** — CUDA device index (same space as
 `--rank-gpu-id`) whose TP rank hosts the solo draft; unset ⇒ rank 0. *Only valid
 with* `--speculative-draft-placement solo`.
+
+**Adaptive drafter routing** — switching the speculative draft model at runtime by context length (`policy` mode) or measured acceptance (`auto` / bandit mode) — is configured by the cross-algorithm flags below.
 
 **`--speculative-cross-algorithm`** (flag) — Co-resident cross-algorithm
 speculative decoding: load **both** a NEXTN/MTP draft and a DFLASH draft and
