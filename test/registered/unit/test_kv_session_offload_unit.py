@@ -635,6 +635,108 @@ def test_small_final_waveback_block_can_be_zero_owned():
     #    because the transfer is rank-LOCAL (no collective to desync).
 
 
+# ---------------------------------------------------------------------------
+# S4 bugfix: host-finish must reset the prefill admission gate + free region
+# (else a request waiting on the freed KV wedges the scheduler at GPU 0%)
+# ---------------------------------------------------------------------------
+
+
+def _bare_manager():
+    """A KVSessionOffloadManager with just the attributes the finish/reap
+    paths touch -- no GPU, no real scheduler (bypasses __init__)."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+
+    mgr = KVSessionOffloadManager.__new__(KVSessionOffloadManager)
+    mgr.spills = {}
+    mgr._free_regions = []
+    mgr.backend = MagicMock()
+    mgr.scheduler = SimpleNamespace(
+        running_batch=SimpleNamespace(batch_is_full=True)
+    )
+    mgr._fast_lane_enabled = False
+    mgr._iter_ct = 0
+    mgr._log = lambda *a, **k: None
+    return mgr
+
+
+def _fake_finished_spill_req(rpi):
+    from types import SimpleNamespace
+
+    req = SimpleNamespace(
+        req_pool_idx=rpi,
+        kv_spill_state="host",
+        kv_spill_boundary=0,      # no device head to free in this test
+        cache_protected_len=0,
+        last_node=None,           # no tree lock
+        mamba_pool_idx=None,      # no mamba
+        rid=f"r{rpi}",
+    )
+    return req
+
+
+def _install_slot(mgr, req, region):
+    from sglang.srt.managers.kv_session_offload import (
+        RestoreHysteresis,
+        SpillSlot,
+        WaveBackController,
+    )
+
+    slot = SpillSlot(
+        req=req,
+        region=region,
+        spill_iter=0,
+        wave=WaveBackController(8, 1),
+        hysteresis=RestoreHysteresis(1),
+    )
+    mgr.spills[req.req_pool_idx] = slot
+    return slot
+
+
+def test_release_on_host_finish_resets_admission_gate_and_frees_region():
+    from unittest.mock import MagicMock
+
+    mgr = _bare_manager()
+    req = _fake_finished_spill_req(5)
+    _install_slot(mgr, req, region=1)
+
+    # pool.free nulls req_pool_idx (like the real ReqToTokenPool.free) -- the
+    # method must capture rpi BEFORE that or it would key the cleanup on None.
+    def _free(r):
+        r.req_pool_idx = None
+
+    mgr.req_to_token_pool = MagicMock()
+    mgr.req_to_token_pool.free.side_effect = _free
+
+    mgr.release_finished_spilled_req(req)
+
+    # admission gate un-stuck (the deadlock fix)
+    assert mgr.scheduler.running_batch.batch_is_full is False
+    # region returned + slot + backend state dropped (keyed on the captured rpi)
+    assert mgr._free_regions == [1]
+    assert 5 not in mgr.spills
+    mgr.backend._sess_close_slot.assert_called_once_with(5)
+
+
+def test_pre_schedule_reap_resets_admission_gate():
+    from unittest.mock import MagicMock
+
+    mgr = _bare_manager()
+    req = _fake_finished_spill_req(7)
+    _install_slot(mgr, req, region=0)
+    # req already finished on host (release ran elsewhere / abort path)
+    req.finished = MagicMock(return_value=True)
+
+    rb = mgr.scheduler.running_batch  # batch_is_full=True
+    out = mgr.pre_schedule(rb, last_batch=None)
+
+    assert rb.batch_is_full is False  # reaped -> gate reset
+    assert 0 in mgr._free_regions and 7 not in mgr.spills
+    assert out is rb
+
+
 def test_restore_hysteresis():
     h = RestoreHysteresis(3)
     assert not h.update(True)

@@ -859,11 +859,20 @@ class KVSessionOffloadManager:
 
         # 1. Reap sessions that finished on host (release ran in the result
         #    processor and already freed the region + backend slot).
+        reaped = False
         for rpi, slot in list(self.spills.items()):
             if slot.req.finished():
                 if slot.batch is not None:
                     slot.batch.filter_batch()
                 self._close_slot(rpi, "finished on host")
+                reaped = True
+        if reaped and running_batch is not None:
+            # A host-finished session freed device KV + its req slot but was
+            # never in running_batch: un-stick the prefill admission gate so a
+            # request waiting on that KV is re-evaluated (see the DEADLOCK FIX
+            # note in release_finished_spilled_req). Safety net for finish
+            # paths that bypass release (e.g. abort). Rank-uniform.
+            running_batch.batch_is_full = False
 
         if not self.spills:
             self._maybe_spill_for_fast_lane(running_batch)
@@ -1344,12 +1353,17 @@ class KVSessionOffloadManager:
         donate)."""
         assert getattr(req, "kv_spill_state", None) == "host"
         pool = self.req_to_token_pool
+        # Capture rpi BEFORE pool.free() nulls req.req_pool_idx (else the slot
+        # lookup / region free below would key on None and leak the region).
+        rpi = req.req_pool_idx
+        slot = self.spills.get(rpi)
+        region = slot.region if slot is not None else -1
         boundary = int(getattr(req, "kv_spill_boundary", 0) or 0)
         protected = int(req.cache_protected_len or 0)
         head_freed = 0
         if boundary > protected:
             # Retained exclusive device head [protected, boundary).
-            head = pool.req_to_token[req.req_pool_idx, protected:boundary]
+            head = pool.req_to_token[rpi, protected:boundary]
             self.allocator.free(head.to(torch.int64))
             head_freed = boundary - protected
         if req.last_node is not None:
@@ -1357,21 +1371,32 @@ class KVSessionOffloadManager:
             self.tree_cache.dec_lock_ref(req.last_node)
         if req.mamba_pool_idx is not None and hasattr(pool, "free_mamba_cache"):
             pool.free_mamba_cache(req)
+        if slot is not None and slot.batch is not None:
+            slot.batch.filter_batch()
         pool.free(req)
         req.kv_spill_state = None
         req.kv_spill_boundary = 0
-        # Free this session's host region + backend slot immediately (before
-        # its req_pool_idx can be reused); filter its tick batch. The
-        # pre_schedule reap loop is then a no-op for this slot.
-        slot = self.spills.get(req.req_pool_idx)
-        region = slot.region if slot is not None else -1
-        if slot is not None and slot.batch is not None:
-            slot.batch.filter_batch()
-        self._close_slot(req.req_pool_idx, "finished on host")
+        # Free this session's host region + backend slot (using the captured
+        # rpi). The pre_schedule reap loop is then a no-op for this slot.
+        self._close_slot(rpi, "finished on host")
+        # DEADLOCK FIX: a session finishing ON HOST frees its device head +
+        # req slot but was never in running_batch, so -- unlike the device-
+        # finish / restore path (which resets batch_is_full via
+        # update_running_batch) -- nothing here un-sticks the prefill
+        # admission gate. Without this, a request waiting on exactly that
+        # freed KV is never re-evaluated (batch_is_full stays True) and the
+        # scheduler wedges at GPU 0%. Reset it so the next
+        # get_new_batch_prefill retries admission. Rank-uniform: every rank
+        # reaps the same finished session at the same iteration. Safe: it only
+        # forces a re-check, which re-sets True if the batch is still full.
+        rb = getattr(self.scheduler, "running_batch", None)
+        if rb is not None:
+            rb.batch_is_full = False
         self._log(
             "kv-session-offload: spilled session rid=%s finished on host; "
             "released device head=%d (boundary=%d protected=%d) + tree lock "
-            "+ mamba + req slot + region %d (no radix insert)",
+            "+ mamba + req slot + region %d (no radix insert); admission gate "
+            "reset",
             req.rid,
             head_freed,
             boundary,
