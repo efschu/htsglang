@@ -1,4 +1,4 @@
-# htsglang — sglang fork: heterogeneous tensor parallelism + Qwen3.5/3.6 GGUF
+# htsglang — sglang fork: asymmetric tensor parallelism (for heterogeneous / mismatched GPUs) + Qwen3.5/3.6 GGUF
 
 under construction
 
