@@ -113,16 +113,27 @@ not yet built, not measured)** should take the eager spill tick out of the share
 even tick-interval 1 should barely touch the device-resident session. The *mechanism* and the full
 isolation matrix are in diagram 12.
 
-## 5 — Multi-rank co-location (TP=5 on 3 GPUs)
+## 5 — Multi-rank co-location: more TP-ranks than physical GPUs
 
-<img src="topologies/05-tp5-colocation.svg" alt="TP=5 co-location: three ranks time-slice the 5090 at ~7 GB budget each and one rank per 3080 at ~17 GB (budgets measured, per-rank split not captured), versus 5 identical cards one rank each (estimated)" width="100%">
+<img src="topologies/05-tp5-colocation.svg" alt="Multi-rank co-location: TP=5 is standard sglang; the fork contribution is co-locating ranks via MPS so a TP=5 config was tested on 3 physical cards — three ranks time-slice the 5090 at ~7 GB budget each and one rank per 3080 at ~17 GB (budgets measured, per-rank split not captured) — versus standard TP=5 on 5 identical cards, one rank each (estimated)" width="100%">
 
+**Attribution first.** TP=5 is a **standard sglang capability** (sglang runs any TP degree; a normal
+TP=5 uses **five** physical cards, one rank each). That is **not** the fork's feature. The fork
+contribution is **multi-rank co-location** — running **more TP-ranks than physical GPUs** by letting
+several ranks share one GPU via **MPS** (plus **NCCL ≥ 2.30** for the co-located communicator).
+
+With co-location, a standard TP=5 config was **tested on just 3 physical cards**:
 `--tp 5 --rank-gpu-id 0,0,0,1,2` runs **three ranks on the 5090** (~7 GB budget each, MPS time-slice)
-and **one rank per 3080** (~17 GB each). The **budgets are measured**; the weight/KV/GDN breakdown
-*inside* each rank was not registry-dumped, so it is drawn as *not captured*. The run is coherent,
-retrieves a needle from ~15k ctx, and is bit-identical across two boots; decode tok/s is deliberately
-**not** 5-card-representative (three ranks share one card). Upstream TP=5 requires **5 physical
-identical cards**, one rank each — this 3-card box cannot express TP=5 at all.
+and **one rank per 3080** (~17 GB each). This **emulates** TP=5 — it is the *original way to test it*, not
+a 5-card performance equivalent: decode tok/s is deliberately **not** 5-card-representative (three ranks
+share one card). The **budgets are measured**; the weight/KV/GDN breakdown *inside* each rank was not
+registry-dumped (*not captured*). The run is coherent, retrieves a needle from ~15k ctx, and is
+bit-identical across two boots. A second fork delta makes this bootable at all: the **uneven-TP +
+kv-boundary-aware auto-split (#116)** lets a co-located **uneven** TP=5 boot even when `num_kv_heads < tp`
+(it constrains the per-rank Q-head split to whole KV-head groups, fixing the #105 Q-split straddle). So
+the honest framing is: **TP=5 = the standard capability; co-location = the fork's way to emulate/test it
+on 3 cards**, not "we can do TP=5". The upstream side (standard TP=5 = 5 identical cards) is the honest
+contrast.
 
 The co-location run uses GGUF models (dense-27B-GGUF and 35B-A3B-GGUF). The **GGUF quantisation
 itself — the format plus the K-quant / MMQ / MMVQ kernels — comes from ggml/llama.cpp (via

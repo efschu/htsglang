@@ -650,19 +650,23 @@ FEATURES = [
     # -- 5. Multi-rank co-location (TP=5) ---------------------------------
     {
         "name": "05-tp5-colocation.svg",
-        "title": "5 — Multi-rank co-location: run more ranks than physical cards (TP=5 on 3 GPUs)",
-        "subtitle": "Fork on the rig vs upstream, which maps one rank per physical card.",
+        "title": "5 — Multi-rank co-location: run MORE TP-ranks than physical GPUs by sharing a GPU via MPS",
+        "subtitle": "TP=5 is a standard sglang capability; the fork contribution is co-locating ranks so it runs on 3 cards, not 5.",
         "sentences": [
-            ("Left (measured budgets): --tp 5 --rank-gpu-id 0,0,0,1,2 --rank-auto-reserve-mib "
-             "11500,11500,11500,3500,3500, MPS on. Three ranks time-slice the 5090 (~7 GB budget each, "
-             "~21 GB of 32) + one rank per 3080 (~17 GB each). The per-rank weight/KV/GDN split inside each "
-             "budget was not dumped — shown as \"not captured\".", "#333"),
-            ("Right (illustrative): upstream TP=5 needs 5 physical identical cards, one rank each; this "
-             "3-card box cannot express TP=5 at all (TP is bounded by physical GPU count). Nearest legal "
-             "upstream here is TP=2 or TP=4 on identical cards.", "#555"),
+            ("Attribution: TP=5 is a STANDARD sglang capability (any TP degree — normally 5 physical cards, one "
+             "rank each). That is NOT the fork's feature. The fork contribution is MULTI-RANK CO-LOCATION — "
+             "running more TP-ranks than physical GPUs by letting several ranks share a GPU via MPS (+ NCCL "
+             ">= 2.30 for the co-located communicator).", "#333"),
+            ("Left (measured budgets): with co-location, a standard TP=5 config was TESTED on just 3 physical "
+             "cards — --tp 5 --rank-gpu-id 0,0,0,1,2 --rank-auto-reserve-mib 11500,11500,11500,3500,3500, MPS on: "
+             "three ranks time-slice the 5090 (~7 GB budget each) + one rank per 3080. This EMULATES TP=5, it is "
+             "NOT a 5-card perf equivalent (decode tok/s deliberately not 5-card-representative). Per-rank "
+             "weight/KV/GDN split inside each budget was not dumped.", "#333"),
+            ("Right (illustrative): a standard TP=5 needs 5 physical identical cards, one rank each; this 3-card "
+             "box cannot express TP=5 without co-location. That 5-cards-vs-3-cards is the honest contrast.", "#555"),
         ],
-        "left_label": "htsglang — TP=5 co-location, MPS (budgets measured)",
-        "right_label": "upstream — 5x identical cards, 1 rank each",
+        "left_label": "htsglang — co-location: standard TP=5 emulated on 3 cards via MPS",
+        "right_label": "upstream — standard TP=5 = 5x identical cards, 1 rank each",
         "left_cw": 140,
         "right_cw": 96,
         "left_cards": [
@@ -686,17 +690,22 @@ FEATURES = [
             ("Budgets are MEASURED (7/7/7 on the 5090, 17/17 on the 3080s); the weight/KV/GDN breakdown "
              "within each rank was not registry-dumped. Coherent, needle from ~15k ctx, bit-identical "
              "across two boots. Decode tok/s is deliberately NOT 5-card-representative (3 ranks share one card).", "#1d6b34"),
+            ("Fork delta beyond co-location: the uneven-TP + kv-boundary-aware auto-split (#116) lets a "
+             "co-located UNEVEN TP=5 boot even when num_kv_heads < tp (it constrains the per-rank Q-head split "
+             "to whole KV-head groups, fixing the #105 Q-split straddle).", "#1d6b34"),
             ("Models are dense-27B-GGUF and 35B-A3B-GGUF. The GGUF quant itself (format + K-quant / MMQ / "
              "MMVQ kernels) is ggml/llama.cpp via upstream; the fork delta is only the uneven-TP adaptation "
              "(256-superblock alignment, MLP coarsening, MMQ-OOB fix under expert sharding, Qwen3.5/3.6+Gemma-4 "
              "arch adapters) and the MMVQ↔MMQ crossover tuning.", "#333"),
         ],
         "right_notes": [
-            ("TP=5 requires 5 equal cards; not expressible on this 3-card box. Illustrative sizes.", "#4a5568"),
+            ("Standard TP=5 = 5 equal cards (one rank each); the honest contrast to co-location on 3 cards. "
+             "Illustrative sizes.", "#4a5568"),
         ],
-        "core": ("the fork runs more ranks than physical cards (3 ranks share the 5090 via MPS) to prototype/serve "
-                 "a larger TP; upstream needs one identical card per rank (5 cards for TP=5) — a capacity/"
-                 "emulation difference, not a throughput advantage."),
+        "core": ("TP=5 is standard sglang (normally 5 physical cards); the fork contribution is co-locating ranks "
+                 "so several share one GPU via MPS — here EMULATING/testing a TP=5 config on just 3 cards — plus "
+                 "the uneven + kv-boundary-aware split that lets a co-located uneven TP=5 boot. A capacity / "
+                 "emulation / testability difference, not a throughput advantage and not a claim to have invented TP=5."),
         "legend_keys": ["weights", "kv", "ctx", "free"],
     },
     # -- 6. Weightless-KV lane --------------------------------------------
