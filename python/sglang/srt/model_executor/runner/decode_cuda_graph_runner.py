@@ -587,6 +587,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # pass is GPU-wired; until then _sess_graph_captured is empty -> eager).
         # Flag OFF or over-ladder -> eager, byte-identical. Replicated inputs
         # -> every rank decides identically (no collective-count divergence).
+        # BUGFIX: _sess_graph_replay_blocks is a sticky backend field that
+        # _variant_label reads to pick the sessblk{R} graph key. It is set only
+        # when a SPILL TICK is admitted (via _sess_graph_can_replay below). A
+        # DEVICE batch never calls that, so a stale value would leak into the
+        # device batch's variant label -> at bs>1 a KeyError (no size=N
+        # sessblk graph), at bs=1 a SILENT replay of the wrong (spill) graph.
+        # Clear it on EVERY admission; the spill-tick branch re-sets it.
+        if self._sess_block_graph:
+            self._sess_attn._sess_graph_replay_blocks = None
         if getattr(forward_batch, "kv_session_spill_tick", False):
             if (
                 self._sess_block_graph

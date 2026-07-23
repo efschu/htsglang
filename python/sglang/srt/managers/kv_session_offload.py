@@ -214,6 +214,18 @@ def spill_graph_enabled() -> bool:
     return os.environ.get("SGLANG_KVSO_SPILL_GRAPH", "0") == "1"
 
 
+def spill_decouple_enabled() -> bool:
+    """Master gate for the decoupled spill lane (design_decoupled_spill.md):
+    run the spill forward CONCURRENTLY with the device batch on its own stream
+    + flashinfer workspace + DCP communicator, so the device session stops
+    waiting on the spill's PCIe H2D. Default OFF -> the spill tick stays serial
+    (taken instead-of the device batch) and every extra resource collapses to
+    the shared one, so flag OFF is byte-identical. Built incrementally (S2
+    workspace, S3 comm, S4 stream/overlap), each step gated by this flag and
+    verified byte-identical while still serial."""
+    return os.environ.get("SGLANG_KVSO_DECOUPLE", "0") == "1"
+
+
 def spill_graph_blocks_needed(owned_tokens: int, block_size: int) -> int:
     """Number of streamed host blocks for ``owned_tokens`` at ``block_size``
     (ceil, at least 1). For rank-uniform capture pass the MAX owned count

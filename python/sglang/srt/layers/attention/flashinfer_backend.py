@@ -2618,6 +2618,31 @@ class FlashInferAttnBackend(AttentionBackend):
         self._sess_copy_stream = torch.cuda.Stream(device=dev)
         self._sess_copy_done = [torch.cuda.Event(), torch.cuda.Event()]
         self._sess_compute_done = [torch.cuda.Event(), torch.cuda.Event()]
+        # DECOUPLE S2: a SEPARATE flashinfer float workspace for the spill-lane
+        # wrappers. Today they share self.workspace_buffer -- safe only because
+        # the spill tick is serial (the device wrapper is never .run()
+        # concurrently). Concurrency (S4) would race the shared scratch, so
+        # reserve a second workspace of the same size when decoupling is on.
+        # Flag OFF -> alias the shared buffer (byte-identical). This is a
+        # STANDING reservation (SGLANG_FLASHINFER_WORKSPACE_SIZE per rank).
+        from sglang.srt.managers.kv_session_offload import spill_decouple_enabled
+
+        self._sess_decouple = bool(spill_decouple_enabled())
+        if self._sess_decouple:
+            self._sess_workspace_buffer = register_flashinfer_workspace_buffer(
+                torch.empty(
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                    dtype=torch.uint8,
+                    device=dev,
+                )
+            )
+            logger.info(
+                "kv-session-offload DECOUPLE: separate spill-lane flashinfer "
+                "workspace reserved (%.0f MiB).",
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get() / 2**20,
+            )
+        else:
+            self._sess_workspace_buffer = self.workspace_buffer
         self._sess_host_arange = torch.arange(
             self._sess_host_pool.size, dtype=torch.int64, device=dev
         )
@@ -3065,7 +3090,7 @@ class FlashInferAttnBackend(AttentionBackend):
         w = self._sess_wrappers.get(key)
         if w is None:
             w = BatchDecodeWithPagedKVCacheWrapper(
-                self.workspace_buffer,
+                self._sess_workspace_buffer,
                 "NHD",
                 backend=self.decode_backend,
                 use_tensor_cores=self.decode_use_tensor_cores,
@@ -3608,7 +3633,7 @@ class FlashInferAttnBackend(AttentionBackend):
             indptr_buf = torch.zeros(2, dtype=torch.int32, device=dev)
             indices_buf = torch.zeros(B, dtype=torch.int32, device=dev)
             w = BatchDecodeWithPagedKVCacheWrapper(
-                self.workspace_buffer,
+                self._sess_workspace_buffer,
                 "NHD",
                 backend=self.decode_backend,
                 use_cuda_graph=True,
@@ -3627,7 +3652,7 @@ class FlashInferAttnBackend(AttentionBackend):
             st.stage_dst.append(self._sess_stage_arange64[:B])
         # Dev-head graph wrapper (real device pool, indices = dev_head_idx).
         st.head_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-            self.workspace_buffer,
+            self._sess_workspace_buffer,
             "NHD",
             backend=self.decode_backend,
             use_cuda_graph=True,
