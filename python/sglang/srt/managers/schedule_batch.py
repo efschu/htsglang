@@ -750,6 +750,9 @@ class Req(ReqDllmMixin):
         # lives in the pinned host pool; None on the default path).
         self.kv_arrival_seq: Optional[int] = None
         self.kv_spill_state: Optional[str] = None
+        # S1b partial spill: number of device-resident head tokens [0, boundary);
+        # the tail [boundary, seq) lives on host (0 == not partially spilled).
+        self.kv_spill_boundary: int = 0
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids

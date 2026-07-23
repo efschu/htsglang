@@ -2601,6 +2601,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self._sess_scratch_i = int(scratch)
         self._sess_wrappers = {}
         self._sess_count_cache = None
+        # S1b: (boundary, dev_head_idx int32, n_head_own) of the current
+        # spill's device-resident head. Constant per spill; reset on clear.
+        self._sess_head = None
         logger.info(
             "kv-session-offload backend wired: mode=%s S=%d prefix=%s "
             "host_base=%d scratch_slot=%d block=%d staging=%.1f MB",
@@ -2651,15 +2654,53 @@ class FlashInferAttnBackend(AttentionBackend):
         assert forward_batch.batch_size == 1, (
             "kv-session-offload: exactly one spilled session per tick"
         )
+        from sglang.srt.managers.kv_session_offload import owned_device_indices
+
         L = int(forward_batch.seq_lens_cpu[0].item())
         rank = self.dcp_rank if self._sess_mode != "plain" else 0
         dcp = len(self._sess_prefix) - 1
+        lo = self._sess_prefix[rank]
+        hi = self._sess_prefix[rank + 1]
+
+        # S1b: head/tail split. The device-resident head [0, boundary) keeps
+        # real slot ids; the host tail [boundary, L) carries sentinels. The
+        # boundary (leading non-sentinel run) is CONSTANT for the life of a
+        # spill -- new tokens append to the host tail -- so it, and this
+        # rank's owned head indices, are derived from the row ONCE and cached
+        # (`_sess_head`, reset by _clear_spill_state). All downstream counts
+        # (blocks, host rows, cur_host_row) are TAIL counts; the head is
+        # attended separately in _sess_blockwise_decode_return_lse.
+        row = None
+        head = self._sess_head
+        if head is None:
+            row = self._sess_req_pool.req_to_token[
+                forward_batch.req_pool_indices[0], :L
+            ]
+            boundary = int((row < self._sess_host_base).sum().item())
+            if boundary > 0:
+                _, dh = owned_device_indices(
+                    row[:boundary],
+                    mode=self._sess_mode,
+                    S=self._sess_S,
+                    lo=lo,
+                    hi=hi,
+                    dcp_size=dcp if self._sess_mode != "plain" else 1,
+                    dcp_rank=rank,
+                )
+                dev_head_idx = dh.to(torch.int32).contiguous()
+            else:
+                dev_head_idx = None
+            n_head_own = 0 if dev_head_idx is None else int(dev_head_idx.numel())
+            self._sess_head = (boundary, dev_head_idx, n_head_own)
+        else:
+            boundary, dev_head_idx, n_head_own = head
+
         if self._sess_mode == "weighted":
             cache = self._sess_count_cache
             if cache is not None and cache[0] == L:
                 counts = list(cache[1])
             elif cache is not None and cache[0] == L - 1:
-                # Incremental: the one appended token (position L-1) has
+                # Incremental: the one appended TAIL token (position L-1) has
                 # residue (L-1) % S by the sentinel construction.
                 res_new = new_token_residue(L - 1, self._sess_S)
                 counts = list(cache[1])
@@ -2668,18 +2709,22 @@ class FlashInferAttnBackend(AttentionBackend):
                         counts[r] += 1
                         break
             else:
-                row = self._sess_req_pool.req_to_token[
-                    forward_batch.req_pool_indices[0], :L
-                ]
-                assert int(row.min().item()) >= self._sess_host_base, (
+                if row is None:
+                    row = self._sess_req_pool.req_to_token[
+                        forward_batch.req_pool_indices[0], :L
+                    ]
+                tailrow = row[boundary:L]
+                assert tailrow.numel() == 0 or (
+                    int(tailrow.min().item()) >= self._sess_host_base
+                ), (
                     "kv-session-offload: non-sentinel slot id in a spill-tick "
-                    "row -- slot space corrupted, refusing to attend garbage KV"
+                    "tail -- slot space corrupted, refusing to attend garbage KV"
                 )
-                residues = row.to(torch.int64) % self._sess_S
+                residues = tailrow.to(torch.int64) % self._sess_S
                 counts = owned_counts_weighted(residues, self._sess_prefix)
-                assert sum(counts) == L, (
-                    f"kv-session-offload: owned counts {counts} do not cover "
-                    f"L={L}"
+                assert sum(counts) == L - boundary, (
+                    f"kv-session-offload: tail owned counts {counts} do not "
+                    f"cover L-boundary={L - boundary}"
                 )
             self._sess_count_cache = (L, tuple(counts))
             res_cur = new_token_residue(L - 1, self._sess_S)
@@ -2687,10 +2732,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 self._sess_prefix[rank] <= res_cur < self._sess_prefix[rank + 1]
             )
         elif self._sess_mode == "even":
-            counts = owned_counts_even(L, dcp)
+            full = owned_counts_even(L, dcp)
+            headc = owned_counts_even(boundary, dcp)
+            counts = [full[r] - headc[r] for r in range(dcp)]
             cur_owned = (L - 1) % dcp == rank
         else:
-            counts = [L]
+            counts = [L - boundary]
             cur_owned = True
         n_own = counts[rank]
         num_blocks = num_blocks_rank_uniform(counts, self._sess_block_size)
@@ -2720,6 +2767,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 g += 1
         st = SimpleNamespace(
             L=L,
+            boundary=boundary,
             n_own=n_own,
             counts=counts,
             num_blocks=num_blocks,
@@ -2733,6 +2781,12 @@ class FlashInferAttnBackend(AttentionBackend):
             k_local=k_local,
             consume_idx=0,
             issue_idx=0,
+            # S1b device head: this rank's owned slots in [0, boundary) (real
+            # pool indices, int32) attended once per layer alongside the host
+            # tail blocks, LSE-merged. None when boundary == 0 (whole-suffix
+            # spill) or this rank owns no head token.
+            dev_head_idx=dev_head_idx,
+            n_head_own=n_head_own,
         )
         # Prime the double buffer: the first two copies (layer 0, and with
         # k_local == 1 already layer 1) start NOW, overlapping everything
@@ -2847,6 +2901,37 @@ class FlashInferAttnBackend(AttentionBackend):
             w._sess_planned = cnt
         return w
 
+    def _sess_plan_dev_head(self, num_qo_heads, num_kv_heads, head_dim):
+        """Persistent decode wrapper for this rank's device-resident head
+        [0, boundary) of a PARTIAL (S1b) spill. Indices are REAL-pool slot
+        ids, frozen for the spill's life, so the plan is built ONCE per tick
+        (guarded on ``st``) and reused across every full-attention layer.
+        Returns None when this rank owns no head token (boundary == 0 or the
+        rank's head shard is empty) -- then only the host tail is attended."""
+        st = self._sess_spill
+        idx = st.dev_head_idx
+        if idx is None or int(idx.numel()) == 0:
+            return None
+        w = self._sess_get_wrapper(("dev_head",))
+        if not getattr(st, "_dev_head_planned", False):
+            iu = self.indices_updater_decode
+            blk_indptr = torch.tensor(
+                [0, int(idx.numel())], dtype=torch.int32, device=idx.device
+            )
+            w.plan(
+                blk_indptr,
+                idx,
+                self.kv_last_page_len[:1],
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,  # page_size
+                q_data_type=iu.q_data_type,
+                kv_data_type=iu.data_type,
+            )
+            st._dev_head_planned = True
+        return w
+
     def _sess_blockwise_decode_return_lse(self, q_full, layer):
         """Spill-tick decode attention over the host-resident shard (DCP
         form): consume this layer's streamed blocks from the double-
@@ -2867,6 +2952,23 @@ class FlashInferAttnBackend(AttentionBackend):
 
         o_acc = None
         lse_acc = None
+        # S1b HYBRID attention: attend the device-resident head [0, boundary)
+        # from the REAL pool first (fast, no host stream), then online-merge
+        # the host tail blocks below. Both partials are the same flashinfer
+        # paged-decode family -> the same _safe_merge_state operator, so the
+        # (o, lse) contract handed to the cross-rank cp_lse merge is
+        # unchanged. Intra-rank: no collective is issued here.
+        dev_w = self._sess_plan_dev_head(num_qo_heads, num_kv_heads, head_dim)
+        if dev_w is not None:
+            real_kv = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            o_acc, lse_acc = dev_w.forward_return_lse(
+                q_full,
+                real_kv,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
         for _ in range(st.k_local):
             ent = st.sched[st.consume_idx]
             e_fl, s_row, e_row, region, need_cur = ent

@@ -11,6 +11,8 @@ import torch
 from sglang.srt.managers.kv_session_offload import (
     RestoreHysteresis,
     assign_owner_matched_slots,
+    bundle_spillable_sizes,
+    chunk_ceil,
     compact_weighted,
     make_sentinels,
     new_token_residue,
@@ -18,6 +20,7 @@ from sglang.srt.managers.kv_session_offload import (
     owned_counts_even,
     owned_counts_weighted,
     owned_device_indices,
+    partial_spill_plan,
     select_spill_victim,
     sentinel_base,
     session_priority_key,
@@ -125,6 +128,26 @@ def test_owned_device_indices_modes():
         row, mode="plain", S=1, lo=0, hi=1, dcp_size=1, dcp_rank=0
     )
     assert bool(owned_p.all()) and torch.equal(dev_p, row.to(torch.int64))
+
+
+def test_owned_device_indices_even_pos_offset():
+    """S1b even-mode tail: ownership must key on the ABSOLUTE position
+    (pos_offset + i), not the segment-relative one. A tail starting at an
+    offset not divisible by dcp_size would otherwise mis-assign owners."""
+    seg = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int32)  # a tail segment
+    boundary = 7  # absolute positions 7,8,9,10,11
+    owned, dev = owned_device_indices(
+        seg, mode="even", S=3, lo=0, hi=0, dcp_size=3, dcp_rank=1,
+        pos_offset=boundary,
+    )
+    # rank 1 owns absolute positions p with p % 3 == 1 -> {7, 10} -> seg idx 0, 3
+    assert owned.nonzero().flatten().tolist() == [0, 3]
+    assert torch.equal(dev, seg.to(torch.int64)[[0, 3]] // 3)
+    # default offset 0 keys on relative position (backward compatible)
+    owned0, _ = owned_device_indices(
+        seg, mode="even", S=3, lo=0, hi=0, dcp_size=3, dcp_rank=1
+    )
+    assert owned0.nonzero().flatten().tolist() == [1, 4]
 
 
 def test_assign_owner_matched_slots_and_restore_mapping():
@@ -239,6 +262,128 @@ def test_minimal_eviction_none_sufficient_falls_back_to_youngest():
     reqs = [_FakeReq(0), _FakeReq(4), _FakeReq(7)]
     sizes = [900, 500, 300]
     assert select_spill_victim(reqs, sizes=sizes, need=5000) == 2
+
+
+# ---------------------------------------------------------------------------
+# S1b partial token spill (tier boundary per session)
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_ceil():
+    assert chunk_ceil(0, 128) == 0
+    assert chunk_ceil(1, 128) == 128
+    assert chunk_ceil(128, 128) == 128
+    assert chunk_ceil(129, 128) == 256
+    assert chunk_ceil(-5, 128) == 0  # negative shortfall -> nothing
+    # degenerate chunk clamps to 1 (never divides by zero)
+    assert chunk_ceil(7, 0) == 7
+    assert chunk_ceil(7, 1) == 7
+    # over-eviction margin bounded by chunk-1
+    for need in range(1, 400):
+        c = chunk_ceil(need, 128)
+        assert c >= need and c - need < 128 and c % 128 == 0
+
+
+class _FakeSpillReq:
+    def __init__(self, protected):
+        self.cache_protected_len = protected
+
+
+def test_bundle_spillable_sizes():
+    # only the KV shard today; a GDN tier appends further ("gdn_state", ...)
+    # entries WITHOUT touching the victim ordering (factoring seam).
+    assert bundle_spillable_sizes(_FakeSpillReq(10), 100) == [("kv", 90)]
+    assert bundle_spillable_sizes(_FakeSpillReq(0), 100) == [("kv", 100)]
+    # protected >= seq_len -> nothing spillable (never negative)
+    assert bundle_spillable_sizes(_FakeSpillReq(100), 100) == [("kv", 0)]
+    assert bundle_spillable_sizes(_FakeSpillReq(120), 100) == [("kv", 0)]
+    # None protected treated as 0
+    assert bundle_spillable_sizes(_FakeSpillReq(None), 50) == [("kv", 50)]
+
+
+def test_partial_spill_plan_basic():
+    CH = 128
+    # small shortfall -> block-aligned tail, head stays large
+    b, sc = partial_spill_plan(L=1000, protected=8, need=1, chunk=CH)
+    assert sc == 128 and b == 872
+    b, sc = partial_spill_plan(L=1000, protected=8, need=129, chunk=CH)
+    assert sc == 256 and b == 744
+    # exact multiple
+    b, sc = partial_spill_plan(L=1000, protected=8, need=256, chunk=CH)
+    assert sc == 256 and b == 744
+
+
+def test_partial_spill_plan_nothing_when_need_nonpositive():
+    b, sc = partial_spill_plan(L=1000, protected=8, need=0, chunk=128)
+    assert sc == 0 and b == 1000
+    b, sc = partial_spill_plan(L=1000, protected=8, need=-50, chunk=128)
+    assert sc == 0 and b == 1000
+
+
+def test_partial_spill_plan_caps_at_exclusive_suffix():
+    # need exceeds the whole exclusive suffix -> spill it entirely, boundary
+    # floors at protected (the shared prefix is NEVER spilled).
+    b, sc = partial_spill_plan(L=1000, protected=200, need=100000, chunk=128)
+    assert b == 200 and sc == 800  # L - protected
+    # protected == 0 degenerates to a whole-session spill (boundary 0)
+    b, sc = partial_spill_plan(L=500, protected=0, need=100000, chunk=128)
+    assert b == 0 and sc == 500
+    # boundary is always in [protected, L]
+    for need in (1, 130, 777, 5000):
+        b, sc = partial_spill_plan(L=900, protected=64, need=need, chunk=128)
+        assert 64 <= b <= 900 and sc == 900 - b
+
+
+def test_partial_sentinel_segment_roundtrip():
+    """S1b row = [real head slots] ++ [tail sentinels]. The boundary
+    (leading non-sentinel run) and every tail position/residue must be
+    recoverable from the row alone -- the backend derives head/tail split +
+    tail ownership with no side state."""
+    alloc_size = 1_000_000
+    hb = sentinel_base(alloc_size, S)
+    L = 300
+    boundary = 176
+    # head: real allocator slots (all strictly below the host base)
+    head = torch.arange(1, boundary + 1, dtype=torch.int64)  # valid slot ids
+    assert int(head.max()) < hb
+    # tail: sentinels for absolute positions [boundary, L)
+    residues = torch.tensor(
+        [(boundary + i) % S for i in range(L - boundary)], dtype=torch.int64
+    )
+    tail = make_sentinels(hb, S, residues, start=boundary)
+    row = torch.cat([head, tail])
+    # 1. boundary recovered as the leading non-sentinel run
+    assert int((row < hb).sum()) == boundary
+    # 2. tail positions recovered (absolute, via start=boundary)
+    seg = row[boundary:]
+    assert torch.equal((seg - hb) // S, torch.arange(boundary, L, dtype=torch.int64))
+    # 3. tail residues recovered (sentinel % S == owner residue)
+    assert torch.equal(seg % S, residues)
+    # 4. head slots survive the split unchanged
+    assert torch.equal(row[:boundary], head)
+    # 5. int32-safe
+    assert int(row.max()) < (1 << 31) - S
+
+
+def test_partial_tail_ownership_composes():
+    """The host tail's per-rank owned counts equal the whole-session counts
+    restricted to the tail -- so reusing owned_counts_weighted on the tail
+    segment is exact (the mechanic the backend relies on)."""
+    rng = random.Random(11)
+    L = 800
+    boundary = 517
+    residues_full = torch.tensor([rng.randrange(S) for _ in range(L)])
+    tail_counts = owned_counts_weighted(residues_full[boundary:], PREFIX)
+    for r in range(3):
+        lo, hi = PREFIX[r], PREFIX[r + 1]
+        brute = int(
+            (
+                (residues_full[boundary:] >= lo)
+                & (residues_full[boundary:] < hi)
+            ).sum()
+        )
+        assert tail_counts[r] == brute
+    assert sum(tail_counts) == L - boundary
 
 
 def test_restore_hysteresis():

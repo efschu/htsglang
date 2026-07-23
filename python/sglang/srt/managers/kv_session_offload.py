@@ -80,13 +80,68 @@ def sentinel_base(alloc_max_slot: int, split_factor: int) -> int:
 
 
 def make_sentinels(
-    host_base: int, split_factor: int, residues: torch.Tensor
+    host_base: int, split_factor: int, residues: torch.Tensor, start: int = 0
 ) -> torch.Tensor:
-    """Sentinel slot ids for positions ``0..len(residues)-1`` with the given
-    owner residues. int64; caller casts for the req_to_token write."""
+    """Sentinel slot ids for positions ``start..start+len(residues)-1`` with
+    the given owner residues. int64; caller casts for the req_to_token
+    write. ``start`` > 0 encodes a PARTIAL spill segment (S1b): only the
+    positions inside the tier segment [a, b) carry sentinels."""
     n = residues.numel()
-    p = torch.arange(n, dtype=torch.int64, device=residues.device)
+    p = torch.arange(start, start + n, dtype=torch.int64, device=residues.device)
     return host_base + p * int(split_factor) + residues.to(torch.int64)
+
+
+def chunk_ceil(need: int, chunk: int) -> int:
+    """Round a token shortfall up to the spill-growth chunk (amortizes the
+    per-event D2H cost; the over-eviction margin is bounded by chunk-1)."""
+    c = max(1, int(chunk))
+    n = max(0, int(need))
+    return ((n + c - 1) // c) * c
+
+
+def bundle_spillable_sizes(req, seq_len: int) -> List[Tuple[str, int]]:
+    """Per-resource spillable sizes of one session's RESIDENCY BUNDLE.
+
+    Factoring seam for the future GDN-state host tier: a session's
+    residency unit is the BUNDLE of (target KV shard, GDN/Mamba states,
+    MTP-draft share). Victim ORDERING stays `session_priority_key` /
+    `select_spill_victim` (resource-agnostic); the MECHANICS consume this
+    list. In S2 the KV shard is the only element; a GDN tier adds
+    ("gdn_state", ...) / ("draft_kv", ...) entries here without touching
+    the ordering logic. NOTE: the S1 spec-decode rejection will later be
+    lifted through exactly this bundle -- the draft share spills WITH the
+    session instead of speculative decoding being forbidden.
+    """
+    kv = max(0, int(seq_len) - int(req.cache_protected_len or 0))
+    return [("kv", kv)]
+
+
+def partial_spill_plan(
+    L: int, protected: int, need: int, chunk: int
+) -> Tuple[int, int]:
+    """Tier boundary for a PARTIAL (S1b) spill of one session.
+
+    Only the TAIL overhang moves to host; the head ``[0, boundary)`` stays
+    device-resident (fast). Returns ``(boundary, spill_count)`` where the
+    spilled tail is exactly ``[boundary, L)`` (``spill_count = L - boundary``
+    host tokens).
+
+    * ``spill_count`` is the shortfall ``need`` rounded UP to ``chunk`` (the
+      streamed-block granularity), so the freed tail is block-aligned and the
+      over-eviction margin is bounded by ``chunk - 1`` (vs. a whole-session
+      spill's margin of ``spillable - need``).
+    * The tail never dips below the protected radix prefix: at most
+      ``L - protected`` tokens (the req-exclusive suffix) are spillable. When
+      the rounded shortfall meets or exceeds that cap the whole exclusive
+      suffix spills (``boundary == protected``) -- the shared prefix ALWAYS
+      stays device-resident and tree-locked, it is never backed up or freed.
+    * ``need <= 0`` yields ``spill_count == 0`` (boundary == L): the caller
+      asked to free nothing, so nothing moves.
+    """
+    max_spill = max(0, int(L) - int(protected))
+    want = min(chunk_ceil(need, chunk), max_spill)
+    boundary = int(L) - want
+    return boundary, want
 
 
 def new_token_residue(position: int, split_factor: int) -> int:
@@ -143,6 +198,7 @@ def owned_device_indices(
     hi: int,
     dcp_size: int,
     dcp_rank: int,
+    pos_offset: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """This rank's owned tokens of a req_to_token row (position order).
 
@@ -152,13 +208,20 @@ def owned_device_indices(
       * even:     ownership from POSITION (p % dcp_size == rank), compact
                   slot = loc // dcp_size (the classic modulo layout).
       * plain:    single owner, compact slot = loc (dcp_size == 1).
-    """
+
+    ``pos_offset`` (S1b): when ``row`` is a TAIL SEGMENT starting at absolute
+    position ``pos_offset``, the even-mode positional owner rule must key on
+    the ABSOLUTE position (``pos_offset + i``), not the segment-relative one.
+    Ignored by weighted/plain (their ownership is slot-derived, position-
+    independent)."""
     L = row.numel()
     if mode == "weighted":
         owned, compact = compact_weighted(row, S, lo, hi)
         return owned, compact[owned].contiguous()
     if mode == "even":
-        pos = torch.arange(L, dtype=torch.int64, device=row.device)
+        pos = torch.arange(
+            pos_offset, pos_offset + L, dtype=torch.int64, device=row.device
+        )
         owned = pos % dcp_size == dcp_rank
         compact = row.to(torch.int64) // dcp_size
         return owned, compact[owned].contiguous()
@@ -382,7 +445,9 @@ class KVSessionOffloadManager:
             for r in getattr(self.scheduler, "waiting_queue", ())
         )
 
-    def try_spill(self, batch: "ScheduleBatch", fast_pressure=None) -> bool:
+    def try_spill(
+        self, batch: "ScheduleBatch", fast_pressure=None, need: Optional[int] = None
+    ) -> bool:
         """Spill the least-protected running session out of ``batch``
         (youngest NORMAL; fast-lane requests are never victims; under
         fast-lane pressure even the oldest normal may lose its device
@@ -390,9 +455,22 @@ class KVSessionOffloadManager:
         failed (after tree eviction) and from the fast-lane admission
         trigger. Returns True when a session was spilled.
 
+        S1b PARTIAL SPILL: only the victim's TAIL overhang moves to host --
+        the head ``[0, boundary)`` stays device-resident and keeps its tree
+        lock / protected prefix. The freed tail is ``chunk_ceil(need,
+        block_size)`` tokens (block-aligned; over-eviction margin <=
+        block-1). A whole-session spill is just the boundary==protected
+        special case (need >= the exclusive suffix).
+
+        ``need`` (token shortfall to free) is computed from the batch's next
+        decode step when not given; the fast-lane trigger passes the waiting
+        request's shortfall explicitly. If a single victim's exclusive
+        suffix cannot cover ``need`` the whole suffix spills and the caller
+        re-checks (multi-eviction across sessions is an S4 extension).
+
         S1 limit: ONE spill slot. If a fast-lane request needs MORE room
         than one eviction frees, it stays cleanly queued (multi-eviction is
-        an S2 extension) -- never an inconsistent partial spill."""
+        an S4 extension) -- never an inconsistent partial spill."""
         if self.spilled_req is not None:
             return False
         if fast_pressure is None:
@@ -401,11 +479,13 @@ class KVSessionOffloadManager:
         # single-session eviction (youngest sufficient; see
         # select_spill_victim). Only req-exclusive slots count as freed
         # (the shared radix prefix stays tree-owned, merely evictable).
-        need = max(
-            0,
-            batch.new_tokens_required_next_decode()
-            - self.allocator.available_size(),
-        )
+        if need is None:
+            need = max(
+                0,
+                batch.new_tokens_required_next_decode()
+                - self.allocator.available_size(),
+            )
+        need = max(0, int(need))
         sizes = [
             max(
                 0,
@@ -422,7 +502,6 @@ class KVSessionOffloadManager:
         req = batch.reqs[idx]
         if req.finished() or getattr(req, "to_finish", None) is not None:
             return False
-        spill_margin = sizes[idx] - need  # over-eviction metric (S1b -> ~0)
 
         L = int(batch.seq_lens_cpu[idx].item())
         if L != req.kv_committed_len or L != req.kv_allocated_len:
@@ -437,20 +516,36 @@ class KVSessionOffloadManager:
                 req.kv_allocated_len,
             )
             return False
+
+        # S1b PARTIAL SPILL: only the block-aligned TAIL overhang migrates to
+        # host. boundary splits the row into a device-resident head
+        # [0, boundary) (kept, tree-locked) and a host tail [boundary, L).
+        protected = int(req.cache_protected_len or 0)
+        boundary, spill_count = partial_spill_plan(
+            L, protected, need, self.block_size
+        )
+        if spill_count <= 0:
+            # need <= 0 after the internal recompute: nothing to free. Leave
+            # the batch untouched (the stock retract path decides).
+            return False
+        spill_margin = spill_count - need  # over-eviction metric (<= block-1)
+
         row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :L]
+        seg = row[boundary:L]  # migrating tail; wholly req-exclusive (>= protected)
         owned_mask, dev_idx = owned_device_indices(
-            row,
+            seg,
             mode=self.mode,
             S=self.S,
             lo=self.lo,
             hi=self.hi,
             dcp_size=self.dcp_size,
             dcp_rank=self.dcp_rank,
+            pos_offset=boundary,  # even-mode ownership keys on absolute position
         )
         n_own = int(dev_idx.numel())
         if n_own > self.host_pool.size:
             logger.warning(
-                "kv-session-offload: session rid=%s needs %d host rows > "
+                "kv-session-offload: session rid=%s tail needs %d host rows > "
                 "pool %d; falling back to stock retraction.",
                 req.rid,
                 n_own,
@@ -458,57 +553,56 @@ class KVSessionOffloadManager:
             )
             return False
 
-        # Owner residues BEFORE the row is overwritten. Weighted rule:
-        # ownership is a function of the slot id -> preserve loc % S.
-        # Even/plain rules: ownership is positional -> p % S keeps the
-        # sentinel encoding uniform (the residue field is not consulted).
+        # Owner residues of the TAIL SEGMENT, before the row is overwritten.
+        # Weighted rule: ownership is a function of the slot id -> preserve
+        # seg % S. Even/plain rules: ownership is positional -> keyed on the
+        # ABSOLUTE position (boundary..L) so the sentinel encoding (which
+        # carries position) stays consistent with the retained head.
         if self.mode == "weighted":
-            residues = (row.to(torch.int64) % self.S).contiguous()
+            residues = (seg.to(torch.int64) % self.S).contiguous()
         else:
             residues = (
-                torch.arange(L, dtype=torch.int64, device=row.device) % self.S
+                torch.arange(boundary, L, dtype=torch.int64, device=row.device)
+                % self.S
             )
 
         # 1. Order after any in-flight forward that still writes this
-        #    session's last KV row (overlap mode), then D2H-backup the whole
-        #    owned shard (all full-attention layers) into host rows [0, n).
+        #    session's last KV row (overlap mode), then D2H-backup the tail's
+        #    owned slots (all full-attention layers) into host rows [0, n).
         #    Also quiesce the streamed-prefetch copy stream: a previous
-        #    spill's queued H2D reads of these host rows must complete
-        #    before we overwrite them (S2 double-buffer pipeline).
+        #    spill's queued H2D reads of these host rows must complete before
+        #    we overwrite them (S2 double-buffer pipeline).
         self._wait_forward_stream()
         torch.cuda.current_stream().wait_stream(self.backend._sess_copy_stream)
         self.backend._sess_count_cache = None
+        self.backend._sess_head = None  # new spill: re-derive head/tail split
         if n_own > 0:
             host_ids = torch.arange(n_own, dtype=torch.int64, device=row.device)
             self.host_pool.backup_from_device_all_layer(
                 self.full_pool, host_ids, dev_idx, io_backend="kernel"
             )
 
-        # 2. Release device references exactly like a retract, EXCEPT that
-        #    the request keeps its req_to_token row and its Mamba/GDN state:
-        #    free the req-exclusive slots, unlock the shared radix prefix
-        #    (the tree keeps those slots; eviction reclaims them lazily --
-        #    our backup above already covers them).
-        protected = int(req.cache_protected_len or 0)
-        if protected < L:
-            self.allocator.free(row[protected:L].to(torch.int64))
-        if req.last_node is not None:
-            self.tree_cache.dec_lock_ref(req.last_node)
-        req.last_node = getattr(self.tree_cache, "root_node", None)
-        req.prefix_indices = torch.empty(0, dtype=torch.int64, device=row.device)
-        req.cache_protected_len = 0
-        req.num_matched_prefix_tokens = 0
+        # 2. Free ONLY the tail device slots. The head [0, boundary) -- the
+        #    shared protected radix prefix AND the retained exclusive head --
+        #    stays device-resident and tree-locked (last_node / prefix_indices
+        #    / cache_protected_len are NOT reset): the hybrid spill tick
+        #    attends the head on device every layer, the tail from host.
+        self.allocator.free(seg.to(torch.int64))
 
-        # 3. Rewrite the row with sentinels (residues preserved).
-        sent = make_sentinels(self.host_base, self.S, residues)
+        # 3. Rewrite ONLY the tail row [boundary, L) with sentinels; the head
+        #    keeps its real slot ids. start=boundary encodes the absolute
+        #    position so every rank re-derives head/tail split + tail
+        #    ownership from the (replicated) row alone.
+        sent = make_sentinels(self.host_base, self.S, residues, start=boundary)
         assert int(sent[-1].item()) < (1 << 31) - self.S, (
             "kv-session-offload: sentinel overflow (int32 req_to_token)"
         )
-        self.req_to_token_pool.req_to_token[req.req_pool_idx, :L] = sent.to(
+        self.req_to_token_pool.req_to_token[req.req_pool_idx, boundary:L] = sent.to(
             torch.int32
         )
 
         req.kv_spill_state = "host"
+        req.kv_spill_boundary = boundary
         self.spilled_req = req
         self.spilled_batch = None  # built lazily at the first tick
         self._spill_iter = self._iter_ct
@@ -519,17 +613,21 @@ class KVSessionOffloadManager:
         batch.batch_is_full = False
 
         self._log(
-            "kv-session-offload SPILL: rid=%s arrival_seq=%s L=%d owned=%d "
-            "(rank %d) protected_prefix=%d -> host; need=%d freed=%d "
-            "over-eviction margin=%d tokens; device batch bs=%d",
+            "kv-session-offload SPILL(partial): rid=%s arrival_seq=%s L=%d "
+            "boundary=%d device_head=%d host_tail=%d owned_tail=%d (rank %d) "
+            "protected_prefix=%d; need=%d freed=%d over-eviction margin=%d "
+            "tokens; device batch bs=%d",
             req.rid,
             getattr(req, "kv_arrival_seq", None),
             L,
+            boundary,
+            boundary,
+            spill_count,
             n_own,
             self.dcp_rank,
             protected,
             need,
-            L - protected,
+            spill_count,
             spill_margin,
             len(batch.reqs),
         )
@@ -662,7 +760,9 @@ class KVSessionOffloadManager:
         have = self.allocator.available_size() + self._tree_evictable_size()
         if have >= need:
             return  # normal admission will take it
-        if self.try_spill(running_batch, fast_pressure=True):
+        # Free exactly the fast request's shortfall (block-rounded inside
+        # try_spill) -- a partial tail spill, not the whole victim.
+        if self.try_spill(running_batch, fast_pressure=True, need=need - have):
             self._log(
                 "kv-session-offload: spilled for FAST-LANE request rid=%s "
                 "(need %d tokens, had %d)",
@@ -773,17 +873,22 @@ class KVSessionOffloadManager:
     def _restore_memory_ok(self, L: int) -> bool:
         from sglang.srt.mem_cache.common import evict_from_tree_cache
 
-        need = L + self.restore_margin_tokens
+        # Only the HOST TAIL needs fresh device slots; the head [0, boundary)
+        # kept its slots throughout the (partial) spill. boundary is derived
+        # from the replicated row (leading non-sentinel run).
+        req = self.spilled_req
+        row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :L]
+        boundary = int((row < self.host_base).sum().item())
+        tail = L - boundary
+        need = tail + self.restore_margin_tokens
         if self.allocator.available_size() < need:
             evict_from_tree_cache(self.tree_cache, need)
         if self.allocator.available_size() < need:
             return False
         if self.mode == "weighted":
             # Per-owner-class availability (free slots whose residue class
-            # matches each rank's owned-token count).
-            req = self.spilled_req
-            row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :L]
-            residues = row.to(torch.int64) % self.S
+            # matches each rank's owned TAIL-token count).
+            residues = row[boundary:L].to(torch.int64) % self.S
             counts = owned_counts_weighted(residues, self.cp_prefix)
             free = self.allocator.free_pages
             res_free = free % self.S
@@ -797,10 +902,14 @@ class KVSessionOffloadManager:
     def _restore(self, running_batch, L: int):
         req = self.spilled_req
         row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :L]
-        assert int(row.min().item()) >= self.host_base, (
-            "kv-session-offload restore: non-sentinel slot in a spilled row"
+        # Wave back ONLY the host tail [boundary, L); the head kept its slots.
+        boundary = int((row < self.host_base).sum().item())
+        seg = row[boundary:L]
+        tail = int(seg.numel())
+        assert tail == 0 or int(seg.min().item()) >= self.host_base, (
+            "kv-session-offload restore: non-sentinel slot in a spilled tail"
         )
-        residues = (row.to(torch.int64) % self.S).contiguous()
+        residues = (seg.to(torch.int64) % self.S).contiguous()
 
         if self.mode == "weighted":
             counts = owned_counts_weighted(residues, self.cp_prefix)
@@ -818,7 +927,7 @@ class KVSessionOffloadManager:
                 residues, self.cp_prefix, class_slots
             )
         else:
-            new_locs = self.allocator.alloc(L)
+            new_locs = self.allocator.alloc(tail)
             if new_locs is None:
                 self.hysteresis.reset()
                 return running_batch
@@ -832,6 +941,7 @@ class KVSessionOffloadManager:
             hi=self.hi,
             dcp_size=self.dcp_size,
             dcp_rank=self.dcp_rank,
+            pos_offset=boundary,  # even-mode ownership keys on absolute position
         )
         n_own = int(dev_idx.numel())
         if self.mode == "weighted":
@@ -847,11 +957,12 @@ class KVSessionOffloadManager:
             self.host_pool.load_to_device_per_layer(
                 self.full_pool, host_ids, dev_idx, fl, io_backend="kernel"
             )
-        self.req_to_token_pool.req_to_token[req.req_pool_idx, :L] = new_locs.to(
-            torch.int32
+        self.req_to_token_pool.req_to_token[req.req_pool_idx, boundary:L] = (
+            new_locs.to(torch.int32)
         )
 
         req.kv_spill_state = None
+        req.kv_spill_boundary = 0
         if self.spilled_batch is None:
             # Never ticked while spilled: build the decode batch now so the
             # session can be merged back like any resumed decode request.
@@ -862,10 +973,12 @@ class KVSessionOffloadManager:
         batch.kv_session_spill_tick = False
         self._clear_spill_state("restored to device")
         self._log(
-            "kv-session-offload RESTORE: rid=%s L=%d owned=%d (rank %d) "
-            "H2D complete; rejoining device batch",
+            "kv-session-offload RESTORE: rid=%s L=%d boundary=%d tail=%d "
+            "owned_tail=%d (rank %d) H2D complete; rejoining device batch",
             req.rid,
             L,
+            boundary,
+            tail,
             n_own,
             self.dcp_rank,
         )
@@ -878,20 +991,40 @@ class KVSessionOffloadManager:
     # -- finish / cleanup ---------------------------------------------------
 
     def release_finished_spilled_req(self, req: "Req"):
-        """Finish path for a request that ends WHILE spilled: its
-        req_to_token row holds sentinels (never allocator slots) and it owns
-        no device KV -- only the Mamba state and the req slot are freed. No
-        radix insert (there is no device KV to donate)."""
+        """Finish path for a request that ends WHILE (partially) spilled: its
+        row holds host sentinels in the tail [boundary, L) and REAL device
+        slots in the retained head [0, boundary). Release the exclusive head
+        slots [protected, boundary), drop the shared-prefix tree lock, and
+        free the Mamba state + req slot. The host tail needs no free (the
+        pinned host pool is a fixed ring reclaimed with the spill slot). No
+        radix insert (the tail is on host -- there is no full device KV to
+        donate)."""
         assert getattr(req, "kv_spill_state", None) == "host"
         pool = self.req_to_token_pool
+        boundary = int(getattr(req, "kv_spill_boundary", 0) or 0)
+        protected = int(req.cache_protected_len or 0)
+        head_freed = 0
+        if boundary > protected:
+            # Retained exclusive device head [protected, boundary).
+            head = pool.req_to_token[req.req_pool_idx, protected:boundary]
+            self.allocator.free(head.to(torch.int64))
+            head_freed = boundary - protected
+        if req.last_node is not None:
+            # The shared radix prefix stayed tree-locked across the spill.
+            self.tree_cache.dec_lock_ref(req.last_node)
         if req.mamba_pool_idx is not None and hasattr(pool, "free_mamba_cache"):
             pool.free_mamba_cache(req)
         pool.free(req)
         req.kv_spill_state = None
+        req.kv_spill_boundary = 0
         self._log(
             "kv-session-offload: spilled session rid=%s finished on host; "
-            "released mamba + req slot (no device KV, no radix insert)",
+            "released device head=%d (boundary=%d protected=%d) + tree lock "
+            "+ mamba + req slot (no radix insert)",
             req.rid,
+            head_freed,
+            boundary,
+            protected,
         )
         # State is cleared in pre_schedule (spilled_req.finished()).
 
@@ -900,9 +1033,11 @@ class KVSessionOffloadManager:
         self.spilled_req = None
         self.spilled_batch = None
         self.hysteresis.reset()
-        # S2: the backend's incremental owned-count cache belongs to THIS
-        # session; a later spill must recompute from its own sentinel row.
+        # S2: the backend's incremental owned-count cache + head/tail split
+        # belong to THIS session; a later spill must recompute from its own
+        # sentinel row.
         self.backend._sess_count_cache = None
+        self.backend._sess_head = None
         logger.debug("kv-session-offload: spill slot cleared (%s, rid=%s)", why, rid)
 
     def inflight_batches(self):
