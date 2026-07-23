@@ -711,19 +711,24 @@ FEATURES = [
     # -- 6. Weightless-KV lane --------------------------------------------
     {
         "name": "06-weightless-kv-lane.svg",
-        "title": "6 — Weightless-KV lane: free the worker cards of weights and add a host KV tier for long context",
-        "subtitle": "Fork on the rig vs a homogeneous upstream config that holds weights on every rank.",
+        "title": "6 — Weightless-KV lane: free the workers of weights so their freed VRAM becomes device KV",
+        "subtitle": "Fork on the rig (head holds all weights, workers become device-KV donors) vs upstream, where every rank splits VRAM between weights and KV.",
         "sentences": [
-            ("Left (measured): --weightless-kv-fastlane, TP=3 + DCP, context 262144. rank0 (5090) is the HEAD "
-             "— it holds ALL layer weights (TP=1) at ~22.8 GiB. rank1/2 (3080) are WEIGHTLESS meta-device "
-             "workers with ZERO layer weights (~14 GiB freed each), holding only a KV token-shard (~3.7 GiB). "
-             "KV tiers: 40000 device + 1024 staging + 64000 host slots; global 312000 tokens, 262k proven.", "#333"),
-            ("Right (illustrative): a homogeneous upstream even-TP holds the layer weights on EVERY rank, so "
-             "each identical card spends part of its VRAM on weights and the rest on KV — there are no "
-             "weightless workers and no host KV tier, so per-card context is far below 262k without more/bigger "
-             "equal cards.", "#555"),
+            ("Left (measured, PRIMARY): --weightless-kv-fastlane, TP=3 + DCP. rank0 (5090) is the HEAD — it holds "
+             "ALL layer weights (TP=1). rank1/2 (3080) are WEIGHTLESS meta-device workers with ZERO layer weights "
+             "(~14 GiB freed EACH, MEASURED); that freed VRAM instead carries DEVICE KV — KV token-shards + "
+             "KV-heads — and the workers compute the attention over it. The slow cards become on-device KV "
+             "DONORS: pooled device KV across the freed workers is the capacity win.", "#333"),
+            ("Secondary (extreme context only): an OPTIONAL host-KV tier sits ON TOP, used only for context that "
+             "exceeds the pooled device KV — up to 262k tokens proven (~12.6 GiB pinned host, #134 B1/B2, "
+             "needle-at-midpoint retrieved). It is an extension, not the primary store; the 262k extreme config "
+             "deliberately shrinks the device pool and pushes most KV to host (40000 device / 64000 host slots), "
+             "whereas in the normal case the freed worker VRAM holds the device KV.", "#8a5a2b"),
+            ("Right (illustrative): a homogeneous upstream even-TP holds the layer weights on EVERY rank, so each "
+             "identical card splits its VRAM between weights and KV — there are no weightless workers, so per-card "
+             "context is bounded without more/bigger equal cards.", "#555"),
         ],
-        "left_label": "htsglang — head card + weightless KV workers (measured)",
+        "left_label": "htsglang — head holds weights, workers become device-KV donors (measured)",
         "right_label": "upstream — N identical cards, weights on every rank",
         "left_cards": [
             ("RTX 5090", "HEAD · 22.8 GB used", 32.6, [
@@ -731,15 +736,13 @@ FEATURES = [
                 ("kv", 4.0, "head KV", E),
                 ("ctx", 1.8, "", E)]),
             ("RTX 3080", "weightless worker", 20.5, [
-                ("weights", 0.3, "0 wts", M),
-                ("kv", 3.0, "KV token-shard", M),
-                ("ctx", 0.7, "", E),
-                ("free", 14.0, "~14 GB freed", M)]),
+                ("weights", 0.3, "0 layer weights (meta-device)", M),
+                ("kv", 16.0, "device KV (freed VRAM)", M),
+                ("ctx", 0.7, "", E)]),
             ("RTX 3080", "weightless worker", 20.5, [
-                ("weights", 0.3, "0 wts", M),
-                ("kv", 3.0, "KV token-shard", M),
-                ("ctx", 0.7, "", E),
-                ("free", 14.0, "~14 GB freed", M)]),
+                ("weights", 0.3, "0 layer weights (meta-device)", M),
+                ("kv", 16.0, "device KV (freed VRAM)", M),
+                ("ctx", 0.7, "", E)]),
         ],
         "right_cards": [
             ("identical 24 GB", "rank0 · even TP", 24, [
@@ -751,23 +754,27 @@ FEATURES = [
                 ("kv", 9.5, "KV", E),
                 ("ctx", 1.5, "", E)]),
         ],
-        "left_free": "freed",
-        "host": ("Host RAM (DDR) — host KV tier",
-                 [("hostkv", 0.42, "host KV tier ~12.6 GB pinned (64000 slots)", M),
+        "host": ("Host RAM (DDR) — OPTIONAL extreme-context tier (only beyond pooled device KV)",
+                 [("hostkv", 0.42, "~12.6 GB pinned — beyond device pool → 262k (#134)", M),
                   ("free", 0.58, "", M)]),
         "left_notes": [
-            ("Weights-freed (~14 GB/worker) and host-pinned 12.6 GB are MEASURED; the internal head-card "
-             "weight/KV split is ESTIMATED (not separately dumped). Throughput is interconnect-bound, NOT a "
-             "win: ~25 tok/s @8k · ~7 @28k · ~1.5 @262k. After #136a/#136b the PCIe wall is mostly hidden, "
-             "so the deep-context floor is now compute + collectives on the slow cards, not H2D bandwidth.", "#1d6b34"),
+            ("PRIMARY win = pooled DEVICE KV on the freed workers (0 layer weights, ~14 GiB freed each, MEASURED; "
+             "head 22.8 / worker 3.7 GiB VRAM in the 262k run). The host tier is a SECONDARY extension for context "
+             "beyond that; it stages only ~C/dcp_size per rank (3.5x host-RAM saving), no unverified context "
+             "multiplier claimed.", "#1d6b34"),
+            ("Throughput is interconnect-bound, NOT a \"fast\" claim: ~25 tok/s @8k · ~7 @28k · ~1.5 @262k eager "
+             "(graph+prefetch raises exact-rung to ~26-29). After #136a/#136b the PCIe wall is mostly hidden, so "
+             "the deep-context floor is now block-attention compute + per-layer collectives on the slow workers, "
+             "not H2D bandwidth.", "#333"),
         ],
         "right_notes": [
-            ("Weights compete with KV on every identical card; no host KV tier. Illustrative sizes.", "#4a5568"),
+            ("Weights compete with KV on every identical card; no weightless workers. Illustrative sizes.", "#4a5568"),
         ],
-        "core": ("the fork frees the worker cards of weights (~14 GiB each) and adds a host KV tier so mismatched "
-                 "cards carry a 262k context; upstream spends every identical card's VRAM on both weights and KV "
-                 "and scales context by adding equal cards — a capacity feature (throughput is interconnect-bound "
-                 "on this no-NVLink rig, not a speed win)."),
+        "core": ("the fork frees the worker cards of ALL weights (~14 GiB each) so their VRAM becomes pooled DEVICE "
+                 "KV — the slow cards turn into KV donors that also compute attention; an OPTIONAL host tier extends "
+                 "context to a proven 262k only beyond the pooled device KV. Upstream spends every identical card's "
+                 "VRAM on both weights and KV. A capacity feature — throughput is interconnect-bound on this "
+                 "no-NVLink rig, not a speed win."),
         "legend_keys": ["weights", "kv", "hostkv", "ctx", "free"],
     },
     # -- 7. MoE expert offload --------------------------------------------

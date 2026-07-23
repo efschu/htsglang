@@ -141,23 +141,33 @@ vLLM/upstream)**; the fork's delta is only the **uneven-TP adaptation** (256-sup
 MLP coarsening, the MMQ out-of-bounds fix under expert sharding, and Qwen3.5/3.6 + Gemma-4 arch
 adapters) plus the MMVQ↔MMQ crossover tuning. The GGUF quant path is not a fork invention.
 
-## 6 — Weightless-KV lane: free the workers of weights, add a host KV tier
+## 6 — Weightless-KV lane: free the workers of weights so their VRAM becomes device KV
 
-<img src="topologies/06-weightless-kv-lane.svg" alt="Weightless-KV lane: the 5090 head card holds all layer weights (~22.8 GiB), the two 3080 workers hold zero weights (~14 GiB freed each) and only a KV token-shard, with a 12.6 GiB pinned host KV tier; upstream holds weights on every identical rank" width="100%">
+<img src="topologies/06-weightless-kv-lane.svg" alt="Weightless-KV lane: the 5090 head holds all layer weights (TP=1); the two 3080 workers hold zero layer weights (~14 GiB freed each, measured) and that freed VRAM instead carries device KV — token-shards plus KV-heads plus attention compute — making the slow cards pooled device-KV donors; an optional host KV tier (~12.6 GiB pinned) extends context only beyond the pooled device KV, to a proven 262k; upstream holds weights on every identical rank" width="100%">
 
 This is a **capacity** feature, not a "fast" one — the name is historical (`--weightless-kv-fastlane`)
-and does **not** mean the lane is fast. On the rig (measured), **rank0 (5090) is the HEAD** holding
-**all** layer weights as collective-free TP=1 (~22.8 GiB), while **rank1/2 (3080) are weightless
-meta-device workers** carrying **zero layer weights** (~14 GiB freed each) and only a KV token-shard.
-KV tiers: 40000 device + 1024 staging + **64000 host** slots, global **312000 tokens**, and **262k
-proven** (host-pinned ~12.6 GiB, measured). This lets **mismatched cards carry a 262k context** that
-would not fit if every card had to hold weights too.
+and does **not** mean the lane is fast.
 
-Throughput is **interconnect-bound, not a win**: ~25 tok/s @8k · ~7 @28k · ~1.5 @262k. After
-#136a/#136b the PCIe wall is mostly hidden, so the deep-context floor is now **compute + collectives
-on the slow cards, not H2D bandwidth**. Upstream even-TP holds the layer weights on **every** rank, so
-each identical card splits its VRAM between weights and KV and reaches far less context per card
-without more/bigger equal cards.
+**The core mechanism (primary).** On the rig (measured), **rank0 (5090) is the HEAD** holding **all**
+layer weights as collective-free TP=1, while **rank1/2 (3080) are weightless meta-device workers**
+carrying **zero layer weights** (**~14 GiB freed each, measured**). Crucially, that freed VRAM does not
+sit idle — it instead carries **device KV: KV token-shards + KV-heads**, and the workers **compute the
+attention** over it. So the slow cards become **on-device KV donors**: the capacity win is the **pooled
+device KV across the freed workers** (head 22.8 / worker 3.7 GiB VRAM in the 262k run, measured).
+
+**The host tier (secondary, extreme context only).** An **optional** host-KV tier sits **on top**, used
+only for context that **exceeds the pooled device KV** — up to **262k tokens proven** (~12.6 GiB pinned
+host, measured, #134 B1/B2, needle-at-midpoint retrieved). It is an **extension, not the primary
+store**: the 262k extreme config deliberately shrinks the device pool and pushes most KV to host (the
+40000-device / 64000-host slot split is that extreme config, and the host tier stages only ~C/dcp_size
+per rank), whereas **in the normal case the freed worker VRAM holds the device KV**. No unverified
+context multiplier is claimed.
+
+Throughput is **interconnect-bound, not a win**: ~25 tok/s @8k · ~7 @28k · ~1.5 @262k eager
+(graph+prefetch raises exact-rung to ~26–29). After #136a/#136b the PCIe wall is mostly hidden, so the
+deep-context floor is now **block-attention compute + per-layer collectives on the slow workers, not
+H2D bandwidth**. Upstream even-TP holds the layer weights on **every** rank, so each identical card
+splits its VRAM between weights and KV and reaches less context per card without more/bigger equal cards.
 
 ## 7 — MoE expert offload: a 122B on 3 mismatched cards
 
