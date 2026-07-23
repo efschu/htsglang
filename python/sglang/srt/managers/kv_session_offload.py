@@ -304,6 +304,7 @@ class KVSessionOffloadManager:
         )
         # Geometry mirrors the backend's (single source: the backend derives
         # it from the installed DCP vector at init).
+        self.backend = backend
         self.mode = backend._sess_mode  # "weighted" | "even" | "plain"
         self.S = backend._sess_S
         self.cp_prefix = list(backend._sess_prefix)
@@ -471,7 +472,12 @@ class KVSessionOffloadManager:
         # 1. Order after any in-flight forward that still writes this
         #    session's last KV row (overlap mode), then D2H-backup the whole
         #    owned shard (all full-attention layers) into host rows [0, n).
+        #    Also quiesce the streamed-prefetch copy stream: a previous
+        #    spill's queued H2D reads of these host rows must complete
+        #    before we overwrite them (S2 double-buffer pipeline).
         self._wait_forward_stream()
+        torch.cuda.current_stream().wait_stream(self.backend._sess_copy_stream)
+        self.backend._sess_count_cache = None
         if n_own > 0:
             host_ids = torch.arange(n_own, dtype=torch.int64, device=row.device)
             self.host_pool.backup_from_device_all_layer(
@@ -894,6 +900,9 @@ class KVSessionOffloadManager:
         self.spilled_req = None
         self.spilled_batch = None
         self.hysteresis.reset()
+        # S2: the backend's incremental owned-count cache belongs to THIS
+        # session; a later spill must recompute from its own sentinel row.
+        self.backend._sess_count_cache = None
         logger.debug("kv-session-offload: spill slot cleared (%s, rid=%s)", why, rid)
 
     def inflight_batches(self):

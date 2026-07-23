@@ -2546,11 +2546,18 @@ class FlashInferAttnBackend(AttentionBackend):
             [scratch], dtype=torch.int64, device=dev
         )
         proto = self._sess_full_pool.k_buffer[0]
+        # S2: TWO block-sized staging regions (double buffer). Region r
+        # occupies staging rows [r*B, (r+1)*B); the H2D copy of streamed
+        # block g+1 (region (g+1)%2) runs on a dedicated copy stream while
+        # attention reads block g from the other region -- including ACROSS
+        # layers (the streamed schedule is flattened layer-major, so the
+        # next layer's first block prefetches during the current layer's
+        # last block).
         self._sess_staging_k = proto.new_empty(
-            (self._sess_block_size,) + tuple(proto.shape[1:])
+            (2 * self._sess_block_size,) + tuple(proto.shape[1:])
         )
         self._sess_staging_v = proto.new_empty(
-            (self._sess_block_size,) + tuple(proto.shape[1:])
+            (2 * self._sess_block_size,) + tuple(proto.shape[1:])
         )
         # The wrapper must see the pool's LOGICAL dtype (e.g. an fp8 view of
         # the uint8 store), exactly like get_kv_buffer() -- a raw uint8
@@ -2563,7 +2570,37 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             self._sess_staging_kv = (self._sess_staging_k, self._sess_staging_v)
-        self._sess_block_wrapper = None
+        # S2 streaming pipeline state -------------------------------------
+        # * Dedicated copy stream: staged H2D reads of the pinned host pool
+        #   NEVER run on the compute stream (isolation invariant: the
+        #   spilled session must not serialize against device batches).
+        # * Per-region events implement the classic double buffer: a copy
+        #   into region r waits the region's last consumer (compute_done),
+        #   a consumer waits the region's copy (copy_done). All event
+        #   record/wait calls are issued from the single forward thread, so
+        #   every wait binds to the intended recording.
+        # * Persistent aranges: block staging index tensors are slices
+        #   (views) of these -- no per-block allocations on the hot path.
+        # * Wrapper pool: flashinfer decode plans are cached per
+        #   (full|tail|empty, region) and REUSED across all layers and
+        #   ticks; a replan happens only when that slot's staged row count
+        #   changed (<= 2 replans per tick, instead of the S1
+        #   plan-per-layer-per-block that dominated the 90 ms tick).
+        self._sess_copy_stream = torch.cuda.Stream(device=dev)
+        self._sess_copy_done = [torch.cuda.Event(), torch.cuda.Event()]
+        self._sess_compute_done = [torch.cuda.Event(), torch.cuda.Event()]
+        self._sess_host_arange = torch.arange(
+            self._sess_host_pool.size, dtype=torch.int64, device=dev
+        )
+        self._sess_stage_arange32 = torch.arange(
+            2 * self._sess_block_size, dtype=torch.int32, device=dev
+        )
+        self._sess_stage_arange64 = torch.arange(
+            2 * self._sess_block_size, dtype=torch.int64, device=dev
+        )
+        self._sess_scratch_i = int(scratch)
+        self._sess_wrappers = {}
+        self._sess_count_cache = None
         logger.info(
             "kv-session-offload backend wired: mode=%s S=%d prefix=%s "
             "host_base=%d scratch_slot=%d block=%d staging=%.1f MB",
@@ -2590,7 +2627,15 @@ class FlashInferAttnBackend(AttentionBackend):
         """Derive the per-step spill state from replicated inputs only:
         seq len + the sentinel req_to_token row. Sets owned counts per rank
         and the RANK-UNIFORM block count. Called from init_forward_metadata
-        for a kv_session_spill_tick decode batch."""
+        for a kv_session_spill_tick decode batch.
+
+        S2: owned counts are maintained INCREMENTALLY across ticks (the
+        sentinel row only ever appends one token per tick, whose residue is
+        a pure function of its position), so the per-tick bincount +
+        row-min device syncs of S1 happen only on the first tick after a
+        spill. Also builds the flattened layer-major streamed-block
+        schedule and primes the double-buffered copy pipeline (depth 2) on
+        the dedicated copy stream."""
         from types import SimpleNamespace
 
         from sglang.srt.managers.kv_session_offload import (
@@ -2604,25 +2649,39 @@ class FlashInferAttnBackend(AttentionBackend):
             "kv-session-offload: spill tick must be a decode batch"
         )
         assert forward_batch.batch_size == 1, (
-            "kv-session-offload (S1): exactly one spilled session per tick"
+            "kv-session-offload: exactly one spilled session per tick"
         )
         L = int(forward_batch.seq_lens_cpu[0].item())
         rank = self.dcp_rank if self._sess_mode != "plain" else 0
         dcp = len(self._sess_prefix) - 1
-        row = self._sess_req_pool.req_to_token[
-            forward_batch.req_pool_indices[0], :L
-        ]
         if self._sess_mode == "weighted":
-            assert int(row.min().item()) >= self._sess_host_base, (
-                "kv-session-offload: non-sentinel slot id in a spill-tick "
-                "row -- slot space corrupted, refusing to attend garbage KV"
-            )
-            residues = row.to(torch.int64) % self._sess_S
-            counts = owned_counts_weighted(residues, self._sess_prefix)
-            assert sum(counts) == L, (
-                f"kv-session-offload: owned counts {counts} do not cover "
-                f"L={L}"
-            )
+            cache = self._sess_count_cache
+            if cache is not None and cache[0] == L:
+                counts = list(cache[1])
+            elif cache is not None and cache[0] == L - 1:
+                # Incremental: the one appended token (position L-1) has
+                # residue (L-1) % S by the sentinel construction.
+                res_new = new_token_residue(L - 1, self._sess_S)
+                counts = list(cache[1])
+                for r in range(dcp):
+                    if self._sess_prefix[r] <= res_new < self._sess_prefix[r + 1]:
+                        counts[r] += 1
+                        break
+            else:
+                row = self._sess_req_pool.req_to_token[
+                    forward_batch.req_pool_indices[0], :L
+                ]
+                assert int(row.min().item()) >= self._sess_host_base, (
+                    "kv-session-offload: non-sentinel slot id in a spill-tick "
+                    "row -- slot space corrupted, refusing to attend garbage KV"
+                )
+                residues = row.to(torch.int64) % self._sess_S
+                counts = owned_counts_weighted(residues, self._sess_prefix)
+                assert sum(counts) == L, (
+                    f"kv-session-offload: owned counts {counts} do not cover "
+                    f"L={L}"
+                )
+            self._sess_count_cache = (L, tuple(counts))
             res_cur = new_token_residue(L - 1, self._sess_S)
             cur_owned = (
                 self._sess_prefix[rank] <= res_cur < self._sess_prefix[rank + 1]
@@ -2639,15 +2698,76 @@ class FlashInferAttnBackend(AttentionBackend):
             f"kv-session-offload: owned shard {n_own} exceeds the host pool "
             f"({self._sess_host_pool.size} tokens)"
         )
-        return SimpleNamespace(
+
+        # Flattened layer-major streamed-block schedule. Every full-attn
+        # layer streams the same k_local non-empty local blocks; regions
+        # alternate in GLOBAL order (g & 1) so the copy of block g+1 --
+        # also across a layer boundary -- overlaps attention on block g.
+        # The tail block's LAST row is this tick's current token when this
+        # rank owns it: that row is produced layer-by-layer DURING the
+        # forward (owner-write), so the bulk H2D prefetch excludes it and a
+        # tiny D2D fixup from the scratch row fills it at consume time.
+        B = self._sess_block_size
+        k_local = (n_own + B - 1) // B if n_own > 0 else 0
+        layer_num = getattr(self._sess_host_pool, "layer_num", 0)
+        sched = []
+        g = 0
+        for fl in range(layer_num):
+            for j in range(k_local):
+                s = j * B
+                e = min((j + 1) * B, n_own)
+                sched.append((fl, s, e, g & 1, cur_owned and e == n_own))
+                g += 1
+        st = SimpleNamespace(
             L=L,
             n_own=n_own,
             counts=counts,
             num_blocks=num_blocks,
             cur_owned=cur_owned,
             cur_host_row=n_own - 1 if cur_owned else -1,
-            device=row.device,
+            cur_host_row_t=(
+                self._sess_host_arange[n_own - 1 : n_own] if cur_owned else None
+            ),
+            device=self._sess_staging_k.device,
+            sched=sched,
+            k_local=k_local,
+            consume_idx=0,
+            issue_idx=0,
         )
+        # Prime the double buffer: the first two copies (layer 0, and with
+        # k_local == 1 already layer 1) start NOW, overlapping everything
+        # that runs before the first full-attention layer.
+        while st.issue_idx < min(2, len(sched)):
+            self._sess_issue_copy(st, st.issue_idx)
+            st.issue_idx += 1
+        return st
+
+    def _sess_issue_copy(self, st, idx):
+        """Issue the H2D staging copy for flattened block ``idx`` on the
+        dedicated copy stream (never the compute stream). Waits the
+        region's last consumer via event; all record/wait calls come from
+        the single forward thread, so the pairing is race-free."""
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer
+
+        fl, s, e, region, need_cur = st.sched[idx]
+        pe = e - 1 if need_cur else e  # current token's row arrives via D2D fixup
+        host = self._sess_host_pool
+        B = self._sess_block_size
+        cs = self._sess_copy_stream
+        with torch.cuda.stream(cs):
+            cs.wait_event(self._sess_compute_done[region])
+            if pe > s:
+                base = region * B
+                transfer_kv_per_layer(
+                    src_k=host.k_data_refs[fl],
+                    dst_k=self._sess_staging_k,
+                    src_v=host.v_data_refs[fl],
+                    dst_v=self._sess_staging_v,
+                    src_indices=self._sess_host_arange[s:pe],
+                    dst_indices=self._sess_stage_arange64[base : base + (pe - s)],
+                    item_size=host.token_stride_size,
+                )
+            self._sess_copy_done[region].record(cs)
 
     def _sess_owner_write(self, layer, k_full, v_full):
         """Spill-tick owner-write for one full-attention layer: quantize the
@@ -2669,9 +2789,7 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         fl = self._sess_full_layer_idx(layer)
         host = self._sess_host_pool
-        dst_row = torch.tensor(
-            [st.cur_host_row], dtype=torch.int64, device=st.device
-        )
+        dst_row = st.cur_host_row_t
         transfer_kv_per_layer(
             src_k=self._sess_full_pool.k_buffer[fl],
             dst_k=host.k_data_refs[fl],
@@ -2682,86 +2800,97 @@ class FlashInferAttnBackend(AttentionBackend):
             item_size=host.token_stride_size,
         )
 
-    def _sess_block_wrapper_get(self):
-        """Persistent block-decode wrapper for the spill tick. Shares the
-        backend workspace: safe because on a spill-tick step the MAIN decode
-        wrapper is never .run() for the full-attention layers (this loop
-        replaces it), mirroring _wl_block_decode_wrapper."""
-        if self._sess_block_wrapper is None:
-            self._sess_block_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+    def _sess_get_wrapper(self, key):
+        """Wrapper pool for the streamed partial decodes: one persistent
+        flashinfer decode wrapper per (kind, region) slot, sharing the
+        backend float workspace (safe: on a spill tick the main decode
+        wrapper is never .run() for the full-attention layers, and all
+        .run() calls are stream-ordered). Each wrapper caches its planned
+        staged-row count in ``_sess_planned``: the 'full' slots plan ONCE
+        EVER (cnt == B, fixed indices), the 'tail' slots replan only when
+        the tail size changed -- i.e. at most twice per tick instead of the
+        S1 plan-per-layer-per-block."""
+        w = self._sess_wrappers.get(key)
+        if w is None:
+            w = BatchDecodeWithPagedKVCacheWrapper(
                 self.workspace_buffer,
                 "NHD",
                 backend=self.decode_backend,
                 use_tensor_cores=self.decode_use_tensor_cores,
             )
-        return self._sess_block_wrapper
+            w._sess_planned = None
+            self._sess_wrappers[key] = w
+        return w
 
-    def _sess_stage_block(self, layer, s: int, e: int):
-        """Stream this rank's host rows [s, e) of the spilled session H2D
-        into the staging buffers for ``layer``. Returns the staged slot ids
-        (into the staging buffers) in row order."""
-        from sgl_kernel.kvcacheio import transfer_kv_per_layer
-
-        st = self._sess_spill
-        host = self._sess_host_pool
-        fl = self._sess_full_layer_idx(layer)
-        n = e - s
-        host_ids = torch.arange(s, e, dtype=torch.int64, device=st.device)
-        stage_ids = torch.arange(0, n, dtype=torch.int64, device=st.device)
-        transfer_kv_per_layer(
-            src_k=host.k_data_refs[fl],
-            dst_k=self._sess_staging_k,
-            src_v=host.v_data_refs[fl],
-            dst_v=self._sess_staging_v,
-            src_indices=host_ids,
-            dst_indices=stage_ids,
-            item_size=host.token_stride_size,
-        )
-        return stage_ids
-
-    def _sess_blockwise_decode_return_lse(self, q_full, layer):
-        """Spill-tick decode attention over the host-resident shard (DCP
-        form): block loop with H2D staging + flashinfer partial decodes +
-        online LSE merge. Returns (o, lse) in the same shape/space as
-        ``forward_return_lse`` so the cross-rank cp_lse merge consumes it
-        unchanged. Loop count is rank-uniform; empty local blocks are
-        skipped WITHOUT any collective (none is issued inside the loop)."""
-        st = self._sess_spill
+    def _sess_plan_block(self, cnt, region, num_qo_heads, num_kv_heads, head_dim):
+        """Planned wrapper for a staged block of ``cnt`` rows in staging
+        region ``region`` (plan-cache hit unless the slot's cnt changed)."""
         B = self._sess_block_size
-        n = st.n_own
-        bs = 1
-        num_qo_heads = q_full.shape[1]
-        num_kv_heads = self.indices_updater_decode.num_kv_heads
-        head_dim = q_full.shape[2]
         iu = self.indices_updater_decode
-        wrapper = self._sess_block_wrapper_get()
-        kv = self._sess_staging_kv
-        last_page = self.kv_last_page_len
-
-        o_acc = None
-        lse_acc = None
-        for j in range(st.num_blocks):
-            s_row = j * B
-            e_row = min((j + 1) * B, n)
-            if s_row >= e_row:
-                # Rank-uniform loop count; nothing owned in this window on
-                # this rank -> no attention, no merge, no divergence.
-                continue
-            stage_ids = self._sess_stage_block(layer, s_row, e_row)
-            cnt = e_row - s_row
+        w = self._sess_get_wrapper(("full" if cnt == B else "tail", region))
+        if w._sess_planned != cnt:
+            base = region * B
             blk_indptr = torch.tensor(
-                [0, cnt], dtype=torch.int32, device=st.device
+                [0, cnt], dtype=torch.int32, device=self._sess_staging_k.device
             )
-            wrapper.plan(
+            w.plan(
                 blk_indptr,
-                stage_ids.to(torch.int32),
-                last_page[:bs],
+                self._sess_stage_arange32[base : base + cnt],
+                self.kv_last_page_len[:1],
                 num_qo_heads,
                 num_kv_heads,
                 head_dim,
                 1,  # page_size
                 q_data_type=iu.q_data_type,
                 kv_data_type=iu.data_type,
+            )
+            w._sess_planned = cnt
+        return w
+
+    def _sess_blockwise_decode_return_lse(self, q_full, layer):
+        """Spill-tick decode attention over the host-resident shard (DCP
+        form): consume this layer's streamed blocks from the double-
+        buffered staging pipeline (H2D prefetch on the copy stream, plans
+        cached) + flashinfer partial decodes + online LSE merge. Returns
+        (o, lse) in the same shape/space as ``forward_return_lse`` so the
+        cross-rank cp_lse merge consumes it unchanged. The loop count is
+        rank-uniform (num_blocks) with empty local blocks skipped WITHOUT
+        any collective (none is issued inside the loop)."""
+        st = self._sess_spill
+        B = self._sess_block_size
+        fl = self._sess_full_layer_idx(layer)
+        num_qo_heads = q_full.shape[1]
+        num_kv_heads = self.indices_updater_decode.num_kv_heads
+        head_dim = q_full.shape[2]
+        kv = self._sess_staging_kv
+        cur = torch.cuda.current_stream()
+
+        o_acc = None
+        lse_acc = None
+        for _ in range(st.k_local):
+            ent = st.sched[st.consume_idx]
+            e_fl, s_row, e_row, region, need_cur = ent
+            assert e_fl == fl, (
+                f"kv-session-offload: streamed-block schedule out of order "
+                f"(expected layer {e_fl}, consuming for layer {fl})"
+            )
+            # Wait the region's prefetch (recorded on the copy stream).
+            cur.wait_event(self._sess_copy_done[region])
+            if need_cur:
+                # The tick's own token: its host row is produced THIS layer
+                # by the owner-write (scratch row holds the just-quantized
+                # K/V) -- tiny D2D into its staging slot on the compute
+                # stream, ordered after the owner-write by stream order.
+                dst = region * B + (e_row - 1 - s_row)
+                sc = self._sess_scratch_i
+                self._sess_staging_k[dst].copy_(
+                    self._sess_full_pool.k_buffer[fl][sc]
+                )
+                self._sess_staging_v[dst].copy_(
+                    self._sess_full_pool.v_buffer[fl][sc]
+                )
+            wrapper = self._sess_plan_block(
+                e_row - s_row, region, num_qo_heads, num_kv_heads, head_dim
             )
             o_b, lse_b = wrapper.forward_return_lse(
                 q_full,
@@ -2771,6 +2900,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
+            # Release the region + refill the pipeline (depth 2: the copy
+            # just issued targets the region we released above).
+            self._sess_compute_done[region].record(cur)
+            st.consume_idx += 1
+            if st.issue_idx < len(st.sched):
+                self._sess_issue_copy(st, st.issue_idx)
+                st.issue_idx += 1
             if o_acc is None:
                 o_acc, lse_acc = o_b, lse_b
             else:
@@ -2779,20 +2915,24 @@ class FlashInferAttnBackend(AttentionBackend):
             # This rank owns ZERO tokens of the session: reproduce the
             # shaped empty-attention (o=0, lse=-inf) contract so the
             # cross-rank cp_lse merge stays balanced (same as the _wl loop).
-            empty_indptr = torch.zeros(2, dtype=torch.int32, device=st.device)
-            empty_ids = torch.zeros(0, dtype=torch.int32, device=st.device)
-            wrapper.plan(
-                empty_indptr,
-                empty_ids,
-                last_page[:bs],
-                num_qo_heads,
-                num_kv_heads,
-                head_dim,
-                1,
-                q_data_type=iu.q_data_type,
-                kv_data_type=iu.data_type,
-            )
-            o_acc, lse_acc = wrapper.forward_return_lse(
+            w = self._sess_get_wrapper(("empty",))
+            if w._sess_planned != 0:
+                empty_indptr = torch.zeros(
+                    2, dtype=torch.int32, device=st.device
+                )
+                w.plan(
+                    empty_indptr,
+                    self._sess_stage_arange32[:0],
+                    self.kv_last_page_len[:1],
+                    num_qo_heads,
+                    num_kv_heads,
+                    head_dim,
+                    1,
+                    q_data_type=self.indices_updater_decode.q_data_type,
+                    kv_data_type=self.indices_updater_decode.data_type,
+                )
+                w._sess_planned = 0
+            o_acc, lse_acc = w.forward_return_lse(
                 q_full,
                 kv,
                 sm_scale=layer.scaling,
