@@ -43,6 +43,7 @@ spill-tick forward is identical to a device decode step.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -175,6 +176,117 @@ def num_blocks_rank_uniform(counts: List[int], block_size: int) -> int:
     without any collective, so the loop count stays identical everywhere."""
     b = max(1, int(block_size))
     return max(1, max((c + b - 1) // b for c in counts))
+
+
+# ---------------------------------------------------------------------------
+# S5 bs=1 spill-tick CUDA-graph planning (PURE; the capture/replay itself is
+# GPU-only). Mirrors the proven weightless-KV #136a mechanics: a fixed-count
+# streamed-block graph selected from a BUCKETED RUNG LADDER over the host
+# block count, with all index/staging maps built OUT of the captured region
+# and empty trailing blocks sanitized to the (o=0, lse=-inf) contract
+# in-graph. A wasted trailing captured block still pays its fixed H2D copy +
+# kernel launch (measured there: one wasted block ~halves the streamed rate),
+# so the ladder stays DENSE in the common low range and only coarsens higher.
+# ---------------------------------------------------------------------------
+
+
+def spill_graph_enabled() -> bool:
+    """Master gate for the S5 spill-tick graph. Default OFF: the flag being
+    unset keeps the spill tick on the byte-identical eager block loop (the
+    'flag AUS byte-identisch' invariant is then trivially held). The GPU
+    validation opts in via SGLANG_KVSO_SPILL_GRAPH=1."""
+    return os.environ.get("SGLANG_KVSO_SPILL_GRAPH", "0") == "1"
+
+
+def spill_graph_blocks_needed(owned_tokens: int, block_size: int) -> int:
+    """Number of streamed host blocks for ``owned_tokens`` at ``block_size``
+    (ceil, at least 1). For rank-uniform capture pass the MAX owned count
+    across ranks (``num_blocks_rank_uniform`` already yields that block
+    count)."""
+    b = max(1, int(block_size))
+    n = max(0, int(owned_tokens))
+    return max(1, (n + b - 1) // b)
+
+
+def spill_graph_rung_ladder(max_blocks: int) -> List[int]:
+    """Bucketed block-count ladder covering 1..``max_blocks``: dense (step 1)
+    up to 8 blocks, then ~x1.5 geometric to the max. Identical construction
+    to the proven ``wl_build_graph_ladder``. Replay picks the smallest
+    covering rung; over-ladder seq lens fall back to eager."""
+    r_max = max(1, int(max_blocks))
+    ladder = set()
+    r = 1
+    while r < r_max:
+        ladder.add(r)
+        r = r + 1 if r < 8 else max(r + 1, int(r * 1.5))
+    ladder.add(r_max)
+    return sorted(ladder)
+
+
+def spill_graph_pick_rung(
+    needed_blocks: int, ladder: List[int]
+) -> Optional[int]:
+    """Smallest captured rung >= ``needed_blocks`` (the RANK-UNIFORM host
+    block count), or None when the seq len needs more blocks than the largest
+    rung -> eager fallback. Rank-uniform: ``needed_blocks`` derives only from
+    replicated scheduler state, so every rank picks the same rung (or all
+    fall back together), preserving the per-layer collective lockstep."""
+    if not ladder:
+        return None
+    n = max(1, int(needed_blocks))
+    for r in ladder:
+        if r >= n:
+            return r
+    return None
+
+
+def spill_graph_block_stage_counts(
+    owned_tokens: int, block_size: int, rung: int
+) -> List[int]:
+    """Per-captured-block staged row count for a ``rung``-block graph: block j
+    stages ``clamp(owned - j*B, 0, B)`` rows. Blocks that reach 0 are captured
+    NO-OPS -- their empty attention is sanitized to (o=0, lse=-inf) in-graph
+    and folded into the online merge as identity, matching the eager loop's
+    ``continue``. This is the out-of-graph plan input, built once per step."""
+    b = max(1, int(block_size))
+    n = max(0, int(owned_tokens))
+    return [max(0, min(b, n - j * b)) for j in range(max(0, int(rung)))]
+
+
+def spill_graph_out_plan(
+    host_base_row: int,
+    owned_tokens: int,
+    block_size: int,
+    rung: int,
+    *,
+    device=None,
+) -> List[dict]:
+    """Out-of-graph staging plan for one spill-tick decode step (built ONCE
+    per step, NEVER inside the captured region -- this is the S5 analogue of
+    hoisting .plan()/index maps out of the graph, the actual #136a speedup).
+
+    The active host tail owns host-pool rows ``[base, base + owned)`` where
+    ``base = region_base + wave_drain`` (S3/S4 region-scoped). For a fixed
+    ``rung``-block graph returns, per block j, a dict with:
+      * ``cnt``:       staged row count (0 => empty, sanitized in-graph),
+      * ``host_rows``: int64 host-pool rows to gather
+                       ``[base + j*B, base + j*B + cnt)`` (empty tensor when 0),
+      * ``indptr``:    int32 ``[0, cnt]`` single-request page indptr.
+    Every block is present (fixed count == rung) so the captured H2D/gather/
+    run/merge sequence has a constant shape; only ``cnt`` varies the planned
+    row count of the (persistent, out-of-graph-planned) wrapper."""
+    counts = spill_graph_block_stage_counts(owned_tokens, block_size, rung)
+    b = max(1, int(block_size))
+    base = int(host_base_row)
+    plan = []
+    for j, cnt in enumerate(counts):
+        s = base + j * b
+        host_rows = torch.arange(
+            s, s + cnt, dtype=torch.int64, device=device
+        )
+        indptr = torch.tensor([0, cnt], dtype=torch.int32, device=device)
+        plan.append({"cnt": cnt, "host_rows": host_rows, "indptr": indptr})
+    return plan
 
 
 def compact_weighted(loc: torch.Tensor, S: int, lo: int, hi: int) -> Tuple[

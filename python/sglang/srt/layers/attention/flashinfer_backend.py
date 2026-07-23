@@ -2616,6 +2616,34 @@ class FlashInferAttnBackend(AttentionBackend):
         # A never-recorded CUDA event reports .query() == True (no pending
         # work), so wave-back throttling starts in the "idle/complete" state.
         self._sess_wave_done = torch.cuda.Event()
+        # S5 bs=1 spill-graph: bucketed rung ladder over the host block count,
+        # built ONCE (max blocks = a full region). None when the flag is off
+        # -> the spill tick stays on the byte-identical eager block loop. The
+        # actual torch.cuda.graph capture/replay of the fixed-count body is
+        # wired by the spill-tick graph runner (GPU pass); this only supplies
+        # the rung ladder + per-step out-of-graph plan (the #136a hoist).
+        from sglang.srt.managers.kv_session_offload import (
+            spill_graph_blocks_needed,
+            spill_graph_enabled,
+            spill_graph_rung_ladder,
+        )
+
+        self._sess_graph_enabled = bool(spill_graph_enabled())
+        if self._sess_graph_enabled:
+            max_blocks = spill_graph_blocks_needed(
+                self._sess_region_tokens, self._sess_block_size
+            )
+            self._sess_graph_ladder = spill_graph_rung_ladder(max_blocks)
+            logger.info(
+                "kv-session-offload S5 spill-graph ENABLED: block=%d "
+                "region=%d -> ladder %s (eager fallback for over-ladder / "
+                "non-graphable ticks; capture wired by the GPU pass)",
+                self._sess_block_size,
+                self._sess_region_tokens,
+                self._sess_graph_ladder,
+            )
+        else:
+            self._sess_graph_ladder = None
         logger.info(
             "kv-session-offload backend wired: mode=%s S=%d prefix=%s "
             "host_base=%d scratch_slot=%d block=%d staging=%.1f MB",
@@ -2844,7 +2872,32 @@ class FlashInferAttnBackend(AttentionBackend):
             # spill) or this rank owns no head token.
             dev_head_idx=dev_head_idx,
             n_head_own=n_head_own,
+            # S5: fixed-count graph rung + out-of-graph plan (None -> eager).
+            graph_rung=None,
+            graph_plan=None,
         )
+        # S5 spill-graph: pick the rank-uniform rung + build the out-of-graph
+        # staging plan (the #136a plan hoist -- once per STEP, never inside the
+        # captured region). num_blocks is already the MAX-over-ranks block
+        # count, so the rung is rank-uniform and every rank captures/replays
+        # the same fixed shape; per-rank extra blocks are (0,-inf)-sanitized
+        # no-ops. Over-ladder (or the flag off) -> graph_rung None -> the
+        # eager block loop below runs unchanged (byte-identical). The captured
+        # body (_sess_blockwise_decode_return_lse_graph) is invoked by the
+        # spill-tick graph runner during replay; eager prepare still fills the
+        # plan so a first (uncaptured) pass is correct.
+        if self._sess_graph_enabled and self._sess_graph_ladder:
+            from sglang.srt.managers.kv_session_offload import (
+                spill_graph_out_plan,
+                spill_graph_pick_rung,
+            )
+
+            rung = spill_graph_pick_rung(num_blocks, self._sess_graph_ladder)
+            st.graph_rung = rung
+            if rung is not None:
+                st.graph_plan = spill_graph_out_plan(
+                    base, n_own, B, rung, device=st.device
+                )
         # Prime the double buffer: the first two copies (layer 0, and with
         # k_local == 1 already layer 1) start NOW, overlapping everything
         # that runs before the first full-attention layer.
@@ -2998,7 +3051,18 @@ class FlashInferAttnBackend(AttentionBackend):
         (o, lse) in the same shape/space as ``forward_return_lse`` so the
         cross-rank cp_lse merge consumes it unchanged. The loop count is
         rank-uniform (num_blocks) with empty local blocks skipped WITHOUT
-        any collective (none is issued inside the loop)."""
+        any collective (none is issued inside the loop).
+
+        S5 spill-graph dispatch hook: when ``st.graph_rung`` is set (flag on +
+        graphable) the spill-tick graph runner replays the fixed-count
+        captured body instead of this eager loop -- it iterates EXACTLY
+        ``st.graph_rung`` blocks from ``st.graph_plan`` (built out-of-graph in
+        _sess_prepare_step), running each {H2D gather + pre-planned wrapper +
+        merge} with empty trailing blocks sanitized to (0,-inf) in-graph (the
+        #136a mechanics, region-scoped to this session's active tail). The
+        capture/replay wiring + validation is the GPU pass; until then this
+        eager loop runs unchanged (byte-identical), so ``graph_rung`` set with
+        no active capture context is simply ignored here."""
         st = self._sess_spill
         B = self._sess_block_size
         fl = self._sess_full_layer_idx(layer)

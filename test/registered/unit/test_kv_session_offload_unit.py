@@ -24,6 +24,12 @@ from sglang.srt.managers.kv_session_offload import (
     select_spill_victim,
     sentinel_base,
     session_priority_key,
+    spill_graph_block_stage_counts,
+    spill_graph_blocks_needed,
+    spill_graph_enabled,
+    spill_graph_out_plan,
+    spill_graph_pick_rung,
+    spill_graph_rung_ladder,
     WaveBackController,
     wave_back_advance,
 )
@@ -735,6 +741,153 @@ def test_pre_schedule_reap_resets_admission_gate():
     assert rb.batch_is_full is False  # reaped -> gate reset
     assert 0 in mgr._free_regions and 7 not in mgr.spills
     assert out is rb
+
+
+# ---------------------------------------------------------------------------
+# S5 spill-tick CUDA-graph planning (pure): rung ladder, rung pick, empty-block
+# sanitize / stage counts, out-of-graph staging plan, flag gate
+# ---------------------------------------------------------------------------
+
+
+def test_spill_graph_enabled_default_off(monkeypatch):
+    monkeypatch.delenv("SGLANG_KVSO_SPILL_GRAPH", raising=False)
+    assert spill_graph_enabled() is False  # flag AUS -> eager, byte-identical
+    monkeypatch.setenv("SGLANG_KVSO_SPILL_GRAPH", "1")
+    assert spill_graph_enabled() is True
+    monkeypatch.setenv("SGLANG_KVSO_SPILL_GRAPH", "0")
+    assert spill_graph_enabled() is False
+
+
+def test_spill_graph_blocks_needed():
+    assert spill_graph_blocks_needed(0, 256) == 1  # at least one
+    assert spill_graph_blocks_needed(1, 256) == 1
+    assert spill_graph_blocks_needed(256, 256) == 1
+    assert spill_graph_blocks_needed(257, 256) == 2
+    assert spill_graph_blocks_needed(4096, 256) == 16
+
+
+def test_spill_graph_rung_ladder_dense_then_geometric():
+    ladder = spill_graph_rung_ladder(64)
+    # dense 1..8 present
+    for r in range(1, 9):
+        assert r in ladder
+    # strictly increasing, unique, covers the max exactly
+    assert ladder == sorted(set(ladder))
+    assert ladder[0] == 1 and ladder[-1] == 64
+    # coarsens above 8 (>= x1.5 gaps), so far fewer than 64 rungs
+    assert len(ladder) < 20
+    above = [r for r in ladder if r > 8]
+    for a, b in zip(above, above[1:]):
+        assert b >= int(a * 1.5) or b == 64
+    # tiny contexts still yield a valid single-rung ladder
+    assert spill_graph_rung_ladder(1) == [1]
+    assert spill_graph_rung_ladder(3) == [1, 2, 3]
+
+
+def test_spill_graph_pick_rung_smallest_covering():
+    ladder = spill_graph_rung_ladder(64)  # [1..8, 12, 18, 27, 40, 60, 64]
+    assert spill_graph_pick_rung(1, ladder) == 1
+    assert spill_graph_pick_rung(5, ladder) == 5
+    # not an exact rung -> smallest covering (dense region exact, so 9 -> 12)
+    assert spill_graph_pick_rung(9, ladder) == 12
+    assert spill_graph_pick_rung(13, ladder) == 18
+    # exactly the max
+    assert spill_graph_pick_rung(64, ladder) == 64
+    # over the ladder -> None (eager fallback)
+    assert spill_graph_pick_rung(65, ladder) is None
+    assert spill_graph_pick_rung(9999, ladder) is None
+    assert spill_graph_pick_rung(5, []) is None
+
+
+def test_spill_graph_block_stage_counts_sanitize_map():
+    # rung 4, block 256: 600 owned -> [256, 256, 88, 0]  (last is empty no-op)
+    counts = spill_graph_block_stage_counts(600, 256, 4)
+    assert counts == [256, 256, 88, 0]
+    assert sum(counts) == 600
+    # the empty trailing block is the (0,-inf)-sanitized no-op that still pays
+    # its captured H2D + launch -- the reason the ladder stays dense
+    assert counts[-1] == 0
+    # exact fill: no empties
+    assert spill_graph_block_stage_counts(512, 256, 2) == [256, 256]
+    # zero owned (a rank owning none of the tail): all empty, fixed count kept
+    assert spill_graph_block_stage_counts(0, 256, 3) == [0, 0, 0]
+    # rung larger than needed -> trailing empties (rung-crossing / over-ladder)
+    assert spill_graph_block_stage_counts(300, 256, 5) == [256, 44, 0, 0, 0]
+
+
+def test_spill_graph_out_plan_windows_and_padding():
+    base = 1000  # region_base + wave drain (S3/S4 region-scoped host rows)
+    plan = spill_graph_out_plan(base, owned_tokens=600, block_size=256, rung=4)
+    assert len(plan) == 4  # fixed count == rung (constant captured shape)
+    # block 0: host rows [1000, 1256), indptr [0,256]
+    assert plan[0]["cnt"] == 256
+    assert torch.equal(
+        plan[0]["host_rows"], torch.arange(1000, 1256, dtype=torch.int64)
+    )
+    assert torch.equal(plan[0]["indptr"], torch.tensor([0, 256], dtype=torch.int32))
+    # block 1: [1256, 1512)
+    assert torch.equal(
+        plan[1]["host_rows"], torch.arange(1256, 1512, dtype=torch.int64)
+    )
+    # block 2: 88 rows [1512, 1600)
+    assert plan[2]["cnt"] == 88
+    assert torch.equal(
+        plan[2]["host_rows"], torch.arange(1512, 1600, dtype=torch.int64)
+    )
+    # block 3: EMPTY -> zero-length host_rows + indptr [0,0] (in-graph no-op)
+    assert plan[3]["cnt"] == 0
+    assert plan[3]["host_rows"].numel() == 0
+    assert torch.equal(plan[3]["indptr"], torch.tensor([0, 0], dtype=torch.int32))
+    # rows never escape the active tail window [base, base+owned)
+    hi = base + 600
+    for blk in plan:
+        if blk["cnt"]:
+            assert int(blk["host_rows"].min()) >= base
+            assert int(blk["host_rows"].max()) < hi
+
+
+def test_spill_graph_rung_covers_rank_uniform_block_count():
+    """End-to-end pure property: the picked rung >= the rank-uniform block
+    count, so every rank's real blocks fit and only trailing empties are
+    padded (sanitized) -- the graph shape is identical on all ranks."""
+    counts = [10, 3200, 3100]  # per-rank owned tail counts, uneven DCP
+    B = 256
+    needed = num_blocks_rank_uniform(counts, B)  # = ceil(3200/256) = 13
+    ladder = spill_graph_rung_ladder(spill_graph_blocks_needed(100000, B))
+    rung = spill_graph_pick_rung(needed, ladder)
+    assert rung is not None and rung >= needed
+    # every rank's real block count <= rung; the rest are empty no-ops
+    for c in counts:
+        real = spill_graph_blocks_needed(c, B) if c else 0
+        assert real <= rung
+
+
+def test_spill_graph_pipeline_mini_smoke():
+    """End-to-end pure pipeline (what _sess_prepare_step assembles per step):
+    ladder -> pick rung from the rank-uniform block count -> out-of-graph plan;
+    the plan's real rows must reconstruct EXACTLY the active tail window with
+    no gaps/overlaps, and the fixed block count equals the rung."""
+    B = 256
+    region_tokens = 40000
+    ladder = spill_graph_rung_ladder(spill_graph_blocks_needed(region_tokens, B))
+
+    for base, owned in [(0, 700), (1024, 256), (5000, 1), (2048, 4097)]:
+        needed = spill_graph_blocks_needed(owned, B)
+        rung = spill_graph_pick_rung(needed, ladder)
+        assert rung is not None and rung >= needed
+        plan = spill_graph_out_plan(base, owned, B, rung, device="cpu")
+        assert len(plan) == rung  # constant captured shape
+
+        # concatenating the real blocks' rows == the whole active tail window,
+        # contiguous, in order (the byte the H2D gather stages)
+        rows = torch.cat([b["host_rows"] for b in plan if b["cnt"] > 0]) \
+            if any(b["cnt"] > 0 for b in plan) else torch.empty(0, dtype=torch.int64)
+        assert torch.equal(rows, torch.arange(base, base + owned, dtype=torch.int64))
+        assert sum(b["cnt"] for b in plan) == owned
+        # trailing blocks past the data are empty no-ops (sanitized in-graph)
+        real = spill_graph_blocks_needed(owned, B)
+        for j in range(real, rung):
+            assert plan[j]["cnt"] == 0 and plan[j]["host_rows"].numel() == 0
 
 
 def test_restore_hysteresis():
