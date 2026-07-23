@@ -384,6 +384,11 @@ class CompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Fast-lane scheduling class (Variant C Stage 0): "fast" or None.
+    # OpenAI clients send it via extra_body={"lane": "fast"}. Only takes
+    # effect when the server runs with --enable-fast-lane; forwarded to
+    # GenerateReqInput.lane exactly like the native /generate endpoint.
+    lane: Optional[str] = None
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
@@ -398,6 +403,13 @@ class CompletionRequest(BaseModel):
     def validate_max_tokens_positive(cls, v):
         if v is not None and v <= 0:
             raise ValueError("max_tokens must be positive")
+        return v
+
+    @field_validator("lane")
+    @classmethod
+    def validate_lane(cls, v):
+        if v is not None and v != "fast":
+            raise ValueError('lane must be "fast" or omitted')
         return v
 
 
@@ -759,6 +771,11 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # Fast-lane scheduling class (Variant C Stage 0): "fast" or None.
+    # OpenAI clients send it via extra_body={"lane": "fast"}. Only takes
+    # effect when the server runs with --enable-fast-lane; forwarded to
+    # GenerateReqInput.lane exactly like the native /generate endpoint.
+    lane: Optional[str] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -785,6 +802,13 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+
+    @field_validator("lane")
+    @classmethod
+    def validate_lane(cls, v):
+        if v is not None and v != "fast":
+            raise ValueError('lane must be "fast" or omitted')
+        return v
 
     @model_validator(mode="before")
     @classmethod
