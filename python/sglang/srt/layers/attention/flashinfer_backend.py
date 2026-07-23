@@ -2629,6 +2629,21 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
         self._sess_graph_enabled = bool(spill_graph_enabled())
+        # S5 graph state (mirrors the _wl_graph_* fields):
+        #   _sess_graph_capture_blocks -- rung currently being CAPTURED (set by
+        #     the decode graph runner around each rung's capture; else None).
+        #   _sess_graph_replay_blocks  -- rung chosen for the CURRENT replay by
+        #     _sess_graph_can_replay (else None -> eager).
+        #   _sess_graph_bucket -- the single bs=1 bucket: persistent per-block
+        #     cuda-graph wrappers (wrappers[0..R-1], shared by all rungs), the
+        #     dev-head graph wrapper, fixed indptr/indices/staging buffers.
+        self._sess_graph_capture_blocks = None
+        self._sess_graph_replay_blocks = None
+        self._sess_graph_bucket = None
+        self._sess_graph_fallback_logged = False
+        # Rungs whose spill-tick graph the capture pass has recorded (GPU pass
+        # populates this; empty -> every spill tick stays eager).
+        self._sess_graph_captured_rungs = set()
         if self._sess_graph_enabled:
             max_blocks = spill_graph_blocks_needed(
                 self._sess_region_tokens, self._sess_block_size
@@ -2637,7 +2652,9 @@ class FlashInferAttnBackend(AttentionBackend):
             logger.info(
                 "kv-session-offload S5 spill-graph ENABLED: block=%d "
                 "region=%d -> ladder %s (eager fallback for over-ladder / "
-                "non-graphable ticks; capture wired by the GPU pass)",
+                "non-graphable ticks; capture driven by the decode graph "
+                "runner -- GPU-justification: capture-region + synthetic "
+                "spill-tick batch + dev-head capture-at-max)",
                 self._sess_block_size,
                 self._sess_region_tokens,
                 self._sess_graph_ladder,
@@ -2873,6 +2890,7 @@ class FlashInferAttnBackend(AttentionBackend):
             dev_head_idx=dev_head_idx,
             n_head_own=n_head_own,
             # S5: fixed-count graph rung + out-of-graph plan (None -> eager).
+            region_base=slot.region_base,
             graph_rung=None,
             graph_plan=None,
         )
@@ -2898,6 +2916,31 @@ class FlashInferAttnBackend(AttentionBackend):
                 st.graph_plan = spill_graph_out_plan(
                     base, n_own, B, rung, device=st.device
                 )
+            # S5 graph prep (the #136a .plan() hoist -- ONCE per step, out of
+            # graph). During CAPTURE the runner set _sess_graph_capture_blocks;
+            # plan every rung wrapper at worst-case. During a graph REPLAY step
+            # (_sess_graph_replay_blocks set by _sess_graph_can_replay) refill
+            # the fixed buffers from st.graph_plan. Plain eager ticks skip this.
+            # GPU-JUSTIFICATION: the exact ordering of prepare vs the runner's
+            # capture/replay hooks (whether this or init_forward_metadata_out_
+            # graph drives replay prep) is validated on GPU -- mirror the _wl
+            # sequence (out_graph -> _wl_graph_prepare_blocks) if adjustment is
+            # needed.
+            self._sess_spill = st  # prepare_blocks reads _sess_spill
+            if self._sess_graph_capture_blocks is not None:
+                self._sess_graph_prepare_blocks(in_capture=True)
+            elif (
+                rung is not None
+                and self._sess_graph_replay_blocks == rung
+                and self._sess_graph_captured(rung)
+            ):
+                # Refill the captured rung's fixed buffers for this replay. On
+                # GPU the runner may instead drive replay prep from its
+                # out-of-graph hook (as _wl does via
+                # init_forward_metadata_out_graph -> _wl_graph_prepare_blocks);
+                # if so, move this call there. Gated on _sess_graph_captured so
+                # flag-on-without-capture never builds graph state.
+                self._sess_graph_prepare_blocks(in_capture=False)
         # Prime the double buffer: the first two copies (layer 0, and with
         # k_local == 1 already layer 1) start NOW, overlapping everything
         # that runs before the first full-attention layer.
@@ -2940,6 +2983,11 @@ class FlashInferAttnBackend(AttentionBackend):
         byte path) and D2H-copy it to this rank's next host row. Rank-local;
         no collectives."""
         st = self._sess_spill
+        # S5: during graph capture route to the fixed-shape graph owner-write
+        # (always writes -- real host row or dump slot -- no cur_owned branch).
+        if self._sess_graph_capture_blocks is not None:
+            self._sess_owner_write_graph(layer, k_full, v_full)
+            return
         if not st.cur_owned:
             return
         from sgl_kernel.kvcacheio import transfer_kv_per_layer
@@ -3063,6 +3111,12 @@ class FlashInferAttnBackend(AttentionBackend):
         capture/replay wiring + validation is the GPU pass; until then this
         eager loop runs unchanged (byte-identical), so ``graph_rung`` set with
         no active capture context is simply ignored here."""
+        # S5 dispatch: while a rung is being CAPTURED (the decode graph runner
+        # set _sess_graph_capture_blocks), record the fixed-count graph body;
+        # replay re-runs the recorded ops (no Python re-entry). Every other
+        # spill tick runs the eager loop below (byte-identical).
+        if self._sess_graph_capture_blocks is not None:
+            return self._sess_blockwise_decode_return_lse_graph(q_full, layer)
         st = self._sess_spill
         B = self._sess_block_size
         fl = self._sess_full_layer_idx(layer)
@@ -3181,6 +3235,325 @@ class FlashInferAttnBackend(AttentionBackend):
         q_local = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         o, _ = self._sess_blockwise_decode_return_lse(q_local, layer)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    # ==================================================================
+    # S5: CUDA-graph capture/replay of the bs=1 spill tick. PORT of the
+    # proven weightless-KV #136a mechanism (_wl_graph_bucket_state /
+    # _wl_graph_prepare_blocks / _wl_blockwise_decode_return_lse_graph /
+    # wl_graph_can_replay), region-scoped to ONE spilled session's active
+    # host tail. Differences from _wl (the S1b hybrid): (a) EVERY block is a
+    # pure host block (no per-block device/host tier split -- the device HEAD
+    # is attended separately by a dedicated graph wrapper), (b) the host tail
+    # rows are ALWAYS densely packed [base, base+n_own) so no contiguity gate
+    # is needed, (c) the dev-head wrapper is captured-at-max / replayed-below
+    # (its size varies per session, independent of the tail rung).
+    #
+    # GPU-JUSTIFICATION (the messagent iterates these; the STRUCTURE mirrors
+    # the working _wl port so the tuning is minimal):
+    #   * the capture harness builds a SYNTHETIC spill-tick batch per rung
+    #     (decode graph runner) -- capture-region boundaries;
+    #   * the dev-head capture-at-max count (`head_max`);
+    #   * #136b side-stream prefetch is DEFERRED (single-region serial copies
+    #     on the main stream, the byte-identical #136a-no-prefetch behavior).
+    # ------------------------------------------------------------------
+
+    def _sess_graph_captured(self, rung) -> bool:
+        """Whether a spill-tick graph for ``rung`` has been captured. The
+        per-rung capture pass (GPU-wired by the messagent) records each rung it
+        captures into ``_sess_graph_captured_rungs``; until then this is empty
+        and can_run_graph keeps the spill tick eager (safe: never replay a
+        graph that was not recorded)."""
+        return rung is not None and rung in getattr(
+            self, "_sess_graph_captured_rungs", set()
+        )
+
+    def _sess_graph_log_fallback(self, reason: str) -> bool:
+        if not self._sess_graph_fallback_logged:
+            self._sess_graph_fallback_logged = True
+            logger.info(
+                "kv-session-offload spill-graph: eager fallback (%s). Logged "
+                "once; later fallbacks silent.",
+                reason,
+            )
+        return False
+
+    def _sess_graph_can_replay(self, forward_batch) -> bool:
+        """Replay admission for the spill-tick graph (analog of
+        wl_graph_can_replay). Sets `_sess_graph_replay_blocks` on success.
+
+        Rank-uniform: the rung is picked from `num_blocks_rank_uniform` over
+        replicated counts, so every rank takes the same graph/eager decision
+        -- the per-layer DCP collective count is preserved either way (the
+        eager spill tick issues the identical cp_lse sequence)."""
+        from sglang.srt.managers.kv_session_offload import spill_graph_pick_rung
+
+        self._sess_graph_replay_blocks = None
+        if not (self._sess_graph_enabled and self._sess_graph_ladder):
+            return False
+        if not getattr(forward_batch, "kv_session_spill_tick", False):
+            return False
+        if forward_batch.batch_size != 1:
+            return self._sess_graph_log_fallback(
+                f"spill-graph is bs=1, got bs={forward_batch.batch_size}"
+            )
+        # The tail's host rows are dense [base, base+n_own) by construction
+        # (backup packs owned tokens contiguously), so -- unlike _wl -- no KV
+        # slot-layout contiguity check is needed. Derive the rank-uniform rung
+        # from the same state _sess_prepare_step will build (it runs after this
+        # in init_forward_metadata and stashes the plan onto _sess_spill).
+        st = getattr(self, "_sess_spill", None)
+        if st is None or st.graph_rung is None:
+            # prepare_step hasn't run yet, or the rung was over-ladder there.
+            return self._sess_graph_log_fallback("no graph rung for this tick")
+        self._sess_graph_replay_blocks = st.graph_rung
+        return True
+
+    def _sess_graph_bucket_state(self):
+        """Persistent bs=1 bucket: max_blocks cuda-graph block wrappers (shared
+        by every rung, rung R uses wrappers[0..R-1]) + a dev-head graph wrapper
+        + fixed indptr/indices/staging-map buffers. Mirrors
+        _wl_graph_bucket_state; single staging region (no #136b prefetch)."""
+        import types
+
+        B = self._sess_block_size
+        max_blocks = max(self._sess_graph_ladder)
+        dev = self.kv_last_page_len.device
+        iu = self.indices_updater_decode
+        # Dev-head capture-at-max: the largest head this rank can attend. Cap
+        # at the region (a full max-context session) -- GPU-tunable.
+        head_max = int(self._sess_region_tokens)
+        st = types.SimpleNamespace(
+            wrappers=[],
+            indptr_dev=[],
+            indptr_host=[],
+            stage_ids=[],       # host source rows per block (refilled at replay)
+            stage_dst=[],       # staging destination slots (fixed)
+            head_wrapper=None,
+            head_indices=torch.zeros(head_max, dtype=torch.int32, device=dev),
+            head_indptr_dev=torch.zeros(2, dtype=torch.int32, device=dev),
+            head_indptr_host=torch.zeros(2, dtype=torch.int32),
+            ow_dst=torch.zeros(1, dtype=torch.int64, device=dev),  # owner-write dst
+        )
+        for j in range(max_blocks):
+            indptr_buf = torch.zeros(2, dtype=torch.int32, device=dev)
+            indices_buf = torch.zeros(B, dtype=torch.int32, device=dev)
+            w = BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=self.decode_backend,
+                use_cuda_graph=True,
+                use_tensor_cores=self.decode_use_tensor_cores,
+                paged_kv_indptr_buffer=indptr_buf,
+                paged_kv_indices_buffer=indices_buf,
+                paged_kv_last_page_len_buffer=self.kv_last_page_len[:1],
+            )
+            st.wrappers.append(w)
+            st.indptr_dev.append(indptr_buf)
+            st.indptr_host.append(torch.zeros(2, dtype=torch.int32))
+            # Fixed staging destination for block j: staging slots [0, B). The
+            # single region is reused serially across blocks (copy j after run
+            # j-1 on the main stream, captured order).
+            st.stage_ids.append(torch.zeros(B, dtype=torch.int64, device=dev))
+            st.stage_dst.append(self._sess_stage_arange64[:B])
+        # Dev-head graph wrapper (real device pool, indices = dev_head_idx).
+        st.head_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+            self.workspace_buffer,
+            "NHD",
+            backend=self.decode_backend,
+            use_cuda_graph=True,
+            use_tensor_cores=self.decode_use_tensor_cores,
+            paged_kv_indptr_buffer=st.head_indptr_dev,
+            paged_kv_indices_buffer=st.head_indices,
+            paged_kv_last_page_len_buffer=self.kv_last_page_len[:1],
+        )
+        logger.info(
+            "kv-session-offload spill-graph bucket built: %d block wrappers "
+            "(ladder %s), block=%d, head_max=%d",
+            max_blocks,
+            self._sess_graph_ladder,
+            B,
+            head_max,
+        )
+        return st
+
+    def _sess_graph_prepare_blocks(self, in_capture: bool):
+        """OUT-of-graph per-step prep (analog of _wl_graph_prepare_blocks): plan
+        the rung's block wrappers + the dev-head wrapper and fill the fixed
+        staging/index/indptr buffers. Runs ONCE per spill tick (the #136a plan
+        hoist). Capture plans the worst case (every block FULL, head at max);
+        replay refills real counts via fast_decode_plan (capture-at-max /
+        replay-below)."""
+        iu = self.indices_updater_decode
+        num_qo_heads = sum(self.dcp_q_head_counts) if self.uneven_dcp else (
+            self.indices_updater_decode.num_qo_heads
+        )
+        num_kv_heads = iu.num_kv_heads
+        head_dim = iu.head_dim
+        last_page = self.kv_last_page_len[:1]
+        B = self._sess_block_size
+        if self._sess_graph_bucket is None:
+            self._sess_graph_bucket = self._sess_graph_bucket_state()
+        st = self._sess_graph_bucket
+
+        if in_capture:
+            rung = self._sess_graph_capture_blocks
+            assert rung is not None, "spill-graph capture without a rung set"
+            synth_indptr = torch.tensor([0, B], dtype=torch.int32, device=last_page.device)
+            synth_indices = torch.zeros(B, dtype=torch.int32, device=last_page.device)
+            for j in range(rung):
+                w = st.wrappers[j]
+                w.plan(
+                    synth_indptr, synth_indices, last_page,
+                    num_qo_heads, num_kv_heads, head_dim, 1,
+                    q_data_type=iu.q_data_type, kv_data_type=iu.data_type,
+                )
+                w.begin_forward = partial(fast_decode_plan, w)
+            # Dev-head captured at max.
+            hmax = int(st.head_indices.numel())
+            head_synth = torch.tensor([0, hmax], dtype=torch.int32, device=last_page.device)
+            st.head_wrapper.plan(
+                head_synth, st.head_indices, last_page,
+                num_qo_heads, num_kv_heads, head_dim, 1,
+                q_data_type=iu.q_data_type, kv_data_type=iu.data_type,
+            )
+            st.head_wrapper.begin_forward = partial(fast_decode_plan, st.head_wrapper)
+            return
+
+        # ---- replay prep: refill from _sess_spill's out-of-graph plan ----
+        spill = self._sess_spill
+        rung = self._sess_graph_replay_blocks
+        assert rung is not None and spill is not None, (
+            "spill-graph replay prep without admission (can_replay first)"
+        )
+        plan = spill.graph_plan  # list of {cnt, host_rows, indptr} (per block)
+        for j in range(rung):
+            w = st.wrappers[j]
+            blk = plan[j] if j < len(plan) else {"cnt": 0}
+            cnt = int(blk["cnt"])
+            ic = st.indptr_host[j]
+            ic[1] = cnt
+            if cnt > 0:
+                st.stage_ids[j][:cnt].copy_(blk["host_rows"], non_blocking=True)
+                # block indices = the staging slots [0, cnt)
+                w._paged_kv_indices_buf[:cnt].copy_(
+                    self._sess_stage_arange32[:cnt], non_blocking=True
+                )
+            st.indptr_dev[j].copy_(ic, non_blocking=True)
+            w.begin_forward(
+                st.indptr_dev[j], w._paged_kv_indices_buf[:cnt], last_page,
+                num_qo_heads, num_kv_heads, head_dim, 1,
+                data_type=iu.data_type, q_data_type=iu.q_data_type,
+                non_blocking=True, fixed_split_size=None,
+                disable_split_kv=self.disable_cuda_graph_kv_split,
+                global_override_indptr_cpu=ic,
+            )
+        # Dev-head refill (replay-below the captured max).
+        n_head = int(spill.n_head_own)
+        st.head_indptr_host[1] = n_head
+        if n_head > 0:
+            st.head_indices[:n_head].copy_(spill.dev_head_idx, non_blocking=True)
+        st.head_indptr_dev.copy_(st.head_indptr_host, non_blocking=True)
+        st.head_wrapper.begin_forward(
+            st.head_indptr_dev, st.head_indices[:n_head], last_page,
+            num_qo_heads, num_kv_heads, head_dim, 1,
+            data_type=iu.data_type, q_data_type=iu.q_data_type,
+            non_blocking=True, fixed_split_size=None,
+            disable_split_kv=self.disable_cuda_graph_kv_split,
+            global_override_indptr_cpu=st.head_indptr_host,
+        )
+        # Owner-write destination (data-driven, not a branch): the current
+        # token's host row if this rank owns it, else a never-read DUMP slot in
+        # this session's region (sized with >=2 slack rows above max context,
+        # so the last region row is always spare). Resolved here out-of-graph.
+        dump = int(spill.region_base) + self._sess_region_tokens - 1
+        st.ow_dst[0] = spill.cur_host_row if spill.cur_owned else dump
+
+    def _sess_blockwise_decode_return_lse_graph(self, q_full, layer):
+        """Graph-recordable fixed-count spill-tick block decode (PORT of
+        _wl_blockwise_decode_return_lse_graph). Iterates EXACTLY the capture
+        rung's blocks; per block {H2D gather (single region, main stream) +
+        pre-planned wrapper run + merge}. The device HEAD is attended first via
+        the persistent head wrapper. Empty blocks (zero-length indptr at
+        replay) are sanitized to the (o=0, lse=-inf) contract in-graph so the
+        online merge folds them as identity -- matching the eager loop's skip.
+        NO .plan()/.item()/host sync inside (all hoisted to prepare_blocks)."""
+        st = self._sess_graph_bucket
+        rung = self._sess_graph_capture_blocks
+        spill = self._sess_spill
+        fl = self._sess_full_layer_idx(layer)
+        kv = self._sess_staging_kv
+        real_kv = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        neg_inf = float("-inf")
+        # The current token's KV was already owner-written to host (real row or
+        # dump slot) by _sess_owner_write's graph branch, run on the compute
+        # stream before this block decode -- same ordering as the eager path.
+
+        o_acc = lse_acc = empty_acc = None
+        # Device head partial (real pool) -- first merge source.
+        oh, lh = st.head_wrapper.forward_return_lse(
+            q_full, real_kv,
+            sm_scale=layer.scaling, logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale_float, v_scale=layer.v_scale_float,
+        )
+        hlen = st.head_indptr_dev[1:] - st.head_indptr_dev[:-1]
+        hem = hlen == 0
+        lh = torch.where(hem.unsqueeze(1), torch.full_like(lh, neg_inf), lh)
+        oh = torch.where(hem.view(-1, 1, 1), torch.zeros_like(oh), oh)
+        o_acc, lse_acc, empty_acc = oh, lh, hem
+
+        # 3. Host tail blocks (fixed count == rung).
+        for j in range(rung):
+            self._sess_host_pool.load_to_device_per_layer(
+                self._sess_full_pool, st.stage_ids[j], st.stage_dst[j],
+                fl, io_backend="kernel",
+            )
+            o_b, lse_b = st.wrappers[j].forward_return_lse(
+                q_full, kv,
+                sm_scale=layer.scaling, logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float, v_scale=layer.v_scale_float,
+            )
+            lens = st.indptr_dev[j][1:] - st.indptr_dev[j][:-1]
+            em = lens == 0
+            lse_b = torch.where(em.unsqueeze(1), torch.full_like(lse_b, neg_inf), lse_b)
+            o_b = torch.where(em.view(-1, 1, 1), torch.zeros_like(o_b), o_b)
+            o_acc, lse_acc = _safe_merge_state(o_acc, lse_acc, o_b, lse_b)
+            empty_acc = empty_acc & em
+            lse_acc = torch.where(
+                empty_acc.unsqueeze(1), torch.full_like(lse_acc, neg_inf), lse_acc
+            )
+            o_acc = torch.where(
+                empty_acc.view(-1, 1, 1), torch.zeros_like(o_acc), o_acc
+            )
+        return o_acc, lse_acc
+
+    def _sess_owner_write_graph(self, layer, k_full, v_full):
+        """Graph-recordable owner-write (fixed shapes; PORT of
+        _wl_spill_owner_write_graph's fixed formulation). Quantize the current
+        token's K/V through the device scratch row (stock set_kv_buffer byte
+        path, 1 row), then D2H-copy the scratch row to st.ow_dst -- the real
+        host row when this rank owns the token, else the region dump slot
+        (both resolved out-of-graph in _sess_graph_prepare_blocks). No
+        .nonzero()/.any()/branch: when cur_owned is false the copy still runs
+        but targets the never-read dump slot, byte-identical to the eager skip
+        for every real host row."""
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer
+
+        st = self._sess_graph_bucket
+        self._sess_pool.set_kv_buffer(
+            layer, self._sess_scratch_loc, k_full.clone(), v_full.clone(),
+            layer.k_scale, layer.v_scale,
+        )
+        fl = self._sess_full_layer_idx(layer)
+        host = self._sess_host_pool
+        transfer_kv_per_layer(
+            src_k=self._sess_full_pool.k_buffer[fl],
+            dst_k=host.k_data_refs[fl],
+            src_v=self._sess_full_pool.v_buffer[fl],
+            dst_v=host.v_data_refs[fl],
+            src_indices=self._sess_scratch_loc,
+            dst_indices=st.ow_dst,
+            item_size=host.token_stride_size,
+        )
 
     # ------------------------------------------------------------------
     # #136a: CUDA-graph integration of the streaming block-decode.

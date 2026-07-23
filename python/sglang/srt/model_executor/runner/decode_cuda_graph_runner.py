@@ -324,6 +324,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.compile_bs = [bs for bs in self.compile_bs if bs <= _wl_max_bs]
             _wl_ab.wl_build_graph_ladder()
 
+        # S5 spill-tick graph: UNLIKE the weightless block-decode (which IS the
+        # decode and reshapes every capture bucket to bs=1), the spill tick is a
+        # SEPARATE bs=1 batch type -- normal decode keeps its own graphs. The
+        # spill-tick graphs are an ADDITIONAL per-rung bs=1 capture pass. Gated
+        # by the backend's _sess_graph_enabled (flag OFF -> this stays False and
+        # the runner is byte-identical). GPU-JUSTIFICATION: the additional
+        # capture pass needs a live-ish spilled-session synthetic batch, so it
+        # is DRIVEN ON GPU by the messagent; here we only wire the admission +
+        # replay-variant so the mechanism is ready.
+        self._sess_block_graph = False
+        _sess_ab = getattr(self.attn_backend, "full_attn_backend", self.attn_backend)
+        if (
+            getattr(_sess_ab, "_sess_graph_enabled", False)
+            and not model_runner.is_draft_worker
+        ):
+            self._sess_block_graph = True
+            self._sess_attn = _sess_ab
+
         self.ragged_verify_mode = (
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
             and (self.capture_forward_mode == ForwardMode.TARGET_VERIFY)
@@ -552,6 +570,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "(can_run_graph admission must precede load_batch)"
             )
             return f"wlblk{rung}"
+        if self._sess_block_graph and self._sess_attn._sess_graph_replay_blocks:
+            # S5: spill-tick replay keys on its captured rung.
+            return f"sessblk{self._sess_attn._sess_graph_replay_blocks}"
         return default
 
     def can_run_graph(self, forward_batch: ForwardBatch):
@@ -559,11 +580,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
-        # kv-session-offload (S1): the spill tick streams host-resident KV
-        # blockwise with per-block host-side plans -- structurally eager.
-        # The flag is replicated scheduler state, so every rank decides
-        # identically (no collective-count divergence).
+        # kv-session-offload: the spill tick streams host-resident KV
+        # blockwise. S5: run it as a captured graph when the spill-graph flag
+        # is on, admission succeeds (bs=1 + a covering rung -- rank-uniform),
+        # AND that rung was actually captured (the additional per-rung capture
+        # pass is GPU-wired; until then _sess_graph_captured is empty -> eager).
+        # Flag OFF or over-ladder -> eager, byte-identical. Replicated inputs
+        # -> every rank decides identically (no collective-count divergence).
         if getattr(forward_batch, "kv_session_spill_tick", False):
+            if (
+                self._sess_block_graph
+                and self._sess_attn._sess_graph_can_replay(forward_batch)
+                and self._sess_attn._sess_graph_captured(
+                    self._sess_attn._sess_graph_replay_blocks
+                )
+            ):
+                return True
             return False
 
         # Weightless streaming block-decode (#136a): rung availability +
