@@ -13,7 +13,7 @@ diagram:
           measured component segments (weights, KV, GDN state, experts, draft
           pools, graphs, CUDA context, free) plus a host-RAM bar.
   RIGHT — the hypothetical NORMAL / homogeneous UPSTREAM config for the same
-          workload: N IDENTICAL cards, even TP = card count, with the divisibility
+          workload: N IDENTICAL cards, symmetric TP = card count, with the divisibility
           reason for that TP. The whole right panel is illustrative / ESTIMATED.
 
 Visual truth convention (used in every diagram, explained in the evidence key):
@@ -434,27 +434,27 @@ E = "estimated"
 U = "unknown"
 
 FEATURES = [
-    # -- 1. Uneven DCP -----------------------------------------------------
+    # -- 1. Asymmetric DCP -----------------------------------------------------
     {
-        "name": "01-uneven-dcp.svg",
-        "title": "1 — Uneven DCP = the KV / TOKEN axis: KV token-bands follow card VRAM, decoupled from the weight split",
+        "name": "01-asymmetric-dcp.svg",
+        "title": "1 — Asymmetric DCP = the KV / TOKEN axis: KV token-bands follow card VRAM, decoupled from the weight split",
         "subtitle": "Read this diagram for the KV bands (foreground); the weight shards are the constant grey background here. Fork on the rig vs a homogeneous upstream config for the same 27B workload.",
         "sentences": [
-            ("Left (measured): FP8-27B TP=3 + uneven-DCP, --rank-gpu-id 0,1,2 --rank-tp-ratio auto "
+            ("Left (measured): FP8-27B TP=3 + asymmetric-DCP, --rank-gpu-id 0,1,2 --rank-tp-ratio auto "
              "--rank-gpu-memory-mib 28591,16464,16464. The MESSAGE is the green KV bands: KV is split along "
              "the TOKEN axis (374310 / 212109 / 212109 tokens) sized to each card's VRAM budget "
              "(28591:16464:16464 ≈ 1.74:1:1) — DECOUPLED from the weight ratio (12.7:8.0:8.0 ≈ 1.59:1:1, grey). "
              "Aggregate context grows with the cards you already own: 735k tokens, 2.81x the hand-budget start.", "#333"),
-            ("This is a DIFFERENT axis from Uneven TP (§2): §2 sizes the WEIGHT shards to card compute; §1 sizes "
-             "the KV TOKENS to card VRAM. On the rig both run together — --rank-tp-ratio auto sets the uneven "
-             "TP weight split AND the uneven-DCP KV token split at once — so a rank's KV band is not tied to its "
+            ("This is a DIFFERENT axis from Asymmetric TP (§2): §2 sizes the WEIGHT shards to card compute; §1 sizes "
+             "the KV TOKENS to card VRAM. On the rig both run together — --rank-tp-ratio auto sets the asymmetric "
+             "TP weight split AND the asymmetric-DCP KV token split at once — so a rank's KV band is not tied to its "
              "weight shard.", "#1d6b34"),
-            ("Right (illustrative): the natural homogeneous upstream config is 2 identical 24 GB cards at even "
+            ("Right (illustrative): the natural homogeneous upstream config is 2 identical 24 GB cards at symmetric "
              "TP=2 (4 KV heads split 2/rank). TP=3 is not legal here — 4 KV heads are not divisible by 3. "
              "Upstream head-shards KV, so aggregate KV does not grow with added cards the way the token split does.", "#555"),
         ],
-        "left_label": "htsglang — uneven-DCP: KV / TOKEN axis (KV foregrounded)",
-        "right_label": "upstream — 2x identical 24 GB, even TP=2",
+        "left_label": "htsglang — asymmetric-DCP: KV / TOKEN axis (KV foregrounded)",
+        "right_label": "upstream — 2x identical 24 GB, symmetric TP=2",
         "emph": "kv",
         "left_cards": [
             ("RTX 5090", "rank0 · 32.6 GB", 32.6, [
@@ -475,11 +475,11 @@ FEATURES = [
                 ("ctx", 0.78, "", M)]),
         ],
         "right_cards": [
-            ("identical 24 GB", "rank0 · even TP=2", 24, [
+            ("identical 24 GB", "rank0 · symmetric TP=2", 24, [
                 ("weights", 12.5, "weights ½", E),
                 ("kv", 8.5, "KV head-shard (2 of 4)", E),
                 ("ctx", 1.5, "", E)]),
-            ("identical 24 GB", "rank1 · even TP=2", 24, [
+            ("identical 24 GB", "rank1 · symmetric TP=2", 24, [
                 ("weights", 12.5, "weights ½", E),
                 ("kv", 8.5, "KV head-shard (2 of 4)", E),
                 ("ctx", 1.5, "", E)]),
@@ -497,30 +497,30 @@ FEATURES = [
              "with added cards the way the token-axis split does. Assumed card size named; not measured.", "#4a5568"),
         ],
         "core": ("the fork splits KV along the TOKEN axis, sized to each card's VRAM and DECOUPLED from the weight "
-                 "split, so aggregate context scales with the mismatched cards you already own; upstream even-TP "
+                 "split, so aggregate context scales with the mismatched cards you already own; upstream symmetric-TP "
                  "head-shards KV and needs identical cards whose KV-head count divides the rank count. (Contrast "
                  "§2, which is about the WEIGHT axis; on the rig both run together.)"),
         "legend_keys": ["weights", "kv", "gdn", "ctx", "free"],
     },
-    # -- 2. Uneven TP ------------------------------------------------------
+    # -- 2. Asymmetric TP ------------------------------------------------------
     {
-        "name": "02-uneven-tp.svg",
-        "title": "2 — Uneven TP (heterogeneous / asymmetric TP) = the WEIGHT axis: size each weight shard to the card's compute (ratio 2:1:1, Q-heads 12/6/6)",
-        "subtitle": "Read this diagram for the weight shards (foreground); the KV here is just the leftover remainder (grey). Fork on the rig vs a homogeneous upstream even-TP config for the same 27B workload.",
+        "name": "02-asymmetric-tp.svg",
+        "title": "2 — Asymmetric TP = the WEIGHT axis: size each weight shard to the card's compute for heterogeneous / mismatched GPUs (ratio 2:1:1, Q-heads 12/6/6)",
+        "subtitle": "Read this diagram for the weight shards (foreground); the KV here is just the leftover remainder (grey). Fork on the rig vs a homogeneous upstream symmetric-TP config for the same 27B workload.",
         "sentences": [
             ("Left (measured): 27B TP=3, --rank-tp-ratio 2,1,1 --rank-gpu-memory-mib 26000,15000,15000, one "
              "rank per GPU. The MESSAGE is the blue weight shards: Q heads split 12 / 6 / 6, the 5090 carries "
              "the 2x shard — measured weight shards 12.7 / 8.0 / 8.0 GiB (ratio 2 : 1 : 1, sized to card "
              "COMPUTE). KV here is only the leftover remainder (grey), not the point.", "#333"),
-            ("This is a DIFFERENT axis from Uneven DCP (§1): §2 sizes the WEIGHT shards to card compute; §1 "
+            ("This is a DIFFERENT axis from Asymmetric DCP (§1): §2 sizes the WEIGHT shards to card compute; §1 "
              "sizes the KV TOKENS to card VRAM. On the rig both run together — --rank-tp-ratio auto sets the "
              "weight split AND the KV token split at once — so do not read the two diagrams as the same thing.", "#1d6b34"),
-            ("Right (illustrative): upstream even-TP gives every rank an IDENTICAL shard, so it wants N equal "
+            ("Right (illustrative): upstream symmetric-TP gives every rank an IDENTICAL shard, so it wants N equal "
              "cards (2x 24 GB shown). On mixed cards it would size every rank to the smallest and strand the "
              "surplus of the larger one. TP=3 is illegal for this model (4 KV heads).", "#555"),
         ],
-        "left_label": "htsglang — uneven-TP: WEIGHT axis, ratio 2:1:1 (weights foregrounded)",
-        "right_label": "upstream — 2x identical 24 GB, even TP=2",
+        "left_label": "htsglang — asymmetric-TP: WEIGHT axis, ratio 2:1:1 (weights foregrounded)",
+        "right_label": "upstream — 2x identical 24 GB, symmetric TP=2",
         "emph": "weights",
         "left_cards": [
             ("RTX 5090", "rank0 · ratio 2 · Q 12", 32.6, [
@@ -540,11 +540,11 @@ FEATURES = [
                 ("kv", 8.8, "KV (remainder)", E)]),
         ],
         "right_cards": [
-            ("identical 24 GB", "rank0 · even shard", 24, [
+            ("identical 24 GB", "rank0 · symmetric shard", 24, [
                 ("weights", 12.5, "weights (equal)", E),
                 ("kv", 9.5, "KV", E),
                 ("ctx", 1.5, "", E)]),
-            ("identical 24 GB", "rank1 · even shard", 24, [
+            ("identical 24 GB", "rank1 · symmetric shard", 24, [
                 ("weights", 12.5, "weights (equal)", E),
                 ("kv", 9.5, "KV", E),
                 ("ctx", 1.5, "", E)]),
@@ -556,11 +556,11 @@ FEATURES = [
              "figures used a contaminated bench (pre-2026-07-22) and are withdrawn, not shown as fact.", "#1d6b34"),
         ],
         "right_notes": [
-            ("Even-TP is clean ON identical cards; the contrast is the hardware premise (N equal cards), "
+            ("Symmetric-TP is clean ON identical cards; the contrast is the hardware premise (N equal cards), "
              "not the per-card layout. Assumed card size named; not measured.", "#4a5568"),
         ],
         "core": ("the fork sizes each WEIGHT shard to the specific card's compute (ratio 2:1:1), using a 32 GB + "
-                 "2x20 GB set as-is; upstream even-TP gives identical shards and therefore wants N equal cards "
+                 "2x20 GB set as-is; upstream symmetric-TP gives identical shards and therefore wants N equal cards "
                  "(and strands a bigger card if mixed). (Contrast §1, which is about the KV/TOKEN axis; on the "
                  "rig both run together.)"),
         "legend_keys": ["weights", "kv", "gdn", "ctx", "free"],
@@ -569,18 +569,18 @@ FEATURES = [
     {
         "name": "03-adaptive-drafter.svg",
         "title": "3 — Cross-algorithm drafter routing (NEXTN ↔ DFLASH): dual residence, itemised per-rung cost",
-        "subtitle": "Fork on the rig (TP=3 uneven) vs a homogeneous upstream TP=2 running one fixed drafter.",
+        "subtitle": "Fork on the rig (TP=3 asymmetric) vs a homogeneous upstream TP=2 running one fixed drafter.",
         "sentences": [
             ("Left (measured): both drafters resident behind --speculative-cross-algorithm. The solo-draft "
              "pool costs 4.58 GiB on rank0 (5090); the per-k rung graphs/state are itemised "
              "DFLASH_k16 662 / EAGLE_k3 634 / EAGLE_k2 554 MiB. Draft graphs push rank0 graphs to 7.44 GiB.", "#333"),
-            ("Right (illustrative): the homogeneous upstream reference is 2 identical 24 GB cards at even "
+            ("Right (illustrative): the homogeneous upstream reference is 2 identical 24 GB cards at symmetric "
              "TP=2 running ONE FIXED drafter (e.g. NEXTN k=3) — a single draft residence, no per-k rung "
              "tags, no dual-residence and no runtime routing (upstream cannot switch draft algorithm). Less "
              "draft VRAM, but no runtime choice.", "#555"),
         ],
-        "left_label": "htsglang — TP=3 uneven, cross-algo drafter resident (measured)",
-        "right_label": "upstream — 2x identical 24 GB, even TP=2, one fixed drafter",
+        "left_label": "htsglang — TP=3 asymmetric, cross-algo drafter resident (measured)",
+        "right_label": "upstream — 2x identical 24 GB, symmetric TP=2, one fixed drafter",
         "left_cw": 132,
         "right_cw": 150,
         "left_cards": [
@@ -602,12 +602,12 @@ FEATURES = [
                 ("free", 2.48, "graphs", M)]),
         ],
         "right_cards": [
-            ("identical 24 GB", "rank0 · even TP=2", 24, [
+            ("identical 24 GB", "rank0 · symmetric TP=2", 24, [
                 ("weights", 12.5, "weights ½", E),
                 ("mtp", 0.5, "1 fixed drafter (NEXTN k=3)", E),
                 ("kv", 9.0, "KV", E),
                 ("ctx", 1.3, "", E)]),
-            ("identical 24 GB", "rank1 · even TP=2", 24, [
+            ("identical 24 GB", "rank1 · symmetric TP=2", 24, [
                 ("weights", 12.5, "weights ½", E),
                 ("kv", 9.5, "KV", E),
                 ("ctx", 1.3, "", E)]),
@@ -669,7 +669,7 @@ FEATURES = [
         "left_notes": [
             ("Host KV bytes = 32 KiB/token x spilled tokens (ESTIMATED from the measured cell size). "
              "Long-context curve (32k~63 ... 262k~7.6 tok/s) is MODELED, not benchmarked (needs S2); "
-             "worthwhile only with uneven DCP active.", "#1d6b34"),
+             "worthwhile only with asymmetric DCP active.", "#1d6b34"),
             ("The more important number — how the DEVICE-RESIDENT (non-spilled) session runs DURING a spill "
              "(measured, ctx ~1.6k): 10.4 / 13.4 / 19.9 / 26.0 tok/s at tick-interval 1 / 2 / 4 / 8 (pre-spill "
              "~40); the spilled session ~7–8 tok/s. Isolation target met only from tick 4 up, VIOLATED at tick "
@@ -698,7 +698,7 @@ FEATURES = [
             ("The deeper enabler: models with FEW KV heads can now run on configs with FAR MORE GPUs than they "
              "have KV heads. The replicated-KV geometry (Task #62 — each rank projects all KV heads replicated "
              "and holds one Q-head slice) removes num_kv_heads as the ceiling on the rank/GPU count (e.g. A3B "
-             "kv=2 on tp=5). Uneven DCP is a BONUS on top (KV token-split across the ranks). Per-rank weight/KV "
+             "kv=2 on tp=5). Asymmetric DCP is a BONUS on top (KV token-split across the ranks). Per-rank weight/KV "
              "split inside each budget was not dumped.", "#333"),
             ("Right (illustrative): a standard TP=5 maps one rank per physical card, so it needs 5 identical "
              "cards. Co-location and the KV-head lift are what let a model with 2 KV heads run at tp=5 on the "
@@ -729,11 +729,11 @@ FEATURES = [
             ("Budgets are MEASURED (7/7/7 on the 5090, 17/17 on the 3080s); the weight/KV/GDN breakdown "
              "within each rank was not registry-dumped. Coherent, needle from ~15k ctx, bit-identical "
              "across two boots. Decode tok/s is deliberately NOT 5-card-representative (3 ranks share one card).", "#1d6b34"),
-            ("Fork delta beyond co-location: the uneven-TP + kv-boundary-aware auto-split (#116) lets a "
-             "co-located UNEVEN TP=5 boot even when num_kv_heads < tp (it constrains the per-rank Q-head split "
+            ("Fork delta beyond co-location: the asymmetric-TP + kv-boundary-aware auto-split (#116) lets a "
+             "co-located ASYMMETRIC TP=5 boot even when num_kv_heads < tp (it constrains the per-rank Q-head split "
              "to whole KV-head groups, fixing the #105 Q-split straddle).", "#1d6b34"),
             ("Models are dense-27B-GGUF and 35B-A3B-GGUF. The GGUF quant itself (format + K-quant / MMQ / "
-             "MMVQ kernels) is ggml/llama.cpp via upstream; the fork delta is only the uneven-TP adaptation "
+             "MMVQ kernels) is ggml/llama.cpp via upstream; the fork delta is only the asymmetric-TP adaptation "
              "(256-superblock alignment, MLP coarsening, MMQ-OOB fix under expert sharding, Qwen3.5/3.6+Gemma-4 "
              "arch adapters) and the MMVQ↔MMQ crossover tuning.", "#333"),
         ],
@@ -743,7 +743,7 @@ FEATURES = [
         ],
         "core": ("TP as a degree is standard sglang; the fork lifts two ceilings on it — the PHYSICAL GPU count "
                  "(co-location shares a GPU via MPS) and the model's KV-HEAD count (replicated-KV geometry, #62, "
-                 "lets num_kv_heads < tp), with uneven DCP adding a KV token-split on top. Tested via 5-rank MPS "
+                 "lets num_kv_heads < tp), with asymmetric DCP adding a KV token-split on top. Tested via 5-rank MPS "
                  "co-location on 3 cards as a feasibility proof — not a 5-card perf number, not a claim to have "
                  "invented TP."),
         "legend_keys": ["weights", "kv", "ctx", "free"],
@@ -767,7 +767,7 @@ FEATURES = [
              "needle-at-midpoint retrieved). It is an extension, not the primary store; the 262k extreme config "
              "deliberately shrinks the device pool and pushes most KV to host (40000 device / 64000 host slots), "
              "whereas in the normal case the freed worker VRAM holds the device KV.", "#8a5a2b"),
-            ("Right (illustrative): a homogeneous upstream even-TP holds the layer weights on EVERY rank, so each "
+            ("Right (illustrative): a homogeneous upstream symmetric-TP holds the layer weights on EVERY rank, so each "
              "identical card splits its VRAM between weights and KV — there are no weightless workers, so per-card "
              "context is bounded without more/bigger equal cards.", "#555"),
         ],
@@ -788,11 +788,11 @@ FEATURES = [
                 ("ctx", 0.7, "", E)]),
         ],
         "right_cards": [
-            ("identical 24 GB", "rank0 · even TP", 24, [
+            ("identical 24 GB", "rank0 · symmetric TP", 24, [
                 ("weights", 12.5, "weights (every rank)", E),
                 ("kv", 9.5, "KV", E),
                 ("ctx", 1.5, "", E)]),
-            ("identical 24 GB", "rank1 · even TP", 24, [
+            ("identical 24 GB", "rank1 · symmetric TP", 24, [
                 ("weights", 12.5, "weights (every rank)", E),
                 ("kv", 9.5, "KV", E),
                 ("ctx", 1.5, "", E)]),
@@ -838,7 +838,7 @@ FEATURES = [
              "scratch experts/layer stay on-GPU, 176/layer spill to pinned host RAM (host floor 24.4 GiB). "
              "Throughput 6.97 (eager) → 10.61 (graph) → 16.34 tok/s (graph+hotset).", "#333"),
             ("Right (illustrative): upstream runs the same 122B on a realistic homogeneous config too — 2 "
-             "identical RTX 3090 (24 GB each, even TP=2) plus --cpu-offload-gb, keeping part of the weights "
+             "identical RTX 3090 (24 GB each, symmetric TP=2) plus --cpu-offload-gb, keeping part of the weights "
              "on-device and the rest in system RAM. The whole right panel is estimated (stock cpu-offload was "
              "not benched here).", "#555"),
         ],
@@ -997,7 +997,7 @@ FEATURES = [
         "subtitle": "Fork on the rig vs upstream. Implemented but NOT perf-/VRAM-benchmarked — TTFT ESTIMATED, combined per-card VRAM not captured.",
         "sentences": [
             ("Left: the prefill instance runs solo TP=1 on the fast x16 5090 (zero cross-GPU traffic); the decode "
-             "instance runs uneven-TP=3 + DCP on the x4/x8 cards; KV is handed off via mooncake_tcp loopback. "
+             "instance runs asymmetric-TP=3 + DCP on the x4/x8 cards; KV is handed off via mooncake_tcp loopback. "
              "Both instances are CUDA-graph-covered by default (prefill = breakable graph, decode = full graph, "
              "MEASURED). Two instances = two weight copies; the combined per-card split was not dumped.", "#333"),
             ("Status: EXPERIMENTAL / work in progress — implemented (local_proxy.py, pd_disaggregation_hook.py; "
@@ -1038,7 +1038,7 @@ FEATURES = [
              "pay cross-card collective latency — on this rig (no P2P/NVLink, all PHB, one 3080 on x4) a hard "
              "floor that can only be hidden, the very slow lane PD keeps prefill off. If model+KV fit the fast "
              "card alone, decode SOLO is faster (skips all cross-card collectives); if not (large model / large "
-             "KV context), decode-KV MUST span the cards via uneven-DCP, the collective cost being the price of "
+             "KV context), decode-KV MUST span the cards via asymmetric-DCP, the collective cost being the price of "
              "fitting. If the decode TP=3 instance also lands on the 5090, two model copies (prefill + decode) "
              "coexist there — the unknown two-copy VRAM.", "#333"),
         ],
@@ -1114,9 +1114,9 @@ def eight_gpu():
     compose("15-eight-gpu-fleet.svg", W,
             "Appendix — Eight-GPU mixed fleet: how the capabilities COMPOSE (illustrative, not measured)",
             "5090 + 2x4090 + 3090 + 3x3080 + 2080Ti, mixed PCIe x16/x8/x4, no NVLink. Hypothetical — this rig has 3 GPUs.",
-            [("The settings compose on CAPACITY: uneven-TP shards, uneven-DCP token-KV, two weightless-KV workers "
+            [("The settings compose on CAPACITY: asymmetric-TP shards, asymmetric-DCP token-KV, two weightless-KV workers "
               "on the x4 cards, per-expert host offload (bottom bar), and PD-style prefill placement on the fast "
-              "x16 card. The entire figure is ESTIMATED (hatched): it was never built or measured. Upstream even-TP "
+              "x16 card. The entire figure is ESTIMATED (hatched): it was never built or measured. Upstream symmetric-TP "
               "would size the whole group to the 11 GB card's shard (or exclude it).", "#333")],
             draw, ["weights", "kv", "resident", "spill", "ctx", "free"], evidence=True)
 
@@ -1247,7 +1247,7 @@ def m12():
         b.append(text(mx + 12, my + 16, "design model — modeled, not benchmarked (needs S2)", size=9.2, weight="bold", color="#4a5568"))
         for i, s in enumerate(["32 KiB/token fp8, x4 link, DCP R=3 + overlap:",
                                 "32k ≈63 · 64k ≈31 · 128k ≈16 · 262k ≈7.6 tok/s",
-                                "worthwhile only with uneven DCP (262k ≈3.8 without)"]):
+                                "worthwhile only with asymmetric DCP (262k ≈3.8 without)"]):
             b.append(text(mx + 12, my + 32 + i * 14, "• " + s, size=8.4, color="#1a1a1a"))
         # Isolation matrix — how the DEVICE-RESIDENT (non-spilled) session runs during a spill.
         iy = my + 108

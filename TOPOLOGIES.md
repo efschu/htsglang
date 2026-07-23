@@ -10,7 +10,7 @@ For **each fork feature** there is **one side-by-side VRAM/RAM diagram**:
   KV cache, GDN/Mamba state, MoE experts, draft pools, CUDA graphs, CUDA context, free/reserve),
   plus a host-RAM bar.
 - **Right — the hypothetical *homogeneous* upstream config** for the same workload: **N identical
-  cards, even TP = card count**, with the divisibility reason that config lands where it does. The
+  cards, symmetric TP = card count**, with the divisibility reason that config lands where it does. The
   entire right panel is illustrative.
 
 The honest difference each diagram shows is a **capacity / hardware-premise** one — *use the
@@ -28,7 +28,7 @@ RAM (DDR)**. Colour meaning is consistent across every diagram:
   grey-blue — free / reserve; grey — CUDA context + overhead.
 - steel — full-attention layer (holds KV); violet — GDN / linear-attention layer; light violet —
   GDN recurrent state; pink — MTP / NEXTN draft head or draft pool; pale red-grey — a region an
-  upstream even-TP layout does not admit here.
+  upstream symmetric-TP layout does not admit here.
 
 ### Evidence convention (used in every diagram)
 
@@ -50,9 +50,12 @@ would otherwise appear.
 
 # The features, side by side
 
-## 1 — Uneven DCP = the KV / token axis
+## 1 — Asymmetric DCP = the KV / token axis
 
-<img src="topologies/01-uneven-dcp.svg" alt="Uneven DCP, KV/token axis: the foregrounded green KV token-bands are 374k/212k/212k tokens sized to each card's VRAM (28591:16464:16464 ≈ 1.74:1:1), decoupled from the grey weight shards (12.7/8.0/8.0 GiB ≈ 1.59:1:1); measured on FP8-27B TP=3 on the rig, versus a hypothetical 2x identical 24 GB even-TP=2 upstream config (estimated) that head-shards KV" width="100%">
+*Asymmetric decode context parallelism (asymmetric DCP) — a capacity-weighted KV token split across the
+ranks; the KV/token axis, decoupled from the weight split of §2.*
+
+<img src="topologies/01-asymmetric-dcp.svg" alt="Asymmetric DCP, KV/token axis: the foregrounded green KV token-bands are 374k/212k/212k tokens sized to each card's VRAM (28591:16464:16464 ≈ 1.74:1:1), decoupled from the grey weight shards (12.7/8.0/8.0 GiB ≈ 1.59:1:1); measured on FP8-27B TP=3 on the rig, versus a hypothetical 2x identical 24 GB symmetric-TP=2 upstream config (estimated) that head-shards KV" width="100%">
 
 **Read this diagram for the KV bands (green, foreground); the weight shards are the constant grey
 background here.** On the rig (measured), the KV cache is split along the **token axis** across three
@@ -60,26 +63,27 @@ mismatched cards — 374310 / 212109 / 212109 tokens — **sized to each card's 
 (28591 : 16464 : 16464 ≈ **1.74 : 1 : 1**), which is **decoupled from the weight ratio**
 (12.7 : 8.0 : 8.0 ≈ **1.59 : 1 : 1**). That gap is the whole point: a rank's KV band follows its VRAM,
 not its weight shard, so **aggregate context scales with the cards you already own** (measured 735k
-tokens, 2.81× the hand-budget start). The upstream-natural config is 2 identical 24 GB cards at even
+tokens, 2.81× the hand-budget start). The upstream-natural config is 2 identical 24 GB cards at symmetric
 TP=2: with **4 KV heads**, TP=3 is not legal (4 is not divisible by 3); upstream head-shards KV, so it
 does not grow aggregate token capacity as cards are added. The exact host-RAM floor for this non-spill
 config was not captured.
 
 **Do not confuse §1 with §2.** §1 (here) is the **KV / token axis**; §2 is the **weight axis**. On the
-rig they **run together** — `--rank-tp-ratio auto` sets the uneven-TP weight split *and* the uneven-DCP
+rig they **run together** — `--rank-tp-ratio auto` sets the asymmetric-TP weight split *and* the asymmetric-DCP
 KV token split at once — which is exactly why a rank's KV band is not tied to its weight shard.
 
-## 2 — Uneven TP = the weight axis
+## 2 — Asymmetric TP = the weight axis
 
-*Uneven TP (also **heterogeneous / asymmetric tensor parallelism** in the literature — HexGen, Hetis).*
+*Asymmetric tensor parallelism (asymmetric TP) — sizing the weight shards for heterogeneous / mismatched
+GPUs (cf. HexGen, Hetis).*
 
-<img src="topologies/02-uneven-tp.svg" alt="Uneven TP, weight axis: the foregrounded blue weight shards are 12.7/8.0/8.0 GiB (ratio 2:1:1, Q-heads 12/6/6) sized to each card's compute; the KV here is only the grey leftover remainder; measured on 27B TP=3 on the rig, versus a 2x identical 24 GB even-TP=2 upstream config (estimated) with equal shards" width="100%">
+<img src="topologies/02-asymmetric-tp.svg" alt="Asymmetric TP, weight axis: the foregrounded blue weight shards are 12.7/8.0/8.0 GiB (ratio 2:1:1, Q-heads 12/6/6) sized to each card's compute; the KV here is only the grey leftover remainder; measured on 27B TP=3 on the rig, versus a 2x identical 24 GB symmetric-TP=2 upstream config (estimated) with equal shards" width="100%">
 
 **Read this diagram for the weight shards (blue, foreground); the KV here is only the leftover
 remainder (grey).** `--rank-tp-ratio 2,1,1` sizes each **weight shard** to its card's **compute** —
 **Q heads split 12 / 6 / 6**, the 5090 carries the **2× shard** (measured shards 12.7 / 8.0 / 8.0 GiB,
 ratio **2 : 1 : 1**). KV on this diagram is just the measured remainder, not the message. Upstream
-even-TP gives every rank an **identical** shard, so it wants **N equal cards**; on mixed cards it would
+symmetric-TP gives every rank an **identical** shard, so it wants **N equal cards**; on mixed cards it would
 size every rank to the smallest and strand the surplus of the larger one. The earlier 68 / 97 tok/s
 decode figures used a contaminated bench and are withdrawn.
 
@@ -94,14 +98,14 @@ run**, not the same thing.
 `SGLANG_CROSS_*`); "drafter routing" and "cross-algorithm" refer to the same feature. The
 context-size gate stays "context-size-aware".*
 
-<img src="topologies/03-adaptive-drafter.svg" alt="Cross-algorithm drafter routing, fork TP=3 uneven, measured registry: solo-draft pool 4.58 GiB on rank0, rung tags DFLASH_k16 662 / EAGLE_k3 634 / EAGLE_k2 554 MiB, graphs 7.44 GiB, versus a homogeneous upstream 2x identical 24 GB even-TP=2 running one fixed drafter (NEXTN k=3, single residence, estimated)" width="100%">
+<img src="topologies/03-adaptive-drafter.svg" alt="Cross-algorithm drafter routing, fork TP=3 asymmetric, measured registry: solo-draft pool 4.58 GiB on rank0, rung tags DFLASH_k16 662 / EAGLE_k3 634 / EAGLE_k2 554 MiB, graphs 7.44 GiB, versus a homogeneous upstream 2x identical 24 GB symmetric-TP=2 running one fixed drafter (NEXTN k=3, single residence, estimated)" width="100%">
 
 Both draft algorithms are kept resident behind the **cross-algorithm** router
 (`--speculative-cross-algorithm`). Measured on the rig
-(TP=3 uneven): the **solo-draft pool costs 4.58 GiB on rank0**, the per-k rungs are itemised
+(TP=3 asymmetric): the **solo-draft pool costs 4.58 GiB on rank0**, the per-k rungs are itemised
 **DFLASH_k16 662 / EAGLE_k3 634 / EAGLE_k2 554 MiB**, and draft graphs push rank0's graph pool to
 7.44 GiB; the KV budget cost of the cross-gate is ~282k vs ~524k tokens without it. The homogeneous
-upstream reference is **2 identical 24 GB cards at even TP=2** running **one fixed drafter** (e.g.
+upstream reference is **2 identical 24 GB cards at symmetric TP=2** running **one fixed drafter** (e.g.
 NEXTN k=3) — a single draft residence, **no per-k rung tags, no dual-residence and no runtime routing**
 (upstream cannot switch draft *algorithm*). That side holds **less draft VRAM** but has **no runtime
 choice**. The honest read is a **capability / VRAM trade-off, not a verdict** — the fork spends more
@@ -127,7 +131,7 @@ one spilled. **Only KV spills; GDN/Mamba state always stays resident.** S1 is me
 when unused +0.16%**, host decode **8.1 tok/s @1k ctx**, restore **~0.4 s**, determinism **50/50 exact**
 host-vs-device. The host KV bytes (32 KiB/token × spilled tokens) are estimated from the measured cell
 size, and the long-context throughput curve (32k ≈63 … 262k ≈7.6 tok/s) is **modeled, not benchmarked**
-(needs S2), worthwhile only with uneven DCP active. Upstream has no per-request host-**decode** path:
+(needs S2), worthwhile only with asymmetric DCP active. Upstream has no per-request host-**decode** path:
 under KV pressure it swaps/recomputes or **pauses** the request — the device KV pool is a hard ceiling.
 
 The more important number is not the spilled request's rate but **how the device-resident (non-spilled)
@@ -160,8 +164,8 @@ split inside each budget was not dumped (*not captured*).
 **The deeper enabler.** Models with **few KV heads** can now run on configs with **far more GPUs than
 they have KV heads**. The **replicated-KV geometry (Task #62)** — each rank projects all KV heads
 replicated and holds one Q-head slice — removes `num_kv_heads` as the ceiling on the rank/GPU count
-(e.g. an A3B with **kv=2 at tp=5**). **Uneven DCP** is a bonus on top (a KV token-split across the
-ranks), and the **kv-boundary-aware auto-split (#116)** keeps a co-located *uneven* TP=5 bootable when
+(e.g. an A3B with **kv=2 at tp=5**). **Asymmetric DCP** is a bonus on top (a KV token-split across the
+ranks), and the **kv-boundary-aware auto-split (#116)** keeps a co-located *asymmetric* TP=5 bootable when
 `num_kv_heads < tp` (it constrains the per-rank Q-head split to whole KV-head groups, fixing the #105
 straddle). Neutral framing: TP itself is upstream; the fork lets you run it beyond the GPU-count and
 KV-head-count limits of the cards you have. The upstream side (standard TP=5 = 5 identical cards, one
@@ -169,7 +173,7 @@ rank each) is the honest contrast.
 
 The co-location run uses GGUF models (dense-27B-GGUF and 35B-A3B-GGUF). The **GGUF quantisation
 itself — the format plus the K-quant / MMQ / MMVQ kernels — comes from ggml/llama.cpp (via
-vLLM/upstream)**; the fork's delta is only the **uneven-TP adaptation** (256-superblock alignment,
+vLLM/upstream)**; the fork's delta is only the **asymmetric-TP adaptation** (256-superblock alignment,
 MLP coarsening, the MMQ out-of-bounds fix under expert sharding, and Qwen3.5/3.6 + Gemma-4 arch
 adapters) plus the MMVQ↔MMQ crossover tuning. The GGUF quant path is not a fork invention.
 
@@ -210,7 +214,7 @@ context multiplier is claimed.
 
 Throughput is **interconnect-bound, not a win**: ~25 tok/s @8k · ~7 @28k · ~1.5 @262k eager
 (graph+prefetch reaches exact-rung ~26–29). The deep-context floor is **block-attention compute +
-per-layer collectives on the slow workers, not H2D bandwidth**. Upstream even-TP holds the layer weights
+per-layer collectives on the slow workers, not H2D bandwidth**. Upstream symmetric-TP holds the layer weights
 on **every** rank, so each identical card splits its VRAM between weights and KV and reaches less context
 per card without more/bigger equal cards.
 
@@ -234,7 +238,7 @@ measured), and per-rank GPU is **25.5 / 16.6 / 15.4 GiB** (measured). Throughput
 no-offload (marlin ~1e-2 argmax at near-ties), the bar being coherence + self-determinism.
 
 Upstream also runs the same 122B on a realistic homogeneous config: **2 identical RTX 3090 (24 GB each,
-even TP=2) plus `--cpu-offload-gb`** ("How many GBs of RAM to reserve for CPU offloading",
+symmetric TP=2) plus `--cpu-offload-gb`** ("How many GBs of RAM to reserve for CPU offloading",
 `server_args.py`), keeping part of the weights on-device and the rest in system RAM. The whole right
 panel is estimated (stock cpu-offload was not benched here). The mechanism difference, stated neutrally:
 `--cpu-offload-gb` is a **generic per-layer-weight offload** — it streams the offloaded weights back in
@@ -283,7 +287,7 @@ estimated). The *mechanism* is diagram 13.
 
 ## 10 — PD-disaggregation: keep prefill off the slow lane (experimental / WIP)
 
-<img src="topologies/10-pd-disagg.svg" alt="PD-disagg (experimental/WIP): prefill solo TP=1 on the fast x16 5090 plus decode uneven-TP=3 on the x4/x8 3080s; both graph-covered (measured), two weight copies and the combined per-card split not captured; TTFT estimated, not benchmarked; distributed decode is a capacity choice, not a throughput win; upstream fuses one TP group or needs an identical PD fleet" width="100%">
+<img src="topologies/10-pd-disagg.svg" alt="PD-disagg (experimental/WIP): prefill solo TP=1 on the fast x16 5090 plus decode asymmetric-TP=3 on the x4/x8 3080s; both graph-covered (measured), two weight copies and the combined per-card split not captured; TTFT estimated, not benchmarked; distributed decode is a capacity choice, not a throughput win; upstream fuses one TP group or needs an identical PD fleet" width="100%">
 
 **Status: experimental / work in progress.** The path is implemented (`local_proxy.py`,
 `pd_disaggregation_hook.py`; #99 M1/M2) but **not perf- or VRAM-benchmarked** — the TTFT factor is
@@ -291,7 +295,7 @@ estimated). The *mechanism* is diagram 13.
 other WIP features here.
 
 The prefill instance runs **solo TP=1 on the fast x16 5090** (zero cross-GPU traffic); the decode
-instance runs **uneven-TP=3 + DCP on the x4/x8 cards**; KV is handed off via `mooncake_tcp` loopback.
+instance runs **asymmetric-TP=3 + DCP on the x4/x8 cards**; KV is handed off via `mooncake_tcp` loopback.
 **Both instances are CUDA-graph-covered by default** (prefill = breakable graph, decode = full graph,
 measured). Faster TTFT is **expected** because prefill avoids the ×4-lane collectives, but the TTFT
 factor is an **estimate, not benchmarked** on this no-P2P/no-NVLink rig.
@@ -305,7 +309,7 @@ PD keeps prefill off. Concretely:
 - **Model + KV fit the fast card alone** → running **decode solo** is faster, because it skips all
   cross-card collectives.
 - **They do not fit** (large model / large KV context) → decode-KV **must** span the cards via
-  uneven-DCP, and the collective cost is simply the price of fitting.
+  asymmetric-DCP, and the collective cost is simply the price of fitting.
 
 If the decode TP=3 instance also lands on the 5090, **two model copies (prefill + decode) coexist**
 there — the unknown two-copy VRAM above. Upstream runs PD across identical cards or a single fused TP
@@ -316,7 +320,7 @@ rig-specific. No throughput numbers are quoted — none were benchmarked.
 
 # Appendix — how the capabilities compose (illustrative, not measured)
 
-<img src="topologies/15-eight-gpu-fleet.svg" alt="Hypothetical 8-GPU mixed fleet combining uneven-TP, uneven-DCP, weightless-KV workers, expert offload and PD placement — the entire figure is hatched/estimated and was never built; this rig has 3 GPUs" width="100%">
+<img src="topologies/15-eight-gpu-fleet.svg" alt="Hypothetical 8-GPU mixed fleet combining asymmetric-TP, asymmetric-DCP, weightless-KV workers, expert offload and PD placement — the entire figure is hatched/estimated and was never built; this rig has 3 GPUs" width="100%">
 
 This figure is a **hypothetical illustration** of how the settings **compose on capacity** across a
 larger mixed fleet — it was **never built or measured** (this rig has 3 GPUs), so the whole diagram is
@@ -403,6 +407,6 @@ Upstream sizes memory by a global fraction (`--rank-gpu-memory-mib` + component 
   perf-/VRAM-benchmarked).
 - **GGUF attribution:** where GGUF appears (co-location, §5), the quantisation format and its
   K-quant / MMQ / MMVQ kernels come from ggml/llama.cpp via upstream; the fork's contribution is the
-  uneven-TP adaptation and crossover tuning, not the quant path itself.
+  asymmetric-TP adaptation and crossover tuning, not the quant path itself.
 - The SVGs are regenerated by [`topologies/gen.py`](topologies/gen.py) (`python3 topologies/gen.py`);
   they are self-contained (inline shapes + text only, no external fonts or images).
