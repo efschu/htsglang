@@ -51,6 +51,7 @@ COLORS = {
     "fullattn":  "#2f6f8f",  # full-attention layer (holds KV cache)
     "state":     "#c9b8e0",  # GDN recurrent state (fixed size)
     "mtp":       "#c65b9b",  # MTP / NEXTN draft head / solo-draft pool
+    "replkv":    "#c9a227",  # replicated / copied KV-heads (attention geometry)
     "bad":       "#e9d7d7",  # upstream: region a split's constraints do not admit here
 }
 LEGEND = [
@@ -66,9 +67,10 @@ LEGEND = [
     ("fullattn", "full-attention layer (KV)"),
     ("state",    "GDN recurrent state"),
     ("mtp",      "MTP draft head / draft pool"),
+    ("replkv",   "replicated KV-heads (attention)"),
     ("bad",      "upstream: not admitted here"),
 ]
-WHITE_TEXT = ("weights", "kv", "resident", "spill", "hostkv", "gdn", "fullattn", "mtp")
+WHITE_TEXT = ("weights", "kv", "resident", "spill", "hostkv", "gdn", "fullattn", "mtp", "replkv")
 
 FONT = 'font-family="DejaVu Sans, Verdana, Arial, sans-serif"'
 
@@ -752,9 +754,10 @@ FEATURES = [
         "sentences": [
             ("Left (measured, PRIMARY): --weightless-kv-fastlane, TP=3 + DCP. rank0 (5090) is the HEAD — it holds "
              "ALL layer weights (TP=1). rank1/2 (3080) are WEIGHTLESS meta-device workers with ZERO layer weights "
-             "(~14 GiB freed EACH, MEASURED); that freed VRAM instead carries DEVICE KV — KV token-shards + "
-             "KV-heads — and the workers compute the attention over it. The slow cards become on-device KV "
-             "DONORS: pooled device KV across the freed workers is the capacity win.", "#333"),
+             "(~14 GiB freed EACH, MEASURED). Each donor 3080 holds TWO things: (a) the REPLICATED / copied "
+             "KV-HEADS — TP=3 > num_kv_heads, so the KV heads are replicated (upstream-standard replicated-KV "
+             "geometry) and the workers COMPUTE THE ATTENTION over them; and (b) the token-sharded DEVICE-KV "
+             "cache in the freed VRAM. Pooled device KV across the freed workers is the capacity win.", "#333"),
             ("Secondary (extreme context only): an OPTIONAL host-KV tier sits ON TOP, used only for context that "
              "exceeds the pooled device KV — up to 262k tokens proven (~12.6 GiB pinned host, #134 B1/B2, "
              "needle-at-midpoint retrieved). It is an extension, not the primary store; the 262k extreme config "
@@ -773,11 +776,13 @@ FEATURES = [
                 ("ctx", 1.8, "", E)]),
             ("RTX 3080", "weightless worker", 20.5, [
                 ("weights", 0.3, "0 layer weights (meta-device)", M),
-                ("kv", 16.0, "device KV (freed VRAM)", M),
+                ("replkv", 2.6, "replicated KV-heads + attn", M),
+                ("kv", 13.1, "token-sharded device KV", M),
                 ("ctx", 0.7, "", E)]),
             ("RTX 3080", "weightless worker", 20.5, [
                 ("weights", 0.3, "0 layer weights (meta-device)", M),
-                ("kv", 16.0, "device KV (freed VRAM)", M),
+                ("replkv", 2.6, "replicated KV-heads + attn", M),
+                ("kv", 13.1, "token-sharded device KV", M),
                 ("ctx", 0.7, "", E)]),
         ],
         "right_cards": [
@@ -794,24 +799,28 @@ FEATURES = [
                  [("hostkv", 0.42, "~12.6 GB pinned — beyond device pool → 262k (#134)", M),
                   ("free", 0.58, "", M)]),
         "left_notes": [
-            ("PRIMARY win = pooled DEVICE KV on the freed workers (0 layer weights, ~14 GiB freed each, MEASURED; "
-             "head 22.8 / worker 3.7 GiB VRAM in the 262k run). The host tier is a SECONDARY extension for context "
-             "beyond that; it stages only ~C/dcp_size per rank (3.5x host-RAM saving), no unverified context "
-             "multiplier claimed.", "#1d6b34"),
+            ("Each worker holds the REPLICATED KV-heads (gold, the copied attention geometry — replicated-KV is "
+             "upstream-standard when TP > num_kv_heads) AND the token-sharded device-KV cache (green, the freed "
+             "~14 GiB). PRIMARY win = pooled DEVICE KV on the freed workers (head 22.8 / worker 3.7 GiB VRAM in "
+             "the 262k run). The host tier is a SECONDARY extension (~C/dcp_size per rank, 3.5x host-RAM saving); "
+             "no unverified context multiplier claimed.", "#1d6b34"),
             ("Throughput is interconnect-bound, NOT a \"fast\" claim: ~25 tok/s @8k · ~7 @28k · ~1.5 @262k eager "
-             "(graph+prefetch raises exact-rung to ~26-29). After #136a/#136b the PCIe wall is mostly hidden, so "
-             "the deep-context floor is now block-attention compute + per-layer collectives on the slow workers, "
-             "not H2D bandwidth.", "#333"),
+             "(graph+prefetch reaches exact-rung ~26-29). The deep-context floor is block-attention compute + "
+             "per-layer collectives on the slow workers, not H2D bandwidth.", "#333"),
+            ("Rig footnote (interconnect property, not a feature deficit): the H2D-prefetch latency-hiding "
+             "(#136b) gained only ~+14-15% at depth here — practically nothing measurable — because this rig has "
+             "no GPUDirect P2P (chipset limit), no NVLink, all links PHB, GPU0 on x4, so the worker collective "
+             "latency cannot be cut. With P2P / NVLink this could improve. Upstream is not implicated.", "#8a5a2b"),
         ],
         "right_notes": [
             ("Weights compete with KV on every identical card; no weightless workers. Illustrative sizes.", "#4a5568"),
         ],
         "core": ("the fork frees the worker cards of ALL weights (~14 GiB each) so their VRAM becomes pooled DEVICE "
-                 "KV — the slow cards turn into KV donors that also compute attention; an OPTIONAL host tier extends "
-                 "context to a proven 262k only beyond the pooled device KV. Upstream spends every identical card's "
-                 "VRAM on both weights and KV. A capacity feature — throughput is interconnect-bound on this "
-                 "no-NVLink rig, not a speed win."),
-        "legend_keys": ["weights", "kv", "hostkv", "ctx", "free"],
+                 "KV — the slow cards hold the replicated KV-heads and compute attention over them plus the "
+                 "token-sharded KV; an OPTIONAL host tier extends context to a proven 262k only beyond the pooled "
+                 "device KV. Upstream spends every identical card's VRAM on both weights and KV. A capacity feature "
+                 "— throughput is interconnect-bound on this no-NVLink rig, not a speed win."),
+        "legend_keys": ["weights", "replkv", "kv", "hostkv", "ctx", "free"],
     },
     # -- 7. MoE expert offload --------------------------------------------
     {

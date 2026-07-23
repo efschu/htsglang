@@ -27,8 +27,9 @@ RAM (DDR)**. Colour meaning is consistent across every diagram:
   expert scratch / prefetch; red — experts spilled to host RAM; teal — host-staged / spilled KV;
   grey-blue — free / reserve; grey — CUDA context + overhead.
 - steel — full-attention layer (holds KV); violet — GDN / linear-attention layer; light violet —
-  GDN recurrent state; pink — MTP / NEXTN draft head or draft pool; pale red-grey — a region an
-  upstream even-TP layout does not admit here.
+  GDN recurrent state; pink — MTP / NEXTN draft head or draft pool; gold — replicated / copied KV-heads
+  (the attention geometry when TP > num_kv_heads); pale red-grey — a region an upstream even-TP layout
+  does not admit here.
 
 ### Evidence convention (used in every diagram)
 
@@ -157,7 +158,7 @@ adapters) plus the MMVQ↔MMQ crossover tuning. The GGUF quant path is not a for
 
 ## 6 — Weightless-KV lane: free the workers of weights so their VRAM becomes device KV
 
-<img src="topologies/06-weightless-kv-lane.svg" alt="Weightless-KV lane: the 5090 head holds all layer weights (TP=1); the two 3080 workers hold zero layer weights (~14 GiB freed each, measured) and that freed VRAM instead carries device KV — token-shards plus KV-heads plus attention compute — making the slow cards pooled device-KV donors; an optional host KV tier (~12.6 GiB pinned) extends context only beyond the pooled device KV, to a proven 262k; upstream holds weights on every identical rank" width="100%">
+<img src="topologies/06-weightless-kv-lane.svg" alt="Weightless-KV lane: the 5090 head holds all layer weights (TP=1); the two 3080 donor workers hold zero layer weights (~14 GiB freed each, measured) and carry two things — the replicated/copied KV-heads (gold, the attention geometry they compute over) and the token-sharded device-KV cache (green) in the freed VRAM — making the slow cards pooled device-KV donors; an optional host KV tier (~12.6 GiB pinned) extends context only beyond the pooled device KV, to a proven 262k; upstream holds weights on every identical rank" width="100%">
 
 This is a **capacity** feature, not a "fast" one — the name is historical (`--weightless-kv-fastlane`)
 and does **not** mean the lane is fast.
@@ -165,9 +166,12 @@ and does **not** mean the lane is fast.
 **The core mechanism (primary).** On the rig (measured), **rank0 (5090) is the HEAD** holding **all**
 layer weights as collective-free TP=1, while **rank1/2 (3080) are weightless meta-device workers**
 carrying **zero layer weights** (**~14 GiB freed each, measured**). Crucially, that freed VRAM does not
-sit idle — it instead carries **device KV: KV token-shards + KV-heads**, and the workers **compute the
-attention** over it. So the slow cards become **on-device KV donors**: the capacity win is the **pooled
-device KV across the freed workers** (head 22.8 / worker 3.7 GiB VRAM in the 262k run, measured).
+sit idle — each donor 3080 holds **two** things: **(a) the replicated / copied KV-heads** — with
+**TP=3 > num_kv_heads** the KV heads are **replicated** (the upstream-standard replicated-KV geometry),
+and the workers **compute the attention over these heads**; and **(b) the token-sharded device-KV
+cache** in the freed VRAM. So the slow cards become **on-device KV donors** carrying both the attention
+geometry and the KV bytes: the capacity win is the **pooled device KV across the freed workers** (head
+22.8 / worker 3.7 GiB VRAM in the 262k run, measured).
 
 **The host tier (secondary, extreme context only).** An **optional** host-KV tier sits **on top**, used
 only for context that **exceeds the pooled device KV** — up to **262k tokens proven** (~12.6 GiB pinned
@@ -178,10 +182,19 @@ per rank), whereas **in the normal case the freed worker VRAM holds the device K
 context multiplier is claimed.
 
 Throughput is **interconnect-bound, not a win**: ~25 tok/s @8k · ~7 @28k · ~1.5 @262k eager
-(graph+prefetch raises exact-rung to ~26–29). After #136a/#136b the PCIe wall is mostly hidden, so the
-deep-context floor is now **block-attention compute + per-layer collectives on the slow workers, not
-H2D bandwidth**. Upstream even-TP holds the layer weights on **every** rank, so each identical card
-splits its VRAM between weights and KV and reaches less context per card without more/bigger equal cards.
+(graph+prefetch reaches exact-rung ~26–29). The deep-context floor is **block-attention compute +
+per-layer collectives on the slow workers, not H2D bandwidth**. Upstream even-TP holds the layer weights
+on **every** rank, so each identical card splits its VRAM between weights and KV and reaches less context
+per card without more/bigger equal cards.
+
+> **Rig footnote — an interconnect property, not a feature deficit (and no reflection on upstream).**
+> Explicitly hiding the PCIe transfer wall (H2D prefetch / overlap, #136b) gained only **~+14–15% at
+> depth on this rig — practically nothing measurable**. The reason is the rig's interconnect, not the
+> technique: this box has **no GPUDirect P2P** (a chipset limitation), **no NVLink**, **all links are
+> PHB**, and **GPU0 sits on a PCIe x4 lane**, so the worker-side collective latency that forms the deep
+> floor cannot be cut here. On a rig **with P2P / NVLink** this latency-hiding could improve. The same
+> caveat applies to the other offload / spill / staging-heavy paths (§4 session spill, §7 MoE offload,
+> §10 PD).
 
 ## 7 — MoE expert offload: a 122B on 3 mismatched cards
 
