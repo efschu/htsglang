@@ -102,7 +102,16 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
             batch.input_ids = prefill_gpu
         batch.prefill_input_ids_cpu = None
         batch.mix_running_indices = None
-    elif batch.input_ids is None and future_map.spec_algo.is_none():
+    elif batch.input_ids is None and (
+        future_map.spec_algo.is_none()
+        or getattr(batch, "kv_session_spill_tick", False)
+    ):
+        # kv-session-offload spill tick: a bs=1 host-resident decode carrying
+        # spec_algorithm=NONE inside an otherwise-spec server. _build_spill_batch
+        # stashed the session's last committed token into output_tokens_buf (via
+        # future_map.stash) and left input_ids=None; the server-global spec_algo
+        # gate would skip this resolution, so admit the spill-tick batch
+        # explicitly. Gather the last token exactly as the non-spec decode path.
         batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(

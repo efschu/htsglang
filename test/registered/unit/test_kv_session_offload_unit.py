@@ -25,6 +25,8 @@ from sglang.srt.managers.kv_session_offload import (
     select_spill_victim,
     sentinel_base,
     session_priority_key,
+    spec_decline_non_back_spill,
+    spec_overlap_deferred_commit_hazard,
     spill_graph_block_stage_counts,
     spill_graph_blocks_needed,
     spill_graph_enabled,
@@ -271,6 +273,32 @@ def test_minimal_eviction_none_sufficient_falls_back_to_youngest():
     reqs = [_FakeReq(0), _FakeReq(4), _FakeReq(7)]
     sizes = [900, 500, 300]
     assert select_spill_victim(reqs, sizes=sizes, need=5000) == 2
+
+
+def test_spec_back_only_removal_invariant():
+    # Flag path unchanged: without spec, ANY index may be spilled (middle too).
+    assert spec_decline_non_back_spill(False, 0, 4) is False
+    assert spec_decline_non_back_spill(False, 2, 4) is False
+    assert spec_decline_non_back_spill(False, 3, 4) is False
+    # Under spec, filter_batch is back-only: a middle/front victim is declined
+    # (-> stock retraction), only the back-most (idx == n-1) spill is allowed.
+    assert spec_decline_non_back_spill(True, 0, 4) is True
+    assert spec_decline_non_back_spill(True, 2, 4) is True
+    assert spec_decline_non_back_spill(True, 3, 4) is False
+    # Single running request: idx 0 is the back -> allowed regardless of spec.
+    assert spec_decline_non_back_spill(True, 0, 1) is False
+    assert spec_decline_non_back_spill(False, 0, 1) is False
+
+
+def test_spec_overlap_deferred_commit_hazard():
+    # Milestone fallback: spill declined only when spec is active AND overlap is
+    # on (the deferred multi-token commit would corrupt the sentinel tail).
+    assert spec_overlap_deferred_commit_hazard(True, True) is True
+    # Plain decode (no spec) is always safe -- spill + restore run fully.
+    assert spec_overlap_deferred_commit_hazard(False, True) is False
+    # Non-overlap spec commits synchronously -> no deferred-commit race.
+    assert spec_overlap_deferred_commit_hazard(True, False) is False
+    assert spec_overlap_deferred_commit_hazard(False, False) is False
 
 
 # ---------------------------------------------------------------------------

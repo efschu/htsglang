@@ -1920,6 +1920,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pass
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+        if getattr(batch, "kv_session_spill_tick", False):
+            # kv-session-offload SPILL TICK: the host-resident session decodes
+            # PLAIN bs=1 straight through the TARGET (base) worker -- NO
+            # draft / verify / draft_extend. While spilled the session has no
+            # device draft KV (the speculative draft was dropped at spill time
+            # and is re-drafted on restore from the resident GDN/mamba state);
+            # the hybrid head-device/tail-host attention is selected inside the
+            # backend by this same kv_session_spill_tick flag. This is exactly
+            # the plain-decode path a non-spec server's TpModelWorker takes for
+            # the tick -- the EAGLE wrapper must NOT force a draft here, because
+            # a draft over a bs=1 batch with spec_info=None builds a 0-row idle
+            # topk stub and the draft cuda-graph's foreach_copy then asserts
+            # ([1,1] vs [0,1]). spec_algorithm is NONE on this batch, so
+            # run_batch passes no on_publish and publishes the future itself.
+            return self.target_worker.forward_batch_generation(batch)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (

@@ -471,6 +471,60 @@ def select_spill_victim(
     return by_youth[0]
 
 
+def spec_decline_non_back_spill(spec_active: bool, idx: int, n_reqs: int) -> bool:
+    """Return True when a spill of request ``idx`` (out of ``n_reqs`` running)
+    must be DECLINED because speculative decoding is active and ``idx`` is not
+    the back-most request.
+
+    SPEC BACK-ONLY REMOVAL INVARIANT: under EAGLE/MTP, ScheduleBatch.filter_batch
+    may only drop requests FROM THE BACK. The spec_info (EagleDraftInput /
+    EagleVerifyInput) carries cross-forward draft state -- topk_p, topk_index,
+    hidden_states, and under overlap a deferred future_indices stub -- whose
+    filter collapses to a PREFIX slice, so removing a middle request desyncs the
+    remaining sessions' spec_info from the batch size (a [0,1] topk stub vs
+    raw_bs>=1 makes the draft graph's grouped foreach_copy assert). Stock
+    retract_decode obeys the identical rule: under spec it leaves the retraction
+    order unsorted and pops only from the end (see
+    _get_decode_retraction_order / "filter_batch API can only filter requests
+    from the back"). Pure function of the replicated batch order -> the same
+    decision on every rank of the communicator.
+    """
+    return spec_active and idx != n_reqs - 1
+
+
+def spec_overlap_deferred_commit_hazard(
+    spec_active: bool, enable_overlap: bool
+) -> bool:
+    """Return True when spilling under speculative decoding is UNSAFE this
+    iteration because a deferred multi-token commit would corrupt the sentinel
+    tail -- in which case try_spill declines and the stock (back-only, proven
+    safe under spec) retraction relieves the pressure instead.
+
+    THE HAZARD (MTP + overlap): a session's spec verify accepts accept_len(>=1)
+    tokens and writes their KV into req_to_token DURING the forward, but
+    kv_committed_len is bumped only later, in the deferred result processor
+    (batch_result_processor: `kv_committed_len += num_accept_tokens`). Under
+    overlap that deferred commit runs AFTER get_next_batch_to_run -> try_spill
+    in the SAME loop iteration (scheduler.event_loop_overlap: pop_and_process
+    follows the batch launch). So try_spill snapshots a STALE committed length,
+    writes the host-tail sentinels for the old length, and then the deferred
+    commit advances kv_committed_len past that tail -- leaving the freshly
+    accepted tokens' REAL slots sitting inside the sentinel region. The spill
+    tick's hybrid attention (which requires the host tail to be all sentinels)
+    then aborts ("non-sentinel slot id in a spill-tick tail").
+
+    MILESTONE FALLBACK (this function): decline the spill when spec is active
+    AND overlap is on. Plain decode (accept_len==1, committed bumped
+    synchronously in prepare_for_decode) is unaffected -- spill + partial
+    restore run fully there. Robust follow-up (so MTP sessions themselves
+    spill): back up the just-accepted tokens' KV to host and extend the
+    sentinel tail from the deferred-commit path, or settle the pending commit
+    before snapshotting. Rank-uniform: spec_active and enable_overlap are both
+    server-global, so every rank of the communicator decides identically.
+    """
+    return spec_active and enable_overlap
+
+
 class RestoreHysteresis:
     """Restore fires only after the memory condition has held for
     ``steps`` consecutive checks (anti-flutter)."""
@@ -972,10 +1026,74 @@ class KVSessionOffloadManager:
         if req.finished() or getattr(req, "to_finish", None) is not None:
             return False
 
+        # SPEC (MTP/EAGLE) BACK-ONLY REMOVAL INVARIANT (see
+        # spec_decline_non_back_spill): under speculative decoding
+        # filter_batch may only drop the back-most request, so if the
+        # policy-chosen victim is not last we decline and let stock retraction
+        # (also back-only under spec) relieve the pressure.
+        spec_active = not (
+            batch.spec_algorithm is None or batch.spec_algorithm.is_none()
+        )
+        if spec_decline_non_back_spill(spec_active, idx, len(batch.reqs)):
+            logger.debug(
+                "kv-session-offload: spec active, victim rid=%s at idx=%d is not "
+                "the back-most request (n=%d); declining spill (back-only under "
+                "spec) -> stock retraction handles the pressure.",
+                req.rid,
+                idx,
+                len(batch.reqs),
+            )
+            return False
+
+        # DEFERRED-COMMIT HAZARD (MTP + overlap): a spec verify writes the
+        # accepted tokens' KV during the forward but bumps kv_committed_len only
+        # in the deferred result processor, which under overlap runs AFTER this
+        # try_spill in the same iteration -- so the sentinel tail we are about to
+        # write for the stale length would be corrupted by that later commit
+        # (see spec_overlap_deferred_commit_hazard). Milestone: decline and let
+        # the stock back-only retraction relieve the pressure. Plain decode is
+        # unaffected (accept_len==1, committed bumped synchronously).
+        if spec_overlap_deferred_commit_hazard(
+            spec_active, bool(getattr(self.scheduler, "enable_overlap", False))
+        ):
+            logger.debug(
+                "kv-session-offload: spec+overlap deferred-commit hazard; "
+                "declining spill of rid=%s -> stock retraction (robust MTP spill "
+                "is a follow-up).",
+                req.rid,
+            )
+            return False
+
         L = int(batch.seq_lens_cpu[idx].item())
+        # MTP / speculative decoding OVER-ALLOCATES the main-pool KV:
+        # kv_allocated_len > kv_committed_len by the drafted-but-unverified
+        # slots at row[committed:allocated) (== num_draft_tokens). Free that
+        # speculative overhang FIRST -- real device slots, exactly what the
+        # stock retraction reclaims via pop_overallocated_kv_cache -- so the
+        # session's bookkeeping is clean (allocated == committed == L) and the
+        # committed tail can be spilled normally. The dropped draft is
+        # re-drafted on restore; the spill tick decodes plain (no spec) while
+        # on host. Rank-uniform: the overhang count is replicated. We free
+        # exactly [committed, allocated) (NOT pop_overallocated's
+        # _cache_commit_len, which can dip below committed under
+        # strip-thinking) so the committed KV we are about to spill stays
+        # intact.
+        if (
+            L == req.kv_committed_len
+            and req.kv_allocated_len > req.kv_committed_len
+            and not getattr(req, "kv_overallocated_freed", False)
+        ):
+            over = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, req.kv_committed_len : req.kv_allocated_len
+            ]
+            self.allocator.free(over.to(torch.int64))
+            req.kv_allocated_len = req.kv_committed_len
+            req.kv_overallocated_freed = True
+
         if L != req.kv_committed_len or L != req.kv_allocated_len:
-            # Never spill a request whose slot bookkeeping we do not fully
-            # understand (e.g. overallocation) -- stock retraction handles it.
+            # Never spill a request whose slot bookkeeping we STILL do not
+            # understand after reclaiming the speculative overhang -- stock
+            # retraction handles it.
             logger.warning(
                 "kv-session-offload: skip spill of rid=%s (seq_lens %d, "
                 "committed %d, allocated %d); falling back to retraction.",
@@ -1128,9 +1246,18 @@ class KVSessionOffloadManager:
         from sglang.srt.managers.schedule_batch import ScheduleBatch
         from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
         sch = self.scheduler
         device = sch.device
 
+        # The spill tick decodes PLAIN bs=1 (no speculative draft/verify) while
+        # the session is host-resident: a host-streamed decode has no device
+        # draft-KV, and spill_decode_alloc allocates exactly one sentinel slot
+        # per tick. Force spec_algorithm=NONE on the spill batch (the device
+        # session runs MTP normally; on restore the session rejoins the device
+        # batch and MTP resumes from its resident GDN state). Correct, just
+        # unaccelerated while spilled.
         batch = ScheduleBatch.init_new(
             reqs=[req],
             req_to_token_pool=sch.req_to_token_pool,
@@ -1138,7 +1265,7 @@ class KVSessionOffloadManager:
             tree_cache=sch.tree_cache,
             model_config=sch.model_config,
             enable_overlap=sch.enable_overlap,
-            spec_algorithm=sch.spec_algorithm,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
         )
         batch.kv_session_spill_tick = True
         # mrope models index batch.multimodal_inputs per request in
