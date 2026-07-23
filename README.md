@@ -232,9 +232,22 @@ curl http://HOST:PORT/generate \
 Fast-lane requests are admitted with the configured `--fast-lane-priority`
 (default `1000000`) in the priority-scheduling path;
 `--fast-lane-reserved-heavy-slots` keeps slots for regular requests and
-`--fast-lane-heavy-aging-ms` prevents starvation of aged heavy requests. The
-`"lane"` field is honored on the **native `/generate` endpoint only** — the
-OpenAI-compatible endpoints do not forward it.
+`--fast-lane-heavy-aging-ms` prevents starvation of aged heavy requests.
+
+The `"lane"` field is honored on both the native `/generate` endpoint (top-level
+field, as above) and the **OpenAI-compatible endpoints** — Chat Completions and
+Completions — where clients pass it in `extra_body`, exactly like `priority`. It
+is forwarded to `GenerateReqInput.lane`; an invalid value is rejected with HTTP
+`400` (`lane must be "fast" or omitted`).
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://HOST:PORT/v1", api_key="none")
+client.chat.completions.create(
+    model="...", messages=[{"role": "user", "content": "..."}],
+    extra_body={"lane": "fast"},
+)
+```
 
 ### Offloading and the weightless-KV lane
 
@@ -274,6 +287,50 @@ hierarchical/unified cache and PD disaggregation. Streaming is PCIe-bound
 the allocatable device-resident KV slots per rank to force the host-streaming
 path at small contexts (the all-resident-vs-streamed byte-parity gate). A server
 arg (not an env) so every rank sees an identical slot→tier map.
+
+#### Per-session KV offload (S1, experimental)
+
+A distinct host-tier mechanism from the weightless-KV lane. When the decode
+batch runs out of KV memory (after tree eviction), the **youngest** running
+session is spilled — its full-attention KV shard is backed up per rank into a
+pinned host pool and it keeps decoding from host via a separate eager `bs=1`
+tick interleaved between device-batch iterations, while its GDN/Mamba state
+stays resident. The oldest session is never evicted; a spilled session is
+restored FIFO with hysteresis once device KV frees up. The spilled session's
+decode is PCIe-bound (each step streams its whole context H2D; token-sharded
+uneven DCP splits that volume across ranks). Default off ⇒ every other path is
+byte-identical.
+
+**`--enable-kv-session-offload`** (flag, **experimental**) — Enable per-session
+KV offload to host RAM with FCFS eviction. *S1 scope, enforced fail-fast:*
+flashinfer attention backend, `page_size == 1`, exactly **one** spilled session
+at a time (further pressure falls back to stock retraction), single-node pure
+TP/DCP; rejects speculative decoding, PD disaggregation, `--enable-mixed-chunk`,
+`--weightless-kv-fastlane`, `--enable-hierarchical-cache` / `--enable-unified-memory`,
+and `--enable-hisparse`.
+
+**`--kv-session-offload-block-size <int>`** (default `8192`) — Streamed-block
+size in per-rank token slots: each spill-tick attention layer pulls the
+host-resident KV shard H2D through a staging buffer of this many slots per block,
+runs a partial flashinfer decode, and online-LSE-merges the partials (the same
+block loop as the weightless-KV lane). Also sizes the staging buffer. *Requires*
+`--enable-kv-session-offload`.
+
+**`--kv-session-offload-tick-interval <int>`** (default `1`, min `1`) — Minimum
+scheduler iterations between two spill ticks while device sessions run (`1` =
+alternate device/spill tick); larger values keep more device throughput and slow
+the spilled session. When no device batch runs, the spilled session ticks every
+iteration. *Requires* `--enable-kv-session-offload`.
+
+**`--kv-session-offload-restore-margin-tokens <int>`** (default `4096`, min `0`)
+— Restore the spilled session only once the allocator has `(session tokens +
+this margin)` free slots (anti-flutter headroom so a restored session does not
+immediately re-trigger a spill). *Requires* `--enable-kv-session-offload`.
+
+**`--kv-session-offload-restore-hysteresis-steps <int>`** (default `4`, min `1`)
+— The restore memory condition must hold for this many consecutive scheduler
+iterations before the session is copied back to device. *Requires*
+`--enable-kv-session-offload`.
 
 ### Persistence / hibernate
 
