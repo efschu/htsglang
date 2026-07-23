@@ -1209,7 +1209,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Point the synthetic batch at the reserved capture row + a
                 # host seq len that yields the capture rung.
                 rpi = self._sess_capture_rpi
-                L = int(self._sess_graph_capture_blocks) * self._sess_block_size
+                L = min(
+                    int(self._sess_graph_capture_blocks) * self._sess_block_size,
+                    self._sess_region_tokens,
+                )
                 forward_batch.kv_session_spill_tick = True
                 forward_batch.req_pool_indices[:1] = rpi
                 if forward_batch.seq_lens_cpu is not None:
@@ -3319,10 +3322,13 @@ class FlashInferAttnBackend(AttentionBackend):
             S = self._sess_S
             # Reserved capture row: the last req_pool slot (idle during warmup).
             rpi = int(self._sess_req_pool.req_to_token.shape[0]) - 1
-            # Worst case: rung full blocks of host tail on THIS rank + a head.
-            # Under DCP the per-rank owned tail is up to rung*B; add a device
-            # head so the head wrapper captures at a representative size.
-            L = rung * B
+            # Worst case for the rung, CAPPED at the region capacity so the
+            # per-rank owned tail never exceeds the region (else the
+            # region-high-water assert in _sess_prepare_step trips, and the
+            # host rows would run past the pool). num_blocks may then come out
+            # below `rung` -- fine: the capture uses _sess_graph_capture_blocks
+            # (= rung) regardless, and the surplus blocks capture empty.
+            L = min(rung * B, self._sess_region_tokens)
             self._sess_open_slot(rpi, region_base=0)
             self._sess_capture_active = True
             self._sess_capture_rpi = rpi
@@ -3370,7 +3376,12 @@ class FlashInferAttnBackend(AttentionBackend):
         replicated counts, so every rank takes the same graph/eager decision
         -- the per-layer DCP collective count is preserved either way (the
         eager spill tick issues the identical cp_lse sequence)."""
-        from sglang.srt.managers.kv_session_offload import spill_graph_pick_rung
+        from sglang.srt.managers.kv_session_offload import (
+            num_blocks_rank_uniform,
+            owned_counts_even,
+            owned_counts_weighted,
+            spill_graph_pick_rung,
+        )
 
         self._sess_graph_replay_blocks = None
         if not (self._sess_graph_enabled and self._sess_graph_ladder):
@@ -3381,16 +3392,35 @@ class FlashInferAttnBackend(AttentionBackend):
             return self._sess_graph_log_fallback(
                 f"spill-graph is bs=1, got bs={forward_batch.batch_size}"
             )
-        # The tail's host rows are dense [base, base+n_own) by construction
-        # (backup packs owned tokens contiguously), so -- unlike _wl -- no KV
-        # slot-layout contiguity check is needed. Derive the rank-uniform rung
-        # from the same state _sess_prepare_step will build (it runs after this
-        # in init_forward_metadata and stashes the plan onto _sess_spill).
-        st = getattr(self, "_sess_spill", None)
-        if st is None or st.graph_rung is None:
-            # prepare_step hasn't run yet, or the rung was over-ladder there.
-            return self._sess_graph_log_fallback("no graph rung for this tick")
-        self._sess_graph_replay_blocks = st.graph_rung
+        # Admission runs BEFORE _sess_prepare_step (init_forward_metadata) --
+        # so derive the RANK-UNIFORM host block count directly from the
+        # replicated row + seq len HERE, exactly as wl_graph_can_replay does
+        # (reading a not-yet-built st.graph_rung is the bug that forced eager
+        # fallback on every tick). The tail host rows are dense [base,
+        # base+n_own), so no contiguity check is needed (unlike _wl).
+        L = int(forward_batch.seq_lens_cpu[0].item())
+        row = self._sess_req_pool.req_to_token[
+            forward_batch.req_pool_indices[0], :L
+        ]
+        boundary = int((row < self._sess_host_base).sum().item())
+        dcp = len(self._sess_prefix) - 1
+        if self._sess_mode == "weighted":
+            residues = row[boundary:L].to(torch.int64) % self._sess_S
+            counts = owned_counts_weighted(residues, self._sess_prefix)
+        elif self._sess_mode == "even":
+            full = owned_counts_even(L, dcp)
+            headc = owned_counts_even(boundary, dcp)
+            counts = [full[r] - headc[r] for r in range(dcp)]
+        else:
+            counts = [L - boundary]
+        num_blocks = num_blocks_rank_uniform(counts, self._sess_block_size)
+        rung = spill_graph_pick_rung(num_blocks, self._sess_graph_ladder)
+        if rung is None:
+            return self._sess_graph_log_fallback(
+                f"tick needs {num_blocks} blocks > max rung "
+                f"{self._sess_graph_ladder[-1]}"
+            )
+        self._sess_graph_replay_blocks = rung
         return True
 
     def _sess_graph_bucket_state(self):
@@ -3562,11 +3592,15 @@ class FlashInferAttnBackend(AttentionBackend):
         replay) are sanitized to the (o=0, lse=-inf) contract in-graph so the
         online merge folds them as identity -- matching the eager loop's skip.
         NO .plan()/.item()/host sync inside (all hoisted to prepare_blocks)."""
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer
+
         st = self._sess_graph_bucket
         rung = self._sess_graph_capture_blocks
         spill = self._sess_spill
         fl = self._sess_full_layer_idx(layer)
         kv = self._sess_staging_kv
+        host = self._sess_host_pool
+        B = self._sess_block_size
         real_kv = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         neg_inf = float("-inf")
         # The current token's KV was already owner-written to host (real row or
@@ -3588,9 +3622,23 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # 3. Host tail blocks (fixed count == rung).
         for j in range(rung):
-            self._sess_host_pool.load_to_device_per_layer(
-                self._sess_full_pool, st.stage_ids[j], st.stage_dst[j],
-                fl, io_backend="kernel",
+            # BUGFIX: stage host rows into the separate STAGING buffer (the
+            # wrapper reads _sess_staging_kv), NOT the real device KV pool.
+            # Mirror the eager _sess_issue_copy: transfer_kv_per_layer host ->
+            # _sess_staging_k/v. A FIXED B-row copy (stage_ids[j] has B valid
+            # host rows: the first cnt real, the rest a valid pad row 0), so
+            # the captured shape is constant; the wrapper attends only [0, cnt)
+            # via its replay-below indptr. Using load_to_device_per_layer into
+            # _sess_full_pool wrote device indices [0, B) into the 3600-slot
+            # pool -> illegal access (df31391708).
+            transfer_kv_per_layer(
+                src_k=host.k_data_refs[fl],
+                dst_k=self._sess_staging_k,
+                src_v=host.v_data_refs[fl],
+                dst_v=self._sess_staging_v,
+                src_indices=st.stage_ids[j],
+                dst_indices=self._sess_stage_arange64[:B],
+                item_size=host.token_stride_size,
             )
             o_b, lse_b = st.wrappers[j].forward_return_lse(
                 q_full, kv,
