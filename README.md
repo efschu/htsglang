@@ -1,4 +1,6 @@
-# htsglang — sglang fork: heterogeneous tensor parallelism + Qwen3.5/3.6 GGUF
+# htsglang: heterogeneous, tier-aware sglang — uneven compute + VRAM pooling, session KV spill to system RAM, adaptive drafter routing, and improved GGUF support
+
+Adaptive drafter routing switches the speculative draft model at runtime — by context length (policy mode) or measured acceptance (bandit mode).
 
 **htsglang** ("split heterogeneous sglang") is a fork of
 [sgl-project/sglang](https://github.com/sgl-project/sglang) that makes a
