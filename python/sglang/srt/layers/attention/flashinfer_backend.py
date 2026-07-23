@@ -3367,6 +3367,14 @@ class FlashInferAttnBackend(AttentionBackend):
             self._sess_capture_active = True
             self._sess_capture_rpi = rpi
             saved = self._sess_req_pool.req_to_token[rpi, :L].clone()
+            # DECOUPLE S4: route the CAPTURED spill-graph collectives to comm B
+            # so the graph tick runs on comm B at replay (a CUDA graph bakes its
+            # NCCL comm at capture time). No-op unless decoupling is on
+            # (_DCP_SPILL is None). Rank-uniform: every rank captures the same
+            # rung with the flag set.
+            from sglang.srt.distributed.parallel_state import set_dcp_spill_active
+
+            set_dcp_spill_active(True)
             try:
                 # Whole-suffix synthetic spill: positions [0, L) are host tail
                 # (boundary 0) so counts -> rung full blocks. Residues p % S.
@@ -3379,6 +3387,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 self._sess_capture_active = False
                 self._sess_capture_rpi = None
                 self._sess_close_slot(rpi)
+                set_dcp_spill_active(False)
 
         return _ctx()
 
