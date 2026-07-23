@@ -1,16 +1,16 @@
-# htsglang: heterogeneous, tier-aware sglang — uneven compute + VRAM pooling, session KV spill to system RAM, adaptive drafter routing, and improved GGUF support
+# htsglang: heterogeneous, tier-aware sglang — asymmetric compute + VRAM pooling, session KV spill to system RAM, cross-algorithm drafter routing, and improved GGUF support
 
 **htsglang** ("split heterogeneous sglang") is a fork of
 [sgl-project/sglang](https://github.com/sgl-project/sglang) that makes a
 **single tensor-parallel group run well on mismatched GPUs** — cards with
 different VRAM sizes, and multiple ranks co-located on one physical GPU. It is
 the sglang sibling of the author's vLLM fork
-[**shvllm**](https://github.com/efschu/shvllm): the same heterogeneous-TP
+[**shvllm**](https://github.com/efschu/shvllm): the same asymmetric-TP
 feature set, built around sglang's native **RadixAttention** prefix cache.
 
-Beyond the core uneven-TP layout, the fork adds speculative-decoding extensions
+Beyond the core asymmetric-TP layout, the fork adds speculative-decoding extensions
 (solo draft placement, co-resident cross-algorithm drafting), a weightless-KV
-fast lane, MoE expert offloading, suspend-to-disk hibernation, and Qwen3.5/3.6 +
+lane, MoE expert offloading, suspend-to-disk hibernation, and Qwen3.5/3.6 +
 Gemma-4 GGUF loading. This document is the **reference for every fork-specific
 command-line flag and environment variable**; for a feature-by-feature
 comparison against upstream sglang and vLLM see
@@ -30,9 +30,9 @@ Fork: [github.com/efschu/htsglang](https://github.com/efschu/htsglang).
 
 ## Fork flag reference
 
-### Heterogeneous tensor parallelism and DCP
+### Asymmetric tensor parallelism and DCP
 
-Explicit rank placement and memory-proportional ("uneven") sharding of a single
+Explicit rank placement and memory-proportional ("asymmetric") sharding of a single
 TP group across mismatched cards.
 
 **`--rank-gpu-id <int,int,...>`** — Comma-separated CUDA device indices, one per
@@ -46,7 +46,7 @@ Co-locating ranks needs **NCCL ≥ 2.30** and a running **CUDA MPS** server.
 Example: `--tp-size 4 --rank-gpu-id 0,0,1,2` (two ranks share GPU 0).
 
 **`--rank-gpu-memory-mib <int | int,int,...>`** — Absolute per-rank memory
-budget in MiB. A single scalar applies uniformly to every rank (under even TP
+budget in MiB. A single scalar applies uniformly to every rank (under symmetric TP
 all shards are structurally equal). A per-rank list is permitted only together
 with `--rank-tp-ratio` (unequal shards) or the weightless-KV lane. The value is
 each rank's **entire** budget — it is converted once to that rank's physical-GPU
@@ -58,11 +58,11 @@ impossibility (`sum of co-located budgets ≤ NVML total`). *Required whenever*
 an explicit `--rank-gpu-memory-mib` value combined with `--mem-fraction-static`
 (mutually exclusive; the MiB budget replaces the global fraction in this mode).
 
-**`--rank-tp-ratio <int,int,... | auto | auto-performance>`** — Uneven TP: split
+**`--rank-tp-ratio <int,int,... | auto | auto-performance>`** — Asymmetric TP: split
 every sharded dimension (attention heads, GDN heads, dense-MLP columns, MoE
 expert partitions, KV pool) proportionally to per-rank integer weights instead
 of evenly. `sum(weights)` must divide every sharded dimension; identical entries
-are rejected (that is the even split — omit the flag). `auto` derives the
+are rejected (that is the symmetric split — omit the flag). `auto` derives the
 weights from `--rank-gpu-memory-mib`, or, when that is omitted, from the NVML
 totals of the assigned GPUs minus `--rank-auto-reserve-mib`. `auto-performance`
 starts from the same VRAM-auto split and additionally derives a dense-MLP family
@@ -105,10 +105,10 @@ NEXTN/EAGLE drafts): weight the shard widths by memory bandwidth so the lm_head
 read time balances across heterogeneous cards instead of being bounded by the
 slowest one. `auto` derives weights from the cached hardware profile.
 *Requires* an active `--rank-tp-ratio` plan. Default **off** — without the flag
-vocab sharding stays even (unchanged). `SGLANG_UNEVEN_VOCAB_VECTOR` overrides it.
+vocab sharding stays symmetric (unchanged). `SGLANG_UNEVEN_VOCAB_VECTOR` overrides it.
 
 **`--rank-kv-ratio <coupled | capacity | auto | int,int,...>`** (default
-`coupled`) — Uneven-DCP KV-token ownership vector, decoupled from the weight
+`coupled`) — Asymmetric-DCP KV-token ownership vector, decoupled from the weight
 split (moving a token's home rank only moves where its attention math runs).
 `coupled` keeps the previous env-gated behavior byte-identical. `capacity`
 (alias `auto`) installs the measured capacity-optimal vector after post-load
@@ -135,7 +135,7 @@ single-node TP; no PD disaggregation. DFLASH+solo additionally rejects
 `--rank-gpu-id`) whose TP rank hosts the solo draft; unset ⇒ rank 0. *Only valid
 with* `--speculative-draft-placement solo`.
 
-**Adaptive drafter routing** — switching the speculative draft model at runtime by context length (`policy` mode) or measured acceptance (`auto` / bandit mode) — is configured by the cross-algorithm flags below.
+**Cross-algorithm drafter routing** — switching the speculative draft model at runtime by context length (`policy` mode) or measured acceptance (`auto` / bandit mode) — is configured by the cross-algorithm flags below.
 
 **`--speculative-cross-algorithm`** (flag) — Co-resident cross-algorithm
 speculative decoding: load **both** a NEXTN/MTP draft and a DFLASH draft and
@@ -254,7 +254,10 @@ client.chat.completions.create(
 ### Offloading and the weightless-KV lane
 
 MoE expert offloading is env-only (see the environment-variable table). The
-weightless-KV fast lane is *experimental*.
+weightless-KV lane is *experimental*. (The `fastlane` in the flag name
+`--weightless-kv-fastlane` is historical and is **unrelated** to the separate
+fast-lane priority scheduling above; read it as the *weightless-KV lane*, its
+weight-bearing side being the *head lane*.)
 
 **`--weightless-kv-fastlane`** (flag, **experimental**) — One head rank holds the
 full model weights and runs Q/O-proj + FFN + GDN as collective-free TP=1; the
@@ -292,15 +295,20 @@ arg (not an env) so every rank sees an identical slot→tier map.
 
 #### Per-session KV offload (S1, experimental)
 
-A distinct host-tier mechanism from the weightless-KV lane. When the decode
+A distinct host-tier mechanism from the weightless-KV lane. Here a **session** is
+a single **in-flight sglang request** (one running sequence), **not** a multi-turn
+conversation — note that sglang separately uses "session" for a parent-chained
+multi-request conversation (`session/session_controller.py`), and the term is also
+used externally (LMCache / Mooncake); the flag label `session` is kept, but in
+this feature it always means an in-flight request. When the decode
 batch runs out of KV memory (after tree eviction), the **youngest** running
-session is spilled — its full-attention KV shard is backed up per rank into a
+request is spilled — its full-attention KV shard is backed up per rank into a
 pinned host pool and it keeps decoding from host via a separate eager `bs=1`
 tick interleaved between device-batch iterations, while its GDN/Mamba state
-stays resident. The oldest session is never evicted; a spilled session is
-restored FIFO with hysteresis once device KV frees up. The spilled session's
+stays resident. The oldest request is never evicted; a spilled request is
+restored FIFO with hysteresis once device KV frees up. The spilled request's
 decode is PCIe-bound (each step streams its whole context H2D; token-sharded
-uneven DCP splits that volume across ranks). Default off ⇒ every other path is
+asymmetric DCP splits that volume across ranks). Default off ⇒ every other path is
 byte-identical.
 
 **`--enable-kv-session-offload`** (flag, **experimental**) — Enable per-session
@@ -351,7 +359,7 @@ mismatch is a hard error (no silent cold-load fallback). *Required whenever*
 
 ### Diagnostics
 
-**`--determinism-logits-dump-dir <path>`** (**debug**) — Exports each TP rank's raw next-token logits row (single-sequence batches only, in the exact served dtype, captured before logit post-processing and sampling) to sequentially numbered, atomically written `torch.save` files tagged by rank and decode step. This is the capture surface for the determinism harness (`tests/determinism`), which compares these rows across repeated runs and across execution configurations to confirm that the fork's heterogeneous execution paths — uneven TP/DCP token/weight sharding, mixed GPU architectures (differing floating-point reduction order), speculative-decode verify, and CUDA-graph replay — leave the emitted token identical, and to localize any divergence to a specific rank and step. Default off; the default serving path is untouched.
+**`--determinism-logits-dump-dir <path>`** (**debug**) — Exports each TP rank's raw next-token logits row (single-sequence batches only, in the exact served dtype, captured before logit post-processing and sampling) to sequentially numbered, atomically written `torch.save` files tagged by rank and decode step. This is the capture surface for the determinism harness (`tests/determinism`), which compares these rows across repeated runs and across execution configurations to confirm that the fork's heterogeneous execution paths — asymmetric TP/DCP token/weight sharding, mixed GPU architectures (differing floating-point reduction order), speculative-decode verify, and CUDA-graph replay — leave the emitted token identical, and to localize any divergence to a specific rank and step. Default off; the default serving path is untouched.
 
 ---
 
@@ -367,7 +375,7 @@ holds diagnostic levers used during the determinism and offload bring-up.
 |---|---|---|
 | `SGLANG_UNEVEN_MLP_VECTOR` | unset | Per-rank dense-MLP weight vector; overrides `--rank-mlp-ratio`. Emitted as a restart hint by the KV-pool self-calibration. |
 | `SGLANG_UNEVEN_MOE_VECTOR` | unset | Per-rank fused-expert (MoE) weight vector; overrides `--rank-moe-ratio`. |
-| `SGLANG_UNEVEN_VOCAB_VECTOR` | unset | Per-rank vocab-shard vector; overrides `--rank-vocab-ratio`. Never falls back to the base plan — unset ⇒ even vocab. |
+| `SGLANG_UNEVEN_VOCAB_VECTOR` | unset | Per-rank vocab-shard vector; overrides `--rank-vocab-ratio`. Never falls back to the base plan — unset ⇒ symmetric vocab. |
 | `SGLANG_UNEVEN_TOKEN_VECTOR` | unset | Per-rank DCP KV-token ownership vector; overrides `--rank-kv-ratio`. |
 | `SGLANG_UNEVEN_DCP` / `SGLANG_UNEVEN_DCP_WEIGHTED` | `0` | Legacy env gate for the weighted-DCP token path; superseded by `--rank-kv-ratio` (kept for the `coupled` byte-identical path). |
 | `SGLANG_PERF_REPROBE` | `0` | Force a fresh `auto-performance` hardware micro-probe, ignoring the `~/.cache/sglang` profile. |
@@ -429,7 +437,7 @@ not needed for normal operation.
 
 ## Qwen3.5/3.6 and Gemma-4 GGUF loading
 
-The GGUF format and its K-quant dequant / MMQ / MMVQ compute kernels come from **ggml / llama.cpp**, integrated into the engine via vLLM / upstream sglang (the `sgl-kernel` GGUF kernels are ported ggml ops — `mmq.cuh` is copied from llama.cpp's `ggml-cuda/mmq.cu` — and the quant layer is adapted from vLLM). The fork's contribution is running GGUF under uneven TP/DCP (256-superblock alignment, MLP-unit coarsening, the MMQ out-of-bounds fix under expert sharding), the bespoke Qwen3.5/3.6 + Gemma-4 architecture adapters, and dispatch tuning (per-device MMVQ↔MMQ crossover, K-split MMVQ).
+The GGUF format and its K-quant dequant / MMQ / MMVQ compute kernels come from **ggml / llama.cpp**, integrated into the engine via vLLM / upstream sglang (the `sgl-kernel` GGUF kernels are ported ggml ops — `mmq.cuh` is copied from llama.cpp's `ggml-cuda/mmq.cu` — and the quant layer is adapted from vLLM). The fork's contribution is running GGUF under asymmetric TP/DCP (256-superblock alignment, MLP-unit coarsening, the MMQ out-of-bounds fix under expert sharding), the bespoke Qwen3.5/3.6 + Gemma-4 architecture adapters, and dispatch tuning (per-device MMVQ↔MMQ crossover, K-split MMVQ).
 
 The fork adds dedicated GGUF adapters for the **Qwen3.5 / 3.6 hybrid-GDN models**
 and **Gemma-4** — architectures upstream sglang's generic GGUF path cannot load.
@@ -438,14 +446,14 @@ On conversion `llama.cpp` rewrites several tensors (norm offset,
 `out_proj` permute); the adapters invert every transform. All K-quants
 (Q4_K_M … Q8_0) load coherent and greedy-deterministic. **NEXTN / MTP** is loaded
 straight from the same `.gguf` (`blk.<num_layers>` / `nextn.*`) as the draft
-model — no separate checkpoint — and composes with uneven TP (the 256-element
+model — no separate checkpoint — and composes with asymmetric TP (the 256-element
 K-quant superblock boundary is respected on every per-rank split). These use the
 upstream `--load-format gguf` / `--quantization gguf` flags; the fork delta is
 the adapter, so no new flag is introduced. The MMVQ↔MMQ decode-kernel crossover
 is picked per physical GPU (`SGLANG_GGUF_MMVQ_SAFE` to override).
 
 ```bash
-# GGUF Q6_K, uneven TP=3, MTP from the same file
+# GGUF Q6_K, asymmetric TP=3, MTP from the same file
 python -m sglang.launch_server \
   --model-path     /models/Qwen3.6-27B-...-Q6_K.gguf \
   --tokenizer-path /models/Qwen3.6-27B-...-GGUF \
@@ -461,13 +469,13 @@ python -m sglang.launch_server \
 **Validated:** Qwen3.6-27B FP8, **TP=3 on 1× RTX 5090 + 2× RTX 3080** — clean
 boot, ~297k `max_total_num_tokens` @ 32k context, coherent output, greedy decode
 bit-identical cold vs. warm. Hybrid GDN + full-attention models and NEXTN / MTP
-speculative decoding both work under the uneven layout.
+speculative decoding both work under the asymmetric layout.
 
 > **Modified upstream flags.** `--load-format gguf` / `--quantization gguf` are
 > extended to the Qwen3.5/3.6 and Gemma-4 arches; `--enable-hierarchical-cache`
-> (HiCache) is made correct under the uneven-TP/DCP layouts (global→owned-compact
+> (HiCache) is made correct under the asymmetric-TP/DCP layouts (global→owned-compact
 > KV index translation); the CUDA `--dcp-size > 1` + speculative-decoding guard
-> is relaxed for the uneven-hybrid weighted-DCP path.
+> is relaxed for the asymmetric-hybrid weighted-DCP path.
 
 ## Docker
 
@@ -492,13 +500,13 @@ pip install -e "python"
 **Runtime container (reference; rebuild required).** The image is CUDA 13.0,
 built for **sm75–sm120** (Turing … Blackwell / RTX 5090), with **NCCL 2.30.7**
 baked in (required for multi-rank-per-GPU), a HiCache file backend, and an
-ENV-driven entrypoint. Two overlays exist: a base heterogeneous-TP image
+ENV-driven entrypoint. Two overlays exist: a base asymmetric-TP image
 (FP8 / safetensors) and a thin overlay adding the Qwen3.5/3.6 GGUF adapter +
 ffmpeg (use the latter for GGUF models). Build them from the Dockerfiles in
 [`docker/`](./docker/) (`htsglang.Dockerfile`, `htsglang-qwen35-gguf.Dockerfile`)
 and publish under your own registry path; the tags below are placeholders.
 
-Pull and run the GGUF image (GGUF + uneven TP=3 + MTP):
+Pull and run the GGUF image (GGUF + asymmetric TP=3 + MTP):
 
 ```bash
 docker pull ghcr.io/<owner>/<gguf-image>:<tag>
