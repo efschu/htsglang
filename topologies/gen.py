@@ -51,7 +51,6 @@ COLORS = {
     "fullattn":  "#2f6f8f",  # full-attention layer (holds KV cache)
     "state":     "#c9b8e0",  # GDN recurrent state (fixed size)
     "mtp":       "#c65b9b",  # MTP / NEXTN draft head / solo-draft pool
-    "replkv":    "#c9a227",  # replicated / copied KV-heads (attention geometry)
     "bad":       "#e9d7d7",  # upstream: region a split's constraints do not admit here
 }
 LEGEND = [
@@ -67,10 +66,9 @@ LEGEND = [
     ("fullattn", "full-attention layer (KV)"),
     ("state",    "GDN recurrent state"),
     ("mtp",      "MTP draft head / draft pool"),
-    ("replkv",   "replicated KV-heads (attention)"),
     ("bad",      "upstream: not admitted here"),
 ]
-WHITE_TEXT = ("weights", "kv", "resident", "spill", "hostkv", "gdn", "fullattn", "mtp", "replkv")
+WHITE_TEXT = ("weights", "kv", "resident", "spill", "hostkv", "gdn", "fullattn", "mtp")
 
 FONT = 'font-family="DejaVu Sans, Verdana, Arial, sans-serif"'
 
@@ -688,22 +686,25 @@ FEATURES = [
     # -- 5. Multi-rank co-location (TP=5) ---------------------------------
     {
         "name": "05-tp5-colocation.svg",
-        "title": "5 — Multi-rank co-location: run MORE TP-ranks than physical GPUs by sharing a GPU via MPS",
-        "subtitle": "TP=5 is a standard sglang capability; the fork contribution is co-locating ranks so it runs on 3 cards, not 5.",
+        "title": "5 — Multi-rank co-location: TP is not capped by the GPU count — nor by the model's KV-head count",
+        "subtitle": "Feasibility proof via 5-rank MPS co-location on 3 cards (not a 5-card perf number). Deeper point: replicated-KV geometry (#62) lifts the KV-head ceiling on TP.",
         "sentences": [
-            ("Attribution: TP=5 is a STANDARD sglang capability (any TP degree — normally 5 physical cards, one "
-             "rank each). That is NOT the fork's feature. The fork contribution is MULTI-RANK CO-LOCATION — "
-             "running more TP-ranks than physical GPUs by letting several ranks share a GPU via MPS (+ NCCL "
-             ">= 2.30 for the co-located communicator).", "#333"),
-            ("Left (measured budgets): with co-location, a standard TP=5 config was TESTED on just 3 physical "
-             "cards — --tp 5 --rank-gpu-id 0,0,0,1,2 --rank-auto-reserve-mib 11500,11500,11500,3500,3500, MPS on: "
-             "three ranks time-slice the 5090 (~7 GB budget each) + one rank per 3080. This EMULATES TP=5, it is "
-             "NOT a 5-card perf equivalent (decode tok/s deliberately not 5-card-representative). Per-rank "
-             "weight/KV/GDN split inside each budget was not dumped.", "#333"),
-            ("Right (illustrative): a standard TP=5 needs 5 physical identical cards, one rank each; this 3-card "
-             "box cannot express TP=5 without co-location. That 5-cards-vs-3-cards is the honest contrast.", "#555"),
+            ("Scalability (feasibility): TP > physical-GPU-count is possible — several ranks can share one GPU via "
+             "MPS (+ NCCL >= 2.30 for the co-located communicator). It is not limited to 3 cards; 5 identical "
+             "cards would work too. We TESTED it the original way — 5-rank MPS co-location on 3 cards "
+             "(--tp 5 --rank-gpu-id 0,0,0,1,2, MPS, NCCL 2.30.7 side-loaded) — as a FEASIBILITY PROOF, not a "
+             "5-card perf number (decode tok/s deliberately not 5-card-representative: 3 ranks time-slice one "
+             "card). Bit-identical across two boots, needle from ~15k ctx (docs/advanced_features/multi_rank_emulation.md).", "#333"),
+            ("The deeper enabler: models with FEW KV heads can now run on configs with FAR MORE GPUs than they "
+             "have KV heads. The replicated-KV geometry (Task #62 — each rank projects all KV heads replicated "
+             "and holds one Q-head slice) removes num_kv_heads as the ceiling on the rank/GPU count (e.g. A3B "
+             "kv=2 on tp=5). Uneven DCP is a BONUS on top (KV token-split across the ranks). Per-rank weight/KV "
+             "split inside each budget was not dumped.", "#333"),
+            ("Right (illustrative): a standard TP=5 maps one rank per physical card, so it needs 5 identical "
+             "cards. Co-location and the KV-head lift are what let a model with 2 KV heads run at tp=5 on the "
+             "cards you have; the 5-cards-vs-3-cards picture is the honest contrast.", "#555"),
         ],
-        "left_label": "htsglang — co-location: standard TP=5 emulated on 3 cards via MPS",
+        "left_label": "htsglang — co-location: TP beyond GPU-count AND KV-head-count",
         "right_label": "upstream — standard TP=5 = 5x identical cards, 1 rank each",
         "left_cw": 140,
         "right_cw": 96,
@@ -740,10 +741,11 @@ FEATURES = [
             ("Standard TP=5 = 5 equal cards (one rank each); the honest contrast to co-location on 3 cards. "
              "Illustrative sizes.", "#4a5568"),
         ],
-        "core": ("TP=5 is standard sglang (normally 5 physical cards); the fork contribution is co-locating ranks "
-                 "so several share one GPU via MPS — here EMULATING/testing a TP=5 config on just 3 cards — plus "
-                 "the uneven + kv-boundary-aware split that lets a co-located uneven TP=5 boot. A capacity / "
-                 "emulation / testability difference, not a throughput advantage and not a claim to have invented TP=5."),
+        "core": ("TP as a degree is standard sglang; the fork lifts two ceilings on it — the PHYSICAL GPU count "
+                 "(co-location shares a GPU via MPS) and the model's KV-HEAD count (replicated-KV geometry, #62, "
+                 "lets num_kv_heads < tp), with uneven DCP adding a KV token-split on top. Tested via 5-rank MPS "
+                 "co-location on 3 cards as a feasibility proof — not a 5-card perf number, not a claim to have "
+                 "invented TP."),
         "legend_keys": ["weights", "kv", "ctx", "free"],
     },
     # -- 6. Weightless-KV lane --------------------------------------------
@@ -753,11 +755,12 @@ FEATURES = [
         "subtitle": "Fork on the rig (head holds all weights, workers become device-KV donors) vs upstream, where every rank splits VRAM between weights and KV.",
         "sentences": [
             ("Left (measured, PRIMARY): --weightless-kv-fastlane, TP=3 + DCP. rank0 (5090) is the HEAD — it holds "
-             "ALL layer weights (TP=1). rank1/2 (3080) are WEIGHTLESS meta-device workers with ZERO layer weights "
-             "(~14 GiB freed EACH, MEASURED). Each donor 3080 holds TWO things: (a) the REPLICATED / copied "
-             "KV-HEADS — TP=3 > num_kv_heads, so the KV heads are replicated (upstream-standard replicated-KV "
-             "geometry) and the workers COMPUTE THE ATTENTION over them; and (b) the token-sharded DEVICE-KV "
-             "cache in the freed VRAM. Pooled device KV across the freed workers is the capacity win.", "#333"),
+             "ALL layer weights (TP=1) and is the ONLY rank that projects K,V. rank1/2 (3080) are WEIGHTLESS "
+             "meta-device workers with ZERO layer weights (~14 GiB freed EACH, MEASURED); that freed VRAM holds "
+             "the RESIDENT token-sharded DEVICE-KV cache — spanning ALL KV heads but only this rank's token slice "
+             "(DCP splits the TOKEN axis, not the head axis; not replicated). Q (all heads) and the new token's "
+             "K,V are projected on the head and BROADCAST per step (transient, not resident); each worker runs "
+             "partial flash-attention over its KV-token-shard → LSE-merge. Pooled device KV is the capacity win.", "#333"),
             ("Secondary (extreme context only): an OPTIONAL host-KV tier sits ON TOP, used only for context that "
              "exceeds the pooled device KV — up to 262k tokens proven (~12.6 GiB pinned host, #134 B1/B2, "
              "needle-at-midpoint retrieved). It is an extension, not the primary store; the 262k extreme config "
@@ -774,15 +777,13 @@ FEATURES = [
                 ("weights", 17.0, "ALL layer weights (TP=1)", M),
                 ("kv", 4.0, "head KV", E),
                 ("ctx", 1.8, "", E)]),
-            ("RTX 3080", "weightless worker", 20.5, [
+            ("RTX 3080", "weightless worker · KV-only", 20.5, [
                 ("weights", 0.3, "0 layer weights (meta-device)", M),
-                ("replkv", 2.6, "replicated KV-heads + attn", M),
-                ("kv", 13.1, "token-sharded device KV", M),
+                ("kv", 15.7, "token-sharded device KV", M),
                 ("ctx", 0.7, "", E)]),
-            ("RTX 3080", "weightless worker", 20.5, [
+            ("RTX 3080", "weightless worker · KV-only", 20.5, [
                 ("weights", 0.3, "0 layer weights (meta-device)", M),
-                ("replkv", 2.6, "replicated KV-heads + attn", M),
-                ("kv", 13.1, "token-sharded device KV", M),
+                ("kv", 15.7, "token-sharded device KV", M),
                 ("ctx", 0.7, "", E)]),
         ],
         "right_cards": [
@@ -799,11 +800,13 @@ FEATURES = [
                  [("hostkv", 0.42, "~12.6 GB pinned — beyond device pool → 262k (#134)", M),
                   ("free", 0.58, "", M)]),
         "left_notes": [
-            ("Each worker holds the REPLICATED KV-heads (gold, the copied attention geometry — replicated-KV is "
-             "upstream-standard when TP > num_kv_heads) AND the token-sharded device-KV cache (green, the freed "
-             "~14 GiB). PRIMARY win = pooled DEVICE KV on the freed workers (head 22.8 / worker 3.7 GiB VRAM in "
-             "the 262k run). The host tier is a SECONDARY extension (~C/dcp_size per rank, 3.5x host-RAM saving); "
-             "no unverified context multiplier claimed.", "#1d6b34"),
+            ("Each worker holds ONLY the token-sharded device-KV cache (green, the freed ~14 GiB): all KV heads "
+             "for THIS rank's token slice, not replicated (DCP splits the token axis). Attention compute = Q + "
+             "the new K,V broadcast from the head each step (transient) → partial flash-attn over this rank's "
+             "KV-shard → LSE-merge; neither Q-heads nor projection weights are resident on the workers (Q is a "
+             "passed-through activation). PRIMARY win = pooled DEVICE KV (head 22.8 / worker 3.7 GiB VRAM, 262k "
+             "run). The host tier is a SECONDARY extension (~C/dcp_size per rank, 3.5x host-RAM saving); no "
+             "unverified context multiplier claimed.", "#1d6b34"),
             ("Throughput is interconnect-bound, NOT a \"fast\" claim: ~25 tok/s @8k · ~7 @28k · ~1.5 @262k eager "
              "(graph+prefetch reaches exact-rung ~26-29). The deep-context floor is block-attention compute + "
              "per-layer collectives on the slow workers, not H2D bandwidth.", "#333"),
@@ -816,11 +819,12 @@ FEATURES = [
             ("Weights compete with KV on every identical card; no weightless workers. Illustrative sizes.", "#4a5568"),
         ],
         "core": ("the fork frees the worker cards of ALL weights (~14 GiB each) so their VRAM becomes pooled DEVICE "
-                 "KV — the slow cards hold the replicated KV-heads and compute attention over them plus the "
-                 "token-sharded KV; an OPTIONAL host tier extends context to a proven 262k only beyond the pooled "
-                 "device KV. Upstream spends every identical card's VRAM on both weights and KV. A capacity feature "
-                 "— throughput is interconnect-bound on this no-NVLink rig, not a speed win."),
-        "legend_keys": ["weights", "replkv", "kv", "hostkv", "ctx", "free"],
+                 "KV — the slow cards hold only the token-sharded KV bytes (all heads, their own token slice) and "
+                 "run attention over Q + K,V broadcast from the head; an OPTIONAL host tier extends context to a "
+                 "proven 262k only beyond the pooled device KV. Upstream spends every identical card's VRAM on both "
+                 "weights and KV. A capacity feature — throughput is interconnect-bound on this no-NVLink rig, not "
+                 "a speed win."),
+        "legend_keys": ["weights", "kv", "hostkv", "ctx", "free"],
     },
     # -- 7. MoE expert offload --------------------------------------------
     {
