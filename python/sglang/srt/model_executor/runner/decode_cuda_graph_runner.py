@@ -953,7 +953,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.is_weightless_head
             or self.model_runner.is_weightless_worker
         )
-        if _wl_lane:
+        # S5 spill-tick graph capture is ALSO guard-free (its per-layer DCP
+        # cp_lse collectives are captured symmetrically on every rank; the
+        # guard's per-step gloo handshake is a host-sync that cannot be
+        # recorded). Rank-uniform: every DCP rank builds this runner and hits
+        # the toggle at the same point (#133 lockstep). GPU-JUSTIFICATION:
+        # confirm the disable window covers exactly the spill capture region.
+        _guard_off = _wl_lane or self._sess_block_graph
+        if _guard_off:
             from sglang.srt.layers.dcp.collective_guard import set_guard_enabled
 
             set_guard_enabled(False)
@@ -982,7 +989,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.enable_profile_cuda_graph:
                 self._post_process_after_profile(prof)
         finally:
-            if _wl_lane:
+            if _guard_off:
                 # Restore the guard for the eager prefill/extend path.
                 set_guard_enabled(True)
 
@@ -1048,6 +1055,64 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
                     self.capture_one_shape(bs, forward, stream_idx, variant_label)
+
+            # S5 spill-tick graph: an ADDITIONAL bs=1 capture pass, one graph
+            # per rung (largest-first for memory-pool reuse). PORT of the
+            # #136a rung loop above; the spill tick is a SEPARATE batch, so it
+            # is captured beside the normal decode graphs (not instead of
+            # them). Rank-uniform SYMMETRIC capture: every DCP rank builds this
+            # runner and iterates the IDENTICAL rung sequence, so the capture-
+            # time per-layer cp_lse collectives pair up (#133 lockstep). Only
+            # bs==1 (the spill tick is always bs=1).
+            if self._sess_block_graph and bs == 1:
+                try:
+                    for rung in sorted(
+                        self._sess_attn._sess_graph_ladder, reverse=True
+                    ):
+                        self._sess_attn._sess_graph_capture_blocks = rung
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.num_tokens_per_bs,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            self._sess_capture_one_spill_rung(
+                                bs, forward, stream_idx, rung
+                            )
+                        self._sess_attn._sess_graph_captured_rungs.add(rung)
+                finally:
+                    self._sess_attn._sess_graph_capture_blocks = None
+
+    def _sess_capture_one_spill_rung(
+        self, bs, forward, stream_idx, rung
+    ) -> None:
+        """Capture one spill-tick decode graph for ``rung`` (PORT of the
+        weightless head's capture_one_shape rung recording). Reuses the normal
+        capture harness (capture_prepare + model.forward record) but marks the
+        synthetic batch as a spill tick at the rung worst case, so every full-
+        attention layer routes to _sess_blockwise_decode_return_lse_graph and
+        the whole tick forward is recorded.
+
+        GPU-JUSTIFICATION (the messagent wires + iterates these; the STRUCTURE
+        hugs the head capture_one_shape so tuning is minimal):
+          * _sess_install_capture_state builds a SYNTHETIC spilled session
+            (backend region slot + sentinel req_to_token row + host-pool rows)
+            so _sess_prepare_step yields a rung-max plan (block FULL, head at
+            max) -- capture-time state install/teardown boundaries;
+          * the exact seq_lens / req_pool_indices the synthetic tick needs;
+          * capture-region boundaries + event ordering."""
+        # Install synthetic spilled-session state for the rung worst case.
+        install = getattr(self._sess_attn, "_sess_install_capture_state", None)
+        ctx = (
+            install(bs, rung)
+            if install is not None
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            # Reuse the head capture path; capture_prepare's batch is tagged as
+            # a spill tick by the backend's install context (it sets the flag
+            # + synthetic state that _sess_prepare_step reads).
+            self.capture_one_shape(bs, forward, stream_idx, f"sessblk{rung}")
 
     def capture_one_shape(
         self,

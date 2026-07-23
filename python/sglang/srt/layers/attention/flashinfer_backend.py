@@ -1191,6 +1191,32 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        # S5 spill-tick graph: out-of-graph prep for the capture / replay of a
+        # spill tick (PORT of the _wl out-graph -> _wl_graph_prepare_blocks
+        # path). During the spill capture pass `_sess_capture_active` tags the
+        # synthetic batch as a spill tick at the rung worst case; on replay the
+        # spill flag + admitted rung are already set. Build the per-step state
+        # (st + graph_plan) and plan/refill the fixed graph buffers, then
+        # return (the block wrappers are on the graph bucket, not the decode
+        # metadata). GPU-JUSTIFICATION: whether ALL of prepare must run here vs
+        # partly in the captured body, and the exact seq_lens the synthetic
+        # tick carries, are validated on GPU.
+        if getattr(self, "_sess_capture_active", False) or (
+            getattr(forward_batch, "kv_session_spill_tick", False)
+            and getattr(self, "_sess_graph_replay_blocks", None) is not None
+        ):
+            if getattr(self, "_sess_capture_active", False):
+                # Point the synthetic batch at the reserved capture row + a
+                # host seq len that yields the capture rung.
+                rpi = self._sess_capture_rpi
+                L = int(self._sess_graph_capture_blocks) * self._sess_block_size
+                forward_batch.kv_session_spill_tick = True
+                forward_batch.req_pool_indices[:1] = rpi
+                if forward_batch.seq_lens_cpu is not None:
+                    forward_batch.seq_lens_cpu[:1] = L
+            # Derive st (+ graph_plan) and plan/refill the graph buffers.
+            self._sess_spill = self._sess_prepare_step(forward_batch)
+            return
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
@@ -2644,6 +2670,9 @@ class FlashInferAttnBackend(AttentionBackend):
         # Rungs whose spill-tick graph the capture pass has recorded (GPU pass
         # populates this; empty -> every spill tick stays eager).
         self._sess_graph_captured_rungs = set()
+        # Set only inside the spill-tick capture pass (synthetic session).
+        self._sess_capture_active = False
+        self._sess_capture_rpi = None
         if self._sess_graph_enabled:
             max_blocks = spill_graph_blocks_needed(
                 self._sess_region_tokens, self._sess_block_size
@@ -2941,12 +2970,19 @@ class FlashInferAttnBackend(AttentionBackend):
                 # if so, move this call there. Gated on _sess_graph_captured so
                 # flag-on-without-capture never builds graph state.
                 self._sess_graph_prepare_blocks(in_capture=False)
-        # Prime the double buffer: the first two copies (layer 0, and with
-        # k_local == 1 already layer 1) start NOW, overlapping everything
-        # that runs before the first full-attention layer.
-        while st.issue_idx < min(2, len(sched)):
-            self._sess_issue_copy(st, st.issue_idx)
-            st.issue_idx += 1
+        # Prime the double buffer for the EAGER block loop. Skip it on the
+        # graph path (capture or an admitted replay): the graph body issues its
+        # own copies, and priming here would run copy-stream ops outside the
+        # captured region.
+        graph_active = self._sess_graph_capture_blocks is not None or (
+            st.graph_rung is not None
+            and self._sess_graph_replay_blocks == st.graph_rung
+            and self._sess_graph_captured(st.graph_rung)
+        )
+        if not graph_active:
+            while st.issue_idx < min(2, len(sched)):
+                self._sess_issue_copy(st, st.issue_idx)
+                st.issue_idx += 1
         return st
 
     def _sess_issue_copy(self, st, idx):
@@ -3256,6 +3292,55 @@ class FlashInferAttnBackend(AttentionBackend):
     #   * #136b side-stream prefetch is DEFERRED (single-region serial copies
     #     on the main stream, the byte-identical #136a-no-prefetch behavior).
     # ------------------------------------------------------------------
+
+    def _sess_install_capture_state(self, bs: int, rung: int):
+        """Context manager: install a SYNTHETIC spilled-session state so the
+        per-rung capture records the rung worst case (every block FULL, head at
+        max), then tear it down. Returns a contextmanager used by the decode
+        graph runner's spill capture pass.
+
+        Sets `_sess_capture_active` -> init_forward_metadata_out_graph treats
+        the capture batch as a spill tick and runs _sess_prepare_step +
+        _sess_graph_prepare_blocks(in_capture=True).
+
+        GPU-JUSTIFICATION (messagent wires/iterates on GPU):
+          * the reserved capture req_pool row (must not clobber a live request;
+            during warmup capture the pool is idle -- confirm on GPU);
+          * the synthetic seq_len / sentinel row that makes _sess_prepare_step
+            yield exactly `rung` full blocks + a max device head;
+          * install/teardown boundaries vs the capture region."""
+        from contextlib import contextmanager
+
+        from sglang.srt.managers.kv_session_offload import make_sentinels
+
+        @contextmanager
+        def _ctx():
+            B = self._sess_block_size
+            S = self._sess_S
+            # Reserved capture row: the last req_pool slot (idle during warmup).
+            rpi = int(self._sess_req_pool.req_to_token.shape[0]) - 1
+            # Worst case: rung full blocks of host tail on THIS rank + a head.
+            # Under DCP the per-rank owned tail is up to rung*B; add a device
+            # head so the head wrapper captures at a representative size.
+            L = rung * B
+            self._sess_open_slot(rpi, region_base=0)
+            self._sess_capture_active = True
+            self._sess_capture_rpi = rpi
+            saved = self._sess_req_pool.req_to_token[rpi, :L].clone()
+            try:
+                # Whole-suffix synthetic spill: positions [0, L) are host tail
+                # (boundary 0) so counts -> rung full blocks. Residues p % S.
+                res = torch.arange(L, device=saved.device, dtype=torch.int64) % S
+                sent = make_sentinels(self._sess_host_base, S, res, start=0)
+                self._sess_req_pool.req_to_token[rpi, :L] = sent.to(torch.int32)
+                yield
+            finally:
+                self._sess_req_pool.req_to_token[rpi, :L] = saved
+                self._sess_capture_active = False
+                self._sess_capture_rpi = None
+                self._sess_close_slot(rpi)
+
+        return _ctx()
 
     def _sess_graph_captured(self, rung) -> bool:
         """Whether a spill-tick graph for ``rung`` has been captured. The
