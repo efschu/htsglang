@@ -920,18 +920,21 @@ FEATURES = [
     # -- 10. PD-disaggregation --------------------------------------------
     {
         "name": "10-pd-disagg.svg",
-        "title": "10 — PD-disaggregation: pin prefill to the fast x16 card so its collectives skip the x4 lane",
-        "subtitle": "Fork on the rig vs upstream, which fuses one TP group or needs a homogeneous PD fleet.",
+        "title": "10 — PD-disaggregation (EXPERIMENTAL / WIP): pin prefill to the fast x16 card so its collectives skip the x4 lane",
+        "subtitle": "Fork on the rig vs upstream. Implemented but NOT perf-/VRAM-benchmarked — TTFT ESTIMATED, combined per-card VRAM not captured.",
         "sentences": [
             ("Left: the prefill instance runs solo TP=1 on the fast x16 5090 (zero cross-GPU traffic); the decode "
              "instance runs uneven-TP=3 + DCP on the x4/x8 cards; KV is handed off via mooncake_tcp loopback. "
              "Both instances are CUDA-graph-covered by default (prefill = breakable graph, decode = full graph, "
              "MEASURED). Two instances = two weight copies; the combined per-card split was not dumped.", "#333"),
+            ("Status: EXPERIMENTAL / work in progress — implemented (local_proxy.py, pd_disaggregation_hook.py; "
+             "#99 M1/M2) but NOT perf- or VRAM-benchmarked: the TTFT factor is ESTIMATED and the combined "
+             "per-card VRAM is UNKNOWN (not captured), consistent with how other WIP features are marked here.", "#8a5a2b"),
             ("Right (illustrative): upstream runs PD across identical cards (a prefill pool + a decode pool of "
              "equal GPUs) or a single fused TP group. On identical cards there is no x4 lane to route around, so "
              "the fork's specific advantage (isolating the slow lane) is rig-specific.", "#555"),
         ],
-        "left_label": "htsglang — prefill solo on 5090 + decode TP=3 on 3080s",
+        "left_label": "htsglang — prefill solo on 5090 + decode TP=3 on 3080s (WIP)",
         "right_label": "upstream — identical PD fleet / fused TP",
         "left_cw": 140,
         "right_cw": 140,
@@ -957,13 +960,22 @@ FEATURES = [
             ("Graph coverage MEASURED; the two-weight-copy combined per-card VRAM was never registry-dumped "
              "(\"not captured\"). Faster TTFT is EXPECTED (prefill avoids the x4-lane collectives) but the TTFT "
              "factor is an ESTIMATE, not benchmarked on this no-P2P/no-NVLink rig.", "#1d6b34"),
+            ("Distributed decode is a CAPACITY choice, not a throughput win: decode is latency-sensitive "
+             "(per-layer collectives EVERY step), so spreading it across the mixed cards makes every decode step "
+             "pay cross-card collective latency — on this rig (no P2P/NVLink, all PHB, one 3080 on x4) a hard "
+             "floor that can only be hidden, the very slow lane PD keeps prefill off. If model+KV fit the fast "
+             "card alone, decode SOLO is faster (skips all cross-card collectives); if not (large model / large "
+             "KV context), decode-KV MUST span the cards via uneven-DCP, the collective cost being the price of "
+             "fitting. If the decode TP=3 instance also lands on the 5090, two model copies (prefill + decode) "
+             "coexist there — the unknown two-copy VRAM.", "#333"),
         ],
         "right_notes": [
             ("On identical cards there is no x4 bottleneck to isolate. Illustrative sizes.", "#4a5568"),
         ],
-        "core": ("the fork pins prefill to the fast x16 card so its collectives skip the x4 lane; upstream fuses one "
-                 "TP group (prefill uses every link) or needs a homogeneous PD fleet — a placement / latency-hiding "
-                 "difference that is rig-specific and interconnect-bound here, not a raw-speed win."),
+        "core": ("PD pins prefill to the fast x16 card so its collectives skip the x4 lane; whether decode runs "
+                 "solo on the fast card or is distributed across the mixed cards is a CAPACITY / PLACEMENT choice, "
+                 "not a throughput win — distributed decode pays per-step cross-card collective latency that is "
+                 "interconnect-bound on this no-P2P/no-NVLink rig. Experimental / not benchmarked."),
         "legend_keys": ["weights", "kv", "hostkv", "free"],
     },
 ]

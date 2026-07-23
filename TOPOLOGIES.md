@@ -203,18 +203,36 @@ queue; a fast request is never itself spilled). This is a **scheduling-behaviour
 off** (default path byte-unchanged); the reserved-floor byte cost was not registry-dumped (drawn
 estimated). The *mechanism* is diagram 13.
 
-## 10 — PD-disaggregation: keep prefill off the slow lane
+## 10 — PD-disaggregation: keep prefill off the slow lane (experimental / WIP)
 
-<img src="topologies/10-pd-disagg.svg" alt="PD-disagg: prefill solo TP=1 on the fast x16 5090 plus decode uneven-TP=3 on the x4/x8 3080s; both graph-covered (measured), two weight copies and the combined per-card split not captured; upstream fuses one TP group or needs an identical PD fleet" width="100%">
+<img src="topologies/10-pd-disagg.svg" alt="PD-disagg (experimental/WIP): prefill solo TP=1 on the fast x16 5090 plus decode uneven-TP=3 on the x4/x8 3080s; both graph-covered (measured), two weight copies and the combined per-card split not captured; TTFT estimated, not benchmarked; distributed decode is a capacity choice, not a throughput win; upstream fuses one TP group or needs an identical PD fleet" width="100%">
+
+**Status: experimental / work in progress.** The path is implemented (`local_proxy.py`,
+`pd_disaggregation_hook.py`; #99 M1/M2) but **not perf- or VRAM-benchmarked** — the TTFT factor is
+**estimated** and the combined per-card VRAM is **unknown (not captured)**, marked the same way as the
+other WIP features here.
 
 The prefill instance runs **solo TP=1 on the fast x16 5090** (zero cross-GPU traffic); the decode
 instance runs **uneven-TP=3 + DCP on the x4/x8 cards**; KV is handed off via `mooncake_tcp` loopback.
 **Both instances are CUDA-graph-covered by default** (prefill = breakable graph, decode = full graph,
-measured). Two instances mean two weight copies coexisting on the same physical cards; the combined
-per-card VRAM split was never registry-dumped (*not captured*). Faster TTFT is **expected** because
-prefill avoids the ×4-lane collectives, but the TTFT factor is an **estimate, not benchmarked** on
-this no-P2P/no-NVLink rig. Upstream runs PD across identical cards or a single fused TP group; on
-identical cards there is no ×4 lane to route around, so the fork's advantage here is rig-specific.
+measured). Faster TTFT is **expected** because prefill avoids the ×4-lane collectives, but the TTFT
+factor is an **estimate, not benchmarked** on this no-P2P/no-NVLink rig.
+
+**Distributing decode across all cards is a capacity choice, not a throughput win.** Decode is
+latency-sensitive — it runs per-layer collectives on **every** step — so spreading it across the mixed
+cards makes each decode step pay **cross-card collective latency**, which on this rig (no P2P/NVLink,
+all PHB, one 3080 on ×4) is a hard floor that can only be *hidden*, never removed — the very slow lane
+PD keeps prefill off. Concretely:
+
+- **Model + KV fit the fast card alone** → running **decode solo** is faster, because it skips all
+  cross-card collectives.
+- **They do not fit** (large model / large KV context) → decode-KV **must** span the cards via
+  uneven-DCP, and the collective cost is simply the price of fitting.
+
+If the decode TP=3 instance also lands on the 5090, **two model copies (prefill + decode) coexist**
+there — the unknown two-copy VRAM above. Upstream runs PD across identical cards or a single fused TP
+group; on identical cards there is no ×4 lane to route around, so the fork's advantage here is
+rig-specific. No throughput numbers are quoted — none were benchmarked.
 
 ---
 
@@ -299,8 +317,9 @@ Upstream sizes memory by a global fraction (`--rank-gpu-memory-mib` + component 
   every cross-GPU feature.
 - **Contaminated throughput figures** (pre-2026-07-22 SSE bench) are withdrawn, not shown as fact.
 - **In-progress / experimental features** are labelled as such: the 122B expert-offload run is a
-  bring-up/validation run (in progress), adaptive drafter routing is work in progress, and session KV
-  spill is experimental (S1).
+  bring-up/validation run (in progress), adaptive drafter routing is work in progress, session KV
+  spill is experimental (S1), and PD-disaggregation is experimental/WIP (implemented but not
+  perf-/VRAM-benchmarked).
 - **GGUF attribution:** where GGUF appears (co-location, §5), the quantisation format and its
   K-quant / MMQ / MMVQ kernels come from ggml/llama.cpp via upstream; the fork's contribution is the
   uneven-TP adaptation and crossover tuning, not the quant path itself.
