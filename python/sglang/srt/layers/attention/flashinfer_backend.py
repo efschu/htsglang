@@ -2602,8 +2602,17 @@ class FlashInferAttnBackend(AttentionBackend):
         self._sess_wrappers = {}
         self._sess_count_cache = None
         # S1b: (boundary, dev_head_idx int32, n_head_own) of the current
-        # spill's device-resident head. Constant per spill; reset on clear.
+        # spill's device-resident head. Reset on clear AND whenever wave-back
+        # (S3) grows the head, so the next tick re-derives the split.
         self._sess_head = None
+        # S3 wave-back: this rank's count of host-tail rows already migrated
+        # back to device -- the active tail owns host rows [base, host_next).
+        # The dedicated wave event lets the next tick's device-head read wait
+        # the (copy-stream) H2D and lets the scheduler throttle on inflight.
+        self._sess_host_row_base = 0
+        # A never-recorded CUDA event reports .query() == True (no pending
+        # work), so wave-back throttling starts in the "idle/complete" state.
+        self._sess_wave_done = torch.cuda.Event()
         logger.info(
             "kv-session-offload backend wired: mode=%s S=%d prefix=%s "
             "host_base=%d scratch_slot=%d block=%d staging=%.1f MB",
@@ -2656,6 +2665,10 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         from sglang.srt.managers.kv_session_offload import owned_device_indices
 
+        # S3: order this tick after any in-flight wave-back H2D so the device
+        # head reads the just-restored slots' KV, not stale device memory. A
+        # no-op when no wave is pending (event already complete).
+        torch.cuda.current_stream().wait_event(self._sess_wave_done)
         L = int(forward_batch.seq_lens_cpu[0].item())
         rank = self.dcp_rank if self._sess_mode != "plain" else 0
         dcp = len(self._sess_prefix) - 1
@@ -2741,9 +2754,13 @@ class FlashInferAttnBackend(AttentionBackend):
             cur_owned = True
         n_own = counts[rank]
         num_blocks = num_blocks_rank_uniform(counts, self._sess_block_size)
-        assert n_own <= self._sess_host_pool.size, (
-            f"kv-session-offload: owned shard {n_own} exceeds the host pool "
-            f"({self._sess_host_pool.size} tokens)"
+        # S3: the active tail owns host rows [base, base + n_own); earlier
+        # wave-back steps drained rows [0, base). host_next = base + n_own is
+        # the high-water mark against the pool size.
+        base = self._sess_host_row_base
+        assert base + n_own <= self._sess_host_pool.size, (
+            f"kv-session-offload: host high-water {base + n_own} exceeds the "
+            f"host pool ({self._sess_host_pool.size} tokens)"
         )
 
         # Flattened layer-major streamed-block schedule. Every full-attn
@@ -2772,9 +2789,15 @@ class FlashInferAttnBackend(AttentionBackend):
             counts=counts,
             num_blocks=num_blocks,
             cur_owned=cur_owned,
-            cur_host_row=n_own - 1 if cur_owned else -1,
+            # host_row_base offsets the LOCAL block offsets (s, e in [0, n_own))
+            # to ACTUAL host rows [base + s, base + e); the current token's row
+            # is base + n_own - 1.
+            host_row_base=base,
+            cur_host_row=base + n_own - 1 if cur_owned else -1,
             cur_host_row_t=(
-                self._sess_host_arange[n_own - 1 : n_own] if cur_owned else None
+                self._sess_host_arange[base + n_own - 1 : base + n_own]
+                if cur_owned
+                else None
             ),
             device=self._sess_staging_k.device,
             sched=sched,
@@ -2807,6 +2830,7 @@ class FlashInferAttnBackend(AttentionBackend):
         pe = e - 1 if need_cur else e  # current token's row arrives via D2D fixup
         host = self._sess_host_pool
         B = self._sess_block_size
+        hb = st.host_row_base  # S3: local block offsets -> actual host rows
         cs = self._sess_copy_stream
         with torch.cuda.stream(cs):
             cs.wait_event(self._sess_compute_done[region])
@@ -2817,7 +2841,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     dst_k=self._sess_staging_k,
                     src_v=host.v_data_refs[fl],
                     dst_v=self._sess_staging_v,
-                    src_indices=self._sess_host_arange[s:pe],
+                    src_indices=self._sess_host_arange[hb + s : hb + pe],
                     dst_indices=self._sess_stage_arange64[base : base + (pe - s)],
                     item_size=host.token_stride_size,
                 )

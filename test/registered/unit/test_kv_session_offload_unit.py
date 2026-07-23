@@ -24,6 +24,8 @@ from sglang.srt.managers.kv_session_offload import (
     select_spill_victim,
     sentinel_base,
     session_priority_key,
+    WaveBackController,
+    wave_back_advance,
 )
 
 # Weighted geometry mirroring a 3-rank uneven-DCP rig (e.g. ratios 1/32/31).
@@ -384,6 +386,106 @@ def test_partial_tail_ownership_composes():
         )
         assert tail_counts[r] == brute
     assert sum(tail_counts) == L - boundary
+
+
+# ---------------------------------------------------------------------------
+# S3 wave-back (incremental on-the-fly restore)
+# ---------------------------------------------------------------------------
+
+
+def test_wave_back_advance_step_size():
+    # a full block off the front while plenty remains
+    assert wave_back_advance(boundary=100, seq_len=1000, wave_step=256) == 256
+    # the final short block completes the restore (< wave_step)
+    assert wave_back_advance(boundary=900, seq_len=1000, wave_step=256) == 100
+    # tail empty -> nothing
+    assert wave_back_advance(boundary=1000, seq_len=1000, wave_step=256) == 0
+    assert wave_back_advance(boundary=1200, seq_len=1000, wave_step=256) == 0
+    # wave_step clamps to >= 1
+    assert wave_back_advance(boundary=0, seq_len=10, wave_step=0) == 1
+
+
+def test_wave_back_advance_capped_by_free_slots():
+    # never ask for more device room than is free right now
+    assert wave_back_advance(100, 1000, 256, remaining_cap=64) == 64
+    assert wave_back_advance(100, 1000, 256, remaining_cap=0) == 0
+    assert wave_back_advance(100, 1000, 256, remaining_cap=10_000) == 256
+
+
+def test_wave_back_advance_never_overshoots_seqlen():
+    # boundary is always in [0, seq_len]; the advance never carries it past
+    for boundary in range(0, 33):
+        adv = wave_back_advance(boundary, 32, wave_step=8)
+        assert 0 <= adv and boundary + adv <= 32
+
+
+def test_wave_back_controller_warmup_then_fires():
+    wb = WaveBackController(wave_step=128, warmup_steps=3)
+    # warmup gate: space_ok must hold 3 consecutive windows before the first
+    # wave (anti-flutter)
+    assert wb.plan(0, 1000, space_ok=True, copy_inflight=False) == 0
+    assert wb.plan(0, 1000, space_ok=True, copy_inflight=False) == 0
+    assert wb.plan(0, 1000, space_ok=True, copy_inflight=False) == 128
+    # keeps firing while space holds
+    assert wb.plan(128, 1000, space_ok=True, copy_inflight=False) == 128
+
+
+def test_wave_back_controller_space_lost_resets_gate():
+    wb = WaveBackController(wave_step=128, warmup_steps=2)
+    assert wb.plan(0, 1000, space_ok=True, copy_inflight=False) == 0
+    # device filled up again -> streak resets, must re-warm
+    assert wb.plan(0, 1000, space_ok=False, copy_inflight=False) == 0
+    assert wb.plan(0, 1000, space_ok=True, copy_inflight=False) == 0
+    assert wb.plan(0, 1000, space_ok=True, copy_inflight=False) == 128
+
+
+def test_wave_back_controller_contention_backs_off_without_breaking_streak():
+    wb = WaveBackController(wave_step=128, warmup_steps=2)
+    assert wb.plan(0, 1000, space_ok=True, copy_inflight=False) == 0
+    assert wb.plan(0, 1000, space_ok=True, copy_inflight=False) == 128
+    # previous wave's H2D still running -> back off, DON'T reset the streak
+    assert wb.plan(128, 1000, space_ok=True, copy_inflight=True) == 0
+    # next free window fires immediately (streak preserved)
+    assert wb.plan(128, 1000, space_ok=True, copy_inflight=False) == 128
+
+
+def test_wave_back_controller_stops_when_tail_empty():
+    wb = WaveBackController(wave_step=128, warmup_steps=1)
+    assert wb.plan(1000, 1000, space_ok=True, copy_inflight=False) == 0
+
+
+def test_wave_back_converges_against_concurrent_append():
+    """Interaction with tail-append: the boundary start is fixed but seq_len
+    grows as new tokens append to the host tail. Remaining is recomputed from
+    the LIVE seq_len every step (no special-casing)."""
+    # Phase 1 -- concurrent append with wave_step (100) > append (10/step):
+    # the host tail shrinks to a small steady-state residual (<= one wave
+    # step; continuous appends keep re-seeding the tail front).
+    wb = WaveBackController(wave_step=100, warmup_steps=1)
+    boundary, seq_len = 0, 500
+    for _ in range(60):
+        adv = wb.plan(boundary, seq_len, space_ok=True, copy_inflight=False)
+        boundary += adv
+        seq_len += 10
+        assert boundary <= seq_len  # never overshoots the live length
+    assert 0 < seq_len - boundary <= 100  # converged to a bounded residual
+
+    # Phase 2 -- generation stops (no more appends): the tail drains fully.
+    for _ in range(10):
+        adv = wb.plan(boundary, seq_len, space_ok=True, copy_inflight=False)
+        boundary += adv
+        if boundary >= seq_len:
+            break
+    assert boundary >= seq_len  # fully restored once appends cease
+
+    # append (100/step) > wave_step (10): the tail strictly grows (diverges)
+    wb2 = WaveBackController(wave_step=10, warmup_steps=1)
+    boundary, seq_len = 0, 500
+    for _ in range(20):
+        adv = wb2.plan(boundary, seq_len, space_ok=True, copy_inflight=False)
+        boundary += adv
+        seq_len += 100
+    assert seq_len - boundary > 500  # host tail grew, wave-back fell behind
 
 
 def test_restore_hysteresis():

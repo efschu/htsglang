@@ -335,6 +335,81 @@ class RestoreHysteresis:
         self._streak = 0
 
 
+def wave_back_advance(
+    boundary: int, seq_len: int, wave_step: int, remaining_cap: Optional[int] = None
+) -> int:
+    """Token advance for ONE incremental wave-back step (S3).
+
+    The device head is ``[0, boundary)``; the host tail is
+    ``[boundary, seq_len)``. Wave-back migrates the FRONT of the host tail
+    back to device, advancing the boundary by a generic block. Returns the
+    number of tokens to move this step (0 when the tail is empty).
+
+    * Bounded by ``wave_step`` (the generic owner-block unit -- amortizes the
+      per-event H2D cost, mirrors the spill-side ``chunk``).
+    * Bounded by what REMAINS on host (``seq_len - boundary``); the final,
+      short block completes the restore even when smaller than a block.
+    * Optionally bounded by ``remaining_cap`` (device slots actually free
+      right now) so a step never asks for more room than exists -- the
+      caller's owner-matched allocation is still the hard gate.
+
+    Because ``remaining`` is recomputed from the LIVE ``seq_len`` every call,
+    tokens appended to the tail while spilled (the boundary is fixed but
+    ``seq_len`` grows) are handled without special-casing: a step still only
+    ever peels ``wave_step`` off the FRONT."""
+    remaining = max(0, int(seq_len) - int(boundary))
+    if remaining == 0:
+        return 0
+    step = min(max(1, int(wave_step)), remaining)
+    if remaining_cap is not None:
+        step = min(step, max(0, int(remaining_cap)))
+    return max(0, step)
+
+
+class WaveBackController:
+    """Opportunistic wave-back gate (S3): decides, per scheduler iteration,
+    whether and how far to migrate the host tail's front block back to the
+    device head. Pure/deterministic -- identical on every TP rank (all inputs
+    are replicated scheduler state).
+
+    Policy:
+      * A warmup gate (``RestoreHysteresis``) requires the "device space is
+        available" condition to hold for N consecutive checks before the
+        FIRST wave of a spill (anti-flutter, same discipline as full restore).
+      * ``copy_inflight`` (the previous wave's H2D still running on the copy
+        stream) backs off WITHOUT breaking the warmup streak: under PCIe
+        contention we simply wave slower, never queue contending copies onto
+        the device path.
+      * ``space_ok`` False (device filled up again) resets the streak: never
+        wave back into a device that has no room."""
+
+    def __init__(self, wave_step: int, warmup_steps: int):
+        self.wave_step = max(1, int(wave_step))
+        self.gate = RestoreHysteresis(warmup_steps)
+
+    def plan(
+        self,
+        boundary: int,
+        seq_len: int,
+        *,
+        space_ok: bool,
+        copy_inflight: bool,
+        remaining_cap: Optional[int] = None,
+    ) -> int:
+        if max(0, int(seq_len) - int(boundary)) == 0:
+            return 0
+        if copy_inflight:
+            # Back off this window; keep the warmup streak (contention, not a
+            # memory shortage).
+            return 0
+        if not self.gate.update(space_ok):
+            return 0
+        return wave_back_advance(boundary, seq_len, self.wave_step, remaining_cap)
+
+    def reset(self):
+        self.gate.reset()
+
+
 # ---------------------------------------------------------------------------
 # Scheduler-side manager
 # ---------------------------------------------------------------------------
@@ -356,6 +431,16 @@ class KVSessionOffloadManager:
         self.hysteresis = RestoreHysteresis(
             sa.kv_session_offload_restore_hysteresis_steps
         )
+        # S3 wave-back: the generic block unit is the streamed owner-block
+        # (block_size); the warmup gate reuses the restore hysteresis. The
+        # host-tail front migrates back one block per free window.
+        self.wave = WaveBackController(
+            self.block_size, sa.kv_session_offload_restore_hysteresis_steps
+        )
+        # Per-rank count of this rank's owned tail tokens already waved back
+        # (host rows [0, base) are drained; the active tail owns rows
+        # [base, host_next)). Reset with every spill.
+        self._host_row_base = 0
 
         mr = scheduler.tp_worker.model_runner
         self.model_runner = mr
@@ -576,6 +661,9 @@ class KVSessionOffloadManager:
         torch.cuda.current_stream().wait_stream(self.backend._sess_copy_stream)
         self.backend._sess_count_cache = None
         self.backend._sess_head = None  # new spill: re-derive head/tail split
+        self._host_row_base = 0
+        self.backend._sess_host_row_base = 0
+        self.wave.reset()
         if n_own > 0:
             host_ids = torch.arange(n_own, dtype=torch.int64, device=row.device)
             self.host_pool.backup_from_device_all_layer(
@@ -824,10 +912,45 @@ class KVSessionOffloadManager:
             L = len(self.spilled_req.origin_input_ids) + len(
                 self.spilled_req.output_ids
             ) - 1
-        ok = self._restore_memory_ok(L)
-        if not self.hysteresis.update(ok):
+
+        row = self.req_to_token_pool.req_to_token[
+            self.spilled_req.req_pool_idx, :L
+        ]
+        boundary = int((row < self.host_base).sum().item())
+        if boundary >= L:
+            # Tail fully drained by earlier wave-back steps -- nothing left on
+            # host; just rejoin the device batch (no H2D remains).
+            return self._finalize_restore(running_batch, L)
+
+        remaining = L - boundary
+        avail = self.allocator.available_size()
+
+        # FALLBACK fast path: the whole tail fits right now -> one-shot
+        # stop-restore (S1/S2 path; faster than nibbling when space is
+        # abundant, e.g. the pressure that caused the spill is fully gone).
+        if avail >= remaining + self.restore_margin_tokens:
+            if self.hysteresis.update(self._restore_memory_ok(L)):
+                return self._restore(running_batch, L)
             return running_batch
-        return self._restore(running_batch, L)
+        self.hysteresis.reset()
+
+        # PRIMARY path: opportunistic incremental wave-back of one owner-block
+        # from the host-tail front. H2D on the copy stream -> other device
+        # sessions are never delayed; under copy-stream contention we simply
+        # wave slower (copy_inflight backs off). The owner-matched allocation
+        # inside _wave_back is the hard gate; `remaining_cap` keeps the step
+        # from ever asking for more slots than are free.
+        copy_inflight = not self.backend._sess_wave_done.query()
+        advance = self.wave.plan(
+            boundary,
+            L,
+            space_ok=avail > 0,
+            copy_inflight=copy_inflight,
+            remaining_cap=avail,
+        )
+        if advance > 0:
+            self._wave_back(L, boundary, advance)
+        return running_batch
 
     def maybe_take_tick(self, running_batch) -> Optional["ScheduleBatch"]:
         """Late hook: decide whether THIS iteration runs the spill tick
@@ -951,7 +1074,12 @@ class KVSessionOffloadManager:
             )
 
         self._wait_forward_stream()
-        host_ids = torch.arange(n_own, dtype=torch.int64, device=row.device)
+        # The active tail owns host rows [base, base + n_own): earlier
+        # wave-back steps (if any) already drained rows [0, base).
+        base = self._host_row_base
+        host_ids = torch.arange(
+            base, base + n_own, dtype=torch.int64, device=row.device
+        )
         layer_num = getattr(self.host_pool, "layer_num", 0)
         for fl in range(layer_num):
             self.host_pool.load_to_device_per_layer(
@@ -960,7 +1088,126 @@ class KVSessionOffloadManager:
         self.req_to_token_pool.req_to_token[req.req_pool_idx, boundary:L] = (
             new_locs.to(torch.int32)
         )
+        self._log(
+            "kv-session-offload RESTORE(stop): rid=%s L=%d boundary=%d "
+            "tail=%d owned_tail=%d host_base=%d (rank %d) H2D complete",
+            req.rid,
+            L,
+            boundary,
+            tail,
+            n_own,
+            base,
+            self.dcp_rank,
+        )
+        return self._finalize_restore(running_batch, L)
 
+    def _wave_back(self, L: int, boundary: int, advance: int) -> bool:
+        """Migrate the host-tail FRONT block ``[boundary, boundary+advance)``
+        back to the device head on the COPY stream (S3 incremental restore).
+
+        The tier boundary advances by the block; the session stays a hybrid
+        spill tick with a larger device head and a shorter host tail. Purely
+        additive to the device path: the H2D runs on the dedicated copy
+        stream (never the compute/default stream) and the freshly written
+        head slots are consumed by the NEXT tick, which waits the copy via
+        ``_sess_wave_done`` -- so OTHER device sessions are never delayed.
+
+        Returns True when a block was moved, False when the owner-matched
+        allocation could not be satisfied right now (wave stalls, retried
+        next window; the stock full-restore stays available as fallback)."""
+        req = self.spilled_req
+        hi_pos = min(boundary + advance, L)
+        row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :L]
+        block = row[boundary:hi_pos]
+        assert int(block.min().item()) >= self.host_base, (
+            "kv-session-offload wave-back: non-sentinel slot in the tail front"
+        )
+        residues = (block % self.S).to(torch.int64).contiguous()
+
+        if self.mode == "weighted":
+            counts = owned_counts_weighted(residues, self.cp_prefix)
+            bounds = [
+                (self.cp_prefix[r], self.cp_prefix[r + 1])
+                for r in range(len(counts))
+            ]
+            class_slots = self.allocator.alloc_owner_matched_classes(
+                self.S, bounds, counts
+            )
+            if class_slots is None:
+                return False  # not enough owner-matched room this window
+            new_locs = assign_owner_matched_slots(
+                residues, self.cp_prefix, class_slots
+            )
+        else:
+            new_locs = self.allocator.alloc(hi_pos - boundary)
+            if new_locs is None:
+                return False
+            new_locs = new_locs.to(torch.int64)
+
+        owned_mask, dev_idx = owned_device_indices(
+            new_locs,
+            mode=self.mode,
+            S=self.S,
+            lo=self.lo,
+            hi=self.hi,
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+            pos_offset=boundary,  # even-mode ownership keys on absolute position
+        )
+        blk_own = int(dev_idx.numel())
+
+        # H2D on the copy stream: read this block's owned host rows
+        # [base, base+blk_own) into the new device slots. Order after any
+        # in-flight forward, record the wave event so the next tick's device-
+        # head read (and the next wave's copy_inflight check) can wait it.
+        base = self._host_row_base
+        host_ids = torch.arange(
+            base, base + blk_own, dtype=torch.int64, device=row.device
+        )
+        layer_num = getattr(self.host_pool, "layer_num", 0)
+        cs = self.backend._sess_copy_stream
+        self._wait_forward_stream()
+        with torch.cuda.stream(cs):
+            cs.wait_stream(torch.cuda.current_stream())
+            for fl in range(layer_num):
+                self.host_pool.load_to_device_per_layer(
+                    self.full_pool, host_ids, dev_idx, fl, io_backend="kernel"
+                )
+            self.backend._sess_wave_done.record(cs)
+
+        # Rewrite the block's row with the real device slots; advance the
+        # boundary (implicitly, via the now-non-sentinel entries) and the
+        # per-rank host-row base. Force re-derivation of the head split +
+        # tail counts on the next tick.
+        self.req_to_token_pool.req_to_token[req.req_pool_idx, boundary:hi_pos] = (
+            new_locs.to(torch.int32)
+        )
+        self._host_row_base = base + blk_own
+        self.backend._sess_host_row_base = self._host_row_base
+        self.backend._sess_head = None
+        self.backend._sess_count_cache = None
+        # Head grew to [0, hi_pos): keep the finish-path free bound current.
+        req.kv_spill_boundary = hi_pos
+        self._log(
+            "kv-session-offload WAVE-BACK: rid=%s boundary %d->%d (+%d) "
+            "owned_block=%d host_base->%d tail_left=%d (rank %d)",
+            req.rid,
+            boundary,
+            hi_pos,
+            hi_pos - boundary,
+            blk_own,
+            self._host_row_base,
+            L - hi_pos,
+            self.dcp_rank,
+        )
+        return True
+
+    def _finalize_restore(self, running_batch, L: int):
+        """Common rejoin tail shared by the one-shot stop-restore and a
+        completed wave-back (host tail empty): flip the session back to the
+        device decode path, clear the spill slot, and merge it into the
+        running batch."""
+        req = self.spilled_req
         req.kv_spill_state = None
         req.kv_spill_boundary = 0
         if self.spilled_batch is None:
@@ -973,16 +1220,12 @@ class KVSessionOffloadManager:
         batch.kv_session_spill_tick = False
         self._clear_spill_state("restored to device")
         self._log(
-            "kv-session-offload RESTORE: rid=%s L=%d boundary=%d tail=%d "
-            "owned_tail=%d (rank %d) H2D complete; rejoining device batch",
+            "kv-session-offload RESTORE complete: rid=%s L=%d (rank %d) "
+            "rejoining device batch",
             req.rid,
             L,
-            boundary,
-            tail,
-            n_own,
             self.dcp_rank,
         )
-
         if running_batch.is_empty():
             return batch
         running_batch.merge_batch(batch)
@@ -1038,6 +1281,9 @@ class KVSessionOffloadManager:
         # sentinel row.
         self.backend._sess_count_cache = None
         self.backend._sess_head = None
+        self._host_row_base = 0
+        self.backend._sess_host_row_base = 0
+        self.wave.reset()
         logger.debug("kv-session-offload: spill slot cleared (%s, rid=%s)", why, rid)
 
     def inflight_batches(self):
