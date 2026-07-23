@@ -251,15 +251,26 @@ benchmarked. Upstream holds the layer weights on every rank.
 
 ## 2.7 More ranks than cards — multi-rank co-location
 
-<img src="topologies/07-multi-rank-colocation.svg" alt="Multi-rank co-location: two ranks sharing the 5090 (illustrative)" width="100%">
+<img src="topologies/07-multi-rank-colocation.svg" alt="Multi-rank co-location: TP=5 on 3 cards — three ranks time-slicing the 5090 via MPS, one rank per 3080" width="100%">
 
-`--rank-gpu-id 0,0,1,2` places two ranks on the 5090 as two processes (§9, co-location #82); NCCL
-multi-rank is auto-set and a physical-impossibility check guards it. The first booted co-location
-on this rig was **TP=4** with two ranks sharing the 5090 (via MPS + a side-loaded NCCL 2.30.7);
-larger co-located layouts such as TP=5 (the illustrative diagram) remain emulation-stage and have
-not been booted here. Replicated-KV itself (kv<TP, #62) is proven separately at TP=3 (§2.3, the
-hero run). Co-located ranks share silicon — capability, not extra bandwidth. Upstream bounds TP at
-the physical card count (one rank per card).
+`--rank-gpu-id` maps each rank to a physical GPU and lets a physical GPU host more than one rank as
+independent processes (§9, co-location #82); NCCL multi-rank is auto-set and a physical-impossibility
+check (`Σ co-located rank budgets ≤ NVML total`) guards it. **TP=5 was booted and validated on this
+3-card rig**: `--tp 5 --rank-gpu-id 0,0,0,1,2 --rank-tp-ratio auto --rank-auto-reserve-mib
+11500,11500,11500,3500,3500` (NCCL 2.30.7 side-loaded, MPS on) places **three ranks on the 5090**
+(~7 GB budget each) and **one rank on each 3080** (~17 GB). All five ranks build the NCCL
+communicator, capture the target-verify + draft-decode + draft-extend graphs, and serve; the output
+is coherent, retrieves a needle from a ~15k-token context, and is **bit-identical across two boots**.
+A simpler **TP=4** layout (two ranks sharing the 5090) is the same mechanism with one fewer
+co-located rank. Decode throughput under co-location is deliberately **not** representative of a
+5-card deployment: the three ranks on the 5090 time-slice one card via MPS.
+
+Models whose `num_kv_heads` is below the rank count (e.g. an A3B GGUF with 2 KV heads at TP=5) run
+the **replicated-KV** geometry here; the `--rank-tp-ratio auto` planner is **kv-boundary-aware**
+(#116) — it constrains the per-rank Q-head split to whole KV-head groups so it composes with
+`--rank-auto-reserve-mib` without straddling a KV-group boundary (the #105 guard case). Replicated-KV
+is also exercised on its own at TP=3 (§2.3, the hero run). Co-located ranks share silicon —
+capability, not extra bandwidth. Upstream bounds TP at the physical card count (one rank per card).
 
 ## 2.8 A slow PCIe x4 link — PD-disaggregation placement
 
@@ -279,6 +290,85 @@ On a fleet spanning 11-32 GB and three PCIe speeds the settings **compose**: une
 uneven-DCP token-KV, weightless-KV workers on the x4 cards, per-expert offload to host RAM, and
 prefill on the fast x16 5090. Upstream even-TP sizes the whole group to the 11 GB card's shard (or
 excludes that card); the token-KV, weightless, and host-offload paths are fork-specific.
+
+---
+
+# Part 3 — Runtime capabilities (speculative routing, memory, scheduling)
+
+The atlas above is about *where tensors are placed*. This part covers fork features that shape the
+*runtime* — which draft algorithm runs, how VRAM is budgeted, how the scheduler prioritises, and how
+KV overflow is handled — each with one diagram that explains the mechanism rather than a placement.
+Colour meaning is unchanged from Parts 1-2.
+
+## 3.1 Adaptive drafter routing — switch draft algorithm at round boundaries
+
+<img src="topologies/17-adaptive-drafter-routing.svg" alt="Two drafters (NEXTN/MTP and DFLASH) resident at once; a per-round router picks one by a deterministic ctx-to-rung policy table or an acceptance-driven bandit, with a context-length gate" width="100%">
+
+Two draft algorithms — **NEXTN/MTP** and **DFLASH** — are kept resident simultaneously
+(`cross_algo_worker`), the inactive one held at **≈0 VRAM** via VMM tag-aliasing (§6, #93/#102). A
+router selects one per batch at round boundaries, in one of two modes (§5, **work in progress**):
+
+- **`policy`** (recommended default): a deterministic **ctx → rung** table
+  (`--speculative-drafter-policy`, e.g. DFLASH `k=16` below the drafter training-ctx 4096, NEXTN with
+  an analytic `k*` above). No probing needed; the switch point is fixed.
+- **`auto`/bandit** (opt-in, `--speculative-cross-algorithm`): an acceptance-driven score
+  `EMA[accept-tokens/round] ÷ EMA[round seconds]`, decided on rank 0 and broadcast every 16 rounds
+  (dwell 64). It carries a small steady-state probe overhead and is meant for unknown drafters or
+  content-split 4-8k loads.
+
+A **context-length gate** (`--speculative-cross-algorithm-ctx-gate`, derived from the drafter
+training config, ~8k) keeps DFLASH to its trained range and suppresses probing above it. The honest
+claim is **robustness / no-regret across mixed streams — not a peak speedup**: a switching mode
+carries **≈+5.7%** systemic overhead vs a single static drafter, so the win is confined to streams
+that change regime (prior art: BanditSpec, arXiv 2505.15141). Upstream adaptive speculative decoding
+adapts `k` / `num_draft_tokens` for one drafter; switching between draft *algorithms* is the fork
+addition.
+
+## 3.2 Session KV spill — overflow the newest session to host RAM, keep decoding
+
+<img src="topologies/18-session-kv-spill.svg" alt="On VRAM KV overflow the newest session's KV shard is offloaded to host RAM and keeps decoding via host-streamed attention; strict FCFS victim order, fast-lane precedence, FIFO restore" width="100%">
+
+On device KV overflow (after tree eviction), the **newest** active session's full-attention KV shard
+is offloaded to host RAM and that session **keeps decoding** from host — block-LSE attention with a
+double-buffer prefetch (reused from the weightless lane), run in a separate **eager `bs=1` tick**,
+never mixed into the device CUDA-graph batch. Victim order is **strict FCFS** (the oldest session
+stays device-resident until it finishes) with **fast-lane precedence**; sessions **restore FIFO**
+when capacity frees. Only KV spills — GDN/Mamba state is always resident (§20,
+`--enable-kv-session-offload`).
+
+Status is **experimental — S1** (single spilled session, eager path). S1 is **measured**:
+zero-overhead when unused **+0.16%** (under the 1% bar), host decode **8.1 tok/s @1k ctx**, restore
+**~0.4 s**, and **50/50 exact** host-vs-device token equality. The longer-context throughput curve
+(32k ≈63, 64k ≈31, 128k ≈16, 262k ≈7.6 tok/s; worthwhile only with uneven DCP — 262k ≈3.8 without)
+is a **modeled estimate, not benchmarked**, and depends on the S2 overlap work. Upstream retracts and
+recomputes, or swaps, a request under KV pressure (the request is paused, not decoded from host RAM).
+
+## 3.3 Fast-lane priority scheduling — preempt a tagged request into the batch
+
+<img src="topologies/19-fast-lane-priority.svg" alt="A fast-tagged request preempts into the running batch by taking a reserved-heavy slot; heavy-aging prevents starvation; composes with session KV spill; default off" width="100%">
+
+A request tagged `"lane":"fast"` **preempts into the running batch immediately**, taking one of a
+**reserved floor of heavy slots** (`--fast-lane-reserved-heavy-slots`) rather than waiting in the
+queue; **heavy-aging** (`--fast-lane-heavy-aging-ms`) raises long-waiting heavy requests so fast
+traffic cannot starve them (§16, `--enable-fast-lane`). It composes with **session KV spill** (§3.2):
+because fast-lane outranks FCFS, admitting a fast request can spill a normal session's KV to host to
+make room, and a spilled session's restore is held while a fast request is still waiting. The feature
+is **default off** — the default scheduling path is unchanged. Upstream has a priority-scheduling
+subsystem the fork builds on; this reserved-floor fast-lane class is the fork addition.
+
+## 3.4 Measured VRAM budget — components measured, KV is the remainder
+
+<img src="topologies/20-measured-vram-budget.svg" alt="Per-rank absolute MiB budget: CUDA context, weight shard, resident experts, solo-draft pool, GDN state and graph pools are measured from a component registry; KV cache is the measured remainder; a corridor rule bounds free and net-waste VRAM" width="100%">
+
+Each rank is given an **absolute MiB budget** (`--rank-gpu-memory-mib`), not a fraction of total or
+free VRAM. Every component — CUDA context, weight shard, resident experts, solo-draft pool, GDN
+state, graph/workspace pools — is read from a **measured component registry** after boot plus one
+short request (so pools and CUDA graphs are really allocated); the **KV cache is sized as the
+measured remainder** within that budget (§10). A logged per-rank split-hint vector, fed back on
+restart, self-calibrates the split over **two boots**. A **corridor rule** (evaluated per card,
+Option A) fails a card whose `nvml_free < 400 MiB` (absolute floor) or whose
+`nvml_free − measured transients > 1.5 GiB` (net waste). Upstream sizes memory by a global fraction
+(`mem-fraction-static` / `gpu-memory-utilization`); a per-rank absolute MiB budget is not present.
 
 ---
 

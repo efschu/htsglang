@@ -42,7 +42,7 @@ COLORS = {
     "fullattn":  "#2f6f8f",  # full-attention layer (holds KV cache)
     "state":     "#c9b8e0",  # GDN recurrent state (fixed size)
     "mtp":       "#c65b9b",  # MTP / NEXTN draft head
-    "bad":       "#e9d7d7",  # stock: impossible / wasted region fill
+    "bad":       "#e9d7d7",  # upstream: unused region / a split its constraints do not admit here
 }
 LEGEND = [
     ("weights",  "model-weight shard"),
@@ -57,7 +57,7 @@ LEGEND = [
     ("fullattn", "full-attention layer (KV)"),
     ("state",    "GDN recurrent state"),
     ("mtp",      "MTP / NEXTN draft head"),
-    ("bad",      "stock: impossible / wasted"),
+    ("bad",      "upstream: unused / not admitted here"),
 ]
 WHITE_TEXT = ("weights", "kv", "resident", "spill", "hostkv", "gdn", "fullattn", "mtp")
 
@@ -207,9 +207,9 @@ def arrow(x1, y1, x2, y2, color="#333", sw=1.7, dash=None, marker="arr"):
 
 
 def panel_label(x, y, label, kind):
-    """Pill badge marking a panel as 'htsglang' (ours) or 'stock sglang'."""
-    col = "#1d6b34" if kind == "ours" else "#8a2b2b"
-    fill = "#e7f2ea" if kind == "ours" else "#f6e7e7"
+    """Pill badge marking a panel as 'htsglang' (ours) or 'upstream sglang' (neutral)."""
+    col = "#1d6b34" if kind == "ours" else "#4a5568"
+    fill = "#e7f2ea" if kind == "ours" else "#eef1f4"
     w = len(label) * 7.2 + 22
     return (rect(x, y - 15, w, 21, fill, stroke=col, sw=1.3, rx=5)
             + text(x + 11, y, label, size=11.5, weight="bold", color=col))
@@ -294,24 +294,24 @@ def s1():
         b.append(gap_tag(x0 + BOXW, x1, topY + 95, "PCIe x16", "x16"))
         # stock even-TP ghost
         lx = LEFT + 2 * SLOT + 20
-        b.append(text(lx + 60, topY - 21, "stock even-TP", size=11.5, anchor="middle", weight="bold", color="#8a2b2b"))
-        b.append(rect(lx, topY, 120, 32 * PXGB, "none", stroke="#8a2b2b", sw=1.4, dash="5 3"))
+        b.append(text(lx + 60, topY - 21, "upstream even-TP", size=11.5, anchor="middle", weight="bold", color="#4a5568"))
+        b.append(rect(lx, topY, 120, 32 * PXGB, "none", stroke="#4a5568", sw=1.4, dash="5 3"))
         b.append(rect(lx, topY, 120, 8 * PXGB, COLORS["weights"]))
-        b.append(text(lx + 60, topY + 8 * PXGB / 2 + 3.6, "weights (capped)", size=9, anchor="middle", color="#fff"))
+        b.append(text(lx + 60, topY + 8 * PXGB / 2 + 3.6, "weights (3080-sized)", size=9, anchor="middle", color="#fff"))
         b.append(rect(lx, topY + 8 * PXGB, 120, 8 * PXGB, COLORS["kv"]))
-        b.append(text(lx + 60, topY + 12 * PXGB + 3.6, "KV (capped)", size=9, anchor="middle", color="#fff"))
-        b.append(rect(lx, topY + 16 * PXGB, 120, 16 * PXGB, "none", stroke="#8a2b2b", sw=1.0, dash="4 3"))
-        b.append(text(lx + 60, topY + 23 * PXGB, "WASTED", size=11, anchor="middle", weight="bold", color="#8a2b2b"))
-        b.append(text(lx + 60, topY + 23 * PXGB + 14, "~12 GB idle", size=9, anchor="middle", color="#8a2b2b"))
+        b.append(text(lx + 60, topY + 12 * PXGB + 3.6, "KV (3080-sized)", size=9, anchor="middle", color="#fff"))
+        b.append(rect(lx, topY + 16 * PXGB, 120, 16 * PXGB, COLORS["bad"], stroke="#4a5568", sw=1.0, dash="4 3"))
+        b.append(text(lx + 60, topY + 23 * PXGB, "~12 GB", size=11, anchor="middle", weight="bold", color="#4a5568"))
+        b.append(text(lx + 60, topY + 23 * PXGB + 14, "unused on the 5090", size=9, anchor="middle", color="#4a5568"))
         return "".join(b), cb + 22
     compose("01-uneven-tp.svg", 700,
             "1 — Two mismatched GPUs, PCIe, no NVLink → uneven Tensor Parallelism",
             "RTX 5090 32 GB + RTX 3080 20 GB. Decisive setting: --rank-tp-ratio (proportional shards).",
             [("--rank-tp-ratio 8,5: shards sized to each card, not to the smallest. Cards linked by "
               "NCCL over PCIe host-staging (no NVLink).", "#333"),
-             ("Stock sglang: even TP only — both ranks capped to the 3080's shard; ~12 GB of the 5090 "
-              "goes unused (dashed box at right).", "#8a2b2b")],
-            draw, ["weights", "kv", "ctx", "free"])
+             ("Upstream sglang: even TP sizes both ranks to the 3080's shard; ~12 GB of the 5090 is left "
+              "unused (dashed box at right).", "#555")],
+            draw, ["weights", "kv", "ctx", "free", "bad"])
 
 
 def s2():
@@ -337,10 +337,10 @@ def s2():
             "1×5090 + 2×3080. Decisive setting: --rank-tp-ratio auto (sets DCP=TP), token-axis KV.",
             [("--rank-tp-ratio auto + uneven-DCP token sharding: KV is split along the TOKEN axis, not "
               "the KV-head axis. Inter-card links are DCP LSE-merges over PCIe.", "#333"),
-             ("Fills every card; the big card is not throttled to the small ones. Doc: ≈+2.5-3x KV "
-              "context vs a naive equal split.", "#2b6b3a"),
-             ("Stock sglang: even TP + head-axis KV — needs equal shards and num_kv_heads divisible by "
-              "rank count; wastes the 5090.", "#8a2b2b")],
+             ("Fills every card; the big card is sized to its own VRAM. Measured ≈+2.3-2.8× token-axis "
+              "KV context vs an equal head-axis split (2.27-2.81× on the 27B uneven-DCP runs).", "#2b6b3a"),
+             ("Upstream sglang: even TP + head-axis KV uses equal shards and requires num_kv_heads "
+              "divisible by the rank count; the 5090 is sized to the 3080's shard.", "#555")],
             draw, ["weights", "kv", "ctx", "free"])
 
 
@@ -371,8 +371,8 @@ def s3():
               "the few KV heads across ranks + token-shard the KV (LSE-merge). Query heads still sharded.", "#333"),
              ("The salmon slice is the only duplicated part (single-digit-% KV overhead per the doc); the "
               "bulk of KV is still split.", "#2b6b3a"),
-             ("Stock sglang: head-axis TP is structurally impossible here — TP is capped at num_kv_heads "
-              "(=2), the 3rd card cannot join.", "#8a2b2b")],
+             ("Upstream sglang: head-axis TP is bounded by num_kv_heads (=2); a 3rd rank is not covered "
+              "by the head split.", "#555")],
             draw, ["weights", "kv", "scratch", "ctx", "free"])
 
 
@@ -406,11 +406,13 @@ def s4():
             "4 — MoE with more experts than fit VRAM → per-expert host offload + uneven-TP",
             "35B-A3B on 1×5090 + 2×3080. Decisive setting: resident-fraction expert offload (§6, [in progress]).",
             [("SGLANG_MOE_RESIDENT_EXPERT_FRACTION<1 [in progress]: a fixed set of experts stays resident "
-              "(amber), the rest spill to pinned host RAM (red) and are prefetched per forward.", "#333"),
-             ("Wave-over-tokens prefetch → byte-identical (doc #120: ≈+0.15% ppl, 15/15 batteries). Cost is "
-              "throughput (decode ≈1.4×), not quality.", "#2b6b3a"),
-             ("Stock sglang: only --cpu-offload-gb (generic, layer-granular, not quant/MoE-aware, slow) or "
-              "EP (needs all experts to fit aggregate VRAM).", "#8a2b2b")],
+              "(amber), the rest spill to pinned host RAM (red) and are prefetched per token-wave.", "#333"),
+             ("FP8 path is quality-neutral (#120: ≈+0.15% ppl within FP8 reduction-order noise, 15/15 "
+              "batteries, needle 100%) and self-deterministic — not bit-identical, diverging only at "
+              "near-ties (sub-ULP). The cost is throughput, not quality (offload is slower than no-offload; "
+              "exact FP8 decode factor is config-dependent, not separately benchmarked).", "#2b6b3a"),
+             ("Upstream sglang: the generic --cpu-offload-gb path (layer-granular, dequantizes on CPU) or "
+              "Expert Parallelism (experts must fit aggregate VRAM).", "#555")],
             draw, ["weights", "resident", "scratch", "kv", "spill", "ctx"])
 
 
@@ -437,12 +439,13 @@ def s5():
             "5 — Model too big for any single card → load-time expert offload to host RAM",
             "122B-A10B Int4 on one RTX 5090 32 GB. Decisive setting: load-time MoE offload (§6, mechanism [in progress] / 122B run [planned]).",
             [("Head-rank load-time MoE offload [in progress]: materialize only resident+cushion experts on "
-              "the GPU, stream the cold tier straight to host RAM at load — instead of materializing all "
-              "experts then slicing (which OOMs at load).", "#333"),
-             ("Boots what used to OOM at load. Mechanism validated on 35B-A3B; the full 122B-A10B Int4 run "
-              "(~61 GB experts) is [planned] (download-gated).", "#2b6b3a"),
-             ("Stock sglang: cannot run — a 122B model does not fit 32 GB, EP needs experts to fit aggregate "
-              "VRAM, generic offload OOMs during load.", "#8a2b2b")],
+              "the GPU and stream the cold tier straight to host RAM at load — rather than materializing all "
+              "experts on the GPU and then slicing.", "#333"),
+             ("Boots a model whose weights exceed a single card's VRAM at load. Mechanism validated on "
+              "35B-A3B; the full 122B-A10B Int4 run (~61 GB experts) is [planned] (download-gated).", "#2b6b3a"),
+             ("Upstream sglang: no load-time host-spill path — a 122B model exceeds 32 GB; Expert Parallelism "
+              "requires experts to fit aggregate VRAM, and the generic offload materializes on the GPU "
+              "during load.", "#555")],
             draw, ["weights", "resident", "scratch", "kv", "spill", "ctx"])
 
 
@@ -467,15 +470,17 @@ def s6():
             b.append(gap_tag(xp + BOXW, x, topY + 100, "KV", "x16"))
         return "".join(b), cb + 22
     compose("06-weightless-kv-lane.svg", 700,
-            "6 — Long-context priority → weightless-KV fast lane",
+            "6 — Long-context priority → weightless-KV lane",
             "1×5090 (full model) + 2×3080 (KV-only). Decisive setting: Variant C weightless lane (§10, landed).",
-            [("Weightless-KV Fast Lane (Variant C, stages B1+B2a — landed, eager-only): the fast card holds "
+            [("Weightless-KV lane (Variant C, landed; CUDA-graph decode landed #133/#136): the fast card holds "
               "the full model as collective-free TP=1; the slow cards hold ONLY a KV token-shard and run a "
               "stripped attention-only forward — no layer weights (thin blue sliver ≈0).", "#333"),
-             ("≈14 GB freed per worker → doc: ≈4× context on the 27B test model. Extend Δ=0 vs full-TP=1; "
-              "decode differs only by benign kernel fp-order.", "#2b6b3a"),
-             ("Stock sglang: every rank must hold layer weights — the slow cards spend VRAM on weight "
-              "shards/replicas instead of pure KV headroom.", "#8a2b2b")],
+             ("≈14 GB of weights freed per worker (measured) becomes KV headroom; the host-spill KV tier was "
+              "measured to 262k tokens on the 27B test model (#134). Prefill is bit-identical to full-TP=1; "
+              "decode/extend is argmax-identical (decode-class, not bit-0). Resulting context multiple depends "
+              "on the KV budget, not separately benchmarked.", "#2b6b3a"),
+             ("Upstream sglang: every rank holds its layer-weight shard; each card's VRAM is shared between "
+              "weights and KV.", "#555")],
             draw, ["weights", "kv", "ctx", "free"])
 
 
@@ -484,32 +489,41 @@ def s7():
         b = []
         cb = cardbottom(topY)
         x0 = LEFT
+        # 5090 hosts THREE co-located ranks (TP=5 layout 0,0,0,1,2), ~7 GB budget each.
         c, _ = gpu_column(x0, topY, "RTX 5090", 32,
-                          [("weights", 6, "rank 0 shard"), ("kv", 8, "rank 0 KV"),
-                           ("weights", 6, "rank 1 shard"), ("kv", 8, "rank 1 KV"),
-                           ("ctx", 3, "2× ctx")],
-                          caption="2 co-located ranks (2 processes)")
+                          [("weights", 3, "rank0 shard"), ("kv", 4, "rank0 KV"),
+                           ("weights", 3, "rank1 shard"), ("kv", 4, "rank1 KV"),
+                           ("weights", 3, "rank2 shard"), ("kv", 4, "rank2 KV"),
+                           ("ctx", 4, "3× ctx (MPS)")],
+                          caption="3 co-located ranks • MPS time-slice")
         b.append(c)
-        for i, r in ((1, 2), (2, 3)):
+        # MPS time-slicing marker: one card, three processes share the SMs in turn.
+        b.append(text(x0 + BOXW / 2, cb + 34, "one card, 3 processes → MPS time-slices the SMs",
+                      size=8.5, anchor="middle", color="#8a5a2b"))
+        for i, r in ((1, 3), (2, 4)):
             x = LEFT + i * SLOT
             c, _ = gpu_column(x, topY + (32 - 20) * PXGB, "RTX 3080", 20,
-                              [("weights", 6, f"rank {r} shard"),
-                               ("kv", 12, f"rank {r} KV"), ("ctx", 2, "ctx")],
-                              caption=f"rank {r}")
+                              [("weights", 5, f"rank{r} shard"),
+                               ("kv", 13, f"rank{r} KV (~17 GB)"), ("ctx", 2, "ctx")],
+                              caption=f"rank {r} • 1 rank / card")
             b.append(c)
             xp = LEFT + (i - 1) * SLOT
-            b.append(gap_tag(xp + BOXW, x, topY + 100, "NCCL", "x16"))
-        return "".join(b), cb + 22
+            b.append(gap_tag(xp + BOXW, x, topY + 100, "NCCL x5", "x16"))
+        return "".join(b), cb + 44
     compose("07-multi-rank-colocation.svg", 700,
-            "7 — More ranks than cards → multi-rank co-location (TP=5 on 3 GPUs)",
-            "1×5090 (2 ranks) + 2×3080 (1 rank each). Decisive setting: --rank-gpu-id duplicates (§9).",
-            [("--rank-gpu-id 0,0,1,2 (duplicate → co-location): two ranks run on the 5090 as two processes; "
-              "NCCL multi-rank auto-set; the physical-impossibility check enforces (ranks × MiB) ≤ NVML "
-              "total. The 5090 shows TWO stacked (weights+KV) blocks — two real ranks on one card.", "#333"),
-             ("Used to prove replicated-KV at TP=5 (#62) without owning 5 GPUs. Honest caveat: co-located "
-              "ranks share silicon — capability, not extra bandwidth.", "#2b6b3a"),
-             ("Stock sglang: TP is bounded by the physical GPU count — you cannot place two ranks on one "
-              "card, so TP=5 on 3 cards is impossible.", "#8a2b2b")],
+            "7 — More ranks than cards → multi-rank co-location (TP=5 on 3 GPUs, booted)",
+            "1×5090 (3 ranks) + 2×3080 (1 rank each). Decisive setting: --rank-gpu-id maps ranks to physical GPUs (§9).",
+            [("--rank-gpu-id 0,0,0,1,2 --rank-tp-ratio auto: three ranks run on the 5090 as three processes "
+              "(~7 GB budget each), one rank on each 3080. NCCL multi-rank auto-set; the physical-impossibility "
+              "check enforces Σ(co-located budgets) ≤ NVML total. The 5090 shows THREE stacked (weights+KV) "
+              "blocks — three real ranks time-slicing one card via MPS.", "#333"),
+             ("Booted + validated (NCCL 2.30.7 side-loaded, MPS on): all 5 ranks build the communicator, "
+              "capture target-verify + draft-decode + draft-extend graphs, serve a coherent needle from ~15k "
+              "context, bit-identical across two boots. A simpler TP=4 (2 ranks on the 5090) is the same "
+              "mechanism with one fewer co-located rank. Decode tok/s is not 5-card-representative — the 3 "
+              "ranks time-slice one card.", "#2b6b3a"),
+             ("Upstream sglang: TP is bounded by the physical GPU count — one rank per physical card, so a "
+              "TP=5 layout is expressed over 5 physical GPUs.", "#555")],
             draw, ["weights", "kv", "ctx", "free"])
 
 
@@ -540,10 +554,11 @@ def s8():
             [("One decode card sits behind a slow PCIe x4 link (dashed brown). Put PREFILL on the fast x16 "
               "card so it runs alone, zero cross-GPU comm; the KV handoff uses mooncake_tcp loopback (teal "
               "region on the decode cards).", "#333"),
-             ("Doc: ≈2-5× faster TTFT; decode stays distributed (negligible ≈-2% long ctx). Crash-robust "
-              "handoff, tears down to 0 MiB.", "#2b6b3a"),
-             ("Stock sglang: a single TP group forces every prefill collective over the x4 link too — the "
-              "slow lane throttles time-to-first-token.", "#8a2b2b")],
+             ("Faster TTFT is expected because prefill avoids the x4-lane collectives; decode stays "
+              "distributed and largely unchanged. Handoff is crash-robust and tears down to 0 MiB. (The "
+              "TTFT factor is an estimate, not benchmarked on this rig.)", "#2b6b3a"),
+             ("Upstream sglang: a single fused TP group runs every prefill collective over every link in "
+              "the group, including the x4 lane.", "#555")],
             draw, ["weights", "kv", "hostkv", "ctx", "free"])
 
 
@@ -602,9 +617,9 @@ def s9():
             [("One TP group across 8 mixed cards combines: uneven-TP (proportional shards), uneven-DCP "
               "(token-KV), per-expert host offload (bottom bar), two weightless-KV workers on the x4 cards "
               "(pure KV headroom), and PD-style placement (prefill on the fast x16 5090).", "#333"),
-             ("Stock sglang: even TP forces the whole group down to the 11 GB 2080Ti's shard (or excludes "
-              "it); no token-KV, no weightless workers, no quant-aware offload — most of the fleet's VRAM is "
-              "wasted or unusable for one model.", "#8a2b2b")],
+             ("Upstream sglang: even TP sizes the whole group to the 11 GB 2080Ti's shard (or excludes it); "
+              "the token-KV, weightless-worker and quant-aware host-offload paths are fork-specific, so the "
+              "larger cards are sized to the smallest card's shard.", "#555")],
             draw, ["weights", "kv", "resident", "hostkv", "spill", "ctx", "free"])
 
 
@@ -673,7 +688,7 @@ def g10():
         b.append(note2)
         note3, y3 = flow(cxr, y2 + 14,
                          "Model: Qwen3.5-122B-A10B-GPTQ-Int4 — 256 experts/layer, top-8 routing, ~10B "
-                         "active. This structure is identical under htsglang and stock sglang; the "
+                         "active. This structure is identical under htsglang and upstream sglang; the "
                          "difference is entirely in HOW each layer is split across the 3 mismatched cards "
                          "(next diagrams).", W - cxr - 30, size=9.5, color="#333")
         b.append(note3)
@@ -714,7 +729,7 @@ def g11():
         mid = W / 2
         b.append(vdivider(mid, topY - 4, topY + 330))
         b.append(panel_label(30, topY - 2, "htsglang — uneven-TP=3, ratio [28,19,19]", "ours"))
-        b.append(panel_label(mid + 20, topY - 2, "stock sglang — even-TP=3", "stock"))
+        b.append(panel_label(mid + 20, topY - 2, "upstream sglang — even-TP=3", "stock"))
         top = topY + 44
         wcol = 132
         # --- ours: three uneven rank columns ---
@@ -749,22 +764,22 @@ def g11():
         sx = [mid + 40, mid + 40 + 150, mid + 40 + 300]
         for i, x in enumerate(sx):
             c, _ = rank_col(x, top, 120, f"rank{i}", "even 1/3 share", [
-                ("bad", 34, "Q 32/3 = 10.7  ✗", "#8a2b2b"),
-                ("bad", 26, "KV 2/3 = 0.7  ✗", "#8a2b2b"),
-                ("bad", 40, "FFN 1024/3 = 341.3  ✗", "#8a2b2b"),
-                ("bad", 22, "not ÷128  ✗", "#8a2b2b")], "#8a2b2b")
+                ("bad", 34, "Q 32/3 = 10.7", "#4a5568"),
+                ("bad", 26, "KV 2/3 = 0.7", "#4a5568"),
+                ("bad", 40, "FFN 1024/3 = 341.3", "#4a5568"),
+                ("bad", 22, "not ÷128", "#4a5568")], "#4a5568")
             b.append(c)
-        b.append(text(mid + 40, maxb + 16, "Even split does not divide: 32, 1024 and 2 are not multiples of 3,",
-                      size=9.5, color="#8a2b2b"))
-        b.append(text(mid + 40, maxb + 30, "and FFN 341.3 is not a multiple of group_size 128 → GPTQ "
-                      "group-alignment assert. sglang refuses to launch TP=3 here.", size=9.5, color="#8a2b2b"))
+        b.append(text(mid + 40, maxb + 16, "Even split does not divide these dims: 32, 1024 and 2 are not multiples of 3,",
+                      size=9.5, color="#4a5568"))
+        b.append(text(mid + 40, maxb + 30, "and FFN 341.3 is not a multiple of group_size 128 → the GPTQ "
+                      "group-alignment check does not admit an even TP=3 here.", size=9.5, color="#4a5568"))
         return "".join(b), maxb + 36
     compose("11-tp-tensor-split.svg", 1320,
             "11 — One layer's tensors across 3 mismatched cards: uneven-TP vs even-TP",
             "Decisive setting: --rank-tp-ratio auto (§1, shipped). Cell heights are proportional to each rank's share.",
             [("htsglang sizes each rank's Q-head / FFN / expert shard to its VRAM budget (16/8/8 Q, "
-              "512/256/256 FFN = 4/2/2 GPTQ groups). Stock even-TP=3 cannot: 32, 1024 and the 2 KV heads "
-              "are not divisible by 3, and 341.3 is not group-128-aligned.", "#333")],
+              "512/256/256 FFN = 4/2/2 GPTQ groups). Upstream even-TP=3 does not divide these dimensions: "
+              "32, 1024 and the 2 KV heads are not divisible by 3, and 341.3 is not group-128-aligned.", "#333")],
             draw, ["weights", "kv", "resident", "bad"])
 
 
@@ -775,7 +790,7 @@ def g12():
         mid = W / 2
         b.append(vdivider(mid, topY - 4, topY + 360))
         b.append(panel_label(30, topY - 2, "htsglang — TP > num_kv_heads: replicate KV + DCP token-shard", "ours"))
-        b.append(panel_label(mid + 20, topY - 2, "stock sglang — head-sharded KV", "stock"))
+        b.append(panel_label(mid + 20, topY - 2, "upstream sglang — head-sharded KV", "stock"))
         top = topY + 40
         # sequence bar split into 3 rank token-ranges
         sx, sw_ = 40, 520
@@ -817,7 +832,7 @@ def g12():
                       size=9.5, color="#1d6b34"))
         # --- stock panel ---
         sx2 = mid + 40
-        b.append(text(sx2, top - 6, "stock shards KV by HEAD — needs one KV head per rank:", size=9.5, color="#333"))
+        b.append(text(sx2, top - 6, "upstream shards KV by HEAD — one KV head per rank:", size=9.5, color="#333"))
         b.append(chip(sx2, top, 90, 40, "kv", "KV head 0", size=9))
         b.append(chip(sx2 + 110, top, 90, 40, "kv", "KV head 1", size=9))
         b.append(arrow(sx2 + 45, top + 44, sx2 + 30, ry - 6, "#227a3a", marker="arrG"))
@@ -827,12 +842,12 @@ def g12():
             ok = i < 2
             b.append(rect(x, ry, 130, 60, RANKTINT[i] if ok else COLORS["bad"], stroke="#2b2b2b", sw=1.2, rx=3))
             b.append(text(x + 65, ry + 20, f"rank{i}", size=9.5, anchor="middle", weight="bold"))
-            b.append(text(x + 65, ry + 40, f"KV head {i}" if ok else "NO KV head  ✗",
-                          size=9.5, anchor="middle", color="#1a1a1a" if ok else "#8a2b2b", weight="normal" if ok else "bold"))
-        b.append(text(sx2, my, "2 KV heads, 3 ranks: rank2 gets none.", size=9.5, color="#8a2b2b", weight="bold"))
-        b.append(text(sx2, my + 15, "stock requires num_kv_heads ≥ tp → 2 < 3 fails.", size=9.5, color="#8a2b2b"))
-        b.append(text(sx2, my + 30, "Replicating all KV on every rank would boot but gives", size=9.5, color="#8a2b2b"))
-        b.append(text(sx2, my + 44, "no token-capacity gain (each rank stores the whole cache).", size=9.5, color="#8a2b2b"))
+            b.append(text(x + 65, ry + 40, f"KV head {i}" if ok else "no head-axis KV",
+                          size=9.5, anchor="middle", color="#1a1a1a" if ok else "#4a5568", weight="normal" if ok else "bold"))
+        b.append(text(sx2, my, "2 KV heads, 3 ranks: rank2 is not covered by the head split.", size=9.5, color="#4a5568", weight="bold"))
+        b.append(text(sx2, my + 15, "Head-axis KV requires num_kv_heads ≥ tp (2 < 3 here).", size=9.5, color="#4a5568"))
+        b.append(text(sx2, my + 30, "Replicating the whole KV on every rank is possible and stores", size=9.5, color="#4a5568"))
+        b.append(text(sx2, my + 44, "the full cache on each card (no token-capacity gain from more cards).", size=9.5, color="#4a5568"))
         return "".join(b), my + 90
     compose("12-attention-dcp.svg", 1320,
             "12 — 2 KV heads across 3 ranks: the DCP token-shard (the crux)",
@@ -850,7 +865,7 @@ def g13():
         mid = W / 2
         b.append(vdivider(mid, topY - 4, topY + 320))
         b.append(panel_label(30, topY - 2, "htsglang — token-sharded KV (per full-attn layer)", "ours"))
-        b.append(panel_label(mid + 20, topY - 2, "stock sglang — head-sharded / replicated KV", "stock"))
+        b.append(panel_label(mid + 20, topY - 2, "upstream sglang — head-sharded / replicated KV", "stock"))
         top = topY + 46
         gx, gw = 40, 470
         rows = 12                     # the 12 full-attn layers
@@ -885,17 +900,17 @@ def g13():
                       size=9.5, color="#1d6b34"))
         # --- stock panel ---
         sx2 = mid + 40
-        b.append(text(sx2, top - 5, "Option A — head-shard (stock default):", size=9, color="#333"))
+        b.append(text(sx2, top - 5, "Option A — head-shard (upstream default):", size=9, color="#333"))
         b.append(rect(sx2, top, 240, rows * rh, COLORS["bad"], stroke="#222", sw=1.2))
-        b.append(text(sx2 + 120, top + rows * rh / 2, "2 KV heads / 3 ranks  ✗", size=10, anchor="middle", weight="bold", color="#8a2b2b"))
+        b.append(text(sx2 + 120, top + rows * rh / 2, "2 KV heads / 3 ranks", size=10, anchor="middle", weight="bold", color="#4a5568"))
         b.append(text(sx2, top + rows * rh + 20, "Option B — replicate KV on every rank:", size=9, color="#333"))
         for i in range(3):
             b.append(rect(sx2 + i * 130, top + rows * rh + 28, 120, 34, R0T, stroke="#222", sw=1.0))
             b.append(text(sx2 + i * 130 + 60, top + rows * rh + 49, "ALL tokens", size=8.5, anchor="middle", color="#1a1a1a"))
         b.append(text(sx2, top + rows * rh + 84, "Every rank stores the WHOLE sequence's KV → 1× capacity,",
-                      size=9.5, color="#8a2b2b"))
-        b.append(text(sx2, top + rows * rh + 98, "no gain from adding cards. And even-TP dims still fail (diagram 11).",
-                      size=9.5, color="#8a2b2b"))
+                      size=9.5, color="#4a5568"))
+        b.append(text(sx2, top + rows * rh + 98, "no token-capacity gain from more cards. Even-TP dims: see diagram 11.",
+                      size=9.5, color="#4a5568"))
         return "".join(b), sy + 66
     compose("13-kv-token-layout.svg", 1200,
             "13 — KV-cache arrangement: which rank holds which tokens, and where MTP sits",
@@ -913,7 +928,7 @@ def g14():
         mid = W / 2
         b.append(vdivider(mid, topY - 4, topY + 360))
         b.append(panel_label(30, topY - 2, "htsglang — per-expert host offload, f=0.25 (§6, [in progress])", "ours"))
-        b.append(panel_label(mid + 20, topY - 2, "stock sglang — no MoE-aware offload", "stock"))
+        b.append(panel_label(mid + 20, topY - 2, "upstream sglang — no per-expert host spill", "stock"))
         top = topY + 44
         # GPU strip: resident + scratch chips
         gx = 40
@@ -970,12 +985,12 @@ def g14():
             b.append(chip(sx2 + cc * (cw - 2 + gap), top + r * (cw - 2 + gap), cw - 2, cw - 2,
                           "spill" if over else "resident", stroke="#888", sw=0.4))
         b.append(rect(sx2 - 4, top - 4, 32 * (cw - 2 + gap) + 4, 5 * (cw - 2 + gap) + 2, "none", stroke="#1d6b34", sw=1.6, rx=3))
-        b.append(text(sx2 + 16 * (cw - 2 + gap), top + 5 * (cw - 2 + gap) + 12, "↑ what fits ·  ↓ overflow → OOM", size=8.5, anchor="middle", color="#8a2b2b"))
+        b.append(text(sx2 + 16 * (cw - 2 + gap), top + 5 * (cw - 2 + gap) + 12, "↑ within aggregate VRAM ·  ↓ beyond it", size=8.5, anchor="middle", color="#4a5568"))
         oy = top + 8 * (cw - 2 + gap) + 26
-        b.append(text(sx2, oy, "256 experts × 48 layers ≈ 65 GB > 72 GB aggregate, and even-TP=3", size=9.5, color="#8a2b2b"))
-        b.append(text(sx2, oy + 14, "is impossible anyway (diagram 11) → OOM at load.", size=9.5, color="#8a2b2b"))
-        b.append(text(sx2, oy + 36, "Option B — --cpu-offload-gb: generic, LAYER-granular, dequantizes on", size=9.5, color="#8a2b2b"))
-        b.append(text(sx2, oy + 50, "CPU, not per-expert / not quant-aware → far slower, no wave prefetch.", size=9.5, color="#8a2b2b"))
+        b.append(text(sx2, oy, "256 experts × 48 layers ≈ 65 GB vs 72 GB aggregate; per-card context +", size=9.5, color="#4a5568"))
+        b.append(text(sx2, oy + 14, "KV must also fit, and even-TP=3 does not divide these dims (diagram 11).", size=9.5, color="#4a5568"))
+        b.append(text(sx2, oy + 36, "Option B — --cpu-offload-gb: generic, LAYER-granular, dequantizes on", size=9.5, color="#4a5568"))
+        b.append(text(sx2, oy + 50, "CPU, not per-expert / not quant-aware; no per-wave prefetch.", size=9.5, color="#4a5568"))
         return "".join(b), max(eby + 40, oy + 60)
     compose("14-expert-offload-flow.svg", 1340,
             "14 — Per-layer MoE expert offload: 256 experts → 64 resident + 16 scratch + 176 host",
@@ -983,7 +998,7 @@ def g14():
             [("Only ceil(f·256)=64 experts stay resident per layer, plus a 16-slot scratch buffer; the other "
               "176 live in pinned host RAM. Per token-wave the top-8 are gathered — resident ones read "
               "directly, spilled ones are fetched H2D over PCIe into scratch, then the grouped GEMM runs. "
-              "Wave-over-tokens keeps it coherent (§6). Stock has no per-expert, quant-aware spill.", "#333")],
+              "Wave-over-tokens keeps it coherent (§6). Upstream has no per-expert, quant-aware host spill.", "#333")],
             draw, ["resident", "scratch", "spill", "weights"])
 
 
@@ -993,7 +1008,7 @@ def g15():
         b = []
         mid = W / 2
         b.append(panel_label(30, topY - 2, "htsglang — 122B-A10B-Int4, TP=3, f=0.25 (measured: 6.97 tok/s)", "ours"))
-        b.append(panel_label(mid + 20, topY - 2, "stock sglang — same 3 cards", "stock"))
+        b.append(panel_label(mid + 20, topY - 2, "upstream sglang — same 3 cards", "stock"))
         top = topY + 52
         PX = 4.0
         cards = [("RTX 5090", 32.6, "cuda:0 · rank0 · 25.5 GB used",
@@ -1044,23 +1059,23 @@ def g15():
             th = top + (32.6 - vram) * PX
             b.append(text(x + 70, th - 20, nm, size=11, anchor="middle", weight="bold"))
             b.append(rect(x, th, 140, vram * PX, COLORS["bad"], stroke="#222", sw=1.5))
-            b.append(text(x + 70, th + vram * PX / 2, "no valid", size=9, anchor="middle", color="#8a2b2b", weight="bold"))
-            b.append(text(x + 70, th + vram * PX / 2 + 14, "TP=3 split", size=9, anchor="middle", color="#8a2b2b"))
+            b.append(text(x + 70, th + vram * PX / 2, "even TP=3", size=9, anchor="middle", color="#4a5568", weight="bold"))
+            b.append(text(x + 70, th + vram * PX / 2 + 14, "not admitted", size=9, anchor="middle", color="#4a5568"))
         wy = base + 34
         for i, s in enumerate([
-                "even-TP=3: 32 Q / 1024 FFN / 2 KV not ÷3, FFN not ÷128 → launch refused (diagram 11)",
-                "head-sharded KV: needs num_kv_heads(2) ≥ tp(3) → fails (diagram 12)",
-                "no MoE offload: 256 experts ×48 ≈ 65 GB > 72 GB aggregate → OOM (diagram 14)",
-                "fallback even-TP=2 caps both ranks to the 3080 shard → ~12 GB of the 5090 wasted, still OOMs"]):
-            b.append(text(mid + 40, wy + i * 15, "• " + s, size=9, color="#8a2b2b"))
+                "even-TP=3: 32 Q / 1024 FFN / 2 KV not ÷3, FFN not ÷128 → not admitted (diagram 11)",
+                "head-sharded KV: requires num_kv_heads(2) ≥ tp(3) (diagram 12)",
+                "no per-expert host spill: 256 experts ×48 ≈ 65 GB vs 72 GB aggregate; KV must also fit (diagram 14)",
+                "even-TP=2 fallback sizes both ranks to the 3080 shard → ~12 GB of the 5090 unused, full model does not fit"]):
+            b.append(text(mid + 40, wy + i * 15, "• " + s, size=9, color="#4a5568"))
         return "".join(b), max(hy + 50, wy + 4 * 15)
     compose("15-endstate-rig-map.svg", 1320,
             "15 — 122B-A10B-Int4 TP=3 end-state: the whole rig, measured",
             "5090 + 2×3080, PCIe, no NVLink. Everything from diagrams 10-14 combined on the real config.",
             [("The measured end-state: uneven-TP [28,19,19], 2 KV heads replicated + DCP token-shard, "
               "per-layer expert offload f=0.25 (64+16 resident, 176 host), MTP on rank0, eager decode. "
-              "Per-rank GPU 25.5 / 16.6 / 15.4 GB; host floor 24.4 GB; 6.97 tok/s. Stock sglang cannot "
-              "produce any valid TP=3 split on this hardware.", "#333")],
+              "Per-rank GPU 25.5 / 16.6 / 15.4 GB; host floor 24.4 GB; 6.97 tok/s. On the upstream path a "
+              "TP=3 split on this hardware meets the structural constraints listed at right.", "#333")],
             draw, ["weights", "resident", "kv", "mtp", "spill", "free", "bad"])
 
 
@@ -1121,8 +1136,295 @@ def g16():
             draw, ["weights", "resident", "scratch", "kv", "mtp", "spill", "free"])
 
 
+# ===========================================================================
+# Part 3 — runtime capabilities (speculative routing, memory, scheduling).
+# These explain the mechanism of a landed/experimental fork feature rather than
+# a GPU-placement topology. Region colours stay consistent with the atlas.
+# ===========================================================================
+DFLASH_FILL, DFLASH_STROKE, DFLASH_TXT = "#e4dcf1", "#7d5ba6", "#4a3b66"
+
+
+def g17():
+    """Adaptive drafter routing: NEXTN/DFLASH dual residence, policy vs bandit, ctx-gate."""
+    def draw(topY, W):
+        b = []
+        top = topY + 6
+        # 1) dual residence
+        b.append(text(40, top, "Both drafters resident at once (cross_algo_worker, dual residence):",
+                      size=10.5, weight="bold", color="#111"))
+        y = top + 10
+        b.append(chip(40, y, 150, 30, "mtp", "NEXTN / MTP", size=9.5))
+        b.append(rect(205, y, 150, 30, DFLASH_FILL, stroke=DFLASH_STROKE, sw=1.4, rx=2))
+        b.append(text(280, y + 19, "DFLASH", size=9.5, anchor="middle", color=DFLASH_TXT, weight="bold"))
+        b.append(rect(370, y, 130, 30, "#eef1f4", stroke="#4a5568", sw=1.1, rx=2))
+        b.append(text(435, y + 13, "solo-draft pool", size=8.5, anchor="middle", color="#333"))
+        b.append(text(435, y + 24, "sized to threshold (→160 MiB)", size=7.6, anchor="middle", color="#555"))
+        b.append(text(520, y + 13, "the inactive drafter holds ≈0 VRAM", size=9, color=DFLASH_STROKE))
+        b.append(text(520, y + 25, "(VMM tag-alias, #93/#102)", size=9, color=DFLASH_STROKE))
+        # 2) router
+        ry = y + 52
+        b.append(rect(40, ry, W - 80, 30, "#f3f6fa", stroke="#3b6fb0", sw=1.3, rx=4))
+        b.append(text(50, ry + 19, "Per-round-boundary router — picks ONE drafter for the next batch; the choice is made by one of two modes:",
+                      size=9.5, color="#1a1a1a"))
+        # 3) two mode cards
+        cy = ry + 48
+        cardw = (W - 80 - 30) / 2
+        # policy card (recommended default)
+        b.append(rect(40, cy, cardw, 132, "#eef5ef", stroke="#1d6b34", sw=1.4, rx=5))
+        b.append(text(52, cy + 17, "policy  —  recommended default", size=10, weight="bold", color="#1d6b34"))
+        b.append(text(52, cy + 32, "deterministic ctx → rung table (--speculative-drafter-policy)", size=8.6, color="#333"))
+        rows = [("ctx < 4096", "DFLASH, k=16", DFLASH_FILL, DFLASH_STROKE),
+                ("ctx ≥ 4096", "NEXTN, k* (analytic)", COLORS["mtp"], "#8a3b6b")]
+        for i, (cond, act, fill, st) in enumerate(rows):
+            yy = cy + 44 + i * 26
+            b.append(text(60, yy + 15, cond, size=9, color="#1a1a1a"))
+            b.append(text(150, yy + 15, "→", size=11, color="#555"))
+            b.append(rect(172, yy + 2, 168, 20, fill, stroke=st, sw=1.0, rx=2))
+            b.append(text(256, yy + 16, act, size=8.6, anchor="middle",
+                          color="#fff" if fill == COLORS["mtp"] else DFLASH_TXT))
+        b.append(text(52, cy + 108, "k* = argmax_k  E[accept]/round_s  from per-depth accept EMA.", size=8.4, color="#333"))
+        b.append(text(52, cy + 122, "Fixed switch point = drafter training-ctx; probing not needed.", size=8.4, color="#333"))
+        # bandit card (opt-in)
+        bx = 40 + cardw + 30
+        b.append(rect(bx, cy, cardw, 132, "#eef1f4", stroke="#4a5568", sw=1.4, rx=5))
+        b.append(text(bx + 12, cy + 17, "auto / bandit  —  opt-in (--speculative-cross-algorithm)", size=10, weight="bold", color="#4a5568"))
+        b.append(text(bx + 12, cy + 33, "acceptance-driven, for unknown drafters or content-split 4-8k loads", size=8.6, color="#333"))
+        b.append(rect(bx + 12, cy + 42, cardw - 24, 24, "#ffffff", stroke="#4a5568", sw=1.0, rx=3))
+        b.append(text(bx + 20, cy + 58, "score = EMA[accept-tokens / round] ÷ EMA[round seconds]", size=8.6, color="#1a1a1a"))
+        b.append(text(bx + 12, cy + 82, "rank-0 decides, gloo-broadcasts every 16 rounds; dwell 64,", size=8.4, color="#333"))
+        b.append(text(bx + 12, cy + 95, "dead-zone 6%. Costs a small steady-state probe overhead.", size=8.4, color="#333"))
+        b.append(text(bx + 12, cy + 116, "Prior art: BanditSpec (arXiv 2505.15141, ICML'25).", size=8.4, color="#555"))
+        # 4) ctx gate
+        gy = cy + 150
+        b.append(rect(40, gy, W - 80, 30, "#fdf3e3", stroke="#c88a2b", sw=1.2, rx=4))
+        b.append(text(50, gy + 19, "Context-length gate (--speculative-cross-algorithm-ctx-gate, from the drafter training config, ~8k): "
+                      "above the gate DFLASH is ineligible and is not probed.", size=9, color="#8a5a2b"))
+        # 5) honest claim
+        hn, hy = flow(40, gy + 48, "Honest claim: robustness / no-regret across mixed streams — not a peak speedup. "
+                      "A switching mode carries ≈+5.7% systemic overhead vs a single static drafter "
+                      "(warm-keep + dual capture), so the win is confined to streams that actually change "
+                      "regime. Feature status: work in progress (§5).", W - 80, size=9.5, color="#333")
+        b.append(hn)
+        return "".join(b), hy
+    compose("17-adaptive-drafter-routing.svg", 1120,
+            "17 — Adaptive drafter routing: switch draft algorithm at round boundaries",
+            "Two draft algorithms resident at once; one chosen per batch. Decisive setting: drafter routing (§5, work in progress).",
+            [("NEXTN/MTP and DFLASH are both loaded (the inactive one held at ≈0 VRAM via VMM tag-aliasing). "
+              "A per-round router selects one, either by a deterministic ctx→rung policy table (recommended "
+              "default) or an acceptance-driven bandit (opt-in), with a context-length gate that keeps DFLASH "
+              "to its trained range. Upstream adaptive spec-decode adapts k / num-draft-tokens for a single "
+              "drafter; switching between draft algorithms is the fork addition.", "#333")],
+            draw, ["mtp"])
+
+
+def g18():
+    """Session KV spill: newest session's KV offloaded to host, keeps decoding."""
+    def draw(topY, W):
+        b = []
+        top = topY + 10
+        # device lane: session KV blocks, oldest..newest
+        b.append(text(40, top, "Device VRAM — full-attention KV, one shard per active session (FCFS):",
+                      size=10, weight="bold", color="#111"))
+        ly = top + 12
+        sess = [("S1 oldest", 0.9), ("S2", 0.9), ("S3", 0.9), ("S4 newest", 0.55)]
+        x = 40
+        for i, (nm, sc) in enumerate(sess):
+            w = 118
+            h = 46
+            newest = i == len(sess) - 1
+            b.append(rect(x, ly, w, h, COLORS["kv"], stroke="#2b2b2b", sw=1.3 if not newest else 1.6,
+                          dash="4 3" if newest else None))
+            b.append(text(x + w / 2, ly + 20, nm, size=9, anchor="middle", color="#fff", weight="bold"))
+            b.append(text(x + w / 2, ly + 34, "KV shard", size=8, anchor="middle", color="#fff"))
+            x += w + 12
+        # GDN resident chip
+        b.append(chip(x + 8, ly, 96, 46, "state", "GDN state", size=8.5))
+        b.append(text(x + 56, ly + 60, "always resident", size=8, anchor="middle", color="#4a3b66"))
+        # overflow marker + spill arrow (newest -> host)
+        newest_x = 40 + 3 * (118 + 12)
+        b.append(text(newest_x + 59, ly - 2, "VRAM overflow (after tree eviction)", size=8.2, anchor="middle", color="#c0504d"))
+        # host lane
+        hy0 = ly + 96
+        hb, hy = host_ram_bar(40, hy0, W - 80,
+                              [("hostkv", 0.30, "S4 KV (host-streamed, still decoding)"),
+                               ("free", 0.70, "host KV tier")],
+                              "Host RAM (DDR) — spilled session KV")
+        b.append(hb)
+        b.append(arrow(newest_x + 59, ly + 46, 40 + (W - 80) * 0.15, hy0, "#c0504d", marker="arrR"))
+        b.append(text(newest_x + 120, ly + 74, "spill newest first (FCFS victim)", size=8.4, color="#c0504d"))
+        b.append(arrow(40 + (W - 80) * 0.30, hy0, newest_x + 59, ly + 48, "#3f9fa0", dash="4 3", marker="arr"))
+        b.append(text(40 + (W - 80) * 0.42, hy0 + 18, "FIFO restore when device capacity frees (~0.4 s)", size=8.4, color="#227a3a"))
+        # mechanism notes
+        n1, ny = flow(40, hy + 26,
+                      "Mechanism: on KV overflow the NEWEST session's full-attention KV shard is moved to host "
+                      "RAM (block-LSE attention + double-buffer prefetch, reused from the weightless lane) and "
+                      "that session keeps DECODING from host, in a separate eager bs=1 tick — never mixed into "
+                      "the device CUDA-graph batch. The oldest session stays fully device-resident until it "
+                      "finishes (strict FCFS). Only KV spills; GDN/Mamba state is always resident. Fast-lane "
+                      "requests take precedence (restore is held while a fast request waits).",
+                      W - 80, size=9.3, color="#333")
+        b.append(n1)
+        # measured vs modeled
+        my = ny + 8
+        b.append(rect(40, my, (W - 80) / 2 - 10, 78, "#eef5ef", stroke="#1d6b34", sw=1.3, rx=4))
+        b.append(text(52, my + 16, "S1 — measured (landed)", size=9.5, weight="bold", color="#1d6b34"))
+        for i, s in enumerate(["zero-overhead when unused +0.16% (<1% bar)",
+                                "host decode 8.1 tok/s @1k ctx; restore 0.4 s",
+                                "determinism 50/50 exact host-vs-device tokens"]):
+            b.append(text(52, my + 32 + i * 14, "• " + s, size=8.4, color="#1a1a1a"))
+        mx = 40 + (W - 80) / 2 + 10
+        b.append(rect(mx, my, (W - 80) / 2 - 10, 78, "#eef1f4", stroke="#4a5568", sw=1.3, rx=4))
+        b.append(text(mx + 12, my + 16, "design model — modeled, not benchmarked (needs S2)", size=9.2, weight="bold", color="#4a5568"))
+        for i, s in enumerate(["12 KiB/token fp8, x4 link, DCP R=3 + overlap:",
+                                "32k ≈63 · 64k ≈31 · 128k ≈16 · 262k ≈7.6 tok/s",
+                                "worthwhile only with uneven DCP (262k ≈3.8 without)"]):
+            b.append(text(mx + 12, my + 32 + i * 14, "• " + s, size=8.4, color="#1a1a1a"))
+        return "".join(b), my + 92
+    compose("18-session-kv-spill.svg", 1120,
+            "18 — Session KV spill: overflow the newest session to host RAM, keep decoding",
+            "Per-session KV offload under VRAM pressure. Decisive setting: --enable-kv-session-offload (§20, experimental S1).",
+            [("When device KV overflows, the newest active session's KV shard is offloaded to host RAM and that "
+              "session keeps decoding via host-streamed attention, instead of being paused. Victim order is "
+              "strict FCFS (oldest stays resident) with fast-lane precedence; sessions restore FIFO when "
+              "capacity frees; only KV spills, GDN state stays resident. Upstream retracts/recomputes or swaps "
+              "a request (paused, not decoded from host).", "#333")],
+            draw, ["kv", "hostkv", "state", "free"])
+
+
+def g19():
+    """Fast-lane priority scheduling: preempt a tagged request, reserved floor, aging."""
+    def draw(topY, W):
+        b = []
+        top = topY + 10
+        colw = 250
+        # running batch before
+        b.append(text(40, top, "Running batch (slot budget)", size=10, weight="bold", color="#111"))
+        by = top + 12
+        slots = [("normal", "kv"), ("normal", "kv"), ("normal", "kv"),
+                 ("reserved", "free"), ("reserved", "free")]
+        sw_ = 44
+        for i, (kind, key) in enumerate(slots):
+            xx = 40 + i * (sw_ + 6)
+            b.append(rect(xx, by, sw_, 40, COLORS[key], stroke="#2b2b2b", sw=1.1, rx=2))
+            b.append(text(xx + sw_ / 2, by + 18, "req" if kind == "normal" else "resv", size=8, anchor="middle",
+                          color="#fff" if key == "kv" else "#1a1a1a"))
+            if kind == "reserved":
+                b.append(text(xx + sw_ / 2, by + 31, "heavy", size=7, anchor="middle", color="#1a1a1a"))
+        b.append(text(40, by + 56, "reserved-heavy-slots: a floor kept for latency-priority work", size=8.6, color="#333"))
+        # fast request arrives
+        fy = by + 78
+        b.append(rect(40, fy, 150, 28, "#c65b9b", stroke="#2b2b2b", sw=1.3, rx=3))
+        b.append(text(115, fy + 18, "\"lane\":\"fast\" request", size=9, anchor="middle", color="#fff", weight="bold"))
+        b.append(arrow(195, fy + 14, 300, fy + 14, "#c65b9b", marker="arr"))
+        b.append(text(360, fy + 6, "preempts INTO the running batch immediately", size=9, color="#c65b9b"))
+        b.append(text(360, fy + 19, "(takes a reserved-heavy slot; no queue wait)", size=8.6, color="#555"))
+        # aging
+        ay = fy + 44
+        b.append(text(40, ay, "heavy-aging (--fast-lane-heavy-aging-ms): a long-waiting heavy request ages up in "
+                      "priority so fast traffic cannot starve it.", size=9, color="#333"))
+        # interaction with spill
+        iy = ay + 24
+        b.append(rect(40, iy, W - 80, 46, "#fdf3e3", stroke="#c88a2b", sw=1.2, rx=4))
+        b.append(text(52, iy + 18, "Interaction with session KV spill (§20): fast-lane outranks FCFS — admitting a fast request "
+                      "can spill a normal", size=9, color="#8a5a2b"))
+        b.append(text(52, iy + 33, "session's KV to host to make room, and a spilled session's restore is held while a fast "
+                      "request is still waiting.", size=9, color="#8a5a2b"))
+        # default off
+        b.append(text(40, iy + 68, "Default off (--enable-fast-lane opt-in): the default scheduling path is unchanged.",
+                      size=9.3, color="#1d6b34"))
+        return "".join(b), iy + 80
+    compose("19-fast-lane-priority.svg", 1000,
+            "19 — Fast-lane priority scheduling: preempt a tagged request into the batch",
+            "Opt-in latency-priority class with a starvation guard. Decisive setting: --enable-fast-lane (§16, implemented).",
+            [("A request tagged \"lane\":\"fast\" preempts into the running batch at once, taking one of a "
+              "reserved floor of heavy slots; heavy-aging raises long-waiting heavy requests so fast traffic "
+              "cannot starve them. It composes with session KV spill (a fast request can spill a normal "
+              "session to host). Default off — the default path is unchanged. Upstream has priority scheduling "
+              "the fork builds on; this reserved-floor fast-lane class is the fork addition.", "#333")],
+            draw, ["kv", "free"])
+
+
+def g20():
+    """Measured VRAM budget: components measured, KV is the remainder; corridor rule."""
+    def draw(topY, W):
+        b = []
+        top = topY + 20
+        PX = 5.2
+        # one rank card, component stack (measured) with KV as remainder
+        x = 60
+        cardw = 150
+        total = 20.0   # a 3080 rank, illustrative absolute MiB budget
+        b.append(text(x + cardw / 2, top - 22, "one rank (3080)", size=11, anchor="middle", weight="bold"))
+        b.append(text(x + cardw / 2, top - 9, "--rank-gpu-memory-mib (absolute)", size=8.5, anchor="middle", color="#444"))
+        b.append(rect(x, top, cardw, total * PX, "none", stroke="#222", sw=1.6))
+        comps = [("ctx", 1.4, "CUDA context"),
+                 ("weights", 2.4, "weight shard"),
+                 ("resident", 3.4, "resident experts"),
+                 ("mtp", 0.7, "solo-draft pool"),
+                 ("state", 0.8, "GDN state"),
+                 ("free", 1.0, "graphs / workspace")]
+        cy = top
+        last_leader_y = top - 20
+        for key, gb, lab in comps:
+            b.append(rect(x, cy, cardw, gb * PX, COLORS[key]))
+            tc = "#fff" if key in WHITE_TEXT else "#1a1a1a"
+            mid_y = cy + gb * PX / 2
+            if gb * PX >= 13:
+                b.append(text(x + cardw / 2, mid_y + 3, lab, size=8, anchor="middle", color=tc))
+            else:
+                ly = max(mid_y, last_leader_y + 12)   # stagger thin-band leader labels
+                last_leader_y = ly
+                b.append(line(x + cardw, mid_y, x + cardw + 8, ly, stroke="#888", sw=0.7))
+                b.append(text(x + cardw + 11, ly + 3, lab, size=8, anchor="start", color="#333"))
+            cy += gb * PX
+        # KV = measured remainder
+        kvh = top + total * PX - cy - 0.5 * PX
+        b.append(rect(x, cy, cardw, kvh, COLORS["kv"]))
+        b.append(text(x + cardw / 2, cy + kvh / 2 - 4, "KV cache", size=9, anchor="middle", color="#fff", weight="bold"))
+        b.append(text(x + cardw / 2, cy + kvh / 2 + 9, "= measured remainder", size=7.6, anchor="middle", color="#fff"))
+        # safety rest at the bottom
+        sy = top + total * PX - 0.5 * PX
+        b.append(rect(x, sy, cardw, 0.5 * PX, "#d3dae1", stroke="#888", sw=0.6))
+        b.append(line(x + cardw, sy + 1, x + cardw + 8, sy + 1, stroke="#888", sw=0.7))
+        b.append(text(x + cardw + 11, sy + 4, "safety rest ≥ 400 MiB", size=8, color="#333"))
+        # right column explanation
+        rx = x + cardw + 130
+        n1, y1 = flow(rx, top + 6,
+                      "Every component above is read from the measured component registry after boot + one "
+                      "short request (so pools and CUDA graphs are really allocated) — no hand-guessed values. "
+                      "KV cache is sized as what is LEFT after those measured components, within the absolute "
+                      "per-rank --rank-gpu-memory-mib ceiling (an absolute MiB budget, not a fraction of total "
+                      "or free VRAM).", W - rx - 30, size=9.4, color="#333")
+        b.append(n1)
+        n2, y2 = flow(rx, y1 + 12,
+                      "Two-boot convergence: the boot logs a per-rank KV-split hint vector; feeding it back on "
+                      "restart self-calibrates the split so the KV remainder lands on the safety rest.",
+                      W - rx - 30, size=9.4, color="#333")
+        b.append(n2)
+        # corridor box
+        cby = y2 + 14
+        b.append(rect(rx, cby, W - rx - 30, 62, "#eef5ef", stroke="#1d6b34", sw=1.3, rx=4))
+        b.append(text(rx + 12, cby + 17, "Corridor rule (evaluated per card, Option A):", size=9.3, weight="bold", color="#1d6b34"))
+        b.append(text(rx + 12, cby + 33, "• fail if nvml_free < 400 MiB (absolute floor)", size=8.8, color="#1a1a1a"))
+        b.append(text(rx + 12, cby + 48, "• fail if (nvml_free − measured transients) > 1.5 GiB (net waste)", size=8.8, color="#1a1a1a"))
+        bottom = max(top + total * PX + 24, cby + 74)
+        b.append(text(x, top + total * PX + 18, "upstream: fraction-based mem-fraction-static /", size=8.6, color="#555"))
+        b.append(text(x, top + total * PX + 30, "gpu-memory-utilization; no per-rank absolute MiB budget.", size=8.6, color="#555"))
+        return "".join(b), max(bottom, top + total * PX + 36)
+    compose("20-measured-vram-budget.svg", 1040,
+            "20 — Measured VRAM budget: components measured, KV is the remainder",
+            "Per-rank absolute MiB budget from measured usage. Decisive setting: --rank-gpu-memory-mib + component registry (§10, implemented).",
+            [("Each rank gets an absolute MiB budget (not a fraction). The per-component usage — CUDA context, "
+              "weight shard, resident experts, solo-draft pool, GDN state, graph/workspace pools — is measured "
+              "from a component registry after boot; the KV cache is sized as the measured remainder, and a "
+              "logged split-hint vector converges over two boots. A corridor rule fails a card that has < 400 "
+              "MiB free or > 1.5 GiB of net measured waste. Upstream sizes memory by a global fraction.", "#333")],
+            draw, ["weights", "kv", "resident", "ctx", "mtp", "state", "free"])
+
+
 if __name__ == "__main__":
     for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9,
-               g10, g11, g12, g13, g14, g15, g16):
+               g10, g11, g12, g13, g14, g15, g16,
+               g17, g18, g19, g20):
         fn()
     print("done")
