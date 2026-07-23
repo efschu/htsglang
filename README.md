@@ -429,6 +429,8 @@ not needed for normal operation.
 
 ## Qwen3.5/3.6 and Gemma-4 GGUF loading
 
+The GGUF format and its K-quant dequant / MMQ / MMVQ compute kernels come from **ggml / llama.cpp**, integrated into the engine via vLLM / upstream sglang (the `sgl-kernel` GGUF kernels are ported ggml ops — `mmq.cuh` is copied from llama.cpp's `ggml-cuda/mmq.cu` — and the quant layer is adapted from vLLM). The fork's contribution is running GGUF under uneven TP/DCP (256-superblock alignment, MLP-unit coarsening, the MMQ out-of-bounds fix under expert sharding), the bespoke Qwen3.5/3.6 + Gemma-4 architecture adapters, and dispatch tuning (per-device MMVQ↔MMQ crossover, K-split MMVQ).
+
 The fork adds dedicated GGUF adapters for the **Qwen3.5 / 3.6 hybrid-GDN models**
 and **Gemma-4** — architectures upstream sglang's generic GGUF path cannot load.
 On conversion `llama.cpp` rewrites several tensors (norm offset,
