@@ -620,6 +620,9 @@ FEATURES = [
              "KV budget cost of the cross-gate: ~282k vs ~524k tokens without it (MEASURED).", "#1d6b34"),
             ("Honest claim: robustness / no-regret on mixed streams, NOT a peak speedup — switching costs "
              "~+5.7% systemic vs a single static drafter (MEASURED).", "#333"),
+            ("Attribution: the context-size gate is planned to be adopted from upstream (context-axis "
+             "adaptive spec PR #31716), not built in-fork; the fork's remaining delta is the runtime "
+             "NEXTN<->DFLASH algorithm switch, which no engine has.", "#8a5a2b"),
         ],
         "right_notes": [
             ("One fixed drafter, single residence — no cross-algo pool, no rung tags, no runtime routing. "
@@ -880,6 +883,10 @@ FEATURES = [
         "left_notes": [
             ("Per-rank GPU + host floor MEASURED. Not bit-identical to no-offload (marlin ~1e-2 argmax at "
              "near-ties); bar is coherence + self-determinism (5/5).", "#1d6b34"),
+            ("Attribution: expert-granular host offload is maturing upstream too (sglang's open Paged Experts "
+             "PR #29971, single-GPU); the fork built its offload independently earlier, but the remaining delta "
+             "is the COMPOSITION with asymmetric TP + asymmetric DCP over 3 mismatched cards, not the "
+             "offloading itself.", "#8a5a2b"),
         ],
         "right_notes": [
             ("--cpu-offload-gb (server_args.py: \"How many GBs of RAM to reserve for CPU offloading\") is a "

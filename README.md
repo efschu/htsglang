@@ -10,8 +10,8 @@ feature set, built around sglang's native **RadixAttention** prefix cache.
 
 Beyond the core asymmetric-TP layout, the fork adds speculative-decoding extensions
 (solo draft placement, co-resident cross-algorithm drafting), a weightless-KV
-lane, MoE expert offloading, suspend-to-disk hibernation, and Qwen3.5/3.6 +
-Gemma-4 GGUF loading. This document is the **reference for every fork-specific
+lane, MoE expert offloading composed with the asymmetric layout, suspend-to-disk
+hibernation, and Qwen3.5/3.6 + Gemma-4 GGUF loading. This document is the **reference for every fork-specific
 command-line flag and environment variable**; for a feature-by-feature
 comparison against upstream sglang and vLLM see
 [`FEATURES_VS_UPSTREAM.md`](./FEATURES_VS_UPSTREAM.md), and for validated
@@ -254,6 +254,10 @@ client.chat.completions.create(
 ### Offloading and the weightless-KV lane
 
 MoE expert offloading is env-only (see the environment-variable table). The
+offloading *base* is now available upstream (sglang's open "Paged Experts" PR
+#29971, expert-granular host paging); the fork's contribution is **composing** it
+with the asymmetric TP/DCP layout across mismatched cards — see
+[`FEATURES_VS_UPSTREAM.md`](./FEATURES_VS_UPSTREAM.md) row 7. The
 weightless-KV lane is *experimental*. (The `fastlane` in the flag name
 `--weightless-kv-fastlane` is historical and is **unrelated** to the separate
 fast-lane priority scheduling above; read it as the *weightless-KV lane*, its

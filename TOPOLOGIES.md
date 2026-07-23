@@ -110,8 +110,10 @@ NEXTN k=3) — a single draft residence, **no per-k rung tags, no dual-residence
 (upstream cannot switch draft *algorithm*). That side holds **less draft VRAM** but has **no runtime
 choice**. The honest read is a **capability / VRAM trade-off, not a verdict** — the fork spends more
 draft VRAM to be runtime-adaptive (robustness / no-regret on mixed streams, not a peak speedup;
-switching costs ~+5.7% systemic), upstream spends less and stays fixed. The routing *mechanism* is
-diagram 11.
+switching costs ~+5.7% systemic), upstream spends less and stays fixed. **Attribution:** the
+context-size gate is planned to be **adopted from upstream** (context-axis adaptive spec PR #31716)
+rather than built in-fork; the fork's remaining delta is the runtime NEXTN↔DFLASH draft-*algorithm*
+switch, which no engine has. The routing *mechanism* is diagram 11.
 
 ## 4 — Session KV spill (request-level KV offload): keep the newest in-flight request decoding on host RAM
 
@@ -245,8 +247,11 @@ panel is estimated (stock cpu-offload was not benched here). The mechanism diffe
 **every forward**, regardless of which experts a token routes; the fork offload is **expert-granular** —
 per token-wave it fetches only the routed top-K experts from host. At the same VRAM budget the fork
 moves less data per token, while upstream moves the full offloaded fraction per forward. That is a
-capability / data-volume difference, not a "faster" claim. The 122B is a bring-up/validation run of a
-feature that is still in progress.
+capability / data-volume difference, not a "faster" claim. **Attribution:** expert-granular host offload
+is now maturing upstream as well (sglang's open **Paged Experts** PR #29971, single-GPU); the fork built
+its offload independently earlier, but the honest remaining delta is the **composition** — running it
+across three mismatched cards under asymmetric TP + asymmetric DCP, which #29971 does not do — not the
+offloading itself. The 122B is a bring-up/validation run of a feature that is still in progress.
 
 ## 8 — Measured VRAM budget: an absolute per-rank MiB budget
 
