@@ -102,29 +102,37 @@ draft VRAM to be runtime-adaptive (robustness / no-regret on mixed streams, not 
 switching costs ~+5.7% systemic), upstream spends less and stays fixed. The routing *mechanism* is
 diagram 11.
 
-## 4 — Session KV spill: overflow the newest session to host RAM
+## 4 — Session KV spill (request-level KV offload): keep the newest in-flight request decoding on host RAM
 
-<img src="topologies/04-session-kv-spill.svg" alt="Session KV spill (measured S1): the newest session's KV band is freed on device and moved to a host KV tier (estimated bytes) while it keeps decoding; upstream pauses/recomputes the request with no host tier. Isolation matrix: the device-resident session holds 10.4/13.4/19.9/26.0 tok/s at tick-interval 1/2/4/8 during a spill, violating the isolation target at tick 1/2" width="100%">
+<img src="topologies/04-session-kv-spill.svg" alt="Session KV spill, i.e. request-level KV offload (measured S1): under VRAM pressure the newest in-flight request's KV band is moved to host RAM and that request keeps decoding on the host, instead of being preempted; victims are ordered FCFS by arrival (oldest request stays fully resident); upstream swaps/recomputes and pauses the request with no host-decode path. Isolation matrix: the device-resident request holds 10.4/13.4/19.9/26.0 tok/s at tick-interval 1/2/4/8 during a spill, violating the isolation target at tick 1/2" width="100%">
 
-On device-KV overflow the **newest** session's full-attention KV shard is pushed to host RAM and that
-session **keeps decoding** (block-LSE attention, eager `bs=1` tick); GDN/Mamba state always stays
-resident. S1 is measured: **zero-overhead when unused +0.16%**, host decode **8.1 tok/s @1k ctx**,
-restore **~0.4 s**, determinism **50/50 exact** host-vs-device. The host KV bytes (32 KiB/token ×
-spilled tokens) are estimated from the measured cell size, and the long-context throughput curve
-(32k ≈63 … 262k ≈7.6 tok/s) is **modeled, not benchmarked** (needs S2), worthwhile only with uneven
-DCP active. Upstream has no per-session host-KV decode: under pressure it retracts/recomputes or
-pauses the request — the device KV pool is a hard ceiling.
+> **Terminology.** The flag and code call this *session* KV offload (`--enable-kv-session-offload`), and
+> that name is kept as the feature's label. But the unit here is **not** a multi-turn conversation
+> (persistent context across requests, as in LMCache/Mooncake "session KV offload") — it is a **single
+> in-flight sglang request** (one running sequence). Read "session" below as **"in-flight request"**.
 
-The more important number is not the spilled session's rate but **how the device-resident (non-spilled)
-session runs during a spill**. Measured isolation matrix (ctx ~1.6k): pre-spill both sessions run
-**~40 tok/s**; during a spill the **device-resident** session holds **10.4 / 13.4 / 19.9 / 26.0 tok/s at
-tick-interval 1 / 2 / 4 / 8**, while the **spilled** session stays **~7–8 tok/s** across all ticks.
-Honestly, the device session is still **dragged along** by the spill: the isolation target (the device
+The differentiator is **request-level KV swapping under memory pressure**: when device KV overflows, the
+**newest in-flight request's** full-attention KV shard is moved to host RAM and that request **keeps
+decoding on the host** (block-LSE attention, eager `bs=1` tick) — in the spirit of preemption-by-swapping
+(KV swapped to host), but the spilled request **keeps decoding rather than pausing**. Victims are ordered
+**FCFS by arrival** — the **oldest** running request stays fully device-resident, the **newest** is the
+one spilled. **Only KV spills; GDN/Mamba state always stays resident.** S1 is measured: **zero-overhead
+when unused +0.16%**, host decode **8.1 tok/s @1k ctx**, restore **~0.4 s**, determinism **50/50 exact**
+host-vs-device. The host KV bytes (32 KiB/token × spilled tokens) are estimated from the measured cell
+size, and the long-context throughput curve (32k ≈63 … 262k ≈7.6 tok/s) is **modeled, not benchmarked**
+(needs S2), worthwhile only with uneven DCP active. Upstream has no per-request host-**decode** path:
+under KV pressure it swaps/recomputes or **pauses** the request — the device KV pool is a hard ceiling.
+
+The more important number is not the spilled request's rate but **how the device-resident (non-spilled)
+request runs during a spill**. Measured isolation matrix (ctx ~1.6k): pre-spill both requests run
+**~40 tok/s**; during a spill the **device-resident** request holds **10.4 / 13.4 / 19.9 / 26.0 tok/s at
+tick-interval 1 / 2 / 4 / 8**, while the **spilled** request stays **~7–8 tok/s** across all ticks.
+Honestly, the device request is still **dragged along** by the spill: the isolation target (the device
 loses at most its 1/N tick share) is met only **from tick-interval 4 upward** and is **violated at tick
 1 / 2**, where the device drops from ~40 to ~10–13 tok/s — because the spill step **still runs eager and
 blocks the shared scheduler tick**. This is the open item; the planned **bs=1 spill CUDA-graph (Step 5,
 not yet built, not measured)** should take the eager spill tick out of the shared cadence, after which
-even tick-interval 1 should barely touch the device-resident session. The *mechanism* and the full
+even tick-interval 1 should barely touch the device-resident request. The *mechanism* and the full
 isolation matrix are in diagram 12.
 
 ## 5 — Multi-rank co-location: TP beyond the GPU count — and the KV-head count
@@ -258,8 +266,8 @@ and its delta is precisely **two anti-starvation guarantees** generic priority d
    `fast_lane_priority − 1` and jumps **ahead of** the fast tier — so a stream of fast requests **cannot
    block** a waiting normal one indefinitely.
 
-It also couples with session KV spill (a fast request can spill a normal session's KV to host rather than
-queue; a fast request is never itself spilled). This is a **scheduling-behaviour** difference, **default
+It also couples with session KV spill (a fast request can spill a normal in-flight request's KV to host
+rather than queue; a fast request is never itself spilled). This is a **scheduling-behaviour** difference, **default
 off** (default path byte-unchanged); the reserved-floor byte cost was not registry-dumped (drawn
 estimated). The *mechanism* is diagram 13.
 
@@ -324,19 +332,21 @@ acceptance-driven **bandit** (opt-in), with a context-length gate keeping DFLASH
 Upstream adaptive spec-decode adapts `k` for a single drafter; switching between draft *algorithms* is
 the fork addition. Work in progress (§5).
 
-## 12 — Session KV spill (mechanism)
+## 12 — Session KV spill / request-level KV offload (mechanism)
 
-<img src="topologies/12-session-kv-spill.svg" alt="On VRAM KV overflow the newest session's KV shard is offloaded to host RAM and keeps decoding via host-streamed attention; strict FCFS victim order, fast-lane precedence, FIFO restore. Isolation matrix during a spill: device-resident session 10.4/13.4/19.9/26.0 tok/s at tick-interval 1/2/4/8 (violated at tick 1/2), planned bs=1 spill-graph resolves it" width="100%">
+<img src="topologies/12-session-kv-spill.svg" alt="Request-level KV offload (the feature's flag calls it session): on VRAM KV overflow the newest in-flight request's KV shard is offloaded to host RAM and keeps decoding via host-streamed attention; strict FCFS-by-arrival victim order (oldest request stays resident), fast-lane precedence, FIFO restore. Isolation matrix during a spill: the device-resident request holds 10.4/13.4/19.9/26.0 tok/s at tick-interval 1/2/4/8 (violated at tick 1/2), planned bs=1 spill-graph resolves it" width="100%">
 
-On device KV overflow the **newest** session's KV shard moves to host RAM and keeps decoding from host
-in a separate eager `bs=1` tick, never mixed into the device CUDA-graph batch. Victim order is strict
-FCFS with fast-lane precedence; sessions restore FIFO; only KV spills, GDN state stays resident.
-Experimental S1 measured; the long-context curve is modeled (needs S2). Upstream pauses/recomputes a
-request under KV pressure (`--enable-kv-session-offload`, §20).
+The unit is a **single in-flight request** (one running sequence), not a multi-turn conversation — the
+flag name `session` is kept as the feature's label only. On device KV overflow the **newest in-flight
+request's** KV shard moves to host RAM and keeps decoding from host in a separate eager `bs=1` tick, never
+mixed into the device CUDA-graph batch. Victim order is strict **FCFS by arrival** (the oldest running
+request stays fully resident) with fast-lane precedence; requests restore FIFO; only KV spills, GDN state
+stays resident. Experimental S1 measured; the long-context curve is modeled (needs S2). Upstream
+swaps/recomputes or **pauses** a request under KV pressure (`--enable-kv-session-offload`, §20).
 
-The diagram's **isolation matrix** (measured, ctx ~1.6k) records how the **device-resident** session
+The diagram's **isolation matrix** (measured, ctx ~1.6k) records how the **device-resident** request
 runs during a spill: **10.4 / 13.4 / 19.9 / 26.0 tok/s at tick-interval 1 / 2 / 4 / 8** (pre-spill
-~40), spilled session ~7–8 tok/s. The isolation target holds only from tick-interval 4 up and is
+~40), spilled request ~7–8 tok/s. The isolation target holds only from tick-interval 4 up and is
 **violated at tick 1 / 2** because the spill step still runs eager on the shared tick — the open item
 the planned **bs=1 spill-graph (Step 5, not yet built, not measured)** is meant to resolve.
 
@@ -351,7 +361,7 @@ anti-starvation guarantees: **reserved heavy slots** (`max_heavy_preemptible = n
 reserved_slots`; preemption stops at the floor, so fast load cannot fully starve normal requests) and
 **heavy aging** (a normal request waiting past the window is promoted to `fast_lane_priority − 1` and
 jumps ahead of the fast tier). It couples with session KV spill (a fast request can spill a normal
-session to host rather than queue; a fast request is never itself spilled). Default off — the default
+in-flight request to host rather than queue; a fast request is never itself spilled). Default off — the default
 path is unchanged (`--enable-fast-lane`, §16). Stated as what each side does, not a ranking.
 
 ## 14 — Measured VRAM budget (mechanism)
