@@ -152,11 +152,14 @@ def evseg(x, y, w, h, key, ev, label="", size=8.5, lead=None):
 
 
 def stack_card(x, base_y, name, sub, vram, segs, PX, cardw=140, force_ev=None,
-               free_label="free"):
+               free_label="free", emph=None):
     """A GPU card, bottom-aligned to base_y, height = vram*PX.
 
     segs: list of (key, gb, label, ev). ev in {measured, estimated, unknown}.
     force_ev: if set, overrides every segment's evidence (upstream panels -> estimated).
+    emph: if set to a colour key, that segment is FOREGROUNDED (bold accent border)
+      while the OTHER of {weights, kv} is de-emphasised (muted grey, kept to scale)
+      so the reader sees which axis this diagram is about.
     Remainder up to vram is drawn as 'free'.
     """
     th = base_y - vram * PX
@@ -167,8 +170,24 @@ def stack_card(x, base_y, name, sub, vram, segs, PX, cardw=140, force_ev=None,
     cy = th
     for key, gb, label, ev in segs:
         e = force_ev or ev
-        o.append(evseg(x, cy, cardw, gb * PX, key, e, label))
-        cy += gb * PX
+        h = gb * PX
+        muted = emph is not None and key in ("weights", "kv") and key != emph
+        if muted:
+            # de-emphasised background segment (kept to scale, muted grey)
+            o.append(rect(x, cy, cardw, h, "#c3cad0", stroke="#9aa3ac", sw=1.0,
+                          dash="4 2" if e == "estimated" else None))
+            if e == "estimated":
+                o.append(f'<rect x="{x:.1f}" y="{cy:.1f}" width="{cardw:.1f}" '
+                         f'height="{h:.1f}" fill="url(#hatch)" stroke="none"/>')
+            if label and h >= 13:
+                o.append(text(x + cardw / 2, cy + h / 2 + 3.2, label, size=8.2, anchor="middle", color="#5a636c"))
+            elif label and h >= 9.5:
+                o.append(text(x + cardw / 2, cy + h / 2 + 2.6, label, size=7.2, anchor="middle", color="#5a636c"))
+        else:
+            o.append(evseg(x, cy, cardw, h, key, e, label))
+            if emph is not None and key == emph:
+                o.append(rect(x, cy, cardw, h, "none", stroke="#12303a", sw=2.6))
+        cy += h
         used += gb
     if used < vram - 0.03:
         fh = (vram - used) * PX
@@ -368,9 +387,10 @@ def feature(spec):
         lcards = spec["left_cards"]
         lxs, lcw = place(40, mid - 26, len(lcards),
                          maxcw=spec.get("left_cw", 140))
+        emph = spec.get("emph")
         for (nm, sub, vram, segs), x in zip(lcards, lxs):
             c, _ = stack_card(x, base, nm, sub, vram, segs, PX, cardw=lcw,
-                              free_label=spec.get("left_free", "free"))
+                              free_label=spec.get("left_free", "free"), emph=emph)
             b.append(c)
         # right cards (upstream, all estimated)
         rcards = spec["right_cards"]
@@ -379,7 +399,7 @@ def feature(spec):
         for (nm, sub, vram, segs), x in zip(rcards, rxs):
             c, _ = stack_card(x, base, nm, sub, vram, segs, PX, cardw=rcw,
                               force_ev="estimated",
-                              free_label=spec.get("right_free", "free"))
+                              free_label=spec.get("right_free", "free"), emph=emph)
             b.append(c)
         b.append(vdivider(mid, topY - 4, base + 18))
         yL = base + 30
@@ -417,34 +437,40 @@ FEATURES = [
     # -- 1. Uneven DCP -----------------------------------------------------
     {
         "name": "01-uneven-dcp.svg",
-        "title": "1 — Uneven DCP: token-axis KV split so aggregate context scales with mismatched cards",
-        "subtitle": "Fork on the rig vs a hypothetical homogeneous upstream config for the same 27B workload.",
+        "title": "1 — Uneven DCP = the KV / TOKEN axis: KV token-bands follow card VRAM, decoupled from the weight split",
+        "subtitle": "Read this diagram for the KV bands (foreground); the weight shards are the constant grey background here. Fork on the rig vs a homogeneous upstream config for the same 27B workload.",
         "sentences": [
-            ("Left (measured): FP8-27B TP=3 + uneven-DCP, --rank-gpu-id 0,1,2 "
-             "--rank-tp-ratio auto --rank-gpu-memory-mib 28591,16464,16464. KV is split along the "
-             "TOKEN axis (374310 / 212109 / 212109 tokens), so aggregate context grows with the "
-             "cards you already own — measured 735k tokens, 2.81x the hand-budget start.", "#333"),
-            ("Right (illustrative): the natural homogeneous upstream config is 2 identical 24 GB cards "
-             "at even TP=2 (4 KV heads split 2/rank). TP=3 is not legal here — 4 KV heads are not "
-             "divisible by 3 — which is the neutral reason upstream lands on TP in {1,2,4}.", "#555"),
+            ("Left (measured): FP8-27B TP=3 + uneven-DCP, --rank-gpu-id 0,1,2 --rank-tp-ratio auto "
+             "--rank-gpu-memory-mib 28591,16464,16464. The MESSAGE is the green KV bands: KV is split along "
+             "the TOKEN axis (374310 / 212109 / 212109 tokens) sized to each card's VRAM budget "
+             "(28591:16464:16464 ≈ 1.74:1:1) — DECOUPLED from the weight ratio (12.7:8.0:8.0 ≈ 1.59:1:1, grey). "
+             "Aggregate context grows with the cards you already own: 735k tokens, 2.81x the hand-budget start.", "#333"),
+            ("This is a DIFFERENT axis from Uneven TP (§2): §2 sizes the WEIGHT shards to card compute; §1 sizes "
+             "the KV TOKENS to card VRAM. On the rig both run together — --rank-tp-ratio auto sets the uneven "
+             "TP weight split AND the uneven-DCP KV token split at once — so a rank's KV band is not tied to its "
+             "weight shard.", "#1d6b34"),
+            ("Right (illustrative): the natural homogeneous upstream config is 2 identical 24 GB cards at even "
+             "TP=2 (4 KV heads split 2/rank). TP=3 is not legal here — 4 KV heads are not divisible by 3. "
+             "Upstream head-shards KV, so aggregate KV does not grow with added cards the way the token split does.", "#555"),
         ],
-        "left_label": "htsglang — FP8-27B TP=3 + uneven-DCP on the rig",
+        "left_label": "htsglang — uneven-DCP: KV / TOKEN axis (KV foregrounded)",
         "right_label": "upstream — 2x identical 24 GB, even TP=2",
+        "emph": "kv",
         "left_cards": [
             ("RTX 5090", "rank0 · 32.6 GB", 32.6, [
-                ("weights", 12.7, "weights", M),
-                ("kv", 11.42, "KV 374k tok", M),
+                ("weights", 12.7, "weights (from TP split)", M),
+                ("kv", 11.42, "KV 374k tok ← card VRAM", M),
                 ("gdn", 0.55, "GDN", M),
                 ("free", 0.41, "", M),  # graphs
                 ("ctx", 0.80, "", M)]),
             ("RTX 3080", "rank1 · 20.5 GB", 20.5, [
-                ("weights", 8.0, "weights", M),
-                ("kv", 6.48, "KV 212k", M),
+                ("weights", 8.0, "weights (TP split)", M),
+                ("kv", 6.48, "KV 212k tok", M),
                 ("gdn", 0.47, "GDN", M),
                 ("ctx", 0.78, "", M)]),
             ("RTX 3080", "rank2 · 20.5 GB", 20.5, [
-                ("weights", 8.0, "weights", M),
-                ("kv", 6.48, "KV 212k", M),
+                ("weights", 8.0, "weights (TP split)", M),
+                ("kv", 6.48, "KV 212k tok", M),
                 ("gdn", 0.47, "GDN", M),
                 ("ctx", 0.78, "", M)]),
         ],
@@ -461,49 +487,57 @@ FEATURES = [
         "host": ("Host RAM (DDR) — no spill in this mode",
                  [("free", 1.0, "not captured (low, no host tier)", U)]),
         "left_notes": [
-            ("Segments MEASURED per rank (weights, token-KV band, GDN state, ctx). Exact host-RAM "
-             "floor for this non-spill config was not captured.", "#1d6b34"),
+            ("KV bands (green, foreground) + weights/GDN/ctx are MEASURED per rank; the weight shards are drawn "
+             "GREY here because in this diagram they are the constant background, not the point. The KV token "
+             "ratio tracks the MiB budget (1.74:1:1), NOT the weight ratio (1.59:1:1) — that gap is the "
+             "decoupling. Exact host-RAM floor for this non-spill config was not captured.", "#1d6b34"),
         ],
         "right_notes": [
             ("Head-axis KV stores every token per head on each card, so aggregate KV does not grow "
              "with added cards the way the token-axis split does. Assumed card size named; not measured.", "#4a5568"),
         ],
-        "core": ("the fork splits KV along the token axis so aggregate context scales with the mismatched "
-                 "cards you already own; upstream even-TP head-shards KV and needs identical cards whose "
-                 "KV-head count divides the rank count — a capacity / hardware-premise difference, not \"faster\"."),
+        "core": ("the fork splits KV along the TOKEN axis, sized to each card's VRAM and DECOUPLED from the weight "
+                 "split, so aggregate context scales with the mismatched cards you already own; upstream even-TP "
+                 "head-shards KV and needs identical cards whose KV-head count divides the rank count. (Contrast "
+                 "§2, which is about the WEIGHT axis; on the rig both run together.)"),
         "legend_keys": ["weights", "kv", "gdn", "ctx", "free"],
     },
     # -- 2. Uneven TP ------------------------------------------------------
     {
         "name": "02-uneven-tp.svg",
-        "title": "2 — Uneven TP (--rank-tp-ratio): size each weight shard to the specific card",
-        "subtitle": "Fork on the rig vs a homogeneous upstream even-TP config for the same 27B workload.",
+        "title": "2 — Uneven TP = the WEIGHT axis: size each weight shard to the card's compute (ratio 2:1:1, Q-heads 12/6/6)",
+        "subtitle": "Read this diagram for the weight shards (foreground); the KV here is just the leftover remainder (grey). Fork on the rig vs a homogeneous upstream even-TP config for the same 27B workload.",
         "sentences": [
-            ("Left (measured): 27B TP=3, --rank-tp-ratio 2,1,1 --rank-gpu-memory-mib 26000,15000,15000, "
-             "one rank per GPU. Q heads split 12/6/6, the 5090 carries the 2x shard; measured weight "
-             "shards 12.7 / 8.0 / 8.0 GiB. KV is sized as the measured remainder (262k auto-fit).", "#333"),
-            ("Right (illustrative): upstream even-TP gives every rank an IDENTICAL shard, so it wants N "
-             "equal cards (2x 24 GB shown). On mixed cards it would size every rank to the smallest and "
-             "strand the surplus of the larger one. TP=3 is illegal for this model (4 KV heads).", "#555"),
+            ("Left (measured): 27B TP=3, --rank-tp-ratio 2,1,1 --rank-gpu-memory-mib 26000,15000,15000, one "
+             "rank per GPU. The MESSAGE is the blue weight shards: Q heads split 12 / 6 / 6, the 5090 carries "
+             "the 2x shard — measured weight shards 12.7 / 8.0 / 8.0 GiB (ratio 2 : 1 : 1, sized to card "
+             "COMPUTE). KV here is only the leftover remainder (grey), not the point.", "#333"),
+            ("This is a DIFFERENT axis from Uneven DCP (§1): §2 sizes the WEIGHT shards to card compute; §1 "
+             "sizes the KV TOKENS to card VRAM. On the rig both run together — --rank-tp-ratio auto sets the "
+             "weight split AND the KV token split at once — so do not read the two diagrams as the same thing.", "#1d6b34"),
+            ("Right (illustrative): upstream even-TP gives every rank an IDENTICAL shard, so it wants N equal "
+             "cards (2x 24 GB shown). On mixed cards it would size every rank to the smallest and strand the "
+             "surplus of the larger one. TP=3 is illegal for this model (4 KV heads).", "#555"),
         ],
-        "left_label": "htsglang — uneven-TP ratio 2,1,1 on the rig",
+        "left_label": "htsglang — uneven-TP: WEIGHT axis, ratio 2:1:1 (weights foregrounded)",
         "right_label": "upstream — 2x identical 24 GB, even TP=2",
+        "emph": "weights",
         "left_cards": [
-            ("RTX 5090", "rank0 · ratio 2", 32.6, [
-                ("weights", 12.7, "weight shard (2x)", M),
+            ("RTX 5090", "rank0 · ratio 2 · Q 12", 32.6, [
+                ("weights", 12.7, "weight shard 2x (Q 12/24)", M),
                 ("gdn", 0.55, "GDN", M),
                 ("ctx", 0.80, "", M),
-                ("kv", 14.5, "KV = measured remainder", E)]),
-            ("RTX 3080", "rank1 · ratio 1", 20.5, [
-                ("weights", 8.0, "weight shard", M),
+                ("kv", 14.5, "KV (just the remainder)", E)]),
+            ("RTX 3080", "rank1 · ratio 1 · Q 6", 20.5, [
+                ("weights", 8.0, "weight shard (Q 6/24)", M),
                 ("gdn", 0.47, "GDN", M),
                 ("ctx", 0.78, "", M),
-                ("kv", 8.8, "KV remainder", E)]),
-            ("RTX 3080", "rank2 · ratio 1", 20.5, [
-                ("weights", 8.0, "weight shard", M),
+                ("kv", 8.8, "KV (remainder)", E)]),
+            ("RTX 3080", "rank2 · ratio 1 · Q 6", 20.5, [
+                ("weights", 8.0, "weight shard (Q 6/24)", M),
                 ("gdn", 0.47, "GDN", M),
                 ("ctx", 0.78, "", M),
-                ("kv", 8.8, "KV remainder", E)]),
+                ("kv", 8.8, "KV (remainder)", E)]),
         ],
         "right_cards": [
             ("identical 24 GB", "rank0 · even shard", 24, [
@@ -516,17 +550,19 @@ FEATURES = [
                 ("ctx", 1.5, "", E)]),
         ],
         "left_notes": [
-            ("Weight shards + GDN + ctx MEASURED; KV is the measured remainder (exact per-rank GiB for "
-             "this config not separately dumped -> drawn ESTIMATED). Earlier 68 / 97 tok/s figures used a "
-             "contaminated bench (pre-2026-07-22) and are withdrawn, not shown as fact.", "#1d6b34"),
+            ("Weight shards (blue, foreground) + GDN + ctx are MEASURED; the weight ratio 2:1:1 (Q-heads 12/6/6) "
+             "is the message — shards sized to card COMPUTE. KV is drawn GREY because here it is only the "
+             "measured remainder (exact per-rank GiB not separately dumped -> ESTIMATED). Earlier 68 / 97 tok/s "
+             "figures used a contaminated bench (pre-2026-07-22) and are withdrawn, not shown as fact.", "#1d6b34"),
         ],
         "right_notes": [
             ("Even-TP is clean ON identical cards; the contrast is the hardware premise (N equal cards), "
              "not the per-card layout. Assumed card size named; not measured.", "#4a5568"),
         ],
-        "core": ("the fork sizes each shard to the specific card, using a 32 GB + 2x20 GB set as-is; "
-                 "upstream even-TP gives identical shards and therefore wants N equal cards (and strands a "
-                 "bigger card if mixed) — a hardware-premise difference, not a speed claim."),
+        "core": ("the fork sizes each WEIGHT shard to the specific card's compute (ratio 2:1:1), using a 32 GB + "
+                 "2x20 GB set as-is; upstream even-TP gives identical shards and therefore wants N equal cards "
+                 "(and strands a bigger card if mixed). (Contrast §1, which is about the KV/TOKEN axis; on the "
+                 "rig both run together.)"),
         "legend_keys": ["weights", "kv", "gdn", "ctx", "free"],
     },
     # -- 3. Adaptive drafter routing --------------------------------------

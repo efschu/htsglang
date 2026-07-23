@@ -50,27 +50,41 @@ would otherwise appear.
 
 # The features, side by side
 
-## 1 — Uneven DCP: token-axis KV split
+## 1 — Uneven DCP = the KV / token axis
 
-<img src="topologies/01-uneven-dcp.svg" alt="FP8-27B TP=3 uneven-DCP on the rig: per-rank weights 12.7/8.0/8.0 GiB and token-KV bands 374k/212k/212k tokens (measured), versus a hypothetical 2x identical 24 GB even-TP=2 upstream config (estimated)" width="100%">
+<img src="topologies/01-uneven-dcp.svg" alt="Uneven DCP, KV/token axis: the foregrounded green KV token-bands are 374k/212k/212k tokens sized to each card's VRAM (28591:16464:16464 ≈ 1.74:1:1), decoupled from the grey weight shards (12.7/8.0/8.0 GiB ≈ 1.59:1:1); measured on FP8-27B TP=3 on the rig, versus a hypothetical 2x identical 24 GB even-TP=2 upstream config (estimated) that head-shards KV" width="100%">
 
-On the rig (measured), the KV cache is split along the **token axis** across three mismatched
-cards — 374310 / 212109 / 212109 tokens — so **aggregate context scales with the cards you already
-own** (measured 735k tokens, 2.81× the hand-budget start). The upstream-natural config is 2
-identical 24 GB cards at even TP=2: with **4 KV heads**, TP=3 is not legal (4 is not divisible by 3),
-which is the neutral reason upstream even-TP lands on TP ∈ {1, 2, 4}. Head-axis KV stores every
-token per head on each card, so it does not grow aggregate token capacity as cards are added the way
-the token-axis split does. The exact host-RAM floor for this non-spill config was not captured.
+**Read this diagram for the KV bands (green, foreground); the weight shards are the constant grey
+background here.** On the rig (measured), the KV cache is split along the **token axis** across three
+mismatched cards — 374310 / 212109 / 212109 tokens — **sized to each card's VRAM budget**
+(28591 : 16464 : 16464 ≈ **1.74 : 1 : 1**), which is **decoupled from the weight ratio**
+(12.7 : 8.0 : 8.0 ≈ **1.59 : 1 : 1**). That gap is the whole point: a rank's KV band follows its VRAM,
+not its weight shard, so **aggregate context scales with the cards you already own** (measured 735k
+tokens, 2.81× the hand-budget start). The upstream-natural config is 2 identical 24 GB cards at even
+TP=2: with **4 KV heads**, TP=3 is not legal (4 is not divisible by 3); upstream head-shards KV, so it
+does not grow aggregate token capacity as cards are added. The exact host-RAM floor for this non-spill
+config was not captured.
 
-## 2 — Uneven TP: size each shard to the card
+**Do not confuse §1 with §2.** §1 (here) is the **KV / token axis**; §2 is the **weight axis**. On the
+rig they **run together** — `--rank-tp-ratio auto` sets the uneven-TP weight split *and* the uneven-DCP
+KV token split at once — which is exactly why a rank's KV band is not tied to its weight shard.
 
-<img src="topologies/02-uneven-tp.svg" alt="27B uneven-TP ratio 2,1,1 on the rig: measured weight shards 12.7/8.0/8.0 GiB with KV as the measured remainder, versus a 2x identical 24 GB even-TP=2 upstream config (estimated)" width="100%">
+## 2 — Uneven TP = the weight axis
 
-`--rank-tp-ratio 2,1,1` sizes each weight shard to its card — Q heads split 12/6/6, the 5090 carries
-the 2× shard (measured shards 12.7 / 8.0 / 8.0 GiB); KV is sized as the measured remainder (262k
-auto-fit). Upstream even-TP gives every rank an **identical** shard, so it wants **N equal cards**; on
-mixed cards it would size every rank to the smallest and strand the surplus of the larger one. The
-earlier 68 / 97 tok/s decode figures used a contaminated bench and are withdrawn.
+<img src="topologies/02-uneven-tp.svg" alt="Uneven TP, weight axis: the foregrounded blue weight shards are 12.7/8.0/8.0 GiB (ratio 2:1:1, Q-heads 12/6/6) sized to each card's compute; the KV here is only the grey leftover remainder; measured on 27B TP=3 on the rig, versus a 2x identical 24 GB even-TP=2 upstream config (estimated) with equal shards" width="100%">
+
+**Read this diagram for the weight shards (blue, foreground); the KV here is only the leftover
+remainder (grey).** `--rank-tp-ratio 2,1,1` sizes each **weight shard** to its card's **compute** —
+**Q heads split 12 / 6 / 6**, the 5090 carries the **2× shard** (measured shards 12.7 / 8.0 / 8.0 GiB,
+ratio **2 : 1 : 1**). KV on this diagram is just the measured remainder, not the message. Upstream
+even-TP gives every rank an **identical** shard, so it wants **N equal cards**; on mixed cards it would
+size every rank to the smallest and strand the surplus of the larger one. The earlier 68 / 97 tok/s
+decode figures used a contaminated bench and are withdrawn.
+
+**Do not confuse §2 with §1.** §2 (here) is the **weight axis** (shard size follows card compute); §1
+is the **KV / token axis** (KV tokens follow card VRAM, decoupled from the weights). On the rig both
+run together via `--rank-tp-ratio auto`, so the two diagrams describe **different axes of the same
+run**, not the same thing.
 
 ## 3 — Adaptive drafter routing (NEXTN ↔ DFLASH)
 
