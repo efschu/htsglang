@@ -158,9 +158,14 @@ vLLM/upstream)**; the fork's delta is only the **uneven-TP adaptation** (256-sup
 MLP coarsening, the MMQ out-of-bounds fix under expert sharding, and Qwen3.5/3.6 + Gemma-4 arch
 adapters) plus the MMVQ↔MMQ crossover tuning. The GGUF quant path is not a fork invention.
 
-## 6 — Weightless-KV lane: free the workers of weights so their VRAM becomes device KV
+## 6 — Weightless-KV lane: free the workers of weights so their VRAM becomes device KV (experimental / WIP)
 
 <img src="topologies/06-weightless-kv-lane.svg" alt="Weightless-KV lane: the 5090 head holds all layer weights (TP=1) and is the only rank that projects K,V; the two 3080 donor workers hold zero layer weights (~14 GiB freed each, measured) and only the token-sharded device-KV cache — all KV heads but only this rank's token slice, not replicated (DCP splits the token axis); Q and the new token's K,V are broadcast from the head each step and the workers run partial attention then LSE-merge; an optional host KV tier (~12.6 GiB pinned) extends context only beyond the pooled device KV, to a proven 262k; upstream holds weights on every identical rank" width="100%">
+
+**Status: experimental / work in progress.** The lane is implemented and its capacity result is measured
+(262k proven), but it is not a finished production mode — the deep-context throughput path is still being
+worked (graph + prefetch landed; see the rig footnote below), so treat the numbers here as a bring-up
+state, not a shipped guarantee.
 
 This is a **capacity** feature, not a "fast" one — the name is historical (`--weightless-kv-fastlane`)
 and does **not** mean the lane is fast.
@@ -373,7 +378,8 @@ Upstream sizes memory by a global fraction (`--rank-gpu-memory-mib` + component 
 - **Contaminated throughput figures** (pre-2026-07-22 SSE bench) are withdrawn, not shown as fact.
 - **In-progress / experimental features** are labelled as such: the 122B expert-offload run is a
   bring-up/validation run (in progress), adaptive drafter routing is work in progress, session KV
-  spill is experimental (S1), and PD-disaggregation is experimental/WIP (implemented but not
+  spill is experimental (S1), the weightless-KV lane is experimental/WIP (capacity measured, throughput
+  path still in progress), and PD-disaggregation is experimental/WIP (implemented but not
   perf-/VRAM-benchmarked).
 - **GGUF attribution:** where GGUF appears (co-location, §5), the quantisation format and its
   K-quant / MMQ / MMVQ kernels come from ggml/llama.cpp via upstream; the fork's contribution is the
