@@ -890,6 +890,57 @@ def test_spill_graph_pipeline_mini_smoke():
             assert plan[j]["cnt"] == 0 and plan[j]["host_rows"].numel() == 0
 
 
+def test_spill_graph_all_rungs_plan_correct():
+    """Coverage for rungs 2-28 (under real load only rung 1 is reachable --
+    partial spill pins host_tail to ~1 block). Synthetic sweep: for a tail
+    landing on EACH ladder rung, the picked rung matches and the out-of-graph
+    plan round-trips (fixed block count == rung, real rows == the tail window,
+    trailing empties). This is the deterministic per-rung correctness the
+    captured body depends on; numeric graph==eager per rung is GPU (needs a
+    synthetic-tail injection since real load never grows the tail past 1
+    block)."""
+    B = 512
+    region = 13878
+    ladder = spill_graph_rung_ladder(spill_graph_blocks_needed(region, B))
+    assert ladder == [1, 2, 3, 4, 5, 6, 7, 8, 12, 18, 27, 28]  # the live rig ladder
+    for rung in ladder:
+        # a tail that needs exactly `rung` blocks: (rung-1)*B < owned <= rung*B,
+        # capped at the region
+        owned = min(rung * B, region)
+        needed = spill_graph_blocks_needed(owned, B)
+        picked = spill_graph_pick_rung(needed, ladder)
+        assert picked is not None and picked >= needed
+        # the picked rung is the smallest covering; for a full-block owned it
+        # equals `rung` (except the capped top rung, where owned<rung*B)
+        if owned == rung * B:
+            assert picked == rung
+        base = 100
+        plan = spill_graph_out_plan(base, owned, B, picked, device="cpu")
+        assert len(plan) == picked  # constant captured shape per rung
+        real = torch.cat([b["host_rows"] for b in plan if b["cnt"] > 0]) \
+            if any(b["cnt"] > 0 for b in plan) else torch.empty(0, dtype=torch.int64)
+        assert torch.equal(real, torch.arange(base, base + owned, dtype=torch.int64))
+        assert sum(b["cnt"] for b in plan) == owned
+        # no host row escapes the region-scoped window
+        for b in plan:
+            if b["cnt"]:
+                assert int(b["host_rows"].max()) < base + owned
+        # trailing blocks past the data are empty no-ops
+        first_real = spill_graph_blocks_needed(owned, B)
+        for j in range(first_real, picked):
+            assert plan[j]["cnt"] == 0
+
+
+def test_spill_graph_over_ladder_falls_back():
+    """Over-ladder (more blocks than the top rung) -> None -> eager fallback.
+    Under real load this is unreachable (host_tail <= region <= top rung), but
+    the guard must hold for the synthetic / mis-sized case."""
+    B = 512
+    ladder = spill_graph_rung_ladder(spill_graph_blocks_needed(13878, B))  # top 28
+    assert spill_graph_pick_rung(29, ladder) is None
+    assert spill_graph_pick_rung(1000, ladder) is None
+
+
 def test_restore_hysteresis():
     h = RestoreHysteresis(3)
     assert not h.update(True)

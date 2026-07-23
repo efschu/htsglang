@@ -192,9 +192,25 @@ def num_blocks_rank_uniform(counts: List[int], block_size: int) -> int:
 
 def spill_graph_enabled() -> bool:
     """Master gate for the S5 spill-tick graph. Default OFF: the flag being
-    unset keeps the spill tick on the byte-identical eager block loop (the
-    'flag AUS byte-identisch' invariant is then trivially held). The GPU
-    validation opts in via SGLANG_KVSO_SPILL_GRAPH=1."""
+    unset means NO S5 code runs -- the spill tick stays on the eager block
+    loop, so the CODE PATH is byte-identical to S2/S3/S4 ('flag AUS
+    byte-identisch'). The GPU validation opts in via SGLANG_KVSO_SPILL_GRAPH=1.
+
+    NORMAL-PATH NUMERIC CAVEAT (GPU-measured, classified DECODE-CLASS): turning
+    the flag ON also captures the spill-tick rung graphs at boot, which shifts
+    the CUDA workspace / autotune layout enough to flip an occasional
+    near-tie argmax on this heterogeneous non-batch-invariant rig (5090 sm120 +
+    3080 sm86, uneven DCP). So flag ON is NOT bit-exact vs flag OFF on the
+    pre-spill device path (measured: greedy solo diverges ~token 70). This is
+    BENIGN decode-class, not a regression: on this rig there is NO bit-exact
+    device-decode baseline to begin with -- flag OFF greedy solo is itself
+    non-reproducible cross-boot (measured: three fresh boots diverge at tokens
+    34 / 112, single-origin flips that compound autoregressively). flag ON was
+    in fact cross-boot IDENTICAL in the same test. The 'flag OFF byte-identisch'
+    claim is a CODE-PATH claim (no S5 code executes) and holds; numeric
+    cross-boot determinism is a rig property independent of this feature.
+    Making flag ON bit-exact-neutral is structurally impossible here (no
+    bit-exact target exists), so it is documented rather than 'fixed'."""
     return os.environ.get("SGLANG_KVSO_SPILL_GRAPH", "0") == "1"
 
 
@@ -402,6 +418,16 @@ def select_spill_victim(
     fast_pressure=True (a fast-lane request needs device space): fast
     beats FCFS -- any normal session may be victimized, INCLUDING the
     oldest. Fast-lane requests are never victims either way.
+
+    BY-DESIGN CONSEQUENCE (a SINGLE session never self-spills): under plain
+    decode-OOM with exactly one running session, that session IS the oldest
+    -> untouchable -> no victim -> None -> the stock retract/length-truncate
+    path caps it at the device budget instead of spilling it to host. Spill
+    is a SCHEDULER-PRESSURE relief (free room for OTHER sessions / a fast
+    request), not a single-session context extender. A lone request > the
+    device KV budget therefore truncates; it does not spill. (Extending a
+    single over-budget session to host would need a different trigger and is
+    out of scope -- cf. the weightless-KV lane's single-request 262k path.)
 
     MINIMAL EVICTION (S1 granularity = whole sessions): when ``sizes``
     (spillable tokens per request) and ``need`` (shortfall) are given, the
