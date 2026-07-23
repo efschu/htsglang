@@ -943,6 +943,36 @@ def test_spill_graph_over_ladder_falls_back():
     assert spill_graph_pick_rung(1000, ladder) is None
 
 
+def test_release_kv_cache_routes_spilled_req_to_manager():
+    """Spill x stock-retraction crash regression: a spilled session's
+    req_to_token row holds host SENTINELS (>= host_base, not allocator slots);
+    the stock cache_finished_req/allocator.free would torch.unique them ->
+    CUDA illegal memory access. release_kv_cache must route kv_spill_state ==
+    'host' reqs to the spill manager (which frees the device head + region and
+    never the sentinel tail), NOT the stock free path. Reached via retract /
+    abort (the finish path routes directly). Device reqs (kv_spill_state None)
+    keep the stock path -> byte-identical."""
+    from unittest.mock import MagicMock
+
+    import sglang.srt.managers.kv_session_offload as kso
+    from sglang.srt.mem_cache.common import release_kv_cache
+
+    saved = kso._MANAGER
+    mgr = MagicMock()
+    kso._MANAGER = mgr
+    try:
+        req = MagicMock()
+        req.req_pool_idx = 5  # not None -> past the mamba early-return
+        req.kv_spill_state = "host"
+        tree_cache = MagicMock()
+        release_kv_cache(req, tree_cache, is_insert=False)
+        # routed to the spill manager, stock free path NOT taken
+        mgr.release_finished_spilled_req.assert_called_once_with(req)
+        tree_cache.cache_finished_req.assert_not_called()
+    finally:
+        kso._MANAGER = saved
+
+
 def test_restore_hysteresis():
     h = RestoreHysteresis(3)
     assert not h.update(True)

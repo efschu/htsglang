@@ -658,6 +658,27 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    # kv-session-offload: a SPILLED session's req_to_token row holds host
+    # SENTINELS in its tail (values >= host_base, NOT allocator slots). The
+    # stock cache_finished_req / allocator.free below would run
+    # torch.unique(free_index // page_size) over those sentinel values -> CUDA
+    # illegal memory access (the spill x stock-retraction crash). Route to the
+    # spill manager's release, which frees the retained device HEAD + tree
+    # lock + Mamba + req slot + host region and NEVER touches the sentinel
+    # tail -- the exact cleanup the finish-on-host path uses. Reached only via
+    # retract / abort here (the finish path already routes to
+    # release_finished_spilled_req directly before this function). The
+    # subsequent reset_for_retract (retract caller) is safe: it resets logical
+    # state and does not touch req_pool_idx. Device (non-spilled) reqs have
+    # kv_spill_state None -> stock path unchanged, byte-identical.
+    if getattr(req, "kv_spill_state", None) == "host":
+        from sglang.srt.managers.kv_session_offload import (
+            get_kv_session_offload_manager,
+        )
+
+        get_kv_session_offload_manager().release_finished_spilled_req(req)
+        return
+
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
