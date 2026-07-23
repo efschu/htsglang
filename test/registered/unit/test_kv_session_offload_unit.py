@@ -27,6 +27,7 @@ from sglang.srt.managers.kv_session_offload import (
     session_priority_key,
     spec_decline_non_back_spill,
     spec_overlap_deferred_commit_hazard,
+    spill_snapshot,
     spill_graph_block_stage_counts,
     spill_graph_blocks_needed,
     spill_graph_enabled,
@@ -291,14 +292,83 @@ def test_spec_back_only_removal_invariant():
 
 
 def test_spec_overlap_deferred_commit_hazard():
-    # Milestone fallback: spill declined only when spec is active AND overlap is
-    # on (the deferred multi-token commit would corrupt the sentinel tail).
+    # Gate for the POST-VERIFY SNAPSHOT path: True exactly when spec is active
+    # AND overlap is on (the only case where seq_lens_cpu / kv_committed_len lag
+    # the physical row by the pending accept count). try_spill then reads the
+    # true post-verify length instead of the stale snapshot.
     assert spec_overlap_deferred_commit_hazard(True, True) is True
-    # Plain decode (no spec) is always safe -- spill + restore run fully.
+    # Plain decode (no spec): committed bumped synchronously -> plain snapshot.
     assert spec_overlap_deferred_commit_hazard(False, True) is False
-    # Non-overlap spec commits synchronously -> no deferred-commit race.
+    # Non-overlap spec commits synchronously -> no deferred-commit lag.
     assert spec_overlap_deferred_commit_hazard(True, False) is False
     assert spec_overlap_deferred_commit_hazard(False, False) is False
+
+
+def test_spill_snapshot_plain_path_unchanged():
+    # Non-spec / non-overlap: committed bumped synchronously, so seq_lens_cpu ==
+    # committed. The snapshot is the plain length and the overhang free is the
+    # classic [committed, allocated) -- byte-identical to the pre-fix path.
+    # (true_L is irrelevant off the spec+overlap path; pass == stale to model
+    # try_spill's true_L = stale_L assignment.)
+    snap = spill_snapshot(
+        spec_overlap=False,
+        stale_seq_lens=100,
+        kv_committed_len=100,
+        kv_allocated_len=104,
+        true_L=100,
+    )
+    assert snap.length == 100
+    assert snap.free_from == 100  # == kv_committed_len -> [100, 104) overhang
+    assert snap.pre_valid is True
+
+
+def test_spill_snapshot_spec_overlap_uses_true_length():
+    # Spec + overlap: seq_lens_cpu AND committed both lag the physical row by the
+    # pending accept count (here 4). true_L is the real post-verify length. The
+    # snapshot length must be true_L so the sentinel tail covers the accepted
+    # slots, and free_from must be true_L so the overhang free [true_L,
+    # allocated) never reclaims the accepted slots [committed, true_L).
+    snap = spill_snapshot(
+        spec_overlap=True,
+        stale_seq_lens=1695,
+        kv_committed_len=1695,
+        kv_allocated_len=1699,
+        true_L=1699,
+    )
+    assert snap.length == 1699  # NOT the stale 1695
+    assert snap.free_from == 1699  # accepted slots [1695,1699) preserved
+    assert snap.pre_valid is True
+
+
+def test_spill_snapshot_spec_overlap_frees_only_draft_overhang():
+    # Real GPU-observed case: committed lags by 3 (true_L 1635), but the row was
+    # over-allocated to 1636 -> exactly ONE drafted-but-unaccepted slot. The
+    # overhang free must be [1635, 1636), reclaiming that 1 slot and NOTHING of
+    # the accepted region [1632, 1635).
+    snap = spill_snapshot(
+        spec_overlap=True,
+        stale_seq_lens=1632,
+        kv_committed_len=1632,
+        kv_allocated_len=1636,
+        true_L=1635,
+    )
+    assert snap.length == 1635
+    assert snap.free_from == 1635  # frees [1635, 1636) only
+    assert snap.pre_valid is True
+
+
+def test_spill_snapshot_declines_when_true_length_lags_committed():
+    # Defensive: an unseeded / stale published buffer would report a true_L
+    # below committed. pre_valid must be False so try_spill declines instead of
+    # corrupting the row.
+    snap = spill_snapshot(
+        spec_overlap=True,
+        stale_seq_lens=500,
+        kv_committed_len=500,
+        kv_allocated_len=504,
+        true_L=499,
+    )
+    assert snap.pre_valid is False
 
 
 # ---------------------------------------------------------------------------

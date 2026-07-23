@@ -762,7 +762,18 @@ class SchedulerMetricsReporter:
             spec_cap_length = 0
             spec_block_accept_length = 0
         else:
-            spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
+            # spec_num_forward_ct can be 0 for a whole log interval when the
+            # only decodes in it were kv-session-offload spill ticks (plain bs=1
+            # host decodes that never increment the spec counters) while the
+            # server's spec_algorithm is still active -- no spec verify ran to
+            # accumulate a forward. Guard the division like the sibling stats
+            # below (spec_cap_length / spec_block_accept_length already do). When
+            # spec_num_forward_ct > 0 this is byte-identical to the prior code.
+            spec_accept_length = (
+                self.spec_num_accept_tokens / self.spec_num_forward_ct
+                if self.spec_num_forward_ct > 0
+                else 0
+            )
             num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
             if self.scheduler.server_args.speculative_num_draft_tokens:
                 draft_per_round = (

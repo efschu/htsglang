@@ -46,7 +46,7 @@ import logging
 import math
 import os
 from collections import deque
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -495,10 +495,8 @@ def spec_decline_non_back_spill(spec_active: bool, idx: int, n_reqs: int) -> boo
 def spec_overlap_deferred_commit_hazard(
     spec_active: bool, enable_overlap: bool
 ) -> bool:
-    """Return True when spilling under speculative decoding is UNSAFE this
-    iteration because a deferred multi-token commit would corrupt the sentinel
-    tail -- in which case try_spill declines and the stock (back-only, proven
-    safe under spec) retraction relieves the pressure instead.
+    """Return True when a spill under speculative decoding must take the
+    POST-VERIFY SNAPSHOT path (spec + overlap) instead of the plain snapshot.
 
     THE HAZARD (MTP + overlap): a session's spec verify accepts accept_len(>=1)
     tokens and writes their KV into req_to_token DURING the forward, but
@@ -506,23 +504,71 @@ def spec_overlap_deferred_commit_hazard(
     (batch_result_processor: `kv_committed_len += num_accept_tokens`). Under
     overlap that deferred commit runs AFTER get_next_batch_to_run -> try_spill
     in the SAME loop iteration (scheduler.event_loop_overlap: pop_and_process
-    follows the batch launch). So try_spill snapshots a STALE committed length,
-    writes the host-tail sentinels for the old length, and then the deferred
-    commit advances kv_committed_len past that tail -- leaving the freshly
-    accepted tokens' REAL slots sitting inside the sentinel region. The spill
-    tick's hybrid attention (which requires the host tail to be all sentinels)
-    then aborts ("non-sentinel slot id in a spill-tick tail").
+    follows the batch launch). So batch.seq_lens_cpu and kv_committed_len are
+    both STALE at try_spill time -- they lag the physical row by the pending
+    accept count. Snapshotting the stale length would leave the freshly accepted
+    tokens' REAL slots sitting inside what becomes the sentinel tail, so the
+    spill tick's hybrid attention (which requires the host tail to be all
+    sentinels) aborts ("non-sentinel slot id in a spill-tick tail").
 
-    MILESTONE FALLBACK (this function): decline the spill when spec is active
-    AND overlap is on. Plain decode (accept_len==1, committed bumped
-    synchronously in prepare_for_decode) is unaffected -- spill + partial
-    restore run fully there. Robust follow-up (so MTP sessions themselves
-    spill): back up the just-accepted tokens' KV to host and extend the
-    sentinel tail from the deferred-commit path, or settle the pending commit
-    before snapshotting. Rank-uniform: spec_active and enable_overlap are both
+    ROBUST HANDLING (try_spill, this predicate as the GATE): when True, try_spill
+    reads the TRUE post-verify length from the future map's published seq_lens
+    (new_seq_lens_buf[req_pool_idx]) so the sentinel tail covers every real
+    accepted slot, and frees the draft overhang from that true length (not the
+    stale committed length, which would span the accepted slots). The deferred
+    result processor remains the single writer of kv_committed_len. Plain decode
+    / non-overlap (accept_len==1, committed bumped synchronously in
+    prepare_for_decode, so seq_lens_cpu == committed) takes the unchanged plain
+    snapshot -> False. Rank-uniform: spec_active and enable_overlap are both
     server-global, so every rank of the communicator decides identically.
     """
     return spec_active and enable_overlap
+
+
+class SpillSnapshot(NamedTuple):
+    length: int  # L: the snapshot length for boundary / sentinel / D2H backup
+    free_from: int  # start of the draft-overhang free range [free_from, allocated)
+    pre_valid: bool  # False -> caller must decline before touching the row
+
+
+def spill_snapshot(
+    spec_overlap: bool,
+    stale_seq_lens: int,
+    kv_committed_len: int,
+    kv_allocated_len: int,
+    true_L: int,
+) -> SpillSnapshot:
+    """Resolve the spill-snapshot length + draft-overhang free range, correcting
+    for the spec+overlap deferred-commit lag (see
+    spec_overlap_deferred_commit_hazard). Pure -> identical on every rank when
+    fed replicated state.
+
+    Non-spec / non-overlap: seq_lens_cpu == kv_committed_len (committed bumped
+    synchronously in prepare_for_decode), so ``length`` is the plain
+    ``stale_seq_lens`` and the overhang free is the classic
+    ``[kv_committed_len, kv_allocated_len)``. Byte-identical to the pre-fix path.
+
+    Spec + overlap: both seq_lens_cpu and kv_committed_len LAG the physical row
+    by the pending (not-yet-committed) accept count; ``true_L`` (the future
+    map's published post-verify seq_lens) is the real length. ``length`` is
+    ``true_L`` so the sentinel tail covers every freshly accepted slot, and
+    ``free_from`` is ``true_L`` so the overhang free ``[true_L, allocated)``
+    reclaims ONLY the drafted-but-not-accepted slots -- never the accepted slots
+    ``[kv_committed_len, true_L)``. ``pre_valid`` is False when ``true_L`` lags
+    committed (an unseeded / stale published buffer) so the caller declines
+    instead of corrupting the row.
+    """
+    if spec_overlap:
+        return SpillSnapshot(
+            length=true_L,
+            free_from=true_L,
+            pre_valid=true_L >= kv_committed_len,
+        )
+    return SpillSnapshot(
+        length=stale_seq_lens,
+        free_from=kv_committed_len,
+        pre_valid=True,
+    )
 
 
 class RestoreHysteresis:
@@ -1045,62 +1091,130 @@ class KVSessionOffloadManager:
             )
             return False
 
-        # DEFERRED-COMMIT HAZARD (MTP + overlap): a spec verify writes the
-        # accepted tokens' KV during the forward but bumps kv_committed_len only
-        # in the deferred result processor, which under overlap runs AFTER this
-        # try_spill in the same iteration -- so the sentinel tail we are about to
-        # write for the stale length would be corrupted by that later commit
-        # (see spec_overlap_deferred_commit_hazard). Milestone: decline and let
-        # the stock back-only retraction relieve the pressure. Plain decode is
-        # unaffected (accept_len==1, committed bumped synchronously).
-        if spec_overlap_deferred_commit_hazard(
+        # POST-VERIFY SNAPSHOT (robust MTP spill under overlap). The deferred-
+        # commit hazard: a spec verify writes the just-accepted tokens' KV into
+        # req_to_token[committed:true_L] DURING the forward, but the deferred
+        # result processor bumps kv_committed_len only LATER (next pop_and_process
+        # in the same event-loop iteration, AFTER this try_spill). So at spill
+        # time both batch.seq_lens_cpu and req.kv_committed_len are STALE -- they
+        # lag the physical row by the pending accept count. Snapshotting the
+        # stale length would sentinelise only [boundary, committed_stale) and
+        # leave the freshly accepted real slots [committed_stale, true_L) sitting
+        # inside what the spill tick treats as the sentinel tail -> the hybrid
+        # attention's "all-sentinel tail" invariant breaks (flashinfer_backend
+        # "non-sentinel slot id in a spill-tick tail").
+        #
+        # FIX: read the TRUE post-verify length straight from the future map's
+        # published seq_lens (new_seq_lens_buf[req_pool_idx] == the seq_lens the
+        # NEXT forward's resolve_seq_lens_cpu would gather -- see overlap_utils
+        # publish/resolve_seq_lens_cpu). We only READ the persistent buffer here
+        # (ordered after the in-flight forward's publish via _wait_forward_stream,
+        # the same barrier the D2H backup below uses); we do NOT touch the
+        # consume-once resolve path (publish_ready / _publish_fresh), so the
+        # overlap seq-lens pipeline is untouched. Rank-uniform: new_seq_lens is a
+        # replicated collective output, so every DCP rank reads the same true_L.
+        #
+        # We do NOT mirror the commit here: the deferred result processor stays
+        # the single writer of kv_committed_len (it advances committed -> true_L
+        # for this same session this same iteration, via the batch copy in the
+        # result queue that still lists it). try_spill only corrects the geometry
+        # snapshot and frees the true draft overhang. Gated on spec+overlap; the
+        # plain-decode / non-overlap path is byte-identical (committed bumped
+        # synchronously in prepare_for_decode, so seq_lens_cpu == committed).
+        spec_overlap = spec_overlap_deferred_commit_hazard(
             spec_active, bool(getattr(self.scheduler, "enable_overlap", False))
-        ):
-            logger.debug(
-                "kv-session-offload: spec+overlap deferred-commit hazard; "
-                "declining spill of rid=%s -> stock retraction (robust MTP spill "
-                "is a follow-up).",
+        )
+        stale_L = int(batch.seq_lens_cpu[idx].item())
+        if spec_overlap:
+            # Read the TRUE post-verify length; order after the in-flight
+            # forward's publish (same barrier the D2H backup below uses) so the
+            # published value is visible. Only READS the persistent buffer -- the
+            # consume-once resolve path (publish_ready / _publish_fresh) is not
+            # touched.
+            self._wait_forward_stream()
+            true_L = int(
+                self.scheduler.future_map.new_seq_lens_buf[req.req_pool_idx].item()
+            )
+        else:
+            true_L = stale_L
+
+        snap = spill_snapshot(
+            spec_overlap,
+            stale_L,
+            req.kv_committed_len,
+            req.kv_allocated_len,
+            true_L,
+        )
+        if not snap.pre_valid:
+            # true_L lags committed: published buffer stale/unseeded (should not
+            # happen once the session has decoded). Decline rather than corrupt.
+            logger.warning(
+                "kv-session-offload: spec+overlap true_L %d < committed %d for "
+                "rid=%s; declining spill -> retraction.",
+                true_L,
+                req.kv_committed_len,
                 req.rid,
             )
             return False
+        L = snap.length
+        if spec_overlap and getattr(req, "kv_arrival_seq", None) is not None:
+            self._log(
+                "kv-session-offload spec+overlap snapshot rid=%s: "
+                "seq_lens_cpu=%d committed=%d allocated=%d true_L=%d "
+                "pending_accept=%d (rank %d)",
+                req.rid,
+                stale_L,
+                req.kv_committed_len,
+                req.kv_allocated_len,
+                true_L,
+                true_L - req.kv_committed_len,
+                self.dcp_rank,
+            )
 
-        L = int(batch.seq_lens_cpu[idx].item())
         # MTP / speculative decoding OVER-ALLOCATES the main-pool KV:
-        # kv_allocated_len > kv_committed_len by the drafted-but-unverified
-        # slots at row[committed:allocated) (== num_draft_tokens). Free that
-        # speculative overhang FIRST -- real device slots, exactly what the
-        # stock retraction reclaims via pop_overallocated_kv_cache -- so the
-        # session's bookkeeping is clean (allocated == committed == L) and the
-        # committed tail can be spilled normally. The dropped draft is
-        # re-drafted on restore; the spill tick decodes plain (no spec) while
-        # on host. Rank-uniform: the overhang count is replicated. We free
-        # exactly [committed, allocated) (NOT pop_overallocated's
-        # _cache_commit_len, which can dip below committed under
-        # strip-thinking) so the committed KV we are about to spill stays
-        # intact.
+        # kv_allocated_len > L by the drafted-but-NOT-accepted slots at
+        # row[L:allocated). Free that speculative overhang FIRST -- real device
+        # slots, exactly what the stock retraction reclaims via
+        # pop_overallocated_kv_cache -- so the session's bookkeeping is clean
+        # (allocated == L) and the committed tail can be spilled normally. The
+        # dropped draft is re-drafted on restore; the spill tick decodes plain
+        # (no spec) while on host. Rank-uniform: the overhang count is replicated.
+        #
+        # snap.free_from is L (== true post-verify length) under spec+overlap so
+        # the freshly accepted slots [committed_stale, true_L) are NOT freed;
+        # outside spec+overlap it is kv_committed_len (== L), the original
+        # [committed, allocated) free unchanged.
         if (
-            L == req.kv_committed_len
-            and req.kv_allocated_len > req.kv_committed_len
+            req.kv_allocated_len > snap.free_from
+            and (spec_overlap or L == req.kv_committed_len)
             and not getattr(req, "kv_overallocated_freed", False)
         ):
             over = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, req.kv_committed_len : req.kv_allocated_len
+                req.req_pool_idx, snap.free_from : req.kv_allocated_len
             ]
             self.allocator.free(over.to(torch.int64))
-            req.kv_allocated_len = req.kv_committed_len
+            req.kv_allocated_len = snap.free_from
             req.kv_overallocated_freed = True
 
-        if L != req.kv_committed_len or L != req.kv_allocated_len:
+        # After reclaiming the overhang, allocated must equal L. Under
+        # spec+overlap kv_committed_len legitimately still lags L by the pending
+        # (not-yet-committed) accept count -- the deferred result processor
+        # settles it this same iteration -- so it is validated only OFF the
+        # spec+overlap path.
+        committed_ok = spec_overlap or (L == req.kv_committed_len)
+        if not committed_ok or L != req.kv_allocated_len:
             # Never spill a request whose slot bookkeeping we STILL do not
             # understand after reclaiming the speculative overhang -- stock
             # retraction handles it.
             logger.warning(
-                "kv-session-offload: skip spill of rid=%s (seq_lens %d, "
-                "committed %d, allocated %d); falling back to retraction.",
+                "kv-session-offload: skip spill of rid=%s (L %d, "
+                "committed %d, allocated %d, spec_overlap=%s); falling back to "
+                "retraction.",
                 req.rid,
                 L,
                 req.kv_committed_len,
                 req.kv_allocated_len,
+                spec_overlap,
             )
             return False
 
@@ -1456,6 +1570,23 @@ class KVSessionOffloadManager:
         return 0
 
     def _maybe_restore_flow(self, slot, running_batch, last_batch):
+        # DEVICE-RESUME UNDER SPEC -- MILESTONE GUARD. A spilled session decodes
+        # PLAIN on host: its EAGLE/MTP draft state (hidden_states / topk /
+        # future_indices) is dropped at spill and never rebuilt while
+        # host-resident. Merging it back into a LIVE spec decode batch therefore
+        # contributes no valid EagleDraftInput, and ScheduleBatch.merge_batch ->
+        # EagleDraftInput.merge_batch asserts on the missing spec_info. Rebuilding
+        # the resumed session's draft state (a one-shot draft-extend from its
+        # committed KV + last token) is the follow-up for true on-device MTP
+        # resume; until then, under an active server spec algorithm we keep the
+        # session on host through completion -- the validated, crash-free
+        # spill + host-decode + finish path. Non-spec sessions restore to device
+        # fully (unchanged / byte-identical). Rank-uniform: the server spec
+        # algorithm is global, so every rank makes the same decision.
+        spec_algo = getattr(self.scheduler, "spec_algorithm", None)
+        if spec_algo is not None and not spec_algo.is_none():
+            return running_batch
+
         # While a fast-lane request is waiting for admission, the freed
         # device space belongs to IT (fast beats FCFS): restoring now would
         # only re-trigger the fast-pressure spill (spill<->restore thrash,
