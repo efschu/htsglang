@@ -505,7 +505,7 @@ FEATURES = [
     # -- 2. Uneven TP ------------------------------------------------------
     {
         "name": "02-uneven-tp.svg",
-        "title": "2 — Uneven TP = the WEIGHT axis: size each weight shard to the card's compute (ratio 2:1:1, Q-heads 12/6/6)",
+        "title": "2 — Uneven TP (heterogeneous / asymmetric TP) = the WEIGHT axis: size each weight shard to the card's compute (ratio 2:1:1, Q-heads 12/6/6)",
         "subtitle": "Read this diagram for the weight shards (foreground); the KV here is just the leftover remainder (grey). Fork on the rig vs a homogeneous upstream even-TP config for the same 27B workload.",
         "sentences": [
             ("Left (measured): 27B TP=3, --rank-tp-ratio 2,1,1 --rank-gpu-memory-mib 26000,15000,15000, one "
@@ -568,7 +568,7 @@ FEATURES = [
     # -- 3. Adaptive drafter routing --------------------------------------
     {
         "name": "03-adaptive-drafter.svg",
-        "title": "3 — Adaptive drafter routing (NEXTN ↔ DFLASH): dual residence, itemised per-rung cost",
+        "title": "3 — Cross-algorithm drafter routing (NEXTN ↔ DFLASH): dual residence, itemised per-rung cost",
         "subtitle": "Fork on the rig (TP=3 uneven) vs a homogeneous upstream TP=2 running one fixed drafter.",
         "sentences": [
             ("Left (measured): both drafters resident behind --speculative-cross-algorithm. The solo-draft "
@@ -754,7 +754,8 @@ FEATURES = [
         "title": "6 — Weightless-KV lane: free the workers of weights so their freed VRAM becomes device KV",
         "subtitle": "Fork on the rig (head holds all weights, workers become device-KV donors) vs upstream, where every rank splits VRAM between weights and KV.",
         "sentences": [
-            ("Left (measured, PRIMARY): --weightless-kv-fastlane, TP=3 + DCP. rank0 (5090) is the HEAD — it holds "
+            ("Left (measured, PRIMARY): --weightless-kv-fastlane (the flag's 'fastlane' is historical, NOT the "
+             "separate --enable-fast-lane priority feature), TP=3 + DCP. rank0 (5090) is the HEAD — it holds "
              "ALL layer weights (TP=1) and is the ONLY rank that projects K,V. rank1/2 (3080) are WEIGHTLESS "
              "meta-device workers with ZERO layer weights (~14 GiB freed EACH, MEASURED); that freed VRAM holds "
              "the RESIDENT token-sharded DEVICE-KV cache — spanning ALL KV heads but only this rank's token slice "
@@ -1184,8 +1185,8 @@ def m11():
         b.append(hn)
         return "".join(b), hy
     compose("11-adaptive-drafter-routing.svg", 1120,
-            "11 (mechanism) — Adaptive drafter routing: switch draft algorithm at round boundaries",
-            "Two draft algorithms resident at once; one chosen per batch. Decisive setting: drafter routing (§5, work in progress).",
+            "11 (mechanism) — Cross-algorithm drafter routing: switch draft algorithm at round boundaries",
+            "Two draft algorithms resident at once; one chosen per batch. Decisive setting: cross-algorithm drafter routing (--speculative-cross-algorithm, §5, work in progress).",
             [("NEXTN/MTP and DFLASH are both loaded (the inactive one held at ≈0 VRAM via VMM tag-aliasing). "
               "A per-round router selects one, either by a deterministic ctx→rung policy table (recommended "
               "default) or an acceptance-driven bandit (opt-in), with a context-length gate that keeps DFLASH "

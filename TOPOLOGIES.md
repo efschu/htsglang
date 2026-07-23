@@ -71,6 +71,8 @@ KV token split at once — which is exactly why a rank's KV band is not tied to 
 
 ## 2 — Uneven TP = the weight axis
 
+*Uneven TP (also **heterogeneous / asymmetric tensor parallelism** in the literature — HexGen, Hetis).*
+
 <img src="topologies/02-uneven-tp.svg" alt="Uneven TP, weight axis: the foregrounded blue weight shards are 12.7/8.0/8.0 GiB (ratio 2:1:1, Q-heads 12/6/6) sized to each card's compute; the KV here is only the grey leftover remainder; measured on 27B TP=3 on the rig, versus a 2x identical 24 GB even-TP=2 upstream config (estimated) with equal shards" width="100%">
 
 **Read this diagram for the weight shards (blue, foreground); the KV here is only the leftover
@@ -86,11 +88,16 @@ is the **KV / token axis** (KV tokens follow card VRAM, decoupled from the weigh
 run together via `--rank-tp-ratio auto`, so the two diagrams describe **different axes of the same
 run**, not the same thing.
 
-## 3 — Adaptive drafter routing (NEXTN ↔ DFLASH)
+## 3 — Cross-algorithm drafter routing (NEXTN ↔ DFLASH)
 
-<img src="topologies/03-adaptive-drafter.svg" alt="Fork TP=3 uneven cross-algo drafter registry (measured): solo-draft pool 4.58 GiB on rank0, rung tags DFLASH_k16 662 / EAGLE_k3 634 / EAGLE_k2 554 MiB, graphs 7.44 GiB, versus a homogeneous upstream 2x identical 24 GB even-TP=2 running one fixed drafter (NEXTN k=3, single residence, estimated)" width="100%">
+*The CLI/env surface for this feature is named **cross-algorithm** (`--speculative-cross-algorithm*`,
+`SGLANG_CROSS_*`); "drafter routing" and "cross-algorithm" refer to the same feature. The
+context-size gate stays "context-size-aware".*
 
-Both draft algorithms are kept resident behind `--speculative-cross-algorithm`. Measured on the rig
+<img src="topologies/03-adaptive-drafter.svg" alt="Cross-algorithm drafter routing, fork TP=3 uneven, measured registry: solo-draft pool 4.58 GiB on rank0, rung tags DFLASH_k16 662 / EAGLE_k3 634 / EAGLE_k2 554 MiB, graphs 7.44 GiB, versus a homogeneous upstream 2x identical 24 GB even-TP=2 running one fixed drafter (NEXTN k=3, single residence, estimated)" width="100%">
+
+Both draft algorithms are kept resident behind the **cross-algorithm** router
+(`--speculative-cross-algorithm`). Measured on the rig
 (TP=3 uneven): the **solo-draft pool costs 4.58 GiB on rank0**, the per-k rungs are itemised
 **DFLASH_k16 662 / EAGLE_k3 634 / EAGLE_k2 554 MiB**, and draft graphs push rank0's graph pool to
 7.44 GiB; the KV budget cost of the cross-gate is ~282k vs ~524k tokens without it. The homogeneous
@@ -175,8 +182,11 @@ adapters) plus the MMVQ↔MMQ crossover tuning. The GGUF quant path is not a for
 worked (graph + prefetch landed; see the rig footnote below), so treat the numbers here as a bring-up
 state, not a shipped guarantee.
 
-This is a **capacity** feature, not a "fast" one — the name is historical (`--weightless-kv-fastlane`)
-and does **not** mean the lane is fast.
+This is a **capacity** feature, not a "fast" one. The `fastlane` in the flag name
+(`--weightless-kv-fastlane`) is historical and does **not** mean the lane is fast; it is also **not
+related** to the separate **fast-lane priority scheduling** feature (`--enable-fast-lane`, §9/§13) — the
+two are independent. To avoid the collision, this feature is referred to throughout as the
+**weightless-KV lane** (its weight-bearing side is the *head lane*).
 
 **The core mechanism (primary).** On the rig (measured), **rank0 (5090) is the HEAD** holding **all**
 layer weights as collective-free TP=1, and it is the **only** rank that projects K,V. **rank1/2 (3080)
