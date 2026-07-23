@@ -627,6 +627,10 @@ FEATURES = [
             ("Host KV bytes = 32 KiB/token x spilled tokens (ESTIMATED from the measured cell size). "
              "Long-context curve (32k~63 ... 262k~7.6 tok/s) is MODELED, not benchmarked (needs S2); "
              "worthwhile only with uneven DCP active.", "#1d6b34"),
+            ("The more important number — how the DEVICE-RESIDENT (non-spilled) session runs DURING a spill "
+             "(measured, ctx ~1.6k): 10.4 / 13.4 / 19.9 / 26.0 tok/s at tick-interval 1 / 2 / 4 / 8 (pre-spill "
+             "~40); the spilled session ~7–8 tok/s. Isolation target met only from tick 4 up, VIOLATED at tick "
+             "1/2 — the eager spill tick still blocks the shared cadence (open item; see mechanism diagram 12).", "#333"),
         ],
         "right_notes": [
             ("Behaviour, not a VRAM split: the request is paused, not decoded from host.", "#4a5568"),
@@ -754,22 +758,21 @@ FEATURES = [
     {
         "name": "07-moe-expert-offload.svg",
         "title": "7 — MoE expert offload: run a 122B on 3 mismatched cards by spilling cold experts to host RAM",
-        "subtitle": "Fork on the rig vs the homogeneous upstream hardware a 122B-A10B would otherwise need.",
-        "PX": 2.6,
-        "maxv": 80,
+        "subtitle": "Fork on the rig vs a realistic homogeneous upstream config that also offloads weights to host RAM.",
         "sentences": [
             ("Left (measured): Qwen3.5-122B-A10B-GPTQ-Int4, TP=3, --rank-tp-ratio auto, "
              "SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.25. Per-rank GPU 25.5 / 16.6 / 15.4 GiB; 64 resident + 16 "
              "scratch experts/layer stay on-GPU, 176/layer spill to pinned host RAM (host floor 24.4 GiB). "
              "Throughput 6.97 (eager) → 10.61 (graph) → 16.34 tok/s (graph+hotset).", "#333"),
-            ("Right (illustrative): upstream has no per-wave host-spill load path, so the experts must fit "
-             "aggregate device VRAM — e.g. 2 identical 80 GB cards at even TP=2 (2 KV heads), or an 8-card "
-             "Expert-Parallel fleet. On 3 mismatched 20–32 GB cards (72 GB total) upstream cannot place the model.", "#555"),
+            ("Right (illustrative): upstream runs the same 122B on a realistic homogeneous config too — 2 "
+             "identical RTX 3090 (24 GB each, even TP=2) plus --cpu-offload-gb, keeping part of the weights "
+             "on-device and the rest in system RAM. The whole right panel is estimated (stock cpu-offload was "
+             "not benched here).", "#555"),
         ],
         "left_label": "htsglang — 122B TP=3, expert offload f=0.25 (measured)",
-        "right_label": "upstream — 2x identical 80 GB, even TP=2",
+        "right_label": "upstream — 2x RTX 3090 24 GB, TP=2 + --cpu-offload-gb",
         "left_cw": 130,
-        "right_cw": 140,
+        "right_cw": 150,
         "left_cards": [
             ("RTX 5090", "rank0 · 25.5 GB", 32.6, [
                 ("weights", 3.0, "shard", M),
@@ -786,29 +789,35 @@ FEATURES = [
                 ("kv", 3.2, "KV band", M)]),
         ],
         "right_cards": [
-            ("identical 80 GB", "rank0 · even TP=2", 80, [
-                ("weights", 33.0, "½ weights (all experts resident)", E),
-                ("kv", 30.0, "KV", E),
-                ("ctx", 3.0, "", E)]),
-            ("identical 80 GB", "rank1 · even TP=2", 80, [
-                ("weights", 33.0, "½ weights (all experts resident)", E),
-                ("kv", 30.0, "KV", E),
-                ("ctx", 3.0, "", E)]),
+            ("RTX 3090", "rank0 · TP=2 + offload", 24, [
+                ("weights", 14.0, "on-device layer-group weights", E),
+                ("kv", 7.5, "KV", E),
+                ("ctx", 2.0, "", E)]),
+            ("RTX 3090", "rank1 · TP=2 + offload", 24, [
+                ("weights", 14.0, "on-device layer-group weights", E),
+                ("kv", 7.5, "KV", E),
+                ("ctx", 2.0, "", E)]),
         ],
         "host": ("Host RAM (DDR) — spilled experts (measured floor)",
                  [("spill", 0.30, "176 experts/layer x48 (pinned) — floor 24.4 GB", M),
                   ("free", 0.70, "of 108 GB (no swap)", M)]),
+        "right_host": ("Host RAM (DDR) — --cpu-offload-gb: offloaded weights",
+                       [("weights", 0.55, "offloaded layer-group weights — streamed EVERY forward", E),
+                        ("free", 0.45, "reserved (--cpu-offload-gb N)", E)]),
         "left_notes": [
             ("Per-rank GPU + host floor MEASURED. Not bit-identical to no-offload (marlin ~1e-2 argmax at "
              "near-ties); bar is coherence + self-determinism (5/5).", "#1d6b34"),
         ],
         "right_notes": [
-            ("Illustrative 80 GB cards named; the point is experts must fit aggregate device VRAM. "
-             "Not measured.", "#4a5568"),
+            ("--cpu-offload-gb (server_args.py: \"How many GBs of RAM to reserve for CPU offloading\") is a "
+             "GENERIC per-layer-weight offload: the offloaded weights are streamed back in EVERY forward, "
+             "regardless of which experts a token routes. Assumed 2x 3090; stock cpu-offload not benched here.", "#4a5568"),
         ],
-        "core": ("the fork runs a 122B on 3 mismatched cards plus 108 GB host RAM by spilling cold experts to "
-                 "system RAM; upstream needs the experts to fit aggregate device VRAM — 2x 80 GB or an 8-card EP "
-                 "fleet of identical cards — a capacity / hardware-cost difference."),
+        "core": ("both run a 122B on modest cards by using host RAM; the mechanism differs — the fork offload is "
+                 "EXPERT-GRANULAR (per token-wave it fetches only the routed top-K experts from host), whereas "
+                 "--cpu-offload-gb streams a fixed offloaded weight fraction back on every forward. At the same "
+                 "VRAM budget the fork moves less data per token; upstream moves the full offloaded fraction per "
+                 "forward — a capability / data-volume difference, stated neutrally."),
         "legend_keys": ["weights", "resident", "kv", "mtp", "spill", "free"],
     },
     # -- 8. Measured VRAM budget ------------------------------------------
@@ -861,19 +870,23 @@ FEATURES = [
     # -- 9. Fast-lane priority scheduling ---------------------------------
     {
         "name": "09-fast-lane.svg",
-        "title": "9 — Fast-lane priority scheduling: a reserved slot class that preempts (and can spill a session)",
-        "subtitle": "Fork on the rig vs upstream's generic priority scheduling. A scheduling behaviour, not a hardware-capacity split.",
+        "title": "9 — Fast-lane scheduling: a fairness / anti-starvation layer on the priority path",
+        "subtitle": "Fork on the rig vs upstream's continuous-priority scheduling. A scheduling behaviour, not a hardware-capacity split.",
         "sentences": [
-            ("Left: --enable-fast-lane reserves a floor of heavy slots (--fast-lane-reserved-heavy-slots); a "
-             "\"lane\":\"fast\" request preempts into the running batch by taking a reserved slot, and heavy-aging "
-             "(--fast-lane-heavy-aging-ms) prevents starvation. It composes with session KV spill: admitting a "
-             "fast request can spill a normal session's KV to host. Default OFF — the default path is byte-unchanged.", "#333"),
-            ("Right (illustrative): upstream has a priority-scheduling subsystem the fork builds on "
-             "(enable_priority_scheduling) but not this reserved-floor fast-lane class + KV-spill coupling; "
-             "no distinct VRAM segment beyond the normal slot pool.", "#555"),
+            ("Left: --enable-fast-lane adds a BINARY two-tier lane on top of the priority path (the \"lane\":\"fast\" "
+             "tag sets a fixed high fast_lane_priority, not a manual integer). Its delta over generic priority is "
+             "two anti-starvation guarantees: (1) RESERVED HEAVY SLOTS (--fast-lane-reserved-heavy-slots) — at "
+             "least N normal (\"heavy\") requests are never preempted below the reserved floor, so sustained fast "
+             "load cannot fully starve normal requests; (2) HEAVY AGING (--fast-lane-heavy-aging-ms) — a normal "
+             "request waiting past the window is promoted ahead of the fast tier, so a stream of fast requests "
+             "cannot block a waiting normal one indefinitely. Default OFF.", "#333"),
+            ("Right (illustrative): upstream priority scheduling sorts the waiting queue by a continuous integer "
+             "priority and preempts a running request when priority_diff exceeds "
+             "priority_scheduling_preemption_threshold — a general mechanism, with no reserved floor for the "
+             "preempted and no aging. No distinct VRAM segment beyond the normal slot pool.", "#555"),
         ],
-        "left_label": "htsglang — reserved fast-lane slot floor (default off)",
-        "right_label": "upstream — generic priority scheduling",
+        "left_label": "htsglang — reserved floor + heavy-aging on the priority path",
+        "right_label": "upstream — continuous-priority + preemption threshold",
         "left_cw": 150,
         "right_cw": 150,
         "left_cards": [
@@ -890,16 +903,18 @@ FEATURES = [
                 ("ctx", 1.2, "", E)]),
         ],
         "left_notes": [
-            ("The reserved-heavy-slot floor's byte cost (reserved-slots x per-slot KV) was not separately "
-             "registry-dumped — drawn ESTIMATED. Scheduling proofs (preempt correctly, restore held while a "
-             "fast request waits) are behavioural; see the fast-lane mechanism diagram.", "#1d6b34"),
+            ("Integration with session KV spill: a fast request can spill a normal session's KV to host RATHER "
+             "than queue, and a fast request is never itself spilled. The reserved-floor byte cost was not "
+             "registry-dumped — drawn ESTIMATED; the guarantees are behavioural (see mechanism diagram 13).", "#1d6b34"),
         ],
         "right_notes": [
-            ("Generic priority scheduling, no reserved-floor / QoS-spill coupling. Not measured.", "#4a5568"),
+            ("enable_priority_scheduling + priority_scheduling_preemption_threshold verified in "
+             "schedule_policy.py. No reserved floor, no aging, no spill coupling. Not measured.", "#4a5568"),
         ],
-        "core": ("the fork adds a reserved fast-lane slot class that preempts and can spill a normal session to "
-                 "host; upstream offers generic priority scheduling without the reserved-floor / QoS-spill coupling "
-                 "— a scheduling-behaviour difference, not a hardware-capacity one."),
+        "core": ("upstream supplies the priority axis (continuous integer priority + a preemption threshold); the "
+                 "fork's fast-lane adds a fairness / anti-starvation layer on top — a reserved floor of heavy slots "
+                 "and heavy-aging that guarantee progress for preempted / waiting normal requests — plus coupling to "
+                 "session KV spill. Stated as what each side does, not a ranking."),
         "legend_keys": ["weights", "kv", "gdn", "free"],
     },
     # -- 10. PD-disaggregation --------------------------------------------
@@ -1149,7 +1164,48 @@ def m12():
                                 "32k ≈63 · 64k ≈31 · 128k ≈16 · 262k ≈7.6 tok/s",
                                 "worthwhile only with uneven DCP (262k ≈3.8 without)"]):
             b.append(text(mx + 12, my + 32 + i * 14, "• " + s, size=8.4, color="#1a1a1a"))
-        return "".join(b), my + 92
+        # Isolation matrix — how the DEVICE-RESIDENT (non-spilled) session runs during a spill.
+        iy = my + 108
+        b.append(text(40, iy, "During a spill (isolation matrix, ctx ~1.6k, MEASURED): does the DEVICE-RESIDENT (non-spilled) session stay fast?",
+                      size=10, weight="bold", color="#111"))
+        cx0, cy0 = 62, iy + 16
+        chh, chw = 96, 300
+        vmax = 44.0
+        b.append(line(cx0, cy0, cx0, cy0 + chh, stroke="#888", sw=0.8))
+        b.append(line(cx0, cy0 + chh, cx0 + chw, cy0 + chh, stroke="#888", sw=0.8))
+        b.append(text(cx0 - 6, cy0 + 8, "tok/s", size=7.5, anchor="end", color="#888"))
+        b.append(text(cx0 - 6, cy0 + chh, "0", size=7.5, anchor="end", color="#888"))
+        refy = cy0 + chh - (40 / vmax) * chh
+        b.append(line(cx0, refy, cx0 + chw, refy, stroke="#4a5568", sw=1.2, dash="5 3"))
+        b.append(text(cx0 + chw + 8, refy + 3, "pre-spill both sessions ~40 tok/s", size=8.4, color="#4a5568"))
+        spy = cy0 + chh - (7.5 / vmax) * chh
+        b.append(line(cx0, spy, cx0 + chw, spy, stroke="#c0504d", sw=1.2, dash="2 2"))
+        b.append(text(cx0 + chw + 8, spy + 3, "spilled session ~7–8 tok/s (all ticks)", size=8.4, color="#c0504d"))
+        ticks = [("tick 1", 10.4), ("tick 2", 13.4), ("tick 4", 19.9), ("tick 8", 26.0)]
+        status = ["target violated", "target violated", "target met", "target met"]
+        bw = 40
+        for i, (lab, val) in enumerate(ticks):
+            bx = cx0 + 22 + i * (bw + 30)
+            bh = (val / vmax) * chh
+            byy = cy0 + chh - bh
+            b.append(rect(bx, byy, bw, bh, COLORS["kv"], stroke="#2b2b2b", sw=1.0))
+            b.append(text(bx + bw / 2, byy - 4, f"{val}", size=8.6, anchor="middle", color="#1a1a1a"))
+            b.append(text(bx + bw / 2, cy0 + chh + 12, lab, size=8.4, anchor="middle", color="#333"))
+            col = "#c0504d" if i < 2 else "#1d6b34"
+            b.append(text(bx + bw / 2, cy0 + chh + 23, status[i], size=7.4, anchor="middle", color=col))
+        ny0 = cy0 + chh + 42
+        hn2, ny1 = flow(40, ny0, "Honest read: the device-resident session is still dragged along by the spill — the "
+                        "isolation target (device loses at most its 1/N tick share) holds only from tick-interval 4 "
+                        "upward; at tick 1/2 it is VIOLATED (device falls from ~40 to ~10–13 tok/s) because the spill "
+                        "step still runs eager and blocks the shared scheduler tick.", W - 80, size=9.3, color="#333")
+        b.append(hn2)
+        pby = ny1 + 6
+        b.append(rect(40, pby, W - 80, 34, "#f4f0fa", stroke="#7d5ba6", sw=1.2, rx=4))
+        b.append(text(52, pby + 14, "Planned (Step 5 — NOT YET built, not measured): a bs=1 spill CUDA-graph takes the eager spill tick out of the shared",
+                      size=9, color="#4a3b66"))
+        b.append(text(52, pby + 27, "cadence, so even tick-interval 1 should barely touch the device-resident session.",
+                      size=9, color="#4a3b66"))
+        return "".join(b), pby + 40
     compose("12-session-kv-spill.svg", 1120,
             "12 (mechanism) — Session KV spill: overflow the newest session to host RAM, keep decoding",
             "Per-session KV offload under VRAM pressure. Decisive setting: --enable-kv-session-offload (§20, experimental S1).",
@@ -1178,33 +1234,44 @@ def m13():
                           color="#fff" if key == "kv" else "#1a1a1a"))
             if kind == "reserved":
                 b.append(text(xx + sw_ / 2, by + 31, "heavy", size=7, anchor="middle", color="#1a1a1a"))
-        b.append(text(40, by + 56, "reserved-heavy-slots: a floor kept for latency-priority work", size=8.6, color="#333"))
-        fy = by + 78
+        b.append(text(40, by + 56, "Guarantee 1 — RESERVED HEAVY SLOTS (--fast-lane-reserved-heavy-slots): at least N "
+                      "normal (\"heavy\") requests are never preempted below this floor", size=8.6, color="#1d6b34"))
+        b.append(text(40, by + 69, "(schedule_policy.py: max_heavy_preemptible = num_heavy_running − reserved_slots; preemption "
+                      "stops at the floor) → sustained fast load cannot fully starve normal requests.", size=8.4, color="#333"))
+        fy = by + 92
         b.append(rect(40, fy, 150, 28, "#c65b9b", stroke="#2b2b2b", sw=1.3, rx=3))
         b.append(text(115, fy + 18, "\"lane\":\"fast\" request", size=9, anchor="middle", color="#fff", weight="bold"))
         b.append(arrow(195, fy + 14, 300, fy + 14, "#c65b9b", marker="arr"))
-        b.append(text(360, fy + 6, "preempts INTO the running batch immediately", size=9, color="#c65b9b"))
-        b.append(text(360, fy + 19, "(takes a reserved-heavy slot; no queue wait)", size=8.6, color="#555"))
+        b.append(text(360, fy + 6, "binary opt-in: sets a fixed high fast_lane_priority (no manual integer)", size=9, color="#c65b9b"))
+        b.append(text(360, fy + 19, "and preempts into the running batch, down to the reserved floor.", size=8.6, color="#555"))
         ay = fy + 44
-        b.append(text(40, ay, "heavy-aging (--fast-lane-heavy-aging-ms): a long-waiting heavy request ages up in "
-                      "priority so fast traffic cannot starve it.", size=9, color="#333"))
-        iy = ay + 24
+        b.append(text(40, ay, "Guarantee 2 — HEAVY AGING (--fast-lane-heavy-aging-ms): a normal request waiting past the "
+                      "window is promoted to fast_lane_priority−1", size=9, color="#1d6b34"))
+        b.append(text(40, ay + 13, "and jumps ahead of the fast tier → a stream of fast requests cannot block a waiting normal one "
+                      "indefinitely.", size=8.6, color="#333"))
+        iy = ay + 34
         b.append(rect(40, iy, W - 80, 46, "#fdf3e3", stroke="#c88a2b", sw=1.2, rx=4))
-        b.append(text(52, iy + 18, "Interaction with session KV spill (§20): fast-lane outranks FCFS — admitting a fast request "
-                      "can spill a normal", size=9, color="#8a5a2b"))
-        b.append(text(52, iy + 33, "session's KV to host to make room, and a spilled session's restore is held while a fast "
-                      "request is still waiting.", size=9, color="#8a5a2b"))
-        b.append(text(40, iy + 68, "Default off (--enable-fast-lane opt-in): the default scheduling path is unchanged.",
+        b.append(text(52, iy + 18, "Coupling with session KV spill (§20): a fast request can spill a normal session's KV to host "
+                      "RATHER than queue,", size=9, color="#8a5a2b"))
+        b.append(text(52, iy + 33, "a spilled session's restore is held while a fast request waits, and a fast request is never itself "
+                      "spilled.", size=9, color="#8a5a2b"))
+        uy = iy + 60
+        b.append(rect(40, uy, W - 80, 44, "#eef1f4", stroke="#4a5568", sw=1.2, rx=4))
+        b.append(text(52, uy + 17, "Upstream baseline (schedule_policy.py, verified): priority scheduling sorts the waiting queue by a "
+                      "continuous integer priority and", size=9, color="#4a5568"))
+        b.append(text(52, uy + 31, "preempts a running request when priority_diff > priority_scheduling_preemption_threshold — general, "
+                      "with no reserved floor for the preempted and no aging.", size=9, color="#4a5568"))
+        b.append(text(40, uy + 62, "Default off (--enable-fast-lane opt-in): the default scheduling path is unchanged.",
                       size=9.3, color="#1d6b34"))
-        return "".join(b), iy + 80
-    compose("13-fast-lane-priority.svg", 1000,
-            "13 (mechanism) — Fast-lane priority scheduling: preempt a tagged request into the batch",
-            "Opt-in latency-priority class with a starvation guard. Decisive setting: --enable-fast-lane (§16, implemented).",
-            [("A request tagged \"lane\":\"fast\" preempts into the running batch at once, taking one of a "
-              "reserved floor of heavy slots; heavy-aging raises long-waiting heavy requests so fast traffic "
-              "cannot starve them. It composes with session KV spill (a fast request can spill a normal "
-              "session to host). Default off — the default path is unchanged. Upstream has priority scheduling "
-              "the fork builds on; this reserved-floor fast-lane class is the fork addition.", "#333")],
+        return "".join(b), uy + 74
+    compose("13-fast-lane-priority.svg", 1060,
+            "13 (mechanism) — Fast-lane: a fairness / anti-starvation layer on the priority path",
+            "Opt-in binary lane with two anti-starvation guarantees. Decisive setting: --enable-fast-lane (§16, implemented).",
+            [("Upstream supplies the priority axis (continuous integer priority + a preemption threshold). The "
+              "fork's fast-lane is a binary opt-in lane ON that path whose delta is two anti-starvation guarantees "
+              "generic priority does not have — a reserved floor of heavy slots that are never preempted, and "
+              "heavy-aging that promotes a long-waiting normal request ahead of the fast tier — plus coupling to "
+              "session KV spill. Stated as what each side does, not a ranking.", "#333")],
             draw, ["kv", "free"])
 
 

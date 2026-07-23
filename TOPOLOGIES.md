@@ -87,7 +87,7 @@ single static drafter. The routing *mechanism* is diagram 11.
 
 ## 4 — Session KV spill: overflow the newest session to host RAM
 
-<img src="topologies/04-session-kv-spill.svg" alt="Session KV spill (measured S1): the newest session's KV band is freed on device and moved to a host KV tier (estimated bytes) while it keeps decoding; upstream pauses/recomputes the request with no host tier" width="100%">
+<img src="topologies/04-session-kv-spill.svg" alt="Session KV spill (measured S1): the newest session's KV band is freed on device and moved to a host KV tier (estimated bytes) while it keeps decoding; upstream pauses/recomputes the request with no host tier. Isolation matrix: the device-resident session holds 10.4/13.4/19.9/26.0 tok/s at tick-interval 1/2/4/8 during a spill, violating the isolation target at tick 1/2" width="100%">
 
 On device-KV overflow the **newest** session's full-attention KV shard is pushed to host RAM and that
 session **keeps decoding** (block-LSE attention, eager `bs=1` tick); GDN/Mamba state always stays
@@ -96,7 +96,19 @@ restore **~0.4 s**, determinism **50/50 exact** host-vs-device. The host KV byte
 spilled tokens) are estimated from the measured cell size, and the long-context throughput curve
 (32k ≈63 … 262k ≈7.6 tok/s) is **modeled, not benchmarked** (needs S2), worthwhile only with uneven
 DCP active. Upstream has no per-session host-KV decode: under pressure it retracts/recomputes or
-pauses the request — the device KV pool is a hard ceiling. The *mechanism* is diagram 12.
+pauses the request — the device KV pool is a hard ceiling.
+
+The more important number is not the spilled session's rate but **how the device-resident (non-spilled)
+session runs during a spill**. Measured isolation matrix (ctx ~1.6k): pre-spill both sessions run
+**~40 tok/s**; during a spill the **device-resident** session holds **10.4 / 13.4 / 19.9 / 26.0 tok/s at
+tick-interval 1 / 2 / 4 / 8**, while the **spilled** session stays **~7–8 tok/s** across all ticks.
+Honestly, the device session is still **dragged along** by the spill: the isolation target (the device
+loses at most its 1/N tick share) is met only **from tick-interval 4 upward** and is **violated at tick
+1 / 2**, where the device drops from ~40 to ~10–13 tok/s — because the spill step **still runs eager and
+blocks the shared scheduler tick**. This is the open item; the planned **bs=1 spill CUDA-graph (Step 5,
+not yet built, not measured)** should take the eager spill tick out of the shared cadence, after which
+even tick-interval 1 should barely touch the device-resident session. The *mechanism* and the full
+isolation matrix are in diagram 12.
 
 ## 5 — Multi-rank co-location (TP=5 on 3 GPUs)
 
@@ -135,17 +147,24 @@ without more/bigger equal cards.
 
 ## 7 — MoE expert offload: a 122B on 3 mismatched cards
 
-<img src="topologies/07-moe-expert-offload.svg" alt="122B-A10B TP=3 with expert offload f=0.25 (measured): per-rank GPU 25.5/16.6/15.4 GiB, 64+16 experts resident, 176/layer spilled to a 24.4 GiB host floor; upstream needs 2x identical 80 GB cards (estimated)" width="100%">
+<img src="topologies/07-moe-expert-offload.svg" alt="122B-A10B TP=3 with expert offload f=0.25 (measured): per-rank GPU 25.5/16.6/15.4 GiB, 64+16 experts resident, 176/layer spilled to a 24.4 GiB host floor; versus a realistic upstream config of 2x RTX 3090 24 GB TP=2 plus --cpu-offload-gb with offloaded weights in host RAM (estimated)" width="100%">
 
 `Qwen3.5-122B-A10B-GPTQ-Int4` runs TP=3 with `SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.25`: **64 resident
 + 16 scratch** experts/layer stay on-GPU, **176/layer spill to pinned host RAM** (host floor 24.4 GiB,
 measured), and per-rank GPU is **25.5 / 16.6 / 15.4 GiB** (measured). Throughput improves from 6.97
 (eager) → 10.61 (graph) → 16.34 tok/s (graph + hotset); the offload path is **not bit-identical** to
-no-offload (marlin ~1e-2 argmax at near-ties), the bar being coherence + self-determinism. Upstream
-has no per-wave host-spill load path, so the experts must fit **aggregate device VRAM** — e.g. 2
-identical 80 GB cards at even TP=2, or an 8-card Expert-Parallel fleet; on 3 mismatched 20–32 GB cards
-(72 GB total) upstream cannot place the model. The expert-offload *flow* underlies this diagram; the
-122B is a bring-up/validation run of a feature that is still in progress.
+no-offload (marlin ~1e-2 argmax at near-ties), the bar being coherence + self-determinism.
+
+Upstream also runs the same 122B on a realistic homogeneous config: **2 identical RTX 3090 (24 GB each,
+even TP=2) plus `--cpu-offload-gb`** ("How many GBs of RAM to reserve for CPU offloading",
+`server_args.py`), keeping part of the weights on-device and the rest in system RAM. The whole right
+panel is estimated (stock cpu-offload was not benched here). The mechanism difference, stated neutrally:
+`--cpu-offload-gb` is a **generic per-layer-weight offload** — it streams the offloaded weights back in
+**every forward**, regardless of which experts a token routes; the fork offload is **expert-granular** —
+per token-wave it fetches only the routed top-K experts from host. At the same VRAM budget the fork
+moves less data per token, while upstream moves the full offloaded fraction per forward. That is a
+capability / data-volume difference, not a "faster" claim. The 122B is a bring-up/validation run of a
+feature that is still in progress.
 
 ## 8 — Measured VRAM budget: an absolute per-rank MiB budget
 
@@ -161,18 +180,28 @@ remainder**; a logged split-hint vector self-calibrates the split over two boots
 identical cards, but with no per-rank absolute budget and no per-segment registry. The registry
 *mechanism* is diagram 14.
 
-## 9 — Fast-lane priority scheduling
+## 9 — Fast-lane: a fairness / anti-starvation layer on the priority path
 
-<img src="topologies/09-fast-lane.svg" alt="Fast-lane: a reserved heavy-slot floor drawn as an estimated slice of the KV pool (byte cost not dumped); upstream has generic priority scheduling with no reserved-floor class" width="100%">
+<img src="topologies/09-fast-lane.svg" alt="Fast-lane: a binary two-tier lane on the priority path with two anti-starvation guarantees (reserved heavy slots, heavy aging) plus session-spill coupling; upstream priority scheduling sorts by continuous integer priority and preempts on a threshold, with no reserved floor or aging" width="100%">
 
-`--enable-fast-lane` reserves a floor of heavy slots; a `"lane":"fast"` request **preempts into the
-running batch** by taking a reserved slot, with heavy-aging to prevent starvation. It composes with
-session KV spill — admitting a fast request can spill a normal session's KV to host, and a spilled
-session's restore is held while a fast request waits. The reserved-floor byte cost was **not
-registry-dumped** (drawn estimated). This is a **scheduling-behaviour** difference, not a
-hardware-capacity one, and it is **default off** (default path byte-unchanged). Upstream has a generic
-priority-scheduling subsystem the fork builds on, without the reserved-floor / QoS-spill coupling. The
-*mechanism* is diagram 13.
+Upstream supplies the **priority axis**: priority scheduling sorts the waiting queue by a **continuous
+integer `priority`** and preempts a running request when `priority_diff` exceeds
+`priority_scheduling_preemption_threshold` (verified in `schedule_policy.py`) — a general mechanism, with
+**no reserved floor for the preempted and no aging**. `--enable-fast-lane` adds a **binary two-tier lane
+on that path** (the `"lane":"fast"` tag sets a fixed high `fast_lane_priority`, not a manual integer),
+and its delta is precisely **two anti-starvation guarantees** generic priority does not have:
+
+1. **Reserved heavy slots** (`--fast-lane-reserved-heavy-slots`): at least N normal ("heavy") requests are
+   never preempted below the reserved floor (`max_heavy_preemptible = num_heavy_running − reserved_slots`;
+   preemption stops at the floor) — so sustained fast load **cannot fully starve** normal requests.
+2. **Heavy aging** (`--fast-lane-heavy-aging-ms`): a normal request waiting past the window is promoted to
+   `fast_lane_priority − 1` and jumps **ahead of** the fast tier — so a stream of fast requests **cannot
+   block** a waiting normal one indefinitely.
+
+It also couples with session KV spill (a fast request can spill a normal session's KV to host rather than
+queue; a fast request is never itself spilled). This is a **scheduling-behaviour** difference, **default
+off** (default path byte-unchanged); the reserved-floor byte cost was not registry-dumped (drawn
+estimated). The *mechanism* is diagram 13.
 
 ## 10 — PD-disaggregation: keep prefill off the slow lane
 
@@ -219,7 +248,7 @@ the fork addition. Work in progress (§5).
 
 ## 12 — Session KV spill (mechanism)
 
-<img src="topologies/12-session-kv-spill.svg" alt="On VRAM KV overflow the newest session's KV shard is offloaded to host RAM and keeps decoding via host-streamed attention; strict FCFS victim order, fast-lane precedence, FIFO restore" width="100%">
+<img src="topologies/12-session-kv-spill.svg" alt="On VRAM KV overflow the newest session's KV shard is offloaded to host RAM and keeps decoding via host-streamed attention; strict FCFS victim order, fast-lane precedence, FIFO restore. Isolation matrix during a spill: device-resident session 10.4/13.4/19.9/26.0 tok/s at tick-interval 1/2/4/8 (violated at tick 1/2), planned bs=1 spill-graph resolves it" width="100%">
 
 On device KV overflow the **newest** session's KV shard moves to host RAM and keeps decoding from host
 in a separate eager `bs=1` tick, never mixed into the device CUDA-graph batch. Victim order is strict
@@ -227,15 +256,25 @@ FCFS with fast-lane precedence; sessions restore FIFO; only KV spills, GDN state
 Experimental S1 measured; the long-context curve is modeled (needs S2). Upstream pauses/recomputes a
 request under KV pressure (`--enable-kv-session-offload`, §20).
 
-## 13 — Fast-lane priority scheduling (mechanism)
+The diagram's **isolation matrix** (measured, ctx ~1.6k) records how the **device-resident** session
+runs during a spill: **10.4 / 13.4 / 19.9 / 26.0 tok/s at tick-interval 1 / 2 / 4 / 8** (pre-spill
+~40), spilled session ~7–8 tok/s. The isolation target holds only from tick-interval 4 up and is
+**violated at tick 1 / 2** because the spill step still runs eager on the shared tick — the open item
+the planned **bs=1 spill-graph (Step 5, not yet built, not measured)** is meant to resolve.
 
-<img src="topologies/13-fast-lane-priority.svg" alt="A fast-tagged request preempts into the running batch by taking a reserved-heavy slot; heavy-aging prevents starvation; composes with session KV spill; default off" width="100%">
+## 13 — Fast-lane: fairness / anti-starvation layer (mechanism)
 
-A `"lane":"fast"` request preempts into the running batch by taking a reserved-heavy slot; heavy-aging
-raises long-waiting heavy requests so fast traffic cannot starve them. It composes with session KV
-spill (a fast request can spill a normal session to host). Default off — the default path is unchanged.
-Upstream has priority scheduling the fork builds on; the reserved-floor fast-lane class is the fork
-addition (`--enable-fast-lane`, §16).
+<img src="topologies/13-fast-lane-priority.svg" alt="Upstream priority scheduling sorts by continuous integer priority and preempts on a threshold; the fork fast-lane adds two anti-starvation guarantees on that path — reserved heavy slots never preempted below a floor, and heavy-aging that promotes a long-waiting normal request ahead of the fast tier — plus session-spill coupling; default off" width="100%">
+
+Upstream supplies the priority axis (continuous integer `priority` + preemption when `priority_diff` >
+`priority_scheduling_preemption_threshold`, verified in `schedule_policy.py`) — general, with no reserved
+floor and no aging. The fork's fast-lane is a **binary opt-in lane on that path** whose delta is two
+anti-starvation guarantees: **reserved heavy slots** (`max_heavy_preemptible = num_heavy_running −
+reserved_slots`; preemption stops at the floor, so fast load cannot fully starve normal requests) and
+**heavy aging** (a normal request waiting past the window is promoted to `fast_lane_priority − 1` and
+jumps ahead of the fast tier). It couples with session KV spill (a fast request can spill a normal
+session to host rather than queue; a fast request is never itself spilled). Default off — the default
+path is unchanged (`--enable-fast-lane`, §16). Stated as what each side does, not a ranking.
 
 ## 14 — Measured VRAM budget (mechanism)
 
