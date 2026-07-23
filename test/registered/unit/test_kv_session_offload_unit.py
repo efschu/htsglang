@@ -585,6 +585,56 @@ def test_fastlane_multi_eviction_capped_by_free_regions():
     assert victims == [3, 2]  # still youngest-first
 
 
+# ---------------------------------------------------------------------------
+# S4 bugfix: H2D restore/wave-back must skip 0-owned ranks (empty index ->
+# 0-block kernel launch = CUDA "invalid configuration argument")
+# ---------------------------------------------------------------------------
+
+
+def test_zero_owned_rank_yields_empty_transfer_indices():
+    """Under weighted uneven-DCP a rank legitimately owns NONE of a restored
+    tail / wave-back block: its owner-matched slot set has no residue in that
+    rank's class, so owned_device_indices returns a 0-element index tensor.
+    The H2D transfer (rank-local memcpy kernel) computes grid dim =
+    div_ceil(len(indices), W); len==0 -> 0 blocks -> invalid launch. Restore
+    and wave-back MUST guard on numel()>0 (backup already does)."""
+    # PREFIX = [0, 1, 33, 64]: rank 0 owns ONLY residue 0.
+    # A block whose owner-matched slots carry residues {1, 2, 34} -> rank 0
+    # owns zero of them.
+    new_locs = torch.tensor([1, 2, 34, 33, 5], dtype=torch.int64)  # slot ids
+    owned0, dev0 = owned_device_indices(
+        new_locs, mode="weighted", S=S, lo=0, hi=1, dcp_size=3, dcp_rank=0
+    )
+    assert dev0.numel() == 0  # rank 0 owns nothing here -> MUST skip the launch
+    assert not bool(owned0.any())
+
+    # rank 1 owns residues [1, 33): slots 1, 2, 5 -> non-empty (launch fine)
+    _, dev1 = owned_device_indices(
+        new_locs, mode="weighted", S=S, lo=1, hi=33, dcp_size=3, dcp_rank=1
+    )
+    assert dev1.numel() == 3
+
+
+def test_small_final_waveback_block_can_be_zero_owned():
+    """The '+92'-style small final wave-back block reproduces the crash: a
+    short tail segment can contain zero tokens owned by a given rank."""
+    # a 2-token block at absolute positions [b, b+2) whose sentinel residues
+    # are both outside rank 2's class [33, 64)
+    block_slots = torch.tensor([100, 101], dtype=torch.int64)  # residues 36, 37
+    # rank 0 (residue 0) owns none:
+    _, d0 = owned_device_indices(
+        block_slots, mode="weighted", S=S, lo=0, hi=1, dcp_size=3, dcp_rank=0
+    )
+    assert d0.numel() == 0
+    # rank 2 (residues [33,64)) owns BOTH (36, 37):
+    _, d2 = owned_device_indices(
+        block_slots, mode="weighted", S=S, lo=33, hi=64, dcp_size=3, dcp_rank=2
+    )
+    assert d2.numel() == 2
+    # -> some ranks skip, some launch: the guard keeps this rank-uniform-safe
+    #    because the transfer is rank-LOCAL (no collective to desync).
+
+
 def test_restore_hysteresis():
     h = RestoreHysteresis(3)
     assert not h.update(True)

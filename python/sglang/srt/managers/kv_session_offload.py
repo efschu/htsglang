@@ -1158,15 +1158,23 @@ class KVSessionOffloadManager:
         self._wait_forward_stream()
         # Within this session's region, the active tail owns host rows
         # [region_base + drain, ... + n_own): wave-back drained [.., drain).
+        # n_own == 0 when this rank owns NONE of the tail (weighted uneven-DCP:
+        # the tail's residues all fall in other ranks' classes). The H2D
+        # transfer is rank-LOCAL (a pure host->device memcpy kernel, no
+        # collective), and its grid dim is div_ceil(len(indices), ...) which
+        # is 0 for an empty index tensor -> a 0-block launch throws CUDA
+        # "invalid configuration argument". Skip the launch on 0-owned ranks;
+        # the row rewrite below still runs everywhere (replicated slot ids).
         base = bslot.region_base + bslot.host_row_base
-        host_ids = torch.arange(
-            base, base + n_own, dtype=torch.int64, device=row.device
-        )
-        layer_num = getattr(self.host_pool, "layer_num", 0)
-        for fl in range(layer_num):
-            self.host_pool.load_to_device_per_layer(
-                self.full_pool, host_ids, dev_idx, fl, io_backend="kernel"
+        if n_own > 0:
+            host_ids = torch.arange(
+                base, base + n_own, dtype=torch.int64, device=row.device
             )
+            layer_num = getattr(self.host_pool, "layer_num", 0)
+            for fl in range(layer_num):
+                self.host_pool.load_to_device_per_layer(
+                    self.full_pool, host_ids, dev_idx, fl, io_backend="kernel"
+                )
         self.req_to_token_pool.req_to_token[req.req_pool_idx, boundary:L] = (
             new_locs.to(torch.int32)
         )
@@ -1244,19 +1252,28 @@ class KVSessionOffloadManager:
         # [base, base+blk_own) into the new device slots. Order after any
         # in-flight forward, record the wave event so the next tick's device-
         # head read (and the next wave's copy_inflight check) can wait it.
+        # blk_own == 0 when this rank owns NONE of the block (weighted
+        # uneven-DCP, or a small final block whose residues miss this rank's
+        # class): the transfer is rank-local and its grid dim is
+        # div_ceil(len(indices), ...) == 0 for an empty index tensor, so a
+        # 0-block launch throws CUDA "invalid configuration argument". Skip
+        # the launches on 0-owned ranks; the boundary/drain advance + row
+        # rewrite below still run everywhere. The wave event is still recorded
+        # (idle when nothing was copied) so the next tick's wait stays valid.
         base = bslot.region_base + bslot.host_row_base
-        host_ids = torch.arange(
-            base, base + blk_own, dtype=torch.int64, device=row.device
-        )
         layer_num = getattr(self.host_pool, "layer_num", 0)
         cs = self.backend._sess_copy_stream
         self._wait_forward_stream()
         with torch.cuda.stream(cs):
             cs.wait_stream(torch.cuda.current_stream())
-            for fl in range(layer_num):
-                self.host_pool.load_to_device_per_layer(
-                    self.full_pool, host_ids, dev_idx, fl, io_backend="kernel"
+            if blk_own > 0:
+                host_ids = torch.arange(
+                    base, base + blk_own, dtype=torch.int64, device=row.device
                 )
+                for fl in range(layer_num):
+                    self.host_pool.load_to_device_per_layer(
+                        self.full_pool, host_ids, dev_idx, fl, io_backend="kernel"
+                    )
             self.backend._sess_wave_done.record(cs)
 
         # Rewrite the block's row with the real device slots; advance the
