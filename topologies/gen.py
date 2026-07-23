@@ -3,19 +3,28 @@
 Generator for the topology diagrams referenced by ../TOPOLOGIES.md.
 
 Every diagram is a self-contained SVG: inline shapes + text only, no external
-fonts, no external images, no <image href> to remote hosts. GPU boxes are scaled
-by VRAM (box height = VRAM_GB * PXGB) and partitioned into labelled regions with
-a fixed, consistent colour meaning across every diagram (see COLORS / LEGEND).
+fonts, no external images, no <image href> to remote hosts.
 
-Text layout is auto-flowed: the title, subtitle and header sentences are wrapped
-to the canvas width and stacked, and the GPU cards are placed below that header
-block with a clear gap, so nothing clips the right edge or collides with a card
-label. Inter-card connector tags are kept short and live in the empty column
-between two cards; card->host-RAM links run down the card's right edge, clear of
-the centred caption.
+The core of this document is, PER FORK FEATURE, ONE side-by-side VRAM/RAM
+diagram:
 
-Region sizes inside a card are illustrative partitionings of that card's VRAM,
-not measured allocations, unless a number is quoted from FEATURES_VS_UPSTREAM.md.
+  LEFT  — the fork feature on the reference rig (1x RTX 5090 32 GB + 2x RTX 3080
+          20 GB, PCIe, no NVLink, no P2P), drawn GRANULARLY per card into the
+          measured component segments (weights, KV, GDN state, experts, draft
+          pools, graphs, CUDA context, free) plus a host-RAM bar.
+  RIGHT — the hypothetical NORMAL / homogeneous UPSTREAM config for the same
+          workload: N IDENTICAL cards, even TP = card count, with the divisibility
+          reason for that TP. The whole right panel is illustrative / ESTIMATED.
+
+Visual truth convention (used in every diagram, explained in the evidence key):
+  * MEASURED           -> solid fill.
+  * ESTIMATED          -> solid fill + diagonal hatch overlay + dashed outline.
+  * UNKNOWN / not captured -> empty box, dashed grey outline, labelled "not captured".
+The entire upstream (right) panel is ESTIMATED by construction (it is hypothetical
+hardware), so every right-panel segment is hatched.
+
+Numbers are taken only from the truth-checked data tables; where a segment was
+never measured it is drawn as "not captured", never invented.
 """
 
 import os
@@ -37,12 +46,12 @@ COLORS = {
     "hostkv":    "#3f9fa0",  # host-staged / transferred KV
     "free":      "#d3dae1",  # unused / reserve headroom
     "ctx":       "#98a2ab",  # CUDA context + framework overhead
-    # granular (per-layer / per-head) palette, used by diagrams 10+:
+    # granular (per-layer / per-head) palette:
     "gdn":       "#7d5ba6",  # GDN / linear-attention layer (recurrent state)
     "fullattn":  "#2f6f8f",  # full-attention layer (holds KV cache)
     "state":     "#c9b8e0",  # GDN recurrent state (fixed size)
-    "mtp":       "#c65b9b",  # MTP / NEXTN draft head
-    "bad":       "#e9d7d7",  # upstream: unused region / a split its constraints do not admit here
+    "mtp":       "#c65b9b",  # MTP / NEXTN draft head / solo-draft pool
+    "bad":       "#e9d7d7",  # upstream: region a split's constraints do not admit here
 }
 LEGEND = [
     ("weights",  "model-weight shard"),
@@ -50,14 +59,14 @@ LEGEND = [
     ("resident", "resident experts (MoE)"),
     ("scratch",  "expert scratch / prefetch"),
     ("spill",    "experts spilled to host RAM"),
-    ("hostkv",   "host-staged KV"),
+    ("hostkv",   "host-staged / spilled KV"),
     ("free",     "free / reserve headroom"),
     ("ctx",      "CUDA context + overhead"),
     ("gdn",      "GDN / linear-attn layer"),
     ("fullattn", "full-attention layer (KV)"),
     ("state",    "GDN recurrent state"),
-    ("mtp",      "MTP / NEXTN draft head"),
-    ("bad",      "upstream: unused / not admitted here"),
+    ("mtp",      "MTP draft head / draft pool"),
+    ("bad",      "upstream: not admitted here"),
 ]
 WHITE_TEXT = ("weights", "kv", "resident", "spill", "hostkv", "gdn", "fullattn", "mtp")
 
@@ -114,12 +123,108 @@ def flow(x, y, s, maxw, size=10.5, color="#1a1a1a", weight="normal", lh=None):
     return "".join(out), cy
 
 
-def gpu_column(x, top, name, vram_gb, regions, caption=None, sub=None):
-    """One GPU box scaled to vram_gb, regions stacked top-down.
+# ---------------------------------------------------------------------------
+# Evidence-aware primitives (the MEASURED / ESTIMATED / UNKNOWN convention).
+# ---------------------------------------------------------------------------
+def evseg(x, y, w, h, key, ev, label="", size=8.5, lead=None):
+    """One evidence-tagged rectangle. ev in {measured, estimated, unknown}.
 
-    regions: list of (colorkey, gb, label); remainder drawn as 'free'.
-    Returns (svg, box_bottom_y).
+    lead: if a label does not fit inside a thin band, draw it to the right of
+    x0 at height 'lead' with a leader line (used only in single-panel diagrams).
     """
+    o = []
+    if ev == "unknown":
+        o.append(rect(x, y, w, h, "#f4f5f6", stroke="#9aa3ac", sw=1.0, dash="3 3"))
+        tc = "#5a636c"
+    else:
+        o.append(rect(x, y, w, h, COLORS[key], stroke="#2b2b2b", sw=1.0,
+                      dash="4 2" if ev == "estimated" else None))
+        if ev == "estimated":
+            o.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" '
+                     f'fill="url(#hatch)" stroke="none"/>')
+        tc = "#ffffff" if key in WHITE_TEXT else "#1a1a1a"
+    if label:
+        if h >= 14:
+            o.append(text(x + w / 2, y + h / 2 + 3.2, label, size=size, anchor="middle", color=tc))
+        elif h >= 9.5:
+            o.append(text(x + w / 2, y + h / 2 + 2.6, label, size=min(size, 7.4), anchor="middle", color=tc))
+    return "".join(o)
+
+
+def stack_card(x, base_y, name, sub, vram, segs, PX, cardw=140, force_ev=None,
+               free_label="free"):
+    """A GPU card, bottom-aligned to base_y, height = vram*PX.
+
+    segs: list of (key, gb, label, ev). ev in {measured, estimated, unknown}.
+    force_ev: if set, overrides every segment's evidence (upstream panels -> estimated).
+    Remainder up to vram is drawn as 'free'.
+    """
+    th = base_y - vram * PX
+    nsz = 10.5 if cardw >= 105 else (9.2 if cardw >= 82 else 8.2)
+    o = [text(x + cardw / 2, th - 19, name, size=nsz, anchor="middle", weight="bold"),
+         text(x + cardw / 2, th - 7, sub, size=min(8.4, nsz - 1.6), anchor="middle", color="#555")]
+    used = 0.0
+    cy = th
+    for key, gb, label, ev in segs:
+        e = force_ev or ev
+        o.append(evseg(x, cy, cardw, gb * PX, key, e, label))
+        cy += gb * PX
+        used += gb
+    if used < vram - 0.03:
+        fh = (vram - used) * PX
+        fev = "estimated" if force_ev == "estimated" else "measured"
+        o.append(evseg(x, cy, cardw, fh, "free", fev, free_label if fh >= 13 else ""))
+    o.append(rect(x, th, cardw, vram * PX, "none", stroke="#222", sw=1.6))
+    return "".join(o), th
+
+
+def host_bar_ev(x, y, w, title, segs):
+    """Horizontal host-RAM bar; segs = (key, frac, label, ev)."""
+    barh = 32
+    o = [text(x, y - 6, title, size=10, weight="bold", color="#333")]
+    o.append(rect(x, y, w, barh, "none", stroke="#222", sw=1.4))
+    cx = x
+    for key, frac, label, ev in segs:
+        rw = w * frac
+        o.append(evseg(cx, y, rw, barh, key, ev, label if rw >= 55 else "", size=9))
+        cx += rw
+    return "".join(o), y + barh
+
+
+def evidence_key(x, y):
+    o = [text(x, y, "Evidence:", size=9.5, weight="bold", color="#333")]
+    bx = x + 62
+    o.append(rect(bx, y - 9, 13, 13, COLORS["kv"], stroke="#333", sw=0.8, rx=1))
+    o.append(text(bx + 18, y + 1, "MEASURED (solid)", size=9, color="#333"))
+    bx2 = bx + 150
+    o.append(rect(bx2, y - 9, 13, 13, COLORS["kv"], stroke="#2b2b2b", sw=1.0, dash="4 2", rx=1))
+    o.append(f'<rect x="{bx2}" y="{y-9}" width="13" height="13" fill="url(#hatch)" stroke="none"/>')
+    o.append(text(bx2 + 18, y + 1, "ESTIMATED (hatched + dashed)", size=9, color="#333"))
+    bx3 = bx2 + 232
+    o.append(rect(bx3, y - 9, 13, 13, "#f4f5f6", stroke="#9aa3ac", sw=1.0, dash="3 3", rx=1))
+    o.append(text(bx3 + 18, y + 1, "UNKNOWN — not captured (empty)", size=9, color="#333"))
+    return "".join(o), y + 6
+
+
+def core_note(x, y, w, s):
+    txt, ny = flow(x + 14, y + 18, "Core — " + s, w - 28, size=10.4,
+                   color="#12303a", weight="bold", lh=15)
+    h = ny - y
+    box = rect(x, y, w, h, "#edf4f6", stroke="#2f6f8f", sw=1.3, rx=6)
+    return box + txt, y + h
+
+
+def place(x0, x1, n, maxcw=140):
+    """Evenly place n cards, centred, in [x0, x1]; returns (xs, cardw)."""
+    gap = 14
+    area = x1 - x0
+    cw = min(maxcw, (area - (n - 1) * gap) / n)
+    total = n * cw + (n - 1) * gap
+    sx = x0 + (area - total) / 2
+    return [sx + i * (cw + gap) for i in range(n)], cw
+
+
+def gpu_column(x, top, name, vram_gb, regions, caption=None, sub=None):
     out = []
     h = vram_gb * PXGB
     out.append(text(x + BOXW / 2, top - 21, name, size=12, anchor="middle", weight="bold"))
@@ -141,58 +246,21 @@ def gpu_column(x, top, name, vram_gb, regions, caption=None, sub=None):
             out.append(text(x + BOXW / 2, cy + rh / 2 + 3.6, label, size=10, anchor="middle", color=tc))
         elif label and rh >= 11:
             out.append(text(x + BOXW / 2, cy + rh / 2 + 3.2, label, size=8.5, anchor="middle", color=tc))
-        elif label:
-            out.append(line(x + BOXW, cy + rh / 2, x + BOXW + 8, cy + rh / 2, stroke="#888", sw=0.8))
-            out.append(text(x + BOXW + 11, cy + rh / 2 + 3.2, label, size=8.5, anchor="start", color="#333"))
         cy += rh
     if caption:
         out.append(text(x + BOXW / 2, top + h + 15, caption, size=9, anchor="middle", color="#333"))
     return "".join(out), top + h
 
 
-def host_ram_bar(x, y, w, regions, title):
-    out = []
-    barh = 34
-    tl, _ = flow(x, y - 7, title, w, size=10.5, color="#333", weight="bold")
-    out.append(tl)
-    out.append(rect(x, y, w, barh, "none", stroke="#222", sw=1.4))
-    cx = x
-    for key, frac, label in regions:
-        rw = w * frac
-        out.append(rect(cx, y, rw, barh, COLORS[key]))
-        tc = "#ffffff" if key in WHITE_TEXT else "#1a1a1a"
-        if rw >= 45:
-            out.append(text(cx + rw / 2, y + barh / 2 + 3.6, label, size=9.5, anchor="middle", color=tc))
-        cx += rw
-    return "".join(out), y + barh
-
-
-def gap_tag(x_left_box_right, x_right_box_left, y, label, kind="x16"):
-    """Short connector drawn in the empty column between two cards."""
-    styles = {"x16": (2.2, None, "#5a5a5a"), "x4": (1.5, "4 3", "#8a5a2b"),
-              "nvlink": (4.0, None, "#227a3a")}
-    sw, dash, col = styles[kind]
-    mx = (x_left_box_right + x_right_box_left) / 2
-    out = [line(x_left_box_right, y, x_right_box_left, y, stroke=col, sw=sw, dash=dash)]
-    out.append(text(mx, y - 5, label, size=8.5, anchor="middle", color=col))
-    return "".join(out)
-
-
-def down_link(x, y1, y2, kind="x16", label=None):
-    """Vertical card->host link, drawn in an empty column; optional top label."""
-    styles = {"x16": (2.2, None, "#5a5a5a"), "x4": (1.5, "4 3", "#8a5a2b")}
-    sw, dash, col = styles[kind]
-    out = [line(x, y1, x, y2, stroke=col, sw=sw, dash=dash)]
-    if label:
-        out.append(text(x, y1 + 11, label, size=8.5, anchor="middle", color=col))
-    return "".join(out)
-
-
 def defs():
-    """Shared arrowhead markers (self-contained, no external refs)."""
+    """Shared arrowhead markers + the hatch pattern (self-contained)."""
     ms = [("arr", "#333"), ("arrP", "#8a5a2b"), ("arrG", "#227a3a"),
           ("arrR", "#c0504d"), ("arrB", "#3b6fb0"), ("arrV", "#7d5ba6")]
     s = "<defs>"
+    s += ('<pattern id="hatch" patternUnits="userSpaceOnUse" width="7" height="7" '
+          'patternTransform="rotate(45)">'
+          '<line x1="0" y1="0" x2="0" y2="7" stroke="#ffffff" stroke-width="2" '
+          'stroke-opacity="0.5"/></pattern>')
     for mid, col in ms:
         s += (f'<marker id="{mid}" markerWidth="9" markerHeight="9" refX="6.5" '
               f'refY="3" orient="auto" markerUnits="userSpaceOnUse">'
@@ -210,9 +278,9 @@ def panel_label(x, y, label, kind):
     """Pill badge marking a panel as 'htsglang' (ours) or 'upstream sglang' (neutral)."""
     col = "#1d6b34" if kind == "ours" else "#4a5568"
     fill = "#e7f2ea" if kind == "ours" else "#eef1f4"
-    w = len(label) * 7.2 + 22
+    w = len(label) * 6.9 + 22
     return (rect(x, y - 15, w, 21, fill, stroke=col, sw=1.3, rx=5)
-            + text(x + 11, y, label, size=11.5, weight="bold", color=col))
+            + text(x + 11, y, label, size=11, weight="bold", color=col))
 
 
 def vdivider(x, y1, y2):
@@ -231,7 +299,7 @@ def legend(x, y, keys, width):
     out = [text(x, y, "Legend (colour meaning is identical in every diagram)",
                 size=9.5, anchor="start", weight="bold", color="#333")]
     per_row = 4 if width >= 620 else 3
-    col_w = min(190, (width - 2 * x) / per_row)
+    col_w = min(210, (width - 2 * x) / per_row)
     cy = y + 15
     for i, k in enumerate(keys):
         label = dict(LEGEND)[k]
@@ -243,7 +311,7 @@ def legend(x, y, keys, width):
     return "".join(out), cy + rows * 16
 
 
-def compose(name, W, title, subtitle, sentences, draw, legend_keys):
+def compose(name, W, title, subtitle, sentences, draw, legend_keys, evidence=False):
     """Stack title/subtitle/header (auto-wrapped), then cards, then legend."""
     body = []
     maxw = W - 40
@@ -255,17 +323,21 @@ def compose(name, W, title, subtitle, sentences, draw, legend_keys):
     for txt, col in sentences:
         s, y = flow(hx, y + 4, txt, maxw, size=10.5, color=col, lh=15)
         body.append(s)
-    topY = y + 30  # clear gap before the first card's name label (at topY-21)
+    topY = y + 30
     dbody, content_bottom = draw(topY, W)
     body.append(dbody)
-    leg, legend_end = legend(20, content_bottom + 30, legend_keys, W)
+    leg, legend_end = legend(20, content_bottom + 28, legend_keys, W)
     body.append(leg)
-    H = int(legend_end + 18)
+    end = legend_end
+    if evidence:
+        ek, end = evidence_key(20, legend_end + 16)
+        body.append(ek)
+    H = int(end + 18)
     head = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" '
             f'width="{W}" height="{H}" font-family="sans-serif">')
     bg = rect(0, 0, W, H, "#ffffff", stroke="none", sw=0, rx=0)
     svg = f'{head}{defs()}{bg}{"".join(body)}</svg>'
-    with open(os.path.join(OUT, name), "w") as f:
+    with open(os.path.join(OUT, name), "w", encoding="utf-8") as f:
         f.write(svg)
     print("wrote", name, f"({W}x{H})")
 
@@ -274,295 +346,620 @@ def cardbottom(topY):
     return topY + MAXVRAM * PXGB
 
 
-# ---------------------------------------------------------------------------
-def s1():
+# ===========================================================================
+# The 10 per-feature SIDE-BY-SIDE VRAM/RAM diagrams (Parts 1-2, cool-first).
+# Data comes only from the truth-checked tables; missing segments are drawn as
+# "not captured". Left = fork on the rig; right = hypothetical homogeneous
+# upstream config (all right-panel segments ESTIMATED).
+# ===========================================================================
+def feature(spec):
+    W = spec.get("W", 1320)
+    PX = spec.get("PX", 4.0)
+    maxv = spec.get("maxv", 32.6)
+
     def draw(topY, W):
         b = []
-        cb = cardbottom(topY)
-        x0 = LEFT
-        c, _ = gpu_column(x0, topY, "RTX 5090", 32,
-                          [("weights", 13, "weight shard (rank0)"),
-                           ("kv", 13, "KV cache"), ("ctx", 2, "ctx")],
-                          caption="rank 0  •  ratio 8")
-        b.append(c)
-        x1 = LEFT + SLOT
-        c, _ = gpu_column(x1, topY + (32 - 20) * PXGB, "RTX 3080", 20,
-                          [("weights", 8, "weight shard (rank1)"),
-                           ("kv", 8, "KV cache"), ("ctx", 2, "ctx")],
-                          caption="rank 1  •  ratio 5")
-        b.append(c)
-        b.append(gap_tag(x0 + BOXW, x1, topY + 95, "PCIe x16", "x16"))
-        # stock even-TP ghost
-        lx = LEFT + 2 * SLOT + 20
-        b.append(text(lx + 60, topY - 21, "upstream even-TP", size=11.5, anchor="middle", weight="bold", color="#4a5568"))
-        b.append(rect(lx, topY, 120, 32 * PXGB, "none", stroke="#4a5568", sw=1.4, dash="5 3"))
-        b.append(rect(lx, topY, 120, 8 * PXGB, COLORS["weights"]))
-        b.append(text(lx + 60, topY + 8 * PXGB / 2 + 3.6, "weights (3080-sized)", size=9, anchor="middle", color="#fff"))
-        b.append(rect(lx, topY + 8 * PXGB, 120, 8 * PXGB, COLORS["kv"]))
-        b.append(text(lx + 60, topY + 12 * PXGB + 3.6, "KV (3080-sized)", size=9, anchor="middle", color="#fff"))
-        b.append(rect(lx, topY + 16 * PXGB, 120, 16 * PXGB, COLORS["bad"], stroke="#4a5568", sw=1.0, dash="4 3"))
-        b.append(text(lx + 60, topY + 23 * PXGB, "~12 GB", size=11, anchor="middle", weight="bold", color="#4a5568"))
-        b.append(text(lx + 60, topY + 23 * PXGB + 14, "unused on the 5090", size=9, anchor="middle", color="#4a5568"))
-        return "".join(b), cb + 22
-    compose("01-uneven-tp.svg", 700,
-            "1 — Two mismatched GPUs, PCIe, no NVLink → uneven Tensor Parallelism",
-            "RTX 5090 32 GB + RTX 3080 20 GB. Decisive setting: --rank-tp-ratio (proportional shards).",
-            [("--rank-tp-ratio 8,5: shards sized to each card, not to the smallest. Cards linked by "
-              "NCCL over PCIe host-staging (no NVLink).", "#333"),
-             ("Upstream sglang: even TP sizes both ranks to the 3080's shard; ~12 GB of the 5090 is left "
-              "unused (dashed box at right).", "#555")],
-            draw, ["weights", "kv", "ctx", "free", "bad"])
-
-
-def s2():
-    def draw(topY, W):
-        b = []
-        cb = cardbottom(topY)
-        cards = [("RTX 5090", 32, "rank 0"), ("RTX 3080", 20, "rank 1"), ("RTX 3080", 20, "rank 2")]
-        for i, (nm, vram, cap) in enumerate(cards):
-            x = LEFT + i * SLOT
-            wsh = 11 if vram == 32 else 7
-            kv = vram - wsh - 2
-            c, _ = gpu_column(x, topY + (32 - vram) * PXGB, nm, vram,
-                              [("weights", wsh, "weight shard"),
-                               ("kv", kv, "KV token-shard"), ("ctx", 2, "ctx")],
-                              caption=cap)
+        mid = W / 2
+        top = topY + 60
+        base = top + maxv * PX
+        b.append(panel_label(30, topY - 2, spec["left_label"], "ours"))
+        b.append(panel_label(mid + 16, topY - 2, spec["right_label"], "stock"))
+        # left cards
+        lcards = spec["left_cards"]
+        lxs, lcw = place(40, mid - 26, len(lcards),
+                         maxcw=spec.get("left_cw", 140))
+        for (nm, sub, vram, segs), x in zip(lcards, lxs):
+            c, _ = stack_card(x, base, nm, sub, vram, segs, PX, cardw=lcw,
+                              free_label=spec.get("left_free", "free"))
             b.append(c)
-            if i > 0:
-                xp = LEFT + (i - 1) * SLOT
-                b.append(gap_tag(xp + BOXW, x, topY + 100, "DCP", "x16"))
-        return "".join(b), cb + 22
-    compose("02-uneven-dcp.svg", 700,
-            "2 — Three mismatched cards → uneven-TP auto + uneven-DCP",
-            "1×5090 + 2×3080. Decisive setting: --rank-tp-ratio auto (sets DCP=TP), token-axis KV.",
-            [("--rank-tp-ratio auto + uneven-DCP token sharding: KV is split along the TOKEN axis, not "
-              "the KV-head axis. Inter-card links are DCP LSE-merges over PCIe.", "#333"),
-             ("Fills every card; the big card is sized to its own VRAM. Measured ≈+2.3-2.8× token-axis "
-              "KV context vs an equal head-axis split (2.27-2.81× on the 27B uneven-DCP runs).", "#2b6b3a"),
-             ("Upstream sglang: even TP + head-axis KV uses equal shards and requires num_kv_heads "
-              "divisible by the rank count; the 5090 is sized to the 3080's shard.", "#555")],
-            draw, ["weights", "kv", "ctx", "free"])
-
-
-def s3():
-    def draw(topY, W):
-        b = []
-        cb = cardbottom(topY)
-        cards = [("RTX 5090", 32, "rank 0"), ("RTX 3080", 20, "rank 1"), ("RTX 3080", 20, "rank 2")]
-        for i, (nm, vram, cap) in enumerate(cards):
-            x = LEFT + i * SLOT
-            wsh = 11 if vram == 32 else 7
-            kvrep = 3
-            kvtok = vram - wsh - kvrep - 2
-            c, _ = gpu_column(x, topY + (32 - vram) * PXGB, nm, vram,
-                              [("weights", wsh, "weight shard"),
-                               ("kv", kvtok, "KV token-shard"),
-                               ("scratch", kvrep, "replicated KV"),
-                               ("ctx", 2, "ctx")], caption=cap)
+        # right cards (upstream, all estimated)
+        rcards = spec["right_cards"]
+        rxs, rcw = place(mid + 26, W - 30, len(rcards),
+                         maxcw=spec.get("right_cw", 140))
+        for (nm, sub, vram, segs), x in zip(rcards, rxs):
+            c, _ = stack_card(x, base, nm, sub, vram, segs, PX, cardw=rcw,
+                              force_ev="estimated",
+                              free_label=spec.get("right_free", "free"))
             b.append(c)
-            if i > 0:
-                xp = LEFT + (i - 1) * SLOT
-                b.append(gap_tag(xp + BOXW, x, topY + 100, "DCP", "x16"))
-        return "".join(b), cb + 22
-    compose("03-tp-gt-kvheads.svg", 700,
-            "3 — Fewer KV heads than ranks → TP > num_kv_heads (replicated KV)",
-            "1×5090 + 2×3080, model with 2 KV heads, TP=3. Decisive setting: replicated-KV path (§1/§9).",
-            [("The model has 2 GQA KV heads; TP=3 cannot head-shard (2 heads < 3 ranks). Fork: replicate "
-              "the few KV heads across ranks + token-shard the KV (LSE-merge). Query heads still sharded.", "#333"),
-             ("The salmon slice is the only duplicated part (single-digit-% KV overhead per the doc); the "
-              "bulk of KV is still split.", "#2b6b3a"),
-             ("Upstream sglang: head-axis TP is bounded by num_kv_heads (=2); a 3rd rank is not covered "
-              "by the head split.", "#555")],
-            draw, ["weights", "kv", "scratch", "ctx", "free"])
+        b.append(vdivider(mid, topY - 4, base + 18))
+        yL = base + 30
+        yR = base + 30
+        # host bars
+        if spec.get("host"):
+            hb, yL = host_bar_ev(40, yL + 8, mid - 26 - 40, spec["host"][0], spec["host"][1])
+            b.append(hb)
+            yL += 6
+        if spec.get("right_host"):
+            hb, yR = host_bar_ev(mid + 26, yR + 8, W - 30 - (mid + 26),
+                                 spec["right_host"][0], spec["right_host"][1])
+            b.append(hb)
+            yR += 6
+        # notes
+        for s, col in spec.get("left_notes", []):
+            sv, yL = flow(40, yL + 13, s, mid - 26 - 40, size=9.3, color=col)
+            b.append(sv)
+        for s, col in spec.get("right_notes", []):
+            sv, yR = flow(mid + 26, yR + 13, s, W - 30 - (mid + 26), size=9.3, color=col)
+            b.append(sv)
+        cy = max(yL, yR) + 14
+        cn, cy = core_note(40, cy, W - 70, spec["core"])
+        b.append(cn)
+        return "".join(b), cy
+    compose(spec["name"], W, spec["title"], spec["subtitle"], spec["sentences"],
+            draw, spec["legend_keys"], evidence=True)
 
 
-def s4():
-    def draw(topY, W):
-        b = []
-        cb = cardbottom(topY)
-        cards = [("RTX 5090", 32, "rank 0"), ("RTX 3080", 20, "rank 1"), ("RTX 3080", 20, "rank 2")]
-        for i, (nm, vram, cap) in enumerate(cards):
-            x = LEFT + i * SLOT
-            wsh = 6 if vram == 32 else 4
-            res = 8 if vram == 32 else 5
-            scr = 3
-            kv = vram - wsh - res - scr - 2
-            c, _ = gpu_column(x, topY + (32 - vram) * PXGB, nm, vram,
-                              [("weights", wsh, "attn+shared wts"),
-                               ("resident", res, "resident experts"),
-                               ("scratch", scr, "prefetch"),
-                               ("kv", kv, "KV cache"), ("ctx", 2, "ctx")], caption=cap)
-            b.append(c)
-        # PCIe links drawn in the empty gap columns between cards
-        for gx in (LEFT + BOXW + (SLOT - BOXW) / 2, LEFT + SLOT + BOXW + (SLOT - BOXW) / 2):
-            b.append(down_link(gx, cb, cb + 44, "x16", "PCIe"))
-        hb, hy = host_ram_bar(LEFT, cb + 44, 3 * SLOT - (SLOT - BOXW),
-                              [("spill", 0.72, "cold experts (pinned) — fetched per token-wave"),
-                               ("free", 0.28, "free")],
-                              "Pinned host RAM (DDR)")
-        b.append(hb)
-        return "".join(b), hy
-    compose("04-moe-expert-offload.svg", 660,
-            "4 — MoE with more experts than fit VRAM → per-expert host offload + uneven-TP",
-            "35B-A3B on 1×5090 + 2×3080. Decisive setting: resident-fraction expert offload (§6, [in progress]).",
-            [("SGLANG_MOE_RESIDENT_EXPERT_FRACTION<1 [in progress]: a fixed set of experts stays resident "
-              "(amber), the rest spill to pinned host RAM (red) and are prefetched per token-wave.", "#333"),
-             ("FP8 path is quality-neutral (#120: ≈+0.15% ppl within FP8 reduction-order noise, 15/15 "
-              "batteries, needle 100%) and self-deterministic — not bit-identical, diverging only at "
-              "near-ties (sub-ULP). The cost is throughput, not quality (offload is slower than no-offload; "
-              "exact FP8 decode factor is config-dependent, not separately benchmarked).", "#2b6b3a"),
-             ("Upstream sglang: the generic --cpu-offload-gb path (layer-granular, dequantizes on CPU) or "
-              "Expert Parallelism (experts must fit aggregate VRAM).", "#555")],
-            draw, ["weights", "resident", "scratch", "kv", "spill", "ctx"])
+M = "measured"
+E = "estimated"
+U = "unknown"
+
+FEATURES = [
+    # -- 1. Uneven DCP -----------------------------------------------------
+    {
+        "name": "01-uneven-dcp.svg",
+        "title": "1 — Uneven DCP: token-axis KV split so aggregate context scales with mismatched cards",
+        "subtitle": "Fork on the rig vs a hypothetical homogeneous upstream config for the same 27B workload.",
+        "sentences": [
+            ("Left (measured): FP8-27B TP=3 + uneven-DCP, --rank-gpu-id 0,1,2 "
+             "--rank-tp-ratio auto --rank-gpu-memory-mib 28591,16464,16464. KV is split along the "
+             "TOKEN axis (374310 / 212109 / 212109 tokens), so aggregate context grows with the "
+             "cards you already own — measured 735k tokens, 2.81x the hand-budget start.", "#333"),
+            ("Right (illustrative): the natural homogeneous upstream config is 2 identical 24 GB cards "
+             "at even TP=2 (4 KV heads split 2/rank). TP=3 is not legal here — 4 KV heads are not "
+             "divisible by 3 — which is the neutral reason upstream lands on TP in {1,2,4}.", "#555"),
+        ],
+        "left_label": "htsglang — FP8-27B TP=3 + uneven-DCP on the rig",
+        "right_label": "upstream — 2x identical 24 GB, even TP=2",
+        "left_cards": [
+            ("RTX 5090", "rank0 · 32.6 GB", 32.6, [
+                ("weights", 12.7, "weights", M),
+                ("kv", 11.42, "KV 374k tok", M),
+                ("gdn", 0.55, "GDN", M),
+                ("free", 0.41, "", M),  # graphs
+                ("ctx", 0.80, "", M)]),
+            ("RTX 3080", "rank1 · 20.5 GB", 20.5, [
+                ("weights", 8.0, "weights", M),
+                ("kv", 6.48, "KV 212k", M),
+                ("gdn", 0.47, "GDN", M),
+                ("ctx", 0.78, "", M)]),
+            ("RTX 3080", "rank2 · 20.5 GB", 20.5, [
+                ("weights", 8.0, "weights", M),
+                ("kv", 6.48, "KV 212k", M),
+                ("gdn", 0.47, "GDN", M),
+                ("ctx", 0.78, "", M)]),
+        ],
+        "right_cards": [
+            ("identical 24 GB", "rank0 · even TP=2", 24, [
+                ("weights", 12.5, "weights ½", E),
+                ("kv", 8.5, "KV head-shard (2 of 4)", E),
+                ("ctx", 1.5, "", E)]),
+            ("identical 24 GB", "rank1 · even TP=2", 24, [
+                ("weights", 12.5, "weights ½", E),
+                ("kv", 8.5, "KV head-shard (2 of 4)", E),
+                ("ctx", 1.5, "", E)]),
+        ],
+        "host": ("Host RAM (DDR) — no spill in this mode",
+                 [("free", 1.0, "not captured (low, no host tier)", U)]),
+        "left_notes": [
+            ("Segments MEASURED per rank (weights, token-KV band, GDN state, ctx). Exact host-RAM "
+             "floor for this non-spill config was not captured.", "#1d6b34"),
+        ],
+        "right_notes": [
+            ("Head-axis KV stores every token per head on each card, so aggregate KV does not grow "
+             "with added cards the way the token-axis split does. Assumed card size named; not measured.", "#4a5568"),
+        ],
+        "core": ("the fork splits KV along the token axis so aggregate context scales with the mismatched "
+                 "cards you already own; upstream even-TP head-shards KV and needs identical cards whose "
+                 "KV-head count divides the rank count — a capacity / hardware-premise difference, not \"faster\"."),
+        "legend_keys": ["weights", "kv", "gdn", "ctx", "free"],
+    },
+    # -- 2. Uneven TP ------------------------------------------------------
+    {
+        "name": "02-uneven-tp.svg",
+        "title": "2 — Uneven TP (--rank-tp-ratio): size each weight shard to the specific card",
+        "subtitle": "Fork on the rig vs a homogeneous upstream even-TP config for the same 27B workload.",
+        "sentences": [
+            ("Left (measured): 27B TP=3, --rank-tp-ratio 2,1,1 --rank-gpu-memory-mib 26000,15000,15000, "
+             "one rank per GPU. Q heads split 12/6/6, the 5090 carries the 2x shard; measured weight "
+             "shards 12.7 / 8.0 / 8.0 GiB. KV is sized as the measured remainder (262k auto-fit).", "#333"),
+            ("Right (illustrative): upstream even-TP gives every rank an IDENTICAL shard, so it wants N "
+             "equal cards (2x 24 GB shown). On mixed cards it would size every rank to the smallest and "
+             "strand the surplus of the larger one. TP=3 is illegal for this model (4 KV heads).", "#555"),
+        ],
+        "left_label": "htsglang — uneven-TP ratio 2,1,1 on the rig",
+        "right_label": "upstream — 2x identical 24 GB, even TP=2",
+        "left_cards": [
+            ("RTX 5090", "rank0 · ratio 2", 32.6, [
+                ("weights", 12.7, "weight shard (2x)", M),
+                ("gdn", 0.55, "GDN", M),
+                ("ctx", 0.80, "", M),
+                ("kv", 14.5, "KV = measured remainder", E)]),
+            ("RTX 3080", "rank1 · ratio 1", 20.5, [
+                ("weights", 8.0, "weight shard", M),
+                ("gdn", 0.47, "GDN", M),
+                ("ctx", 0.78, "", M),
+                ("kv", 8.8, "KV remainder", E)]),
+            ("RTX 3080", "rank2 · ratio 1", 20.5, [
+                ("weights", 8.0, "weight shard", M),
+                ("gdn", 0.47, "GDN", M),
+                ("ctx", 0.78, "", M),
+                ("kv", 8.8, "KV remainder", E)]),
+        ],
+        "right_cards": [
+            ("identical 24 GB", "rank0 · even shard", 24, [
+                ("weights", 12.5, "weights (equal)", E),
+                ("kv", 9.5, "KV", E),
+                ("ctx", 1.5, "", E)]),
+            ("identical 24 GB", "rank1 · even shard", 24, [
+                ("weights", 12.5, "weights (equal)", E),
+                ("kv", 9.5, "KV", E),
+                ("ctx", 1.5, "", E)]),
+        ],
+        "left_notes": [
+            ("Weight shards + GDN + ctx MEASURED; KV is the measured remainder (exact per-rank GiB for "
+             "this config not separately dumped -> drawn ESTIMATED). Earlier 68 / 97 tok/s figures used a "
+             "contaminated bench (pre-2026-07-22) and are withdrawn, not shown as fact.", "#1d6b34"),
+        ],
+        "right_notes": [
+            ("Even-TP is clean ON identical cards; the contrast is the hardware premise (N equal cards), "
+             "not the per-card layout. Assumed card size named; not measured.", "#4a5568"),
+        ],
+        "core": ("the fork sizes each shard to the specific card, using a 32 GB + 2x20 GB set as-is; "
+                 "upstream even-TP gives identical shards and therefore wants N equal cards (and strands a "
+                 "bigger card if mixed) — a hardware-premise difference, not a speed claim."),
+        "legend_keys": ["weights", "kv", "gdn", "ctx", "free"],
+    },
+    # -- 3. Adaptive drafter routing --------------------------------------
+    {
+        "name": "03-adaptive-drafter.svg",
+        "title": "3 — Adaptive drafter routing (NEXTN ↔ DFLASH): dual residence, itemised per-rung cost",
+        "subtitle": "Fork on the rig vs a homogeneous upstream single-drafter config.",
+        "sentences": [
+            ("Left (measured): both drafters resident behind --speculative-cross-algorithm. The solo-draft "
+             "pool costs 4.58 GiB on rank0 (5090); the per-k rung graphs/state are itemised "
+             "DFLASH_k16 662 / EAGLE_k3 634 / EAGLE_k2 554 MiB. Draft graphs push rank0 graphs to 7.44 GiB.", "#333"),
+            ("Right (illustrative): upstream runs ONE drafter (NEXTN/EAGLE) with adaptive k — one draft "
+             "head + its k-ladder (~0.6–0.7 GiB), on a single card (TP=1) or 2 identical cards. ~4.6 GiB "
+             "less draft VRAM, but it cannot switch draft algorithm on a regime change.", "#555"),
+        ],
+        "left_label": "htsglang — cross-algo drafter resident (measured registry)",
+        "right_label": "upstream — single drafter, adaptive k (TP=1)",
+        "left_cw": 132,
+        "right_cw": 150,
+        "left_cards": [
+            ("RTX 5090", "rank0 · 28.5 GB used", 32.6, [
+                ("weights", 13.09, "weights", M),
+                ("kv", 1.37, "KV pool", M),
+                ("gdn", 1.96, "GDN state", M),
+                ("mtp", 4.58, "solo-draft pool", M),
+                ("free", 7.44, "graphs incl draft", M)]),
+            ("RTX 3080", "rank1 · 18.6 GB", 20.5, [
+                ("weights", 8.03, "weights", M),
+                ("kv", 6.41, "KV pool", M),
+                ("gdn", 1.43, "GDN", M),
+                ("free", 2.48, "graphs", M)]),
+            ("RTX 3080", "rank2 · 18.4 GB", 20.5, [
+                ("weights", 7.68, "weights", M),
+                ("kv", 6.87, "KV pool", M),
+                ("gdn", 1.13, "GDN", M),
+                ("free", 2.48, "graphs", M)]),
+        ],
+        "right_cards": [
+            ("identical card", "TP=1 · one drafter", 24, [
+                ("weights", 13.0, "weights", E),
+                ("mtp", 0.65, "1 draft head + k-ladder", E),
+                ("kv", 7.5, "KV", E),
+                ("ctx", 1.2, "", E)]),
+        ],
+        "host": ("Host RAM (DDR) — solo-draft placement",
+                 [("hostkv", 0.28, "~2–3 GB draft (embed/lm_head + draft KV)", M),
+                  ("free", 0.72, "", M)]),
+        "left_notes": [
+            ("Rung tags itemised (MEASURED): DFLASH_k16 662 · EAGLE_k3 634 · EAGLE_k2 554 MiB. "
+             "KV budget cost of the cross-gate: ~282k vs ~524k tokens without it (MEASURED).", "#1d6b34"),
+            ("Honest claim: robustness / no-regret on mixed streams, NOT a peak speedup — switching costs "
+             "~+5.7% systemic vs a single static drafter (MEASURED).", "#333"),
+        ],
+        "right_notes": [
+            ("One resident drafter, no cross-algo pool. Assumed card; not measured.", "#4a5568"),
+        ],
+        "core": ("the fork keeps two draft algorithms resident and routes per round (~4.6 GiB on rank0 plus a "
+                 "KV-budget cost) to stay no-regret across mixed streams; upstream runs one drafter (less VRAM) "
+                 "tuned to one regime — an observability / robustness trade, not a peak-speed win."),
+        "legend_keys": ["weights", "kv", "gdn", "mtp", "hostkv", "free"],
+    },
+    # -- 4. Session KV spill ----------------------------------------------
+    {
+        "name": "04-session-kv-spill.svg",
+        "title": "4 — Session KV spill: overflow the newest session to host RAM and keep decoding",
+        "subtitle": "Fork on the rig vs upstream behaviour under KV pressure (any homogeneous TP).",
+        "sentences": [
+            ("Left (measured S1): on device-KV overflow the NEWEST session's full-attention KV shard is "
+             "pushed to host and keeps decoding (block-LSE attention, eager bs=1 tick). GDN/Mamba state "
+             "always stays resident. Zero-overhead when unused +0.16%; host decode 8.1 tok/s @1k ctx; "
+             "restore ~0.4 s; determinism 50/50 exact host-vs-device.", "#333"),
+            ("Right (illustrative): upstream has no per-session host-KV decode — under pressure it "
+             "retracts/recomputes or pauses the request. The device KV pool is a hard ceiling; there is no "
+             "host KV tier to overflow into.", "#555"),
+        ],
+        "left_label": "htsglang — device KV + host overflow tier (S1, measured)",
+        "right_label": "upstream — device KV is the hard ceiling",
+        "left_cards": [
+            ("RTX 5090", "device · rank0", 32.6, [
+                ("weights", 12.7, "weights", M),
+                ("gdn", 0.55, "GDN (always resident)", M),
+                ("kv", 11.0, "resident session KV", M),
+                ("free", 4.0, "band freed by spill", M)]),
+        ],
+        "right_cards": [
+            ("identical card", "device · KV ceiling", 24, [
+                ("weights", 12.5, "weights", E),
+                ("gdn", 0.5, "state", E),
+                ("kv", 9.0, "session KV (hard ceiling)", E),
+                ("bad", 1.0, "overflow → pause/recompute", E)]),
+        ],
+        "host": ("Host RAM (DDR) — spilled-session KV tier",
+                 [("hostkv", 0.32, "spilled session KV (32 KiB/tok x tokens, est)", E),
+                  ("free", 0.68, "host KV tier", M)]),
+        "right_host": ("Host RAM — no host KV decode path",
+                       [("free", 1.0, "not captured (no host tier)", U)]),
+        "left_notes": [
+            ("Host KV bytes = 32 KiB/token x spilled tokens (ESTIMATED from the measured cell size). "
+             "Long-context curve (32k~63 ... 262k~7.6 tok/s) is MODELED, not benchmarked (needs S2); "
+             "worthwhile only with uneven DCP active.", "#1d6b34"),
+        ],
+        "right_notes": [
+            ("Behaviour, not a VRAM split: the request is paused, not decoded from host.", "#4a5568"),
+        ],
+        "core": ("the fork lets an overflowing session keep decoding from system RAM instead of being "
+                 "paused/rejected — a capacity/behaviour difference (device-KV ceiling vs host-tier overflow), "
+                 "not a speed claim."),
+        "legend_keys": ["weights", "kv", "gdn", "hostkv", "bad", "free"],
+    },
+    # -- 5. Multi-rank co-location (TP=5) ---------------------------------
+    {
+        "name": "05-tp5-colocation.svg",
+        "title": "5 — Multi-rank co-location: run more ranks than physical cards (TP=5 on 3 GPUs)",
+        "subtitle": "Fork on the rig vs upstream, which maps one rank per physical card.",
+        "sentences": [
+            ("Left (measured budgets): --tp 5 --rank-gpu-id 0,0,0,1,2 --rank-auto-reserve-mib "
+             "11500,11500,11500,3500,3500, MPS on. Three ranks time-slice the 5090 (~7 GB budget each, "
+             "~21 GB of 32) + one rank per 3080 (~17 GB each). The per-rank weight/KV/GDN split inside each "
+             "budget was not dumped — shown as \"not captured\".", "#333"),
+            ("Right (illustrative): upstream TP=5 needs 5 physical identical cards, one rank each; this "
+             "3-card box cannot express TP=5 at all (TP is bounded by physical GPU count). Nearest legal "
+             "upstream here is TP=2 or TP=4 on identical cards.", "#555"),
+        ],
+        "left_label": "htsglang — TP=5 co-location, MPS (budgets measured)",
+        "right_label": "upstream — 5x identical cards, 1 rank each",
+        "left_cw": 140,
+        "right_cw": 96,
+        "left_cards": [
+            ("RTX 5090", "3 ranks · MPS", 32.6, [
+                ("free", 7.0, "rank0 budget ~7 GB — split not captured", U),
+                ("free", 7.0, "rank1 budget ~7 GB — not captured", U),
+                ("free", 7.0, "rank2 budget ~7 GB — not captured", U),
+                ("ctx", 2.5, "MPS/ctx", E)]),
+            ("RTX 3080", "rank3", 20.5, [
+                ("free", 17.0, "rank3 budget ~17 GB — split not captured", U)]),
+            ("RTX 3080", "rank4", 20.5, [
+                ("free", 17.0, "rank4 budget ~17 GB — split not captured", U)]),
+        ],
+        "right_cards": [
+            ("identical", f"rank{i}", 16, [("weights", 3.0, "shard", E), ("kv", 9.0, "KV", E), ("ctx", 1.2, "", E)])
+            for i in range(5)
+        ],
+        "host": ("Host RAM (DDR) — GGUF file cache + MPS",
+                 [("free", 1.0, "not captured", U)]),
+        "left_notes": [
+            ("Budgets are MEASURED (7/7/7 on the 5090, 17/17 on the 3080s); the weight/KV/GDN breakdown "
+             "within each rank was not registry-dumped. Coherent, needle from ~15k ctx, bit-identical "
+             "across two boots. Decode tok/s is deliberately NOT 5-card-representative (3 ranks share one card).", "#1d6b34"),
+            ("Models are dense-27B-GGUF and 35B-A3B-GGUF. The GGUF quant itself (format + K-quant / MMQ / "
+             "MMVQ kernels) is ggml/llama.cpp via upstream; the fork delta is only the uneven-TP adaptation "
+             "(256-superblock alignment, MLP coarsening, MMQ-OOB fix under expert sharding, Qwen3.5/3.6+Gemma-4 "
+             "arch adapters) and the MMVQ↔MMQ crossover tuning.", "#333"),
+        ],
+        "right_notes": [
+            ("TP=5 requires 5 equal cards; not expressible on this 3-card box. Illustrative sizes.", "#4a5568"),
+        ],
+        "core": ("the fork runs more ranks than physical cards (3 ranks share the 5090 via MPS) to prototype/serve "
+                 "a larger TP; upstream needs one identical card per rank (5 cards for TP=5) — a capacity/"
+                 "emulation difference, not a throughput advantage."),
+        "legend_keys": ["weights", "kv", "ctx", "free"],
+    },
+    # -- 6. Weightless-KV lane --------------------------------------------
+    {
+        "name": "06-weightless-kv-lane.svg",
+        "title": "6 — Weightless-KV lane: free the worker cards of weights and add a host KV tier for long context",
+        "subtitle": "Fork on the rig vs a homogeneous upstream config that holds weights on every rank.",
+        "sentences": [
+            ("Left (measured): --weightless-kv-fastlane, TP=3 + DCP, context 262144. rank0 (5090) is the HEAD "
+             "— it holds ALL layer weights (TP=1) at ~22.8 GiB. rank1/2 (3080) are WEIGHTLESS meta-device "
+             "workers with ZERO layer weights (~14 GiB freed each), holding only a KV token-shard (~3.7 GiB). "
+             "KV tiers: 40000 device + 1024 staging + 64000 host slots; global 312000 tokens, 262k proven.", "#333"),
+            ("Right (illustrative): a homogeneous upstream even-TP holds the layer weights on EVERY rank, so "
+             "each identical card spends part of its VRAM on weights and the rest on KV — there are no "
+             "weightless workers and no host KV tier, so per-card context is far below 262k without more/bigger "
+             "equal cards.", "#555"),
+        ],
+        "left_label": "htsglang — head card + weightless KV workers (measured)",
+        "right_label": "upstream — N identical cards, weights on every rank",
+        "left_cards": [
+            ("RTX 5090", "HEAD · 22.8 GB used", 32.6, [
+                ("weights", 17.0, "ALL layer weights (TP=1)", M),
+                ("kv", 4.0, "head KV", E),
+                ("ctx", 1.8, "", E)]),
+            ("RTX 3080", "weightless worker", 20.5, [
+                ("weights", 0.3, "0 wts", M),
+                ("kv", 3.0, "KV token-shard", M),
+                ("ctx", 0.7, "", E),
+                ("free", 14.0, "~14 GB freed", M)]),
+            ("RTX 3080", "weightless worker", 20.5, [
+                ("weights", 0.3, "0 wts", M),
+                ("kv", 3.0, "KV token-shard", M),
+                ("ctx", 0.7, "", E),
+                ("free", 14.0, "~14 GB freed", M)]),
+        ],
+        "right_cards": [
+            ("identical 24 GB", "rank0 · even TP", 24, [
+                ("weights", 12.5, "weights (every rank)", E),
+                ("kv", 9.5, "KV", E),
+                ("ctx", 1.5, "", E)]),
+            ("identical 24 GB", "rank1 · even TP", 24, [
+                ("weights", 12.5, "weights (every rank)", E),
+                ("kv", 9.5, "KV", E),
+                ("ctx", 1.5, "", E)]),
+        ],
+        "left_free": "freed",
+        "host": ("Host RAM (DDR) — host KV tier",
+                 [("hostkv", 0.42, "host KV tier ~12.6 GB pinned (64000 slots)", M),
+                  ("free", 0.58, "", M)]),
+        "left_notes": [
+            ("Weights-freed (~14 GB/worker) and host-pinned 12.6 GB are MEASURED; the internal head-card "
+             "weight/KV split is ESTIMATED (not separately dumped). Throughput is interconnect-bound, NOT a "
+             "win: ~25 tok/s @8k · ~7 @28k · ~1.5 @262k. After #136a/#136b the PCIe wall is mostly hidden, "
+             "so the deep-context floor is now compute + collectives on the slow cards, not H2D bandwidth.", "#1d6b34"),
+        ],
+        "right_notes": [
+            ("Weights compete with KV on every identical card; no host KV tier. Illustrative sizes.", "#4a5568"),
+        ],
+        "core": ("the fork frees the worker cards of weights (~14 GiB each) and adds a host KV tier so mismatched "
+                 "cards carry a 262k context; upstream spends every identical card's VRAM on both weights and KV "
+                 "and scales context by adding equal cards — a capacity feature (throughput is interconnect-bound "
+                 "on this no-NVLink rig, not a speed win)."),
+        "legend_keys": ["weights", "kv", "hostkv", "ctx", "free"],
+    },
+    # -- 7. MoE expert offload --------------------------------------------
+    {
+        "name": "07-moe-expert-offload.svg",
+        "title": "7 — MoE expert offload: run a 122B on 3 mismatched cards by spilling cold experts to host RAM",
+        "subtitle": "Fork on the rig vs the homogeneous upstream hardware a 122B-A10B would otherwise need.",
+        "PX": 2.6,
+        "maxv": 80,
+        "sentences": [
+            ("Left (measured): Qwen3.5-122B-A10B-GPTQ-Int4, TP=3, --rank-tp-ratio auto, "
+             "SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.25. Per-rank GPU 25.5 / 16.6 / 15.4 GiB; 64 resident + 16 "
+             "scratch experts/layer stay on-GPU, 176/layer spill to pinned host RAM (host floor 24.4 GiB). "
+             "Throughput 6.97 (eager) → 10.61 (graph) → 16.34 tok/s (graph+hotset).", "#333"),
+            ("Right (illustrative): upstream has no per-wave host-spill load path, so the experts must fit "
+             "aggregate device VRAM — e.g. 2 identical 80 GB cards at even TP=2 (2 KV heads), or an 8-card "
+             "Expert-Parallel fleet. On 3 mismatched 20–32 GB cards (72 GB total) upstream cannot place the model.", "#555"),
+        ],
+        "left_label": "htsglang — 122B TP=3, expert offload f=0.25 (measured)",
+        "right_label": "upstream — 2x identical 80 GB, even TP=2",
+        "left_cw": 130,
+        "right_cw": 140,
+        "left_cards": [
+            ("RTX 5090", "rank0 · 25.5 GB", 32.6, [
+                ("weights", 3.0, "shard", M),
+                ("resident", 16.0, "64+16 experts/layer x48", M),
+                ("kv", 5.0, "KV band", M),
+                ("mtp", 1.0, "MTP", M)]),
+            ("RTX 3080", "rank1 · 16.6 GB", 20.5, [
+                ("weights", 2.2, "shard", M),
+                ("resident", 11.0, "experts/layer", M),
+                ("kv", 3.4, "KV band", M)]),
+            ("RTX 3080", "rank2 · 15.4 GB", 20.5, [
+                ("weights", 2.2, "shard", M),
+                ("resident", 10.0, "experts/layer", M),
+                ("kv", 3.2, "KV band", M)]),
+        ],
+        "right_cards": [
+            ("identical 80 GB", "rank0 · even TP=2", 80, [
+                ("weights", 33.0, "½ weights (all experts resident)", E),
+                ("kv", 30.0, "KV", E),
+                ("ctx", 3.0, "", E)]),
+            ("identical 80 GB", "rank1 · even TP=2", 80, [
+                ("weights", 33.0, "½ weights (all experts resident)", E),
+                ("kv", 30.0, "KV", E),
+                ("ctx", 3.0, "", E)]),
+        ],
+        "host": ("Host RAM (DDR) — spilled experts (measured floor)",
+                 [("spill", 0.30, "176 experts/layer x48 (pinned) — floor 24.4 GB", M),
+                  ("free", 0.70, "of 108 GB (no swap)", M)]),
+        "left_notes": [
+            ("Per-rank GPU + host floor MEASURED. Not bit-identical to no-offload (marlin ~1e-2 argmax at "
+             "near-ties); bar is coherence + self-determinism (5/5).", "#1d6b34"),
+        ],
+        "right_notes": [
+            ("Illustrative 80 GB cards named; the point is experts must fit aggregate device VRAM. "
+             "Not measured.", "#4a5568"),
+        ],
+        "core": ("the fork runs a 122B on 3 mismatched cards plus 108 GB host RAM by spilling cold experts to "
+                 "system RAM; upstream needs the experts to fit aggregate device VRAM — 2x 80 GB or an 8-card EP "
+                 "fleet of identical cards — a capacity / hardware-cost difference."),
+        "legend_keys": ["weights", "resident", "kv", "mtp", "spill", "free"],
+    },
+    # -- 8. Measured VRAM budget ------------------------------------------
+    {
+        "name": "08-measured-vram-budget.svg",
+        "title": "8 — Measured VRAM budget: an absolute per-rank MiB budget with a per-segment registry",
+        "subtitle": "Fork on the rig vs upstream's single global fraction across identical cards.",
+        "sentences": [
+            ("Left (measured): --rank-gpu-memory-mib gives each rank an ABSOLUTE MiB budget (not a fraction). "
+             "Every component — weights, KV pool, GDN state, draft pool, graphs, CUDA context, fragmentation, "
+             "required-free — is read from a measured registry after boot + one warm request; KV is the "
+             "measured remainder. Two-boot self-calibration via a logged split-hint vector.", "#333"),
+            ("Right (illustrative): upstream sizes memory by ONE global fraction (mem-fraction-static / "
+             "gpu-memory-utilization, e.g. 0.806) applied uniformly, with no per-rank absolute MiB budget and "
+             "no measured per-segment registry. On identical cards a single fraction is a natural fit.", "#555"),
+        ],
+        "left_label": "htsglang — measured per-rank registry (rank0, no-spec boot)",
+        "right_label": "upstream — global fraction 0.806",
+        "left_cw": 150,
+        "right_cw": 150,
+        "left_cards": [
+            ("RTX 5090", "rank0 · absolute MiB budget", 32.6, [
+                ("ctx", 0.80, "CUDA ctx", M),
+                ("weights", 12.70, "param+buffer weights", M),
+                ("gdn", 0.55, "GDN/aux", M),
+                ("free", 0.41, "graphs/ws", M),
+                ("kv", 11.5, "KV = measured remainder", M),
+                ("free", 0.11, "frag", M),
+                ("free", 3.00, "required-free (safety)", M)]),
+        ],
+        "right_cards": [
+            ("identical card", "0.806 fraction", 24, [
+                ("free", 0.6, "reserved (1 - fraction)", E),
+                ("weights", 12.5, "weights", E),
+                ("kv", 9.0, "KV (within fraction)", E)]),
+        ],
+        "left_notes": [
+            ("Entire registry MEASURED per rank. Corridor rule (Option A): fail a card if nvml_free < 400 MiB "
+             "(floor) or nvml_free − measured transients > 1536 MiB (net waste). Self-calibration vector across "
+             "boots: C 215488 → 282560 → 484160 → 524160.", "#1d6b34"),
+        ],
+        "right_notes": [
+            ("One fraction, no per-segment readout. Natural on identical cards. Not measured.", "#4a5568"),
+        ],
+        "core": ("the fork gives each rank an absolute measured MiB budget with a per-segment registry and a "
+                 "corridor rule; upstream uses one global fraction across identical cards — an "
+                 "observability / capability difference, not a speed claim."),
+        "legend_keys": ["weights", "kv", "gdn", "ctx", "free"],
+    },
+    # -- 9. Fast-lane priority scheduling ---------------------------------
+    {
+        "name": "09-fast-lane.svg",
+        "title": "9 — Fast-lane priority scheduling: a reserved slot class that preempts (and can spill a session)",
+        "subtitle": "Fork on the rig vs upstream's generic priority scheduling. A scheduling behaviour, not a hardware-capacity split.",
+        "sentences": [
+            ("Left: --enable-fast-lane reserves a floor of heavy slots (--fast-lane-reserved-heavy-slots); a "
+             "\"lane\":\"fast\" request preempts into the running batch by taking a reserved slot, and heavy-aging "
+             "(--fast-lane-heavy-aging-ms) prevents starvation. It composes with session KV spill: admitting a "
+             "fast request can spill a normal session's KV to host. Default OFF — the default path is byte-unchanged.", "#333"),
+            ("Right (illustrative): upstream has a priority-scheduling subsystem the fork builds on "
+             "(enable_priority_scheduling) but not this reserved-floor fast-lane class + KV-spill coupling; "
+             "no distinct VRAM segment beyond the normal slot pool.", "#555"),
+        ],
+        "left_label": "htsglang — reserved fast-lane slot floor (default off)",
+        "right_label": "upstream — generic priority scheduling",
+        "left_cw": 150,
+        "right_cw": 150,
+        "left_cards": [
+            ("RTX 5090", "rank0 · slot/KV pool", 32.6, [
+                ("weights", 12.7, "weights", M),
+                ("gdn", 0.55, "GDN", M),
+                ("kv", 11.0, "normal KV slot pool", M),
+                ("free", 2.5, "reserved heavy-slot floor (bytes est)", E)]),
+        ],
+        "right_cards": [
+            ("identical card", "normal slot pool", 24, [
+                ("weights", 12.5, "weights", E),
+                ("kv", 9.0, "KV slot pool (no reserved class)", E),
+                ("ctx", 1.2, "", E)]),
+        ],
+        "left_notes": [
+            ("The reserved-heavy-slot floor's byte cost (reserved-slots x per-slot KV) was not separately "
+             "registry-dumped — drawn ESTIMATED. Scheduling proofs (preempt correctly, restore held while a "
+             "fast request waits) are behavioural; see the fast-lane mechanism diagram.", "#1d6b34"),
+        ],
+        "right_notes": [
+            ("Generic priority scheduling, no reserved-floor / QoS-spill coupling. Not measured.", "#4a5568"),
+        ],
+        "core": ("the fork adds a reserved fast-lane slot class that preempts and can spill a normal session to "
+                 "host; upstream offers generic priority scheduling without the reserved-floor / QoS-spill coupling "
+                 "— a scheduling-behaviour difference, not a hardware-capacity one."),
+        "legend_keys": ["weights", "kv", "gdn", "free"],
+    },
+    # -- 10. PD-disaggregation --------------------------------------------
+    {
+        "name": "10-pd-disagg.svg",
+        "title": "10 — PD-disaggregation: pin prefill to the fast x16 card so its collectives skip the x4 lane",
+        "subtitle": "Fork on the rig vs upstream, which fuses one TP group or needs a homogeneous PD fleet.",
+        "sentences": [
+            ("Left: the prefill instance runs solo TP=1 on the fast x16 5090 (zero cross-GPU traffic); the decode "
+             "instance runs uneven-TP=3 + DCP on the x4/x8 cards; KV is handed off via mooncake_tcp loopback. "
+             "Both instances are CUDA-graph-covered by default (prefill = breakable graph, decode = full graph, "
+             "MEASURED). Two instances = two weight copies; the combined per-card split was not dumped.", "#333"),
+            ("Right (illustrative): upstream runs PD across identical cards (a prefill pool + a decode pool of "
+             "equal GPUs) or a single fused TP group. On identical cards there is no x4 lane to route around, so "
+             "the fork's specific advantage (isolating the slow lane) is rig-specific.", "#555"),
+        ],
+        "left_label": "htsglang — prefill solo on 5090 + decode TP=3 on 3080s",
+        "right_label": "upstream — identical PD fleet / fused TP",
+        "left_cw": 140,
+        "right_cw": 140,
+        "left_cards": [
+            ("RTX 5090", "prefill TP=1 · x16", 32.6, [
+                ("weights", 25.0, "full weights fp8 (prefill)", E),
+                ("kv", 3.0, "prefill KV (handed off)", E),
+                ("free", 2.0, "decode rank0 co-resident — not captured", U)]),
+            ("RTX 3080", "decode rank0 · x4", 20.5, [
+                ("weights", 8.0, "decode shard", E),
+                ("hostkv", 3.0, "handed KV in", E),
+                ("kv", 6.0, "decode KV", E)]),
+            ("RTX 3080", "decode rank1 · x8", 20.5, [
+                ("weights", 8.0, "decode shard", E),
+                ("hostkv", 3.0, "handed KV in", E),
+                ("kv", 6.0, "decode KV", E)]),
+        ],
+        "right_cards": [
+            ("identical", "prefill pool", 24, [("weights", 12.5, "weights", E), ("kv", 9.0, "KV", E)]),
+            ("identical", "decode pool", 24, [("weights", 12.5, "weights", E), ("kv", 9.0, "KV", E)]),
+        ],
+        "left_notes": [
+            ("Graph coverage MEASURED; the two-weight-copy combined per-card VRAM was never registry-dumped "
+             "(\"not captured\"). Faster TTFT is EXPECTED (prefill avoids the x4-lane collectives) but the TTFT "
+             "factor is an ESTIMATE, not benchmarked on this no-P2P/no-NVLink rig.", "#1d6b34"),
+        ],
+        "right_notes": [
+            ("On identical cards there is no x4 bottleneck to isolate. Illustrative sizes.", "#4a5568"),
+        ],
+        "core": ("the fork pins prefill to the fast x16 card so its collectives skip the x4 lane; upstream fuses one "
+                 "TP group (prefill uses every link) or needs a homogeneous PD fleet — a placement / latency-hiding "
+                 "difference that is rig-specific and interconnect-bound here, not a raw-speed win."),
+        "legend_keys": ["weights", "kv", "hostkv", "free"],
+    },
+]
 
 
-def s5():
-    def draw(topY, W):
-        b = []
-        cb = cardbottom(topY)
-        x = LEFT
-        c, _ = gpu_column(x, topY, "RTX 5090", 32,
-                          [("weights", 6, "attn + shared (dense) wts"),
-                           ("resident", 12, "resident experts (hot tier)"),
-                           ("scratch", 3, "prefetch + cushion"),
-                           ("kv", 9, "KV cache"), ("ctx", 2, "ctx")],
-                          caption="full model, TP=1")
-        b.append(c)
-        b.append(down_link(x + BOXW + 30, cb, cb + 46, "x16", "PCIe"))
-        hb, hy = host_ram_bar(LEFT, cb + 46, W - 2 * LEFT,
-                              [("spill", 0.80, "~61 GB cold experts (pinned host RAM)"),
-                               ("free", 0.20, "free")],
-                              "Pinned host RAM (DDR)")
-        b.append(hb)
-        return "".join(b), hy
-    compose("05-122b-host-spill.svg", 660,
-            "5 — Model too big for any single card → load-time expert offload to host RAM",
-            "122B-A10B Int4 on one RTX 5090 32 GB. Decisive setting: load-time MoE offload (§6, mechanism [in progress] / 122B run [planned]).",
-            [("Head-rank load-time MoE offload [in progress]: materialize only resident+cushion experts on "
-              "the GPU and stream the cold tier straight to host RAM at load — rather than materializing all "
-              "experts on the GPU and then slicing.", "#333"),
-             ("Boots a model whose weights exceed a single card's VRAM at load. Mechanism validated on "
-              "35B-A3B; the full 122B-A10B Int4 run (~61 GB experts) is [planned] (download-gated).", "#2b6b3a"),
-             ("Upstream sglang: no load-time host-spill path — a 122B model exceeds 32 GB; Expert Parallelism "
-              "requires experts to fit aggregate VRAM, and the generic offload materializes on the GPU "
-              "during load.", "#555")],
-            draw, ["weights", "resident", "scratch", "kv", "spill", "ctx"])
+# ===========================================================================
+# Reframed 8-GPU fleet: explicitly ILLUSTRATIVE / NOT MEASURED, capacity only.
+# ===========================================================================
+def eight_gpu():
+    W = 1180
 
-
-def s6():
-    def draw(topY, W):
-        b = []
-        cb = cardbottom(topY)
-        x0 = LEFT
-        c, _ = gpu_column(x0, topY, "RTX 5090", 32,
-                          [("weights", 14, "FULL model (TP=1)"),
-                           ("kv", 16, "KV cache"), ("ctx", 2, "ctx")],
-                          caption="Q/K/V producer + attn dispatcher")
-        b.append(c)
-        for i in (1, 2):
-            x = LEFT + i * SLOT
-            c, _ = gpu_column(x, topY + (32 - 20) * PXGB, "RTX 3080", 20,
-                              [("weights", 0.4, ""),
-                               ("kv", 17.6, "KV token-shard ONLY"), ("ctx", 2, "ctx")],
-                              caption="weightless KV worker • ~14 GB freed")
-            b.append(c)
-            xp = LEFT + (i - 1) * SLOT
-            b.append(gap_tag(xp + BOXW, x, topY + 100, "KV", "x16"))
-        return "".join(b), cb + 22
-    compose("06-weightless-kv-lane.svg", 700,
-            "6 — Long-context priority → weightless-KV lane",
-            "1×5090 (full model) + 2×3080 (KV-only). Decisive setting: Variant C weightless lane (§10, landed).",
-            [("Weightless-KV lane (Variant C, landed; CUDA-graph decode landed #133/#136): the fast card holds "
-              "the full model as collective-free TP=1; the slow cards hold ONLY a KV token-shard and run a "
-              "stripped attention-only forward — no layer weights (thin blue sliver ≈0).", "#333"),
-             ("≈14 GB of weights freed per worker (measured) becomes KV headroom; the host-spill KV tier was "
-              "measured to 262k tokens on the 27B test model (#134). Prefill is bit-identical to full-TP=1; "
-              "decode/extend is argmax-identical (decode-class, not bit-0). Resulting context multiple depends "
-              "on the KV budget, not separately benchmarked.", "#2b6b3a"),
-             ("Upstream sglang: every rank holds its layer-weight shard; each card's VRAM is shared between "
-              "weights and KV.", "#555")],
-            draw, ["weights", "kv", "ctx", "free"])
-
-
-def s7():
-    def draw(topY, W):
-        b = []
-        cb = cardbottom(topY)
-        x0 = LEFT
-        # 5090 hosts THREE co-located ranks (TP=5 layout 0,0,0,1,2), ~7 GB budget each.
-        c, _ = gpu_column(x0, topY, "RTX 5090", 32,
-                          [("weights", 3, "rank0 shard"), ("kv", 4, "rank0 KV"),
-                           ("weights", 3, "rank1 shard"), ("kv", 4, "rank1 KV"),
-                           ("weights", 3, "rank2 shard"), ("kv", 4, "rank2 KV"),
-                           ("ctx", 4, "3× ctx (MPS)")],
-                          caption="3 co-located ranks • MPS time-slice")
-        b.append(c)
-        # MPS time-slicing marker: one card, three processes share the SMs in turn.
-        b.append(text(x0 + BOXW / 2, cb + 34, "one card, 3 processes → MPS time-slices the SMs",
-                      size=8.5, anchor="middle", color="#8a5a2b"))
-        for i, r in ((1, 3), (2, 4)):
-            x = LEFT + i * SLOT
-            c, _ = gpu_column(x, topY + (32 - 20) * PXGB, "RTX 3080", 20,
-                              [("weights", 5, f"rank{r} shard"),
-                               ("kv", 13, f"rank{r} KV (~17 GB)"), ("ctx", 2, "ctx")],
-                              caption=f"rank {r} • 1 rank / card")
-            b.append(c)
-            xp = LEFT + (i - 1) * SLOT
-            b.append(gap_tag(xp + BOXW, x, topY + 100, "NCCL x5", "x16"))
-        return "".join(b), cb + 44
-    compose("07-multi-rank-colocation.svg", 700,
-            "7 — More ranks than cards → multi-rank co-location (TP=5 on 3 GPUs, booted)",
-            "1×5090 (3 ranks) + 2×3080 (1 rank each). Decisive setting: --rank-gpu-id maps ranks to physical GPUs (§9).",
-            [("--rank-gpu-id 0,0,0,1,2 --rank-tp-ratio auto: three ranks run on the 5090 as three processes "
-              "(~7 GB budget each), one rank on each 3080. NCCL multi-rank auto-set; the physical-impossibility "
-              "check enforces Σ(co-located budgets) ≤ NVML total. The 5090 shows THREE stacked (weights+KV) "
-              "blocks — three real ranks time-slicing one card via MPS.", "#333"),
-             ("Booted + validated (NCCL 2.30.7 side-loaded, MPS on): all 5 ranks build the communicator, "
-              "capture target-verify + draft-decode + draft-extend graphs, serve a coherent needle from ~15k "
-              "context, bit-identical across two boots. A simpler TP=4 (2 ranks on the 5090) is the same "
-              "mechanism with one fewer co-located rank. Decode tok/s is not 5-card-representative — the 3 "
-              "ranks time-slice one card.", "#2b6b3a"),
-             ("Upstream sglang: TP is bounded by the physical GPU count — one rank per physical card, so a "
-              "TP=5 layout is expressed over 5 physical GPUs.", "#555")],
-            draw, ["weights", "kv", "ctx", "free"])
-
-
-def s8():
-    def draw(topY, W):
-        b = []
-        cb = cardbottom(topY)
-        x0 = LEFT
-        c, _ = gpu_column(x0, topY, "RTX 5090", 32,
-                          [("weights", 14, "full weights — PREFILL"),
-                           ("kv", 14, "prefill KV (handed off)"), ("ctx", 2, "ctx")],
-                          caption="solo prefill TP=1 • zero cross-GPU traffic", sub="PCIe x16")
-        b.append(c)
-        for i, r in ((1, 0), (2, 1)):
-            x = LEFT + i * SLOT
-            c, _ = gpu_column(x, topY + (32 - 20) * PXGB, "RTX 3080", 20,
-                              [("weights", 7, "decode wt shard"),
-                               ("hostkv", 4, "handed KV in"),
-                               ("kv", 7, "decode KV"), ("ctx", 2, "ctx")],
-                              caption=f"decode rank {r} (TP=2 uneven+DCP)", sub="PCIe x4")
-            b.append(c)
-        b.append(gap_tag(x0 + BOXW, LEFT + SLOT, topY + 90, "x4 KV in", "x4"))
-        b.append(gap_tag(LEFT + SLOT + BOXW, LEFT + 2 * SLOT, topY + 120, "x4", "x4"))
-        return "".join(b), cb + 22
-    compose("08-pd-disagg-slow-pcie.svg", 700,
-            "8 — A slow PCIe x4 link in the rig → PD-disaggregation placement",
-            "5090 on x16 (prefill), 3080s on x4 (decode). Decisive setting: single-node PD-disagg (§2).",
-            [("One decode card sits behind a slow PCIe x4 link (dashed brown). Put PREFILL on the fast x16 "
-              "card so it runs alone, zero cross-GPU comm; the KV handoff uses mooncake_tcp loopback (teal "
-              "region on the decode cards).", "#333"),
-             ("Faster TTFT is expected because prefill avoids the x4-lane collectives; decode stays "
-              "distributed and largely unchanged. Handoff is crash-robust and tears down to 0 MiB. (The "
-              "TTFT factor is an estimate, not benchmarked on this rig.)", "#2b6b3a"),
-             ("Upstream sglang: a single fused TP group runs every prefill collective over every link in "
-              "the group, including the x4 lane.", "#555")],
-            draw, ["weights", "kv", "hostkv", "ctx", "free"])
-
-
-def s9():
     def draw(topY, W):
         b = []
         SLOT8 = (W - 2 * LEFT) / 8
@@ -595,561 +992,48 @@ def s9():
                 if gb <= 0:
                     continue
                 rh = gb * PXGB
-                o.append(rect(x, cy, boxw8, rh, COLORS[key]))
-                if lab and rh >= 12:
-                    tc = "#fff" if key in WHITE_TEXT else "#1a1a1a"
-                    o.append(text(x + boxw8 / 2, cy + rh / 2 + 3, lab, size=8, anchor="middle", color=tc))
+                # whole fleet is illustrative -> hatched estimated fill
+                o.append(evseg(x, cy, boxw8, rh, key, "estimated", lab if rh >= 12 else "", size=8))
                 cy += rh
             o.append(text(x + boxw8 / 2, top + h + 12, cap, size=8, anchor="middle", color="#333"))
             return "".join(o)
         for i, (nm, vram, link, regs, cap) in enumerate(fleet):
             x = LEFT + i * SLOT8 + 11
             b.append(col8(x, topY + (32 - vram) * PXGB, nm, vram, regs, cap, link))
-        hb, hy = host_ram_bar(LEFT, cb + 40, W - 2 * LEFT,
-                              [("spill", 0.6, "cold MoE experts (pinned host RAM), streamed over PCIe"),
-                               ("free", 0.4, "free")],
-                              "Pinned host RAM (DDR)")
+        hb, hy = host_bar_ev(LEFT, cb + 40, W - 2 * LEFT,
+                             "Pinned host RAM (DDR) — illustrative",
+                             [("spill", 0.6, "cold MoE experts (pinned), streamed over PCIe", "estimated"),
+                              ("free", 0.4, "free", "estimated")])
         b.append(hb)
-        return "".join(b), hy
-    compose("09-eight-gpu-fleet.svg", 1180,
-            "9 — Eight-GPU mixed fleet → several capabilities combined in one TP group",
-            "5090 + 2×4090 + 3090 + 3×3080 + 2080Ti, mixed PCIe x16/x8/x4, no NVLink. Composite of §1/§6/§9/§10.",
-            [("One TP group across 8 mixed cards combines: uneven-TP (proportional shards), uneven-DCP "
-              "(token-KV), per-expert host offload (bottom bar), two weightless-KV workers on the x4 cards "
-              "(pure KV headroom), and PD-style placement (prefill on the fast x16 5090).", "#333"),
-             ("Upstream sglang: even TP sizes the whole group to the 11 GB 2080Ti's shard (or excludes it); "
-              "the token-KV, weightless-worker and quant-aware host-offload paths are fork-specific, so the "
-              "larger cards are sized to the smallest card's shard.", "#555")],
-            draw, ["weights", "kv", "resident", "hostkv", "spill", "ctx", "free"])
+        cn, cy = core_note(LEFT, hy + 16, W - 2 * LEFT,
+                           "capacity composition only. Per-layer-TP collectives over PCIe without P2P/NVLink are "
+                           "bandwidth-bound — more cards / slower links means LESS throughput, not more. This whole "
+                           "figure is a hypothetical 8-GPU illustration; this rig has only 3 GPUs and none of it was measured.")
+        b.append(cn)
+        return "".join(b), cy
+    compose("15-eight-gpu-fleet.svg", W,
+            "Appendix — Eight-GPU mixed fleet: how the capabilities COMPOSE (illustrative, not measured)",
+            "5090 + 2x4090 + 3090 + 3x3080 + 2080Ti, mixed PCIe x16/x8/x4, no NVLink. Hypothetical — this rig has 3 GPUs.",
+            [("The settings compose on CAPACITY: uneven-TP shards, uneven-DCP token-KV, two weightless-KV workers "
+              "on the x4 cards, per-expert host offload (bottom bar), and PD-style prefill placement on the fast "
+              "x16 card. The entire figure is ESTIMATED (hatched): it was never built or measured. Upstream even-TP "
+              "would size the whole group to the 11 GB card's shard (or exclude it).", "#333")],
+            draw, ["weights", "kv", "resident", "spill", "ctx", "free"], evidence=True)
 
 
 # ===========================================================================
-# GRANULAR diagrams for the measured 122B-A10B-Int4 TP=3 end-state.
-# Config (offload_handoff.md): Qwen3.5-122B-A10B-GPTQ-Int4, 48 layers, hybrid-GDN
-# ~3:1, 256 experts/layer top-8, 2 GQA KV heads, 32 Q heads, FFN intermediate
-# 1024, GPTQ group_size 128. tp=3 dcp=3, --rank-tp-ratio auto -> [28,19,19]:
-# rank0=5090(cuda:0, 28000 MiB budget), rank1/2=3080(19000). q 16/8/8, FFN
-# 512/256/256 => 4/2/2 GPTQ groups, 2 KV heads REPLICATED on all ranks, KV
-# token-sharded 3 ways by DCP. Offload f=0.25 -> 64 resident + 16 scratch
-# (buffer 80) + 176 host-spilled per layer x48. Per-rank GPU 25.5/16.6/15.4 GB,
-# host floor 24.4 GB, eager (--disable-cuda-graph), 6.97 tok/s, MTP on rank0.
-# ===========================================================================
-R0T, R1T, R2T = "#cfe0f0", "#d4ecd9", "#f5e3c7"   # rank ownership tints
-RANKTINT = (R0T, R1T, R2T)
-
-
-def swatch_note(x, y, key, s, maxw, size=9.5):
-    o = rect(x, y - 10, 13, 13, COLORS[key], stroke="#333", sw=0.8, rx=2)
-    t, ny = flow(x + 20, y, s, maxw - 20, size=size, color="#333")
-    return o + t, ny
-
-
-def g10():
-    """Shared model structure: the 48-layer hybrid-GDN stack + MTP head."""
-    def draw(topY, W):
-        b = []
-        x = 90
-        cellh = 6.4
-        n = 48
-        wcol = 150
-        top = topY + 34
-        # MTP head above the stack
-        b.append(chip(x, top - 26, wcol, 17, "mtp", "MTP / NEXTN draft head"))
-        b.append(arrow(x + wcol, top - 17, x + wcol + 26, top - 17, "#c65b9b", marker="arr"))
-        b.append(text(x + wcol + 30, top - 21, "1 draft layer, lives on rank0 (5090);", size=9.5, color="#333"))
-        b.append(text(x + wcol + 30, top - 8, "own small KV reservation (see KV-layout diagram).", size=9.5, color="#333"))
-        # layer stack, L47 at top -> L0 at bottom
-        for idx in range(n):
-            layer = n - 1 - idx
-            y = top + idx * cellh
-            key = "fullattn" if layer % 4 == 3 else "gdn"
-            b.append(rect(x, y, wcol, cellh, COLORS[key], stroke="#ffffff", sw=0.4, rx=0))
-        b.append(rect(x, top, wcol, n * cellh, "none", stroke="#222", sw=1.5))
-        b.append(text(x - 8, top + 7, "L47", size=8.5, anchor="end", color="#555"))
-        b.append(text(x - 8, top + n * cellh - 1, "L0", size=8.5, anchor="end", color="#555"))
-        b.append(text(x + wcol / 2, top + n * cellh + 16, "48 decoder layers", size=10.5, anchor="middle", weight="bold"))
-        b.append(text(x + wcol / 2, top + n * cellh + 30, "hybrid-GDN, ~3:1 (GDN : full-attn)", size=9, anchor="middle", color="#555"))
-        # callouts with arrows to a representative full-attn row and gdn row
-        rx = x + wcol
-        cxr = 330
-        fy = top + (n - 1 - 43) * cellh + cellh / 2   # layer 43 = full-attn
-        gy = top + (n - 1 - 42) * cellh + cellh / 2   # layer 42 = gdn
-        b.append(arrow(rx + 2, fy, cxr - 8, top + 18, "#2f6f8f"))
-        b.append(arrow(rx + 2, gy, cxr - 8, top + 92, "#7d5ba6"))
-        note1, y1 = swatch_note(cxr, top + 14, "fullattn",
-                                "full-attention layer (12 of 48): holds a growing KV cache — 2 GQA KV "
-                                "heads, 32 Q heads. KV grows per token, so it is TOKEN-sharded across "
-                                "ranks by uneven-DCP (dcp-size 3).", W - cxr - 30)
-        b.append(note1)
-        note2, y2 = swatch_note(cxr, top + 96, "gdn",
-                                "GDN / linear-attention layer (36 of 48): holds a fixed-size recurrent "
-                                "state, not a per-token KV cache — its VRAM does not grow with sequence "
-                                "length.", W - cxr - 30)
-        b.append(note2)
-        note3, y3 = flow(cxr, y2 + 14,
-                         "Model: Qwen3.5-122B-A10B-GPTQ-Int4 — 256 experts/layer, top-8 routing, ~10B "
-                         "active. This structure is identical under htsglang and upstream sglang; the "
-                         "difference is entirely in HOW each layer is split across the 3 mismatched cards "
-                         "(next diagrams).", W - cxr - 30, size=9.5, color="#333")
-        b.append(note3)
-        bottom = max(top + n * cellh + 34, y3)
-        return "".join(b), bottom
-    compose("10-model-layer-stack.svg", 940,
-            "10 — The model both stacks run: 48-layer hybrid-GDN, 256-expert MoE",
-            "Qwen3.5-122B-A10B-GPTQ-Int4. Shared structure; the fork's work is in the split, shown next.",
-            [("Full-attention layers carry the KV cache (2 KV heads); GDN layers carry a fixed recurrent "
-              "state. The MTP/NEXTN draft head is one extra layer on rank0 (§3, shipped).", "#333")],
-            draw, ["fullattn", "gdn", "mtp", "state"])
-
-
-def rank_col(x, top, wcol, title, sub, cells, tint, foot=None):
-    """A rank column: header + vertically stacked labelled tensor cells."""
-    o = [text(x + wcol / 2, top - 20, title, size=11, anchor="middle", weight="bold"),
-         text(x + wcol / 2, top - 8, sub, size=9, anchor="middle", color="#555")]
-    cy = top
-    for key, h, label, tc in cells:
-        if key in COLORS:
-            o.append(rect(x, cy, wcol, h, COLORS[key], stroke="#2b2b2b", sw=1.0))
-        else:
-            o.append(rect(x, cy, wcol, h, key, stroke="#2b2b2b", sw=1.0))
-        col = tc or ("#fff" if key in WHITE_TEXT else "#1a1a1a")
-        o.append(text(x + wcol / 2, cy + h / 2 + 3.4, label, size=9, anchor="middle", color=col))
-        cy += h + 3
-    o.append(rect(x - 4, top - 4, wcol + 8, cy - top + 4, "none", stroke=tint, sw=2.0, rx=4))
-    if foot:
-        o.append(text(x + wcol / 2, cy + 12, foot, size=8.5, anchor="middle", color="#333"))
-        cy += 16
-    return "".join(o), cy
-
-
-def g11():
-    """Per-layer tensor split across 3 ranks: uneven-TP vs stock even-TP=3."""
-    def draw(topY, W):
-        b = []
-        mid = W / 2
-        b.append(vdivider(mid, topY - 4, topY + 330))
-        b.append(panel_label(30, topY - 2, "htsglang — uneven-TP=3, ratio [28,19,19]", "ours"))
-        b.append(panel_label(mid + 20, topY - 2, "upstream sglang — even-TP=3", "stock"))
-        top = topY + 44
-        wcol = 132
-        # --- ours: three uneven rank columns ---
-        ours = [
-            ("rank0 — 5090", "cuda:0 · 28000 MiB", [
-                ("weights", 58, "Q: 16 heads", None),
-                ("kv", 24, "KV: 2 heads (repl.)", None),
-                ("weights", 46, "FFN 512 = 4 grp", None),
-                ("resident", 22, "256 experts →offload", None)], "#1d6b34"),
-            ("rank1 — 3080", "cuda:1 · 19000 MiB", [
-                ("weights", 30, "Q: 8", None),
-                ("kv", 24, "KV: 2 (repl.)", None),
-                ("weights", 24, "FFN 256 = 2 grp", None),
-                ("resident", 22, "experts →offload", None)], "#1d6b34"),
-            ("rank2 — 3080", "cuda:2 · 19000 MiB", [
-                ("weights", 30, "Q: 8", None),
-                ("kv", 24, "KV: 2 (repl.)", None),
-                ("weights", 24, "FFN 256 = 2 grp", None),
-                ("resident", 22, "experts →offload", None)], "#1d6b34"),
-        ]
-        xs = [40, 40 + 165, 40 + 330]
-        maxb = top
-        for x, (t, s, cells, tint) in zip(xs, ours):
-            c, cb = rank_col(x, top, wcol, t, s, cells, tint)
-            b.append(c)
-            maxb = max(maxb, cb)
-        b.append(text(40, maxb + 16, "Every dimension divides cleanly: 32 Q = 16+8+8, 1024 FFN = 512+256+256,",
-                      size=9.5, color="#1d6b34"))
-        b.append(text(40, maxb + 30, "each FFN shard is a whole multiple of group_size 128 (4/2/2 groups). 2 KV "
-                      "heads < 3 ranks, so KV is replicated + token-sharded (next).", size=9.5, color="#1d6b34"))
-        # --- stock: three EQUAL columns with failing arithmetic ---
-        sx = [mid + 40, mid + 40 + 150, mid + 40 + 300]
-        for i, x in enumerate(sx):
-            c, _ = rank_col(x, top, 120, f"rank{i}", "even 1/3 share", [
-                ("bad", 34, "Q 32/3 = 10.7", "#4a5568"),
-                ("bad", 26, "KV 2/3 = 0.7", "#4a5568"),
-                ("bad", 40, "FFN 1024/3 = 341.3", "#4a5568"),
-                ("bad", 22, "not ÷128", "#4a5568")], "#4a5568")
-            b.append(c)
-        b.append(text(mid + 40, maxb + 16, "Even split does not divide these dims: 32, 1024 and 2 are not multiples of 3,",
-                      size=9.5, color="#4a5568"))
-        b.append(text(mid + 40, maxb + 30, "and FFN 341.3 is not a multiple of group_size 128 → the GPTQ "
-                      "group-alignment check does not admit an even TP=3 here.", size=9.5, color="#4a5568"))
-        return "".join(b), maxb + 36
-    compose("11-tp-tensor-split.svg", 1320,
-            "11 — One layer's tensors across 3 mismatched cards: uneven-TP vs even-TP",
-            "Decisive setting: --rank-tp-ratio auto (§1, shipped). Cell heights are proportional to each rank's share.",
-            [("htsglang sizes each rank's Q-head / FFN / expert shard to its VRAM budget (16/8/8 Q, "
-              "512/256/256 FFN = 4/2/2 GPTQ groups). Upstream even-TP=3 does not divide these dimensions: "
-              "32, 1024 and the 2 KV heads are not divisible by 3, and 341.3 is not group-128-aligned.", "#333")],
-            draw, ["weights", "kv", "resident", "bad"])
-
-
-def g12():
-    """Attention under 2 KV heads: replicate + DCP token-shard + LSE-merge."""
-    def draw(topY, W):
-        b = []
-        mid = W / 2
-        b.append(vdivider(mid, topY - 4, topY + 360))
-        b.append(panel_label(30, topY - 2, "htsglang — TP > num_kv_heads: replicate KV + DCP token-shard", "ours"))
-        b.append(panel_label(mid + 20, topY - 2, "upstream sglang — head-sharded KV", "stock"))
-        top = topY + 40
-        # sequence bar split into 3 rank token-ranges
-        sx, sw_ = 40, 520
-        fr = [0.42, 0.29, 0.29]
-        labels = ["rank0: tokens 0..t0", "rank1: t0..t1", "rank2: t1..T"]
-        cx = sx
-        b.append(text(sx, top - 6, "sequence KV (per full-attn layer), split along the TOKEN axis:", size=9.5, color="#333"))
-        for f, lab, tint in zip(fr, labels, RANKTINT):
-            w = sw_ * f
-            b.append(rect(cx, top, w, 26, tint, stroke="#2b2b2b", sw=1.0))
-            b.append(text(cx + w / 2, top + 16, lab, size=8.5, anchor="middle", color="#1a1a1a"))
-            cx += w
-        # new-token Q broadcast
-        qy = top + 58
-        b.append(chip(40, qy, 150, 20, "weights", "Q (new token), 32 heads"))
-        # three rank compute boxes
-        ry = qy + 52
-        rxs = [40, 220, 400]
-        for i, x in enumerate(rxs):
-            b.append(rect(x, ry, 150, 74, RANKTINT[i], stroke="#2b2b2b", sw=1.2, rx=3))
-            b.append(text(x + 75, ry + 14, f"rank{i}", size=9.5, anchor="middle", weight="bold"))
-            b.append(chip(x + 8, ry + 22, 60, 16, "kv", "2 KV", size=8))
-            b.append(text(x + 105, ry + 33, f"Q {[16,8,8][i]} heads", size=8.5, anchor="middle", color="#333"))
-            b.append(text(x + 75, ry + 52, "partial attn", size=8.5, anchor="middle", color="#1a1a1a"))
-            b.append(text(x + 75, ry + 65, "+ local LSE", size=8.5, anchor="middle", color="#555"))
-            # Q broadcast arrow
-            b.append(arrow(115, qy + 20, x + 75, ry - 2, "#3b6fb0", dash="4 3", marker="arrB"))
-        # LSE-merge
-        my = ry + 100
-        b.append(rect(180, my, 200, 26, COLORS["kv"], stroke="#2b2b2b", sw=1.2, rx=3))
-        b.append(text(280, my + 16, "LSE-merge → attention out", size=9.5, anchor="middle", color="#fff"))
-        for x in rxs:
-            b.append(arrow(x + 75, ry + 74, 280, my - 2, "#227a3a", marker="arrG"))
-        b.append(text(40, my + 48, "Each rank holds BOTH KV heads (replicated) but only its token-slice of the",
-                      size=9.5, color="#1d6b34"))
-        b.append(text(40, my + 62, "cache. Q is broadcast; ranks attend their slice; LSE-merge stitches the",
-                      size=9.5, color="#1d6b34"))
-        b.append(text(40, my + 76, "partial softmaxes. Aggregate KV capacity scales with ranks (§1, shipped).",
-                      size=9.5, color="#1d6b34"))
-        # --- stock panel ---
-        sx2 = mid + 40
-        b.append(text(sx2, top - 6, "upstream shards KV by HEAD — one KV head per rank:", size=9.5, color="#333"))
-        b.append(chip(sx2, top, 90, 40, "kv", "KV head 0", size=9))
-        b.append(chip(sx2 + 110, top, 90, 40, "kv", "KV head 1", size=9))
-        b.append(arrow(sx2 + 45, top + 44, sx2 + 30, ry - 6, "#227a3a", marker="arrG"))
-        b.append(arrow(sx2 + 155, top + 44, sx2 + 150, ry - 6, "#227a3a", marker="arrG"))
-        for i in range(3):
-            x = sx2 + i * 150
-            ok = i < 2
-            b.append(rect(x, ry, 130, 60, RANKTINT[i] if ok else COLORS["bad"], stroke="#2b2b2b", sw=1.2, rx=3))
-            b.append(text(x + 65, ry + 20, f"rank{i}", size=9.5, anchor="middle", weight="bold"))
-            b.append(text(x + 65, ry + 40, f"KV head {i}" if ok else "no head-axis KV",
-                          size=9.5, anchor="middle", color="#1a1a1a" if ok else "#4a5568", weight="normal" if ok else "bold"))
-        b.append(text(sx2, my, "2 KV heads, 3 ranks: rank2 is not covered by the head split.", size=9.5, color="#4a5568", weight="bold"))
-        b.append(text(sx2, my + 15, "Head-axis KV requires num_kv_heads ≥ tp (2 < 3 here).", size=9.5, color="#4a5568"))
-        b.append(text(sx2, my + 30, "Replicating the whole KV on every rank is possible and stores", size=9.5, color="#4a5568"))
-        b.append(text(sx2, my + 44, "the full cache on each card (no token-capacity gain from more cards).", size=9.5, color="#4a5568"))
-        return "".join(b), my + 90
-    compose("12-attention-dcp.svg", 1320,
-            "12 — 2 KV heads across 3 ranks: the DCP token-shard (the crux)",
-            "Decisive setting: replicated-KV + uneven-DCP (§1/§9, shipped). Why 2 KV heads on 3 cards is the hard case.",
-            [("The 122B has only 2 GQA KV heads but runs TP=3. It cannot head-shard (2<3), so the fork "
-              "REPLICATES the 2 KV heads on every rank and shards the KV cache by TOKEN (dcp-size 3): each "
-              "rank attends its token-slice, then a Q-broadcast + LSE-merge stitches the partial softmaxes.", "#333")],
-            draw, ["weights", "kv", "bad"])
-
-
-def g13():
-    """Per-token KV-cache memory arrangement across ranks + MTP reservation."""
-    def draw(topY, W):
-        b = []
-        mid = W / 2
-        b.append(vdivider(mid, topY - 4, topY + 320))
-        b.append(panel_label(30, topY - 2, "htsglang — token-sharded KV (per full-attn layer)", "ours"))
-        b.append(panel_label(mid + 20, topY - 2, "upstream sglang — head-sharded / replicated KV", "stock"))
-        top = topY + 46
-        gx, gw = 40, 470
-        rows = 12                     # the 12 full-attn layers
-        rh = 12
-        fr = [0.42, 0.29, 0.29]
-        # column bands
-        cx = gx
-        for f, tint, lab in zip(fr, RANKTINT, ["rank0 tokens 0..t0", "rank1 t0..t1", "rank2 t1..T"]):
-            w = gw * f
-            b.append(rect(cx, top, w, rows * rh, tint, stroke="#ffffff", sw=0))
-            b.append(text(cx + w / 2, top - 5, lab, size=8.5, anchor="middle", color="#333"))
-            cx += w
-        # row grid lines + labels
-        for r in range(rows + 1):
-            b.append(line(gx, top + r * rh, gx + gw, top + r * rh, stroke="#c8ccd0", sw=0.6))
-        b.append(rect(gx, top, gw, rows * rh, "none", stroke="#222", sw=1.4))
-        b.append(text(gx - 6, top + 9, "L47", size=8, anchor="end", color="#555"))
-        b.append(text(gx - 6, top + rows * rh - 2, "L3", size=8, anchor="end", color="#555"))
-        b.append(text(gx + gw / 2, top + rows * rh + 15, "12 full-attention layers × (2 KV heads) — each rank owns a TOKEN band",
-                      size=9, anchor="middle", color="#333"))
-        # MTP strip on rank0
-        mtpy = top + rows * rh + 26
-        b.append(chip(gx, mtpy, gw * fr[0], 16, "mtp", "MTP draft KV (rank0)", size=8))
-        # GDN state block (separate, small, per rank)
-        sy = mtpy + 30
-        b.append(text(gx, sy - 4, "36 GDN layers: fixed recurrent state (no per-token growth)", size=9, color="#333"))
-        for i, f in enumerate(fr):
-            b.append(chip(gx + sum(fr[:i]) * gw, sy, gw * f, 16, "state", "GDN state", size=8))
-        b.append(text(gx, sy + 42, "Per-rank KV memory = 12 layers × 2 KV heads × its token-band. Growing the",
-                      size=9.5, color="#1d6b34"))
-        b.append(text(gx, sy + 56, "context adds tokens split 3 ways → aggregate KV capacity scales with ranks.",
-                      size=9.5, color="#1d6b34"))
-        # --- stock panel ---
-        sx2 = mid + 40
-        b.append(text(sx2, top - 5, "Option A — head-shard (upstream default):", size=9, color="#333"))
-        b.append(rect(sx2, top, 240, rows * rh, COLORS["bad"], stroke="#222", sw=1.2))
-        b.append(text(sx2 + 120, top + rows * rh / 2, "2 KV heads / 3 ranks", size=10, anchor="middle", weight="bold", color="#4a5568"))
-        b.append(text(sx2, top + rows * rh + 20, "Option B — replicate KV on every rank:", size=9, color="#333"))
-        for i in range(3):
-            b.append(rect(sx2 + i * 130, top + rows * rh + 28, 120, 34, R0T, stroke="#222", sw=1.0))
-            b.append(text(sx2 + i * 130 + 60, top + rows * rh + 49, "ALL tokens", size=8.5, anchor="middle", color="#1a1a1a"))
-        b.append(text(sx2, top + rows * rh + 84, "Every rank stores the WHOLE sequence's KV → 1× capacity,",
-                      size=9.5, color="#4a5568"))
-        b.append(text(sx2, top + rows * rh + 98, "no token-capacity gain from more cards. Even-TP dims: see diagram 11.",
-                      size=9.5, color="#4a5568"))
-        return "".join(b), sy + 66
-    compose("13-kv-token-layout.svg", 1200,
-            "13 — KV-cache arrangement: which rank holds which tokens, and where MTP sits",
-            "Decisive setting: uneven-DCP token sharding (§1, shipped). GDN layers hold state, not KV.",
-            [("Only the 12 full-attention layers hold a KV cache; the fork splits it by TOKEN band across "
-              "ranks (rank0 gets the largest band, matching its shard). The MTP draft head keeps its own "
-              "small KV band on rank0. The 36 GDN layers hold a fixed recurrent state instead.", "#333")],
-            draw, ["fullattn", "state", "mtp"])
-
-
-def g14():
-    """Per-layer MoE expert-offload flow (f=0.25) vs stock (no offload)."""
-    def draw(topY, W):
-        b = []
-        mid = W / 2
-        b.append(vdivider(mid, topY - 4, topY + 360))
-        b.append(panel_label(30, topY - 2, "htsglang — per-expert host offload, f=0.25 (§6, [in progress])", "ours"))
-        b.append(panel_label(mid + 20, topY - 2, "upstream sglang — no per-expert host spill", "stock"))
-        top = topY + 44
-        # GPU strip: resident + scratch chips
-        gx = 40
-        b.append(text(gx, top - 6, "GPU — 80 expert slots resident (per layer):", size=9.5, color="#333"))
-        cw, gap = 11, 2
-        # 64 resident chips in a 16-wide grid
-        for k in range(64):
-            r, cc = divmod(k, 16)
-            b.append(chip(gx + cc * (cw + gap), top + r * (cw + gap), cw, cw, "resident"))
-        rx = gx + 16 * (cw + gap) + 14
-        b.append(text(gx + 8 * (cw + gap), top + 4 * (cw + gap) + 8, "64 resident (slots 0..63)", size=8.5, anchor="middle", color="#333"))
-        # 16 scratch chips
-        for k in range(16):
-            r, cc = divmod(k, 8)
-            b.append(chip(rx + cc * (cw + gap), top + r * (cw + gap), cw, cw, "scratch"))
-        b.append(text(rx + 4 * (cw + gap), top + 2 * (cw + gap) + 8, "16 scratch (64..79)", size=8.5, anchor="middle", color="#333"))
-        # host strip: 176 spill
-        hy = top + 96
-        b.append(text(gx, hy - 6, "Pinned host RAM — 176 spilled experts (per layer × 48 = host floor 24.4 GB):", size=9.5, color="#333"))
-        for k in range(176):
-            r, cc = divmod(k, 44)
-            b.append(chip(gx + cc * (cw + gap), hy + r * (cw + gap), cw, cw, "spill", stroke="#a03b38", sw=0.5))
-        # flow steps
-        fy = hy + 92
-        steps = [
-            "1. router picks top-8 experts for the token-wave",
-            "2. resident hits → read on GPU directly",
-            "3. spill misses → fetch H2D over PCIe into scratch slots",
-            "4. resident + fetched → grouped GEMM → output tokens",
-        ]
-        ty = fy
-        for s in steps:
-            b.append(text(gx, ty, s, size=9.5, color="#1a1a1a"))
-            ty += 15
-        # arrow: host -> scratch (PCIe), scratch -> GEMM
-        b.append(arrow(gx + 22 * (cw + gap), hy + 8, rx + 3 * (cw + gap), top + 20, "#8a5a2b", marker="arrP"))
-        b.append(text(gx + 300, hy - 20, "PCIe H2D fetch", size=8.5, color="#8a5a2b"))
-        b.append(rect(gx + 250, ty + 6, 150, 24, COLORS["weights"], stroke="#222", sw=1.1, rx=3))
-        b.append(text(gx + 325, ty + 22, "grouped GEMM", size=9, anchor="middle", color="#fff"))
-        b.append(arrow(rx + 3 * (cw + gap), top + 30, gx + 320, ty + 4, "#3b6fb0", marker="arrB"))
-        # eager banner
-        eby = ty + 40
-        b.append(rect(gx, eby, mid - gx - 30, 34, "#fdf3e3", stroke="#c88a2b", sw=1.2, rx=4))
-        b.append(text(gx + 10, eby + 14, "EAGER (--disable-cuda-graph): the expert set is data-dependent per wave,",
-                      size=9, color="#8a5a2b"))
-        b.append(text(gx + 10, eby + 27, "so the decode path is not CUDA-graph-capturable. Graph-capture for offload: [planned].",
-                      size=9, color="#8a5a2b"))
-        # --- stock panel ---
-        sx2 = mid + 40
-        b.append(text(sx2, top - 6, "Option A — keep all 256 experts resident in VRAM:", size=9.5, color="#333"))
-        for k in range(256):
-            r, cc = divmod(k, 32)
-            over = r >= 5
-            b.append(chip(sx2 + cc * (cw - 2 + gap), top + r * (cw - 2 + gap), cw - 2, cw - 2,
-                          "spill" if over else "resident", stroke="#888", sw=0.4))
-        b.append(rect(sx2 - 4, top - 4, 32 * (cw - 2 + gap) + 4, 5 * (cw - 2 + gap) + 2, "none", stroke="#1d6b34", sw=1.6, rx=3))
-        b.append(text(sx2 + 16 * (cw - 2 + gap), top + 5 * (cw - 2 + gap) + 12, "↑ within aggregate VRAM ·  ↓ beyond it", size=8.5, anchor="middle", color="#4a5568"))
-        oy = top + 8 * (cw - 2 + gap) + 26
-        b.append(text(sx2, oy, "256 experts × 48 layers ≈ 65 GB vs 72 GB aggregate; per-card context +", size=9.5, color="#4a5568"))
-        b.append(text(sx2, oy + 14, "KV must also fit, and even-TP=3 does not divide these dims (diagram 11).", size=9.5, color="#4a5568"))
-        b.append(text(sx2, oy + 36, "Option B — --cpu-offload-gb: generic, LAYER-granular, dequantizes on", size=9.5, color="#4a5568"))
-        b.append(text(sx2, oy + 50, "CPU, not per-expert / not quant-aware; no per-wave prefetch.", size=9.5, color="#4a5568"))
-        return "".join(b), max(eby + 40, oy + 60)
-    compose("14-expert-offload-flow.svg", 1340,
-            "14 — Per-layer MoE expert offload: 256 experts → 64 resident + 16 scratch + 176 host",
-            "Decisive setting: SGLANG_MOE_RESIDENT_EXPERT_FRACTION<1 (§6, [in progress]). f=0.25 on the measured run.",
-            [("Only ceil(f·256)=64 experts stay resident per layer, plus a 16-slot scratch buffer; the other "
-              "176 live in pinned host RAM. Per token-wave the top-8 are gathered — resident ones read "
-              "directly, spilled ones are fetched H2D over PCIe into scratch, then the grouped GEMM runs. "
-              "Wave-over-tokens keeps it coherent (§6). Upstream has no per-expert, quant-aware host spill.", "#333")],
-            draw, ["resident", "scratch", "spill", "weights"])
-
-
-def g15():
-    """Full 122B TP=3 end-state rig map (measured) vs stock 'cannot run'."""
-    def draw(topY, W):
-        b = []
-        mid = W / 2
-        b.append(panel_label(30, topY - 2, "htsglang — 122B-A10B-Int4, TP=3, f=0.25 (measured: 6.97 tok/s)", "ours"))
-        b.append(panel_label(mid + 20, topY - 2, "upstream sglang — same 3 cards", "stock"))
-        top = topY + 52
-        PX = 4.0
-        cards = [("RTX 5090", 32.6, "cuda:0 · rank0 · 25.5 GB used",
-                  [("weights", 3.0, "Q16+KV2+FFN512 shard"),
-                   ("resident", 16.0, "64+16 experts/layer ×48"),
-                   ("kv", 5.0, "KV token-band (rank0)"),
-                   ("mtp", 1.0, "MTP head")]),
-                 ("RTX 3080", 20.48, "cuda:1 · rank1 · 16.6 GB used",
-                  [("weights", 2.2, "Q8+KV2+FFN256"),
-                   ("resident", 11.0, "experts/layer ×48"),
-                   ("kv", 3.4, "KV token-band")]),
-                 ("RTX 3080", 20.48, "cuda:2 · rank2 · 15.4 GB used",
-                  [("weights", 2.2, "Q8+KV2+FFN256"),
-                   ("resident", 10.0, "experts/layer ×48"),
-                   ("kv", 3.2, "KV token-band")])]
-        xs = [40, 210, 380]
-        base = top + 32.6 * PX
-        for (nm, vram, sub, regs), x in zip(cards, xs):
-            th = top + (32.6 - vram) * PX
-            b.append(text(x + 70, th - 20, nm, size=11, anchor="middle", weight="bold"))
-            b.append(text(x + 70, th - 8, sub, size=8, anchor="middle", color="#555"))
-            b.append(rect(x, th, 140, vram * PX, "none", stroke="#222", sw=1.5))
-            cy = th
-            for key, gb, lab in regs:
-                b.append(rect(x, cy, 140, gb * PX, COLORS[key]))
-                tc = "#fff" if key in WHITE_TEXT else "#1a1a1a"
-                if gb * PX >= 12:
-                    b.append(text(x + 70, cy + gb * PX / 2 + 3, lab, size=8, anchor="middle", color=tc))
-                cy += gb * PX
-            b.append(rect(x, cy, 140, base - cy, COLORS["free"]))
-            if base - cy >= 12:
-                b.append(text(x + 70, cy + (base - cy) / 2 + 3, "free", size=8, anchor="middle", color="#1a1a1a"))
-        # host RAM bar
-        hby = base + 40
-        for i, x in enumerate(xs):
-            b.append(down_link(x + 110, base, hby, "x16", "PCIe" if i == 1 else None))
-        hb, hy = host_ram_bar(40, hby, 480,
-                              [("spill", 0.66, "176 spilled experts/layer ×48 (pinned)"), ("free", 0.34, "host floor 24.4 GB")],
-                              "Pinned host RAM (DDR)")
-        b.append(hb)
-        # eager + tok/s banner
-        b.append(rect(40, hy + 14, 480, 30, "#fdf3e3", stroke="#c88a2b", sw=1.1, rx=4))
-        b.append(text(50, hy + 33, "decode: EAGER (--disable-cuda-graph, offload is data-dependent) · 6.97 tok/s · MTP on rank0",
-                      size=9, color="#8a5a2b"))
-        # --- stock panel: 3 cards, walls ---
-        sx = [mid + 40, mid + 210, mid + 380]
-        for (nm, vram, sub, _), x in zip(cards, sx):
-            th = top + (32.6 - vram) * PX
-            b.append(text(x + 70, th - 20, nm, size=11, anchor="middle", weight="bold"))
-            b.append(rect(x, th, 140, vram * PX, COLORS["bad"], stroke="#222", sw=1.5))
-            b.append(text(x + 70, th + vram * PX / 2, "even TP=3", size=9, anchor="middle", color="#4a5568", weight="bold"))
-            b.append(text(x + 70, th + vram * PX / 2 + 14, "not admitted", size=9, anchor="middle", color="#4a5568"))
-        wy = base + 34
-        for i, s in enumerate([
-                "even-TP=3: 32 Q / 1024 FFN / 2 KV not ÷3, FFN not ÷128 → not admitted (diagram 11)",
-                "head-sharded KV: requires num_kv_heads(2) ≥ tp(3) (diagram 12)",
-                "no per-expert host spill: 256 experts ×48 ≈ 65 GB vs 72 GB aggregate; KV must also fit (diagram 14)",
-                "even-TP=2 fallback sizes both ranks to the 3080 shard → ~12 GB of the 5090 unused, full model does not fit"]):
-            b.append(text(mid + 40, wy + i * 15, "• " + s, size=9, color="#4a5568"))
-        return "".join(b), max(hy + 50, wy + 4 * 15)
-    compose("15-endstate-rig-map.svg", 1320,
-            "15 — 122B-A10B-Int4 TP=3 end-state: the whole rig, measured",
-            "5090 + 2×3080, PCIe, no NVLink. Everything from diagrams 10-14 combined on the real config.",
-            [("The measured end-state: uneven-TP [28,19,19], 2 KV heads replicated + DCP token-shard, "
-              "per-layer expert offload f=0.25 (64+16 resident, 176 host), MTP on rank0, eager decode. "
-              "Per-rank GPU 25.5 / 16.6 / 15.4 GB; host floor 24.4 GB; 6.97 tok/s. On the upstream path a "
-              "TP=3 split on this hardware meets the structural constraints listed at right.", "#333")],
-            draw, ["weights", "resident", "kv", "mtp", "spill", "free", "bad"])
-
-
-def g16():
-    """Smaller concrete offload examples: solo 1-card 122B (f=0.15) + 35B TP=3."""
-    def draw(topY, W):
-        b = []
-        mid = W / 2
-        b.append(vdivider(mid, topY - 4, topY + 300))
-        b.append(panel_label(30, topY - 2, "solo 1-card 122B — f=0.15 (39 resident)", "ours"))
-        b.append(panel_label(mid + 20, topY - 2, "35B-A3B TP=3 — 2/1/1 groups, 11.83 tok/s", "ours"))
-        PX = 4.0
-        top = topY + 50
-        # solo card
-        x = 60
-        b.append(text(x + 70, top - 18, "RTX 5090 (solo, TP=1)", size=10.5, anchor="middle", weight="bold"))
-        b.append(rect(x, top, 140, 32.6 * PX, "none", stroke="#222", sw=1.5))
-        cy = top
-        for key, gb, lab in [("weights", 4, "attn+shared wts"), ("resident", 12, "39 resident experts/layer"),
-                             ("scratch", 2, "scratch"), ("kv", 6, "KV cache"), ("mtp", 1.2, "MTP")]:
-            b.append(rect(x, cy, 140, gb * PX, COLORS[key]))
-            tc = "#fff" if key in WHITE_TEXT else "#1a1a1a"
-            if gb * PX >= 12:
-                b.append(text(x + 70, cy + gb * PX / 2 + 3, lab, size=8, anchor="middle", color=tc))
-            cy += gb * PX
-        b.append(rect(x, cy, 140, top + 32.6 * PX - cy, COLORS["free"]))
-        b.append(down_link(x + 170, top + 32.6 * PX - 40, top + 32.6 * PX + 34, "x16", "PCIe"))
-        hb, hy = host_ram_bar(x, top + 32.6 * PX + 34, 320,
-                              [("spill", 0.78, "208 spilled experts/layer (pinned)"), ("free", 0.22, "floor ~28 GB")],
-                              "Pinned host RAM (DDR)")
-        b.append(hb)
-        b.append(text(x, hy + 20, "Same offload mechanism at TP=1: fewer resident (f=0.15 → 39),", size=9, color="#333"))
-        b.append(text(x, hy + 33, "more host spill. Boots the 122B on a single 32 GB card (§6).", size=9, color="#333"))
-        # 35B TP=3 mini map
-        sx = mid + 40
-        for i, (nm, vram, grp) in enumerate([("5090", 32.6, "FFN 2 grp"), ("3080", 20.48, "1 grp"), ("3080", 20.48, "1 grp")]):
-            xx = sx + i * 150
-            th = top + (32.6 - vram) * PX
-            b.append(text(xx + 60, th - 16, nm, size=10, anchor="middle", weight="bold"))
-            b.append(rect(xx, th, 120, vram * PX, "none", stroke="#222", sw=1.3))
-            cy = th
-            for key, gb, lab in [("weights", 2.5, "wts · " + grp), ("resident", 5, "experts"), ("kv", 4, "KV band")]:
-                b.append(rect(xx, cy, 120, gb * PX, COLORS[key]))
-                tc = "#fff" if key in WHITE_TEXT else "#1a1a1a"
-                if gb * PX >= 12:
-                    b.append(text(xx + 60, cy + gb * PX / 2 + 3, lab, size=7.5, anchor="middle", color=tc))
-                cy += gb * PX
-            b.append(rect(xx, cy, 120, top + 32.6 * PX - cy, COLORS["free"]))
-        b.append(text(sx, top + 32.6 * PX + 24, "35B-A3B-AWQ: uneven-TP=3 + DCP + offload, mixed-arch. Stage(a)", size=9, color="#333"))
-        b.append(text(sx, top + 32.6 * PX + 37, "32/32 token-identical to TP=1; self-det 5/5; 11.83 tok/s (§6/§7).", size=9, color="#333"))
-        return "".join(b), hy + 44
-    compose("16-solo-and-35b.svg", 1200,
-            "16 — Smaller concrete examples: solo-card 122B and 35B TP=3",
-            "The same offload + uneven-TP machinery at other scales (§6/§7, [in progress]/shipped).",
-            [("Solo 122B on one 5090 uses f=0.15 (39 resident experts/layer, host floor ~28 GB). The 35B-A3B "
-              "runs uneven-TP=3 (2/1/1 groups) with offload and was validated 32/32 token-identical to TP=1 "
-              "under uneven-TP+DCP.", "#333")],
-            draw, ["weights", "resident", "scratch", "kv", "mtp", "spill", "free"])
-
-
-# ===========================================================================
-# Part 3 — runtime capabilities (speculative routing, memory, scheduling).
-# These explain the mechanism of a landed/experimental fork feature rather than
-# a GPU-placement topology. Region colours stay consistent with the atlas.
+# Part 3 - runtime-mechanism diagrams (kept intact from the prior revision):
+# adaptive drafter routing, session KV spill, fast-lane, measured VRAM budget.
+# These explain the MECHANISM of a feature rather than a placement/VRAM split.
 # ===========================================================================
 DFLASH_FILL, DFLASH_STROKE, DFLASH_TXT = "#e4dcf1", "#7d5ba6", "#4a3b66"
 
 
-def g17():
+def m11():
     """Adaptive drafter routing: NEXTN/DFLASH dual residence, policy vs bandit, ctx-gate."""
     def draw(topY, W):
         b = []
         top = topY + 6
-        # 1) dual residence
         b.append(text(40, top, "Both drafters resident at once (cross_algo_worker, dual residence):",
                       size=10.5, weight="bold", color="#111"))
         y = top + 10
@@ -1158,18 +1042,15 @@ def g17():
         b.append(text(280, y + 19, "DFLASH", size=9.5, anchor="middle", color=DFLASH_TXT, weight="bold"))
         b.append(rect(370, y, 130, 30, "#eef1f4", stroke="#4a5568", sw=1.1, rx=2))
         b.append(text(435, y + 13, "solo-draft pool", size=8.5, anchor="middle", color="#333"))
-        b.append(text(435, y + 24, "sized to threshold (→160 MiB)", size=7.6, anchor="middle", color="#555"))
+        b.append(text(435, y + 24, "4.58 GiB on rank0 (measured)", size=7.6, anchor="middle", color="#555"))
         b.append(text(520, y + 13, "the inactive drafter holds ≈0 VRAM", size=9, color=DFLASH_STROKE))
         b.append(text(520, y + 25, "(VMM tag-alias, #93/#102)", size=9, color=DFLASH_STROKE))
-        # 2) router
         ry = y + 52
         b.append(rect(40, ry, W - 80, 30, "#f3f6fa", stroke="#3b6fb0", sw=1.3, rx=4))
         b.append(text(50, ry + 19, "Per-round-boundary router — picks ONE drafter for the next batch; the choice is made by one of two modes:",
                       size=9.5, color="#1a1a1a"))
-        # 3) two mode cards
         cy = ry + 48
         cardw = (W - 80 - 30) / 2
-        # policy card (recommended default)
         b.append(rect(40, cy, cardw, 132, "#eef5ef", stroke="#1d6b34", sw=1.4, rx=5))
         b.append(text(52, cy + 17, "policy  —  recommended default", size=10, weight="bold", color="#1d6b34"))
         b.append(text(52, cy + 32, "deterministic ctx → rung table (--speculative-drafter-policy)", size=8.6, color="#333"))
@@ -1184,7 +1065,6 @@ def g17():
                           color="#fff" if fill == COLORS["mtp"] else DFLASH_TXT))
         b.append(text(52, cy + 108, "k* = argmax_k  E[accept]/round_s  from per-depth accept EMA.", size=8.4, color="#333"))
         b.append(text(52, cy + 122, "Fixed switch point = drafter training-ctx; probing not needed.", size=8.4, color="#333"))
-        # bandit card (opt-in)
         bx = 40 + cardw + 30
         b.append(rect(bx, cy, cardw, 132, "#eef1f4", stroke="#4a5568", sw=1.4, rx=5))
         b.append(text(bx + 12, cy + 17, "auto / bandit  —  opt-in (--speculative-cross-algorithm)", size=10, weight="bold", color="#4a5568"))
@@ -1194,20 +1074,18 @@ def g17():
         b.append(text(bx + 12, cy + 82, "rank-0 decides, gloo-broadcasts every 16 rounds; dwell 64,", size=8.4, color="#333"))
         b.append(text(bx + 12, cy + 95, "dead-zone 6%. Costs a small steady-state probe overhead.", size=8.4, color="#333"))
         b.append(text(bx + 12, cy + 116, "Prior art: BanditSpec (arXiv 2505.15141, ICML'25).", size=8.4, color="#555"))
-        # 4) ctx gate
         gy = cy + 150
         b.append(rect(40, gy, W - 80, 30, "#fdf3e3", stroke="#c88a2b", sw=1.2, rx=4))
         b.append(text(50, gy + 19, "Context-length gate (--speculative-cross-algorithm-ctx-gate, from the drafter training config, ~8k): "
                       "above the gate DFLASH is ineligible and is not probed.", size=9, color="#8a5a2b"))
-        # 5) honest claim
         hn, hy = flow(40, gy + 48, "Honest claim: robustness / no-regret across mixed streams — not a peak speedup. "
-                      "A switching mode carries ≈+5.7% systemic overhead vs a single static drafter "
-                      "(warm-keep + dual capture), so the win is confined to streams that actually change "
-                      "regime. Feature status: work in progress (§5).", W - 80, size=9.5, color="#333")
+                      "A switching mode carries ≈+5.7% systemic overhead vs a single static drafter (measured), so the "
+                      "win is confined to streams that actually change regime. Feature status: work in progress (§5).",
+                      W - 80, size=9.5, color="#333")
         b.append(hn)
         return "".join(b), hy
-    compose("17-adaptive-drafter-routing.svg", 1120,
-            "17 — Adaptive drafter routing: switch draft algorithm at round boundaries",
+    compose("11-adaptive-drafter-routing.svg", 1120,
+            "11 (mechanism) — Adaptive drafter routing: switch draft algorithm at round boundaries",
             "Two draft algorithms resident at once; one chosen per batch. Decisive setting: drafter routing (§5, work in progress).",
             [("NEXTN/MTP and DFLASH are both loaded (the inactive one held at ≈0 VRAM via VMM tag-aliasing). "
               "A per-round router selects one, either by a deterministic ctx→rung policy table (recommended "
@@ -1217,12 +1095,11 @@ def g17():
             draw, ["mtp"])
 
 
-def g18():
-    """Session KV spill: newest session's KV offloaded to host, keeps decoding."""
+def m12():
+    """Session KV spill mechanism."""
     def draw(topY, W):
         b = []
         top = topY + 10
-        # device lane: session KV blocks, oldest..newest
         b.append(text(40, top, "Device VRAM — full-attention KV, one shard per active session (FCFS):",
                       size=10, weight="bold", color="#111"))
         ly = top + 12
@@ -1237,34 +1114,27 @@ def g18():
             b.append(text(x + w / 2, ly + 20, nm, size=9, anchor="middle", color="#fff", weight="bold"))
             b.append(text(x + w / 2, ly + 34, "KV shard", size=8, anchor="middle", color="#fff"))
             x += w + 12
-        # GDN resident chip
         b.append(chip(x + 8, ly, 96, 46, "state", "GDN state", size=8.5))
         b.append(text(x + 56, ly + 60, "always resident", size=8, anchor="middle", color="#4a3b66"))
-        # overflow marker + spill arrow (newest -> host)
         newest_x = 40 + 3 * (118 + 12)
         b.append(text(newest_x + 59, ly - 2, "VRAM overflow (after tree eviction)", size=8.2, anchor="middle", color="#c0504d"))
-        # host lane
         hy0 = ly + 96
-        hb, hy = host_ram_bar(40, hy0, W - 80,
-                              [("hostkv", 0.30, "S4 KV (host-streamed, still decoding)"),
-                               ("free", 0.70, "host KV tier")],
-                              "Host RAM (DDR) — spilled session KV")
+        hb, hy = host_bar_ev(40, hy0, W - 80, "Host RAM (DDR) — spilled session KV",
+                             [("hostkv", 0.30, "S4 KV (host-streamed, still decoding)", "measured"),
+                              ("free", 0.70, "host KV tier", "measured")])
         b.append(hb)
         b.append(arrow(newest_x + 59, ly + 46, 40 + (W - 80) * 0.15, hy0, "#c0504d", marker="arrR"))
         b.append(text(newest_x + 120, ly + 74, "spill newest first (FCFS victim)", size=8.4, color="#c0504d"))
         b.append(arrow(40 + (W - 80) * 0.30, hy0, newest_x + 59, ly + 48, "#3f9fa0", dash="4 3", marker="arr"))
         b.append(text(40 + (W - 80) * 0.42, hy0 + 18, "FIFO restore when device capacity frees (~0.4 s)", size=8.4, color="#227a3a"))
-        # mechanism notes
         n1, ny = flow(40, hy + 26,
                       "Mechanism: on KV overflow the NEWEST session's full-attention KV shard is moved to host "
-                      "RAM (block-LSE attention + double-buffer prefetch, reused from the weightless lane) and "
-                      "that session keeps DECODING from host, in a separate eager bs=1 tick — never mixed into "
-                      "the device CUDA-graph batch. The oldest session stays fully device-resident until it "
-                      "finishes (strict FCFS). Only KV spills; GDN/Mamba state is always resident. Fast-lane "
-                      "requests take precedence (restore is held while a fast request waits).",
-                      W - 80, size=9.3, color="#333")
+                      "RAM (block-LSE attention + double-buffer prefetch) and that session keeps DECODING from "
+                      "host, in a separate eager bs=1 tick — never mixed into the device CUDA-graph batch. The "
+                      "oldest session stays fully device-resident until it finishes (strict FCFS). Only KV spills; "
+                      "GDN/Mamba state is always resident. Fast-lane requests take precedence (restore is held "
+                      "while a fast request waits).", W - 80, size=9.3, color="#333")
         b.append(n1)
-        # measured vs modeled
         my = ny + 8
         b.append(rect(40, my, (W - 80) / 2 - 10, 78, "#eef5ef", stroke="#1d6b34", sw=1.3, rx=4))
         b.append(text(52, my + 16, "S1 — measured (landed)", size=9.5, weight="bold", color="#1d6b34"))
@@ -1275,13 +1145,13 @@ def g18():
         mx = 40 + (W - 80) / 2 + 10
         b.append(rect(mx, my, (W - 80) / 2 - 10, 78, "#eef1f4", stroke="#4a5568", sw=1.3, rx=4))
         b.append(text(mx + 12, my + 16, "design model — modeled, not benchmarked (needs S2)", size=9.2, weight="bold", color="#4a5568"))
-        for i, s in enumerate(["12 KiB/token fp8, x4 link, DCP R=3 + overlap:",
+        for i, s in enumerate(["32 KiB/token fp8, x4 link, DCP R=3 + overlap:",
                                 "32k ≈63 · 64k ≈31 · 128k ≈16 · 262k ≈7.6 tok/s",
                                 "worthwhile only with uneven DCP (262k ≈3.8 without)"]):
             b.append(text(mx + 12, my + 32 + i * 14, "• " + s, size=8.4, color="#1a1a1a"))
         return "".join(b), my + 92
-    compose("18-session-kv-spill.svg", 1120,
-            "18 — Session KV spill: overflow the newest session to host RAM, keep decoding",
+    compose("12-session-kv-spill.svg", 1120,
+            "12 (mechanism) — Session KV spill: overflow the newest session to host RAM, keep decoding",
             "Per-session KV offload under VRAM pressure. Decisive setting: --enable-kv-session-offload (§20, experimental S1).",
             [("When device KV overflows, the newest active session's KV shard is offloaded to host RAM and that "
               "session keeps decoding via host-streamed attention, instead of being paused. Victim order is "
@@ -1291,13 +1161,11 @@ def g18():
             draw, ["kv", "hostkv", "state", "free"])
 
 
-def g19():
-    """Fast-lane priority scheduling: preempt a tagged request, reserved floor, aging."""
+def m13():
+    """Fast-lane priority scheduling mechanism."""
     def draw(topY, W):
         b = []
         top = topY + 10
-        colw = 250
-        # running batch before
         b.append(text(40, top, "Running batch (slot budget)", size=10, weight="bold", color="#111"))
         by = top + 12
         slots = [("normal", "kv"), ("normal", "kv"), ("normal", "kv"),
@@ -1311,30 +1179,26 @@ def g19():
             if kind == "reserved":
                 b.append(text(xx + sw_ / 2, by + 31, "heavy", size=7, anchor="middle", color="#1a1a1a"))
         b.append(text(40, by + 56, "reserved-heavy-slots: a floor kept for latency-priority work", size=8.6, color="#333"))
-        # fast request arrives
         fy = by + 78
         b.append(rect(40, fy, 150, 28, "#c65b9b", stroke="#2b2b2b", sw=1.3, rx=3))
         b.append(text(115, fy + 18, "\"lane\":\"fast\" request", size=9, anchor="middle", color="#fff", weight="bold"))
         b.append(arrow(195, fy + 14, 300, fy + 14, "#c65b9b", marker="arr"))
         b.append(text(360, fy + 6, "preempts INTO the running batch immediately", size=9, color="#c65b9b"))
         b.append(text(360, fy + 19, "(takes a reserved-heavy slot; no queue wait)", size=8.6, color="#555"))
-        # aging
         ay = fy + 44
         b.append(text(40, ay, "heavy-aging (--fast-lane-heavy-aging-ms): a long-waiting heavy request ages up in "
                       "priority so fast traffic cannot starve it.", size=9, color="#333"))
-        # interaction with spill
         iy = ay + 24
         b.append(rect(40, iy, W - 80, 46, "#fdf3e3", stroke="#c88a2b", sw=1.2, rx=4))
         b.append(text(52, iy + 18, "Interaction with session KV spill (§20): fast-lane outranks FCFS — admitting a fast request "
                       "can spill a normal", size=9, color="#8a5a2b"))
         b.append(text(52, iy + 33, "session's KV to host to make room, and a spilled session's restore is held while a fast "
                       "request is still waiting.", size=9, color="#8a5a2b"))
-        # default off
         b.append(text(40, iy + 68, "Default off (--enable-fast-lane opt-in): the default scheduling path is unchanged.",
                       size=9.3, color="#1d6b34"))
         return "".join(b), iy + 80
-    compose("19-fast-lane-priority.svg", 1000,
-            "19 — Fast-lane priority scheduling: preempt a tagged request into the batch",
+    compose("13-fast-lane-priority.svg", 1000,
+            "13 (mechanism) — Fast-lane priority scheduling: preempt a tagged request into the batch",
             "Opt-in latency-priority class with a starvation guard. Decisive setting: --enable-fast-lane (§16, implemented).",
             [("A request tagged \"lane\":\"fast\" preempts into the running batch at once, taking one of a "
               "reserved floor of heavy slots; heavy-aging raises long-waiting heavy requests so fast traffic "
@@ -1344,16 +1208,15 @@ def g19():
             draw, ["kv", "free"])
 
 
-def g20():
-    """Measured VRAM budget: components measured, KV is the remainder; corridor rule."""
+def m14():
+    """Measured VRAM budget mechanism: components measured, KV is the remainder; corridor rule."""
     def draw(topY, W):
         b = []
         top = topY + 20
         PX = 5.2
-        # one rank card, component stack (measured) with KV as remainder
         x = 60
         cardw = 150
-        total = 20.0   # a 3080 rank, illustrative absolute MiB budget
+        total = 20.0
         b.append(text(x + cardw / 2, top - 22, "one rank (3080)", size=11, anchor="middle", weight="bold"))
         b.append(text(x + cardw / 2, top - 9, "--rank-gpu-memory-mib (absolute)", size=8.5, anchor="middle", color="#444"))
         b.append(rect(x, top, cardw, total * PX, "none", stroke="#222", sw=1.6))
@@ -1372,22 +1235,19 @@ def g20():
             if gb * PX >= 13:
                 b.append(text(x + cardw / 2, mid_y + 3, lab, size=8, anchor="middle", color=tc))
             else:
-                ly = max(mid_y, last_leader_y + 12)   # stagger thin-band leader labels
+                ly = max(mid_y, last_leader_y + 12)
                 last_leader_y = ly
                 b.append(line(x + cardw, mid_y, x + cardw + 8, ly, stroke="#888", sw=0.7))
                 b.append(text(x + cardw + 11, ly + 3, lab, size=8, anchor="start", color="#333"))
             cy += gb * PX
-        # KV = measured remainder
         kvh = top + total * PX - cy - 0.5 * PX
         b.append(rect(x, cy, cardw, kvh, COLORS["kv"]))
         b.append(text(x + cardw / 2, cy + kvh / 2 - 4, "KV cache", size=9, anchor="middle", color="#fff", weight="bold"))
         b.append(text(x + cardw / 2, cy + kvh / 2 + 9, "= measured remainder", size=7.6, anchor="middle", color="#fff"))
-        # safety rest at the bottom
         sy = top + total * PX - 0.5 * PX
         b.append(rect(x, sy, cardw, 0.5 * PX, "#d3dae1", stroke="#888", sw=0.6))
         b.append(line(x + cardw, sy + 1, x + cardw + 8, sy + 1, stroke="#888", sw=0.7))
         b.append(text(x + cardw + 11, sy + 4, "safety rest ≥ 400 MiB", size=8, color="#333"))
-        # right column explanation
         rx = x + cardw + 130
         n1, y1 = flow(rx, top + 6,
                       "Every component above is read from the measured component registry after boot + one "
@@ -1401,7 +1261,6 @@ def g20():
                       "restart self-calibrates the split so the KV remainder lands on the safety rest.",
                       W - rx - 30, size=9.4, color="#333")
         b.append(n2)
-        # corridor box
         cby = y2 + 14
         b.append(rect(rx, cby, W - rx - 30, 62, "#eef5ef", stroke="#1d6b34", sw=1.3, rx=4))
         b.append(text(rx + 12, cby + 17, "Corridor rule (evaluated per card, Option A):", size=9.3, weight="bold", color="#1d6b34"))
@@ -1411,8 +1270,8 @@ def g20():
         b.append(text(x, top + total * PX + 18, "upstream: fraction-based mem-fraction-static /", size=8.6, color="#555"))
         b.append(text(x, top + total * PX + 30, "gpu-memory-utilization; no per-rank absolute MiB budget.", size=8.6, color="#555"))
         return "".join(b), max(bottom, top + total * PX + 36)
-    compose("20-measured-vram-budget.svg", 1040,
-            "20 — Measured VRAM budget: components measured, KV is the remainder",
+    compose("14-measured-vram-budget.svg", 1040,
+            "14 (mechanism) — Measured VRAM budget: components measured, KV is the remainder",
             "Per-rank absolute MiB budget from measured usage. Decisive setting: --rank-gpu-memory-mib + component registry (§10, implemented).",
             [("Each rank gets an absolute MiB budget (not a fraction). The per-component usage — CUDA context, "
               "weight shard, resident experts, solo-draft pool, GDN state, graph/workspace pools — is measured "
@@ -1423,8 +1282,9 @@ def g20():
 
 
 if __name__ == "__main__":
-    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9,
-               g10, g11, g12, g13, g14, g15, g16,
-               g17, g18, g19, g20):
+    for spec in FEATURES:
+        feature(spec)
+    eight_gpu()
+    for fn in (m11, m12, m13, m14):
         fn()
     print("done")
