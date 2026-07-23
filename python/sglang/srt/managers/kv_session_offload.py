@@ -228,6 +228,23 @@ def spill_decouple_enabled() -> bool:
     return os.environ.get("SGLANG_KVSO_DECOUPLE", "0") == "1"
 
 
+def resume_under_spec_enabled() -> bool:
+    """Bring-up gate for ON-DEVICE MTP RESUME (lift the host-finish guard so a
+    spilled spec session waves back and rejoins the LIVE spec decode batch,
+    instead of finishing on host). Default OFF keeps the validated host-finish
+    path. Set KVSO_RESUME=1 to opt into the resume path (draft-KV bundle +
+    spec-in-spill-tick). Mirrors KVSO_ALLOW_SPEC's staged-bring-up role."""
+    return os.environ.get("KVSO_RESUME", "0") == "1"
+
+
+def draft_kv_verify_enabled() -> bool:
+    """Stage-1 self-check: after restoring the draft-KV bundle into the new
+    slots, read it back and assert byte-exact equality with the pinned-CPU
+    snapshot (validates the snapshot/restore plumbing -- slot indexing, dtype,
+    shapes -- end to end). Off by default; KVSO_S1_VERIFY=1 for bring-up."""
+    return os.environ.get("KVSO_S1_VERIFY", "0") == "1"
+
+
 def spill_graph_blocks_needed(owned_tokens: int, block_size: int) -> int:
     """Number of streamed host blocks for ``owned_tokens`` at ``block_size``
     (ceil, at least 1). For rank-uniform capture pass the MAX owned count
@@ -687,6 +704,11 @@ class SpillSlot:
         "last_tick_iter",
         "wave",
         "hysteresis",
+        "last_hidden",
+        "draft_kv_k",
+        "draft_kv_v",
+        "draft_spill_boundary",
+        "draft_spill_L",
     )
 
     def __init__(self, req, region, spill_iter, wave, hysteresis):
@@ -697,6 +719,28 @@ class SpillSlot:
         self.last_tick_iter = -(1 << 30)
         self.wave = wave
         self.hysteresis = hysteresis
+        # ON-DEVICE MTP RESUME: the target hidden state of the LAST host-decoded
+        # token, captured (cloned) from that spill tick's plain target forward
+        # (capture_hidden_mode=LAST). Used at restore to re-seed the EAGLE/MTP
+        # draft state so the resumed session rejoins the live spec decode batch
+        # with a valid draft input instead of spec_info=None. GDN/Mamba state is
+        # NOT recomputed: this hidden state comes from the single, correct target
+        # forward the host-decode tick already ran (one legit SSM advance), so no
+        # second advance / no corruption. None until the first tick captures one.
+        self.last_hidden = None
+        # DRAFT-KV BUNDLE (Stage 1): pinned-CPU snapshot of the spilled TAIL's
+        # EAGLE/NEXTN draft KV shard, taken at spill and written back into the
+        # restored slots on wave-back so the draft KV of [draft_spill_boundary,
+        # draft_spill_L) survives the free+realloc round-trip (its slots would
+        # otherwise be reused, and its target hidden states -- needed to rebuild
+        # it -- are unrecoverable / GDN forbids a target re-forward). Covers ONLY
+        # the positions that existed at spill; host-grown positions carry no
+        # draft KV under a plain host tick (that gap is the spec-in-tick stage).
+        # Shapes: [layer_num, tail_len, *k_row] / [..., *v_row] in store_dtype.
+        self.draft_kv_k = None
+        self.draft_kv_v = None
+        self.draft_spill_boundary = 0
+        self.draft_spill_L = 0
 
 
 class SpillTickController:
@@ -894,6 +938,47 @@ class KVSessionOffloadManager:
         self.allocator = scheduler.token_to_kv_pool_allocator
         self.tree_cache = scheduler.tree_cache
 
+        # === DRAFT-KV BUNDLE (Stage 1): the spilled session's EAGLE/NEXTN draft
+        # KV shard rides WITH the session (the ("draft_kv", ...) bundle element).
+        # The draft pool shares the allocator + req_to_token virtual slot space
+        # with the target (verified at bring-up), so restore's new_locs are valid
+        # draft slot ids. Unlike the DCP-token-sharded TARGET pool, the draft pool
+        # is NOT token-sharded: it holds the FULL token context on every rank
+        # (M4, flashinfer_backend._sess_wire note; head-sharded [2,1,1] GQA
+        # groups). So the draft-KV tail is snapshotted/restored in FULL (no owner
+        # filter) -- a single tiny layer per rank, direct pinned-CPU stash rather
+        # than a host-pool region. None when the server runs no spec algorithm.
+        # DFLASH is excluded from spill sessions (short-ctx regime); only the
+        # model-configured NEXTN/EAGLE-family drafter is bundled.
+        self.draft_full_pool = None
+        try:
+            from sglang.srt.mem_cache.kv_cache_builder import get_draft_kv_pool
+
+            spec_algo0 = getattr(scheduler, "spec_algorithm", None)
+            dw = getattr(scheduler, "draft_worker", None)
+            if (
+                dw is not None
+                and spec_algo0 is not None
+                and not spec_algo0.is_none()
+                and not spec_algo0.is_dflash_family()
+            ):
+                dpool = get_draft_kv_pool(
+                    draft_worker=dw,
+                    spec_algorithm=spec_algo0,
+                    server_args=sa,
+                )
+                self.draft_full_pool = getattr(dpool, "full_kv_pool", dpool)
+        except Exception as _e:  # noqa: BLE001
+            logger.warning("kv-session-offload: draft-KV bundle disabled: %r", _e)
+        if self.draft_full_pool is not None:
+            logger.info(
+                "kv-session-offload: draft-KV bundle armed (draft pool "
+                "size=%d layer_num=%d head_num=%d).",
+                getattr(self.draft_full_pool, "size", -1),
+                getattr(self.draft_full_pool, "layer_num", -1),
+                getattr(self.draft_full_pool, "head_num", -1),
+            )
+
         # S4 multi-spill: the host pool is partitioned into `max_spills` equal
         # regions of `region_tokens` rows each; region r owns host rows
         # [r * region_tokens, (r+1) * region_tokens). At most one session per
@@ -963,6 +1048,20 @@ class KVSessionOffloadManager:
 
     def _slot_of(self, req) -> Optional["SpillSlot"]:
         return self.spills.get(req.req_pool_idx)
+
+    def capture_tick_hidden(self, req_pool_idx: int, hidden: torch.Tensor) -> None:
+        """ON-DEVICE MTP RESUME: record the LAST token's target hidden state
+        from a spill tick's plain target forward (called from the worker, same
+        process). Cloned so it survives the pooled forward buffer's reuse by the
+        next forward. Overwritten every tick -> at restore the slot holds the
+        hidden of the MOST RECENT host-decoded token, i.e. the correct draft
+        seed position. Rank-uniform: every DCP rank runs the same tick forward
+        and captures its own (replicated) hidden state. No-op if the session is
+        no longer spilled (already reaped)."""
+        slot = self.spills.get(req_pool_idx)
+        if slot is None:
+            return
+        slot.last_hidden = hidden.detach().clone()
 
     # -- helpers ----------------------------------------------------------
 
@@ -1291,6 +1390,19 @@ class KVSessionOffloadManager:
                 self.full_pool, host_ids, dev_idx, io_backend="kernel"
             )
 
+        # 1b. DRAFT-KV BUNDLE: snapshot the tail's draft KV shard to pinned CPU
+        #     BEFORE the free below reclaims these slots (they get reused, and
+        #     the draft KV would be clobbered / unrecoverable). The draft pool is
+        #     NOT DCP-token-sharded (full context on every rank, M4), so the
+        #     snapshot is the FULL tail seg -- no owner filter, unlike the target
+        #     backup above. Ordered after the in-flight forward via the
+        #     _wait_forward_stream() already issued above.
+        draft_k_snap = draft_v_snap = None
+        if self.draft_full_pool is not None and resume_under_spec_enabled():
+            # Only the resume path reads it back; the host-finish path (guard up)
+            # never restores, so skip the D2H entirely there.
+            draft_k_snap, draft_v_snap = self._draft_kv_snapshot(seg)
+
         # 2. Free ONLY the tail device slots. The head [0, boundary) -- the
         #    shared protected radix prefix AND the retained exclusive head --
         #    stays device-resident and tree-locked (last_node / prefix_indices
@@ -1319,6 +1431,11 @@ class KVSessionOffloadManager:
             wave=WaveBackController(self.block_size, self._hysteresis_steps),
             hysteresis=RestoreHysteresis(self._hysteresis_steps),
         )
+        if draft_k_snap is not None:
+            slot.draft_kv_k = draft_k_snap
+            slot.draft_kv_v = draft_v_snap
+            slot.draft_spill_boundary = boundary
+            slot.draft_spill_L = L
         self.spills[req.req_pool_idx] = slot
 
         keep = [i for i in range(len(batch.reqs)) if i != idx]
@@ -1382,6 +1499,18 @@ class KVSessionOffloadManager:
             spec_algorithm=SpeculativeAlgorithm.NONE,
         )
         batch.kv_session_spill_tick = True
+        # ON-DEVICE MTP RESUME: under an active server spec algorithm, ask the
+        # tick's plain target forward to also emit the LAST token's hidden state
+        # (capture_hidden_mode=LAST). It is cloned into the slot after the
+        # forward and used at restore to re-seed the draft state. Only affects
+        # what the forward RETURNS, never the sampled token -> the host-decode
+        # output stays byte-identical. Gated on spec active so the non-spec /
+        # flag-OFF path emits nothing extra (byte-identical there too).
+        spec_algo = getattr(sch, "spec_algorithm", None)
+        if spec_algo is not None and not spec_algo.is_none():
+            from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+            batch.capture_hidden_mode = CaptureHiddenMode.LAST
         # mrope models index batch.multimodal_inputs per request in
         # ForwardBatch.init_new (None entries take the plain-text path).
         batch.multimodal_inputs = [getattr(req, "multimodal_inputs", None)]
@@ -1584,7 +1713,11 @@ class KVSessionOffloadManager:
         # fully (unchanged / byte-identical). Rank-uniform: the server spec
         # algorithm is global, so every rank makes the same decision.
         spec_algo = getattr(self.scheduler, "spec_algorithm", None)
-        if spec_algo is not None and not spec_algo.is_none():
+        if (
+            spec_algo is not None
+            and not spec_algo.is_none()
+            and not resume_under_spec_enabled()
+        ):
             return running_batch
 
         # While a fast-lane request is waiting for admission, the freed
@@ -1718,6 +1851,78 @@ class KVSessionOffloadManager:
 
     # -- restore ------------------------------------------------------------
 
+    def _draft_kv_snapshot(self, seg):
+        """DRAFT-KV BUNDLE (Stage 1): clone the draft KV shard at the tail's
+        virtual slots ``seg`` into pinned CPU, stacked ``[layer_num, n, *row]``
+        per K and V. Raw ``store_dtype`` (fp8 stored as uint8) keeps it byte
+        exact. FULL tail -- the draft pool is not DCP-token-sharded (M4), every
+        rank holds all token positions; no owner filter. Ordered after the
+        in-flight forward by the caller's ``_wait_forward_stream()``."""
+        dp = self.draft_full_pool
+        assert getattr(dp, "page_size", 1) == 1, (
+            "kv-session-offload draft-KV bundle: draft pool page_size must be 1 "
+            f"(got {getattr(dp, 'page_size', None)})"
+        )
+        seg64 = seg.to(torch.int64)
+        ln = int(dp.layer_num)
+        k_layers, v_layers = [], []
+        for l in range(ln):
+            k_layers.append(dp.k_buffer[l][seg64].to("cpu", copy=True))
+            v_layers.append(dp.v_buffer[l][seg64].to("cpu", copy=True))
+        k_cpu = torch.stack(k_layers, dim=0)
+        v_cpu = torch.stack(v_layers, dim=0)
+        try:
+            k_cpu = k_cpu.pin_memory()
+            v_cpu = v_cpu.pin_memory()
+        except RuntimeError:
+            pass  # pinning is a perf nicety; correctness holds either way
+        return k_cpu, v_cpu
+
+    def _draft_kv_restore_block(self, slot, new_locs, boundary: int, hi: int):
+        """DRAFT-KV BUNDLE (Stage 1): write the snapshot back into the restored
+        slots for positions ``[boundary, hi)`` that overlap the snapshot range
+        ``[draft_spill_boundary, draft_spill_L)``. ``new_locs`` is positional for
+        ``[boundary, hi)``. Host-grown positions (>= draft_spill_L) carry NO
+        draft KV under a plain host tick -- that residual gap is closed by the
+        spec-in-spill-tick stage, not here."""
+        if slot.draft_kv_k is None or self.draft_full_pool is None:
+            return
+        sb = slot.draft_spill_boundary
+        sL = slot.draft_spill_L
+        lo = max(boundary, sb)
+        hio = min(hi, sL)
+        if hio <= lo:
+            return
+        dp = self.draft_full_pool
+        dst = new_locs[lo - boundary : hio - boundary].to(torch.int64)
+        s0, s1 = lo - sb, hio - sb
+        verify = draft_kv_verify_enabled()
+        for l in range(int(dp.layer_num)):
+            k_src = slot.draft_kv_k[l, s0:s1].to(dp.k_buffer[l].device)
+            v_src = slot.draft_kv_v[l, s0:s1].to(dp.v_buffer[l].device)
+            dp.k_buffer[l][dst] = k_src
+            dp.v_buffer[l][dst] = v_src
+            if verify:
+                ok_k = torch.equal(dp.k_buffer[l][dst], k_src)
+                ok_v = torch.equal(dp.v_buffer[l][dst], v_src)
+                assert ok_k and ok_v, (
+                    "kv-session-offload draft-KV bundle S1 self-check FAILED "
+                    f"rid={slot.req.rid} layer={l} k_ok={ok_k} v_ok={ok_v}"
+                )
+        if verify:
+            self._log(
+                "kv-session-offload draft-KV bundle S1 self-check PASS: rid=%s "
+                "positions[%d,%d) (snapshot[%d,%d)) layers=%d slots=%d (rank %d)",
+                slot.req.rid,
+                lo,
+                hio,
+                s0,
+                s1,
+                int(dp.layer_num),
+                int(dst.numel()),
+                self.dcp_rank,
+            )
+
     def _restore_memory_ok(self, req, L: int) -> bool:
         from sglang.srt.mem_cache.common import evict_from_tree_cache
 
@@ -1821,6 +2026,10 @@ class KVSessionOffloadManager:
         self.req_to_token_pool.req_to_token[req.req_pool_idx, boundary:L] = (
             new_locs.to(torch.int32)
         )
+        # DRAFT-KV BUNDLE: write the snapshotted draft KV of the overlapping
+        # pre-spill positions back into these same new_locs (draft shares the
+        # virtual slot space with the target, so new_locs are valid draft slots).
+        self._draft_kv_restore_block(slot, new_locs, boundary, L)
         self._log(
             "kv-session-offload RESTORE(stop): rid=%s L=%d boundary=%d "
             "tail=%d owned_tail=%d region=%d host_base=%d (rank %d) H2D complete",
@@ -1926,6 +2135,9 @@ class KVSessionOffloadManager:
         self.req_to_token_pool.req_to_token[req.req_pool_idx, boundary:hi_pos] = (
             new_locs.to(torch.int32)
         )
+        # DRAFT-KV BUNDLE: restore this block's overlapping pre-spill draft KV
+        # into the same new_locs (positional for [boundary, hi_pos)).
+        self._draft_kv_restore_block(slot, new_locs, boundary, hi_pos)
         bslot.host_row_base += blk_own
         self.backend._sess_slot_reset_head(req.req_pool_idx)
         # Head grew to [0, hi_pos): keep the finish-path free bound current.
@@ -1961,6 +2173,16 @@ class KVSessionOffloadManager:
         # Back on device: this batch (or its reqs inside running_batch) must
         # take the normal decode path again.
         batch.kv_session_spill_tick = False
+        # ON-DEVICE MTP RESUME: under an active server spec algorithm, re-seed
+        # the session's EAGLE/MTP draft state so it rejoins the LIVE spec decode
+        # batch with a valid EagleDraftInput (future_indices) instead of the
+        # spec_algorithm=NONE spill batch's spec_info=None (which trips
+        # EagleDraftInput.merge_batch's future_indices assert). Non-spec restore
+        # is unchanged (byte-identical). Rank-uniform: every DCP rank captured
+        # its own replicated tick hidden and runs the identical seed here.
+        spec_algo = getattr(self.scheduler, "spec_algorithm", None)
+        if spec_algo is not None and not spec_algo.is_none():
+            self._seed_resumed_draft_state(slot, L)
         self._close_slot(req.req_pool_idx, "restored to device")
         self._log(
             "kv-session-offload RESTORE complete: rid=%s L=%d (rank %d) "
@@ -1973,6 +2195,82 @@ class KVSessionOffloadManager:
             return batch
         running_batch.merge_batch(batch)
         return running_batch
+
+    def _seed_resumed_draft_state(self, slot, L: int) -> None:
+        """ON-DEVICE MTP RESUME (Variant A -- no target re-forward, GDN-safe).
+
+        Build a valid one-row EAGLE draft seed for the resumed session and
+        relay it through the overlap FutureMap so the next iteration's
+        ``_resolve_spec_extras`` gathers it by ``future_indices``:
+
+          * ``hidden_states`` = the target hidden state of the LAST host-decoded
+            token, captured from that tick's plain target forward
+            (``slot.last_hidden``). NOT recomputed -> the resident GDN/Mamba
+            recurrent state is never advanced a second time (Variant B's silent
+            corruption is avoided).
+          * ``topk_index`` / ``bonus_tokens`` = the last committed token id.
+            For topk==1 MTP this is the natural step-0 draft input (embed the
+            last token, combine with its hidden state to propose the next).
+          * ``topk_p`` = 1.0.
+
+        The residual MTP draft-KV tail-hole (positions decoded plain on host
+        carry no draft KV) is a v1 QUALITY item, not a correctness one: the
+        target VERIFY always yields the correct token, so acceptance merely
+        recovers over the next few rounds as fresh draft KV accumulates. The
+        cross-algo/bandit warm-keeping primitive (``draft_extend_catchup`` /
+        ``_warmkeep_nextn_after_dflash_round``) is the gap-free follow-up.
+
+        Consume-once / rank-uniformity: this stash + publish is an off-forward
+        -stream FutureMap write (same pattern as PD-decode prebuilt seeding);
+        ``publish`` chains ``publish_ready`` so no in-flight fence is dropped,
+        and every DCP rank runs the identical write on replicated inputs.
+        """
+        from sglang.srt.managers.overlap_utils import RelayPayload
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        req = slot.req
+        batch = slot.batch
+        device = self.scheduler.device
+        rpi = req.req_pool_idx
+        assert slot.last_hidden is not None, (
+            "kv-session-offload MTP resume: no captured tick hidden for "
+            f"rid={req.rid} (should have been gated in _maybe_restore_flow)"
+        )
+        last_tok = int(req.output_ids[-1])
+        hidden = slot.last_hidden  # [1, hidden_dim], already cloned/detached
+        topk_index = torch.tensor([[last_tok]], dtype=torch.int64, device=device)
+        topk_p = torch.ones((1, 1), dtype=torch.float32, device=device)
+        bonus_tokens = torch.tensor([last_tok], dtype=torch.int64, device=device)
+        future_indices = torch.tensor([rpi], dtype=torch.int64, device=device)
+
+        seed = EagleDraftInput(
+            topk_p=topk_p,
+            topk_index=topk_index,
+            hidden_states=hidden,
+            bonus_tokens=bonus_tokens,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
+        fmap = self.scheduler.future_map
+        # Relay the seed extras into the FutureMap buffers at this rpi, then
+        # publish the (unchanged) length L so next iter's resolve_seq_lens_cpu +
+        # _resolve_spec_extras gather a FRESH row (no stale/poisoned buffer).
+        fmap.stash(future_indices, RelayPayload.from_draft_input(seed))
+        fmap.publish(future_indices, batch.seq_lens)
+        # The batch merges via the overlap future_indices branch; carry the seed
+        # object too so an empty-running-batch restore (returned directly) is a
+        # valid standalone spec decode batch next iteration.
+        seed.future_indices = future_indices
+        batch.spec_info = seed
+        slot.last_hidden = None
+        self._log(
+            "kv-session-offload MTP RESUME seed: rid=%s L=%d last_tok=%d "
+            "(rank %d) draft state re-primed from captured tick hidden",
+            req.rid,
+            L,
+            last_tok,
+            self.dcp_rank,
+        )
 
     # -- finish / cleanup ---------------------------------------------------
 

@@ -1934,7 +1934,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # topk stub and the draft cuda-graph's foreach_copy then asserts
             # ([1,1] vs [0,1]). spec_algorithm is NONE on this batch, so
             # run_batch passes no on_publish and publishes the future itself.
-            return self.target_worker.forward_batch_generation(batch)
+            batch_output = self.target_worker.forward_batch_generation(batch)
+            # ON-DEVICE MTP RESUME: stash the LAST token's target hidden state
+            # (requested via capture_hidden_mode=LAST on the spill batch) into
+            # the session's slot. It re-seeds the draft state at restore so the
+            # session rejoins the live spec batch with a valid EagleDraftInput
+            # instead of spec_info=None (the merge-time assert this fixes). CLONE
+            # it -- logits_output.hidden_states is a view into a pooled forward
+            # buffer that the next forward overwrites. No GDN re-advance: this is
+            # the hidden state of the single, correct host-decode forward.
+            lo = getattr(batch_output, "logits_output", None)
+            hs = getattr(lo, "hidden_states", None) if lo is not None else None
+            if hs is not None and len(batch.reqs) == 1:
+                from sglang.srt.managers.kv_session_offload import (
+                    get_kv_session_offload_manager,
+                )
+
+                mgr = get_kv_session_offload_manager()
+                if mgr is not None:
+                    mgr.capture_tick_hidden(batch.reqs[0].req_pool_idx, hs[-1:])
+            return batch_output
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
