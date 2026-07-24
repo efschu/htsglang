@@ -510,10 +510,19 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         dcp_avail_deficit: int = 0,
+        prefill_spill_regions: int = 0,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        # Prefill-Spill (kv-session-offload, PS1-V1a). Number of born-spilled
+        # admissions still allowed THIS iteration (= free host regions; 0 when
+        # the feature is off -> the relaxation below is inert, byte-identical).
+        # Decremented as born-spilled prompts are admitted so we never admit
+        # more born-spilled prompts than there are free host regions to hold
+        # them. Replicated across DCP ranks (see prefill_spill_free_regions) and
+        # decremented identically per rank -> rank-uniform, no collective.
+        self.prefill_spill_regions = int(prefill_spill_regions)
         # RANK-UNIFORM admission under uneven DCP (kv-session-offload): a
         # non-negative correction (local_avail - min_reduce(local_avail))
         # subtracted from every `available_size()`-based admission budget so all
@@ -754,6 +763,45 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
+
+    def _admit_born_spilled(self, req, born_input_tokens: int) -> bool:
+        """Prefill-Spill (kv-session-offload, PS1-V1a): decide whether a prompt
+        that FAILED the lifetime device-budget gate (its input + max_new won't
+        fit VRAM) can instead be ADMITTED born-spilled -- prefilled on device
+        (its input transiently fits) and then rode into the host pool by the
+        EXISTING decode-OOM spill (try_spill), rather than wedged / retracted.
+
+        Relaxes ONLY the lifetime: the current-step guard stays strict -- the
+        prefill INPUT must still transiently fit the (rank-uniform, deficit-
+        pinned) device budget, so the prefill itself cannot OOM. The exclusive
+        suffix then spills at decode time. (Never-materialize-on-device born
+        writes are PS2, only for the deep case where even one chunk won't fit.)
+
+        RANK-UNIFORM (R2-safe): every input is replicated (born_input_tokens
+        from request metadata) or already min-reduced (rem_total_tokens via
+        dcp_avail_deficit; prefill_spill_regions a replicated free-region
+        count), so the verdict is identical on every DCP rank WITHOUT a
+        collective. Over-admission beyond the free host regions is crash-safe:
+        the surplus born-spilled prompt's later try_spill finds no free region,
+        returns False, and the request takes the pre-existing graceful retract
+        path -- no crash. Off (prefill_spill_regions == 0) -> byte-identical."""
+        if self.prefill_spill_regions <= 0:
+            return False
+        # Current-step guard (STRICT): the prefill input must transiently fit
+        # the device. If not, this is the DEEP case (PS2) -> reject, today's
+        # wedge/wait behaviour, no born-spill.
+        if born_input_tokens >= self.rem_total_tokens:
+            return False
+        req.born_spilled = True
+        logger.info(
+            "kv-session-offload prefill-spill: admit rid=%s BORN-SPILLED "
+            "(input=%d fits device budget=%d; full lifetime would wedge) -> "
+            "rides the decode-OOM spill into host.",
+            getattr(req, "rid", "?"),
+            int(born_input_tokens),
+            int(self.rem_total_tokens),
+        )
+        return True
 
     def _update_prefill_budget(
         self,
@@ -1085,6 +1133,11 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
+        # Prefill-Spill (PS1-V1a): the born-spilled current-step demand is the
+        # lifetime demand MINUS the future decode (max_new) that will spill to
+        # host -- i.e. just the prefill input (+ page + mamba gap). Used only if
+        # the lifetime gate below fails and the feature is on.
+        born_input_tokens = total_tokens - max_new
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = cand_extend_input_len - req.host_hit_length
@@ -1092,7 +1145,10 @@ class PrefillAdder:
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
+            # Lifetime doesn't fit VRAM: wedge -- UNLESS Prefill-Spill can admit
+            # it born-spilled (input transiently fits, a host region is free).
+            if not self._admit_born_spilled(req, born_input_tokens):
+                return AddReqResult.NO_TOKEN
 
         if self.is_hybrid_swa:
             swa_needed = self._swa_budget_for_req(
@@ -1114,7 +1170,13 @@ class PrefillAdder:
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
-                return AddReqResult.NO_TOKEN
+                # Prefill-Spill: a prompt already admitted born-spilled at the
+                # pre-lock gate stays admitted as long as its input still fits
+                # the (possibly shrunk) device budget; otherwise wedge as usual.
+                if not (
+                    req.born_spilled and born_input_tokens < self.rem_total_tokens
+                ):
+                    return AddReqResult.NO_TOKEN
 
             if self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(

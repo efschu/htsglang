@@ -3109,8 +3109,15 @@ class Scheduler(
         # so admission stays uniform without adding a branch-local reduce. 0 on
         # the default path (offload manager absent) -> byte-identical.
         dcp_avail_deficit = 0
+        prefill_spill_regions = 0
         if self.kv_session_offload is not None:
             dcp_avail_deficit = self.kv_session_offload.dcp_budget_deficit()
+            # Prefill-Spill (PS1-V1a): replicated free-region count (0 when the
+            # feature is off -> the adder relaxation is inert). No collective
+            # here (rank-uniform by construction, see prefill_spill_free_regions).
+            prefill_spill_regions = (
+                self.kv_session_offload.prefill_spill_free_regions()
+            )
 
         # Prefill policy
         adder = PrefillAdder(
@@ -3130,6 +3137,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             dcp_avail_deficit=dcp_avail_deficit,
+            prefill_spill_regions=prefill_spill_regions,
         )
 
         if self.chunked_req is not None:

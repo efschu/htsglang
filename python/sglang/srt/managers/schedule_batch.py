@@ -901,6 +901,13 @@ class Req(ReqDllmMixin):
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
+        # kv-session-offload Prefill-Spill (born-spilled, PS1-V1a): set at
+        # admission when the prompt's lifetime KV would not fit VRAM but its
+        # prefill input transiently fits. The prompt is admitted (instead of
+        # wedged) and rides the existing decode-OOM spill (try_spill) into the
+        # host pool. Default False -> byte-identical when the feature is off.
+        self.born_spilled = False
+
         # Incremental streamining
         self.send_token_offset: int = 0
         self.send_decode_id_offset: int = 0

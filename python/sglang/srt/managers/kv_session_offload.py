@@ -1491,6 +1491,23 @@ class KVSessionOffloadManager:
         admit against the binding rank. 0 until first computed / single-rank."""
         return int(getattr(self, "_dcp_budget_deficit", 0))
 
+    def prefill_spill_free_regions(self) -> int:
+        """Prefill-Spill (PS1-V1a): number of free host regions available to
+        born-spill a would-be-wedged prompt this iteration. 0 when the feature
+        is off -> the PrefillAdder relaxation is inert (byte-identical).
+
+        RANK-UNIFORM without a collective (R2-safe): host regions are claimed /
+        freed ONLY in rank-uniform spill / restore / finish events, and every
+        region is max_ratio-sized (holds any rank's per-rank shard of a full-
+        context session), so `len(self._free_regions)` is identical on every DCP
+        rank. `region_tokens` and `max_spills` are replicated config. The adder
+        reads this replicated count and decrements it identically per rank as it
+        admits born-spilled prompts, so the born-spilled verdict never diverges
+        -> no branch-local collective, no desync."""
+        if not self.prefill_spill:
+            return 0
+        return len(self._free_regions)
+
     # -- slot bookkeeping -------------------------------------------------
 
     def _slot_of(self, req) -> Optional["SpillSlot"]:
