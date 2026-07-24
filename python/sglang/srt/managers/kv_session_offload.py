@@ -148,6 +148,33 @@ def partial_spill_plan(
     return boundary, want
 
 
+def mtp_resident_tail_fits(tail_tokens: int, resident_cap_slices: int) -> bool:
+    """spec-in-spill-tick, Option (b'): whether a spilled session's DRAFT-KV
+    tail can be kept DEVICE-resident within the
+    ``--kv-session-offload-mtp-resident-slices`` cap.
+
+    Under Option (b') the tiny (1-layer NEXTN / few-layer EAGLE) draft-KV tail
+    is snapshotted into a dedicated device buffer at spill (the large,
+    multi-layer, DCP-sharded TARGET KV still spills to host), so draft() runs
+    on device while spilled. The draft pool is NOT DCP-token-sharded -- every
+    rank holds the FULL token context (M4) -- so ``tail_tokens`` is the FULL
+    tail ``L - boundary`` and this decision is RANK-UNIFORM by construction
+    (every rank sees the same replicated L / boundary -> same verdict, no
+    collective, no desync).
+
+    ``resident_cap_slices == 0`` disables the cap (any tail is kept resident).
+    A tail that EXCEEDS a positive cap does NOT OOM: the session falls back
+    GRACEFULLY to the plain (spec-off) host tick for as long as it overflows
+    (the caller keeps ``spec_algorithm=NONE`` for it and logs the fallback).
+    The cap is a per-session, per-rank DEVICE-buffer ceiling the operator sets
+    to bound the resident draft-KV growth of deep offloads; it is a QoS knob,
+    not a correctness guard.
+    """
+    if int(resident_cap_slices) <= 0:
+        return True
+    return int(tail_tokens) <= int(resident_cap_slices)
+
+
 def new_token_residue(position: int, split_factor: int) -> int:
     """Owner residue assigned to a token generated WHILE spilled."""
     return int(position) % max(1, int(split_factor))

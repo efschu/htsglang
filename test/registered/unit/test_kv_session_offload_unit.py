@@ -16,6 +16,7 @@ from sglang.srt.managers.kv_session_offload import (
     chunk_ceil,
     compact_weighted,
     make_sentinels,
+    mtp_resident_tail_fits,
     new_token_residue,
     num_blocks_rank_uniform,
     owned_counts_even,
@@ -439,6 +440,31 @@ def test_partial_spill_plan_caps_at_exclusive_suffix():
     for need in (1, 130, 777, 5000):
         b, sc = partial_spill_plan(L=900, protected=64, need=need, chunk=128)
         assert 64 <= b <= 900 and sc == 900 - b
+
+
+def test_mtp_resident_tail_fits_cap_semantics():
+    # cap == 0 disables the cap: any tail (incl. deep offloads) stays resident.
+    assert mtp_resident_tail_fits(tail_tokens=0, resident_cap_slices=0)
+    assert mtp_resident_tail_fits(tail_tokens=1_000_000, resident_cap_slices=0)
+    # negative cap is treated as disabled (defensive; validator forbids <0).
+    assert mtp_resident_tail_fits(tail_tokens=999, resident_cap_slices=-1)
+    # positive cap: fits at/below, overflows strictly above (-> plain-tick
+    # fallback, never OOM). Boundary is inclusive.
+    assert mtp_resident_tail_fits(tail_tokens=4096, resident_cap_slices=4096)
+    assert mtp_resident_tail_fits(tail_tokens=4095, resident_cap_slices=4096)
+    assert not mtp_resident_tail_fits(tail_tokens=4097, resident_cap_slices=4096)
+    # empty tail always fits.
+    assert mtp_resident_tail_fits(tail_tokens=0, resident_cap_slices=1)
+
+
+def test_mtp_resident_tail_fits_is_rank_uniform():
+    # The draft pool is not DCP-token-sharded: every rank passes the SAME full
+    # tail L - boundary and the SAME cap, so all ranks return the identical
+    # verdict (no per-rank divergence -> no NCCL desync at the spec/plain fork).
+    for L, boundary, cap in [(2267, 2215, 32), (30000, 0, 8192), (5000, 4000, 900)]:
+        tail = L - boundary
+        verdicts = {mtp_resident_tail_fits(tail, cap) for _rank in range(3)}
+        assert len(verdicts) == 1
 
 
 def test_partial_sentinel_segment_roundtrip():
