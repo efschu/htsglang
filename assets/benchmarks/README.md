@@ -15,9 +15,6 @@ DFLASH's acceptance lead, so cross-algo ≈ pure NEXTN on code; only static
 DFLASH wins on code (but loses on prose and above 4096); adaptive-k beats
 fixed k=3.
 
-## `spill_tokens_over_time.svg`
-KV-session-offload (spill): cumulative generated tokens vs wall-clock for a
-co-resident run. A session whose KV is spilled to host RAM keeps decoding
-in place over host-streamed KV at the slower floor slope, while the
-device-resident sessions run at full speed — graceful degradation instead
-of preemption.
+_A spill tokens-per-second-over-time chart (per-session + aggregate, with
+spill/wave-back transitions annotated) is produced by the dedicated
+spill-lifecycle benchmark and will be added here once that run lands._
