@@ -509,10 +509,18 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        dcp_avail_deficit: int = 0,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        # RANK-UNIFORM admission under uneven DCP (kv-session-offload): a
+        # non-negative correction (local_avail - min_reduce(local_avail))
+        # subtracted from every `available_size()`-based admission budget so all
+        # DCP ranks admit against the binding (least-slack) rank's pool and take
+        # the identical decision (no divergent prefill batch -> no forward
+        # desync). 0 on the default path -> byte-identical.
+        self.dcp_avail_deficit = dcp_avail_deficit
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
@@ -637,7 +645,13 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
             )
-        return available_and_evictable - self.rem_total_token_offset
+        # dcp_avail_deficit (0 off the uneven-DCP kv-session-offload path) pins
+        # the budget to the binding rank's available_size -> rank-uniform.
+        return (
+            available_and_evictable
+            - self.rem_total_token_offset
+            - self.dcp_avail_deficit
+        )
 
     @property
     def rem_swa_tokens(self):
@@ -670,7 +684,13 @@ class PrefillAdder:
                 + self.tree_cache.evictable_size()
             )
 
-        return available_and_evictable - self.cur_rem_token_offset
+        # dcp_avail_deficit (0 off the uneven-DCP kv-session-offload path) pins
+        # the budget to the binding rank's available_size -> rank-uniform.
+        return (
+            available_and_evictable
+            - self.cur_rem_token_offset
+            - self.dcp_avail_deficit
+        )
 
     def _swa_budget_for_req(
         self, extend_input_len: int, swa_host_hit_length: int = 0

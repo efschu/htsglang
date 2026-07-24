@@ -1040,6 +1040,11 @@ class KVSessionOffloadManager:
 
     def __init__(self, scheduler):
         self.scheduler = scheduler
+        # Rank-uniform admission/decode budget for the current iteration
+        # (recomputed once per iteration in update_dcp_admission_state). None ->
+        # not yet computed; dcp_min_avail then falls back to the live local pool.
+        self._dcp_min_avail = None
+        self._dcp_budget_deficit = 0
         sa = scheduler.server_args
         self.block_size = int(sa.kv_session_offload_block_size)
         self.tick_interval = max(1, int(sa.kv_session_offload_tick_interval))
@@ -1401,6 +1406,77 @@ class KVSessionOffloadManager:
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
         return int(t.item())
 
+    def update_dcp_admission_state(self) -> None:
+        """Compute the RANK-UNIFORM admission/decode budget for THIS iteration
+        with a SINGLE collective, at a guaranteed-uniform pre-branch call site.
+
+        Root problem (uneven DCP): the per-rank KV allocator available_size AND
+        the tree-cache evictable_size both differ per rank (weighted ownership
+        [18,23,23]). Every scheduling decision that reads them -- prefill
+        admission (rem_total_tokens / cur_rem_tokens / the ignore-eos sort check)
+        and the decode-spill trigger (check_decode_mem) -- can therefore flip on
+        the binding (least-slack) rank while the slack ranks still fit. A
+        divergent decision makes rank 0 take the prefill branch while ranks 1/2
+        take the decode branch of get_next_batch_to_run; those branches carry
+        DIFFERENT collectives, so the ranks desync (NCCL/gloo hang, observed in
+        recv_requests one iteration later). Normally this stays latent because
+        the global cap keeps every rank in slack; a spec-in-tick flat scratch
+        shrink (disproportionate to ownership) pushes ranks 1/2 to saturation
+        while rank 0 has slack -> deterministic divergence.
+
+        Fix: MIN-reduce the pool-derived budget ONCE per iteration here (called
+        unconditionally by every rank at the top of get_next_batch_to_run when
+        the offload manager is active, so the collective count is ALWAYS
+        rank-uniform regardless of the later prefill/decode branch), and have
+        every downstream decision read the reduced value instead of its local
+        one. Two quantities are packed into one MIN all-reduce:
+          * min available_size  -> the decode-spill trigger + try_spill `need`
+            (check_decode_mem compares available vs the replicated token demand).
+          * min (available + evictable) -> the prefill admission budget
+            (rem_total_tokens / cur_rem_tokens add the evictable radix).
+        The per-rank surplus over the reduced value is stored as a non-negative
+        deficit the PrefillAdder subtracts. Conservative (binding-rank-safe): the
+        spill an admission forgoes still fires later at DECODE time (KV growth)
+        via the uniform trigger, so this is NOT a "never spills" regression.
+
+        No collective / byte-identical when TP world size is 1. Valid for the
+        whole iteration: between here and the admission / decode-mem checks the
+        scheduler only builds batches from offsets (ignore-eos) and defers real
+        allocation to the forward, so the reduced snapshot still holds."""
+        alloc = self.scheduler.token_to_kv_pool_allocator
+        tree = self.scheduler.tree_cache
+        local_avail = int(alloc.available_size())
+        fe = getattr(tree, "full_evictable_size", None)
+        local_evict = int(fe() if fe is not None else tree.evictable_size())
+        grp = getattr(self.scheduler, "tp_cpu_group", None)
+        if grp is None or torch.distributed.get_world_size(grp) <= 1:
+            self._dcp_min_avail = local_avail
+            self._dcp_budget_deficit = 0
+            return
+        t = torch.tensor(
+            [local_avail, local_avail + local_evict], dtype=torch.int64
+        )
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
+        self._dcp_min_avail = int(t[0].item())
+        # >= 0: the local budget can only exceed the group minimum.
+        self._dcp_budget_deficit = (local_avail + local_evict) - int(t[1].item())
+
+    def dcp_min_avail(self) -> int:
+        """Rank-uniform available_size for THIS iteration (min-reduced in
+        update_dcp_admission_state). Used by the decode-spill trigger and
+        try_spill so every DCP rank agrees. Falls back to the live local value
+        if the per-iteration state was never computed (single-rank / flag-off)."""
+        v = getattr(self, "_dcp_min_avail", None)
+        if v is None:
+            return int(self.allocator.available_size())
+        return int(v)
+
+    def dcp_budget_deficit(self) -> int:
+        """Non-negative per-rank surplus (available + evictable) over the group
+        minimum, subtracted from the prefill admission budget so all DCP ranks
+        admit against the binding rank. 0 until first computed / single-rank."""
+        return int(getattr(self, "_dcp_budget_deficit", 0))
+
     # -- slot bookkeeping -------------------------------------------------
 
     def _slot_of(self, req) -> Optional["SpillSlot"]:
@@ -1520,10 +1596,17 @@ class KVSessionOffloadManager:
         # select_spill_victim). Only req-exclusive slots count as freed
         # (the shared radix prefix stays tree-owned, merely evictable).
         if need is None:
+            # RANK-UNIFORM shortfall under uneven DCP: use the iteration's
+            # min-reduced available (dcp_min_avail, computed once at the
+            # unconditional pre-branch site) so the freed-token target `need`
+            # (-> victim selection + block-aligned spill boundary) is IDENTICAL
+            # on every rank -- no extra collective here (the reduce already
+            # happened). `new_tokens_required_next_decode` is replicated batch
+            # metadata -> uniform. Single-rank: dcp_min_avail == local available
+            # -> byte-identical to the old local computation.
             need = max(
                 0,
-                batch.new_tokens_required_next_decode()
-                - self.allocator.available_size(),
+                batch.new_tokens_required_next_decode() - self.dcp_min_avail(),
             )
         need = max(0, int(need))
         sizes = [
