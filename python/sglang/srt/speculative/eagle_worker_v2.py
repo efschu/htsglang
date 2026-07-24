@@ -1915,6 +1915,50 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def draft_worker(self):
         return self._draft_worker
 
+    def backfill_draft_extend_for_resume(
+        self,
+        batch: ScheduleBatch,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ):
+        """ON-DEVICE MTP RESUME (kv-session-offload Option B): draft-ONLY extend
+        over a resumed session's host-grown tail [L_spill, L) to backfill the
+        draft KV those plain host-tick positions never got (the drafter did not
+        run there) AND to produce the real resume seed.
+
+        The TARGET is NEVER re-forwarded: its KV and resident GDN/Mamba state
+        advanced exactly once, on the host tick. Only the single-layer draft
+        runs, consuming the per-tick target hidden states captured on the host.
+        Reuses the prefill draft-extend primitive (``_draft_extend_for_prefill``):
+        same EAGLE input rotation, same draft-KV write into the session's
+        (restored) slots via ``out_cache_loc``, same seed assembly. The draft
+        attends its own prefix draft KV [0, L_spill), which is device-resident
+        again by restore time (head + the draft-KV bundle, Stage 1).
+
+        Generic: whatever NEXTN/EAGLE-family drafter the model configured (not
+        NEXTN-hardcoded). DFLASH is excluded from spill sessions (short-ctx
+        regime) -- the kv-session-offload caller does not arm this path for it.
+        Rank-uniform: a collective draft forward, run identically on every DCP
+        rank for the same session in the same iteration; the target hidden
+        states are replicated across TP (each decoder layer ends in a
+        RowParallel all-reduce) so every rank's inputs are byte-equal. Returns
+        the seed ``EagleDraftInput``."""
+        if self._spec_solo_active and not self._spec_solo_is_host:
+            # Shadow rank: the draft runs only on the solo host (draft KV +
+            # hiddens are local there); mirror the prefill shadow stub.
+            return self._solo_stub_draft_input(batch, next_token_ids)
+        with (
+            self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("kvso_resume_backfill"),
+        ):
+            return self.draft_worker._draft_extend_for_prefill(
+                batch, target_hidden_states, next_token_ids
+            )
+
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
