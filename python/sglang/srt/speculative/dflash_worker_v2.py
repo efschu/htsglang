@@ -65,6 +65,49 @@ def _get_fused_kv_materialize_helper():
     return _FusedKVMaterializeHelper
 
 
+def _resolve_lm_head_compute(lm_head, context: str):
+    """Pick how DFLASH draft sampling must turn hidden states into logits.
+
+    Returns ``(dense_weight, quant_method)`` with exactly one of the two set:
+
+    * a dense float ``.weight`` -> the direct ``hidden @ weight.T`` this worker
+      has always used. EVERY head that worked before lands here (dense HF /
+      FP8-checkpoint targets keep an unquantized bf16 lm_head), so that path
+      stays byte-identical.
+    * no dense ``.weight`` -> a quantized-resident head, i.e. a GGUF ``lm_head``
+      the loader keeps packed as ``qweight`` + ``GGUFEmbeddingMethod``
+      (``layers/quantization/gguf.py``: a VocabParallelEmbedding only gets a
+      dense weight when it is listed in ``modules_to_not_convert``). Then the
+      logits are computed through the head's OWN ``quant_method.apply``, gated
+      by the very predicate ``LogitsProcessor._compute_lm_head`` uses
+      (``should_apply_lm_head_quant_method``). Draft sampling therefore runs
+      the exact kernel (``fused_mul_mat_gguf``) the target verify runs, so the
+      draft argmax is consistent with the logits the verify scores. This
+      mirrors how the NEXTN rung reuses the packed lm_head MODULE
+      (``models/qwen3_5_mtp.py: set_embed_and_head_modules``) and how
+      llama.cpp's DFlash builds its logits over the quantized output tensor
+      (``build_lora_mm(output, cur)``, PR ggml-org/llama.cpp#22105). No dense
+      copy of the head is materialized on purpose: that would change the base
+      target's own verify numerics and cost ~1-1.5 GB of VRAM.
+
+    Raises when the head offers neither.
+    """
+    from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+
+    weight = getattr(lm_head, "weight", None)
+    if weight is not None and torch.is_floating_point(weight):
+        return weight, None
+    quant_method = getattr(lm_head, "quant_method", None)
+    if should_apply_lm_head_quant_method(lm_head, quant_method):
+        return None, quant_method
+    raise NotImplementedError(
+        f"{context} requires the target lm_head to expose either a dense "
+        "floating-point `.weight` or a quantized module whose `quant_method` "
+        "computes the logits (as a GGUF-resident head does); got "
+        f"{type(lm_head).__name__} with neither."
+    )
+
+
 class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
@@ -417,24 +460,35 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         target_model = self._target_worker.model_runner.model
         lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
+        if lm_head is None:
             raise NotImplementedError(
                 "--speculative-draft-placement solo with DFLASH requires the "
-                "target to expose a dense lm_head.weight (every rank samples "
-                "the draft block against its own vocab shard of it)."
+                "target to expose an lm_head (every rank samples the draft "
+                "block against its own vocab shard of it)."
             )
-        weight = lm_head.weight
-        if not torch.is_floating_point(weight):
-            raise NotImplementedError(
-                "--speculative-draft-placement solo with DFLASH requires an "
-                "unquantized target lm_head.weight; got dtype "
-                f"{weight.dtype}."
+        # Rank-uniform by construction: the branch below is decided by the
+        # target head's MODULE structure, which every rank loads identically.
+        weight, quant_method = _resolve_lm_head_compute(
+            lm_head, "--speculative-draft-placement solo with DFLASH"
+        )
+        if weight is not None:
+            # Dense lm_head: the hidden dim is the weight's input dim and the
+            # broadcast dtype is the weight dtype the greedy matmul casts to
+            # anyway, so the payload needs no extra cast on the receiving side.
+            self._solo_hidden_dim = int(weight.shape[1])
+            self._solo_hs_dtype = weight.dtype
+        else:
+            # Quantized-resident (GGUF) lm_head: no dense weight to read the
+            # geometry off, so take it from the module itself. The broadcast
+            # dtype is the head's compute dtype (= the model dtype the target
+            # verify feeds into the same kernel), so staging the hidden states
+            # into the buffer is a no-op cast and the per-rank
+            # `quant_method.apply` below sees exactly what verify sees.
+            self._solo_hidden_dim = int(lm_head.embedding_dim)
+            self._solo_hs_dtype = (
+                getattr(quant_method, "params_dtype", None)
+                or self._target_worker.model_runner.dtype
             )
-        # Rank-uniform geometry: the hidden dim is the lm_head's input dim and
-        # the broadcast dtype is the weight dtype the greedy matmul casts to
-        # anyway, so the payload needs no extra cast on the receiving side.
-        self._solo_hidden_dim = int(weight.shape[1])
-        self._solo_hs_dtype = weight.dtype
         if not self._spec_solo_is_host:
             # Shadow: expose the loud-AttributeError / None surface on the meta
             # draft runner. No recv buffers to drop — nothing was gathered.
@@ -763,8 +817,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _eager("block_size<=1")
         target_model = self._target_worker.model_runner.model
         lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
+        if lm_head is None:
             return _eager("no target lm_head")
+        if not hasattr(lm_head, "weight"):
+            # Quantized-resident head (GGUF: packed qweight, no dense weight).
+            # It is sampled through its quant kernel, which allocates a dequant
+            # workspace and cannot be folded into the static graph matmul.
+            return _eager("quantized-resident lm_head")
         if not torch.is_floating_point(lm_head.weight):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
@@ -1113,8 +1172,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         if hidden_states.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
 
-        weight = lm_head.weight  # [local_vocab_padded, hidden]
-        weight_dtype = weight.dtype
+        # Head dispatch: dense `.weight` -> the matmul path, unchanged;
+        # quantized-resident (GGUF) head -> the head's own quant kernel, i.e.
+        # the same one the target verify uses. See _resolve_lm_head_compute.
+        # The per-rank argmax + cross-rank greedy reduction below is orthogonal
+        # to that choice and is shared by both branches.
+        # weight: [local_vocab_padded, hidden]
+        weight, quant_method = _resolve_lm_head_compute(
+            lm_head, "DFLASH greedy draft sampling"
+        )
+        _dense_head = weight is not None
+        if _dense_head:
+            weight_dtype = weight.dtype
+        else:
+            # Compute dtype of the packed head (= the model dtype); the cast
+            # below is then a no-op and the kernel input matches verify's.
+            weight_dtype = (
+                getattr(quant_method, "params_dtype", None) or hidden_states.dtype
+            )
         num_tokens = int(hidden_states.shape[0])
         out_tokens = torch.empty(
             (num_tokens,), dtype=torch.long, device=hidden_states.device
@@ -1127,7 +1202,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
                 hs = _cast_hs(hidden_states[start:end])
-                logits = torch.matmul(hs, weight.T)
+                if _dense_head:
+                    logits = torch.matmul(hs, weight.T)
+                else:
+                    logits = quant_method.apply(lm_head, hs)
                 out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
             return out_tokens
 
@@ -1143,6 +1221,52 @@ class DFlashWorkerV2(BaseSpecWorker):
         num_added = int(shard.num_added_elements)
         org_vocab_start = int(shard.org_vocab_start_index)
         added_vocab_start = int(shard.added_vocab_start_index)
+
+        def _shard_base_added_logits(hs: torch.Tensor):
+            """Per-chunk (base_logits, added_logits) over this rank's shard.
+
+            Dense head: two sliced matmuls (weight rows -> base / added), byte
+            identical to the original path. Quantized (GGUF) head: ONE packed
+            kernel apply produces the full local-shard logits
+            ``[chunk, local_vocab_padded]``; the base/added split becomes a
+            COLUMN slice of that, because a packed ``qweight`` cannot be
+            row-sliced (its rows are quant blocks along the HIDDEN dim). The
+            column layout is the same as the dense weight's row layout: the
+            GGUF vocab loader materializes exactly
+            ``num_embeddings_per_partition`` rows and zero-fills the padding
+            ones (``vocab_parallel_embedding.py`` weight_loader), and zero
+            bytes dequantize to exact 0.0 — so excluding padding via the
+            ``:num_org`` / ``num_org_padded:`` bounds matches the dense path's
+            row-slice exclusion. Argmax indices therefore line up with the same
+            global-token conversion below.
+            """
+            if _dense_head:
+                base = torch.matmul(hs, weight[:num_org].T) if num_org > 0 else None
+                added = None
+                if num_added > 0:
+                    added = torch.matmul(
+                        hs, weight[num_org_padded : num_org_padded + num_added].T
+                    )
+                return base, added
+            if num_org == 0 and num_added == 0:
+                return None, None
+            local = quant_method.apply(lm_head, hs)  # [chunk, local_vocab_padded]
+            need = num_org_padded + num_added if num_added > 0 else num_org
+            if int(local.shape[1]) < need:
+                # Fail loudly instead of silently sampling the wrong columns.
+                raise RuntimeError(
+                    "DFLASH greedy draft sampling: quantized lm_head produced "
+                    f"{int(local.shape[1])} local vocab columns but the shard "
+                    f"layout needs {need} (num_org={num_org}, "
+                    f"num_org_padded={num_org_padded}, num_added={num_added})."
+                )
+            base = local[:, :num_org] if num_org > 0 else None
+            added = (
+                local[:, num_org_padded : num_org_padded + num_added]
+                if num_added > 0
+                else None
+            )
+            return base, added
 
         def _ensure_local_reduce_buffers(
             chunk_len: int,
@@ -1182,7 +1306,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 end = min(num_tokens, start + fast_chunk_size)
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
-                    base_logits = torch.matmul(hs, weight[:num_org].T)
+                    base_logits, _ = _shard_base_added_logits(hs)
                     local_max, local_arg = _ensure_local_reduce_buffers(
                         end - start, base_logits.dtype, hs.device
                     )
@@ -1198,9 +1322,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             hs = _cast_hs(hidden_states[start:end])
             chunk_len = int(hs.shape[0])
 
+            # Base + added shard logits (dense matmul or quantized apply).
+            base_logits, added_logits = _shard_base_added_logits(hs)
+
             # Base vocab logits.
             if num_org > 0:
-                base_logits = torch.matmul(hs, weight[:num_org].T)
                 local_max, local_arg = _ensure_local_reduce_buffers(
                     chunk_len, base_logits.dtype, hs.device
                 )
@@ -1218,11 +1344,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # Added vocab logits (e.g., LoRA-added embeddings), if present.
             if num_added > 0:
-                added_slice_start = num_org_padded
-                added_slice_end = num_org_padded + num_added
-                added_logits = torch.matmul(
-                    hs, weight[added_slice_start:added_slice_end].T
-                )
                 added_max, added_arg = torch.max(added_logits, dim=-1)
                 use_added = added_max > local_max
                 local_max = torch.where(use_added, added_max, local_max)
@@ -1951,10 +2072,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
         lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
+        if lm_head is None:
             raise RuntimeError(
-                "DFLASH requires the target model to expose `lm_head` with `weight`."
+                "DFLASH requires the target model to expose an `lm_head`."
             )
+        # Do NOT demand a dense `.weight` here: a GGUF target keeps the head
+        # packed (qweight + GGUFEmbeddingMethod) and is sampled through its own
+        # quant kernel. _resolve_lm_head_compute (called by the sampler below)
+        # is the single place that decides — and rejects a head that offers
+        # neither route.
 
         block_size = int(self.block_size)
         self._audit_mark("t0")  # DFLASH AUDIT (env-gated)
