@@ -113,6 +113,14 @@ def _bare_worker():
     w._switch_count = 0
     w._forced_algo = SpeculativeAlgorithm.EAGLE
     w._secondary_algo = SpeculativeAlgorithm.DFLASH
+    # #156-4 off: the lazy-capture controller and the retirement latch are
+    # None/False, i.e. the schedule path below is the untouched old one.
+    # (__getattr__ delegates unknown attributes to the primary sub-worker, so
+    # these MUST be present on any hand-built shell, exactly as __init__ sets
+    # them before anything else.)
+    w._lazy = None
+    w._lazy_warmkeep = True
+    w._dflash_retired = False
     return w
 
 

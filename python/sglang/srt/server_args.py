@@ -2459,6 +2459,56 @@ class ServerArgs:
             "above.",
         ),
     ] = None
+    speculative_cross_algorithm_lazy_capture: A[
+        bool,
+        Arg(
+            help="Lazy single capture for --speculative-cross-algorithm-force "
+            "auto. Default OFF -> the switching worker keeps BOTH target "
+            "hidden-state captures (DFLASH aux concat + the MTP final hidden) "
+            "and the per-round warm-keep of the idle rung alive on every "
+            "round, purely so a switch could happen at any moment -- a "
+            "standing ~13-15% tax (measured: pure DFLASH 138 tok/s vs "
+            "cross-algo-with-DFLASH 116-120 on code below ctx 4096). ON: the "
+            "steady state runs ONLY the active rung's capture and no "
+            "warm-keep; both captures (and, because the capture setting is "
+            "baked into every captured graph, an EAGER target verify) are "
+            "entered only for a short probe window -- a few warm-up rounds "
+            "that re-prime the incoming rung's draft KV, then a measured "
+            "window. Probes are triggered by NEXTN's own accept-length EMA "
+            "(high = structured content = a DFLASH probe is plausible; low = "
+            "prose = DFLASH does not win there), not by a fixed cadence. "
+            "Tunables: SGLANG_CROSS_LAZY_* (WARMUP_ROUNDS, "
+            "PROBE_WINDOW_ROUNDS, PROBE_INTERVAL_ROUNDS, MIN_DWELL_ROUNDS, "
+            "SIGNAL_HIGH_FRAC, SIGNAL_LOW_FRAC, ...).",
+        ),
+    ] = False
+    speculative_cross_algorithm_retire_ctx: A[
+        str,
+        Arg(
+            help="Measured, MONOTONE retirement of the DFLASH rung under "
+            "--speculative-cross-algorithm-force auto|policy. Context only "
+            "ever grows within a session, so a DFLASH acceptance collapse "
+            "that is CONTEXT-driven can never heal: past it the rung is "
+            "retired permanently -- never selected, never probed, aux "
+            "capture and warm-keep dropped (zero dual-capture tax in the "
+            "long-context tail). Low acceptance at LOW context is read as a "
+            "CONTENT effect instead (DFLASH is weak on prose at every "
+            "length) and does NOT retire, so a prose passage cannot kill "
+            "DFLASH for the code that follows. 'off' (default): no "
+            "retirement -- exactly today's behavior. An integer sets the "
+            "collapse context in tokens. 'auto': factor x the DFLASH "
+            "drafter's sliding window, factor via "
+            "SGLANG_CROSS_RETIRE_CTX_FACTOR -- which has NO default on "
+            "purpose, because the collapse point is not measured yet (the "
+            "crossover suite only reached ctx 6000, where DFLASH was still "
+            "ahead); 'auto' without that factor stays disabled and logs why. "
+            "Band and collapse criterion via SGLANG_CROSS_RETIRE_BAND_FRAC "
+            "(default 0.8 of the collapse ctx: below it, low acceptance "
+            "counts as content) and SGLANG_CROSS_RETIRE_ACCEPT_RATIO "
+            "(default 1.0: inside the band, retire once the DFLASH accept "
+            "EMA drops below this multiple of the NEXTN accept EMA).",
+        ),
+    ] = "off"
     speculative_adaptive_graph_memory: A[
         str,
         Arg(

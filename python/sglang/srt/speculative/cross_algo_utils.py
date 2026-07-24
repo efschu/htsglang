@@ -30,6 +30,7 @@ Stage 3 (per-batch switching) only changes who stamps
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import logging
 import os
@@ -581,6 +582,79 @@ def policy_select(
     return rung, max_ctx, fell_back
 
 
+# ---------------------------------------------------------------------------
+# #156-4: DFLASH ctx retirement + lazy single capture (see cross_algo_lazy).
+#
+# Both are resolved at ARGUMENT time and stashed, exactly like the ctx gate:
+# the resolution reads env vars and the drafter config in the launcher
+# process, and every scheduler process receives the frozen result through the
+# pickled shapes stash -- so no rank can ever derive a different policy.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_retire_stash(server_args, dflash_draft_path: str) -> Dict[str, Any]:
+    from sglang.srt.speculative.cross_algo_lazy import resolve_retire_policy
+
+    raw = getattr(server_args, "speculative_cross_algorithm_retire_ctx", "off")
+    _, sliding, err = _read_drafter_ctx_fields(dflash_draft_path)
+    if err is not None:
+        sliding = None
+    try:
+        policy = resolve_retire_policy(raw, sliding)
+    except ValueError as e:
+        _fail(str(e))
+    if policy.enabled:
+        logger.info(
+            "Cross-algo DFLASH retirement: collapse ctx %d tokens (%s); "
+            "content band below %d (low acceptance there is content, not ctx "
+            "collapse); collapse criterion dflash_accept < %.2f * "
+            "nextn_accept.",
+            policy.collapse_ctx,
+            policy.source,
+            policy.band_low,
+            policy.accept_ratio,
+        )
+    else:
+        # debug, not info: the default is OFF, and flag-OFF must not even
+        # change the boot log.
+        logger.debug("Cross-algo DFLASH retirement: disabled (%s).", policy.source)
+    return policy.to_stash()
+
+
+def _resolve_lazy_stash(server_args, force: str) -> Optional[Dict[str, Any]]:
+    """None == lazy capture off == today's code path, byte for byte."""
+    from sglang.srt.speculative.cross_algo_lazy import LazyCaptureConfig
+
+    if not getattr(
+        server_args, "speculative_cross_algorithm_lazy_capture", False
+    ):
+        return None
+    if force != "auto":
+        _fail(
+            "--speculative-cross-algorithm-lazy-capture requires "
+            "--speculative-cross-algorithm-force auto (it owns the family "
+            "decision, the probe windows and the capture mode together); got "
+            f"force={force!r}."
+        )
+    # Seed the round-count knobs from the bandit config so a user who tuned
+    # SGLANG_CROSS_BANDIT_* does not have to re-tune a parallel vocabulary;
+    # SGLANG_CROSS_LAZY_* wins where both are set.
+    from sglang.srt.speculative.cross_algo_bandit import CrossBanditConfig
+
+    bandit = CrossBanditConfig.from_env()
+    try:
+        cfg = LazyCaptureConfig.from_env(
+            probe_window_rounds=bandit.probe_window_rounds,
+            probe_interval_rounds=bandit.probe_interval_rounds,
+            min_dwell_rounds=bandit.min_dwell_rounds,
+            decide_interval_rounds=bandit.decide_interval_rounds,
+        )
+    except ValueError as e:
+        _fail(str(e))
+    logger.info("Cross-algo lazy single capture: ON (%s).", cfg)
+    return {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)}
+
+
 def get_cross_shapes(server_args) -> Dict[str, Dict[str, Any]]:
     shapes = getattr(server_args, CROSS_SHAPES_ATTR, None)
     if shapes is None:
@@ -837,6 +911,31 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
             ),
         )
 
+    # #156-4 flags are only meaningful for the rung-set modes (auto/policy);
+    # fail fast instead of silently ignoring them.
+    retire_raw = getattr(
+        server_args, "speculative_cross_algorithm_retire_ctx", "off"
+    )
+    if (
+        retire_raw is not None
+        and str(retire_raw).strip().lower() != "off"
+        and force not in ("auto", "policy")
+    ):
+        _fail(
+            "--speculative-cross-algorithm-retire-ctx needs "
+            "--speculative-cross-algorithm-force auto or policy (the DFLASH "
+            f"rung must be a runtime choice to be retired); got force={force!r}."
+        )
+    if (
+        getattr(server_args, "speculative_cross_algorithm_lazy_capture", False)
+        and force != "auto"
+    ):
+        _fail(
+            "--speculative-cross-algorithm-lazy-capture requires "
+            "--speculative-cross-algorithm-force auto; got force="
+            f"{force!r}."
+        )
+
     drafter_policy_raw = getattr(server_args, "speculative_drafter_policy", None)
     if drafter_policy_raw is not None and force != "policy":
         _fail(
@@ -945,6 +1044,14 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
                 )
             else:
                 logger.info("Cross-algo ctx gate: disabled (%s).", gate["source"])
+            # DFLASH ctx-collapse retirement (#156-4 part 1) and lazy
+            # single capture (#156-4 parts 2+3). Both resolved here, at
+            # argument time, so they travel to every scheduler process
+            # inside the pickled stash -- rank-uniform by construction.
+            stash["retire"] = _resolve_retire_stash(
+                server_args, dflash_draft_path
+            )
+            stash["lazy_capture"] = _resolve_lazy_stash(server_args, force)
             if force == "policy":
                 stash["policy_table"] = policy_table
                 logger.info(
