@@ -382,6 +382,39 @@ class GroupCoordinator:
                 qr_rocm_arch_available,
             )
 
+        # HTCCL (task #117): vendor-neutral host-staged collectives, for TP
+        # groups that span GPUs without a common device collective library
+        # (NCCL and RCCL cannot form a joint communicator). Constructed
+        # BEFORE pynccl and consulted FIRST in every dispatch, so that when
+        # the flag is on no collective reaches NCCL.
+        #
+        # Flag OFF (the default) leaves htccl_comm as None and every dispatch
+        # seam falls through a single `is not None` check -- behavior is
+        # byte-identical to stock sglang.
+        #
+        # It attaches to self.cpu_group (gloo), which sglang already builds
+        # for every group, so this adds no process group and no new
+        # collective beyond HTCCL's own startup calibration.
+        self.htccl_comm: Optional[Any] = None
+        if envs.SGLANG_HTCCL.get() and self.world_size > 1:
+            from sglang.srt.distributed.device_communicators.htccl import (
+                HTCCLCommunicator,
+            )
+
+            self.htccl_comm = HTCCLCommunicator(
+                cpu_group=self.cpu_group,
+                device=self.device,
+            )
+            logger.info(
+                "HTCCL enabled for group '%s' (transport=%s): TP collectives "
+                "run over the vendor-neutral host-staged path instead of "
+                "NCCL. Every SGLANG_HTCCL* env must be identical on all "
+                "ranks; the CPU transports (shm/gloo) additionally require "
+                "--disable-cuda-graph.",
+                self.unique_name,
+                envs.SGLANG_HTCCL_TRANSPORT.get(),
+            )
+
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
         if use_pynccl and self.world_size > 1:
             self.pynccl_comm = PyNcclCommunicator(
@@ -602,6 +635,14 @@ class GroupCoordinator:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
 
+        # HTCCL must return BEFORE the Dynamo custom-op machinery below
+        # (inplace_all_reduce / outplace_all_reduce). Those ops exist to keep
+        # the NCCL call opaque to torch.compile; letting HTCCL be decomposed
+        # through them would split the host-staging schedule across graph
+        # segments. Out-of-place, matching the outplace contract.
+        if self.htccl_comm is not None:
+            return self.htccl_comm.all_reduce(input_)
+
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
             return self.hpu_communicator.all_reduce(input_)
 
@@ -794,6 +835,12 @@ class GroupCoordinator:
         assert (
             -input_.dim() <= dim < input_.dim()
         ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+
+        # HTCCL handles the dim/movedim bookkeeping itself and must not go
+        # through the symmetric-memory allocator below (which is a NCCL/
+        # pynccl mechanism).
+        if self.htccl_comm is not None:
+            return self.htccl_comm.reduce_scatter(input_, dim)
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -1067,6 +1114,12 @@ class GroupCoordinator:
             -input_.dim() <= dim < input_.dim()
         ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
 
+        # HTCCL: vendor-neutral path, ahead of every device-specific
+        # communicator. The output_tensor_list form above is left on NCCL in
+        # v1 (out-parameter variant, see PLAN_htccl_port.md section 5).
+        if self.htccl_comm is not None:
+            return self.htccl_comm.all_gather(input_, dim)
+
         # For HPUs, use HPU communicator.
         hpu_comm = self.hpu_communicator
         if hpu_comm is not None and not hpu_comm.disabled:
@@ -1227,6 +1280,10 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+        # HTCCL: broadcast over the gloo cpu_group instead of the NCCL
+        # device_group. In-place, like the stock path.
+        if self.htccl_comm is not None:
+            return self.htccl_comm.broadcast(input_, src)
         # Broadcast.
         torch.distributed.broadcast(
             input_, src=self.ranks[src], group=self.device_group
@@ -1603,6 +1660,11 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        # Before the process groups go away: HTCCL owns a POSIX shm segment
+        # that must be unlinked, and its close() uses no collectives.
+        if getattr(self, "htccl_comm", None) is not None:
+            self.htccl_comm.close()
+            self.htccl_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None

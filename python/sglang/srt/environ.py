@@ -508,6 +508,42 @@ class Envs:
     # Force a fresh stage-0 hardware micro-probe for --rank-tp-ratio
     # auto-performance, ignoring the cached profile under ~/.cache/sglang.
     SGLANG_PERF_REPROBE = EnvBool(False)
+
+    # --- HTCCL: vendor-neutral host-staged collectives (task #117) ---------
+    # Route this group's TP collectives over HTCCL instead of NCCL. Needed
+    # when a TP group spans GPUs with no common device collective library
+    # (mixed NVIDIA + AMD); also forceable on a homogeneous group, where it
+    # exercises the identical code path (on P2P-less consumer cards NCCL
+    # already stages through the host, so the data movement is the same).
+    # OFF by default -- with this unset the dispatch is byte-identical to
+    # stock sglang.
+    #
+    # RANK-UNIFORMITY: every SGLANG_HTCCL* variable below MUST be set to the
+    # same value on every rank of the group. Divergence does not produce a
+    # wrong answer, it deadlocks -- the transports agree on a per-chunk flag
+    # protocol, and a rank that took a different branch never publishes the
+    # flag its peers spin on.
+    SGLANG_HTCCL = EnvBool(False)
+    # Data plane: "device" (GPU-driven DMA + spin kernels, CUDA-graph
+    # capturable), "shm" (CPU-orchestrated pinned staging) or "gloo" (TCP,
+    # also multi-node). The CPU transports synchronize with the host and
+    # therefore require --disable-cuda-graph.
+    SGLANG_HTCCL_TRANSPORT = EnvStr("device")
+    # Per-rank shared-memory slot size (MiB) for payload staging.
+    SGLANG_HTCCL_SLOT_MIB = EnvInt(64)
+    # Chunk size (MiB) of the gloo data-plane pipeline.
+    SGLANG_HTCCL_CHUNK_MIB = EnvInt(8)
+    # Chunk size (MiB) of the device transport's dual-stream pipeline.
+    # Unset -> calibrated at startup (a collective sweep; see the
+    # rank-uniformity note above -- set it on all ranks or on none).
+    SGLANG_HTCCL_PIPE_CHUNK_MIB = EnvStr(None)
+    # Upcast half dtypes to fp32 for the gloo-plane reduction, to match
+    # NCCL numerics.
+    SGLANG_HTCCL_FP32_REDUCE = EnvBool(True)
+    # RS+AG chunk-ownership weights for world >= 3 ("a,b,c", one positive
+    # integer per rank). Unset -> measured from per-rank slot DMA bandwidth
+    # at startup, so a slow PCIe link owns fewer reduce-scatter chunks.
+    SGLANG_HTCCL_RSAG_SHARES = EnvStr(None)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
     # Override the distributed init method used by torch.distributed.init_process_group.
