@@ -1590,6 +1590,100 @@ class ModelRunnerKVCacheMixin:
             * full_pool.store_dtype.itemsize
             * 2  # K + V
         )
+        budget_gib = float(
+            getattr(self.server_args, "kv_session_offload_host_ram_gib", 0.0) or 0.0
+        )
+        if budget_gib > 0:
+            # ---- P2 (deep-offload S1): RAM-BUDGETED host pool --------------
+            # Separate branch on purpose: with the flag unset (else:) not a
+            # single statement below runs, so the default path stays exactly
+            # what it was.
+            #
+            # The budget is a PHYSICAL CEILING on the allocation, nothing
+            # else -- it is NEVER read by the tick regulator / wave-back /
+            # admission logic (P3 guard, unit-tested). The per-session DEPTH
+            # (region_tokens) is untouched: a session can never hold more than
+            # context_len, so the budget instead bounds HOW MANY regions are
+            # dimensioned == the effective max_spills.
+            #
+            # RANK-UNIFORM without a new collective. Careful: the REQUESTED GB
+            # is min(context_need, budget/rank), and the context_need term is
+            # rank-LOCAL under uneven TP (different kv-head shares -> different
+            # bytes/token), exactly as in the flag-OFF path below. What makes
+            # the result uniform is HostKVCache's OWN min-all-reduce over the
+            # token capacity (sync_fixed_hicache_size, pool_host/base.py) --
+            # active precisely when the per-token bytes differ (uneven TP); with
+            # even TP every rank computes the identical number anyway. The
+            # effective region count is therefore derived from the POST-sync
+            # host_pool.size, so it is one integer on every rank -- including
+            # the eff<1 fail-fast below, which then fires on ALL ranks.
+            from sglang.srt.managers.kv_session_offload import (
+                host_pool_effective_max_spills,
+                host_pool_request_gb,
+            )
+
+            # PP/DP are rejected for this feature (server_args), and draft
+            # workers never attach a pool -> the TP ranks are exactly the
+            # processes that share the node-wide budget.
+            n_pool_ranks = max(1, int(getattr(self, "tp_size", 1) or 1))
+            host_size_gb = host_pool_request_gb(
+                need_tokens, per_token_bytes, budget_gib, n_pool_ranks
+            )
+            host_pool = MHATokenToKVPoolHost(
+                device_pool=full_pool,
+                host_to_device_ratio=0.0,
+                host_size=host_size_gb,
+                page_size=self.page_size,
+                layout="layer_first",
+                pin_memory=True,
+            )
+            eff_max_spills = host_pool_effective_max_spills(
+                host_pool.size, region_tokens, max_spills
+            )
+            if eff_max_spills < 1:
+                raise ValueError(
+                    "kv-session-offload: --kv-session-offload-host-ram-gib="
+                    f"{budget_gib:g} GiB (node-wide, {n_pool_ranks} ranks -> "
+                    f"{host_size_gb:.2f} GB/rank) cannot hold even ONE "
+                    f"full-context session on this rank: the allocated pool "
+                    f"holds {host_pool.size} tokens < {region_tokens} tokens "
+                    f"per region (context_len {ctx}, S {S}, max_ratio "
+                    f"{max_ratio}, {per_token_bytes} B/token -> "
+                    f"{region_tokens * per_token_bytes / 1e9:.2f} GB per "
+                    "region per rank). Raise the budget or lower "
+                    "--context-length."
+                )
+            self.kv_sess_host_pool = host_pool
+            self.kv_sess_region_tokens = region_tokens
+            # The manager must partition into the EFFECTIVE count, not the
+            # configured one, or its region assert / _free_regions would run
+            # past the allocated pool.
+            self.kv_sess_max_spills = eff_max_spills
+            logger.info(
+                "kv-session-offload (P2 budget): attached %d-token pinned host "
+                "pool (%.2f GB/rank of a %g GiB node budget over %d ranks, "
+                "%d full-attention layers) for up to %d concurrent spill "
+                "sessions (configured %d, %d tokens/region).",
+                host_pool.size,
+                host_pool.size * per_token_bytes / 1e9,
+                budget_gib,
+                n_pool_ranks,
+                full_pool.layer_num,
+                eff_max_spills,
+                max_spills,
+                region_tokens,
+            )
+            if eff_max_spills < max_spills:
+                logger.warning(
+                    "kv-session-offload (P2 budget): effective max_spills "
+                    "reduced %d -> %d by --kv-session-offload-host-ram-gib="
+                    "%g (per-session depth %d tokens is unchanged).",
+                    max_spills,
+                    eff_max_spills,
+                    budget_gib,
+                    region_tokens,
+                )
+            return
         host_size_gb = max(1, -(-(need_tokens * per_token_bytes) // 10**9))
         host_pool = MHATokenToKVPoolHost(
             device_pool=full_pool,
@@ -1610,6 +1704,7 @@ class ModelRunnerKVCacheMixin:
         # S4: the manager partitions [0, size) into max_spills regions of
         # >= region_tokens each; expose the per-region capacity it must use.
         self.kv_sess_region_tokens = region_tokens
+        self.kv_sess_max_spills = max_spills
         logger.info(
             "kv-session-offload: attached %d-token pinned host pool "
             "(%.2f GB, %d full-attention layers) for up to %d concurrent "

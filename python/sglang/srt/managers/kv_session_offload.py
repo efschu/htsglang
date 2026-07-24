@@ -284,6 +284,131 @@ def tick_trace_enabled() -> bool:
     return os.environ.get("SGLANG_KVSO_TICK_TRACE", "0") == "1"
 
 
+# ---------------------------------------------------------------------------
+# P2 (deep-offload S1): host-pool sizing from an explicit RAM BUDGET
+#
+# Today the pinned host pool is sized PURELY from --context-length:
+#   region_tokens = (ctx // S + 2) * max_ratio;  need = region_tokens * max_spills
+# so reaching the ten-thousand-token tail depth the deep-offload story needs
+# (a big --context-length) also multiplies the host allocation, with no knob
+# to bound it -- the box has 108 GB and NO swap, so an over-large auto-size is
+# an OOM-killer event, not a graceful failure.
+#
+# --kv-session-offload-host-ram-gib decouples the two: the per-session DEPTH
+# (region_tokens) stays the full context (a session can never hold more than
+# context_len anyway), and the budget bounds only HOW MANY regions are really
+# dimensioned == the effective --kv-session-offload-max-spills. The budget is
+# a PHYSICAL CEILING, never a cadence / regulator input (P3 guard: it must not
+# appear anywhere in ScheduleBatchRegulator / observe_sample / _local_ratio /
+# _desired -- there is a unit test asserting exactly that).
+#
+# RANK-UNIFORMITY (this fork: divergence == NCCL hang, not a wrong number):
+# every function here is PURE and takes only REPLICATED inputs (server args,
+# context_len, the DCP prefix geometry). The one rank-LOCAL quantity in the
+# sizing, per_token_bytes (uneven TP -> different kv-head shares), is folded
+# out by the host pool's OWN existing min-all-reduce over the token capacity
+# (sync_fixed_hicache_size, pool_host/base.py) -- so the effective region
+# count is derived from the post-sync host_pool.size and needs NO new
+# collective. Never introduce a per-rank free-memory query into this path.
+# ---------------------------------------------------------------------------
+
+# Host RAM left free for the OS and everything else when a budget is given.
+# Same magnitude as HICACHE_HOST_MEMORY_RESERVE_BYTES (pool_host/base.py); the
+# pool is PINNED (non-swappable) and this box has no swap at all.
+HOST_RAM_BUDGET_RESERVE_BYTES: int = 10 * (1024**3)
+
+
+def host_ram_budget_error(
+    budget_gib: float,
+    total_bytes: int,
+    available_bytes: int,
+    reserve_bytes: int = HOST_RAM_BUDGET_RESERVE_BYTES,
+) -> Optional[str]:
+    """Plausibility check for --kv-session-offload-host-ram-gib against the
+    REAL host RAM. Returns None when the budget is plausible, else a complete
+    operator-facing message (fail fast and loud instead of letting the OOM
+    killer pick a victim later -- on a swap-less box that victim is often an
+    unrelated process).
+
+    The budget is the NODE-WIDE total across all TP ranks (each rank allocates
+    budget/tp_size), so it is compared against the machine's RAM as a whole.
+
+    Deliberately checked ONCE at argument-parse time in the launcher process,
+    NOT per rank at pool-alloc time: `available` shrinks as each rank pins its
+    share, so a per-rank check would pass on rank 0 and raise on rank 2 --
+    a rank-divergent boot decision, i.e. an NCCL hang."""
+    b = float(budget_gib)
+    if b <= 0:
+        return None
+    want = b * (1024**3)
+    if want > int(total_bytes):
+        return (
+            "--kv-session-offload-host-ram-gib="
+            f"{b:g} GiB exceeds the machine's TOTAL host RAM "
+            f"({int(total_bytes) / (1024 ** 3):.1f} GiB). The kv-session-offload "
+            "host pool is PINNED memory and cannot be swapped out."
+        )
+    usable = int(available_bytes) - int(reserve_bytes)
+    if want > usable:
+        return (
+            "--kv-session-offload-host-ram-gib="
+            f"{b:g} GiB does not fit in the currently available host RAM: "
+            f"{int(available_bytes) / (1024 ** 3):.1f} GiB available minus a "
+            f"{int(reserve_bytes) / (1024 ** 3):.1f} GiB OS reserve = "
+            f"{max(0, usable) / (1024 ** 3):.1f} GiB usable. Lower the budget, "
+            "or free host memory first (the pool is pinned; over-committing it "
+            "invokes the OOM killer instead of swapping)."
+        )
+    return None
+
+
+def host_pool_budget_bytes_per_rank(budget_gib: float, n_pool_ranks: int) -> int:
+    """Per-rank share of the NODE-WIDE host-RAM budget. Every rank that
+    attaches a host pool (== the non-draft TP ranks; PP/DP are rejected for
+    this feature) gets the same share, so the value is replicated by
+    construction."""
+    return int((float(budget_gib) * (1024**3)) // max(1, int(n_pool_ranks)))
+
+
+def host_pool_request_gb(
+    need_tokens: int,
+    per_token_bytes: int,
+    budget_gib: float,
+    n_pool_ranks: int,
+) -> float:
+    """Host-pool size to REQUEST on this rank, in GB (10**9 B -- the unit
+    HostKVCache's ``host_size`` uses).
+
+    ``budget_gib <= 0`` (flag OFF, the default) reproduces today's
+    context-derived auto-size EXACTLY: ceil(need_bytes / 1e9), at least 1.
+
+    With a budget the request is ``min(context_need, budget/rank)`` -- the
+    budget is a CEILING, never an inflation: a budget larger than the context
+    need yields the identical context-derived size, so a generous budget is
+    behaviourally identical to flag OFF."""
+    need_bytes = int(need_tokens) * int(per_token_bytes)
+    ctx_gb = float(max(1, -(-need_bytes // 10**9)))
+    if budget_gib is None or float(budget_gib) <= 0:
+        return ctx_gb
+    per_rank_bytes = host_pool_budget_bytes_per_rank(budget_gib, n_pool_ranks)
+    return min(ctx_gb, per_rank_bytes / 1e9)
+
+
+def host_pool_effective_max_spills(
+    pool_size_tokens: int, region_tokens: int, max_spills: int
+) -> int:
+    """How many full-context regions the ALLOCATED host pool really holds,
+    capped by the configured --kv-session-offload-max-spills.
+
+    Called with the pool's POST-min-all-reduce ``size`` (rank-uniform) and the
+    replicated ``region_tokens`` -> rank-uniform without a new collective.
+    0 means not even ONE full-context session fits: the caller must fail fast
+    (physical impossibility), never silently shrink the per-session depth."""
+    region = max(1, int(region_tokens))
+    fits = int(pool_size_tokens) // region
+    return max(0, min(int(max_spills), fits))
+
+
 def spill_graph_blocks_needed(owned_tokens: int, block_size: int) -> int:
     """Number of streamed host blocks for ``owned_tokens`` at ``block_size``
     (ceil, at least 1). For rank-uniform capture pass the MAX owned count
@@ -1252,7 +1377,22 @@ class KVSessionOffloadManager:
         # regions of `region_tokens` rows each; region r owns host rows
         # [r * region_tokens, (r+1) * region_tokens). At most one session per
         # region is spilled at a time.
-        self.max_spills = max(1, int(sa.kv_session_offload_max_spills))
+        # P2 (deep-offload S1): with --kv-session-offload-host-ram-gib the model
+        # runner may have dimensioned FEWER regions than configured (the RAM
+        # budget is a physical ceiling). It publishes the effective count; the
+        # fallback is the configured value, so the flag-OFF path is unchanged
+        # (the runner then publishes exactly that value anyway). The effective
+        # count is derived from the post-min-reduce host_pool.size -> the same
+        # integer on every rank, which _free_regions / prefill_spill_free_regions
+        # rely on (rank-divergent region counts desync, they do not just differ).
+        self.max_spills = max(
+            1,
+            int(
+                getattr(
+                    mr, "kv_sess_max_spills", sa.kv_session_offload_max_spills
+                )
+            ),
+        )
         self.region_tokens = int(
             getattr(mr, "kv_sess_region_tokens", self.host_pool.size)
         )

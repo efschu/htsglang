@@ -1413,6 +1413,29 @@ class ServerArgs:
             "linearly (N x one-session budget).",
         ),
     ] = 1
+    kv_session_offload_host_ram_gib: A[
+        float,
+        Arg(
+            help="kv-session-offload (P2 / deep-offload): NODE-WIDE host RAM "
+            "budget in GiB for the pinned spill pools, summed over all TP "
+            "ranks (each rank allocates budget / tp_size). Default 0 = OFF -> "
+            "the pool keeps today's purely context-derived auto-size "
+            "(max_spills x one max-context session), byte-identical. "
+            "WHY: the per-session spill DEPTH is the full --context-length, so "
+            "reaching a deep host tail means running a large context -- which "
+            "today multiplies the host allocation with no knob to bound it. "
+            "This flag decouples the two: the per-session depth stays the full "
+            "context (a session can never hold more), and the budget bounds "
+            "only HOW MANY sessions can be spilled concurrently (the EFFECTIVE "
+            "--kv-session-offload-max-spills, reduced to what the budget "
+            "holds). It is a CEILING only: a budget larger than the context "
+            "need allocates exactly the context-derived size. If the budget "
+            "cannot hold even ONE full-context session the server fails fast "
+            "at boot (physical impossibility) instead of silently truncating "
+            "the depth. The pool is PINNED (never swapped), so the value is "
+            "validated against the machine's real free RAM at startup.",
+        ),
+    ] = 0.0
     kv_session_offload_spec_in_tick: A[
         bool,
         Arg(
@@ -4014,8 +4037,43 @@ class ServerArgs:
                 "--kv-session-offload-prefill requires "
                 "--enable-kv-session-offload."
             )
+        if self.kv_session_offload_host_ram_gib and (
+            not self.enable_kv_session_offload
+        ):
+            # P2: the RAM budget sizes the offload host pool; standalone it
+            # would silently do nothing. Reject instead of ignoring.
+            raise ValueError(
+                "--kv-session-offload-host-ram-gib requires "
+                "--enable-kv-session-offload."
+            )
         if not self.enable_kv_session_offload:
             return
+        if self.kv_session_offload_host_ram_gib < 0:
+            raise ValueError(
+                "--kv-session-offload-host-ram-gib must be >= 0 (0 = OFF, "
+                "context-derived auto-size); got "
+                f"{self.kv_session_offload_host_ram_gib}."
+            )
+        if self.kv_session_offload_host_ram_gib > 0:
+            # P2 host-RAM plausibility. Done HERE (single launcher process,
+            # before any rank forks or pins anything) and NOT per rank at
+            # pool-alloc time: `available` shrinks as each rank pins its share,
+            # so a per-rank check would pass on rank 0 and raise on rank 2 --
+            # a rank-divergent boot decision, i.e. an NCCL hang rather than an
+            # error. Every per-rank sizing decision downstream is pure
+            # arithmetic over replicated arguments.
+            import psutil
+
+            from sglang.srt.managers.kv_session_offload import (
+                host_ram_budget_error,
+            )
+
+            _vm = psutil.virtual_memory()
+            _err = host_ram_budget_error(
+                self.kv_session_offload_host_ram_gib, _vm.total, _vm.available
+            )
+            if _err is not None:
+                raise ValueError(_err)
         if self.kv_session_offload_block_size <= 0:
             raise ValueError(
                 "--kv-session-offload-block-size must be > 0; got "
