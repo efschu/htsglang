@@ -1343,6 +1343,44 @@ class ServerArgs:
             "iteration regardless.",
         ),
     ] = 1
+    kv_session_offload_tick_adaptive: A[
+        bool,
+        Arg(
+            help="kv-session-offload: SELF-CALIBRATING spill-tick cadence (QoS "
+            "regulator). Default OFF -> the tick cadence is the STATIC "
+            "--kv-session-offload-tick-interval (byte-identical). When ON, the "
+            "minimum device-iterations between two spill ticks EMERGES from "
+            "runtime MEASUREMENT (it does not guess): each iteration the "
+            "regulator times the device idle SLACK and the marginal COST of one "
+            "spill tick. When a whole tick fits in the idle the device would "
+            "waste anyway the tick is ~free -> the interval falls to 1 (spill "
+            "advances for free); when the device is saturated a tick fully "
+            "steals a device step -> the interval backs off to the "
+            "anti-starvation FLOOR (--kv-session-offload-tick-floor), which "
+            "guarantees each spilled session a minimum progress rate. Fast-lane "
+            "pressure hard-pins the interval to the floor. Idle is NOT "
+            "rank-uniform (heterogeneous GPUs), so the per-rank headroom is "
+            "combined with all-reduce(MIN) (the binding/bottleneck rank) once "
+            "per dwell window -> every DCP rank makes the identical tick/defer "
+            "decision (a spill tick is a rank-uniform collective event). "
+            "Targets a speculative-decoding server (its intended config); in a "
+            "non-spec server the regulator conservatively holds the floor.",
+        ),
+    ] = False
+    kv_session_offload_tick_floor: A[
+        int,
+        Arg(
+            help="kv-session-offload: anti-starvation FLOOR for the "
+            "self-calibrating spill-tick cadence (only used with "
+            "--kv-session-offload-tick-adaptive). This is the operator QoS knob: "
+            "the MAXIMUM number of device iterations a spilled session may go "
+            "without a tick == its GUARANTEED minimum progress rate, even under "
+            "sustained device pressure. The regulator clamps the measured "
+            "effective interval to [1, this] and pins to it under fast-lane "
+            "pressure. Larger -> the device lane is protected harder (spilled "
+            "sessions advance more slowly, but never stall). Default 8.",
+        ),
+    ] = 8
     kv_session_offload_restore_margin_tokens: A[
         int,
         Arg(
@@ -1360,6 +1398,21 @@ class ServerArgs:
             "spilled session is copied back to device.",
         ),
     ] = 4
+    kv_session_offload_max_spills: A[
+        int,
+        Arg(
+            help="kv-session-offload (S4): maximum number of sessions spilled "
+            "to host CONCURRENTLY. The pinned host pool is partitioned into "
+            "this many equal per-session regions; each region holds one "
+            "max-context session's owned KV shard. >1 lifts the S1 "
+            "one-spill-slot limit: a second decode-OOM spills a second "
+            "session, and a fast-lane request may evict SEVERAL normal "
+            "sessions to fit. The spill ticks still run one session at a time "
+            "(round-robin), so raising this trades host RAM for admission "
+            "headroom, not per-session decode speed. Sizes the host pool "
+            "linearly (N x one-session budget).",
+        ),
+    ] = 1
     rank_tp_ratio: A[
         Optional[Union[List[int], str]],
         Arg(
@@ -3910,20 +3963,39 @@ class ServerArgs:
                 "--kv-session-offload-tick-interval must be >= 1; got "
                 f"{self.kv_session_offload_tick_interval}."
             )
+        if self.kv_session_offload_tick_floor < 1:
+            raise ValueError(
+                "--kv-session-offload-tick-floor must be >= 1; got "
+                f"{self.kv_session_offload_tick_floor}."
+            )
         if self.kv_session_offload_restore_hysteresis_steps < 1:
             raise ValueError(
                 "--kv-session-offload-restore-hysteresis-steps must be >= 1."
+            )
+        if self.kv_session_offload_max_spills < 1:
+            raise ValueError(
+                "--kv-session-offload-max-spills must be >= 1; got "
+                f"{self.kv_session_offload_max_spills}."
             )
         if self.kv_session_offload_restore_margin_tokens < 0:
             raise ValueError(
                 "--kv-session-offload-restore-margin-tokens must be >= 0."
             )
-        if self.speculative_algorithm is not None:
+        if self.speculative_algorithm is not None and (
+            os.environ.get("KVSO_ALLOW_SPEC", "0") != "1"
+        ):
+            # The S1 "no speculative decoding" limit. Being LIFTED (spill +
+            # MTP): the spill tick is a plain bs=1 decode while device sessions
+            # run draft/verify, and MTP carries its own 1-layer draft KV that
+            # a spilled session must co-handle (the bundle_spillable_sizes seam
+            # reserves the draft share). Gated by KVSO_ALLOW_SPEC=1 during
+            # bring-up so the default path stays rejected (byte-identical);
+            # the gate is removed once spill+MTP is validated.
             raise ValueError(
-                "--enable-kv-session-offload (S1) does not support "
+                "--enable-kv-session-offload does not yet support "
                 "speculative decoding (--speculative-algorithm="
-                f"{self.speculative_algorithm}). The spill tick is a plain "
-                "eager decode; the draft/verify dispatch is a later stage."
+                f"{self.speculative_algorithm}). Set KVSO_ALLOW_SPEC=1 to "
+                "opt into the spill+MTP bring-up path."
             )
         if self.attention_backend not in (None, "flashinfer"):
             raise ValueError(

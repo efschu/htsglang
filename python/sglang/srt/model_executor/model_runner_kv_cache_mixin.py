@@ -1579,7 +1579,10 @@ class ModelRunnerKVCacheMixin:
         else:
             S, max_ratio = 1, 1
         ctx = int(self.model_config.context_len)
-        need_tokens = (ctx // S + 2) * max_ratio
+        # S4: N equal per-session regions -> size for N max-context sessions.
+        max_spills = max(1, int(self.server_args.kv_session_offload_max_spills))
+        region_tokens = (ctx // S + 2) * max_ratio
+        need_tokens = region_tokens * max_spills
         per_token_bytes = (
             full_pool.head_num
             * full_pool.head_dim
@@ -1600,15 +1603,22 @@ class ModelRunnerKVCacheMixin:
             raise ValueError(
                 "kv-session-offload: allocated host pool holds "
                 f"{host_pool.size} tokens < required {need_tokens} "
-                f"(context_len {ctx}, S {S}, max_ratio {max_ratio})."
+                f"(context_len {ctx}, S {S}, max_ratio {max_ratio}, "
+                f"max_spills {max_spills})."
             )
         self.kv_sess_host_pool = host_pool
+        # S4: the manager partitions [0, size) into max_spills regions of
+        # >= region_tokens each; expose the per-region capacity it must use.
+        self.kv_sess_region_tokens = region_tokens
         logger.info(
             "kv-session-offload: attached %d-token pinned host pool "
-            "(%.2f GB, %d full-attention layers) for the spill session.",
+            "(%.2f GB, %d full-attention layers) for up to %d concurrent "
+            "spill sessions (%d tokens/region).",
             host_pool.size,
             need_tokens * per_token_bytes / 1e9,
             full_pool.layer_num,
+            max_spills,
+            region_tokens,
         )
 
     def _pool_kv_head_num(self: ModelRunner) -> int:

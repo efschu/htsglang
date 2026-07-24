@@ -1915,11 +1915,89 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def draft_worker(self):
         return self._draft_worker
 
+    def backfill_draft_extend_for_resume(
+        self,
+        batch: ScheduleBatch,
+        target_hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ):
+        """ON-DEVICE MTP RESUME (kv-session-offload Option B): draft-ONLY extend
+        over a resumed session's host-grown tail [L_spill, L) to backfill the
+        draft KV those plain host-tick positions never got (the drafter did not
+        run there) AND to produce the real resume seed.
+
+        The TARGET is NEVER re-forwarded: its KV and resident GDN/Mamba state
+        advanced exactly once, on the host tick. Only the single-layer draft
+        runs, consuming the per-tick target hidden states captured on the host.
+        Reuses the prefill draft-extend primitive (``_draft_extend_for_prefill``):
+        same EAGLE input rotation, same draft-KV write into the session's
+        (restored) slots via ``out_cache_loc``, same seed assembly. The draft
+        attends its own prefix draft KV [0, L_spill), which is device-resident
+        again by restore time (head + the draft-KV bundle, Stage 1).
+
+        Generic: whatever NEXTN/EAGLE-family drafter the model configured (not
+        NEXTN-hardcoded). DFLASH is excluded from spill sessions (short-ctx
+        regime) -- the kv-session-offload caller does not arm this path for it.
+        Rank-uniform: a collective draft forward, run identically on every DCP
+        rank for the same session in the same iteration; the target hidden
+        states are replicated across TP (each decoder layer ends in a
+        RowParallel all-reduce) so every rank's inputs are byte-equal. Returns
+        the seed ``EagleDraftInput``."""
+        if self._spec_solo_active and not self._spec_solo_is_host:
+            # Shadow rank: the draft runs only on the solo host (draft KV +
+            # hiddens are local there); mirror the prefill shadow stub.
+            return self._solo_stub_draft_input(batch, next_token_ids)
+        with (
+            self.draft_worker.draft_tp_context(
+                self.draft_worker.draft_runner.tp_group
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("kvso_resume_backfill"),
+        ):
+            return self.draft_worker._draft_extend_for_prefill(
+                batch, target_hidden_states, next_token_ids
+            )
+
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+        if getattr(batch, "kv_session_spill_tick", False):
+            # kv-session-offload SPILL TICK: the host-resident session decodes
+            # PLAIN bs=1 straight through the TARGET (base) worker -- NO
+            # draft / verify / draft_extend. While spilled the session has no
+            # device draft KV (the speculative draft was dropped at spill time
+            # and is re-drafted on restore from the resident GDN/mamba state);
+            # the hybrid head-device/tail-host attention is selected inside the
+            # backend by this same kv_session_spill_tick flag. This is exactly
+            # the plain-decode path a non-spec server's TpModelWorker takes for
+            # the tick -- the EAGLE wrapper must NOT force a draft here, because
+            # a draft over a bs=1 batch with spec_info=None builds a 0-row idle
+            # topk stub and the draft cuda-graph's foreach_copy then asserts
+            # ([1,1] vs [0,1]). spec_algorithm is NONE on this batch, so
+            # run_batch passes no on_publish and publishes the future itself.
+            batch_output = self.target_worker.forward_batch_generation(batch)
+            # ON-DEVICE MTP RESUME: stash the LAST token's target hidden state
+            # (requested via capture_hidden_mode=LAST on the spill batch) into
+            # the session's slot. It re-seeds the draft state at restore so the
+            # session rejoins the live spec batch with a valid EagleDraftInput
+            # instead of spec_info=None (the merge-time assert this fixes). CLONE
+            # it -- logits_output.hidden_states is a view into a pooled forward
+            # buffer that the next forward overwrites. No GDN re-advance: this is
+            # the hidden state of the single, correct host-decode forward.
+            lo = getattr(batch_output, "logits_output", None)
+            hs = getattr(lo, "hidden_states", None) if lo is not None else None
+            if hs is not None and len(batch.reqs) == 1:
+                from sglang.srt.managers.kv_session_offload import (
+                    get_kv_session_offload_manager,
+                )
+
+                mgr = get_kv_session_offload_manager()
+                if mgr is not None:
+                    mgr.capture_tick_hidden(batch.reqs[0].req_pool_idx, hs[-1:])
+            return batch_output
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (

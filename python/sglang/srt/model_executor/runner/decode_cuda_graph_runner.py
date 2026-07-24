@@ -324,6 +324,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.compile_bs = [bs for bs in self.compile_bs if bs <= _wl_max_bs]
             _wl_ab.wl_build_graph_ladder()
 
+        # S5 spill-tick graph: UNLIKE the weightless block-decode (which IS the
+        # decode and reshapes every capture bucket to bs=1), the spill tick is a
+        # SEPARATE bs=1 batch type -- normal decode keeps its own graphs. The
+        # spill-tick graphs are an ADDITIONAL per-rung bs=1 capture pass. Gated
+        # by the backend's _sess_graph_enabled (flag OFF -> this stays False and
+        # the runner is byte-identical). GPU-JUSTIFICATION: the additional
+        # capture pass needs a live-ish spilled-session synthetic batch, so it
+        # is DRIVEN ON GPU by the messagent; here we only wire the admission +
+        # replay-variant so the mechanism is ready.
+        self._sess_block_graph = False
+        _sess_ab = getattr(self.attn_backend, "full_attn_backend", self.attn_backend)
+        if (
+            getattr(_sess_ab, "_sess_graph_enabled", False)
+            and not model_runner.is_draft_worker
+        ):
+            self._sess_block_graph = True
+            self._sess_attn = _sess_ab
+
         self.ragged_verify_mode = (
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
             and (self.capture_forward_mode == ForwardMode.TARGET_VERIFY)
@@ -552,6 +570,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "(can_run_graph admission must precede load_batch)"
             )
             return f"wlblk{rung}"
+        if self._sess_block_graph and self._sess_attn._sess_graph_replay_blocks:
+            # S5: spill-tick replay keys on its captured rung.
+            return f"sessblk{self._sess_attn._sess_graph_replay_blocks}"
         return default
 
     def can_run_graph(self, forward_batch: ForwardBatch):
@@ -559,11 +580,31 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
-        # kv-session-offload (S1): the spill tick streams host-resident KV
-        # blockwise with per-block host-side plans -- structurally eager.
-        # The flag is replicated scheduler state, so every rank decides
-        # identically (no collective-count divergence).
+        # kv-session-offload: the spill tick streams host-resident KV
+        # blockwise. S5: run it as a captured graph when the spill-graph flag
+        # is on, admission succeeds (bs=1 + a covering rung -- rank-uniform),
+        # AND that rung was actually captured (the additional per-rung capture
+        # pass is GPU-wired; until then _sess_graph_captured is empty -> eager).
+        # Flag OFF or over-ladder -> eager, byte-identical. Replicated inputs
+        # -> every rank decides identically (no collective-count divergence).
+        # BUGFIX: _sess_graph_replay_blocks is a sticky backend field that
+        # _variant_label reads to pick the sessblk{R} graph key. It is set only
+        # when a SPILL TICK is admitted (via _sess_graph_can_replay below). A
+        # DEVICE batch never calls that, so a stale value would leak into the
+        # device batch's variant label -> at bs>1 a KeyError (no size=N
+        # sessblk graph), at bs=1 a SILENT replay of the wrong (spill) graph.
+        # Clear it on EVERY admission; the spill-tick branch re-sets it.
+        if self._sess_block_graph:
+            self._sess_attn._sess_graph_replay_blocks = None
         if getattr(forward_batch, "kv_session_spill_tick", False):
+            if (
+                self._sess_block_graph
+                and self._sess_attn._sess_graph_can_replay(forward_batch)
+                and self._sess_attn._sess_graph_captured(
+                    self._sess_attn._sess_graph_replay_blocks
+                )
+            ):
+                return True
             return False
 
         # Weightless streaming block-decode (#136a): rung availability +
@@ -921,7 +962,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.is_weightless_head
             or self.model_runner.is_weightless_worker
         )
-        if _wl_lane:
+        # S5 spill-tick graph capture is ALSO guard-free (its per-layer DCP
+        # cp_lse collectives are captured symmetrically on every rank; the
+        # guard's per-step gloo handshake is a host-sync that cannot be
+        # recorded). Rank-uniform: every DCP rank builds this runner and hits
+        # the toggle at the same point (#133 lockstep). GPU-JUSTIFICATION:
+        # confirm the disable window covers exactly the spill capture region.
+        _guard_off = _wl_lane or self._sess_block_graph
+        if _guard_off:
             from sglang.srt.layers.dcp.collective_guard import set_guard_enabled
 
             set_guard_enabled(False)
@@ -950,12 +998,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.enable_profile_cuda_graph:
                 self._post_process_after_profile(prof)
         finally:
-            if _wl_lane:
+            if _guard_off:
                 # Restore the guard for the eager prefill/extend path.
                 set_guard_enabled(True)
 
         # No pool-side pin to clear: the captured full-physical write loc rides the
         # backend's `ForwardMetadata.out_cache_loc_full_physical` (-> KVWriteLoc.full_loc).
+
+        # S5: ENV-gated per-rung graph==eager selftest (KVSO_GRAPH_SELFTEST),
+        # run OUTSIDE the capture context now that all rungs are recorded.
+        # Default OFF -> no-op. Covers rungs 2-28 (unreachable under real load).
+        if self._sess_block_graph:
+            sess_selftest = getattr(self._sess_attn, "_sess_graph_selftest", None)
+            if sess_selftest is not None:
+                try:
+                    sess_selftest(self.model_runner)
+                except Exception as _sess_e:
+                    # Diagnostic only -- never fail the boot on the selftest.
+                    logger.warning(
+                        "kvso spill-graph selftest raised (ignored): %r", _sess_e
+                    )
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
@@ -1016,6 +1078,64 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
                     self.capture_one_shape(bs, forward, stream_idx, variant_label)
+
+            # S5 spill-tick graph: an ADDITIONAL bs=1 capture pass, one graph
+            # per rung (largest-first for memory-pool reuse). PORT of the
+            # #136a rung loop above; the spill tick is a SEPARATE batch, so it
+            # is captured beside the normal decode graphs (not instead of
+            # them). Rank-uniform SYMMETRIC capture: every DCP rank builds this
+            # runner and iterates the IDENTICAL rung sequence, so the capture-
+            # time per-layer cp_lse collectives pair up (#133 lockstep). Only
+            # bs==1 (the spill tick is always bs=1).
+            if self._sess_block_graph and bs == 1:
+                try:
+                    for rung in sorted(
+                        self._sess_attn._sess_graph_ladder, reverse=True
+                    ):
+                        self._sess_attn._sess_graph_capture_blocks = rung
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.num_tokens_per_bs,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            self._sess_capture_one_spill_rung(
+                                bs, forward, stream_idx, rung
+                            )
+                        self._sess_attn._sess_graph_captured_rungs.add(rung)
+                finally:
+                    self._sess_attn._sess_graph_capture_blocks = None
+
+    def _sess_capture_one_spill_rung(
+        self, bs, forward, stream_idx, rung
+    ) -> None:
+        """Capture one spill-tick decode graph for ``rung`` (PORT of the
+        weightless head's capture_one_shape rung recording). Reuses the normal
+        capture harness (capture_prepare + model.forward record) but marks the
+        synthetic batch as a spill tick at the rung worst case, so every full-
+        attention layer routes to _sess_blockwise_decode_return_lse_graph and
+        the whole tick forward is recorded.
+
+        GPU-JUSTIFICATION (the messagent wires + iterates these; the STRUCTURE
+        hugs the head capture_one_shape so tuning is minimal):
+          * _sess_install_capture_state builds a SYNTHETIC spilled session
+            (backend region slot + sentinel req_to_token row + host-pool rows)
+            so _sess_prepare_step yields a rung-max plan (block FULL, head at
+            max) -- capture-time state install/teardown boundaries;
+          * the exact seq_lens / req_pool_indices the synthetic tick needs;
+          * capture-region boundaries + event ordering."""
+        # Install synthetic spilled-session state for the rung worst case.
+        install = getattr(self._sess_attn, "_sess_install_capture_state", None)
+        ctx = (
+            install(bs, rung)
+            if install is not None
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            # Reuse the head capture path; capture_prepare's batch is tagged as
+            # a spill tick by the backend's install context (it sets the flag
+            # + synthetic state that _sess_prepare_step reads).
+            self.capture_one_shape(bs, forward, stream_idx, f"sessblk{rung}")
 
     def capture_one_shape(
         self,

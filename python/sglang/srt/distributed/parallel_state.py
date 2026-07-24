@@ -1690,6 +1690,21 @@ _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
+# kv-session-offload decoupling: a SECOND DCP communicator over the SAME ranks
+# (PDMUX-style duplicate group), so the spill forward's DCP collectives run on
+# their own NCCL comm -- disjoint from the device forward's comm -- a
+# prerequisite for running the two lanes concurrently (NCCL pairs collectives
+# by per-communicator enqueue order; one comm across two lanes = hang). Built
+# at init only when SGLANG_KVSO_DECOUPLE=1 and DCP>1; None otherwise (so
+# get_dcp_group is byte-identical). Routing is a serial per-forward flag: the
+# spill forward sets _DCP_SPILL_ACTIVE, so get_dcp_group returns _DCP_SPILL for
+# the whole spill forward and _DCP for everything else. Rank-uniform: every
+# rank builds the spill batch from replicated state and toggles the flag
+# identically, so comm A sees only device ops and comm B only spill ops, both
+# in a rank-uniform order.
+_DCP_SPILL: Optional[GroupCoordinator] = None
+_DCP_SPILL_ACTIVE: bool = False
+
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
@@ -1730,8 +1745,28 @@ def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
 
 
 def get_dcp_group() -> GroupCoordinator:
+    # kv-session-offload decoupling: route the (serial, per-forward) spill
+    # forward to its own communicator. Falls back to _DCP when decoupling is
+    # off (_DCP_SPILL is None) or outside a spill forward -> byte-identical.
+    if _DCP_SPILL_ACTIVE and _DCP_SPILL is not None:
+        return _DCP_SPILL
     assert _DCP is not None, "decode context parallel group is not initialized"
     return _DCP
+
+
+def get_dcp_spill_group_no_assert() -> Optional[GroupCoordinator]:
+    return _DCP_SPILL
+
+
+def set_dcp_spill_active(active: bool) -> None:
+    """Route get_dcp_group() to the spill communicator (_DCP_SPILL) for the
+    duration of one spill forward. No-op unless the second comm was built
+    (decoupling on). Serial: SGLang runs one forward at a time per rank, so
+    this whole-forward flag cleanly scopes the spill forward's collectives to
+    comm B and leaves device forwards on comm A. Rank-uniform (set from
+    replicated kv_session_spill_tick)."""
+    global _DCP_SPILL_ACTIVE
+    _DCP_SPILL_ACTIVE = bool(active) and _DCP_SPILL is not None
 
 
 _MOE_DP: Optional[GroupCoordinator] = None
@@ -2137,6 +2172,36 @@ def initialize_model_parallel(
             logger.info(
                 f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
             )
+
+        # kv-session-offload decoupling: build the SECOND DCP communicator over
+        # the SAME dcp_group_ranks (PDMUX duplicate-group pattern). A group
+        # CREATE is itself a collective, so build it now on ALL ranks at init --
+        # never lazily on first spill (a lazy create would race the device
+        # lane). Gated by SGLANG_KVSO_DECOUPLE so the default path is
+        # byte-identical (comm B not created, get_dcp_group stays on _DCP).
+        # Enable both pynccl comms explicitly (PDMUX precedent).
+        import os as _os
+
+        if _os.environ.get("SGLANG_KVSO_DECOUPLE", "0") == "1":
+            global _DCP_SPILL
+            assert _DCP_SPILL is None, "spill DCP group already initialized"
+            _DCP_SPILL = init_model_parallel_group(
+                dcp_group_ranks,
+                get_world_group().local_rank,
+                backend,
+                use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+                group_name="dcp_spill",
+                recovered_rank=recovered_rank,
+            )
+            if _DCP.pynccl_comm:
+                _DCP.pynccl_comm.disabled = False
+            if _DCP_SPILL.pynccl_comm:
+                _DCP_SPILL.pynccl_comm.disabled = False
+            if get_tensor_model_parallel_rank() == 0:
+                logger.info(
+                    "kv-session-offload DECOUPLE: second DCP communicator "
+                    "'dcp_spill' built over the same ranks (comm B)."
+                )
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
@@ -2549,6 +2614,12 @@ def destroy_model_parallel():
     if _DCP:
         _DCP.destroy()
     _DCP = None
+
+    global _DCP_SPILL, _DCP_SPILL_ACTIVE
+    if _DCP_SPILL:
+        _DCP_SPILL.destroy()
+    _DCP_SPILL = None
+    _DCP_SPILL_ACTIVE = False
 
     global _MOE_EP
     if _MOE_EP:
