@@ -1780,6 +1780,14 @@ class CrossAlgoWorker(BaseSpecWorker):
                 self._warmkeep_dflash_after_nextn_round(batch, batch_output)
             self._warmkeep_ms_since_switch += (time.perf_counter() - tic) * 1e3
             self._warmkeep_rounds_since_switch += 1
+        elif self._active_name == "dflash":
+            # The NEXTN catch-up is what normally CONSUMES the target's final
+            # hidden states and nulls them (the DFLASH rung reads the aux
+            # field, dflash_worker_v2._release_target_context_hidden releases
+            # only that one). With the catch-up skipped nothing would drop the
+            # reference, so a big buffer would ride along through the overlap
+            # relay for no reader. Release it here.
+            batch_output.logits_output.hidden_states = None
         self._trace_round(batch, batch_output)
         return batch_output
 

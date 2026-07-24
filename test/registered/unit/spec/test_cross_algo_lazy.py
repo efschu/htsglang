@@ -21,8 +21,14 @@ not here.
 import os
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
+import torch
+
+from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload, relay_field
 from sglang.srt.speculative.adaptive_spec_params import RungMetrics
+from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.cross_algo_utils import (
     _resolve_lazy_stash,
     _resolve_retire_stash,
@@ -737,6 +743,198 @@ class TestWorkerWiring(CustomTestCase):
         for ctx in (0, 4096, 10**6):
             w._maybe_retire_dflash(ctx)
         self.assertFalse(w._dflash_retired)
+
+
+class TestOverlapRelayAcrossFamilyTransition(CustomTestCase):
+    """Regression for the crash lazy capture exposed on GPU (round 549).
+
+    THE LESSON: this bug needed ~550 rounds of a real run to appear, because
+    it only bites once the run is DFLASH-only for more than one round -- and
+    the SHAPE of a smoke test (20 tokens) cannot reach that. So it is tested
+    here as a ROUND SEQUENCE over the relay, not as a single call.
+
+    What broke: DFlashDraftInputV2's Eagle-shaped fields are zero-width
+    PLACEHOLDERS ((bs, 0)); the drafter documents them as unused. The
+    per-round warm-keep of the idle NEXTN rung used to overwrite all three
+    with real seeds on every DFLASH round, so a placeholder never reached
+    FutureMap.stash. Lazy capture drops that warm-keep -- on purpose, it is
+    the expensive half of the tax -- and the placeholder went straight into
+    a slot sized from a real NEXTN payload:
+        RuntimeError: shape mismatch: value tensor of shape [0] cannot be
+        broadcast to indexing result of shape [1, 1]
+    """
+
+    ALGO = "EAGLE"  # the global relay type under every switching mode
+
+    def _future_map(self, req_pool_size=8):
+        pool = SimpleNamespace(
+            req_to_token=torch.zeros((req_pool_size, 4), dtype=torch.int32)
+        )
+        return FutureMap(
+            torch.device("cpu"),
+            SpeculativeAlgorithm.from_string(self.ALGO),
+            pool,
+        )
+
+    @staticmethod
+    def _nextn_payload(token, topk_width=1, hidden=16):
+        return RelayPayload(
+            bonus_tokens=torch.tensor([token], dtype=torch.int64),
+            topk_p=torch.full((1, topk_width), float(token)),
+            topk_index=torch.full((1, topk_width), token, dtype=torch.int64),
+            hidden_states=torch.full((1, hidden), float(token)),
+        )
+
+    @staticmethod
+    def _dflash_payload(token):
+        """The REAL DFLASH decode payload, built by the production helper."""
+        return RelayPayload.from_draft_input(
+            make_draft_input_v2(
+                bonus_tokens=torch.tensor([token], dtype=torch.int64),
+                new_seq_lens=torch.tensor([100 + token], dtype=torch.int64),
+            )
+        )
+
+    def test_dflash_placeholders_are_normalized_to_absent(self):
+        d = make_draft_input_v2(
+            bonus_tokens=torch.tensor([7], dtype=torch.int64),
+            new_seq_lens=torch.tensor([10], dtype=torch.int64),
+        )
+        # Precondition of the whole bug: they are (bs, 0) tensors, NOT None.
+        self.assertEqual(tuple(d.topk_p.shape), (1, 0))
+        self.assertEqual(tuple(d.topk_index.shape), (1, 0))
+        self.assertEqual(tuple(d.hidden_states.shape), (1, 0))
+        payload = RelayPayload.from_draft_input(d)
+        self.assertIsNone(payload.topk_p)
+        self.assertIsNone(payload.topk_index)
+        self.assertIsNone(payload.hidden_states)
+        self.assertIsNotNone(payload.bonus_tokens)
+
+    def test_relay_field_passes_real_tensors_through_unchanged(self):
+        t = torch.rand(2, 3)
+        self.assertIs(relay_field(t), t)
+        self.assertIsNone(relay_field(None))
+        self.assertIsNone(relay_field(torch.empty((2, 0))))
+        self.assertIsNone(relay_field(torch.empty((0,))))
+
+    def test_long_dflash_segment_after_a_nextn_segment(self):
+        """The crash, as the run produced it: many NEXTN rounds, a switch,
+        then a LONG DFLASH-only stretch. Every DFLASH round must stash
+        cleanly and the last real NEXTN seeds must survive."""
+        idx = torch.tensor([0])
+        with mock.patch(
+            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            return_value=True,
+        ):
+            fm = self._future_map()
+            for tok in range(1, 40):  # NEXTN segment
+                fm.stash(idx, self._nextn_payload(tok))
+            self.assertEqual(tuple(fm.topk_p_buf.shape), (8, 1))
+            last_seeds = fm.topk_p_buf[0].clone()
+            last_hidden = fm.hidden_states_buf[0].clone()
+
+            for tok in range(40, 600):  # DFLASH-only stretch (the crash zone)
+                fm.stash(idx, self._dflash_payload(tok))
+
+            # bonus tokens keep flowing (DFLASH owns that field) ...
+            self.assertEqual(int(fm.output_tokens_buf[0]), 599)
+            # ... and the absent fields kept their last relayed value, which
+            # is exactly the documented absent-field contract.
+            self.assertTrue(torch.equal(fm.topk_p_buf[0], last_seeds))
+            self.assertTrue(torch.equal(fm.hidden_states_buf[0], last_hidden))
+
+    def test_round_trip_nextn_dflash_nextn_refreshes_the_seeds(self):
+        """The switch BACK: the warm-up window re-primes the NEXTN seeds
+        before the family change, so the first NEXTN round after a long
+        DFLASH segment does not draft from pre-segment seeds."""
+        idx = torch.tensor([0])
+        with mock.patch(
+            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            return_value=True,
+        ):
+            fm = self._future_map()
+            for tok in range(1, 20):
+                fm.stash(idx, self._nextn_payload(tok))
+            stale = fm.topk_p_buf[0].clone()
+            for tok in range(20, 400):
+                fm.stash(idx, self._dflash_payload(tok))
+            self.assertTrue(torch.equal(fm.topk_p_buf[0], stale))
+            # Warm-up rounds: the catch-up attaches real seeds to the DFLASH
+            # draft input again (cross_algo_worker._warmkeep_nextn_after_
+            # dflash_round), so the payload stops being a placeholder.
+            for tok in range(400, 405):
+                fm.stash(idx, self._nextn_payload(tok))
+            self.assertFalse(torch.equal(fm.topk_p_buf[0], stale))
+            self.assertAlmostEqual(float(fm.topk_p_buf[0][0]), 404.0)
+
+    def test_dflash_first_then_nextn_sizes_the_buffers_from_real_data(self):
+        """Reverse order: a placeholder must never SIZE the pool buffers.
+        A (req_pool_size, 0) buffer would swallow every write silently and
+        then mismatch the first real payload -- the same bug, one round
+        later and much harder to read."""
+        idx = torch.tensor([0])
+        with mock.patch(
+            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            return_value=True,
+        ):
+            fm = self._future_map()
+            for tok in range(1, 30):
+                fm.stash(idx, self._dflash_payload(tok))
+            self.assertIsNone(fm.topk_p_buf)
+            self.assertIsNone(fm.hidden_states_buf)
+            fm.stash(idx, self._nextn_payload(99))
+            self.assertEqual(tuple(fm.topk_p_buf.shape), (8, 1))
+            self.assertEqual(tuple(fm.hidden_states_buf.shape), (8, 16))
+            self.assertAlmostEqual(float(fm.topk_p_buf[0][0]), 99.0)
+
+    def test_relayed_extras_do_not_depend_on_stash_order(self):
+        """Second bug of the same family, found while fixing the first:
+        need_hidden_states used to be latched from the FIRST payload's shape.
+        Under cross-algorithm switching a DFLASH round can be stashed first,
+        and it carries no hidden states -- which pinned the flag to False for
+        the FutureMap's whole life and silently stripped the NEXTN rung of
+        its hidden-state relay. Silent accept-rate loss, not a crash, so it
+        needs an explicit assertion."""
+        idx = torch.tensor([0])
+        with mock.patch(
+            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            return_value=True,
+        ):
+            nextn_first = self._future_map()
+            nextn_first.stash(idx, self._nextn_payload(1))
+            dflash_first = self._future_map()
+            dflash_first.stash(idx, self._dflash_payload(1))
+            bonus_first = self._future_map()
+            bonus_first.stash(
+                idx,
+                RelayPayload(bonus_tokens=torch.tensor([1], dtype=torch.int64)),
+            )
+            for fm in (nextn_first, dflash_first, bonus_first):
+                self.assertTrue(fm.need_topk)
+                self.assertTrue(fm.need_hidden_states)
+            # ... and the two that started without the field pick the real
+            # shape up as soon as a payload carries it.
+            for fm in (dflash_first, bonus_first):
+                self.assertIsNone(fm.hidden_states_buf)
+                fm.stash(idx, self._nextn_payload(2))
+                self.assertEqual(tuple(fm.hidden_states_buf.shape), (8, 16))
+
+    def test_bonus_only_payload_still_works(self):
+        """Flag-OFF / non-spec shape: a payload with no spec extras at all
+        was already tolerated and must stay tolerated."""
+        idx = torch.tensor([0])
+        with mock.patch(
+            "sglang.srt.speculative.spec_utils.spec_need_hidden_states",
+            return_value=True,
+        ):
+            fm = self._future_map()
+            fm.stash(idx, self._nextn_payload(5))
+            fm.stash(
+                idx,
+                RelayPayload(bonus_tokens=torch.tensor([6], dtype=torch.int64)),
+            )
+            self.assertEqual(int(fm.output_tokens_buf[0]), 6)
+            self.assertAlmostEqual(float(fm.topk_p_buf[0][0]), 5.0)
 
 
 if __name__ == "__main__":
