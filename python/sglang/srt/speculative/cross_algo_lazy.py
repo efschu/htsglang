@@ -493,6 +493,9 @@ class LazyCaptureController:
         self._best_nextn: Optional[float] = None
         self._signal_high = True  # cold start: the first probe is allowed
         self._failed_probe_signal: Dict[str, float] = {}
+        # Families that have actually RUN a measured window this session.
+        # Everything outside this set is a cold start (see _probe_allowed).
+        self._measured: set = {initial_family}
 
     # -- introspection (logging / tests / worker boot) ------------------
     @property
@@ -655,6 +658,8 @@ class LazyCaptureController:
                 self._adopt(self.adopted)
             return
         # DECIDE_END_MEASURE: rank 0 said which family wins.
+        if self.candidate is not None:
+            self._measured.add(self.candidate)
         won = family == self.candidate
         if not won and self.candidate is not None:
             # Remember the signal level at which this candidate lost, so the
@@ -697,8 +702,22 @@ class LazyCaptureController:
         cand = self._other(self.adopted)
         if cand == "dflash" and self.retired:
             return False
+        # The family dwell always binds -- it prices the switch itself.
         if (self._round - self._last_adopt_round) < self.cfg.min_dwell_rounds:
             return False
+        if cand not in self._measured:
+            # COLD START: this family has never run in this session, so there
+            # is nothing for the interval or the signal gate to reason ABOUT.
+            # Both exist to avoid re-asking a question already answered; at
+            # round 0 no question has been answered. Waiting out
+            # probe_interval_rounds here would strand the session on the boot
+            # family for the first ~512 rounds -- measured 2026-07-24: the
+            # lazy arm ran NEXTN for 517 rounds before its first probe, so
+            # three of four measurement runs never saw the other family at
+            # all. Mirrors the bandit's own rule ("never-measured rungs are
+            # probed as soon as the dwell allows", cross_algo_bandit
+            # _probe_candidate), so both explorers agree on cold start.
+            return True
         if (
             self._round - self._last_window_end
         ) < self.cfg.probe_interval_rounds:

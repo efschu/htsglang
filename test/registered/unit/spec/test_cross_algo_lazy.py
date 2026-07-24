@@ -317,7 +317,10 @@ class TestPhaseMachine(CustomTestCase):
 
     def test_measure_phase_runs_the_candidate(self):
         ctl = LazyCaptureController(_cfg())
-        _run(ctl, 106)  # into the window
+        for _ in range(200):  # drive until the window opens
+            _run(ctl, 1)
+            if ctl.phase == PHASE_MEASURE:
+                break
         self.assertEqual(ctl.phase, PHASE_MEASURE)
         v = ctl.step(ctl._round)
         self.assertEqual(v.running, "dflash")
@@ -354,7 +357,9 @@ class TestPhaseMachine(CustomTestCase):
         self.fail("no probe window was ever opened")
 
     def test_steady_k_decisions_run_on_the_cheap_cadence(self):
-        cfg = _cfg(decide_interval_rounds=16, probe_interval_rounds=10**6)
+        # min_dwell always binds, including at cold start -- so a dwell
+        # longer than the run isolates the k cadence.
+        cfg = _cfg(decide_interval_rounds=16, min_dwell_rounds=10**6)
         ctl = LazyCaptureController(cfg)
         events = _run(ctl, 100)
         kinds = {v.decision_kind for _r, v in events}
@@ -420,9 +425,11 @@ class TestSignalGate(CustomTestCase):
             ctl = LazyCaptureController(_cfg())
             # Adopt on every probe so the improve-since-failed-probe rule
             # never fires; the signal gate is what is under test here.
-            _run(ctl, 30, nextn=4.3, commit=lambda v: v.candidate)
+            # The first 200 rounds consume the ONE-TIME cold-start probe.
+            _run(ctl, 200, nextn=4.3, commit=lambda v: v.candidate)
+            before = ctl.window_count
             _run(ctl, 1000, nextn=signal, commit=lambda v: v.candidate)
-            return ctl.window_count
+            return ctl.window_count - before
 
         prose = run(2.9)  # 0.67 of the peak -> below the low threshold
         code = run(4.3)  # at the peak
@@ -431,10 +438,11 @@ class TestSignalGate(CustomTestCase):
 
     def test_high_signal_after_a_prose_stretch_re_enables_probing(self):
         ctl = LazyCaptureController(_cfg())
-        _run(ctl, 30, nextn=4.3, commit=lambda v: v.candidate)
+        _run(ctl, 200, nextn=4.3, commit=lambda v: v.candidate)  # cold start
+        cold = ctl.window_count
         _run(ctl, 300, nextn=2.9, commit=lambda v: v.candidate)
         windows_after_prose = ctl.window_count
-        self.assertEqual(windows_after_prose, 0)
+        self.assertEqual(windows_after_prose, cold, "prose opened a window")
         _run(ctl, 300, nextn=4.3, commit=lambda v: v.candidate)  # code is back
         self.assertGreater(ctl.window_count, windows_after_prose)
 
@@ -465,6 +473,40 @@ class TestSignalGate(CustomTestCase):
         _run(ctl, 400, nextn=4.5, commit=lambda v: v.adopted)
         self.assertGreater(ctl.window_count, after_first)
 
+    def test_cold_start_probes_after_the_dwell_not_after_the_interval(self):
+        # Measured 2026-07-24: with the interval binding at cold start the
+        # lazy arm sat on the boot family for 517 rounds, so three of four
+        # measurement runs never saw the other family at all. A family that
+        # has never run is not a repeated question.
+        cfg = _cfg(min_dwell_rounds=20, probe_interval_rounds=10**6)
+        ctl = LazyCaptureController(cfg)
+        events = _run(ctl, 400)
+        starts = [r for r, v in events if v.decision_kind == DECIDE_ENTER_MEASURE]
+        self.assertTrue(starts, "cold start never probed")
+        # dwell (20) + warmup (5), and the steady k cadence may add a round.
+        self.assertLess(starts[0], cfg.min_dwell_rounds + cfg.warmup_rounds + 4)
+
+    def test_cold_start_probes_even_when_the_signal_is_low(self):
+        # Nothing has been answered yet, so there is nothing for the signal
+        # gate to suppress -- same rule the bandit uses for unmeasured rungs.
+        ctl = LazyCaptureController(_cfg())
+        _run(ctl, 30, nextn=4.3)
+        _run(ctl, 200, nextn=2.0)  # signal collapses
+        self.assertFalse(ctl._signal_high)
+        self.assertGreaterEqual(ctl.window_count, 1)
+
+    def test_second_probe_is_back_under_the_interval_and_signal_gates(self):
+        # Cold start is a ONE-TIME bypass; afterwards the cadence binds again.
+        cfg = _cfg(min_dwell_rounds=20, probe_interval_rounds=300)
+        ctl = LazyCaptureController(cfg)
+        events = _run(ctl, 1000, commit=lambda v: v.candidate)
+        starts = [r for r, v in events if v.decision_kind == DECIDE_ENTER_MEASURE]
+        ends = [r for r, v in events if v.decision_kind == DECIDE_END_MEASURE]
+        self.assertGreaterEqual(len(starts), 2)
+        self.assertLess(starts[0], 40)  # cold start: fast
+        for end, nxt in zip(ends, starts[1:]):  # everything after: gated
+            self.assertGreaterEqual(nxt - end, cfg.probe_interval_rounds)
+
     def test_min_dwell_and_probe_interval_bound_the_cadence(self):
         cfg = _cfg(min_dwell_rounds=20, probe_interval_rounds=100)
         ctl = LazyCaptureController(cfg)
@@ -488,8 +530,11 @@ class TestSignalGate(CustomTestCase):
 
     def test_absolute_floor_blocks_probing_when_configured(self):
         ctl = LazyCaptureController(_cfg(signal_min_accept=4.0))
-        _run(ctl, 1000, nextn=3.5)
-        self.assertEqual(ctl.window_count, 0)
+        _run(ctl, 200, nextn=3.5, commit=lambda v: v.candidate)  # cold start
+        cold = ctl.window_count
+        self.assertEqual(cold, 1)
+        _run(ctl, 2000, nextn=3.5, commit=lambda v: v.candidate)
+        self.assertEqual(ctl.window_count, cold)
 
 
 class TestWarmkeepStride(CustomTestCase):
@@ -712,6 +757,8 @@ class TestWorkerWiring(CustomTestCase):
 
         # Back to steady: the pointer must be restored, not left None.
         ctl._adopt("nextn")
+        ctl._last_adopt_round = 3  # re-pin: _adopt keeps it on a no-op adopt
+        ctl._measured.add("dflash")  # cold start consumed
         ctl.observe(3, 1000, 4.0, 6.0)
         w._lazy_apply_capture_mode(ctl.step(3))
         self.assertEqual(toggles, [True, False])
