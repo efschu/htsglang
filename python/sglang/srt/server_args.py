@@ -1450,6 +1450,24 @@ class ServerArgs:
             "otherwise (byte-identical OFF).",
         ),
     ] = 0
+    kv_session_offload_prefill: A[
+        bool,
+        Arg(
+            help="kv-session-offload (Prefill-Spill / born-spilled): admit a "
+            "prompt whose KV would not fit in VRAM by writing its freshly "
+            "computed KV directly to the host pool DURING the prefill (per "
+            "chunk, D2H on the copy stream) instead of wedging / retracting it. "
+            "After the last chunk the session is handed over to the existing "
+            "off-batch decode spill tick (it then decodes in-spill at the host "
+            "rate, speculating again once VRAM frees and it waves back). "
+            "Requires --enable-kv-session-offload; only meaningful under "
+            "uneven-DCP (the write hook lives in the DCP owner-write path). "
+            "Default OFF -> the prefill path is byte-identical to today "
+            "(chunk / wedge). The global memory / decode-spill behaviour is "
+            "unchanged; this only adds a prefill-time admission + born-spilled "
+            "write path, gated behind this flag.",
+        ),
+    ] = False
     rank_tp_ratio: A[
         Optional[Union[List[int], str]],
         Arg(
@@ -3988,6 +4006,14 @@ class ServerArgs:
         """kv-session-offload (S1) scope validation: fail fast at arg-parse
         for every out-of-scope mode instead of desyncing the DCP collective
         sequence into a runtime NCCL hang or corrupting slot identity."""
+        if self.kv_session_offload_prefill and not self.enable_kv_session_offload:
+            # Prefill-Spill (born-spilled) is a sub-mode of the offload feature;
+            # it shares the host pool, admission reduce, and off-batch tick.
+            # Reject the flag standalone rather than silently ignore it.
+            raise ValueError(
+                "--kv-session-offload-prefill requires "
+                "--enable-kv-session-offload."
+            )
         if not self.enable_kv_session_offload:
             return
         if self.kv_session_offload_block_size <= 0:

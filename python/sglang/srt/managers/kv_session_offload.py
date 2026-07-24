@@ -1144,6 +1144,20 @@ class KVSessionOffloadManager:
         self.mtp_resident_slices = int(
             getattr(sa, "kv_session_offload_mtp_resident_slices", 0) or 0
         )
+        # Prefill-Spill (born-spilled) master gate (PS0). Read once here; the
+        # prefill-time admission (PS1), the born-spilled write hook (PS2), the
+        # host-prefix read (PS3) and the handover (PS4) are all gated on this.
+        # Default False -> the prefill path is byte-identical to today.
+        self.prefill_spill = bool(
+            getattr(sa, "kv_session_offload_prefill", False)
+        )
+        if self.prefill_spill:
+            logger.info(
+                "kv-session-offload prefill-spill (born-spilled) ENABLED: a "
+                "prompt whose KV exceeds VRAM is admitted and its KV is written "
+                "to host during the prefill, then handed to the off-batch decode "
+                "tick. (default path unchanged when off)."
+            )
         _spec = getattr(scheduler, "spec_algorithm", None)
         self.server_spec_algorithm = _spec
         # Ready only when the flag is on, the env allows spec on the spill lane
