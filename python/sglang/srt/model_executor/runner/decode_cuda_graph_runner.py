@@ -1019,6 +1019,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         "kvso spill-graph selftest raised (ignored): %r", _sess_e
                     )
 
+        # C4 (spec-in-spill): ENV-gated (KVSO_ATTN_SELFTEST) target-verify
+        # host-prefix attention correctness proof. Independent of the spill
+        # graph (resolves the target full-attn backend directly), gated by the
+        # env inside the method -> default OFF is byte-inert. Run once here now
+        # that the model + KV pool + staging buffers are fully initialized.
+        _sess_ab = getattr(self.attn_backend, "full_attn_backend", self.attn_backend)
+        attn_selftest = getattr(_sess_ab, "_sess_attn_selftest", None)
+        if (
+            attn_selftest is not None
+            and not self.model_runner.is_draft_worker
+            and getattr(_sess_ab, "_sess_enabled", False)
+        ):
+            try:
+                attn_selftest(self.model_runner)
+            except Exception as _sess_e:
+                # Diagnostic only -- never fail the boot on the selftest.
+                logger.warning(
+                    "kvso C4 attn selftest raised (ignored): %r", _sess_e
+                )
+
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
             self.model_runner.device,

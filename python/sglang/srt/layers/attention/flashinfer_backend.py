@@ -2142,11 +2142,20 @@ class FlashInferAttnBackend(AttentionBackend):
         which receives k/v broadcast from the head rank: the owner-rule +
         compact-slot mapping is identical for both, so it lives here once
         (single source of truth)."""
-        if self._sess_spill is not None:
-            # kv-session-offload spill tick: the new token's slot is a HOST
-            # sentinel -- never scatter it into the device pool. Route the
-            # (gathered, replicated-head) K/V through the scratch-row D2H
-            # owner-write instead. Strictly the spill-tick lane.
+        if self._sess_spill is not None and not self._sess_verify_active():
+            # kv-session-offload spill tick (plain DECODE): the new token's slot
+            # is a HOST sentinel -- never scatter it into the device pool. Route
+            # the (gathered, replicated-head) K/V through the scratch-row D2H
+            # owner-write instead. Strictly the plain-decode spill-tick lane.
+            #
+            # C4 (spec-in-spill-tick VERIFY): the num_draft candidate tokens are
+            # written to REAL device candidate slots (out_cache_loc from
+            # eagle_prepare_for_verify) -- they must take the NORMAL device
+            # scatter below, not the single-token host owner-write (whose st has
+            # no cur_owned field). The committed prefix stays host-resident;
+            # only accepted candidates are promoted to the committed prefix (on
+            # device) by the verify commit. So the verify spill tick falls
+            # through to the normal DCP owner scatter.
             self._sess_owner_write(layer, k_full, v_full)
             return
         if self.uneven_dcp_weighted:
@@ -2796,8 +2805,16 @@ class FlashInferAttnBackend(AttentionBackend):
             owned_counts_weighted,
         )
 
-        assert forward_batch.forward_mode.is_decode(), (
-            "kv-session-offload: spill tick must be a decode batch"
+        # C4 (spec-in-spill-tick): the spill tick's TARGET-VERIFY forward also
+        # routes here (bs=1 session, num_draft+1 query rows over the committed
+        # prefix). It builds a MINIMAL verify st (owned committed-prefix tail
+        # count + device head) and early-returns -- no decode schedule /
+        # double-buffer pipeline / spill-graph (the verify twin
+        # _sess_blockwise_prefix_return_lse builds its own block loop). The
+        # plain decode spill tick keeps its full path below (byte-identical).
+        is_verify = forward_batch.forward_mode.is_target_verify()
+        assert forward_batch.forward_mode.is_decode() or is_verify, (
+            "kv-session-offload: spill tick must be a decode or target-verify batch"
         )
         assert forward_batch.batch_size == 1, (
             "kv-session-offload: exactly one spilled session per tick"
@@ -2827,8 +2844,12 @@ class FlashInferAttnBackend(AttentionBackend):
         # host rows, cur_host_row) are TAIL counts; the head is attended
         # separately in _sess_blockwise_decode_return_lse.
         row = None
+        boundary, dev_head_idx, n_head_own = 0, None, 0
         head = slot.head
-        if head is None:
+        # C4 verify recomputes its own (suffix-aware) dev/host split below and
+        # must NOT read or poison the cached decode-time slot.head (whose
+        # boundary would wrongly fold the accepted device suffix into the head).
+        if head is None and not is_verify:
             row = self._sess_req_pool.req_to_token[
                 forward_batch.req_pool_indices[0], :L
             ]
@@ -2848,8 +2869,80 @@ class FlashInferAttnBackend(AttentionBackend):
                 dev_head_idx = None
             n_head_own = 0 if dev_head_idx is None else int(dev_head_idx.numel())
             slot.head = (boundary, dev_head_idx, n_head_own)
-        else:
+        elif head is not None and not is_verify:
             boundary, dev_head_idx, n_head_own = head
+
+        if is_verify:
+            # C4 (spec-in-spill-tick VERIFY, Option A -- accepted tokens stay
+            # DEVICE-resident): the committed prefix row is
+            #   [0, boundary) real HEAD ++ [boundary, spill_L) host SENTINELS ++
+            #   [spill_L, L) real accepted SUFFIX
+            # -- the FROZEN spilled host region [boundary, spill_L) never grows
+            # (draft_dev covers exactly it), and every new (bootstrap / accepted)
+            # token lands on device as the suffix, its target+draft KV persisting
+            # at its committed candidate slot. So the device-resident set is ALL
+            # real slots (head + suffix, NOT contiguous), the host stream is the
+            # sentinel block, and the twin's dev_head_idx spans both. Recomputed
+            # every verify tick (the suffix grows) -- NOT the cached slot.head.
+            # No in-flight current token, no count_cache mutation, no schedule/
+            # pipeline/graph. Rank-uniform: derived from the replicated row.
+            if row is None:
+                row = self._sess_req_pool.req_to_token[
+                    forward_batch.req_pool_indices[0], :L
+                ]
+            sentinel_mask = row >= self._sess_host_base
+            host_slots = row[sentinel_mask]  # FROZEN spilled host region
+            dev_slots = row[~sentinel_mask]  # head + accepted suffix (device)
+            if int(dev_slots.numel()) > 0:
+                _, dh = owned_device_indices(
+                    dev_slots,
+                    mode=self._sess_mode,
+                    S=self._sess_S,
+                    lo=lo,
+                    hi=hi,
+                    dcp_size=dcp if self._sess_mode != "plain" else 1,
+                    dcp_rank=rank,
+                )
+                dev_head_idx = dh.to(torch.int32).contiguous()
+                n_head_own = int(dev_head_idx.numel())
+            else:
+                dev_head_idx = None
+                n_head_own = 0
+            n_host = int(host_slots.numel())
+            if self._sess_mode == "weighted":
+                residues = host_slots.to(torch.int64) % self._sess_S
+                counts = owned_counts_weighted(residues, self._sess_prefix)
+            elif self._sess_mode == "even":
+                # Positional ownership: the sentinel encodes its absolute
+                # position as (slot - host_base) // S; count this rank's owned
+                # host positions directly (position-set, not a [0,L) prefix diff).
+                pos = (host_slots.to(torch.int64) - self._sess_host_base) // self._sess_S
+                counts = [int((pos % dcp == r).sum().item()) for r in range(dcp)]
+            else:
+                counts = [n_host]
+            assert sum(counts) == n_host, (
+                f"kv-session-offload: verify host owned counts {counts} do not "
+                f"cover host region {n_host} (rid slot-space corrupted)"
+            )
+            n_own = counts[rank]
+            drain = slot.host_row_base
+            assert drain + n_own <= self._sess_region_tokens, (
+                f"kv-session-offload: verify region high-water {drain + n_own} "
+                f"exceeds region ({self._sess_region_tokens} tokens)"
+            )
+            base = slot.region_base + drain
+            return SimpleNamespace(
+                verify=True,
+                L=L,
+                boundary=boundary,
+                n_own=n_own,
+                counts=counts,
+                host_row_base=base,
+                dev_head_idx=dev_head_idx,
+                n_head_own=n_head_own,
+                region_base=slot.region_base,
+                device=self._sess_staging_k.device,
+            )
 
         if self._sess_mode == "weighted":
             cache = slot.count_cache
@@ -3308,6 +3401,396 @@ class FlashInferAttnBackend(AttentionBackend):
         q_local = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         o, _ = self._sess_blockwise_decode_return_lse(q_local, layer)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    # ==================================================================
+    def _sess_verify_active(self) -> bool:
+        """True on a spec-in-spill-tick target-VERIFY forward whose committed
+        prefix is host-resident: route the DCP prefix read to the C4 twin
+        (_sess_blockwise_prefix_return_lse) instead of the monolithic paged
+        read. False for the plain decode spill tick and every non-spill batch
+        (getattr default), so those paths stay byte-identical."""
+        st = self._sess_spill
+        return st is not None and getattr(st, "verify", False)
+
+    # C4 (spec-in-spill-tick): target-VERIFY host-prefix attention. The
+    # spill-tick verify forward has bs = num_draft+1 QUERY rows (the
+    # candidate chain); they all attend the SAME committed prefix (device
+    # head [0, boundary) + host tail [boundary, L)) NON-CAUSALLY (every
+    # candidate lies strictly after the whole prefix). This is the direct
+    # ``_sess`` twin of the weightless-KV extend prefix read
+    # ``_wl_blockwise_prefix_return_lse`` (:4507): same online _safe_merge_
+    # state, same (o, lse) prefill-paged contract, only the host-block SOURCE
+    # is this session's spill region instead of the _wl host pool. Phase 1 is
+    # EAGER (no spill-graph). The candidate-tail tree-masked partial and the
+    # cross-rank cp_lse merge are handled by the caller (_forward_extend_dcp
+    # target_verify branch) exactly as for the monolithic paged read.
+    # ------------------------------------------------------------------
+
+    def _sess_prefix_prefill_wrapper(self):
+        """Persistent paged PREFILL wrapper for the C4 host-tail block read
+        (multi-row query). Shares the spill-lane workspace -- safe: on a spill
+        tick the main paged prefix wrapper is never .run() for the full-attn
+        layers (this loop replaces it), and every .run() here is stream-
+        ordered on the compute stream."""
+        w = getattr(self, "_sess_prefix_prefill_wrapper_obj", None)
+        if w is None:
+            w = BatchPrefillWithPagedKVCacheWrapper(
+                self._sess_workspace_buffer,
+                "NHD",
+                backend=self.prefill_backend,
+            )
+            w._sess_planned = None
+            self._sess_prefix_prefill_wrapper_obj = w
+        return w
+
+    def _sess_dev_head_prefill_wrapper(self):
+        """Persistent paged PREFILL wrapper for the C4 device-resident head
+        [0, boundary) read (multi-row query, REAL pool slot ids)."""
+        w = getattr(self, "_sess_dev_head_prefill_wrapper_obj", None)
+        if w is None:
+            w = BatchPrefillWithPagedKVCacheWrapper(
+                self._sess_workspace_buffer,
+                "NHD",
+                backend=self.prefill_backend,
+            )
+            w._sess_planned = None
+            self._sess_dev_head_prefill_wrapper_obj = w
+        return w
+
+    def _sess_blockwise_prefix_return_lse(self, q_full, layer, logits_soft_cap=None):
+        """C4 target-VERIFY twin of ``_wl_blockwise_prefix_return_lse``:
+        multi-row (num_draft+1) NON-CAUSAL paged read of this rank's committed
+        prefix for the spill tick -- device-resident head [0, boundary) from
+        the real pool + the host-resident tail [0, n_own) streamed blockwise
+        from the session spill region -- online-merged with the SAME
+        _safe_merge_state operator (both partials are the same flashinfer
+        paged-prefill family, identical byte class). Returns (o, lse) in the
+        same shape/space as ``prefill_wrapper_paged.forward_return_lse`` so the
+        caller's cross-rank cp_lse merge and the candidate-tail logaddexp
+        combine are UNCHANGED.
+
+        Intra-rank: NO collective is issued inside the loop. The block count is
+        rank-uniform (derived from the per-rank owned tail counts in
+        _sess_prepare_step's st, whose max is rank-uniform), so every DCP rank
+        streams the same number of blocks -> the caller's per-layer collective
+        count is preserved. Correctness-first EAGER staging: each block is
+        staged H2D on the compute stream, planned, attended, merged, in order
+        (no double-buffer prefetch -- that is a Phase-1.x perf refinement; the
+        decode lane keeps its pipeline)."""
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer
+
+        st = self._sess_spill
+        B = self._sess_block_size
+        fl = self._sess_full_layer_idx(layer)
+        Q = q_full.shape[0]
+        num_qo_heads = q_full.shape[1]
+        iu = self.indices_updater_prefill
+        num_kv_heads = iu.num_kv_heads
+        head_dim = q_full.shape[2]
+        if logits_soft_cap is None:
+            logits_soft_cap = layer.logit_cap
+        dev = self._sess_staging_k.device
+        qo_indptr = torch.tensor([0, Q], dtype=torch.int32, device=dev)
+        last_page = self.kv_last_page_len
+        kv_stage = self._sess_staging_kv
+        host = self._sess_host_pool
+        n_own = st.n_own
+        base = st.host_row_base
+
+        o_acc = None
+        lse_acc = None
+        # (1) Device-resident head [0, boundary): REAL pool slots, planned once
+        # per tick (indices frozen for the spill's life), attended non-causal.
+        idx = st.dev_head_idx
+        if idx is not None and int(idx.numel()) > 0:
+            w = self._sess_dev_head_prefill_wrapper()
+            head_indptr = torch.tensor(
+                [0, int(idx.numel())], dtype=torch.int32, device=idx.device
+            )
+            w.plan(
+                qo_indptr,
+                head_indptr,
+                idx,
+                last_page[:1],
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,  # page_size
+                causal=False,
+                q_data_type=iu.q_data_type,
+                kv_data_type=iu.data_type,
+            )
+            real_kv = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            o_acc, lse_acc = w.forward_return_lse(
+                q_full,
+                real_kv,
+                causal=False,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+        # (2) Host tail [0, n_own): stream in B-row blocks from the session
+        # spill region into staging region 0, attend non-causal, online-merge.
+        w = self._sess_prefix_prefill_wrapper()
+        k_local = (n_own + B - 1) // B if n_own > 0 else 0
+        for j in range(k_local):
+            s = j * B
+            e = min((j + 1) * B, n_own)
+            cnt = e - s
+            transfer_kv_per_layer(
+                src_k=host.k_data_refs[fl],
+                dst_k=self._sess_staging_k,
+                src_v=host.v_data_refs[fl],
+                dst_v=self._sess_staging_v,
+                src_indices=self._sess_host_arange[base + s : base + e],
+                dst_indices=self._sess_stage_arange64[:cnt],
+                item_size=host.token_stride_size,
+            )
+            blk_indptr = torch.tensor([0, cnt], dtype=torch.int32, device=dev)
+            w.plan(
+                qo_indptr,
+                blk_indptr,
+                self._sess_stage_arange32[:cnt],
+                last_page[:1],
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,  # page_size
+                causal=False,
+                q_data_type=iu.q_data_type,
+                kv_data_type=iu.data_type,
+            )
+            o_b, lse_b = w.forward_return_lse(
+                q_full,
+                kv_stage,
+                causal=False,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+            if o_acc is None:
+                o_acc, lse_acc = o_b, lse_b
+            else:
+                o_acc, lse_acc = _safe_merge_state(o_acc, lse_acc, o_b, lse_b)
+        if o_acc is None:
+            # This rank owns ZERO prefix slots -> shaped empty attention
+            # (o=0, lse=-inf) so the caller's cross-rank cp_lse merge stays
+            # balanced (same contract as the decode/_wl empty branch).
+            w = self._sess_prefix_prefill_wrapper()
+            empty_indptr = torch.zeros(2, dtype=torch.int32, device=dev)
+            w.plan(
+                qo_indptr,
+                empty_indptr,
+                self._sess_stage_arange32[:0],
+                last_page[:1],
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                1,
+                causal=False,
+                q_data_type=iu.q_data_type,
+                kv_data_type=iu.data_type,
+            )
+            o_acc, lse_acc = w.forward_return_lse(
+                q_full,
+                kv_stage,
+                causal=False,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+        return o_acc, lse_acc
+
+    def _sess_attn_selftest(self, model_runner):
+        """ENV-gated (KVSO_ATTN_SELFTEST) WITHIN-BOOT identical-input
+        correctness proof of the C4 target-verify host-prefix attention
+        (_sess_blockwise_prefix_return_lse). Default OFF -> byte-inert.
+
+        Self-contained (no _sess_prepare_step / no big-B / no big pool): builds
+        a SMALL synthetic committed prefix (a device-resident head + a
+        multi-block host tail, tiny so it fits any device pool), materializes
+        KNOWN K/V BYTE-EXACT into both the device slots and the host tail rows
+        (device slots written through get_kv_buffer, then transfer_kv_per_layer
+        D2H so the host bytes are identical to the device mirror -- the same
+        kernel the real spill uses), samples num_draft+1 NON-CAUSAL query rows,
+        and compares WITHIN ONE BOOT on IDENTICAL inputs:
+          * PATH T (twin): the host-stream blockwise device-head+tail attention
+            over the SPILL region (the C4 code under test);
+          * PATH R (ref):  the SAME committed-prefix KV gathered CONTIGUOUS on
+            device, attended by ONE plain paged prefill wrapper (non-causal).
+        Because T reads byte-identical KV, the ONLY gap T-vs-R is bounded
+        blockwise fp reassociation (decode-class); a WRONG mask/merge/host-read
+        diverges grossly. This is the silent-wrong-attention guard -- the caller
+        (verify) then only needs accept-len health, since spec is output-
+        preserving by construction. Intra-rank (no collective) -> rank-uniform,
+        no desync risk. Runs a small block-size ladder to exercise the
+        multi-block _safe_merge_state chain."""
+        import os
+        from types import SimpleNamespace
+
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer
+
+        if not os.environ.get("KVSO_ATTN_SELFTEST"):
+            return
+        rank = getattr(model_runner, "tp_rank", 0)
+        layers = [
+            m
+            for m in model_runner.model.modules()
+            if type(m).__name__ == "RadixAttention"
+        ]
+        layers.sort(key=lambda a: a.layer_id)
+        layers = [ly for ly in layers if self._is_full_attention_layer(ly)] or layers
+        if not layers:
+            logger.warning("kvso attn selftest: no attention layer found")
+            return
+        layer = layers[0]
+        dev = self._sess_staging_k.device
+        iu = self.indices_updater_prefill
+        num_qo = sum(self.dcp_q_head_counts) if self.uneven_dcp else iu.num_qo_heads
+        num_kv = iu.num_kv_heads
+        head_dim = iu.head_dim
+        fl = self._sess_full_layer_idx(layer)
+        # num_draft+1 verify query rows. Use the server's speculative width when
+        # configured, else a representative 4 (the attention is width-generic).
+        sa = model_runner.server_args
+        ndraft = int(getattr(sa, "speculative_num_draft_tokens", 0) or 0)
+        Q = ndraft if ndraft > 0 else 4
+        torch.manual_seed(20260724)
+        qdt = getattr(iu, "q_data_type", torch.bfloat16)
+        if not isinstance(qdt, torch.dtype):
+            qdt = torch.bfloat16
+        q = torch.randn(Q, num_qo, head_dim, device=dev).to(qdt)
+
+        # SMALL synthetic sizes (fit any device pool): override the block size
+        # to a tiny value so a few-hundred-token tail spans multiple blocks.
+        Bt = 16
+        head_n = 24  # device-resident head slots [1, 1+head_n)
+        rungs = [1, 2, 3]  # tail = R*Bt blocks -> exercises multi-block merge
+        kdev, vdev = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        real_k = self._sess_full_pool.k_buffer[fl]  # raw store (parallels host)
+        real_v = self._sess_full_pool.v_buffer[fl]
+        host = self._sess_host_pool
+        head_slots = torch.arange(1, 1 + head_n, device=dev, dtype=torch.int64)
+
+        def _plain_prefix_ref(idx_dev):
+            """Reference: ONE plain paged prefill wrapper over the contiguous
+            device slots `idx_dev` (the whole committed prefix), non-causal."""
+            w = BatchPrefillWithPagedKVCacheWrapper(
+                self._sess_workspace_buffer, "NHD", backend=self.prefill_backend
+            )
+            n = int(idx_dev.numel())
+            w.plan(
+                torch.tensor([0, Q], dtype=torch.int32, device=dev),
+                torch.tensor([0, n], dtype=torch.int32, device=dev),
+                idx_dev.to(torch.int32),
+                self.kv_last_page_len[:1],
+                num_qo,
+                num_kv,
+                head_dim,
+                1,
+                causal=False,
+                q_data_type=iu.q_data_type,
+                kv_data_type=iu.data_type,
+            )
+            o, _lse = w.forward_return_lse(
+                q,
+                (kdev, vdev),
+                causal=False,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+            return o
+
+        def _write_kv(dev_slots, host_rows):
+            """Fill `dev_slots` (device) with fresh random KV through the
+            logical get_kv_buffer view, then D2H-mirror the SAME bytes into
+            `host_rows` so the host tail is byte-identical to the device
+            mirror (transfer_kv_per_layer = the real spill's copy kernel)."""
+            n = int(dev_slots.numel())
+            kk = torch.randn(n, num_kv, head_dim, device=dev).to(kdev.dtype)
+            vv = torch.randn(n, num_kv, head_dim, device=dev).to(vdev.dtype)
+            kdev[dev_slots] = kk
+            vdev[dev_slots] = vv
+            if host_rows is not None:
+                transfer_kv_per_layer(
+                    src_k=real_k,
+                    dst_k=host.k_data_refs[fl],
+                    src_v=real_v,
+                    dst_v=host.v_data_refs[fl],
+                    src_indices=dev_slots,
+                    dst_indices=host_rows,
+                    item_size=host.token_stride_size,
+                )
+
+        rows = []
+        saved_block = self._sess_block_size
+        try:
+            self._sess_block_size = Bt
+            # device head KV (shared by twin's head-read and the reference)
+            _write_kv(head_slots, None)
+            for R in rungs:
+                tail_n = R * Bt
+                host_rows = self._sess_host_arange[0:tail_n]  # region base 0
+                # device mirror slots for the tail (contiguous, after the head)
+                dev_tail = torch.arange(
+                    1 + head_n, 1 + head_n + tail_n, device=dev, dtype=torch.int64
+                )
+                _write_kv(dev_tail, host_rows)
+                # synthetic spill state the twin reads (fields: n_own,
+                # host_row_base, dev_head_idx). boundary/head_n>0 -> the
+                # head+tail LSE merge is exercised.
+                st = SimpleNamespace(
+                    n_own=tail_n,
+                    host_row_base=0,
+                    dev_head_idx=head_slots.to(torch.int32).contiguous(),
+                )
+                self._sess_spill = st
+                # PATH T: the C4 twin (device head from real pool + host stream)
+                o_t, _ = self._sess_blockwise_prefix_return_lse(q, layer)
+                o_t = o_t.clone()
+                # PATH R: monolithic contiguous device prefill over the SAME
+                # committed prefix ([head slots] ++ [device tail mirror]).
+                ref_idx = torch.cat([head_slots, dev_tail])
+                o_r = _plain_prefix_ref(ref_idx)
+                md = float((o_t - o_r).abs().max().item())
+                denom = max(1e-6, float(o_r.abs().max().item()))
+                rel = md / denom
+                nan = bool(torch.isnan(o_t).any() or torch.isnan(o_r).any())
+                # bf16 blockwise reassociation is decode-class (~1e-2 rel);
+                # PASS well under that, FAIL on gross (wrong mask/merge/read).
+                ok = (not nan) and rel < 5e-2
+                verdict = (
+                    "NAN" if nan
+                    else ("MACHINE_ZERO" if md == 0.0
+                          else f"{'PASS' if ok else 'FAIL'} maxd={md:.3e} rel={rel:.3e}")
+                )
+                rows.append((R, tail_n, head_n, verdict))
+        finally:
+            self._sess_block_size = saved_block
+            self._sess_spill = None
+        logger.info(
+            "==== kvso C4 VERIFY-attn SELFTEST (rank %d) twin-vs-monolithic, "
+            "Q=%d head=%d block=%d (residual = bounded blockwise fp "
+            "reassociation; gross divergence = wrong mask/merge/host-read) ====",
+            rank,
+            Q,
+            head_n,
+            Bt,
+        )
+        for R, tail_n, head_n_, verdict in rows:
+            logger.info(
+                "  blocks=%-3d owned_tail=%-6d dev_head=%-6d: %s",
+                R,
+                tail_n,
+                head_n_,
+                verdict,
+            )
+        logger.info("==== kvso C4 VERIFY-attn SELFTEST done (rank %d) ====", rank)
 
     # ==================================================================
     # S5: CUDA-graph capture/replay of the bs=1 spill tick. PORT of the
@@ -4878,7 +5361,16 @@ class FlashInferAttnBackend(AttentionBackend):
             q_full = cp_all_gather_heads_uneven(
                 q_local, group, self.dcp_q_head_counts
             )
-            if getattr(self, "_wl_spill_active", False) and getattr(
+            if self._sess_verify_active():
+                # C4 (spec-in-spill-tick): this rank's committed prefix lives on
+                # host (kv-session-offload spill) -- stream it blockwise via the
+                # session spill region with the multi-row NON-CAUSAL verify twin.
+                # Rank-LOCAL (no collective inside); the cp_lse below is reached
+                # identically. (_sess and _wl spills are mutually exclusive.)
+                o_pre_raw, lse_pre_raw = self._sess_blockwise_prefix_return_lse(
+                    q_full, layer, logits_soft_cap
+                )
+            elif getattr(self, "_wl_spill_active", False) and getattr(
                 self, "_dcp_extend_has_host", False
             ):
                 # Stage B1: part of this rank's owned prefix lives on host --
@@ -4970,7 +5462,16 @@ class FlashInferAttnBackend(AttentionBackend):
         # main lane waits for B (and transitively A) before the paged read.
         if not _reorder_only:
             cur_stream.wait_stream(comm_stream)
-        if getattr(self, "_wl_spill_active", False) and getattr(
+        if self._sess_verify_active():
+            # C4 (spec-in-spill-tick): host-resident committed prefix -> the
+            # multi-row NON-CAUSAL verify twin over the session spill region.
+            # Rank-LOCAL main-lane compute (no collective inside the loop), so
+            # the two-lane schedule is unchanged: C still follows on the comm
+            # lane exactly as with the plain paged read.
+            o_pre_raw, lse_pre_raw = self._sess_blockwise_prefix_return_lse(
+                q_full, layer, logits_soft_cap
+            )
+        elif getattr(self, "_wl_spill_active", False) and getattr(
             self, "_dcp_extend_has_host", False
         ):
             # Stage B1 (weightless-KV): part of this rank's owned prefix lives

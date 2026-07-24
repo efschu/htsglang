@@ -273,6 +273,17 @@ def draft_kv_verify_enabled() -> bool:
     return os.environ.get("KVSO_S1_VERIFY", "0") == "1"
 
 
+def tick_trace_enabled() -> bool:
+    """Diagnostic-only time-series trace of the self-cal spill-tick regulator:
+    when SGLANG_KVSO_TICK_TRACE=1, emit one throttled log line per spilled
+    session while any spill is in flight -- effective interval, measured
+    tick_cost, binding headroom ratio, and the CURRENT host-tail size
+    (offload length in tokens). Pure logging; reads only existing regulator /
+    slot state and changes NO control decision, so default OFF is byte-
+    identical (and this trace is a no-op unless the adaptive regulator is on)."""
+    return os.environ.get("SGLANG_KVSO_TICK_TRACE", "0") == "1"
+
+
 def spill_graph_blocks_needed(owned_tokens: int, block_size: int) -> int:
     """Number of streamed host blocks for ``owned_tokens`` at ``block_size``
     (ceil, at least 1). For rank-uniform capture pass the MAX owned count
@@ -740,6 +751,17 @@ class SpillSlot:
         "tick_hiddens",
         "tick_hidden_start",
         "suppress_tick",
+        # C2 (spec-in-spill-tick, Option b'): the spilled session's DRAFT KV
+        # kept DEVICE-resident so draft() runs as a normal device decode while
+        # the (large, DCP-sharded) TARGET KV lives on host. draft_dev_k/v are
+        # stacked [layer_num, tail_cap, *row] device tensors holding the draft
+        # tail [draft_spill_boundary, draft_dev_len); draft_dev_len grows with
+        # the host tail as accepted tokens append their draft KV. Only set when
+        # spec-in-tick routes this session (else None -> plain host tick).
+        "draft_dev_k",
+        "draft_dev_v",
+        "draft_dev_len",
+        "spec_in_tick",
     )
 
     def __init__(self, req, region, spill_iter, wave, hysteresis):
@@ -782,6 +804,13 @@ class SpillSlot:
         # re-forward. tick_hidden_start pins the first accumulated position.
         self.tick_hiddens = []
         self.tick_hidden_start = None
+        # C2 (spec-in-spill-tick): device-resident draft-KV buffer for this
+        # spilled session (Option b'). None until try_spill routes the session
+        # under spec-in-tick; draft_dev_len tracks the resident tail length.
+        self.draft_dev_k = None
+        self.draft_dev_v = None
+        self.draft_dev_len = 0
+        self.spec_in_tick = False
         # RESTORE-READINESS handshake (quiescence-trap fix): when a spilled
         # session is restore-ready but its last host-tick result is still
         # pending (last_batch is its own tick), one tick is suppressed so the
@@ -1096,6 +1125,110 @@ class KVSessionOffloadManager:
                 getattr(self.draft_full_pool, "head_num", -1),
             )
 
+        # === C2/C3 (spec-in-spill-tick, Phase 1 EAGER): run the model-configured
+        # NEXTN/EAGLE drafter DURING the spill tick (Option b': draft KV kept
+        # DEVICE-resident, only the TARGET KV host-streams via the C4 verify
+        # twin). DFLASH is EXCLUDED for spilled (long-context) sessions -- only
+        # the ONE configured NEXTN/EAGLE-family drafter is used (short-ctx DFLASH
+        # is off by the ctx-gate at spill lengths anyway). Gated so OFF is
+        # byte-identical: spec_in_tick_ready False -> _build_spill_batch keeps
+        # spec_algorithm=NONE (plain host tick, unchanged).
+        self.spec_in_tick = bool(
+            getattr(sa, "kv_session_offload_spec_in_tick", False)
+        )
+        self.mtp_resident_slices = int(
+            getattr(sa, "kv_session_offload_mtp_resident_slices", 0) or 0
+        )
+        _spec = getattr(scheduler, "spec_algorithm", None)
+        self.server_spec_algorithm = _spec
+        # Ready only when the flag is on, the env allows spec on the spill lane
+        # (KVSO_ALLOW_SPEC -- the same bring-up gate server_args validates for
+        # --kv-session-offload-spec-in-tick), the server runs a NON-DFLASH spec
+        # algorithm, and the draft pool exists (device-resident draft KV needs
+        # it). NOTE: this is INDEPENDENT of KVSO_RESUME (the wave-back/host-
+        # finish gate) -- spec-in-tick runs draft/verify DURING the spill and
+        # does not require the resume path to engage.
+        self.spec_in_tick_ready = bool(
+            self.spec_in_tick
+            and os.environ.get("KVSO_ALLOW_SPEC", "0") == "1"
+            and _spec is not None
+            and not _spec.is_none()
+            and not _spec.is_dflash_family()
+            and self.draft_full_pool is not None
+        )
+        if self.spec_in_tick:
+            logger.info(
+                "kv-session-offload spec-in-spill-tick: flag=%s ready=%s "
+                "(server_spec=%s dflash_excluded=%s resident_slices=%d). When "
+                "ready, spilled sessions run draft()/verify() during the tick; "
+                "DFLASH is excluded (only the configured NEXTN/EAGLE drafter).",
+                self.spec_in_tick,
+                self.spec_in_tick_ready,
+                None if _spec is None else _spec,
+                _spec is not None and _spec.is_dflash_family(),
+                self.mtp_resident_slices,
+            )
+
+        # C3/d4 draft-read SCRATCH: the spill-tick draft attends its resident
+        # draft-KV tail through draft-POOL slots (req_to_token surgery). Under
+        # spill PRESSURE the shared allocator has NO free slots (that is why the
+        # session spilled), so per-tick alloc fails -> the scratch is reserved
+        # ONCE here, sized to the resident cap, and held for the manager's life.
+        # A positive --kv-session-offload-mtp-resident-slices is REQUIRED to arm
+        # the device draft (the reservation must be bounded); with 0 (uncapped)
+        # no scratch is reserved and every spilled session falls back to the
+        # plain host tick (spec-in-tick effectively off but crash-free). The
+        # reserved slot ids index BOTH pools (shared slot space); only the draft
+        # pool is written at them, and the tail must fit (mtp_resident_tail_fits
+        # uses the same cap so an over-cap tail plain-falls-back before surgery).
+        self._draft_read_scratch = None
+        if self.spec_in_tick_ready and self.mtp_resident_slices > 0:
+            _sc = self.allocator.alloc(self.mtp_resident_slices)
+            if _sc is not None:
+                self._draft_read_scratch = _sc.to(torch.int64)
+                # Take the reserved slots OUT of the pool's accounted size so the
+                # SchedulerInvariantChecker (available + evictable + protected +
+                # session_held + uncached == total, total = allocator.size)
+                # stays balanced -- they are genuinely out of circulation for the
+                # manager's life. This honestly shrinks the effective KV capacity
+                # by the resident cap (the operator's device-draft budget).
+                try:
+                    self.allocator.size -= int(self.mtp_resident_slices)
+                except Exception:
+                    pass
+                logger.info(
+                    "kv-session-offload spec-in-tick: reserved %d draft-read "
+                    "scratch slots (held for the manager's life; index the "
+                    "shared draft/target slot space, written on the draft pool "
+                    "only; allocator.size shrunk to %d to keep the leak "
+                    "invariant balanced). (rank %d)",
+                    self.mtp_resident_slices,
+                    self.allocator.size,
+                    self.dcp_rank,
+                )
+            else:
+                logger.warning(
+                    "kv-session-offload spec-in-tick: could NOT reserve %d "
+                    "draft-read scratch slots (avail %d) -> spilled sessions "
+                    "fall back to the plain host tick (no device draft).",
+                    self.mtp_resident_slices,
+                    self.allocator.available_size(),
+                )
+        elif self.spec_in_tick_ready:
+            logger.warning(
+                "kv-session-offload spec-in-tick: --kv-session-offload-mtp-"
+                "resident-slices is 0 (uncapped); the device draft-read scratch "
+                "needs a POSITIVE bound, so spilled sessions fall back to the "
+                "plain host tick. Set a positive cap to arm the device draft."
+            )
+        # The device draft can only arm when the read scratch is actually
+        # reserved -- otherwise every spilled session would plain-fall-back. Tie
+        # readiness to the reservation so try_spill never routes a session it
+        # cannot draft (spec_in_tick stays False -> the spill batch stays plain,
+        # byte-identical to the pre-feature path).
+        if self.spec_in_tick_ready and self._draft_read_scratch is None:
+            self.spec_in_tick_ready = False
+
         # S4 multi-spill: the host pool is partitioned into `max_spills` equal
         # regions of `region_tokens` rows each; region r owns host rows
         # [r * region_tokens, (r+1) * region_tokens). At most one session per
@@ -1136,6 +1269,10 @@ class KVSessionOffloadManager:
         # not separate tick from main decode and conservatively holds the floor.
         _spec0 = getattr(scheduler, "spec_algorithm", None)
         self._regulator_spec_server = _spec0 is not None and not _spec0.is_none()
+        # Diagnostic-only regulator time-series trace (default OFF -> byte-
+        # identical); cached once so the per-iteration path stays branch-cheap.
+        self._tick_trace = tick_trace_enabled()
+        self._tick_trace_iter = 0
         if bool(getattr(sa, "kv_session_offload_tick_adaptive", False)):
             self.tick_controller = SpillTickController(
                 floor_interval=int(sa.kv_session_offload_tick_floor),
@@ -1247,6 +1384,22 @@ class KVSessionOffloadManager:
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
         out = float(t.item())
         return float("inf") if out >= _REDUCE_INF else out
+
+    def _min_reduce_avail(self, local_avail: int) -> int:
+        """all-reduce(MIN) of the per-rank allocator available_size over the TP
+        collective. Under uneven DCP the per-rank pool sizes differ, so a spec
+        spill tick's device candidate allocation must be gated on the BINDING
+        (least-slack) rank -- else ranks diverge on whether to tick and the
+        collective spill forward DESYNCs (NCCL hang). Called only when a spill
+        tick is due (rank-uniform), so every rank enters this collective at the
+        same iteration; MIN over one int is bit-exact -> identical on every
+        rank."""
+        grp = getattr(self.scheduler, "tp_cpu_group", None)
+        if grp is None or torch.distributed.get_world_size(grp) <= 1:
+            return int(local_avail)
+        t = torch.tensor([int(local_avail)], dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
+        return int(t.item())
 
     # -- slot bookkeeping -------------------------------------------------
 
@@ -1622,6 +1775,37 @@ class KVSessionOffloadManager:
             # never restores, so skip the D2H entirely there.
             draft_k_snap, draft_v_snap = self._draft_kv_snapshot(seg)
 
+        # C2 (spec-in-spill-tick, Option b'): if this session is routed for
+        # spec-in-tick and its draft tail fits the resident cap, snapshot the
+        # draft KV into a DEVICE buffer (kept resident so draft() runs on device
+        # while spilled). Overflow -> graceful plain host tick for this session
+        # (spec_in_tick stays False; NOT an OOM). Captured BEFORE the free below
+        # reclaims the slots, ordered after the in-flight forward by the
+        # _wait_forward_stream() already issued above.
+        draft_dev_k = draft_dev_v = None
+        session_spec_in_tick = False
+        if self.spec_in_tick_ready:
+            tail_tokens = L - boundary  # full tail (draft pool not DCP-sharded)
+            if mtp_resident_tail_fits(tail_tokens, self.mtp_resident_slices):
+                cap = (
+                    self.mtp_resident_slices
+                    if self.mtp_resident_slices > 0
+                    else self.region_tokens
+                )
+                draft_dev_k, draft_dev_v, _ndev = self._draft_kv_snapshot_device(
+                    seg, cap
+                )
+                session_spec_in_tick = True
+            else:
+                self._log(
+                    "kv-session-offload spec-in-tick: rid=%s draft tail %d "
+                    "exceeds resident cap %d -> graceful plain host tick (no "
+                    "spec) for this session.",
+                    req.rid,
+                    tail_tokens,
+                    self.mtp_resident_slices,
+                )
+
         # 2. Free ONLY the tail device slots. The head [0, boundary) -- the
         #    shared protected radix prefix AND the retained exclusive head --
         #    stays device-resident and tree-locked (last_node / prefix_indices
@@ -1655,6 +1839,16 @@ class KVSessionOffloadManager:
             slot.draft_kv_v = draft_v_snap
             slot.draft_spill_boundary = boundary
             slot.draft_spill_L = L
+        if draft_dev_k is not None:
+            # C2 (spec-in-spill-tick): the device-resident draft-KV tail. The
+            # draft() surgery (d4) copies [0, draft_dev_len) into draft-pool
+            # scratch slots around the tick and appends accepted-token draft KV.
+            slot.draft_dev_k = draft_dev_k
+            slot.draft_dev_v = draft_dev_v
+            slot.draft_dev_len = L - boundary
+            slot.draft_spill_boundary = boundary
+            slot.draft_spill_L = L
+            slot.spec_in_tick = True
         self.spills[req.req_pool_idx] = slot
 
         keep = [i for i in range(len(batch.reqs)) if i != idx]
@@ -1708,6 +1902,37 @@ class KVSessionOffloadManager:
         # session runs MTP normally; on restore the session rejoins the device
         # batch and MTP resumes from its resident GDN state). Correct, just
         # unaccelerated while spilled.
+        #
+        # C3/d1 (spec-in-spill-tick, Option b'): when this session is routed
+        # for spec-in-tick (try_spill snapshotted its draft KV DEVICE-resident,
+        # slot.spec_in_tick=True) the tick runs the model-configured NEXTN/EAGLE
+        # drafter DURING the spill: keep the SERVER spec algorithm on the batch
+        # so prepare_for_decode -> eagle_prepare_for_decode allocates candidate
+        # slots and forward_batch_generation takes the real draft->verify path.
+        # DFLASH is EXCLUDED for spilled (long-context) sessions -- spec_in_tick
+        # is only ever set for the ONE configured NEXTN/EAGLE-family drafter
+        # (spec_in_tick_ready gates out is_dflash_family()); short-ctx DFLASH is
+        # off by the ctx-gate at spill lengths anyway. OFF path is byte-
+        # identical: slot None / spec_in_tick False -> spec_algorithm stays NONE.
+        # spec-in-tick armed from the FIRST tick (no plain bootstrap tick, so the
+        # committed L never shifts out of lockstep with the frozen host region /
+        # draft_dev). The first tick has no draft seed yet -> the worker runs a
+        # TRIVIAL 1-node verify (device-suffix token, captures last_hidden); every
+        # later tick re-seeds the draft from that captured hidden. Both go through
+        # the C4 verify twin, so the committed prefix stays head + frozen host
+        # sentinels + growing device suffix (Option A).
+        _slot = self.spills.get(req.req_pool_idx)
+        _spec_in_tick = (
+            self.spec_in_tick_ready
+            and _slot is not None
+            and getattr(_slot, "spec_in_tick", False)
+        )
+        _server_spec = getattr(sch, "spec_algorithm", None)
+        _batch_spec = (
+            _server_spec
+            if (_spec_in_tick and _server_spec is not None)
+            else SpeculativeAlgorithm.NONE
+        )
         batch = ScheduleBatch.init_new(
             reqs=[req],
             req_to_token_pool=sch.req_to_token_pool,
@@ -1715,9 +1940,18 @@ class KVSessionOffloadManager:
             tree_cache=sch.tree_cache,
             model_config=sch.model_config,
             enable_overlap=sch.enable_overlap,
-            spec_algorithm=SpeculativeAlgorithm.NONE,
+            spec_algorithm=_batch_spec,
         )
         batch.kv_session_spill_tick = True
+        if _spec_in_tick:
+            self._log(
+                "kv-session-offload spec-in-tick: rid=%s spill batch armed with "
+                "server spec algo %s (draft KV device-resident, len=%d) (rank %d)",
+                req.rid,
+                _server_spec,
+                getattr(_slot, "draft_dev_len", 0),
+                self.dcp_rank,
+            )
         # ON-DEVICE MTP RESUME: under an active server spec algorithm, ask the
         # tick's plain target forward to also emit the LAST token's hidden state
         # (capture_hidden_mode=LAST). It is cloned into the slot after the
@@ -1822,6 +2056,42 @@ class KVSessionOffloadManager:
                     len(self.spills),
                     tc.n_changes,
                 )
+            # Diagnostic-only time series (SGLANG_KVSO_TICK_TRACE=1): correlate
+            # the emergent interval / measured tick_cost / binding headroom with
+            # the CURRENT host-tail (offload) size, so "offload grows -> tick
+            # cost grows -> interval widens" (or not) is directly observable.
+            # Throttled; reads only existing state -> no control effect.
+            if self._tick_trace and self.spills:
+                self._tick_trace_iter += 1
+                if self._tick_trace_iter % 8 == 0:
+                    tc = self.tick_controller
+                    headroom = (
+                        tc._ratio_window[-1] if tc._ratio_window else float("nan")
+                    )
+                    max_tail = 0
+                    tot_tail = 0
+                    for _s in self.spills.values():
+                        _r = _s.req
+                        _L = len(_r.origin_input_ids) + len(_r.output_ids) - 1
+                        _b = int(getattr(_r, "kv_spill_boundary", 0) or 0)
+                        _t = max(0, _L - _b)
+                        tot_tail += _t
+                        if _t > max_tail:
+                            max_tail = _t
+                    self._log(
+                        "kv-session-offload: tick-trace t=%.3f interval=%d "
+                        "tick_cost=%.3fms headroom=%.4f host_tail=%d "
+                        "host_tail_sum=%d spilled=%d",
+                        time.time(),
+                        tc._effective,
+                        self._tick_cost_ms
+                        if self._tick_cost_ms is not None
+                        else float("nan"),
+                        headroom,
+                        max_tail,
+                        tot_tail,
+                        len(self.spills),
+                    )
 
         # 1. Reap sessions that finished on host (release ran in the result
         #    processor and already freed the region + backend slot).
@@ -2086,15 +2356,41 @@ class KVSessionOffloadManager:
         if slot.batch is None:
             slot.batch = self._build_spill_batch(slot.req)
             self._log(
-                "kv-session-offload: first spill tick for rid=%s (L=%d)",
+                "kv-session-offload: first spill tick for rid=%s (L=%d spec=%s)",
                 slot.req.rid,
                 int(slot.batch.seq_lens_cpu[0].item()),
+                not slot.batch.spec_algorithm.is_none(),
             )
         batch = slot.batch
         batch.filter_batch()
         if batch.is_empty():
             self._close_slot(slot.req.req_pool_idx, "finished on host")
             return None
+        # C4 (spec-in-spill-tick, Option A): a spec spill tick allocates DEVICE
+        # candidate slots (eagle_prepare_for_decode) and accepted tokens stay
+        # device-resident (growing suffix), so under device pressure the pool
+        # can be exhausted -> alloc_token_slots would OOM-crash. Gate the spec
+        # tick on a RANK-UNIFORM MIN-reduced headroom: if the binding rank
+        # cannot fit the per-decode candidate reserve, ALL ranks skip THIS tick
+        # (the session waits for headroom -- correct spill behavior; it resumes
+        # once co-resident sessions free device KV, or restores via wave-back).
+        # Plain (non-spec) spill ticks use sentinel slots (no device alloc) and
+        # are never gated. The MIN-reduce keeps the collective forward in
+        # lock-step (a per-rank available_size gate would desync -> NCCL hang).
+        if not batch.spec_algorithm.is_none():
+            from sglang.srt.mem_cache.common import get_alloc_reserve_per_decode
+
+            need = get_alloc_reserve_per_decode() + 8
+            min_avail = self._min_reduce_avail(self.allocator.available_size())
+            if min_avail < need:
+                self._log(
+                    "kv-session-offload spec-in-tick: device headroom %d < %d "
+                    "(binding rank) rid=%s -> skip spec tick this iter",
+                    min_avail,
+                    need,
+                    slot.req.rid,
+                )
+                return None
         batch.prepare_for_decode()
         # Re-arm LAST-hidden capture EVERY tick: the persistent spill batch's
         # capture_hidden_mode is reset (to None) after each forward, so setting
@@ -2112,6 +2408,206 @@ class KVSessionOffloadManager:
         return batch
 
     # -- restore ------------------------------------------------------------
+
+    def _draft_kv_snapshot_device(self, seg, cap):
+        """C2 (spec-in-spill-tick, Option b'): clone the draft KV tail ``seg``
+        into a DEVICE-resident stacked buffer ``[layer_num, cap, *row]`` per K
+        and V, filled ``[0, len(seg))``. Kept on device (unlike the pinned-CPU
+        ``_draft_kv_snapshot`` used by the resume path) so the spill-tick
+        ``draft()`` attends it as a normal device decode while the TARGET KV
+        host-streams. FULL tail (draft pool is not DCP-token-sharded, M4). Raw
+        ``store_dtype``. Ordered after the in-flight forward by the caller's
+        ``_wait_forward_stream()``. ``cap`` bounds the resident growth (the
+        session appends accepted-token draft KV up to ``cap``)."""
+        dp = self.draft_full_pool
+        assert getattr(dp, "page_size", 1) == 1, (
+            "kv-session-offload spec-in-tick: draft pool page_size must be 1 "
+            f"(got {getattr(dp, 'page_size', None)})"
+        )
+        seg64 = seg.to(torch.int64)
+        n = int(seg64.numel())
+        pcap = int(dp.k_buffer[0].shape[0])
+        if n:
+            hi = int(seg64.max().item())
+            lo = int(seg64.min().item())
+            assert 0 <= lo and hi < pcap, (
+                "kv-session-offload spec-in-tick device snapshot: slot id out of "
+                f"draft pool bounds [0,{pcap}): min={lo} max={hi}"
+            )
+        assert n <= cap, (
+            f"kv-session-offload spec-in-tick: draft tail {n} exceeds resident "
+            f"buffer cap {cap} (should have been caught by mtp_resident_tail_fits)"
+        )
+        ln = int(dp.layer_num)
+        kbuf = dp.k_buffer[0].new_empty((ln, cap) + tuple(dp.k_buffer[0].shape[1:]))
+        vbuf = dp.v_buffer[0].new_empty((ln, cap) + tuple(dp.v_buffer[0].shape[1:]))
+        for l in range(ln):
+            if n:
+                kbuf[l, :n] = dp.k_buffer[l][seg64]
+                vbuf[l, :n] = dp.v_buffer[l][seg64]
+        return kbuf, vbuf, n
+
+    # === C3/d4 (spec-in-spill-tick): DRAFT req_to_token surgery ============
+    # The spilled session's committed-prefix TAIL [boundary, L) carries HOST
+    # SENTINELS in the shared req_to_token (the target KV lives on host). The
+    # draft READ (draft attention over req_to_token[rpi, :L]) would attend
+    # garbage at those sentinel slots. Around draft() we temporarily point that
+    # tail at DEVICE draft-scratch slots loaded from the resident draft_dev_k/v
+    # snapshot, run draft(), then restore the sentinels. The device HEAD
+    # [0, boundary) keeps its real (never-freed, tree-locked) draft slots. The
+    # draft WRITE target [L, L+num_steps] is the candidate region eagle_prepare_
+    # for_decode allocated -- untouched by this surgery, so writes hit real
+    # device draft slots (no pool corruption). Rank-uniform: every DCP rank
+    # holds the full replicated draft context and runs the identical surgery.
+
+    # Signal returned by spec_in_tick_draft_pre when a device draft CANNOT run
+    # for this tick (no reserved scratch, or the tail overflowed the reserved
+    # cap): the worker MUST fall back to the plain host tick -- running the
+    # spec draft over the host SENTINELS would be a CUDA illegal access.
+    DRAFT_SURGERY_FALLBACK = "kvso_spec_in_tick_fallback"
+
+    def spec_in_tick_draft_pre(self, batch):
+        """d4 PRE (call right before draft()): redirect the spilled session's
+        committed-prefix tail req_to_token slots to the RESERVED device draft-
+        scratch, loaded from draft_dev_k/v. Returns:
+          * an opaque handle           -> surgery applied, run the device draft;
+          * ``DRAFT_SURGERY_FALLBACK`` -> device draft CANNOT run (no scratch /
+                                          tail over cap) -> caller plain-falls-
+                                          back (drafting over the host sentinels
+                                          would be an illegal memory access);
+          * ``None``                   -> no surgery needed (empty tail)."""
+        rpi = int(batch.req_pool_indices[0].item())
+        slot = self.spills.get(rpi)
+        if slot is None or not getattr(slot, "spec_in_tick", False):
+            return None
+        if slot.draft_dev_k is None:
+            return None
+        boundary = int(slot.draft_spill_boundary)
+        L = int(slot.draft_spill_L)
+        n = int(slot.draft_dev_len)
+        if n <= 0:
+            return None
+        assert n == L - boundary, (
+            f"kv-session-offload spec-in-tick draft surgery: draft_dev_len {n} "
+            f"!= L-boundary {L - boundary} (rid={slot.req.rid})"
+        )
+        scratch = self._draft_read_scratch
+        if scratch is None or n > int(scratch.numel()):
+            # No reserved scratch, or the resident tail overflowed the reserved
+            # cap -> the device draft cannot run this tick: plain-fallback.
+            self._log(
+                "kv-session-offload spec-in-tick: draft tail %d has no "
+                "reserved scratch (cap=%s) rid=%s -> plain host tick this tick",
+                n,
+                None if scratch is None else int(scratch.numel()),
+                slot.req.rid,
+            )
+            return self.DRAFT_SURGERY_FALLBACK
+        scratch = scratch[:n]
+        dp = self.draft_full_pool
+        self._wait_forward_stream()
+        ln = int(dp.layer_num)
+        for l in range(ln):
+            dp.k_buffer[l][scratch] = slot.draft_dev_k[l, :n]
+            dp.v_buffer[l][scratch] = slot.draft_dev_v[l, :n]
+        r2t = self.req_to_token_pool.req_to_token
+        saved = r2t[rpi, boundary:L].clone()
+        r2t[rpi, boundary:L] = scratch.to(r2t.dtype)
+        return (rpi, boundary, L, saved)
+
+    def spec_in_tick_seed(self, batch):
+        """d2: build the per-tick EAGLE draft seed for a spec-in-tick spilled
+        session from the LAST committed token's target hidden (the proven
+        seed-only resume primitive -- topk_p=1, topk_index=[last_tok],
+        hidden_states=last_hidden). Valid one-row seed; the draft's num_steps
+        forwards then attend the surgery-provided device draft prefix KV.
+        Returns None when the session is not spec-in-tick / has no seed yet."""
+        rpi = int(batch.req_pool_indices[0].item())
+        slot = self.spills.get(rpi)
+        if slot is None or not getattr(slot, "spec_in_tick", False):
+            return None
+        if getattr(slot, "last_hidden", None) is None:
+            return None
+        L = int(batch.seq_lens_cpu[0].item())
+        return self._seed_only_resume(slot, L)
+
+    def spec_in_tick_bootstrap_seed(self, batch):
+        """d2 BOOTSTRAP: the first spec-in-tick after a spill has no captured
+        hidden yet, so it runs a TRIVIAL 1-node verify (no draft). Provide the
+        minimal EagleDraftInput the trivial-verify builder reads -- just
+        bonus_tokens = the last committed token (the 1-node root). Its verify
+        forward captures the hidden that seeds the NEXT tick's real draft."""
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+        device = self.scheduler.device
+        req = batch.reqs[0]
+        last_tok = int(req.output_ids[-1])
+        return EagleDraftInput(
+            bonus_tokens=torch.tensor([last_tok], dtype=torch.int64, device=device),
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
+
+    def spec_in_tick_note_committed(self, batch, last_token_id, last_hidden):
+        """d2/d6: after a spec-in-tick verify commits, refresh the seed source
+        (last committed token id + its target hidden) so the NEXT tick re-seeds
+        the draft chain. Cloned to survive pooled-buffer reuse."""
+        rpi = int(batch.req_pool_indices[0].item())
+        slot = self.spills.get(rpi)
+        if slot is None:
+            return
+        slot.last_hidden = last_hidden.detach().clone()
+
+    def spec_in_tick_draft_post(self, handle):
+        """d4 POST (call right after draft(), before the accepted-KV append):
+        restore the committed-prefix sentinels. The scratch is reserved (held
+        for the manager's life), so nothing is freed here."""
+        if handle is None or handle == self.DRAFT_SURGERY_FALLBACK:
+            return
+        rpi, boundary, L, saved = handle
+        r2t = self.req_to_token_pool.req_to_token
+        r2t[rpi, boundary:L] = saved
+
+    def spec_in_tick_append_accepted(self, batch, accepted_slots):
+        """d6 (call after verify commits): append the accepted candidate tokens'
+        DRAFT KV (at draft-pool slots ``accepted_slots``) to the session's
+        device-resident draft_dev_k/v so the NEXT tick's draft attends them, and
+        advance the resident tail bounds. ``accepted_slots`` is the int64 draft-
+        pool slot tensor for the accepted candidates (in commit order). Grows
+        draft_dev_len / draft_spill_L by len(accepted_slots) (capped)."""
+        rpi = int(batch.req_pool_indices[0].item())
+        slot = self.spills.get(rpi)
+        if slot is None or not getattr(slot, "spec_in_tick", False):
+            return
+        if slot.draft_dev_k is None or accepted_slots is None:
+            return
+        a = int(accepted_slots.numel())
+        if a <= 0:
+            return
+        dp = self.draft_full_pool
+        cap = int(slot.draft_dev_k.shape[1])
+        n = int(slot.draft_dev_len)
+        if n + a > cap:
+            # Resident buffer full: fall back to plain host tick from now on
+            # (graceful, no OOM). The overflow is logged once.
+            self._log(
+                "kv-session-offload spec-in-tick: draft resident buffer full "
+                "(%d+%d>%d) rid=%s -> plain host tick from now",
+                n,
+                a,
+                cap,
+                slot.req.rid,
+            )
+            slot.spec_in_tick = False
+            slot.batch = None  # force rebuild as plain (spec_algorithm=NONE)
+            return
+        sl = accepted_slots.to(torch.int64)
+        ln = int(dp.layer_num)
+        for l in range(ln):
+            slot.draft_dev_k[l, n : n + a] = dp.k_buffer[l][sl]
+            slot.draft_dev_v[l, n : n + a] = dp.v_buffer[l][sl]
+        slot.draft_dev_len = n + a
+        slot.draft_spill_L = int(slot.draft_spill_L) + a
 
     def _draft_kv_snapshot(self, seg):
         """DRAFT-KV BUNDLE (Stage 1): clone the draft KV shard at the tail's
@@ -2750,6 +3246,31 @@ class KVSessionOffloadManager:
             head = pool.req_to_token[rpi, protected:boundary]
             self.allocator.free(head.to(torch.int64))
             head_freed = boundary - protected
+        # C4 (spec-in-spill-tick, Option A): a spec-in-tick session accumulated a
+        # DEVICE SUFFIX [draft_spill_L, L) -- the accepted tokens whose target+
+        # draft KV stayed device-resident at real committed slots (the FROZEN
+        # host region is only [boundary, draft_spill_L)). The finish path above
+        # only frees the head; free the suffix real slots here too or they leak
+        # (the "pool memory leak" the invariant checker flags at cleanup).
+        suffix_freed = 0
+        if slot is not None and getattr(slot, "spec_in_tick", False):
+            spill_L = int(getattr(slot, "draft_spill_L", 0) or 0)
+            # Free the device SUFFIX [draft_spill_L, committed) AND the last
+            # tick's candidate OVER-ALLOCATION [committed, allocated) -- both are
+            # real device slots past the frozen host region; the normal spec
+            # overhang-free (pop_overallocated_kv_cache) never ran for the
+            # persistent spill batch, so free them here (masked to real slots so
+            # a stray sentinel is never double-freed).
+            hi = max(
+                int(getattr(req, "kv_committed_len", 0) or 0),
+                int(getattr(req, "kv_allocated_len", 0) or 0),
+            )
+            if hi > spill_L > 0:
+                suffix = pool.req_to_token[rpi, spill_L:hi]
+                real = suffix[suffix < self.host_base]
+                if int(real.numel()) > 0:
+                    self.allocator.free(real.to(torch.int64))
+                    suffix_freed = int(real.numel())
         if req.last_node is not None:
             # The shared radix prefix stayed tree-locked across the spill.
             self.tree_cache.dec_lock_ref(req.last_node)
