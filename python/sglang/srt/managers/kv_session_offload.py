@@ -45,6 +45,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from collections import deque
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
@@ -765,92 +766,157 @@ class SpillSlot:
         self.suppress_tick = False
 
 
+# Tick-cost estimate smoothing (EMA weight of a fresh sample) and the floor
+# below which a measured tick cost is treated as "not yet measured".
+_TICK_COST_EMA_ALPHA = 0.3
+_MEAS_EPS_MS = 1e-3
+# Finite transport sentinel for the "no measurement yet" +inf under a gloo
+# all-reduce(MIN) (gloo dislikes inf). Any real headroom ratio is far below it.
+_REDUCE_INF = 1e18
+
+
 class SpillTickController:
-    """Adaptive spill-tick cadence regulator (QoS: device fast, spill best
-    effort). Turns the STATIC ``tick_interval`` gate in ``maybe_take_tick``
-    into a DYNAMIC one driven by device demand.
+    """SELF-CALIBRATING spill-tick cadence regulator (QoS: device fast, spill
+    best effort). Replaces the fixed demand->interval setpoint with a cadence
+    that EMERGES from runtime MEASUREMENT: it times the device SLACK (idle) per
+    iteration and the marginal COST of one spill tick, and picks the frequency
+    that maximises total (device + spilled) throughput.
 
-    Semantics
-    ---------
-    The spill tick runs *instead of* the device decode batch on the iterations
-    it fires (serial S1 path), so each tick costs the device one iteration.
-    The lever is therefore purely the CADENCE:
+    Measured signal (no guess, no interval table)
+    ---------------------------------------------
+    Each dwell window yields ONE ``headroom_ratio`` =
+        (measured device idle time per iteration) / (measured cost of one tick)
+      * ratio >= 1 : a whole tick fits in the idle the device would waste
+                     anyway -> the tick is ~free (the slack evaporates
+                     otherwise) -> drive the interval to 1 (tick every
+                     iteration; the spilled session advances for free);
+      * ratio -> 0 : the device is saturated, a tick fully steals a device
+                     step -> back off to the FLOOR (tick only at the operator's
+                     guaranteed minimum rate; protect main throughput);
+      * between    : monotone interpolation floor..1.
+    The endpoints are PHYSICAL (fits-in-idle vs fully-steals), not tuned
+    constants; the interval is a consequence of the timing, not a lookup.
 
-      * device under demand (running decode-batch occupied)  -> effective
-        interval RISES  -> spill fires less often -> the device lane stays
-        near its no-spill baseline;
-      * device light / idle                                  -> effective
-        interval FALLS toward 1 -> the spilled session ticks more often and
-        advances faster.
+    Rank-uniformity of a MEASURED signal (the trap)
+    -----------------------------------------------
+    Device idle is NOT rank-uniform: a 5090 (sm120) and a 3080 (sm86) have
+    different slack. If each rank chose its own interval from its own idle, the
+    collective spill tick (a rank-uniform NCCL event) would DESYNC -> hang. So
+    the control decision comes from a rank-uniform scalar: the per-rank
+    ``headroom_ratio`` is combined with **all-reduce(MIN)**. A collective tick
+    is only truly free when the LEAST-slack (bottleneck) rank has slack, and a
+    tick costs THAT rank, so MIN is the binding-constraint semantics -- not
+    mean (would over-tick when only the fast card is idle) nor max (would
+    starve spill whenever any card is busy). The reduce (injected as
+    ``reduce_fn``; identity for a single rank) runs ONLY at the dwell boundary,
+    which is gated purely on the REPLICATED integer counters (window fill +
+    dwell), so every rank enters the collective at the SAME iteration; MIN over
+    one float is bit-exact, so the reduced ratio -- and every downstream
+    pure-Python step -- is identical on every rank. The hot per-iteration path
+    stays collective-free (the reduce fires once per dwell, ~1/64 iters).
 
-    Signal
-    ------
-    The demand sample is the DEVICE running decode-batch occupancy
-    (``len(running_batch.reqs)``) observed once per scheduler iteration. It is
-    the cheapest robust demand proxy available at the decision site and,
-    crucially, it is a REPLICATED scheduler quantity: every DCP rank builds the
-    same schedule batch (the #50 rank-uniform-scheduling invariant this whole
-    module rests on), so the sample -- and hence every controller decision --
-    is bit-identical on every rank with NO broadcast. A spill tick is a
-    rank-uniform collective event; deriving the cadence from rank-uniform
-    integers keeps every rank in lock-step over whether a tick fires. Wall
-    clock / device decode RATE is deliberately NOT used: it is not rank-uniform
-    and would desync the collective (same discipline as the cross-algo
-    k-controller, bdc1714551).
-
-    Anti-flap (mirrors the k-controller)
-    ------------------------------------
-      * trailing WINDOW of demand samples (``window_size``); decisions read the
-        window mean, not an instantaneous sample;
-      * minimum DWELL (``min_dwell_iters`` scheduler iterations, rank-uniform --
-        counted in iterations, never seconds) between two interval changes;
-      * noise-scaled DEADZONE: the demand mean must clear ``deadzone_sigma``
-        standard errors of the window mean (widened in interval units) before a
-        step is taken, so a demand that straddles a rung boundary does not
+    Anti-flap (kept -- matters MORE for a noisy measured signal)
+    -----------------------------------------------------------
+      * trailing WINDOW of rank-uniform binding ratios; decisions read the
+        window mean, not one sample;
+      * minimum DWELL (``min_dwell_iters`` scheduler iterations, rank-uniform)
+        between two interval changes;
+      * noise-scaled DEADZONE (``deadzone_sigma`` stderr of the ratio mean,
+        widened into interval units) so a ratio straddling a rung does not
         oscillate;
       * one interval unit per decision (rate-limited, anti-overshoot);
-      * bounds ``[1, max_interval]``.
+      * bounds ``[1, floor_interval]``.
 
-    All arithmetic is pure Python over rank-uniform integer inputs in identical
-    order -> bit-identical across ranks.
+    Bootstrap: until the bottleneck rank has TIMED a tick (first tick still
+    pending, or lazy-harvest lag) the ratio is undefined -> the controller
+    HOLDS the conservative floor. A rank with no local measurement contributes
+    +inf to the MIN (never lowers it), so a lagging rank cannot corrupt the
+    binding ratio; the floor guarantees the first tick fires so the cost gets
+    measured -> the loop self-bootstraps.
     """
+
+    _NO_MEASUREMENT = float("inf")
 
     def __init__(
         self,
-        initial_interval: int,
-        max_interval: int,
-        pressure_ref: float = 2.0,
+        floor_interval: int,
         window_size: int = 16,
         min_dwell_iters: int = 64,
         deadzone_sigma: float = 1.0,
+        reduce_fn=None,
     ):
         self.min_interval = 1
-        self.max_interval = max(1, int(max_interval))
-        # Occupancy at (or above) which the device is treated as fully loaded
-        # -> effective interval saturates at max_interval. 2 concurrent device
-        # decodes already means every spill tick steals a real device step.
-        self.pressure_ref = max(1e-6, float(pressure_ref))
+        # Anti-starvation FLOOR = the operator QoS knob: the maximum iterations
+        # a spilled session may go without a tick == its guaranteed minimum
+        # progress rate. It is also the saturated-cadence and the absolute cap.
+        self.floor_interval = max(1, int(floor_interval))
         self.window_size = max(1, int(window_size))
         self.min_dwell_iters = max(0, int(min_dwell_iters))
         self.deadzone_sigma = max(0.0, float(deadzone_sigma))
+        # MIN-reduce of the per-rank headroom across the collective (identity
+        # for a single rank / unit tests). Called ONLY at the dwell boundary.
+        self._reduce = reduce_fn if reduce_fn is not None else (lambda r: r)
 
-        self._window: deque[float] = deque(maxlen=self.window_size)
-        self._effective = min(self.max_interval, max(self.min_interval, int(initial_interval)))
-        # Start dwell "expired" so the first post-warmup decision is not
-        # additionally delayed.
-        self._iters_since_change = self.min_dwell_iters
-        # Flap accounting (observability only; never a decision input).
+        # Trailing window of rank-uniform BINDING ratios (each a reduce output).
+        self._ratio_window: deque[float] = deque(maxlen=self.window_size)
+        # Per-rank measurement accumulators for the CURRENT dwell window. Wall
+        # and busy are summed (not pre-divided): per-iteration busy is noisy
+        # under the lazy-query harvest, but the window SUM recovers the true
+        # utilisation and the phase error cancels.
+        self._win_wall_ms = 0.0
+        self._win_busy_ms = 0.0
+        self._win_iters = 0
+        self._tick_cost_ms: Optional[float] = None  # latest local estimate
+
+        # Bootstrap: hold the conservative floor until a finite binding ratio.
+        self._effective = self.floor_interval
+        self._iters_since_change = self.min_dwell_iters  # first decision prompt
         self.n_changes = 0
 
     # -- per-iteration sampling ------------------------------------------
-    def observe(self, demand: int) -> None:
-        """Feed one rank-uniform demand sample (device occupancy) and advance
-        the dwell clock. Called once per scheduler iteration."""
-        self._window.append(float(max(0, int(demand))))
+    def observe_sample(
+        self, wall_ms: float, busy_ms: float, tick_cost_ms: Optional[float]
+    ) -> None:
+        """One MEASURED per-iteration sample: device wall time, device-busy
+        time, and the current tick-cost estimate (None until a tick is timed).
+        Accumulates wall/busy as window sums and advances the dwell clock.
+        Called once per scheduler iteration on every rank (rank-uniform call
+        site) so the dwell counters stay in lock-step."""
+        self._win_wall_ms += max(0.0, float(wall_ms))
+        self._win_busy_ms += max(0.0, float(busy_ms))
+        self._win_iters += 1
+        if tick_cost_ms is not None:
+            self._tick_cost_ms = float(tick_cost_ms)
         self._iters_since_change += 1
 
+    def _local_ratio(self) -> float:
+        """Per-rank headroom = mean device idle per iter / tick cost. Returns
+        the +inf sentinel when this rank has no valid tick cost yet (safe under
+        MIN)."""
+        if (
+            self._win_iters <= 0
+            or self._tick_cost_ms is None
+            or self._tick_cost_ms <= _MEAS_EPS_MS
+        ):
+            return self._NO_MEASUREMENT
+        idle_total = max(0.0, self._win_wall_ms - self._win_busy_ms)
+        return (idle_total / self._win_iters) / self._tick_cost_ms
+
+    def _reset_window(self) -> None:
+        self._win_wall_ms = 0.0
+        self._win_busy_ms = 0.0
+        self._win_iters = 0
+
+    def _desired(self, ratio: float) -> float:
+        """Interval EMERGES from measured headroom: ratio>=1 (a whole tick fits
+        in the wasted idle) -> 1 (tick freely); ratio->0 (saturated) -> floor
+        (tick only at the guaranteed rate). Physical endpoints; monotone
+        interpolation between."""
+        r = 0.0 if ratio < 0.0 else (1.0 if ratio > 1.0 else ratio)
+        return self.floor_interval - (self.floor_interval - self.min_interval) * r
+
     def _mean_and_margin(self) -> Tuple[float, float]:
-        w = self._window
+        w = self._ratio_window
         n = len(w)
         mean = sum(w) / n
         if n < 2 or self.deadzone_sigma == 0.0:
@@ -859,30 +925,32 @@ class SpillTickController:
         stderr = math.sqrt(var / n)
         return mean, self.deadzone_sigma * stderr
 
-    def _desired(self, mean: float) -> float:
-        """Continuous target interval for a given mean demand (before the
-        one-step rate limit / deadzone are applied)."""
-        pressure = min(1.0, mean / self.pressure_ref)
-        span = self.max_interval - self.min_interval
-        return self.min_interval + span * pressure
-
     def maybe_update(self) -> bool:
-        """Recompute the effective interval under dwell + deadzone. At most one
-        interval unit changes per call. Returns True on a change."""
-        if len(self._window) < max(1, self.window_size // 2):
+        """At a rank-uniform dwell boundary: MIN-reduce the per-rank headroom,
+        then step the effective interval one unit toward the measured target
+        under the deadzone. Returns True on a change.
+
+        RANK-UNIFORM COLLECTIVE ENTRY: the two gates below are purely replicated
+        integer counters (window fill + dwell), NEVER a per-rank-variable
+        condition, so all ranks reach the reduce at the SAME iteration."""
+        if self._win_iters < max(1, self.window_size // 2):
             return False
         if self._iters_since_change < self.min_dwell_iters:
             return False
+        binding = self._reduce(self._local_ratio())
+        self._reset_window()
+        if not math.isfinite(binding):
+            # No rank has timed a tick yet -> hold the conservative floor.
+            return False
+        self._ratio_window.append(float(binding))
         mean, margin = self._mean_and_margin()
         desired = self._desired(mean)
-        span = max(1e-6, float(self.max_interval - self.min_interval))
-        # deadzone expressed in interval units (stderr of demand mean scaled by
-        # the demand->interval slope span/pressure_ref).
-        margin_iv = margin * span / self.pressure_ref
+        slope = float(self.floor_interval - self.min_interval)
+        margin_iv = margin * slope  # ratio stderr -> interval units
         changed = False
         if (
             desired > self._effective + 0.5 + margin_iv
-            and self._effective < self.max_interval
+            and self._effective < self.floor_interval
         ):
             self._effective += 1
             changed = True
@@ -899,10 +967,10 @@ class SpillTickController:
 
     def effective_interval(self, fast_pressure: bool) -> int:
         """The cadence gate value for this iteration. Fast-lane pressure hard-
-        pins to the maximum (device fully protected) without disturbing the
+        pins to the floor (device maximally protected) without disturbing the
         regulator state -- fast > FCFS, always."""
         if fast_pressure:
-            return self.max_interval
+            return self.floor_interval
         return self._effective
 
 
@@ -1023,15 +1091,30 @@ class KVSessionOffloadManager:
         self._fast_queue_logged_rid = None
         self._fast_lane_enabled = bool(getattr(sa, "enable_fast_lane", False))
 
-        # Adaptive spill-tick cadence regulator (default OFF -> the cadence gate
-        # below reads the STATIC self.tick_interval, byte-identical). When ON,
-        # maybe_take_tick reads tick_controller.effective_interval() instead.
+        # Self-calibrating spill-tick cadence regulator (default OFF -> the
+        # cadence gate below reads the STATIC self.tick_interval, byte-
+        # identical). When ON, maybe_take_tick reads
+        # tick_controller.effective_interval() instead. See SpillTickController.
         self.tick_controller = None
+        # Per-rank measurement state feeding the regulator (device-timer
+        # reporter + host wall clock). Untouched when the regulator is off.
+        self._busy_ms_accum = 0.0        # device-busy ms harvested since last iter
+        self._tick_cost_ms = None        # EMA of a spill-tick forward's cost (ms)
+        self._last_iter_wall = None      # host perf_counter of the last pre_schedule
+        # A spill tick is a bs=1 PLAIN decode (spec_algo NONE) -> device-timer
+        # category "decode". In a SPEC server the main forwards are
+        # target_verify / extend / draft, so category=="decode" cleanly isolates
+        # the tick's marginal cost. The regulator therefore targets a spec
+        # server (the intended + validated config); in a non-spec server it can
+        # not separate tick from main decode and conservatively holds the floor.
+        _spec0 = getattr(scheduler, "spec_algorithm", None)
+        self._regulator_spec_server = _spec0 is not None and not _spec0.is_none()
         if bool(getattr(sa, "kv_session_offload_tick_adaptive", False)):
             self.tick_controller = SpillTickController(
-                initial_interval=self.tick_interval,
-                max_interval=int(sa.kv_session_offload_tick_adaptive_max),
+                floor_interval=int(sa.kv_session_offload_tick_floor),
+                reduce_fn=self._min_reduce_headroom,
             )
+            self._install_regulator_device_timer()
 
         global _MANAGER
         _MANAGER = self
@@ -1054,17 +1137,89 @@ class KVSessionOffloadManager:
         )
         if self.tick_controller is not None:
             logger.info(
-                "kv-session-offload: ADAPTIVE spill-tick cadence armed "
-                "(start_interval=%d, bounds=[1,%d], pressure_ref=%.1f, "
-                "window=%d, dwell=%d iters, sigma=%.1f) -- effective interval "
-                "tracks device demand, rank-uniform, no broadcast",
-                self.tick_controller._effective,
-                self.tick_controller.max_interval,
-                self.tick_controller.pressure_ref,
+                "kv-session-offload: SELF-CALIBRATING spill-tick cadence armed "
+                "(floor=%d iters, bounds=[1,%d], window=%d, dwell=%d iters, "
+                "sigma=%.1f, spec_server=%s) -- effective interval EMERGES from "
+                "measured device idle vs tick cost; MIN-reduced per-rank "
+                "headroom keeps every rank in lock-step",
+                self.tick_controller.floor_interval,
+                self.tick_controller.floor_interval,
                 self.tick_controller.window_size,
                 self.tick_controller.min_dwell_iters,
                 self.tick_controller.deadzone_sigma,
+                self._regulator_spec_server,
             )
+
+    # -- self-calibrating regulator: measurement + rank-uniform reduce ----
+
+    def _install_regulator_device_timer(self) -> None:
+        """Wire the regulator's device-idle / tick-cost measurement onto the
+        existing CUDA-event DeviceTimer (the head-split / decoupling fallback:
+        Event(enable_timing=True) pairs harvested lazily via .query(), never a
+        host sync -> the measurement never stalls the pipeline nor steals device
+        time; samples are a few iters stale, which the trailing window absorbs).
+
+        TARGET RUNNER ONLY -- deliberately NOT the draft runners. Instrumenting
+        the EAGLE/NEXTN draft runners' forwards with timing events races with
+        the draft-KV bundle's spill/restore stream choreography under sustained
+        pool pressure (a co-located retraction + wave-back interleaving): the
+        extra per-forward event enqueues on the draft stream surface a
+        cross-stream free-before-read that a plain (uninstrumented) run does not
+        hit -- reproduced as an async CUDA illegal-access at retract time,
+        closed by CUDA_LAUNCH_BLOCKING, and gone entirely once the draft runners
+        are left uninstrumented. The target timer already captures BOTH signals
+        the regulator needs: the spill tick (a bs=1 plain "decode" forward on
+        the target) and the dominant verify/extend busy. Draft-forward time is
+        therefore counted as device IDLE -- a conservative, monotonic offset
+        (headroom biased slightly up -> ticks a touch more eagerly): the
+        RELATIVE response (idle falls as the verify batch grows) and the
+        anti-starvation floor are both preserved, and under topk=1 the draft
+        forward is a small fraction of the verify. Runs only when the regulator
+        flag is on, so the default path is untouched.
+
+        Reuses the metrics DeviceTimer on the target if one is already installed
+        (adds a reporter); else creates and installs one on the target only."""
+        from sglang.srt.utils.device_timer import DeviceTimer
+
+        mr = self.model_runner
+        timer = getattr(mr, "device_timer", None)
+        if timer is None:
+            mr.device_timer = DeviceTimer(reporter=self._device_timer_report)
+        else:
+            timer.add_reporter(self._device_timer_report)
+
+    def _device_timer_report(self, t, category=None, **kw) -> None:
+        """DeviceTimer reporter (t = elapsed SECONDS for one forward). Runs at
+        lazy harvest time. Accumulates total device-busy ms since the last
+        iteration and, in a spec server, EMAs the spill-tick cost from the
+        "decode"-category forward (the bs=1 plain tick; see __init__ note)."""
+        ms = t * 1000.0
+        self._busy_ms_accum += ms
+        if self._regulator_spec_server and category == "decode":
+            self._tick_cost_ms = (
+                ms
+                if self._tick_cost_ms is None
+                else (1.0 - _TICK_COST_EMA_ALPHA) * self._tick_cost_ms
+                + _TICK_COST_EMA_ALPHA * ms
+            )
+
+    def _min_reduce_headroom(self, local_ratio: float) -> float:
+        """all-reduce(MIN) of the per-rank headroom ratio over the TP collective
+        (the group that runs the spill tick). MIN = binding-constraint: a
+        collective tick is free only if the least-slack rank has slack, and a
+        tick costs that rank. Called ONLY at the rank-uniform dwell boundary, so
+        every rank enters this collective at the same iteration. MIN over one
+        float is bit-exact -> the reduced value is identical on every rank. The
+        +inf "no measurement" sentinel is transported as a large finite value
+        (gloo dislikes inf) and restored."""
+        grp = getattr(self.scheduler, "tp_cpu_group", None)
+        if grp is None or torch.distributed.get_world_size(grp) <= 1:
+            return local_ratio
+        val = local_ratio if math.isfinite(local_ratio) else _REDUCE_INF
+        t = torch.tensor([val], dtype=torch.float64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
+        out = float(t.item())
+        return float("inf") if out >= _REDUCE_INF else out
 
     # -- slot bookkeeping -------------------------------------------------
 
@@ -1604,26 +1759,39 @@ class KVSessionOffloadManager:
         session. Returns the (possibly merged) running_batch."""
         self._iter_ct += 1
 
-        # Adaptive cadence: sample device demand every iteration (rank-uniform
-        # device decode-batch occupancy) and advance the regulator. Done here,
-        # before any early return, so the window stays continuous even across
-        # prefill / no-spill iterations and is warm when a spill starts. No-op
-        # when the regulator is off (flag OFF -> byte-identical).
+        # Self-calibrating cadence: every iteration, feed the regulator one
+        # MEASURED sample -- host wall time, harvested device-busy time, and the
+        # current tick-cost estimate -- then advance it. observe_sample /
+        # maybe_update are called unconditionally on every rank (rank-uniform
+        # call site) so the dwell counters and the boundary MIN-reduce stay in
+        # lock-step. Done before any early return so the window stays continuous
+        # across prefill / no-spill iterations and is warm when a spill starts.
+        # No-op when the regulator is off (flag OFF -> byte-identical).
         if self.tick_controller is not None:
-            demand = (
-                len(running_batch.reqs)
-                if running_batch is not None and not running_batch.is_empty()
-                else 0
+            now = time.perf_counter()
+            wall_ms = (
+                (now - self._last_iter_wall) * 1000.0
+                if self._last_iter_wall is not None
+                else 0.0
             )
-            self.tick_controller.observe(demand)
+            self._last_iter_wall = now
+            busy_ms = self._busy_ms_accum
+            self._busy_ms_accum = 0.0
+            tick_cost = (
+                self._tick_cost_ms
+                if (self._tick_cost_ms is not None and self._tick_cost_ms > _MEAS_EPS_MS)
+                else None
+            )
+            self.tick_controller.observe_sample(wall_ms, busy_ms, tick_cost)
             if self.tick_controller.maybe_update():
                 tc = self.tick_controller
-                mean, _ = tc._mean_and_margin()
+                headroom = tc._ratio_window[-1] if tc._ratio_window else float("nan")
                 self._log(
-                    "kv-session-offload: adaptive tick interval -> %d "
-                    "(demand_mean=%.2f, spilled=%d, changes=%d)",
+                    "kv-session-offload: self-cal tick interval -> %d "
+                    "(headroom=%.2f, tick_cost=%.2fms, spilled=%d, changes=%d)",
                     tc._effective,
-                    mean,
+                    headroom,
+                    self._tick_cost_ms if self._tick_cost_ms is not None else float("nan"),
                     len(self.spills),
                     tc.n_changes,
                 )

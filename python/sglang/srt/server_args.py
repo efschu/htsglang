@@ -1346,31 +1346,39 @@ class ServerArgs:
     kv_session_offload_tick_adaptive: A[
         bool,
         Arg(
-            help="kv-session-offload: ADAPTIVE spill-tick cadence (QoS "
+            help="kv-session-offload: SELF-CALIBRATING spill-tick cadence (QoS "
             "regulator). Default OFF -> the tick cadence is the STATIC "
             "--kv-session-offload-tick-interval (byte-identical). When ON, the "
-            "minimum device-iterations between two spill ticks is driven by a "
-            "rank-uniform control loop off device demand (running device "
-            "decode-batch occupancy): under device pressure the effective "
-            "interval RISES (spill less often -> protect the device lane near "
-            "its no-spill baseline); when the device goes light/idle the "
-            "interval FALLS toward 1 (spill more often -> the spilled session "
-            "advances faster). Fast-lane pressure hard-pins the interval to the "
-            "adaptive maximum. The static --kv-session-offload-tick-interval is "
-            "used only as the starting interval in this mode. The decision is a "
-            "pure function of replicated scheduler state, so it is identical on "
-            "every DCP rank (a spill tick is a rank-uniform collective event); "
-            "no broadcast/communicator is added.",
+            "minimum device-iterations between two spill ticks EMERGES from "
+            "runtime MEASUREMENT (it does not guess): each iteration the "
+            "regulator times the device idle SLACK and the marginal COST of one "
+            "spill tick. When a whole tick fits in the idle the device would "
+            "waste anyway the tick is ~free -> the interval falls to 1 (spill "
+            "advances for free); when the device is saturated a tick fully "
+            "steals a device step -> the interval backs off to the "
+            "anti-starvation FLOOR (--kv-session-offload-tick-floor), which "
+            "guarantees each spilled session a minimum progress rate. Fast-lane "
+            "pressure hard-pins the interval to the floor. Idle is NOT "
+            "rank-uniform (heterogeneous GPUs), so the per-rank headroom is "
+            "combined with all-reduce(MIN) (the binding/bottleneck rank) once "
+            "per dwell window -> every DCP rank makes the identical tick/defer "
+            "decision (a spill tick is a rank-uniform collective event). "
+            "Targets a speculative-decoding server (its intended config); in a "
+            "non-spec server the regulator conservatively holds the floor.",
         ),
     ] = False
-    kv_session_offload_tick_adaptive_max: A[
+    kv_session_offload_tick_floor: A[
         int,
         Arg(
-            help="kv-session-offload: upper bound for the adaptive spill-tick "
-            "interval (only used with --kv-session-offload-tick-adaptive). The "
-            "regulator clamps the effective interval to [1, this]. Larger -> "
-            "the device lane can be protected harder (spill starved more) when "
-            "device demand is high. Default 8.",
+            help="kv-session-offload: anti-starvation FLOOR for the "
+            "self-calibrating spill-tick cadence (only used with "
+            "--kv-session-offload-tick-adaptive). This is the operator QoS knob: "
+            "the MAXIMUM number of device iterations a spilled session may go "
+            "without a tick == its GUARANTEED minimum progress rate, even under "
+            "sustained device pressure. The regulator clamps the measured "
+            "effective interval to [1, this] and pins to it under fast-lane "
+            "pressure. Larger -> the device lane is protected harder (spilled "
+            "sessions advance more slowly, but never stall). Default 8.",
         ),
     ] = 8
     kv_session_offload_restore_margin_tokens: A[
@@ -3955,10 +3963,10 @@ class ServerArgs:
                 "--kv-session-offload-tick-interval must be >= 1; got "
                 f"{self.kv_session_offload_tick_interval}."
             )
-        if self.kv_session_offload_tick_adaptive_max < 1:
+        if self.kv_session_offload_tick_floor < 1:
             raise ValueError(
-                "--kv-session-offload-tick-adaptive-max must be >= 1; got "
-                f"{self.kv_session_offload_tick_adaptive_max}."
+                "--kv-session-offload-tick-floor must be >= 1; got "
+                f"{self.kv_session_offload_tick_floor}."
             )
         if self.kv_session_offload_restore_hysteresis_steps < 1:
             raise ValueError(

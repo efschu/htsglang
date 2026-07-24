@@ -1128,112 +1128,156 @@ def test_alloc_owner_matched_classes_cpu():
 # ---------------------------------------------------------------------------
 
 
-def _drive(ctrl, demand_seq):
-    """Feed a per-iteration demand sequence; return the effective interval
-    (fast_pressure=False) sampled after each iteration."""
+# Measured-sample helpers: the self-calibrating controller consumes
+# (wall_ms, busy_ms, tick_cost_ms) per iteration, not a demand integer.
+_TICK_MS = 2.0
+
+
+def _drive_meas(ctrl, samples):
+    """Feed a per-iteration (wall_ms, busy_ms, tick_cost_ms) sequence; return
+    the effective interval (fast_pressure=False) after each iteration."""
     out = []
-    for d in demand_seq:
-        ctrl.observe(d)
+    for wall, busy, tc in samples:
+        ctrl.observe_sample(wall, busy, tc)
         ctrl.maybe_update()
         out.append(ctrl.effective_interval(False))
     return out
 
 
+def _saturated(n, tick_ms=_TICK_MS):
+    # busy == wall -> zero device idle -> headroom ratio 0 -> back off to floor.
+    return [(10.0, 10.0, tick_ms)] * n
+
+
+def _idle(n, tick_ms=_TICK_MS):
+    # busy == 0 -> all wall is device idle -> headroom >> 1 -> tick freely (1).
+    return [(10.0, 0.0, tick_ms)] * n
+
+
+def _headroom(n, ratio, tick_ms=_TICK_MS):
+    # mean_idle_per_iter / tick == ratio, with wall fixed.
+    idle = ratio * tick_ms
+    return [(10.0, max(0.0, 10.0 - idle), tick_ms)] * n
+
+
 def test_spill_tick_controller_characteristic_up_and_down():
-    # Sustained HIGH device demand -> interval climbs toward the max; then
-    # demand drops to idle -> interval falls back toward 1.
-    ctrl = SpillTickController(
-        initial_interval=1, max_interval=8, min_dwell_iters=4, window_size=8
-    )
-    hi = _drive(ctrl, [3] * 200)
-    assert hi[-1] == 8, f"high demand should saturate at max, got {hi[-1]}"
-    lo = _drive(ctrl, [0] * 200)
-    assert lo[-1] == 1, f"idle demand should fall to min, got {lo[-1]}"
-    # Monotone climb and monotone descent (one step per dwell, no overshoot).
-    climb = [h for h in hi if True]
-    assert all(b >= a for a, b in zip(climb, climb[1:])), "interval must not dip while demand high"
+    # Device IDLE (a whole tick fits in the wasted slack) -> interval falls to 1
+    # (tick freely); then device SATURATED -> interval climbs back to the floor.
+    ctrl = SpillTickController(floor_interval=8, min_dwell_iters=4, window_size=8)
+    assert ctrl._effective == 8, "must start at the conservative floor"
+    lo = _drive_meas(ctrl, _idle(200))
+    assert lo[-1] == 1, f"idle device should drive interval to 1, got {lo[-1]}"
+    hi = _drive_meas(ctrl, _saturated(200))
+    assert hi[-1] == 8, f"saturated device should back off to floor, got {hi[-1]}"
+    # Monotone descent then monotone climb (one step per dwell, no overshoot).
     assert all(b <= a for a, b in zip(lo, lo[1:])), "interval must not rise while idle"
+    assert all(b >= a for a, b in zip(hi, hi[1:])), "interval must not dip while saturated"
 
 
-def test_spill_tick_controller_intermediate_demand_lands_between():
-    # Demand == pressure_ref/2 -> steady interval strictly between 1 and max.
+def test_spill_tick_controller_intermediate_headroom_lands_between():
+    # headroom ratio 0.5 -> desired = floor - (floor-1)*0.5 = 8 - 3.5 = 4.5 ->
+    # settles at 4 or 5 under the 0.5 band.
     ctrl = SpillTickController(
-        initial_interval=1, max_interval=8, pressure_ref=2.0,
-        min_dwell_iters=4, window_size=8, deadzone_sigma=0.0,
+        floor_interval=8, min_dwell_iters=4, window_size=8, deadzone_sigma=0.0
     )
-    out = _drive(ctrl, [1] * 300)
+    out = _drive_meas(ctrl, _headroom(400, 0.5))
     final = out[-1]
-    assert 1 < final < 8, f"mid demand should settle strictly inside bounds, got {final}"
-    # desired = 1 + 7 * (1/2) = 4.5 -> rounds to 4 or 5 under the 0.5 band.
-    assert final in (4, 5), f"expected ~4-5 for demand=1, got {final}"
+    assert 1 < final < 8, f"mid headroom should settle strictly inside bounds, got {final}"
+    assert final in (4, 5), f"expected ~4-5 for headroom 0.5, got {final}"
 
 
 def test_spill_tick_controller_dwell_blocks_rapid_change():
-    ctrl = SpillTickController(
-        initial_interval=1, max_interval=8, min_dwell_iters=32, window_size=8
-    )
-    out = _drive(ctrl, [3] * 200)
-    # Consecutive interval changes must be at least min_dwell_iters apart.
+    ctrl = SpillTickController(floor_interval=8, min_dwell_iters=32, window_size=8)
+    out = _drive_meas(ctrl, _idle(400))
     change_iters = [i for i in range(1, len(out)) if out[i] != out[i - 1]]
     gaps = [b - a for a, b in zip(change_iters, change_iters[1:])]
     assert all(g >= 32 for g in gaps), f"dwell violated: gaps={gaps}"
 
 
 def test_spill_tick_controller_deadzone_suppresses_flap():
-    # Demand oscillating around the pressure_ref/2 boundary must NOT flap once
+    # Headroom straddling a rung boundary with high variance must NOT flap once
     # settled: the noise-scaled deadzone absorbs the straddle.
     ctrl = SpillTickController(
-        initial_interval=4, max_interval=8, pressure_ref=2.0,
-        min_dwell_iters=8, window_size=16, deadzone_sigma=1.0,
+        floor_interval=8, min_dwell_iters=8, window_size=16, deadzone_sigma=1.0
     )
-    seq = [0, 2] * 400  # mean ~1.0 == pressure_ref/2, high variance
-    out = _drive(ctrl, seq)
+    # Alternate idle / saturated windows -> mean headroom ~0.5 but high variance.
+    seq = (_idle(1) + _saturated(1)) * 800
+    out = _drive_meas(ctrl, seq)
     tail = out[len(out) // 2 :]
     changes = sum(1 for a, b in zip(tail, tail[1:]) if a != b)
     assert changes == 0, f"deadzone must eliminate flap on a straddling signal, got {changes}"
 
 
-def test_spill_tick_controller_stable_demand_zero_flap():
-    ctrl = SpillTickController(
-        initial_interval=1, max_interval=8, min_dwell_iters=8, window_size=8
-    )
-    out = _drive(ctrl, [2] * 500)
+def test_spill_tick_controller_stable_headroom_zero_flap():
+    ctrl = SpillTickController(floor_interval=8, min_dwell_iters=8, window_size=8)
+    out = _drive_meas(ctrl, _headroom(500, 0.3))
     tail = out[len(out) // 2 :]
     changes = sum(1 for a, b in zip(tail, tail[1:]) if a != b)
-    assert changes == 0, f"stable demand -> zero flap once settled, got {changes}"
+    assert changes == 0, f"stable headroom -> zero flap once settled, got {changes}"
 
 
-def test_spill_tick_controller_fast_pressure_pins_max():
-    ctrl = SpillTickController(initial_interval=1, max_interval=8, min_dwell_iters=4)
-    ctrl.observe(0)
+def test_spill_tick_controller_fast_pressure_pins_floor():
+    ctrl = SpillTickController(floor_interval=8, min_dwell_iters=4)
+    # Drive to the minimum first, then assert fast pressure overrides to floor.
+    _drive_meas(ctrl, _idle(200))
+    assert ctrl._effective == 1
     assert ctrl.effective_interval(True) == 8
-    # Fast pressure does not disturb regulator state (still at start interval).
+    # Fast pressure does not disturb regulator state (still at 1).
     assert ctrl._effective == 1
 
 
+def test_spill_tick_controller_bootstrap_holds_floor_until_measured():
+    # Until a tick is TIMED (tick_cost None), the headroom is undefined -> the
+    # controller HOLDS the conservative floor no matter how idle the device is.
+    ctrl = SpillTickController(floor_interval=8, min_dwell_iters=4, window_size=8)
+    pre = _drive_meas(ctrl, [(10.0, 0.0, None)] * 200)  # idle but unmeasured
+    assert all(x == 8 for x in pre), "must hold floor until a tick cost exists"
+    assert ctrl.n_changes == 0
+    # Once the tick cost is measured, the idle device drives the interval down.
+    post = _drive_meas(ctrl, _idle(200))
+    assert post[-1] == 1, f"should adapt once measured, got {post[-1]}"
+
+
+def test_spill_tick_controller_min_reduce_binding_constraint():
+    # The control decision must follow the MIN (bottleneck) rank, not the local
+    # ratio: even though THIS rank is fully idle, a co-rank reports saturation,
+    # so the collective tick is NOT free -> interval must stay at the floor.
+    ctrl = SpillTickController(
+        floor_interval=8, min_dwell_iters=4, window_size=8,
+        reduce_fn=lambda local: min(local, 0.0),  # a saturated bottleneck rank
+    )
+    out = _drive_meas(ctrl, _idle(200))
+    assert out[-1] == 8, f"MIN-binding: saturated co-rank must pin floor, got {out[-1]}"
+    # Sanity: without the bottleneck (identity reduce) the same input drives to 1.
+    solo = SpillTickController(floor_interval=8, min_dwell_iters=4, window_size=8)
+    assert _drive_meas(solo, _idle(200))[-1] == 1
+
+
 def test_spill_tick_controller_rank_uniform_determinism():
-    # Two independent instances (two 'ranks') fed the identical rank-uniform
-    # demand sequence must produce bit-identical effective intervals at EVERY
-    # step -- the property that keeps the collective spill tick in lock-step.
+    # Two independent instances ('ranks') fed the identical rank-uniform reduced
+    # measurement stream must produce bit-identical intervals at EVERY step --
+    # the property that keeps the collective spill tick in lock-step. (In
+    # production the MIN-reduce makes the per-rank samples identical; here we
+    # model that by feeding both the same post-reduce stream.)
     import random
 
     rng = random.Random(1234)
-    seq = [rng.randint(0, 3) for _ in range(2000)]
-    a = SpillTickController(initial_interval=2, max_interval=8)
-    b = SpillTickController(initial_interval=2, max_interval=8)
-    oa = _drive(a, seq)
-    ob = _drive(b, seq)
+    seq = [(10.0, rng.uniform(0.0, 10.0), _TICK_MS) for _ in range(3000)]
+    a = SpillTickController(floor_interval=8)
+    b = SpillTickController(floor_interval=8)
+    oa = _drive_meas(a, seq)
+    ob = _drive_meas(b, seq)
     assert oa == ob, "controller output diverged between ranks on identical input"
     assert a.n_changes == b.n_changes
 
 
 def test_spill_tick_controller_bounds_respected():
-    ctrl = SpillTickController(initial_interval=99, max_interval=8)
-    assert ctrl._effective == 8  # clamped at construction
-    ctrl2 = SpillTickController(initial_interval=0, max_interval=8)
-    assert ctrl2._effective == 1
-    out = _drive(ctrl2, [3] * 500 + [0] * 500)
+    ctrl = SpillTickController(floor_interval=8)
+    assert ctrl._effective == 8  # starts at the floor
+    out = _drive_meas(ctrl, _idle(500) + _saturated(500))
     assert min(out) >= 1 and max(out) <= 8
+    # floor clamped to >= 1 at construction.
+    assert SpillTickController(floor_interval=0).floor_interval == 1
 
 
 if __name__ == "__main__":
