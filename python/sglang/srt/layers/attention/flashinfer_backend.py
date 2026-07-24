@@ -2048,9 +2048,22 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        decode_wrapper = self.forward_metadata.decode_wrappers[
-            self._get_wrapper_idx(layer)
-        ]
+        # kv-session-offload spill tick: the host-streamed decode
+        # (_sess_forward_decode_plain / _forward_decode_dcp spill branch) never
+        # uses the paged decode_wrapper. On the LIVE tick self.forward_metadata
+        # is decode metadata (init_forward_metadata built decode_wrappers), so
+        # the fetch is a harmless read; but during the S0 spill-graph CAPTURE the
+        # out-graph early-return (init_forward_metadata_out_graph) never builds
+        # decode_wrappers -- and under a speculative server the normal decode
+        # capture left self.forward_metadata as PrefillMetadata -- so a naive
+        # fetch AttributeErrors. Skip the fetch when this is a spill tick; the
+        # wrapper is unused on that path anyway (byte-identical for every non-
+        # spill batch, whose _sess_spill is None).
+        decode_wrapper = (
+            self.forward_metadata.decode_wrappers[self._get_wrapper_idx(layer)]
+            if self._sess_spill is None
+            else None
+        )
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -3933,7 +3946,11 @@ class FlashInferAttnBackend(AttentionBackend):
 
         def make_fb(L):
             return SimpleNamespace(
-                forward_mode=SimpleNamespace(is_decode=lambda: True),
+                # The selftest injects a PLAIN decode spill tick; _sess_prepare_
+                # step reads is_decode()/is_target_verify() (the C4 twin gate).
+                forward_mode=SimpleNamespace(
+                    is_decode=lambda: True, is_target_verify=lambda: False
+                ),
                 batch_size=1,
                 seq_lens_cpu=torch.tensor([L], dtype=torch.int64),
                 req_pool_indices=torch.tensor([rpi], dtype=torch.int64, device=dev),
