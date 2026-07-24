@@ -2338,6 +2338,59 @@ class ModelRunnerKVCacheMixin:
                     # scratch.
                     self._kv_sess_scratch_slot = _hybrid_pool_size + 1
                     _hybrid_pool_size += 1
+                # spec-in-spill-tick (S2, IRON-LAW off-allocator draft scratch):
+                # append a DEDICATED scratch REGION of `mtp_resident_slices`
+                # rows to the DRAFT full-attention pool, sharing the exact
+                # mechanism as the +1 target scratch row above -- physically
+                # backed slot ids [old_size+1, old_size+cap] that the SHARED
+                # target allocator (sized to the base pool) NEVER hands out.
+                #
+                # WHY (the IRON LAW, S5): the spill-tick draft attends its
+                # resident draft-KV tail through draft-POOL slots (req_to_token
+                # surgery). Drawing those slots from the shared allocator makes
+                # a spill's freed tail be re-consumed by the draft scratch 1:1
+                # (net slot relief == 0), so the verify-candidate alloc starves
+                # forever ("headroom 15 < 16 -> skip"). Giving the draft-read
+                # scratch its OWN off-allocator draft-pool rows leaves the
+                # spill's freed target room genuinely available for the small
+                # verify/draft candidate allocs -> the spilled session takes
+                # real spec ticks. The base pool that admission reads is
+                # UNCHANGED (no shrink, no wedge) -- the region lives beyond it.
+                # Allocated HERE, before the draft CUDA-graph capture (the draft
+                # KV buffer is [size+page]-VMM-bound; post-capture growth is
+                # unsafe). Rank-uniform: every DCP rank sizes its (non-DCP,
+                # full-context) draft pool by the same cap. Cheap: the draft
+                # pool is a single tiny layer.
+                self._kv_sess_draft_scratch_base = None
+                self._kv_sess_draft_scratch_len = 0
+                if (
+                    self.server_args.enable_kv_session_offload
+                    and self.is_draft_worker
+                    and getattr(
+                        self.server_args, "kv_session_offload_spec_in_tick", False
+                    )
+                ):
+                    _kvso_cap = int(
+                        getattr(
+                            self.server_args,
+                            "kv_session_offload_mtp_resident_slices",
+                            0,
+                        )
+                        or 0
+                    )
+                    if _kvso_cap > 0:
+                        self._kv_sess_draft_scratch_base = _hybrid_pool_size + 1
+                        self._kv_sess_draft_scratch_len = _kvso_cap
+                        _hybrid_pool_size += _kvso_cap
+                        logger.info(
+                            "kv-session-offload spec-in-tick: appended %d "
+                            "off-allocator draft-read scratch slots to the draft "
+                            "pool (slot ids [%d, %d]; NOT in the admission "
+                            "allocator, which stays at the base pool size).",
+                            _kvso_cap,
+                            self._kv_sess_draft_scratch_base,
+                            self._kv_sess_draft_scratch_base + _kvso_cap - 1,
+                        )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=_hybrid_pool_size,
@@ -2370,6 +2423,17 @@ class ModelRunnerKVCacheMixin:
                     self._wl_attach_spill_host_pool()
                 if getattr(self, "_kv_sess_scratch_slot", None) is not None:
                     self._kv_sess_attach_host_pool()
+                # Publish the draft-read scratch region on the pool so the
+                # kv-session-offload manager (which fetches this pool via
+                # get_draft_kv_pool) can point _draft_read_scratch at these
+                # off-allocator draft slots.
+                if getattr(self, "_kv_sess_draft_scratch_base", None) is not None:
+                    self.token_to_kv_pool._kv_sess_draft_scratch_base = (
+                        self._kv_sess_draft_scratch_base
+                    )
+                    self.token_to_kv_pool._kv_sess_draft_scratch_len = (
+                        self._kv_sess_draft_scratch_len
+                    )
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     assert (
