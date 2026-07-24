@@ -2521,6 +2521,27 @@ class KVSessionOffloadManager:
         donate)."""
         assert getattr(req, "kv_spill_state", None) == "host"
         pool = self.req_to_token_pool
+        # RETRACT/ABORT-PATH RACE FIX: a session that ends WHILE spilled may
+        # still have IN-FLIGHT device work touching the very slots freed below:
+        # a streamed wave-back / prefetch H2D copy on ``_sess_copy_stream`` (it
+        # restores the tail into freshly allocated device slots and reads the
+        # region) and/or a spill-tick forward on ``forward_stream`` (it reads
+        # the retained device head every layer). This method runs on the
+        # schedule stream, and the retract path frees + INSTANTLY REUSES the
+        # slots (evict_from_tree_cache). Without ordering the frees after those
+        # streams, the reused slots collide with the still-running copy/forward
+        # -> a free-before-copy-completes race -> an async CUDA illegal memory
+        # access that surfaces at a LATER kernel (observed as the crash inside
+        # retract_decode's torch.unique; CUDA_LAUNCH_BLOCKING=1 hid it). Order
+        # the frees after BOTH streams (event waits; no host sync). Cheap and
+        # only on this spilled-req cleanup path; the stock (non-spilled) free
+        # path is untouched. Mirrors the try_spill quiesce (backup before free).
+        # Guarded on a real copy Stream so the CPU unit path (mock backend)
+        # skips it; on GPU both streams exist.
+        copy_stream = getattr(self.backend, "_sess_copy_stream", None)
+        if isinstance(copy_stream, torch.cuda.Stream):
+            self._wait_forward_stream()
+            torch.cuda.current_stream().wait_stream(copy_stream)
         # Capture rpi BEFORE pool.free() nulls req.req_pool_idx (else the slot
         # lookup / region free below would key on None and leak the region).
         rpi = req.req_pool_idx
