@@ -671,6 +671,69 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
     dflash_draft_revision = server_args.speculative_draft_model_revision
 
     # ------------------------------------------------------------------
+    # GGUF target detection.
+    #
+    # For an FP8/HF target the NEXTN/MTP rung drafts from the TARGET
+    # checkpoint: ModelConfig swaps the arch to the *MTP variant on
+    # is_draft_model and the None->model_path fallback (model_config.py) picks
+    # the right directory over the HF loader -- so eagle_shape's draft path is
+    # None there (see the plain NEXTN server shape).
+    #
+    # A GGUF target breaks that assumption: the Qwen3.5/3.6-GGUF NEXTN head
+    # lives in the target .gguf file (blk.N.nextn.*), and the loader only
+    # takes the GGUF adapter + MTP name-map when it goes through the .gguf
+    # file with load_format=gguf. Left at None the draft falls back to the
+    # target path but is routed through the HF-safetensors loader
+    # (download_weights_from_hf -> "repository not found"), the reported boot
+    # crash. So under a GGUF target the NEXTN rung must draft from the target
+    # GGUF file explicitly, as gguf.
+    #
+    # _handle_load_format / _gguf_quantization run later (post-__post_init__
+    # resolution pass), so detect robustly from the raw flags AND the model
+    # file, not the not-yet-resolved quantization value.
+    # ------------------------------------------------------------------
+    from sglang.srt.utils.hf_transformers.common import check_gguf_file
+
+    _gguf_target = (
+        server_args.load_format == "gguf"
+        or server_args.quantization == "gguf"
+        or check_gguf_file(server_args.model_path)
+    )
+    if _gguf_target:
+        if force == "dflash":
+            _fail(
+                "GGUF-target cross-algo supports the NEXTN-primary modes "
+                "(force nextn/policy/auto/schedule) only; force=dflash on a "
+                "GGUF target is not yet supported (the NEXTN rung must draft "
+                "from the target GGUF's MTP head, which cannot be the primary "
+                "under force=dflash)."
+            )
+        # Primary NEXTN draft loads the target GGUF via the GGUF loader.
+        # Reject a conflicting draft load-format instead of silently routing
+        # the GGUF draft through the HF-safetensors loader (the boot crash).
+        if server_args.speculative_draft_load_format in (None, "gguf"):
+            server_args.speculative_draft_load_format = "gguf"
+        else:
+            _fail(
+                "GGUF-target cross-algo requires the NEXTN draft to load as "
+                "gguf; got --speculative-draft-load-format "
+                f"{server_args.speculative_draft_load_format!r}. Drop the flag "
+                "or set it to 'gguf'."
+            )
+        # A GGUF target defaults speculative_draft_model_quantization to 'gguf'
+        # (_handle_missing_default_values, run earlier); None here therefore
+        # means the user passed --speculative-draft-model-quantization unquant.
+        # Reject that (and any other value): the GGUF MTP draft must load as
+        # gguf.
+        if server_args.speculative_draft_model_quantization != "gguf":
+            got = server_args.speculative_draft_model_quantization or "unquant"
+            _fail(
+                "GGUF-target cross-algo requires the NEXTN draft quantization "
+                f"to be gguf; got --speculative-draft-model-quantization {got!r}"
+                ". Drop the flag (it defaults to the gguf target)."
+            )
+
+    # ------------------------------------------------------------------
     # Resolve the DFLASH shape on a probe copy: _handle_dflash performs the
     # full validation + block-size inference + draft-attention-backend
     # resolution; reusing it verbatim keeps the cross path in lockstep with
@@ -707,14 +770,33 @@ def normalize_cross_algorithm_args(server_args: "ServerArgs") -> None:
         "speculative_draft_window_size": None,
         "speculative_use_rejection_sampling": False,
     }
+    if _gguf_target:
+        # The DFLASH rung keeps its OWN draft checkpoint (a separate
+        # HF-safetensors DFLASH model, e.g. qwen3.6-27b-dflash), NOT the GGUF
+        # target. Under a GGUF target the global load_format/quantization are
+        # gguf, which would (wrongly) send this HF checkpoint through the GGUF
+        # loader. Force the secondary DFLASH sub-worker's ServerArgs copy back
+        # to the HF loader. These extra keys are applied to the deep-copied
+        # secondary args by apply_shape_to_args_copy (override(**shape)); the
+        # forced-shape loop only touches _SHAPE_FIELDS, so they never mutate
+        # the real (target) load_format.
+        dflash_shape["load_format"] = "auto"
+        dflash_shape["speculative_draft_model_quantization"] = None
 
     eagle_steps = int(user_steps) if user_steps is not None else 3
     eagle_shape: Dict[str, Any] = {
         "speculative_algorithm": "EAGLE",
-        # The MTP rung drafts from the TARGET checkpoint (ModelConfig swaps
-        # the arch to the *MTP variant when is_draft_model=True and the path
-        # falls back to model_path) -- exactly the plain NEXTN server shape.
-        "speculative_draft_model_path": None,
+        # FP8/HF: the MTP rung drafts from the TARGET checkpoint (ModelConfig
+        # swaps the arch to the *MTP variant when is_draft_model=True and the
+        # path falls back to model_path) -- exactly the plain NEXTN server
+        # shape, so None is correct. GGUF: the MTP head lives in the target
+        # .gguf file and must be loaded via the GGUF loader; point the draft
+        # explicitly at the target GGUF file (see the _gguf_target block
+        # above for the full rationale). draft_load_format/quantization for
+        # this primary rung were forced to gguf on the real args above.
+        "speculative_draft_model_path": (
+            server_args.model_path if _gguf_target else None
+        ),
         "speculative_draft_model_revision": None,
         "speculative_num_steps": eagle_steps,
         "speculative_eagle_topk": 1,
