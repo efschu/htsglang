@@ -1085,3 +1085,51 @@ silently dropped.
 **GPU-validation pending for all three fixes:** arm E on this rig (NVIDIA
 no-op regression) and a gfx900 reject check on the second host. The CPU tests
 (19, vendor and capability mocked) pin the directions in the meantime.
+
+### Max-context column (harness requirement #4)
+
+Throughput without capacity is only half the picture, so every comparison
+table from here on carries a max-context column. Two values per row, because
+the bench runs were CAPPED and reporting only the capped number would invert
+the ranking:
+
+| configuration | KV pool at bench config (capped) | uncapped capacity | ratio vs stock PP even |
+|---|---|---|---|
+| stock flags, PP=3 even | 98,316 | **149,437** | 1.00x |
+| stock flags, PP=3 uneven (18/28/18) | 131,088 | **178,992** | 1.20x |
+| fork, same shackles (control) | 32,772 | **925,184** | **6.19x** |
+| **fork, full programme** | 32,776 | **886,336** | **5.93x** |
+
+**Read the uncapped column, not the capped one.** The bench ran with
+`--max-running-requests 1 --context-length 32768`, and sglang caps the pool at
+`max_running_requests x (context_len + headroom)`. It says so itself:
+
+```
+Hybrid mamba/attention KV cap: max_total_num_tokens 886336 -> 32776
+  (max_running_requests=1 x (context_len=32768 + headroom); the full-attention-only
+   KV cell size otherwise overstates a physically unreachable pool)
+```
+
+So the capped figure is an artefact of the bench shape, and taken alone it
+would suggest stock PP holds 3x more context than the fork -- the exact
+opposite of the truth. The uncapped value is the pool the configuration could
+actually serve, and it is printed by the engine immediately before the cap is
+applied, i.e. it is measured on the same boot rather than estimated.
+
+**Why the fork is ~6x ahead here.** Under `--rank-kv-ratio capacity` the fork
+installs a MEASURED KV-token ownership vector `[13, 30, 21]`: rank 1 -- the
+5090 -- carries 30/64 of the tokens, so the 32 GB card's pool is used in
+proportion to its size. Stock PP cannot do this: its stages hold a slice of
+LAYERS, so the KV a stage can hold is bounded by the smallest card in the
+pipeline, and the 5090's headroom sits idle. The uneven layer split recovers
+part of it (149,437 -> 178,992, +20%) by moving full-attention layers onto the
+big card (4/7/5 instead of 5/5/6), but it cannot reach a weighted token split.
+
+This is the capacity half of the fork's case, and it is larger than the decode
+half: 5.93x context against 3.25x decode.
+
+**Method note / limit:** these uncapped numbers come from the bench boots'
+own pre-cap line, at the bench memory configuration. A dedicated uncapped
+probe boot per configuration (`--context-length -1`, everyday mem-fraction,
+boot to READY only) is queued for the next window to confirm them
+independently; both numbers will then be shown side by side.
