@@ -5,6 +5,8 @@
 import argparse
 import os
 import unittest
+
+import pytest
 from unittest.mock import patch
 
 import sglang.srt.server_args as server_args_module
@@ -779,3 +781,46 @@ class TestTreeSpecDcpGuardBroadened(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+def test_uneven_tp_is_rejected_on_models_whose_attention_is_not_aware():
+    """A non-uniform ratio must be REFUSED, not half-applied.
+
+    qwen2 / qwen3 / qwen3_moe derive `num_heads = total // tp_size` (an even
+    split) while their Linear layers follow the installed ratio plan. Measured
+    on TP=2 with `--rank-tp-ratio 11,21`: both ranks kept 7 heads
+    (448 = 7x64, clamped to whole KV units) while o_proj's input was cut by the
+    RAW ratio into 308/588 -> "mat1 and mat2 shapes cannot be multiplied".
+
+    Clamping o_proj would be the WRONG repair: the shapes would agree while
+    self.num_heads still reports the even count, turning a loud failure into a
+    silent one. So the ratio is rejected until an architecture opts in.
+    """
+    import sglang.srt.distributed.utils as du
+    from sglang.srt.models.qwen3 import _reject_uneven_tp_unaware_attention
+
+    saved = du.get_tp_partition_ratios
+
+    try:
+        # non-uniform plan -> reject, naming the numbers and a way out
+        du.get_tp_partition_ratios = lambda family=None: [11, 21]
+        du.tp_plan_active = lambda tp_size, family=None: True
+        with pytest.raises(ValueError) as ei:
+            _reject_uneven_tp_unaware_attention("Qwen3", 2)
+        msg = str(ei.value)
+        assert "11, 21" in msg or "[11, 21]" in msg, msg
+        assert "not uneven-TP aware" in msg, msg
+
+        # uniform vector IS the even split -> must NOT be rejected
+        du.get_tp_partition_ratios = lambda family=None: [1, 1]
+        _reject_uneven_tp_unaware_attention("Qwen3", 2)
+
+        # no plan installed -> must NOT be rejected
+        du.tp_plan_active = lambda tp_size, family=None: False
+        du.get_tp_partition_ratios = lambda family=None: None
+        _reject_uneven_tp_unaware_attention("Qwen3", 2)
+    finally:
+        du.get_tp_partition_ratios = saved
+        import importlib
+        importlib.reload(du)

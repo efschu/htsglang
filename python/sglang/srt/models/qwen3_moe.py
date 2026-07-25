@@ -229,6 +229,45 @@ def compute_yarn_parameters(
     return factor, low, high, attention_factor
 
 
+def _reject_uneven_tp_unaware_attention(model_name: str, tp_size: int) -> None:
+    """Fail at CONSTRUCTION when a non-uniform --rank-tp-ratio is installed for
+    a model whose attention is not uneven-TP aware.
+
+    This architecture derives `num_heads = total // tp_size` -- an EVEN split --
+    while the parallel Linear layers consult the installed ratio plan. The two
+    axes then disagree: measured on TP=2 with `--rank-tp-ratio 11,21`, both
+    ranks kept 7 heads (448 = 7x64, correctly clamped to whole KV units) while
+    o_proj's input was cut by the RAW ratio into 308/588, and the forward died
+    with "mat1 and mat2 shapes cannot be multiplied".
+
+    Clamping o_proj to the head split would be the WRONG repair here: it makes
+    the shapes agree while `self.num_heads` still reports the even count, i.e.
+    it trades a loud shape error for a silent one. An architecture must opt in
+    by deriving its head counts from the plan (see qwen3_5 / qwen3_next /
+    gemma4_causal, which pass `tp_units`/`tp_q_groups` to o_proj); until then
+    the ratio is rejected rather than half-applied.
+
+    Same rationale as assert_activation_aligned_shards: reject at plan time,
+    not at the first forward.
+    """
+    from sglang.srt.distributed.utils import get_tp_partition_ratios, tp_plan_active
+
+    if not tp_plan_active(tp_size):
+        return
+    ratios = get_tp_partition_ratios()
+    if ratios and len(set(ratios)) == 1:
+        return  # uniform vector IS the even split
+    raise ValueError(
+        f"--rank-tp-ratio {list(ratios)} is a NON-UNIFORM shard plan, but the "
+        f"{model_name} attention is not uneven-TP aware: it derives its head "
+        f"counts as total // tp_size (an even split) while its projections "
+        f"follow the ratio, so the head axis and the o_proj input axis "
+        f"disagree. Use an uneven-TP-aware architecture (e.g. Qwen3.5/Qwen3.6, "
+        f"Gemma-4), or run this model with a uniform ratio / without "
+        f"--rank-tp-ratio."
+    )
+
+
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -456,6 +495,7 @@ class Qwen3MoeAttention(nn.Module):
         self.config = config
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
+        _reject_uneven_tp_unaware_attention("Qwen3-MoE", attn_tp_size)
         self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = num_kv_heads
         if self.total_num_kv_heads >= attn_tp_size:

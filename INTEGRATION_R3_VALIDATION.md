@@ -380,3 +380,66 @@ AssertionError: world=2 shape=(4, 6, 2) dim=2 rank=0: shape (2, 4, 3) != (4, 6, 
 Re-validated after the fix: 3-rank ground-truth probe green on **all three**
 transports (gloo, shm, device); arm E green under CUDA graphs (health 200,
 0 crash markers, accept 3.45/2.75/3.33, unchanged).
+
+
+## o_proj vs the clamped head split — audited, and the fix is REJECT not clamp
+
+Reported: `--rank-tp-ratio 11,21` on TP=2 gave both ranks 7 heads
+(448 = 7x64, correctly clamped to whole KV units) while o_proj's input was cut
+by the RAW ratio (308/588) -> `mat1 and mat2 shapes cannot be multiplied`.
+
+### Mechanism
+
+`partition_sizes(total, weights, units=...)` distributes indivisible units by
+largest-remainder (whole heads). WITHOUT `units` it computes
+`total // sum(weights) * w` -- the raw ratio. For 11:21 over 896 that is
+exactly 308/588; the clamped head split is 448/448.
+
+### The audit — where else is a raw ratio applied to a head-coupled dimension
+
+Mechanical sweep of every `RowParallelLinear` in `python/sglang/srt/models/`
+(AST, assignment-target names, MLP `down_proj` excluded):
+
+* 102 true attention-output sites; **7 pass `tp_units`, 95 do not**.
+* Of the architectures this fork actually runs with uneven TP:
+
+| site | `tp_units` |
+|---|---|
+| `dflash.py:146`, `gemma4_causal.py:414`, `qwen3_5.py:347/947`, `qwen3_next.py:258/820` | YES |
+| **`qwen2.py:158`, `qwen3.py:131`, `qwen3_moe.py:490`** | **NO** |
+
+### Why clamping o_proj would have been the WRONG repair
+
+The three unaware models derive `num_heads = total // tp_size` -- an EVEN
+split -- and import none of the uneven-TP helpers, while their Linear layers
+consult the installed ratio plan. Clamping o_proj to the head split would make
+the shapes agree while `self.num_heads` still reported the even count: it
+trades a LOUD shape error for a SILENT one. That is the failure variant this
+audit exists to prevent, so the ratio is rejected instead until an
+architecture opts in.
+
+### Fix
+
+`_reject_uneven_tp_unaware_attention(model, tp_size)` runs at attention
+construction in `qwen2.py`, `qwen3.py`, `qwen3_moe.py`: a NON-UNIFORM base
+plan raises with the ratio, the reason, and a way out. A uniform vector (which
+IS the even split) and an absent plan both pass through, so the default path is
+untouched. Same rationale as the existing
+`assert_activation_aligned_shards`: reject at plan time, not at the first
+forward.
+
+Test `test_uneven_tp_is_rejected_on_models_whose_attention_is_not_aware` pins
+all three directions (non-uniform rejected and names the numbers; uniform
+accepted; no plan accepted).
+
+Verified the guard does NOT over-reject: the Qwen3.6 uneven-TP arm
+(`--rank-tp-ratio auto-performance`, TP=3) boots with **0** guard hits and
+reproduces its numbers exactly (accept 3.693877551020408 / 2.8205128205128207
+/ 3.283582089552239).
+
+### Left open deliberately
+
+The other **95** attention-output sites lacking `tp_units` are latent, not
+fixed: they belong to architectures this fork does not run with uneven TP, so
+they are unreachable today. They would need the same treatment (opt in, or be
+rejected) before uneven TP is offered on them.
