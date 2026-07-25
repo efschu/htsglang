@@ -29,6 +29,19 @@ class CompressedTensorsLinearScheme(BaseLinearScheme):
         """
         raise NotImplementedError
 
+    def needs_device_kernel(self) -> bool:
+        """Whether this scheme depends on a device kernel with a capability floor.
+
+        A scheme that runs on plain torch ops (dequantise + ``F.linear``) has
+        no floor -- it works wherever the storage dtype itself works. Such a
+        scheme returns False so the capability gate is not consulted at all,
+        rather than being handed a threshold that does not describe it.
+
+        Instance-level, not a classmethod, because a scheme may only discover
+        which path it is taking once it can see the device.
+        """
+        return True
+
     @abstractmethod
     def create_weights(self, *args, **kwargs):
         """

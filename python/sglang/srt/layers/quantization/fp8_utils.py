@@ -220,6 +220,85 @@ def cutlass_fp8_supported():
     return False
 
 
+@lru_cache(maxsize=1)
+def fp8_native_gemm_available() -> bool:
+    """Whether this device has a working native fp8 GEMM.
+
+    Asked FUNCTIONALLY -- by attempting the operation once -- and not by
+    comparing a capability integer, on purpose.
+
+    ``torch.cuda.get_device_capability()`` answers in the *caller's* vendor
+    namespace, and the two namespaces collide: gfx900 reports ``(9, 0)``, the
+    same integer as NVIDIA Hopper. A ``>= 89`` threshold therefore admits an
+    8 GB Vega 64, which then dies later on a missing kernel -- a silent time
+    bomb instead of a clean rejection.
+
+    torch itself gets this right internally: its own error reads "only
+    supported on CUDA devices with compute capability >= 9.0 or 8.9, or ROCm
+    MI300+", and it rejects gfx900 *despite* the ``(9, 0)``. That is precisely
+    why the integer alone cannot be the gate -- the same number means "yes" in
+    one namespace and "no" in the other.
+
+    Measured 2026-07-25: raises on both gfx900 (ROCm 6.3) and sm75.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        a = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device="cuda")
+        # _scaled_mm wants the second operand column-major
+        b = torch.zeros((16, 32), dtype=torch.float8_e4m3fn, device="cuda").t()
+        scale = torch.ones((), dtype=torch.float32, device="cuda")
+        torch._scaled_mm(a, b, scale_a=scale, scale_b=scale, out_dtype=torch.float16)
+        return True
+    except Exception as e:  # noqa: BLE001 - any failure means "not available"
+        logger.info("No native fp8 GEMM on this device (%s); "
+                    "fp8 checkpoints will run through the dequant fallback.", e)
+        return False
+
+
+@lru_cache(maxsize=1)
+def fp8_needs_dequant_fallback() -> bool:
+    """True when NO fp8 GEMM of any kind is reachable on this device.
+
+    Checked in the order the fast paths would be tried: a native fp8 GEMM
+    (sm89+/Hopper/Blackwell, MI300+), cutlass, then Marlin (sm80..88). If none
+    of them exists, the only correct route left is dequantise + F.linear.
+
+    Deliberately not a capability number -- see fp8_native_gemm_available.
+
+    SGLANG_FORCE_FP8_DEQUANT=1 forces this on. It exists so the fallback can be
+    exercised on a machine that does have fp8 hardware -- otherwise the only
+    way to test it is on a card too small for the checkpoints that need it.
+    """
+    if get_bool_env_var("SGLANG_FORCE_FP8_DEQUANT"):
+        return True
+    return not (
+        fp8_native_gemm_available()
+        or cutlass_fp8_supported()
+        or can_auto_enable_marlin_fp8()
+    )
+
+
+def dequant_fp8_weight(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dequantise an fp8 weight to ``out_dtype``: W_deq = W_fp8 * scale.
+
+    ``weight`` is ``(out_features, in_features)`` and ``weight_scale`` is
+    either a scalar (per-tensor) or ``(out_features, 1)`` (per-channel), so
+    the scale broadcasts along the output dimension.
+
+    This is the W8A16 half of the fallback: the *weights* stay fp8 in VRAM and
+    are expanded per forward, while the *activations* remain in the model's
+    compute dtype and are never quantised. That is the whole point on a card
+    with no fp8 GEMM -- the capacity win of an fp8 checkpoint is kept (weights
+    occupy half the bytes at rest) without needing an fp8 arithmetic unit.
+    """
+    return weight.to(out_dtype) * weight_scale.to(out_dtype)
+
+
 def normalize_e4m3fn_to_e4m3fnuz(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,

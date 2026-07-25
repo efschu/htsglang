@@ -269,7 +269,15 @@ def _get_quantization_config(
                 quant_config = HybridFp8NvFp4Config(
                     fp8_config=quant_config, nvfp4_config=nvfp4_config
                 )
-        if not _is_npu:
+        # NOTE: get_device_capability() answers in the caller's VENDOR
+        # namespace, while get_min_capability() returns NVIDIA numbers, and the
+        # two namespaces collide -- gfx900 reports (9, 0), the same integer as
+        # Hopper. So on ROCm this comparison is not meaningful and can admit a
+        # device that has no kernel for the method, which then fails later.
+        # Fixing that for every quantization method at once is out of scope
+        # here; what is fixed is the case where the method itself says it needs
+        # no device kernel, in which case the floor does not apply at all.
+        if not _is_npu and quant_config.needs_device_kernel():
             major, minor = get_device_capability()
 
             if major is not None and minor is not None:

@@ -404,6 +404,45 @@ class CompressedTensorsConfig(QuantizationConfig):
         return []
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
+        """Is this scheme's device kernel available here?
+
+        The ``min_capability`` values in this file are NVIDIA compute
+        capabilities, so they may only be compared against a capability read
+        in the NVIDIA namespace. ``torch.cuda.get_device_capability()`` answers
+        in whichever namespace the build belongs to, and the two collide:
+        gfx900 reports ``(9, 0)``, the same integer as Hopper.
+
+        Comparing an AMD arch against a CUDA threshold is therefore not merely
+        imprecise, it fails in the DANGEROUS direction: an 8 GB Vega 64 sails
+        through an sm89 fp8 gate and dies later on a missing kernel, instead of
+        being told no at startup. So: vendor first, capability second, each in
+        its own namespace.
+
+        On ROCm there is no meaningful CUDA capability to compare, so the
+        question is asked functionally instead -- does a native fp8 GEMM exist
+        on this device? That keeps MI300-class parts (which have one) working
+        exactly as before, while gfx900 and friends get a clean "no" and route
+        to the dequant fallback.
+        """
+        # Imported lazily: fp8_utils pulls in the kernel modules, and this file
+        # is imported while the quantization registry is still being built.
+        from sglang.srt.layers.quantization.fp8_utils import (
+            fp8_native_gemm_available,
+        )
+
+        if torch.version.hip is not None:
+            # AMD: the CUDA threshold does not apply in this namespace.
+            supported = fp8_native_gemm_available()
+            if error and not supported:
+                raise RuntimeError(
+                    "Quantization scheme is not supported on this AMD GPU: no "
+                    "native fp8 GEMM. (Note the capability reported here, "
+                    f"{torch.cuda.get_device_capability()}, is an AMD arch and "
+                    f"is NOT comparable to the CUDA min capability "
+                    f"{min_capability}.)"
+                )
+            return supported
+
         capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
 
         if capability_tuple is not None:
@@ -879,7 +918,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         # Note: NPU devices do not support min_capability function
-        if not _is_npu:
+        # A scheme that needs no device kernel has no capability floor to
+        # check -- see CompressedTensorsLinearScheme.needs_device_kernel.
+        if not _is_npu and scheme.needs_device_kernel():
             self._check_scheme_supported(scheme.get_min_capability())
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme

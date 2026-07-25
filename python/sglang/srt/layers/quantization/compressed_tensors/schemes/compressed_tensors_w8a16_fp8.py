@@ -15,26 +15,50 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
+from sglang.srt.layers.quantization.fp8_utils import dequant_fp8_weight
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.utils import convert_to_channelwise
+from sglang.srt.utils import is_cuda
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
 SUPPORTED_STRATEGIES = [QuantizationStrategy.CHANNEL, QuantizationStrategy.TENSOR]
+
+_is_cuda = is_cuda()
+
+
+def _marlin_available() -> bool:
+    """Marlin is the fast W8A16 path, but it is CUDA-only (its kernels are not
+    even imported on ROCm) and needs sm80. Where it is missing there is still a
+    correct W8A16 path -- dequantise and use F.linear -- so its absence is a
+    reason to take the slower route, not to refuse the checkpoint."""
+    if not _is_cuda:
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 8
 
 
 class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
     def __init__(self, strategy: str, is_static_input_scheme: bool):
         self.strategy = strategy
         self.is_static_input_scheme = is_static_input_scheme
+        # Decided once, here, because create_weights and apply_weights must
+        # agree on the weight LAYOUT: marlin wants it transposed and repacked,
+        # the dequant path wants it left as (out_features, in_features).
+        self.use_marlin = _marlin_available()
 
     @classmethod
     def get_min_capability(cls) -> int:
         # ampere and up
         return 80
+
+    def needs_device_kernel(self) -> bool:
+        # Only the marlin path has a capability floor; the dequant path is
+        # plain torch and runs anywhere fp8 storage works (sm75, gfx900).
+        return self.use_marlin
 
     # W8A8-Fp8 kernels support only per-tensor and per-channel cases.
     # So if we have a fused module (QKV, MLP) with per tensor scales,
@@ -51,14 +75,22 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
                 layer.weight_scale.data, requires_grad=False
             )
 
-        # Weights must be transposed for marlin
-        layer.weight = torch.nn.Parameter(layer.weight.t(), requires_grad=False)
-
         if self.is_static_input_scheme:
             # required by torch.compile to be torch.nn.Parameter
             layer.input_scale = torch.nn.Parameter(
                 layer.input_scale.data, requires_grad=False
             )
+
+        if not self.use_marlin:
+            # Dequant path: F.linear wants (out_features, in_features), which
+            # is exactly how the weight was loaded, so leave it alone. The
+            # weight STAYS fp8 in VRAM -- that is the capacity win -- and is
+            # expanded per forward in apply_weights.
+            layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
+            return
+
+        # Weights must be transposed for marlin
+        layer.weight = torch.nn.Parameter(layer.weight.t(), requires_grad=False)
         prepare_fp8_layer_for_marlin(layer, size_k_first=True)
 
     def create_weights(
@@ -125,6 +157,17 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if not self.use_marlin:
+            # W8A16: weights dequantised per forward, activations untouched in
+            # their compute dtype. The input scale, if the checkpoint carried
+            # one, is deliberately unused -- nothing quantises the activations
+            # on this path, so there is nothing for it to scale.
+            return torch.nn.functional.linear(
+                x,
+                dequant_fp8_weight(layer.weight, layer.weight_scale, x.dtype),
+                bias,
+            )
+
         return apply_fp8_marlin_linear(
             input=x,
             weight=layer.weight,

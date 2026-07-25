@@ -107,7 +107,9 @@ __global__ void store_kvcache(const __grid_constant__ StoreKVCacheParams params)
   const auto index = *index_ptr;
   // A stale/OOB slot id would cause an illegal memory access in the store below;
   // fail fast at the culprit instead. always-on (kvcache JIT compiles without NDEBUG).
-  assert(index >= 0 && index < size_limit);
+  // SGL_DEVICE_ASSERT rather than a bare assert: a device assert makes this
+  // kernel unlaunchable on gfx900 (see utils.cuh). Same fail-fast contract.
+  SGL_DEVICE_ASSERT(index >= 0 && index < size_limit);
   const auto k_src = pointer::offset(k_input, item_id * stride_k, split_id * kSplitSize);
   const auto v_src = pointer::offset(v_input, item_id * stride_v, split_id * kSplitSize);
   const auto k_dst = pointer::offset(k_cache, index * stride_cache, split_id * kSplitSize);
