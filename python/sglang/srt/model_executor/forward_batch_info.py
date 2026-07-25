@@ -390,6 +390,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # kv-session-offload (S1): eager bs=1 decode tick of a host-spilled
     # session (KV streamed from the pinned host pool; never graph-replayed).
     kv_session_spill_tick: bool = False
+    # kv-session-offload PS2 (deep prefill-spill): born-spilled EXTEND whose
+    # out_cache_loc is a row of host sentinels -- the attention backend routes
+    # the KV write through the staging carve + copy-stream D2H instead of the
+    # device scatter.
+    kv_session_prefill_spill: bool = False
     spec_algorithm: SpeculativeAlgorithm = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
@@ -722,6 +727,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             kv_session_spill_tick=batch.kv_session_spill_tick,
+            kv_session_prefill_spill=getattr(
+                batch, "kv_session_prefill_spill", False
+            ),
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,

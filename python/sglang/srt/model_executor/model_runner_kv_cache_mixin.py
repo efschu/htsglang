@@ -1743,6 +1743,10 @@ class ModelRunnerKVCacheMixin:
 
         # ---- kv-session-offload (S1): scope fail-fast ----------------------
         self._kv_sess_scratch_slot = None
+        # PS2 (deep prefill-spill) staging carve; stays 0/None unless
+        # --kv-session-offload-prefill is set (flag OFF reserves nothing).
+        self._kv_sess_prefill_stage_base = 0
+        self._kv_sess_prefill_stage_tokens = 0
         if self.server_args.enable_kv_session_offload and not self.is_draft_worker:
             if self.mambaish_config is None:
                 raise ValueError(
@@ -2433,6 +2437,49 @@ class ModelRunnerKVCacheMixin:
                     # scratch.
                     self._kv_sess_scratch_slot = _hybrid_pool_size + 1
                     _hybrid_pool_size += 1
+                    # PS2 (deep prefill-spill): a born-spilled EXTEND allocates
+                    # NO device KV slots, so its whole chunk is quantised
+                    # through a STAGING CARVE appended right after the scratch
+                    # row (also never handed out by the allocator) and then
+                    # copied D2H into the session's host region. Sized RANK-
+                    # UNIFORMLY from replicated config (chunk size, S,
+                    # max_ratio) so every rank reserves the same rows even
+                    # though their owned fill levels differ (S3b.4 item 3).
+                    # Flag-gated on --kv-session-offload-prefill: without it
+                    # not a single row is reserved.
+                    if getattr(
+                        self.server_args, "kv_session_offload_prefill", False
+                    ):
+                        from sglang.srt.managers.kv_session_offload import (
+                            prefill_stage_tokens,
+                        )
+
+                        _chunk = int(
+                            self.server_args.chunked_prefill_size
+                            or self.max_total_num_tokens
+                        )
+                        if _chunk <= 0:
+                            _chunk = int(self.max_total_num_tokens)
+                        if uneven_dcp_active(self.dcp_size) and not _draft_non_dcp:
+                            _stage_S = _S
+                            _stage_ratio = max(get_cp_token_ratios())
+                        else:
+                            _stage_S = max(1, self.dcp_size)
+                            _stage_ratio = 1
+                        _stage = prefill_stage_tokens(_chunk, _stage_S, _stage_ratio)
+                        self._kv_sess_prefill_stage_base = _hybrid_pool_size + 1
+                        self._kv_sess_prefill_stage_tokens = _stage
+                        _hybrid_pool_size += _stage
+                        logger.info(
+                            "kv-session-offload PS2 (prefill-spill): device "
+                            "staging carve of %d rows reserved at slot %d "
+                            "(chunk=%d, S=%d, max_ratio=%d).",
+                            _stage,
+                            self._kv_sess_prefill_stage_base,
+                            _chunk,
+                            _stage_S,
+                            _stage_ratio,
+                        )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=_hybrid_pool_size,

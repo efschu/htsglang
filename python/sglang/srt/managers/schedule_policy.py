@@ -38,6 +38,7 @@ import torch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
+from sglang.srt.managers.kv_session_offload import prefill_spill_deep_ok
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -511,6 +512,8 @@ class PrefillAdder:
         waiting_queue_len: int = 0,
         dcp_avail_deficit: int = 0,
         prefill_spill_regions: int = 0,
+        prefill_spill_region_tokens: int = 0,
+        prefill_spill_deep: bool = False,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -523,6 +526,16 @@ class PrefillAdder:
         # them. Replicated across DCP ranks (see prefill_spill_free_regions) and
         # decremented identically per rank -> rank-uniform, no collective.
         self.prefill_spill_regions = int(prefill_spill_regions)
+        # PS2 (deep prefill-spill). `prefill_spill_deep` is the master gate
+        # (--kv-session-offload-prefill); `region_tokens` bounds a session's
+        # host tail. `_deep_taken` enforces the ALL-OR-NOTHING batch
+        # separation: a born-spilled-deep prompt is admitted only into an EMPTY
+        # can_run_list and closes the batch behind it, so its host-sentinel
+        # out_cache_loc is never mixed with real device slots. All three are
+        # replicated -> the partition is identical on every DCP rank.
+        self.prefill_spill_deep = bool(prefill_spill_deep)
+        self.prefill_spill_region_tokens = int(prefill_spill_region_tokens)
+        self.prefill_spill_deep_taken = False
         # RANK-UNIFORM admission under uneven DCP (kv-session-offload): a
         # non-negative correction (local_avail - min_reduce(local_avail))
         # subtracted from every `available_size()`-based admission budget so all
@@ -742,6 +755,11 @@ class PrefillAdder:
         return -(-tokens // self.page_size) * self.page_size
 
     def budget_state(self):
+        # PS2 batch separation: once a born-spilled-deep prompt is in the list
+        # the extend batch is CLOSED -- its out_cache_loc is a row of host
+        # sentinels and must not be concatenated with real device slots.
+        if self.prefill_spill_deep_taken:
+            return AddReqResult.OTHER
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
             no_token = self.rem_swa_tokens <= 0
@@ -799,6 +817,58 @@ class PrefillAdder:
             "rides the decode-OOM spill into host.",
             getattr(req, "rid", "?"),
             int(born_input_tokens),
+            int(self.rem_total_tokens),
+        )
+        return True
+
+    def _admit_born_spilled_deep(self, req, born_input_tokens: int) -> bool:
+        """PS2 (deep prefill-spill): admit a prompt whose INPUT does not even
+        transiently fit the device budget, by never giving it device KV slots.
+
+        The strict COMPLEMENT of ``_admit_born_spilled``'s window: PS1 is tried
+        first and PS2 only sees what PS1 rejected, so the validated PS1 path
+        keeps its exact behaviour and PS2 adds a new admission, never a
+        different one.
+
+        Guards (all hard, all replicated -> RANK-UNIFORM without a collective;
+        see ``prefill_spill_deep_ok`` for the verdict itself):
+          * feature on and a free host region available;
+          * ONE CHUNK: the prompt must fit ``rem_chunk_tokens`` whole. Without
+            PS3 (host-prefix extend read) a second chunk would attend the first
+            chunk's SENTINEL rows -- garbage. A single non-chunked extend
+            attends only its own ragged keys plus the device-resident radix
+            prefix, so it needs no host read;
+          * the tail fits one region;
+          * BATCH SEPARATION: only into an empty ``can_run_list``, and the
+            batch is closed behind it (``prefill_spill_deep_taken``), because
+            ``out_cache_loc`` cannot hold device slots and host sentinels at
+            once.
+        Off (``prefill_spill_deep`` False) -> byte-identical."""
+        if not self.prefill_spill_deep:
+            return False
+        if self.can_run_list or self.prefill_spill_deep_taken:
+            return False
+        input_tokens = self.ceil_paged_tokens(
+            len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+        )
+        if not prefill_spill_deep_ok(
+            free_regions=self.prefill_spill_regions,
+            born_input_tokens=born_input_tokens,
+            rem_total_tokens=self.rem_total_tokens,
+            input_tokens=input_tokens,
+            rem_chunk_tokens=self.rem_chunk_tokens,
+            region_tokens=self.prefill_spill_region_tokens,
+        ):
+            return False
+        req.born_spilled_deep = True
+        self.prefill_spill_deep_taken = True
+        self.prefill_spill_regions -= 1
+        logger.info(
+            "kv-session-offload prefill-spill (PS2): admit rid=%s BORN-SPILLED "
+            "DEEP (input=%d does NOT fit device budget=%d) -- prefilled "
+            "straight into a host region, no device KV slots.",
+            getattr(req, "rid", "?"),
+            int(input_tokens),
             int(self.rem_total_tokens),
         )
         return True
@@ -1097,6 +1167,10 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        # PS2 batch separation (see budget_state): a born-spilled-deep prompt
+        # owns its extend batch exclusively.
+        if self.prefill_spill_deep_taken:
+            return AddReqResult.OTHER
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
@@ -1146,8 +1220,12 @@ class PrefillAdder:
 
         if total_tokens >= self.rem_total_tokens:
             # Lifetime doesn't fit VRAM: wedge -- UNLESS Prefill-Spill can admit
-            # it born-spilled (input transiently fits, a host region is free).
-            if not self._admit_born_spilled(req, born_input_tokens):
+            # it born-spilled (input transiently fits, a host region is free),
+            # or -- PS2, the strict complement -- born-spilled DEEP (not even
+            # the input fits; the prefill never materializes device KV slots).
+            if not self._admit_born_spilled(
+                req, born_input_tokens
+            ) and not self._admit_born_spilled_deep(req, born_input_tokens):
                 return AddReqResult.NO_TOKEN
 
         if self.is_hybrid_swa:
@@ -1173,7 +1251,11 @@ class PrefillAdder:
                 # Prefill-Spill: a prompt already admitted born-spilled at the
                 # pre-lock gate stays admitted as long as its input still fits
                 # the (possibly shrunk) device budget; otherwise wedge as usual.
-                if not (
+                # PS2: a born-spilled-DEEP prompt allocates NO device KV slots
+                # at all, so a shrunk device budget cannot invalidate it -- it
+                # stays admitted (its host region was reserved at the pre-lock
+                # verdict, replicated on every rank).
+                if not req.born_spilled_deep and not (
                     req.born_spilled and born_input_tokens < self.rem_total_tokens
                 ):
                     return AddReqResult.NO_TOKEN

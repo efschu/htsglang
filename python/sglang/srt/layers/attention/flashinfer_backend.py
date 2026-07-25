@@ -1002,6 +1002,10 @@ class FlashInferAttnBackend(AttentionBackend):
         # Per-step state of the spill tick (None on every other forward --
         # the ONLY dispatch key; unset means every path below is untouched).
         self._sess_spill = None
+        # PS2 (deep prefill-spill): per-forward state of a born-spilled EXTEND
+        # (None on every other forward -- same dispatch discipline as
+        # _sess_spill, so flag OFF / non-PS2 forwards run byte-identically).
+        self._sess_prefill_spill = None
         self._sess_enabled = bool(
             getattr(model_runner.server_args, "enable_kv_session_offload", False)
         ) and not getattr(model_runner, "is_draft_worker", False)
@@ -1402,6 +1406,18 @@ class FlashInferAttnBackend(AttentionBackend):
             is_spill = bool(getattr(forward_batch, "kv_session_spill_tick", False))
             self._sess_spill = (
                 self._sess_prepare_step(forward_batch) if is_spill else None
+            )
+            # PS2 (deep prefill-spill): same discipline -- set unconditionally
+            # so a born-spilled prefill's state can never leak into the next
+            # (regular) forward. Rank-uniform: the flag rides the replicated
+            # batch, so every rank takes the same branch in _dcp_write_scatter
+            # and therefore issues the same per-layer collective sequence.
+            self._sess_prefill_spill = (
+                self._sess_prefill_prepare(forward_batch)
+                if bool(
+                    getattr(forward_batch, "kv_session_prefill_spill", False)
+                )
+                else None
             )
             # DECOUPLE S3: route THIS forward's DCP collectives to comm B when
             # it is a spill forward (serial per-forward flag; no-op unless the
@@ -2171,6 +2187,14 @@ class FlashInferAttnBackend(AttentionBackend):
             # through to the normal DCP owner scatter.
             self._sess_owner_write(layer, k_full, v_full)
             return
+        if self._sess_prefill_spill is not None:
+            # PS2 (deep prefill-spill): this EXTEND's out_cache_loc is a row of
+            # HOST sentinels -- there is no device slot to scatter into. Route
+            # the whole chunk through the staging carve + copy-stream D2H.
+            # Strictly the born-spilled prefill lane (the flag is set per
+            # forward and cleared on every other batch).
+            self._sess_prefill_owner_write(layer, k_full, v_full)
+            return
         if self.uneven_dcp_weighted:
             # WEIGHTED owner rule: ownership + compact physical slot are derived
             # from the out_cache_loc itself (not the sequence position), so the
@@ -2701,6 +2725,38 @@ class FlashInferAttnBackend(AttentionBackend):
         # A never-recorded CUDA event reports .query() == True (no pending
         # work), so wave-back throttling starts in the "idle/complete" state.
         self._sess_wave_done = torch.cuda.Event()
+        # ---- PS2 (deep prefill-spill) stage A/B' -------------------------
+        # A born-spilled EXTEND allocates NO device KV slots, so its freshly
+        # computed K/V cannot be scattered into the pool: it is quantised
+        # through a device STAGING CARVE (the stock set_kv_buffer byte path,
+        # so the bytes equal what a device write would have produced) and then
+        # D2H-copied into this session's host region rows.
+        #   * the carve is rank-uniformly SIZED at pool construction
+        #     (prefill_stage_tokens) -- the FILL level differs per rank;
+        #   * the D2H runs on _sess_copy_stream (stage B'), forked per layer
+        #     from the compute stream and joined ONCE at the handover;
+        #   * _sess_prefill_slots holds the per-session plan built at alloc
+        #     time (owner indices + host rows), so the forward itself does no
+        #     rank-local decision making.
+        self._sess_prefill_stage_base = int(
+            getattr(model_runner, "_kv_sess_prefill_stage_base", 0) or 0
+        )
+        self._sess_prefill_stage_cap = int(
+            getattr(model_runner, "_kv_sess_prefill_stage_tokens", 0) or 0
+        )
+        self._sess_prefill_slots = {}
+        self._sess_prefill_fork_ev = torch.cuda.Event()
+        self._sess_prefill_done = torch.cuda.Event()
+        self._sess_prefill_stage_arange = (
+            torch.arange(
+                self._sess_prefill_stage_base,
+                self._sess_prefill_stage_base + self._sess_prefill_stage_cap,
+                dtype=torch.int64,
+                device=dev,
+            )
+            if self._sess_prefill_stage_cap > 0
+            else None
+        )
         # S5 bs=1 spill-graph: bucketed rung ladder over the host block count,
         # built ONCE (max blocks = a full region). None when the flag is off
         # -> the spill tick stays on the byte-identical eager block loop. The
@@ -2777,6 +2833,131 @@ class FlashInferAttnBackend(AttentionBackend):
     def _sess_close_slot(self, rpi: int):
         """Drop a session's per-session state on restore/finish (S4)."""
         self._sess_slots.pop(int(rpi), None)
+
+    # ---- PS2 (deep prefill-spill) stage A/B' -----------------------------
+
+    def _sess_prefill_open(self, rpi: int, boundary: int, own_idx, region_base: int):
+        """Register the born-spilled EXTEND write plan for one session.
+
+        Called from the manager's ``spill_extend_alloc`` in the SAME
+        synchronous scheduler section that claims the region and writes the
+        sentinel row -- never from a stream callback (U8).
+
+        ``own_idx`` indexes the extend chunk (ascending position order); host
+        row ``region_base + j`` receives the j-th owned token, which is exactly
+        where ``_sess_prepare_step`` will look for it afterwards
+        (``base = region_base + host_row_base``, rows ``[base, base + n_own)``,
+        ``host_row_base == 0`` for a fresh region). That identity IS the PS2
+        half of the lockstep invariant."""
+        from types import SimpleNamespace
+
+        n_own = int(own_idx.numel())
+        if n_own > self._sess_prefill_stage_cap:
+            raise RuntimeError(
+                "kv-session-offload prefill-spill (PS2): chunk needs "
+                f"{n_own} staging rows > carve {self._sess_prefill_stage_cap} "
+                f"(dcp_rank {self.dcp_rank}). The carve is sized from "
+                "--chunked-prefill-size; refusing an out-of-range write."
+            )
+        dev = self._sess_staging_k.device
+        self._sess_prefill_slots[int(rpi)] = SimpleNamespace(
+            boundary=int(boundary),
+            own_idx=own_idx.to(dev),
+            n_own=n_own,
+            host_rows=torch.arange(
+                region_base, region_base + n_own, dtype=torch.int64, device=dev
+            ),
+            stage_rows=(
+                self._sess_prefill_stage_arange[:n_own]
+                if self._sess_prefill_stage_arange is not None
+                else None
+            ),
+        )
+
+    def _sess_prefill_close(self, rpi: int):
+        """Drop the born-spilled EXTEND plan at handover (the region is frozen
+        from then on and the tick owns every further row)."""
+        self._sess_prefill_slots.pop(int(rpi), None)
+
+    def _sess_prefill_join(self):
+        """Join the born-spilled prefill's copy-stream D2H (stage B').
+
+        THE ONLY join edge, and it sits at the HANDOVER (U9): during the
+        prefill nothing reads the rows back (the chunk attends its own RAGGED
+        keys, not the pool), so the copy has a whole scheduler iteration to
+        retire behind the compute. Every rank issues this wait at the same
+        iteration -- it is a stream wait, not a collective, so differing
+        per-rank copy volumes change only the WAIT TIME, never the collective
+        sequence."""
+        torch.cuda.current_stream().wait_event(self._sess_prefill_done)
+
+    def _sess_prefill_prepare(self, forward_batch):
+        """Per-forward state for a born-spilled EXTEND. Derived purely from
+        the (replicated) req_pool_idx -> the plan registered at alloc time."""
+        rpi = int(forward_batch.req_pool_indices[0].item())
+        plan = self._sess_prefill_slots.get(rpi)
+        assert plan is not None, (
+            "kv-session-offload prefill-spill (PS2): forward flagged as "
+            f"born-spilled but no write plan for req_pool_idx {rpi}"
+        )
+        return plan
+
+    def _sess_prefill_owner_write(self, layer, k_full, v_full):
+        """PS2 stage B/B': owner-write of a born-spilled EXTEND chunk.
+
+        Device half: NOTHING. The chunk owns no device KV slots -- that is the
+        whole point of "never materialize".
+
+        Host half: select this rank's owned rows, quantise them through the
+        staging carve with the stock ``set_kv_buffer`` byte path (identical
+        dtype/scale handling, so the stored bytes equal a device write's), then
+        copy them D2H into this session's host region rows.
+
+        STAGE B' -- the D2H runs on ``_sess_copy_stream``, not the compute
+        stream: on the compute stream a ``chunk_len x per_token_bytes`` copy
+        would queue in front of the next layer's compute and stall both this
+        prefill and any co-running device session (DESIGN_prefill_spill
+        6b.2/6b.4). The fork event is re-recorded per layer and waited by the
+        copy stream immediately, so each wait binds to that layer's record
+        (single issuing thread -- the same pairing discipline as
+        ``_sess_issue_copy``). ``_sess_prefill_done`` is re-recorded on the
+        copy stream every layer; the handover waits its LAST recording.
+
+        The weightless-lane owner write (``_wl_spill_owner_write``) keeps its
+        current-stream copy untouched -- moving it would change that validated
+        lane's behaviour."""
+        st = self._sess_prefill_spill
+        if st.n_own == 0:
+            return
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer
+
+        idx = st.own_idx
+        self._sess_pool.set_kv_buffer(
+            layer,
+            st.stage_rows,
+            k_full[idx].clone(),
+            v_full[idx].clone(),
+            layer.k_scale,
+            layer.v_scale,
+        )
+        fl = self._sess_full_layer_idx(layer)
+        host = self._sess_host_pool
+        cs = self._sess_copy_stream
+        # Fork: the staged rows must be written before the copy engine reads
+        # them; join only at the handover.
+        self._sess_prefill_fork_ev.record(torch.cuda.current_stream())
+        with torch.cuda.stream(cs):
+            cs.wait_event(self._sess_prefill_fork_ev)
+            transfer_kv_per_layer(
+                src_k=self._sess_full_pool.k_buffer[fl],
+                dst_k=host.k_data_refs[fl],
+                src_v=self._sess_full_pool.v_buffer[fl],
+                dst_v=host.v_data_refs[fl],
+                src_indices=st.stage_rows,
+                dst_indices=st.host_rows,
+                item_size=host.token_stride_size,
+            )
+            self._sess_prefill_done.record(cs)
 
     def _sess_slot_reset_head(self, rpi: int):
         """Force re-derivation of the head/tail split + tail counts on the

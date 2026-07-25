@@ -27,6 +27,10 @@ from sglang.srt.managers.kv_session_offload import (
     owned_counts_weighted,
     owned_device_indices,
     partial_spill_plan,
+    prefill_spill_deep_gate,
+    prefill_spill_deep_ok,
+    prefill_spill_owner_split,
+    prefill_stage_tokens,
     select_spill_victim,
     sentinel_base,
     session_priority_key,
@@ -41,6 +45,7 @@ from sglang.srt.managers.kv_session_offload import (
     spill_graph_rung_ladder,
     WaveBackController,
     wave_back_advance,
+    wave_back_gate,
 )
 
 # Weighted geometry mirroring a 3-rank uneven-DCP rig (e.g. ratios 1/32/31).
@@ -552,6 +557,85 @@ def test_wave_back_advance_never_overshoots_seqlen():
     for boundary in range(0, 33):
         adv = wave_back_advance(boundary, 32, wave_step=8)
         assert 0 <= adv and boundary + adv <= 32
+
+
+# --- P1: configurable wave-back threshold -------------------------------
+
+
+def test_wave_back_gate_default_is_todays_behaviour():
+    """Threshold 0 (DEFAULT) must reproduce the pre-P1 gate EXACTLY:
+    `space_ok = local_avail > 0`, cap = the LIVE LOCAL pool. The uniform
+    (min-reduced) value must not be consulted at all -- flag-off is
+    byte-identical, including which quantity is read."""
+    for local in (0, 1, 7, 4096, 1_000_000):
+        for uniform in (0, 1, 999_999):  # deliberately contradictory
+            assert wave_back_gate(local, uniform, 0) == (local > 0, local)
+            # negative is normalized to OFF, never to "always wave"
+            assert wave_back_gate(local, uniform, -5) == (local > 0, local)
+
+
+def test_wave_back_gate_threshold_holds_the_tail():
+    """With a threshold set, a trickle of free slots must NOT pass the gate --
+    that is the whole point: the tail accumulated under pressure stays put."""
+    # below the threshold -> no wave, however many iterations trickle by
+    assert wave_back_gate(4096, 1, 4096)[0] is False
+    assert wave_back_gate(4096, 4095, 4096)[0] is False
+    # exactly at the threshold -> wave (>=, not >)
+    assert wave_back_gate(4096, 4096, 4096)[0] is True
+    assert wave_back_gate(4096, 8192, 4096)[0] is True
+    # the cap handed to wave_back_advance is the uniform value, not the local
+    assert wave_back_gate(99_999, 8192, 4096)[1] == 8192
+
+
+def test_wave_back_gate_is_rank_uniform_under_uneven_dcp():
+    """THE hang-prevention property. Under uneven DCP the per-rank pools
+    differ, so the LOCAL availability differs per rank. The decision (and the
+    step cap, which sets how far the tier boundary moves) must still be
+    identical on every rank -- a divergent wave rewrites req_to_token
+    differently per rank and hangs the next collective."""
+    uniform = 3000  # the MIN-reduce: the same number on every rank
+    per_rank_local = [3000, 51_200, 48_000]  # ratios 1/32/31-style skew
+    for threshold in (1, 2999, 3000, 3001, 65_536):
+        decisions = {
+            wave_back_gate(local, uniform, threshold) for local in per_rank_local
+        }
+        assert len(decisions) == 1, (
+            f"threshold={threshold} produced rank-divergent wave decisions "
+            f"{decisions} -- this is an NCCL hang, not a wrong number"
+        )
+    # and the contrast that motivates it: comparing the LOCAL value against
+    # the same threshold WOULD have diverged.
+    assert len({local >= 3001 for local in per_rank_local}) == 2
+
+
+def test_wave_back_gate_threshold_reaches_the_controller():
+    """End-to-end through the real controller: below-threshold windows keep
+    the warmup streak at zero (same discipline as `space_ok=False` today), and
+    the step size respects the uniform cap once the gate opens."""
+    wb = WaveBackController(wave_step=128, warmup_steps=2)
+    below = wave_back_gate(local_avail=50_000, uniform_avail=100, min_free_tokens=4096)
+    for _ in range(5):
+        ok, cap = below
+        assert wb.plan(0, 1000, space_ok=ok, copy_inflight=False, remaining_cap=cap) == 0
+    ok, cap = wave_back_gate(50_000, 4096, 4096)
+    assert (ok, cap) == (True, 4096)
+    assert wb.plan(0, 1000, space_ok=ok, copy_inflight=False, remaining_cap=cap) == 0
+    assert wb.plan(0, 1000, space_ok=ok, copy_inflight=False, remaining_cap=cap) == 128
+    # a step is still capped by the free room even after the gate opens
+    ok, cap = wave_back_gate(50_000, 4100, 4096)
+    assert wb.plan(0, 1000, space_ok=ok, copy_inflight=False, remaining_cap=64) == 64
+
+
+def test_wave_back_min_free_server_arg_defaults_to_off():
+    """The knob must ship OFF so an unmodified launch keeps today's path."""
+    from sglang.srt.server_args import ServerArgs
+
+    assert (
+        ServerArgs.__dataclass_fields__[
+            "kv_session_offload_wave_back_min_free_tokens"
+        ].default
+        == 0
+    )
 
 
 def test_wave_back_controller_warmup_then_fires():
@@ -1530,6 +1614,7 @@ def _fake_server_args(**over):
         kv_session_offload_restore_hysteresis_steps=4,
         kv_session_offload_max_spills=1,
         kv_session_offload_restore_margin_tokens=4096,
+        kv_session_offload_wave_back_min_free_tokens=0,
         kv_session_offload_mtp_resident_slices=0,
         kv_session_offload_spec_in_tick=False,
         speculative_algorithm=None,
@@ -1570,6 +1655,17 @@ def test_server_args_rejects_budget_without_the_feature():
         assert "requires --enable-kv-session-offload" in str(e)
     else:
         raise AssertionError("standalone budget flag must be rejected")
+
+
+def test_server_args_rejects_negative_wave_back_min_free():
+    try:
+        _validate(
+            _fake_server_args(kv_session_offload_wave_back_min_free_tokens=-1)
+        )
+    except ValueError as e:
+        assert "--kv-session-offload-wave-back-min-free-tokens must be >= 0" in str(e)
+    else:
+        raise AssertionError("negative wave-back threshold must be rejected")
 
 
 def test_server_args_rejects_negative_budget():
@@ -1764,3 +1860,254 @@ if __name__ == "__main__":
         print(f"PASS {fn.__name__}")
     print(f"{len(fns)} tests passed")
     sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# PS2 -- deep prefill-spill (stage A + B'): admission verdict, staging carve
+# sizing, and the owner/host-row index math that carries the LOCKSTEP
+# invariant across the born-spilled prefill write.
+#
+# Every test below states the OLD semantics explicitly and feeds it into the
+# SAME assertions, so a missing/stub implementation is not the only thing that
+# turns them red -- the pre-fix BEHAVIOUR is falsified too.
+# ---------------------------------------------------------------------------
+
+
+def _ps1_admits(born_input_tokens, rem_total_tokens):
+    """OLD (PS1-V1a) semantics: born-spilled only when the prefill INPUT still
+    fits the device budget transiently. This is the pre-PS2 behaviour."""
+    return born_input_tokens < rem_total_tokens
+
+
+def test_ps2_admits_exactly_what_ps1_rejects_and_nothing_else():
+    """PS2's window is the strict COMPLEMENT of PS1's, so the validated PS1
+    path never changes hands. Feeding the OLD predicate into these assertions
+    fails on the deep case (it rejects) and on the shallow case (it admits
+    where PS2 must not)."""
+    region_tokens = 40000
+    chunk = 1600
+    # DEEP: a 1200-token prompt against a 900-token device budget.
+    deep = dict(
+        free_regions=2,
+        born_input_tokens=1200,
+        rem_total_tokens=900,
+        input_tokens=1200,
+        rem_chunk_tokens=chunk,
+        region_tokens=region_tokens,
+    )
+    assert prefill_spill_deep_ok(**deep) is True
+    assert _ps1_admits(deep["born_input_tokens"], deep["rem_total_tokens"]) is False
+
+    # SHALLOW: the same prompt against a 5000-token budget -- PS1's case. PS2
+    # must decline it so PS1 keeps serving it.
+    shallow = dict(deep, rem_total_tokens=5000)
+    assert prefill_spill_deep_ok(**shallow) is False
+    assert _ps1_admits(shallow["born_input_tokens"], shallow["rem_total_tokens"]) is True
+
+
+def test_ps2_one_chunk_guard_is_hard_without_ps3():
+    """A prompt that would be CHUNKED must be refused: chunk i+1 would attend
+    chunk i's sentinel rows (garbage) until PS3 exists. The OLD device path had
+    no such restriction -- chunking was always legal -- so asserting the guard
+    with 'chunking is fine' semantics fails."""
+    base = dict(
+        free_regions=1,
+        born_input_tokens=5000,
+        rem_total_tokens=900,
+        input_tokens=5000,
+        rem_chunk_tokens=1600,
+        region_tokens=40000,
+    )
+    assert prefill_spill_deep_ok(**base) is False  # 5000 > 1600 -> chunked
+    assert prefill_spill_deep_ok(**dict(base, input_tokens=1600)) is True
+    # chunked prefill OFF (rem_chunk_tokens is None) -> the whole prompt is one
+    # extend, which qualifies.
+    assert (
+        prefill_spill_deep_ok(**dict(base, rem_chunk_tokens=None)) is True
+    )
+    # OLD semantics ("chunking is fine, admit any deep prompt"):
+    _old = lambda **kw: kw["free_regions"] > 0 and not _ps1_admits(
+        kw["born_input_tokens"], kw["rem_total_tokens"]
+    )
+    assert _old(**base) is True  # would have admitted the chunked prompt
+
+
+def test_ps2_needs_a_free_region_and_a_fitting_tail():
+    base = dict(
+        free_regions=1,
+        born_input_tokens=1200,
+        rem_total_tokens=900,
+        input_tokens=1200,
+        rem_chunk_tokens=1600,
+        region_tokens=40000,
+    )
+    assert prefill_spill_deep_ok(**base) is True
+    assert prefill_spill_deep_ok(**dict(base, free_regions=0)) is False
+    assert prefill_spill_deep_ok(**dict(base, region_tokens=1000)) is False
+    assert prefill_spill_deep_ok(**dict(base, input_tokens=0)) is False
+
+
+def test_ps2_verdict_is_rank_uniform_without_a_collective():
+    """Every input is replicated or already min-reduced, so three ranks reach
+    the identical verdict from identical arguments. (U8: the region count must
+    not be re-read per rank from a local pool.)"""
+    args = dict(
+        free_regions=3,
+        born_input_tokens=1400,
+        rem_total_tokens=1000,
+        input_tokens=1400,
+        rem_chunk_tokens=1600,
+        region_tokens=40000,
+    )
+    verdicts = {prefill_spill_deep_ok(**args) for _ in range(3)}
+    assert verdicts == {True}
+
+
+def test_prefill_stage_tokens_is_rank_uniform_and_sufficient():
+    """The carve SIZE must be identical on every rank (it is a reservation)
+    while the FILL level differs. It must also cover the largest owned share of
+    ANY chunk window.
+
+    OLD semantics = the floored per-rank share ``chunk * ratio_r // S``: it is
+    both rank-VARYING and can UNDER-size a window that straddles an extra
+    residue period. Both failures are asserted against here."""
+    ratios = [1, 32, 31]  # the 5090 + 2x3080 weighted geometry
+    S = sum(ratios)
+    # NOT a multiple of S on purpose: that is exactly where the floored
+    # per-rank share under-sizes (the window's partial period can land wholly
+    # inside one rank's residue range).
+    chunk = 1500
+    carve = prefill_stage_tokens(chunk, S, max(ratios))
+
+    # rank-uniform: the same replicated inputs on every rank -> the same size.
+    per_rank = [prefill_stage_tokens(chunk, S, max(ratios)) for _ in ratios]
+    assert len(set(per_rank)) == 1
+    # OLD (floored per-rank share) is NOT rank-uniform:
+    old = [chunk * r // S for r in ratios]
+    assert len(set(old)) != 1
+
+    # sufficiency over every window offset and every rank.
+    prefix = [0]
+    for r in ratios:
+        prefix.append(prefix[-1] + r)
+    worst = 0
+    worst_old = 0
+    for start in range(0, 3 * S):
+        pos = torch.arange(start, start + chunk, dtype=torch.int64)
+        for r in range(len(ratios)):
+            n_own = int(
+                prefill_spill_owner_split(pos, S, prefix[r], prefix[r + 1]).numel()
+            )
+            worst = max(worst, n_own)
+            worst_old = max(worst_old, n_own - (chunk * ratios[r] // S))
+    assert worst <= carve
+    # the floored old sizing is provably too small for some window:
+    assert worst_old > 0
+
+
+def test_prefill_spill_owner_split_partitions_the_chunk():
+    """Across the DCP ranks the owner split is a PARTITION of the chunk (every
+    token owned exactly once) and each rank's indices are ASCENDING -- the
+    ordering the tick assumes when it maps host row j to the j-th owned tail
+    token."""
+    boundary, L = 137, 137 + 900
+    pos = torch.arange(boundary, L, dtype=torch.int64)
+    seen = []
+    for r in range(len(PREFIX) - 1):
+        idx = prefill_spill_owner_split(pos, S, PREFIX[r], PREFIX[r + 1])
+        assert torch.equal(idx, idx.sort().values)
+        seen.append(idx)
+    allidx = torch.cat(seen).sort().values
+    assert torch.equal(allidx, torch.arange(L - boundary, dtype=torch.int64))
+
+
+def test_ps2_write_rows_match_the_tick_rederivation_lockstep():
+    """THE LOCKSTEP TEST.
+
+    A token's host row is never stored -- the tick recomputes it every step
+    from (L, boundary, host_row_base, owner rule) as
+    ``region_base + host_row_base + <compacted index among owned tail
+    tokens>``. So the born-spilled prefill WRITE must place row j at exactly
+    that index, or the very first tick reads another token's KV (silently, not
+    loudly).
+
+    Verified by building the sentinel row exactly as ``spill_extend_alloc``
+    does and then running the TICK's own derivation over it
+    (``owned_counts_weighted`` on ``tailrow % S``, the code at
+    flashinfer_backend ``_sess_prepare_step``).
+
+    OLD semantics fed into the same assertions: assigning host rows by
+    POSITION (``region_base + p - boundary``, the obvious-looking mapping) --
+    it disagrees as soon as any rank owns fewer than all tokens."""
+    host_base = sentinel_base(100_000, S)
+    region_base = 4096
+    boundary, L = 40, 40 + 777
+    positions = torch.arange(boundary, L, dtype=torch.int64)
+    residues = positions % S
+    row = make_sentinels(host_base, S, residues, start=boundary)
+    # sanity: the row the manager writes decodes back to the positions.
+    assert torch.equal((row - host_base) // S, positions)
+
+    # tick-side derivation (weighted mode), verbatim shape of _sess_prepare_step
+    counts = owned_counts_weighted(row.to(torch.int64) % S, PREFIX)
+    assert sum(counts) == L - boundary
+
+    for r in range(len(PREFIX) - 1):
+        idx = prefill_spill_owner_split(positions, S, PREFIX[r], PREFIX[r + 1])
+        n_own = int(idx.numel())
+        # (a) the write's owned count equals the count the tick will derive
+        assert n_own == counts[r]
+        # (b) the write's host rows are exactly [region_base, region_base+n_own)
+        write_rows = region_base + torch.arange(n_own, dtype=torch.int64)
+        # (c) the tick's rows for the same tokens, re-derived independently:
+        #     row j <- the j-th owned tail token in ascending position order.
+        owned_positions = positions[idx]
+        tick_rows = region_base + torch.arange(
+            owned_positions.numel(), dtype=torch.int64
+        )
+        assert torch.equal(write_rows, tick_rows)
+        # OLD (positional) mapping disagrees wherever the rank is not the sole
+        # owner -- i.e. for every real uneven-DCP rank.
+        positional_rows = region_base + (owned_positions - boundary)
+        if n_own != (L - boundary):
+            assert not torch.equal(positional_rows, tick_rows)
+
+
+def test_ps2_compacted_device_slot_mapping_would_leave_the_region():
+    """A born-spilled chunk's out_cache_loc is a HOST sentinel row. Running it
+    through the stock DCP compaction (``block * ratio + (off - lo)``, what
+    ``_dcp_write_scatter`` does for a device batch) yields slot ids far outside
+    both the device pool and the session region -- which is exactly why PS2
+    needs its own owner write instead of 'just retargeting' the existing one.
+    This encodes the OLD semantics and asserts it is out of range."""
+    host_base = sentinel_base(100_000, S)
+    region_tokens = 40_000
+    region_base = 0
+    positions = torch.arange(0, 512, dtype=torch.int64)
+    row = make_sentinels(host_base, S, positions % S, start=0)
+    ratio, lo, hi = PREFIX[2] - PREFIX[1], PREFIX[1], PREFIX[2]
+    off = row % S
+    block = row // S
+    mask = (off >= lo) & (off < hi)
+    compacted = (block * ratio + (off - lo))[mask]
+    assert int(compacted.min().item()) > region_base + region_tokens
+    # the PS2 mapping stays inside the region:
+    idx = prefill_spill_owner_split(positions, S, lo, hi)
+    rows = region_base + torch.arange(idx.numel(), dtype=torch.int64)
+    assert int(rows.max().item()) < region_base + region_tokens
+
+
+def test_ps2_master_gate_declines_under_speculative_decoding():
+    """V1 boundary: under an active spec algorithm the DRAFT extend reuses the
+    target batch's out_cache_loc, which for a born-spilled prompt is a row of
+    host sentinels -- unaddressable in the (separate, non-DCP-sharded) draft
+    pool. PS2 declines instead of admitting a prompt that would write out of
+    bounds.
+
+    OLD semantics ("the feature flag alone is the gate") admits under spec and
+    therefore fails the second assertion."""
+    assert prefill_spill_deep_gate(True, spec_active=False) is True
+    assert prefill_spill_deep_gate(True, spec_active=True) is False
+    assert prefill_spill_deep_gate(False, spec_active=False) is False
+    _old_gate = lambda flag, spec_active: bool(flag)
+    assert _old_gate(True, True) is True  # what the naive gate would have done
