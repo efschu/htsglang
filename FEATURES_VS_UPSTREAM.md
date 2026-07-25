@@ -23,9 +23,8 @@ the local validation state observed on this fork's own rig(s) at the time of wri
 the cross-vendor rows — not a claim of finished code review, exhaustive test coverage, or
 upstream-mergeable maturity. `Implemented` means code is merged and has cleared the specific
 tests/boots named in that row's detail section, nothing more; it is not shorthand for "done" in
-the sense of fully reviewed and tested, and further validation and hardening is expected to
-follow. See the `Fork` column definition below for the full token vocabulary (`Implemented` /
-`WIP` / `Exp`).
+the sense of fully reviewed and tested — that review has not happened yet. See the `Fork` column
+definition below for the full token vocabulary (`Implemented` / `WIP` / `Exp`).
 
 ## Document structure
 
@@ -312,10 +311,10 @@ cuMem tag aliasing.
   `-ncmoe`/`--n-cpu-moe` (keep the first N layers' MoE weights on CPU) is the same expert-granular
   host-offload idea, but there is no asymmetric-TP/DCP to combine it with, since neither concept
   exists in llama.cpp.
-- **ik_llama.cpp:** partial, and worth calling out — same `-ot`/`--cpu-moe`/`-n-cpu-moe` flags, and
-  this project is widely credited in the community as an early driver of practical MoE CPU+GPU
-  hybrid offload for models like DeepSeek-V3 (row-interleaved quant kernels tuned specifically for
-  that CPU/GPU split). Still no asymmetric-TP/DCP to compose it with.
+- **ik_llama.cpp:** partial — same `-ot`/`--cpu-moe`/`-n-cpu-moe` flags; this project also
+  maintains its own row-interleaved quant kernel lineage (`iqk_mul_mat`, see row 8d), used for MoE
+  CPU+GPU hybrid offload for models like DeepSeek-V3. Still no asymmetric-TP/DCP to compose it
+  with.
 
 **References:** [vLLM offload config](https://docs.vllm.ai/en/latest/api/vllm/config/offload/)
 · [SGLang offload PR](https://github.com/sgl-project/sglang/pull/3675) · [SGLang expert-granular request](https://github.com/sgl-project/sglang/issues/14233)
@@ -457,12 +456,11 @@ tests.
   exist.
 - **vLLM:** no — asymmetric TP absent upstream.
 - **llama.cpp:** n/a — the closest analog is `--split-mode row`, which does split individual
-  quantized tensors by row across GPUs; being the reference K-quant implementation, that path is
-  presumably correct by construction for its own splitting granularity. But true per-rank
-  asymmetric TP (independent uneven attention-head shards, the thing this row's bugfixes are
-  about) does not exist there, so the bugfix class itself doesn't arise. **Unverified**: whether
-  `--split-mode row` at an uneven GPU *count* (not an uneven *ratio*, which it doesn't expose) ever
-  hits a K-quant superblock boundary issue — not found in the time available.
+  quantized tensors by row across GPUs. True per-rank asymmetric TP (independent uneven
+  attention-head shards, the thing this row's bugfixes are about) does not exist there, so the
+  bugfix class itself doesn't arise. **Unverified**: whether `--split-mode row` is itself correct
+  at an uneven GPU *count* (not an uneven *ratio*, which it doesn't expose), including whether it
+  ever hits a K-quant superblock boundary issue — not checked in the time available.
 - **ik_llama.cpp:** n/a — same reasoning; asymmetric TP is absent there too.
 
 **References:** depends on feature #1 (asymmetric TP)
@@ -573,7 +571,7 @@ and sm120 reduce in different order, so the low-order bits differ and are not cl
 - **vLLM:** partial — determinism work exists (batch-invariant ops); mixed-GPU-architecture TP
   groups not addressed.
 - **llama.cpp:** no — no mixed-vendor/mixed-architecture TP determinism engineering found. The
-  RPC backend could in principle connect heterogeneous backends, but no verify-sync/graph-pad/
+  RPC backend does connect heterogeneous backends (row 21), but no verify-sync/graph-pad/
   workspace-alignment work analogous to the fork's three root causes is documented anywhere found.
 - **ik_llama.cpp:** no — same, no evidence found.
 
@@ -759,8 +757,8 @@ swa-pool-sizing.
   the fork's own code.
 - **vLLM:** n/a — model support.
 - **llama.cpp:** n/a — model support is model support; llama.cpp's own architecture coverage is
-  very broad (arguably broader than SGLang/vLLM/this fork combined), but the row's fixes are
-  specifically about asymmetric-TP interactions, which don't apply there.
+  very broad, but the row's fixes are specifically about asymmetric-TP interactions, which don't
+  apply there.
 - **ik_llama.cpp:** n/a — same; model coverage there is narrower than mainline llama.cpp but
   growing (DeepSeek, Qwen3/3.5, Gemma3/4, GLM-4/5, Kimi-2, Hunyuan per project README), and
   asymmetric-TP fixes are still n/a for the same reason.
@@ -865,8 +863,8 @@ separately-registered NVIDIA-side prefill-capture assertion, remain open after i
   vendors.
 - **llama.cpp:** partial — the RPC backend (`tools/rpc`, `ggml-rpc-server`) lets one
   `llama-cli`/`llama-server` process delegate compute to remote/heterogeneous backends (CUDA,
-  Metal, CPU, and presumably Vulkan/ROCm devices too) over TCP, without needing NCCL/RCCL. But
-  it's explicitly "proof-of-concept... fragile and insecure" per its own README, and it's a
+  Metal, CPU confirmed; Vulkan/ROCm devices **unverified**) over TCP, without needing NCCL/RCCL.
+  But it's explicitly "proof-of-concept... fragile and insecure" per its own README, and it's a
   backend-delegation/pipeline model (the local process dispatches ops to a remote device), not a
   TP all-reduce/all-gather collective substituting for NCCL *within* one TP group — a materially
   different mechanism from HTCCL's collective-replacement approach.
