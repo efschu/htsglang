@@ -1045,12 +1045,82 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             self.init_attention_backend()
 
+    def _harmonize_cuda_graph_plan(self):
+        """Make the resolved cuda-graph plan identical on every rank.
+
+        `cuda_graph_config` is resolved per rank from that rank's own device,
+        model and memory, through an auto-disable cascade. On a homogeneous
+        group every rank reaches the same answer and this function is a no-op.
+        On a MIXED group it silently produces different plans: measured on an
+        RTX 2080 Ti + Radeon RX Vega 64 pair, rank 0 began prefill capture
+        (backend=breakable) while rank 1's cascade disabled prefill and went
+        straight to decode. Nobody selected that.
+
+        A captured rank replays a FIXED collective sequence while an eager rank
+        re-derives it per batch, so a phase captured on one rank and not the
+        other is a rank-divergent execution path -- the same class of defect as
+        a kernel chosen by platform instead of availability, and the reason the
+        weightless-KV path already routes BOTH sides to the EagerRunner rather
+        than letting one side capture (see init_prefill_cuda_graph).
+
+        Rule: gather each rank's per-phase backend; if they do not all agree,
+        DISABLE that phase for everyone. Deliberately not "pick the most
+        capable" or an ordering over backends -- two ranks capturing different
+        STRUCTURES is exactly what must not happen, and eager is the only
+        option guaranteed available everywhere. Logged on every rank, because a
+        silently downgraded plan is how this class of bug hides.
+
+        On a homogeneous group the gathered values are equal by construction,
+        so nothing changes -- that is the NVIDIA regression criterion.
+        """
+        import torch.distributed as dist
+
+        from sglang.srt.runtime_context import get_server_args
+
+        try:
+            server_args = get_server_args()
+        except ValueError:
+            return  # no published ServerArgs (unit tests, early startup)
+        cfg = getattr(server_args, "cuda_graph_config", None)
+        if cfg is None:
+            return
+
+        group = (
+            self.attention_tp_group.cpu_group
+            if self.server_args.enable_dp_attention
+            else self.tp_group.cpu_group
+        )
+        if group is None or dist.get_world_size(group) <= 1:
+            return
+
+        local = {phase: getattr(cfg, phase).backend for phase in Phase.ALL}
+        gathered: list = [None] * dist.get_world_size(group)
+        dist.all_gather_object(gathered, local, group=group)
+
+        for phase in Phase.ALL:
+            seen = {g[phase] for g in gathered if g is not None}
+            if len(seen) <= 1:
+                continue
+            logger.warning(
+                "CUDA graph plan differs across the group for the %s phase "
+                "(ranks resolved %s); disabling it on every rank so the "
+                "collective sequence stays rank-uniform. Set "
+                "--cuda-graph-backend-%s explicitly to make this deliberate.",
+                phase,
+                ", ".join(sorted(seen)),
+                phase,
+            )
+            getattr(cfg, phase).backend = Backend.DISABLED
+
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs. Requires init_attention_backends() to have run.
 
         Spec draft runners pass capture_decode_cuda_graph=False
         because they capture their own decode-style graphs separately.
         """
+
+        # The graph plan must be a GROUP decision, not a per-rank one.
+        self._harmonize_cuda_graph_plan()
 
         self.graph_shared_output = GraphSharedOutput.create_for_model_runner(self)
 
