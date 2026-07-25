@@ -109,15 +109,38 @@ class RotaryEmbedding(MultiPlatformOp):
         ):
             # rotary_embedding from sglang.jit_kernel.rope and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
-            if _is_cuda:
-                from sglang.jit_kernel.rope import rotary_embedding
-            elif _is_hip:
-                from sgl_kernel import rotary_embedding
-            else:
-                from vllm._custom_ops import rotary_embedding
+            # NOTE: this import happens at LAYER CONSTRUCTION time, not at
+            # module import. Module-level import sweeps cannot see it -- it was
+            # found only by actually building a model on gfx900, where
+            # sgl-kernel has no ROCm build below gfx942. The same applies to an
+            # sm75 CUDA rank via the vllm branch.
+            #
+            # `use_fallback_kernel = False` is not a new path: it is the
+            # existing non-kernel route this constructor already takes when the
+            # conditions above are not met, so declining here lands on code
+            # that is exercised on every platform that lacks the kernel.
+            _rotary_embedding = None
+            try:
+                if _is_cuda:
+                    from sglang.jit_kernel.rope import rotary_embedding
 
-            self.use_fallback_kernel = True
-            self.fallback_rotary_embedding = rotary_embedding
+                    _rotary_embedding = rotary_embedding
+                elif _is_hip:
+                    from sgl_kernel import rotary_embedding
+
+                    _rotary_embedding = rotary_embedding
+                else:
+                    from vllm._custom_ops import rotary_embedding
+
+                    _rotary_embedding = rotary_embedding
+            except ImportError:
+                _rotary_embedding = None
+
+            if _rotary_embedding is not None:
+                self.use_fallback_kernel = True
+                self.fallback_rotary_embedding = _rotary_embedding
+            else:
+                self.use_fallback_kernel = False
         else:
             self.use_fallback_kernel = False
 
