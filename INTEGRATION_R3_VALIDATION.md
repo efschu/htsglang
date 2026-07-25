@@ -137,3 +137,41 @@ in the lm_head dequant path). It OOMs **identically with the flag ON and OFF**,
 so it is launcher headroom, not the feature: this tree carries more resident
 machinery than the `htsglang-gguf` tree the launcher was written for.
 `RESERVE=4500` boots green.
+
+
+## integration/r1 — NOT merged, because its content is already here
+
+`integration/r1` reports 47 commits "ahead" of this branch, carrying
+`feat/rig-dashboard`, `feat/autoperf-gguf-knee` and `feat/kquant-kernel`.
+Investigated before merging; **all three features are already present**, and
+the ahead-count is an ancestry artefact of a rewritten/parallel line.
+
+Verified per feature, by content rather than by ancestry:
+
+| feature | evidence |
+|---|---|
+| rig dashboard | `tools/rig_dashboard/` already present. `README.md`, `index.html`, `plan_parser.py`, `server.py` identical in size (117/267/335/575 lines) on both sides |
+| K-quant MMVQ kernel + GGUF-MoE expert-index guard | `mmvq.cuh`, `moe.cuh`, `gguf_kernel.cu` **byte-identical** to the branch's versions |
+| auto-performance GGUF knee guard | present and MORE developed here: `uneven_perf.py` 2826 lines / 42 `knee` references, against 1180 lines / 37 on the r1 line |
+
+The single file that differs is `tools/rig_dashboard/test_plan_parser.py`, and
+**this branch is the better version**: it replaced hardcoded
+`/root/.claude/jobs/...` paths with an env-overridable `PLAN_PARSER_LOGDIR`.
+The r1 line still carries the hardcoded paths.
+
+A trial merge was attempted and **aborted**: it produced **25 conflicting
+files**, including add/add conflicts where both lines independently created
+the same module — `uneven_perf.py` (2826 vs 1180 lines), `gguf_qwen35.py`,
+`test_draft_pick_rank_sync.py` (368 vs 151) — plus content conflicts in
+`flashinfer_backend.py`, `dcp/comm.py`, `scheduler.py`,
+`model_runner_kv_cache_mixin.py`, `eagle_worker_v2.py` and the CUDA
+`mmvq.cuh`. Reconciling those would have added nothing and risked regressing
+the file above.
+
+**Method note, the reusable part:** `git rev-list --count <branch> ^<here>`
+answers ancestry, not content. For a rebased or independently rewritten
+line it reports a large "ahead" count for work that has already landed. The
+same trap was seen earlier with `feat/dcp-comm-fusion`, whose r2 merge parent
+(`681220baba`) is no longer on the branch. Before merging any branch that
+reports "ahead", check whether its distinctive identifiers or files are
+already present.
