@@ -65,6 +65,7 @@ fi
 
 if [ "$SIDE" = main ]; then
   MODEL=${MODEL:-/spinning/llm_stuff/club-3090/models-cache/Llama-3.1-8B-Instruct}
+  DRAFT=${DRAFT:-/spinning/llm_stuff/club-3090/models-cache/EAGLE3-LLaMA3.1-Instruct-8B}
   case "$RANK" in
     0) export CUDA_VISIBLE_DEVICES=0 ;;   # RTX 5090  (torch index, NOT nvidia-smi's)
     1) export CUDA_VISIBLE_DEVICES=1 ;;   # RTX 3080
@@ -77,6 +78,7 @@ if [ "$SIDE" = main ]; then
   export PYTHONPATH=/spinning/wt-htccl/python
 else
   MODEL=${MODEL:-/root/models/llama-3.1-8b}
+  DRAFT=${DRAFT:-/root/models/eagle3-llama31-8b}
   export GLOO_SOCKET_IFNAME=${GLOO_IFNAME:-enp9s0}
   export TP_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME
   cd /root
@@ -94,10 +96,30 @@ else
   esac
 fi
 
+# S3 = EAGLE3 drafter, standard (split) placement: the draft model is TP-sharded
+# over all five ranks like the target. Llama-3.1-8B has no native MTP head, so a
+# drafter is required; yuhuili/EAGLE3-LLaMA3.1-Instruct-8B matches this fork's
+# loader (legacy names midlayer/aux_norm_* and d2t/t2d are mapped in
+# llama_eagle3.py) and its q=32/kv=8 geometry survives TP=5 like the target's.
+# topk 1 keeps the draft a linear chain (no tree), which is the only shape S4
+# could ever mirror.
+#
+# S4 (--speculative-draft-placement solo) is REJECTED BY DESIGN in this
+# topology: server_args rejects solo for nnodes > 1, and L0 runs five ranks as
+# five nodes. Kept here so the attempt is reproducible, not because it boots.
+SPECFLAGS=""
+if [ "$STAGE" = s3 ] || [ "$STAGE" = s4 ]; then
+  SPECFLAGS="--speculative-algorithm EAGLE3 --speculative-draft-model-path $DRAFT \
+    --speculative-num-steps ${SPEC_STEPS:-3} --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens ${SPEC_DRAFT_TOKENS:-4}"
+  [ "$STAGE" = s4 ] && SPECFLAGS="$SPECFLAGS --speculative-draft-placement solo"
+fi
+
+
 exec $PY -u -m sglang.launch_server \
   --model-path "$MODEL" --dtype float16 \
   --tp-size 5 --nnodes 5 --node-rank "$RANK" --dist-init-addr "$MASTER:$PORT" \
-  --rank-tp-ratio "$RATIO" $DCPFLAGS \
+  --rank-tp-ratio "$RATIO" $DCPFLAGS $SPECFLAGS \
   --page-size 1 --disable-overlap-schedule \
   --attention-backend triton --disable-cuda-graph \
   --max-total-tokens $CTX --context-length $CTX --max-running-requests 1 \
