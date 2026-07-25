@@ -793,6 +793,16 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not _has_sgl_rmsnorm:
+            # Same guard RMSNorm.forward_cuda already carries, and for the same
+            # reason: the import above binds gemma_rmsnorm AND
+            # gemma_fused_add_rmsnorm to None when sgl_kernel is absent, which
+            # it is on any CUDA GPU below sm_80 (sgl_kernel's gencode floor).
+            # Without this, _forward_impl called a None and raised
+            # "TypeError: 'NoneType' object is not callable" deep inside the
+            # model forward, on the NVIDIA rank -- RMSNorm was guarded, this
+            # sibling class in the same file was missed.
+            return self.forward_native(x, residual, post_residual_addition)
         return self._forward_impl(x, residual, post_residual_addition)
 
     def forward_hip(
