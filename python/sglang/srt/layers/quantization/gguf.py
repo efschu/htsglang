@@ -3,6 +3,7 @@
 # Adapted from: https://github.com/vllm-project/vllm/blob/ab3e80042eac24dd362408e6d63ad98768046359/vllm/model_executor/layers/quantization/gguf.py
 from __future__ import annotations
 
+import bisect
 import logging
 import os
 import warnings
@@ -375,6 +376,226 @@ def _mmvq_safe_for_device() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Task #163: bucket-coupled MMVQ->MMQ decode threshold. OPT-IN, default OFF.
+#
+# THE PROBLEM. `_batched_mmvq_enabled()` pins `mmvq_safe = 8`, so `M <= 8`
+# always takes the matrix-VECTOR kernel, while `_MMQ_MAX_TOKENS` is also 8 --
+# which makes the MMQ branch below unreachable for every MMQ-capable type. The
+# tiled kernel `ggml_mul_mat_a8` exists and Q8_0 is in MMQ_QUANT_TYPES, but
+# nothing ever dispatches to it. Measured on the real per-rank decode shapes
+# (task163_xover_probe.py, Q8_0, correctness-gated against MMVQ at the
+# pre-registered bar 4*ULP_bf16(max|ref|) and rel_Fro <= 1e-3; median of 3):
+#
+#   RTX 5090 (sm120)         M=4    M=7    M=8    (us/call, MMVQ -> MMQ)
+#     qkv/o_proj  5120x5120  15.4   25.4   46.3 -> 26.4   MMQ 1.75x
+#     gate_up     5120x2688   9.4   14.8   25.4 -> 15.0   MMQ 1.70x
+#     down        2688x5120   8.8   13.4   26.6 -> 22.7   MMQ 1.17x
+#   RTX 3080 (sm86)
+#     qkv/o_proj  5120x5120  51.0   81.1   88.0 -> 89.2   MMQ 0.99x (LOSES)
+#     gate_up     5120x2688  29.8   36.8   39.4 -> 50.5   MMQ 0.78x (LOSES)
+#     down        2688x5120  30.7   46.0   47.0 -> 53.0   MMQ 0.89x (LOSES)
+#
+# So the crossover is DEVICE-dependent, not shape-dependent: on sm120 MMVQ
+# falls off a cliff at exactly M=8 and MMQ wins on every shape class; on sm86
+# MMVQ still wins at M=8 and its cliff sits above the MMQ band (M=12: MMVQ
+# 470us vs MMQ 139us, but 12 > _MMQ_MAX_TOKENS, so that range belongs to the
+# dequant branch and is out of scope here). The table below is therefore keyed
+# by (device capability, shape class) and carries only MEASURED entries; an
+# unmeasured device gets no threshold at all rather than an extrapolation.
+#
+# ---- WHY OPT-IN, AND WHAT YOU TRADE ---------------------------------------
+# The threshold is coupled to the CUDA-graph decode buckets, not to the raw
+# token count. That is necessary: a captured graph replays at its bucket size,
+# so the kernel choice must be constant across the whole bucket or a replay
+# would run a kernel other than the one it was captured with.
+#
+# What the coupling BUYS beyond replay consistency: a batch of 5 real tokens
+# padded into captured bucket 8 and the SAME batch run eagerly (graphs off, or
+# a batch too large to be captured) pick the same kernel. What it COSTS: an
+# eager forward at a token count strictly between two buckets is rounded UP,
+# so a genuine 5-token extend on sm120 runs MMQ (26.1us) where MMVQ would have
+# been faster (19.2us) -- about 1.36x on that call. With the usual ladder
+# (1,2,4,8) the exposure is exactly M=5..7 on non-replayed forwards, which is
+# why the coupling is worth its price here; it is a real cost, not zero.
+#
+# It is NOT sufficient for run-to-run reproducibility. WHICH bucket a request
+# lands in depends on the other traffic in the batch, so the same request can
+# take MMVQ in one run and MMQ in another. MMVQ and MMQ are both `*_a8` (both
+# quantise activations to int8) and agree to well inside the bf16 output
+# resolution, but they are not bit-identical -- different reduction order. So
+# enabling this introduces a NEW run-to-run variation that does not exist
+# today, and that is exactly why it is opt-in with the default OFF: with the
+# flag off, `_mmq_threshold_prefers_mmq` returns False before touching
+# anything and the dispatch is byte-identical to the previous behaviour.
+#
+# `dequant_cublas` is NEVER a target of this threshold at any tolerance: it
+# does not quantise the activations, so it sits ~6e-3 away in a different
+# PRECISION CLASS (TOLERANCE_task163.md). Rerouting into it would silently
+# change the precision class as a side effect of a speed optimisation. The
+# `bucket > _MMQ_MAX_TOKENS` guard below keeps this path strictly inside the
+# MMVQ<->MMQ pair.
+# ---------------------------------------------------------------------------
+_MMQ_THRESHOLD_ENV = "SGLANG_GGUF_MMQ_DECODE_THRESHOLD"
+
+# (major, minor) -> {shape class -> smallest decode BUCKET that takes MMQ}.
+# `None` means "measured on this device, MMQ never wins inside the MMQ band".
+# A device absent from this table is unmeasured and gets no rerouting.
+_MMQ_BUCKET_MIN: dict = {
+    (12, 0): {"square": 8, "tall": 8, "wide_k": 8},  # RTX 5090, measured
+    (8, 6): {"square": None, "tall": None, "wide_k": None},  # RTX 3080, measured
+}
+
+# Shape classes over K/N (N = output rows, K = dot-product length). The three
+# classes separate the real decode shapes cleanly (down 1.91, qkv/o 1.00,
+# gate_up 0.53). NOTE, so nobody reads more into this axis than it carries:
+# on BOTH measured devices the crossover M came out identical across the three
+# classes -- what differs by class is the SIZE of the win (1.17x on wide_k vs
+# 1.75x on square), not where it starts. The axis is kept because it is the
+# place a class can be excluded when a future device or shape flips one of
+# them, and because #72's dispatch already reasons per shape class.
+_WIDE_K_RATIO = 1.25
+_TALL_RATIO = 0.8
+
+_dev_cap_by_dev: dict = {}
+_mmq_threshold_cached: Optional[bool] = None
+_mmq_threshold_logged: bool = False
+
+# Decode token-count buckets, registered by the decode CUDA-graph runner(s):
+# bs * num_tokens_per_bs for every captured bs. Target and draft runners both
+# register; the union is used, which keeps the invariant that matters -- every
+# token count a graph actually replays at IS itself a bucket, so
+# `_decode_bucket_for` is the identity during a replay and the replay runs the
+# kernel it was captured with.
+_decode_token_buckets: tuple = ()
+
+
+def set_decode_token_buckets(token_counts) -> None:
+    """Register captured decode token counts (idempotent, union-merging)."""
+    global _decode_token_buckets
+    merged = set(_decode_token_buckets)
+    merged.update(int(t) for t in token_counts if int(t) > 0)
+    _decode_token_buckets = tuple(sorted(merged))
+
+
+def _decode_bucket_for(m: int) -> int:
+    """Smallest registered decode bucket >= m (m itself if none applies).
+
+    With no buckets registered (CUDA graphs disabled) this is the identity, so
+    eager serving simply thresholds on the raw token count.
+    """
+    buckets = _decode_token_buckets
+    if not buckets or m > buckets[-1]:
+        return m
+    return buckets[bisect.bisect_left(buckets, m)]
+
+
+def _reset_mmq_threshold_cache() -> None:
+    """Test hook: drop the cached enable decision (and registered buckets)."""
+    global _mmq_threshold_cached, _decode_token_buckets, _mmq_threshold_logged
+    _mmq_threshold_cached = None
+    _decode_token_buckets = ()
+    _mmq_threshold_logged = False
+
+
+def _mmq_decode_threshold_enabled() -> bool:
+    """Opt-in gate: --gguf-mmq-decode-threshold, or the env override."""
+    global _mmq_threshold_cached
+    if _mmq_threshold_cached is not None:
+        return _mmq_threshold_cached
+    env = os.environ.get(_MMQ_THRESHOLD_ENV)
+    if env is not None:
+        _mmq_threshold_cached = env == "1"
+        return _mmq_threshold_cached
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        _mmq_threshold_cached = bool(
+            getattr(get_server_args(), "gguf_mmq_decode_threshold", False)
+        )
+        return _mmq_threshold_cached
+    except Exception:
+        # No published ServerArgs yet (unit tests, standalone kernel use, or a
+        # call that beat ModelRunner's publish). Answer False but do NOT latch
+        # it -- latching here would permanently disable the flag for anyone
+        # whose first GGUF matmul ran before the publish.
+        return False
+
+
+def _device_cap() -> tuple:
+    try:
+        dev = torch.cuda.current_device()
+    except Exception:
+        return (0, 0)
+    v = _dev_cap_by_dev.get(dev)
+    if v is None:
+        try:
+            v = tuple(torch.cuda.get_device_capability(dev))
+        except Exception:
+            v = (0, 0)
+        _dev_cap_by_dev[dev] = v
+    return v
+
+
+def _gguf_shape_class(qweight: torch.Tensor, qweight_type: int) -> str:
+    """Classify a GGUF weight shard by K/N (see _MMQ_BUCKET_MIN)."""
+    n = qweight.shape[0]
+    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+    k = qweight.shape[1] // type_size * block_size
+    ratio = k / max(n, 1)
+    if ratio > _WIDE_K_RATIO:
+        return "wide_k"
+    if ratio < _TALL_RATIO:
+        return "tall"
+    return "square"
+
+
+def _mmq_threshold_prefers_mmq(m: int, qweight: torch.Tensor, qweight_type: int) -> bool:
+    """Task #163 opt-in reroute of a decode BUCKET from MMVQ to MMQ.
+
+    Returns False before touching anything when the flag is off, which is what
+    makes the default path byte-identical.
+    """
+    if not _mmq_decode_threshold_enabled():
+        return False
+    if not _is_cuda or qweight_type not in MMQ_QUANT_TYPES:
+        return False
+    bucket = _decode_bucket_for(m)
+    # Stay strictly inside the MMVQ<->MMQ pair. Above _MMQ_MAX_TOKENS the
+    # dequant + cuBLAS branch owns the range, and it is a different PRECISION
+    # class (no activation quantisation) -- moving that boundary must be a
+    # declared decision, never a side effect of a speed threshold.
+    if bucket > _MMQ_MAX_TOKENS:
+        return False
+    cap = _device_cap()
+    table = _MMQ_BUCKET_MIN.get(cap)
+    if not table:
+        return False
+    shape_class = _gguf_shape_class(qweight, qweight_type)
+    min_bucket = table.get(shape_class)
+    if min_bucket is None or bucket < min_bucket:
+        return False
+    global _mmq_threshold_logged
+    if not _mmq_threshold_logged:
+        # One-shot, so a run can be PROVEN to have taken the new path instead
+        # of it being inferred from the throughput number.
+        _mmq_threshold_logged = True
+        logger.info(
+            "GGUF MMQ decode threshold ACTIVE (#163): device sm%d%d, first "
+            "reroute at bucket %d (raw M=%d, shape class %s, min %d), decode "
+            "buckets %s. MMVQ->MMQ is not bit-identical run-to-run; see "
+            "--gguf-mmq-decode-threshold.",
+            cap[0],
+            cap[1],
+            bucket,
+            m,
+            shape_class,
+            min_bucket,
+            _decode_token_buckets or "(none: eager)",
+        )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # #63: persistent dequant workspace.
 #
 # The large-batch (prefill) path below dequantizes each weight shard into a
@@ -536,6 +757,10 @@ def fused_mul_mat_gguf(
         # #72 shape-aware dispatch: reroute wide-K / M>=8 K-quant shapes to
         # MMQ on sm<9 devices (see _kquant_prefers_mmq).
         and not _kquant_prefers_mmq(x.shape[0], qweight, qweight_type)
+        # #163 bucket-coupled MMQ threshold: OPT-IN (--gguf-mmq-decode-
+        # threshold), default OFF -> returns False without side effects, so
+        # the dispatch below is byte-identical when the flag is not set.
+        and not _mmq_threshold_prefers_mmq(x.shape[0], qweight, qweight_type)
     ):
         y = ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     # MMQ (quantized GEMM) only for small batches (standard + k-quants): it is
