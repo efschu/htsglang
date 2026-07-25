@@ -257,3 +257,59 @@ of `_ggml_dequantize_ws` and `_mul_mat_dequant_chunked` has exactly one call
 site and that both sit inside `fused_mul_mat_gguf`, the function whose GEMM
 consumes them. A second consumer now fails the test instead of silently making
 one GEMM read another's weights.
+
+
+## Task #167 (GPU-side HTCCL rendezvous) — ALREADY IMPLEMENTED, now numerically verified
+
+Checked before building, per the rule established on the r1 line: content
+first, not the task description. The feature exists as the **`device`
+transport** (`htccl_device.py`) and is what arms E and G have been running all
+day. Nothing was built; no `sgl-kernel` rebuild was needed (the kernel is a
+JIT `load_inline` extension and was already cached).
+
+Each of the three named risks is addressed in the existing code:
+
+| risk | where it is handled |
+|---|---|
+| memory ordering | `htccl_publish_kernel` does `__threadfence_system()` **before** writing the flag (release); `htccl_wait_kernel` spins on `volatile` flag loads and does `__threadfence_system()` **after** the flag is observed (acquire). System scope, which is what host-mapped cross-process memory requires. |
+| spin abort | `clock64()` deadline -> `__trap()` in both wait kernels; `_TIMEOUT_CYCLES = 60_000_000_000` (~30 s at 2 GHz). A diverged peer traps instead of hanging the GPU. |
+| capturability | the op path has **no** host sync, no CPU collective and no D2H — only `self._ext.htccl_allreduce(...)` per slot-sized chunk. |
+
+Vendor neutrality is pursued by construction: the CUDA source is restricted to
+constructs hipify translates 1:1 (`__threadfence_system`, `clock64`, volatile
+loads), so the same file is intended to serve the ROCm build.
+
+### What was actually missing: numerical verification
+
+The transport had been validated by BOOT behaviour, never against ground
+truth. Closed here with the standalone 3-rank probe (no model, no server),
+comparing every collective to `torch.distributed`:
+
+```
+SGLANG_HTCCL_TRANSPORT=device   RANK0 OK   RANK1 OK   RANK2 OK
+```
+all_reduce / all_gather / reduce_scatter, fp32 + bf16 + fp16, shapes to
+4096x5120, plus a jittered stress loop with sizes straddling the slot. The
+same probe was previously run for `shm` and `gloo`.
+
+Under CUDA graphs — the entire point of the design — it is confirmed live:
+arms E and G both log `HTCCL device transport up: 3 ranks, GPU-driven
+collectives (CUDA-graph capturable)` on all three ranks with
+`cuda graph: True` in the decode lines.
+
+### Bandwidth — a metric, not a gate
+
+```
+RS+AG link calibration: 14.3/6.4/12.7 GB/s
+pipeline-chunk calibration: 1 MiB 5.86 ms, 2 MiB 5.67 ms, 4 MiB 6.27 ms, 8 MiB 7.26 ms -> 2 MiB
+```
+`nvidia-smi topo -m` reports **PHB between all three GPUs** — chipset, no P2P,
+no NVLink, and one card on x4. On a weak interconnect: **14.3/6.4/12.7 GB/s**.
+This rig is the unfavourable case, so that is a floor, not a verdict.
+
+### Scope boundary
+
+This host is pure NVIDIA, so the **mechanism** is fully verified here —
+GPU-side rendezvous over mapped host memory, under CUDA graphs, numerically
+correct against ground truth. The **cross-vendor** claim is NOT verified here
+and rests on the hipify-1:1 construct choice; it needs the second host.
