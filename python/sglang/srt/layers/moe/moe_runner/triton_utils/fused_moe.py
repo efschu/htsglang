@@ -69,7 +69,18 @@ if _is_cuda:
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
+    # Same reason as the _is_cuda branch above, other vendor: sgl-kernel has no
+    # ROCm build below gfx942 (setup_rocm.py), so a gfx900 rank has nothing to
+    # import. This module is on the ordinary startup path even for dense
+    # models, so it must not take the server down; an MoE model still needs
+    # the kernels.
+    try:
+        from sgl_kernel import gelu_and_mul, silu_and_mul
+
+        _has_sgl_moe_activation = True
+    except ImportError:
+        _has_sgl_moe_activation = False
+        gelu_and_mul = silu_and_mul = None
 
     if _use_aiter:
         try:
