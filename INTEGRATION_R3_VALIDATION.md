@@ -1374,3 +1374,92 @@ else's datapoint and not used.
 **Net effect on the comparison: none.** The headline rests on the local
 measured pair (94,400 / 1.00x at tp=2 versus 1,146,573 / 4.37x at tp=3 auto),
 both from this rig and the same engine.
+
+### ANSWERED: what caps stock PP at ~149k -- and it is NOT pipeline structure
+
+Probe-boot batch, boot-to-READY only, capacity lines read, torn down. Three
+candidate binders were eliminated by measurement, not argument:
+
+| candidate | test | result |
+|---|---|---|
+| VRAM | read free memory after pool allocation | **NO** -- 5.19-20.08 GB still free every time |
+| `context_len` | 32,768 vs 262,144 (model max) | **NO** -- pool unchanged |
+| `max_running_requests` | mrr 1 vs mrr 8 | **NO** -- 149,437 vs 146,024, i.e. identical |
+
+So the pool stops at ~149k while a third of each card sits idle, and nothing in
+the request shape moves it.
+
+**The binder is the stock hybrid (mamba/GDN) pool-sizing path.** The
+discriminator is one log line that is present on one side and absent on the
+other:
+
+```
+stock-flags PP run : "[auto-mamba]" appears 0 times
+fork run           : "[auto-mamba]" appears 3 times
+  [auto-mamba] demand-driven mamba pool: target_concurrency=1 ratio=5
+  safety=1.25 -> max_mamba_cache_size=7 slots (0.16 GB @ per_req=23.38 MiB;
+  fit_cap=249) -> admits ~1 reqs; activation_reserve=1.00 GB;
+  remaining VRAM -> KV pool.
+```
+
+The fork's sizer measures per-request demand, allocates the mamba pool to fit
+it (7 slots, 0.16 GB), and then **explicitly hands the remaining VRAM to the KV
+pool**. The stock path allocates a fixed 9 (even) / 14 (uneven) mamba slots and
+stops, never claiming the rest. That is the whole difference, and it is a
+SIZING FORMULA, not an architecture.
+
+Measured pools, all uncapped (`context_len` = model max 262,144):
+
+| configuration | pool | mamba slots | free VRAM left over |
+|---|---|---|---|
+| stock flags, PP=3 even | 146,024 | 9 | 5.19 / 20.06 GB |
+| stock flags, PP=3 uneven | 176,066 | 14 | 6.58 / 16.10 GB |
+| fork full | **883,584** (capped to 262,152 = model max + headroom) | 7 (demand-driven) | 8.40-10.50 GB |
+
+The fork figure independently confirms the 886,336 from the bench boots to
+within 0.3%.
+
+### Consequence: the capacity claim must be re-labelled, not restored
+
+The earlier 5.93x is therefore **not** a pipeline-vs-DCP structural advantage.
+Decomposed as far as the logs allow:
+
+* **dtype: 0%** -- both sides ran `torch.float8_e5m2` (verified).
+* **Sizing formula: the dominant part.** The fork's `[auto-mamba]` demand-driven
+  sizer (the #79/#90 work) is what converts idle VRAM into KV pool. Stock leaves
+  5-20 GB unused on every stage. This is a real fork advantage and a real
+  upstream weakness -- but it is OUR SIZER beating stock's, not tensor- versus
+  pipeline-parallelism.
+* **Structural (min-over-stages vs sum-over-ranks): real but not isolated
+  here.** It cannot be quantified while the sizing difference dominates; doing
+  so needs stock PP run with an equivalent sizer, which does not exist.
+
+**For the forum post:** the capacity row should say "the fork's memory sizing
+uses the whole card; stock's leaves a third of it idle", and must NOT be sold as
+an inherent property of pipeline parallelism. The honest, defensible number is
+the one measured under equal treatment, and that measurement does not exist yet.
+
+### The 0.82 reference command -- now MEASURED
+
+Verbatim CLAUDE.md command, vLLM from `/spinning/shvllm/.venv`, TP=2 on the two
+3080s, `--gpu-memory-utilization 0.82`, MTP=3, kv fp8. Flag-for-flag identical
+to the reference (checked mechanically, all 17 flags):
+
+```
+Model loading took 13.51 GiB memory
+Available KV cache memory: 0.89 GiB
+Auto-fit max_model_len: reduced from 262144 to 30400
+GPU KV cache size: 30,400 tokens
+Maximum concurrency for 30,400 tokens per request: 1.00x
+```
+
+| pre-fork vLLM TP=2, 2x 3080 | KV pool | max context/request | concurrency |
+|---|---|---|---|
+| **util 0.82 (the reference command)** | **30,400** | **30,400** (auto-cut from 262,144) | **1.00x** |
+| util 0.88 (earlier log) | 94,400 | 94,400 (auto-cut from 262,144) | 1.00x |
+
+The reference configuration is thus **worse** than the 0.88 datapoint the table
+previously leaned on: it reaches **11.6%** of the model's own context, serves
+exactly one request, and has 0.89 GiB of KV to work with. The pre-fork
+comparison line is therefore stronger than stated, and now rests on the exact
+command the project documents.
