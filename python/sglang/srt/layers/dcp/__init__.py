@@ -51,6 +51,11 @@ from sglang.srt.layers.dcp.layout import (
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+from sglang.srt.layers.dcp.owner import (
+    build_dcp_weighted_kv_indices,
+    dcp_weighted_owner_bounds,
+    dcp_weighted_write_slots,
+)
 
 # NOTE: planner.py is intentionally NOT imported here. It depends on server_args
 # (get_server_args), whereas this package-init executes at module-load time
@@ -67,11 +72,14 @@ __all__ = [
     "all_gather_kv_cache_for_mha_extend",
     "all_gather_kv_cache_for_mla_extend",
     "all_gather_q_for_mla_decode",
+    "build_dcp_weighted_kv_indices",
     "cp_all_gather_heads_uneven",
     "cp_local_head_bounds",
     "cp_lse_ag_out_ar_mha_uneven",
     "cp_lse_ag_out_rs_mha",
     "cp_lse_ag_out_rs_mla",
+    "dcp_weighted_owner_bounds",
+    "dcp_weighted_write_slots",
     "create_triton_kv_indices_for_dcp_triton",
     "dcp_enabled",
     "filter_dcp_local_kv_indices",
