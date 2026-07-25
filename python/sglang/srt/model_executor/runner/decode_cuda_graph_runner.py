@@ -149,10 +149,27 @@ def build_replay_fb_view(
     Subsumes the _replay_forward_batch side channel that DSV4 used to
     read out-of-band before the init_forward_metadata 3-method ABC.
     """
+    # kv-session-offload S5 spill-tick graph replay: the spill tick is a PLAIN
+    # bs=1 DECODE batch (spec_algorithm=NONE) that replays the sessblk{rung}
+    # DECODE graph. It MUST reach the backend as a spill tick with its REAL
+    # (decode) forward_mode. Two things break otherwise, but ONLY under a
+    # speculative server (the deep-offload reference runs --speculative-config
+    # mtp): (1) the marker attribute kv_session_spill_tick was dropped by this
+    # view, so the backend's spill-tick early-return
+    # (FlashInferAttnBackend.init_forward_metadata_out_graph) never fired at
+    # replay; (2) forward_mode was overwritten with capture_forward_mode
+    # (=TARGET_VERIFY under MTP), so the tick was mis-dispatched into the
+    # uneven-DCP target-verify path with spec_info=None -> "assert prefix_lens
+    # is not None". Carry the marker and keep the tick's real forward_mode.
+    # (Non-spill batches are unchanged: _spill_tick is False -> byte-identical.)
+    _spill_tick = bool(getattr(forward_batch, "kv_session_spill_tick", False))
     return SimpleNamespace(
         batch_size=bs,
-        forward_mode=capture_forward_mode,
+        forward_mode=(
+            forward_batch.forward_mode if _spill_tick else capture_forward_mode
+        ),
         actual_forward_mode=forward_batch.forward_mode,
+        kv_session_spill_tick=_spill_tick,
         input_ids=buffers.input_ids[:num_tokens],
         positions=buffers.positions[:num_tokens],
         req_pool_indices=buffers.req_pool_indices[:bs],
@@ -334,6 +351,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # is DRIVEN ON GPU by the messagent; here we only wire the admission +
         # replay-variant so the mechanism is ready.
         self._sess_block_graph = False
+        # S0 (deep-offload): set True only inside _sess_capture_one_spill_rung to
+        # force plain-decode shaping for the spill-rung capture (read by
+        # get_spec_info + capture_prepare). Default False -> byte-inert.
+        self._sess_force_plain_decode = False
         _sess_ab = getattr(self.attn_backend, "full_attn_backend", self.attn_backend)
         if (
             getattr(_sess_ab, "_sess_graph_enabled", False)
@@ -599,6 +620,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if getattr(forward_batch, "kv_session_spill_tick", False):
             if (
                 self._sess_block_graph
+                # S0 (deep-offload): the spill tick is a PLAIN bs=1 DECODE with
+                # ONE new token (spec_algorithm=NONE, spill_decode_alloc gives one
+                # sentinel slot/tick). This decode-graph runner buckets bs by
+                # num_tokens_per_bs -- and under a SPECULATIVE server that is
+                # num_draft+1 (TARGET_VERIFY shape). The replay buffer/graph-size
+                # bookkeeping (raw_num_token = raw_bs * num_tokens_per_bs, the
+                # padded req_pool_indices slot) then assumes the multi-token
+                # verify shape and mismatches the 1-token tick (stale capture
+                # req_pool row -> KeyError, wrong token count). The eager block
+                # loop handles deep multi-block tails correctly regardless, so
+                # route the spill tick to EAGER whenever the runner is not in the
+                # plain 1-token/bs decode shape. Non-spec servers (num_tokens_per
+                # _bs == 1) keep the captured spill-tick graph. Capacity (reachable
+                # depth) is unaffected -- only this tick's per-step graph speedup
+                # is deferred under MTP. Rank-uniform: num_tokens_per_bs is a
+                # replicated server config, so every DCP rank decides identically.
+                and self.num_tokens_per_bs == 1
                 and self._sess_attn._sess_graph_can_replay(forward_batch)
                 and self._sess_attn._sess_graph_captured(
                     self._sess_attn._sess_graph_replay_blocks
@@ -1019,6 +1057,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         "kvso spill-graph selftest raised (ignored): %r", _sess_e
                     )
 
+        # C4 (spec-in-spill): ENV-gated (KVSO_ATTN_SELFTEST) target-verify
+        # host-prefix attention correctness proof. Independent of the spill
+        # graph (resolves the target full-attn backend directly), gated by the
+        # env inside the method -> default OFF is byte-inert. Run once here now
+        # that the model + KV pool + staging buffers are fully initialized.
+        _sess_ab = getattr(self.attn_backend, "full_attn_backend", self.attn_backend)
+        attn_selftest = getattr(_sess_ab, "_sess_attn_selftest", None)
+        if (
+            attn_selftest is not None
+            and not self.model_runner.is_draft_worker
+            and getattr(_sess_ab, "_sess_enabled", False)
+        ):
+            try:
+                attn_selftest(self.model_runner)
+            except Exception as _sess_e:
+                # Diagnostic only -- never fail the boot on the selftest.
+                logger.warning(
+                    "kvso C4 attn selftest raised (ignored): %r", _sess_e
+                )
+
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
             self.model_runner.device,
@@ -1131,11 +1189,47 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if install is not None
             else contextlib.nullcontext()
         )
-        with ctx:
-            # Reuse the head capture path; capture_prepare's batch is tagged as
-            # a spill tick by the backend's install context (it sets the flag
-            # + synthetic state that _sess_prepare_step reads).
-            self.capture_one_shape(bs, forward, stream_idx, f"sessblk{rung}")
+        # S0 (deep-offload block>512 fix): the LIVE spill tick is a PLAIN bs=1
+        # DECODE batch -- _build_spill_batch forces spec_algorithm=NONE, so the
+        # session decodes host-streamed one token per tick (kv_session_offload.py
+        # _build_spill_batch). The capture MUST match that shape. Under a
+        # speculative server (--speculative-config mtp, the deep-offload
+        # reference) the runner's default capture shaping is TARGET_VERIFY with
+        # num_tokens_per_bs = num_draft+1 and a spec_info; feeding that to the
+        # spill-rung capture routes _sess_prepare_step into the C4 is_verify
+        # early-return -> forward_extend -> _sess_blockwise_prefix_return_lse
+        # (the verify twin), which (a) never records the multi-block DECODE body
+        # the live plain tick replays, and (b) builds CPU tensors mid-capture
+        # (torch.tensor([0, Q]) at flashinfer_backend.py:3493) -> hard
+        # "Cannot copy between CPU and CUDA tensors during CUDA graph capture"
+        # for any rung>=2 (deep host tail > 1 block). Force plain-decode capture
+        # shaping (DECODE mode, 1 token/bs, no spec_info, no ragged verify) for
+        # the spill rung so it records the capture-safe
+        # _sess_blockwise_decode_return_lse_graph body, then restore. This is
+        # the spill-graph analog of _build_spill_batch's spec=NONE erasure; the
+        # C4 verify twin path is a SEPARATE (spec-in-tick, default OFF) concern
+        # and is untouched.
+        saved_mode = self.capture_forward_mode
+        saved_ntpb = self.num_tokens_per_bs
+        saved_ragged = self.ragged_verify_mode
+        saved_hidden = self.capture_hidden_mode
+        self.capture_forward_mode = ForwardMode.DECODE
+        self.num_tokens_per_bs = 1
+        self.ragged_verify_mode = False
+        self.capture_hidden_mode = CaptureHiddenMode.NULL
+        self._sess_force_plain_decode = True
+        try:
+            with ctx:
+                # Reuse the head capture path; capture_prepare's batch is tagged
+                # as a spill tick by the backend's install context (it sets the
+                # flag + synthetic state that _sess_prepare_step reads).
+                self.capture_one_shape(bs, forward, stream_idx, f"sessblk{rung}")
+        finally:
+            self.capture_forward_mode = saved_mode
+            self.num_tokens_per_bs = saved_ntpb
+            self.ragged_verify_mode = saved_ragged
+            self.capture_hidden_mode = saved_hidden
+            self._sess_force_plain_decode = False
 
     def capture_one_shape(
         self,
@@ -1617,6 +1711,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
+        # S0 (deep-offload): during the spill-rung capture the batch is forced
+        # to a PLAIN bs=1 DECODE shape (see _sess_capture_one_spill_rung), which
+        # must carry no spec_info -- exactly like the live plain spill tick
+        # (_build_spill_batch spec_algorithm=NONE). Return None regardless of the
+        # server's speculative config.
+        if getattr(self, "_sess_force_plain_decode", False):
+            return None
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()

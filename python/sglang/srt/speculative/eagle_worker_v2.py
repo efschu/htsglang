@@ -1965,6 +1965,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if getattr(batch, "kv_session_spill_tick", False):
+            # C3/d2 (spec-in-spill-tick): when the spill batch carries the SERVER
+            # spec algorithm (try_spill routed it, draft KV device-resident, d1
+            # armed it), run the REAL draft->verify DURING the spill instead of
+            # the plain force below. Gated on spec_algorithm != NONE, so the
+            # OFF / non-spec-in-tick path (spill batch built NONE) is byte-
+            # identical to the original plain force.
+            if not batch.spec_algorithm.is_none():
+                return self._forward_spill_tick_spec(batch, on_publish)
             # kv-session-offload SPILL TICK: the host-resident session decodes
             # PLAIN bs=1 straight through the TARGET (base) worker -- NO
             # draft / verify / draft_extend. While spilled the session has no
@@ -2115,6 +2123,109 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             return batch_output
+
+    def _forward_spill_tick_spec(self, batch: ScheduleBatch, on_publish=None):
+        """C3/d2 (spec-in-spill-tick): run the model-configured NEXTN/EAGLE
+        drafter DURING a kv-session-offload spill tick (Option b').
+
+        The session's committed TARGET KV lives on host (streamed by the C4
+        verify twin, _sess_blockwise_prefix_return_lse); its tiny draft KV is
+        kept DEVICE-resident (draft_dev_k/v) so draft() runs as a normal device
+        decode. Per tick:
+          1. SEED: re-seed the draft from the last committed token's target
+             hidden (the proven seed-only resume primitive) -- valid one-row
+             EAGLE seed; the draft's num_steps forwards attend the resident
+             draft prefix KV.
+          2. DRAFT with req_to_token SURGERY: the committed-prefix tail
+             [boundary, L) carries host sentinels; redirect it to device draft-
+             scratch loaded from draft_dev_k/v around draft(), then restore.
+          3. VERIFY: the standard verify path -- output-correct by construction
+             (target-exact tokens). Its target forward routes the host-prefix
+             read to the C4 twin (via forward_batch.kv_session_spill_tick +
+             _sess_verify_active) and its eagle_sample broadcasts accept results
+             from rank 0 (#50 / d6), so accept is rank-uniform.
+          4. RE-SEED source: refresh last_hidden from the verify forward's last
+             hidden so the next tick chains.
+
+        DFLASH is excluded (spec_in_tick is only set for the configured NEXTN/
+        EAGLE drafter). Rank-uniform: replicated seed + surgery + a collective
+        draft/verify run identically on every DCP rank.
+        """
+        from sglang.srt.managers.kv_session_offload import (
+            get_kv_session_offload_manager,
+        )
+
+        mgr = get_kv_session_offload_manager()
+        assert mgr is not None, "spec-in-tick armed without a kv-session manager"
+
+        self.activate_step_by_batch(batch.seq_lens.shape[0])
+
+        # 1. SEED from the last committed token's target hidden. None on the
+        #    FIRST tick after a spill (no captured hidden yet) -> BOOTSTRAP via a
+        #    trivial 1-node verify (no draft): its TARGET_VERIFY forward runs the
+        #    C4 twin over the committed prefix, samples one target-exact token
+        #    (device suffix), and its hidden re-seeds the next tick. Every later
+        #    tick has a seed -> real draft->verify.
+        seed = mgr.spec_in_tick_seed(batch)
+        if seed is None:
+            # BOOTSTRAP tick: no draft, 1-node verify (device-suffix token).
+            batch.spec_info = mgr.spec_in_tick_bootstrap_seed(batch)
+            verify_input = self._build_trivial_verify_input(batch)
+        else:
+            batch.spec_info = seed
+            # 2. DRAFT with req_to_token surgery over the FROZEN host-sentinel
+            #    region. draft() writes candidate draft KV to the [L, L+num_steps]
+            #    candidate slots (real device draft slots eagle_prepare_for_decode
+            #    allocated -- untouched by the surgery, no pool corruption).
+            surgery = mgr.spec_in_tick_draft_pre(batch)
+            if surgery == mgr.DRAFT_SURGERY_FALLBACK:
+                # Device draft cannot run this tick (no reserved scratch / tail
+                # over cap). Drafting over the host SENTINELS would be a CUDA
+                # illegal access -> trivial 1-node verify instead (C4 twin, one
+                # target-exact token, no draft).
+                verify_input = self._build_trivial_verify_input(batch)
+            else:
+                try:
+                    with (
+                        self.draft_worker.draft_tp_context(
+                            self.draft_worker.draft_runner.tp_group
+                        ),
+                        speculative_moe_backend_context(),
+                        speculative_moe_a2a_backend_context(),
+                        spec_stage_span("kvso_spec_in_tick_draft"),
+                    ):
+                        verify_input: EagleVerifyInput = self.draft_worker.draft(
+                            batch
+                        )
+                finally:
+                    mgr.spec_in_tick_draft_post(surgery)
+
+        assert verify_input.is_verify_input()
+        batch.spec_info = verify_input
+
+        # 3. VERIFY (output-correct C4 host-prefix twin + rank-0 accept sync).
+        batch_output = self.verify(batch)
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+
+        # 4. RE-SEED source for the next tick's draft chain: the target hidden
+        #    of the LAST ACCEPTED position (the EAGLE seed that predicts the next
+        #    token), NOT the last CANDIDATE row (hs[-1] is often a REJECTED
+        #    draft, which starves the next draft -> low accept-len). The last
+        #    accepted row is accept_lens-1 (the bonus position), mirroring
+        #    _draft_extend_for_decode's select_index.
+        lo = getattr(batch_output, "logits_output", None)
+        hs = getattr(lo, "hidden_states", None) if lo is not None else None
+        if hs is not None and int(hs.shape[0]) > 0:
+            al = getattr(batch_output, "accept_lens", None)
+            if al is not None and int(al.numel()) > 0:
+                idx = int(al[0].item()) - 1
+            else:
+                idx = int(hs.shape[0]) - 1
+            idx = max(0, min(idx, int(hs.shape[0]) - 1))
+            mgr.spec_in_tick_note_committed(batch, None, hs[idx : idx + 1])
+
+        return batch_output
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.

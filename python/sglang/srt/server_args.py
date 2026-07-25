@@ -1413,6 +1413,84 @@ class ServerArgs:
             "linearly (N x one-session budget).",
         ),
     ] = 1
+    kv_session_offload_host_ram_gib: A[
+        float,
+        Arg(
+            help="kv-session-offload (P2 / deep-offload): NODE-WIDE host RAM "
+            "budget in GiB for the pinned spill pools, summed over all TP "
+            "ranks (each rank allocates budget / tp_size). Default 0 = OFF -> "
+            "the pool keeps today's purely context-derived auto-size "
+            "(max_spills x one max-context session), byte-identical. "
+            "WHY: the per-session spill DEPTH is the full --context-length, so "
+            "reaching a deep host tail means running a large context -- which "
+            "today multiplies the host allocation with no knob to bound it. "
+            "This flag decouples the two: the per-session depth stays the full "
+            "context (a session can never hold more), and the budget bounds "
+            "only HOW MANY sessions can be spilled concurrently (the EFFECTIVE "
+            "--kv-session-offload-max-spills, reduced to what the budget "
+            "holds). It is a CEILING only: a budget larger than the context "
+            "need allocates exactly the context-derived size. If the budget "
+            "cannot hold even ONE full-context session the server fails fast "
+            "at boot (physical impossibility) instead of silently truncating "
+            "the depth. The pool is PINNED (never swapped), so the value is "
+            "validated against the machine's real free RAM at startup.",
+        ),
+    ] = 0.0
+    kv_session_offload_spec_in_tick: A[
+        bool,
+        Arg(
+            help="kv-session-offload (Step 2, Phase 1 EAGER): run the "
+            "model-configured speculative drafter (NEXTN/EAGLE-family) DURING "
+            "the spill tick so a HOST-resident session keeps MTP speed instead "
+            "of a plain bs=1 host decode. Default OFF -> the spill tick stays "
+            "the plain, byte-identical bs=1 target forward (spec_algorithm=NONE "
+            "on the spill batch). When ON (and the server runs a spec algorithm, "
+            "and KVSO_ALLOW_SPEC=1), the spill batch is built with the SERVER "
+            "spec algorithm: the generic spec worker runs draft() as a normal "
+            "rank-local device decode (the draft KV is kept device-RESIDENT, "
+            "see --kv-session-offload-mtp-resident-slices) and verify() as a "
+            "num_draft+1-row target forward that host-streams the spilled "
+            "target KV prefix. The win is FEWER host-KV stream passes per "
+            "accepted token (~accept_len factor). DFLASH is excluded for "
+            "spilled (long-context) sessions -- only the ONE configured "
+            "NEXTN/EAGLE drafter is used. Phase 1 is EAGER (no spec-shaped "
+            "spill CUDA graph; the bs=1 decode graph is untouched). Requires an "
+            "active --speculative-algorithm; hard error otherwise.",
+        ),
+    ] = False
+    kv_session_offload_mtp_resident_slices: A[
+        int,
+        Arg(
+            help="kv-session-offload (Step 2): safety CAP, in per-rank token "
+            "slots, on how much of a spilled session's DRAFT KV tail is kept "
+            "device-resident under --kv-session-offload-spec-in-tick (Option b: "
+            "the tiny 1-layer NEXTN / few-layer EAGLE draft KV stays on device "
+            "so draft() is a normal device decode, while the large multi-layer "
+            "target KV spills to host). A session whose draft tail exceeds this "
+            "cap falls back GRACEFULLY to the plain host tick (no spec) for that "
+            "session. 0 disables the cap (any draft tail kept resident). Only "
+            "consulted when --kv-session-offload-spec-in-tick is ON; ignored "
+            "otherwise (byte-identical OFF).",
+        ),
+    ] = 0
+    kv_session_offload_prefill: A[
+        bool,
+        Arg(
+            help="kv-session-offload (Prefill-Spill / born-spilled): admit a "
+            "prompt whose KV would not fit in VRAM by writing its freshly "
+            "computed KV directly to the host pool DURING the prefill (per "
+            "chunk, D2H on the copy stream) instead of wedging / retracting it. "
+            "After the last chunk the session is handed over to the existing "
+            "off-batch decode spill tick (it then decodes in-spill at the host "
+            "rate, speculating again once VRAM frees and it waves back). "
+            "Requires --enable-kv-session-offload; only meaningful under "
+            "uneven-DCP (the write hook lives in the DCP owner-write path). "
+            "Default OFF -> the prefill path is byte-identical to today "
+            "(chunk / wedge). The global memory / decode-spill behaviour is "
+            "unchanged; this only adds a prefill-time admission + born-spilled "
+            "write path, gated behind this flag.",
+        ),
+    ] = False
     rank_tp_ratio: A[
         Optional[Union[List[int], str]],
         Arg(
@@ -3951,8 +4029,51 @@ class ServerArgs:
         """kv-session-offload (S1) scope validation: fail fast at arg-parse
         for every out-of-scope mode instead of desyncing the DCP collective
         sequence into a runtime NCCL hang or corrupting slot identity."""
+        if self.kv_session_offload_prefill and not self.enable_kv_session_offload:
+            # Prefill-Spill (born-spilled) is a sub-mode of the offload feature;
+            # it shares the host pool, admission reduce, and off-batch tick.
+            # Reject the flag standalone rather than silently ignore it.
+            raise ValueError(
+                "--kv-session-offload-prefill requires "
+                "--enable-kv-session-offload."
+            )
+        if self.kv_session_offload_host_ram_gib and (
+            not self.enable_kv_session_offload
+        ):
+            # P2: the RAM budget sizes the offload host pool; standalone it
+            # would silently do nothing. Reject instead of ignoring.
+            raise ValueError(
+                "--kv-session-offload-host-ram-gib requires "
+                "--enable-kv-session-offload."
+            )
         if not self.enable_kv_session_offload:
             return
+        if self.kv_session_offload_host_ram_gib < 0:
+            raise ValueError(
+                "--kv-session-offload-host-ram-gib must be >= 0 (0 = OFF, "
+                "context-derived auto-size); got "
+                f"{self.kv_session_offload_host_ram_gib}."
+            )
+        if self.kv_session_offload_host_ram_gib > 0:
+            # P2 host-RAM plausibility. Done HERE (single launcher process,
+            # before any rank forks or pins anything) and NOT per rank at
+            # pool-alloc time: `available` shrinks as each rank pins its share,
+            # so a per-rank check would pass on rank 0 and raise on rank 2 --
+            # a rank-divergent boot decision, i.e. an NCCL hang rather than an
+            # error. Every per-rank sizing decision downstream is pure
+            # arithmetic over replicated arguments.
+            import psutil
+
+            from sglang.srt.managers.kv_session_offload import (
+                host_ram_budget_error,
+            )
+
+            _vm = psutil.virtual_memory()
+            _err = host_ram_budget_error(
+                self.kv_session_offload_host_ram_gib, _vm.total, _vm.available
+            )
+            if _err is not None:
+                raise ValueError(_err)
         if self.kv_session_offload_block_size <= 0:
             raise ValueError(
                 "--kv-session-offload-block-size must be > 0; got "
@@ -3981,6 +4102,29 @@ class ServerArgs:
             raise ValueError(
                 "--kv-session-offload-restore-margin-tokens must be >= 0."
             )
+        if self.kv_session_offload_mtp_resident_slices < 0:
+            raise ValueError(
+                "--kv-session-offload-mtp-resident-slices must be >= 0 "
+                f"(0 disables the cap); got "
+                f"{self.kv_session_offload_mtp_resident_slices}."
+            )
+        if self.kv_session_offload_spec_in_tick:
+            # Step 2 Phase 1: running the drafter in the spill tick is only
+            # meaningful when the server actually has a speculative algorithm to
+            # run, and it rides on the same KVSO_ALLOW_SPEC bring-up gate as the
+            # spill+MTP resume path. Fail fast at arg-parse rather than desync
+            # the spill batch's spec dispatch into a runtime NCCL hang.
+            if self.speculative_algorithm is None:
+                raise ValueError(
+                    "--kv-session-offload-spec-in-tick requires an active "
+                    "--speculative-algorithm (the spill tick runs the "
+                    "model-configured drafter). None is configured."
+                )
+            if os.environ.get("KVSO_ALLOW_SPEC", "0") != "1":
+                raise ValueError(
+                    "--kv-session-offload-spec-in-tick rides on the spill+MTP "
+                    "bring-up gate; set KVSO_ALLOW_SPEC=1 to opt in."
+                )
         if self.speculative_algorithm is not None and (
             os.environ.get("KVSO_ALLOW_SPEC", "0") != "1"
         ):

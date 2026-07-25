@@ -226,7 +226,11 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
-from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    evict_from_tree_cache,
+    maybe_cache_unfinished_req,
+    release_kv_cache,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -2906,6 +2910,16 @@ class Scheduler(
             running_batch = self.kv_session_offload.pre_schedule(
                 running_batch, last_batch
             )
+            # RANK-UNIFORM admission under uneven DCP: recompute the min-reduced
+            # available / (available+evictable) budget for this iteration with a
+            # SINGLE collective, HERE -- before the prefill/decode branch below,
+            # reached unconditionally by every rank every iteration. This is the
+            # only cross-rank reduce on the offload scheduling path; both the
+            # prefill admission (PrefillAdder deficit) and the decode-spill
+            # trigger read the stored result, so a divergent local pool can never
+            # split the ranks across branches with mismatched collective counts.
+            # See update_dcp_admission_state for the full rationale.
+            self.kv_session_offload.update_dcp_admission_state()
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -3089,6 +3103,22 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        # RANK-UNIFORM prefill admission budget (uneven DCP): the deficit was
+        # min-reduced once this iteration in update_dcp_admission_state (single
+        # collective, pre-branch). Read the stored value -- NO collective here,
+        # so admission stays uniform without adding a branch-local reduce. 0 on
+        # the default path (offload manager absent) -> byte-identical.
+        dcp_avail_deficit = 0
+        prefill_spill_regions = 0
+        if self.kv_session_offload is not None:
+            dcp_avail_deficit = self.kv_session_offload.dcp_budget_deficit()
+            # Prefill-Spill (PS1-V1a): replicated free-region count (0 when the
+            # feature is off -> the adder relaxation is inert). No collective
+            # here (rank-uniform by construction, see prefill_spill_free_regions).
+            prefill_spill_regions = (
+                self.kv_session_offload.prefill_spill_free_regions()
+            )
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -3106,6 +3136,8 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            dcp_avail_deficit=dcp_avail_deficit,
+            prefill_spill_regions=prefill_spill_regions,
         )
 
         if self.chunked_req is not None:
@@ -3338,15 +3370,34 @@ class Scheduler(
         # check_decode_mem call, identical to the stock path; the extra
         # re-check runs only on an actual spill event. If one spill is not
         # enough (or the slot is taken), the stock retraction runs below.
-        kv_full_retract_flag = not batch.check_decode_mem()
-        if (
-            kv_full_retract_flag
-            and self.kv_session_offload is not None
-            and self.kv_session_offload.try_spill(batch)
-        ):
-            if batch.is_empty():
-                batch.batch_is_full = False
-                return batch
+        if self.kv_session_offload is not None:
+            # RANK-UNIFORM decode-OOM decision (uneven DCP). check_decode_mem
+            # would read the LOCAL per-rank available_size, which differs per
+            # rank; near the pool boundary the binding rank flips to OOM while
+            # others still fit -> divergent spill/retract -> divergent batch ->
+            # collective desync (hang). Instead decide on the iteration's
+            # min-reduced available (dcp_min_avail, from the single pre-branch
+            # reduce) vs the replicated token demand -> identical on every rank,
+            # with NO collective here. Still evict locally for the space (side
+            # effect); the decision uses the reduced pre-evict value (in the
+            # full-pool spill regime eviction frees ~nothing, so this is exact
+            # and always uniform).
+            num_tokens_next = batch.new_tokens_required_next_decode()
+            evict_from_tree_cache(self.tree_cache, num_tokens_next)
+            kv_full_retract_flag = (
+                self.kv_session_offload.dcp_min_avail() < num_tokens_next
+            )
+            if kv_full_retract_flag and self.kv_session_offload.try_spill(batch):
+                if batch.is_empty():
+                    batch.batch_is_full = False
+                    return batch
+                # try_spill freed the binding rank's shortfall (need sized from
+                # the same reduced available); treat the OOM as resolved. If one
+                # spill was not enough the NEXT iteration re-evaluates uniformly
+                # (max_spills gates further victims) -> no second collective, no
+                # branch-count divergence.
+                kv_full_retract_flag = False
+        else:
             kv_full_retract_flag = not batch.check_decode_mem()
         if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0

@@ -15,7 +15,12 @@ from sglang.srt.managers.kv_session_offload import (
     bundle_spillable_sizes,
     chunk_ceil,
     compact_weighted,
+    host_pool_budget_bytes_per_rank,
+    host_pool_effective_max_spills,
+    host_pool_request_gb,
+    host_ram_budget_error,
     make_sentinels,
+    mtp_resident_tail_fits,
     new_token_residue,
     num_blocks_rank_uniform,
     owned_counts_even,
@@ -439,6 +444,31 @@ def test_partial_spill_plan_caps_at_exclusive_suffix():
     for need in (1, 130, 777, 5000):
         b, sc = partial_spill_plan(L=900, protected=64, need=need, chunk=128)
         assert 64 <= b <= 900 and sc == 900 - b
+
+
+def test_mtp_resident_tail_fits_cap_semantics():
+    # cap == 0 disables the cap: any tail (incl. deep offloads) stays resident.
+    assert mtp_resident_tail_fits(tail_tokens=0, resident_cap_slices=0)
+    assert mtp_resident_tail_fits(tail_tokens=1_000_000, resident_cap_slices=0)
+    # negative cap is treated as disabled (defensive; validator forbids <0).
+    assert mtp_resident_tail_fits(tail_tokens=999, resident_cap_slices=-1)
+    # positive cap: fits at/below, overflows strictly above (-> plain-tick
+    # fallback, never OOM). Boundary is inclusive.
+    assert mtp_resident_tail_fits(tail_tokens=4096, resident_cap_slices=4096)
+    assert mtp_resident_tail_fits(tail_tokens=4095, resident_cap_slices=4096)
+    assert not mtp_resident_tail_fits(tail_tokens=4097, resident_cap_slices=4096)
+    # empty tail always fits.
+    assert mtp_resident_tail_fits(tail_tokens=0, resident_cap_slices=1)
+
+
+def test_mtp_resident_tail_fits_is_rank_uniform():
+    # The draft pool is not DCP-token-sharded: every rank passes the SAME full
+    # tail L - boundary and the SAME cap, so all ranks return the identical
+    # verdict (no per-rank divergence -> no NCCL desync at the spec/plain fork).
+    for L, boundary, cap in [(2267, 2215, 32), (30000, 0, 8192), (5000, 4000, 900)]:
+        tail = L - boundary
+        verdicts = {mtp_resident_tail_fits(tail, cap) for _rank in range(3)}
+        assert len(verdicts) == 1
 
 
 def test_partial_sentinel_segment_roundtrip():
@@ -1278,6 +1308,294 @@ def test_spill_tick_controller_bounds_respected():
     assert min(out) >= 1 and max(out) <= 8
     # floor clamped to >= 1 at construction.
     assert SpillTickController(floor_interval=0).floor_interval == 1
+
+
+# ---------------------------------------------------------------------------
+# P2 (deep-offload S1): host-pool sizing from a RAM budget
+# ---------------------------------------------------------------------------
+
+# A realistic per-rank per-token cost: 4 kv-heads x 128 dim x 24 full-attn
+# layers x 2 bytes x (K+V).
+PTB = 4 * 128 * 24 * 2 * 2  # 49152 B/token
+
+
+def _todays_autosize_gb(need_tokens, per_token_bytes):
+    """Verbatim copy of the pre-P2 expression in _kv_sess_attach_host_pool."""
+    return max(1, -(-(need_tokens * per_token_bytes) // 10**9))
+
+
+def _region_tokens(ctx, split_factor, max_ratio):
+    """Verbatim copy of the (unchanged) per-session depth expression."""
+    return (ctx // split_factor + 2) * max_ratio
+
+
+def _pool_tokens(host_size_gb, per_token_bytes):
+    """What HostKVCache turns a GB request into (pool_host/base.py:127)."""
+    return int(host_size_gb * 1e9 // per_token_bytes)
+
+
+def test_host_pool_request_gb_off_is_todays_autosize():
+    # Flag OFF (0 / None / negative) must reproduce the pre-P2 expression bit
+    # for bit -- this is the "flag-OFF byte-identisch" property of the sizing.
+    for ctx in (4096, 32768, 262144):
+        need = _region_tokens(ctx, 64, 32) * 3
+        want = float(_todays_autosize_gb(need, PTB))
+        assert host_pool_request_gb(need, PTB, 0.0, 3) == want
+        assert host_pool_request_gb(need, PTB, None, 3) == want
+        assert host_pool_request_gb(need, PTB, -1.0, 3) == want
+    # ... including the "at least 1 GB" floor for a tiny context.
+    assert host_pool_request_gb(1, PTB, 0.0, 3) == 1.0
+
+
+def test_host_pool_request_gb_budget_is_a_ceiling_not_an_inflation():
+    # A budget LARGER than the context need must allocate exactly the
+    # context-derived size (never inflate) -> a generous budget is
+    # behaviourally identical to flag OFF.
+    need = _region_tokens(32768, 64, 32) * 2
+    off = host_pool_request_gb(need, PTB, 0.0, 3)
+    assert host_pool_request_gb(need, PTB, 900.0, 3) == off
+
+
+def test_host_pool_request_gb_budget_caps_and_splits_per_rank():
+    # 60 GiB node-wide over 3 ranks = 20 GiB/rank ~= 21.47 GB.
+    need = _region_tokens(1_000_000, 64, 32) * 8  # deliberately huge
+    got = host_pool_request_gb(need, PTB, 60.0, 3)
+    assert got == host_pool_budget_bytes_per_rank(60.0, 3) / 1e9
+    assert abs(got - 21.474836) < 1e-3
+    # The node-wide total is what the operator budgeted, not 3x it.
+    assert abs(got * 3 * 1e9 - 60.0 * 1024**3) < 1e3
+    # Single rank -> the whole budget.
+    assert host_pool_request_gb(need, PTB, 60.0, 1) == 60.0 * 1024**3 / 1e9
+
+
+def test_host_pool_effective_max_spills_floor_and_clamp():
+    # Pool holds 3.5 regions -> 3 usable, and never more than configured.
+    assert host_pool_effective_max_spills(3500, 1000, 8) == 3
+    assert host_pool_effective_max_spills(3500, 1000, 2) == 2
+    assert host_pool_effective_max_spills(1000, 1000, 4) == 1
+
+
+def test_host_pool_effective_max_spills_zero_when_one_region_does_not_fit():
+    # Physical impossibility -> 0, so the caller fails fast instead of
+    # silently truncating the per-session depth.
+    assert host_pool_effective_max_spills(999, 1000, 4) == 0
+    assert host_pool_effective_max_spills(0, 1000, 1) == 0
+
+
+def test_host_ram_budget_off_is_never_an_error():
+    assert host_ram_budget_error(0.0, 8 * 1024**3, 1 * 1024**3) is None
+    assert host_ram_budget_error(-5.0, 8 * 1024**3, 1 * 1024**3) is None
+
+
+def test_host_ram_budget_accepts_a_plausible_budget():
+    # 108 GiB box, 100 GiB free, 60 GiB budget + 10 GiB reserve -> fits.
+    assert (
+        host_ram_budget_error(60.0, 108 * 1024**3, 100 * 1024**3) is None
+    )
+
+
+def test_host_ram_budget_rejects_more_than_total_ram():
+    msg = host_ram_budget_error(200.0, 108 * 1024**3, 100 * 1024**3)
+    assert msg is not None
+    assert "TOTAL host RAM" in msg and "108.0" in msg and "200" in msg
+
+
+def test_host_ram_budget_rejects_more_than_available_minus_reserve():
+    # Fits in total RAM, but another process holds most of it: 40 GiB free,
+    # 10 GiB reserve -> only 30 GiB usable, so a 35 GiB budget must fail
+    # LOUDLY at parse time rather than invoking the OOM killer later.
+    msg = host_ram_budget_error(35.0, 108 * 1024**3, 40 * 1024**3)
+    assert msg is not None
+    assert "available" in msg and "30.0 GiB usable" in msg
+    # One GiB less fits.
+    assert host_ram_budget_error(30.0, 108 * 1024**3, 40 * 1024**3) is None
+
+
+def test_host_ram_budget_reserve_is_configurable_and_applied():
+    assert host_ram_budget_error(35.0, 108 * 1024**3, 40 * 1024**3, 0) is None
+
+
+def test_p2_sizing_is_rank_uniform_under_uneven_tp():
+    # THE hang-relevant property. Three uneven-TP ranks own different kv-head
+    # shares -> different bytes/token, so the per-rank REQUESTED GB legitimately
+    # differs (min(context_need, budget/rank) -- the context_need term is
+    # rank-local, exactly as in the flag-OFF path). Uniformity comes from the
+    # host pool's EXISTING min-all-reduce over the token capacity
+    # (sync_fixed_hicache_size), and the effective region count is derived from
+    # THAT post-sync size -> the same integer on every rank. No new collective.
+    ctx, split, max_ratio, cfg_max_spills = 32768, 64, 32, 4
+    region = _region_tokens(ctx, split, max_ratio)
+    need = region * cfg_max_spills
+    # ranks with 1 / 32 / 31 kv-head-ish shares of the same layer stack
+    per_rank_ptb = [1 * 128 * 24 * 2 * 2, 32 * 128 * 24 * 2 * 2, 31 * 128 * 24 * 2 * 2]
+
+    gbs = [host_pool_request_gb(need, ptb, 60.0, 3) for ptb in per_rank_ptb]
+    tokens = [_pool_tokens(gbs[r], per_rank_ptb[r]) for r in range(3)]
+    assert len(set(tokens)) > 1, "test is vacuous unless the raw sizes differ"
+    synced = min(tokens)  # what sync_fixed_hicache_size returns on every rank
+    effs = [
+        host_pool_effective_max_spills(synced, region, cfg_max_spills)
+        for _ in range(3)
+    ]
+    assert len(set(effs)) == 1, f"effective max_spills diverged: {effs}"
+    assert effs[0] >= 1
+    # region_tokens itself is replicated (max_ratio, not this rank's ratio).
+    assert len({_region_tokens(ctx, split, max_ratio) for _ in range(3)}) == 1
+
+
+def test_p2_impossible_budget_fails_on_every_rank_not_just_one():
+    # A budget too small for one full-context region must produce the SAME
+    # verdict on every rank (a rank-divergent boot decision is an NCCL hang,
+    # not an error message). The verdict reads only the post-sync size.
+    ctx, split, max_ratio, cfg_max_spills = 262144, 64, 32, 4
+    region = _region_tokens(ctx, split, max_ratio)
+    need = region * cfg_max_spills
+    per_rank_ptb = [1 * 128 * 24 * 2 * 2, 32 * 128 * 24 * 2 * 2, 31 * 128 * 24 * 2 * 2]
+    gbs = [host_pool_request_gb(need, ptb, 48.0, 3) for ptb in per_rank_ptb]
+    synced = min(_pool_tokens(gbs[r], per_rank_ptb[r]) for r in range(3))
+    effs = [
+        host_pool_effective_max_spills(synced, region, cfg_max_spills)
+        for _ in range(3)
+    ]
+    assert effs == [0, 0, 0], f"fail-fast verdict diverged across ranks: {effs}"
+
+
+def test_p2_generous_budget_equals_flag_off_end_to_end():
+    # Full sizing chain (request GB -> pool tokens -> region count) with a
+    # generous budget must land on exactly the flag-OFF outcome.
+    ctx, split, max_ratio, cfg_max_spills = 32768, 64, 32, 2
+    region = _region_tokens(ctx, split, max_ratio)
+    need = region * cfg_max_spills
+
+    off_gb = host_pool_request_gb(need, PTB, 0.0, 3)
+    on_gb = host_pool_request_gb(need, PTB, 512.0, 3)
+    assert on_gb == off_gb
+    off_tokens = _pool_tokens(off_gb, PTB)
+    assert off_tokens >= need  # the pre-P2 boot check
+    assert (
+        host_pool_effective_max_spills(off_tokens, region, cfg_max_spills)
+        == cfg_max_spills
+    )
+
+
+def test_p2_tight_budget_keeps_depth_and_reduces_region_count():
+    # THE point of P2: a big context stays a big per-session DEPTH; only the
+    # NUMBER of concurrently spilled sessions shrinks to what RAM holds.
+    ctx, split, max_ratio, cfg_max_spills = 262144, 64, 32, 4
+    region = _region_tokens(ctx, split, max_ratio)
+    need = region * cfg_max_spills
+    region_gb = region * PTB / 1e9
+
+    # Budget for ~2 regions per rank on a 3-rank node.
+    budget_gib = (2.05 * region_gb * 1e9 / 1024**3) * 3
+    gb = host_pool_request_gb(need, PTB, budget_gib, 3)
+    assert gb < _todays_autosize_gb(need, PTB)  # the budget really capped it
+    eff = host_pool_effective_max_spills(_pool_tokens(gb, PTB), region, cfg_max_spills)
+    assert eff == 2, f"expected 2 regions to fit the budget, got {eff}"
+    # depth untouched: one region still holds a FULL-context session's shard
+    assert region == _region_tokens(ctx, split, max_ratio)
+
+
+def test_p2_budget_is_not_referenced_by_the_tick_regulator():
+    # P3 guard (DESIGN 3b): the RAM budget is a physical allocation ceiling and
+    # must never become a CADENCE input -- no regulator path may read it.
+    import inspect
+
+    from sglang.srt.managers import kv_session_offload as kvso
+
+    sources = [inspect.getsource(kvso.SpillTickController)]
+    for name in ("maybe_take_tick", "_min_reduce_headroom", "pre_schedule"):
+        # getattr without a default: a renamed method must break this guard
+        # loudly instead of silently making it vacuous.
+        sources.append(inspect.getsource(getattr(kvso.KVSessionOffloadManager, name)))
+    assert len(sources) == 4
+    for src in sources:
+        assert "host_ram_gib" not in src
+        assert "host_pool_request_gb" not in src
+        assert "budget_gib" not in src
+
+
+def _fake_server_args(**over):
+    """Minimal stand-in exposing exactly the attributes
+    ServerArgs._handle_kv_session_offload reads."""
+    import types
+
+    ns = types.SimpleNamespace(
+        enable_kv_session_offload=True,
+        kv_session_offload_prefill=False,
+        kv_session_offload_host_ram_gib=0.0,
+        kv_session_offload_block_size=8192,
+        kv_session_offload_tick_interval=1,
+        kv_session_offload_tick_floor=8,
+        kv_session_offload_restore_hysteresis_steps=4,
+        kv_session_offload_max_spills=1,
+        kv_session_offload_restore_margin_tokens=4096,
+        kv_session_offload_mtp_resident_slices=0,
+        kv_session_offload_spec_in_tick=False,
+        speculative_algorithm=None,
+        attention_backend="flashinfer",
+        page_size=1,
+        disaggregation_mode="null",
+        weightless_kv_fastlane=False,
+        enable_hierarchical_cache=False,
+        enable_unified_memory=False,
+        enable_hisparse=False,
+        pp_size=1,
+        dp_size=1,
+        enable_mixed_chunk=False,
+    )
+    for k, v in over.items():
+        setattr(ns, k, v)
+    return ns
+
+
+def _validate(ns):
+    from sglang.srt.server_args import ServerArgs
+
+    ServerArgs._handle_kv_session_offload(ns)
+
+
+def test_server_args_default_budget_validates():
+    _validate(_fake_server_args())  # must not raise (flag OFF)
+
+
+def test_server_args_rejects_budget_without_the_feature():
+    try:
+        _validate(
+            _fake_server_args(
+                enable_kv_session_offload=False, kv_session_offload_host_ram_gib=8.0
+            )
+        )
+    except ValueError as e:
+        assert "requires --enable-kv-session-offload" in str(e)
+    else:
+        raise AssertionError("standalone budget flag must be rejected")
+
+
+def test_server_args_rejects_negative_budget():
+    try:
+        _validate(_fake_server_args(kv_session_offload_host_ram_gib=-1.0))
+    except ValueError as e:
+        assert "must be >= 0" in str(e)
+    else:
+        raise AssertionError("negative budget must be rejected")
+
+
+def test_server_args_rejects_budget_beyond_physical_ram():
+    import psutil
+
+    huge = psutil.virtual_memory().total / (1024**3) * 4
+    try:
+        _validate(_fake_server_args(kv_session_offload_host_ram_gib=huge))
+    except ValueError as e:
+        assert "host-ram-gib" in str(e)
+    else:
+        raise AssertionError("budget beyond physical RAM must be rejected")
+
+
+def test_server_args_accepts_a_small_plausible_budget():
+    # 1 GiB is plausible on any machine that can run this test suite.
+    _validate(_fake_server_args(kv_session_offload_host_ram_gib=1.0))
 
 
 if __name__ == "__main__":
