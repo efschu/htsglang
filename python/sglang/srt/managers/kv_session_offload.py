@@ -1287,11 +1287,18 @@ class KVSessionOffloadManager:
         self.server_spec_algorithm = _spec
         # Ready only when the flag is on, the env allows spec on the spill lane
         # (KVSO_ALLOW_SPEC -- the same bring-up gate server_args validates for
-        # --kv-session-offload-spec-in-tick), the server runs a NON-DFLASH spec
-        # algorithm, and the draft pool exists (device-resident draft KV needs
-        # it). NOTE: this is INDEPENDENT of KVSO_RESUME (the wave-back/host-
-        # finish gate) -- spec-in-tick runs draft/verify DURING the spill and
-        # does not require the resume path to engage.
+        # --kv-session-offload-spec-in-tick), the server's CONFIGURED spec
+        # algorithm is a non-DFLASH family, and the draft pool exists (device-
+        # resident draft KV needs it). NOTE: this is INDEPENDENT of KVSO_RESUME
+        # (the wave-back/host-finish gate) -- spec-in-tick runs draft/verify
+        # DURING the spill and does not require the resume path to engage.
+        #
+        # This is a BOOT-TIME gate over the boot configuration and is NOT on its
+        # own sufficient to exclude DFLASH: under cross-algorithm switching the
+        # configured family is the PRIMARY (NEXTN/EAGLE) while the family that
+        # actually runs moves with the active rung. The runtime half of the
+        # exclusion lives in _effective_spec_algorithm() and is applied at both
+        # the admission and the per-tick site below.
         self.spec_in_tick_ready = bool(
             self.spec_in_tick
             and os.environ.get("KVSO_ALLOW_SPEC", "0") == "1"
@@ -1312,6 +1319,42 @@ class KVSessionOffloadManager:
                 _spec is not None and _spec.is_dflash_family(),
                 self.mtp_resident_slices,
             )
+
+    def _effective_spec_algorithm(self):
+        """The spec family that would ACTUALLY run on a spill tick right now.
+
+        ``scheduler.spec_algorithm`` is fixed at boot and names the PRIMARY
+        family. Under cross-algorithm switching (--speculative-cross-algorithm-
+        force auto|policy) the family a forward really takes moves with the
+        active rung, so the boot value answers "nextn" while DFLASH is running
+        -- and spec-in-tick is only valid for the NEXTN/EAGLE-family drafter
+        (the device-resident draft KV, the seed primitive and the C4 verify twin
+        are all built for it; DFLASH relays through a different path entirely).
+
+        Thin one-way coupling by design: this READS a public property off the
+        spec worker and keeps no state of its own, and the spec worker knows
+        nothing about spilling. Any worker that does not publish
+        ``active_spec_algorithm`` (i.e. every non-cross-algo worker) falls
+        through to the boot value, which is exactly today's behaviour -- so the
+        flag-OFF and no-cross-algo paths are unchanged.
+
+        RANK-UNIFORM: the cross-algo worker derives ``active_spec_algorithm``
+        from ``_active_name``, which is only written by ``_apply_rung`` from the
+        rank-0 rung-id broadcast. Every rank therefore sees the same family at
+        the same round boundary, and this adds NO collective.
+        """
+        dw = getattr(self.scheduler, "draft_worker", None)
+        active = getattr(dw, "active_spec_algorithm", None)
+        return self.server_spec_algorithm if active is None else active
+
+    def _spec_in_tick_allowed_now(self) -> bool:
+        """Runtime half of the DFLASH exclusion (see _effective_spec_algorithm).
+
+        False while the ACTIVE rung is a DFLASH-family drafter, even though the
+        boot gate ``spec_in_tick_ready`` passed on the primary family.
+        """
+        eff = self._effective_spec_algorithm()
+        return eff is not None and not eff.is_none() and not eff.is_dflash_family()
 
         # C3/d4 draft-read SCRATCH: the spill-tick draft attends its resident
         # draft-KV tail through draft-POOL slots (req_to_token surgery). Under
@@ -2038,7 +2081,20 @@ class KVSessionOffloadManager:
         # _wait_forward_stream() already issued above.
         draft_dev_k = draft_dev_v = None
         session_spec_in_tick = False
-        if self.spec_in_tick_ready:
+        # R1: the boot gate is not enough -- under cross-algo the ACTIVE rung
+        # decides which drafter runs. Do not route a session into spec-in-tick
+        # while a DFLASH-family rung is active; it would take the plain tick on
+        # its very first tick anyway, and the device draft-KV snapshot below
+        # would be wasted VRAM.
+        if self.spec_in_tick_ready and not self._spec_in_tick_allowed_now():
+            self._log(
+                "kv-session-offload spec-in-tick: rid=%s admitted while the "
+                "ACTIVE cross-algo rung is %s (DFLASH family) -> plain host "
+                "tick (no spec) for this session.",
+                req.rid,
+                self._effective_spec_algorithm(),
+            )
+        elif self.spec_in_tick_ready:
             tail_tokens = L - boundary  # full tail (draft pool not DCP-sharded)
             if mtp_resident_tail_fits(tail_tokens, self.mtp_resident_slices):
                 cap = (
@@ -2163,11 +2219,16 @@ class KVSessionOffloadManager:
         # drafter DURING the spill: keep the SERVER spec algorithm on the batch
         # so prepare_for_decode -> eagle_prepare_for_decode allocates candidate
         # slots and forward_batch_generation takes the real draft->verify path.
-        # DFLASH is EXCLUDED for spilled (long-context) sessions -- spec_in_tick
-        # is only ever set for the ONE configured NEXTN/EAGLE-family drafter
-        # (spec_in_tick_ready gates out is_dflash_family()); short-ctx DFLASH is
-        # off by the ctx-gate at spill lengths anyway. OFF path is byte-
-        # identical: slot None / spec_in_tick False -> spec_algorithm stays NONE.
+        # DFLASH is EXCLUDED for spilled (long-context) sessions. That exclusion
+        # has TWO halves: spec_in_tick_ready gates out a DFLASH-family BOOT
+        # configuration, and _spec_in_tick_allowed_now() gates out a DFLASH
+        # ACTIVE RUNG under cross-algorithm switching -- the boot value names the
+        # primary family and stays "nextn" while DFLASH is running, so the boot
+        # gate alone would let a DFLASH rung drive the spill tick (R1). Do NOT
+        # rely on the DFLASH ctx-gate to cover this: it is a coincidence between
+        # two features that do not know each other, and retire-ctx defaults off.
+        # OFF path is byte-identical: slot None / spec_in_tick False ->
+        # spec_algorithm stays NONE.
         # spec-in-tick armed from the FIRST tick (no plain bootstrap tick, so the
         # committed L never shifts out of lockstep with the frozen host region /
         # draft_dev). The first tick has no draft seed yet -> the worker runs a
@@ -2176,6 +2237,32 @@ class KVSessionOffloadManager:
         # the C4 verify twin, so the committed prefix stays head + frozen host
         # sentinels + growing device suffix (Option A).
         _slot = self.spills.get(req.req_pool_idx)
+        # R1 runtime gate: an ALREADY-ARMED session whose active rung switched to
+        # DFLASH mid-flight must stop running spec on the tick. Disarm PERMANENTLY
+        # via the established idiom (see spec_in_tick_append_accepted's resident-
+        # buffer-full path): spec_in_tick=False + batch=None forces a plain
+        # rebuild. Permanent and not re-armed on a switch back to NEXTN on
+        # purpose -- re-arming mid-session would shift the committed L out of
+        # lockstep with the frozen host region / draft_dev, which is exactly the
+        # invariant the "armed from the FIRST tick" note below protects. Losing
+        # the spec speedup on an already-spilled session is a graceful
+        # degradation; running DFLASH over the device-resident NEXTN draft KV is
+        # not.
+        if (
+            self.spec_in_tick_ready
+            and _slot is not None
+            and getattr(_slot, "spec_in_tick", False)
+            and not self._spec_in_tick_allowed_now()
+        ):
+            self._log(
+                "kv-session-offload spec-in-tick: rid=%s active cross-algo rung "
+                "switched to %s (DFLASH family) -> disarming spec-in-tick "
+                "permanently for this session, plain host tick from now.",
+                req.rid,
+                self._effective_spec_algorithm(),
+            )
+            _slot.spec_in_tick = False
+            _slot.batch = None  # force rebuild as plain (spec_algorithm=NONE)
         _spec_in_tick = (
             self.spec_in_tick_ready
             and _slot is not None

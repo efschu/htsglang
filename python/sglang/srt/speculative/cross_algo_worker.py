@@ -953,6 +953,28 @@ class CrossAlgoWorker(BaseSpecWorker):
         )
 
     @property
+    def active_spec_algorithm(self) -> SpeculativeAlgorithm:
+        """The spec family that would ACTUALLY run right now (public read-only).
+
+        ``server_args.speculative_algorithm`` / ``scheduler.spec_algorithm``
+        name the PRIMARY family and are fixed at boot; under cross-algorithm
+        switching the family that a forward actually takes moves with the
+        active rung. Any consumer outside this module that must know "which
+        drafter runs on the next round" has to read THIS, not the boot
+        configuration -- reading the latter silently answers "nextn" while
+        DFLASH is running.
+
+        First such consumer: the kv-session-offload spill tick, whose
+        spec-in-tick path is only valid for the NEXTN/EAGLE-family drafter
+        (see KVSessionOffloadManager._effective_spec_algorithm).
+
+        RANK-UNIFORM: ``_active_name`` is only ever written by ``_apply_rung``,
+        which is fed exclusively from the rank-0 rung-id broadcast, so every
+        rank reports the same family without any collective of its own.
+        """
+        return self._active_algo
+
+    @property
     def _active_rung(self) -> tuple:
         if self._active_name == "dflash":
             return ("dflash", self._dflash_block_size)

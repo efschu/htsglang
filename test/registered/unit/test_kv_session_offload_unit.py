@@ -1598,6 +1598,163 @@ def test_server_args_accepts_a_small_plausible_budget():
     _validate(_fake_server_args(kv_session_offload_host_ram_gib=1.0))
 
 
+# ---------------------------------------------------------------------------
+# R1: the DFLASH exclusion of the spill tick must follow the ACTIVE cross-algo
+# rung, not the boot configuration.
+#
+# Under --speculative-cross-algorithm-force auto the server's configured
+# speculative_algorithm is the PRIMARY family (NEXTN/EAGLE), so the boot gate
+# spec_in_tick_ready passes -- while the rung that actually runs a forward can
+# be DFLASH. spec-in-tick is only valid for the NEXTN/EAGLE drafter (device-
+# resident draft KV + seed primitive + C4 verify twin), so a DFLASH rung must
+# be rejected at tick time.
+# ---------------------------------------------------------------------------
+
+
+def _spec_gate_manager(server_algo, active_algo, has_worker=True):
+    """Bare manager wired only for the spec-in-tick family gate.
+
+    `active_algo=None` models a NON-cross-algo worker: it publishes no
+    `active_spec_algorithm`, so the gate must fall back to the boot value.
+    """
+    from types import SimpleNamespace
+
+    from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+
+    mgr = KVSessionOffloadManager.__new__(KVSessionOffloadManager)
+    mgr.server_spec_algorithm = server_algo
+    mgr._log = lambda *a, **k: None
+    if not has_worker:
+        mgr.scheduler = SimpleNamespace()
+    elif active_algo is None:
+        # A plain EAGLE/NEXTN worker: no cross-algo switching, no such property.
+        mgr.scheduler = SimpleNamespace(draft_worker=SimpleNamespace())
+    else:
+        mgr.scheduler = SimpleNamespace(
+            draft_worker=SimpleNamespace(active_spec_algorithm=active_algo)
+        )
+    return mgr
+
+
+def test_spec_in_tick_gate_rejects_an_active_dflash_rung():
+    """THE R1 CASE: primary family NEXTN/EAGLE, active rung DFLASH -> reject."""
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    mgr = _spec_gate_manager(
+        server_algo=SpeculativeAlgorithm.EAGLE,
+        active_algo=SpeculativeAlgorithm.DFLASH,
+    )
+    # The boot configuration still says EAGLE -- that is exactly the trap.
+    assert not mgr.server_spec_algorithm.is_dflash_family()
+    assert mgr._effective_spec_algorithm() == SpeculativeAlgorithm.DFLASH
+    assert not mgr._spec_in_tick_allowed_now()
+
+
+def test_spec_in_tick_gate_allows_an_active_nextn_rung():
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    mgr = _spec_gate_manager(
+        server_algo=SpeculativeAlgorithm.EAGLE,
+        active_algo=SpeculativeAlgorithm.EAGLE,
+    )
+    assert mgr._spec_in_tick_allowed_now()
+
+
+def test_spec_in_tick_gate_also_rejects_the_dspark_rung():
+    """is_dflash_family() covers DSPARK too; the gate must not narrow it."""
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    mgr = _spec_gate_manager(
+        server_algo=SpeculativeAlgorithm.EAGLE,
+        active_algo=SpeculativeAlgorithm.DSPARK,
+    )
+    assert not mgr._spec_in_tick_allowed_now()
+
+
+def test_spec_in_tick_gate_is_unchanged_without_cross_algo():
+    """No cross-algo worker -> no active_spec_algorithm -> boot value governs.
+
+    This is the flag-OFF / no-cross-algo equivalence: the gate must reduce to
+    exactly the pre-existing static behaviour.
+    """
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    mgr = _spec_gate_manager(
+        server_algo=SpeculativeAlgorithm.EAGLE, active_algo=None
+    )
+    assert mgr._effective_spec_algorithm() == SpeculativeAlgorithm.EAGLE
+    assert mgr._spec_in_tick_allowed_now()
+
+    # A DFLASH-configured server without cross-algo stays excluded as before.
+    mgr = _spec_gate_manager(
+        server_algo=SpeculativeAlgorithm.DFLASH, active_algo=None
+    )
+    assert not mgr._spec_in_tick_allowed_now()
+
+    # No draft_worker at all (spec worker not built yet) -> boot value.
+    mgr = _spec_gate_manager(
+        server_algo=SpeculativeAlgorithm.EAGLE, active_algo=None, has_worker=False
+    )
+    assert mgr._spec_in_tick_allowed_now()
+
+
+def test_spec_in_tick_gate_handles_a_none_algorithm():
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    mgr = _spec_gate_manager(
+        server_algo=SpeculativeAlgorithm.NONE, active_algo=None
+    )
+    assert not mgr._spec_in_tick_allowed_now()
+
+    mgr = _spec_gate_manager(server_algo=None, active_algo=None)
+    assert not mgr._spec_in_tick_allowed_now()
+
+
+def test_cross_algo_worker_publishes_the_active_family():
+    """The one-way coupling point: the property the offload gate reads must
+    exist on CrossAlgoWorker and must track the active rung, not the boot
+    configuration."""
+    from sglang.srt.speculative.cross_algo_worker import CrossAlgoWorker
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    assert isinstance(
+        getattr(CrossAlgoWorker, "active_spec_algorithm", None), property
+    )
+
+    w = CrossAlgoWorker.__new__(CrossAlgoWorker)
+    w._switching = True
+    w._forced_algo = SpeculativeAlgorithm.EAGLE
+    w._active_name = "dflash"
+    assert w.active_spec_algorithm == SpeculativeAlgorithm.DFLASH
+    w._active_name = "nextn"
+    assert w.active_spec_algorithm == SpeculativeAlgorithm.EAGLE
+
+
+def test_spill_batch_and_admission_consult_the_runtime_family_gate():
+    """Ratchet: both enforcement sites must keep consulting the RUNTIME gate.
+
+    The boot gate spec_in_tick_ready alone is insufficient (it reads the
+    primary family). If a refactor drops _spec_in_tick_allowed_now from either
+    site, R1 silently returns.
+    """
+    import inspect
+
+    from sglang.srt.managers import kv_session_offload as kvso
+
+    mgr_cls = kvso.KVSessionOffloadManager
+    admission = inspect.getsource(mgr_cls.try_spill)
+    assert "_spec_in_tick_allowed_now" in admission, (
+        "try_spill must not route a session into spec-in-tick while a "
+        "DFLASH-family rung is active"
+    )
+
+    tick = inspect.getsource(mgr_cls._build_spill_batch)
+    assert "_spec_in_tick_allowed_now" in tick, (
+        "_build_spill_batch must disarm spec-in-tick when the active rung "
+        "switched to a DFLASH family mid-session"
+    )
+
+
 if __name__ == "__main__":
     import sys
 
