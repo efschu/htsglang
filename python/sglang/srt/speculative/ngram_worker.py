@@ -17,7 +17,7 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.eagle_utils import eagle_sample, ensure_spec_kernel_backend
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
@@ -69,6 +69,22 @@ class NGRAMWorker(BaseSpecWorker):
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
+
+        # GROUP-WIDE spec kernel decision (collective). NGRAM never calls
+        # build_tree_kernel_efficient -- its tree comes from the corpus match --
+        # but it DOES reach verify_tree_greedy_func through eagle_sample, so it
+        # needs the decision like every other spec worker.
+        #
+        # The shape passed is the corpus's max BFS breadth, not `topk`: an
+        # ngram draft is a tree whenever that breadth exceeds 1, and the
+        # refusal must key on the shape actually verified. On an all-native
+        # group nothing changes; on a fallback group (a rank without
+        # sgl_kernel, i.e. sm75/gfx900) a tree is refused because the Triton
+        # verify has not been validated for trees on those architectures.
+        ensure_spec_kernel_backend(
+            max(int(server_args.speculative_ngram_max_bfs_breadth), 1)
+        )
+
         # req_to_token_pool / token_to_kv_pool_allocator are set in
         # alloc_memory_pool(), after the target pools are allocated.
         self.device = server_args.device
