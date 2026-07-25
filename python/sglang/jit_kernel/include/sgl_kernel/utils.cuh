@@ -20,6 +20,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
+#include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <memory>
@@ -103,6 +104,37 @@ using fp32x4_t = float4;
 #define SGLANG_LDG(arg) __ldg(arg)
 #else
 #define SGLANG_LDG(arg) *(arg)
+#endif
+
+/*
+ * Device-side assertion.
+ *
+ * A device `assert()` lowers to `__assertfail`. On gfx900 a kernel containing
+ * one FAILS TO LAUNCH -- hipErrorIllegalState, "the operation cannot be
+ * performed in the present state" -- so the assert never fires, because the
+ * kernel never runs, and any kernel carrying one is dead on that arch.
+ *
+ * Measured 2026-07-25, Radeon RX Vega 64 (gfx900, ROCm 6.3.4), standalone, no
+ * graph capture, default stream. A one-line kernel with an `assert` fails to
+ * launch; the same kernel with `printf`, `__builtin_trap()` or `abort()`
+ * launches without error. So this is specific to `__assertfail` and NOT to
+ * device-side hostcalls in general, and a trap is a working substitute.
+ *
+ * The trap keeps the FAIL-FAST contract the assert call sites rely on: a
+ * violated precondition stops the kernel loudly (s_trap -> HSA exception ->
+ * process abort) rather than letting a bad value run on into an illegal
+ * access. It gives up only the assert's source-location message.
+ *
+ * Scope of the measurement is gfx900; other AMD arches are untested. The trap
+ * form is correct on all of them, so the shim is not gated per-arch.
+ */
+#ifndef USE_ROCM
+#define SGL_DEVICE_ASSERT(cond) assert(cond)
+#else
+#define SGL_DEVICE_ASSERT(cond)    \
+  do {                             \
+    if (!(cond)) __builtin_trap(); \
+  } while (0)
 #endif
 
 // DLPack device type for the current platform
