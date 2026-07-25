@@ -1187,3 +1187,81 @@ that it carries the biggest multiplier.
 
 The throughput rows are unaffected by this: they are direct measurements, not
 derived from the pool sizing.
+
+
+## Usable context per request: pre-fork TP=2 vs fork TP=3 uneven DCP
+
+Desk calculation, no boots. The question is not "how big is the pool" but "how
+much context can a request actually get", at 1 and at 2 concurrent requests.
+
+**Model maximum is 262,144 tokens** (`max_position_embeddings`, identical on the
+AWQ and FP8 checkpoints). That ceiling turns out to decide the comparison.
+
+| configuration | quant | 1 request | 2 requests (each) | basis |
+|---|---|---|---|---|
+| pre-fork **TP=2, 2x 3080** (vLLM ref cmd, util 0.82, MTP=3) | AWQ-BF16-INT4 | **~74,000** (34.7k-106.8k) | **~34,000** (14.6k-50.6k) | **computed** |
+| fork **TP=3 uneven DCP**, 5090+2x3080 | AWQ-BF16-INT4 | **262,144** = model max | **262,144** = model max | **measured** pool 563,763-798,528 |
+| fork **TP=3 uneven DCP**, 5090+2x3080 | FP8 | **262,144** = model max | **262,144** = model max | **measured** pool 886,336 |
+
+**The headline is not a multiplier, it is a threshold:** the pre-fork
+configuration cannot reach the model's own maximum context even with a single
+request, while the fork configuration serves *two* requests at full 262k
+context and is bounded by the model rather than by memory.
+
+### Measured inputs (not assumed)
+
+* **KV cost 32.0 KB per token, whole model, fp8** -- derived
+  `2(K,V) x 4 kv_heads x 256 head_dim x 1 B = 2048 B per layer per token`, x16
+  full-attention layers. Confirmed against the boot logs: 31.15-31.34 KB/token.
+* **GDN/mamba state ~174 MiB per concurrent request** (fork FP8 TP=3: ~1.16 GB
+  of ssm + intermediate + conv state across ranks for 7 slots). This is the
+  per-request cost that makes concurrency expensive on this model class.
+* **AWQ-BF16-INT4 weights 26.37 GB**, FP8 28.75 GB (safetensors, measured).
+  Note: the AWQ checkpoint is only ~8% smaller than FP8, NOT dramatically
+  smaller -- it is a mixed BF16/INT4 checkpoint, so "INT4 must be much smaller"
+  does not hold here and was checked rather than assumed.
+* **Fork pools measured** on five independent boots: AWQ 563,763 / 634,240 /
+  743,936 / 798,528, FP8 886,336.
+
+### Assumptions in the computed row (the only estimated row)
+
+Per 3080: `20480 MiB x 0.82 = 16,794 MiB` total budget; TP=2 halves the weights
+(13.19 GB/rank) and the MTP draft. The spread comes from CUDA context +
+activation headroom, which is the one number not measured for that config:
+
+| variant | overhead/rank | MTP draft | KV pool | 1 req | 2 req each |
+|---|---|---|---|---|---|
+| optimistic | 1.3 GB | 0.4 GB | 3.43 GB | 106,824 | 50,627 |
+| **central** | 1.8 GB | 0.4 GB | 2.43 GB | **74,056** | **34,243** |
+| conservative | 2.3 GB | 0.6 GB | 1.23 GB | 34,734 | 14,582 |
+
+Even the optimistic variant (106,824) stays well under the model maximum, so
+the qualitative result does not depend on which variant is chosen -- only the
+exact number does. That is why the threshold statement is safe where a
+multiplier would not be.
+
+### Robustness of the 2-request claim
+
+Two requests at full model context need a pool of `2 x 262,144 = 524,288`. All
+five measured fork pools clear it, the thinnest by 7.5%:
+
+```
+AWQ 563,763 -> +39,475   AWQ 634,240 -> +109,952   AWQ 743,936 -> +219,648
+AWQ 798,528 -> +274,240  FP8 886,336 -> +362,048
+```
+
+### Limits, stated
+
+* The TP=2 row is **computed, not measured** -- no boot log of that
+  configuration was found on this machine. It should be replaced by a real
+  boot when a window allows; the calculation is laid out above so it can be
+  checked line by line.
+* The fork pool figures are `max_total_num_tokens`, i.e. pool capacity. Whether
+  the scheduler actually admits a single 262k request is a separate question:
+  admission on this branch follows roughly
+  `3 x prompt_len + ~0.73 x sum(max_new) <= max_total_tokens`, so a request near
+  the ceiling can still be queued rather than run.
+* The PROVISIONAL caveat on the capacity column applies here too: what caps
+  stock PP is still unidentified. It does **not** affect this table, because
+  neither row here is stock PP -- but the same uncapped probe boots should
+  confirm the fork pools independently.
