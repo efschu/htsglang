@@ -763,6 +763,27 @@ class HTCCLDeviceTransport:
             )
             _tune_report("pipe_mib", str(best))
 
+    # -- pluggable-transport interface (see htccl.py "transport seam") --
+    #
+    # The device transport chunks internally, so it has no payload ceiling:
+    # size is irrelevant to `handles`. It serves all three collectives, which
+    # is exactly what the previous per-op `if self.device_transport is not
+    # None` checks did -- this is a restatement of today's behaviour, not a
+    # change. Nothing in the GPU-validated data path below is touched.
+    HTCCL_OPS = frozenset({"all_reduce", "all_gather", "reduce_scatter"})
+
+    def handles(self, op: str, nbytes: int) -> bool:
+        return op in self.HTCCL_OPS
+
+    def htccl_all_reduce(self, comm, inp: torch.Tensor) -> torch.Tensor:
+        return self.all_reduce(inp)
+
+    def htccl_all_gather(self, comm, inp: torch.Tensor, dim: int) -> torch.Tensor:
+        return self.all_gather(inp, dim)
+
+    def htccl_reduce_scatter(self, comm, inp: torch.Tensor, dim: int) -> torch.Tensor:
+        return self.reduce_scatter(inp, dim)
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         inp = input_.contiguous()
         out = torch.empty_like(inp)

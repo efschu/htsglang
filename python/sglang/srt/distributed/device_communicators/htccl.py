@@ -64,6 +64,74 @@ _TRANSPORT = os.environ.get("SGLANG_HTCCL_TRANSPORT", "device")
 _SLOT_BYTES = int(os.environ.get("SGLANG_HTCCL_SLOT_MIB", "64")) * 1024 * 1024
 
 
+# ----------------------------------------------------------------------
+# Transport seam
+#
+# A transport is anything exposing:
+#     handles(op: str, nbytes: int) -> bool
+#     htccl_<op>(comm, ...)            for each op it declares
+# The communicator ASKS `handles` rather than knowing a transport's limits, so
+# no transport-specific condition (e.g. the shm slot-size ceiling) lives at a
+# call site. Adding a transport -- `ucx` for RDMA is the expected next one --
+# is one registry entry plus its module; no dispatch site changes.
+#
+# `None` means "no transport object": the inline gloo data plane below, which
+# is always available and is the universal fallback.
+# ----------------------------------------------------------------------
+
+
+def _make_device_transport(cpu_group, device):
+    from sglang.srt.distributed.device_communicators.htccl_device import (
+        HTCCLDeviceTransport,
+    )
+
+    return HTCCLDeviceTransport(
+        cpu_group=cpu_group, device=device, slot_bytes=_SLOT_BYTES
+    )
+
+
+def _make_shm_transport(cpu_group, device):
+    from sglang.srt.distributed.device_communicators.htccl_shm import (
+        HTCCLShmTransport,
+    )
+
+    return HTCCLShmTransport(
+        cpu_group=cpu_group, device=device, slot_bytes=_SLOT_BYTES
+    )
+
+
+# name -> factory. "gloo" is intentionally absent: it is the inline plane.
+TRANSPORT_REGISTRY = {
+    "device": _make_device_transport,
+    "shm": _make_shm_transport,
+}
+
+# Transports that must NOT silently fall back to the gloo plane on failure.
+# The device transport is the one case: the compilation config allowed CUDA
+# graphs on the strength of it, so a CPU-orchestrated replacement would be
+# captured and crash later. Preserved verbatim from the pre-refactor code.
+_NO_FALLBACK = frozenset({"device"})
+
+
+def _build_transport(name: str, cpu_group, device, disabled: bool):
+    if disabled:
+        return None
+    factory = TRANSPORT_REGISTRY.get(name)
+    if factory is None:
+        return None  # "gloo" or an unknown name -> inline data plane
+    if name in _NO_FALLBACK:
+        return factory(cpu_group, device)
+    try:
+        return factory(cpu_group, device)
+    except Exception as e:
+        logger.warning(
+            "HTCCL: %s transport unavailable (%s); using the gloo data plane.",
+            name,
+            e,
+        )
+        return None
+
+
 class HTCCLCommunicator:
     """Host-staged collectives over the group's gloo CPU process group."""
 
@@ -77,37 +145,9 @@ class HTCCLCommunicator:
         self.world_size = dist.get_world_size(cpu_group)
         self.rank = dist.get_rank(cpu_group)
         self.disabled = self.world_size == 1
-        self.shm_transport = None
-        self.device_transport = None
-        if not self.disabled and _TRANSPORT == "device":
-            # No silent fallback: the compilation config allowed CUDA
-            # graphs based on this transport; a CPU-orchestrated
-            # replacement would be captured and crash later.
-            from sglang.srt.distributed.device_communicators.htccl_device import (
-                HTCCLDeviceTransport,
-            )
-
-            self.device_transport = HTCCLDeviceTransport(
-                cpu_group=cpu_group,
-                device=device,
-                slot_bytes=_SLOT_BYTES,
-            )
-        elif not self.disabled and _TRANSPORT == "shm":
-            try:
-                from sglang.srt.distributed.device_communicators.htccl_shm import (
-                    HTCCLShmTransport,
-                )
-
-                self.shm_transport = HTCCLShmTransport(
-                    cpu_group=cpu_group,
-                    device=device,
-                    slot_bytes=_SLOT_BYTES,
-                )
-            except Exception as e:
-                logger.warning(
-                    "HTCCL: shm transport unavailable (%s); using the "
-                    "gloo data plane.", e,
-                )
+        self.transport = _build_transport(
+            _TRANSPORT, cpu_group, device, disabled=self.disabled
+        )
         # Dedicated copy stream: D2H of the next chunk overlaps with the
         # CPU-side gloo reduction of the current one.
         self._stream = torch.cuda.Stream(device=device)
@@ -124,6 +164,18 @@ class HTCCLCommunicator:
         # shape gets one persistent device buffer that is reused (and
         # overwritten) on every call, like attention's out-parameter.
         self._out_pool: dict[tuple, torch.Tensor] = {}
+
+    def _select(self, op: str, nbytes: int):
+        """The transport for ``op`` at this size, or None for the gloo plane.
+
+        One attribute test plus the transport's own `handles` -- the same shape
+        at every dispatch site, so op coverage can no longer differ silently
+        between ops the way it did when each site hard-coded its own condition.
+        """
+        t = self.transport
+        if t is not None and t.handles(op, nbytes):
+            return t
+        return None
 
     def _get_out_buf(self, ref: torch.Tensor) -> torch.Tensor:
         key = (tuple(ref.shape), ref.dtype)
@@ -156,13 +208,9 @@ class HTCCLCommunicator:
             return input_.clone()
         inp = input_.contiguous()
         nbytes = inp.numel() * inp.element_size()
-        if self.device_transport is not None:
-            return self.device_transport.all_reduce(inp)
-        if self.shm_transport is not None and nbytes <= self.shm_transport.slot_bytes:
-            out = self._get_out_buf(inp)
-            out.copy_(inp)
-            self.shm_transport.all_reduce_(out.view(-1))
-            return out
+        t = self._select("all_reduce", nbytes)
+        if t is not None:
+            return t.htccl_all_reduce(self, inp)
         out = self._get_out_buf(inp)
 
         reduce_dtype = (
@@ -224,8 +272,11 @@ class HTCCLCommunicator:
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if self.disabled:
             return input_
-        if self.device_transport is not None:
-            return self.device_transport.all_gather(input_, dim)
+        t = self._select(
+            "all_gather", input_.numel() * input_.element_size()
+        )
+        if t is not None:
+            return t.htccl_all_gather(self, input_, dim)
         if dim < 0:
             dim += input_.dim()
         inp = input_.contiguous()
@@ -257,8 +308,11 @@ class HTCCLCommunicator:
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if self.disabled:
             return input_
-        if self.device_transport is not None:
-            return self.device_transport.reduce_scatter(input_, dim)
+        t = self._select(
+            "reduce_scatter", input_.numel() * input_.element_size()
+        )
+        if t is not None:
+            return t.htccl_reduce_scatter(self, input_, dim)
         if dim < 0:
             dim += input_.dim()
         # Host-staged: full all-reduce, then slice this rank's shard.
@@ -331,10 +385,9 @@ class HTCCLCommunicator:
         entry per run (rank 0 owns the unlink). Called from
         GroupCoordinator.destroy().
         """
-        for transport in (self.device_transport, self.shm_transport):
-            if transport is None:
-                continue
-            try:
-                transport.close()
-            except Exception as e:  # teardown must never mask the real error
-                logger.warning("HTCCL: transport close failed (%s).", e)
+        if self.transport is None:
+            return
+        try:
+            self.transport.close()
+        except Exception as e:  # teardown must never mask the real error
+            logger.warning("HTCCL: transport close failed (%s).", e)

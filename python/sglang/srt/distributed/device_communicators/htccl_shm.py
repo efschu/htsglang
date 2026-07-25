@@ -154,6 +154,35 @@ class HTCCLShmTransport:
                 )
             time.sleep(0)
 
+    # -- pluggable-transport interface (see htccl.py "transport seam") --
+    #
+    # `handles` declares what this transport can serve; the communicator asks
+    # instead of knowing. Encoding it here rather than at the call site is the
+    # point: the slot-size ceiling is a property of the shm segment, not of
+    # all_reduce.
+    #
+    # Deliberately UNCHANGED semantics: shm serves all_reduce only, and only
+    # within slot_bytes -- exactly the condition that used to be inlined in
+    # HTCCLCommunicator.all_reduce. all_gather/reduce_scatter were never
+    # served by shm and still are not; making them shm-capable is a separate,
+    # testable change (htccl.py notes it as the one op-coverage gap).
+    HTCCL_OPS = frozenset({"all_reduce"})
+
+    def handles(self, op: str, nbytes: int) -> bool:
+        return op in self.HTCCL_OPS and nbytes <= self.slot_bytes
+
+    def htccl_all_reduce(self, comm, inp: torch.Tensor) -> torch.Tensor:
+        """This transport's all_reduce calling convention.
+
+        shm reduces IN PLACE on a flat view, so it needs the communicator's
+        stable per-shape output buffer. Byte-identical to the sequence that
+        used to live in HTCCLCommunicator.all_reduce.
+        """
+        out = comm._get_out_buf(inp)
+        out.copy_(inp)
+        self.all_reduce_(out.view(-1))
+        return out
+
     def all_reduce_(self, flat: torch.Tensor) -> None:
         """In-place sum-all-reduce of a flat contiguous GPU tensor.
 
