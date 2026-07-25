@@ -1043,3 +1043,45 @@ Recorded because it is an upstream defect, not ours:
 * The cu130 index's recorded hash `d751c4dc...` no longer matches the actual
   release asset `62d41f63...`, i.e. the artifact was rebuilt without updating
   the index, so pip refuses it outright.
+
+
+## #171 capability-gate namespace sweep -- classification
+
+`get_min_capability()` and every literal like `>= 9` / `< 8` are NVIDIA compute
+capabilities. `get_device_capability()` answers in whichever namespace the
+torch build belongs to, and the two COLLIDE: gfx900 reports `(9, 0)`, the same
+integer as Hopper. A comparison across them fails in the DANGEROUS direction --
+an AMD card sails through an NVIDIA gate and dies later inside a kernel that
+does not exist there, instead of being refused at startup.
+
+Sweep over `python/sglang/srt`: **91 call sites -> 31 are comparisons (gates)
+-> 23 already carry a vendor guard -> 8 candidates**, of which 2 are false
+positives (`fla/utils.py:274,279` are guarded by `is_nvidia`) and 1 is a
+docstring. Five real findings:
+
+| site | reachable on ROCm | wrong direction | action |
+|---|---|---|---|
+| `model_loader/loader.py` generic floor | yes, every quant method | admitted wrongly | **FIXED** `65beaccc5d` |
+| `model_executor/model_runner.py:1688` bf16 fallback | yes, every rank | admitted wrongly (silent bad dtype) | **FIXED** `e879d35f2a` |
+| `lora/lora_moe_runner_marlin.py:74` | yes, if LoRA+MoE+Marlin | admitted wrongly | **FIXED** (this commit) |
+| `model_executor/runner/flashinfer_autotune.py:105` | **no** | would be admitted wrongly | registered, not fixed |
+| `layers/moe/fused_moe_triton/fused_marlin_moe.py:226` | **no** | would be admitted wrongly | registered, not fixed |
+
+The two unfixed ones are unreachable rather than harmless, and the reason is
+recorded so nobody has to re-derive it:
+
+* `flashinfer_autotune.py:105` sits behind
+  `if not (moe_needs_autotune or fp4_gemm_needs_autotune or
+  fp8_gemm_needs_autotune): return False`, and all three are
+  flashinfer-cutlass / modelopt-fp8 paths that do not exist on ROCm, so the
+  function returns before reaching the capability line.
+* `fused_marlin_moe.py:226` is inside `fused_marlin_moe`, and Marlin has no
+  ROCm kernel at all.
+
+Both become live the moment their feature gains a ROCm path, which is exactly
+when nobody will remember the collision -- hence registered rather than
+silently dropped.
+
+**GPU-validation pending for all three fixes:** arm E on this rig (NVIDIA
+no-op regression) and a gfx900 reject check on the second host. The CPU tests
+(19, vendor and capability mocked) pin the directions in the meantime.

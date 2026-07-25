@@ -70,6 +70,17 @@ class MarlinLoraRunnerCore:
         topk_ids = topk_output.topk_ids
 
         assert runner_config.activation == "silu", "Only SiLU activation is supported."
+        # Vendor first: "compute capability >= 9" is an NVIDIA statement, and
+        # get_device_capability() answers in the caller's vendor namespace. The
+        # two COLLIDE -- gfx900 reports (9, 0) -- so the bare comparison lets an
+        # AMD card through an NVIDIA gate and it then dies inside a Marlin
+        # kernel that does not exist on ROCm at all. Refusing here is the loud,
+        # correct direction; sailing through is the dangerous one.
+        assert is_cuda(), (
+            "MarlinLoraRunnerCore requires CUDA: Marlin has no ROCm kernel. "
+            "(Any capability this build reports is in its own vendor's "
+            "namespace and is NOT comparable to the NVIDIA minimum 9.)"
+        )
         assert (
             torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
         ), "MarlinLoraRunnerCore requires CUDA compute capability >= 9"
