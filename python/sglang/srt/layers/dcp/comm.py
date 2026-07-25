@@ -29,10 +29,49 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.distributed.utils import weightless_kv_active
+from sglang.srt.distributed.utils import get_tp_partition_ratios, weightless_kv_active
 from sglang.srt.layers.dcp.collective_guard import guard_dcp_step
 from sglang.srt.layers.dcp.kernels import CPTritonContext, correct_attn_out
 from sglang.srt.runtime_context import get_parallel
+
+
+def _reject_uneven_tp_mla(fn: str, detail: str) -> None:
+    """Fail fast: the MLA DCP collectives have NO uneven-TP variant.
+
+    ``cp_lse_ag_out_rs_mla`` and ``all_gather_q_for_mla_decode`` both assume an
+    EQUAL per-rank head count. Under a non-uniform --rank-tp-ratio plan they do
+    not error on their own -- they either compute a silently wrong result or
+    deadlock, because torch's reduce_scatter/all_gather require every rank to
+    agree on the shape. That is the worst possible failure mode, so reject it
+    here instead.
+
+    Contrast the MHA path, which HAS an uneven variant and encodes the design
+    decision in its name: ``cp_lse_ag_out_AR_mha_uneven`` uses all-**r**educe
+    plus a head-bounds slice, precisely because ``_RS_`` (reduce-**s**catter)
+    cannot express an uneven split.
+
+    RANK-UNIFORMITY (this is the point of the guard, more than the message):
+    the predicate is ``get_tp_partition_ratios()``, process-global state
+    installed once per scheduler process from ``server_args.rank_tp_ratio``
+    before the model is built -- a deterministic function of the CLI args, so
+    every rank computes the SAME answer. Combined with SPMD (all ranks reach
+    the same call site in the same order) the raise happens on every rank or on
+    none. A guard that fired on a subset of ranks would itself be a hang
+    source, which is exactly what this is meant to prevent.
+    """
+    ratios = get_tp_partition_ratios()
+    if not ratios or len(set(ratios)) == 1:
+        return
+    raise NotImplementedError(
+        f"{fn} does not support uneven tensor parallelism "
+        f"(--rank-tp-ratio={list(ratios)}). {detail} There is no uneven-MLA "
+        "variant: the uneven-MHA combine (cp_lse_ag_out_ar_mha_uneven) had to "
+        "trade reduce-scatter for all-reduce-plus-slice to express unequal "
+        "head shards, and that rework was never done for MLA. Running anyway "
+        "would silently produce wrong output or deadlock, so it is rejected "
+        "here. Use an even --rank-tp-ratio (or omit it) for MLA models, or an "
+        "MHA model for uneven TP."
+    )
 
 
 def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
@@ -218,6 +257,14 @@ def cp_lse_ag_out_rs_mla(
     if cp_group.world_size == 1:
         return cp_attn_out
 
+    # reduce_scatter_along_dim(dim=0) splits dim 0 into world_size EQUAL
+    # chunks -- it cannot express an uneven head split. See _reject_uneven_tp_mla.
+    _reject_uneven_tp_mla(
+        "cp_lse_ag_out_rs_mla",
+        "Its reduce_scatter_along_dim(dim=0) splits the head dim into "
+        "world_size EQUAL chunks.",
+    )
+
     if ctx is None:
         ctx = CPTritonContext()
 
@@ -324,6 +371,14 @@ def all_gather_q_for_mla_decode(
     q_pe: torch.Tensor,
 ):
     group = get_parallel().dcp_group
+    # The all_gather below is over dim 0 of a [H, B, L] tensor, where H is THIS
+    # rank's head count -- unequal across ranks under uneven TP, which torch's
+    # all_gather cannot express. See _reject_uneven_tp_mla.
+    _reject_uneven_tp_mla(
+        "all_gather_q_for_mla_decode",
+        "It all-gathers a [H, B, L] tensor over dim 0, where H is this rank's "
+        "head count and therefore differs between ranks.",
+    )
     with use_symmetric_memory(group):
         # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
         combined = torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
