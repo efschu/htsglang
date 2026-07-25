@@ -196,6 +196,76 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 logger = logging.getLogger(__name__)
 
 
+def _enforce_capability_floor(quant_config, model_config) -> None:
+    """Reject a quantization method the device cannot run -- vendor first.
+
+    ``get_min_capability()`` returns NVIDIA compute capabilities, so it may only
+    be compared against a capability read in the NVIDIA namespace.
+    ``get_device_capability()`` answers in whichever namespace the torch build
+    belongs to, and the two COLLIDE: gfx900 reports ``(9, 0)``, the same integer
+    as Hopper.
+
+    The old unconditional comparison therefore failed in the DANGEROUS
+    direction: an 8 GB Vega 64 sailed through an sm89 fp8 floor and died later
+    inside a kernel that does not exist there, instead of being told no at
+    startup. Being refused loudly is a good outcome; being admitted wrongly is
+    not.
+
+    Order:
+      1. ask the config for a VENDOR-AWARE answer (functional where it can be:
+         "does this kernel exist here?", not "is this integer big enough?");
+      2. only inside the NVIDIA namespace, apply the numeric floor.
+
+    On CUDA with a config that does not implement the hook, step 1 returns None
+    and step 2 runs exactly the comparison that ran before -- so NVIDIA
+    behaviour is unchanged, which is the regression criterion.
+    """
+    supported = None
+    hook = getattr(quant_config, "supports_current_device", None)
+    if callable(hook):
+        supported = hook()
+
+    if supported is False:
+        raise ValueError(
+            f"The quantization method {model_config.quantization} is not "
+            "supported on this device: the kernel it requires does not exist "
+            "here. (Any capability number reported by this build is in its own "
+            "vendor's namespace and is NOT comparable to the NVIDIA minimum "
+            f"capability {quant_config.get_min_capability()}.)"
+        )
+    if supported is True:
+        return
+
+    # supported is None: unknown. The numeric floor is only meaningful in the
+    # NVIDIA namespace.
+    if torch.version.hip is not None:
+        logger.warning(
+            "Quantization method %s declares an NVIDIA minimum capability of "
+            "%s, but this is a ROCm build: the device capability %s is an AMD "
+            "arch in a different namespace and the two are not comparable, so "
+            "the floor CANNOT be enforced here. Proceeding unchecked -- if the "
+            "required kernel is absent this will fail later, at its first "
+            "launch rather than at startup. Teach this config "
+            "supports_current_device() to get a clean answer.",
+            model_config.quantization,
+            quant_config.get_min_capability(),
+            get_device_capability(),
+        )
+        return
+
+    major, minor = get_device_capability()
+    if major is not None and minor is not None:
+        assert 0 <= minor < 10
+        capability = major * 10 + minor
+        if capability < quant_config.get_min_capability():
+            raise ValueError(
+                f"The quantization method {model_config.quantization} "
+                "is not supported for the current GPU. "
+                f"Minimum capability: {quant_config.get_min_capability()}. "
+                f"Current capability: {capability}."
+            )
+
+
 def _get_quantization_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
@@ -269,27 +339,9 @@ def _get_quantization_config(
                 quant_config = HybridFp8NvFp4Config(
                     fp8_config=quant_config, nvfp4_config=nvfp4_config
                 )
-        # NOTE: get_device_capability() answers in the caller's VENDOR
-        # namespace, while get_min_capability() returns NVIDIA numbers, and the
-        # two namespaces collide -- gfx900 reports (9, 0), the same integer as
-        # Hopper. So on ROCm this comparison is not meaningful and can admit a
-        # device that has no kernel for the method, which then fails later.
-        # Fixing that for every quantization method at once is out of scope
-        # here; what is fixed is the case where the method itself says it needs
-        # no device kernel, in which case the floor does not apply at all.
+        # Vendor first, capability second -- see _enforce_capability_floor.
         if not _is_npu and quant_config.needs_device_kernel():
-            major, minor = get_device_capability()
-
-            if major is not None and minor is not None:
-                assert 0 <= minor < 10
-                capability = major * 10 + minor
-                if capability < quant_config.get_min_capability():
-                    raise ValueError(
-                        f"The quantization method {model_config.quantization} "
-                        "is not supported for the current GPU. "
-                        f"Minimum capability: {quant_config.get_min_capability()}. "
-                        f"Current capability: {capability}."
-                    )
+            _enforce_capability_floor(quant_config, model_config)
         supported_dtypes = quant_config.get_supported_act_dtypes()
         if model_config.dtype not in supported_dtypes:
             raise ValueError(

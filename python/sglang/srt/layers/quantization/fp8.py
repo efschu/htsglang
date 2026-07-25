@@ -308,6 +308,26 @@ class Fp8Config(QuantizationConfig):
             return True
         return not fp8_needs_dequant_fallback()
 
+    def supports_current_device(self) -> Optional[bool]:
+        """Vendor-aware support answer; see QuantizationConfig.
+
+        Only answers outside the NVIDIA namespace, where the numeric floor is
+        meaningless. There the question is asked FUNCTIONALLY -- does a native
+        fp8 GEMM exist on this device? -- which keeps MI300-class parts working
+        exactly as before while giving gfx900 a clean "no" at startup instead
+        of a missing-kernel death later.
+
+        On CUDA this returns None on purpose, so the caller falls through to the
+        unchanged numeric comparison and NVIDIA behaviour does not move.
+        """
+        if torch.version.hip is None:
+            return None
+        from sglang.srt.layers.quantization.fp8_utils import (
+            fp8_native_gemm_available,
+        )
+
+        return fp8_native_gemm_available()
+
     @classmethod
     def get_config_filenames(cls) -> List[str]:
         return []

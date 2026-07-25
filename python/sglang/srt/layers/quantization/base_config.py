@@ -165,6 +165,31 @@ class QuantizationConfig(ABC):
         """
         return True
 
+    def supports_current_device(self) -> Optional[bool]:
+        """Vendor-aware answer to "can this device run this config?".
+
+        ``get_min_capability()`` returns NVIDIA compute capabilities, and they
+        may only be compared against a capability read in the NVIDIA namespace.
+        ``get_device_capability()`` answers in whichever namespace the torch
+        build belongs to, and the two collide: gfx900 reports ``(9, 0)`` -- the
+        same integer as Hopper. Comparing across them fails in the DANGEROUS
+        direction: an AMD card sails through an sm89/sm90 floor and dies later
+        on a missing kernel, instead of being told no at startup.
+
+        So outside the NVIDIA namespace the number cannot decide, and the
+        question has to be asked FUNCTIONALLY instead -- does the kernel this
+        config needs actually exist here?
+
+        Returns:
+            True  -- verified supported (skip the numeric floor),
+            False -- verified unsupported (reject, with a vendor-aware reason),
+            None  -- unknown; the caller must not pretend the floor was checked.
+
+        Default None: a config that has not been taught to answer for its own
+        vendor must not silently claim support.
+        """
+        return None
+
     @staticmethod
     @abstractmethod
     def get_config_filenames() -> List[str]:
