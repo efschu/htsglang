@@ -813,6 +813,43 @@ def mtp_resident_reservation_error(
     return None
 
 
+def spill_tick_seq_len(n_origin_input_ids: int, n_output_ids: int) -> Optional[int]:
+    """Committed sequence length for a spill-tick decode batch, or None when
+    the session has no token to decode yet.
+
+    ONE formula, two entry paths into the tick:
+
+    * DECODE-SPILL (the path this was written for): the session spilled
+      mid-decode, so it always holds at least one output token, and its LAST
+      output token is the one whose KV this tick is about to write. Hence
+      ``origin + output - 1`` == ``kv_committed_len``. Unchanged.
+
+    * BORN-SPILLED (PS1/PS2): the session is handed to the tick straight out
+      of prefill. ``prepare_for_extend`` already set
+      ``kv_committed_len = seq_len`` for the WHOLE input, and under the
+      overlap scheduler the prefill's sampled token is appended to
+      ``output_ids`` only when its result is processed -- one iteration later.
+      In that window ``output_ids`` is EMPTY, and the old expression silently
+      undercounted by one: measured on this rig ``origin=1967 output=0
+      committed=1967`` -> 1966, tripping the tick-build assert and taking
+      SIGQUIT on all three ranks.
+
+      The right answer there is not a different arithmetic. With no output
+      token there is nothing to decode FROM -- a decode step needs a token to
+      feed, and ``req.output_ids[-1]`` would raise IndexError two lines on.
+      The session is simply not tickable yet, so the tick defers one
+      iteration; by then ``output=1``, ``committed=1967`` and the SAME formula
+      gives 1967.
+
+    Returning None (rather than raising) keeps the caller's decision explicit
+    and is rank-uniform: ``output_ids`` is replicated batch metadata, and the
+    diagnostic above showed identical values on all three ranks.
+    """
+    if int(n_output_ids) <= 0:
+        return None
+    return int(n_origin_input_ids) + int(n_output_ids) - 1
+
+
 def spec_decline_non_back_spill(spec_active: bool, idx: int, n_reqs: int) -> bool:
     """Return True when a spill of request ``idx`` (out of ``n_reqs`` running)
     must be DECLINED because speculative decoding is active and ``idx`` is not
@@ -2569,7 +2606,14 @@ class KVSessionOffloadManager:
         batch.req_pool_indices_cpu = torch.tensor(
             [req.req_pool_idx], dtype=torch.int64
         )
-        seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        seq_len = spill_tick_seq_len(
+            len(req.origin_input_ids), len(req.output_ids)
+        )
+        assert seq_len is not None, (
+            "kv-session-offload tick build: rid=%s has no output token yet "
+            "(born-spilled, prefill result not processed); _pick_tick_slot "
+            "must defer such a session" % req.rid
+        )
         assert seq_len == req.kv_committed_len, (
             f"kv-session-offload tick build: seq_len {seq_len} != committed "
             f"{req.kv_committed_len} (rid={req.rid})"
@@ -3117,6 +3161,16 @@ class KVSessionOffloadManager:
         due = []
         for slot in self.spills.values():
             if slot.req.finished() or self._iter_ct <= slot.spill_iter:
+                continue
+            if spill_tick_seq_len(
+                len(slot.req.origin_input_ids), len(slot.req.output_ids)
+            ) is None:
+                # BORN-SPILLED, prefill result not processed yet: no output
+                # token exists, so there is nothing for a decode tick to feed
+                # (see spill_tick_seq_len). Defer one iteration instead of
+                # building a batch whose seq_len contradicts kv_committed_len.
+                # A decode-spilled session always holds an output token, so
+                # this never fires on that path.
                 continue
             if slot.suppress_tick:
                 # Restore-ready this iteration: skip its tick so it goes

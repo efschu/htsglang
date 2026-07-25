@@ -38,6 +38,7 @@ from sglang.srt.managers.kv_session_offload import (
     spec_decline_non_back_spill,
     spec_overlap_deferred_commit_hazard,
     spill_snapshot,
+    spill_tick_seq_len,
     spill_graph_block_stage_counts,
     spill_graph_blocks_needed,
     spill_graph_enabled,
@@ -2228,3 +2229,43 @@ def test_mtp_resident_reservation_rejects_a_pool_starving_carve():
     assert mtp_resident_reservation_error(3600, 0, 2048) is None
     assert mtp_resident_reservation_error(0, 2048, 2048) is None
     assert mtp_resident_reservation_error(3600, 256, 0) is None
+
+
+def test_spill_tick_seq_len_handles_born_spilled_and_decode_spill():
+    """One formula, two entry paths into the spill tick.
+
+    DECODE-SPILL is the path the expression was written for and must stay
+    bit-for-bit as it was: the session's LAST output token is the one whose KV
+    the tick is about to write, so seq_len = origin + output - 1 and that
+    equals kv_committed_len.
+
+    BORN-SPILLED (PS1/PS2) enters straight out of prefill.
+    prepare_for_extend already set kv_committed_len for the WHOLE input, and
+    under the overlap scheduler the sampled token reaches output_ids only when
+    the prefill result is processed, one iteration later. In that window
+    output_ids is EMPTY and the old expression undercounted by exactly one.
+    Measured on the mixed-GPU rig, identically on all three ranks:
+
+        PS2DIAG origin=1967 output=0 committed=1967 seq_len=1966
+        AssertionError: tick build: seq_len 1966 != committed 1967
+        -> SIGQUIT on all three ranks
+
+    There is no arithmetic that rescues that case: with no output token there
+    is nothing to decode FROM, and req.output_ids[-1] would raise IndexError
+    two lines later. The session is not tickable yet, so the helper reports
+    None and the picker defers one iteration.
+    """
+    # born-spilled, prefill result not yet processed -> not tickable
+    assert spill_tick_seq_len(1967, 0) is None
+
+    # ... and one iteration later the SAME formula agrees with kv_committed_len
+    assert spill_tick_seq_len(1967, 1) == 1967
+
+    # DECODE-SPILL arithmetic unchanged: last output token is uncommitted
+    assert spill_tick_seq_len(1967, 5) == 1971
+    assert spill_tick_seq_len(10, 1) == 10
+    assert spill_tick_seq_len(1, 3) == 3
+
+    # defensive: a negative/absent count is treated as "nothing to decode",
+    # never as a negative length
+    assert spill_tick_seq_len(1967, -1) is None
