@@ -37,8 +37,25 @@
 #endif
 using cudaError_t = hipError_t;
 using cudaStream_t = hipStream_t;
-using cudaLaunchConfig_t = hipLaunchConfig_t;
-using cudaLaunchAttribute = hipLaunchAttribute;
+// ROCm 6.3 provides NEITHER hipLaunchConfig_t NOR a hipLaunchAttribute struct
+// (only the hipLaunchAttributeID enum), so aliasing to them does not compile:
+//   error: no member named 'cudaLaunchConfig_t' in the global namespace
+// Newer ROCm may add them, but nothing on the HIP path ever hands either type
+// to a HIP API -- hipLaunchKernelGGL takes grid/block/smem/stream as separate
+// arguments, and both attribute setters (enable_pdl, enable_cluster) are
+// compiled out under USE_ROCM. So define the minimal layout locally and stay
+// independent of the ROCm version rather than gating on HIP_VERSION.
+struct cudaLaunchAttribute {
+  int id;
+};
+struct cudaLaunchConfig_t {
+  dim3 gridDim;
+  dim3 blockDim;
+  std::size_t dynamicSmemBytes;
+  cudaStream_t stream;
+  cudaLaunchAttribute* attrs;
+  unsigned int numAttrs;
+};
 inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaStreamPerThread hipStreamPerThread
 #define cudaGetErrorString hipGetErrorString
