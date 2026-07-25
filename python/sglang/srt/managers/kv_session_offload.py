@@ -1501,42 +1501,6 @@ class KVSessionOffloadManager:
                 self.mtp_resident_slices,
             )
 
-    def _effective_spec_algorithm(self):
-        """The spec family that would ACTUALLY run on a spill tick right now.
-
-        ``scheduler.spec_algorithm`` is fixed at boot and names the PRIMARY
-        family. Under cross-algorithm switching (--speculative-cross-algorithm-
-        force auto|policy) the family a forward really takes moves with the
-        active rung, so the boot value answers "nextn" while DFLASH is running
-        -- and spec-in-tick is only valid for the NEXTN/EAGLE-family drafter
-        (the device-resident draft KV, the seed primitive and the C4 verify twin
-        are all built for it; DFLASH relays through a different path entirely).
-
-        Thin one-way coupling by design: this READS a public property off the
-        spec worker and keeps no state of its own, and the spec worker knows
-        nothing about spilling. Any worker that does not publish
-        ``active_spec_algorithm`` (i.e. every non-cross-algo worker) falls
-        through to the boot value, which is exactly today's behaviour -- so the
-        flag-OFF and no-cross-algo paths are unchanged.
-
-        RANK-UNIFORM: the cross-algo worker derives ``active_spec_algorithm``
-        from ``_active_name``, which is only written by ``_apply_rung`` from the
-        rank-0 rung-id broadcast. Every rank therefore sees the same family at
-        the same round boundary, and this adds NO collective.
-        """
-        dw = getattr(self.scheduler, "draft_worker", None)
-        active = getattr(dw, "active_spec_algorithm", None)
-        return self.server_spec_algorithm if active is None else active
-
-    def _spec_in_tick_allowed_now(self) -> bool:
-        """Runtime half of the DFLASH exclusion (see _effective_spec_algorithm).
-
-        False while the ACTIVE rung is a DFLASH-family drafter, even though the
-        boot gate ``spec_in_tick_ready`` passed on the primary family.
-        """
-        eff = self._effective_spec_algorithm()
-        return eff is not None and not eff.is_none() and not eff.is_dflash_family()
-
         # C3/d4 draft-read SCRATCH: the spill-tick draft attends its resident
         # draft-KV tail through draft-POOL slots (req_to_token surgery). Under
         # spill PRESSURE the shared allocator has NO free slots (that is why the
@@ -1708,6 +1672,42 @@ class KVSessionOffloadManager:
                 self.tick_controller.deadzone_sigma,
                 self._regulator_spec_server,
             )
+
+    def _effective_spec_algorithm(self):
+        """The spec family that would ACTUALLY run on a spill tick right now.
+
+        ``scheduler.spec_algorithm`` is fixed at boot and names the PRIMARY
+        family. Under cross-algorithm switching (--speculative-cross-algorithm-
+        force auto|policy) the family a forward really takes moves with the
+        active rung, so the boot value answers "nextn" while DFLASH is running
+        -- and spec-in-tick is only valid for the NEXTN/EAGLE-family drafter
+        (the device-resident draft KV, the seed primitive and the C4 verify twin
+        are all built for it; DFLASH relays through a different path entirely).
+
+        Thin one-way coupling by design: this READS a public property off the
+        spec worker and keeps no state of its own, and the spec worker knows
+        nothing about spilling. Any worker that does not publish
+        ``active_spec_algorithm`` (i.e. every non-cross-algo worker) falls
+        through to the boot value, which is exactly today's behaviour -- so the
+        flag-OFF and no-cross-algo paths are unchanged.
+
+        RANK-UNIFORM: the cross-algo worker derives ``active_spec_algorithm``
+        from ``_active_name``, which is only written by ``_apply_rung`` from the
+        rank-0 rung-id broadcast. Every rank therefore sees the same family at
+        the same round boundary, and this adds NO collective.
+        """
+        dw = getattr(self.scheduler, "draft_worker", None)
+        active = getattr(dw, "active_spec_algorithm", None)
+        return self.server_spec_algorithm if active is None else active
+
+    def _spec_in_tick_allowed_now(self) -> bool:
+        """Runtime half of the DFLASH exclusion (see _effective_spec_algorithm).
+
+        False while the ACTIVE rung is a DFLASH-family drafter, even though the
+        boot gate ``spec_in_tick_ready`` passed on the primary family.
+        """
+        eff = self._effective_spec_algorithm()
+        return eff is not None and not eff.is_none() and not eff.is_dflash_family()
 
     # -- self-calibrating regulator: measurement + rank-uniform reduce ----
 

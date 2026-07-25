@@ -1826,6 +1826,85 @@ def test_cross_algo_worker_publishes_the_active_family():
     assert w.active_spec_algorithm == SpeculativeAlgorithm.EAGLE
 
 
+def test_offload_manager_init_is_not_truncated():
+    """Guard against a method definition being inserted INTO __init__.
+
+    Every unit test in this file builds the manager with __new__ and sets the
+    handful of attributes it needs, because a real __init__ wants a scheduler,
+    pools and a GPU. That is necessary here -- and it means NO test in this
+    suite executes __init__, so a `def` accidentally placed in the middle of it
+    silently truncates the constructor and every test still passes. That
+    happened once (the R1 fix); this is the guard.
+
+    Checked structurally: __init__ must still assign the load-bearing
+    attributes that live at the very END of its body. If a def lands mid-body,
+    the tail becomes that def's dead code and these disappear.
+    """
+    import ast
+    import inspect
+
+    from sglang.srt.managers import kv_session_offload as kvso
+
+    tree = ast.parse(inspect.getsource(kvso.KVSessionOffloadManager))
+    init = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+    )
+    assigned = {
+        node.attr
+        for node in ast.walk(init)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.ctx, ast.Store)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    }
+    for attr in (
+        "spills",
+        "_free_regions",  # first casualty of the real truncation
+        "region_tokens",
+        "spec_in_tick_ready",
+        "draft_full_pool",
+        "_draft_read_scratch",  # last assignment in the body
+    ):
+        assert attr in assigned, (
+            f"KVSessionOffloadManager.__init__ no longer assigns self.{attr} -- "
+            "the constructor is truncated, most likely by a 'def' inserted into "
+            "its body. Check the line numbers of __init__ against the methods "
+            "that follow it."
+        )
+
+
+def test_no_manager_method_has_unreachable_code_after_return():
+    """The exact fingerprint of the truncation bug, as a general guard.
+
+    When a `def` is inserted into another function's body, the host function's
+    remaining statements become unreachable code after the new function's
+    `return`. Nothing in Python complains. Assert that no method of this class
+    has statements following a top-level return.
+    """
+    import ast
+    import inspect
+
+    from sglang.srt.managers import kv_session_offload as kvso
+
+    tree = ast.parse(inspect.getsource(kvso.KVSessionOffloadManager))
+    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef))
+    offenders = []
+    for fn in cls.body:
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        for i, stmt in enumerate(fn.body[:-1]):
+            if isinstance(stmt, ast.Return):
+                offenders.append((fn.name, fn.body[i + 1].lineno))
+                break
+    assert not offenders, (
+        "unreachable statements after a top-level return: "
+        + ", ".join(f"{n} (from line {ln})" for n, ln in offenders)
+        + " -- this is what an accidentally in-lined 'def' looks like"
+    )
+
+
 def test_spill_batch_and_admission_consult_the_runtime_family_gate():
     """Ratchet: both enforcement sites must keep consulting the RUNTIME gate.
 
