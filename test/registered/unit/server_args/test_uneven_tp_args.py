@@ -121,10 +121,31 @@ class TestMutualRequirements(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "requires --rank-gpu-id"):
             run_handler(args)
 
-    def test_ratio_requires_gpu_id(self):
+    def test_ratio_does_not_require_gpu_id(self):
+        """--rank-tp-ratio is a pure PARTITION description and is independent
+        of device placement, so it must be usable without --rank-gpu-id.
+
+        This replaces the former test_ratio_requires_gpu_id, which asserted the
+        opposite. The coupling was removed deliberately: it blocked the
+        cross-vendor bring-up, where two launchers (--nnodes 2 --node-rank 0/1,
+        one CUDA venv + one ROCm venv on ONE host) each place their own rank,
+        and where --rank-gpu-id could not describe the AMD rank at all because
+        it resolves devices through NVML.
+        """
         args = make_args(tp_size=2, rank_tp_ratio=[2, 1])
-        with self.assertRaisesRegex(ValueError, "requires --rank-gpu-id"):
-            run_handler(args)
+        run_handler(args)
+        self.assertEqual(args.rank_tp_ratio, [2, 1])
+        self.assertIsNone(args.rank_gpu_id)
+
+    def test_ratio_validated_without_gpu_id(self):
+        """Decoupling must not lose validation: the ratio checks have to run on
+        the placement-free path too, not just after --rank-gpu-id is seen."""
+        with self.assertRaisesRegex(ValueError, "length"):
+            run_handler(make_args(tp_size=2, rank_tp_ratio=[2, 1, 1]))
+        with self.assertRaisesRegex(ValueError, "identical entries"):
+            run_handler(make_args(tp_size=2, rank_tp_ratio=[1, 1]))
+        with self.assertRaisesRegex(ValueError, "positive integers"):
+            run_handler(make_args(tp_size=2, rank_tp_ratio=[2, 0]))
 
 
 class TestLengthAndValueChecks(CustomTestCase):

@@ -5309,22 +5309,21 @@ class ServerArgs:
                 "--rank-gpu-id requires --rank-gpu-memory-mib to be set "
                 "(or --rank-tp-ratio auto to derive the budgets from NVML)."
             )
-        if self.rank_tp_ratio is not None and self.rank_gpu_id is None:
-            raise ValueError("--rank-tp-ratio requires --rank-gpu-id to be set.")
-        if self.rank_gpu_id is None:
-            self._handle_uneven_mlp_ratio()
-            return
-
-        # Length vs tp_size.
-        if len(self.rank_gpu_id) != self.tp_size:
-            raise ValueError(
-                f"--rank-gpu-id length ({len(self.rank_gpu_id)}) must equal "
-                f"--tp-size ({self.tp_size})."
-            )
-        if any(g < 0 for g in self.rank_gpu_id):
-            raise ValueError(
-                f"--rank-gpu-id entries must be >= 0, got {self.rank_gpu_id}."
-            )
+        # ---------------------------------------------------------------
+        # PLAN-ONLY validation (no device placement required).
+        #
+        # --rank-tp-ratio is a pure PARTITION DESCRIPTION: it says how the
+        # sharded dimensions are split across TP ranks, which is independent
+        # of which physical GPU each rank lands on. It therefore does NOT
+        # require --rank-gpu-id. Decoupling the two is what lets a rank be
+        # placed by something other than this process -- e.g. the
+        # cross-vendor bring-up, where two launchers (--nnodes 2 --node-rank
+        # 0/1, one CUDA venv + one ROCm venv on ONE host) each place their
+        # own rank, and --rank-gpu-id could not describe the AMD rank anyway
+        # because it resolves devices through NVML.
+        # The checks below are exactly the ones that do not read
+        # self.rank_gpu_id; everything that does stays after the early return.
+        # ---------------------------------------------------------------
 
         # Uneven-TP ratio checks.
         if self.rank_tp_ratio is not None:
@@ -5385,6 +5384,29 @@ class ServerArgs:
                 # uneven weights.
                 g = math.gcd(*self.rank_kv_ratio)
                 self.rank_kv_ratio = [v // g for v in self.rank_kv_ratio]
+
+        if self.rank_gpu_id is None:
+            self._handle_uneven_mlp_ratio()
+            return
+
+        # ---------------------------------------------------------------
+        # PLACEMENT validation (everything below reads self.rank_gpu_id).
+        # ---------------------------------------------------------------
+
+        # Length vs tp_size.
+        if len(self.rank_gpu_id) != self.tp_size:
+            raise ValueError(
+                f"--rank-gpu-id length ({len(self.rank_gpu_id)}) must equal "
+                f"--tp-size ({self.tp_size})."
+            )
+        if any(g < 0 for g in self.rank_gpu_id):
+            raise ValueError(
+                f"--rank-gpu-id entries must be >= 0, got {self.rank_gpu_id}."
+            )
+
+        # (--rank-tp-ratio and --rank-kv-ratio validation was hoisted above the
+        # rank_gpu_id early return: both describe the PARTITION, not the
+        # placement, so they must also run when --rank-gpu-id is absent.)
 
         # Per-rank MiB list checks.
         if isinstance(self.rank_gpu_memory_mib, list):
