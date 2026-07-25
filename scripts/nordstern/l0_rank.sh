@@ -1,54 +1,79 @@
 #!/bin/bash
 # Nordstern L0 -- ONE rank of a flat TP=5 group spanning two hosts.
 #
-# L0 is a FEASIBILITY step, not a performance one: flat gloo over Ethernet,
-# no RDMA, no hierarchical transport. It exists to prove group formation,
-# uneven ratios over five heterogeneous cards in four architecture classes,
-# and rank-uniform execution paths. It will be slow. That is expected and is
-# not a result.
+# L0 is a FEASIBILITY step: flat gloo over Ethernet, no RDMA, no hierarchical
+# transport. It proves group formation, uneven ratios over five heterogeneous
+# cards in four architecture classes, and rank-uniform execution paths. It is
+# slow by construction; that is not a result.
 #
-# Every rank is its own "node" (--nnodes 5 --node-rank R), which is how this
-# fork already splits ranks across two different venvs on one host. The only
-# new thing here is that the nodes are on two different machines.
+# CUDA GRAPHS ARE OUT FOR L0 BY DESIGN. Flat gloo is a CPU transport and the
+# fork's own startup guard rejects graph capture on it. Not to be bypassed --
+# see the report; the two ways to get graphs later are L2 (hierarchical
+# transport, device intra-rig) and a piecewise-capture port.
+#
+# Model: Llama-3.1-8B-Instruct. Chosen because q=32/kv=8 means kv >= tp=5, so
+# the REPLICATED-KV geometry does NOT engage: no mandatory DCP, and the triton
+# backend's normal path is correct. (Any kv<5 model needs flashinfer's weighted
+# owner rule, which does not exist on gfx900 -- task #173.)
 #
 # Required env: RANK (0-4), SIDE (main|second)
-# Optional:     MODEL, CTX, RATIO, MASTER, PORT, EXTRA, GRAPHFLAG
+# Optional:     STAGE (s1|s2), MODEL, CTX, RATIO, MASTER, PORT, EXTRA
 set -u
 RANK=${RANK:?set RANK=0..4}
 SIDE=${SIDE:?set SIDE=main|second}
-MASTER=${MASTER:-192.168.0.101}     # main rig LAN address; must be reachable from BOTH hosts
+STAGE=${STAGE:-s1}
+MASTER=${MASTER:-192.168.0.101}
 PORT=${PORT:-31900}
 CTX=${CTX:-4096}
-RATIO=${RATIO:-3,2,2,1,1}
-GRAPHFLAG=${GRAPHFLAG---disable-cuda-graph}
+# 4,3,3,2,1 -> kv heads [2,2,2,1,1], q heads [8,8,8,4,4]: monotonic with
+# capability and >= 6.5 GB headroom on every card. (3,2,2,1,1 is NOT monotonic
+# here -- it gives kv [2,1,1,2,2], i.e. the weakest cards the most heads.)
+RATIO=${RATIO:-4,3,3,2,1}
 SRVPORT=${SRVPORT:-31095}
 
-# ---- rank -> GPU/venv map -------------------------------------------------
-# rank 0 : RTX 5090   (sm120)  main rig,   CUDA index resolved below
-# rank 1 : RTX 3080   (sm86)   main rig
-# rank 2 : RTX 3080   (sm86)   main rig
-# rank 3 : RTX 2080Ti (sm75)   second host
-# rank 4 : Vega 64    (gfx900) second host
-# NOTE: torch's CUDA order is NOT nvidia-smi's on the main rig (measured:
-# CUDA 0 = 5090, CUDA 1/2 = 3080). Indices below are TORCH indices.
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export TORCHDYNAMO_DISABLE=1
 export SGLANG_HTCCL=1
-export SGLANG_HTCCL_TRANSPORT=${TRANSPORT:-gloo}   # L0 = flat gloo, cross-host
+export SGLANG_HTCCL_TRANSPORT=${TRANSPORT:-gloo}
 export MAX_JOBS=4
+# The shm message-queue broadcaster is a NODE-LOCAL shared-memory optimisation.
+# Across two hosts its handle is broadcast with dist.broadcast_object_list and
+# comes back as a plain str on the far side (the two hosts run different torch
+# builds), so create_from_handle dies with
+#   AttributeError: 'str' object has no attribute 'local_reader_ranks'
+# Measured on the second L0 attempt. Shared memory cannot span hosts anyway.
+export SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=0
+# Cross-host gloo MUST be told which interface to use. Without this, gloo
+# resolves the local hostname for its advertised endpoint, and on Debian that
+# is 127.0.1.1 (/etc/hosts maps the hostname to loopback). Rank 0 then
+# publishes 127.0.1.1 as its address and every remote rank tries to connect to
+# its OWN loopback: "Connection refused, remote=[127.0.1.1]" -> connectFullMesh
+# fails. Measured on the first L0 attempt. Pin the real LAN interface instead.
+
+# S2 adds uneven DCP on top of S1. Explicit --dcp-size (not the env auto-set)
+# so the validation handlers actually run: they are ordered before the
+# auto-set, so with the env route the spec/tree guards are silently skipped.
+DCPFLAGS=""
+if [ "$STAGE" = s2 ]; then
+  DCPFLAGS="--dcp-size 5 --rank-kv-ratio capacity"
+fi
 
 if [ "$SIDE" = main ]; then
-  MODEL=${MODEL:-/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8}
+  MODEL=${MODEL:-/spinning/llm_stuff/club-3090/models-cache/Llama-3.1-8B-Instruct}
   case "$RANK" in
-    0) export CUDA_VISIBLE_DEVICES=0 ;;   # 5090
-    1) export CUDA_VISIBLE_DEVICES=1 ;;   # 3080
-    2) export CUDA_VISIBLE_DEVICES=2 ;;   # 3080
+    0) export CUDA_VISIBLE_DEVICES=0 ;;   # RTX 5090  (torch index, NOT nvidia-smi's)
+    1) export CUDA_VISIBLE_DEVICES=1 ;;   # RTX 3080
+    2) export CUDA_VISIBLE_DEVICES=2 ;;   # RTX 3080
     *) echo "rank $RANK is not a main-rig rank" >&2; exit 2 ;;
   esac
+  export GLOO_SOCKET_IFNAME=${GLOO_IFNAME:-eth0}
+  export TP_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME
   PY=/spinning/htsglang-gpu/.venv/bin/python
   export PYTHONPATH=/spinning/wt-htccl/python
 else
-  MODEL=${MODEL:-/root/models/qwen3.6-27b-fp8}
+  MODEL=${MODEL:-/root/models/llama-3.1-8b}
+  export GLOO_SOCKET_IFNAME=${GLOO_IFNAME:-enp9s0}
+  export TP_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME
   cd /root
   case "$RANK" in
     3) export CUDA_VISIBLE_DEVICES=0
@@ -67,9 +92,9 @@ fi
 exec $PY -u -m sglang.launch_server \
   --model-path "$MODEL" --dtype float16 \
   --tp-size 5 --nnodes 5 --node-rank "$RANK" --dist-init-addr "$MASTER:$PORT" \
-  --rank-tp-ratio "$RATIO" \
-  --mamba-radix-cache-strategy no_buffer --page-size 1 --disable-overlap-schedule \
-  --attention-backend triton $GRAPHFLAG \
+  --rank-tp-ratio "$RATIO" $DCPFLAGS \
+  --page-size 1 --disable-overlap-schedule \
+  --attention-backend triton --disable-cuda-graph \
   --max-total-tokens $CTX --context-length $CTX --max-running-requests 1 \
   --mem-fraction-static ${MEMFRAC:-0.80} \
   ${EXTRA:-} \

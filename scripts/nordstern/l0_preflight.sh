@@ -8,8 +8,8 @@ KEY=${KEY:-/root/.ssh/id_ed25519_192.168.0.89}
 SSH="ssh -i $KEY -o IdentitiesOnly=yes -o ConnectTimeout=10"
 MASTER=${MASTER:-192.168.0.101}
 PORT=${PORT:-31900}
-MODEL_MAIN=${MODEL_MAIN:-/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8}
-MODEL_SECOND=${MODEL_SECOND:-/root/models/qwen3.6-27b-fp8}
+MODEL_MAIN=${MODEL_MAIN:-/spinning/llm_stuff/club-3090/models-cache/Llama-3.1-8B-Instruct}
+MODEL_SECOND=${MODEL_SECOND:-/root/models/llama-3.1-8b}
 fail=0
 ok(){ echo "  OK   $*"; }; bad(){ echo "  FAIL $*"; fail=1; }
 
