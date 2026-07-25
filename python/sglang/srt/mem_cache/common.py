@@ -130,6 +130,41 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         return
 
+    if getattr(req, "kv_spill_state", None) == "host":
+        # kv-session-offload: this request's rows past `kv_spill_boundary` are
+        # HOST SENTINELS, not device KV. Inserting them into the device radix
+        # tree donates indices that address no device row: the tree's
+        # `evictable_size` grows by tokens the pool does not own, and when the
+        # session finishes and the tree lock drops, the accounting invariant
+        # blows up ("pool memory leak detected", evictable > total).
+        #
+        # Measured on the mixed-GPU rig, identically on all three ranks, for a
+        # PS2 born-spilled-DEEP session -- which holds NO device head at all
+        # (boundary=0, every row a sentinel):
+        #     D5DIAG unfinished  boundary=0 protected_before=0 extend_end=1967
+        #     D5DIAG after       boundary=0 protected_after=1920
+        # i.e. 1920 sentinel rows entered the tree. At completion that surfaced
+        # as: evictable=4351 against total=3600, with the released session
+        # reporting "protected=1920" against a host boundary of 994.
+        #
+        # The FINISH path already refuses the insert for exactly this reason
+        # (see release_kv_cache below: "No radix insert -- the tail is on host,
+        # there is no full device KV to donate"). This is the same rule at the
+        # UNFINISHED seam, which was missing it. It also repairs the head free:
+        # release_finished_spilled_req frees [cache_protected_len, boundary),
+        # so a protected length inflated past the boundary made it free
+        # NOTHING and leak the real device head too.
+        #
+        # The rows stay request-owned and are released by
+        # release_finished_spilled_req. Advance prefix_indices without touching
+        # the tree, exactly as the skip_radix_cache_insert branch above does,
+        # so the chunk -> prefix bookkeeping is unchanged.
+        kv_indices = tree_cache.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : req.extend_range.end
+        ]
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        return
+
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 

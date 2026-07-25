@@ -5,6 +5,7 @@ CPU-only; no server, no GPU. Run:
 """
 
 import random
+import types
 
 import torch
 
@@ -2269,3 +2270,75 @@ def test_spill_tick_seq_len_handles_born_spilled_and_decode_spill():
     # defensive: a negative/absent count is treated as "nothing to decode",
     # never as a negative length
     assert spill_tick_seq_len(1967, -1) is None
+
+
+def test_spilled_req_never_donates_sentinel_rows_to_the_radix_tree():
+    """A spilled request must not be inserted into the DEVICE radix tree.
+
+    Rows past `kv_spill_boundary` are host sentinels: indices that address no
+    device row. Inserting them grows the tree's evictable_size by tokens the
+    pool does not own, and when the session finishes and the tree lock drops,
+    the accounting invariant blows up.
+
+    Measured on the mixed-GPU rig, identically on all three ranks, for a PS2
+    born-spilled-DEEP session (no device head at all, boundary=0):
+
+        D5DIAG unfinished  boundary=0 protected_before=0 extend_end=1967
+        D5DIAG after       boundary=0 protected_after=1920
+
+    1920 sentinel rows entered the tree; at completion that surfaced as
+    "pool memory leak detected! total=3600 ... evictable=4351", with the
+    released session reporting protected=1920 against a host boundary of 994.
+    The FINISH path already refuses the insert for this exact reason; this
+    pins the same rule at the UNFINISHED seam.
+    """
+    from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+
+    class _Pool:
+        def __init__(self):
+            # row 0: 1967 "indices"; the tail would be sentinels in the server
+            self.req_to_token = torch.arange(4096).unsqueeze(0)
+
+    class _Tree:
+        def __init__(self):
+            self.req_to_token_pool = _Pool()
+            self.inserted = []
+
+        def cache_unfinished_req(self, req, **kwargs):
+            self.inserted.append(req.rid)
+            # what the real tree does, and the source of the leak
+            req.cache_protected_len = 1920
+
+    class _Req:
+        def __init__(self, rid, spill_state):
+            self.rid = rid
+            self.req_pool_idx = 0
+            self.kv_spill_state = spill_state
+            self.kv_spill_boundary = 0
+            self.cache_protected_len = 0
+            self.prefix_indices = None
+            self.extend_range = types.SimpleNamespace(end=1967)
+
+    # the born-spilled session: must NOT reach the tree
+    tree = _Tree()
+    spilled = _Req("spilled", "host")
+    maybe_cache_unfinished_req(spilled, tree)
+    assert tree.inserted == [], (
+        "a spilled request was inserted into the device radix tree; its "
+        "sentinel rows become evictable tokens the pool does not own"
+    )
+    assert spilled.cache_protected_len == 0, (
+        "cache_protected_len was inflated past the host boundary, which also "
+        "makes release_finished_spilled_req free NOTHING of the device head"
+    )
+    # the prefix bookkeeping must still advance (chunk -> prefix conversion)
+    assert spilled.prefix_indices is not None
+    assert len(spilled.prefix_indices) == 1967
+
+    # a normal device request is untouched -- the default path must not change
+    tree2 = _Tree()
+    normal = _Req("normal", None)
+    maybe_cache_unfinished_req(normal, tree2)
+    assert tree2.inserted == ["normal"], (
+        "the non-spilled path must still insert into the radix tree"
+    )
