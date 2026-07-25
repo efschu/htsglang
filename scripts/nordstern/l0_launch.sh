@@ -70,7 +70,13 @@ if [ "$LOCAL_ONLY" != 1 ]; then
     # ranks 4 and 3 first: slowest to import; a late joiner is cheaper than a
     # rendezvous master that has already timed out.
     for r in 4 3; do
+        # Forward EVERY knob that shapes the run. MAXTOK was missing here, so
+        # `MAXTOK=0` (uncapped) applied to the main rig while ranks 3/4 silently
+        # kept the default cap: rank 0 sized its KV pool to 133802 tokens and
+        # ranks 3/4 to 2048, which is a capacity number that means nothing.
+        # Measured on the S4 run of window #2.
         $SSH root@$SECOND "RANK=$r SIDE=second STAGE=$STAGE RATIO='$RATIO' CTX=$CTX \
+           MAXTOK='${MAXTOK:-}' MEMFRAC='${MEMFRAC:-}' EXTRA='${EXTRA:-}' \
            L0_RUN_TAG='$RUN_TAG' \
            nohup setsid /root/nordstern/l0_rank.sh > /root/nordstern/r$r.log 2>&1 < /dev/null &" &
     done

@@ -4552,6 +4552,35 @@ class ServerArgs:
 
         handle_pd_disaggregation(self)
 
+    def tree_verify_activation_reason(self) -> Optional[str]:
+        """Which flag would activate a TREE-MASKED verify, or None.
+
+        One place, because the terrain behind it is measured-wrong (#76) and
+        the number of doors onto it keeps growing:
+
+        * ``--speculative-eagle-topk > 1`` -- the EAGLE tree draft. This is the
+          door that was measured: under uneven-weighted DCP a topk>1 tree gives
+          non-deterministic, non-greedy output at temp 0.
+        * ``--speculative-dflash-tree-verify`` -- a SECOND door, added by three
+          unconsolidated upstream PRs (#31069 / #29587 / #29907) for DFLASH
+          block drafts. It does not exist in this tree yet, so it is read via
+          getattr: the guard is ARMED FOR ITS ARRIVAL rather than waiting to be
+          remembered during a future merge. A new flag name reaching the same
+          tree-masked draft->draft verify is exactly how a guard gets bypassed
+          without anyone deciding to bypass it.
+
+        Returns a human-readable reason (used verbatim in the error) or None.
+        """
+        topk = self.speculative_eagle_topk
+        if topk is not None and topk > 1:
+            return f"--speculative-eagle-topk={topk} > 1 (EAGLE tree draft)"
+        if getattr(self, "speculative_dflash_tree_verify", False):
+            return (
+                "--speculative-dflash-tree-verify (DFLASH tree verify, upstream "
+                "#31069/#29587/#29907)"
+            )
+        return None
+
     def _handle_dcp_validation(self):
         # Decode context parallel (DCP) is currently implemented and validated
         # only on AMD HIP/ROCm. Reject invalid or unverified configurations
@@ -4620,18 +4649,22 @@ class ServerArgs:
             # _build_dcp_ragged_tree_mask vs the paged/ragged LSE-merge are
             # audited, hard-error instead of silently emitting wrong tokens.
             # topk == 1 keeps the byte-identical, correct plain-causal chain path.
+            #
+            # HARDENED (#98 sighting): the trigger is no longer read as "topk >
+            # 1" but as "anything that would activate a tree-masked verify" --
+            # see tree_verify_activation_reason(). Upstream is carrying a
+            # SECOND door onto this exact terrain
+            # (--speculative-dflash-tree-verify, PRs #31069/#29587/#29907), and
+            # a guard that names one flag is a guard that a merge walks past.
+            tree_reason = self.tree_verify_activation_reason()
             if (
-                (
-                    uneven_weighted_dcp
-                    or self.rank_tp_ratio is not None
-                    or self.weightless_kv_fastlane
-                )
-                and self.speculative_eagle_topk is not None
-                and self.speculative_eagle_topk > 1
-            ):
+                uneven_weighted_dcp
+                or self.rank_tp_ratio is not None
+                or self.weightless_kv_fastlane
+            ) and tree_reason is not None:
                 raise ValueError(
                     "Tree/branching speculative decoding "
-                    f"(--speculative-eagle-topk={self.speculative_eagle_topk} > 1) "
+                    f"({tree_reason}) "
                     "is not supported under any cross-rank DCP variant that "
                     "activates the DCP tree mask (uneven-hybrid DCP via "
                     "--rank-tp-ratio -- even-modulo or weighted -- or the "

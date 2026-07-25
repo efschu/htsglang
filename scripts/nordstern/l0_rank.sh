@@ -35,6 +35,15 @@ RATIO=${RATIO:-4,3,3,2,1}
 # its warmup then hit ANOTHER rank's app and got a 404). One port per rank;
 # only rank 0's is ever queried.
 SRVPORT=${SRVPORT:-$((31095 + RANK))}
+# CAPACITY IS PART OF EVERY RESULT (harness rule #4): a tok/s number without
+# the context it was reached at is not a result. MAXTOK=0 leaves the KV pool
+# UNCAPPED so the boot log's `max_total_num_tokens` reports what the
+# configuration actually affords; any other value caps it and must be labelled
+# "capped" in the table. S1's numbers were taken CAPPED at 4096.
+MAXTOK=${MAXTOK:-}
+MAXTOK=${MAXTOK:-$CTX}
+MAXTOK_FLAG=""
+[ "$MAXTOK" != "0" ] && MAXTOK_FLAG="--max-total-tokens $MAXTOK"
 
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export TORCHDYNAMO_DISABLE=1
@@ -149,7 +158,7 @@ export L0_RUN_TAG=${L0_RUN_TAG:-l0-standalone-$$}
   --rank-tp-ratio "$RATIO" $DCPFLAGS $SPECFLAGS \
   --page-size 1 --disable-overlap-schedule \
   --attention-backend triton --disable-cuda-graph \
-  --max-total-tokens $CTX --context-length $CTX --max-running-requests 1 \
+  $MAXTOK_FLAG --context-length $CTX --max-running-requests 1 \
   --mem-fraction-static ${MEMFRAC:-0.80} \
   ${EXTRA:-} \
   --host 0.0.0.0 --port $SRVPORT &
