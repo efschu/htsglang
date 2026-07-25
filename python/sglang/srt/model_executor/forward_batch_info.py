@@ -1634,7 +1634,34 @@ def _clamp_position_native(seq_lens):
 if is_cuda() or is_hip():
     from sglang.jit_kernel.clamp_position import clamp_position_cuda
 
-    clamp_position = clamp_position_cuda
+    def clamp_position(seq_lens):
+        # The JIT kernel is built on FIRST CALL, not at import, so a toolchain
+        # that cannot build it surfaces here rather than above. Dispatch keyed
+        # on `is_cuda() or is_hip()` asks WHICH PLATFORM, but the thing that
+        # actually varies is WHETHER THE BUILD SUCCEEDS -- on a ROCm host with
+        # no compiler the two answers differ. Fall back to the native
+        # implementation that already exists a few lines up, and latch the
+        # choice so the failed build is attempted only once.
+        # On a working toolchain the first call succeeds and rebinds to the
+        # kernel, so the steady state is byte-identical there.
+        global clamp_position
+        try:
+            out = clamp_position_cuda(seq_lens)
+        except Exception as e:
+            # This module imports neither `logging` nor defines a logger;
+            # keep both local to this handler rather than adding globals for
+            # a one-shot warning.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                f"JIT clamp_position unavailable on this device ({e}); "
+                "using the native implementation."
+            )
+            clamp_position = _clamp_position_native
+            return _clamp_position_native(seq_lens)
+        clamp_position = clamp_position_cuda
+        return out
+
 else:
     clamp_position = _clamp_position_native
 

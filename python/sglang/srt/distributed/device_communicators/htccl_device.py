@@ -83,6 +83,18 @@ _CUDA_SRC = r"""
 
 #define HTCCL_MAX_RANKS 8
 
+// __trap() is CUDA-only and hipify does NOT translate it: the AMD build fails
+// with "use of undeclared identifier '__trap'". The note at the top of this
+// module lists __threadfence_system / clock64 / volatile loads as the
+// constructs that survive hipify 1:1 -- __trap was simply not among them and
+// had never been compiled for HIP. abort() is HIP's device-side equivalent and
+// lowers to s_trap on amdgcn.
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
+#define HTCCL_TRAP() abort()
+#else
+#define HTCCL_TRAP() __trap()
+#endif
+
 using u64 = unsigned long long;
 
 struct SlotPtrs {
@@ -121,7 +133,7 @@ __global__ void htccl_begin_kernel(u64* seq_dev,
   u64 start = clock64();
   for (int r = 0; r < world; ++r) {
     while (vload(&cons_flags[r * 8]) < seq - 1) {
-      if (clock64() - start > timeout) { __trap(); }
+      if (clock64() - start > timeout) { HTCCL_TRAP(); }
     }
   }
 }
@@ -147,7 +159,7 @@ __global__ void htccl_wait_kernel(const volatile u64* pub_flags,
   for (int r = 0; r < world; ++r) {
     if (r == rank) continue;
     while (vload(&pub_flags[r * HTCCL_MAX_CHUNKS + chunk]) < seq) {
-      if (clock64() - start > timeout) { __trap(); }
+      if (clock64() - start > timeout) { HTCCL_TRAP(); }
     }
   }
   __threadfence_system();
@@ -160,7 +172,7 @@ __global__ void htccl_wait_one_kernel(const volatile u64* pub_flags,
   u64 seq = *seq_dev;
   u64 start = clock64();
   while (vload(&pub_flags[owner * HTCCL_MAX_CHUNKS + idx]) < seq) {
-    if (clock64() - start > timeout) { __trap(); }
+    if (clock64() - start > timeout) { HTCCL_TRAP(); }
   }
   __threadfence_system();
 }
@@ -541,50 +553,131 @@ void htccl_allgather(at::Tensor inp, at::Tensor out, int64_t rank,
 _ext = None
 
 
-def _resolve_build_arches(cpu_group) -> list[str]:
-    """Every CUDA arch this extension must contain, as ``"8.6"``-style strings.
+def _local_vendor() -> str:
+    """``"hip"`` or ``"cuda"``, taken from the RUNTIME build.
 
-    Each rank can only see its OWN card: the fork isolates a rank to one
-    physical GPU via ``CUDA_VISIBLE_DEVICES``, so ``torch.cuda.device_count()``
-    is 1 inside a worker and torch's own arch inference (which walks the
-    *visible* devices) yields a single architecture. On a mixed-arch rig that
-    single architecture is whichever rank happened to compile first, and every
-    other rank then loads a cubin its GPU cannot run.
+    `torch.version.hip` is set only on a ROCm build and is None on a CUDA one.
+    Deliberately NOT inferred from an architecture string: conflating the two
+    namespaces is exactly the defect this module had. `torch.cuda.*` is the
+    same API on both builds (ROCm maps it onto HIP), so the API used says
+    nothing about the vendor -- only `torch.version` does.
+    """
+    return "hip" if torch.version.hip else "cuda"
 
-    Union-ing the capabilities over the group is therefore not an
-    optimisation but the only way a rank can learn the node's real mix. The
-    all-gather also makes the result identical on every rank by construction,
-    which is what allows it to be used as a cache key.
+
+def _local_arches(vendor: str) -> list[str]:
+    """This rank's architectures, in its OWN vendor's namespace.
+
+    CUDA yields capability strings ("7.5"); HIP yields gfx names ("gfx900").
+    The two namespaces overlap numerically and must never be mixed: gfx900
+    reports `get_device_capability() == (9, 0)`, i.e. the string "9.0", which
+    is ALSO NVIDIA Hopper. A group containing a Vega therefore used to make
+    every CUDA rank compile an sm_90 cubin. Returning gfx names on HIP removes
+    the collision at the source rather than trying to disambiguate later.
     """
     import re
 
-    import torch.distributed as dist
+    if vendor == "hip":
+        env = os.environ.get("PYTORCH_ROCM_ARCH")
+        if env and env.strip():
+            return sorted({s.strip().split(":")[0]
+                           for s in re.split(r"[;,\s]+", env) if s.strip()})
+        # Clamp to what this torch build actually contains. On ROCm
+        # get_arch_list() returns gfx names, so the CUDA-shaped `"sm_" in a`
+        # test matched nothing and the clamp silently did nothing on exactly
+        # the platform whose namespace it could not parse. Parse gfx instead.
+        supported = {a.split(":")[0] for a in torch.cuda.get_arch_list()
+                     if a.startswith("gfx")}
+        out = []
+        for i in range(torch.cuda.device_count()):
+            # gcnArchName carries feature suffixes ("gfx900:xnack-"); the base
+            # name is what --offload-arch and get_arch_list() agree on.
+            name = torch.cuda.get_device_properties(i).gcnArchName.split(":")[0]
+            if supported and name not in supported:
+                logger.warning(
+                    "HTCCL device transport: this torch build lists %s but the "
+                    "GPU reports %s; building for it anyway, which will fail if "
+                    "the compiler cannot target it.",
+                    ",".join(sorted(supported)), name,
+                )
+            out.append(name)
+        return out
 
     env = os.environ.get("TORCH_CUDA_ARCH_LIST")
     if env and env.strip().lower() != "native":
         # An explicit list wins (and is assumed rank-uniform, like every
         # other SGLANG_HTCCL* / build env in this transport).
         specs = [s.strip() for s in re.split(r"[;,\s]+", env) if s.strip()]
-        arches = {s.replace("+PTX", "").strip() for s in specs}
-    else:
-        # Clamp to what the installed nvcc/torch can actually emit, exactly
-        # as torch.utils.cpp_extension._get_cuda_arch_flags does.
-        supported = [
-            int("".join(re.findall(r"\d+", a.split("_")[1])))
-            for a in torch.cuda.get_arch_list()
-            if "sm_" in a
-        ]
-        ceiling = max((sm // 10, sm % 10) for sm in supported) if supported else None
-        local = []
-        for i in range(torch.cuda.device_count()):
-            cap = torch.cuda.get_device_capability(i)
-            if ceiling is not None:
-                cap = min(ceiling, cap)
-            local.append(f"{cap[0]}.{cap[1]}")
-        gathered: list[list[str] | None] = [None] * dist.get_world_size(cpu_group)
-        dist.all_gather_object(gathered, local, group=cpu_group)
-        arches = {a for part in gathered for a in part}  # type: ignore[union-attr]
-    return sorted(arches, key=lambda s: tuple(int(x) for x in s.split(".")))
+        return sorted({s.replace("+PTX", "").strip() for s in specs})
+    # Clamp to what the installed nvcc/torch can actually emit, exactly
+    # as torch.utils.cpp_extension._get_cuda_arch_flags does.
+    supported_sm = [
+        int("".join(re.findall(r"\d+", a.split("_")[1])))
+        for a in torch.cuda.get_arch_list()
+        if a.startswith("sm_")
+    ]
+    ceiling = max((sm // 10, sm % 10) for sm in supported_sm) if supported_sm else None
+    out = []
+    for i in range(torch.cuda.device_count()):
+        cap = torch.cuda.get_device_capability(i)
+        if ceiling is not None:
+            cap = min(ceiling, cap)
+        out.append(f"{cap[0]}.{cap[1]}")
+    return out
+
+
+def _arch_sort_key(vendor: str, arch: str):
+    if vendor == "hip":
+        return arch
+    return tuple(int(x) for x in arch.split("."))
+
+
+def _resolve_build_arches(cpu_group) -> dict:
+    """Vendor -> sorted architectures present in the group, as (vendor, arch).
+
+    Each rank can only see its OWN card: the fork isolates a rank to one
+    physical GPU via ``CUDA_VISIBLE_DEVICES``, so ``torch.cuda.device_count()``
+    is 1 inside a worker and torch's own arch inference (which walks the
+    *visible* devices) yields a single architecture. On a mixed-arch rig that
+    single architecture is whichever rank happened to compile first, and every
+    other rank then loads a cubin its GPU cannot run. Union-ing over the group
+    is therefore not an optimisation but the only way a rank can learn the
+    node's real mix.
+
+    What is gathered is (vendor, arch) PAIRS, never bare capability strings.
+    A cross-vendor group holds architectures from two disjoint namespaces that
+    can collide numerically, so a flat set of strings cannot represent it: the
+    union is taken WITHIN each vendor and the vendors stay separate all the way
+    through to the compiler flags and the cache key.
+    """
+    import torch.distributed as dist
+
+    vendor = _local_vendor()
+    local = [(vendor, a) for a in _local_arches(vendor)]
+    gathered: list = [None] * dist.get_world_size(cpu_group)
+    dist.all_gather_object(gathered, local, group=cpu_group)
+    by_vendor: dict = {}
+    for part in gathered:
+        for v, a in part or ():
+            by_vendor.setdefault(v, set()).add(a)
+    return {
+        v: sorted(arches, key=lambda a, _v=v: _arch_sort_key(_v, a))
+        for v, arches in by_vendor.items()
+    }
+
+
+def _build_flags(vendor: str, arches: list) -> list:
+    """Compiler flags for ONE vendor. No flag of one namespace ever reaches
+    the compiler of the other: `-gencode` is nvcc-only and made hipcc fail
+    outright, and `--offload-arch` is meaningless to nvcc."""
+    if vendor == "hip":
+        return [f"--offload-arch={a}" for a in arches]
+    tags = [a.replace(".", "") for a in arches]
+    flags = [f"-gencode=arch=compute_{t},code=sm_{t}" for t in tags]
+    if tags:
+        # PTX of the newest arch, so a card added later still runs.
+        flags.append(f"-gencode=arch=compute_{tags[-1]},code=compute_{tags[-1]}")
+    return flags
 
 
 def _load_ext(cpu_group):
@@ -592,23 +685,30 @@ def _load_ext(cpu_group):
     if _ext is None:
         from torch.utils.cpp_extension import load_inline
 
-        arches = _resolve_build_arches(cpu_group)
-        tags = [a.replace(".", "") for a in arches]
-        flags = [f"-gencode=arch=compute_{t},code=sm_{t}" for t in tags]
-        if tags:
-            # PTX of the newest arch, so a card added later still runs.
-            flags.append(
-                f"-gencode=arch=compute_{tags[-1]},code=compute_{tags[-1]}"
-            )
+        by_vendor = _resolve_build_arches(cpu_group)
+        vendor = _local_vendor()
+        # Build for THIS rank's vendor only. A cubin for gfx900 is meaningless
+        # to nvcc and vice versa, so the cross-vendor union is a union of
+        # artifacts, not of flags. Within a vendor the union is preserved,
+        # which is what the mixed-NVIDIA case needs.
+        arches = by_vendor.get(vendor, [])
+        flags = _build_flags(vendor, arches)
         # The arch list belongs in the CACHE KEY, not just in the flags:
         # torch keys its JIT build directory by extension name and rebuilds
         # only when the SOURCES change. A name that ignores the architecture
         # lets a stale single-arch .so from an earlier run be handed back to
         # a rank it cannot run on -- which is the failure this guards, and it
         # survives the flags alone.
-        name = "htccl_device_ext"
-        if tags:
-            name += "_sm" + "_".join(tags)
+        #
+        # The VENDOR belongs in it too. The name used to be built from the
+        # group-wide arch union, which is identical on every rank by
+        # construction -- and that is precisely what made it wrong across
+        # vendors: one key naming two incompatible artifacts. Keying on
+        # (vendor, that vendor's arches) keeps it deterministic per rank while
+        # letting the two vendors' builds coexist.
+        name = "htccl_device_ext_" + vendor
+        if arches:
+            name += "_" + "_".join(a.replace(".", "") for a in arches)
         t0 = time.time()
         _ext = load_inline(
             name=name,
@@ -619,8 +719,11 @@ def _load_ext(cpu_group):
             verbose=False,
         )
         _info_once(
-            "HTCCL device extension %r built for arch(es) %s in %.1f s",
-            name, ",".join(arches) or "<torch default>", time.time() - t0,
+            "HTCCL device extension %r built for %s arch(es) %s in %.1f s "
+            "(group: %s)",
+            name, vendor, ",".join(arches) or "<torch default>",
+            time.time() - t0,
+            "; ".join(f"{v}:{','.join(a)}" for v, a in sorted(by_vendor.items())),
         )
     return _ext
 

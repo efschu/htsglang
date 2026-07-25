@@ -199,8 +199,17 @@ def _tvm_ffi_version() -> str:
 def _jit_build_dir_name(module_name: str) -> str:
     # Key on arch + tvm-ffi ABI too (module_name only hashes sources), so a
     # shared cache volume never reuses a cross-arch/ABI .so.
+    #
+    # The VENDOR belongs in the key as well: the arch tag is derived from
+    # torch.cuda.get_device_capability(), and that namespace collides across
+    # vendors -- an AMD gfx900 reports (9, 0), i.e. the same "9.0" as an NVIDIA
+    # Hopper part. Without the vendor, a shared cache volume would hand a
+    # gfx900 .so to an sm_90 rank (or the reverse) under an identical key,
+    # which is exactly the cross-arch reuse this name exists to prevent.
+    # Same defect and same fix shape as the HTCCL device-extension cache key.
+    vendor = "hip" if torch.version.hip else "cuda"
     arch = get_jit_cuda_arch().target_name
-    return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
+    return f"{module_name}__{vendor}_arch_{arch}__tvmffi_{_tvm_ffi_version()}"
 
 
 def load_jit(

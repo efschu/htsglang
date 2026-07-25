@@ -277,21 +277,23 @@ def test_device_extension_builds_for_every_arch_and_keys_the_cache_by_it(
 ):
     """A mixed-arch rig must not share a single-arch cubin between ranks.
 
-    `load_inline` was called with no arch flags and a name-only cache key.
-    Under per-rank CUDA_VISIBLE_DEVICES isolation each worker sees exactly one
-    card, so torch inferred ONE architecture -- whichever rank compiled first
-    -- and every other rank then loaded a cubin its GPU cannot launch
-    (`unspecified launch failure` on the first HTCCL kernel).
-
-    Both halves matter: the flags make the binary fat, and the arch-aware
-    name stops a stale single-arch build directory from being reused. This
-    class of bug is INVISIBLE on a rig with identical GPUs.
+    Original defect: `load_inline` with no arch flags and a name-only cache
+    key; under per-rank CUDA_VISIBLE_DEVICES isolation each worker sees ONE
+    card, so the first compiler fixed the arch for everyone and the sm_86
+    ranks died on their first kernel launch. Both halves matter: the flags
+    make the binary fat, the arch-aware NAME stops a stale single-arch build
+    directory from being reused. The seam is now vendor-aware
+    (gfx900 merge): same invariants, keyed per (vendor, arches).
     """
     import torch.utils.cpp_extension as cpp_extension
 
     module = _load_standalone("htccl_device")
     module._ext = None
-    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.6;12.0")
+    monkeypatch.setattr(
+        module, "_resolve_build_arches",
+        lambda cpu_group: {"cuda": ["8.6", "12.0"]},
+    )
+    monkeypatch.setattr(module, "_local_vendor", lambda: "cuda")
 
     captured = {}
 
@@ -303,59 +305,59 @@ def test_device_extension_builds_for_every_arch_and_keys_the_cache_by_it(
     module._load_ext(cpu_group=None)
 
     name = captured["name"]
+    assert "cuda" in name, f"{name!r} does not encode the vendor"
     assert "86" in name and "120" in name, (
         f"extension name {name!r} does not encode the architecture set -- a "
         "cached single-arch .so from an earlier run would be reused"
     )
-
     flags = " ".join(captured.get("extra_cuda_cflags") or [])
     for sm in ("86", "120"):
         assert f"code=sm_{sm}" in flags, (
-            f"no SASS requested for sm_{sm}; flags were {flags!r}. The rank "
-            f"on that card would die on its first kernel launch."
+            f"no SASS requested for sm_{sm}; flags were {flags!r}"
         )
 
 
-def test_device_extension_arch_set_is_the_union_over_the_group(monkeypatch):
-    """A rank must build for the WHOLE group, not just its own visible card.
+def test_device_extension_arch_union_keeps_vendors_separate(monkeypatch):
+    """The group union is per (vendor, arch) pairs, never bare capabilities.
 
-    With per-rank GPU isolation `torch.cuda.device_count()` is 1, so torch's
-    own inference can never see the node's mix. The union is gathered over
-    the process group, which also makes the value -- and therefore the cache
-    key -- identical on every rank.
+    Two invariants in one: (a) a rank that sees only its own card still
+    builds for the WHOLE group's arches of its vendor (the mixed-NVIDIA
+    case); (b) '9.0' from a Hopper rank and gfx900 from a Vega rank must
+    never merge -- the numeric namespaces collide, which is the third
+    instance of the (9,0) collision the vendor-aware key exists for.
     """
     module = _load_standalone("htccl_device")
-    monkeypatch.delenv("TORCH_CUDA_ARCH_LIST", raising=False)
 
-    fake_torch = types.SimpleNamespace(
-        cuda=types.SimpleNamespace(
-            get_arch_list=lambda: ["sm_86", "sm_90", "sm_120"],
-            device_count=lambda: 1,
-            get_device_capability=lambda i: (8, 6),  # this rank sees a 3080
-        )
-    )
-    monkeypatch.setattr(module, "torch", fake_torch)
+    monkeypatch.setattr(module, "_local_vendor", lambda: "cuda")
+    monkeypatch.setattr(module, "_local_arches", lambda vendor: ["8.6"])
 
     def fake_all_gather_object(out_list, obj, group=None):
-        # rank 0 = sm_86 (this process), rank 1 = sm_120 (the 5090)
-        out_list[0] = obj
-        out_list[1] = ["12.0"]
+        out_list[0] = obj                       # this rank: cuda 8.6
+        out_list[1] = [("cuda", "12.0")]        # the 5090 rank
+        out_list[2] = [("hip", "gfx900")]       # a Vega rank
 
     monkeypatch.setattr(
-        torch.distributed, "get_world_size", lambda group: 2, raising=False
+        torch.distributed, "get_world_size", lambda group: 3, raising=False
     )
     monkeypatch.setattr(
-        torch.distributed,
-        "all_gather_object",
-        fake_all_gather_object,
+        torch.distributed, "all_gather_object", fake_all_gather_object,
         raising=False,
     )
 
-    arches = module._resolve_build_arches(cpu_group=None)
-    assert arches == ["8.6", "12.0"], (
-        f"got {arches}: a rank that only builds for its own visible card "
-        "reproduces the mixed-arch crash"
+    by_vendor = module._resolve_build_arches(cpu_group=None)
+    assert by_vendor.get("cuda") == ["8.6", "12.0"], (
+        f"got {by_vendor}: a rank must build for the whole group's arches "
+        "of its vendor"
     )
+    assert by_vendor.get("hip") == ["gfx900"], by_vendor
+    # the collision case: no flat set may ever mix the two namespaces
+    assert "gfx900" not in by_vendor.get("cuda", []), by_vendor
+
+    # per-vendor flags stay in their own compiler's namespace
+    nv = " ".join(module._build_flags("cuda", ["8.6", "12.0"]))
+    amd = " ".join(module._build_flags("hip", ["gfx900"]))
+    assert "-gencode" in nv and "--offload-arch" not in nv
+    assert "--offload-arch=gfx900" in amd and "-gencode" not in amd
 
 
 # --------------------------------------------------------------------------
