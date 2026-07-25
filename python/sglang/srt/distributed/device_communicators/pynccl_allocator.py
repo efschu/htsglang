@@ -6,12 +6,36 @@ import traceback
 from contextlib import nullcontext
 
 import torch
-from torch.cuda.memory import (
-    CUDAPluggableAllocator,
-    _cuda_beginAllocateCurrentThreadToPool,
-    _cuda_endAllocateToPool,
-    _cuda_releasePool,
-)
+
+# These are PRIVATE torch symbols and they do not exist in every torch a rank
+# may legitimately run. Concretely: gfx900 (Vega) tops out at torch 2.7.1+rocm6.3
+# (ROCm 6.4 dropped the gfx900 Tensile kernels), and
+# `_cuda_beginAllocateCurrentThreadToPool` was added after that. An unguarded
+# import here therefore takes down the ENTIRE core forward path on such a rank:
+# it is reached from layers.activation via
+#   quantization.utils -> fp8_kernel -> deep_gemm_wrapper -> compile_utils.
+#
+# Guarding is safe because these symbols are only ever CALLED inside
+# SymmetricMemoryContext.__enter__/__exit__, and use_symmetric_memory() returns
+# nullcontext() unless --enable-symm-mem is on. Symmetric memory is a
+# NCCL-specific optimisation and is meaningless on a rank that is not running
+# NCCL at all. is_symmetric_memory_enabled() below additionally hard-refuses
+# when the APIs are absent, so the context can never be constructed without them.
+try:
+    from torch.cuda.memory import (
+        CUDAPluggableAllocator,
+        _cuda_beginAllocateCurrentThreadToPool,
+        _cuda_endAllocateToPool,
+        _cuda_releasePool,
+    )
+
+    _HAS_SYMM_MEM_APIS = True
+except ImportError:
+    _HAS_SYMM_MEM_APIS = False
+    CUDAPluggableAllocator = None
+    _cuda_beginAllocateCurrentThreadToPool = None
+    _cuda_endAllocateToPool = None
+    _cuda_releasePool = None
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
@@ -158,6 +182,11 @@ _register_func = None
 
 
 def is_symmetric_memory_enabled():
+    # Hard gate: without the private torch memory-pool APIs the symmetric-memory
+    # path cannot run at all, so refuse it here rather than letting
+    # SymmetricMemoryContext be constructed and fail on a None symbol later.
+    if not _HAS_SYMM_MEM_APIS:
+        return False
     try:
         return get_server_args().enable_symm_mem
     except ValueError:

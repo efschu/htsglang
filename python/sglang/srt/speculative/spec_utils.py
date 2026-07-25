@@ -74,7 +74,14 @@ if TYPE_CHECKING:
 if _is_cuda:
     from sgl_kernel import fast_topk
 elif _is_hip:
-    from sgl_kernel import fast_topk
+    # sgl-kernel has no gfx900 build, and this module is reached from
+    # triton_backend, so an unguarded import blocks the attention backend on
+    # such a rank. The pure-torch replacement is already written and is what
+    # every other platform uses -- fall through to it rather than failing.
+    try:
+        from sgl_kernel import fast_topk
+    except ImportError:
+        from sglang.srt.utils.common import fast_topk
 else:
     from sglang.srt.utils.common import fast_topk
 
