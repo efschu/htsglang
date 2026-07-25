@@ -313,3 +313,70 @@ This host is pure NVIDIA, so the **mechanism** is fully verified here —
 GPU-side rendezvous over mapped host memory, under CUDA graphs, numerically
 correct against ground truth. The **cross-vendor** claim is NOT verified here
 and rests on the hipify-1:1 construct choice; it needs the second host.
+
+
+## Second-host reports — resolved
+
+### The HTCCL x DCP garbage is defect 1, on a branch that predates its fix
+
+The second host saw garbage with `--dcp-size 2`, two ranks on one 2080 Ti, one
+venv, no vendor mix — and my arms E/G are green with HTCCL. One of the two
+observations had to be describing the pushed branch wrongly. Neither was: they
+describe **different branches**.
+
+```
+$ git show feat/htccl-port:.../htccl.py   # what the second host tested
+    def _get_out_buf(self, ref):
+        key = (tuple(ref.shape), ref.dtype)
+        buf = self._out_pool.get(key)        # <-- defect 1, verbatim
+$ git branch --contains 452e46ed3e          # the fix
+    * integration/r3-probe                   # ...and nowhere else
+```
+
+`feat/htccl-port` still carries the pooled per-(shape, dtype) output buffer.
+The fix landed on `integration/r3-probe` BEFORE that branch was merged in, so
+the branch itself never received it.
+
+This explains every detail of the report without any DCP hypothesis:
+* garbage on **gloo/shm** but device untestable there (`cusparse.h` missing) —
+  and gloo/shm are exactly the two transports that route through
+  `_get_out_buf`; the device transport never calls it;
+* no vendor mix, one GPU, one venv — correct, defect 1 has nothing to do with
+  vendors or interconnects;
+* `all_gather` byte-exact on gloo and shm — correct, the defect is in
+  `all_reduce`'s **output buffer**, not in all_gather;
+* decode rather than extend — the aliasing needs two same-shape all_reduce
+  results live at once, which is the decode pattern.
+
+**Action for the second host: re-test on `integration/r3-probe`, or cherry-pick
+`452e46ed3e`.** No DCP defect is implied, and none was found.
+
+### reduce_scatter scattered the wrong axis (real, silent, now fixed)
+
+`moved = reduced.movedim(0, dim)` moves axis 0 TO position `dim`; it does not
+bring axis `dim` to the front. The two coincide only for `dim` in {0, 1}, so
+from `dim >= 2` the original axis 1 stayed in front and the scatter sliced
+THAT — while every shape assertion still passed:
+
+```
+shape (4,6,2)   dim=2 -> sliced 6, needed 2
+shape (2,4,6,2) dim=3 -> sliced 4, needed 2
+```
+
+The signature defaults to `dim=-1`, so a bare `reduce_scatter(x)` on ndim >= 3
+distributed the wrong axis **silently**. 2-D is accidentally correct, which is
+why it survived. `reduce_scatter_tensor` passes `dim=0` and was never affected.
+
+Fixed in BOTH transports (`htccl.py` and `htccl_device.py` carried identical
+code). Pinned by `test_reduce_scatter_slices_the_requested_axis`, a
+known-answer test on VALUES: distinct value per position, world sizes 2/3/4,
+dims 0/1/2/3/-1, every rank, compared against an independently computed
+reference. RED on the old axis:
+
+```
+AssertionError: world=2 shape=(4, 6, 2) dim=2 rank=0: shape (2, 4, 3) != (4, 6, 1)
+```
+
+Re-validated after the fix: 3-rank ground-truth probe green on **all three**
+transports (gloo, shm, device); arm E green under CUDA graphs (health 200,
+0 crash markers, accept 3.45/2.75/3.33, unchanged).

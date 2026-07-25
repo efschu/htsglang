@@ -658,3 +658,67 @@ def test_cpu_transports_are_rejected_while_cuda_graphs_are_on():
             ps._enforce_cpu_transport_needs_eager(transport)
     finally:
         rc.get_server_args = orig
+
+
+def _reduce_scatter_reference(total, world, rank, dim):
+    """What reduce_scatter must return: sum over ranks, then this rank's slice
+    ALONG `dim` -- computed independently of the implementation."""
+    chunk = total.shape[dim] // world
+    return total.narrow(dim, rank * chunk, chunk)
+
+
+def test_reduce_scatter_slices_the_requested_axis():
+    """KNOWN-ANSWER test on VALUES, not shapes.
+
+    `movedim(0, dim)` moves axis 0 TO position dim; it does not bring axis dim
+    to the front. The two coincide only for dim in {0, 1}, so from dim >= 2 the
+    old code left the ORIGINAL axis 1 in front and scattered THAT, while every
+    shape assertion still passed. The signature defaults to dim=-1, so a bare
+    reduce_scatter(x) on ndim >= 3 silently distributed the wrong axis.
+    2-D is accidentally correct, which is why it survived.
+
+    Elements are encoded so that any transposition or wrong-axis slice shows up
+    as a value mismatch, not merely a shape mismatch.
+    """
+    module = _load_standalone("htccl")
+
+    for world in (2, 3, 4):
+        for shape, dim in (
+            ((4, 6, 2), 2),
+            ((2, 4, 6, 2), 3),
+            ((6, 4, 2), 0),
+            ((4, 6, 2), 1),
+            ((12, 5), -1),
+            ((12, 5), 0),
+        ):
+            ndim = len(shape)
+            d = dim % ndim
+            if shape[d] % world:
+                continue
+            # distinct value per position: no transposition can survive this
+            total = torch.arange(1, 1 + torch.tensor(shape).prod().item(),
+                                 dtype=torch.float32).reshape(shape)
+
+            for rank in range(world):
+                comm = object.__new__(module.HTCCLCommunicator)
+                comm.disabled = False
+                comm.world_size = world
+                comm.rank = rank
+                comm.transport = None  # force the inline path; axis logic under test
+                # all_reduce is not under test here: hand back the summed
+                # tensor directly so the axis logic is isolated.
+                comm.all_reduce = lambda x, _t=total: _t.clone()
+
+                got = module.HTCCLCommunicator.reduce_scatter(
+                    comm, total.clone(), dim
+                )
+                want = _reduce_scatter_reference(total, world, rank, d)
+                assert got.shape == want.shape, (
+                    f"world={world} shape={shape} dim={dim} rank={rank}: "
+                    f"shape {tuple(got.shape)} != {tuple(want.shape)}"
+                )
+                assert torch.equal(got, want), (
+                    f"world={world} shape={shape} dim={dim} rank={rank}: "
+                    f"reduce_scatter returned the wrong AXIS's data "
+                    f"(shape matched, values did not)"
+                )

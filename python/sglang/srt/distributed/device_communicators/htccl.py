@@ -330,7 +330,15 @@ class HTCCLCommunicator:
         # code stays trivially correct. Axis handling mirrors the base
         # communicator's reduce_scatter exactly.
         reduced = self.all_reduce(input_)
-        moved = reduced.movedim(0, dim).contiguous()
+        # movedim(dim, 0) -- NOT movedim(0, dim). The two agree only for dim
+        # in {0, 1}; from dim >= 2 they differ, and the old form left the
+        # ORIGINAL axis 1 in front, so the scatter sliced the wrong axis while
+        # every shape check still passed. Measured: shape (4,6,2) dim=2 sliced
+        # 6 instead of 2; (2,4,6,2) dim=3 sliced 4 instead of 2. The signature
+        # defaults to dim=-1, so a bare reduce_scatter(x) on ndim >= 3
+        # scattered the wrong axis SILENTLY. 2-D happened to be correct, which
+        # is why it survived.
+        moved = reduced.movedim(dim, 0).contiguous()
         assert moved.shape[0] % self.world_size == 0
         chunk = moved.shape[0] // self.world_size
         shard = moved[self.rank * chunk : (self.rank + 1) * chunk]
