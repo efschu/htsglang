@@ -254,6 +254,29 @@ def load_jit(
 
     from tvm_ffi.cpp import load, load_inline
 
+    # Tell tvm_ffi which toolchain to use INSTEAD of letting it guess from the
+    # filesystem.
+    #
+    # tvm_ffi._detect_gpu_backend() decides like this:
+    #     try:  _find_rocm_home();  return "hip"
+    #     except RuntimeError:      return "cuda"
+    # and _find_rocm_home() falls back to "/opt/rocm" whenever that directory
+    # merely EXISTS. So on any machine with ROCm installed it returns "hip" for
+    # EVERY process -- including a CUDA one. Observed on the cross-vendor host:
+    # a CUDA venv (torch.version.cuda=13.0, torch.version.hip=None) driving an
+    # RTX 2080 Ti tried to build with
+    #     /opt/rocm/bin/hipcc --offload-arch=gfx900 --offload-arch=gfx90c
+    #     -DSGL_CUDA_ARCH=750
+    # i.e. the AMD compiler, AMD arch flags and an NVIDIA arch macro at once.
+    #
+    # This is not exotic: a vendor-mixed host has BOTH runtimes installed by
+    # construction, so filesystem probing is guaranteed to be wrong for one of
+    # them. The process's own torch build is the only authority on which
+    # toolchain it needs, and `backend=` is tvm_ffi's supported way to say so
+    # (an explicit parameter, not an environment trick -- environment guessing
+    # is what caused this).
+    _backend = "hip" if is_hip_runtime() else "cuda"
+
     cpp_files = cpp_files or []
     cuda_files = cuda_files or []
     extra_cflags = extra_cflags or []
@@ -313,6 +336,7 @@ def load_jit(
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,
+                backend=_backend,
             )
     else:
         assert cpp_wrappers is None and cuda_wrappers is None
@@ -325,6 +349,7 @@ def load_jit(
                 extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+                backend=_backend,
                 build_directory=build_directory,
             )
 
