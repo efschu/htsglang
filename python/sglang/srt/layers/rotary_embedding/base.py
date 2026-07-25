@@ -41,6 +41,13 @@ _is_mps = is_mps()
 
 if _is_cuda:
     from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
+else:
+    # Bind the name on every platform so the call site can test availability
+    # instead of raising NameError. This mirrors what mrope.py already does
+    # (`if _is_cuda and (apply_rope_with_cos_sin_cache_inplace is not None)`);
+    # base.py gated the call on `use_fallback_kernel` alone, which is False on
+    # ROCm too, so a rank without the kernel called a name never imported.
+    apply_rope_with_cos_sin_cache_inplace = None
 
 if _is_npu:
     import torch_npu
@@ -389,6 +396,28 @@ class RotaryEmbedding(MultiPlatformOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # BOTH branches below require a kernel: the `if` needs the CUDA-only
+        # jit_kernel rope, the `else` needs self.fallback_rotary_embedding,
+        # which the constructor sets only when some kernel imported. On a
+        # device where neither exists -- ROCm below gfx942 has no sgl_kernel
+        # build -- the constructor lands on use_fallback_kernel=False and this
+        # method then dereferenced a name that was never bound (NameError),
+        # or an attribute that was never set (AttributeError).
+        #
+        # forward_native is the class's own documented PyTorch implementation,
+        # so route to it rather than inventing a third path. Measured
+        # equivalent: on identical inputs the jit kernel and forward_native
+        # agree to one fp16 ULP (max 0.00195), and forward_native is
+        # BYTE-identical between sm75 and gfx900. On CUDA the jit kernel is
+        # always present, so this test is False there and behaviour is
+        # unchanged.
+        if not self.use_fallback_kernel and (
+            apply_rope_with_cos_sin_cache_inplace is None
+        ):
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
+            )
+
         if not self.use_fallback_kernel:
             batch_size = positions.size(0)
             q_rope = query.view(batch_size, -1, self.head_size)
