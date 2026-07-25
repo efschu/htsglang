@@ -790,7 +790,28 @@ def attn_kv_replicated(tp_size: int, total_num_kv_heads: int) -> bool:
     the REPLICATED-KV geometry under the installed uneven-TP plan: fewer kv
     heads than ranks, so the whole-kv-head-unit split cannot give every rank
     a kv head. False on the default path (no plan) and whenever kv >= tp
-    (the normal uneven unit split handles kv % tp != 0 fine)."""
+    (the normal uneven unit split handles kv % tp != 0 fine).
+
+    kv == tp is deliberately EXCLUDED, and a `<` -> `<=` flip was tried and
+    REVERTED on measurement -- do not repeat it. At kv == tp the kv-boundary
+    alignment has groups == ranks, so the only non-straddling q split is the
+    even one (`_partition_units_kv_aligned` returns the raw split at
+    `groups >= n`, and the #105 uniform-GQA ragged kernel then rejects any
+    straddling split at the FIRST FORWARD). Measured on Qwen3.5-2B
+    (q=8/kv=2, TP=2, --rank-tp-ratio 11,21):
+
+      * with `<=`: REPLICATED-KV engaged, q split [2, 6], KV cache
+        duplicated per rank, boot green -- then
+        "ValueError: REPLICATED-KV current-chunk attention (#105): ...
+        q heads (offset 2, 6 heads over 2 local kv slots) straddle a global
+        kv-head boundary" on the first request. Strictly worse.
+      * with `<` (this code): normal mode, even [4, 4] attention split, the
+        non-uniform plan applied to every OTHER dimension, output coherent
+        and token-identical to TP=1, no KV duplication.
+
+    Truly uneven attention at kv == tp needs a ragged kernel that supports
+    per-rank non-uniform GQA mapping (the #169 head-gather family), not a
+    threshold flip."""
     return tp_plan_active(tp_size) and total_num_kv_heads < tp_size
 
 

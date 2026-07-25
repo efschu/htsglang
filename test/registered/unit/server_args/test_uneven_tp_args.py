@@ -801,6 +801,7 @@ def test_uneven_tp_is_rejected_on_models_whose_attention_is_not_aware():
     from sglang.srt.models.qwen3 import _reject_uneven_tp_unaware_attention
 
     saved = du.get_tp_partition_ratios
+    saved_active = du.tp_plan_active
 
     try:
         # non-uniform plan -> reject, naming the numbers and a way out
@@ -821,6 +822,56 @@ def test_uneven_tp_is_rejected_on_models_whose_attention_is_not_aware():
         du.get_tp_partition_ratios = lambda family=None: None
         _reject_uneven_tp_unaware_attention("Qwen3", 2)
     finally:
+        # exact restore, NOT importlib.reload: reloading swaps the module
+        # object underneath every other module that imported from it and
+        # poisons later tests in the same process (observed as a
+        # test_uneven_tp_memory failure that vanishes in isolation)
         du.get_tp_partition_ratios = saved
-        import importlib
-        importlib.reload(du)
+        du.tp_plan_active = saved_active
+
+
+def test_kv_eq_tp_stays_in_normal_mode_by_measurement():
+    """kv == tp is deliberately NOT replicated -- a `<` -> `<=` flip was tried
+    and REVERTED on measurement. Pin both the behavior and the reason.
+
+    At kv == tp the kv-boundary alignment has groups == ranks, so the only
+    non-straddling q split is the even one; `_partition_units_kv_aligned`
+    falls back to the raw split at `groups >= n`, and the #105 uniform-GQA
+    ragged kernel rejects a straddling split at the FIRST FORWARD. Measured
+    on Qwen3.5-2B (q=8/kv=2, TP=2, ratio 11,21): the flip produced a green
+    boot, duplicated KV, q split [2, 6] -- and a ValueError on the first
+    request. The `<` semantics on the same config ran coherent,
+    token-identical to TP=1, with the plan applied to every other dimension.
+    """
+    import sglang.srt.distributed.utils as du
+
+    saved_active = du.tp_plan_active
+    try:
+        du.tp_plan_active = lambda tp_size, family=None: True
+
+        # kv == tp: NORMAL mode (not replicated), even attention by geometry
+        assert not du.attn_kv_replicated(2, 2)
+        # kv < tp: replicated, unchanged
+        assert du.attn_kv_replicated(4, 2)
+        # kv > tp: normal, unchanged
+        assert not du.attn_kv_replicated(2, 8)
+
+        # WHY the flip cannot work at kv == tp: groups == ranks makes the
+        # aligned partitioner fall back to the raw (straddling) split --
+        # the exact split the #105 kernel then rejects at runtime.
+        assert du._partition_units_kv_aligned(4, [11, 21], 2) == [1, 3], (
+            "at groups == ranks the aligned partitioner returns the raw "
+            "split; if this changed, re-evaluate the kv == tp decision"
+        )
+
+        # ...while at ranks > groups the repair engages and the o_proj input
+        # follows the head-true units (the second-host numbers, kv < tp):
+        sizes = du.partition_sizes(896, [11, 21], units=7)
+        assert sizes == [256, 640], sizes  # head-true, NOT the raw 308/588
+
+        # default path: no plan -> never replicated
+        du.tp_plan_active = lambda tp_size, family=None: False
+        assert not du.attn_kv_replicated(2, 2)
+        assert not du.attn_kv_replicated(4, 2)
+    finally:
+        du.tp_plan_active = saved_active

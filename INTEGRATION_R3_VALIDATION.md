@@ -529,3 +529,69 @@ four measured cases.
 4. Secondary observation: 27B + triton + uneven-DCP wedged at boot in triton
    `_init_handles` on all three ranks (0% CPU, 14+ min) -- possibly
    multi-rank JIT cache-lock contention; not pursued.
+
+
+## The kv == tp replication flip (`<` -> `<=`) — TRIED, MEASURED, REVERTED
+
+Commissioned as: flip `attn_kv_replicated`'s strict `<` so kv == tp enters
+REPLICATED-KV mode, making a non-uniform plan expressible on attention, fixed
+together with the o_proj unit coupling. The flip is one character and its
+gating is already structural (`tp_plan_active` is inside the predicate, the
+default path can never see it). It was implemented, tested red/green on CPU,
+and validated on GPU — and the GPU measurement REFUTED it.
+
+### What the flip actually does at kv == tp (Qwen3.5-2B, q=8/kv=2, TP=2, ratio 11,21)
+
+Boot: green. `REPLICATED-KV geometry active ... all kv heads on every rank,
+q heads split [2, 6]` — the uneven expression works, o_proj follows the units
+(no shape error). KV cache duplicated per rank. Then the FIRST request:
+
+```
+ValueError: REPLICATED-KV current-chunk attention (#105): this rank's q heads
+(offset 2, 6 heads over 2 local kv slots) straddle a global kv-head boundary
+(global GQA group size 4); the uniform-GQA ragged kernel cannot represent
+this split.
+```
+
+### Why this is geometric, not a tuning problem
+
+The #116 alignment machinery exists precisely to snap uneven q splits to
+kv-group boundaries — but its repair requires ranks > groups (each rank must
+fit inside one kv group). At kv == tp, groups == ranks ALWAYS, so
+`_partition_units_kv_aligned` falls back to the raw split (`groups >= n`
+bail-out), the raw split straddles for every non-uniform ratio, and the only
+aligned split is the even one. The flip therefore buys: duplicated KV + a
+boot that dies on the first forward. For the second-host qwen05b geometry
+(q=14/kv=2) it is worse still: units % groups != 0, alignment impossible by
+the partitioner's own docstring.
+
+### What the `<` semantics deliver on the same config (measured)
+
+Normal mode: attention splits even ([4, 4] — geometrically forced), the
+non-uniform plan applies to every other dimension, output coherent and
+TOKEN-IDENTICAL to the TP=1 reference, no crash, no KV duplication. On the
+aware model class the o_proj unit coupling already holds (it booted and ran
+[11,21] with no shape error).
+
+### Consequences
+
+* `<` stays, now with the measured rationale in the docstring and a test that
+  pins both the behavior and the geometric reason
+  (`test_kv_eq_tp_stays_in_normal_mode_by_measurement`), including the
+  `[256, 640]` head-true o_proj arithmetic for the kv < tp case where the
+  repair DOES engage.
+* Truly uneven ATTENTION at kv == tp requires a ragged kernel that supports
+  per-rank non-uniform GQA mapping — the #169 head-gather family, not a
+  threshold flip.
+* For the second host: kv == tp + non-uniform ratio on an AWARE model class
+  is usable TODAY (even attention, ratio elsewhere); their qwen05b needs its
+  model class made plan-aware first (it is qwen2-class, which the
+  construction guard now rejects instead of letting o_proj crash).
+
+### Side finding (pre-existing, named): order-dependent test pollution
+
+`test/registered/unit/server_args/test_server_args.py` poisons
+`test/registered/unit/distributed/test_uneven_tp_memory.py::test_fractions_survive_pickling`
+when both run in one process (fails in the pair, passes alone). Present at
+the pushed HEAD without any of this session's changes; bisected to the file
+level. Not fixed here.
