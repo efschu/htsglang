@@ -99,10 +99,45 @@ def test_modules_expose_expected_api():
     assert hasattr(_load_standalone("htccl_device"), "HTCCLDeviceTransport")
 
 
-def test_communicator_implements_the_four_collectives():
+def test_communicator_implements_the_supported_collectives():
     comm = _load_standalone("htccl").HTCCLCommunicator
-    for op in ("all_reduce", "all_gather", "reduce_scatter", "broadcast", "close"):
+    for op in (
+        "all_reduce",
+        "all_gather",
+        "all_gather_into_tensor",
+        "reduce_scatter",
+        "reduce_scatter_tensor",
+        "broadcast",
+        "close",
+    ):
         assert callable(getattr(comm, op, None)), f"missing {op}"
+
+
+def test_out_parameter_forms_add_no_new_collective():
+    """The out-parameter forms must be compositions of the existing ops.
+
+    A new collective would need its own rank-uniformity argument; composing
+    keeps the existing one intact. Assert they only call sibling methods and
+    never torch.distributed directly.
+    """
+    src = (_COMM_DIR / "htccl.py").read_text()
+    tree = ast.parse(src)
+    cls = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.ClassDef) and n.name == "HTCCLCommunicator"
+    )
+    for name in ("all_gather_into_tensor", "reduce_scatter_tensor"):
+        fn = next(
+            n
+            for n in cls.body
+            if isinstance(n, ast.FunctionDef) and n.name == name
+        )
+        body = ast.unparse(fn)
+        assert "dist." not in body, (
+            f"{name} calls torch.distributed directly; it must compose the "
+            "existing HTCCL collectives instead"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -232,7 +267,10 @@ def test_dispatch_seams_are_all_none_guarded():
     lines = src.splitlines()
 
     def _is_none_guard(test):
-        """Match `self.htccl_comm is not None` and the getattr variant."""
+        """Match `self.htccl_comm is not None`, including as one operand of a
+        boolean condition (`htccl_comm is not None or pynccl is None ...`)."""
+        if isinstance(test, ast.BoolOp):
+            return any(_is_none_guard(v) for v in test.values)
         if not isinstance(test, ast.Compare) or not isinstance(
             test.ops[0], ast.IsNot
         ):
@@ -244,7 +282,9 @@ def test_dispatch_seams_are_all_none_guarded():
     guarded_lines = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.If) and _is_none_guard(node.test):
-            guarded_lines.add(node.test.lineno)
+            for sub in ast.walk(node.test):
+                if hasattr(sub, "lineno"):
+                    guarded_lines.add(sub.lineno)
             for stmt in node.body:
                 for sub in ast.walk(stmt):
                     if hasattr(sub, "lineno"):
@@ -265,16 +305,73 @@ def test_dispatch_seams_are_all_none_guarded():
         )
 
 
-def test_seams_cover_the_four_collectives():
+def test_seams_cover_every_supported_collective():
     """Guard against a seam silently disappearing in a rebase."""
     src = _PARALLEL_STATE.read_text()
     for op in (
         "self.htccl_comm.all_reduce(",
         "self.htccl_comm.reduce_scatter(",
+        "self.htccl_comm.reduce_scatter_tensor(",
         "self.htccl_comm.all_gather(",
+        "self.htccl_comm.all_gather_into_tensor(",
         "self.htccl_comm.broadcast(",
     ):
         assert op in src, f"dispatch seam missing: {op}"
+
+
+# --------------------------------------------------------------------------
+# 6. unsupported collectives fail fast rather than reaching NCCL
+# --------------------------------------------------------------------------
+
+# On a mixed-vendor group a collective that reaches NCCL does not run slowly,
+# it deadlocks -- NCCL and RCCL cannot form a joint communicator. Every
+# collective HTCCL does not implement must therefore raise immediately.
+_MUST_FAIL_FAST = (
+    "reduce_scatterv",
+    "all_gatherv",
+    "reduce_scatter(output, input_list)",
+    "all_gather(output_tensor_list=...)",
+)
+
+
+def test_unsupported_collectives_are_guarded():
+    src = _PARALLEL_STATE.read_text()
+    for op in _MUST_FAIL_FAST:
+        assert f'self._htccl_unsupported("{op}")' in src, (
+            f"{op} has no HTCCL fail-fast guard -- under SGLANG_HTCCL it "
+            "would silently fall through to NCCL and hang"
+        )
+
+
+def test_fail_fast_helper_raises_and_names_the_op():
+    """The message must name the op; a bare exception minutes into a run is
+    what this guard exists to avoid."""
+    tree = ast.parse(_PARALLEL_STATE.read_text())
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_htccl_unsupported"
+    )
+    body = ast.unparse(fn)
+    assert "raise NotImplementedError" in body
+    assert "{op!r}" in body, "the error message must interpolate the op name"
+
+
+def test_async_allgather_does_not_bypass_htccl():
+    """cp_all_gather_into_tensor_async has a pynccl fast path; under HTCCL it
+    must route to the HTCCL-aware synchronous form."""
+    tree = ast.parse(_PARALLEL_STATE.read_text())
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef)
+        and n.name == "cp_all_gather_into_tensor_async"
+    )
+    body = ast.unparse(fn)
+    assert "self.htccl_comm is not None" in body, (
+        "cp_all_gather_into_tensor_async would take the pynccl path while "
+        "HTCCL is active"
+    )
 
 
 def test_construction_is_flag_gated():

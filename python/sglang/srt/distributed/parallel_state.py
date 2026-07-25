@@ -888,7 +888,32 @@ class GroupCoordinator:
             )
         return output
 
+    def _htccl_unsupported(self, op: str) -> None:
+        """Fail fast on a collective HTCCL does not implement.
+
+        On a mixed-vendor group there is no NCCL fallback to silently take:
+        NCCL and RCCL cannot form a joint communicator, so letting the call
+        through does not degrade performance, it deadlocks (or asserts deep
+        inside pynccl). Raising here names the op and the caller instead of
+        surfacing as a hang minutes later.
+
+        Rank-uniform by construction: all ranks issue the same collective
+        sequence (SPMD), so every rank raises on the same call.
+        """
+        raise NotImplementedError(
+            f"HTCCL does not implement {op!r}. SGLANG_HTCCL routes TP "
+            f"collectives over the vendor-neutral host-staged path, which "
+            f"currently covers all_reduce, all_gather(_into_tensor), "
+            f"reduce_scatter(_tensor) and broadcast. {op!r} would fall back "
+            f"to NCCL, which cannot span a mixed-vendor group -- that is a "
+            f"deadlock, not a slowdown. Either avoid the feature that calls "
+            f"{op!r} (uneven/variable-size collectives are the usual "
+            f"source) or extend HTCCLCommunicator."
+        )
+
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if self.htccl_comm is not None:
+            return self.htccl_comm.reduce_scatter_tensor(output, input)
         if _is_npu:
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
@@ -957,6 +982,8 @@ class GroupCoordinator:
         output: torch.Tensor,
         input_list: List[torch.Tensor],
     ) -> None:
+        if self.htccl_comm is not None:
+            self._htccl_unsupported("reduce_scatter(output, input_list)")
         # TODO(ch-wan): support other backends
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
         return output
@@ -967,6 +994,8 @@ class GroupCoordinator:
         output: Optional[torch.Tensor] = None,
         sizes: Optional[List[int]] = None,
     ) -> torch.Tensor:
+        if self.htccl_comm is not None:
+            self._htccl_unsupported("reduce_scatterv")
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
@@ -1061,6 +1090,8 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if self.htccl_comm is not None:
+            return self.htccl_comm.all_gather_into_tensor(output, input)
         if _is_npu:
             self._all_gather_into_tensor(output, input)
         else:
@@ -1080,7 +1111,11 @@ class GroupCoordinator:
         The specific implementation uses the interface provided by pynccl to remove the synchronization logic of events.
         """
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is None or pynccl_comm.disabled:
+        # Under HTCCL the pynccl fast path must not be taken even when a
+        # pynccl communicator happens to exist: route to the (HTCCL-aware)
+        # synchronous form instead. The async-stream optimization is a NCCL
+        # feature and has no host-staged equivalent.
+        if self.htccl_comm is not None or pynccl_comm is None or pynccl_comm.disabled:
             self.all_gather_into_tensor(output, input)
         else:
             pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
@@ -1105,6 +1140,8 @@ class GroupCoordinator:
                 return input_
 
         if output_tensor_list is not None:
+            if self.htccl_comm is not None:
+                self._htccl_unsupported("all_gather(output_tensor_list=...)")
             # TODO(ch-wan): support other backends
             return torch.distributed.all_gather(
                 output_tensor_list, input_, group=self.device_group
@@ -1178,6 +1215,8 @@ class GroupCoordinator:
             When given, NCCL writes the gathered result directly into it, avoiding an
             extra output allocation + caller-side copy.
         """
+        if self.htccl_comm is not None:
+            self._htccl_unsupported("all_gatherv")
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 

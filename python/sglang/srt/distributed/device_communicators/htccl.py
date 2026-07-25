@@ -273,6 +273,41 @@ class HTCCLCommunicator:
         shard = moved[self.rank * chunk : (self.rank + 1) * chunk]
         return shard.movedim(0, dim).contiguous()
 
+    # ------------------------------------------------------------------
+    # out-parameter forms
+    #
+    # sglang calls these directly (they are NOT reachable from the dim-based
+    # variants above), so leaving them out would silently route part of the
+    # traffic back to NCCL -- which on a mixed-vendor group is not a slow
+    # path but a hang. Both are pure compositions of the collectives above:
+    # they introduce NO new collective, which keeps the rank-uniformity
+    # argument unchanged.
+    # ------------------------------------------------------------------
+
+    def all_gather_into_tensor(
+        self, output: torch.Tensor, input_: torch.Tensor
+    ) -> None:
+        """`output[i*n:(i+1)*n] = input_` of rank i, matching
+        torch.distributed.all_gather_into_tensor."""
+        if self.disabled:
+            output.copy_(input_)
+            return
+        # dim=0 concatenation IS the [world, n]-flattened layout this API
+        # specifies, so no extra transposition is needed.
+        gathered = self.all_gather(input_, dim=0)
+        output.copy_(gathered.reshape(output.shape))
+
+    def reduce_scatter_tensor(
+        self, output: torch.Tensor, input_: torch.Tensor
+    ) -> None:
+        """Sum-reduce `input_` and scatter along dim 0 into `output`,
+        matching torch.distributed.reduce_scatter_tensor."""
+        if self.disabled:
+            output.copy_(input_)
+            return
+        shard = self.reduce_scatter(input_, dim=0)
+        output.copy_(shard.reshape(output.shape))
+
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         if self.disabled:
             return tensor
