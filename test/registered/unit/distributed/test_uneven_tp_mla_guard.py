@@ -1,3 +1,4 @@
+import pathlib
 """Fail-fast guard: the MLA DCP collectives have no uneven-TP variant.
 
 ``cp_lse_ag_out_rs_mla`` and ``all_gather_q_for_mla_decode`` both assume an
@@ -84,3 +85,50 @@ class TestUnevenTpMlaGuard(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_even_dcp_triton_requires_replicated_kv_heads_across_the_group():
+    """The even-DCP triton decode gathers the DCP group's q heads and attends
+    them against the LOCAL kv-head shard; the kernel remaps q->kv as
+    cur_head // (gathered_q // local_kv). Correct ONLY when every rank of the
+    group holds the same full kv-head set (tp // total_kv >= dcp_size).
+
+    Measured outside that geometry (Qwen2.5-1.5B, q12/kv2, TP=2/DCP=2): CJK
+    mojibake in an English greedy completion from the FIRST decode token, on
+    NCCL and HTCCL alike; the same model at TP=4/DCP=2 (replicas 2 >= 2) is
+    coherent, and a 1-token prompt still garbles -- so it is the head
+    geometry, not the token-ownership layout. This pins the boot-time guard
+    that converts that silent garbage into a startup error.
+    """
+    import re
+
+    import sglang.srt.layers.attention.triton_backend as tb
+
+    src = pathlib.Path(tb.__file__).read_text()
+    # the guard must sit in the constructor, gated on even DCP only
+    m = re.search(
+        r"if self\.dcp_size > 1 and not uneven_dcp_active\(self\.dcp_size\):"
+        r"[\s\S]{0,900}?raise ValueError",
+        src,
+    )
+    assert m, (
+        "the even-DCP kv-head replication guard is gone from "
+        "TritonAttnBackend.__init__; Qwen2/Qwen3-class models under "
+        "--attention-backend triton --dcp-size N would emit silent garbage "
+        "again"
+    )
+    body = m.group(0)
+    assert "get_total_num_kv_heads" in body
+    assert "dcp_size" in body
+
+    # arithmetic of the condition itself, on the measured cases
+    cases = [
+        # (attn_tp, total_kv, dcp, must_reject)
+        (2, 2, 2, True),    # Qwen2.5-1.5B TP=2/DCP=2 -> garbage, must reject
+        (2, 8, 2, True),    # Qwen3-0.6B                 -> garbage, must reject
+        (4, 2, 2, False),   # replicas 2 >= 2            -> measured coherent
+        (8, 4, 2, False),   # the path's origin geometry (Qwen3.5-397B)
+    ]
+    for attn_tp, kv, dcp, must_reject in cases:
+        replicas = attn_tp // kv if kv else 0
+        assert (replicas < dcp) == must_reject, (attn_tp, kv, dcp)

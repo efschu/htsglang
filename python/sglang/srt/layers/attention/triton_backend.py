@@ -300,6 +300,41 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size
         )
+        # DCP DECODE GEOMETRY GUARD. The even-DCP decode path below gathers
+        # the WHOLE DCP group's q heads (all_gather dim=1) and attends them
+        # against THIS RANK'S local KV-head shard; the kernel then remaps
+        # q-head -> kv-head as `cur_head // (gathered_q // local_kv)`. That is
+        # correct only when every rank of the DCP group holds the SAME, FULL
+        # kv-head set -- i.e. when kv heads are REPLICATED across the group:
+        # tp_size // total_kv_heads >= dcp_size (consecutive ranks share a kv
+        # head, and DCP groups are consecutive tp slices). That is the
+        # geometry of the path's origin (Qwen3.5-397B, TP=8/DCP=2, kv=4) and
+        # its only CI case.
+        #
+        # Outside it the output is SILENT GARBAGE from the first decode token:
+        # measured, Qwen2.5-1.5B (q12/kv2) TP=2/DCP=2 -> CJK mojibake in an
+        # English greedy completion, on NCCL and HTCCL alike, while the same
+        # model at TP=4/DCP=2 (replicas 2 >= 2) is coherent, and a 1-token
+        # prompt still garbles (so it is not the token-ownership layout; the
+        # write and read sides agree on tokens). The uneven-DCP path
+        # (weighted owner rule) has its own head handling and is exempt.
+        from sglang.srt.distributed.utils import uneven_dcp_active
+        if self.dcp_size > 1 and not uneven_dcp_active(self.dcp_size):
+            _total_kv = model_runner.model_config.get_total_num_kv_heads()
+            _attn_tp = get_parallel().attn_tp_size
+            _replicas = _attn_tp // _total_kv if _total_kv else 0
+            if _replicas < self.dcp_size:
+                raise ValueError(
+                    f"Triton attention with --dcp-size {self.dcp_size} "
+                    f"requires the kv heads to be replicated across each DCP "
+                    f"group: tp_size // total_kv_heads >= dcp_size, but "
+                    f"{_attn_tp} // {_total_kv} = {_replicas} < "
+                    f"{self.dcp_size}. Every rank would attend the gathered "
+                    f"q heads against a DIFFERENT kv-head shard and the "
+                    f"output is silently wrong from the first decode token. "
+                    f"Use --attention-backend flashinfer, raise tp so that "
+                    f"tp // kv_heads >= dcp_size, or drop --dcp-size."
+                )
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with
         # differing SWA/full v_head_dim need a second buffer for SWA layers.

@@ -443,3 +443,89 @@ The other **95** attention-output sites lacking `tp_units` are latent, not
 fixed: they belong to architectures this fork does not run with uneven TP, so
 they are unreachable today. They would need the same treatment (opt in, or be
 rejected) before uneven TP is offered on them.
+
+
+## Triton x DCP silent garbage — root-caused, guarded (second-host bug, reproduced here)
+
+### Isolation matrix (all on this rig, exact prompt `The capital of France is`, greedy)
+
+| model (class) | q/kv | backend | dcp | transport | result |
+|---|---|---|---|---|---|
+| Qwen2.5-1.5B (qwen2) | 12/2 | triton | 2 | HTCCL gloo, co-located | mojibake |
+| same | | flashinfer | 2 | same | coherent |
+| same | | triton | 2 | NCCL, 2 cards | mojibake |
+| same | | triton | none | NCCL | coherent |
+| Qwen3-0.6B (qwen3) | 16/8 | triton | 2 | NCCL | mojibake |
+| Qwen2.5-1.5B, PRE-merge tree | | triton | 2 | NCCL | mojibake, byte-identical |
+| Qwen3.5-2B (qwen3_5, hybrid) | 8/2 | triton | 2 | NCCL | coherent text |
+| Qwen2.5-1.5B | | triton | 2 (TP=4) | gloo | **coherent** |
+| Qwen2.5-1.5B, 1-token prompt | | triton | 2 (TP=2) | NCCL | **mojibake** |
+
+Transport exonerated; predates all of today's merges; not the kv==dcp edge.
+
+### Root cause (MECHANISM A, confirmed by both discriminators)
+
+The even-DCP triton decode all-gathers the WHOLE DCP group's q heads (dim=1,
+`triton_backend.py` decode) and attends them against THIS RANK'S local
+kv-head shard; the kernel remaps q->kv as `cur_head // (q.shape[1] //
+kv_head_num)` (`kernels/ops/attention/decode_attention.py:601,139`). That is
+correct ONLY when every rank of the DCP group holds the same full kv-head
+set, i.e. kv heads REPLICATED across the group: `tp // total_kv >= dcp_size`
+(consecutive ranks share a kv head; DCP groups are consecutive tp slices).
+That is exactly the geometry of the path's origin (upstream #25090,
+Qwen3.5-397B TP=8/DCP=2) and its only CI case.
+
+Discriminators, both as predicted:
+* TP=4/DCP=2 (replicas 2 >= 2), same model/backend/transport -> coherent.
+* 1-token prompt (any token-layout theory vacuous: one slot, one owner) ->
+  still mojibake. The write and read sides agree on tokens (same
+  position-mod owner rule and `loc // dcp_size` compaction on both).
+
+Why flashinfer looked healthy: under plain even DCP its DCP machinery is
+gated on `uneven_dcp` and never engages -- it silently runs stock full-KV
+attention (see below). Where it IS on, it all-gathers the kv heads to the
+full set before writing (`_dcp_write_gather`) -- precisely the step the
+triton path lacks.
+
+Why the hybrid class looked healthy: only 6/24 layers are full attention and
+the group-collapse keeps each rank's own heads on the right kv head; the text
+stays fluent. Formally it shares the defect class (peer partials attend the
+wrong head); nailing that down needs a dcp=1-vs-2 logprob comparison, left
+open.
+
+### Fix: boot-time geometry guard (reject, in both directions verified)
+
+`TritonAttnBackend.__init__` now rejects even-DCP when
+`tp // total_kv < dcp_size`, naming the numbers and the three ways out:
+
+```
+ValueError: Triton attention with --dcp-size 2 requires the kv heads to be
+replicated across each DCP group: tp_size // total_kv_heads >= dcp_size, but
+2 // 2 = 1 < 2. ...
+```
+
+* garbage config (TP=2/DCP=2, kv=2): now fails at startup with that message;
+* healthy geometry (TP=4/DCP=2, replicas 2): boots and serves coherently;
+* the fork's validated uneven-DCP path is exempt (`uneven_dcp_active`),
+  because its weighted machinery has its own head handling and its validated
+  geometry (27B, kv=8, tp=3) would fail the replication arithmetic.
+
+Test `test_even_dcp_triton_requires_replicated_kv_heads_across_the_group`
+pins the guard's presence, its gating, and the condition arithmetic on the
+four measured cases.
+
+### Residuals, stated
+
+1. **Uneven-DCP + dense class remains unguarded**: `SGLANG_UNEVEN_DCP=1` +
+   token vector + qwen2-class + triton also produced mojibake (measured).
+   The exemption cannot use the replication arithmetic (it would reject the
+   validated hybrid config), and a class-aware guard does not belong in the
+   backend. Requires the uneven path to be either fixed or class-gated --
+   open item.
+2. **flashinfer silently IGNORES plain even `--dcp-size N`** (machinery gated
+   on uneven only): the user asks for DCP and gets stock attention. Correct
+   output, but a silent no-op of an explicit flag -- open item.
+3. Hybrid-class formal correctness under even DCP (logprob check) -- open.
+4. Secondary observation: 27B + triton + uneven-DCP wedged at boot in triton
+   `_init_handles` on all three ranks (0% CPU, 14+ min) -- possibly
+   multi-rank JIT cache-lock contention; not pursued.
