@@ -82,15 +82,52 @@ def _load_standalone(name):
 
 
 def test_import_does_not_initialize_cuda():
-    assert not torch.cuda.is_initialized(), (
-        "precondition failed: something initialized CUDA before this test"
+    """Importing the HTCCL modules must create no CUDA context.
+
+    Runs in a FRESH interpreter on purpose. Asserting
+    ``not torch.cuda.is_initialized()`` in-process makes the result depend on
+    whatever else the pytest session imported first -- any earlier test in this
+    directory that touches CUDA turns this into a spurious red, and a test that
+    is only green when run alone is a test nobody can trust. A subprocess makes
+    the precondition true by construction, and it checks the identical property:
+    a ROCm or CPU-only rank of a cross-vendor group must be able to import
+    these modules.
+    """
+    import subprocess
+    import textwrap
+
+    probe = textwrap.dedent(
+        """
+        import importlib.util, sys, pathlib
+        import torch
+
+        comm_dir = pathlib.Path(sys.argv[1])
+        assert not torch.cuda.is_initialized(), "torch import alone initialized CUDA"
+        for name in ("htccl", "htccl_shm", "htccl_device"):
+            spec = importlib.util.spec_from_file_location(
+                f"_htccl_probe_{name}", comm_dir / f"{name}.py"
+            )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            if torch.cuda.is_initialized():
+                raise SystemExit(
+                    f"{name}.py created a CUDA context at import time; the "
+                    "ROCm rank of a cross-vendor group could not import it"
+                )
+        print("OK")
+        """
     )
-    for name in ("htccl", "htccl_shm", "htccl_device"):
-        _load_standalone(name)
-        assert not torch.cuda.is_initialized(), (
-            f"{name}.py created a CUDA context at import time; the ROCm rank "
-            "of a cross-vendor group could not import it"
-        )
+    res = subprocess.run(
+        [sys.executable, "-c", probe, str(_COMM_DIR)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert res.returncode == 0 and "OK" in res.stdout, (
+        f"HTCCL import probe failed (rc={res.returncode}):\n"
+        f"stdout: {res.stdout}\nstderr: {res.stderr}"
+    )
 
 
 def test_modules_expose_expected_api():
