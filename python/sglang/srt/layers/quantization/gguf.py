@@ -36,16 +36,29 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_npu = is_npu()
 
+_has_sgl_gguf_kernels = False
 if _is_cuda:
-    from sgl_kernel import moe_sum
-    from sgl_kernel.quantization import (
-        ggml_dequantize,
-        ggml_moe_a8,
-        ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
-        ggml_mul_mat_a8,
-        ggml_mul_mat_vec_a8,
-    )
+    # Turing (sm75): sgl-kernel is cubin-only with a gencode floor of sm_80 and
+    # no PTX, so it holds no code a 2080/2080 Ti/T4 can execute. Guarding lets
+    # the quantization package import on such a card; a rank that actually
+    # loads a GGUF checkpoint fails loudly at GGUFConfig instead of dying on a
+    # missing symbol mid-forward.
+    try:
+        from sgl_kernel import moe_sum
+        from sgl_kernel.quantization import (
+            ggml_dequantize,
+            ggml_moe_a8,
+            ggml_moe_a8_vec,
+            ggml_moe_get_block_size,
+            ggml_mul_mat_a8,
+            ggml_mul_mat_vec_a8,
+        )
+
+        _has_sgl_gguf_kernels = True
+    except ImportError:
+        moe_sum = None
+        ggml_dequantize = ggml_moe_a8 = ggml_moe_a8_vec = None
+        ggml_moe_get_block_size = ggml_mul_mat_a8 = ggml_mul_mat_vec_a8 = None
 
     from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
 elif _is_musa:

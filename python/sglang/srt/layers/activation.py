@@ -56,6 +56,10 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+# True unless the HIP branch below finds sgl-kernel missing. Defined here so
+# every platform can reference it without a NameError.
+_has_sgl_kernel_activation = True
+
 if _is_cuda:
     from sglang.jit_kernel.activation import (
         gelu_and_mul,
@@ -66,7 +70,29 @@ if _is_cuda:
 elif _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
-    from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
+    # sgl-kernel has no gfx900 build at all (sgl-kernel/setup_rocm.py accepts
+    # only gfx942/gfx950), so on such a rank this import fails and takes the
+    # whole forward path with it. Guard it and fall back to the pure-torch
+    # forward_native path, which is mathematically identical for these ops.
+    #
+    # NOTE: a soft import is NOT sufficient on its own. MultiPlatformOp.
+    # dispatch_forward maps HIP to forward_hip, whose base implementation is
+    # `return self.forward_cuda(...)` (layers/utils/multi_platform.py:94) --
+    # which calls these very symbols. Without the forward_hip overrides below,
+    # guarding here would only move the failure from import time to call time:
+    # quieter and later, i.e. worse. layers/layernorm.py already does it this
+    # way (forward_hip -> forward_native when the kernel is absent).
+    try:
+        from sgl_kernel import (
+            gelu_and_mul,
+            gelu_quick,
+            gelu_tanh_and_mul,
+            silu_and_mul,
+        )
+
+        _has_sgl_kernel_activation = True
+    except ImportError:
+        _has_sgl_kernel_activation = False
 elif _is_musa:
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 
@@ -104,6 +130,19 @@ class SiluAndMul(MultiPlatformOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         silu_and_mul(x, out)
         return out
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # Without sgl-kernel (no gfx900 build) fall back to pure torch.
+        # forward_native is F.silu(a) * b -- the same MATHEMATICAL function as
+        # silu_and_mul, not an approximation. It is NOT bit-identical: F.silu
+        # is fused, so last-bit rounding differs from a decomposed
+        # a*sigmoid(a) (measured max abs diff 4.8e-07 in fp32). That is well
+        # inside normal kernel-to-kernel variation and is the accepted cost of
+        # running without the kernel; do not expect byte-identity against a
+        # CUDA rank here.
+        if not _has_sgl_kernel_activation:
+            return self.forward_native(x)
+        return self.forward_cuda(x)
 
     def forward_aiter(self, x: torch.Tensor, limit: float = 0.0) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -172,6 +211,13 @@ class GeluAndMul(MultiPlatformOp):
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         return self._forward_impl(x)
 
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # See SiluAndMul.forward_hip. forward_native is
+        # F.gelu(a, approximate=...) * b, identical to the kernel.
+        if not _has_sgl_kernel_activation:
+            return self.forward_native(x)
+        return self.forward_cuda(x)
+
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         return self._forward_impl(x)
 
@@ -210,6 +256,13 @@ class ReLU2(MultiPlatformOp):
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         return relu2(x)
 
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # `relu2` is imported ONLY in the _is_cuda branch, so the inherited
+        # forward_hip -> forward_cuda would raise NameError on any HIP rank,
+        # with or without sgl-kernel. forward_native is F.relu(x)**2, exactly
+        # the same function.
+        return self.forward_native(x)
+
 
 class QuickGELU(MultiPlatformOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
@@ -219,6 +272,9 @@ class QuickGELU(MultiPlatformOp):
         return self.forward_native(x)
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # forward_native is x * sigmoid(1.702x), i.e. gelu_quick exactly.
+        if not _has_sgl_kernel_activation:
+            return self.forward_native(x)
         out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         gelu_quick(x, out)
         return out

@@ -15,14 +15,26 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_cuda:
     # Temporary
+    #
+    # As in fp8_kernel.py: the except-branch imports from sgl_kernel again, so
+    # it is a fallback for a missing SYMBOL and re-raises when the module is
+    # absent. sgl_kernel is absent on any device the wheel was not built for --
+    # gfx900 (no ROCm build) and sm75 alike (cubin-only wheel, gencode floor
+    # sm_80, no PTX to JIT down from).
     try:
         from sgl_kernel import sgl_per_token_group_quant_8bit
 
         enable_sgl_per_token_group_quant_8bit = True
+        _has_sgl_kernel_int8_quant = True
     except ImportError:
-        from sgl_kernel import sgl_per_token_group_quant_int8
+        try:
+            from sgl_kernel import sgl_per_token_group_quant_int8
 
-        enable_sgl_per_token_group_quant_8bit = False
+            enable_sgl_per_token_group_quant_8bit = False
+            _has_sgl_kernel_int8_quant = True
+        except ImportError:
+            enable_sgl_per_token_group_quant_8bit = False
+            _has_sgl_kernel_int8_quant = False
 
 logger = logging.getLogger(__name__)
 

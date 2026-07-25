@@ -11,15 +11,44 @@ from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import direct_register_custom_op, mxfp_supported
 
 _is_hip = is_hip()
+
+# aiter backs the MXFP4 path on AMD. It supports gfx90a/908/942/950/1100 --
+# NOT gfx900 (Vega), where it is simply not installed.
+#
+# This matters far beyond MXFP4: nearly every core layer imports
+# layers/quantization/__init__.py, which pulls in quark -> this module. An
+# unguarded aiter import therefore takes down the ENTIRE forward path on such a
+# rank, and because it raises first it MASKS every other blocker behind it
+# (measured: it hid the sgl_kernel imports in activation.py and spec_utils.py).
+#
+# Guarding it is the correct behaviour, not a workaround: without aiter this
+# quantization scheme cannot run, and a rank that does not select MXFP4 has no
+# reason to care. `get_min_capability`/scheme selection already decides whether
+# it is used; the import must not decide it for the whole process.
+_HAS_AITER_MXFP4 = False
 if _is_hip:
-    from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
-        fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
-    )
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4 as _gemm_afp4wfp4_orig
-    from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
-        gemm_afp4wfp4_pre_quant as _gemm_afp4wfp4_pre_quant_orig,
-    )
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant as _dynamic_mxfp4_quant_orig
+    try:
+        from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
+            fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
+        )
+        from aiter.ops.triton.gemm_afp4wfp4 import (
+            gemm_afp4wfp4 as _gemm_afp4wfp4_orig,
+        )
+        from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
+            gemm_afp4wfp4_pre_quant as _gemm_afp4wfp4_pre_quant_orig,
+        )
+        from aiter.ops.triton.quant import (
+            dynamic_mxfp4_quant as _dynamic_mxfp4_quant_orig,
+        )
+
+        _HAS_AITER_MXFP4 = True
+    except ImportError:
+        # No aiter (e.g. gfx900): leave the scheme undefined-but-importable.
+        # QuarkW4A4MXFP4.__init__ raises a clear error if anything tries to
+        # actually select it.
+        pass
+
+if _is_hip and _HAS_AITER_MXFP4:
 
     def _aiter_gemm_afp4wfp4(
         x: torch.Tensor,
@@ -163,6 +192,18 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         input_quant_spec: dict[str, Any],
         is_checkpoint_mxfp4_serialized: bool = True,
     ):
+        # The module-scope aiter import is guarded so that a rank without
+        # aiter (e.g. gfx900) can still IMPORT this module -- otherwise it
+        # takes down every core layer that transitively reaches quark. Selecting
+        # the scheme without aiter is a different matter and must fail loudly
+        # here, rather than as a NameError deep inside create_weights().
+        if _is_hip and not _HAS_AITER_MXFP4:
+            raise NotImplementedError(
+                "QuarkW4A4MXFP4 requires the aiter kernel library, which is "
+                "not available on this AMD device (aiter supports "
+                "gfx90a/908/942/950/1100; gfx900/Vega is not among them). "
+                "Use a different quantization scheme on this rank."
+            )
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec

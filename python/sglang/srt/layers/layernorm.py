@@ -54,6 +54,9 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
+# True unless the CUDA branch below finds sgl-kernel unusable on this device.
+# Module scope so every platform can reference it without a NameError.
+_has_sgl_rmsnorm = True
 
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
@@ -85,12 +88,26 @@ if _is_cuda or _is_xpu or _is_musa:
     else:
         _flashinfer_layernorm_available = False
 
-    from sgl_kernel import (
-        fused_add_rmsnorm,
-        gemma_fused_add_rmsnorm,
-        gemma_rmsnorm,
-        rmsnorm,
-    )
+    # Turing (sm75): sgl-kernel is cubin-only with a gencode floor of sm_80 and
+    # no PTX, so a 2080/2080 Ti/T4 has no executable code in it. RMSNorm runs
+    # in every layer, so this needs a real fallback -- and one exists:
+    # forward_native below is the torch implementation, already used by
+    # forward_hip when the AMD kernels are missing. _has_sgl_rmsnorm routes
+    # forward_cuda there. Not bit-identical to the fused kernel (different
+    # reduction order), same class of difference as the F.silu fallback.
+    try:
+        from sgl_kernel import (
+            fused_add_rmsnorm,
+            gemma_fused_add_rmsnorm,
+            gemma_rmsnorm,
+            rmsnorm,
+        )
+
+        _has_sgl_rmsnorm = True
+    except ImportError:
+        _has_sgl_rmsnorm = False
+        fused_add_rmsnorm = gemma_fused_add_rmsnorm = None
+        gemma_rmsnorm = rmsnorm = None
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 _has_rocm_triton_gemma_rms_norm = False
@@ -267,6 +284,12 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not _has_sgl_rmsnorm:
+            # Turing (sm75): no sgl-kernel code for this device. forward_native
+            # is the torch implementation of exactly this normalisation and is
+            # already the fallback forward_hip uses when the AMD kernels are
+            # missing -- so this is a tested path, not a new one.
+            return self.forward_native(x, residual, post_residual_addition)
         if x.numel() == 0:
             if residual is not None:
                 if post_residual_addition is not None:

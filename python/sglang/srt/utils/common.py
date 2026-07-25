@@ -309,6 +309,75 @@ try:
 except:
     is_intel_amx_backend_available = False
 
+
+# ---------------------------------------------------------------------------
+# sgl_kernel availability -- a CAPABILITY of the architecture, not of the vendor
+# ---------------------------------------------------------------------------
+#
+# The guards that use this used to key off `is_hip()`. That was a proxy for
+# "sgl_kernel is not usable here", and it was wrong in BOTH directions:
+# `_is_hip` was true by accident on a gfx900 rank (sgl-kernel/setup_rocm.py
+# builds only gfx942/gfx950, so no ROCm build exists) and FALSE by accident on
+# a Turing card that has exactly the same problem.
+#
+# Turing is the case that exposes the proxy. sgl-kernel/CMakeLists.txt emits
+# `-gencode arch=compute_XX,code=sm_XX` only -- cubin, never `code=compute_XX`
+# -- so the wheel carries NO PTX, cannot JIT down to an older arch, and its
+# floor is sm_80. An RTX 2080 Ti (sm75) therefore has no executable code in the
+# wheel even when the module imports perfectly. Measured: with sgl_kernel simply
+# absent, the SAME five compute layers fail on a gfx900 rank and on an sm75
+# rank -- one cause, two vendors.
+#
+# TWO LEVELS, and the split is not cosmetic:
+#
+#   sgl_kernel_importable()  answered at IMPORT time. MUST NOT touch the
+#                            device. A module-scope device query initialises
+#                            the driver during import -- that exact bug was
+#                            removed from quark_int4fp8_moe.py, which called
+#                            torch.cuda.get_device_properties() at module
+#                            scope. A single eager predicate would reintroduce
+#                            it.
+#   sgl_kernel_runnable()    answered on FIRST USE, when a device context
+#                            legitimately exists. Catches the installed-but-
+#                            wrong-arch case that importability cannot see.
+
+# sgl-kernel/CMakeLists.txt gencode floor (cubin-only, no PTX fallback).
+SGL_KERNEL_MIN_CUDA_CC = (8, 0)
+
+
+@lru_cache(maxsize=1)
+def sgl_kernel_importable() -> bool:
+    """Is sgl_kernel present at all? Device-free, safe at module import."""
+    try:
+        import sgl_kernel  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=1)
+def sgl_kernel_runnable() -> bool:
+    """Importable AND the current device is at or above the build floor.
+
+    Only call this once a device context exists -- it queries the device.
+    Returns False rather than raising when there is no device to ask, so a
+    CPU-only caller degrades to the native path instead of crashing.
+    """
+    if not sgl_kernel_importable():
+        return False
+    try:
+        if torch.version.hip is not None:
+            # ROCm: the wheel is built for an explicit gfx list, and a mismatch
+            # is not expressible as a numeric floor. Importability is the only
+            # honest signal available without launching a kernel.
+            return True
+        if not torch.cuda.is_available():
+            return False
+        return torch.cuda.get_device_capability() >= SGL_KERNEL_MIN_CUDA_CC
+    except Exception:
+        return False
+
 try:
     # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile

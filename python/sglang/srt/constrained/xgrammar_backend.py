@@ -40,12 +40,24 @@ from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 
+# The Triton implementation is imported unconditionally: it is the fallback for
+# any device sgl-kernel was not built for. gfx900 has no ROCm build below
+# gfx942, and an sm75 CUDA card has no code in the cubin-only wheel either --
+# but Triton compiles for both. This module is reached during grammar-backend
+# init, i.e. at RUNTIME, so a module-level import failure here kills the server
+# after startup rather than at import; the solo gfx900 run is what surfaced it.
+from sglang.kernels.ops.grammar.bitmask_ops import (
+    apply_token_bitmask_inplace_triton,
+)
+
+_has_sgl_bitmask_kernel = False
 if _is_hip:
-    from sgl_kernel import apply_token_bitmask_inplace_cuda
-else:
-    from sglang.kernels.ops.grammar.bitmask_ops import (
-        apply_token_bitmask_inplace_triton,
-    )
+    try:
+        from sgl_kernel import apply_token_bitmask_inplace_cuda
+
+        _has_sgl_bitmask_kernel = True
+    except ImportError:
+        apply_token_bitmask_inplace_cuda = None
 
 from sglang.kernels.ops.grammar.token_filter_ops import set_token_filter_triton
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
@@ -111,7 +123,7 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         if logits.device.type in {"cuda", "xpu", "musa"}:
-            if _is_hip:
+            if _is_hip and _has_sgl_bitmask_kernel:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
@@ -237,7 +249,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
         if logits.device.type in {"cuda", "npu", "xpu", "musa"}:
-            if _is_hip:
+            if _is_hip and _has_sgl_bitmask_kernel:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)

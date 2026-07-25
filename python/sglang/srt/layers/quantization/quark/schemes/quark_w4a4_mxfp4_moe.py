@@ -37,7 +37,15 @@ if _use_aiter:
     from aiter.utility.fp4_utils import e8m0_shuffle
 
 if _is_hip:
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    # aiter supports gfx90a/908/942/950/1100, NOT gfx900 (Vega), where it is
+    # not installed at all. This module is reached transitively from
+    # layers/quantization/__init__.py by nearly every core layer, so an
+    # unguarded import takes down the whole forward path on such a rank.
+    # The non-HIP branch already tolerates `None`, so reuse that contract.
+    try:
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    except ImportError:
+        dynamic_mxfp4_quant = None
 else:
     dynamic_mxfp4_quant = None
 

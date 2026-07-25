@@ -42,21 +42,42 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
+_has_sgl_kvcacheio = False
 if _is_cuda or _is_hip:
-    from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer,
-        transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_all_layer_lf_pf,
-        transfer_kv_all_layer_lf_ph,
-        transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer,
-        transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
-        transfer_kv_per_layer_pf_lf,
-        transfer_kv_per_layer_ph_lf,
-    )
+    # Turing (sm75) / gfx900: being CUDA or ROCm is necessary but not
+    # sufficient -- sgl-kernel is cubin-only with a gencode floor of sm_80
+    # and has no ROCm build below gfx942, so these HiCache transfer kernels
+    # are simply absent there. This module is on the ordinary startup path,
+    # so guard it; a rank that enables HiCache still needs the kernels.
+    try:
+        from sgl_kernel.kvcacheio import (
+            transfer_kv_all_layer,
+            transfer_kv_all_layer_direct_lf_pf,
+            transfer_kv_all_layer_lf_pf,
+            transfer_kv_all_layer_lf_ph,
+            transfer_kv_all_layer_mla_lf_pf,
+            transfer_kv_direct,
+            transfer_kv_per_layer,
+            transfer_kv_per_layer_direct_pf_lf,
+            transfer_kv_per_layer_mla,
+            transfer_kv_per_layer_mla_pf_lf,
+            transfer_kv_per_layer_pf_lf,
+            transfer_kv_per_layer_ph_lf,
+        )
+        _has_sgl_kvcacheio = True
+    except ImportError:
+        transfer_kv_all_layer = None
+        transfer_kv_all_layer_direct_lf_pf = None
+        transfer_kv_all_layer_lf_pf = None
+        transfer_kv_all_layer_lf_ph = None
+        transfer_kv_all_layer_mla_lf_pf = None
+        transfer_kv_direct = None
+        transfer_kv_per_layer = None
+        transfer_kv_per_layer_direct_pf_lf = None
+        transfer_kv_per_layer_mla = None
+        transfer_kv_per_layer_mla_pf_lf = None
+        transfer_kv_per_layer_pf_lf = None
+        transfer_kv_per_layer_ph_lf = None
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 

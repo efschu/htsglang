@@ -26,10 +26,24 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 
 
+_HAS_AITER_SHUFFLE = False
+ON_GFX950 = False
 if _is_hip:
-    from aiter.ops.shuffle import shuffle_weight
+    # aiter has no gfx900 support and is absent on such a rank. This module is
+    # imported by layers/quantization/__init__.py, i.e. transitively by nearly
+    # every core layer, so an unguarded import blocks the whole forward path.
+    # Note the second line was ALSO unsafe for a different reason: it calls
+    # torch.cuda.get_device_properties at import time, which initialises the
+    # driver during module import.
+    try:
+        from aiter.ops.shuffle import shuffle_weight
 
-    ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+        _HAS_AITER_SHUFFLE = True
+        ON_GFX950 = (
+            "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+        )
+    except ImportError:
+        pass
 
 logger = logging.getLogger(__name__)
 

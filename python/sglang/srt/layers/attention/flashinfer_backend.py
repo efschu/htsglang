@@ -29,7 +29,9 @@ from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dcp import (
+    build_dcp_weighted_kv_indices,
     cp_all_gather_heads_uneven,
+    dcp_weighted_write_slots,
     cp_lse_ag_out_ar_mha_uneven,
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
@@ -2202,13 +2204,12 @@ class FlashInferAttnBackend(AttentionBackend):
             # concurrent requests exactly like the even L // dcp_size. This rank
             # owns L iff (L % cp_S) in [cp_lo, cp_hi); its compact slot is
             # (L // cp_S) * cp_ratio + (L % cp_S - cp_lo).
-            off = cache_loc % self.cp_S
-            block = cache_loc // self.cp_S
-            dcp_kv_mask = (off >= self.cp_lo) & (off < self.cp_hi)
-            loc = torch.where(
-                dcp_kv_mask,
-                block * self.cp_ratio + (off - self.cp_lo),
-                torch.zeros_like(cache_loc),
+            # Shared with the Triton backend and with the READ side
+            # (build_dcp_weighted_kv_indices) via layers/dcp/owner.py, so the
+            # two can no longer drift apart. Byte-identical to the expression
+            # that used to be inlined here.
+            loc, dcp_kv_mask = dcp_weighted_write_slots(
+                cache_loc, self.cp_S, self.cp_lo, self.cp_hi, self.cp_ratio
             )
         else:
             loc = cache_loc // self.dcp_size
@@ -5906,63 +5907,12 @@ def _build_dcp_ragged_tree_mask(
     return full_mask[idx]
 
 
-def _build_dcp_weighted_kv_indices(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    paged_kernel_lens: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_start_idx: Optional[torch.Tensor],
-    cp_S: int,
-    cp_lo: int,
-    cp_hi: int,
-    cp_ratio: int,
-    pad: int = 0,
-):
-    """Weighted-DCP paged kv_indices: this rank's OWNED cache slots, compacted.
-
-    Builds the full per-request out_cache_loc list for [kv_start, kv_start+len),
-    keeps the slots this rank owns under the WEIGHTED owner rule
-    (loc % cp_S in [cp_lo, cp_hi)) and maps each to its compact physical slot
-    (loc // cp_S) * cp_ratio + (loc % cp_S - cp_lo) -- the exact inverse of the
-    _dcp_masked_write packing, so a token is read from the slot it was written
-    to. Writes the per-request owned counts into ``kv_indptr`` and returns
-    (kv_indptr[:bs+1], kv_indices).
-    """
-    bs = len(req_pool_indices)
-    device = req_pool_indices.device
-    lens64 = paged_kernel_lens.to(torch.int64)
-    full_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)
-    full_indptr[1:] = torch.cumsum(lens64, dim=0).to(torch.int32)
-    total = int(full_indptr[bs].item())
-    full_kv = torch.empty(max(total, 1), dtype=torch.int32, device=device)
-    if total > 0:
-        create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            full_indptr,
-            kv_start_idx,
-            full_kv,
-            req_to_token.shape[1],
-        )
-    full_kv = full_kv[:total]
-    full_kv64 = full_kv.to(torch.int64)
-    off = full_kv64 % cp_S
-    owned = (off >= cp_lo) & (off < cp_hi)
-    compact = ((full_kv64 // cp_S) * cp_ratio + (off - cp_lo)).to(torch.int32)
-    kv_indices = compact[owned].contiguous()
-    if pad > 0:
-        kv_indices = torch.cat([kv_indices, kv_indices.new_zeros(pad)])
-    if total > 0:
-        seg = torch.repeat_interleave(
-            torch.arange(bs, device=device, dtype=torch.int64), lens64
-        )
-        owned_per_req = torch.zeros(bs, dtype=torch.int64, device=device)
-        owned_per_req.scatter_add_(0, seg, owned.to(torch.int64))
-    else:
-        owned_per_req = torch.zeros(bs, dtype=torch.int64, device=device)
-    kv_indptr[1 : bs + 1] = torch.cumsum(owned_per_req, dim=0)
-    return kv_indptr[: bs + 1], kv_indices
+# Wall A (cross-vendor uneven DCP): the weighted owner rule moved VERBATIM to
+# sglang.srt.layers.dcp.owner -- it is pure torch + a shared Triton kernel and
+# never had a flashinfer dependency, so it can also serve the Triton backend
+# (and thus ROCm/gfx900 and sm75). Imported at module scope above and aliased
+# here so every call site in this file stays byte-identical.
+_build_dcp_weighted_kv_indices = build_dcp_weighted_kv_indices
 
 
 class FlashInferIndicesUpdaterDecode:

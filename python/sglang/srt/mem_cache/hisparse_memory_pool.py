@@ -14,15 +14,28 @@ logger = logging.getLogger(__name__)
 # sgl_kernel.kvcacheio is only available in CUDA/ROCm sgl-kernel builds (not XPU/MPS/NPU/CPU).
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-if _is_cuda or _is_hip:
-    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
-else:
+def _transfer_kv_all_layer_mla_unavailable(*args, **kwargs):
+    raise RuntimeError(
+        "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
+        "It is not available on this backend."
+    )
 
-    def transfer_kv_all_layer_mla(*args, **kwargs):
-        raise RuntimeError(
-            "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
-            "It is not available on this backend."
-        )
+
+_has_sgl_kvcacheio_mla = False
+if _is_cuda or _is_hip:
+    # Being CUDA/ROCm is necessary but not sufficient: sgl-kernel is cubin-only
+    # with a gencode floor of sm_80 and has no ROCm build below gfx942, so a
+    # Turing or gfx900 card is in the same position as an unsupported backend.
+    # Reuse the existing raising stub for that case rather than failing at
+    # import -- this module is reached on ordinary startup.
+    try:
+        from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
+
+        _has_sgl_kvcacheio_mla = True
+    except ImportError:
+        transfer_kv_all_layer_mla = _transfer_kv_all_layer_mla_unavailable
+else:
+    transfer_kv_all_layer_mla = _transfer_kv_all_layer_mla_unavailable
 
 
 class HiSparseDSATokenToKVPool(DSATokenToKVPool):

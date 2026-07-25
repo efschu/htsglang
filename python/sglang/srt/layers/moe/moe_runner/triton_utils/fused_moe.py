@@ -52,14 +52,35 @@ _use_sgl_xpu = use_intel_xpu_backend()
 _is_musa = is_musa()
 
 
+_has_sgl_moe_sum_reduce = False
 if _is_cuda:
-    from sgl_kernel import moe_sum_reduce
+    # Turing (sm75): sgl-kernel holds no code for this arch (cubin-only,
+    # gencode floor sm_80, no PTX). This module is on the ordinary import
+    # chain even for dense models, so it must not take down startup; a rank
+    # that actually runs an MoE model still needs the kernel.
+    try:
+        from sgl_kernel import moe_sum_reduce
+
+        _has_sgl_moe_sum_reduce = True
+    except ImportError:
+        moe_sum_reduce = None
 
     from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
+    # Same reason as the _is_cuda branch above, other vendor: sgl-kernel has no
+    # ROCm build below gfx942 (setup_rocm.py), so a gfx900 rank has nothing to
+    # import. This module is on the ordinary startup path even for dense
+    # models, so it must not take the server down; an MoE model still needs
+    # the kernels.
+    try:
+        from sgl_kernel import gelu_and_mul, silu_and_mul
+
+        _has_sgl_moe_activation = True
+    except ImportError:
+        _has_sgl_moe_activation = False
+        gelu_and_mul = silu_and_mul = None
 
     if _use_aiter:
         try:

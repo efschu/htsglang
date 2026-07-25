@@ -145,7 +145,10 @@ _LOAD_BEARING_INIT_ATTRS = (
         "distributed/device_communicators/htccl.py",
         "HTCCLCommunicator",
         (
-            "device_transport",
+            # `device_transport` / `shm_transport` were replaced by the single
+            # pluggable seam `transport` (shm | device | ucx). The pin follows
+            # the seam, not the old names.
+            "transport",
             "_stream",
             "_host_bufs",
             "_host_buf_bytes",

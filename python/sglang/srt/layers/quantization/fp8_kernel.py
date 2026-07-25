@@ -62,14 +62,27 @@ if _is_cuda or _is_musa:
     from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
 
     # Temporary
+    #
+    # NOTE: the except-branch here is a fallback for a missing SYMBOL, not for a
+    # missing MODULE -- it imports from sgl_kernel again, so it re-raises when
+    # sgl_kernel is absent entirely. That is the case on any device the wheel
+    # was not built for: gfx900 (no ROCm build) and equally sm75, where the
+    # cubin-only wheel (gencode floor sm_80, no PTX) contains no executable
+    # code. Keyed on the capability, not on the vendor.
     try:
         from sgl_kernel import sgl_per_token_group_quant_8bit
 
         enable_sgl_per_token_group_quant_8bit = True
+        _has_sgl_kernel_fp8_quant = True
     except ImportError:
-        from sgl_kernel import sgl_per_token_group_quant_fp8
+        try:
+            from sgl_kernel import sgl_per_token_group_quant_fp8
 
-        enable_sgl_per_token_group_quant_8bit = False
+            enable_sgl_per_token_group_quant_8bit = False
+            _has_sgl_kernel_fp8_quant = True
+        except ImportError:
+            enable_sgl_per_token_group_quant_8bit = False
+            _has_sgl_kernel_fp8_quant = False
 
     from sglang.jit_kernel.per_token_group_quant_8bit import (
         per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,

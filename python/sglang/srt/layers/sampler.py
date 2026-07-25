@@ -24,15 +24,32 @@ from sglang.srt.utils.common import (
     is_npu,
 )
 
+# True unless the CUDA branch below finds sgl-kernel unusable on this device.
+# Defined at module scope so every platform can reference it.
+_has_sgl_sampling_kernels = True
+
 if is_cuda():
     from flashinfer.sampling import (
         min_p_sampling_from_probs,
         top_k_top_p_sampling_from_probs,
     )
-    from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-    )
+    # Turing (sm75): sgl-kernel is cubin-only with a gencode floor of sm_80 and
+    # carries no PTX, so a 2080/2080 Ti/T4 has no executable code in it. Sampling
+    # runs on EVERY request, so this needs a real fallback rather than only a
+    # guard -- and one already exists: the "pytorch" sampling backend below is a
+    # complete torch-native implementation. When the kernels are unavailable the
+    # dispatch routes there instead of failing.
+    try:
+        from sgl_kernel import (
+            top_k_renorm_prob,
+            top_p_renorm_prob,
+        )
+
+        _has_sgl_sampling_kernels = True
+    except ImportError:
+        _has_sgl_sampling_kernels = False
+        top_k_renorm_prob = None
+        top_p_renorm_prob = None
 
 if is_musa():
     from sgl_kernel import (
@@ -228,6 +245,25 @@ class Sampler(nn.Module):
             )
         else:
             backend = get_server_args().sampling_backend
+            if backend == "flashinfer" and not _has_sgl_sampling_kernels:
+                # Turing (sm75) and any other device sgl-kernel was not built
+                # for: the renorm kernels do not exist here. The torch-native
+                # backend below is a complete implementation of the same
+                # sampling, so degrade to it rather than fail. Numerics differ
+                # slightly from the kernel path (different reduction order), so
+                # this is NOT byte-identical to an sm80+ rank -- expected, and
+                # the same class of difference as the F.silu fallback.
+                _sampling_fallback_warned = getattr(
+                    self, "_sampling_fallback_warned", False
+                )
+                if not _sampling_fallback_warned:
+                    logger.warning(
+                        "sampling_backend=flashinfer requested but the "
+                        "sgl-kernel renorm kernels are unavailable on this "
+                        "device; using the torch-native sampling backend."
+                    )
+                    self._sampling_fallback_warned = True
+                backend = "pytorch"
             if backend == "flashinfer":
                 assert (
                     sampling_info.sampling_seed is None

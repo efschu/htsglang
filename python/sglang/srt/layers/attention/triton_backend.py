@@ -48,7 +48,17 @@ _is_gfx942 = is_gfx942_supported()
 _is_xpu = is_xpu()
 
 if _is_cuda:
-    from sgl_kernel.utils import is_arch_support_pdl
+    # PDL (Programmatic Dependent Launch) is a Hopper+ feature, and the helper
+    # that reports it lives in sgl_kernel -- which has no code for sm75 (the
+    # wheel is cubin-only with a gencode floor of sm_80). Without a guard a
+    # Turing card cannot even construct the Triton attention backend, although
+    # the answer for it is simply "no PDL".
+    try:
+        from sgl_kernel.utils import is_arch_support_pdl
+
+        _has_pdl_probe = True
+    except ImportError:
+        _has_pdl_probe = False
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -110,6 +120,76 @@ def _plan_aware_num_q_heads(model_config) -> int:
         )
         for kv in kv_bases
     )
+
+
+def _plan_aware_dcp_gathered_q_heads(model_config, dcp_size: int) -> int:
+    """Head count of the GATHERED q set the decode workspaces must hold.
+
+    Under DCP each rank's partial attention is merged across the DCP group, so
+    the attn_logits/attn_lse workspaces are sized for the gathered head set --
+    NOT for this rank's own shard.
+
+    The previous expression was ``_plan_aware_num_q_heads(cfg) * dcp_size``.
+    That double-counts under an uneven plan, because _plan_aware_num_q_heads is
+    ALREADY plan-aware and returns THIS rank's (unequal) count. Concretely, with
+    total_q=32, kv=8, tp=dcp=3 and a --rank-tp-ratio of [12,6,6], the real split
+    is [16,8,8], so the old formula gave rank 0 16*3=48 (harmless over-alloc)
+    but ranks 1 and 2 8*3=24 against a true gathered 32 -- EIGHT HEADS SHORT,
+    i.e. exactly the out-of-bounds decode write _plan_aware_num_q_heads' own
+    docstring warns about. Latent until the Triton backend is wired for uneven
+    DCP; this lands in the same change as that wiring.
+
+    The correct value follows from the partition being EXHAUSTIVE: the per-rank
+    q counts sum to total_q (verified against the partition helpers for both
+    [2,1,1] and [12,6,6] -> [16,8,8], sum 32). So when DCP spans the whole TP
+    group the gathered set is every q head exactly once.
+
+    Cases, in order:
+      dcp_size == 1        -> no gather at all; this rank's own count.
+                              Byte-identical to the old expression, and it is
+                              what keeps uneven-TP-WITHOUT-DCP (a working,
+                              validated path) unchanged.
+      no plan active       -> (total_q // tp_size) * dcp_size, byte-identical.
+      dcp_size == tp_size  -> total_q. The fix. (Every uneven-DCP path already
+                              requires dcp_size == tp_size.)
+      otherwise            -> max over ranks * dcp_size: an UPPER bound, since
+                              max*n >= sum. Over-allocating is harmless;
+                              under-allocating writes out of bounds, so this is
+                              the correct direction to be wrong in.
+    """
+    from sglang.srt.distributed.utils import (
+        attn_q_partition_groups,
+        attn_q_partition_units,
+        tp_partition_size,
+        tp_plan_active,
+    )
+
+    if dcp_size == 1:
+        return _plan_aware_num_q_heads(model_config)
+
+    tp_size = get_parallel().attn_tp_size
+    total_q = model_config.num_attention_heads
+    if not tp_plan_active(tp_size):
+        return (total_q // tp_size) * dcp_size
+    if dcp_size == tp_size:
+        return total_q
+
+    kv_bases = {model_config.get_total_num_kv_heads()}
+    swa_kv = getattr(model_config.hf_text_config, "swa_num_key_value_heads", None)
+    if swa_kv:
+        kv_bases.add(swa_kv)
+    per_rank_max = max(
+        tp_partition_size(
+            total_q,
+            tp_size,
+            r,
+            attn_q_partition_units(total_q, kv, tp_size),
+            groups=attn_q_partition_groups(kv, tp_size),
+        )
+        for kv in kv_bases
+        for r in range(tp_size)
+    )
+    return per_rank_max * dcp_size
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -210,8 +290,12 @@ class TritonAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
-        self.num_head = (
-            _plan_aware_num_q_heads(model_runner.model_config) * self.dcp_size
+        # NOT _plan_aware_num_q_heads(...) * dcp_size: that helper is already
+        # plan-aware, so multiplying double-counts and UNDER-sizes the decode
+        # workspaces on the smaller ranks under an uneven plan. See
+        # _plan_aware_dcp_gathered_q_heads.
+        self.num_head = _plan_aware_dcp_gathered_q_heads(
+            model_runner.model_config, self.dcp_size
         )
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size
@@ -255,9 +339,12 @@ class TritonAttnBackend(AttentionBackend):
                 # fp32 attn_logits buffer to ~4 GiB on Kimi-K2.6 and faulting in
                 # ROCm graph replay; pin to 256 to match validated gfx950 behavior.
                 self.max_kv_splits = min(self.max_kv_splits, 256)
-        if _is_cuda:
+        if _is_cuda and _has_pdl_probe:
             self.use_pdl = is_arch_support_pdl()
         else:
+            # No probe available => no PDL. Correct for sm75, which predates
+            # the feature entirely, and unchanged on sm80+ where the probe is
+            # present and answers for itself.
             self.use_pdl = False
 
         self.allow_bidirectional_attention_in_extend = (

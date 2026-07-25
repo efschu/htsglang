@@ -154,6 +154,41 @@ class HTCCLShmTransport:
                 )
             time.sleep(0)
 
+    # -- pluggable-transport interface (see htccl.py "transport seam") --
+    #
+    # `handles` declares what this transport can serve; the communicator asks
+    # instead of knowing. Encoding it here rather than at the call site is the
+    # point: the slot-size ceiling is a property of the shm segment, not of
+    # all_reduce.
+    #
+    # Deliberately UNCHANGED semantics: shm serves all_reduce only, and only
+    # within slot_bytes -- exactly the condition that used to be inlined in
+    # HTCCLCommunicator.all_reduce. all_gather/reduce_scatter were never
+    # served by shm and still are not; making them shm-capable is a separate,
+    # testable change (htccl.py notes it as the one op-coverage gap).
+    HTCCL_OPS = frozenset({"all_reduce"})
+
+    def handles(self, op: str, nbytes: int) -> bool:
+        return op in self.HTCCL_OPS and nbytes <= self.slot_bytes
+
+    def htccl_all_reduce(self, comm, inp: torch.Tensor) -> torch.Tensor:
+        """This transport's all_reduce calling convention.
+
+        shm reduces IN PLACE on a flat view, so it needs an output tensor it
+        may overwrite -- it borrows the communicator's allocator for that.
+
+        NOTE, and do not "restore" this: `_get_out_buf` returns a FRESH tensor
+        per call. It once returned a stable per-(shape, dtype) buffer, which
+        made two same-shape all_reduce results the SAME tensor and corrupted
+        the model forward outright (garbage tokens, HTTP 200, no crash, no
+        hang) on every non-device transport. `all_reduce` is documented and
+        dispatched as out-of-place. See HTCCLCommunicator._get_out_buf.
+        """
+        out = comm._get_out_buf(inp)
+        out.copy_(inp)
+        self.all_reduce_(out.view(-1))
+        return out
+
     def all_reduce_(self, flat: torch.Tensor) -> None:
         """In-place sum-all-reduce of a flat contiguous GPU tensor.
 

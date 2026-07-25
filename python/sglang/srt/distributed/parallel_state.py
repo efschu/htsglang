@@ -213,6 +213,33 @@ def reg_all_to_all_single(
     group._all_to_all_single(output, input)
 
 
+def should_build_pynccl(
+    use_pynccl: bool, world_size: int, htccl_active: bool
+) -> bool:
+    """Whether GroupCoordinator should CONSTRUCT a PyNccl communicator.
+
+    Module-level and importable ON PURPOSE: it is the single definition of this
+    decision, used by __init__ and asserted on directly by the tests. A test
+    that re-implemented the condition would keep passing after the real one was
+    reverted -- which is exactly what happened while developing this, and is the
+    same "checks something adjacent to the thing under test" failure this
+    codebase keeps producing.
+
+    `htccl_active` -> do not build. NCCL cannot span vendors: on a mixed group
+    ncclCommInitRank segfaults inside the C library trying to form a world with
+    a peer that has no NCCL. HTCCL reroutes the collectives but never prevented
+    the CONSTRUCTION, because `use_pynccl` is independent of SGLANG_HTCCL.
+
+    RANK-UNIFORM: every input is derived identically on every rank from the same
+    CLI/env. A rank-divergent answer here would produce a hang rather than a
+    crash -- quieter and worse.
+
+    Flag OFF reduces exactly to the original `use_pynccl and world_size > 1`,
+    so same-vendor rigs keep pynccl, which is their faster path.
+    """
+    return use_pynccl and world_size > 1 and not htccl_active
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -415,11 +442,53 @@ class GroupCoordinator:
                 envs.SGLANG_HTCCL_TRANSPORT.get(),
             )
 
+        # When HTCCL is active the pynccl communicator is NOT CONSTRUCTED --
+        # not merely left unused.
+        #
+        # `use_pynccl` is independent of SGLANG_HTCCL: enabling HTCCL reroutes
+        # the COLLECTIVES but never stopped PyNcclCommunicator from being built
+        # first. On a same-vendor rig that construction is harmless. On a
+        # vendor-mixed group it is fatal: ncclCommInitRank tries to form an
+        # NCCL world with a peer that has no NCCL at all, and SEGFAULTS inside
+        # the C library. Measured on the cross-vendor host -- both ranks logged
+        # "HTCCL enabled ... (transport=gloo)" and rank 0 then died at
+        #   pynccl_wrapper.py:404 in ncclCommInitRank
+        #   parallel_state.py:420 in __init__
+        # before the model was even loaded.
+        #
+        # RANK-UNIFORM by construction: the condition reads only
+        # `envs.SGLANG_HTCCL` and `self.world_size`, both of which every rank
+        # derives identically from the same CLI/env. That matters more than the
+        # crash it prevents -- if one rank built pynccl and another did not,
+        # the result would not be a segfault but a HANG, which is quieter and
+        # worse.
+        #
+        # FLAG-OFF IS BYTE-IDENTICAL: with SGLANG_HTCCL unset, `_htccl_active`
+        # is False and the condition reduces to the original
+        # `use_pynccl and self.world_size > 1`. pynccl remains the faster path
+        # on same-vendor rigs and is not given up -- the rule is
+        # "HTCCL active -> no pynccl", not "no pynccl".
+        #
+        # Every consumer of self.pynccl_comm was checked to tolerate None:
+        # the two sites that dereference it without a guard
+        # (_all_reduce_out_place's assert, and the reduce_scatter path) are
+        # both preceded by an `if self.htccl_comm is not None:` early return,
+        # so they are unreachable when this is None. Otherwise the fix would
+        # only relocate the crash.
+        _htccl_active = self.htccl_comm is not None
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
-        if use_pynccl and self.world_size > 1:
+        if should_build_pynccl(use_pynccl, self.world_size, _htccl_active):
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+            )
+        elif use_pynccl and self.world_size > 1:
+            logger.info(
+                "HTCCL is active for group '%s': skipping PyNccl "
+                "communicator construction. NCCL cannot span vendors, and "
+                "constructing it would abort in ncclCommInitRank on a "
+                "vendor-mixed group.",
+                self.unique_name,
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
