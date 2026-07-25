@@ -101,6 +101,19 @@ class CrossAlgoWorker(BaseSpecWorker):
         self._target_worker = target_worker
         self.device = target_worker.device
 
+        # #156-4 state. Set BEFORE anything else: __getattr__ delegates
+        # unknown attributes to the primary sub-worker, so a missing field
+        # here would silently read the sub-worker's instead of raising.
+        # None/False == the feature is off == today's code path.
+        self._lazy = None
+        self._lazy_aux_active = None
+        self._lazy_eager_active = False
+        self._lazy_warmkeep = True
+        self._dflash_retired = False
+        from sglang.srt.speculative.cross_algo_lazy import RetirePolicy
+
+        self._retire_policy = RetirePolicy()
+
         shapes = get_cross_shapes(server_args)
         self._force: str = shapes["force"]
         self._forced_algo = SpeculativeAlgorithm.from_string(
@@ -245,6 +258,11 @@ class CrossAlgoWorker(BaseSpecWorker):
             self._ctx_gate_near_frac = float(gate.get("near_frac", 0.8))
             self._ctx_gate_last_ctx = 0
             self._policy_has_auto = False
+            # #156-4 part 1: measured, monotone DFLASH ctx retirement.
+            # Resolved at argument time and shipped in the stash, so it is
+            # rank-uniform by construction. Disabled (collapse_ctx None) ==
+            # today's behavior: no retirement branch is ever reached.
+            self._retire_policy = RetirePolicy.from_stash(shapes.get("retire"))
 
         if self._force == "policy":
             from sglang.srt.speculative.cross_algo_utils import (
@@ -335,6 +353,243 @@ class CrossAlgoWorker(BaseSpecWorker):
                 )
                 + ".",
             )
+            self._init_lazy_capture(shapes)
+
+    # ------------------------------------------------------------------
+    # #156-4: lazy single capture + monotone DFLASH retirement.
+    #
+    # THE TAX THIS REMOVES (measured, RESULT_draft_crossover.md): pure
+    # DFLASH does 138 tok/s on code below ctx 4096, the switching worker with
+    # DFLASH active only 116-120. The difference is not the drafter -- it is
+    # the shared target producing BOTH hidden-state variants every round plus
+    # the per-round warm-keep of the idle rung, paid purely for the ability
+    # to switch at any instant.
+    #
+    # The decision logic lives in cross_algo_lazy (pure, unit-tested without
+    # a GPU); this class only executes it. Everything below is unreachable
+    # unless --speculative-cross-algorithm-lazy-capture (self._lazy) or
+    # --speculative-cross-algorithm-retire-ctx (self._retire_policy.enabled)
+    # is set: flag-OFF is the byte-identical old path.
+    # ------------------------------------------------------------------
+    # Accept-EMA samples a rung needs before its accept EMA is trusted as a
+    # retirement / signal input. Same order as the bandit's burn-in.
+    LAZY_MIN_ACCEPT_SAMPLES = 8
+
+    def _init_lazy_capture(self, shapes) -> None:
+        stash = shapes.get("lazy_capture")
+        if not stash:
+            return
+        from sglang.srt.speculative.cross_algo_lazy import (
+            LazyCaptureConfig,
+            LazyCaptureController,
+        )
+
+        cfg = LazyCaptureConfig(**stash)
+        self._lazy = LazyCaptureController(
+            cfg,
+            retire=self._retire_policy,
+            # The primary (NEXTN) rung is what the boot pipeline activates,
+            # so it is also what the target graph sets get baked for.
+            initial_family="nextn",
+        )
+        self._lazy_aux_active = self._lazy.aux_required_now
+        # _policy_pick_k (reused verbatim for the k choice inside the adopted
+        # NEXTN family) reads these; auto mode never initialized them.
+        self._policy_last_k_decide = 0
+        self._policy_last_k_change = 0
+        log_info_on_rank0(
+            logger,
+            "Cross-algo lazy single capture ACTIVE: steady state runs only "
+            f"the active rung's capture ({cfg}). The bandit's decide() is "
+            "bypassed for the FAMILY choice (the lazy controller owns probe "
+            "windows); the analytic k model still owns k inside NEXTN.",
+        )
+
+    def _bandit_or_none(self):
+        # NOT getattr(self, "_bandit", None): __getattr__ would delegate the
+        # miss to the primary sub-worker.
+        return self.__dict__.get("_bandit")
+
+    def _rung_accept_ema(self, rung) -> Optional[float]:
+        """Rung accept-length EMA, or None below the sample floor.
+
+        RANK-UNIFORM: RungMetrics.accept_len is fed exclusively from the
+        rank-0-broadcast accept counts (#50), unlike reward()/round_s(). Any
+        decision built on it therefore needs no broadcast of its own.
+        """
+        bandit = self._bandit_or_none()
+        if bandit is None:
+            return None
+        return bandit.metrics.accept_len(
+            rung, min_samples=self.LAZY_MIN_ACCEPT_SAMPLES
+        )
+
+    def _lazy_signals(self, batch) -> tuple:
+        """(max ctx, NEXTN accept EMA, DFLASH accept EMA) -- all rank-uniform."""
+        ctx_and_remaining = self._batch_ctx_and_remaining(batch)
+        max_ctx = max((int(c) for c, _r in ctx_and_remaining), default=0)
+        return (
+            max_ctx,
+            self._rung_accept_ema(("nextn", self._active_k)),
+            self._rung_accept_ema(("dflash", self._dflash_block_size)),
+        )
+
+    def _maybe_retire_dflash(self, max_ctx: int) -> None:
+        """Latch the monotone DFLASH retirement flag (non-lazy paths).
+
+        Pure ctx + accept-EMA inputs -> every rank latches in the SAME round
+        without a collective. ctx grows monotonically within a session, so a
+        context-driven collapse can never heal and the latch is safe to make
+        permanent -- while a low acceptance at LOW context is read as a
+        content effect and does not retire (see cross_algo_lazy).
+        """
+        if self._dflash_retired or not self._retire_policy.enabled:
+            return
+        from sglang.srt.speculative.cross_algo_lazy import retire_verdict
+
+        dfl = self._rung_accept_ema(("dflash", self._dflash_block_size))
+        nxt = self._rung_accept_ema(("nextn", self._active_k))
+        do_retire, reason = retire_verdict(
+            max_ctx, dfl, nxt, self._retire_policy
+        )
+        if do_retire:
+            self._dflash_retired = True
+            log_info_on_rank0(
+                logger,
+                f"Cross-algo: DFLASH rung RETIRED permanently @round "
+                f"{self._rounds_total} (ctx {max_ctx}, reason={reason}, "
+                f"collapse_ctx={self._retire_policy.collapse_ctx}, "
+                f"dflash_accept={dfl}, nextn_accept={nxt}). It is now "
+                "ineligible for selection and probing, and its per-round "
+                "warm-keep is dropped.",
+            )
+
+    # ------------------------------------------------------------------
+    # Lazy-capture round-boundary driver
+    # ------------------------------------------------------------------
+    def _maybe_lazy_switch(self, batch) -> None:
+        """Round-boundary hook under lazy capture (force=auto only).
+
+        Replaces _maybe_bandit_switch: the lazy controller owns the FAMILY
+        decision (which is what determines the capture mode), the analytic
+        accept model still owns k inside the NEXTN family. The bandit object
+        stays as the ESTIMATOR (metrics + accept model are fed unchanged in
+        on_verify_complete_cpu); only decide() is bypassed.
+
+        RANK UNIFORMITY: observe()/step() consume ctx and accept EMAs only --
+        both rank-uniform -- so every rank walks the same phase machine and
+        reaches the broadcast below in the same round. The one wall-clock
+        input in the whole design ("did the probe win?") is evaluated on rank
+        0 and travels over the EXISTING rung-id broadcast; commit() then
+        advances every rank's phase from that broadcast value, never from a
+        local recomputation.
+        """
+        lazy = self._lazy
+        max_ctx, nextn_acc, dflash_acc = self._lazy_signals(batch)
+        self._ctx_gate_last_ctx = max_ctx
+        lazy.observe(self._rounds_total, max_ctx, nextn_acc, dflash_acc)
+        self._dflash_retired = lazy.retired
+        verdict = lazy.step(self._rounds_total)
+
+        if verdict.decision_due:
+            if self.tp_rank == 0:
+                idx = self._rungs.index(self._lazy_target_rung(verdict))
+            else:
+                idx = 0  # placeholder; overwritten by the broadcast
+            t = torch.tensor([idx], dtype=torch.int64)
+            torch.distributed.broadcast(
+                t, src=self._decision_src, group=self._decision_cpu_group
+            )
+            new_rung = self._rungs[int(t.item())]
+            if new_rung != self._active_rung:
+                intra_family_k = (
+                    new_rung[0] == "nextn" and self._active_name == "nextn"
+                )
+                self._apply_rung(batch, new_rung)
+                if intra_family_k and self._active_rung == new_rung:
+                    # Feed the analytic k dwell (task A) -- _policy_pick_k
+                    # reads it, and without it k could move on every
+                    # decide interval.
+                    self._policy_last_k_change = self._rounds_total
+            # Commit the family that is ACTUALLY running: _apply_rung may
+            # decline (first-boot swap guard), and that refusal is itself
+            # rank-uniform (collective MAX), so every rank commits the same.
+            lazy.commit(self._active_name, self._rounds_total)
+            verdict = lazy.step(self._rounds_total)
+
+        self._lazy_apply_capture_mode(verdict)
+
+    def _lazy_target_rung(self, verdict) -> tuple:
+        """RANK 0 ONLY: resolve the verdict into a concrete rung id.
+
+        The only place wall clock enters the lazy design -- and it is
+        immediately funneled into the broadcast, exactly like the bandit's
+        decide().
+        """
+        from sglang.srt.speculative.cross_algo_lazy import DECIDE_END_MEASURE
+
+        def rung_of(family: str) -> tuple:
+            if family == "dflash":
+                return ("dflash", self._dflash_block_size)
+            return ("nextn", self._policy_pick_k())
+
+        if verdict.decision_kind != DECIDE_END_MEASURE:
+            return rung_of(verdict.family_target or verdict.adopted)
+        # Probe window over: adopt the candidate iff it MEASURED better.
+        # score() = EMA[accepted tokens/round] / EMA[round seconds], the same
+        # objective the bandit uses -- accept alone would be wrong here, the
+        # two families draft at very different block widths.
+        bandit = self._bandit_or_none()
+        cand = verdict.candidate
+        inc = verdict.adopted
+        cand_rung = rung_of(cand) if cand else None
+        inc_rung = rung_of(inc)
+        if bandit is None or cand_rung is None:
+            return inc_rung
+        cand_s = bandit.score(cand_rung)
+        inc_s = bandit.score(inc_rung)
+        won = cand_s is not None and (inc_s is None or cand_s > inc_s)
+        logger.info(
+            "Cross-algo lazy probe @round %d: %s scored %s vs incumbent %s "
+            "%s -> %s.",
+            self._rounds_total,
+            cand,
+            None if cand_s is None else round(cand_s, 2),
+            inc,
+            None if inc_s is None else round(inc_s, 2),
+            "ADOPT" if won else "return",
+        )
+        return cand_rung if won else inc_rung
+
+    def _active_target_graph_runner(self):
+        if self._active_name == "dflash":
+            return self._secondary_target_graph_runner
+        return self._nextn_states[self._active_k].target_graph_runner
+
+    def _lazy_apply_capture_mode(self, verdict) -> None:
+        """Point the target at the capture mode this round needs.
+
+        Two knobs, both eager scheduler code far from any graph-capture
+        region (the stage-3 deadlock lesson), both driven by the rank-uniform
+        verdict:
+
+        * the model's aux-hidden capture flag, and
+        * ``decode_cuda_graph_runner``: None routes the target verify through
+          the existing eager fallback, which is the ONLY way to honor a
+          capture setting the active graph set was not baked with (HAKEN 1;
+          see LazyVerdict.eager for why no dual-capture graph variant).
+        """
+        self._lazy_warmkeep = verdict.warmkeep
+        if verdict.aux_capture != self._lazy_aux_active:
+            self._set_target_aux_capture(verdict.aux_capture)
+            self._lazy_aux_active = verdict.aux_capture
+        want_eager = verdict.eager
+        mr = self._target_worker.model_runner
+        if want_eager:
+            mr.decode_cuda_graph_runner = None
+        elif self._lazy_eager_active:
+            mr.decode_cuda_graph_runner = self._active_target_graph_runner()
+        self._lazy_eager_active = want_eager
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -456,7 +711,26 @@ class CrossAlgoWorker(BaseSpecWorker):
         self._set_target_aux_capture(enabled=self._runtime_aux_enabled())
 
     def _runtime_aux_enabled(self) -> bool:
-        """The target model's steady-state aux-capture setting."""
+        """The target model's steady-state aux-capture setting.
+
+        This is also WHAT THE TARGET GRAPHS GET BAKED WITH: every capture in
+        the boot pipeline runs under the value returned here (the secondary
+        DFLASH build temporarily forces it on and restores it afterwards).
+
+        Default (lazy capture off): on for every switching mode -- both graph
+        sets are dual-capture, which is exactly the standing tax.
+
+        Lazy capture on: the value of the family that boots active (NEXTN ->
+        OFF), so the primary NEXTN target-verify graph set is baked WITHOUT
+        the aux capture and stops producing the aux concat on every round.
+        The DFLASH set is still baked aux-ON inside
+        _init_secondary_cuda_graphs, so each set carries precisely the
+        setting its own rung needs and replay stays correct in both steady
+        states; only a capture mode that contradicts the ACTIVE set's bake
+        needs the eager fallback (see _lazy_apply_capture_mode).
+        """
+        if self._lazy is not None:
+            return self._lazy.aux_required_now
         return self._switching or self._force == "dflash"
 
     def init_cuda_graphs(self):
@@ -729,7 +1003,11 @@ class CrossAlgoWorker(BaseSpecWorker):
         """
         if not self._switching:
             return
-        if self._schedule_interval is not None:
+        if self._lazy is not None:
+            # #156-4: the lazy controller owns the family decision (and with
+            # it the capture mode); it subsumes the bandit's decide().
+            self._maybe_lazy_switch(batch)
+        elif self._schedule_interval is not None:
             if (
                 self._rounds_total - self._rounds_at_switch
             ) >= self._schedule_interval:
@@ -771,7 +1049,11 @@ class CrossAlgoWorker(BaseSpecWorker):
         the decision point is PULLED FORWARD to this round boundary instead
         of waiting out the decide interval -- the trigger is rank-uniform,
         so the collective call stays rank-uniform."""
-        gate_on = self._ctx_gate_threshold is not None
+        # Retirement makes DFLASH ineligible the same way the gate does, so
+        # it must run the eligibility path even with the gate switched off.
+        gate_on = (
+            self._ctx_gate_threshold is not None or self._retire_policy.enabled
+        )
         dflash_eligible = True
         if gate_on:
             dflash_eligible = self._dflash_ctx_eligible(batch)
@@ -841,16 +1123,30 @@ class CrossAlgoWorker(BaseSpecWorker):
         bs>1: the max over the requests is the context the verify attention
         pays for; any single request violating the gate makes the rung
         ineligible. The turn-start pre-emption criterion lives in
-        cross_algo_utils.ctx_gate_eligible."""
+        cross_algo_utils.ctx_gate_eligible.
+
+        #156-4: the monotone RETIREMENT latch is evaluated here too and, once
+        set, removes DFLASH from the eligible set permanently -- which is all
+        it takes for the bandit to stop selecting AND stop probing it
+        (decide() never sees an ineligible rung). No new collective: the
+        eligibility computation was already rank-local, and retirement adds
+        only rank-uniform inputs to it.
+        """
         from sglang.srt.speculative.cross_algo_utils import ctx_gate_eligible
 
-        eligible, max_ctx = ctx_gate_eligible(
-            self._batch_ctx_and_remaining(batch),
-            self._ctx_gate_threshold,
-            self._ctx_gate_near_frac,
-        )
+        ctx_and_remaining = self._batch_ctx_and_remaining(batch)
+        if self._ctx_gate_threshold is not None:
+            eligible, max_ctx = ctx_gate_eligible(
+                ctx_and_remaining,
+                self._ctx_gate_threshold,
+                self._ctx_gate_near_frac,
+            )
+        else:
+            eligible = True
+            max_ctx = max((int(c) for c, _r in ctx_and_remaining), default=0)
         self._ctx_gate_last_ctx = max_ctx
-        return eligible
+        self._maybe_retire_dflash(max_ctx)
+        return eligible and not self._dflash_retired
 
     def _maybe_policy_switch(self, batch) -> None:
         """force=policy (T156 follow-up): deterministic ctx -> rung lookup
@@ -891,6 +1187,19 @@ class CrossAlgoWorker(BaseSpecWorker):
             ("nextn", self._primary_k),
         )
         self._ctx_gate_last_ctx = max_ctx
+        # #156-4 part 1: the retirement latch is a second safety filter on
+        # top of the table, with the same rank-uniform-inputs argument as the
+        # gate filter inside policy_select. A retired DFLASH stage falls back
+        # to the next non-DFLASH stage, or to the primary NEXTN rung.
+        self._maybe_retire_dflash(max_ctx)
+        if self._dflash_retired and target[0] == "dflash":
+            fell_back = True
+            target = ("nextn", self._primary_k)
+            for start, cand in self._policy_table:
+                if start <= max_ctx or cand[0] == "dflash":
+                    continue
+                target = tuple(cand)
+                break
         if fell_back:
             if not self._policy_fallback_logged:
                 self._policy_fallback_logged = True
@@ -1258,6 +1567,13 @@ class CrossAlgoWorker(BaseSpecWorker):
 
     def _warmkeep_dflash_after_nextn_round(self, batch, batch_output) -> None:
         logits_output = batch_output.logits_output
+        if self._dflash_retired:
+            # #156-4 part 1: a retired DFLASH rung can never run again, so
+            # keeping its draft KV warm is pure waste. (Under lazy capture
+            # the aux is not even produced any more; under the plain
+            # retirement flag the graphs still emit it -- drop it here.)
+            logits_output.cross_aux_hidden_states = None
+            return
         aux = logits_output.cross_aux_hidden_states
         assert aux is not None, (
             "cross-algo dual capture: NEXTN verify returned no aux hidden "
@@ -1342,19 +1658,62 @@ class CrossAlgoWorker(BaseSpecWorker):
         with open(self._trace_path, "a") as f:
             f.write(json.dumps(rec) + "\n")
 
+    @contextmanager
+    def _lazy_prefill_ctx(self):
+        """Aux capture ON (and an eager target prefill) for the duration of a
+        dual prefill under lazy capture.
+
+        The DFLASH rung's prefill append consumes the target's aux hidden
+        states, so a prefill run in the lazy steady state (aux OFF) would
+        starve it. Prefill is a per-REQUEST cost, not a per-round one -- the
+        tax this feature removes is per round -- so it keeps the old
+        behavior. The prefill graph runner is routed to the eager runner
+        (its own "prefill graph disabled" representation) because a captured
+        prefill graph would have baked the steady-state aux setting; the
+        target-verify decode graphs are untouched.
+
+        No-op when lazy capture is off: the whole method is only entered
+        through the `self._lazy is not None` branch.
+        """
+        mr = self._target_worker.model_runner
+        prev_aux = self._lazy_aux_active
+        prev_prefill = mr.prefill_cuda_graph_runner
+        if not prev_aux:
+            self._set_target_aux_capture(True)
+            self._lazy_aux_active = True
+            mr.prefill_cuda_graph_runner = getattr(mr, "eager_runner", None)
+        try:
+            yield
+        finally:
+            if not prev_aux:
+                mr.prefill_cuda_graph_runner = prev_prefill
+                self._set_target_aux_capture(False)
+                self._lazy_aux_active = False
+
     def _dual_prefill(self, batch, on_publish=None):
         """One shared target prefill forward feeding BOTH rungs' draft-prefill
         paths, so every request is warm in both drafts from birth and can be
         served by either rung after any later switch."""
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch_output = self._target_worker.forward_batch_generation(batch)
-        batch_output.new_seq_lens = batch.seq_lens
-        if on_publish is not None:
-            on_publish(batch_output.new_seq_lens)
+        prefill_ctx = (
+            self._lazy_prefill_ctx() if self._lazy is not None else nullcontext()
+        )
+        with prefill_ctx:
+            batch_output = self._target_worker.forward_batch_generation(batch)
+            batch_output.new_seq_lens = batch.seq_lens
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
 
-        # DFLASH first: it reads batch.extend_lens/prefix_lens/out_cache_loc,
-        # which the NEXTN draft-extend below partially rewrites.
-        dflash_input = self._dflash_sub.prefill_after_target(batch, batch_output)
+            # DFLASH first: it reads batch.extend_lens/prefix_lens/
+            # out_cache_loc, which the NEXTN draft-extend below partially
+            # rewrites. A RETIRED DFLASH rung is skipped entirely (#156-4
+            # part 1): it can never serve this request, so its prefill
+            # append is pure waste.
+            dflash_input = (
+                None
+                if self._dflash_retired
+                else self._dflash_sub.prefill_after_target(batch, batch_output)
+            )
 
         nx = self._nextn_sub
         dw = nx.draft_worker
@@ -1372,6 +1731,10 @@ class CrossAlgoWorker(BaseSpecWorker):
             )
 
         if self._active_name == "dflash":
+            assert dflash_input is not None, (
+                "cross-algo: the DFLASH rung is retired but still active -- "
+                "retirement must evict it before the next prefill"
+            )
             # Serve the DFLASH rung, but carry the NEXTN seeds along (relayed
             # through the FutureMap / the object itself) for a later switch.
             dflash_input.topk_p = eagle_input.topk_p
@@ -1404,13 +1767,27 @@ class CrossAlgoWorker(BaseSpecWorker):
             batch, *args, **kwargs
         )
         # Keep the INACTIVE rung warm (see the section comment above).
-        tic = time.perf_counter()
-        if self._active_name == "dflash":
-            self._warmkeep_nextn_after_dflash_round(batch, batch_output)
-        else:
-            self._warmkeep_dflash_after_nextn_round(batch, batch_output)
-        self._warmkeep_ms_since_switch += (time.perf_counter() - tic) * 1e3
-        self._warmkeep_rounds_since_switch += 1
+        # #156-4 part 2: under lazy capture the steady state skips this
+        # entirely -- it is the expensive half of the standing tax (an eager
+        # 1-layer MTP draft-extend on every DFLASH round) -- and it is
+        # restored only inside a warm-up/probe window (or on the optional
+        # warmkeep_stride). _lazy_warmkeep is True whenever lazy is off.
+        if self._lazy_warmkeep:
+            tic = time.perf_counter()
+            if self._active_name == "dflash":
+                self._warmkeep_nextn_after_dflash_round(batch, batch_output)
+            else:
+                self._warmkeep_dflash_after_nextn_round(batch, batch_output)
+            self._warmkeep_ms_since_switch += (time.perf_counter() - tic) * 1e3
+            self._warmkeep_rounds_since_switch += 1
+        elif self._active_name == "dflash":
+            # The NEXTN catch-up is what normally CONSUMES the target's final
+            # hidden states and nulls them (the DFLASH rung reads the aux
+            # field, dflash_worker_v2._release_target_context_hidden releases
+            # only that one). With the catch-up skipped nothing would drop the
+            # reference, so a big buffer would ride along through the overlap
+            # relay for no reader. Release it here.
+            batch_output.logits_output.hidden_states = None
         self._trace_round(batch, batch_output)
         return batch_output
 

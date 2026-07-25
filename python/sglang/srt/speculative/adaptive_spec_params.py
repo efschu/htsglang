@@ -568,6 +568,21 @@ class RungMetrics:
             return None
         return m[0] / m[2]
 
+    def accept_len(self, steps, min_samples: int = 1) -> float | None:
+        """EMA accepted tokens per verify round for one rung, or None below
+        *min_samples* observations.
+
+        RANK-UNIFORM, unlike reward()/round_s(): it is fed exclusively from
+        the rank-0-broadcast accept counts (#50), so every rank holds the
+        same value and a decision built on it needs no broadcast of its own.
+        That is what makes it usable as the free content signal / collapse
+        criterion of the cross-algo lazy-capture controller.
+        """
+        m = self._per_rung.get(steps)
+        if m is None or m[1] < min_samples:
+            return None
+        return m[0]
+
     def round_s(self, steps, min_time_samples: int = 1) -> float | None:
         """EMA round duration of one rung, or None below *min_time_samples*.
         RANK-LOCAL wall clock -- same consumption rule as reward()."""

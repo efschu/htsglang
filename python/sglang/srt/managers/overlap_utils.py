@@ -134,11 +134,42 @@ class ResolvedConfidence(msgspec.Struct):
     generation: torch.Tensor
 
 
+def relay_field(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Normalize one relay extra to "present" (a tensor) or "absent" (None).
+
+    A drafter that does not OWN an Eagle-shaped field carries a zero-width
+    PLACEHOLDER for it rather than nothing: DFlashDraftInputV2's topk_p /
+    topk_index / hidden_states are documented as "legacy Eagle-shaped fields;
+    DFLASH relays via FutureMap so these are unused" and
+    draft_worker_common.make_draft_input_v2 builds them as ``(bs, 0)``. That
+    placeholder is semantically ABSENT, and the stash path already has a
+    complete absent-field contract -- but it keys on ``is None``, so a
+    zero-width tensor slipped past it and was written into a slot sized from
+    a real payload.
+
+    Under cross-algorithm switching that used to be invisible: the per-round
+    warm-keep of the idle NEXTN rung overwrote all three fields with real
+    seeds on EVERY DFLASH round, so a placeholder never reached the stash.
+    Dropping that per-round warm-keep is exactly what lazy single capture
+    does (#156-4), which is why the crash surfaced there first -- but the
+    latent hole is in the relay, not in the lazy path, so it is fixed here.
+
+    Zero-numel is a pure local SHAPE test, identical on every rank (batch
+    size and draft width are rank-uniform), so the branch cannot desync.
+    """
+    if t is None or t.numel() == 0:
+        return None
+    return t
+
+
 @dataclass
 class RelayPayload:
     """Per-iteration stash payload for the FutureMap bufs. Non-spec fills only
     `bonus_tokens`; which spec extras get relayed is decided by
-    `FutureMap.spec_algo`, not by this payload's shape."""
+    `FutureMap.spec_algo`, not by this payload's shape.
+
+    Spec extras are None when ABSENT -- see relay_field: a drafter that does
+    not own a field must not present its zero-width placeholder as data."""
 
     bonus_tokens: torch.Tensor
     topk_p: Optional[torch.Tensor] = None
@@ -151,11 +182,13 @@ class RelayPayload:
     def from_draft_input(cls, draft_input: EagleDraftInput) -> RelayPayload:
         return cls(
             bonus_tokens=draft_input.bonus_tokens,
-            topk_p=draft_input.topk_p,
-            topk_index=draft_input.topk_index,
-            hidden_states=draft_input.hidden_states,
-            draft_probs=getattr(draft_input, "draft_probs", None),
-            dsa_topk_indices=getattr(draft_input, "dsa_topk_indices", None),
+            topk_p=relay_field(draft_input.topk_p),
+            topk_index=relay_field(draft_input.topk_index),
+            hidden_states=relay_field(draft_input.hidden_states),
+            draft_probs=relay_field(getattr(draft_input, "draft_probs", None)),
+            dsa_topk_indices=relay_field(
+                getattr(draft_input, "dsa_topk_indices", None)
+            ),
         )
 
 
@@ -311,10 +344,21 @@ class FutureMap:
         # Spec extras are gated by spec_algo, not by the payload's shape, so a
         # non-spec stash allocates no extra bufs (only output_tokens_buf).
         self.need_topk = self.spec_algo.is_some() and self.spec_algo.need_topk()
+        # Deliberately NOT gated on `payload.hidden_states is not None`: which
+        # extras this server relays is a property of the CONFIGURATION, and
+        # latching it from whichever payload happened to be stashed first
+        # makes it depend on stash ORDER. That order is algorithm-dependent
+        # under cross-algorithm switching -- a DFLASH round (or any bonus-only
+        # stash) can legitimately come first, and it carries no hidden states,
+        # which would pin need_hidden_states to False for the FutureMap's whole
+        # lifetime and silently strip the NEXTN/MTP rung of its hidden-state
+        # relay forever after. Not a crash: a silent accept-rate regression.
+        # The per-field lazy allocation below is what tolerates an absent
+        # field, and it already does so correctly (_ensure_hidden_buf returns
+        # False and nothing is written), so no buffer is allocated until a
+        # payload that HAS the field arrives.
         self.need_hidden_states = (
-            self.spec_algo.is_some()
-            and spec_need_hidden_states()
-            and payload.hidden_states is not None
+            self.spec_algo.is_some() and spec_need_hidden_states()
         )
 
         # Buf allocation is per-field lazy (see _ensure_topk_bufs /
@@ -350,10 +394,16 @@ class FutureMap:
     def _ensure_topk_bufs(self, payload: RelayPayload) -> bool:
         if self.topk_p_buf is not None:
             return True
-        if payload.topk_p is None or payload.topk_index is None:
+        # Shape PEEK: never size the pool buffers from a zero-width
+        # placeholder (relay_field) -- a (req_pool_size, 0) buffer would
+        # silently swallow every later write and then mismatch the first
+        # real payload.
+        topk_p = relay_field(payload.topk_p)
+        topk_index = relay_field(payload.topk_index)
+        if topk_p is None or topk_index is None:
             return False
-        topk_p0 = payload.topk_p[0]
-        topk_index0 = payload.topk_index[0]
+        topk_p0 = topk_p[0]
+        topk_index0 = topk_index[0]
         self.topk_p_buf = torch.empty(
             (self.req_pool_size, *topk_p0.shape),
             dtype=topk_p0.dtype,
@@ -369,9 +419,10 @@ class FutureMap:
     def _ensure_hidden_buf(self, payload: RelayPayload) -> bool:
         if self.hidden_states_buf is not None:
             return True
-        if payload.hidden_states is None:
+        hidden_states = relay_field(payload.hidden_states)
+        if hidden_states is None:
             return False
-        hidden_states0 = payload.hidden_states[0]
+        hidden_states0 = hidden_states[0]
         self.hidden_states_buf = torch.empty(
             (self.req_pool_size, *hidden_states0.shape),
             dtype=hidden_states0.dtype,
@@ -543,19 +594,24 @@ class FutureMap:
             self.output_tokens_buf.dtype
         )
 
-        # None-tolerant per field (cross-algorithm switching may stash
+        # Absent-tolerant per field (cross-algorithm switching may stash
         # bonus-only payloads); an absent field simply keeps the previous
         # relayed value, and the consumer contract guarantees a round that
         # READS a field was preceded by a round that stashed it.
-        if self.need_topk and payload.topk_p is not None:
+        # "Absent" means None OR a zero-width placeholder -- see relay_field;
+        # re-normalized here so a directly built payload cannot bypass it.
+        topk_p = relay_field(payload.topk_p)
+        topk_index = relay_field(payload.topk_index)
+        hidden_states = relay_field(payload.hidden_states)
+        if self.need_topk and topk_p is not None and topk_index is not None:
             if self._ensure_topk_bufs(payload):
-                self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
-                self.topk_index_buf[indices] = payload.topk_index.to(
+                self.topk_p_buf[indices] = topk_p.to(self.topk_p_buf.dtype)
+                self.topk_index_buf[indices] = topk_index.to(
                     self.topk_index_buf.dtype
                 )
-        if self.need_hidden_states and payload.hidden_states is not None:
+        if self.need_hidden_states and hidden_states is not None:
             if self._ensure_hidden_buf(payload):
-                self.hidden_states_buf[indices] = payload.hidden_states.to(
+                self.hidden_states_buf[indices] = hidden_states.to(
                     self.hidden_states_buf.dtype
                 )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
