@@ -58,6 +58,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
+    dequant_fp8_block_weight,
     dequant_fp8_weight,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
@@ -304,7 +305,10 @@ class Fp8Config(QuantizationConfig):
         Instance-level, because the answer depends both on the checkpoint and
         on what the device can actually do.
         """
-        if self.use_mxfp8 or self.weight_block_size is not None:
+        # mxfp8 keeps its floor: UE8M0 scales have no plain-torch route here.
+        # BLOCK-scaled fp8 does have one (dequant_fp8_block_weight), so it is
+        # treated like the per-tensor/per-channel case: no kernel, no floor.
+        if self.use_mxfp8:
             return True
         return not fp8_needs_dequant_fallback()
 
@@ -465,11 +469,22 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_dequant = (
             not self.block_quant and not self.use_marlin and fp8_needs_dequant_fallback()
         )
+        # Block-scaled fp8 with no block-fp8 GEMM anywhere: dequantise the
+        # [block_n, block_k] tiles per forward. mxfp8 is excluded -- its UE8M0
+        # scales are a different encoding with no plain-torch route here.
+        self.use_block_dequant = (
+            self.block_quant and not self.use_mxfp8 and fp8_needs_dequant_fallback()
+        )
         self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
         self.weight_block_size = self.quant_config.weight_block_size
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
-        if self.use_mxfp8 and not self.convert_mxfp8_to_block:
+        if self.use_block_dequant:
+            # Do not dispatch a block-fp8 GEMM runner we have already
+            # established does not exist on this device; the dispatch itself
+            # can import kernels this platform cannot build.
+            pass
+        elif self.use_mxfp8 and not self.convert_mxfp8_to_block:
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
@@ -976,6 +991,23 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=weight_scale,
                 input_scale=None,
                 bias=bias,
+            )
+
+        if self.use_block_dequant:
+            # W8A16, block-scaled: one scale per [block_n, block_k] tile,
+            # expanded per forward. Weights stay fp8 resident; activations are
+            # never quantised, so layer.input_scale plays no part. Unlike the
+            # per-channel case this cannot be folded into a vector multiply --
+            # the scale varies along BOTH axes -- so it costs more, which is
+            # measured rather than assumed.
+            if isinstance(x, tuple):
+                x = x[0]  # (input, scale) pairs only arrive on quantised paths
+            return torch.nn.functional.linear(
+                x,
+                dequant_fp8_block_weight(
+                    layer.weight, layer.weight_scale_inv, self.weight_block_size, x.dtype
+                ),
+                bias,
             )
 
         if self.use_dequant:

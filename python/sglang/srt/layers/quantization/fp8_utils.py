@@ -299,6 +299,49 @@ def dequant_fp8_weight(
     return weight.to(out_dtype) * weight_scale.to(out_dtype)
 
 
+def dequant_fp8_block_weight(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: List[int],
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dequantise a BLOCK-scaled fp8 weight: one scale per [block_n, block_k] tile.
+
+    ``weight`` is ``(n, k)`` fp8 and ``scale`` is
+    ``(ceil(n/block_n), ceil(k/block_k))``, so element ``(i, j)`` is scaled by
+    ``scale[i // block_n, j // block_k]``.
+
+    Two paths, same result:
+
+    * When both dimensions are exact multiples of the block, the weight is
+      VIEWED as ``(n/bn, bn, k/bk, bk)`` and multiplied by the scale broadcast
+      as ``(n/bn, 1, k/bk, 1)``. No expanded scale is ever materialised -- the
+      only allocation is the output itself.
+    * Otherwise the last row/column of blocks is partial, broadcasting cannot
+      express it, and the scale is expanded with repeat_interleave and sliced
+      back to ``(n, k)``. Correct for ragged edges, at the cost of one extra
+      ``(n, k)`` temporary.
+
+    The existing block_quant_dequant() does the expand-and-slice unconditionally
+    and in fp32, i.e. it allocates two fp32 (n, k) temporaries. This computes in
+    the compute dtype and skips the expansion whenever the shape allows, which
+    is the common case (128 | n and 128 | k for essentially every real
+    checkpoint), so the transient cost drops by roughly 4x.
+    """
+    block_n, block_k = block_size[0], block_size[1]
+    n, k = weight.shape[-2], weight.shape[-1]
+    if n % block_n == 0 and k % block_k == 0:
+        w = weight.to(out_dtype).view(n // block_n, block_n, k // block_k, block_k)
+        s = scale.to(out_dtype).view(scale.shape[-2], 1, scale.shape[-1], 1)
+        return (w * s).view(n, k)
+    s = (
+        scale.to(out_dtype)
+        .repeat_interleave(block_n, dim=-2)
+        .repeat_interleave(block_k, dim=-1)[..., :n, :k]
+    )
+    return weight.to(out_dtype) * s
+
+
 def normalize_e4m3fn_to_e4m3fnuz(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
