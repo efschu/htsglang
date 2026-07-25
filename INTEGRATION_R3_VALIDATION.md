@@ -922,3 +922,124 @@ comparison checkpoint (`RedHatAI/Qwen3.5-4B-FP8-dynamic`) is
 
 **Limit of this claim:** established by reading and evaluating the gates on this
 host. It is NOT measured on sm75 or gfx900, which this rig does not have.
+
+
+## Baseline: what normal sglang usage gives on these three cards
+
+**One binary, one venv, one model.** The "stock" rows are this fork's own build
+(`e879d35f2a`, `/spinning/htsglang-gpu/.venv`, `/spinning/wt-merge-probe`) run
+with STOCK FLAGS ONLY -- no `--rank-tp-ratio`, no uneven DCP, no MTP where
+stock forbids it. So the delta is purely flags and features; "that was a
+different build / different kernels / different install" cannot be argued.
+
+Qwen3.6-27B-FP8, `--kv-cache-dtype fp8_e5m2`, `--context-length 32768`,
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`, devices 0,1,2 = 3080 / 5090 / 3080.
+Decode is a SLOPE over two generation lengths on one prompt (prefill cancels
+exactly); prefill is a 1172-token prompt with `max_new_tokens=1`; the M=8 cell
+is 8 concurrent 1172-token prompts, aggregate = sum(prompt_tokens)/wall.
+
+### The capability statement comes first
+
+**Stock TP cannot use these three cards at all.** Not "slower" -- refused, on
+the same binary our features run on:
+
+```
+RuntimeError: The memory capacity is unbalanced. Some GPUs may be occupied by
+other processes. pre_model_load_memory=19.2269287109375,
+local_gpu_memory=30.54656982421875, local_gpu_memory * 0.9=27.491912841796875
+```
+
+The check compares the group-minimum free memory (19.23 GB, a 3080) against
+this rank's own total (30.55 GB, the 5090) at a 90% tolerance: 19.23 < 27.49.
+Stock TP therefore requires roughly-equal VRAM and **never reaches** the kv=4
+divisibility question, which would block it a second time. GPUs were verified
+idle (1 MiB each) immediately before launch, so stock's "occupied by other
+processes" wording is misleading -- the cause is heterogeneous VRAM.
+
+**Under stock PP, MTP and the overlap scheduler are FORBIDDEN, not switched
+off** (`server_args.py`): `assert self.disable_overlap_schedule and
+self.speculative_algorithm is None, "Pipeline parallelism is not compatible
+with overlap schedule, speculative decoding"`. The stock PP rows are therefore
+handicapped by obligation, which is why the shackled fork control exists.
+
+### The table
+
+| configuration | cards | decode tok/s (bs=1) | prefill tok/s (bs=1) | M=8 aggregate prefill | MTP |
+|---|---|---|---|---|---|
+| stock flags, TP=3 | **0 -- refused** | -- | -- | -- | -- |
+| stock flags, PP=3 even (21/21/22) | 3 | 28.28 | 1357.4 | **2597.6** | forbidden |
+| stock flags, PP=3 uneven (18/28/18) | 3 | 35.73 | 1495.0 | **3000.8** | forbidden |
+| fork, same shackles (control) | 3 | 33.46 | 1426.7 | not run | off |
+| **fork, full programme** | 3 | **91.92** | 1155.9 | 1221.6 | yes, accept 3.130 |
+| solo 5090 | 1 | **OOM** | -- | -- | -- |
+
+`cached_tokens = 0` on every M=8 request, so the prefill was genuinely
+recomputed and not served from the radix cache.
+
+### What the numbers actually say -- including where stock wins
+
+1. **Decode latency is the fork's case.** 91.92 vs 28.28 tok/s is **3.25x**
+   over stock PP even, 2.57x over stock PP uneven.
+2. **But that win is MTP + overlap, NOT tensor- vs pipeline-parallelism.**
+   The control settles it: the fork shackled identically reaches 33.46, and
+   stock PP uneven reaches **35.73 -- i.e. stock is 6.8% FASTER than the fork
+   once both are stripped of MTP and overlap.** On the pure parallelism axis at
+   bs=1 the layer split is not behind; it is slightly ahead. Anyone quoting the
+   3.25x without this line is quoting a capability gap as if it were a
+   parallelism gap.
+3. **At concurrent prefill stock PP wins outright, by a lot.** 3000.8 vs
+   1221.6 tok/s -- stock PP uneven is **2.46x the fork**. This is the layer
+   split's parade discipline: with 8 requests in flight the stages fill and
+   work overlapped. It belongs in the table at exactly the same size as the
+   decode result.
+4. **The fork's prefill is saturated at M=1, and this run proves it
+   independently.** fork_full goes 1155.9 (M=1) -> 1221.6 (M=8), **+5.7%**,
+   while stock PP uneven goes 1495.0 -> 3000.8, **+101%**. That matches the
+   earlier campaign's Par8-Prefill ~= single-stream observation exactly, on a
+   different prompt length -- so the flat-bar prediction held.
+5. **The uneven layer split is worth using.** 18/28/18 over the default
+   21/21/22 buys +26% decode (28.28 -> 35.73) and +15.5% aggregate prefill
+   (2597.6 -> 3000.8), by moving KV-bearing full-attention layers onto the
+   32 GB card (4/7/5 instead of 5/5/6). `SGLANG_PP_LAYER_PARTITION` is upstream
+   sglang, so this is a stock capability, not a fork one.
+6. **The single-card anchor answers "why more than one card": it does not
+   fit.** `torch.OutOfMemoryError: Tried to allocate 2.37 GiB. GPU 0 has a
+   total capacity of 31.34 GiB of which 2.08 GiB is free` -- 27 GB of weights
+   plus the MTP draft and a KV pool does not fit a 32 GB 5090.
+
+So the honest summary is NOT "the fork is faster everywhere". It is: the fork
+makes these three cards usable in TP at all, and buys a large decode-latency
+and capacity win via MTP; stock's layer split is competitive at bs=1 decode
+once equally shackled and clearly better at bulk prefill.
+
+### Deviations, stated
+
+* `FLASHINFER_USE_CUDA_NORM=1` on **every** row, so all rows share one norm
+  implementation and the delta stays parallelism/features. Required because
+  flashinfer's CuTe norm decides PDL from `input.device` but compiles for the
+  CURRENT device: with all three GPUs visible per process (what PP does) it
+  emits `griddepcontrol` -- sm_90+ -- into a kernel targeting `chip="sm_86"`
+  and ptxas aborts. Fork TP never hits this because `--rank-gpu-id` pins one
+  GPU per rank, so the two devices cannot disagree. It is flashinfer's own
+  documented fallback env, not a patch, and it blocks PP for stock flags and
+  fork alike.
+* `fork_full` here runs the shared shape (`--max-running-requests` 1 or 8,
+  single-stream slope), so its accepts are NOT the arm-E numbers, which used
+  `max-running-requests 3`. Same regime (3.130 sits inside the established
+  3.01-3.76 band), different configuration -- do not cross-read them.
+
+### Separate finding: the published sgl-kernel wheel does not work here
+
+Found while first attempting this as a separate stock install (that approach
+was abandoned in favour of the flag-level comparison above, which is stronger).
+Recorded because it is an upstream defect, not ours:
+
+* `pip install "sglang[all]==0.5.15.post1"` installs **no working sgl-kernel**;
+  without it sglang falls back to the CuTe norm above and cannot boot on sm86.
+* The PyPI wheel is a CUDA-12 build (`libnvrtc.so.12`) against a cu130 torch.
+* The `cu130` wheel wants
+  `_ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_`**`ib`** while torch
+  2.11.0+cu130 defines **`jb`** -- built against a different torch signature.
+* The cu130 index's recorded hash `d751c4dc...` no longer matches the actual
+  release asset `62d41f63...`, i.e. the artifact was rebuilt without updating
+  the index, so pip refuses it outright.
