@@ -1325,3 +1325,52 @@ calculation was therefore sound but unnecessary -- measurement wins, and the
 **The qualitative claim is unchanged and now rests on measurement rather than
 assumption:** the pre-fork configuration cannot serve this model at its own
 maximum context, while the fork configuration can, several times over.
+
+#### Addendum: the 0.82 reference command itself was never measured
+
+A second, deeper search (including `/root/.omp/agent/sessions/`) settles two
+open points.
+
+**1. The exact reference command has no numbers anywhere.** It was launched
+twice: once bare from `/root/.bash_history` (interactive, no redirect, nothing
+captured), and once under an LMCache connector, where it died in
+`initialize_kv_cache -> kv_transfer_group.register_kv_caches` **before** vLLM
+printed `Available KV cache memory` / `GPU KV cache size`. So the `0.82` case
+remains unmeasured on this machine, exactly as stated above -- every `0.82`
+occurrence on disk is a command line, documentation, or a crashed boot.
+
+**2. Which hardware the tp=2 log ran on -- resolved, and my arithmetic held.**
+The search flagged that the model cache is named `club-3090` and suggested the
+runs might be on 3090s, which would have invalidated the inference. Checked:
+
+* `nvidia-smi` on this box reports 2x RTX 3080 (20480 MiB) + 1x RTX 5090;
+* `club-3090` is the name of a community project, not a hardware statement --
+  `HARDWARE.md` is its compatibility table, and its 2x-3080-20GB row is
+  explicitly "Tested 2026-05-02 by @troymroberts (#25)", a third-party
+  contribution;
+* the sibling `shvllm_awq_tp3auto` log carries `rank_tp_ratio: 'auto'`, which
+  is the FORK's heterogeneous-TP flag and only means anything on mixed GPUs --
+  so the matrix logs come from this rig.
+
+The tp=2 log is therefore on this rig's 3080s, which is what the memory
+arithmetic already implied (2.15 GiB overhead on a 20 GB card, against an
+implausible 5.67 GiB on a 24 GB one).
+
+**3. Further measured tp=2 datapoints** (recorded, not merged into the main
+table -- each differs from the reference config in a way that matters):
+
+| run | config delta | KV size | concurrency |
+|---|---|---|---|
+| vLLM tp2, util 0.95, MTP=**2** | fewer spec tokens, LMCache attached | 193,600 tok | 1.00x at 193,600 |
+| vLLM tp2, eager, **no MTP**, default KV dtype | no speculation, `max_model_len 32000` | 96,000 tok | 3.00x at 32,000 |
+| HARDWARE.md, 2x3080-20GB, util 0.82 | **third-party**, config not fully specified | 5.2 GB KV/card | 1.43x |
+
+The third-party 0.82 row is the only external claim about the exact utilisation
+the reference command uses, and it does not reconcile with the local 0.88 run
+(5.2 GB/card against 1.94 GiB): a *lower* utilisation reporting *more* KV means
+the two are not the same configuration. It is therefore quoted as somebody
+else's datapoint and not used.
+
+**Net effect on the comparison: none.** The headline rests on the local
+measured pair (94,400 / 1.00x at tp=2 versus 1,146,573 / 4.37x at tp=3 auto),
+both from this rig and the same engine.
