@@ -256,6 +256,29 @@ def fp8_native_gemm_available() -> bool:
         return False
 
 
+@lru_cache(maxsize=1)
+def fp8_needs_dequant_fallback() -> bool:
+    """True when NO fp8 GEMM of any kind is reachable on this device.
+
+    Checked in the order the fast paths would be tried: a native fp8 GEMM
+    (sm89+/Hopper/Blackwell, MI300+), cutlass, then Marlin (sm80..88). If none
+    of them exists, the only correct route left is dequantise + F.linear.
+
+    Deliberately not a capability number -- see fp8_native_gemm_available.
+
+    SGLANG_FORCE_FP8_DEQUANT=1 forces this on. It exists so the fallback can be
+    exercised on a machine that does have fp8 hardware -- otherwise the only
+    way to test it is on a card too small for the checkpoints that need it.
+    """
+    if get_bool_env_var("SGLANG_FORCE_FP8_DEQUANT"):
+        return True
+    return not (
+        fp8_native_gemm_available()
+        or cutlass_fp8_supported()
+        or can_auto_enable_marlin_fp8()
+    )
+
+
 def dequant_fp8_weight(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,

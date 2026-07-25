@@ -58,8 +58,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
+    dequant_fp8_weight,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
+    fp8_needs_dequant_fallback,
     get_fp8_gemm_runner_backend,
     input_to_float8,
     mxfp8_group_quantize,
@@ -291,6 +293,21 @@ class Fp8Config(QuantizationConfig):
 
         return 100 if self.use_mxfp8 else 80
 
+    def needs_device_kernel(self) -> bool:
+        """Whether this config depends on a device kernel with a capability floor.
+
+        A plain (non-block, non-mxfp8) fp8 checkpoint can be served by
+        dequantising the weights and using F.linear, which needs no fp8 kernel
+        and therefore has no floor. Block-scaled and mxfp8 checkpoints keep
+        their floor: their scale layouts have no plain-torch route here.
+
+        Instance-level, because the answer depends both on the checkpoint and
+        on what the device can actually do.
+        """
+        if self.use_mxfp8 or self.weight_block_size is not None:
+            return True
+        return not fp8_needs_dequant_fallback()
+
     @classmethod
     def get_config_filenames(cls) -> List[str]:
         return []
@@ -440,6 +457,13 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
+        )
+        # Last resort: no native fp8 GEMM, no cutlass, no Marlin. Weights stay
+        # fp8 in VRAM and are dequantised per forward (W8A16); activations are
+        # never quantised. Only for plain per-tensor/per-channel checkpoints --
+        # block-scaled and mxfp8 layouts have no plain-torch route here.
+        self.use_dequant = (
+            not self.block_quant and not self.use_marlin and fp8_needs_dequant_fallback()
         )
         self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
         self.weight_block_size = self.quant_config.weight_block_size
@@ -821,9 +845,17 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
 
                 # cutlass sgl-kernel and marlin only support per-channel scale; aiter supports per-channel scale
+                # The dequant fallback joins this branch on purpose: it wants
+                # per-channel scales too, and -- more importantly -- this branch
+                # is the one that needs NO kernel. The per-tensor branch below
+                # requantises via scaled_fp8_quant, which is exactly the kind of
+                # kernel the fallback exists because the device does not have.
+                # Keeping the loaded scales also avoids a requantisation step,
+                # so the fallback is if anything slightly more accurate.
                 if (
                     self.cutlass_fp8_supported
                     or self.use_marlin
+                    or self.use_dequant
                     or (_use_aiter and self.use_aiter_fp8_per_token)
                 ):
                     weight = layer.weight
@@ -944,6 +976,20 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=weight_scale,
                 input_scale=None,
                 bias=bias,
+            )
+
+        if self.use_dequant:
+            # W8A16: weights are dequantised per forward, activations stay in
+            # their compute dtype and are never quantised, so layer.input_scale
+            # (if the checkpoint carried one) is deliberately unused.
+            # layer.weight was stored transposed as (in, out); .t() is a view
+            # back to (out, in), which is what F.linear wants. weight_scale is
+            # either per-tensor (scalar) or per-channel (out, 1); both
+            # broadcast correctly against (out, in).
+            return torch.nn.functional.linear(
+                x,
+                dequant_fp8_weight(layer.weight.t(), layer.weight_scale, x.dtype),
+                bias,
             )
 
         if self.block_quant:

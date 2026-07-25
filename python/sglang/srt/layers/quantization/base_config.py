@@ -155,6 +155,16 @@ class QuantizationConfig(ABC):
         """
         raise NotImplementedError()
 
+    def needs_device_kernel(self) -> bool:
+        """Whether get_min_capability() actually describes this config here.
+
+        A config that can serve its checkpoint with plain torch ops (e.g. by
+        dequantising weights and using F.linear) has no capability floor, and
+        the floor must not be enforced against it. Configs that always require
+        a custom kernel leave this at True.
+        """
+        return True
+
     @staticmethod
     @abstractmethod
     def get_config_filenames() -> List[str]:
