@@ -559,3 +559,57 @@ def test_decode_bucket_registration_happens_after_the_last_capture_bs_edit():
         "buckets would not be the captured set, so a replay could run a kernel "
         "other than the one it was captured with"
     )
+
+
+def test_dequant_workspace_has_exactly_one_consumer_each():
+    """Pin the invariant that keeps the shared dequant workspace safe.
+
+    `_DEQUANT_WS` is ONE buffer per (device, dtype), shared by every GGUF
+    layer, and `_ggml_dequantize_ws` hands the dequantized weight itself back
+    to the caller. Its safety argument is stated in a docstring: the
+    dequant -> GEMM pairs run back-to-back on one stream, so each GEMM
+    consumes the buffer before the next dequant overwrites it.
+
+    That argument holds only while there is exactly ONE consumer. A second
+    call site -- another layer type, a second stream, a prefetch -- breaks it
+    silently: no crash, no shape error, just a GEMM reading someone else's
+    weights. The buffer is deliberately kept (a static allocation is friendlier
+    to CUDA-graph capture than a per-replay one), so the invariant is pinned
+    here instead of being made structural.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve()
+    while root.name and not (root / "python" / "sglang").is_dir():
+        root = root.parent
+    src = root / "python/sglang/srt/layers/quantization/gguf.py"
+    tree = ast.parse(src.read_text())
+
+    calls = {"_ggml_dequantize_ws": [], "_mul_mat_dequant_chunked": []}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in calls:
+                calls[node.func.id].append(node.lineno)
+
+    for name, sites in calls.items():
+        assert len(sites) == 1, (
+            f"{name} now has {len(sites)} call sites at lines {sites}. The "
+            "shared dequant workspace is safe only while a single consumer "
+            "uses it back-to-back with its GEMM; a second consumer makes one "
+            "GEMM read the other's weights, silently."
+        )
+
+    # ...and both must sit inside the one function whose GEMM consumes them.
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "fused_mul_mat_gguf"
+    )
+    lo, hi = fn.lineno, max(
+        getattr(x, "lineno", fn.lineno) for x in ast.walk(fn)
+    )
+    for name, sites in calls.items():
+        assert lo <= sites[0] <= hi, (
+            f"{name} moved out of fused_mul_mat_gguf (line {sites[0]} not in "
+            f"{lo}..{hi}); the consume-immediately argument no longer applies"
+        )

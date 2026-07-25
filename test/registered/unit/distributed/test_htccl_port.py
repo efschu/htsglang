@@ -621,3 +621,40 @@ def test_construction_is_flag_gated():
         "from sglang.srt.distributed.device_communicators.htccl import"
     )
     assert idx_import > idx_gate, "the HTCCL import must sit inside the flag gate"
+
+
+def test_cpu_transports_are_rejected_while_cuda_graphs_are_on():
+    """shm/gloo + CUDA graphs must fail at STARTUP, not mid-capture.
+
+    Both CPU transports host-stage every collective (shm: two
+    cudaStreamSynchronize per op plus a spin on shm counters; gloo: a
+    cudaEventSynchronize and a gloo CPU collective per chunk). Inside a
+    capture that raises `cudaErrorStreamCaptureUnsupported` from whichever
+    kernel is capturing -- observed on arm E, where it read as an unrelated
+    CUDA fault. The constraint used to live only in a log line.
+    """
+    import types as _types
+
+    import sglang.srt.distributed.parallel_state as ps
+
+    graphs_on = _types.SimpleNamespace(disable_cuda_graph=False)
+    graphs_off = _types.SimpleNamespace(disable_cuda_graph=True)
+
+    import sglang.srt.runtime_context as rc
+    orig = rc.get_server_args
+    try:
+        rc.get_server_args = lambda: graphs_on
+        for transport in ("shm", "gloo"):
+            with pytest.raises(ValueError) as ei:
+                ps._enforce_cpu_transport_needs_eager(transport)
+            msg = str(ei.value)
+            assert "--disable-cuda-graph" in msg, msg
+            assert "device" in msg, msg  # names the capturable alternative
+        # the GPU-driven transport is capturable and must NOT be rejected
+        ps._enforce_cpu_transport_needs_eager("device")
+
+        rc.get_server_args = lambda: graphs_off
+        for transport in ("shm", "gloo", "device"):
+            ps._enforce_cpu_transport_needs_eager(transport)
+    finally:
+        rc.get_server_args = orig

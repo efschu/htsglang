@@ -175,3 +175,85 @@ same trap was seen earlier with `feat/dcp-comm-fusion`, whose r2 merge parent
 (`681220baba`) is no longer on the branch. Before merging any branch that
 reports "ahead", check whether its distinctive identifiers or files are
 already present.
+
+
+## GraphSharedOutput x overlap scheduler — CHECKED, NOT a defect
+
+Third suspected instance of the "shared buffer returned to the caller, safety
+resting on an unenforced ordering assumption" family. `GraphSharedOutput`
+holds one `(max_rows, vocab)` logits buffer keyed by `vocab_size` alone and
+hands `buffer[:rows]` to three graph runners (decode, prefill,
+eagle-draft-extend). `_copy_logits_to_buffer` copies into it and RETURNS it,
+so `logits_output.next_token_logits` aliases it.
+
+### Falsifier first
+
+Un-shared the buffer behind an env and byte-compared greedy output against the
+shared run — full programme, CUDA graphs + NEXTN spec, uneven TP=3.
+
+| variant | allocation | code prompt |
+|---|---|---|
+| shared (production) | one `(max_rows, vocab)`, `[:rows]` view | 181 tok, accept 3.693877551020408 |
+| un-shared, naive | fresh `(rows, vocab)` per call | 138 tok, accept 3.5384615384615383 |
+| un-shared, faithful | fresh `(max_rows, vocab)` per call, `[:rows]` | **181 tok, accept 3.693877551020408** |
+
+Both configurations are deterministic (each reproduced exactly on a repeat
+boot). The **faithful** un-shared variant reproduces the shared run
+bit-for-bit on all three content classes. Sharing is therefore NOT the
+variable; the naive variant diverged because it under-allocates — it gives the
+captured graph only `rows` of backing store where the runner asked for
+`max_num_token`.
+
+### Why it cannot occur, structurally
+
+`get_logits_buffer` is called **once per runner, in `__init__`**
+(`decode_cuda_graph_runner.py:476`, `rows=self.max_num_token`), stored in the
+runner's input buffers and captured as the graph's static output address.
+That is the standard CUDA-graph static-buffer pattern, not a per-call
+shape-keyed handout: there is no second call that could hand the same buffer
+to a live consumer. Consumers read it inside the same stream-ordered step, and
+the result path copies to CPU before the explicit release at
+`scheduler.py:3912`.
+
+**Limits of this check, stated:** verified for `enable_two_batch_overlap=False`
+with `disable_overlap_schedule=False` (i.e. the overlap scheduler ON, which is
+the configuration we ship and it did not diverge). `return_logprob`, which
+routes through `compute_logprobs_only` and reads the logits after the forward,
+was NOT exercised.
+
+## Hardening 1 — CPU HTCCL transports now reject CUDA graphs at startup
+
+The requirement lived only in a log line. Violating it produced a bare
+`cudaErrorStreamCaptureUnsupported` mid-capture — the shape of the arm-E
+crash, which reads as an unrelated CUDA fault.
+`_enforce_cpu_transport_needs_eager` now fails at startup:
+
+```
+ValueError: SGLANG_HTCCL_TRANSPORT='shm' is a host-staged (CPU) transport:
+every collective synchronizes with the host, which is illegal inside a
+CUDA-graph capture. Pass --disable-cuda-graph, or use
+SGLANG_HTCCL_TRANSPORT=device, which runs the collectives on the GPU and IS
+capturable.
+```
+
+Verified in both directions at boot: shm + graphs is rejected with the message
+above; **device + graphs is NOT rejected** (arm E green, 0 rejections, graphs
+active, accept 3.45/2.75/3.33) and **shm + eager still boots** (accept
+3.69/2.86/3.33). Only reachable when HTCCL is on, so the default path is
+untouched by construction.
+
+## Hardening 2 — the GGUF dequant workspace invariant is pinned
+
+`_DEQUANT_WS` is one buffer per `(device, dtype)` shared by every GGUF layer,
+and `_ggml_dequantize_ws` returns the dequantized weight itself. Its safety
+argument — dequant and GEMM run back-to-back on one stream, so each GEMM
+consumes the buffer before the next dequant overwrites it — holds only while
+there is exactly ONE consumer. That was a docstring, not a structure.
+
+The buffer is deliberately kept (a static allocation is friendlier to
+CUDA-graph capture than a per-replay one), so the invariant is pinned by test
+instead: `test_dequant_workspace_has_exactly_one_consumer_each` asserts each
+of `_ggml_dequantize_ws` and `_mul_mat_dequant_chunked` has exactly one call
+site and that both sit inside `fused_mul_mat_gguf`, the function whose GEMM
+consumes them. A second consumer now fails the test instead of silently making
+one GEMM read another's weights.

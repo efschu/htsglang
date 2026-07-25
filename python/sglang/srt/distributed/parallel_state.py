@@ -213,6 +213,37 @@ def reg_all_to_all_single(
     group._all_to_all_single(output, input)
 
 
+CPU_ONLY_HTCCL_TRANSPORTS = frozenset({"shm", "gloo"})
+
+
+def _enforce_cpu_transport_needs_eager(transport: str) -> None:
+    """Reject a host-staged HTCCL transport while CUDA graphs are enabled.
+
+    Not a style check: a host-staged collective inside a capture raises
+    `cudaErrorStreamCaptureUnsupported` from whichever kernel happens to be
+    capturing, which reads as an unrelated CUDA fault. Checked here, where the
+    transport is known, and only when HTCCL is actually on -- flag off, this
+    function is never called.
+    """
+    if transport not in CPU_ONLY_HTCCL_TRANSPORTS:
+        return
+    try:
+        from sglang.srt.runtime_context import get_server_args
+
+        server_args = get_server_args()
+    except Exception:
+        return  # no published ServerArgs yet -> nothing to validate against
+    if server_args is None or getattr(server_args, "disable_cuda_graph", False):
+        return
+    raise ValueError(
+        f"SGLANG_HTCCL_TRANSPORT={transport!r} is a host-staged (CPU) "
+        "transport: every collective synchronizes with the host, which is "
+        "illegal inside a CUDA-graph capture. Pass --disable-cuda-graph, or "
+        "use SGLANG_HTCCL_TRANSPORT=device, which runs the collectives on "
+        "the GPU and IS capturable."
+    )
+
+
 def should_build_pynccl(
     use_pynccl: bool, world_size: int, htccl_active: bool
 ) -> bool:
@@ -428,6 +459,16 @@ class GroupCoordinator:
                 HTCCLCommunicator,
             )
 
+            # The CPU transports host-stage every collective: shm calls
+            # cudaStreamSynchronize twice per op and spins on shm counters,
+            # the gloo plane calls cudaEventSynchronize plus a gloo CPU
+            # collective per chunk. All of that is ILLEGAL inside a CUDA-graph
+            # capture. Until now that constraint lived only in the log line
+            # below, so violating it surfaced as a bare
+            # `cudaErrorStreamCaptureUnsupported` in the middle of capture --
+            # the exact shape of the arm-E crash. Fail at startup, naming the
+            # cause, instead.
+            _enforce_cpu_transport_needs_eager(envs.SGLANG_HTCCL_TRANSPORT.get())
             self.htccl_comm = HTCCLCommunicator(
                 cpu_group=self.cpu_group,
                 device=self.device,
