@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -13,6 +14,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.laguna import normalize_gating
+from sglang.srt.distributed.utils import tp_partition_size, tp_plan_active
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -73,6 +75,7 @@ class DFlashAttention(nn.Module):
         super().__init__()
         hidden_size = int(config.hidden_size)
         tp_size = int(get_parallel().tp_size)
+        tp_rank = int(get_parallel().tp_rank)
         total_num_heads = int(config.num_attention_heads)
         total_num_kv_heads = int(
             getattr(config, "num_key_value_heads", total_num_heads)
@@ -82,22 +85,48 @@ class DFlashAttention(nn.Module):
         self.hidden_size = hidden_size
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
-        assert self.total_num_heads % tp_size == 0, (
-            f"DFlashAttention requires total_num_heads divisible by tp_size. "
-            f"total_num_heads={self.total_num_heads}, tp_size={tp_size}."
-        )
-        self.num_heads = self.total_num_heads // tp_size
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0, (
-                f"DFlashAttention requires total_num_kv_heads divisible by tp_size when >= tp_size. "
-                f"total_num_kv_heads={self.total_num_kv_heads}, tp_size={tp_size}."
+        if tp_plan_active(tp_size):
+            # Uneven TP (--rank-tp-ratio): heads follow the shard plan with
+            # kv heads as the indivisible units (whole GQA groups per rank),
+            # exactly the split QKVParallelLinear performs internally — the
+            # even ``total // tp_size`` below would silently disagree with
+            # the shapes qkv_proj actually allocates. Mirrors llama.py /
+            # qwen3_next.py; the per-rank counts also reach the attention
+            # backend through RadixAttention, and flashinfer derives the
+            # same numbers itself (see _local_attn_head_counts, f7ff51435).
+            if self.total_num_kv_heads < tp_size:
+                # REPLICATED-KV geometry (kv < tp) is not wired up for the
+                # DFLASH draft: fail fast instead of building shapes that
+                # disagree with QKVParallelLinear's replicated-kv branch.
+                raise ValueError(
+                    "DFLASH draft under uneven TP (--rank-tp-ratio) requires "
+                    f"total_num_kv_heads >= tp_size; got "
+                    f"total_num_kv_heads={self.total_num_kv_heads}, "
+                    f"tp_size={tp_size}."
+                )
+            self.num_heads = tp_partition_size(
+                self.total_num_heads, tp_size, tp_rank, self.total_num_kv_heads
+            )
+            self.num_kv_heads = tp_partition_size(
+                self.total_num_kv_heads, tp_size, tp_rank, self.total_num_kv_heads
             )
         else:
-            assert tp_size % self.total_num_kv_heads == 0, (
-                f"DFlashAttention requires tp_size divisible by total_num_kv_heads when total_num_kv_heads < tp_size. "
-                f"total_num_kv_heads={self.total_num_kv_heads}, tp_size={tp_size}."
+            assert self.total_num_heads % tp_size == 0, (
+                f"DFlashAttention requires total_num_heads divisible by tp_size. "
+                f"total_num_heads={self.total_num_heads}, tp_size={tp_size}."
             )
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            self.num_heads = self.total_num_heads // tp_size
+            if self.total_num_kv_heads >= tp_size:
+                assert self.total_num_kv_heads % tp_size == 0, (
+                    f"DFlashAttention requires total_num_kv_heads divisible by tp_size when >= tp_size. "
+                    f"total_num_kv_heads={self.total_num_kv_heads}, tp_size={tp_size}."
+                )
+            else:
+                assert tp_size % self.total_num_kv_heads == 0, (
+                    f"DFlashAttention requires tp_size divisible by total_num_kv_heads when total_num_kv_heads < tp_size. "
+                    f"total_num_kv_heads={self.total_num_kv_heads}, tp_size={tp_size}."
+                )
+            self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = head_dim
         self.q_size = self.num_heads * head_dim
         self.kv_size = self.num_kv_heads * head_dim
@@ -120,6 +149,10 @@ class DFlashAttention(nn.Module):
             bias=attention_bias,
             quant_config=quant_config,
             prefix="o_proj",
+            # Uneven TP: the o_proj input dim is partitioned like the q
+            # heads in qkv_proj (kv-head units). Ignored on the default
+            # path (no shard plan installed).
+            tp_units=self.total_num_kv_heads,
         )
 
         # Per-head Q/K RMSNorm, matching HF Qwen3.
@@ -246,12 +279,23 @@ class DFlashMLP(nn.Module):
                 f"Invalid intermediate_size={intermediate_size} for DFlash MLP."
             )
 
+        # Uneven TP (--rank-tp-ratio): the intermediate size is the unit
+        # family — gate/up outputs and the down input share one per-rank
+        # partition. Units are 16-element groups, not single elements: the
+        # jit activation kernel vector-loads up to 16 bf16 elements and
+        # rejects per-rank intermediate sizes not divisible by its vector
+        # size (same rationale as LlamaMLP, task #100). Without this the
+        # DFLASH draft fails at init whenever sum(ratio weights) does not
+        # divide intermediate_size. Inert without an installed shard plan.
+        _mlp_units = intermediate_size // math.gcd(intermediate_size, 16)
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix="gate_up_proj" if not prefix else f"{prefix}.gate_up_proj",
+            tp_units=_mlp_units,
+            tp_family="mlp",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -259,6 +303,8 @@ class DFlashMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix="down_proj" if not prefix else f"{prefix}.down_proj",
+            tp_units=_mlp_units,
+            tp_family="mlp",
         )
         hidden_act = getattr(config, "hidden_act", "silu")
         if hidden_act != "silu":
@@ -507,6 +553,12 @@ class DFlashLagunaAttention(DFlashAttention):
                 bias=False,
                 quant_config=quant_config,
                 prefix="g_proj",
+                # Uneven TP: the gate output is per q head (or per q-head
+                # channel), so it must follow the SAME kv-head-unit split
+                # as the q block in qkv_proj — otherwise the gate shard
+                # would not line up with this rank's attention output.
+                # Ignored on the default path (no shard plan installed).
+                tp_units=self.total_num_kv_heads,
             )
 
     def apply_attention_output(
