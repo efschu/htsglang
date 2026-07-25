@@ -842,3 +842,83 @@ Both drives reported several points INVALID (`char-loop`). This is a **validator
 change, not a model regression**: 6 of the 9 completions on the pre-merge
 control are byte-identical to the 10:02 arm-E reference that scored 0 INVALID,
 and `bench_harness.py` was last modified at 12:58, after that run.
+
+
+## feat/htccl-gfx900 commits 8-10 — merged, validated (merge `23961b7f7c`)
+
+`fa5c507476` (SGL_DEVICE_ASSERT), `3cc2fc9da5` + `3cedf0c41e` (fp8 dequant
+fallback, both families). Tip `3cedf0c41e`. Rollback tag
+`pre-gfx900-followup-r3` -> `14d7a164bb`.
+
+Zero textual conflicts and no file overlap: this line's delta since
+`fb85955276` touched `distributed/utils.py`, `triton_backend.py`, tests and
+docs; the three new commits touch `kvcache.cuh`, `utils.cuh`, `quantization/`
+and `loader.py`.
+
+### The semantic check, done before merging
+
+This rig serves Qwen3.6-27B-FP8 across two sm86 3080s that have **no fp8
+tensor cores**, so an fp8 fallback landing in the merge is exactly the kind of
+change that could silently reroute the model. It does not:
+
+* the new functional probe in `_check_scheme_supported` is gated on
+  `torch.version.hip is not None` — the CUDA capability comparison is untouched;
+* `needs_device_kernel()` defaults to `True` in `base_config`, so every other
+  quantization config keeps its floor;
+* `Fp8LinearMethod` sets
+  `use_dequant = not block_quant and not use_marlin and fp8_needs_dequant_fallback()`,
+  and this checkpoint is block-scaled (`weight_block_size [128, 128]`).
+
+### Cold-cache procedure applied (the finding from 52480d8338, used as method)
+
+`utils.cuh` and `kvcache.cuh` both change, which moves the JIT module source
+hash (`80637fc9b4d70791` -> `c4d7650d69785eff`, the same hash the second host
+reports post-fix) and forces cold builds. So: verified 0 `.so`-less cache dirs,
+then **eager warm boot first** (nvcc observed compiling during it, with no
+capture deadline over it, GREEN), **then** graphs.
+
+Arm E on the merge tip, warm: **GREEN**, capture `elapsed=3.80 / 3.81 / 3.81 s`,
+health 200, 0 `plan differs`. This is also the **second** warm boot, so
+"warm cache -> green" is now n=2 (3.76-3.78 s and 3.80-3.81 s) rather than the
+n=1 flagged earlier. Accepts: code 3.459/3.368, prose 3.160/3.122/3.282, mixed
+2.977/2.977/3.369 — the established regime.
+
+### 27B forced-dequant check — the fallback CANNOT engage on this checkpoint
+
+`SGLANG_FORCE_FP8_DEQUANT=1`, same arm-E TP config: boots **GREEN**, health 200,
+and logs **zero** dequant-engagement markers. The reason is structural, and was
+evaluated directly rather than inferred:
+
+```
+SGLANG_FORCE_FP8_DEQUANT=1 -> fp8_needs_dequant_fallback() = True
+  block_quant=True  -> use_dequant=False
+  block_quant=False -> use_dequant=True
+```
+
+The env forces the *capability answer*, but `use_dequant` is gated behind
+`not block_quant`, and this checkpoint is block-scaled. **The forced-fallback
+comparison is therefore void on the 27B** — there is no fallback path to
+compare against, and the run measures the native path twice.
+
+Only 1 of 9 completions is byte-identical between the two boots. That is **not**
+a dequant effect: nothing was rerouted. This configuration is not
+boot-to-boot deterministic (`random_seed` is auto-generated and is the one
+`ServerArgs` field that differs between boots). The cause was not isolated —
+stated as a limit, not explained away.
+
+### Consequence for a mixed-rig TP group — flagged, code-level only
+
+For a **block-scaled** fp8 checkpoint the new fallback does not apply, and the
+floor still does: `Fp8Config.needs_device_kernel()` returns `True` when
+`weight_block_size is not None`, and `get_min_capability()` returns **80**. An
+sm75 rank (2080 Ti reports 75) is therefore refused for Qwen3.6-27B-FP8 even
+after this merge, and gfx900 has no plain-torch route for block-scaled scales
+either — the docstring says so explicitly ("block-scaled and mxfp8 layouts have
+no plain-torch route here").
+
+The fallback IS reachable for plain per-tensor/per-channel fp8: the 4B
+comparison checkpoint (`RedHatAI/Qwen3.5-4B-FP8-dynamic`) is
+`compressed-tensors`, `strategy=channel`, `weight_block_size None`.
+
+**Limit of this claim:** established by reading and evaluating the gates on this
+host. It is NOT measured on sm75 or gfx900, which this rig does not have.
