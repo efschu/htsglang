@@ -1133,3 +1133,57 @@ own pre-cap line, at the bench memory configuration. A dedicated uncapped
 probe boot per configuration (`--context-length -1`, everyday mem-fraction,
 boot to READY only) is queued for the next window to confirm them
 independently; both numbers will then be shown side by side.
+
+#### CORRECTION: the 5.93x capacity claim is NOT yet safe -- do not publish it
+
+Challenged on the arithmetic (149k tokens x ~5 KV layers per 3080 stage is
+under 1 GB, far below the free stage memory), and the challenge is right. Three
+things were checked in the boot logs before the number goes anywhere:
+
+**1. dtype parity: CONFIRMED, contributes nothing.** Every row ran
+`torch.float8_e5m2`. A fp16 KV on the stock rows would alone have been a factor
+2; it is not the case.
+
+**2. mem_fraction_static parity: CONFIRMED, contributes nothing.** Identical
+`0.7435115625` on stock PP even, stock PP uneven and fork full. So the gap is
+not our tuned memory budget against a conservative stock default -- the
+suspicion was reasonable, and it is refuted.
+
+**3. KV accounting parity: CONFIRMED.** Cost per layer per token is the same on
+both sides, which means the two pools are measured in the same unit:
+
+| row | tokens | KV GB | full-attn layers | KB/token | KB/layer/token |
+|---|---|---|---|---|---|
+| stock PP even, stage | 98,316 | 0.94 | ~5 | 10.03 | 2.005 |
+| stock PP even, stage | 98,316 | 1.12 | ~6 | 11.95 | 1.991 |
+| fork rank 1 (5090) | 15,390 | 0.46 | 16 | 31.34 | 1.959 |
+| fork rank 0 | 10,773 | 0.32 | 16 | 31.15 | 1.947 |
+
+**But the binder is NOT VRAM on the stock side, and that breaks the claim.**
+After allocating its pool, each stock stage still had **6.31 / 6.83 / 20.54 GB
+free**. At 10.03 KB/token the tightest 3080 stage's leftover alone is worth
+roughly 660k further tokens. So stock's 149,437 is not a memory ceiling --
+something else caps it, and until that something is identified the 5.93x cannot
+be attributed to pipeline structure.
+
+What IS established is the difference in how capacity is composed:
+
+* fork (uneven DCP): tokens are SHARDED, so capacity is the **sum** over ranks
+  -- 182,442 + 415,470 + 294,420 = 892,332, matching the reported 886,336;
+* stock PP: every stage must hold the SAME token range for its own layers, so
+  capacity is the **min** over stages, and the 5090 stage's 20.54 GB idles.
+
+Sum-over-ranks versus min-over-stages is a real structural difference and it
+does favour the fork. What is NOT established is its SIZE. If stock's stages
+could actually use their free VRAM, the tightest stage would land near ~758k
+tokens against the fork's ~892k -- on the order of 1.2x, not 5.9x.
+
+**Consequence:** the capacity row is marked PROVISIONAL and the 5.93x figure is
+withheld from the forum post until the uncapped probe boots
+(`--context-length -1`, everyday mem-fraction) settle what actually caps stock
+PP. If the honest structural factor turns out to be ~1.2x, then 1.2x is the
+number that gets published. The post's value is that it cannot be attacked, not
+that it carries the biggest multiplier.
+
+The throughput rows are unaffected by this: they are direct measurements, not
+derived from the pool sizing.
