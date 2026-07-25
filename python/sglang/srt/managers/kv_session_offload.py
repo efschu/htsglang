@@ -799,6 +799,59 @@ def wave_back_advance(
     return max(0, step)
 
 
+def wave_back_gate(
+    local_avail: int, uniform_avail: int, min_free_tokens: int
+) -> Tuple[bool, int]:
+    """Resolve the wave-back SPACE gate (P1): is there enough free device room
+    this iteration to wave a block of the host tail back, and how many free
+    slots may the step assume? Returns ``(space_ok, remaining_cap)``.
+
+    ``min_free_tokens <= 0`` -- the DEFAULT -- reproduces the historical gate
+    verbatim: ``space_ok = local_avail > 0`` with the LIVE local pool as the
+    cap. P1 is inert until an operator sets the knob; no new collective, no
+    changed decision, no changed step size.
+
+    ``min_free_tokens > 0`` waves back only once at least that many device
+    slots are free, and reads availability from the RANK-UNIFORM min-reduced
+    snapshot instead of the rank-local pool. Both halves are load-bearing:
+
+    * PURPOSE. Today ANY single free slot passes the gate, so wave-back peels
+      one block off the tail front every single iteration; in a regime that
+      keeps freeing slots it drains the tail faster than the host tick
+      (~2.7 tok/s) refills it, and the tail -- i.e. the reachable context
+      DEPTH -- stays shallow. A threshold lets the tail accumulated under
+      pressure STAY on host; the operator decides how much VRAM must be free
+      before trimming it is worth doing. The measurable win is CAPACITY, not
+      speed.
+    * RANK-UNIFORMITY. ``available_size()`` is rank-LOCAL, and under uneven
+      DCP the per-rank pools differ, so comparing a threshold against the
+      local pool would let ranks disagree about whether to wave. A divergent
+      wave decision in this fork does not produce a wrong number, it HANGS
+      NCCL: the wave rewrites ``req_to_token`` and moves the tier boundary,
+      so the next tick's collectives would be built from different geometries
+      on different ranks. ``uniform_avail`` is the MIN-reduce that
+      ``update_dcp_admission_state`` already computes once per iteration
+      (``dcp_min_avail``) -- reused deliberately, NO new collective. Being a
+      minimum it is also the conservative side of the comparison.
+
+    The uniform value is an iteration-start snapshot, so it may overstate the
+    room still free at wave time. That is harmless and already handled: the
+    owner-matched allocation inside ``_wave_back`` is the hard gate and simply
+    declines, retrying next window.
+
+    NOTE for the RESTORE path: this gate gets the tail out of the drip-feed,
+    it does not strand it. RESTORE-READY (``_restore_memory_ok`` / ``fits_now``)
+    is untouched, so a session whose whole tail fits still comes back in one
+    step regardless of this threshold.
+
+    Pure -> identical on every rank for identical inputs.
+    """
+    if int(min_free_tokens) <= 0:
+        return bool(int(local_avail) > 0), int(local_avail)
+    ua = int(uniform_avail)
+    return ua >= int(min_free_tokens), ua
+
+
 class WaveBackController:
     """Opportunistic wave-back gate (S3): decides, per scheduler iteration,
     whether and how far to migrate the host tail's front block back to the
@@ -1187,6 +1240,13 @@ class KVSessionOffloadManager:
         self._hysteresis_steps = int(
             sa.kv_session_offload_restore_hysteresis_steps
         )
+        # P1 (S3): minimum free device slots before wave-back peels another
+        # block off the host tail. 0 = today's "any free slot waves" behaviour
+        # (byte-identical). Server-global -> replicated on every rank, so the
+        # threshold itself can never be a source of rank divergence.
+        self.wave_back_min_free_tokens = max(
+            0, int(sa.kv_session_offload_wave_back_min_free_tokens)
+        )
 
         mr = scheduler.tp_worker.model_runner
         self.model_runner = mr
@@ -1458,6 +1518,18 @@ class KVSessionOffloadManager:
             self.max_spills,
             self.region_tokens,
         )
+        if self.wave_back_min_free_tokens > 0:
+            # Only logged when the knob is actually engaged: the default path's
+            # log output stays exactly as before.
+            logger.info(
+                "kv-session-offload (P1): wave-back THRESHOLD armed -- a host "
+                "tail is only pulled back once >= %d device slots are free "
+                "(rank-uniform min-reduced availability). Deep tails now stay "
+                "put under pressure instead of draining one block per "
+                "iteration; RESTORE-READY (margin=%d) is unaffected.",
+                self.wave_back_min_free_tokens,
+                self.restore_margin_tokens,
+            )
         if self.tick_controller is not None:
             logger.info(
                 "kv-session-offload: SELF-CALIBRATING spill-tick cadence armed "
@@ -2540,12 +2612,23 @@ class KVSessionOffloadManager:
         # inside _wave_back is the hard gate; `remaining_cap` keeps the step
         # from ever asking for more slots than are free.
         copy_inflight = not self.backend._sess_wave_done.query()
+        # P1 (S3): the wave-back space gate is a knob, not a constant. With the
+        # default threshold 0 the call below resolves to the historical
+        # `space_ok=avail > 0, remaining_cap=avail` on the LIVE LOCAL pool --
+        # byte-identical. With a threshold set it compares the rank-uniform
+        # min-reduced availability (already reduced once this iteration in
+        # update_dcp_admission_state -- no new collective) so every DCP rank
+        # waves in lock-step. dcp_min_avail() is a side-effect-free read of
+        # that snapshot; see wave_back_gate for the full rationale.
+        space_ok, wave_cap = wave_back_gate(
+            avail, self.dcp_min_avail(), self.wave_back_min_free_tokens
+        )
         advance = slot.wave.plan(
             boundary,
             L,
-            space_ok=avail > 0,
+            space_ok=space_ok,
             copy_inflight=copy_inflight,
-            remaining_cap=avail,
+            remaining_cap=wave_cap,
         )
         if advance > 0:
             self._wave_back(slot, L, boundary, advance)

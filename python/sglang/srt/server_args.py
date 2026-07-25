@@ -1398,6 +1398,28 @@ class ServerArgs:
             "spilled session is copied back to device.",
         ),
     ] = 4
+    kv_session_offload_wave_back_min_free_tokens: A[
+        int,
+        Arg(
+            help="kv-session-offload (P1): wave a block of a spilled session's "
+            "host tail back to device only once at least this many device KV "
+            "slots are free. 0 (DEFAULT) = today's behaviour exactly: ANY "
+            "single free slot passes the gate, so wave-back peels one block "
+            "off the tail front every iteration and, in a regime that keeps "
+            "freeing slots, drains the tail faster than the host tick refills "
+            "it -- which caps the reachable context DEPTH. Raise it to let the "
+            "tail that accumulated under device pressure STAY on host: the "
+            "operator, not the scheduler, then decides how much VRAM must be "
+            "free before the tail is worth trimming. This trades nothing away "
+            "for "
+            "safety: the full RESTORE-READY path "
+            "(--kv-session-offload-restore-margin-tokens) is untouched, so a "
+            "session whose whole tail fits still returns to device in one "
+            "step. The knob buys CAPACITY (reachable depth), not throughput. "
+            "Compared against the rank-uniform min-reduced availability so "
+            "every DCP rank waves in lock-step.",
+        ),
+    ] = 0
     kv_session_offload_max_spills: A[
         int,
         Arg(
@@ -4101,6 +4123,13 @@ class ServerArgs:
         if self.kv_session_offload_restore_margin_tokens < 0:
             raise ValueError(
                 "--kv-session-offload-restore-margin-tokens must be >= 0."
+            )
+        if self.kv_session_offload_wave_back_min_free_tokens < 0:
+            raise ValueError(
+                "--kv-session-offload-wave-back-min-free-tokens must be >= 0 "
+                "(0 = today's behaviour: wave back whenever any slot is "
+                f"free); got "
+                f"{self.kv_session_offload_wave_back_min_free_tokens}."
             )
         if self.kv_session_offload_mtp_resident_slices < 0:
             raise ValueError(

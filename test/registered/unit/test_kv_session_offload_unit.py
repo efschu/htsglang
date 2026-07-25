@@ -41,6 +41,7 @@ from sglang.srt.managers.kv_session_offload import (
     spill_graph_rung_ladder,
     WaveBackController,
     wave_back_advance,
+    wave_back_gate,
 )
 
 # Weighted geometry mirroring a 3-rank uneven-DCP rig (e.g. ratios 1/32/31).
@@ -552,6 +553,85 @@ def test_wave_back_advance_never_overshoots_seqlen():
     for boundary in range(0, 33):
         adv = wave_back_advance(boundary, 32, wave_step=8)
         assert 0 <= adv and boundary + adv <= 32
+
+
+# --- P1: configurable wave-back threshold -------------------------------
+
+
+def test_wave_back_gate_default_is_todays_behaviour():
+    """Threshold 0 (DEFAULT) must reproduce the pre-P1 gate EXACTLY:
+    `space_ok = local_avail > 0`, cap = the LIVE LOCAL pool. The uniform
+    (min-reduced) value must not be consulted at all -- flag-off is
+    byte-identical, including which quantity is read."""
+    for local in (0, 1, 7, 4096, 1_000_000):
+        for uniform in (0, 1, 999_999):  # deliberately contradictory
+            assert wave_back_gate(local, uniform, 0) == (local > 0, local)
+            # negative is normalized to OFF, never to "always wave"
+            assert wave_back_gate(local, uniform, -5) == (local > 0, local)
+
+
+def test_wave_back_gate_threshold_holds_the_tail():
+    """With a threshold set, a trickle of free slots must NOT pass the gate --
+    that is the whole point: the tail accumulated under pressure stays put."""
+    # below the threshold -> no wave, however many iterations trickle by
+    assert wave_back_gate(4096, 1, 4096)[0] is False
+    assert wave_back_gate(4096, 4095, 4096)[0] is False
+    # exactly at the threshold -> wave (>=, not >)
+    assert wave_back_gate(4096, 4096, 4096)[0] is True
+    assert wave_back_gate(4096, 8192, 4096)[0] is True
+    # the cap handed to wave_back_advance is the uniform value, not the local
+    assert wave_back_gate(99_999, 8192, 4096)[1] == 8192
+
+
+def test_wave_back_gate_is_rank_uniform_under_uneven_dcp():
+    """THE hang-prevention property. Under uneven DCP the per-rank pools
+    differ, so the LOCAL availability differs per rank. The decision (and the
+    step cap, which sets how far the tier boundary moves) must still be
+    identical on every rank -- a divergent wave rewrites req_to_token
+    differently per rank and hangs the next collective."""
+    uniform = 3000  # the MIN-reduce: the same number on every rank
+    per_rank_local = [3000, 51_200, 48_000]  # ratios 1/32/31-style skew
+    for threshold in (1, 2999, 3000, 3001, 65_536):
+        decisions = {
+            wave_back_gate(local, uniform, threshold) for local in per_rank_local
+        }
+        assert len(decisions) == 1, (
+            f"threshold={threshold} produced rank-divergent wave decisions "
+            f"{decisions} -- this is an NCCL hang, not a wrong number"
+        )
+    # and the contrast that motivates it: comparing the LOCAL value against
+    # the same threshold WOULD have diverged.
+    assert len({local >= 3001 for local in per_rank_local}) == 2
+
+
+def test_wave_back_gate_threshold_reaches_the_controller():
+    """End-to-end through the real controller: below-threshold windows keep
+    the warmup streak at zero (same discipline as `space_ok=False` today), and
+    the step size respects the uniform cap once the gate opens."""
+    wb = WaveBackController(wave_step=128, warmup_steps=2)
+    below = wave_back_gate(local_avail=50_000, uniform_avail=100, min_free_tokens=4096)
+    for _ in range(5):
+        ok, cap = below
+        assert wb.plan(0, 1000, space_ok=ok, copy_inflight=False, remaining_cap=cap) == 0
+    ok, cap = wave_back_gate(50_000, 4096, 4096)
+    assert (ok, cap) == (True, 4096)
+    assert wb.plan(0, 1000, space_ok=ok, copy_inflight=False, remaining_cap=cap) == 0
+    assert wb.plan(0, 1000, space_ok=ok, copy_inflight=False, remaining_cap=cap) == 128
+    # a step is still capped by the free room even after the gate opens
+    ok, cap = wave_back_gate(50_000, 4100, 4096)
+    assert wb.plan(0, 1000, space_ok=ok, copy_inflight=False, remaining_cap=64) == 64
+
+
+def test_wave_back_min_free_server_arg_defaults_to_off():
+    """The knob must ship OFF so an unmodified launch keeps today's path."""
+    from sglang.srt.server_args import ServerArgs
+
+    assert (
+        ServerArgs.__dataclass_fields__[
+            "kv_session_offload_wave_back_min_free_tokens"
+        ].default
+        == 0
+    )
 
 
 def test_wave_back_controller_warmup_then_fires():
@@ -1530,6 +1610,7 @@ def _fake_server_args(**over):
         kv_session_offload_restore_hysteresis_steps=4,
         kv_session_offload_max_spills=1,
         kv_session_offload_restore_margin_tokens=4096,
+        kv_session_offload_wave_back_min_free_tokens=0,
         kv_session_offload_mtp_resident_slices=0,
         kv_session_offload_spec_in_tick=False,
         speculative_algorithm=None,
@@ -1570,6 +1651,17 @@ def test_server_args_rejects_budget_without_the_feature():
         assert "requires --enable-kv-session-offload" in str(e)
     else:
         raise AssertionError("standalone budget flag must be rejected")
+
+
+def test_server_args_rejects_negative_wave_back_min_free():
+    try:
+        _validate(
+            _fake_server_args(kv_session_offload_wave_back_min_free_tokens=-1)
+        )
+    except ValueError as e:
+        assert "--kv-session-offload-wave-back-min-free-tokens must be >= 0" in str(e)
+    else:
+        raise AssertionError("negative wave-back threshold must be rejected")
 
 
 def test_server_args_rejects_negative_budget():
