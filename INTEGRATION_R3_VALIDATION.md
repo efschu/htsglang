@@ -73,3 +73,67 @@ decoding** (not eager), `--rank-tp-ratio auto-performance`,
 `test/registered/unit/distributed`: 4x `test_vmm_utils` `KeyError: 'LOCAL_RANK'`
 and 1x `test_uneven_tp_nccl_env` MPS-pipe. Verified identical before and after
 the merge by materialising the pre-merge sources and re-running.
+
+
+## feat/gguf-mmq-threshold — merged as its own validated step
+
+Opt-in `--gguf-mmq-decode-threshold`, default OFF. Reroutes GGUF decode from
+the matrix-VECTOR kernel to the tiled MMQ kernel above a measured, per-device
+bucket. Threshold table: sm120 -> 8 for every shape class (measured), sm86 ->
+None (measured: MMVQ still wins there). On this rig only the 5090 rank can
+reroute.
+
+### Latent ordering defect fixed at the merge
+
+The threshold decides per enclosing CUDA-graph bucket, and its correctness
+argument is that on replay the token count IS a captured bucket, so the
+rounding is the identity. That requires the PUBLISHED buckets to be the
+CAPTURED ones. As merged, `_register_gguf_decode_buckets` ran before two
+passes of this integration line that narrow `capture_bs` (MoE-offload cap,
+weightless-KV block-graph cap) — correct only because both SHRINK. Anything
+that ADDS a bucket after publication would let a captured graph replay a
+different kernel than it was captured with, silently. Registration moved
+after the last mutation; ordering pinned by
+`test_decode_bucket_registration_happens_after_the_last_capture_bs_edit`.
+
+### Flag OFF — nothing changes
+
+FP8 arm A, CUDA graphs + MTP, uneven TP=3, after the merge:
+
+```
+accept 3.693877551020408 / 2.8205128205128207 / 3.283582089552239
+budgets [26107, 18280, 18280]   ownership [18, 23, 23]
+max_total_num_tokens=98328
+```
+Identical to sixteen digits to the pre-merge runs, i.e. the same token
+sequences. Arm G (HTCCL + cross-algo + offload + spec-in-tick, graphs) also
+green, health 200, 0 crash markers.
+
+GGUF with the flag off: **0** occurrences of the threshold's engagement log —
+the reroute never happens.
+
+### Flag ON — it does what it claims, on the rank it claims
+
+GGUF `Qwen3.6-27B-UD-Q6_K_XL` (K-quant, MMQ-capable), CUDA graphs + NEXTN MTP,
+uneven TP=3, three concurrent requests so decode reaches bucket 8:
+
+```
+GGUF MMQ decode threshold ACTIVE (#163): device sm120, first reroute at
+bucket 8 (raw M=8, shape class square, min 8), decode buckets
+(4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64).
+```
+* logged exactly **once across all three ranks** — only the sm120 rank
+  reroutes, exactly as the measured table says;
+* `raw M=8` equals `bucket 8` — the rounding is the identity, so bucket
+  coupling holds;
+* output coherent on all three content classes, accept 3.64/2.74/3.23 against
+  3.53/2.70/3.13 with the flag off.
+
+### Not a defect, but record it: the inherited GGUF launcher is too tight here
+
+`launch_gguf_mtp_graph.sh` uses `--rank-auto-reserve-mib 1500`, which OOMs
+during graph capture on this integration tree (810 MiB request, 555 MiB free,
+in the lm_head dequant path). It OOMs **identically with the flag ON and OFF**,
+so it is launcher headroom, not the feature: this tree carries more resident
+machinery than the `htsglang-gguf` tree the launcher was written for.
+`RESERVE=4500` boots green.
