@@ -116,7 +116,34 @@ if [ "$STAGE" = s3 ] || [ "$STAGE" = s4 ]; then
 fi
 
 
-exec $PY -u -m sglang.launch_server \
+# --------------------------------------------------------------------------
+# SUPERVISED LAUNCH -- do NOT exec, and do NOT detach the server.
+#
+# This is the guardrail for the container kill of 2026-07-25 20:48:34. sglang
+# signals its PARENT when a scheduler dies (scheduler.py:
+# parent_process.send_signal(SIGQUIT) via os.getppid()). If the server has been
+# orphaned, that parent is PID 1: systemd caught the QUIT, dumped core, and the
+# whole LXC container went down with every agent on it.
+#
+# `exec` would make this script BE the server, so the server's parent would be
+# whatever started the script -- and when the launcher returns (it must, once
+# the group is up) the server is reparented to init. Supervising instead keeps
+# a parent alive for the server's entire life. If THIS script is later
+# reparented to init that is harmless: a bash script's default SIGQUIT action
+# is to die, not to take the container with it.
+#
+# Note SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION does NOT remove the hazard on its
+# own: in scheduler.py the SIGQUIT to the parent is sent BEFORE the optional
+# killpg. It is set below because it stops sibling ranks spewing tracebacks,
+# not because it fixes this.
+export SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION=1
+
+# Tag: every process this run starts carries it in its ENVIRONMENT, so the
+# launcher can find and kill exactly its own ranks. Never pattern-kill on this
+# shared box.
+export L0_RUN_TAG=${L0_RUN_TAG:-l0-standalone-$$}
+
+"$PY" -u -m sglang.launch_server \
   --model-path "$MODEL" --dtype float16 \
   --tp-size 5 --nnodes 5 --node-rank "$RANK" --dist-init-addr "$MASTER:$PORT" \
   --rank-tp-ratio "$RATIO" $DCPFLAGS $SPECFLAGS \
@@ -125,4 +152,41 @@ exec $PY -u -m sglang.launch_server \
   --max-total-tokens $CTX --context-length $CTX --max-running-requests 1 \
   --mem-fraction-static ${MEMFRAC:-0.80} \
   ${EXTRA:-} \
-  --host 0.0.0.0 --port $SRVPORT
+  --host 0.0.0.0 --port $SRVPORT &
+CHILD=$!
+echo "l0_rank: rank $RANK server pid $CHILD, supervisor pid $$ (tag $L0_RUN_TAG)"
+
+_l0_forward() { kill -TERM "$CHILD" 2>/dev/null; }
+trap _l0_forward TERM INT
+# If the server crashes while orphaned it would signal init. Supervised, the
+# signal lands HERE. Log it as what it is, then take the server down cleanly.
+trap 'echo "l0_rank: rank '"$RANK"' caught SIGQUIT from its own child -- this is
+      the crash signal that killed the container on 2026-07-25 when it reached
+      PID 1 instead of a supervisor." >&2; _l0_forward' QUIT
+
+# LIVE ORPHAN CHECK. The invariant is "the server''s PPID is this supervisor".
+# It can only break if the supervisor is SIGKILLed, and the point of the check
+# is that the server then dies with a clear message instead of surviving as a
+# process whose next fault signals init.
+(
+  while kill -0 "$CHILD" 2>/dev/null; do
+    _ppid=$(awk '{print $4}' "/proc/$CHILD/stat" 2>/dev/null)
+    if [ "$_ppid" = "1" ]; then
+      echo "l0_rank: rank $RANK server $CHILD was REPARENTED TO INIT (PPID 1)." >&2
+      echo "         Its supervisor is gone, so its crash path would SIGQUIT" >&2
+      echo "         PID 1 and kill the container. Aborting the rank instead." >&2
+      kill -TERM "$CHILD" 2>/dev/null; sleep 5; kill -KILL "$CHILD" 2>/dev/null
+      exit 0
+    fi
+    sleep 2
+  done
+) &
+WATCHDOG=$!
+
+rc=0
+while kill -0 "$CHILD" 2>/dev/null; do
+  wait "$CHILD"; rc=$?
+done
+kill -TERM "$WATCHDOG" 2>/dev/null
+echo "l0_rank: rank $RANK server pid $CHILD exited rc=$rc"
+exit $rc
