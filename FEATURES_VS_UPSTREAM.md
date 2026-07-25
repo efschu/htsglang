@@ -15,6 +15,18 @@ This document lists the features carried by the htsglang fork and records, for e
 implementation status in the fork and whether an equivalent capability is present in upstream
 SGLang, upstream vLLM, `llama.cpp`, or `ik_llama.cpp`.
 
+## Status legend
+
+This project is **work in progress**. Every `Fork`/`Fork status` entry in this document records
+the local validation state observed on this fork's own rig(s) at the time of writing — 1x RTX
+5090 + 2x RTX 3080 for most rows, plus 1x RTX 2080 Ti (sm75) + 1x Radeon RX Vega 64 (gfx900) for
+the cross-vendor rows — not a claim of finished code review, exhaustive test coverage, or
+upstream-mergeable maturity. `Implemented` means code is merged and has cleared the specific
+tests/boots named in that row's detail section, nothing more; it is not shorthand for "done" in
+the sense of fully reviewed and tested, and further validation and hardening is expected to
+follow. See the `Fork` column definition below for the full token vocabulary (`Implemented` /
+`WIP` / `Exp`).
+
 ## Document structure
 
 To stay readable on GitHub without horizontal scrolling, this file is split in two layers:
@@ -28,10 +40,11 @@ All measurements, caveats, and references that used to live in the wide table ce
 the detail sections — nothing was dropped in the rewrite, only reflowed.
 
 **Column definitions (overview matrix)**
-- **Fork** — implementation state in `integration/r3-probe`: `Done` (merged, with registered
-  tests and/or a validated boot), `WIP` (present but not complete/validated), `Exp` (highly
-  experimental, not production-ready). A trailing `*` means the capability instead lives only on
-  the not-yet-merged `feat/htccl-gfx900` branch — see the detail section.
+- **Fork** — implementation state in `integration/r3-probe`: `Implemented` (merged, with
+  registered tests and/or a validated boot — see the Status legend above; not a claim of
+  exhaustive review or final test coverage), `WIP` (present but not complete/validated), `Exp`
+  (highly experimental, not production-ready). A trailing `*` means the capability instead lives
+  only on the not-yet-merged `feat/htccl-gfx900` branch — see the detail section.
 - **SGLang / vLLM** — `yes` / `partial` / `no` / `n/a`, expanded in the detail section.
 - **llama.cpp / ik_llama.cpp** — same vocabulary. `partial` means a related capability exists
   through a genuinely **different mechanism** — the difference is named in the detail section,
@@ -46,34 +59,34 @@ top of it — the detail section always says which).
 
 | # | Feature | Fork | SGLang | vLLM | llama.cpp | ik_llama.cpp |
 |---|---|---|---|---|---|---|
-| [1](#f1) | Asymmetric tensor parallelism | Done | no | no | partial | partial |
-| [2](#f2) | Asymmetric decode context parallelism | Done | partial | partial | no | no |
-| [3](#f3) | Rank-to-GPU mapping and co-location | Done | no | no | no | no |
-| [4](#f4) | Solo drafter placement | Done | no | yes | partial | partial |
+| [1](#f1) | Asymmetric tensor parallelism | Implemented | no | no | partial | partial |
+| [2](#f2) | Asymmetric decode context parallelism | Implemented | partial | partial | no | no |
+| [3](#f3) | Rank-to-GPU mapping and co-location | Implemented | no | no | no | no |
+| [4](#f4) | Solo drafter placement | Implemented | no | yes | partial | partial |
 | [5](#f5) | Cross-algorithm drafter routing | WIP | no | no | no | no |
-| [6](#f6) | CUDA graph memory aliasing for spec branches | Done | partial | partial | no | no |
-| [7](#f7) | MoE expert offload + asymmetric TP/DCP | Done | partial | partial | partial | partial |
-| [8a](#f8a) | Bespoke GGUF adapter framework | Done | no | no | n/a | n/a |
-| [8b](#f8b) | Qwen3.5/3.6 GGUF | Done | no | no | yes | yes |
-| [8c](#f8c) | Gemma-4 GGUF | Done | no | no | yes | yes |
-| [8d](#f8d) | GGUF K-quant compute kernels | Done | partial | partial | yes | yes |
-| [8e](#f8e) | Asymmetric-TP x GGUF correctness | Done | no | no | n/a | n/a |
-| [8f](#f8f) | Multimodal and dynamic-quant GGUF | Done | partial | partial | yes | partial |
-| [9](#f9) | Hibernate checkpoint/restore | Done | no | partial | partial | partial |
-| [10](#f10) | Measured VRAM budget | Done | partial | partial | partial | partial |
-| [11](#f11) | Cross-architecture speculative determinism | Done | partial | partial | no | no |
-| [12](#f12) | Weightless-KV lane | Done | no | no | no | no |
+| [6](#f6) | CUDA graph memory aliasing for spec branches | Implemented | partial | partial | no | no |
+| [7](#f7) | MoE expert offload + asymmetric TP/DCP | Implemented | partial | partial | partial | partial |
+| [8a](#f8a) | Bespoke GGUF adapter framework | Implemented | no | no | n/a | n/a |
+| [8b](#f8b) | Qwen3.5/3.6 GGUF | Implemented | no | no | yes | yes |
+| [8c](#f8c) | Gemma-4 GGUF | Implemented | no | no | yes | yes |
+| [8d](#f8d) | GGUF K-quant compute kernels | Implemented | partial | partial | yes | yes |
+| [8e](#f8e) | Asymmetric-TP x GGUF correctness | Implemented | no | no | n/a | n/a |
+| [8f](#f8f) | Multimodal and dynamic-quant GGUF | Implemented | partial | partial | yes | partial |
+| [9](#f9) | Hibernate checkpoint/restore | Implemented | no | partial | partial | partial |
+| [10](#f10) | Measured VRAM budget | Implemented | partial | partial | partial | partial |
+| [11](#f11) | Cross-architecture speculative determinism | Implemented | partial | partial | no | no |
+| [12](#f12) | Weightless-KV lane | Implemented | no | no | no | no |
 | [13](#f13) | Rig dashboard / planner UI | Exp | n/a | n/a | n/a | n/a |
-| [14](#f14) | Single-node PD disaggregation | Done | yes (base) | yes (base) | no | no |
-| [15](#f15) | Asymmetric-TP quantization correctness | Done | partial | partial | n/a | n/a |
-| [16](#f16) | Fast-lane priority scheduling | Done | partial | partial | no | no |
-| [17](#f17) | HiCache under asymmetric-TP/DCP | Done | yes (base) | n/a | partial | partial |
-| [18](#f18) | TP greater than num_kv_heads | Done | partial | partial | partial | partial |
-| [19](#f19) | Broad model bring-up under asymmetric-TP | Done | n/a | n/a | n/a | n/a |
+| [14](#f14) | Single-node PD disaggregation | Implemented | yes (base) | yes (base) | no | no |
+| [15](#f15) | Asymmetric-TP quantization correctness | Implemented | partial | partial | n/a | n/a |
+| [16](#f16) | Fast-lane priority scheduling | Implemented | partial | partial | no | no |
+| [17](#f17) | HiCache under asymmetric-TP/DCP | Implemented | yes (base) | n/a | partial | partial |
+| [18](#f18) | TP greater than num_kv_heads | Implemented | partial | partial | partial | partial |
+| [19](#f19) | Broad model bring-up under asymmetric-TP | Implemented | n/a | n/a | n/a | n/a |
 | [20](#f20) | Session KV spill | Exp | partial | partial | partial | partial |
-| [21](#f21) | HTCCL cross-vendor collectives | Done | no | no | partial | partial |
-| [22](#f22) | fp8 dequant fallback (W8A16) | Done* | no | no | partial | unverified |
-| [23](#f23) | Turing/gfx900 without sgl-kernel | Done | no | no | partial | partial |
+| [21](#f21) | HTCCL cross-vendor collectives | Implemented | no | no | partial | partial |
+| [22](#f22) | fp8 dequant fallback (W8A16) | Implemented* | no | no | partial | unverified |
+| [23](#f23) | Turing/gfx900 without sgl-kernel | Implemented | no | no | partial | partial |
 
 ---
 
