@@ -149,7 +149,13 @@ _LOAD_BEARING_INIT_ATTRS = (
             "_stream",
             "_host_bufs",
             "_host_buf_bytes",
-            "_out_pool",
+            # NOTE: `_out_pool` was deliberately REMOVED, not lost. It cached
+            # one output tensor per (shape, dtype) and so made two same-shape
+            # all_reduce results the same tensor -- the second call clobbered
+            # the first while the model still held it, corrupting the forward
+            # on every non-device transport. all_reduce is documented and
+            # dispatched as out-of-place; it now allocates per call, like the
+            # device transport always did.
         ),
     ),
     (

@@ -25,6 +25,7 @@ import types
 
 import pytest
 import torch
+import torch.distributed
 
 _COMM_DIR = (
     pathlib.Path(__file__).resolve().parents[4]
@@ -175,6 +176,181 @@ def test_out_parameter_forms_add_no_new_collective():
             f"{name} calls torch.distributed directly; it must compose the "
             "existing HTCCL collectives instead"
         )
+
+
+def _fake_comm(module, slot_bytes=1 << 30):
+    """An HTCCLCommunicator wired for the shm branch, on CPU tensors only.
+
+    __init__ is bypassed on purpose: it builds CUDA streams and a real
+    process group, neither of which this file is allowed to touch. Every
+    attribute the shm branch of `all_reduce` reads is supplied here,
+    INCLUDING `_out_pool` -- so the historical shape-keyed cache runs to
+    completion and fails on the assertions below rather than erroring out
+    on a missing attribute.
+    """
+
+    class _Transport:
+        def __init__(self):
+            self.slot_bytes = slot_bytes
+
+        @staticmethod
+        def all_reduce_(flat):
+            # stand-in for the peers' contribution; the value is irrelevant,
+            # only that the call writes through to the returned buffer
+            flat.mul_(2)
+
+    comm = object.__new__(module.HTCCLCommunicator)
+    comm.disabled = False
+    comm.device_transport = None
+    comm.shm_transport = _Transport()
+    comm._out_pool = {}
+    return comm
+
+
+def test_all_reduce_is_out_of_place_across_calls():
+    """Two same-shape results must be two DISTINCT tensors.
+
+    `all_reduce` documents itself as out-of-place ("returns a new tensor").
+    A per-(shape, dtype) buffer cache silently broke that: the second call
+    handed back the very tensor the first result lived in, so a caller
+    holding both saw its first result overwritten. In the server this
+    destroyed the model forward -- valid HTTP 200s, garbage tokens, no
+    crash and no hang -- on every transport that used this helper.
+    """
+    module = _load_standalone("htccl")
+    comm = _fake_comm(module)
+
+    x = torch.ones(4, 8)
+    y = torch.full((4, 8), 3.0)
+
+    first = comm.all_reduce(x)
+    first_snapshot = first.clone()
+    second = comm.all_reduce(y)
+
+    assert first.data_ptr() != second.data_ptr(), (
+        "all_reduce returned the same storage twice -- the out-of-place "
+        "contract is broken and the earlier result has been clobbered"
+    )
+    assert torch.equal(first, first_snapshot), (
+        "the first all_reduce result changed while a later all_reduce ran; "
+        "callers that hold two same-shape results read corrupted data"
+    )
+    assert torch.equal(second, y * 2)
+
+
+def test_communicator_keeps_no_shape_keyed_output_cache():
+    """Guard the fix at source level, not just behaviourally.
+
+    The graph-capturable transport (`htccl_device`) allocates its output
+    fresh per call; the CPU transports cannot be captured at all. So no
+    HTCCL path has a reason to hold a persistent output buffer, and
+    reintroducing one would resurrect the corruption above.
+    """
+    src = (_COMM_DIR / "htccl.py").read_text()
+    tree = ast.parse(src)
+    cls = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.ClassDef) and n.name == "HTCCLCommunicator"
+    )
+    fn = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_get_out_buf"
+    )
+    body = ast.unparse(fn)
+    assert "_out_pool" not in ast.unparse(cls), (
+        "HTCCLCommunicator reintroduced a persistent output buffer cache"
+    )
+    assert "empty_like" in body, (
+        "_get_out_buf must allocate a fresh tensor per call"
+    )
+
+
+def test_device_extension_builds_for_every_arch_and_keys_the_cache_by_it(
+    monkeypatch,
+):
+    """A mixed-arch rig must not share a single-arch cubin between ranks.
+
+    `load_inline` was called with no arch flags and a name-only cache key.
+    Under per-rank CUDA_VISIBLE_DEVICES isolation each worker sees exactly one
+    card, so torch inferred ONE architecture -- whichever rank compiled first
+    -- and every other rank then loaded a cubin its GPU cannot launch
+    (`unspecified launch failure` on the first HTCCL kernel).
+
+    Both halves matter: the flags make the binary fat, and the arch-aware
+    name stops a stale single-arch build directory from being reused. This
+    class of bug is INVISIBLE on a rig with identical GPUs.
+    """
+    import torch.utils.cpp_extension as cpp_extension
+
+    module = _load_standalone("htccl_device")
+    module._ext = None
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.6;12.0")
+
+    captured = {}
+
+    def fake_load_inline(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(htccl_allreduce=None, htccl_allgather=None)
+
+    monkeypatch.setattr(cpp_extension, "load_inline", fake_load_inline)
+    module._load_ext(cpu_group=None)
+
+    name = captured["name"]
+    assert "86" in name and "120" in name, (
+        f"extension name {name!r} does not encode the architecture set -- a "
+        "cached single-arch .so from an earlier run would be reused"
+    )
+
+    flags = " ".join(captured.get("extra_cuda_cflags") or [])
+    for sm in ("86", "120"):
+        assert f"code=sm_{sm}" in flags, (
+            f"no SASS requested for sm_{sm}; flags were {flags!r}. The rank "
+            f"on that card would die on its first kernel launch."
+        )
+
+
+def test_device_extension_arch_set_is_the_union_over_the_group(monkeypatch):
+    """A rank must build for the WHOLE group, not just its own visible card.
+
+    With per-rank GPU isolation `torch.cuda.device_count()` is 1, so torch's
+    own inference can never see the node's mix. The union is gathered over
+    the process group, which also makes the value -- and therefore the cache
+    key -- identical on every rank.
+    """
+    module = _load_standalone("htccl_device")
+    monkeypatch.delenv("TORCH_CUDA_ARCH_LIST", raising=False)
+
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            get_arch_list=lambda: ["sm_86", "sm_90", "sm_120"],
+            device_count=lambda: 1,
+            get_device_capability=lambda i: (8, 6),  # this rank sees a 3080
+        )
+    )
+    monkeypatch.setattr(module, "torch", fake_torch)
+
+    def fake_all_gather_object(out_list, obj, group=None):
+        # rank 0 = sm_86 (this process), rank 1 = sm_120 (the 5090)
+        out_list[0] = obj
+        out_list[1] = ["12.0"]
+
+    monkeypatch.setattr(
+        torch.distributed, "get_world_size", lambda group: 2, raising=False
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        fake_all_gather_object,
+        raising=False,
+    )
+
+    arches = module._resolve_build_arches(cpu_group=None)
+    assert arches == ["8.6", "12.0"], (
+        f"got {arches}: a rank that only builds for its own visible card "
+        "reproduces the mixed-arch crash"
+    )
 
 
 # --------------------------------------------------------------------------

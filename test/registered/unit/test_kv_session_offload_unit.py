@@ -20,6 +20,7 @@ from sglang.srt.managers.kv_session_offload import (
     host_pool_request_gb,
     host_ram_budget_error,
     make_sentinels,
+    mtp_resident_reservation_error,
     mtp_resident_tail_fits,
     new_token_residue,
     num_blocks_rank_uniform,
@@ -2190,3 +2191,40 @@ def test_ps2_master_gate_declines_under_speculative_decoding():
     assert prefill_spill_deep_gate(False, spec_active=False) is False
     _old_gate = lambda flag, spec_active: bool(flag)
     assert _old_gate(True, True) is True  # what the naive gate would have done
+
+
+
+def test_mtp_resident_reservation_rejects_a_pool_starving_carve():
+    """A spec-in-tick scratch carve that leaves less than one prefill chunk
+    must be refused at arm time.
+
+    `--kv-session-offload-mtp-resident-slices` takes slots out of the
+    allocator permanently. Nothing bounded it against the pool, and the
+    resulting failure is silent: the ranks keep looping in lockstep and issue
+    their scheduling collectives at full rate, nothing crashes, nothing hangs
+    in a collective -- the scheduler simply can never assemble a full prefill
+    again, so new requests are queued and never run. Measured: pool 3600,
+    slices 2048 (1552 left, chunk 2048) wedged after 6 requests; the same load
+    with slices 256 (3344 left) completed all 9.
+    """
+    # the configuration that wedged the server
+    err = mtp_resident_reservation_error(3600, 2048, 2048)
+    assert err is not None, (
+        "a carve leaving 1552 of 3600 tokens against a 2048-token prefill "
+        "chunk was accepted; that configuration wedges the scheduler silently"
+    )
+    for needle in ("2048", "3600", "1552", "chunked_prefill_size"):
+        assert needle in err, f"error text does not name {needle!r}: {err}"
+
+    # the configuration that ran the identical load to completion
+    assert mtp_resident_reservation_error(3600, 256, 2048) is None
+
+    # a carve larger than the whole pool is impossible, not merely tight
+    err = mtp_resident_reservation_error(3600, 4096, 2048)
+    assert err is not None and "entire KV pool" in err
+
+    # inert when the feature is off (slices 0) or the pool is unknown --
+    # the default path must not be able to raise
+    assert mtp_resident_reservation_error(3600, 0, 2048) is None
+    assert mtp_resident_reservation_error(0, 2048, 2048) is None
+    assert mtp_resident_reservation_error(3600, 256, 0) is None

@@ -30,6 +30,7 @@ serves the ROCm build once the AMD card is installed.
 """
 
 import logging
+import os
 import time
 
 import torch
@@ -540,21 +541,86 @@ void htccl_allgather(at::Tensor inp, at::Tensor out, int64_t rank,
 _ext = None
 
 
-def _load_ext():
+def _resolve_build_arches(cpu_group) -> list[str]:
+    """Every CUDA arch this extension must contain, as ``"8.6"``-style strings.
+
+    Each rank can only see its OWN card: the fork isolates a rank to one
+    physical GPU via ``CUDA_VISIBLE_DEVICES``, so ``torch.cuda.device_count()``
+    is 1 inside a worker and torch's own arch inference (which walks the
+    *visible* devices) yields a single architecture. On a mixed-arch rig that
+    single architecture is whichever rank happened to compile first, and every
+    other rank then loads a cubin its GPU cannot run.
+
+    Union-ing the capabilities over the group is therefore not an
+    optimisation but the only way a rank can learn the node's real mix. The
+    all-gather also makes the result identical on every rank by construction,
+    which is what allows it to be used as a cache key.
+    """
+    import re
+
+    import torch.distributed as dist
+
+    env = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    if env and env.strip().lower() != "native":
+        # An explicit list wins (and is assumed rank-uniform, like every
+        # other SGLANG_HTCCL* / build env in this transport).
+        specs = [s.strip() for s in re.split(r"[;,\s]+", env) if s.strip()]
+        arches = {s.replace("+PTX", "").strip() for s in specs}
+    else:
+        # Clamp to what the installed nvcc/torch can actually emit, exactly
+        # as torch.utils.cpp_extension._get_cuda_arch_flags does.
+        supported = [
+            int("".join(re.findall(r"\d+", a.split("_")[1])))
+            for a in torch.cuda.get_arch_list()
+            if "sm_" in a
+        ]
+        ceiling = max((sm // 10, sm % 10) for sm in supported) if supported else None
+        local = []
+        for i in range(torch.cuda.device_count()):
+            cap = torch.cuda.get_device_capability(i)
+            if ceiling is not None:
+                cap = min(ceiling, cap)
+            local.append(f"{cap[0]}.{cap[1]}")
+        gathered: list[list[str] | None] = [None] * dist.get_world_size(cpu_group)
+        dist.all_gather_object(gathered, local, group=cpu_group)
+        arches = {a for part in gathered for a in part}  # type: ignore[union-attr]
+    return sorted(arches, key=lambda s: tuple(int(x) for x in s.split(".")))
+
+
+def _load_ext(cpu_group):
     global _ext
     if _ext is None:
         from torch.utils.cpp_extension import load_inline
 
+        arches = _resolve_build_arches(cpu_group)
+        tags = [a.replace(".", "") for a in arches]
+        flags = [f"-gencode=arch=compute_{t},code=sm_{t}" for t in tags]
+        if tags:
+            # PTX of the newest arch, so a card added later still runs.
+            flags.append(
+                f"-gencode=arch=compute_{tags[-1]},code=compute_{tags[-1]}"
+            )
+        # The arch list belongs in the CACHE KEY, not just in the flags:
+        # torch keys its JIT build directory by extension name and rebuilds
+        # only when the SOURCES change. A name that ignores the architecture
+        # lets a stale single-arch .so from an earlier run be handed back to
+        # a rank it cannot run on -- which is the failure this guards, and it
+        # survives the flags alone.
+        name = "htccl_device_ext"
+        if tags:
+            name += "_sm" + "_".join(tags)
         t0 = time.time()
         _ext = load_inline(
-            name="htccl_device_ext",
+            name=name,
             cpp_sources=_CPP_SRC,
             cuda_sources=_CUDA_SRC,
             functions=["htccl_allreduce", "htccl_allgather"],
+            extra_cuda_cflags=flags or None,
             verbose=False,
         )
         _info_once(
-            "HTCCL device extension built in %.1f s", time.time() - t0,
+            "HTCCL device extension %r built for arch(es) %s in %.1f s",
+            name, ",".join(arches) or "<torch default>", time.time() - t0,
         )
     return _ext
 
@@ -594,7 +660,7 @@ class HTCCLDeviceTransport:
         self.rank = self._shm.rank
         self.world_size = self._shm.world_size
         self.slot_bytes = slot_bytes
-        self._ext = _load_ext()
+        self._ext = _load_ext(cpu_group)
 
         import ctypes
 

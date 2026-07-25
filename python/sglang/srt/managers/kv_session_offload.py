@@ -763,6 +763,56 @@ def select_spill_victim(
     return by_youth[0]
 
 
+def mtp_resident_reservation_error(
+    pool_tokens: int, slices: int, chunked_prefill_size: int
+) -> Optional[str]:
+    """Reject a spec-in-tick scratch reservation that starves the KV pool.
+
+    ``--kv-session-offload-mtp-resident-slices`` reserves device KV slots for
+    the spill tick's device draft and takes them OUT of the allocator for the
+    manager's whole lifetime (``allocator.size -= slices``). Nothing bounded
+    that against the pool it is carved from.
+
+    The failure it produces is the worst kind. If what remains cannot hold one
+    maximum prefill chunk, the scheduler can never assemble a full prefill
+    again: requests are still accepted and queued, they are simply never
+    admitted. The server does not crash, does not hang in any collective (the
+    ranks keep looping in lockstep and issue their scheduling collectives at
+    full rate), and logs nothing -- it just stops answering. Measured on this
+    rig: pool 3600 tokens, slices 2048 -> 1552 left against
+    chunked_prefill_size 2048, and the server wedged after 6 requests with the
+    7th queued forever. The same load with slices 256 (3344 left) ran all 9.
+
+    Returns the error text, or None when the reservation is safe.
+    """
+    slices = int(slices)
+    pool_tokens = int(pool_tokens)
+    chunked_prefill_size = int(chunked_prefill_size)
+    if slices <= 0 or pool_tokens <= 0:
+        return None
+    remaining = pool_tokens - slices
+    if remaining <= 0:
+        return (
+            f"--kv-session-offload-mtp-resident-slices={slices} exceeds this "
+            f"rank's entire KV pool of {pool_tokens} tokens. The reservation "
+            "is permanent, so no request could ever be admitted."
+        )
+    if chunked_prefill_size > 0 and remaining < chunked_prefill_size:
+        return (
+            f"--kv-session-offload-mtp-resident-slices={slices} would "
+            f"permanently remove {slices} of the {pool_tokens} KV tokens in "
+            f"this rank's pool, leaving {remaining} -- less than one chunked "
+            f"prefill (chunked_prefill_size={chunked_prefill_size}). The "
+            "reservation is held for the manager's lifetime, so the scheduler "
+            "could never admit a full prefill chunk again: new requests are "
+            "accepted, queued, and never run, with no crash, no collective "
+            "hang and no log line. Lower "
+            "--kv-session-offload-mtp-resident-slices, raise "
+            "--max-total-tokens, or lower --chunked-prefill-size."
+        )
+    return None
+
+
 def spec_decline_non_back_spill(spec_active: bool, idx: int, n_reqs: int) -> bool:
     """Return True when a spill of request ``idx`` (out of ``n_reqs`` running)
     must be DECLINED because speculative decoding is active and ``idx`` is not
@@ -1515,6 +1565,18 @@ class KVSessionOffloadManager:
         # uses the same cap so an over-cap tail plain-falls-back before surgery).
         self._draft_read_scratch = None
         if self.spec_in_tick_ready and self.mtp_resident_slices > 0:
+            # Fail fast BEFORE the carve: a reservation that leaves less than
+            # one prefill chunk wedges the scheduler silently (see
+            # mtp_resident_reservation_error). Validating here -- at arm time,
+            # on every rank, with the numbers in hand -- turns a server that
+            # simply stops answering into a startup error naming the cause.
+            _err = mtp_resident_reservation_error(
+                getattr(self.allocator, "size", 0),
+                self.mtp_resident_slices,
+                getattr(self.scheduler, "chunked_prefill_size", 0) or 0,
+            )
+            if _err is not None:
+                raise ValueError("kv-session-offload spec-in-tick: " + _err)
             _sc = self.allocator.alloc(self.mtp_resident_slices)
             if _sc is not None:
                 self._draft_read_scratch = _sc.to(torch.int64)

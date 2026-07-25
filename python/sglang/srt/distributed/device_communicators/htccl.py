@@ -116,22 +116,31 @@ class HTCCLCommunicator:
         # still being reduced/written back.
         self._host_bufs: list[torch.Tensor] = []
         self._host_buf_bytes = 0
-        # Stable per-shape output buffers: under piecewise CUDA graphs
-        # the collective runs eagerly BETWEEN captured segments, and the
-        # following segment was captured reading the collective's output
-        # at a fixed address. Returning a freshly allocated tensor every
-        # call would make replays read stale memory — so every result
-        # shape gets one persistent device buffer that is reused (and
-        # overwritten) on every call, like attention's out-parameter.
-        self._out_pool: dict[tuple, torch.Tensor] = {}
 
     def _get_out_buf(self, ref: torch.Tensor) -> torch.Tensor:
-        key = (tuple(ref.shape), ref.dtype)
-        buf = self._out_pool.get(key)
-        if buf is None:
-            buf = torch.empty_like(ref)
-            self._out_pool[key] = buf
-        return buf
+        """One FRESH output tensor per call — never a shape-keyed cache.
+
+        This used to hand out a persistent per-(shape, dtype) buffer, on the
+        theory that a piecewise CUDA graph captured downstream of the
+        collective needs the result at a stable address. That reasoning does
+        not survive contact with either path that exists:
+
+        * the CPU transports (shm/gloo) synchronize with the host inside the
+          collective, so they can never be inside a captured region at all;
+        * the one graph-capturable transport (`htccl_device`) does NOT use
+          this helper — it allocates with `torch.empty_like` per call, and is
+          correct precisely because capture-time allocations come from the
+          graph's private pool and therefore already replay at a stable
+          address.
+
+        Meanwhile the cache actively BREAKS the documented contract of
+        `all_reduce` ("returns a new tensor, out-of-place"): two results of
+        the same shape and dtype were the SAME tensor, so the second call
+        silently overwrote the first while the model still held it. That is
+        not a hypothetical — it corrupted the forward outright (garbage
+        tokens, no crash, no hang) on every non-device transport.
+        """
+        return torch.empty_like(ref)
 
     def _get_host_bufs(self, nbytes: int, count: int = 2) -> list[torch.Tensor]:
         if self._host_buf_bytes < nbytes or len(self._host_bufs) < count:
