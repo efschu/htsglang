@@ -29,7 +29,12 @@ CTX=${CTX:-4096}
 # capability and >= 6.5 GB headroom on every card. (3,2,2,1,1 is NOT monotonic
 # here -- it gives kv [2,1,1,2,2], i.e. the weakest cards the most heads.)
 RATIO=${RATIO:-4,3,3,2,1}
-SRVPORT=${SRVPORT:-31095}
+# Every node-rank starts its own HTTP server in this version, and ranks 0-2 are
+# co-located on the main rig -- one shared port means "[Errno 98] address
+# already in use" on whichever rank loses the race (measured: rank 0 lost, and
+# its warmup then hit ANOTHER rank's app and got a 404). One port per rank;
+# only rank 0's is ever queried.
+SRVPORT=${SRVPORT:-$((31095 + RANK))}
 
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export TORCHDYNAMO_DISABLE=1
