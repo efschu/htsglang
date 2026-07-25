@@ -707,6 +707,38 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = None
+    gguf_mmq_decode_threshold: A[
+        bool,
+        Arg(
+            help="EXPERIMENTAL (GGUF only): let large decode batches use the "
+            "tiled quantized GEMM (MMQ, ggml_mul_mat_a8) instead of the "
+            "matrix-vector kernel (MMVQ). Today MMVQ serves every batch up "
+            "to 8 tokens, which is where it falls off a cliff: measured on "
+            "the real per-rank Q8_0 decode shapes at 8 tokens, MMQ is "
+            "1.17-1.75x faster on an RTX 5090 (sm120). The threshold is "
+            "MEASURED per (device, shape class); on an RTX 3080 (sm86) MMVQ "
+            "still wins at 8 tokens, so the flag is a no-op there, and an "
+            "unmeasured device gets no rerouting at all rather than an "
+            "extrapolation. Never routes to the dequantize + cuBLAS path, "
+            "which is a different precision class (it does not quantize "
+            "activations). "
+            "TRADE-OFF YOU ARE ACCEPTING -- read before enabling: the "
+            "kernel is chosen per CUDA-graph decode BUCKET, which keeps a "
+            "captured graph replaying the kernel it was captured with, but "
+            "which bucket a request lands in depends on the OTHER traffic "
+            "in the batch. So the same request can take MMVQ in one run and "
+            "MMQ in another. Both kernels quantize activations to int8 and "
+            "agree well inside the bf16 output resolution, but they use a "
+            "different reduction order and are NOT bit-identical, so this "
+            "introduces a run-to-run output variation that does not exist "
+            "with the flag off. This is the same class of change as "
+            "swapping in a new kernel, not a milder one. "
+            "Equivalent env override (same trade-off, documented at the "
+            "dispatch site): SGLANG_GGUF_MMQ_DECODE_THRESHOLD=0|1, which "
+            "wins over this flag. "
+            "Default OFF -> the GGUF dispatch is byte-identical to before.",
+        ),
+    ] = False
     quantization_param_path: A[
         Optional[str],
         Arg(

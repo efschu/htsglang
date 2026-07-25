@@ -115,6 +115,22 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+def _register_gguf_decode_buckets(capture_bs, num_tokens_per_bs: int) -> None:
+    """#163: hand the decode token-count buckets to the GGUF dispatch.
+
+    Imported lazily so a non-GGUF deployment never pulls the module in, and
+    tolerant of an sgl_kernel build without the GGUF ops (the import is the
+    only thing that can fail; a failure just leaves the dispatch on raw token
+    counts, which is what it used before).
+    """
+    try:
+        from sglang.srt.layers.quantization.gguf import set_decode_token_buckets
+
+        set_decode_token_buckets(bs * num_tokens_per_bs for bs in capture_bs)
+    except Exception as e:  # pragma: no cover - optional dependency path
+        logger.debug("GGUF decode-bucket registration skipped: %s", e)
+
+
 def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -> bool:
     if not spec_algorithm.supports_ragged_verify():
         return False
@@ -291,6 +307,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ]
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
+
+        # #163: publish the decode TOKEN-count buckets (bs * num_tokens_per_bs)
+        # to the GGUF dispatch, so its opt-in MMVQ->MMQ threshold decides per
+        # bucket instead of per raw token count. Without this coupling a
+        # captured graph could replay a kernel other than the one it was
+        # captured with. Registration is unconditional and side-effect free
+        # (the consumer ignores it while --gguf-mmq-decode-threshold is off);
+        # target and draft runners both register and the union is kept, which
+        # preserves the invariant that every replayed token count is itself a
+        # bucket.
+        _register_gguf_decode_buckets(self.capture_bs, self.num_tokens_per_bs)
 
         # Weightless-KV streaming block-decode graphs (#136a): when the lane's
         # B0/B1 block loop is active, decode graphs are captured as a bucketed
