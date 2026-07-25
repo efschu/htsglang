@@ -178,10 +178,50 @@ class TestRealTransportsDeclareTheExpectedCapability(CustomTestCase):
             HTCCLDeviceTransport,
         )
 
-        self.assertEqual(HTCCLDeviceTransport.HTCCL_OPS, frozenset(OPS))
+        # `broadcast` joined the three data-plane ops: the communicator's
+        # generic broadcast is host-staged and therefore ILLEGAL inside a CUDA
+        # graph capture, which the speculative draft-pick sync performs once
+        # PyNccl is suppressed under HTCCL. The device transport declares and
+        # implements a capturable one (all_gather + src slice).
+        self.assertEqual(
+            HTCCLDeviceTransport.HTCCL_OPS,
+            frozenset(OPS) | {"broadcast"},
+        )
         for name in ("handles", "htccl_all_reduce", "htccl_all_gather",
-                     "htccl_reduce_scatter"):
+                     "htccl_reduce_scatter", "htccl_broadcast"):
             self.assertTrue(hasattr(HTCCLDeviceTransport, name), name)
+
+    def test_device_broadcast_is_built_on_a_byte_exact_primitive(self):
+        """It must be all_gather-based, not zero+all_reduce.
+
+        The draft-pick sync carries an int64 `topk_index`. The device reduce
+        kernel dispatches only kHalf/kBFloat16/kFloat, so a zero+all_reduce
+        emulation would either fail outright or, if bit-cast into a float
+        dtype, silently corrupt indices (-0.0 and NaN payloads are not
+        preserved by `x + 0.0`). all_gather's kernel is pure byte movement,
+        so it is exact for every dtype.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from sglang.srt.distributed.device_communicators.htccl_device import (
+            HTCCLDeviceTransport,
+        )
+
+        fn = ast.parse(
+            textwrap.dedent(
+                inspect.getsource(HTCCLDeviceTransport.htccl_broadcast)
+            )
+        ).body[0]
+        # judge the CODE, not the prose: the docstring names the rejected
+        # alternative on purpose
+        if (fn.body and isinstance(fn.body[0], ast.Expr)
+                and isinstance(fn.body[0].value, ast.Constant)):
+            fn.body = fn.body[1:]
+        body = ast.unparse(fn)
+        self.assertIn("all_gather", body)
+        self.assertNotIn("all_reduce", body)
 
 
 if __name__ == "__main__":

@@ -836,13 +836,41 @@ class HTCCLDeviceTransport:
     # is exactly what the previous per-op `if self.device_transport is not
     # None` checks did -- this is a restatement of today's behaviour, not a
     # change. Nothing in the GPU-validated data path below is touched.
-    HTCCL_OPS = frozenset({"all_reduce", "all_gather", "reduce_scatter"})
+    HTCCL_OPS = frozenset(
+        {"all_reduce", "all_gather", "reduce_scatter", "broadcast"}
+    )
 
     def handles(self, op: str, nbytes: int) -> bool:
         return op in self.HTCCL_OPS
 
     def htccl_all_reduce(self, comm, inp: torch.Tensor) -> torch.Tensor:
         return self.all_reduce(inp)
+
+    def htccl_broadcast(self, comm, tensor: torch.Tensor, src: int):
+        """CUDA-GRAPH-CAPTURABLE broadcast: all_gather, then take src's slice.
+
+        The communicator's generic broadcast is host-staged (pinned buffer +
+        gloo), which is illegal inside a capture -- `cudaErrorStreamCapture
+        Unsupported`. That never surfaced while a PyNccl communicator existed
+        alongside HTCCL, because the speculative path preferred pynccl for its
+        capture-time syncs. Suppressing PyNccl under HTCCL (required: NCCL
+        cannot span vendors and ncclCommInitRank segfaults on a mixed group)
+        removed that fallback and routed those syncs here, inside the EAGLE
+        draft capture.
+
+        all_gather is the right primitive to build this on: its kernel is pure
+        byte movement (nbytes + cudaMemcpyAsync, no dtype dispatch and no
+        arithmetic), so unlike a zero+all_reduce emulation it is exact for
+        EVERY dtype -- including the int64 `topk_index` the draft-pick sync
+        carries, which the reduce kernel does not even dispatch.
+
+        Cost is world_size x payload instead of 1x. The payloads on this path
+        are per-step draft picks (a few KiB), so this is not a hot path.
+        """
+        n = tensor.numel()
+        gathered = self.all_gather(tensor.reshape(-1), dim=0)
+        tensor.copy_(gathered[src * n : (src + 1) * n].view(tensor.shape))
+        return tensor
 
     def htccl_all_gather(self, comm, inp: torch.Tensor, dim: int) -> torch.Tensor:
         return self.all_gather(inp, dim)

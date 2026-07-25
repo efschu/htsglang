@@ -374,6 +374,13 @@ class HTCCLCommunicator:
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         if self.disabled:
             return tensor
+        # A transport that can broadcast on-device does so: the host-staged
+        # path below synchronizes with the host and is therefore ILLEGAL
+        # inside a CUDA-graph capture, which the speculative draft-pick sync
+        # performs. See HTCCLDeviceTransport.htccl_broadcast.
+        t = self._select("broadcast", tensor.numel() * tensor.element_size())
+        if t is not None:
+            return t.htccl_broadcast(self, tensor, src)
         host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
         if self.rank == src:
             host.copy_(tensor, non_blocking=False)
