@@ -875,3 +875,42 @@ def test_kv_eq_tp_stays_in_normal_mode_by_measurement():
         assert not du.attn_kv_replicated(4, 2)
     finally:
         du.tp_plan_active = saved_active
+
+
+def test_token_vector_without_a_plan_is_rejected_not_ignored():
+    """SGLANG_UNEVEN_TOKEN_VECTOR without a non-uniform --rank-tp-ratio used
+    to be SILENTLY IGNORED: resolve_cp_token_ratios bails on `not weights`
+    BEFORE reading the env, the server boots green, flashinfer's even-DCP
+    no-op serves plain TP output -- and the requested token ownership never
+    exists. Measured on Qwen3.5-2B TP=2/DCP=2 TOKVEC=2,1: coherent,
+    token-identical to TP=1, zero uneven-machinery log lines.
+
+    A configured-looking server that does nothing that was asked is worse
+    than a startup error. Pin the rejection, and pin that the plainest
+    default (no vector, no plan) still resolves to None silently.
+    """
+    import os
+    import types
+
+    import sglang.srt.distributed.utils as du
+
+    sa = types.SimpleNamespace(rank_tp_ratio=None, dcp_size=2)
+    saved = os.environ.get("SGLANG_UNEVEN_TOKEN_VECTOR")
+    try:
+        os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = "2,1"
+        with pytest.raises(ValueError) as ei:
+            du.resolve_cp_token_ratios(sa)
+        assert "silently ignored" in str(ei.value)
+
+        # dcp_size == 1: the vector is inert by definition, no rejection
+        sa1 = types.SimpleNamespace(rank_tp_ratio=None, dcp_size=1)
+        assert du.resolve_cp_token_ratios(sa1) is None
+
+        # default path: no vector, no plan -> silent None, unchanged
+        del os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"]
+        assert du.resolve_cp_token_ratios(sa) is None
+    finally:
+        if saved is None:
+            os.environ.pop("SGLANG_UNEVEN_TOKEN_VECTOR", None)
+        else:
+            os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = saved

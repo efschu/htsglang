@@ -595,3 +595,47 @@ aware model class the o_proj unit coupling already holds (it booted and ran
 when both run in one process (fails in the pair, passes alone). Present at
 the pushed HEAD without any of this session's changes; bisected to the file
 level. Not fixed here.
+
+
+## The DCP gate (--rank-kv-ratio requires uneven TP) — CHECKED: real wiring dependency, not arbitrary
+
+Question: the docs call token ownership "a free placement knob", yet
+`--rank-kv-ratio` demands a non-uniform `--rank-tp-ratio` (plus placement).
+Can the gate be decoupled?
+
+**Answer: not by removing the check.** The dependency is real in the current
+wiring, in three places that all key on the base plan:
+
+1. `server_args.py:5606` — the arg gate itself (explicit vector without a
+   plan: hard reject; `capacity` degrades to a warning + no-op).
+2. `server_args.py:5803` — the `dcp_size = tp_size` auto-set requires
+   `uneven_plan`.
+3. The deep one: `uneven_dcp_kv_replicated()` — the predicate the whole
+   replicated-KV token-sharded pool machinery hangs on — is DEFINED as
+   `dcp_size > 1 and get_tp_partition_ratios() is not None`. And
+   `resolve_cp_token_ratios` bailed on `not weights` BEFORE reading the env
+   vector.
+
+**Measured, not argued:** Qwen3.5-2B, TP=2/DCP=2, flashinfer,
+`SGLANG_UNEVEN_TOKEN_VECTOR=2,1`, NO plan -> boots green, output
+token-identical to TP=1, ZERO uneven-machinery log lines. The vector was
+silently ignored and flashinfer's even-DCP no-op (#169.2) served plain TP.
+A configured-looking server doing nothing that was asked.
+
+**What decoupling would actually take** (a designed task, #169-adjacent, not
+done here): re-base the engagement predicate on the token machinery's own
+state instead of the TP-plan proxy, audit every consumer of
+`uneven_dcp_kv_replicated` / `uneven_dcp_active`, and resolve the head-mode
+interaction — the replicated pool assumes FULL kv heads per rank, which
+contradicts the even head-sharded split that an even TP plan produces
+(same geometric knot as the kv == tp flip refutation above).
+
+**Hardening landed instead:** `resolve_cp_token_ratios` now REJECTS a set
+`SGLANG_UNEVEN_TOKEN_VECTOR` without a plan (naming why), instead of
+silently ignoring it. dcp_size == 1 stays inert; no-vector default stays a
+silent None; the with-plan path is untouched (verified: plan + matching
+vector still resolves, `[18, 23, 23]`).
+`test_token_vector_without_a_plan_is_rejected_not_ignored` pins all three
+directions. For the second host: the gate's error text is accurate about the
+wiring — their kv=2 model does not lose uneven DCP "for no reason"; the
+machinery genuinely does not exist without a plan today.

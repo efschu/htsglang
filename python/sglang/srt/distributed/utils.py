@@ -374,6 +374,28 @@ def resolve_cp_token_ratios(server_args, checkpoint_size_mib: Optional[int] = No
     weights = getattr(server_args, "rank_tp_ratio", None)
     dcp_size = getattr(server_args, "dcp_size", 1)
     if not weights or dcp_size <= 1 or len(set(weights)) == 1:
+        # HONESTY GUARD (measured): this bail-out runs BEFORE the env vector
+        # is read, so SGLANG_UNEVEN_TOKEN_VECTOR without a non-uniform
+        # --rank-tp-ratio plan was SILENTLY IGNORED -- the server booted
+        # green, flashinfer's even-DCP no-op served plain TP output, and the
+        # requested token ownership never existed. Every engagement point of
+        # the token-sharded pool (uneven_dcp_kv_replicated, the dcp auto-set,
+        # this resolver) keys on the base plan today, so decoupled token
+        # ownership is NOT reachable through this door; say so instead of
+        # ignoring the ask.
+        from sglang.srt.environ import envs as _envs
+
+        _env_vec = _envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()
+        if _env_vec and dcp_size > 1:
+            raise ValueError(
+                f"SGLANG_UNEVEN_TOKEN_VECTOR={_env_vec!r} is set, but no "
+                "non-uniform --rank-tp-ratio plan is installed. The uneven "
+                "token-ownership machinery only engages under a base shard "
+                "plan (uneven_dcp_kv_replicated keys on it); without one the "
+                "vector would be silently ignored and the server would run "
+                "plain even DCP while looking configured. Install a "
+                "non-uniform --rank-tp-ratio, or unset the vector."
+            )
         return None
     if len(weights) != dcp_size:
         return None
