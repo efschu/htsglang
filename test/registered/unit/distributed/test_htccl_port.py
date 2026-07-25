@@ -335,6 +335,23 @@ def test_dispatch_seams_are_all_none_guarded():
         if "self.htccl_comm =" in line or "self.htccl_comm:" in line
     }
 
+    # A touch that IS the guard itself, outside an `if` -- e.g.
+    #     _htccl_active = self.htccl_comm is not None
+    # This is not a loophole: the invariant being protected is that flag-off
+    # falls through, and such an expression evaluates to False exactly when the
+    # flag is off, which is the required behaviour. What stays forbidden is an
+    # unguarded USE of the object (attribute access, call, truthiness), because
+    # that is what could change flag-off semantics.
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Compare)
+            and isinstance(node.ops[0], ast.IsNot)
+            and "htccl_comm" in ast.unparse(node.left)
+        ):
+            for sub in ast.walk(node):
+                if hasattr(sub, "lineno"):
+                    guarded_lines.add(sub.lineno)
+
     for lineno in _htccl_attribute_uses(tree):
         assert lineno in guarded_lines or lineno in assigned_lines, (
             f"{_PARALLEL_STATE}:{lineno} touches self.htccl_comm without an "
