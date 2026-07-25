@@ -22,6 +22,8 @@
 
 #include <concepts>
 #include <cstddef>
+#include <memory>
+#include <tuple>
 #include <type_traits>
 #ifndef USE_ROCM
 #include <cuda_bf16.h>
@@ -269,6 +271,21 @@ inline void RuntimeDeviceCheck(DebugInfo location = {}) {
  * The constructor resolves the CUDA stream from a `DLDevice` (via `TVMFFIEnvGetStream`)
  * or accepts a raw `cudaStream_t`. The call operator launches the kernel and checks for errors.
  */
+#ifdef USE_ROCM
+/// Parameter list of a `__global__` function, used to prove that the untyped
+/// hipLaunchKernel path below is passed exactly the types the kernel declares.
+template <typename F>
+struct KernelParams;
+template <typename... P>
+struct KernelParams<void (*)(P...)> {
+  using decayed = std::tuple<std::decay_t<P>...>;
+};
+template <typename... P>
+struct KernelParams<void(P...)> {
+  using decayed = std::tuple<std::decay_t<P>...>;
+};
+#endif
+
 struct LaunchKernel {
  private:
   struct KernelConfig {
@@ -345,14 +362,43 @@ struct LaunchKernel {
   template <typename T, typename... Args>
   auto operator()(T&& kernel, Args&&... args) const -> void {
 #ifdef USE_ROCM
-    hipLaunchKernelGGL(
-        std::forward<T>(kernel),
-        m_config.gridDim,
-        m_config.blockDim,
-        m_config.dynamicSmemBytes,
-        m_config.stream,
-        std::forward<Args>(args)...);
-    RuntimeDeviceCheck(m_location);
+    // Mirror the CUDA branch: use a launch API that RETURNS an error code.
+    //
+    // This used to call hipLaunchKernelGGL (which returns void) and then query
+    // ::cudaGetLastError(). That extra post-launch query is NOT legal during
+    // stream capture, so every CUDA-graph capture containing an sgl_kernel
+    // launch failed on ROCm with
+    //   "CUDA error: the operation cannot be performed in the present state"
+    // while the CUDA branch, which checks the launch's own return value, was
+    // fine. The asymmetry was the bug -- not the kernel, not the types, but
+    // the error-checking STRATEGY around the launch -- so it is removed rather
+    // than worked around.
+    //
+    // hipLaunchKernel takes an UNTYPED void** argument array, whereas
+    // cudaLaunchKernelEx is a typed template that would implicitly convert
+    // arguments to the kernel's parameter types. Raw bytes are passed here, so
+    // a mismatch would silently misread them. The static_assert makes that a
+    // compile-time error instead: the caller must pass exactly the declared
+    // types.
+    static_assert(
+        std::is_same_v<
+            std::tuple<std::decay_t<Args>...>,
+            typename KernelParams<std::decay_t<T>>::decayed>,
+        "hipLaunchKernel passes arguments untyped: the arguments must match "
+        "the kernel's declared parameter types exactly (no implicit "
+        "conversions).");
+    // +1 keeps the array well-formed for a zero-argument kernel.
+    void* arg_ptrs[sizeof...(Args) + 1] = {
+        const_cast<void*>(static_cast<const void*>(std::addressof(args)))...};
+    RuntimeDeviceCheck(
+        ::hipLaunchKernel(
+            reinterpret_cast<const void*>(kernel),
+            m_config.gridDim,
+            m_config.blockDim,
+            arg_ptrs,
+            m_config.dynamicSmemBytes,
+            m_config.stream),
+        m_location);
 #else
     RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
