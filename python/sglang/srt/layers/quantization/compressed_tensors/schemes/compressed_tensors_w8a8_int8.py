@@ -26,8 +26,23 @@ from sglang.srt.utils import is_cuda
 __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
+_has_sgl_int8_scaled_mm = False
 if _is_cuda:
-    from sgl_kernel import int8_scaled_mm
+    # Turing (sm75): sgl-kernel's wheel is cubin-only with a gencode floor of
+    # sm_80 and no PTX, so it carries no code this card can run. Guarding the
+    # import lets the rest of the quantization package load; a rank that
+    # actually selects this scheme still fails loudly in __init__ below rather
+    # than silently computing with a missing symbol.
+    #
+    # Worth noting for the Turing feature's direction: INT8 scaled matmul is
+    # exactly the arithmetic Turing is strongest at, so this call site is a
+    # future OPTIMISATION target, not merely an obstacle.
+    try:
+        from sgl_kernel import int8_scaled_mm
+
+        _has_sgl_int8_scaled_mm = True
+    except ImportError:
+        int8_scaled_mm = None
 
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
@@ -35,6 +50,15 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     def __init__(
         self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
     ):
+        if _is_cuda and not _has_sgl_int8_scaled_mm:
+            raise NotImplementedError(
+                "CompressedTensorsW8A8Int8 needs sgl_kernel.int8_scaled_mm, "
+                "which this build has no code for on this device (sgl-kernel "
+                "is cubin-only with a gencode floor of sm_80; an sm75 card "
+                "such as a 2080/2080 Ti/T4 has no executable code in it). "
+                "Use an unquantized or differently-quantized checkpoint on "
+                "this rank."
+            )
         self.strategy = strategy
         self.is_static_input_scheme = is_static_input_scheme
         self.input_symmetric = input_symmetric

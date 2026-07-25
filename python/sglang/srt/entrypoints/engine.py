@@ -102,6 +102,7 @@ from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
     is_cuda,
+    sgl_kernel_runnable,
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
@@ -1339,11 +1340,26 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
             )
-        if _is_cuda:
+        # Turing (sm75) support: sgl-kernel's wheel is cubin-only with a
+        # gencode floor of sm_80 and no PTX, so on a 2080/2080 Ti/T4 it
+        # contains no executable code even when installed. Demanding it there
+        # refuses to start a server that would otherwise run fine on the
+        # native/Triton paths. Gate on the CAPABILITY, not on being CUDA.
+        #
+        # On sm80+ this is unchanged: sgl_kernel_runnable() is True whenever the
+        # package is present and the device is at or above the floor, so a
+        # normal rig still gets the same hard assertion as before.
+        if _is_cuda and sgl_kernel_runnable():
             assert_pkg_version(
                 "sglang-kernel",
                 "0.4.4",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
+            )
+        elif _is_cuda:
+            logger.warning(
+                "sgl-kernel is not usable on this device (compute capability "
+                "below the sm_80 build floor, or package absent). Running on "
+                "the native/Triton fallback paths."
             )
 
     # Signal handlers can only be registered from the main thread.

@@ -48,7 +48,17 @@ _is_gfx942 = is_gfx942_supported()
 _is_xpu = is_xpu()
 
 if _is_cuda:
-    from sgl_kernel.utils import is_arch_support_pdl
+    # PDL (Programmatic Dependent Launch) is a Hopper+ feature, and the helper
+    # that reports it lives in sgl_kernel -- which has no code for sm75 (the
+    # wheel is cubin-only with a gencode floor of sm_80). Without a guard a
+    # Turing card cannot even construct the Triton attention backend, although
+    # the answer for it is simply "no PDL".
+    try:
+        from sgl_kernel.utils import is_arch_support_pdl
+
+        _has_pdl_probe = True
+    except ImportError:
+        _has_pdl_probe = False
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -329,9 +339,12 @@ class TritonAttnBackend(AttentionBackend):
                 # fp32 attn_logits buffer to ~4 GiB on Kimi-K2.6 and faulting in
                 # ROCm graph replay; pin to 256 to match validated gfx950 behavior.
                 self.max_kv_splits = min(self.max_kv_splits, 256)
-        if _is_cuda:
+        if _is_cuda and _has_pdl_probe:
             self.use_pdl = is_arch_support_pdl()
         else:
+            # No probe available => no PDL. Correct for sm75, which predates
+            # the feature entirely, and unchanged on sm80+ where the probe is
+            # present and answers for itself.
             self.use_pdl = False
 
         self.allow_bidirectional_attention_in_extend = (

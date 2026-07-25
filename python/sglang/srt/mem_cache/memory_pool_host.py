@@ -31,16 +31,32 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
+_has_sgl_kvcacheio = False
 if _is_cuda or _is_hip:
-    from sgl_kernel.kvcacheio import (
-        transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_all_layer_mla,
-        transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
-    )
+    # Turing (sm75) / gfx900: no sgl-kernel code for these archs. These are the
+    # HiCache host<->device KV transfer kernels; a rank without them simply
+    # cannot use HiCache, but must still be able to start a plain server, and
+    # this module is on the ordinary import path.
+    try:
+        from sgl_kernel.kvcacheio import (
+            transfer_kv_all_layer_direct_lf_pf,
+            transfer_kv_all_layer_mla,
+            transfer_kv_all_layer_mla_lf_pf,
+            transfer_kv_direct,
+            transfer_kv_per_layer_direct_pf_lf,
+            transfer_kv_per_layer_mla,
+            transfer_kv_per_layer_mla_pf_lf,
+        )
+
+        _has_sgl_kvcacheio = True
+    except ImportError:
+        transfer_kv_all_layer_direct_lf_pf = None
+        transfer_kv_all_layer_mla = None
+        transfer_kv_all_layer_mla_lf_pf = None
+        transfer_kv_direct = None
+        transfer_kv_per_layer_direct_pf_lf = None
+        transfer_kv_per_layer_mla = None
+        transfer_kv_per_layer_mla_pf_lf = None
 
 logger = logging.getLogger(__name__)
 

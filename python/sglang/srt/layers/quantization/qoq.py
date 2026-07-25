@@ -19,8 +19,21 @@ from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
+_has_sgl_qoq_kernels = False
 if _is_cuda:
-    from sgl_kernel import qserve_w4a8_per_chn_gemm, qserve_w4a8_per_group_gemm
+    # Turing (sm75): sgl-kernel is cubin-only, gencode floor sm_80, no PTX --
+    # nothing a 2080/2080 Ti/T4 can execute. Guard so the quantization package
+    # imports; QoQConfig below refuses loudly if this scheme is selected.
+    try:
+        from sgl_kernel import (
+            qserve_w4a8_per_chn_gemm,
+            qserve_w4a8_per_group_gemm,
+        )
+
+        _has_sgl_qoq_kernels = True
+    except ImportError:
+        qserve_w4a8_per_chn_gemm = None
+        qserve_w4a8_per_group_gemm = None
 
 
 QoQ_SUPPORTED_WEIGHT_BITS = [4]

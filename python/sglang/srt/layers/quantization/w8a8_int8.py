@@ -42,8 +42,20 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
+_has_sgl_int8_scaled_mm = False
 if _is_cuda:
-    from sgl_kernel import int8_scaled_mm
+    # Turing (sm75): see compressed_tensors_w8a8_int8.py -- sgl-kernel holds no
+    # code for this arch. INT8 scaled matmul is also the operation Turing is
+    # arithmetically strongest at, so this is a future optimisation target for
+    # the Turing feature, not just a blocker.
+    try:
+        from sgl_kernel import int8_scaled_mm
+
+        _has_sgl_int8_scaled_mm = True
+    except ImportError:
+        int8_scaled_mm = None
+
+if _is_cuda and _has_sgl_int8_scaled_mm:
 
     @register_fake_if_exists("sgl_kernel::int8_scaled_mm")
     def _int8_scaled_mm_abstract(

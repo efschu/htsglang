@@ -158,7 +158,17 @@ if _use_aiter:
 
 
 if _is_cuda:
-    from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+    # Capability, not vendor: absent on any device the cubin-only wheel was not
+    # built for (gencode floor sm_80, no PTX) -- e.g. sm75 -- exactly as it is
+    # absent on gfx900.
+    try:
+        from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+
+        _has_sgl_kernel_fp8_mm = True
+    except ImportError:
+        _has_sgl_kernel_fp8_mm = False
+        fp8_blockwise_scaled_mm = None
+        fp8_scaled_mm = None
 
     from sglang.srt.utils.patch_torch import register_fake_if_exists
 

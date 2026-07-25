@@ -52,8 +52,18 @@ _use_sgl_xpu = use_intel_xpu_backend()
 _is_musa = is_musa()
 
 
+_has_sgl_moe_sum_reduce = False
 if _is_cuda:
-    from sgl_kernel import moe_sum_reduce
+    # Turing (sm75): sgl-kernel holds no code for this arch (cubin-only,
+    # gencode floor sm_80, no PTX). This module is on the ordinary import
+    # chain even for dense models, so it must not take down startup; a rank
+    # that actually runs an MoE model still needs the kernel.
+    try:
+        from sgl_kernel import moe_sum_reduce
+
+        _has_sgl_moe_sum_reduce = True
+    except ImportError:
+        moe_sum_reduce = None
 
     from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:

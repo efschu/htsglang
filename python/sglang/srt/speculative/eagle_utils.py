@@ -52,10 +52,22 @@ _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
+_has_sgl_build_tree_kernel = False
 if _is_cuda or _is_hip or _is_musa:
-    from sgl_kernel import (
-        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
-    )
+    # Turing (sm75) and gfx900 alike: sgl-kernel has no code for these archs
+    # (cubin-only wheel, gencode floor sm_80; no ROCm build below gfx942). This
+    # module is imported on the ordinary startup path even when speculative
+    # decoding is off, so an unguarded import blocks a plain server.
+    # Speculative decoding itself still requires the kernel -- the guard only
+    # stops it from taking down non-speculative startup.
+    try:
+        from sgl_kernel import (
+            build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
+        )
+
+        _has_sgl_build_tree_kernel = True
+    except ImportError:
+        sgl_build_tree_kernel_efficient = None
 elif _is_cpu:
     from sgl_kernel import (
         build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,

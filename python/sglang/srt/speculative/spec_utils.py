@@ -72,7 +72,14 @@ if TYPE_CHECKING:
 
 
 if _is_cuda:
-    from sgl_kernel import fast_topk
+    # Same reason as the HIP branch below, different architecture: sgl-kernel
+    # is cubin-only with a gencode floor of sm_80 and no PTX, so an sm75 card
+    # (2080/2080 Ti/T4) has no code in it either. The pure-torch fast_topk is
+    # already written and is what every other platform uses.
+    try:
+        from sgl_kernel import fast_topk
+    except ImportError:
+        from sglang.srt.utils.common import fast_topk
 elif _is_hip:
     # sgl-kernel has no gfx900 build, and this module is reached from
     # triton_backend, so an unguarded import blocks the attention backend on
