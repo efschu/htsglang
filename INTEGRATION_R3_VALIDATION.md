@@ -813,6 +813,29 @@ collect) **and** `LD_LIBRARY_PATH` pointing at the venv's nvidia libs (else
 `deep_gemm/_C.so` cannot find `libnvrtc.so.13` and 5 more abort collection).
 `test_hicache_nixl_storage.py` needs `--ignore` (missing `nixl`).
 
+**The full suite cannot be run to completion on this tree, and that is not new.**
+It dies deterministically at ~29% — twice at the identical byte offset — inside
+`mem_cache/test_minimax_sparse_pool_host_unit.py`, with the runner killed rather
+than a failure reported (no verdict is emitted for the tests in flight). 1758
+tests pass and 75 fail before that point.
+
+The merge is nevertheless clean, established by comparison rather than by a
+completed run. The 75 failures were extracted and replayed **in isolation on
+both trees**:
+
+```
+merge tip    25 failed / 50 passed
+pre-merge    25 failed / 50 passed
+set difference: IDENTICAL FAILURE SETS
+```
+
+So the merge introduces **no new red**. The 75-vs-25 gap is the order-dependent
+pollution already documented on this branch (a test's verdict depends on what
+ran before it in the same process), not a property of either tree; the 5-failure
+baseline (`test_vmm_utils` x4, `test_uneven_tp_nccl_env` x1) is contained in
+both sets. The runner-killing test and the pollution are pre-existing and remain
+open.
+
 ### Note on the arm-E generation validator
 
 Both drives reported several points INVALID (`char-loop`). This is a **validator
