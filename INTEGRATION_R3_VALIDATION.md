@@ -1265,3 +1265,63 @@ AWQ 798,528 -> +274,240  FP8 886,336 -> +362,048
   stock PP is still unidentified. It does **not** affect this table, because
   neither row here is stock PP -- but the same uncapped probe boots should
   confirm the fork pools independently.
+
+#### SUPERSEDED: real logs found -- the computed TP=2 row is replaced by measurement
+
+A search of the machine turned up actual boot logs of the pre-fork
+configuration, so the computed row above is retired. It is kept only as a
+cross-check, and it landed in the right range.
+
+**All numbers below are verbatim from logs. Same engine (vLLM), same model
+(Qwen3.6-27B-AWQ-BF16-INT4), same box.**
+
+| configuration | GPU KV cache size | max context per request | concurrency at that context |
+|---|---|---|---|
+| **vLLM TP=2, 2 cards**, MTP=3, kv fp8, util **0.88** | 94,400 tokens | **94,400** -- auto-REDUCED from 262,144 | **1.00x** |
+| **vLLM TP=3 auto** (fork uneven ratio), 3 cards | 1,146,573 tokens | **262,144** (model max) | **4.37x** |
+| vLLM TP=3 auto + dcp=3 (fork) | 840,330 tokens | **262,144** (model max) | 3.21x |
+
+vLLM says it itself, and this single line is the whole comparison:
+
+```
+Auto-fit max_model_len: reduced from 262144 to 94400 to fit in available GPU
+memory (1.94 GiB available for KV cache)
+Maximum concurrency for 94,400 tokens per request: 1.00x
+```
+
+**Pre-fork, the engine had to cut the model's own context by 64% to make it
+fit, and could then serve exactly one request. With the fork's uneven ratio on
+the third card, the same engine serves 4.37 concurrent requests at the full
+262,144.**
+
+Corroborating sglang datapoints (different engine, so not mixed into the table
+above): `htsglang_awq_tp2` at `mem_fraction_static=0.9` reaches
+`max_total_num_tokens=148,864` but only with `context_length=24576`, weights
+13.32 GB/rank plus a 2.57 GB MTP draft per rank, mamba 13 slots costing
+0.98 + 0.84 GB. This session's fork TP=3 boots measured 563,763-798,528 (AWQ)
+and 886,336 (FP8).
+
+**Which card these logs ran on -- checked, not assumed.** The log does not name
+the GPU, so it was derived from the memory arithmetic at util 0.88 with
+13.51 GiB of weights and 1.94 GiB of KV:
+
+| assumed card | implied overhead |
+|---|---|
+| 3080 20 GB | **2.15 GiB -- plausible** |
+| 3090 24 GB | 5.67 GiB -- implausible |
+
+So the TP=2 log is a 20 GB card, i.e. this rig's 3080s. Stated because the
+model cache directory is named `club-3090` and would otherwise invite the
+wrong inference.
+
+**How the retired computation compares.** It assumed util 0.82 (the reference
+command in CLAUDE.md) where the log used 0.88, and predicted 34.7k / 74.1k /
+106.8k tokens for one request across its overhead variants. The measured 94,400
+at the higher utilisation sits inside that band, and the measured overhead
+(2.15 GiB) matches the "conservative" variant (2.3 GB) most closely. The
+calculation was therefore sound but unnecessary -- measurement wins, and the
+0.82 figure remains unmeasured.
+
+**The qualitative claim is unchanged and now rests on measurement rather than
+assumption:** the pre-fork configuration cannot serve this model at its own
+maximum context, while the fork configuration can, several times over.
