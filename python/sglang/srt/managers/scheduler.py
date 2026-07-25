@@ -3110,8 +3110,41 @@ class Scheduler(
         # the default path (offload manager absent) -> byte-identical.
         dcp_avail_deficit = 0
         prefill_spill_regions = 0
+        prefill_spill_region_tokens = 0
+        prefill_spill_deep = False
         if self.kv_session_offload is not None:
             dcp_avail_deficit = self.kv_session_offload.dcp_budget_deficit()
+            # PS2 (deep prefill-spill): replicated region capacity + master
+            # gate. Both 0/False when --kv-session-offload-prefill is off, so
+            # the deep branch in the adder is unreachable (byte-identical).
+            prefill_spill_region_tokens = int(
+                self.kv_session_offload.region_tokens
+                if self.kv_session_offload.prefill_spill
+                else 0
+            )
+            # PS2 V1 master gate (feature flag AND no speculative decoding --
+            # see prefill_spill_deep_gate for why spec is excluded).
+            from sglang.srt.managers.kv_session_offload import (
+                prefill_spill_deep_gate,
+            )
+
+            prefill_spill_deep = prefill_spill_deep_gate(
+                self.kv_session_offload.prefill_spill,
+                not self.spec_algorithm.is_none(),
+            )
+            if (
+                self.kv_session_offload.prefill_spill
+                and not self.spec_algorithm.is_none()
+                and not getattr(self, "_ps2_spec_declined_logged", False)
+            ):
+                self._ps2_spec_declined_logged = True
+                logger.info(
+                    "kv-session-offload prefill-spill (PS2): DEEP born-spilled "
+                    "admission is disabled under speculative decoding (%s) -- "
+                    "the draft extend would write to host sentinel slots. "
+                    "PS1 born-spilled admission is unaffected.",
+                    self.spec_algorithm,
+                )
             # Prefill-Spill (PS1-V1a): replicated free-region count (0 when the
             # feature is off -> the adder relaxation is inert). No collective
             # here (rank-uniform by construction, see prefill_spill_free_regions).
@@ -3138,6 +3171,8 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
             dcp_avail_deficit=dcp_avail_deficit,
             prefill_spill_regions=prefill_spill_regions,
+            prefill_spill_region_tokens=prefill_spill_region_tokens,
+            prefill_spill_deep=prefill_spill_deep,
         )
 
         if self.chunked_req is not None:

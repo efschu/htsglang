@@ -908,6 +908,15 @@ class Req(ReqDllmMixin):
         # host pool. Default False -> byte-identical when the feature is off.
         self.born_spilled = False
 
+        # kv-session-offload Prefill-Spill DEEP (PS2): set at admission when
+        # not even the prefill INPUT fits the device budget -- the strict
+        # complement of born_spilled's window. Such a prompt never gets device
+        # KV slots at all: prepare_for_extend takes spill_extend_alloc, the
+        # chunk's K/V is written straight into the session's host region, and
+        # the session is handed to the spill tick one iteration later. Default
+        # False -> byte-identical when the feature is off.
+        self.born_spilled_deep = False
+
         # Incremental streamining
         self.send_token_offset: int = 0
         self.send_decode_id_offset: int = 0
@@ -1933,6 +1942,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # flashinfer decode to the host-streamed block-attention path.
     kv_session_spill_tick: bool = False
 
+    # kv-session-offload PS2 (deep prefill-spill): True only on an EXTEND batch
+    # whose requests are all born-spilled-deep. Gates the sentinel extend
+    # allocation here and the staging-carve owner write in the attention
+    # backend. All-or-nothing per batch (a mixed batch would put two disjoint
+    # address spaces into one out_cache_loc).
+    kv_session_prefill_spill: bool = False
+
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
 
@@ -2198,9 +2214,46 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens = extend_num_tokens
 
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
-        )
+        #
+        # kv-session-offload PS2 (deep prefill-spill): a born-spilled-deep
+        # batch must NOT reach alloc_for_extend -- that call allocates real
+        # device slots for every new token before any write happens, so a
+        # prompt that does not transiently fit wedges right there and no write
+        # retarget could ever help ("never materialize" is an ALLOCATION
+        # property, not a write property). Instead the request slots are
+        # allocated normally (cheap, and the row is needed) and the token slots
+        # become host sentinels. Gated on the manager, so with the feature off
+        # the default path below is byte-identical.
+        _kv_sess_prefill = False
+        if server_args.kv_session_offload_prefill and any(
+            getattr(r, "born_spilled_deep", False) for r in reqs
+        ):
+            from sglang.srt.managers.kv_session_offload import (
+                get_kv_session_offload_manager,
+            )
+
+            _mgr = get_kv_session_offload_manager()
+            _kv_sess_prefill = _mgr.prefill_spill_extend_ready(self)
+        if _kv_sess_prefill:
+            from sglang.srt.mem_cache.common import alloc_req_slots
+
+            self.kv_session_prefill_spill = True
+            req_pool_indices = alloc_req_slots(
+                self.req_to_token_pool, self.reqs, self.tree_cache
+            )
+            req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+            req_pool_indices_tensor = req_pool_indices_cpu.to(
+                self.device, non_blocking=True
+            )
+            # alloc_req_slots assigns req.req_pool_idx in place and returns one
+            # index per request (reused slots included).
+            self.req_pool_indices = req_pool_indices_tensor
+            self.req_pool_indices_cpu = req_pool_indices_cpu
+            out_cache_loc = _mgr.spill_extend_alloc(self)
+        else:
+            out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+                alloc_for_extend(self)
+            )
 
         # Set fields
         input_embeds = []
@@ -3149,6 +3202,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
             kv_session_spill_tick=self.kv_session_spill_tick,
+            kv_session_prefill_spill=self.kv_session_prefill_spill,
         )
 
     def maybe_evict_swa(self):

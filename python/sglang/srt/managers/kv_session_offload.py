@@ -200,6 +200,117 @@ def owned_counts_even(seq_len: int, dcp_size: int) -> List[int]:
     ]
 
 
+def prefill_spill_deep_gate(prefill_spill: bool, spec_active: bool) -> bool:
+    """PS2 MASTER GATE (V1). On top of ``--kv-session-offload-prefill`` the deep
+    path is disabled under speculative decoding.
+
+    Reason, hard: under an active spec algorithm the target prefill is followed
+    by a DRAFT extend that reuses the SAME ScheduleBatch, hence the same
+    ``out_cache_loc`` (``eagle_worker_v2._draft_extend_for_prefill`` ->
+    ``ForwardBatch.init_new(batch, self.draft_runner)``). For a born-spilled
+    prompt that tensor holds HOST SENTINELS, which the draft pool -- a separate,
+    non-DCP-sharded pool sized to the context -- cannot address: the draft write
+    would land out of bounds. Routing a born-spilled prefill's draft KV is
+    separate work (the decode side solved the analogous problem with the
+    spec-in-tick draft snapshot). Until then PS2 declines rather than admitting
+    a prompt that would crash. PS1 born-spilled admission is unaffected.
+
+    Rank-uniform: both inputs are replicated config."""
+    return bool(prefill_spill) and not bool(spec_active)
+
+
+def prefill_spill_deep_ok(
+    free_regions: int,
+    born_input_tokens: int,
+    rem_total_tokens: int,
+    input_tokens: int,
+    rem_chunk_tokens: Optional[int],
+    region_tokens: int,
+) -> bool:
+    """PS2 (deep prefill-spill) ADMISSION VERDICT -- pure, rank-uniform.
+
+    PS1-V1a admits a prompt born-spilled when its INPUT still fits the device
+    transiently (``born_input_tokens < rem_total_tokens``): it prefills on
+    device and rides the existing decode-OOM spill to host. PS2 is the strict
+    COMPLEMENT of that window -- the input does not even transiently fit, so
+    the prefill must never materialize device KV slots at all.
+
+    Every input is replicated or already min-reduced (``rem_total_tokens`` /
+    ``rem_chunk_tokens`` carry the ``dcp_avail_deficit`` pin, ``free_regions``
+    is the replicated free-region count, the token counts are request
+    metadata), so the verdict is IDENTICAL on every DCP rank without a
+    collective (U8: no asynchronous region claim, no rank-local pool read).
+
+    Conditions, all hard:
+      * a free host region exists (the whole session lives in ONE region);
+      * PS1's window does NOT apply (``born_input_tokens >= rem_total_tokens``)
+        -- PS2 never takes a prompt PS1 can serve, so the validated PS1 path
+        keeps its exact behaviour;
+      * ONE CHUNK ONLY (``input_tokens <= rem_chunk_tokens``): without PS3
+        (host-prefix extend read) chunk i+1 would attend chunk i's sentinel
+        rows, i.e. garbage. A single non-chunked extend attends only its own
+        RAGGED keys plus the device-resident radix prefix, so it needs no
+        host read at all. ``rem_chunk_tokens is None`` means chunked prefill
+        is off -> the whole prompt is one extend, which also qualifies;
+      * the spilled tail fits one region.
+    """
+    if free_regions <= 0:
+        return False
+    if born_input_tokens < rem_total_tokens:
+        return False  # PS1's window -- leave it to the validated PS1 path
+    if rem_chunk_tokens is not None and input_tokens > rem_chunk_tokens:
+        return False  # would be CHUNKED -> needs PS3
+    if input_tokens <= 0 or input_tokens > region_tokens:
+        return False
+    return True
+
+
+def prefill_stage_tokens(chunk_tokens: int, split_factor: int, max_ratio: int) -> int:
+    """RANK-UNIFORM size (in tokens) of the device STAGING CARVE the
+    born-spilled prefill write needs (PS2 stage B).
+
+    The chunk's owned share differs per rank under uneven DCP (rank r owns the
+    residue window ``[prefix[r], prefix[r+1])``), but the CARVE must be sized
+    from replicated config only, so every rank reserves the same number of
+    device rows. Sizes may differ per rank at RUN time (fill level); the
+    RESERVATION may not (S3b.4 item 3).
+
+    The bound is ``ceil(T / S) * max_ratio``: a T-token POSITION window covers
+    ``ceil(T/S)`` residue periods at most, and a rank owns ``ratio_r`` residues
+    of each period. Flooring the per-rank share (``T * ratio_r // S``) is BOTH
+    rank-varying and too small whenever ``T % S != 0`` -- the window's partial
+    period can land entirely inside one rank's residue range."""
+    T = max(0, int(chunk_tokens))
+    S = max(1, int(split_factor))
+    r = max(1, int(max_ratio))
+    if T == 0:
+        return 0
+    return ((T + S - 1) // S) * r
+
+
+def prefill_spill_owner_split(
+    positions: torch.Tensor, split_factor: int, lo: int, hi: int
+) -> torch.Tensor:
+    """Indices (into the extend chunk) of the tokens THIS rank owns, ascending.
+
+    A born-spilled token at absolute position ``p`` carries the sentinel
+    ``host_base + p * S + (p % S)``, so its owner residue is ``p % S`` and this
+    rank owns it iff that residue falls in its window ``[lo, hi)`` -- the same
+    positional rule ``spill_decode_alloc`` uses for tokens generated while
+    spilled, and the same one ``_sess_prepare_step`` re-derives from the row.
+
+    The j-th returned index is the j-th owned token of the tail in ASCENDING
+    POSITION order, which is exactly how the tick addresses host rows
+    (``region_base + host_row_base + j``). Keeping this ordering is the PS2
+    half of the LOCKSTEP invariant: the host row of a token is never stored,
+    it is recomputed every tick from (L, boundary, host_row_base, owner rule),
+    so the write must place row j where that recomputation will look for it."""
+    S = max(1, int(split_factor))
+    res = positions.to(torch.int64) % S
+    mask = (res >= int(lo)) & (res < int(hi))
+    return mask.nonzero(as_tuple=False).flatten()
+
+
 def num_blocks_rank_uniform(counts: List[int], block_size: int) -> int:
     """Rank-uniform streamed-block count: every rank iterates the MAX over
     all ranks' ceil(owned/B); empty trailing blocks are skipped locally
@@ -940,6 +1051,12 @@ class SpillSlot:
         "draft_dev_v",
         "draft_dev_len",
         "spec_in_tick",
+        # PS2 (deep prefill-spill): this session was BORN spilled -- its KV was
+        # never device-resident, the prefill wrote it straight into the region.
+        # ``adopted`` flips at the handover (the iteration after the prefill),
+        # which is also where the copy-stream D2H is joined (U9).
+        "born_spilled",
+        "adopted",
     )
 
     def __init__(self, req, region, spill_iter, wave, hysteresis):
@@ -989,6 +1106,10 @@ class SpillSlot:
         self.draft_dev_v = None
         self.draft_dev_len = 0
         self.spec_in_tick = False
+        # PS2: decode-spilled sessions are never "born" spilled and need no
+        # handover, so the defaults keep every existing path unchanged.
+        self.born_spilled = False
+        self.adopted = True
         # RESTORE-READINESS handshake (quiescence-trap fix): when a spilled
         # session is restore-ready but its last host-tick result is still
         # pending (last_batch is its own tick), one tick is suppressed so the
@@ -2337,6 +2458,204 @@ class KVSessionOffloadManager:
         self.req_to_token_pool.req_to_token[req.req_pool_idx, p] = sent
         return torch.tensor([sent], dtype=torch.int64, device=batch.seq_lens.device)
 
+    def prefill_spill_extend_ready(self, batch: "ScheduleBatch") -> bool:
+        """Whether ``prepare_for_extend`` must take the PS2 born-spilled-deep
+        allocation instead of ``alloc_for_extend``.
+
+        ALL-OR-NOTHING per batch (S3b.3 stage A): a mixed extend batch would
+        make ``out_cache_loc`` span two disjoint address spaces (real device
+        slots + host sentinels) in one tensor, which the write scatter cannot
+        split. The PrefillAdder guarantees the separation
+        (``_admit_born_spilled_deep`` refuses to join a batch that already
+        holds normal requests and vice versa); this is the enforcement, and a
+        violation raises rather than silently corrupting the slot space.
+
+        Rank-uniform: ``born_spilled_deep`` is set by the replicated admission
+        verdict, so every rank sees the same partition and takes the same
+        branch -> identical collective sequence in the forward."""
+        if not self.prefill_spill or not batch.reqs:
+            return False
+        deep = [bool(getattr(r, "born_spilled_deep", False)) for r in batch.reqs]
+        if not any(deep):
+            return False
+        if not all(deep):
+            raise RuntimeError(
+                "kv-session-offload prefill-spill (PS2): MIXED extend batch "
+                f"({sum(deep)} born-spilled-deep of {len(deep)} requests). "
+                "out_cache_loc would span device slots and host sentinels at "
+                "once; refusing the batch instead of corrupting the slot space."
+            )
+        if len(batch.reqs) != 1:
+            raise RuntimeError(
+                "kv-session-offload prefill-spill (PS2): born-spilled-deep "
+                f"extend batch carries {len(batch.reqs)} requests; V1 admits "
+                "exactly one per batch (one session, one host region)."
+            )
+        return True
+
+    def spill_extend_alloc(self, batch: "ScheduleBatch") -> torch.Tensor:
+        """PS2 stage A -- ``alloc_for_extend`` replacement for a born-spilled
+        DEEP prompt: allocate NO device KV slots at all.
+
+        The stock path (``mem_cache/common.alloc_for_extend``) allocates real
+        device slots for every new token BEFORE any write happens, so a prompt
+        that does not transiently fit wedges in the allocator and the write
+        retarget never gets a chance. Here the new positions
+        ``[prefix_len, seq_len)`` get HOST SENTINELS straight away -- the same
+        encoding ``spill_decode_alloc`` hands to tokens generated while
+        spilled, just vectorised over a whole chunk.
+
+        The request slot itself (``alloc_req_slots``) is still allocated by the
+        caller path: it is cheap and the row is needed.
+
+        LOCKSTEP (I1-I3): ``L``, ``boundary``, ``host_row_base`` and the region
+        content advance as ONE step here. The row is written, the region is
+        claimed, the backend slot is opened and the SpillSlot is registered in
+        the same synchronous scheduler section, BEFORE the forward that fills
+        the region runs; nothing is provisional and nothing is committed later
+        (I3 -- there is no speculative start whose commit could be deferred).
+        The region content for ``[boundary, L)`` is written exactly once by
+        this prefill and is FROZEN afterwards, exactly like a decode spill's
+        frozen region.
+
+        RANK-UNIFORM (U8): the region is claimed HERE, synchronously, inside
+        the replicated scheduler section -- never from a copy-stream callback
+        and never gated on rank-local progress. Every rank pops the same region
+        index in the same iteration."""
+        assert self.prefill_spill_extend_ready(batch)
+        req = batch.reqs[0]
+        rpi = int(req.req_pool_idx)
+        boundary = int(batch.prefix_lens[0])
+        L = int(batch.seq_lens_cpu[0].item())
+        n_new = L - boundary
+        assert n_new == int(batch.extend_num_tokens), (
+            "kv-session-offload prefill-spill (PS2): extend_num_tokens "
+            f"{batch.extend_num_tokens} != seq_len-prefix {n_new}; the prompt "
+            "is chunked, which needs PS3 (host-prefix extend read)."
+        )
+        device = self.req_to_token_pool.req_to_token.device
+        positions = torch.arange(boundary, L, dtype=torch.int64, device=device)
+        own_idx = prefill_spill_owner_split(positions, self.S, self.lo, self.hi)
+        n_own = int(own_idx.numel())
+        if n_own > self.region_tokens:
+            raise RuntimeError(
+                "kv-session-offload prefill-spill (PS2): born-spilled prompt "
+                f"rid={req.rid} needs {n_own} host rows > region "
+                f"{self.region_tokens}; the admission gate should have "
+                "rejected it."
+            )
+        if not self._free_regions:
+            raise RuntimeError(
+                "kv-session-offload prefill-spill (PS2): no free host region "
+                f"for born-spilled prompt rid={req.rid}; the admission gate "
+                "and the region book-keeping disagree."
+            )
+        region = self._free_regions.pop(0)
+        region_base = region * self.region_tokens
+
+        # Sentinel row for the new positions. The device-resident radix prefix
+        # [0, boundary) keeps its REAL slot ids -- it is tree-locked and is
+        # read normally (paged) by this very extend forward.
+        residues = positions % self.S
+        sent = make_sentinels(self.host_base, self.S, residues, start=boundary)
+        assert int(sent[-1].item()) < (1 << 31) - self.S, (
+            "kv-session-offload: sentinel overflow (int32 req_to_token)"
+        )
+        self.req_to_token_pool.req_to_token[rpi, boundary:L] = sent.to(torch.int32)
+
+        # Open the backend slot BEFORE the forward: the write path reads
+        # region_base from it, and the tick re-derives every host row from
+        # (row, region_base, host_row_base) afterwards.
+        self.backend._sess_open_slot(rpi, region_base)
+        self.backend._sess_prefill_open(rpi, boundary, own_idx, region_base)
+
+        req.kv_spill_state = "host"
+        req.kv_spill_boundary = boundary
+        slot = SpillSlot(
+            req=req,
+            region=region,
+            spill_iter=self._iter_ct,
+            wave=WaveBackController(self.block_size, self._hysteresis_steps),
+            hysteresis=RestoreHysteresis(self._hysteresis_steps),
+        )
+        slot.born_spilled = True
+        slot.adopted = False
+        self.spills[rpi] = slot
+        # One verdict, one prefill: clear the admission flag so a request that
+        # is later RETRACTED and re-prefilled goes through a fresh admission
+        # (and does not silently claim a second host region here).
+        req.born_spilled_deep = False
+
+        self._log(
+            "kv-session-offload PREFILL-SPILL (PS2, born-spilled deep): rid=%s "
+            "L=%d boundary=%d host_tail=%d owned_tail=%d (rank %d) region=%d "
+            "spills=%d/%d -- NO device KV slots allocated",
+            req.rid,
+            L,
+            boundary,
+            n_new,
+            n_own,
+            self.dcp_rank,
+            region,
+            len(self.spills),
+            self.max_spills,
+        )
+        return sent.to(torch.int64)
+
+    def adopt_born_spilled_prefills(self, running_batch):
+        """PS2 handover: hand a just-prefilled born-spilled session over to the
+        spill tick.
+
+        Runs at the TOP of ``pre_schedule``, i.e. after the prefill batch has
+        been merged into ``running_batch`` and before any restore / wave-back /
+        tick decision looks at the region.
+
+        U9 -- THE JOIN EDGE SITS HERE, NOT AT THE ADMISSION VERDICT. The
+        per-chunk D2H of the freshly computed KV runs on the copy stream, so
+        the host region is not readable until that copy retires. Waiting the
+        event here means every rank waits at the SAME iteration and at the
+        SAME point in its collective sequence (this is a stream wait, not a
+        collective and not a condition): ranks may wait for different amounts
+        of time -- their owned shares differ under uneven DCP -- but none of
+        them skips or repeats a step because of it.
+
+        I2: the session is removed from ``running_batch`` before the tick /
+        wave-back machinery can touch it, so no device decode forward and no
+        boundary-advancing wave-back is ever in flight against the prefill
+        write."""
+        if not getattr(self, "prefill_spill", False):
+            return running_batch
+        pending = [
+            slot
+            for slot in self.spills.values()
+            if getattr(slot, "born_spilled", False) and not getattr(slot, "adopted", True)
+        ]
+        if not pending:
+            return running_batch
+        self.backend._sess_prefill_join()
+        for slot in pending:
+            slot.adopted = True
+            self.backend._sess_prefill_close(int(slot.req.req_pool_idx))
+            self._log(
+                "kv-session-offload PREFILL-SPILL (PS2): rid=%s handed over to "
+                "the spill tick (region %d, boundary %d) (rank %d)",
+                slot.req.rid,
+                slot.region,
+                int(slot.req.kv_spill_boundary or 0),
+                self.dcp_rank,
+            )
+        if running_batch is not None and not running_batch.is_empty():
+            adopted_rpi = {int(s.req.req_pool_idx) for s in pending}
+            keep = [
+                i
+                for i, r in enumerate(running_batch.reqs)
+                if int(r.req_pool_idx) not in adopted_rpi
+            ]
+            if len(keep) != len(running_batch.reqs):
+                running_batch.filter_batch(keep_indices=keep)
+                running_batch.batch_is_full = False
+        return running_batch
+
     # -- scheduling hooks ---------------------------------------------------
 
     def pre_schedule(self, running_batch, last_batch):
@@ -2418,6 +2737,13 @@ class KVSessionOffloadManager:
                         tot_tail,
                         len(self.spills),
                     )
+
+        # 0. PS2 handover: a born-spilled prompt that prefilled straight into
+        #    its host region last iteration leaves the running batch here and
+        #    becomes a normal spilled session. Done FIRST so the reap / restore
+        #    / wave-back steps below already see a consistent slot, and so the
+        #    copy-stream D2H is joined before anything reads the region (U9).
+        running_batch = self.adopt_born_spilled_prefills(running_batch)
 
         # 1. Reap sessions that finished on host (release ran in the result
         #    processor and already freed the region + backend slot).
