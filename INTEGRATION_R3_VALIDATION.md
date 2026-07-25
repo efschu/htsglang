@@ -639,3 +639,183 @@ vector still resolves, `[18, 23, 23]`).
 directions. For the second host: the gate's error text is accurate about the
 wiring — their kv=2 model does not lose uneven DCP "for no reason"; the
 machinery genuinely does not exist without a plan today.
+
+
+## feat/htccl-gfx900 — merged; arm E RED on a COLD JIT cache, GREEN once warm
+
+Merge commit `aec1308973`, branch tip `fb85955276`, seven commits, zero textual
+conflicts. Arm E — HTCCL `device` transport under CUDA graphs, uneven TP=3 —
+failed at startup on the merge tip and passed on the pre-merge tip,
+reproducibly. **None of the seven commits is wrong.** They trip a pre-existing
+latent defect, which was then root-caused and worked around; with the JIT cache
+warm the merge tip is green.
+
+### The measurement (interleaved, cross-boot state pinned)
+
+`SGLANG_MEASURED_KV_BUDGET=1` carries state from the previous boot, so the
+matching cache entry was cleared before every boot in the replication series;
+otherwise consecutive runs are coupled.
+
+| tree | boots | green | red |
+|---|---|---|---|
+| merge tip `aec1308973`, cold JIT cache | 6 | 0 | 6 |
+| pre-merge tip `4c90038a78` | 5 | 5 | 0 |
+| **merge tip, JIT cache warmed** | **1** | **1** | **0** |
+
+Capture time is cleanly bimodal: green ends capture in **3.6-3.8 s**; red stalls
+**23-30 s**, then `cudaErrorLaunchFailure`.
+
+### Root cause — directly observed, not inferred
+
+sglang's `jit_kernel` modules build on FIRST CALL, and for several of them that
+first call lands **inside** the decode/target-verify graph capture. Caught in
+the act during a boot:
+
+```
+nvcc ... -gencode=arch=compute_86,code=sm_86 -DSGL_CUDA_ARCH=860 ...
+  -c /root/.cache/tvm-ffi/sgl_kernel_jit_gptq_marlin_bf16_t_94a284ca1583e2c3__cuda_arch_8.6__tvmffi_0.1.11/cuda.cu
+```
+
+`compute_86` is the **two 3080 ranks**. They sit in a multi-minute nvcc build
+while rank 0 (the 5090) is already inside the capture waiting on an HTCCL
+device collective. HTCCL's spin deadline is `_TIMEOUT_CYCLES =
+60_000_000_000`; at the 5090's ~2.6 GHz that is **23.1 s** — the observed stall
+to the digit. The wait kernel executes `HTCCL_TRAP()`, poisoning the context,
+and `cudaErrorLaunchFailure` then surfaces at the next launch, which happens to
+be `gemma_fused_add_rmsnorm` -> flashinfer `fused_add_rmsnorm_cute`. **That
+traceback is the symptom, not the site.**
+
+The merge invalidates the JIT cache **two independent ways**:
+
+1. `jit_kernel/utils.py` (`fb85955276`) puts the vendor in the build-dir name,
+   so every entry gets a new path (`__arch_8.6__` -> `__cuda_arch_8.6__`): 63
+   old-format entries, 0 new-format ones at merge time.
+2. `jit_kernel/include/sgl_kernel/utils.cuh` (`f560631dc6`, `2548b630bf`) is
+   part of the module SOURCE HASH, so entries get a new hash even under the old
+   key format.
+
+Either alone forces cold builds. That is why file-level bisection produced
+apparently contradictory results — **two independent sufficient triggers**, so
+no single revert helped:
+
+| variant | JIT identity | result |
+|---|---|---|
+| merge tip | new key + new hash | RED |
+| minus `model_runner.py` (harmonize call) | new key + new hash | RED |
+| minus `htccl_device.py` | new key + new hash | RED |
+| minus `jit_kernel/utils.py` | old key, **new hash** | RED |
+| minus `layernorm`+`rope`+`fbi`+`utils.cuh` | **new key**, old hash | RED |
+| pre-merge + `htccl_device.py` only | old key, old hash | GREEN |
+| pre-merge + `forward_batch_info.py` only | old key, old hash | GREEN |
+| full revert (content == pre-merge) | old key, old hash | GREEN |
+
+The rule "a boot that must freshly build `gptq_marlin_bf16` goes RED, a boot
+that finds it cached goes GREEN" fits **all eleven** runs. No single file is
+either necessary or sufficient — the naive one-guilty-file model is refuted.
+
+### It is not HTCCL-specific
+
+Arm A on the merge tip — default path, NCCL, no HTCCL at all — wedges at the
+identical point (capture begin, right after the W8A8 kernel-config line). HTCCL
+merely converts the wedge into a 23 s trap with a loud but misleading error; on
+NCCL it just hangs. The blast radius is "first boot on a cold JIT cache", not
+"the HTCCL device transport".
+
+### Self-perpetuating: crashed boots poison the cache
+
+A boot killed mid-build leaves a half-built tvm-ffi directory — `build.ninja`,
+`cuda.cu`, `cuda_0.o.d`, **no `.so`**. The next process wanting that module dies
+with `Check failed: (lib_handle_ != nullptr) ... Failed to load`. Four such
+directories had accumulated (three from today's crashed boots, one from
+Jul 21). The cache does not self-heal; they had to be removed by hand.
+
+### The workaround that proves it
+
+Removed the four incomplete directories, then booted the merge tip **eager**
+(`--disable-cuda-graph`, so there is no capture and no spin deadline over the
+build). nvcc finished the marlin build; server reached ready. Then arm E on the
+merge tip, unchanged:
+
+```
+Capture target verify CUDA graph end. elapsed=3.76 / 3.77 / 3.78 s
+HTCCL device transport up: 3 ranks, GPU-driven collectives (CUDA-graph capturable)
+RS+AG link calibration: 14.3/6.5/13.2 GB/s -> ownership weights [2, 1, 2]
+health 200
+```
+
+Nine-point drive, accepts: code 3.413 / 3.413 / 3.325, prose 3.160 / 3.048 /
+3.282, mixed 3.657 / 2.977 / 3.369; tps 70-87. Against the arm-E reference
+(accept 3.45 / 2.75 / 3.33) and the pre-merge control measured today
+(3.368/3.459/3.507, 3.200/3.160/3.012, 3.368/3.241/3.459) this is the same
+regime.
+
+### The two explicit post-merge checks
+
+* **(a) group graph-plan decision is a no-op on the homogeneous NVIDIA group** —
+  **0** occurrences of "plan differs" in any of the six merge-tip boots; the
+  resolved plan is identical to pre-merge (prefill `disabled` on all three
+  ranks, `Capture target verify ... backend=full, bs=[1, 2, 3]`).
+* **(b) cache-key determinism** — the new-format key is stable across boots:
+  `htccl_device_ext_cuda_86_120` in all six merge-tip boots.
+
+### Controls run, so the attribution is not assumed
+
+* **Config identity** — resolved `ServerArgs` of a green pre-merge boot vs a red
+  merge boot: **486 keys, exactly one differs** (auto-generated `random_seed`).
+* **Worktree identity** — four red bisects and a green boot ran in the *same*
+  worktree; reverting its content to pre-merge turned it green.
+* **Memory identity** — `avail mem` at capture begin is **10.93 / 10.25 /
+  10.25 GB in all eleven boots**, green and red alike.
+* **HTCCL calibration identity** — `ownership weights [2, 1, 2]` every boot.
+* **Cross-boot coupling** — the measured-KV-budget correction alternates between
+  `+76.28 GiB` and `+93.64 GiB` and appears in both green and red runs, so it is
+  not the discriminator; pinned anyway.
+
+Four of the seven commits are inert on the CUDA path, verified rather than
+assumed: the `utils.cuh` launch rework is entirely inside `#ifdef USE_ROCM` (the
+`#else` branch is still `cudaLaunchKernelEx`); the emitted HTCCL kernel source
+differs from pre-merge **only** by `__trap()` -> `HTCCL_TRAP()`, which expands
+to `__trap()` on CUDA (diffed on both generated `cuda.cu`; `-gencode` flags and
+object sizes identical); the `GemmaRMSNorm` guard's test is False here, which
+the failing traceback itself proves; the rope guard needs
+`apply_rope_with_cos_sin_cache_inplace is None`, impossible on CUDA. Their only
+effect on this rig is via the JIT cache identity above.
+
+### Open — the real defect, registered not fixed
+
+1. **Warm the JIT kernels before graph capture.** A build inside capture is
+   never legitimate. The precedent already exists in this tree:
+   `prewarm_nvfp4_jit_modules()` (`jit_kernel/nvfp4.py`) does exactly this for
+   the NVFP4 modules. `gptq_marlin*` / `per_token_group_quant*` have no
+   equivalent and are not reached by the capture path's two warmup forwards.
+2. **A desync must be reported as a desync.** HTCCL's only backstop turns a
+   merely slow peer into a poisoned context plus a traceback in an unrelated
+   norm kernel. It should name the ranks and their sequence numbers.
+3. **Never leave half-built JIT directories behind** — build to a temp dir and
+   rename on success, so a killed boot cannot poison the next one.
+
+Until (1), any cache-invalidating change — this merge, a new GPU arch, a fresh
+container, a cleared cache — reproduces this on the next boot.
+
+### Suites
+
+`test_htccl_port.py`: 22 passed / 1 failed. The failure
+(`test_cpu_transports_are_rejected_while_cuda_graphs_are_on`, `AttributeError`
+on `parallel_state`) reproduces **identically on the pre-merge tree**, so it is
+pre-existing. The reduce_scatter known-answer test
+(`test_reduce_scatter_slices_the_requested_axis`) and both arch/vendor
+cache-key tests pass.
+
+Running the registered unit suite needs the launcher's environment, or the
+result is meaningless: `PYTHONPATH=<worktree>/python PYTHONSAFEPATH=1` (else
+imports resolve against `/spinning/htsglang-gpu/python` and 53 modules fail to
+collect) **and** `LD_LIBRARY_PATH` pointing at the venv's nvidia libs (else
+`deep_gemm/_C.so` cannot find `libnvrtc.so.13` and 5 more abort collection).
+`test_hicache_nixl_storage.py` needs `--ignore` (missing `nixl`).
+
+### Note on the arm-E generation validator
+
+Both drives reported several points INVALID (`char-loop`). This is a **validator
+change, not a model regression**: 6 of the 9 completions on the pre-merge
+control are byte-identical to the 10:02 arm-E reference that scored 0 INVALID,
+and `bench_harness.py` was last modified at 12:58, after that run.
