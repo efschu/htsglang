@@ -297,6 +297,39 @@ logger = logging.getLogger(__name__)
 _UNSET: Any = object()
 
 
+def _needs_float16_fallback() -> bool:
+    """Does this device lack bfloat16, so the model must fall back to fp16?
+
+    Asked vendor-first, because the old test -- ``get_device_capability()[0] <
+    8`` -- reads a number whose namespace depends on the torch build, while the
+    threshold 8 is an NVIDIA compute capability. The two COLLIDE: gfx900
+    reports ``(9, 0)``, the same integer as Hopper, so ``9 < 8`` is False and
+    the fallback never fires on a Vega 64 -- a card with no bfloat16 at all.
+    That is the DANGEROUS direction: not a loud refusal but a silently wrong
+    dtype, on the load path of every rank. (It is why the second host has to
+    pass ``--dtype float16`` by hand.)
+
+    Outside the NVIDIA namespace the question is asked FUNCTIONALLY instead --
+    does torch report bf16 support on this device? -- which keeps MI300-class
+    parts on bf16 and puts gfx900 on fp16 without either being a magic number.
+
+    On CUDA this is exactly the previous comparison, so NVIDIA behaviour does
+    not move; that is the regression criterion.
+    """
+    if torch.version.hip is not None:
+        try:
+            return not torch.cuda.is_bf16_supported()
+        except Exception as e:  # noqa: BLE001 - probe must never be fatal
+            logger.warning(
+                "Could not probe bfloat16 support on this ROCm device (%s); "
+                "leaving the model dtype unchanged. If this card has no bf16, "
+                "pass --dtype float16 explicitly.",
+                e,
+            )
+            return False
+    return torch.cuda.get_device_capability()[0] < 8
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -1685,7 +1718,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device != "cpu":
             torch.set_num_threads(1)
         if self.device == "cuda":
-            if torch.cuda.get_device_capability()[0] < 8:
+            if _needs_float16_fallback():
                 logger.info(
                     "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
                 )
@@ -1697,7 +1730,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "ModelRunner._sm80_dtype_fallback", {"dtype": "float16"}
                 )
                 self.model_config.dtype = torch.float16
-                if torch.cuda.get_device_capability()[1] < 5:
+                # "sm75 and above" is a statement about NVIDIA parts, so the
+                # minor number may only be read in the NVIDIA namespace.
+                if (
+                    torch.version.hip is None
+                    and torch.cuda.get_device_capability()[1] < 5
+                ):
                     raise RuntimeError("SGLang only supports sm75 and above.")
 
         set_cuda_arch()
