@@ -181,7 +181,7 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
         for kwargs, fragment in (
             ({"weightless": True}, "weightless-KV fast lane"),
             ({"mla": True}, "MLA"),
-            ({"spec": True}, "speculative decoding"),
+            ({"spec": True, "spec_tree": True}, "--speculative-eagle-topk 1"),
         ):
             with self.subTest(**kwargs):
                 with self.assertRaises(ValueError) as ctx:
@@ -196,6 +196,35 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
                         **kwargs,
                     )
                 self.assertIn(fragment, str(ctx.exception))
+
+    def test_window_lane_times_chain_verify_is_permitted_but_unvalidated(self):
+        """Rebase seam between #96 and the merged #180. REGISTERED, NOT PROVEN.
+
+        Before #180 this pair could not arise: any `speculative=True` was
+        refused on the uneven lane, so #96's original test listed it among the
+        refusals the Stage-B flag must not open. #180 serves the CHAIN verify
+        (topk == 1), so after the rebase the guard lets
+        `swa_hybrid_dcp + speculative` through -- the assertion was stale, not
+        the code.
+
+        What is NOT established is that the combination is *correct*. #180
+        drops `custom_mask`/`mask_indptr` under `dcp_size > 1` on the
+        target-verify branch, justified for the DCP paged path ("the dxd
+        draft->draft block IS the causal mask"). Under #96 a sliding-window
+        layer no longer takes the DCP path at all: it falls through to the
+        plain 2-stage kernel and DOES receive a mask, with `window_kv_offsets`
+        re-basing the column arithmetic. Whether the drop is still right there
+        is unverified in either direction.
+
+        This test pins only what the guard currently decides, so that a future
+        change to that decision is visible. It is not evidence of correctness.
+        Settle on GPU with a chain-verify (`--speculative-eagle-topk 1`) run of
+        an SWA-hybrid model on the uneven-DCP lane, asserting per layer what a
+        sliding-window layer receives under `is_target_verify()`.
+        """
+        kw = dict(plan=True, tokens=True, window=True, swa_hybrid_dcp=True, spec=True)
+        _call(3, 3, 2, **kw)
+        _call(3, 3, 8, **kw)
 
     def test_the_lane_names_every_unserved_feature_at_once(self):
         """A config that trips several must name all of them, so the operator
