@@ -2561,3 +2561,136 @@ the two effects in-build.
 Merge stack (all branches rebased, pairwise intel recorded), #119-A/B, the
 integrated arm-E / determinism / 27B-working-arm closing boots, #143 R4/R5,
 #197, the `available == dcp_size x total` residual.
+
+# Task #199 (intra-rig collective overlap on the NCCL path) — MEASURED, NOT BUILT
+
+Arm: Qwen3.6-27B-FP8, TP=3 uneven DCP (`--rank-tp-ratio auto-performance`,
+ownership vector `[6,5,5]`), flashinfer, MTP NEXTN 3/1/4, CUDA graphs ON —
+`dcp_launch.sh b4_fi_mtp`. torch profiler (GPU activities), 40 decode steps,
+all three ranks, single and dual session. Harness: `/spinning/r3val/`
+(`nccl_lat.py`, `prof_decode.py`, `trace_split.py`, `skew_split.py`,
+`chain_shape.py`, `bench_ab.py`).
+
+## The collective budget IS there — 15.8 % single, 23.6 % dual
+
+Per-collective skew decomposition. All ranks issue the same collectives in the
+same order, so the i-th instance is the same collective on every rank;
+`pure_comm_i = min over ranks of dur_i` (the last arriver does not wait),
+`wait_i(r) = dur_i(r) - pure_comm_i`.
+
+Single session, 1600 ms span (~42 decode steps):
+
+| family | n | pure comm | r0 wait | r1 wait | r2 wait |
+|---|---|---|---|---|---|
+| AR bf16 (TP, 128/step) | 5400 | 149.6 ms | 106.0 | 431.3 | 435.1 |
+| AR f32 (DCP out) | 640 | 45.0 ms | 0.0 | 5.4 | 2.6 |
+| AllGather (DCP, 48/step) | 2040 | 56.5 ms | 87.5 | 13.3 | 7.8 |
+| Broadcast | 280 | 1.1 ms | 0.7 | 0.9 | 8.5 |
+| **total** | | **252.2 ms = 15.8 %** | 194.3 | 450.9 | 454.0 |
+
+Rank summary: r0 span 1599.9 ms = 938.4 compute + 446.5 NCCL (27.9 %);
+r1/r2 = 627/629 compute + 703/706 NCCL (43.9/44.1 %).
+
+Dual session, 1760.9 ms span: pure comm **415.9 ms = 23.6 %** (AR bf16 247.7,
+AG 104.5, AR f32 62.6). The comm fraction gets **worse** with batch: the
+collectives grow ~linearly with tokens while the weight-bound GEMMs at bs=1..8
+barely do. So this is not a "small budget" finding.
+
+NCCL latency floor on this rig (`nccl_lat.py`, torchrun 3 ranks, real decode
+message sizes): 10 KiB/40 KiB all-reduce = 55-58 us isolated, **31-37 us
+back-to-back**. Measured in-server pure comm is 27.7 us per AR bf16 — NCCL is
+already at its floor; there is no slack in the transport itself. Custom-AR is
+rejected before the P2P probe (`_SUPPORTED_WORLD_SIZES = [2,4,6,8]`, world
+size 3), and the rig has no P2P anyway (all PHB).
+
+## Why it is NOT overlappable — the dependency chain, read off the hardware
+
+`chain_shape.py` prints the kernel sequence between consecutive collectives on
+rank 0. The steady-state GDN layer (48 of 64 layers) is exactly:
+
+```
+NCCL:AllReduce  22.4 us          <- previous layer's MLP down_proj AR
+  [compute  84.5 us] GEMM -> quant -> GEMM_fp8 -> conv1d -> gdn_state -> norm -> quant -> GEMM_fp8
+NCCL:AllReduce  71.0 us          <- this layer's GDN out_proj AR
+  [compute 217.7 us] GEMM -> quant -> GEMM_fp8 -> quant -> GEMM_fp8          (the MLP)
+```
+
+Both compute segments are strictly downstream of the all-reduce that precedes
+them: `AR(o_proj) -> +residual -> ln2 -> gate_up -> down_proj -> AR -> +residual
+-> next layer`. At bs=1..8 decode there is **no independent compute anywhere in
+the layer** to hide a collective behind. The 84.5 us / 217.7 us windows are
+large enough to swallow a 28-46 us collective — they are simply not available.
+
+This is the same structural reason #198 came out neutral cross-rig, arrived at
+from the opposite direction: there the window was too small, here the window is
+big enough but data-dependent.
+
+The two classic escapes do not apply: sequence chunking needs many tokens
+(prefill, not bs=1 decode), and scattered-residual / sequence-parallel mode
+cannot scatter 1-8 tokens across 3 ranks.
+
+Also note `fuse_mlp_allreduce` — the seam #198 consumed — is **dead on this
+rig**: `apply_flashinfer_allreduce_fusion` requires sm90/sm100
+(`communicator.py:164-175`), and this is sm120 + 2x sm86. There is no existing
+seam to hang an async handle on.
+
+## The one genuinely independent pair, and its ceiling
+
+In `_forward_decode_dcp` (`flashinfer_backend.py:5340`) the KV-write all-gather
+(`_dcp_masked_write`) and the Q all-gather (`cp_all_gather_heads_uneven`) are
+mutually independent. They could be fused #132-style into one collective. The
+full-attention layers are collective-dominated (3 AG + 1 AR against ~65 us of
+compute), so this is the only real candidate. Ceiling: 16 of 48.6 gathers per
+step, i.e. one third of the 56.5 ms AG budget = **18.8 ms of 1600 ms = 1.2 %**.
+Below the >5 % bar, so not built.
+
+(`#128` DCP comm/compute overlap already exists but only in the EXTEND path;
+`_forward_decode_dcp` is purely sequential. That gap is real — it is just worth
+1.2 % here, not 5 %.)
+
+## CUDA-graph compatibility — NOT the blocker
+
+Worth recording, because it was the expected risk and it is not one. Multi-stream
+inside a capture is already proven in this fork: `qwen3_5.py:1050-1056` (Q/K-norm
+alt stream) and `:553-558` (GDN qkvz/ba), both `_is_cuda`-gated and therefore
+live on this rig, with streams leased outside capture per
+`runtime_context.py:547-558`. pynccl resolves `get_current_device_stream_fast()`
+per call (`pynccl.py:129-131`), so `with torch.cuda.stream(s)` moves a TP
+all-reduce onto a side stream inside a capture with no new API, and TP and DCP
+are separate NCCL communicators over the same 3 ranks
+(`parallel_state.py:2434`), so they can genuinely run concurrently. Graphs would
+have admitted an overlap path. The dependency chain is what refuses it.
+
+## What the profile says the money actually is
+
+The dominant cost on the two 3080s is not communication but **wait**: 451/454 ms
+of a 1600 ms span (28 %) spent spinning inside NCCL kernels. That is *by design*
+— `auto-performance` picked `--rank-mlp-ratio [6,1,1]`, concentrating the MLP on
+the 5090 (documented as +10 % prefill / +7 % conc-8), so the 3080s idle through
+the 217.7 us MLP segment. It is a deliberate, already-A/B'd trade, not a
+miscalibration, and it is not addressable by making collectives asynchronous.
+
+One side finding was measured because the trace surfaced it: the 3080s carry an
+even 1/3 vocab shard and spend ~1.2 ms/call in `ampere_bf16_s16816gemm`
+(95.9 ms/span) that rank 0 does not have. The boot log already prints the fix as
+an unused hint (`--rank-vocab-ratio 7,3,3`). A/B, slope method, 3 content
+classes, 3 reps, KV capacity identical (98328 both arms):
+
+| class | single base -> 7,3,3 | dual base -> 7,3,3 |
+|---|---|---|
+| code | 89.75 -> 93.22 (+3.9 %) | 142.32 -> 147.19 (+3.4 %) |
+| prosa | 69.13 -> 72.12 (+4.3 %) | 120.11 -> 123.89 (+3.1 %) |
+| misch | 71.82 -> 76.13 (+6.0 %) | 124.83 -> 123.01 (-1.5 %) |
+
+Directionally positive but **under the bar and inside the within-arm spread**
+(base single code was 80.45/91.52/89.75 across reps). Reported as a lead, not a
+result; it needs a longer run to separate from noise. No code change either way
+— it is an existing flag.
+
+## Verdict
+
+**NOT BUILT.** The collective budget is large (15.8 % single / 23.6 % dual of
+critical-path GPU time) but structurally unreachable by issue/wait overlap at
+bs=1..8 decode, and the one independent collective pair is worth 1.2 %. Building
+the async NCCL machinery would have reproduced #198's neutral result with more
+code. Nothing merged, no behaviour change on any path.
