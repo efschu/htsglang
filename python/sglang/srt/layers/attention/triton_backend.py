@@ -17,9 +17,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dcp import (
+    build_dcp_weighted_kv_indices,
     cp_all_gather_heads_uneven,
     cp_lse_ag_out_ar_mha_uneven,
     create_triton_kv_indices_for_dcp_triton,
+    dcp_weighted_owner_bounds,
+    dcp_weighted_write_slots,
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
@@ -282,38 +285,40 @@ def reject_unsupported_dcp_geometry(
     weighted_tokens: bool,
     weightless_kv: bool,
     swa_kv_heads: Optional[int] = None,
+    mla: bool = False,
+    speculative: bool = False,
+    sliding_window: bool = False,
 ) -> None:
     """Boot-time gate for every DCP geometry the Triton backend cannot serve.
 
     Pure function of the geometry so the constructor's decision is testable
     without a device, a process group, or a ModelRunner.
 
-    TWO independent rejections, in order:
+    THREE branches, in order:
 
-    (1) NO UNEVEN-DCP WIRING AT ALL. The Triton backend implements exactly one
-        owner rule -- the EVEN modulo one -- on both sides:
-          * write: ``loc = out_cache_loc // dcp_size`` plus the mask
-            ``positions % dcp_size == dcp_rank`` (_set_kv_buffer);
-          * read: ``get_dcp_lens`` / ``create_triton_kv_indices_for_dcp_triton``,
-            same modulo;
-          * and it never gathers the kv heads before the write, the step
-            flashinfer does in ``_dcp_write_gather``.
-        The fork's uneven-DCP pool is a DIFFERENT layout: the weighted owner
-        rule packs a virtual block of ``sum(token ratios)`` slots (not
-        ``dcp_size``) and every rank's slot is declared to hold the FULL,
-        replicated kv-head set. Feeding that pool through the modulo rule reads
-        and writes the wrong slots with the wrong head subset. Measured:
-        ``SGLANG_UNEVEN_DCP=1`` + token vector + a qwen2-class model + triton
-        -> CJK mojibake in an English greedy completion.
+    (1) THE UNEVEN-DCP LANE (a ``--rank-tp-ratio`` plan is installed, so the
+        KV pool is token-sharded with the FULL replicated kv-head set per
+        slot). #169.1 refused this outright, because the Triton backend then
+        implemented exactly one owner rule -- the EVEN modulo one -- on both
+        sides, and never gathered the kv heads before the write. #173 ports
+        the fork's weighted machinery over from flashinfer:
+          * write: ``dcp_weighted_write_slots`` + the fused kv-head gather;
+          * read:  ``build_dcp_weighted_kv_indices``;
+          * both from ``layers/dcp/owner.py``, the SAME functions the
+            flashinfer path calls, so the two backends cannot drift apart.
+        So the lane is now SERVED, and this branch only rejects the pieces of
+        it that still have no Triton twin (see the sub-reasons below). The
+        replication arithmetic of branch (3) deliberately does NOT apply here:
+        under this lane every rank's pool row already holds every kv head, so
+        the condition it checks is satisfied by construction of the pool.
 
-        Until this commit the constructor's guard was SKIPPED whenever the
-        uneven path was active (``not uneven_dcp_active(...)``) on the premise
-        that "the uneven path has its own head handling" -- true of flashinfer,
-        which owns that machinery, and false of this backend, which has none of
-        it. The exemption therefore turned the one config the guard should
-        reject hardest into the one config it waved through.
+    (2) A TOKEN VECTOR WITHOUT A PLAN. ``uneven_dcp_active`` sizes the pool by
+        the weighted rule while ``uneven_dcp_kv_replicated`` decides whether
+        its rows carry the full kv-head set. A token vector with no plan is a
+        half-installed state: weighted pool sizing, head-sharded rows. Neither
+        backend serves it; refuse rather than pick one of the two layouts.
 
-    (2) EVEN DCP WITHOUT KV-HEAD REPLICATION, ON ANY OF THE MODEL'S KV BASES.
+    (3) EVEN DCP WITHOUT KV-HEAD REPLICATION, ON ANY OF THE MODEL'S KV BASES.
         The even-DCP decode gathers the whole DCP group's q heads and attends
         them against THIS RANK'S local kv-head shard; the kernel remaps
         q-head -> kv-head as ``cur_head // (gathered_q // local_kv)``. Correct
@@ -331,35 +336,66 @@ def reject_unsupported_dcp_geometry(
     if dcp_size <= 1:
         return
 
-    reasons = []
     if uneven_plan:
-        reasons.append(
-            "a --rank-tp-ratio shard plan is installed, so the KV pool is "
-            "token-sharded with REPLICATED kv heads"
-        )
+        # ---- (1) the ported lane: reject only what has no Triton twin ----
+        reasons = []
+        if weightless_kv:
+            reasons.append(
+                "the weightless-KV fast lane is on (per-rank head counts "
+                "[all, 0, 0, ...]), whose block-decode / host-spill / "
+                "broadcast-K,V dispatch exists only in the flashinfer backend"
+            )
+        if mla:
+            reasons.append(
+                "the model is MLA, and the Triton MLA decode is a different "
+                "kernel family that the uneven-DCP wiring here has never been "
+                "run against"
+            )
+        if speculative:
+            reasons.append(
+                "speculative decoding is on, and the Triton target-verify "
+                "metadata builds FULL un-sharded kv indices (global allocator "
+                "slot ids) which index a compact token-sharded pool out of "
+                "bounds; flashinfer has a dedicated verify split (M4), this "
+                "backend has none"
+            )
+        if sliding_window:
+            reasons.append(
+                "a sliding window is configured, and the DCP extend path "
+                "cannot causally mask a sparse owned-slot subset"
+            )
+        if reasons:
+            raise ValueError(
+                f"Triton attention cannot serve --dcp-size {dcp_size} under "
+                f"the uneven-DCP (token-sharded, replicated-kv-head) lane: "
+                + "; ".join(reasons)
+                + ". The weighted owner rule itself IS supported here (#173); "
+                "these are the parts of the lane that are not. Use "
+                "--attention-backend flashinfer, or drop the listed feature."
+            )
+        return
+
     if weighted_tokens:
-        reasons.append(
-            "a non-uniform DCP token vector is installed, so token ownership "
-            "follows the WEIGHTED owner rule (virtual block = sum of the token "
-            "ratios), not `pos % dcp_size == dcp_rank`"
-        )
-    if weightless_kv:
-        reasons.append(
-            "the weightless-KV fast lane is on, so the per-rank q/kv head "
-            "counts are [all, 0, 0, ...] instead of an equal split"
-        )
-    if reasons:
+        # ---- (2) half-installed uneven state ----
         raise ValueError(
-            f"Triton attention cannot serve --dcp-size {dcp_size} under this "
-            f"geometry: " + "; ".join(reasons) + ". The Triton DCP path "
-            f"implements only the EVEN modulo owner rule (write "
-            f"`out_cache_loc // dcp_size` + `positions % dcp_size == "
-            f"dcp_rank`, read `get_dcp_lens`) and never gathers the kv heads "
-            f"before writing, so it would read and write the wrong KV slots "
-            f"with the wrong head subset and emit silently wrong tokens "
-            f"(measured: CJK mojibake in an English greedy completion). Use "
-            f"--attention-backend flashinfer, which owns the uneven-DCP "
-            f"machinery, or drop --dcp-size."
+            f"Triton attention cannot serve --dcp-size {dcp_size}: a "
+            f"non-uniform DCP token vector is installed (weighted owner rule, "
+            f"virtual block = sum of the token ratios) but no --rank-tp-ratio "
+            f"shard plan is, so the KV pool is sized by the weighted rule "
+            f"while its rows carry only this rank's kv-head shard. That "
+            f"combination has no correct read: the weighted rule assumes the "
+            f"FULL replicated kv-head set per row. Install a --rank-tp-ratio "
+            f"plan (the supported uneven-DCP lane), or drop the token vector."
+        )
+
+    if weightless_kv:
+        raise ValueError(
+            f"Triton attention cannot serve --dcp-size {dcp_size}: the "
+            f"weightless-KV fast lane is on, so the per-rank q/kv head counts "
+            f"are [all, 0, 0, ...] instead of an equal split, and its "
+            f"block-decode / host-spill / broadcast-K,V dispatch exists only "
+            f"in the flashinfer backend. Use --attention-backend flashinfer, "
+            f"or drop the fast lane."
         )
 
     # HYBRID CLASSES HAVE MORE THAN ONE KV-HEAD BASE. A hybrid/SWA model can
@@ -396,6 +432,47 @@ def reject_unsupported_dcp_geometry(
             f"Use --attention-backend flashinfer, raise tp so that "
             f"tp // kv_heads >= dcp_size, or drop --dcp-size."
         )
+
+
+def replicated_kv_reindex(
+    q_head_offset: int, local_q: int, local_kv: int, global_gqa: int
+) -> Optional[list]:
+    """REPLICATED-KV (#105): local kv slot -> the GLOBAL kv head its q group
+    attends, or None when that is already the identity.
+
+    Pure integer function of the head geometry so it is testable without a
+    device or a ModelRunner; ``_replicated_kv_ragged_reindex`` is the cached
+    tensor wrapper around it.
+
+    The uniform-GQA extend kernel derives its grouping from the tensors it is
+    handed (``kv_group_num = q.shape[1] // k.shape[1]``). Under REPLICATED-KV a
+    rank holds a q-head SLICE but ALL kv heads, so local grouping
+    ``local_q // local_kv`` is not the global ``total_q // total_kv``. Gathering
+    the kv heads with the returned index list makes the uniform kernel
+    reproduce the global mapping.
+
+    Raises when one local slot's q group spans two global kv heads: the
+    uniform-GQA kernel has no way to express that, and quietly picking one of
+    the two would be a silently wrong answer rather than a crash.
+    """
+    idx = []
+    local_gqa = local_q // local_kv
+    for m in range(local_kv):
+        lo = q_head_offset + m * local_gqa
+        hi = q_head_offset + (m + 1) * local_gqa - 1
+        g = lo // global_gqa
+        if hi // global_gqa != g:
+            raise ValueError(
+                f"REPLICATED-KV current-chunk attention (#105): this rank's q "
+                f"heads (offset {q_head_offset}, {local_q} heads over "
+                f"{local_kv} local kv slots) straddle a global kv-head boundary "
+                f"(global GQA group size {global_gqa}); the uniform-GQA Triton "
+                f"extend kernel cannot represent this split. Choose a "
+                f"--rank-tp-ratio whose q-unit boundaries align with kv-head "
+                f"boundaries."
+            )
+        idx.append(g)
+    return None if idx == list(range(local_kv)) else idx
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -496,6 +573,46 @@ class TritonAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
+        from sglang.srt.distributed.utils import (
+            attn_kv_replicated,
+            tp_partition_sizes,
+            uneven_dcp_active,
+            uneven_dcp_kv_replicated,
+            weightless_kv_active,
+        )
+
+        _attn_tp_size = get_parallel().attn_tp_size
+        _total_kv = model_runner.model_config.get_total_num_kv_heads()
+        self.is_draft_worker = bool(getattr(model_runner, "is_draft_worker", False))
+        # THE UNEVEN-DCP LANE (#173). A --rank-tp-ratio plan spanning the whole
+        # TP group means the KV pool is TOKEN-sharded with the FULL replicated
+        # kv-head set per row. The draft/NEXTN worker is excluded by design and
+        # exactly as in the flashinfer backend: its pool keeps the full token
+        # context with LOCAL heads, so DCP is simply OFF for that backend
+        # instance -- and since every DCP branch here keys on `dcp_size > 1`,
+        # turning it off means setting dcp_size to 1 for this object. (Reading
+        # the draft's full-context pool through the owner rule would compact
+        # indices that were never compacted.)
+        _uneven_plan = uneven_dcp_kv_replicated(self.dcp_size)
+        if _uneven_plan and self.is_draft_worker:
+            self.dcp_size = 1
+            self.dcp_rank = 0
+        self.uneven_dcp = _uneven_plan and not self.is_draft_worker
+        # WEIGHTED owner rule: a non-uniform token vector is installed, so this
+        # rank owns the contiguous virtual-block offset range [cp_lo, cp_hi) of
+        # every block of cp_S slots instead of the residue == dcp_rank. Bounds
+        # come from the shared helper, so the read side
+        # (build_dcp_weighted_kv_indices) and the write side
+        # (dcp_weighted_write_slots) cannot end up with different ones.
+        self.uneven_dcp_weighted = self.uneven_dcp and uneven_dcp_active(self.dcp_size)
+        self.cp_S = self.cp_lo = self.cp_hi = self.cp_ratio = 0
+        if self.uneven_dcp_weighted:
+            (
+                self.cp_S,
+                self.cp_lo,
+                self.cp_hi,
+                self.cp_ratio,
+            ) = dcp_weighted_owner_bounds(self.dcp_size, self.dcp_rank)
         # NOT _plan_aware_num_q_heads(...) * dcp_size: that helper is already
         # plan-aware, so multiplying double-counts and UNDER-sizes the decode
         # workspaces on the smaller ranks under an uneven plan. See
@@ -506,28 +623,50 @@ class TritonAttnBackend(AttentionBackend):
         # Kept for the DCP head collectives, which need the group's per-rank
         # q-head counts and not just this rank's (_dcp_group_q_head_counts).
         self.dcp_model_config = model_runner.model_config
-        self.num_kv_head = model_runner.model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size
-        )
+        self.num_kv_head = model_runner.model_config.get_num_kv_heads(_attn_tp_size)
+        # KV-HEAD BOOKKEEPING FOR THE UNEVEN LANE. Under it the KV pool rows
+        # hold the FULL total_num_kv_heads on every rank (see
+        # model_runner_kv_cache_mixin: `_hybrid_kv_head_num =
+        # get_total_num_kv_heads()` whenever uneven_dcp_kv_replicated), so the
+        # split-KV schedule must be sized for that count and not for this
+        # rank's projection share -- they differ exactly when the kv heads are
+        # head-sharded rather than replicated.
+        self.dcp_kv_replicated_heads = False
+        self.dcp_kv_head_counts = None
+        self._repl_kv_reindex_cache = {}
+        self.dcp_full_qo_heads = model_runner.model_config.num_attention_heads
+        self.dcp_full_kv_heads = _total_kv
+        if self.uneven_dcp:
+            # kv < tp -> every rank projects ALL kv heads itself (replicated
+            # k/v weights), so the per-layer kv-head gather is a no-op and is
+            # skipped. This is the 27B/35B Nordstern case and it issues NO
+            # extra collective at all.
+            self.dcp_kv_replicated_heads = attn_kv_replicated(_attn_tp_size, _total_kv)
+            self.dcp_kv_head_counts = (
+                [_total_kv] * _attn_tp_size
+                if self.dcp_kv_replicated_heads
+                else tp_partition_sizes(_total_kv, _attn_tp_size, units=_total_kv)
+            )
+            self.num_kv_head = _total_kv
         # DCP GEOMETRY GUARD -- see reject_unsupported_dcp_geometry for the
-        # full reasoning of both rejections (no uneven-DCP wiring in this
-        # backend; even DCP needs kv-head replication across the group).
-        # Everything the decision depends on is read here and passed by value,
-        # so the rule itself stays testable without a device.
-        from sglang.srt.distributed.utils import (
-            uneven_dcp_active,
-            uneven_dcp_kv_replicated,
-            weightless_kv_active,
-        )
-
+        # full reasoning of the three branches (the uneven lane and what of it
+        # is still unserved; a token vector without a plan; even DCP needing
+        # kv-head replication across the group). Everything the decision
+        # depends on is read here and passed by value, so the rule itself stays
+        # testable without a device.
         reject_unsupported_dcp_geometry(
             self.dcp_size,
-            get_parallel().attn_tp_size,
-            model_runner.model_config.get_total_num_kv_heads(),
+            _attn_tp_size,
+            _total_kv,
             uneven_plan=uneven_dcp_kv_replicated(self.dcp_size),
             weighted_tokens=uneven_dcp_active(self.dcp_size),
             weightless_kv=weightless_kv_active(),
             swa_kv_heads=total_swa_kv_heads(model_runner.model_config),
+            mla=self.use_mla,
+            speculative=bool(self.num_draft_tokens or self.speculative_num_steps),
+            sliding_window=(
+                self.sliding_window_size is not None and self.sliding_window_size > 0
+            ),
         )
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with
@@ -699,6 +838,10 @@ class TritonAttnBackend(AttentionBackend):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Build per-DCP-rank sharded KV indptr/indices. eager passes kv_indices=None
         # (fresh tensor); cuda-graph passes an address-stable buffer to fill in place.
+        if self.uneven_dcp_weighted:
+            return self._dcp_weighted_kv_indices(
+                req_pool_indices, lens, kv_indptr, kv_indices, kv_start_idx
+            )
         dcp_lens = self._dcp_lens(lens, kv_start_idx)
         kv_indptr[1 : len(req_pool_indices) + 1] = torch.cumsum(dcp_lens, dim=0)
         kv_indptr = kv_indptr[: len(req_pool_indices) + 1]
@@ -718,6 +861,74 @@ class TritonAttnBackend(AttentionBackend):
             self.dcp_rank,
         )
         return kv_indptr, kv_indices, dcp_lens
+
+    def _dcp_weighted_kv_indices(
+        self,
+        req_pool_indices: torch.Tensor,
+        lens: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: Optional[torch.Tensor],
+        kv_start_idx: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """WEIGHTED owner rule read side (#173), same contract as the even one.
+
+        ``build_dcp_weighted_kv_indices`` is the function the flashinfer backend
+        calls; sharing it is the point -- read and write, and now flashinfer and
+        Triton, all derive the compact slot from the SAME expression, so a token
+        cannot be fetched from a row it was never stored in.
+
+        BUFFER CONTRACT (the reason this is not a two-liner). The helper returns
+        a FRESH tensor, while a captured CUDA graph reads the address-stable
+        ``cuda_graph_kv_indices`` whose pointer was frozen at capture. Returning
+        the fresh tensor to a replay would leave the graph reading whatever the
+        buffer held at capture time -- a silent wrong-context decode, not a
+        crash. So when the caller hands in a buffer, the result is copied INTO
+        it and that same buffer object is returned; when it hands in None
+        (eager), a fresh exactly-sized tensor is returned. Which of the two came
+        back is decided by the caller's argument, never by anything computed in
+        here.
+        """
+        bs = len(req_pool_indices)
+        kv_indptr, compact = build_dcp_weighted_kv_indices(
+            self.req_to_token,
+            req_pool_indices,
+            lens,
+            kv_indptr,
+            kv_start_idx,
+            self.cp_S,
+            self.cp_lo,
+            self.cp_hi,
+            self.cp_ratio,
+            req_to_token_stride=self.req_to_token.stride(0),
+        )
+        # Same dtype as the even branch's get_dcp_lens result, because both feed
+        # the same get_num_kv_splits kernel and a Triton pointer's element type
+        # is inferred from the tensor it is handed.
+        owned_lens = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(lens.dtype)
+        n = compact.numel()
+        if kv_indices is None:
+            # int64 to match what the even branch hands the Triton kernels.
+            # A rank can legitimately own ZERO rows of the whole batch (a short
+            # prefix and a small token ratio); the attention kernels are then
+            # driven by an all-zero kv_indptr and never dereference the index
+            # tensor, but a 0-element tensor has no storage to take a pointer
+            # from, so keep one dummy row.
+            out = torch.zeros(max(n, 1), dtype=torch.int64, device=self.device)
+            if n:
+                out[:n].copy_(compact)
+            return kv_indptr, out, owned_lens
+        if n > kv_indices.numel():
+            raise ValueError(
+                f"weighted-DCP kv_indices buffer overflow: this rank owns {n} "
+                f"cache rows for the current batch but the capture-stable "
+                f"buffer holds {kv_indices.numel()}. The buffer is sized for "
+                f"max_num_tokens * max_context_len, so this means the owned "
+                f"share exceeded the global context -- a broken token ratio "
+                f"vector or a stale cp_S."
+            )
+        if n:
+            kv_indices[:n].copy_(compact)
+        return kv_indptr, kv_indices, owned_lens
 
     def _fill_kv_indptr_and_indices(
         self,
@@ -1047,6 +1258,12 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_offsets = None
         swa_attn_logits = None
         spec_info = forward_batch.spec_info
+        # This rank's per-request OWNED kv length, when the DCP index build
+        # already produced it. Under the WEIGHTED owner rule it is not
+        # get_dcp_lens(seq_lens) -- ownership follows the token ratios -- so the
+        # split-KV schedule has to be sized from the same numbers the index
+        # build used. Stays None off the DCP path.
+        dcp_seq_lens = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or spec_info.kv_indptr is None:
@@ -1054,7 +1271,7 @@ class TritonAttnBackend(AttentionBackend):
                 if self.dcp_size > 1:
                     # DCP: per-rank sharded KV indices, else each rank reads the
                     # whole KV instead of its owner shard.
-                    kv_indptr, kv_indices, _ = self._dcp_kv_indices(
+                    kv_indptr, kv_indices, dcp_seq_lens = self._dcp_kv_indices(
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
                         self.kv_indptr,
@@ -1118,14 +1335,20 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
-            self.get_num_kv_splits(
-                num_kv_splits,
-                (
-                    self._dcp_lens(forward_batch.seq_lens).clamp_min(1)
-                    if self.dcp_size > 1
-                    else forward_batch.seq_lens
-                ),
-            )
+            if self.dcp_size > 1:
+                # dcp_seq_lens, when set, is BY CONSTRUCTION the same tensor the
+                # index build produced: on the even rule that is exactly
+                # self._dcp_lens(seq_lens) (same call, same args), so this is a
+                # no-op there; on the weighted rule it is the only correct
+                # source, since ownership follows the ratios and not the modulo.
+                split_lens = (
+                    dcp_seq_lens
+                    if dcp_seq_lens is not None
+                    else self._dcp_lens(forward_batch.seq_lens)
+                ).clamp_min(1)
+            else:
+                split_lens = forward_batch.seq_lens
+            self.get_num_kv_splits(num_kv_splits, split_lens)
 
             qo_indptr = None
             custom_mask = None
@@ -1529,6 +1752,50 @@ class TritonAttnBackend(AttentionBackend):
             self.dcp_model_config, self.dcp_size, local_heads
         )
 
+    def _replicated_kv_ragged_reindex(self, local_q: int, local_kv: int, device):
+        """REPLICATED-KV geometry (#105): map each of this rank's LOCAL kv slots
+        to the GLOBAL kv head its q group attends.
+
+        The current-chunk stage of ``extend_attention_fwd`` is a uniform-GQA
+        kernel: it derives the grouping from the tensors it is handed,
+        ``kv_group_num = q_extend.shape[1] // k_extend.shape[1]``. Under
+        REPLICATED-KV this rank holds a q-head SLICE but ALL kv heads, so the
+        LOCAL grouping (local_q // local_kv) is not the GLOBAL one
+        (total_q // total_kv) whenever the rank does not hold every q head of
+        its kv head(s). Re-indexing the kv heads makes the uniform kernel
+        reproduce the global mapping.
+
+        (8q / 2kv over a [4,2,2] q split: rank 0 holds q0-3, all of which attend
+        kv0 globally, but local GQA 2 would send q2-3 to kv1 -- short prompts
+        and first chunks come out corrupted while the gathered-q paged prefix
+        and decode paths stay correct, which is what makes it hard to see.)
+
+        Returns a LongTensor of length local_kv, or None when the mapping is
+        already the identity. Cached per (local_q, local_kv): both are constant
+        across layers and forwards for a given rank. The rule itself lives in
+        the module-level ``replicated_kv_reindex`` so it can be pinned without a
+        device; this is the caching tensor wrapper. Byte-for-byte the flashinfer
+        twin's rule.
+        """
+        cache = self._repl_kv_reindex_cache
+        key = (local_q, local_kv)
+        if key in cache:
+            return cache[key]
+        counts = self._dcp_group_q_head_counts(local_q)
+        idx = replicated_kv_reindex(
+            sum(counts[: self.dcp_rank]),
+            local_q,
+            local_kv,
+            self.dcp_full_qo_heads // self.dcp_full_kv_heads,
+        )
+        out = (
+            None
+            if idx is None
+            else torch.tensor(idx, device=device, dtype=torch.long)
+        )
+        cache[key] = out
+        return out
+
     def _dcp_gather_q_heads(self, q_local: torch.Tensor, group) -> torch.Tensor:
         """All-gather the DCP group's q heads along dim=1.
 
@@ -1576,6 +1843,50 @@ class TritonAttnBackend(AttentionBackend):
             out, lse, group, counts, return_lse=return_lse
         )
 
+    def _dcp_write_gather(self, layer: RadixAttention, k: torch.Tensor, v: torch.Tensor):
+        """Raise this rank's kv-head shard to the FULL replicated head set.
+
+        Under the uneven-DCP lane every pool row holds all total_num_kv_heads,
+        because the pool is sharded along TOKENS instead of heads. When the kv
+        heads are also head-sharded across ranks (kv >= tp), the freshly
+        projected k/v carry only this rank's slice and have to be gathered
+        first. When kv < tp the k/v weights are REPLICATED -- every rank already
+        projects all kv heads from identical weights -- so the gather is a no-op
+        and, importantly, no collective is issued at all: that is the 27B/35B
+        case this port targets.
+
+        The gather is one FUSED all-gather of cat(k, v) along the head dim, not
+        two: k and v share dcp_kv_head_counts, so stacking them on the row dim
+        gives per-tensor results identical to two separate gathers (pure data
+        movement, no reduction) at half the launches. Same construction as the
+        flashinfer twin.
+
+        RANK-UNIFORM: the branch is on dcp_kv_replicated_heads, a boot-time
+        property of the geometry, identical on every rank of the group -- never
+        on anything derived from this batch's data.
+        """
+        # Same view the layer itself uses, so a model with qk_head_dim !=
+        # v_head_dim is reshaped correctly rather than by a shared head_dim.
+        k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        if self.dcp_kv_replicated_heads:
+            return k, v
+        if layer.qk_head_dim != layer.v_head_dim:
+            raise ValueError(
+                "uneven-DCP kv-head gather with head-sharded kv heads requires "
+                f"qk_head_dim == v_head_dim (got {layer.qk_head_dim} != "
+                f"{layer.v_head_dim}); the fused cat(k, v) all-gather cannot "
+                "stack two different head dims. Use --attention-backend "
+                "flashinfer for this model, or a geometry with kv < tp so the "
+                "kv heads are replicated and no gather is needed."
+            )
+        group = get_parallel().dcp_group
+        n = k.shape[0]
+        kv_full = cp_all_gather_heads_uneven(
+            torch.cat((k, v), dim=0), group, self.dcp_kv_head_counts
+        )
+        return kv_full[:n], kv_full[n:]
+
     def _set_kv_buffer(
         self,
         forward_batch: ForwardBatch,
@@ -1590,14 +1901,37 @@ class TritonAttnBackend(AttentionBackend):
         # dcp_size) through the masked path so each rank only stores the tokens
         # it owns. Non-DCP keeps the original write loc and plain set_kv_buffer.
         if self.dcp_size > 1:
-            loc = forward_batch.out_cache_loc // self.dcp_size
-            if (
-                forward_batch.positions is not None
-                and forward_batch.positions.numel() == loc.numel()
-            ):
-                dcp_kv_mask = forward_batch.positions % self.dcp_size == self.dcp_rank
+            if self.uneven_dcp:
+                k, v = self._dcp_write_gather(layer, k, v)
+            if self.uneven_dcp_weighted:
+                # WEIGHTED owner rule (#173): ownership AND the compact row are
+                # derived from out_cache_loc itself, not from the sequence
+                # position, which is what keeps the row an injective function of
+                # the slot across concurrent requests -- exactly as the even
+                # `loc // dcp_size` is. This rank owns L iff (L % cp_S) is in
+                # [cp_lo, cp_hi) and stores it at
+                # (L // cp_S) * cp_ratio + (L % cp_S - cp_lo).
+                # dcp_weighted_write_slots is the SAME function the flashinfer
+                # write path calls, and its expression is shared with the read
+                # side (build_dcp_weighted_kv_indices), so the two cannot drift.
+                loc, dcp_kv_mask = dcp_weighted_write_slots(
+                    forward_batch.out_cache_loc,
+                    self.cp_S,
+                    self.cp_lo,
+                    self.cp_hi,
+                    self.cp_ratio,
+                )
             else:
-                dcp_kv_mask = forward_batch.dcp_kv_mask
+                loc = forward_batch.out_cache_loc // self.dcp_size
+                if (
+                    forward_batch.positions is not None
+                    and forward_batch.positions.numel() == loc.numel()
+                ):
+                    dcp_kv_mask = (
+                        forward_batch.positions % self.dcp_size == self.dcp_rank
+                    )
+                else:
+                    dcp_kv_mask = forward_batch.dcp_kv_mask
             kwargs = {"dcp_kv_mask": dcp_kv_mask}
         else:
             loc = loc_info
@@ -1778,6 +2112,42 @@ class TritonAttnBackend(AttentionBackend):
         )
         return o
 
+    @staticmethod
+    def _dcp_batch_has_prefix(
+        forward_batch: ForwardBatch, kv_indices: torch.Tensor
+    ) -> bool:
+        """Does this BATCH have any paged prefix to read? A GROUP-UNIFORM answer.
+
+        The DCP extend path skips the q-head all-gather and the LSE merge when
+        there is no prefix. Those are COLLECTIVES, so the decision has to be
+        identical on every rank of the group -- and the obvious local test,
+        "did I get any kv indices", is not: a rank owns
+        len//N + (rank < len%N) prefix slots under the even rule and a
+        ratio-proportional share under the weighted one, so a short prefix over
+        an uneven vector is routinely owned entirely by the high-ratio rank.
+        The low-ratio ranks would return early, the high-ratio one would sit in
+        an all-gather nobody joins, and the server hangs on a request whose only
+        peculiarity is a 1-token prefix.
+
+        extend_prefix_lens is a GLOBAL, replicated tensor, so basing the branch
+        on it is uniform by construction. A rank that then owns zero rows still
+        runs both collectives and contributes out=0 / lse=-inf, which is exactly
+        the empty-attention contract the LSE merge already handles.
+
+        The old local test is kept only as the fallback for a batch that carries
+        no prefix lengths at all (it is then equivalent: no prefix lengths means
+        no paged read was planned for anyone).
+        """
+        lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        if lens_cpu is not None:
+            return any(lens_cpu)
+        lens = getattr(forward_batch, "extend_prefix_lens", None)
+        if lens is not None:
+            # gpu_only batches leave the _cpu mirror unset; one sync on a
+            # bs-sized tensor, and only on that configuration.
+            return bool(lens.numel()) and int(lens.max()) > 0
+        return kv_indices.numel() > 0
+
     def _forward_extend_dcp(
         self,
         q: torch.Tensor,
@@ -1831,11 +2201,28 @@ class TritonAttnBackend(AttentionBackend):
         # Current chunk K/V is still local before masked cache write, so it can
         # use the original extend kernel's current-token stage directly.
         if k.numel() > 0:
+            k_cur = k.contiguous()
+            v_cur = v.contiguous()
+            if self.uneven_dcp and self.dcp_kv_replicated_heads:
+                # #105: this rank holds a q-head SLICE but ALL kv heads, so the
+                # uniform-GQA kernel's local grouping is not the global q->kv
+                # mapping. Re-index the kv heads so it becomes one. Identity (and
+                # a no-op) whenever the local and global groupings coincide.
+                _kv_idx = self._replicated_kv_ragged_reindex(
+                    layer.tp_q_head_num, layer.tp_k_head_num, k.device
+                )
+                if _kv_idx is not None:
+                    k_cur = k_cur.view(-1, layer.tp_k_head_num, layer.qk_head_dim)[
+                        :, _kv_idx, :
+                    ].contiguous()
+                    v_cur = v_cur.view(-1, layer.tp_v_head_num, layer.v_head_dim)[
+                        :, _kv_idx, :
+                    ].contiguous()
             empty_kv_indptr = torch.zeros_like(kv_indptr)
             self.extend_attention_fwd(
                 q_local,
-                k.contiguous(),
-                v.contiguous(),
+                k_cur,
+                v_cur,
                 current_out,
                 k_buffer,
                 v_buffer,
@@ -1855,7 +2242,7 @@ class TritonAttnBackend(AttentionBackend):
                 skip_prefix=True,
             )
 
-        if kv_indices.numel() == 0:
+        if not self._dcp_batch_has_prefix(forward_batch, kv_indices):
             return current_out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(
                 q.dtype
             )
@@ -1875,8 +2262,23 @@ class TritonAttnBackend(AttentionBackend):
             device=q.device,
             dtype=torch.float32,
         )
-        empty_k = k[:0].contiguous()
-        empty_v = v[:0].contiguous()
+        # The prefix stage reads k_buffer/v_buffer, but extend_attention_fwd
+        # takes its GQA grouping from the tensors it is handed
+        # (kv_group_num = q_extend.shape[1] // k_extend.shape[1]) -- and the
+        # k_extend it is handed here is EMPTY. So this placeholder's head count
+        # is what decides how the pool is indexed, and it must be the POOL's kv
+        # head count. On the even path that is this rank's projection count and
+        # `k[:0]` is right; under the uneven lane the pool row holds all
+        # total_num_kv_heads while a head-sharded rank projects fewer, so the
+        # placeholder is built from self.num_kv_head (which the constructor set
+        # to the pool's count for that lane). Same dtype/device as k either way,
+        # so the compiled kernel variant is unchanged on the even path.
+        if self.uneven_dcp and not self.dcp_kv_replicated_heads:
+            empty_k = k.new_empty((0, self.num_kv_head, k.shape[-1]))
+            empty_v = v.new_empty((0, self.num_kv_head, v.shape[-1]))
+        else:
+            empty_k = k[:0].contiguous()
+            empty_v = v[:0].contiguous()
         self.extend_attention_fwd(
             q_all,
             empty_k,

@@ -169,6 +169,30 @@ behaviour.
 | a token vector WITHOUT a `--rank-tp-ratio` plan | mixed pool state (pool sized weighted, heads not replicated) |
 | even DCP without kv-head replication (no plan) | unchanged #169.2 rule |
 
+One further refusal is raised at the first forward rather than at boot,
+because it depends on the layer and not on the server args: a head-sharded
+uneven lane (`kv >= tp`) on a model with `qk_head_dim != v_head_dim`. The
+fused `cat(k, v)` kv-head all-gather cannot stack two different head dims,
+and doing two separate gathers would double the per-layer collective count
+rather than silently work. `kv < tp` never reaches it (no gather at all).
+
+## 4b. What actually landed
+
+* `layers/dcp/owner.py`: `dcp_weighted_read_slots` and
+  `dcp_weighted_owned_lengths` extracted; `build_dcp_weighted_kv_indices`
+  now composes them and takes an optional `req_to_token_stride`.
+* `triton_backend.py`:
+  * constructor: `uneven_dcp` / `uneven_dcp_weighted` / `cp_S,cp_lo,cp_hi,
+    cp_ratio` / `dcp_kv_replicated_heads` / `dcp_kv_head_counts` /
+    `dcp_full_{qo,kv}_heads`, `num_kv_head = total_kv` for the lane, and
+    `dcp_size = 1` for a draft worker under the lane (D6);
+  * `_dcp_weighted_kv_indices` (read side, D3 buffer contract, D4 lengths);
+  * `_dcp_write_gather` + the weighted branch of `_set_kv_buffer`;
+  * `replicated_kv_reindex` / `_replicated_kv_ragged_reindex` (D7);
+  * `_dcp_batch_has_prefix` (D5);
+  * prefix-stage placeholder head count (D2);
+  * `reject_unsupported_dcp_geometry` restructured into three branches.
+
 ---
 
 ## 5. Test strategy
@@ -189,3 +213,96 @@ not** — they are pure integer tensor arithmetic. So:
 * A GPU-marked test file exercises the Triton wrapper end to end
   (`req_to_token` -> `kv_indptr`/`kv_indices`) against the same numpy
   reference, and the `_dcp_kv_indices` cuda-graph buffer contract.
+
+---
+
+## 6. GPU validation recipe (to run in a GPU window)
+
+Nothing below was run for this change: the implementation phase had no cards.
+Ordered cheapest-first, each step is a falsifier for the one after it
+("Einzelteil vor Verbund").
+
+### G1 — index math on a device, no model, no collectives (~1 min, any 1 GPU)
+
+```
+PYTHONPATH=<worktree>/python .venv/bin/python -m pytest \
+  test/registered/unit/distributed/test_triton_weighted_dcp_gpu.py -v
+```
+Covers: the shared kv-index kernel composed with the owner rule; the
+`kv_start_idx` (chunked-prefill) offset; read rows == write rows; the
+capture-stable buffer contract; the buffer-overflow refusal; the
+owns-nothing case. If this fails, nothing further is worth booting.
+
+### G2 — the guard actually opens (~2 min, main rig)
+
+Boot the 27B uneven-DCP config with `--attention-backend triton` and confirm
+the process gets past `TritonAttnBackend.__init__` instead of raising
+"Triton attention cannot serve --dcp-size". Then confirm the four refusals
+still fire, by adding each of `--speculative-*`, an MLA model, a
+sliding-window model, and the weightless-KV flag to that same command: each
+must abort at boot naming itself.
+
+### G3 — single-rank coherence before any TP (~5 min, 5090 alone)
+
+Same model, `--attention-backend triton`, `--dcp-size 1`. This is the
+BASELINE the parity anchor is compared against and it must be unchanged from
+before the branch (the whole weighted path is inert at `dcp_size <= 1`).
+
+### G4 — the parity anchor: 27B uneven DCP, triton vs flashinfer (main rig)
+
+The point of the task. Same model, same `--rank-tp-ratio`, same token
+vector, same seed, greedy, **no** speculative decoding (refused under this
+lane, see §4):
+
+* run A: `--attention-backend flashinfer`
+* run B: `--attention-backend triton`
+
+Compare on the same prompt set: (a) coherence of B on its own; (b) A vs B
+token sequences under greedy decoding. Exact token identity is NOT expected
+across two different attention kernel families — the acceptance bar is
+"coherent, and the same answer semantically, with the first divergence late
+rather than at token 1". A first-token divergence, or CJK/mojibake output,
+means the owner rule is wired wrong, not that the kernels differ.
+
+Run this in BOTH eager and CUDA-graph decode: G4 with graphs is what
+exercises the D3 buffer contract, and a wrong-context replay shows up only
+there ("Full-Perf-Testen": validate with graphs, not just eager).
+
+Cover both prefill shapes: one short prompt (single chunk, exercises the
+current-chunk ragged stage alone) and one long enough to chunk (exercises
+the paged owned-prefix read + the LSE merge).
+
+### G5 — the head-sharded sub-lane (`kv >= tp`)
+
+G4's 27B is `kv < tp` (REPLICATED-KV: no kv collective, `_dcp_write_gather`
+is a no-op). The other sub-lane — a model with `kv >= tp` under a
+`--rank-tp-ratio` plan — is the only path that issues the fused kv-head
+all-gather on the write, and it is untested by G4. Boot one such model
+(e.g. a Qwen3.5 class with 8 kv heads at TP=3) and repeat G4's comparison.
+
+### G6 — the empty-shard hang (D5), deliberately provoked
+
+Send a request whose prefix is 1-2 tokens under a strongly uneven token
+vector (e.g. `[13,30,21]`), so at least one rank owns ZERO prefix rows.
+Before this change the group would hang there; it must now complete. Do this
+on the flashinfer run too — the fix is in shared structure, and flashinfer
+already gets it right, so the two must agree.
+
+### G7 — sm75 / gfx900, the actual Nordstern reason
+
+Everything above can run on the main rig. The point of the port is a rank
+with no flashinfer. Repeat G3 and then G4 on the hetero host
+(2080Ti = sm75, Vega64 = gfx900) once a rank there can hold the model at
+all. Note the known gfx900 limits (stock Triton rejects gfx900; torch-native
+falls back to MATH SDPA and OOMs on long prefill) — expect this step to be
+gated on those, not on #173.
+
+### Hosts
+
+| step | host | why |
+|---|---|---|
+| G1 | any single GPU | no collectives, seconds |
+| G2, G3 | main rig, one card | boot-only |
+| G4, G6 | main rig, 5090 + 2x3080, TP=3 | the parity anchor |
+| G5 | main rig | needs a `kv >= tp` model |
+| G7 | hetero host 192.168.0.89 | the sm75/gfx900 target |
