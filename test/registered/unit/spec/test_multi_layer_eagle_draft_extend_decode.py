@@ -12,15 +12,22 @@ O1/O2):
 * #185 (#50 family) -- the picks were NOT rank-0-broadcast, unlike every pick
   in eagle_worker_v2. On heterogeneous GPUs per-rank logits differ in the last
   bits, so a near-tie flips on one rank and the TP group desynchronizes.
-* #184 -- rungs >= 1 of the eager path run on attention metadata that only
-  rung 0 ever planned (tracked separately).
+* #184 -- `prepare_for_draft_extend` plans attention metadata for
+  `draft_runner_list[0]`'s backend only, then the batch is marked
+  metadata-ready, so rungs >= 1 used to run on whatever metadata their backend
+  happened to hold (the standing "may have correctness issue" warning). The
+  per-rung graph path already re-plans per rung in
+  `MultiLayerEagleDraftExtendCudaGraphRunner.replay`; the eager path now does
+  the same.
 
 Everything here runs on CPU with fake runners/backends: these tests pin
 STRUCTURE (who is synced, in what order things are planned), not the numerics
 of the MTP layers, which need a GPU and a multi-layer checkpoint.
 """
 
+import ast
 import contextlib
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -250,6 +257,76 @@ class TestDecodeDraftExtendRankSync(CustomTestCase):
         ):
             worker._draft_extend_for_decode(batch, batch_result)
         self.assertEqual(batch_result.next_draft_input.topk_index.shape, (BS, STEPS))
+
+
+class TestDecodeDraftExtendPerRungMetadata(CustomTestCase):
+    """#184: every rung must have its attention metadata planned before its
+    forward, mirroring the per-rung plan in the graph path's replay()."""
+
+    def test_each_rung_is_planned_before_its_forward(self):
+        trace = []
+        _run_rank(0.0, lambda t, src: None, trace)
+
+        plans_forwards = [e for e in trace if e[0] in ("plan", "forward")]
+        self.assertEqual(
+            plans_forwards,
+            [x for s in range(STEPS) for x in (("plan", s), ("forward", s))],
+            "eager multi-step draft extend did not plan every rung's attention "
+            "metadata immediately before that rung's forward (#184)",
+        )
+
+    def test_graph_path_plans_per_rung(self):
+        """The template: the composite graph runner re-plans the rung's
+        backend inside replay(). Pinned so the eager fix cannot drift away
+        from the path that is known to work."""
+        import sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner as gr
+
+        tree = ast.parse(inspect.getsource(gr))
+        found = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name != "replay":
+                    continue
+                for sub in ast.walk(node):
+                    if (
+                        isinstance(sub, ast.Call)
+                        and isinstance(sub.func, ast.Attribute)
+                        and sub.func.attr.startswith("init_forward_metadata")
+                    ):
+                        found.append(sub.func.attr)
+        self.assertTrue(
+            found,
+            "graph replay() no longer plans its rung's attention metadata — "
+            "the eager fix in _draft_extend_for_decode was modelled on it",
+        )
+
+    def test_eager_loop_plans_the_rung_backend_by_step(self):
+        """Ratchet: the plan call must index draft_extend_attn_backend_list
+        with the loop's step, inside the rung loop."""
+        import sglang.srt.speculative.multi_layer_eagle_worker_v2 as ml
+
+        tree = ast.parse(inspect.getsource(ml))
+        hits = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "init_forward_metadata"
+            ):
+                continue
+            target = node.func.value
+            if (
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Attribute)
+                and target.value.attr == "draft_extend_attn_backend_list"
+            ):
+                hits.append(node.lineno)
+        self.assertTrue(
+            hits,
+            "no per-rung draft_extend_attn_backend_list[...].init_forward_metadata "
+            "call in the multi-layer worker — rungs >= 1 would run the eager "
+            "draft extend on stale attention metadata (#184)",
+        )
 
 
 if __name__ == "__main__":
