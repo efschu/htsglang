@@ -91,6 +91,80 @@ def write_routing_trace(
 
 
 @dataclass
+class ExpertOffloadRelease:
+    """Per-rank tally of expert weight memory the offload took OFF the GPU.
+
+    #119: the KV pool is sized from a live free-memory reading taken after the
+    weights are resident, so the VRAM the offload releases flows into the KV
+    budget on its own -- PROVIDED the install happens before the profiling and
+    the freed blocks are actually back with the driver. That reclaim used to be
+    an invisible side effect: nothing said how much was released, and a
+    regression that moved the install back behind the sizing step (the #77
+    "known limitation") would silently cost the whole win with no log line to
+    notice it by. These counters make the reclaim an accounted, assertable
+    quantity.
+
+    ``device_bytes`` is the expert weight VRAM no longer held on the GPU;
+    ``host_bytes`` is what the pinned spill pool took over in its place.
+    """
+
+    device_bytes: int = 0
+    host_bytes: int = 0
+    layers: int = 0
+    tensors: int = 0
+
+
+_RELEASE_TALLY = ExpertOffloadRelease()
+
+
+def expert_offload_released_device_bytes(
+    num_local_experts: int, buffer_slots: int, row_bytes: int
+) -> int:
+    """Pure: VRAM (bytes) one expert-major tensor stops holding under offload.
+
+    The layer used to hold ``num_local_experts`` expert rows on GPU; after the
+    split it holds ``buffer_slots`` (= R resident + C scratch). The difference
+    is what the KV pool may claim. Returns 0 whenever the split keeps at least
+    as many slots as there are experts (fully-resident = no offload), so the
+    no-offload path tallies exactly nothing.
+    """
+    experts = int(num_local_experts)
+    slots = max(0, int(buffer_slots))
+    width = max(0, int(row_bytes))
+    if experts <= 0 or slots >= experts:
+        return 0
+    return (experts - slots) * width
+
+
+def record_expert_offload_release(
+    device_bytes: int, host_bytes: int, tensors: int = 1
+) -> None:
+    """Tally one layer's release. Called once per layer that actually split."""
+    _RELEASE_TALLY.device_bytes += max(0, int(device_bytes))
+    _RELEASE_TALLY.host_bytes += max(0, int(host_bytes))
+    _RELEASE_TALLY.tensors += max(0, int(tensors))
+    _RELEASE_TALLY.layers += 1
+
+
+def expert_offload_release_totals() -> ExpertOffloadRelease:
+    """Snapshot of this rank's release tally (a copy; callers must not mutate)."""
+    return ExpertOffloadRelease(
+        device_bytes=_RELEASE_TALLY.device_bytes,
+        host_bytes=_RELEASE_TALLY.host_bytes,
+        layers=_RELEASE_TALLY.layers,
+        tensors=_RELEASE_TALLY.tensors,
+    )
+
+
+def reset_expert_offload_release() -> None:
+    """Clear the tally (tests; and a second model load in one process)."""
+    _RELEASE_TALLY.device_bytes = 0
+    _RELEASE_TALLY.host_bytes = 0
+    _RELEASE_TALLY.layers = 0
+    _RELEASE_TALLY.tensors = 0
+
+
+@dataclass
 class ResidencyStats:
     fetches: int = 0          # experts H2D-copied (misses that fit)
     hits: int = 0             # needed experts already resident
@@ -573,6 +647,11 @@ class MoEExpertOffloadCache:
         R = self.resident_count
         buf_slots = self.planner.buffer_size  # R + C
         presplit = getattr(self.layer, "_moe_offload_presplit", None)
+        # #119 tally. Only the split-here branch releases VRAM *here*; the
+        # presplit branch already released it at load time (and tallied there),
+        # so counting it again would double-report the reclaim.
+        freed_device = 0
+        freed_host = 0
 
         for attr in self.EXPERT_TENSOR_ATTRS:
             if presplit is not None:
@@ -613,6 +692,12 @@ class MoEExpertOffloadCache:
                 if isinstance(getattr(self.layer, attr), torch.nn.Parameter)
                 else buf,
             )
+            if not full.is_cpu:
+                row_bytes = (full.numel() // full.shape[0]) * full.element_size()
+                freed_device += expert_offload_released_device_bytes(
+                    self.num_local_experts, buf_slots, row_bytes
+                )
+            freed_host += spill.numel() * spill.element_size()
 
         # The marlin apply reads E = w1.shape[0] = buffer size (R+C). Advertise
         # it so moe_align / the runner size to the buffer; topk_ids arriving at
@@ -632,6 +717,10 @@ class MoEExpertOffloadCache:
                 delattr(self.layer, "_moe_offload_presplit")
             except Exception:
                 self.layer._moe_offload_presplit = None
+        elif self._resident:
+            record_expert_offload_release(
+                freed_device, freed_host, len(self._resident)
+            )
         self._installed = True
 
     # --- fetch / remap helpers (GPU window) --------------------------------
@@ -1083,6 +1172,8 @@ def presplit_expert_offload_after_repack(layer) -> None:  # pragma: no cover - C
     buf_slots = min(R + C, int(E))
 
     presplit = {}
+    freed_device = 0
+    freed_host = 0
     for attr in MoEExpertOffloadCache.EXPERT_TENSOR_ATTRS:
         p = getattr(layer, attr, None)
         if p is None:
@@ -1101,6 +1192,13 @@ def presplit_expert_offload_after_repack(layer) -> None:  # pragma: no cover - C
         ).pin_memory()
         spill.copy_(t[R:])
         presplit[attr] = (buf, spill)
+        # #119: tally the VRAM this tensor stops holding, so the KV-pool sizing
+        # step can report (and assert on) the reclaim it is about to inherit.
+        row_bytes = (t.numel() // t.shape[0]) * t.element_size()
+        freed_device += expert_offload_released_device_bytes(
+            int(E), buf_slots, row_bytes
+        )
+        freed_host += spill.numel() * spill.element_size()
         # Replace the param with a 0-row placeholder so device_loading_context
         # copies nothing back to host (the full [E] GPU tensor is dropped here).
         empty = torch.empty((0,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device)
@@ -1112,6 +1210,7 @@ def presplit_expert_offload_after_repack(layer) -> None:  # pragma: no cover - C
     if presplit:
         layer._moe_offload_presplit = presplit
         layer._moe_offload_full_experts = int(E)
+        record_expert_offload_release(freed_device, freed_host, len(presplit))
         # Return freed host memory to the OS NOW. create_weights loaded the full
         # [E] expert set to host CPU; the loader frees each layer's loaded tensor
         # (via device_loading_context) as it is repacked, but glibc/torch retain
