@@ -274,6 +274,7 @@ def test_communicator_keeps_no_shape_keyed_output_cache():
 
 def test_device_extension_builds_for_every_arch_and_keys_the_cache_by_it(
     monkeypatch,
+    tmp_path,
 ):
     """A mixed-arch rig must not share a single-arch cubin between ranks.
 
@@ -286,6 +287,12 @@ def test_device_extension_builds_for_every_arch_and_keys_the_cache_by_it(
     (gfx900 merge): same invariants, keyed per (vendor, arches).
     """
     import torch.utils.cpp_extension as cpp_extension
+
+    # _load_ext now does cache hygiene (#181) on the real torch extensions
+    # root before building, so give this test a root of its own: a unit test
+    # must not sweep, mark, or otherwise write into the developer's warm
+    # extension cache.
+    monkeypatch.setenv("TORCH_EXTENSIONS_DIR", str(tmp_path))
 
     module = _load_standalone("htccl_device")
     module._ext = None
