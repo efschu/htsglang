@@ -373,7 +373,7 @@ class BreakableCUDAGraphCapture:
             _current_stream_var.reset(self._stream_token)
             _current_capture_var.reset(self._capture_token)
             if self._stream_ctx is not None:
-                self._stream_ctx.__exit__(*args)
+                self._stream_ctx.__exit__(exc_type, exc_val, exc_tb)
                 self._stream_ctx = None
             _uninstall_wait_stream_hook()
         return False

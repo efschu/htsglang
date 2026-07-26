@@ -61,6 +61,27 @@ class _FakeStream:
     cuda_stream = 1
 
 
+class _RecordingStreamCtx:
+    """Stand-in for the object torch.cuda.stream() returns.
+
+    Records the triple __exit__ is called with, which is the whole point: the
+    capture context manager must forward its own exception triple here.
+    """
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.entered = False
+        self.exit_args: tuple | None = None
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.exit_args = (exc_type, exc_val, exc_tb)
+        return False
+
+
 class BreakableCaptureTestBase(unittest.TestCase):
     def setUp(self):
         self.graphs: list[_FakeGraph] = []
@@ -166,6 +187,98 @@ class TestBreakFailureIsReported(BreakableCaptureTestBase):
         # one break -> two segments; the nested call must not add a third
         self.assertEqual(len(graph._segments), 2)
         self.assertEqual(len(graph._break_fns), 1)
+        self.assertCaptureStateClean()
+
+
+class TestCaptureOnADedicatedStream(BreakableCaptureTestBase):
+    """Every real capture runs on a stream -- so __exit__ must survive one.
+
+    `capture_session()` always hands the runner's capture stream to
+    `BreakableCUDAGraphCapture(stream=...)`, so `self._stream_ctx` is NEVER
+    None in production; the only captures that leave it None are the ones this
+    file used to construct. That gap let the #164 signature change
+    (`__exit__(self, *args)` -> `__exit__(self, exc_type=None, exc_val=None,
+    exc_tb=None)`) ship with `self._stream_ctx.__exit__(*args)` still in the
+    body: a NameError on the closing line of EVERY breakable capture, on every
+    GPU, that no test could see. Constructing the manager with a stream is the
+    entire falsifier.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # A NameError raised INSIDE __exit__'s finally block aborts it before
+        # _uninstall_wait_stream_hook(), so the module-global hook state leaks
+        # into whatever runs next -- that leak is part of the bug's blast
+        # radius, but it must not turn one red test into a red file. Restore
+        # the globals after each test here so the red set stays exactly the
+        # tests that assert on the defect.
+        self.addCleanup(self._restore_hook_globals)
+
+    def _restore_hook_globals(self):
+        if bcg._original_wait_stream is not None:
+            torch.cuda.Stream.wait_stream = bcg._original_wait_stream
+        bcg._original_wait_stream = None
+        bcg._hook_refcount = 0
+
+    def _capture(self, cuda_graph):
+        """A capture whose stream context is a recorder, as in production."""
+        self.stream_ctxs: list[_RecordingStreamCtx] = getattr(
+            self, "stream_ctxs", []
+        )
+
+        def make_stream_ctx(stream):
+            ctx = _RecordingStreamCtx(stream)
+            self.stream_ctxs.append(ctx)
+            return ctx
+
+        patcher = mock.patch.object(bcg.torch.cuda, "stream", make_stream_ctx)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return bcg.BreakableCUDAGraphCapture(
+            cuda_graph=cuda_graph, stream=_FakeStream()
+        )
+
+    # ---- the defect this exists to prevent ------------------------------
+    def test_successful_capture_on_a_stream_closes_the_stream_context(self):
+        """The plain path: no exception, and the stream context is exited with
+        the empty triple. Before the fix this raised NameError('args')."""
+        graph = bcg.BreakableCUDAGraph()
+        with self._capture(graph):
+            pass
+        self.assertEqual(len(graph._segments), 1)
+        self.assertEqual(len(self.stream_ctxs), 1)
+        self.assertTrue(self.stream_ctxs[0].entered)
+        self.assertEqual(self.stream_ctxs[0].exit_args, (None, None, None))
+        self.assertCaptureStateClean()
+
+    def test_failing_capture_on_a_stream_still_reports_ITS_error(self):
+        """The unwinding path with a stream: the body's exception must reach
+        the caller, not a NameError raised while closing the stream context --
+        and the stream context must see the real triple."""
+        boom = RuntimeError("kernel launch failed")
+        graph = bcg.BreakableCUDAGraph()
+        with self.assertRaises(RuntimeError) as caught:
+            with self._capture(graph):
+                raise boom
+        self.assertIs(caught.exception, boom)
+        ctx = self.stream_ctxs[0]
+        self.assertIs(ctx.exit_args[0], RuntimeError)
+        self.assertIs(ctx.exit_args[1], boom)
+        self.assertCaptureStateClean()
+
+    def test_break_points_on_a_stream_capture_normally(self):
+        """A stream capture with graph breaks -- the shape real prefill capture
+        has -- produces the same segments as the streamless one."""
+
+        @bcg.eager_on_graph(True)
+        def eager_step():
+            return torch.zeros(1, device="cpu")
+
+        graph = bcg.BreakableCUDAGraph()
+        with self._capture(graph):
+            eager_step()
+        self.assertEqual(len(graph._segments), 2)
+        self.assertEqual(self.stream_ctxs[0].exit_args, (None, None, None))
         self.assertCaptureStateClean()
 
 
