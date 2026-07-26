@@ -478,6 +478,56 @@ def _tag_adaptive_int_workspace(wrapper, share_key=None):
     return wrapper
 
 
+def reject_silently_inert_dcp(
+    dcp_size: int,
+    *,
+    uneven_dcp: bool,
+    is_draft_worker: bool,
+) -> None:
+    """Refuse a --dcp-size that this backend would silently ignore.
+
+    Every DCP branch in FlashInferAttnBackend is gated on ``self.uneven_dcp``
+    (an installed --rank-tp-ratio plan with dcp_size == tp_size, i.e. the
+    replicated-KV token-sharded pool, or the weightless-KV fast lane). Upstream
+    flashinfer has NO DCP path at all -- the pre-fork file contains zero ``dcp``
+    references -- so with the predicate false the backend does not degrade to a
+    slower DCP, it runs stock full-KV attention: no token sharding, no owner
+    rule, no LSE merge, and no context-capacity gain. The user asked for
+    decode context parallelism and got plain TP.
+
+    Measured (Qwen3.5-2B, TP=2/DCP=2, SGLANG_UNEVEN_TOKEN_VECTOR=2,1, no
+    plan): boots green, output token-identical to TP=1, ZERO uneven-machinery
+    log lines. A configured-looking server doing nothing that was asked -- the
+    silent-no-op half of the same family as a silent wrong answer, and the
+    reason the token-vector-without-a-plan case was already made a hard reject
+    in resolve_cp_token_ratios.
+
+    THE DRAFT WORKER IS EXEMPT, BY DESIGN, NOT BY OVERSIGHT (M4): dcp_size is a
+    property of the parallel context, so an EAGLE/NEXTN draft runner sees
+    dcp_size > 1 too, and it deliberately does not token-shard its tiny 1-layer
+    full-context KV pool (it runs as a plain uneven-TP model). Its uneven_dcp
+    is forced False for that reason a few lines below, and rejecting it here
+    would refuse the validated MTP + uneven-DCP arm.
+
+    Pure function of the decision inputs so the rule is testable on CPU.
+    """
+    if dcp_size <= 1 or uneven_dcp or is_draft_worker:
+        return
+    raise ValueError(
+        f"--dcp-size {dcp_size} with --attention-backend flashinfer would be "
+        f"SILENTLY IGNORED: this backend's decode-context-parallel machinery "
+        f"is gated on the uneven-DCP replicated-KV geometry (a "
+        f"--rank-tp-ratio shard plan with dcp_size == tp_size, or "
+        f"--weightless-kv-fastlane), and neither is active here. Upstream "
+        f"flashinfer has no plain even-DCP path, so the server would boot, "
+        f"answer correctly, and give you exactly the plain-TP behaviour you "
+        f"would get without the flag -- no token sharding and no extra "
+        f"context capacity. Pass --rank-tp-ratio (uneven DCP), use "
+        f"--attention-backend triton, which implements the even-modulo DCP "
+        f"path, or drop --dcp-size."
+    )
+
+
 class FlashInferAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -556,6 +606,14 @@ class FlashInferAttnBackend(AttentionBackend):
         self.uneven_dcp = (
             uneven_dcp_kv_replicated(self.dcp_size) or self.weightless_kv
         ) and not getattr(model_runner, "is_draft_worker", False)
+        # A --dcp-size this backend would silently ignore is refused here
+        # rather than served as plain TP under a DCP-looking config. See
+        # reject_silently_inert_dcp (draft workers exempt by design).
+        reject_silently_inert_dcp(
+            self.dcp_size,
+            uneven_dcp=self.uneven_dcp,
+            is_draft_worker=bool(getattr(model_runner, "is_draft_worker", False)),
+        )
         # WEIGHTED owner rule (SGLANG_UNEVEN_DCP_WEIGHTED): a non-uniform token
         # vector is installed, so this rank owns the contiguous virtual-block
         # offset range [cp_lo, cp_hi) of every block of cp_S slots (instead of
