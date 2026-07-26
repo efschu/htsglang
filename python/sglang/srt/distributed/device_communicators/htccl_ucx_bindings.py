@@ -37,6 +37,7 @@ The offsets asserted at import time were dumped from UCX 1.16.0 headers.
 """
 
 import ctypes
+import functools
 import os
 import time
 
@@ -191,9 +192,14 @@ class UcxVersionMismatch(RuntimeError):
     """
 
 
+# ``UCS_PTR_IS_ERR`` threshold, precomputed. Every post compares against this,
+# so it is a module constant rather than a c_size_t round trip per call.
+_ERR_PTR_FLOOR = ctypes.c_size_t(UCS_ERR_LAST).value
+
+
 def _ptr_is_err(p: int) -> bool:
     """``UCS_PTR_IS_ERR`` -- error "pointers" are small negative status codes."""
-    return p >= (ctypes.c_size_t(UCS_ERR_LAST).value)
+    return p >= _ERR_PTR_FLOOR
 
 
 def _ptr_status(p: int) -> int:
@@ -431,6 +437,26 @@ class UcpWorker:
         self._param = _make_request_param()
         self._param_ref = ctypes.byref(self._param)
 
+        # Hot-path call targets bound once.
+        #
+        # A barrier on this link is ~12 us of which the wire is ~1.5 us; the
+        # rest is Python. `self.lib.lib.ucp_tag_send_nbx` is three attribute
+        # lookups and a bound-method frame per post, and the collectives issue
+        # two posts plus several progress calls each. Binding the ctypes
+        # function objects here removes that from every crossing. Measured
+        # against a bare `ucp_worker_progress` of 0.26 us, the lookups are not
+        # noise -- they are a comparable slice.
+        L = self.lib.lib
+        self._c_send = L.ucp_tag_send_nbx
+        self._c_recv = L.ucp_tag_recv_nbx
+        self._c_progress = L.ucp_worker_progress
+        self._c_check = L.ucp_request_check_status
+        self._c_free = L.ucp_request_free
+        # An attribute rather than a method, deliberately: the pipelined
+        # staging copies in the transport call this between sub-blocks, where
+        # a Python frame would cost more than the call it wraps.
+        self.progress = functools.partial(self._c_progress, self.worker)
+
     # -- address ------------------------------------------------------------
 
     def address(self) -> bytes:
@@ -476,21 +502,45 @@ class UcpWorker:
 
     # -- data path ----------------------------------------------------------
 
-    def progress(self) -> int:
-        return self.lib.lib.ucp_worker_progress(self.worker)
+    # `progress` is bound in __init__.
+    #
+    # The two posts below are written flat -- no helper call, no eagerly
+    # formatted description string -- because they are the per-collective hot
+    # path. The old shape built `f"tag_send(peer={peer}, tag={tag:#x})"` on
+    # EVERY post just to hand it to `_as_request`, which threw it away unless
+    # the post failed; a hex format plus a string build per crossing is real
+    # money at this scale. The message is now constructed only in the branch
+    # that raises. `_as_request` is kept for callers outside the hot path.
+    #
+    # The pointer is passed as a plain int: `argtypes` already declares
+    # `c_void_p`, so ctypes converts in C rather than us allocating a
+    # `c_void_p` object per post.
 
     def post_send(self, peer: int, ptr: int, nbytes: int, tag: int):
-        req = self.lib.lib.ucp_tag_send_nbx(
-            self._eps[peer], ctypes.c_void_p(ptr), nbytes, tag, self._param_ref
+        req = self._c_send(
+            self._eps[peer], ptr, nbytes, tag, self._param_ref
         )
-        return self._as_request(req, f"tag_send(peer={peer}, tag={tag:#x})")
+        if not req:
+            return None  # immediate completion
+        if req >= _ERR_PTR_FLOOR:
+            raise UcxError(
+                f"htccl ucx: tag_send(peer={peer}, tag={tag:#x}) failed: "
+                f"{self.lib.status_string(_ptr_status(req))}"
+            )
+        return req
 
     def post_recv(self, ptr: int, nbytes: int, tag: int):
-        req = self.lib.lib.ucp_tag_recv_nbx(
-            self.worker, ctypes.c_void_p(ptr), nbytes, tag,
-            _TAG_MASK_EXACT, self._param_ref,
+        req = self._c_recv(
+            self.worker, ptr, nbytes, tag, _TAG_MASK_EXACT, self._param_ref
         )
-        return self._as_request(req, f"tag_recv(tag={tag:#x})")
+        if not req:
+            return None
+        if req >= _ERR_PTR_FLOOR:
+            raise UcxError(
+                f"htccl ucx: tag_recv(tag={tag:#x}) failed: "
+                f"{self.lib.status_string(_ptr_status(req))}"
+            )
+        return req
 
     def _as_request(self, req, what: str):
         """Normalise a ``ucs_status_ptr_t`` into None (done) or a request."""
@@ -503,6 +553,12 @@ class UcpWorker:
             )
         return req
 
+    # How many spins pass between two clock reads in `wait`. The timeout it
+    # guards is measured in minutes, so reading the clock on every pass buys
+    # nothing and costs ~0.1 us of a ~0.7 us spin -- an eighth of the poll
+    # granularity that decides how promptly a completion is noticed.
+    _CLOCK_EVERY = 512
+
     def wait(self, requests: list) -> None:
         """Drive the worker until every outstanding request completes.
 
@@ -513,33 +569,66 @@ class UcpWorker:
         order.
         """
         pending = [r for r in requests if r is not None]
-        if not pending:
+        n = len(pending)
+        if n == 0:
             return
-        L = self.lib.lib
+        progress, check, free = self._c_progress, self._c_check, self._c_free
+        worker = self.worker
+        spins = 0
         deadline = time.monotonic() + self.timeout_s
+
+        if n == 1:
+            # The overwhelmingly common shape: a barrier, or a single-chunk
+            # exchange whose send completed inline. Spelling it out avoids
+            # rebuilding a one-element list on every pass of the spin -- which
+            # at ~0.7 us per pass is a visible share of the poll granularity.
+            req = pending[0]
+            while True:
+                progress(worker)
+                status = check(req)
+                if status != UCS_INPROGRESS:
+                    free(req)
+                    if status != UCS_OK:
+                        raise UcxError(
+                            f"htccl ucx: request failed: "
+                            f"{self.lib.status_string(status)}"
+                        )
+                    return
+                spins += 1
+                if not spins % self._CLOCK_EVERY and time.monotonic() > deadline:
+                    self._timeout(1)
+
         while pending:
-            L.ucp_worker_progress(self.worker)
+            progress(worker)
             still = []
             for req in pending:
-                status = L.ucp_request_check_status(req)
+                status = check(req)
                 if status == UCS_INPROGRESS:
                     still.append(req)
                     continue
-                L.ucp_request_free(req)
+                free(req)
                 if status != UCS_OK:
                     raise UcxError(
                         f"htccl ucx: request failed: "
                         f"{self.lib.status_string(status)}"
                     )
             pending = still
-            if pending and time.monotonic() > deadline:
-                raise UcxError(
-                    f"htccl ucx: {len(pending)} request(s) still pending after "
-                    f"{self.timeout_s:.0f}s. The peer is unreachable or the two "
-                    f"sides disagree about the collective sequence. Check "
-                    f"UCX_TLS / UCX_NET_DEVICES and that every rank issues the "
-                    f"same collectives in the same order."
-                )
+            spins += 1
+            if (
+                pending
+                and not spins % self._CLOCK_EVERY
+                and time.monotonic() > deadline
+            ):
+                self._timeout(len(pending))
+
+    def _timeout(self, n_pending: int) -> None:
+        raise UcxError(
+            f"htccl ucx: {n_pending} request(s) still pending after "
+            f"{self.timeout_s:.0f}s. The peer is unreachable or the two "
+            f"sides disagree about the collective sequence. Check "
+            f"UCX_TLS / UCX_NET_DEVICES and that every rank issues the "
+            f"same collectives in the same order."
+        )
 
     # -- teardown -----------------------------------------------------------
 
