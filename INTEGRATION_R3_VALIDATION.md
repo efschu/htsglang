@@ -1686,3 +1686,52 @@ larger relative win.
 fused GEMV, prefill / large M -> existing materialisation) with a byte/coherence
 gate, and the true dequant share on the pair via layer timing rather than the
 main-rig proxy.
+
+### #171 second-host validation: item 3 confirmed, item 1 FAILED and was refixed
+
+Run on the real gfx900 (Radeon RX Vega 64, ROCm 6.3, torch 2.7.1+rocm6.3) after
+syncing the #171 files (md5-verified, backup taken; the diff showed **no foreign
+changes** -- every remote-only line was the old code these fixes supersede).
+
+**Item 3, engagement -- CONFIRMED on the target.** The namespace collision is
+real and measured, not argued:
+
+```
+capability (AMD namespace)   = (9, 0)      <- same integer as Hopper
+fp8_native_gemm_available()  = False
+fp8_needs_dequant_fallback() = True
+  block_quant=True  -> use_block_dequant=True
+  block_quant=False -> use_dequant=True
+```
+
+**Item 1, bf16 fallback -- my own fix did NOT work here, and the GPU validation
+is what caught it.** `_needs_float16_fallback()` returned **False** on gfx900,
+i.e. bf16 was kept on a card that has none. Cause:
+
+```
+torch.cuda.is_bf16_supported()  = True     on a Vega 64
+bf16 matmul 2048^2  = 2.885 ms
+fp16 matmul 2048^2  = 1.785 ms             -> bf16 is 62% SLOWER
+```
+
+ROCm reports the DTYPE as usable -- which it is, by emulation -- and says
+nothing about hardware acceleration. The functional probe asked the wrong
+oracle. This was flagged as a risk when the fix was written ("ROCm's
+is_bf16_supported may report True broadly"); the target card turned the risk
+into a measured fact.
+
+**Refixed** to decide inside the AMD namespace, by gfx family
+(`_ROCM_ARCHS_WITHOUT_BF16`), with the suffix stripped (`gfx900:xnack-`) and
+only families measured/documented to lack bf16 listed -- an unknown or newer
+arch is deliberately left alone so no working card regresses on a guess.
+Re-verified on the card:
+
+```
+gcnArchName                = gfx900:xnack-
+is_bf16_supported()        = True          (unreliable, ignored)
+_needs_float16_fallback()  = True          <- fp16 now chosen automatically
+```
+
+So the second host's `--dtype float16` workaround can be dropped. 9 CPU tests
+pin it, including that an unknown arch is left alone and that CUDA never enters
+the AMD path.

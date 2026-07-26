@@ -297,6 +297,17 @@ logger = logging.getLogger(__name__)
 _UNSET: Any = object()
 
 
+# GCN5/Vega-class AMD parts have no bfloat16 units. ROCm still reports
+# is_bf16_supported() == True for them because the DTYPE works (by emulation),
+# so the arch family is the only honest signal. Measured on gfx900: bf16 matmul
+# 2.885 ms vs fp16 1.785 ms, i.e. 62% slower. Only families measured or
+# documented to lack bf16 are listed -- unknown/newer archs are deliberately
+# absent so a working card cannot regress on a guess.
+_ROCM_ARCHS_WITHOUT_BF16 = frozenset(
+    {"gfx900", "gfx902", "gfx904", "gfx906", "gfx909", "gfx90c"}
+)
+
+
 def _needs_float16_fallback() -> bool:
     """Does this device lack bfloat16, so the model must fall back to fp16?
 
@@ -317,16 +328,34 @@ def _needs_float16_fallback() -> bool:
     not move; that is the regression criterion.
     """
     if torch.version.hip is not None:
+        # NOT torch.cuda.is_bf16_supported(): MEASURED on a Radeon RX Vega 64
+        # (gfx900) it returns True, while a bf16 matmul is 2.885 ms against
+        # 1.785 ms for fp16 -- i.e. ROCm reports the DTYPE as usable (it is,
+        # by emulation) and says nothing about hardware acceleration. Trusting
+        # it kept bf16 on a card with no bf16 units, which is the exact bug
+        # this function exists to prevent, and it is why the second host had to
+        # pass --dtype float16 by hand.
+        #
+        # So the question is asked in the AMD namespace instead, by gfx family.
+        # Only families MEASURED to lack bf16 are listed; anything unknown or
+        # newer is left alone, so no working card can regress on a guess.
         try:
-            return not torch.cuda.is_bf16_supported()
+            arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
         except Exception as e:  # noqa: BLE001 - probe must never be fatal
             logger.warning(
-                "Could not probe bfloat16 support on this ROCm device (%s); "
-                "leaving the model dtype unchanged. If this card has no bf16, "
-                "pass --dtype float16 explicitly.",
+                "Could not read gcnArchName (%s); leaving the model dtype "
+                "unchanged. If this card has no bf16, pass --dtype float16.",
                 e,
             )
             return False
+        if arch in _ROCM_ARCHS_WITHOUT_BF16:
+            logger.info(
+                "%s has no bfloat16 hardware (torch reports is_bf16_supported()"
+                " = True, but that is emulation); selecting float16.",
+                arch,
+            )
+            return True
+        return False
     return torch.cuda.get_device_capability()[0] < 8
 
 
