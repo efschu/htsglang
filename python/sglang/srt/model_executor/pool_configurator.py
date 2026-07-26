@@ -474,9 +474,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             else model_config.get_num_kv_heads(tp_size)
         )
         self._full_per_token = (
-            _full_kv_heads
-            * (model_config.head_dim + model_config.v_head_dim)
-            * kv_size
+            _full_kv_heads * (model_config.head_dim + model_config.v_head_dim) * kv_size
         )
 
         # SWA layer per-token memory (bytes). NOT touched by the DCP lane: the

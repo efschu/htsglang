@@ -2399,9 +2399,7 @@ class ModelRunnerKVCacheMixin:
                     from sglang.srt.layers.dcp.owner import dcp_compact_pool_rows
 
                     _swa_S = cp_token_split_factor(self.dcp_size)
-                    _swa_ratio_r = get_cp_token_ratios()[
-                        get_parallel().attn_dcp_rank
-                    ]
+                    _swa_ratio_r = get_cp_token_ratios()[get_parallel().attn_dcp_rank]
                     _swa_full_size = dcp_compact_pool_rows(
                         self.full_max_total_num_tokens, _swa_S, _swa_ratio_r
                     )

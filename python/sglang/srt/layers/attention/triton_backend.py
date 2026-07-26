@@ -730,18 +730,13 @@ class TritonAttnBackend(AttentionBackend):
         # dispatches for the other. Configuration-only inputs, hence identical
         # on every rank -- which is what makes the per-layer dispatch built on it
         # safe to gate COLLECTIVES with.
+        _mc = model_runner.model_config
         self.swa_hybrid_dcp = swa_hybrid_dcp_lane(
             is_hybrid_swa=bool(getattr(model_runner, "is_hybrid_swa", False)),
             uneven_plan=self.uneven_dcp,
             is_draft_worker=self.is_draft_worker,
-            num_full_layers=len(
-                getattr(model_runner.model_config, "full_attention_layer_ids", None)
-                or []
-            ),
-            num_swa_layers=len(
-                getattr(model_runner.model_config, "swa_attention_layer_ids", None)
-                or []
-            ),
+            num_full_layers=len(getattr(_mc, "full_attention_layer_ids", None) or []),
+            num_swa_layers=len(getattr(_mc, "swa_attention_layer_ids", None) or []),
             swa_pool_sizing_capped=(
                 model_runner.server_args.swa_pool_sizing == "cap"
                 or bool(model_runner.server_args.disable_radix_cache)
