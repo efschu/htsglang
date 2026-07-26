@@ -834,5 +834,124 @@ class TestComputeDraftSoloRole(CustomTestCase):
         )
 
 
+class TestPrefillRunnerConstructorBarrier(CustomTestCase):
+    """#194 (collective family, 6th sighting): the PREFILL cuda-graph
+    runner's CONSTRUCTOR entered a TP-group barrier unconditionally.
+
+    Under --speculative-draft-placement solo only the host rank builds the
+    draft prefill runner (shadows return early from
+    EagleDraftWorker.init_cuda_graphs), so the host parked in a barrier no
+    other rank would ever enter. Measured: py-spy showed TP0 in
+    ``prefill_cuda_graph_runner.__init__ -> barrier`` and TP1 already in
+    ``_broadcast_reqs_across_ranks``; both GPUs 0 % for 17 minutes.
+
+    The contract pinned here is BALANCE, not "skip": across a group the set
+    of ranks entering a runner's capture barrier must be either ALL of them
+    or NONE -- never a strict subset.
+    """
+
+    @staticmethod
+    def _entered_ranks(tp_size, solo_rank, is_draft_worker):
+        """Replay one boot's group protocol; return the ranks that actually
+        entered the capture barrier."""
+        from sglang.srt.model_executor.runner.base_runner import (
+            enter_capture_group_barrier,
+        )
+
+        server_args = SimpleNamespace(
+            speculative_draft_placement=(
+                "solo" if solo_rank is not None else "split"
+            ),
+            speculative_draft_solo_rank=lambda: solo_rank,
+        )
+        entered = []
+        for rank in range(tp_size):
+            host, shadow = compute_draft_solo_role(
+                server_args, is_draft_worker, rank
+            )
+            if shadow:
+                # Shadow ranks never construct a draft prefill runner, so
+                # they never reach the barrier at all.
+                continue
+            model_runner = SimpleNamespace(
+                tp_group=SimpleNamespace(barrier=lambda r=rank: entered.append(r)),
+            )
+            if host:
+                # Set by EagleDraftWorker.__init__ on the solo host.
+                model_runner.spec_solo_rank_local_graphs = True
+            enter_capture_group_barrier(model_runner)
+        return entered
+
+    def test_solo_draft_runner_barrier_is_balanced(self):
+        # The host would be the ONLY entrant -> deadlock. Must be nobody.
+        self.assertEqual(
+            self._entered_ranks(tp_size=3, solo_rank=0, is_draft_worker=True),
+            [],
+        )
+
+    def test_split_draft_runner_keeps_the_barrier(self):
+        # Default placement: every rank builds the runner and must sync.
+        self.assertEqual(
+            self._entered_ranks(tp_size=3, solo_rank=None, is_draft_worker=True),
+            [0, 1, 2],
+        )
+
+    def test_target_runner_keeps_the_barrier_under_solo(self):
+        # Solo placement exempts the DRAFT runner only; the target path is
+        # untouched and stays fully collective.
+        self.assertEqual(
+            self._entered_ranks(tp_size=3, solo_rank=0, is_draft_worker=False),
+            [0, 1, 2],
+        )
+
+    def test_helper_reports_whether_it_entered(self):
+        from sglang.srt.model_executor.runner.base_runner import (
+            enter_capture_group_barrier,
+        )
+
+        calls = []
+        plain = SimpleNamespace(
+            tp_group=SimpleNamespace(barrier=lambda: calls.append(1))
+        )
+        self.assertTrue(enter_capture_group_barrier(plain))
+        rank_local = SimpleNamespace(
+            tp_group=SimpleNamespace(barrier=lambda: calls.append(2)),
+            spec_solo_rank_local_graphs=True,
+        )
+        self.assertFalse(enter_capture_group_barrier(rank_local))
+        self.assertEqual(calls, [1])
+
+    def test_no_direct_tp_group_barrier_in_runner_package(self):
+        """Family pin: every group barrier on a runner's construction /
+        capture path must go through ``enter_capture_group_barrier``. A new
+        runner copying the old unguarded
+        ``self.model_runner.tp_group.barrier()`` would reintroduce the solo
+        deadlock in a fresh place -- this is the 6th sighting of that
+        family."""
+        import sglang.srt.model_executor.runner as runner_pkg
+
+        runner_dir = Path(list(runner_pkg.__path__)[0])
+        offenders = []
+        for path in sorted(runner_dir.glob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            for m in re.finditer(r"\btp_group\.barrier\(\)", text):
+                # The one sanctioned call site is inside
+                # enter_capture_group_barrier, right under its guard.
+                before = text[: m.start()].rsplit("\n", 4)
+                if any(
+                    "spec_solo_rank_local_graphs" in line
+                    for line in before[-4:]
+                ):
+                    continue
+                line_no = text.count("\n", 0, m.start()) + 1
+                offenders.append(f"{path.name}:{line_no}")
+        self.assertEqual(
+            offenders,
+            [],
+            "Direct TP-group barrier(s) in the runner package; use "
+            f"enter_capture_group_barrier() instead: {offenders}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

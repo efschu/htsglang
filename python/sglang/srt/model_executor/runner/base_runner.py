@@ -60,6 +60,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def enter_capture_group_barrier(model_runner: ModelRunner) -> bool:
+    """Enter the TP-group barrier that separates a runner's construction /
+    warmup from its capture. Returns whether the barrier was entered.
+
+    THE INVARIANT: a group barrier is only legal when the set of ranks that
+    reach it is the WHOLE group. Every caller here sits on a path that is
+    rank-uniform by construction -- except one: under
+    ``--speculative-draft-placement solo`` only the solo HOST owns a real
+    draft runner (the shadow ranks get a stub from
+    ``install_shadow_draft_runner_surface`` and return early from
+    ``EagleDraftWorker.init_cuda_graphs``), so a barrier taken by the host's
+    draft runner waits on ranks that will never arrive.
+
+    ``spec_solo_rank_local_graphs`` -- set on the solo host's draft
+    ModelRunner at construction time, i.e. a boot-config property the whole
+    group agrees on -- declares exactly this: "this runner's graphs are
+    captured rank-locally". It already suppresses the capture backends'
+    per-warmup barrier (full / breakable / tc_piecewise) and the graph-plan
+    harmonisation's all_gather_object; the runner-level barriers are the
+    same category and take the same exemption.
+
+    MEASURED (#194, R3 validation window 3): with the barrier
+    unconditional, py-spy showed TP0 parked in
+    ``PrefillCudaGraphRunner.__init__ -> tp_group.barrier`` while TP1 was
+    already serving in ``_broadcast_reqs_across_ranks``; both GPUs 0 % util,
+    log frozen 17 minutes. Falsified as lane-specific: it reproduces with
+    the weightless-KV fast lane off.
+    """
+    if getattr(model_runner, "spec_solo_rank_local_graphs", False):
+        return False
+    model_runner.tp_group.barrier()
+    return True
+
+
 def _allocate_decode_buffers(
     *,
     device: torch.device,
@@ -580,7 +614,7 @@ class BaseRunner(ABC):
             return logits_output_or_pp_proxy_tensors
 
         torch.get_device_module(mr.device).synchronize()
-        mr.tp_group.barrier()
+        enter_capture_group_barrier(mr)
         with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
             with torch.inference_mode(), run_ctx or empty_context():
                 run_once()
