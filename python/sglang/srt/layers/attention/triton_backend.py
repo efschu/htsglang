@@ -17,7 +17,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dcp import (
-    cp_lse_ag_out_rs_mha,
+    cp_all_gather_heads_uneven,
+    cp_lse_ag_out_ar_mha_uneven,
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
 )
@@ -190,6 +191,65 @@ def _plan_aware_dcp_gathered_q_heads(model_config, dcp_size: int) -> int:
         for r in range(tp_size)
     )
     return per_rank_max * dcp_size
+
+
+def _plan_aware_dcp_group_q_head_counts(
+    model_config, dcp_size: int, local_heads: int
+) -> list:
+    """Per-rank q-head counts of THIS rank's DCP group, in rank order.
+
+    The DCP head collectives need the WHOLE group's per-rank counts, not just
+    this rank's: an all-gather along the head dim has to know how many heads
+    each peer contributes, and the LSE merge has to slice this rank's heads
+    back out of the gathered set by prefix sum. With an equal split both
+    reduce to ``H // world_size`` -- which is exactly why the assumption could
+    sit unstated in the code for so long.
+
+    ``local_heads`` is taken FROM THE MODEL (the q tensor actually handed to
+    the forward), not re-derived, and it is what the no-plan case replicates.
+    That keeps the default path a pure identity: whatever head count the layer
+    reports is the count every peer is assumed to have, byte-for-byte the
+    situation before this helper existed. Only with a --rank-tp-ratio plan
+    installed do the counts come from the partition helpers, and then
+    cp_all_gather_heads_uneven asserts counts[rank] == local_heads, so a model
+    whose reported per-rank head count disagrees with the plan fails loudly
+    at the first forward instead of issuing a mismatched collective.
+    """
+    from sglang.srt.distributed.utils import (
+        attn_q_partition_groups,
+        attn_q_partition_units,
+        tp_partition_size,
+        tp_plan_active,
+    )
+
+    if dcp_size <= 1:
+        return [local_heads]
+
+    tp_size = get_parallel().attn_tp_size
+    if not tp_plan_active(tp_size):
+        return [local_heads] * dcp_size
+
+    total_q = model_config.num_attention_heads
+    kv_bases = {model_config.get_total_num_kv_heads()}
+    swa_kv = getattr(model_config.hf_text_config, "swa_num_key_value_heads", None)
+    if swa_kv:
+        kv_bases.add(swa_kv)
+    # DCP groups are consecutive tp slices, so this rank's group is the
+    # dcp_size-wide block its tp rank falls into.
+    group_start = (get_parallel().attn_tp_rank // dcp_size) * dcp_size
+    return [
+        max(
+            tp_partition_size(
+                total_q,
+                tp_size,
+                r,
+                attn_q_partition_units(total_q, kv, tp_size),
+                groups=attn_q_partition_groups(kv, tp_size),
+            )
+            for kv in kv_bases
+        )
+        for r in range(group_start, group_start + dcp_size)
+    ]
 
 
 def reject_unsupported_dcp_geometry(
@@ -400,6 +460,9 @@ class TritonAttnBackend(AttentionBackend):
         self.num_head = _plan_aware_dcp_gathered_q_heads(
             model_runner.model_config, self.dcp_size
         )
+        # Kept for the DCP head collectives, which need the group's per-rank
+        # q-head counts and not just this rank's (_dcp_group_q_head_counts).
+        self.dcp_model_config = model_runner.model_config
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size
         )
@@ -1416,6 +1479,59 @@ class TritonAttnBackend(AttentionBackend):
     ):
         pass
 
+    def _dcp_group_q_head_counts(self, local_heads: int) -> list:
+        """This DCP group's per-rank q-head counts (see the module helper)."""
+        return _plan_aware_dcp_group_q_head_counts(
+            self.dcp_model_config, self.dcp_size, local_heads
+        )
+
+    def _dcp_gather_q_heads(self, q_local: torch.Tensor, group) -> torch.Tensor:
+        """All-gather the DCP group's q heads along dim=1.
+
+        Was a bare ``group.all_gather(x, dim=1)``, i.e. an EQUAL-SHAPE
+        collective whose precondition -- every rank of the group contributes
+        the same number of q heads -- lived nowhere but in the reader's head.
+        Under a --rank-tp-ratio plan the shards are unequal ([16,8,8] for
+        total_q=32/kv=8/tp=3), the ranks disagree on the collective's byte
+        count, and torch neither refuses nor repairs that: it hangs or returns
+        garbage in global head order. Routing through
+        cp_all_gather_heads_uneven makes the counts an explicit argument
+        (pad-to-max, gather, slice each rank's true count, concatenate in rank
+        order) and asserts this rank's count against the tensor it was handed.
+
+        Equal counts take that helper's documented fast path -- the same plain
+        collective as before -- so the reachable configurations are unchanged.
+        """
+        counts = self._dcp_group_q_head_counts(q_local.shape[1])
+        return cp_all_gather_heads_uneven(q_local, group, counts)
+
+    def _dcp_merge_q_heads(
+        self,
+        out: torch.Tensor,
+        lse: torch.Tensor,
+        group,
+        local_heads: int,
+        return_lse: bool = False,
+    ):
+        """LSE-merge the group's partial attention and slice this rank's heads.
+
+        Counterpart of _dcp_gather_q_heads: ``cp_lse_ag_out_rs_mha`` slices the
+        merged output with ``H // world_size * rank``, which silently picks the
+        WRONG heads the moment the shards are unequal (with [16,8,8] rank 1
+        would read heads 10:20 instead of 16:24, and heads 30 and 31 would be
+        dropped by every rank). The uneven variant slices by prefix sum over
+        the same counts; for an equal split the two expressions are the same
+        number.
+        """
+        counts = self._dcp_group_q_head_counts(local_heads)
+        assert sum(counts) == out.shape[1], (
+            f"DCP head merge: per-rank counts {counts} sum to {sum(counts)}, "
+            f"but the gathered attention output carries {out.shape[1]} heads"
+        )
+        return cp_lse_ag_out_ar_mha_uneven(
+            out, lse, group, counts, return_lse=return_lse
+        )
+
     def _set_kv_buffer(
         self,
         forward_batch: ForwardBatch,
@@ -1702,7 +1818,7 @@ class TritonAttnBackend(AttentionBackend):
 
         # Prefix KV is sharded across DCP ranks, so compute each rank's
         # partial attention with all gathered query heads and merge by LSE.
-        q_all = group.all_gather(q_local, dim=1).contiguous()
+        q_all = self._dcp_gather_q_heads(q_local, group).contiguous()
         total_heads = q_all.shape[1]
         prefix_out = torch.zeros(
             (total_tokens, total_heads, layer.v_head_dim),
@@ -1740,8 +1856,8 @@ class TritonAttnBackend(AttentionBackend):
             skip_extend=True,
         )
 
-        prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(
-            prefix_out, prefix_lse, group, return_lse=True
+        prefix_out, prefix_lse = self._dcp_merge_q_heads(
+            prefix_out, prefix_lse, group, layer.tp_q_head_num, return_lse=True
         )
         final_lse = torch.logaddexp(prefix_lse, current_lse)
         prefix_scale = torch.exp(prefix_lse - final_lse).unsqueeze(-1)
@@ -1968,7 +2084,9 @@ class TritonAttnBackend(AttentionBackend):
                 q_for_decode = q.view(
                     -1, layer.tp_q_head_num, layer.qk_head_dim
                 ).contiguous()
-            q_for_decode = group.all_gather(q_for_decode, dim=1).contiguous()
+            q_for_decode = self._dcp_gather_q_heads(
+                q_for_decode, group
+            ).contiguous()
             o_for_decode = torch.empty(
                 (q_for_decode.shape[0], q_for_decode.shape[1], layer.v_head_dim),
                 dtype=torch.float32,
@@ -1999,7 +2117,9 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
-            o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
+            o = self._dcp_merge_q_heads(
+                o_for_decode, local_lse, group, layer.tp_q_head_num
+            )
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
         self.decode_attention_fwd(
