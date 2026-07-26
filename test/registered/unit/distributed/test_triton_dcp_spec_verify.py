@@ -383,6 +383,73 @@ class TestTritonDcpSpecVerify(CustomTestCase):
                 expected = "tree" if reason is not None else "causal"
                 self.assertEqual(dcp_verify_mask_mode(topk, dflash), expected)
 
+    # ------------------------------------------------ 5. source pins
+
+    def test_the_verify_branch_forks_on_dcp_and_shares_the_builder(self):
+        """The wiring, in source form.
+
+        Three things must hold at once and each is a silent-wrongness bug on
+        its own: the verify branch must consult DCP at all (before #180 it was
+        the only forward mode in init_forward_metadata that did not), it must
+        go through the SHARED builder rather than a verify-private copy, and it
+        must feed it the committed lengths through dcp_verify_paged_lens.
+        """
+        import sglang.srt.layers.attention.triton_backend as tb
+
+        src = pathlib.Path(tb.__file__).read_text()
+        self.assertIn("dcp_verify_paged_lens(", src)
+        # the verify metadata build no longer reaches the full un-sharded
+        # builder while DCP is on
+        verify = src.split("is_target_verify():", 1)[1].split("        else:", 1)[0]
+        self.assertIn("self.dcp_size > 1", verify)
+        self.assertIn("self._dcp_kv_indices(", verify)
+        # and the tree predicate is never re-derived locally
+        self.assertNotIn("self.topk > 1", src)
+
+    def test_the_graph_twin_routes_through_the_stable_buffer(self):
+        """D3, for verify.
+
+        build_dcp_weighted_kv_indices returns a FRESH tensor; a captured graph
+        reads the address-stable cuda_graph_kv_indices whose pointer was frozen
+        at capture. Handing a replay a fresh tensor leaves the graph reading
+        whatever the buffer held at capture time -- a silently wrong verify
+        context, not a crash. So the verify buffer update must pass the buffer
+        in, exactly as the decode one does.
+        """
+        import sglang.srt.layers.attention.triton_backend as tb
+
+        src = pathlib.Path(tb.__file__).read_text()
+        body = src.split("def _update_target_verify_buffers(", 1)[1].split(
+            "\n    def ", 1
+        )[0]
+        self.assertIn("self.dcp_size > 1", body)
+        self.assertIn("self.cuda_graph_kv_indices", body)
+        self.assertIn("dcp_verify_paged_lens(", body)
+
+    def test_the_prefix_gate_answers_verify_before_anything_rank_local(self):
+        """Order matters, not just presence.
+
+        The gate's later sources (extend_prefix_lens, then kv_indices.numel())
+        are absent-or-rank-local for a verify batch, so the verify answer has to
+        come FIRST. A check placed after them would be dead code that still
+        reads as a fix.
+        """
+        import sglang.srt.layers.attention.triton_backend as tb
+
+        src = pathlib.Path(tb.__file__).read_text()
+        body = src.split("def _dcp_batch_has_prefix(", 1)[1].split("\n    def ", 1)[0]
+        code = body.split('"""', 2)[-1]
+        self.assertIn("is_target_verify()", code)
+        self.assertLess(
+            code.index("is_target_verify()"),
+            code.index("extend_prefix_lens"),
+            "the verify answer must precede every rank-local source",
+        )
+        self.assertLess(
+            code.index("is_target_verify()"),
+            code.index("kv_indices.numel()"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,9 @@
    #173 ported the weighted machinery over from flashinfer -- the SAME
    ``layers/dcp/owner.py`` functions on both sides -- so the lane is now
    SERVED, and this branch only refuses the parts of it with no Triton twin:
-   the weightless-KV fast lane, MLA, speculative decoding, sliding window.
+   the weightless-KV fast lane, MLA, TREE-masked speculative verify, sliding
+   window. (#180 ported flashinfer's M4 verify split, so CHAIN speculative
+   decoding -- ``--speculative-eagle-topk 1`` -- left that list.)
 
    The replication arithmetic of branch 3 deliberately does not run here: the
    pool rows carry every kv head by construction under this lane.
@@ -47,6 +49,7 @@ def _call(
     swa=None,
     mla=False,
     spec=False,
+    spec_tree=False,
     window=False,
 ):
     reject_unsupported_dcp_geometry(
@@ -59,6 +62,7 @@ def _call(
         swa_kv_heads=swa,
         mla=mla,
         speculative=spec,
+        speculative_tree=spec_tree,
         sliding_window=window,
     )
 
@@ -104,7 +108,7 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
         for kwargs, fragment in (
             ({"weightless": True}, "weightless-KV fast lane"),
             ({"mla": True}, "MLA"),
-            ({"spec": True}, "speculative decoding"),
+            ({"spec": True, "spec_tree": True}, "TREE-masked speculative verify"),
             ({"window": True}, "sliding window"),
         ):
             with self.subTest(**kwargs):
@@ -113,13 +117,61 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
                     _call(3, 3, 2, plan=True, tokens=True, **kwargs)
                 self.assertIn(fragment, str(ctx.exception))
 
+    def test_chain_speculative_decoding_is_now_served(self):
+        """THE acceptance case for #180.
+
+        Before it, ANY speculative decoding was refused on this lane because
+        Triton's target-verify built FULL un-sharded kv indices. The M4 verify
+        split closes that, but only for a CHAIN draft: at topk == 1 the
+        draft->draft mask IS the causal mask, so it can be dropped, which an
+        owner-sharded prefix requires (the mask's row stride is the GLOBAL
+        prefix length).
+
+        So speculative=True alone must now pass -- on both sub-lanes, kv < tp
+        (replicated kv heads, the 27B/35B Nordstern case) and kv >= tp.
+        """
+        _call(3, 3, 2, plan=True, tokens=True, spec=True)
+        _call(3, 3, 8, plan=True, tokens=True, spec=True)
+        # and with the even-modulo rule inside the same lane
+        _call(3, 3, 2, plan=True, tokens=False, spec=True)
+
+    def test_only_the_tree_half_of_speculation_is_refused(self):
+        """The narrowing must be exactly one predicate wide.
+
+        ``speculative_tree`` without ``speculative`` is not a real config and
+        must not manufacture a refusal on its own; ``speculative`` without the
+        tree is the served chain; both together is the refusal, and the message
+        has to point at the actionable flag rather than at speculation as such.
+        """
+        _call(3, 3, 2, plan=True, tokens=True, spec_tree=True)  # incoherent: inert
+        _call(3, 3, 2, plan=True, tokens=True, spec=True)  # chain: served
+        with self.assertRaises(ValueError) as ctx:
+            _call(3, 3, 2, plan=True, tokens=True, spec=True, spec_tree=True)
+        msg = str(ctx.exception)
+        self.assertIn("--speculative-eagle-topk 1", msg)
+        self.assertIn("#76", msg)
+
     def test_the_lane_names_every_unserved_feature_at_once(self):
         """A config that trips several must name all of them, so the operator
         does not drop one and re-run into the next."""
         with self.assertRaises(ValueError) as ctx:
-            _call(3, 3, 2, plan=True, tokens=True, weightless=True, mla=True, spec=True)
+            _call(
+                3,
+                3,
+                2,
+                plan=True,
+                tokens=True,
+                weightless=True,
+                mla=True,
+                spec=True,
+                spec_tree=True,
+            )
         msg = str(ctx.exception)
-        for fragment in ("weightless-KV fast lane", "MLA", "speculative decoding"):
+        for fragment in (
+            "weightless-KV fast lane",
+            "MLA",
+            "TREE-masked speculative verify",
+        ):
             self.assertIn(fragment, msg)
 
     def test_a_token_vector_without_a_plan_is_still_refused(self):
@@ -261,6 +313,14 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
         self.assertIn("mla=self.use_mla", src)
         self.assertIn("speculative=", src)
         self.assertIn("sliding_window=", src)
+        # #180: the tree predicate is decided by the SHARED helper, never
+        # re-derived at the call site. dcp_verify_mask_mode knows about both
+        # doors onto a tree mask (topk > 1 and --speculative-dflash-tree-
+        # verify); a local `self.topk > 1` here would silently reopen the
+        # second one, which is exactly how it was missed the first time.
+        self.assertIn("speculative_tree=", src)
+        self.assertIn("dcp_verify_mask_mode(", src)
+        self.assertNotIn("speculative_tree=bool(self.topk", src)
 
 
 if __name__ == "__main__":
