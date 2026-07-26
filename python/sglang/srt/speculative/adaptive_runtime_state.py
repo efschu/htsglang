@@ -46,6 +46,16 @@ class SpecRuntimeState:
     draft_extend_attn_backend: "AttentionBackend | None"
     cuda_graph_runner_for_draft_extend: "EAGLEDraftExtendCudaGraphRunner | None"
 
+    # Multi-layer EAGLE (#138) only: that worker runs ONE DRAFT MODEL PER CHAIN
+    # POSITION, so its draft-extend stage owns a LIST of backends (one per step)
+    # instead of a single one -- see MultiLayerEagleDraftWorker.init_attention_backend.
+    # Declared here rather than in a subclass so assert_runtime_state_isolation
+    # walks these backends too: without it the M16/#50 identity check would pass
+    # while per-step backends 1..k-1 alias across rungs, which is exactly the
+    # stale-buffer corruption class the check exists to catch. None (the default)
+    # keeps every single-backend worker's construction site unchanged.
+    draft_extend_attn_backend_list: "list | None" = None
+
 
 _WORKSPACE_ATTRS = ("workspace_buffer", "full_cg_prefill_workspace_buffer")
 
@@ -53,15 +63,15 @@ _WORKSPACE_ATTRS = ("workspace_buffer", "full_cg_prefill_workspace_buffer")
 def _iter_state_backends(state: SpecRuntimeState):
     """Yield (role, backend) for every attention backend of *state*,
     unwrapping hybrid prefill/decode wrappers into their leaf backends."""
-    stack = [
-        (role, backend)
-        for role, backend in (
-            ("draft", state.draft_attn_backend),
-            ("target", state.target_attn_backend),
-            ("draft_extend", state.draft_extend_attn_backend),
-        )
-        if backend is not None
+    roles = [
+        ("draft", state.draft_attn_backend),
+        ("target", state.target_attn_backend),
+        ("draft_extend", state.draft_extend_attn_backend),
     ]
+    # Multi-layer EAGLE's per-step draft-extend backends (see the dataclass field).
+    for i, backend in enumerate(state.draft_extend_attn_backend_list or ()):
+        roles.append((f"draft_extend[{i}]", backend))
+    stack = [(role, backend) for role, backend in roles if backend is not None]
     while stack:
         role, backend = stack.pop()
         yield role, backend

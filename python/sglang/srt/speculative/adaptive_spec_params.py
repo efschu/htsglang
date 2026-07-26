@@ -85,6 +85,48 @@ FROZEN_MTP_DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
 }
 
 
+# Multi-layer EAGLE default (#138). Shares the frozen-MTP shape (every candidate
+# step >= 1) for the same structural reason, plus one of its own:
+# 1. There is no step-0 (nospec) branch: MultiLayerEagleDraftWorker.draft_forward
+#    builds the chain by slicing k columns out of the carried draft state, and
+#    _draft_extend_for_decode would loop range(0) and torch.cat([]) at k=0.
+#    MultiLayerEagleWorkerV2._assert_adaptive_supported hard-rejects step < 1.
+# 2. The ceiling is 3 because EVERY rung costs a real MTP LAYER's weights, not
+#    just a captured graph set: multi-layer EAGLE loads one draft ModelRunner
+#    per chain position (tp_worker._init_multi_layer_eagle_model_runners), so
+#    max(candidate_steps) determines how many draft layers are resident, and the
+#    draft checkpoint must actually contain that many. Ceiling 3 matches what
+#    _auto_choose_speculative_params picks for the multi-layer architectures
+#    (MiMoV2*: steps 3 / topk 1 / draft 4), so the default adaptive ladder loads
+#    exactly as many layers as the default STATIC config -- zero extra weight
+#    VRAM at the default shape.
+MULTI_LAYER_EAGLE_DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
+    "1": {
+        "candidate_steps": [1, 2, 3],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": -0.25,
+        "ceiling_coeff": 0,
+    },
+    "8": {
+        "candidate_steps": [1, 2],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+    "32": {
+        "candidate_steps": [1],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+}
+
+# Derived algorithm key for multi-layer EAGLE. NOT a --speculative-algorithm
+# value: multi-layer EAGLE is "EAGLE" plus --enable-multi-layer-eagle. Use
+# adaptive_algorithm_key() so every resolver call site agrees.
+MULTI_LAYER_EAGLE_ALGO_KEY = "MULTI_LAYER_EAGLE"
+
+
 # Built-in profile for high-predictability workloads (per-position accept
 # probability p >~ 0.85: code boilerplate, structured/tabular emission, ...).
 # Adds k=4/5 ladder rungs: with graph-memory OFFLOAD (#93) an extra rung
@@ -137,7 +179,26 @@ def default_adaptive_config_for(algorithm: str | None) -> dict[str, dict]:
     """
     if algorithm == "FROZEN_KV_MTP":
         return FROZEN_MTP_DEFAULT_ADAPTIVE_CONFIG
+    if algorithm == MULTI_LAYER_EAGLE_ALGO_KEY:
+        return MULTI_LAYER_EAGLE_DEFAULT_ADAPTIVE_CONFIG
     return DEFAULT_ADAPTIVE_CONFIG
+
+
+def adaptive_algorithm_key(server_args: ServerArgs) -> str | None:
+    """The algorithm key the adaptive config resolvers should be called with.
+
+    Multi-layer EAGLE (#138) is not a --speculative-algorithm value but
+    "EAGLE" + --enable-multi-layer-eagle, and it needs its own default config
+    (no step-0 rung, ceiling bounded by the loaded MTP layer count). Routing
+    every call site -- server_args buffer sizing, the speculative-hook param
+    init, and the worker -- through this helper is what keeps them from
+    disagreeing about which default applies.
+    """
+    from sglang.srt.arg_groups.overrides import resolved_view
+
+    if resolved_view(server_args).enable_multi_layer_eagle:
+        return MULTI_LAYER_EAGLE_ALGO_KEY
+    return server_args.speculative_algorithm
 
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
@@ -162,11 +223,12 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             "enable_dp_attention=True is not supported "
             "(adaptive tier decisions are not synchronized across DP ranks)"
         )
-    if resolved_view(server_args).enable_multi_layer_eagle:
-        return (
-            "enable_multi_layer_eagle=True is not supported "
-            "(MultiLayerEagleWorkerV2 does not implement adaptive)"
-        )
+    # enable_multi_layer_eagle used to be rejected here ("MultiLayerEagleWorkerV2
+    # does not implement adaptive"). It does now (#138): the worker implements the
+    # AdaptiveSpecWorker protocol, the ladder ceiling is bounded by the loaded MTP
+    # layer count, and MultiLayerEagleWorkerV2._assert_adaptive_supported enforces
+    # the multi-layer-specific constraints (candidate steps >= 1, ceiling <=
+    # num_nextn_predict_layers) with a hard error instead of a silent fallback.
     if server_args.enable_two_batch_overlap:
         return (
             "enable_two_batch_overlap=True is not supported "

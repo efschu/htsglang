@@ -14,6 +14,7 @@
 
 import contextlib
 import logging
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -23,7 +24,11 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
 )
-from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
@@ -41,7 +46,16 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
 )
+from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+)
+from sglang.srt.speculative.adaptive_spec_params import (
+    adaptive_algorithm_key,
+    adaptive_unsupported_reason,
+)
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
@@ -60,7 +74,10 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.multi_layer_eagle_utils import rotate_input_ids
+from sglang.srt.speculative.multi_layer_eagle_utils import (
+    adapt_draft_state_width,
+    rotate_input_ids,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -75,7 +92,12 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
-from sglang.srt.utils.common import empty_context, fast_topk
+from sglang.srt.utils.common import (
+    empty_context,
+    fast_topk,
+    get_available_gpu_memory,
+    log_info_on_rank0,
+)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -147,9 +169,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             server_args.speculative_algorithm
         )
 
-        # Set constant
+        # Set constant. ALLOC_LEN_PER_DECODE is a CLASS-level global, so under
+        # adaptive draft length (#138) it must be sized for the LARGEST rung the
+        # ladder can reach, not for the initial one -- a later upshift would
+        # otherwise under-allocate the per-decode KV window.
+        alloc_steps = max(
+            self.speculative_num_steps,
+            server_args.adaptive_max_candidate_steps or 0,
+        )
         EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
-            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
+            alloc_steps * self.topk, alloc_steps + 1
         )
 
         # Load draft model weights only.
@@ -218,9 +247,13 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
     def init_lm_head(self):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-        # Share the embedding and lm_head
-        for i in range(self.speculative_num_steps):
-            self.draft_runner_list[i].model.set_embed_and_head(embed, head)
+        # Share the embedding and lm_head with EVERY LOADED draft runner, not
+        # just the first `speculative_num_steps` of them: under adaptive draft
+        # length (#138) the boot k is only the INITIAL rung, while the loaded
+        # runner count is the ladder ceiling. Runners above the initial rung
+        # would otherwise never get the target's embed/head.
+        for runner in self.draft_runner_list:
+            runner.model.set_embed_and_head(embed, head)
 
     def init_attention_backend(self):
         # Create attn backends
@@ -261,6 +294,22 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
+        # Adaptive draft length (#138): the chain columns in `draft_input` were
+        # produced at the END of the previous round, at the k that was active
+        # then. A k switch lands between rounds, so bring the carried columns to
+        # the active width first (slice on downshift, repeat-last on upshift --
+        # see adapt_draft_columns for why padding cannot break correctness).
+        # No-op (one integer compare) whenever the width already matches, which
+        # is every round except the first one after a switch.
+        #
+        # UNCONDITIONAL, including on idle batches: draft_forward() runs BEFORE
+        # the is_idle() early-return below and indexes the carried columns up to
+        # speculative_num_steps, so an idle rank that skipped the adaptation
+        # would index out of bounds after an upshift. It is also the
+        # rank-uniformity rule ([[rank-lokaler-test-vor-kollektiv]]): the k a
+        # rank drafts at must never depend on a rank-local condition such as
+        # "is my slice of this batch empty".
+        adapt_draft_state_width(draft_input, self.speculative_num_steps, self.topk)
         forward_batch, can_cuda_graph = self.prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
@@ -699,6 +748,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             context_length=target_worker.model_runner.model_config.context_len,
         )
 
+        # BEFORE building the draft worker: that constructor loads one MTP
+        # layer's weights per ladder rung, so an unsupported adaptive config
+        # must be rejected while the failure is still cheap and legible.
+        if server_args.speculative_adaptive:
+            self._assert_adaptive_supported(server_args)
+
         self._draft_worker = MultiLayerEagleDraftWorker(
             server_args,
             gpu_id,
@@ -710,6 +765,16 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             nccl_port,
             target_worker,
         )
+
+        # Adaptive speculative (#138). Same shape as EAGLEWorkerV2 /
+        # FrozenKVMTPWorkerV2: OFF unless --speculative-adaptive is passed.
+        self.adaptive_controller: Optional[AdaptiveController] = None
+        if server_args.speculative_adaptive:
+            self.adaptive_controller = AdaptiveController(
+                self,
+                config_path=server_args.speculative_adaptive_config,
+                algorithm=adaptive_algorithm_key(server_args),
+            )
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -736,6 +801,41 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         self._draft_worker.init_cuda_graphs()
+        # Build the adaptive ladder once target and draft backends exist. Every
+        # candidate k gets a fully pre-captured graph set here; nothing is ever
+        # re-captured at runtime (see MultiLayerEagleWorkerV2 adaptive notes).
+        if self.adaptive_controller is not None:
+            dw = self._draft_worker
+            with (
+                dw.draft_tp_context(dw.draft_runner_list[0].tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
+                self.adaptive_controller.register(
+                    SpecRuntimeState(
+                        speculative_num_steps=self.speculative_num_steps,
+                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                        # This worker never builds a draft-DECODE graph or
+                        # backend: draft() runs no model (all k draft forwards
+                        # happen in the draft-EXTEND stage of the prior round).
+                        draft_attn_backend=None,
+                        cuda_graph_runner=None,
+                        target_attn_backend=self._target_worker.model_runner.attn_backend,
+                        target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
+                        draft_extend_attn_backend=None,
+                        cuda_graph_runner_for_draft_extend=dw.cuda_graph_runner_for_draft_extend,
+                        draft_extend_attn_backend_list=list(
+                            dw.draft_extend_attn_backend_list
+                        ),
+                    )
+                )
+                self.adaptive_controller.init_states(
+                    cuda_graph_bs=(
+                        None
+                        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+                        else self.server_args.cuda_graph_bs_decode
+                    ),
+                )
 
     @property
     def target_worker(self):
@@ -761,6 +861,259 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
+
+    # -- Adaptive speculative decoding (#138) --
+    #
+    # Multi-layer EAGLE differs from EAGLE in one structural way that shapes all
+    # of the code below: it runs ONE DRAFT MODEL PER CHAIN POSITION
+    # (tp_worker._init_multi_layer_eagle_model_runners loads one ModelRunner per
+    # step, each holding a different MTP layer of the draft checkpoint). So k
+    # cannot grow past the number of LOADED layers -- it can only select a
+    # prefix of them. Boot therefore loads max(candidate_steps) layers and every
+    # rung uses draft_runner_list[:k]. Contrast EAGLE, where one draft model is
+    # rolled out k times and growth is free.
+
+    def _assert_adaptive_supported(self, server_args: ServerArgs) -> None:
+        reason = adaptive_unsupported_reason(server_args)
+        if reason is not None:
+            raise ValueError(
+                "Multi-layer EAGLE cannot enable adaptive speculative "
+                f"decoding: {reason}"
+            )
+        from sglang.srt.speculative.adaptive_spec_params import (
+            resolve_candidate_steps_from_config,
+        )
+
+        candidate_steps = resolve_candidate_steps_from_config(
+            cfg_path=server_args.speculative_adaptive_config,
+            algorithm=adaptive_algorithm_key(server_args),
+        )
+        if any(s < 1 for s in candidate_steps):
+            raise ValueError(
+                "Multi-layer EAGLE adaptive speculative decoding supports only "
+                f"candidate steps >= 1, but the config resolves to {candidate_steps}. "
+                "Step 0 (nospec) has no branch in this worker: draft() builds the "
+                "chain by slicing k columns out of the carried draft state, and the "
+                "draft-extend loop would produce none. Pass "
+                '--speculative-adaptive-config with candidate_steps >= 1 (e.g. '
+                '{"1": {"candidate_steps": [1, 2, 3]}}).'
+            )
+        # The remaining multi-layer constraint -- the ladder ceiling is a WEIGHT
+        # budget, so rung k needs MTP layers 0..k-1 to EXIST in the draft
+        # checkpoint -- is enforced in
+        # TpModelWorker._num_multi_layer_eagle_draft_runners, which is where the
+        # draft model config is first available and where the layers would
+        # otherwise be loaded (a bad ceiling must fail before the weight load,
+        # not as a missing-parameter error deep inside it).
+
+    def build_adaptive_runtime_state(
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs=None,
+    ) -> SpecRuntimeState:
+        """Build a fully captured SpecRuntimeState for one candidate k."""
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        dw = self._draft_worker
+
+        with self._override_worker_state(
+            speculative_num_steps,
+            speculative_num_draft_tokens,
+            cuda_graph_bs=cuda_graph_bs,
+        ):
+            # Fresh per-step draft-extend backends + a fresh composite graph
+            # runner. Both MUST be rebuilt per rung: the composite's shared
+            # buffer window is speculative_num_draft_tokens wide and it holds
+            # exactly `speculative_num_steps` per-step graphs, so nothing can be
+            # shared across rungs (M16/#50 isolation, enforced by
+            # assert_runtime_state_isolation over draft_extend_attn_backend_list).
+            dw.init_attention_backend()
+            dw._capture_cuda_graphs()
+
+            target_model_runner = self._target_worker.model_runner
+            backup_init = target_model_runner.init_new_workspace
+            try:
+                target_attn_backend = target_model_runner._get_attention_backend(
+                    init_new_workspace=True
+                )
+            finally:
+                target_model_runner.init_new_workspace = backup_init
+
+            target_graph_runner = None
+            if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+                TargetGraphRunnerCls = (
+                    NPUGraphRunner if _is_npu else DecodeCudaGraphRunner
+                )
+                target_graph_runner = TargetGraphRunnerCls(
+                    target_model_runner,
+                    attn_backend=target_attn_backend,
+                    speculative_num_steps=speculative_num_steps,
+                    speculative_num_draft_tokens=speculative_num_draft_tokens,
+                )
+
+            state = SpecRuntimeState(
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                draft_attn_backend=None,
+                cuda_graph_runner=None,
+                target_attn_backend=target_attn_backend,
+                target_graph_runner=target_graph_runner,
+                draft_extend_attn_backend=None,
+                cuda_graph_runner_for_draft_extend=dw.cuda_graph_runner_for_draft_extend,
+                draft_extend_attn_backend_list=list(dw.draft_extend_attn_backend_list),
+            )
+
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        log_info_on_rank0(
+            logger,
+            f"Built multi-layer EAGLE adaptive runtime state "
+            f"steps={speculative_num_steps}: "
+            f"elapsed={time.perf_counter() - tic:.2f}s, "
+            f"mem={(before_mem - after_mem):.2f}GB",
+        )
+        return state
+
+    def apply_runtime_state(self, state: SpecRuntimeState) -> None:
+        """Point the worker at a pre-built runtime state (pure pointer swap)."""
+        if self.speculative_num_steps == state.speculative_num_steps:
+            return
+
+        log_info_on_rank0(
+            logger,
+            "Switch multi-layer EAGLE adaptive runtime state: "
+            f"steps {self.speculative_num_steps} -> {state.speculative_num_steps}, "
+            f"draft_tokens {self.speculative_num_draft_tokens} -> "
+            f"{state.speculative_num_draft_tokens}",
+        )
+
+        self.speculative_num_steps = state.speculative_num_steps
+        self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+
+        dw = self._draft_worker
+        dw.speculative_num_steps = state.speculative_num_steps
+        dw.speculative_num_draft_tokens = state.speculative_num_draft_tokens
+        dw.cuda_graph_runner_for_draft_extend = state.cuda_graph_runner_for_draft_extend
+        self._bind_draft_extend_backends(state.draft_extend_attn_backend_list)
+
+        self._target_worker.model_runner.attn_backend = state.target_attn_backend
+        self._target_worker.model_runner.decode_cuda_graph_runner = (
+            state.target_graph_runner
+        )
+
+        self.server_args.override(
+            "adaptive_spec.restore",
+            speculative_num_steps=state.speculative_num_steps,
+            speculative_num_draft_tokens=state.speculative_num_draft_tokens,
+        )
+
+    def _bind_draft_extend_backends(self, backend_list) -> None:
+        """Install a rung's per-step draft-extend backends.
+
+        Mirrors MultiLayerEagleDraftWorker.init_attention_backend: the per-step
+        draft forward reads draft_runner_list[step].attn_backend, so the runner
+        rebind must travel with the list. Runners above the active rung keep
+        whatever they had -- they are not touched by a k-step draft round.
+        """
+        if backend_list is None:
+            # A state built with graphs/backends disabled carries no list;
+            # clearing the live one would strand the draft runners.
+            return
+        dw = self._draft_worker
+        dw.draft_extend_attn_backend_list = list(backend_list)
+        for step, backend in enumerate(dw.draft_extend_attn_backend_list):
+            if backend is not None:
+                dw.draft_runner_list[step].attn_backend = backend
+
+    @contextlib.contextmanager
+    def _override_worker_state(
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: "list[int] | None" = None,
+    ):
+        """Temporarily point server_args + worker at a target k for capture.
+
+        server_args is part of the contract, not a convenience: the per-step
+        draft-extend graph runner reads speculative_num_steps /
+        speculative_num_draft_tokens / speculative_eagle_topk straight off
+        model_runner.server_args, so mutating worker attributes alone would
+        capture every rung at the boot geometry.
+        """
+        sa = self.server_args
+        dw = self._draft_worker
+        backup = (
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+            dw.speculative_num_steps,
+            dw.speculative_num_draft_tokens,
+            list(dw.draft_extend_attn_backend_list),
+            [runner.attn_backend for runner in dw.draft_runner_list],
+            dw.cuda_graph_runner,
+            dw.cuda_graph_runner_for_draft_extend,
+            sa.speculative_num_steps,
+            sa.speculative_num_draft_tokens,
+            sa.cuda_graph_bs_decode,
+            sa.disable_cuda_graph,
+        )
+
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
+        dw.speculative_num_steps = speculative_num_steps
+        dw.speculative_num_draft_tokens = speculative_num_draft_tokens
+        sa.override(
+            "adaptive_spec.capture_override",
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
+        if cuda_graph_bs is not None:
+            # A rung no BS range can reach gets an empty pruned list; capture
+            # nothing for it rather than capturing the full bs sweep.
+            sa.override(
+                "adaptive_spec.capture_override",
+                cuda_graph_bs_decode=cuda_graph_bs,
+                **({"disable_cuda_graph": True} if not cuda_graph_bs else {}),
+            )
+
+        try:
+            yield
+        finally:
+            (
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                dw.speculative_num_steps,
+                dw.speculative_num_draft_tokens,
+                dw.draft_extend_attn_backend_list,
+                restored_runner_backends,
+                dw.cuda_graph_runner,
+                dw.cuda_graph_runner_for_draft_extend,
+            ) = backup[:8]
+            for runner, backend in zip(dw.draft_runner_list, restored_runner_backends):
+                runner.attn_backend = backend
+            sa.override(
+                "adaptive_spec.capture_restore",
+                speculative_num_steps=backup[8],
+                speculative_num_draft_tokens=backup[9],
+                cuda_graph_bs_decode=backup[10],
+                disable_cuda_graph=backup[11],
+            )
+
+    def on_verify_complete_cpu(
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        steps: int | None = None,
+    ) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.on_verify_complete(
+                num_correct_drafts_per_req,
+                batch_size=batch_size,
+                result_steps=steps,
+            )
+
+    def activate_step_by_batch(self, batch_size: int) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.activate_step_by_batch(batch_size)
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -789,6 +1142,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             )
             return batch_output
         else:
+            # Adaptive: pick this round's k BEFORE drafting, so draft / verify /
+            # draft-extend of the round all run on one rung's graph set. The
+            # batch size is rank-identical, and the k decision it routes to was
+            # itself derived from the rank-0-broadcast accept counts, so every
+            # TP rank activates the same rung on the same round.
+            self.activate_step_by_batch(batch.seq_lens.shape[0])
             if batch.spec_info is None:
                 capture_mode = (
                     CaptureHiddenMode.NULL
@@ -918,10 +1277,11 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        for i in range(self.speculative_num_steps):
-            success, message = self._draft_worker.draft_runner_list[
-                i
-            ].update_weights_from_disk(
+        # Every LOADED draft runner, not just the active rung's prefix: under
+        # adaptive draft length the ladder ceiling exceeds the active k, and a
+        # skipped runner would keep stale weights until the next upshift.
+        for runner in self._draft_worker.draft_runner_list:
+            success, message = runner.update_weights_from_disk(
                 recv_req.model_path,
                 recv_req.load_format,
                 recapture_cuda_graph=recv_req.recapture_cuda_graph,
@@ -931,10 +1291,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         return True, "Succeeded to update model weights."
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        for i in range(self.speculative_num_steps):
-            success, message = self._draft_worker.draft_runner_list[
-                i
-            ].update_weights_from_ipc(recv_req)
+        for runner in self._draft_worker.draft_runner_list:
+            success, message = runner.update_weights_from_ipc(recv_req)
             if not success:
                 return success, message
         return True, "Succeeded to update model weights."

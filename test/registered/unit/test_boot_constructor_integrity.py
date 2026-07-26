@@ -129,6 +129,18 @@ _LOAD_BEARING_INIT_ATTRS = (
         ),
     ),
     (
+        "speculative/multi_layer_eagle_worker_v2.py",
+        "MultiLayerEagleWorkerV2",
+        (
+            "_draft_worker",
+            "adaptive_controller",
+            "num_new_pages_per_topk",
+            "extend_lens",
+            "plan_stream",
+            "plan_stream_ctx",
+        ),
+    ),
+    (
         "speculative/frozen_kv_mtp_worker_v2.py",
         "FrozenKVMTPDraftWorker",
         (

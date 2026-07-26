@@ -73,14 +73,17 @@ class EagerRunner(BaseRunner):
             # speculative_adaptive can grow draft tokens at runtime; size to the max.
             num_draft_tokens = sa.max_speculative_num_draft_tokens or 1
             if mr.is_draft_worker:
+                # Multi-layer EAGLE term: sized to the LADDER CEILING, not the
+                # boot k -- adaptive draft length can upshift at runtime and the
+                # pool is allocated once (#138).
+                multi_layer_steps = max(
+                    sa.speculative_num_steps or 0,
+                    sa.adaptive_max_candidate_steps or 0,
+                )
                 num_tokens_per_bs = max(
                     sa.speculative_eagle_topk or 1,
                     num_draft_tokens,
-                    (
-                        2 * (sa.speculative_num_steps or 0)
-                        if sa.enable_multi_layer_eagle
-                        else 0
-                    ),
+                    2 * multi_layer_steps if sa.enable_multi_layer_eagle else 0,
                 )
             else:
                 num_tokens_per_bs = (
