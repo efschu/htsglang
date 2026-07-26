@@ -118,7 +118,7 @@ class TestBreakFailureIsReported(BreakableCaptureTestBase):
         with mock.patch.object(bcg, "_weak_ref_if_tensor", side_effect=boom):
             with self.assertRaises(ModuleNotFoundError) as caught:
                 with bcg.BreakableCUDAGraphCapture(cuda_graph=graph):
-                    eager_step(torch.zeros(2))
+                    eager_step(torch.zeros(2, device="cpu"))
         self.assertIs(caught.exception, boom)
         self.assertCaptureStateClean()
 
@@ -188,7 +188,7 @@ class TestNormalCaptureUnchanged(BreakableCaptureTestBase):
         @bcg.eager_on_graph(True)
         def eager_step(tag):
             order.append(("capture", tag))
-            return torch.zeros(1)
+            return torch.zeros(1, device="cpu")
 
         graph = bcg.BreakableCUDAGraph()
         with bcg.BreakableCUDAGraphCapture(cuda_graph=graph):
