@@ -24,6 +24,12 @@ from typing import (
 
 import torch
 
+from sglang.jit_kernel.cache_health import (
+    building_marker,
+    heal_entry,
+    purge_entry,
+    sweep_cache_root,
+)
 from sglang.utils import is_in_ci
 
 if TYPE_CHECKING:
@@ -196,6 +202,43 @@ def _tvm_ffi_version() -> str:
         return "unknown"
 
 
+def _jit_cache_root() -> pathlib.Path:
+    return pathlib.Path(
+        os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
+    ).expanduser()
+
+
+def _selfheal_enabled() -> bool:
+    # Read per call, not at import: the flag exists so an operator can turn the
+    # sweep off in place if it ever misjudges an entry.
+    return os.environ.get("SGLANG_JIT_CACHE_SELFHEAL", "1") not in ("0", "false", "False")
+
+
+_jit_cache_swept = False
+
+
+def _selfheal_jit_cache_once() -> List[str]:
+    """Sweep incomplete entries out of the JIT cache, once per process.
+
+    Runs on the first load_jit call rather than from server startup: that is
+    the earliest point at which the cache is about to be trusted, needs no
+    wiring into every entrypoint, and is still before any kernel is built.
+    Idempotent, and a peer rank's in-flight build directory is skipped (see
+    cache_health.entry_state).
+    """
+    global _jit_cache_swept
+    if _jit_cache_swept:
+        return []
+    _jit_cache_swept = True
+    if not _selfheal_enabled():
+        return []
+    try:
+        return sweep_cache_root(_jit_cache_root())
+    except Exception as exc:  # never fail a boot on cache hygiene
+        logger.warning("JIT cache self-heal skipped: %r", exc)
+        return []
+
+
 def _jit_build_dir_name(module_name: str) -> str:
     # Key on arch + tvm-ffi ABI too (module_name only hashes sources), so a
     # shared cache volume never reuses a cross-arch/ABI .so.
@@ -313,6 +356,14 @@ def load_jit(
         build_directory = str(
             pathlib.Path(cache_dir).expanduser() / _jit_build_dir_name(module_name)
         )
+    # Self-heal the cache before trusting anything in it. A build killed
+    # mid-flight (the deadline collision of the sibling fix made that routine)
+    # leaves build.ninja + cuda.cu + cuda_0.o.d and NO .so, and tvm-ffi hands
+    # that wreck back forever: "Check failed: (lib_handle_ != nullptr)". Four
+    # such directories once had to be removed by hand before this host would
+    # boot. Complete entries -- anything with a .so -- are never touched.
+    _selfheal_jit_cache_once()
+
     prebuilt = pathlib.Path(build_directory) / f"{module_name}.so"
     if prebuilt.is_file():
         from tvm_ffi import load_module
@@ -325,6 +376,15 @@ def load_jit(
             logger.warning(
                 "Cached JIT module %s failed to load; rebuilding.", module_name
             )
+            # The .so is there and unusable -- truncated, cross-ABI, or written
+            # by a build that died during the link. Rebuilding ON TOP of it
+            # lets ninja's mtime check decide everything is up to date and hand
+            # the same broken artefact back. Take the directory with it.
+            purge_entry(build_directory)
+    else:
+        # No artefact: if what is there is residue rather than a peer's live
+        # build, discard it so ninja starts from a clean directory.
+        heal_entry(build_directory)
 
     if header_only:
         cpp_wrappers = cpp_wrappers or []
@@ -335,7 +395,11 @@ def load_jit(
         # include cuda files
         cuda_sources = [f'#include "{path}"' for path in cuda_files]
         cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
-        with _jit_compile_context():
+        # building_marker records host+pid for the duration of the build. It is
+        # what lets a co-located rank's sweep tell "a peer is compiling this
+        # right now" from "somebody was killed compiling this", without a lock
+        # and without deleting live work.
+        with building_marker(build_directory), _jit_compile_context():
             return load_inline(
                 module_name,
                 cpp_sources=cpp_sources,
@@ -349,7 +413,7 @@ def load_jit(
             )
     else:
         assert cpp_wrappers is None and cuda_wrappers is None
-        with _jit_compile_context():
+        with building_marker(build_directory), _jit_compile_context():
             return load(
                 module_name,
                 cpp_files=cpp_files,

@@ -36,6 +36,27 @@ import time
 import torch
 from torch.distributed import ProcessGroup
 
+# NOT a module-level `from sglang.srt.utils.jit_cold_build import ...`:
+# importing the `sglang.srt.utils` PACKAGE runs its __init__, which creates a
+# CUDA context, and this file must stay importable on the ROCm/CPU-only rank
+# of a cross-vendor group (pinned by
+# test_htccl_port.py::test_import_does_not_initialize_cuda). By the time a
+# collective is launched the module is long since imported, so the lazy
+# lookup below is a cached global read.
+_resolve_timeout_cycles = None
+
+
+def resolve_timeout_cycles(base_cycles: int) -> int:
+    """Deadline for a device collective right now -- see utils/jit_cold_build."""
+    global _resolve_timeout_cycles
+    if _resolve_timeout_cycles is None:
+        from sglang.srt.utils.jit_cold_build import (
+            resolve_timeout_cycles as _resolver,
+        )
+
+        _resolve_timeout_cycles = _resolver
+    return _resolve_timeout_cycles(base_cycles)
+
 logger = logging.getLogger(__name__)
 
 
@@ -1020,7 +1041,13 @@ class HTCCLDeviceTransport:
                 self._slot_addrs,
                 self._pub_addr,
                 self._cons_addr,
-                self._TIMEOUT_CYCLES,
+                # Not the raw constant: during the pre-capture warmup a peer
+                # may still be in nvcc building a first-call JIT kernel, and
+                # the cycle deadline would trap this rank's wait kernel long
+                # before it arrives. resolve_timeout_cycles() is the identity
+                # outside that window, so the value baked into the CAPTURED
+                # graph -- and every replay after it -- is unchanged.
+                resolve_timeout_cycles(self._TIMEOUT_CYCLES),
                 pipe_elems,
                 self._stream2.cuda_stream,
                 region2_off_elems,
@@ -1052,7 +1079,8 @@ class HTCCLDeviceTransport:
             self._slot_addrs,
             self._pub_addr,
             self._cons_addr,
-            self._TIMEOUT_CYCLES,
+            # See all_reduce: relaxed only inside the cold-build window.
+            resolve_timeout_cycles(self._TIMEOUT_CYCLES),
         )
         output = output.movedim(0, dim)
         return output.reshape(

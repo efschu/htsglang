@@ -50,6 +50,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.jit_cold_build import run_capture_warmups
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -228,13 +229,19 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         # Call 1 warms FX state; call 2 captures the cuda graph inside capture_session.
         # See cuda_piecewise_backend.py for the FX backend that drives the capture.
-        for _ in range(2):
-            self._device_module.synchronize()
-            if not self._skip_warmup_barrier:
-                self._tp_group.barrier()
-            forward_fn()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+        #
+        # Same cold-build window as the full backend: first-call JIT builds are
+        # paid here, and a peer still in nvcc must not trip this rank's
+        # cycle-counted collective deadline.
+        run_capture_warmups(
+            forward_fn,
+            repeats=2,
+            device_module=self._device_module,
+            tp_group=self._tp_group,
+            skip_barrier=self._skip_warmup_barrier,
+            post_warmup_hook=post_warmup_hook,
+            reason="piecewise cuda-graph capture warmup",
+        )
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         # torch.compile manages its per-shape cache internally.

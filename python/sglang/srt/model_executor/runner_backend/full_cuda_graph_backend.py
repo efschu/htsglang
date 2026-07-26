@@ -35,6 +35,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.speculative import adaptive_graph_memory
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.jit_cold_build import run_capture_warmups
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -102,13 +103,23 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         # Two warmups so kernels are loaded and one-time setup is paid before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
-        for _ in range(2):
-            self._device_module.synchronize()
-            if not self._skip_warmup_barrier:
-                self._tp_group.barrier()
-            forward_fn()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+        #
+        # "kernels are loaded" is where the cold-build collision lives: several
+        # jit_kernel modules BUILD on first call, so on an empty cache this
+        # loop can sit minutes in nvcc while a peer rank is already waiting in
+        # a deadline-bearing device collective. run_capture_warmups runs the
+        # identical loop inside the cold-build window, which relaxes that
+        # deadline for exactly these forwards -- the recorded pass below stays
+        # outside it, so the captured graph keeps the steady-state deadline.
+        run_capture_warmups(
+            forward_fn,
+            repeats=2,
+            device_module=self._device_module,
+            tp_group=self._tp_group,
+            skip_barrier=self._skip_warmup_barrier,
+            post_warmup_hook=post_warmup_hook,
+            reason="full cuda-graph capture warmup",
+        )
 
         graph = torch.cuda.CUDAGraph()
 

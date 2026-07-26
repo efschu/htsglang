@@ -43,6 +43,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
 )
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.jit_cold_build import run_capture_warmups
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -116,14 +117,20 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         dummies: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
-        warmup_out = None
-        for _ in range(2):
-            self._device_module.synchronize()
-            if not self._skip_warmup_barrier:
-                self._tp_group.barrier()
-            warmup_out = forward_fn()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+        # Same cold-build window as the full and piecewise backends: several
+        # jit_kernel modules build on FIRST CALL, so on an empty cache these
+        # forwards can sit minutes in nvcc while a peer rank already waits in a
+        # deadline-bearing device collective. The capture below stays outside
+        # the window.
+        warmup_out = run_capture_warmups(
+            forward_fn,
+            repeats=2,
+            device_module=self._device_module,
+            tp_group=self._tp_group,
+            skip_barrier=self._skip_warmup_barrier,
+            post_warmup_hook=post_warmup_hook,
+            reason="breakable cuda-graph capture warmup",
+        )
 
         graph = BreakableCUDAGraph()
         captured_fn = (
