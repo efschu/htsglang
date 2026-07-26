@@ -252,6 +252,27 @@ def _plan_aware_dcp_group_q_head_counts(
     ]
 
 
+def total_swa_kv_heads(model_config) -> Optional[int]:
+    """The model's SECOND (sliding-window) total kv-head count, if it has one.
+
+    Mirrors ModelConfig.get_swa_num_kv_heads' source selection, but returns
+    the TOTAL rather than the per-GPU share: the DCP replication condition is
+    about how many ranks share one kv head, so it needs the undivided count.
+    Returns None for a model with a single kv-head base, which is every
+    non-hybrid class and most hybrid ones.
+    """
+    hf = getattr(model_config, "hf_text_config", None)
+    if hf is None:
+        return None
+    swa = getattr(hf, "swa_num_key_value_heads", None)
+    if swa:
+        return swa
+    other = getattr(hf, "attention_other_setting", None)  # step3p5
+    if isinstance(other, dict):
+        return other.get("num_attention_groups")
+    return None
+
+
 def reject_unsupported_dcp_geometry(
     dcp_size: int,
     attn_tp_size: int,
@@ -260,6 +281,7 @@ def reject_unsupported_dcp_geometry(
     uneven_plan: bool,
     weighted_tokens: bool,
     weightless_kv: bool,
+    swa_kv_heads: Optional[int] = None,
 ) -> None:
     """Boot-time gate for every DCP geometry the Triton backend cannot serve.
 
@@ -291,7 +313,7 @@ def reject_unsupported_dcp_geometry(
         it. The exemption therefore turned the one config the guard should
         reject hardest into the one config it waved through.
 
-    (2) EVEN DCP WITHOUT KV-HEAD REPLICATION (unchanged, #169 predecessor).
+    (2) EVEN DCP WITHOUT KV-HEAD REPLICATION, ON ANY OF THE MODEL'S KV BASES.
         The even-DCP decode gathers the whole DCP group's q heads and attends
         them against THIS RANK'S local kv-head shard; the kernel remaps
         q-head -> kv-head as ``cur_head // (gathered_q // local_kv)``. Correct
@@ -340,13 +362,34 @@ def reject_unsupported_dcp_geometry(
             f"machinery, or drop --dcp-size."
         )
 
-    replicas = attn_tp_size // total_kv_heads if total_kv_heads else 0
+    # HYBRID CLASSES HAVE MORE THAN ONE KV-HEAD BASE. A hybrid/SWA model can
+    # declare a second count (swa_num_key_value_heads, or step3p5's
+    # attention_other_setting.num_attention_groups) for its sliding-window
+    # layers, and the replication condition has to hold for EVERY layer kind
+    # the model runs -- a rank whose SWA kv shard is not the full set attends
+    # the gathered q heads against the wrong kv head just as a full-attention
+    # rank would. The binding base is the LARGEST one, because more kv heads
+    # means fewer replicas per head; reading only get_total_num_kv_heads()
+    # (the full-attention base) would leave exactly the hybrid class -- the
+    # one whose formal correctness under even DCP was the open question --
+    # able to slip past the guard whenever its SWA base is the larger of the
+    # two. max() can only make the condition stricter, never more permissive,
+    # so a model with one base or a smaller SWA base keeps its old verdict.
+    bases = [b for b in (total_kv_heads, swa_kv_heads) if b]
+    binding_kv = max(bases) if bases else 0
+    replicas = attn_tp_size // binding_kv if binding_kv else 0
     if replicas < dcp_size:
+        which = (
+            " (the sliding-window base, larger than the full-attention "
+            f"{total_kv_heads})"
+            if swa_kv_heads and swa_kv_heads > (total_kv_heads or 0)
+            else ""
+        )
         raise ValueError(
             f"Triton attention with --dcp-size {dcp_size} "
             f"requires the kv heads to be replicated across each DCP "
             f"group: tp_size // total_kv_heads >= dcp_size, but "
-            f"{attn_tp_size} // {total_kv_heads} = {replicas} < "
+            f"{attn_tp_size} // {binding_kv}{which} = {replicas} < "
             f"{dcp_size}. Every rank would attend the gathered "
             f"q heads against a DIFFERENT kv-head shard and the "
             f"output is silently wrong from the first decode token. "
@@ -484,6 +527,7 @@ class TritonAttnBackend(AttentionBackend):
             uneven_plan=uneven_dcp_kv_replicated(self.dcp_size),
             weighted_tokens=uneven_dcp_active(self.dcp_size),
             weightless_kv=weightless_kv_active(),
+            swa_kv_heads=total_swa_kv_heads(model_runner.model_config),
         )
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with

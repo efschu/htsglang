@@ -27,6 +27,7 @@ import unittest
 
 from sglang.srt.layers.attention.triton_backend import (
     reject_unsupported_dcp_geometry,
+    total_swa_kv_heads,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -34,7 +35,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _call(dcp, tp, kv, *, plan=False, tokens=False, weightless=False):
+def _call(dcp, tp, kv, *, plan=False, tokens=False, weightless=False, swa=None):
     reject_unsupported_dcp_geometry(
         dcp,
         tp,
@@ -42,7 +43,19 @@ def _call(dcp, tp, kv, *, plan=False, tokens=False, weightless=False):
         uneven_plan=plan,
         weighted_tokens=tokens,
         weightless_kv=weightless,
+        swa_kv_heads=swa,
     )
+
+
+class _HF:
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+class _Cfg:
+    def __init__(self, hf):
+        self.hf_text_config = hf
 
 
 class TestTritonDcpGeometryGuard(CustomTestCase):
@@ -133,6 +146,49 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
                 else:
                     _call(dcp, attn_tp, kv)
 
+    # ---------------------------------------------- hybrid: two kv bases
+
+    def test_a_larger_sliding_window_kv_base_is_the_binding_one(self):
+        """THE falsifier for the hybrid half (#169.3).
+
+        A hybrid class can declare a SECOND kv-head total for its
+        sliding-window layers. The replication condition has to hold for every
+        layer kind the model runs: at tp=8/dcp=2 a full-attention base of 4
+        gives replicas 2 (accepted), but if the SWA layers carry 8 kv heads
+        their replicas is 1 and those layers attend the gathered q heads
+        against the wrong kv head. Reading only the full-attention base lets
+        exactly that model through.
+        """
+        _call(2, 8, 4)  # full-attention base alone: accepted
+        with self.assertRaises(ValueError) as ctx:
+            _call(2, 8, 4, swa=8)
+        msg = str(ctx.exception)
+        self.assertIn("sliding-window base", msg)
+        self.assertIn("8 // 8", msg)
+
+    def test_a_smaller_or_equal_swa_base_changes_no_verdict(self):
+        """max() may only tighten. Every model with one base, or with a
+        smaller SWA base, must keep the verdict it had before."""
+        for kv, swa in ((4, 2), (4, 4), (4, None), (2, 1)):
+            with self.subTest(kv=kv, swa=swa):
+                _call(2, 8, kv, swa=swa)
+        for kv, swa in ((8, 4), (8, 8), (8, None)):
+            with self.subTest(kv=kv, swa=swa):
+                with self.assertRaises(ValueError):
+                    _call(2, 8, kv, swa=swa)
+
+    def test_the_swa_base_is_read_from_both_config_spellings(self):
+        self.assertIsNone(total_swa_kv_heads(_Cfg(_HF())))
+        self.assertEqual(total_swa_kv_heads(_Cfg(_HF(swa_num_key_value_heads=8))), 8)
+        self.assertEqual(
+            total_swa_kv_heads(
+                _Cfg(_HF(attention_other_setting={"num_attention_groups": 6}))
+            ),
+            6,
+        )
+        # a model config without hf_text_config must not explode
+        self.assertIsNone(total_swa_kv_heads(object()))
+
     def test_zero_kv_heads_does_not_divide_by_zero(self):
         with self.assertRaises(ValueError):
             _call(2, 2, 0)
@@ -175,6 +231,9 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
         self.assertIn("uneven_plan=uneven_dcp_kv_replicated(self.dcp_size)", src)
         self.assertIn("weighted_tokens=uneven_dcp_active(self.dcp_size)", src)
         self.assertIn("weightless_kv=weightless_kv_active()", src)
+        self.assertIn(
+            "swa_kv_heads=total_swa_kv_heads(model_runner.model_config)", src
+        )
 
 
 if __name__ == "__main__":

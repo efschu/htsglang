@@ -1530,3 +1530,130 @@ earlier, not a generation regression.
 No JIT source was touched by this merge (`git diff --name-only` over
 `jit_kernel/`, `*.cuh`, `*.cu` is empty), so the cold-build hazard from #172 did
 not apply and 0 incomplete cache dirs were present before and after.
+
+
+## #169 DCP geometry leftovers — the four residuals, closed
+
+The four items registered as residuals of the even-DCP triton guard
+(`6a8e7f76ef`) are fixed on `fix/dcp-geometry-leftovers`, one commit each. No
+GPU was used: every fix is a geometry rule, and each is tested by calling that
+rule directly on CPU. The GPU recipe that would exercise them at runtime is at
+the end of this section.
+
+### #169.1 — uneven-DCP + dense class was unguarded because the guard exempted it
+
+The predecessor guard read
+
+```python
+if self.dcp_size > 1 and not uneven_dcp_active(self.dcp_size):
+```
+
+on the premise that "the uneven-DCP path has its own head handling". True of
+flashinfer, which owns that machinery; **false of the triton backend, which
+has none of it**. So the config that garbles hardest was the one config the
+guard waved through.
+
+What triton actually implements is one owner rule, the even modulo one:
+write `out_cache_loc // dcp_size` + `positions % dcp_size == dcp_rank`
+(`_set_kv_buffer`), read `get_dcp_lens` /
+`create_triton_kv_indices_for_dcp_triton`, and **no kv-head all-gather before
+the write** (flashinfer's `_dcp_write_gather`). The fork's uneven-DCP pool is a
+different layout: a virtual block of `sum(token ratios)` slots, every slot
+declared to hold the FULL replicated kv-head set.
+
+So the repair is not class-gating in the backend (which the residual rightly
+said does not belong there) but a backend-capability gate:
+`reject_unsupported_dcp_geometry` refuses an installed `--rank-tp-ratio` plan
+(`uneven_dcp_kv_replicated`), a non-uniform token vector (`uneven_dcp_active`)
+and the weightless-KV fast lane, before the replication arithmetic runs.
+
+Third case the old arithmetic could not see: an uneven plan WITHOUT a token
+vector at tp=4/kv=2/dcp=2 has replicas 2 >= 2, so it was accepted while the
+pool was already token-sharded with replicated kv heads.
+
+### #169.2 — flashinfer's silent even-DCP no-op is now a refusal
+
+Every DCP branch in `FlashInferAttnBackend` is gated on `self.uneven_dcp`, and
+upstream flashinfer has **no** DCP path (zero `dcp` references in the pre-fork
+file, `07165d5daa`). With the predicate false the backend does not degrade to a
+slower DCP — it runs stock full-KV attention. `reject_silently_inert_dcp` now
+refuses that instead of serving plain TP under a DCP-looking config.
+
+**The draft worker is exempt, by design (M4):** `dcp_size` lives in the
+parallel context, so an EAGLE/NEXTN draft runner sees `dcp_size > 1` too and
+deliberately does not token-shard its 1-layer full-context pool. Rejecting it
+would refuse the validated MTP + uneven-DCP arm. All draft construction sites
+go through `draft_model_runner`, so `is_draft_worker` covers them.
+
+### #169.3 — the hybrid logprob question, answered structurally instead
+
+The open item was "hybrid-class formal correctness under even DCP (logprob
+check)" — a `dcp=1`-vs-`2` comparison on Qwen3.5-2B (q8/kv2, TP=2/DCP=2),
+which looked coherent but formally shares the defect class.
+
+**That configuration can no longer boot**: `2 // 2 = 1 < 2` fails the
+replication arithmetic, and flashinfer's even DCP is now refused as well. The
+only even-DCP geometry any backend still admits is the replicated one
+(`tp // kv >= dcp`), where every rank holds the full kv-head set and no peer
+partial *can* attend the wrong head. The question is therefore closed by
+construction, not by measurement — and the GPU comparison is no longer the
+thing that would answer it.
+
+What that argument exposed is a real hole, and it is fixed: **a hybrid class
+can declare a SECOND kv-head total** (`swa_num_key_value_heads`, or step3p5's
+`attention_other_setting.num_attention_groups`) for its sliding-window layers,
+and the guard read only the full-attention base. At tp=8/dcp=2 a full-attention
+base of 4 gives replicas 2 (accepted) while an SWA base of 8 gives replicas 1 —
+those layers attend against the wrong kv head. The condition now takes the
+LARGEST base, which can only tighten the verdict, never loosen it.
+
+### #169.4 — the equal-shape head gather now carries per-rank counts
+
+Both triton DCP forwards used
+
+```python
+q_all = group.all_gather(q_local, dim=1)   # every rank contributes h
+out   = cp_lse_ag_out_rs_mha(...)          # slice = H // world * rank
+```
+
+whose precondition — all ranks of the group hold the same q-head count — was
+stated nowhere. Same family as the shared-buffer sightings above: an ordering /
+shape assumption living only in a comment. Measured on `[4,2,2]` with head
+values equal to their global index, using a stand-in that reproduces what the
+real collective does with a disagreeing shape (output sized from the LOCAL
+tensor):
+
+| rank | old gather | new gather |
+|---|---|---|
+| 0 | `[0,1,2,3,4,5,0,0,6,7,0,0]` | `[0..7]` |
+| 1 | `[0,1,4,5,6,7]` | `[0..7]` |
+| 2 | `[0,1,4,5,6,7]` | `[0..7]` |
+
+and on the merge slice for `[16,8,8]`: old `(0,10)/(10,20)/(20,30)` — rank 1
+reading heads it does not own and `{30,31}` read by nobody — vs new
+`(0,16)/(16,24)/(24,32)`.
+
+Both sites now go through `cp_all_gather_heads_uneven` /
+`cp_lse_ag_out_ar_mha_uneven`, the helpers the flashinfer path already uses.
+The counts come from `_plan_aware_dcp_group_q_head_counts`, which takes this
+rank's count **from the model** (the q tensor handed to the forward) and
+replicates it when no plan is installed — so the default path is a pure
+identity — and derives the peers' counts from the partition helpers only under
+a plan, where `cp_all_gather_heads_uneven` then asserts `counts[rank]` against
+the tensor's own head dim. A model whose reported per-rank head count
+disagrees with the plan fails loudly at the first forward instead of issuing a
+mismatched collective.
+
+### GPU recipe (not run here; the cards belonged to another strand)
+
+| # | boot | expected | loads |
+|---|---|---|---|
+| 1 | reference uneven-TP=3 arm, no DCP flags | unchanged accepts / tps | regression: all four gates inert |
+| 2 | Qwen3.5-2B, TP=2/DCP=2, `--attention-backend triton` | refused at startup, `2 // 2 = 1 < 2` | #169.3 (was coherent-looking) |
+| 3 | same + `SGLANG_UNEVEN_DCP=1` + token vector | refused, "WEIGHTED owner rule" | #169.1 (was mojibake) |
+| 4 | 27B uneven-DCP arm on flashinfer, TP=3, MTP on | boots, accepts reproduce | #169.2 draft exemption + #169.4 identity |
+| 5 | any model, `--dcp-size 2 --attention-backend flashinfer`, no plan | refused, "SILENTLY IGNORED" | #169.2 |
+| 6 | TP=4/DCP=2 model with `tp // kv >= dcp`, triton | boots and serves coherently | #169.1/.3 must not over-reject |
+
+Boot 4 is the one that must be green; 2, 3 and 5 are the ones that must now be
+red at startup rather than silently wrong.
