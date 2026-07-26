@@ -470,7 +470,27 @@ lands at or below the measurement noise, that is the number that goes into
 5. **The `num_kv_splits` granularity for SWA layers under DCP** is a known
    left-on-the-table perf item (§3.2), deliberately not taken to keep the
    default SWA path byte-identical.
-6. **One existing test expectation was intentionally rewritten**:
+6. **Global-index consumers of the full sub-pool, audited.** Anything that
+   indexes the full sub-pool's *buffers* with GLOBAL allocator ids is wrong
+   under a compact pool. Checked, with the result that none of them is reachable
+   on this lane:
+   * `SWAKVPool.move_kv_cache` — called only from the speculative paths
+     (`spec_utils.py`, `base_spec_worker.py`), and speculative decoding is
+     refused on the lane;
+   * `--enable-kv-session-offload` — requires a mambaish model, so a hybrid-SWA
+     model raises before reaching it;
+   * HiCache — gated (§4.2); unified memory pool — pre-existing assert.
+   The one that is NOT lane-specific: `ScheduleBatch.offload_kv_cache` /
+   `get_cpu_copy(global token indices)` is equally wrong under the *existing*
+   qwen weighted-DCP lane, so it is a DCP-wide pre-existing gap and deliberately
+   not "fixed" here (fixing it blind, with no way to run it, is how a working
+   lane gets broken).
+7. **Deterministic mode** (`--enable-deterministic-inference`) sends non-DCP
+   layers through `_forward_extend_unified` and DCP layers through
+   `_forward_extend_dcp`; on the lane a model would therefore mix the two extend
+   kernels across layer types. DCP x deterministic was already unvalidated
+   before #96 and stays so — worth an explicit refusal if it is ever asked for.
+8. **One existing test expectation was intentionally rewritten**:
    `test_the_lane_still_refuses_what_has_no_triton_twin` asserted that a window
    under the uneven lane is always refused. It now asserts the *conditional*
    refusal (refused without the Stage-B preconditions, served with them). That
