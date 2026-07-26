@@ -625,7 +625,28 @@ GPU consumer, where the model computes on the GPU while CPU+wire run the collect
 87%-idle lock-step stall this API exists to attack, and it is a model-runner measurement, not a
 transport one.
 
-*Overlap design sketch (analysis only — the consumer side of it remains open).* The transport is now within ~20% of the
+**L2 block 5 — consumer-side overlap, `SGLANG_HTCCL_UCX_OVERLAP=1` (default OFF).** The MLP
+all-reduce rides the existing `fuse_mlp_allreduce` seam, which is the one legal deferral window in
+a dense decoder chain (layer N's down_proj AR is mathematically movable into layer N+1's
+`prepare_attn`, where AR + residual + layernorm happen together; everything else in the chain is a
+strict dependency). Three touch points, all no-ops with the flag off: (a)
+`should_fuse_mlp_allreduce_with_next_layer` gains a group-uniform gate (env flag + transport class
+only — no rank-local state, per the rank-local-test-before-collective rule; the structural guards
+moe_cp / dp+eagle / input_scattered / SCATTERED / is_last_layer still veto); (b)
+`RowParallelLinear.forward` issues `all_reduce_async` at the skip point and attaches
+`(comm, handle)` to the tensor exactly like the existing `_sglang_needs_allreduce_fusion` tag;
+(c) `prepare_attn`'s fusion branch checks for the handle FIRST (a kernel fusion on unreduced data
+with a handle in flight would double-reduce and orphan the requests) and falls back to the
+unchanged sync AR when no handle was attached — so an issue-side refusal degrades cleanly.
+Communicator plumbing: `HTCCLCommunicator.supports_async/all_reduce_async/wait_async`, with
+`supports_async` shaped like `handles()` (payload-independent, group-uniform); covered by seam
+unit tests (56 registered HTCCL tests green). *Honest expectation, stated before the E2E run:* the
+overlap window is the host-side layer-boundary work (tag, loop, prepare_attn entry — tens of us in
+eager mode), so this hides at most the wire+remote share of one AR per layer; the dependency
+analysis says the big idle sits elsewhere (straggler lock-step, draft-solo phases). The A/B/C
+end-to-end run is the arbiter, not this paragraph.
+
+*Overlap design sketch (analysis) — now implemented through blocks 4-5 above.* The transport is now within ~20% of the
 wire at large sizes, which makes the next order of magnitude a *scheduling* problem, not a
 transport one: in the TP=4 cross-rig L0 run the main rig was **87% idle**, waiting in lock step.
 Every collective here is synchronous — the caller blocks from post to completion — so the model's

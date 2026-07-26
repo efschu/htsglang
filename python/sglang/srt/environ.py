@@ -567,6 +567,11 @@ class Envs:
     # a silent hang when a peer dies or the ranks disagree about the
     # collective sequence.
     SGLANG_HTCCL_UCX_TIMEOUT_S = EnvInt(300)
+    # Overlap the MLP all-reduce with the layer boundary: issue it
+    # asynchronously at down_proj, complete it in the next layer's
+    # prepare_attn (rides the fuse_mlp_allreduce seam). Requires the ucx
+    # transport; rank-uniform like every other flag in this block.
+    SGLANG_HTCCL_UCX_OVERLAP = EnvBool(False)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
     # Override the distributed init method used by torch.distributed.init_process_group.

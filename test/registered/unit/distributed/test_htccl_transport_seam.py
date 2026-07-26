@@ -126,6 +126,59 @@ class TestRegistry(CustomTestCase):
             TRANSPORT_REGISTRY.pop("ucx-test", None)
 
 
+class TestAsyncSeam(CustomTestCase):
+    """The issue/wait split's dispatch contract (task #198).
+
+    supports_async must depend only on group-uniform state (transport class
+    and coverage), never on payloads -- the same property handles() has, and
+    for the same reason: no rank may go async while a peer goes sync.
+    """
+
+    def _comm(self, transport, disabled=False):
+        comm = HTCCLCommunicator.__new__(HTCCLCommunicator)
+        comm.transport = transport
+        comm.disabled = disabled
+        return comm
+
+    def test_sync_only_transport_does_not_support_async(self):
+        comm = self._comm(_FakeDevice())
+        self.assertFalse(comm.supports_async())
+        self.assertIsNone(comm.all_reduce_async(__import__("torch").zeros(4)))
+
+    def test_no_transport_does_not_support_async(self):
+        comm = self._comm(None)
+        self.assertFalse(comm.supports_async())
+
+    def test_disabled_group_does_not_support_async(self):
+        class _FakeAsync(_FakeDevice):
+            def all_reduce_async(self, comm, inp):
+                return "handle"
+
+        comm = self._comm(_FakeAsync(), disabled=True)
+        self.assertFalse(comm.supports_async())
+
+    def test_async_transport_dispatches_issue_and_wait(self):
+        import torch
+
+        issued = []
+
+        class _FakeAsync(_FakeDevice):
+            def all_reduce_async(self, comm, inp):
+                issued.append(inp)
+                return ("h", inp)
+
+            def wait_async(self, handle):
+                return handle[1] * 2
+
+        comm = self._comm(_FakeAsync())
+        self.assertTrue(comm.supports_async())
+        x = torch.ones(4)
+        h = comm.all_reduce_async(x)
+        self.assertEqual(len(issued), 1)
+        out = comm.wait_async(h)
+        self.assertTrue(torch.equal(out, x * 2))
+
+
 class TestFallbackPolicy(CustomTestCase):
     """The device transport must NEVER silently degrade to gloo.
 
