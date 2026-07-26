@@ -1645,3 +1645,44 @@ backend"): one kernel, lowered to gfx900 via the gcn5 fork and to sm75 natively.
 Gate before any wiring: a MICROBENCH of the kernel alone against
 `F.linear` + materialisation on the real bs=1 shapes, on a 3080 as proxy. **If
 the microbench does not win clearly, B is stopped as honestly as C was.**
+
+### Design B pre-decision microbench -- clears the gate on ALL THREE cards
+
+Fused Triton dequant-GEMV (reads fp8 bytes directly, dequantises in-register,
+materialises nothing) against the current path (`materialise to bf16/fp16` then
+`F.linear`), on the real bs=1 decode shapes.
+
+| shape (N x K) | 3080 sm86 bf16 | 2080 Ti sm75 fp16 | **Vega 64 gfx900 fp16** |
+|---|---|---|---|
+| 6144 x 5120 | 4.03x | **5.46x** | 3.71x |
+| 5120 x 2304 | 3.46x | 3.98x | 2.10x |
+| 4096 x 2560 | 4.19x | 3.82x | **5.34x** |
+| 2560 x 2560 | 2.77x | 2.51x | 2.30x |
+
+**The kernel compiles and runs on gfx900** through the gcn5 Triton fork, which
+was the open risk in "one kernel, lowers everywhere". It is now measured, not
+assumed -- on the actual target card.
+
+**Two findings that would have sunk a later implementation:**
+
+1. **Triton's native `fp8e4nv` type is REJECTED on sm86** ("type fp8e4nv not
+   supported in this architecture"), and would be equally unavailable on
+   gfx900. A design B built on Triton's fp8 type dies on both target cards. The
+   portable route is decoding raw bytes in-register -- sign / 4-bit exponent
+   (bias 7) / 3-bit mantissa, with the subnormal branch -- the same pattern the
+   GGUF MMVQ K-quant kernels use. That decode is verified **bit-exact** against
+   `torch.to(float32)` (max diff 0.0).
+2. **The fused kernel is MORE accurate than the path it replaces**, because it
+   accumulates in fp32 where the current path materialises to bf16 first.
+   Against an fp32 ground truth: fused mean relative error 0.0014, materialise
+   0.0133. An early `max|err| = 1.0000` reading was bf16-vs-bf16 rounding at
+   output magnitude ~70, not a defect -- checked rather than shipped on.
+
+The bandwidth argument also shows up where predicted: on the largest shape the
+2080 Ti gains more than the 3080 (5.46x vs 4.03x), i.e. less bandwidth ->
+larger relative win.
+
+**Verdict: design B proceeds.** Next is the wiring (dispatch: small-bs decode ->
+fused GEMV, prefill / large M -> existing materialisation) with a byte/coherence
+gate, and the true dequant share on the pair via layer timing rather than the
+main-rig proxy.
