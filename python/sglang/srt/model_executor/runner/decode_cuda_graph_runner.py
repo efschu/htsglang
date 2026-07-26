@@ -1395,15 +1395,28 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
     ):
-        """Weightless-KV WORKER decode-graph capture (#133).
+        """Weightless-KV WORKER decode/verify-graph capture (#133, #143).
 
         Symmetric counterpart of the head's capture_one_shape: instead of
         recording model.forward (impossible — the worker's model is on the meta
         device), record the stripped per-full-attention-layer DCP dispatch
-        (``ModelRunner._forward_weightless_worker``'s decode loop). The recorded
+        (``ModelRunner._forward_weightless_worker``'s loop). The recorded
         graph issues the IDENTICAL DCP-group collective sequence as the head's
-        decode graph (KV all-gather x2, Q all-gather, LSE-merge per layer), so
+        graph (fused K+V all-gather, Q all-gather, LSE-merge per layer), so
         the two graphs' NCCL ops pair up on replay.
+
+        #143: the recorded BODY follows ``capture_forward_mode``, exactly as the
+        eager ``_forward_weightless_worker`` follows ``forward_batch.forward_mode``.
+        With chain speculation on, this runner captures TARGET_VERIFY (the target
+        never runs a plain DECODE step again) with ``num_tokens_per_bs ==
+        num_draft_tokens``, and the worker must record the EXTEND dispatch — it
+        reads ``forward_metadata.prefill_wrappers`` where the decode dispatch
+        reads ``decode_wrappers``. ``capture_forward_mode`` is derived from
+        server_args, so head and worker pick the same body without communicating.
+        The two bodies emit the same op-tag tuple either way (see
+        ``layers/dcp/lockstep.weightless_layer_op_tags``); what differs is which
+        flashinfer wrapper the baked kernels came from, and getting THAT wrong is
+        a wrong-answer bug rather than a hang.
 
         Attention metadata is prepped OUT of the graph
         (``init_forward_metadata_out_graph(in_capture=True)`` installs the decode
@@ -1422,6 +1435,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # HybridLinearAttnBackend; the weightless_worker dispatch lives on the
         # flashinfer backend (mirrors _forward_weightless_worker).
         wl_attn = getattr(attn_backend, "full_attn_backend", attn_backend)
+        # #143: pick the body by capture mode, mirroring the eager dispatch in
+        # ModelRunner._forward_weightless_worker. Rank-uniform (capture_forward_mode
+        # comes from server_args), so the head's captured body and this one always
+        # describe the same step.
+        if self.capture_forward_mode == ForwardMode.TARGET_VERIFY:
+            wl_dispatch = wl_attn.forward_extend_weightless_worker
+        elif self.capture_forward_mode.is_decode_or_idle():
+            wl_dispatch = wl_attn.forward_decode_weightless_worker
+        else:
+            raise NotImplementedError(
+                "weightless-KV worker graph capture: unsupported capture mode "
+                f"{self.capture_forward_mode} (decode and target-verify only)."
+            )
 
         with forward_context(ForwardContext(attn_backend=attn_backend)):
             # Out-of-graph metadata prep: installs the decode cuda-graph wrappers
@@ -1443,7 +1469,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 set_is_extend_in_batch(False)
                 for layer in model_runner._weightless_attn_layers():
-                    wl_attn.forward_decode_weightless_worker(layer, forward_batch)
+                    wl_dispatch(layer, forward_batch)
                 # Sentinel output: the worker produces no logits. The backend
                 # stores this (None) and returns it from replay; execute() maps
                 # a None replay output to a logits-free ModelRunnerOutput.

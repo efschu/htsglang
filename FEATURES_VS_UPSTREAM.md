@@ -328,7 +328,11 @@ verify-sync/graph-pad work is documented (no).
 shared name) a meta-device worker holds only KV cache and attention while a separate head holds
 the weights.
 
-**Fork status:** Implemented — chunked prefill and graph-decode paths in place.
+**Fork status:** Implemented — chunked prefill and graph-decode paths in place. Chain
+speculation (EAGLE/EAGLE3/NEXTN at `--speculative-eagle-topk 1`) runs on the lane as of #143,
+composed with `--speculative-draft-placement solo` hosted on the lane's head rank; tree verify,
+adaptive draft length and the block-decode/host-spill tier stay hard-rejected alongside it.
+Design: `docs_new/weightless_chain_spec.md`.
 
 **Upstream:** no equivalent found in SGLang, vLLM, llama.cpp, or ik_llama.cpp.
 
