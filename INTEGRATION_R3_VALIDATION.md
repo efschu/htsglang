@@ -2083,3 +2083,59 @@ digit-for-digit with the historical rows.
 3. Multi-rank-per-GPU over NCCL needs NCCL >= 2.30 (installed: 2.28.9) or MPS;
    until then co-located ranks must use an HTCCL transport.
 4. G7 (sm75 / gfx900) remains gated on the second host.
+
+### Design B wired: fused raw-byte dequant-GEMV for small-batch decode
+
+Rebase: the branch had moved (dcp-geometry, triton-weighted-dcp,
+jit-coldbuild + validation). Worktree was already at `1ff5178fd5` and all seven
+of my commits verified as ancestors before building on it.
+
+**Dispatch** (`fp8.py`): small-batch decode -> fused kernel; prefill and larger
+batches keep the existing materialisation. That is the measured asymmetry
+(-69.9% decode vs -8.1% prefill) written as code. The path rides the existing
+`fp8_needs_dequant_fallback()` gate rather than adding a second, independently
+driftable flag. Design C's budget cache stays default-off alongside.
+
+**Gate is deliberately NOT `torch.equal` against the old path.** The fused
+kernel accumulates in fp32 where materialisation rounds the weight to bf16
+first, so it is the MORE accurate of the two (mean relative error 0.0014 vs
+0.0133 against an fp32 reference). Demanding bit-equality would pin the kernel
+to the old path's error. The gate is an fp32 error band it must meet at least
+as well as what it replaces, plus the raw-byte e4m3 decode pinned bit-exact
+against `tensor.to(torch.float32)` -- that part IS exactly reproducible.
+
+**End to end, 27B block-fp8, TP=3, forced dequant, slope method:**
+
+| configuration | decode tok/s | per token | prefill tok/s |
+|---|---|---|---|
+| no dequant (anchor) | 91.53 | 10.93 ms | 1472.5 |
+| forced dequant, no fusion | 27.59 | 36.25 ms | 1353.1 |
+| **forced dequant + fused GEMV** | **37.26** | **26.84 ms** | 1395.5 |
+
+**+35.0% over the unfused fallback, closing 15.1% of the gap to the anchor.**
+Real, but well short of the microbench's 2.8-4.2x on the kernel alone.
+
+**Two implementation errors found by measuring end to end rather than trusting
+the microbench** -- both would have shipped as "done" on unit tests alone:
+
+1. **The first wiring never fired.** The dispatch predicate admitted up to 8
+   rows but the kernel handled exactly one, and this configuration runs NEXTN
+   speculative decode with 4 draft tokens -- so every real decode call declined
+   and fell back. End to end: +2.6%, i.e. nothing. A strictly 1-row kernel
+   declines precisely when it is most needed.
+2. **The first multi-row kernel was 4x SLOWER than not fusing at all**
+   (6.54 tok/s against 27.59). With `BLOCK_M=8` it took a broadcast branch,
+   `tl.sum(x[:, None, :] * wq[None, :, :], axis=2)`, materialising a
+   (BLOCK_M, BLOCK_N, BLOCK_K) intermediate in registers. Replaced by `tl.dot`
+   with `BLOCK_M` padded to 16.
+
+**Why the end-to-end gain is 35% and not ~250%: open, not explained.** The
+microbench isolates one GEMV at ideal shapes; the model runs many layers, some
+of which will not meet the predicate (ragged blocks decline by design), and the
+draft rows make M=5 rather than 1. Which of these dominates is NOT established
+-- it needs per-layer timing, which is the next step rather than a guess.
+
+The pair end-to-end measurement is dropped: the Vega/2080 Ti host was
+dismantled. The V100 (sm70) is the new target and the kernel suits it unchanged
+-- no fp8 GEMM, and Triton's `fp8e4nv` is unavailable there too, which is why
+the raw-byte decode was chosen.

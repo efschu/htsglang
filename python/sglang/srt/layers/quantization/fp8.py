@@ -52,6 +52,10 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
+from sglang.srt.layers.quantization.fp8_dequant_gemv import (
+    fused_block_dequant_gemv,
+    fused_gemv_applicable,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
@@ -1023,6 +1027,21 @@ class Fp8LinearMethod(LinearMethodBase):
             # measured rather than assumed.
             if isinstance(x, tuple):
                 x = x[0]  # (input, scale) pairs only arrive on quantised paths
+            # Small-batch DECODE: fused kernel reads the fp8 bytes directly and
+            # dequantises in-register, so nothing is materialised at all. This
+            # is where the penalty lives (-69.9% decode vs -8.1% prefill), so
+            # prefill and larger batches deliberately keep the path below.
+            if fused_gemv_applicable(x, layer.weight):
+                fused = fused_block_dequant_gemv(
+                    x,
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    self.weight_block_size,
+                    x.dtype,
+                )
+                if fused is not None:
+                    return fused if bias is None else fused + bias
+
             # Cached when a budget is set: the expansion is a pure function of
             # (weight, scale, block_size, dtype), so it need not be redone every
             # forward. Measured cost of NOT caching on this rig: -69.9% decode.
