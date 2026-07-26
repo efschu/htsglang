@@ -31,7 +31,9 @@ serves the ROCm build once the AMD card is installed.
 
 import logging
 import os
+import pathlib
 import time
+from contextlib import contextmanager
 
 import torch
 from torch.distributed import ProcessGroup
@@ -701,6 +703,113 @@ def _build_flags(vendor: str, arches: list) -> list:
     return flags
 
 
+# ---------------------------------------------------------------------------
+# torch_extensions cache hygiene (#181).
+#
+# This extension is built by torch's load_inline into
+# $TORCH_EXTENSIONS_DIR/<name>/ and that takes ~150 s of nvcc. A boot killed
+# inside that window leaves the directory holding main.cpp, cuda.cu,
+# build.ninja and *.o -- and NO .so. torch hands the wreck to every later boot
+# and ninja's mtime check will happily call it up to date, so one interrupted
+# build becomes a permanent failure. Same poisoning class as the tvm-ffi JIT
+# cache (#172b), different writer, so the MECHANICS are reused from
+# jit_kernel.cache_health rather than copied: completeness by artifact, a
+# host+pid+time build marker whose liveness check keeps a co-located rank's
+# in-flight build from looking like residue, rename-before-delete purge, and
+# never failing a boot on cache hygiene.
+#
+# THE ONE THING THAT IS GENUINELY DIFFERENT HERE: torch's extensions root is
+# SHARED with every other cpp_extension on the machine, while the tvm-ffi root
+# belongs to sglang alone. A half-built entry there may be another extension's
+# live business, so this sweep is scoped BY NAME to our own entries. An
+# unscoped sweep of that root would be a new bug, not a fix.
+# ---------------------------------------------------------------------------
+
+#: Every cache entry this module owns starts with this. The name is extended
+#: with vendor + arches below; the prefix is what makes the sweep scopeable.
+_EXT_NAME_PREFIX = "htccl_device_ext"
+
+#: A finished cpp_extension build. `.pyd` is torch's Windows name for it.
+_EXT_ARTIFACT_SUFFIXES = (".so", ".pyd")
+
+_EXT_CACHE_LABEL = "torch extension cache"
+
+
+def _ext_owned(name: str) -> bool:
+    return name.startswith(_EXT_NAME_PREFIX)
+
+
+def _ext_selfheal_enabled() -> bool:
+    # Read per call, not at import: the switch exists so an operator can turn
+    # the sweep off in place if it ever misjudges an entry.
+    return os.environ.get("SGLANG_EXT_CACHE_SELFHEAL", "1") not in (
+        "0",
+        "false",
+        "False",
+    )
+
+
+def _ext_build_dir(name: str) -> pathlib.Path:
+    """The directory torch will build ``name`` into.
+
+    Asked of torch itself rather than reconstructed: the layout depends on
+    TORCH_EXTENSIONS_DIR, the python tag and the accelerator tag, and a
+    reimplementation that drifted would heal one directory while torch built
+    into another.
+    """
+    from torch.utils.cpp_extension import _get_build_directory
+
+    return pathlib.Path(_get_build_directory(name, False))
+
+
+@contextmanager
+def _ext_cache_guarded(name: str):
+    """Sweep our own poisoned entries, then hold the build marker for `name`.
+
+    Cache hygiene must never be the reason a server fails to start, so every
+    step is best-effort: on any error the build simply proceeds as it did
+    before this existed.
+    """
+    build_dir = None
+    marker = None
+    try:
+        from sglang.jit_kernel import cache_health
+
+        build_dir = _ext_build_dir(name)
+        if _ext_selfheal_enabled():
+            # The whole root first (a wreck under a DIFFERENT arch name still
+            # breaks the boot that wants that arch), then the specific entry
+            # we are about to build into, so ninja starts clean.
+            cache_health.sweep_cache_root(
+                build_dir.parent,
+                artifact_suffixes=_EXT_ARTIFACT_SUFFIXES,
+                name_filter=_ext_owned,
+                label=_EXT_CACHE_LABEL,
+            )
+            cache_health.heal_entry(
+                build_dir,
+                artifact_suffixes=_EXT_ARTIFACT_SUFFIXES,
+                label=_EXT_CACHE_LABEL,
+            )
+        marker = cache_health.building_marker
+    except Exception as exc:  # never fail a boot on cache hygiene
+        logger.warning("HTCCL extension cache self-heal skipped: %r", exc)
+        build_dir = None
+        marker = None
+
+    if marker is None:
+        # No marker and no build_directory override: byte-identical to the
+        # pre-#181 call, which is the right thing to degrade to.
+        yield None
+        return
+    # The marker is what lets the NEXT process tell "a co-located rank is
+    # compiling this right now" from "somebody was killed compiling this",
+    # without a lock and without deleting live work. An orderly failure inside
+    # the block clears it, so the entry is immediately recognisable as poison.
+    with marker(build_dir):
+        yield build_dir
+
+
 def _load_ext(cpu_group):
     global _ext
     if _ext is None:
@@ -731,14 +840,21 @@ def _load_ext(cpu_group):
         if arches:
             name += "_" + "_".join(a.replace(".", "") for a in arches)
         t0 = time.time()
-        _ext = load_inline(
-            name=name,
-            cpp_sources=_CPP_SRC,
-            cuda_sources=_CUDA_SRC,
-            functions=["htccl_allreduce", "htccl_allgather"],
-            extra_cuda_cflags=flags or None,
-            verbose=False,
-        )
+        # Discard a killed build's residue under our own names before trusting
+        # this cache, and hold the build marker while nvcc runs -- see the
+        # cache-hygiene block above. Passing build_directory explicitly ties
+        # the directory that was healed and marked to the one torch builds
+        # into, so the two can never drift apart.
+        with _ext_cache_guarded(name) as build_dir:
+            _ext = load_inline(
+                name=name,
+                cpp_sources=_CPP_SRC,
+                cuda_sources=_CUDA_SRC,
+                functions=["htccl_allreduce", "htccl_allgather"],
+                extra_cuda_cflags=flags or None,
+                verbose=False,
+                build_directory=str(build_dir) if build_dir is not None else None,
+            )
         _info_once(
             "HTCCL device extension %r built for %s arch(es) %s in %.1f s "
             "(group: %s)",

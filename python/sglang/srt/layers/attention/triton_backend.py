@@ -317,6 +317,13 @@ def reject_unsupported_dcp_geometry(
         its rows carry the full kv-head set. A token vector with no plan is a
         half-installed state: weighted pool sizing, head-sharded rows. Neither
         backend serves it; refuse rather than pick one of the two layouts.
+        Since #182 a BOOT can no longer reach this branch: the scheduler now
+        resolves the token vector whenever one is set, and
+        ``resolve_cp_token_ratios`` rejects "vector without a plan" earlier and
+        with a message about the vector rather than about this backend. The
+        branch stays as the backstop for any other way a vector gets installed
+        (the post-profiling phase-2 install, tests) -- it keys on the INSTALLED
+        vector, not on the flag, which is why it remains correct.
 
     (3) EVEN DCP WITHOUT KV-HEAD REPLICATION, ON ANY OF THE MODEL'S KV BASES.
         The even-DCP decode gathers the whole DCP group's q heads and attends

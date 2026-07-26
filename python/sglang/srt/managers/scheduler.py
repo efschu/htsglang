@@ -4941,8 +4941,9 @@ def configure_scheduler_process(
     # capacity-optimal vector replaces it after the post-weight-load
     # profiling, before any pool/backend snapshots it (see
     # _maybe_suggest_dcp_token_vector).
+    _dcp_size = getattr(server_args, "dcp_size", 1)
     if (
-        getattr(server_args, "dcp_size", 1) > 1
+        _dcp_size > 1
         and base_plan is not None
         and server_args.uneven_weighted_dcp_enabled()
     ):
@@ -4950,6 +4951,28 @@ def configure_scheduler_process(
         set_cp_token_ratios(cp_vector)
         if cp_vector is not None:
             logger.info("Uneven DCP token vector installed: %s", cp_vector)
+    elif _dcp_size > 1 and envs.SGLANG_UNEVEN_TOKEN_VECTOR.get():
+        # GUARD REACHABILITY, not a second installer.
+        #
+        # resolve_cp_token_ratios owns the honesty guard for "a token vector
+        # is set but nothing can engage it" -- and the gate above asked for
+        # `base_plan is not None`, i.e. for the presence of the very plan
+        # whose ABSENCE that guard reports. So from a real boot the resolver
+        # was never called in the one case it exists for: the vector was
+        # silently ignored and the server came up looking configured while
+        # running plain even DCP (measured: Qwen3.5-2B TP=2/DCP=2 TOKVEC=2,1,
+        # token-identical to TP=1, zero uneven-machinery log lines). Tie the
+        # call to the token-vector machinery's OWN state instead: a vector is
+        # set, so its resolver runs, and is allowed to refuse.
+        #
+        # It raises for every shape reachable here (no plan, or a uniform
+        # one). Should it ever return a vector instead, we deliberately do
+        # NOT install it -- the installing lane above is the uneven-DCP lane
+        # and stays exactly as it was, so the validated --rank-tp-ratio boots
+        # cannot move. The one remaining inert combination (a non-uniform
+        # plan plus a vector while the weighted owner rule is switched off)
+        # is left inert on purpose: rejecting it would change that lane.
+        resolve_cp_token_ratios(server_args)
 
     # Weightless-KV fast lane (Variant C Stage 1): name the head rank that
     # holds all weights/heads. The flashinfer backend then forces the DCP
