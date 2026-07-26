@@ -525,8 +525,9 @@ class Envs:
     # flag its peers spin on.
     SGLANG_HTCCL = EnvBool(False)
     # Data plane: "device" (GPU-driven DMA + spin kernels, CUDA-graph
-    # capturable), "shm" (CPU-orchestrated pinned staging) or "gloo" (TCP,
-    # also multi-node). The CPU transports synchronize with the host and
+    # capturable), "shm" (CPU-orchestrated pinned staging), "gloo" (TCP,
+    # also multi-node) or "ucx" (RDMA, multi-node; same host-staged
+    # semantics as gloo). The CPU transports synchronize with the host and
     # therefore require --disable-cuda-graph.
     SGLANG_HTCCL_TRANSPORT = EnvStr("device")
     # Per-rank shared-memory slot size (MiB) for payload staging.
@@ -544,6 +545,28 @@ class Envs:
     # integer per rank). Unset -> measured from per-rank slot DMA bandwidth
     # at startup, so a slow PCIe link owns fewer reduce-scatter chunks.
     SGLANG_HTCCL_RSAG_SHARES = EnvStr(None)
+    # --- ucx transport (RDMA data plane) -----------------------------------
+    # Which libucp to load. Unset -> the system "libucp.so.0". Point this at a
+    # side-by-side install to satisfy the transport's version-parity check
+    # when the hosts ship different UCX releases, e.g.
+    # "/opt/ucx116/lib/libucp.so.0"; libucs/libuct are pre-loaded from the
+    # same directory, so LD_LIBRARY_PATH is not additionally needed.
+    # Mixed releases are REJECTED at rendezvous -- UCX's UCP wire address
+    # format is not compatible across them and fails as "invalid bandwidth
+    # 0.00".
+    SGLANG_HTCCL_UCX_LIB = EnvStr(None)
+    # Largest single UCX transfer (MiB). Chunks of one collective step are
+    # posted and progressed together, so this caps per-request footprint
+    # without costing extra round trips.
+    SGLANG_HTCCL_UCX_CHUNK_MIB = EnvInt(4)
+    # all_reduce payload (MiB) at or above which the one-step flat exchange
+    # gives way to a ring. Below it, latency beats bandwidth -- which is the
+    # regime bs=1 decode lives in.
+    SGLANG_HTCCL_UCX_RING_MIB = EnvInt(1)
+    # Seconds before a pending UCX request is declared stuck. Guards against
+    # a silent hang when a peer dies or the ranks disagree about the
+    # collective sequence.
+    SGLANG_HTCCL_UCX_TIMEOUT_S = EnvInt(300)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
     # Override the distributed init method used by torch.distributed.init_process_group.
