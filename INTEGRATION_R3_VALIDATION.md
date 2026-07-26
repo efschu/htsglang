@@ -2224,6 +2224,37 @@ messages. What follows is only what those messages do not carry.
 
 ### #96 Stage B is RED: Gemma-4 installs a custom mask on EVERY prefill
 
+> **CORRECTED by task #186 (2026-07-26). The heading and the root cause below
+> are wrong; the RED itself and every reading of the instrumentation are
+> right.** Two errors, both in the attribution:
+>
+> 1. **The mask was NOT text-only.** `prepare_attn_masks` is not called on
+>    every prefill -- `gemma4_mm.py:657-665` already guards on
+>    `contains_image_inputs()`, so a batch with no image never reaches it. The
+>    `75625 = 275^2` mask came from sglang's own VLM boot warmup, which posts a
+>    32x32 base64 PNG (`entrypoints/http_server.py:2034`, `:2091-2115`).
+>    Measured on CPU with the real gemma-4-31B processor and chat template:
+>    that warmup request is **275 tokens, 256 of them image soft tokens**; the
+>    same text without the image is 17. The mask was a **genuine bidirectional
+>    image mask**, not a degenerate causal one.
+> 2. **The append at `:406` is load-bearing, not a stray.** Route (b) below
+>    ("skip installing a mask that is purely causal") is right only at BATCH
+>    granularity. Per-request it corrupts attention: the mask is one flat
+>    buffer addressed by `mask_indptr` and `USE_CUSTOM_MASK` is a whole-launch
+>    constexpr (`extend_attention.py:675`), so a missing slot makes the kernel
+>    read the next request's bytes with this request's row stride -- and read
+>    out of bounds when the skipped request is last. The
+>    [[geteilte-puffer-familie]] reading was right, but inverted: the
+>    redundant-looking append is the invariant.
+>
+> Consequence for #96: the real blocker is that **the DCP Triton extend lane
+> cannot serve an image request at all, and the boot warmup sends one**, so
+> every Gemma-4 boot on that lane dies in warmup before any user request. Fixed
+> by routes 1+2 of the #186 record (auto text warmup on the lane + admission-time
+> refusal of image requests). Full analysis, the owner.py cross-check that
+> clears #96's q-head basis against #180, and the GPU recipe:
+> `TASK_186_GEMMA4_MASK.md` on `fix/gemma4-textonly-mask`.
+
 The lane opens, the sizing is right, and the first forward dies:
 
 ```
