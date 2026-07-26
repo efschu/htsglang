@@ -2391,3 +2391,162 @@ exhaustiveness assert -- against #180's verify use of the same head counts.**
 verify path gathers q heads through `_dcp_gather_q_heads` on the same counts.
 Single-base models are unaffected, but that interaction is unvalidated and must
 be checked before #96 merges.
+
+## #190 — the long-prompt prefill nondeterminism is FP8 Marlin on sm8x, not the GDN lane
+
+#187 (`docs/187-longprompt-nondeterminism`, 84a50b5345) measured that the
+prefill forward of Qwen3.6-27B-FP8 is not run-to-run reproducible above roughly
+128 prompt tokens, and named the Qwen3.5/3.6 gated-DeltaNet lane as the site
+**by elimination**, with the unit falsifier explicitly recorded as owed. The
+falsifier has now been built against the real call path. It clears the GDN lane
+and names a different kernel.
+
+### 1. The GDN lane is bit-deterministic — attribution falsified
+
+`scripts/determinism/gdn_chunk_falsifier.py` calls `chunk_gated_delta_rule`
+with exactly the convention `gdn_backend.forward_extend` uses (via
+`kernels/gdn_triton.py::extend`): `q,k [1,T,Hg,128]`, `v [1,T,H,128]`, `g/beta`
+straight out of `fused_gdn_gating`, `initial_state` = the whole `[slots,H,V,K]`
+fp32 pool with `initial_state_indices`, `cu_seqlens`, `head_first=False`,
+`use_qk_l2norm_in_kernel=True`. The earlier NaN / illegal-memory-access
+attempt was a wrong synthetic call, and its output was correctly discarded.
+
+The whole fla chain — `l2norm_fwd`, `chunk_local_cumsum`,
+`chunk_gated_delta_rule_fwd_intra`, `chunk_delta_h` (the in-place
+`initial_state` writeback that carried the suspicion), `chunk_fwd_o` — is
+**bit-identical over repeated calls at every length tested** (64, 109, 128,
+129, 133, 157, 205, 257, 512, 1024), on both sm120 and sm86, for `o`, for the
+returned `h`, and for the updated state pool.
+
+Crucially this is measured **with the CUDA caching allocator poisoned between
+reps**: a naive repeat loop cannot see a read of never-written memory, because
+the allocator hands the same physical block back to every `torch.empty` and the
+garbage is therefore constant. Poisoning changes nothing, so `chunk_delta_h`'s
+`h = k.new_empty(B, NT, H, V, K)` is fully written and the in-place
+`h0`/`ht` aliasing is race-free (disjoint `i_v` row ranges per program).
+
+`causal_conv1d_fn` (prefill conv, exercised on the non-contiguous +
+`seq_lens_cpu` path the backend actually takes, i.e. the Triton variant) is
+likewise clean. **Note the trap:** the CUDA variant is in-place on `x` and
+returns `x`, so a repeat harness that does not re-clone the input convolves the
+previous rep's output and reports a spurious 5-way split.
+
+### 2. The live layer bisect
+
+sglang's own `--forward-hooks` (`scripts/determinism/layer_hash_hook.py`,
+factory `layer_hash_hook:make_hash_hook`) hashes every module output per
+forward inside the TP workers; `layer_hash_diff.py` segments the append-ordered
+stream into forwards and diffs them. A parent-process monkeypatch does **not**
+work here — TP workers are spawned and re-import sglang.
+
+Arm: stock even TP=2 over the two 3080s, Qwen3.6-27B-FP8, triton attention, no
+fork flags. Five flushed identical 689-token prefills, `max_new_tokens=1`.
+Prefill CUDA graph is off by construction on this model ("Breakable CUDA graph
+is incompatible with multimodal model"), so graph padding is not in play.
+
+Rank 1, run 2 against runs 0/1/3/4:
+
+```
+  ok 0285.RowParallelLinear         dc14c340 x5   (689,5120)   <- GDN out_proj
+  ok 0286.Qwen3_5GatedDeltaNet      dc14c340 x5   (689,5120)   <- whole GDN block
+  ok 0287.GemmaRMSNorm              33c46811 x5   (689,5120)
+DIFF 0288.MergedColumnParallelLinear 60696bb9 | 60696bb9 | 19611c43 | 60696bb9 | 60696bb9
+DIFF 0289.SiluAndMul
+DIFF 0290.RowParallelLinear
+```
+
+The **GDN block itself is bit-identical**, and so is the RMSNorm feeding the
+MLP. The first divergent module is the MLP `gate_up_proj` — a
+`MergedColumnParallelLinear`, column-parallel, **no collective at all** — with
+a bit-identical input hash. Rank 0's first divergence is one module later
+(`0290.RowParallelLinear`, the `down_proj` whose all-reduce imports rank 1's
+error), which is what "the all-reduce" would have looked like if only rank 0
+had been instrumented.
+
+### 3. Which GEMM that actually is
+
+On sm80..sm88 `Fp8LinearMethod` sets `use_marlin` unconditionally
+(`can_auto_enable_marlin_fp8`: `80 <= sm < 89`), so **every fp8 linear on an
+RTX 3080 runs through `torch.ops.sglang.apply_fp8_marlin_linear` ->
+`gptq_marlin_gemm`**, not through the triton block-fp8 matmul. Triton cannot
+even compile that kernel on Ampere: `type fp8e4nv not supported in this
+architecture`. `use_marlin` is checked before every dequant branch in
+`apply()`, so `SGLANG_FORCE_FP8_DEQUANT=1` does not bypass it on sm8x.
+
+### 4. The kernel-level falsifier
+
+`scripts/determinism/fp8_marlin_hammer.py` repeats one
+`apply_fp8_marlin_linear` call on bit-identical inputs at the model's real
+shape (N=8704 = gate_up per rank at TP=2, K=5120), RTX 3080:
+
+| M | 8 | 32 | 64 | 96 | 109 | 128 | 129 | 133 | 160 | 205 | 256 | 512 | 689 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mismatching iters / 1200 | 0 | 0 | 0 | 0 | **0** | **1** | 0 | **2** | 0 | 0 | 4 | 12 | 10 |
+
+Worst per-call `|delta|` ~1e-1 on individual elements. The RTX 5090 (sm120,
+`can_auto_enable_marlin_fp8` false, flashinfer groupwise fp8 path) is
+**0/2000** at the same shape — the defect is Marlin-on-sm8x, not fp8 as such.
+
+### 5. This explains #187's threshold, including its ragged rows
+
+#187 measured clean at 7-109 prompt tokens, dirty at 133/157/181, clean at
+205/229, dirty from 277 up, and read the clean 205/229 pair as under-sampling.
+Both features fall out of the table above:
+
+* the boundary is **not** the GDN `CHUNK_SIZE = 64` and not
+  `chunked_prefill_size`; it is where Marlin's M tiling stops being a single
+  deterministic slice. 0/1200 for every M <= 109, first mismatches at M = 128;
+* the rate is low (1e-3 to 1e-2 per call) **and non-monotonic in M**, because
+  Marlin picks a different tile/slice config per shape and some configs are
+  deterministic — M=129, 160 and 205 are 0/1200 here, mirroring #187's clean
+  205/229 exactly. So those rows are shape-dependence, not just sampling luck.
+
+Per forward there are ~200 fp8 linears over 64 layers, which at 1e-2 gives the
+observed "roughly one of five flushed prefills visibly diverges".
+
+Not explained by this and left open: #187's `Llama-3.1-8B --quantization fp8`
+control was clean to 512 tokens although it is also on sm8x and also Marlin.
+Llama's shapes (4096/14336) may simply land on deterministic Marlin configs,
+as M=129/160/205 do here, but that was not measured.
+
+### 6. Mechanism and cost of a fix
+
+`should_use_atomic_add_reduce` returns False for these shapes (n >= 2048), so
+this is **not** the atomic-add path. Two candidate mechanisms were tested and
+both are falsified:
+
+| variant | mismatches / 1500 at M=512 |
+|---|---|
+| `use_fp32_reduce=True` (default) | 16 |
+| `use_fp32_reduce=False` | 21 |
+| `workspace.zero_()` before every call | 22 |
+
+So it is neither reduce precision nor a stale lock/counter left in the Marlin
+workspace between calls. What remains is the global-reduce accumulation order
+across K-slices inside `gptq_marlin_gemm` itself — partial sums combined in
+completion order, which float addition does not forgive. Fixing that is a
+change inside the Marlin CUDA kernel (a fixed slice order, or a single-slice
+config), not a config flip in sglang.
+
+**Consequence for `--enable-deterministic-inference`**: it pins `NCCL_ALGO`,
+disables custom all-reduce, and constrains the attention backends and sampling.
+It does not touch the quantized GEMM path, so on any sm80..sm88 card serving an
+fp8 checkpoint it cannot deliver what its name promises. That is an upstream
+gap. The cheap local fix is to force `use_marlin = False` under deterministic
+mode — but on sm8x with a **block-scaled** checkpoint that leaves no fp8 GEMM
+at all, so it must be paired with `use_block_dequant` (dequantise the
+[128,128] tiles and run bf16 `F.linear`, which measured clean). That trade is a
+real throughput loss and is deliberately NOT implemented here pending a
+decision.
+
+### 7. Consequence for #187's byte-gate policy
+
+#187's policy conclusions stand, but their **reason changes**, and that widens
+their scope:
+
+* the ~109-token byte-gate boundary is now derived from Marlin's M tiling
+  rather than observed empirically, so it is a defensible policy line;
+* it is **not** GDN-specific and **not** Qwen-specific. Every fp8 checkpoint
+  served on the two 3080s is exposed, whatever the architecture. Byte gates
+  that ran fp8 arms on sm8x above ~128 tokens were measuring this;
+* an arm run entirely on the 5090 (sm120) is not exposed by this mechanism.
