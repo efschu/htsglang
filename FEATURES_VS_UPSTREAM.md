@@ -461,6 +461,50 @@ assumptions were found and fixed on gfx900 in sequence; the last (`fa5c507476`, 
 `3cc2fc9da5`), **not yet merged**; symmetric decode capture and a separate NVIDIA-side
 prefill-capture assertion remain open.
 
+**Cross-rig transport, measured (task #204, 2026-07-26).** Two hosts, one rank per host, CPU
+tensors, world=2, 10 iterations per cell, median. Three configurations, chosen so that the
+*wire* and the *transport stack* can be told apart: `gloo` over the 1 GbE LAN, `gloo` over the
+RoCE NIC's IP (TCP on the fast wire), and HTCCL/UCX native RDMA on that same NIC.
+
+| cell | gloo 1 GbE | gloo RoCE (TCP) | **UCX RDMA** | RDMA vs 1 GbE | RDMA vs gloo-on-same-wire |
+|---|---|---|---|---|---|
+| barrier | 146.63 us | 116.43 us | **8.30 us** | 17.7x | 14.0x |
+| all_reduce 8 KiB | 526.05 us | 362.20 us | **44.92 us** | 11.7x | 8.1x |
+| all_gather 8 KiB | 365.28 us | 234.98 us | **41.13 us** | 8.9x | 5.7x |
+| all_reduce 64 KiB | 1209.84 us | 318.53 us | **55.79 us** | 21.7x | 5.7x |
+| all_gather 64 KiB | 909.12 us | 203.58 us | **64.37 us** | 14.1x | 3.2x |
+| all_reduce 512 KiB | 5360.59 us | 547.43 us | **237.70 us** | 22.6x | 2.3x |
+| all_gather 512 KiB | 5024.35 us | 608.40 us | **250.45 us** | 20.1x | 2.4x |
+| all_reduce 4 MiB | 36588.97 us | 2075.18 us | **1717.39 us** | 21.3x | 1.2x |
+| all_gather 4 MiB | 37484.93 us | 3142.25 us | **1693.10 us** | 22.1x | 1.9x |
+
+Reading it: **RDMA's win is latency, not bandwidth.** On the *same* wire it is 14x at barrier
+and 8x at 8 KiB, but only 1.2x at 4 MiB — at large payloads both stacks are bandwidth-bound near
+the link limit (~16-20 Gbit/s realised). The 1 GbE column saturates at 0.92 Gbit/s, i.e. line
+rate, which is the sanity check that the harness measures the wire and not itself.
+
+**This supersedes the "78 us" figure** previously quoted for 1 GbE: that was a raw TCP
+round-trip taken during network bring-up, not a collective, and comparing it against UCX
+collective numbers understated the gap by roughly 2x. The 1 GbE collective barrier is 146.63 us.
+
+**End-to-end, cross-rig TP=4** (Llama-3.1-8B fp16, 3 ranks on the main rig + 1 rank on the
+2080 Ti rig, ctx 4096, no speculation, decode-only rate measured by streaming between first and
+last token, so prefill and the radix prefix-cache cannot leak into it):
+
+| arm | transport | split | code | prosa | misch |
+|---|---|---|---|---|---|
+| B | gloo 1 GbE | even | 7.78 | 7.72 | 7.54 tok/s |
+| C | **UCX RDMA** | even | **28.44** | **28.56** | **27.13** tok/s |
+| D | gloo 1 GbE | uneven 3,2,2,1 | 7.52 | 7.52 | 7.47 tok/s |
+| E | UCX RDMA | uneven 3,2,2,1 | 28.06 | 27.76 | 27.68 tok/s |
+
+**RDMA is 3.6-3.7x faster than 1 GbE end-to-end**, consistently across all three content
+classes. The uneven split changes nothing measurable on either wire (D vs B: -3.3/-2.5/-0.9 %;
+E vs C: -1.3/-2.8/+2.0 %). Per-rank utilisation during decode explains why: 5090 10-13 %,
+3080s 19-24 %, 2080 Ti 30-35 % — **every rank is mostly idle, the group is collective- and
+latency-bound, not compute-bound**, so rebalancing compute has nothing to recover. Capacity is
+part of the result: `max_total_num_tokens` 140168 even vs 129242 uneven (-7.8 %).
+
 **Upstream:** SGLang/vLLM distributed backends are NCCL/RCCL only, never bridged (no).
 llama.cpp/ik_llama.cpp's RPC backend connects heterogeneous backends over TCP (CUDA/Metal/CPU
 confirmed, Vulkan/ROCm **unverified**) but is a backend-delegation/pipeline model, not a collective
