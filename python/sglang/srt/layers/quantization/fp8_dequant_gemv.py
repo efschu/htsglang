@@ -131,13 +131,33 @@ if _HAS_TRITON:
 
 
 def fused_gemv_applicable(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Cheap dispatch predicate: is this the small-batch decode case?"""
+    """Cheap dispatch predicate: is this the small-batch decode case, on a
+    shape where the kernel actually wins?
+
+    The aspect test is not a guess. The grid parallelises over N only, so a
+    small N starves occupancy while a long K loop runs serially. Measured on
+    the 27B's real weighted shape mix (RTX 3080, materialise vs fused):
+
+        N=17408 K= 5120  N/K=3.40   1.41x  WIN
+        N=12288 K= 5120  N/K=2.40   1.37x  WIN
+        N=10240 K= 5120  N/K=2.00   1.16x  WIN
+        N= 6144 K= 5120  N/K=1.20   1.06x  WIN
+        N= 5120 K= 6144  N/K=0.83   0.86x  LOSE
+        N= 5120 K=17408  N/K=0.29   0.90x  LOSE
+
+    Fusing everywhere gives 1.151x on the weighted mix; fusing only where it
+    wins gives 1.204x AND removes the regressions on a third of the layers.
+    N >= K separates the two groups cleanly on every shape measured.
+    """
     if not _HAS_TRITON or not x.is_cuda:
         return False
     if weight.dtype != torch.float8_e4m3fn:
         return False
     rows = 1 if x.dim() == 1 else x.shape[0]
-    return rows <= FUSED_GEMV_MAX_ROWS
+    if rows > FUSED_GEMV_MAX_ROWS:
+        return False
+    N, K = weight.shape[-2], weight.shape[-1]
+    return N >= K
 
 
 def fused_block_dequant_gemv(

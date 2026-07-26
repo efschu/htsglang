@@ -2139,3 +2139,55 @@ The pair end-to-end measurement is dropped: the Vega/2080 Ti host was
 dismantled. The V100 (sm70) is the new target and the kernel suits it unchanged
 -- no fp8 GEMM, and Triton's `fp8e4nv` is unavailable there too, which is why
 the raw-byte decode was chosen.
+
+### Gap attributed: it is SHAPE, and the honest ceiling is ~1.2x on this mix
+
+The microbench-vs-end-to-end gap (2.8-4.2x on the kernel, +35% in the system)
+was attributed by separating the three candidates. Two were answered without
+spending a boot at all.
+
+**(a) Layers declining on ragged blocks: ZERO.** Read the checkpoint's
+safetensors headers directly -- of **407** block-scaled linear tensors,
+**0 are ragged** (every N and K is 128-divisible). This hypothesis contributes
+nothing, and a boot would only have confirmed it more expensively.
+
+**(b) M=5 draft rows vs M=1: small, ~3%.** Weighted over the real shape mix,
+1.15x at M=1 against 1.11x at M=5.
+
+**(c) Shape ideality: DOMINANT.** The microbench used 6144x5120 plus three
+shapes that do not occur in this model. The real mix, weighted by multiplicity
+(RTX 3080, materialise vs fused, M=1):
+
+| shape (N x K) | count | N/K | speedup |
+|---|---|---|---|
+| 17408 x 5120 | 130 | 3.40 | **1.41x** |
+| 5120 x 17408 | 65 | 0.29 | **0.90x (loses)** |
+| 5120 x 6144 | 65 | 0.83 | **0.86x (loses)** |
+| 10240 x 5120 | 48 | 2.00 | 1.16x |
+| 6144 x 5120 | 48 | 1.20 | 1.06x |
+| 12288 x 5120 | 17 | 2.40 | 1.37x |
+
+**Weighted total: 1.151x, not 2.8-4.2x.** The mechanism is plain: the grid
+parallelises over N only, so a small N starves occupancy while a long K loop
+runs serially. The kernel wins on tall weights and loses on wide ones.
+
+**Fix applied and measured once, per the decision rule.** The dispatch now
+requires `N >= K`, which separates the two groups cleanly on every shape
+measured. On the weighted mix that is 1.204x against 1.151x, and it removes the
+regression on a third of the layers.
+
+**End to end it is a WASH: 36.68 tok/s against 37.26 before** -- within
+run-to-run variation (accept differed, 3.00 vs 3.03, so the content is not
+identical either). So the selective dispatch is kept because it is principled
+and stops the kernel making individual layers slower, NOT because it bought
+throughput. Claiming otherwise would be reading noise.
+
+**Booked: +35% (27.59 -> 37.26 tok/s), and the ceiling on this mix is ~1.2x on
+the linear time.** The remaining distance to the 91.53 anchor is not reachable
+by tuning this kernel: it needs split-K so that small-N/large-K shapes get
+parallelism, which is a new kernel rather than a threshold, and is explicitly
+NOT moderate effort. Named as a limit, not left as a mystery.
+
+Standing caveat: these 27B numbers are the FORCED fallback on cards that do not
+need it. The real beneficiary is a card with no fp8 GEMM -- the 2080 Ti, and
+later the V100 -- and that measurement waits for hardware.

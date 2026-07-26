@@ -156,6 +156,19 @@ class TestDispatch(unittest.TestCase):
         x = torch.randn(100, device="cuda", dtype=torch.bfloat16)
         self.assertIsNone(fused_block_dequant_gemv(x, w, s, [128, 128], torch.bfloat16))
 
+    @unittest.skipUnless(CUDA, "needs a GPU")
+    def test_unfavourable_aspect_declines(self):
+        """The grid parallelises over N only, so small-N/large-K starves
+        occupancy and the kernel LOSES there. Measured on the 27B's real
+        shapes: N/K 0.29 and 0.83 both lose (0.86-0.90x) while N/K >= 1.20 all
+        win (1.06-1.41x). Fusing everywhere gave 1.151x on the weighted mix;
+        fusing only where it wins gives 1.204x and removes the regressions."""
+        dev = "cuda"
+        wide = torch.randn(512, 2048, device=dev).to(torch.float8_e4m3fn)  # N<K
+        tall = torch.randn(2048, 512, device=dev).to(torch.float8_e4m3fn)  # N>K
+        self.assertFalse(fused_gemv_applicable(torch.randn(2048, device=dev), wide))
+        self.assertTrue(fused_gemv_applicable(torch.randn(512, device=dev), tall))
+
     def test_non_fp8_weight_declines(self):
         dev = "cuda" if CUDA else "cpu"
         w = torch.randn(128, 64, device=dev, dtype=torch.bfloat16)
