@@ -1,6 +1,12 @@
 # Uneven DCP for SWA-hybrid models (Gemma4 class) — design note (Task #91)
 
 Status: CHECKPOINT RULED — **Stage A only** (constant-swa sizing, no DCP).
+**Update 2026-07-26 (#96): Stage B was subsequently built** on branch
+`feat/swa-dcp-triton` (section 3's design, on top of #173's Triton weighted
+owner rule) — see `docs_new/swa_dcp_stage_b_triton.md` for what landed, what it
+refuses, and the GPU recipe. It is CPU-pinned and NOT GPU-validated; the
++6-10% below is still an estimate. The rest of this note is the original
+Stage-A checkpoint text and is left as the historical record.
 Stage B (the triton weighted-DCP port, sections 3(a-c)) is DESCOPED to a
 backlog task; recorded reactivation criteria: Stage-A measurements revealing
 a bigger stranded-VRAM gap than estimated, strategic desire for a uniform
