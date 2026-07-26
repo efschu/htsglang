@@ -154,6 +154,15 @@ class TestWarmupLoopCarriesTheWindow(CustomTestCase):
             "would bake a relaxed deadline into the captured graph",
         )
 
+    def test_the_last_forwards_result_is_returned(self):
+        """The breakable backend sizes its shared output buffer from it."""
+        _, dev, group = self._fakes()
+        seq = iter(["first", "last"])
+        out = run_capture_warmups(
+            lambda: next(seq), device_module=dev, tp_group=group
+        )
+        self.assertEqual(out, "last")
+
     def test_skip_barrier_and_hook_are_honoured(self):
         calls, dev, group = self._fakes()
         run_capture_warmups(
@@ -204,11 +213,18 @@ class TestCallSites(CustomTestCase):
 
     def test_graph_backends_use_the_shared_warmup_loop(self):
         from sglang.srt.model_executor.runner_backend import (
+            breakable_cuda_graph_backend,
             full_cuda_graph_backend,
             tc_piecewise_cuda_graph_backend,
         )
 
-        for mod in (full_cuda_graph_backend, tc_piecewise_cuda_graph_backend):
+        for mod in (
+            full_cuda_graph_backend,
+            tc_piecewise_cuda_graph_backend,
+            # PD prefill is graph-covered by default via the breakable
+            # backend -- NOT eager -- so it pays the cold builds too.
+            breakable_cuda_graph_backend,
+        ):
             src = inspect.getsource(mod)
             self.assertIn(
                 "run_capture_warmups",

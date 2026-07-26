@@ -181,24 +181,27 @@ def run_capture_warmups(
     skip_barrier: bool = False,
     post_warmup_hook: Optional[Callable[[], None]] = None,
     reason: str = "cuda-graph capture warmup",
-) -> None:
+) -> Any:
     """The pre-capture warmup forwards, inside the cold-build window.
 
     Exactly the loop the graph backends used to inline (synchronize, barrier,
     forward, hook), with two additions: the window, and the loud re-raise.
-    Extracted so it is importable by its test -- a copy in the test would let
-    a revert of the fix stay green.
+    Returns the last forward's result, which the breakable backend sizes its
+    shared output buffer from. Extracted so it is importable by its test -- a
+    copy in the test would let a revert of the fix stay green.
     """
     with cold_build_window(reason):
         try:
+            out = None
             for _ in range(repeats):
                 if device_module is not None:
                     device_module.synchronize()
                 if tp_group is not None and not skip_barrier:
                     tp_group.barrier()
-                forward_fn()
+                out = forward_fn()
                 if post_warmup_hook is not None:
                     post_warmup_hook()
+            return out
         except BaseException as exc:
             hint = _cold_build_hint(reason)
             logger.error("%s", hint)
