@@ -160,9 +160,11 @@ def _weak_ref_if_tensor(x):
     between segments — storage stays alive for each segment CUDAGraph's
     lifetime via its pool use_count.
 
-    weak_ref_tensors is imported lazily because it hard-raises on
-    platforms without a CUDA/HIP/NPU backend; we only reach this code during
-    an active Breakable capture, which runs only on those backends."""
+    weak_ref_tensors is imported lazily because it refuses platforms without a
+    CUDA/HIP/NPU backend; we only reach this code during an active Breakable
+    capture, which runs only on those backends. Note that this call sits in the
+    window where no segment is open, so anything it raises must reach the
+    caller intact -- see __exit__."""
     if torch.is_tensor(x):
         from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 
@@ -229,16 +231,27 @@ def eager_on_graph(enable: bool):
             # End the segment that captured up to this break point.
             capture._end_current_segment()
 
-            # Run the eager function once so it allocates its outputs and
-            # writes real data into them.
-            output = inner(*args, **kwargs)
+            # No segment is open from here until _begin_new_segment() below.
+            # Clear the active-capture context for that window so a break point
+            # reached from inside the eager region (a decorated callee) simply
+            # runs, instead of trying to split a segment that does not exist.
+            nested_token = _current_capture_var.set(None)
+            try:
+                # Run the eager function once so it allocates its outputs and
+                # writes real data into them.
+                output = inner(*args, **kwargs)
 
-            # Weak-ref captured inputs produced by graph segments. Their storage
-            # is pinned by the segment CUDAGraphs' mempool use-count, so Python
-            # refs do not need to keep every intermediate alive.
+                # Weak-ref captured inputs produced by graph segments. Their
+                # storage is pinned by the segment CUDAGraphs' mempool
+                # use-count, so Python refs do not need to keep every
+                # intermediate alive.
+                captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
+                captured_kwargs = {
+                    k: _weak_ref_if_tensor(v) for k, v in kwargs.items()
+                }
+            finally:
+                _current_capture_var.reset(nested_token)
             captured_inner = inner
-            captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
-            captured_kwargs = {k: _weak_ref_if_tensor(v) for k, v in kwargs.items()}
             # The eager break output is different: it is allocated between graph
             # captures and is the static input address consumed by the next
             # captured segment. Keep a strong reference so replay can safely
@@ -336,9 +349,25 @@ class BreakableCUDAGraphCapture:
         self._begin_new_segment()
         return self
 
-    def __exit__(self, *args: object):
+    def __exit__(self, exc_type=None, exc_val=None, exc_tb=None):
         try:
-            self._end_current_segment()
+            if exc_type is None:
+                self._end_current_segment()
+            else:
+                # The capture is unwinding, and the exception carrying the
+                # diagnosis is already in flight. Two states are normal here and
+                # neither may raise on top of it:
+                #   * no segment open -- an exception escaped a break point, in
+                #     the window between _end_current_segment() and
+                #     _begin_new_segment(); that is where an eager break
+                #     function or its weak-ref bookkeeping fails.
+                #   * a segment open but invalid -- capture_end() on a capture
+                #     that has already failed can fail again.
+                # Closing the segment here would replace the real error with a
+                # bookkeeping one (`assert graph is not None` used to be exactly
+                # that), which is how a plain missing dependency reads as an
+                # internal state-machine defect.
+                self._discard_current_segment()
         finally:
             _forked_streams_var.reset(self._forked_token)
             _current_stream_var.reset(self._stream_token)
@@ -377,11 +406,42 @@ class BreakableCUDAGraphCapture:
                     _original_wait_stream(main_stream, side)
             forked.clear()
         graph = self._current_graph
-        assert graph is not None
+        if graph is None:
+            raise RuntimeError(
+                "BreakableCUDAGraph: no segment is open, so there is nothing to "
+                "end. Between a break point's _end_current_segment() and the "
+                "following _begin_new_segment() this is the expected state, so "
+                "reaching here means the capture is being closed from inside "
+                "that window."
+            )
         graph.capture_end()
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
         self._current_graph = None
         self._current_graph_needs_instantiate = False
+
+    def _discard_current_segment(self) -> None:
+        """Drop the open segment, if any, without ever raising.
+
+        Used only while an exception is unwinding: the segment is not appended
+        (a half-captured graph must never become replayable) and any error from
+        closing it is logged, not propagated.
+        """
+        graph = self._current_graph
+        self._current_graph = None
+        self._current_graph_needs_instantiate = False
+        forked = _forked_streams_var.get()
+        if forked:
+            forked.clear()
+        if graph is None:
+            return
+        try:
+            graph.capture_end()
+        except Exception:
+            logger.debug(
+                "Ignoring capture_end() failure while unwinding a breakable "
+                "CUDA graph capture",
+                exc_info=True,
+            )
 
 
 @eager_on_graph(True)
