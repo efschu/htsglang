@@ -585,6 +585,25 @@ copies are H2D/D2D DMAs and the fault storm does not exist. The structure is pro
 all_reduce numbers; the honest end-to-end number for all_gather comes from the model run, not from
 this cell.
 
+**L2 block 3 — small-message path, second pass.** Profiled the 8 KiB all_reduce on the real link
+(phase timestamps, 48 samples): stage 4.5 / post 8.1 / wait 8.3 / finish 4.2 us + ~2 us residual
+(lock, seq, `empty_like`). Post and wait are the ctypes + UCX-internal + RTT floor; stage/finish
+are torch dispatch. What changed: (a) the single-chunk all_gather builds its output FLAT
+(`view(world, n)` rows, `select+copy` per rank instead of `select+reshape+copy`, and dim==0 — the
+common gather axis — returns a single `view`, no movedim/reshape), with the own-slice copy placed
+BETWEEN the posts and the wait so it runs while the wire is in flight (progress-interleaved above
+one progress block, so a large single-chunk copy cannot starve its own RNDV handshake); (b) `wait`
+gained an n==2 fast path (one recv + one non-inline send, the world-2 exchange shape) holding two
+locals instead of rebuilding a list per poll pass. Cross-rig (reps 5): **all_gather 8 KiB
+43.2 -> 27.0 us (-37%), 64 KiB 67 -> 49.0 us, 512 KiB 268 -> 219 us** — the small all_gather now
+costs the same as the small all_reduce; all_reduce 8 KiB 27.4 -> 26.5-27.1 us; barrier steady at
+5.2 us. *Deliberately rejected:* posting the send directly from a CPU input and fusing the last
+accumulate into the output (`torch.add(out=)`) — both only fire for fp32 CPU tensors, i.e. they
+would have tuned the harness, not the bf16/GPU model path. *C/Cython extension: skipped against
+the >2x bar* — it could recover roughly the ~5 us of Python around the two posts and the polls, on
+a 27 us collective; the honest ceiling is ~1.3x, and it would add a build step on every host,
+which the ctypes design exists to avoid.
+
 *Overlap design sketch (analysis only — NOT implemented).* The transport is now within ~20% of the
 wire at large sizes, which makes the next order of magnitude a *scheduling* problem, not a
 transport one: in the TP=4 cross-rig L0 run the main rig was **87% idle**, waiting in lock step.

@@ -598,6 +598,43 @@ class UcpWorker:
                 if not spins % self._CLOCK_EVERY and time.monotonic() > deadline:
                     self._timeout(1)
 
+        if n == 2:
+            # The other common decode shape: one receive plus one send that
+            # did not complete inline (a world-2 single-chunk exchange).
+            # Two locals instead of a list rebuilt on every pass -- at ~0.7 us
+            # per pass and a handful of passes per collective, the rebuild was
+            # a measurable slice of the poll granularity.
+            r0, r1 = pending
+            while True:
+                progress(worker)
+                if r0 is not None:
+                    status = check(r0)
+                    if status != UCS_INPROGRESS:
+                        free(r0)
+                        if status != UCS_OK:
+                            raise UcxError(
+                                f"htccl ucx: request failed: "
+                                f"{self.lib.status_string(status)}"
+                            )
+                        if r1 is None:
+                            return
+                        r0 = None
+                if r1 is not None:
+                    status = check(r1)
+                    if status != UCS_INPROGRESS:
+                        free(r1)
+                        if status != UCS_OK:
+                            raise UcxError(
+                                f"htccl ucx: request failed: "
+                                f"{self.lib.status_string(status)}"
+                            )
+                        if r0 is None:
+                            return
+                        r1 = None
+                spins += 1
+                if not spins % self._CLOCK_EVERY and time.monotonic() > deadline:
+                    self._timeout((r0 is not None) + (r1 is not None))
+
         while pending:
             progress(worker)
             still = []

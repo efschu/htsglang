@@ -812,6 +812,72 @@ class HTCCLUcxTransport:
             input_size = inp.size()
             n = inp.numel()
 
+            if self.pipeline and n <= max(self.chunk_bytes // inp.dtype.itemsize, 1):
+                # Single-chunk fast path: the same one-step flat exchange as
+                # the generic branch below, with the per-call staging dict,
+                # its eagerly formatted keys and the extra dispatch layers
+                # stripped -- the all_gather twin of the single-chunk branch
+                # in _pipelined_all_reduce. This is what a decode-sized
+                # all_gather (logits gather, DCP merges) hits, and at that
+                # size the bookkeeping was a third of the whole collective.
+                #
+                # The output is built FLAT and viewed as (world, n) rows:
+                # per-rank `select + copy` is two dispatches instead of the
+                # `select + reshape + copy` of the generic path, and for
+                # dim == 0 (the overwhelmingly common gather axis) the result
+                # is a single `view` -- no movedim, no reshape.
+                src = inp.reshape(-1)
+                skey, rkeys = self._ag_keys[0]
+                send_view, send_ptr, send_nbytes = self._slot(skey, n, inp.dtype)
+                send_view.copy_(src)
+                reqs = []
+                recv_views = []
+                for i, peer in enumerate(self._peers):
+                    rv, rptr, rnbytes = self._slot(rkeys[i], n, inp.dtype)
+                    recv_views.append(rv)
+                    reqs.append(
+                        self.worker.post_recv(rptr, rnbytes, _tag(seq, 0, peer, 0))
+                    )
+                for peer in self._peers:
+                    reqs.append(
+                        self.worker.post_send(
+                            peer, send_ptr, send_nbytes, _tag(seq, 0, self.rank, 0)
+                        )
+                    )
+                out_flat = torch.empty(
+                    self.world_size * n, dtype=inp.dtype, device=inp.device
+                )
+                rows = out_flat.view(self.world_size, n)
+                # Own slice straight from the input (on a GPU a D2D copy that
+                # never touches the host staging buffer), placed BETWEEN the
+                # posts and the wait so it runs while the wire is in flight.
+                # Above one progress block the copy is interleaved with
+                # worker progress -- a multi-hundred-us memcpy with no
+                # progress call would starve the RNDV handshake of the very
+                # transfer it is trying to hide under.
+                if 0 < self.progress_bytes < n * inp.dtype.itemsize:
+                    self._staged_copy(rows[self.rank], src, self.worker.progress)
+                else:
+                    rows[self.rank].copy_(src)
+                self.worker.wait(reqs)
+                for i, peer in enumerate(self._peers):
+                    rows[peer].copy_(recv_views[i])
+                if dim == 0:
+                    return out_flat.view(
+                        (self.world_size * input_size[0],) + tuple(input_size[1:])
+                        if len(input_size)
+                        else (self.world_size,)
+                    )
+                return (
+                    out_flat.view((self.world_size,) + tuple(input_size))
+                    .movedim(0, dim)
+                    .reshape(
+                        input_size[:dim]
+                        + (self.world_size * input_size[dim],)
+                        + input_size[dim + 1 :]
+                    )
+                )
+
             output = torch.empty(
                 (self.world_size,) + tuple(input_size),
                 dtype=inp.dtype,
@@ -819,43 +885,7 @@ class HTCCLUcxTransport:
             )
 
             if self.pipeline:
-                if n > max(self.chunk_bytes // inp.dtype.itemsize, 1):
-                    self._pipelined_all_gather(inp, output, n, seq)
-                else:
-                    # Single-chunk fast path: the same one-step flat exchange
-                    # as the generic branch below, with the per-call staging
-                    # dict, its eagerly formatted keys and the extra call
-                    # layers stripped -- the all_gather twin of the
-                    # single-chunk branch in _pipelined_all_reduce. This is
-                    # what a decode-sized all_gather (logits gather, DCP
-                    # merges) hits, and at that size the bookkeeping was a
-                    # third of the whole collective.
-                    src = inp.reshape(-1)
-                    skey, rkeys = self._ag_keys[0]
-                    send_view, send_ptr, send_nbytes = self._slot(
-                        skey, n, inp.dtype
-                    )
-                    send_view.copy_(src)
-                    reqs = []
-                    recv_views = []
-                    for i, peer in enumerate(self._peers):
-                        rv, rptr, rnbytes = self._slot(rkeys[i], n, inp.dtype)
-                        recv_views.append(rv)
-                        reqs.append(
-                            self.worker.post_recv(rptr, rnbytes, _tag(seq, 0, peer, 0))
-                        )
-                    for peer in self._peers:
-                        reqs.append(
-                            self.worker.post_send(
-                                peer, send_ptr, send_nbytes, _tag(seq, 0, self.rank, 0)
-                            )
-                        )
-                    self.worker.wait(reqs)
-                    for i, peer in enumerate(self._peers):
-                        output[peer].reshape(-1).copy_(recv_views[i])
-                    # Own slice straight from the input -- on a GPU a D2D
-                    # copy that never touches the host staging buffer.
-                    output[self.rank].reshape(-1).copy_(src)
+                self._pipelined_all_gather(inp, output, n, seq)
             else:
                 # Pre-pipelining path, kept verbatim as the A/B control
                 # (SGLANG_HTCCL_UCX_PIPELINE=0).
