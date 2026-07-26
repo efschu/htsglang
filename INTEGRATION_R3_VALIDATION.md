@@ -2422,3 +2422,142 @@ exhaustiveness assert -- against #180's verify use of the same head counts.**
 verify path gathers q heads through `_dcp_gather_q_heads` on the same counts.
 Single-base models are unaffected, but that interaction is unvalidated and must
 be checked before #96 merges.
+
+---
+
+# Window 3 (2026-07-26): validation only — NOTHING MERGED
+
+Window ended early on a user focus change to the HTCCL-RDMA path. No merge was
+performed; `integration/r3-probe` is unchanged at `5867419f43` apart from this
+docs commit. The rebased merge stack stays prepared for a later window.
+
+All boots on the main rig (5090 + 2x 3080). torch order 0=5090 1=3080 2=3080,
+NVML order differs (1=5090) — resolved at runtime, never assumed. GPUs verified
+at 0 MiB / no processes at hand-back.
+
+## Validated GREEN this window
+
+### #194 `fix/solo-barrier-and-budget` — hardware-validated, READY TO MERGE
+`PrefillCudaGraphRunner.__init__` issued an unconditional `tp_group.barrier()`,
+but under `--speculative-draft-placement solo` only the host rank constructs the
+DRAFT prefill runner. Diagnosed by py-spy on a live deadlock:
+
+```
+TP0 (head):   barrier -> prefill_cuda_graph_runner.py:361 __init__
+                      <- eagle_worker_v2.init_cuda_graphs:547
+TP1 (worker): broadcast -> _broadcast_reqs_across_ranks   (already serving)
+```
+
+0 % util on both cards, log frozen ~17 min. **Falsified as lane-specific:**
+identical stacks with `weightless_kv_fastlane=False`, so it is a solo-placement
+bug (#138 family), not #143. With the fix and the PREFILL GRAPH ON:
+`Capture draft prefill CUDA graph end. elapsed=0.72 s`, verify symmetric
+TP0 1.84 s / TP1 1.81 s, no hang; and the non-lane solo arm booted and served
+coherently. `--disable-prefill-cuda-graph` is no longer needed.
+
+### #127 `feat/weightless-fp8-kv` — Bug B CLOSED, promote in the stack
+The weightless lane on a DENSE full-attention model (Llama-3.1-8B, TP=2, lane
+ON, **spec OFF**) emitted garbage: `'Schwartz Schwartz Schwartz ...'`,
+`'://OO://def ...'`, self-det False on all four prompts — while the identical
+vehicle with the lane OFF was fully coherent. #127's `_compute_cell_size`
+undercharge + the missing plain-MHA rule in `_pool_kv_head_num` are exactly that
+site (marked in-branch as "reasoned, not GPU-exercised; validated vehicle was
+hybrid-GDN").
+
+Discriminator (r3-probe + `feat/weightless-fp8-kv` `0c0f538dcc`, same repro):
+the KV cell size **doubled** (K/V 1.22 GB vs 0.61 GB — the undercharge fix
+firing) and output became **coherent** on all four prompts: a correct
+linked-list reversal, a sensible medical vignette, sane prose. **#127's sizing
+fix is hardware-proven; Bug B is closed by it.**
+
+RESIDUAL, separate and narrower: the idle invariant
+`pool memory leak detected! [full] total=20000, available=40000`
+(`available == dcp_size x total`) still fires WITH #127. It is a free-list
+accounting duality, not a correctness bug — output is coherent once the idle
+check is downgraded (`SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0`). Worth its
+own small task.
+
+### #96 x #186 H-series — H4/H5/H6/H7 GREEN
+Test worktree = `feat/swa-dcp-triton` + `fix/gemma4-textonly-mask`.
+**Correction to the plan: the #186 CODE fix is NOT in r3-probe** (r3-probe holds
+only the docs correction) and NOT an ancestor of `feat/swa-dcp-triton`. The two
+must be merged together or H4 cannot pass.
+
+* **H4 GREEN** — Stage B boots, 50 s. Mechanism visible in the log:
+  `Boot warmup: using a TEXT warmup instead of the image one`. GREEN means the
+  TEXT lane is open, **not** image support.
+  Sizing: global C `max_total_num_tokens` 369728 -> capped 32776
+  (hybrid SWA/global cap). SWA pool **identical on all three ranks** (6403);
+  full size 13851 / 9747 / 9234 for vector [27,19,18] — i.e. `rows / ratio_r =
+  513.0` exactly on every rank.
+* **H5 GREEN (anchor).** C vs B (triton, DCP off): **token-identical** on both
+  prompts. Coherence via the chat endpoint on Stage B: `'Paris'`, and the needle
+  planted ~3k tokens beyond the 1024-token sliding window **retrieved** —
+  `'The maintenance passphrase for the north cabinet is quartz-hemlock-49.'`,
+  byte-identical to a TP=1 solo-5090 oracle. Self-det 3/3. So the token-sharded
+  global layers DO carry context through the owner-rule merge.
+* **H6 covered** — the H4/H5 boots ran with CUDA graphs ON (`Capturing batches`
+  in the log); `--disable-cuda-graph` was never passed.
+* **H7 GREEN** — vector [13,30,21], 1-token prefixes all completed in 0.5 s, no
+  hang. `rows / ratio_r = 513.0` again (6669/13, 15390/30, 10773/21).
+
+**METHOD FIX, load-bearing:** `needle_probe.py` posts RAW completion prompts to
+an instruction-tuned model. Measured this window, it returns byte-identical
+output — an echo loop plus a needle MISS — on (a) Stage B TP=3 uneven DCP,
+(b) triton DCP-off TP=3, and (c) a TP=1 solo-5090 oracle with no sharding at
+all. A probe that fails identically on one GPU has no power to falsify a DCP
+owner-rule bug; the earlier H5 reading against it was measuring the prompt
+format. `chat_needle.py` (applies the chat template) is the replacement and is
+what produced the GREEN above. Also recorded: **Gemma-4 rejects flashinfer
+outright** ("only supports trtllm_mha, triton, intel_xpu"), so the recipe's H5
+arm A (flashinfer oracle) is not runnable — the TP=1 triton oracle replaces it.
+
+## NO-SHIP / not merged
+
+### #143 `feat/weightless-chain-spec` — NO-SHIP this window
+R0 GREEN (3/3 short-prompt token-id sequences identical to r3-probe, accepts and
+self-det identical, ownership pinned `[6,5,5]` per the #188 rule), R2 GREEN
+(all 7 rejections abort in 8 s naming themselves), R6 GREEN, R1 GREEN (GGUF
+TP=3: `max_total_num_tokens=67000`, head 4.03 GB vs workers 14.59 GB, 57.7-59.7
+tok/s). The symmetric verify capture — the design's own biggest open risk — is
+hardware-confirmed. **But R4/R5 never ran, so Gate 4 (the "B ~ A/2 = eager
+verify" no-ship criterion) is unmeasured.** No vehicle on this rig runs the lane
+and admits solo spec simultaneously; all four blockers are PRE-EXISTING, each
+reproduced with spec OFF or the lane OFF:
+
+| vehicle | geometry | blocker |
+|---|---|---|
+| Qwen3.6-27B GGUF | TP=3 | `_solo_init_lm_head` refuses packed vocab (#197) |
+| Qwen3.6-27B FP8 | TP=3 | `moe_intermediate_size 512 % moe_tp_size 3` — lane never sets head-full moe_tp=1 |
+| Llama-3.1-8B dense | TP=2 | was Bug B; now unblocked by #127 — **retry here first** |
+| Llama-3.1-8B dense | TP=3 | 32 q / 8 kv heads not divisible by 3 |
+
+Cheapest path to R4 next window: Llama TP=2 lane **with #127 merged in**, which
+this window proved coherent.
+
+### Bug A (#197) — the advertised GGUF escape hatch is not wired
+`_solo_init_lm_head` tells the user to set `SGLANG_GGUF_DENSE_VOCAB=1`. That flag
+cannot work: `embed_tokens` is gated on `gguf_dense_vocab()`
+(`qwen3_5.py:1394-1398`) but `lm_head` is built with
+`quant_config=quant_config` UNCONDITIONALLY (`qwen3_vl.py:1280-1286`). The
+loader side honours the flag (`gguf_qwen35.py:469`), the module side does not.
+
+### #189 x #192 semantic pre-check (desk, no boot)
+The doubly-touched sources are `layers/quantization/fp8.py` and
+`compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py` — **not**
+`fp8_utils.py` (that one is #192-only). No textual conflict (#192 at fp8.py:482,
+#189 at fp8.py:1068). Semantically coupled though: #192 sets `use_marlin=False`
+and arms the dequant/W8A16 lane; #189 adds its fused GEMV to exactly that lane.
+Safe — `_fp8_channel_dequant_gemv` accumulates fp32 in a single program per
+output tile, sequential k-loop, scale applied once, single store; **no atomics,
+no split-K, no cross-program reduction**, hence run-to-run bit-stable.
+**Consequence to carry forward:** #189 is *more accurate* than the
+materialisation it replaces, so it CHANGES values on that lane — #192's solo
+byte baseline is invalidated and the integrated `SGLANG_DETERMINISTIC_FP8_GEMM=1`
+boot must be RE-baselined after both merges. `SGLANG_FP8_FUSED_GEMV=0` separates
+the two effects in-build.
+
+## Still open (later window)
+Merge stack (all branches rebased, pairwise intel recorded), #119-A/B, the
+integrated arm-E / determinism / 27B-working-arm closing boots, #143 R4/R5,
+#197, the `available == dcp_size x total` residual.
