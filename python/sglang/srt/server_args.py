@@ -9553,6 +9553,29 @@ class ServerArgs:
         )
 
     @cached_property
+    def adaptive_max_candidate_steps(self) -> Optional[int]:
+        """Largest k the adaptive ladder can reach, or None when adaptive is off.
+
+        Single source of truth for everything that must be sized for the TOP
+        rung rather than the boot rung: the draft-token buffers below, the
+        multi-layer EAGLE MTP-layer count (tp_worker), the draft input pool
+        (eager_runner), and EagleDraftInput.ALLOC_LEN_PER_DECODE.
+        """
+        if not self.speculative_adaptive:
+            return None
+        from sglang.srt.speculative.adaptive_spec_params import (
+            adaptive_algorithm_key,
+            resolve_candidate_steps_from_config,
+        )
+
+        return max(
+            resolve_candidate_steps_from_config(
+                cfg_path=self.speculative_adaptive_config,
+                algorithm=adaptive_algorithm_key(self),
+            )
+        )
+
+    @cached_property
     def max_speculative_num_draft_tokens(self) -> Optional[int]:
         """Return the maximum draft-token count speculative decoding may use."""
         if self.speculative_num_draft_tokens is None:
@@ -9560,18 +9583,10 @@ class ServerArgs:
         if not self.speculative_adaptive:
             result = self.speculative_num_draft_tokens
         else:
-            from sglang.srt.speculative.adaptive_spec_params import (
-                resolve_candidate_steps_from_config,
-            )
-
-            candidate_steps = resolve_candidate_steps_from_config(
-                cfg_path=self.speculative_adaptive_config,
-                algorithm=self.speculative_algorithm,
-            )
             # TODO: adaptive spec currently requires topk=1, so each runtime
             # state needs steps + 1 draft-token slots. Revisit this if topk>1
             # is supported.
-            result = max(candidate_steps) + 1
+            result = self.adaptive_max_candidate_steps + 1
 
         # T156 stage 2 (--speculative-cross-algorithm): the SECONDARY rung
         # captures verify graphs with its own draft-token width against the

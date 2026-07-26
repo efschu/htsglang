@@ -2283,9 +2283,12 @@ def profiles(
             elif draft is not None:
                 algo = str(draft.get("algorithm") or "EAGLE3")
                 # adaptive spec is VERIFIED legal only for EAGLE/EAGLE3 (+
-                # FROZEN_KV_MTP): adaptive_spec_params.
-                # adaptive_unsupported_reason rejects every other algorithm,
-                # so a STANDALONE draft keeps adaptive off.
+                # FROZEN_KV_MTP, and multi-layer EAGLE since #138):
+                # adaptive_spec_params.adaptive_unsupported_reason rejects every
+                # other algorithm, so a STANDALONE draft keeps adaptive off.
+                # The planner never picks multi-layer EAGLE itself (it is
+                # auto-enabled by the MiMoV2 / Step3p5 override registry), so
+                # this branch stays EAGLE/EAGLE3-only.
                 adaptive = algo in ("EAGLE", "EAGLE3")
                 s.update(
                     speculative_algorithm=algo,
