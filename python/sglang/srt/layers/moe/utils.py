@@ -434,6 +434,9 @@ def should_skip_mlp_all_reduce() -> bool:
 _HTCCL_UCX_OVERLAP = bool(int(os.environ.get("SGLANG_HTCCL_UCX_OVERLAP", "0")))
 
 
+_htccl_overlap_announced = False
+
+
 def htccl_mlp_ar_overlap_comm():
     """The TP group's HTCCL communicator, iff async MLP-AR overlap is active.
 
@@ -446,6 +449,17 @@ def htccl_mlp_ar_overlap_comm():
 
     comm = getattr(get_tp_group(), "htccl_comm", None)
     if comm is not None and comm.supports_async():
+        # Announce ONCE, so a measurement run can prove the overlap path is
+        # live rather than silently dormant -- "no difference" is only a
+        # result if the path demonstrably ran.
+        global _htccl_overlap_announced
+        if not _htccl_overlap_announced:
+            _htccl_overlap_announced = True
+            logger.info(
+                "HTCCL: async MLP-AR overlap ACTIVE "
+                "(SGLANG_HTCCL_UCX_OVERLAP=1, issue at down_proj, "
+                "wait in next prepare_attn)."
+            )
         return comm
     return None
 

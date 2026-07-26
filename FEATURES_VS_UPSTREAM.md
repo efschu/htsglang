@@ -646,7 +646,35 @@ eager mode), so this hides at most the wire+remote share of one AR per layer; th
 analysis says the big idle sits elsewhere (straggler lock-step, draft-solo phases). The A/B/C
 end-to-end run is the arbiter, not this paragraph.
 
-*Overlap design sketch (analysis) — now implemented through blocks 4-5 above.* The transport is now within ~20% of the
+*Overlap design sketch (analysis) — now implemented through blocks 4-5 above.*
+
+**L2 end-to-end proof (task #198, 2026-07-26).** TP=4 cross-rig working arm (Qwen3.6-27B-FP8,
+`--rank-tp-ratio 6,4,4,2 --rank-kv-ratio capacity`, NEXTN 3 + solo draft, triton backend, eager,
+ctx 8192, bs=1), slope method, 3 content classes, reps 3, same boot recipe for every arm; only the
+8 HTCCL-touched files (and one env flag) differ. Arms: **A** = pre-L2 transport (684ef3dd13
+content), **B** = L2 transport (blocks 1-3), **C** = B + `SGLANG_HTCCL_UCX_OVERLAP=1` (activation
+proven by the once-per-rank "overlap ACTIVE" log on all 4 ranks), **D** = B with
+`--rank-kv-ratio coupled` (perf-oriented KV split, 2080 Ti share 26.6% -> 12.5%).
+
+| slope tok/s | A | B | C | D | B/A | C/B |
+|---|---|---|---|---|---|---|
+| code  | 16.38 | 17.31 | 17.92 | 18.11 | +5.7% | +3.5% |
+| prose | 15.67 | 17.57 | 17.12 | 16.84 | +12.1% | -2.6% |
+| mixed | 16.54 | 18.36 | 17.84 | 18.15 | +11.0% | -2.9% |
+
+`spec_accept_length` identical across arms per content (3.08 / 3.03 / 2.91) — the arms generated
+the same tokens; zero degeneration anywhere. **Verdict: the transport work IS the end-to-end win
+(~+10% mean B/A); the async overlap (C/B) is neutral within run-to-run spread** — exactly what the
+dependency analysis predicted (the deferral window is only the host-side layer boundary), and now
+it is a measured negative result, not a guess. D (fewer tokens on the slowest card) is also
+within spread at THIS benchmark's short sequences (~0.2-2k tokens live context) — attention is a
+small compute share there; the KV-split lever belongs to long-context runs (input for #103).
+Per-rank GPU utilization, sampled during the measure window of every arm: main rig ~10-13% per
+GPU, 2080 Ti ~50-55% — stable across A/B/C/D. The slowest card is >4x as utilized as any other
+rank and paces the lock-step group; neither the faster transport nor the overlap moved that
+ratio, which makes straggler compute (not communication) the next order of magnitude
+(#103 k-matrix / split balance, #200 autotune). Raw results: `/root/crossrig/res_arm_{a,b,c,d}*.json`,
+GPU samples `gpu_{a,b,c,d}_{main,rig2}.log` (CT999). The transport is now within ~20% of the
 wire at large sizes, which makes the next order of magnitude a *scheduling* problem, not a
 transport one: in the TP=4 cross-rig L0 run the main rig was **87% idle**, waiting in lock step.
 Every collective here is synchronous — the caller blocks from post to completion — so the model's
