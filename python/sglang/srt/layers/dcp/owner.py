@@ -37,6 +37,8 @@ from sglang.kernels.ops.kvcache.kv_indices import create_flashinfer_kv_indices_t
 
 __all__ = [
     "build_dcp_weighted_kv_indices",
+    "dcp_compact_pool_rows",
+    "dcp_token_sharded_layer",
     "dcp_verify_mask_mode",
     "dcp_verify_paged_lens",
     "dcp_verify_window_is_disjoint",
@@ -44,7 +46,110 @@ __all__ = [
     "dcp_weighted_owner_bounds",
     "dcp_weighted_read_slots",
     "dcp_weighted_write_slots",
+    "swa_hybrid_dcp_lane",
 ]
+
+
+def dcp_compact_pool_rows(global_tokens: int, cp_S: int, cp_ratio: int) -> int:
+    """Physical KV rows this rank must hold for a GLOBAL context of
+    ``global_tokens`` slots under the weighted owner rule.
+
+    The owner rule stores global slot ``L`` at
+    ``(L // cp_S) * cp_ratio + (L % cp_S - cp_lo)``, so a context of C slots
+    needs ``(C // cp_S + 1) * cp_ratio`` rows -- note the CEIL to a whole owner
+    block, which is not cosmetic: allocator slot ids reach ``C`` itself, and any
+    slot in a trailing PARTIAL block (``C % cp_S != 0``, e.g. an explicit
+    unaligned ``--max-total-tokens``) compacts to ``(C // cp_S) * cp_ratio +
+    off`` -- one block PAST the floored sizing. Flooring let those top slots
+    scatter out of bounds once free-list churn handed them out (async illegal
+    memory access, found by the kv-session-offload S1 test with
+    --max-total-tokens 3000 on cp_S=64). It costs under one block of rows.
+
+    Stated ONCE here because two pool families need it (HybridLinearKVPool for
+    the mamba/linear hybrids, SWAKVPool's full sub-pool for the SWA hybrids)
+    and a sizing rule whose off-by-one has already cost a debugging round must
+    not exist twice.
+    """
+    if cp_S <= 0 or cp_ratio <= 0:
+        raise ValueError(
+            f"dcp_compact_pool_rows: cp_S ({cp_S}) and cp_ratio ({cp_ratio}) "
+            "must be positive; they come from dcp_weighted_owner_bounds and "
+            "are only meaningful on the weighted lane."
+        )
+    return (int(global_tokens) // int(cp_S) + 1) * int(cp_ratio)
+
+
+def swa_hybrid_dcp_lane(
+    *,
+    is_hybrid_swa: bool,
+    uneven_plan: bool,
+    is_draft_worker: bool,
+    num_full_layers: int,
+    num_swa_layers: int,
+    swa_pool_sizing_capped: bool,
+) -> bool:
+    """Is this process serving SWA-hybrid uneven DCP (task #96, Stage B)?
+
+    THE lane predicate: the ~10 global full-attention layers are token-sharded
+    by the weighted owner rule while the ~50 sliding-window layers keep their
+    local, unsharded path. Consumed by the KV-pool sizing, the Triton attention
+    backend, and the geometry guard, so those three cannot disagree about which
+    mode the process is in.
+
+    A pure function of process-global CONFIGURATION -- server args and the model
+    config -- and of nothing derived from a batch, a request, or a rank's data.
+    That is what makes the per-layer dispatch built on it group-uniform, which
+    is the whole safety argument: the sharded layers enter a q all-gather and an
+    LSE merge, so every rank must classify every layer identically or the group
+    deadlocks on a layer one rank skipped ([[rank-lokaler-test-vor-kollektiv]]).
+
+    Conditions, and why each is necessary:
+
+    ``is_hybrid_swa`` + ``num_swa_layers > 0`` + ``num_full_layers > 0``
+        There must be both kinds of layer. A pure-SWA model has nothing to
+        shard (window-bounded KV only): DCP would add collectives for no
+        capacity. A model with no SWA layers is not this lane at all -- it is
+        plain #173.
+    ``uneven_plan``
+        ``uneven_dcp_kv_replicated(dcp_size)``: a --rank-tp-ratio plan spanning
+        the TP group with dcp_size == tp_size, i.e. the token-sharded pool with
+        replicated kv-head rows that the owner rule assumes.
+    ``not is_draft_worker``
+        Exactly as in #173: the draft/NEXTN worker keeps a plain uneven-TP pool
+        (local heads, FULL token context), so DCP is off for that instance.
+    ``swa_pool_sizing_capped``
+        Stage A (--swa-pool-sizing cap, or the legacy --disable-radix-cache
+        route to the same configurator). In ratio mode the SWA pool is sized
+        ``ratio * full_tokens``, and under DCP ``full_tokens`` is the GLOBAL
+        context budget C -- several times any single rank's reach -- while the
+        SWA pool is NOT sharded. That is the pre-#90 OOM disease multiplied by
+        the token split. Stage B strictly builds on Stage A.
+    """
+    return bool(
+        is_hybrid_swa
+        and uneven_plan
+        and not is_draft_worker
+        and int(num_full_layers) > 0
+        and int(num_swa_layers) > 0
+        and swa_pool_sizing_capped
+    )
+
+
+def dcp_token_sharded_layer(is_swa_layer: bool, *, swa_hybrid_lane: bool) -> bool:
+    """Is THIS layer's KV token-sharded across the DCP group?
+
+    The per-layer dispatch of Stage B, in one place so the write path, the
+    extend path and the decode path cannot drift apart: under the SWA-hybrid
+    lane the sliding-window layers are replicated (every rank holds every
+    in-window position of its own kv-head shard) and only the global
+    full-attention layers are sharded. Off the lane every layer is sharded,
+    which is byte-for-byte the #173 behaviour.
+
+    ``is_swa_layer`` must come from the MODEL (the layer's configured sliding
+    window, or the pool's ``layers_mapping``), never from a per-batch quantity;
+    see ``swa_hybrid_dcp_lane`` for why.
+    """
+    return not (swa_hybrid_lane and is_swa_layer)
 
 
 def dcp_weighted_owner_bounds(dcp_size: int, dcp_rank: int):
