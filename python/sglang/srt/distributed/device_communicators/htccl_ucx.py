@@ -104,6 +104,34 @@ def _tag(seq: int, phase: int, src: int, chunk: int) -> int:
     )
 
 
+class _UcxAsyncHandle:
+    """An in-flight collective issued by one of the ``*_async`` methods.
+
+    Owns its staging slots (``send``, ``recvs`` -- pool records) until
+    ``wait_async`` releases them, and carries its own ``seq`` so handles can
+    be awaited out of issue order. See the async section of the transport
+    for the full ownership / progress / order contracts.
+    """
+
+    __slots__ = (
+        "op", "seq", "reqs", "send", "recvs",
+        "shape", "dtype", "device", "n", "dim", "done",
+    )
+
+    def __init__(self, op, seq, reqs, send, recvs, shape, dtype, device, n, dim):
+        self.op = op
+        self.seq = seq
+        self.reqs = reqs
+        self.send = send
+        self.recvs = recvs
+        self.shape = shape
+        self.dtype = dtype
+        self.device = device
+        self.n = n
+        self.dim = dim
+        self.done = False
+
+
 class HTCCLUcxTransport:
     """Persistent-endpoint UCX collectives over the group's CPU process group.
 
@@ -145,6 +173,9 @@ class HTCCLUcxTransport:
         self._seq = 0
         self._staging_bufs: dict[str, torch.Tensor] = {}
         self._view_cache: dict[tuple, tuple] = {}
+        # Free list for the async collectives' staging slots, keyed by
+        # power-of-two size class. See the async section below.
+        self._async_free: dict[int, list[torch.Tensor]] = {}
         self._closed = False
 
         # Everything below is per-collective bookkeeping that does not depend
@@ -956,6 +987,177 @@ class HTCCLUcxTransport:
                 self.worker.wait(self._post_recv(src, host, seq, 0))
                 tensor.reshape(-1).copy_(host)
             return tensor
+
+    # ------------------------------------------------------------------
+    # async collectives -- issue now, wait later (task #198, block 4)
+    #
+    # The three contracts, in the order they have historically been broken:
+    #
+    # OWNERSHIP. An async collective's staging buffers are acquired from a
+    # free-list pool at issue and released only inside wait_async, after the
+    # last byte has been read out of them. They are owned by the HANDLE, not
+    # by the transport's per-call slot sets -- the sync paths' two-parity
+    # rotation is safe precisely because a sync collective cannot outlive its
+    # call, and an async one can. Nothing here may hand a pool buffer (or a
+    # view of one) to the caller; results are freshly allocated in wait.
+    # The caller's INPUT is free the moment issue returns: it is staged
+    # before the first post, and -- for all_gather -- the own-rank slice is
+    # later copied out of the STAGING slot, never re-read from the input.
+    #
+    # PROGRESS. UCX makes no progress unattended. Issue ends with a single
+    # progress pass to push eager sends onto the wire; from then on the
+    # transfer advances in hardware for eager-sized payloads (every
+    # decode-sized collective) and completes under the progress loop inside
+    # wait_async. Rendezvous-sized payloads additionally need both peers to
+    # progress, so their overlap window degrades toward the sync cost --
+    # still correct, just not faster. There is deliberately no progress
+    # thread: the worker is created THREAD_MODE_SINGLE (the fast mode), and
+    # every entry point here runs under self._lock on the caller's thread.
+    #
+    # ORDER. _next_seq counts ISSUES, under the lock, so the group-uniform
+    # contract ("every rank issues the same collectives in the same order")
+    # covers async issues exactly like sync calls. Each handle carries its
+    # seq, and every transfer's tag carries (seq, src, chunk) with exact
+    # matching -- so wait_async order is free: handles may be awaited out of
+    # issue order without any risk of crossed payloads.
+    # ------------------------------------------------------------------
+
+    def _pool_acquire(self, numel: int, dtype: torch.dtype) -> tuple:
+        """``(view, ptr, nbytes, buf, size_class)`` from the async free list.
+
+        Size classes are powers of two >= 4096, so steady-state decode
+        (same shapes forever) recycles the same few buffers and never grows
+        the pool.
+        """
+        nbytes = max(numel * dtype.itemsize, 1)
+        cls = 1 << max(nbytes - 1, 4095).bit_length()
+        free = self._async_free.get(cls)
+        if free:
+            buf = free.pop()
+        else:
+            pin = self.device.type == "cuda" and torch.cuda.is_available()
+            buf = torch.empty(cls, dtype=torch.uint8, pin_memory=pin)
+        view = buf[:nbytes].view(dtype)
+        return (view, view.data_ptr(), nbytes, buf, cls)
+
+    def _pool_release(self, rec: tuple) -> None:
+        self._async_free.setdefault(rec[4], []).append(rec[3])
+
+    def all_reduce_async(self, comm, inp: torch.Tensor) -> "_UcxAsyncHandle":
+        """Stage and post an all_reduce; complete it later with wait_async.
+
+        Always the flat exchange, never the ring: the async path exists for
+        the decode-sized collectives the consumer wants to hide behind
+        compute, and the ring's 2(N-1) lock-step phases cannot run
+        unattended anyway (each phase needs the previous one's arrival).
+        Oversized payloads stay correct -- all chunks are posted here and
+        completed in wait -- they just lean on the RNDV note above.
+        """
+        with self._lock:
+            seq = self._next_seq()
+            reduce_dtype = (
+                torch.float32
+                if _FP32_REDUCE and inp.dtype in (torch.float16, torch.bfloat16)
+                else inp.dtype
+            )
+            n = inp.numel()
+            send = self._pool_acquire(n, reduce_dtype)
+            send[0].copy_(inp.reshape(-1))  # (+ upcast); input is free after this
+            recvs = [self._pool_acquire(n, reduce_dtype) for _ in self._peers]
+            reqs = []
+            for i, peer in enumerate(self._peers):
+                reqs += self._post_recv_bytes(peer, recvs[i][1], recvs[i][2], seq, 0)
+            for peer in self._peers:
+                reqs += self._post_send_bytes(peer, send[1], send[2], seq, 0)
+            self.worker.progress()
+            return _UcxAsyncHandle(
+                "all_reduce", seq, reqs, send, recvs,
+                tuple(inp.shape), inp.dtype, inp.device, n, None,
+            )
+
+    def all_gather_async(self, comm, inp: torch.Tensor, dim: int) -> "_UcxAsyncHandle":
+        """Stage and post an all_gather; complete it later with wait_async."""
+        with self._lock:
+            seq = self._next_seq()
+            if dim < 0:
+                dim += inp.dim()
+            inp = inp.contiguous()
+            n = inp.numel()
+            send = self._pool_acquire(n, inp.dtype)
+            send[0].copy_(inp.reshape(-1))  # input is free after this
+            recvs = [self._pool_acquire(n, inp.dtype) for _ in self._peers]
+            reqs = []
+            for i, peer in enumerate(self._peers):
+                reqs += self._post_recv_bytes(peer, recvs[i][1], recvs[i][2], seq, 0)
+            for peer in self._peers:
+                reqs += self._post_send_bytes(peer, send[1], send[2], seq, 0)
+            self.worker.progress()
+            return _UcxAsyncHandle(
+                "all_gather", seq, reqs, send, recvs,
+                tuple(inp.shape), inp.dtype, inp.device, n, dim,
+            )
+
+    def wait_async(self, handle: "_UcxAsyncHandle") -> torch.Tensor:
+        """Progress the worker until ``handle`` completes; return its result.
+
+        The result is freshly allocated -- never a pool buffer, never a view
+        of one. The handle's slots go back to the free list before this
+        returns, so a handle must be awaited exactly once: a second wait
+        would read slots that a later collective may already own, and it
+        raises instead.
+        """
+        with self._lock:
+            if handle.done:
+                raise UcxError(
+                    "htccl ucx: wait_async called twice on the same handle "
+                    f"(op={handle.op}, seq={handle.seq})."
+                )
+            self.worker.wait(handle.reqs)
+            handle.done = True
+            try:
+                if handle.op == "all_reduce":
+                    acc = handle.send[0]
+                    for rec in handle.recvs:
+                        acc.add_(rec[0])
+                    out = torch.empty(
+                        handle.shape, dtype=handle.dtype, device=handle.device
+                    )
+                    out.reshape(-1).copy_(acc)  # (+ downcast)
+                    return out
+
+                # all_gather -- same flat-output construction as the sync
+                # fast path; own slice from the STAGED copy (see OWNERSHIP).
+                W = self.world_size
+                n = handle.n
+                out_flat = torch.empty(
+                    W * n, dtype=handle.dtype, device=handle.device
+                )
+                rows = out_flat.view(W, n)
+                rows[self.rank].copy_(handle.send[0])
+                for i, peer in enumerate(self._peers):
+                    rows[peer].copy_(handle.recvs[i][0])
+                shape = handle.shape
+                dim = handle.dim
+                if dim == 0:
+                    return out_flat.view((W * shape[0],) + shape[1:])
+                return (
+                    out_flat.view((W,) + shape)
+                    .movedim(0, dim)
+                    .reshape(shape[:dim] + (W * shape[dim],) + shape[dim + 1 :])
+                )
+            finally:
+                self._pool_release(handle.send)
+                for rec in handle.recvs:
+                    self._pool_release(rec)
+
+    def poke_async(self) -> None:
+        """One unlocked progress pass.
+
+        Optional: a consumer with an outstanding handle may call this
+        between compute steps to nudge RNDV handshakes along. Never
+        required for correctness -- wait_async completes everything.
+        """
+        self.worker.progress()
 
     # ------------------------------------------------------------------
     # teardown

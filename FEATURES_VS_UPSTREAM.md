@@ -604,7 +604,28 @@ the >2x bar* — it could recover roughly the ~5 us of Python around the two pos
 a 27 us collective; the honest ceiling is ~1.3x, and it would add a build step on every host,
 which the ctypes design exists to avoid.
 
-*Overlap design sketch (analysis only — NOT implemented).* The transport is now within ~20% of the
+**L2 block 4 — async collectives (`all_reduce_async` / `all_gather_async` -> handle,
+`wait_async(handle)` -> out).** The three contracts from the design sketch are implemented and
+falsified-first: (i) *ownership* — async staging comes from a power-of-two-size-class free-list
+pool, acquired at issue, owned by the handle, released only inside `wait_async`; the caller's
+input is free the moment issue returns (staged before the first post; all_gather's own slice is
+later copied out of the STAGING slot, never re-read from the input); results are freshly
+allocated, never pool views; double-wait raises. A deliberate release-at-issue mutation flips 10+
+lifetime tests red. (ii) *progress* — issue ends with one progress pass (pushes eager sends onto
+the wire); completion happens under the progress loop in `wait_async`; no progress thread (worker
+is THREAD_MODE_SINGLE under the transport lock). Eager-sized payloads then move in hardware while
+the caller computes; RNDV-sized ones degrade toward sync cost but stay correct. (iii) *order* —
+`_next_seq` counts issues under the lock, handles carry their seq, tags match exactly, so waits
+may be out of issue order (tested, including a sync collective between issue and wait, and mixed
+ar+ag outstanding). *Honest transport-level overlap measurement, CPU tensors over the real link:*
+`sync(coll+busy)` vs `issue+busy+wait` shows **nothing hidden** (-6 to +4 us) — as it must: at
+8 KiB ~22 of 27 us are LOCAL software on the same CPU the busy loop runs on, only the ~5 us of
+wire is hideable, and the handle/pool overhead (~4 us) eats it. The async API's value case is the
+GPU consumer, where the model computes on the GPU while CPU+wire run the collective — that is the
+87%-idle lock-step stall this API exists to attack, and it is a model-runner measurement, not a
+transport one.
+
+*Overlap design sketch (analysis only — the consumer side of it remains open).* The transport is now within ~20% of the
 wire at large sizes, which makes the next order of magnitude a *scheduling* problem, not a
 transport one: in the TP=4 cross-rig L0 run the main rig was **87% idle**, waiting in lock step.
 Every collective here is synchronous — the caller blocks from post to completion — so the model's

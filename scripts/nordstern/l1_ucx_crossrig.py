@@ -202,6 +202,26 @@ def main() -> int:
     chk("ag-pipeline/matches-unpipelined", g_piped, g_plain, 0.0)
     t.chunk_bytes = 4 << 20
 
+    # Async collectives over the real link: lifetime falsifiers (the local
+    # selftest carries the full suite; these are the RDMA-facing subset).
+    ar_a = [torch.arange(2048, dtype=torch.float32) * (r + 1) + r * 1e5
+            for r in range(W)]
+    ar_b = [torch.arange(2048, dtype=torch.float32) * (r + 7) - r * 3e4
+            for r in range(W)]
+    h1 = t.all_reduce_async(comm, ar_a[R].clone())
+    h2 = t.all_reduce_async(comm, ar_b[R].clone())
+    chk("async/out-of-order-2", t.wait_async(h2), sum(ar_b), 1e-2)
+    chk("async/out-of-order-1", t.wait_async(h1), sum(ar_a), 1e-2)
+    inp = ar_a[R].clone()
+    h1 = t.all_reduce_async(comm, inp)
+    inp.fill_(-777.0)
+    chk("async/input-free-after-issue", t.wait_async(h1), sum(ar_a), 1e-2)
+    a_res = t.wait_async(t.all_reduce_async(comm, ar_a[R].clone()))
+    s_res = t.htccl_all_reduce(comm, ar_a[R].clone())
+    chk("async/matches-sync", a_res, s_res, 0.0)
+    h1 = t.all_gather_async(comm, ar_b[R].clone(), 0)
+    chk("async/all_gather", t.wait_async(h1), torch.cat(ar_b, dim=0), 0.0)
+
     for _ in range(5):
         t.barrier()
     print(f"[rank {R}] ok   barrier x5", flush=True)
@@ -252,6 +272,45 @@ def main() -> int:
                 print(f"[rank {R}] {name} {nbytes/1024:9.1f} KiB  "
                       f"median {med*1e6:9.1f} us  {nbytes*8/med/1e9:6.2f} Gbit/s "
                       f"(rep spread {spread*1e6:.1f} us)", flush=True)
+
+        # --- overlap proof (async vs sync with compute in between) --------
+        #
+        # T_sync   = all_reduce, then `busy` us of compute (no progress).
+        # T_async  = issue, the same compute, then wait.
+        # If the wire really flies while the CPU computes, T_async approaches
+        # max(compute, collective) instead of their sum. The busy loop makes
+        # NO progress calls on purpose -- that is exactly what a model
+        # forward looks like to the transport.
+        def busy(us):
+            end = time.perf_counter() + us * 1e-6
+            while time.perf_counter() < end:
+                pass
+
+        print(f"[rank {R}] --- async overlap (all_reduce, us) ---", flush=True)
+        for mib, busy_us in ((0.0078125, 30), (0.0078125, 100),
+                             (0.0625, 100), (0.0625, 300)):
+            n = max(int(mib * 1024 * 1024 / 4), 2)
+            x = torch.randn(n)
+            for _ in range(5):
+                t.wait_async(t.all_reduce_async(comm, x))
+            sync_s, async_s = [], []
+            for _ in range(50):
+                t0 = time.perf_counter()
+                t.htccl_all_reduce(comm, x)
+                busy(busy_us)
+                sync_s.append(time.perf_counter() - t0)
+            for _ in range(50):
+                t0 = time.perf_counter()
+                h = t.all_reduce_async(comm, x)
+                busy(busy_us)
+                t.wait_async(h)
+                async_s.append(time.perf_counter() - t0)
+            ms, ma = (statistics.median(sync_s) * 1e6,
+                      statistics.median(async_s) * 1e6)
+            nb = n * 4
+            print(f"[rank {R}] overlap {nb/1024:7.1f} KiB + {busy_us:4d} us "
+                  f"compute: sync {ms:7.1f}  async {ma:7.1f}  "
+                  f"hidden {ms-ma:6.1f} us", flush=True)
         print(f"[rank {R}] barrier median {statistics.median(bar_reps)*1e6:.1f} us "
               f"(reps: "
               f"{', '.join(f'{b*1e6:.1f}' for b in bar_reps)})", flush=True)
