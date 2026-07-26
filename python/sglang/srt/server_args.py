@@ -1562,7 +1562,9 @@ class ServerArgs:
             "(--rank-mlp-ratio) from a measured hardware profile to "
             "maximize prefill/throughput, subject to the "
             "--rank-perf-loose-ctx-percent context floor (see also "
-            "--rank-perf-tune). Requires --rank-gpu-id.",
+            "--rank-perf-tune). Requires --rank-gpu-id. "
+            "Pure tensor parallelism only: combining it with --pp-size > 1 "
+            "is rejected, not silently applied.",
             type_parser=_parse_rank_tp_ratio,
         ),
     ] = None
@@ -5688,6 +5690,27 @@ class ServerArgs:
                 raise ValueError(
                     "--rank-tp-ratio with identical entries is the even "
                     "split — omit the flag instead."
+                )
+            # Pure single-node tensor parallelism only — the same scope the
+            # --rank-gpu-id block below enforces, but it needs restating
+            # here: --rank-tp-ratio is legal WITHOUT --rank-gpu-id (it
+            # describes the PARTITION, not the placement), so it walks past
+            # every parallelism reject down there, all of which sit after the
+            # `rank_gpu_id is None` early return.
+            #
+            # It is not inert under a pipeline: configure_scheduler_process
+            # installs the plan in every scheduler process, so each PP stage
+            # would shard its TP dimension by the vector. Nothing in the
+            # uneven-TP machinery — the shard solver, the family vectors, the
+            # weighted-DCP token axis, the per-rank memory budgets — has ever
+            # been exercised with a pipeline stage in front of it, so this
+            # combination boots into an unvalidated split. Refuse it loudly
+            # instead.
+            if self.pp_size > 1:
+                raise ValueError(
+                    f"--rank-tp-ratio is not compatible with --pp-size > 1 "
+                    f"(current: {self.pp_size}). Only pure single-node "
+                    "tensor parallelism is supported."
                 )
 
         # Decoupled KV-token ownership (--rank-kv-ratio, task #88): requires
