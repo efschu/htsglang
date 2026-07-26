@@ -763,6 +763,18 @@ class Envs:
     # Max decode batch size eligible for the captured offload path. Buckets with
     # bs*top_k > scratch (would need >1 wave) fall back to eager. 0 = no cap.
     SGLANG_MOE_OFFLOAD_MAX_GRAPH_BS = EnvInt(0)
+    # #119: hand the weight VRAM freed by the expert offload to the KV pool.
+    # Default ON, but STRICTLY scoped to the offload lane -- every effect is
+    # additionally gated on SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0, so with
+    # offload off (the default) this flag changes nothing and the sizing path
+    # stays byte-identical. On the offload lane it (a) enforces that the offload
+    # is installed BEFORE the KV pool is profiled -- otherwise the profiler
+    # measures the pre-offload footprint and the reclaim is lost, which was the
+    # #77 "known limitation"; (b) synchronizes the release across the TP group
+    # so every rank's freed blocks are back with the driver before ANY rank
+    # takes its free-memory reading; and (c) logs the reclaimed bytes. Set to
+    # False to fall back to the unsynchronized, unaccounted behaviour.
+    SGLANG_MOE_OFFLOAD_KV_REGAIN = EnvBool(True)
     # Weightless-KV streaming block-decode graphs (#136a): max decode capture
     # bucket. Each bucket carries a full ladder block-wrapper pool (~8 MB int
     # workspace per block), and the host-spill graph path only supports bs=1;
