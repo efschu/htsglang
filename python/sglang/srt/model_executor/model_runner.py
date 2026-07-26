@@ -1783,6 +1783,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 declare_load_time_override(
                     "ModelRunner._sm80_dtype_fallback", {"dtype": "float16"}
                 )
+                # This is the LAST word on the dtype and it lands after
+                # ModelConfig.__init__, so the HF config still carries the
+                # checkpoint's bfloat16. Writing through ModelConfig.dtype
+                # re-pins the HF config(s) (see its setter): consumers that
+                # derive their own dtype from the config -- the mamba conv-state
+                # cache above all -- must follow the fallback, or a hybrid GDN
+                # model writes float16 activations into a bfloat16 cache.
                 self.model_config.dtype = torch.float16
                 # "sm75 and above" is a statement about NVIDIA parts, so the
                 # minor number may only be read in the NVIDIA namespace.

@@ -107,6 +107,17 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
     # (`Index put requires source and destination dtypes match`). Follow the
     # model dtype from the config instead; fall back to bfloat16 only when no
     # config dtype is available. An explicit SGLANG_MAMBA_CONV_DTYPE always wins.
+    #
+    # There are TWO ways the config can disagree with the runtime dtype, and the
+    # AWQ downcast above is only the first. The second is a runtime override:
+    # ModelRunner.load_model() re-decides the dtype on a device without bfloat16
+    # (`_needs_float16_fallback()`, sm75 / gfx900) LONG after the HF config was
+    # read, so a bf16 checkpoint runs in fp16 with the config still saying bf16.
+    # Reading `config` here would then hand back bf16 and every hybrid GDN
+    # Qwen3.5 would be unbootable on sm75 with exactly the error above. That is
+    # handled at the source: `ModelConfig.dtype` is a property whose setter pins
+    # the resolved dtype onto the HF config(s), so the override is visible here
+    # too and this function needs no notion of the runtime at all.
     # NOTE: SGLANG_MAMBA_CONV_DTYPE has a non-None default ("bfloat16"), so we
     # must check is_set() — not the returned value — to know whether the user
     # explicitly pinned the conv dtype. Only an explicit override wins; the

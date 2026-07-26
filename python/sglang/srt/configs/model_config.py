@@ -514,20 +514,9 @@ class ModelConfig:
         self.is_multimodal_piecewise_cuda_graph_supported = enable_multimodal and (
             is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
         )
+        # Assigning `dtype` also pins it onto the HF config(s) — see the
+        # property setter below for why that has to happen on every write.
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
-        # Pin the *resolved* runtime dtype back onto the HF config(s) so every
-        # downstream consumer that reads `config.torch_dtype` (GDN RMSNormGated,
-        # the mamba conv/ssm state-cache dtype, etc.) sees the dtype the model
-        # actually runs in — not the raw checkpoint value, which may be missing
-        # (-> "auto" downcast to float16) or overridden via --dtype. Without this
-        # a float16-resolved hybrid model mismatches its bf16-defaulted state
-        # cache. Only the runtime dtype is authoritative once resolution is done.
-        for _cfg in (self.hf_config, self.hf_text_config):
-            if _cfg is not None:
-                try:
-                    _cfg.torch_dtype = self.dtype
-                except Exception:
-                    pass
 
         # Derive context length and model shapes
         self._derive_context_length(context_length)
@@ -609,6 +598,49 @@ class ModelConfig:
             speculative_algorithm=server_args.speculative_algorithm,
             **kwargs,
         )
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """The dtype the model actually runs in."""
+        return self._dtype
+
+    @dtype.setter
+    def dtype(self, value: torch.dtype) -> None:
+        """Set the runtime dtype and pin it onto the HF config(s).
+
+        Every downstream consumer that reads `config.torch_dtype` / `config.dtype`
+        (GDN RMSNormGated, the mamba conv/ssm state-cache dtype, ...) must see
+        the dtype the model actually runs in -- not the raw checkpoint value,
+        which may be missing (-> "auto" downcast to float16), overridden via
+        --dtype, or contradicted at RUNTIME.
+
+        This is a property rather than a plain attribute precisely because of
+        that last case. `_get_and_verify_dtype` is not the last word: ModelRunner
+        re-decides the dtype during `load_model()` when the device has no
+        bfloat16 (`_needs_float16_fallback()`, sm75 / gfx900) and assigns
+        `model_config.dtype = torch.float16`. A pin performed only once in
+        __init__ is stale from that moment on, and the HF config still says
+        bfloat16 while the model emits float16 -- which is how a hybrid GDN
+        model (Qwen3.5) came apart on sm75: the conv-state cache was built
+        bfloat16 from the config, the GDN in_proj wrote float16 into it, and the
+        boot died with `Index put requires source and destination dtypes match`
+        (gdn_backend.py). Pinning on assignment makes the runtime override
+        propagate by construction, with no second code path to keep in sync.
+
+        SGLANG_MAMBA_CONV_DTYPE keeps its precedence: mamba_utils checks the
+        explicit env override BEFORE consulting the config, so this only ever
+        supplies the default.
+        """
+        self._dtype = value
+        for _cfg in (
+            getattr(self, "hf_config", None),
+            getattr(self, "hf_text_config", None),
+        ):
+            if _cfg is not None:
+                try:
+                    _cfg.torch_dtype = value
+                except Exception:
+                    pass
 
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
