@@ -182,6 +182,31 @@ llama.cpp/ik_llama.cpp have no comparable alternate-depth-graph concept to alias
 
 **Fork status:** Implemented — validated on a 122B-A10B MoE across three mismatched GPUs.
 
+**KV-pool reclaim (#119).** The weight VRAM the offload frees is claimed by the KV pool. No second
+sizing path exists and none is needed: the KV budget is profiled from a live free-memory reading
+taken after the weights are resident, so the reclaim lands in it by construction — provided the
+release has happened, on every rank, before anyone measures. #123's eager install (right after
+`load_model`, ahead of pool sizing) supplies the first half; #119 adds the parts that make it hold:
+
+- an **ordering invariant** — a FusedMoE layer still waiting to install when the pool is sized is a
+  hard error, not a silent fallback to the pre-#123 behaviour where the pool was sized against the
+  pre-offload footprint (the #77 "known limitation");
+- a **group-ordered release** — `gc.collect() -> empty_cache() -> barrier` before any rank reads
+  `mem_get_info()`. That reading is driver-level and therefore sees co-located siblings, while the
+  caching allocator only returns freed blocks at `empty_cache()`; unsynchronized, a rank that reads
+  early counts a sibling's already-released expert weights as still occupied. Below the offload the
+  skew was small — at f=0.25 on the 122B run it is the whole reclaim (~18 GiB on the shared card);
+- a **rank-uniform verdict** — "the reclaim is present" is a MIN over the TP group, so a rank that
+  released nothing (MoE-free shard, failed install) makes the whole group take the plain path
+  rather than half the ranks synchronizing while the other half measures unsynchronized;
+- **accounting** — released device/host bytes are tallied per rank and logged next to the resulting
+  KV budget (`[offload-kv-regain]`), so the win is readable from a boot log.
+
+No new budget term is introduced, so the #68 graph-capture reserve is untouched: the reclaim
+arrives as free bytes and is spent net of the same reserves as any other free byte. Switch:
+`SGLANG_MOE_OFFLOAD_KV_REGAIN` (default on, additionally gated on
+`SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0`, so the no-offload path is byte-identical).
+
 **Upstream:** SGLang/vLLM offload weights layer-granularly (`--cpu-offload-gb`), not
 expert-granularly, and not combined with asymmetric TP/DCP (partial). llama.cpp/ik_llama.cpp have
 the same expert-granular idea (`-ot`/`-ncmoe`/`--n-cpu-moe`; ik_llama.cpp also runs its own
