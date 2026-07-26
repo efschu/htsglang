@@ -138,6 +138,75 @@ def _worker(rank, world, store, q):
             torch.cat(parts, dim=0))
         t.chunk_bytes = 4 << 20
 
+        # ---- pipelining (task #198) -------------------------------------
+        #
+        # The pipelined all_reduce writes the result chunk by chunk out of two
+        # rotating slot sets. A reference built from `randn` would not notice
+        # a chunk landing at the wrong offset, or two chunks swapped, as long
+        # as the sums happened to be close -- so these use payloads whose
+        # every element is DISTINCT and position-dependent. A misplaced chunk
+        # then shows up as a large max|delta|, not as noise.
+        t.chunk_bytes = 4096  # 1024 fp32 elements per chunk
+        for label, count in (
+            ("aligned-4chunks", 4096),      # exact multiple of the chunk
+            ("ragged-tail", 4096 + 7),      # short final chunk
+            ("one-past-boundary", 1025),    # 2 chunks, second holds 1 element
+            ("exact-one-chunk", 1024),      # boundary case: no pipelining at all
+            ("sub-chunk", 3),               # smaller than one chunk
+            ("odd", 4999),
+        ):
+            ramp = [
+                torch.arange(count, dtype=torch.float32) * (r + 1) + r * 1e5
+                for r in range(world)
+            ]
+            chk(f"all_reduce/pipeline/{label}",
+                t.htccl_all_reduce(comm, ramp[rank].clone()), sum(ramp), 1e-2)
+
+        # Same, with a progress interleave so short that every sub-block
+        # boundary inside a chunk is exercised too.
+        t.progress_bytes = 512
+        ramp = [
+            torch.arange(5000, dtype=torch.float32) * (r + 3) + r * 7e4
+            for r in range(world)
+        ]
+        chk("all_reduce/pipeline/fine-progress",
+            t.htccl_all_reduce(comm, ramp[rank].clone()), sum(ramp), 1e-2)
+        t.progress_bytes = 256 * 1024
+
+        # Back-to-back multi-chunk collectives: the slot parities rotate
+        # across calls, so a stale slot from the previous collective would
+        # corrupt this one. Both results must stay independent and correct.
+        first = t.htccl_all_reduce(comm, ramp[rank].clone())
+        first_snapshot = first.clone()
+        second = t.htccl_all_reduce(comm, (ramp[rank] * 2).clone())
+        chk("all_reduce/pipeline/back-to-back-1", first, first_snapshot, 0.0)
+        chk("all_reduce/pipeline/back-to-back-2", second,
+            sum(r * 2 for r in ramp), 1e-2)
+        if first.data_ptr() == second.data_ptr():
+            fails.append("pipelined all_reduce returned an aliased buffer")
+
+        # bf16 in, fp32 on the wire: the chunk length is counted in REDUCE
+        # elements, so an input-element-size mix-up shows up here as a
+        # misplaced tail.
+        bramp = [
+            (torch.arange(3000, dtype=torch.float32) * 0.01 + r).bfloat16()
+            for r in range(world)
+        ]
+        chk("all_reduce/pipeline/bf16",
+            t.htccl_all_reduce(comm, bramp[rank].clone()).float(),
+            sum(b.float() for b in bramp), 3e-1)
+
+        # The pipelined and unpipelined paths must agree exactly -- same
+        # accumulation order, same result, byte for byte.
+        payload = torch.arange(4096 + 5, dtype=torch.float32) * (rank + 1)
+        piped = t.htccl_all_reduce(comm, payload.clone())
+        was = t.pipeline  # restore, never assign True back
+        t.pipeline = False
+        plain = t.htccl_all_reduce(comm, payload.clone())
+        t.pipeline = was
+        chk("all_reduce/pipeline/matches-unpipelined", piped, plain, 0.0)
+        t.chunk_bytes = 4 << 20
+
         for _ in range(3):
             t.barrier()
 

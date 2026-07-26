@@ -508,6 +508,80 @@ regression vs 4 MiB is CPU-memory-bound, not link-bound — V1 makes four passes
 (stage in, wire, accumulate, stage out), ~4x32 MiB of host traffic that is not overlapped with the
 wire. Chunked pipelining of D2H against the transfer is the fix and belongs to L2.
 
+**L2 (task #198) — transport-level speed-up. Both L1 gaps closed; measured, not projected.**
+
+*Where the 12 us barrier actually was.* Profiled on the real link (phase timestamps inside the
+barrier, 2000 samples), and cross-checked against a same-host `self/sm/tcp` run whose barrier was
+**10.9 us** — i.e. the wire contributed essentially nothing and the number was ~100% software.
+The 12.37 us split: setup 1.43 (a `fill_(0)` on a byte nobody reads, plus a peer dict rebuilt with
+f-string keys per call), posting 4.29 (two ctypes crossings wrapped in eagerly formatted error
+strings, per-post `data_ptr`/`numel`/`element_size`, a `c_void_p` object per post), waiting 4.13
+(median 5-6 spin passes, each rebuilding a list and reading the clock). So ~7 us of the 12 was
+bookkeeping around two library calls.
+
+*Where the 32 MiB regression actually was.* Measured directly: the four host passes over 32 MiB
+cost **9.4 ms single-threaded**, and a 32 MiB buffer runs at ~13 GiB/s versus ~34 GiB/s for a
+4 MiB one because it no longer fits in L3. Against a ~13 ms wire budget that fully accounts for
+the 23.6 ms observed. So the fix is worth about as much for *cache locality* as for overlap.
+
+*What changed.* (a) **Pipelined `all_reduce`** — the payload is processed chunk by chunk out of
+two rotating slot sets, scheduled `stage-in(k+1) -> wait(k) -> post(k+1) -> finish(k)`, so the
+stage-in sits under chunk k's transfer and the accumulate + copy-out sit under chunk k+1's.
+(b) **Progress interleaving** — the staged copies call `ucp_worker_progress` every
+`SGLANG_HTCCL_UCX_PROGRESS_KIB` (default 256). This is load-bearing, not defensive: without it the
+rendezvous handshake for the next chunk cannot start while the CPU is inside a several-hundred-
+microsecond memcpy, and the measured 32 MiB figure falls from 17.4 to **13.8 Gbit/s**.
+(c) **Short small-message path** — precomputed barrier slots and staging records
+(`view, ptr, nbytes` memoised together), error strings built only on failure, bound ctypes function
+objects, a single-request fast path in `wait`, and a dedicated single-chunk branch in `all_reduce`
+so a decode-sized collective never builds the pipeline's closures. `SGLANG_HTCCL_UCX_PIPELINE=0`
+restores the old path as an A/B control.
+
+*Cross-rig result*, 40G RoCE, `UCX_TLS=rc`, world 2, median of 5 reps of per-cell medians, both
+directions live:
+
+| cell | L1 (#117) | L2 (#198) | |
+|---|---|---|---|
+| 8 KiB | 37.0 us / 1.77 Gbit/s | **26.6 us / 2.47 Gbit/s** | -28% latency |
+| 64 KiB | 60.2 us / 8.71 | **50.4 us / 10.39** | -16% |
+| 512 KiB | 232.9 us / 18.01 | **223.3 us / 18.78** | -4% |
+| 4 MiB | 1625.7 us / 20.64 | **1583.3 us / 21.19** | -3% (was already at the wire) |
+| 32 MiB | 24.30 ms / 11.05 | **15.42 ms / 17.41** | **-37% / +58%** |
+| barrier | 12 us (min 9.9) | **5.5 us** | -54% |
+
+The 32 MiB point moved from 53% of the 4 MiB peak to **82%** of it. The barrier's remaining 5.5 us
+is now 0.20 setup / 2.25 posting / 3.08 waiting, i.e. mostly the ctypes marshalling floor for two
+5-argument calls plus 5 poll passes over a ~1.5 us link — the next lever there is fewer crossings,
+not cheaper ones.
+
+*Sweep, for whoever tunes further:* at 32 MiB, `CHUNK_MIB=2` gave 17.72 and `CHUNK_MIB=8` gave
+17.34 Gbit/s against 17.41 at the default 4 — within ~1.5x the run-to-run spread, so the default
+was left alone rather than tuned to this one link.
+
+*Deliberately NOT pipelined:* the ring `all_reduce` (world > 2 only, and this fleet has two rigs,
+so it cannot be measured here), `all_gather` and `broadcast`. They inherit the cheaper post/wait
+path but still make unoverlapped host passes; `all_gather` is the one worth doing next, since TP
+activations go through it.
+
+*Overlap design sketch (analysis only — NOT implemented).* The transport is now within ~20% of the
+wire at large sizes, which makes the next order of magnitude a *scheduling* problem, not a
+transport one: in the TP=4 cross-rig L0 run the main rig was **87% idle**, waiting in lock step.
+Every collective here is synchronous — the caller blocks from post to completion — so the model's
+compute cannot cover the link. The shape of the fix, mirroring the DCP collective-overlap work
+(#128): split each collective into `all_reduce_async(inp) -> handle` and `wait(handle) -> out`,
+where the async half stages, posts, and returns immediately, and the wait half progresses the
+worker and finishes the accumulate + copy-out. The transport already has the pieces — the request
+list *is* the handle, `_pipelined_all_reduce`'s staged slot dict is already a per-collective
+carrier, and the pipeline loop already proves the CPU work can be deferred past the post. What it
+does not have, and what the follow-up task must add: (i) slot ownership that survives past the
+call, so an outstanding handle's staging buffers cannot be reused by the next collective — the
+two-parity rotation must become an allocator with a free list, and this is exactly the
+shared-buffer trap this file has been bitten by before; (ii) a rule for who progresses the worker
+while the caller is off computing, since UCX makes no progress unattended for handshakes;
+(iii) an ordering contract, because `_next_seq` assumes collectives complete in issue order.
+The consumer side (issuing the all-reduce of layer N and waiting for it after layer N+1's GEMM)
+is a model-runner change and belongs with #128's machinery, not here.
+
 *GPU staging end-to-end (TP=2 cross-rig with a real model) is written up but deliberately NOT run
 yet* — see the recipe below.
 

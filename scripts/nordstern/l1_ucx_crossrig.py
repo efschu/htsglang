@@ -67,6 +67,9 @@ def main() -> int:
     ap.add_argument("--comm-dir", required=True,
                     help="path to .../distributed/device_communicators")
     ap.add_argument("--bench", action="store_true")
+    ap.add_argument("--reps", type=int, default=3,
+                    help="repeat the whole bench cell set N times; the "
+                         "reported figure is the median of the per-rep medians")
     ap.add_argument("--expect-version-mismatch", action="store_true",
                     help="succeed only if the parity check REJECTS the group")
     args = ap.parse_args()
@@ -160,6 +163,26 @@ def main() -> int:
     t.chunk_bytes = 8192  # force multi-chunk transfers
     chk("all_reduce/chunked", t.htccl_all_reduce(comm, parts[R].clone()),
         sum(parts), 1e-4)
+
+    # Pipelining (task #198) over the REAL link: ramps, not randn, so a chunk
+    # landing at the wrong offset is a large delta rather than plausible noise.
+    for label, count in (("aligned", 8192), ("ragged", 8192 + 11),
+                         ("one-past-boundary", 2049), ("sub-chunk", 5)):
+        ramp = [torch.arange(count, dtype=torch.float32) * (r + 1) + r * 1e5
+                for r in range(W)]
+        chk(f"pipeline/{label}", t.htccl_all_reduce(comm, ramp[R].clone()),
+            sum(ramp), 1e-2)
+    ramp = [torch.arange(9000, dtype=torch.float32) * (r + 3) for r in range(W)]
+    piped = t.htccl_all_reduce(comm, ramp[R].clone())
+    # Save and RESTORE, never assign True back: the bench below reports which
+    # path it measured, and a hard-coded restore would silently re-enable
+    # pipelining in the SGLANG_HTCCL_UCX_PIPELINE=0 control run -- turning the
+    # A/B into a measurement of the same code twice.
+    was = t.pipeline
+    t.pipeline = False
+    plain = t.htccl_all_reduce(comm, ramp[R].clone())
+    t.pipeline = was
+    chk("pipeline/matches-unpipelined", piped, plain, 0.0)
     t.chunk_bytes = 4 << 20
 
     for _ in range(5):
@@ -167,31 +190,45 @@ def main() -> int:
     print(f"[rank {R}] ok   barrier x5", flush=True)
 
     if args.bench:
-        print(f"[rank {R}] --- throughput (all_reduce, world={W}) ---", flush=True)
-        for mib in (0.0078125, 0.0625, 0.5, 4, 32):
-            n = max(int(mib * 1024 * 1024 / 4), 2)
-            x = torch.randn(n)
-            for _ in range(3):
-                t.htccl_all_reduce(comm, x)
-            iters = 50 if mib < 1 else 10
-            samples = []
-            for _ in range(iters):
+        # `--reps` runs the whole cell set end to end several times and
+        # reports the median OF THE PER-REP MEDIANS. Repeating inside one rep
+        # would only average away jitter within a single scheduling window;
+        # the run-to-run spread on a shared link is the one that matters.
+        print(f"[rank {R}] --- throughput (all_reduce, world={W}, "
+              f"reps={args.reps}, pipeline={t.pipeline}) ---", flush=True)
+        cells = (0.0078125, 0.0625, 0.5, 4, 32)
+        per_rep = {mib: [] for mib in cells}
+        bar_reps = []
+        for _ in range(args.reps):
+            for mib in cells:
+                n = max(int(mib * 1024 * 1024 / 4), 2)
+                x = torch.randn(n)
+                for _ in range(3):
+                    t.htccl_all_reduce(comm, x)
+                iters = 50 if mib < 1 else 10
+                samples = []
+                for _ in range(iters):
+                    t0 = time.perf_counter()
+                    t.htccl_all_reduce(comm, x)
+                    samples.append(time.perf_counter() - t0)
+                per_rep[mib].append(statistics.median(samples))
+            bar = []
+            for _ in range(200):
                 t0 = time.perf_counter()
-                t.htccl_all_reduce(comm, x)
-                samples.append(time.perf_counter() - t0)
-            med = statistics.median(samples)
-            nbytes = n * 4
-            gbps = nbytes * 8 / med / 1e9
-            print(f"[rank {R}] all_reduce {nbytes/1024:9.1f} KiB  "
-                  f"median {med*1e6:9.1f} us  {gbps:6.2f} Gbit/s", flush=True)
+                t.barrier()
+                bar.append(time.perf_counter() - t0)
+            bar_reps.append(statistics.median(bar))
 
-        bar = []
-        for _ in range(200):
-            t0 = time.perf_counter()
-            t.barrier()
-            bar.append(time.perf_counter() - t0)
-        print(f"[rank {R}] barrier median {statistics.median(bar)*1e6:.1f} us  "
-              f"min {min(bar)*1e6:.1f} us", flush=True)
+        for mib in cells:
+            med = statistics.median(per_rep[mib])
+            nbytes = max(int(mib * 1024 * 1024 / 4), 2) * 4
+            spread = max(per_rep[mib]) - min(per_rep[mib])
+            print(f"[rank {R}] all_reduce {nbytes/1024:9.1f} KiB  "
+                  f"median {med*1e6:9.1f} us  {nbytes*8/med/1e9:6.2f} Gbit/s "
+                  f"(rep spread {spread*1e6:.1f} us)", flush=True)
+        print(f"[rank {R}] barrier median {statistics.median(bar_reps)*1e6:.1f} us "
+              f"(reps: "
+              f"{', '.join(f'{b*1e6:.1f}' for b in bar_reps)})", flush=True)
 
     t.close()
     dist.destroy_process_group()

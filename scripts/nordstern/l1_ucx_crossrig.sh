@@ -23,6 +23,8 @@
 # Usage:
 #   ./l1_ucx_crossrig.sh              # correctness + throughput over RDMA
 #   ./l1_ucx_crossrig.sh --mismatch   # prove the parity check rejects 1.18 vs 1.16
+#   ./l1_ucx_crossrig.sh --reps 5     # extra args go to both ranks
+#   EXTRA_ENV=SGLANG_HTCCL_UCX_PIPELINE=0 ./l1_ucx_crossrig.sh   # A/B control
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -55,7 +57,15 @@ MODE_FLAG="--bench"
 if [[ "${1:-}" == "--mismatch" ]]; then
   MODE_FLAG="--expect-version-mismatch"
   R0_UCX_LIB=""   # let rank 0 load its native 1.18.1 -> a real mismatch
+  shift
 fi
+# Anything left on the command line goes to BOTH ranks (e.g. --reps 5).
+EXTRA_ARGS=("$@")
+# EXTRA_ENV is applied to both ranks identically -- the A/B control for the
+# pipelining measurement is EXTRA_ENV="SGLANG_HTCCL_UCX_PIPELINE=0". Both
+# sides must agree: the two paths post the same tags in the same order, but
+# only a group that is uniformly configured is a meaningful measurement.
+EXTRA_ENV="${EXTRA_ENV:-}"
 
 echo "== staging to both rigs (port $PORT) =="
 for spec in "R0" "R1"; do
@@ -73,8 +83,9 @@ echo "== launching rank 1 (second rig, 10.10.10.2) =="
 # timeout here is the normal, expected exit path.
 timeout 25 "${R1_SSH[@]}" "cd $STAGE && setsid env \
   GLOO_SOCKET_IFNAME=$R1_LAN_IF UCX_TLS=rc,self,sm UCX_IB_GID_INDEX=3 UCX_NET_DEVICES=$R1_IB \
+  $EXTRA_ENV \
   $R1_PY l1_ucx_crossrig.py --rank 1 --world 2 --master-addr $MASTER_ADDR \
-  --master-port $PORT --comm-dir $STAGE $MODE_FLAG \
+  --master-port $PORT --comm-dir $STAGE $MODE_FLAG ${EXTRA_ARGS[*]} \
   </dev/null >$STAGE/r1.log 2>&1 & echo rank1-launched" || true
 sleep 4
 
@@ -83,9 +94,9 @@ R0_LIB_ENV=""
 [[ -n "$R0_UCX_LIB" ]] && R0_LIB_ENV="SGLANG_HTCCL_UCX_LIB=$R0_UCX_LIB"
 "${R0_SSH[@]}" "cd $STAGE && env \
   GLOO_SOCKET_IFNAME=$R0_LAN_IF UCX_TLS=rc,self,sm UCX_IB_GID_INDEX=3 UCX_NET_DEVICES=$R0_IB \
-  $R0_LIB_ENV \
+  $R0_LIB_ENV $EXTRA_ENV \
   $R0_PY l1_ucx_crossrig.py --rank 0 --world 2 --master-addr $MASTER_ADDR \
-  --master-port $PORT --comm-dir $STAGE $MODE_FLAG"
+  --master-port $PORT --comm-dir $STAGE $MODE_FLAG ${EXTRA_ARGS[*]}"
 RC=$?
 
 echo "== rank 1 log =="
