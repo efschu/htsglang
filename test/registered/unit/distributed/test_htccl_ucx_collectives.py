@@ -205,6 +205,63 @@ def _worker(rank, world, store, q):
         plain = t.htccl_all_reduce(comm, payload.clone())
         t.pipeline = was
         chk("all_reduce/pipeline/matches-unpipelined", piped, plain, 0.0)
+
+        # ---- all_gather pipelining (task #198, block 2) ------------------
+        #
+        # Pure data movement, so every reference here is EXACT (atol 0.0):
+        # a chunk landing at the wrong offset, in the wrong rank's row, or
+        # out of a stale slot is a hard failure, never tolerance noise.
+        for label, count in (
+            ("aligned-4chunks", 4096),
+            ("ragged-tail", 4096 + 7),
+            ("one-past-boundary", 1025),
+            ("sub-chunk", 3),
+            ("odd", 4999),
+        ):
+            gramp = [
+                torch.arange(count, dtype=torch.float32) * (r + 1) + r * 1e5
+                for r in range(world)
+            ]
+            chk(f"all_gather/pipeline/{label}",
+                t.htccl_all_gather(comm, gramp[rank].clone(), 0),
+                torch.cat(gramp, dim=0), 0.0)
+
+        # Chunking is over the FLAT input, axis handling over the output; a
+        # mix-up between the two scrambles rows across ranks.
+        gramp2 = [
+            (torch.arange(6000, dtype=torch.float32) * (r + 2)).reshape(6, 1000)
+            for r in range(world)
+        ]
+        for dim in (0, 1, -1):
+            chk(f"all_gather/pipeline/2d-dim={dim}",
+                t.htccl_all_gather(comm, gramp2[rank].clone(), dim),
+                torch.cat(gramp2, dim=dim), 0.0)
+
+        # Pipelined vs unpipelined, and the single-chunk fast path vs the
+        # generic path: all bit-identical, they are all pure copies.
+        gramp = [torch.arange(9000, dtype=torch.float32) * (r + 3)
+                 for r in range(world)]
+        g_piped = t.htccl_all_gather(comm, gramp[rank].clone(), 0)
+        was = t.pipeline  # restore, never assign True back
+        t.pipeline = False
+        g_plain = t.htccl_all_gather(comm, gramp[rank].clone(), 0)
+        t.pipeline = was
+        chk("all_gather/pipeline/matches-unpipelined", g_piped, g_plain, 0.0)
+
+        small = [
+            (torch.arange(500, dtype=torch.float32) * (r + 1)).reshape(20, 25)
+            for r in range(world)
+        ]
+        for dim in (0, 1):
+            g_fast = t.htccl_all_gather(comm, small[rank].clone(), dim)
+            was = t.pipeline
+            t.pipeline = False
+            g_gen = t.htccl_all_gather(comm, small[rank].clone(), dim)
+            t.pipeline = was
+            chk(f"all_gather/fastpath/matches-generic-dim={dim}",
+                g_fast, g_gen, 0.0)
+            chk(f"all_gather/fastpath/reference-dim={dim}", g_fast,
+                torch.cat(small, dim=dim), 0.0)
         t.chunk_bytes = 4 << 20
 
         for _ in range(3):

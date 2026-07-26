@@ -183,6 +183,23 @@ def main() -> int:
     plain = t.htccl_all_reduce(comm, ramp[R].clone())
     t.pipeline = was
     chk("pipeline/matches-unpipelined", piped, plain, 0.0)
+
+    # all_gather pipelining over the real link: pure data movement, so the
+    # reference is EXACT (atol 0) -- a misplaced chunk is a hard failure.
+    for label, count in (("aligned", 8192), ("ragged", 8192 + 11),
+                         ("one-past-boundary", 2049), ("sub-chunk", 5)):
+        ramp = [torch.arange(count, dtype=torch.float32) * (r + 1) + r * 1e5
+                for r in range(W)]
+        chk(f"ag-pipeline/{label}",
+            t.htccl_all_gather(comm, ramp[R].clone(), 0),
+            torch.cat(ramp, dim=0), 0.0)
+    ramp = [torch.arange(9000, dtype=torch.float32) * (r + 3) for r in range(W)]
+    g_piped = t.htccl_all_gather(comm, ramp[R].clone(), 0)
+    was = t.pipeline  # save/restore, same reason as the all_reduce toggle
+    t.pipeline = False
+    g_plain = t.htccl_all_gather(comm, ramp[R].clone(), 0)
+    t.pipeline = was
+    chk("ag-pipeline/matches-unpipelined", g_piped, g_plain, 0.0)
     t.chunk_bytes = 4 << 20
 
     for _ in range(5):
@@ -197,21 +214,29 @@ def main() -> int:
         print(f"[rank {R}] --- throughput (all_reduce, world={W}, "
               f"reps={args.reps}, pipeline={t.pipeline}) ---", flush=True)
         cells = (0.0078125, 0.0625, 0.5, 4, 32)
-        per_rep = {mib: [] for mib in cells}
+        # Both ops share the cell set. all_reduce stays first and complete --
+        # the 8 KiB cell is the decode path and re-measuring it after every
+        # transport change is the standing rule of this harness.
+        ops = (
+            ("all_reduce", lambda x: t.htccl_all_reduce(comm, x)),
+            ("all_gather", lambda x: t.htccl_all_gather(comm, x, 0)),
+        )
+        per_rep = {(name, mib): [] for name, _ in ops for mib in cells}
         bar_reps = []
         for _ in range(args.reps):
-            for mib in cells:
-                n = max(int(mib * 1024 * 1024 / 4), 2)
-                x = torch.randn(n)
-                for _ in range(3):
-                    t.htccl_all_reduce(comm, x)
-                iters = 50 if mib < 1 else 10
-                samples = []
-                for _ in range(iters):
-                    t0 = time.perf_counter()
-                    t.htccl_all_reduce(comm, x)
-                    samples.append(time.perf_counter() - t0)
-                per_rep[mib].append(statistics.median(samples))
+            for name, fn in ops:
+                for mib in cells:
+                    n = max(int(mib * 1024 * 1024 / 4), 2)
+                    x = torch.randn(n)
+                    for _ in range(3):
+                        fn(x)
+                    iters = 50 if mib < 1 else 10
+                    samples = []
+                    for _ in range(iters):
+                        t0 = time.perf_counter()
+                        fn(x)
+                        samples.append(time.perf_counter() - t0)
+                    per_rep[(name, mib)].append(statistics.median(samples))
             bar = []
             for _ in range(200):
                 t0 = time.perf_counter()
@@ -219,13 +244,14 @@ def main() -> int:
                 bar.append(time.perf_counter() - t0)
             bar_reps.append(statistics.median(bar))
 
-        for mib in cells:
-            med = statistics.median(per_rep[mib])
-            nbytes = max(int(mib * 1024 * 1024 / 4), 2) * 4
-            spread = max(per_rep[mib]) - min(per_rep[mib])
-            print(f"[rank {R}] all_reduce {nbytes/1024:9.1f} KiB  "
-                  f"median {med*1e6:9.1f} us  {nbytes*8/med/1e9:6.2f} Gbit/s "
-                  f"(rep spread {spread*1e6:.1f} us)", flush=True)
+        for name, _ in ops:
+            for mib in cells:
+                med = statistics.median(per_rep[(name, mib)])
+                nbytes = max(int(mib * 1024 * 1024 / 4), 2) * 4
+                spread = max(per_rep[(name, mib)]) - min(per_rep[(name, mib)])
+                print(f"[rank {R}] {name} {nbytes/1024:9.1f} KiB  "
+                      f"median {med*1e6:9.1f} us  {nbytes*8/med/1e9:6.2f} Gbit/s "
+                      f"(rep spread {spread*1e6:.1f} us)", flush=True)
         print(f"[rank {R}] barrier median {statistics.median(bar_reps)*1e6:.1f} us "
               f"(reps: "
               f"{', '.join(f'{b*1e6:.1f}' for b in bar_reps)})", flush=True)

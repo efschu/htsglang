@@ -158,6 +158,15 @@ class HTCCLUcxTransport:
             (f"ar_s{par}", tuple(f"ar_r{par}_{p}" for p in self._peers))
             for par in (0, 1)
         )
+        # Same two-parity layout for all_gather. Distinct keys from the
+        # all_reduce set on purpose: sharing them would be functionally safe
+        # today (collectives are strictly serialised under self._lock) but
+        # would make slot lifetime depend on that serialisation -- the exact
+        # comment-only invariant the async follow-up must not inherit.
+        self._ag_keys = tuple(
+            (f"ag_s{par}", tuple(f"ag_r{par}_{p}" for p in self._peers))
+            for par in (0, 1)
+        )
         self._bar_slots = None
 
         if self.world_size > 256:
@@ -711,6 +720,83 @@ class HTCCLUcxTransport:
     # all_gather
     # ------------------------------------------------------------------
 
+    def _pipelined_all_gather(
+        self, inp: torch.Tensor, out_rows: torch.Tensor, n: int, seq: int
+    ) -> None:
+        """Chunked flat all_gather that overlaps the host passes with the wire.
+
+        Same schedule and the same slot-ownership discipline as
+        :meth:`_pipelined_all_reduce` -- read the ownership section there
+        before changing anything here. The differences are exactly two:
+
+        * No arithmetic. finish(k) only scatters each peer's received chunk
+          into that peer's row of ``out_rows``, so pipelined and unpipelined
+          agree bit for bit by construction (the selftest pins that down).
+        * This rank's own slice never crosses the wire: it is copied
+          device-locally from ``inp`` into its output row inside finish(k) --
+          on a GPU that is a D2D copy that skips the host round trip
+          entirely, and doing it per chunk keeps it underneath chunk k+1's
+          transfer like every other finish pass.
+
+        ``out_rows`` is the caller's freshly allocated ``(world, *shape)``
+        output -- contiguous by construction, so the per-rank flat views
+        below are views, never copies.
+        """
+        dtype = inp.dtype
+        esz = dtype.itemsize
+        chunk = max(self.chunk_bytes // esz, 1)
+        peers = self._peers
+        src = inp.reshape(-1)
+        dsts = tuple(out_rows[p].reshape(-1) for p in range(self.world_size))
+        own = dsts[self.rank]
+
+        n_chunks = (n + chunk - 1) // chunk
+        if n_chunks > 0xFFFFFF:
+            raise UcxError(
+                f"htccl ucx: all_gather of {n * esz} bytes needs {n_chunks} "
+                f"chunks, more than the 2^24 the tag layout encodes. Raise "
+                f"SGLANG_HTCCL_UCX_CHUNK_MIB."
+            )
+        prog = self.worker.progress if self.progress_bytes > 0 else None
+        staged: dict = {}
+
+        def stage(k: int) -> None:
+            par = k & 1
+            off = k * chunk
+            count = n - off if off + chunk > n else chunk
+            skey, rkeys = self._ag_keys[par]
+            send_view, send_ptr, send_nbytes = self._slot(skey, count, dtype)
+            self._staged_copy(send_view, src[off : off + count], prog)
+            recvs = [self._slot(rkeys[i], count, dtype) for i in range(len(peers))]
+            staged[par] = (off, count, send_ptr, send_nbytes, recvs)
+
+        def post(k: int) -> list:
+            _, _, send_ptr, send_nbytes, recvs = staged[k & 1]
+            reqs = []
+            # Receives first, as everywhere else in this file.
+            for i, peer in enumerate(peers):
+                reqs += self._post_recv_bytes(
+                    peer, recvs[i][1], recvs[i][2], seq, 0, k
+                )
+            for peer in peers:
+                reqs += self._post_send_bytes(peer, send_ptr, send_nbytes, seq, 0, k)
+            return reqs
+
+        stage(0)
+        reqs = post(0)
+        for k in range(n_chunks):
+            nxt = k + 1
+            has_next = nxt < n_chunks
+            if has_next:
+                stage(nxt)
+            self.worker.wait(reqs)
+            if has_next:
+                reqs = post(nxt)
+            off, count, _, _, recvs = staged[k & 1]
+            for i, peer in enumerate(peers):
+                self._staged_copy(dsts[peer][off : off + count], recvs[i][0], prog)
+            self._staged_copy(own[off : off + count], src[off : off + count], prog)
+
     def htccl_all_gather(self, comm, inp: torch.Tensor, dim: int) -> torch.Tensor:
         """Concatenate every rank's ``inp`` along ``dim``.
 
@@ -726,23 +812,65 @@ class HTCCLUcxTransport:
             input_size = inp.size()
             n = inp.numel()
 
-            send = self._staging("ag_s", n, inp.dtype)
-            send.copy_(inp.reshape(-1))
-            recvs = {
-                p: self._staging(f"ag_r{p}", n, inp.dtype)
-                for p in range(self.world_size)
-                if p != self.rank
-            }
-            self._exchange_all(send, recvs, seq)
-
             output = torch.empty(
                 (self.world_size,) + tuple(input_size),
                 dtype=inp.dtype,
                 device=inp.device,
             )
-            for p in range(self.world_size):
-                src = send if p == self.rank else recvs[p]
-                output[p].reshape(-1).copy_(src)
+
+            if self.pipeline:
+                if n > max(self.chunk_bytes // inp.dtype.itemsize, 1):
+                    self._pipelined_all_gather(inp, output, n, seq)
+                else:
+                    # Single-chunk fast path: the same one-step flat exchange
+                    # as the generic branch below, with the per-call staging
+                    # dict, its eagerly formatted keys and the extra call
+                    # layers stripped -- the all_gather twin of the
+                    # single-chunk branch in _pipelined_all_reduce. This is
+                    # what a decode-sized all_gather (logits gather, DCP
+                    # merges) hits, and at that size the bookkeeping was a
+                    # third of the whole collective.
+                    src = inp.reshape(-1)
+                    skey, rkeys = self._ag_keys[0]
+                    send_view, send_ptr, send_nbytes = self._slot(
+                        skey, n, inp.dtype
+                    )
+                    send_view.copy_(src)
+                    reqs = []
+                    recv_views = []
+                    for i, peer in enumerate(self._peers):
+                        rv, rptr, rnbytes = self._slot(rkeys[i], n, inp.dtype)
+                        recv_views.append(rv)
+                        reqs.append(
+                            self.worker.post_recv(rptr, rnbytes, _tag(seq, 0, peer, 0))
+                        )
+                    for peer in self._peers:
+                        reqs.append(
+                            self.worker.post_send(
+                                peer, send_ptr, send_nbytes, _tag(seq, 0, self.rank, 0)
+                            )
+                        )
+                    self.worker.wait(reqs)
+                    for i, peer in enumerate(self._peers):
+                        output[peer].reshape(-1).copy_(recv_views[i])
+                    # Own slice straight from the input -- on a GPU a D2D
+                    # copy that never touches the host staging buffer.
+                    output[self.rank].reshape(-1).copy_(src)
+            else:
+                # Pre-pipelining path, kept verbatim as the A/B control
+                # (SGLANG_HTCCL_UCX_PIPELINE=0).
+                send = self._staging("ag_s", n, inp.dtype)
+                send.copy_(inp.reshape(-1))
+                recvs = {
+                    p: self._staging(f"ag_r{p}", n, inp.dtype)
+                    for p in range(self.world_size)
+                    if p != self.rank
+                }
+                self._exchange_all(send, recvs, seq)
+                for p in range(self.world_size):
+                    src = send if p == self.rank else recvs[p]
+                    output[p].reshape(-1).copy_(src)
+
             output = output.movedim(0, dim)
             return output.reshape(
                 input_size[:dim]

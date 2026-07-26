@@ -559,9 +559,31 @@ not cheaper ones.
 was left alone rather than tuned to this one link.
 
 *Deliberately NOT pipelined:* the ring `all_reduce` (world > 2 only, and this fleet has two rigs,
-so it cannot be measured here), `all_gather` and `broadcast`. They inherit the cheaper post/wait
-path but still make unoverlapped host passes; `all_gather` is the one worth doing next, since TP
-activations go through it.
+so it cannot be measured here) and `broadcast`. They inherit the cheaper post/wait path but still
+make unoverlapped host passes.
+
+**L2 block 2 — `all_gather` pipelined + single-chunk fast path; measured honestly, including the
+part that did not move.** `all_gather` now has (a) the same two-parity chunk pipeline as
+`all_reduce` (multi-chunk payloads; own rank's slice is copied device-locally inside finish(k) and
+never crosses the wire — on a GPU that is a D2D copy) and (b) a single-chunk fast path (the
+all_gather twin of `all_reduce`'s flat branch: precomputed slots, no staging dict, no per-call key
+formatting; the own slice copies straight from the input). `SGLANG_HTCCL_UCX_PIPELINE=0` keeps the
+pre-pipelining path verbatim as the A/B control. Correctness: all references EXACT (atol 0.0 —
+all_gather is pure data movement), ramp payloads, chunk-boundary/ragged/2d-axis cases, pipelined ==
+unpipelined and fastpath == generic bit-for-bit, in the registered unit test, the local selftest
+(world 2+3) and cross-rig over RDMA; a deliberate parity-bug mutation flips 8+ tests red.
+Cross-rig numbers (reps 5): 32 MiB 26.4 -> 24.9 ms (**only ~+6%**), 512 KiB 268 -> 242 us, 8 KiB
+43.2 -> 41.2 us; all_reduce and barrier unchanged (8 KiB 27.4 us, barrier 5.2 us — the standing
+rule that every change re-measures the decode path held). *Why 32 MiB barely moved, profiled not
+guessed:* phase timers on the real link show total 22.5 ms = stage 1.4 + wait 8.1 + **finish 12.6**;
+the finish pass writes 64 MiB into a FRESHLY allocated output (mandatory — returning a reused
+buffer is the `_get_out_buf` aliasing bug), and a fresh 64 MiB CPU tensor costs ~4 ms in pure
+mmap/page-fault zero-fill (measured: 6.6 ms fresh+2 copies vs 2.7 ms into a reused buffer) plus
+DRAM bandwidth the NIC's RDMA DMA is competing for. The CPU-tensor bench is therefore the WORST
+case for all_gather (its host passes are 2x all_reduce's per byte); on the GPU path the finish
+copies are H2D/D2D DMAs and the fault storm does not exist. The structure is proven by the
+all_reduce numbers; the honest end-to-end number for all_gather comes from the model run, not from
+this cell.
 
 *Overlap design sketch (analysis only — NOT implemented).* The transport is now within ~20% of the
 wire at large sizes, which makes the next order of magnitude a *scheduling* problem, not a

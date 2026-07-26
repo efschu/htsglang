@@ -177,6 +177,94 @@ def _worker(rank, world, store, comm_dir, q):
             t.htccl_all_reduce(comm, ramp[rank].clone()), sum(ramp), 1e-2)
         t.progress_bytes = 256 * 1024
 
+        # ---- all_gather pipelining (task #198, block 2) ------------------
+        #
+        # all_gather is pure data movement -- no arithmetic -- so the
+        # reference comparison is EXACT (atol 0.0): a chunk landing at the
+        # wrong offset, in the wrong rank's row, or out of a stale slot is a
+        # hard failure, never tolerance noise. Ramps for the same reason as
+        # above: every element is distinct and position-dependent.
+        for label, count in (
+            ("aligned-4chunks", 4096),
+            ("ragged-tail", 4096 + 7),
+            ("one-past-boundary", 1025),
+            ("exact-one-chunk", 1024),
+            ("sub-chunk", 3),
+            ("odd", 4999),
+        ):
+            ramp = [
+                torch.arange(count, dtype=torch.float32) * (r + 1) + r * 1e5
+                for r in range(world)
+            ]
+            chk(f"all_gather/pipeline/{label}",
+                t.htccl_all_gather(comm, ramp[rank].clone(), 0),
+                torch.cat(ramp, dim=0), 0.0)
+
+        # Non-zero gather dim with multi-chunk payloads: the chunking is over
+        # the FLAT input, the axis handling over the output -- a mix-up
+        # between the two scrambles rows across ranks.
+        ramp2 = [
+            (torch.arange(6000, dtype=torch.float32) * (r + 2)).reshape(6, 1000)
+            for r in range(world)
+        ]
+        for dim in (0, 1, -1):
+            chk(f"all_gather/pipeline/2d-dim={dim}",
+                t.htccl_all_gather(comm, ramp2[rank].clone(), dim),
+                torch.cat(ramp2, dim=dim), 0.0)
+
+        # bf16: chunk length is counted in INPUT elements (2 bytes) -- an
+        # element-size mix-up shows up as a misplaced tail.
+        bramp2 = [
+            (torch.arange(3000, dtype=torch.float32) * 0.01 + r).bfloat16()
+            for r in range(world)
+        ]
+        chk("all_gather/pipeline/bf16",
+            t.htccl_all_gather(comm, bramp2[rank].clone(), 0),
+            torch.cat(bramp2, dim=0), 0.0)
+
+        # Back-to-back: slot parities rotate across calls; a stale slot from
+        # the first call corrupting the second, or an aliased output, fails.
+        g1 = t.htccl_all_gather(comm, ramp[rank].clone(), 0)
+        g1_snapshot = g1.clone()
+        g2 = t.htccl_all_gather(comm, (ramp[rank] * 2).clone(), 0)
+        chk("all_gather/pipeline/back-to-back-1", g1, g1_snapshot, 0.0)
+        chk("all_gather/pipeline/back-to-back-2", g2,
+            torch.cat([r * 2 for r in ramp], dim=0), 0.0)
+        if g1.data_ptr() == g2.data_ptr():
+            fails.append("pipelined all_gather returned an aliased buffer")
+
+        # Fine progress granularity across every sub-block boundary.
+        t.progress_bytes = 512
+        chk("all_gather/pipeline/fine-progress",
+            t.htccl_all_gather(comm, ramp[rank].clone(), 0),
+            torch.cat(ramp, dim=0), 0.0)
+        t.progress_bytes = 256 * 1024
+
+        # Pipelined and unpipelined must agree bit for bit (both are pure
+        # copies, so anything else is a routing bug).
+        gp = t.htccl_all_gather(comm, ramp[rank].clone(), 0)
+        was_ag = t.pipeline  # restore, never assign True back
+        t.pipeline = False
+        gu = t.htccl_all_gather(comm, ramp[rank].clone(), 0)
+        t.pipeline = was_ag
+        chk("all_gather/pipeline/matches-unpipelined", gp, gu, 0.0)
+
+        # Single-chunk FAST path vs the generic path: same exactness bar,
+        # including a non-zero dim so the axis handling is compared too.
+        small = [
+            (torch.arange(500, dtype=torch.float32) * (r + 1)).reshape(20, 25)
+            for r in range(world)
+        ]
+        for dim in (0, 1):
+            gf = t.htccl_all_gather(comm, small[rank].clone(), dim)
+            was_ag = t.pipeline
+            t.pipeline = False
+            gg = t.htccl_all_gather(comm, small[rank].clone(), dim)
+            t.pipeline = was_ag
+            chk(f"all_gather/fastpath/matches-generic-dim={dim}", gf, gg, 0.0)
+            chk(f"all_gather/fastpath/reference-dim={dim}", gf,
+                torch.cat(small, dim=dim), 0.0)
+
         # Back-to-back multi-chunk collectives: the slot parities rotate
         # across calls, so a stale slot would corrupt this one.
         first = t.htccl_all_reduce(comm, ramp[rank].clone())
