@@ -383,6 +383,13 @@ def resolve_cp_token_ratios(server_args, checkpoint_size_mib: Optional[int] = No
         # this resolver) keys on the base plan today, so decoupled token
         # ownership is NOT reachable through this door; say so instead of
         # ignoring the ask.
+        #
+        # REACHABILITY (#182): this branch is worth nothing unless a real boot
+        # gets here. configure_scheduler_process used to call the resolver
+        # only when a base plan was installed -- i.e. only when this guard
+        # could not fire -- so the guard held on a direct call and never on a
+        # server. The boot gate now keys on the token vector's own presence;
+        # see the "GUARD REACHABILITY" branch there before narrowing it again.
         from sglang.srt.environ import envs as _envs
 
         _env_vec = _envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()
