@@ -1530,3 +1530,39 @@ earlier, not a generation regression.
 No JIT source was touched by this merge (`git diff --name-only` over
 `jit_kernel/`, `*.cuh`, `*.cu` is empty), so the cold-build hazard from #172 did
 not apply and 0 incomplete cache dirs were present before and after.
+
+### #171 GPU validation -- NVIDIA side done, AMD side specified
+
+All three #171 fixes (`65beaccc5d`, `e879d35f2a`, `96d34740f6`) are ancestors of
+the arm-E boot on merge tip `2eced7a914`, so that green boot IS the NVIDIA
+regression. The fixes are meant to be INERT here, and the log shows they are:
+
+| gate | expected on NVIDIA | observed |
+|---|---|---|
+| bf16 fallback (`_needs_float16_fallback`) | never fires (sm86/sm120 have bf16) | 0 occurrences, model stays bf16 |
+| generic capability floor (`loader.py`) | no rejection | 0 rejections |
+| "floor CANNOT be enforced" warning | never (that path is ROCm-only) | 0 occurrences |
+| Marlin LoRA vendor assert | not reached | 0 occurrences |
+| boot | green | **GREEN**, capture 3.78-3.81 s |
+
+**Limit, stated:** the Marlin LoRA gate (`96d34740f6`) was NOT exercised at
+runtime -- arm E has no LoRA+MoE+Marlin path, so the assert is never reached.
+It rests on its 4 CPU tests until a config that uses it exists. The other two
+gates ARE on the executed path and are confirmed inert.
+
+**Still owed, second host (gfx900 + 2080 Ti):**
+
+1. `loader.py` floor -- an fp8 checkpoint on gfx900 must now be REFUSED at
+   startup with the vendor-aware message, instead of dying later in a missing
+   kernel. Note this interacts with merge #2: block-scaled fp8 now has a
+   dequant route, so `needs_device_kernel()` is False for it and the floor is
+   not invoked; the reject check therefore needs a NON-block fp8 checkpoint
+   (e.g. the compressed-tensors 4B) to exercise the gate at all.
+2. bf16 fallback -- gfx900 must now select float16 BY ITSELF. The existing
+   workaround of passing `--dtype float16` by hand should be removable; that is
+   the observable.
+3. Marlin LoRA -- **behaviour change on AMD**: a config that previously sailed
+   through the `>= 9` capability check and died inside a Marlin kernel will now
+   be refused at the gate. Expected and intended, but it turns a late crash into
+   an early refusal, so the second host should see it deliberately rather than
+   be surprised by it.
