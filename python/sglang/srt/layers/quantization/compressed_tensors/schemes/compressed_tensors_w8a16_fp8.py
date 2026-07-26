@@ -15,7 +15,10 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
-from sglang.srt.layers.quantization.fp8_utils import dequant_fp8_weight
+from sglang.srt.layers.quantization.fp8_utils import (
+    dequant_fp8_weight,
+    deterministic_fp8_marlin_disabled,
+)
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
@@ -34,8 +37,16 @@ def _marlin_available() -> bool:
     """Marlin is the fast W8A16 path, but it is CUDA-only (its kernels are not
     even imported on ROCm) and needs sm80. Where it is missing there is still a
     correct W8A16 path -- dequantise and use F.linear -- so its absence is a
-    reason to take the slower route, not to refuse the checkpoint."""
+    reason to take the slower route, not to refuse the checkpoint.
+
+    #192: SGLANG_DETERMINISTIC_FP8_GEMM makes it "missing" on sm80..88 as well.
+    gptq_marlin_gemm is not run-to-run reproducible there (#190) and this scheme
+    already owns the correct slower route, so the flag simply takes it. sm89+ and
+    sm120 keep Marlin: the flag is scoped to the range where the defect was
+    measured, not to every card that can run the kernel."""
     if not _is_cuda:
+        return False
+    if deterministic_fp8_marlin_disabled():
         return False
     major, _ = torch.cuda.get_device_capability()
     return major >= 8

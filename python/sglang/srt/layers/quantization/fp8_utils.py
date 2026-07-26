@@ -259,6 +259,58 @@ def fp8_native_gemm_available() -> bool:
 
 
 @lru_cache(maxsize=1)
+def deterministic_fp8_marlin_disabled() -> bool:
+    """True when SGLANG_DETERMINISTIC_FP8_GEMM must switch the fp8 Marlin path off.
+
+    Narrow on purpose, in BOTH directions:
+
+    * only when the env flag is set -- default off, so nothing about the stock
+      path moves;
+    * only on NVIDIA sm80..sm88. That range is exactly where
+      ``can_auto_enable_marlin_fp8`` routes fp8 through ``gptq_marlin_gemm``,
+      and exactly where #190 measured that kernel to be run-to-run
+      nondeterministic (K-slice reduction order; up to 12/1200 repeats of one
+      identical call diverging at M=512, worst element ~1e-1). sm89+, sm90 and
+      sm120 keep Marlin and everything else untouched -- the same shape measures
+      0/2000 on sm120's flashinfer path, so there is nothing to fix there and
+      this flag is deliberately NOT a global "disable fp8".
+
+    The capability range is checked under ``is_cuda()`` because the integer
+    alone is ambiguous across vendors -- see ``fp8_native_gemm_available`` for
+    the gfx900-reports-(9,0) trap. Restricting to 80..88 dodges it anyway, but
+    the guard keeps the intent legible.
+
+    lru_cached, so the warning below is emitted exactly once per process (i.e.
+    once per rank, which is the right granularity: the decision is rank-local).
+    """
+    from sglang.srt import environ as _environ
+
+    if not _environ.envs.SGLANG_DETERMINISTIC_FP8_GEMM.get():
+        return False
+    if not is_cuda():
+        return False
+    try:
+        major, minor = get_device_capability()
+    except Exception:  # noqa: BLE001 - unknown device means "leave it alone"
+        return False
+    sm = major * 10 + minor
+    if not (80 <= sm < 89):
+        return False
+    logger.warning(
+        "SGLANG_DETERMINISTIC_FP8_GEMM is set and this rank is sm%d: the fp8 "
+        "Marlin GEMM is switched off and dense fp8 linears run through the "
+        "dequant W8A16 fallback instead. This buys bit-identical repeats "
+        "(gptq_marlin_gemm is nondeterministic on sm80..88, see #190) and costs "
+        "a large amount of decode throughput -- from ~2.5x on a 27B where only "
+        "part of the model is on sm8x, to ~6x when every layer is. fp8 MoE "
+        "experts and FBGEMM fp8 keep Marlin -- they have no fallback on this "
+        "architecture.",
+        sm,
+    )
+    return True
+
+
+@lru_cache(maxsize=1)
 def fp8_needs_dequant_fallback() -> bool:
     """True when NO fp8 GEMM of any kind is reachable on this device.
 
@@ -271,8 +323,17 @@ def fp8_needs_dequant_fallback() -> bool:
     SGLANG_FORCE_FP8_DEQUANT=1 forces this on. It exists so the fallback can be
     exercised on a machine that does have fp8 hardware -- otherwise the only
     way to test it is on a card too small for the checkpoints that need it.
+
+    SGLANG_DETERMINISTIC_FP8_GEMM forces it on too, and MUST: on sm80..88 Marlin
+    is the only fp8 GEMM there is, so switching it off for determinism leaves
+    the dequant lane as the sole correct route. Without this clause the two
+    decisions would be made independently and a block-scaled checkpoint would
+    land with no fp8 GEMM at all -- Marlin refused, block-dequant not armed --
+    which is precisely the state #190 warned the fix must not produce.
     """
     if get_bool_env_var("SGLANG_FORCE_FP8_DEQUANT"):
+        return True
+    if deterministic_fp8_marlin_disabled():
         return True
     return not (
         fp8_native_gemm_available()
@@ -2169,6 +2230,16 @@ def apply_fp8_linear(
 
 
 def can_auto_enable_marlin_fp8() -> bool:
+    """Whether sm80..88 would auto-route fp8 through Marlin. HARDWARE ONLY.
+
+    Deliberately NOT gated by SGLANG_DETERMINISTIC_FP8_GEMM. That flag is
+    applied at the CONSUMER sites instead, because only some of them have a
+    fallback to switch to: the dense Fp8LinearMethod and CompressedTensorsW8A16Fp8
+    do (dequant W8A16), while the fp8 MoE method, FBGEMM fp8 and the
+    multimodal_gen runtime do not -- on sm8x their non-Marlin branch needs a
+    native/cutlass fp8 GEMM or triton's fp8e4nv, none of which exist on Ampere.
+    Gating here would silently break those; see deterministic_fp8_marlin_disabled.
+    """
     try:
         major, minor = get_device_capability()
         sm = major * 10 + minor

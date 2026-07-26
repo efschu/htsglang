@@ -719,6 +719,49 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # Opt-in BIT-DETERMINISM for fp8 linears on sm80..sm88 (#192, from #190).
+    #
+    # WHAT IS BROKEN. On sm80..88 an fp8 checkpoint has exactly one GEMM
+    # available -- Marlin (can_auto_enable_marlin_fp8: 80 <= sm < 89) -- and
+    # gptq_marlin_gemm is NOT run-to-run reproducible there. Measured on an RTX
+    # 3080 at the real 27B shape (N=8704, K=5120), repeating one
+    # apply_fp8_marlin_linear call on bit-identical inputs: 0/1200 mismatching
+    # iterations for M <= 109, then 1/1200 at M=128, 4/1200 at M=256, 12/1200 at
+    # M=512, worst per-element |delta| ~1e-1. The cause is the accumulation order
+    # across K-slices inside the kernel (falsified: not the atomic-add path, not
+    # use_fp32_reduce, not a stale workspace) -- a CUDA-kernel defect, not a
+    # config flip. The same shape on sm120 is 0/2000; sm89+ is unaffected.
+    #
+    # WHAT THIS FLAG DOES. On sm80..88 ONLY, it forces the fp8 Marlin path off
+    # for the dense linears that have a paired fallback, which routes them to the
+    # dequant W8A16 lane (fused dequant-GEMV for small-batch decode,
+    # materialise + F.linear for prefill). sm89+/sm90/sm120 are untouched -- the
+    # native / flashinfer fp8 paths there are already clean, and this flag is not
+    # a global "no fp8".
+    #
+    # WHAT IT COSTS. A large decode penalty, and how large depends on how much
+    # of the model sits on sm8x ranks:
+    #   * #179/#189 anchor, Qwen3.6-27B block-fp8, TP=3 (5090 + 2x 3080), the
+    #     5090 carrying its share on the native path: 91.5 tok/s Marlin against
+    #     27.6 (uncached dequant) to 37.3 (fused GEMV) on the fallback -- roughly
+    #     a factor 2.5, and that is the OPTIMISTIC end;
+    #   * this flag's own A/B, same checkpoint but TP=2 across the two 3080s so
+    #     every layer is on sm8x: 36.4 -> 5.8 tok/s on a short single request.
+    # Prefill is only mildly affected (-8% at the #179 anchor) -- the fallback
+    # expands the weight once per FORWARD, so batch-1 decode pays the whole
+    # thing for one token while prefill amortises it over the prompt.
+    # This is deliberately opt-in: pay it when byte-reproducibility is the
+    # product (CI byte gates, bisecting a numerical regression, debugging), not
+    # in normal serving.
+    #
+    # COVERAGE GAPS, on purpose. fp8 MoE experts, FBGEMM fp8 and the
+    # multimodal_gen runtime keep Marlin on sm8x because they have no fallback
+    # there -- switching them off would leave no fp8 GEMM at all. Each logs a
+    # warning when this flag is set. Under mixed-arch TP (5090 + 3080s) the flag
+    # is rank-local by construction: only the sm8x ranks change lane, so ranks
+    # stop agreeing numerically -- that is the #50 broadcast family's problem,
+    # not this flag's.
+    SGLANG_DETERMINISTIC_FP8_GEMM = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     # MoE expert-offload (M-B/M-C, feat/moe-expert-offload). Fraction of each
     # layer's local routed experts kept resident on GPU (1.0 = no offload =

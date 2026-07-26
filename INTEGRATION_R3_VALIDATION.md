@@ -2422,3 +2422,164 @@ exhaustiveness assert -- against #180's verify use of the same head counts.**
 verify path gathers q heads through `_dcp_gather_q_heads` on the same counts.
 Single-base models are unaffected, but that interaction is unvalidated and must
 be checked before #96 merges.
+
+---
+
+## #192 — opt-in bit-determinism for fp8 on sm8x (`SGLANG_DETERMINISTIC_FP8_GEMM`)
+
+#190 (`fix/gdn-prefill-determinism`) closed the attribution: the long-prompt
+prefill nondeterminism of Qwen3.6-27B-FP8 is not the GDN lane but
+`gptq_marlin_gemm`, which is the *only* fp8 GEMM reachable on sm80..sm88
+(`can_auto_enable_marlin_fp8`: `80 <= sm < 89`). Its K-slice reduction order is
+not fixed, and float addition does not forgive that. #190 named the cheap local
+fix, priced it, and deliberately did **not** implement it. This is that fix,
+built as an opt-in flag.
+
+### What the flag does, and where the gate sits
+
+`SGLANG_DETERMINISTIC_FP8_GEMM` (default **off**), `environ.py`. On sm80..88 and
+nowhere else it forces the fp8 Marlin path off for the dense linears that own a
+fallback, and arms the dequant W8A16 lane in the same step.
+
+| site | file | under the flag |
+|---|---|---|
+| gate helper | `fp8_utils.py::deterministic_fp8_marlin_disabled` | True only if flag set **and** `is_cuda()` **and** `80 <= sm < 89` |
+| pairing | `fp8_utils.py::fp8_needs_dequant_fallback` | returns True, so the fallback is armed |
+| dense fp8 linear | `fp8.py::Fp8LinearMethod.__init__` | `use_marlin = False`; `use_dequant` / `use_block_dequant` become True |
+| compressed-tensors W8A16 | `compressed_tensors_w8a16_fp8.py::_marlin_available` | returns False; the scheme's own dequant branch takes over |
+| fp8 MoE | `fp8.py::Fp8MoEMethod.__init__` | **unchanged**, logs the gap |
+| FBGEMM fp8 | `fpgemm_fp8.py::FBGEMMFp8Config.__init__` | **unchanged**, logs the gap |
+
+Two design points that are load-bearing rather than stylistic:
+
+* **`can_auto_enable_marlin_fp8()` is NOT gated.** It stays a pure hardware
+  question and the flag is applied at the consumers, because only some
+  consumers have somewhere to go. The fp8 MoE method's non-Marlin branch is the
+  triton fused-MoE, whose block-fp8 kernel needs triton's `fp8e4nv` — rejected
+  outright on Ampere; FBGEMM's non-Marlin branch needs cutlass or
+  `torch._scaled_mm`, neither of which exists on sm8x. Gating the probe would
+  have left those with no expert/linear GEMM at all, i.e. a model that refuses
+  to boot. A documented gap beats a broken server, so both keep Marlin and both
+  say so in the log.
+* **The pairing is inside `fp8_needs_dequant_fallback()`, not next to the
+  gate.** On sm8x Marlin is the only fp8 GEMM there is, so a flag that switched
+  it off without also arming the fallback would leave a block-scaled checkpoint
+  with *nothing* — precisely the state #190 §6 warned a fix must not produce.
+  Wiring the two decisions to the same helper makes that unrepresentable rather
+  than merely unlikely; `test_pairs_with_the_dequant_fallback` pins it.
+
+The flag also beats an explicit `SGLANG_FORCE_FP8_MARLIN`. A determinism request
+that silently kept the nondeterministic kernel would be worse than no flag.
+
+### Determinism result — the #190 falsifier, both arms
+
+`scripts/determinism/fp8_det_flag_falsifier.py` is the counterpart to #190's
+`fp8_marlin_hammer.py`. It drives the real entry point — `Fp8LinearMethod.apply()`
+on one block-fp8 layer at the 27B's real shape (N=8704, K=5120) — twice in the
+same process, once per flag state, and counts mismatching repeats. RTX 3080
+(sm86), 1200 iterations per cell:
+
+```
+# arm marlin : use_marlin=True  use_block_dequant=False needs_fallback=False
+# arm flag_on: use_marlin=False use_block_dequant=True  needs_fallback=True
+
+     M        arm    bad/iters      rate  firstbad       worst
+     8     marlin       0/1200    0.0000      None   0.000e+00
+     8    flag_on       0/1200    0.0000      None   0.000e+00
+   128     marlin       0/1200    0.0000      None   0.000e+00
+   128    flag_on       0/1200    0.0000      None   0.000e+00
+   256     marlin       9/1200    0.0075       455   7.617e-02
+   256    flag_on       0/1200    0.0000      None   0.000e+00
+   512     marlin      24/1200    0.0200        11   1.016e-01
+   512    flag_on       0/1200    0.0000      None   0.000e+00
+   689     marlin      13/1200    0.0108        31   8.691e-02
+   689    flag_on       0/1200    0.0000      None   0.000e+00
+```
+
+The Marlin arm reproduces #190 independently (#190 read 4/1200 at M=256,
+12/1200 at M=512, 10/1200 at M=689 — same order, same shape-dependence), which
+is what makes the flag arm's 0/1200 a result rather than an absence of
+sampling. M=128 came out 0/1200 here against #190's 1/1200; at a rate near 1e-3
+that is sub-sampling, not disagreement.
+
+Both fallback lanes are covered by the table, not just one: M=8 takes the fused
+dequant-GEMV (`FUSED_GEMV_MAX_ROWS = 8`, and this shape satisfies `N >= K`),
+M >= 128 takes materialise + `F.linear`. Neither is a route "into the nowhere":
+the printed `use_block_dequant=True` on the flag arm is the assertion that the
+block-scaled checkpoint actually landed on a GEMM.
+
+CPU-side, `test/registered/unit/layers/quantization/test_deterministic_fp8_gemm.py`
+pins the routing matrix with faked capability and vendor — 13 tests, all green:
+default-off at every sm, fires at sm80/86/87/88, silent at sm89/90/100/120 and
+below sm80, silent on non-CUDA (the gfx900-reports-(9,0) trap), silent on an
+unreadable capability, pairs with the fallback, and leaves sm120 routing
+bit-for-bit identical between flag states.
+
+### Short A/B boot — the flag on a real server
+
+Qwen3.6-27B-FP8 (block-scaled fp8 `[128, 128]`, the checkpoint #190 measured),
+TP=2 across the two 3080s, `--kv-cache-dtype fp8_e5m2`, `--context-length 8192`,
+CUDA graphs on. `scripts/determinism/fp8_det_flag_boot_ab.sh off|on`.
+
+| | flag off | flag on |
+|---|---|---|
+| boot | OK | OK |
+| `prepare_fp8_layer_for_marlin` fired | yes, TP0 and TP1 | **no, neither rank** |
+| gate warning in log | — | yes, TP0 and TP1 |
+| greedy 48-token completion | coherent | coherent, **identical text to the off arm** |
+| same request repeated | identical | identical |
+
+The absence of the upstream "leveraging the Marlin kernel" line in the flag-on
+log is the runtime evidence, independent of my own logging: that message is
+emitted by `prepare_fp8_layer_for_marlin`, so its absence means no Marlin layer
+was ever prepared. The off arm is byte-for-byte the stock path — the code adds
+one `if` that is False there.
+
+The two arms producing the *same* completion is the expected shape of the
+result, not a null: the flag changes reproducibility, not semantics, and 48
+tokens sits well below the M where Marlin starts diverging.
+
+### Cost, stated honestly
+
+Decode throughput from the same two boots, single request, steady window:
+**36.4 -> 5.8 tok/s**, roughly 6x. That is worse than the ~2.5x the #179/#189
+anchor implies (27B, TP=3, 91.5 tok/s Marlin vs 27.6 uncached / 37.3 fused),
+and the difference is structural rather than noise: at TP=3 the 5090 carries a
+third of the model on its native fp8 path, while this TP=2 arm puts *every*
+layer on sm8x. So 2.5x is the optimistic end and ~6x the pessimistic one; the
+real number depends on what fraction of the model sits on Ampere ranks. Neither
+figure is a bench — the boot number is one short request, recorded as an order
+of magnitude, not a measurement.
+
+Prefill is barely affected (-8% at the #179 anchor): the fallback expands the
+weight once per FORWARD, so batch-1 decode pays it for a single token while
+prefill amortises it over the whole prompt. That asymmetry is why the fused
+GEMV exists and why it is capped at M <= 8.
+
+### Coverage gaps, deliberate and logged
+
+1. **fp8 MoE experts stay nondeterministic on sm8x.** No fallback exists there
+   (see above). Logged at init when the flag is set.
+2. **FBGEMM fp8 stays nondeterministic on sm8x.** Same reason, same logging.
+3. **Marlin on sm89+/sm120 is not covered.** `CompressedTensorsW8A16Fp8` routes
+   through Marlin on any `major >= 8`, and #190 never measured Marlin above
+   sm88 — its sm120 0/2000 cell was the flashinfer groupwise path, a different
+   kernel. The flag is scoped to the range where the defect was *measured*
+   rather than to everywhere the kernel can run, which is the honest scope but
+   leaves that cell open. Owed: run `fp8_marlin_hammer.py` on the 5090 with
+   `SGLANG_FORCE_FP8_MARLIN=1`.
+4. **Mixed-arch TP.** The gate is rank-local by construction — it reads the
+   capability of the rank's own device. On the 5090 + 2x 3080 rig only the sm8x
+   ranks change lane, so the ranks stop agreeing numerically with each other.
+   That is correct for this flag (each rank becomes self-reproducible, which is
+   what byte gates and bisects need) and is explicitly *not* an attempt at
+   cross-rank agreement — that belongs to the #50 broadcast family.
+5. **`--enable-deterministic-inference` still does not cover the fp8 GEMM.** It
+   pins NCCL_ALGO, the attention backends and sampling, and never touches the
+   quantized GEMM, so on sm8x fp8 it cannot deliver what its name promises —
+   an upstream gap. Rather than silently coupling the two flags (which would
+   hand every deterministic-inference user a surprise 2.5-6x decode
+   regression), `Fp8LinearMethod.__init__` now *logs* the gap when
+   deterministic inference is on and this rank is still on Marlin, naming the
+   env var that closes it. Making the hole visible is the deliverable; closing
+   it silently is not.
