@@ -222,9 +222,7 @@ class TestCaptureOnADedicatedStream(BreakableCaptureTestBase):
 
     def _capture(self, cuda_graph):
         """A capture whose stream context is a recorder, as in production."""
-        self.stream_ctxs: list[_RecordingStreamCtx] = getattr(
-            self, "stream_ctxs", []
-        )
+        self.stream_ctxs: list[_RecordingStreamCtx] = getattr(self, "stream_ctxs", [])
 
         def make_stream_ctx(stream):
             ctx = _RecordingStreamCtx(stream)
