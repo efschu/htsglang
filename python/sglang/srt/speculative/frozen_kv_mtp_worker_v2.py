@@ -57,6 +57,7 @@ from sglang.srt.speculative.adaptive_spec_params import adaptive_unsupported_rea
 from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
+    ensure_spec_kernel_backend,
     organize_draft_results,
 )
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2, _get_plan_stream
@@ -119,6 +120,15 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
     ):
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
+
+        # GROUP-WIDE spec kernel decision (collective). Runs here because the
+        # draft-worker variants deliberately bypass each other's __init__
+        # (#136a), so there is no shared constructor to hook -- and it must
+        # happen before any draft round, on every rank, the same number of
+        # times. If ANY rank lacks sgl_kernel's build_tree/verify ops (sm75,
+        # gfx900), every rank switches to the Triton implementations: verify
+        # decides accept counts, so a mixture would desync the group silently.
+        ensure_spec_kernel_backend(self.topk)
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.gpu_id = gpu_id

@@ -4321,6 +4321,12 @@ class ServerArgs:
                 self.gpu_id_for_rank(0, tp_rank, 1, self.tp_size)
                 == self.speculative_draft_gpu
             ):
+                # Co-location tie-break: lowest rank on the device wins. This
+                # is DETERMINISTIC and rank-uniform (every rank derives it from
+                # the same server_args), so it cannot desync the group -- but it
+                # is an ambiguity of user INTENT, so
+                # _handle_speculative_draft_placement warns about it at startup
+                # rather than letting it be silent.
                 return tp_rank
         raise ValueError(
             f"--speculative-draft-gpu={self.speculative_draft_gpu} does not "
@@ -4447,11 +4453,64 @@ class ServerArgs:
                 "draft's EP dispatch would add collectives the non-solo "
                 "ranks do not mirror."
             )
-        if self.nnodes > 1:
+        # MULTI-NODE: narrowed to the ONE thing that is actually node-bound.
+        #
+        # This used to reject nnodes > 1 outright, grouped with the DP/PP/EP
+        # rejections above. Those are structural; this one was not. Checked
+        # against the wiring rather than the docstring (PLAN 61): the entire
+        # cross-rank contract of solo placement is a single
+        #   get_tp_group().broadcast(payload, src=solo_rank)
+        # in eagle_worker_v2._solo_send_draft_tokens -- the ORDINARY TP group,
+        # the same one that carries every collective of the model, and which a
+        # TP=5 group spanning two hosts demonstrably serves (Nordstern L0 S1,
+        # HTCCL/gloo). `eagle_worker_v2.py` contains zero occurrences of
+        # local_rank, nnodes, node_rank or torch.cuda.current_device.
+        #
+        # What IS node-bound is --speculative-draft-gpu: it is a CUDA DEVICE
+        # INDEX, resolved through gpu_id_for_rank(), and device indices are
+        # unique within a node only. With nnodes > 1 "device 0" exists on every
+        # host, so the device -> rank search below is ambiguous. Unset, the
+        # solo host is rank 0 and no device lookup happens at all.
+        #
+        # RELAXED, NOT PROVEN: no multi-node solo run has booted yet. The
+        # first thing the next TP=5 window does is a short solo smoke test
+        # before any measurement.
+        if self.nnodes > 1 and self.speculative_draft_gpu is not None:
             raise ValueError(
-                "--speculative-draft-placement solo is single-node only; got "
-                f"nnodes={self.nnodes}."
+                "--speculative-draft-gpu is a PER-NODE CUDA device index and is "
+                f"ambiguous across hosts (nnodes={self.nnodes}): device "
+                f"{self.speculative_draft_gpu} exists on every node, so it does "
+                "not identify one rank. Drop the flag to host the solo draft on "
+                "rank 0, which needs no device lookup, or run single-node."
             )
+
+        # Resolve the solo host HERE so a --speculative-draft-gpu that matches
+        # no rank fails at startup with the full rank -> device map, instead of
+        # at worker construction after the model has loaded.
+        if self.speculative_draft_gpu is not None:
+            solo_rank = self.speculative_draft_solo_rank()
+            colocated = [
+                r
+                for r in range(self.tp_size)
+                if self.gpu_id_for_rank(0, r, 1, self.tp_size)
+                == self.speculative_draft_gpu
+            ]
+            if len(colocated) > 1:
+                # The other per-node assumption in the same function. Not a
+                # correctness hazard -- the tie-break is deterministic and every
+                # rank computes the same answer -- but the user named a DEVICE
+                # while several ranks live on it, and only one gets the draft.
+                # Say which, loudly, rather than let it surprise later.
+                logger.warning(
+                    "--speculative-draft-gpu=%s hosts %d co-located ranks %s "
+                    "(--rank-gpu-id). The solo draft goes to the LOWEST of "
+                    "them, rank %d; the others become shadow ranks. Name the "
+                    "intended rank's own device if that is not what you want.",
+                    self.speculative_draft_gpu,
+                    len(colocated),
+                    colocated,
+                    solo_rank,
+                )
         if self.disaggregation_mode != "null":
             raise ValueError(
                 "--speculative-draft-placement solo does not support PD "
@@ -4492,6 +4551,35 @@ class ServerArgs:
         )
 
         handle_pd_disaggregation(self)
+
+    def tree_verify_activation_reason(self) -> Optional[str]:
+        """Which flag would activate a TREE-MASKED verify, or None.
+
+        One place, because the terrain behind it is measured-wrong (#76) and
+        the number of doors onto it keeps growing:
+
+        * ``--speculative-eagle-topk > 1`` -- the EAGLE tree draft. This is the
+          door that was measured: under uneven-weighted DCP a topk>1 tree gives
+          non-deterministic, non-greedy output at temp 0.
+        * ``--speculative-dflash-tree-verify`` -- a SECOND door, added by three
+          unconsolidated upstream PRs (#31069 / #29587 / #29907) for DFLASH
+          block drafts. It does not exist in this tree yet, so it is read via
+          getattr: the guard is ARMED FOR ITS ARRIVAL rather than waiting to be
+          remembered during a future merge. A new flag name reaching the same
+          tree-masked draft->draft verify is exactly how a guard gets bypassed
+          without anyone deciding to bypass it.
+
+        Returns a human-readable reason (used verbatim in the error) or None.
+        """
+        topk = self.speculative_eagle_topk
+        if topk is not None and topk > 1:
+            return f"--speculative-eagle-topk={topk} > 1 (EAGLE tree draft)"
+        if getattr(self, "speculative_dflash_tree_verify", False):
+            return (
+                "--speculative-dflash-tree-verify (DFLASH tree verify, upstream "
+                "#31069/#29587/#29907)"
+            )
+        return None
 
     def _handle_dcp_validation(self):
         # Decode context parallel (DCP) is currently implemented and validated
@@ -4561,18 +4649,22 @@ class ServerArgs:
             # _build_dcp_ragged_tree_mask vs the paged/ragged LSE-merge are
             # audited, hard-error instead of silently emitting wrong tokens.
             # topk == 1 keeps the byte-identical, correct plain-causal chain path.
+            #
+            # HARDENED (#98 sighting): the trigger is no longer read as "topk >
+            # 1" but as "anything that would activate a tree-masked verify" --
+            # see tree_verify_activation_reason(). Upstream is carrying a
+            # SECOND door onto this exact terrain
+            # (--speculative-dflash-tree-verify, PRs #31069/#29587/#29907), and
+            # a guard that names one flag is a guard that a merge walks past.
+            tree_reason = self.tree_verify_activation_reason()
             if (
-                (
-                    uneven_weighted_dcp
-                    or self.rank_tp_ratio is not None
-                    or self.weightless_kv_fastlane
-                )
-                and self.speculative_eagle_topk is not None
-                and self.speculative_eagle_topk > 1
-            ):
+                uneven_weighted_dcp
+                or self.rank_tp_ratio is not None
+                or self.weightless_kv_fastlane
+            ) and tree_reason is not None:
                 raise ValueError(
                     "Tree/branching speculative decoding "
-                    f"(--speculative-eagle-topk={self.speculative_eagle_topk} > 1) "
+                    f"({tree_reason}) "
                     "is not supported under any cross-rank DCP variant that "
                     "activates the DCP tree mask (uneven-hybrid DCP via "
                     "--rank-tp-ratio -- even-modulo or weighted -- or the "

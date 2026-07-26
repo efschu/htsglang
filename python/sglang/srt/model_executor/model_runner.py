@@ -1118,6 +1118,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if cfg is None:
             return
 
+        # DRAFT-SOLO: this runner's graphs are RANK-LOCAL, so there is no group
+        # to harmonise with -- and harmonising would hang.
+        #
+        # Under --speculative-draft-placement solo only the solo rank owns a
+        # real draft runner; the shadow ranks get a stub
+        # (install_shadow_draft_runner_surface) and never call
+        # init_cuda_graphs on it. The all_gather_object below is group-wide, so
+        # the solo rank would enter a collective that no other rank ever joins.
+        #
+        # MEASURED, Nordstern L0 S4 (TP=5 over two hosts, --disable-cuda-graph):
+        # ranks 1-4 reached "Tree cache initialized" and their health checks
+        # while rank 0 sat here for 8 minutes until the launcher killed it.
+        # py-spy on the solo rank:
+        #     all_gather_object -> _harmonize_cuda_graph_plan (model_runner)
+        #     -> init_cuda_graphs -> eagle_worker_v2.init_cuda_graphs
+        #
+        # `spec_solo_rank_local_graphs` already declares exactly this property
+        # (it suppresses the capture backends' per-warmup TP barrier for this
+        # runner); the harmonisation is a second group collective in the same
+        # category and needs the same exemption. Note it also MUTATES the
+        # shared cuda_graph_config, so letting the draft runner harmonise could
+        # disable a phase for the target runner too.
+        if getattr(self, "spec_solo_rank_local_graphs", False):
+            return
+
         group = (
             self.attention_tp_group.cpu_group
             if self.server_args.enable_dp_attention

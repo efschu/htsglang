@@ -914,3 +914,104 @@ def test_token_vector_without_a_plan_is_rejected_not_ignored():
             os.environ.pop("SGLANG_UNEVEN_TOKEN_VECTOR", None)
         else:
             os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = saved
+        import importlib
+        importlib.reload(du)
+
+
+class TestTreeSpecDcpGuardHardenedForNewFlagPaths(CustomTestCase):
+    """#98 sighting: the #76 guard must reject the NEW tree-verify door too.
+
+    Upstream carries three unconsolidated PRs (#31069 / #29587 / #29907) adding
+    `--speculative-dflash-tree-verify` -- a second flag that reaches the same
+    tree-masked draft->draft verify this guard exists to keep off uneven-DCP.
+    The flag does not exist in this tree yet, so the guard reads it via getattr
+    and is ARMED FOR ITS ARRIVAL: a guard that names one flag is a guard a
+    merge walks past.
+
+    The evidence behind the refusal is not theoretical. Byte gate, window #2,
+    RTX 5090, native sgl_kernel vs Triton spec kernels on identical inputs:
+    topk=1 chains were bit-identical 16/16, while topk>1 trees DIFFERED
+    (tree_mask 6-13 elements) and one case raised a CUDA error. Trees on the
+    fallback path are measurably not the same computation.
+    """
+
+    def _run_guard(self, **overrides):
+        kwargs = dict(
+            tp_size=3,
+            dcp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=[26000, 17000, 17000],
+            rank_tp_ratio=[2, 1, 1],
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=1,
+        )
+        kwargs.update(overrides)
+        dflash_tree = kwargs.pop("dflash_tree_verify", None)
+        args = make_args(**kwargs)
+        if dflash_tree is not None:
+            # Simulate the upstream flag landing on ServerArgs.
+            args.speculative_dflash_tree_verify = dflash_tree
+        env = {
+            **os.environ,
+            "SGLANG_UNEVEN_DCP": "1",
+            "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
+        }
+        with patch.object(
+            server_args_module, "is_hip", return_value=False
+        ), patch.object(
+            server_args_module, "is_cuda", return_value=True
+        ), patch.dict(
+            os.environ, env, clear=True
+        ):
+            args._handle_dcp_validation()
+        return args
+
+    def test_new_dflash_tree_verify_flag_rejected_under_uneven_dcp(self):
+        """The point of the hardening: topk is 1, so the OLD guard would have
+        let this through."""
+        with self.assertRaisesRegex(ValueError, "dflash-tree-verify"):
+            self._run_guard(dflash_tree_verify=True)
+
+    def test_healthy_path_still_open(self):
+        """Both doors shut: chain draft, no tree verify -> must NOT raise."""
+        self._run_guard(dflash_tree_verify=False)
+        self._run_guard()  # flag absent entirely, as in this tree today
+
+    def test_old_topk_door_still_rejected(self):
+        """Hardening must not have replaced the original trigger."""
+        with self.assertRaisesRegex(ValueError, "eagle-topk"):
+            self._run_guard(speculative_eagle_topk=4)
+
+    def test_reason_is_named_in_the_message(self):
+        """Same explanation quality for the new door as for the old one: the
+        message must say WHICH flag tripped it, not just 'tree'."""
+        with self.assertRaises(ValueError) as cm:
+            self._run_guard(dflash_tree_verify=True)
+        msg = str(cm.exception)
+        self.assertIn("#31069", msg)
+        self.assertIn("non-deterministic", msg)
+        self.assertIn("#76", msg)
+
+    def test_reason_helper_is_the_single_definition(self):
+        """Both doors must go through one predicate, so a third door has one
+        place to be added rather than two to be forgotten."""
+        args = make_args(tp_size=3, speculative_eagle_topk=4)
+        self.assertIn("eagle-topk", args.tree_verify_activation_reason())
+        args2 = make_args(tp_size=3, speculative_eagle_topk=1)
+        self.assertIsNone(args2.tree_verify_activation_reason())
+        args2.speculative_dflash_tree_verify = True
+        self.assertIn("dflash-tree-verify", args2.tree_verify_activation_reason())
+
+    def test_guard_does_not_fire_without_a_dcp_variant(self):
+        """A plain single-GPU tree run must stay allowed -- the guard is about
+        uneven DCP, not about trees in general."""
+        args = make_args(
+            tp_size=1,
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=4,
+        )
+        args.speculative_dflash_tree_verify = True
+        with patch.object(
+            server_args_module, "is_hip", return_value=False
+        ), patch.object(server_args_module, "is_cuda", return_value=True):
+            args._handle_dcp_validation()  # must not raise

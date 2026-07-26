@@ -271,6 +271,51 @@ def should_build_pynccl(
     return use_pynccl and world_size > 1 and not htccl_active
 
 
+def should_build_custom_allreduce(
+    use_custom_allreduce: bool, world_size: int, htccl_active: bool
+) -> bool:
+    """Whether GroupCoordinator should CONSTRUCT a CustomAllreduce.
+
+    Same shape and same reason as `should_build_pynccl`, and module-level for
+    the same reason: one definition, imported by the test rather than copied.
+
+    `htccl_active` -> do not build. CustomAllreduce is a CUDA-IPC intra-node
+    fast path; it cannot serve a group that spans vendors or hosts, which is
+    precisely the group HTCCL exists for.
+
+    THE FAILURE IT PREVENTS IS A HANG, NOT A CRASH, AND IT WAS MEASURED.
+    `CustomAllreduce.__init__` returns EARLY, before any collective, when
+    `ops.IS_CUSTOM_AR_AVAILABLE` is false -- i.e. wherever sgl_kernel's custom
+    AR ops are absent (an sm75 build, a ROCm build). Where they ARE present the
+    constructor calls `can_use_custom_all_reduce_with_nvlink`, which runs
+    `in_the_same_node_as` -> `broadcast_object_list` over the WHOLE group.
+    A group in which only some ranks have the ops therefore has some ranks
+    inside a collective and some already past it: deadlock.
+
+    Nordstern L0, TP=5 over two hosts, per-rank py-spy at the stall:
+
+        ranks 0,1,2 (sm120/sm86, sgl_kernel present)
+            broadcast_object_list -> in_the_same_node_as
+            -> can_use_custom_all_reduce_with_nvlink
+            -> CustomAllreduce.__init__ -> GroupCoordinator.__init__
+        rank 3 (sm75) and rank 4 (gfx900), ops absent, already past it:
+            all_reduce -> get_available_gpu_memory -> init_torch_distributed
+
+    Note the trap in the existing code: the constructor is wrapped in
+    `try/except` with a warning, which handles a rank that FAILS but not one
+    that never arrives. An exception is rank-local; a missing participant is
+    not.
+
+    RANK-UNIFORM: every input is derived identically on every rank from the
+    same CLI/env. `IS_CUSTOM_AR_AVAILABLE` -- the thing that actually diverged
+    -- is rank-LOCAL and must not decide a collective.
+
+    Flag OFF reduces exactly to the original `use_custom_allreduce and
+    world_size > 1`, so same-vendor rigs keep custom all-reduce.
+    """
+    return use_custom_allreduce and world_size > 1 and not htccl_active
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -541,7 +586,9 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
-        if use_custom_allreduce and self.world_size > 1:
+        if should_build_custom_allreduce(
+            use_custom_allreduce, self.world_size, _htccl_active
+        ):
             # Initialize a custom fast all-reduce implementation.
             try:
                 CAClass = dispatch_custom_allreduce(
@@ -570,6 +617,19 @@ class GroupCoordinator:
                         )
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
+        elif use_custom_allreduce and self.world_size > 1:
+            # HTCCL active. Skipping is the point: the constructor's
+            # nvlink probe is a COLLECTIVE that only the ranks with
+            # sgl_kernel's custom-AR ops would enter (measured: L0 TP=5
+            # deadlocked with ranks 0-2 inside broadcast_object_list and
+            # ranks 3-4 already past it).
+            logger.info(
+                "HTCCL is active for group '%s': skipping CustomAllreduce "
+                "construction. Its NVLink probe is a group-wide collective "
+                "that ranks without sgl_kernel's custom-AR ops never enter, "
+                "so a vendor-mixed or multi-host group deadlocks there.",
+                self.unique_name,
+            )
         elif self.world_size > 1 and is_hip():
             logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
 

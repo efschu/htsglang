@@ -53,13 +53,13 @@ _is_cpu = is_cpu()
 logger = logging.getLogger(__name__)
 
 _has_sgl_build_tree_kernel = False
+_has_sgl_verify_tree_greedy = False
+sgl_verify_tree_greedy = None
 if _is_cuda or _is_hip or _is_musa:
     # Turing (sm75) and gfx900 alike: sgl-kernel has no code for these archs
     # (cubin-only wheel, gencode floor sm_80; no ROCm build below gfx942). This
     # module is imported on the ordinary startup path even when speculative
     # decoding is off, so an unguarded import blocks a plain server.
-    # Speculative decoding itself still requires the kernel -- the guard only
-    # stops it from taking down non-speculative startup.
     try:
         from sgl_kernel import (
             build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
@@ -68,11 +68,181 @@ if _is_cuda or _is_hip or _is_musa:
         _has_sgl_build_tree_kernel = True
     except ImportError:
         sgl_build_tree_kernel_efficient = None
+
+    # verify_tree_greedy had NO availability flag: it was imported inline,
+    # inside verify_tree_greedy_func, under `if _is_cuda or _is_hip or
+    # _is_musa`. On a build without sgl_kernel that is an ImportError in the
+    # middle of the verify step -- one round later than the build kernel's
+    # `TypeError: 'NoneType' object is not callable`, and just as fatal. Both
+    # capabilities are now probed at import time, so the DISPATCH can be keyed
+    # on capability instead of on platform.
+    try:
+        from sgl_kernel import verify_tree_greedy as sgl_verify_tree_greedy
+
+        _has_sgl_verify_tree_greedy = True
+    except ImportError:
+        sgl_verify_tree_greedy = None
+
 elif _is_cpu:
     from sgl_kernel import (
         build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
     )
     from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
+
+# Both native spec kernels present on THIS rank. Rank-local by nature -- which
+# is exactly why it must not decide anything the whole group sees; see
+# decide_spec_kernel_backend below.
+_has_native_spec_kernels = _has_sgl_build_tree_kernel and _has_sgl_verify_tree_greedy
+
+
+# ---------------------------------------------------------------------------
+# SPEC KERNEL BACKEND -- one GROUP-WIDE decision, never a per-rank one.
+#
+# The tree build and the greedy verify exist twice in this tree: as sgl_kernel
+# ops (CUDA/HIP/MUSA) and as Triton kernels. Until now both dispatches were
+# keyed on PLATFORM, so a build where `_is_cuda` is true but sgl_kernel has no
+# code for the arch (sm75, gfx900) fell into the native branch and died --
+# `TypeError: 'NoneType' object is not callable` at the first draft round,
+# measured on Nordstern L0 S3 with ranks 3 and 4.
+#
+# Keying each dispatch on local availability alone would boot and be WRONG in
+# the dangerous direction. verify decides how many draft tokens are ACCEPTED,
+# and the accepted count changes the batch on every rank. With ranks 0-2 on the
+# CUDA kernel and ranks 3-4 on Triton, any disagreement about a single
+# candidate desynchronises the group: no hang, no error, just divergent state.
+# That is the same failure class as the CustomAllreduce hang, except silent.
+#
+# So the choice is made ONCE, collectively: every rank contributes its own
+# capability, the MINIMUM rules, and if one rank lacks the native kernels then
+# ALL ranks take Triton. Never a mixture.
+# ---------------------------------------------------------------------------
+
+SPEC_KERNEL_BACKEND_NATIVE = "native"
+SPEC_KERNEL_BACKEND_TRITON = "triton"
+
+_SPEC_KERNEL_BACKEND: Optional[str] = None
+
+
+def local_native_spec_kernels_available() -> bool:
+    """Whether THIS rank has both native spec kernels. Rank-local."""
+    return _has_native_spec_kernels
+
+
+def set_spec_kernel_backend(backend: str) -> None:
+    """Record the group's decision. Idempotent for the same value.
+
+    A second, DIFFERENT value is refused rather than silently winning: two
+    disagreeing decisions in one process means the collective was run twice
+    with different inputs, which is precisely the rank-divergence this
+    machinery exists to prevent.
+    """
+    global _SPEC_KERNEL_BACKEND
+    if backend not in (SPEC_KERNEL_BACKEND_NATIVE, SPEC_KERNEL_BACKEND_TRITON):
+        raise ValueError(f"unknown spec kernel backend: {backend!r}")
+    if _SPEC_KERNEL_BACKEND is not None and _SPEC_KERNEL_BACKEND != backend:
+        raise RuntimeError(
+            f"spec kernel backend already decided as {_SPEC_KERNEL_BACKEND!r}; "
+            f"refusing to change it to {backend!r} mid-process."
+        )
+    _SPEC_KERNEL_BACKEND = backend
+
+
+def reset_spec_kernel_backend() -> None:
+    """Test-only: clear the decision."""
+    global _SPEC_KERNEL_BACKEND
+    _SPEC_KERNEL_BACKEND = None
+
+
+def get_spec_kernel_backend() -> str:
+    """The decided backend. ASSERTS rather than defaulting.
+
+    A default here would silently restore the per-rank answer on any path that
+    forgot to run the collective -- the exact bug being fixed. Failing loudly
+    is the safe direction: it names the initialiser.
+    """
+    if _SPEC_KERNEL_BACKEND is None:
+        raise RuntimeError(
+            "spec kernel backend was never decided. ensure_spec_kernel_backend() "
+            "must run on EVERY rank before the first draft round (it performs a "
+            "collective). Direct callers and tests can pin it with "
+            "set_spec_kernel_backend('native'|'triton')."
+        )
+    return _SPEC_KERNEL_BACKEND
+
+
+def decide_spec_kernel_backend(topk: int, tp_group=None) -> str:
+    """COLLECTIVE. Agree one spec kernel backend across the TP group.
+
+    Every rank contributes 1 if it has both native kernels, 0 otherwise, and
+    the group takes the MINIMUM: one rank without them puts everyone on Triton.
+    The reduction runs on the CPU (gloo) group -- the same one
+    get_available_gpu_memory uses -- so it does not depend on a device
+    communicator being up, and it works across hosts (proven by Nordstern L0).
+
+    MUST be called on every rank, the same number of times.
+    """
+    local_ok = local_native_spec_kernels_available()
+    group_ok = local_ok
+    world = 1
+    if tp_group is None:
+        from sglang.srt.distributed import get_tp_group
+
+        try:
+            tp_group = get_tp_group()
+        except Exception:  # noqa: BLE001 -- single-process/unit-test contexts
+            tp_group = None
+    if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
+        world = tp_group.world_size
+        flag = torch.tensor([1 if local_ok else 0], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.MIN, group=tp_group.cpu_group
+        )
+        group_ok = bool(flag.item())
+
+    backend = SPEC_KERNEL_BACKEND_NATIVE if group_ok else SPEC_KERNEL_BACKEND_TRITON
+
+    if backend == SPEC_KERNEL_BACKEND_TRITON and topk > 1:
+        # REFUSED until trees are validated on the Triton path. L0 runs
+        # topk=1 chains, so nothing is lost today. The Triton tree build has
+        # been exercised on XPU only; it has never run on sm75 or gfx900, and
+        # it does not implement QLEN_ONLY_BITPACKING at all. Booting a tree on
+        # it would put an unvalidated kernel in charge of accept counts.
+        raise ValueError(
+            f"speculative_eagle_topk={topk} (tree drafts) is not supported when "
+            "the group falls back to the Triton spec kernels: at least one rank "
+            "lacks sgl_kernel's build_tree/verify ops (sm75 and gfx900 have no "
+            "sgl-kernel code), and the Triton tree path is not yet validated on "
+            "those architectures. Use --speculative-eagle-topk 1 (chain drafts)."
+        )
+
+    set_spec_kernel_backend(backend)
+    logger.info(
+        "Spec kernel backend for this group: %s (local native kernels: build=%s "
+        "verify=%s, world_size=%d). The decision is group-wide by MIN: one rank "
+        "without the native ops puts every rank on Triton, because verify "
+        "decides accept counts and a mixture would desync the group silently.",
+        backend,
+        _has_sgl_build_tree_kernel,
+        _has_sgl_verify_tree_greedy,
+        world,
+    )
+    return backend
+
+
+def ensure_spec_kernel_backend(topk: int, tp_group=None) -> str:
+    """Decide once per process. COLLECTIVE on the first call.
+
+    Idempotent so the several draft-worker variants can each call it without
+    coordinating: they all run the same constructor on every rank, so the
+    collective stays rank-symmetric.
+    """
+    if _SPEC_KERNEL_BACKEND is not None:
+        return _SPEC_KERNEL_BACKEND
+    return decide_spec_kernel_backend(topk, tp_group=tp_group)
+
+
+def use_triton_spec_kernels() -> bool:
+    return get_spec_kernel_backend() == SPEC_KERNEL_BACKEND_TRITON
 
 
 ALLOC_EXTEND_FUNCS = defaultdict(
@@ -284,6 +454,28 @@ def build_tree_kernel_efficient(
             num_verify_tokens,
             tree_mask_mode,
         )
+    elif use_triton_spec_kernels():
+        # CAPABILITY, not platform -- and deliberately placed AFTER the
+        # npu/xpu/cpu branches, which have their own implementations and must
+        # not be made to consult (or require) the group decision. `_is_cuda`
+        # and `_is_hip` are true on sm75 and gfx900 while sgl_kernel has no
+        # code for them, so the `else` below used to call a symbol that is
+        # None. Reaching this branch means the GROUP chose Triton -- never
+        # that this rank alone lacks the op.
+        sgl_build_tree_kernel_triton(
+            parent_list,
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
     else:
         sgl_build_tree_kernel_efficient(
             parent_list,
@@ -402,8 +594,13 @@ def verify_tree_greedy_func(
     target_predict: torch.Tensor,
     topk: int = -1,
 ):
-    if _is_cuda or _is_hip or _is_musa:
-        from sgl_kernel import verify_tree_greedy
+    if (_is_cuda or _is_hip or _is_musa) and not use_triton_spec_kernels():
+        # CAPABILITY, not platform -- and the import moved to module scope so
+        # a missing op is a startup fact, not an ImportError in the middle of
+        # the verify step. This branch is only reached when the GROUP decided
+        # native, so every rank runs the same implementation and therefore
+        # computes the same accept counts.
+        verify_tree_greedy = sgl_verify_tree_greedy
 
         verify_tree_greedy(
             predicts=predicts,  # mutable
@@ -445,7 +642,7 @@ def verify_tree_greedy_func(
             retrive_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
         )
-    elif _is_xpu:
+    elif _is_xpu or use_triton_spec_kernels():
         verify_tree_greedy_triton(
             predicts=predicts,
             accept_index=accept_index,
@@ -455,6 +652,14 @@ def verify_tree_greedy_func(
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
+        )
+    else:
+        # No branch matched: better a named failure than silently returning the
+        # zero-initialised buffers as if nothing had been accepted.
+        raise RuntimeError(
+            "verify_tree_greedy_func: no implementation for this platform "
+            f"(backend={get_spec_kernel_backend()}, cuda={_is_cuda} hip={_is_hip} "
+            f"musa={_is_musa} cpu={_is_cpu} npu={_is_npu} xpu={_is_xpu})."
         )
     return predicts, accept_index, accept_token_num
 

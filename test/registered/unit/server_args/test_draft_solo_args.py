@@ -111,9 +111,39 @@ class TestSoloValidation(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "expert parallelism"):
             solo_args(ep_size=2)._handle_speculative_draft_placement()
 
-    def test_solo_multinode_rejected(self):
-        with self.assertRaisesRegex(ValueError, "single-node"):
-            solo_args(nnodes=2)._handle_speculative_draft_placement()
+    def test_solo_multinode_with_draft_gpu_rejected(self):
+        """The node-bound half: a per-node device index cannot name a rank
+        across hosts, so this must still fail -- and say why."""
+        with self.assertRaisesRegex(ValueError, "PER-NODE CUDA device index"):
+            solo_args(
+                nnodes=2, speculative_draft_gpu=0
+            )._handle_speculative_draft_placement()
+
+    def test_solo_multinode_without_draft_gpu_allowed(self):
+        """The other direction, and the reason the gate was narrowed.
+
+        Verified against the wiring, not the docstring (PLAN 61): solo's whole
+        cross-rank contract is one get_tp_group().broadcast() -- the ordinary
+        TP group, which a TP=5 group spanning two hosts demonstrably serves.
+        Without --speculative-draft-gpu the solo host is rank 0 and no device
+        lookup happens, so nothing here is node-bound.
+
+        RELAXED, NOT PROVEN: no multi-node solo run has booted yet. This test
+        pins the ARGUMENT contract only.
+        """
+        args = solo_args(nnodes=2)
+        args._handle_speculative_draft_placement()  # must not raise
+        self.assertEqual(args.speculative_draft_solo_rank(), 0)
+
+    def test_solo_multinode_still_rejects_the_structural_modes(self):
+        """Narrowing nnodes must not have loosened its neighbours."""
+        for kwargs, needle in (
+            (dict(dp_size=2), "data parallel"),
+            (dict(pp_size=2), "pipeline"),
+            (dict(ep_size=2), "expert parallelism"),
+        ):
+            with self.assertRaisesRegex(ValueError, needle):
+                solo_args(nnodes=2, **kwargs)._handle_speculative_draft_placement()
 
     def test_solo_pd_disagg_rejected(self):
         with self.assertRaisesRegex(ValueError, "disaggregation"):
@@ -193,6 +223,49 @@ class TestSoloRankResolution(CustomTestCase):
     def test_unmapped_gpu_rejected_with_mapping(self):
         args = solo_args(tp_size=2, speculative_draft_gpu=7)
         with self.assertRaisesRegex(ValueError, "rank 0 -> cuda:0"):
+            args._handle_speculative_draft_placement()
+
+
+
+
+class TestSoloDraftGpuResolution(CustomTestCase):
+    """--speculative-draft-gpu is the one node-bound element of solo placement.
+
+    Two properties are pinned: it resolves at STARTUP (not after the model has
+    loaded), and its --rank-gpu-id co-location tie-break is announced rather
+    than silent.
+    """
+
+    def test_unmatched_draft_gpu_fails_at_startup(self):
+        """Fail fast, with the map, instead of at worker construction."""
+        with self.assertRaisesRegex(ValueError, "does not match any TP rank"):
+            solo_args(
+                tp_size=2, speculative_draft_gpu=7
+            )._handle_speculative_draft_placement()
+
+    def test_draft_gpu_resolves_to_the_rank_on_that_device(self):
+        args = solo_args(tp_size=3, rank_gpu_id=[0, 1, 2], speculative_draft_gpu=2)
+        args._handle_speculative_draft_placement()
+        self.assertEqual(args.speculative_draft_solo_rank(), 2)
+
+    def test_colocation_tiebreak_is_deterministic_and_announced(self):
+        """Several ranks on the named device: lowest wins, and it is logged.
+
+        Deterministic and rank-uniform, so it cannot desync the group -- but
+        the user named a DEVICE while two ranks live on it, so the choice is
+        stated instead of being discovered later.
+        """
+        args = solo_args(tp_size=3, rank_gpu_id=[0, 1, 1], speculative_draft_gpu=1)
+        with self.assertLogs("sglang.srt.server_args", level="WARNING") as cm:
+            args._handle_speculative_draft_placement()
+        joined = "\n".join(cm.output)
+        self.assertIn("co-located ranks", joined)
+        self.assertIn("[1, 2]", joined)
+        self.assertEqual(args.speculative_draft_solo_rank(), 1)
+
+    def test_no_warning_without_colocation(self):
+        args = solo_args(tp_size=2, rank_gpu_id=[0, 1], speculative_draft_gpu=1)
+        with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
             args._handle_speculative_draft_placement()
 
 
