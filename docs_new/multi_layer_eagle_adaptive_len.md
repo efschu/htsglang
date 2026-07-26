@@ -281,11 +281,15 @@ pure function of rank-invariant inputs, and this worker satisfies every link:
 `SGLANG_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC=1` all-gathers `(swap_ordinal, target_steps)` on
 every swap and raises on divergence — use it in the first TP GPU run.
 
-Note (pre-existing, out of scope): the multi-layer draft picks themselves
-(`fast_topk` / `sample_draft_proposal` in `_draft_extend_for_decode`) are NOT
-rank-0-broadcast, unlike `eagle_worker_v2._broadcast_draft_picks`. On heterogeneous
-GPUs that is a latent #50-class divergence in the multi-layer path. It does not affect
-the k decision (which rides on the broadcast accept counts) — see open point O2.
+Note (was pre-existing, FIXED in #185): the multi-layer draft picks themselves
+(`fast_topk` / `sample_draft_proposal` in `_draft_extend_for_prefill` /
+`_draft_extend_for_decode`, plus the in-graph topk returned by
+`cgr.replay(step)`) were NOT rank-0-broadcast, unlike
+`eagle_worker_v2._broadcast_draft_picks`. On heterogeneous GPUs that was a latent
+#50-class divergence in the multi-layer path. It never affected the k decision
+(which rides on the broadcast accept counts). `_broadcast_draft_picks` now lives in
+`spec_utils.py` and is called once per MTP rung, before the chain rotation carries
+the pick into rung i+1's input_ids — see open point O2.
 
 ### 4.6 Default: OFF
 
@@ -392,8 +396,14 @@ accept-length threshold 2.5) and `test_step3p5_flash_chain_mtp.py:41` (threshold
   (`multi_layer_eagle_worker_v2.py:612`). Hence the standing warning at `:595`.
   Fix would be to loop `draft_extend_attn_backend_list[step].init_forward_metadata`.
   Needs a GPU to validate; filed here so it is not rediscovered.
-- **O2 — pre-existing #50 gap:** multi-layer draft picks are not rank-0-broadcast
-  (see §4.5). Affects heterogeneous-GPU TP only, and not the k decision.
+- **O2 — FIXED (#185):** multi-layer draft picks are now rank-0-broadcast, one
+  sync per MTP rung, placed before the chain rotation in all three pick paths
+  (prefill loop, decode graph replay, decode eager loop). `_broadcast_draft_picks`
+  moved from `eagle_worker_v2.py` to `spec_utils.py` (re-imported under the same
+  name in both workers). CPU-tested by a two-rank simulation plus an AST ratchet
+  that requires the sync in the pick's own rung loop
+  (`test_multi_layer_eagle_draft_extend_decode.py`,
+  `test_draft_pick_rank_sync.py`). Not yet exercised on real heterogeneous GPUs.
 - **O3 — rejection sampling x upshift padding:** argued exact in §3, but never measured.
   If an accept-rate anomaly shows up right after upshifts under
   `--speculative-use-rejection-sampling`, this is the first suspect.
