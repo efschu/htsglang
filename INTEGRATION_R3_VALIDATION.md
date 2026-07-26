@@ -2191,3 +2191,203 @@ NOT moderate effort. Named as a limit, not left as a mystery.
 Standing caveat: these 27B numbers are the FORCED fallback on cards that do not
 need it. The real beneficiary is a card with no fp8 GEMM -- the 2080 Ti, and
 later the V100 -- and that measurement waits for hardware.
+
+
+## Merge window: #180, #96, #164, #182/#181 -- three merged, ONE RED
+
+Main rig only (5090 + 2x3080). The second host (gfx900 + 2080 Ti) was
+unavailable this window (NIC hardware fault), so every arm needing it was
+SKIPPED and is listed as owed, not as passed.
+
+Device identity resolved at runtime, never assumed (`r3val/gpu_map.py`):
+
+```
+NVML  order: nvml[0]=3080  nvml[1]=5090  nvml[2]=3080
+torch order: torch[0]=5090(sm120) torch[1]=3080(sm86) torch[2]=3080(sm86)
+torch->nvml permutation [1, 0, 2]   -- the two orders DO diverge on this rig
+```
+
+`--rank-gpu-id 0,1,2` is therefore 5090-first in torch order, which is what the
+established harness uses.
+
+### Verdicts
+
+| # | branch | verdict | merged |
+|---|---|---|---|
+| #182/#181 | fix/guard-reachability-and-ext-cache | GREEN | `a620d946da` |
+| #164 | fix/sm75-path-leftovers | GREEN (main-rig part only) | `81902b6eaa` |
+| #180 | feat/triton-dcp-spec-verify | GREEN | `af162cda99` |
+| #96 | feat/swa-dcp-triton | **RED -- blocked** | NOT merged |
+
+Per-phase boot tables and the full gate readings are in the three merge commit
+messages. What follows is only what those messages do not carry.
+
+### #96 Stage B is RED: Gemma-4 installs a custom mask on EVERY prefill
+
+The lane opens, the sizing is right, and the first forward dies:
+
+```
+NotImplementedError: DCP Triton extend does not support custom masks
+  triton_backend.py:2261, from forward_extend -> _forward_extend_dcp
+```
+
+Instrumented at the raise, on all three ranks:
+
+```
+R3DEBUG setter=init:1548 mask=False mode=1 custom_mask non-None:
+        shape=(75625,) layer_id=5 sw=-1 swa_hybrid_dcp=True
+        token_sharded=True spec_info=NoneType
+```
+
+Read it carefully: `mode=1` is EXTEND, `spec_info` is None, `sw=-1` means layer
+5 is a **full-attention** layer and is correctly classified token-sharded, and
+the setter that last built the metadata recorded `mask=False`. So the metadata
+was constructed WITHOUT a mask and acquired one afterwards.
+
+**Root cause, `models/gemma4_mm.py:428`:**
+
+```python
+get_attn_backend().forward_metadata.custom_mask = bidirectional_attn_masks
+```
+
+Gemma-4 mutates the attention backend's `forward_metadata` **in place**, after
+`init_forward_metadata` has run, to install the bidirectional mask its image
+soft tokens need. And the mask is appended per request at `:406`, OUTSIDE the
+`if mm_inputs is not None` guard -- the loop starts from `fill_(1).tril(...)`,
+a plain causal mask -- so a **pure-text** Gemma-4 prefill installs one too.
+75625 = 275^2, the warmup prefill. This is the [[geteilte-puffer-familie]]
+shape again: a shared buffer written out of band, with the ordering assumption
+nowhere but in the reader's head.
+
+**Attribution, deliberately careful.** The briefing warned that Gemma-4-31B is
+the first load on #173's `kv >= tp` write-gather sublane and that a failure
+there would belong to #173, not #96. **It is not that.** The failure is a
+precondition check on the extend READ path, before any write gather runs, and
+the mask originates in the model file. Both the mutation (upstream, and
+`gemma3_mm.py:272` does the same) and the refusal (#173) pre-date #96. What
+#96 contributes is **reachability**: it opens `reject_unsupported_dcp_geometry`
+for SWA-hybrid models and so puts a Gemma-4-class MM model on the Triton DCP
+extend path for the first time. The design note reasoned that the *sliding
+window* refusal inside `_forward_extend_dcp` becomes unreachable by
+construction (§3.2) but never considered its sibling `custom_mask` refusal in
+the same function, nor that every Gemma-4 checkpoint is a multimodal one.
+
+This needs a design decision, not a patch. Honouring the mask is wrong for the
+reason #180 §2.1 already records -- the mask's row stride is the GLOBAL prefix
+length, which stops describing the rows the kernel walks once the prefix is
+owner-sharded. The plausible routes are (a) refuse MM models on the lane, (b)
+have the model skip installing a mask that is purely causal, which is what a
+text-only request produces and which `extend_attention_fwd` would compute
+anyway (`SKIP_PREFIX_CUSTOM_MASK=True`), or (c) teach the DCP extend path an
+owner-sharded mask. Not decided here, and not patched blind in a validation
+window.
+
+**What did pass on #96, and is worth keeping:**
+
+* H1 CPU: 68 passed / 177 subtests (`test_swa_dcp_stage_b.py`,
+  geometry guard, `test_triton_weighted_dcp_gpu.py`, pool configurator).
+* H2 positive: the guard opens -- the Stage B config gets past
+  `TritonAttnBackend.__init__` and all the way to a forward.
+* H3 DCP-off Stage A regression, GREEN and Stage B inert:
+  `SWAKVPool ... swa size: 6403, full size: 32776` on all three ranks --
+  full size unsharded and identical per rank, which is exactly the off-lane
+  expectation. `max_total_num_tokens=32776`, up in 40 s, health 200.
+* H4 sizing, from the RED boot (it got far enough to size the pools):
+  `full size` 13851 / 9747 / 9234 against a global C of 32776 -- per-rank
+  compacted rows, and the SWA pool 6403 identical on every rank, as designed.
+* H5 oracle established for whoever fixes this: the needle probe is only valid
+  through the **chat template**. On raw `/generate` the it-model degenerates
+  into a repeat loop and misses the needle even on the DCP-off oracle, so a
+  bare completion prompt would have produced a false RED. Via
+  `/v1/chat/completions`, DCP off, 10956 prompt tokens (window is 1024):
+  needle retrieved 3/3, self-deterministic. That is the H5 arm-A baseline.
+
+H6 (graphs), H7 (`[13,30,21]` empty slices) and H8 (capacity table) are
+BLOCKED behind the custom-mask defect -- none of them can run without a
+working forward.
+
+### Registered, and NOT a #180 defect: the long-prompt cache-state sensitivity
+
+Found while running #180's V4 and chased to ground rather than explained away.
+On the Triton lane, an 11650-token prompt's output depends on radix-cache state
+and on `max_total_num_tokens`:
+
+| control | long prompt stable? |
+|---|---|
+| triton, uneven DCP, MTP on (the #180 arm) | cold run != warm runs |
+| triton, uneven DCP, **spec OFF** | cold != warm -- reproduces |
+| triton, **`--dcp-size 1`**, spec on | cold != warm -- reproduces |
+| triton, `--dcp-size 1`, on #180's PARENT `763ddef0d2` | cold != warm -- reproduces |
+| **flashinfer**, uneven DCP, MTP on | stable cold and warm |
+
+So it reproduces with every line of #180 inert, and on the parent commit. It is
+not #180. Warm, the Triton arms are 3x byte-identical, so Gate 3 is met at a
+fixed cache state; the three short prompts are identical in every arm and every
+cache state.
+
+A second, separate trap surfaced in the same investigation and is worth
+recording because it will bite the next reader: `SGLANG_MEASURED_KV_BUDGET=1`
+derives its correction from **the previous boot's measured leftover**, so the
+FIRST boot of a given config in a cold budget record sizes differently
+(`max_total_num_tokens` 380289 vs 447173 for the identical command). Any
+capacity or byte comparison across trees must be done in a matched budget
+regime, or it compares the harness to itself.
+
+The open question -- why a radix prefix hit and a cold chunked prefill differ
+numerically on the Triton path when flashinfer's do not -- belongs to #173's
+lane and is registered, not fixed.
+
+### Integrated regression boot on the merge tip `af162cda99`
+
+HTCCL `device` transport + CUDA graphs + uneven DCP TP=3 + MTP chain verify on
+Triton, i.e. all three merged changes in one process, warm caches:
+
+```
+HTCCL RS+AG link calibration: 14.3/6.5/13.2 GB/s -> ownership weights [2, 1, 2]
+HTCCL device extension 'htccl_device_ext_cuda_86_120' ... in 0.1 s
+torch extension cache self-heal: 0 poisoned entries
+JIT cache self-heal: 0 poisoned entries
+Capture target verify CUDA graph end: elapsed 3.93 / 3.93 / 3.95 s
+max_total_num_tokens=98328      health 200
+accepts (accept_probe): code 3.636 / prose 2.857 / mixed 2.857
+self-determinism: 3x byte-identical on all short prompts (warm: all four)
+```
+
+The calibration identity `[2, 1, 2]` is unchanged from every previous arm-E
+boot. Two honest deviations rather than rounded-off claims:
+
+1. **Capture is 3.93-3.95 s, above the 3.8-3.9 s band asked for** and above the
+   3.76-3.81 s historical arm-E band. The same config without HTCCL measured
+   3.76-3.78 s earlier in this window, so the delta is small and this arm now
+   additionally carries #180's verify split. Recorded as slightly-high, not
+   waved through.
+2. **`"plan differs"` is not emitted at all** in this boot -- the line is
+   absent from the log, so it is reported as absent rather than as 0. The
+   group is homogeneous NVIDIA, where the harmonisation has nothing to say.
+3. prose/mixed accepts 2.857 sit just below the recorded 3.048-3.459 arm-E
+   band, but that band was measured on a different arm (no uneven DCP, no
+   Triton verify split), so the two are not directly comparable. Noted.
+
+### Skipped this window, still owed
+
+* #180 V7 -- sm75 / gfx900, the actual Nordstern reason for the port.
+* #164 -- the 2080 Ti solo boot, the Vega arm, and the mixed-vendor pair. The
+  native `weak_ref_tensor` fallback still rests on CPU tests alone; only
+  "sm80+ is unchanged" was measured.
+* #96 -- everything from H6 on, behind the custom-mask defect.
+* The `--swa-pool-sizing ratio` / HiCache / speculative refusals of #96 §4.2
+  were not individually provoked, since the lane cannot serve a forward anyway.
+* #180's weightless guard branch: pre-empted at boot by the earlier
+  server_args weightless-x-spec refusal, so it is CPU-covered only.
+
+### Merge-order note for whoever picks #96 back up
+
+`layers/dcp/owner.py` is touched by BOTH #96 and #180, and #180 is now merged.
+The specific check that was queued for this window and could NOT be performed
+(because #96 did not earn its merge) is: **#96's q-head-base correction in
+`_plan_aware_dcp_group_q_head_counts` -- full-attention base only, plus the
+exhaustiveness assert -- against #180's verify use of the same head counts.**
+#96 §2.1 changes which vector the collectives use on a hybrid model; #180's
+verify path gathers q heads through `_dcp_gather_q_heads` on the same counts.
+Single-base models are unaffected, but that interaction is unvalidated and must
+be checked before #96 merges.
