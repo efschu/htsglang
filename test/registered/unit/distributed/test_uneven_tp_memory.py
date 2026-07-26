@@ -179,6 +179,10 @@ class TestTokenCapacitySync(UnevenTPTestCase):
             # these tests, so dcp_size=1 keeps uneven_dcp_active() False and
             # exercises the classic min-sync branch below it.
             dcp_size=1,
+            # #127: the min-sync branch logs which rank BINDS the group
+            # capacity (the number that decides whether a per-rank change --
+            # e.g. a lower-precision KV pool on one role -- buys anything).
+            tp_rank=0,
             # #79/#90 hybrid physical ceilings (mamba / SWA): inactive for
             # this plain-MHA stub. _apply_hybrid_kv_token_cap with cap=None
             # is the real no-op contract.

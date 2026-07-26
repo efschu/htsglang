@@ -333,6 +333,22 @@ EXCLUDED_CASES: Dict[str, str] = {
         "Contrast graph_vs_eager_weightless, which IS machine-zero because the "
         "weightless lane has no capture-gated branches."
     ),
+    "weightless_worker_fp8_kv": (
+        "#127 per-ROLE KV precision (--weightless-kv-worker-cache-dtype "
+        "fp8_e5m2: workers store their KV token-shard in fp8, the head keeps "
+        "its own format). NOT YET A GATED ROW -- deliberately, not by "
+        "oversight. The delta here is QUANTIZATION on ~(dcp_size-1)/dcp_size "
+        "of the tokens, not fp reassociation, so it needs its own measured "
+        "band; the #124 calibration lesson was that a guessed band can be two "
+        "orders of magnitude wrong, and a wrong band is worse than no row. "
+        "Two rows belong here once a GPU window has measured them: (a) "
+        "worker-fp8 lane vs the SAME lane inheriting --kv-cache-dtype -> "
+        "DECODE_CLASS with a measured band, and (b) head_local_prefill under "
+        "a role split -> MACHINE_ZERO, which is the concrete claim the design "
+        "makes for splitting by ROLE rather than switching the whole group "
+        "(the head's KV format is untouched, so its head-local path must stay "
+        "bit-exact). Recipe in docs_new/weightless_kv_role_precision.md §8."
+    ),
     "fp8_offload_machine_zero": (
         "RETRACTED OVERCLAIM (0fb3d8007): FP8 offload is NOT byte-identical to "
         "no-offload. The 64-token 'proof' was confident-prompt luck; the "

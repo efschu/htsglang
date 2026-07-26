@@ -1274,6 +1274,32 @@ class ServerArgs:
             "weightless (KV-token-shard only).",
         ),
     ] = 0
+    weightless_kv_worker_cache_dtype: A[
+        Optional[str],
+        Arg(
+            help="EXPERIMENTAL, LOSSY, OPT-IN (#127): KV-cache storage dtype "
+            "for the WEIGHTLESS WORKER ranks only, overriding the group-wide "
+            "--kv-cache-dtype on those ranks. None/'auto' (default) = inherit "
+            "--kv-cache-dtype everywhere -> byte-identical to today. The head "
+            "rank ALWAYS keeps --kv-cache-dtype, so 'fp8_e5m2' here means "
+            "'workers store KV in fp8, the head keeps its own precision'. "
+            "Rationale: a weightless worker's entire VRAM is KV, so its "
+            "per-token bytes are the only capacity knob it has, while the "
+            "head's VRAM is dominated by weights. Nothing is converted "
+            "between the roles: the per-step K/V that the head broadcasts "
+            "travels in the model COMPUTE dtype and each rank quantizes into "
+            "its own pool locally. NOTE the capacity arithmetic before "
+            "expecting a win: under the lane's even-modulo owner rule the "
+            "group capacity is dcp_size x MIN over ranks of the per-rank "
+            "token capacity, so worker-side fp8 only buys tokens when a "
+            "WORKER is the binding rank -- the boot log names it. "
+            "Accuracy-wise this is the same fp8 KV storage the engine "
+            "already supports globally, applied to a subset of ranks; it is "
+            "lossy and stays off unless asked for. Requires "
+            "--weightless-kv-fastlane.",
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+        ),
+    ] = None
     weightless_kv_chunked_block_size: A[
         int,
         Arg(
@@ -3988,6 +4014,13 @@ class ServerArgs:
                     "--weightless-kv-fastlane (it tiers the weightless lane's "
                     "full-attention KV shard)."
                 )
+            if self.weightless_kv_worker_cache_dtype is not None:
+                raise ValueError(
+                    "--weightless-kv-worker-cache-dtype requires "
+                    "--weightless-kv-fastlane: without the lane there are no "
+                    "weightless worker ranks to give a separate KV precision "
+                    "to. Use the group-wide --kv-cache-dtype instead."
+                )
             return
 
         # Single-node pure TP + DCP only.
@@ -4069,6 +4102,50 @@ class ServerArgs:
                 "--weightless-kv-fastlane requires a flashinfer attention "
                 f"backend; got --attention-backend={self.attention_backend}."
             )
+        # #127: per-ROLE KV storage precision. The override lands on the
+        # weightless worker ranks only; the head keeps --kv-cache-dtype. Scope
+        # it here (fail fast) rather than discovering an unsupported storage
+        # format after the pools are built.
+        if self.weightless_kv_worker_cache_dtype is not None:
+            from sglang.srt.layers.dcp.role_kv_dtype import (
+                WORKER_KV_CACHE_DTYPE_CHOICES,
+                worker_dtype_is_role_split,
+            )
+
+            if (
+                self.weightless_kv_worker_cache_dtype
+                not in WORKER_KV_CACHE_DTYPE_CHOICES
+            ):
+                raise ValueError(
+                    "--weightless-kv-worker-cache-dtype must be one of "
+                    f"{list(WORKER_KV_CACHE_DTYPE_CHOICES)}; got "
+                    f"{self.weightless_kv_worker_cache_dtype!r}. fp4_e2m1 is "
+                    "deliberately excluded: an fp4 pool carries a separate "
+                    "per-block scale buffer and its own pool class, neither "
+                    "of which has been exercised on this lane."
+                )
+            if worker_dtype_is_role_split(
+                self.kv_cache_dtype, self.weightless_kv_worker_cache_dtype
+            ):
+                # KV scales are per-tensor floats that live on the MODEL's
+                # attention layers. A weightless worker holds a META model and
+                # deliberately skips the KV-scale load (see model_runner's
+                # `kv_cache_dtype == "fp8_e4m3" and not is_weightless_worker`
+                # guard), so with a scale file the head would quantize against
+                # a loaded scale while the worker quantizes against the 1.0
+                # default -- the two roles' shards would then not be on the
+                # same scale. Refuse instead of silently mixing them.
+                if self.quantization_param_path is not None:
+                    raise ValueError(
+                        "--weightless-kv-worker-cache-dtype cannot be combined "
+                        "with --quantization-param-path: the KV scaling "
+                        "factors load into model weights, which a weightless "
+                        "(meta-device) worker does not have, so the head and "
+                        "the workers would quantize their KV shards against "
+                        "different scales. Use the group-wide "
+                        "--kv-cache-dtype for scale-carrying checkpoints."
+                    )
+
         # Stage B0 block-decode staging size: non-negative; 0 = monolithic.
         if self.weightless_kv_chunked_block_size < 0:
             raise ValueError(
