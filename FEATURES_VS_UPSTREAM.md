@@ -13,48 +13,26 @@ capability is present in upstream SGLang, upstream vLLM, `llama.cpp`, or `ik_lla
 
 ## Status legend
 
-This project is **work in progress, in the literal sense: nothing below is final**. Every
-`Fork`/`Fork status` entry records the local validation state observed on this fork's own rig(s)
-at the time of writing — 1x RTX 5090 + 2x RTX 3080 for most rows, plus 1x RTX 2080 Ti (sm75) + 1x
-Radeon RX Vega 64 (gfx900) for the cross-vendor rows — not a claim of finished code review,
-exhaustive test coverage, or upstream-mergeable maturity.
+**Status**
+- `Built` — merged; covered by our own tests only.
+- `Boot-checked` — executed on hardware with a real model; coherent output.
+- `Cross-checked` — validated against an independent reference (another
+  backend, a solo/TP=1 run as oracle, `torch`/`torch.distributed`, or a
+  byte-/token-identity that must hold for structural reasons). Reference and
+  scope are stated per row.
 
-`Fork status` uses a three-tier evidence classification instead of a single "done" word, because
-the three tiers carry genuinely different weight:
+All entries are work in progress. No entry implies external review or upstream-mergeable maturity.
+Reference rig: 1x RTX 5090 + 2x RTX 3080 for most rows, plus 1x RTX 2080 Ti (sm75) + 1x Radeon RX
+Vega 64 (gfx900) for the cross-vendor rows.
 
-- **`Built`** — the code is merged and has cleared only the fork's own tests. This is the weakest
-  tier on purpose: a test written by the same effort that wrote the code can share the same
-  blind spot as the code, so a green `Built` test demonstrates internal consistency, not
-  correctness.
-- **`Boot-checked`** — the path has actually run on real hardware with a real model and produced
-  coherent output. This proves the code was genuinely *executed* end to end, not merely
-  imported or unit-tested — but it is still self-referential: nothing outside the fork's own run
-  confirms the output is the right one.
-- **`Cross-checked`** — checked against an *independent* reference: a different backend (e.g.
-  flashinfer vs. Triton), a solo/TP=1 run used as an oracle, `torch`/`torch.distributed` as a
-  reference, or a byte-/token-identity that has to hold for structural reasons if the change is
-  correct. This is the only tier that does not rest solely on the fork's own assumptions.
+`falsifikator-geprueft` marks a row whose own test is on record as red before its fix and green
+after.
 
-**There is no tier above `Cross-checked`.** None of the three means "verified," "done," "stable,"
-"final," or "production-ready" — `Cross-checked` in particular is not an external code review and
-not an upstream-mergeable claim; it only means one specific claim survived one specific
-independent check, stated in that row.
-
-Where a row's own test is known to have been RED before the fix it now guards and GREEN after, the
-row adds **falsifikator-geprueft** — this distinguishes a test that has demonstrated it can catch
-a real regression from one that merely runs alongside the code without ever having been shown to
-fail.
-
-**fp8-on-RTX-3080 byte comparisons, since #190:** `gptq_marlin_gemm` — the only fp8 GEMM path RTX
-3080 (sm86) has — was found to be run-to-run nondeterministic above roughly M=128 (measured 0/1200
-mismatches through M=109, first mismatch at M=128; see `fix/gdn-prefill-determinism`, not yet
-merged into this branch's `integration/r3-probe` line, but the hardware measurement stands
-regardless of merge status). Consequence: a byte-/token-identity claim that includes an fp8
-request above roughly 109 prompt tokens on a 3080 is not solid `Cross-checked` evidence — the
-match could be luck at the kernel's own noise floor, not a demonstration of correctness. Below
-that length, and on the RTX 5090 (sm120, a different fp8 GEMM path entirely) at any length, the
-byte comparisons stand. Rows affected by a long-prompt fp8@3080 claim are flagged below rather
-than silently kept at `Cross-checked`.
+**fp8 on RTX 3080, since #190:** `gptq_marlin_gemm`, the only fp8 GEMM sm86 has, is measured
+run-to-run nondeterministic above ~109 prompt tokens (0/1200 mismatches through M=109, first
+mismatch at M=128; `fix/gdn-prefill-determinism`, not yet merged). Byte-/token-identity claims
+above that length on a 3080 are flagged per row rather than counted as `Cross-checked`; the RTX
+5090 (sm120, a different fp8 GEMM path) is unaffected at any length.
 
 ## Core concepts
 
@@ -72,10 +50,9 @@ linked by anchor to its **detail section**, which carries the fork status, key m
 and only the upstream distinctions not already implied by the matrix token.
 
 **Column definitions**
-- **Fork** — `Built` / `Boot-checked` / `Cross-checked` (merged code; see Status legend above for
-  what each tier actually requires and does not claim), `WIP` (present but not complete/validated),
-  `Exp` (highly experimental, not production-ready). A trailing `*` means the capability lives only
-  on a not-yet-merged branch, named in the detail section.
+- **Fork** — `Built` / `Boot-checked` / `Cross-checked` (see Status legend above), `WIP` (present
+  but not complete/validated), `Exp` (highly experimental, not production-ready). A trailing `*`
+  means the capability lives only on a not-yet-merged branch, named in the detail section.
 - **SGLang / vLLM / llama.cpp / ik_llama.cpp** — `yes` / `partial` / `no` / `n/a` / `unverified`.
   `partial` always names the mechanism difference in the detail section, never left implicit.
   `unverified` means the check could not be completed with the sources available in this pass.
@@ -148,25 +125,20 @@ concepts.
 **Fork status:** Cross-checked — token-split variant validated. The arg-gate dependency on a
 non-uniform `--rank-tp-ratio` was audited and confirmed genuine, not arbitrary. A silent-ignore
 defect in `resolve_cp_token_ratios` (an explicit token vector with no plan booted green but did
-nothing) now hard-rejects instead (`4c90038a78`, falsifikator-geprueft — the old behavior booted
-green while silently doing nothing; the new test would have caught it). Separately found and
+nothing) now hard-rejects instead (`4c90038a78`, falsifikator-geprueft: booted green while silently
+doing nothing). Separately found and
 guarded: stock (non-fork) `--dcp-size N` under the Triton backend silently corrupts output when KV
 heads aren't replicated across the DCP group — the fork's own uneven-DCP geometry is exempt.
 
-Two independent-reference checks, both on the main rig (27B FP8, TP=3, 5090 + 2x 3080, so both fall
-under the fp8@3080 caveat above where a prompt runs long):
-- **#173 G4** (Triton uneven-DCP vs a DCP-off ground truth, greedy, no spec): `short_code`
-  byte-identical arm-for-arm. The same comparison's `chunked` (11650-token) prompt also came out
-  byte-identical against the DCP-off baseline in this run, but per the fp8@3080 caveat above that
-  length is past the ~109-token boundary where `gptq_marlin_gemm` is measured nondeterministic —
-  one clean match at that length is not solid evidence, so only the short-prompt result is carried
-  here as `Cross-checked`.
+Two independent-reference checks, both on the main rig (27B FP8, TP=3, 5090 + 2x 3080):
+- **#173 G4** (Triton uneven-DCP vs. a DCP-off ground truth, greedy, no spec): `short_code`
+  byte-identical arm-for-arm. The same run's `chunked` (11650-token) prompt also matched, but sits
+  past the ~109-token fp8@3080 boundary (see legend) and is excluded from the tier.
 - **#180 V4** (Triton vs. flashinfer, chain speculative verify under uneven DCP, 27B FP8 TP=3, MTP,
   greedy, CUDA graphs on, 4 prompts): token ids identical arm-for-arm on the 3 short prompts;
-  `meta_info.spec_accept_length` in the same band. The 4th prompt (11650 tokens) is registered in
-  the source validation record as cold/warm-state-sensitive on the Triton lane for a separate,
-  still-open reason (not attributed to #180) — combined with the fp8@3080 caveat, that prompt's
-  match is not counted as evidence here either.
+  `meta_info.spec_accept_length` in the same band. The 4th prompt (11650 tokens) is separately on
+  record as cache-state-sensitive on the Triton lane (not attributed to #180) and, combined with
+  the fp8@3080 boundary, is excluded.
 
 **Upstream:** SGLang/vLLM have DCP but only a symmetric, evenly-split KV cache (partial).
 llama.cpp/ik_llama.cpp have no context-parallel decode of any kind (no).
@@ -194,7 +166,7 @@ flag (no). llama.cpp/ik_llama.cpp have no "rank" concept at all (no).
 broadcasting its output instead of all-reducing.
 
 **Fork status:** Built — registered unit tests (solo placement, weight/KV planning, vocab
-broadcast); no hardware boot recorded for this row specifically.
+broadcast); no hardware boot recorded for this row.
 
 **Upstream:** vLLM has the same capability (`--speculative-draft-tensor-parallel-size 1`, yes).
 SGLang has no equivalent flag (no). llama.cpp/ik_llama.cpp reach the same outcome via per-model
@@ -251,10 +223,8 @@ asymmetric-TP nor DCP exists there (partial).
 inverse weight transforms) on top of the generic GGUF path, plus sibling-file config/tokenizer
 loading for archs the generic metadata reader can't parse.
 
-**Fork status:** Boot-checked — registry with two families; unit tests (header, sizing). The
-registry itself has no independent hardware boot of its own, but every family registered in it
-(rows 8b-8f below) loads through this same code on real hardware, which is where its boot evidence
-comes from.
+**Fork status:** Boot-checked — registry with two families; unit tests (header, sizing). Boot
+evidence comes from rows 8b-8f, which load through this registry on real hardware.
 
 **Upstream:** SGLang/vLLM's generic GGUF path can't load these arches (no). llama.cpp/ik_llama.cpp
 are GGUF's native home — their own converter/loader **is** the reference implementation, so an
@@ -312,9 +282,9 @@ coarsening, GGUF-MoE out-of-bounds expert-id fixes, per-rank local-expert-count 
 alignment applied to compressed-tensors AWQ/GPTQ INT4.
 
 **Fork status:** Boot-checked — a series of merged bugfixes (#80, #81, #82, #109) with registered
-tests; the #82/#109 class (out-of-bounds expert ids, K-quant superblock alignment under uneven
-sharding) was found and fixed via real GPU crashes/reads, falsifikator-geprueft in that sense —
-each guard test corresponds to a reproduced hardware fault, not a hypothetical one.
+tests. The #82/#109 class (out-of-bounds expert ids, K-quant superblock alignment under uneven
+sharding) was found via real GPU crashes/reads (falsifikator-geprueft — each guard test corresponds
+to a reproduced hardware fault).
 
 **Upstream:** SGLang/vLLM: n/a, asymmetric TP is absent upstream. llama.cpp/ik_llama.cpp: n/a for
 the same reason — the closest analog, `--split-mode row`, has no per-rank asymmetric head split
@@ -374,11 +344,9 @@ match the mechanism in full detail (partial).
 0.
 
 **Fork status:** Boot-checked — three divergence root causes resolved; the emitted greedy token
-sequence is reproducible across the mixed-architecture TP group. This is output-preserving
-reproducibility, **not** bit-identical activations (sm86/sm120 reduce in a different order); it is
-recorded as `Boot-checked` rather than `Cross-checked` because the rank-0 broadcast that produces
-this agreement forces it by construction, rather than each architecture independently landing on
-the same answer and then being compared.
+sequence is reproducible across the mixed-architecture TP group (not bit-identical activations:
+sm86/sm120 reduce in a different order). Agreement is enforced by the rank-0 sampling broadcast,
+not an independent per-architecture comparison.
 
 **Upstream:** SGLang/vLLM have single-architecture determinism modes; mixed-GPU-architecture TP
 groups aren't addressed (partial). llama.cpp/ik_llama.cpp: no mixed-vendor TP determinism
@@ -392,10 +360,8 @@ verify-sync/graph-pad work is documented (no).
 shared name) a meta-device worker holds only KV cache and attention while a separate head holds
 the weights.
 
-**Fork status:** Cross-checked — chunked prefill and graph-decode paths in place. The lane's own
-determinism harness (#124) enforces a byte-identity class registry that includes a TP=1 solo run
-used as an independent oracle for the lane's output, which is what backs `Cross-checked` here
-rather than `Boot-checked`.
+**Fork status:** Cross-checked — chunked prefill and graph-decode paths in place. The lane's
+determinism harness (#124) checks output against a TP=1 solo run as reference oracle.
 
 **Upstream:** no equivalent found in SGLang, vLLM, llama.cpp, or ik_llama.cpp.
 
@@ -523,9 +489,8 @@ reduces on-GPU over host-mapped memory and is CUDA-graph capturable.
 `9a10846a82`, plus `feat/htccl-gfx900`'s `aec1308973`). Correctness: known-answer tests per
 collective/dtype/world-size/transport vs `torch.distributed`; 2 real bugs found and fixed
 pre-cross-vendor (an output-buffer aliasing defect; a `reduce_scatter` wrong-axis defect for
-`dim >= 2`, `8acd4221a3` — falsifikator-geprueft, the known-answer test asserted RED on the old
-axis before the fix and GREEN after on all three transports). **Cross-vendor (2080 Ti sm75 + Vega
-64 gfx900), eager:** byte-exact vs
+`dim >= 2`, `8acd4221a3` — falsifikator-geprueft: RED on the old axis, GREEN after the fix on all
+three transports). **Cross-vendor (2080 Ti sm75 + Vega 64 gfx900), eager:** byte-exact vs
 `torch.distributed`; model-scale byte-identical to `gloo` (Qwen3.5-4B, even 2/2 and uneven 3,1);
 `device` transport **+37%/+48% decode, +45%/+62% prefill vs `gloo`** (16.51 vs 11.13 tok/s
 uneven-decode). **Cross-vendor with CUDA graphs: in reach, not demonstrated** — 4 CUDA-only
@@ -548,22 +513,19 @@ own README (partial).
 than a capability-number comparison (`torch.cuda.get_device_capability()` reports `(9,0)` for both
 Hopper and gfx900).
 
-**Fork status:** Cross-checked, GPU-validated cross-vendor — **on `feat/htccl-gfx900` (`3cc2fc9da5`),
-NOT YET merged into `integration/r3-probe`.** CUDA path verified untouched by construction.
-Correctness: Qwen3.5-4B-FP8-dynamic, solo Vega 64 vs solo 2080 Ti, vs mixed TP=2 uneven 3,1, vs
-mixed TP=2 even 2/2 — all **byte-identical** (solo runs used as the independent oracle; neither
-card is in the sm80-88 range the fp8@3080 Marlin caveat above applies to, so this comparison is
-unaffected by it). Model fits solo on Vega 64 in fp8 (6.27 GB weights,
-1.07 GB free) where fp16 doesn't fit at all. Costs **~23% of decode** vs fp16 at the same TP
-config (12.67 vs 16.51 tok/s); on this specific pair the mixed configuration is pointless since
-the model fits solo on the 2080 Ti alone (15.23 tok/s). **Explicitly open:** the
-non-compressed-tensors `fp8.py` `Fp8Config` family (the user's own 27B/35B checkpoints) is not
-wired to the probe. A separate, narrower fused dequant-GEMV kernel (design B, #189) for the same
-lane decodes raw fp8-e4m3 bytes **bit-exact against `torch.to(float32)`** (max diff 0.0) and sits
-inside a fp32 error band tighter than the materialize-then-`F.linear` path it would replace (mean
-relative error 0.0014 vs 0.0133 against an fp32 reference) — also Cross-checked evidence, but for
-the kernel microbench alone: it is **not yet merged or wired into a live model boot** as of this
-pass (only a pre-merge semantic desk-check against #192 has been done).
+**Fork status:** Cross-checked, GPU-validated cross-vendor — on `feat/htccl-gfx900` (`3cc2fc9da5`),
+not yet merged into `integration/r3-probe`. CUDA path unchanged by construction. Correctness:
+Qwen3.5-4B-FP8-dynamic, solo Vega 64 vs. solo 2080 Ti, vs. mixed TP=2 uneven 3,1, vs. mixed TP=2
+even 2/2 — all **byte-identical** (solo runs as oracle; neither card is in the sm80-88 range the
+fp8@3080 caveat covers). Model fits solo on Vega 64 in fp8 (6.27 GB weights, 1.07 GB free) where
+fp16 doesn't fit at all. Costs **~23% of decode** vs fp16 at the same TP config (12.67 vs 16.51
+tok/s); on this pair the mixed configuration is pointless since the model fits solo on the 2080 Ti
+alone (15.23 tok/s). Open: the non-compressed-tensors `fp8.py` `Fp8Config` family (the user's own
+27B/35B checkpoints) is not wired to the probe. A separate fused dequant-GEMV kernel for the same
+lane (design B, #189) decodes raw fp8-e4m3 bytes **bit-exact against `torch.to(float32)`** (max
+diff 0.0), with a tighter fp32 error band than the materialize-then-`F.linear` path it would
+replace (mean relative error 0.0014 vs 0.0133). Not yet merged or wired into a model boot; only a
+pre-merge semantic desk-check against #192 has been done.
 
 **Upstream:** SGLang/vLLM require a native GEMM or Marlin (sm80+); no dequant fallback (no).
 llama.cpp handles fp8 via offline conversion (`--fp8-as-q8`) rather than a runtime dequant path
@@ -578,10 +540,9 @@ sm80) via a two-level capability predicate (`sgl_kernel_importable()`/`sgl_kerne
 instead of platform checks, with real fallbacks (`forward_native`, torch-native sampler backend).
 
 **Fork status:** Cross-checked, GPU-validated on both vendors — Turing support (`0eb7e68880`),
-rope/clamp_position routing (`3f0a93ac1c`), a 4th platform-vs-availability bug this time hitting
-the NVIDIA rank (`621311aa24`, falsifikator-geprueft — a real capability-vs-availability
-mismatch reproduced on the NVIDIA rank before the fix). Verified end-to-end on a real RTX 2080 Ti
-with `sgl_kernel`
+rope/clamp_position routing (`3f0a93ac1c`), a 4th platform-vs-availability bug, this time on the
+NVIDIA rank (`621311aa24`, falsifikator-geprueft — reproduced on hardware before the fix). Verified
+end-to-end on a real RTX 2080 Ti with `sgl_kernel`
 absent: all 11 core modules import, server starts, coherent generation, 608 unit tests pass.
 `forward_native` measured **byte-identical between sm75 and gfx900** (not vs. the kernel path,
 which differs by a ~4.8e-07-class reduction-order difference). Mixed-vendor TP=2 (Triton,
@@ -605,19 +566,15 @@ uneven-TP/DCP machinery, which has no upstream analog (see rows 1/2/18 for that 
 - **Tree speculative decoding with `--speculative-eagle-topk > 1` under asymmetric-weighted DCP
   (#76)** — Built and GPU-tested; found silently non-greedy under weighted DCP and
   perf-negative on this rig; restored as a hard fail-fast guard with a CPU test
-  (falsifikator-geprueft — the silent-non-greedy behavior was reproduced on hardware before the
-  guard, the guard test is what would catch a regression).
-- **SWA-DCP Stage B** — in `integration/r3-probe` itself, **still not implemented**: the DCP
-  Triton extend path raises `NotImplementedError` for sliding windows, and Gemma-4 SWA
-  long-context is served instead by `--swa-pool-sizing` (row 19). (Corrected 2026-07-25: previously
-  misstated as "implemented and evaluated (~+6-10%)"; that figure was an ex-ante design estimate,
-  not a measurement.) **Update (2026-07-26, Window 3 validation):** on the separate, still-unmerged
-  `feat/swa-dcp-triton` + `fix/gemma4-textonly-mask` combination, Stage B now boots (H4) and its
-  needle-retrieval result is Cross-checked — a needle planted ~3k tokens beyond the 1024-token
-  sliding window is retrieved byte-identical to a TP=1 solo-5090 oracle (#96-H5) — with H6/H7 also
-  green. This is validation-only: neither branch is merged into `integration/r3-probe`, so Stage B
-  stays excluded from the main matrix until it lands; recorded here so the guarded/descoped entry
-  does not go stale a second time.
+  (falsifikator-geprueft — reproduced on hardware before the guard).
+- **SWA-DCP Stage B** — in `integration/r3-probe`, not implemented: the DCP Triton extend path
+  raises `NotImplementedError` for sliding windows; Gemma-4 SWA long-context is served instead by
+  `--swa-pool-sizing` (row 19). (Corrected 2026-07-25: previously misstated as "implemented and
+  evaluated (~+6-10%)"; that figure was an ex-ante design estimate, not a measurement.) On the
+  separate, unmerged `feat/swa-dcp-triton` + `fix/gemma4-textonly-mask` combination (2026-07-26,
+  Window 3), Stage B boots (H4) and is Cross-checked: a needle planted ~3k tokens beyond the
+  1024-token sliding window retrieves byte-identical to a TP=1 solo-5090 oracle (#96-H5); H6/H7
+  also green. Neither branch is merged, so Stage B stays out of the main matrix until it lands.
 - **Replicated-KV eligibility widened to `kv == tp` (the `<` -> `<=` flip, row 1)** —
   Built, red/green-tested on CPU, and GPU-measured (falsifikator-geprueft — the CPU test was
   written red-then-green against the flip); the GPU measurement **refuted** it: at
@@ -776,21 +733,16 @@ process. Sources for the llama.cpp/ik_llama.cpp columns: a local `llama.cpp` che
 architecture files, and conversion-script behavior; GitHub API/raw-file fetches against
 `ikawrakow/ik_llama.cpp` `main` (no local checkout exists); WebSearch/WebFetch for project docs and
 discussion threads where neither repo answered directly.
-**This pass (2026-07-26):** replaced the single `Implemented` status token, in the overview matrix
-and every detail section, with a three-tier evidence classification (`Built` / `Boot-checked` /
-`Cross-checked`, see Status legend) so the matrix distinguishes "code merged, own tests only" from
-"actually run on real hardware with a real model" from "checked against an independent reference" —
-per row, based on the evidence already on record for that row, not re-derived from scratch. Added a
-`falsifikator-geprueft` marker where a row's own test was demonstrably red before its fix and green
-after. Sharpened the WIP framing: there is no tier above `Cross-checked`, and `Cross-checked` is
-explicitly not "verified," "done," or "production-ready." Folded in the #190 finding
-(`fix/gdn-prefill-determinism`, not yet merged) that `gptq_marlin_gemm` — the only fp8 GEMM the RTX
-3080 has — is run-to-run nondeterministic above roughly 109 prompt tokens, and flagged the two
-existing cross-checks that included a long fp8@3080 prompt (row 2's #173 G4 chunked prompt and
-#180 V4's 4th prompt) as not counted past that boundary. Added three previously undocumented
-cross-checks to their rows: row 2 (#180 V4, Triton vs. flashinfer chain-verify parity under uneven
-DCP), row 12 (#124's TP=1-solo-oracle regression harness for the weightless-KV lane), and row 22
-(#189's fp8-e4m3 raw-byte decode, bit-exact against `torch`, not yet merged/wired). Updated the
-guarded/descoped SWA-DCP Stage B entry with the 2026-07-26 Window 3 validation-only finding
-(H4/H5/H6/H7 green on a still-unmerged branch pair, #96-H5 needle retrieval Cross-checked against a
-TP=1 solo oracle) without moving it into the main matrix, since neither branch is merged.
+**This pass (2026-07-26):** replaced the single `Implemented` status token with a three-tier
+evidence classification (`Built` / `Boot-checked` / `Cross-checked`, see Status legend), applied
+per row to the existing evidence. Added a `falsifikator-geprueft` marker where a row's own test
+was red before its fix and green after. Folded in the #190 finding
+(`fix/gdn-prefill-determinism`, not yet merged): `gptq_marlin_gemm`, the only fp8 GEMM the RTX 3080
+has, is nondeterministic above roughly 109 prompt tokens; flagged the two cross-checks that
+included a long fp8@3080 prompt (row 2's #173 G4 chunked prompt, #180 V4's 4th prompt) as excluded
+past that boundary. Added three cross-checks: row 2 (#180 V4, Triton vs. flashinfer chain-verify
+parity under uneven DCP), row 12 (#124's TP=1-solo-oracle regression harness for the weightless-KV
+lane), row 22 (#189's fp8-e4m3 raw-byte decode, bit-exact against `torch`, not yet merged/wired).
+Updated the guarded/descoped SWA-DCP Stage B entry with the 2026-07-26 Window 3 finding (H4-H7
+green on an unmerged branch pair, #96-H5 needle retrieval Cross-checked against a TP=1 solo
+oracle); Stage B stays out of the main matrix since neither branch is merged.
