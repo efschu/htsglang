@@ -37,6 +37,9 @@ from sglang.kernels.ops.kvcache.kv_indices import create_flashinfer_kv_indices_t
 
 __all__ = [
     "build_dcp_weighted_kv_indices",
+    "dcp_verify_mask_mode",
+    "dcp_verify_paged_lens",
+    "dcp_verify_window_is_disjoint",
     "dcp_weighted_owned_lengths",
     "dcp_weighted_owner_bounds",
     "dcp_weighted_read_slots",
@@ -206,3 +209,96 @@ def build_dcp_weighted_kv_indices(
     owned_per_req = dcp_weighted_owned_lengths(owned, lens64)
     kv_indptr[1 : bs + 1] = torch.cumsum(owned_per_req, dim=0)
     return kv_indptr[: bs + 1], kv_indices
+
+
+# ---------------------------------------------------------------------------
+# The M4 verify split (#180). Three pure decisions, so the parts of a
+# speculative verify that decide whether uneven DCP is CORRECT can be pinned
+# with no device, no process group and no model.
+# ---------------------------------------------------------------------------
+
+
+def dcp_verify_paged_lens(
+    seq_lens: torch.Tensor,
+    num_draft_tokens: int,
+) -> torch.Tensor:
+    """The PAGED read length vector for a target-verify step: ``seq_lens``.
+
+    A verify step appends ``num_draft_tokens`` query positions per request, and
+    the attention over them splits in two:
+
+      * the COMMITTED prefix ``[0, seq_len)`` -- read from the KV pool, and
+        therefore owner-sharded under the weighted rule;
+      * the draft block -- attended out of this rank's freshly projected k/v,
+        which is locally complete on every rank, so it is NOT sharded.
+
+    ``seq_lens`` is the committed length: ``eagle_prepare_for_verify`` allocates
+    ``out_cache_loc`` for the draft tokens but does NOT advance ``seq_lens``.
+
+    The point of this function is what it does NOT return. Reading
+    ``seq_lens + num_draft_tokens`` from the pool would double-count the draft
+    block against the ragged stage AND dereference slots this rank may not own
+    -- and it is the natural mistake, because the non-DCP verify branch this
+    replaces also reads ``seq_lens``, for the unrelated reason that the draft
+    k/v are handed to the kernel as tensors. Two paths, same length vector,
+    different reasons; stating the reason once is cheaper than rediscovering it.
+
+    ``num_draft_tokens`` is taken only to be validated -- a verify step with no
+    draft tokens is not a verify step.
+    """
+    if num_draft_tokens <= 0:
+        raise ValueError(
+            f"target-verify needs num_draft_tokens >= 1, got {num_draft_tokens}"
+        )
+    return seq_lens
+
+
+def dcp_verify_window_is_disjoint(
+    seq_lens: torch.Tensor,
+    num_draft_tokens: int,
+    qo_stride: int,
+) -> bool:
+    """Do the paged and ragged stages together cover the attended context once?
+
+    The verify invariant, checkable on integers alone: each of the ``d`` draft
+    queries of a request attends ``seq_len`` paged rows plus its own causal
+    prefix of the ``d`` ragged rows, and the two sets are disjoint because the
+    paged read stops exactly where the draft block begins. So the split is
+    complete and non-overlapping iff the ragged stage's per-request query count
+    (``qo_stride``, the uniform ``qo_indptr`` step) equals ``num_draft_tokens``.
+
+    A mismatch is what a stale ``num_draft_tokens`` looks like: the kernel grid
+    covers fewer query blocks than there are draft tokens and silently drops
+    the tail, which reads as a collapsed accept rate rather than as an error.
+    """
+    if num_draft_tokens <= 0 or qo_stride != num_draft_tokens:
+        return False
+    return bool((seq_lens.to(torch.int64) >= 0).all())
+
+
+def dcp_verify_mask_mode(topk: Optional[int], dflash_tree_verify: bool = False) -> str:
+    """``"causal"`` or ``"tree"`` -- which draft->draft mask a verify needs.
+
+    At ``topk == 1`` the EAGLE draft is a CHAIN, so its d x d draft->draft mask
+    block is exactly lower-triangular: the plain causal mask. The verify can
+    therefore drop ``custom_mask`` entirely, which is not merely an
+    optimisation under DCP but a requirement -- the mask's row stride is the
+    GLOBAL prefix length, which stops describing the rows the kernel walks once
+    the prefix is owner-sharded.
+
+    The equivalence is already relied on twice in this tree
+    (``kernels/ops/attention/verify_splitkv.py`` gates on ``topk == 1`` for the
+    same reason; the flashinfer verify branch sets ``custom_mask = None``), so
+    this states it a third time in ONE place instead of a third copy.
+
+    ``dflash_tree_verify`` is the second door onto a tree-masked verify
+    (upstream #31069/#29587/#29907). It is read here for the same reason
+    ``ServerArgs.tree_verify_activation_reason`` reads it: a new flag name
+    reaching the same draft->draft tree mask is exactly how a guard gets
+    bypassed without anyone deciding to bypass it.
+    """
+    if dflash_tree_verify:
+        return "tree"
+    if topk is not None and topk > 1:
+        return "tree"
+    return "causal"

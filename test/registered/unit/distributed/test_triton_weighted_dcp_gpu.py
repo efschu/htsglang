@@ -18,6 +18,10 @@ Also covered here, because both need device tensors:
     a crash.
   * the write side's compact rows agreeing with the read side's, slot for slot,
     through the real ``dcp_weighted_write_slots``.
+  * #180's VERIFY SPLIT: the draft slots are physically present in
+    ``req_to_token`` (eagle_prepare_for_verify writes them without advancing
+    ``seq_lens``), so "the paged read walks past them" is a property of the
+    real table, not of the arithmetic, and only shows up here.
 
 SKIPPED WITHOUT CUDA. Single-process, single-rank: no collectives, no model,
 no server -- it fakes the per-rank bounds directly, so it runs in seconds in a
@@ -207,6 +211,103 @@ class TestTritonWeightedDcpGpu(CustomTestCase):
         with self.assertRaises(ValueError) as ctx:
             be._dcp_weighted_kv_indices(self.reqs, lens, ptr_buf, tiny, None)
         self.assertIn("overflow", str(ctx.exception))
+
+    # ------------------------------------------------- #180, the verify split
+
+    def test_the_verify_read_never_touches_the_draft_block(self):
+        """#180's load-bearing device property, and the one the pure tests
+        cannot reach: the draft slots exist in req_to_token, and the verify
+        read must walk past them.
+
+        eagle_prepare_for_verify writes out_cache_loc for the d draft tokens
+        into ``req_to_token[req, seq_len : seq_len+d]`` WITHOUT advancing
+        seq_lens. So the table row physically contains them, and the only thing
+        keeping them out of the paged read is that the build runs over
+        ``seq_lens`` and not ``seq_lens + d``. Building over the wrong vector
+        would double-count the draft block against the ragged stage -- which is
+        not a crash but a wrong verify context, i.e. a collapsed accept rate.
+
+        The check is direct: every compact row the build returns must be the
+        image of a COMMITTED slot, and none of the draft slots' images may
+        appear.
+        """
+        from sglang.srt.layers.dcp.owner import dcp_verify_paged_lens
+
+        d = 4
+        seq_np = np.array([1, 9, 40, 0, self.width - d], dtype=np.int32)
+        seq_lens = torch.from_numpy(seq_np).to(self.dev)
+        for plan in PLANS:
+            for rank in range(len(plan)):
+                with self.subTest(plan=plan, rank=rank):
+                    S, lo, hi, ratio = self._bounds(plan, rank)
+                    kv_indptr = torch.zeros(
+                        self.n_req + 1, dtype=torch.int32, device=self.dev
+                    )
+                    _, idx = build_dcp_weighted_kv_indices(
+                        self.table,
+                        self.reqs,
+                        dcp_verify_paged_lens(seq_lens, d),
+                        kv_indptr,
+                        None,
+                        S,
+                        lo,
+                        hi,
+                        ratio,
+                    )
+                    got = set(idx.cpu().numpy().astype(np.int64).tolist())
+
+                    def _rows(cols):
+                        out = set()
+                        for r, (a, b) in enumerate(cols):
+                            row = self.table_np[r, a:b].astype(np.int64)
+                            own = row[((row % S) >= lo) & ((row % S) < lo + ratio)]
+                            out |= set(((own // S) * ratio + (own % S - lo)).tolist())
+                        return out
+
+                    committed = _rows([(0, int(n)) for n in seq_np])
+                    draft_only = _rows(
+                        [(int(n), int(n) + d) for n in seq_np]
+                    ) - committed
+                    self.assertEqual(got, committed)
+                    self.assertEqual(
+                        got & draft_only,
+                        set(),
+                        "a draft slot reached the paged verify read",
+                    )
+
+    def test_the_verify_window_is_covered_once_by_the_whole_group(self):
+        """Across the DCP group the committed prefix must be read exactly once.
+
+        A gap is a token no rank attends (silently truncated verify context);
+        an overlap is a token the LSE merge counts twice. Both surface as a
+        degraded accept rate rather than as an error, which is why this is
+        asserted on the device build and not only on the arithmetic.
+        """
+        from sglang.srt.layers.dcp.owner import dcp_verify_paged_lens
+
+        seq_np = np.array([1, 9, 40, 0, 63], dtype=np.int32)
+        seq_lens = torch.from_numpy(seq_np).to(self.dev)
+        for plan in PLANS:
+            with self.subTest(plan=plan):
+                seen = []
+                for rank in range(len(plan)):
+                    S, lo, hi, ratio = self._bounds(plan, rank)
+                    kv_indptr = torch.zeros(
+                        self.n_req + 1, dtype=torch.int32, device=self.dev
+                    )
+                    ptr, _ = build_dcp_weighted_kv_indices(
+                        self.table,
+                        self.reqs,
+                        dcp_verify_paged_lens(seq_lens, 3),
+                        kv_indptr,
+                        None,
+                        S,
+                        lo,
+                        hi,
+                        ratio,
+                    )
+                    seen.append(int(ptr[-1].item()))
+                self.assertEqual(sum(seen), int(seq_np.sum()))
 
     def test_a_rank_that_owns_nothing_still_gets_a_usable_index_tensor(self):
         """Short prefix + low token ratio -> zero owned rows. The kernels are

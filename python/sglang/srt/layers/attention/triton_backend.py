@@ -21,6 +21,8 @@ from sglang.srt.layers.dcp import (
     cp_all_gather_heads_uneven,
     cp_lse_ag_out_ar_mha_uneven,
     create_triton_kv_indices_for_dcp_triton,
+    dcp_verify_mask_mode,
+    dcp_verify_paged_lens,
     dcp_weighted_owner_bounds,
     dcp_weighted_write_slots,
     get_dcp_lens,
@@ -31,6 +33,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -68,6 +71,20 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+# The verify-input types the M4 split is valid for (#180), kept in lockstep with
+# flashinfer's _DCP_VERIFY_SPEC_INPUT_TYPES. Both present a uniform
+# draft_token_num query block per request and a LINEAR (non-tree) draft chain,
+# which is exactly what the split assumes: the draft block is attended ragged on
+# local heads with a plain causal mask, and the committed prefix is read
+# owner-sharded. A verify type with a different query layout would be routed
+# into that assumption silently, so anything else is refused rather than served
+# -- and refused rather than fallen back to the FULL un-sharded build, which is
+# the out-of-bounds read this whole change exists to remove.
+_DCP_VERIFY_SPEC_INPUT_TYPES = frozenset(
+    {SpecInputType.EAGLE_VERIFY, SpecInputType.DFLASH_VERIFY}
+)
 
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
@@ -287,6 +304,7 @@ def reject_unsupported_dcp_geometry(
     swa_kv_heads: Optional[int] = None,
     mla: bool = False,
     speculative: bool = False,
+    speculative_tree: bool = False,
     sliding_window: bool = False,
 ) -> None:
     """Boot-time gate for every DCP geometry the Triton backend cannot serve.
@@ -307,7 +325,10 @@ def reject_unsupported_dcp_geometry(
           * both from ``layers/dcp/owner.py``, the SAME functions the
             flashinfer path calls, so the two backends cannot drift apart.
         So the lane is now SERVED, and this branch only rejects the pieces of
-        it that still have no Triton twin (see the sub-reasons below). The
+        it that still have no Triton twin (see the sub-reasons below). #180
+        then ported flashinfer's M4 verify split, so CHAIN speculative decoding
+        (topk == 1) left that list; only the TREE-masked verify is still
+        refused. The
         replication arithmetic of branch (3) deliberately does NOT apply here:
         under this lane every rank's pool row already holds every kv head, so
         the condition it checks is satisfied by construction of the pool.
@@ -358,13 +379,16 @@ def reject_unsupported_dcp_geometry(
                 "kernel family that the uneven-DCP wiring here has never been "
                 "run against"
             )
-        if speculative:
+        if speculative and speculative_tree:
             reasons.append(
-                "speculative decoding is on, and the Triton target-verify "
-                "metadata builds FULL un-sharded kv indices (global allocator "
-                "slot ids) which index a compact token-sharded pool out of "
-                "bounds; flashinfer has a dedicated verify split (M4), this "
-                "backend has none"
+                "a TREE-masked speculative verify is on (--speculative-eagle-"
+                "topk > 1, or the DFLASH tree-verify door). Chain verify "
+                "(topk == 1) IS served here since #180, but the tree mask is "
+                "not: its row stride is the GLOBAL prefix length, which stops "
+                "describing the rows the kernel walks once the prefix is "
+                "owner-sharded -- and #76 measured the flashinfer tree twin "
+                "non-deterministic under this very lane, so there is no "
+                "correct version to port. Use --speculative-eagle-topk 1"
             )
         if sliding_window:
             reasons.append(
@@ -671,6 +695,24 @@ class TritonAttnBackend(AttentionBackend):
             swa_kv_heads=total_swa_kv_heads(model_runner.model_config),
             mla=self.use_mla,
             speculative=bool(self.num_draft_tokens or self.speculative_num_steps),
+            # The tree predicate is NOT re-derived here. dcp_verify_mask_mode
+            # is the one place the "which draft->draft mask does a verify need"
+            # question is answered, and it knows about BOTH doors onto a tree
+            # mask (topk > 1 and --speculative-dflash-tree-verify) -- a second
+            # copy is how the second door got missed the first time.
+            speculative_tree=(
+                dcp_verify_mask_mode(
+                    self.topk,
+                    bool(
+                        getattr(
+                            model_runner.server_args,
+                            "speculative_dflash_tree_verify",
+                            False,
+                        )
+                    ),
+                )
+                == "tree"
+            ),
             sliding_window=(
                 self.sliding_window_size is not None and self.sliding_window_size > 0
             ),
@@ -1027,9 +1069,26 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
-        kv_indptr = self._fill_kv_indptr_and_indices(
-            bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
-        )
+        if self.dcp_size > 1:
+            # M4 verify split under capture (#180). Same owner-rule builder as
+            # eager, over the COMMITTED seq_lens, and handed the address-stable
+            # buffer so the D3 contract applies: _dcp_weighted_kv_indices
+            # copies INTO cuda_graph_kv_indices and returns that same object.
+            # Returning a fresh tensor here would leave a replay reading
+            # whatever the buffer held at capture time -- a silently wrong
+            # verify context, not a crash.
+            self._dcp_kv_indices(
+                req_pool_indices[:bs],
+                dcp_verify_paged_lens(seq_lens[:bs], self.num_draft_tokens),
+                self.kv_indptr,
+                self.cuda_graph_kv_indices,
+                None,
+            )
+            kv_indptr = self.kv_indptr[: bs + 1]
+        else:
+            kv_indptr = self._fill_kv_indptr_and_indices(
+                bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
+            )
         window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None
         window_num_kv_splits = None
@@ -1050,17 +1109,22 @@ class TritonAttnBackend(AttentionBackend):
                     window_kv_indices=window_kv_indices,
                 )
             )
-        custom_mask = self.cuda_graph_custom_mask
-        if (
-            spec_info is not None
-            and getattr(spec_info, "custom_mask", None) is not None
-        ):
-            custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-        else:
+        if self.dcp_size > 1:
+            # Chain verify on the DCP lane carries no mask; see the eager twin.
             custom_mask = None
-        seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
-        mask_indptr = self.mask_indptr[: bs + 1]
-        mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+            mask_indptr = None
+        else:
+            custom_mask = self.cuda_graph_custom_mask
+            if (
+                spec_info is not None
+                and getattr(spec_info, "custom_mask", None) is not None
+            ):
+                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+            else:
+                custom_mask = None
+            seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
+            mask_indptr = self.mask_indptr[: bs + 1]
+            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         return (
             qo_indptr,
             kv_indptr,
@@ -1370,19 +1434,53 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
-            seq_lens_sum = forward_batch.seq_lens_sum
-            if seq_lens_sum is None:
-                seq_lens_sum = bs * self.max_context_len
-            kv_indices = torch.empty(
-                seq_lens_sum, dtype=torch.int64, device=self.device
-            )
-            kv_indptr = self._fill_kv_indptr_and_indices(
-                bs,
-                forward_batch.seq_lens,
-                forward_batch.req_pool_indices,
-                kv_indices,
-            )
+            if self.dcp_size > 1:
+                # The split assumes a uniform draft_token_num query block per
+                # request and a LINEAR draft chain. A verify input with a
+                # different layout would be routed into that assumption
+                # SILENTLY, so it is refused here -- and refused rather than
+                # allowed to fall through to the full un-sharded build below,
+                # which is precisely the out-of-bounds read #180 removes.
+                _spec_type = getattr(spec_info, "spec_input_type", None)
+                if _spec_type not in _DCP_VERIFY_SPEC_INPUT_TYPES:
+                    raise NotImplementedError(
+                        f"Triton uneven-DCP target-verify (#180) serves "
+                        f"{sorted(t.name for t in _DCP_VERIFY_SPEC_INPUT_TYPES)}, "
+                        f"got {getattr(_spec_type, 'name', _spec_type)}. The M4 "
+                        f"split assumes a uniform draft-token query block and a "
+                        f"linear draft chain; use --attention-backend flashinfer "
+                        f"or --dcp-size 1 for this algorithm."
+                    )
+                # THE M4 VERIFY SPLIT (#180). The verify attention is two
+                # stages: the COMMITTED prefix, read from the pool and
+                # therefore owner-sharded, and the draft block, attended out of
+                # this rank's freshly projected k/v and NOT sharded (every rank
+                # holds all of it for its own head shard). So the paged read
+                # runs over seq_lens -- see dcp_verify_paged_lens for why that
+                # is emphatically not seq_lens + num_draft_tokens -- through
+                # the SAME owner-rule builder decode and extend call, and the
+                # draft block never appears in kv_indices at all.
+                kv_indptr, kv_indices, _ = self._dcp_kv_indices(
+                    forward_batch.req_pool_indices,
+                    dcp_verify_paged_lens(
+                        forward_batch.seq_lens, self.num_draft_tokens
+                    ),
+                    self.kv_indptr,
+                )
+            else:
+                # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
+                seq_lens_sum = forward_batch.seq_lens_sum
+                if seq_lens_sum is None:
+                    seq_lens_sum = bs * self.max_context_len
+                kv_indices = torch.empty(
+                    seq_lens_sum, dtype=torch.int64, device=self.device
+                )
+                kv_indptr = self._fill_kv_indptr_and_indices(
+                    bs,
+                    forward_batch.seq_lens,
+                    forward_batch.req_pool_indices,
+                    kv_indices,
+                )
 
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
                 # window_kv_offsets gives the start position in custom mask
@@ -1402,13 +1500,28 @@ class TritonAttnBackend(AttentionBackend):
                     self.token_to_kv_pool,
                 )
 
-            custom_mask = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (
-                forward_batch.seq_lens + self.num_draft_tokens
-            )
-            mask_indptr = self.mask_indptr
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
-            mask_indptr = mask_indptr[: bs + 1]
+            if self.dcp_size > 1:
+                # CHAIN verify drops the mask (#180). At topk == 1 the EAGLE
+                # draft is a chain, so its d x d draft->draft block IS the
+                # causal mask, which the current-chunk stage applies anyway.
+                # Under DCP dropping it is not an optimisation but a
+                # requirement: the mask's row stride is the GLOBAL prefix
+                # length and stage 2 offsets by it, so an owner-sharded prefix
+                # would index it wrong. topk > 1 never reaches here -- the boot
+                # guard refuses a tree mask on this lane by name.
+                assert (
+                    dcp_verify_mask_mode(self.topk) == "causal"
+                ), "tree verify reached the DCP metadata build; guard hole"
+                custom_mask = None
+                mask_indptr = None
+            else:
+                custom_mask = spec_info.custom_mask
+                seq_mask_len = self.num_draft_tokens * (
+                    forward_batch.seq_lens + self.num_draft_tokens
+                )
+                mask_indptr = self.mask_indptr
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
+                mask_indptr = mask_indptr[: bs + 1]
             max_extend_len = self.num_draft_tokens
             num_kv_splits = None
             attn_logits = None
@@ -1644,9 +1757,13 @@ class TritonAttnBackend(AttentionBackend):
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
         elif forward_mode.is_target_verify():
+            # On the DCP lane the chain verify carries no mask (#180) -- the
+            # captured graph must agree with the buffer update, else it would
+            # plan a tree-mask read the eager path already dropped.
             custom_mask = (
                 self.cuda_graph_custom_mask
-                if spec_info is not None
+                if self.dcp_size <= 1
+                and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
                 else None
             )
@@ -1659,7 +1776,9 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indices=self.cuda_graph_kv_indices,
                 qo_indptr=self.qo_indptr[: bs + 1],
                 custom_mask=custom_mask,
-                mask_indptr=self.mask_indptr[: bs + 1],
+                mask_indptr=(
+                    None if self.dcp_size > 1 else self.mask_indptr[: bs + 1]
+                ),
                 window_kv_indptr=self.window_kv_indptr[: bs + 1] if swa else None,
                 window_kv_indices=self.cuda_graph_window_kv_indices if swa else None,
                 window_num_kv_splits=(
@@ -2141,10 +2260,27 @@ class TritonAttnBackend(AttentionBackend):
         runs both collectives and contributes out=0 / lse=-inf, which is exactly
         the empty-attention contract the LSE merge already handles.
 
+        TARGET-VERIFY IS ANSWERED FIRST AND UNCONDITIONALLY (#180). A verify
+        batch carries NO prefix lengths -- forward_batch_info fills them from
+        batch.prefix_lens, which a verify batch built out of a decode batch
+        never sets -- so before #180 it fell through to the rank-local
+        fallback below. That is the D5 defect arriving through a second door:
+        the committed prefix of a verify step IS owner-sharded, so a short one
+        over an uneven token vector is owned entirely by the high-ratio rank
+        and the others would skip two collectives the owner then waits in.
+        forward_mode is replicated, so keying on it is uniform by
+        construction -- this is flashinfer's `force_prefix =
+        forward_mode.is_target_verify()` (M4), stated the same way. A verify
+        step always HAS a committed prefix; and even if it did not, forcing the
+        branch costs two collectives over an empty read, which the LSE merge
+        already handles as out=0 / lse=-inf.
+
         The old local test is kept only as the fallback for a batch that carries
-        no prefix lengths at all (it is then equivalent: no prefix lengths means
-        no paged read was planned for anyone).
+        no prefix lengths at all AND is not a verify (it is then equivalent: no
+        prefix lengths means no paged read was planned for anyone).
         """
+        if forward_batch.forward_mode.is_target_verify():
+            return True
         lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
         if lens_cpu is not None:
             return any(lens_cpu)
@@ -2169,7 +2305,17 @@ class TritonAttnBackend(AttentionBackend):
         if sinks is not None:
             raise NotImplementedError("DCP Triton extend does not support sinks")
         if self.forward_metadata.custom_mask is not None:
-            raise NotImplementedError("DCP Triton extend does not support custom masks")
+            # BACKSTOP, not the gate. Chain verify (topk == 1) is served here
+            # since #180 and reaches this function with custom_mask already
+            # dropped in the metadata build, because the mask's row stride is
+            # the GLOBAL prefix length and an owner-sharded prefix would index
+            # it wrong. A tree mask is refused at boot. So a non-None mask
+            # arriving here means one of those two decisions has a hole.
+            raise NotImplementedError(
+                "DCP Triton extend does not support custom masks; a chain "
+                "verify must arrive with custom_mask=None (#180) and a tree "
+                "verify must be refused at boot"
+            )
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             raise NotImplementedError(
                 "DCP Triton extend does not support sliding window"

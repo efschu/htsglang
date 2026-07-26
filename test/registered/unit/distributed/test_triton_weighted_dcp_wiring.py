@@ -37,6 +37,7 @@ from sglang.srt.layers.dcp.owner import (
     dcp_weighted_owner_bounds,
     dcp_weighted_read_slots,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -44,11 +45,17 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class _Batch:
-    """The two ForwardBatch fields the prefix gate reads."""
+    """The three ForwardBatch fields the prefix gate reads.
 
-    def __init__(self, lens=None, lens_cpu=None):
+    ``forward_mode`` is the REAL enum, not a stub: #180 made the gate answer
+    target-verify first, and the point of that answer is that it comes from a
+    replicated field. A stub predicate would test the test.
+    """
+
+    def __init__(self, lens=None, lens_cpu=None, mode=ForwardMode.EXTEND):
         self.extend_prefix_lens = lens
         self.extend_prefix_lens_cpu = lens_cpu
+        self.forward_mode = mode
 
 
 def _simulated_kv_index_build(req_to_token, req_pool_indices, lens, plan, rank):
@@ -238,12 +245,67 @@ class TestTritonWeightedDcpWiring(CustomTestCase):
         )
 
     def test_the_prefix_gate_falls_back_to_the_local_test_without_lengths(self):
-        """Target-verify style batches carry no extend_prefix_lens; the old
-        local test is then equivalent (no prefix lengths -> no paged read was
-        planned for anyone) and stays the fallback."""
+        """A NON-verify batch with no extend_prefix_lens at all: the old local
+        test is then equivalent (no prefix lengths -> no paged read was planned
+        for anyone) and stays the fallback.
+
+        NOTE the docstring this test used to carry said "target-verify style
+        batches" -- that premise died with #180, which gave verify a paged read.
+        See the two tests below.
+        """
         gate = TritonAttnBackend._dcp_batch_has_prefix
         self.assertFalse(gate(_Batch(), torch.zeros(0, dtype=torch.int64)))
         self.assertTrue(gate(_Batch(), torch.zeros(3, dtype=torch.int64)))
+
+    def test_target_verify_never_reaches_the_rank_local_fallback(self):
+        """#180, and the whole reason the gate had to change.
+
+        A verify batch carries NO extend_prefix_lens (forward_batch_info fills
+        them from batch.prefix_lens, which a verify batch built out of a decode
+        batch never sets), so before #180 it fell through to
+        ``kv_indices.numel() > 0`` -- a RANK-LOCAL quantity now that verify has
+        an owner-sharded paged read. A short committed prefix over an uneven
+        token vector is owned entirely by the high-ratio rank; the others would
+        skip the q-head all-gather and the LSE merge, and the owner would wait
+        in them alone. That is the D5 defect arriving through a second door.
+
+        The empty kv_indices below is exactly the rank that owns nothing.
+        """
+        gate = TritonAttnBackend._dcp_batch_has_prefix
+        empty = torch.zeros(0, dtype=torch.int64)
+        self.assertTrue(gate(_Batch(mode=ForwardMode.TARGET_VERIFY), empty))
+        # and it must not depend on the lengths being absent, either
+        self.assertTrue(
+            gate(_Batch(lens_cpu=[0, 0, 0], mode=ForwardMode.TARGET_VERIFY), empty)
+        )
+        self.assertTrue(
+            gate(
+                _Batch(
+                    lens=torch.zeros(3, dtype=torch.int64),
+                    mode=ForwardMode.TARGET_VERIFY,
+                ),
+                empty,
+            )
+        )
+
+    def test_the_verify_answer_is_uniform_across_a_whole_group(self):
+        """The property that actually matters: every rank of the group answers
+        the same, whatever it happens to own.
+
+        forward_mode is replicated, so simulating three ranks means varying
+        only the rank-local input (how many rows this rank owns) and demanding
+        one answer. If any rank ever disagreed, the collectives would go out of
+        lockstep -- which is a hang, not a wrong number.
+        """
+        gate = TritonAttnBackend._dcp_batch_has_prefix
+        batch = _Batch(mode=ForwardMode.TARGET_VERIFY)
+        owned_per_rank = [
+            torch.zeros(0, dtype=torch.int64),  # owns nothing
+            torch.zeros(1, dtype=torch.int64),  # owns the single slot
+            torch.zeros(17, dtype=torch.int64),  # owns the bulk
+        ]
+        answers = {gate(batch, owned) for owned in owned_per_rank}
+        self.assertEqual(answers, {True})
 
     # ------------------------------------------------- 4. the default path
 

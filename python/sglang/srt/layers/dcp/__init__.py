@@ -53,6 +53,9 @@ from sglang.srt.layers.dcp.layout import (
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.layers.dcp.owner import (
     build_dcp_weighted_kv_indices,
+    dcp_verify_mask_mode,
+    dcp_verify_paged_lens,
+    dcp_verify_window_is_disjoint,
     dcp_weighted_owned_lengths,
     dcp_weighted_owner_bounds,
     dcp_weighted_read_slots,
@@ -80,6 +83,9 @@ __all__ = [
     "cp_lse_ag_out_ar_mha_uneven",
     "cp_lse_ag_out_rs_mha",
     "cp_lse_ag_out_rs_mla",
+    "dcp_verify_mask_mode",
+    "dcp_verify_paged_lens",
+    "dcp_verify_window_is_disjoint",
     "dcp_weighted_owned_lengths",
     "dcp_weighted_owner_bounds",
     "dcp_weighted_read_slots",
