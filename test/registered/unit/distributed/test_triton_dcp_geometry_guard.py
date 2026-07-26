@@ -1,22 +1,23 @@
 """The Triton backend's DCP geometry gate: loud at boot, never silently wrong.
 
-Two independent rejections live in ``reject_unsupported_dcp_geometry``:
+``reject_unsupported_dcp_geometry`` has three branches:
 
-1. **No uneven-DCP wiring.** The Triton DCP path implements exactly one owner
-   rule -- the EVEN modulo one -- on the write side (``out_cache_loc //
-   dcp_size`` + ``positions % dcp_size == dcp_rank``) and on the read side
-   (``get_dcp_lens``), and it never gathers the kv heads before writing
-   (flashinfer's ``_dcp_write_gather``). The fork's uneven-DCP pool is a
-   different layout: a virtual block of ``sum(token ratios)`` slots, every slot
-   declared to hold the FULL replicated kv-head set. Measured on that
-   combination: CJK mojibake in an English greedy completion.
+1. **The uneven-DCP lane** (a ``--rank-tp-ratio`` plan installed, so the KV
+   pool is token-sharded with the FULL replicated kv-head set per row).
+   #169.1 refused it outright, because the Triton path then implemented only
+   the EVEN modulo owner rule and never gathered the kv heads before writing.
+   #173 ported the weighted machinery over from flashinfer -- the SAME
+   ``layers/dcp/owner.py`` functions on both sides -- so the lane is now
+   SERVED, and this branch only refuses the parts of it with no Triton twin:
+   the weightless-KV fast lane, MLA, speculative decoding, sliding window.
 
-   The predecessor guard SKIPPED itself on exactly that config
-   (``not uneven_dcp_active(...)``), so the geometry it should have rejected
-   hardest was the one it waved through. ``test_the_old_exemption_waved_through
-   _the_measured_garbage`` pins that regression directly.
+   The replication arithmetic of branch 3 deliberately does not run here: the
+   pool rows carry every kv head by construction under this lane.
 
-2. **Even DCP without kv-head replication** (the pre-existing rule, kept
+2. **A token vector without a plan** -- weighted pool sizing with head-sharded
+   rows, a half-installed state no backend serves.
+
+3. **Even DCP without kv-head replication** (the pre-existing rule, kept
    byte-identical): ``tp_size // total_kv_heads >= dcp_size``.
 
 CPU only: the rule is a pure function of the geometry, so it is called here
@@ -35,7 +36,19 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _call(dcp, tp, kv, *, plan=False, tokens=False, weightless=False, swa=None):
+def _call(
+    dcp,
+    tp,
+    kv,
+    *,
+    plan=False,
+    tokens=False,
+    weightless=False,
+    swa=None,
+    mla=False,
+    spec=False,
+    window=False,
+):
     reject_unsupported_dcp_geometry(
         dcp,
         tp,
@@ -44,6 +57,9 @@ def _call(dcp, tp, kv, *, plan=False, tokens=False, weightless=False, swa=None):
         weighted_tokens=tokens,
         weightless_kv=weightless,
         swa_kv_heads=swa,
+        mla=mla,
+        speculative=spec,
+        sliding_window=window,
     )
 
 
@@ -61,49 +77,65 @@ class _Cfg:
 class TestTritonDcpGeometryGuard(CustomTestCase):
     # ---------------------------------------------------------------- uneven
 
-    def test_the_old_exemption_waved_through_the_measured_garbage(self):
-        """THE falsifier for this fix.
+    def test_the_measured_mojibake_config_is_now_served(self):
+        """THE acceptance case for #173.
 
-        The measured mojibake config is uneven-DCP + a dense (qwen2) class on
-        triton: a --rank-tp-ratio plan, a non-uniform token vector, dcp == tp.
-        The old condition was ``if dcp_size > 1 and not uneven_dcp_active(...)``
-        -- i.e. a token vector DISABLED the whole guard. This asserts both
-        halves: the old predicate skips, the new rule rejects.
+        The config that produced CJK mojibake on the pre-#169 backend is
+        uneven-DCP + a dense (qwen2) class on triton: a --rank-tp-ratio plan, a
+        non-uniform token vector, dcp == tp. #169.1 rejected it because the
+        backend had no weighted wiring; #173 gave it the weighted wiring, so it
+        must now pass the gate -- INCLUDING at kv >= tp (8 kv heads over tp 3),
+        where the kv heads are head-sharded and the write gathers them.
+
+        Note the replication arithmetic of branch 3 would reject this geometry
+        (3 // 8 = 0 < 3). It must not run for this lane: under it every pool row
+        holds all 8 kv heads regardless of what any rank projects.
         """
-        dcp, tp, kv = 3, 3, 8
-        weighted_tokens = True
+        _call(3, 3, 8, plan=True, tokens=True)
+        # kv < tp, the REPLICATED-KV / Nordstern 27B-class case
+        _call(3, 3, 2, plan=True, tokens=True)
+        # the same lane with the even-modulo rule (uniform / absent vector)
+        _call(3, 3, 2, plan=True, tokens=False)
 
-        # what the old code did: guard body not entered at all
-        old_guard_runs = dcp > 1 and not weighted_tokens
-        self.assertFalse(
-            old_guard_runs,
-            "premise of this test is wrong: the old guard did run here",
-        )
+    def test_the_lane_still_refuses_what_has_no_triton_twin(self):
+        """Opening the gate must not open it for the pieces that were never
+        ported. Each names itself, so the operator sees which feature to drop.
+        """
+        for kwargs, fragment in (
+            ({"weightless": True}, "weightless-KV fast lane"),
+            ({"mla": True}, "MLA"),
+            ({"spec": True}, "speculative decoding"),
+            ({"window": True}, "sliding window"),
+        ):
+            with self.subTest(**kwargs):
+                _call(3, 3, 2, plan=True, tokens=True)  # without it: served
+                with self.assertRaises(ValueError) as ctx:
+                    _call(3, 3, 2, plan=True, tokens=True, **kwargs)
+                self.assertIn(fragment, str(ctx.exception))
 
+    def test_the_lane_names_every_unserved_feature_at_once(self):
+        """A config that trips several must name all of them, so the operator
+        does not drop one and re-run into the next."""
         with self.assertRaises(ValueError) as ctx:
-            _call(dcp, tp, kv, plan=True, tokens=True)
+            _call(3, 3, 2, plan=True, tokens=True, weightless=True, mla=True, spec=True)
         msg = str(ctx.exception)
-        self.assertIn("WEIGHTED owner rule", msg)
-        self.assertIn("flashinfer", msg)
+        for fragment in ("weightless-KV fast lane", "MLA", "speculative decoding"):
+            self.assertIn(fragment, msg)
 
-    def test_uneven_plan_without_a_token_vector_is_rejected_too(self):
-        """The silent hole the replication arithmetic could not see.
-
-        tp=4 / kv=2 / dcp=2 has replicas = 2 >= 2, so the even-DCP arithmetic
-        PASSES it. With a --rank-tp-ratio plan installed the pool is still
-        token-sharded with replicated kv heads, which triton neither writes nor
-        reads correctly -- and its q-head shards are unequal on top. Without
-        this branch the config boots and serves wrong tokens.
+    def test_a_token_vector_without_a_plan_is_still_refused(self):
+        """The half-installed state: the pool is SIZED by the weighted rule
+        (uneven_dcp_active) but its rows carry only this rank's kv-head shard
+        (uneven_dcp_kv_replicated is what makes them full). The weighted read
+        assumes full rows, so there is no correct interpretation -- and picking
+        one silently would be the exact class of bug this guard exists for.
         """
-        # the arithmetic alone accepts it ...
-        _call(2, 4, 2)
-        # ... the plan makes it unserviceable
         with self.assertRaises(ValueError) as ctx:
-            _call(2, 4, 2, plan=True)
-        self.assertIn("--rank-tp-ratio", str(ctx.exception))
-        self.assertIn("REPLICATED kv heads", str(ctx.exception))
+            _call(3, 3, 2, plan=False, tokens=True)
+        msg = str(ctx.exception)
+        self.assertIn("--rank-tp-ratio", msg)
+        self.assertIn("weighted owner rule", msg.lower())
 
-    def test_weightless_kv_fastlane_is_rejected(self):
+    def test_weightless_kv_fastlane_is_rejected_without_a_plan_too(self):
         """Head counts [all, 0, 0] are not an equal split either.
 
         Geometry chosen so the replication arithmetic ACCEPTS it (tp=4, kv=2,
@@ -114,15 +146,6 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
         with self.assertRaises(ValueError) as ctx:
             _call(2, 4, 2, weightless=True)
         self.assertIn("weightless", str(ctx.exception))
-
-    def test_every_uneven_reason_is_named_when_several_apply(self):
-        """A config that trips all three must name all three, so the operator
-        does not fix one and re-run into the next."""
-        with self.assertRaises(ValueError) as ctx:
-            _call(3, 3, 8, plan=True, tokens=True, weightless=True)
-        msg = str(ctx.exception)
-        for fragment in ("--rank-tp-ratio", "WEIGHTED owner rule", "weightless"):
-            self.assertIn(fragment, msg)
 
     # ------------------------------------------------- even-DCP replication
 
@@ -234,6 +257,10 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
         self.assertIn(
             "swa_kv_heads=total_swa_kv_heads(model_runner.model_config)", src
         )
+        # #173: the still-unserved parts of the now-open uneven lane
+        self.assertIn("mla=self.use_mla", src)
+        self.assertIn("speculative=", src)
+        self.assertIn("sliding_window=", src)
 
 
 if __name__ == "__main__":

@@ -37,7 +37,9 @@ from sglang.kernels.ops.kvcache.kv_indices import create_flashinfer_kv_indices_t
 
 __all__ = [
     "build_dcp_weighted_kv_indices",
+    "dcp_weighted_owned_lengths",
     "dcp_weighted_owner_bounds",
+    "dcp_weighted_read_slots",
     "dcp_weighted_write_slots",
 ]
 
@@ -91,6 +93,58 @@ def dcp_weighted_write_slots(
     return loc, mask
 
 
+def dcp_weighted_read_slots(
+    cache_loc: torch.Tensor,
+    cp_S: int,
+    cp_lo: int,
+    cp_hi: int,
+    cp_ratio: int,
+):
+    """READ side of the weighted owner rule: ``(compact, owned)``.
+
+    The exact counterpart of ``dcp_weighted_write_slots`` -- SAME expression,
+    stated once -- for a flat list of GLOBAL cache slots (typically the
+    ``req_to_token`` rows of a paged read). ``owned[i]`` is True iff this rank
+    stores slot ``cache_loc[i]``; ``compact[i]`` is the physical row it stores
+    it in. ``compact`` is computed for EVERY entry, not only the owned ones,
+    so the caller can mask without a second pass; unowned entries carry a
+    meaningless (possibly negative) value and must not be dereferenced.
+
+    Extracted out of ``build_dcp_weighted_kv_indices`` so that the index math
+    -- the part that decides whether uneven DCP is CORRECT -- is a pure tensor
+    function with no Triton kernel in it, and can therefore be pinned against
+    an independent reference on CPU, with no device and no collectives.
+    """
+    loc64 = cache_loc.to(torch.int64)
+    off = loc64 % cp_S
+    owned = (off >= cp_lo) & (off < cp_hi)
+    compact = ((loc64 // cp_S) * cp_ratio + (off - cp_lo)).to(torch.int32)
+    return compact, owned
+
+
+def dcp_weighted_owned_lengths(
+    owned: torch.Tensor,
+    lens: torch.Tensor,
+) -> torch.Tensor:
+    """Per-request count of owned slots, given the flat ``owned`` mask.
+
+    ``owned`` is the concatenation of the per-request slot lists in request
+    order and ``lens`` their (global) lengths, so this is a segmented sum.
+    Returned as int64, one entry per request. Pure tensor math -- CPU-safe,
+    tested against numpy.
+    """
+    lens64 = lens.to(torch.int64)
+    bs = lens64.numel()
+    out = torch.zeros(bs, dtype=torch.int64, device=lens64.device)
+    if owned.numel() == 0:
+        return out
+    seg = torch.repeat_interleave(
+        torch.arange(bs, device=lens64.device, dtype=torch.int64), lens64
+    )
+    out.scatter_add_(0, seg, owned.to(torch.int64))
+    return out
+
+
 def build_dcp_weighted_kv_indices(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -102,6 +156,7 @@ def build_dcp_weighted_kv_indices(
     cp_hi: int,
     cp_ratio: int,
     pad: int = 0,
+    req_to_token_stride: Optional[int] = None,
 ):
     """Weighted-DCP paged kv_indices: this rank's OWNED cache slots, compacted.
 
@@ -112,6 +167,15 @@ def build_dcp_weighted_kv_indices(
     _dcp_masked_write packing, so a token is read from the slot it was written
     to. Writes the per-request owned counts into ``kv_indptr`` and returns
     (kv_indptr[:bs+1], kv_indices).
+
+    ``req_to_token_stride`` defaults to ``req_to_token.shape[1]``, which is the
+    row stride of the (contiguous) req_to_token table. Callers that hold a
+    stride from the pool pass it explicitly rather than re-deriving it.
+
+    Only the ``create_flashinfer_kv_indices_triton`` launch is device-bound;
+    the actual owner-rule arithmetic is ``dcp_weighted_read_slots`` /
+    ``dcp_weighted_owned_lengths``, which are pure tensor functions pinned on
+    CPU against an independent reference.
     """
     bs = len(req_pool_indices)
     device = req_pool_indices.device
@@ -128,23 +192,17 @@ def build_dcp_weighted_kv_indices(
             full_indptr,
             kv_start_idx,
             full_kv,
-            req_to_token.shape[1],
+            (
+                req_to_token.shape[1]
+                if req_to_token_stride is None
+                else req_to_token_stride
+            ),
         )
     full_kv = full_kv[:total]
-    full_kv64 = full_kv.to(torch.int64)
-    off = full_kv64 % cp_S
-    owned = (off >= cp_lo) & (off < cp_hi)
-    compact = ((full_kv64 // cp_S) * cp_ratio + (off - cp_lo)).to(torch.int32)
+    compact, owned = dcp_weighted_read_slots(full_kv, cp_S, cp_lo, cp_hi, cp_ratio)
     kv_indices = compact[owned].contiguous()
     if pad > 0:
         kv_indices = torch.cat([kv_indices, kv_indices.new_zeros(pad)])
-    if total > 0:
-        seg = torch.repeat_interleave(
-            torch.arange(bs, device=device, dtype=torch.int64), lens64
-        )
-        owned_per_req = torch.zeros(bs, dtype=torch.int64, device=device)
-        owned_per_req.scatter_add_(0, seg, owned.to(torch.int64))
-    else:
-        owned_per_req = torch.zeros(bs, dtype=torch.int64, device=device)
+    owned_per_req = dcp_weighted_owned_lengths(owned, lens64)
     kv_indptr[1 : bs + 1] = torch.cumsum(owned_per_req, dim=0)
     return kv_indptr[: bs + 1], kv_indices
