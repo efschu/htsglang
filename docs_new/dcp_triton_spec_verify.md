@@ -142,6 +142,23 @@ already installed and is what keeps the draft's multi-step backend untouched.
 | `_dcp_masked_write` (`:2212`) | `_set_kv_buffer` (`:1890`) — keys on `out_cache_loc`, not on forward mode | **already correct for verify** |
 | per-bucket verify ragged CG wrappers (`:1836`) | *not needed* — `extend_attention_fwd` is stateless | n/a |
 | tree mask `_build_dcp_ragged_tree_mask` (`:5904`, dormant) | *not ported* | stays refused |
+| `_DCP_VERIFY_SPEC_INPUT_TYPES` (`:79`) | same frozenset, pinned EQUAL to flashinfer's by test | added in #180.3 |
+
+### 2.0 Which verify layouts the split is valid for
+
+Four `SpecInputType`s end in `_VERIFY` (`EAGLE`, `FROZEN_KV_MTP`, `DFLASH`,
+`NGRAM`), and flashinfer's M4 admits exactly two: `EAGLE_VERIFY` and
+`DFLASH_VERIFY`. Both present a uniform `draft_token_num` query block per request
+and a **linear** draft chain, which is what the split assumes — the draft block is
+attended ragged on local heads with a plain causal mask while the committed prefix
+is read owner-sharded.
+
+Keying the Triton branch on `forward_mode.is_target_verify()` alone would admit the
+other two silently. So the same frozenset gates it, and a non-member **raises**
+rather than falling through to the non-DCP branch — falling through would rebuild
+the FULL un-sharded indices against a compact pool, which is the out-of-bounds read
+this whole change removes. The test pins Triton's set *equal to* flashinfer's
+rather than restating its members, so the two cannot drift.
 
 **No new kernel, no new collective kind, no second copy of the owner rule.** The
 verify read is `build_dcp_weighted_kv_indices` over a different length vector; the

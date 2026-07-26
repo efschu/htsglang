@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -70,6 +71,20 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+# The verify-input types the M4 split is valid for (#180), kept in lockstep with
+# flashinfer's _DCP_VERIFY_SPEC_INPUT_TYPES. Both present a uniform
+# draft_token_num query block per request and a LINEAR (non-tree) draft chain,
+# which is exactly what the split assumes: the draft block is attended ragged on
+# local heads with a plain causal mask, and the committed prefix is read
+# owner-sharded. A verify type with a different query layout would be routed
+# into that assumption silently, so anything else is refused rather than served
+# -- and refused rather than fallen back to the FULL un-sharded build, which is
+# the out-of-bounds read this whole change exists to remove.
+_DCP_VERIFY_SPEC_INPUT_TYPES = frozenset(
+    {SpecInputType.EAGLE_VERIFY, SpecInputType.DFLASH_VERIFY}
+)
 
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
@@ -1413,6 +1428,22 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
             if self.dcp_size > 1:
+                # The split assumes a uniform draft_token_num query block per
+                # request and a LINEAR draft chain. A verify input with a
+                # different layout would be routed into that assumption
+                # SILENTLY, so it is refused here -- and refused rather than
+                # allowed to fall through to the full un-sharded build below,
+                # which is precisely the out-of-bounds read #180 removes.
+                _spec_type = getattr(spec_info, "spec_input_type", None)
+                if _spec_type not in _DCP_VERIFY_SPEC_INPUT_TYPES:
+                    raise NotImplementedError(
+                        f"Triton uneven-DCP target-verify (#180) serves "
+                        f"{sorted(t.name for t in _DCP_VERIFY_SPEC_INPUT_TYPES)}, "
+                        f"got {getattr(_spec_type, 'name', _spec_type)}. The M4 "
+                        f"split assumes a uniform draft-token query block and a "
+                        f"linear draft chain; use --attention-backend flashinfer "
+                        f"or --dcp-size 1 for this algorithm."
+                    )
                 # THE M4 VERIFY SPLIT (#180). The verify attention is two
                 # stages: the COMMITTED prefix, read from the pool and
                 # therefore owner-sharded, and the draft block, attended out of

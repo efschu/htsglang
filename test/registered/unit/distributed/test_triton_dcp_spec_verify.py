@@ -406,6 +406,43 @@ class TestTritonDcpSpecVerify(CustomTestCase):
         # and the tree predicate is never re-derived locally
         self.assertNotIn("self.topk > 1", src)
 
+    def test_only_the_verify_layouts_the_split_was_written_for_are_served(self):
+        """The split assumes a uniform draft-token query block and a LINEAR
+        chain. Four SpecInputTypes end in _VERIFY, and flashinfer's M4 admits
+        exactly two of them; keying on forward_mode alone would route the other
+        two into that assumption silently.
+
+        The refusal must also not be a fall-through: dropping into the non-DCP
+        branch would rebuild the FULL un-sharded indices, which is the
+        out-of-bounds read #180 exists to remove. So the set is pinned against
+        flashinfer's, and the branch raises.
+        """
+        import pathlib
+
+        import sglang.srt.layers.attention.flashinfer_backend as fb
+        import sglang.srt.layers.attention.triton_backend as tb
+        from sglang.srt.speculative.spec_info import SpecInputType
+
+        self.assertEqual(
+            tb._DCP_VERIFY_SPEC_INPUT_TYPES,
+            fb._DCP_VERIFY_SPEC_INPUT_TYPES,
+            "the two backends must admit the same verify layouts",
+        )
+        self.assertEqual(
+            tb._DCP_VERIFY_SPEC_INPUT_TYPES,
+            frozenset({SpecInputType.EAGLE_VERIFY, SpecInputType.DFLASH_VERIFY}),
+        )
+        # the other verify layouts are excluded, not merely unmentioned
+        for name in ("FROZEN_KV_MTP_VERIFY", "NGRAM_VERIFY"):
+            with self.subTest(spec_input_type=name):
+                self.assertNotIn(
+                    getattr(SpecInputType, name), tb._DCP_VERIFY_SPEC_INPUT_TYPES
+                )
+        src = pathlib.Path(tb.__file__).read_text()
+        verify = src.split("is_target_verify():", 1)[1].split("        else:", 1)[0]
+        self.assertIn("_DCP_VERIFY_SPEC_INPUT_TYPES", verify)
+        self.assertIn("raise NotImplementedError", verify)
+
     def test_the_graph_twin_routes_through_the_stable_buffer(self):
         """D3, for verify.
 
