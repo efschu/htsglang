@@ -554,6 +554,24 @@ ik_llama.cpp use an entirely different compute stack (ggml), so no comparison co
   bit-for-bit; the buffer is obtained once per runner in `__init__`, not per call, so nothing could
   hand it to a live consumer. Verified for the overlap scheduler ON (the shipped configuration);
   `return_logprob`'s separate read path was not exercised.
+- **Cold JIT builds collide with the device-collective deadline** (`fix/jit-coldbuild-robustness`).
+  `jit_kernel` modules build on FIRST CALL, and several first calls land in the pre-capture warmup
+  forward, so ranks reach that forward minutes apart on an empty cache. `HTCCLDeviceTransport`'s
+  wait kernels compare `clock64()` against `_TIMEOUT_CYCLES = 60e9` (~23 s at 2.6 GHz) and trap on
+  expiry, poisoning the CUDA context; the `cudaErrorLaunchFailure` then surfaces on the NEXT,
+  unrelated kernel. Measured: 6/6 boots RED on a cold cache, 1/1 GREEN with the same tree once
+  warm, stall 23-30 s. Fixed by a cold-build *window* around the warmup forwards
+  (`srt/utils/jit_cold_build.py`) rather than by raising the constant — the recorded pass stays
+  outside it, so the deadline baked into the captured graph is unchanged. Opened rank-uniformly and
+  unconditionally; a rank-local predicate in front of a group collective is the hang family that
+  already produced the pynccl and CustomAllreduce defects.
+- **The JIT kernel cache does not self-heal** (`fix/jit-coldbuild-robustness`). A build killed
+  mid-flight leaves `build.ninja` + `cuda.cu` + `cuda_0.o.d` and no `.so`; every later process then
+  dies with `Check failed: (lib_handle_ != nullptr)`. Four such directories accumulated on the r3
+  host and had to be removed by hand — one interrupted boot turns into a permanent failure.
+  `jit_kernel/cache_health.py` classifies entries (complete = a `.so` exists, and is never touched)
+  and discards poison, with a host+pid build marker so a co-located rank's in-flight directory is
+  not mistaken for wreckage.
 - **Validator hygiene:** the campaign's own output-corruption validator mis-scored a healthy,
   math-heavy sample as `CORRUPT`; the faulty letter-fraction rule was removed rather than tuned.
 
