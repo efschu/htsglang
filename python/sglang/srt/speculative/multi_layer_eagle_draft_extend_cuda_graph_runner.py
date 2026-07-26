@@ -277,6 +277,18 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
+            # Fixed per-req window; drives the constant qo layout. MUST be
+            # stamped here and not only in the composite runner's prepare():
+            # EagleDraftExtendInput defaults it to -1 with no auto-fill (unlike
+            # EagleVerifyInput), and attention backends read it while building
+            # CAPTURE-time metadata -- FA3's DRAFT_EXTEND_V2 branch falls back
+            # to it whenever spec_info carries no extend_seq_lens_tensor, which
+            # is exactly the capture-time state, and derives max_seq_len_q /
+            # cu_seqlens_q from it. Those are host scalars, so a -1 is baked
+            # into the captured launch and silently survives every replay.
+            # Same defect and same fix as upstream sgl-project/sglang#31367;
+            # the single-layer runner has always passed it.
+            num_tokens_per_req=self.num_tokens_per_bs,
         )
         spec_info.positions = None
 
