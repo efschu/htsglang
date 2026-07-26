@@ -28,13 +28,18 @@ What this file pins:
    text-only ones, because `USE_CUSTOM_MASK` is a whole-launch constexpr.
 """
 
+import pathlib
+import re
 import types
 
+import pytest
 import torch
 
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import gemma4_mm
+from sglang.srt.multimodal import lane_support
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -195,3 +200,131 @@ def test_single_token_image_span_stays_degenerate():
     """A 1-token span writes only the diagonal, which causal already covers."""
     one = [_FakeMMInputs([_FakeItem([(7, 7)])])]
     assert _run([64], [0], one).custom_mask is None
+
+
+# ---------------------------------------------------------------------------
+# Routes 1 + 2: image requests are refused before the forward, and the boot
+# warmup stops sending an image on a lane that cannot serve one.
+# ---------------------------------------------------------------------------
+
+
+def _server_args(backend="triton", prefill_backend=None, dcp_size=1):
+    return types.SimpleNamespace(
+        dcp_size=dcp_size,
+        get_attention_backends=lambda: (prefill_backend or backend, backend),
+    )
+
+
+def _model_config(*architectures):
+    return types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(architectures=list(architectures))
+    )
+
+
+def test_lane_predicate_mirrors_the_backend_dispatch():
+    # The dispatch tests `self.dcp_size > 1` and nothing else; the backend
+    # selector is the only thing added here.
+    assert lane_support.triton_dcp_extend_lane_active(_server_args(dcp_size=3))
+    assert not lane_support.triton_dcp_extend_lane_active(_server_args(dcp_size=1))
+    assert not lane_support.triton_dcp_extend_lane_active(
+        _server_args(backend="flashinfer", dcp_size=3)
+    )
+    # --prefill-attention-backend on its own must be honoured: extend is what
+    # dispatches, so the prefill backend decides.
+    assert lane_support.triton_dcp_extend_lane_active(
+        _server_args(backend="flashinfer", prefill_backend="triton", dcp_size=3)
+    )
+    assert not lane_support.triton_dcp_extend_lane_active(
+        _server_args(backend="triton", prefill_backend="flashinfer", dcp_size=3)
+    )
+
+
+def test_refusal_needs_both_the_lane_and_a_mask_installing_model():
+    gemma = _model_config("Gemma4ForConditionalGeneration")
+    qwen = _model_config("Qwen2VLForConditionalGeneration")
+
+    reason = lane_support.image_requests_unsupported_reason(
+        _server_args(dcp_size=3), gemma
+    )
+    assert reason is not None
+    # House style: name the flag, the value, and the escape hatches.
+    assert "--dcp-size 3" in reason
+    assert "--attention-backend flashinfer" in reason
+    assert "Text-only requests are served normally" in reason
+
+    # A VL model that installs no bidirectional mask runs on this lane today.
+    # Refusing it would be a regression, not a fix.
+    assert (
+        lane_support.image_requests_unsupported_reason(_server_args(dcp_size=3), qwen)
+        is None
+    )
+    # And the lane has to be active at all.
+    assert (
+        lane_support.image_requests_unsupported_reason(_server_args(dcp_size=1), gemma)
+        is None
+    )
+    assert (
+        lane_support.image_requests_unsupported_reason(
+            _server_args(backend="flashinfer", dcp_size=3), gemma
+        )
+        is None
+    )
+
+
+def test_arch_list_has_not_drifted_from_the_model_sources():
+    """Ratchet. The arch tuple is a hand-maintained mirror of "which model
+    classes install a bidirectional image mask", chosen over ModelRegistry
+    because resolving through it imports every model module. If a new model
+    grows a `prepare_attn_masks`, or an existing one is subclassed, this test
+    fails and the tuple has to be updated."""
+    models_dir = pathlib.Path(lane_support.__file__).resolve().parents[1] / "models"
+    definers, entry_of = set(), {}
+    for path in sorted(models_dir.glob("*.py")):
+        src = path.read_text()
+        entry = re.search(r"^EntryClass\s*=\s*(\w+)", src, re.M)
+        if entry:
+            entry_of[path.stem] = entry.group(1)
+        if re.search(r"^\s+def prepare_attn_masks\b", src, re.M):
+            definers.add(path.stem)
+
+    expected = {entry_of[stem] for stem in definers if stem in entry_of}
+    # plus one level of subclassing: a module whose EntryClass derives from a
+    # definer's class inherits the mask install (gemma4_unified does).
+    for path in sorted(models_dir.glob("*.py")):
+        stem = path.stem
+        if stem in definers or stem not in entry_of:
+            continue
+        src = path.read_text()
+        for base in list(expected):
+            if re.search(rf"^class {entry_of[stem]}\({base}\)", src, re.M):
+                expected.add(entry_of[stem])
+
+    assert expected, "scan found nothing -- the ratchet itself is broken"
+    assert expected == set(lane_support.BIDIRECTIONAL_IMAGE_MASK_ARCHS), (
+        f"BIDIRECTIONAL_IMAGE_MASK_ARCHS is stale: sources say {sorted(expected)}, "
+        f"tuple says {sorted(lane_support.BIDIRECTIONAL_IMAGE_MASK_ARCHS)}"
+    )
+
+
+def test_admission_refuses_images_but_never_video_or_audio():
+    """IMAGE only. `prepare_attn_masks` is gated on `contains_image_inputs()`
+    and only punches blocks for `is_image()` items, so a video/audio payload
+    never builds a mask and must not be refused."""
+    tm = object.__new__(TokenizerManager)
+    tm.mm_lane_refusal = "refused because reasons"
+
+    img = types.SimpleNamespace(image_data=["<png>"], video_data=None, audio_data=None)
+    with pytest.raises(ValueError, match="refused because reasons"):
+        TokenizerManager._validate_mm_lane_support(tm, img)
+
+    for payload in (
+        types.SimpleNamespace(image_data=None, video_data=["<mp4>"], audio_data=None),
+        types.SimpleNamespace(image_data=None, video_data=None, audio_data=["<wav>"]),
+        types.SimpleNamespace(image_data=[], video_data=None, audio_data=None),
+        types.SimpleNamespace(image_data=None, video_data=None, audio_data=None),
+    ):
+        TokenizerManager._validate_mm_lane_support(tm, payload)
+
+    # And with no refusal configured, images pass straight through.
+    tm.mm_lane_refusal = None
+    TokenizerManager._validate_mm_lane_support(tm, img)
