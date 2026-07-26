@@ -157,13 +157,14 @@ function, unit-tested on CPU.
 - **Straddle state `(W_in=k_prev+1, S=k_new)`, captured.** Correct and graph-covered,
   but turns the state set from |C| into up to |C|^2 composites (default |C|=3 -> 9),
   ~2.3x boot capture time and graph memory. Padding gets the same correctness for free.
-- **Straddle extend run EAGERLY.** The eager multi-step extend path is already
-  suspect: `prepare_for_draft_extend` only inits metadata on
-  `draft_runner_list[0]`'s backend, so steps >= 1 run with uninitialised attention
-  metadata — hence the standing
+- **Straddle extend run EAGERLY.** The eager multi-step extend path is
+  unvalidated: `prepare_for_draft_extend` only inits metadata on
+  `draft_runner_list[0]`'s backend, so steps >= 1 used to run with
+  uninitialised/stale attention metadata — hence the standing
   `"can't use cuda graph for draft extend! may have correctness issue!"`
-  warning (`multi_layer_eagle_worker_v2.py:595`). Never route a correctness-critical
-  transition through it. (See open point O1 — this is a real pre-existing bug.)
+  warning. #184 now plans each rung's backend inside the eager loop, but that
+  fix has no GPU evidence yet and the warning stays, so this remains true:
+  never route a correctness-critical transition through it. (See open point O1.)
 - **Fixed extend window `W = k_max+1` with variable step count.** Needs `k_max` draft
   columns to build the verify tree, i.e. `k_max` MTP forwards — which is exactly the
   cost the ladder exists to avoid. No saving.
@@ -388,14 +389,22 @@ accept-length threshold 2.5) and `test_step3p5_flash_chain_mtp.py:41` (threshold
 
 ## 7. Open points
 
-- **O1 — pre-existing bug (not fixed here):** the eager (non-graph) multi-step
-  draft-extend runs steps >= 1 with uninitialised attention metadata.
-  `prepare_for_draft_extend` (`base_spec_worker.py:177`) only calls
-  `init_forward_metadata` on `draft_runner_list[0]`'s backend, then
-  `_draft_extend_for_decode` marks metadata ready for all steps
-  (`multi_layer_eagle_worker_v2.py:612`). Hence the standing warning at `:595`.
-  Fix would be to loop `draft_extend_attn_backend_list[step].init_forward_metadata`.
-  Needs a GPU to validate; filed here so it is not rediscovered.
+- **O1 — pre-existing bug, STRUCTURALLY FIXED (#184), GPU EVIDENCE OPEN:** the
+  eager (non-graph) multi-step draft-extend ran steps >= 1 with
+  uninitialised/stale attention metadata. `prepare_for_draft_extend`
+  (`base_spec_worker.py`) only calls `init_forward_metadata` on
+  `draft_runner_list[0]`'s backend, then `_draft_extend_for_decode` marks
+  metadata ready for all steps, so the forward path will not repair it.
+  The eager loop now plans `draft_extend_attn_backend_list[step]` immediately
+  before rung `step`'s forward, mirroring the graph path
+  (`MultiLayerEagleDraftExtendCudaGraphRunner.replay`), which plans per rung and
+  is the path known to work. Guarded to non-NPU, non-idle batches so the two
+  documented exceptions keep their behavior.
+  What is NOT proven: that the resulting numerics are correct. That needs a GPU
+  plus a multi-layer EAGLE checkpoint (MiMo-V2 / Step-3.5, neither in the local
+  cache), so the "may have correctness issue" warning DELIBERATELY STAYS in the
+  code, extended with a pointer to the fix. CPU tests pin the plan/forward
+  interleaving only (`test_multi_layer_eagle_draft_extend_decode.py`).
 - **O2 — FIXED (#185):** multi-layer draft picks are now rank-0-broadcast, one
   sync per MTP rung, placed before the chain rotation in all three pick paths
   (prefill loop, decode graph replay, decode eager loop). `_broadcast_draft_picks`

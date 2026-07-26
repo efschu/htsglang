@@ -669,8 +669,15 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                         cgr.buffers.select_index[: cgr.raw_bs],
                     )
         else:
+            # WARNING KEPT ON PURPOSE (#184): the per-rung metadata plan below
+            # removes the known structural defect of this path, but the eager
+            # multi-step draft extend has never been validated numerically on
+            # GPU (needs a multi-layer EAGLE checkpoint), so the warning stays
+            # until that evidence exists.
             logger.warning_once(
-                "can't use cuda graph for draft extend! may have correctness issue!"
+                "can't use cuda graph for draft extend! may have correctness "
+                "issue! (#184: per-rung attention metadata is planned below; "
+                "the eager multi-step path is still GPU-unvalidated)"
             )
             select_index = (
                 torch.arange(len(batch.seq_lens), device=self.device)
@@ -678,10 +685,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 + batch_result.accept_lens
                 - 1
             )
-            # NOTE: this non-graph path runs the per-step forwards without any
-            # pre-plan (see warning above). Mark the batch so the forward path
-            # keeps skipping metadata init — preserves the pre-existing
-            # behavior; the latent issue is tracked by the warning.
+            # prepare_for_draft_extend planned metadata for draft_runner_list[0]'s
+            # backend ONLY (base_spec_worker.py) and then marks the batch ready,
+            # which makes every forward skip its own init. Rungs >= 1 are planned
+            # per rung inside the loop below.
             # On NPU with --disable-cuda-graph, leave each draft runner to init
             # its own metadata in forward_extend (post-pad), otherwise
             # per-runner attn_backend.forward_metadata is never initialized for
@@ -690,6 +697,30 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 forward_batch.mark_forward_metadata_ready()
 
             for step in range(self.speculative_num_steps):
+                # #184: plan THIS rung's attention metadata right before its
+                # forward. Every rung is a separate model runner with its own
+                # backend (init_attention_backend binds
+                # draft_runner_list[step].attn_backend =
+                # draft_extend_attn_backend_list[step]), but only rung 0 was
+                # ever planned -- rungs >= 1 ran on whatever their backend held
+                # from the previous prefill draft-extend, with a batch marked
+                # metadata-ready so the forward would not repair it.
+                # Modelled on the graph path, which is the one that demonstrably
+                # works: MultiLayerEagleDraftExtendCudaGraphRunner.replay plans
+                # draft_extend_attn_backend_list[step] on every replay. Planning
+                # per rung immediately before that rung's forward (rather than
+                # all rungs up front) also matches it, and is the safe order for
+                # backends that share a planning workspace.
+                if (
+                    step > 0
+                    and not _is_npu
+                    and not forward_batch.forward_mode.is_idle()
+                    and step < len(self.draft_extend_attn_backend_list)
+                    and self.draft_extend_attn_backend_list[step] is not None
+                ):
+                    self.draft_extend_attn_backend_list[step].init_forward_metadata(
+                        forward_batch
+                    )
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch
                 )
