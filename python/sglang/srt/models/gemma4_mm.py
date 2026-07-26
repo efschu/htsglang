@@ -346,6 +346,16 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         tokens), not across items.
         Currently only the TritonAttnBackend supports this.
 
+        The mask is a batch-wide FLAT buffer addressed by ``mask_indptr``, and
+        the Triton extend kernel's ``USE_CUSTOM_MASK`` is a whole-launch
+        ``constexpr`` (``custom_mask is not None``) -- there is no per-request
+        "this one has no mask" switch. So the per-request append below is
+        all-or-nothing for the batch: every request must contribute its slot,
+        including pure-text requests in a mixed batch, or the kernel reads a
+        later request's bytes with this request's row stride. The only safe
+        skip is at BATCH granularity, which is what the degeneracy check at the
+        end of this method does. See TASK_186_GEMMA4_MASK.md.
+
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
         if not isinstance(get_attn_backend(), TritonAttnBackend):
@@ -362,6 +372,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         )
 
         split_images = []
+        # Set as soon as a single bidirectional bit is actually written. While
+        # this stays False every row of every request's mask is exactly
+        # ``tril(diagonal=prefix_len)``, i.e. the plain causal predicate the
+        # kernel already applies via ``IS_CAUSAL`` -- installing it then buys
+        # nothing and costs an O(sum(extend * (extend + prefix))) bool buffer
+        # plus a mask load per tile. See the degeneracy check below.
+        wrote_bidirectional = False
 
         for i in range(forward_batch.batch_size):
             extend_seq_len = forward_batch.extend_seq_lens[i]
@@ -397,12 +414,23 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                                     im_begin - prefix_len : im_end + 1 - prefix_len,
                                     im_begin : im_end + 1,
                                 ] = 1
+                                # A single-token span writes only the diagonal
+                                # element, which the causal fill already set,
+                                # so it leaves the mask degenerate.
+                                if im_end > im_begin:
+                                    wrote_bidirectional = True
                             elif (
                                 im_end >= prefix_len
                                 and im_begin < prefix_len + extend_seq_len
                             ):
                                 split_images.append((i, im_begin, im_end))
 
+            # Unconditional by design -- see the flat-buffer note in the
+            # docstring. Do NOT move this inside the `mm_inputs is not None`
+            # branch above: a missing slot makes ``mask_indptr`` describe a
+            # zero-length region and the kernel then reads the NEXT request's
+            # mask with this request's row stride (silently wrong attention,
+            # and an out-of-bounds read for the last request in the batch).
             bidirectional_attn_masks_list.append(bidirectional_attn_mask.flatten())
             bidirectional_attn_mask_indptr[i + 1] = (
                 bidirectional_attn_mask_indptr[i] + bidirectional_attn_mask.nelement()
@@ -420,8 +448,29 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             logger.warning_once(
                 "Those images will receive causal attention. Disable chunked prefill (--chunked-prefill-size=-1) for full bidirectional attention.",
             )
+        if not wrote_bidirectional:
+            # Degeneracy check (batch granularity -- the only granularity the
+            # flat buffer allows). Nothing in this batch actually needs
+            # bidirectional attention: either no request carries an image at
+            # all (pure-text request batched next to an image one), or every
+            # image span sits wholly in the cached prefix (multi-turn follow-up)
+            # or is split across a chunk boundary. Every mask built above is
+            # then exactly `tril(diagonal=prefix_len)`, which is bit-for-bit
+            # the predicate the kernel applies on the `IS_CAUSAL` branch, so
+            # installing it changes no output -- it only allocates the buffer
+            # and forces every extend tile through the mask-load path.
+            # Skipping also keeps the batch off the custom-mask refusals in
+            # `_forward_extend_dcp` / `verify_splitkv_fwd`, which is correct
+            # precisely because there is no non-causal semantics to lose.
+            return
         if bidirectional_attn_masks_list:
             bidirectional_attn_masks = torch.cat(bidirectional_attn_masks_list, dim=0)
+            # In-place install AFTER `init_forward_metadata` has run. This is
+            # structural, not laziness: the backend builds its metadata before
+            # the model's forward, and the image spans this mask is derived
+            # from are only known inside the model. The two fields are written
+            # together, here and nowhere else, so the buffer and the indptr
+            # that addresses it can never disagree.
             get_attn_backend().forward_metadata.mask_indptr = (
                 bidirectional_attn_mask_indptr
             )
