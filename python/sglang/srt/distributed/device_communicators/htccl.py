@@ -100,10 +100,23 @@ def _make_shm_transport(cpu_group, device):
     )
 
 
+def _make_ucx_transport(cpu_group, device):
+    from sglang.srt.distributed.device_communicators.htccl_ucx import (
+        HTCCLUcxTransport,
+    )
+
+    return HTCCLUcxTransport(cpu_group=cpu_group, device=device)
+
+
 # name -> factory. "gloo" is intentionally absent: it is the inline plane.
 TRANSPORT_REGISTRY = {
     "device": _make_device_transport,
     "shm": _make_shm_transport,
+    # RDMA data plane for groups that span hosts. Same host-staged semantics
+    # as gloo, UCX instead of TCP. Sizing/threshold knobs live in its own
+    # module (SGLANG_HTCCL_UCX_*), not here, because they describe the wire,
+    # not the communicator.
+    "ucx": _make_ucx_transport,
 }
 
 # Transports that must NOT silently fall back to the gloo plane on failure.
