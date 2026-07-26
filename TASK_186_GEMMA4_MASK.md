@@ -276,7 +276,63 @@ Routes, in increasing cost:
    actually work, and it is a #76-class task, not a patch.
 
 Recommendation: 1 + 2 together as the #96 unblock, 3 registered separately.
-Not decided here -- this is the design surface, the call is the user's.
+
+**DECIDED (coordinator): build 1 + 2, register 3 as its own backlog task.**
+Both are implemented; see §5b.
+
+---
+
+## 5b. Routes 1 + 2 as built
+
+Shared predicate, `python/sglang/srt/multimodal/lane_support.py` (new):
+
+* `triton_dcp_extend_lane_active(server_args)` -- the config-level mirror of
+  `triton_backend.py:2146`, which tests `self.dcp_size > 1` and nothing else.
+  Reads the **prefill** backend via `get_attention_backends()`, because extend
+  is what dispatches and `--prefill-attention-backend triton` can be set alone.
+* `image_requests_unsupported_reason(server_args, model_config)` -- the
+  user-facing text, or `None`. **Keyed on the model as well as the lane.** Only
+  Gemma-3 and Gemma-4 install a bidirectional mask; a VL model that does not
+  (Qwen-VL and friends) runs on this lane today, and a blanket image refusal
+  would have been a regression, not a fix. The arch tuple is a literal rather
+  than a `ModelRegistry.resolve_model_cls` lookup because that call imports
+  *every* model module and this runs in the tokenizer process --
+  `test_arch_list_has_not_drifted_from_the_model_sources` scans the model
+  sources (including one level of subclassing, which is how
+  `Gemma4UnifiedForConditionalGeneration` gets in) and fails if the tuple
+  drifts.
+
+**Route 2 -- admission.** `TokenizerManager._validate_mm_lane_support`, called
+from `_tokenize_one_request` right after `_validate_mm_limits` and *before*
+`process_mm_data_async`, so a refused request never pays for vision
+preprocessing. Raises `ValueError`, which the HTTP layer already turns into a
+clean 400 with the message verbatim, streaming and non-streaming. The decision
+is resolved **once** at init (`mm_lane_refusal`), not per request.
+
+**IMAGE only.** Video- and audio-only payloads never build a mask
+(`prepare_attn_masks` is gated on `contains_image_inputs()` and only punches
+blocks for `is_image()` items), so refusing them would be wrong. Pinned by
+`test_admission_refuses_images_but_never_video_or_audio`.
+
+**Route 1 -- boot warmup.** `_execute_server_warmup` now clears `is_vlm` when
+`mm_lane_refusal` is set, falling back to the existing text warmup. It reads
+the tokenizer manager's already-computed decision rather than recomputing, so
+warmup and admission cannot disagree. `--skip-server-warmup` stays as the
+documented manual escape hatch; route 1 makes it unnecessary for this case.
+
+**Known over-strictness, accepted deliberately.** The refusal keys on the
+request carrying `image_data`, so it also refuses turn 2+ of an image
+conversation -- which, after §3's degeneracy fix, would have *succeeded* (the
+span sits in the cached prefix, so no mask is installed). This is not a
+practical regression: reaching that state requires a turn 1 that puts the image
+in the extend window, and turn 1 cannot succeed on this lane. The one genuinely
+lost case is an image span that no chunk ever fully contains, which already
+silently degrades to causal attention -- not behaviour worth preserving.
+
+**Not dead code, but narrow today.** On this tree a Gemma-4 (SWA) model under
+an *uneven* plan is already refused at boot by `reject_unsupported_dcp_geometry`
+(`triton_backend.py:393-397`). So the lane these routes target is reachable
+today only via *even* DCP, or on the #96 branch -- which is exactly the point.
 
 ---
 
@@ -340,7 +396,30 @@ torch and NVML order diverge on this rig.
    they batch together. This is the §1b invariant under live conditions:
    outputs of *both* must match their solo-run outputs. A regression here would
    be the silent-corruption mode.
-5. **Then #96 H4 again** -- expected still RED for the reason in §5 (the warmup
-   image is genuinely bidirectional). Re-run with route 1 applied
-   (`--skip-server-warmup`) to confirm the lane opens for text-only traffic and
-   to unblock H6/H7/H8. If it does *not* open, that is new information.
+5. **Routes 1 + 2, on the lane.** Boot Gemma-4 with `--attention-backend triton`
+   and `--dcp-size > 1`, no `--skip-server-warmup`. Expect: a WARNING naming the
+   text-warmup fallback, boot completes, health 200. Then POST an image request
+   -> **HTTP 400** with the §5b message, server still up and serving; and a
+   text request immediately after -> normal completion. The old behaviour is a
+   `NotImplementedError` that takes the batch down, so "server survives the
+   image request" is the gate. Also boot a **non-Gemma VL** model (Qwen-VL) on
+   the same lane and confirm an image request is **not** refused -- that is the
+   guard against the over-strict version of this fix.
+6. **Then #96 H4 again.** Expectation is now **GREEN, and for a stated reason**:
+   with route 1 the boot no longer sends an image, so the `custom_mask` refusal
+   in `_forward_extend_dcp` is not reached during warmup and the lane reaches a
+   real forward. Concretely: H4 previously died at the first forward with
+   `NotImplementedError: DCP Triton extend does not support custom masks`; it
+   should now get past warmup with the same pool sizing already recorded
+   (`full size` 13851 / 9747 / 9234, SWA 6403 identical per rank) and hand
+   H6/H7/H8 a working forward.
+
+   Be precise about what GREEN does and does not mean here. It means **the
+   text-only lane opens**. It does not mean image support -- images are now
+   refused by design (route 2), not served. If H4 still dies, the failure has
+   moved somewhere new and the mask is no longer the explanation.
+7. **The registered seam, if it is being settled in the same window** (#96 x
+   #180, see §4): chain verify with `--speculative-eagle-topk 1` on an
+   SWA-hybrid model on the uneven-DCP lane, asserting per layer what a
+   sliding-window layer receives under `is_target_verify()`. The rebased #96
+   now *permits* this combination; nothing yet shows it is correct.
