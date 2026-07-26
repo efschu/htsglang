@@ -1463,3 +1463,70 @@ previously leaned on: it reaches **11.6%** of the model's own context, serves
 exactly one request, and has 0.89 GiB of KV to work with. The pre-fork
 comparison line is therefore stronger than stated, and now rests on the exact
 command the project documents.
+
+
+## Merge #2: feat/htccl-gfx900 tip 1357538806 (9 commits) -- merged, arm E green
+
+Merge commit `2eced7a914`. Rollback tag `pre-merge2-r3` -> `5ce2f70eff`.
+Delta 21 files, +1831/-25: block-scaled fp8 dequant, the CustomAllreduce
+construction fix under HTCCL, draft-solo placement and graph-plan exemptions,
+group-wide spec-kernel capability dispatch, and the Nordstern L0 scripts.
+
+### First textual conflict on this branch -- and it was an add/add
+
+`test/registered/unit/server_args/test_uneven_tp_args.py`: both lines appended
+to the same region. Mine, two standalone functions
+(`test_kv_eq_tp_stays_in_normal_mode_by_measurement`,
+`test_token_vector_without_a_plan_is_rejected_not_ignored`); theirs, one class
+(`TestTreeSpecDcpGuardHardenedForNewFlagPaths`). Independent, so both were
+kept; the import they need was already in the file. Resolved file: **80 passed**.
+
+### The two-sided files, checked before merging rather than after
+
+Every previous merge here had a semantic conflict under zero textual ones, so
+the overlap was inspected first. Both files are touched by both lines:
+
+* **`fp8.py`** -- their `needs_device_kernel()` drops the capability floor for
+  BLOCK-scaled fp8, which now has a plain-torch route
+  (`dequant_fp8_block_weight`); my #171 `supports_current_device()` hook sits
+  directly below it. Compatible: for block fp8 the loader floor is simply no
+  longer invoked (their intent), and for non-block fp8 the hook still governs.
+  On CUDA the hook returns None, so the numeric path is untouched either way.
+* **`model_runner.py`** -- their draft-solo exemption for
+  `_harmonize_cuda_graph_plan` is at ~1085; my #171 `_needs_float16_fallback()`
+  is at ~297 with its call site at ~1700. Disjoint regions, independent
+  semantics.
+
+Their draft-solo fix is the same defect class as `55bfdb4db8` on this branch: a
+group collective entered by a rank whose peers never join. Measured on Nordstern
+L0 S4 -- rank 0 sat in `all_gather_object` inside `_harmonize_cuda_graph_plan`
+for 8 minutes while ranks 1-4 went healthy. Worth noting that the harmonisation
+this branch introduced is exactly what needed the exemption once draft-solo
+placement arrived.
+
+### Regression gate: arm E (HTCCL device transport + CUDA graphs, uneven TP=3)
+
+`a9ced80ac4` (do not CONSTRUCT CustomAllreduce under HTCCL -- its nvlink probe
+is itself a collective) and the 62-line `parallel_state.py` delta touch the
+exact path this arm exercises, so arm E is the gate.
+
+```
+GREEN. Capture target verify CUDA graph end: elapsed 3.78 / 3.80 / 3.81 s
+HTCCL device transport up: 3 ranks, GPU-driven collectives (CUDA-graph capturable)
+RS+AG ownership weights [2, 1, 2]      "plan differs": 0      health 200
+```
+
+Capture time is unchanged against the pre-merge band (3.76-3.81 s across the
+last four boots), the group graph-plan decision is still a no-op on the
+homogeneous NVIDIA group, and the device transport still comes up capturable --
+i.e. the CustomAllreduce change did not disturb the NVIDIA path.
+
+Nine-point drive: accepts code 2.909-3.459, prose 3.200 / 3.048 / 3.325, mixed
+3.325 / 3.325 / 3.459; tps 69.6-82.6. Same regime as the established band
+(3.01-3.76, with the known mixed-class dips). 3 of 9 flagged `char-loop` by the
+validator, which is the known post-12:58 validator threshold artefact recorded
+earlier, not a generation regression.
+
+No JIT source was touched by this merge (`git diff --name-only` over
+`jit_kernel/`, `*.cuh`, `*.cu` is empty), so the cold-build hazard from #172 did
+not apply and 0 incomplete cache dirs were present before and after.
