@@ -1861,3 +1861,225 @@ mismatched collective.
 
 Boot 4 is the one that must be green; 2, 3 and 5 are the ones that must now be
 red at startup rather than silently wrong.
+
+
+## GPU validation of #169 / #173 / #172, and the three merges — main rig
+
+Hardware resolved at runtime, not assumed. **torch and NVML disagree on this
+rig and the difference matters**, because `--rank-gpu-id` indexes TORCH order:
+
+```
+torch:0 RTX 5090 32088 MiB sm_120   |   nvml:0 RTX 3080
+torch:1 RTX 3080  20054 MiB sm_86   |   nvml:1 RTX 5090
+torch:2 RTX 3080  20054 MiB sm_86   |   nvml:2 RTX 3080
+```
+
+Every boot below was preceded by a `nvidia-smi` check that all three cards sat
+at 1 MiB, and torn down by its own launcher pid.
+
+### Phase 1 — #173/#169 on `feat/triton-weighted-dcp`
+
+| step | expected | observed | verdict |
+|---|---|---|---|
+| G1 index math on device | passes, else stop | 6 passed / 33 subtests, 13.3 s | GREEN |
+| G2 guard opens | 27B uneven-DCP + triton gets past `TritonAttnBackend.__init__` | boots in 40 s, `max_total_num_tokens=98316` | GREEN |
+| G2 refusal: spec | aborts naming itself | `...cannot serve --dcp-size 3 under the uneven-DCP lane: speculative decoding is on...` | RED as required |
+| G2 refusal: weightless | aborts naming itself | `--weightless-kv-fastlane requires a flashinfer attention backend` | RED as required (see note) |
+| G2 refusal: MLA / SWA | aborts naming itself | not GPU-reachable — no MLA or SWA checkpoint fits this rig; both branches pinned by `test_triton_dcp_geometry_guard.py` | CPU-pinned only |
+| G3 DCP-off baseline | unchanged, weighted path inert | `dcp_size=1`, boots, serves coherently | GREEN |
+| G4 parity anchor | coherent, semantically equal, late first divergence | see table below | GREEN |
+| G5 `kv >= tp` sub-lane | same | Qwen3.5-4B q16/kv4 TP=3: both backends coherent, divergences at 68 / 215 / 55 chars | GREEN |
+| G6 empty-shard (D5) | completes, no hang | vector `[13,30,21]`, 1- and 2-token prefixes: 4/4 completed in ~2.3 s each, on BOTH backends | GREEN |
+| #169 boot 2 | refused `2 // 2 = 1 < 2` | exact message | RED as required |
+| #169 boot 3 | refused "WEIGHTED owner rule" | refused, but by the boot-2 branch — see "boot 3 fired the wrong guard" | RED, different guard |
+| #169 boot 4 | boots, accepts reproduce | `max_total_num_tokens=98328`, accepts 3.571 / 2.941 / 2.985 | GREEN |
+| #169 boot 5 | refused "SILENTLY IGNORED" | exact message | RED as required |
+| #169 boot 6 | boots and serves coherently | TP=4/DCP=2 Qwen2.5-1.5B, `max_total_num_tokens=525897`, coherent | GREEN |
+
+Capacity lines carried forward: the G4 arms all resolved the SAME ownership
+vector `[14, 9, 9]` and the same pool
+(`KV Cache ... #tokens: 43022 / 27657 / 27657`, `max_total_num_tokens=98316`,
+`Memory pool end. avail mem=15.61 / 9.54 / 9.54 GB`), so the two backends are
+compared at identical geometry rather than at two different pools.
+
+#### G4, the parity anchor — common-prefix characters, greedy, no spec
+
+| prompt | fi-eager vs tri-eager | fi-graph vs tri-graph | fi-eager vs fi-graph | tri-eager vs tri-graph |
+|---|---|---|---|---|
+| short_code | **IDENTICAL** | **IDENTICAL** | **IDENTICAL** | **IDENTICAL** |
+| short_prose | 248 (fi is a strict PREFIX of tri: same tokens, fi stops earlier) | 248 | **IDENTICAL** | **IDENTICAL** |
+| chunked (11650 tok) | 43 | 43 | 43 | 43 |
+
+Two things this table settles:
+
+* **eager == graphs, byte-for-byte, within each backend** on both short
+  prompts. That is the D3 capture-stable buffer contract: a wrong-context
+  replay shows up here and does not.
+* **the chunked divergence is not backend-attributable.** flashinfer diverges
+  from ITSELF at the same character 43 across two identical requests to one
+  live server, and so does the DCP-off baseline. Triton is the only one of the
+  three that is self-deterministic on that prompt. Measured, not argued:
+
+```
+chunked_natural, common-prefix chars
+  flashinfer run1 vs its own run2 : 43
+  baseline   run1 vs its own run2 : 43
+  triton     run1 vs its own run2 : 235  (identical)
+  flashinfer vs triton            : 43
+```
+
+No first-token divergence anywhere, and **zero non-ASCII characters** in any
+output of any arm — the two failure signatures the recipe names as "owner rule
+wired wrong" are both absent.
+
+Against the DCP-OFF ground truth, triton-DCP is byte-identical on `short_code`
+AND on the chunked prompt; only the `<think>`-empty vs `<think>`-reasoning
+branch toggles, and it toggles between DCP-off and DCP-on rather than between
+the two backends.
+
+#### The first probe was a bad instrument, and was replaced
+
+The first chunking prompt was one paragraph repeated 40x. Both arms were
+coherent but diverged at token ~4, which reads alarming. It is not: a
+40x-repeated paragraph puts the model on a knife edge between "summarize" and
+"notice the repetition", so the first token flips on any numerical noise. It
+was replaced by non-repeating natural text, and a self-determinism control
+(every prompt run twice against the same live server) was added, which is what
+exposed that flashinfer is not self-deterministic there either. Recorded
+because the original probe would have produced a false alarm.
+
+#### Boot 3 fired the wrong guard — a pre-existing reachability gap
+
+Boot 3 (token vector, no plan, triton) is red, but with boot 2's replication
+message, not the "WEIGHTED owner rule" one. The reason is not on either branch
+under test:
+
+* the branch-(2) message needs `uneven_dcp_active()` true, i.e. a token vector
+  actually INSTALLED in `_CP_TOKEN_RATIOS`;
+* the only boot-path installer is `scheduler.py:4949`, and it is gated on
+  `base_plan is not None`;
+* so with no `--rank-tp-ratio` the vector is never installed — and
+  `resolve_cp_token_ratios`, which contains the "SGLANG_UNEVEN_TOKEN_VECTOR
+  without a plan" HONESTY GUARD, is never called.
+
+Verified directly: called on its own the resolver DOES raise; reached through
+a boot it never runs. The gate is `cc4ff87d41`, the original uneven-DCP commit,
+and is byte-identical on `integration/r3-probe` — **pre-existing, not a
+regression of #169/#173**.
+
+Two consequences, stated rather than smoothed over:
+
+1. The documented "token vector without a plan is rejected, not ignored"
+   hardening is **unreachable from the boot path**. Its CPU test passes because
+   it calls the resolver directly. `SGLANG_UNEVEN_TOKEN_VECTOR` without a plan
+   is still silently ignored at runtime.
+2. Branch (2) of `reject_unsupported_dcp_geometry` is consequently dead code at
+   boot: with a plan, branch (1) fires first; without one, the vector never
+   installs. It is defence in depth, not a reachable gate.
+
+Neither is a safety hole *today*: the dangerous geometry is still refused (by
+the replication branch), and without a plan the pool really is even-modulo, so
+nothing is silently mis-read. Registered as an open item, not as passing.
+
+#### Two environment limits found while building the probes
+
+* **stock's heterogeneity check pre-empts the DCP guards.** A plain TP=2 across
+  the 5090 and a 3080 dies in `init_torch_distributed` with "The memory
+  capacity is unbalanced" before any attention backend is constructed. The
+  small-model probes therefore pin themselves to the two equal 3080s
+  (`--rank-gpu-id 1,2`, torch order) so the guard under test is the thing that
+  fires.
+* **NCCL 2.28.9 cannot co-locate ranks.** The fork correctly logs
+  `setting NCCL_MULTI_RANK_GPU_ENABLE=1 (requires NCCL >= 2.30)` and correctly
+  warns that MPS is not running, but NCCL then fails with `invalid usage`.
+  Boot 6 was therefore run over the HTCCL `gloo` transport, which is the
+  recorded precedent for exactly that row of the isolation matrix.
+
+### Phase 2 — #172 on `fix/jit-coldbuild-robustness`
+
+Falsifier first: the reproducer was re-established on the PRE-FIX tree before
+the fix was credited with anything. Both trees used their own fresh
+`TVM_FFI_CACHE_DIR`, so the shared `~/.cache/tvm-ffi` was never touched.
+
+| boot | tree | cache | expected | observed |
+|---|---|---|---|---|
+| control | `integration/r3-probe` (pre-fix) | cold | RED, 23-30 s stall | **RED**: capture begins 08:31:25, `cudaErrorLaunchFailure` 08:31:55 — a **30 s** stall, surfacing in `fused_add_rmsnorm_cute` (the documented symptom-not-site) |
+| P2.1 | `fix/jit-coldbuild-robustness` | cold | GREEN, window logged | **GREEN** in 230 s, `JIT cold-build window open ... 40x deadline` on all three ranks, capture 174.9 s (the nvcc builds now happen INSIDE the window) |
+| P2.2 | same | warm | unremarkable, 3.6-3.8 s | **GREEN** in 45 s, capture **3.83 / 3.85 / 3.86 s** |
+| P2.3 poison | same | naturally poisoned | discards and rebuilds | **GREEN**, `Discarded incomplete JIT cache entry .../gptq_marlin_repack..._cuda_arch_8.6__... (build residue, no .so ...)` logged exactly once, no manual intervention |
+
+Every green boot: `HTCCL device transport up: 3 ranks`,
+`ownership weights [2, 1, 2]`, `RS+AG link calibration: 14.3/6.5/13.2 GB/s`,
+`max_total_num_tokens=98328`, `plan differs` = 0. P2.1 accepts
+3.571 / 2.740 / 2.817.
+
+The poison was produced the way the defect describes: a boot killed with -9
+while `cicc` was compiling `gptq_marlin_repack` for `compute_86`, leaving
+`build.ninja cuda.cu cuda_0.o cuda_0.o.d lock main.cpp` and **no .so**.
+
+**Honest limit on the poison control.** The pre-fix tree booted GREEN (eager,
+215 s) on a COPY of that same residue: ninja simply finished the interrupted
+build. So this particular residue was recoverable, and the control does not
+prove the pre-fix tree is broken by it. The fatal variant documented earlier
+(four dirs removed by hand) came from a different kill point where ninja
+considered the wreck up to date. What Phase 2 does establish on GPU is that the
+self-heal path fires, names the entry, and rebuilds — the fatality of every
+residue shape remains covered by the unit tests, not by this boot.
+
+Escape hatch, in-process (no boot needed):
+
+```
+outside window          : 60000000000   (identity)
+inside window (default) : 2400000000000 (40x)
+inside window (MULT=1)  : 60000000000   (identity -- old deadline restored exactly)
+```
+
+### Phase 3 — the three merges
+
+| merge | branch | conflicts |
+|---|---|---|
+| `c0395f911c` | `fix/dcp-geometry-leftovers` | 1, the predicted doc tail in this file — both sides appended a new section, both kept |
+| `bc32749ae5` | `feat/triton-weighted-dcp` | none |
+| `7cb555a275` | `fix/jit-coldbuild-robustness` | none |
+
+Rollback tag `pre-r3-dcp-jit-merge` -> `5972fc9d1c`.
+
+Semantic check before merging, since this line's history is "every merge had
+semantic conflicts under zero textual ones": the branch that had moved under
+this work (two new #171/Vega commits, `1dd69ac4e1` and `5972fc9d1c`) touches
+`model_runner.py` and `test_bf16_fallback_vendor.py`, and **none of the three
+merged branches touches either file**. The only shared file is this document.
+
+On the merge tip: the merged features' own suites are **80 passed / 167
+subtests**, and the other line's `test_bf16_fallback_vendor.py` plus
+`test_htccl_port.py` are **32 passed** — including
+`test_cpu_transports_are_rejected_while_cuda_graphs_are_on`, which was
+previously recorded as a pre-existing failure and now passes.
+
+Integrated regression boot, arm E on `7cb555a275`, warm:
+
+```
+Capture target verify CUDA graph end. elapsed=3.88 / 3.89 / 3.90 s
+HTCCL device transport up: 3 ranks
+RS+AG link calibration: 14.3/6.5/13.2 GB/s -> ownership weights [2, 1, 2]
+max_total_num_tokens=98328
+plan differs = 0     health 200     cuda graph: True in the decode lines
+accepts 3.571 / 2.857 / 2.740
+```
+
+Same regime as the pre-merge arm-E reference (3.45 / 2.75 / 3.33) and the same
+capture band as P2.2. Accepts here come from a three-class probe of this
+session, not from `bench_harness.py`, so they are comparable in regime and not
+digit-for-digit with the historical rows.
+
+### Open, carried forward
+
+1. The token-vector-without-a-plan honesty guard is unreachable from the boot
+   path (`scheduler.py:4949` gate), and branch (2) of the triton geometry guard
+   is dead code at boot. Pre-existing; needs the installer gate re-based on the
+   token machinery's own state, not on the TP-plan proxy.
+2. MLA and SWA refusal branches are CPU-pinned only — no checkpoint of either
+   class fits this rig.
+3. Multi-rank-per-GPU over NCCL needs NCCL >= 2.30 (installed: 2.28.9) or MPS;
+   until then co-located ranks must use an HTCCL transport.
+4. G7 (sm75 / gfx900) remains gated on the second host.
