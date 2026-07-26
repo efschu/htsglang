@@ -192,6 +192,109 @@ def _plan_aware_dcp_gathered_q_heads(model_config, dcp_size: int) -> int:
     return per_rank_max * dcp_size
 
 
+def reject_unsupported_dcp_geometry(
+    dcp_size: int,
+    attn_tp_size: int,
+    total_kv_heads: int,
+    *,
+    uneven_plan: bool,
+    weighted_tokens: bool,
+    weightless_kv: bool,
+) -> None:
+    """Boot-time gate for every DCP geometry the Triton backend cannot serve.
+
+    Pure function of the geometry so the constructor's decision is testable
+    without a device, a process group, or a ModelRunner.
+
+    TWO independent rejections, in order:
+
+    (1) NO UNEVEN-DCP WIRING AT ALL. The Triton backend implements exactly one
+        owner rule -- the EVEN modulo one -- on both sides:
+          * write: ``loc = out_cache_loc // dcp_size`` plus the mask
+            ``positions % dcp_size == dcp_rank`` (_set_kv_buffer);
+          * read: ``get_dcp_lens`` / ``create_triton_kv_indices_for_dcp_triton``,
+            same modulo;
+          * and it never gathers the kv heads before the write, the step
+            flashinfer does in ``_dcp_write_gather``.
+        The fork's uneven-DCP pool is a DIFFERENT layout: the weighted owner
+        rule packs a virtual block of ``sum(token ratios)`` slots (not
+        ``dcp_size``) and every rank's slot is declared to hold the FULL,
+        replicated kv-head set. Feeding that pool through the modulo rule reads
+        and writes the wrong slots with the wrong head subset. Measured:
+        ``SGLANG_UNEVEN_DCP=1`` + token vector + a qwen2-class model + triton
+        -> CJK mojibake in an English greedy completion.
+
+        Until this commit the constructor's guard was SKIPPED whenever the
+        uneven path was active (``not uneven_dcp_active(...)``) on the premise
+        that "the uneven path has its own head handling" -- true of flashinfer,
+        which owns that machinery, and false of this backend, which has none of
+        it. The exemption therefore turned the one config the guard should
+        reject hardest into the one config it waved through.
+
+    (2) EVEN DCP WITHOUT KV-HEAD REPLICATION (unchanged, #169 predecessor).
+        The even-DCP decode gathers the whole DCP group's q heads and attends
+        them against THIS RANK'S local kv-head shard; the kernel remaps
+        q-head -> kv-head as ``cur_head // (gathered_q // local_kv)``. Correct
+        only when every rank of the group holds the same FULL kv-head set:
+        ``tp_size // total_kv_heads >= dcp_size`` (consecutive ranks share a kv
+        head, DCP groups are consecutive tp slices) -- the geometry of the
+        path's origin (Qwen3.5-397B, TP=8/DCP=2, kv=4) and its only CI case.
+        Measured outside it: Qwen2.5-1.5B (q12/kv2) TP=2/DCP=2 -> mojibake on
+        NCCL and HTCCL alike; the same model at TP=4/DCP=2 (replicas 2 >= 2) is
+        coherent; a 1-token prompt still garbles, so it is the head geometry
+        and not the token-ownership layout.
+
+    dcp_size <= 1 is inert, which is what keeps the default path untouched.
+    """
+    if dcp_size <= 1:
+        return
+
+    reasons = []
+    if uneven_plan:
+        reasons.append(
+            "a --rank-tp-ratio shard plan is installed, so the KV pool is "
+            "token-sharded with REPLICATED kv heads"
+        )
+    if weighted_tokens:
+        reasons.append(
+            "a non-uniform DCP token vector is installed, so token ownership "
+            "follows the WEIGHTED owner rule (virtual block = sum of the token "
+            "ratios), not `pos % dcp_size == dcp_rank`"
+        )
+    if weightless_kv:
+        reasons.append(
+            "the weightless-KV fast lane is on, so the per-rank q/kv head "
+            "counts are [all, 0, 0, ...] instead of an equal split"
+        )
+    if reasons:
+        raise ValueError(
+            f"Triton attention cannot serve --dcp-size {dcp_size} under this "
+            f"geometry: " + "; ".join(reasons) + ". The Triton DCP path "
+            f"implements only the EVEN modulo owner rule (write "
+            f"`out_cache_loc // dcp_size` + `positions % dcp_size == "
+            f"dcp_rank`, read `get_dcp_lens`) and never gathers the kv heads "
+            f"before writing, so it would read and write the wrong KV slots "
+            f"with the wrong head subset and emit silently wrong tokens "
+            f"(measured: CJK mojibake in an English greedy completion). Use "
+            f"--attention-backend flashinfer, which owns the uneven-DCP "
+            f"machinery, or drop --dcp-size."
+        )
+
+    replicas = attn_tp_size // total_kv_heads if total_kv_heads else 0
+    if replicas < dcp_size:
+        raise ValueError(
+            f"Triton attention with --dcp-size {dcp_size} "
+            f"requires the kv heads to be replicated across each DCP "
+            f"group: tp_size // total_kv_heads >= dcp_size, but "
+            f"{attn_tp_size} // {total_kv_heads} = {replicas} < "
+            f"{dcp_size}. Every rank would attend the gathered "
+            f"q heads against a DIFFERENT kv-head shard and the "
+            f"output is silently wrong from the first decode token. "
+            f"Use --attention-backend flashinfer, raise tp so that "
+            f"tp // kv_heads >= dcp_size, or drop --dcp-size."
+        )
+
+
 def logit_capping_mod(logit_capping_method, logit_cap):
     # positive logit_cap -> tanh cap
     if logit_capping_method == "tanh":
@@ -300,41 +403,25 @@ class TritonAttnBackend(AttentionBackend):
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size
         )
-        # DCP DECODE GEOMETRY GUARD. The even-DCP decode path below gathers
-        # the WHOLE DCP group's q heads (all_gather dim=1) and attends them
-        # against THIS RANK'S local KV-head shard; the kernel then remaps
-        # q-head -> kv-head as `cur_head // (gathered_q // local_kv)`. That is
-        # correct only when every rank of the DCP group holds the SAME, FULL
-        # kv-head set -- i.e. when kv heads are REPLICATED across the group:
-        # tp_size // total_kv_heads >= dcp_size (consecutive ranks share a kv
-        # head, and DCP groups are consecutive tp slices). That is the
-        # geometry of the path's origin (Qwen3.5-397B, TP=8/DCP=2, kv=4) and
-        # its only CI case.
-        #
-        # Outside it the output is SILENT GARBAGE from the first decode token:
-        # measured, Qwen2.5-1.5B (q12/kv2) TP=2/DCP=2 -> CJK mojibake in an
-        # English greedy completion, on NCCL and HTCCL alike, while the same
-        # model at TP=4/DCP=2 (replicas 2 >= 2) is coherent, and a 1-token
-        # prompt still garbles (so it is not the token-ownership layout; the
-        # write and read sides agree on tokens). The uneven-DCP path
-        # (weighted owner rule) has its own head handling and is exempt.
-        from sglang.srt.distributed.utils import uneven_dcp_active
-        if self.dcp_size > 1 and not uneven_dcp_active(self.dcp_size):
-            _total_kv = model_runner.model_config.get_total_num_kv_heads()
-            _attn_tp = get_parallel().attn_tp_size
-            _replicas = _attn_tp // _total_kv if _total_kv else 0
-            if _replicas < self.dcp_size:
-                raise ValueError(
-                    f"Triton attention with --dcp-size {self.dcp_size} "
-                    f"requires the kv heads to be replicated across each DCP "
-                    f"group: tp_size // total_kv_heads >= dcp_size, but "
-                    f"{_attn_tp} // {_total_kv} = {_replicas} < "
-                    f"{self.dcp_size}. Every rank would attend the gathered "
-                    f"q heads against a DIFFERENT kv-head shard and the "
-                    f"output is silently wrong from the first decode token. "
-                    f"Use --attention-backend flashinfer, raise tp so that "
-                    f"tp // kv_heads >= dcp_size, or drop --dcp-size."
-                )
+        # DCP GEOMETRY GUARD -- see reject_unsupported_dcp_geometry for the
+        # full reasoning of both rejections (no uneven-DCP wiring in this
+        # backend; even DCP needs kv-head replication across the group).
+        # Everything the decision depends on is read here and passed by value,
+        # so the rule itself stays testable without a device.
+        from sglang.srt.distributed.utils import (
+            uneven_dcp_active,
+            uneven_dcp_kv_replicated,
+            weightless_kv_active,
+        )
+
+        reject_unsupported_dcp_geometry(
+            self.dcp_size,
+            get_parallel().attn_tp_size,
+            model_runner.model_config.get_total_num_kv_heads(),
+            uneven_plan=uneven_dcp_kv_replicated(self.dcp_size),
+            weighted_tokens=uneven_dcp_active(self.dcp_size),
+            weightless_kv=weightless_kv_active(),
+        )
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with
         # differing SWA/full v_head_dim need a second buffer for SWA layers.
