@@ -889,14 +889,21 @@ class HTCCLDeviceTransport:
 
         import torch.distributed as dist
 
-        # Collective sweep over the REAL all_reduce path (16 MiB bf16
+        # Collective sweep over the REAL all_reduce path (16 MiB fp16
         # payload). All ranks iterate the candidates in the same order
         # and decide on the summed times, so every rank picks the same
         # value — the per-chunk flag protocol requires agreement, hence
         # pipe_mib is a scalar, not per-rank.
-        payload = torch.randn(
-            8 * 1024 * 1024, dtype=torch.bfloat16, device=self.device
-        )
+        #
+        # fp16 and NOT bf16: both are 2 bytes, so the bandwidth measured is
+        # the same, but bf16 has no hardware conversion on a Turing (sm75) or
+        # gfx900 rank -- the two cards this transport exists for. The kernel's
+        # to_f/from_f would be emulated for the probe while the traffic those
+        # ranks actually carry is fp16, so the sweep would time arithmetic
+        # that never runs and pick a chunk size for it. fp16 is converted by a
+        # single instruction on every card this transport targets, including
+        # the ones that do have native bf16.
+        payload = torch.randn(8 * 1024 * 1024, dtype=torch.float16, device=self.device)
         candidates = [1, 2, 4, 8]
         my_times = []
         for mib in candidates:
