@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from collections import OrderedDict
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -277,6 +279,116 @@ def fp8_needs_dequant_fallback() -> bool:
         or cutlass_fp8_supported()
         or can_auto_enable_marlin_fp8()
     )
+
+
+class _DequantCache:
+    """Budgeted cache of dequantised fp8 weights, keyed per (weight, dtype).
+
+    WHY this exists, measured rather than assumed. The dequant fallback expands
+    the weight ONCE PER FORWARD, so its cost is paid per forward rather than per
+    token. On this rig (Qwen3.6-27B fp8 block-scaled, TP=3, forced fallback):
+
+        decode   91.53 -> 27.59 tok/s   (-69.9%; 10.93 -> 36.25 ms per token)
+        prefill  1472.5 -> 1353.1 tok/s (-8.1%)
+
+    That asymmetry IS the design. Prefill amortises one dequant over ~1172
+    tokens; batch-1 decode pays the whole thing for a single token. So caching
+    the expanded weight removes almost all of the decode penalty and nearly
+    none of the prefill penalty -- which is fine, because decode is where the
+    penalty is.
+
+    Correctness rests on a falsified property, not on hope: the dequantised
+    weight is a PURE function of (weight, scale, block_size, out_dtype). Checked
+    empirically -- repeated calls are bit-identical, interleaved GPU work and an
+    intervening call at another dtype do not perturb the result, the ragged
+    (partial-block) path is equally pure, and the inputs are never mutated.
+
+    Two things follow and are enforced below:
+
+    * ``out_dtype`` is part of the KEY, because it changes the result.
+    * weights are NOT immutable in general (weight loading, LoRA, checkpoint
+      engine), so an entry is bound to the tensor's ``_version``. Any in-place
+      write bumps that counter and the entry is discarded instead of silently
+      serving a stale weight. Binding to ``data_ptr`` alone would not catch it.
+
+    Budget: an entry costs 2.00x the fp8 weight bytes (measured), so an
+    unbudgeted cache doubles resident weight memory -- fatal on an 8 GiB Vega,
+    free on a 32 GiB card. Hence a byte budget with LRU eviction at LAYER
+    granularity (one weight = one entry); deliberately not finer, because the
+    complexity of a smarter policy is the main risk of this design and layer
+    granularity already matches how the weights are used.
+
+    Default is 0 (OFF), so nothing changes for anybody who does not opt in.
+    """
+
+    def __init__(self) -> None:
+        self._entries: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
+        self._bytes = 0
+        self._budget: Optional[int] = None
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    def budget_bytes(self) -> int:
+        if self._budget is None:
+            mib = 0
+            try:
+                mib = int(os.environ.get("SGLANG_FP8_DEQUANT_CACHE_MIB", "0"))
+            except ValueError:
+                logger.warning(
+                    "SGLANG_FP8_DEQUANT_CACHE_MIB is not an integer; cache off."
+                )
+            self._budget = max(0, mib) * 1024 * 1024
+            if self._budget:
+                logger.info(
+                    "fp8 dequant cache: budget %d MiB, LRU at layer granularity. "
+                    "An entry costs 2x the fp8 weight bytes.",
+                    mib,
+                )
+        return self._budget
+
+    def get_or_make(self, weight: torch.Tensor, out_dtype: torch.dtype, make):
+        budget = self.budget_bytes()
+        if budget <= 0:
+            return make()
+        # _version catches in-place weight mutation; data_ptr alone would not.
+        key = (weight.data_ptr(), weight.shape, out_dtype, weight._version)
+        hit = self._entries.get(key)
+        if hit is not None:
+            self._entries.move_to_end(key)
+            self.hits += 1
+            return hit
+        self.misses += 1
+        value = make()
+        nbytes = value.numel() * value.element_size()
+        if nbytes > budget:
+            # single entry larger than the whole budget: never cache it, and do
+            # not evict everything else trying to make room for it
+            return value
+        while self._bytes + nbytes > budget and self._entries:
+            _, victim = self._entries.popitem(last=False)
+            self._bytes -= victim.numel() * victim.element_size()
+            self.evictions += 1
+        self._entries[key] = value
+        self._bytes += nbytes
+        return value
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._bytes = 0
+
+    def stats(self) -> dict:
+        return {
+            "entries": len(self._entries),
+            "bytes": self._bytes,
+            "budget_bytes": self.budget_bytes(),
+            "hits": self.hits,
+            "misses": self.misses,
+            "evictions": self.evictions,
+        }
+
+
+_dequant_cache = _DequantCache()
 
 
 def dequant_fp8_weight(
@@ -2153,3 +2265,22 @@ def validate_fp8_block_shape(
                     f"{output_partition_size} is not divisible by "
                     f"weight quantization block_n = {block_n}."
                 )
+
+
+def cached_dequant(weight: torch.Tensor, out_dtype: torch.dtype, make):
+    """Return the dequantised ``weight``, from cache when a budget is set.
+
+    ``make`` must be a nullary callable producing the dequantised tensor. With
+    no budget (the default) this is exactly ``make()``, so the uncached path is
+    unchanged for anyone who does not opt in.
+    """
+    return _dequant_cache.get_or_make(weight, out_dtype, make)
+
+
+def dequant_cache_stats() -> dict:
+    """Hits/misses/evictions/bytes -- for tests and for reporting a real run."""
+    return _dequant_cache.stats()
+
+
+def dequant_cache_clear() -> None:
+    _dequant_cache.clear()

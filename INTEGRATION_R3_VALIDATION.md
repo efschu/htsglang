@@ -1566,3 +1566,82 @@ gates ARE on the executed path and are confirmed inert.
    be refused at the gate. Expected and intended, but it turns a late crash into
    an early refusal, so the second host should see it deliberately rather than
    be surprised by it.
+
+
+## #179 candidate 3: fp8 dequant. Cost measured, design C built and STOPPED
+
+### The cost, measured (the anchor for everything that follows)
+
+Clean same-session A/B, Qwen3.6-27B fp8 block-scaled, fork TP=3 uneven, slope
+method, `SGLANG_FORCE_FP8_DEQUANT=1` to exercise the fallback on fp8-capable
+hardware:
+
+| | decode tok/s | per token | prefill tok/s |
+|---|---|---|---|
+| dequant OFF | **91.53** | 10.93 ms | 1472.5 |
+| dequant ON | **27.59** | 36.25 ms | 1353.1 |
+| delta | **-69.9%** | **+25.32 ms** | **-8.1%** |
+
+**The asymmetry is the whole story.** The expansion happens ONCE PER FORWARD,
+so prefill amortises it over ~1172 tokens (-8.1%) while batch-1 decode pays it
+in full for a single token (-69.9%). An earlier guess of "~23%" was wrong by
+3x; the measurement replaced it.
+
+### Design C (budgeted whole-weight cache) -- built, correct, and insufficient
+
+Implemented as `_DequantCache` + `cached_dequant()`, budget via
+`SGLANG_FP8_DEQUANT_CACHE_MIB`, **default 0 (off)**. Legitimate because the
+dequantised weight is a PURE function of (weight, scale, block_size, dtype) --
+falsified first, not assumed: repeated calls bit-identical, unperturbed by
+interleaved GPU work and an intervening other-dtype call, ragged partial-block
+path equally pure, inputs never mutated. An entry costs exactly **2.00x** the
+fp8 bytes.
+
+Measured end to end:
+
+| configuration | decode tok/s |
+|---|---|
+| dequant OFF (anchor) | 91.53 |
+| dequant ON, no cache | 27.59 |
+| dequant ON, cache 2500 MiB | **28.98 (+5.0% only)** |
+| dequant ON, cache 12000 MiB | **OOM** during capture |
+| dequant ON, cache 9000 MiB + larger reserve | **boot refused**: `max_mamba_cache_size=0 (total_rest_memory=-4.39 GB)` |
+
+**Why it cannot work here, by arithmetic.** The working set is 2x the fp8
+weights -- 13-30 GB per rank for this model -- while the dequant fallback exists
+*precisely because* the card is too small for native fp8. The cache needs a big
+card; the fallback implies a small one. On the actual target (Vega 64, 8 GiB)
+the cache would need multiples of the card.
+
+Two secondary flaws the build exposed, worth recording:
+
+1. the cache allocates LAZILY, after the KV pool has already been sized to
+   consume the card, so it competes with graph/activation headroom instead of
+   being budgeted against KV up front;
+2. freeing room via `--rank-auto-reserve-mib` only moves the failure -- the
+   hybrid mamba state then computes a negative rest budget and refuses to boot.
+
+**Verdict: stopped, not tuned.** Chasing budget settings would be pursuing a few
+percent of a 70% problem. The code is kept because it is correct, default-off,
+zero-cost when unused, and genuinely useful in the case it fits -- a small model
+on a large card (4B on the 5090). It is **NOT** the fix for the Vega decode
+penalty and must not be cited as one.
+
+### Where candidate 3 goes next: design B, narrowly cut
+
+The measured asymmetry defines the cut. Prefill stays on today's
+materialisation path (-8.1% is not where the problem is); the 70% lives in
+bs=1 decode, which is a **memory-bound GEMV**. A Triton kernel that reads the
+fp8 block weights DIRECTLY (half the bytes of bf16) and dequantises in-kernel
+materialises nothing at all, so design C's working-set problem disappears by
+construction rather than by tuning.
+
+In-house precedent: the GGUF MMVQ / K-quant kernels (#66/#73) are exactly this
+pattern -- quantised weights, dequant inside the GEMV -- and they beat
+llama.cpp. fp8-e4m3 block scaling is a simpler format than K-quant. Triton
+rather than hand-CUDA also answers the standing objection to B ("a kernel per
+backend"): one kernel, lowered to gfx900 via the gcn5 fork and to sm75 natively.
+
+Gate before any wiring: a MICROBENCH of the kernel alone against
+`F.linear` + materialisation on the real bs=1 shapes, on a 3080 as proxy. **If
+the microbench does not win clearly, B is stopped as honestly as C was.**
