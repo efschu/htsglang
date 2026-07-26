@@ -80,6 +80,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    _broadcast_draft_picks,
     draft_tp_context,
     record_stream_each,
     record_stream_for_v2_verify,
@@ -424,6 +425,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         ss_token_list = torch.cat(
             token_list, dim=1
         )  # b, (self.topk + (num_steps-1) * self.topk)
+        # No rank sync here (#185): multi-layer EAGLE runs NO model at draft
+        # time, so this is not a per-rank pick from per-rank logits -- it is a
+        # deterministic re-ranking of the carried topk_p columns, which the
+        # draft-extend already broadcast from rank 0. Same position as
+        # organize_draft_results in eagle_worker_v2.draft_forward.
         top_scores = torch.topk(
             score_list, self.speculative_num_draft_tokens - 1, dim=-1
         )
@@ -532,6 +538,18 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             else:
                 probs = torch.softmax(output.logits_output.next_token_logits, dim=-1)
                 topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            # Sync this rung's pick across TP ranks (#185, #50 family). Per
+            # rung, not once per round: topk_index is rotated into the NEXT
+            # rung's input_ids below, so a rank that picked differently would
+            # feed a different token into rung i+1 and write divergent KV --
+            # the sync has to land before the rotation, exactly like the
+            # in-loop sync in eagle_worker_v2.draft_forward.
+            _broadcast_draft_picks(
+                topk_index,
+                topk_p,
+                draft_probs_list[-1] if draft_probs_list else None,
+                solo_single_rank=self._spec_solo_active,
+            )
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
             # Chain-style: use this step's output hidden_states as next step's input
@@ -628,6 +646,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                         forward_batch.sampling_info.temperatures,
                     )
                     ret_draft_probs_list.append(probs)
+                # Rank-sync this rung's pick BEFORE it is cloned out and
+                # before the chain rotation feeds it to rung i+1 (#185). The
+                # graph computed the topk in-graph, so the divergence source
+                # is the same per-rank logits as in the eager branch below.
+                _broadcast_draft_picks(
+                    ret_topk_index,
+                    ret_topk_p,
+                    ret_draft_probs_list[-1] if ret_draft_probs_list else None,
+                    solo_single_rank=self._spec_solo_active,
+                )
                 ret_topk_p_list.append(ret_topk_p.clone())
                 ret_topk_index_list.append(ret_topk_index.clone())
                 # Advance the draft chain by rotating the shared input_ids window
@@ -676,6 +704,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 else:
                     probs = torch.softmax(logits_sel, dim=-1)
                     ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+                # Same per-rung rank sync as the graph branch (#185): the pick
+                # is rotated into rung i+1's input_ids a few lines down.
+                _broadcast_draft_picks(
+                    ret_topk_index,
+                    ret_topk_p,
+                    ret_draft_probs_list[-1] if ret_draft_probs_list else None,
+                    solo_single_rank=self._spec_solo_active,
+                )
                 # Chain-style: use this step's output hidden_states as next step's input
                 if (
                     self.chain_mtp_hidden_states
