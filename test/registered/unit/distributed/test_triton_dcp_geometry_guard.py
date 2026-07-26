@@ -51,6 +51,7 @@ def _call(
     spec=False,
     spec_tree=False,
     window=False,
+    swa_hybrid_dcp=False,
 ):
     reject_unsupported_dcp_geometry(
         dcp,
@@ -64,6 +65,7 @@ def _call(
         speculative=spec,
         speculative_tree=spec_tree,
         sliding_window=window,
+        swa_hybrid_dcp=swa_hybrid_dcp,
     )
 
 
@@ -104,6 +106,10 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
     def test_the_lane_still_refuses_what_has_no_triton_twin(self):
         """Opening the gate must not open it for the pieces that were never
         ported. Each names itself, so the operator sees which feature to drop.
+
+        The sliding window is the CONDITIONAL one since #96 (see
+        test_a_windowed_model_is_served_only_under_the_stage_b_preconditions):
+        refused unless the Stage-B lane carries it.
         """
         for kwargs, fragment in (
             ({"weightless": True}, "weightless-KV fast lane"),
@@ -150,6 +156,46 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
         msg = str(ctx.exception)
         self.assertIn("--speculative-eagle-topk 1", msg)
         self.assertIn("#76", msg)
+
+    def test_a_windowed_model_is_served_only_under_the_stage_b_preconditions(self):
+        """#96 Stage B: the ~10 global layers of an SWA-hybrid are token-sharded
+        while the ~50 window layers keep their unsharded local path, so nothing
+        has to causally mask a sparse owned-slot subset -- which is what the
+        refusal was about. ``swa_hybrid_dcp`` is swa_hybrid_dcp_lane(...): a
+        hybrid model (global AND window layers), cap-sized SWA pool, plan,
+        target worker. Without it the refusal must stand verbatim, because every
+        other windowed configuration (pure-SWA model, ratio-sized SWA pool,
+        draft worker) still has no Triton twin.
+        """
+        # served: the Stage-B lane
+        _call(3, 3, 8, plan=True, tokens=True, window=True, swa_hybrid_dcp=True)
+        _call(3, 3, 2, plan=True, tokens=True, window=True, swa_hybrid_dcp=True)
+        # a larger SWA kv base does not change branch 1's verdict (branch 3's
+        # replication arithmetic does not run under a plan)
+        _call(3, 3, 2, plan=True, tokens=True, window=True, swa=8, swa_hybrid_dcp=True)
+        # refused: window without the lane, same message as before #96
+        with self.assertRaises(ValueError) as ctx:
+            _call(3, 3, 2, plan=True, tokens=True, window=True)
+        self.assertIn("sliding window", str(ctx.exception))
+        # and the lane flag does NOT open any of the other refusals
+        for kwargs, fragment in (
+            ({"weightless": True}, "weightless-KV fast lane"),
+            ({"mla": True}, "MLA"),
+            ({"spec": True}, "speculative decoding"),
+        ):
+            with self.subTest(**kwargs):
+                with self.assertRaises(ValueError) as ctx:
+                    _call(
+                        3,
+                        3,
+                        2,
+                        plan=True,
+                        tokens=True,
+                        window=True,
+                        swa_hybrid_dcp=True,
+                        **kwargs,
+                    )
+                self.assertIn(fragment, str(ctx.exception))
 
     def test_the_lane_names_every_unserved_feature_at_once(self):
         """A config that trips several must name all of them, so the operator
@@ -321,6 +367,8 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
         self.assertIn("speculative_tree=", src)
         self.assertIn("dcp_verify_mask_mode(", src)
         self.assertNotIn("speculative_tree=bool(self.topk", src)
+        # #96: and the Stage-B lane flag that makes the window one conditional
+        self.assertIn("swa_hybrid_dcp=self.swa_hybrid_dcp", src)
 
 
 if __name__ == "__main__":
