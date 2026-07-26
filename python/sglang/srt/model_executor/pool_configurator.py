@@ -453,14 +453,35 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
 
-        # Full layer per-token memory (bytes)
+        # Full layer per-token memory (bytes).
+        #
+        # SWA-HYBRID UNEVEN DCP (#96, Stage B): the full-attention sub-pool's
+        # rows carry ALL kv heads on every rank (they are sharded along TOKENS
+        # instead, by the owner rule), so a full-pool token costs the REPLICATED
+        # cell here -- the same branch DefaultPoolConfigurator already has for
+        # the non-hybrid weighted lane. The per-rank token share is applied
+        # later and elsewhere: calculate_pool_sizes returns this rank's PHYSICAL
+        # token count P_r and _apply_token_constraints turns it into the global
+        # context C = min_r(P_r // ratio_r) * S.
+        # ``is True``, not ``bool(...)``: the predicate returns a strict bool
+        # (ModelRunnerKVCacheMixin._swa_hybrid_dcp_lane), and a MagicMock-based
+        # unit ModelRunner must stay on the DEFAULT path rather than be pulled
+        # onto the DCP lane by a truthy mock attribute.
+        self._swa_dcp_lane = mr._swa_hybrid_dcp_lane() is True
+        _full_kv_heads = (
+            model_config.get_total_num_kv_heads()
+            if self._swa_dcp_lane
+            else model_config.get_num_kv_heads(tp_size)
+        )
         self._full_per_token = (
-            model_config.get_num_kv_heads(tp_size)
+            _full_kv_heads
             * (model_config.head_dim + model_config.v_head_dim)
             * kv_size
         )
 
-        # SWA layer per-token memory (bytes)
+        # SWA layer per-token memory (bytes). NOT touched by the DCP lane: the
+        # sliding-window layers keep this rank's kv-head shard AND every token
+        # position (window-bounded), so their cost per token is unchanged.
         self._swa_per_token = (
             model_config.get_swa_num_kv_heads(tp_size)
             * (model_config.swa_head_dim + model_config.swa_v_head_dim)
