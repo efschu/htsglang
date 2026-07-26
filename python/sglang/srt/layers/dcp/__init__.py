@@ -53,7 +53,9 @@ from sglang.srt.layers.dcp.layout import (
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.layers.dcp.owner import (
     build_dcp_weighted_kv_indices,
+    dcp_weighted_owned_lengths,
     dcp_weighted_owner_bounds,
+    dcp_weighted_read_slots,
     dcp_weighted_write_slots,
 )
 
@@ -78,7 +80,9 @@ __all__ = [
     "cp_lse_ag_out_ar_mha_uneven",
     "cp_lse_ag_out_rs_mha",
     "cp_lse_ag_out_rs_mla",
+    "dcp_weighted_owned_lengths",
     "dcp_weighted_owner_bounds",
+    "dcp_weighted_read_slots",
     "dcp_weighted_write_slots",
     "create_triton_kv_indices_for_dcp_triton",
     "dcp_enabled",
