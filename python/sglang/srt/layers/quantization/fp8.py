@@ -54,6 +54,8 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_dequant_gemv import (
     fused_block_dequant_gemv,
+    fused_channel_dequant_gemv,
+    fused_channel_gemv_applicable,
     fused_gemv_applicable,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -1068,6 +1070,24 @@ class Fp8LinearMethod(LinearMethodBase):
             # back to (out, in), which is what F.linear wants. weight_scale is
             # either per-tensor (scalar) or per-channel (out, 1); both
             # broadcast correctly against (out, in).
+            if isinstance(x, tuple):
+                x = x[0]  # (input, scale) pairs only arrive on quantised paths
+            # Same cut as the block-scaled branch above: small-batch DECODE goes
+            # to the fused kernel, which reads the fp8 bytes directly and
+            # dequantises in-register so nothing is materialised; prefill and
+            # larger batches keep the materialisation, because that is where the
+            # expansion is amortised. Declines (unsupported scale shape,
+            # unfavourable aspect) return None and fall through untouched.
+            if fused_channel_gemv_applicable(x, layer.weight.t()):
+                fused = fused_channel_dequant_gemv(
+                    x,
+                    layer.weight.t(),
+                    layer.weight_scale,
+                    x.dtype,
+                )
+                if fused is not None:
+                    return fused if bias is None else fused + bias
+
             return torch.nn.functional.linear(
                 x,
                 cached_dequant(
