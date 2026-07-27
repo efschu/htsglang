@@ -26,7 +26,8 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
-from sglang.srt.utils.device_timer import DeviceTimer
+from sglang.srt.utils.collective_clock import CollectiveClock, collective_clock
+from sglang.srt.utils.device_timer import DeviceTimer, SplitDeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
@@ -96,7 +97,8 @@ class RankPrefillLog:
     own radix cache). This class emits one brief line per prefill batch on
     EVERY rank, at the same log level as the existing summary line:
 
-        Prefill rank batch, #new-token: N, #cached-token: C, #chunks: K, gpu-ms: T
+        Prefill rank batch, #new-token: N, #cached-token: C, #chunks: K,
+        gpu-ms: T (compute Tc, wait Tw)
 
     ``#cached-token`` is the rank-local evidence that a prefill was actually
     computed rather than served from this rank's prefix cache. ``gpu-ms`` is
@@ -108,6 +110,23 @@ class RankPrefillLog:
     ``#chunks`` counts how many prefill forwards are folded into one line
     (normally 1; >1 only when several completed at the same flush point, e.g.
     the tail of a chunked prefill flushed from the decode loop).
+
+    ``gpu-ms`` alone does not answer the question an uneven-TP shard split
+    raises. The ranks run lock-step: whoever finishes a layer shard first
+    blocks in that layer's collective until the slowest rank arrives, so the
+    collective barrier sits INSIDE the event window and every rank reports
+    roughly the same total. ``compute`` and ``wait`` split that window:
+    ``wait`` is the device time spent inside collectives (see
+    utils/collective_clock.py), ``compute`` is the rest. ``wait`` covers the
+    transfer as well as the rendezvous, so read the SPREAD of ``wait`` across
+    ranks, not its absolute value: the rank with the largest shard shows the
+    smallest ``wait``.
+
+    The split is omitted (line stays exactly as before) when the forward ran
+    from a captured CUDA graph. Collectives inside a replayed graph do not
+    execute the Python body that records the events, so their time is
+    unobservable here -- reporting ``wait 0.0`` for them would be a lie
+    rather than a measurement.
 
     Pairing is FIFO on both sides: records are queued in schedule order and
     the DeviceTimer harvests interval durations in completion order of the
@@ -122,23 +141,40 @@ class RankPrefillLog:
         # Installed by SchedulerMetricsReporter when CUDA-event timing is
         # applicable; stays None otherwise.
         self.timer: Optional[DeviceTimer] = None
-        self._pending: deque = deque()  # (new_tokens, cached_tokens)
-        self._durations: deque = deque()  # seconds, completion order
+        self.clock: Optional[CollectiveClock] = None
+        # (new_tokens, cached_tokens, graphed)
+        self._pending: deque = deque()
+        # (total_seconds, collective_seconds | None), completion order
+        self._durations: deque = deque()
 
     @property
     def has_pending(self) -> bool:
         return bool(self._pending)
 
-    def _on_duration(self, t: float, **_kwargs) -> None:
-        self._durations.append(t)
+    def _on_duration(self, t: float, collective_slot=None, **_kwargs) -> None:
+        wait_s = None
+        if self.clock is not None:
+            # Query-only. The slot's events were recorded before the interval
+            # end event that just completed, so this normally returns a value;
+            # None means "not readable", and the split is dropped rather than
+            # guessed.
+            wait_s = self.clock.harvest(collective_slot)
+            if collective_slot is not None and collective_slot.graph_capture_skipped:
+                wait_s = None
+        self._durations.append((t, wait_s))
 
-    def record(self, new_tokens: int, cached_tokens: int, timed: bool) -> None:
+    def record(
+        self,
+        new_tokens: int,
+        cached_tokens: int,
+        timed: bool,
+        graphed: bool = False,
+    ) -> None:
         if timed and self.timer is not None:
-            self._pending.append((new_tokens, cached_tokens))
+            self._pending.append((new_tokens, cached_tokens, graphed))
         else:
             logger.info(
-                "Prefill rank batch, #new-token: %d, #cached-token: %d, "
-                "#chunks: 1",
+                "Prefill rank batch, #new-token: %d, #cached-token: %d, " "#chunks: 1",
                 new_tokens,
                 cached_tokens,
             )
@@ -153,19 +189,30 @@ class RankPrefillLog:
             return
         new_tokens = cached_tokens = 0
         gpu_s = 0.0
+        wait_s = 0.0
+        split_known = True
         for _ in range(k):
-            n, c = self._pending.popleft()
+            n, c, graphed = self._pending.popleft()
             new_tokens += n
             cached_tokens += c
-            gpu_s += self._durations.popleft()
-        logger.info(
+            t, w = self._durations.popleft()
+            gpu_s += t
+            if graphed or w is None:
+                split_known = False
+            else:
+                wait_s += w
+        line = (
             "Prefill rank batch, #new-token: %d, #cached-token: %d, "
-            "#chunks: %d, gpu-ms: %.1f",
-            new_tokens,
-            cached_tokens,
-            k,
-            gpu_s * 1000.0,
+            "#chunks: %d, gpu-ms: %.1f"
         )
+        args = [new_tokens, cached_tokens, k, gpu_s * 1000.0]
+        if split_known:
+            # Clamp: the collective spans are measured inside the forward
+            # window, so their sum cannot legitimately exceed it, but event
+            # granularity can push the difference a hair below zero.
+            line += " (compute %.1f, wait %.1f)"
+            args += [max(gpu_s - wait_s, 0.0) * 1000.0, wait_s * 1000.0]
+        logger.info(line, *args)
 
 
 @dataclass(kw_only=True)
@@ -278,8 +325,10 @@ class SchedulerMetricsReporter:
             or self.scheduler.server_args.pp_size != 1
         ):
             return
-        self.rank_prefill_log.timer = DeviceTimer(
-            reporter=self.rank_prefill_log._on_duration
+        self.rank_prefill_log.clock = collective_clock()
+        self.rank_prefill_log.timer = SplitDeviceTimer(
+            reporter=self.rank_prefill_log._on_duration,
+            clock=self.rank_prefill_log.clock,
         )
         self.scheduler.tp_worker.model_runner.prefill_rank_timer = (
             self.rank_prefill_log.timer
@@ -655,6 +704,7 @@ class SchedulerMetricsReporter:
                 and batch.forward_mode is not None
                 and batch.forward_mode.is_plain_prefill()
             ),
+            graphed=can_run_cuda_graph,
         )
         self.rank_prefill_log.flush()
 

@@ -6,6 +6,12 @@ logging-rank gate, and must carry #cached-token as rank-local evidence that a
 prefill was computed rather than served from the prefix cache. GPU durations
 attach deferred (FIFO pairing with CUDA-event completions); no host sync is
 involved anywhere. Pure CPU: the timer is faked, no CUDA events are created.
+
+The second half covers the compute/wait split: gpu-ms alone folds the
+collective barrier into the measurement, so the line also reports the device
+time spent inside collectives (``wait``) and the remainder (``compute``), and
+suppresses the split rather than reporting a fake zero when it cannot be
+observed (graph replay, unreadable events).
 """
 
 import logging
@@ -29,6 +35,7 @@ try:
         SchedulerMetricsReporter,
     )
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.utils.collective_clock import CollectiveClock, Slot
     from sglang.test.ci.ci_register import register_cpu_ci
 except RuntimeError as _import_err:  # pragma: no cover - leak-dependent
     pytest.skip(
@@ -51,7 +58,40 @@ class FakeTimer:
 
     def _report(self):
         while self.completed:
-            self._log._on_duration(self.completed.pop(0))
+            item = self.completed.pop(0)
+            if isinstance(item, tuple):
+                t, slot = item
+                self._log._on_duration(t, collective_slot=slot)
+            else:
+                self._log._on_duration(item)
+
+
+class FakeEvent:
+    """CUDA event stand-in: fixed timestamp, controllable completion."""
+
+    def __init__(self, ts: float, ready: bool = True):
+        self.ts = ts
+        self.ready = ready
+        self.recorded = 0
+
+    def record(self):
+        self.recorded += 1
+
+    def query(self):
+        return self.ready
+
+    def elapsed_time(self, other):
+        return other.ts - self.ts
+
+
+class FakeClock:
+    """Returns a scripted collective total for whatever slot it is handed."""
+
+    def __init__(self, values):
+        self.values = list(values)
+
+    def harvest(self, slot):
+        return self.values.pop(0)
 
 
 class TestForwardModePlainPrefill(unittest.TestCase):
@@ -147,6 +187,171 @@ class TestRankPrefillLog(unittest.TestCase):
             log.flush()
         self.assertEqual(len(cm.output), 1)
         self.assertIn("gpu-ms: 50.0", cm.output[0])
+
+
+class TestComputeWaitSplit(unittest.TestCase):
+    """The line must separate rank-local compute from collective wait."""
+
+    def _make(self, wait_values):
+        log = RankPrefillLog()
+        timer = FakeTimer(log)
+        log.timer = timer
+        log.clock = FakeClock(wait_values)
+        return log, timer
+
+    def _emit(self, log, timer, records, completions):
+        for new_tokens, cached_tokens, graphed in records:
+            log.record(
+                new_tokens=new_tokens,
+                cached_tokens=cached_tokens,
+                timed=True,
+                graphed=graphed,
+            )
+        timer.completed.extend(completions)
+        with self.assertLogs(LOGGER_NAME, level=logging.INFO) as cm:
+            log.flush()
+        self.assertEqual(len(cm.output), 1)
+        return cm.output[0]
+
+    def test_split_is_appended_after_gpu_ms(self):
+        log, timer = self._make([0.05])
+        line = self._emit(log, timer, [(64, 3, False)], [(0.25, Slot())])
+        # Prefix-compatible: everything the old line carried is unchanged and
+        # in the same order, the split is appended.
+        self.assertIn("#chunks: 1, gpu-ms: 250.0 (compute 200.0, wait 50.0)", line)
+
+    def test_split_sums_over_chunks(self):
+        log, timer = self._make([0.02, 0.03])
+        line = self._emit(
+            log,
+            timer,
+            [(10, 1, False), (20, 2, False)],
+            [(0.1, Slot()), (0.2, Slot())],
+        )
+        self.assertIn("#chunks: 2", line)
+        self.assertIn("gpu-ms: 300.0 (compute 250.0, wait 50.0)", line)
+
+    def test_graphed_forward_reports_no_split(self):
+        # Collectives inside a replayed CUDA graph never run the Python that
+        # records the events; a 0.0 wait would be a lie, so the split is
+        # dropped and the line falls back to its previous shape.
+        log, timer = self._make([0.0])
+        line = self._emit(log, timer, [(64, 0, True)], [(0.25, Slot())])
+        self.assertIn("gpu-ms: 250.0", line)
+        self.assertNotIn("compute", line)
+
+    def test_one_graphed_chunk_drops_the_whole_line_split(self):
+        log, timer = self._make([0.02, 0.0])
+        line = self._emit(
+            log,
+            timer,
+            [(10, 0, False), (20, 0, True)],
+            [(0.1, Slot()), (0.2, Slot())],
+        )
+        self.assertIn("gpu-ms: 300.0", line)
+        self.assertNotIn("compute", line)
+
+    def test_unreadable_slot_reports_no_split(self):
+        log, timer = self._make([None])
+        line = self._emit(log, timer, [(64, 0, False)], [(0.25, Slot())])
+        self.assertIn("gpu-ms: 250.0", line)
+        self.assertNotIn("compute", line)
+
+    def test_capture_skipped_slot_reports_no_split(self):
+        slot = Slot()
+        slot.graph_capture_skipped = True
+        log, timer = self._make([0.05])
+        line = self._emit(log, timer, [(64, 0, False)], [(0.25, slot)])
+        self.assertIn("gpu-ms: 250.0", line)
+        self.assertNotIn("compute", line)
+
+    def test_compute_is_clamped_at_zero(self):
+        # Event granularity can make the collective sum marginally exceed the
+        # enclosing window; compute must not go negative.
+        log, timer = self._make([0.26])
+        line = self._emit(log, timer, [(64, 0, False)], [(0.25, Slot())])
+        self.assertIn("(compute 0.0, wait 260.0)", line)
+
+    def test_no_clock_keeps_the_old_line(self):
+        # Non-CUDA / not installed: unchanged behaviour.
+        log = RankPrefillLog()
+        timer = FakeTimer(log)
+        log.timer = timer
+        line = self._emit(log, timer, [(64, 0, False)], [0.25])
+        self.assertIn("gpu-ms: 250.0", line)
+        self.assertNotIn("compute", line)
+
+
+class TestCollectiveClock(unittest.TestCase):
+    """Arming, re-entrancy and deferred harvesting, with faked events."""
+
+    def _clock(self, timestamps, ready=True):
+        clock = CollectiveClock()
+        events = [FakeEvent(ts, ready) for ts in timestamps]
+        clock._acquire = lambda: events.pop(0)
+        return clock
+
+    def test_disarmed_span_records_nothing(self):
+        clock = self._clock([0.0, 1.0])
+        self.assertFalse(clock.armed)
+        with clock.span():
+            pass
+        self.assertIsNone(clock.disarm())
+
+    def test_armed_span_accumulates(self):
+        clock = self._clock([0.0, 2.0, 5.0, 8.0])
+        clock.arm()
+        with clock.span():
+            pass
+        with clock.span():
+            pass
+        slot = clock.disarm()
+        self.assertEqual(len(slot.pairs), 2)
+        self.assertAlmostEqual(clock.harvest(slot), 0.005)
+
+    def test_nested_span_is_counted_once(self):
+        # A collective implemented via other collectives must not be charged
+        # once per level.
+        clock = self._clock([0.0, 10.0])
+        clock.arm()
+        with clock.span():
+            self.assertFalse(clock.armed)
+            with clock.span():
+                pass
+        slot = clock.disarm()
+        self.assertEqual(len(slot.pairs), 1)
+        self.assertAlmostEqual(clock.harvest(slot), 0.010)
+
+    def test_harvest_is_query_only_and_defers(self):
+        clock = self._clock([0.0, 4.0], ready=False)
+        clock.arm()
+        with clock.span():
+            pass
+        slot = clock.disarm()
+        self.assertIsNone(clock.harvest(slot))
+        for _, end in slot.pairs:
+            end.ready = True
+        for start, _ in slot.pairs:
+            start.ready = True
+        self.assertAlmostEqual(clock.harvest(slot), 0.004)
+
+    def test_harvest_returns_events_to_the_pool(self):
+        clock = CollectiveClock()
+        events = [FakeEvent(0.0), FakeEvent(3.0)]
+        clock._acquire = lambda: events.pop(0)
+        clock.arm()
+        with clock.span():
+            pass
+        slot = clock.disarm()
+        clock.harvest(slot)
+        self.assertEqual(len(clock._pool), 2)
+        self.assertEqual(slot.pairs, [])
+
+    def test_empty_slot_is_zero_not_unknown(self):
+        clock = CollectiveClock()
+        clock.arm()
+        self.assertEqual(clock.harvest(clock.disarm()), 0.0)
+        self.assertIsNone(clock.harvest(None))
 
 
 class TestReporterEmitsAheadOfLoggingGate(unittest.TestCase):
