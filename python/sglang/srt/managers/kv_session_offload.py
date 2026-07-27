@@ -2896,6 +2896,19 @@ class KVSessionOffloadManager:
         req = slot.req
         slot.budget_demoted = True
         slot.budget_demote_iter = self._iter_ct
+        # LOSSLESS HAND-OVER (#242): the donation at the end of the drain is
+        # the session's last chance to reach the host tier -- the device slots
+        # are freed by the very finish that donates them. HiCache's write-
+        # through is hit-rate driven (write_through_threshold; write_back defers
+        # to eviction), so left to itself it hands over the shared prefix and
+        # silently drops the leaves under the threshold -- precisely the tokens
+        # this session just produced. Mark the request so its finishing insert
+        # writes the whole chain through (see
+        # ``requests_forced_host_write_through``). Rank-uniform: the demotion
+        # decision is replicated, so every rank marks the same request. Nothing
+        # else about the finish changes, and an unmarked request keeps the stock
+        # heuristic byte for byte.
+        req.force_host_write_through = True
         self._budget_counters.episodes_demoted += 1
         self._budget_counters.note_exhaustion(reason)
         # LIVENESS ends here (the tick exclusion below stops all host decode),

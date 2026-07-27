@@ -485,6 +485,28 @@ def test_episode_window_exhaustion_demotes_with_cap():
     assert mgr._budget_counters.episodes_demoted == 1
 
 
+def test_demotion_marks_the_request_for_a_lossless_host_handover():
+    """#242: the donation at the end of the drain is the session's only
+    surviving copy, so the demotion must exempt it from HiCache's hit-count
+    write-through heuristic -- otherwise the leaves under the threshold (the
+    newest tokens) are dropped silently. The mark is the whole mechanism; a
+    session that is NOT demoted keeps the stock heuristic."""
+    from sglang.srt.mem_cache.base_prefix_cache import (
+        requests_forced_host_write_through,
+    )
+
+    cfg = SpillBudgetConfig(total_tokens=150)
+    mgr = _budget_manager(cfg)
+    old = _slot_for(mgr, _spilled_req(1, seq=1), region=0)
+    young = _slot_for(mgr, _spilled_req(2, seq=9), region=1)
+    assert not requests_forced_host_write_through(young.req)
+
+    mgr._budget_evaluate_episodes()
+
+    assert young.budget_demoted and requests_forced_host_write_through(young.req)
+    assert not old.budget_demoted and not requests_forced_host_write_through(old.req)
+
+
 def test_total_volume_exhaustion_demotes_the_youngest_live():
     cfg = SpillBudgetConfig(total_tokens=150)
     mgr = _budget_manager(cfg)
