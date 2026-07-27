@@ -267,7 +267,11 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import (
+    is_npu,
+    kill_process_tree,
+    process_group_is_confined_to_tree,
+)
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -5174,7 +5178,26 @@ def run_scheduler_process(
         # of NCCL/TCPStore tracebacks before they finally die.
         if envs.SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION.get():
             try:
-                os.killpg(os.getpgrp(), signal.SIGKILL)
+                # A process group is inherited, so it is only ours if nothing
+                # else joined it. Two servers launched from the same shell share
+                # one pgid, and killpg would then SIGKILL the co-tenant's ranks
+                # too -- an uncatchable signal, so the victim dies with no
+                # traceback and no indication of who killed it. Blast radius
+                # must be verified, not assumed.
+                pgid = os.getpgrp()
+                root_pid = parent_process.pid
+                if process_group_is_confined_to_tree(root_pid, pgid):
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    logger.error(
+                        "SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION: process group %d "
+                        "holds processes outside this server's tree (root pid "
+                        "%d); killing only this server's tree so a co-tenant "
+                        "server is not taken down with it.",
+                        pgid,
+                        root_pid,
+                    )
+                    kill_process_tree(root_pid)
             except Exception:
                 pass
     finally:

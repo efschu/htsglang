@@ -520,6 +520,7 @@ def sgl_kernel_runnable() -> bool:
     except Exception:
         return False
 
+
 try:
     # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile
@@ -2254,6 +2255,53 @@ def kill_process_tree(
 
     if wait_timeout is not None and killed:
         _wait_for_reap_or_raise(killed, wait_timeout)
+
+
+def process_group_is_confined_to_tree(
+    root_pid: int,
+    pgid: Optional[int] = None,
+    _process_iter=None,
+    _getpgid=None,
+) -> bool:
+    """True iff every live member of ``pgid`` belongs to ``root_pid``'s tree.
+
+    ``kill_process_tree`` walks psutil children and can only reach this
+    server's own processes. ``os.killpg`` cannot: a process group is INHERITED,
+    so two servers started from the same shell share one pgid, and a rank that
+    SIGKILLs its group on a scheduler exception takes the co-tenant server down
+    with it -- with no traceback on the victim, because SIGKILL is uncatchable.
+    Check this before killpg and fall back to a tree-scoped kill when it is
+    False.
+
+    Fails closed: any error enumerating processes returns False, because the
+    caller's fallback (kill our own tree) is always the safe direction.
+    """
+    process_iter = _process_iter or psutil.process_iter
+    getpgid = _getpgid or os.getpgid
+    if pgid is None:
+        pgid = os.getpgrp()
+
+    try:
+        root = psutil.Process(root_pid)
+        owned = {root_pid} | {c.pid for c in root.children(recursive=True)}
+        for proc in process_iter(["pid"]):
+            pid = proc.pid
+            if pid in owned:
+                continue
+            try:
+                if getpgid(pid) == pgid:
+                    return False
+            except (ProcessLookupError, PermissionError, psutil.Error, OSError):
+                continue
+        return True
+    except Exception:
+        logger.warning(
+            "process_group_is_confined_to_tree: could not enumerate process "
+            "group %s, assuming it is shared",
+            pgid,
+            exc_info=True,
+        )
+        return False
 
 
 def monkey_patch_p2p_access_check():
