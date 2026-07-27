@@ -4694,3 +4694,29 @@ Triton kernels quantize Q and P down to the KV format where fp8 compiles
 and a latent k_scale sentinel break spot (unreachable today, assert
 candidate). e5m2 default-scale: all reachable states symmetric, no #41343
 analogue; a warning line now fires on explicit fp8_e5m2 choice.
+
+# #260 final verdict — PD+MAIN coexistence with the 27B-Q3 DOES NOT FIT, now with complete accounting
+
+With the corrected budget mapping merged (ec906919c9) the budget rejection
+disappears; the failure moves to the last card with slack: at reserve
+23600,7000,7000 the capacity-based split shifts shard mass onto the 3080s
+and CUDA-graph capture dies there at avail_mem 0.01-0.03 GB (surfacing as an
+NCCL "unhandled cuda error" — memory exhaustion during capture, not a
+collective bug; named via one NCCL_DEBUG rerun). Bracket closes from both
+sides at every tried allocation (28300/29300/25800/23600): rank0 needs
+~9.0 GiB of budget (weights 4.3 + mamba/spec/activation posts 2.5 + scratch
+0.7 + graphs), the 3080s need their graphs+draft on top of shard+KV, and
+32 GiB minus a 22.2-GiB PD leaves no allocation satisfying both. Five boot
+attempts total, each converted into a durable fix (mem-fraction semantics,
+scratch accounting #257, budget mapping #260, wedge #259, killpg #259);
+no further boots. Paths that WOULD open it, untested by design tonight:
+smaller PD model, or shrinking main's graph/spec posts (lower
+cuda-graph-max-bs, spec off) — planner-computable once #258 lands.
+
+Also merged in this window: #259 (bounded waits + fixed pool universe on the
+HiCache control collectives, gloo cpu_group timeout was 2 h and never
+overridden; killpg blast-radius guard — two servers from one shell share a
+pgid, the dying one SIGKILLed the neighbour, which explains the tracebackless
+PD collateral death) and #171 (13 real vendor-blind capability gates fixed at
+the root: helpers now carry the vendor in the name; gfx900 reads as (9,0) and
+cleared every "sm90" gate before).
