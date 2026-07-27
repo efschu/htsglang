@@ -1,66 +1,170 @@
-# htsglang (uneven-TP sglang fork) — Qwen3.6-27B AEON FP8-MTP, tri-GPU.
-# Sibling of shvllm.yml (the vLLM fork). Same host-integration pattern:
-#   security_opt: apparmor=unconfined   (LXC/Proxmox — REQUIRED)
-#   deploy.devices driver: nvidia       (GPU via nvidia-container-runtime)
-#   shm_size + ipc: host                (NCCL / shared-memory IPC)
+# htsglang (uneven-TP sglang fork) — single-node serving compose.
 #
-# The image bakes in the ENV-driven entrypoint (htsglang-entrypoint.sh) and the
-# froggeric v21.3 chat template (/etc/htsglang/chat_template.jinja), so the
-# launch flags live in `environment:` here, not in `command:`.
+#   cp docker/htsglang.env.example .env      # then edit the paths
+#   docker compose -f docker/htsglang.yml up
 #
-# Default profile = production 1-rank-per-GPU uneven TP (mirrors shvllm.yml:
-# TP=3, rank-gpu-id 0,1,2, rank-tp-ratio auto) + HiCache file backend + NEXTN.
-# For multi-rank-per-GPU co-location (e.g. 2 ranks on the 5090) override via
-# the environment or a .env file next to this compose:
-#   RANK_GPU_ID=0,0,1,2   RANK_GPU_MEMORY_MIB=13500
-# RANK_GPU_MEMORY_MIB auto-disables the ratio/reserve flags; needs NCCL>=2.30
-# (baked in). Verified: boots, sizes, serves.
+# Every value below comes from the .env file; the ${VAR:-default} fallbacks are
+# what you get without one. The .env.example documents each variable.
 #
-# Run (on proxmox):
-#   cd <this dir> && docker compose -f htsglang.yml up
+# Host integration (LXC/Proxmox, as validated on this rig):
+#   security_opt: apparmor=unconfined   REQUIRED under LXC, otherwise the
+#                                       nvidia device nodes are blocked
+#   deploy.devices driver: nvidia       GPUs via nvidia-container-runtime
+#   shm_size + ipc: host                NCCL / CUDA IPC shared memory. Without
+#                                       enough /dev/shm, multi-rank boots hang
+#                                       or die in the first collective
+#   init: true                          reap orphaned worker processes
+#
+# The image's own defaults are neutral (TP=1, no speculation, no HiCache), so
+# everything the production profile needs is set explicitly here.
 services:
-  htsglang-qwen36-27b-tri:
-    image: htsglang:cu130-nccl2307
-    container_name: "${ESTATE_CONTAINER:-htsglang-qwen36-27b}"
-    restart: no
+  htsglang:
+    image: ${HTSGLANG_IMAGE:-htsglang:cu130-nccl2307}
+    container_name: ${CONTAINER_NAME:-htsglang}
+    restart: ${RESTART_POLICY:-no}
+    init: true
     security_opt:
       - apparmor=unconfined
     ports:
-      - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8011}}:30000"
+      # OpenAI-compatible API. Bind to 127.0.0.1 unless the LAN is trusted —
+      # sglang has no authentication of its own.
+      - "${BIND_HOST:-127.0.0.1}:${PUBLISH_PORT:-30000}:30000"
     volumes:
-      # Model cache (same source dir shvllm.yml mounts) -> /models-cache.
-      - ${MODEL_DIR:-../../../../../../models-cache}:/models-cache:ro
-      # HiCache file backend L2/L3 storage (persist across restarts).
-      - ../../../cache/htsglang-hicache:/sgl-workspace/sglang_storage
+      # --- models -----------------------------------------------------------
+      # The main model. Read-only: nothing in the serving path writes here.
+      # MISSING -> the server exits at startup with a path error.
+      - ${MODEL_DIR:?set MODEL_DIR in .env}:/models:ro
+      # The draft/speculative model. Deliberately a SEPARATE mount: draft
+      # checkpoints usually live somewhere other than the main model tree
+      # (different disk, different download). Point it at the same directory as
+      # MODEL_DIR if they do share a tree; for Qwen3.5/3.6 GGUF the MTP layer
+      # is inside the main .gguf and this mount is unused.
+      # MISSING -> speculative decoding fails to load its draft; the server
+      # aborts at startup rather than silently serving without speculation.
+      - ${DRAFT_MODEL_DIR:-${MODEL_DIR}}:/draft:ro
+      # Chat templates and any other jinja/parser assets you want to swap
+      # without rebuilding. The froggeric v21.3 template is baked into the
+      # image at /etc/htsglang/chat_template.jinja and needs no mount.
+      # MISSING -> only the baked-in and the builtin templates are available.
+      - ${TEMPLATE_DIR:-./templates}:/templates:ro
+
+      # --- state that must survive a restart --------------------------------
+      # HiCache L3 (disk tier of the hierarchical cache). This is the whole
+      # point of the file backend: prefixes evicted from GPU and host RAM land
+      # here and are reusable after a restart.
+      # MISSING -> the backend falls back to /tmp/hicache INSIDE the container
+      # writable layer: it works, but every prefix is lost when the container
+      # is removed, and the layer grows unbounded.
+      - ${HICACHE_DIR:-./state/hicache}:/var/lib/htsglang/hicache
+      # Hibernate (#89, suspend-to-disk of the per-rank weight shards). A boot
+      # with a matching manifest here restores instead of cold-loading —
+      # measured 50s -> 8-14s for uneven TP=3 dense GGUF.
+      # NOTE the shards are RANK-INDEXED, so this directory belongs to one
+      # specific rank layout on one specific node. Do not share it between
+      # nodes or between different --rank-gpu-id mappings.
+      # MISSING -> every boot is a cold load. No error, just slower.
+      - ${HIBERNATE_DIR_HOST:-./state/hibernate}:/var/lib/htsglang/hibernate
+      # ~/.cache/sglang: the rig hardware profile (hw_profile-*.json, the NVML
+      # probe) and the MEASURED KV budget (kv_budget-*.json, written by one
+      # boot and consumed by the next to size the KV pool without re-probing).
+      # Also the planner's saved profiles and graph-memory anchors.
+      # MISSING -> every boot re-probes the rig (seconds) and re-derives the KV
+      # budget, which costs a boot cycle of the full sizing loop.
+      - ${SGLANG_CACHE_DIR:-./state/sglang-cache}:/root/.cache/sglang
+      # flashinfer compiles its kernels at runtime with nvcc. This cache is the
+      # difference between a warm boot and minutes of recompilation.
+      # MISSING -> long first boot after every container recreate.
+      - ${FLASHINFER_CACHE_DIR:-./state/flashinfer}:/root/.cache/flashinfer
+      # The HiCache page-hash C++ extension is JIT-compiled by
+      # torch.utils.cpp_extension against openssl/sha.h on first use.
+      # MISSING -> it is rebuilt on every boot (tens of seconds).
+      - ${TORCH_EXT_CACHE_DIR:-./state/torch-extensions}:/root/.cache/torch_extensions
+      # Triton kernel cache. Matters most on sm75 and on any Triton attention
+      # backend, where a cold cache means autotuning on every boot.
+      # MISSING -> repeated Triton compilation.
+      - ${TRITON_CACHE_DIR_HOST:-./state/triton}:/root/.triton
+      # Server logs, if you want them outside the container's json-file driver.
+      # MISSING -> logs only via `docker logs`.
+      - ${LOG_DIR:-./state/logs}:/var/log/htsglang
     environment:
-      - NVIDIA_VISIBLE_DEVICES=${ESTATE_GPUS:-${NVIDIA_VISIBLE_DEVICES:-all}}
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      # `utility` is what provides nvidia-smi/NVML inside the container; the
+      # nvidia/cuda base image already sets compute,utility. NVML is read-only
+      # here — clock and power control do not work from a container at all.
+      - NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+
       # --- model + identity ---
-      - MODEL_PATH=/models-cache/Qwen3.6-27B-AEON-Ultimate-Uncensored-FP8-MTP
-      - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-qwen3.6-27b-aeon-fp8}
-      # --- (uneven) tensor parallelism: 1 rank per GPU, proportional shards ---
-      - TP_SIZE=${TP_SIZE:-3}
-      - RANK_GPU_ID=${RANK_GPU_ID:-0,1,2}
-      - RANK_TP_RATIO=${RANK_TP_RATIO:-auto}
-      - RANK_AUTO_RESERVE_MIB=${RANK_AUTO_RESERVE_MIB:-2048}
-      # Absolute per-rank budget (set for multi-rank-per-GPU; empty = ratio mode)
-      - RANK_GPU_MEMORY_MIB=${RANK_GPU_MEMORY_MIB:-}
-      # Uneven-TP MLP self-calibration vector (first boot may suggest one;
-      # put it here + restart for the full KV pool). Empty = uncalibrated.
-      - SGLANG_UNEVEN_MLP_VECTOR=${SGLANG_UNEVEN_MLP_VECTOR:-}
-      # --- kv cache / NEXTN spec decode ---
-      - KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_e4m3}
-      - SPECULATIVE_ALGORITHM=${SPECULATIVE_ALGORITHM:-NEXTN}
-      # --- HiCache (RAM L1 + file L2/L3) ---
-      - ENABLE_HIERARCHICAL_CACHE=${ENABLE_HIERARCHICAL_CACHE:-1}
-      - HICACHE_STORAGE_BACKEND=${HICACHE_STORAGE_BACKEND:-file}
-      - HICACHE_RATIO=${HICACHE_RATIO:-0.5}
-      - HICACHE_MEM_LAYOUT=${HICACHE_MEM_LAYOUT:-page_first_direct}
-      # --- server sizing ---
-      - MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-8}
+      - MODEL_PATH=${MODEL_PATH:?set MODEL_PATH in .env}
+      - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-}
+      - TOKENIZER_PATH=${TOKENIZER_PATH:-}
+      - LOAD_FORMAT=${LOAD_FORMAT:-}
+      - QUANTIZATION=${QUANTIZATION:-}
+      - DTYPE=${DTYPE:-}
       - CONTEXT_LENGTH=${CONTEXT_LENGTH:-32768}
+      - CHAT_TEMPLATE=${CHAT_TEMPLATE:-/etc/htsglang/chat_template.jinja}
+      - REASONING_PARSER=${REASONING_PARSER:-}
+      - TOOL_CALL_PARSER=${TOOL_CALL_PARSER:-}
+      - TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-0}
+
+      # --- (uneven) tensor parallelism ---
+      - TP_SIZE=${TP_SIZE:-1}
+      - RANK_GPU_ID=${RANK_GPU_ID:-}
+      - RANK_TP_RATIO=${RANK_TP_RATIO:-}
+      - RANK_AUTO_RESERVE_MIB=${RANK_AUTO_RESERVE_MIB:-}
+      # Absolute per-rank budget. REQUIRED for multi-rank-per-GPU co-location
+      # (duplicate ids in RANK_GPU_ID); it disables the ratio/reserve pair.
+      - RANK_GPU_MEMORY_MIB=${RANK_GPU_MEMORY_MIB:-}
+      - RANK_KV_RATIO=${RANK_KV_RATIO:-}
+      - RANK_MLP_RATIO=${RANK_MLP_RATIO:-}
+      - RANK_MOE_RATIO=${RANK_MOE_RATIO:-}
+      - RANK_VOCAB_RATIO=${RANK_VOCAB_RATIO:-}
+      - DCP_SIZE=${DCP_SIZE:-}
+      # Uneven-TP MLP self-calibration vector. The first boot suggests one;
+      # put it here and restart for the full KV pool. Empty = uncalibrated.
+      - SGLANG_UNEVEN_MLP_VECTOR=${SGLANG_UNEVEN_MLP_VECTOR:-}
+
+      # --- kv cache / speculative decoding ---
+      - KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
+      - MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-}
+      - SPECULATIVE_ALGORITHM=${SPECULATIVE_ALGORITHM:-}
+      - SPECULATIVE_NUM_STEPS=${SPECULATIVE_NUM_STEPS:-}
+      - SPECULATIVE_EAGLE_TOPK=${SPECULATIVE_EAGLE_TOPK:-}
+      - SPECULATIVE_NUM_DRAFT_TOKENS=${SPECULATIVE_NUM_DRAFT_TOKENS:-}
+      - SPECULATIVE_DRAFT_MODEL_PATH=${SPECULATIVE_DRAFT_MODEL_PATH:-}
+
+      # --- HiCache / hibernate / offload ---
+      - ENABLE_HIERARCHICAL_CACHE=${ENABLE_HIERARCHICAL_CACHE:-0}
+      - HICACHE_STORAGE_BACKEND=${HICACHE_STORAGE_BACKEND:-file}
+      - HICACHE_RATIO=${HICACHE_RATIO:-}
+      - HICACHE_MEM_LAYOUT=${HICACHE_MEM_LAYOUT:-}
+      - HICACHE_STORAGE_DIR=/var/lib/htsglang/hicache
+      # Hibernate needs BOTH set or NEITHER — the fork rejects one without the
+      # other. Set HIBERNATE_ENABLE=1 and HIBERNATE_DIR=/var/lib/htsglang/hibernate
+      # in .env to turn it on.
+      - HIBERNATE_DIR=${HIBERNATE_DIR:-}
+      - ENABLE_WEIGHTS_DISK_BACKUP=${HIBERNATE_ENABLE:-}
+      - ENABLE_KV_SESSION_OFFLOAD=${ENABLE_KV_SESSION_OFFLOAD:-}
+      - KV_SESSION_OFFLOAD_HOST_RAM_GIB=${KV_SESSION_OFFLOAD_HOST_RAM_GIB:-}
+
+      # --- sizing / observability ---
+      - MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-}
+      - ATTENTION_BACKEND=${ATTENTION_BACKEND:-}
+      - DISABLE_CUSTOM_ALL_REDUCE=${DISABLE_CUSTOM_ALL_REDUCE:-}
+      - ENFORCE_EAGER=${ENFORCE_EAGER:-}
+      - ENABLE_METRICS=${ENABLE_METRICS:-1}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - EXTRA_ARGS=${EXTRA_ARGS:-}
       - PORT=30000
-    shm_size: "16gb"
+    shm_size: ${SHM_SIZE:-16gb}
     ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:30000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      # Cold load of a large model plus a cold flashinfer cache can take
+      # minutes; start_period keeps that from counting as unhealthy.
+      start_period: ${HEALTH_START_PERIOD:-600s}
+      retries: 3
     deploy:
       resources:
         reservations:

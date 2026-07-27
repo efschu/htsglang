@@ -1,0 +1,120 @@
+# htsglang GUI mode — the planner is the only process started; it launches
+# sglang itself, inside this same container.
+#
+#   cp docker/htsglang.env.example .env
+#   docker compose -f docker/htsglang-gui.yml up
+#   then open http://127.0.0.1:8780
+#
+# How this differs from htsglang.yml: no MODEL_PATH, no TP flags, no
+# speculative flags. The planner UI collects all of that and builds the
+# `python3 -m sglang.launch_server` command line itself, spawns it in its own
+# process group, waits for /get_model_info, and can stop and restart it. The
+# generated command line is shown in the UI response, not written to a file.
+#
+# SECURITY: the planner UI has no authentication whatsoever, and its API can
+# start and stop servers and download models from HuggingFace. The port is
+# published to 127.0.0.1 on purpose. Do not move it to 0.0.0.0 without putting
+# an authenticating proxy in front.
+#
+# CLOCK CONTROL DOES NOT WORK FROM A CONTAINER. The driver refuses
+# `nvidia-smi -pm / -lgc / -lmc / -pl` from inside a container even as root
+# with full capabilities. rigmon already reports this honestly: the
+# power_target, clock_lock and persistence_mode facilities show up as
+# visible-but-disabled with the remedy "run the collector on the hypervisor
+# host". NVML *reads* — utilization, temperature, power draw, clocks, memory —
+# work fine, so the short hardware probe and the live telemetry are unaffected.
+# The one write path in the codebase, nvmlDeviceSetPowerManagementLimit in
+# planner/energy.py, is reached from the energy sweep (--run-study), and it
+# raises rather than degrading when the driver denies permission.
+services:
+  htsglang-gui:
+    image: ${HTSGLANG_IMAGE:-htsglang:cu130-nccl2307}
+    container_name: ${GUI_CONTAINER_NAME:-htsglang-gui}
+    restart: ${RESTART_POLICY:-no}
+    # The planner is a supervisor: it spawns and kills a server subprocess
+    # group. An init process reaps anything that gets orphaned.
+    init: true
+    security_opt:
+      - apparmor=unconfined
+    ports:
+      # Planner web UI. 127.0.0.1 only — see the security note above.
+      - "127.0.0.1:${PLANNER_PUBLISH_PORT:-8780}:8780"
+      # The sglang server the planner starts. It defaults to binding
+      # 127.0.0.1 INSIDE the container, which is not reachable from here — set
+      # the host field in the UI to 0.0.0.0 if you want to use this mapping.
+      - "${BIND_HOST:-127.0.0.1}:${PUBLISH_PORT:-30000}:30000"
+      # rigmon aggregator, if you start one manually inside the container
+      # (`docker exec ... python3 -m sglang.srt.rigmon serve --host 0.0.0.0
+      # --port 8770 --token <token>`). It REFUSES a non-loopback bind without
+      # a token.
+      - "127.0.0.1:${RIGMON_PUBLISH_PORT:-8770}:8770"
+    volumes:
+      # Model roots the UI scans. SGLANG_MODEL_ROOTS below must list exactly
+      # these container-side paths.
+      # MISSING -> the model dropdown is empty and you can only type paths.
+      - ${MODEL_DIR:?set MODEL_DIR in .env}:/models:ro
+      - ${DRAFT_MODEL_DIR:-${MODEL_DIR}}:/draft:ro
+      - ${TEMPLATE_DIR:-./templates}:/templates:ro
+
+      # Same persistent state as htsglang.yml — the planner reads the same
+      # hw_profile / kv_budget caches the server writes, so sharing these
+      # directories between the two composes is intended.
+      - ${HICACHE_DIR:-./state/hicache}:/var/lib/htsglang/hicache
+      - ${HIBERNATE_DIR_HOST:-./state/hibernate}:/var/lib/htsglang/hibernate
+      # Planner state lives here too: planner_profiles.json (saved configs),
+      # graph_mem_anchors.json, power_profile.json, quality_shots.jsonl,
+      # gguf_headers/ (ranged GGUF header slices, up to 256 MiB each), and
+      # rigmon/node_tokens.json.
+      # MISSING -> saved profiles and calibration are lost on every restart.
+      - ${SGLANG_CACHE_DIR:-./state/sglang-cache}:/root/.cache/sglang
+      - ${FLASHINFER_CACHE_DIR:-./state/flashinfer}:/root/.cache/flashinfer
+      - ${TORCH_EXT_CACHE_DIR:-./state/torch-extensions}:/root/.cache/torch_extensions
+      - ${TRITON_CACHE_DIR_HOST:-./state/triton}:/root/.triton
+
+      # The planner's supervisor writes the launched server's stdout/stderr to
+      # /tmp/sglang_boot_<port>.log, and the graph-memory anchor scraper reads
+      # those logs back by glob. The path is hardcoded in GUI mode (the webui
+      # constructs SglangSupervisor() with no log_dir argument), so /tmp is the
+      # only place it can go.
+      # MISSING -> the UI still tails the current boot, but log history is
+      # lost on restart and graph-memory anchors cannot be re-derived.
+      - ${PLANNER_LOG_DIR:-./state/planner-logs}:/tmp
+      # Two planner result stores are written INSIDE the installed package
+      # (measured_results.jsonl, hicache_savings.json) and have no env
+      # override. This mount keeps them.
+      # MISSING -> benchmark results and HiCache-savings history are lost when
+      # the container is recreated.
+      - ${PLANNER_RESULTS_DIR:-./state/planner-results}:/var/lib/htsglang/planner-results
+    environment:
+      - MODE=planner
+      - PLANNER_HOST=0.0.0.0
+      - PLANNER_PORT=8780
+      # Extra `python3 -m sglang.planner` arguments, e.g.
+      #   --results-store /var/lib/htsglang/planner-results/measured_results.jsonl
+      # which is the supported way to move the package-internal result store.
+      - PLANNER_ARGS=${PLANNER_ARGS:---results-store /var/lib/htsglang/planner-results/measured_results.jsonl}
+      # Where the UI looks for models. os.pathsep-separated.
+      - SGLANG_MODEL_ROOTS=${SGLANG_MODEL_ROOTS:-/models:/draft}
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      # Read by the sglang server the planner spawns.
+      - HICACHE_STORAGE_DIR=/var/lib/htsglang/hicache
+      - SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/var/lib/htsglang/hicache
+      # HF token for the UI's model-download button. Leave empty for public
+      # repos only.
+      - HF_TOKEN=${HF_TOKEN:-}
+    shm_size: ${SHM_SIZE:-16gb}
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8780/api/knobs >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
