@@ -35,6 +35,34 @@ class DeviceTimer:
                 reporter(t=elapsed, **interval.metadata)
 
 
+class SplitDeviceTimer(DeviceTimer):
+    """DeviceTimer that also accounts the collective time inside the block.
+
+    Arms a CollectiveClock for the duration of the wrapped block and hands
+    the resulting slot to the reporter as ``collective_slot`` metadata, so a
+    single deferred report carries both the total span and the part of it
+    that was spent inside collectives. The slot is attached before the
+    interval's end event is recorded, which is also why a completed end event
+    implies the slot's own events are complete: they were recorded earlier on
+    the same stream.
+    """
+
+    def __init__(self, reporter: Callable, clock):
+        super().__init__(reporter)
+        self._clock = clock
+
+    @contextmanager
+    def wrap(self, metadata: Dict):
+        self._clock.arm()
+        self._intervals.append(_TimingInterval.create())
+        try:
+            yield
+        finally:
+            slot = self._clock.disarm()
+            self._intervals[-1].end(metadata={**metadata, "collective_slot": slot})
+            self._report()
+
+
 class GapTimer(DeviceTimer):
     """Measures GPU idle gaps between consecutive uses of a stream.
 

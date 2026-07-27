@@ -62,6 +62,7 @@ from sglang.srt.utils import (
     is_shm_available,
     is_xpu,
 )
+from sglang.srt.utils.collective_clock import collective_clock
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
@@ -72,6 +73,11 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+
+# Per-rank compute/wait split for the prefill log. Disarmed for every forward
+# except the ones the per-rank prefill line already times, so the cost on all
+# other collectives is the `armed` attribute read below.
+_COLLECTIVE_CLOCK = collective_clock()
 
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
@@ -256,9 +262,7 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
     )
 
 
-def should_build_pynccl(
-    use_pynccl: bool, world_size: int, htccl_active: bool
-) -> bool:
+def should_build_pynccl(use_pynccl: bool, world_size: int, htccl_active: bool) -> bool:
     """Whether GroupCoordinator should CONSTRUCT a PyNccl communicator.
 
     Module-level and importable ON PURPOSE: it is the single definition of this
@@ -806,6 +810,14 @@ class GroupCoordinator:
         a new tensor in the same op. So we need to figure out if the op is
         in-place or out-of-place ahead of time.
         """
+        if _COLLECTIVE_CLOCK.armed:
+            # Time this collective for the per-rank compute/wait split, then
+            # re-enter with the clock disarmed: the body runs exactly once,
+            # and a collective built out of other collectives is counted once
+            # rather than once per level.
+            with _COLLECTIVE_CLOCK.span():
+                return self.all_reduce(input_)
+
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
@@ -1176,6 +1188,10 @@ class GroupCoordinator:
         output: Optional[torch.Tensor] = None,
         sizes: Optional[List[int]] = None,
     ) -> torch.Tensor:
+        if _COLLECTIVE_CLOCK.armed:
+            # See all_reduce for why this re-enters.
+            with _COLLECTIVE_CLOCK.span():
+                return self.reduce_scatterv(input_, output=output, sizes=sizes)
         if self.htccl_comm is not None:
             self._htccl_unsupported("reduce_scatterv")
         world_size = self.world_size
@@ -1308,6 +1324,12 @@ class GroupCoordinator:
         dim: int = -1,
         output_tensor_list: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
+        if _COLLECTIVE_CLOCK.armed:
+            # See all_reduce for why this re-enters.
+            with _COLLECTIVE_CLOCK.span():
+                return self.all_gather(
+                    input_, dim=dim, output_tensor_list=output_tensor_list
+                )
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
@@ -1397,6 +1419,10 @@ class GroupCoordinator:
             When given, NCCL writes the gathered result directly into it, avoiding an
             extra output allocation + caller-side copy.
         """
+        if _COLLECTIVE_CLOCK.armed:
+            # See all_reduce for why this re-enters.
+            with _COLLECTIVE_CLOCK.span():
+                return self.all_gatherv(input_, sizes=sizes, output=output)
         if self.htccl_comm is not None:
             self._htccl_unsupported("all_gatherv")
         world_size = self.world_size
