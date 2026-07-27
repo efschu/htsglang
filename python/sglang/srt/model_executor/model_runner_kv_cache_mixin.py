@@ -57,6 +57,7 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
+    empty_device_cache,
     get_available_gpu_memory,
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
@@ -136,6 +137,128 @@ _is_hip = is_hip()
 
 
 class ModelRunnerKVCacheMixin:
+    # === #119: expert-offload VRAM -> KV pool ==============================
+    # The expert offload (#77/#123) parks cold experts in a pinned host pool and
+    # gives their VRAM back. Nothing in the sizing code has to ADD that memory
+    # anywhere: the budget below is derived from a live free-memory reading, so
+    # the reclaim lands in it by construction -- as long as two ordering
+    # properties hold. They are cheap to state and were previously unenforced:
+    #
+    #   1. RELEASE BEFORE MEASURE. The offload must be installed before the
+    #      profiling runs. It is (model_runner.load_model -> the eager install),
+    #      but only by call-site accident; the #77 lazy install ran AFTER sizing
+    #      and cost the entire win silently. _assert_expert_offload_installed
+    #      turns that back into a loud failure instead of a quiet regression.
+    #   2. RELEASE BEFORE *ANY* RANK MEASURES. get_available_gpu_memory reads
+    #      torch.cuda.mem_get_info(), which is DRIVER-level and therefore sees
+    #      co-located siblings too, while the caching allocator only returns
+    #      freed blocks to the driver at empty_cache(). Each rank empties its
+    #      own cache inside its own reading, unsynchronized -- so a rank that
+    #      reads early sees a sibling's already-freed expert weights as still
+    #      occupied. Below the offload that skew was small; with the offload it
+    #      is the whole reclaim (~18 GiB on the co-located card in the #77 122B
+    #      run), and it lands in the min-reduce/co-location terms as pure noise.
+    #      _expert_offload_release_sync makes the release a group-ordered step.
+    #
+    # No new budget term is introduced, so the graph-capture reserve (#68
+    # derived_rank_auto_reserve_mib / reserve_for_graph_mb, both folded in
+    # before this point) is untouched: the reclaim arrives as free bytes and is
+    # spent net of the same reserves as any other free byte.
+
+    def _expert_offload_lane_active(self: ModelRunner) -> bool:
+        """True when the #119 reclaim handling applies at all.
+
+        Both terms are env vars and therefore WORLD-UNIFORM: every rank agrees
+        without communicating, so the collectives further down can never be
+        entered by only a subset of ranks. With the offload off this returns
+        False before any memory or collective operation, leaving the default
+        sizing path byte-identical.
+        """
+        return (
+            envs.SGLANG_MOE_OFFLOAD_KV_REGAIN.get()
+            and envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get() < 1.0
+        )
+
+    def _assert_expert_offload_installed(self: ModelRunner) -> None:
+        """Ordering invariant: no FusedMoE layer may still be waiting to install.
+
+        A layer that installs lazily on its first forward releases its expert
+        VRAM after this profiling step, so the KV pool is sized against the
+        pre-offload footprint and the reclaim is lost (and, worse, the resident
+        buffers then have to fit alongside a pool that already claimed their
+        space). Rank-local raise, matching the rank-local ValueErrors that the
+        budget check below already uses.
+        """
+        model = getattr(self, "model", None)
+        if model is None or getattr(self, "is_weightless_worker", False):
+            # Weightless workers hold a meta model: no expert weights, nothing
+            # to install, and the walk would only produce false positives.
+            return
+        try:
+            from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        except Exception:  # pragma: no cover - import-time env differences
+            return
+        pending = [
+            getattr(m, "layer_id", "?")
+            for m in model.modules()
+            if isinstance(m, FusedMoE)
+            and getattr(m, "_moe_offload_enabled", False)
+            and getattr(m, "_expert_offload", None) is None
+            and not getattr(m, "_expert_offload_install_failed", False)
+        ]
+        if pending:
+            raise ValueError(
+                f"MoE expert-offload is active but {len(pending)} FusedMoE "
+                f"layer(s) {pending[:8]} have not installed their offload cache "
+                f"before the KV pool is sized (rank {self.tp_rank}). Those "
+                f"layers would release their expert VRAM only on the first "
+                f"forward, i.e. AFTER this profiling step, so the KV pool would "
+                f"be sized against the pre-offload footprint and then collide "
+                f"with the resident buffers. The eager install in "
+                f"ModelRunner.load_model() must run before pool sizing; set "
+                f"SGLANG_MOE_OFFLOAD_KV_REGAIN=0 to profile without it."
+            )
+
+    def _expert_offload_reclaim_active(self: ModelRunner) -> bool:
+        """Group-minimum verdict: did EVERY rank actually release expert VRAM?
+
+        The reclaim changes the pool the whole TP group shares, so the decision
+        to treat it as present has to be rank-uniform. Test rank-locally first,
+        then reduce with MIN -- a single rank that released nothing (an MoE-free
+        shard, a failed install falling back to fully-resident) makes the group
+        fall back to the plain path rather than half the ranks synchronizing
+        while the other half reads unsynchronized memory.
+        """
+        from sglang.srt.layers.moe.expert_offload import (
+            expert_offload_release_totals,
+        )
+
+        local = 1 if expert_offload_release_totals().layers > 0 else 0
+        if get_world_group().world_size > 1:
+            verdict = torch.tensor(local, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                verdict,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_world_group().cpu_group,
+            )
+            local = int(verdict.item())
+        return bool(local)
+
+    def _expert_offload_release_sync(self: ModelRunner) -> None:
+        """Return every rank's freed expert blocks to the driver, then barrier.
+
+        Order is the whole point: collect -> empty_cache -> barrier. Only after
+        the barrier may any rank read mem_get_info(), because only then is every
+        co-located sibling's release visible at driver level. Without this the
+        profiled free memory depends on which rank happened to run first.
+        """
+        import gc
+
+        gc.collect()
+        empty_device_cache(torch.cuda)
+        if get_world_group().world_size > 1:
+            torch.distributed.barrier(group=get_world_group().cpu_group)
+
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
@@ -150,6 +273,14 @@ class ModelRunnerKVCacheMixin:
         # capacities (per-token bytes scale with each rank's kv-head
         # share, so proportional budgets yield near-equal token counts).
         uneven_memory = self.server_args.uneven_memory_budgets_active()
+        # #119: on the offload lane, settle the release before anyone measures.
+        # Both steps are no-ops off the lane, so the default path is unchanged.
+        offload_reclaim = False
+        if self._expert_offload_lane_active():
+            self._assert_expert_offload_installed()
+            offload_reclaim = self._expert_offload_reclaim_active()
+            if offload_reclaim:
+                self._expert_offload_release_sync()
         if uneven_memory and get_world_group().world_size > 1:
             # Serialize the profiling of co-located ranks per physical
             # GPU: a barrier guarantees every rank finished loading its
@@ -272,6 +403,29 @@ class ModelRunnerKVCacheMixin:
                 f"(minimum viable = 1 - available/pre = "
                 f"{minimum_mem_fraction_static:.4f}). If using speculative "
                 f"decoding, draft weights are now counted."
+            )
+
+        if offload_reclaim:
+            # #119: state the reclaim in the log. The bytes are already inside
+            # rest_memory (the free-memory reading above saw them); this line
+            # exists so the win is verifiable from a boot log instead of being
+            # inferred, and so a regression that loses it is visible as a drop
+            # here rather than as an unexplained smaller KV pool.
+            from sglang.srt.layers.moe.expert_offload import (
+                expert_offload_release_totals,
+            )
+
+            released = expert_offload_release_totals()
+            logger.info(
+                "[offload-kv-regain] rank %d: expert offload released %.2f GiB "
+                "of weight VRAM across %d MoE layer(s) (%.2f GiB moved to the "
+                "pinned host pool); that VRAM is part of the %.2f GiB KV budget "
+                "profiled here.",
+                self.tp_rank,
+                released.device_bytes / (1 << 30),
+                released.layers,
+                released.host_bytes / (1 << 30),
+                rest_memory,
             )
 
         # Component-balance checkpoint "post-weights" (weights + CUDA context
