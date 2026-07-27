@@ -337,3 +337,71 @@ def test_no_matrix_row_claims_spec_vs_nospec_token_identity():
         if spec_on and spec_off:
             assert case.expected_class is not ByteIdentityClass.MACHINE_ZERO, case.case_id
             assert case.expected_class is not ByteIdentityClass.DECODE_CLASS, case.case_id
+
+
+# --------------------------------------------------------------------------
+# 6. Reading the GPU-side dump back
+# --------------------------------------------------------------------------
+
+
+def _dump_record(accept_lens, bs=1, d=4, vocab=VOCAB):
+    """A record in the shape sglang.srt.speculative.spec_verify_dump writes."""
+    logits = torch.zeros(bs * d, vocab, dtype=torch.float32)
+    for r in range(bs * d):
+        logits[r, (r + 3) % vocab] = 5.0
+    predict = [int((r + 3) % vocab) for r in range(bs * d)]
+    accepted_rows = [
+        list(range(b * d, b * d + accept_lens[b])) for b in range(bs)
+    ]
+    return {
+        "step": 0,
+        "tp_rank": 0,
+        "mode": "target_verify",
+        "bs": bs,
+        "draft_token_num": d,
+        "logits": logits,
+        "candidates": torch.zeros(bs, d, dtype=torch.int64),
+        "predict": torch.tensor(predict, dtype=torch.int64),
+        "accept_lens": torch.tensor(accept_lens, dtype=torch.int64),
+        "accepted_rows": accepted_rows,
+        "emitted": [[predict[r] for r in rows] for rows in accepted_rows],
+    }
+
+
+def test_verify_round_from_dump_record_reorders_rows_into_emitted_order():
+    rec = _dump_record([2])
+    rnd = VerifyRound.from_dump_record(rec, request=0)
+    assert list(rnd.emitted) == rec["emitted"][0]
+    assert rnd.accept_len == 2
+    # Rows must be REORDERED into emitted order, not sliced positionally --
+    # accept_index carries global flat indices and a tree layout would not
+    # hand back 0, 1, 2, ...
+    for i, tok in enumerate(rnd.emitted):
+        assert int(rnd.logits[i].argmax()) == int(tok)
+
+
+def test_verify_round_from_dump_record_selects_the_request():
+    rec = _dump_record([1, 3], bs=2)
+    r0 = VerifyRound.from_dump_record(rec, request=0)
+    r1 = VerifyRound.from_dump_record(rec, request=1)
+    assert r0.accept_len == 1 and r1.accept_len == 3
+    assert list(r1.emitted) == rec["emitted"][1]
+
+
+def test_spec_run_from_dump_records_is_ordered_by_step():
+    """Records are read back by step number, not by directory order."""
+    recs = []
+    for step in (2, 0, 1):
+        rec = _dump_record([2])
+        rec["step"] = step
+        recs.append(rec)
+    run = SpecRun.from_dump_records(recs, seed=1234, request=0)
+    assert [r for r in run.meta["steps"]] == [0, 1, 2]
+    assert check_accept_rule_exactness(run).ok
+
+
+def test_spec_run_from_dump_records_rejects_a_wrong_mode():
+    rec = _dump_record([2])
+    rec["mode"] = "decode"
+    with pytest.raises(ValueError, match="target_verify"):
+        SpecRun.from_dump_records([rec], seed=1234, request=0)

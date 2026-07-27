@@ -104,6 +104,38 @@ class VerifyRound:
     def draft_token_num(self) -> int:
         return int(self.logits.shape[0])
 
+    @classmethod
+    def from_dump_record(cls, record: dict, request: int = 0) -> "VerifyRound":
+        """Build a round from one record written by
+        ``sglang.srt.speculative.spec_verify_dump``.
+
+        The rows are REORDERED into emitted order via the record's
+        ``accepted_rows`` (which come from ``accept_index``, i.e. GLOBAL flat
+        row indices) rather than sliced positionally. For a chain those happen
+        to be ``b*D, b*D+1, ...``, but relying on that would silently produce a
+        plausible-looking wrong trajectory the day a tree layout is dumped --
+        and "plausible but wrong" is the failure mode this whole harness
+        exists to make impossible.
+
+        Only the ACCEPTED rows survive into the round. The record keeps the
+        full matrix for accept-length forensics; the oracle only ever compares
+        rows that produced a token.
+        """
+        if record.get("mode") != "target_verify":
+            raise ValueError(
+                f"expected a target_verify record, got mode "
+                f"{record.get('mode')!r}"
+            )
+        rows = record["accepted_rows"][request]
+        logits = record["logits"]
+        return cls(
+            logits=torch.stack([logits[r] for r in rows]),
+            # Candidates are carried per surviving row, so the round stays
+            # self-consistent (candidates width == logits rows).
+            candidates=[int(c) for c in record["candidates"][request][: len(rows)]],
+            emitted=[int(t) for t in record["emitted"][request]],
+        )
+
 
 @dataclass
 class SpecRun:
@@ -132,6 +164,30 @@ class SpecRun:
 
     def emitted_tokens(self) -> List[int]:
         return [int(t) for r in self.rounds for t in r.emitted]
+
+    @classmethod
+    def from_dump_records(
+        cls,
+        records: Sequence[dict],
+        seed: int,
+        request: int = 0,
+        label: str = "",
+    ) -> "SpecRun":
+        """Assemble a run from dump records, ORDERED BY THEIR OWN ``step``.
+
+        Never by directory listing or by argument order: the writer names files
+        ``rank{r}_verify{step:07d}.pt`` and a reader that trusts glob order
+        would silently reorder the trajectory on any filesystem that does not
+        sort, which reads as a token flip rather than as a reader bug.
+        """
+        ordered = sorted(records, key=lambda r: int(r["step"]))
+        rounds = [VerifyRound.from_dump_record(r, request=request) for r in ordered]
+        return cls(
+            rounds=rounds,
+            seed=seed,
+            label=label,
+            meta={"steps": [int(r["step"]) for r in ordered], "request": request},
+        )
 
     def to_trajectory(self) -> Trajectory:
         """Project into emitted-token space: one logits row per emitted token.
