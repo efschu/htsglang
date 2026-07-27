@@ -22,7 +22,10 @@ Import this module early (before any ``from_pretrained`` call) to activate
 all patches.  It is safe to import multiple times -- patches are idempotent.
 """
 
+import importlib.abc
+import importlib.util
 import inspect
+import sys
 
 from sglang.srt.utils import logger
 
@@ -183,6 +186,79 @@ def _patch_flash_attn_availability():
         pass
 
 
+_MODELING_LLAMA = "transformers.models.llama.modeling_llama"
+
+
+def _add_llama_flash_attention2_alias(module) -> None:
+    """Alias ``LlamaFlashAttention2`` (removed in v5.4) to ``LlamaAttention``."""
+    if not hasattr(module, "LlamaFlashAttention2") and hasattr(
+        module, "LlamaAttention"
+    ):
+        module.LlamaFlashAttention2 = module.LlamaAttention
+
+
+class _ModelingLlamaAliasFinder(importlib.abc.MetaPathFinder):
+    """Post-import hook: set the ``LlamaFlashAttention2`` alias when
+    ``transformers.models.llama.modeling_llama`` is first imported.
+
+    Importing ``modeling_llama`` eagerly would pull in the transformers
+    quantizer stack; its torchao import runs ``has_triton()`` ->
+    ``torch.cuda.current_device()`` -> ``_lazy_init``, mapping a ~636 MiB
+    CUDA context in every process that merely imports ``sglang`` -- including
+    GPU-passive ones like the tokenizer-manager/HTTP-server parent.
+    The alias is only observable to code that imports
+    ``modeling_llama`` itself, and a ``from ... import LlamaFlashAttention2``
+    resolves the attribute only after the module body has executed, so
+    setting it right after ``exec_module`` is behavior-preserving without
+    the eager import.
+    """
+
+    def __init__(self):
+        self._in_find_spec = False
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname != _MODELING_LLAMA or self._in_find_spec:
+            return None
+        # find_spec() re-enters the meta path (this finder included);
+        # guard against recursing into ourselves.
+        self._in_find_spec = True
+        try:
+            spec = importlib.util.find_spec(fullname)
+        finally:
+            self._in_find_spec = False
+        if spec is None or spec.loader is None:
+            return None
+        spec.loader = _AliasApplyingLoader(spec.loader)
+        return spec
+
+
+class _AliasApplyingLoader(importlib.abc.Loader):
+    """Delegating loader that applies the alias after module execution."""
+
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    def create_module(self, spec):
+        create = getattr(self._wrapped, "create_module", None)
+        return create(spec) if create is not None else None
+
+    def exec_module(self, module):
+        import logging
+
+        # The import triggers a deep chain (modeling_llama -> modeling_utils
+        # -> quantizers -> torchao); torchao emits a noisy warning about
+        # incompatible torch versions that is irrelevant here — suppress it
+        # for the duration of the import.
+        _torchao_logger = logging.getLogger("torchao")
+        _prev_level = _torchao_logger.level
+        _torchao_logger.setLevel(logging.ERROR)
+        try:
+            self._wrapped.exec_module(module)
+        finally:
+            _torchao_logger.setLevel(_prev_level)
+        _add_llama_flash_attention2_alias(module)
+
+
 def _patch_removed_symbols():
     """Re-export symbols removed in transformers v5.4.0.
 
@@ -197,30 +273,12 @@ def _patch_removed_symbols():
 
     TODO(upstream): DeepSeek-OCR / deepseek_vl_v2 remote code needs update.
     """
-    # LlamaFlashAttention2
-    try:
-        import logging
-
-        # Importing modeling_llama triggers a deep import chain:
-        #   modeling_llama -> modeling_utils -> quantizers -> torchao
-        # torchao emits a noisy warning about incompatible torch versions
-        # that is irrelevant here — suppress it during this import.
-        _torchao_logger = logging.getLogger("torchao")
-        _prev_level = _torchao_logger.level
-        _torchao_logger.setLevel(logging.ERROR)
-        try:
-            from transformers.models.llama import modeling_llama
-        finally:
-            _torchao_logger.setLevel(_prev_level)
-
-        if not hasattr(modeling_llama, "LlamaFlashAttention2"):
-            if hasattr(modeling_llama, "LlamaAttention"):
-                modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
-    except ImportError:
-        logger.warning(
-            "Could not import transformers.models.llama.modeling_llama; "
-            "LlamaFlashAttention2 compat patch not applied."
-        )
+    # LlamaFlashAttention2: never import modeling_llama here (see
+    # _ModelingLlamaAliasFinder) -- patch it lazily on first import.
+    if _MODELING_LLAMA in sys.modules:
+        _add_llama_flash_attention2_alias(sys.modules[_MODELING_LLAMA])
+    elif not any(isinstance(f, _ModelingLlamaAliasFinder) for f in sys.meta_path):
+        sys.meta_path.insert(0, _ModelingLlamaAliasFinder())
 
     # is_flash_attn_greater_or_equal_2_10
     try:
