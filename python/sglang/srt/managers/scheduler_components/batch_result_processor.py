@@ -185,8 +185,22 @@ class SchedulerBatchResultProcessor:
         rank. Such a rank runs no lm_head, so result.logits_output is None and
         every logprob / hidden-state dereference must be skipped -- only the
         head rank computes and streams logprobs. Always False on the default
-        path (predicate requires --weightless-kv-fastlane)."""
-        model_runner = getattr(self.model_worker, "model_runner", None)
+        path (predicate requires --weightless-kv-fastlane).
+
+        Under speculative decoding `self.model_worker` is a BaseSpecWorker,
+        which carries no `model_runner` of its own -- the target runner sits
+        behind its `target_worker` property. Reading only `.model_runner` there
+        yields None, the predicate degrades to False, and the weightless worker
+        rank walks into `logits_output.next_token_logprobs` on a None. That is
+        the role flag of the TARGET runner in both cases; the draft runner is
+        deliberately never weightless (see the role assignment in
+        ModelRunner.__init__), so resolving through target_worker is the right
+        object, not merely the reachable one."""
+        model_worker = self.model_worker
+        model_runner = getattr(model_worker, "model_runner", None)
+        if model_runner is None:
+            target_worker = getattr(model_worker, "target_worker", None)
+            model_runner = getattr(target_worker, "model_runner", None)
         return model_runner is not None and getattr(
             model_runner, "is_weightless_worker", False
         )

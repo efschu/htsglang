@@ -30,6 +30,7 @@ into a runtime hang.
 
 import ast
 import pathlib
+import types
 import unittest
 
 from sglang.srt.layers.dcp.lockstep import (
@@ -288,6 +289,95 @@ class TestSourcePins(CustomTestCase):
             "the is_verify early return must come BEFORE the weightless-worker "
             "gloo receive, or every verify step deadlocks the lane",
         )
+
+
+class TestWeightlessWorkerPredicateSurvivesTheSpecWorker(CustomTestCase):
+    """The scheduler-side weightless-worker guard must resolve through a spec worker.
+
+    `SchedulerBatchResultProcessor._is_weightless_worker` decides whether this
+    rank skips every logprob / hidden-state dereference, because a weightless
+    worker has no lm_head and therefore `result.logits_output is None`.
+
+    Without speculation `self.model_worker` is a TpModelWorker and carries
+    `.model_runner` directly. With speculation it is a BaseSpecWorker, which has
+    no `model_runner` attribute at all -- the target runner sits behind its
+    `target_worker` property. A plain `getattr(model_worker, "model_runner")`
+    therefore returns None on EXACTLY the configuration #143 adds, the predicate
+    degrades to False, and the worker rank walks into
+    `logits_output.next_token_logprobs` on a None the moment a request asks for
+    logprobs.
+
+    That is not a hang and not a wrong number: it is an AttributeError that
+    takes the rank down and SIGQUITs the server, and it only fires under
+    `return_logprob`, so a plain generate smoke test misses it entirely. Found
+    on hardware (Llama-3.1-8B TP=2, lane + EAGLE3 solo) at the first probe
+    request; pinned here so the guard cannot silently lose the spec path again.
+    """
+
+    @staticmethod
+    def _predicate(model_worker):
+        from sglang.srt.managers.scheduler_components.batch_result_processor import (
+            SchedulerBatchResultProcessor,
+        )
+
+        stub = types.SimpleNamespace(model_worker=model_worker)
+        return SchedulerBatchResultProcessor._is_weightless_worker(stub)
+
+    def test_plain_tp_worker_weightless_is_true(self):
+        runner = types.SimpleNamespace(is_weightless_worker=True)
+        worker = types.SimpleNamespace(model_runner=runner)
+        self.assertTrue(self._predicate(worker))
+
+    def test_plain_tp_worker_head_is_false(self):
+        runner = types.SimpleNamespace(is_weightless_worker=False)
+        worker = types.SimpleNamespace(model_runner=runner)
+        self.assertFalse(self._predicate(worker))
+
+    def test_spec_worker_resolves_through_target_worker(self):
+        # The regression: no `model_runner` on the spec worker itself.
+        runner = types.SimpleNamespace(is_weightless_worker=True)
+        spec_worker = types.SimpleNamespace(
+            target_worker=types.SimpleNamespace(model_runner=runner)
+        )
+        self.assertFalse(hasattr(spec_worker, "model_runner"))
+        self.assertTrue(
+            self._predicate(spec_worker),
+            "the guard must see the weightless role through a spec worker, or "
+            "the worker rank dereferences logits_output=None under "
+            "return_logprob",
+        )
+
+    def test_spec_worker_on_the_head_rank_is_false(self):
+        runner = types.SimpleNamespace(is_weightless_worker=False)
+        spec_worker = types.SimpleNamespace(
+            target_worker=types.SimpleNamespace(model_runner=runner)
+        )
+        self.assertFalse(self._predicate(spec_worker))
+
+    def test_default_path_worker_without_either_attribute_is_false(self):
+        # No lane, no spec: the predicate must not raise and must stay False.
+        self.assertFalse(self._predicate(types.SimpleNamespace()))
+        self.assertFalse(
+            self._predicate(types.SimpleNamespace(target_worker=None))
+        )
+
+    def test_base_spec_worker_really_has_no_model_runner(self):
+        """The premise of the fix, pinned against the class itself.
+
+        If BaseSpecWorker ever grows a `model_runner` property the fallback
+        becomes dead code -- and, worse, a property returning the DRAFT runner
+        would flip the predicate to False again, since draft runners are
+        deliberately never weightless.
+        """
+        from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+
+        self.assertFalse(
+            hasattr(BaseSpecWorker, "model_runner"),
+            "BaseSpecWorker grew a model_runner attribute; re-check "
+            "SchedulerBatchResultProcessor._is_weightless_worker resolves the "
+            "TARGET runner, not the draft one",
+        )
+        self.assertTrue(hasattr(BaseSpecWorker, "target_worker"))
 
 
 def _function_source(
