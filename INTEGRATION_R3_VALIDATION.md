@@ -3891,7 +3891,7 @@ instrument changes dissolve that reading:
   decoded text. Text only moves when the argmax flips, so it reports a fraction
   of the drift and only on prompts that happen to contain a near-tie.
 
-Probes: `/spinning/r3val/coldwarm_probe.py` (the three-hypothesis
+Probes: `<REPO_PATH>/r3val/coldwarm_probe.py` (the three-hypothesis
 discriminator), `cw_locate.py` (prefill-vs-decode localiser), `cw_bisect.py`
 (length threshold). Launchers `cw_launch.sh` (fork topology) and `cw_stock.sh`
 (no fork flags at all).
@@ -4007,7 +4007,7 @@ and did not land:
   32.6 GB 5090 leaves room for `max_mamba_cache_size=2` against a required
   `mamba_ratio=5`. So "does this survive with zero collectives *for this
   model*" is untested here — a hardware limit, not a result.
-* **The unit-level falsifier did not run.** `/spinning/r3val/gdn_unit.py` calls
+* **The unit-level falsifier did not run.** `<REPO_PATH>/r3val/gdn_unit.py` calls
   `chunk_gated_delta_rule` directly, but the synthetic call convention is wrong
   (NaN output, then an illegal memory access). Its output must NOT be read as
   evidence about the kernel — it is evidence about the harness. Rebuilding it
@@ -4212,7 +4212,7 @@ their scope:
 Arm: Qwen3.6-27B-FP8, TP=3 uneven DCP (`--rank-tp-ratio auto-performance`,
 ownership vector `[6,5,5]`), flashinfer, MTP NEXTN 3/1/4, CUDA graphs ON —
 `dcp_launch.sh b4_fi_mtp`. torch profiler (GPU activities), 40 decode steps,
-all three ranks, single and dual session. Harness: `/spinning/r3val/`
+all three ranks, single and dual session. Harness: `<REPO_PATH>/r3val/`
 (`nccl_lat.py`, `prof_decode.py`, `trace_split.py`, `skew_split.py`,
 `chain_shape.py`, `bench_ab.py`).
 

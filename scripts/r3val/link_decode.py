@@ -19,6 +19,7 @@ Usage: link_decode.py <base_url> <label> [reps] [max_new_tokens]
 """
 
 import json
+import os
 import statistics as st
 import subprocess
 import sys
@@ -31,6 +32,12 @@ LABEL = sys.argv[2]
 REPS = int(sys.argv[3]) if len(sys.argv) > 3 else 3
 NTOK = int(sys.argv[4]) if len(sys.argv) > 4 else 200
 
+# Records land beside this harness unless R3VAL_LOGS points elsewhere.
+LOGS = os.environ.get("R3VAL_LOGS") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "logs"
+)
+os.makedirs(LOGS, exist_ok=True)
+
 PROMPTS = {
     "code": "Write a complete, well-commented Python implementation of a red-black tree "
             "with insert, delete, and search, plus a short explanation of each rebalancing case.",
@@ -40,8 +47,14 @@ PROMPTS = {
              "an annotated Python sketch of the block table, then discuss the trade-offs in prose.",
 }
 
-REMOTE_SMI = ["ssh", "-n", "-i", "/root/.ssh/id_root@proxmox", "-o", "IdentitiesOnly=yes",
-              "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "root@192.168.0.1",
+# Rig 1's ssh key and address come from the environment (source your local rig
+# env file); the fallbacks are placeholders so an unsourced run fails at ssh
+# instead of probing some other machine.
+RIG1_KEY = os.environ.get("RIG1_KEY", "<RIG1_SSH_KEY>")
+RIG1_HOST = os.environ.get("RIG1_HOST", "<RIG1_IP>")
+
+REMOTE_SMI = ["ssh", "-n", "-i", RIG1_KEY, "-o", "IdentitiesOnly=yes",
+              "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", f"root@{RIG1_HOST}",
               "nvidia-smi --query-gpu=index,clocks.sm,temperature.gpu,"
               "clocks_throttle_reasons.active --format=csv,noheader,nounits"]
 
@@ -140,7 +153,7 @@ for cls, p in PROMPTS.items():
         print(f"{cls:6s}  -> median {st.median(rates):.2f} tok/s "
               f"(n={len(rates)}, sd={out['classes'][cls]['sd']:.2f})", flush=True)
 
-path = f"/spinning/r3val/logs/link_{LABEL}.json"
+path = os.path.join(LOGS, f"link_{LABEL}.json")
 with open(path, "w") as f:
     json.dump(out, f, indent=1)
 print(f"\nraw -> {path}")

@@ -8,10 +8,10 @@ comparing).
 Bar to clear: **> 5 % decode, single AND dual session**, without quality loss
 and without max-KV falling more than 10 %.
 
-Harness: `/spinning/r3val/noise_floor.py` (per-block driver, also used per
-arm), `/spinning/r3val/arm_measure.sh` (per-arm protocol),
-`/spinning/r3val/cmp_arms.py` (two-arm comparison with detection limit).
-Raw per-block records: `/spinning/r3val/logs/nf_*.jsonl` (appended
+Harness: `<REPO_PATH>/r3val/noise_floor.py` (per-block driver, also used per
+arm), `<REPO_PATH>/r3val/arm_measure.sh` (per-arm protocol),
+`<REPO_PATH>/r3val/cmp_arms.py` (two-arm comparison with detection limit).
+Raw per-block records: `<REPO_PATH>/r3val/logs/nf_*.jsonl` (appended
 incrementally, so a killed run keeps its points).
 
 ---
@@ -322,8 +322,8 @@ speculation/split axis.**
 Vehicle: Llama-3.1-8B fp16, cross-rig TP=4 (nnodes=4, one rank per node):
 rank 0 = 5090, ranks 1/2 = 3080, rank 3 = 2080 Ti on the second rig. ctx 4096,
 triton attention, no CUDA graph, no speculation (identical on every arm, so
-the transport is the only variable). Raw: `/spinning/r3val/logs/link_*.json`,
-`/spinning/r3val/logs/lat_*.json`.
+the transport is the only variable). Raw: `<REPO_PATH>/r3val/logs/link_*.json`,
+`<REPO_PATH>/r3val/logs/lat_*.json`.
 
 **Decode rate is measured by streaming**, as `(n-1)/(t_last - t_first)`. This
 was deliberate: the earlier L0 e2e-slope numbers are invalid because a

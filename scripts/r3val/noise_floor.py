@@ -39,6 +39,13 @@ NBLOCKS = int(sys.argv[3])
 CLS = sys.argv[4] if len(sys.argv) > 4 else "code"
 BASE = f"http://127.0.0.1:{PORT}"
 
+# Records land beside this harness unless R3VAL_LOGS points elsewhere; no
+# machine-specific path is baked in.
+LOGS = os.environ.get("R3VAL_LOGS") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "logs"
+)
+os.makedirs(LOGS, exist_ok=True)
+
 N_SHORT = int(os.environ.get("NF_SHORT", "200"))
 N_LONG = int(os.environ.get("NF_LONG", "1000"))
 
@@ -170,7 +177,7 @@ for b in range(NBLOCKS):
            "t_rel": round(t0 - T0, 1), "thermal": w}
     blocks.append(rec)
     # append incrementally: a killed run must never lose its collected points
-    with open(f"/spinning/r3val/logs/nf_{LABEL}.jsonl", "a") as fh:
+    with open(os.path.join(LOGS, f"nf_{LABEL}.jsonl"), "a") as fh:
         fh.write(json.dumps(rec) + "\n")
     print(f"{b:3d} {rate:8.2f} {a2:7.3f} {n2:6d} {h:>8} "
           + " ".join(f"{w[f'gpu{i}']['sm_mhz_mean']:6.0f} {w[f'gpu{i}']['temp_mean']:4.0f}"
@@ -179,7 +186,7 @@ for b in range(NBLOCKS):
 
 out = {"label": LABEL, "cls": CLS, "n_short": N_SHORT, "n_long": N_LONG,
        "blocks": blocks}
-path = f"/spinning/r3val/logs/nf_{LABEL}.json"
+path = os.path.join(LOGS, f"nf_{LABEL}.json")
 with open(path, "w") as f:
     json.dump(out, f, indent=1)
 

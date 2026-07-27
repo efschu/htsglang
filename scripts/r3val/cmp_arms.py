@@ -19,13 +19,18 @@ Usage: cmp_arms.py <tagA> <tagB> [mode] [classes]
 
 import glob
 import json
+import os
 import statistics as st
 import sys
 
 A, B = sys.argv[1], sys.argv[2]
 MODE = sys.argv[3] if len(sys.argv) > 3 else "single"
 CLASSES = (sys.argv[4] if len(sys.argv) > 4 else "code,prosa,misch").split(",")
-LOGS = "/spinning/r3val/logs"
+# Records are read from beside this harness unless R3VAL_LOGS points elsewhere;
+# no machine-specific path is baked in.
+LOGS = os.environ.get("R3VAL_LOGS") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "logs"
+)
 
 
 def load(tag, mode, cls):

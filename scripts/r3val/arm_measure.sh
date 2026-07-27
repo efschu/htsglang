@@ -13,13 +13,17 @@
 #     not hardware, dominates the residual end-to-end scatter.
 #
 # Usage: arm_measure.sh <tag> <port> [blocks_single] [blocks_dual]
+#
+# VENV comes from the environment (source your local rig env file); its
+# fallback is a placeholder, so an unsourced run fails on a visibly bogus
+# interpreter path instead of using somebody else's.
 set -u
 TAG="$1"
 PORT="${2:-30000}"
 NB="${3:-6}"
 ND="${4:-4}"
-PY=/spinning/htsglang-gpu/.venv/bin/python
-cd /spinning/r3val || exit 1
+PY="${VENV:-<VENV>}/bin/python"
+cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 
 echo "=== arm $TAG: capacity line ==="
 curl -s "http://127.0.0.1:$PORT/get_server_info" \

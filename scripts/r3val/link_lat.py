@@ -11,8 +11,8 @@ operations at the SAME sizes through each transport so the comparison is real.
 
 Three configurations, which separate the software stack from the wire:
 
-  gloo-1g    torch.distributed gloo over the 1 GbE LAN   (192.168.0.x)
-  gloo-roce  torch.distributed gloo over the RoCE NIC's IP (10.10.10.x, TCP)
+  gloo-1g    torch.distributed gloo over the 1 GbE LAN   (<RIG_LAN>.x)
+  gloo-roce  torch.distributed gloo over the RoCE NIC's IP (<RDMA_NET>.x, TCP)
   ucx        HTCCL/UCX native RDMA over the same RoCE NIC
 
 gloo-1g vs ucx is the deployment question ("how much does RDMA buy").
