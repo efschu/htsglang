@@ -35,7 +35,9 @@ Concentration is bounded by the decode-knee guard: no rank's share of the
 streamed weight bytes may exceed its share of the rig's EFFECTIVE decode
 bandwidth (measured M23: beyond that knee decode regresses (-4.8% at 16,1,2)
 while prefill gains saturate at the knee-exact C6 level). Effective is not
-probed peak -- see ``_PREDICT_DECODE_BW_COMPRESSION``. Every candidate also
+streaming peak: it is the probe's decode-shaped GEMV rate, with a residual
+exponent for the part a dense probe cannot see -- see
+``PerfCostModel.decode_bw_basis``. Every candidate also
 carries a predicted decode-step delta in the log, accepted or rejected: the
 guard is a model, and a reader has to be able to disagree with it.
 
@@ -73,7 +75,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-PROFILE_VERSION = 1
+#: 2: per-GPU membw_read_gbs / membw_copy_gbs / membw_gemv_gbs added. Cached
+#: v1 profiles carry no GEMV rate, so they re-probe rather than silently fall
+#: back to the streaming peak as the decode divisor.
+PROFILE_VERSION = 2
 PROFILE_CACHE_DIR = os.path.expanduser("~/.cache/sglang")
 
 #: Probe shapes (model-relevant): GEMM = one chunked-prefill MLP matmul
@@ -142,42 +147,107 @@ _PREDICT_KNEE_COARSE_UNITS = 256
 #: overshoot. Calibrated on the M27d rig (5090 + 2x3080, membw share 51.9%):
 #: this rejects the FP8 4,1,1 knee overshoot (picking the 3,1,1 class) while
 #: the fine AWQ 544-unit grid is unaffected and keeps its measured-win 5,1,1.
+#:
+#: What this stands in for, and what would replace it. The guard compares
+#: WHOLE-MODEL streamed-byte shares, i.e. it models the decode round as
+#: max_r(total bytes_r / bw_r). A TP decode step does not work that way: it
+#: all-reduces after every mixer block and every MLP block, so the round time
+#: is the SUM over sync points of the per-sync MAX, and the two are only equal
+#: when the same rank is the bottleneck everywhere. They are not equal here --
+#: attention/GDN follow the base plan while the MLP follows the candidate
+#: vector -- and max-of-sums is the smaller of the two, which is why the guard
+#: needs a hand-set margin to catch what it structurally understates. Summing
+#: per-sync maxima instead is parameter-free and moves the three #216
+#: predictions from -7.7/-5.8/-1.8 to +1.1/+4.3/+8.3 against measured
+#: +6.0/+13.4/+15.5, i.e. it fixes the SIGN with no exponent at all. It is not
+#: adopted here: it is a second change to the same model, it needs its own
+#: campaign (per-block testing rejects 3,1,1 too, which does cost +6.0 %), and
+#: bundling it would leave neither change with clean evidence.
 _PREDICT_KNEE_COARSE_HEADROOM_UNITS = 2
-#: Exponent that turns a rank's PROBED PEAK memory bandwidth into the
-#: bandwidth it actually reaches while streaming its weight shard at batch
-#: size 1: ``bw_effective ~ bw_peak ** BETA``.
+#: The decode roofline's divisor is a rank's ACHIEVED weight-read bandwidth,
+#: not the card's streaming peak. A card 2.32x faster on a streaming benchmark
+#: is not 2.32x faster at pulling a weight shard through the GEMV kernels a
+#: bs=1 decode step is made of, and on a mixed rig the two fractions do not
+#: cancel: the measured decode advantage of the 5090 over a 3080 here is
+#: 1.70x. Reading the peak ratio as an achieved ratio puts the ceiling for the
+#: fast rank far too high, and the guard then waves through exactly the
+#: concentration that makes that rank the lockstep pacer.
 #:
-#: BETA = 1 is the identity, and the identity is what this guard shipped
-#: with -- the assumption that a card 2.3x faster on a streaming benchmark is
-#: also 2.3x faster at pulling a quantized weight shard through the many
-#: small GEMV kernels a bs=1 decode step is made of. It is not. Achieved
-#: bandwidth is a fraction of peak that differs per architecture and per
-#: quantization lane, and on a mixed rig those fractions do not cancel: the
-#: measured decode advantage of the 5090 over a 3080 here is 1.70x where the
-#: probe reports 2.32x. Reading the peak ratio as an achieved ratio puts the
-#: ceiling for the fast rank far too high, and the guard then waves through
-#: exactly the concentration that makes that rank the lockstep pacer.
+#: Two things supply the correction, in this order:
 #:
+#:  1. MEASUREMENT. The probe's decode-shaped GEMV reads the same buffer the
+#:     streaming kernels read, and reaches less: 1532 vs 1663 GB/s on the
+#:     5090, 717.4 vs 717.8 on the 3080 -- the fast card gives up 8 % of its
+#:     stream to the GEMV, the slow card gives up nothing. Ratio 2.32 -> 2.14.
+#:     That is a third of the way (26 % in log terms) to the measured 1.70,
+#:     and it costs no constant: it is read off the rig.
+#:  2. The residual exponent below, for the rest.
+#:
+#: Exponent applied to the achieved GEMV rate: ``bw_eff ~ bw_gemv ** BETA``.
 #: Fitted (task #216 follow-up) on ms per SPECULATIVE STEP over four MLP
 #: vectors, interleaved cold boots, KV ownership vector pinned, radix cache
 #: defeated on the prefill axis: base [63,37,36] 30.10 ms, 3,1,1 31.90,
 #: 4,1,1 34.12, 6,1,1 34.76 -- rms 0.38 ms, boot-to-boot floor 0.6-0.8 %.
-#: The shipped BETA = 1 predicted -10 to -15 % for those same vectors where
-#: +6 to +16 % was measured; at BETA = 0.63 the sign is right and the
-#: magnitude lands within ~2 points.
+#: BETA = 1 predicts -8 to -2 % for those vectors where +6 to +16 % was
+#: measured; at 0.70 the three predictions land at +7.2 / +11.3 / +16.3
+#: against measured +6.0 / +13.4 / +15.5 (rms 1.5 points).
+#:
+#: What the residual IS. The probe reads dense bf16; a decode step reads
+#: QUANTIZED weights through dequantising kernels -- native FP8 on sm_120,
+#: Marlin upconvert on sm_86, MMVQ for GGUF -- and those lanes do not sit at
+#: the same fraction of DRAM peak as a dense read. A dense probe cannot
+#: measure that, and a synthetic stand-in does not help: at per-layer
+#: granularity the same measurement swings 1.98..2.58 on the row count alone
+#: (see _bench_membw_rates), which is the size of the effect being chased.
+#: Closing this the rest of the way means timing the ACTUAL quantized kernels
+#: per lane, which is a per-lane, per-checkpoint measurement, not a constant.
 #:
 #: Sample width: ONE rig (5090 + 2x 3080, PCIe, no P2P) and one checkpoint
 #: family (FP8 dense, sm_120 native lane against sm_86 Marlin upconvert).
-#: The direction -- achieved ratios are compressed relative to peak ratios --
+#: The direction -- achieved ratios are compressed relative to probed ones --
 #: is general; this particular value is not claimed to be.
+_PREDICT_DECODE_GEMV_RESIDUAL = 0.70
+#: FALLBACK exponent, applied to the STREAMING peak when no usable GEMV rate
+#: is available (profile from before PROFILE_VERSION 2, or the saturation
+#: check below rejecting the measurement). Same fit, same three points, same
+#: caveat -- but it starts from a divisor that has measured none of the
+#: compression, so it has to supply all of it. Its existence is why the
+#: fallback is NAMED and logged rather than taken silently: 0.63 and 0.70 are
+#: not interchangeable, they belong to different divisors.
 _PREDICT_DECODE_BW_COMPRESSION = 0.63
+#: Saturation floor for the GEMV probe, as a fraction of the same card's
+#: streaming rate. Below this the GEMV is not bandwidth-bound at all (a
+#: kernel that fell back to something pathological on an architecture we have
+#: not seen), and its rate says nothing about weight streaming. Measured
+#: here: 0.92 on the 5090, 1.00 on the 3080 -- so the floor is set where only
+#: a broken kernel can reach it, NOT where a legitimately slower decode lane
+#: would. A guard that fires on a real measurement would put us back where
+#: the max() was.
+_PROBE_GEMV_SATURATION_FLOOR = 0.25
+#: Ceiling, likewise as a fraction of the streaming rate: a GEMV that reads
+#: FASTER than a pure stream is being served from cache, not DRAM, and is not
+#: a bandwidth measurement either. Not hypothetical -- a 64 MiB matrix is L2
+#: -resident on a 5090 (96 MiB L2) and reads at 2.2 TB/s, past its own DRAM
+#: peak. The 1.34 GB probe matrix is far past any L2 on any card we know of,
+#: so this is a guard against future probe shapes and unfamiliar cards.
+_PROBE_GEMV_CACHE_CEILING = 1.05
 #: Fraction of a bs=1 decode step that is NOT weight streaming (attention
 #: over the KV, the speculative draft and verify passes, collectives, kernel
 #: launch). The weight-term ratio alone overstates the step-time delta,
 #: because this part of the step does not move when the MLP split does;
 #: folding it in is what takes the reported cost from "the right sign" to
-#: "within ~2 points of measured". Same fit and same sample-width caveat as
-#: the compression exponent above.
+#: "within ~2 points of measured".
+#:
+#: Not independently fitted: on three measurement points this value and the
+#: exponent above trade off along a valley (rms stays within 1.6-2.0 points
+#: over f=0.00/BETA=0.75 through f=0.30/BETA=0.70), so the data pin their
+#: combination, not either one. Separating them does not need a wider
+#: campaign, it needs a DIRECT measurement: profile one decode step and split
+#: device time between weight-reading kernels and everything else. Then f is
+#: read off, and the exponent is what the step times alone determine. Note it
+#: is not a constant even in principle -- attention time grows with context --
+#: though the #216 pair at ctx 400 vs 12000 moved the 6,1,1 cost only from
+#: +16.7 % to +16.4 %, so over that range it is nearly flat.
 _PREDICT_DECODE_NONWEIGHT_FRACTION = 0.28
 #: TP-degree recommendation: a GPU whose best pairwise link is below this
 #: fraction of the rig's best link is called out as a drop candidate.
@@ -282,17 +352,48 @@ def _time_best_gbs(dev, fn, moved_bytes: float, iters: int = 40) -> float:
     return moved_bytes / 1e9 / (best_ms / 1e3)
 
 
-def _bench_membw_gbs(dev) -> float:
-    """MEASURED effective device memory bandwidth (GB/s) — a genuine
-    bandwidth-bound probe, NOT a nameplate spec. Runs three kernels whose
-    working sets sit well past L2 (a read-only reduction, a copy, and the decode
-    -shaped GEMV weight read) and returns the BEST effective GB/s achieved. The
-    GEMV is what a bs=1 decode actually does (stream the weights once), so this
-    number is the right divisor for the decode roofline; the reduction/copy
-    guard against a GEMV kernel that fails to saturate on some arch. Effective
-    bandwidth lands BELOW the nameplate peak (measured ~1.56 TB/s on a 5090 vs
-    ~1.79 nameplate, ~0.72 TB/s on a 3080 vs ~0.76) — expected, and exactly why
-    the roofline prefers this probe over the reference table for cards on-box."""
+@dataclasses.dataclass
+class MembwRates:
+    """The three rates the memory-bandwidth probe measures, kept APART.
+
+    ``read_gbs`` / ``copy_gbs`` are streaming kernels: they establish what the
+    card's DRAM path can do when nothing else limits it. ``gemv_gbs`` is the
+    decode-shaped weight read -- one matrix pulled through once against a
+    single activation vector, which is what a bs=1 decode step does to every
+    weight tensor it touches. The three answer different questions, so they
+    are reported separately; collapsing them to a maximum returns the largest,
+    which is the streaming peak on every card measured here, and the decode
+    number is then lost precisely where it was supposed to be used."""
+
+    read_gbs: float
+    copy_gbs: float
+    gemv_gbs: float
+
+    @property
+    def streaming_peak_gbs(self) -> float:
+        """Best rate a pure stream reaches -- the card's bandwidth score."""
+        return max(self.read_gbs, self.copy_gbs)
+
+
+def _bench_membw_rates(dev) -> MembwRates:
+    """MEASURED device memory bandwidth (GB/s), per kernel — a genuine
+    bandwidth-bound probe, NOT a nameplate spec. Three kernels over a working
+    set well past L2: a read-only reduction, a copy, and the decode-shaped
+    GEMV weight read.
+
+    Measured rates land BELOW the nameplate peak (~1.66 TB/s streaming on a
+    5090 vs ~1.79 nameplate, ~0.72 TB/s on a 3080 vs ~0.76) — expected, and
+    exactly why the roofline prefers this probe over the reference table for
+    cards on-box.
+
+    Shape stability (measured on the reference rig, sweeping the GEMV row
+    count over 98304..163840 at fixed K): each rate repeats to within 0.3 %,
+    and the 5090:3080 GEMV ratio stays in 2.131..2.145. The size matters: at
+    per-layer granularity (~32 MiB matrices) the same measurement swings
+    1.98..2.58 depending on how the row count happens to divide, and a 64 MiB
+    matrix is L2-resident on a 5090 and reads at 2.2 TB/s, past its own DRAM
+    peak. One large matrix is the shape that measures DRAM rather than kernel
+    tiling luck, which is why the probe uses it."""
     import torch
 
     n = _PROBE_GEMV_ROWS * _PROBE_GEMV_K  # ~0.67 G elems -> ~1.34 GB bf16
@@ -301,14 +402,29 @@ def _bench_membw_gbs(dev) -> float:
     x = torch.randn(1, _PROBE_GEMV_K, dtype=torch.bfloat16, device=dev)
     w = a.view(_PROBE_GEMV_ROWS, _PROBE_GEMV_K)
     nbytes = n * 2
-    best = max(
-        _time_best_gbs(dev, lambda: a.sum(), nbytes),          # read-only
-        _time_best_gbs(dev, lambda: b.copy_(a), nbytes * 2),   # read + write
-        _time_best_gbs(dev, lambda: torch.nn.functional.linear(x, w), nbytes),  # decode GEMV
+    # Tensors bound as defaults, not captured: the buffers are freed below,
+    # and a late-binding closure over a deleted name is only ever a trap.
+    rates = MembwRates(
+        read_gbs=_time_best_gbs(dev, lambda a=a: a.sum(), nbytes),
+        copy_gbs=_time_best_gbs(dev, lambda a=a, b=b: b.copy_(a), nbytes * 2),
+        gemv_gbs=_time_best_gbs(
+            dev,
+            lambda x=x, w=w: torch.nn.functional.linear(x, w),
+            nbytes,
+        ),
     )
     del a, b, x, w
     torch.cuda.empty_cache()
-    return best
+    return rates
+
+
+def _bench_membw_gbs(dev) -> float:
+    """The card's STREAMING bandwidth score (GB/s) — ``_bench_membw_rates``
+    reduced to the one number the bandwidth-score consumers want (the vocab /
+    KV-speed weighting, the power calibration's decode-relevant active load).
+    The decode roofline does NOT use this; it uses the GEMV rate, see
+    ``PerfCostModel.decode_bw_basis``."""
+    return _bench_membw_rates(dev).streaming_peak_gbs
 
 
 def _link_worker(rank: int, world: int, results) -> None:
@@ -375,13 +491,21 @@ def run_probe(out_path: str) -> dict:
         dev = torch.device(f"cuda:{g['cuda_index']}")
         torch.cuda.set_device(dev)
         gemm = _bench_gemm_tflops(dev)
-        membw = _bench_membw_gbs(dev)
+        rates = _bench_membw_rates(dev)
         per_gpu[g["uuid"]] = {
             "name": g["name"],
             "cuda_index": g["cuda_index"],
             "total_mib": g["total_mib"],
             "gemm_tflops": round(gemm, 2),
-            "membw_gbs": round(membw, 1),
+            # Unchanged meaning and unchanged consumers: the card's streaming
+            # bandwidth score.
+            "membw_gbs": round(rates.streaming_peak_gbs, 1),
+            # The three rates kept apart. membw_gemv_gbs is the decode
+            # roofline's divisor; the other two are what it is judged against
+            # (see _PROBE_GEMV_SATURATION_FLOOR / _PROBE_GEMV_CACHE_CEILING).
+            "membw_read_gbs": round(rates.read_gbs, 1),
+            "membw_copy_gbs": round(rates.copy_gbs, 1),
+            "membw_gemv_gbs": round(rates.gemv_gbs, 1),
         }
 
     links: Dict[str, dict] = {}
@@ -2152,31 +2276,94 @@ class PerfCostModel:
             return 0.0
         return (self.families["mlp"].bytes / self.mlp_units) / total_streamed
 
-    def effective_decode_bw(self, membw_gbs: List[float]) -> List[float]:
-        """Per-rank bandwidth actually reached while streaming a weight shard
-        at batch size 1, from the probed streaming peak.
+    def decode_bw_basis(
+        self,
+        membw_gbs: Sequence[float],
+        gemv_gbs: Optional[Sequence[float]] = None,
+    ) -> Tuple[List[float], float, str]:
+        """Pick the divisor for the decode roofline, and SAY which one.
 
-        The probe measures a large contiguous stream; a decode step is many
-        small quantized GEMVs, which reach a per-architecture fraction of
-        that. On a mixed rig the fractions differ, so the peak ratio is not
-        the achieved ratio and cannot be used as one -- see
-        ``_PREDICT_DECODE_BW_COMPRESSION`` for the measurement. Returned in
-        arbitrary units: only ratios between ranks are ever consumed."""
-        beta = _PREDICT_DECODE_BW_COMPRESSION
-        return [max(float(b), 1e-9) ** beta for b in membw_gbs]
+        Returns ``(rates, exponent, basis)``. The preferred basis is the
+        probe's decode-shaped GEMV rate: it is measured on this rig and
+        already carries part of the compression between a card's streaming
+        peak and what it reaches reading weights (see
+        ``_PREDICT_DECODE_GEMV_RESIDUAL``). Falling back to the streaming peak
+        is a real loss of information, so every reason to fall back is a
+        named, reported condition -- never a silent max().
+
+        Fallback conditions, per rank:
+          * no GEMV rate at all (profile predates PROFILE_VERSION 2);
+          * GEMV below ``_PROBE_GEMV_SATURATION_FLOOR`` of the streaming
+            rate -- not bandwidth-bound, so it measures something else;
+          * GEMV above ``_PROBE_GEMV_CACHE_CEILING`` of it -- served from
+            cache, so it measures something else.
+        A single unusable rank falls the whole rig back, because the roofline
+        consumes RATIOS between ranks: mixing a GEMV rate on one rank with a
+        streaming rate on another would compare two different quantities."""
+        peak = [max(float(b), 1e-9) for b in membw_gbs]
+        if gemv_gbs is None or len(gemv_gbs) != len(peak):
+            return (
+                peak,
+                _PREDICT_DECODE_BW_COMPRESSION,
+                "streaming peak (no GEMV rate in the hardware profile; "
+                "re-probe with SGLANG_PERF_REPROBE=1 to measure it)",
+            )
+        gemv = [float(g or 0.0) for g in gemv_gbs]
+        for r, (g, p) in enumerate(zip(gemv, peak)):
+            frac = g / p
+            if frac < _PROBE_GEMV_SATURATION_FLOOR:
+                return (
+                    peak,
+                    _PREDICT_DECODE_BW_COMPRESSION,
+                    f"streaming peak (rank {r}: GEMV {g:.0f} GB/s is "
+                    f"{frac * 100:.0f} % of its streaming {p:.0f} GB/s, below "
+                    f"the {_PROBE_GEMV_SATURATION_FLOOR * 100:.0f} % "
+                    f"saturation floor -- the probe is not bandwidth-bound on "
+                    f"this architecture and its rate is not a weight-read "
+                    f"rate)",
+                )
+            if frac > _PROBE_GEMV_CACHE_CEILING:
+                return (
+                    peak,
+                    _PREDICT_DECODE_BW_COMPRESSION,
+                    f"streaming peak (rank {r}: GEMV {g:.0f} GB/s exceeds its "
+                    f"streaming {p:.0f} GB/s, so it is reading from cache "
+                    f"rather than DRAM and is not a weight-read rate)",
+                )
+        return gemv, _PREDICT_DECODE_GEMV_RESIDUAL, "measured decode GEMV rate"
+
+    def effective_decode_bw(
+        self,
+        membw_gbs: Sequence[float],
+        gemv_gbs: Optional[Sequence[float]] = None,
+    ) -> List[float]:
+        """Per-rank bandwidth actually reached while streaming a weight shard
+        at batch size 1.
+
+        Divisor and exponent come from ``decode_bw_basis``; the exponent
+        supplies only what the probe could not measure. Returned in arbitrary
+        units: only ratios between ranks are ever consumed."""
+        rates, beta, _ = self.decode_bw_basis(membw_gbs, gemv_gbs)
+        return [max(float(b), 1e-9) ** beta for b in rates]
 
     def decode_round_time(
-        self, mlp_vector: List[int], membw_gbs: List[float]
+        self,
+        mlp_vector: List[int],
+        membw_gbs: Sequence[float],
+        gemv_gbs: Optional[Sequence[float]] = None,
     ) -> float:
         """Relative bs=1 decode round time: the lockstep max over ranks of
         (streamed weight bytes / effective bandwidth). Only ratios between
         candidates are consumed."""
-        bw = self.effective_decode_bw(membw_gbs)
+        bw = self.effective_decode_bw(membw_gbs, gemv_gbs)
         streamed = self.streamed_bytes(list(mlp_vector))
         return max(s / b for s, b in zip(streamed, bw))
 
     def decode_cost_percent(
-        self, mlp_vector: List[int], membw_gbs: List[float]
+        self,
+        mlp_vector: List[int],
+        membw_gbs: Sequence[float],
+        gemv_gbs: Optional[Sequence[float]] = None,
     ) -> float:
         """Predicted change of the bs=1 decode STEP time against the base
         plan, in percent. Positive = the candidate makes decode slower.
@@ -2191,18 +2378,19 @@ class PerfCostModel:
         is held at ``_PREDICT_DECODE_NONWEIGHT_FRACTION`` of the base step so
         the percentage refers to the step a user actually waits for rather
         than to the weight term alone."""
-        base = self.decode_round_time(self.base_plan, membw_gbs)
+        base = self.decode_round_time(self.base_plan, membw_gbs, gemv_gbs)
         if base <= 0:
             return 0.0
-        ratio = self.decode_round_time(mlp_vector, membw_gbs) / base
+        ratio = self.decode_round_time(mlp_vector, membw_gbs, gemv_gbs) / base
         f = _PREDICT_DECODE_NONWEIGHT_FRACTION
         return (f + (1.0 - f) * ratio - 1.0) * 100.0
 
     def decode_knee_ok(
         self,
         mlp_vector: List[int],
-        membw_gbs: List[float],
+        membw_gbs: Sequence[float],
         tol: float = _PREDICT_DECODE_KNEE_TOL,
+        gemv_gbs: Optional[Sequence[float]] = None,
     ) -> bool:
         """Decode-knee guard (M20/M22/M23/#216-measured): decode throughput is
         FLAT while every rank's share of the streamed weight bytes stays at
@@ -2215,7 +2403,10 @@ class PerfCostModel:
         Effective, not probed peak. The two differ by an architecture- and
         quant-dependent factor that does not cancel across a mixed rig, and
         taking peak for achieved is what let 6,1,1 through at a measured
-        +16.5 % decode cost -- see ``_PREDICT_DECODE_BW_COMPRESSION``.
+        +16.5 % decode cost. The effective rate is built from the probe's
+        decode-shaped GEMV where it is usable and from the streaming peak
+        otherwise -- see ``decode_bw_basis``, which names which of the two it
+        used and why.
 
         The per-rank share is computed from the ACTUAL integer unit partition
         (``mlp_unit_partition`` via ``streamed_bytes``), never from the wish
@@ -2229,11 +2420,14 @@ class PerfCostModel:
         the knee and round DOWN to the last safe vector; fine grids keep the
         exact bandwidth-share ceiling. A rank that only sheds/keeps bytes vs
         the base plan can never become the knee and is skipped."""
-        ok, _ = self.decode_knee_detail(mlp_vector, membw_gbs)
+        ok, _ = self.decode_knee_detail(mlp_vector, membw_gbs, gemv_gbs)
         return ok
 
     def decode_knee_detail(
-        self, mlp_vector: List[int], membw_gbs: List[float]
+        self,
+        mlp_vector: List[int],
+        membw_gbs: Sequence[float],
+        gemv_gbs: Optional[Sequence[float]] = None,
     ) -> Tuple[bool, Optional[str]]:
         """Like ``decode_knee_ok`` but also returns a human-readable reason
         for the first violating rank, naming the unit granularity (for the
@@ -2243,8 +2437,8 @@ class PerfCostModel:
         total = sum(cand)
         # EFFECTIVE, not peak: the ceiling has to be the bandwidth a rank
         # really reaches on this workload, or it certifies concentration the
-        # rank cannot absorb (see _PREDICT_DECODE_BW_COMPRESSION).
-        bw_eff = self.effective_decode_bw(membw_gbs)
+        # rank cannot absorb (see decode_bw_basis).
+        bw_eff = self.effective_decode_bw(membw_gbs, gemv_gbs)
         bw_total = sum(bw_eff)
         coarse = self.mlp_units < _PREDICT_KNEE_COARSE_UNITS
         unit_share = self._mlp_unit_share(total)
@@ -2275,7 +2469,7 @@ class PerfCostModel:
                     f"{membw_share * 100:.1f}% (peak share "
                     f"{membw_gbs[r] / max(sum(membw_gbs), 1e-9) * 100:.1f}%, "
                     f"safe ceiling {limit * 100:.1f}%); predicted decode step "
-                    f"{self.decode_cost_percent(mlp_vector, membw_gbs):+.1f}%"
+                    f"{self.decode_cost_percent(mlp_vector, membw_gbs, gemv_gbs):+.1f}%"
                 )
                 return False, reason
         return True, None
@@ -2547,6 +2741,10 @@ def apply_auto_performance(server_args) -> None:
     uuid_by_idx = {g["cuda_index"]: g["uuid"] for g in gpus}
     rank_scores_gemm: List[float] = []
     rank_scores_bw: List[float] = []
+    # Decode-shaped GEMV rate per rank, or None if ANY rank's profile entry
+    # lacks it (a v1 cache alongside a v2 one cannot happen -- the version is
+    # part of the cache key -- but a hand-edited profile can).
+    rank_scores_gemv: Optional[List[float]] = []
     rank_names: List[str] = []
     for gid in server_args.rank_gpu_id:
         entry = profile["gpus"].get(uuid_by_idx.get(gid, ""), None)
@@ -2558,12 +2756,22 @@ def apply_auto_performance(server_args) -> None:
             return
         rank_scores_gemm.append(entry["gemm_tflops"])
         rank_scores_bw.append(entry["membw_gbs"])
+        gemv = entry.get("membw_gemv_gbs")
+        if gemv is None:
+            rank_scores_gemv = None
+        elif rank_scores_gemv is not None:
+            rank_scores_gemv.append(float(gemv))
         rank_names.append(entry["name"])
     for r in range(server_args.tp_size):
+        gemv_txt = (
+            f", decode GEMV {rank_scores_gemv[r]:.0f} GB/s"
+            if rank_scores_gemv is not None
+            else ""
+        )
         lines.append(
             f"rank {r} -> GPU {server_args.rank_gpu_id[r]} ({rank_names[r]}): "
             f"GEMM {rank_scores_gemm[r]:.1f} TFLOPS, "
-            f"membw {rank_scores_bw[r]:.0f} GB/s"
+            f"membw {rank_scores_bw[r]:.0f} GB/s{gemv_txt}"
         )
     links = profile.get("links") or {}
     pair_bws = [v["p2p_gbs"] for k, v in links.items() if k != "__group__"]
@@ -2596,6 +2804,25 @@ def apply_auto_performance(server_args) -> None:
         measured=(registry or {}).get("components"),
         measured_mlp_vector=(registry or {}).get("mlp_vector"),
     )
+    # Which bandwidth the decode roofline divides by, stated once. The GEMV
+    # rate is the informative one; every fall back to the streaming peak is
+    # reported with its reason, because the two carry different exponents and
+    # a silent swap between them is not a detail (see decode_bw_basis).
+    _bw_rates, _bw_beta, _bw_basis = model.decode_bw_basis(
+        rank_scores_bw, rank_scores_gemv
+    )
+    _bw_eff = model.effective_decode_bw(rank_scores_bw, rank_scores_gemv)
+    _bw_eff_total = sum(_bw_eff) or 1.0
+    lines.append(
+        f"decode roofline divisor: {_bw_basis} "
+        f"{[round(x, 1) for x in _bw_rates]} GB/s, residual exponent "
+        f"{_bw_beta:g} -> effective bandwidth shares "
+        + ", ".join(
+            f"rank {r} {x / _bw_eff_total * 100:.1f}%"
+            for r, x in enumerate(_bw_eff)
+        )
+    )
+
     base_pred = model.predict_capacity(base_plan)
     floor = (1.0 - loose / 100.0) * base_pred["ctx"]
     lines.append(
@@ -2697,9 +2924,11 @@ def apply_auto_performance(server_args) -> None:
             # Decode round-time delta vs base. Built on EFFECTIVE bandwidth:
             # the same expression over PROBED PEAK bandwidth reported -22 %
             # for a vector that measured +16.5 % (task #216).
-            dec_delta = model.decode_cost_percent(list(cand), rank_scores_bw)
+            dec_delta = model.decode_cost_percent(
+                list(cand), rank_scores_bw, rank_scores_gemv
+            )
             knee_ok, knee_reason = model.decode_knee_detail(
-                list(cand), rank_scores_bw
+                list(cand), rank_scores_bw, rank_scores_gemv
             )
             t_base = model.prefill_time_model(base_plan, enc_scores, min_link)
             for c2, p2, t2 in sorted(scored, key=lambda x: -x[1]["ctx"])[:6]:
@@ -2776,7 +3005,7 @@ def apply_auto_performance(server_args) -> None:
             t_cand = model.prefill_time_model(list(cand), enc_scores, min_link)
             gain = t_base / t_cand - 1.0
             knee_ok, knee_reason = model.decode_knee_detail(
-                list(cand), rank_scores_bw
+                list(cand), rank_scores_bw, rank_scores_gemv
             )
             floor_ok = pred["feasible"] and pred["ctx"] >= floor
             results.append((cand, pred, gain, floor_ok, knee_ok, knee_reason))
@@ -2799,7 +3028,9 @@ def apply_auto_performance(server_args) -> None:
             # regression got proposed as a default (task #216): the guard's
             # verdict is a model, the number next to it is what lets a reader
             # disagree with the model.
-            dec_pct = model.decode_cost_percent(list(cand), rank_scores_bw)
+            dec_pct = model.decode_cost_percent(
+                list(cand), rank_scores_bw, rank_scores_gemv
+            )
             lines.append(
                 f"candidate MLP vector {','.join(map(str, cand))}: "
                 f"predicted ctx ~{int(pred['ctx'])} ({verdict}), "
@@ -2825,7 +3056,7 @@ def apply_auto_performance(server_args) -> None:
             f"predicted ctx ~{int(pred['ctx'])} >= floor {int(floor)}; "
             f"predicted per-rank capacity {[int(x) for x in pred['p']]}; "
             f"predicted decode step "
-            f"{model.decode_cost_percent(list(chosen), rank_scores_bw):+.1f}% "
+            f"{model.decode_cost_percent(list(chosen), rank_scores_bw, rank_scores_gemv):+.1f}% "
             f"vs the VRAM-auto split)"
         )
         lines.append(

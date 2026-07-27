@@ -33,7 +33,9 @@ These tests pin both halves of the correction:
 
 import os
 import unittest
+from unittest import mock
 
+from sglang.srt import uneven_perf
 from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -45,6 +47,14 @@ _MODEL = os.path.join(_CACHE, "Qwen3.6-27B-FP8") if _CACHE else ""
 
 #: Probed peak membw of the reference rig, rank order 5090, 3080, 3080.
 _MEMBW = [1664.1, 718.2, 718.2]
+
+#: Decode-shaped GEMV rate of the same three cards, same rank order, from the
+#: same probe run (best-of-40, five repeats, spread under 0.3 %; SM clock
+#: 2910-2917 MHz on the 3080s, 38-53 C, no thermal cap on any point). The
+#: 5090 gives up 8 % of its streaming rate to the GEMV and the 3080s give up
+#: none, so the ratio drops 2.32 -> 2.14 -- a quarter of the way to the 1.70
+#: the decode measurement implies, MEASURED rather than fitted.
+_MEMBW_GEMV = [1532.3, 717.4, 717.4]
 
 #: The budget vector the #216 campaign booted under. The guard's verdict
 #: depends on it (it sets the base plan the attention/GDN families follow),
@@ -160,6 +170,89 @@ class TestDecodeKneeCalibration(CustomTestCase):
             _MEMBW[0] / sum(_MEMBW),
             "effective bandwidth share is not compressed against peak",
         )
+
+
+@unittest.skipUnless(
+    _MODEL and os.path.isdir(_MODEL),
+    "HTSGLANG_TEST_MODEL_DIR/Qwen3.6-27B-FP8 not present",
+)
+class TestGemvDivisor(CustomTestCase):
+    """How much of the compression the GEMV divisor MEASURES, and how much is
+    still supplied by the residual exponent.
+
+    The three measured points are the yardstick. The question these tests
+    answer is not "is the divisor better" in the abstract -- both bases are
+    fitted to the same three points and therefore reproduce them equally well
+    -- but how much of the correction each one has to invent."""
+
+    def test_the_gemv_path_tracks_the_measured_cost(self):
+        """Same accuracy as the peak-plus-exponent path, from a divisor that
+        measured a quarter of the correction instead of assuming it."""
+        m = _model(_BUDGETS_MEASURED)
+        for vec, measured in _MEASURED_COST_PCT.items():
+            with self.subTest(vec=vec):
+                self.assertAlmostEqual(
+                    m.decode_cost_percent(list(vec), _MEMBW, _MEMBW_GEMV),
+                    measured,
+                    delta=5.0,
+                )
+
+    def test_both_bases_agree_on_the_effective_bandwidth(self):
+        """They are two fits of the same three step times, so they land on the
+        same achieved-bandwidth ratio (~1.70 between the 5090 and a 3080).
+        The difference is what had to be assumed to get there."""
+        m = _model(_BUDGETS_MEASURED)
+        peak_path = m.effective_decode_bw(_MEMBW)
+        gemv_path = m.effective_decode_bw(_MEMBW, _MEMBW_GEMV)
+        self.assertAlmostEqual(
+            peak_path[0] / peak_path[1], gemv_path[0] / gemv_path[1], delta=0.05
+        )
+        self.assertAlmostEqual(gemv_path[0] / gemv_path[1], 1.70, delta=0.05)
+
+    def test_the_measurement_carries_part_of_the_compression(self):
+        """The divisor itself is already compressed against the streaming
+        peak, before any exponent is applied. That part is not fitted."""
+        raw = _MEMBW[0] / _MEMBW[1]
+        gemv = _MEMBW_GEMV[0] / _MEMBW_GEMV[1]
+        self.assertLess(gemv, raw)
+        self.assertAlmostEqual(gemv, 2.14, delta=0.02)
+
+    def test_the_exponent_is_smaller_on_the_measured_divisor(self):
+        """The residual the exponent still has to supply shrinks, which is the
+        whole return on the change: less of the model is a fitted constant."""
+        self.assertGreater(
+            uneven_perf._PREDICT_DECODE_GEMV_RESIDUAL,
+            uneven_perf._PREDICT_DECODE_BW_COMPRESSION,
+        )
+
+    def test_the_exponent_does_not_go_away(self):
+        """Stated as a test so it is not quietly forgotten: a dense bf16 GEMV
+        does not measure what a Marlin or MMVQ decode lane does, so the
+        divisor alone gets the SIGN wrong on all three points. Removing the
+        exponent needs per-lane kernel timing, not a better synthetic probe."""
+        m = _model(_BUDGETS_MEASURED)
+        with mock.patch.object(
+            uneven_perf, "_PREDICT_DECODE_GEMV_RESIDUAL", 1.0
+        ):
+            for vec in _MEASURED_COST_PCT:
+                with self.subTest(vec=vec):
+                    self.assertLess(
+                        m.decode_cost_percent(list(vec), _MEMBW, _MEMBW_GEMV),
+                        0.0,
+                        "the unexponentiated GEMV divisor reports a decode "
+                        "GAIN where a cost was measured",
+                    )
+
+    def test_a_fallback_is_named_not_silent(self):
+        """Silent fallbacks are a recurring fault class in this planner; the
+        two bases carry different exponents, so a swap between them has to be
+        visible."""
+        m = _model(_BUDGETS_MEASURED)
+        _, beta_gemv, basis_gemv = m.decode_bw_basis(_MEMBW, _MEMBW_GEMV)
+        _, beta_peak, basis_peak = m.decode_bw_basis(_MEMBW, None)
+        self.assertNotEqual(beta_gemv, beta_peak)
+        self.assertNotEqual(basis_gemv, basis_peak)
+        self.assertIn("streaming peak", basis_peak)
 
 
 if __name__ == "__main__":
