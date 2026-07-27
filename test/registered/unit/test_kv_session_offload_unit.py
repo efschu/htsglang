@@ -1632,6 +1632,7 @@ def _fake_server_args(**over):
         kv_session_offload_spill_hysteresis_steps=0,
         kv_session_offload_spill_cooldown_seconds=0.0,
         kv_session_offload_budget_demote_grace_iters=256,
+        kv_session_offload_default_spill_class="normal",
         # #224 destinations (unset by default -> byte-identical path)
         kv_session_offload_destinations=None,
         kv_session_offload_destination_extra_config=None,

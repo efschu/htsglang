@@ -270,6 +270,14 @@ class GenerateReqInput:
     # effect when the server is launched with --enable-fast-lane; a "fast" lane
     # seeds a high priority in the existing priority-scheduling path.
     lane: Optional[str] = None
+    # kv-session-offload: per-session LATENCY CLASS steering the spill victim
+    # order. "never" = never a spill victim (latency-critical session),
+    # "preferred" = offer this session before FCFS (latency-tolerant),
+    # "normal" (default) = today's FCFS order. Only consulted when the server
+    # runs with --enable-kv-session-offload. Purely a user-supplied regler --
+    # nothing infers a class from traffic. Unset -> the server-wide default
+    # (--kv-session-offload-default-spill-class, itself "normal").
+    spill_class: Optional[str] = None
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -765,6 +773,7 @@ class GenerateReqInput:
             http_worker_ipc=self.http_worker_ipc,
             priority=self.priority,
             lane=self.lane,
+            spill_class=self.spill_class,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
@@ -850,6 +859,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Fast-lane scheduling class (Variant C Stage 0): "fast" | "heavy" | None.
     lane: Optional[str] = None
+
+    # kv-session-offload spill class: "never" | "normal" | "preferred" | None.
+    # Resolved to a concrete class by the tokenizer manager; None only reaches
+    # the scheduler on internal paths that bypass it (treated as "normal").
+    spill_class: Optional[str] = None
 
     # Extra cache key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None

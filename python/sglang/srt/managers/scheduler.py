@@ -2331,6 +2331,14 @@ class Scheduler(
             # from heavy requests during preemption. Only meaningful when the
             # server was launched with --enable-fast-lane.
             req.is_fast_lane = getattr(recv_req, "lane", None) == "fast"
+            # kv-session-offload: carry the per-session spill (latency) class
+            # onto the Req. The tokenizer manager already validated it and
+            # applied the server default; a None here means an internal path
+            # that never carried the field -> keep the "normal" default set in
+            # Req.__init__ (stock FCFS order).
+            _spill_class = getattr(recv_req, "spill_class", None)
+            if _spill_class is not None:
+                req.spill_class = _spill_class
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode

@@ -83,6 +83,7 @@ from sglang.srt.managers.io_struct import (
     sock_send,
     unwrap_from_pickle,
 )
+from sglang.srt.managers.kv_session_offload import SPILL_CLASSES
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -338,6 +339,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.default_priority_value = server_args.default_priority_value
         self.enable_fast_lane = server_args.enable_fast_lane
         self.fast_lane_priority = server_args.fast_lane_priority
+        self.default_spill_class = server_args.kv_session_offload_default_spill_class
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -635,6 +637,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
+        self._set_default_spill_class(obj)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
@@ -1237,6 +1240,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
                 lane=obj.lane,
+                spill_class=obj.spill_class,
                 extra_key=obj.extra_key,
                 routing_key=obj.routing_key,
                 token_type_ids=token_type_ids,
@@ -3142,6 +3146,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and self.default_priority_value is not None
         ):
             obj.priority = self.default_priority_value
+
+    def _set_default_spill_class(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
+        """Validate and default the kv-session-offload spill class.
+
+        The class is a user regler, so an unknown value is a client error and
+        must be rejected here rather than silently degrade to FCFS at victim
+        selection. Embedding requests have no field and are skipped."""
+        cls = getattr(obj, "spill_class", None)
+        if cls is None:
+            if hasattr(obj, "spill_class"):
+                obj.spill_class = self.default_spill_class
+            return
+        if cls not in SPILL_CLASSES:
+            raise ValueError(
+                f"spill_class must be one of {list(SPILL_CLASSES)}, got {cls!r}"
+            )
 
 
 class ServerStatus(Enum):

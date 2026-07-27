@@ -389,6 +389,12 @@ class CompletionRequest(BaseModel):
     # effect when the server runs with --enable-fast-lane; forwarded to
     # GenerateReqInput.lane exactly like the native /generate endpoint.
     lane: Optional[str] = None
+    # kv-session-offload spill (latency) class: "preferred" | "normal" |
+    # "never", or None for the server default. OpenAI clients send it via
+    # extra_body={"spill_class": "never"}. Only takes effect when the server
+    # runs with --enable-kv-session-offload; forwarded to
+    # GenerateReqInput.spill_class exactly like the native /generate endpoint.
+    spill_class: Optional[str] = None
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
@@ -410,6 +416,15 @@ class CompletionRequest(BaseModel):
     def validate_lane(cls, v):
         if v is not None and v != "fast":
             raise ValueError('lane must be "fast" or omitted')
+        return v
+
+    @field_validator("spill_class")
+    @classmethod
+    def validate_spill_class(cls, v):
+        if v is not None and v not in ("preferred", "normal", "never"):
+            raise ValueError(
+                'spill_class must be "preferred", "normal", "never" or omitted'
+            )
         return v
 
 
@@ -776,6 +791,12 @@ class ChatCompletionRequest(BaseModel):
     # effect when the server runs with --enable-fast-lane; forwarded to
     # GenerateReqInput.lane exactly like the native /generate endpoint.
     lane: Optional[str] = None
+    # kv-session-offload spill (latency) class: "preferred" | "normal" |
+    # "never", or None for the server default. OpenAI clients send it via
+    # extra_body={"spill_class": "never"}. Only takes effect when the server
+    # runs with --enable-kv-session-offload; forwarded to
+    # GenerateReqInput.spill_class exactly like the native /generate endpoint.
+    spill_class: Optional[str] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -808,6 +829,15 @@ class ChatCompletionRequest(BaseModel):
     def validate_lane(cls, v):
         if v is not None and v != "fast":
             raise ValueError('lane must be "fast" or omitted')
+        return v
+
+    @field_validator("spill_class")
+    @classmethod
+    def validate_spill_class(cls, v):
+        if v is not None and v not in ("preferred", "normal", "never"):
+            raise ValueError(
+                'spill_class must be "preferred", "normal", "never" or omitted'
+            )
         return v
 
     @model_validator(mode="before")
