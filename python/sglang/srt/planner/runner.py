@@ -108,6 +108,9 @@ __all__ = [
     "suggest_num_prompts",
     "HarnessOutcome",
     "SubprocessHarness",
+    "load_study",
+    "render_study_text",
+    "render_dry_run_text",
 ]
 
 
@@ -1091,13 +1094,57 @@ class Study:
     def steps(self) -> List[WindowStep]:
         return window_plan(self.scenario, self.window_drivers)
 
+    def dry_run(self) -> Dict[str, Any]:
+        """Everything the study would do, without doing any of it.
+
+        The point of a dry run here is not reassurance: it is that the two
+        failure modes which cost the most (a harness command that cannot
+        express an axis, and a missing device timer that empties every round
+        time) are both visible before the first boot, and both take multiple
+        boots to notice afterwards.
+        """
+        plan = self.plan()
+        arms = []
+        for arm in self.arms:
+            cmd = self.harness_command(arm)
+            arms.append(
+                {
+                    "label": arm.label,
+                    "runnable": bool(cmd.get("runnable")),
+                    "reason": cmd.get("reason", ""),
+                    "command": cmd.get("command", ""),
+                    "env": self._launch_env(arm),
+                    "launch": _launch_argv(arm),
+                }
+            )
+        primary = self.scenario.primary_metric
+        return {
+            "scenario": self.scenario.key,
+            "question": self.scenario.question,
+            "primary_metric": primary.key if primary else "",
+            "boots": len(plan),
+            "schedule": [b.to_json() for b in plan],
+            "windows": [s.to_json() for s in self.steps()],
+            "arms": arms,
+            "preflight": self.preflight(),
+            "budget": dataclasses.asdict(self.policy.budget),
+            "estimated_load_s": len(plan)
+            * len([s for s in self.steps() if not s.undrivable_reason])
+            * self.policy.budget.target_high_s,
+            "runnable": all(a["runnable"] for a in arms),
+        }
+
     def preflight(self) -> List[str]:
         """What the operator has to know before this runs, in order."""
+        tail = (
+            f"then {self.policy.comparison_repeats}x interleaved over "
+            f"{len(self.arms)} arms"
+            if len(self.arms) > 1
+            else "one arm only, so the floor is the whole schedule"
+        )
         out = [
             f"schedule: {len(self.plan())} boots "
-            f"({self.policy.noise_floor_boots} A-vs-A first, then "
-            f"{self.policy.comparison_repeats}x interleaved over "
-            f"{len(self.arms)} arms)",
+            f"({self.policy.noise_floor_boots} A-vs-A first, {tail})",
             (
                 "the floor is measured boot-to-boot; repeats inside one boot "
                 "are not offered"
@@ -1494,6 +1541,117 @@ class Study:
             if not step.excluded_from_headline and not step.undrivable_reason:
                 return step.window
         return DEFAULT_WINDOW
+
+
+def _launch_argv(arm: Arm) -> List[str]:
+    try:
+        return list(arm.settings.launch_command())
+    except Exception:
+        return []
+
+
+def load_study(path: str, **overrides) -> Study:
+    """Build a :class:`Study` from a JSON description.
+
+    A study is data for the same reason a scenario is: a new comparison is a
+    new file, not a new code path, and the file is the thing that gets
+    attached to a result when somebody asks six weeks later what exactly ran.
+
+    ::
+
+        {
+          "scenario": "noise_floor",
+          "policy": {"noise_floor_boots": 3, "comparison_repeats": 2,
+                     "num_prompts": 64,
+                     "env": {"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"}},
+          "point": {},
+          "arms": [
+            {"label": "even",   "settings": {...}, "conditions": {...}},
+            {"label": "uneven", "settings": {...}, "env": {...}}
+          ]
+        }
+
+    ``settings`` is a ``server_manager.LaunchSettings`` field mapping and is
+    validated on construction, so a bad rank map fails here rather than after
+    the first boot.
+    """
+    from sglang.srt.planner.scenarios import SCENARIOS, load_scenarios
+    from sglang.srt.planner.server_manager import LaunchSettings
+
+    with open(path) as f:
+        spec = json.load(f)
+
+    registry = dict(SCENARIOS)
+    if spec.get("scenario_file"):
+        load_scenarios(spec["scenario_file"], into=registry)
+    key = spec.get("scenario")
+    scenario = registry.get(key)
+    if scenario is None:
+        raise KeyError(
+            f"no scenario {key!r}. Known: {', '.join(sorted(registry))}. "
+            "A new question is a new scenario entry (or a scenario_file), not "
+            "a new flag."
+        )
+
+    policy_spec = dict(spec.get("policy") or {})
+    budget = policy_spec.pop("budget", None)
+    policy = RunPolicy(**policy_spec)
+    if budget:
+        policy.budget = TimeBudget(**budget)
+
+    arms = []
+    for entry in spec.get("arms") or []:
+        settings = LaunchSettings(**entry["settings"]).validate()
+        arms.append(
+            Arm(
+                label=entry["label"],
+                settings=settings,
+                env=dict(entry.get("env") or {}),
+                conditions=dict(entry.get("conditions") or {}),
+                note=entry.get("note", ""),
+            )
+        )
+    if not arms:
+        raise ValueError(f"{path}: a study needs at least one arm")
+
+    return Study(
+        scenario, arms, policy=policy, point=spec.get("point") or {}, **overrides
+    )
+
+
+def render_dry_run_text(dry: Dict[str, Any]) -> str:
+    lines = [
+        f"Study: {dry['scenario']}",
+        f"Question: {dry['question']}",
+        f"Yardstick: {dry['primary_metric'] or '(none declared)'}",
+        "",
+        f"{dry['boots']} boots, load only ~{dry['estimated_load_s']:.0f}s at the "
+        "top of the band (boot and teardown come on top):",
+    ]
+    for b in dry["schedule"]:
+        lines.append(
+            f"  {b['order']:>2}. {b['arm']} r{b['repeat']}  [{b['role']}]"
+        )
+    lines += ["", "Windows:"]
+    for w in dry["windows"]:
+        mark = " [excluded from headline]" if w["excluded_from_headline"] else ""
+        how = "harness" if w["drives_harness"] else "driver"
+        if w["undrivable_reason"]:
+            how = "NOT MEASURED"
+        lines.append(f"  {w['window']:<20} {how}{mark}")
+        if w["undrivable_reason"]:
+            lines.append(f"      {w['undrivable_reason']}")
+    lines += ["", "Arms:"]
+    for a in dry["arms"]:
+        lines.append(f"  {a['label']}: {'runnable' if a['runnable'] else 'BLOCKED'}")
+        if a["reason"]:
+            lines.append(f"      {a['reason']}")
+        if a["command"]:
+            lines.append(f"      {a['command']}")
+    lines += ["", "Before running:"]
+    for p in dry["preflight"]:
+        lines.append(f"  - {p}")
+    return "\n".join(lines)
 
 
 def render_study_text(result: StudyResult) -> str:

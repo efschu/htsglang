@@ -23,6 +23,7 @@ from sglang.srt.planner.runner import (
     arm_result_from_points,
     build_schedule,
     card_state,
+    load_study,
     neutralise_kv_budget,
     noise_floor_from_points,
     own_vram_gate,
@@ -760,6 +761,136 @@ class TestStudy(CustomTestCase):
         text = render_study_text(a_study().run())
         self.assertIn("Noise floor", text)
         self.assertIn("Comparisons", text)
+
+
+class TestDryRun(CustomTestCase):
+    def test_a_dry_run_boots_nothing(self):
+        study = a_study()
+        study.dry_run()
+        self.assertEqual(study.supervisor.booted, [])
+        self.assertEqual(study.harness.commands, [])
+
+    def test_it_shows_the_whole_schedule(self):
+        dry = a_study().dry_run()
+        self.assertEqual(dry["boots"], 7)
+        self.assertEqual(len(dry["schedule"]), 7)
+
+    def test_a_blocked_axis_makes_the_dry_run_not_runnable(self):
+        study = Study(
+            POWER,
+            [Arm("A", settings())],
+            policy=RunPolicy(settle_s=0),
+            point={"power_limit_w": "60%"},
+        )
+        dry = study.dry_run()
+        self.assertFalse(dry["runnable"])
+        self.assertIn("host or server controls", dry["arms"][0]["reason"])
+
+    def test_rendering_names_the_yardstick_and_the_windows(self):
+        from sglang.srt.planner.runner import render_dry_run_text
+
+        text = render_dry_run_text(a_study().dry_run())
+        self.assertIn("ms_per_verify_round", text)
+        self.assertIn("Windows", text)
+        self.assertIn("Before running", text)
+
+
+class TestLoadStudy(CustomTestCase):
+    def _write(self, tmpdir, spec):
+        import json
+        import os
+
+        path = os.path.join(tmpdir, "study.json")
+        with open(path, "w") as f:
+            json.dump(spec, f)
+        return path
+
+    def _spec(self, **policy):
+        base = {"noise_floor_boots": 2, "comparison_repeats": 1}
+        base.update(policy)
+        return {
+            "scenario": "noise_floor",
+            "policy": base,
+            "arms": [
+                {
+                    "label": "A",
+                    "settings": {"model_path": "/models/x", "tp_size": 1},
+                    "conditions": {"model": "x"},
+                }
+            ],
+        }
+
+    def test_a_study_file_becomes_a_study(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            study = load_study(self._write(d, self._spec()))
+        self.assertEqual(study.scenario.key, "noise_floor")
+        self.assertEqual([a.label for a in study.arms], ["A"])
+        self.assertEqual(study.policy.noise_floor_boots, 2)
+
+    def test_an_unknown_scenario_lists_the_known_ones(self):
+        import tempfile
+
+        spec = self._spec()
+        spec["scenario"] = "nope"
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(KeyError) as cm:
+                load_study(self._write(d, spec))
+        self.assertIn("noise_floor", str(cm.exception))
+
+    def test_an_invalid_rank_map_fails_at_load_not_at_boot(self):
+        import tempfile
+
+        spec = self._spec()
+        spec["arms"][0]["settings"] = {
+            "model_path": "/models/x",
+            "tp_size": 2,
+            "rank_gpu_id": [0, 1, 2],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                load_study(self._write(d, spec))
+
+    def test_the_policy_refusals_survive_the_file(self):
+        import tempfile
+
+        spec = self._spec(reset_kv_budget=False)
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(KvBudgetUnpinned):
+                load_study(self._write(d, spec))
+
+    def test_a_custom_time_budget_is_read(self):
+        import tempfile
+
+        spec = self._spec()
+        spec["policy"]["budget"] = {
+            "target_low_s": 5.0,
+            "target_high_s": 12.0,
+            "ceiling_s": 40.0,
+        }
+        with tempfile.TemporaryDirectory() as d:
+            study = load_study(self._write(d, spec))
+        self.assertEqual(study.policy.budget.ceiling_s, 40.0)
+
+    def test_the_shipped_studies_load_and_dry_run(self):
+        import glob
+        import os
+
+        root = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))),
+            "tools", "rig_dashboard", "studies",
+        )
+        files = sorted(glob.glob(os.path.join(root, "*.json")))
+        self.assertTrue(files, f"no study files under {root}")
+        for path in files:
+            with self.subTest(study=os.path.basename(path)):
+                dry = load_study(path).dry_run()
+                self.assertTrue(dry["runnable"], dry["arms"])
+                self.assertEqual(
+                    dry["schedule"][0]["role"], "noise_floor"
+                )
 
 
 class TestSuggestNumPrompts(CustomTestCase):
