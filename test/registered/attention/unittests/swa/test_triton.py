@@ -252,6 +252,145 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
+    # ------------------------------------------------------------------
+    # #191: chain target-verify on a WINDOW layer with the mask dropped.
+    #
+    # The seam between #96 Stage B and #180. #180 sets
+    # `custom_mask = mask_indptr = None` for the whole target-verify forward
+    # whenever `dcp_size > 1` (`triton_backend.py:1567-1580` eager,
+    # `:1176-1179` cuda-graph) -- the mask's row stride is the GLOBAL prefix
+    # length, which stops describing the rows the kernel walks once the prefix
+    # is owner-sharded. That drop is per-FORWARD. #96 Stage B's dispatch is
+    # per-LAYER: `forward_extend` (`:2242`) sends only the token-sharded global
+    # layers into `_forward_extend_dcp`, so a sliding-window layer falls
+    # through to the ordinary 2-stage window path at `:2254-2334` and reads
+    # `self.forward_metadata.custom_mask` (`:2321`) -- now None. The non-DCP
+    # verify path never produces that combination, so it had no coverage in
+    # either direction: a window layer could over-attend (window violated) or
+    # under-attend (context truncated) and nothing would say so.
+    #
+    # These cases pin it structurally, without a process group and without
+    # comparing tokens across two spec configurations (which is not a valid
+    # gate -- speculation breaks token identity at temperature 0 on the
+    # standard path already). The spec input carries `custom_mask=None`, which
+    # is exactly what the Stage-B metadata hands the window layer, while the
+    # expected output keeps the FULL prefix + draft-causal + window mask. So
+    # each case asserts the actual claim: at topk == 1 the mask is redundant on
+    # a window layer, because the kernel's own `SLIDING_WINDOW_SIZE` mask is
+    # per-query and absolute in BOTH stages, and the `elif IS_CAUSAL` branch of
+    # the ragged stage reproduces the chain's lower-triangular draft block.
+    #
+    # Geometries chosen so each stage's window arithmetic is load-bearing at
+    # least once: prefix below the window (no clipping), prefix above it (stage
+    # 1's `cur_seq_len_prefix + m <= n + W` re-basing bites), and a window
+    # SHORTER than the draft block (stage 2's `m <= n + W` bites, so the plain
+    # causal fallback alone would be wrong).
+    # ------------------------------------------------------------------
+    SPEC_VERIFY_MASK_DROP_CASES = (
+        (
+            DenseAttentionCase(
+                name="runner_chain_verify_swa_maskless_within_window",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 5),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_chain_verify_swa_maskless_above_window",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(6, 8),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
+                name="runner_chain_verify_swa_maskless_window_inside_draft_block",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(6, 8),
+                extend_lens=(3, 3),
+                # W == 1 < draft_token_num - 1, so the RAGGED stage's own
+                # window mask decides: draft token 2 must not see draft token
+                # 0. At W == 2 the kernel's inclusive rule (q <= k + W) still
+                # admits the whole 3-token block and the stage-2 window mask is
+                # vacuous -- a mutation run caught exactly that hole here.
+                sliding_window_size=1,
+            ),
+            1,
+            "eagle",
+        ),
+        # The GQA shape, because the window mask and the q->kv head remap are
+        # applied in the same kernel and a hybrid's window layers are GQA.
+        (
+            DenseAttentionCase(
+                name="runner_chain_verify_swa_maskless_gqa_above_window",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=8,
+                num_kv_heads=2,
+                page_size=16,
+                prefix_lens=(6, 8),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "eagle",
+        ),
+    )
+    SPEC_VERIFY_MASK_DROP_CUDA_GRAPH_CASES = (
+        (
+            DenseAttentionCase(
+                name="runner_cuda_graph_chain_verify_swa_maskless_above_window",
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(6, 8),
+                extend_lens=(3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "eagle",
+        ),
+        (
+            DenseAttentionCase(
+                name=(
+                    "runner_cuda_graph_chain_verify_swa_maskless"
+                    "_window_inside_draft_block"
+                ),
+                backend="triton",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(6, 8),
+                extend_lens=(3, 3),
+                sliding_window_size=1,
+            ),
+            1,
+            "eagle",
+        ),
+    )
+
     def test_projected_swa_attention_cases(self):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):
@@ -344,6 +483,54 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
                     topk=topk,
                     spec_kind=spec_kind,
                 )
+
+    def test_chain_verify_on_a_window_layer_needs_no_custom_mask(self):
+        """#191. Both arms of the same geometry must hit the same reference.
+
+        Running the mask-installed arm alongside the dropped-mask arm is what
+        makes a failure attributable: if only the dropped arm moves, the drop
+        is the cause; if both move, the window reference itself is wrong.
+        """
+        for case, topk, spec_kind in self.SPEC_VERIFY_MASK_DROP_CASES:
+            for drop in (False, True):
+                with self.subTest(
+                    case=case.name,
+                    backend=case.backend,
+                    topk=topk,
+                    spec_kind=spec_kind,
+                    custom_mask="dropped" if drop else "installed",
+                ):
+                    run_dense_spec_verify_case(
+                        self,
+                        case,
+                        topk=topk,
+                        spec_kind=spec_kind,
+                        drop_custom_mask=drop,
+                    )
+
+    def test_chain_verify_on_a_window_layer_needs_no_custom_mask_cuda_graph(self):
+        """#191 under capture/replay -- the lane production actually runs.
+
+        The graph twin drops the mask in a second place
+        (`_build_cuda_graph_forward_metadata`, `_update_target_verify_buffers`),
+        so eager coverage alone would not pin it.
+        """
+        for case, topk, spec_kind in self.SPEC_VERIFY_MASK_DROP_CUDA_GRAPH_CASES:
+            for drop in (False, True):
+                with self.subTest(
+                    case=case.name,
+                    backend=case.backend,
+                    topk=topk,
+                    spec_kind=spec_kind,
+                    custom_mask="dropped" if drop else "installed",
+                ):
+                    run_dense_spec_verify_cuda_graph_case(
+                        self,
+                        case,
+                        topk=topk,
+                        spec_kind=spec_kind,
+                        drop_custom_mask=drop,
+                    )
 
 
 if __name__ == "__main__":

@@ -198,6 +198,52 @@ class TestPerLayerDispatch(CustomTestCase):
         # re-derivation
         self.assertIn("self.swa_hybrid_dcp = swa_hybrid_dcp_lane(", src)
 
+    def test_the_verify_mask_drop_is_per_forward_not_per_layer(self):
+        """#191, the #96 x #180 seam, pinned in the shape it actually has.
+
+        #180 drops ``custom_mask``/``mask_indptr`` on the target-verify branch
+        keyed on ``self.dcp_size > 1`` alone -- a per-FORWARD decision, taken in
+        the metadata build before any layer is dispatched. #96's dispatch is
+        per-LAYER. So under Stage B a sliding-window layer, which never enters
+        ``_forward_extend_dcp``, still reaches the ordinary 2-stage window
+        kernel with no mask: a combination the non-DCP verify path never
+        produces.
+
+        That combination is CORRECT, and the reason is a property of the
+        kernel, not of the dispatch: ``extend_attention_fwd`` applies its
+        ``SLIDING_WINDOW_SIZE`` mask in both stages independently of
+        ``USE_CUSTOM_MASK`` -- per query and in absolute positions -- and the
+        ragged stage's ``elif IS_CAUSAL`` branch reproduces the chain's
+        lower-triangular draft block exactly. The window is therefore neither
+        widened nor narrowed by the drop. Settled on GPU by
+        ``test/registered/attention/unittests/swa/test_triton.py``
+        (``test_chain_verify_on_a_window_layer_needs_no_custom_mask`` and its
+        cuda-graph twin), which runs both arms of the same geometry against the
+        dense window-aware reference.
+
+        This test pins the SHAPE, so that making the drop per-layer -- the
+        change that looks like a tightening and would in fact re-introduce a
+        mask the window layer's kernel is not indexed for -- cannot happen
+        silently.
+        """
+        import sglang.srt.layers.attention.triton_backend as tb
+
+        src = pathlib.Path(tb.__file__).read_text()
+        for marker in (
+            # eager metadata build
+            'dcp_verify_mask_mode(self.topk) == "causal"',
+            # cuda-graph buffer update and its metadata twin
+            "# Chain verify on the DCP lane carries no mask; see the eager twin.",
+        ):
+            self.assertIn(marker, src)
+        self.assertNotIn(
+            "self._dcp_layer_token_sharded(layer)",
+            src[: src.index("def init_cuda_graph_state")],
+            "the verify mask drop must stay a per-forward decision in the "
+            "metadata build; a per-layer test there would make it depend on a "
+            "layer the metadata build does not have",
+        )
+
 
 class _Recorder:
     def __init__(self):

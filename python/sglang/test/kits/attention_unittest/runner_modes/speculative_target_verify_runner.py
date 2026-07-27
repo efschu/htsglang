@@ -332,9 +332,30 @@ def _make_spec_verify_input(
     topk: int,
     device: str,
     spec_kind: SpecVerifyKind,
+    drop_custom_mask: bool = False,
 ):
     draft_token_num = _check_target_verify_case(case)
     _, custom_mask = _make_custom_masks(case, topk=topk, device=device)
+    if drop_custom_mask:
+        # THE #191 SHAPE. Under uneven DCP the Triton metadata build sets
+        # ``custom_mask = mask_indptr = None`` for the WHOLE target-verify
+        # forward (`triton_backend.py:1567-1580` eager, `:1176-1179` graph),
+        # because the mask's row stride is the GLOBAL prefix length and an
+        # owner-sharded prefix would index it wrong. That drop is per-FORWARD,
+        # while #96 Stage B's layer dispatch is per-LAYER: a sliding-window
+        # layer keeps its unsharded local 2-stage path and therefore reaches
+        # the extend kernel with the window buffers AND no mask -- a
+        # combination the non-DCP verify path never produces.
+        #
+        # A spec input carrying ``custom_mask=None`` reproduces exactly that
+        # kernel-level configuration (``USE_CUSTOM_MASK`` False,
+        # ``SLIDING_WINDOW_SIZE`` > 0, ``is_causal`` True) without needing a
+        # process group. The expected output is deliberately NOT relaxed: the
+        # reference still applies the full prefix + draft-causal + window mask,
+        # so the case asserts that at topk == 1 the mask is redundant on a
+        # window layer -- in BOTH directions, since a violated window would
+        # over-attend and a truncated context would under-attend.
+        custom_mask = None
     retrieve_index, retrieve_next_token, retrieve_next_sibling = _make_retrieve_tensors(
         case,
         topk=topk,
@@ -453,6 +474,7 @@ def _prepare_spec_verify_batch(
     topk: int,
     spec_kind: SpecVerifyKind,
     device: str,
+    drop_custom_mask: bool = False,
 ) -> None:
     _prepare_target_verify_batch(batch, case, device)
     batch.spec_info = _make_spec_verify_input(
@@ -461,6 +483,7 @@ def _prepare_spec_verify_batch(
         topk=topk,
         device=device,
         spec_kind=spec_kind,
+        drop_custom_mask=drop_custom_mask,
     )
 
 
@@ -470,6 +493,7 @@ def _run_spec_verify_cuda_graph_case(
     *,
     topk: int,
     spec_kind: SpecVerifyKind,
+    drop_custom_mask: bool = False,
     build_fixture,
     make_case_with_prefix_lens,
     make_forward_batch,
@@ -506,6 +530,7 @@ def _run_spec_verify_cuda_graph_case(
             topk=topk,
             spec_kind=spec_kind,
             device=device,
+            drop_custom_mask=drop_custom_mask,
         ),
         prepare_inputs=prepare_inputs,
         run_forward=run_forward,
@@ -542,6 +567,7 @@ def run_dense_spec_verify_case(
     *,
     topk: int,
     spec_kind: SpecVerifyKind = "eagle",
+    drop_custom_mask: bool = False,
     head_dim: int = DEFAULT_HEAD_DIM,
     hidden_size: int = DEFAULT_HIDDEN_SIZE,
     max_context_len: int = DENSE_DEFAULT_MAX_CONTEXT_LEN,
@@ -570,6 +596,7 @@ def run_dense_spec_verify_case(
         topk=topk,
         device=device,
         spec_kind=spec_kind,
+        drop_custom_mask=drop_custom_mask,
     )
     inputs = dense_fixture_inputs(fixture)
     expected = dense_attention_reference_with_custom_mask(
@@ -617,6 +644,7 @@ def run_dense_spec_verify_cuda_graph_case(
     *,
     topk: int,
     spec_kind: SpecVerifyKind = "eagle",
+    drop_custom_mask: bool = False,
     head_dim: int = DEFAULT_HEAD_DIM,
     hidden_size: int = DEFAULT_HIDDEN_SIZE,
     max_context_len: int = DENSE_DEFAULT_MAX_CONTEXT_LEN,
@@ -629,6 +657,7 @@ def run_dense_spec_verify_cuda_graph_case(
         case,
         topk=topk,
         spec_kind=spec_kind,
+        drop_custom_mask=drop_custom_mask,
         build_fixture=build_dense_attention_fixture,
         make_case_with_prefix_lens=make_dense_case_with_prefix_lens,
         make_forward_batch=_make_dense_forward_batch,

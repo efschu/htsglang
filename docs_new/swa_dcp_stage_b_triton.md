@@ -515,3 +515,104 @@ lands at or below the measurement noise, that is the number that goes into
    under the uneven lane is always refused. It now asserts the *conditional*
    refusal (refused without the Stage-B preconditions, served with them). That
    is the guard change, made visible in the test, not a weakened test.
+
+---
+
+## 10. Task #191 — the `custom_mask` drop on a window layer under target-verify
+
+The seam the #96 x #180 rebase left open, and its resolution. Settled on
+hardware (5090 + 2x 3080, single card, Triton).
+
+### 10.1 Which case can actually arise
+
+Only one of the two. The mask is dropped, never wrongly kept:
+
+* `init_forward_metadata`'s target-verify branch sets
+  `custom_mask = mask_indptr = None` keyed on **`self.dcp_size > 1` alone**
+  (`triton_backend.py:1567-1580`), and the cuda-graph twin does the same in two
+  places (`:1176-1179` in `_update_target_verify_buffers`, `:1827-1833` in
+  `_build_cuda_graph_forward_metadata`). No per-layer condition appears in any
+  of them, and nothing re-installs a mask later.
+* `forward_extend` (`:2242`) then sends only the token-sharded GLOBAL layers
+  into `_forward_extend_dcp`. A sliding-window layer falls through to the
+  ordinary 2-stage window path (`:2254-2334`) and reads
+  `self.forward_metadata.custom_mask` at `:2321` — now `None`, where the
+  non-DCP twin would hand it the EAGLE chain mask.
+
+So the question is exactly: **is a window layer's chain verify correct without
+the mask?** ("Mask wrongly present" cannot occur: the drop is unconditional
+under DCP, and off the lane the mask is upstream's own behaviour.)
+
+The seam is Triton-only. FlashInfer's DCP lane never looks at a window at all,
+so the pairing does not exist there.
+
+### 10.2 Why it is correct
+
+A property of the kernel, not of the dispatch. In
+`kernels/ops/attention/extend_attention.py`:
+
+* **Paged stage.** The window mask at `:381-387` is applied under
+  `if SLIDING_WINDOW_SIZE > 0`, with no reference to `USE_CUSTOM_MASK`, and it
+  is per-query and absolute: `cur_seq_len_prefix + m <= n + W`, where
+  `cur_seq_len_prefix` is `min(seq_len, W)` (the clipped window buffer) so the
+  expression re-bases correctly to `q_abs <= k_abs + W`. Moreover the custom
+  mask was **never** consulted in this stage: `skip_prefix_custom_mask`
+  defaults to True (`:640`) and the Triton backend never overrides it. The two
+  arms are bit-identical here by construction.
+* **Ragged stage.** With the mask gone, `elif IS_CAUSAL` (`:514-519`) supplies
+  `m >= n`, which for a topk == 1 chain is exactly the mask's d x d
+  draft->draft block. The window mask at `:524-529` is again applied
+  independently of `USE_CUSTOM_MASK`.
+
+Hence the window is neither widened (no out-of-window key becomes visible) nor
+narrowed (no in-window key is lost). `window_kv_offsets` is loaded only inside
+the `USE_CUSTOM_MASK` branches, so dropping the mask makes it inert rather than
+wrong.
+
+`verify_splitkv_fwd` cannot take this case: its `can_handle` returns False for
+any `sliding_window_size > 0`, so a window layer always reaches
+`extend_attention_fwd`.
+
+### 10.3 How it was falsified
+
+The needle test of §8 H5 would have worked but is the expensive instrument, and
+comparing tokens between spec-on and spec-off is not a valid gate anyway —
+speculation breaks token identity at temperature 0 on the standard path. The
+cheaper and stronger instrument is a direct structural comparison at the kernel:
+`test/registered/attention/unittests/swa/test_triton.py`,
+`test_chain_verify_on_a_window_layer_needs_no_custom_mask` and its cuda-graph
+twin.
+
+Each geometry is run in **both arms** — mask installed and mask dropped — with
+the spec input carrying `custom_mask=None` for the dropped arm, which is the
+exact kernel-level configuration Stage B hands the window layer. The expected
+output is not relaxed for the dropped arm: the dense reference keeps the full
+prefix + draft-causal + window mask in absolute positions. Geometries: prefix
+below the window, prefix above it (paged-stage re-basing), a window shorter
+than the draft block (ragged-stage window), and a GQA shape.
+
+Mutation-checked, because a green test that cannot fail proves nothing:
+
+| mutation | result |
+|---|---|
+| ragged stage: `elif IS_CAUSAL` -> `elif IS_CAUSAL and USE_CUSTOM_MASK` (remove the causal fallback) | 6 failures, **all in the dropped arm, none in the installed arm** — the coverage is drop-specific |
+| ragged stage: neutralise the window mask | 4 failures, both arms, on the window-shorter-than-draft-block geometry |
+| paged stage: drop the `cur_seq_len_prefix` re-basing | 12 failures, both arms |
+
+The second mutation also found a hole in the first draft of the test: at
+`W == 2` with a 3-token draft block the kernel's inclusive rule (`q <= k + W`)
+still admits the whole block, so the ragged-stage window mask was vacuous. The
+case now uses `W == 1`.
+
+### 10.4 Result
+
+**No defect.** The drop is correct on window layers for the chain verify, for
+the reason in §10.2, and the seam is now pinned by GPU coverage in both arms
+plus a CPU source-pin
+(`test_swa_dcp_stage_b.py::test_the_verify_mask_drop_is_per_forward_not_per_layer`)
+that makes the per-forward shape of the decision explicit — so the plausible
+"tightening" of making the drop per-layer, which would re-install a mask the
+window kernel is not indexed for, cannot happen silently.
+
+Scope of this result: **topk == 1 only.** The tree verify remains refused at
+boot and nothing here weakens that.

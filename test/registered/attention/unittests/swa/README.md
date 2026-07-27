@@ -16,7 +16,7 @@ Columns are runner modes; rows are attention backends. Cells use:
 | Backend | Eager Phase 2 | CG decode | PCG extend | BCG extend | Verify eager | Verify CG | DE eager | DE CG | DE-V2 CG | EAGLE-draft runner | EAGLE-DE runner | FKVMTP runner |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | `torch_native` | ✓ no-prefix + prefix window edges, MHA + GQA decode window edges (uses explicit SDPA local-attention mask) | — (no CG hooks) | — (no CG path) | — (no CG path) | — | — | — | — | — | — | — | — |
-| `triton` | ✓ no-prefix lengths below/equal/above window + prefix lengths below/equal/above window | ✓ within-window decode (`prefix_lens=(1,2,3)`, `window=4`) + above-window decode (`prefix_lens=(7,8,9)`, `window=4`) | ✓ no-prefix window edges, prefix-within-window MHA extend | ✓ same as PCG | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2), `window=4` | ✓ EAGLE tree within-window + EAGLE chain above-window (`prefix_lens=(6,8)`, `window=4`) | — | — | — | — | — | — |
+| `triton` | ✓ no-prefix lengths below/equal/above window + prefix lengths below/equal/above window | ✓ within-window decode (`prefix_lens=(1,2,3)`, `window=4`) + above-window decode (`prefix_lens=(7,8,9)`, `window=4`) | ✓ no-prefix window edges, prefix-within-window MHA extend | ✓ same as PCG | ✓ EAGLE chain (topk=1) + EAGLE tree (topk=2), `window=4`; **plus the #191 maskless chain arm** (see below) | ✓ EAGLE tree within-window + EAGLE chain above-window (`prefix_lens=(6,8)`, `window=4`); **plus the #191 maskless chain arm** | — | — | — | — | — | — |
 | `flashinfer` | ✓ no-prefix lengths below/equal/above window (`head_dim=64` for SM90) | ✓ within-window decode | ✓ no-prefix window edges (MHA extend) | ✓ same as PCG | ✓ DFLASH chain (`topk=1`, `window=4`) | ✓ DFLASH chain (`topk=1`, `window=4`) | — | — | — | — | — | — |
 
 ## Input And Config Coverage
@@ -61,3 +61,28 @@ Columns are runner modes; rows are attention backends. Cells use:
   separately (the above-window case currently asserts within tolerance with the
   matching reference rule; if a real backend regression appears, lower the
   tolerance).
+
+## The #191 maskless-verify arm
+
+`test_chain_verify_on_a_window_layer_needs_no_custom_mask` (and its cuda-graph
+twin) covers a combination the non-DCP verify path never produces: a
+sliding-window layer at `TARGET_VERIFY` with **no** `custom_mask`.
+
+Under #96 Stage B the ~50 window layers of an SWA hybrid keep their unsharded
+local path, while #180 drops `custom_mask`/`mask_indptr` for the whole
+target-verify forward whenever `dcp_size > 1`. The drop is per-forward, the
+dispatch is per-layer, so the window layer reaches this kernel with the window
+buffers and no mask. The cases run **both arms** of each geometry against the
+same dense window-aware reference, so the assertion is that at `topk == 1` the
+mask is redundant on a window layer -- in both directions, since a violated
+window over-attends and a truncated context under-attends.
+
+Geometries: prefix below the window; prefix above it (the paged stage's
+`cur_seq_len_prefix + m <= n + W` re-basing); `window=1` with a 3-token draft
+block (the ragged stage's own window mask -- note that `window=2` is NOT enough,
+the kernel's inclusive `q <= k + W` rule still admits the whole block); and a
+GQA shape.
+
+Mutation coverage: removing the ragged stage's `elif IS_CAUSAL` fallback fails
+the dropped arm only; neutralising either stage's window mask fails both arms.
+Full reasoning in `docs_new/swa_dcp_stage_b_triton.md` section 10.
