@@ -1968,8 +1968,10 @@ class ModelRunnerKVCacheMixin:
         # all of them into its owned token slots. The HYBRID pool site already
         # spells this out inline (`_hybrid_kv_head_num`); stating it here too
         # keeps the plain-MHA pool (non-hybrid models on the lane) from being
-        # shaped for a per-rank shard the broadcast would not match. The lane
-        # hard-rejects speculative decoding, so no draft pool can reach this.
+        # shaped for a per-rank shard the broadcast would not match. Since #143
+        # the lane admits chain speculation, but every draft runner on it goes
+        # through the solo-host branch above -- `is_draft_worker` is never paired
+        # with a weightless role -- so no draft pool reaches this line either.
         if not self.is_draft_worker and weightless_kv_active():
             return self.model_config.get_total_num_kv_heads()
         return self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)

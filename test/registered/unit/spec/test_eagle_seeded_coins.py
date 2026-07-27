@@ -269,7 +269,10 @@ class TestCoinsSitBeforeTheRank0Broadcast(CustomTestCase):
     def test_verify_coins_precede_capture_safe_tp_broadcast(self):
         src = inspect.getsource(eagle_sample)
         coin_at = src.find("_verify_coins(")
-        broadcast_at = src.find("capture_safe_tp_broadcast(")
+        # rfind, not find: #143 inserted a weightless-lane receive branch at the
+        # TOP of eagle_sample which carries its own capture_safe_tp_broadcast(.
+        # The pin is about the HEAD-side outcome broadcast, which is the last one.
+        broadcast_at = src.rfind("capture_safe_tp_broadcast(")
         self.assertNotEqual(coin_at, -1, "_verify_coins call site vanished")
         self.assertNotEqual(
             broadcast_at, -1, "#50 rank-0 verify broadcast vanished from eagle_sample"

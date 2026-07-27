@@ -804,6 +804,107 @@ class TestTreeSpecDcpGuardBroadened(CustomTestCase):
         args._handle_weightless_kv_fastlane()  # must not raise
 
 
+class TestWeightlessChainSpecAdmission(CustomTestCase):
+    """#143: the lane admits CHAIN speculation, in exactly one shape.
+
+    The Stage-1 blanket "no speculative decoding" reject is replaced by a set of
+    NAMED rejects, each protecting one asymmetric piece the weightless workers
+    would otherwise have to mirror. These tests pin both halves: the admitted
+    config boots, and every neighbouring config still refuses with its reason.
+
+    Deliberately NOT relaxed here (covered by TestTreeSpecGuardBreadth above):
+    topk > 1 and the tree-verify door.
+    """
+
+    def _chain_args(self, **overrides):
+        # NOTE the algorithm is spelled EAGLE, not NEXTN: the admission check
+        # runs AFTER handle_speculative_decoding resolves the alias, so it only
+        # ever sees resolved names. Constructing raw args here mirrors that.
+        kwargs = dict(
+            tp_size=3,
+            dcp_size=3,
+            weightless_kv_fastlane=True,
+            weightless_kv_head_rank=0,
+            speculative_algorithm="EAGLE",
+            speculative_eagle_topk=1,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_draft_placement="solo",
+        )
+        kwargs.update(overrides)
+        return make_args(**kwargs)
+
+    def test_chain_spec_on_the_lane_is_admitted(self):
+        args = self._chain_args()
+        args._handle_weightless_kv_fastlane()  # must not raise
+        args._reject_unsupported_weightless_spec()  # must not raise
+
+    def test_dcp_validation_no_longer_shuts_the_blanket_door(self):
+        # The lane forces dcp_size == tp_size and is never uneven_WEIGHTED, so
+        # before #143 the blanket CUDA "DCP + spec" reject fired here and
+        # relaxing the lane handler alone would have been useless.
+        args = self._chain_args()
+        with patch.object(
+            server_args_module, "is_hip", return_value=False
+        ), patch.object(
+            server_args_module, "is_cuda", return_value=True
+        ), patch.dict(os.environ, dict(os.environ), clear=True):
+            args._handle_dcp_validation()  # must not raise
+
+    def test_split_placement_rejected(self):
+        # THE load-bearing condition: a weightless rank has no draft weights,
+        # no draft KV pool and no draft backends.
+        args = self._chain_args(speculative_draft_placement="split")
+        with self.assertRaisesRegex(ValueError, "draft-placement solo"):
+            args._reject_unsupported_weightless_spec()
+
+    def test_solo_rank_must_equal_head_rank(self):
+        args = self._chain_args(
+            tp_size=3,
+            weightless_kv_head_rank=1,
+            speculative_draft_gpu=None,
+        )
+        # solo rank resolves to 0 (no --speculative-draft-gpu), head rank is 1.
+        with self.assertRaisesRegex(ValueError, "weightless-kv-head-rank"):
+            args._reject_unsupported_weightless_spec()
+
+    def test_non_eagle_family_rejected(self):
+        for algo in ("NGRAM", "STANDALONE"):
+            with self.subTest(algo=algo):
+                args = self._chain_args(speculative_algorithm=algo)
+                with self.assertRaisesRegex(ValueError, "EAGLE-family"):
+                    args._reject_unsupported_weightless_spec()
+
+    def test_adaptive_k_rejected(self):
+        # One symmetric capture shape per boot; a runtime-varying draft length
+        # would need a bucketed head+worker ladder.
+        args = self._chain_args(speculative_adaptive=True)
+        with self.assertRaisesRegex(ValueError, "speculative-adaptive"):
+            args._reject_unsupported_weightless_spec()
+
+    def test_block_decode_lane_rejected_with_spec(self):
+        # The streaming block-decode graph ladder is captured over block COUNT
+        # for a decode-shaped step; a verify's bs*(k+1) rows are a second axis.
+        args = self._chain_args(weightless_kv_chunked_block_size=2048)
+        with self.assertRaisesRegex(ValueError, "chunked-block-size"):
+            args._reject_unsupported_weightless_spec()
+
+    def test_block_decode_lane_still_allowed_without_spec(self):
+        args = self._chain_args(
+            speculative_algorithm=None,
+            speculative_draft_placement="split",
+            weightless_kv_chunked_block_size=2048,
+        )
+        args._handle_weightless_kv_fastlane()  # must not raise
+
+    def test_topk_gt_1_still_rejected_with_a_chain_capable_config(self):
+        # The #139 guard must survive this relaxation: same admitted shape,
+        # only topk flipped.
+        args = self._chain_args(speculative_eagle_topk=2)
+        with self.assertRaisesRegex(ValueError, "eagle-topk"):
+            args._handle_weightless_kv_fastlane()
+
+
 if __name__ == "__main__":
     unittest.main()
 

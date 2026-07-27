@@ -583,6 +583,21 @@ class TpModelWorker(BaseTpWorker):
             # which never times out). One tiny gloo broadcast per generation
             # batch on the existing lockstep CPU channel; the head's matching
             # send is below. The per-layer NCCL collective count is untouched.
+            #
+            # ORDERING (#143): the is_verify early return must come FIRST. On a
+            # verify step the head skips sampling entirely (the spec worker
+            # resolves the accepted run afterwards and publishes it itself), so
+            # it never reaches the matching send below -- a weightless worker
+            # that took the recv branch here would block in gloo forever. Under
+            # speculation the authoritative tokens are `predict`, delivered by
+            # the rank-0 accept broadcast inside eagle_sample, which every rank
+            # including the weightless workers enters; this gloo channel carries
+            # the NON-spec generation step only. Both sides answer from
+            # `is_verify`, which is an argument, hence rank-uniform.
+            if is_verify:
+                # Skip sampling; spec_v2 worker fires its own publish post-verify.
+                return batch_result
+
             if getattr(self.model_runner, "is_weightless_worker", False):
                 head_ids = broadcast_pyobj(
                     [],
@@ -597,10 +612,6 @@ class TpModelWorker(BaseTpWorker):
                     dtype=torch.long,
                     device=forward_batch.seq_lens.device,
                 )
-                return batch_result
-
-            if is_verify:
-                # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
 
             if (

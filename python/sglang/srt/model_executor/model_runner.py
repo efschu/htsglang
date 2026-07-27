@@ -456,10 +456,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # materializes no layer weights. These flags are COMPUTED here (B0) and
         # consumed by the worker forward (B1) and the weightless loader (B2);
         # they are no-ops on the default path (fast lane off).
+        #
+        # NEVER set on a DRAFT runner (#143). The flags name a role in the
+        # TARGET forward: "holds the full model" vs "holds only a KV token
+        # shard and mirrors the attention dispatch". A draft runner has neither
+        # role -- its pool is not token-sharded and its attention backend
+        # already excludes itself from the lane
+        # (`flashinfer_backend.py`: `weightless_kv = ... and not
+        # is_draft_worker`). Leaving them set on a draft runner crosses the two:
+        # `_forward_raw` would route a draft forward into the stripped
+        # weightless dispatch whose first line asserts a `weightless_kv`
+        # backend. The draft's own asymmetry is expressed by the draft-solo
+        # roles computed just below, and every load-path site that reads the
+        # weightless flags for a draft runner already has an
+        # `is_draft_solo_host` / `is_draft_solo_shadow` sibling.
         _wl_fastlane = getattr(server_args, "weightless_kv_fastlane", False)
         _wl_head = getattr(server_args, "weightless_kv_head_rank", 0)
-        self.is_weightless_head = _wl_fastlane and self.tp_rank == _wl_head
-        self.is_weightless_worker = _wl_fastlane and self.tp_rank != _wl_head
+        _wl_target = _wl_fastlane and not is_draft_worker
+        self.is_weightless_head = _wl_target and self.tp_rank == _wl_head
+        self.is_weightless_worker = _wl_target and self.tp_rank != _wl_head
         if self.is_weightless_worker:
             logger.info(
                 "Weightless-KV fast lane: rank %d is a WEIGHTLESS KV worker "
@@ -3745,15 +3760,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             worker_dispatch = attn.forward_decode_weightless_worker
         elif forward_batch.forward_mode.is_extend():
             # PREFILL/EXTEND: mirror the head's _forward_extend_dcp per-layer
-            # dispatch (data-dependent 2-or-4 DCP collectives on the rank-uniform
+            # dispatch (data-dependent 1-or-4 DCP collectives on the rank-uniform
             # has_prefix). The worker writes the current chunk's KV to its owned
             # token-shard and reads its owned prefix slots; it skips the
             # head-local current-chunk ragged attention.
+            #
+            # TARGET_VERIFY lands here too (ForwardMode.is_extend() includes it),
+            # and that is the intended route for chain speculation (#143), not an
+            # accident: a verify step IS an extend over bs*(k+1) rows whose
+            # committed prefix is read owner-sharded while the draft block is
+            # attended out of the head's local k/v. has_prefix is forced True for
+            # verify on both sides (layers/dcp/lockstep.weightless_has_prefix), so
+            # the collective sequence is the same 4-op tuple decode issues.
             worker_dispatch = attn.forward_extend_weightless_worker
         else:
             raise NotImplementedError(
                 "weightless-KV worker forward: unsupported forward mode "
-                f"{forward_batch.forward_mode} (B1 supports decode + extend)."
+                f"{forward_batch.forward_mode} (decode, extend and target-verify "
+                "are supported). Draft-side modes (DRAFT_EXTEND_V2) must never "
+                "reach a weightless worker: the lane requires "
+                "--speculative-draft-placement solo, under which non-host ranks "
+                "run no draft forward at all."
             )
         for layer in self._weightless_attn_layers():
             worker_dispatch(layer, forward_batch)
@@ -3794,9 +3821,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # blocks on the gloo handshake (a desync/hang). PREFILL/EXTEND
                 # stays eager and GUARDED. `disable_cuda_graph` and the forward
                 # mode are rank-uniform, so head and workers decide identically.
-                _wl_decode_graphs = (
-                    not self.server_args.disable_cuda_graph
-                    and forward_batch.forward_mode.is_decode_or_idle()
+                #
+                # #143: TARGET_VERIFY joins DECODE/IDLE here. Under chain spec
+                # every generation step IS a verify, captured by the same
+                # DecodeCudaGraphRunner (its capture_forward_mode flips to
+                # TARGET_VERIFY), so a verify replay is just as guard-free as a
+                # decode replay -- and leaving the guard ON for verify would put
+                # a gloo handshake inside a captured region. The rule to keep is
+                # "guard OFF whenever a captured region may be entered", i.e.
+                # exactly the modes ForwardMode.is_cuda_graph() admits that the
+                # lane can reach. PREFILL/EXTEND stays eager and GUARDED.
+                _wl_mode = forward_batch.forward_mode
+                _wl_decode_graphs = not self.server_args.disable_cuda_graph and (
+                    _wl_mode.is_decode_or_idle() or _wl_mode.is_target_verify()
                 )
                 set_guard_enabled(not _wl_decode_graphs)
             if self.is_weightless_worker:

@@ -876,15 +876,43 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def spec_accept_broadcast_src() -> int:
+    """Group rank that owns the authoritative accept decision.
+
+    Rank 0 everywhere except on the weightless-KV fast lane, where the head
+    rank is the ONLY rank with an lm_head and valid hidden states -- the
+    weightless workers hold no layer weights at all, so their
+    ``next_token_logits`` does not exist. Broadcasting from a hard-coded 0 with
+    ``--weightless-kv-head-rank != 0`` would publish garbage accepts from a rank
+    that never computed any, silently: a wrong-answer bug, not a hang.
+    """
+    from sglang.srt.runtime_context import get_server_args
+
+    server_args = get_server_args()
+    if getattr(server_args, "weightless_kv_fastlane", False):
+        return int(getattr(server_args, "weightless_kv_head_rank", 0))
+    return 0
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     vocab_mask: torch.Tensor = None,
+    weightless_recv: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information).
+
+    ``weightless_recv`` (#143): RECEIVE-ONLY mode for a weightless-KV worker
+    rank. Such a rank ran the stripped attention-only verify forward and has no
+    logits, so it cannot run the accept kernel -- but it must still enter the
+    rank-0 accept broadcast below, or the head blocks in it alone. It therefore
+    allocates the three result tensors at the rank-uniform shapes and receives
+    them. This is deliberately the SAME broadcast the heterogeneous-GPU accept
+    sync already uses (#50), not a second channel: one place decides accepts for
+    every rank, and it is capture-safe.
     """
     import torch.nn.functional as F
 
@@ -911,6 +939,46 @@ def eagle_sample(
         return predict, num_correct_drafts, accept_index
 
     bs = len(batch.seq_lens)
+
+    if weightless_recv:
+        # WEIGHTLESS-KV WORKER (#143). No logits here, so no accept kernel --
+        # allocate the three results at the boot-fixed shapes and take the head
+        # rank's answer off the same broadcast every other rank uses. Shapes are
+        # derived from replicated geometry (bs, draft_token_num,
+        # max_tree_depth), so head and worker agree without communicating.
+        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.layers.dcp.lockstep import spec_accept_broadcast_shapes
+        from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
+
+        if SIMULATE_ACC_LEN > 0:
+            # The simulation rewrites predict/accept_index AFTER the broadcast,
+            # on whichever rank computed them. A weightless worker cannot
+            # reproduce that rewrite (it never had candidates or target logits),
+            # so head and workers would commit different accept lengths and
+            # desync the KV bookkeeping. Refuse instead of drifting.
+            raise ValueError(
+                "SGLANG_SIMULATE_ACC_LEN is not supported on the weightless-KV "
+                "fast lane: the simulated accept rewrite happens after the "
+                "rank-0 accept broadcast and the weightless workers cannot "
+                "reproduce it, which would desync their KV bookkeeping."
+            )
+        p_shape, ai_shape, nd_shape = spec_accept_broadcast_shapes(
+            bs, verify_input.draft_token_num, verify_input.max_tree_depth
+        )
+        predict = torch.zeros(p_shape, dtype=torch.int32, device=device)
+        accept_index = torch.full(ai_shape, -1, dtype=torch.int32, device=device)
+        num_correct_drafts = torch.zeros(nd_shape, dtype=torch.int32, device=device)
+        tp_group = (
+            get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            capture_safe_tp_broadcast(
+                tp_group,
+                (predict, accept_index, num_correct_drafts),
+                src=spec_accept_broadcast_src(),
+            )
+        return predict, num_correct_drafts + 1, accept_index
+
     sampling_info = batch.sampling_info
     next_token_logits = logits_output.next_token_logits
 
@@ -1079,7 +1147,9 @@ def eagle_sample(
         from sglang.srt.speculative.spec_utils import capture_safe_tp_broadcast
 
         capture_safe_tp_broadcast(
-            tp_group, (predict, accept_index, num_correct_drafts), src=0
+            tp_group,
+            (predict, accept_index, num_correct_drafts),
+            src=spec_accept_broadcast_src(),
         )
 
     if SIMULATE_ACC_LEN > 0:

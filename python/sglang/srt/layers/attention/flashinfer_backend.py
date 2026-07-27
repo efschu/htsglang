@@ -36,6 +36,7 @@ from sglang.srt.layers.dcp import (
     create_triton_kv_indices_for_dcp_triton,
     get_dcp_lens,
 )
+from sglang.srt.layers.dcp.lockstep import weightless_has_prefix
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -5472,12 +5473,14 @@ class FlashInferAttnBackend(AttentionBackend):
         self._dcp_owner_write(layer, forward_batch, cache_loc, k_full, v_full)
         # (2) current-chunk ragged attention: head-LOCAL, NO collective -> skip.
         # (3) has_prefix -- computed IDENTICALLY to the head (rank-uniform), so
-        # the Q/LSE collectives below stay balanced with the head.
-        if forward_batch.forward_mode.is_target_verify():
-            has_prefix = True
-        else:
-            prefix_cpu = forward_batch.extend_prefix_lens_cpu
-            has_prefix = prefix_cpu is not None and any(prefix_cpu)
+        # the Q/LSE collectives below stay balanced with the head. ONE
+        # expression, shared with _forward_extend_dcp; see
+        # layers/dcp/lockstep.weightless_has_prefix for why forward_mode must
+        # answer first (#180 D5).
+        has_prefix = weightless_has_prefix(
+            forward_batch.forward_mode.is_target_verify(),
+            forward_batch.extend_prefix_lens_cpu,
+        )
         if not has_prefix:
             return
         # (4) Q broadcast (1 collective) -> non-causal PAGED prefix read over this
@@ -5581,11 +5584,10 @@ class FlashInferAttnBackend(AttentionBackend):
         # length is seq_lens (extend_prefix_lens is unset for verify).
         # (CPU-side info, so it is hoisted above the kernels: the overlapped
         # comm lane must know up front whether the q-gather B will be issued.)
-        if force_prefix:
-            has_prefix = True
-        else:
-            prefix_cpu = forward_batch.extend_prefix_lens_cpu
-            has_prefix = prefix_cpu is not None and any(prefix_cpu)
+        # ONE expression, shared with forward_extend_weightless_worker.
+        has_prefix = weightless_has_prefix(
+            force_prefix, forward_batch.extend_prefix_lens_cpu
+        )
 
         comm_stream = self.dcp_comm_stream
         if comm_stream is None:

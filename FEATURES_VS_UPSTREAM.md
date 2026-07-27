@@ -329,7 +329,11 @@ per-ROLE KV storage precision (`--weightless-kv-worker-cache-dtype`, opt-in, def
 weightless workers can hold their KV token-shard in fp8 while the head keeps its own format, since
 KV bytes cross the role boundary only in the model compute dtype. Whether that buys capacity
 depends on which rank binds the min-reduced token budget — the boot log names it (see
-`docs_new/weightless_kv_role_precision.md`).
+`docs_new/weightless_kv_role_precision.md`). Chain speculation
+(EAGLE/EAGLE3/NEXTN at `--speculative-eagle-topk 1`) composes with the lane as of #143 via
+`--speculative-draft-placement solo` hosted on the lane's head rank; tree verify, adaptive
+draft length and the block-decode/host-spill tier stay hard-rejected alongside it.
+Design: `docs_new/weightless_chain_spec.md`.
 
 **Upstream:** no equivalent in sglang.
 
