@@ -4339,3 +4339,61 @@ critical-path GPU time) but structurally unreachable by issue/wait overlap at
 bs=1..8 decode, and the one independent collective pair is worth 1.2 %. Building
 the async NCCL machinery would have reproduced #198's neutral result with more
 code. Nothing merged, no behaviour change on any path.
+
+# Task #200 (GDN/fla kernel autotune reactivation) — MEASURED, NOT BUILT
+
+Ceiling measurement before any build. Boot: integration/r3-probe-next2
+@ 662c6a01bc, Qwen3.6-27B-FP8, TP=3 auto-performance, CUDA graphs on, NEXTN.
+Profiler resolves graph-replayed kernels fully (5568 GDN calls decode =
+48 layers x 116 steps; 144 prefill = 48 x 3 chunks) — no eager run needed.
+CUPTI overhead ~10-15 %; the high NCCL share is real (no-P2P/PHB topology).
+
+GDN/fla total share of wall time: decode 1.49-1.84 %, prefill 0.38-1.00 %
+across the three ranks. Split by autotune state:
+
+| Bucket | Decode (%wall, all ranks) | Prefill TP0/TP1/TP2 (%wall) |
+|---|---|---|
+| A single-config kill (`chunk_delta_h`, blocked by state alias) | 0 | 0.129 / 0.253 / 0.241 |
+| B decorators commented out (state-free: `chunk_o`, `wy_fast`, `l2norm`, `cumsum`) | 0 | 0.121 / 0.397 / 0.322 |
+| C genuinely autotuned (`chunk_fwd` kkt_solve, 6 configs) | 0 | 0.051 / 0.093 / 0.087 |
+| D no decorator at all (`fused_sigmoid_gating`, `causal_conv1d`, `layer_norm_1pass`, `fused_gdn_gating`) | 1.49 / 1.83 / 1.84 | 0.083 / 0.255 / 0.210 |
+
+100 % of decode GDN time sits in bucket D — no decorator exists to
+reactivate; configs would have to be written first (a new feature).
+Ceiling with measured gains (143 historical autotune.json from this
+hardware: bucket B 1.3-1.7x config spread, generously 30 %; bucket A only
+0-9 % vs the hardcoded config — default already optimal at H=24/H=30):
+**decode 0.00 %, prefill 0.048-0.142 % wall.** Noise floor is 2.7-4.2 %
+tok/s, 0.98-1.46 % host-level ms/round — the ceiling sits ~10x below it.
+Robust against the gain assumption: even at 100 % kernel gain, prefill
+stays under 0.4 % and decode at zero.
+
+Groundwork recorded for a future attempt (none planned):
+- The in-place h0/ht alias in `chunk_delta_h.py:116-117` (INPLACE_UPDATE
+  hardcoded at :352, full SSM pool passed at `gdn_triton.py:182,190`) is an
+  upstream-sglang invention (eb3da9c); upstream fla allocates `final_state`
+  fresh and runs 12 configs. The single-config kill (a61a14f416) is also
+  upstream-sglang, not this fork.
+- Correction to an older note: upstream fla DOES use `restore_value`
+  (`fla/modules/conv/triton/kernels.py:350`) for the analogous conv state.
+- Triton disk cache keys include target arch (backend hash), so sm_86/sm_120
+  cannot cross-poison; the in-memory key is process-local. Residual risk:
+  `fla/utils.py:293-295,332` derives config SPACES from device 0 at import
+  time — harmless under --rank-gpu-id (one visible device per process is
+  forced), but the env default is False.
+- Minimal safe-benchmark fix would be a pre/post_hook saving only
+  `initial_state[initial_state_indices]` (~30-45 lines, one file). Not
+  worth it at this ceiling, and `chunk_delta_h` is a suspect in the GDN
+  prefill divergence (see line ~3995) — reactivation would widen the error
+  space before that falsifier has run.
+
+Verdict: backlog stays backlog. If ever touched, only bucket B (~40 lines,
+state-free) as a rider inside a larger GDN prefill effort.
+
+Side finding (new lead, two orders of magnitude larger): TP0 (5090/sm120)
+runs the FP8 GEMMs through the Triton path `_w8a8_block_fp8_matmul` —
+44 % of decode kernel time, 8 % prefill — while TP1/TP2 (3080) use
+cutlass/cublas. If a cutlass FP8 path exists or can be enabled for sm120,
+that is the largest single-rank lever currently known on this rig.
+Evidence: /tmp/atc/{agg.csv,out_all.txt,prof/}, worktree
+/spinning/wt-autotune-ceiling (unchanged).
