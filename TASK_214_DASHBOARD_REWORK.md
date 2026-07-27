@@ -8,9 +8,10 @@ the work is here.
 
 ## 0. Baseline as measured on the base commit
 
-Environment: no GPU (`CUDA_VISIBLE_DEVICES=99`), tools from
-`/spinning/htsglang-gpu/.venv/bin`, `PYTHONPATH` pointed at this worktree's
-`python/` directory (the venv has a different checkout installed).
+Environment: no GPU (`CUDA_VISIBLE_DEVICES=99`), tools from the project venv
+(`${HTSGLANG_VENV:-<venv>}/bin`), with `PYTHONPATH` pointed at this worktree's
+`python/` directory — the venv generally has a different checkout installed,
+and without that the planner package resolves to the wrong tree.
 
 | gate | command | baseline |
 | --- | --- | --- |
