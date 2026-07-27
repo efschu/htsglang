@@ -472,8 +472,11 @@ def test_episode_window_exhaustion_demotes_with_cap():
     mgr._budget_evaluate_episodes()
     assert slot.budget_demoted
     assert not slot.budget_tick_release  # drain grace running (no spec guard)
-    # Herabstufung: generation capped at the CURRENT output -> the stock
-    # finish delivers what exists and donates the prefix after the drain.
+    # The cap is NOT set at the demote instant (it would race the in-flight
+    # tick result into an immediate host finish, swallowing the handover --
+    # GPU-measured). It lands at the quiescent completion points.
+    assert req.sampling_params.max_new_tokens == 4096
+    mgr._budget_finish_cap(req, extra=0)
     assert req.sampling_params.max_new_tokens == len(req.output_ids)
     assert mgr._budget_counters.episodes_demoted == 1
     assert mgr._budget_counters.exhaustions == {"episode-window": 1}
@@ -518,6 +521,8 @@ def test_demoted_session_is_excluded_from_ticks_until_grace_expiry():
     mgr._budget_evaluate_episodes()
     assert slot.budget_tick_release
     assert mgr._pick_tick_slot(None) is slot
+    # the released finishing tick appends one token, then FINISH_LENGTH
+    assert req.sampling_params.max_new_tokens == len(req.output_ids) + 1
     assert mgr._budget_counters.episodes_demoted == 1
 
 
@@ -527,10 +532,13 @@ def test_spec_host_finish_guard_skips_the_drain_grace():
     cfg = SpillBudgetConfig(episode_seconds=1.0)
     mgr = _budget_manager(cfg)
     mgr.scheduler.spec_algorithm = types.SimpleNamespace(is_none=lambda: False)
-    slot = _slot_for(mgr, _spilled_req(1), region=0, start=0.0)
+    req = _spilled_req(1)
+    slot = _slot_for(mgr, req, region=0, start=0.0)
     mgr._budget_now = 2.0
     mgr._budget_evaluate_episodes()
     assert slot.budget_demoted and slot.budget_tick_release
+    # host-finish path: the releasing tick appends the finishing token
+    assert req.sampling_params.max_new_tokens == len(req.output_ids) + 1
 
 
 def test_try_spill_declines_at_the_session_count_budget():

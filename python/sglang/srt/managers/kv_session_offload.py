@@ -2744,6 +2744,10 @@ class KVSessionOffloadManager:
                 continue
             if self._iter_ct - slot.budget_demote_iter > cfg.demote_grace_iters:
                 slot.budget_tick_release = True
+                # Quiescent since the demote (no ticks ran) -> the cap is
+                # race-free here; the released tick appends the finishing
+                # token and update_finish_state ends the session on host.
+                self._budget_finish_cap(slot.req, extra=1)
                 self._log(
                     "kv-session-offload BUDGET: demoted rid=%s drain grace "
                     "(%d iters) expired -> finishing on host (tail dropped).",
@@ -2784,12 +2788,17 @@ class KVSessionOffloadManager:
         slot.budget_demote_iter = self._iter_ct
         self._budget_counters.episodes_demoted += 1
         self._budget_counters.note_exhaustion(reason)
-        sp = getattr(req, "sampling_params", None)
-        cap = max(1, len(req.output_ids))
-        if sp is not None and (
-            getattr(sp, "max_new_tokens", None) is None or sp.max_new_tokens > cap
-        ):
-            sp.max_new_tokens = cap
+        # LIVENESS ends here (the tick exclusion below stops all host decode),
+        # but the max_new_tokens CAP is deliberately NOT set yet. Capping at
+        # the demote instant races the in-flight tick pipeline: the pending
+        # tick result runs update_finish_state with len(output) already at the
+        # cap, so the session finishes ON HOST in the same iteration and the
+        # release path (head freed, no radix insert) swallows the handover --
+        # demotions_drained would be structurally unreachable (GPU-measured:
+        # DEMOTING and 'finished on host' in the same second). The cap is
+        # applied at the two QUIESCENT completion points instead:
+        # _finalize_restore (drain done -> device finish + donation) and the
+        # tick_release grant (grace expiry / spec host-finish guard).
         spec_algo = getattr(self.scheduler, "spec_algorithm", None)
         if (
             spec_algo is not None
@@ -2797,16 +2806,33 @@ class KVSessionOffloadManager:
             and not resume_under_spec_enabled()
         ):
             slot.budget_tick_release = True
+            self._budget_finish_cap(req, extra=1)
         self._log(
             "kv-session-offload BUDGET: DEMOTING rid=%s (budget '%s' "
-            "exhausted): generation capped at %d output tokens; work is kept "
-            "-- the spilled tail drains and the finish donates the prefix "
-            "(continuation = prefix hit). host_finish_fallback=%s",
+            "exhausted) at %d output tokens: liveness ends (no further host "
+            "ticks); work is kept -- the spilled tail drains and the finish "
+            "donates the prefix (continuation = prefix hit). "
+            "host_finish_fallback=%s",
             req.rid,
             reason,
-            cap,
+            len(req.output_ids),
             slot.budget_tick_release,
         )
+
+    @staticmethod
+    def _budget_finish_cap(req, extra: int) -> None:
+        """Cap a demoted session's generation at its settled output length
+        (+``extra`` for a path whose finishing step must still append a
+        token). Called only at quiescent completion points -- never at the
+        demote instant (see _budget_demote). update_finish_state then ends
+        the session with FINISH_LENGTH and finished_len == the cap, so the
+        client receives exactly what was produced."""
+        sp = getattr(req, "sampling_params", None)
+        if sp is None:
+            return
+        cap = max(1, len(req.output_ids) + max(0, int(extra)))
+        if getattr(sp, "max_new_tokens", None) is None or sp.max_new_tokens > cap:
+            sp.max_new_tokens = cap
 
     def budget_stats(self) -> dict:
         """Counters + the four residency states, for the dashboard. The
@@ -4922,6 +4948,9 @@ class KVSessionOffloadManager:
                 # STOCK finish donates the whole prefix to the radix tree
                 # (HiRadixCache then write-backs per its own policy). The
                 # continuation is a prefix hit -- work kept, liveness gone.
+                # The cap lands HERE (quiescent -- finalize requires the tick
+                # result to be settled), never at the demote instant.
+                self._budget_finish_cap(req, extra=0)
                 self._budget_counters.demotions_drained += 1
             elif self._budget_cooldown is not None:
                 # (a)/(c) cooldown arms for a LIVE restored session: not a
