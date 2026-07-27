@@ -184,9 +184,7 @@ class TestBatonSelfHeal(CustomTestCase):
             self.assertIn("newer than its sources", verdict.reason)
 
             self.assertTrue(self._wait(d / "lock", 5.0))
-            self.assertFalse(
-                (d / "lock").exists(), "the orphaned lock was left behind"
-            )
+            self.assertFalse((d / "lock").exists(), "the orphaned lock was left behind")
             self.assertTrue((d / "hicache_hash_cpp.so").exists())
 
     def test_a_live_build_is_not_stolen_from(self):

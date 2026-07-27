@@ -91,16 +91,22 @@ def load_extension_with_recovery(
 ) -> Any:
     from torch.utils.cpp_extension import load
 
+    from sglang.jit_kernel.baton_health import jit_build_guard
+
+    # The recovery below handles a broken cache; it cannot handle an abandoned
+    # build lock, because a process stuck in FileBaton.wait() never raises.
+    # See sglang.jit_kernel.baton_health.
     try:
-        return load(
-            name=name,
-            sources=list(sources),
-            extra_cflags=None if extra_cflags is None else list(extra_cflags),
-            extra_cuda_cflags=(
-                None if extra_cuda_cflags is None else list(extra_cuda_cflags)
-            ),
-            verbose=verbose,
-        )
+        with jit_build_guard(name, sources=sources):
+            return load(
+                name=name,
+                sources=list(sources),
+                extra_cflags=None if extra_cflags is None else list(extra_cflags),
+                extra_cuda_cflags=(
+                    None if extra_cuda_cflags is None else list(extra_cuda_cflags)
+                ),
+                verbose=verbose,
+            )
     except Exception as exc:
         build_directory = _get_build_directory(name)
         if not _is_recoverable_load_error(exc, name, build_directory):
@@ -116,15 +122,16 @@ def load_extension_with_recovery(
         if build_directory.exists():
             shutil.rmtree(build_directory)
 
-        return load(
-            name=name,
-            sources=list(sources),
-            extra_cflags=None if extra_cflags is None else list(extra_cflags),
-            extra_cuda_cflags=(
-                None if extra_cuda_cflags is None else list(extra_cuda_cflags)
-            ),
-            verbose=verbose,
-        )
+        with jit_build_guard(name, sources=sources):
+            return load(
+                name=name,
+                sources=list(sources),
+                extra_cflags=None if extra_cflags is None else list(extra_cflags),
+                extra_cuda_cflags=(
+                    None if extra_cuda_cflags is None else list(extra_cuda_cflags)
+                ),
+                verbose=verbose,
+            )
 
 
 __all__ = ["load_extension_with_recovery"]

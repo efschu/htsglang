@@ -774,6 +774,15 @@ def _ext_cache_guarded(name: str):
     marker = None
     try:
         from sglang.jit_kernel import cache_health
+        from sglang.jit_kernel.baton_health import install_baton_selfheal
+
+        # Residue and lock are two different wrecks the same killed build can
+        # leave. cache_health below removes the residue; this bounds the wait
+        # on the lock, which no amount of sweeping reaches -- a process stuck
+        # in FileBaton.wait() never gets far enough to sweep anything. The
+        # build marker written below is what tells that check a co-located
+        # rank is compiling here rather than gone.
+        install_baton_selfheal()
 
         build_dir = _ext_build_dir(name)
         if _ext_selfheal_enabled():

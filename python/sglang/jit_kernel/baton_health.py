@@ -110,10 +110,6 @@ BATON_ORPHAN_MARKER = "SGLANG_JIT_BATON_ORPHANED"
 #: A finished cpp_extension build. ``.pyd`` is torch's Windows name for it.
 ARTIFACT_SUFFIXES = (".so", ".pyd")
 
-#: Sources torch copies into the build directory itself (``load_inline``).
-#: Listed so they are not mistaken for build products.
-_SOURCE_SUFFIXES = (".cpp", ".cc", ".cxx", ".c", ".cu", ".hip", ".sycl")
-
 #: How long a build directory must be motionless before "nobody is building
 #: here" is a fair reading. Two orders of magnitude above the sub-second window
 #: in which a warm-cache process holds the lock for a no-op ninja run, and
@@ -353,7 +349,9 @@ def claim_baton(lock_path: PathLike) -> bool:
 def _selfhealing_wait(baton) -> None:
     """Replacement for ``FileBaton.wait``. Bounded, and never silent."""
     lock = Path(baton.lock_file_path)
-    poll = min(getattr(baton, "wait_seconds", _POLL_SECONDS) or _POLL_SECONDS, _POLL_SECONDS)
+    poll = min(
+        getattr(baton, "wait_seconds", _POLL_SECONDS) or _POLL_SECONDS, _POLL_SECONDS
+    )
     quiet = _env_float("SGLANG_JIT_BATON_QUIET_SECONDS", DEFAULT_QUIET_SECONDS)
     limit = _env_float("SGLANG_JIT_BATON_MAX_WAIT_SECONDS", DEFAULT_MAX_WAIT_SECONDS)
 

@@ -10,10 +10,16 @@ from typing import List
 import torch
 from torch.utils.cpp_extension import load
 
+from sglang.jit_kernel.baton_health import jit_build_guard
 from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
 
 root = Path(__file__).parent.resolve()
-hf3fs_utils = load(name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"])
+_sources = [f"{root}/hf3fs_utils.cpp"]
+# An interrupted build leaves torch's `lock` behind and every later import of
+# this module then waits on it forever; the guard makes that lock recognisable
+# as orphaned. See sglang.jit_kernel.baton_health.
+with jit_build_guard("hf3fs_utils", sources=_sources):
+    hf3fs_utils = load(name="hf3fs_utils", sources=_sources)
 
 logger = logging.getLogger(__name__)
 

@@ -7,10 +7,12 @@ import torch
 from torch.utils.cpp_extension import load
 from tqdm import tqdm
 
+from sglang.jit_kernel.baton_health import jit_build_guard
+
 root = Path(__file__).parent.resolve()
-hf3fs_utils = load(
-    name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"], verbose=True
-)
+_sources = [f"{root}/hf3fs_utils.cpp"]
+with jit_build_guard("hf3fs_utils", sources=_sources):
+    hf3fs_utils = load(name="hf3fs_utils", sources=_sources, verbose=True)
 
 
 def test_rw_shm():

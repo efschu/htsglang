@@ -171,14 +171,20 @@ class KvVmmArena:
         out_dir = os.path.join(tempfile.gettempdir(), "sgl_kv_vmm_arena", self._sfx)
         os.makedirs(out_dir, exist_ok=True)
         libname = f"sgl_kv_vmm_arena_stub_{self._sfx}"
-        torch.utils.cpp_extension.load_inline(
-            name=libname,
-            cpp_sources=_stub_source(self._sfx),
-            with_cuda=False,  # pure arithmetic — no nvcc, no CUDA headers
-            is_python_module=False,
-            verbose=False,
-            build_directory=out_dir,
-        )
+        # A build killed before it released torch's `lock` here would stall
+        # every later arena with the same suffix; the guard bounds that wait.
+        # See sglang.jit_kernel.baton_health.
+        from sglang.jit_kernel.baton_health import jit_build_guard
+
+        with jit_build_guard(libname, build_directory=out_dir):
+            torch.utils.cpp_extension.load_inline(
+                name=libname,
+                cpp_sources=_stub_source(self._sfx),
+                with_cuda=False,  # pure arithmetic — no nvcc, no CUDA headers
+                is_python_module=False,
+                verbose=False,
+                build_directory=out_dir,
+            )
         self._so_path = f"{out_dir}/{libname}.so"
         lib = ctypes.CDLL(self._so_path)
         self._fn_set_base = getattr(lib, f"kvarena_set_base_{self._sfx}")

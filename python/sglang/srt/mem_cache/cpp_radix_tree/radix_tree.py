@@ -6,16 +6,23 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from torch.utils.cpp_extension import load
 
+from sglang.jit_kernel.baton_health import jit_build_guard
+
 _abs_path = os.path.dirname(os.path.abspath(__file__))
-radix_tree_cpp = load(
-    name="radix_tree_cpp",
-    sources=[
-        f"{_abs_path}/tree_v2_binding.cpp",
-        f"{_abs_path}/tree_v2_debug.cpp",
-        f"{_abs_path}/tree_v2.cpp",
-    ],
-    extra_cflags=["-O3", "-std=c++20"],
-)
+_sources = [
+    f"{_abs_path}/tree_v2_binding.cpp",
+    f"{_abs_path}/tree_v2_debug.cpp",
+    f"{_abs_path}/tree_v2.cpp",
+]
+# An interrupted build leaves torch's `lock` behind and every later import of
+# this module then waits on it forever; the guard makes that lock recognisable
+# as orphaned. See sglang.jit_kernel.baton_health.
+with jit_build_guard("radix_tree_cpp", sources=_sources):
+    radix_tree_cpp = load(
+        name="radix_tree_cpp",
+        sources=_sources,
+        extra_cflags=["-O3", "-std=c++20"],
+    )
 
 if TYPE_CHECKING:
 
