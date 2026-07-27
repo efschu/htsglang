@@ -43,6 +43,7 @@ import dataclasses
 import json
 import os
 import re
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
@@ -2082,6 +2083,85 @@ def tooltips_payload(payload: Optional[dict] = None) -> dict:
     return {"ok": True, "tooltips": tipsmod.tooltip_map(_measured_figures())}
 
 
+#: Last engine scrape per endpoint, so the lead metrics are a delta between
+#: two calls rather than a blocking sleep inside one. Same shape the landing
+#: strip uses client-side; kept here because ms-per-round needs the
+#: phase-labelled forward-time counter, which only the host-side scraper reads.
+_LEAD_PREV: Dict[str, tuple] = {}
+
+
+def bench_lead_metrics_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/bench_lead_metrics {endpoint} -> ms per round, from the engine.
+
+    ms/verify-round and ms/1k-prefill-tokens are the yardstick, not tok/s:
+    they say how long a round actually takes, which is what a change to the
+    split or the speculation depth moves. They come from the engine's
+    phase-labelled forward-time counter differenced across a window.
+
+    The window is the gap between two calls to this endpoint. Sampling twice
+    with a sleep in between would block a request for the length of the
+    window, and the caller is already polling.
+
+    A metric the engine did not export is ABSENT, never zero, and ``notes``
+    says why -- an empty column has to read as "the device timer was off"
+    rather than as "the round took no time".
+    """
+    from sglang.srt.rigmon.rates import phase_seconds, round_time
+    from sglang.srt.rigmon.sources import EngineScraper
+
+    endpoint = _norm_endpoint((payload or {}).get("endpoint") or "")
+    if not endpoint:
+        return {"ok": False, "error": "no endpoint given"}
+
+    scraper = EngineScraper(endpoint)
+    now = time.time()
+    try:
+        sample = scraper.scrape()
+    except Exception as e:
+        return {"ok": False, "error": f"scrape of {endpoint} failed: {e}"}
+    if not sample.up:
+        return {"ok": False, "error": sample.reason or "engine not reachable"}
+
+    prev = _LEAD_PREV.get(endpoint)
+    _LEAD_PREV[endpoint] = (now, sample)
+    if prev is None:
+        return {
+            "ok": True,
+            "metrics": {},
+            "notes": ["First sample: the round times appear on the next poll, "
+                      "because they are a delta across a window."],
+            "window_s": None,
+        }
+
+    prev_t, prev_sample = prev
+    dt = max(now - prev_t, 1e-6)
+    delta = phase_seconds(sample.per_rank_phase, prev_sample.per_rank_phase)
+    notes = []
+    if not delta:
+        notes.append(
+            "No phase-labelled forward time in this window: the round times "
+            "are absent, not zero. Boot the server with "
+            "SGLANG_ENABLE_METRICS_DEVICE_TIMER=1 (and "
+            "--enable-metrics-for-all-schedulers for the per-rank split)."
+        )
+    rt = round_time(sample.metrics, prev_sample.metrics, delta, dt)
+    metrics = {}
+    for key in ("ms_per_verify_round", "ms_per_decode_round",
+                "ms_per_1k_prefill_tokens", "ms_per_draft_pass",
+                "accept_length", "verify_ct"):
+        v = getattr(rt, key, None)
+        if v is not None:
+            metrics[key] = float(v)
+    if not metrics and not notes:
+        notes.append("Nothing moved in this window: the server was idle.")
+    return {
+        "ok": True,
+        "metrics": metrics,
+        "notes": notes,
+        "window_s": round(dt, 2),
+    }
+
+
 # ===========================================================================
 # Task #214 -- rig pairing. THIN adapters only.
 #
@@ -2963,6 +3043,9 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/resolve_flags"):
                 self._json(200, resolve_flags_payload(payload))
                 return
+            if self.path.startswith("/api/bench_lead_metrics"):
+                self._json(200, bench_lead_metrics_payload(payload))
+                return
             if self.path.startswith("/api/rig_pair/start"):
                 self._json(200, rig_pair_start_payload(payload))
                 return
@@ -3489,8 +3572,21 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       </fieldset>
     </div>
     <div>
+      <!-- Lead metrics: how long a round TAKES. tok/s hides which phase moved;
+           ms per verify round and ms per 1k prefill tokens do not. Absent is
+           shown as absent, never as zero. -->
       <fieldset>
-        <legend>results (streamed per test)</legend>
+        <legend>lead metrics &mdash; ms per round</legend>
+        <div id="bn_lead" class="muted">start a run, or point at a busy server&hellip;</div>
+      </fieldset>
+      <!-- Running and finished are separated, so a finished table is never
+           silently a partial one. -->
+      <fieldset id="bn_running_box" style="display:none">
+        <legend>running</legend>
+        <div id="bn_running"></div>
+      </fieldset>
+      <fieldset>
+        <legend>finished runs</legend>
         <div id="bn_out" class="muted">no run yet.</div>
       </fieldset>
     </div>
@@ -4982,6 +5078,8 @@ function showTab(t) {
     loadFlagCatalog(); refreshServerStatus();
   }
   if (t==='bench' && !window._benchInit) { window._benchInit=true; benchInit(); }
+  // The lead-metric poll runs only while its tab is visible.
+  if (t!=='bench') benchLeadStop();
   // Pairing state lives on the host, so entering the tab READS it rather than
   // creating anything -- a flow started from a script shows up here.
   if (t==='pair') pairRefresh(); else pairStopPoll();
@@ -7306,34 +7404,60 @@ async function autofillQuality() {
     }
   } catch(e) {}
 }
+// The chess suite follows the same line as the benchmark window: a run is
+// visibly RUNNING until it is finished, and the outcome is a table of
+// measure and value rather than a paragraph. The verdict stays a verdict --
+// it is a judgement, not a measurement, and reads as one.
+function qualityTableHtml(d){
+  const tk=d.tokens||{};
+  const rows=[];
+  rows.push({k:'verdict', v:d.verdict, cls:verdictClass(d.verdict)});
+  if(d.representation) rows.push({k:'representation', v:d.representation});
+  if(tk.prompt!=null) rows.push({k:'prompt tokens', v:tk.prompt});
+  if(tk.completion!=null) rows.push({k:'completion tokens', v:tk.completion});
+  if(tk.total!=null) rows.push({k:'total tokens', v:tk.total});
+  if(d.pieces_correct!=null) rows.push({k:'pieces correct', v:d.pieces_correct?'yes':'no'});
+  if(d.highlight_ok!=null) rows.push({k:'move highlighted', v:d.highlight_ok?'yes':'no'});
+  return '<table class="mx"><tr><th style="text-align:left">measure</th>'
+    +'<th style="text-align:left">value</th></tr>'
+    +rows.map(r=>'<tr data-key="q_'+r.k.replace(/ /g,'_')+'">'
+      +'<td style="text-align:left">'+esc(r.k)+'</td>'
+      +'<td style="text-align:left" class="'+(r.cls||'')+'"><b>'+esc(String(r.v))+'</b></td></tr>'
+      ).join('')+'</table>';
+}
 async function qualityRun() {
   if (!$('q_endpoint').value.trim() || !$('q_model').value.trim()) await autofillQuality();
   const endpoint = $('q_endpoint').value.trim();
   const model = $('q_model').value.trim();
-  if (!endpoint || !model) { $('q_status').innerHTML = '<span class="reasons">endpoint + model required</span>'; return; }
-  $('q_btn').disabled = true; $('q_status').innerHTML = 'calling the model (backend-side)…';
+  if (!endpoint || !model) { setHTML($('q_status'), '<span class="reasons">endpoint + model required</span>'); return; }
+  $('q_btn').disabled = true;
+  setHTML($('q_status'), '<span class="chip loading">running</span> calling the model (backend-side)…');
+  setHTML($('q_result'), '<span class="muted">waiting for the model…</span>');
   const budget = $('q_budget').value.trim();
   try {
+    // Not routed through api(): a quality run is a deliberate act and must
+    // not be aborted because something else asked a newer question.
     const r = await fetch('/api/quality_run', {method:'POST', body: JSON.stringify({
       endpoint, model, thinking: $('q_think').checked,
       thinking_budget: budget!==''?parseInt(budget):null})});
     const d = await r.json();
-    if (!d.ok) { $('q_status').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; return; }
+    if (!d.ok) {
+      setHTML($('q_status'), '<span class="reasons">'+esc(d.error)+'</span>');
+      setHTML($('q_result'), '');
+      return;
+    }
     window._lastQuality = d;
     $('q_svg').innerHTML = d.svg ? d.svg : '<span class="muted">no SVG extracted</span>';
-    const tk = d.tokens||{};
-    let h = '<div class="verdict '+verdictClass(d.verdict)+'">'+esc(d.verdict)+'</div>';
-    h += '<div class="legend"><b>tokens:</b> prompt '+(tk.prompt??'?')+' / completion '+(tk.completion??'?')+' / total '+(tk.total??'?')
-       + ' &nbsp; <b>representation:</b> '+esc(d.representation||'?')+'</div>';
-    h += '<div style="margin:.4rem 0">'+esc(d.report||'')+'</div>';
+    let h = qualityTableHtml(d);
+    if (d.report) h += '<div class="legend" style="margin-top:.4rem">'+esc(d.report)+'</div>';
     if (d.offer_download && d.svg)
-      h += '<button class="mini secondary" onclick="dlSvg()">download raw SVG</button>';
+      h += '<div class="actions" style="margin-top:.4rem"><button class="mini secondary" onclick="dlSvg()">download raw SVG</button></div>';
     else if (d.offer_download && d.raw)
-      h += '<button class="mini secondary" onclick="dlRaw()">download raw answer</button>';
-    $('q_result').innerHTML = h;
-    $('q_status').innerHTML = 'done.';
+      h += '<div class="actions" style="margin-top:.4rem"><button class="mini secondary" onclick="dlRaw()">download raw answer</button></div>';
+    setHTML($('q_result'), h);
+    setHTML($('q_status'), '<span class="chip ready">finished</span>');
     if ($('q_save').checked) await saveShot(d);
-  } catch(e) { $('q_status').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
+  } catch(e) { setHTML($('q_status'), '<span class="reasons">'+esc(''+e)+'</span>'); }
   finally { $('q_btn').disabled = false; }
 }
 function dlSvg() { const d=window._lastQuality; if(d&&d.svg) dlBlob(d.svg, 'chess.svg', 'image/svg+xml'); }
@@ -7442,20 +7566,93 @@ function benchPreset(p){
     if(el && !el.disabled) el.checked=ids.includes(t.test_id);
   }
 }
+// ===========================================================================
+// Benchmark window.
+//
+// Running and finished are separate panels: a table that is still filling
+// must never be mistaken for a complete result. Each finished run keeps its
+// own table of configuration / measure / value, so two runs can be read
+// against each other instead of one overwriting the other.
+//
+// ttft_ms and prefill tok/s are recorded by bench_suite per test and were
+// previously dropped on the floor here -- benchEvent read only status and
+// metric. They are measures, so they go in the measure column.
+// ===========================================================================
+const BENCH_STATUS_CLASS={pass:'st-pass',warn:'st-warn',fail:'st-fail',
+                          skip:'st-skip',blocked:'st-blocked'};
+function benchMeasures(r){
+  // Every number this test produced, one row each. Absent stays absent.
+  const out=[];
+  const m=r.metric||{};
+  if(m.name && m.name!=='none' && m.value!=null)
+    out.push({k:m.name, v:m.value, u:m.unit||''});
+  const d=r.detail||{};
+  if(d.ttft_ms!=null) out.push({k:'time to first token', v:(+d.ttft_ms).toFixed(1), u:'ms'});
+  if(d.prefill_tps!=null) out.push({k:'prefill', v:(+d.prefill_tps).toFixed(1), u:'tok/s'});
+  if(d.prompt_tokens!=null) out.push({k:'prompt', v:d.prompt_tokens, u:'tokens'});
+  return out;
+}
+function benchRowHtml(r){
+  const cls=BENCH_STATUS_CLASS[r.status]||'';
+  const ms=benchMeasures(r);
+  const note=r.reason||(r.detail&&r.detail.http_code!=null?('http '+r.detail.http_code):'')||'';
+  return '<tr data-key="bnr_'+r.test_id+'"><td>'+r.test_id+'</td>'
+    +'<td style="text-align:left">'+esc(r.label||'')+'</td>'
+    +'<td class="'+cls+'"><b>'+esc(r.status)+'</b></td>'
+    +'<td style="text-align:left">'+(ms.length
+        ? ms.map(x=>esc(x.k)+' <b>'+esc(String(x.v))+'</b>'+(x.u?' '+esc(x.u):'')).join('<br>')
+        : '<span class="muted">&mdash;</span>')+'</td>'
+    +'<td style="text-align:left" class="muted">'+esc(note)+'</td></tr>';
+}
+function benchTableHtml(rows){
+  return '<table class="mx"><tr><th>#</th><th>test</th><th>status</th>'
+    +'<th style="text-align:left">measure / value</th><th style="text-align:left">note</th></tr>'
+    +rows.map(benchRowHtml).join('')+'</table>';
+}
+function renderBenchRunning(){
+  const rows=window._benchResults||[];
+  const box=$('bn_running_box');
+  if(!window._benchActive){ if(box) box.style.display='none'; return; }
+  if(box) box.style.display='';
+  setHTML($('bn_running'),
+    '<div class="muted">'+rows.length+' of '+(window._benchSelected||0)
+    +' test(s) done&hellip;</div>'+benchTableHtml(rows));
+}
+function renderBenchFinished(){
+  const runs=window._benchRuns||[];
+  if(!runs.length){ setHTML($('bn_out'),'<span class="muted">no run yet.</span>'); return; }
+  let h='';
+  // Newest first: the run just finished is the one being read.
+  for(let i=runs.length-1;i>=0;i--){
+    const run=runs[i];
+    h+='<details data-key="bnrun_'+run.id+'"'+(i===runs.length-1?' open':'')+'>'
+      +'<summary style="cursor:pointer"><b>'+esc(run.label)+'</b> '
+      +'<span class="muted">'+esc(run.summary)+'</span></summary>'
+      +'<div class="legend">configuration: '+esc(run.config)+'</div>'
+      +benchTableHtml(run.results)+'</details>';
+  }
+  setHTML($('bn_out'), h);
+}
 async function benchRun(){
   const d=window._benchCatalog;
   const endpoint=$('bn_endpoint').value.trim();
-  if(!endpoint){ $('bn_out').innerHTML='<span class="reasons">endpoint required</span>'; return; }
+  if(!endpoint){ setHTML($('bn_out'),'<span class="reasons">endpoint required</span>'); return; }
   const selected=[];
   if(d) for(const t of d.tests){ const el=$('bnt_'+t.test_id); if(el&&el.checked) selected.push(t.test_id); }
-  if(!selected.length){ $('bn_out').innerHTML='<span class="reasons">select at least one test (or a preset).</span>'; return; }
+  if(!selected.length){ setHTML($('bn_out'),'<span class="reasons">select at least one test (or a preset).</span>'); return; }
   window._benchResults=[];
+  window._benchSelected=selected.length;
+  window._benchActive=true;
+  window._benchError=null;
   $('bn_run_btn').disabled=true;
-  $('bn_out').innerHTML='<table class="mx" id="bn_table"><tr><th>#</th><th>test</th><th>status</th>'
-    +'<th>metric</th><th>note</th></tr></table><div id="bn_done" class="muted">running&hellip;</div>';
+  renderBenchRunning();
+  benchLeadStart(endpoint);
+  const model=$('bn_model').value.trim();
   try{
-    const body={endpoint, model:$('bn_model').value.trim(), selected, force:$('bn_force').checked};
+    const body={endpoint, model, selected, force:$('bn_force').checked};
     if(d && d.capabilities) body.capabilities=d.capabilities;
+    // Streamed, so it is deliberately NOT routed through api(): aborting a
+    // benchmark because a newer request arrived would be wrong.
     const resp=await fetch('/api/bench_run',{method:'POST',body:JSON.stringify(body)});
     const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf='';
     while(true){
@@ -7467,30 +7664,80 @@ async function benchRun(){
         if(line.startsWith('data:')) benchEvent(JSON.parse(line.slice(5)));
       }
     }
-  }catch(e){ const el=$('bn_done'); if(el) el.innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
-  finally{ $('bn_run_btn').disabled=false; }
+  }catch(e){ window._benchError=''+e; }
+  finally{
+    $('bn_run_btn').disabled=false;
+    benchFinish(endpoint, model);
+  }
+}
+function benchFinish(endpoint, model){
+  window._benchActive=false;
+  const rows=window._benchResults||[];
+  const counts=window._benchCounts||{};
+  const summary=window._benchError
+    ? ('failed — '+window._benchError)
+    : (Object.keys(counts).map(k=>k+' '+counts[k]).join(' · ')||(rows.length+' test(s)'));
+  window._benchRuns=(window._benchRuns||[]);
+  window._benchRuns.push({
+    id: Date.now(),
+    label: new Date().toLocaleTimeString(),
+    summary: summary,
+    config: endpoint+(model?(' · '+model):'')+' · '+rows.length+' test(s)',
+    results: rows.slice(),
+  });
+  window._benchCounts=null;
+  renderBenchRunning();
+  renderBenchFinished();
 }
 function benchEvent(ev){
   if(ev.event==='result' && ev.result){
-    const r=ev.result; window._benchResults.push(r);
-    const m=r.metric||{};
-    const mtxt=(m.name && m.name!=='none' && m.value!=null)
-      ? (m.name+'='+m.value+(m.unit?' '+m.unit:'')) : '';
-    const cls={pass:'st-pass',warn:'st-warn',fail:'st-fail',skip:'st-skip',blocked:'st-blocked'}[r.status]||'';
-    const row=document.createElement('tr');
-    row.innerHTML='<td>'+r.test_id+'</td><td style="text-align:left">'+esc(r.label||'')+'</td>'
-      +'<td class="'+cls+'"><b>'+esc(r.status)+'</b></td><td>'+esc(mtxt)+'</td>'
-      +'<td style="text-align:left" class="muted">'
-      +esc(r.reason||(r.detail&&r.detail.http_code!=null?('http '+r.detail.http_code):'')||'')+'</td>';
-    const tb=$('bn_table'); if(tb) tb.appendChild(row);
+    window._benchResults.push(ev.result);
+    renderBenchRunning();
   } else if(ev.event==='done'){
-    const el=$('bn_done');
-    if(el) el.innerHTML='done &mdash; '+Object.keys(ev.counts||{})
-      .map(k=>k+' '+ev.counts[k]).join(' · ');
+    window._benchCounts=ev.counts||{};
   } else if(ev.event==='error'){
-    const el=$('bn_done');
-    if(el) el.innerHTML='<span class="reasons">'+esc(ev.error)+'</span>';
+    window._benchError=ev.error;
   }
+}
+// ---- lead metrics: ms per round, polled off the engine's device timer -----
+// A delta between two polls, computed host-side. The first poll only seeds
+// the window, which the panel says rather than showing an empty table.
+window._benchLeadTimer=null;
+const BENCH_LEAD_MS=2000;
+const LEAD_LABELS={
+  ms_per_verify_round:'ms / verify round',
+  ms_per_decode_round:'ms / decode round',
+  ms_per_1k_prefill_tokens:'ms / 1k prefill tokens',
+  ms_per_draft_pass:'ms / draft pass',
+  accept_length:'accepted tokens per round',
+  verify_ct:'verify rounds in window',
+};
+function benchLeadStart(endpoint){
+  benchLeadStop();
+  benchLeadPoll(endpoint);
+  window._benchLeadTimer=setInterval(()=>benchLeadPoll(endpoint), BENCH_LEAD_MS);
+}
+function benchLeadStop(){
+  if(window._benchLeadTimer){ clearInterval(window._benchLeadTimer); window._benchLeadTimer=null; }
+}
+async function benchLeadPoll(endpoint){
+  try{
+    const d=await api('/api/bench_lead_metrics',
+      {key:'lead', body:{endpoint}, timeout:BENCH_LEAD_MS-200});
+    if(!d.ok){ setHTML($('bn_lead'),'<span class="muted">'+esc(d.error||'')+'</span>'); return; }
+    const m=d.metrics||{};
+    const keys=Object.keys(LEAD_LABELS).filter(k=>m[k]!=null);
+    let h='';
+    if(keys.length)
+      h='<table class="mx"><tr><th style="text-align:left">measure</th><th>value</th></tr>'
+        +keys.map(k=>'<tr data-key="lead_'+k+'"><td style="text-align:left">'+esc(LEAD_LABELS[k])
+          +'</td><td><b>'+(+m[k]).toFixed(2)+'</b></td></tr>').join('')+'</table>';
+    // A metric the engine did not export is absent, never zero -- the note
+    // says which, so an empty panel never reads as "the round took no time".
+    for(const n of (d.notes||[])) h+='<div class="muted">'+esc(n)+'</div>';
+    if(d.window_s!=null) h+='<div class="legend">window '+d.window_s+' s</div>';
+    setHTML($('bn_lead'), h||'<span class="muted">nothing reported.</span>');
+  }catch(e){}
 }
 
 // ---- GitHub share (#152) -- preview first, explicit confirm, PAT per-use ----

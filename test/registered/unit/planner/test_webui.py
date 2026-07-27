@@ -2583,3 +2583,143 @@ class TestRigPairUiIsSteeringOnly(CustomTestCase):
         body = js[i:i + 4000]
         self.assertIn("never starts a run by itself", body)
         self.assertNotIn("serverStart", body)
+
+
+# ===========================================================================
+# Etappe 5: the benchmark and chess windows.
+# ===========================================================================
+
+
+class TestBenchLeadMetrics(CustomTestCase):
+    """ms per round is the yardstick; absent must never read as zero."""
+
+    def setUp(self):
+        webui._LEAD_PREV.clear()
+
+    def tearDown(self):
+        webui._LEAD_PREV.clear()
+
+    def test_endpoint_required(self):
+        d = webui.bench_lead_metrics_payload({"endpoint": ""})
+        self.assertFalse(d["ok"])
+
+    def test_first_call_only_seeds_the_window(self):
+        # A delta needs two samples. Saying so beats showing an empty table
+        # that looks like a measurement of nothing.
+        class _Sample:
+            up = True
+            reason = None
+            metrics = {}
+            info = {}
+            per_rank = {}
+            per_rank_phase = {}
+
+        with mock.patch(
+            "sglang.srt.rigmon.sources.EngineScraper.scrape",
+            return_value=_Sample(),
+        ):
+            d = webui.bench_lead_metrics_payload({"endpoint": "127.0.0.1:30000"})
+            self.assertTrue(d["ok"])
+            self.assertEqual(d["metrics"], {})
+            self.assertIn("next poll", " ".join(d["notes"]))
+
+    def test_missing_device_timer_is_explained_not_zeroed(self):
+        class _Sample:
+            up = True
+            reason = None
+            metrics = {}
+            info = {}
+            per_rank = {}
+            per_rank_phase = {}
+
+        with mock.patch(
+            "sglang.srt.rigmon.sources.EngineScraper.scrape",
+            return_value=_Sample(),
+        ):
+            webui.bench_lead_metrics_payload({"endpoint": "127.0.0.1:30000"})
+            d = webui.bench_lead_metrics_payload({"endpoint": "127.0.0.1:30000"})
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["metrics"], {})
+        joined = " ".join(d["notes"])
+        self.assertIn("absent, not zero", joined)
+        self.assertIn("SGLANG_ENABLE_METRICS_DEVICE_TIMER", joined)
+
+    def test_unreachable_engine_reports_rather_than_raises(self):
+        d = webui.bench_lead_metrics_payload({"endpoint": "127.0.0.1:1"})
+        self.assertFalse(d["ok"])
+        self.assertTrue(d["error"])
+
+
+class TestBenchLeadMetricsRoute(TestHttpRoundTrip):
+    def test_route(self):
+        d = self._post("/api/bench_lead_metrics", {"endpoint": ""})
+        self.assertFalse(d["ok"])
+
+
+class TestBenchWindow(CustomTestCase):
+    def test_running_and_finished_are_separate(self):
+        # A table still filling must never be mistaken for a complete result.
+        html = webui.INDEX_HTML
+        self.assertIn('id="bn_running_box"', html)
+        self.assertIn("<legend>finished runs</legend>", html)
+        js = _index_script()
+        self.assertIn("function renderBenchRunning(", js)
+        self.assertIn("function renderBenchFinished(", js)
+
+    def test_results_are_configuration_measure_value_tables(self):
+        js = _index_script()
+        self.assertIn("function benchTableHtml(", js)
+        self.assertIn("measure / value", js)
+        i = js.index("function renderBenchFinished(")
+        self.assertIn("configuration:", js[i:i + 1200])
+
+    def test_recorded_measures_are_no_longer_dropped(self):
+        # bench_suite records these per test; the old renderer read only
+        # status and metric and threw the rest away.
+        js = _index_script()
+        i = js.index("function benchMeasures(")
+        body = js[i:i + 900]
+        self.assertIn("d.ttft_ms", body)
+        self.assertIn("d.prefill_tps", body)
+
+    def test_lead_metrics_are_ms_per_round(self):
+        js = _index_script()
+        self.assertIn("ms_per_verify_round:'ms / verify round'", js)
+        self.assertIn("ms_per_1k_prefill_tokens:'ms / 1k prefill tokens'", js)
+
+    def test_a_run_is_never_aborted_by_a_newer_request(self):
+        # api() aborts the previous call under the same key, which is right
+        # for a poll and wrong for a benchmark.
+        js = _index_script()
+        i = js.index("async function benchRun(")
+        body = js[i:js.index("function benchFinish(")]
+        self.assertIn("deliberately NOT routed through api()", body)
+
+    def test_lead_poll_stops_when_the_tab_is_left(self):
+        js = _index_script()
+        self.assertIn("if (t!=='bench') benchLeadStop();", js)
+
+
+class TestChessWindow(CustomTestCase):
+    """Same design line as the benchmark window."""
+
+    def test_result_is_a_measure_value_table(self):
+        js = _index_script()
+        self.assertIn("function qualityTableHtml(", js)
+        i = js.index("function qualityTableHtml(")
+        body = js[i:i + 1400]
+        self.assertIn("prompt tokens", body)
+        self.assertIn("completion tokens", body)
+
+    def test_running_state_is_visible(self):
+        js = _index_script()
+        i = js.index("async function qualityRun(")
+        body = js[i:i + 2000]
+        self.assertIn('chip loading', body)
+        self.assertIn('chip ready', body)
+
+    def test_verdict_stays_a_verdict(self):
+        # It is a judgement, not a measurement, and has to read as one.
+        js = _index_script()
+        i = js.index("function qualityTableHtml(")
+        self.assertIn("verdictClass(d.verdict)", js[i:i + 1400])
