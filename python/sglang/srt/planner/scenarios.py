@@ -1012,6 +1012,10 @@ def render_scenario_text(plan: ScenarioPlan) -> str:
     for m in s.metrics:
         star = " (primary)" if m.primary else ""
         lines.append(f"  - {m.label} [{m.unit}, {m.direction}]{star}")
+        if m.context_only:
+            # A metric shown without being trusted has to say which it is,
+            # here as well as in the JSON, or it gets compared anyway.
+            lines.append(f"      context only: {m.context_only}")
     if s.windows:
         lines.append("")
         lines.append("Windows (reported separately):")

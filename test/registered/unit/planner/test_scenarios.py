@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import dataclasses
 import unittest
 
 from sglang.srt.planner.scenarios import (
@@ -301,6 +302,69 @@ class TestTheYardstick(CustomTestCase):
         rule = SCENARIOS["noise_floor"].stop_rules[0].condition
         self.assertIn("round time", rule)
         self.assertIn("throughput", rule)
+
+
+class TestHarnessBindingsAreReal(CustomTestCase):
+    """A scenario must not emit a command the shipped harness cannot parse.
+
+    The whole point of binding to sglang's own load generators instead of
+    writing another one is that the flags and result fields already exist; a
+    binding that has drifted turns that saving into a trap, so it is checked
+    against the harness source and the harness result type rather than against
+    a copy of them.
+    """
+
+    def _harness_source(self, module: str) -> str:
+        import importlib
+
+        mod = importlib.import_module(module)
+        with open(mod.__file__) as f:
+            return f.read()
+
+    def test_every_bound_module_imports(self):
+        import importlib
+
+        for key, s in SCENARIOS.items():
+            if s.harness:
+                importlib.import_module(s.harness.module)
+
+    def test_every_emitted_flag_exists_in_the_harness(self):
+        for key, s in SCENARIOS.items():
+            if not s.harness:
+                continue
+            src = self._harness_source(s.harness.module)
+            flags = [f.split()[0] for f in s.harness.fixed_flags]
+            flags += [
+                v for v in s.harness.axis_flags.values() if v.startswith("--")
+            ]
+            for flag in flags:
+                self.assertIn(
+                    f'"{flag}"', src, f"{key}: {flag} is not a flag of {s.harness.module}"
+                )
+
+    def test_every_harness_result_field_exists_on_the_result_type(self):
+        from sglang.benchmark.serving import BenchmarkMetrics
+
+        fields = {f.name for f in dataclasses.fields(BenchmarkMetrics)}
+        for key, s in SCENARIOS.items():
+            if not s.harness or s.harness.module != "sglang.benchmark.serving":
+                continue
+            for metric_key, field in s.harness.metric_fields.items():
+                # A parenthesised entry names a source the harness does not
+                # have -- the collector, or the engine's own exposition.
+                if field.startswith("("):
+                    continue
+                self.assertIn(
+                    field, fields, f"{key}: {metric_key} reads a missing field"
+                )
+
+    def test_the_command_it_prints_is_the_module_that_exists(self):
+        from sglang.srt.planner.scenarios import build_harness_command
+
+        s = SCENARIOS["noise_floor"]
+        cmd = build_harness_command(s, {}, base_url="http://x:1")
+        self.assertTrue(cmd["command"].startswith("python -m sglang.benchmark.serving"))
+        self.assertTrue(cmd["runnable"])
 
 
 if __name__ == "__main__":

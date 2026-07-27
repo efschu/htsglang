@@ -28,6 +28,15 @@ Typical two-rig setup::
         --join-token <token> --engine http://127.0.0.1:30000
 
 Rig 2 needs no inbound firewall rule: it opens the connection.
+
+This CLI is host telemetry only. The five levers and the measurement
+scenarios are planner data and live in the planner CLI::
+
+    python -m sglang.planner --levers
+    python -m sglang.planner --list-scenarios
+
+They were reachable from here as well, which meant one concept behind two
+front doors in two argument styles.
 """
 
 from __future__ import annotations
@@ -356,72 +365,6 @@ def cmd_kv_budget(args) -> int:
     return 0
 
 
-def cmd_levers(args) -> int:
-    from sglang.srt.planner.levers import render_levers_text, suggest_levers
-
-    hw, _ = load_cached_profiles()
-    facs = [f.key for f in facilities(detect_host_environment()) if f.available]
-    out = suggest_levers(
-        heterogeneous=not args.homogeneous,
-        probe=hw,
-        node_count=args.nodes,
-        facility_keys_available=facs,
-        keys=(args.lever.split(",") if args.lever else None),
-    )
-    if args.json:
-        print(json.dumps([s.to_json() for s in out], indent=1))
-        return 0
-    print(render_levers_text(out))
-    return 0
-
-
-def cmd_scenario(args) -> int:
-    from sglang.srt.planner.scenarios import (
-        SCENARIOS,
-        build_harness_command,
-        plan_scenario,
-        render_scenario_text,
-        suggest,
-    )
-
-    if args.list:
-        for key, s in SCENARIOS.items():
-            print(f"{key:34s} {s.question}")
-        return 0
-    scenario = None
-    if args.key:
-        scenario = SCENARIOS.get(args.key)
-        if scenario is None:
-            print(f"error: no scenario {args.key!r}", file=sys.stderr)
-            return 2
-    elif args.question:
-        scenario = suggest(args.question)
-        if scenario is None:
-            print(
-                "No scenario matches that question. Use --list to see the "
-                "known ones, or add your own with a scenario JSON file.",
-                file=sys.stderr,
-            )
-            return 1
-    else:
-        print("error: give --key, --question or --list", file=sys.stderr)
-        return 2
-    plan = plan_scenario(scenario, facilities(detect_host_environment()))
-    if args.json:
-        print(json.dumps(plan.to_json(), indent=1))
-        return 0
-    print(render_scenario_text(plan))
-    if scenario.harness:
-        first = {a.key: (a.values[0] if a.values else None) for a in scenario.axes}
-        cmd = build_harness_command(scenario, first, base_url=args.engine)
-        print()
-        print("First point drives the existing harness:")
-        print(f"  {cmd['command']}")
-        for e in cmd["external"]:
-            print(f"  before it: set {e['label']} = {e['value']} ({e['apply']})")
-    return 0
-
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m sglang.srt.rigmon",
@@ -506,22 +449,6 @@ def build_parser() -> argparse.ArgumentParser:
     kv.add_argument("--no-backup", action="store_true")
     kv.add_argument("--json", action="store_true")
     kv.set_defaults(func=cmd_kv_budget)
-
-    lv = sub.add_parser("levers", help="the five lever profiles for this rig")
-    lv.add_argument("--homogeneous", action="store_true",
-                    help="treat the rig as uniform (skip heterogeneous-only flags)")
-    lv.add_argument("--nodes", type=int, default=1)
-    lv.add_argument("--lever", default="", help="comma-separated subset")
-    lv.add_argument("--json", action="store_true")
-    lv.set_defaults(func=cmd_levers)
-
-    sc = sub.add_parser("scenario", help="benchmark scenarios")
-    sc.add_argument("--key", default="")
-    sc.add_argument("--question", default="")
-    sc.add_argument("--list", action="store_true")
-    sc.add_argument("--engine", default="http://127.0.0.1:30000")
-    sc.add_argument("--json", action="store_true")
-    sc.set_defaults(func=cmd_scenario)
 
     return p
 
