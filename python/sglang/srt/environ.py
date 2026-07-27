@@ -576,10 +576,16 @@ class Envs:
     # posted and progressed together, so this caps per-request footprint
     # without costing extra round trips.
     SGLANG_HTCCL_UCX_CHUNK_MIB = EnvInt(4)
-    # all_reduce payload (MiB) at or above which the one-step flat exchange
-    # gives way to a ring. Below it, latency beats bandwidth -- which is the
-    # regime bs=1 decode lives in.
-    SGLANG_HTCCL_UCX_RING_MIB = EnvInt(1)
+    # all_reduce payload (KiB) at or above which the one-step flat exchange
+    # gives way to a ring. Below it latency beats bandwidth; above it the
+    # flat exchange's (W-1) payloads per direction dominate. Measured
+    # crossover on a cross-rig world-4 group is ~22 KiB (task #244), so a
+    # speculative verify all-reduce sits on the ring side and a bs=1 decode
+    # all-reduce on the flat side.
+    SGLANG_HTCCL_UCX_RING_KIB = EnvInt(24)
+    # Deprecated MiB spelling of the same threshold; still honoured, and it
+    # wins when both are set.
+    SGLANG_HTCCL_UCX_RING_MIB = EnvInt(None)
     # Seconds before a pending UCX request is declared stuck. Guards against
     # a silent hang when a peer dies or the ranks disagree about the
     # collective sequence.

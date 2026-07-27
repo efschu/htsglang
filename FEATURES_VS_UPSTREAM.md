@@ -698,7 +698,7 @@ host-staged semantics as `gloo` but RDMA instead of TCP. **Cross-checked**, merg
 |---|---|
 | ctypes over `libucp`, not ucx-py or Cython | version parity requires loading a *specific* library path; `ucx-py` bundles its own UCX and hard-codes one side of the mismatch, and is asyncio-shaped, the wrong control flow for a synchronous collective on a bs=1 decode path. Cython needs a compiler and UCX headers per host, and the second rig has the runtime libraries without the `-dev` package. A subprocess bridge adds an IPC hop to a ~1.5 us path. ctypes needs no build step and no headers, and takes the library from `SGLANG_HTCCL_UCX_LIB`. Struct layouts are mask-driven, over-allocated, and the transcribed offsets are asserted at import |
 | Version parity enforced, not hoped for | mixed UCX releases do not degrade; endpoint creation fails with `invalid bandwidth 0.00`. The rendezvous gathers each rank's version over the existing `gloo` `cpu_group` and refuses **before any endpoint exists**, naming every rank's version, library path and the `SGLANG_HTCCL_UCX_LIB` remedy |
-| Latency shaping | default is a single-step full exchange, one round trip at any world size; `all_reduce` switches to a ring above `SGLANG_HTCCL_UCX_RING_MIB`. Endpoints are persistent and wired at construction, so no decode step pays a handshake. `handles()` is size-independent, unlike `shm`'s slot ceiling, so two ranks can never disagree about whether a collective goes over UCX or `gloo` |
+| Latency shaping | default is a single-step full exchange, one round trip at any world size; `all_reduce` switches to a ring above `SGLANG_HTCCL_UCX_RING_KIB` (24 KiB, measured -- see the world-4 table below). Endpoints are persistent and wired at construction, so no decode step pays a handshake. `handles()` is size-independent, unlike `shm`'s slot ceiling, so two ranks can never disagree about whether a collective goes over UCX or `gloo` |
 
 **Status (`ucx`):** implemented and validated on real RDMA, CPU-only — not yet exercised with a GPU
 or a model.
@@ -708,6 +708,37 @@ or a model.
 | Local, single host, `self`/`sm`/`tcp` loopback | 16 tests green across world 2/3/4, every collective against a computed reference, including the buffer-aliasing and `reduce_scatter dim>=2` traps, forced multi-chunk transfers and idempotent teardown; the 47 pre-existing tests still pass |
 | Cross-rig over 40G RoCE, `UCX_TLS=rc` with no TCP fallback, so a pass proves RDMA carried it | all collectives green on both ranks; rendezvous and wireup 0.11 s |
 | Raw link the same day, `ucx_perftest tag_bw` unidirectional | 3413 MB/s (~27.3 Gbit/s) |
+
+**World 4 is not world 2, and the difference is the algorithm, not the wire** (task #244). Every
+figure in the world-2 table below understates a cross-rig TP=4 decode, because the flat exchange
+puts (W-1) payloads in each direction per collective. Measured at the production rank placement
+(ranks 0-2 on rig 1, rank 3 on rig 2), `all_reduce`, median of 100 after 20 warmup:
+
+| Payload | world 2 | world 4, flat | world 4, ring | raw link, `ucx_perftest tag_lat` |
+|---|---|---|---|---|
+| 20 KiB (bs=1 decode) | 29.1 us | 101.1 us | 106.6 us | 10.9 us |
+| 80 KiB (4-token verify) | 53.5 us | 385.9 us | **195.0 us** | 28.1 us |
+| 128 KiB | — | 646.3 us | 270.4 us | — |
+
+Three verdicts follow, all falsifiable from the same harness
+(`scripts/r3val/link_collective_cost.py`, `run_collective_cost.sh`):
+
+* **The wire is not the cost.** The same world-4 group with *every rank on one host and no wire at
+  all* is **slower** than across the RDMA link (80 KiB: 486 us vs 386 us; 640 KiB: 47.0 ms vs
+  33.0 ms). Cost tracks the bytes each rank pushes through its single-threaded UCX worker, not the
+  link.
+* **Rendezvous is not the cost.** `UCX_RNDV_THRESH=inf` at world 4 moves 80 KiB from 394 to 389 us
+  — inside noise. The protocol-handshake hypothesis is refuted at decode sizes.
+* **The ring threshold was 25x too high.** flat and ring cross at ~22 KiB, and the ring wins 2x from
+  64 KiB up, so `SGLANG_HTCCL_UCX_RING_KIB` now defaults to 24 KiB (was `..._RING_MIB=1`, still
+  accepted). A speculative verify all-reduce is the far side of that crossover, so on a cross-rig
+  group the ring is the ordinary decode path. Exactness gated on the real link at world 4 across
+  8/16/23/24/25/32/80/128 KiB and ragged tails: 0 mismatches, ring and flat alike.
+
+Open, not fixed here: `all_gather` has no ring and stays at ~388 us for 80 KiB; and both algorithms
+fall off a cliff between 128 and 256 KiB (256 KiB: 34.3 ms flat / 15.6 ms ring, with the *local*
+stage and finish host copies accounting for most of it) — a decode never reaches that size, a large
+batch would.
 
 Transport throughput, median per direction while the reverse direction runs simultaneously, world 2,
 5 repetitions of per-cell medians:
