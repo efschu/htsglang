@@ -70,6 +70,14 @@ class CaseSpec:
     seed: int = PINNED_SEED
     #: whether SELF_DET_NEAR_TIE reruns are needed (run==run evidence).
     needs_rerun: bool = False
+    #: True when the row's fp band has NOT been measured on hardware yet. Such
+    #: a row is fully specified (configs, reference, class, runner
+    #: obligations) but must NOT gate: the #124 calibration lesson was that a
+    #: guessed band can be two orders of magnitude wrong, and a wrong band is
+    #: worse than no row. ``validate_matrix`` therefore admits ``band is
+    #: None`` only together with this flag, and the runner must refuse to
+    #: return a verdict for such a row until the band is filled in.
+    pending_calibration: bool = False
     #: GPU-window-only evidence beyond the trajectory assertion.
     quality_gate: Optional[str] = None
     notes: str = ""
@@ -110,6 +118,22 @@ _SOLO_BASE: Dict[str, Any] = {
 _SOLO_EAGER_REF: Dict[str, Any] = {
     **_SOLO_BASE,
     "disable_cuda_graph": True,
+}
+
+#: The chain-speculation configuration shared by BOTH arms of every spec row.
+#: Matching it across arms is the substance of the oracle, not a formality --
+#: an unmatched reference puts the verify forward's shape change in one arm
+#: only, and then the comparison measures speculation rather than the feature
+#: under test (Window 5's Gate 1). ``topk == 1`` is the only mode the lane
+#: admits (tree verify stays rejected, #76/#139), and ``k`` must be fixed per
+#: boot -- adaptive k is rejected on the lane precisely because it would make
+#: the verify capture multi-shaped.
+_CHAIN_SPEC: Dict[str, Any] = {
+    "speculative_algorithm": "EAGLE3",
+    "speculative_eagle_topk": 1,
+    "speculative_num_steps": 3,
+    "speculative_num_draft_tokens": 4,
+    "speculative_draft_placement": "solo",
 }
 
 
@@ -316,12 +340,131 @@ TEST_MATRIX: List[CaseSpec] = [
             "marlin vehicles is a contract decision, not a calibration."
         ),
     ),
+    CaseSpec(
+        case_id="weightless_spec_matched",
+        description=(
+            "Weightless-KV lane WITH chain speculation (#143) vs. a TP=1 solo "
+            "boot carrying the IDENTICAL speculative configuration. The "
+            "matched reference is the whole point: speculation changes the "
+            "target forward's shape (k+1 rows in one verify instead of one "
+            "decode row per token), so an unmatched reference measures "
+            "speculation, not the lane."
+        ),
+        model_role="dense_lane",
+        test_config={**_LANE_BASE, **_CHAIN_SPEC},
+        test_env={},
+        reference_config={**_SOLO_EAGER_REF, **_CHAIN_SPEC},
+        reference_env={},
+        expected_class=ByteIdentityClass.SPEC_NEAR_TIE,
+        num_decode_tokens=256,
+        band=None,  # MEASURE FIRST -- see notes
+        near_tie_margin=1.0,
+        needs_rerun=True,
+        pending_calibration=True,
+        quality_gate=(
+            "mean accept length (meta_info.spec_accept_length) clears its "
+            "floor and is recorded beside the reference arm's; Window 5 saw "
+            "the lane run 8-12% below the plain path on the same prompts, "
+            "unexplained -- this row is the content-pinned setting in which "
+            "that number is finally comparable"
+        ),
+        notes=(
+            "PRIMARY lane x spec oracle. Runner obligations: (1) capture the "
+            "target VERIFY logits, not ModelRunner.sample's decode row -- the "
+            "spec path never reaches that dump hook (bs*(k+1) rows fail its "
+            "shape[0] == 1 guard); use --determinism-logits-dump-dir with the "
+            "spec verify dump. (2) Project both arms with "
+            "SpecRun.to_trajectory() before comparing. (3) The draft is "
+            "bit-identical across the arms BY GEOMETRY -- the lane forces "
+            "--speculative-draft-placement solo with an UNSHARDED draft on "
+            "the head rank, and a TP=1 reference's draft is unsharded too -- "
+            "so the whole draft side is common-mode. Verify that assumption "
+            "at the window with the cheap TP=1 solo-vs-split A/B rather than "
+            "assuming it. BAND IS DELIBERATELY None: it must be MEASURED at "
+            "the GPU window before this row can gate, and it will NOT equal "
+            "weightless_decode's 24.0 -- the projected rows come from a "
+            "verify-shaped forward, and once the arms' accept lengths differ "
+            "the same token index is scored at different slot positions in "
+            "the two arms, which is a further fp difference. The #124 "
+            "calibration lesson applies verbatim: a guessed band is worse "
+            "than no row."
+        ),
+    ),
+    CaseSpec(
+        case_id="spec_replay_teacher_forced",
+        description=(
+            "Teacher-forced replay: the token sequence the lane+spec arm "
+            "emitted is fed back as a plain prompt to a NON-speculative boot "
+            "of the same geometry, and that boot's per-position argmax must "
+            "reproduce the sequence. This is the only row that reaches the "
+            "question the token-level checks are blind to -- did the verify "
+            "forward attend over the RIGHT KV context."
+        ),
+        model_role="dense_lane",
+        test_config={**_LANE_BASE, **_CHAIN_SPEC},
+        test_env={},
+        reference_config=dict(_SOLO_EAGER_REF),
+        reference_env={},
+        expected_class=ByteIdentityClass.SPEC_NEAR_TIE,
+        num_decode_tokens=256,
+        band=None,  # MEASURE FIRST -- see notes
+        near_tie_margin=1.0,
+        needs_rerun=True,
+        pending_calibration=True,
+        notes=(
+            "TEACHER-FORCED REPLAY, not a free-running A/B. The reference arm "
+            "runs ONE prefill over the test arm's emitted sequence and yields "
+            "one logits row per position; no reference generation happens, so "
+            "the two arms cannot fork and the comparison stays step-aligned "
+            "for the whole window. That is what makes this the sharpest "
+            "instrument available: an accept plumbing bug is caught by "
+            "check_accept_rule_exactness, but a verify reading the wrong KV "
+            "slots emits its own argmax perfectly consistently and is only "
+            "visible against an independently-computed continuation. Still "
+            "near-tie-gated, not 0-flip: a single prefill over N positions is "
+            "a third fp path, different from both decode and verify. BAND "
+            "DELIBERATELY None -- measure at the window."
+        ),
+    ),
 ]
 
 
 #: Deliberately-NOT-encoded cases, with the reason. These document negative
 #: knowledge so nobody "helpfully" adds them back as gates.
 EXCLUDED_CASES: Dict[str, str] = {
+    "spec_vs_nospec_token_identity": (
+        "MEASURED-FALSE PREMISE (#143 Window 5), not an oversight. "
+        "docs_new/weightless_chain_spec.md §5.2 originally asserted that a "
+        "lane WITH chain spec at temperature 0 must be TOKEN-IDENTICAL to the "
+        "lane WITHOUT spec -- 'a hard equality, not a similarity'. It is not. "
+        "Two control arms on plain TP=2 with the lane switched OFF show "
+        "speculation alone breaking strict token identity at temperature 0 on "
+        "the default path (common prefixes 1 / 172 / 16 / 256-of-256 across "
+        "four content classes). The greedy verify's ACCEPT RULE is exact -- "
+        "integer equality against the target argmax, no threshold, no "
+        "tolerance (eagle_utils.verify_tree_greedy_func; the "
+        "--speculative-accept-threshold-* knobs are consumed by the sampling "
+        "branch only) -- so a divergence cannot originate in the accept "
+        "decision. It originates in the target LOGITS: a verify scores k+1 "
+        "positions in one forward, a different batch shape and attention "
+        "kernel path from a one-row decode, hence a different fp reduction "
+        "order and a different argmax at near-ties. Note this is a claim "
+        "about the observed configuration, and 'plausible' is not 'proven': "
+        "the DISCRIMINATOR is the margin at the divergence, which is what the "
+        "weightless_spec_matched and spec_replay_teacher_forced rows measure. "
+        "Independently of fp there is also a STRUCTURAL losslessness caveat "
+        "that no reassociation argument covers: with repetition / presence / "
+        "frequency penalties active, a verify applies the round's pre-step "
+        "penalty vector to all k+1 draft positions (eagle_utils.py:919-941, "
+        "upstream's 'relaxed version of penalties for speculative decoding') "
+        "and only ONE token per round reaches the penalizers "
+        "(eagle_prepare_for_decode -> cumulate_penalty_output_tokens takes "
+        "req.output_ids[-1]), so the intermediate accepted tokens are never "
+        "counted. Inert at default sampling params, and therefore NOT the "
+        "explanation for Window 5 -- but it means 'greedy speculation is "
+        "lossless' is false by construction whenever penalties are set. "
+        "Do not add a spec-on-vs-spec-off token-identity gate."
+    ),
     "moe_offload_graph_vs_eager": (
         "MoE-offload captured-vs-eager is NOT machine-zero and NOT gateable as "
         "such: even at fraction=1.0 with zero offload code active, graph vs "
@@ -391,14 +534,27 @@ def validate_matrix() -> None:
                 "machine-zero row silently weakens the contract"
             )
             assert not c.needs_rerun, c.case_id
+        elif c.pending_calibration:
+            assert c.band is None, (
+                f"{c.case_id}: pending_calibration rows carry NO band -- a "
+                "value here would read as measured. Clear the flag when the "
+                "band is measured on hardware."
+            )
+            assert c.near_tie_margin is not None, (
+                f"{c.case_id}: the near-tie margin is a contract choice, not a "
+                "measurement, and is required even while the band is pending"
+            )
         else:
             assert c.band is not None and c.near_tie_margin is not None, (
                 f"{c.case_id}: {c.expected_class.value} requires explicit band "
-                "and near_tie_margin"
+                "and near_tie_margin (or pending_calibration=True)"
             )
-        if c.expected_class is ByteIdentityClass.SELF_DET_NEAR_TIE:
+        if c.expected_class in (
+            ByteIdentityClass.SELF_DET_NEAR_TIE,
+            ByteIdentityClass.SPEC_NEAR_TIE,
+        ):
             assert c.needs_rerun, (
-                f"{c.case_id}: SELF_DET_NEAR_TIE without a rerun cannot "
+                f"{c.case_id}: {c.expected_class.value} without a rerun cannot "
                 "establish run==run"
             )
         # The overclaim guard: no offload case may claim bit-exactness or
@@ -408,6 +564,23 @@ def validate_matrix() -> None:
                 f"{c.case_id}: offload vs no-offload is SELF_DET_NEAR_TIE, "
                 "never MACHINE_ZERO/DECODE_CLASS -- see EXCLUDED_CASES"
                 "['fp8_offload_machine_zero'] (retracted overclaim 0fb3d8007)"
+            )
+        # The Window-5 guard: a speculative arm may never be gated as
+        # bit-exact or argmax-clean against a NON-speculative reference. See
+        # EXCLUDED_CASES["spec_vs_nospec_token_identity"] -- that premise was
+        # measured false with the feature under test switched off.
+        spec_on = c.test_config.get("speculative_algorithm") is not None
+        spec_off = c.reference_config.get("speculative_algorithm") is None
+        if spec_on and spec_off:
+            assert c.expected_class is ByteIdentityClass.SPEC_NEAR_TIE, (
+                f"{c.case_id}: a speculative arm against a non-speculative "
+                "reference is SPEC_NEAR_TIE, never MACHINE_ZERO/DECODE_CLASS "
+                "-- see EXCLUDED_CASES['spec_vs_nospec_token_identity']"
+            )
+        if c.expected_class is ByteIdentityClass.SPEC_NEAR_TIE:
+            assert spec_on, (
+                f"{c.case_id}: SPEC_NEAR_TIE requires speculation on the arm "
+                "under test"
             )
         assert (c.test_config, c.test_env) != (c.reference_config, c.reference_env), (
             f"{c.case_id}: test and reference configs are identical -- the row "

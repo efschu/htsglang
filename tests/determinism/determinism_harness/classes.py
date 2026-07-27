@@ -35,6 +35,22 @@ SELF_DET_NEAR_TIE
     at token 115 on a near-tie. FP8 and marlin differ only in magnitude
     (FP8 sub-ULP, marlin ~1e-2 from moe_align tiling). Do not re-encode the
     overclaim; ``tests/determinism/test_matrix.py`` guards against it.
+
+SPEC_NEAR_TIE
+    The speculative-decoding class (#143). Same assertion bundle as
+    SELF_DET_NEAR_TIE -- run==run bit-identity plus near-tie-only divergence
+    -- but reached for a structurally different reason, which is why it is a
+    separate class and not a reused label: under speculation a single argmax
+    flip changes ``accept_len``, which changes the shape of every later
+    forward, so DECODE_CLASS's "0 flips over N tokens" is unattainable BY
+    CONSTRUCTION, not by defect. Trajectories are compared after
+    :meth:`~.spec_trajectory.SpecRun.to_trajectory` projects them into
+    emitted-token space, so accept lengths are never an index in the oracle.
+
+    A speculative arm is never MACHINE_ZERO or DECODE_CLASS against a
+    non-speculative reference. Window 5 measured that on the default,
+    non-lane path: speculation alone breaks strict token identity at
+    temperature 0 (``EXCLUDED_CASES['spec_vs_nospec_token_identity']``).
 """
 
 from __future__ import annotations
@@ -60,6 +76,7 @@ class ByteIdentityClass(enum.Enum):
     MACHINE_ZERO = "machine_zero"
     DECODE_CLASS = "decode_class"
     SELF_DET_NEAR_TIE = "self_det_near_tie"
+    SPEC_NEAR_TIE = "spec_near_tie"
 
 
 @dataclass(frozen=True)
@@ -140,6 +157,38 @@ CLASS_SPECS = {
             "0fb3d8007 (256-token rerun 118/256, fork at token 115 near-tie)"
         ),
     ),
+    ByteIdentityClass.SPEC_NEAR_TIE: ClassSpec(
+        cls=ByteIdentityClass.SPEC_NEAR_TIE,
+        summary=(
+            "speculative arms: run==run bit-identical AND divergence vs. the "
+            "reference only at genuine near-ties; 0-flip identity is "
+            "unattainable by construction, not by defect"
+        ),
+        assertions=(
+            "check_self_determinism(test, rerun) AND "
+            "check_near_tie_only_divergence(ref, test, band, near_tie_margin) "
+            "-- on trajectories projected into emitted-token space by "
+            "SpecRun.to_trajectory()"
+        ),
+        required_inputs="ref+test+rerun",
+        needs_band=True,
+        needs_near_tie_margin=True,
+        gpu_evidence=(
+            "mean accept length (meta_info.spec_accept_length, NOT "
+            "spec_ema_accept_len) clears its floor and is recorded beside the "
+            "reference arm's -- check_accept_length_floor; plus "
+            "check_accept_rule_exactness on the dumped verify rows"
+        ),
+        provenance=(
+            "#143 chain speculation on the weightless-KV lane. Window 5 "
+            "measured that a spec arm and a no-spec arm are not token-"
+            "identical at temperature 0 even on the default non-lane path, so "
+            "the reference arm must carry the SAME speculative configuration; "
+            "the greedy accept rule itself is exact integer equality against "
+            "the target argmax (eagle_utils.verify_tree_greedy_func), so a "
+            "divergence can only enter through the target logits"
+        ),
+    ),
 }
 
 
@@ -181,7 +230,10 @@ def check_class(
         ]
         return combine("decode_class", subs)
 
-    if cls is ByteIdentityClass.SELF_DET_NEAR_TIE:
+    if cls in (
+        ByteIdentityClass.SELF_DET_NEAR_TIE,
+        ByteIdentityClass.SPEC_NEAR_TIE,
+    ):
         subs = []
         if rerun is None:
             subs.append(
@@ -197,6 +249,6 @@ def check_class(
         else:
             subs.append(check_self_determinism(test, rerun))
         subs.append(check_near_tie_only_divergence(ref, test, band, near_tie_margin))
-        return combine("self_det_near_tie", subs)
+        return combine(cls.value, subs)
 
     raise ValueError(f"unknown class {cls!r}")
