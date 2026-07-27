@@ -481,6 +481,34 @@ class HiCacheFile(HiCacheStorage):
             ),
         )
 
+    # Longest filename most Linux filesystems accept, in bytes.
+    _NAME_MAX = 255
+
+    def _tmp_path_for(self, tensor_path: str) -> str:
+        """Staging name for the atomic write, sized to fit NAME_MAX.
+
+        The final name is already long (page hash + served model name +
+        identity hash + geometry suffix; the served model name is a full
+        checkpoint PATH when the user does not pass --served-model-name). A
+        staging suffix carrying pid + thread id + a full uuid4 hex added ~50
+        more bytes, which pushed component pages of a deeply-nested checkpoint
+        over the limit: the write failed with "[Errno 36] File name too long"
+        and the store silently stayed empty -- the page was never persisted
+        even though the FINAL name would have fit. Keep the staging suffix
+        short, and shrink it further rather than fail when the final name is
+        near the limit; uniqueness comes from uuid4 alone.
+        """
+        base = os.path.basename(tensor_path)
+        room = self._NAME_MAX - len(base.encode("utf-8")) - len(".tmp.")
+        if room < 4:
+            raise OSError(
+                f"cannot stage an atomic write for '{base}': the final name "
+                f"already uses {len(base.encode('utf-8'))} of "
+                f"{self._NAME_MAX} bytes. Pass a short --served-model-name; "
+                "the default is the full checkpoint path."
+            )
+        return f"{tensor_path}.tmp.{uuid.uuid4().hex[:min(16, room)]}"
+
     def _get_suffixed_key(self, key: str) -> str:
         # Plain KV page keys are bare page hashes (hex, no '.'); component /
         # draft keys are '{hash}.{pool_name}'. In dcp_owner_mode only the KV
@@ -530,8 +558,22 @@ class HiCacheFile(HiCacheStorage):
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
-                if f.readinto(buf) != expected:
-                    raise IOError(f"Short read for {suffixed}")
+                # An unbuffered readinto is one syscall and may legitimately
+                # return short on a large page -- loop until the page is whole
+                # or the file really is truncated. KV pages (tens of KiB) never
+                # hit this; component pages do (a Mamba/GDN state page is tens
+                # of MiB), and a partial recurrent state is the worst possible
+                # thing to hand back.
+                got = 0
+                while got < expected:
+                    n = f.readinto(buf[got:])
+                    if not n:
+                        break
+                    got += n
+                if got != expected:
+                    raise IOError(
+                        f"Short read for {suffixed}: {got} of {expected} bytes"
+                    )
             self._evictor.touch(suffixed, tensor_path)
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
@@ -580,10 +622,7 @@ class HiCacheFile(HiCacheStorage):
                 return False
             reserved = True
 
-            tmp_path = (
-                f"{tensor_path}.tmp."
-                f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
-            )
+            tmp_path = self._tmp_path_for(tensor_path)
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tmp_path)
             os.replace(tmp_path, tensor_path)
             self._evictor.commit(suffixed)
