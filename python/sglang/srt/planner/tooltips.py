@@ -169,6 +169,19 @@ TRADEOFFS: Dict[str, Tradeoff] = {
         cost="Each slot takes its own KV and recurrent state, so maximum "
         "context falls as this rises.",
     ),
+    "plan.mrr_balance": Tradeoff(
+        gain="Names the concurrency where a hybrid model carries the most "
+        "sessions at a given context, instead of leaving the recurrent-state "
+        "versus KV trade to be guessed.",
+        cost="A suggestion the plan never applies, resting on estimated "
+        "capacity, and it assumes every session wants the same context — a "
+        "mixed workload sits between two rows.",
+        # Deliberately no measured_from: no mrr sweep has been run on this rig.
+        # The #119/#123 KV-regain branch is a capacity change on the MoE
+        # expert-offload lane with no GPU boot recorded, so it supplies no
+        # sessions-versus-concurrency figure either. When a sweep is built,
+        # add its source here rather than a number in the sentence above.
+    ),
     # ---- heterogeneous rank mapping ---------------------------------------
     "rank_gpu_id": Tradeoff(
         gain="Puts each rank on a chosen physical card, including several "

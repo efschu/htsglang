@@ -121,6 +121,12 @@ class PlanResult:
     #: provenance, never a measured number. None when it cannot be sized (no
     #: throughput estimate, or a card missing a catalog TDP). Typed loosely.
     roofline_energy: Optional[object] = None
+    #: GDN-state / KV balance point for --max-running-requests (#253) — a
+    #: SUGGESTION per target context, computed instead of guessed. Never
+    #: applied: the plan keeps whatever concurrency was passed in. None for
+    #: non-hybrid models (no state pool -> no trade) and for measured-residency
+    #: plans. Typed loosely (sglang.srt.planner.mrr_balance).
+    mrr_balance: Optional[object] = None
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +451,23 @@ def plan(
             result = dataclasses.replace(result, roofline_energy=energy)
         except Exception:
             result = dataclasses.replace(result, roofline_energy=None)
+
+        # GDN-state / KV balance point for --max-running-requests (#253).
+        # Additive and advisory: it changes no field the plan already
+        # computed, and the plan keeps the concurrency it was given. Same
+        # guarded discipline — a model the trade cannot be sized for simply
+        # carries no suggestion.
+        try:
+            from sglang.srt.planner.mrr_balance import balance_report
+
+            result = dataclasses.replace(
+                result,
+                mrr_balance=balance_report(
+                    inputs, base_plan, inputs.effective_vram_mib
+                ),
+            )
+        except Exception:
+            result = dataclasses.replace(result, mrr_balance=None)
     return result
 
 
