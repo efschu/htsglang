@@ -381,6 +381,37 @@ rank are both 0.
 
 Order: R0 → R1 → R2 → R3 → R4 → R5 → R6.
 
+### R4 result (Window 5, Llama-3.1-8B dense TP=2, EAGLE3 topk 1 solo)
+
+**Gate 4 PASSED.** Full numbers, controls and noise floor in
+`INTEGRATION_R3_VALIDATION.md`, section "Window 5".
+
+* Mechanism: `Capture target verify CUDA graph end` on **both** ranks
+  (TP0 1.94 s, TP1 1.90 s). The verify is graph-captured symmetrically, so the
+  "B ~ A/2 = eager verify" condition of §0 does not arise.
+* tok/s B/A per content class: 1.126 / 1.727 / 1.215 / 1.205
+  (one_token / code / prose / mixed), against a **boot-to-boot** noise floor of
+  2.60 % on raw tok/s. Smallest margin clears it by 4.8x.
+* Content-robust restatement, since raw tok/s follows output content: a verify
+  round costs **1.22-1.27** plain decode steps and returns **1.38-2.12** tokens.
+  `B/A = accept_length / cost_ratio` reproduces the measured ratios.
+* Gate 2 passed (accept 2.116 on code). Gate 3 passed on a settled server and
+  boot-to-boot; the `011` first-probe pattern is prefix-caching in the harness
+  and appears identically in arm A, which runs no speculation.
+
+**Gate 1 as written above is not usable on this vehicle, and this is not a #143
+defect.** Two control arms on plain TP=2 (no lane) show that (a) spec alone
+already breaks strict token identity at `temperature 0` on the default path, and
+(b) the lane alone already changes tokens versus plain TP=2 — the expected
+consequence of DCP token-sharding plus LSE merge being a different float
+reassociation. Both hold with the feature under test switched off.
+
+Consequence for this document: **Gate 1 must be restated against the #124
+TP=1 solo oracle**, which is the oracle the lane's determinism harness already
+uses, rather than against arm A. Until that runs, lane+spec has no correctness
+oracle — Window 5 established that the old gate cannot serve as one, not that
+the composition is correct.
+
 ---
 
 ## 7. Open points

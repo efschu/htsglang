@@ -2515,6 +2515,8 @@ arm A (flashinfer oracle) is not runnable — the TP=1 triton oracle replaces it
 ## NO-SHIP / not merged
 
 ### #143 `feat/weightless-chain-spec` — NO-SHIP this window
+*(superseded: Gate 4 was measured and PASSED in Window 5, on exactly the
+Llama TP=2 vehicle this section nominates. See "Window 5" at the end.)*
 R0 GREEN (3/3 short-prompt token-id sequences identical to r3-probe, accepts and
 self-det identical, ownership pinned `[6,5,5]` per the #188 rule), R2 GREEN
 (all 7 rejections abort in 8 s naming themselves), R6 GREEN, R1 GREEN (GGUF
@@ -3292,9 +3294,10 @@ it is the safer default because it is the one that maximises capacity.
 
 ## Open after this window
 
-* `feat/weightless-chain-spec` (#143) -- Gate 4 still unmeasured; R3 still blocked
-  on the pre-existing solo-placement deadlock that #194 in merge 2 targets, so it
-  is worth re-testing on this tip before anything else.
+* `feat/weightless-chain-spec` (#143) -- **closed in Window 5 below.** Gate 4
+  PASSED on Llama-3.1-8B TP=2 (+12.6 % to +72.7 %); R3 runs clean on this tip.
+  What remains open is narrower: a correctness oracle for lane+spec, since
+  Gate 1's premise does not hold on this vehicle with the feature switched off.
 * `feat/offload-kv-regain` (#119) -- unmerged, needs its 122B A/B. Re-run its
   pre-check against the post-stack `model_runner_kv_cache_mixin.py`.
 * #197 remains merged-but-not-hardware-validated. Its load-bearing vehicle is the
@@ -3304,3 +3307,218 @@ it is the safer default because it is the one that maximises capacity.
   answered to better than ~3 %.
 * `FEATURES_VS_UPSTREAM.md`: the SWA-DCP Stage B bullet still sits physically
   under the "gated off" heading while its text says it is merged. Doc restructure.
+
+---
+
+# Window 5 — #143 Gate 4 measured
+
+Merge `335b0f2f0f` (`feat/weightless-chain-spec` onto `e1b96a2a61`) plus the
+bugfix `fded6dd78f`. Vehicle: **Llama-3.1-8B-Instruct dense, TP=2**, lane head
+= torch[0] = 5090 (NVML index 1; resolved at runtime with `gpu_map.py`, never
+assumed), weightless worker = torch[1] = 3080. `--rank-gpu-memory-mib
+29000,18000`, `--context-length 2048` (the EAGLE3 checkpoint's
+`max_position_embeddings`), `--max-total-tokens 16384`, CUDA graphs ON.
+Arm A = `r1_lane_nospec`, arm B = `r4_lane_spec` (EAGLE3, topk 1, 3 steps,
+4 draft tokens, `--speculative-draft-placement solo`). Harness `/spinning/r3val/`.
+
+This is the vehicle the previous window nominated ("Cheapest path to R4 next
+window: Llama TP=2 lane with #127 merged in"). It works.
+
+## The mechanism point, which decides Gate 4 before any tok/s number
+
+`Capture target verify CUDA graph end` appears on **both** ranks, every boot:
+
+```
+[TP1] Capture target verify CUDA graph end. elapsed=1.90 s, mem usage=0.03 GB
+[TP0] Capture target verify CUDA graph end. elapsed=1.94 s, mem usage=0.03 GB
+```
+
+The verify is graph-captured symmetrically. It is not eager, so the "B ~ A/2"
+no-ship condition cannot arise. Confirmed independently by the depth-normalised
+cost below. `Capture draft prefill CUDA graph end. elapsed=0.77 s` appears on
+TP0 only, which is correct under solo placement and no longer deadlocks (#194).
+
+## Noise floor — boot-to-boot, taken first
+
+Two cold boots per arm, matched probe position. Within-boot spread is recorded
+for contrast only; it is **not** the yardstick.
+
+| class | A boot1 | A boot2 | delta | B boot1 | B boot2 | delta |
+|---|---|---|---|---|---|---|
+| one_token | 70.12 | 71.94 | +2.60 % | 81.00 | 80.31 | -0.85 % |
+| code | 69.41 | 71.11 | +2.45 % | 108.09 | 107.10 | -0.92 % |
+| prose | 71.88 | 71.80 | -0.11 % | 90.93 | 91.19 | +0.29 % |
+| mixed | 71.53 | 71.80 | +0.38 % | 86.39 | 86.21 | -0.21 % |
+
+**Noise floor on raw tok/s: 2.60 %** (worst boot-to-boot excursion). This
+reproduces the recorded 2.7-4.2 % band for that axis.
+
+`ms per verify round` is the low-variance axis, as recorded: boot-to-boot
++0.85 / +0.21 / +0.09 / +0.20 % across the four classes. Every claim below that
+needs resolution finer than 2.6 % is made on that axis, not on raw tok/s.
+
+## Gate 4 — PASSED
+
+| class | A tok/s | B tok/s | B/A | gain | vs noise floor |
+|---|---|---|---|---|---|
+| one_token | 71.67 | 80.67 | 1.126 | **+12.6 %** | 4.8x |
+| code | 69.52 | 120.05 | 1.727 | **+72.7 %** | 28x |
+| prose | 71.80 | 87.20 | 1.215 | **+21.5 %** | 8.3x |
+| mixed | 71.53 | 86.18 | 1.205 | **+20.5 %** | 7.9x |
+
+(Settled probes: second probe against the same live server, where all three
+repeats are byte-identical. Taking instead the median across all probes
+including the cold first one gives +12.6 / +55.5 / +26.6 / +20.5 % — the same
+verdict, and the difference is the content effect described under Gate 1.)
+
+`B ~ A/2` would be ~35 tok/s. Measured 80-120. Every class clears the noise
+floor by at least 4.8x. Gate 4 passes on every content class separately.
+
+### The content-robust form of the same result
+
+Raw tok/s follows output content (r=0.90), and Gate 1 does not pin the content
+here (below), so the verdict is restated on an axis that does not depend on
+which tokens came out. All runs emit exactly 256 tokens, so length is controlled.
+
+| class | A: ms per decode step | B: ms per verify round | B accept length | verify cost in decode-steps |
+|---|---|---|---|---|
+| one_token | 13.95 | 17.06 | 1.376 | 1.223 |
+| code | 14.38 | 17.62 | 2.116 | 1.225 |
+| prose | 13.93 | 17.69 | 1.542 | 1.270 |
+| mixed | 13.98 | 17.27 | 1.488 | 1.235 |
+
+A verify round costs **1.22-1.27** plain decode steps and returns **1.38-2.12**
+tokens. It pays for itself in every class, and `B/A = accept_length / cost_ratio`
+reproduces the measured ratios (code: 2.116/1.225 = 1.727 vs measured 1.727).
+An eager verify would put the cost ratio far above the accept length; it is
+below it everywhere. This is the same conclusion as the capture log line,
+reached from the timing side.
+
+## Gate 1 — fails as specified, and the specification is the thing at fault
+
+Arm B's token ids differ from arm A's on every class (common prefix 1 / 11 / 11
+/ 5 of 256). Both arms are coherent and on-topic; this is a different
+continuation, not garbage. Two control arms were booted to attribute it —
+**plain TP=2, no lane** (`--rank-gpu-memory-mib 18000` scalar; a per-rank list
+is rejected under even TP), with and without spec:
+
+| pairing | one_token | code | prose | mixed |
+|---|---|---|---|---|
+| C plain-nospec vs D plain-**spec** | differ @1 | differ @172 | differ @16 | **identical** |
+| A lane-nospec vs C plain-nospec | differ @32 | differ @172 | differ @11 | differ @19 |
+| A lane-nospec vs B lane-spec (the gate) | differ @1 | differ @11 | differ @11 | differ @5 |
+| B lane-spec vs D plain-spec | differ @1 | differ @11 | differ @16 | differ @5 |
+
+Both contributors are present with the feature under test switched **off**:
+
+1. **Spec alone breaks strict token identity at `temperature 0`** on the default,
+   non-lane path (row 1). The premise "greedy verify must reproduce the greedy
+   no-spec sequence" does not hold on this stack for this vehicle — near-tie
+   argmax flips under the verify batch's different kernel shape.
+2. **The lane alone changes tokens versus plain TP=2** (row 2), which is expected:
+   DCP token-sharding plus LSE merge is a different float reassociation. The
+   lane's own determinism harness (#124) uses a **TP=1 solo run** as oracle for
+   exactly this reason, not plain TP=2.
+
+So Gate 1 as written compares against an oracle that is already not token-identical
+for two independent pre-existing reasons. **It is not evidence of a #143 defect,
+and it is equally not evidence of correctness.** What this window establishes is
+that the gate's premise is invalid on this vehicle; a real correctness check for
+lane+spec still needs the #124 TP=1 oracle and has not been run. Recorded as open.
+
+## Gate 2 — PASSED, with one observation
+
+`meta_info.spec_accept_length` (not `spec_ema_accept_len`): code **2.116**,
+prose 1.580, mixed 1.497, one_token 1.376. Sane band; the draft is working
+head-locally and verify is reading the right slots.
+
+Observation: the lane's accept length runs systematically **8-12 % below** the
+plain path on the same prompts (code 2.116 vs 2.327, prose 1.580 vs 1.766,
+mixed 1.497 vs 1.695, one_token 1.376 vs 1.384). Since the two arms produce
+different continuations this is not necessarily a defect, but it is the reason
+the lane keeps most and not all of the spec multiplier (B/A 1.13-1.73 vs D/C
+1.11-1.73). Worth a look once a content-pinned oracle exists.
+
+## Gate 3 — PASSED on a settled server; the exception is the harness, not the lane
+
+Arm B is 3/3 byte-identical on the second probe against the same live server,
+all four classes, and **boot-to-boot identical** (B boot1 == B boot2, 256/256 on
+all four classes).
+
+On the *first* probe after boot the pattern is `011` — run 0 differs, runs 1
+and 2 agree. **Arm A shows the identical pattern with no speculation anywhere in
+the process**, so it is not a spec property. Cause is in the boot log: the probe
+repeats the same prompt, so run 0 does a fresh prefill and runs 1-2 hit the
+radix cache —
+
+```
+#new-token: 13, #cached-token: 1      <- run 0
+#new-token: 1,  #cached-token: 13     <- runs 1, 2
+```
+
+— a different prefill path with different numerics. A harness property of
+repeating a prompt under prefix caching, present in both arms.
+
+## R6 — rejections stay rejected
+
+Both abort at boot naming themselves:
+
+* `--speculative-eagle-topk 2` on the lane -> tree-mask verify-logit rejection (#76).
+* `--weightless-kv-chunked-block-size 2048` + spec -> block-ladder capture-axis rejection.
+
+## #128 freeloader — dead, as the code predicted
+
+One extra arm-A boot with `SGLANG_DCP_COMM_OVERLAP=1`:
+
+| class | A off (3 boots) | A on (2 probes) | delta | off's own spread |
+|---|---|---|---|---|
+| one_token | 70.12 / 71.67 / 71.94 | 70.87 / 72.22 | -0.17 % | 2.60 % |
+| code | 69.41 / 69.52 / 71.11 | 71.85 / 71.53 | +3.12 % | 2.45 % |
+| prose | 71.88 / 71.60 / 71.80 | 72.03 / 71.81 | +0.17 % | 0.39 % |
+| mixed | 71.53 / 71.09 / 71.80 | 72.12 / 71.50 | +0.39 % | 1.00 % |
+
+Three of four classes land under 0.4 %. The fourth is +3.12 % against a 2.60 %
+noise floor on a class whose off-arm boots already span 2.45 % by themselves —
+not separable. This matches the source: the overlap machinery exists only in
+`_forward_extend_dcp` (`flashinfer_backend.py:5559`, comm-stream branch from
+`:5592`); `_forward_decode_dcp` has none, and **neither
+`forward_decode_weightless_worker` (`:5379`) nor
+`forward_extend_weightless_worker` (`:5444`) has an overlap branch at all** —
+both issue their collectives inline on the main stream. Confirmed by reading,
+then measured: the item is dead until someone shows worker-side idle time in a
+trace.
+
+**#132 is confirmed live on the lane**, in the same reading: both weightless
+worker forwards issue the single stacked k+v gather,
+`cp_all_gather_heads_uneven(torch.cat((zk, zv), dim=0), ...)` at `:5410` and
+`:5466`, mirroring the head's fused `_dcp_write_gather` 1:1.
+
+## Bug found and fixed on the way
+
+`fded6dd78f` — the scheduler's weightless-worker guard resolved
+`self.model_worker.model_runner`, which does not exist on a `BaseSpecWorker`.
+Under spec the predicate silently returned False on the worker rank, which then
+dereferenced `logits_output=None`. Fires only under `return_logprob`, so the D5
+provocation passed on the same boot that this killed. See the commit for the
+falsified regression test.
+
+## Throttling
+
+No card was in a throttled state during any measured point.
+`clocks_throttle_reasons.active` read `0x1` (GpuIdle) before boots and `0x0`
+during measurement on the active cards; 5090 2400-2880 MHz at 44-49 C, 3080s
+1710-1905 MHz at 55-57 C. Clock pinning is not possible from this container
+(the driver refuses `-pm`/`-lgc`/`-lmc`/`-pl`); the cards are not stuck in a low
+P-state.
+
+## Verdict
+
+**Gate 4 PASSED.** Chain speculation on the weightless-KV lane is a throughput
+feature, not only a capacity feature: +12.6 % to +72.7 % over the lane without
+spec, every class clearing the boot-to-boot noise floor by at least 4.8x, with
+the mechanism confirmed twice independently (symmetric verify graph capture in
+the log; verify round costing 1.22-1.27 decode steps while returning 1.38-2.12
+tokens).
+
+Still open: a correctness oracle for lane+spec. Gate 1 cannot serve as one on
+this vehicle, for reasons that predate #143 on both sides.
