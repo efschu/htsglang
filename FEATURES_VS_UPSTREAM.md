@@ -413,7 +413,6 @@ expert-granularly, and not combined with asymmetric TP/DCP (partial). llama.cpp/
 the same expert-granular idea (`-ot`/`-ncmoe`/`--n-cpu-moe`; ik_llama.cpp also runs its own
 `iqk_mul_mat` kernel lineage, see row 8d) but nothing to combine it with, since neither
 asymmetric-TP nor DCP exists there (partial).
->>>>>>> origin/feat/offload-kv-regain
 
 <a id="f8a"></a>
 ### 8a. Bespoke GGUF adapter framework
