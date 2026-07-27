@@ -213,7 +213,17 @@ def reg_all_to_all_single(
     group._all_to_all_single(output, input)
 
 
-CPU_ONLY_HTCCL_TRANSPORTS = frozenset({"shm", "gloo"})
+# The transports whose collectives run entirely ON the GPU and are therefore
+# legal inside a CUDA-graph capture. An ALLOWLIST on purpose: every other
+# value host-stages its collectives -- shm and gloo over CPU memory, ucx over
+# pinned host buffers for RDMA (FEATURES_VS_UPSTREAM.md, ucx transport table:
+# "`--enforce-eager` required ... Only `device` is capturable"), and any
+# unknown name silently maps to the inline gloo plane in
+# htccl._build_transport. The previous denylist ({"shm", "gloo"}) did not
+# know "ucx", so a ucx boot with CUDA graphs enabled passed this guard and
+# then either crashed mid-capture or captured only rank-local regions --
+# silently, which left the graph regime of a cross-rig measurement unknown.
+CAPTURABLE_HTCCL_TRANSPORTS = frozenset({"device"})
 
 
 def _enforce_cpu_transport_needs_eager(transport: str) -> None:
@@ -225,7 +235,7 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
     transport is known, and only when HTCCL is actually on -- flag off, this
     function is never called.
     """
-    if transport not in CPU_ONLY_HTCCL_TRANSPORTS:
+    if transport in CAPTURABLE_HTCCL_TRANSPORTS:
         return
     try:
         from sglang.srt.runtime_context import get_server_args
@@ -236,11 +246,13 @@ def _enforce_cpu_transport_needs_eager(transport: str) -> None:
     if server_args is None or getattr(server_args, "disable_cuda_graph", False):
         return
     raise ValueError(
-        f"SGLANG_HTCCL_TRANSPORT={transport!r} is a host-staged (CPU) "
-        "transport: every collective synchronizes with the host, which is "
-        "illegal inside a CUDA-graph capture. Pass --disable-cuda-graph, or "
-        "use SGLANG_HTCCL_TRANSPORT=device, which runs the collectives on "
-        "the GPU and IS capturable."
+        f"SGLANG_HTCCL_TRANSPORT={transport!r} is a host-staged transport "
+        "(shm/gloo stage over CPU memory, ucx stages over pinned host "
+        "buffers for RDMA; an unknown name falls back to the gloo plane): "
+        "every collective synchronizes with the host, which is illegal "
+        "inside a CUDA-graph capture. Pass --disable-cuda-graph, or use "
+        "SGLANG_HTCCL_TRANSPORT=device, which runs the collectives on the "
+        "GPU and IS capturable."
     )
 
 
@@ -522,8 +534,8 @@ class GroupCoordinator:
                 "HTCCL enabled for group '%s' (transport=%s): TP collectives "
                 "run over the vendor-neutral host-staged path instead of "
                 "NCCL. Every SGLANG_HTCCL* env must be identical on all "
-                "ranks; the CPU transports (shm/gloo) additionally require "
-                "--disable-cuda-graph.",
+                "ranks; the host-staged transports (shm/gloo/ucx) "
+                "additionally require --disable-cuda-graph.",
                 self.unique_name,
                 envs.SGLANG_HTCCL_TRANSPORT.get(),
             )
