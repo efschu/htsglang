@@ -39,7 +39,24 @@ Every level carries a cross-probe: the same bytes reinterpreted as ``e5m2``
 must deviate grossly.  Without that cross-probe an "it matches" result would be
 worthless, because a test that cannot see the confusion cannot rule it out.
 
-    python -m pytest test/registered/unit/layers/attention/test_fp8_e4m3_kv_decode.py -v
+Measured on an RTX 3080, capability (8, 6), over all 256 finite fp8 byte
+patterns::
+
+    flashinfer paged decode, e4m3 pool: max|out - ref_e4m3| = 0.0
+                                        max|out - ref_e5m2| = 56992.0
+    flashinfer paged decode, e5m2 pool: max|out - ref_e5m2| = 0.0
+                                        max|out - ref_e4m3| = 56992.0
+    triton kernel load of e4m3:  ValueError("type fp8e4nv not supported in
+                                 this architecture. The supported fp8 dtypes
+                                 are ('fp8e4b15', 'fp8e5')")
+    triton kernel load of e5m2:  compiles
+
+Pin the device by PCI order when reproducing -- with the default
+``CUDA_DEVICE_ORDER=FASTEST_FIRST`` a bare ``CUDA_VISIBLE_DEVICES=0`` selects
+the newest card on a mixed rig, not the Ampere one this file is about::
+
+    CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<ampere> \
+        python -m pytest test/registered/unit/layers/attention/test_fp8_e4m3_kv_decode.py -v
 """
 
 import math
