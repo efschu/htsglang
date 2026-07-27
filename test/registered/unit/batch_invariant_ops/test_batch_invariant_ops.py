@@ -15,21 +15,28 @@ register_cuda_ci(est_time=10, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=10, suite="nightly-amd-1-gpu-mi35x", nightly=True)
 
 device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
-torch.set_default_device(device_type)
-
-# Just to get the logging out of the way
-with set_batch_invariant_mode(True):
-    pass
 
 
 class TestBatchInvariantOps(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        # torch.set_default_device is process-wide state. Set it here, with a
+        # matching reset in tearDownClass, instead of at module scope where it
+        # leaks into every test module collected after this one in the same
+        # pytest process (on machines without a usable accelerator that breaks
+        # any later tensor construction that relies on the default device).
+        if device_type == "cpu" or not torch.accelerator.is_available():
+            raise unittest.SkipTest("requires a CUDA/XPU accelerator")
+        torch.set_default_device(device_type)
+        # Just to get the logging out of the way
+        with set_batch_invariant_mode(True):
+            pass
         batch_invariant_ops._ENABLE_MM_COMPARISON_TEST = True
 
     @classmethod
     def tearDownClass(cls):
         batch_invariant_ops._ENABLE_MM_COMPARISON_TEST = False
+        torch.set_default_device(None)
 
     def _test_batch_invariance(self, M, K, N, dtype):
         """
