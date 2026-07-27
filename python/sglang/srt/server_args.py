@@ -2620,7 +2620,7 @@ class ServerArgs:
             "drafter lifts the gate automatically. An integer sets the "
             "threshold in tokens. 'off': no gate (pre-gate auto-mode "
             "behavior). Requests near the threshold whose remaining "
-            "max_new_tokens budget can cross it are pre-empted at decode "
+            "max_new_tokens budget can cross it are preempted at decode "
             "start (nearness via SGLANG_CROSS_CTX_GATE_NEAR_FRAC, default "
             "0.8). Ignored outside force=auto|policy (under force=policy it "
             "acts as a safety filter on top of the policy table).",
