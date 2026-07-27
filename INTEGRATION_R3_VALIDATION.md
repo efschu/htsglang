@@ -3522,3 +3522,178 @@ tokens).
 
 Still open: a correctness oracle for lane+spec. Gate 1 cannot serve as one on
 this vehicle, for reasons that predate #143 on both sides.
+
+---
+
+# PS2 (born-spilled deep prefill) x speculative decoding — GPU validation
+
+Validated commit: `65e056b4c3` (merge tip of `integration/r3-probe`, carrying
+`95a51c74b5`). Worktree `/spinning/wt-ps2spec-val`. Qwen3.6-27B-FP8, uneven
+TP=3 / uneven DCP=3 on 5090 + 2x 3080, `--rank-tp-ratio auto-performance`,
+`--rank-kv-ratio capacity`, MTP (NEXTN, 3 steps, topk 1, 4 draft tokens),
+`--max-total-tokens 3600`.
+
+PS2 had never run together with speculation before this campaign: the old gate
+`prefill_spill_deep_gate` switched PS2 off outright as soon as a spec algorithm
+was configured.
+
+Metric is **ms per verify round**, not raw tok/s. KV ownership vector pinned
+with `SGLANG_UNEVEN_TOKEN_VECTOR=2,3,3` and the measured-KV-budget cache
+(`/root/.cache/sglang/kv_budget-*.json`) removed before every arm, so the #188
+persistence trap cannot make two arms differ by capacity.
+
+## Gate results
+
+| gate | arm | result | evidence |
+|---|---|---|---|
+| 1 | `ctrl` — kvso OFF, MTP ON | GREEN | boots, generates coherently; zero `kv-session-offload` lines in the log, so the new guard is unreachable as designed. ms/round 37.92 (within-boot CV 0.21 %), accept 3.282, verify_ct 78 identical across all 5 reps |
+| 2 | `ps2spec` — kvso + `--kv-session-offload-prefill` + MTP | GREEN | decline line ABSENT; PS2 admitted a born-spilled deep prompt twice, each time on all three ranks |
+| 3 | `blocked` — plus `--kv-session-offload-spec-in-tick` | GREEN | decline line present on all three ranks and it NAMES its condition; PS2 admission count stayed 0; the request was still served through the ordinary path (no silent pass-through, no wedge) |
+| 4 | output coherence of the spilled session | GREEN | 200 tokens, `valid=True`, no repetition flags (ngram8 0.0000, MATTR300 0.72, unique-word 0.72) |
+
+Gate 2, verbatim, for `L=1829` against a device budget of 1306 tokens:
+
+```
+prefill-spill (PS2): admit rid=1cb1d83f... BORN-SPILLED DEEP
+  (input=1829 does NOT fit device budget=1306)
+PREFILL-SPILL (PS2, born-spilled deep): rid=1cb1d83f... L=1829 boundary=0
+  host_tail=1829 owned_tail=458/687/684 (ranks 0/1/2) region=0 spills=1/1
+  -- NO device KV slots allocated
+PREFILL-SPILL (PS2): rid=1cb1d83f... handed over to the spill tick
+```
+
+No illegal memory access, no device-side assert, no traceback, no silent
+fallback in any of the three arms.
+
+Steady-state decode is unaffected by arming the feature: ms/round 37.92
+(`ctrl`) against 37.74 (`ps2spec`), a 0.5 % difference against a boot-to-boot
+noise band of 0.09-0.85 % on this metric. One `ps2spec` point ran with GPU 2 in
+SW thermal slowdown (`0x20`, 83 C); it is taken and annotated, not dropped.
+
+## What operates on the sentinel slots — answered by falsification
+
+The open question was whether anything besides the draft extend touches the
+host sentinels in `out_cache_loc`. Setting the guard in
+`EagleDraftWorker._draft_extend_for_prefill` to `if False` and re-running the
+same PS2 scenario kills all three ranks on the first born-spilled prefill:
+
+```
+eagle_worker_v2.py:1397 in _draft_extend_for_prefill
+  logits_output = self.draft_runner.forward(forward_batch).logits_output
+...
+layernorm.py:754 in _forward_impl
+  needs_reshape = x.dim() != 2 and residual is None
+AttributeError: 'NoneType' object has no attribute 'dim'
+```
+
+Two things follow. The guard is load-bearing — without it PS2 x spec does not
+survive a single prefill. And the two halves of the fix are coupled: the run
+dies on the missing FULL hidden capture (item 3) before it ever reaches the
+out-of-bounds scatter the guard was written for, so the skip and the capture
+removal cannot be reverted independently. That the scatter would have been out
+of bounds is true by construction and needs no run: the sentinels start at
+`host_base=3608` while the draft pool holds 3600 rows.
+
+## The disturbance verdict is a harness artifact, control-proven
+
+`spill_prefill_test.py` PART 2 reports FAIL for PS2 (incumbent decode at 5.1 %
+and 6.7 % of its pre-prefill rate during the new prefill, threshold 50 %). A
+same-boot control settles what that means. A 1222-token prompt admitted through
+the ORDINARY path — no spill, PS2 admission counter unchanged at 6 — pushes the
+incumbent to **1.4 %**, i.e. worse than either PS2 run:
+
+| newcomer | admission path | during/before | incumbent after |
+|---|---|---|---|
+| 1829 tok | PS2 born-spilled deep | 5.1 % | 21.4 tok/s |
+| 1829 tok | PS2 born-spilled deep | 6.7 % | 23.6 tok/s |
+| 1222 tok | ordinary (no spill) | 1.4 % | 11.8 tok/s |
+
+With `enable_mixed_chunk=False` any prefill blocks the running decode, so the
+50 % threshold is unreachable on this configuration for every admission path.
+PS2 disturbs the incumbent LESS than the ordinary path here, because the
+born-spilled session leaves the running batch and finishes off-batch. The
+threshold needs a mixed-chunk-aware baseline before it can judge PS2; the
+verdict as it stands is not evidence against the feature.
+
+## Two launcher defects found
+
+* The `ps2spec` arm of `kvso_launch_ps2spec.sh` cannot boot: any
+  kv-session-offload + speculation boot requires `KVSO_ALLOW_SPEC=1`
+  (`server_args._handle_kv_session_offload`), which the script exported only for
+  the `blocked` arm. Setting it does NOT arm spec-in-tick — `spec_in_tick_ready`
+  additionally requires `--kv-session-offload-spec-in-tick`.
+* The `blocked` arm's default `KVSO_RESIDENT_SLICES=2048` against
+  `--max-total-tokens 3600` trips the reservation guard from defect 3 above,
+  correctly and at startup. Lowered to 512 for the gate.
+
+## Limits of what was exercised
+
+PS2's admission window is narrower than the flag suggests, and both bounds bit
+during this campaign. A prompt must clear `max_req_input_len`
+(`min(context_len, max_token_pool_size) - 5`, here 3594) at the front door — the
+first attempt with a 5554-token prompt was rejected there and never reached the
+scheduler. It must then fit ONE prefill chunk (`rem_chunk_tokens`, here 2048),
+because PS3 (host-prefix extend read) does not exist yet. So the validated
+window is roughly 1500-2000 tokens on this configuration, not the multi-region
+prompts the host pool (30518 tokens, 12294 per region) is sized for.
+
+---
+
+# Task #216 — the MLP weight split is a SECOND decode lever
+
+A/B over the MLP split ALONE, four cold boots, interleaved plain, mlp, plain,
+mlp. Held identical by construction in both arms: `--rank-tp-ratio auto`
+(derived weights `[26107, 18280, 18280]` in both logs), the KV ownership vector
+(`SGLANG_UNEVEN_TOKEN_VECTOR=2,3,3`; the plain arm's log confirms `active
+vector [2, 3, 3]`), `--max-total-tokens 16384`, the speculative configuration,
+and kv-session-offload OFF. The only free variable is `--rank-mlp-ratio`:
+`None` against `6,1,1`, the vector the auto-performance optimizer itself picks
+on this rig.
+
+Two context depths per boot, 4 reps each after a warm-up, `--max-new 192`.
+
+| arm | ctx 400 | ctx 12000 | boot-to-boot spread |
+|---|---|---|---|
+| plain auto | 32.569 / 32.522 ms | 33.019 / 33.189 ms | 0.14 % / 0.51 % |
+| `--rank-mlp-ratio 6,1,1` | 37.915 / 38.062 ms | 38.571 / 38.532 ms | 0.39 % / 0.10 % |
+
+```
+ctx   400: plain 32.546 ms   mlp611 37.989 ms   +5.443 ms  (+16.72 %)
+ctx 12000: plain 33.104 ms   mlp611 38.551 ms   +5.447 ms  (+16.46 %)
+
+depth term plain : step_ms(12000) - step_ms(400) = +0.558 ms
+depth term mlp   : step_ms(12000) - step_ms(400) = +0.563 ms
+```
+
+**The claim is confirmed and its sign is negative for the deep MLP split.**
+`6,1,1` costs 16.5 % of the decode step against plain auto — 30x to 160x the
+boot-to-boot spread, so the effect is not in question.
+
+The depth term settles the attribution. It is identical across the two arms
+(+0.558 against +0.563 ms, a 0.9 % difference on a term that is itself only
+1.7 % of the step), which is exactly what a pinned KV vector should produce.
+The whole +5.44 ms is a CONSTANT per-step offset, unchanged from 400 to 12000
+tokens of context. A context-independent per-step cost is the weight-streaming
+term, not the attention term. So the gap comes from the weight plan, and
+"decode is flat over the representable weight splits" is falsified.
+
+Consequence for the profile generator: it must serve two decode levers, not
+one. The KV-token split (#210) and the MLP weight split move the decode step
+independently, and the second one moves it further than the first. Note also
+that the optimizer's own decode-knee guard passed `6,1,1` as "floor OK, knee
+OK" while rejecting `8,1,1` and `10,1,1` — so the guard's model does not
+capture this cost and needs re-fitting against measurement.
+
+Mechanism, stated as hypothesis rather than result: `6,1,1` puts units
+`[102, 17, 17]`, i.e. 75 % of the MLP weight bytes, on rank 0, whose measured
+memory-bandwidth share is 7/13 = 53.8 %. Rank 0 then paces every step. The two
+3080s additionally run FP8 through the Marlin weight-only path, where a 17-unit
+shard is a small and inefficient GEMM. Separating those two contributions was
+not attempted.
+
+What this measurement does NOT say: nothing about prefill. The optimizer picks
+`6,1,1` for a predicted +26.4 % PREFILL gain, and this campaign measured decode
+only. TTFT here is useless as a prefill proxy — repeated identical prompts are
+served from the radix cache (0.147-0.153 s for a 12000-token prompt in both
+arms). The trade-off between the two phases is unresolved and is the obvious
+next measurement.
