@@ -33,6 +33,9 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import A, Arg, add_cli_args_from_dataclass
+from sglang.srt.disaggregation.topology import (
+    TOPOLOGY_CHOICES as PD_TOPOLOGY_CHOICES,
+)
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -3414,6 +3417,75 @@ class ServerArgs:
         int,
         "Number of optimistic prefill forward passes that skip the bootstrap wait.",
     ] = 0
+    # Free PD topology choice (#107). Unset -> today's placement, unchanged.
+    disaggregation_topology: A[
+        Optional[str],
+        Arg(
+            help="Placement topology of the PD deployment. 'disjoint': the "
+            "prefill server runs on its own cards "
+            "(--disaggregation-prefill-gpus), optionally layer-sliced "
+            "unevenly across them (--disaggregation-prefill-layer-split, "
+            "e.g. 36,12 for a 3:1 group). 'colocated-congruent': cards are "
+            "REUSED — the prefill lane runs inside the decode server's "
+            "processes and computes with the decode rank's resident weight "
+            "shard (congruent sharding => shared weight bytes; costs only "
+            "activations + scratch; one NCCL rank per card, so neither "
+            "NCCL >= 2.30 nor MPS is required). 'colocated-process': a "
+            "separate prefill process holding its own layer slice shares a "
+            "physical GPU with a decode rank; requires an NCCL runtime "
+            ">= 2.30 and a CUDA MPS daemon (probed at launch; a missing "
+            "prerequisite rejects with the probe's reason). Every topology "
+            "passes a boot-time per-card VRAM check: decode claim + prefill "
+            "weight slice + prefill budget must fit the NVML total, else "
+            "the launch is rejected naming card, items, sum and capacity. "
+            "Unset (default): current behavior, byte-identical.",
+            choices=list(PD_TOPOLOGY_CHOICES),
+        ),
+    ] = None
+    disaggregation_prefill_gpus: A[
+        Optional[List[int]],
+        Arg(
+            help="CUDA device indices carrying the prefill role, one entry "
+            "per card, no duplicates. Required with "
+            "--disaggregation-topology. For 'colocated-congruent' each "
+            "named card must host a decode rank (the lane reuses its "
+            "shard); for 'colocated-process' at least one named card must "
+            "also host a decode rank, and BOTH servers are launched "
+            "without a CUDA_VISIBLE_DEVICES restriction with the SAME "
+            "topology flags (indices are in the shared host view; each "
+            "worker process is then isolated to exactly its own card). "
+            "'disjoint' topology flags go on the prefill launch only. "
+            "Example: 0,1.",
+            type_parser=_parse_int_list,
+        ),
+    ] = None
+    disaggregation_prefill_layer_split: A[
+        Optional[List[int]],
+        Arg(
+            help="Model layers per prefill card (same order/length as "
+            "--disaggregation-prefill-gpus); the counts must sum to the "
+            "model's hidden layers. Enables an UNEVEN prefill group (e.g. "
+            "36,12 places 3x the layers on the stronger card); mapped onto "
+            "the existing uneven-PP machinery (SGLANG_PP_LAYER_PARTITION). "
+            "Slices are full-width per card: combining a layer split with "
+            "partial TP is the hierarchical-parallelism track, not this "
+            "flag. Required for 'colocated-process' (only a slice fits "
+            "next to the resident decode shard); not applicable to "
+            "'colocated-congruent' (the lane uses the decode sharding).",
+            type_parser=_parse_int_list,
+        ),
+    ] = None
+    disaggregation_prefill_budget_mib: A[
+        Optional[int],
+        Arg(
+            help="Prefill-side activation/scratch budget in MiB PER CARD, "
+            "an explicit item of the boot-time VRAM check. Required with "
+            "--disaggregation-topology. This is the ENTIRE prefill budget "
+            "item: no utilization ceiling, safety factor or context-"
+            "overhead subtraction is applied on top — leaving headroom for "
+            "the CUDA context is the operator's responsibility.",
+        ),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

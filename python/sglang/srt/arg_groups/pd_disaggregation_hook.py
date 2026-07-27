@@ -105,3 +105,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"disaggregation_transfer_backend='mooncake' or 'nixl', "
                 f"got '{server_args.disaggregation_transfer_backend}'."
             )
+
+    # Free PD topology choice (#107). Without --disaggregation-topology this
+    # returns before touching anything (default placement byte-identical);
+    # with it, the topology is validated, probe-gated and normalized, and an
+    # infeasible per-card VRAM sum rejects the launch here instead of
+    # surfacing as a runtime OOM.
+    from sglang.srt.disaggregation.topology import apply_pd_topology
+
+    apply_pd_topology(server_args)
