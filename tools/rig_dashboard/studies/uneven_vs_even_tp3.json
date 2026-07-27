@@ -14,7 +14,14 @@
     "",
     "Both arms carry the same load and the same prompt set on purpose. If the",
     "verdict comes back not_comparable, read the reason: it names the term",
-    "that drifted, and that term is the experiment, not a nuisance."
+    "that drifted, and that term is the experiment, not a nuisance.",
+    "",
+    "PATHS COME FROM THE ENVIRONMENT. model_path, the draft model and",
+    "python_exe are written as ${MODEL_ROOT:-<MODEL_ROOT>}/... and",
+    "${VENV:-<VENV>}/bin/python; load_study expands them. Source your local",
+    "rig env file before running. The defaults are placeholders on purpose --",
+    "an unsourced run fails on a visibly bogus path instead of booting",
+    "against whatever tree this file's author happened to have."
   ],
   "scenario": "noise_floor",
   "point": {},
@@ -39,7 +46,7 @@
       "label": "even-tp3",
       "note": "baseline: stock even TP split across three mismatched cards",
       "settings": {
-        "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8",
+        "model_path": "${MODEL_ROOT:-<MODEL_ROOT>}/Qwen3.6-27B-FP8",
         "served_model_name": "Qwen3.6-27B",
         "tp_size": 3,
         "rank_gpu_id": [0, 1, 2],
@@ -50,11 +57,11 @@
         "trust_remote_code": true,
         "host": "127.0.0.1",
         "port": 30000,
-        "python_exe": "/spinning/htsglang-gpu/.venv/bin/python",
+        "python_exe": "${VENV:-<VENV>}/bin/python",
         "extra_flags": [
           "--enable-metrics-for-all-schedulers",
           "--speculative-algorithm", "DFLASH",
-          "--speculative-draft-model", "/spinning/llm_stuff/club-3090/models-cache/qwen3.6-27b-dflash",
+          "--speculative-draft-model", "${MODEL_ROOT:-<MODEL_ROOT>}/qwen3.6-27b-dflash",
           "--speculative-dflash-block-size", "16",
           "--speculative-draft-placement", "solo"
         ]
@@ -69,7 +76,7 @@
       "label": "uneven-tp3",
       "note": "candidate: shards proportional to measured per-card capacity",
       "settings": {
-        "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8",
+        "model_path": "${MODEL_ROOT:-<MODEL_ROOT>}/Qwen3.6-27B-FP8",
         "served_model_name": "Qwen3.6-27B",
         "tp_size": 3,
         "rank_gpu_id": [0, 1, 2],
@@ -81,12 +88,12 @@
         "trust_remote_code": true,
         "host": "127.0.0.1",
         "port": 30000,
-        "python_exe": "/spinning/htsglang-gpu/.venv/bin/python",
+        "python_exe": "${VENV:-<VENV>}/bin/python",
         "extra_flags": [
           "--enable-metrics-for-all-schedulers",
           "--rank-auto-reserve-mib", "3000,2200,2200",
           "--speculative-algorithm", "DFLASH",
-          "--speculative-draft-model", "/spinning/llm_stuff/club-3090/models-cache/qwen3.6-27b-dflash",
+          "--speculative-draft-model", "${MODEL_ROOT:-<MODEL_ROOT>}/qwen3.6-27b-dflash",
           "--speculative-dflash-block-size", "16",
           "--speculative-draft-placement", "solo"
         ]

@@ -633,7 +633,7 @@ enabled, so the report is reproducible upstream as-is.
 
 Cheapest first, and deliberately ordered so a failure is diagnosable where it
 happens. `--rank-gpu-id` is CUDA order (`[[tp5-emulation-uneven-gguf-bugs]]`);
-resolve the 5090's index at runtime with `/spinning/r3val/gpu_map.py`, never
+resolve the 5090's index at runtime with `<REPO_PATH>/r3val/gpu_map.py`, never
 assume it. Vehicle: the Window-5 one — **Llama-3.1-8B-Instruct dense, TP=2**,
 lane head = torch[0], `--rank-gpu-memory-mib 29000,18000`, `--context-length
 2048`, `--max-total-tokens 16384`, CUDA graphs ON, `--random-seed 1234` on

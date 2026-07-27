@@ -35,7 +35,14 @@
   "SPECULATION IS ON in the decode point of this tier, which is why the",
   "decode metric is ms per SPECULATIVE STEP rather than ms per output token:",
   "under speculation the per-token time fuses accept length with step time",
-  "and the two arms need not have the same accept length."
+  "and the two arms need not have the same accept length.",
+  "",
+  "PATHS COME FROM THE ENVIRONMENT. model_path, the draft model and",
+  "python_exe are written as ${MODEL_ROOT:-<MODEL_ROOT>}/... and",
+  "${VENV:-<VENV>}/bin/python; load_study expands them. Source your local",
+  "rig env file before running. The defaults are placeholders on purpose --",
+  "an unsourced run fails on a visibly bogus path instead of booting",
+  "against whatever tree this file's author happened to have."
  ],
  "scenario": "mlp_split_crossover",
  "point": {
@@ -69,7 +76,7 @@
    "label": "base",
    "note": "reference: the plain VRAM-proportional split, no MLP concentration",
    "settings": {
-    "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8",
+    "model_path": "${MODEL_ROOT:-<MODEL_ROOT>}/Qwen3.6-27B-FP8",
     "served_model_name": "Qwen3.6-27B",
     "tp_size": 3,
     "rank_gpu_id": [0, 1, 2],
@@ -81,7 +88,7 @@
     "trust_remote_code": true,
     "host": "127.0.0.1",
     "port": 30000,
-    "python_exe": "/spinning/htsglang-gpu/.venv/bin/python",
+    "python_exe": "${VENV:-<VENV>}/bin/python",
     "extra_flags": [
      "--enable-metrics-for-all-schedulers",
      "--max-total-tokens", "16384"
@@ -98,7 +105,7 @@
    "label": "mlp-3-1-1",
    "note": "candidate: mild concentration on rank 0",
    "settings": {
-    "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8",
+    "model_path": "${MODEL_ROOT:-<MODEL_ROOT>}/Qwen3.6-27B-FP8",
     "served_model_name": "Qwen3.6-27B",
     "tp_size": 3,
     "rank_gpu_id": [0, 1, 2],
@@ -110,7 +117,7 @@
     "trust_remote_code": true,
     "host": "127.0.0.1",
     "port": 30000,
-    "python_exe": "/spinning/htsglang-gpu/.venv/bin/python",
+    "python_exe": "${VENV:-<VENV>}/bin/python",
     "extra_flags": [
      "--enable-metrics-for-all-schedulers",
      "--max-total-tokens", "16384",
@@ -128,7 +135,7 @@
    "label": "mlp-4-1-1",
    "note": "candidate: the intermediate step, kept so the envelope can be drawn rather than assumed",
    "settings": {
-    "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8",
+    "model_path": "${MODEL_ROOT:-<MODEL_ROOT>}/Qwen3.6-27B-FP8",
     "served_model_name": "Qwen3.6-27B",
     "tp_size": 3,
     "rank_gpu_id": [0, 1, 2],
@@ -140,7 +147,7 @@
     "trust_remote_code": true,
     "host": "127.0.0.1",
     "port": 30000,
-    "python_exe": "/spinning/htsglang-gpu/.venv/bin/python",
+    "python_exe": "${VENV:-<VENV>}/bin/python",
     "extra_flags": [
      "--enable-metrics-for-all-schedulers",
      "--max-total-tokens", "16384",
@@ -158,7 +165,7 @@
    "label": "mlp-6-1-1",
    "note": "candidate: deep concentration on rank 0",
    "settings": {
-    "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8",
+    "model_path": "${MODEL_ROOT:-<MODEL_ROOT>}/Qwen3.6-27B-FP8",
     "served_model_name": "Qwen3.6-27B",
     "tp_size": 3,
     "rank_gpu_id": [0, 1, 2],
@@ -170,7 +177,7 @@
     "trust_remote_code": true,
     "host": "127.0.0.1",
     "port": 30000,
-    "python_exe": "/spinning/htsglang-gpu/.venv/bin/python",
+    "python_exe": "${VENV:-<VENV>}/bin/python",
     "extra_flags": [
      "--enable-metrics-for-all-schedulers",
      "--max-total-tokens", "16384",

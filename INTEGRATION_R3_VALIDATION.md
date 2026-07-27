@@ -156,7 +156,7 @@ Verified per feature, by content rather than by ancestry:
 
 The single file that differs is `tools/rig_dashboard/test_plan_parser.py`, and
 **this branch is the better version**: it replaced hardcoded
-`/root/.claude/jobs/...` paths with an env-overridable `PLAN_PARSER_LOGDIR`.
+`<HOME>/.claude/jobs/...` paths with an env-overridable `PLAN_PARSER_LOGDIR`.
 The r1 line still carries the hardcoded paths.
 
 A trial merge was attempted and **aborted**: it produced **25 conflicting
@@ -673,7 +673,7 @@ the act during a boot:
 
 ```
 nvcc ... -gencode=arch=compute_86,code=sm_86 -DSGL_CUDA_ARCH=860 ...
-  -c /root/.cache/tvm-ffi/sgl_kernel_jit_gptq_marlin_bf16_t_94a284ca1583e2c3__cuda_arch_8.6__tvmffi_0.1.11/cuda.cu
+  -c <HOME>/.cache/tvm-ffi/sgl_kernel_jit_gptq_marlin_bf16_t_94a284ca1583e2c3__cuda_arch_8.6__tvmffi_0.1.11/cuda.cu
 ```
 
 `compute_86` is the **two 3080 ranks**. They sit in a multi-minute nvcc build
@@ -808,7 +808,7 @@ cache-key tests pass.
 
 Running the registered unit suite needs the launcher's environment, or the
 result is meaningless: `PYTHONPATH=<worktree>/python PYTHONSAFEPATH=1` (else
-imports resolve against `/spinning/htsglang-gpu/python` and 53 modules fail to
+imports resolve against `<REPO_PATH>/htsglang-gpu/python` and 53 modules fail to
 collect) **and** `LD_LIBRARY_PATH` pointing at the venv's nvidia libs (else
 `deep_gemm/_C.so` cannot find `libnvrtc.so.13` and 5 more abort collection).
 `test_hicache_nixl_storage.py` needs `--ignore` (missing `nixl`).
@@ -927,7 +927,7 @@ host. It is NOT measured on sm75 or gfx900, which this rig does not have.
 ## Baseline: what normal sglang usage gives on these three cards
 
 **One binary, one venv, one model.** The "stock" rows are this fork's own build
-(`e879d35f2a`, `/spinning/htsglang-gpu/.venv`, `/spinning/wt-merge-probe`) run
+(`e879d35f2a`, `<VENV>`, `<REPO_PATH>/wt-merge-probe`) run
 with STOCK FLAGS ONLY -- no `--rank-tp-ratio`, no uneven DCP, no MTP where
 stock forbids it. So the delta is purely flags and features; "that was a
 different build / different kernels / different install" cannot be argued.
@@ -1328,11 +1328,11 @@ maximum context, while the fork configuration can, several times over.
 
 #### Addendum: the 0.82 reference command itself was never measured
 
-A second, deeper search (including `/root/.omp/agent/sessions/`) settles two
+A second, deeper search (including `<HOME>/.omp/agent/sessions/`) settles two
 open points.
 
 **1. The exact reference command has no numbers anywhere.** It was launched
-twice: once bare from `/root/.bash_history` (interactive, no redirect, nothing
+twice: once bare from `<HOME>/.bash_history` (interactive, no redirect, nothing
 captured), and once under an LMCache connector, where it died in
 `initialize_kv_cache -> kv_transfer_group.register_kv_caches` **before** vLLM
 printed `Available KV cache memory` / `GPU KV cache size`. So the `0.82` case
@@ -1441,7 +1441,7 @@ the one measured under equal treatment, and that measurement does not exist yet.
 
 ### The 0.82 reference command -- now MEASURED
 
-Verbatim CLAUDE.md command, vLLM from `/spinning/shvllm/.venv`, TP=2 on the two
+Verbatim CLAUDE.md command, vLLM from `<VENV>`, TP=2 on the two
 3080s, `--gpu-memory-utilization 0.82`, MTP=3, kv fp8. Flag-for-flag identical
 to the reference (checked mechanically, all 17 flags):
 
@@ -2574,7 +2574,7 @@ boots torn down by their own PID, GPUs verified empty between arms.
 
 | # | check | expected | observed | verdict |
 |---|---|---|---|---|
-| a | stale CuTe / tvm-ffi cache | purge needed | `/tmp/root/cutlass_python_cache` already empty; 0 tvm-ffi dirs with `build.ninja` and no `.so` | nothing to purge |
+| a | stale CuTe / tvm-ffi cache | purge needed | `/tmp/<HOME>/cutlass_python_cache` already empty; 0 tvm-ffi dirs with `build.ninja` and no `.so` | nothing to purge |
 | b | **Llama-3.1-8B TP=3, NO `--rank-gpu-id`, bf16** | boots (was `cudaErrorNoKernelImageForDevice` in `rmsnorm_cute`) | **booted**, 128 tok / 2.525 s = 50.7 tok/s, coherent | **GREEN** |
 | c | same boot, `--dtype float16` | boots | **booted**, 128 tok / 2.514 s = 50.9 tok/s, coherent | **GREEN** |
 | d | per-rank `CUTE_DSL_ARCH` differs | sm_120a rank 0, sm_86 ranks 1/2 | exactly that, see log quote below | **GREEN** |
@@ -2584,7 +2584,7 @@ boots torn down by their own PID, GPUs verified empty between arms.
 
 `SGLANG_OPT_USE_JIT_NORM=0` was removed from the boot recipe as instructed. It
 was inert: the arms above boot without it. `boot_p1.sh` / `boot_p1dbg.sh` in
-`/spinning/r3val/` are the recipe, derived from `boot_a.sh`.
+`<REPO_PATH>/r3val/` are the recipe, derived from `boot_a.sh`.
 
 ## (d) The direct evidence, from the fp16 debug log
 
@@ -2623,7 +2623,7 @@ three ranks report "for GPU 0" but with correctly DIFFERENT archs.
 **TRAP, cost an arm to find:** the first comparison was run against the Jul-26
 `b4_fi_mtp` baseline and showed a 4x `max_total_num_tokens` swing. That was NOT
 the fix. `SGLANG_MEASURED_KV_BUDGET` persists per-rank corrections to
-`/root/.cache/sglang/kv_budget-<confighash>.json` and the NEXT boot with the
+`<HOME>/.cache/sglang/kv_budget-<confighash>.json` and the NEXT boot with the
 same hash consumes them. The arm is therefore **path-dependent on boot order**.
 Any future A/B on this vehicle must either reset that file between arms or pin
 `SGLANG_UNEVEN_TOKEN_VECTOR` -- otherwise boot order is a hidden variable. This
@@ -2763,7 +2763,7 @@ measured separately.
 | A, `SGLANG_FP8_FUSED_GEMV=1` | 0.87 | 0.87 | 0.87 | **0.87 tok/s** | 0/3 |
 | B, `SGLANG_FP8_FUSED_GEMV=0` | 2.71 | 2.69 | 2.68 | **2.69 tok/s** | 0/3 |
 
-Raw: `192.168.0.89:/root/fp8pc_ab_{on,off}.json`, logs `fp8pc_boot{A,B}.log`,
+Raw: `<RIG2_IP>:<HOME>/fp8pc_ab_{on,off}.json`, logs `fp8pc_boot{A,B}.log`,
 microbench `fp8pc_micro_2080ti.json`.
 
 **What this run does establish:**
@@ -3102,7 +3102,7 @@ All 68 changed Python files AST-compile.
 
 All boots on the merge tip (`0f2734aeea`, i.e. the full stack), rig1 solo, GPUs
 verified empty between arms and at the end. The persisted
-`SGLANG_MEASURED_KV_BUDGET` record (`/root/.cache/sglang/kv_budget-*.json`, 31
+`SGLANG_MEASURED_KV_BUDGET` record (`<HOME>/.cache/sglang/kv_budget-*.json`, 31
 files) was moved aside at the start of the phase and DELETED before every 27B
 boot, so no arm inherited another arm's correction.
 
@@ -3319,7 +3319,7 @@ assumed), weightless worker = torch[1] = 3080. `--rank-gpu-memory-mib
 29000,18000`, `--context-length 2048` (the EAGLE3 checkpoint's
 `max_position_embeddings`), `--max-total-tokens 16384`, CUDA graphs ON.
 Arm A = `r1_lane_nospec`, arm B = `r4_lane_spec` (EAGLE3, topk 1, 3 steps,
-4 draft tokens, `--speculative-draft-placement solo`). Harness `/spinning/r3val/`.
+4 draft tokens, `--speculative-draft-placement solo`). Harness `<REPO_PATH>/r3val/`.
 
 This is the vehicle the previous window nominated ("Cheapest path to R4 next
 window: Llama TP=2 lane with #127 merged in"). It works.
@@ -3528,7 +3528,7 @@ this vehicle, for reasons that predate #143 on both sides.
 # PS2 (born-spilled deep prefill) x speculative decoding — GPU validation
 
 Validated commit: `65e056b4c3` (merge tip of `integration/r3-probe`, carrying
-`95a51c74b5`). Worktree `/spinning/wt-ps2spec-val`. Qwen3.6-27B-FP8, uneven
+`95a51c74b5`). Worktree `<REPO_PATH>/wt-ps2spec-val`. Qwen3.6-27B-FP8, uneven
 TP=3 / uneven DCP=3 on 5090 + 2x 3080, `--rank-tp-ratio auto-performance`,
 `--rank-kv-ratio capacity`, MTP (NEXTN, 3 steps, topk 1, 4 draft tokens),
 `--max-total-tokens 3600`.
@@ -3539,7 +3539,7 @@ was configured.
 
 Metric is **ms per verify round**, not raw tok/s. KV ownership vector pinned
 with `SGLANG_UNEVEN_TOKEN_VECTOR=2,3,3` and the measured-KV-budget cache
-(`/root/.cache/sglang/kv_budget-*.json`) removed before every arm, so the #188
+(`<HOME>/.cache/sglang/kv_budget-*.json`) removed before every arm, so the #188
 persistence trap cannot make two arms differ by capacity.
 
 ## Gate results

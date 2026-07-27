@@ -4,7 +4,7 @@ Task #138. Single authoritative file for this feature: current state (code-refer
 design decisions, rejected alternatives + why, build plan, test recipes, open points.
 A fresh agent should be able to work from this file alone.
 
-Branch: `feat/mleagle-adaptive-len` (worktree `/spinning/wt-mleagle-adaptive`,
+Branch: `feat/mleagle-adaptive-len` (worktree `<REPO_PATH>/wt-mleagle-adaptive`,
 based on `origin/integration/r3-probe`).
 
 ---
@@ -325,8 +325,8 @@ passed. An unsupported adaptive config is soft-disabled at arg time
 ### 6.1 CPU (no GPU needed)
 
 ```
-cd /spinning/wt-mleagle-adaptive
-PYTHONPATH=/spinning/wt-mleagle-adaptive/python /spinning/htsglang-gpu/.venv/bin/python \
+cd <REPO_PATH>/wt-mleagle-adaptive
+PYTHONPATH=<REPO_PATH>/wt-mleagle-adaptive/python <VENV>/bin/python \
   -m pytest test/registered/unit/spec/test_adaptive_spec_params.py \
             test/registered/unit/spec/test_frozen_mtp_adaptive_init.py \
             test/registered/unit/spec/test_draft_pick_rank_sync.py \
@@ -345,7 +345,7 @@ Baseline before this branch: 118 passed (first four files).
 - `MiMoV2ForCausalLM` / `MiMoV2FlashForCausalLM` (`arg_groups/overrides.py:449`)
 - `Step3p5ForCausalLM` / `Step3p7ForConditionalGeneration` (`overrides.py:1021`)
 
-`/spinning/llm_stuff/club-3090/models-cache/` contains neither (only Qwen3.5/3.6,
+`<MODEL_PATH>/club-3090/models-cache/` contains neither (only Qwen3.5/3.6,
 Gemma-4, Llama-3.1 and their EAGLE3/dflash/MTP drafts). The draft checkpoint must
 additionally carry >= 3 MTP layers (`num_nextn_predict_layers >= 3`) for the default
 ladder — most published MiMo-V2 drafts ship 3.

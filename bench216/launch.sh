@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # Boot one arm of the MLP-split campaign (task #216 follow-up).
 # $1 = arm label, $2 = rank-mlp-ratio ("none" for plain auto), $3 = port
+#
+# The source tree is this script's checkout; VENV and MODEL_ROOT come from the
+# environment (source your local rig env file). Their fallbacks are
+# placeholders so an unsourced run fails on a bogus path rather than booting
+# against somebody else's venv or model cache.
 set -u
 ARM="$1"; MLP="$2"; PORT="${3:-30000}"
-LOG="/spinning/wt-knee-guard/bench216/logs/${ARM}.log"
-mkdir -p "$(dirname "$LOG")"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+LOGDIR="$REPO_ROOT/bench216/logs"
+LOG="$LOGDIR/${ARM}.log"
+mkdir -p "$LOGDIR"
 
 # #188: the measured-KV-budget cache persists per config hash. Keep the
 # feature OFF and pin the ownership vector so the KV axis is identical in
@@ -13,12 +20,13 @@ rm -f /root/.cache/sglang/kv_budget-*.json
 export SGLANG_MEASURED_KV_BUDGET=0
 export SGLANG_UNEVEN_TOKEN_VECTOR=2,3,3
 
-NV=/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia
+VENV="${VENV:-<VENV>}"
+NV="$VENV/lib/python3.12/site-packages/nvidia"
 # deep_gemm/_C.so links libnvrtc.so.13, which only resolves via the venv's
 # bundled nvidia libs; without this every TP rank aborts at scheduler start.
 export LD_LIBRARY_PATH="$NV/cu13/lib:$NV/cuda_nvrtc/lib:$NV/nvjitlink/lib:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH=/spinning/wt-knee-guard/python
-MODEL=/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8
+export PYTHONPATH="$REPO_ROOT/python"
+MODEL="${MODEL_ROOT:-<MODEL_ROOT>}/Qwen3.6-27B-FP8"
 ARGS=(
   --model-path "$MODEL"
   --tp-size 3
@@ -35,7 +43,7 @@ ARGS=(
 )
 [ "$MLP" != "none" ] && ARGS+=(--rank-mlp-ratio "$MLP")
 
-/spinning/htsglang-gpu/.venv/bin/python -m sglang.launch_server "${ARGS[@]}" \
+"$VENV/bin/python" -m sglang.launch_server "${ARGS[@]}" \
   > "$LOG" 2>&1 &
-echo $! > "/spinning/wt-knee-guard/bench216/logs/${ARM}.pid"
-echo "arm=$ARM mlp=$MLP port=$PORT pid=$(cat /spinning/wt-knee-guard/bench216/logs/${ARM}.pid) log=$LOG"
+echo $! > "$LOGDIR/${ARM}.pid"
+echo "arm=$ARM mlp=$MLP port=$PORT pid=$(cat "$LOGDIR/${ARM}.pid") log=$LOG"
