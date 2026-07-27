@@ -33,6 +33,28 @@ per-token result is bit-identical to the no-offload (fraction == 1.0) path.
 There is no cross-wave accumulation of a single token's partial sums, so no
 floating-point re-association is introduced.
 
+Expert-major waves (SGLANG_MOE_OFFLOAD_WAVE_ORDER=expert, #254)
+---------------------------------------------------------------
+The token-major split above re-fetches a spill expert in EVERY wave whose
+tokens route to it -- with C=16 scratch slots a 2048-token chunk runs ~62
+waves, so each spill expert is streamed ~62 times (hundreds of GiB per chunk
+and rank). The opt-in expert-major split inverts the axis: waves are disjoint
+groups of at most C SPILL EXPERTS, and each group is fetched exactly once per
+forward.
+
+That breaks the "a wave holds a token's complete top-k" property the identity
+argument above rests on, so the reduction is taken out of the wave: each routed
+(token, k-slot) pair is submitted as its own pseudo-token with top_k == 1 (the
+fused kernel then writes the weighted contribution straight out, with no
+internal reduction) and stored at its own k-slot in a [T, top_k, H] buffer. The
+k-slot is fixed by the routing, so the buffer holds the same values in the same
+places for ANY wave split; the top-k reduction runs once at the end over the
+full buffer, in k order, with the same reduction the unsplit kernel applies to
+its own intermediate_cache3. The result is bit-identical to both the
+token-major and the no-offload path (measured on bf16 and fp8-blockwise,
+tests/moe_offload/test_wave_order_gpu.py). Cost: one transient [T, top_k, H]
+buffer per layer. Decode (single wave) is unaffected; default stays token.
+
 Design notes
 ------------
 * Cold experts are FETCHED and computed on GPU (this rig's AMD CPU has no AMX,
@@ -166,13 +188,14 @@ def reset_expert_offload_release() -> None:
 
 @dataclass
 class ResidencyStats:
-    fetches: int = 0          # experts H2D-copied (misses that fit)
-    hits: int = 0             # needed experts already resident
-    misses: int = 0           # needed experts not resident
-    evictions: int = 0        # resident experts kicked out
-    forwards: int = 0         # resolve() calls (== number of waves run)
+    fetches: int = 0  # experts H2D-copied (misses that fit)
+    hits: int = 0  # needed experts already resident
+    misses: int = 0  # needed experts not resident
+    evictions: int = 0  # resident experts kicked out
+    forwards: int = 0  # resolve() calls (== number of waves run)
     overflow_forwards: int = 0  # forwards that needed >n_slots unique experts
-    waves: int = 0            # total waves run across all forwards
+    waves: int = 0  # total waves run across all forwards
+    h2d_bytes: int = 0  # bytes streamed host->device by _fetch()
 
     @property
     def hit_rate(self) -> float:
@@ -214,17 +237,15 @@ def plan_token_waves(
         raise ValueError("scratch must be >= 1")
 
     def _is_spill(e: int) -> bool:
-        return e not in resident_ids if resident_ids is not None else e >= resident_count
+        return (
+            e not in resident_ids if resident_ids is not None else e >= resident_count
+        )
 
     waves: List[List[int]] = []
     cur_rows: List[int] = []
     cur_spill: set = set()
     for t, experts in enumerate(experts_per_token):
-        spill = {
-            int(e)
-            for e in experts
-            if e is not None and _is_spill(int(e))
-        }
+        spill = {int(e) for e in experts if e is not None and _is_spill(int(e))}
         if len(spill) > scratch:
             raise ValueError(
                 f"token {t} routes to {len(spill)} spill experts but only "
@@ -241,6 +262,96 @@ def plan_token_waves(
     if cur_rows:
         waves.append(cur_rows)
     return waves
+
+
+def plan_expert_waves(
+    experts_per_token: Sequence[Sequence[int]],
+    resident_count: int,
+    scratch: int,
+    resident_ids: Optional[frozenset] = None,
+) -> Tuple[List[int], List[List[int]]]:
+    """Partition the forward's routed SPILL experts into waves of <= ``scratch``.
+
+    The expert-major counterpart of ``plan_token_waves``. Returns
+    ``(resident_used, spill_waves)``:
+
+    * ``resident_used`` -- the resident experts this forward routes to, sorted.
+      They are already on GPU, need no scratch slot and no fetch, so they are
+      computed in ONE wave of their own however many there are.
+    * ``spill_waves`` -- the routed spill experts, sorted and chunked into
+      groups of at most ``scratch``. Each group is fetched ONCE; a spill expert
+      therefore crosses PCIe exactly once per forward instead of once per
+      token-major wave.
+
+    Deterministic (sorted ids, fixed chunking), pure-python, CPU-testable.
+    Unlike the token-major split this cannot fail: a token's top-k may be
+    spread across waves, so no per-token scratch bound exists.
+    """
+    if scratch < 1:
+        raise ValueError("scratch must be >= 1")
+
+    def _is_spill(e: int) -> bool:
+        return (
+            e not in resident_ids if resident_ids is not None else e >= resident_count
+        )
+
+    resident_used: set = set()
+    spill_used: set = set()
+    for experts in experts_per_token:
+        for e in experts:
+            if e is None:
+                continue
+            e = int(e)
+            if e < 0:
+                continue
+            (spill_used if _is_spill(e) else resident_used).add(e)
+
+    spill_sorted = sorted(spill_used)
+    spill_waves = [
+        spill_sorted[i : i + scratch] for i in range(0, len(spill_sorted), scratch)
+    ]
+    return sorted(resident_used), spill_waves
+
+
+def resolve_wave_order(value: Optional[str]) -> str:
+    """Normalize SGLANG_MOE_OFFLOAD_WAVE_ORDER; reject anything else loudly."""
+    order = (value or "token").strip().lower()
+    if order not in ("token", "expert"):
+        raise RuntimeError(
+            f"SGLANG_MOE_OFFLOAD_WAVE_ORDER must be 'token' or 'expert', got {value!r}"
+        )
+    return order
+
+
+def combine_topk_partials(partials, out, routed_scaling_factor):  # pragma: no cover
+    """Reduce a [T, top_k, H] per-(token, k-slot) contribution stack to [T, H].
+
+    This is the SAME reduction ``_fused_moe_kernel_sequence`` applies to its own
+    ``intermediate_cache3`` (see moe_runner/triton_utils/fused_moe.py, the
+    combine block after the second kernel): the branch selection depends only on
+    ``top_k``, the token count and ``routed_scaling_factor`` -- all of which the
+    expert-major path keeps at their unsplit, full-batch values. Feeding it the
+    same values in the same k order therefore reproduces the unsplit output bit
+    for bit.
+    """
+    import torch
+
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+        _use_moe_sum_reduce_torch_compile,
+        moe_sum_reduce,
+        moe_sum_reduce_torch_compile,
+    )
+
+    topk = partials.shape[1]
+    rsf = 1.0 if routed_scaling_factor is None else routed_scaling_factor
+    if topk == 2 and rsf == 1.0:
+        torch.add(partials[:, 0], partials[:, 1], out=out)
+        return out
+    if _use_moe_sum_reduce_torch_compile(partials.shape[0]):
+        moe_sum_reduce_torch_compile(partials, out, rsf)
+    else:
+        moe_sum_reduce(partials, out, rsf)
+    return out
 
 
 @dataclass
@@ -583,7 +694,7 @@ class MoEExpertOffloadCache:
             resident_count=self.resident_count,
             scratch=self.scratch,
         )
-        self._pinned: Dict[str, "object"] = {}    # attr -> pinned spill [E-R,...]
+        self._pinned: Dict[str, "object"] = {}  # attr -> pinned spill [E-R,...]
         self._resident: Dict[str, "object"] = {}  # attr -> GPU buffer [R+C,...]
         self._stream = None
         self._installed = False
@@ -606,6 +717,13 @@ class MoEExpertOffloadCache:
         self._hot_frozen = False
         self._spill_pool_index: Optional[Dict[int, int]] = None  # None => id-R
 
+        # --- #254 prefill wave order ---------------------------------------
+        # "token" (default) = disjoint token subsets, every wave re-fetches its
+        # tokens' spill experts. "expert" = disjoint spill-expert groups, each
+        # spill expert fetched once per forward; byte-identical via the fixed
+        # k-order combine in _run_waves_expert_major.
+        self._wave_order = resolve_wave_order(envs.SGLANG_MOE_OFFLOAD_WAVE_ORDER.get())
+
         # --- Stage-3 CUDA-graph-capturable path ----------------------------
         # Built by install_capturable_buffers() (after install(), and after any
         # freeze_from_source() rearrange): frozen device LUTs + UVA device
@@ -621,11 +739,11 @@ class MoEExpertOffloadCache:
             )
         self._capturable_ready = False
         self._cap_resident_slot_lut = None  # int32[E] device
-        self._cap_is_spill = None           # bool[E] device
+        self._cap_is_spill = None  # bool[E] device
         self._cap_spill_pool_row_lut = None  # int32[E] device
-        self._cap_pool_dev: Dict[str, "object"] = {}     # attr -> UVA view [E-R,...]
+        self._cap_pool_dev: Dict[str, "object"] = {}  # attr -> UVA view [E-R,...]
         self._cap_scratch_dst: Dict[str, "object"] = {}  # attr -> resident[R:R+C]
-        self._cap_view_holders: List["object"] = []      # keep pinned bases alive
+        self._cap_view_holders: List["object"] = []  # keep pinned bases alive
 
     # --- lifecycle (GPU window) --------------------------------------------
     def install(self):  # pragma: no cover - requires CUDA
@@ -661,7 +779,8 @@ class MoEExpertOffloadCache:
                 self._resident[attr] = resident_buf
                 self._pinned[attr] = spill
                 setattr(
-                    self.layer, attr,
+                    self.layer,
+                    attr,
                     torch.nn.Parameter(resident_buf, requires_grad=False),
                 )
                 continue
@@ -687,10 +806,13 @@ class MoEExpertOffloadCache:
                 spill.copy_(spill_src)
             self._pinned[attr] = spill
             setattr(
-                self.layer, attr,
-                torch.nn.Parameter(buf, requires_grad=False)
-                if isinstance(getattr(self.layer, attr), torch.nn.Parameter)
-                else buf,
+                self.layer,
+                attr,
+                (
+                    torch.nn.Parameter(buf, requires_grad=False)
+                    if isinstance(getattr(self.layer, attr), torch.nn.Parameter)
+                    else buf
+                ),
             )
             if not full.is_cpu:
                 row_bytes = (full.numel() // full.shape[0]) * full.element_size()
@@ -718,9 +840,7 @@ class MoEExpertOffloadCache:
             except Exception:
                 self.layer._moe_offload_presplit = None
         elif self._resident:
-            record_expert_offload_release(
-                freed_device, freed_host, len(self._resident)
-            )
+            record_expert_offload_release(freed_device, freed_host, len(self._resident))
         self._installed = True
 
     # --- fetch / remap helpers (GPU window) --------------------------------
@@ -735,13 +855,21 @@ class MoEExpertOffloadCache:
             return
         R = self.resident_count
         pool_index = self._spill_pool_index  # None => static layout (id - R)
+        moved = 0
         with torch.cuda.stream(self._stream):
             for attr, spill in self._pinned.items():
                 dst = self._resident[attr]
+                per_expert = dst[0].numel() * dst.element_size()
                 for expert_id, slot in fetch_plan:
-                    row = pool_index[expert_id] if pool_index is not None else expert_id - R
+                    row = (
+                        pool_index[expert_id]
+                        if pool_index is not None
+                        else expert_id - R
+                    )
                     dst[slot].copy_(spill[row], non_blocking=True)
+                    moved += per_expert
         torch.cuda.current_stream().wait_stream(self._stream)
+        self.planner.stats.h2d_bytes += moved
 
     def _build_lut(self, slot_of_needed, dtype, device):
         """Global expert id -> slot LUT for one wave; -1 for every id the wave
@@ -821,9 +949,7 @@ class MoEExpertOffloadCache:
         if self._capturable_ready:
             return
         if not self._installed:
-            raise RuntimeError(
-                "install_capturable_buffers() requires install() first"
-            )
+            raise RuntimeError("install_capturable_buffers() requires install() first")
         R, C = self.resident_count, self.scratch
         if self.planner.buffer_size != R + C:
             raise RuntimeError(
@@ -868,9 +994,7 @@ class MoEExpertOffloadCache:
         import torch
 
         for attr, pool_dev in self._cap_pool_dev.items():
-            torch.index_select(
-                pool_dev, 0, src_row, out=self._cap_scratch_dst[attr]
-            )
+            torch.index_select(pool_dev, 0, src_row, out=self._cap_scratch_dst[attr])
 
     def prepare_capturable(self, topk_ids):  # pragma: no cover - requires CUDA
         """Single-wave, host-sync-free prepare for the captured decode path:
@@ -976,6 +1100,19 @@ class MoEExpertOffloadCache:
             if self._hot_seen >= self._hot_calib_steps:
                 self._freeze_hotset()
 
+        if self._wave_order == "expert":
+            # #254: split over SPILL EXPERTS instead of tokens. The single-wave
+            # case is bit-for-bit the token-major fast path below.
+            resident_used, spill_waves = plan_expert_waves(
+                ids_list, self.resident_count, self.scratch, self.planner.resident_ids
+            )
+            if len(spill_waves) > 1:
+                self.planner.stats.overflow_forwards += 1
+                return self._run_waves_expert_major(
+                    dispatch_output, apply_fn, ids_list, resident_used, spill_waves
+                )
+            return self._run_single_wave(dispatch_output, apply_fn, ids_list)
+
         waves = plan_token_waves(
             ids_list, self.resident_count, self.scratch, self.planner.resident_ids
         )
@@ -983,18 +1120,11 @@ class MoEExpertOffloadCache:
         # Fast path: the whole forward fits in one wave (typical decode). Remap
         # the full batch and run a single apply -- no token slicing overhead.
         if len(waves) == 1:
-            needed = sorted({e for row in ids_list for e in row if e >= 0})
-            slot_of_needed, fetch_plan = self.planner.resolve(needed)
-            self._fetch(fetch_plan)
-            lut = self._build_lut(slot_of_needed, topk_ids.dtype, topk_ids.device)
-            remapped = self._remap(topk_ids, lut)
-            sub = dispatch_output._replace(
-                topk_output=topk_output._replace(topk_ids=remapped)
-            )
-            return apply_fn(sub)
+            return self._run_single_wave(dispatch_output, apply_fn, ids_list)
 
         # Multi-wave (prefill overflow): process disjoint token subsets.
         self.planner.stats.overflow_forwards += 1
+        h2d_before = self.planner.stats.h2d_bytes
         hidden = dispatch_output.hidden_states
         scale = dispatch_output.hidden_states_scale
         topk_weights = topk_output.topk_weights
@@ -1040,6 +1170,157 @@ class MoEExpertOffloadCache:
             )
 
         # Reuse the last wave's CombineInput type/fields, swapping in full output.
+        self._log_wave_h2d("token", len(waves), h2d_before)
+        return combine_out._replace(hidden_states=out_full)
+
+    def _log_wave_h2d(self, order, waves, before):  # pragma: no cover - CUDA
+        """One line per multi-wave forward with the PCIe volume it cost, so the
+        token- vs expert-major difference is readable off the log instead of
+        being inferred from the wall clock. INFO on layer 0 (one line per chunk),
+        DEBUG on the rest."""
+        import logging
+
+        gib = (self.planner.stats.h2d_bytes - before) / float(1 << 30)
+        layer_id = getattr(self.layer, "layer_id", "?")
+        logging.getLogger(__name__).log(
+            logging.INFO if layer_id == 0 else logging.DEBUG,
+            "MoE offload layer %s: %s-major prefill, %d waves, %.2f GiB H2D",
+            layer_id,
+            order,
+            waves,
+            gib,
+        )
+
+    def _run_single_wave(self, dispatch_output, apply_fn, ids_list):  # pragma: no cover
+        """One apply over the full batch: every routed expert fits the buffer at
+        once (typical decode, and any prefill whose spill set fits the scratch).
+        Shared by both wave orders -- with a single wave they are the same path."""
+        topk_output = dispatch_output.topk_output
+        topk_ids = topk_output.topk_ids
+        needed = sorted({e for row in ids_list for e in row if e >= 0})
+        slot_of_needed, fetch_plan = self.planner.resolve(needed)
+        self._fetch(fetch_plan)
+        lut = self._build_lut(slot_of_needed, topk_ids.dtype, topk_ids.device)
+        remapped = self._remap(topk_ids, lut)
+        sub = dispatch_output._replace(
+            topk_output=topk_output._replace(topk_ids=remapped)
+        )
+        return apply_fn(sub)
+
+    def _run_waves_expert_major(
+        self, dispatch_output, apply_fn, ids_list, resident_used, spill_waves
+    ):  # pragma: no cover - requires CUDA
+        """#254 expert-major prefill: waves are disjoint SPILL-EXPERT groups, so
+        every spill expert crosses PCIe exactly ONCE per forward instead of once
+        per token-major wave (~62x at C=16 on a 2048-token chunk).
+
+        Byte-identity to the token-major path
+        -------------------------------------
+        A wave no longer holds a token's complete top-k, so the per-token
+        reduction may not happen inside the wave -- accumulating per-wave partial
+        sums would re-associate it and lose bit-identity. Instead every wave
+        computes its (token, k-slot) contributions as INDEPENDENT rows: each
+        routed pair becomes its own pseudo-token with top_k == 1, which makes the
+        fused kernel write the weighted contribution straight out (no internal
+        reduction), and it is stored at its own k-slot in a [T, top_k, H] buffer.
+        The k-slot comes from the routing and is independent of the wave split,
+        so the buffer's contents are the same values in the same places for ANY
+        split. The top-k reduction then runs ONCE at the end over the full buffer
+        via ``combine_topk_partials`` -- the same reduction the unsplit kernel
+        applies to its own intermediate_cache3.  Padded (-1) slots are never
+        assigned to a wave and stay zero, which is what the kernel writes for
+        them. Verified bit-exact against the unsplit apply on bf16 and
+        fp8-blockwise up to T=2048/E=64/top_k=8 (tests/moe_offload).
+
+        ``routed_scaling_factor`` is applied by the FINAL reduction, so the
+        per-wave applies run with it neutralized to 1.0 (the kernel's top_k == 1
+        path does not carry a scaling step of its own).
+
+        Cost: one transient [T, top_k, H] buffer per layer, freed when the
+        forward returns.
+        """
+        import numpy as np
+        import torch
+
+        topk_output = dispatch_output.topk_output
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+        hidden = dispatch_output.hidden_states
+        scale = dispatch_output.hidden_states_scale
+        router_logits = getattr(topk_output, "router_logits", None)
+        device = topk_ids.device
+        T, K = int(topk_ids.shape[0]), int(topk_ids.shape[1])
+
+        # pair index (t*K + k) -> wave: 0 = the fetch-free resident wave,
+        # 1..n = spill groups, -1 = padded slot (contributes an exact zero).
+        flat_np = np.asarray(ids_list, dtype=np.int64).reshape(-1)
+        wave_lut = np.full(self.num_local_experts, -1, dtype=np.int64)
+        for e in resident_used:
+            wave_lut[e] = 0
+        for w, group in enumerate(spill_waves):
+            for e in group:
+                wave_lut[e] = w + 1
+        wave_of_pair = np.where(flat_np >= 0, wave_lut[np.maximum(flat_np, 0)], -1)
+
+        flat_ids = topk_ids.reshape(-1)
+        flat_weights = topk_weights.reshape(-1, 1).contiguous()
+        partials = None
+        combine_out = None
+
+        h2d_before = self.planner.stats.h2d_bytes
+        cfg = self.layer.moe_runner_config
+        saved_rsf = cfg.routed_scaling_factor
+        try:
+            cfg.routed_scaling_factor = 1.0
+            for w, needed in enumerate([resident_used] + spill_waves):
+                idx_np = np.flatnonzero(wave_of_pair == w)
+                if idx_np.size == 0:
+                    continue
+                slot_of_needed, fetch_plan = self.planner.resolve(needed)
+                self._fetch(fetch_plan)
+                lut = self._build_lut(slot_of_needed, topk_ids.dtype, device)
+
+                idx = torch.from_numpy(idx_np).to(device, non_blocking=True)
+                rows = torch.div(idx, K, rounding_mode="floor")
+                tid_w = lut[flat_ids.index_select(0, idx)].unsqueeze(1)
+                tw_w = flat_weights.index_select(0, idx)
+                hs_w = hidden.index_select(0, rows).contiguous()
+                sc_w = (
+                    scale.index_select(0, rows)
+                    if isinstance(scale, torch.Tensor) and scale.shape[0] == T
+                    else scale
+                )
+                rl_w = (
+                    router_logits.index_select(0, rows)
+                    if isinstance(router_logits, torch.Tensor)
+                    and router_logits.dim() >= 1
+                    and router_logits.shape[0] == T
+                    else router_logits
+                )
+
+                sub_topk = topk_output._replace(
+                    topk_weights=tw_w, topk_ids=tid_w, router_logits=rl_w
+                )
+                sub = dispatch_output._replace(
+                    hidden_states=hs_w,
+                    hidden_states_scale=sc_w,
+                    topk_output=sub_topk,
+                )
+                combine_out = apply_fn(sub)
+                part = combine_out.hidden_states
+                if partials is None:
+                    partials = torch.zeros(
+                        (T * K, part.shape[-1]), dtype=part.dtype, device=device
+                    )
+                partials.index_copy_(0, idx, part.to(partials.dtype))
+        finally:
+            cfg.routed_scaling_factor = saved_rsf
+
+        out_full = torch.empty(
+            (T, partials.shape[-1]), dtype=partials.dtype, device=device
+        )
+        combine_topk_partials(partials.view(T, K, -1), out_full, saved_rsf)
+        self._log_wave_h2d("expert", len(spill_waves) + 1, h2d_before)
         return combine_out._replace(hidden_states=out_full)
 
     # --- Stage-1 hot-set freeze (GPU window) -------------------------------
@@ -1113,8 +1394,8 @@ class MoEExpertOffloadCache:
         # into buf[0:R]); no new GPU tensor is allocated. Per-attr host temp is
         # one layer's expert set (~O(100 MB)), freed each iteration.
         for attr in list(self._resident.keys()):
-            buf = self._resident[attr]         # [R+C,...]; slot i (i<R) == expert i
-            old_spill = self._pinned[attr]     # [E-R,...]; row (e-R) == expert e>=R
+            buf = self._resident[attr]  # [R+C,...]; slot i (i<R) == expert i
+            old_spill = self._pinned[attr]  # [E-R,...]; row (e-R) == expert e>=R
             tail = tuple(buf.shape[1:])
 
             # Host snapshot of the current resident experts [0,R) so overwriting
@@ -1129,13 +1410,13 @@ class MoEExpertOffloadCache:
                 (E - R,) + tail, dtype=old_spill.dtype, device="cpu"
             ).pin_memory()
             for j, e in enumerate(cold):
-                new_spill[j].copy_(_src(e))     # host<-host (snapshot or old_spill)
+                new_spill[j].copy_(_src(e))  # host<-host (snapshot or old_spill)
 
             # Push hot experts into the existing resident slots, in place.
             for i, e in enumerate(hot):
-                buf[i].copy_(_src(e))           # GPU<-host (H2D); no new GPU alloc
+                buf[i].copy_(_src(e))  # GPU<-host (H2D); no new GPU alloc
 
-            self._pinned[attr] = new_spill      # self._resident[attr] stays `buf`
+            self._pinned[attr] = new_spill  # self._resident[attr] stays `buf`
             del resident_host, old_spill
 
         torch.cuda.synchronize()
