@@ -48,6 +48,12 @@ If the relaxed deadline tears anyway, the failure is re-raised with the
 cold-build hypothesis attached, so the next reader is not sent chasing the
 unrelated kernel that happened to launch next.
 
+That hypothesis is about PEER ranks, so it is attached only when a peer
+exists. On a single-rank boot the original exception is re-raised unchanged
+(#257): an OOM in the warmup forward is an OOM, and dressing it as a
+cold-build collision sends the reader looking for a second rank that was
+never there.
+
 Default path: with no HTCCL device transport in the process, nothing reads
 the window. ``resolve_timeout_cycles`` is the only consumer, and it is called
 only from the HTCCL device collectives.
@@ -158,6 +164,42 @@ class ColdBuildWindowError(RuntimeError):
     """
 
 
+def _peer_ranks_possible(tp_group: Any) -> bool:
+    """True only when this process provably has a peer rank.
+
+    The cold-build hypothesis is a statement about OTHER ranks: one of them
+    is still in nvcc while this one waits in a deadline-bearing collective.
+    On a single-rank boot there is no such rank, so the hypothesis cannot
+    hold and must not be attached to the failure (#257: a plain
+    ``torch.OutOfMemoryError`` from the decode warmup surfaced as a
+    ``ColdBuildWindowError`` advertising a peer, on a TP=1 boot, with the
+    real cause reachable only through the chained traceback).
+
+    Undeterminable counts as "no peer": the hint is a hypothesis, and
+    asserting it without evidence is exactly the defect.
+    """
+    ws = getattr(tp_group, "world_size", None)
+    if isinstance(ws, int) and ws > 0:
+        return ws > 1
+    try:
+        from sglang.srt.distributed import get_world_group
+
+        return int(get_world_group().world_size) > 1
+    except Exception:
+        return False
+
+
+def _single_rank_note(reason: str) -> str:
+    return (
+        f"Failure inside the JIT cold-build window ({reason}) on a "
+        "single-rank boot: there is no peer that could still be in nvcc, so "
+        "the cold-build collision does not apply and the original exception "
+        "is re-raised unchanged -- it IS the cause, not a symptom. (A cold "
+        "kernel cache still costs minutes in this window on a first boot; "
+        "it just cannot trip a collective deadline without a peer.)"
+    )
+
+
 def _cold_build_hint(reason: str) -> str:
     return (
         f"Failure inside the JIT cold-build window ({reason}). On a first boot "
@@ -203,8 +245,14 @@ def run_capture_warmups(
                     post_warmup_hook()
             return out
         except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            if not _peer_ranks_possible(tp_group):
+                # Single rank: pass the cause through as itself. Wrapping it
+                # would bury an OOM (or any other honest local failure) one
+                # __cause__ level down behind a hypothesis that cannot apply.
+                logger.error("%s", _single_rank_note(reason))
+                raise
             hint = _cold_build_hint(reason)
             logger.error("%s", hint)
-            if isinstance(exc, Exception):
-                raise ColdBuildWindowError(hint) from exc
-            raise
+            raise ColdBuildWindowError(hint) from exc

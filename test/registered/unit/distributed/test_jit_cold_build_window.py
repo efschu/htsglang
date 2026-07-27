@@ -24,6 +24,9 @@ What is pinned here:
     resolver, rather than reading the constant directly.
  6. A failure inside the window is re-raised WITH the cold-build hypothesis,
     not silently forwarded as some unrelated kernel's launch failure.
+ 7. #257: ...but only when a peer rank exists. On a single-rank boot the
+    original exception is re-raised as itself, because "a peer may still be
+    in nvcc" is not a possible explanation there.
 
 CPU only: this tests the deadline POLICY and the loop that carries it, not
 any CUDA kernel.
@@ -109,7 +112,7 @@ class TestColdBuildWindow(CustomTestCase):
 class TestWarmupLoopCarriesTheWindow(CustomTestCase):
     """The loop the graph backends run, driven with fakes."""
 
-    def _fakes(self):
+    def _fakes(self, world_size=3):
         calls = []
 
         class FakeDeviceModule:
@@ -117,6 +120,9 @@ class TestWarmupLoopCarriesTheWindow(CustomTestCase):
                 calls.append("sync")
 
         class FakeGroup:
+            def __init__(self_inner):
+                self_inner.world_size = world_size
+
             def barrier(self_inner):
                 calls.append("barrier")
 
@@ -175,7 +181,8 @@ class TestWarmupLoopCarriesTheWindow(CustomTestCase):
         self.assertEqual(calls, ["sync", "forward", "hook"] * 2)
 
     def test_failure_inside_the_window_names_the_cold_build(self):
-        _, dev, group = self._fakes()
+        """MULTI-rank: the peer hypothesis is the useful reading."""
+        _, dev, group = self._fakes(world_size=3)
 
         def boom():
             raise RuntimeError("CUDA error: unspecified launch failure")
@@ -184,7 +191,56 @@ class TestWarmupLoopCarriesTheWindow(CustomTestCase):
             run_capture_warmups(boom, device_module=dev, tp_group=group)
         msg = str(ctx.exception)
         self.assertIn("cold-build", msg.lower())
+        self.assertIn("peer", msg.lower())
         self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
+        self.assertFalse(in_cold_build_window())
+
+    def test_single_rank_failure_is_re_raised_as_itself(self):
+        """#257: no peer exists, so the peer hypothesis must not be attached.
+
+        The observed defect: a `torch.OutOfMemoryError` from the decode
+        warmup forward of a TP=1 GGUF boot arrived as a
+        `ColdBuildWindowError` whose text says "a peer may still be in
+        nvcc". The reader has to unwrap __cause__ to find out it was an OOM,
+        on a boot that structurally has no peer.
+        """
+        _, dev, group = self._fakes(world_size=1)
+
+        def boom():
+            raise MemoryError("CUDA out of memory. Tried to allocate 2.37 GiB")
+
+        with self.assertRaises(MemoryError) as ctx:
+            run_capture_warmups(boom, device_module=dev, tp_group=group)
+        self.assertNotIsInstance(ctx.exception, ColdBuildWindowError)
+        self.assertIn("2.37 GiB", str(ctx.exception))
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertFalse(in_cold_build_window())
+
+    def test_undeterminable_world_size_does_not_claim_a_peer(self):
+        """No group, no initialized world group -> no evidence of a peer.
+
+        The hint is a hypothesis; asserting it without evidence is the bug.
+        """
+        _, dev, _ = self._fakes()
+
+        def boom():
+            raise RuntimeError("something local")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            run_capture_warmups(
+                boom, device_module=dev, tp_group=None, skip_barrier=True
+            )
+        self.assertNotIsInstance(ctx.exception, ColdBuildWindowError)
+        self.assertEqual(str(ctx.exception), "something local")
+
+    def test_keyboard_interrupt_is_never_wrapped(self):
+        _, dev, group = self._fakes(world_size=3)
+
+        def boom():
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_capture_warmups(boom, device_module=dev, tp_group=group)
         self.assertFalse(in_cold_build_window())
 
 
