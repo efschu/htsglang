@@ -224,6 +224,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
@@ -530,7 +531,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # plain prefill forwards (see ForwardMode.is_plain_prefill), while
         # device_timer is shared with the draft runners and covers every
         # forward category.
-        self.prefill_rank_timer = None
+        self.prefill_rank_timer: Optional[DeviceTimer] = None
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported

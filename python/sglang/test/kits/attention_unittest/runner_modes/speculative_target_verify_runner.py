@@ -1,5 +1,5 @@
 from dataclasses import replace
-from typing import Literal
+from typing import Literal, Optional, cast
 
 import torch
 
@@ -335,6 +335,7 @@ def _make_spec_verify_input(
     drop_custom_mask: bool = False,
 ):
     draft_token_num = _check_target_verify_case(case)
+    custom_mask: Optional[torch.Tensor]
     _, custom_mask = _make_custom_masks(case, topk=topk, device=device)
     if drop_custom_mask:
         # THE #191 SHAPE. Under uneven DCP the Triton metadata build sets
@@ -382,10 +383,13 @@ def _make_spec_verify_input(
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
+    # The verify-input dataclasses annotate ``custom_mask`` as Tensor, but the
+    # production Triton metadata build hands them None under the #191 shape
+    # (see ``drop_custom_mask`` above), so the cast mirrors runtime reality.
     if spec_kind == "ngram":
         return NgramVerifyInput(
             draft_token=batch.input_ids,
-            custom_mask=custom_mask,
+            custom_mask=cast(torch.Tensor, custom_mask),
             positions=batch.positions,
             retrieve_index=retrieve_index,
             retrieve_next_token=retrieve_next_token,
@@ -399,7 +403,7 @@ def _make_spec_verify_input(
     }[spec_kind]
     return verify_cls(
         draft_token=batch.input_ids,
-        custom_mask=custom_mask,
+        custom_mask=cast(torch.Tensor, custom_mask),
         positions=batch.positions,
         retrieve_index=retrieve_index,
         retrieve_next_token=retrieve_next_token,
