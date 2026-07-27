@@ -1154,19 +1154,28 @@ def list_models_payload(payload: Optional[dict] = None) -> dict:
     """Enumerate every local model the dashboard can serve (config-authoritative
     quant, gguf variants, vision-capable, size). Pure discovery — no GPU."""
     from sglang.srt.planner.server_manager import (
-        DEFAULT_MODEL_ROOTS,
         discover_models,
+        model_roots,
     )
 
     payload = payload or {}
     extra = payload.get("extra_roots") or None
+    roots = list(model_roots()) + list(extra or [])
     try:
         models = discover_models(extra_roots=extra)
     except Exception as e:  # pragma: no cover - defensive
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "roots": roots}
+    # ``roots`` is what was scanned; ``roots_present`` says which of them
+    # actually exist, so an empty list is diagnosable from the payload alone
+    # (a mistyped --model-root shows up as present: false, not as "no models").
     return {
         "ok": True,
-        "roots": list(DEFAULT_MODEL_ROOTS),
+        "roots": roots,
+        "roots_present": [
+            {"path": r, "exists": os.path.isdir(os.path.expanduser(r))}
+            for r in roots
+        ],
+        "count": len(models),
         "models": [_model_to_json(m) for m in models],
     }
 
@@ -1174,6 +1183,16 @@ def list_models_payload(payload: Optional[dict] = None) -> dict:
 def _launch_settings_from_payload(payload: dict):
     """Map the UI launch knobs onto a validated ``LaunchSettings``."""
     from sglang.srt.planner.server_manager import LaunchSettings
+
+    def _int_or_none(v):
+        if v in (None, ""):
+            return None
+        return int(v)
+
+    def _float_or_none(v):
+        if v in (None, ""):
+            return None
+        return float(v)
 
     def _ints(v):
         if v is None or v == "":
@@ -1203,9 +1222,27 @@ def _launch_settings_from_payload(payload: dict):
             else None
         ),
         spec_mode=payload.get("spec_mode", "off"),
+        # Speculative DEPTH is part of the configuration, not a detail: a
+        # NEXTN boot is defined by steps / topk / draft-tokens, and dropping
+        # them silently produced a differently-configured server than the one
+        # that was asked for.
+        speculative_num_steps=_int_or_none(payload.get("speculative_num_steps")),
+        speculative_eagle_topk=_int_or_none(payload.get("speculative_eagle_topk")),
+        speculative_num_draft_tokens=_int_or_none(
+            payload.get("speculative_num_draft_tokens")),
+        speculative_draft_model_path=(
+            payload.get("speculative_draft_model_path") or None),
+        mem_fraction_static=_float_or_none(payload.get("mem_fraction_static")),
+        # Loader identity -- what makes a GGUF boot a GGUF boot.
+        tokenizer_path=payload.get("tokenizer_path") or None,
+        load_format=payload.get("load_format") or None,
+        quantization=payload.get("quantization") or None,
+        rank_auto_reserve_mib=_int_or_none(payload.get("rank_auto_reserve_mib")),
         chat_template=payload.get("chat_template") or None,
         tool_call_parser=payload.get("tool_call_parser") or None,
         reasoning_parser=payload.get("reasoning_parser") or None,
+        trust_remote_code=bool(payload.get("trust_remote_code", True)),
+        extra_flags=[str(a) for a in (payload.get("extra_flags") or [])],
         vision=bool(payload.get("vision")),
         port=int(payload.get("port") or 30000),
     )
@@ -1293,6 +1330,27 @@ def _argv_from_payload(payload: dict, settings) -> Optional[list]:
     return [*head, *prof, *extra]
 
 
+def _force_enable_metrics(argv: Optional[list]) -> Optional[list]:
+    """Guarantee ``--enable-metrics`` on every server this dashboard boots.
+
+    There is deliberately no opt-out. The flag changes observability only,
+    never inference: without it /metrics is absent, and the whole live half of
+    this dashboard -- token rates, per-session throughput, MTP acceptance,
+    cache-hit, tokens per watt -- has nothing to read. A server booted from
+    here is a server that can be watched.
+
+    ``LaunchSettings.launch_command()`` already appends it, so this only has
+    to cover the argv OVERRIDE path (an explicit argv, or a profile's exact
+    argv), where a caller-supplied command would otherwise decide.
+    """
+    if argv is None:
+        return None
+    out = list(argv)
+    if "--enable-metrics" not in out:
+        out.append("--enable-metrics")
+    return out
+
+
 def server_start_payload(payload: dict) -> dict:
     """Boot the managed sglang server from the UI launch knobs. Builds a
     ``LaunchSettings`` (fail-fast validated) and hands it to the supervisor.
@@ -1310,7 +1368,7 @@ def server_start_payload(payload: dict) -> dict:
             "REPLACES the single managed instance).",
             "status": sup.status(),
         }
-    argv = _argv_from_payload(payload, settings)
+    argv = _force_enable_metrics(_argv_from_payload(payload, settings))
     try:
         status = sup.start(
             settings,
@@ -1739,7 +1797,13 @@ _LANDING_TARGET_KEY = None
 #: Ports probed for a reachable sglang server when neither an explicit
 #: endpoint nor a managed instance exists (the user launches servers BY HAND;
 #: the landing page must attach to them regardless of who started them).
-_MONITOR_DETECT_PORTS = (30000, 30100, 8000)
+#: Deliberately SHORT -- this list runs on every landing poll.
+_MONITOR_DETECT_PORTS = (30000, 30001, 30100, 8000)
+
+#: The explicit 'detect' button sweeps the whole documented sglang port range
+#: plus the common OpenAI-API ports. Reached only on demand, and gated behind a
+#: TCP pre-scan, so the width costs nothing when the ports are closed.
+_DETECT_SWEEP_PORTS = tuple(range(30000, 30101)) + (8000, 8080)
 
 #: Cache of the last auto-detected endpoint (re-verified first on each poll so
 #: a stable hand-started server is one cheap probe, not a port sweep).
@@ -2335,6 +2399,21 @@ def flag_catalog_payload(payload: Optional[dict] = None) -> dict:
     }
 
 
+def _serves_metrics(base_url: str, timeout: float = 1.0) -> bool:
+    """True when the server exposes Prometheus /metrics, i.e. was started with
+    ``--enable-metrics``. A detected foreign server without it is a REPORTED
+    state, not a dashboard that quietly shows nothing."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            base_url.rstrip("/") + "/metrics", timeout=timeout
+        ) as r:
+            return r.getcode() == 200
+    except Exception:
+        return False
+
+
 def _probe_sglang(base_url: str, timeout: float = 0.8) -> bool:
     """True when ``base_url`` answers 200 on /get_model_info or /metrics --
     the cheap 'is this an sglang server?' reachability probe (read-only)."""
@@ -2374,22 +2453,90 @@ def _detect_external_endpoint(
     return None
 
 
+def _tcp_open(host: str, port: int, timeout: float = 0.15) -> bool:
+    """True when something accepts a TCP connection on host:port. A closed port
+    refuses instantly, so this pre-scan makes a 100-port sweep cheap; only the
+    ports that answer get the (much more expensive) HTTP probe."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _split_host_port(text: str, default_port: int = 30000):
+    """'host:port' / 'http://host:port' / 'host' / ':port' -> (host, port)."""
+    from urllib.parse import urlsplit
+
+    t = (text or "").strip()
+    if not t:
+        return None, None
+    if "://" not in t:
+        t = "http://" + t
+    parts = urlsplit(t)
+    host = parts.hostname or "127.0.0.1"
+    port = parts.port or default_port
+    return host, int(port)
+
+
 def detect_endpoint_payload(payload: Optional[dict] = None) -> dict:
-    """GET /api/detect_endpoint -> fresh sweep of the common ports (the
-    landing page's 'detect' button). Read-only probes; never boots anything."""
-    ports = list((payload or {}).get("ports") or _MONITOR_DETECT_PORTS)
+    """GET/POST /api/detect_endpoint -> find a reachable sglang server (the
+    landing page's 'detect' button). Read-only probes; never boots anything.
+
+    Accepted payload keys (all optional):
+      ``endpoint``  an explicit ``host:port`` to verify directly -- when given,
+                    only that one target is probed and no sweep runs;
+      ``host``      the host to sweep (default 127.0.0.1);
+      ``ports``     an explicit port list, else the full sglang range
+                    30000-30100 plus the common OpenAI-API ports.
+    """
+    global _DETECTED_ENDPOINT
+    payload = payload or {}
+    explicit = (payload.get("endpoint") or "").strip()
+    if explicit:
+        host, port = _split_host_port(explicit)
+        url = f"http://{host}:{port}"
+        ok = _probe_sglang(url, timeout=1.5)
+        _DETECTED_ENDPOINT = url if ok else None
+        return {
+            "ok": True,
+            "endpoint": url if ok else None,
+            "reachable": [url] if ok else [],
+            "probed": [port],
+            "host": host,
+            "explicit": True,
+            "metrics": _serves_metrics(url) if ok else None,
+            "error": None if ok else f"no sglang server answering at {url}",
+        }
+
+    host = (payload.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    ports = [int(p) for p in (payload.get("ports") or _DETECT_SWEEP_PORTS)]
+    # Two stages: a cheap threaded TCP scan, then the HTTP identity probe only
+    # on the ports that actually accept a connection.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=32) as ex:
+        open_ports = [
+            p for p, is_open in zip(ports, ex.map(lambda p: _tcp_open(host, p), ports))
+            if is_open
+        ]
     reachable = []
-    for p in ports:
-        url = f"http://127.0.0.1:{p}"
+    for p in open_ports:
+        url = f"http://{host}:{p}"
         if _probe_sglang(url):
             reachable.append(url)
-    global _DETECTED_ENDPOINT
     _DETECTED_ENDPOINT = reachable[0] if reachable else None
     return {
         "ok": True,
         "endpoint": reachable[0] if reachable else None,
         "reachable": reachable,
         "probed": ports,
+        "host": host,
+        "tcp_open": open_ports,
+        "explicit": False,
+        "metrics": _serves_metrics(reachable[0]) if reachable else None,
     }
 
 
@@ -2783,6 +2930,11 @@ def bench_run_events(payload: dict):
         "preset": preset,
     }
     counts: dict = {}
+    results: List[dict] = []
+    # run_suite records every model exchange on its context; the sink hands it
+    # back so the finished run can be stored WITH what was asked and answered.
+    sink: List[Any] = []
+    started = time.time()
     try:
         for res in bench_suite.run_suite(
             endpoint,
@@ -2791,13 +2943,88 @@ def bench_run_events(payload: dict):
             capabilities=caps,
             preset=preset,
             force=bool(payload.get("force")),
+            transcript_sink=sink,
         ):
             counts[res.get("status")] = counts.get(res.get("status"), 0) + 1
+            results.append(res)
             yield {"event": "result", "result": res}
     except Exception as e:  # pragma: no cover - defensive
+        _save_bench_run(endpoint, model, preset, caps, results, sink, started,
+                        error=str(e))
         yield {"event": "error", "error": str(e)}
         return
-    yield {"event": "done", "counts": counts}
+    run_id = _save_bench_run(endpoint, model, preset, caps, results, sink,
+                             started)
+    yield {"event": "done", "counts": counts, "run_id": run_id}
+
+
+def _save_bench_run(endpoint, model, preset, caps, results, sink, started,
+                    error=None) -> Optional[str]:
+    """Persist one finished (or crashed) run to the per-model history.
+
+    A run that ends in an exception is stored too: the transcript up to the
+    failure is usually the only record of what killed it. Storing must never
+    take the run down with it, so a write failure is reported in the payload
+    rather than raised at the client.
+    """
+    from sglang.srt.planner import bench_history
+
+    transcript = []
+    for ctx in sink:
+        transcript.extend(getattr(ctx, "transcript", []) or [])
+    record = {
+        "endpoint": endpoint,
+        "model": model or None,
+        "preset": preset,
+        "started_at": started,
+        "duration_s": round(time.time() - started, 3),
+        "capabilities": (
+            dataclasses.asdict(caps) if dataclasses.is_dataclass(caps) else None
+        ),
+        "results": results,
+        "transcript": transcript,
+        "error": error,
+    }
+    try:
+        return bench_history.save_run(record)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def bench_history_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/bench_history[?model=...] -> newest-first run summaries."""
+    from sglang.srt.planner import bench_history
+
+    payload = payload or {}
+    model = (payload.get("model") or "").strip() or None
+    try:
+        limit = int(payload.get("limit") or 50)
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        runs = bench_history.list_runs(model=model, limit=limit)
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e), "runs": []}
+    return {
+        "ok": True,
+        "model": model,
+        "root": bench_history.history_root(),
+        "runs": runs,
+    }
+
+
+def bench_run_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/bench_run_detail?run_id=... -> one stored run, transcript and
+    all. This is what the download button fetches."""
+    from sglang.srt.planner import bench_history
+
+    run_id = ((payload or {}).get("run_id") or "").strip()
+    if not run_id:
+        return {"ok": False, "error": "run_id is required"}
+    rec = bench_history.load_run(run_id)
+    if rec is None:
+        return {"ok": False, "error": f"no stored run {run_id!r}"}
+    return {"ok": True, "run": rec}
 
 
 # ===========================================================================
@@ -2897,7 +3124,14 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/detect_endpoint"):
             # MUST precede the /api/detect prefix check below.
             try:
-                self._json(200, detect_endpoint_payload())
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                if q.get("ports"):
+                    q["ports"] = [
+                        int(x) for x in q["ports"].replace(",", " ").split()
+                    ]
+                self._json(200, detect_endpoint_payload(q))
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
@@ -2979,6 +3213,41 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
+        if self.path.startswith("/api/bench_history"):
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, bench_history_payload(q))
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/bench_run_detail"):
+            # Served as a DOWNLOAD: the point of keeping the transcript is
+            # being able to take the whole request/answer series away.
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                d = bench_run_payload(q)
+                body = json.dumps(d, ensure_ascii=False, indent=1)
+                if d.get("ok") and q.get("download"):
+                    data = body.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header(
+                        "Content-Disposition",
+                        'attachment; filename="bench-%s.json"'
+                        % (q.get("run_id") or "run"),
+                    )
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                self._send(200, body, "application/json")
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
         if self.path.startswith("/api/quality_shots"):
             try:
                 self._json(200, quality_shots_payload())
@@ -3030,6 +3299,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._sse_stream(bench_run_events(payload))
             return
         try:
+            # Detect is reachable by BOTH methods: GET (no body) for the plain
+            # button, POST for a body-carrying probe (explicit host:port, custom
+            # port list). The prefix order mirrors do_GET -- the longer
+            # "/api/detect_endpoint" must be tested first.
+            if self.path.startswith("/api/detect_endpoint"):
+                self._json(200, detect_endpoint_payload(payload))
+                return
+            if self.path.startswith("/api/detect"):
+                self._json(200, detect_hardware())
+                return
             if self.path.startswith("/api/gguf_options"):
                 self._json(200, gguf_options_for(payload))
                 return
@@ -3163,12 +3442,12 @@ def serve(host: str = "127.0.0.1", port: int = 8780) -> None:
 _ASSET_DIR = os.path.join(os.path.dirname(__file__), "assets")
 
 
-def _vendored_js(name: str) -> str:
+def _vendored_asset(name: str) -> str:
     """Read a vendored front-end asset for inlining into the page.
 
     The dashboard serves one self-contained page and makes no external
-    requests, so third-party JavaScript is inlined rather than linked. See
-    ``assets/README.md`` for what is vendored and why.
+    requests, so third-party JavaScript and CSS are inlined rather than
+    linked. See ``assets/README.md`` for what is vendored and why.
     """
     with open(os.path.join(_ASSET_DIR, name), encoding="utf-8") as f:
         return f.read()
@@ -3181,230 +3460,387 @@ _INDEX_TEMPLATE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>htsglang config planner</title>
 <style>
-  :root { color-scheme: light dark; }
+/*__VENDOR_NORMALIZE__*/
+  /* ---- design tokens -------------------------------------------------------
+     Values are Grafana's published dark theme (grafana-data/src/themes:
+     palette.ts, createColors.ts, createSpacing.ts, createTypography.ts), not
+     invented ones. Grafana is the reference for this class of page -- a dense,
+     dark, panel-based monitoring UI -- and its scales are what make the
+     spacing come out even: one 8px grid unit, three surface levels, three
+     border weights, and colour used only to carry state.
+     The cross-browser reset above is vendored modern-normalize (MIT), inlined
+     like morphdom; see assets/README.md. */
+  :root {
+    color-scheme: dark;
+    /* surfaces: canvas < panel < elevated */
+    --bg-canvas:   #111217;
+    --bg-panel:    #181b1f;
+    --bg-elevated: #22252b;
+    --bg-input:    #0d1014;
+    /* borders: weak = decoration, medium = widget outline, strong = focus */
+    --bd-weak:   #363940;
+    --bd-medium: #44464e;
+    --bd-strong: #555760;
+    /* text */
+    --fg:          #ccccdc;
+    --fg-strong:   #e6e9f0;
+    --fg-muted:    rgba(204,204,220,.65);
+    --fg-disabled: rgba(204,204,220,.45);
+    /* interaction */
+    --accent:        #3d71d9;
+    --accent-text:   #6e9fff;
+    --hover:         rgba(204,204,220,.10);
+    --selected:      rgba(204,204,220,.16);
+    /* state -- the ONLY decorative use of colour on this page is none */
+    --ok:      #73BF69; --ok-dim:   #37872D;
+    --warn:    #EAB839; --warn-dim: #E0B400;
+    --bad:     #F2495C; --bad-dim:  #C4162A;
+    --info:    #5794F2;
+    /* 8px grid */
+    --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px;
+    /* type scale: 14 base, 12 for tile metadata */
+    --t-xs: 11px; --t-sm: 12px; --t-md: 13px; --t-lg: 14px; --t-xl: 18px;
+    --radius: 4px; --radius-lg: 6px;
+    --mono: ui-monospace, SFMono-Regular, "Roboto Mono", Menlo, monospace;
+    /* the page never grows past this; the gutter stays constant either side */
+    --page-max: 1680px;
+    --gutter: var(--s4);
+  }
   * { box-sizing: border-box; }
-  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-         margin: 0; padding: 1.2rem; line-height: 1.4;
-         background: #0e1116; color: #d7dde5; }
-  h1 { font-size: 1.15rem; margin: 0 0 .2rem; }
-  .sub { color: #8b96a5; font-size: .8rem; margin-bottom: 1rem; }
-  .cols { display: grid; grid-template-columns: 360px 1fr; gap: 1.2rem; }
+  body { font-family: var(--mono); font-size: var(--t-md); line-height: 1.45;
+         background: var(--bg-canvas); color: var(--fg);
+         margin: 0; padding: 0; }
+  /* Every top-level block sits in the same centred column, so the left and
+     right margins are equal on every tab and do not change with content. */
+  body > .hdr, body > .tabs, body > div[id^="view_"] {
+    max-width: var(--page-max); margin-left: auto; margin-right: auto;
+    padding-left: var(--gutter); padding-right: var(--gutter); }
+  h1 { font-size: var(--t-xl); font-weight: 500; margin: 0; letter-spacing: 0; }
+  .sub { color: var(--fg-muted); font-size: var(--t-sm); margin: var(--s1) 0 0;
+         max-width: 96ch; }
+  .cols { display: grid; grid-template-columns: 380px 1fr; gap: var(--s4);
+          align-items: start; }
   /* runner: full page width, settings left / results right */
   .cols.runner { grid-template-columns: minmax(420px, 5fr) 7fr; }
   @media (max-width: 820px) { .cols, .cols.runner { grid-template-columns: 1fr; } }
   @media (max-width: 1100px) { .cols.runner { grid-template-columns: 1fr; } }
-  fieldset { border: 1px solid #2a323d; border-radius: 8px; margin: 0 0 .9rem;
-             padding: .7rem .8rem; }
-  legend { color: #9fb0c3; font-size: .78rem; padding: 0 .35rem; }
-  label { display: block; font-size: .72rem; color: #9aa6b4; margin: .5rem 0 .15rem; }
+
+  /* ---- panels --------------------------------------------------------------
+     A section is separated by a surface shift plus one weak border, never by
+     whitespace -- the convention every dense monitoring UI converges on. */
+  fieldset { border: 1px solid var(--bd-weak); border-radius: var(--radius-lg);
+             background: var(--bg-panel);
+             margin: 0 0 var(--s3); padding: var(--s3); }
+  legend { color: var(--fg-muted); font-size: var(--t-sm); font-weight: 500;
+           padding: 0 var(--s1); text-transform: none; }
+  label { display: block; font-size: var(--t-sm); color: var(--fg-muted);
+          margin: var(--s2) 0 var(--s1); }
   input, select, textarea {
-    width: 100%; background: #161b22; color: #e6edf3; border: 1px solid #303a46;
-    border-radius: 5px; padding: .32rem .45rem; font: inherit; font-size: .8rem; }
-  input::placeholder { color: #5b6675; }
-  .knob-help { color: #6b7686; font-size: .66rem; margin: .1rem 0 .2rem; }
-  button { background: #1f6feb; color: #fff; border: 0; border-radius: 6px;
-           padding: .5rem .9rem; font: inherit; font-size: .8rem; cursor: pointer; }
-  button.secondary { background: #30363d; }
-  button.mini { padding: .18rem .5rem; font-size: .68rem; }
-  .cardlist { display: flex; flex-direction: column; gap: .35rem; }
+    width: 100%; background: var(--bg-input); color: var(--fg-strong);
+    border: 1px solid var(--bd-medium); border-radius: var(--radius);
+    padding: 5px 8px; font: inherit; font-size: var(--t-sm); }
+  input:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--bd-strong); }
+  input::placeholder { color: var(--fg-disabled); }
+  .knob-help { color: var(--fg-muted); font-size: var(--t-xs);
+               margin: 2px 0 var(--s1); }
+  button { background: var(--accent); color: #fff; border: 1px solid transparent;
+           border-radius: var(--radius); padding: 6px 12px; font: inherit;
+           font-size: var(--t-sm); line-height: 1.4; cursor: pointer; }
+  button:hover { filter: brightness(1.12); }
+  button:disabled { opacity: .5; cursor: default; filter: none; }
+  button.secondary { background: var(--bg-elevated); color: var(--fg);
+                     border-color: var(--bd-medium); }
+  button.secondary:hover { background: var(--selected); filter: none; }
+  button.mini { padding: 3px 8px; font-size: var(--t-xs); }
+
+  /* ---- header + tab bar ----------------------------------------------------
+     A conservative admin tab bar: one row, fixed 36px height, active tab
+     marked by a 2px underline in the accent colour and a brighter label,
+     hover by a flat tint. No pills, no colour per tab, no shadow. The bar's
+     own bottom border runs the full width so the tabs read as a strip rather
+     than as a row of loose buttons. */
+  .hdr { display: flex; align-items: flex-start; justify-content: space-between;
+         gap: var(--s4); flex-wrap: wrap;
+         padding-top: var(--s4); padding-bottom: var(--s3); }
+  /* The bar WRAPS; it never scrolls. A scrollbar in a navigation strip hides
+     destinations behind a gesture, which is exactly what navigation must not
+     do. Labels are one word each so wrapping is rare in the first place. */
+  .tabs { display: flex; flex-wrap: wrap; gap: 0; margin: 0 auto var(--s4);
+          border-bottom: 1px solid var(--bd-weak); overflow: visible; }
+  .tab, button.tab { background: transparent; color: var(--fg-muted);
+    border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+    padding: 0 var(--s3); height: 36px; font-size: var(--t-md);
+    white-space: nowrap; flex: none; cursor: pointer; }
+  .tab:hover { background: var(--hover); color: var(--fg); filter: none; }
+  .tab.active, button.tab.active { background: transparent;
+    color: var(--fg-strong); border-bottom-color: var(--accent-text); }
+  .tab.active:hover { background: var(--hover); }
+
+  /* ---- tables --------------------------------------------------------------
+     Numbers are the content, so they get tabular figures and right alignment;
+     the label column stays left. */
+  table { border-collapse: collapse; width: 100%; font-size: var(--t-sm); }
+  th, td { text-align: right; padding: 4px 8px;
+           border-bottom: 1px solid var(--bd-weak);
+           font-variant-numeric: tabular-nums; }
+  th { color: var(--fg-muted); font-weight: 500; }
+  th:first-child, td:first-child { text-align: left;
+                                   font-variant-numeric: normal; }
+
+  /* ---- meters --------------------------------------------------------------
+     One bar, filled left to right, numeric label beside it -- never a stack of
+     decorative segments for a single quantity. */
+  .bar { height: 8px; background: var(--bg-input); border-radius: 2px;
+         overflow: hidden; border: 1px solid var(--bd-weak); }
+  .bar > span { display: block; height: 100%; background: var(--info); }
+  .verdict { font-size: var(--t-lg); font-weight: 500; padding: var(--s2) var(--s3);
+             border-radius: var(--radius); margin-bottom: var(--s3); }
+  .verdict.offload { background: rgba(234,184,57,.10); color: var(--warn);
+                     border: 1px solid var(--warn-dim); }
+  .fit { background: rgba(115,191,105,.10); color: var(--ok);
+         border: 1px solid var(--ok-dim); }
+  .nofit { background: rgba(242,73,92,.10); color: var(--bad);
+           border: 1px solid var(--bad-dim); }
+  .pricebar { margin-top: var(--s3); font-size: var(--t-sm);
+              color: var(--fg-muted); }
+  .pricebar input { width: 5rem; padding: 3px 6px; }
+  .measured { margin-top: var(--s3); background: var(--bg-panel);
+              border: 1px solid var(--ok-dim); border-radius: var(--radius-lg);
+              padding: var(--s3); }
+  .ms-title { font-weight: 500; color: var(--ok); font-size: var(--t-lg);
+              text-transform: uppercase; letter-spacing: .04em; }
+  .ms-note { font-size: var(--t-sm); color: var(--fg-muted);
+             margin: var(--s1) 0 var(--s2); }
+  .ms-wl { margin: var(--s2) 0; }
+  .ms-mult { font-size: var(--t-sm); color: var(--fg-strong);
+             background: var(--bg-elevated); border: 1px solid var(--ok-dim);
+             border-radius: var(--radius); padding: var(--s1) var(--s2);
+             margin: var(--s1) 0; }
+  .ms-row { border-top: 1px solid var(--bd-weak); margin-top: var(--s2);
+            padding-top: var(--s1); }
+  .ms-row-h { font-size: var(--t-md); color: var(--fg); }
+  .ms-wl-h { font-size: var(--t-sm); color: var(--fg-muted);
+             margin-top: var(--s1); }
+  .ms-phases { display: flex; gap: var(--s3); flex-wrap: wrap; }
+  .ms-phase { flex: 1 1 320px; min-width: 300px; border-radius: var(--radius);
+              padding: var(--s2); }
+  .ms-prefill { background: var(--bg-elevated);
+                border: 1px solid var(--bd-weak); }
+  .ms-decode  { background: var(--bg-elevated);
+                border: 1px solid var(--bd-weak); }
+  .ms-ph-h { font-weight: 500; font-size: var(--t-sm); letter-spacing: .04em;
+             margin-bottom: var(--s1); text-transform: uppercase; }
+  .ms-prefill .ms-ph-h { color: var(--info); }
+  .ms-decode .ms-ph-h { color: var(--ok); }
+  .ms-phase table, .ms-wl table { border-collapse: collapse; margin: var(--s1) 0;
+                                  font-size: var(--t-xs); width: 100%; }
+  .ms-phase th, .ms-phase td, .ms-wl th, .ms-wl td {
+      border: 1px solid var(--bd-weak); padding: 2px 6px; text-align: right;
+      font-variant-numeric: tabular-nums; }
+  .ms-phase th, .ms-wl th { color: var(--fg-muted); font-weight: 500; }
+  .roofline { margin-top: var(--s3); background: var(--bg-panel);
+              border: 1px solid var(--warn-dim); border-radius: var(--radius-lg);
+              padding: var(--s3); }
+  .rf-title { font-weight: 500; color: var(--warn); font-size: var(--t-lg);
+              text-transform: uppercase; letter-spacing: .04em; }
+  .rf-nums { display: flex; gap: var(--s3); margin: var(--s2) 0;
+             flex-wrap: wrap; }
+  .rf-num { background: var(--bg-elevated); border: 1px solid var(--bd-weak);
+            border-radius: var(--radius); padding: var(--s2) var(--s3); }
+  .rf-num span { display: block; font-size: var(--t-xs); color: var(--fg-muted);
+                 text-transform: uppercase; letter-spacing: .04em; }
+  .rf-num b { font-size: var(--t-xl); color: var(--fg-strong); font-weight: 500;
+              font-variant-numeric: tabular-nums; }
+  .rf-num small { display: block; font-size: var(--t-xs);
+                  color: var(--fg-muted); }
+  .rf-meas { color: var(--ok); font-weight: 500; }
+  .rf-name { color: var(--warn); }
+  .rf-caveats { margin: var(--s2) 0 0; padding-left: var(--s4);
+                font-size: var(--t-sm); color: var(--fg-muted); }
+  .rf-caveats li { margin: 2px 0; }
+  .rf-energy { margin-top: var(--s3); padding-top: var(--s2);
+               border-top: 1px solid var(--bd-weak); }
+  pre { background: var(--bg-input); border: 1px solid var(--bd-weak);
+        border-radius: var(--radius); padding: var(--s2); overflow-x: auto;
+        font-size: var(--t-sm); white-space: pre-wrap; word-break: break-word;
+        margin: var(--s2) 0; }
+  code { font-family: var(--mono); }
+  .muted { color: var(--fg-muted); font-size: var(--t-sm); }
+  .est { color: var(--warn); font-size: var(--t-xs); }
+  .reasons li { color: var(--bad); font-size: var(--t-sm); margin: 2px 0; }
+  .adv { border-left: 2px solid var(--accent); padding: var(--s1) var(--s3);
+         margin: var(--s2) 0; }
+  .knoblist { font-size: var(--t-xs); color: var(--fg-muted); }
+  .pill { display: inline-block; background: var(--bg-elevated);
+          border: 1px solid var(--bd-weak); border-radius: 9999px;
+          padding: 1px 8px; margin: 2px 2px 0 0; font-size: var(--t-xs); }
+  .actions { display: flex; gap: var(--s2); flex-wrap: wrap;
+             margin-top: var(--s2); }
+  a { color: var(--accent-text); }
+  /* ---- benchmark test buttons ---------------------------------------------
+     The tests are the tab's content, so they are the thing you click. A
+     selected test is a pressed button (accent border + tinted surface), a
+     gated one is disabled and carries its reason on hover. Fixed-width tiles
+     keep the grid even however long a label is. */
+  .testbtn { display: flex; flex-direction: column; align-items: flex-start;
+             gap: 2px; width: 232px; min-height: 52px; text-align: left;
+             background: var(--bg-elevated); color: var(--fg);
+             border: 1px solid var(--bd-medium); border-radius: var(--radius);
+             padding: var(--s2); font: inherit; font-size: var(--t-sm);
+             cursor: pointer; }
+  .testbtn:hover { background: var(--selected); filter: none; }
+  .testbtn.on { border-color: var(--accent-text); background: rgba(61,113,217,.16);
+                color: var(--fg-strong); }
+  .testbtn.on .tb-n { color: var(--accent-text); }
+  .testbtn.gated { opacity: .5; cursor: not-allowed; }
+  .testbtn .tb-n { font-size: var(--t-xs); color: var(--fg-muted);
+                   font-variant-numeric: tabular-nums; }
+  .testbtn .tb-l { line-height: 1.3; }
+  .testbtn .tb-t { font-size: var(--t-xs); color: var(--fg-muted); }
+  .testbtn .tb-t.warn { color: var(--warn); }
+  .mx td, .mx th { text-align: center; }
+  .mx .estcell { outline: 1px dashed var(--warn-dim); }
+  .mx .fitc { color: var(--ok); } .mx .nofitc { color: var(--bad); }
+  .legend { color: var(--fg-muted); font-size: var(--t-xs);
+            margin-top: var(--s2); }
+  .cardlist { display: flex; flex-direction: column; gap: var(--s1); }
   .cardrow { display: grid; grid-template-columns: auto 1fr auto auto;
-             gap: .4rem; align-items: center; background: #12171e;
-             border: 1px solid #263041; border-radius: 6px; padding: .3rem .45rem; }
-  .cardrow input[type=text] { padding: .2rem .35rem; font-size: .74rem; }
-  .cardrow .vram { width: 5.2rem; text-align: right; }
-  .cardrow .resv { width: 4rem; text-align: right; }
-  .cardrow .cap { font-size: .64rem; color: #7f8b99; }
+             gap: var(--s2); align-items: center; background: var(--bg-elevated);
+             border: 1px solid var(--bd-weak); border-radius: var(--radius);
+             padding: var(--s1) var(--s2); }
+  .cardrow input[type=text] { padding: 2px 6px; font-size: var(--t-sm); }
+  .cardrow .vram { width: 5.4rem; text-align: right; }
+  .cardrow .resv { width: 4.2rem; text-align: right; }
+  .cardrow .cap { font-size: var(--t-xs); color: var(--fg-muted); }
   .cardrow.excluded { opacity: .45; }
   .cardrow input[type=checkbox] { width: auto; }
-  .verdict.offload { background: #33280f; color: #e3b341; border: 1px solid #7a5c14; }
-  .verdict { font-size: 1rem; font-weight: 700; padding: .55rem .7rem;
-             border-radius: 7px; margin-bottom: .8rem; }
-  .fit { background: #10331d; color: #56d364; border: 1px solid #1c6b34; }
-  .nofit { background: #3a1417; color: #ff7b72; border: 1px solid #7d2a2a; }
-  table { border-collapse: collapse; width: 100%; font-size: .76rem; }
-  th, td { text-align: right; padding: .3rem .5rem; border-bottom: 1px solid #232b35; }
-  th:first-child, td:first-child { text-align: left; }
-  .bar { height: 9px; background: #232b35; border-radius: 4px; overflow: hidden; }
-  .bar > span { display: block; height: 100%; background: #2f81f7; }
-  .pricebar { margin-top: .9rem; font-size: .78rem; color: #adbac7; }
-  .pricebar input { width: 5rem; padding: .2rem .4rem; background: #0d1117;
-                    color: #e6edf3; border: 1px solid #30363d; border-radius: 5px; }
-  .measured { margin-top: .9rem; background: #0f1a12; border: 1px solid #2ea043;
-              border-radius: 8px; padding: .7rem .8rem; }
-  .ms-title { font-weight: 700; color: #56d364; font-size: .9rem;
-              text-transform: uppercase; letter-spacing: .02em; }
-  .ms-note { font-size: .72rem; color: #9fb0a4; margin: .35rem 0 .5rem; }
-  .ms-wl { margin: .5rem 0; }
-  .ms-mult { font-size: .8rem; color: #d2f7dd; background: #10251a;
-             border: 1px solid #2ea043; border-radius: 6px; padding: .4rem .6rem;
-             margin: .4rem 0; }
-  .ms-row { border-top: 1px solid #21402b; margin-top: .6rem; padding-top: .4rem; }
-  .ms-row-h { font-size: .8rem; color: #adbac7; }
-  .ms-wl-h { font-size: .74rem; color: #8b98a5; margin-top: .35rem; }
-  .ms-phases { display: flex; gap: 1rem; flex-wrap: wrap; }
-  .ms-phase { flex: 1 1 320px; min-width: 300px; border-radius: 6px;
-              padding: .35rem .5rem; }
-  .ms-prefill { background: #0d1a22; border: 1px solid #1f3a4d; }
-  .ms-decode  { background: #10251a; border: 1px solid #235c34; }
-  .ms-ph-h { font-weight: 700; font-size: .74rem; letter-spacing: .02em;
-             margin-bottom: .2rem; }
-  .ms-prefill .ms-ph-h { color: #6cb6ff; }
-  .ms-decode .ms-ph-h { color: #56d364; }
-  .ms-phase table, .ms-wl table { border-collapse: collapse; margin: .3rem 0;
-                                  font-size: .7rem; width: 100%; }
-  .ms-phase th, .ms-phase td, .ms-wl th, .ms-wl td {
-      border: 1px solid #21402b; padding: .16rem .45rem; text-align: right; }
-  .ms-phase th, .ms-wl th { color: #7f8b99; font-weight: 600; }
-  .roofline { margin-top: .9rem; background: #191410; border: 1px dashed #7a5c14;
-              border-radius: 8px; padding: .7rem .8rem; }
-  .rf-title { font-weight: 700; color: #e3b341; font-size: .9rem;
-              text-transform: uppercase; letter-spacing: .02em; }
-  .rf-nums { display: flex; gap: 1.2rem; margin: .5rem 0; flex-wrap: wrap; }
-  .rf-num { background: #12171e; border: 1px solid #263041; border-radius: 6px;
-            padding: .4rem .7rem; }
-  .rf-num span { display: block; font-size: .66rem; color: #7f8b99;
-                 text-transform: uppercase; }
-  .rf-num b { font-size: 1.15rem; color: #e6edf3; }
-  .rf-num small { display: block; font-size: .62rem; color: #7f8b99; }
-  .rf-meas { color: #56d364; font-weight: 600; }
-  .rf-name { color: #d29922; }
-  .rf-caveats { margin: .5rem 0 0; padding-left: 1.1rem; font-size: .68rem;
-                color: #8b949e; }
-  .rf-caveats li { margin: .15rem 0; }
-  .rf-energy { margin-top: .8rem; padding-top: .6rem;
-               border-top: 1px dashed #7a5c14; }
-  pre { background: #161b22; border: 1px solid #232b35; border-radius: 6px;
-        padding: .6rem; overflow-x: auto; font-size: .74rem; white-space: pre-wrap;
-        word-break: break-word; }
-  .muted { color: #8b96a5; font-size: .72rem; }
-  .est { color: #d29922; font-size: .68rem; }
-  .reasons li { color: #ff9d96; font-size: .76rem; margin: .2rem 0; }
-  .adv { border-left: 3px solid #2f81f7; padding: .3rem .6rem; margin: .5rem 0; }
-  .knoblist { font-size: .68rem; color: #7f8b99; }
-  .pill { display: inline-block; background: #21262d; border: 1px solid #30363d;
-          border-radius: 10px; padding: .05rem .5rem; margin: .1rem .15rem 0 0;
-          font-size: .66rem; }
-  .actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .3rem; }
-  a { color: #58a6ff; }
-  .tabs { display: flex; gap: .4rem; margin-bottom: .8rem; }
-  .tab { background: #21262d; color: #9aa6b4; }
-  .tab.active { background: #1f6feb; color: #fff; }
-  .mx td, .mx th { text-align: center; }
-  .mx .estcell { outline: 1px dashed #6e5417; }
-  .mx .fitc { color: #56d364; } .mx .nofitc { color: #ff7b72; }
-  .legend { color: #8b96a5; font-size: .68rem; margin-top: .5rem; }
-  .cardblock { border: 1px solid #263041; border-radius: 8px;
-               padding: .45rem .6rem; margin: .4rem 0; background: #12171e; }
-  .segbar { display: flex; height: 14px; border-radius: 4px; overflow: hidden;
-            background: #0d1117; border: 1px solid #263041; margin: .25rem 0; }
+  .cardblock { border: 1px solid var(--bd-weak); border-radius: var(--radius-lg);
+               padding: var(--s2) var(--s3); margin: var(--s2) 0;
+               background: var(--bg-panel); }
+  .segbar { display: flex; height: 14px; border-radius: 2px; overflow: hidden;
+            background: var(--bg-input); border: 1px solid var(--bd-weak);
+            margin: var(--s1) 0; }
   .segbar span { display: block; height: 100%; }
   /* replicated segments (KV heads synced/duplicated): hatched overlay so the
      not-the-normal case is unmissable in the bar itself. */
   .segbar span.hatch { background-image: repeating-linear-gradient(
       45deg, rgba(255,255,255,.28) 0 3px, transparent 3px 7px); }
-  .seglegend { font-size: .66rem; color: #8b96a5; margin: .1rem 0; }
-  .repltag { font-size: .6rem; color: #e3a008; border: 1px solid #7a5c14;
-             border-radius: 4px; padding: 0 .25rem; margin-left: .25rem; }
-  .graphline { font-size: .68rem; color: #8b96a5; margin: .1rem 0; }
+  .seglegend { font-size: var(--t-xs); color: var(--fg-muted); margin: 2px 0; }
+  .repltag { font-size: var(--t-xs); color: var(--warn);
+             border: 1px solid var(--warn-dim); border-radius: 2px;
+             padding: 0 4px; margin-left: var(--s1); }
+  .graphline { font-size: var(--t-xs); color: var(--fg-muted); margin: 2px 0; }
   /* side-by-side planned vs plain normal-TP (runner): two equal columns,
      stacking on narrow screens. */
   .sxs { display: grid; grid-template-columns: repeat(auto-fit,
-         minmax(340px, 1fr)); gap: .7rem; align-items: start; }
-  .sxs-h { font-size: .72rem; font-weight: 700; color: #adbac7;
-           margin-bottom: .2rem; text-transform: uppercase;
-           letter-spacing: .03em; }
+         minmax(340px, 1fr)); gap: var(--s3); align-items: start; }
+  .sxs-h { font-size: var(--t-sm); font-weight: 500; color: var(--fg);
+           margin-bottom: var(--s1); text-transform: uppercase;
+           letter-spacing: .04em; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px;
-         margin-right: .25rem; }
-  .rankline { color: #8b96a5; font-size: .68rem; margin: .12rem 0 0 .2rem; }
-  .st-pass { color: #56d364; } .st-warn { color: #e3a008; }
-  .st-fail { color: #ff7b72; } .st-skip { color: #8b96a5; }
-  .st-blocked { color: #8b96a5; }
-  .cfgrow { margin: .15rem 0; }
-  .cfgrow .cfgk { display: inline-block; width: 7.5rem; color: #8b96a5;
-                  font-size: .72rem; vertical-align: top; }
-  /* -- LM-Studio-style settings rows: label left, control right, ? at end -- */
-  .setrow { display: flex; align-items: center; gap: .45rem; margin: .28rem 0;
-            font-size: .74rem; }
-  .setrow .lbl { flex: 1; min-width: 0; color: #b6c2d0; display: flex;
-                 align-items: center; gap: .25rem; overflow: hidden;
+         margin-right: var(--s1); }
+  .rankline { color: var(--fg-muted); font-size: var(--t-xs);
+              margin: 2px 0 0 var(--s1); }
+  .st-pass { color: var(--ok); } .st-warn { color: var(--warn); }
+  .st-fail { color: var(--bad); } .st-skip { color: var(--fg-muted); }
+  .st-blocked { color: var(--fg-muted); }
+  .cfgrow { margin: 2px 0; }
+  .cfgrow .cfgk { display: inline-block; width: 7.5rem; color: var(--fg-muted);
+                  font-size: var(--t-sm); vertical-align: top; }
+  /* -- settings rows: label left, control right, ? at the end --------------- */
+  .setrow { display: flex; align-items: center; gap: var(--s2);
+            margin: var(--s1) 0; font-size: var(--t-sm); }
+  .setrow .lbl { flex: 1; min-width: 0; color: var(--fg); display: flex;
+                 align-items: center; gap: var(--s1); overflow: hidden;
                  white-space: nowrap; text-overflow: ellipsis; }
   .setrow input[type=text], .setrow input[type=number], .setrow select {
-    width: auto; max-width: 42%; padding: .22rem .4rem; font-size: .74rem; }
-  .setrow input[type=number].num { width: 6.2rem; }
+    width: auto; max-width: 42%; padding: 2px 6px; font-size: var(--t-sm); }
+  .setrow input[type=number].num { width: 6.4rem;
+                                   font-variant-numeric: tabular-nums; }
   .setrow input[type=range] { flex: 1.2; width: auto; max-width: none;
-    padding: 0; accent-color: #1f6feb; background: transparent; border: 0; }
+    padding: 0; accent-color: var(--accent); background: transparent; border: 0; }
   .qmark { flex: none; width: 15px; height: 15px; border-radius: 50%;
-           border: 1px solid #465362; color: #8b96a5;
-           font-size: .62rem; line-height: 1; display: inline-flex;
+           border: 1px solid var(--bd-medium); color: var(--fg-muted);
+           font-size: var(--t-xs); line-height: 1; display: inline-flex;
            align-items: center; justify-content: center; cursor: help;
            user-select: none; }
   .chg { display: none; width: 6px; height: 6px; border-radius: 50%;
-         background: #e3a008; flex: none; }
+         background: var(--warn); flex: none; }
   .setrow.changed .chg { display: inline-block; }
   /* toggle switch (pure CSS; the real input stays a hidden checkbox) */
   .switch { position: relative; display: inline-block; width: 34px;
             height: 18px; flex: none; }
   .switch input { opacity: 0; width: 0; height: 0; position: absolute;
                   margin: 0; padding: 0; border: 0; }
-  .switch .track { position: absolute; inset: 0; background: #30363d;
-    border-radius: 10px; transition: .15s; cursor: pointer;
-    border: 1px solid #3a4552; }
+  .switch .track { position: absolute; inset: 0; background: var(--bg-elevated);
+    border-radius: 9999px; transition: .15s; cursor: pointer;
+    border: 1px solid var(--bd-medium); }
   .switch .track:before { content: ""; position: absolute; width: 12px;
-    height: 12px; left: 2px; top: 2px; background: #8b96a5;
+    height: 12px; left: 2px; top: 2px; background: var(--fg-muted);
     border-radius: 50%; transition: .15s; }
-  .switch input:checked + .track { background: #1f6feb; border-color: #1f6feb; }
+  .switch input:checked + .track { background: var(--accent);
+                                   border-color: var(--accent); }
   .switch input:checked + .track:before { transform: translateX(16px);
     background: #fff; }
   .switch input:disabled + .track { opacity: .45; cursor: default; }
   /* collapsible config sections in a fixed order */
-  .cfg-section { border: 1px solid #263041; border-radius: 7px;
-                 margin: .35rem 0; background: #10151c; }
-  .cfg-section > summary { cursor: pointer; padding: .4rem .55rem;
-    font-size: .76rem; color: #c8d3df; list-style-position: inside; }
-  .cfg-section > summary b { color: #dbe4ee; }
-  .cfg-section .sec-sum { color: #7f8b99; font-size: .66rem;
-                          margin-left: .35rem; }
-  .cfg-section .sec-body { padding: .15rem .6rem .5rem; }
-  .advrow { border: 1px dashed #3a4552; border-radius: 7px; margin: .45rem 0;
-            padding: .35rem .55rem; }
+  .cfg-section { border: 1px solid var(--bd-weak); border-radius: var(--radius);
+                 margin: var(--s1) 0; background: var(--bg-elevated); }
+  .cfg-section > summary { cursor: pointer; padding: var(--s2);
+    font-size: var(--t-sm); color: var(--fg); list-style-position: inside; }
+  .cfg-section > summary:hover { background: var(--hover); }
+  .cfg-section > summary b { color: var(--fg-strong); font-weight: 500; }
+  .cfg-section .sec-sum { color: var(--fg-muted); font-size: var(--t-xs);
+                          margin-left: var(--s1); }
+  .cfg-section .sec-body { padding: 0 var(--s2) var(--s2); }
+  .advrow { border: 1px dashed var(--bd-medium); border-radius: var(--radius);
+            margin: var(--s2) 0; padding: var(--s2); }
   /* sticky action bar (load / eject / restart + status chip) */
-  .actionbar { position: sticky; bottom: 0; z-index: 5; background: #0e1116;
-    border: 1px solid #2a323d; border-radius: 8px; padding: .55rem .7rem;
-    margin: .6rem 0 .9rem; box-shadow: 0 -8px 16px rgba(0,0,0,.4); }
-  .chip { display: inline-flex; align-items: center; gap: .3rem;
-    border-radius: 10px; padding: .12rem .55rem; font-size: .7rem;
-    border: 1px solid #30363d; background: #161b22; color: #8b96a5; }
+  .actionbar { position: sticky; bottom: 0; z-index: 5;
+    background: var(--bg-panel); border: 1px solid var(--bd-weak);
+    border-radius: var(--radius-lg); padding: var(--s2) var(--s3);
+    margin: var(--s3) 0; box-shadow: 0 -6px 12px rgba(0,0,0,.45); }
+  .chip { display: inline-flex; align-items: center; gap: var(--s1);
+    border-radius: 9999px; padding: 2px 10px; font-size: var(--t-xs);
+    border: 1px solid var(--bd-medium); background: var(--bg-elevated);
+    color: var(--fg-muted); }
   .chip:before { content: ""; width: 7px; height: 7px; border-radius: 50%;
-                 background: #6e7681; }
-  .chip.ready { color: #56d364; border-color: #1c6b34; }
-  .chip.ready:before { background: #56d364; }
-  .chip.loading { color: #e3b341; border-color: #7a5c14; }
-  .chip.loading:before { background: #e3b341; }
-  .chip.error { color: #ff7b72; border-color: #7d2a2a; }
-  .chip.error:before { background: #ff7b72; }
+                 background: var(--fg-disabled); }
+  .chip.ready { color: var(--ok); border-color: var(--ok-dim); }
+  .chip.ready:before { background: var(--ok); }
+  .chip.loading { color: var(--warn); border-color: var(--warn-dim); }
+  .chip.loading:before { background: var(--warn); }
+  .chip.error { color: var(--bad); border-color: var(--bad-dim); }
+  .chip.error:before { background: var(--bad); }
   /* hardware: per-card VRAM bar spanning the row */
   .cardrow .cardbar { grid-column: 1 / -1; }
   /* landing top strip: ONE full-width row of live metric tiles (label, big
      value, secondary line, 60s sparkline). Normal flow -- the strip pushes
      the rest of the page down, nothing overlaps; tiles wrap to a second row
      on narrow screens instead of overflowing. */
-  .mstrip { display: flex; flex-wrap: wrap; gap: .45rem; width: 100%;
-            margin: .2rem 0 .7rem; }
-  .mtile { flex: 1 1 168px; min-width: 168px; background: #12171e;
-           border: 1px solid #263041; border-radius: 8px;
-           padding: .38rem .55rem .45rem; }
-  .mtile .mt-l { font-size: .62rem; color: #7f8b99; text-transform: uppercase;
-                 letter-spacing: .03em; white-space: nowrap; overflow: hidden;
+  .mstrip { display: flex; flex-wrap: wrap; gap: var(--s2); width: 100%;
+            margin: 0 0 var(--s3); }
+  .mtile { flex: 1 1 172px; min-width: 172px; background: var(--bg-panel);
+           border: 1px solid var(--bd-weak); border-radius: var(--radius-lg);
+           padding: var(--s2); }
+  .mtile .mt-l { font-size: var(--t-xs); color: var(--fg-muted);
+                 text-transform: uppercase; letter-spacing: .04em;
+                 white-space: nowrap; overflow: hidden;
                  text-overflow: ellipsis; }
-  .mtile .mt-v { font-size: 1.2rem; font-weight: 700; color: #e6edf3;
-                 line-height: 1.3; white-space: nowrap; }
-  .mtile .mt-v small { font-size: .64rem; font-weight: 400; color: #8b96a5; }
-  .mtile .mt-s { font-size: .62rem; color: #8b96a5; line-height: 1.35;
-                 min-height: 1.7em; }
+  .mtile .mt-v { font-size: 20px; font-weight: 500; color: var(--fg-strong);
+                 line-height: 1.3; white-space: nowrap;
+                 font-variant-numeric: tabular-nums; }
+  .mtile .mt-v small { font-size: var(--t-xs); font-weight: 400;
+                       color: var(--fg-muted); }
+  .mtile .mt-s { font-size: var(--t-xs); color: var(--fg-muted);
+                 line-height: 1.4; min-height: 1.7em;
+                 font-variant-numeric: tabular-nums; }
   /* fixed-pixel sparkline: sized in JS as samples*px so ONE sample = ONE
      pixel bucket; never stretched by CSS (stretching would alias samples). */
-  .mtile svg.spk { display: block; margin-top: .25rem; background: #0d1117;
-                   border-radius: 3px; max-width: 100%; }
+  .mtile svg.spk { display: block; margin-top: var(--s1);
+                   background: var(--bg-input); border-radius: 2px;
+                   max-width: 100%; }
 
   /* ---- refresh affordance -------------------------------------------------
      A panel waiting on a slow backend call keeps showing its previous
@@ -3412,51 +3848,55 @@ _INDEX_TEMPLATE = r"""<!doctype html>
      panel and throws away what the reader was looking at. The transition is
      short enough that a fast answer never registers as a flicker. */
   .stale { opacity: .55; transition: opacity .12s linear; }
-  .stale-note { font-size: .62rem; color: #8b96a5; }
+  .stale-note { font-size: var(--t-xs); color: var(--fg-muted); }
   /* A backend call that failed or timed out. The panel keeps its last good
      content; this line says why it is no longer moving. */
-  .rev-error { font-size: .68rem; color: #d29922; margin-top: .25rem; }
+  .rev-error { font-size: var(--t-sm); color: var(--warn);
+               margin-top: var(--s1); }
 
   /* ---- simple / expert -----------------------------------------------------
      Two densities of the same page, not two different pages. Expert ADDS
      dimensions; it never changes what a control shared by both means. */
-  .hdr { display: flex; align-items: flex-start; justify-content: space-between;
-         gap: 1rem; flex-wrap: wrap; }
-  .vmode { display: flex; border: 1px solid #30363d; border-radius: 7px;
-           overflow: hidden; flex: none; margin-top: .2rem; }
-  .vmode .vm { background: #12171e; color: #8b96a5; border: 0;
-               padding: .3rem .8rem; font: inherit; font-size: .74rem;
-               cursor: pointer; }
-  .vmode .vm.on { background: #1f6feb; color: #fff; }
-  .vmode .vm:not(.on):hover { color: #e6edf3; }
+  .vmode { display: flex; border: 1px solid var(--bd-medium);
+           border-radius: var(--radius); overflow: hidden; flex: none; }
+  .vmode .vm { background: var(--bg-elevated); color: var(--fg-muted);
+               border: 0; border-radius: 0; padding: 5px 14px; font: inherit;
+               font-size: var(--t-sm); cursor: pointer; }
+  .vmode .vm.on { background: var(--accent); color: #fff; }
+  .vmode .vm:not(.on):hover { color: var(--fg-strong);
+                              background: var(--selected); filter: none; }
   /* Visibility is driven by one class on <body>, so no panel has to know
      which mode it is in and a mode switch touches no backend call. */
   body.mode-simple .expert-only { display: none !important; }
   body.mode-expert .simple-only { display: none !important; }
 
   /* ---- simple view: one bar and one budget slider per card ---------------- */
-  .cardsimple { border: 1px solid #263041; border-radius: 8px;
-                padding: .5rem .6rem; margin: .4rem 0; background: #12171e; }
+  .cardsimple { border: 1px solid var(--bd-weak); border-radius: var(--radius-lg);
+                padding: var(--s2) var(--s3); margin: var(--s2) 0;
+                background: var(--bg-panel); }
   .cardsimple .cs-h { display: flex; justify-content: space-between;
-                      align-items: baseline; gap: .5rem; flex-wrap: wrap; }
-  .cardsimple .cs-n { font-weight: 600; color: #e6edf3; }
-  .cardsimple .cs-u { font-size: .72rem; color: #8b96a5; white-space: nowrap; }
+                      align-items: baseline; gap: var(--s2); flex-wrap: wrap; }
+  .cardsimple .cs-n { font-weight: 500; color: var(--fg-strong); }
+  .cardsimple .cs-u { font-size: var(--t-sm); color: var(--fg-muted);
+                      white-space: nowrap; font-variant-numeric: tabular-nums; }
   /* One bar = everything the configuration puts on this card. The granular
-     split is the expert view's job; here the number is the whole point. */
-  .csbar { position: relative; height: 20px; border-radius: 4px;
-           background: #0d1117; border: 1px solid #263041; overflow: hidden;
-           margin: .35rem 0 .3rem; }
-  .csbar .fill { position: absolute; inset: 0 auto 0 0; background: #1f6feb; }
-  .csbar .fill.over { background: #f85149; }
-  .csbar .fill.tight { background: #d29922; }
+     split is the expert view's job; here the number is the whole point.
+     Fill colour is state, not decoration: normal / tight / over. */
+  .csbar { position: relative; height: 18px; border-radius: 2px;
+           background: var(--bg-input); border: 1px solid var(--bd-weak);
+           overflow: hidden; margin: var(--s1) 0; }
+  .csbar .fill { position: absolute; inset: 0 auto 0 0; background: var(--info); }
+  .csbar .fill.over { background: var(--bad); }
+  .csbar .fill.tight { background: var(--warn); }
   /* The budget the user set, drawn as a line across the bar: the reader can
      see at a glance whether the configuration sits under it or over it. */
   .csbar .cap { position: absolute; top: 0; bottom: 0; width: 2px;
-                background: #e6edf3; }
-  .csrow { display: flex; align-items: center; gap: .5rem; }
+                background: var(--fg-strong); }
+  .csrow { display: flex; align-items: center; gap: var(--s2); }
   .csrow input[type=range] { flex: 1 1 auto; min-width: 8rem; }
-  .csrow .cs-v { font-size: .72rem; color: #8b96a5; min-width: 7.5rem;
-                 text-align: right; white-space: nowrap; }
+  .csrow .cs-v { font-size: var(--t-sm); color: var(--fg-muted);
+                 min-width: 7.5rem; text-align: right; white-space: nowrap;
+                 font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -3477,15 +3917,25 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   </div>
 </div>
 
+<!-- One word per tab, so the bar fits on a normal window without ever
+     scrolling; the long form is the title attribute. -->
 <div class="tabs">
-  <button id="tab_landing" class="tab active" onclick="showTab('landing')">Landing (live monitor)</button>
-  <button id="tab_runner" class="tab" onclick="showTab('runner')">Runner (models + planner)</button>
-  <button id="tab_bench" class="tab" onclick="showTab('bench')">Benchmark</button>
-  <button id="tab_explore" class="tab" onclick="showTab('explore')">Explore rigs (matrix)</button>
-  <button id="tab_landscape" class="tab" onclick="showTab('landscape')">Landscape (benchmark DB)</button>
-  <button id="tab_energy" class="tab" onclick="showTab('energy')">Energy (calibration)</button>
-  <button id="tab_quality" class="tab" onclick="showTab('quality')">Quality</button>
-  <button id="tab_pair" class="tab" onclick="showTab('pair')">Couple a rig</button>
+  <button id="tab_landing" class="tab active" onclick="showTab('landing')"
+    title="live monitor of any reachable sglang server">Monitor</button>
+  <button id="tab_runner" class="tab" onclick="showTab('runner')"
+    title="models, capacity planner and server launch">Planner</button>
+  <button id="tab_bench" class="tab" onclick="showTab('bench')"
+    title="behavioural benchmark / quality suite">Benchmark</button>
+  <button id="tab_explore" class="tab" onclick="showTab('explore')"
+    title="model x rig capacity matrix">Rigs</button>
+  <button id="tab_landscape" class="tab" onclick="showTab('landscape')"
+    title="recorded benchmark database">Landscape</button>
+  <button id="tab_energy" class="tab" onclick="showTab('energy')"
+    title="per-card power calibration">Energy</button>
+  <button id="tab_quality" class="tab" onclick="showTab('quality')"
+    title="rendering / instruction-following checks">Quality</button>
+  <button id="tab_pair" class="tab" onclick="showTab('pair')"
+    title="couple a second rig">Pair rig</button>
 </div>
 
 <div id="view_pair" style="display:none">
@@ -3525,9 +3975,25 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       <input id="land_endpoint" placeholder="host:port (blank = managed instance, else auto-detect)" style="max-width:22rem">
       <button class="mini" onclick="setLandingEndpoint()">use</button>
       <button class="mini secondary" onclick="clearLandingEndpoint()" title="clear the explicit endpoint; fall back to managed / auto-detect">auto</button>
-      <button class="mini secondary" onclick="detectLandingEndpoint()" title="probe the common local ports for a reachable sglang server">detect</button>
+      <button class="mini secondary" onclick="detectLandingEndpoint()" title="empty box: sweep the local sglang ports (30000-30100, 8000, 8080). Box filled: verify that host:port.">detect</button>
       <span id="land_target_note" class="muted">resolving&hellip;</span>
     </div>
+  </fieldset>
+  <!-- Always present, in every state. Living inside the "a server is
+       running" container is what let a warning outlive the server it was
+       about: the container was hidden, the stale text stayed. -->
+  <fieldset id="live_panel">
+    <legend>VRAM in use, throughput per session, tokens per watt (live)</legend>
+    <div id="live_note" class="muted">looking for a running server&hellip;</div>
+    <div id="live_strip" class="mstrip" style="display:none"></div>
+    <div id="live_cards"></div>
+    <div class="legend" id="live_legend" style="display:none">Bars are the
+      <b>measured</b> NVML occupancy of each card, drawn with the same bar the
+      planner uses for its projection, so the two are comparable by looking.
+      Per-session rates divide the server-wide rate by the concurrent requests
+      being served. Tokens per watt is the live token rate over NVML power
+      draw &mdash; per card it says what that card costs to keep in the group,
+      the total is the figure for the whole configuration.</div>
   </fieldset>
   <div id="landing_none" class="muted" style="display:none;padding:1rem;border:1px solid #30363d;border-radius:8px">
     No reachable sglang server: no explicit endpoint, no managed instance,
@@ -3583,15 +4049,6 @@ _INDEX_TEMPLATE = r"""<!doctype html>
         <div id="bn_caps" class="muted" style="margin-top:.5rem">probe to see the gating state&hellip;</div>
       </fieldset>
       <fieldset>
-        <legend>tests &mdash; presets + per-test selection</legend>
-        <div class="actions" id="bn_presets"></div>
-        <label style="margin:.4rem 0"><input type="checkbox" id="bn_force" style="width:auto" onchange="benchReGate()">
-          force-run tool tests despite a missing tool parser
-          <span class="muted">(deliberately surfaces the tool-call cascade)</span></label>
-        <div id="bn_tests" class="muted">loading test catalog&hellip;</div>
-        <div style="margin-top:.5rem"><button onclick="benchRun()" id="bn_run_btn">Run selected</button></div>
-      </fieldset>
-      <fieldset>
         <legend>share results on GitHub (#152)</legend>
         <div class="muted" style="margin-bottom:.4rem">Builds the EXACT
           markdown to post as a preview &mdash; nothing is sent until you
@@ -3642,6 +4099,36 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       </fieldset>
     </div>
     <div>
+      <!-- The tests ARE the tab. They get the full width and are picked by
+           clicking them, not by hunting checkboxes in a narrow column: a
+           selected test is a pressed button, a gated one is disabled and says
+           why on hover. -->
+      <fieldset>
+        <legend>tests &mdash; click to select</legend>
+        <div class="actions" id="bn_presets" style="margin-bottom:var(--s2)"></div>
+        <div id="bn_tests" class="muted">loading test catalog&hellip;</div>
+        <label style="margin:var(--s2) 0"><input type="checkbox" id="bn_force" style="width:auto" onchange="benchReGate()">
+          force-run tool tests despite a missing tool parser
+          <span class="muted">(deliberately surfaces the tool-call cascade)</span></label>
+        <div class="actions">
+          <button onclick="benchRun()" id="bn_run_btn">Run selected</button>
+          <span id="bn_sel_note" class="muted"></span>
+        </div>
+      </fieldset>
+      <!-- Past runs, per model. A verdict table is not reviewable on its own;
+           the stored run carries every request and every answer, and the
+           download is the whole series. -->
+      <fieldset>
+        <legend>history &mdash; past runs for this model</legend>
+        <div class="actions" style="margin-bottom:var(--s2)">
+          <button class="mini secondary" onclick="benchHistory()">refresh</button>
+          <label style="display:inline-flex;align-items:center;gap:var(--s1);margin:0">
+            <input type="checkbox" id="bn_hist_all" style="width:auto" onchange="benchHistory()">
+            <span class="muted">all models</span></label>
+          <span id="bn_hist_note" class="muted"></span>
+        </div>
+        <div id="bn_history" class="muted">no runs recorded yet.</div>
+      </fieldset>
       <!-- Lead metrics: how long a round TAKES. tok/s hides which phase moved;
            ms per verify round and ms per 1k prefill tokens do not. Absent is
            shown as absent, never as zero. -->
@@ -3829,7 +4316,10 @@ _INDEX_TEMPLATE = r"""<!doctype html>
 <div class="sub">Pick the model ONCE at the top &mdash; it drives everything:
   profiles, flag resolve, plan, placement and launch. Below it: profile &rarr;
   serving identity &rarr; the one flag surface &rarr; launch. No field appears
-  twice.</div>
+  twice. The page opens on the configuration that is currently loaded, when
+  there is one; live telemetry is the Monitor tab's job.</div>
+<div id="loaded_cfg" class="adv" style="margin-bottom:var(--s3)">
+  <span class="muted">reading the running configuration&hellip;</span></div>
 
 <fieldset>
   <legend>model &mdash; the ONE selector (drives plan, profiles, placement, launch)
@@ -3856,6 +4346,7 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   </div>
   <div id="model_info" class="muted" style="margin-top:.4rem;word-break:break-all"></div>
 </fieldset>
+
 
 <!-- ===================================================================== -->
 <!-- SIMPLE view: per card, how much VRAM this configuration uses, and one -->
@@ -5155,6 +5646,9 @@ function showTab(t) {
   if (t==='pair') pairRefresh(); else pairStopPoll();
   // The landing page live-poll runs only while its tab is visible.
   if (t==='landing') startLanding(); else stopLanding();
+  // The Planner opens on the RUNNING configuration when there is one: the
+  // useful default is what is loaded, not an empty form.
+  if (t==='runner') prefillFromRunning();
 }
 
 // ===========================================================================
@@ -5587,28 +6081,40 @@ const STRIP_PX_PER_SAMPLE=5;
 const STRIP_SAMPLES=Math.round(RING_SECONDS*1000/LAND_POLL_MS);
 const STRIP_W=STRIP_SAMPLES*STRIP_PX_PER_SAMPLE;
 const STRIP_H=26;
+// -- column rendering -------------------------------------------------------
+// One filled column per sample, drawn from the LEFT and growing rightwards as
+// samples arrive, each column anchored on the baseline. A polyline was the
+// wrong mark here twice over: with two samples it drew a single stroke across
+// half an empty field, which reads as data that is not there, and it
+// interpolated between samples taken seconds apart. A column stands for
+// exactly one sample and for nothing in between.
+function _columns(a, w, h, max){
+  if(!a || !a.length) return '';
+  const n=Math.max(1, Math.floor(w/STRIP_PX_PER_SAMPLE));
+  const bw=Math.max(1, STRIP_PX_PER_SAMPLE-1);
+  let mx=max;
+  if(mx==null){ mx=-Infinity; for(const p of a) if(p.v>mx) mx=p.v; }
+  if(!(mx>0)) mx=1;
+  let out='';
+  const shown=a.slice(-n);
+  for(let i=0;i<shown.length;i++){
+    const v=Math.max(0, shown[i].v);
+    const bh=Math.max(1, Math.round((h-2)*Math.min(1, v/mx)));
+    out+='<rect x="'+(i*STRIP_PX_PER_SAMPLE)+'" y="'+(h-bh)+'" width="'+bw
+      +'" height="'+bh+'" fill="var(--info)"/>';
+  }
+  return out;
+}
 function stripSpark(key){
   const a=(window._ring[key]||[]).slice(-STRIP_SAMPLES);
-  let inner='';
-  if(a.length>=2){
-    let mx=-Infinity; for(const p of a) if(p.v>mx) mx=p.v;
-    if(mx<=0) mx=1;  // baseline is always 0 (activity graph)
-    const x0=STRIP_W-a.length*STRIP_PX_PER_SAMPLE+STRIP_PX_PER_SAMPLE/2;
-    const pts=a.map((p,i)=>(x0+i*STRIP_PX_PER_SAMPLE)+','
-      +(1+(STRIP_H-2)*(1-Math.max(0,p.v)/mx)).toFixed(1)).join(' ');
-    inner='<polyline fill="none" stroke="#1f6feb" stroke-width="1.5" points="'+pts+'"/>';
-  }
-  return '<svg class="spk" width="'+STRIP_W+'" height="'+STRIP_H+'">'+inner+'</svg>';
+  return '<svg class="spk" width="'+STRIP_W+'" height="'+STRIP_H+'">'
+    +_columns(a, STRIP_W, STRIP_H)+'</svg>';
 }
 function sparkline(key,w,hh){
-  const a=window._ring[key]||[]; if(a.length<2) return '';
-  let mn=Infinity,mx=-Infinity;
-  for(const p of a){ if(p.v<mn)mn=p.v; if(p.v>mx)mx=p.v; }
-  if(mx<=mn) mx=mn+1;
-  const t0=a[0].t, t1=a[a.length-1].t, span=(t1-t0)||1;
-  const pts=a.map(p=>((p.t-t0)/span*w).toFixed(1)+','+(hh-((p.v-mn)/(mx-mn))*hh).toFixed(1)).join(' ');
-  return '<svg width="'+w+'" height="'+hh+'" style="vertical-align:middle;background:#0d1117;border-radius:3px">'
-    +'<polyline fill="none" stroke="#1f6feb" stroke-width="1.5" points="'+pts+'"/></svg>';
+  const a=window._ring[key]||[]; if(!a.length) return '';
+  return '<svg width="'+w+'" height="'+hh+'" style="vertical-align:middle;'
+    +'background:var(--bg-input);border-radius:2px">'
+    +_columns(a, w, hh)+'</svg>';
 }
 function landingEndpoint(){
   try{ return (localStorage.getItem('land_endpoint')||'').trim(); }catch(e){ return ''; }
@@ -5624,15 +6130,32 @@ function clearLandingEndpoint(){
   try{ localStorage.removeItem('land_endpoint'); }catch(e){}
   $('land_endpoint').value=''; resetLandingRings(); landingPoll();
 }
+// 'detect' with something typed in the endpoint box VERIFIES that one target;
+// with the box empty it sweeps the local sglang port range. Same endpoint,
+// same button -- the input decides which of the two the user asked for.
 async function detectLandingEndpoint(){
-  $('land_target_note').textContent='probing the common local ports…';
+  const typed=($('land_endpoint').value||'').trim();
+  $('land_target_note').textContent = typed
+    ? ('probing '+typed+'…') : 'sweeping the local sglang ports…';
   try{
-    const d=await (await fetch('/api/detect_endpoint')).json();
+    const r=await fetch('/api/detect_endpoint',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(typed?{endpoint:typed}:{})});
+    const d=await r.json();
     if(d.endpoint){
       $('land_endpoint').value=d.endpoint.replace(/^https?:\/\//,'');
       setLandingEndpoint();
+      if(d.metrics===false)
+        $('land_target_note').innerHTML='<span class="est">found '
+          +esc(d.endpoint)+', but it serves no /metrics &mdash; started '
+          +'without --enable-metrics, so live rates stay unavailable.</span>';
+    } else if(d.explicit){
+      $('land_target_note').textContent=d.error||('no sglang server at '+typed);
     } else {
-      $('land_target_note').textContent='nothing reachable on ports '+(d.probed||[]).join(', ');
+      const pr=d.probed||[];
+      const span=pr.length>4?(pr[0]+'-'+pr[pr.length-1]+' ('+pr.length+' ports)')
+                            :pr.join(', ');
+      $('land_target_note').textContent='nothing reachable on '+span;
     }
   }catch(e){ $('land_target_note').textContent=''+e; }
 }
@@ -5667,6 +6190,9 @@ async function landingPoll(){
     $('land_target_note').textContent='no target';
   }
   if(!d || !d.running || !d.snapshot){
+    // State 1: nothing is running. Rendered from THIS tick, so a warning
+    // about a server that has since gone away cannot survive it.
+    renderLivePanel(null, d);
     $('landing_none').style.display=''; $('landing_live').style.display='none';
     const st=d && d.status;
     $('landing_none_status').textContent = (d && d.error)? ' ('+d.error+')'
@@ -5756,12 +6282,12 @@ function renderStartConfig(s, tgt){
 }
 function renderLanding(s, tgt){
   window._lastSnapshot=s;
+  renderLivePanel(s);
   // Patched, not replaced: this block carries two <details> ("full launch
   // command + env", "raw server_info") and a scrollable <pre>. Rewriting it
   // wholesale on every 2 s tick is what used to slam them shut.
   setHTML($('landing_config'), renderStartConfig(s, tgt)
-    +(s.metrics_error?'<div class="reasons" style="margin-top:.3rem">'+esc(s.metrics_error)
-      +' &mdash; token rates need --enable-metrics on the server.</div>':''));
+    +(s.metrics_error?noMetricsBanner(s.metrics_error, s):''));
 
   // Per-card 60s telemetry rings (rendered INSIDE the placement card blocks,
   // renderPlacement's live line -- the old standalone per-GPU chart grid is
@@ -6698,6 +7224,243 @@ function fmtGiB(m){
   if(m==null||isNaN(m)) return 'n/a';
   return (m/1024).toFixed(1)+' GiB';
 }
+
+// ===========================================================================
+// LIVE panel (runner tab, both densities).
+//
+// The planner draws what a configuration WOULD occupy. This draws what the
+// running server DOES occupy, with the same bar, so the two are comparable by
+// looking rather than by arithmetic. Everything here comes from one
+// /api/live_snapshot poll -- NVML per card, the Prometheus scrape for rates.
+//
+// Fill colour is state, using the thresholds these tools converge on: under
+// 80% of the card normal, 80-90% tight, above 90% critical. Nothing on this
+// panel is coloured for decoration.
+// ===========================================================================
+const LIVE_POLL_MS=2000;
+window._liveTimer=null;
+// A server started WITHOUT --enable-metrics serves no /metrics, so every rate
+// on this page is unavailable -- not zero, not pending. Say which of the two
+// it is, and say what to do about it; an empty widget that never fills is the
+// worst of the three states to be shown.
+// WHICH server is meant has to be on the banner. A state line that names no
+// target reads as a statement about the server the reader has in mind, and a
+// stray process on a nearby port then looks like the real one.
+function targetLabel(s){
+  const n=s?normalizeStartConfig(s):null;
+  const cfg=(n&&n.cfg)||{};
+  const st=(s&&s.status)||null;
+  const name=cfg.served_model_name||cfg.model_path||(st&&st.served_model_name)
+             ||(st&&st.model_path)||'unnamed model';
+  let port=cfg.port||(st&&st.port)||null;
+  if(!port && s && s.endpoint){
+    const m=(''+s.endpoint).match(/:(\d+)\s*$/); if(m) port=m[1];
+  }
+  const pid=(st&&st.pid)||null;
+  return esc(String(name))+(port?(' @ :'+esc(String(port))):'')
+        +(pid?(' &middot; pid '+esc(String(pid))):'');
+}
+function noMetricsBanner(err, s){
+  return '<div class="verdict offload" style="font-size:var(--t-sm);'
+    +'font-weight:400;margin:var(--s2) 0 0">'
+    +'<b>Server started without --enable-metrics</b>'
+    +(s?(' &mdash; <b>'+targetLabel(s)+'</b>'):'')
+    +' &mdash; live rates (decode / prefill tok/s, per-session throughput, '
+    +'MTP acceptance, cache hit) are not available from this server. Per-card '
+    +'VRAM, power and utilisation come from NVML and keep working. Restart '
+    +'the server with <code>--enable-metrics</code>; a server booted from '
+    +'this dashboard always has it.'
+    +(err?'<div class="muted" style="margin-top:var(--s1)">'+esc(err)+'</div>':'')
+    +'</div>';
+}
+function vramClass(frac){
+  if(frac==null) return '';
+  if(frac>=0.90) return ' over';
+  if(frac>=0.80) return ' tight';
+  return '';
+}
+// One card's measured occupancy, on the planner's own bar.
+function liveCardHtml(g, tokS){
+  const frac=(g.mem_total_mib? g.mem_used_mib/g.mem_total_mib : null);
+  const pct=frac==null?0:Math.min(100,frac*100);
+  const idx=devLabel(g.cuda_index, g.nvml_index)||('nvml:'+g.nvml_index);
+  const key='gpu'+g.nvml_index;
+  pushRing(key+'_util', window._liveT, g.utilization_pct);
+  pushRing(key+'_pow', window._liveT, g.power_watts);
+  pushRing(key+'_mem', window._liveT, frac==null?null:frac*100);
+  // Tokens per watt for ONE card: the server-wide token rate over what this
+  // card is drawing. It is what this card costs to keep in the group -- the
+  // tokens are produced by the whole TP group, never by one card alone, and
+  // the label says so rather than implying a per-card share of the work.
+  const tpw=(tokS!=null&&g.power_watts>0)?(tokS/g.power_watts):null;
+  return '<div class="cardsimple" data-key="live_'+g.nvml_index+'">'
+    +'<div class="cs-h"><span class="cs-n">'+esc(g.name)
+    +' <span class="muted" style="font-weight:400">['+esc(idx)+']</span></span>'
+    +'<span class="cs-u">'+fmtGiB(g.mem_used_mib)+' of '+fmtGiB(g.mem_total_mib)
+    +' &middot; '+pct.toFixed(0)+'%</span></div>'
+    +'<div class="csbar" title="measured NVML occupancy of this card">'
+    +'<div class="fill'+vramClass(frac)+'" style="width:'+pct.toFixed(1)+'%"></div></div>'
+    +'<div class="csrow" style="font-size:var(--t-xs);color:var(--fg-muted);'
+    +'flex-wrap:wrap;gap:var(--s3)">'
+    +'<span>util <b>'+g.utilization_pct+'%</b> '+sparkline(key+'_util',72,16)+'</span>'
+    +'<span>power <b>'+g.power_watts.toFixed(0)+'</b>/'+g.power_limit_w.toFixed(0)
+    +' W '+sparkline(key+'_pow',72,16)+'</span>'
+    +'<span>VRAM '+sparkline(key+'_mem',72,16)+'</span>'
+    +'<span>'+g.temperature_c+' &deg;C</span>'
+    +'<span>SM '+g.sm_clock_mhz+' MHz</span>'
+    +'<span title="server-wide token rate over this card\'s NVML power draw">'
+    +'tok/W <b>'+(tpw!=null?tpw.toFixed(2):'--')+'</b></span>'
+    +'</div></div>';
+}
+function liveTile(label, value, sub, spark){
+  return '<div class="mtile" data-key="'+label.replace(/[^a-z]/gi,'')+'">'
+    +'<div class="mt-l">'+label+'</div><div class="mt-v">'+value+'</div>'
+    +'<div class="mt-s">'+(sub||'&nbsp;')+'</div>'
+    +(spark?stripSpark(spark):'')+'</div>';
+}
+// Exactly three states, and the panel is in one of them after EVERY poll:
+//   1. no inference server running        -- neutral, not an error;
+//   2. a server that serves no /metrics   -- warning, names the target;
+//   3. a server with metrics              -- the live readings.
+// The banner is a function of the current tick, never something set once.
+function renderLivePanel(s, envelope){
+  const note=$('live_note'), strip=$('live_strip'), cards=$('live_cards');
+  if(!note) return;
+  if(!s||!s.ok||!s.gpus){
+    note.style.display=''; strip.style.display='none';
+    $('live_legend').style.display='none';
+    setHTML(cards,'');
+    const st=(envelope&&envelope.status)||null;
+    const err=(s&&s.error)||(envelope&&envelope.error)||null;
+    if(err){
+      setHTML(note,'<span class="rev-error">'+esc(err)+'</span>');
+    } else if(st && st.state && st.state!=='stopped'){
+      setHTML(note,'<span class="muted">Managed server is <b>'+esc(st.state)
+        +'</b>'+(st.model_path?(' &mdash; '+esc(st.model_path)):'')
+        +(st.port?(' @ :'+esc(String(st.port))):'')
+        +' &mdash; readings appear once it is ready.</span>');
+    } else {
+      setHTML(note,'<span class="muted"><b>No inference server running.</b> '
+        +'Nothing to read here yet &mdash; start one in the Planner tab, or '
+        +'point the monitor at a running one above.</span>');
+    }
+    return;
+  }
+  window._liveT=s.t;
+  const noMetrics=!!s.metrics_error;
+  const rates=s.rates||null;
+  const dec=rates?rates.decode_tok_s:null, pfx=rates?rates.prefill_tok_s:null;
+  const running=(s.num_running_reqs!=null)?s.num_running_reqs:null;
+  const queued=(s.num_queue_reqs!=null)?s.num_queue_reqs:null;
+  // Per session = the server-wide rate divided by the requests it is actually
+  // serving. With nothing running the per-session figure is undefined, not 0.
+  const per=(v)=>(v==null||running==null||running<1)?null:v/running;
+  const decPer=per(dec), pfxPer=per(pfx);
+  let watts=null;
+  for(const g of s.gpus) if(g.power_watts!=null) watts=(watts||0)+g.power_watts;
+  const EPS=0.05;
+  let tokS=null;
+  if(dec!=null&&dec>EPS) tokS=dec; else if(pfx!=null&&pfx>EPS) tokS=pfx;
+  const tpwTotal=(tokS!=null&&watts)?tokS/watts:null;
+  stripPush('lv_dec',s.t,dec); stripPush('lv_pfx',s.t,pfx);
+  stripPush('lv_tpw',s.t,tpwTotal);
+  // Without /metrics a rate is UNAVAILABLE, which is a different fact from
+  // "idle at 0" -- the tiles must not be able to be read as the latter.
+  const NA='<span class="muted">n/a</span>';
+  const n1=(v)=>noMetrics?NA:(v==null?'&ndash;':Number(v).toFixed(1));
+  const n2=(v)=>noMetrics?NA:(v==null?'&ndash;':Number(v).toFixed(2));
+  note.style.display=noMetrics?'':'none';
+  if(noMetrics) setHTML(note, noMetricsBanner(s.metrics_error, s));
+  strip.style.display=''; $('live_legend').style.display='';
+  setHTML(strip,
+    liveTile('decode per session',
+      n1(decPer)+'<small> tok/s</small>',
+      'server total '+n1(dec)+' tok/s &middot; '
+      +(running==null?'sessions n/a':running+' running')
+      +(queued?(' &middot; '+queued+' queued'):''), 'lv_dec')
+   +liveTile('prefill per session',
+      n1(pfxPer)+'<small> tok/s</small>',
+      'server total '+n1(pfx)+' tok/s (non-cached)', 'lv_pfx')
+   +liveTile('tokens per watt (total)',
+      n2(tpwTotal)+'<small> tok/W</small>',
+      (watts!=null?Math.round(watts)+' W across '+s.gpus.length+' cards':'-- W')
+      +(tokS!=null?(' &middot; '+n1(tokS)+' tok/s'):' &middot; idle'), 'lv_tpw')
+   +liveTile('energy per token',
+      (tpwTotal?n1(1/tpwTotal):(noMetrics?NA:'&ndash;'))+'<small> J/tok</small>',
+      tpwTotal?'at the current phase rate'
+        :(noMetrics?'needs /metrics for the token rate':'undefined while idle'),
+      ''));
+  setHTML(cards, s.gpus.map(g=>liveCardHtml(g, tokS)).join(''));
+}
+// The Planner's default is the configuration that is CURRENTLY LOADED. An
+// empty form is only the right starting point when nothing is running; when a
+// server is up, the thing the reader wants to edit is what that server was
+// started with. Runs once per visit and never overwrites a form the user has
+// already typed into.
+window._prefilledFrom=null;
+async function prefillFromRunning(){
+  if(window._prefillBusy) return;
+  window._prefillBusy=true;
+  try{
+    const ep=landingEndpoint();
+    const d=await api('/api/live_snapshot'+(ep?('?endpoint='+encodeURIComponent(ep)):''),
+                      {key:'prefill', timeout:4000});
+    const s=(d&&d.running)?d.snapshot:null;
+    const n=s?normalizeStartConfig(s):null;
+    const cfg=(n&&n.cfg)||null;
+    if(!cfg||!cfg.model_path){ renderLoadedConfigNote(null); return; }
+    const key=cfg.model_path+'|'+(cfg.port||'');
+    renderLoadedConfigNote(cfg, n.src);
+    if(window._prefilledFrom===key) return;      // already applied this one
+    if($('model').value.trim()) return;          // never overwrite the user
+    window._prefilledFrom=key;
+    $('model').value=cfg.model_path;
+    applyRunningConfigToForm(cfg);
+    onModelChange(); onRunnerModel();
+  }catch(e){ /* the form simply stays empty */ }
+  finally{ window._prefillBusy=false; }
+}
+function applyRunningConfigToForm(cfg){
+  const direct={served_model_name:'sv_served', host:'sv_host', port:'sv_port',
+                context_length:'sv_ctx', max_running_requests:'max_running_requests'};
+  for(const k of Object.keys(direct)){
+    const el=$(direct[k]);
+    if(el && cfg[k]!=null && cfg[k]!=='') el.value=String(cfg[k]);
+  }
+  window._flagSettings=window._flagSettings||{};
+  const flags={tp_size:'tp_size', rank_gpu_id:'rank_gpu_id',
+               rank_tp_ratio:'rank_tp_ratio', rank_gpu_memory_mib:'rank_gpu_memory_mib',
+               kv_cache_dtype:'kv_cache_dtype'};
+  for(const k of Object.keys(flags)){
+    const v=cfg[k]; if(v==null||v==='') continue;
+    const str=Array.isArray(v)?v.join(','):String(v);
+    const el=$('fl_'+flags[k]); if(el) el.value=str;
+    window._flagSettings[flags[k]]=v;
+  }
+  window._presetBase=presetSnapshot();
+  markPresetDrift(); updateSectionSummaries(); updateGpuPick(); updateColoUI();
+  scheduleRecompute();
+}
+// The Planner states which configuration it is showing, always -- "the
+// running one", "the running one, edited", or "nothing loaded".
+function renderLoadedConfigNote(cfg, src){
+  const box=$('loaded_cfg'); if(!box) return;
+  if(!cfg){
+    setHTML(box,'<span class="muted">No server running &mdash; this is a fresh '
+      +'configuration. Pick a model below.</span>');
+    return;
+  }
+  const bits=[];
+  if(cfg.tp_size) bits.push('tp '+cfg.tp_size);
+  if(cfg.rank_gpu_id) bits.push('ranks on '+[].concat(cfg.rank_gpu_id).join(','));
+  if(cfg.context_length) bits.push('ctx '+cfg.context_length);
+  if(cfg.kv_cache_dtype) bits.push('kv '+cfg.kv_cache_dtype);
+  if(cfg.spec_mode) bits.push('spec '+cfg.spec_mode);
+  setHTML(box,'<b>currently loaded:</b> '+esc(cfg.model_path||'(unnamed)')
+    +(bits.length?' <span class="muted">&middot; '+esc(bits.join(' &middot; '))+'</span>':'')
+    +' <span class="muted">&mdash; read from '+esc(src||'the running server')
+    +'; the rows below start from it.</span>');
+}
 function renderSimpleCards(placement){
   const box=$('simple_cards'); if(!box) return;
   const incl=CARDS.filter(c=>c.include);
@@ -6787,8 +7550,10 @@ function markTune(){
     b.className='mini'+(k===cur?'':' secondary');
   }
   const note=$('tune_note');
-  if(note) note.textContent='objective: '+(TUNE_LABELS[cur]||cur)
-    +' — every control below stays free to move past it.';
+  if(note) note.innerHTML='objective: <b>'+esc(TUNE_LABELS[cur]||cur)+'</b>'
+    +' &mdash; sets --rank-perf-tune only; every control below stays free to '
+    +'move past it. This is not a second preset: a preset fills every row, '
+    +'an objective moves one.';
 }
 function runnerFlags(){
   const s=window._flagSettings||{};
@@ -6923,7 +7688,8 @@ async function loadConfigProfiles(){
     window._profiles=(d.generated||[]).concat(d.saved||[]);
     // LM-Studio-style preset DROPDOWN: generated presets first, user-saved
     // after (marked); picking one applies it and fills the settings rows.
-    let h='<select id="profile_select" onchange="applyProfileSel()" style="max-width:70%">'
+    let h='<label for="profile_select">preset</label>'
+      +'<select id="profile_select" onchange="applyProfileSel()">'
       +'<option value="">&mdash; apply a preset &mdash;</option>'
       +window._profiles.map((p,i)=>'<option value="'+i+'" title="'
         +esc((p.info||[]).join(' | '))+'">'+esc(p.name)
@@ -6978,8 +7744,17 @@ function applyProfile(i){
   window._profileArgv=p.argv||null;
   window._profileDirty=false;
   renderProfileLaunch();
-  $('profile_msg').innerHTML='<span class="muted">applied <b>'+esc(p.name)+'</b>'
-    +((p.info&&p.info.length)?' — '+esc(p.info.join(' | ')):'')+'</span>';
+  // A preset that lands silently is indistinguishable from a dead control.
+  // Report what it actually wrote, and -- the case that made it look broken --
+  // say plainly when nothing downstream can move because no model is picked.
+  const nSet=Object.keys(window._flagSettings||{}).length;
+  const noModel=!$('model').value.trim();
+  $('profile_msg').innerHTML='<span class="muted">applied <b>'+esc(p.name)+'</b> &middot; '
+    +nSet+' setting'+(nSet===1?'':'s')+' written to the rows below'
+    +((p.info&&p.info.length)?' &middot; '+esc(p.info.join(' | ')):'')+'</span>'
+    +(noModel?'<div class="rev-error">No model selected, so the plan and the '
+      +'per-card bars cannot be recomputed yet. Pick a model above &mdash; the '
+      +'preset stays applied.</div>':'');
   // Sync the slider pairs to the applied values, then snapshot for the
   // changed-from-preset markers (the snapshot IS the applied state).
   const sl=$('sv_ctx_slider');
@@ -7575,6 +8350,7 @@ function benchInit(){
   if(t && t.endpoint && !$('bn_endpoint').value.trim())
     $('bn_endpoint').value=t.endpoint.replace(/^https?:\/\//,'');
   benchProbe(true);  // catalog + presets only; nothing probed without endpoint
+  benchHistory();
 }
 function benchUseMonitor(){
   const t=window._lastTarget;
@@ -7608,33 +8384,138 @@ async function benchProbe(catalogOnly){
     renderBenchTests();
   }catch(e){ $('bn_caps').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
 }
+// Which tests are selected. Held in one set rather than read back out of
+// the DOM, so a re-gate (which re-renders the buttons) cannot silently drop
+// a selection the user made.
+window._benchSel=window._benchSel||new Set();
+function benchGated(t){ return t.gate_status!=null; }
 function renderBenchTests(){
   const d=window._benchCatalog; if(!d) return;
   $('bn_presets').innerHTML='<span class="muted">presets:</span> '
-    +Object.keys(d.presets).map(p=>'<button class="mini secondary" onclick="benchPreset(\''+p+'\')">'+esc(p)+'</button>').join(' ');
-  let h='';
+    +Object.keys(d.presets).map(p=>'<button class="mini secondary" onclick="benchPreset(\''+p+'\')">'+esc(p)+'</button>').join(' ')
+    +' <button class="mini secondary" onclick="benchSelectAll(true)">all runnable</button>'
+    +' <button class="mini secondary" onclick="benchSelectAll(false)">none</button>';
+  let h='<div style="display:flex;flex-wrap:wrap;gap:var(--s2)">';
   for(const t of d.tests){
-    const gated=t.gate_status!=null;  // blocked / skip: greyed with the reason
-    h+='<div style="margin:.12rem 0;opacity:'+(gated?'.45':'1')+'" title="'
-      +esc(t.gate_reason||t.expected_fail_note||'')+'">'
-      +'<label style="display:flex;gap:.35rem;align-items:flex-start;margin:0">'
-      +'<input type="checkbox" id="bnt_'+t.test_id+'" style="width:auto;margin-top:.15rem" '+(gated?'disabled':'')+'>'
-      +'<span>'+t.test_id+'. '+esc(t.label)
-      +(t.optional?' <span class="muted">(opt)</span>':'')
-      +(t.crash_prone?' <span style="color:#e3a008">(crash-prone, runs last)</span>':'')
-      +(gated?' <span class="muted">['+esc(t.gate_status)+': '+esc(t.gate_reason||'')+']</span>':'')
-      +(!gated&&t.expected_fail_note?' <span style="color:#e3a008">[expected-fail: '+esc(t.expected_fail_note)+']</span>':'')
-      +'</span></label></div>';
+    const gated=benchGated(t);
+    const on=!gated&&window._benchSel.has(t.test_id);
+    const why=gated?(t.gate_status+': '+(t.gate_reason||''))
+                   :(t.expected_fail_note?('expected-fail: '+t.expected_fail_note):'');
+    h+='<button type="button" id="bnt_'+t.test_id+'" class="testbtn'
+      +(on?' on':'')+(gated?' gated':'')+'"'+(gated?' disabled':'')
+      +' onclick="benchToggle('+t.test_id+')" title="'+esc(why)+'">'
+      +'<span class="tb-n">'+t.test_id+'</span>'
+      +'<span class="tb-l">'+esc(t.label)+'</span>'
+      +(t.crash_prone?'<span class="tb-t" title="runs last">crash-prone</span>':'')
+      +(t.optional?'<span class="tb-t">optional</span>':'')
+      +(gated?'<span class="tb-t warn">'+esc(t.gate_status)+'</span>':'')
+      +(!gated&&t.expected_fail_note?'<span class="tb-t warn">expected-fail</span>':'')
+      +'</button>';
   }
+  h+='</div>';
   $('bn_tests').innerHTML=h;
+  benchSelNote();
+}
+function benchSelNote(){
+  const n=window._benchSel.size;
+  const el=$('bn_sel_note'); if(!el) return;
+  el.textContent=n?(n+' test'+(n===1?'':'s')+' selected'):'nothing selected yet';
+}
+function benchToggle(id){
+  if(window._benchSel.has(id)) window._benchSel.delete(id);
+  else window._benchSel.add(id);
+  const b=$('bnt_'+id); if(b) b.classList.toggle('on', window._benchSel.has(id));
+  benchSelNote();
+}
+function benchSelectAll(on){
+  const d=window._benchCatalog; if(!d) return;
+  window._benchSel=new Set();
+  if(on) for(const t of d.tests) if(!benchGated(t)) window._benchSel.add(t.test_id);
+  renderBenchTests();
 }
 function benchPreset(p){
   const d=window._benchCatalog; if(!d) return;
   const ids=d.presets[p]||[];
-  for(const t of d.tests){
-    const el=$('bnt_'+t.test_id);
-    if(el && !el.disabled) el.checked=ids.includes(t.test_id);
-  }
+  window._benchSel=new Set();
+  for(const t of d.tests)
+    if(!benchGated(t) && ids.includes(t.test_id)) window._benchSel.add(t.test_id);
+  renderBenchTests();
+}
+// ---- run history ----------------------------------------------------------
+function benchHistoryModel(){
+  return $('bn_hist_all').checked ? '' : ($('bn_model').value.trim()||'');
+}
+async function benchHistory(){
+  const m=benchHistoryModel();
+  try{
+    const d=await (await fetch('/api/bench_history'+(m?('?model='+encodeURIComponent(m)):''))).json();
+    if(!d.ok){ setHTML($('bn_history'),'<span class="reasons">'+esc(d.error||'error')+'</span>'); return; }
+    $('bn_hist_note').textContent=(d.runs.length||0)+' run'
+      +((d.runs.length===1)?'':'s')+' in '+d.root;
+    if(!d.runs.length){
+      setHTML($('bn_history'), m
+        ? 'no runs recorded for this model yet.'
+        : 'no runs recorded yet.');
+      return;
+    }
+    let h='<table><tr><th>when</th><th>model</th><th>tests</th>'
+      +'<th>pass</th><th>fail</th><th>warn</th><th>skip</th>'
+      +'<th>exchanges</th><th></th></tr>';
+    for(const r of d.runs){
+      const c=r.counts||{};
+      const when=new Date((r.started_at||0)*1000).toLocaleString();
+      h+='<tr><td>'+esc(when)+'</td>'
+        +'<td>'+esc(r.model||'(unnamed)')+'</td>'
+        +'<td>'+(r.n_tests||0)+'</td>'
+        +'<td class="st-pass">'+(c.pass||0)+'</td>'
+        +'<td class="st-fail">'+(c.fail||0)+'</td>'
+        +'<td class="st-warn">'+(c.warn||0)+'</td>'
+        +'<td class="st-skip">'+(c.skip||0)+'</td>'
+        +'<td>'+(r.n_exchanges||0)+'</td>'
+        +'<td><button class="mini secondary" onclick="benchShowRun(\''+esc(r.run_id)+'\')">view</button> '
+        +'<a class="pill" href="/api/bench_run_detail?download=1&run_id='
+        +encodeURIComponent(r.run_id)+'" download>download</a></td></tr>';
+    }
+    h+='</table><div id="bn_run_detail"></div>';
+    setHTML($('bn_history'), h);
+  }catch(e){ setHTML($('bn_history'),'<span class="reasons">'+esc(''+e)+'</span>'); }
+}
+// The whole point of storing the transcript: read back what was asked and
+// what the model answered, per test, without leaving the page.
+async function benchShowRun(id){
+  const box=$('bn_run_detail'); if(!box) return;
+  setHTML(box,'<span class="muted">loading run&hellip;</span>');
+  try{
+    const d=await (await fetch('/api/bench_run_detail?run_id='+encodeURIComponent(id))).json();
+    if(!d.ok){ setHTML(box,'<span class="reasons">'+esc(d.error||'error')+'</span>'); return; }
+    const r=d.run;
+    let h='<div class="cardblock"><div class="sxs-h">run '+esc(r.run_id)+'</div>'
+      +'<div class="muted">'+esc(r.model||'(unnamed)')+' &middot; '+esc(r.endpoint||'')
+      +' &middot; '+(r.duration_s||0)+' s'
+      +(r.error?' &middot; <span class="st-fail">ended with: '+esc(r.error)+'</span>':'')
+      +'</div>';
+    for(const t of (r.results||[])){
+      h+='<div style="margin-top:var(--s2)"><b>'+t.test_id+'. '+esc(t.label||'')+'</b> '
+        +'<span class="st-'+esc(t.status||'skip')+'">'+esc(t.status||'')+'</span>'
+        +(t.reason?' <span class="muted">'+esc(t.reason)+'</span>':'')+'</div>';
+      const ex=(r.transcript||[]).filter(e=>e.test_id===t.test_id);
+      for(const e of ex){
+        const req=(((e.request||{}).messages)||[])
+          .map(m=>(m.role||'?')+': '+(typeof m.content==='string'?m.content:JSON.stringify(m.content)))
+          .join('\n\n');
+        h+='<details style="margin:var(--s1) 0"><summary class="muted">'
+          +'exchange &middot; HTTP '+(e.http_code==null?'--':e.http_code)
+          +(e.wall_ms!=null?(' &middot; '+Math.round(e.wall_ms)+' ms'):'')+'</summary>'
+          +'<div class="muted" style="margin-top:var(--s1)">request</div>'
+          +'<pre style="max-height:220px;overflow:auto">'+esc(req||JSON.stringify(e.request||{},null,1))+'</pre>'
+          +'<div class="muted">answer</div>'
+          +'<pre style="max-height:280px;overflow:auto">'+esc(e.answer==null?'(none)':e.answer)+'</pre>'
+          +'</details>';
+      }
+    }
+    h+='</div>';
+    setHTML(box,h);
+  }catch(e){ setHTML(box,'<span class="reasons">'+esc(''+e)+'</span>'); }
 }
 // ===========================================================================
 // Benchmark window.
@@ -7708,7 +8589,7 @@ async function benchRun(){
   const endpoint=$('bn_endpoint').value.trim();
   if(!endpoint){ setHTML($('bn_out'),'<span class="reasons">endpoint required</span>'); return; }
   const selected=[];
-  if(d) for(const t of d.tests){ const el=$('bnt_'+t.test_id); if(el&&el.checked) selected.push(t.test_id); }
+  if(d) for(const t of d.tests) if(window._benchSel.has(t.test_id)) selected.push(t.test_id);
   if(!selected.length){ setHTML($('bn_out'),'<span class="reasons">select at least one test (or a preset).</span>'); return; }
   window._benchResults=[];
   window._benchSelected=selected.length;
@@ -7977,5 +8858,7 @@ showTab('landing');
 # inlined. INDEX_HTML stays a plain string constant: the handler serves it
 # verbatim and the tests read it directly, exactly as before.
 INDEX_HTML = _INDEX_TEMPLATE.replace(
-    "/*__VENDOR_MORPHDOM__*/", _vendored_js("morphdom-umd.min.js")
+    "/*__VENDOR_MORPHDOM__*/", _vendored_asset("morphdom-umd.min.js")
+).replace(
+    "/*__VENDOR_NORMALIZE__*/", _vendored_asset("modern-normalize.css")
 )

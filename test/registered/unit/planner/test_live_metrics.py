@@ -380,3 +380,37 @@ class TestEndpointAndConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestConcurrencyGauges(unittest.TestCase):
+    """Per-session rates need the concurrency gauges: a server-wide token rate
+    says nothing about what one request experiences."""
+
+    def _with_reqs(self, running=None, queued=None):
+        m = _metrics(prompt=100, gen=100)
+        extra = []
+        if running is not None:
+            extra.append('sglang:num_running_reqs{model="m"} %s' % running)
+        if queued is not None:
+            extra.append('sglang:num_queue_reqs{model="m"} %s' % queued)
+        return m + ("\n".join(extra) + "\n" if extra else "")
+
+    def test_gauges_are_carried_into_the_snapshot(self):
+        snap, _ = snapshot("x", None, nvml=_rig(),
+                           metrics_text=self._with_reqs(running=4, queued=2),
+                           now=0.0)
+        self.assertEqual(snap["num_running_reqs"], 4.0)
+        self.assertEqual(snap["num_queue_reqs"], 2.0)
+
+    def test_absent_gauge_is_none_not_zero(self):
+        # "no concurrency metric" and "nothing running" must stay tellable
+        # apart -- the UI shows n/a for one and 0 for the other.
+        snap, _ = snapshot("x", None, nvml=_rig(),
+                           metrics_text=self._with_reqs(), now=0.0)
+        self.assertIsNone(snap["num_running_reqs"])
+        self.assertIsNone(snap["num_queue_reqs"])
+
+    def test_zero_running_is_reported_as_zero(self):
+        snap, _ = snapshot("x", None, nvml=_rig(),
+                           metrics_text=self._with_reqs(running=0), now=0.0)
+        self.assertEqual(snap["num_running_reqs"], 0.0)

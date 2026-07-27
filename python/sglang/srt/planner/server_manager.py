@@ -94,17 +94,87 @@ from sglang.srt.planner.energy import (
 from sglang.srt.uneven_perf import _read_gguf_metadata
 
 # ---------------------------------------------------------------------------
-# Default model roots scanned by discover_models(). ``SGLANG_MODEL_ROOTS``
-# (colon-separated directories) overrides the generic defaults.
+# Model roots scanned by discover_models().
+#
+# Three layers, most specific first:
+#   1. ``set_model_roots()``  -- the ``--model-root`` CLI flag (repeatable);
+#   2. ``SGLANG_PLANNER_MODEL_ROOTS`` / ``SGLANG_MODEL_ROOTS`` (colon-separated);
+#   3. the generic fallback (HF hub cache + ./models).
+#
+# Resolved on every call rather than frozen at import time, so a root set after
+# the module is imported (CLI parsing happens after the import) still takes
+# effect.
 # ---------------------------------------------------------------------------
+#: Fallback when neither an explicit override nor an env var is set.
+GENERIC_MODEL_ROOTS: Tuple[str, ...] = ("~/.cache/huggingface/hub", "./models")
+
+#: Process-wide override installed by ``--model-root``. None = not set.
+_MODEL_ROOTS_OVERRIDE: Optional[Tuple[str, ...]] = None
+
+
+def set_model_roots(roots: Optional[Sequence[str]]) -> None:
+    """Install the process-wide model roots (the ``--model-root`` flag). Passing
+    None/empty clears the override and falls back to env / generic defaults."""
+    global _MODEL_ROOTS_OVERRIDE
+    cleaned = tuple(str(r).strip() for r in (roots or []) if str(r).strip())
+    _MODEL_ROOTS_OVERRIDE = cleaned or None
+
+
 def _model_roots_from_env() -> Tuple[str, ...]:
-    env = os.environ.get("SGLANG_MODEL_ROOTS")
-    if env:
-        return tuple(p for p in env.split(os.pathsep) if p)
-    return ("~/.cache/huggingface/hub", "./models")
+    for var in ("SGLANG_PLANNER_MODEL_ROOTS", "SGLANG_MODEL_ROOTS"):
+        env = os.environ.get(var)
+        if env:
+            return tuple(p for p in env.split(os.pathsep) if p)
+    return GENERIC_MODEL_ROOTS
 
 
-DEFAULT_MODEL_ROOTS: Tuple[str, ...] = _model_roots_from_env()
+def model_roots() -> Tuple[str, ...]:
+    """The roots discover_models() scans when no explicit ``roots=`` is given."""
+    if _MODEL_ROOTS_OVERRIDE:
+        return _MODEL_ROOTS_OVERRIDE
+    return _model_roots_from_env()
+
+
+class _DefaultModelRoots(tuple):
+    """Backwards-compatible view of :func:`model_roots`.
+
+    Older call sites read ``DEFAULT_MODEL_ROOTS`` as a plain tuple constant.
+    Freezing it at import time is exactly the bug this replaces, so the name
+    stays but resolves live on every access.
+    """
+
+    def __new__(cls):
+        return super().__new__(cls)
+
+    def _live(self) -> Tuple[str, ...]:
+        return model_roots()
+
+    def __iter__(self):
+        return iter(self._live())
+
+    def __len__(self):
+        return len(self._live())
+
+    def __getitem__(self, i):
+        return self._live()[i]
+
+    def __contains__(self, x):
+        return x in self._live()
+
+    def __eq__(self, other):
+        return tuple(self._live()) == other
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return hash(self._live())
+
+    def __repr__(self):
+        return repr(self._live())
+
+
+DEFAULT_MODEL_ROOTS = _DefaultModelRoots()
 
 #: llama.cpp ``LLAMA_FTYPE`` enum -> human quant tag (config-authoritative GGUF
 #: quant, read from the GGUF header ``general.file_type``, NOT the file name).
@@ -335,15 +405,22 @@ def discover_models(
     ``max_depth`` allows descending one level into org-style subdirs
     (``unsloth/<model>``)."""
     root_list: List[str] = []
-    for r in (list(roots) if roots is not None else list(DEFAULT_MODEL_ROOTS)):
+    for r in (list(roots) if roots is not None else list(model_roots())):
         root_list.append(os.path.expanduser(r))
     for r in (extra_roots or []):
         root_list.append(os.path.expanduser(r))
 
     found: List[DiscoveredModel] = []
     seen_paths: set = set()
+    seen_dirs: set = set()
 
-    def scan(dir_path: str, depth: int):
+    def scan(dir_path: str, depth: int, prefix: str):
+        # Guard against a root listed twice and against symlinked self-loops
+        # (``<root>/models-cache -> <root>``): a directory is descended once.
+        real_dir = os.path.realpath(dir_path)
+        if real_dir in seen_dirs:
+            return
+        seen_dirs.add(real_dir)
         try:
             entries = sorted(os.listdir(dir_path))
         except OSError:
@@ -367,17 +444,21 @@ def discover_models(
 
             if real in seen_paths:
                 continue
-            m = _classify_model_dir(name, entry)
+            # Nested dirs keep their sub-path in the display name, so two
+            # distinct checkpoints with the same basename (``unsloth/X`` vs
+            # ``models-cache/X``) stay tellable apart instead of showing up
+            # twice under one name.
+            m = _classify_model_dir(prefix + name, entry)
             if m is not None:
                 seen_paths.add(real)
                 found.append(m)
             elif depth < max_depth:
                 # Not a model dir itself -> maybe an org dir of sub-models.
-                scan(entry, depth + 1)
+                scan(entry, depth + 1, prefix + name + "/")
 
     for root in root_list:
         if os.path.isdir(root):
-            scan(root, 0)
+            scan(root, 0, "")
     return found
 
 
@@ -401,6 +482,15 @@ class LaunchSettings:
     rank_gpu_memory_mib: Optional[List[int]] = None
     kv_cache_dtype: str = "auto"
     mem_fraction_static: Optional[float] = None
+    #: Loader / quantisation identity. A GGUF checkpoint needs its own loader
+    #: and, because the .gguf file carries no HF tokenizer, a tokenizer path
+    #: pointing at the model DIR. Rewriting --model-path onto the .gguf file
+    #: alone is not a GGUF boot.
+    tokenizer_path: Optional[str] = None
+    load_format: Optional[str] = None
+    quantization: Optional[str] = None
+    #: Fork flag: per-rank reserve carved out before the KV pool is sized.
+    rank_auto_reserve_mib: Optional[int] = None
     context_length: int = 8192
     max_running_requests: int = 16
     max_num_seqs: Optional[int] = None
@@ -409,6 +499,7 @@ class LaunchSettings:
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
+    speculative_draft_model_path: Optional[str] = None
     chat_template: Optional[str] = None
     tool_call_parser: Optional[str] = None
     reasoning_parser: Optional[str] = None
@@ -426,6 +517,13 @@ class LaunchSettings:
 
     # -- validation ------------------------------------------------------
     def validate(self) -> "LaunchSettings":
+        # Without this the launcher happily booted a child with an empty
+        # --model-path, which dies seconds later in the child's own argument
+        # parsing -- far away from the request that caused it.
+        if not (self.model_path or "").strip():
+            raise ValueError(
+                "model_path is required (pass the model dir, the .gguf file, "
+                "or an HF id)")
         if self.tp_size < 1:
             raise ValueError(f"tp_size must be >= 1 (got {self.tp_size})")
         if self.port <= 0 or self.port > 65535:
@@ -468,6 +566,27 @@ class LaunchSettings:
         extra: List[str] = []
         if self.mem_fraction_static is not None:
             extra += ["--mem-fraction-static", str(self.mem_fraction_static)]
+        # Loader identity. For a GGUF model the defaults are derived rather
+        # than demanded: the loader is gguf and the tokenizer comes from the
+        # model DIR, because the .gguf file has no HF tokenizer beside it. An
+        # explicit value always wins over the derived one.
+        load_format = self.load_format
+        tokenizer_path = self.tokenizer_path
+        if self.format == "gguf":
+            load_format = load_format or "gguf"
+            if not tokenizer_path and os.path.isdir(self.model_path):
+                tokenizer_path = self.model_path
+        if load_format:
+            extra += ["--load-format", load_format]
+        if tokenizer_path:
+            extra += ["--tokenizer-path", tokenizer_path]
+        if self.quantization:
+            extra += ["--quantization", self.quantization]
+        if self.rank_auto_reserve_mib is not None:
+            extra += ["--rank-auto-reserve-mib", str(self.rank_auto_reserve_mib)]
+        if self.speculative_draft_model_path:
+            extra += ["--speculative-draft-model-path",
+                      self.speculative_draft_model_path]
         if self.max_num_seqs is not None:
             extra += ["--max-running-requests", str(self.max_num_seqs)]
         if self.chat_template:

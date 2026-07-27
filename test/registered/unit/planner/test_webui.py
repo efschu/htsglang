@@ -1157,6 +1157,8 @@ class TestMonitorTargetResolution(CustomTestCase):
 
     def test_detect_endpoint_payload_probes_ports(self):
         with mock.patch.object(
+            webui, "_tcp_open", side_effect=lambda h, p, timeout=0.15: p == 30100
+        ), mock.patch.object(
             webui, "_probe_sglang",
             side_effect=lambda u, timeout=0.8: u.endswith(":30100"),
         ):
@@ -1164,6 +1166,45 @@ class TestMonitorTargetResolution(CustomTestCase):
         self.assertTrue(d["ok"])
         self.assertEqual(d["endpoint"], "http://127.0.0.1:30100")
         self.assertIn(30100, d["probed"])
+
+    def test_detect_endpoint_sweeps_the_whole_sglang_range(self):
+        # The 'detect' button must cover the documented 30000-30100 range, not
+        # just a three-port sample.
+        with mock.patch.object(webui, "_tcp_open", return_value=False):
+            d = webui.detect_endpoint_payload()
+        for p in (30000, 30017, 30100, 8000):
+            self.assertIn(p, d["probed"])
+        self.assertIsNone(d["endpoint"])
+        self.assertFalse(d["explicit"])
+
+    def test_detect_endpoint_tcp_prescan_gates_the_http_probe(self):
+        # A closed port must never reach the (expensive) HTTP probe.
+        with mock.patch.object(webui, "_tcp_open", return_value=False), \
+                mock.patch.object(webui, "_probe_sglang") as probe:
+            webui.detect_endpoint_payload()
+        probe.assert_not_called()
+
+    def test_detect_endpoint_explicit_target_skips_the_sweep(self):
+        with mock.patch.object(webui, "_tcp_open") as scan, \
+                mock.patch.object(webui, "_probe_sglang", return_value=True):
+            d = webui.detect_endpoint_payload({"endpoint": "1.2.3.4:31000"})
+        scan.assert_not_called()
+        self.assertTrue(d["explicit"])
+        self.assertEqual(d["endpoint"], "http://1.2.3.4:31000")
+        self.assertEqual(d["probed"], [31000])
+
+    def test_detect_endpoint_explicit_target_unreachable_reports_why(self):
+        with mock.patch.object(webui, "_probe_sglang", return_value=False):
+            d = webui.detect_endpoint_payload({"endpoint": "host-x:31000"})
+        self.assertIsNone(d["endpoint"])
+        self.assertIn("host-x:31000", d["error"])
+
+    def test_split_host_port_forms(self):
+        self.assertEqual(webui._split_host_port("1.2.3.4:31000"), ("1.2.3.4", 31000))
+        self.assertEqual(
+            webui._split_host_port("http://1.2.3.4:31000"), ("1.2.3.4", 31000))
+        self.assertEqual(webui._split_host_port("1.2.3.4"), ("1.2.3.4", 30000))
+        self.assertEqual(webui._split_host_port(""), (None, None))
 
 
 class TestProfileLaunchWiring(CustomTestCase):
@@ -1270,7 +1311,7 @@ class TestBenchRoutes(CustomTestCase):
         ]
 
         def fake_run(endpoint, model, selected=None, capabilities=None,
-                     preset=None, force=False):
+                     preset=None, force=False, transcript_sink=None):
             yield from results
 
         with mock.patch(
@@ -1295,7 +1336,7 @@ class TestBenchRoutes(CustomTestCase):
         captured = {}
 
         def fake_run(endpoint, model, selected=None, capabilities=None,
-                     preset=None, force=False):
+                     preset=None, force=False, transcript_sink=None):
             captured["caps"] = capabilities
             captured["force"] = force
             return iter(())
@@ -1425,7 +1466,7 @@ class TestV3HttpRoutes(WebUIFixture):
         ]
 
         def fake_run(endpoint, model, selected=None, capabilities=None,
-                     preset=None, force=False):
+                     preset=None, force=False, transcript_sink=None):
             yield from results
 
         with mock.patch(
@@ -1464,13 +1505,38 @@ class TestV3HttpRoutes(WebUIFixture):
         self.assertIn("Measured metrics", d["report"])
 
     def test_detect_endpoint_route(self):
-        with mock.patch.object(webui, "_probe_sglang", return_value=False):
+        with mock.patch.object(webui, "_tcp_open", return_value=False):
             with urllib.request.urlopen(
                 f"http://127.0.0.1:{self.port}/api/detect_endpoint", timeout=10
             ) as r:
                 d = json.loads(r.read())
         self.assertTrue(d["ok"])
         self.assertIsNone(d["endpoint"])
+
+    def test_detect_routes_answer_post_too(self):
+        # The page's detect button POSTs a body (explicit host:port / port
+        # list); a GET-only route answered {"error": "not found"}.
+        with mock.patch.object(webui, "_probe_sglang", return_value=True):
+            with self._post_raw(
+                "/api/detect_endpoint", {"endpoint": "1.2.3.4:31000"}
+            ) as r:
+                d = json.loads(r.read())
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["endpoint"], "http://1.2.3.4:31000")
+        with self._post_raw("/api/detect", {}) as r:
+            d = json.loads(r.read())
+        self.assertIn("ok", d)
+        self.assertNotIn("error", d)
+
+    def test_detect_endpoint_route_accepts_query_params(self):
+        with mock.patch.object(webui, "_probe_sglang", return_value=True):
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}"
+                "/api/detect_endpoint?endpoint=1.2.3.4:31000",
+                timeout=10,
+            ) as r:
+                d = json.loads(r.read())
+        self.assertEqual(d["endpoint"], "http://1.2.3.4:31000")
 
     def test_live_snapshot_route_accepts_endpoint_query(self):
         fake_snap = (
@@ -2082,8 +2148,11 @@ class TestColocationControls(CustomTestCase):
         # applyProfile refreshes the co-location controls (reverse-populate,
         # never redistribute) right after filling the flag surface.
         html = webui.INDEX_HTML
+        # Both anchors are searched FROM applyProfile: the same two calls also
+        # appear in the running-config prefill earlier in the file, and this
+        # test is about the order inside applyProfile.
         i_apply = html.index("function applyProfile(")
-        i_snap = html.index("window._presetBase=presetSnapshot()")
+        i_snap = html.index("window._presetBase=presetSnapshot()", i_apply)
         i_colo = html.index("updateColoUI()", i_apply)
         self.assertLess(i_apply, i_colo)
         self.assertLess(i_colo, i_snap)
@@ -2260,6 +2329,26 @@ class TestVendoredAssets(CustomTestCase):
         self.assertTrue(os.path.exists(lic), lic)
         with open(lic, encoding="utf-8") as f:
             self.assertIn("MIT License", f.read())
+
+    def test_normalize_is_vendored_with_its_licence(self):
+        d = os.path.join(os.path.dirname(webui.__file__), "assets")
+        css = os.path.join(d, "modern-normalize.css")
+        lic = os.path.join(d, "modern-normalize.LICENSE")
+        self.assertTrue(os.path.exists(css), css)
+        self.assertTrue(os.path.exists(lic), lic)
+        with open(lic, encoding="utf-8") as f:
+            self.assertIn("MIT License", f.read())
+        html = webui.INDEX_HTML
+        self.assertIn("modern-normalize v3", html)
+        self.assertNotIn("/*__VENDOR_NORMALIZE__*/", html)
+
+    def test_design_tokens_are_defined_once(self):
+        # Every surface/spacing/state value comes from the :root token block,
+        # so a colour is never spelled out twice in the page.
+        html = webui.INDEX_HTML
+        for tok in ("--bg-canvas", "--bg-panel", "--bd-weak", "--fg-muted",
+                    "--accent", "--ok", "--warn", "--bad", "--s2", "--t-md"):
+            self.assertIn(tok + ":", html, tok)
 
     def test_page_inlines_it_and_links_nothing_external(self):
         html = webui.INDEX_HTML
@@ -2969,3 +3058,216 @@ class TestDiscussionUi(CustomTestCase):
         js = _index_script()
         i = js.index("async function discussionSubmit(")
         self.assertIn("confirm(", js[i:i + 600])
+
+
+class TestObservabilityIsNotOptional(CustomTestCase):
+    """A server booted from this dashboard is a server that can be watched."""
+
+    def test_argv_override_still_gets_enable_metrics(self):
+        # The full-argv path is the one place a caller could otherwise decide
+        # to boot a blind server.
+        out = webui._force_enable_metrics(["python", "-m", "sglang.launch_server"])
+        self.assertIn("--enable-metrics", out)
+
+    def test_not_added_twice(self):
+        argv = ["python", "--enable-metrics"]
+        self.assertEqual(webui._force_enable_metrics(argv).count("--enable-metrics"), 1)
+
+    def test_none_stays_none(self):
+        # None means "no override": LaunchSettings.launch_command() appends the
+        # flag itself, and that path is already covered.
+        self.assertIsNone(webui._force_enable_metrics(None))
+
+    def test_launch_settings_command_has_it(self):
+        from sglang.srt.planner.server_manager import LaunchSettings
+
+        self.assertIn("--enable-metrics",
+                      LaunchSettings(model_path="/m").launch_command())
+
+    def test_page_names_the_no_metrics_state(self):
+        html = webui.INDEX_HTML
+        self.assertIn("Server started without --enable-metrics", html)
+        self.assertIn("noMetricsBanner", html)
+
+    def test_detect_reports_whether_metrics_are_served(self):
+        with mock.patch.object(webui, "_probe_sglang", return_value=True), \
+                mock.patch.object(webui, "_serves_metrics", return_value=False):
+            d = webui.detect_endpoint_payload({"endpoint": "1.2.3.4:30000"})
+        self.assertEqual(d["endpoint"], "http://1.2.3.4:30000")
+        self.assertIs(d["metrics"], False)
+
+
+class TestLaunchPayloadCompleteness(CustomTestCase):
+    """Every field LaunchSettings models must be reachable from the payload --
+    otherwise the API can only express a subset of the configurations the
+    launcher supports, and a full-argv override becomes the only real path."""
+
+    def test_spec_depth_loader_and_reserve_survive_the_mapper(self):
+        ls = webui._launch_settings_from_payload({
+            "model": "/m", "format": "gguf", "gguf_variant": "x.gguf",
+            "speculative_num_steps": 3, "speculative_eagle_topk": 1,
+            "speculative_num_draft_tokens": 4,
+            "speculative_draft_model_path": "/draft",
+            "mem_fraction_static": 0.85, "rank_auto_reserve_mib": 2700,
+            "tokenizer_path": "/tok", "load_format": "gguf",
+            "quantization": "gguf", "extra_flags": ["--enable-torch-compile"],
+        })
+        self.assertEqual(ls.speculative_num_steps, 3)
+        self.assertEqual(ls.speculative_eagle_topk, 1)
+        self.assertEqual(ls.speculative_num_draft_tokens, 4)
+        self.assertEqual(ls.speculative_draft_model_path, "/draft")
+        self.assertEqual(ls.mem_fraction_static, 0.85)
+        self.assertEqual(ls.rank_auto_reserve_mib, 2700)
+        self.assertEqual(ls.tokenizer_path, "/tok")
+        self.assertEqual(ls.load_format, "gguf")
+        self.assertEqual(ls.quantization, "gguf")
+        self.assertEqual(ls.extra_flags, ["--enable-torch-compile"])
+
+    def test_blank_values_stay_unset(self):
+        ls = webui._launch_settings_from_payload({
+            "model": "/m", "speculative_num_steps": "",
+            "mem_fraction_static": "", "rank_auto_reserve_mib": "",
+        })
+        self.assertIsNone(ls.speculative_num_steps)
+        self.assertIsNone(ls.mem_fraction_static)
+        self.assertIsNone(ls.rank_auto_reserve_mib)
+
+
+class TestBenchTabAndHistory(CustomTestCase):
+    """The tests are the tab's content, and a finished run is reviewable."""
+
+    def test_tests_are_buttons_not_checkboxes(self):
+        html = webui.INDEX_HTML
+        self.assertIn('class="testbtn', html)
+        self.assertIn("function benchToggle(", html)
+        self.assertIn("window._benchSel", html)
+        # the old per-test checkbox markup is gone
+        self.assertNotIn('<input type="checkbox" id="bnt_', html)
+
+    def test_selection_survives_a_regate(self):
+        # The selection lives in one set, not in the DOM, so re-rendering the
+        # buttons after a gate change cannot silently drop it.
+        html = webui.INDEX_HTML
+        i_render = html.index("function renderBenchTests(")
+        i_set = html.index("window._benchSel.has(t.test_id)", i_render)
+        self.assertGreater(i_set, i_render)
+
+    def test_history_ui_and_download_link(self):
+        html = webui.INDEX_HTML
+        self.assertIn("/api/bench_history", html)
+        self.assertIn("/api/bench_run_detail?download=1", html)
+        self.assertIn("function benchShowRun(", html)
+
+    def test_graphs_are_columns_not_a_polyline(self):
+        # A polyline across two samples drew a stroke over half an empty
+        # field and interpolated between samples seconds apart.
+        html = webui.INDEX_HTML
+        self.assertIn("function _columns(", html)
+        self.assertIn("<rect x=", html)
+        self.assertNotIn("<polyline", html)
+
+
+class TestBenchHistoryRoutes(CustomTestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="bhroute_")
+        self._env = mock.patch.dict(
+            os.environ, {"SGLANG_PLANNER_BENCH_HISTORY": self.tmp})
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_run_is_saved_with_its_transcript_and_listed(self):
+        from sglang.srt.planner import bench_history
+
+        class _Ctx:
+            transcript = [{"test_id": 1, "request": {"messages": []},
+                           "answer": "Paris", "http_code": 200}]
+
+        def fake_run(endpoint, model, selected=None, capabilities=None,
+                     preset=None, force=False, transcript_sink=None):
+            if transcript_sink is not None:
+                transcript_sink.append(_Ctx())
+            yield {"test_id": 1, "label": "Basic", "status": "pass",
+                   "metric": {"name": "none", "value": None}, "detail": {},
+                   "deps": {}}
+
+        with mock.patch("sglang.srt.planner.bench_suite.run_suite",
+                        side_effect=fake_run):
+            evs = list(webui.bench_run_events(
+                {"endpoint": "127.0.0.1:30000", "model": "/m/Model-A"}))
+        run_id = evs[-1]["run_id"]
+        self.assertIsNotNone(run_id)
+        listed = webui.bench_history_payload({"model": "/m/Model-A"})
+        self.assertTrue(listed["ok"])
+        self.assertEqual(len(listed["runs"]), 1)
+        self.assertEqual(listed["runs"][0]["n_exchanges"], 1)
+        detail = webui.bench_run_payload({"run_id": run_id})
+        self.assertTrue(detail["ok"])
+        self.assertEqual(detail["run"]["transcript"][0]["answer"], "Paris")
+        self.assertEqual(bench_history.load_run(run_id)["model"], "/m/Model-A")
+
+    def test_a_crashed_run_is_still_stored(self):
+        # The transcript up to the failure is usually the only record of what
+        # killed it.
+        def boom(endpoint, model, selected=None, capabilities=None,
+                 preset=None, force=False, transcript_sink=None):
+            yield {"test_id": 1, "label": "Basic", "status": "pass",
+                   "metric": {"name": "none", "value": None}, "detail": {},
+                   "deps": {}}
+            raise RuntimeError("engine died")
+
+        with mock.patch("sglang.srt.planner.bench_suite.run_suite",
+                        side_effect=boom):
+            evs = list(webui.bench_run_events(
+                {"endpoint": "127.0.0.1:30000", "model": "/m/Model-B"}))
+        self.assertEqual(evs[-1]["event"], "error")
+        runs = webui.bench_history_payload({"model": "/m/Model-B"})["runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["n_tests"], 1)
+
+    def test_detail_requires_a_run_id(self):
+        d = webui.bench_run_payload({})
+        self.assertFalse(d["ok"])
+        self.assertIn("run_id", d["error"])
+
+
+class TestLiveBannerStates(CustomTestCase):
+    """Three states, and the panel is in one of them after EVERY poll.
+
+    A warning that outlives the server it was about is the failure mode here,
+    so the structural guarantee is what gets tested: the panel is not inside
+    the "a server is running" container, and the not-running branch of the
+    poll rewrites it.
+    """
+
+    def test_panel_is_outside_the_running_container(self):
+        html = webui.INDEX_HTML
+        i_panel = html.index('<fieldset id="live_panel">')
+        i_live = html.index('<div id="landing_live"')
+        self.assertLess(i_panel, i_live,
+                        "live_panel must not live inside landing_live")
+
+    def test_not_running_branch_rerenders_the_panel(self):
+        html = webui.INDEX_HTML
+        i_branch = html.index("if(!d || !d.running || !d.snapshot){")
+        i_render = html.index("renderLivePanel(null, d)", i_branch)
+        i_hide = html.index("$('landing_none').style.display=''", i_branch)
+        self.assertLess(i_render, i_hide + 1)
+
+    def test_the_three_states_are_named(self):
+        html = webui.INDEX_HTML
+        self.assertIn("No inference server running", html)
+        self.assertIn("Server started without --enable-metrics", html)
+        self.assertIn("function targetLabel(", html)
+
+    def test_no_metrics_banner_names_model_and_port(self):
+        html = webui.INDEX_HTML
+        i = html.index("function targetLabel(")
+        seg = html[i:i + 900]
+        self.assertIn("served_model_name", seg)
+        self.assertIn("' @ :'", seg)
+        self.assertIn("pid", seg)

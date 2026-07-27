@@ -110,6 +110,12 @@ SPEC_ACCEPT_RATE_METRIC = "sglang:spec_accept_rate"
 SPEC_NUM_STEPS_METRIC = "sglang:spec_num_steps"        # current adaptive-k
 SPEC_EMA_ACCEPT_LEN_METRIC = "sglang:spec_ema_accept_len"
 GEN_THROUGHPUT_METRIC = "sglang:gen_throughput"        # coarse gauge (reference)
+#: Concurrency gauges. Needed to turn a server-wide token rate into a PER
+#: SESSION one -- 40 tok/s across 4 concurrent requests is not the same
+#: experience as 40 tok/s for one, and only the per-session figure is what a
+#: reader actually feels.
+NUM_RUNNING_REQS_METRIC = "sglang:num_running_reqs"
+NUM_QUEUE_REQS_METRIC = "sglang:num_queue_reqs"
 HICACHE_HOST_USED_METRIC = "sglang:hicache_host_used_tokens"
 HICACHE_HOST_TOTAL_METRIC = "sglang:hicache_host_total_tokens"
 
@@ -267,6 +273,18 @@ def _parse_counters(metrics_text: str) -> Dict[str, Any]:
         "cached_by_source": cached_by_source,
         "cached_total": sum(cached_by_source.values()),
         "gen_throughput": flat.get(GEN_THROUGHPUT_METRIC, 0.0),
+        # None (not 0.0) when the gauge is absent from the scrape, so the UI
+        # can tell "no concurrency metric" from "nothing running".
+        "num_running_reqs": (
+            flat.get(NUM_RUNNING_REQS_METRIC)
+            if NUM_RUNNING_REQS_METRIC in flat
+            else None
+        ),
+        "num_queue_reqs": (
+            flat.get(NUM_QUEUE_REQS_METRIC)
+            if NUM_QUEUE_REQS_METRIC in flat
+            else None
+        ),
         "spec": spec,
         "hicache": hicache,
     }
@@ -510,6 +528,8 @@ def snapshot(
         "spec": cur["spec"],            # None if spec metrics absent
         "hicache": cur["hicache"],      # None if no hierarchical cache
         "gen_throughput_server": cur["gen_throughput"],
+        "num_running_reqs": cur["num_running_reqs"],
+        "num_queue_reqs": cur["num_queue_reqs"],
         "cached_by_source": cur["cached_by_source"],
         "counters": {
             "prompt_tokens_total": cur["prompt_tokens_total"],
