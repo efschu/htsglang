@@ -164,7 +164,7 @@ class TimeBudget:
             )
 
     def verdict(self, duration_s: float) -> str:
-        """"" (in band) | "short" | "over_target" | "ceiling"."""
+        """ "" (in band) | "short" | "over_target" | "ceiling"."""
         if duration_s > self.ceiling_s:
             return "ceiling"
         if duration_s > self.target_high_s:
@@ -458,9 +458,7 @@ def own_vram_gate(
         "own_holding": [],
     }
     if nvml is None:
-        record["reason"] = (
-            "NVML unavailable; the gate could not look and did not block"
-        )
+        record["reason"] = "NVML unavailable; the gate could not look and did not block"
         return record
 
     start = clock()
@@ -550,6 +548,7 @@ def card_state(samples: Sequence[Any]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Metrics for one window
 # ---------------------------------------------------------------------------
+
 
 def _is_harness_field(spec: str) -> bool:
     """Whether a scenario's ``metric_fields`` entry names a real harness field.
@@ -828,11 +827,7 @@ class StudyResult:
     notes: List[str] = dataclasses.field(default_factory=list)
 
     def points_for(self, arm: str, role: str = "") -> List[PointResult]:
-        return [
-            p
-            for p in self.points
-            if p.arm == arm and (not role or p.role == role)
-        ]
+        return [p for p in self.points if p.arm == arm and (not role or p.role == role)]
 
     def to_json(self) -> dict:
         return {
@@ -930,7 +925,9 @@ def arm_result_from_points(
     for p in usable:
         for w in p.windows:
             slot = windows.setdefault(w.window, {})
-            excluded[w.window] = excluded.get(w.window, False) or w.excluded_from_headline
+            excluded[w.window] = (
+                excluded.get(w.window, False) or w.excluded_from_headline
+            )
             for key, value in w.metrics.items():
                 slot.setdefault(key, []).append(float(value))
             for key, n in w.samples.items():
@@ -958,9 +955,7 @@ def arm_result_from_points(
         results.append(
             WindowResult(
                 window=key,
-                metrics={
-                    m: statistics.median(v) for m, v in slot.items() if v
-                },
+                metrics={m: statistics.median(v) for m, v in slot.items() if v},
                 samples=dict(samples.get(key, {})),
                 excluded_from_headline=excluded.get(key, False),
                 note="; ".join(notes.get(key, [])),
@@ -985,18 +980,14 @@ def arm_result_from_points(
         "boots_run": len(points),
         "boots_used": len(usable),
         "boots_throttled": throttled,
-        "boots_aborted": [
-            {"repeat": p.repeat, "reason": p.aborted} for p in dropped
-        ],
+        "boots_aborted": [{"repeat": p.repeat, "reason": p.aborted} for p in dropped],
         "state_note": (
             f"{throttled} of {len(usable)} boots ran throttled; kept and "
             "marked, not dropped"
             if throttled
             else "no throttling observed in the boots used"
         ),
-        "newest_point_age_s": (
-            min(p.age_s() for p in usable) if usable else None
-        ),
+        "newest_point_age_s": (min(p.age_s() for p in usable) if usable else None),
     }
     return ArmResult(
         label=label,
@@ -1334,9 +1325,7 @@ class Study:
 
         return EngineScraper(base_url)
 
-    def _run_windows(
-        self, result: PointResult, arm: Arm, cmd: Dict[str, Any]
-    ) -> None:
+    def _run_windows(self, result: PointResult, arm: Arm, cmd: Dict[str, Any]) -> None:
         scraper = self._scraper(arm)
         metric_fields = cmd.get("metric_fields") or {}
         for step in self.steps():
@@ -1372,9 +1361,7 @@ class Study:
             t1 = self.clock()
             after = scraper.scrape()
 
-            duration = (
-                outcome.duration_s if outcome is not None else max(0.0, t1 - t0)
-            )
+            duration = outcome.duration_s if outcome is not None else max(0.0, t1 - t0)
             result.durations_s[step.window] = duration
             verdict = self.policy.budget.verdict(duration)
             result.budget_verdicts[step.window] = verdict
@@ -1414,9 +1401,7 @@ class Study:
 
             if outcome is not None and outcome.result:
                 self._absorb_conditions(result, outcome.result)
-                result.provenance.setdefault("harness", []).append(
-                    outcome.to_json()
-                )
+                result.provenance.setdefault("harness", []).append(outcome.to_json())
 
     def _absorb_conditions(
         self, result: PointResult, harness_result: Dict[str, Any]
@@ -1499,8 +1484,7 @@ class Study:
 
         for arm in self.arms:
             points = [
-                p for p in out.points
-                if p.arm == arm.label and p.role == "comparison"
+                p for p in out.points if p.arm == arm.label and p.role == "comparison"
             ] or out.points_for(arm.label)
             out.arms.append(arm_result_from_points(arm.label, points, self.scenario))
 
@@ -1513,12 +1497,7 @@ class Study:
                     )
                 )
 
-        durations = [
-            d
-            for p in out.points
-            for d in p.durations_s.values()
-            if d > 0
-        ]
+        durations = [d for p in out.points for d in p.durations_s.values() if d > 0]
         if durations:
             advice = suggest_num_prompts(
                 statistics.median(durations),
@@ -1531,8 +1510,7 @@ class Study:
         aborted = [p for p in out.points if p.aborted]
         if aborted and len(aborted) == len(out.points):
             out.aborted = (
-                "every point aborted; the first reason was: "
-                f"{aborted[0].aborted}"
+                "every point aborted; the first reason was: " f"{aborted[0].aborted}"
             )
         return out
 
@@ -1629,9 +1607,7 @@ def render_dry_run_text(dry: Dict[str, Any]) -> str:
         "top of the band (boot and teardown come on top):",
     ]
     for b in dry["schedule"]:
-        lines.append(
-            f"  {b['order']:>2}. {b['arm']} r{b['repeat']}  [{b['role']}]"
-        )
+        lines.append(f"  {b['order']:>2}. {b['arm']} r{b['repeat']}  [{b['role']}]")
     lines += ["", "Windows:"]
     for w in dry["windows"]:
         mark = " [excluded from headline]" if w["excluded_from_headline"] else ""
@@ -1670,9 +1646,7 @@ def render_study_text(result: StudyResult) -> str:
             if verdict:
                 marks.append(f"{window}:{verdict}")
         suffix = f"  [{', '.join(marks)}]" if marks else ""
-        lines.append(
-            f"  {p.order:>2}. {p.arm} r{p.repeat} ({p.role}){suffix}"
-        )
+        lines.append(f"  {p.order:>2}. {p.arm} r{p.repeat} ({p.role}){suffix}")
         if p.aborted:
             lines.append(f"      {p.aborted}")
     if result.noise:
@@ -1684,9 +1658,7 @@ def render_study_text(result: StudyResult) -> str:
     if result.comparisons:
         lines += ["", "Comparisons:"]
         for c in result.comparisons:
-            lines.append(
-                f"  [{c.verdict}] {c.metric} in {c.window}: {c.reason}"
-            )
+            lines.append(f"  [{c.verdict}] {c.metric} in {c.window}: {c.reason}")
     if result.notes:
         lines += ["", "Notes:"]
         for n in result.notes:

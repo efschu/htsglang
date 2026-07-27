@@ -273,9 +273,7 @@ class TestWindowPlan(CustomTestCase):
 
     def test_declared_windows_are_all_kept(self):
         steps = window_plan(SPILL)
-        self.assertEqual(
-            [s.window for s in steps], [w.key for w in SPILL.windows]
-        )
+        self.assertEqual([s.window for s in steps], [w.key for w in SPILL.windows])
 
     def test_the_transient_window_stays_excluded(self):
         steps = {s.window: s for s in window_plan(SPILL)}
@@ -288,8 +286,7 @@ class TestWindowPlan(CustomTestCase):
 
     def test_a_supplied_driver_removes_the_reason(self):
         steps = {
-            s.window: s
-            for s in window_plan(SPILL, {"during_spill": lambda *a: None})
+            s.window: s for s in window_plan(SPILL, {"during_spill": lambda *a: None})
         }
         self.assertEqual(steps["during_spill"].undrivable_reason, "")
 
@@ -441,9 +438,7 @@ class TestWindowMetrics(CustomTestCase):
         after = FakeEngineSample({"generation_tokens_total": 100.0}, {})
         metrics, _, notes = window_metrics(before, after, 10.0)
         self.assertNotIn("ms_per_verify_round", metrics)
-        self.assertTrue(
-            any("SGLANG_ENABLE_METRICS_DEVICE_TIMER" in n for n in notes)
-        )
+        self.assertTrue(any("SGLANG_ENABLE_METRICS_DEVICE_TIMER" in n for n in notes))
 
     def test_harness_fields_are_bound_by_the_scenario_mapping(self):
         before = FakeEngineSample({}, {})
@@ -476,7 +471,9 @@ class TestWindowMetrics(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
-def point(arm="A", repeat=0, role="noise_floor", aborted="", throttled=False, **metrics):
+def point(
+    arm="A", repeat=0, role="noise_floor", aborted="", throttled=False, **metrics
+):
     return PointResult(
         arm=arm,
         repeat=repeat,
@@ -501,7 +498,10 @@ class TestNoiseFloor(CustomTestCase):
 
     def test_a_metric_seen_once_gets_no_floor(self):
         floor = noise_floor_from_points(
-            [point(ms_per_verify_round=2.0, tok_s=100.0), point(ms_per_verify_round=2.1)]
+            [
+                point(ms_per_verify_round=2.0, tok_s=100.0),
+                point(ms_per_verify_round=2.1),
+            ]
         )
         self.assertIsNone(floor.for_metric("tok_s"))
         self.assertIsNotNone(floor.for_metric("ms_per_verify_round"))
@@ -657,9 +657,7 @@ class TestStudy(CustomTestCase):
     def test_a_point_over_the_ceiling_is_aborted_with_the_reason(self):
         study = a_study(harness=FakeHarness(duration_s=95.0))
         out = study.run()
-        verdicts = [
-            v for p in out.points for v in p.budget_verdicts.values()
-        ]
+        verdicts = [v for p in out.points for v in p.budget_verdicts.values()]
         self.assertIn("ceiling", verdicts)
 
     def test_the_measured_duration_is_recorded(self):
@@ -672,9 +670,7 @@ class TestStudy(CustomTestCase):
         out = study.run()
         self.assertTrue(any("not this one" in n for n in out.notes))
         # every point ran at the load the study started with
-        self.assertTrue(
-            all("--num-prompts 64" in c for c in study.harness.commands)
-        )
+        self.assertTrue(all("--num-prompts 64" in c for c in study.harness.commands))
 
     def test_a_failing_harness_aborts_the_point_with_its_reason(self):
         study = a_study(harness=FakeHarness(ok=False))
@@ -717,9 +713,7 @@ class TestStudy(CustomTestCase):
                 settle_s=0, env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"}
             )
         )
-        self.assertFalse(
-            any("will be ABSENT" in p for p in study.preflight())
-        )
+        self.assertFalse(any("will be ABSENT" in p for p in study.preflight()))
 
     def test_undrivable_windows_are_reported_empty_not_dropped(self):
         study = Study(
@@ -878,9 +872,16 @@ class TestLoadStudy(CustomTestCase):
         import os
 
         root = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))),
-            "tools", "rig_dashboard", "studies",
+            os.path.dirname(
+                os.path.dirname(
+                    os.path.dirname(
+                        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    )
+                )
+            ),
+            "tools",
+            "rig_dashboard",
+            "studies",
         )
         files = sorted(glob.glob(os.path.join(root, "*.json")))
         self.assertTrue(files, f"no study files under {root}")
@@ -888,9 +889,7 @@ class TestLoadStudy(CustomTestCase):
             with self.subTest(study=os.path.basename(path)):
                 dry = load_study(path).dry_run()
                 self.assertTrue(dry["runnable"], dry["arms"])
-                self.assertEqual(
-                    dry["schedule"][0]["role"], "noise_floor"
-                )
+                self.assertEqual(dry["schedule"][0]["role"], "noise_floor")
 
 
 class TestSuggestNumPrompts(CustomTestCase):
