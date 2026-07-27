@@ -32,9 +32,12 @@ SSM/GDN shifting is deliberately NOT a lever: the mamba state pool moves
 with the GDN units (~4.7 MiB/req/unit) and collapses context (M22 C3).
 
 Concentration is bounded by the decode-knee guard: no rank's share of the
-streamed weight bytes may exceed its share of the rig's memory bandwidth
-(measured M23: beyond that knee decode regresses (-4.8% at 16,1,2) while
-prefill gains saturate at the knee-exact C6 level).
+streamed weight bytes may exceed its share of the rig's EFFECTIVE decode
+bandwidth (measured M23: beyond that knee decode regresses (-4.8% at 16,1,2)
+while prefill gains saturate at the knee-exact C6 level). Effective is not
+probed peak -- see ``_PREDICT_DECODE_BW_COMPRESSION``. Every candidate also
+carries a predicted decode-step delta in the log, accepted or rejected: the
+guard is a model, and a reader has to be able to disagree with it.
 
 The MLP vector is derived from a MEASURED hardware profile (stage-0
 micro-probe: per-card GEMM + memory-bandwidth score, pairwise NCCL link
@@ -140,6 +143,42 @@ _PREDICT_KNEE_COARSE_UNITS = 256
 #: this rejects the FP8 4,1,1 knee overshoot (picking the 3,1,1 class) while
 #: the fine AWQ 544-unit grid is unaffected and keeps its measured-win 5,1,1.
 _PREDICT_KNEE_COARSE_HEADROOM_UNITS = 2
+#: Exponent that turns a rank's PROBED PEAK memory bandwidth into the
+#: bandwidth it actually reaches while streaming its weight shard at batch
+#: size 1: ``bw_effective ~ bw_peak ** BETA``.
+#:
+#: BETA = 1 is the identity, and the identity is what this guard shipped
+#: with -- the assumption that a card 2.3x faster on a streaming benchmark is
+#: also 2.3x faster at pulling a quantized weight shard through the many
+#: small GEMV kernels a bs=1 decode step is made of. It is not. Achieved
+#: bandwidth is a fraction of peak that differs per architecture and per
+#: quantization lane, and on a mixed rig those fractions do not cancel: the
+#: measured decode advantage of the 5090 over a 3080 here is 1.70x where the
+#: probe reports 2.32x. Reading the peak ratio as an achieved ratio puts the
+#: ceiling for the fast rank far too high, and the guard then waves through
+#: exactly the concentration that makes that rank the lockstep pacer.
+#:
+#: Fitted (task #216 follow-up) on ms per SPECULATIVE STEP over four MLP
+#: vectors, interleaved cold boots, KV ownership vector pinned, radix cache
+#: defeated on the prefill axis: base [63,37,36] 30.10 ms, 3,1,1 31.90,
+#: 4,1,1 34.12, 6,1,1 34.76 -- rms 0.38 ms, boot-to-boot floor 0.6-0.8 %.
+#: The shipped BETA = 1 predicted -10 to -15 % for those same vectors where
+#: +6 to +16 % was measured; at BETA = 0.63 the sign is right and the
+#: magnitude lands within ~2 points.
+#:
+#: Sample width: ONE rig (5090 + 2x 3080, PCIe, no P2P) and one checkpoint
+#: family (FP8 dense, sm_120 native lane against sm_86 Marlin upconvert).
+#: The direction -- achieved ratios are compressed relative to peak ratios --
+#: is general; this particular value is not claimed to be.
+_PREDICT_DECODE_BW_COMPRESSION = 0.63
+#: Fraction of a bs=1 decode step that is NOT weight streaming (attention
+#: over the KV, the speculative draft and verify passes, collectives, kernel
+#: launch). The weight-term ratio alone overstates the step-time delta,
+#: because this part of the step does not move when the MLP split does;
+#: folding it in is what takes the reported cost from "the right sign" to
+#: "within ~2 points of measured". Same fit and same sample-width caveat as
+#: the compression exponent above.
+_PREDICT_DECODE_NONWEIGHT_FRACTION = 0.28
 #: TP-degree recommendation: a GPU whose best pairwise link is below this
 #: fraction of the rig's best link is called out as a drop candidate.
 _TP_DROP_LINK_FRACTION = 0.7
@@ -2113,19 +2152,70 @@ class PerfCostModel:
             return 0.0
         return (self.families["mlp"].bytes / self.mlp_units) / total_streamed
 
+    def effective_decode_bw(self, membw_gbs: List[float]) -> List[float]:
+        """Per-rank bandwidth actually reached while streaming a weight shard
+        at batch size 1, from the probed streaming peak.
+
+        The probe measures a large contiguous stream; a decode step is many
+        small quantized GEMVs, which reach a per-architecture fraction of
+        that. On a mixed rig the fractions differ, so the peak ratio is not
+        the achieved ratio and cannot be used as one -- see
+        ``_PREDICT_DECODE_BW_COMPRESSION`` for the measurement. Returned in
+        arbitrary units: only ratios between ranks are ever consumed."""
+        beta = _PREDICT_DECODE_BW_COMPRESSION
+        return [max(float(b), 1e-9) ** beta for b in membw_gbs]
+
+    def decode_round_time(
+        self, mlp_vector: List[int], membw_gbs: List[float]
+    ) -> float:
+        """Relative bs=1 decode round time: the lockstep max over ranks of
+        (streamed weight bytes / effective bandwidth). Only ratios between
+        candidates are consumed."""
+        bw = self.effective_decode_bw(membw_gbs)
+        streamed = self.streamed_bytes(list(mlp_vector))
+        return max(s / b for s, b in zip(streamed, bw))
+
+    def decode_cost_percent(
+        self, mlp_vector: List[int], membw_gbs: List[float]
+    ) -> float:
+        """Predicted change of the bs=1 decode STEP time against the base
+        plan, in percent. Positive = the candidate makes decode slower.
+
+        This exists because a guard that only answers yes/no is how a vector
+        that costs 16.5 % of the decode step passed review in silence. Even
+        when the verdict is wrong the number is actionable, so it is reported
+        for every candidate, accepted or rejected.
+
+        The weight term moves with the MLP split; the rest of the step (KV
+        attention, draft+verify, collectives, launch overhead) does not, and
+        is held at ``_PREDICT_DECODE_NONWEIGHT_FRACTION`` of the base step so
+        the percentage refers to the step a user actually waits for rather
+        than to the weight term alone."""
+        base = self.decode_round_time(self.base_plan, membw_gbs)
+        if base <= 0:
+            return 0.0
+        ratio = self.decode_round_time(mlp_vector, membw_gbs) / base
+        f = _PREDICT_DECODE_NONWEIGHT_FRACTION
+        return (f + (1.0 - f) * ratio - 1.0) * 100.0
+
     def decode_knee_ok(
         self,
         mlp_vector: List[int],
         membw_gbs: List[float],
         tol: float = _PREDICT_DECODE_KNEE_TOL,
     ) -> bool:
-        """Decode-knee guard (M20/M22/M23-measured): decode throughput is
+        """Decode-knee guard (M20/M22/M23/#216-measured): decode throughput is
         FLAT while every rank's share of the streamed weight bytes stays at
-        or below its share of the rig's total memory bandwidth; pushing a
+        or below its share of the rig's EFFECTIVE decode bandwidth; pushing a
         rank past that knee makes it the decode lockstep bottleneck (M23:
         16,1,2 = 56.5% bytes on the 51.9%-membw 5090 -> decode -4.8%) and
         the prefill model's extra predicted gain does NOT materialize
         (measured +10.0%, identical to the knee-exact C6 vector).
+
+        Effective, not probed peak. The two differ by an architecture- and
+        quant-dependent factor that does not cancel across a mixed rig, and
+        taking peak for achieved is what let 6,1,1 through at a measured
+        +16.5 % decode cost -- see ``_PREDICT_DECODE_BW_COMPRESSION``.
 
         The per-rank share is computed from the ACTUAL integer unit partition
         (``mlp_unit_partition`` via ``streamed_bytes``), never from the wish
@@ -2151,7 +2241,11 @@ class PerfCostModel:
         cand = self.streamed_bytes(mlp_vector)
         base = self.streamed_bytes(self.base_plan)
         total = sum(cand)
-        bw_total = sum(membw_gbs)
+        # EFFECTIVE, not peak: the ceiling has to be the bandwidth a rank
+        # really reaches on this workload, or it certifies concentration the
+        # rank cannot absorb (see _PREDICT_DECODE_BW_COMPRESSION).
+        bw_eff = self.effective_decode_bw(membw_gbs)
+        bw_total = sum(bw_eff)
         coarse = self.mlp_units < _PREDICT_KNEE_COARSE_UNITS
         unit_share = self._mlp_unit_share(total)
         headroom = (
@@ -2161,7 +2255,7 @@ class PerfCostModel:
             if cand[r] <= base[r] * (1.0 + 1e-6):
                 continue  # rank sheds or keeps bytes: cannot become the knee
             achievable = cand[r] / total if total else 0.0
-            membw_share = membw_gbs[r] / bw_total if bw_total else 0.0
+            membw_share = bw_eff[r] / bw_total if bw_total else 0.0
             limit = membw_share - headroom
             if achievable > limit:
                 # requested = share the wish ratio (continuous, no rounding)
@@ -2177,8 +2271,11 @@ class PerfCostModel:
                 reason = (
                     f"unit granularity ({grain}): rank {r} requested "
                     f"{requested * 100:.1f}% -> achievable {achievable * 100:.1f}% "
-                    f"of streamed weight bytes exceeds membw share "
-                    f"{membw_share * 100:.1f}% (safe ceiling {limit * 100:.1f}%)"
+                    f"of streamed weight bytes exceeds EFFECTIVE membw share "
+                    f"{membw_share * 100:.1f}% (peak share "
+                    f"{membw_gbs[r] / max(sum(membw_gbs), 1e-9) * 100:.1f}%, "
+                    f"safe ceiling {limit * 100:.1f}%); predicted decode step "
+                    f"{self.decode_cost_percent(mlp_vector, membw_gbs):+.1f}%"
                 )
                 return False, reason
         return True, None
@@ -2597,16 +2694,10 @@ def apply_auto_performance(server_args) -> None:
                 )
             else:
                 cand, pred, t_cand = min(near, key=lambda x: x[2])
-            # Decode round-time proxy: bs=1 decode is weight-streaming bound,
-            # time ~ max_r(streamed_bytes_r / membw_r). Reported vs base.
-            def _dec_proxy(vec):
-                streamed = model.streamed_bytes(list(vec))
-                return max(
-                    s / max(bw, 1e-9) * 1e-9
-                    for s, bw in zip(streamed, rank_scores_bw)
-                )
-
-            dec_delta = (_dec_proxy(cand) / _dec_proxy(base_plan) - 1.0) * 100
+            # Decode round-time delta vs base. Built on EFFECTIVE bandwidth:
+            # the same expression over PROBED PEAK bandwidth reported -22 %
+            # for a vector that measured +16.5 % (task #216).
+            dec_delta = model.decode_cost_percent(list(cand), rank_scores_bw)
             knee_ok, knee_reason = model.decode_knee_detail(
                 list(cand), rank_scores_bw
             )
@@ -2703,10 +2794,17 @@ def apply_auto_performance(server_args) -> None:
                 verdict = f"REJECTED by decode-knee guard -- {knee_reason}"
             else:
                 verdict = "floor OK, knee OK"
+            # The decode cost is stated for EVERY candidate, including the
+            # ones the guard accepts. A silent pass is how a +16.5 % decode
+            # regression got proposed as a default (task #216): the guard's
+            # verdict is a model, the number next to it is what lets a reader
+            # disagree with the model.
+            dec_pct = model.decode_cost_percent(list(cand), rank_scores_bw)
             lines.append(
                 f"candidate MLP vector {','.join(map(str, cand))}: "
                 f"predicted ctx ~{int(pred['ctx'])} ({verdict}), "
-                f"predicted prefill gain {gain * 100:+.1f}% "
+                f"predicted prefill gain {gain * 100:+.1f}%, predicted decode "
+                f"step {dec_pct:+.1f}% "
                 f"(units {model.mlp_unit_partition(list(cand)) if pred['feasible'] else 'n/a'})"
             )
         if chosen is None:
@@ -2725,7 +2823,10 @@ def apply_auto_performance(server_args) -> None:
             f"CHOSEN MLP vector: {','.join(map(str, chosen))} "
             f"(materialized units {model.mlp_unit_partition(list(chosen))}; "
             f"predicted ctx ~{int(pred['ctx'])} >= floor {int(floor)}; "
-            f"predicted per-rank capacity {[int(x) for x in pred['p']]})"
+            f"predicted per-rank capacity {[int(x) for x in pred['p']]}; "
+            f"predicted decode step "
+            f"{model.decode_cost_percent(list(chosen), rank_scores_bw):+.1f}% "
+            f"vs the VRAM-auto split)"
         )
         lines.append(
             "floor check: predicted ctx of chosen vector "
