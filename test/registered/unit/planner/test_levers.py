@@ -1,4 +1,4 @@
-"""CPU unit tests for the five lever profiles."""
+"""CPU unit tests for the five levers."""
 
 import unittest
 
@@ -7,6 +7,8 @@ from sglang.srt.planner.levers import (
     RATES_KNOWN,
     STRUCTURE_ONLY,
     Confidence,
+    FlagSpec,
+    Lever,
     flag_available,
     missing_flags,
     render_levers_text,
@@ -31,7 +33,7 @@ class TestLeverDefinitions(CustomTestCase):
         )
 
     def test_every_lever_states_a_price(self):
-        """A profile that lists only what it improves is a sales pitch."""
+        """A lever that lists only what it improves is a sales pitch."""
         for key, p in LEVERS.items():
             self.assertTrue(p.gains, key)
             self.assertTrue(p.costs, f"{key} names no cost")
@@ -55,20 +57,52 @@ class TestBuildGate(CustomTestCase):
         self.assertFalse(flag_available("definitely_not_a_field"))
 
     def test_a_lever_whose_knob_is_absent_says_so(self):
-        """--rank-kv-ratio does not exist on this branch, and the decode lever
-        wants it. Emitting it anyway would produce a command that cannot
-        parse."""
-        if flag_available("rank_kv_ratio"):
-            self.skipTest("this build has --rank-kv-ratio")
-        missing = missing_flags(LEVERS["decode_speed"])
-        self.assertEqual([f.flag for f in missing], ["--rank-kv-ratio"])
-        s = [x for x in suggest_levers(probe=PROBE) if x.profile.key == "decode_speed"][0]
-        self.assertTrue(s.unavailable_flags)
-        self.assertEqual(s.unavailable_flags[0]["flag"], "--rank-kv-ratio")
-        self.assertNotIn("--rank-kv-ratio", " ".join(s.command_flags))
+        """A lever must never emit a flag the running build cannot parse.
+
+        Exercised on a synthetic lever rather than on a real one: which flags
+        exist is a property of the branch under test, so asserting a specific
+        absence would make the test a claim about the branch instead of about
+        the gate.
+        """
+        synthetic = Lever(
+            key="synthetic",
+            label="Synthetic",
+            maximises="nothing",
+            flags=[
+                FlagSpec(
+                    "--definitely-not-a-flag",
+                    "1",
+                    "definitely_not_a_field",
+                    why="exists only to be missing",
+                )
+            ],
+            gains=["none"],
+            costs=["none"],
+            vague_statement="none",
+        )
+        missing = missing_flags(synthetic)
+        self.assertEqual([f.flag for f in missing], ["--definitely-not-a-flag"])
+
+    def test_the_decode_lever_has_its_knob_on_this_build(self):
+        """#210 shipped --rank-kv-ratio; the decode lever sits in the KV-token
+        split, so on this build it must resolve to a real flag rather than to
+        an unavailability notice."""
+        self.assertTrue(flag_available("rank_kv_ratio"))
+        self.assertEqual(missing_flags(LEVERS["decode_speed"]), [])
+        s = [x for x in suggest_levers(probe=PROBE) if x.lever.key == "decode_speed"][0]
+        self.assertEqual(s.unavailable_flags, [])
+        self.assertIn("--rank-kv-ratio speed", " ".join(s.command_flags))
+        # 'speed' reads the per-rank bandwidth scores, which only the
+        # auto-performance plan resolves; without it the mode degrades to the
+        # opposite direction, so the lever must carry it.
+        self.assertIn("--rank-tp-ratio auto-performance", " ".join(s.command_flags))
+
+    def test_the_context_lever_asks_for_capacity_ownership(self):
+        s = [x for x in suggest_levers(probe=PROBE) if x.lever.key == "context"][0]
+        self.assertIn("--rank-kv-ratio capacity", " ".join(s.command_flags))
 
     def test_available_flags_are_still_emitted(self):
-        s = [x for x in suggest_levers(probe=PROBE) if x.profile.key == "context"][0]
+        s = [x for x in suggest_levers(probe=PROBE) if x.lever.key == "context"][0]
         self.assertIn("--rank-tp-ratio auto", " ".join(s.command_flags))
 
 
@@ -79,14 +113,14 @@ class TestStaging(CustomTestCase):
                 continue
             self.assertEqual(s.stage, STRUCTURE_ONLY)
             self.assertEqual(s.confidence, Confidence.VAGUE)
-            self.assertEqual(s.statement, s.profile.vague_statement)
+            self.assertEqual(s.statement, s.lever.vague_statement)
 
     def test_rate_dependent_flags_are_withheld_before_a_probe(self):
-        s = [x for x in suggest_levers(probe=None) if x.profile.key == "prefill_speed"][0]
+        s = [x for x in suggest_levers(probe=None) if x.lever.key == "prefill_speed"][0]
         self.assertNotIn("--rank-perf-tune", " ".join(s.command_flags))
 
     def test_with_a_probe_suggestions_become_concrete(self):
-        s = [x for x in suggest_levers(probe=PROBE) if x.profile.key == "prefill_speed"][0]
+        s = [x for x in suggest_levers(probe=PROBE) if x.lever.key == "prefill_speed"][0]
         self.assertEqual(s.stage, RATES_KNOWN)
         self.assertEqual(s.confidence, Confidence.DETAILED)
         self.assertIn("--rank-perf-tune enc", " ".join(s.command_flags))
@@ -95,7 +129,7 @@ class TestStaging(CustomTestCase):
     def test_fit_levers_do_not_need_a_probe_for_their_main_flag(self):
         """Fit questions are answerable without measurement; speed questions
         are not."""
-        s = [x for x in suggest_levers(probe=None) if x.profile.key == "context"][0]
+        s = [x for x in suggest_levers(probe=None) if x.lever.key == "context"][0]
         self.assertIn("--rank-tp-ratio auto", " ".join(s.command_flags))
 
 
@@ -104,7 +138,7 @@ class TestHomogeneousRig(CustomTestCase):
         s = [
             x
             for x in suggest_levers(heterogeneous=False, probe=PROBE)
-            if x.profile.key == "context"
+            if x.lever.key == "context"
         ][0]
         self.assertNotIn("--rank-tp-ratio", " ".join(s.command_flags))
 
@@ -112,23 +146,23 @@ class TestHomogeneousRig(CustomTestCase):
 class TestPreconditions(CustomTestCase):
     def test_ttft_lever_needs_a_second_node(self):
         s = [x for x in suggest_levers(probe=PROBE, node_count=1)
-             if x.profile.key == "ttft_loaded"][0]
+             if x.lever.key == "ttft_loaded"][0]
         self.assertTrue(s.unmet_preconditions)
         self.assertIn("second node", " ".join(s.unmet_preconditions))
         s2 = [x for x in suggest_levers(probe=PROBE, node_count=2)
-              if x.profile.key == "ttft_loaded"][0]
+              if x.lever.key == "ttft_loaded"][0]
         self.assertNotIn("second node", " ".join(s2.unmet_preconditions))
 
     def test_energy_lever_needs_power_control(self):
         s = [x for x in suggest_levers(probe=PROBE, facility_keys_available=[])
-             if x.profile.key == "energy"][0]
+             if x.lever.key == "energy"][0]
         self.assertIn("Power-target", " ".join(s.unmet_preconditions))
         s2 = [
             x
             for x in suggest_levers(
                 probe=PROBE, facility_keys_available=["power_target"]
             )
-            if x.profile.key == "energy"
+            if x.lever.key == "energy"
         ][0]
         self.assertEqual(s2.unmet_preconditions, [])
 
@@ -153,7 +187,7 @@ class TestRendering(CustomTestCase):
 
     def test_filtering_by_key(self):
         out = suggest_levers(probe=PROBE, keys=["energy"])
-        self.assertEqual([s.profile.key for s in out], ["energy"])
+        self.assertEqual([s.lever.key for s in out], ["energy"])
 
 
 if __name__ == "__main__":

@@ -11,19 +11,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Lever profiles: one flag combination per direction, with its counter-price.
+"""Levers: one flag combination per direction, with its counter-price.
 
 DESIGN_216 names five directions, and DESIGN_210 explains why they are
 separately reachable at all: the fork has several knobs on different axes
 (weight shards, MLP units, expert dimension, lm_head width, token ownership),
 not one compromise slider.
 
-    profile          maximises                 typical price
+    lever            maximises                 typical price
     context          max_total_num_tokens      slowest rank carries most tokens
     decode_speed     tok/s at bs=1             less context
     prefill_speed    prompt throughput         decode split off-optimum
-    ttft_loaded      time to first token        needs a satellite and a handover
+    ttft_loaded      time to first token       needs a satellite and a handover
     energy           joules per token          peak throughput drops
+
+"Lever", not "profile": on this fork ``profile`` already names a saved launch
+configuration (``planner.flags``) and a catalog card
+(``planner.card_library``). A direction that maximises one quantity at a named
+price is a third thing, and calling all three the same word in one surface is
+how a control panel becomes unreadable.
 
 Two rules keep this from becoming a wish list.
 
@@ -34,20 +40,25 @@ questions do. So an unprobed rig gets a deliberately vague suggestion, and the
 detailed one unlocks only once measurements exist. The staging is not a UI
 nicety; it is a statement about what is answerable.
 
-**Gated by the build.** A profile that emits a flag this build does not have
-is worse than no profile at all. Every flag a lever wants is checked against
+**Gated by the build.** A lever that emits a flag this build does not have is
+worse than no lever at all. Every flag a lever wants is checked against
 ``ServerArgs`` (:func:`flag_available`), and a lever whose central knob is
 missing says so and names the branch instead of quietly emitting a command
-that will fail to parse. On this branch, for example, ``--rank-kv-ratio`` is
-absent, which is exactly the knob the decode lever wants — and DESIGN_210
-already records that ``--rank-perf-tune dec`` is a documented near-no-op
-because the decode lever sits in the token split, not in the weight split.
-Saying that is more useful than emitting a flag combination that cannot move
-the quantity it claims to move.
+that will fail to parse. The gate reads the running build, so a lever's state
+follows the branch it is executed on rather than a claim written here.
 
-Counter-reckoning is mandatory: :class:`LeverProfile` has no field for the
-gain without a matching field for the cost, so "in all directions" is
-structural rather than a habit.
+The decode lever is the worked example of why the gate is dynamic. DESIGN_210
+records that the WEIGHT split is a near-no-op for decode; the decode lever
+sits in the KV-TOKEN split, because under DCP each rank runs attention over
+the tokens it owns and at bs=1 the slowest rank sets the pace. That knob —
+``--rank-kv-ratio speed`` — landed with #210: measured on 27B FP8, TP=3 uneven
+DCP, 120 k resident tokens, bs=1, moving the ownership vector from [2,3,3] to
+[2,1,1] cut the context-dependent part of the decode step by 24.5 % against a
+boot-to-boot noise floor of 1.07 %.
+
+Counter-reckoning is mandatory: :class:`Lever` has no field for the gain
+without a matching field for the cost, so "in all directions" is structural
+rather than a habit.
 """
 
 from __future__ import annotations
@@ -58,7 +69,7 @@ from typing import Any, Dict, List, Optional, Sequence
 __all__ = [
     "Confidence",
     "FlagSpec",
-    "LeverProfile",
+    "Lever",
     "LeverSuggestion",
     "LEVERS",
     "flag_available",
@@ -99,10 +110,10 @@ class FlagSpec:
 
 
 @dataclasses.dataclass
-class LeverProfile:
+class Lever:
     """A direction, its flags, and what it costs.
 
-    ``gains`` and ``costs`` are both required and both non-empty; a profile
+    ``gains`` and ``costs`` are both required and both non-empty; a lever
     that only lists what it improves is a sales pitch.
     """
 
@@ -153,24 +164,24 @@ def flag_available(field: str) -> bool:
         return False
 
 
-def missing_flags(profile: LeverProfile) -> List[FlagSpec]:
-    return [f for f in profile.flags if f.field and not flag_available(f.field)]
+def missing_flags(lever: Lever) -> List[FlagSpec]:
+    return [f for f in lever.flags if f.field and not flag_available(f.field)]
 
 
 # ---------------------------------------------------------------------------
 # The five levers
 # ---------------------------------------------------------------------------
 
-LEVERS: Dict[str, LeverProfile] = {}
+LEVERS: Dict[str, Lever] = {}
 
 
-def _register(p: LeverProfile) -> LeverProfile:
+def _register(p: Lever) -> Lever:
     LEVERS[p.key] = p
     return p
 
 
 _register(
-    LeverProfile(
+    Lever(
         key="context",
         label="Context",
         maximises="max_total_num_tokens",
@@ -192,11 +203,21 @@ _register(
                 heterogeneous_only=True,
             ),
             FlagSpec(
+                "--rank-kv-ratio",
+                "capacity",
+                "rank_kv_ratio",
+                why="Capacity-weighted KV-token ownership: after the "
+                "post-weight-load profiling each rank installs the vector "
+                "proportional to its measured free-VRAM-after-weights "
+                "capacity, which is what maximises max_total_num_tokens.",
+                heterogeneous_only=True,
+            ),
+            FlagSpec(
                 "--rank-perf-loose-ctx-percent",
                 "0",
                 "rank_perf_loose_ctx_percent",
                 why="Zero tolerance: no context may be traded for speed in "
-                "this profile.",
+                "this lever.",
             ),
         ],
         gains=[
@@ -233,7 +254,7 @@ _register(
 )
 
 _register(
-    LeverProfile(
+    Lever(
         key="decode_speed",
         label="Decode speed",
         maximises="tok/s at batch size 1",
@@ -254,8 +275,21 @@ _register(
                 "speed",
                 "rank_kv_ratio",
                 why="Token ownership shifted from the capacity proportion "
-                "toward the fast cards. This is where the decode lever "
-                "actually sits.",
+                "toward the memory-bandwidth proportion. This is where the "
+                "decode lever actually sits: under DCP a rank runs attention "
+                "over the tokens it owns, so ownership IS the decode work "
+                "split.",
+                heterogeneous_only=True,
+                needs_probe=True,
+            ),
+            FlagSpec(
+                "--rank-tp-ratio",
+                "auto-performance",
+                "rank_tp_ratio",
+                why="--rank-kv-ratio speed reads the per-rank bandwidth "
+                "scores, which only the auto-performance plan resolves. "
+                "Without it the mode degrades to 'capacity' — the opposite "
+                "direction.",
                 heterogeneous_only=True,
                 needs_probe=True,
             ),
@@ -269,6 +303,12 @@ _register(
         gains=[
             "Balances the per-step read time across unequal cards instead of "
             "letting the slowest one set it.",
+            "Measured (#210): 27B FP8, TP=3 uneven DCP, 120 k resident tokens, "
+            "bs=1, no speculation — moving the ownership vector from [2,3,3] "
+            "to [2,1,1] cut the context-dependent part of the decode step by "
+            "24.5 % (2.296 -> 1.732 ms) against a 1.07 % boot-to-boot noise "
+            "floor. End to end that was -2.5 % step time, and it grows "
+            "linearly with resident context.",
         ],
         costs=[
             "Less context: the speed-directed token split holds fewer tokens "
@@ -277,7 +317,7 @@ _register(
             "at bs=1 those dominate.",
         ],
         tradeoff_against={
-            "context": "Directly opposed — see the context profile.",
+            "context": "Directly opposed — see the context lever.",
         },
         vague_statement=(
             "Decode speed on a heterogeneous rig is set by the slowest rank "
@@ -291,13 +331,13 @@ _register(
             "flatness may be P-state artefact.",
             "Speculation raises the arithmetic intensity of decode: at high "
             "accept length the decode optimum drifts toward the compute "
-            "proportion, i.e. toward the prefill profile.",
+            "proportion, i.e. toward the prefill lever.",
         ],
     )
 )
 
 _register(
-    LeverProfile(
+    Lever(
         key="prefill_speed",
         label="Prefill speed",
         maximises="prompt throughput",
@@ -331,8 +371,8 @@ _register(
             "Concentrates MLP mass on the compute-strong card, which is where "
             "prefill time is spent.",
             "The compute ratio between card classes spreads wider than the "
-            "bandwidth ratio, so this profile moves further from an even split "
-            "than the decode profile does.",
+            "bandwidth ratio, so this lever moves further from an even split "
+            "than the decode lever does.",
         ],
         costs=[
             "The decode split ends up off its optimum — one static weight "
@@ -354,7 +394,7 @@ _register(
 )
 
 _register(
-    LeverProfile(
+    Lever(
         key="ttft_loaded",
         label="TTFT under load",
         maximises="time to first token while the hub is busy",
@@ -375,7 +415,7 @@ _register(
             "it.",
         ],
         costs=[
-            "Needs a second node and a handover path; without one this profile "
+            "Needs a second node and a handover path; without one this lever "
             "has nothing to offer.",
             "Below roughly 2 300 tokens the length-independent recurrent-state "
             "handover outweighs the saved prefill, so short prompts lose.",
@@ -406,7 +446,7 @@ _register(
 )
 
 _register(
-    LeverProfile(
+    Lever(
         key="energy",
         label="Energy per token",
         maximises="joules per token (lower is better)",
@@ -428,7 +468,7 @@ _register(
             "draws power.",
         ],
         costs=[
-            "Peak throughput drops. This profile trades the top of the range "
+            "Peak throughput drops. This lever trades the top of the range "
             "for the middle of it.",
         ],
         tradeoff_against={
@@ -466,7 +506,7 @@ _register(
 class LeverSuggestion:
     """A lever resolved against this rig, this build and the evidence at hand."""
 
-    profile: LeverProfile
+    lever: Lever
     stage: str
     confidence: str
     statement: str
@@ -477,19 +517,19 @@ class LeverSuggestion:
 
     def to_json(self) -> dict:
         return {
-            "key": self.profile.key,
-            "label": self.profile.label,
-            "maximises": self.profile.maximises,
+            "key": self.lever.key,
+            "label": self.lever.label,
+            "maximises": self.lever.maximises,
             "stage": self.stage,
             "confidence": self.confidence,
             "statement": self.statement,
             "command_flags": list(self.command_flags),
             "unavailable_flags": list(self.unavailable_flags),
             "unmet_preconditions": list(self.unmet_preconditions),
-            "gains": list(self.profile.gains),
-            "costs": list(self.profile.costs),
+            "gains": list(self.lever.gains),
+            "costs": list(self.lever.costs),
             "counter_reckoning": dict(self.counter_reckoning),
-            "notes": list(self.profile.notes),
+            "notes": list(self.lever.notes),
         }
 
 
@@ -563,7 +603,7 @@ def suggest_levers(
             )
         out.append(
             LeverSuggestion(
-                profile=p,
+                lever=p,
                 stage=stage,
                 confidence=confidence,
                 statement=statement,
@@ -589,7 +629,7 @@ def render_levers_text(suggestions: Sequence[LeverSuggestion]) -> str:
         )
         lines.append("")
     for s in suggestions:
-        lines.append(f"[{s.confidence}] {s.profile.label} -> {s.profile.maximises}")
+        lines.append(f"[{s.confidence}] {s.lever.label} -> {s.lever.maximises}")
         lines.append(f"  {s.statement}")
         if s.command_flags:
             lines.append(f"  flags: {' '.join(s.command_flags)}")
