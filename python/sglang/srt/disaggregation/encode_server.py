@@ -1820,7 +1820,13 @@ class MMEncoder:
                 == embedding.data_ptr()
             )
             if not mr_already_registered:
-                self.engine.register(embedding.data_ptr(), embedding.nbytes)
+                # An unregistered MR is not addressable by RDMA; fail here
+                # rather than in the transfer below, far from the cause.
+                self.engine.register_checked(
+                    embedding.data_ptr(),
+                    embedding.nbytes,
+                    f"the embedding of request {req_id}",
+                )
             _t_xfer_start = time.monotonic()
             await asyncio.to_thread(
                 self.engine.transfer_sync,
@@ -2088,7 +2094,13 @@ class MMEncoder:
                     if self.rank == 0:
                         # Register the MR exactly once here so all sibling-TP /send coroutines share a single registration.
                         try:
-                            self.engine.register(emb.data_ptr(), emb.nbytes)
+                            # register_checked raises on a failure status;
+                            # register alone reports failure only in its
+                            # return value, which would record a bad mr_ptr
+                            # here and skip the fallback below.
+                            self.engine.register_checked(
+                                emb.data_ptr(), emb.nbytes, f"request {req_id}"
+                            )
                             self._forward_results[req_id]["mr_ptr"] = emb.data_ptr()
                         except Exception as reg_err:
                             logger.warning(

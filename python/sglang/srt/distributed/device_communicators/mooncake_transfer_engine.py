@@ -132,7 +132,15 @@ class MooncakeTransferEngine:
             self.hostname, self.engine.get_rpc_port()
         ).to_host_port_str()
 
-    def register(self, ptr, length):
+    def register(self, ptr, length) -> int:
+        """Register a single memory region; returns the engine status.
+
+        0 = success, non-zero = failure (-1 when the underlying binding
+        raised) -- the same contract as ``batch_register``. A region that
+        failed to register is not addressable by RDMA, so callers that need
+        the registration must check the status (or use ``register_checked``)
+        instead of letting a later transfer fail far from the cause.
+        """
         try:
             ret_value = self.engine.register_memory(ptr, length)
         except Exception:
@@ -141,8 +149,20 @@ class MooncakeTransferEngine:
 
         if ret_value != 0:
             logger.debug("Mooncake memory registration %s failed.", ptr)
+        return ret_value
 
-    def deregister(self, ptr):
+    def register_checked(self, ptr: int, length: int, what: str) -> None:
+        """Register one memory region and raise if the engine reports failure."""
+        ret_value = self.register(ptr, length)
+        if ret_value != 0:
+            raise RuntimeError(
+                f"Mooncake memory registration failed for {what} "
+                f"(ptr={hex(ptr)}, {length} bytes): register returned "
+                f"{ret_value}"
+            )
+
+    def deregister(self, ptr) -> int:
+        """Deregister a single memory region; returns the engine status."""
         try:
             ret_value = self.engine.unregister_memory(ptr)
         except Exception:
@@ -151,6 +171,7 @@ class MooncakeTransferEngine:
 
         if ret_value != 0:
             logger.debug("Mooncake memory deregistration %s failed.", ptr)
+        return ret_value
 
     def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
         """Batch register multiple memory regions."""
