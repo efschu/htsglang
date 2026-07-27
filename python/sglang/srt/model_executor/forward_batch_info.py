@@ -103,6 +103,14 @@ class ForwardMode(IntEnum):
     def is_prefill(self, include_draft_extend_v2: bool = False):
         return self.is_extend(include_draft_extend_v2=include_draft_extend_v2)
 
+    def is_plain_prefill(self):
+        """EXTEND/MIXED only: the target-runner prefill forwards that pair 1:1
+        with ``process_batch_result_prefill``. Used by the per-rank prefill
+        log to match one timed forward span to one reported prefill batch;
+        spec verify, draft extend, split prefill and dLLM extend are excluded
+        because their forward count is not 1:1 with prefill batch reports."""
+        return self == ForwardMode.EXTEND or self == ForwardMode.MIXED
+
     def is_extend(self, include_draft_extend_v2: bool = False):
         return (
             self == ForwardMode.EXTEND

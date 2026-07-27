@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import tempfile
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -86,6 +86,88 @@ class PrefillStats:
         )
 
 
+class RankPrefillLog:
+    """Per-rank prefill visibility.
+
+    The "Prefill batch ..." summary line is emitted only on the stats-logging
+    rank (attn_tp_rank == 0); the other ranks stay silent, so a per-rank
+    prefill measurement cannot be won from the logs even though the numbers
+    exist on every rank (each rank runs the same scheduling pass against its
+    own radix cache). This class emits one brief line per prefill batch on
+    EVERY rank, at the same log level as the existing summary line:
+
+        Prefill rank batch, #new-token: N, #cached-token: C, #chunks: K, gpu-ms: T
+
+    ``#cached-token`` is the rank-local evidence that a prefill was actually
+    computed rather than served from this rank's prefix cache. ``gpu-ms`` is
+    the CUDA-event span of the prefill forward(s), harvested DEFERRED --
+    never a host sync in the hot path, the same discipline as the decode-side
+    DeviceTimer: the record is queued at report time, the duration attaches
+    once its events have completed, and the line is emitted at the next flush
+    point (next prefill report, any decode iteration, or the idle self-check).
+    ``#chunks`` counts how many prefill forwards are folded into one line
+    (normally 1; >1 only when several completed at the same flush point, e.g.
+    the tail of a chunked prefill flushed from the decode loop).
+
+    Pairing is FIFO on both sides: records are queued in schedule order and
+    the DeviceTimer harvests interval durations in completion order of the
+    same forwards, so index i of one queue corresponds to index i of the
+    other (only ForwardMode.is_plain_prefill forwards are wrapped, and those
+    are exactly the ones reported through ``report_prefill_stats``). Without
+    a timer (non-CUDA device, PP > 1, or a non-timeable forward mode) the
+    line is emitted immediately, without the gpu-ms field.
+    """
+
+    def __init__(self) -> None:
+        # Installed by SchedulerMetricsReporter when CUDA-event timing is
+        # applicable; stays None otherwise.
+        self.timer: Optional[DeviceTimer] = None
+        self._pending: deque = deque()  # (new_tokens, cached_tokens)
+        self._durations: deque = deque()  # seconds, completion order
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self._pending)
+
+    def _on_duration(self, t: float, **_kwargs) -> None:
+        self._durations.append(t)
+
+    def record(self, new_tokens: int, cached_tokens: int, timed: bool) -> None:
+        if timed and self.timer is not None:
+            self._pending.append((new_tokens, cached_tokens))
+        else:
+            logger.info(
+                "Prefill rank batch, #new-token: %d, #cached-token: %d, "
+                "#chunks: 1",
+                new_tokens,
+                cached_tokens,
+            )
+
+    def flush(self) -> None:
+        """Harvest completed CUDA events (query-only, no sync) and emit one
+        line for every record whose duration has arrived."""
+        if self.timer is not None:
+            self.timer._report()
+        k = min(len(self._pending), len(self._durations))
+        if k == 0:
+            return
+        new_tokens = cached_tokens = 0
+        gpu_s = 0.0
+        for _ in range(k):
+            n, c = self._pending.popleft()
+            new_tokens += n
+            cached_tokens += c
+            gpu_s += self._durations.popleft()
+        logger.info(
+            "Prefill rank batch, #new-token: %d, #cached-token: %d, "
+            "#chunks: %d, gpu-ms: %.1f",
+            new_tokens,
+            cached_tokens,
+            k,
+            gpu_s * 1000.0,
+        )
+
+
 @dataclass(kw_only=True)
 class SchedulerMetricsReporter:
     scheduler: Scheduler
@@ -110,6 +192,7 @@ class SchedulerMetricsReporter:
         )
         self._init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
         self._install_device_timer_on_runners()
+        self._install_rank_prefill_timer()
 
     def _init_metrics(
         self,
@@ -159,6 +242,8 @@ class SchedulerMetricsReporter:
 
         self.fwd_occupancy = float("nan")
 
+        self.rank_prefill_log = RankPrefillLog()
+
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
 
         if ENABLE_METRICS_DEVICE_TIMER:
@@ -179,6 +264,25 @@ class SchedulerMetricsReporter:
 
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
             enable_metrics=self.enable_metrics
+        )
+
+    def _install_rank_prefill_timer(self):
+        """Wire the per-rank prefill log's CUDA-event timer onto the TARGET
+        runner only (see RankPrefillLog). Deliberately NOT the draft runners:
+        their extend forwards are not 1:1 with prefill batch reports. GPU
+        timing needs a CUDA(-alike) device; PP pipelines process prefill
+        results on the last stage only, which breaks the FIFO pairing, so
+        they keep the untimed line."""
+        if (
+            getattr(self.scheduler, "device", "") != "cuda"
+            or self.scheduler.server_args.pp_size != 1
+        ):
+            return
+        self.rank_prefill_log.timer = DeviceTimer(
+            reporter=self.rank_prefill_log._on_duration
+        )
+        self.scheduler.tp_worker.model_runner.prefill_rank_timer = (
+            self.rank_prefill_log.timer
         )
 
     def _install_device_timer_on_runners(self):
@@ -541,6 +645,19 @@ class SchedulerMetricsReporter:
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
+        # Per-rank line first: it runs on EVERY rank, ahead of the
+        # logging-rank gate below.
+        self.rank_prefill_log.record(
+            new_tokens=prefill_stats.log_input_tokens,
+            cached_tokens=prefill_stats.log_hit_tokens,
+            timed=(
+                batch is not None
+                and batch.forward_mode is not None
+                and batch.forward_mode.is_plain_prefill()
+            ),
+        )
+        self.rank_prefill_log.flush()
+
         if (
             not self.is_stats_logging_rank
             and not self.current_scheduler_metrics_enabled
@@ -695,6 +812,11 @@ class SchedulerMetricsReporter:
         running_batch: ScheduleBatch = None,
         num_correct_drafts: int = 0,
     ):
+        # Flush per-rank prefill lines whose CUDA events completed after the
+        # last prefill report (e.g. the tail chunk of a prefill burst).
+        if self.rank_prefill_log.has_pending:
+            self.rank_prefill_log.flush()
+
         batch = running_batch or self.scheduler.running_batch
 
         # Every-iteration work: realtime token counting + status logger
@@ -1115,6 +1237,11 @@ class SchedulerMetricsReporter:
 
     def _maybe_log_idle_metrics(self):
         """Collect and log metrics every 30 seconds during idle."""
+        # A prefill burst that goes straight to idle (short generations) has
+        # no decode iteration left to flush its last per-rank line.
+        if self.rank_prefill_log.has_pending:
+            self.rank_prefill_log.flush()
+
         if (
             not self.current_scheduler_metrics_enabled
             or time.perf_counter() <= self.metrics_collector.last_log_time + 30
