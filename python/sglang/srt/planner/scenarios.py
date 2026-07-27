@@ -52,6 +52,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 __all__ = [
     "Axis",
+    "HarnessBinding",
+    "build_harness_command",
     "Window",
     "Metric",
     "StopRule",
@@ -137,6 +139,35 @@ class StopRule:
 
 
 @dataclasses.dataclass
+class HarnessBinding:
+    """How a scenario drives an EXISTING benchmark harness.
+
+    The scenarios here describe measurements; they do not run them. sglang
+    already ships the load generators (``sglang.benchmark.serving`` for the
+    serving path, ``sglang.benchmark.offline_throughput`` and
+    ``bench_one_batch`` for the offline ones) together with a dataset registry.
+    Rebuilding any of that would mean maintaining a second load generator and
+    a second dataset story for no gain, so a scenario binds to one instead:
+    it says which harness, which harness flag each axis maps to, and which
+    harness output field each metric reads from.
+    """
+
+    module: str
+    provides: str = ""
+    fixed_flags: List[str] = dataclasses.field(default_factory=list)
+    #: scenario axis key -> harness flag
+    axis_flags: Dict[str, str] = dataclasses.field(default_factory=dict)
+    #: scenario metric key -> field in the harness result
+    metric_fields: Dict[str, str] = dataclasses.field(default_factory=dict)
+    #: Axes the harness cannot set, because they are host or server settings.
+    external_axes: List[str] = dataclasses.field(default_factory=list)
+    note: str = ""
+
+    def to_json(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
 class Scenario:
     key: str
     question: str
@@ -152,6 +183,8 @@ class Scenario:
     confounders: List[str] = dataclasses.field(default_factory=list)
     requires: List[str] = dataclasses.field(default_factory=list)
     est_runtime_min: Optional[int] = None
+    #: Which existing harness runs this, and how the axes map onto it.
+    harness: Optional[HarnessBinding] = None
     #: Free-text keywords used by :func:`suggest`.
     keywords: List[str] = dataclasses.field(default_factory=list)
     #: A-vs-A noise floor before any comparison. Off only with a reason.
@@ -174,6 +207,7 @@ class Scenario:
             "metrics": [m.to_json() for m in self.metrics],
             "windows": [w.to_json() for w in self.windows],
             "stop_rules": [s.to_json() for s in self.stop_rules],
+            "harness": self.harness.to_json() if self.harness else None,
             "confounders": list(self.confounders),
             "requires": list(self.requires),
             "est_runtime_min": self.est_runtime_min,
@@ -192,6 +226,9 @@ class Scenario:
             metrics=[Metric(**m) for m in d.get("metrics", [])],
             windows=[Window(**w) for w in d.get("windows", [])],
             stop_rules=[StopRule(**s) for s in d.get("stop_rules", [])],
+            harness=(
+                HarnessBinding(**d["harness"]) if d.get("harness") else None
+            ),
             confounders=list(d.get("confounders", [])),
             requires=list(d.get("requires", [])),
             est_runtime_min=d.get("est_runtime_min"),
@@ -303,6 +340,26 @@ _register(
             "the prompt set and validate the outputs.",
             "Clocks unpinned: a drifting P-state inflates the floor.",
         ],
+        harness=HarnessBinding(
+            module="sglang.benchmark.serving",
+            provides="load generation, dataset selection, TTFT/ITL/e2e percentiles",
+            fixed_flags=[
+                "--backend sglang",
+                "--dataset-name random",
+                "--warmup-requests 8",
+                "--seed 1",
+                "--flush-cache",
+                "--output-details",
+            ],
+            axis_flags={'repeat': '(repeat the whole invocation)'},
+            metric_fields={'tok_s': 'output_throughput', 'ttft_p50': 'median_ttft_ms'},
+            external_axes=[],
+            note=(
+                "Percentiles and throughput come from the harness; card state "
+                "and per-rank work come from the collector over the same wall "
+                "clock, joined by timestamp."
+            ),
+        ),
         est_runtime_min=10,
         keywords=["noise", "floor", "rauschen", "a-vs-a", "threshold", "spread"],
         noise_floor_required=False,
@@ -365,6 +422,26 @@ _register(
             "The slowest rank paces the group; a cap applied to the fast card "
             "may not move group throughput at all.",
         ],
+        harness=HarnessBinding(
+            module="sglang.benchmark.serving",
+            provides="load generation, dataset selection, TTFT/ITL/e2e percentiles",
+            fixed_flags=[
+                "--backend sglang",
+                "--dataset-name random",
+                "--warmup-requests 8",
+                "--seed 1",
+                "--flush-cache",
+                "--output-details",
+            ],
+            axis_flags={},
+            metric_fields={'tok_s': 'output_throughput', 'j_per_token': '(collector: energy counter delta / generated tokens)'},
+            external_axes=['power_limit_w'],
+            note=(
+                "Percentiles and throughput come from the harness; card state "
+                "and per-rank work come from the collector over the same wall "
+                "clock, joined by timestamp."
+            ),
+        ),
         requires=["power_target"],
         est_runtime_min=30,
         keywords=["power", "target", "watt", "energy", "efficiency", "cap",
@@ -429,6 +506,26 @@ _register(
             "Fixed cost per handover and cost per token are different terms; "
             "vary the window size to separate them.",
         ],
+        harness=HarnessBinding(
+            module="sglang.benchmark.serving",
+            provides="load generation, dataset selection, TTFT/ITL/e2e percentiles",
+            fixed_flags=[
+                "--backend sglang",
+                "--dataset-name random",
+                "--warmup-requests 8",
+                "--seed 1",
+                "--flush-cache",
+                "--output-details",
+            ],
+            axis_flags={},
+            metric_fields={'steady_tok_s': 'output_throughput', 'restore_gbs': '(collector: spill-path counters, per window)', 'restore_ms': '(collector: restore window duration)'},
+            external_axes=['ram_clock', 'spill_state'],
+            note=(
+                "Percentiles and throughput come from the harness; card state "
+                "and per-rank work come from the collector over the same wall "
+                "clock, joined by timestamp."
+            ),
+        ),
         requires=["ram_timings"],
         est_runtime_min=45,
         keywords=["ram", "memory", "clock", "spill", "offload", "takt",
@@ -519,6 +616,26 @@ _register(
             "Chunked prefill mixes phases in one batch; hold the chunk size "
             "fixed across arms.",
         ],
+        harness=HarnessBinding(
+            module="sglang.benchmark.serving",
+            provides="load generation, dataset selection, TTFT/ITL/e2e percentiles",
+            fixed_flags=[
+                "--backend sglang",
+                "--dataset-name random",
+                "--warmup-requests 8",
+                "--seed 1",
+                "--flush-cache",
+                "--output-details",
+            ],
+            axis_flags={'concurrency': '--max-concurrency', 'prompt_len': '--random-input-len'},
+            metric_fields={'ttft_p95': 'p95_ttft_ms', 'ttft_p50': 'median_ttft_ms', 'prefill_tok_s': 'input_throughput', 'queue_wait_ms': '(engine: sglang:num_queue_reqs and the scheduler wait histogram)'},
+            external_axes=['topology'],
+            note=(
+                "Percentiles and throughput come from the harness; card state "
+                "and per-rank work come from the collector over the same wall "
+                "clock, joined by timestamp."
+            ),
+        ),
         est_runtime_min=40,
         keywords=["prefill", "concurrent", "ttft", "queue", "satellite",
                   "zweitrig", "gleichzeitig", "latenz", "wartezeit"],
@@ -578,6 +695,26 @@ _register(
             "Output content variance exceeds many real effects; fix the prompts "
             "and validate the outputs.",
         ],
+        harness=HarnessBinding(
+            module="sglang.benchmark.serving",
+            provides="load generation, dataset selection, TTFT/ITL/e2e percentiles",
+            fixed_flags=[
+                "--backend sglang",
+                "--dataset-name random",
+                "--warmup-requests 8",
+                "--seed 1",
+                "--flush-cache",
+                "--output-details",
+            ],
+            axis_flags={'sessions': '--max-concurrency', 'context_len': '--random-input-len'},
+            metric_fields={'e2e_p95': 'p95_e2e_latency_ms', 'victim_tok_s': '(collector: per-window throughput of the spilled session)', 'bystander_tok_s': '(collector: per-window throughput of the others)', 'restore_ms': '(collector: restore window duration)'},
+            external_axes=['spill_enabled'],
+            note=(
+                "Percentiles and throughput come from the harness; card state "
+                "and per-rank work come from the collector over the same wall "
+                "clock, joined by timestamp."
+            ),
+        ),
         est_runtime_min=50,
         keywords=["spill", "latency", "concurrent", "session", "offload",
                   "latenz", "gleichzeitig", "victim", "restore"],
@@ -753,6 +890,62 @@ def render_scenario_text(plan: ScenarioPlan) -> str:
         lines.append("")
         lines.append(f"Estimated runtime: ~{s.est_runtime_min} min")
     return "\n".join(lines)
+
+
+def build_harness_command(
+    scenario: Scenario,
+    point: Dict[str, Any],
+    base_url: str = "http://127.0.0.1:30000",
+    num_prompts: int = 64,
+) -> Dict[str, Any]:
+    """Turn one point of the parameter space into a harness invocation.
+
+    Axes the harness cannot set (a host control, a server flag that needs a
+    restart) come back under ``external`` as steps to take BEFORE the command,
+    rather than being dropped. A sweep whose control axis silently vanished
+    would run the same point repeatedly and look like a completed measurement.
+    """
+    h = scenario.harness
+    if h is None:
+        return {
+            "runnable": False,
+            "reason": f"scenario {scenario.key} declares no harness binding",
+        }
+    flags = list(h.fixed_flags) + [f"--base-url {base_url}", f"--num-prompts {num_prompts}"]
+    external: List[Dict[str, Any]] = []
+    unmapped: List[str] = []
+    for axis in scenario.axes:
+        if axis.key not in point:
+            continue
+        value = point[axis.key]
+        flag = h.axis_flags.get(axis.key)
+        if flag and flag.startswith("--"):
+            flags.append(f"{flag} {value}")
+        elif axis.key in h.external_axes:
+            external.append(
+                {
+                    "axis": axis.key,
+                    "label": axis.label,
+                    "value": value,
+                    "kind": axis.kind,
+                    "apply": (
+                        "set on the host before the run"
+                        if axis.kind == "control"
+                        else "restart the server with this setting"
+                    ),
+                }
+            )
+        else:
+            unmapped.append(axis.key)
+    return {
+        "runnable": not unmapped,
+        "module": h.module,
+        "command": f"python -m {h.module} " + " ".join(flags),
+        "external": external,
+        "unmapped_axes": unmapped,
+        "metric_fields": dict(h.metric_fields),
+        "windows": [w.key for w in scenario.windows],
+    }
 
 
 def load_scenarios(path: str, into: Optional[Dict[str, Scenario]] = None) -> Dict[str, Scenario]:

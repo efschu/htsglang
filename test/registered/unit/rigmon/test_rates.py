@@ -4,6 +4,7 @@ import unittest
 
 from sglang.srt.rigmon.rates import (
     PeakCapability,
+    engine_rank_rates,
     group_throughput,
     idle_floor_from_power_profile,
     pacing_rank,
@@ -244,6 +245,117 @@ class TestPacingRank(CustomTestCase):
 
     def test_single_rank_has_no_pacer(self):
         self.assertEqual(pacing_rank([]), (None, None))
+
+
+class TestEngineDerivedWork(CustomTestCase):
+    """The engine already publishes per-TP-rank busy time and estimated work.
+    That is an exact attribution and must outrank the device counters."""
+
+    def _rates(self, dt=2.0):
+        prev = {
+            0: {"forward_execution_seconds_total": 10.0,
+                "estimated_flops_per_gpu_total": 1e12,
+                "estimated_read_bytes_per_gpu_total": 1e9,
+                "estimated_write_bytes_per_gpu_total": 0.0},
+            1: {"forward_execution_seconds_total": 10.0,
+                "estimated_flops_per_gpu_total": 1e12,
+                "estimated_read_bytes_per_gpu_total": 1e9,
+                "estimated_write_bytes_per_gpu_total": 0.0},
+        }
+        cur = {
+            0: {"forward_execution_seconds_total": 11.8,
+                "estimated_flops_per_gpu_total": 1e12 + 200e12,
+                "estimated_read_bytes_per_gpu_total": 1e9 + 800e9,
+                "estimated_write_bytes_per_gpu_total": 200e9},
+            1: {"forward_execution_seconds_total": 10.8,
+                "estimated_flops_per_gpu_total": 1e12 + 40e12,
+                "estimated_read_bytes_per_gpu_total": 1e9 + 300e9,
+                "estimated_write_bytes_per_gpu_total": 100e9},
+        }
+        return engine_rank_rates(cur, prev, dt)
+
+    def test_busy_time_delta_is_the_active_share(self):
+        r = self._rates()
+        self.assertAlmostEqual(r[0]["active_share"], 0.9)
+        self.assertAlmostEqual(r[1]["active_share"], 0.4)
+
+    def test_estimated_counters_become_achieved_rates(self):
+        r = self._rates()
+        self.assertAlmostEqual(r[0]["achieved_tflops"], 100.0)
+        self.assertAlmostEqual(r[0]["achieved_gbs"], 500.0)
+
+    def test_reads_and_writes_are_both_counted(self):
+        r = self._rates()
+        # rank 1: (300 + 100) GB over 2 s
+        self.assertAlmostEqual(r[1]["achieved_gbs"], 200.0)
+
+    def test_engine_rates_outrank_coarse_device_counters(self):
+        cards = [
+            card(0, "GPU-5090", "RTX 5090", sm_active=0.10, dram_active=0.10,
+                 activity_source="nvml-utilization (coarse fallback)"),
+            card(1, "GPU-3080a", "RTX 3080", sm_active=0.10, dram_active=0.10,
+                 activity_source="nvml-utilization (coarse fallback)"),
+        ]
+        v = rank_shares(cards, peaks_from_hw_profile(HW_PROFILE),
+                        rank_gpu_id=[0, 1], engine_rates=self._rates())
+        self.assertAlmostEqual(v.ranks[0].active_share, 0.9)
+        self.assertEqual(v.ranks[0].work_source, "engine forward-time counter")
+        self.assertAlmostEqual(v.ranks[0].achieved_gbs, 500.0)
+        # ...and the coarse caveat is gone, replaced by the estimation caveat.
+        keys = {c.key for c in v.caveats}
+        self.assertIn("engine_work_estimated", keys)
+        self.assertNotIn("coarse_activity", keys)
+
+    def test_achieved_fraction_against_the_probed_peak(self):
+        v = rank_shares(
+            [card(0, "GPU-5090", "RTX 5090")],
+            peaks_from_hw_profile(HW_PROFILE),
+            rank_gpu_id=[0],
+            engine_rates=self._rates(),
+        )
+        # 500 GB/s of a measured 1664.1 GB/s peak
+        self.assertAlmostEqual(v.ranks[0].membw_achieved_frac, 500.0 / 1664.1, places=5)
+
+    def test_roofline_from_engine_rates(self):
+        v = rank_shares(
+            [card(0, "GPU-5090", "RTX 5090")],
+            peaks_from_hw_profile(HW_PROFILE),
+            rank_gpu_id=[0],
+            engine_rates=self._rates(),
+        )
+        # 100 TFLOP/s over 500 GB/s = 200 flop/byte, balance ~140 -> compute
+        self.assertAlmostEqual(v.ranks[0].intensity_flop_per_byte, 200.0, places=6)
+        self.assertEqual(v.ranks[0].bound_by, "compute")
+
+    def test_pacer_from_engine_rates(self):
+        v = rank_shares(
+            [card(0, "GPU-5090", "RTX 5090"), card(1, "GPU-3080a", "RTX 3080")],
+            peaks_from_hw_profile(HW_PROFILE),
+            rank_gpu_id=[0, 1],
+            engine_rates=self._rates(),
+        )
+        self.assertEqual(v.pacer_rank, 0)
+        self.assertNotIn("direction, not a measurement", v.pacer_basis)
+
+    def test_single_rank_export_is_flagged(self):
+        v = rank_shares([card(0, "GPU-5090", "RTX 5090")], {},
+                        single_rank_export=True)
+        keys = {c.key for c in v.caveats}
+        self.assertIn("single_rank_export", keys)
+        text = [c.text for c in v.caveats if c.key == "single_rank_export"][0]
+        self.assertIn("--enable-metrics-for-all-schedulers", text)
+
+    def test_no_previous_sample_yields_no_rates(self):
+        self.assertEqual(engine_rank_rates({0: {"a": 1.0}}, None, 1.0), {})
+        self.assertEqual(engine_rank_rates({0: {"a": 1.0}}, {0: {"a": 0.0}}, 0.0), {})
+
+    def test_counter_reset_is_ignored_rather_than_reported_negative(self):
+        r = engine_rank_rates(
+            {0: {"forward_execution_seconds_total": 1.0}},
+            {0: {"forward_execution_seconds_total": 100.0}},
+            2.0,
+        )
+        self.assertNotIn(0, r)
 
 
 if __name__ == "__main__":

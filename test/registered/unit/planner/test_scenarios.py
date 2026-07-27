@@ -7,6 +7,7 @@ import unittest
 
 from sglang.srt.planner.scenarios import (
     SCENARIOS,
+    build_harness_command,
     Scenario,
     load_scenarios,
     plan_scenario,
@@ -188,6 +189,69 @@ class TestExtensibility(CustomTestCase):
             [w.exclude_from_headline for w in again.windows],
             [w.exclude_from_headline for w in s.windows],
         )
+
+
+class TestHarnessBinding(CustomTestCase):
+    """Scenarios DRIVE the existing harnesses; they do not reimplement them."""
+
+    def test_every_scenario_binds_to_an_existing_harness(self):
+        for key, s in SCENARIOS.items():
+            self.assertIsNotNone(s.harness, f"{key} has no harness binding")
+            self.assertTrue(s.harness.module.startswith("sglang."), key)
+
+    def test_the_bound_module_actually_exists(self):
+        import importlib
+
+        for s in SCENARIOS.values():
+            importlib.import_module(s.harness.module)
+
+    def test_axis_flags_are_real_harness_flags(self):
+        import pathlib
+
+        src = pathlib.Path("python/sglang/benchmark/serving.py")
+        if not src.is_file():
+            self.skipTest("harness source not in this checkout")
+        text = src.read_text()
+        for s in SCENARIOS.values():
+            for flag in s.harness.axis_flags.values():
+                if flag.startswith("--"):
+                    self.assertIn(f'"{flag}"', text, f"{flag} is not a harness flag")
+
+    def test_command_is_built_for_a_sweep_point(self):
+        s = SCENARIOS["concurrent_prefill_capacity"]
+        out = build_harness_command(s, {"concurrency": 8, "prompt_len": 8192})
+        self.assertTrue(out["runnable"])
+        self.assertIn("--max-concurrency 8", out["command"])
+        self.assertIn("--random-input-len 8192", out["command"])
+        self.assertIn("sglang.benchmark.serving", out["command"])
+
+    def test_axes_the_harness_cannot_set_surface_as_manual_steps(self):
+        """A control axis silently dropped would make the sweep run the same
+        point repeatedly and still look complete."""
+        s = SCENARIOS["power_target_sweep"]
+        out = build_harness_command(s, {"power_limit_w": "70%"})
+        self.assertEqual(out["external"][0]["axis"], "power_limit_w")
+        self.assertIn("host", out["external"][0]["apply"])
+        self.assertEqual(out["unmapped_axes"], [])
+
+    def test_server_side_axis_is_marked_as_needing_a_restart(self):
+        s = SCENARIOS["spill_latency_under_concurrency"]
+        out = build_harness_command(s, {"spill_enabled": True, "sessions": 3})
+        ext = {e["axis"]: e for e in out["external"]}
+        self.assertIn("restart", ext["spill_enabled"]["apply"])
+        self.assertIn("--max-concurrency 3", out["command"])
+
+    def test_reproducibility_flags_are_fixed(self):
+        out = build_harness_command(SCENARIOS["noise_floor"], {})
+        self.assertIn("--seed", out["command"])
+        self.assertIn("--flush-cache", out["command"])
+        self.assertIn("--warmup-requests", out["command"])
+
+    def test_windows_travel_with_the_command(self):
+        out = build_harness_command(
+            SCENARIOS["spill_latency_under_concurrency"], {"sessions": 2}
+        )
+        self.assertIn("restore_transient", out["windows"])
 
 
 if __name__ == "__main__":

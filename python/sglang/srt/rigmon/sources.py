@@ -670,6 +670,25 @@ class GpuSampler:
 # ---------------------------------------------------------------------------
 
 _METRIC = re.compile(r"^(sglang:[a-z_0-9]+)(?:\{([^}]*)\})?\s+([0-9eE.+-]+)\s*$")
+_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
+
+#: Metrics the engine already publishes PER TP RANK, which is what makes an
+#: exact per-rank work attribution possible without any profiling counter.
+#: ``forward_execution_seconds_total`` is GPU-busy time, so differencing it
+#: gives a rank's active share directly; the estimated FLOP and byte counters
+#: are derived from the shapes actually executed, so differencing them gives
+#: achieved rates that can be put against the probe's measured peaks.
+#:
+#: Caveat that must travel with them: unless the server runs with
+#: ``--enable-metrics-for-all-schedulers`` only TP rank 0 exports, and every
+#: series then carries ``tp_rank="0"`` regardless of which rank did the work.
+PER_RANK_KEYS = {
+    "forward_execution_seconds_total": "sglang:forward_execution_seconds_total",
+    "estimated_flops_per_gpu_total": "sglang:estimated_flops_per_gpu_total",
+    "estimated_read_bytes_per_gpu_total": "sglang:estimated_read_bytes_per_gpu_total",
+    "estimated_write_bytes_per_gpu_total": "sglang:estimated_write_bytes_per_gpu_total",
+    "fwd_occupancy": "sglang:fwd_occupancy",
+}
 
 #: Prometheus names the collector keeps, mapped to short keys.
 _ENGINE_KEYS = {
@@ -687,7 +706,48 @@ _ENGINE_KEYS = {
     "num_requests_total": "sglang:num_requests_total",
     "prompt_tokens_total": "sglang:prompt_tokens_total",
     "generation_tokens_total": "sglang:generation_tokens_total",
+    "e2e_request_latency_seconds": "sglang:e2e_request_latency_seconds_sum",
+    "inter_token_latency_seconds": "sglang:inter_token_latency_seconds_sum",
+    "utilization": "sglang:utilization",
 }
+
+
+def parse_prometheus(text: str) -> Dict[str, List[Tuple[Dict[str, str], float]]]:
+    """Parse an exposition into ``name -> [(labels, value), ...]``.
+
+    Labels are KEPT. An earlier version of this parser collapsed each metric to
+    its bare name and retained the last value seen, which silently discarded
+    exactly the dimension that matters here: the engine labels its counters
+    with ``tp_rank``, so collapsing them threw away the per-rank breakdown and
+    replaced it with whichever rank happened to be printed last.
+    """
+    out: Dict[str, List[Tuple[Dict[str, str], float]]] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _METRIC.match(line)
+        if not m:
+            continue
+        try:
+            value = float(m.group(3))
+        except ValueError:
+            continue
+        labels = dict(_LABEL.findall(m.group(2) or ""))
+        out.setdefault(m.group(1), []).append((labels, value))
+    return out
+
+
+def _sum_series(series: Optional[List[Tuple[Dict[str, str], float]]]) -> Optional[float]:
+    """Total a counter across its label sets.
+
+    Summing is right for counters split by a secondary label (a forward-time
+    counter carries a ``category`` label per forward mode, and the rank's busy
+    time is the total across modes). Picking one arbitrarily would under-report.
+    """
+    if not series:
+        return None
+    return sum(v for _, v in series)
 
 
 @dataclasses.dataclass
@@ -700,6 +760,12 @@ class EngineSample:
     reason: Optional[str] = None
     metrics: Dict[str, float] = dataclasses.field(default_factory=dict)
     info: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    #: tp_rank -> {short key: cumulative value}. Empty when the server does not
+    #: export per-rank series.
+    per_rank: Dict[int, Dict[str, float]] = dataclasses.field(default_factory=dict)
+    #: Set when only one rank exports, i.e. the per-rank view is really the
+    #: rank-0 view wearing every rank's name.
+    per_rank_note: Optional[str] = None
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -731,19 +797,45 @@ class EngineScraper:
             return EngineSample(
                 up=False, reason=f"{self.base_url}/metrics unreachable ({e})"
             )
-        vals: Dict[str, float] = {}
-        for line in txt.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            m = _METRIC.match(line)
-            if not m:
-                continue
-            try:
-                vals[m.group(1)] = float(m.group(3))
-            except ValueError:
-                continue
-        metrics = {k: vals[v] for k, v in _ENGINE_KEYS.items() if v in vals}
+        parsed = parse_prometheus(txt)
+        metrics: Dict[str, float] = {}
+        for short, name in _ENGINE_KEYS.items():
+            total = _sum_series(parsed.get(name))
+            if total is not None:
+                metrics[short] = total
+
+        per_rank: Dict[int, Dict[str, float]] = {}
+        for short, name in PER_RANK_KEYS.items():
+            for labels, value in parsed.get(name, []):
+                raw = labels.get("tp_rank")
+                if raw is None:
+                    continue
+                try:
+                    rank = int(raw)
+                except ValueError:
+                    continue
+                slot = per_rank.setdefault(rank, {})
+                # Counters split by a secondary label (category / mode)
+                # accumulate; gauges simply take the latest value.
+                if short.endswith("_total"):
+                    slot[short] = slot.get(short, 0.0) + value
+                else:
+                    slot[short] = value
+
+        note = None
+        if len(per_rank) == 1:
+            note = (
+                "only one TP rank exports metrics, so this is rank "
+                f"{next(iter(per_rank))}'s view, not a per-rank breakdown. "
+                "Start the server with --enable-metrics-for-all-schedulers to "
+                "get one series per rank."
+            )
+        elif not per_rank:
+            note = (
+                "the server exports no per-rank series; per-rank work "
+                "attribution falls back to device counters"
+            )
+
         info: Dict[str, Any] = {}
         for path in ("/get_server_info", "/server_info"):
             try:
@@ -751,4 +843,10 @@ class EngineScraper:
                 break
             except Exception:
                 continue
-        return EngineSample(up=True, metrics=metrics, info=info)
+        return EngineSample(
+            up=True,
+            metrics=metrics,
+            info=info,
+            per_rank=per_rank,
+            per_rank_note=note,
+        )

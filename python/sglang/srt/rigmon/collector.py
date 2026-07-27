@@ -39,6 +39,7 @@ from sglang.srt.rigmon.config import CollectorConfig
 from sglang.srt.rigmon.rates import (
     GroupThroughput,
     RankView,
+    engine_rank_rates,
     group_throughput,
     peaks_from_hw_profile,
     rank_shares,
@@ -258,6 +259,7 @@ class Collector:
         self._last_engine = EngineSample(up=False, reason="not sampled yet")
         self._last_metrics: Optional[Dict[str, float]] = None
         self._last_metrics_ts: Optional[float] = None
+        self._last_per_rank: Optional[Dict[int, Dict[str, float]]] = None
         self._last_view: Optional[RankView] = None
         self._last_throughput = GroupThroughput()
         self._caps: Optional[CapabilityReport] = None
@@ -285,7 +287,21 @@ class Collector:
             rank_gpu = info["rank_gpu_id"]
         elif info.get("tp_size"):
             rank_gpu = list(range(int(info["tp_size"])))
-        view = rank_shares(cards, self.peaks, rank_gpu)
+
+        # The engine's per-rank counters are the exact attribution; device
+        # counters are the fallback. Differencing needs the previous sample.
+        engine_rates = engine_rank_rates(
+            engine.per_rank, self._last_per_rank, dt
+        )
+        if engine.per_rank:
+            self._last_per_rank = {k: dict(v) for k, v in engine.per_rank.items()}
+        view = rank_shares(
+            cards,
+            self.peaks,
+            rank_gpu,
+            engine_rates=engine_rates,
+            single_rank_export=(len(engine.per_rank or {}) == 1),
+        )
 
         values = flatten_sample(cards, engine, view)
         if throughput.gen_tok_s is not None:
