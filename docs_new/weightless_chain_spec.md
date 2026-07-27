@@ -560,9 +560,15 @@ integer equality — and write `predicts[parent] = target_predict[parent]`, with
 `target_predict = argmax(next_token_logits)` (`eagle_utils.py:1029`). There is no
 threshold, tolerance, probability comparison or coin anywhere on this path;
 `--speculative-accept-threshold-single` / `-acc` and the uniform coins are
-consumed by the **sampling** branch only (`eagle_utils.py:1107-1128`), which
-`temperature 0` never enters (`sampling_params.py:169-172` sets `top_k = 1`,
-and `is_all_greedy = all(top_k <= 1)`).
+consumed by the **sampling** branch only (`eagle_utils.py:1107-1128`; their
+only other mention in the tree is the scheduler's runtime-update allowlist,
+not a second consumption site). `temperature 0` takes the greedy branch
+(`sampling_params.py:169-172` sets `top_k = 1`), with the caveat that the
+predicate is BATCH-wide -- `is_all_greedy = all(top_k <= 1)` over the batch's
+requests, so one non-greedy request routes the whole batch into the sampling
+branch. Gate runs are single-request, so this does not affect the oracle; it
+does mean "temperature 0 implies the greedy verify path" is a statement about
+the batch, not about the request.
 
 *Therefore a divergence cannot originate in the accept decision.* It enters
 through the target logits, or through something that changes what the logits are
