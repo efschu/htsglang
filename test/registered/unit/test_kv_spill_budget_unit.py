@@ -694,6 +694,11 @@ def _fake_server_args(**over):
         kv_session_offload_spill_hysteresis_steps=0,
         kv_session_offload_spill_cooldown_seconds=0.0,
         kv_session_offload_budget_demote_grace_iters=256,
+        # #224 destination flags (unset -> inert; the merged validator
+        # reads both the budget and the destination attribute sets)
+        kv_session_offload_destinations=None,
+        kv_session_offload_destination_extra_config=None,
+        kv_session_offload_park_timeout_iters=512,
         speculative_algorithm=None,
         attention_backend="flashinfer",
         page_size=1,
