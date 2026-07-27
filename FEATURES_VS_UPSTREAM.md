@@ -329,7 +329,11 @@ per-ROLE KV storage precision (`--weightless-kv-worker-cache-dtype`, opt-in, def
 weightless workers can hold their KV token-shard in fp8 while the head keeps its own format, since
 KV bytes cross the role boundary only in the model compute dtype. Whether that buys capacity
 depends on which rank binds the min-reduced token budget — the boot log names it (see
-`docs_new/weightless_kv_role_precision.md`).
+`docs_new/weightless_kv_role_precision.md`). Chain speculation
+(EAGLE/EAGLE3/NEXTN at `--speculative-eagle-topk 1`) composes with the lane as of #143 via
+`--speculative-draft-placement solo` hosted on the lane's head rank; tree verify, adaptive
+draft length and the block-decode/host-spill tier stay hard-rejected alongside it.
+Design: `docs_new/weightless_chain_spec.md`.
 
 **Upstream:** no equivalent in sglang.
 
@@ -762,6 +766,29 @@ on each vendor. **Scope note:** gfx900 Triton support itself depends on the exte
 
 ---
 
+### SWA-DCP Stage B (#96)
+
+Status: Cross-checked. Merged into `integration/r3-probe` in the Window-4 merge stack
+(2026-07-27) together with `fix/gemma4-textonly-mask` (#186), which is its required partner —
+either branch alone leaves H4 red. The ~10 global
+full-attention layers of an SWA-hybrid (Gemma-4 class) are token-sharded by the weighted owner
+rule of #173; the ~50 sliding-window layers keep their unsharded local path, so no
+`(owner slice ∩ window)` masking arises at all (the window-sharding alternative was measured
+against and rejected in #91 §4). Requires `--swa-pool-sizing cap` (Stage A, row 19) — in ratio
+mode the unsharded SWA pool would be scaled by the *global* context budget. Refused: HiCache,
+speculative decoding, MLA, weightless-KV, pure-SWA models. Evidence (Window 3, on the then-
+unmerged branch pair): Stage B boots (H4) and a needle planted ~3k tokens beyond the 1024-token
+sliding window retrieves byte-identical to a TP=1 solo-5090 oracle (#96-H5); H6/H7 also green.
+The **~+6-10% figure remains an ex-ante design estimate, not a measurement** — no throughput
+number has been taken; the recipe is `docs_new/swa_dcp_stage_b_triton.md` §8.
+Carried along, because Stage B is where it bites: `_plan_aware_dcp_group_q_head_counts` took
+`max()` over a hybrid model's two kv-head bases, which is right for a workspace size and wrong
+for a collective's per-rank counts — for 32 q heads over bases {16, 8} and ratios [5,3,2] the max
+is `[16,10,8]`, sum 34 against a total of 32. Collectives now use the full-attention base with an
+exhaustiveness check; single-base models are byte-identical.
+
+---
+
 ## Guarded / descoped (implemented in code, deliberately gated off)
 
 Built and evaluated, then gated off — listed for completeness, not shipped as usable capabilities.
@@ -772,24 +799,6 @@ uneven-TP/DCP machinery, which has no upstream analog (see rows 1/2/18 for that 
   (#76)** — Built and GPU-tested; found silently non-greedy under weighted DCP and
   perf-negative on this rig; restored as a hard fail-fast guard with a CPU test
   (falsifikator-geprueft — reproduced on hardware before the guard).
-- **SWA-DCP Stage B (#96)** — **no longer gated off: merged into `integration/r3-probe` in the
-  Window-4 merge stack (2026-07-27), together with `fix/gemma4-textonly-mask` (#186), which is its
-  required partner — either branch alone leaves H4 red.** Status: Cross-checked. The ~10 global
-  full-attention layers of an SWA-hybrid (Gemma-4 class) are token-sharded by the weighted owner
-  rule of #173; the ~50 sliding-window layers keep their unsharded local path, so no
-  `(owner slice ∩ window)` masking arises at all (the window-sharding alternative was measured
-  against and rejected in #91 §4). Requires `--swa-pool-sizing cap` (Stage A, row 19) — in ratio
-  mode the unsharded SWA pool would be scaled by the *global* context budget. Refused: HiCache,
-  speculative decoding, MLA, weightless-KV, pure-SWA models. Evidence (Window 3, on the then-
-  unmerged branch pair): Stage B boots (H4) and a needle planted ~3k tokens beyond the 1024-token
-  sliding window retrieves byte-identical to a TP=1 solo-5090 oracle (#96-H5); H6/H7 also green.
-  The **~+6-10% figure remains an ex-ante design estimate, not a measurement** — no throughput
-  number has been taken; the recipe is `docs_new/swa_dcp_stage_b_triton.md` §8.
-  Carried along, because Stage B is where it bites: `_plan_aware_dcp_group_q_head_counts` took
-  `max()` over a hybrid model's two kv-head bases, which is right for a workspace size and wrong
-  for a collective's per-rank counts — for 32 q heads over bases {16, 8} and ratios [5,3,2] the max
-  is `[16,10,8]`, sum 34 against a total of 32. Collectives now use the full-attention base with an
-  exhaustiveness check; single-base models are byte-identical.
 - **Replicated-KV eligibility widened to `kv == tp` (the `<` -> `<=` flip, row 1)** —
   Built, red/green-tested on CPU, and GPU-measured (falsifikator-geprueft — the CPU test was
   written red-then-green against the flip); the GPU measurement **refuted** it: at
@@ -968,3 +977,11 @@ llama.cpp, and ik_llama.cpp comparisons in detail sections — engine-by-engine 
 mechanism-difference asides, "no equivalent"/"ahead of" framing — are removed; those engines are
 compared only in the matrix now. No status level, measured number, or `unverified`/`not yet merged`
 marker was touched.
+**This pass (2026-07-27, placement):** SWA-DCP Stage B (#96) moved out of "Guarded / descoped"
+into its own detail section. Its text already described the Window-4 merge; the surrounding
+heading still declared it gated off, so the document contradicted itself. Wording adjusted to
+state the merge plainly instead of as a correction to the old status. No status level, evidence
+tier, or measured number was changed — the `~+6-10%` figure remains an ex-ante design estimate,
+and the ex-post note in the 2026-07-26 entry above ("stays out of the main matrix since neither
+branch is merged") is left standing as the record of what was true then. An overview-matrix row
+for Stage B is still open.

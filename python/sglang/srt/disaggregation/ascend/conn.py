@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 
 class AscendKVManager(MooncakeKVManager):
+    _transport_name = "Ascend"
+
     def init_engine(self):
         # TransferEngine initialized on ascend.
         local_ip = get_local_ip_auto()
@@ -29,17 +31,30 @@ class AscendKVManager(MooncakeKVManager):
         )
 
     def register_buffer_to_engine(self):
-        self.engine.batch_register(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+        # Status is checked via _batch_register_checked: a region the NPU
+        # fabric did not register is not addressable by RDMA, and continuing
+        # defers the symptom to a later transfer error or a wrong payload.
+        # Reached again on the resume path after a memory-occupation release,
+        # so a failed re-registration is caught there too.
+        self._batch_register_checked(
+            self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens, "KV data buffers"
+        )
         # The Ascend backend optimize batch registration for small memory blocks.
-        self.engine.batch_register(
-            self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+        self._batch_register_checked(
+            self.kv_args.aux_data_ptrs,
+            self.kv_args.aux_data_lens,
+            "auxiliary data buffers",
         )
         # Batch register state/extra pool data buffers
-        for component_ptrs, component_lens in zip(
-            self.kv_args.state_data_ptrs or [],
-            self.kv_args.state_data_lens or [],
+        for idx, (component_ptrs, component_lens) in enumerate(
+            zip(
+                self.kv_args.state_data_ptrs or [],
+                self.kv_args.state_data_lens or [],
+            )
         ):
-            self.engine.batch_register(component_ptrs, component_lens)
+            self._batch_register_checked(
+                component_ptrs, component_lens, f"state data buffers (component {idx})"
+            )
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]

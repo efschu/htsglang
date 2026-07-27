@@ -26,7 +26,7 @@ import tempfile
 import unittest
 
 from sglang.srt.planner.hardware import GpuDescriptor, HardwareSpec
-from sglang.srt.planner.profiles import GpuProfile, ProfileLibrary
+from sglang.srt.planner.card_library import CardSpec, CardLibrary
 from sglang.srt.planner.roofline import (
     IDLE_FRACTION_OF_TDP,
     ROOFLINE_PROVENANCE,
@@ -54,7 +54,7 @@ def _tiny_model_dir() -> str:
 
 
 def _profile(name, total_mib, tdp_w, membw, flops):
-    return GpuProfile(
+    return CardSpec(
         name=name,
         total_mib=total_mib,
         tdp_w=tdp_w,
@@ -74,7 +74,7 @@ def _hetero_rig():
         for i, n in enumerate(names)
     )
     hw = HardwareSpec(gpus=gpus, source="manual", host_ram_mib=256 * 1024)
-    lib = ProfileLibrary({
+    lib = CardLibrary({
         "RTX 5090": _profile("RTX 5090", 32607, 575, 1792.0, 419.0),
         "RTX 3080 20GB": _profile("RTX 3080 20GB", 20480, 320, 760.0, 119.0),
     })
@@ -118,8 +118,8 @@ class TestRooflineEnergyProduced(unittest.TestCase):
         # A card whose profile carries no TDP -> no energy estimate (like an
         # unknown peak drops the throughput estimate).
         hw, _ = _hetero_rig()
-        lib = ProfileLibrary({
-            "RTX 5090": GpuProfile("RTX 5090", 32607, peak_membw_gbs=1792.0,
+        lib = CardLibrary({
+            "RTX 5090": CardSpec("RTX 5090", 32607, peak_membw_gbs=1792.0,
                                    peak_gemm_tflops_fp16=419.0),  # tdp_w=None
             "RTX 3080 20GB": _profile("RTX 3080 20GB", 20480, 320, 760.0, 119.0),
         })
@@ -235,7 +235,7 @@ class TestColocatedRanks(unittest.TestCase):
         gpus = (GpuDescriptor(index=0, name="RTX 5090", total_mib=32607,
                               pcie_gen=4, pcie_width=16),)
         hw = HardwareSpec(gpus=gpus, source="manual", host_ram_mib=256 * 1024)
-        lib = ProfileLibrary({"RTX 5090": _profile("RTX 5090", 32607, 575,
+        lib = CardLibrary({"RTX 5090": _profile("RTX 5090", 32607, 575,
                                                    1792.0, 419.0)})
         inp = _plan_inputs(self.model, [0, 0], [15000, 15000], ratio=[1, 1])
         rf = estimate_roofline(inp, hw, None, None, library=lib)

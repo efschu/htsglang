@@ -194,9 +194,9 @@ def build_parser() -> argparse.ArgumentParser:
         "Use --rig live to include the live-NVML rig.",
     )
     mx.add_argument(
-        "--list-profiles",
+        "--list-cards",
         action="store_true",
-        help="Print the hardware-profile library and exit.",
+        help="Print the GPU-model card library and exit.",
     )
     ls = p.add_argument_group("landscape / benchmark DB (S5)")
     ls.add_argument(
@@ -223,7 +223,249 @@ def build_parser() -> argparse.ArgumentParser:
         help="Group by nominal bits only (APPROXIMATE — scheme/group-size "
         "shift efficiency and quality).",
     )
+    lv = p.add_argument_group(
+        "levers and measurement scenarios (#220)",
+        "The five directions and the scenario registry are planner data, so "
+        "they are reachable from the planner CLI. They used to live in the "
+        "rigmon CLI, which meant one concept behind two front doors with two "
+        "different argument styles.",
+    )
+    lv.add_argument(
+        "--levers",
+        action="store_true",
+        help="Print the five levers resolved against this rig, this build and "
+        "the evidence at hand: with a cached probe the suggestions are "
+        "concrete, without one deliberately vague. Fit questions need no "
+        "probe; speed questions do.",
+    )
+    lv.add_argument(
+        "--lever",
+        default="",
+        help="Restrict --levers to a comma-separated subset "
+        "(context, decode_speed, prefill_speed, ttft_loaded, energy).",
+    )
+    lv.add_argument(
+        "--homogeneous",
+        action="store_true",
+        help="Treat the rig as uniform, which drops the heterogeneous-only "
+        "flags from every lever.",
+    )
+    lv.add_argument(
+        "--nodes",
+        type=int,
+        default=1,
+        help="How many nodes are joined; the TTFT lever needs at least two.",
+    )
+    lv.add_argument(
+        "--scenario",
+        default="",
+        metavar="KEY",
+        help="Print one measurement scenario resolved against this host's "
+        "facilities: question, parameter space, measured quantities, windows "
+        "and stopping rule, plus the command that drives the existing harness.",
+    )
+    lv.add_argument(
+        "--scenario-question",
+        default="",
+        metavar="TEXT",
+        help="Pick a scenario from a free-text question instead of a key. No "
+        "match returns nothing rather than the first entry.",
+    )
+    lv.add_argument(
+        "--list-scenarios",
+        action="store_true",
+        help="List the known measurement scenarios and their questions.",
+    )
+    lv.add_argument(
+        "--engine",
+        default="http://127.0.0.1:30000",
+        help="Engine base URL a scenario's harness command should target.",
+    )
+    rn = p.add_argument_group(
+        "running a scenario (the executor)",
+        "A scenario says what to measure and comparison.py says what may be "
+        "concluded; --run-study is what runs in between. The A-vs-A noise "
+        "floor is always the head of the schedule, so nothing here can hand a "
+        "comparison a threshold derived from the runs it is meant to judge.",
+    )
+    rn.add_argument(
+        "--run-study",
+        default="",
+        metavar="PATH",
+        help="Run a study described by a JSON file: which scenario, which "
+        "arms, which policy. Boots one server per measurement point and tears "
+        "it down again. Needs GPUs.",
+    )
+    rn.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --run-study: print the boot schedule, the windows, the "
+        "harness command per arm and the preflight, and boot nothing. The two "
+        "failures worth catching early — an axis the harness cannot express "
+        "and a missing device timer — are both visible here.",
+    )
+    rn.add_argument(
+        "--study-out",
+        default="",
+        metavar="PATH",
+        help="Write the study result as JSON. Carries every point with its "
+        "card state, its age and its abort reason, not just the figures.",
+    )
     return p
+
+
+def _available_facilities() -> List[str]:
+    """Facility keys this host actually has, for the lever preconditions.
+
+    Imported lazily and defensively: the planner CLI is offline-capable, and a
+    host without the rigmon dependencies must still be able to print levers —
+    it just cannot claim a facility it could not check.
+    """
+    try:
+        from sglang.srt.rigmon.facilities import detect_host_environment, facilities
+
+        return [f.key for f in facilities(detect_host_environment()) if f.available]
+    except Exception:
+        return []
+
+
+def _cached_probe() -> Optional[dict]:
+    """The cached hardware probe, or None. Never triggers a probe: a
+    multi-second measurement as a side effect of printing a suggestion would
+    be a surprise."""
+    try:
+        from sglang.srt.uneven_perf import get_cached_hardware_profile
+
+        profile, _ = get_cached_hardware_profile()
+        return profile
+    except Exception:
+        return None
+
+
+def _run_levers(args) -> int:
+    from sglang.srt.planner.levers import render_levers_text, suggest_levers
+
+    out = suggest_levers(
+        heterogeneous=not args.homogeneous,
+        probe=_cached_probe(),
+        node_count=args.nodes,
+        facility_keys_available=_available_facilities(),
+        keys=(args.lever.split(",") if args.lever else None),
+    )
+    if args.json:
+        print(json.dumps([s.to_json() for s in out], indent=1))
+        return 0
+    print(render_levers_text(out))
+    return 0
+
+
+def _run_scenario(args) -> int:
+    from sglang.srt.planner.scenarios import (
+        SCENARIOS,
+        build_harness_command,
+        plan_scenario,
+        render_scenario_text,
+        suggest,
+    )
+
+    if args.list_scenarios:
+        for key, s in SCENARIOS.items():
+            print(f"{key:34s} {s.question}")
+        return 0
+
+    scenario = None
+    if args.scenario:
+        scenario = SCENARIOS.get(args.scenario)
+        if scenario is None:
+            print(f"error: no scenario {args.scenario!r}", file=sys.stderr)
+            return 2
+    else:
+        scenario = suggest(args.scenario_question)
+        if scenario is None:
+            print(
+                "No scenario matches that question. Use --list-scenarios to "
+                "see the known ones, or add your own with a scenario JSON "
+                "file.",
+                file=sys.stderr,
+            )
+            return 1
+
+    facs = []
+    try:
+        from sglang.srt.rigmon.facilities import detect_host_environment, facilities
+
+        facs = facilities(detect_host_environment())
+    except Exception:
+        pass
+
+    plan = plan_scenario(scenario, facs)
+    if args.json:
+        print(json.dumps(plan.to_json(), indent=1))
+        return 0
+    print(render_scenario_text(plan))
+    if scenario.harness:
+        first = {a.key: (a.values[0] if a.values else None) for a in scenario.axes}
+        cmd = build_harness_command(scenario, first, base_url=args.engine)
+        print()
+        print("First point drives the existing harness:")
+        print(f"  {cmd['command']}")
+        for e in cmd["external"]:
+            print(f"  before it: set {e['label']} = {e['value']} ({e['apply']})")
+    return 0
+
+
+def _run_study(args) -> int:
+    """Run (or dry-run) a study file.
+
+    A blocked arm ends the invocation before anything boots. The alternative
+    would be a sweep that ran its first point, discovered the axis it cannot
+    set, and left a half-measured server behind.
+    """
+    from sglang.srt.planner.runner import (
+        load_study,
+        render_dry_run_text,
+        render_study_text,
+    )
+
+    try:
+        study = load_study(args.run_study)
+    except Exception as e:
+        print(f"error: {args.run_study}: {e}", file=sys.stderr)
+        return 2
+
+    dry = study.dry_run()
+    if args.dry_run:
+        if args.json:
+            print(json.dumps(dry, indent=1, default=str))
+        else:
+            print(render_dry_run_text(dry))
+        return 0 if dry["runnable"] else 1
+
+    if not dry["runnable"]:
+        print(render_dry_run_text(dry), file=sys.stderr)
+        print(
+            "\nrefusing to start: an arm above is blocked. Running it anyway "
+            "would repeat one point and look like a completed sweep.",
+            file=sys.stderr,
+        )
+        return 1
+
+    from sglang.srt.planner.server_manager import SglangSupervisor
+    from sglang.srt.rigmon.sources import GpuSampler
+
+    study.supervisor = SglangSupervisor()
+    study.sampler = GpuSampler(profile_every=0)
+    study.nvml = study.supervisor._nvml_mod()
+
+    result = study.run()
+    if args.study_out:
+        with open(args.study_out, "w") as f:
+            json.dump(result.to_json(), f, indent=1, default=str)
+    if args.json:
+        print(json.dumps(result.to_json(), indent=1, default=str))
+    else:
+        print(render_study_text(result))
+    return 1 if result.aborted else 0
 
 
 def _load_hardware(args):
@@ -414,9 +656,9 @@ def _print_roofline(rf) -> None:
 def _run_matrix(args) -> int:
     from sglang.srt.planner.explorer import plan_matrix, render_matrix_text
     from sglang.srt.planner.model import resolve_model_ref
-    from sglang.srt.planner.profiles import ProfileLibrary, compose_rig
+    from sglang.srt.planner.card_library import CardLibrary, compose_rig
 
-    lib = ProfileLibrary()
+    lib = CardLibrary()
 
     # Models: --matrix-model (LABEL=PATH) entries, falling back to --model.
     raw_models = list(args.matrix_model or [])
@@ -482,7 +724,7 @@ def _run_matrix(args) -> int:
 def _run_landscape(args) -> int:
     from sglang.srt.planner.landscape import build_mode_a, render_mode_a_text
     from sglang.srt.planner.model import resolve_model_ref
-    from sglang.srt.planner.profiles import ProfileLibrary, compose_rig
+    from sglang.srt.planner.card_library import CardLibrary, compose_rig
     from sglang.srt.planner.results_store import QuantDescriptor, ResultsStore
 
     if not args.model:
@@ -499,7 +741,7 @@ def _run_landscape(args) -> int:
         ResultsStore.load(args.results_store) if args.results_store else ResultsStore()
     )
 
-    lib = ProfileLibrary()
+    lib = CardLibrary()
     planner_rigs = []
     try:
         model_path = resolve_model_ref(args.model)
@@ -550,10 +792,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         serve(host=args.host, port=args.port)
         return 0
 
-    if args.list_profiles:
-        from sglang.srt.planner.profiles import ProfileLibrary
+    if args.list_cards:
+        from sglang.srt.planner.card_library import CardLibrary
 
-        lib = ProfileLibrary()
+        lib = CardLibrary()
         for name in lib.names():
             p = lib.get(name)
             print(
@@ -562,6 +804,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"{(str(p.tdp_w) + 'W') if p.tdp_w else '-'}"
             )
         return 0
+
+    if args.levers:
+        return _run_levers(args)
+
+    if args.run_study:
+        return _run_study(args)
+
+    if args.scenario or args.scenario_question or args.list_scenarios:
+        return _run_scenario(args)
 
     if args.matrix:
         return _run_matrix(args)

@@ -699,13 +699,18 @@ _CURATED: Dict[str, dict] = {
         group="weightless-kv",
         type="bool",
         default=False,
-        mutually_exclusive_with=("speculative_algorithm", "enable_mixed_chunk"),
+        mutually_exclusive_with=("enable_mixed_chunk",),
         hover="EXPERIMENTAL: one 'head rank' holds the full weights and runs "
         "collective-free TP=1; the other DCP ranks are weightless (KV "
         "token-shard + attention only), so a large KV lives on smaller cards "
         "while single-stream speed stays near the head card's rate. Requires "
-        "tp_size == dcp_size and a flashinfer attention backend. Speculative "
-        "decoding and --enable-mixed-chunk are hard-rejected.",
+        "tp_size == dcp_size and a flashinfer attention backend. "
+        "--enable-mixed-chunk is hard-rejected. Speculative decoding is "
+        "supported for CHAIN drafts only (#143): EAGLE/EAGLE3/NEXTN at "
+        "--speculative-eagle-topk 1, with --speculative-draft-placement solo "
+        "hosted on the head rank and a fixed --speculative-num-steps; tree "
+        "verify, adaptive k and the block-decode/host-spill lane stay "
+        "hard-rejected alongside it.",
     ),
     "weightless_kv_head_rank": dict(
         source="fork",
@@ -1174,6 +1179,14 @@ def _c_dcp_spec(values: dict, model_cfg) -> Optional[Tuple[str, str]]:
     # --dcp-size > 1 with speculation; ServerArgs auto-sets dcp_size itself.
     dcp = _int_or(values.get("dcp_size"), 1)
     if dcp <= 1 or not values.get("speculative_algorithm"):
+        return None
+    if values.get("weightless_kv_fastlane"):
+        # #143: the lane is the second supported spec+DCP config (chain drafts
+        # only). Its own admission rules are checked by ServerArgs
+        # (_reject_unsupported_weightless_spec); this constraint only guards the
+        # blanket CUDA door, which the lane no longer sits behind. The lane also
+        # REQUIRES dcp_size == tp_size, so an explicit --dcp-size here is
+        # expected rather than suspicious.
         return None
     tp = _int_or(values.get("tp_size"), 1)
     rtr = values.get("rank_tp_ratio")
@@ -1702,7 +1715,7 @@ def _gpu_names(gpus: Sequence) -> List[str]:
 
 def _gpu_flops(g) -> float:
     """Best-effort FLOPs for the single-GPU tiebreak: a measured/explicit value
-    on the descriptor wins; else the SEED_PROFILES peak table matched by name;
+    on the descriptor wins; else the SEED_CARDS peak table matched by name;
     else 0 (unknown cards tie and fall through to first-index)."""
     name = str((g.get("name") if isinstance(g, dict) else getattr(g, "name", "")) or "")
     for key in ("gemm_tflops", "tflops", "peak_gemm_tflops_fp16"):
@@ -1710,10 +1723,10 @@ def _gpu_flops(g) -> float:
         if v:
             return float(v)
     try:
-        from sglang.srt.planner.profiles import SEED_PROFILES
+        from sglang.srt.planner.card_library import SEED_CARDS
 
         low = name.lower()
-        for p in SEED_PROFILES.values():
+        for p in SEED_CARDS.values():
             if p.name.lower() in low or low in p.name.lower():
                 return float(p.peak_gemm_tflops_fp16 or 0.0)
     except Exception:

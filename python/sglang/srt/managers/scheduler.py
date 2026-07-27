@@ -3122,29 +3122,51 @@ class Scheduler(
                 if self.kv_session_offload.prefill_spill
                 else 0
             )
-            # PS2 V1 master gate (feature flag AND no speculative decoding --
-            # see prefill_spill_deep_gate for why spec is excluded).
+            # PS2 master gate: the feature flag AND no spec configuration that
+            # would later READ the prompt's draft KV. Under plain speculative
+            # decoding the draft extend of a born-spilled prefill is skipped
+            # (nothing reads it) and PS2 runs -- see
+            # prefill_spill_deep_reject_reason for the full argument and for
+            # the three conditions that still block it.
             from sglang.srt.managers.kv_session_offload import (
                 prefill_spill_deep_gate,
+                prefill_spill_deep_reject_reason,
+                resume_under_spec_enabled,
             )
 
+            _spec_active = not self.spec_algorithm.is_none()
+            # BOOT-time DFLASH predicate: under cross-algorithm switching the
+            # DFLASH prefill append runs on every prefill regardless of which
+            # rung is active, so keying this to the active rung would miss it.
+            _dflash_prefill = bool(
+                getattr(self.server_args, "speculative_cross_algorithm", False)
+            ) or self.spec_algorithm.is_dflash_family()
+            _spec_in_tick = bool(
+                getattr(self.kv_session_offload, "spec_in_tick_ready", False)
+            )
+            _resume_spec = resume_under_spec_enabled()
             prefill_spill_deep = prefill_spill_deep_gate(
                 self.kv_session_offload.prefill_spill,
-                not self.spec_algorithm.is_none(),
+                _spec_active,
+                spec_in_tick_ready=_spec_in_tick,
+                resume_under_spec=_resume_spec,
+                dflash_prefill_append=_dflash_prefill,
             )
-            if (
-                self.kv_session_offload.prefill_spill
-                and not self.spec_algorithm.is_none()
-                and not getattr(self, "_ps2_spec_declined_logged", False)
-            ):
-                self._ps2_spec_declined_logged = True
-                logger.info(
-                    "kv-session-offload prefill-spill (PS2): DEEP born-spilled "
-                    "admission is disabled under speculative decoding (%s) -- "
-                    "the draft extend would write to host sentinel slots. "
-                    "PS1 born-spilled admission is unaffected.",
-                    self.spec_algorithm,
+            if self.kv_session_offload.prefill_spill and not prefill_spill_deep:
+                _reason = prefill_spill_deep_reject_reason(
+                    _spec_active, _spec_in_tick, _resume_spec, _dflash_prefill
                 )
+                if _reason is not None and _reason != getattr(
+                    self, "_ps2_spec_declined_reason", None
+                ):
+                    self._ps2_spec_declined_reason = _reason
+                    logger.info(
+                        "kv-session-offload prefill-spill (PS2): DEEP "
+                        "born-spilled admission is declined -- %s "
+                        "(spec=%s). PS1 born-spilled admission is unaffected.",
+                        _reason,
+                        self.spec_algorithm,
+                    )
             # Prefill-Spill (PS1-V1a): replicated free-region count (0 when the
             # feature is off -> the adder relaxation is inert). No collective
             # here (rank-uniform by construction, see prefill_spill_free_regions).

@@ -3006,7 +3006,14 @@ class ServerArgs:
     ] = None
     enable_int8_mamba_checkpoint: A[
         bool,
-        "Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
+        "Store radix-cached linear-attn (mamba) states in int8 in a SEPARATE "
+        "checkpoint pool, doubling cached-prefix capacity for those states. The "
+        "pool is ADDITIONAL memory: it defaults to 2x the active pool's slot "
+        "count at half the per-slot size, so enabling this adds roughly one "
+        "active pool's worth of VRAM per rank (measured 1.9-3.3 GiB) rather "
+        "than saving any. It raises cached-prefix reuse, not "
+        "--max-total-tokens, which is bounded by the ACTIVE pool. Rejected "
+        "together with --enable-hierarchical-cache and --radix-cache-backend.",
     ] = False
     int8_mamba_ckpt_size: A[
         Optional[int],
@@ -3925,6 +3932,16 @@ class ServerArgs:
         # speculative defaults (topk, num_steps) are final.
         self._handle_speculative_draft_placement()
 
+        # Weightless-KV fast lane x speculative decoding (#143): admit CHAIN
+        # drafts, reject every other speculative shape by name. Runs HERE, after
+        # both handle_speculative_decoding (alias + defaults) and the solo
+        # placement validation, because it reads the resolved algorithm and the
+        # resolved solo rank. The lane's mode-independent checks (tp/dcp
+        # geometry, topk > 1, mixed chunk, backend) already ran in
+        # _handle_weightless_kv_fastlane.
+        if self.weightless_kv_fastlane and self.speculative_algorithm is not None:
+            self._reject_unsupported_weightless_spec()
+
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
 
@@ -4101,17 +4118,27 @@ class ServerArgs:
                 "Use --speculative-eagle-topk 1 (linear chain) if/when "
                 "speculative decoding is supported on the lane."
             )
-        # Stage 1 scope: NO speculative decoding (the MTP/NEXTN draft adds its
-        # own attention/DCP sites on the head rank that the weightless workers
-        # do not mirror).
-        if self.speculative_algorithm is not None:
-            raise ValueError(
-                "--weightless-kv-fastlane (Stage 1) does not support "
-                "speculative decoding "
-                f"(--speculative-algorithm={self.speculative_algorithm}). Run "
-                "with speculative decoding OFF; the MTP draft dispatch is a "
-                "later stage."
-            )
+        # SPECULATIVE DECODING (#143): CHAIN speculation only, and only in the
+        # one shape whose cross-rank contract the lane can serve.
+        #
+        # The Stage-1 blanket reject read "the MTP/NEXTN draft adds its own
+        # attention/DCP sites on the head rank that the weightless workers do
+        # not mirror". That is still true of SPLIT draft placement, and it is
+        # exactly what --speculative-draft-placement solo removes: under solo,
+        # the non-host ranks hold a meta draft with no pool, no backends and no
+        # graphs, run no draft forward at all, and take the whole draft phase off
+        # ONE fixed-shape broadcast per round. The verify that follows is a plain
+        # extend over bs*(k+1) rows, which the lane's extend dispatch already
+        # mirrors with the same four collectives per layer that decode issues.
+        #
+        # So the lane admits spec iff every asymmetric piece has a matching
+        # mirror. Those conditions are checked in
+        # _reject_unsupported_weightless_spec, which runs LATER in the handler
+        # chain (right after _handle_speculative_draft_placement) rather than
+        # here: they read the algorithm ALIAS (NEXTN -> EAGLE), the resolved
+        # draft placement and the final speculative defaults, none of which
+        # exist yet at this point. The topk > 1 reject above stays here because
+        # it reads a raw user value and must fire even without an algorithm.
         # Chunked prefill IS supported (#131): every chunk is a plain extend
         # forward mirrored by forward_extend_weightless_worker, branching on the
         # rank-uniform has_prefix (2 collectives for the first chunk, 4 for
@@ -4235,6 +4262,95 @@ class ServerArgs:
                     "weighted token vector); the static slot->tier map is "
                     "defined on the even compaction loc // dcp_size."
                 )
+
+    def _reject_unsupported_weightless_spec(self):
+        """#143: admit CHAIN speculation on the weightless-KV fast lane, and
+        reject every other speculative shape BY NAME.
+
+        Called from _handle_weightless_kv_fastlane only when both the lane and a
+        speculative algorithm are on. Each check names the asymmetric piece it
+        protects, so a future reader can tell what would have to be mirrored to
+        lift it -- rather than reading one blanket "not supported".
+
+        The tree/topk > 1 rejects are NOT here: they live at their own sites
+        (_handle_weightless_kv_fastlane above, _handle_dcp_validation below) and
+        are deliberately independent of this relaxation.
+        """
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        algo = SpeculativeAlgorithm.from_string(self.speculative_algorithm)
+        if algo.is_frozen_kv_mtp() or not algo.is_eagle():
+            # FROZEN_KV_MTP is is_eagle() but reads the TARGET's KV pool in
+            # place; on the lane that pool is token-sharded across the workers,
+            # so no single rank holds what the frozen draft needs. DFLASH /
+            # NGRAM / STANDALONE / DSPARK have their own draft-round shapes that
+            # the lane's worker dispatch does not mirror.
+            raise ValueError(
+                "--weightless-kv-fastlane supports the EAGLE-family chain "
+                "drafters (EAGLE / EAGLE3 / NEXTN) only; got "
+                f"--speculative-algorithm={self.speculative_algorithm}. "
+                "FROZEN_KV_MTP cannot work here at all: its draft reads the "
+                "target KV cache in place, and on the lane that cache is "
+                "token-sharded across the weightless workers."
+            )
+        if self.speculative_draft_placement != "solo":
+            # THE load-bearing condition. Split placement runs a sharded draft
+            # forward on every rank; a weightless worker has no draft weights,
+            # no draft KV pool and no draft backends, so its draft phase would
+            # have to be invented. Solo already defines it: no draft forward at
+            # all, one broadcast per round.
+            raise ValueError(
+                "--weightless-kv-fastlane requires "
+                "--speculative-draft-placement solo when speculative decoding "
+                f"is on (got '{self.speculative_draft_placement}'). The "
+                "weightless ranks hold no draft weights, no draft KV pool and "
+                "no draft attention backends, so they cannot take part in a "
+                "split draft forward; solo placement drafts entirely on the "
+                "host rank and broadcasts the chain token ids once per round."
+            )
+        solo_rank = self.speculative_draft_solo_rank()
+        if solo_rank != self.weightless_kv_head_rank:
+            # Two asymmetries must coincide, or the draft would run on a rank
+            # that holds no target weights (and the target's hidden states,
+            # which the draft consumes, live only on the head).
+            raise ValueError(
+                "--weightless-kv-fastlane requires the solo draft to be hosted "
+                "on the lane's head rank: resolved solo draft rank "
+                f"{solo_rank} != --weightless-kv-head-rank="
+                f"{self.weightless_kv_head_rank}. The draft consumes the "
+                "target's hidden states, which exist only on the head rank "
+                "(every other rank runs a meta model)."
+            )
+        if self.speculative_adaptive:
+            # The verify CUDA graph is captured at ONE shape,
+            # bs * (num_draft_tokens), on both the head and the workers. An
+            # adaptive controller changes num_draft_tokens at runtime, which
+            # would need a bucketed head+worker capture ladder (the #136a
+            # problem, one axis further).
+            raise ValueError(
+                "--weightless-kv-fastlane does not support "
+                "--speculative-adaptive: the lane captures ONE symmetric "
+                "head+worker verify graph shape per boot "
+                "(bs * speculative_num_draft_tokens), and a runtime-varying "
+                "draft length would need a bucketed capture ladder on both "
+                "sides. Use a fixed --speculative-num-steps."
+            )
+        if self.weightless_kv_chunked_block_size:
+            # The block-decode loop (#136a) and its host-spill tier (#134/B1)
+            # are DECODE-shaped structures with their own bucketed graph ladder
+            # over block count. Composing that ladder with a verify-shaped
+            # capture is a separate slice; refuse rather than boot a
+            # combination nobody has captured.
+            raise ValueError(
+                "--weightless-kv-fastlane does not yet support speculative "
+                "decoding together with --weightless-kv-chunked-block-size "
+                f"({self.weightless_kv_chunked_block_size}) / "
+                "--weightless-kv-host-spill-tokens: the streaming block-decode "
+                "graph ladder is captured over block COUNT for a decode-shaped "
+                "step, and a verify step's bs*(k+1) rows are a second capture "
+                "axis that has not been built. Run spec without the block loop, "
+                "or the block loop without spec."
+            )
 
     def _handle_kv_session_offload(self):
         """kv-session-offload (S1) scope validation: fail fast at arg-parse
@@ -4783,7 +4899,19 @@ class ServerArgs:
                     "1 (linear chain speculation), which is correct and "
                     "bitwise-deterministic under uneven-DCP."
                 )
-            if self.speculative_algorithm is not None and not uneven_weighted_dcp:
+            # #143: the weightless-KV fast lane joins the uneven-weighted path as
+            # a supported spec+DCP config, for CHAIN speculation only. Its own
+            # admission rules (solo placement, solo rank == head rank, fixed k,
+            # no block-decode loop) live in _reject_unsupported_weightless_spec,
+            # which runs right after this in _handle_weightless_kv_fastlane --
+            # this site only decides whether the blanket DCP door is shut.
+            # The tree/topk > 1 reject above is unaffected: it fires first and
+            # names the lane explicitly.
+            if (
+                self.speculative_algorithm is not None
+                and not uneven_weighted_dcp
+                and not self.weightless_kv_fastlane
+            ):
                 raise ValueError(
                     "Decode context parallel (--dcp-size / "
                     "--decode-context-parallel-size > 1) on CUDA platform "
@@ -4792,7 +4920,8 @@ class ServerArgs:
                     "speculative decoding enabled. (The uneven-hybrid weighted "
                     "DCP path -- SGLANG_UNEVEN_DCP=1 + "
                     "SGLANG_UNEVEN_DCP_WEIGHTED=1 on a non-uniform "
-                    "--rank-tp-ratio -- is the only supported spec+DCP config.)"
+                    "--rank-tp-ratio -- and the --weightless-kv-fastlane with "
+                    "chain speculation are the supported spec+DCP configs.)"
                 )
         else:
             raise ValueError(

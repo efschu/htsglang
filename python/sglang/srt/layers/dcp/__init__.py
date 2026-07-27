@@ -50,6 +50,13 @@ from sglang.srt.layers.dcp.layout import (
     get_dcp_lens,
     update_local_kv_lens_for_dcp,
 )
+from sglang.srt.layers.dcp.lockstep import (
+    chain_spec_verify_rows,
+    spec_accept_broadcast_shapes,
+    weightless_has_prefix,
+    weightless_layer_op_tags,
+    weightless_step_op_tags,
+)
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.layers.dcp.owner import (
     build_dcp_weighted_kv_indices,
@@ -81,6 +88,7 @@ __all__ = [
     "all_gather_kv_cache_for_mla_extend",
     "all_gather_q_for_mla_decode",
     "build_dcp_weighted_kv_indices",
+    "chain_spec_verify_rows",
     "cp_all_gather_heads_uneven",
     "cp_local_head_bounds",
     "cp_lse_ag_out_ar_mha_uneven",
@@ -102,5 +110,9 @@ __all__ = [
     "get_attention_dcp_rank",
     "get_attention_dcp_world_size",
     "get_dcp_lens",
+    "spec_accept_broadcast_shapes",
     "update_local_kv_lens_for_dcp",
+    "weightless_has_prefix",
+    "weightless_layer_op_tags",
+    "weightless_step_op_tags",
 ]

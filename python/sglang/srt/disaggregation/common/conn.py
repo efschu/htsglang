@@ -978,14 +978,16 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
         if self.kv_mgr.server_args.dp_size > 1 and not req_has_disagg_prefill_dp_rank:
             if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
-                self._register_prefill_dp_rank()
+                if not self._register_prefill_dp_rank_or_fail():
+                    return
             elif (
                 self.kv_mgr.attn_dp_rank
                 != self.bootstrap_room % self.kv_mgr.server_args.dp_size
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
                 if envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get():
-                    self._register_prefill_dp_rank()
+                    if not self._register_prefill_dp_rank_or_fail():
+                        return
                 else:
                     self.kv_mgr.record_failure(
                         self.bootstrap_room,
@@ -999,8 +1001,11 @@ class CommonKVSender(BaseKVSender):
                     self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                     return
 
-    def _register_prefill_dp_rank(self):
-        """Register this request's prefill dp_rank to the bootstrap server."""
+    def _register_prefill_dp_rank(self) -> bool:
+        """Register this request's prefill dp_rank to the bootstrap server.
+
+        Returns True when the bootstrap server accepted the registration.
+        """
         url = f"http://{self.bootstrap_server_url}/register_dp_rank"
         payload = {
             "bootstrap_room": self.bootstrap_room,
@@ -1012,8 +1017,31 @@ class CommonKVSender(BaseKVSender):
                 logger.error(
                     f"Failed to register prefill dp_rank: {response.status_code}, {response.text}"
                 )
+                return False
         except Exception as e:
             logger.error(f"Failed to register prefill dp_rank: {e}")
+            return False
+        return True
+
+    def _register_prefill_dp_rank_or_fail(self) -> bool:
+        """Register the dp_rank, failing the room if the server did not take it.
+
+        Without a registration the decode side queries the bootstrap server and
+        finds nothing, so the request stalls until a timeout with no record of
+        why. Failing the room here matches the routing-conflict branch above,
+        which also records the failure and moves to KVPoll.Failed.
+        """
+        if self._register_prefill_dp_rank():
+            return True
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            f"Failed to register prefill dp_rank {self.kv_mgr.attn_dp_rank} for "
+            f"bootstrap_room {self.bootstrap_room} at "
+            f"{self.bootstrap_server_url}; the decode side cannot resolve this "
+            f"request. See the preceding log line for the transport error.",
+        )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        return False
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices

@@ -24,7 +24,7 @@ STRUCTURAL composed != measured (design §8): every cell carries a
 
   * ``"live"``      — rig read from live NVML (real hardware, real totals).
   * ``"declared"``  — a manually declared real rig (user typed real cards).
-  * ``"composed"``  — a rig assembled from the profile library
+  * ``"composed"``  — a rig assembled from the card library
                       (``source == "library-composition"``): NO measured
                       free-VRAM, NO measured interconnect -> an ESTIMATE. The
                       cell is stamped ``estimate=True`` with the mandatory

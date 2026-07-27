@@ -1,0 +1,68 @@
+{
+  "_": [
+    "The first thing to run on this rig, and the precondition for every A/B",
+    "that follows: the same configuration against itself, boot to boot.",
+    "Without the floor it produces, planner/comparison.py returns 'unknown'",
+    "for every metric, which is the correct answer rather than a failure.",
+    "",
+    "One arm, so the schedule is nothing but the A-vs-A boots. Expect the",
+    "spread on ms_per_verify_round to land near 0.1-0.4 % and on tok_s near",
+    "3-4 %; a tok_s spread far outside that says the prompt set is not fixed.",
+    "",
+    "Topology is the validated uneven TP=3 reference (5090 + 2x 3080).",
+    "rank_gpu_id is torch order, which is NOT NVML order on this box -- check",
+    "it with planner/device_map.py before trusting the mapping."
+  ],
+  "scenario": "noise_floor",
+  "point": {},
+  "policy": {
+    "noise_floor_boots": 3,
+    "comparison_repeats": 1,
+    "num_prompts": 32,
+    "settle_s": 8,
+    "reset_kv_budget": true,
+    "own_vram_timeout_s": 180,
+    "budget": {"target_low_s": 10.0, "target_high_s": 20.0, "ceiling_s": 60.0},
+    "env": {
+      "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1",
+      "SGLANG_MAMBA_SSM_DTYPE": "bfloat16",
+      "SGLANG_UNEVEN_DCP": "1",
+      "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
+      "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+    }
+  },
+  "arms": [
+    {
+      "label": "reference-tp3",
+      "note": "the uneven TP=3 reference topology, unchanged between repeats",
+      "settings": {
+        "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8",
+        "served_model_name": "Qwen3.6-27B",
+        "tp_size": 3,
+        "rank_gpu_id": [0, 1, 2],
+        "rank_tp_ratio": "auto-performance",
+        "kv_cache_dtype": "fp8_e5m2",
+        "context_length": 262144,
+        "max_running_requests": 2,
+        "spec_mode": "off",
+        "trust_remote_code": true,
+        "host": "127.0.0.1",
+        "port": 30000,
+        "python_exe": "/spinning/htsglang-gpu/.venv/bin/python",
+        "extra_flags": [
+          "--enable-metrics-for-all-schedulers",
+          "--rank-auto-reserve-mib", "3000,2200,2200",
+          "--speculative-algorithm", "DFLASH",
+          "--speculative-draft-model", "/spinning/llm_stuff/club-3090/models-cache/qwen3.6-27b-dflash",
+          "--speculative-dflash-block-size", "16",
+          "--speculative-draft-placement", "solo"
+        ]
+      },
+      "conditions": {
+        "model": "Qwen3.6-27B-FP8",
+        "quant": "fp8",
+        "prompt_set": "random/seed1"
+      }
+    }
+  ]
+}

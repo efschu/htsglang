@@ -388,8 +388,20 @@ class DecodeStagingHandler:
                         sock.send_multipart(
                             [b"WATERMARK", wm_round_b, wm_tail_b, sid_b]
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    # A dropped watermark leaves the peer treating the staging
+                    # region as unsafe, which shows up as a stall. Recorded so
+                    # the stall is traceable; the broadcast continues to the
+                    # remaining subscribers.
+                    logger.warning(
+                        "Failed to send WATERMARK (round=%s tail=%s session=%s) "
+                        "for room %s: %s",
+                        wm_round,
+                        wm_tail,
+                        session_id,
+                        room,
+                        e,
+                    )
 
 
 def is_watermark_ready(
@@ -601,12 +613,38 @@ def _get_custom_mem_pool(device: str):
     return custom_mem_pool, pool_type
 
 
+def _check_register_result(result, ptr: int, size: int, what: str) -> None:
+    """Enforce the register_fn contract: failure must not pass silently.
+
+    Transport backends differ in how they report a failed memory-region
+    registration. NIXL raises from its callback and returns None; Mooncake
+    returns an int status (0 = success). Accepting only None or 0 means a
+    backend that reports failure by return value cannot regress into a silent
+    failure whose symptom (transfer error or corrupted payload) shows up far
+    from the cause.
+    """
+    if isinstance(result, bool):
+        # A bool-returning backend reports success as True; note that
+        # `False == 0` in Python, so bools must be classified before the
+        # int-status check below.
+        if result:
+            return
+    elif result is None or result == 0:
+        return
+    raise RuntimeError(
+        f"Transport memory registration failed for {what} "
+        f"(ptr={hex(ptr)}, size={size} bytes): register_fn returned {result!r}"
+    )
+
+
 def init_staging_buffers(register_fn, kv_args, count: int) -> list:
     """Create prefill-side staging buffers and register them with the transport.
 
     Args:
         register_fn: callable(ptr: int, size: int) that registers a memory
-            region with the transport backend.
+            region with the transport backend. It must either raise on failure
+            or return a status of None / 0 on success; any other return value
+            is treated as a registration failure.
         kv_args: KVArgs with gpu_id.
         count: number of staging buffers to create.
 
@@ -623,9 +661,14 @@ def init_staging_buffers(register_fn, kv_args, count: int) -> list:
     custom_mem_pool, _ = _get_custom_mem_pool(device)
 
     buffers = []
-    for _ in range(count):
+    for idx in range(count):
         buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
-        register_fn(buf.get_ptr(), buf.get_size())
+        _check_register_result(
+            register_fn(buf.get_ptr(), buf.get_size()),
+            buf.get_ptr(),
+            buf.get_size(),
+            f"prefill staging buffer {idx} on {device}",
+        )
         buffers.append(buf)
     return buffers
 
@@ -635,7 +678,9 @@ def init_staging_allocator(register_fn, kv_args):
 
     Args:
         register_fn: callable(ptr: int, size: int) that registers a memory
-            region with the transport backend.
+            region with the transport backend. It must either raise on failure
+            or return a status of None / 0 on success; any other return value
+            is treated as a registration failure.
         kv_args: KVArgs with gpu_id.
 
     Returns a StagingAllocator instance.
@@ -650,7 +695,12 @@ def init_staging_allocator(register_fn, kv_args):
 
     custom_mem_pool, _ = _get_custom_mem_pool(device)
     allocator = StagingAllocator(pool_size_bytes, device, gpu_id, custom_mem_pool)
-    register_fn(allocator.get_base_ptr(), allocator.get_total_size())
+    _check_register_result(
+        register_fn(allocator.get_base_ptr(), allocator.get_total_size()),
+        allocator.get_base_ptr(),
+        allocator.get_total_size(),
+        f"decode staging allocator pool on {device}",
+    )
     return allocator
 
 
@@ -771,8 +821,21 @@ def handle_staging_req(
                             session_id.encode("ascii"),
                         ]
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                # Without the response the prefill side never learns where to
+                # stage this chunk and waits for its timeout. Recorded so the
+                # stall is traceable to its cause.
+                logger.warning(
+                    "Failed to send STAGING_RSP for room %s chunk %s "
+                    "(offset=%s round=%s end=%s session=%s): %s",
+                    room,
+                    chunk_idx,
+                    offset,
+                    rnd,
+                    end,
+                    session_id,
+                    e,
+                )
 
 
 def prefetch_staging_reqs(

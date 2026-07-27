@@ -468,6 +468,12 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # kv-session-offload PS2: a born-spilled prefill has host sentinels in
+        # out_cache_loc -- the draft write would land outside the draft pool.
+        # See born_spilled_stub_draft_input for why skipping is sound.
+        if getattr(batch, "kv_session_prefill_spill", False):
+            return self.born_spilled_stub_draft_input(batch, next_token_ids)
+
         # The draft embed clamps unconditionally (to tolerate multimodal pad
         # sentinels), so probe next_token_ids here first -- otherwise a corrupted id
         # would be clamped away instead of surfacing.

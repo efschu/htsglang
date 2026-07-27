@@ -1324,6 +1324,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # kv-session-offload PS2: a born-spilled prefill has host sentinels in
+        # out_cache_loc -- the draft write would land outside the draft pool.
+        # See born_spilled_stub_draft_input for why skipping is sound.
+        if getattr(batch, "kv_session_prefill_spill", False):
+            return self.born_spilled_stub_draft_input(batch, next_token_ids)
+
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
@@ -1979,6 +1985,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
+            # kv-session-offload PS2: the draft extend of a born-spilled
+            # prefill is skipped, so the per-token FULL capture feeds nothing
+            # -- and a born-spilled prompt is by definition long enough that
+            # the capture is a large allocation at the moment device memory is
+            # scarcest. A request that asked for hidden states itself keeps it.
+            if getattr(batch, "kv_session_prefill_spill", False) and not getattr(
+                batch, "return_hidden_states", False
+            ):
+                target_capture_mode = CaptureHiddenMode.NULL
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
 
@@ -2653,14 +2668,37 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
 
-        # Sample
-        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
-        maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+        # Sample.
+        #
+        # WEIGHTLESS-KV WORKER (#143): this rank ran the stripped attention-only
+        # verify forward, so logits_output is None. It cannot probe, sample or
+        # accept -- it RECEIVES the head rank's accept decision off the same
+        # rank-0 broadcast the heterogeneous-GPU accept sync already uses (#50).
+        # Everything after this point is pure tensor/CPU bookkeeping over
+        # replicated inputs and runs identically on both sides, which is what
+        # keeps the scheduler state (seq_lens, kv_committed_len, finish state) in
+        # lockstep. The predicate is a boot-time role, hence rank-uniform.
+        _wl_worker = getattr(
+            self.target_worker.model_runner, "is_weightless_worker", False
+        )
+        if not _wl_worker:
+            maybe_detect_nan(
+                logits_output.next_token_logits, "verify: target model logits"
+            )
+            maybe_detect_inf(
+                logits_output.next_token_logits, "verify: target model logits"
+            )
         (
             predict,
             accept_lens,
             accept_index,
-        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+        ) = eagle_sample(
+            verify_input,
+            batch,
+            logits_output,
+            vocab_mask,
+            weightless_recv=_wl_worker,
+        )
         new_seq_lens = batch.seq_lens + accept_lens
         clear_unaccepted_c128 = getattr(
             self.token_to_kv_pool_allocator.get_kvcache(),
@@ -2675,14 +2713,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.speculative_num_draft_tokens,
             )
 
-        # Update mamba state for hybrid GDN models after verification
-        commit_mamba_states_after_verify(
-            self.target_worker,
-            batch,
-            accept_lens,
-            accept_index,
-            self.speculative_num_draft_tokens,
-        )
+        # Update mamba state for hybrid GDN models after verification.
+        # Weightless-KV worker: it never ran a GDN/linear-attention layer (its
+        # stripped forward issues the full-attention DCP dispatch only), so it
+        # holds no per-step intermediate states to commit -- the head rank owns
+        # the single copy of the recurrent state, TP=1 and collective-free.
+        # Rank-local, issues no collective, so skipping it cannot desync.
+        if not _wl_worker:
+            commit_mamba_states_after_verify(
+                self.target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                self.speculative_num_draft_tokens,
+            )
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
@@ -2699,7 +2743,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
-        if batch.return_logprob and not batch.forward_mode.is_idle():
+        if (
+            batch.return_logprob
+            and not batch.forward_mode.is_idle()
+            # Weightless worker: no logits, and logprobs are head-only anyway
+            # (batch_result_processor skips every logprob dereference when
+            # result.logits_output is None on the lane).
+            and not _wl_worker
+        ):
             compute_spec_v2_logprobs(
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )

@@ -19,7 +19,7 @@ from sglang.srt.planner.landscape import (
     build_mode_b,
     render_mode_a_text,
 )
-from sglang.srt.planner.profiles import compose_rig
+from sglang.srt.planner.card_library import compose_rig
 from sglang.srt.planner.hardware import hardware_from_manual
 from sglang.srt.planner.results_store import (
     Band,

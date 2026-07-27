@@ -93,6 +93,64 @@ class EagleDraftWorkerBase(ABC):
     def draft_extend():
         pass
 
+    # -- kv-session-offload PS2 (born-spilled prefill) -----------------------
+
+    def born_spilled_stub_draft_input(
+        self, batch: ScheduleBatch, next_token_ids: torch.Tensor
+    ) -> EagleDraftInput:
+        """Stand-in for ``_draft_extend_for_prefill``'s return on a PS2
+        born-spilled prefill batch (``batch.kv_session_prefill_spill``).
+
+        A born-spilled-deep prompt allocates NO device KV slots: its
+        ``out_cache_loc`` carries HOST SENTINELS (``kv_session_offload.
+        spill_extend_alloc``). The draft extend reuses that same tensor via
+        ``ForwardBatch.init_new(batch, self.draft_runner)``, so running it
+        would scatter draft KV far outside the draft pool. The draft extend
+        produces exactly two things, and for such a batch NEITHER is read:
+
+          * the prompt's draft KV -- read only when the spilled session later
+            drafts on device (spec-in-tick) or waves back under spec. Both are
+            excluded by ``prefill_spill_deep_gate``, which does not open PS2
+            while either is armed;
+          * this return value -- the seed for the NEXT draft round of this
+            request. A born-spilled session leaves the running batch at the top
+            of the very next ``pre_schedule`` (``adopt_born_spilled_prefills``)
+            and finishes on the off-batch spill tick, so no draft round on this
+            batch ever consumes it.
+
+        The stub keeps the shapes valid so the overlap FutureMap can stash it
+        (same contract as ``_solo_stub_draft_input``); ``bonus_tokens`` carries
+        the real next tokens because that is the one field a merge/filter step
+        may still move around before the request is adopted.
+
+        Rank-uniform: ``kv_session_prefill_spill`` is set from the replicated
+        admission verdict, so every rank skips the same forward.
+        """
+        from sglang.srt.speculative.eagle_info import EagleDraftInput
+        from sglang.srt.speculative.eagle_utils import (
+            get_draft_recurrent_hidden_state_spec,
+        )
+
+        bs = batch.seq_lens.shape[0]
+        device = next_token_ids.device
+        topk = max(1, int(getattr(self, "topk", 1) or 1))
+        hidden_states = None
+        hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+            self.draft_runner
+        )
+        if hidden_size is not None:
+            hidden_states = torch.zeros(
+                (bs, hidden_size), dtype=hidden_dtype, device=device
+            )
+        return EagleDraftInput(
+            topk_p=torch.zeros((bs, topk), dtype=torch.float32, device=device),
+            topk_index=torch.zeros((bs, topk), dtype=torch.int64, device=device),
+            hidden_states=hidden_states,
+            bonus_tokens=next_token_ids,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+        )
+
     def alloc_memory_pool(self, **kwargs):
         pass
 

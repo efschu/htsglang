@@ -31,6 +31,7 @@ from sglang.srt.managers.kv_session_offload import (
     partial_spill_plan,
     prefill_spill_deep_gate,
     prefill_spill_deep_ok,
+    prefill_spill_deep_reject_reason,
     prefill_spill_owner_split,
     prefill_stage_tokens,
     select_spill_victim,
@@ -2179,20 +2180,80 @@ def test_ps2_compacted_device_slot_mapping_would_leave_the_region():
     assert int(rows.max().item()) < region_base + region_tokens
 
 
-def test_ps2_master_gate_declines_under_speculative_decoding():
-    """V1 boundary: under an active spec algorithm the DRAFT extend reuses the
-    target batch's out_cache_loc, which for a born-spilled prompt is a row of
-    host sentinels -- unaddressable in the (separate, non-DCP-sharded) draft
-    pool. PS2 declines instead of admitting a prompt that would write out of
-    bounds.
+def test_ps2_master_gate_admits_under_spec_when_no_draft_kv_is_read():
+    """The V1 boundary was a PLACEMENT problem, not a logical one.
 
-    OLD semantics ("the feature flag alone is the gate") admits under spec and
-    therefore fails the second assertion."""
+    The draft extend reuses the target batch's out_cache_loc, which for a
+    born-spilled prompt is a row of host sentinels -- unaddressable in the
+    (separate, non-DCP-sharded) draft pool. But the draft extend's two products
+    are both unread for such a request when neither spec-in-tick nor
+    resume-under-spec is armed, so the extend is SKIPPED (see
+    EagleDraftWorkerBase.born_spilled_stub_draft_input) and PS2 may run.
+
+    The OLD gate ("no PS2 whenever spec is configured at all") fails the second
+    assertion -- that configuration is exactly the production one."""
     assert prefill_spill_deep_gate(True, spec_active=False) is True
-    assert prefill_spill_deep_gate(True, spec_active=True) is False
+    assert prefill_spill_deep_gate(True, spec_active=True) is True
     assert prefill_spill_deep_gate(False, spec_active=False) is False
-    _old_gate = lambda flag, spec_active: bool(flag)
-    assert _old_gate(True, True) is True  # what the naive gate would have done
+    assert prefill_spill_deep_gate(False, spec_active=True) is False
+    _old_gate = lambda flag, spec_active: bool(flag) and not bool(spec_active)
+    assert _old_gate(True, True) is False  # what the all-or-nothing gate did
+
+
+def test_ps2_master_gate_still_declines_when_the_prompt_draft_kv_is_read():
+    """The three conditions under which the prompt's draft KV IS read again,
+    so skipping the draft extend would silently corrupt the session."""
+    # spec-in-tick: the spilled session drafts on device during the tick and
+    # attends the prompt's draft KV through the req_to_token surgery.
+    assert (
+        prefill_spill_deep_gate(True, spec_active=True, spec_in_tick_ready=True)
+        is False
+    )
+    # resume-under-spec: the session waves back and rejoins the live spec
+    # batch, whose draft attends the prompt positions.
+    assert (
+        prefill_spill_deep_gate(True, spec_active=True, resume_under_spec=True)
+        is False
+    )
+    # DFLASH family (primary or cross-algorithm secondary): its prefill append
+    # (dflash_worker_v2.prefill_after_target) is a separate write path that the
+    # PS2 skip does not cover.
+    assert (
+        prefill_spill_deep_gate(True, spec_active=True, dflash_prefill_append=True)
+        is False
+    )
+    # ... and none of them matters when spec is off entirely.
+    assert (
+        prefill_spill_deep_gate(
+            True,
+            spec_active=False,
+            spec_in_tick_ready=True,
+            resume_under_spec=True,
+            dflash_prefill_append=True,
+        )
+        is True
+    )
+
+
+def test_ps2_reject_names_the_condition_instead_of_declining_silently():
+    """A guard that only returns False leaves the operator with a feature that
+    is 'on' and does nothing. The reject carries the blocking condition."""
+    assert prefill_spill_deep_reject_reason(False, False, False, False) is None
+    assert prefill_spill_deep_reject_reason(True, False, False, False) is None
+    for kwargs, needle in (
+        (dict(spec_in_tick_ready=True), "spec-in-tick"),
+        (dict(resume_under_spec=True), "KVSO_RESUME"),
+        (dict(dflash_prefill_append=True), "DFLASH"),
+    ):
+        reason = prefill_spill_deep_reject_reason(
+            True,
+            kwargs.get("spec_in_tick_ready", False),
+            kwargs.get("resume_under_spec", False),
+            kwargs.get("dflash_prefill_append", False),
+        )
+        assert reason is not None and needle in reason, (kwargs, reason)
+        # and it says what to do about it
+        assert "born-spilled" in reason
 
 
 

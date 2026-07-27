@@ -477,19 +477,19 @@ def roofline_energy(
 ) -> Optional[RooflineEnergyEstimate]:
     """Estimated J/token (total + per physical card) for a planned config, the
     ENERGY sibling of ``estimate_roofline``. Returns None when it cannot be sized
-    (no throughput estimate, or a card missing a TDP in the profile library).
+    (no throughput estimate, or a card missing a TDP in the card library).
     NEVER raises into the plan flow — callers guard it.
 
     Reuses ``estimate`` (the throughput roofline) for BOTH the shared per-token
     wall time (1 / tok_s, WITH all discounts) and the per-rank activity terms
     (bytes streamed / FLOPs per token, and the peak membw / FLOPS that were
-    used) — it does not re-derive throughput. TDP comes from the ``GpuProfile``
+    used) — it does not re-derive throughput. TDP comes from the ``CardSpec``
     catalog (``tdp_w``); ``compute_share`` from the uneven-TP ratio."""
-    from sglang.srt.planner.profiles import ProfileLibrary
+    from sglang.srt.planner.card_library import CardLibrary
 
     if estimate is None:
         return None
-    library = library or ProfileLibrary()
+    library = library or CardLibrary()
     per_rank = estimate.per_rank
     tp = inputs.tp_size
     if not per_rank or len(per_rank) != tp:
@@ -628,7 +628,7 @@ def _infer_compute(model_path: str, cfg: dict):
 
 
 def _profile_for(library, name):
-    """Look up a GpuProfile by card name, tolerating the vendor/marketing prefix
+    """Look up a CardSpec by card name, tolerating the vendor/marketing prefix
     that live NVML reports ("NVIDIA GeForce RTX 5090") but the catalog omits
     ("RTX 5090"). Returns None when the card is not in the library (then the
     roofline has no nameplate fallback for it — measured probe or nothing)."""
@@ -683,9 +683,9 @@ def _rank_peaks(model, hardware, library, measured_scores, dtype):
     custom/OC/higher-binned card on-box drives the roofline with its REAL
     bandwidth, not the reference table); a rank whose card has neither is a hard
     miss (returns None -> no roofline)."""
-    from sglang.srt.planner.profiles import ProfileLibrary
+    from sglang.srt.planner.card_library import CardLibrary
 
-    library = library or ProfileLibrary()
+    library = library or CardLibrary()
     measured_by_idx = _measured_by_index(hardware, measured_scores)
 
     out = []
@@ -805,9 +805,9 @@ def _interconnect(hardware, library, used_gids, n_cross, weight_share_by_card,
     discount is the TP-collective knock-down (applies to decode AND prefill);
     the donor surcharge is the KV-traffic knock-down (decode only). Detects
     NVLink vs PCIe and the KV-donor surcharge from the weight/KV distribution."""
-    from sglang.srt.planner.profiles import ProfileLibrary
+    from sglang.srt.planner.card_library import CardLibrary
 
-    library = library or ProfileLibrary()
+    library = library or CardLibrary()
     if n_cross <= 1:
         return "solo", 1.0, 1.0, False, (
             "solo / single physical card in the plan — no cross-card collective"
@@ -887,10 +887,10 @@ def estimate_roofline(
     the PCIe-fetch term). ``measured_scores`` are advantage.MeasuredCardScore
     (cached micro-probe) — used in preference to the nameplate peaks.
     """
-    from sglang.srt.planner.profiles import ProfileLibrary
+    from sglang.srt.planner.card_library import CardLibrary
     from sglang.srt.uneven_perf import PerfCostModel
 
-    library = library or ProfileLibrary()
+    library = library or CardLibrary()
     tp = inputs.tp_size
     budgets = inputs.effective_vram_mib or [1024] * tp
     base_plan = inputs.rank_tp_ratio or [1] * tp
