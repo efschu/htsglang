@@ -646,12 +646,12 @@ def _print_report(result, model_path: str) -> None:
                 )
             )
             print(
-                "    Predicted, not measured. The decode side of this model is "
+                "    Predicted, not measured. Both sides of this model are "
                 "fitted against"
             )
             print(
-                "    measured vectors; the prefill side is not and "
-                "over-predicts by ~1.8x,"
+                "    measured vectors on ONE rig; off that rig no error bound "
+                "exists,"
             )
             print(
                 "    so no net of the two is shown. Measure the crossover for "

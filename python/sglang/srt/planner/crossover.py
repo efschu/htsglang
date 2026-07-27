@@ -41,10 +41,10 @@ weight and collapsing them is how a fitted constant becomes a law:
                         select a vector.
 ``measured_elsewhere``  another rig's finding. Shown for size and shape, with
                         its cards named. Never selects anything.
-``modelled``            the parse-time optimizer's prediction. Its decode term
-                        is fitted to measurement; its prefill term is not and
-                        over-predicts (:data:`MODELLED_PREFILL_NOTE`), so a
-                        modelled NET is not reported at all
+``modelled``            the parse-time optimizer's prediction. Both terms are
+                        fitted to measurement on ONE rig
+                        (:data:`MODELLED_PREFILL_NOTE`), so a modelled NET is
+                        still not reported at all
                         (:data:`MODELLED_NET_REFUSED`).
 
 **Which candidates may be proposed is structural.** A candidate is kept only
@@ -110,20 +110,21 @@ MODELLED_DECODE_NOTE = (
     "and within ~2 points of them there. The fit is one rig wide."
 )
 
-#: What it is NOT worth on the other axis. Stated wherever a prefill number
-#: from the model is shown, because the two halves are not equally trustworthy
-#: and a reader will otherwise assume they are.
+#: What the prefill half is worth. Stated wherever a prefill number from the
+#: model is shown, because a fit's width travels with its number.
 MODELLED_PREFILL_NOTE = (
-    "Modelled and not calibrated: the prefill term over-predicts by ~1.8x "
-    "where it has been checked (23.7 % predicted against 13.0 % measured "
-    "slope gain on the reference rig). Read it as a direction, not a value."
+    "Modelled: the prefill term is calibrated against three measured "
+    "concentration points on the reference rig (rms 0.4 points) by charging "
+    "the split-invariant share of an eager prefill step; before that charge "
+    "it over-predicted by ~1.8x. The fit is one rig wide, taken with "
+    "prefill.backend='disabled' (no captured prefill graph)."
 )
 
 #: Why no modelled net is printed anywhere.
 MODELLED_NET_REFUSED = (
-    "A modelled net combines a decode term fitted to measurement with a "
-    "prefill term that is not, so the net inherits the uncalibrated error "
-    "with no bound. Not reported; measure the crossover instead."
+    "A modelled net combines a decode term and a prefill term that are each "
+    "fitted on one rig; off that rig the net compounds both fits' unknown "
+    "errors with no bound. Not reported; measure the crossover instead."
 )
 
 #: A crossover finding older than this is not used for advice. Driver
