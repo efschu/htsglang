@@ -35,7 +35,7 @@ different card. This module is the planner's ONE bridge: per physical card
      bus IDs); skipped when ``CUDA_VISIBLE_DEVICES`` filters the process
      (torch would then see a subset in a remapped order);
   2. else a documented FASTEST_FIRST EMULATION (source ``"heuristic"``):
-     stable sort by the SEED_PROFILES fp16 GEMM peak, descending. CUDA's
+     stable sort by the SEED_CARDS fp16 GEMM peak, descending. CUDA's
      FASTEST_FIRST ranks by device performance and breaks ties in PCI order,
      which the stable sort reproduces; unknown card names rank 0 and keep
      NVML order. Callers must surface ``source == "heuristic"`` to the user.
@@ -69,13 +69,13 @@ def norm_uuid(u) -> str:
 
 def seed_fp16_peak(name) -> float:
     """Best-effort fp16 tensor-core peak for a card NAME from the planner's
-    SEED_PROFILES (bidirectional substring match, mirroring
+    SEED_CARDS (bidirectional substring match, mirroring
     ``flags._gpu_flops``). Unknown names return 0.0."""
     try:
-        from sglang.srt.planner.profiles import SEED_PROFILES
+        from sglang.srt.planner.card_library import SEED_CARDS
 
         low = str(name or "").lower()
-        for p in SEED_PROFILES.values():
+        for p in SEED_CARDS.values():
             if p.name.lower() in low or low in p.name.lower():
                 return float(p.peak_gemm_tflops_fp16 or 0.0)
     except Exception:
@@ -87,7 +87,7 @@ def emulate_cuda_order(names: Sequence[str]) -> List[int]:
     """FASTEST_FIRST emulation: the CUDA index each input position would get.
 
     ``names[i]`` is the card at NVML/list position ``i``; the returned list
-    gives its emulated CUDA index. Stable sort by SEED_PROFILES fp16 peak
+    gives its emulated CUDA index. Stable sort by SEED_CARDS fp16 peak
     descending -- CUDA's FASTEST_FIRST orders by device performance and keeps
     PCI order among equals, which a stable descending sort reproduces. This is
     a HEURISTIC (CUDA's internal ranking is not exactly the fp16 GEMM peak);

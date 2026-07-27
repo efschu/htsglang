@@ -32,7 +32,7 @@ from sglang.srt.planner.power_calibration import (
     power_profile_by_arch,
     save_power_profile,
 )
-from sglang.srt.planner.profiles import GpuProfile, ProfileLibrary
+from sglang.srt.planner.card_library import CardSpec, CardLibrary
 from sglang.srt.planner.roofline import (
     IDLE_FRACTION_OF_TDP,
     estimate_roofline,
@@ -67,7 +67,7 @@ def _tiny_model_dir():
 
 
 def _profile(name, total_mib, tdp_w, membw, flops, arch):
-    return GpuProfile(name=name, total_mib=total_mib, tdp_w=tdp_w, sm_arch=arch,
+    return CardSpec(name=name, total_mib=total_mib, tdp_w=tdp_w, sm_arch=arch,
                       peak_membw_gbs=membw, peak_gemm_tflops_fp16=flops)
 
 
@@ -79,7 +79,7 @@ def _hetero_rig(source="manual", uuids=(None, None)):
         for i, n in enumerate(names)
     )
     hw = HardwareSpec(gpus=gpus, source=source, host_ram_mib=256 * 1024)
-    lib = ProfileLibrary({
+    lib = CardLibrary({
         "RTX 5090": _profile("RTX 5090", 32607, 575, 1792.0, 419.0, "sm120"),
         "RTX 3080 20GB": _profile("RTX 3080 20GB", 20480, 320, 760.0, 119.0, "sm86"),
     })

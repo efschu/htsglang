@@ -194,9 +194,9 @@ def build_parser() -> argparse.ArgumentParser:
         "Use --rig live to include the live-NVML rig.",
     )
     mx.add_argument(
-        "--list-profiles",
+        "--list-cards",
         action="store_true",
-        help="Print the hardware-profile library and exit.",
+        help="Print the GPU-model card library and exit.",
     )
     ls = p.add_argument_group("landscape / benchmark DB (S5)")
     ls.add_argument(
@@ -414,9 +414,9 @@ def _print_roofline(rf) -> None:
 def _run_matrix(args) -> int:
     from sglang.srt.planner.explorer import plan_matrix, render_matrix_text
     from sglang.srt.planner.model import resolve_model_ref
-    from sglang.srt.planner.profiles import ProfileLibrary, compose_rig
+    from sglang.srt.planner.card_library import CardLibrary, compose_rig
 
-    lib = ProfileLibrary()
+    lib = CardLibrary()
 
     # Models: --matrix-model (LABEL=PATH) entries, falling back to --model.
     raw_models = list(args.matrix_model or [])
@@ -482,7 +482,7 @@ def _run_matrix(args) -> int:
 def _run_landscape(args) -> int:
     from sglang.srt.planner.landscape import build_mode_a, render_mode_a_text
     from sglang.srt.planner.model import resolve_model_ref
-    from sglang.srt.planner.profiles import ProfileLibrary, compose_rig
+    from sglang.srt.planner.card_library import CardLibrary, compose_rig
     from sglang.srt.planner.results_store import QuantDescriptor, ResultsStore
 
     if not args.model:
@@ -499,7 +499,7 @@ def _run_landscape(args) -> int:
         ResultsStore.load(args.results_store) if args.results_store else ResultsStore()
     )
 
-    lib = ProfileLibrary()
+    lib = CardLibrary()
     planner_rigs = []
     try:
         model_path = resolve_model_ref(args.model)
@@ -550,10 +550,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         serve(host=args.host, port=args.port)
         return 0
 
-    if args.list_profiles:
-        from sglang.srt.planner.profiles import ProfileLibrary
+    if args.list_cards:
+        from sglang.srt.planner.card_library import CardLibrary
 
-        lib = ProfileLibrary()
+        lib = CardLibrary()
         for name in lib.names():
             p = lib.get(name)
             print(

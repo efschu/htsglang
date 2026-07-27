@@ -18,10 +18,10 @@ from sglang.srt.planner.explorer import (
 )
 from sglang.srt.planner.hardware import HardwareSpec, hardware_from_manual
 from sglang.srt.planner.issue_text import HardwareFingerprint
-from sglang.srt.planner.profiles import (
-    SEED_PROFILES,
-    GpuProfile,
-    ProfileLibrary,
+from sglang.srt.planner.card_library import (
+    SEED_CARDS,
+    CardSpec,
+    CardLibrary,
     compose_rig,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -63,9 +63,9 @@ def _make_model(tmpdir, name="model", ckpt_gib=14.0):
 # ---------------------------------------------------------------------------
 
 
-class TestProfileLibrary(CustomTestCase):
+class TestCardLibrary(CustomTestCase):
     def test_seed_has_the_rig_cards(self):
-        lib = ProfileLibrary()
+        lib = CardLibrary()
         self.assertTrue(lib.has("RTX 5090"))
         self.assertTrue(lib.has("RTX 3080 20GB"))
         self.assertEqual(lib.get("RTX 5090").total_mib, 32607)
@@ -73,7 +73,7 @@ class TestProfileLibrary(CustomTestCase):
         self.assertTrue(lib.has("nvidia rtx 5090"))
 
     def test_populate_from_fingerprint(self):
-        lib = ProfileLibrary()
+        lib = CardLibrary()
         n0 = len(lib.names())
         fp = HardwareFingerprint(
             cards=[(1, "RTX 7090", 49152), (2, "RTX 3080 20GB", 20480)]
@@ -87,26 +87,26 @@ class TestProfileLibrary(CustomTestCase):
     def test_populate_skips_unknown_vram(self):
         # A boot-log-only fingerprint has total_mib=0 -> must not poison the
         # library with a bogus total.
-        lib = ProfileLibrary()
+        lib = CardLibrary()
         fp = HardwareFingerprint(cards=[(1, "MysteryCard", 0)])
         self.assertEqual(lib.populate_from_fingerprint(fp), 0)
         self.assertFalse(lib.has("MysteryCard"))
 
     def test_measured_fields_fill_but_never_downgrade(self):
-        lib = ProfileLibrary(profiles={})
-        lib.add(GpuProfile("Card", 20480, gemm_tflops=100.0))
+        lib = CardLibrary(profiles={})
+        lib.add(CardSpec("Card", 20480, gemm_tflops=100.0))
         # A newcomer without perf fields must not wipe the measured one.
-        changed = lib.add(GpuProfile("Card", 20480))
+        changed = lib.add(CardSpec("Card", 20480))
         self.assertFalse(changed)
         self.assertEqual(lib.get("Card").gemm_tflops, 100.0)
 
     def test_save_load_roundtrip_keeps_seed(self):
-        lib = ProfileLibrary()
-        lib.add(GpuProfile("RTX 7090", 49152))
+        lib = CardLibrary()
+        lib.add(CardSpec("RTX 7090", 49152))
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "profiles.json")
             lib.save(p)
-            reloaded = ProfileLibrary.load(p)
+            reloaded = CardLibrary.load(p)
         self.assertTrue(reloaded.has("RTX 7090"))
         self.assertTrue(reloaded.has("RTX 5090"))  # seed preserved
 
@@ -131,7 +131,7 @@ class TestComposition(CustomTestCase):
             compose_rig(["RTX 5090", "RTX 9999"])
 
     def test_compose_accepts_profile_objects(self):
-        rig = compose_rig([GpuProfile("Custom", 12345)])
+        rig = compose_rig([CardSpec("Custom", 12345)])
         self.assertEqual(rig.gpus[0].total_mib, 12345)
 
 
@@ -255,8 +255,8 @@ class TestWebuiExplorer(CustomTestCase):
     def tearDownClass(cls):
         cls._tmp.cleanup()
 
-    def test_list_profiles(self):
-        d = webui.list_profiles()
+    def test_list_cards(self):
+        d = webui.list_cards()
         names = {p["name"] for p in d["profiles"]}
         self.assertIn("RTX 5090", names)
         self.assertIn("RTX 3080 20GB", names)

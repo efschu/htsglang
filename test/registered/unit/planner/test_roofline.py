@@ -25,7 +25,7 @@ import tempfile
 import unittest
 
 from sglang.srt.planner.hardware import GpuDescriptor, HardwareSpec
-from sglang.srt.planner.profiles import GpuProfile, ProfileLibrary
+from sglang.srt.planner.card_library import CardSpec, CardLibrary
 from sglang.srt.planner.roofline import (
     ROOFLINE_PROVENANCE,
     RooflineEstimate,
@@ -58,14 +58,14 @@ def _tiny_model_dir(moe: bool = False) -> str:
 
 
 def _hardware(names, membw, gemm_fp16, nvlink=False, tp=None):
-    """A HardwareSpec + a matching ProfileLibrary with the given peak specs."""
+    """A HardwareSpec + a matching CardLibrary with the given peak specs."""
     gpus = tuple(
         GpuDescriptor(index=i, name=n, total_mib=40000, pcie_gen=4, pcie_width=16)
         for i, n in enumerate(names)
     )
     hw = HardwareSpec(gpus=gpus, source="manual", host_ram_mib=256 * 1024)
     profs = {
-        n: GpuProfile(
+        n: CardSpec(
             name=n,
             total_mib=40000,
             nvlink=nvlink,
@@ -74,7 +74,7 @@ def _hardware(names, membw, gemm_fp16, nvlink=False, tp=None):
         )
         for n in set(names)
     }
-    return hw, ProfileLibrary(profs)
+    return hw, CardLibrary(profs)
 
 
 def _plan_inputs(model_dir, rank_gpu_id, budgets, ratio=None):
@@ -111,7 +111,7 @@ class TestRooflineProduced(unittest.TestCase):
             source="manual",
         )
         inp = _plan_inputs(self.model, [0], [30000])
-        rf = estimate_roofline(inp, hw, None, None, library=ProfileLibrary({}))
+        rf = estimate_roofline(inp, hw, None, None, library=CardLibrary({}))
         self.assertIsNone(rf)
 
 

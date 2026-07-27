@@ -1702,7 +1702,7 @@ def _gpu_names(gpus: Sequence) -> List[str]:
 
 def _gpu_flops(g) -> float:
     """Best-effort FLOPs for the single-GPU tiebreak: a measured/explicit value
-    on the descriptor wins; else the SEED_PROFILES peak table matched by name;
+    on the descriptor wins; else the SEED_CARDS peak table matched by name;
     else 0 (unknown cards tie and fall through to first-index)."""
     name = str((g.get("name") if isinstance(g, dict) else getattr(g, "name", "")) or "")
     for key in ("gemm_tflops", "tflops", "peak_gemm_tflops_fp16"):
@@ -1710,10 +1710,10 @@ def _gpu_flops(g) -> float:
         if v:
             return float(v)
     try:
-        from sglang.srt.planner.profiles import SEED_PROFILES
+        from sglang.srt.planner.card_library import SEED_CARDS
 
         low = name.lower()
-        for p in SEED_PROFILES.values():
+        for p in SEED_CARDS.values():
             if p.name.lower() in low or low in p.name.lower():
                 return float(p.peak_gemm_tflops_fp16 or 0.0)
     except Exception:
