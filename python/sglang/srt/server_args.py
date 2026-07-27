@@ -33,9 +33,6 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import A, Arg, add_cli_args_from_dataclass
-from sglang.srt.disaggregation.topology import (
-    TOPOLOGY_CHOICES as PD_TOPOLOGY_CHOICES,
-)
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -45,6 +42,7 @@ from sglang.srt.arg_groups.argparse_actions import (
 )
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
+from sglang.srt.disaggregation.topology import TOPOLOGY_CHOICES as PD_TOPOLOGY_CHOICES
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
@@ -1809,8 +1807,13 @@ class ServerArgs:
             "GPU (the derived capture term additionally scales with the "
             "number of co-located ranks). Covers the CUDA context plus "
             "allocations that appear lazily after KV sizing (NCCL buffers, "
-            "attention workspaces, captured graphs). Only valid with "
-            "--rank-tp-ratio auto.",
+            "attention workspaces, captured graphs, prefill activations). A "
+            "pinned numeric value REPLACES the derived demand model, "
+            "captured-token term included; when it falls below what 'auto' "
+            "would derive, a startup warning names the deficit and its "
+            "components, because the shortfall otherwise surfaces as an OOM "
+            "in the first real prefill rather than at startup. Only valid "
+            "with --rank-tp-ratio auto.",
             type_parser=str,
         ),
     ] = "auto"
@@ -4389,10 +4392,7 @@ class ServerArgs:
         # even when chain speculation (topk == 1) is eventually enabled on the
         # lane and the blanket reject below is relaxed: topk > 1 remains
         # rejected until the tree mask is proven on this path.
-        if (
-            self.speculative_eagle_topk is not None
-            and self.speculative_eagle_topk > 1
-        ):
+        if self.speculative_eagle_topk is not None and self.speculative_eagle_topk > 1:
             raise ValueError(
                 "--weightless-kv-fastlane does not support tree/branching "
                 "speculative decoding (--speculative-eagle-topk="
@@ -4644,8 +4644,7 @@ class ServerArgs:
             # it shares the host pool, admission reduce, and off-batch tick.
             # Reject the flag standalone rather than silently ignore it.
             raise ValueError(
-                "--kv-session-offload-prefill requires "
-                "--enable-kv-session-offload."
+                "--kv-session-offload-prefill requires " "--enable-kv-session-offload."
             )
         if self.kv_session_offload_host_ram_gib and (
             not self.enable_kv_session_offload
@@ -4739,9 +4738,7 @@ class ServerArgs:
                 parse_destinations(self.kv_session_offload_destinations)
             )
             if _dest_err is not None:
-                raise ValueError(
-                    f"--kv-session-offload-destinations: {_dest_err}"
-                )
+                raise ValueError(f"--kv-session-offload-destinations: {_dest_err}")
             if self.kv_session_offload_destination_extra_config:
                 import json as _json
 
@@ -4817,9 +4814,7 @@ class ServerArgs:
                 f"{self.kv_session_offload_max_spills}."
             )
         if self.kv_session_offload_restore_margin_tokens < 0:
-            raise ValueError(
-                "--kv-session-offload-restore-margin-tokens must be >= 0."
-            )
+            raise ValueError("--kv-session-offload-restore-margin-tokens must be >= 0.")
         if self.kv_session_offload_wave_back_min_free_tokens < 0:
             raise ValueError(
                 "--kv-session-offload-wave-back-min-free-tokens must be >= 0 "
@@ -5240,8 +5235,7 @@ class ServerArgs:
                 and (
                     (
                         os.environ.get("SGLANG_UNEVEN_DCP", "0") == "1"
-                        and os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0")
-                        == "1"
+                        and os.environ.get("SGLANG_UNEVEN_DCP_WEIGHTED", "0") == "1"
                     )
                     # --rank-kv-ratio != 'coupled' implies the weighted-DCP
                     # path without the env pair.
@@ -6161,6 +6155,7 @@ class ServerArgs:
             from collections import Counter
 
             counts = Counter(self.rank_gpu_id)
+            reserve_was_pinned = str(self.rank_auto_reserve_mib) != "auto"
             if str(self.rank_auto_reserve_mib) == "auto":
                 # #68: derive the reserve from the actual demand (stock
                 # runtime reserve + captured-token graph demand; the
@@ -6238,6 +6233,8 @@ class ServerArgs:
                 budgets,
                 {g: r for g, r in sorted(reserve_per_gpu.items())},
             )
+            if reserve_was_pinned:
+                self._warn_pinned_reserve_shortfall(reserve_per_gpu, budgets, counts)
 
         budgets = (
             list(self.rank_gpu_memory_mib)
@@ -6260,8 +6257,7 @@ class ServerArgs:
             return
         self.rank_tp_ratio = weights
         logger.info(
-            "--rank-tp-ratio auto: derived weights %s from memory budgets "
-            "%s MiB.",
+            "--rank-tp-ratio auto: derived weights %s from memory budgets " "%s MiB.",
             weights,
             budgets,
         )
@@ -6296,8 +6292,7 @@ class ServerArgs:
                 ServerArgs.AUTO_RANK_MEMORY_RESERVE_MIB
             ):
                 raise ValueError(
-                    "--rank-auto-reserve-mib only applies with "
-                    "--rank-tp-ratio auto."
+                    "--rank-auto-reserve-mib only applies with " "--rank-tp-ratio auto."
                 )
             if self.uneven_kv_flag_active():
                 raise ValueError(
@@ -6423,10 +6418,7 @@ class ServerArgs:
                         f"--rank-kv-ratio length ({len(self.rank_kv_ratio)}) "
                         f"must equal --tp-size ({self.tp_size})."
                     )
-                if any(
-                    not isinstance(r, int) or r <= 0
-                    for r in self.rank_kv_ratio
-                ):
+                if any(not isinstance(r, int) or r <= 0 for r in self.rank_kv_ratio):
                     raise ValueError(
                         "--rank-kv-ratio entries must be positive integers, "
                         f"got {self.rank_kv_ratio}."
@@ -6560,8 +6552,7 @@ class ServerArgs:
         # Underscore attribute: derived (not a CLI field), pickled to the
         # scheduler child processes with the rest of the instance.
         self._rank_mem_fraction_static = [
-            budgets[r] / mem_info[self.rank_gpu_id[r]][0]
-            for r in range(self.tp_size)
+            budgets[r] / mem_info[self.rank_gpu_id[r]][0] for r in range(self.tp_size)
         ]
 
         # Custom all-reduce assumes symmetric peers: it allocates
@@ -6570,9 +6561,7 @@ class ServerArgs:
         # compute capabilities), an uneven shard plan (per-rank tensor
         # shapes differ by design) and co-located ranks (two processes,
         # one device) all violate those assumptions — fall back to NCCL.
-        heterogeneous = (
-            len({mem_info[g][0] for g in set(self.rank_gpu_id)}) > 1
-        )
+        heterogeneous = len({mem_info[g][0] for g in set(self.rank_gpu_id)}) > 1
         colocated = len(set(self.rank_gpu_id)) < len(self.rank_gpu_id)
         uneven_plan = self.rank_tp_ratio is not None
         if (
@@ -6910,6 +6899,202 @@ class ServerArgs:
             )
         return int(math.ceil(runtime_reserve + capture_tokens * 2 * colocated_ranks))
 
+    def _gdn_linear_attention_dims(self) -> Optional[Tuple[int, int, int, int, int]]:
+        """``(num_k_heads, num_v_heads, head_k_dim, head_v_dim, itemsize)`` of
+        the checkpoint's GDN / linear-attention layers, or None when it has
+        none (or its HF config is not readable here).
+
+        Reads the HF config directly instead of ``get_model_config()``: that
+        one memoizes a full ModelConfig on ``self``, and this runs from
+        ``_handle_uneven_tp``, i.e. BEFORE ``_handle_gpu_memory_settings`` --
+        caching a ModelConfig built at that point would change what every
+        later reader sees. This is a diagnostic, so any failure degrades to
+        None rather than breaking a boot.
+        """
+        try:
+            from sglang.srt.utils.hf_transformers.common import get_hf_text_config
+            from sglang.srt.utils.hf_transformers.config import get_config
+
+            cfg = get_hf_text_config(
+                get_config(
+                    self.model_path,
+                    trust_remote_code=self.trust_remote_code,
+                    revision=self.revision,
+                    model_config_parser=self.model_config_parser,
+                )
+            )
+        except Exception:  # pragma: no cover - config-source differences
+            return None
+        dtype = str(
+            getattr(cfg, "torch_dtype", None) or getattr(cfg, "dtype", "") or ""
+        ).lower()
+        itemsize = 4 if "float32" in dtype or "fp32" in dtype else 2
+        try:
+            return (
+                int(getattr(cfg, "linear_num_key_heads")),
+                int(getattr(cfg, "linear_num_value_heads")),
+                int(getattr(cfg, "linear_key_head_dim")),
+                int(getattr(cfg, "linear_value_head_dim")),
+                itemsize,
+            )
+        except (AttributeError, TypeError, ValueError):
+            # No GDN/linear-attention layers, or an unexpected config shape.
+            return None
+
+    def gdn_prefill_scratch_mib(self, head_share: float) -> Optional[float]:
+        """Peak transient VRAM (MiB) of ONE GDN/linear-attention prefill chunk
+        on ONE rank, or None when the checkpoint has no GDN layers.
+
+        Derived from the allocation sites, not measured. The chunked
+        gated-delta-rule prefill keeps every intermediate of a layer alive
+        simultaneously -- nothing is freed between the conv output and the
+        final ``o`` write -- so with ``T`` chunk tokens,
+        ``NT = ceil(T / FLA_CHUNK_SIZE)`` chunks and activation itemsize ``s``:
+
+            peak = s*T*(3*q_dim + 3*k_dim + 5*v_dim + Hv*Dk + FLA_CHUNK_SIZE*Hv)
+                 + s*NT*Hv*Dv*Dk
+                 + 12*T*Hv
+
+        In allocation order the terms are: the conv output ``mixed_qkv``
+        (q+k+v), the fused ``q``/``k``/``v`` split
+        (``jit_kernel/triton/gdn_fused_proj.py``), the l2-normed ``q``/``k``,
+        the ``A`` matrix (``FLA_CHUNK_SIZE`` per v-head per token), ``u`` and
+        ``w``, the inter-chunk state ``h`` (the ``s*NT*Hv*Dv*Dk`` term, the
+        largest single buffer), ``v_new``, and the output ``o``. The trailing
+        ``12*T*Hv`` are the three fp32 ``[T, Hv]`` gates (``g``, ``beta``, the
+        cumsum). The ``torch.split`` fallback taken above
+        ``MAX_FUSED_QKV_SPLIT_DIM`` allocates the same bytes -- its views are
+        copied contiguous by the FLA input guard.
+
+        ``head_share`` is this rank's share of the sharded head dimension.
+        The head units are split largest-remainder under uneven TP, so a
+        share-based count is exact to within one unit, which is the accuracy
+        a reserve breakdown needs.
+        """
+        dims = self._gdn_linear_attention_dims()
+        if dims is None:
+            return None
+        num_k_heads, num_v_heads, head_k_dim, head_v_dim, itemsize = dims
+        if min(num_k_heads, num_v_heads, head_k_dim, head_v_dim) <= 0:
+            return None
+        # Qwen3-Next / Qwen3.5-family GDN layers build num_q_heads from
+        # num_k_heads with head_q_dim == head_k_dim, so q_dim == k_dim.
+        units = max(1, min(num_k_heads, int(round(num_k_heads * head_share))))
+        hk = units
+        hv = max(1, units * num_v_heads // num_k_heads)
+        q_dim = k_dim = hk * head_k_dim
+        v_dim = hv * head_v_dim
+        tokens = int(self.chunked_prefill_size or 0)
+        if tokens <= 0:
+            tokens = max(int(self.max_prefill_tokens or 0), 2048)
+        num_chunks = math.ceil(tokens / FLA_CHUNK_SIZE)
+        peak_bytes = (
+            itemsize
+            * tokens
+            * (
+                3 * q_dim
+                + 3 * k_dim
+                + 5 * v_dim
+                + hv * head_k_dim
+                + FLA_CHUNK_SIZE * hv
+            )
+            + itemsize * num_chunks * hv * head_v_dim * head_k_dim
+            + 12 * tokens * hv
+        )
+        return peak_bytes / (1 << 20)
+
+    def _warn_pinned_reserve_shortfall(
+        self,
+        reserve_per_gpu: Dict[int, int],
+        budgets: List[int],
+        counts,
+    ) -> None:
+        """Log one shortfall note per physical GPU whose PINNED reserve is
+        below the derived demand. Diagnostic only: no budget is changed, and
+        any failure to compute it is swallowed -- a reserve advisory must
+        never be the reason a boot fails."""
+        try:
+            gpu_mem = get_device_memory_capacity(self.device)
+            total_budget = sum(budgets) or 1
+            seen: set = set()
+            rank_gpu_ids: List[int] = list(self.rank_gpu_id or [])
+            for tp_rank, gpu_id in enumerate(rank_gpu_ids):
+                if gpu_id in seen:
+                    continue
+                seen.add(gpu_id)
+                note = self.pinned_reserve_shortfall_note(
+                    gpu_id,
+                    reserve_per_gpu[gpu_id],
+                    gpu_mem,
+                    counts[gpu_id],
+                    budgets[tp_rank] / total_budget,
+                )
+                if note is not None:
+                    logger.warning("%s", note)
+        except Exception as e:  # pragma: no cover - advisory only
+            logger.debug("Could not evaluate the pinned reserve: %s", e)
+
+    def pinned_reserve_shortfall_note(
+        self,
+        gpu_id: int,
+        pinned_mib: int,
+        gpu_mem,
+        colocated_ranks: int,
+        head_share: float,
+    ) -> Optional[str]:
+        """Diagnostic for a PINNED ``--rank-auto-reserve-mib`` that is below
+        what ``auto`` would have derived, or None when it covers it.
+
+        An explicit reserve takes the non-'auto' branch of
+        ``_resolve_auto_rank_tp_ratio`` and therefore discards the whole
+        derived demand model -- runtime/activation reserve AND graph-capture
+        term. On the uneven-DCP path nothing else charges those: ``dcp_size >
+        1`` makes ``post_capture_kv_active`` False, so neither the
+        ``mamba_pre_capture_reserve_mb`` subtraction in
+        ``_profile_available_bytes`` nor the post-capture measure-and-resize
+        runs, and the pinned value is the only headroom between the KV pool
+        and the prefill activations.
+
+        Warning, never a reject, and the threshold is the UNCHANGED derived
+        value: a boot that runs today keeps running. Deliberately no attempt
+        to reject at the exact value where a given rig tips over -- that point
+        is the fragmentation-sensitive sum of five unbudgeted terms (CUDA
+        context, NCCL buffers, the flashinfer workspace allocated after pool
+        init, graph capture, and the per-layer GDN prefill scratch below), so
+        any such threshold would be a constant reverse-engineered from two
+        measurements, which is the defect this diagnostic exists to expose.
+        """
+        derived = self.derived_rank_auto_reserve_mib(gpu_mem, colocated_ranks)
+        if pinned_mib >= derived:
+            return None
+        runtime_reserve = self.mamba_pre_capture_reserve_mb(gpu_mem)
+        capture_reserve = derived - runtime_reserve
+        scratch = self.gdn_prefill_scratch_mib(head_share)
+        scratch_note = (
+            "not applicable (no GDN/linear-attention layers in this " "checkpoint)"
+            if scratch is None
+            else (
+                f"{scratch:.0f} MiB per layer at "
+                f"chunked_prefill_size={self.chunked_prefill_size}"
+            )
+        )
+        return (
+            f"--rank-auto-reserve-mib pins {pinned_mib} MiB on GPU {gpu_id}, "
+            f"below the {derived} MiB that 'auto' would derive for it "
+            f"(short by {derived - pinned_mib} MiB). A pinned value replaces "
+            f"the derived demand model outright, and with uneven DCP no other "
+            f"term charges it: runtime/activation reserve "
+            f"{runtime_reserve:.0f} MiB + CUDA-graph capture "
+            f"{capture_reserve:.0f} MiB (captured tokens across all graph "
+            f"families x {colocated_ranks} co-located rank(s)); of the "
+            f"activation part the GDN prefill scratch alone is "
+            f"{scratch_note}. The KV pool takes whatever the reserve does not "
+            f"hold back, so the shortfall surfaces as an OOM in the first "
+            f"real prefill, not at startup. Pass "
+            f"--rank-auto-reserve-mib auto to derive it, or raise the pinned "
+            f"value."
+        )
+
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
         Configure GPU memory-dependent settings including
@@ -7128,7 +7313,11 @@ class ServerArgs:
             # mamba pool from 5 to 4 slots -> "state cache too small").
             # The uneven-TP absolute-reserve path, whose flat default DID
             # OOM at capture, carries the full captured-token formula
-            # instead (derived_rank_auto_reserve_mib).
+            # instead -- but ONLY via --rank-auto-reserve-mib 'auto'
+            # (derived_rank_auto_reserve_mib). A pinned numeric reserve takes
+            # the other branch of _resolve_auto_rank_tp_ratio and replaces the
+            # derived value wholesale, captured-token term included; that case
+            # is diagnosed by pinned_reserve_shortfall_note, not corrected.
             reserved_mem += decode_cuda_graph_config.max_bs * 2
 
         if (
@@ -10450,7 +10639,10 @@ class ServerArgs:
         # requests default to default_priority_value. This keeps the default path
         # (flag off) byte-identical.
         if self.enable_fast_lane:
-            if self.enable_priority_scheduling and self.schedule_low_priority_values_first:
+            if (
+                self.enable_priority_scheduling
+                and self.schedule_low_priority_values_first
+            ):
                 raise ValueError(
                     "--enable-fast-lane requires higher-value-is-higher-priority and is "
                     "incompatible with --schedule-low-priority-values-first."

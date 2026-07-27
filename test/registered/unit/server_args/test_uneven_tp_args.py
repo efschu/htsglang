@@ -5,9 +5,9 @@
 import argparse
 import os
 import unittest
+from unittest.mock import patch
 
 import pytest
-from unittest.mock import patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.server_args import ServerArgs
@@ -46,9 +46,7 @@ def make_args(**kwargs):
 
 
 def run_handler(args):
-    with patch.object(
-        server_args_module, "_query_rank_gpu_memory_mib", _fake_query
-    ):
+    with patch.object(server_args_module, "_query_rank_gpu_memory_mib", _fake_query):
         args._handle_uneven_tp()
     return args
 
@@ -91,7 +89,9 @@ class TestCliParsing(CustomTestCase):
         )
 
     def test_ratio_list_and_auto(self):
-        self.assertEqual(self.parse("--rank-tp-ratio", "2,1,1").rank_tp_ratio, [2, 1, 1])
+        self.assertEqual(
+            self.parse("--rank-tp-ratio", "2,1,1").rank_tp_ratio, [2, 1, 1]
+        )
         self.assertEqual(self.parse("--rank-tp-ratio", "auto").rank_tp_ratio, "auto")
 
     def test_reserve_stays_string(self):
@@ -294,17 +294,13 @@ class TestPureTpScope(CustomTestCase):
 class TestPhysicalImpossibility(CustomTestCase):
     def test_scalar_budget_fits(self):
         # 2 x 15000 on the 32 GiB card, 1 x 15000 on each 20 GiB card.
-        args = make_args(
-            tp_size=4, rank_gpu_id=[0, 0, 1, 2], rank_gpu_memory_mib=15000
-        )
+        args = make_args(tp_size=4, rank_gpu_id=[0, 0, 1, 2], rank_gpu_memory_mib=15000)
         run_handler(args)  # must not raise
         self.assertIsNone(args.rank_tp_ratio)
 
     def test_scalar_budget_colocated_overflow(self):
         # 2 x 17000 = 34000 > 32768 on GPU 0.
-        args = make_args(
-            tp_size=4, rank_gpu_id=[0, 0, 1, 2], rank_gpu_memory_mib=17000
-        )
+        args = make_args(tp_size=4, rank_gpu_id=[0, 0, 1, 2], rank_gpu_memory_mib=17000)
         with self.assertRaisesRegex(
             ValueError, r"Physical impossibility.*GPU 0.*32768.*34000"
         ):
@@ -359,9 +355,7 @@ class TestAutoRatio(CustomTestCase):
         )
         run_handler(args)
         # GPU 0 budget 28976 shared by two ranks -> 14488 each.
-        self.assertEqual(
-            args.rank_gpu_memory_mib, [14488, 14488, 17976, 17976]
-        )
+        self.assertEqual(args.rank_gpu_memory_mib, [14488, 14488, 17976, 17976])
         self.assertEqual(args.rank_tp_ratio, [1811, 1811, 2247, 2247])
 
     def test_auto_uniform_budgets_collapse_to_even_split(self):
@@ -390,9 +384,7 @@ class TestAutoRatio(CustomTestCase):
             default_cuda_graph_config,
         )
 
-        args = make_args(
-            tp_size=2, rank_gpu_id=[1, 2], rank_tp_ratio="auto"
-        )
+        args = make_args(tp_size=2, rank_gpu_id=[1, 2], rank_tp_ratio="auto")
         args.cuda_graph_config = default_cuda_graph_config()
         args.disable_cuda_graph = True  # capture term off: runtime reserve only
         gpu_mem = 20480.0
@@ -505,9 +497,7 @@ class TestGpuIdLookup(CustomTestCase):
     def test_default_formula_unchanged(self):
         args = make_args(tp_size=4, base_gpu_id=2, gpu_id_step=2)
         for tp_rank in range(4):
-            self.assertEqual(
-                args.gpu_id_for_rank(0, tp_rank, 1, 4), 2 + tp_rank * 2
-            )
+            self.assertEqual(args.gpu_id_for_rank(0, tp_rank, 1, 4), 2 + tp_rank * 2)
 
     def test_default_formula_with_pp(self):
         args = make_args(tp_size=2, pp_size=2)
@@ -547,9 +537,7 @@ class TestMlpRatio(CustomTestCase):
             ["--model-path", "m", "--rank-mlp-ratio", "5,3,3"]
         )
         self.assertEqual(parsed.rank_mlp_ratio, [5, 3, 3])
-        self.assertIsNone(
-            self.parser.parse_args(["--model-path", "m"]).rank_mlp_ratio
-        )
+        self.assertIsNone(self.parser.parse_args(["--model-path", "m"]).rank_mlp_ratio)
 
     def test_valid_with_base_plan(self):
         args = run_handler(self._valid_base(rank_mlp_ratio=[5, 3, 3]))
@@ -641,9 +629,7 @@ class TestMoeRatio(CustomTestCase):
             ["--model-path", "m", "--rank-moe-ratio", "5,3,3"]
         )
         self.assertEqual(parsed.rank_moe_ratio, [5, 3, 3])
-        self.assertIsNone(
-            self.parser.parse_args(["--model-path", "m"]).rank_moe_ratio
-        )
+        self.assertIsNone(self.parser.parse_args(["--model-path", "m"]).rank_moe_ratio)
 
     def test_valid_with_base_plan(self):
         args = run_handler(self._valid_base(rank_moe_ratio=[5, 3, 3]))
@@ -703,9 +689,11 @@ class TestTreeSpecDcpGuard(CustomTestCase):
             "SGLANG_UNEVEN_DCP": "1",
             "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
         }
-        with patch.object(server_args_module, "is_hip", return_value=False), patch.object(
-            server_args_module, "is_cuda", return_value=True
-        ), patch.dict(os.environ, env, clear=True):
+        with patch.object(
+            server_args_module, "is_hip", return_value=False
+        ), patch.object(server_args_module, "is_cuda", return_value=True), patch.dict(
+            os.environ, env, clear=True
+        ):
             args._handle_dcp_validation()
         return args
 
@@ -732,9 +720,9 @@ class TestTreeSpecDcpGuardBroadened(CustomTestCase):
         env = {**os.environ, **(env_extra or {})}
         with patch.object(
             server_args_module, "is_hip", return_value=False
-        ), patch.object(
-            server_args_module, "is_cuda", return_value=True
-        ), patch.dict(os.environ, env, clear=True):
+        ), patch.object(server_args_module, "is_cuda", return_value=True), patch.dict(
+            os.environ, env, clear=True
+        ):
             args._handle_dcp_validation()
         return args
 
@@ -846,9 +834,9 @@ class TestWeightlessChainSpecAdmission(CustomTestCase):
         args = self._chain_args()
         with patch.object(
             server_args_module, "is_hip", return_value=False
-        ), patch.object(
-            server_args_module, "is_cuda", return_value=True
-        ), patch.dict(os.environ, dict(os.environ), clear=True):
+        ), patch.object(server_args_module, "is_cuda", return_value=True), patch.dict(
+            os.environ, dict(os.environ), clear=True
+        ):
             args._handle_dcp_validation()  # must not raise
 
     def test_split_placement_rejected(self):
@@ -905,9 +893,160 @@ class TestWeightlessChainSpecAdmission(CustomTestCase):
             args._handle_weightless_kv_fastlane()
 
 
+class TestPinnedReserveShortfall(CustomTestCase):
+    """#250: a PINNED --rank-auto-reserve-mib replaces the derived demand
+    model wholesale (runtime/activation reserve AND graph-capture term), and
+    on the uneven-DCP path nothing else charges those -- so the shortfall
+    surfaces as an OOM in the first real prefill, not at startup.
+
+    Numbers are the reference rig's: 1x 32 GiB + 2x 20 GiB (FAKE_GPU_MEMORY),
+    TP=3, MTP with 4 draft tokens, and the Qwen3.6-27B GDN geometry.
+    """
+
+    # linear_num_key_heads, linear_num_value_heads, linear_key_head_dim,
+    # linear_value_head_dim, activation itemsize (bf16).
+    QWEN36_27B_GDN = (16, 48, 128, 128, 2)
+    # get_device_memory_capacity() reports the FIRST visible device: the
+    # 32 GiB card -> chunked_prefill_size 2048, decode max_bs 24 (tp < 4).
+    TIER_GPU_MEM = 32768.0
+
+    def _args(self, reserve):
+        from sglang.srt.model_executor.cuda_graph_config import (
+            default_cuda_graph_config,
+        )
+
+        args = make_args(
+            tp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib=reserve,
+            speculative_algorithm="NEXTN",
+            speculative_num_draft_tokens=4,
+        )
+        args.cuda_graph_config = default_cuda_graph_config()
+        return args
+
+    def test_derived_demand_for_the_reference_rig(self):
+        args = self._args("auto")
+        args._apply_gpu_mem_capacity_defaults(self.TIER_GPU_MEM)
+        # 512 + 2048 * 1.5 + 3 * 1 / 8 * 1024 = 3968 MiB runtime reserve,
+        # plus 24 * 4 captured tokens * 2 MiB = 192 MiB graph capture.
+        self.assertEqual(args.chunked_prefill_size, 2048)
+        self.assertEqual(args.cuda_graph_config.decode.max_bs, 24)
+        self.assertEqual(args.derived_rank_auto_reserve_mib(self.TIER_GPU_MEM, 1), 4160)
+
+    def test_gdn_prefill_scratch_formula(self):
+        args = self._args("auto")
+        args._apply_gpu_mem_capacity_defaults(self.TIER_GPU_MEM)
+        with patch.object(
+            ServerArgs,
+            "_gdn_linear_attention_dims",
+            return_value=self.QWEN36_27B_GDN,
+        ):
+            # A 20 GiB rank of this rig owns ~27.7% of the summed budgets ->
+            # 4 of 16 key-head units -> Hk=4, Hv=12, q_dim=k_dim=512,
+            # v_dim=1536; T=2048, NT=32, s=2.
+            scratch = args.gdn_prefill_scratch_mib(17976 / 64928)
+        expected = (
+            2 * 2048 * (3 * 512 + 3 * 512 + 5 * 1536 + 12 * 128 + 64 * 12)
+            + 2 * 32 * 12 * 128 * 128
+            + 12 * 2048 * 12
+        ) / (1 << 20)
+        self.assertAlmostEqual(scratch, expected, places=6)
+        # The scratch is real but SMALL next to the reserve: it explains the
+        # OOM site, not the 500 MiB gap between two pinned reserve values.
+        self.assertLess(scratch, 100.0)
+
+    def test_no_gdn_layers_means_no_scratch_item(self):
+        args = self._args("auto")
+        with patch.object(ServerArgs, "_gdn_linear_attention_dims", return_value=None):
+            self.assertIsNone(args.gdn_prefill_scratch_mib(1 / 3))
+
+    def test_note_fires_below_the_derived_value_and_names_the_items(self):
+        args = self._args("3000,2200,2200")
+        args._apply_gpu_mem_capacity_defaults(self.TIER_GPU_MEM)
+        with patch.object(
+            ServerArgs,
+            "_gdn_linear_attention_dims",
+            return_value=self.QWEN36_27B_GDN,
+        ):
+            note = args.pinned_reserve_shortfall_note(
+                1, 2200, self.TIER_GPU_MEM, 1, 17976 / 64928
+            )
+        self.assertIsNotNone(note)
+        self.assertIn("2200 MiB on GPU 1", note)
+        self.assertIn("4160 MiB", note)
+        self.assertIn("short by 1960 MiB", note)
+        self.assertIn("3968 MiB", note)  # runtime/activation reserve
+        self.assertIn("192 MiB", note)  # graph capture
+        self.assertIn("GDN prefill scratch", note)
+        self.assertIn("63 MiB per layer", note)
+        self.assertIn("--rank-auto-reserve-mib auto", note)
+
+    def test_note_fires_for_the_value_that_boots_today_too(self):
+        """2700 MiB carries on the reference rig while 2200 tips over, but
+        both are below the derived demand. The advisory says so and stays a
+        warning -- the tipping point is the fragmentation-sensitive sum of
+        several unbudgeted terms, not a single sizing item."""
+        args = self._args("2700")
+        args._apply_gpu_mem_capacity_defaults(self.TIER_GPU_MEM)
+        for pinned in (2200, 2700, 3000):
+            self.assertIsNotNone(
+                args.pinned_reserve_shortfall_note(
+                    1, pinned, self.TIER_GPU_MEM, 1, 17976 / 64928
+                ),
+                f"{pinned} MiB is below the derived demand and must be noted",
+            )
+
+    def test_note_silent_when_the_pin_covers_the_demand(self):
+        args = self._args("4160")
+        args._apply_gpu_mem_capacity_defaults(self.TIER_GPU_MEM)
+        self.assertIsNone(
+            args.pinned_reserve_shortfall_note(
+                1, 4160, self.TIER_GPU_MEM, 1, 17976 / 64928
+            )
+        )
+
+    def _run_and_capture_warnings(self, reserve):
+        args = self._args(reserve)
+        with patch.object(
+            server_args_module,
+            "get_device_memory_capacity",
+            return_value=self.TIER_GPU_MEM,
+            create=True,
+        ), patch.object(
+            ServerArgs,
+            "_gdn_linear_attention_dims",
+            return_value=self.QWEN36_27B_GDN,
+        ), patch.object(
+            server_args_module, "logger"
+        ) as mock_logger:
+            run_handler(args)
+        return args, [
+            call.args[1] if len(call.args) > 1 else call.args[0]
+            for call in mock_logger.warning.call_args_list
+        ]
+
+    def test_pinned_reserve_warns_at_boot(self):
+        args, warnings = self._run_and_capture_warnings("3000,2200,2200")
+        shortfall = [w for w in warnings if "rank-auto-reserve-mib pins" in str(w)]
+        # One note per physical GPU, all three below the derived 4160 MiB.
+        self.assertEqual(len(shortfall), 3)
+        self.assertTrue(any("3000 MiB on GPU 0" in str(w) for w in shortfall))
+        self.assertTrue(any("2200 MiB on GPU 1" in str(w) for w in shortfall))
+        self.assertTrue(any("2200 MiB on GPU 2" in str(w) for w in shortfall))
+        # Advisory only: the budgets are exactly what they were before.
+        self.assertEqual(args.rank_gpu_memory_mib, [28976, 17976, 17976])
+
+    def test_auto_reserve_does_not_warn(self):
+        args, warnings = self._run_and_capture_warnings("auto")
+        self.assertEqual(
+            [w for w in warnings if "rank-auto-reserve-mib pins" in str(w)], []
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
-
 
 
 def test_uneven_tp_is_rejected_on_models_whose_attention_is_not_aware():
@@ -1041,6 +1180,7 @@ def test_token_vector_without_a_plan_is_rejected_not_ignored():
         else:
             os.environ["SGLANG_UNEVEN_TOKEN_VECTOR"] = saved
         import importlib
+
         importlib.reload(du)
 
 
@@ -1084,9 +1224,7 @@ class TestTreeSpecDcpGuardHardenedForNewFlagPaths(CustomTestCase):
         }
         with patch.object(
             server_args_module, "is_hip", return_value=False
-        ), patch.object(
-            server_args_module, "is_cuda", return_value=True
-        ), patch.dict(
+        ), patch.object(server_args_module, "is_cuda", return_value=True), patch.dict(
             os.environ, env, clear=True
         ):
             args._handle_dcp_validation()

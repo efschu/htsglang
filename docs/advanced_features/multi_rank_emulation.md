@@ -80,9 +80,22 @@ launcher, so the `LD_PRELOAD`-loaded library is inherited even though the
 `--rank-tp-ratio auto` sizes each rank's weight/KV budget proportional to its
 GPU memory. On a co-located GPU that budget is split across the co-located
 ranks. The per-GPU **reserve** (`--rank-auto-reserve-mib`) is what is held back
-from the KV pool for **graph capture + CUDA context**, and each co-located rank
-captures its **own** graphs, so a shared GPU needs roughly *N×* the
-single-rank capture headroom.
+from the KV pool for **graph capture + CUDA context + prefill activations**, and
+each co-located rank captures its **own** graphs, so a shared GPU needs roughly
+*N×* the single-rank capture headroom.
+
+Leaving the flag at its default `auto` derives that headroom from the actual
+demand. **A pinned numeric value replaces the derived model outright** — the
+captured-token term included — and on the uneven-DCP path (`SGLANG_UNEVEN_DCP`,
+which sets `dcp_size > 1`) nothing else charges the runtime activation reserve
+either, so the pinned value is the only headroom between the KV pool and the
+prefill activations. A pin below the derived value is logged at startup with
+the deficit and its components (runtime/activation reserve, graph capture, and
+the GDN prefill scratch for linear-attention checkpoints); it is a warning, not
+a rejection, because the exact point where a rig tips over is the
+fragmentation-sensitive sum of several unbudgeted terms. Symptom of an
+under-pinned reserve: startup and warmup succeed, the **first real prefill**
+OOMs.
 
 Two practical points learned on real hardware:
 
