@@ -1,0 +1,168 @@
+# htsglang second node — worker only (node_rank >= 1).
+#
+#   On the head rig:   docker compose -f docker/htsglang.yml up      (NODE_RANK=0)
+#   On the second rig: docker compose -f docker/htsglang-node2.yml up
+#
+# This node serves NO API. sglang starts a TokenizerManager and a
+# DetokenizerManager only on node_rank 0; every other node spawns its scheduler
+# processes, reports ready, and then runs a dummy health-check server. All HTTP
+# traffic goes to the head node. Start the head node first — the second node
+# blocks in the torch TCPStore rendezvous at DIST_INIT_ADDR until it appears.
+#
+# ---------------------------------------------------------------------------
+# HOW THE WEIGHTS GET HERE
+# ---------------------------------------------------------------------------
+# They do not travel over the process group. Verified in the code:
+#
+#   * DefaultModelLoader._prepare_weights (model_loader/loader.py) does a plain
+#     os.path.isdir + glob of the checkpoint files, in EVERY rank process on
+#     EVERY node. There is no rank gating and no scatter.
+#   * The only torch.distributed.broadcast in model_loader/ is inside
+#     RemoteInstanceModelLoader (the R-Fork path), on a separate group that
+#     pairs a rank with the matching rank of a DIFFERENT, already-running
+#     instance. It is not the inference TP group.
+#   * --weight-loader-prefetch-checkpoints keys its dedup on the NODE-LOCAL
+#     rank, with the comment "each node independently prefetches the full
+#     checkpoint into its own page cache ... page cache is not shared across
+#     nodes". That only makes sense if every node reads the whole checkpoint.
+#   * After loading, all ranks meet at a monitored_barrier whose timeout
+#     message talks about "a slow node" — independent per-node loads.
+#
+# The tokenizer and config.json are also needed here: each Scheduler calls
+# init_tokenizer() unconditionally (unless --skip-tokenizer-init), and
+# ModelConfig is built per node.
+#
+# So there are exactly two supported ways to feed this node, and both are a
+# MOUNT question, not a transfer question:
+#
+#   A) LOCAL COPY  — rsync the model tree to this rig's disk.
+#      cost: disk space on the second rig
+#      gain: fastest load, no dependency on the link at boot
+#
+#   B) NETWORK SHARE — NFS/SMB export the head rig's model directory and mount
+#      it here; point MODEL_DIR at the mountpoint.
+#      cost: the whole checkpoint crosses the link on every cold boot. On the
+#            40G RoCE link measured at 3.58 GB/s that is ~4.7 s per 16 GiB of
+#            checkpoint at link speed, plus whatever the exporting filesystem
+#            and the NFS stack cost on top. Over 1 GbE it is ~10x the model
+#            size in seconds and not worth doing.
+#      gain: no second copy, no drift between the rigs
+#
+#      Mitigations that make B practical: --weight-loader-prefetch-checkpoints
+#      (one read per node instead of one per rank), and the hibernate cache
+#      below, which turns every boot after the first into a LOCAL read.
+#
+# A true weights-broadcast over the process group would be a new feature, not a
+# flag. Estimated 600-1100 LOC touching load_config.py, server_args.py,
+# loader.py, model_runner.py and weight_utils.py, and it is not obviously worth
+# it: the shard a rank needs is produced inside each layer's weight_loader from
+# the global tp_rank, so rank 0 cannot cheaply produce rank 3's slice. The
+# cheap variant broadcasts FULL tensors and shards locally, which puts the
+# entire checkpoint on the wire rather than 1/N of it — i.e. no better than
+# option B, with a lot more code. Not built.
+#
+# ---------------------------------------------------------------------------
+# EXCEPTIONS worth knowing
+# ---------------------------------------------------------------------------
+#   * Weightless-KV worker ranks build a meta-device model and read no weight
+#     files at all. They still need config.json and the tokenizer.
+#   * --load-format dummy needs no weight files anywhere.
+#   * The hibernate directory holds RANK-INDEXED shards. It is per node and
+#     per rank layout — never share one between the two rigs.
+#   * The remote load formats (remote, remote_instance, runai_streamer, and an
+#     s3:// model path) do pull weights over the network, but each rank pulls
+#     for itself; they are not a head-node fan-out either.
+services:
+  htsglang-node2:
+    image: ${HTSGLANG_IMAGE:-htsglang:cu130-nccl2307}
+    container_name: ${NODE2_CONTAINER_NAME:-htsglang-node2}
+    restart: ${RESTART_POLICY:-no}
+    init: true
+    security_opt:
+      - apparmor=unconfined
+    # Host networking: the rendezvous, NCCL and UCX all need to reach the head
+    # node directly, and RDMA does not survive a bridge NAT. This also means no
+    # `ports:` section — nothing is published, because this node serves no API.
+    network_mode: host
+    # RDMA needs pinned memory and the verbs device nodes.
+    cap_add:
+      - IPC_LOCK
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    devices:
+      # /dev/infiniband must be present in the container namespace for the UCX
+      # rc transport. If this rig has no RoCE NIC, comment this out and use
+      # SGLANG_HTCCL_TRANSPORT=shm or gloo (TCP) instead — slower, still
+      # correct.
+      # MISSING -> UCX endpoint creation fails at the first collective.
+      - ${IB_DEVICE:-/dev/infiniband}:/dev/infiniband
+    volumes:
+      # The model. Either a local copy (option A) or a mountpoint of the head
+      # rig's export (option B) — see the block above. Must contain the
+      # weights, config.json AND the tokenizer files.
+      # MISSING -> this node's schedulers die during load and the head node
+      # hangs in the post-load barrier until it times out.
+      - ${NODE2_MODEL_DIR:?set NODE2_MODEL_DIR in .env}:/models:ro
+      - ${NODE2_DRAFT_MODEL_DIR:-${NODE2_MODEL_DIR}}:/draft:ro
+      # Per-node caches. These are NOT shared with the head rig: the hardware
+      # profile, the JIT cubins and the hibernate shards all describe this
+      # rig's cards.
+      - ${NODE2_SGLANG_CACHE_DIR:-./state/node2-sglang-cache}:/root/.cache/sglang
+      - ${NODE2_FLASHINFER_CACHE_DIR:-./state/node2-flashinfer}:/root/.cache/flashinfer
+      - ${NODE2_TORCH_EXT_CACHE_DIR:-./state/node2-torch-extensions}:/root/.cache/torch_extensions
+      - ${NODE2_TRITON_CACHE_DIR:-./state/node2-triton}:/root/.triton
+      - ${NODE2_HIBERNATE_DIR:-./state/node2-hibernate}:/var/lib/htsglang/hibernate
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${NODE2_NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+
+      # --- multi-node identity ---
+      - NNODES=${NNODES:-2}
+      - NODE_RANK=${NODE_RANK:-1}
+      # <head-rig-ip>:<port>. The control plane stays on the ordinary LAN;
+      # only the collectives ride RoCE.
+      - DIST_INIT_ADDR=${DIST_INIT_ADDR:?set DIST_INIT_ADDR in .env}
+
+      # --- every model/TP flag must MATCH the head node exactly ---
+      - MODEL_PATH=${NODE2_MODEL_PATH:-${MODEL_PATH}}
+      - TOKENIZER_PATH=${TOKENIZER_PATH:-}
+      - LOAD_FORMAT=${LOAD_FORMAT:-}
+      - QUANTIZATION=${QUANTIZATION:-}
+      - DTYPE=${DTYPE:-}
+      - CONTEXT_LENGTH=${CONTEXT_LENGTH:-32768}
+      - TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-0}
+      - TP_SIZE=${TP_SIZE:-1}
+      - RANK_GPU_ID=${RANK_GPU_ID:-}
+      - RANK_TP_RATIO=${RANK_TP_RATIO:-}
+      - RANK_GPU_MEMORY_MIB=${RANK_GPU_MEMORY_MIB:-}
+      - RANK_KV_RATIO=${RANK_KV_RATIO:-}
+      - KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
+      - SGLANG_UNEVEN_MLP_VECTOR=${SGLANG_UNEVEN_MLP_VECTOR:-}
+
+      # --- HTCCL cross-vendor / cross-rig transport ---
+      # Both rigs must run the SAME UCX release: UCX refuses to interoperate
+      # across releases whose UCP wire address format differs, and the failure
+      # mode is an unhelpful "invalid bandwidth 0.00" at endpoint creation.
+      # Running the same image on both sides is what guarantees that.
+      - SGLANG_HTCCL=${SGLANG_HTCCL:-}
+      - SGLANG_HTCCL_TRANSPORT=${SGLANG_HTCCL_TRANSPORT:-ucx}
+      - SGLANG_HTCCL_UCX_LIB=${SGLANG_HTCCL_UCX_LIB:-}
+      - UCX_TLS=${UCX_TLS:-rc,self,sm}
+      - UCX_IB_GID_INDEX=${UCX_IB_GID_INDEX:-3}
+      - UCX_NET_DEVICES=${UCX_NET_DEVICES:-}
+      # HTCCL synchronises with the host inside every collective, so it cannot
+      # live inside a CUDA-graph capture. Eager is mandatory with it.
+      - ENFORCE_EAGER=${ENFORCE_EAGER:-1}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - EXTRA_ARGS=${NODE2_EXTRA_ARGS:-}
+      - PORT=30000
+    shm_size: ${SHM_SIZE:-16gb}
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
