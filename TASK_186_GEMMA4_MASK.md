@@ -1,6 +1,6 @@
 # Task #186 -- Gemma-4 custom_mask on prefill: decision record
 
-Branch `fix/gemma4-textonly-mask`, worktree `/spinning/wt-gemma-mask`, based on
+Branch `fix/gemma4-textonly-mask`, worktree `<REPO_PATH>/wt-gemma-mask`, based on
 `origin/integration/r3-probe` @ `8d87afe941`.
 
 Trigger: `INTEGRATION_R3_VALIDATION.md` "#96 Stage B is RED: Gemma-4 installs a
@@ -338,8 +338,8 @@ today only via *even* DCP, or on the #96 branch -- which is exactly the point.
 
 ## 6. Tests
 
-CPU, `PYTHONPATH=/spinning/wt-gemma-mask/python`, venv
-`/spinning/htsglang-gpu/.venv`.
+CPU, `PYTHONPATH=<REPO_PATH>/wt-gemma-mask/python`, venv
+`<VENV>`.
 
 New: `test/registered/unit/models/test_gemma4_bidirectional_mask.py`,
 6 tests, `register_cpu_ci(est_time=12, suite="base-a-test-cpu")`.
@@ -358,7 +358,7 @@ Regression sweep, related CPU suites (`test_gemma4_geometry.py`,
 two source ratchets): **89 passed, 1 failed**. The failure is
 `test_dllm_forces_flashinfer_with_cuda_graph` (`_dllm_attention_backend`
 override missing from `_resolved_overrides`) -- **pre-existing**, reproduced
-identically on the untouched base tree `/spinning/wt-merge-probe` @ `8d87afe941`.
+identically on the untouched base tree `<REPO_PATH>/wt-merge-probe` @ `8d87afe941`.
 Error sets are identical before and after. Nothing to do with Gemma or masks.
 
 Token-count falsifier for §1a: `AutoProcessor` from

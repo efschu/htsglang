@@ -4,12 +4,12 @@
 # Nordstern L1 -- drive scripts/nordstern/l1_ucx_crossrig.py on both rigs.
 #
 # Stages the two transport modules plus the driver to each host and starts one
-# rank per host: rank 0 on the main rig (10.10.10.1), rank 1 on the second rig
-# (10.10.10.2). CPU tensors only -- no GPU is touched, so this is safe to run
+# rank per host: rank 0 on the main rig (<RDMA_NET>.1), rank 1 on the second rig
+# (<RDMA_NET>.2). CPU tensors only -- no GPU is touched, so this is safe to run
 # while a GPU window is busy on either machine.
 #
 # Control plane and data plane are deliberately separate:
-#   * gloo rendezvous  -> the 1 GbE LAN (192.168.0.x)
+#   * gloo rendezvous  -> the 1 GbE LAN (<RIG_LAN>.x)
 #   * UCX collectives  -> the 40G RoCE link, UCX_TLS=rc with no tcp fallback
 # so a run that passes has demonstrably moved its bytes over RDMA. If RDMA is
 # broken the run fails rather than quietly degrading to TCP.
@@ -75,7 +75,7 @@ for spec in "R0" "R1"; do
       "$DRIVER" "${!host_var}:$STAGE/" >/dev/null || { echo "FATAL: stage failed"; exit 1; }
 done
 
-echo "== launching rank 1 (second rig, 10.10.10.2) =="
+echo "== launching rank 1 (second rig, <RDMA_NET>.2) =="
 # `timeout` is load-bearing, not defensive. ssh holds the session open until
 # the channel closes, and a backgrounded setsid does not close it even with
 # all three fds redirected -- so this call never returns on its own. The rank
@@ -89,7 +89,7 @@ timeout 25 "${R1_SSH[@]}" "cd $STAGE && setsid env \
   </dev/null >$STAGE/r1.log 2>&1 & echo rank1-launched" || true
 sleep 4
 
-echo "== rank 0 (main rig, 10.10.10.1) =="
+echo "== rank 0 (main rig, <RDMA_NET>.1) =="
 R0_LIB_ENV=""
 [[ -n "$R0_UCX_LIB" ]] && R0_LIB_ENV="SGLANG_HTCCL_UCX_LIB=$R0_UCX_LIB"
 "${R0_SSH[@]}" "cd $STAGE && env \

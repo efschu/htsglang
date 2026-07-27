@@ -305,4 +305,4 @@ gated on those, not on #173.
 | G2, G3 | main rig, one card | boot-only |
 | G4, G6 | main rig, 5090 + 2x3080, TP=3 | the parity anchor |
 | G5 | main rig | needs a `kv >= tp` model |
-| G7 | hetero host 192.168.0.89 | the sm75/gfx900 target |
+| G7 | hetero host `<RIG2_IP>` | the sm75/gfx900 target |
