@@ -15,6 +15,10 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
+from sglang.srt.layers.quantization.fp8_dequant_gemv import (
+    fused_channel_dequant_gemv,
+    fused_channel_gemv_applicable,
+)
 from sglang.srt.layers.quantization.fp8_utils import dequant_fp8_weight
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
@@ -162,6 +166,22 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
             # their compute dtype. The input scale, if the checkpoint carried
             # one, is deliberately unused -- nothing quantises the activations
             # on this path, so there is nothing for it to scale.
+            #
+            # Small-batch DECODE takes the fused per-channel GEMV instead: it
+            # reads the fp8 bytes directly and dequantises in-register, so the
+            # per-forward expansion disappears entirely. This is the path a
+            # per-channel compressed-tensors checkpoint on an sm75/sm70/gfx900
+            # card actually lands on -- a w8a8 config whose min capability (89)
+            # is not met is routed HERE by _get_scheme, so this branch, not the
+            # block-scaled one, is what such a card runs. Prefill and larger
+            # batches keep the materialisation, where it is amortised.
+            if fused_channel_gemv_applicable(x, layer.weight):
+                fused = fused_channel_dequant_gemv(
+                    x, layer.weight, layer.weight_scale, x.dtype
+                )
+                if fused is not None:
+                    return fused if bias is None else fused + bias
+
             return torch.nn.functional.linear(
                 x,
                 dequant_fp8_weight(layer.weight, layer.weight_scale, x.dtype),

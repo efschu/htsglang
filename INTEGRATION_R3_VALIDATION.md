@@ -2647,3 +2647,166 @@ is real in the source, but the configuration that would expose it is the
 Window 3 recorded the packed-vocab refusal -- and that lane needs #127 merged
 before it can run. #197 is safe to merge, but it must NOT be recorded as
 hardware-validated; it is "no observable effect on the reachable vehicle".
+## #189: per-channel fp8 fused GEMV, an A/B off-switch, and a card that lied
+
+### Why this existed to be done
+
+Design B (#179) shipped as a kernel that fires ONLY for `use_block_dequant` --
+block-scaled fp8. Every end-to-end number for it came from the 27B on the main
+rig, which is block-scaled. The checkpoint that actually lives on the card the
+fallback was built for -- Qwen3.5-4B fp8 on the 2080 Ti -- is
+compressed-tensors `strategy: channel`, so it takes the per-channel branch and
+the block kernel **was never compiled on the target card at all**. The owed
+end-to-end number was therefore not merely unmeasured, it was structurally
+unreachable.
+
+Read straight from the checkpoint's safetensors headers (no model load): **128
+fp8 2-D weights, every scale of shape (N, 1)** -- per-channel throughout, five
+distinct shapes. Confirmed at boot: a w8a8 config whose min capability (89) is
+not met is routed by `_get_scheme` to `CompressedTensorsW8A16Fp8`, whose dequant
+branch is what sm75 runs. That branch, plus `Fp8LinearMethod.use_dequant`, are
+the two sites wired here.
+
+### Kernel delta to the block variant
+
+Same raw-byte e4m3 decode (Triton's `fp8e4nv` exists on none of the target
+cards), same fp32 accumulator, same `tl.dot` with `BLOCK_M` padded to 16, same
+`FUSED_GEMV_MAX_ROWS = 8` decode cut. Three differences:
+
+1. The scale depends on `n` only, so it leaves the k loop entirely: one vector
+   load applied to the accumulator, instead of a scale tile loaded and
+   multiplied on every k step.
+2. No block geometry, therefore **no ragged decline** -- shapes the block
+   variant hands back are computed here.
+3. Tiles `(BLOCK_N, BLOCK_K) = (32, 64)`, not the block variant's `(64, 128)`,
+   and **no `N >= K` guard** (below).
+
+`SGLANG_FP8_FUSED_GEMV=0` disables BOTH variants. It rides on the existing
+`fp8_needs_dequant_fallback()` lane and can only subtract from it -- deliberately
+not a second, independently driftable enable.
+
+### The N >= K guard does not transfer, and keeping it would cost half the gain
+
+Inheriting #179's aspect guard was the obvious move and it is measured to be
+wrong. Fused vs materialise+F.linear, real 4B shapes, bf16, shipped tiles:
+
+| shape (N x K) | count | N/K | RTX 3080 sm86 | RTX 5090 sm120 |
+|---|---|---|---|---|
+| 9216 x 2560 | 64 | 3.60 | 5.54x | 2.75x |
+| 2560 x 9216 | 32 | 0.28 | 3.52x | 2.33x |
+| 1024 x 2560 | 16 | 0.40 | 1.48x | 1.30x |
+| 2560 x 4096 |  8 | 0.62 | 3.72x | 1.22x |
+| 8192 x 2560 |  8 | 3.20 | 6.04x | 2.32x |
+
+**Every shape wins, wide ones included** -- worst case 1.22x, not a loss.
+Count-weighted, the guard would cost 4.44x -> 3.58x (3080) and 2.34x -> 1.96x
+(5090); time-weighted, 4.52x -> 2.18x. The mechanism: in the block variant a
+long-K weight is hit twice, by starved occupancy AND by a scale-tile load plus
+full-tile multiply on every k step. Here the loop is only load, decode, dot, so
+a wide shape loses occupancy and nothing else -- and the materialisation it
+races is expensive enough that it still wins.
+
+### A formulation that is mathematically simpler and 2.7x slower
+
+The first version factored the scale out of the k loop (exact -- the same
+product, reassociated) and measured **2.5x slower than the block kernel that
+does strictly more work**, on the 2080 Ti. Five formulations were then measured
+rather than argued about. The layout hypothesis -- that feeding the decode chain
+straight into `tl.dot` lets Triton sink a dot-operand layout back into the uint8
+load -- was **falsified from the generated TTGIR**: both variants give that load
+the identical `#blocked<sizePerThread=[1,16], threadsPerWarp=[8,4]>` encoding.
+
+On the two HEALTHY cards the ranking is the other way round: the factored-out
+form is the fastest of the five, and the block-kernel-shaped in-loop 2-D scale
+multiply is the slowest by 2x. The 2080 Ti's inverted ranking is an artifact of
+its clock fault (next section), which is why the clean formulation ships.
+
+### The 2080 Ti was locked at 300 MHz, and that invalidates its numbers
+
+Found while asking why a kernel could be 15x off memory bandwidth:
+
+```
+Performance State           : P8            (under 100% load)
+SW Power Cap                : Active
+SW Thermal Slowdown         : Active        (at 52 C)
+clocks.sm                   : 300 MHz       (boost is 1545+)
+power.draw                  : 318 W         at 300 MHz -- telemetry is bogus
+```
+
+Throttle counters equal the whole uptime, so it is like this from second one;
+no XID errors; `nvidia-smi -pm 1`, `-lgc 1350,1900` and `-pl 336` all fail to
+move it. Roofline probe, same torch/triton on both:
+
+| | fp16 matmul 4096^3 | exp2 over 64M | clone 128 MiB |
+|---|---|---|---|
+| RTX 3080 | **58.2 TFLOP/s** | 85.9 Gelem/s | 636 GB/s |
+| RTX 2080 Ti | **6.0 TFLOP/s** | 39.9 Gelem/s | 287 GB/s |
+
+Compute is at 10% of the 3080's while memory is at 45% -- a **4.4x bias against
+a compute-heavy kernel and in favour of the bandwidth-heavy materialisation it
+replaces**. This is the exact axis the whole trade-off turns on. #179 measured
+this same card at 2.51-5.46x for the block kernel when it was healthy.
+
+Rebooting was not an option: the host carries a live logged-in desktop session.
+
+### End to end on the 2080 Ti: functional PASS, throughput BLOCKED on the card
+
+4B fp8, ctx 16384 @ mem-fraction 0.90, budget pinned identically across arms
+(`max_total_num_tokens=16384`, KV 0.25+0.25 GB in both) so the #188 trap -- a
+budget that floats between arms -- cannot apply. Slope method, content classes
+measured separately.
+
+| arm | code | prose | mixed | all | degenerate |
+|---|---|---|---|---|---|
+| A, `SGLANG_FP8_FUSED_GEMV=1` | 0.87 | 0.87 | 0.87 | **0.87 tok/s** | 0/3 |
+| B, `SGLANG_FP8_FUSED_GEMV=0` | 2.71 | 2.69 | 2.68 | **2.69 tok/s** | 0/3 |
+
+Raw: `192.168.0.89:/root/fp8pc_ab_{on,off}.json`, logs `fp8pc_boot{A,B}.log`,
+microbench `fp8pc_micro_2080ti.json`.
+
+**What this run does establish:**
+
+* the wiring FIRES -- `_fp8_channel_dequant_gemv` has 176 artifacts in the
+  Triton cache after arm A, i.e. it compiled and launched. #179's first wiring
+  silently declined every call, so this is checked, not assumed;
+* output is coherent in all three content classes, 0 degenerate in both arms;
+* the off-switch works end to end, from env var to measured behaviour;
+* the microbench PREDICTS the system: it called 0.30x weighted for this card,
+  the system delivered 0.87/2.69 = **0.32x**, within 7%. #179's open
+  microbench-vs-system gap does not reappear here.
+
+**What it does not establish:** any honest throughput verdict for sm75. Both
+arms ran at ~10% of the card's compute. Correcting 0.32x by the measured 4.4x
+bias lands near 1.4x -- the same sign as the healthy cards -- but that is an
+extrapolation, not a measurement. Identical tok/s across all three content
+classes is itself a symptom: on a healthy rig throughput tracks content at
+r=0.90; here the card is so clock-bound that content cannot register.
+
+**The owed sm75 end-to-end number remains OPEN, on hardware grounds.** It needs
+this card clocking properly (or another sm75/sm70 host). The default stays ON,
+because the two healthy cards say 2.3-4.8x and the flag exists for exactly the
+case where a specific machine disagrees.
+
+### Gates
+
+24/24 green on sm86 (RTX 3080) and on sm75 (RTX 2080 Ti); 4/4 of the
+GPU-independent subset on CPU. Raw-byte e4m3 decode pinned bit-exact against
+`tensor.to(torch.float32)`; fp32 error band, NOT `torch.equal` against the old
+path -- worst fused relative error 0.00141 against materialise's 0.01325, i.e.
+the fused path is again the more accurate of the two. Both wired layouts ((N,K)
+row-major and a `.t()` view of (K,N)) asserted bit-identical to each other.
+Purity: repeated calls bit-identical across interleaved GPU work and an
+intervening other-dtype call; inputs never mutated.
+
+### GDN conv-dtype fix (74d542e9f9) confirmed on the target card
+
+Owed evidence, taken for free inside the arm-A boot with
+`SGLANG_MAMBA_CONV_DTYPE` explicitly UNSET (verified absent from the worker's
+`/proc/<pid>/environ`):
+
+* `Compute capability below sm80. Use float16 due to lack of bfloat16 support.`
+* `Index put requires source and destination dtypes match` -- **0 occurrences**
+* `The server is fired up and ready to roll!` -- reached, Mamba conv/ssm state
+  and KV cache all allocated at `torch.float16`
+
+The workaround env is no longer needed on this path.
