@@ -11,6 +11,7 @@ import dataclasses
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.disaggregation.congruent_lane import CongruentPrefillLane
 from sglang.srt.disaggregation.topology import (
     TOPOLOGY_COLOCATED_CONGRUENT,
     TOPOLOGY_COLOCATED_PROCESS,
@@ -47,6 +48,8 @@ def _args(**kw):
         rank_gpu_memory_mib=None,
         mem_fraction_static=None,
         model_path="",
+        enable_mixed_chunk=False,
+        disaggregation_prefill_lane_interval=1,
     )
     base.update(kw)
     return SimpleNamespace(**base)
@@ -158,6 +161,54 @@ class TestStructuralValidation(CustomTestCase):
                     disaggregation_topology=TOPOLOGY_COLOCATED_CONGRUENT,
                     disaggregation_prefill_gpus=[5],
                     disaggregation_prefill_budget_mib=2000,
+                )
+            )
+
+    def test_congruent_requires_the_full_decode_assignment(self):
+        # A strict subset is rejected: the lane forward is a TP forward
+        # through the whole group, a card cannot opt out. Both assignments
+        # must be named.
+        with self.assertRaises(ValueError) as ctx:
+            validate_pd_topology_args(
+                _args(
+                    disaggregation_topology=TOPOLOGY_COLOCATED_CONGRUENT,
+                    disaggregation_prefill_gpus=[0],
+                    disaggregation_prefill_budget_mib=2000,
+                )
+            )
+        msg = str(ctx.exception)
+        self.assertIn("[0]", msg)
+        self.assertIn("[0, 1, 2]", msg)
+        self.assertIn("opt out", msg)
+
+    def test_congruent_full_assignment_passes(self):
+        validate_pd_topology_args(
+            _args(
+                disaggregation_topology=TOPOLOGY_COLOCATED_CONGRUENT,
+                disaggregation_prefill_gpus=[0, 1, 2],
+                disaggregation_prefill_budget_mib=2000,
+            )
+        )
+
+    def test_congruent_rejects_mixed_chunk(self):
+        with self.assertRaisesRegex(ValueError, "mixed"):
+            validate_pd_topology_args(
+                _args(
+                    disaggregation_topology=TOPOLOGY_COLOCATED_CONGRUENT,
+                    disaggregation_prefill_gpus=[0, 1, 2],
+                    disaggregation_prefill_budget_mib=2000,
+                    enable_mixed_chunk=True,
+                )
+            )
+
+    def test_congruent_rejects_nonpositive_lane_interval(self):
+        with self.assertRaisesRegex(ValueError, "lane-interval"):
+            validate_pd_topology_args(
+                _args(
+                    disaggregation_topology=TOPOLOGY_COLOCATED_CONGRUENT,
+                    disaggregation_prefill_gpus=[0, 1, 2],
+                    disaggregation_prefill_budget_mib=2000,
+                    disaggregation_prefill_lane_interval=0,
                 )
             )
 
@@ -380,22 +431,30 @@ class TestApplyNormalization(CustomTestCase):
         )
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "1")
 
-    def test_congruent_names_the_stage_boundary(self):
+    def test_congruent_apply_returns_a_plan(self):
+        # Stage 2: the lane is wired — apply returns the plan instead of a
+        # stage-boundary error; the lane card shows shared weights.
         args = _args(
             disaggregation_topology=TOPOLOGY_COLOCATED_CONGRUENT,
-            disaggregation_prefill_gpus=[0],
+            disaggregation_prefill_gpus=[0, 1, 2],
             disaggregation_prefill_budget_mib=2000,
             rank_gpu_id=[0, 1, 2],
             rank_gpu_memory_mib=[26000, 17000, 17000],
         )
-        with self.assertRaisesRegex(NotImplementedError, "colocated-congruent"):
-            apply_pd_topology(
-                args,
-                card_totals_mib=TOTALS,
-                model_weight_mib=14000,
-                num_hidden_layers=48,
-                setenv={},
-            )
+        env = {}
+        plan = apply_pd_topology(
+            args,
+            card_totals_mib=TOTALS,
+            model_weight_mib=14000,
+            num_hidden_layers=48,
+            setenv=env,
+        )
+        self.assertIsNotNone(plan)
+        for gpu in (0, 1, 2):
+            card = plan.card(gpu)
+            self.assertTrue(card.weights_shared)
+            self.assertEqual(card.prefill_weight_mib, 0)
+        self.assertEqual(env["SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS"], "1")
 
     def test_infeasible_topology_rejected_at_apply(self):
         args = _args(
@@ -431,6 +490,91 @@ class TestApplyNormalization(CustomTestCase):
         )
 
 
+class TestCongruentLanePacing(CustomTestCase):
+    def test_interval_below_one_rejected(self):
+        with self.assertRaisesRegex(ValueError, ">= 1"):
+            CongruentPrefillLane(0)
+
+    def test_no_decode_work_runs_prefill_freely(self):
+        lane = CongruentPrefillLane(3)
+        for _ in range(5):
+            self.assertTrue(lane.allow_prefill(device_has_decode_work=False))
+
+    def test_first_prefill_is_free_then_alternation(self):
+        lane = CongruentPrefillLane(1)
+        self.assertTrue(lane.allow_prefill(device_has_decode_work=True))
+        lane.note_prefill_ran()
+        # One device iteration must pass before the next prefill chunk.
+        self.assertFalse(lane.allow_prefill(device_has_decode_work=True))
+        self.assertTrue(lane.allow_prefill(device_has_decode_work=True))
+        lane.note_prefill_ran()
+        self.assertFalse(lane.allow_prefill(device_has_decode_work=True))
+
+    def test_larger_interval_protects_more_device_iterations(self):
+        lane = CongruentPrefillLane(3)
+        self.assertTrue(lane.allow_prefill(device_has_decode_work=True))
+        lane.note_prefill_ran()
+        decisions = [lane.allow_prefill(device_has_decode_work=True) for _ in range(4)]
+        self.assertEqual(decisions, [False, False, False, True])
+
+
+class TestCongruentLaneWeightSharing(CustomTestCase):
+    def _linear(self):
+        import torch.nn as nn
+
+        return nn.Linear(4, 4, bias=False)
+
+    def test_same_model_passes(self):
+        lane = CongruentPrefillLane(1)
+        model = self._linear()
+        lane.bind_model(model)
+        lane.assert_congruent(model)
+
+    def test_shared_storage_passes(self):
+        lane = CongruentPrefillLane(1)
+        decode_model = self._linear()
+        prefill_view = self._linear()
+        prefill_view.weight = decode_model.weight  # shared bytes
+        lane.bind_model(decode_model)
+        lane.assert_congruent(prefill_view)
+
+    def test_second_weight_copy_is_named_and_rejected(self):
+        # Same values, different storage: exactly the silent VRAM doubling
+        # the invariant exists to catch.
+        import torch
+
+        lane = CongruentPrefillLane(1)
+        decode_model = self._linear()
+        copy_model = self._linear()
+        with torch.no_grad():
+            copy_model.weight.copy_(decode_model.weight)
+        lane.bind_model(decode_model)
+        with self.assertRaises(AssertionError) as ctx:
+            lane.assert_congruent(copy_model)
+        msg = str(ctx.exception)
+        self.assertIn("weight sharing broken", msg)
+        self.assertIn("'weight'", msg)
+
+    def test_unknown_parameter_rejected(self):
+        import torch.nn as nn
+
+        lane = CongruentPrefillLane(1)
+        decode_model = self._linear()
+        lane.bind_model(decode_model)
+        bigger = nn.Sequential(self._linear(), self._linear())
+        with self.assertRaisesRegex(AssertionError, "no counterpart"):
+            lane.assert_congruent(bigger)
+
+    def test_note_prefill_ran_verifies_once(self):
+        lane = CongruentPrefillLane(1)
+        model = self._linear()
+        lane.bind_model(model)
+        lane.note_prefill_ran(model)
+        other = self._linear()
+        # Verified flag short-circuits: identity is stable within a run.
+        lane.note_prefill_ran(other)
+
+
 class TestServerArgsSurface(CustomTestCase):
     def test_flags_exist_in_the_disaggregation_block_and_default_off(self):
         from sglang.srt.server_args import ServerArgs
@@ -444,6 +588,19 @@ class TestServerArgsSurface(CustomTestCase):
         ):
             self.assertIn(name, fields)
             self.assertIsNone(fields[name].default)
+        self.assertEqual(
+            fields["disaggregation_prefill_lane_interval"].default, 1
+        )
+
+    def test_scheduler_default_lane_is_none(self):
+        # The lane attribute exists and defaults to None on every path that
+        # does not set the topology flag (byte-identical default).
+        import inspect
+
+        from sglang.srt.managers import scheduler as scheduler_mod
+
+        src = inspect.getsource(scheduler_mod.Scheduler)
+        self.assertIn("self.congruent_prefill_lane = None", src)
 
 
 if __name__ == "__main__":

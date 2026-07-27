@@ -3486,6 +3486,21 @@ class ServerArgs:
             "the CUDA context is the operator's responsibility.",
         ),
     ] = None
+    disaggregation_prefill_lane_interval: A[
+        int,
+        Arg(
+            help="colocated-congruent only: minimum device (decode) "
+            "iterations between two prefill-lane chunks. The lane replaces "
+            "the stock prefill-first policy with DECODE priority — the "
+            "property PD exists for: 1 (default) alternates prefill and "
+            "decode under load, larger values protect the decode cadence "
+            "more strongly. Without decode work prefill runs freely. The "
+            "lane tick runs INSTEAD of a device iteration (serial, the "
+            "kv-session-offload S1 pattern); concurrent dispatch on a "
+            "second stream needs the comm-B split for the model's shared "
+            "TP/MoE communicators first and is a later slice.",
+        ),
+    ] = 1
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

@@ -254,13 +254,46 @@ def validate_pd_topology_args(args: Any) -> None:
                 "shared). Layer placement belongs to the disjoint and "
                 "colocated-process topologies."
             )
-        decode_gpus = set(decode_gpu_of_ranks(args))
-        missing = [g for g in prefill_gpus if g not in decode_gpus]
-        if missing:
+        if getattr(args, "enable_mixed_chunk", False):
             raise ValueError(
-                "colocated-congruent: every prefill-lane card must host a "
-                f"decode rank whose shard the lane reuses; GPU(s) {missing} "
-                f"host none (decode ranks sit on {sorted(decode_gpus)})."
+                "colocated-congruent cannot run with --enable-mixed-chunk: "
+                "the lane's separation invariant is that prefill and decode "
+                "batches are never mixed (only the weights are shared)."
+            )
+        interval = getattr(args, "disaggregation_prefill_lane_interval", 1)
+        if interval < 1:
+            raise ValueError(
+                "--disaggregation-prefill-lane-interval must be >= 1, got "
+                f"{interval}."
+            )
+        # Congruence is enforced, not hoped for: the lane forward is a TP
+        # forward through the WHOLE decode group (a card cannot opt out of
+        # the collective), so the prefill assignment must equal the decode
+        # assignment card for card. A mismatch would mean non-shareable
+        # weights and a broken VRAM plan.
+        decode_gpus = set(decode_gpu_of_ranks(args))
+        prefill_set = set(prefill_gpus)
+        if prefill_set != decode_gpus:
+            missing = sorted(prefill_set - decode_gpus)
+            absent = sorted(decode_gpus - prefill_set)
+            detail = []
+            if missing:
+                detail.append(
+                    f"GPU(s) {missing} carry no decode rank (no shard to "
+                    "reuse)"
+                )
+            if absent:
+                detail.append(
+                    f"GPU(s) {absent} carry a decode rank but were not "
+                    "named (they participate in every lane forward "
+                    "regardless — a card cannot opt out of the TP "
+                    "collective)"
+                )
+            raise ValueError(
+                "colocated-congruent: the prefill-lane assignment must be "
+                "CONGRUENT with the decode assignment — "
+                f"prefill names {sorted(prefill_set)}, decode ranks sit on "
+                f"{sorted(decode_gpus)}: " + "; ".join(detail) + "."
             )
         return
 
@@ -701,12 +734,11 @@ def apply_pd_topology(
             )
 
     if topology == TOPOLOGY_COLOCATED_CONGRUENT:
-        raise NotImplementedError(
-            "--disaggregation-topology=colocated-congruent: the in-process "
-            "prefill lane is not wired yet. The topology plan, congruence "
-            "validation and VRAM feasibility check above are in place; the "
-            "lane forward (scheduler slice) is the next stage and needs GPU "
-            "validation. Until then use 'disjoint' or 'colocated-process'."
+        logger.info(
+            "PD topology colocated-congruent: prefill lane rides the decode "
+            "processes (decode priority, lane interval %d); weights shared "
+            "by congruence, verified at first lane tick.",
+            getattr(server_args, "disaggregation_prefill_lane_interval", 1),
         )
 
     logger.info(
