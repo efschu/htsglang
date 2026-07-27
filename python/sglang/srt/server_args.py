@@ -1571,6 +1571,66 @@ class ServerArgs:
             "write path, gated behind this flag.",
         ),
     ] = False
+    kv_session_offload_destinations: A[
+        Optional[str],
+        Arg(
+            help="kv-session-offload DESTINATIONS (#224): ordered, "
+            "comma-separated list of spill targets. Unset (DEFAULT) = "
+            "today's behaviour, byte-identical: sessions spill only into "
+            "the local pinned host-RAM pool. The first entry MUST be "
+            "'local' -- a hard physical boundary, not a preference: the "
+            "device's D2H DMA lands in locally pinned host RAM, so every "
+            "further hop stages through it, and the measured cross-rig "
+            "path (3.43 GB/s RDMA write / 1.47 us latency, "
+            "PCIe-3.0-x4-bound) is orders of magnitude below the local "
+            "host-RAM path -- a network tier is a tier BELOW local host "
+            "RAM, never above it. Each FURTHER entry names a PARK tier "
+            "(a HiCache storage backend; V1 supports 'file' = persistent "
+            "local/mounted storage, 'mooncake' = remote host RAM across "
+            "rigs, 'dynamic' = operator-supplied class). When the local "
+            "tier is exhausted (no free host region under fresh spill "
+            "pressure -- and, once the #236 budget lands, at its "
+            "exhaustion sites via park_instead_of_demote), the oldest "
+            "eligible spilled session's host tail is PARKED into the "
+            "first listed tier that takes it; a failing tier falls over "
+            "to the next, and after the last the behaviour is exactly "
+            "today's (decline -> stock retraction). A parked session is "
+            "SUSPENDED, never degraded: it stops generating until "
+            "unparked (FIFO, once local pressure is gone), then resumes "
+            "with all work intact -- no re-prefill, no output cap. "
+            "GDN/Mamba state stays device-resident and NEVER crosses the "
+            "wire (never quantized; parking relieves the local host-RAM "
+            "region, not the mamba pool or the device head). Remote "
+            "entries are only restored after an explicit producer-identity "
+            "check (model, quantization, KV dtype, TP/DCP geometry); a "
+            "mismatch is a hard error, never a silent restore. Requires "
+            "--enable-kv-session-offload.",
+        ),
+    ] = None
+    kv_session_offload_destination_extra_config: A[
+        Optional[str],
+        Arg(
+            help="kv-session-offload DESTINATIONS (#224): JSON extra "
+            "config forwarded to the park-tier storage backend factory "
+            "(same schema as --hicache-storage-backend-extra-config; for "
+            "'dynamic' also honours 'pointer_io'). Requires "
+            "--kv-session-offload-destinations.",
+        ),
+    ] = None
+    kv_session_offload_park_timeout_iters: A[
+        int,
+        Arg(
+            help="kv-session-offload DESTINATIONS (#224): scheduler "
+            "iterations (the rank-uniform clock) an in-flight park/unpark "
+            "transfer may stay unconfirmed before it is abandoned. An "
+            "abandoned transfer resolves as FAILED on every rank "
+            "deterministically -- but only once every rank's I/O has "
+            "actually stopped (pool rows are never released under a live "
+            "worker). Park failure falls over to the next tier or back to "
+            "today's behaviour; unpark failure aborts the request with a "
+            "named error (its parked KV cannot be restored). Default 512.",
+        ),
+    ] = 512
     rank_tp_ratio: A[
         Optional[Union[List[int], str]],
         Arg(
@@ -2617,7 +2677,7 @@ class ServerArgs:
             "drafter lifts the gate automatically. An integer sets the "
             "threshold in tokens. 'off': no gate (pre-gate auto-mode "
             "behavior). Requests near the threshold whose remaining "
-            "max_new_tokens budget can cross it are pre-empted at decode "
+            "max_new_tokens budget can cross it are preempted at decode "
             "start (nearness via SGLANG_CROSS_CTX_GATE_NEAR_FRAC, default "
             "0.8). Ignored outside force=auto|policy (under force=policy it "
             "acts as a safety filter on top of the policy table).",
@@ -4373,6 +4433,59 @@ class ServerArgs:
                 "--kv-session-offload-host-ram-gib requires "
                 "--enable-kv-session-offload."
             )
+        # #224 destinations: sub-mode of the offload feature; standalone the
+        # flags would silently do nothing -> reject. List validation itself
+        # (order rule, supported tiers) fails fast here, at arg-parse.
+        if self.kv_session_offload_destinations and (
+            not self.enable_kv_session_offload
+        ):
+            raise ValueError(
+                "--kv-session-offload-destinations requires "
+                "--enable-kv-session-offload."
+            )
+        if (
+            self.kv_session_offload_destination_extra_config
+            and not self.kv_session_offload_destinations
+        ):
+            raise ValueError(
+                "--kv-session-offload-destination-extra-config requires "
+                "--kv-session-offload-destinations."
+            )
+        if self.kv_session_offload_destinations:
+            from sglang.srt.managers.kv_session_spill_destination import (
+                destinations_error,
+                parse_destinations,
+            )
+
+            _dest_err = destinations_error(
+                parse_destinations(self.kv_session_offload_destinations)
+            )
+            if _dest_err is not None:
+                raise ValueError(
+                    f"--kv-session-offload-destinations: {_dest_err}"
+                )
+            if self.kv_session_offload_destination_extra_config:
+                import json as _json
+
+                try:
+                    _parsed = _json.loads(
+                        self.kv_session_offload_destination_extra_config
+                    )
+                except ValueError as e:
+                    raise ValueError(
+                        "--kv-session-offload-destination-extra-config is "
+                        f"not valid JSON: {e}"
+                    ) from e
+                if not isinstance(_parsed, dict):
+                    raise ValueError(
+                        "--kv-session-offload-destination-extra-config must "
+                        "be a JSON object."
+                    )
+            if self.kv_session_offload_park_timeout_iters < 1:
+                raise ValueError(
+                    "--kv-session-offload-park-timeout-iters must be >= 1; "
+                    f"got {self.kv_session_offload_park_timeout_iters}."
+                )
         if not self.enable_kv_session_offload:
             return
         if self.kv_session_offload_host_ram_gib < 0:

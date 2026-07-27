@@ -1224,6 +1224,10 @@ class SpillSlot:
         # which is also where the copy-stream D2H is joined (U9).
         "born_spilled",
         "adopted",
+        # #224 destinations: chosen for parking (tick + restore stop so the
+        # region content settles before the transfer snapshots it). Always
+        # False unless the destination chain is armed.
+        "park_pending",
     )
 
     def __init__(self, req, region, spill_iter, wave, hysteresis):
@@ -1277,6 +1281,8 @@ class SpillSlot:
         # handover, so the defaults keep every existing path unchanged.
         self.born_spilled = False
         self.adopted = True
+        # #224: never set on the default path (destination chain unarmed).
+        self.park_pending = False
         # RESTORE-READINESS handshake (quiescence-trap fix): when a spilled
         # session is restore-ready but its last host-tick result is still
         # pending (last_batch is its own tick), one tick is suppressed so the
@@ -1806,6 +1812,15 @@ class KVSessionOffloadManager:
             )
             self._install_regulator_device_timer()
 
+        # #224 spill destinations: ordered target chain (local host RAM +
+        # park tiers). None when --kv-session-offload-destinations is unset
+        # -> every _dest-gated site below is inert (byte-identical default).
+        from sglang.srt.managers.kv_session_spill_destination import (
+            attach_destinations,
+        )
+
+        self._dest = attach_destinations(self)
+
         global _MANAGER
         _MANAGER = self
 
@@ -2018,17 +2033,29 @@ class KVSessionOffloadManager:
         fe = getattr(tree, "full_evictable_size", None)
         local_evict = int(fe() if fe is not None else tree.evictable_size())
         grp = getattr(self.scheduler, "tp_cpu_group", None)
+        # #224 destinations: the in-flight park/unpark transfer's rank-local
+        # (done, ok) flags ride on THIS reduce -- per-rank network I/O must
+        # never feed a decision directly, so state transitions consume only
+        # the MIN of these flags. None (flag unset) -> today's 2-element
+        # payload, byte-identical.
+        _dest = getattr(self, "_dest", None)
+        dest_extra = _dest.reduce_extra() if _dest is not None else None
         if grp is None or torch.distributed.get_world_size(grp) <= 1:
             self._dcp_min_avail = local_avail
             self._dcp_budget_deficit = 0
+            if _dest is not None and dest_extra is not None:
+                _dest.consume_reduced(dest_extra[0], dest_extra[1])
             return
-        t = torch.tensor(
-            [local_avail, local_avail + local_evict], dtype=torch.int64
-        )
+        vals = [local_avail, local_avail + local_evict]
+        if dest_extra is not None:
+            vals.extend(dest_extra)
+        t = torch.tensor(vals, dtype=torch.int64)
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=grp)
         self._dcp_min_avail = int(t[0].item())
         # >= 0: the local budget can only exceed the group minimum.
         self._dcp_budget_deficit = (local_avail + local_evict) - int(t[1].item())
+        if _dest is not None and dest_extra is not None:
+            _dest.consume_reduced(int(t[2].item()), int(t[3].item()))
 
     def dcp_min_avail(self) -> int:
         """Rank-uniform available_size for THIS iteration (min-reduced in
@@ -2174,6 +2201,13 @@ class KVSessionOffloadManager:
         False when no region is free (falls back to stock retraction) --
         never an inconsistent partial spill."""
         if not self._free_regions:
+            if getattr(self, "_dest", None) is not None:
+                # #224: a spill declined for lack of a region is FRESH
+                # pressure -- the signal that lets the destination chain
+                # park the oldest spilled session to free a region for the
+                # NEXT spill (this one still falls back to stock retraction,
+                # honestly: a network tier cannot free a region in-line).
+                self._dest.note_region_shortfall(self._iter_ct)
             return False
         if fast_pressure is None:
             fast_pressure = self._fast_lane_pressure(batch.reqs)
@@ -3035,6 +3069,18 @@ class KVSessionOffloadManager:
             # paths that bypass release (e.g. abort). Rank-uniform.
             running_batch.batch_is_full = False
 
+        # 1b. #224 destinations: advance the park/unpark state machine.
+        #     BEFORE the empty-spills early return -- unparking must run
+        #     even when no session is currently host-resident. Inert
+        #     (single gated call, no other state touched) when the
+        #     destination chain is unarmed.
+        if getattr(self, "_dest", None) is not None:
+            from sglang.srt.managers.kv_session_spill_destination import (
+                maybe_park_flow,
+            )
+
+            running_batch = maybe_park_flow(self, running_batch, last_batch)
+
         if not self.spills:
             self._maybe_spill_for_fast_lane(running_batch)
             return running_batch
@@ -3046,6 +3092,10 @@ class KVSessionOffloadManager:
         # 3. Restore / wave-back each spilled session independently. A
         #    completed restore merges that session back into running_batch.
         for rpi, slot in list(self.spills.items()):
+            if getattr(slot, "park_pending", False):
+                # #224: on its way OUT to a park tier -- restoring it now
+                # would race the snapshot. False unless the chain armed it.
+                continue
             running_batch = self._maybe_restore_flow(slot, running_batch, last_batch)
         return running_batch
 
@@ -3268,6 +3318,11 @@ class KVSessionOffloadManager:
         due = []
         for slot in self.spills.values():
             if slot.req.finished() or self._iter_ct <= slot.spill_iter:
+                continue
+            if getattr(slot, "park_pending", False):
+                # #224: chosen for parking -- its tick stops so the region
+                # content settles before the transfer snapshots it. False on
+                # every slot unless the destination chain armed it.
                 continue
             if spill_tick_seq_len(
                 len(slot.req.origin_input_ids), len(slot.req.output_ids)
@@ -4311,4 +4366,31 @@ class KVSessionOffloadManager:
                 out.append(slot.batch)
             else:
                 out.append(SimpleNamespace(reqs=[slot.req]))
+        if getattr(self, "_dest", None) is not None:
+            # #224: parked sessions are in NO real batch while parked; the
+            # abort scan must still reach them.
+            from sglang.srt.managers.kv_session_spill_destination import (
+                parked_inflight_entries,
+            )
+
+            out.extend(parked_inflight_entries(self))
         return out
+
+    def park_instead_of_demote(self, slot) -> bool:
+        """#224 <-> #236 SEAM. The spill-budget branch calls this at its
+        demotion sites (immediately before ``_budget_demote``): when the
+        destination chain is armed and the slot is park-eligible, the
+        session is routed to the next tier instead of being demoted -- the
+        budget exhaustion EXTENDS into remote capacity (work kept AND
+        liveness kept, merely suspended) rather than capping generation.
+        Returns False (demote as before) when the chain is unarmed, busy,
+        or the slot is ineligible. A committed park moves the tail out of
+        the local host volume; the budget branch discounts it at its
+        _budget_note_* sites when this returned True."""
+        if getattr(self, "_dest", None) is None:
+            return False
+        from sglang.srt.managers.kv_session_spill_destination import (
+            park_instead_of_demote,
+        )
+
+        return park_instead_of_demote(self, slot)
