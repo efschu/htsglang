@@ -757,7 +757,40 @@ waiting in lock step.
 | Expected first failures, in likelihood order | pinned-buffer registration cost on the first collective, since staging buffers are `pin_memory=True` only when the rank's device is CUDA; a rank-uniformity break if any path issues a collective on one rig and not the other; the per-collective software floor showing up as poor decode tok/s |
 | Validation bar | byte-identical output against a solo run on one rig |
 
-**Upstream:** sglang's distributed backend is NCCL/RCCL only, never bridged.
+**Cross-rig transport, measured (task #204, 2026-07-26).** Two hosts, one rank per host, CPU
+tensors, world=2, 10 iterations per cell, median. Three configurations, chosen so that the
+*wire* and the *transport stack* can be told apart: `gloo` over the 1 GbE LAN, `gloo` over the
+RoCE NIC's IP (TCP on the fast wire), and HTCCL/UCX native RDMA on that same NIC.
+
+| cell | gloo 1 GbE | gloo RoCE (TCP) | **UCX RDMA** | RDMA vs 1 GbE | RDMA vs gloo-on-same-wire |
+|---|---|---|---|---|---|
+| barrier | 146.63 us | 116.43 us | **8.30 us** | 17.7x | 14.0x |
+| all_reduce 8 KiB | 526.05 us | 362.20 us | **44.92 us** | 11.7x | 8.1x |
+| all_gather 8 KiB | 365.28 us | 234.98 us | **41.13 us** | 8.9x | 5.7x |
+| all_reduce 64 KiB | 1209.84 us | 318.53 us | **55.79 us** | 21.7x | 5.7x |
+| all_gather 64 KiB | 909.12 us | 203.58 us | **64.37 us** | 14.1x | 3.2x |
+| all_reduce 512 KiB | 5360.59 us | 547.43 us | **237.70 us** | 22.6x | 2.3x |
+| all_gather 512 KiB | 5024.35 us | 608.40 us | **250.45 us** | 20.1x | 2.4x |
+| all_reduce 4 MiB | 36588.97 us | 2075.18 us | **1717.39 us** | 21.3x | 1.2x |
+| all_gather 4 MiB | 37484.93 us | 3142.25 us | **1693.10 us** | 22.1x | 1.9x |
+
+Reading it: **RDMA's win is latency, not bandwidth.** On the *same* wire it is 14x at barrier
+and 8x at 8 KiB, but only 1.2x at 4 MiB — at large payloads both stacks are bandwidth-bound near
+the link limit (~16-20 Gbit/s realised). The 1 GbE column saturates at 0.92 Gbit/s, i.e. line
+rate, which is the sanity check that the harness measures the wire and not itself.
+
+**This supersedes the "78 us" figure** previously quoted for 1 GbE: that was a raw TCP
+round-trip taken during network bring-up, not a collective, and comparing it against UCX
+collective numbers understated the gap by roughly 2x. The 1 GbE collective barrier is 146.63 us.
+
+The end-to-end TP=4 arm tables (RDMA vs 1 GbE, even vs uneven split) are condensed into the
+boot-check table above; method and full analysis in `TASK_103_SPEC_K_POLICY.md` (task #204).
+
+**Upstream:** SGLang/vLLM distributed backends are NCCL/RCCL only, never bridged (no).
+llama.cpp/ik_llama.cpp's RPC backend connects heterogeneous backends over TCP (CUDA/Metal/CPU
+confirmed, Vulkan/ROCm **unverified**) but is a backend-delegation/pipeline model, not a collective
+substituting for NCCL within one TP group, and is explicitly "proof-of-concept... fragile" per its
+own README (partial).
 
 <a id="f22"></a>
 ### 22. fp8 dequant fallback (W8A16)
