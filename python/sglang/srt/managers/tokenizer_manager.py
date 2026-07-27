@@ -86,6 +86,8 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.multimodal.lane_support import image_requests_unsupported_reason
+from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
@@ -258,6 +260,11 @@ class InputFormat(Enum):
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
+    # #186: set in init_tokenizer_and_processor. Declared here so a subclass
+    # that overrides that method cannot turn the admission check into an
+    # AttributeError.
+    mm_lane_refusal = None
+
     @property
     def serving_chat_class(self):
         """Return the serving chat class for OpenAI API.
@@ -347,6 +354,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def init_tokenizer_and_processor(self):
         server_args = self.server_args
+
+        # #186: resolved once -- the answer is a pure function of config, and
+        # `_validate_mm_lane_support` runs on every multimodal request.
+        self.mm_lane_refusal = image_requests_unsupported_reason(
+            server_args, self.model_config
+        )
+        if self.mm_lane_refusal is not None:
+            logger.warning(
+                "Image requests will be refused on this configuration: %s",
+                self.mm_lane_refusal,
+            )
 
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal:
@@ -870,6 +888,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.audio_data = [obj.audio_data]
             if contains_mm_input:
                 self._validate_mm_limits(obj)
+                self._validate_mm_lane_support(obj)
 
             mm_inputs = None
 
@@ -1063,6 +1082,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     raise ValueError(
                         f"{modality.capitalize()} count {count} exceeds limit {limit} per request."
                     )
+
+    def _validate_mm_lane_support(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        """Refuse image requests the configured attention lane cannot serve.
+
+        Task #186, route 2. Without this an image request on the Triton DCP
+        extend lane dies four frames deep in the attention backend with a
+        `NotImplementedError`, taking the whole batch with it. Checked here,
+        before the vision preprocessing runs, so a refused request costs
+        nothing and the client gets a 400 naming the escape hatch.
+
+        IMAGE only. Video- and audio-only payloads never build a bidirectional
+        mask -- `prepare_attn_masks` punches blocks for `is_image()` items and
+        the whole call is gated on `contains_image_inputs()` -- so refusing
+        them would be wrong.
+        """
+        if self.mm_lane_refusal is None or not has_valid_data(obj.image_data):
+            return
+        raise ValueError(self.mm_lane_refusal)
 
     def _validate_for_matryoshka_dim(self, obj: EmbeddingReqInput) -> None:
         """Validate the request for Matryoshka dim if it has the field set."""

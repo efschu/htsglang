@@ -2066,6 +2066,25 @@ def _execute_server_warmup(server_args: ServerArgs):
 
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
     is_vlm = bool(model_info.get("has_image_understanding", False)) and not is_mps()
+    # #186 route 1: the image warmup below is a real image request (275 tokens,
+    # 256 of them soft tokens, measured), so on a lane that cannot serve image
+    # requests it would kill the server during boot -- before any user request,
+    # and for a reason that has nothing to do with the workload. Fall back to
+    # the text warmup instead, which exercises the same path a text-only
+    # deployment on this lane will actually use. `--skip-server-warmup` remains
+    # the manual escape hatch.
+    # Read the decision the tokenizer manager already made, rather than
+    # recomputing it, so the warmup and the admission check can never disagree.
+    mm_lane_refusal = getattr(
+        _global_state.tokenizer_manager, "mm_lane_refusal", None
+    )
+    if is_vlm and mm_lane_refusal is not None:
+        logger.warning(
+            "Boot warmup: using a TEXT warmup instead of the image one, because "
+            "image requests are not supported on this configuration. %s",
+            mm_lane_refusal,
+        )
+        is_vlm = False
     if model_info["is_generation"]:
         if is_vlm and not server_args.skip_tokenizer_init:
             request_name = "/v1/chat/completions"
