@@ -3102,9 +3102,36 @@ class KVSessionOffloadManager:
         remaining = L - boundary
         avail = self.allocator.available_size()
 
+        # Slots a RESTORE could actually obtain. Radix-tree-evictable tokens
+        # count here, because _restore_memory_ok() evicts exactly that way
+        # before it commits and re-checks the free list afterwards -- so this
+        # test may be optimistic, the commit below is the authority.
+        #
+        # Gating on the free list alone deadlocks: the eviction that would
+        # grow `avail` sits BEHIND this test. A finished co-resident session
+        # does not return its KV to the allocator, it inserts it into the
+        # radix tree (radix_cache.cache_finished_req), so `avail` stays ~0
+        # while the tree holds thousands of evictable tokens. `fits_now` then
+        # never turns true and the victim finishes on the host floor even
+        # though the GPU is otherwise idle. The spill side already accounts
+        # this way (_maybe_spill_for_fast_lane).
+        #
+        # Wave-back below deliberately keeps the un-augmented `avail`: it
+        # allocates on the spot without evicting first.
+        restorable = avail + self._tree_evictable_size()
+
         # RESTORE-READY: tail already fully drained, OR the whole tail fits now.
         drained = boundary >= L
-        fits_now = avail >= remaining + self.restore_margin_tokens
+        fits_now = restorable >= remaining + self.restore_margin_tokens
+        if tick_trace_enabled() and self._iter_ct % 16 == 0:
+            self._log(
+                "kv-session-offload restore-gate: iter=%d L=%d boundary=%d "
+                "remaining=%d avail=%d evictable=%d margin=%d drained=%s "
+                "fits_now=%s quiescent=%s suppress_tick=%s",
+                self._iter_ct, L, boundary, remaining, avail,
+                restorable - avail, self.restore_margin_tokens,
+                drained, fits_now, quiescent, slot.suppress_tick,
+            )
         if drained or fits_now:
             if not quiescent:
                 # Restore-ready but the last host-tick result is still pending.

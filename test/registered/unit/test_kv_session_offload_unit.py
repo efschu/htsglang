@@ -2342,3 +2342,85 @@ def test_spilled_req_never_donates_sentinel_rows_to_the_radix_tree():
     assert tree2.inserted == ["normal"], (
         "the non-spilled path must still insert into the radix tree"
     )
+
+
+def test_restore_readiness_counts_radix_evictable_not_just_the_free_list():
+    """A spilled victim must become restore-READY on memory the tree still holds.
+
+    A co-resident session that FINISHES does not hand its KV back to the
+    allocator: `radix_cache.cache_finished_req` INSERTS it into the tree, where
+    it counts as evictable, not as free. If the restore-readiness test looks
+    only at `allocator.available_size()`, that memory is invisible and the gate
+    deadlocks -- the eviction that would convert evictable into free lives
+    inside `_restore_memory_ok()`, which is only reached AFTER the gate has
+    already opened. The victim then finishes on the host floor on an otherwise
+    idle GPU.
+
+    Measured on the mixed-GPU rig (task 217), 9 boots without the fix and 3
+    with it, same config, same 2-session choreography:
+
+        without:  restores=0/9, sustained  avail=13  evictable=2045  margin=1024
+                  victim ran 56-69 s at ~94 ms per verify round, alone
+        with:     restores=3/3, victim rejoined at ~37.4 ms per verify round
+
+    The spill side of this same file already accounts this way
+    (`_maybe_spill_for_fast_lane`: `available_size() + _tree_evictable_size()`).
+    This pins the restore side to the same rule.
+    """
+    from sglang.srt.managers.kv_session_offload import KVSessionOffloadManager
+
+    class _WaveBackReached(Exception):
+        """Raised instead of executing the incremental wave-back branch."""
+
+    class _NoBackend:
+        def __getattr__(self, name):
+            raise _WaveBackReached(name)
+
+    L, boundary, margin = 2000, 1500, 1024
+    remaining = L - boundary  # 500 -> a restore needs 1524 slots
+
+    def _mgr(avail, evictable):
+        m = object.__new__(KVSessionOffloadManager)
+        m.scheduler = types.SimpleNamespace(spec_algorithm=None, tp_rank=0)
+        m._fast_lane_enabled = False
+        m.host_base = 100000
+        row = torch.arange(L, dtype=torch.int64)
+        row[boundary:] += m.host_base  # tail rows are host sentinels
+        m.req_to_token_pool = types.SimpleNamespace(req_to_token=row.unsqueeze(0))
+        m.allocator = types.SimpleNamespace(available_size=lambda: avail)
+        m.tree_cache = types.SimpleNamespace(evictable_size=lambda: evictable)
+        m.restore_margin_tokens = margin
+        m._iter_ct = 100
+        m.backend = _NoBackend()
+        return m
+
+    def _slot():
+        req = types.SimpleNamespace(req_pool_idx=0, rid="victim")
+        batch = types.SimpleNamespace(seq_lens_cpu=torch.tensor([L]))
+        return types.SimpleNamespace(
+            req=req, batch=batch, spill_iter=0, suppress_tick=False,
+            hysteresis=RestoreHysteresis(4),
+        )
+
+    def _run(avail, evictable):
+        """Return True if the RESTORE-READY branch was taken."""
+        mgr, slot = _mgr(avail, evictable), _slot()
+        try:
+            # last_batch IS slot.batch -> not quiescent -> the ready branch
+            # parks the tick for one iteration instead of restoring outright.
+            mgr._maybe_restore_flow(slot, None, slot.batch)
+        except _WaveBackReached:
+            return False
+        return slot.suppress_tick
+
+    # THE BUG: nothing free, but the finished peer's KV sits in the tree.
+    assert _run(avail=0, evictable=4096), (
+        "restore stayed blocked while the radix tree held 4096 evictable "
+        "tokens -- the victim would finish on the host floor on an idle GPU"
+    )
+    # Free list alone is still sufficient (behaviour must not change).
+    assert _run(avail=4096, evictable=0)
+    # Genuinely out of memory on both counts -> incremental wave-back, as before.
+    assert not _run(avail=0, evictable=0)
+    # Not enough even when combined -> wave-back, not a doomed restore.
+    assert not _run(avail=700, evictable=700)
