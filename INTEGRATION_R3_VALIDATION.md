@@ -3095,3 +3095,212 @@ count. Failure-set diffing, not failure counting, is what makes these runs
 comparable -- the counts alone drift with JIT cache warmth.
 
 All 68 changed Python files AST-compile.
+
+# Window 4 -- Phase 3: closing boots and the two measurements
+
+All boots on the merge tip (`0f2734aeea`, i.e. the full stack), rig1 solo, GPUs
+verified empty between arms and at the end. The persisted
+`SGLANG_MEASURED_KV_BUDGET` record (`/root/.cache/sglang/kv_budget-*.json`, 31
+files) was moved aside at the start of the phase and DELETED before every 27B
+boot, so no arm inherited another arm's correction.
+
+## Closing boots
+
+| arm | result | evidence |
+|---|---|---|
+| 27B uneven-DCP TP=3 + NEXTN MTP (the working arm) | **GREEN** | `max_total_num_tokens = 98328` -- identical to the Phase-1 reference; coherent; accept 3.478 |
+| arm E: the same + `SGLANG_HTCCL=1 SGLANG_HTCCL_TRANSPORT=device` | **GREEN** | shm transport up (3 ranks x 64 MiB, pinned); device extension `htccl_device_ext_cuda_86_120` built for arch **8.6 AND 12.0** in one group; `max_total = 98328`; 3/3 byte-identical repeats; 72.9 / 72.8 / 77.6 tok/s (code/prosa/misch) |
+| det: the same + `SGLANG_DETERMINISTIC_FP8_GEMM=1` | **GREEN** | both sm86 ranks announce the Marlin switch-off; 4/4 byte-identical greedy repeats |
+
+The arm-E line worth keeping is the extension name: `..._cuda_86_120`, one build
+covering both architectures. That is the Window-3 defect ("device extension
+built for one GPU arch, first compiler fixed the arch for everyone") staying
+fixed under the full merge stack.
+
+Both the arm-E and det boots returned the SAME output hash `af09c5b2cf26` on
+the shared probe prompt, so the determinism flag did not move the answer on this
+arm.
+
+## #192 re-baselined after #189 (the debt the merge opened)
+
+`fp8_det_flag_falsifier.py`, one 3080 (sm86), N=8704 K=5120 block=128,
+**M=256, 300 iterations**. Re-run from scratch because #189's fused GEMV is
+more accurate than the materialisation it replaced and therefore invalidated
+#192's solo byte baseline.
+
+| build | `marlin` arm bad/iters | worst abs err | `flag_on` arm bad/iters | verdict |
+|---|---|---|---|---|
+| merged default (#189 fused GEMV ACTIVE) | **2/300** (0.67 %) | 4.395e-02 | **0/300** | PASS |
+| `SGLANG_FP8_FUSED_GEMV=0` (#192 alone) | **4/300** (1.33 %) | 5.859e-02 | **0/300** | PASS |
+
+Two things are settled by the second row being present:
+
+1. #192 still delivers what it claims **after** #189 landed -- the flag-on arm
+   is 0/300 in both builds, so the new kernel did not reintroduce nondeterminism
+   into the lane it now serves. This confirms the desk prediction (single
+   program per output tile, sequential k-loop, no atomics, no split-K).
+2. The nondeterminism being fixed is Marlin's and is unrelated to #189: the
+   `marlin` control arm is nondeterministic in BOTH builds (2/300 and 4/300 --
+   both are the same phenomenon sampled 300 times, not a difference).
+
+## Phase 3 / A1-A2: the Rig1-solo row of the link matrix
+
+Llama-3.1-8B, TP=3, rig1 solo, `link_decode.py` at the SAME settings as the four
+cross-rig JSONs (3 reps, 150 new tokens, greedy, code/prosa/misch), so the six
+fields are comparable.
+
+**Note on "even":** a strictly even TP=3 is NOT expressible for Llama -- 32 q /
+8 kv heads are not divisible by 3, and the even branch asserts on it. It is also
+no longer expressible through the uneven partitioner: `--rank-tp-ratio 1,1,1` is
+now REJECTED outright with *"--rank-tp-ratio with identical entries is the even
+split -- omit the flag instead"*. The honest nearest-to-even at TP=3 is therefore
+the explicit unit split `3,3,2`, which is what A1 uses.
+
+| arm | split | max_total_num_tokens | code | prosa | misch |
+|---|---|---|---|---|---|
+| A1 | `--rank-tp-ratio 3,3,2` (nearest-even) | 171773 | 50.76 | 51.05 | 51.05 |
+| A2 | `--rank-tp-ratio 4,2,2` (perf-weighted) | 155165 | 51.49 | 51.45 | 51.60 |
+
+Completed matrix (tok/s, median of 3):
+
+| link | even / nearest-even | uneven |
+|---|---|---|
+| rig1 solo, no link (TP=3) | 50.76 / 51.05 / 51.05 | 51.49 / 51.45 / 51.60 |
+| cross-rig gloo over 1 GbE (TP=4) | 7.78 / 7.72 / 7.54 | 7.52 / 7.52 / 7.47 |
+| cross-rig RDMA (TP=4) | 28.44 / 28.56 / 27.13 | 28.06 / 27.76 / 27.68 |
+
+A2 is +0.8 to +1.4 % over A1 and buys that with **10 % less** context
+(155165 vs 171773). Both differences are small; the useful reading of the row is
+the one the cross-rig rows already showed -- the split is not what governs this
+axis, the link is. Solo is 1.8x RDMA and 6.6x gloo-1GbE, while even-vs-uneven
+moves nothing by comparison, in either direction, at any of the three link
+conditions.
+
+## SPLIT-BALANCE: perf-oriented KV split vs `--rank-kv-ratio capacity`
+
+The user question. 27B, TP=3, uneven DCP, flashinfer, NEXTN MTP.
+
+**The premise is confirmed.** `--rank-kv-ratio capacity` installed the vector
+`[2, 3, 3]` (pre-boot estimate `[14, 9, 9]`) from profiled per-rank capacities
+`[211241, 316072, 316072]`: the 5090 -- the FAST card -- is given the FEWEST
+context tokens, because after weights the 3080s have proportionally more free
+VRAM. The perf arm is its mirror image, `--rank-kv-ratio 4,2,2` (normalised to
+`[2, 1, 1]`), weighting toward the 5090's ~54 % membw share as resolved by
+`auto-performance`.
+
+The vectors did what they say -- per-rank KV rows:
+
+| arm | rank 0 (5090) | rank 1 (3080) | rank 2 (3080) | max_total_num_tokens |
+|---|---|---|---|---|
+| capacity `[2,3,3]` | 24584 | 36876 | 36876 | 98328 |
+| perf `[2,1,1]` | **49166** | 24583 | 24583 | 98328 |
+
+**KV cost: zero.** `max_total_num_tokens` is 98328 in BOTH arms, well inside the
+10 % bar -- but not because the split is free in general. On this arm the
+*hybrid mamba/attention cap* binds first (842856 -> 98328 for capacity,
+422480 -> 98328 for perf), so the KV-token split never reaches the constraint
+that would price it. On a config where the KV budget binds, the perf split
+would cost: its min-reduced unit is 105620 against capacity's 105357 per unit,
+but over 4 units instead of 8 -- 422480 vs 842856 of headroom, a 50 % reduction
+that this arm simply cannot feel.
+
+### Result: no effect above the noise
+
+| point | capacity round_rate | perf round_rate | Δ | capacity tok/s | perf tok/s | Δ |
+|---|---|---|---|---|---|---|
+| single code | 26.298 | 27.035 | **+2.80 %** | 78.27 | 91.33 | +16.70 % |
+| single prosa | 26.101 | 25.831 | **-1.03 %** | 69.01 | 66.81 | -3.19 % |
+| single misch | 25.900 | 26.155 | **+0.98 %** | 73.26 | 74.42 | +1.58 % |
+| dual code | 46.686 | 47.715 | **+2.20 %** | 149.28 | 159.09 | +6.57 % |
+| dual prosa | 46.089 | 46.403 | **+0.68 %** | 121.78 | 123.27 | +1.22 % |
+| dual misch | 46.382 | 45.631 | **-1.62 %** | 130.44 | 129.19 | -0.96 % |
+
+round_rate across the six points: mean **+0.67 %**, sd 1.74 %, range -1.62 to
++2.80, sign split 4 positive / 2 negative. tok/s: mean +3.65 %, sd 7.17 %.
+Against a stated detection limit of ~3.5 % on tok/s this is **nothing**.
+
+### Why the +16.7 % on `single code` is not a win, and why this A/B has a ceiling
+
+The text hashes settle it: **at every one of the six points the two arms
+produced DIFFERENT output text** (0 shared hashes, both arms greedy at
+temperature 0). Moving the KV-token ownership vector changes which rank owns
+which context token, hence the LSE-merge partitioning, hence the numerics,
+hence -- at greedy -- the sampled token at the first near-tie. From there the
+two arms are decoding different texts.
+
+That is decisive for how the table may be read. Throughput follows output
+CONTENT on this rig (recorded r = 0.90), so a tok/s comparison between two arms
+that produced different text is not a hardware comparison at all. `single code`
+is the clearest case: its +16.70 % tok/s is carried by accept 2.976 -> 3.378,
+i.e. the perf arm happened to draw an easier-to-speculate text. `round_rate`
+divides the accept length out and shrinks that same point to +2.80 %, which is
+why it is the axis of record -- but it does not divide out that a different text
+has a different mix of easy and hard tokens, so even round_rate is only
+partially controlled here.
+
+**Consequence, and it is a methodology finding, not a result:** this A/B cannot
+resolve a <= 3 % effect *by construction*, because its independent variable
+perturbs the dependent variable's content. The within-arm sd (0.09 % on
+`single code`) massively understates the real uncertainty and must not be used
+as the significance yardstick -- doing so would have reported `single code` as a
+significant +2.80 % win. Any future attempt at this question needs the output
+pinned (teacher-forced decode of a fixed token sequence), not more repeats.
+
+### The mechanism does work -- it just does not pay here
+
+Independent of content, the per-rank load probe (`rankwait.py`, 20 s sustained
+decode, 10 Hz sampling) shows the split moving work exactly as intended:
+
+| arm | GPU0 3080 | GPU1 5090 | GPU2 3080 (throttled) | tok/s |
+|---|---|---|---|---|
+| capacity `[2,3,3]` | 257.3 W / 1920 MHz / 80 C | 278.0 W / 2821 MHz / 73 C | 219.5 W / 1731 MHz / 85 C | 73.84 |
+| perf `[2,1,1]` | 272.3 W / 1920 MHz / 82 C | **293.2 W** / 2845 MHz / 75 C | 224.1 W / 1715 MHz / 87 C | 75.89 |
+
+The 5090 draws +5.5 % more power under the perf split, with its KV share
+doubled -- the work did move onto the fast card. It does not convert into
+system throughput because under lock-step TP the slowest rank sets the pace, and
+that rank is GPU2.
+
+`utilization.gpu` is useless as a wait proxy here and is reported only to say
+so: it reads 90-93 % on all three cards in both arms. Decode kernels are small
+and back-to-back, so the counter saturates. Power is the sensitive axis. Neither
+is a wait TIME -- there is no per-rank timer exposed, and these are load proxies.
+
+### Thermal state -- annotated, not laundered
+
+Per instruction the points are kept, and no recommendation is drawn from the
+throttled state. Per-point clock/temp for the capacity arm (the perf arm is
+within 1 % of these):
+
+| point | GPU0 3080 | GPU1 5090 | GPU2 3080 |
+|---|---|---|---|
+| single code | 1924 MHz / 81 C / thr 0.00 | 2857 MHz / 67 C / thr 0.00 | 1840 MHz / 84 C / **thr 0.75** |
+| single prosa | 1920 / 83 / 0.00 | 2857 / 71 / 0.00 | 1733 / 85 / **1.00** |
+| single misch | 1919 / 83 / 0.02 | 2847 / 72 / 0.00 | 1724 / 85 / **1.00** |
+| dual code | 1920 / 82 / 0.00 | 2842 / 73 / 0.00 | 1719 / 85 / **1.00** |
+| dual prosa | 1920 / 80 / 0.00 | 2842 / 74 / 0.00 | 1724 / 86 / **1.00** |
+| dual misch | 1920 / 81 / 0.00 | 2842 / 73 / 0.00 | 1723 / 85 / **1.00** |
+
+GPU2 is in sw thermal slowdown for essentially the entire measurement -- 1719 to
+1840 MHz against GPU0's 1920 MHz on the identical card, a 10-12 % clock deficit
+at 85-87 C. GPU2 is therefore the pace-setter in every point, and it is the
+rank whose share the perf split *reduces*. A rig without that throttle would
+give the perf split a different, and plausibly better, chance. **No
+recommendation is derived from this state.** What can be said without it:
+capacity's `[2,3,3]` is not leaving a measurable amount on the table here, and
+it is the safer default because it is the one that maximises capacity.
+
+## Open after this window
+
+* `feat/weightless-chain-spec` (#143) -- Gate 4 still unmeasured; R3 still blocked
+  on the pre-existing solo-placement deadlock that #194 in merge 2 targets, so it
+  is worth re-testing on this tip before anything else.
+* `feat/offload-kv-regain` (#119) -- unmerged, needs its 122B A/B. Re-run its
+  pre-check against the post-stack `model_runner_kv_cache_mixin.py`.
+* #197 remains merged-but-not-hardware-validated. Its load-bearing vehicle is the
+  weightless-KV fast lane, which #127 (merge 8) has now unblocked -- so it is
+  reachable for the first time and should be closed next window.
+* SPLIT-BALANCE needs a content-pinned harness before the question can be
+  answered to better than ~3 %.
+* `FEATURES_VS_UPSTREAM.md`: the SWA-DCP Stage B bullet still sits physically
+  under the "gated off" heading while its text says it is merged. Doc restructure.
