@@ -530,8 +530,22 @@ class HiCacheFile(HiCacheStorage):
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
-                if f.readinto(buf) != expected:
-                    raise IOError(f"Short read for {suffixed}")
+                # An unbuffered readinto is one syscall and may legitimately
+                # return short on a large page -- loop until the page is whole
+                # or the file really is truncated. KV pages (tens of KiB) never
+                # hit this; component pages do (a Mamba/GDN state page is tens
+                # of MiB), and a partial recurrent state is the worst possible
+                # thing to hand back.
+                got = 0
+                while got < expected:
+                    n = f.readinto(buf[got:])
+                    if not n:
+                        break
+                    got += n
+                if got != expected:
+                    raise IOError(
+                        f"Short read for {suffixed}: {got} of {expected} bytes"
+                    )
             self._evictor.touch(suffixed, tensor_path)
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
