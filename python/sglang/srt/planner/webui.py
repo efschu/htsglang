@@ -54,7 +54,7 @@ __all__ = [
     "issue_from_payload",
     "matrix_from_payload",
     "landscape_from_payload",
-    "list_profiles",
+    "list_cards",
     "hicache_saved_read",
     "hicache_saved_record",
     "list_models_payload",
@@ -734,16 +734,16 @@ def issue_from_payload(payload: dict) -> dict:
 
 
 # ===========================================================================
-# S4 explorer: profile library + model x rig matrix.
+# S4 explorer: card library + model x rig matrix.
 # ===========================================================================
 
 
-def list_profiles() -> dict:
-    """The hardware-profile library (design §2.7), for the explorer's rig
+def list_cards() -> dict:
+    """The GPU-model card library (design §2.7), for the explorer's rig
     composer."""
-    from sglang.srt.planner.profiles import ProfileLibrary
+    from sglang.srt.planner.card_library import CardLibrary
 
-    lib = ProfileLibrary()
+    lib = CardLibrary()
     return {
         "profiles": [
             {
@@ -769,9 +769,9 @@ def matrix_from_payload(payload: dict) -> dict:
         hardware_from_nvml,
     )
     from sglang.srt.planner.model import resolve_model_ref
-    from sglang.srt.planner.profiles import ProfileLibrary, compose_rig
+    from sglang.srt.planner.card_library import CardLibrary, compose_rig
 
-    lib = ProfileLibrary()
+    lib = CardLibrary()
     models = []
     for m in payload.get("models", []):
         label = m.get("label") or m["model"]
@@ -811,7 +811,7 @@ def landscape_from_payload(payload: dict) -> dict:
 
     from sglang.srt.planner.landscape import build_mode_a
     from sglang.srt.planner.model import resolve_model_ref
-    from sglang.srt.planner.profiles import ProfileLibrary, compose_rig
+    from sglang.srt.planner.card_library import CardLibrary, compose_rig
     from sglang.srt.planner.results_store import QuantDescriptor, ResultsStore
 
     try:
@@ -831,7 +831,7 @@ def landscape_from_payload(payload: dict) -> dict:
         except Exception as e:
             return {"ok": False, "error": f"results store: {e}"}
 
-    lib = ProfileLibrary()
+    lib = CardLibrary()
     planner_rigs = []
     for r in payload.get("rigs", []):
         try:
@@ -2277,7 +2277,7 @@ def config_profiles_get(payload: Optional[dict] = None) -> dict:
     """GET /api/config_profiles -> generated (flags.profiles) + user-saved
     (ProfileStore) config profiles for the runner-tab picker.
 
-    NOTE: distinct from ``/api/profiles`` (the hardware-rig library the
+    NOTE: distinct from ``/api/cards`` (the GPU-model catalogue the
     explore/landscape tabs use) -- these are full flag-set config profiles."""
     from sglang.srt.planner import flags as flagsmod
 
@@ -2588,9 +2588,9 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"error": str(e)})
             return
-        if self.path.startswith("/api/profiles"):
+        if self.path.startswith("/api/cards"):
             try:
-                self._json(200, list_profiles())
+                self._json(200, list_cards())
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"error": str(e)})
             return
@@ -3210,7 +3210,7 @@ INDEX_HTML = r"""<!doctype html>
         <label><input type="checkbox" id="ls_similar" style="width:auto"> similar-quant (by bits — approximate)</label>
       </fieldset>
       <fieldset>
-        <legend>rigs to feasibility-check (NAME=profile,profile,...)</legend>
+        <legend>rigs to feasibility-check (NAME=card,card,...)</legend>
         <textarea id="ls_rigs" rows="4" placeholder="hetero=RTX 5090,RTX 3080 20GB,RTX 3080 20GB&#10;4x4090=RTX 4090,RTX 4090,RTX 4090,RTX 4090"></textarea>
       </fieldset>
       <button onclick="doLandscape()">Build landscape</button>
@@ -3331,7 +3331,7 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 
 <div id="view_explore" style="display:none">
-  <div class="sub">Compose rigs from the hardware-profile library (or add the
+  <div class="sub">Compose rigs from the GPU-model card library (or add the
     live one) and see which models fit on each. <b>Composed rigs are
     ESTIMATES</b> &mdash; no measured free-VRAM or interconnect (§8).</div>
   <div class="cols">
@@ -3341,9 +3341,9 @@ INDEX_HTML = r"""<!doctype html>
         <textarea id="mx_models" rows="4" placeholder="27B-AWQ=/path/to/Qwen3.6-27B-AWQ&#10;35B-A3B=/path/to/model"></textarea>
       </fieldset>
       <fieldset>
-        <legend>rigs (one per line: NAME=profile,profile,... — or 'live')</legend>
+        <legend>rigs (one per line: NAME=card,card,... — or 'live')</legend>
         <textarea id="mx_rigs" rows="4" placeholder="hetero=RTX 5090,RTX 3080 20GB,RTX 3080 20GB&#10;4x4090=RTX 4090,RTX 4090,RTX 4090,RTX 4090"></textarea>
-        <div id="mx_profiles" class="knoblist" style="margin-top:.5rem"></div>
+        <div id="mx_cards" class="knoblist" style="margin-top:.5rem"></div>
       </fieldset>
       <button onclick="doMatrix()">Build matrix</button>
     </div>
@@ -5787,8 +5787,8 @@ async function saveProfile(){
 
 async function loadProfiles() {
   window._profLoaded = true;
-  const r = await fetch('/api/profiles'); const d = await r.json();
-  $('mx_profiles').innerHTML = '<b>library:</b> ' +
+  const r = await fetch('/api/cards'); const d = await r.json();
+  $('mx_cards').innerHTML = '<b>library:</b> ' +
     d.profiles.map(p=>'<span class="pill">'+esc(p.name)+' '+Math.round(p.total_mib/1024)+'GB</span>').join('');
 }
 

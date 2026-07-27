@@ -11,7 +11,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Hardware-profile library + rig composition (design #97 stage S4, §2.7).
+"""GPU-model catalogue + rig composition (design #97 stage S4, §2.7).
+
+Called a CARD LIBRARY, not a profile library. Three unrelated things on this
+fork were competing for the word "profile": a launchable server preset
+(``planner.flags.Profile``, the one users meet), a measurement file
+(``hw_profile-*.json``, ``power_profile.json``) and this catalogue of GPU
+models. A control panel that uses one word for three things is unreadable, so
+this one is a card, its container a library, and "profile" is left to the
+preset.
 
 The planner-core is a pure function of ``(model_config, HardwareSpec)`` (S1),
 so varying the *hardware* side is free: the same ``plan()`` that answers "my
@@ -20,14 +28,14 @@ possible". This module is only a new SOURCE for ``HardwareSpec`` (§2.1) —
 nothing in the engine changes.
 
 Contents:
-  * ``GpuProfile``      — one catalog card (hardware-only, non-sensitive:
-    name, VRAM, sm-arch, typical PCIe/NVLink, TDP).
-  * ``SEED_PROFILES``   — a curated seed set (the memory rig + common
+  * ``CardSpec``     — one catalogue card (hardware-only, non-sensitive:
+    name, VRAM, sm-arch, typical PCIe/NVLink, TDP, nameplate peaks).
+  * ``SEED_CARDS``   — a curated seed set (the memory rig + common
     consumer / datacenter GPUs).
-  * ``ProfileLibrary``  — load/save JSON, add, and **populate from parsed
+  * ``CardLibrary``  — load/save JSON, add, and **populate from parsed
     RESULTS-issue fingerprints** (S2 already emits those anonymously: card
     model + count) — closing the loop submissions -> library.
-  * ``compose_rig``     — assemble N profiles into a
+  * ``compose_rig``  — assemble N cards into a
     ``HardwareSpec(source="library-composition")``.
 
 HONESTY (design §8): a composed rig has NO measured free-VRAM and NO measured
@@ -50,15 +58,15 @@ from typing import Dict, List, Optional, Sequence
 from sglang.srt.planner.hardware import GpuDescriptor, HardwareSpec
 
 __all__ = [
-    "GpuProfile",
-    "SEED_PROFILES",
-    "ProfileLibrary",
+    "CardSpec",
+    "SEED_CARDS",
+    "CardLibrary",
     "compose_rig",
 ]
 
 
 @dataclasses.dataclass(frozen=True)
-class GpuProfile:
+class CardSpec:
     """A catalog card — hardware-only, non-identifying (design §2.7). Optional
     measured perf fields (``gemm_tflops`` / ``membw_gbs``) fill in ONLY from a
     submission that carried a cached probe; absent, capacity/feasibility still
@@ -115,50 +123,50 @@ class GpuProfile:
 #: sparsity; peak GDDR/HBM bandwidth) — theoretical ceilings, ~ballpark, used
 #: only by the roofline estimate. fp8 peak is None on Ampere (sm8x: no fp8
 #: tensor cores).
-SEED_PROFILES: Dict[str, GpuProfile] = {
+SEED_CARDS: Dict[str, CardSpec] = {
     p.name: p
     for p in [
         # -- this system's rig (MEMORY) ------------------------------------
-        GpuProfile("RTX 5090", 32607, "sm120", 5, 16, False, 575,
+        CardSpec("RTX 5090", 32607, "sm120", 5, 16, False, 575,
                    peak_membw_gbs=1792.0, peak_gemm_tflops_fp16=419.0,
                    peak_gemm_tflops_fp8=838.0),
-        GpuProfile("RTX 3080 20GB", 20480, "sm86", 4, 16, False, 320,
+        CardSpec("RTX 3080 20GB", 20480, "sm86", 4, 16, False, 320,
                    peak_membw_gbs=760.0, peak_gemm_tflops_fp16=119.0),
         # -- common consumer -----------------------------------------------
-        GpuProfile("RTX 5080", 16303, "sm120", 5, 16, False, 360,
+        CardSpec("RTX 5080", 16303, "sm120", 5, 16, False, 360,
                    peak_membw_gbs=960.0, peak_gemm_tflops_fp16=225.0,
                    peak_gemm_tflops_fp8=450.0),
-        GpuProfile("RTX 4090", 24564, "sm89", 4, 16, False, 450,
+        CardSpec("RTX 4090", 24564, "sm89", 4, 16, False, 450,
                    peak_membw_gbs=1008.0, peak_gemm_tflops_fp16=330.0,
                    peak_gemm_tflops_fp8=660.0),
-        GpuProfile("RTX 4080", 16376, "sm89", 4, 16, False, 320,
+        CardSpec("RTX 4080", 16376, "sm89", 4, 16, False, 320,
                    peak_membw_gbs=717.0, peak_gemm_tflops_fp16=195.0,
                    peak_gemm_tflops_fp8=390.0),
-        GpuProfile("RTX 3090", 24576, "sm86", 4, 16, True, 350,
+        CardSpec("RTX 3090", 24576, "sm86", 4, 16, True, 350,
                    peak_membw_gbs=936.0, peak_gemm_tflops_fp16=142.0),
-        GpuProfile("RTX 3090 Ti", 24564, "sm86", 4, 16, True, 450,
+        CardSpec("RTX 3090 Ti", 24564, "sm86", 4, 16, True, 450,
                    peak_membw_gbs=1008.0, peak_gemm_tflops_fp16=160.0),
-        GpuProfile("RTX 3080", 10240, "sm86", 4, 16, False, 320,
+        CardSpec("RTX 3080", 10240, "sm86", 4, 16, False, 320,
                    peak_membw_gbs=760.0, peak_gemm_tflops_fp16=119.0),
-        GpuProfile("RTX 3060", 12288, "sm86", 4, 16, False, 170,
+        CardSpec("RTX 3060", 12288, "sm86", 4, 16, False, 170,
                    peak_membw_gbs=360.0, peak_gemm_tflops_fp16=51.0),
         # -- workstation / datacenter --------------------------------------
-        GpuProfile("RTX A6000", 49140, "sm86", 4, 16, True, 300,
+        CardSpec("RTX A6000", 49140, "sm86", 4, 16, True, 300,
                    peak_membw_gbs=768.0, peak_gemm_tflops_fp16=155.0),
-        GpuProfile("L40S", 46068, "sm89", 4, 16, False, 350,
+        CardSpec("L40S", 46068, "sm89", 4, 16, False, 350,
                    peak_membw_gbs=864.0, peak_gemm_tflops_fp16=362.0,
                    peak_gemm_tflops_fp8=733.0),
-        GpuProfile("A100 40GB", 40960, "sm80", 4, 16, True, 400,
+        CardSpec("A100 40GB", 40960, "sm80", 4, 16, True, 400,
                    peak_membw_gbs=1555.0, peak_gemm_tflops_fp16=312.0),
-        GpuProfile("A100 80GB", 81920, "sm80", 4, 16, True, 400,
+        CardSpec("A100 80GB", 81920, "sm80", 4, 16, True, 400,
                    peak_membw_gbs=2039.0, peak_gemm_tflops_fp16=312.0),
-        GpuProfile("H100 80GB", 81559, "sm90", 5, 16, True, 700,
+        CardSpec("H100 80GB", 81559, "sm90", 5, 16, True, 700,
                    peak_membw_gbs=3350.0, peak_gemm_tflops_fp16=989.0,
                    peak_gemm_tflops_fp8=1979.0),
-        GpuProfile("H200", 143771, "sm90", 5, 16, True, 700,
+        CardSpec("H200", 143771, "sm90", 5, 16, True, 700,
                    peak_membw_gbs=4800.0, peak_gemm_tflops_fp16=989.0,
                    peak_gemm_tflops_fp8=1979.0),
-        GpuProfile("MI300X", 196608, "cdna3", 5, 16, True, 750,
+        CardSpec("MI300X", 196608, "cdna3", 5, 16, True, 750,
                    peak_membw_gbs=5300.0, peak_gemm_tflops_fp16=1307.0,
                    peak_gemm_tflops_fp8=2614.0),
     ]
@@ -170,14 +178,14 @@ def _canonical(name: str) -> str:
     return " ".join(str(name).lower().replace("nvidia", "").split())
 
 
-class ProfileLibrary:
-    """A catalog of ``GpuProfile``s keyed by card name, seeded from
-    ``SEED_PROFILES`` and grown from submitted RESULTS fingerprints (§2.7).
+class CardLibrary:
+    """A catalog of ``CardSpec``s keyed by card name, seeded from
+    ``SEED_CARDS`` and grown from submitted RESULTS fingerprints (§2.7).
     JSON persistence, no server."""
 
-    def __init__(self, profiles: Optional[Dict[str, GpuProfile]] = None):
-        self._by_key: Dict[str, GpuProfile] = {}
-        for p in (profiles or SEED_PROFILES).values():
+    def __init__(self, profiles: Optional[Dict[str, CardSpec]] = None):
+        self._by_key: Dict[str, CardSpec] = {}
+        for p in (profiles or SEED_CARDS).values():
             self._by_key[_canonical(p.name)] = p
 
     # -- access -------------------------------------------------------------
@@ -185,7 +193,7 @@ class ProfileLibrary:
     def names(self) -> List[str]:
         return sorted(p.name for p in self._by_key.values())
 
-    def get(self, name: str) -> GpuProfile:
+    def get(self, name: str) -> CardSpec:
         key = _canonical(name)
         if key not in self._by_key:
             raise KeyError(
@@ -196,7 +204,7 @@ class ProfileLibrary:
     def has(self, name: str) -> bool:
         return _canonical(name) in self._by_key
 
-    def add(self, profile: GpuProfile, overwrite: bool = False) -> bool:
+    def add(self, profile: CardSpec, overwrite: bool = False) -> bool:
         """Add/refresh a profile. Returns True when the library changed. An
         existing entry is kept unless ``overwrite`` (a submission never
         silently downgrades a curated entry's perf fields to None)."""
@@ -229,7 +237,7 @@ class ProfileLibrary:
         for count, name, total_mib in getattr(fingerprint, "cards", []):
             if not total_mib or total_mib <= 0:
                 continue
-            prof = GpuProfile(name=str(name), total_mib=int(total_mib))
+            prof = CardSpec(name=str(name), total_mib=int(total_mib))
             if self.add(prof):
                 changed += 1
         return changed
@@ -243,7 +251,7 @@ class ProfileLibrary:
             for item in e.get("cards", []):
                 count, name, total_mib = item
                 if total_mib and total_mib > 0 and self.add(
-                    GpuProfile(name=str(name), total_mib=int(total_mib))
+                    CardSpec(name=str(name), total_mib=int(total_mib))
                 ):
                     changed += 1
         return changed
@@ -260,24 +268,24 @@ class ProfileLibrary:
         os.replace(tmp, path)
 
     @classmethod
-    def load(cls, path: str, seed: bool = True) -> "ProfileLibrary":
-        """Load a saved library. ``seed=True`` starts from ``SEED_PROFILES``
+    def load(cls, path: str, seed: bool = True) -> "CardLibrary":
+        """Load a saved library. ``seed=True`` starts from ``SEED_CARDS``
         and overlays the file (so a saved library never loses the seed set)."""
         lib = cls() if seed else cls(profiles={})
         with open(path) as f:
             data = json.load(f)
         for pd in data.get("profiles", []):
-            lib.add(GpuProfile(**pd), overwrite=True)
+            lib.add(CardSpec(**pd), overwrite=True)
         return lib
 
 
 def compose_rig(
     profiles: Sequence,
-    library: Optional[ProfileLibrary] = None,
+    library: Optional[CardLibrary] = None,
     host_ram_mib: Optional[int] = None,
 ) -> HardwareSpec:
     """Compose ``profiles`` (names resolved via ``library``, or
-    ``GpuProfile`` objects) into a ``HardwareSpec(source="library-composition")``.
+    ``CardSpec`` objects) into a ``HardwareSpec(source="library-composition")``.
 
     Card ``i`` in the list is physical index ``i``. ``free_mib`` is None on
     every card (no live measurement) and the source marks the whole spec an
@@ -285,10 +293,10 @@ def compose_rig(
     not measured" label (design §8). Duplicates are allowed (a homogeneous or
     heterogeneous pile: e.g. ["RTX 5090", "RTX 3080 20GB", "RTX 3080 20GB"]).
     """
-    library = library or ProfileLibrary()
+    library = library or CardLibrary()
     gpus = []
     for i, item in enumerate(profiles):
-        prof = item if isinstance(item, GpuProfile) else library.get(item)
+        prof = item if isinstance(item, CardSpec) else library.get(item)
         gpus.append(prof.to_descriptor(i))
     if not gpus:
         raise ValueError("compose_rig needs at least one profile.")
