@@ -1492,6 +1492,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             raise
 
+        # Mixed-architecture rigs (bug #208): nvidia-cutlass-dsl picks its
+        # compile target ONCE per process from driver device 0, not from the
+        # device this rank just selected, and that same string keys its JIT
+        # cache. Without --rank-gpu-id every rank sees every GPU, so a rank
+        # not owning device 0 compiles (and caches) for the wrong arch and
+        # dies in the first CuTe kernel -- e.g. flashinfer rmsnorm_cute --
+        # with cudaErrorNoKernelImageForDevice. Retarget it to this rank's
+        # own device; a no-op when all cards share one architecture.
+        if self.device == "cuda":
+            from sglang.srt.utils.cute_dsl_arch import align_cute_dsl_arch
+
+            arch = align_cute_dsl_arch(self.gpu_id)
+            if arch is not None:
+                logger.debug(
+                    "CuTe DSL compile target for TP rank %s (GPU %s): %s",
+                    self.tp_rank,
+                    self.gpu_id,
+                    arch,
+                )
+
         backend = get_default_distributed_backend(self.device)
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"

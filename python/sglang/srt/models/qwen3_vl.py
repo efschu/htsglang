@@ -1277,10 +1277,28 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 ):
                     self.lm_head = self.model.embed_tokens
                 else:
+                    # GGUF only: the same gate embed_tokens carries in
+                    # Qwen3Model.__init__. SGLANG_GGUF_DENSE_VOCAB=1 makes the
+                    # loader dequantize `lm_head` on the fly
+                    # (gguf_qwen35.transform_stream) and add it to the dense
+                    # prefix set, but this module was built with the GGUF
+                    # quant_config regardless — the loader honoured the flag
+                    # and the module did not, so the legacy dense path was
+                    # only half restored. Every non-GGUF quantization keeps
+                    # quant_config unchanged here, i.e. the default path is
+                    # byte-identical.
+                    lm_head_quant_config = quant_config
+                    if quant_config is not None and quant_config.get_name() == "gguf":
+                        from sglang.srt.model_loader.gguf_qwen35 import (
+                            gguf_dense_vocab,
+                        )
+
+                        if gguf_dense_vocab():
+                            lm_head_quant_config = None
                     self.lm_head = ParallelLMHead(
                         self.config.vocab_size,
                         self.config.hidden_size,
-                        quant_config=quant_config,
+                        quant_config=lm_head_quant_config,
                         use_attn_tp_group=get_server_args().enable_dp_lm_head,
                         prefix=add_prefix("lm_head", prefix),
                     )

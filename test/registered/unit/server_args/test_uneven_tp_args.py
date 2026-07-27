@@ -149,6 +149,31 @@ class TestMutualRequirements(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "positive integers"):
             run_handler(make_args(tp_size=2, rank_tp_ratio=[2, 0]))
 
+    def test_ratio_with_pipeline_parallel_rejected(self):
+        """#202: the placement-free path had no parallelism reject at all.
+
+        The --pp-size/--dp-size/--ep-size/--nnodes rejects all live after the
+        `rank_gpu_id is None` early return, so --rank-tp-ratio alone reached a
+        pipeline unchecked — and it is NOT inert there:
+        configure_scheduler_process installs the plan in every scheduler
+        process, so each PP stage would shard its TP dimension by a vector
+        that no part of the uneven-TP machinery was ever validated with.
+        """
+        with self.assertRaisesRegex(ValueError, r"--rank-tp-ratio.*--pp-size"):
+            run_handler(make_args(tp_size=2, pp_size=2, rank_tp_ratio=[2, 1]))
+
+    def test_ratio_without_pipeline_parallel_unchanged(self):
+        """The default pp_size=1 lane must be untouched by the reject."""
+        args = make_args(tp_size=2, pp_size=1, rank_tp_ratio=[2, 1])
+        run_handler(args)
+        self.assertEqual(args.rank_tp_ratio, [2, 1])
+
+    def test_even_split_with_pipeline_parallel_still_allowed(self):
+        """No ratio, no reject: plain PP keeps working."""
+        args = make_args(tp_size=2, pp_size=2)
+        run_handler(args)
+        self.assertIsNone(args.rank_tp_ratio)
+
 
 class TestLengthAndValueChecks(CustomTestCase):
     def test_gpu_id_length_mismatch(self):
