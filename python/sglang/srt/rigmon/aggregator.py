@@ -54,7 +54,26 @@ from sglang.srt.rigmon.series import Point, TimeSeries
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["NodeState", "Aggregator", "make_handler", "serve"]
+__all__ = [
+    "NodeState",
+    "Aggregator",
+    "CompatibilityRefused",
+    "make_handler",
+    "serve",
+]
+
+
+class CompatibilityRefused(Exception):
+    """The join gate blocked the pairing. Carries the full report so the
+    joining side gets the reasons, not just a refusal."""
+
+    def __init__(self, report):
+        self.report = report
+        blockers = [c for c in report.checks if c.verdict == "block"]
+        super().__init__(
+            "compatibility gate refused the join: "
+            + "; ".join(f"{c.label}: {c.detail}" for c in blockers)
+        )
 
 #: Refuse absurd pushes outright rather than letting one node exhaust memory.
 MAX_PUSH_BYTES = 8 * 1024 * 1024
@@ -92,6 +111,10 @@ class Aggregator:
         self._node_tokens: Dict[str, str] = {}
         #: pairing token -> expiry
         self._join_tokens: Dict[str, float] = {}
+        #: node_id -> CompatReport from its join.
+        self._compat: Dict[str, Any] = {}
+        #: This node's identity, set by the CLI when a model is declared.
+        self.local_identity = None
 
     # -- local node ---------------------------------------------------------
 
@@ -130,8 +153,22 @@ class Aggregator:
             "expires_at": self.clock() + self.config.join_token_ttl_s,
         }
 
-    def redeem_join_token(self, token: str, node_id: str) -> Dict[str, Any]:
-        """Exchange a pairing token for this node's long-lived push token."""
+    def redeem_join_token(
+        self,
+        token: str,
+        node_id: str,
+        identity: Optional[dict] = None,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Exchange a pairing token for this node's long-lived push token.
+
+        The compatibility gate runs HERE, before the two sides are joined,
+        because every check it performs otherwise surfaces much later — as a
+        worker crash, or as a silent quality difference. A blocking verdict
+        refuses the join and returns the reasons; ``force`` overrides it, which
+        exists because a user who understands the mismatch may still want
+        telemetry from the other node.
+        """
         now = self.clock()
         with self._lock:
             for t, exp in list(self._join_tokens.items()):
@@ -140,11 +177,37 @@ class Aggregator:
             exp = self._join_tokens.get(token)
             if exp is None:
                 raise PermissionError("unknown or already-used pairing token")
+
+        report = None
+        if identity is not None and self.local_identity is not None:
+            from sglang.srt.rigmon.compat import NodeIdentity, check_compatibility
+
+            report = check_compatibility(
+                self.local_identity, NodeIdentity.from_json(identity)
+            )
+            if report.blocked and not force:
+                raise CompatibilityRefused(report)
+
+        with self._lock:
+            # Consume the token only once the gate has passed, so a refused
+            # join can be retried after the mismatch is fixed.
+            if token not in self._join_tokens:
+                raise PermissionError("pairing token was consumed concurrently")
             del self._join_tokens[token]
             node_token = secrets.token_urlsafe(24)
             self._node_tokens[node_id] = node_token
+            self._compat[node_id] = report
             self._persist_tokens()
-        return {"node_id": node_id, "push_token": node_token}
+        out: Dict[str, Any] = {"node_id": node_id, "push_token": node_token}
+        if report is not None:
+            out["compatibility"] = report.to_json()
+            out["forced"] = bool(force and report.blocked)
+        return out
+
+    def compatibility(self, node_id: str) -> Optional[dict]:
+        with self._lock:
+            r = self._compat.get(node_id)
+        return r.to_json() if r is not None else None
 
     def _token_path(self) -> str:
         return os.path.join(self.config.state_dir, "node_tokens.json")
@@ -253,6 +316,11 @@ class Aggregator:
                             st.points_received if st.remote else None
                         ),
                         "resolutions": st.series.resolutions(),
+                        "compatibility": (
+                            self._compat[st.node_id].to_json()
+                            if self._compat.get(st.node_id) is not None
+                            else None
+                        ),
                     }
                 )
             return sorted(out, key=lambda d: (d["remote"], d["node_id"]))
@@ -398,13 +466,28 @@ def make_handler(agg: Aggregator, static_dir: Optional[str] = None):
                 return self._json(400, {"error": f"malformed JSON: {e}"})
             try:
                 if u.path == "/api/join":
-                    return self._json(
-                        200,
-                        agg.redeem_join_token(
-                            str(payload.get("join_token") or ""),
-                            str(payload.get("node_id") or ""),
-                        ),
-                    )
+                    try:
+                        return self._json(
+                            200,
+                            agg.redeem_join_token(
+                                str(payload.get("join_token") or ""),
+                                str(payload.get("node_id") or ""),
+                                identity=payload.get("identity"),
+                                force=bool(payload.get("force")),
+                            ),
+                        )
+                    except CompatibilityRefused as e:
+                        # 409, not 403: the credential was fine, the two sides
+                        # are not. The report is the actionable part.
+                        return self._json(
+                            409,
+                            {
+                                "error": str(e),
+                                "compatibility": e.report.to_json(),
+                                "hint": "fix the blocking checks, or retry with "
+                                "force=true to join anyway",
+                            },
+                        )
                 if u.path == "/api/push":
                     node_id = str(payload.get("node_id") or "")
                     token = self.headers.get("X-Rigmon-Token") or ""

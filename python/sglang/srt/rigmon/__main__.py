@@ -38,6 +38,7 @@ import os
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from typing import List, Optional
 
@@ -68,23 +69,73 @@ def _tiers(args):
     return tuple(parse_tier_spec(r) for r in args.resolution)
 
 
-def _join(aggregator_url: str, join_token: str, node_id: str) -> str:
-    """Redeem a pairing token for this node's long-lived push token."""
-    body = json.dumps({"join_token": join_token, "node_id": node_id}).encode()
+def _join(
+    aggregator_url: str,
+    join_token: str,
+    node_id: str,
+    model_paths: Optional[List[str]] = None,
+    force: bool = False,
+) -> str:
+    """Redeem a pairing token, presenting this node's identity to the gate.
+
+    A refusal comes back as HTTP 409 with the full report; it is printed in
+    full, because the reasons are the whole point of running the gate before
+    the join rather than discovering the mismatch in a worker later.
+    """
+    from sglang.srt.rigmon.compat import local_identity
+
+    identity = local_identity(node_id, model_paths or [])
+    body = json.dumps(
+        {
+            "join_token": join_token,
+            "node_id": node_id,
+            "identity": identity.to_json(),
+            "force": force,
+        }
+    ).encode()
     req = urllib.request.Request(
         aggregator_url.rstrip("/") + "/api/join",
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read())["push_token"]
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            out = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            detail = json.loads(e.read())
+            print("compatibility gate refused the join:", file=sys.stderr)
+            for c in detail["compatibility"]["checks"]:
+                if c["verdict"] == "block":
+                    print(f"  BLOCK {c['label']}: {c['detail']}", file=sys.stderr)
+                    if c.get("remedy"):
+                        print(f"        {c['remedy']}", file=sys.stderr)
+            print(f"  {detail['hint']}", file=sys.stderr)
+            raise SystemExit(3)
+        raise
+    report = out.get("compatibility")
+    if report:
+        for c in report["checks"]:
+            if c["verdict"] == "warn":
+                print(f"  warning: {c['label']}: {c['detail']}", file=sys.stderr)
+        if out.get("forced"):
+            print(
+                "  joined despite blocking checks (--force)", file=sys.stderr
+            )
+    return out["push_token"]
 
 
 def cmd_collect(args) -> int:
     token = args.push_token
     if args.join_token:
-        token = _join(args.aggregator, args.join_token, args.node_id)
+        token = _join(
+            args.aggregator,
+            args.join_token,
+            args.node_id,
+            model_paths=args.model or [],
+            force=args.force,
+        )
         print(f"joined {args.aggregator} as {args.node_id}")
         if args.print_token:
             print(f"push token: {token}")
@@ -124,6 +175,9 @@ def cmd_serve(args) -> int:
             print(f"error: {e}", file=sys.stderr)
         return 2
     agg = Aggregator(cfg)
+    from sglang.srt.rigmon.compat import local_identity
+
+    agg.local_identity = local_identity(args.node_id, args.model or [])
     col = None
     if not args.no_local:
         col = Collector(
@@ -389,6 +443,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="single-use pairing token from `join-token`")
     c.add_argument("--push-token", default="", help="an already-issued push token")
     c.add_argument("--push-every", type=float, default=5.0)
+    c.add_argument("--model", action="append", default=None,
+                   help="model path to present to the compatibility gate; "
+                        "repeatable")
+    c.add_argument("--force", action="store_true",
+                   help="join even when the compatibility gate blocks")
     c.add_argument("--print-token", action="store_true",
                    help="print the issued push token (it is a secret)")
     c.add_argument("--boot-log", default="")
@@ -407,6 +466,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-local", action="store_true",
                    help="aggregator only; do not sample this host")
     s.add_argument("--ui-dir", default=None, help="directory holding index.html")
+    s.add_argument("--model", action="append", default=None,
+                   help="model path this node serves; the compatibility "
+                        "gate compares it against a joining node. Repeatable.")
     s.add_argument("--boot-log", default="")
     _add_resolution_arg(s)
     s.set_defaults(func=cmd_serve)
