@@ -330,6 +330,8 @@ class Scheduler(
         # kv-session-offload defaults BEFORE any watchdog thread can touch
         # is_fully_idle(); the manager itself is created late in __init__.
         self.kv_session_offload = None
+        # colocated-congruent PD lane (#107): None on every default path.
+        self.congruent_prefill_lane = None
         self._kv_arrival_ct = 0
         self.init_soft_watchdog(server_args)
 
@@ -569,6 +571,23 @@ class Scheduler(
         self.init_load_inquirer()
 
         self.init_output_streamer()
+
+        # colocated-congruent PD topology (#107): the prefill lane rides
+        # these decode processes with DECODE priority, computing with the
+        # resident weight shards. Bind the model so the weight-sharing
+        # invariant (one copy per card) is verified at the first lane tick
+        # instead of assumed.
+        if self.server_args.disaggregation_topology == "colocated-congruent":
+            from sglang.srt.disaggregation.congruent_lane import (
+                CongruentPrefillLane,
+            )
+
+            self.congruent_prefill_lane = CongruentPrefillLane(
+                self.server_args.disaggregation_prefill_lane_interval
+            )
+            self.congruent_prefill_lane.bind_model(
+                self.tp_worker.model_runner.model
+            )
 
         # kv-session-offload (S1): FCFS host-spill of the youngest session
         # under KV pressure. Must init before the batch-result processor
@@ -2923,10 +2942,40 @@ class Scheduler(
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
+        elif (
+            self.congruent_prefill_lane is not None
+            and not self.congruent_prefill_lane.allow_prefill(
+                device_has_decode_work=not running_batch.is_empty()
+                and not running_batch.is_prefill_only
+            )
+        ):
+            # colocated-congruent PD lane (#107): DECODE priority. The stock
+            # policy runs prefill first whenever one can be built; under the
+            # lane, prefill is cadence-gated so the decode lane keeps its
+            # rate — the property PD exists for, delivered in-process. The
+            # prefill batch is not built at all this iteration (nothing is
+            # allocated and then dropped). Rank-uniform: the gate reads only
+            # replicated state (batch emptiness, the deterministic tick
+            # counter), so every rank takes the same branch — the same
+            # argument the spill tick makes; a rank-local input here would
+            # split the ranks across mismatched collective counts.
+            new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
+            if (
+                self.congruent_prefill_lane is not None
+                and new_batch is not None
+                and new_batch.forward_mode.is_extend()
+            ):
+                # A prefill batch was actually selected: reset the cadence
+                # and verify (once) that it computes with the decode ranks'
+                # resident weights — the shared-bytes invariant of this
+                # topology, checked instead of assumed.
+                self.congruent_prefill_lane.note_prefill_ran(
+                    self.tp_worker.model_runner.model
+                )
 
         need_mlp_sync = self.require_mlp_sync
         if (
