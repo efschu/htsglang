@@ -3382,9 +3382,11 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   .hdr { display: flex; align-items: flex-start; justify-content: space-between;
          gap: var(--s4); flex-wrap: wrap;
          padding-top: var(--s4); padding-bottom: var(--s3); }
-  .tabs { display: flex; gap: 0; margin: 0 auto var(--s4);
-          border-bottom: 1px solid var(--bd-weak); overflow-x: auto;
-          scrollbar-width: thin; }
+  /* The bar WRAPS; it never scrolls. A scrollbar in a navigation strip hides
+     destinations behind a gesture, which is exactly what navigation must not
+     do. Labels are one word each so wrapping is rare in the first place. */
+  .tabs { display: flex; flex-wrap: wrap; gap: 0; margin: 0 auto var(--s4);
+          border-bottom: 1px solid var(--bd-weak); overflow: visible; }
   .tab, button.tab { background: transparent; color: var(--fg-muted);
     border: 0; border-bottom: 2px solid transparent; border-radius: 0;
     padding: 0 var(--s3); height: 36px; font-size: var(--t-md);
@@ -3713,15 +3715,25 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   </div>
 </div>
 
+<!-- One word per tab, so the bar fits on a normal window without ever
+     scrolling; the long form is the title attribute. -->
 <div class="tabs">
-  <button id="tab_landing" class="tab active" onclick="showTab('landing')">Landing (live monitor)</button>
-  <button id="tab_runner" class="tab" onclick="showTab('runner')">Runner (models + planner)</button>
-  <button id="tab_bench" class="tab" onclick="showTab('bench')">Benchmark</button>
-  <button id="tab_explore" class="tab" onclick="showTab('explore')">Explore rigs (matrix)</button>
-  <button id="tab_landscape" class="tab" onclick="showTab('landscape')">Landscape (benchmark DB)</button>
-  <button id="tab_energy" class="tab" onclick="showTab('energy')">Energy (calibration)</button>
-  <button id="tab_quality" class="tab" onclick="showTab('quality')">Quality</button>
-  <button id="tab_pair" class="tab" onclick="showTab('pair')">Couple a rig</button>
+  <button id="tab_landing" class="tab active" onclick="showTab('landing')"
+    title="live monitor of any reachable sglang server">Monitor</button>
+  <button id="tab_runner" class="tab" onclick="showTab('runner')"
+    title="models, capacity planner and server launch">Planner</button>
+  <button id="tab_bench" class="tab" onclick="showTab('bench')"
+    title="behavioural benchmark / quality suite">Benchmark</button>
+  <button id="tab_explore" class="tab" onclick="showTab('explore')"
+    title="model x rig capacity matrix">Rigs</button>
+  <button id="tab_landscape" class="tab" onclick="showTab('landscape')"
+    title="recorded benchmark database">Landscape</button>
+  <button id="tab_energy" class="tab" onclick="showTab('energy')"
+    title="per-card power calibration">Energy</button>
+  <button id="tab_quality" class="tab" onclick="showTab('quality')"
+    title="rendering / instruction-following checks">Quality</button>
+  <button id="tab_pair" class="tab" onclick="showTab('pair')"
+    title="couple a second rig">Pair rig</button>
 </div>
 
 <div id="view_pair" style="display:none">
@@ -4091,6 +4103,27 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     </div>
   </div>
   <div id="model_info" class="muted" style="margin-top:.4rem;word-break:break-all"></div>
+</fieldset>
+
+<!-- ===================================================================== -->
+<!-- LIVE: what the RUNNING server is actually doing, drawn with the same   -->
+<!-- bars the planner uses for its projection. Deliberately OUTSIDE the     -->
+<!-- simple/expert gating: the measured state of the machine is not an      -->
+<!-- expert-only detail, and the planner's projection is only readable next -->
+<!-- to the measurement it is meant to predict.                             -->
+<!-- ===================================================================== -->
+<fieldset id="live_panel">
+  <legend>live &mdash; VRAM in use, throughput per session, tokens per watt</legend>
+  <div id="live_note" class="muted">looking for a running server&hellip;</div>
+  <div id="live_strip" class="mstrip" style="display:none"></div>
+  <div id="live_cards"></div>
+  <div class="legend" id="live_legend" style="display:none">Bars are the
+    <b>measured</b> NVML occupancy of each card, on the same scale as the
+    planner's projected bars below. Per-session rates divide the server-wide
+    rate by the concurrent requests it is serving. Tokens per watt is the
+    live token rate over the card's NVML power draw &mdash; per card it says
+    what that card costs to keep in the group, the total is the figure for
+    the whole configuration.</div>
 </fieldset>
 
 <!-- ===================================================================== -->
@@ -5391,6 +5424,8 @@ function showTab(t) {
   if (t==='pair') pairRefresh(); else pairStopPoll();
   // The landing page live-poll runs only while its tab is visible.
   if (t==='landing') startLanding(); else stopLanding();
+  // The runner's live panel polls the same snapshot, on the same rule.
+  if (t==='runner') startLive(); else stopLive();
 }
 
 // ===========================================================================
@@ -5832,7 +5867,7 @@ function stripSpark(key){
     const x0=STRIP_W-a.length*STRIP_PX_PER_SAMPLE+STRIP_PX_PER_SAMPLE/2;
     const pts=a.map((p,i)=>(x0+i*STRIP_PX_PER_SAMPLE)+','
       +(1+(STRIP_H-2)*(1-Math.max(0,p.v)/mx)).toFixed(1)).join(' ');
-    inner='<polyline fill="none" stroke="#1f6feb" stroke-width="1.5" points="'+pts+'"/>';
+    inner='<polyline fill="none" stroke="var(--info)" stroke-width="1.5" points="'+pts+'"/>';
   }
   return '<svg class="spk" width="'+STRIP_W+'" height="'+STRIP_H+'">'+inner+'</svg>';
 }
@@ -5843,8 +5878,9 @@ function sparkline(key,w,hh){
   if(mx<=mn) mx=mn+1;
   const t0=a[0].t, t1=a[a.length-1].t, span=(t1-t0)||1;
   const pts=a.map(p=>((p.t-t0)/span*w).toFixed(1)+','+(hh-((p.v-mn)/(mx-mn))*hh).toFixed(1)).join(' ');
-  return '<svg width="'+w+'" height="'+hh+'" style="vertical-align:middle;background:#0d1117;border-radius:3px">'
-    +'<polyline fill="none" stroke="#1f6feb" stroke-width="1.5" points="'+pts+'"/></svg>';
+  return '<svg width="'+w+'" height="'+hh+'" style="vertical-align:middle;'
+    +'background:var(--bg-input);border-radius:2px">'
+    +'<polyline fill="none" stroke="var(--info)" stroke-width="1.5" points="'+pts+'"/></svg>';
 }
 function landingEndpoint(){
   try{ return (localStorage.getItem('land_endpoint')||'').trim(); }catch(e){ return ''; }
@@ -6947,6 +6983,135 @@ function fmtGiB(m){
   if(m==null||isNaN(m)) return 'n/a';
   return (m/1024).toFixed(1)+' GiB';
 }
+
+// ===========================================================================
+// LIVE panel (runner tab, both densities).
+//
+// The planner draws what a configuration WOULD occupy. This draws what the
+// running server DOES occupy, with the same bar, so the two are comparable by
+// looking rather than by arithmetic. Everything here comes from one
+// /api/live_snapshot poll -- NVML per card, the Prometheus scrape for rates.
+//
+// Fill colour is state, using the thresholds these tools converge on: under
+// 80% of the card normal, 80-90% tight, above 90% critical. Nothing on this
+// panel is coloured for decoration.
+// ===========================================================================
+const LIVE_POLL_MS=2000;
+window._liveTimer=null;
+function vramClass(frac){
+  if(frac==null) return '';
+  if(frac>=0.90) return ' over';
+  if(frac>=0.80) return ' tight';
+  return '';
+}
+// One card's measured occupancy, on the planner's own bar.
+function liveCardHtml(g, tokS){
+  const frac=(g.mem_total_mib? g.mem_used_mib/g.mem_total_mib : null);
+  const pct=frac==null?0:Math.min(100,frac*100);
+  const idx=devLabel(g.cuda_index, g.nvml_index)||('nvml:'+g.nvml_index);
+  const key='gpu'+g.nvml_index;
+  pushRing(key+'_util', window._liveT, g.utilization_pct);
+  pushRing(key+'_pow', window._liveT, g.power_watts);
+  pushRing(key+'_mem', window._liveT, frac==null?null:frac*100);
+  // Tokens per watt for ONE card: the server-wide token rate over what this
+  // card is drawing. It is what this card costs to keep in the group -- the
+  // tokens are produced by the whole TP group, never by one card alone, and
+  // the label says so rather than implying a per-card share of the work.
+  const tpw=(tokS!=null&&g.power_watts>0)?(tokS/g.power_watts):null;
+  return '<div class="cardsimple" data-key="live_'+g.nvml_index+'">'
+    +'<div class="cs-h"><span class="cs-n">'+esc(g.name)
+    +' <span class="muted" style="font-weight:400">['+esc(idx)+']</span></span>'
+    +'<span class="cs-u">'+fmtGiB(g.mem_used_mib)+' of '+fmtGiB(g.mem_total_mib)
+    +' &middot; '+pct.toFixed(0)+'%</span></div>'
+    +'<div class="csbar" title="measured NVML occupancy of this card">'
+    +'<div class="fill'+vramClass(frac)+'" style="width:'+pct.toFixed(1)+'%"></div></div>'
+    +'<div class="csrow" style="font-size:var(--t-xs);color:var(--fg-muted);'
+    +'flex-wrap:wrap;gap:var(--s3)">'
+    +'<span>util <b>'+g.utilization_pct+'%</b> '+sparkline(key+'_util',72,16)+'</span>'
+    +'<span>power <b>'+g.power_watts.toFixed(0)+'</b>/'+g.power_limit_w.toFixed(0)
+    +' W '+sparkline(key+'_pow',72,16)+'</span>'
+    +'<span>VRAM '+sparkline(key+'_mem',72,16)+'</span>'
+    +'<span>'+g.temperature_c+' &deg;C</span>'
+    +'<span>SM '+g.sm_clock_mhz+' MHz</span>'
+    +'<span title="server-wide token rate over this card\'s NVML power draw">'
+    +'tok/W <b>'+(tpw!=null?tpw.toFixed(2):'--')+'</b></span>'
+    +'</div></div>';
+}
+function liveTile(label, value, sub, spark){
+  return '<div class="mtile" data-key="'+label.replace(/[^a-z]/gi,'')+'">'
+    +'<div class="mt-l">'+label+'</div><div class="mt-v">'+value+'</div>'
+    +'<div class="mt-s">'+(sub||'&nbsp;')+'</div>'
+    +(spark?stripSpark(spark):'')+'</div>';
+}
+function renderLivePanel(s){
+  const note=$('live_note'), strip=$('live_strip'), cards=$('live_cards');
+  if(!note) return;
+  if(!s||!s.ok||!s.gpus){
+    note.style.display=''; strip.style.display='none';
+    $('live_legend').style.display='none';
+    setHTML(cards,'');
+    setHTML(note, s&&s.error
+      ? '<span class="rev-error">'+esc(s.error)+'</span>'
+      : 'No reachable server. The bars below are the planner\'s projection; '
+        +'this panel fills in once a server is running (Landing tab &rarr; '
+        +'detect, or load a model here).');
+    return;
+  }
+  window._liveT=s.t;
+  const rates=s.rates||null;
+  const dec=rates?rates.decode_tok_s:null, pfx=rates?rates.prefill_tok_s:null;
+  const running=(s.num_running_reqs!=null)?s.num_running_reqs:null;
+  const queued=(s.num_queue_reqs!=null)?s.num_queue_reqs:null;
+  // Per session = the server-wide rate divided by the requests it is actually
+  // serving. With nothing running the per-session figure is undefined, not 0.
+  const per=(v)=>(v==null||running==null||running<1)?null:v/running;
+  const decPer=per(dec), pfxPer=per(pfx);
+  let watts=null;
+  for(const g of s.gpus) if(g.power_watts!=null) watts=(watts||0)+g.power_watts;
+  const EPS=0.05;
+  let tokS=null;
+  if(dec!=null&&dec>EPS) tokS=dec; else if(pfx!=null&&pfx>EPS) tokS=pfx;
+  const tpwTotal=(tokS!=null&&watts)?tokS/watts:null;
+  stripPush('lv_dec',s.t,dec); stripPush('lv_pfx',s.t,pfx);
+  stripPush('lv_tpw',s.t,tpwTotal);
+  const n1=(v)=>v==null?'&ndash;':Number(v).toFixed(1);
+  const n2=(v)=>v==null?'&ndash;':Number(v).toFixed(2);
+  note.style.display='none';
+  strip.style.display=''; $('live_legend').style.display='';
+  setHTML(strip,
+    liveTile('decode per session',
+      n1(decPer)+'<small> tok/s</small>',
+      'server total '+n1(dec)+' tok/s &middot; '
+      +(running==null?'sessions n/a':running+' running')
+      +(queued?(' &middot; '+queued+' queued'):''), 'lv_dec')
+   +liveTile('prefill per session',
+      n1(pfxPer)+'<small> tok/s</small>',
+      'server total '+n1(pfx)+' tok/s (non-cached)', 'lv_pfx')
+   +liveTile('tokens per watt (total)',
+      n2(tpwTotal)+'<small> tok/W</small>',
+      (watts!=null?Math.round(watts)+' W across '+s.gpus.length+' cards':'-- W')
+      +(tokS!=null?(' &middot; '+n1(tokS)+' tok/s'):' &middot; idle'), 'lv_tpw')
+   +liveTile('energy per token',
+      (tpwTotal?n1(1/tpwTotal):'&ndash;')+'<small> J/tok</small>',
+      tpwTotal?'at the current phase rate':'undefined while idle', ''));
+  setHTML(cards, s.gpus.map(g=>liveCardHtml(g, tokS)).join(''));
+}
+async function livePoll(){
+  const ep=landingEndpoint();
+  try{
+    const d=await api('/api/live_snapshot'+(ep?('?endpoint='+encodeURIComponent(ep)):''),
+                      {key:'runnerlive', timeout:LIVE_POLL_MS-200});
+    renderLivePanel(d&&d.running?d.snapshot:null);
+  }catch(e){ if(!apiAborted(e)) renderLivePanel({ok:false,error:apiError(e)}); }
+}
+function startLive(){
+  if(window._liveTimer) return;
+  livePoll();
+  window._liveTimer=setInterval(livePoll, LIVE_POLL_MS);
+}
+function stopLive(){
+  if(window._liveTimer){ clearInterval(window._liveTimer); window._liveTimer=null; }
+}
 function renderSimpleCards(placement){
   const box=$('simple_cards'); if(!box) return;
   const incl=CARDS.filter(c=>c.include);
@@ -7036,8 +7201,10 @@ function markTune(){
     b.className='mini'+(k===cur?'':' secondary');
   }
   const note=$('tune_note');
-  if(note) note.textContent='objective: '+(TUNE_LABELS[cur]||cur)
-    +' — every control below stays free to move past it.';
+  if(note) note.innerHTML='objective: <b>'+esc(TUNE_LABELS[cur]||cur)+'</b>'
+    +' &mdash; sets --rank-perf-tune only; every control below stays free to '
+    +'move past it. This is not a second preset: a preset fills every row, '
+    +'an objective moves one.';
 }
 function runnerFlags(){
   const s=window._flagSettings||{};
@@ -7172,7 +7339,8 @@ async function loadConfigProfiles(){
     window._profiles=(d.generated||[]).concat(d.saved||[]);
     // LM-Studio-style preset DROPDOWN: generated presets first, user-saved
     // after (marked); picking one applies it and fills the settings rows.
-    let h='<select id="profile_select" onchange="applyProfileSel()" style="max-width:70%">'
+    let h='<label for="profile_select">preset</label>'
+      +'<select id="profile_select" onchange="applyProfileSel()">'
       +'<option value="">&mdash; apply a preset &mdash;</option>'
       +window._profiles.map((p,i)=>'<option value="'+i+'" title="'
         +esc((p.info||[]).join(' | '))+'">'+esc(p.name)
@@ -7227,8 +7395,17 @@ function applyProfile(i){
   window._profileArgv=p.argv||null;
   window._profileDirty=false;
   renderProfileLaunch();
-  $('profile_msg').innerHTML='<span class="muted">applied <b>'+esc(p.name)+'</b>'
-    +((p.info&&p.info.length)?' — '+esc(p.info.join(' | ')):'')+'</span>';
+  // A preset that lands silently is indistinguishable from a dead control.
+  // Report what it actually wrote, and -- the case that made it look broken --
+  // say plainly when nothing downstream can move because no model is picked.
+  const nSet=Object.keys(window._flagSettings||{}).length;
+  const noModel=!$('model').value.trim();
+  $('profile_msg').innerHTML='<span class="muted">applied <b>'+esc(p.name)+'</b> &middot; '
+    +nSet+' setting'+(nSet===1?'':'s')+' written to the rows below'
+    +((p.info&&p.info.length)?' &middot; '+esc(p.info.join(' | ')):'')+'</span>'
+    +(noModel?'<div class="rev-error">No model selected, so the plan and the '
+      +'per-card bars cannot be recomputed yet. Pick a model above &mdash; the '
+      +'preset stays applied.</div>':'');
   // Sync the slider pairs to the applied values, then snapshot for the
   // changed-from-preset markers (the snapshot IS the applied state).
   const sl=$('sv_ctx_slider');
