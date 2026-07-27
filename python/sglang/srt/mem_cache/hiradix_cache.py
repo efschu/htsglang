@@ -923,16 +923,25 @@ class HiRadixCache(RadixCache):
         host_value = torch.cat([n.host_value for n in chain])
         return top, key, hash_value, host_value
 
-    def _inc_hit_count(self, node: TreeNode, chunked=False):
+    def _inc_hit_count(
+        self, node: TreeNode, chunked=False, force_host_write_through: bool = False
+    ):
         # skip the hit count update for chunked requests
         if self.cache_controller.write_policy == "write_back" or chunked:
-            return
-        node.hit_count += 1
+            # A hand-off (see requests_forced_host_write_through) still has to
+            # reach the host tier under write_back: that policy stages nodes
+            # only at eviction time and drops them when the host pool is full,
+            # which for a donated session is the same silent loss.
+            if not force_host_write_through:
+                return
+        else:
+            node.hit_count += 1
 
-        if not node.backuped:
-            if node.hit_count >= self.write_through_threshold:
-                # write to host if the node is not backuped
-                self.write_backup(node)
+        if not node.backuped and (
+            force_host_write_through or node.hit_count >= self.write_through_threshold
+        ):
+            # write to host if the node is not backuped
+            self.write_backup(node)
 
     def writing_check(self, write_back=False):
         if write_back:
@@ -1751,6 +1760,10 @@ class HiRadixCache(RadixCache):
         value = params.value
         chunked = params.chunked
         priority = params.priority
+        # Hand-off insert: every node on this chain goes to the host tier, the
+        # hit-count heuristic does not get a vote. Parent-first order below
+        # keeps write_backup's contiguity invariant intact.
+        force = params.force_host_write_through
 
         if priority is None:
             priority = 0
@@ -1784,7 +1797,7 @@ class HiRadixCache(RadixCache):
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(node.parent)
                 else:
-                    self._inc_hit_count(node, chunked)
+                    self._inc_hit_count(node, chunked, force)
                     total_prefix_length += prefix_len
             else:
                 # partial match, split the node
@@ -1799,7 +1812,7 @@ class HiRadixCache(RadixCache):
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(new_node.parent)
                 else:
-                    self._inc_hit_count(new_node, chunked)
+                    self._inc_hit_count(new_node, chunked, force)
                     total_prefix_length += prefix_len
                 node = new_node
 
@@ -1826,8 +1839,8 @@ class HiRadixCache(RadixCache):
             # Emit BlockStored so the router indexes this block.
             self._record_store_event(new_node)
 
-            if self.cache_controller.write_policy != "write_back":
-                self._inc_hit_count(new_node, chunked)
+            if force or self.cache_controller.write_policy != "write_back":
+                self._inc_hit_count(new_node, chunked, force)
         return InsertResult(prefix_len=total_prefix_length)
 
     def release_aborted_request(self, rid: str):

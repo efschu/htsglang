@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    requests_forced_host_write_through,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.session_radix_cache import SessionRadixCacheMixin
@@ -463,7 +464,12 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    priority=priority,
+                    force_host_write_through=requests_forced_host_write_through(req),
+                )
             )
             session_leaf = result.last_device_node
             # Free the duplicates that were already in the tree
