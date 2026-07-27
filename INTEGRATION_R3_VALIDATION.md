@@ -3868,3 +3868,184 @@ fails 9 assertions at `BETA = 1.00` (the shipped model) and passes all of them
 at 0.63, so the tests pin the calibration and nothing else. Planner suite
 777 passed; the single `test_webui.py::test_reference_png_static_route`
 failure reproduces on the unmodified base commit.
+## #187 — the long-prompt "cold vs warm" divergence is not cold-vs-warm, not Triton, and not ours
+
+Registered above (§ "the long-prompt cache-state sensitivity") as a Triton-lane
+question belonging to #173. Chased with a different instrument, it turns out to
+be none of the three things its name says.
+
+**Measured statement.** The *prefill forward of this model* is not run-to-run
+reproducible above roughly 128 prompt tokens. Identical bytes in, different
+logits out, on every repeat — on either attention backend, with or without any
+fork flag, and with `--enable-deterministic-inference` switched on.
+
+### Why the earlier framing pointed the wrong way
+
+The earlier arms compared decoded TEXT of the first probe pass against the
+second pass, and read "run 1 differs, runs 2-3 agree" as cold-vs-warm. Two
+instrument changes dissolve that reading:
+
+* **flush the radix cache between every request**, so "cold" is a state that
+  can be re-entered rather than a one-shot;
+* **compare the returned top-k logprob FLOATS at output position 0**, not the
+  decoded text. Text only moves when the argmax flips, so it reports a fraction
+  of the drift and only on prompts that happen to contain a near-tie.
+
+Probes: `/spinning/r3val/coldwarm_probe.py` (the three-hypothesis
+discriminator), `cw_locate.py` (prefill-vs-decode localiser), `cw_bisect.py`
+(length threshold). Launchers `cw_launch.sh` (fork topology) and `cw_stock.sh`
+(no fork flags at all).
+
+### The discriminator that killed the radix hypothesis
+
+One boot, Triton, `--dcp-size 1`, spec off, KV budget PINNED with
+`--max-total-tokens 98304` so the #188 measured-budget trap cannot masquerade as
+a JIT effect (`max_total_num_tokens=98304`, exactly as asked). Sequence:
+flush, R1, R2, R3, flush, R4, R5, flush, R6 — the 11650-token prompt each time.
+
+Three hypotheses were separated in advance:
+
+| hypothesis | prediction |
+|---|---|
+| radix state (cold chunked prefill vs prefix hit) | R1 = R4 = R6, R2 = R3 = R5, cold != warm |
+| one-shot warmup (JIT / autotune / lazy workspace) | R1 alone odd; R4 = R6 = R2 |
+| nondeterminism | the cold runs disagree with *each other* |
+
+Measured (`logs/cw1_tri.long.json`), `cached_tokens` confirming the state:
+
+```
+R1_cold cached=0      class 0
+R2_warm cached=11648  class 1
+R3_warm cached=11648  class 1
+R4_cold cached=0      class 2
+R5_warm cached=11648  class 3
+R6_cold cached=0      class 3
+```
+
+Four equivalence classes among six runs. Cold runs disagree with each other and
+warm runs disagree with each other, so the third hypothesis holds and the first
+two are dead. The flips sit on genuine near-ties: at the first differing
+position the top-2 logprob gap is **0.0 to 0.25 nats** — an exact tie in one
+run.
+
+### Prefill, not decode
+
+`cw_locate.py` with `max_new_tokens=1` isolates the prefill. Six flushed
+repeats of the same 11650-token prompt, top-5 logprobs at output position 0:
+
+```
+run0: 271:-0.020039, 248046:-4.645040, 198:-5.770040, 248068:-5.957540
+run1: 271:-0.018623, 248046:-4.643623, 198:-5.956123, 248068:-6.143623
+run2: 271:-0.018965, 248046:-4.768965, 248068:-5.768965, 198:-5.956465
+run4: 271:-0.026560, 248046:-4.276560, 198:-5.526560, 248068:-5.776560
+```
+
+Six distinct logit vectors, ranks 3 and 4 even reordering, up to ~0.5 nats of
+movement on the lower-ranked tokens. The counter-test pins the site: repeating
+the same request **without** flushing, so runs 1-5 are full prefix hits and the
+long prefill is not re-run, gives five bit-identical vectors. Reading cached KV
+is exact; producing it is not.
+
+### Length threshold, and it is not chunked prefill
+
+`cw_bisect.py`, 4-5 flushed repeats per length, `chunked_prefill_size=2048`:
+
+| prompt_tokens | 7-109 | 133 | 157 | 181 | 205 | 229 | 277 | 401 | 657 | 913 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| bit-identical | yes | **no** | **no** | **no** | yes | yes | **no** | **no** | **no** | **no** |
+
+The boundary sits between 109 and 133 tokens — nowhere near
+`chunked_prefill_size`, which the earlier framing had suspected. The clean
+205/229 entries are under-sampling at n=5, not a second boundary: the drift
+there is simply below the last printed digit. Drift grows with length
+(`top1_lp_spread` 7e-4 at 133 tokens, 2.8e-3 at 913, and the ~0.5 nat figures
+above at 11650).
+
+### Repro matrix — what it is NOT
+
+Every row is the same prompt set and the same instrument.
+
+| arm | model | topology | result |
+|---|---|---|---|
+| `cw1_tri` | Qwen3.6-27B-FP8 | fork uneven TP=3, `--dcp-size 1`, **triton** | nondet from 133 |
+| `cw2_fi` | Qwen3.6-27B-FP8 | fork uneven TP=3, `--dcp-size 1`, **flashinfer** | nondet from 157 |
+| `cw7_q27_tp2` | Qwen3.6-27B-FP8 | **stock even TP=2, two identical 3080s, zero fork flags** | nondet from 133 |
+| `cw8_q27_det` | Qwen3.6-27B-FP8 | stock even TP=2 + `--enable-deterministic-inference` | nondet from 133 |
+| `cw3_tp1` | Llama-3.1-8B bf16 | **TP=1**, one GPU, no collectives | clean to 512, and clean at ~6000 tokens |
+| `cw4_tp2` | Llama-3.1-8B bf16 | stock even TP=2 | clean to 512, and clean at ~6000 tokens |
+| `cw10_llama_fp8` | Llama-3.1-8B **+ `--quantization fp8`** | stock even TP=2 | clean to 512 |
+
+So, one falsification per row:
+
+1. **Not the Triton lane.** flashinfer reproduces it with the same profile. The
+   premise this task inherited is wrong; the earlier "flashinfer is stable" was
+   an argmax that happened not to flip, on a text-only instrument.
+2. **Not #180, not #173, not the fork.** It reproduces on stock even TP=2 over
+   two identical 3080s with no `--rank-gpu-id`, no `--rank-tp-ratio`, no uneven
+   DCP, no `SGLANG_UNEVEN_*`.
+3. **Not the fp8 GEMM.** Llama-8B forced through the same fp8 path is clean.
+4. **Not the all-reduce, and not configurable away.**
+   `--enable-deterministic-inference` logs that it pinned `NCCL_ALGO` to
+   `allreduce:tree` and disabled custom all-reduce — and changes nothing. Its
+   coverage (attention backends, sampling, all-reduce) does not reach whatever
+   this is. That is an upstream gap, not a local misconfiguration.
+
+### What it IS — and how far that is actually pinned
+
+By elimination the site is the **Qwen3.5/3.6 architecture lane**, of which the
+48-of-64 gated-DeltaNet linear-attention layers are the obvious suspect: they
+are the one large thing Llama does not have, they are prefill-chunked at
+`CHUNK_SIZE = 64`, and `fla/chunk_delta_h.py` already carries a comment saying
+its autotune had to be cut to a single hardcoded config because the kernel
+"writes ht (final state) back into initial_state in-place" and the benchmark
+phase corrupted the state pool. That is the [[geteilte-puffer-familie]] shape.
+
+Stated as elimination rather than as proof, because two things were attempted
+and did not land:
+
+* **Qwen3.6-27B at TP=1 will not boot on this rig.** 25 GB of weights on the
+  32.6 GB 5090 leaves room for `max_mamba_cache_size=2` against a required
+  `mamba_ratio=5`. So "does this survive with zero collectives *for this
+  model*" is untested here — a hardware limit, not a result.
+* **The unit-level falsifier did not run.** `/spinning/r3val/gdn_unit.py` calls
+  `chunk_gated_delta_rule` directly, but the synthetic call convention is wrong
+  (NaN output, then an illegal memory access). Its output must NOT be read as
+  evidence about the kernel — it is evidence about the harness. Rebuilding it
+  against the real call path (`prepare_chunk_indices`, the state-pool dtype and
+  layout the backend actually passes) is the next concrete step, and it is the
+  [[einzelteil-vor-verbund]] gate this root cause still owes.
+
+### Consequence for the byte comparisons already in this record
+
+This is the part that matters more than the root cause.
+
+* **Every short-prompt byte gate stands.** The three short prompts are bit-exact
+  in every arm at every cache state, and the measured floor confirms it: below
+  ~109 prompt tokens the logits are bit-identical across repeats. G4's
+  `short_code` / `short_prose` identities, the self-determinism gates, the
+  arm-vs-arm token-id comparisons on short prompts — all unaffected.
+* **Every long-prompt byte comparison in this record was measuring the engine's
+  own noise, not the arm.** That includes G4's `chunked_natural` row (the
+  "flashinfer diverges from itself at char 43" observation is this effect, seen
+  early and misattributed), the #180 V4 cold/warm arms, and the parent-commit
+  control. None of them were wrong to record — but none of them can support a
+  claim about a branch. They were not "warm-vs-warm and therefore valid": the
+  warm runs are not stable either.
+* **A cold-boot-vs-warm-boot byte gate on a long prompt is not achievable** on
+  this model, by construction. It was the deliverable this task was given, and
+  it cannot be met by any config, because the same server does not reproduce
+  itself. What replaces it:
+  1. byte gates on prompts under ~109 tokens, which are exact;
+  2. for long prompts, a semantic gate (needle retrieval, answer correctness)
+     plus a logit-drift bound, not byte equality;
+  3. `top2_gap` at the first divergence as the honest discriminator — a flip at
+     a 0.0-0.25 nat tie is noise amplification, a flip at a wide gap is a bug.
+
+### Open
+
+* The GDN attribution needs the unit falsifier, rebuilt correctly.
+* Whether upstream's deterministic-inference mode is *documented* as not
+  covering mamba/linear-attention layers, or whether this is an unreported gap
+  worth filing.
+* Whether the same profile appears on the other GDN-hybrid checkpoints
+  (Qwen3.6-35B-A3B, Qwen3.5-122B) — expected yes, untested.
