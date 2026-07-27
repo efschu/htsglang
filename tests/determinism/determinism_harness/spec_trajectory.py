@@ -24,7 +24,7 @@ identical sgl_kernel op). So the round's emitted sequence is
     target_predict[slot_0], target_predict[slot_1], ..., target_predict[slot_{n-1}]
 
 with ``n = accept_len``, and ``target_predict = argmax(next_token_logits)``
-(``eagle_utils.py:961``). Row ``i`` of the verify matrix is therefore the
+(``eagle_utils.py:1029``). Row ``i`` of the verify matrix is therefore the
 parent of emitted token ``i`` of that round.
 
 What the projection deliberately does NOT hide

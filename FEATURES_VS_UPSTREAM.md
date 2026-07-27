@@ -28,6 +28,22 @@ Vega 64 (gfx900) for the cross-vendor rows.
 `falsifikator-geprueft` marks a row whose own test is on record as red before its fix and green
 after.
 
+**Speculative decoding is not token-identical to non-speculative decoding, even at temperature 0.**
+The usual claim that greedy speculation is lossless does not survive measurement on this stack, and
+the failure is upstream, not a fork delta: with the lane and every fork feature switched OFF, two
+control arms on plain TP=2 diverge at token 1 / 172 / 16 and agree only on one of four content
+classes (#143 Window 5). The mechanism the code permits is that a verify scores `k+1` positions in
+one forward — a different batch shape and attention kernel path from a one-row decode, hence a
+different floating-point reduction order and a different argmax at near-ties. The accept rule
+itself is exact (integer equality against the target argmax; the `--speculative-accept-threshold-*`
+knobs are consumed by the sampling branch only), so a divergence cannot originate there. Separately
+and independent of any fp argument, speculation is *structurally* lossy whenever repetition /
+presence / frequency penalties are set: a round applies its pre-step penalty vector to all `k+1`
+draft positions and only one token per round reaches the penalizers. Consequence for this
+document: **a spec-on-vs-spec-off token comparison is not a structural identity and never counts as
+`Cross-checked` evidence.** The valid reference for a speculative arm carries the *same* speculative
+configuration; see `tests/determinism` (`SPEC_NEAR_TIE`) and `docs_new/weightless_chain_spec.md` §8.
+
 **fp8 on RTX 3080, since #190:** `gptq_marlin_gemm`, the only fp8 GEMM sm86 has, is measured
 run-to-run nondeterministic above ~109 prompt tokens (0/1200 mismatches through M=109, first
 mismatch at M=128; `fix/gdn-prefill-determinism`, not yet merged). Byte-/token-identity claims

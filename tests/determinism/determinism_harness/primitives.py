@@ -367,7 +367,7 @@ def check_accept_rule_exactness(
     argmax -- ``verify_tree_greedy_func`` accepts draft slot i iff
     ``candidates[i] == target_predict[parent]`` and writes
     ``predicts[parent] = target_predict[parent]``, with
-    ``target_predict = argmax(next_token_logits)`` (``eagle_utils.py:961``).
+    ``target_predict = argmax(next_token_logits)`` (``eagle_utils.py:1029``).
     There is no threshold, tolerance or approximation on this path;
     ``--speculative-accept-threshold-single/-acc`` are consumed by the
     SAMPLING branch only. So no fp band can excuse a violation here.
