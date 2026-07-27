@@ -380,7 +380,7 @@ class EICStorage(HiCacheStorage):
 
     def _batch_exists_impl(self, keys) -> List[bool]:
         if len(keys) == 0:
-            return 0
+            return []
         eic_keys = self._get_eic_key(keys)
         logger.debug(f"eic exists {len(keys)}")
         result = []
@@ -397,7 +397,12 @@ class EICStorage(HiCacheStorage):
                 logger.error(
                     f"eic exists {len(keys)} failed, status_code {status_code}"
                 )
+                # The mask must stay one entry per key. Falling through to the
+                # per-key loop below would append the outcome codes on top of
+                # the Falses just added, shifting every entry after this batch
+                # and letting batch_exists count absent pages as present.
                 result.extend([False] * len(batch_keys))
+                continue
             for err_code in exist_outcome.status_codes:
                 result.append(err_code == eic.StatusCode.SUCCESS)
         return result
@@ -530,7 +535,7 @@ class EICStorage(HiCacheStorage):
         assert len(keys) == len(values)
         logger.debug(f"eic generic set {len(keys)} keys")
         if len(keys) == 0:
-            return True
+            return []
         eic_keys = self._get_eic_key(keys)
         keys_vec = eic.StringVector()
         vals_vec = eic.IOBuffers()
@@ -584,18 +589,32 @@ class EICStorage(HiCacheStorage):
         set_option.ns = self.eic_namespace
         set_option.ttl_second = -1
         status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
-        if status_code != eic.StatusCode.SUCCESS:
+        # A non-SUCCESS status_code means the whole mset failed. Reporting
+        # success here would mark the pages as backed up to L3 when they are
+        # not there; set_outcome.status_codes may also be empty, in which case
+        # the per-key inspection below would raise IndexError.
+        failed = status_code != eic.StatusCode.SUCCESS
+        if failed:
             logger.error(f"eic mset {len(eic_keys)} failed, status_code {status_code}")
         else:
             logger.debug(f"eic mset {len(eic_keys)} success")
+            # All keys of a batch share one outcome, so any per-key failure
+            # fails the batch. Inspecting only status_codes[0] reported success
+            # for keys 1..n-1 whose write had failed.
+            for err_code in set_outcome.status_codes:
+                if err_code != eic.StatusCode.SUCCESS:
+                    logger.error(
+                        f"set data key {len(eic_keys)} failed, err_code {err_code}"
+                    )
+                    failed = True
+                    break
 
+        # Runs on both paths: the pooled buffers must go back regardless.
         if self.enable_kv_set_direct and items is not None:
             for item in items:
                 self.kv_cache_write_mem_pool.free_to_mempool(item.data_ptr())
 
-        err_code = set_outcome.status_codes[0]
-        if err_code != eic.StatusCode.SUCCESS:
-            logger.error(f"set data key {len(eic_keys)} failed, err_code {err_code}")
+        if failed:
             return [False] * len(keys)
 
         logger.debug(f"set data key {len(eic_keys)} success")
