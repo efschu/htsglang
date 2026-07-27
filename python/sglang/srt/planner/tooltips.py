@@ -106,6 +106,10 @@ MEASUREMENT_SOURCES = {
     "mlp_crossover": "the MLP-split crossover study",
     "power_profile": "the per-card power calibration",
     "bench_suite": "the benchmark suite",
+    "moe_offload_wave_order": (
+        "the #254 offload wave-order study (Qwen3.6-35B-A3B-AWQ, single 5090, "
+        "resident expert fraction 0.25)"
+    ),
 }
 
 
@@ -329,6 +333,28 @@ TRADEOFFS: Dict[str, Tradeoff] = {
     "SGLANG_MEMORY_SAVER_CUDA_GRAPH": Tradeoff(
         gain="Releases captured CUDA-graph memory when the server idles.",
         cost="The first request after an idle period pays the capture again.",
+    ),
+    "SGLANG_MOE_OFFLOAD_WAVE_ORDER": Tradeoff(
+        gain="Chooses how a chunk's offload waves are ordered, which decides "
+        "how often a spilled expert has to cross PCIe.",
+        cost="The two orderings trade PCIe traffic against a transient "
+        "per-layer buffer; they produce byte-identical output either way.",
+        measured_from="moe_offload_wave_order",
+    ),
+    "SGLANG_MOE_OFFLOAD_WAVE_ORDER=token": Tradeoff(
+        gain="Today's behaviour, and it needs no extra memory.",
+        cost="Every spilled expert is streamed again for each wave, and with "
+        "a wave covering only a token or two the PCIe traffic grows with the "
+        "chunk instead of with the number of experts.",
+        measured_from="moe_offload_wave_order",
+    ),
+    "SGLANG_MOE_OFFLOAD_WAVE_ORDER=expert": Tradeoff(
+        gain="Each spilled expert crosses PCIe once per chunk, so offloaded "
+        "prefill stops scaling with the prompt length -- the longer the "
+        "prompt, the larger the margin.",
+        cost="One transient tokens x top_k x hidden buffer per layer, on the "
+        "order of tens of MiB at a 2048-token chunk.",
+        measured_from="moe_offload_wave_order",
     ),
     # ---- weightless KV lane ------------------------------------------------
     "weightless_kv_fastlane": Tradeoff(
