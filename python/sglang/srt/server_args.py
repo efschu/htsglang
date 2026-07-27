@@ -1834,8 +1834,12 @@ class ServerArgs:
             "captured-token term included; when it falls below what 'auto' "
             "would derive, a startup warning names the deficit and its "
             "components, because the shortfall otherwise surfaces as an OOM "
-            "in the first real prefill rather than at startup. Only valid "
-            "with --rank-tp-ratio auto.",
+            "in the first real prefill rather than at startup. The budget is "
+            "derived from the NVML TOTAL, never from the memory that happens "
+            "to be free at launch: a co-resident process does not shrink it "
+            "(it is the reserve's job to account for one), it only limits "
+            "what can physically be allocated — which is reported "
+            "separately. Only valid with --rank-tp-ratio auto.",
             type_parser=str,
         ),
     ] = "auto"
@@ -6252,17 +6256,25 @@ class ServerArgs:
             mem_info = _query_rank_gpu_memory_mib(self.rank_gpu_id)
             budgets = []
             for gpu_id in self.rank_gpu_id:
-                total_mib, free_mib = mem_info[gpu_id]
-                # The budget can never exceed what is actually free when
-                # the worker checks it — and the worker checks AFTER
-                # creating its own CUDA context, so cap at "free now minus
-                # a context allowance". reserve=0 therefore means "use
-                # everything that is free now, minus the worker's own
-                # context".
-                budget = (
-                    min(total_mib - reserve_per_gpu[gpu_id], free_mib - 1024)
-                    // counts[gpu_id]
-                )
+                total_mib, _free_mib = mem_info[gpu_id]
+                # The documented mapping, and it has to hold under
+                # co-residence too (#260): budget = NVML TOTAL minus the
+                # reserve, split among the ranks placed on this GPU. The
+                # live free reading is deliberately not part of this
+                # arithmetic.
+                #
+                # Capping the budget at "free right now" charged a
+                # co-resident process twice — once because it really holds
+                # those bytes, and a second time through the reserve the
+                # operator sized to cover it — and it silently re-derived
+                # the SHARD RATIO below from a transient occupancy reading,
+                # so the partition plan depended on who else happened to be
+                # on the card. Free memory bounds what can physically be
+                # allocated, not what the budget IS; that bound is checked
+                # separately (_warn_budget_exceeds_free here, and the
+                # per-rank physical check in _profile_available_bytes,
+                # which owns the authoritative numbers).
+                budget = (total_mib - reserve_per_gpu[gpu_id]) // counts[gpu_id]
                 if budget <= 0:
                     raise ValueError(
                         f"--rank-auto-reserve-mib "
@@ -6278,6 +6290,7 @@ class ServerArgs:
                 budgets,
                 {g: r for g, r in sorted(reserve_per_gpu.items())},
             )
+            self._warn_budget_exceeds_free(budgets, mem_info)
             if reserve_was_pinned:
                 self._warn_pinned_reserve_shortfall(reserve_per_gpu, budgets, counts)
 
@@ -7047,6 +7060,84 @@ class ServerArgs:
             + 12 * tokens * hv
         )
         return peak_bytes / (1 << 20)
+
+    # Per-rank CUDA context allowance (MiB). Not covered by
+    # --rank-auto-reserve-mib / --rank-gpu-memory-mib by design (the runbook
+    # says so), so a plan that fills the free memory to the last MiB is worth
+    # a note even when it is not yet impossible.
+    RANK_CONTEXT_ALLOWANCE_MIB = 1024
+
+    @staticmethod
+    def budget_free_shortfall_note(
+        gpu_id: int,
+        ranks: List[int],
+        required_mib: int,
+        total_mib: int,
+        free_mib: int,
+        context_allowance_mib: int,
+    ) -> Optional[str]:
+        """Note for a per-GPU budget plan that the LIVE free memory cannot
+        carry, or None when it fits.
+
+        The budget is absolute by definition -- NVML total minus the reserve
+        -- so a co-resident process must never shrink it (#260). What that
+        process does limit is how much can physically be handed out, and the
+        two are worth keeping apart in words: "free X < budget Y because Z is
+        held by someone else" sends the operator to the neighbour, while the
+        same shortfall reported as an exhausted budget sends them on a hunt
+        through their own weight accounting.
+        """
+        occupied_mib = max(0, total_mib - free_mib)
+        common = (
+            f"GPU {gpu_id}: rank(s) {ranks} plan {required_mib} MiB in total "
+            f"(NVML total {total_mib} MiB, {free_mib} MiB free right now, "
+            f"{occupied_mib} MiB already held by other processes)"
+        )
+        if required_mib > free_mib:
+            return (
+                f"{common}. The budget is an ABSOLUTE allowance and is not "
+                f"reduced by that occupancy, so it stands as planned -- but "
+                f"only {free_mib} MiB can actually be allocated, "
+                f"{required_mib - free_mib} MiB short. Size the plan for what "
+                f"the co-resident process leaves free (raise "
+                f"--rank-auto-reserve-mib on this GPU, or pass an explicit "
+                f"--rank-gpu-memory-mib), or stop that process. The per-rank "
+                f"profiler will reject this with the exact numbers."
+            )
+        if required_mib > free_mib - context_allowance_mib * len(ranks):
+            return (
+                f"{common}. That fits, but leaves less than "
+                f"{context_allowance_mib} MiB per rank for the CUDA "
+                f"context(s), which no budget covers. Expect a tight boot."
+            )
+        return None
+
+    def _warn_budget_exceeds_free(
+        self,
+        budgets: List[int],
+        mem_info: Dict[int, Tuple[int, int]],
+    ) -> None:
+        """Log one note per physical GPU whose derived budgets exceed the
+        memory that is free right now. Diagnostic only: no budget is changed
+        (that is the point -- see budget_free_shortfall_note), and any failure
+        to compute it is swallowed."""
+        try:
+            rank_gpu_ids: List[int] = list(self.rank_gpu_id or [])
+            for gpu_id in sorted(set(rank_gpu_ids)):
+                ranks = [r for r, g in enumerate(rank_gpu_ids) if g == gpu_id]
+                total_mib, free_mib = mem_info[gpu_id]
+                note = self.budget_free_shortfall_note(
+                    gpu_id,
+                    ranks,
+                    sum(budgets[r] for r in ranks),
+                    total_mib,
+                    free_mib,
+                    self.RANK_CONTEXT_ALLOWANCE_MIB,
+                )
+                if note is not None:
+                    logger.warning("%s", note)
+        except Exception as e:  # pragma: no cover - advisory only
+            logger.debug("Could not evaluate the budget against free VRAM: %s", e)
 
     def _warn_pinned_reserve_shortfall(
         self,

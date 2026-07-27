@@ -340,11 +340,12 @@ class TestAutoRatio(CustomTestCase):
             rank_auto_reserve_mib="2048",
         )
         run_handler(args)
-        # budget = min(total - 2048, free - 1024) per GPU, one rank each:
-        # GPU 0: min(30720, 28976) = 28976; GPU 1/2: min(18432, 17976) = 17976.
-        self.assertEqual(args.rank_gpu_memory_mib, [28976, 17976, 17976])
-        # gcd(28976, 17976, 17976) = 8.
-        self.assertEqual(args.rank_tp_ratio, [3622, 2247, 2247])
+        # budget = NVML TOTAL - reserve per GPU, one rank each (#260: the
+        # live free reading is NOT part of this -- see
+        # TestBudgetIsTotalMinusReserve below).
+        self.assertEqual(args.rank_gpu_memory_mib, [30720, 18432, 18432])
+        # gcd(30720, 18432, 18432) = 6144.
+        self.assertEqual(args.rank_tp_ratio, [5, 3, 3])
 
     def test_auto_colocated_budget_split(self):
         args = make_args(
@@ -354,9 +355,9 @@ class TestAutoRatio(CustomTestCase):
             rank_auto_reserve_mib="2048",
         )
         run_handler(args)
-        # GPU 0 budget 28976 shared by two ranks -> 14488 each.
-        self.assertEqual(args.rank_gpu_memory_mib, [14488, 14488, 17976, 17976])
-        self.assertEqual(args.rank_tp_ratio, [1811, 1811, 2247, 2247])
+        # GPU 0 budget 30720 shared by two ranks -> 15360 each.
+        self.assertEqual(args.rank_gpu_memory_mib, [15360, 15360, 18432, 18432])
+        self.assertEqual(args.rank_tp_ratio, [5, 5, 6, 6])
 
     def test_auto_uniform_budgets_collapse_to_even_split(self):
         # Same card type for both ranks -> uniform budgets: the ratio must
@@ -370,7 +371,7 @@ class TestAutoRatio(CustomTestCase):
         )
         run_handler(args)
         self.assertIsNone(args.rank_tp_ratio)
-        self.assertEqual(args.rank_gpu_memory_mib, 17976)
+        self.assertEqual(args.rank_gpu_memory_mib, 18432)
 
     def test_auto_reserve_auto_derives_from_demand(self):
         # #68 default path ('auto' reserve): the short-circuited ServerArgs
@@ -378,7 +379,7 @@ class TestAutoRatio(CustomTestCase):
         # CudaGraphConfig and a mocked device capacity (the reserve is a
         # function of the capacity tier, so the raw NVML totals must not
         # leak in). Wiring-level assertion: the budgets follow
-        # min(total - derived_reserve, free - 1024) with the reserve from
+        # total - derived_reserve with the reserve from
         # derived_rank_auto_reserve_mib.
         from sglang.srt.model_executor.cuda_graph_config import (
             default_cuda_graph_config,
@@ -396,8 +397,8 @@ class TestAutoRatio(CustomTestCase):
         ):
             expected_reserve = args.derived_rank_auto_reserve_mib(gpu_mem, 1)
             run_handler(args)
-        total, free = FAKE_GPU_MEMORY[1]
-        expected_budget = min(total - expected_reserve, free - 1024)
+        total, _free = FAKE_GPU_MEMORY[1]
+        expected_budget = total - expected_reserve
         self.assertGreater(expected_reserve, 0)
         # Uniform cards -> collapse to the even split with a scalar budget.
         self.assertIsNone(args.rank_tp_ratio)
@@ -437,7 +438,7 @@ class TestAutoRatio(CustomTestCase):
             rank_auto_reserve_mib="4096",
         )
         run_handler(args)
-        # min(20480 - 4096, 19000 - 1024) = 16384 per rank.
+        # 20480 - 4096 = 16384 per rank.
         self.assertEqual(args.rank_gpu_memory_mib, 16384)
 
     def test_auto_reserve_per_rank_max_wins_per_gpu(self):
@@ -448,9 +449,9 @@ class TestAutoRatio(CustomTestCase):
             rank_auto_reserve_mib="2048,8192,2048",
         )
         run_handler(args)
-        # GPU 0: reserve max(2048, 8192) = 8192 -> min(24576, 28976) // 2
-        # = 12288 per rank; GPU 1: min(18432, 17976) = 17976.
-        self.assertEqual(args.rank_gpu_memory_mib, [12288, 12288, 17976])
+        # GPU 0: reserve max(2048, 8192) = 8192 -> (32768 - 8192) // 2
+        # = 12288 per rank; GPU 1: 20480 - 2048 = 18432.
+        self.assertEqual(args.rank_gpu_memory_mib, [12288, 12288, 18432])
 
     def test_auto_reserve_list_length_mismatch(self):
         args = make_args(
@@ -1036,7 +1037,7 @@ class TestPinnedReserveShortfall(CustomTestCase):
         self.assertTrue(any("2200 MiB on GPU 1" in str(w) for w in shortfall))
         self.assertTrue(any("2200 MiB on GPU 2" in str(w) for w in shortfall))
         # Advisory only: the budgets are exactly what they were before.
-        self.assertEqual(args.rank_gpu_memory_mib, [28976, 17976, 17976])
+        self.assertEqual(args.rank_gpu_memory_mib, [29768, 18280, 18280])
 
     def test_auto_reserve_does_not_warn(self):
         args, warnings = self._run_and_capture_warnings("auto")
@@ -1279,3 +1280,101 @@ class TestTreeSpecDcpGuardHardenedForNewFlagPaths(CustomTestCase):
             server_args_module, "is_hip", return_value=False
         ), patch.object(server_args_module, "is_cuda", return_value=True):
             args._handle_dcp_validation()  # must not raise
+
+
+class TestBudgetIsTotalMinusReserve(CustomTestCase):
+    """#260: a co-resident process must not shrink the derived budgets.
+
+    The budget is documented as NVML TOTAL minus the reserve. The derivation
+    used to cap it at ``free_mib - 1024``, which charges a neighbour twice --
+    once because it really holds those bytes, and once through the reserve
+    the operator sized to cover it -- and re-derives the SHARD RATIO from a
+    transient occupancy reading on top.
+
+    Numbers below are the measured 2026-07-27 case: a 5090 (NVML total 32607
+    MiB) with a PD instance holding 22227 MiB, plus two idle 3080s.
+    """
+
+    GPU_MEMORY = {
+        0: (32607, 32607 - 22227),  # 5090, co-resident PD instance
+        1: (20480, 20100),  # 3080, idle
+        2: (20480, 20100),  # 3080, idle
+    }
+    CLEAN_MEMORY = {
+        0: (32607, 32300),  # same rig, nothing else on the cards
+        1: (20480, 20100),
+        2: (20480, 20100),
+    }
+
+    def _run(self, reserve, memory, tp_size=3, rank_gpu_id=(0, 1, 2)):
+        args = make_args(
+            tp_size=tp_size,
+            rank_gpu_id=list(rank_gpu_id),
+            rank_tp_ratio="auto",
+            rank_auto_reserve_mib=reserve,
+        )
+        with patch.object(
+            server_args_module,
+            "_query_rank_gpu_memory_mib",
+            lambda ids: {g: memory[g] for g in sorted(set(ids))},
+        ), patch.object(server_args_module, "logger") as mock_logger:
+            args._handle_uneven_tp()
+        warnings = [
+            call.args[1] if len(call.args) > 1 else call.args[0]
+            for call in mock_logger.warning.call_args_list
+        ]
+        return args, warnings
+
+    def test_measured_case_keeps_total_minus_reserve(self):
+        args, _ = self._run("25800,7000,7000", self.GPU_MEMORY)
+        # Exactly the budgets the failing boot logged.
+        self.assertEqual(args.rank_gpu_memory_mib, [6807, 13480, 13480])
+
+    def test_neighbour_larger_than_the_reserve_does_not_rewrite_the_plan(self):
+        """The case where the old cap silently took over.
+
+        Reserve 7000 on a card whose neighbour holds 22227 MiB: the old
+        formula returned min(25607, 10380 - 1024) = 9356 -- a budget, and
+        therefore a shard ratio, derived from who else was on the card.
+        """
+        args, warnings = self._run("7000", self.GPU_MEMORY)
+        self.assertEqual(args.rank_gpu_memory_mib, [25607, 13480, 13480])
+        self.assertNotIn(9356, args.rank_gpu_memory_mib)
+        # ... and the impossible part is SAID, not silently absorbed.
+        shortfall = [w for w in warnings if "GPU 0" in str(w)]
+        self.assertEqual(len(shortfall), 1)
+        self.assertIn("22227 MiB already held by other processes", str(shortfall[0]))
+        self.assertIn("10380 MiB free right now", str(shortfall[0]))
+        self.assertIn("ABSOLUTE allowance", str(shortfall[0]))
+
+    def test_clean_cards_are_unchanged_by_the_fix(self):
+        """No co-residence -> the old cap never bound, and neither does the
+        new arithmetic: byte-for-byte the same budgets and ratio."""
+        args, warnings = self._run("3000,2700,2700", self.CLEAN_MEMORY)
+        old_formula = [
+            min(total - reserve, free - 1024)
+            for (total, free), reserve in zip(
+                [self.CLEAN_MEMORY[g] for g in (0, 1, 2)], [3000, 2700, 2700]
+            )
+        ]
+        self.assertEqual(args.rank_gpu_memory_mib, old_formula)
+        self.assertEqual(args.rank_gpu_memory_mib, [29607, 17780, 17780])
+        self.assertEqual([w for w in warnings if "free right now" in str(w)], [])
+
+    def test_colocated_ranks_split_the_absolute_budget(self):
+        args, warnings = self._run(
+            "7000", self.CLEAN_MEMORY, tp_size=4, rank_gpu_id=(0, 0, 1, 2)
+        )
+        # (32607 - 7000) // 2 = 12803 per co-located rank.
+        self.assertEqual(args.rank_gpu_memory_mib, [12803, 12803, 13480, 13480])
+        # 2 x 12803 = 25606 <= 32300 free -> nothing to warn about.
+        self.assertEqual([w for w in warnings if "free right now" in str(w)], [])
+
+    def test_note_is_silent_when_the_plan_fits(self):
+        self.assertIsNone(
+            ServerArgs.budget_free_shortfall_note(1, [0], 13480, 20480, 20100, 1024)
+        )
+
+    def test_note_flags_a_tight_context_margin(self):
+        note = ServerArgs.budget_free_shortfall_note(1, [0], 19500, 20480, 20100, 1024)
+        self.assertIn("less than 1024 MiB per rank", note)
