@@ -37,6 +37,55 @@ logger = logging.getLogger(__name__)
 USE_FULL_MASK = True
 
 
+def reject_ngram_verify_under_dcp(dcp_size: int) -> None:
+    """Boot gate: NGRAM speculation has no DCP-aware target-verify build.
+
+    ``NGRAM_VERIFY`` is deliberately outside both backends'
+    ``_DCP_VERIFY_SPEC_INPUT_TYPES`` (#180.3): the M4 verify split assumes a
+    uniform ``draft_token_num`` query block per request over a LINEAR draft
+    chain, and an ngram draft is a corpus-matched TREE whose breadth comes
+    from ``--speculative-ngram-{min,max}-bfs-breadth``. That exclusion is
+    correct and stays.
+
+    What it lacked was a moment. Both backends refuse the combination LOUDLY,
+    so nothing is ever computed wrong -- but both refuse in the target-verify
+    METADATA BUILD, i.e. at the first verify step of the first request. The
+    weights are loaded, the pools are sized, the graphs are captured and the
+    server reports ready before a configuration error decidable from
+    ``server_args`` alone surfaces. Say it here instead, with the condition
+    named, the way ``reject_unsupported_dcp_geometry`` (Triton) and
+    ``reject_silently_inert_dcp`` (flashinfer) say theirs.
+
+    ``dcp_size > 1`` is the exact reachable condition, not a widening of it:
+
+    * Triton's target-verify arm gates on ``self.dcp_size > 1`` and raises
+      ``NotImplementedError`` for any spec input type outside the set -- even
+      and uneven DCP alike, because either way the pool rows are compact while
+      the non-DCP verify metadata builds GLOBAL allocator ids.
+    * flashinfer's split is an ``elif`` on ``uneven_dcp`` AND membership, so an
+      ngram verify misses it and drops into the generic spec branch, which
+      leaves ``use_ragged`` False while ``_forward_extend_dcp`` runs the ragged
+      stage unconditionally -> ``AttributeError`` (the shape DFLASH verify hit
+      before it joined the set). Its even-DCP case cannot arise:
+      ``reject_silently_inert_dcp`` already refuses a ``--dcp-size`` this
+      backend would ignore.
+
+    ``dcp_size <= 1`` is inert, which is what keeps every stock boot untouched.
+    """
+    if dcp_size <= 1:
+        return
+    raise ValueError(
+        f"Speculative algorithm 'ngram' cannot run under --dcp-size {dcp_size}: "
+        "NGRAM_VERIFY is not one of the target-verify layouts the decode-context-"
+        "parallel verify split serves (EAGLE_VERIFY, DFLASH_VERIFY). The split "
+        "assumes a uniform draft-token query block per request over a LINEAR "
+        "draft chain, while an ngram draft is a corpus-matched tree; reading the "
+        "committed prefix the non-DCP way would dereference GLOBAL allocator ids "
+        "against a compact token-sharded pool. Use --dcp-size 1, or a chain "
+        "speculative algorithm (eagle / mtp with --speculative-eagle-topk 1)."
+    )
+
+
 class NGRAMWorker(BaseSpecWorker):
     def alloc_memory_pool(self, **kwargs):
         # The target memory pool does not exist yet when __init__ runs.
@@ -58,6 +107,11 @@ class NGRAMWorker(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        # DCP GATE -- see reject_ngram_verify_under_dcp. First statement of
+        # __init__ on purpose: this is the earliest point that knows both
+        # "the algorithm is ngram" and "the DCP size", and the refusal must
+        # land before the corpus (capacity-sized) is allocated.
+        reject_ngram_verify_under_dcp(getattr(server_args, "dcp_size", 1))
         self.server_args = server_args
         self.enable_overlap = not server_args.disable_overlap_schedule
         self._target_worker = target_worker
