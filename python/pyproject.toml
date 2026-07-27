@@ -156,6 +156,10 @@ test = [
   "bitsandbytes",
   "pymupdf",
   "diff-cover",
+  # The planner dashboard is one embedded <script>; a syntax slip in it is
+  # invisible to every Python test and shows up only as a blank page. esprima
+  # parses it in test_webui.py so that break is caught in CI instead.
+  "esprima",
   "expecttest",
   "granian>=2.6.0",
   "jsonlines",

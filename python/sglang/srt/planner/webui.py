@@ -43,8 +43,9 @@ import dataclasses
 import json
 import os
 import re
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 __all__ = [
     "discover_knobs",
@@ -620,6 +621,10 @@ def _kv_by_concurrency(
     """Max-KV-tokens (and mamba pool, fit) at a ladder of concurrencies, so the
     UI can show how ``max_running_requests`` trades KV cache for parallel
     slots. Cheap re-plans; failures degrade to an absent row."""
+    # PlanRejected is caught below; without this import the rung raised
+    # NameError instead of degrading to an absent row, which is the exact
+    # opposite of what the handler was written to do.
+    from sglang.srt.planner.feasibility import PlanRejected
     from sglang.srt.planner.feasibility import plan as _plan
 
     rows = []
@@ -884,45 +889,6 @@ def gpu_state_payload() -> dict:
     except Exception:  # pragma: no cover - defensive
         pass
     return {"ok": True, "cards": cards}
-
-
-def live_snapshot_payload(payload: dict) -> dict:
-    """One /metrics scrape of a RUNNING target server (#149 live widget /
-    'measure against a running server'). The client polls this at its chosen
-    resolution and computes delta rates locally — the token counters are
-    already Prometheus counters, so prefill/s + decode/s are pure client deltas.
-
-    Also echoes the CLAMPED resolution so the widget cannot poll below the
-    ~30ms floor."""
-    from sglang.srt.planner.energy import (
-        clamp_live_resolution_ms,
-        fetch_live_snapshot,
-    )
-
-    target = (payload.get("target") or "").strip()
-    if not target:
-        return {"ok": False, "error": "no target server (host:port) given"}
-    if not target.startswith("http"):
-        target = "http://" + target
-    resolution_ms = clamp_live_resolution_ms(
-        payload.get("resolution_ms", 250.0))
-    try:
-        snap = fetch_live_snapshot(target)
-    except Exception as e:
-        return {"ok": False, "error": f"scrape of {target}/metrics failed: {e}"}
-    return {
-        "ok": True,
-        "resolution_ms": resolution_ms,
-        "snapshot": {
-            "t": snap.t,
-            "prompt_tokens_total": snap.prompt_tokens_total,
-            "generation_tokens_total": snap.generation_tokens_total,
-            "spec_accept_rate": snap.spec_accept_rate,
-            "spec_num_steps": snap.spec_num_steps,
-            "spec_ema_accept_len": snap.spec_ema_accept_len,
-            "gen_throughput": snap.gen_throughput,
-        },
-    }
 
 
 def scenario_payload(payload: dict) -> dict:
@@ -2020,15 +1986,329 @@ def resolve_flags_payload(payload: dict) -> dict:
     }
 
 
+def recompute_payload(payload: dict) -> dict:
+    """POST /api/recompute -> plan + placement + resolved field states, once.
+
+    Every dimension the fork exposes propagates to every dependent value, and
+    all of that arithmetic already exists server-side (feasibility.plan,
+    placement.compute_placement, flags.resolve). What did not exist was a way
+    to ask for all three about the SAME configuration.
+
+    The UI used to fire ``/api/plan``, ``/api/placement`` and
+    ``/api/resolve_flags`` in parallel on every edit. Three calls, three
+    independent latencies, no ordering: a slow placement answer could land on
+    top of a newer one and leave the panels describing two different
+    configurations at once. One call cannot disagree with itself, and it is
+    one round trip instead of three.
+
+    ``sections`` selects what to compute -- the simple view asks only for the
+    parts it shows. Each section reports its own error rather than failing
+    the whole answer, because a rejected plan must still be able to show the
+    per-field reasons that explain the rejection.
+    """
+    payload = payload or {}
+    want = payload.get("sections") or ["plan", "placement", "fields"]
+    out: Dict[str, Any] = {"ok": True}
+
+    if "plan" in want:
+        try:
+            out["plan"] = plan_from_payload(payload)
+        except Exception as e:  # pragma: no cover - defensive
+            out["plan"] = {"valid": False, "reasons": [str(e)]}
+
+    if "placement" in want:
+        pl = dict(payload.get("placement_request") or {})
+        pl.setdefault("model", payload.get("model"))
+        pl.setdefault("model_cfg", payload.get("model_cfg"))
+        pl.setdefault("gguf_choice", payload.get("gguf_choice"))
+        pl.setdefault("flags", payload.get("flags") or {})
+        try:
+            out["placement"] = placement_payload(pl)
+        except Exception as e:  # pragma: no cover - defensive
+            out["placement"] = {"ok": False, "error": str(e)}
+
+    if "fields" in want:
+        try:
+            out["fields"] = resolve_flags_payload(
+                {
+                    "settings": payload.get("settings") or payload.get("flags") or {},
+                    "model": payload.get("model"),
+                    "model_cfg": payload.get("model_cfg"),
+                    "gguf_choice": payload.get("gguf_choice"),
+                }
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            out["fields"] = {"ok": False, "error": str(e)}
+
+    return out
+
+
+def _measured_figures() -> Dict[str, str]:
+    """Short figures this rig actually measured, for the trade-off tooltips.
+
+    Only findings measured HERE produce a number. A finding carried over from
+    another rig, or none at all, leaves the entry absent, and
+    ``tooltips.describe`` then says the study has not been run rather than
+    quoting somebody else's hardware.
+    """
+    out: Dict[str, str] = {}
+    try:
+        from sglang.srt.planner import crossover as crossovermod
+
+        finding = crossovermod.load_finding()
+        if finding is not None and finding.provenance == crossovermod.MEASURED_HERE:
+            rows = [r for r in finding.break_even_table() if r.get("proposable")]
+            if rows:
+                best = max(rows, key=lambda r: r.get("prefill_gain_pct") or 0.0)
+                out["mlp_crossover"] = (
+                    f"{best['prefill_gain_pct']:+.1f}% prefill / "
+                    f"{best['decode_cost_pct']:+.1f}% decode at {best['vector']}"
+                )
+    except Exception:  # pragma: no cover - a missing finding is normal
+        pass
+    return out
+
+
+def tooltips_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/tooltips -> every control's what-it-gives / what-it-costs line.
+
+    One registry (``planner/tooltips.py``) feeds the flag surface, the
+    templates, the view switch and the simple-view sliders alike, so a
+    control's stated cost is written once and cannot drift between the four
+    places it is drawn. Served on its own endpoint as well as merged into the
+    flag catalog, so a CLI reads exactly the text the UI shows.
+    """
+    from sglang.srt.planner import tooltips as tipsmod
+
+    return {"ok": True, "tooltips": tipsmod.tooltip_map(_measured_figures())}
+
+
+def discussion_preview_payload(payload: dict) -> dict:
+    """POST /api/discussion_preview -> the exact Markdown, plus whether it could
+    be sent. Pure: no network, no token read beyond checking one exists."""
+    from sglang.srt.planner import discussion_export as dx
+
+    payload = payload or {}
+    try:
+        return dx.preview(
+            payload.get("data") or {},
+            payload.get("bundle") or "bench_system",
+            energy_groups=payload.get("energy_groups"),
+            target=payload.get("target"),
+        )
+    except dx.DiscussionError as e:
+        return {"ok": False, "error": str(e)}
+
+
+def discussion_submit_payload(payload: dict) -> dict:
+    """POST /api/discussion_submit -> post the previewed Markdown, if armed.
+
+    Gated by design: with no discussion configured this returns the preview
+    and reports "no target configured". Nothing is created automatically --
+    creating a discussion to post into is a decision for a human, not a side
+    effect of pressing a button.
+    """
+    from sglang.srt.planner import discussion_export as dx
+
+    payload = payload or {}
+    try:
+        return dx.submit(
+            payload.get("data") or {},
+            payload.get("bundle") or "bench_system",
+            energy_groups=payload.get("energy_groups"),
+            target=payload.get("target"),
+            confirmed=bool(payload.get("confirmed")),
+        )
+    except dx.DiscussionError as e:
+        # Already token-redacted by the module.
+        return {"ok": False, "error": str(e)}
+
+
+#: Last engine scrape per endpoint, so the lead metrics are a delta between
+#: two calls rather than a blocking sleep inside one. Same shape the landing
+#: strip uses client-side; kept here because ms-per-round needs the
+#: phase-labelled forward-time counter, which only the host-side scraper reads.
+_LEAD_PREV: Dict[str, tuple] = {}
+
+
+def bench_lead_metrics_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/bench_lead_metrics {endpoint} -> ms per round, from the engine.
+
+    ms/verify-round and ms/1k-prefill-tokens are the yardstick, not tok/s:
+    they say how long a round actually takes, which is what a change to the
+    split or the speculation depth moves. They come from the engine's
+    phase-labelled forward-time counter differenced across a window.
+
+    The window is the gap between two calls to this endpoint. Sampling twice
+    with a sleep in between would block a request for the length of the
+    window, and the caller is already polling.
+
+    A metric the engine did not export is ABSENT, never zero, and ``notes``
+    says why -- an empty column has to read as "the device timer was off"
+    rather than as "the round took no time".
+    """
+    from sglang.srt.rigmon.rates import phase_seconds, round_time
+    from sglang.srt.rigmon.sources import EngineScraper
+
+    endpoint = _norm_endpoint((payload or {}).get("endpoint") or "")
+    if not endpoint:
+        return {"ok": False, "error": "no endpoint given"}
+
+    scraper = EngineScraper(endpoint)
+    now = time.time()
+    try:
+        sample = scraper.scrape()
+    except Exception as e:
+        return {"ok": False, "error": f"scrape of {endpoint} failed: {e}"}
+    if not sample.up:
+        return {"ok": False, "error": sample.reason or "engine not reachable"}
+
+    prev = _LEAD_PREV.get(endpoint)
+    _LEAD_PREV[endpoint] = (now, sample)
+    if prev is None:
+        return {
+            "ok": True,
+            "metrics": {},
+            "notes": ["First sample: the round times appear on the next poll, "
+                      "because they are a delta across a window."],
+            "window_s": None,
+        }
+
+    prev_t, prev_sample = prev
+    dt = max(now - prev_t, 1e-6)
+    delta = phase_seconds(sample.per_rank_phase, prev_sample.per_rank_phase)
+    notes = []
+    if not delta:
+        notes.append(
+            "No phase-labelled forward time in this window: the round times "
+            "are absent, not zero. Boot the server with "
+            "SGLANG_ENABLE_METRICS_DEVICE_TIMER=1 (and "
+            "--enable-metrics-for-all-schedulers for the per-rank split)."
+        )
+    rt = round_time(sample.metrics, prev_sample.metrics, delta, dt)
+    metrics = {}
+    for key in ("ms_per_verify_round", "ms_per_decode_round",
+                "ms_per_1k_prefill_tokens", "ms_per_draft_pass",
+                "accept_length", "verify_ct"):
+        v = getattr(rt, key, None)
+        if v is not None:
+            metrics[key] = float(v)
+    if not metrics and not notes:
+        notes.append("Nothing moved in this window: the server was idle.")
+    return {
+        "ok": True,
+        "metrics": metrics,
+        "notes": notes,
+        "window_s": round(dt, 2),
+    }
+
+
+# ===========================================================================
+# Task #214 -- rig pairing. THIN adapters only.
+#
+# The flow itself lives in rigmon/pairing.py and runs on the host; these
+# functions map an HTTP call onto it and JSON-shape the answer. One endpoint
+# per step, each taking a small body, so `curl` is a complete client and the
+# dashboard has no privileged path. Nothing here computes anything.
+# ===========================================================================
+
+
+def rig_pair_start_payload(payload: dict) -> dict:
+    """POST /api/rig_pair/start {target} -> a session, held on the host."""
+    from sglang.srt.rigmon import pairing
+
+    target = ((payload or {}).get("target") or "").strip()
+    if not target:
+        return {
+            "ok": False,
+            "error": "no target given",
+            "remedy": "Pass the far rig's rigmon aggregator as host:port.",
+        }
+    try:
+        s = pairing.STORE.create(target)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "session": s.to_json()}
+
+
+def rig_pair_advance_payload(payload: dict) -> dict:
+    """POST /api/rig_pair/advance {session_id[, step]} -> returns immediately.
+
+    The step is started and the call returns; the caller polls
+    ``/api/rig_pair/status``. A slow or unreachable far rig therefore never
+    holds an HTTP request open, and a browser reload mid-step loses nothing
+    because the state is here rather than in the page.
+    """
+    from sglang.srt.rigmon import pairing
+
+    payload = payload or {}
+    sid = (payload.get("session_id") or "").strip()
+    try:
+        s = pairing.STORE.advance(sid, payload.get("step") or None)
+    except KeyError:
+        return {"ok": False, "error": f"no such pairing session: {sid}"}
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "session": s.to_json()}
+
+
+def rig_pair_status_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/rig_pair/status?session_id=... -> the whole flow state."""
+    from sglang.srt.rigmon import pairing
+
+    sid = ((payload or {}).get("session_id") or "").strip()
+    if not sid:
+        return {
+            "ok": True,
+            "sessions": [s.to_json() for s in pairing.STORE.list()],
+        }
+    s = pairing.STORE.get(sid)
+    if s is None:
+        return {"ok": False, "error": f"no such pairing session: {sid}"}
+    return {"ok": True, "session": s.to_json()}
+
+
+def rig_pair_reset_payload(payload: dict) -> dict:
+    """POST /api/rig_pair/reset {session_id} -> clear the results, keep target.
+
+    Retrying after fixing whatever a remedy named is the normal path, so it
+    gets its own verb rather than making the caller start a fresh session and
+    retype the target.
+    """
+    from sglang.srt.rigmon import pairing
+
+    sid = ((payload or {}).get("session_id") or "").strip()
+    s = pairing.STORE.reset(sid)
+    if s is None:
+        return {"ok": False, "error": f"no such pairing session: {sid}"}
+    return {"ok": True, "session": s.to_json()}
+
+
 def flag_catalog_payload(payload: Optional[dict] = None) -> dict:
     """GET /api/flag_catalog -> the full flag catalog metadata, grouped, for
-    rendering the runner-tab flag surface (help / hover / dropdown options)."""
-    from sglang.srt.planner import flags as flagsmod
+    rendering the runner-tab flag surface (help / hover / dropdown options).
 
+    Each entry also carries its ``tradeoff`` line -- what the knob buys and
+    what it costs -- resolved from the central registry in ``tooltips.py``,
+    plus ``tradeoff_by_value`` for enums whose options pull in opposite
+    directions (``rank_kv_ratio`` capacity against speed, say). The UI renders
+    what it is given and holds no copy of the text.
+    """
+    from sglang.srt.planner import flags as flagsmod
+    from sglang.srt.planner import tooltips as tipsmod
+
+    measured = _measured_figures()
     cat = flagsmod.catalog()
     groups: Dict[str, List[dict]] = {}
     for cid, spec in cat.items():
+        by_value = {}
+        for allowed in (spec.allowed or ()):
+            txt = tipsmod.describe(f"{spec.id}={allowed}", measurements=measured)
+            if txt:
+                by_value[str(allowed)] = txt
         groups.setdefault(spec.group, []).append({
+            "tradeoff": tipsmod.describe(spec.id, measurements=measured),
+            "tradeoff_by_value": by_value,
             "id": spec.id,
             "name": spec.name,
             "type": spec.type,
@@ -2049,6 +2329,7 @@ def flag_catalog_payload(payload: Optional[dict] = None) -> dict:
     return {
         "ok": True,
         "groups": ordered,
+        "tooltips": tipsmod.tooltip_map(measured),
         "upstream_count": flagsmod.upstream_count(),
         "fork_count": flagsmod.fork_count(),
     }
@@ -2656,6 +2937,21 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
+        if self.path.startswith("/api/rig_pair/status"):
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, rig_pair_status_payload(q))
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/tooltips"):
+            try:
+                self._json(200, tooltips_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
         if self.path.startswith("/api/flag_catalog"):
             try:
                 self._json(200, flag_catalog_payload())
@@ -2749,9 +3045,6 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/landscape"):
                 self._json(200, landscape_from_payload(payload))
                 return
-            if self.path.startswith("/api/live"):
-                self._json(200, live_snapshot_payload(payload))
-                return
             if self.path.startswith("/api/scenario"):
                 self._json(200, scenario_payload(payload))
                 return
@@ -2790,6 +3083,27 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/resolve_flags"):
                 self._json(200, resolve_flags_payload(payload))
+                return
+            if self.path.startswith("/api/discussion_preview"):
+                self._json(200, discussion_preview_payload(payload))
+                return
+            if self.path.startswith("/api/discussion_submit"):
+                self._json(200, discussion_submit_payload(payload))
+                return
+            if self.path.startswith("/api/bench_lead_metrics"):
+                self._json(200, bench_lead_metrics_payload(payload))
+                return
+            if self.path.startswith("/api/rig_pair/start"):
+                self._json(200, rig_pair_start_payload(payload))
+                return
+            if self.path.startswith("/api/rig_pair/advance"):
+                self._json(200, rig_pair_advance_payload(payload))
+                return
+            if self.path.startswith("/api/rig_pair/reset"):
+                self._json(200, rig_pair_reset_payload(payload))
+                return
+            if self.path.startswith("/api/recompute"):
+                self._json(200, recompute_payload(payload))
                 return
             if self.path.startswith("/api/config_profiles"):
                 self._json(200, config_profiles_save(payload))
@@ -2846,7 +3160,21 @@ def serve(host: str = "127.0.0.1", port: int = 8780) -> None:
 # The single HTML page (inline CSS + JS, no CDN, self-contained).
 # ===========================================================================
 
-INDEX_HTML = r"""<!doctype html>
+_ASSET_DIR = os.path.join(os.path.dirname(__file__), "assets")
+
+
+def _vendored_js(name: str) -> str:
+    """Read a vendored front-end asset for inlining into the page.
+
+    The dashboard serves one self-contained page and makes no external
+    requests, so third-party JavaScript is inlined rather than linked. See
+    ``assets/README.md`` for what is vendored and why.
+    """
+    with open(os.path.join(_ASSET_DIR, name), encoding="utf-8") as f:
+        return f.read()
+
+
+_INDEX_TEMPLATE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -3077,12 +3405,77 @@ INDEX_HTML = r"""<!doctype html>
      pixel bucket; never stretched by CSS (stretching would alias samples). */
   .mtile svg.spk { display: block; margin-top: .25rem; background: #0d1117;
                    border-radius: 3px; max-width: 100%; }
+
+  /* ---- refresh affordance -------------------------------------------------
+     A panel waiting on a slow backend call keeps showing its previous
+     numbers, dimmed. Stale-while-revalidate, not a spinner that blanks the
+     panel and throws away what the reader was looking at. The transition is
+     short enough that a fast answer never registers as a flicker. */
+  .stale { opacity: .55; transition: opacity .12s linear; }
+  .stale-note { font-size: .62rem; color: #8b96a5; }
+  /* A backend call that failed or timed out. The panel keeps its last good
+     content; this line says why it is no longer moving. */
+  .rev-error { font-size: .68rem; color: #d29922; margin-top: .25rem; }
+
+  /* ---- simple / expert -----------------------------------------------------
+     Two densities of the same page, not two different pages. Expert ADDS
+     dimensions; it never changes what a control shared by both means. */
+  .hdr { display: flex; align-items: flex-start; justify-content: space-between;
+         gap: 1rem; flex-wrap: wrap; }
+  .vmode { display: flex; border: 1px solid #30363d; border-radius: 7px;
+           overflow: hidden; flex: none; margin-top: .2rem; }
+  .vmode .vm { background: #12171e; color: #8b96a5; border: 0;
+               padding: .3rem .8rem; font: inherit; font-size: .74rem;
+               cursor: pointer; }
+  .vmode .vm.on { background: #1f6feb; color: #fff; }
+  .vmode .vm:not(.on):hover { color: #e6edf3; }
+  /* Visibility is driven by one class on <body>, so no panel has to know
+     which mode it is in and a mode switch touches no backend call. */
+  body.mode-simple .expert-only { display: none !important; }
+  body.mode-expert .simple-only { display: none !important; }
+
+  /* ---- simple view: one bar and one budget slider per card ---------------- */
+  .cardsimple { border: 1px solid #263041; border-radius: 8px;
+                padding: .5rem .6rem; margin: .4rem 0; background: #12171e; }
+  .cardsimple .cs-h { display: flex; justify-content: space-between;
+                      align-items: baseline; gap: .5rem; flex-wrap: wrap; }
+  .cardsimple .cs-n { font-weight: 600; color: #e6edf3; }
+  .cardsimple .cs-u { font-size: .72rem; color: #8b96a5; white-space: nowrap; }
+  /* One bar = everything the configuration puts on this card. The granular
+     split is the expert view's job; here the number is the whole point. */
+  .csbar { position: relative; height: 20px; border-radius: 4px;
+           background: #0d1117; border: 1px solid #263041; overflow: hidden;
+           margin: .35rem 0 .3rem; }
+  .csbar .fill { position: absolute; inset: 0 auto 0 0; background: #1f6feb; }
+  .csbar .fill.over { background: #f85149; }
+  .csbar .fill.tight { background: #d29922; }
+  /* The budget the user set, drawn as a line across the bar: the reader can
+     see at a glance whether the configuration sits under it or over it. */
+  .csbar .cap { position: absolute; top: 0; bottom: 0; width: 2px;
+                background: #e6edf3; }
+  .csrow { display: flex; align-items: center; gap: .5rem; }
+  .csrow input[type=range] { flex: 1 1 auto; min-width: 8rem; }
+  .csrow .cs-v { font-size: .72rem; color: #8b96a5; min-width: 7.5rem;
+                 text-align: right; white-space: nowrap; }
 </style>
 </head>
 <body>
-<h1>htsglang offline config planner</h1>
-<div class="sub">capacity / feasibility / split &mdash; never estimated throughput.
-  Every edit re-runs the same planner the server runs. No GPU touched.</div>
+<div class="hdr">
+  <div>
+    <h1>htsglang offline config planner</h1>
+    <div class="sub">capacity / feasibility / split &mdash; never estimated throughput.
+      Every edit re-runs the same planner the server runs. No GPU touched.</div>
+  </div>
+  <!-- Simple vs expert. Not a hiding place for broken controls: expert adds
+       dimensions, it never changes what a shared control means. The choice
+       persists, so the page opens the way it was left. -->
+  <div class="vmode" id="view_mode">
+    <button id="vm_simple" class="vm" onclick="setViewMode('simple')"
+            title="per-card VRAM as one number, one budget slider per card">simple</button>
+    <button id="vm_expert" class="vm" onclick="setViewMode('expert')"
+            title="the granular VRAM breakdown and every dimension the fork exposes">expert</button>
+  </div>
+</div>
 
 <div class="tabs">
   <button id="tab_landing" class="tab active" onclick="showTab('landing')">Landing (live monitor)</button>
@@ -3092,6 +3485,32 @@ INDEX_HTML = r"""<!doctype html>
   <button id="tab_landscape" class="tab" onclick="showTab('landscape')">Landscape (benchmark DB)</button>
   <button id="tab_energy" class="tab" onclick="showTab('energy')">Energy (calibration)</button>
   <button id="tab_quality" class="tab" onclick="showTab('quality')">Quality</button>
+  <button id="tab_pair" class="tab" onclick="showTab('pair')">Couple a rig</button>
+</div>
+
+<div id="view_pair" style="display:none">
+  <div class="sub">Couple a second rig, one step at a time. Every step runs on
+    this host &mdash; reachability, the compatibility gate, the transport
+    choice and the configuration are all computed here, exactly like telemetry
+    collection and plan computation are. This page only sends the command and
+    shows what came back, so the same flow is drivable from a script, and
+    reloading the browser resumes rather than restarts.
+    <b>Nothing is booted across rigs</b>: the flow ends at a configuration.</div>
+  <fieldset>
+    <legend>far rig</legend>
+    <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap">
+      <input id="pair_target" placeholder="far rig's rigmon aggregator — host:port"
+        style="max-width:24rem">
+      <button class="mini" onclick="pairStart()">couple</button>
+      <button class="mini secondary" onclick="pairReset()"
+        title="clear the results and run the steps again against the same rig">retry</button>
+      <span id="pair_note" class="muted"></span>
+    </div>
+    <div class="legend" style="margin-top:.3rem">The far rig needs its rigmon
+      aggregator running (<code>python -m sglang.srt.rigmon serve</code>). Only
+      its read-only endpoints are touched; nothing is pushed or changed there.</div>
+  </fieldset>
+  <div id="pair_steps"><span class="muted">enter a rig above to begin.</span></div>
 </div>
 
 <div id="view_landing">
@@ -3198,10 +3617,46 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div id="sh_out" class="muted" style="margin-top:.4rem"></div>
       </fieldset>
+      <fieldset>
+        <legend>share in a GitHub discussion</legend>
+        <div class="muted" style="margin-bottom:.4rem">Pick a bundle, read the
+          preview, then send. System details always pass through the
+          redaction: card models and driver versions go, host names, addresses
+          and paths do not. <b>Nothing is created automatically</b> &mdash;
+          with no discussion configured this builds the preview and says so.</div>
+        <label>bundle</label>
+        <select id="dx_bundle" onchange="discussionPreview()"></select>
+        <div id="dx_bundle_note" class="muted" style="font-size:.68rem;margin:.2rem 0"></div>
+        <label>energy metrics</label>
+        <div id="dx_groups" class="muted" style="font-size:.7rem"></div>
+        <div style="margin-top:.4rem"><button class="secondary" onclick="discussionPreview()">Build preview</button></div>
+        <div id="dx_wrap" style="display:none;margin-top:.5rem">
+          <div class="muted">this exact markdown would be posted:</div>
+          <pre id="dx_preview" style="max-height:300px;overflow:auto"></pre>
+          <div id="dx_gate" class="muted"></div>
+          <div class="actions" style="margin-top:.4rem">
+            <button onclick="discussionSubmit()" id="dx_btn">Confirm + post</button>
+          </div>
+        </div>
+        <div id="dx_out" class="muted" style="margin-top:.4rem"></div>
+      </fieldset>
     </div>
     <div>
+      <!-- Lead metrics: how long a round TAKES. tok/s hides which phase moved;
+           ms per verify round and ms per 1k prefill tokens do not. Absent is
+           shown as absent, never as zero. -->
       <fieldset>
-        <legend>results (streamed per test)</legend>
+        <legend>lead metrics &mdash; ms per round</legend>
+        <div id="bn_lead" class="muted">start a run, or point at a busy server&hellip;</div>
+      </fieldset>
+      <!-- Running and finished are separated, so a finished table is never
+           silently a partial one. -->
+      <fieldset id="bn_running_box" style="display:none">
+        <legend>running</legend>
+        <div id="bn_running"></div>
+      </fieldset>
+      <fieldset>
+        <legend>finished runs</legend>
         <div id="bn_out" class="muted">no run yet.</div>
       </fieldset>
     </div>
@@ -3402,13 +3857,59 @@ INDEX_HTML = r"""<!doctype html>
   <div id="model_info" class="muted" style="margin-top:.4rem;word-break:break-all"></div>
 </fieldset>
 
-<div class="cols runner">
+<!-- ===================================================================== -->
+<!-- SIMPLE view: per card, how much VRAM this configuration uses, and one -->
+<!-- slider for how much it is ALLOWED to use. Everything else is derived  -->
+<!-- server-side and shown as the verdict. The granular breakdown, the     -->
+<!-- ratios and the full flag surface are the expert view's business.      -->
+<!-- ===================================================================== -->
+<div class="simple-only">
+  <fieldset>
+    <legend>VRAM per card &mdash; usage and budget</legend>
+    <div id="simple_cards" class="muted">pick a model above&hellip;</div>
+    <div class="legend" style="margin-top:.35rem">The slider is each card's
+      budget: how much of it this server may take. What the configuration
+      actually needs is the bar. A budget below the bar is not refused here
+      &mdash; it is reported, with the reason, in the verdict.</div>
+  </fieldset>
+  <fieldset>
+    <legend>verdict</legend>
+    <div id="simple_verdict" class="muted">waiting for a model&hellip;</div>
+  </fieldset>
+  <div class="actions" style="align-items:center;margin:.5rem 0">
+    <button onclick="serverStart()">Load model</button>
+    <button class="secondary" onclick="serverStop()">Eject</button>
+    <span class="chip" id="simple_status_chip">stopped</span>
+    <span id="simple_status_note" class="muted"></span>
+  </div>
+</div>
+
+<div class="cols runner expert-only">
   <div>
     <!-- preset bar: dropdown + save, directly above the settings panel -->
     <fieldset>
       <legend>preset &mdash; fills the settings rows below; adaptive MTP is
         always on when the checkpoint has draft layers</legend>
       <div id="profile_pick" class="muted">select a model to list presets&hellip;</div>
+      <!-- Tuning objective: the same trio the fork's --rank-perf-tune takes.
+           A template is a STARTING POINT. Applying one seeds the controls;
+           the controls keep their full range afterwards, and the limits stay
+           the hard rejects, never the value the template happened to set. -->
+      <div style="margin-top:.5rem">
+        <label>tuning objective <span class="muted">(template &mdash; a starting
+          point, not a ceiling)</span></label>
+        <div id="tune_pick" style="display:flex;gap:.3rem;flex-wrap:wrap;margin-top:.2rem">
+          <button class="mini secondary" id="tune_both" onclick="applyTune('both')"
+            title="prefill and concurrent throughput together (the default)">balanced</button>
+          <button class="mini secondary" id="tune_maxkv" onclick="applyTune('maxkv')"
+            title="maximum context: give the KV cache everything that is left">max KV</button>
+          <button class="mini secondary" id="tune_dec" onclick="applyTune('dec')"
+            title="decode throughput">max decode</button>
+          <button class="mini secondary" id="tune_enc" onclick="applyTune('enc')"
+            title="prefill throughput">max prefill</button>
+        </div>
+        <div id="tune_note" class="muted" style="font-size:.68rem;margin-top:.2rem"></div>
+      </div>
       <div style="display:flex;gap:.4rem;margin-top:.4rem;align-items:center">
         <input id="profile_save_name" placeholder="save current settings as&hellip;" style="max-width:60%">
         <button class="secondary mini" onclick="saveProfile()">save preset</button>
@@ -3446,9 +3947,10 @@ INDEX_HTML = r"""<!doctype html>
               <span class="chg" title="changed from preset"></span></span>
             <input type="range" id="mrr_slider" min="1" max="64" step="1" value="1"
               oninput="mrrFromSlider()">
+            <span id="mrr_max" class="muted" style="font-size:.62rem"></span>
             <input type="number" id="max_running_requests" class="num"
               placeholder="auto" onchange="mrrFromNum()">
-            <span class="qmark" title="Concurrent request slots. 1 = single-user = largest KV; raising it grows the GDN/mamba pool and shrinks max context (see the KV-vs-concurrency table in the plan result). Blank: plan 1, launch 16.">?</span>
+            <span class="qmark" title="Concurrent request slots. 1 = single-user = largest KV; raising it grows the GDN/mamba pool and shrinks max context (see the KV-vs-concurrency table in the plan result). The slider range follows what the plan reports as fitting; the numeric field is free, and a value that does not fit is REJECTED with a reason rather than silently clamped. Blank: plan 1, launch 16.">?</span>
           </div>
           <div id="secflags_context"></div>
         </div>
@@ -3665,7 +4167,228 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 
 <script>
+/*__VENDOR_MORPHDOM__*/
 const $ = id => document.getElementById(id);
+
+// ===========================================================================
+// Update foundation.
+//
+// The rule this section exists to enforce: a refresh changes numbers and
+// nothing else. It never closes a collapse the reader opened, never discards
+// a scroll position, never overwrites a field that is being typed into, and
+// never lets a slow answer land on top of a newer one.
+//
+// Panels are still described as HTML strings -- that part of the existing
+// design is fine and keeps rendering readable -- but the string is now
+// diffed against the live tree instead of replacing it. Surviving nodes keep
+// their identity, and with it every piece of state the browser hangs off a
+// node rather than off its markup: <details open>, scrollTop, focus,
+// selection range, and the current value of an input.
+//
+// The tree diff is morphdom (MIT, vendored, inlined above -- see
+// assets/README.md). It supplies the algorithm; the rules below about what
+// must survive an update are ours and live in the onBeforeElUpdated hook.
+// ===========================================================================
+
+// Fields carry live state that markup does not describe.
+function _isField(n){
+  const t=n&&n.tagName;
+  return t==='INPUT'||t==='TEXTAREA'||t==='SELECT';
+}
+
+// True when the node is, or contains, whatever the user is working in.
+function _busy(node){
+  const a=document.activeElement;
+  if(!a||a===document.body) return false;
+  return node===a||(node.contains&&node.contains(a));
+}
+
+// Node identity for re-matching across renders: morphdom keys on id by
+// default; data-key extends that to nodes that have no business owning a
+// global id (the two collapses inside the landing start-config block).
+function _nodeKey(n){
+  if(!n||n.nodeType!==1) return '';
+  return n.id||n.getAttribute('data-key')||'';
+}
+
+// The policy hook. Returning false tells morphdom to leave the node and its
+// subtree exactly as they are.
+function _beforeElUpdated(fromEl,toEl){
+  // A field being edited is untouchable -- re-enabling or re-labelling it
+  // mid-keystroke is exactly the sort of false update this rework removes.
+  if(_isField(fromEl)&&_busy(fromEl)) return false;
+  // The open state of a collapse belongs to the reader, not to the renderer.
+  // Deliberate opens go through openDetails(), which is not undone here.
+  if(fromEl.tagName==='DETAILS'&&fromEl.open!==toEl.open){
+    if(fromEl.open) toEl.setAttribute('open',''); else toEl.removeAttribute('open');
+  }
+  // Scroll positions survive: a <pre> the reader scrolled through must not
+  // jump back to the top because a number above it changed.
+  if(fromEl.scrollTop||fromEl.scrollLeft){
+    const t=fromEl.scrollTop, l=fromEl.scrollLeft;
+    _restore.push(()=>{ fromEl.scrollTop=t; fromEl.scrollLeft=l; });
+  }
+  return true;
+}
+let _restore=[];
+
+// The replacement for `el.innerHTML = html`.
+//
+// Two short-circuits before any DOM work: identical markup does nothing at
+// all (this is what makes a 2 s poll free when nothing moved), and a panel
+// the user is typing inside is deferred until focus leaves it.
+function setHTML(el,html){
+  if(!el) return;
+  if(el._lastHTML===html) return;
+  if(_busy(el)&&_isField(document.activeElement)){
+    el._pendingHTML=html;
+    if(!el._flushBound){
+      el._flushBound=true;
+      el.addEventListener('focusout',()=>{
+        setTimeout(()=>{
+          if(el._pendingHTML!=null&&!_busy(el)){
+            const h=el._pendingHTML; el._pendingHTML=null; setHTML(el,h);
+          }
+        },0);
+      });
+    }
+    return;
+  }
+  el._pendingHTML=null;
+  const act=document.activeElement;
+  const sel=(act&&_isField(act)&&act.selectionStart!=null)
+    ?{s:act.selectionStart,e:act.selectionEnd}:null;
+  // childrenOnly: `el` itself is the container the caller owns; only its
+  // contents are described by `html`.
+  const holder=document.createElement(el.tagName==='SELECT'?'select':'div');
+  holder.innerHTML=html;
+  // Rebuilding a <select>'s own option list: the options are markup, the
+  // selection is state. morphdom's SELECT handler derives selectedIndex from
+  // the incoming markup, so the selection is put back explicitly afterwards
+  // if it is still on offer.
+  const wasSel=(el.tagName==='SELECT')?el.value:null;
+  _restore=[];
+  morphdom(el,holder,{childrenOnly:true, getNodeKey:_nodeKey,
+                      onBeforeElUpdated:_beforeElUpdated});
+  for(const f of _restore) f();
+  _restore=[];
+  if(wasSel!=null&&Array.prototype.some.call(el.options,o=>o.value===wasSel))
+    el.value=wasSel;
+  if(act&&document.contains(act)&&document.activeElement!==act){
+    try{
+      act.focus();
+      if(sel&&act.setSelectionRange) act.setSelectionRange(sel.s,sel.e);
+    }catch(e){}
+  }
+  el._lastHTML=html;
+}
+
+// A deliberate open, e.g. "the boot failed, show the log". Recorded so a
+// later poll does not keep re-opening what the reader closed again.
+function openDetails(el){
+  if(!el||el._autoOpened) return;
+  el._autoOpened=true;
+  el.open=true;
+}
+
+// ---- backend calls --------------------------------------------------------
+// Every call is bounded and cancellable. `key` names a logical slot: issuing
+// a second call under the same key aborts the first, so the answer that
+// lands is always the answer to the newest question.
+const API_TIMEOUT_MS=15000;
+window._inflight={};
+async function api(path,opts){
+  opts=opts||{};
+  const key=opts.key||path;
+  const prev=window._inflight[key];
+  if(prev){ try{ prev.abort(); }catch(e){} }
+  const ac=new AbortController();
+  window._inflight[key]=ac;
+  const timer=setTimeout(()=>{ try{ ac.abort(); }catch(e){} },
+                         opts.timeout||API_TIMEOUT_MS);
+  try{
+    const init={signal:ac.signal};
+    if(opts.body!==undefined){
+      init.method=opts.method||'POST';
+      init.body=JSON.stringify(opts.body);
+    } else if(opts.method) init.method=opts.method;
+    const r=await fetch(path,init);
+    return await r.json();
+  } finally {
+    clearTimeout(timer);
+    if(window._inflight[key]===ac) delete window._inflight[key];
+  }
+}
+// An aborted call is a superseded or timed-out call, never a real failure --
+// callers use this to stay quiet instead of painting an error over good data.
+function apiAborted(e){
+  return !!e&&(e.name==='AbortError'||e.name==='TimeoutError');
+}
+function apiError(e){ return apiAborted(e)?'':(''+(e&&e.message||e)); }
+
+// Mark a panel as refreshing without replacing what it shows.
+//
+// The dim engages only after STALE_AFTER_MS, so a fast answer -- which is
+// the normal case -- produces no visible change at all. Flashing a panel on
+// every 2 s poll would be its own kind of jitter, and a spinner that blanks
+// the panel would throw away the numbers the reader is looking at.
+const STALE_AFTER_MS=250;
+function stale(el,on){
+  if(!el) return;
+  if(on===false){
+    if(el._staleTimer){ clearTimeout(el._staleTimer); el._staleTimer=null; }
+    el.classList.remove('stale');
+    return;
+  }
+  if(el._staleTimer) return;
+  el._staleTimer=setTimeout(()=>{ el._staleTimer=null; el.classList.add('stale'); },
+                            STALE_AFTER_MS);
+}
+
+// One debounce implementation. Every control that triggers a backend call
+// on each tick (sliders above all) goes through it.
+function debounce(fn,ms){
+  let t=null;
+  return function(){
+    const args=arguments, self=this;
+    if(t) clearTimeout(t);
+    t=setTimeout(()=>{ t=null; fn.apply(self,args); },ms);
+  };
+}
+
+// ===========================================================================
+// Simple / expert.
+//
+// Two densities of one page, not two pages. Visibility is a single class on
+// <body>, so no panel has to know which mode it is in and switching costs no
+// backend call. Controls hidden in simple mode keep their values and are
+// still read when the configuration is assembled -- expert ADDS dimensions,
+// it never changes what a shared control means.
+// ===========================================================================
+const VIEW_MODES=['simple','expert'];
+function viewMode(){
+  try{
+    const m=localStorage.getItem('view_mode');
+    if(VIEW_MODES.indexOf(m)>=0) return m;
+  }catch(e){}
+  return 'simple';
+}
+function setViewMode(m){
+  if(VIEW_MODES.indexOf(m)<0) m='simple';
+  try{ localStorage.setItem('view_mode',m); }catch(e){}
+  applyViewMode();
+}
+function applyViewMode(){
+  const m=viewMode();
+  document.body.classList.toggle('mode-simple', m==='simple');
+  document.body.classList.toggle('mode-expert', m==='expert');
+  for(const k of VIEW_MODES){
+    const b=$('vm_'+k); if(b) b.classList.toggle('on', k===m);
+  }
+  // The mode decides which panels are worth computing, so a switch asks for
+  // the sections the newly visible panels need.
+  scheduleRecompute();
+}
 
 // Serving identity is owned by the MODEL selector + the SERVING form group,
 // NOT by the flag surface -- these catalog ids are hidden there and routed to
@@ -3827,7 +4550,7 @@ async function onModelChange() {
   if (opts.length) {
     window._modelMeta = {format:'gguf', variants: opts.map(o=>({filename:o}))};
     if (opts.length > 1) {
-      $('gguf_choice').innerHTML = opts.map(o=>'<option value="'+esc(o)+'">'+esc(o)+'</option>').join('');
+      setHTML($('gguf_choice'), opts.map(o=>'<option value="'+esc(o)+'">'+esc(o)+'</option>').join(''));
       $('gguf_pick').style.display = '';
     }
   }
@@ -3925,12 +4648,13 @@ async function doPlan() {
   $('verdict').innerHTML = '<div class="verdict">sizing…</div>';
   $('split').innerHTML = '';
   try {
-    const r = await fetch('/api/plan', {method:'POST', body: JSON.stringify(payload())});
-    const d = await r.json();
+    const d = await api('/api/plan', {key:'plan', body:payload()});
     render(d);
   } catch (e) {
+    // Superseded by a newer edit: the newer plan owns the panel, say nothing.
+    if (apiAborted(e)) return;
     $('verdict').innerHTML = '<div class="verdict nofit">PLAN ERROR</div>';
-    $('split').innerHTML = '<ul class="reasons"><li>' + esc(String(e)) + '</li></ul>';
+    $('split').innerHTML = '<ul class="reasons"><li>' + esc(apiError(e)) + '</li></ul>';
   }
 }
 
@@ -3948,6 +4672,11 @@ function render(d) {
   const off = d.offload;
   // context-length slider: clamp to the plan's capacity max when known.
   setCtxCap(cap ? cap.max_context_tokens : null);
+  // concurrency slider: the range follows the highest rung the planner
+  // reports as fitting, doubled so the reader can walk past it and see the
+  // rejection with its reason. A limit is a hard reject, not a preset value.
+  const rungs=(d.kv_by_concurrency||[]).filter(r=>r.fits).map(r=>r.concurrency);
+  setMrrCap(rungs.length? Math.max(64, Math.max.apply(null,rungs)*2) : 64);
   // Three honest states: fits-in-VRAM (fast) / fits-with-RAM-offload (slower,
   // PCIe-bound) / genuinely cannot fit (design §PART 4).
   if (d.fits) {
@@ -4408,7 +5137,7 @@ async function doIssue(kind) {
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
 function showTab(t) {
-  const TABS = ['landing','runner','bench','explore','landscape','energy','quality'];
+  const TABS = ['landing','runner','bench','explore','landscape','energy','quality','pair'];
   for (const v of TABS) $('view_'+v).style.display = t===v ? '' : 'none';
   for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
   if ((t==='explore'||t==='landscape') && !window._profLoaded) loadProfiles();
@@ -4419,8 +5148,186 @@ function showTab(t) {
     loadFlagCatalog(); refreshServerStatus();
   }
   if (t==='bench' && !window._benchInit) { window._benchInit=true; benchInit(); }
+  // The lead-metric poll runs only while its tab is visible.
+  if (t!=='bench') benchLeadStop();
+  // Pairing state lives on the host, so entering the tab READS it rather than
+  // creating anything -- a flow started from a script shows up here.
+  if (t==='pair') pairRefresh(); else pairStopPoll();
   // The landing page live-poll runs only while its tab is visible.
   if (t==='landing') startLanding(); else stopLanding();
+}
+
+// ===========================================================================
+// Task #214 -- couple a rig. STEERING ONLY.
+//
+// Every decision in this flow is made on the host: whether the far rig is
+// reachable, whether the two are compatible, which transport the measurements
+// support, what the resulting configuration is. This code posts a command and
+// renders the state that comes back. It contains no rule about what makes a
+// pairing valid, and it must not grow one -- the same flow has to behave
+// identically when driven by a shell script, and a rule that lives here would
+// simply be absent there.
+//
+// Consequently the session id is the only client-side state, and it is kept
+// in localStorage so a reload rejoins a flow already running on the host.
+// ===========================================================================
+const PAIR_POLL_MS=1200;
+window._pairTimer=null;
+function pairSession(){
+  try{ return localStorage.getItem('pair_session')||''; }catch(e){ return ''; }
+}
+function setPairSession(id){
+  try{ if(id) localStorage.setItem('pair_session',id);
+       else localStorage.removeItem('pair_session'); }catch(e){}
+}
+function pairStopPoll(){
+  if(window._pairTimer){ clearInterval(window._pairTimer); window._pairTimer=null; }
+}
+function pairStartPoll(){
+  if(window._pairTimer) return;
+  window._pairTimer=setInterval(pairRefresh, PAIR_POLL_MS);
+}
+async function pairStart(){
+  const target=$('pair_target').value.trim();
+  if(!target){ $('pair_note').textContent='enter the far rig as host:port.'; return; }
+  $('pair_note').textContent='creating session…';
+  try{
+    const d=await api('/api/rig_pair/start',{key:'pair', body:{target}});
+    if(!d.ok){ $('pair_note').textContent=d.error+(d.remedy?(' — '+d.remedy):''); return; }
+    setPairSession(d.session.session_id);
+    renderPair(d.session);
+    pairAdvance();
+  }catch(e){ if(!apiAborted(e)) $('pair_note').textContent=apiError(e); }
+}
+async function pairAdvance(step){
+  const sid=pairSession(); if(!sid) return;
+  try{
+    const d=await api('/api/rig_pair/advance',
+      {key:'pair_advance', body:{session_id:sid, step:step||null}});
+    if(d.ok){ renderPair(d.session); pairStartPoll(); }
+    else $('pair_note').textContent=d.error;
+  }catch(e){ if(!apiAborted(e)) $('pair_note').textContent=apiError(e); }
+}
+async function pairReset(){
+  const sid=pairSession(); if(!sid) return;
+  try{
+    const d=await api('/api/rig_pair/reset',{key:'pair', body:{session_id:sid}});
+    if(d.ok) renderPair(d.session);
+  }catch(e){ if(!apiAborted(e)) $('pair_note').textContent=apiError(e); }
+}
+async function pairRefresh(){
+  const sid=pairSession();
+  if(!sid){ setHTML($('pair_steps'),'<span class="muted">enter a rig above to begin.</span>'); return; }
+  try{
+    const d=await api('/api/rig_pair/status?session_id='+encodeURIComponent(sid),
+                      {key:'pair_status', timeout:PAIR_POLL_MS-200});
+    if(!d.ok){ setPairSession(''); pairStopPoll(); return; }
+    renderPair(d.session);
+  }catch(e){}
+}
+const PAIR_TITLES={
+  reach:'1 — reach the far rig',
+  gate:'2 — compatibility gate',
+  transport:'3 — transport',
+  config:'4 — start configuration',
+};
+function pairStateClass(st){
+  if(st==='ok') return 'fitc';
+  if(st==='blocked'||st==='error') return 'nofitc';
+  return 'muted';
+}
+function renderPair(s){
+  if(!s) return;
+  if($('pair_target')!==document.activeElement && !$('pair_target').value)
+    $('pair_target').value=s.target||'';
+  $('pair_note').innerHTML='session <code>'+esc(s.session_id)+'</code> &mdash; '
+    +(s.complete?'complete':('next: '+esc(s.next_step||'—')));
+  // The host says which step runs next, so the poll simply stops when it
+  // says there is nothing running.
+  const running=(s.steps||[]).some(x=>x.state==='running');
+  if(!running) pairStopPoll();
+  let h='';
+  for(const st of (s.steps||[])){
+    const t=PAIR_TITLES[st.step]||st.step;
+    h+='<fieldset data-key="pairstep_'+st.step+'"><legend>'+esc(t)
+      +' <span class="'+pairStateClass(st.state)+'">'+esc(st.state)+'</span></legend>';
+    if(st.error)
+      h+='<div class="reasons">'+esc(st.error)+'</div>';
+    if(st.remedy)
+      h+='<div class="adv"><b>remedy:</b> '+esc(st.remedy)+'</div>';
+    h+=pairStepBody(st);
+    if(st.state==='pending'||st.state==='blocked'||st.state==='error')
+      h+='<div class="actions" style="margin-top:.4rem">'
+        +'<button class="mini" onclick="pairAdvance(\''+st.step+'\')">'
+        +(st.state==='pending'?'run this step':'run again')+'</button></div>';
+    h+='</fieldset>';
+  }
+  setHTML($('pair_steps'), h);
+}
+function pairStepBody(st){
+  const d=st.detail||{};
+  if(st.step==='reach'){
+    if(!d.url) return '';
+    let h='<div class="cfgrow"><span class="cfgk">endpoint</span>'
+      +'<span class="pill">'+esc(d.url)+'</span>';
+    if(d.rtt_ms!=null) h+='<span class="pill">'+d.rtt_ms+' ms</span>';
+    if((d.node_ids||[]).length) h+='<span class="pill">nodes: '+esc(d.node_ids.join(', '))+'</span>';
+    h+='</div>';
+    if(d.reachable && !d.identity)
+      h+='<div class="muted">reachable, but the far rig reports no identity yet.</div>';
+    return h;
+  }
+  if(st.step==='gate'){
+    const rows=d.rows||[];
+    if(!rows.length) return '';
+    // Every unmet row shows its reason AND its remedy. Nothing is greyed out
+    // without saying why, which is the capability table's rule.
+    let h='<table class="mx"><tr><th>check</th><th>verdict</th><th>this rig</th>'
+      +'<th>far rig</th><th style="text-align:left">why / what to do</th></tr>';
+    for(const r of rows){
+      h+='<tr><td style="text-align:left">'+esc(r.label||r.key)+'</td>'
+        +'<td class="'+pairStateClass(r.verdict==='ok'?'ok':(r.verdict==='block'?'blocked':''))
+        +'"><b>'+esc(r.verdict)+'</b></td>'
+        +'<td>'+esc(r.local||'')+'</td><td>'+esc(r.remote||'')+'</td>'
+        +'<td style="text-align:left">'+esc(r.reason||'')
+        +(r.remedy?('<br><span class="muted">'+esc(r.remedy)+'</span>'):'')
+        +'</td></tr>';
+    }
+    return h+'</table>';
+  }
+  if(st.step==='transport'){
+    let h='<div>'+esc(d.note||'')+'</div>';
+    if(d.offer)
+      h+='<div class="adv"><b>not measured yet.</b> '+esc(d.offer.what||'')
+        +' <span class="muted">'+esc(d.offer.cost||'')+'</span>'
+        +'<div class="actions" style="margin-top:.3rem">'
+        +'<button class="mini secondary" onclick="showTab(\'energy\')" '
+        +'title="the study machinery lives in the measurement tabs; this flow never starts a run by itself">'
+        +'open the measurement tools</button></div></div>';
+    const pairs=(d.pairs||[]).filter(p=>!p.same_node);
+    if(pairs.length){
+      h+='<table class="mx"><tr><th>pair</th><th>chosen</th>'
+        +'<th style="text-align:left">options</th></tr>';
+      for(const p of pairs)
+        h+='<tr><td style="text-align:left">'+esc(p.src)+' &rarr; '+esc(p.dst)+'</td>'
+          +'<td>'+(p.chosen?('<b>'+esc(p.chosen)+'</b>'):'<span class="muted">unknown</span>')+'</td>'
+          +'<td style="text-align:left">'+(p.options||[]).map(o=>
+              '<span class="pill" title="'+esc(o.reason||'')+'">'+esc(o.key)+': '+esc(o.verdict)+'</span>'
+            ).join(' ')+'</td></tr>';
+      h+='</table>';
+    }
+    return h;
+  }
+  if(st.step==='config'){
+    if(!d.env) return '';
+    let h='';
+    for(const n of (d.notes||[])) h+='<div class="muted">'+esc(n)+'</div>';
+    h+='<pre>'+esc(Object.keys(d.env).map(k=>k+'='+d.env[k]).join('\n'))+'</pre>';
+    h+='<div class="legend">Placeholders, not this machine\'s values: the '
+      +'block is safe to paste anywhere.</div>';
+    return h;
+  }
+  return '';
 }
 
 // ===========================================================================
@@ -4739,10 +5646,19 @@ function stopLanding(){ if(window._landTimer){ clearInterval(window._landTimer);
 async function landingPoll(){
   let d;
   const ep=landingEndpoint();
+  const live=$('landing_live');
   try{
-    const r=await fetch('/api/live_snapshot'+(ep?('?endpoint='+encodeURIComponent(ep)):''));
-    d=await r.json();
-  }catch(e){ return; }
+    // Keyed on 'landing': a poll that is still outstanding when the next
+    // tick fires is aborted, so two snapshots can never race to paint the
+    // same panels. The timeout is just under the poll period for the same
+    // reason. While it is out, the panel dims rather than blanks.
+    stale(live,true);
+    d=await api('/api/live_snapshot'+(ep?('?endpoint='+encodeURIComponent(ep)):''),
+                {key:'landing', timeout:LAND_POLL_MS-200});
+  }catch(e){
+    if(!apiAborted(e)) $('land_target_note').textContent='snapshot unavailable: '+apiError(e);
+    return;
+  } finally { stale(live,false); }
   window._lastTarget=d && d.target;
   if(d && d.target){
     $('land_target_note').innerHTML='monitoring <b>'+esc(d.target.endpoint)+'</b> ('
@@ -4823,22 +5739,29 @@ function renderStartConfig(s, tgt){
   for(const [name,row] of groups)
     if(row.trim()) h+='<div class="cfgrow"><span class="cfgk">'+esc(name)+'</span>'+row+'</div>';
   h+='<div class="legend" style="margin-top:.25rem">source: '+esc(n.src)+'</div>';
+  // data-key gives the patcher a stable identity for these two collapses, so
+  // they are re-matched across polls even when the groups above them change
+  // shape. Without it they would fall back to positional matching, which is
+  // correct but fragile once a group appears or disappears mid-run.
   if(n.argv||n.env){
-    h+='<details style="margin-top:.3rem"><summary class="muted" style="cursor:pointer">full launch command + env</summary><pre>';
+    h+='<details data-key="cfg_launch" style="margin-top:.3rem"><summary class="muted" style="cursor:pointer">full launch command + env</summary><pre>';
     if(n.env) for(const k of Object.keys(n.env)) h+=esc(k+'='+n.env[k])+'\n';
     if(n.argv) h+=esc(n.argv.join(' '));
     h+='</pre></details>';
   }
   if(n.raw)
-    h+='<details style="margin-top:.3rem"><summary class="muted" style="cursor:pointer">raw server_info</summary>'
-      +'<pre style="max-height:260px;overflow:auto">'+esc(JSON.stringify(n.raw,null,1))+'</pre></details>';
+    h+='<details data-key="cfg_raw" style="margin-top:.3rem"><summary class="muted" style="cursor:pointer">raw server_info</summary>'
+      +'<pre data-key="cfg_raw_pre" style="max-height:260px;overflow:auto">'+esc(JSON.stringify(n.raw,null,1))+'</pre></details>';
   return h;
 }
 function renderLanding(s, tgt){
   window._lastSnapshot=s;
-  $('landing_config').innerHTML=renderStartConfig(s, tgt)
+  // Patched, not replaced: this block carries two <details> ("full launch
+  // command + env", "raw server_info") and a scrollable <pre>. Rewriting it
+  // wholesale on every 2 s tick is what used to slam them shut.
+  setHTML($('landing_config'), renderStartConfig(s, tgt)
     +(s.metrics_error?'<div class="reasons" style="margin-top:.3rem">'+esc(s.metrics_error)
-      +' &mdash; token rates need --enable-metrics on the server.</div>':'');
+      +' &mdash; token rates need --enable-metrics on the server.</div>':''));
 
   // Per-card 60s telemetry rings (rendered INSIDE the placement card blocks,
   // renderPlacement's live line -- the old standalone per-GPU chart grid is
@@ -5000,8 +5923,8 @@ async function renderLandingPlacement(s){
       gh+='<div class="cardblock"><div><b>'
         +(devLabel(g.cuda_index, g.nvml_index)||('#'+g.nvml_index))+'</b> '
         +esc(g.name)+'</div>'+cardLiveHtml(g)+'</div>';
-    $('landing_placement').innerHTML=
-      '<span class="muted">no start config for placement (external server without /get_server_info).</span>'+gh;
+    setHTML($('landing_placement'),
+      '<span class="muted">no start config for placement (external server without /get_server_info).</span>'+gh);
     return;
   }
   const flags={
@@ -5039,14 +5962,17 @@ async function renderLandingPlacement(s){
     ct[k]=g.mem_total_mib; cn[k]=g.name; });
   flags.card_total_mib=ct; flags.card_name=cn;
   try{
-    const r=await fetch('/api/placement',{method:'POST',body:JSON.stringify(
-      {model, gguf_choice: cfg.gguf_variant||null, flags})});
-    const d=await r.json();
-    $('landing_placement').innerHTML = d.ok
+    const d=await api('/api/placement',{key:'placement_landing',
+      body:{model, gguf_choice: cfg.gguf_variant||null, flags}});
+    setHTML($('landing_placement'), d.ok
       ? renderPlacement(d.placement, s.gpus, {graphCapture: window._lastGraphCapture})
       : '<span class="reasons">'+esc(d.error)+'</span>'
-        +((s.gpus&&s.gpus.length)?'':(s.nvml_error?'<div class="muted">no NVML cards ('+esc(s.nvml_error)+')</div>':''));
-  }catch(e){ $('landing_placement').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
+        +((s.gpus&&s.gpus.length)?'':(s.nvml_error?'<div class="muted">no NVML cards ('+esc(s.nvml_error)+')</div>':'')));
+  }catch(e){
+    // A superseded call is not a failure; the panel keeps the newer answer.
+    if(apiAborted(e)) return;
+    setHTML($('landing_placement'),'<span class="reasons">'+esc(apiError(e))+'</span>');
+  }
 }
 
 // ===========================================================================
@@ -5057,12 +5983,38 @@ window._flagCat=null; window._flagSettings={}; window._profiles=[];
 window._flagSection={};   // catalog id -> section key (built at render time)
 async function loadFlagCatalog(){
   try{
-    const r=await fetch('/api/flag_catalog'); const d=await r.json();
+    const d=await api('/api/flag_catalog',{key:'flag_catalog'});
     if(!d.ok) return;
     window._flagCat=d;
+    // The trade-off registry rides along with the catalog: one fetch, one
+    // source. Controls that are not flags (the view switch, the objective
+    // templates, the budget sliders) look themselves up in it by key.
+    window._tips=d.tooltips||{};
     $('flag_counts').textContent=d.upstream_count+' upstream + '+d.fork_count+' fork';
     renderFlagSurface();
+    applyStaticTips();
   }catch(e){}
+}
+// ---- what it gives / what it costs, for the controls that are not flags ---
+// The text lives server-side in planner/tooltips.py, keyed the same way. This
+// only puts it on the elements; it never composes a sentence of its own, so
+// there is exactly one place to edit when a control's cost changes.
+const STATIC_TIPS={
+  vm_simple:'view_mode.simple', vm_expert:'view_mode.expert',
+  tune_both:'tune.both', tune_maxkv:'tune.maxkv',
+  tune_dec:'tune.dec', tune_enc:'tune.enc',
+  sv_ctx:'context_length', sv_ctx_slider:'context_length',
+  row_sv_ctx:'context_length',
+  max_running_requests:'max_running_requests', mrr_slider:'max_running_requests',
+  row_mrr:'max_running_requests',
+};
+function tip(key){ return (window._tips||{})[key]||''; }
+function applyStaticTips(){
+  for(const id of Object.keys(STATIC_TIPS)){
+    const el=$(id); if(!el) continue;
+    const t=tip(STATIC_TIPS[id]);
+    if(t) el.title=t;
+  }
 }
 function _surfaceSpecs(g){
   // The serving-identity ids are owned by the MODEL/SERVING sections above
@@ -5096,25 +6048,46 @@ function flagSection(f){
 // switch for bool / compact dropdown for enum / numeric or text input), a
 // pure-CSS "?" hover at the row end. Ids flrow_/fl_/flq_/flh_ are unchanged
 // so resolve()-driven greying, auto-set notes and profiles keep working.
+// The row markup describes the CURRENT value, not an empty control.
+// _flagSettings is the single source of truth for what a knob is set to, and
+// the row now says so out loud. That matters twice over: the patcher treats
+// markup as the description of state, and the old full rebuild used to drop
+// every entered value because the markup claimed the field was empty.
+function _flagValue(id){
+  const v=(window._flagSettings||{})[id];
+  return (v==null||v===false)?'':String(Array.isArray(v)?v.join(','):v);
+}
+// Hover text for a flag: its trade-off line if one is written, the value's
+// own line when the selected value pulls a different way, else the catalog's
+// hover. All of it arrives from the server; the browser stores no copy.
+function flagTip(f, cur){
+  const byVal=f.tradeoff_by_value||{};
+  return (cur && byVal[cur]) || f.tradeoff || f.hover || f.help || '';
+}
 function flagRowHtml(f){
   const src=f.source!=='upstream'? ' <span class="pill">'+esc(f.source)+'</span>':'';
-  let h='<div class="setrow" id="flrow_'+f.id+'">'
-    +'<span class="lbl" title="'+esc(f.hover||f.help||'')+'">'+esc(f.name)+src
+  const cur=_flagValue(f.id);
+  const tip=flagTip(f, cur);
+  let h='<div class="setrow" id="flrow_'+f.id+'" title="'+esc(tip)+'">'
+    +'<span class="lbl" title="'+esc(tip)+'">'+esc(f.name)+src
     +' <span class="flag-q" id="flq_'+f.id+'" style="color:#e3a008"></span>'
     +'<span class="chg" title="changed from preset"></span></span>';
   if(f.type==='bool')
-    h+='<label class="switch"><input type="checkbox" id="fl_'+f.id
-      +'" onchange="onFlagChange(\''+f.id+'\')"><span class="track"></span></label>';
+    h+='<label class="switch"><input type="checkbox" id="fl_'+f.id+'"'
+      +(cur?' checked':'')+' onchange="onFlagChange(\''+f.id+'\')"><span class="track"></span></label>';
   else if(f.allowed)
-    h+='<select id="fl_'+f.id+'" onchange="onFlagChange(\''+f.id+'\')"><option value="">(default)</option>'
-      +f.allowed.map(a=>'<option value="'+esc(String(a))+'">'+esc(String(a))+'</option>').join('')+'</select>';
+    h+='<select id="fl_'+f.id+'" onchange="onFlagChange(\''+f.id+'\')">'
+      +'<option value=""'+(cur===''?' selected':'')+'>(default)</option>'
+      +f.allowed.map(a=>'<option value="'+esc(String(a))+'"'
+        +(String(a)===cur?' selected':'')+'>'+esc(String(a))+'</option>').join('')+'</select>';
   else if(f.type==='int'||f.type==='float')
     h+='<input type="number" class="num" id="fl_'+f.id+'" placeholder="'
-      +(f.default!=null?esc(String(f.default)):'auto')+'" '
+      +(f.default!=null?esc(String(f.default)):'auto')+'" value="'+esc(cur)+'" '
       +(f.type==='float'?'step="any" ':'')+'onchange="onFlagChange(\''+f.id+'\')">';
   else
     h+='<input type="text" id="fl_'+f.id+'" placeholder="'
-      +(f.default!=null?esc(String(f.default)):'default')+'" onchange="onFlagChange(\''+f.id+'\')">';
+      +(f.default!=null?esc(String(f.default)):'default')+'" value="'+esc(cur)
+      +'" onchange="onFlagChange(\''+f.id+'\')">';
   h+='<span class="qmark" title="'+esc(f.help||f.hover||'')+'">?</span></div>'
     +'<div class="knob-help" id="flh_'+f.id+'"></div>';
   return h;
@@ -5133,8 +6106,12 @@ function renderFlagSurface(){
   for(const sec of SECTION_KEYS)
     bySec[sec].sort((a,b)=>(a.source!=='upstream')-(b.source!=='upstream')
       || (a.id<b.id?-1:1));
+  // Patched: the rows carry the user's current values, and the patcher keeps
+  // them. The old full rebuild dropped every entered value on the floor --
+  // window._flagSettings held the truth but nothing wrote it back into the
+  // DOM afterwards.
   for(const sec of ['context','gpu','speculative','cache','serving'])
-    $('secflags_'+sec).innerHTML=bySec[sec].map(flagRowHtml).join('');
+    setHTML($('secflags_'+sec), bySec[sec].map(flagRowHtml).join(''));
   // advanced: everything else, still grouped by catalog group for
   // navigability, all behind the ONE toggle.
   const byGrp={};
@@ -5145,7 +6122,7 @@ function renderFlagSurface(){
       +esc(g)+'</b> <span class="muted">('+byGrp[g].length+')</span></summary>'
       +byGrp[g].map(flagRowHtml).join('')+'</details>';
   }
-  $('sec_advanced').innerHTML=ah;
+  setHTML($('sec_advanced'), ah);
   $('adv_count').textContent='('+bySec.advanced.length+' more flags)';
   filterFlags();
   updateSectionSummaries();
@@ -5183,10 +6160,19 @@ function filterFlags(){
       if(hit) secHits[window._flagSection[f.id]||'advanced']++;
     }
   }
+  // A search opens the sections that have hits, so the reader can see what
+  // matched. Clearing the search must NOT slam everything shut again: only
+  // the sections the search itself opened are put back, and a section the
+  // reader opened by hand is left alone. That is what _searchOpened records.
   for(const sec of ['context','gpu','speculative','cache','serving']){
     const det=$('sec_'+sec); if(!det) continue;
-    if(q){ det.style.display=secHits[sec]?'':'none'; det.open=secHits[sec]>0; }
-    else { det.style.display=''; det.open=false; }
+    if(q){
+      det.style.display=secHits[sec]?'':'none';
+      if(secHits[sec]>0 && !det.open){ det.open=true; det._searchOpened=true; }
+    } else {
+      det.style.display='';
+      if(det._searchOpened){ det.open=false; det._searchOpened=false; }
+    }
   }
   // advanced groups: show only those with hits while searching.
   let gi=0; let det;
@@ -5195,7 +6181,9 @@ function filterFlags(){
     for(const row of det.querySelectorAll('.setrow'))
       if(row.style.display!=='none') vis++;
     det.style.display=vis?'':'none';
-    det.open=!!q && vis>0;
+    if(q){
+      if(vis>0 && !det.open){ det.open=true; det._searchOpened=true; }
+    } else if(det._searchOpened){ det.open=false; det._searchOpened=false; }
   }
   $('sec_advanced').style.display =
     q? (secHits.advanced?'':'none') : ($('advanced_toggle').checked?'':'none');
@@ -5246,7 +6234,9 @@ function onFlagChange(id){
   // rank_gpu_id is never overwritten).
   if(id==='tp_size') window._coloRedistribute=true;
   updateGpuPick(); updateColoUI(); markPresetDrift(); updateSectionSummaries();
-  resolveFlags(); refreshRunnerPlacement(); schedulePlan();
+  markTune();
+  // ONE consistent recompute rather than three calls racing each other.
+  scheduleRecompute();
 }
 // ---- context-length / max-running-requests: slider+numeric pairs ----------
 // The numeric field (sv_ctx / max_running_requests) stays authoritative --
@@ -5263,23 +6253,42 @@ function setCtxCap(cap){
   sl.value=Math.min(v||8192, parseInt(sl.max));
   updateSectionSummaries();
 }
+function _reflow(){ scheduleRecompute(); }
 function ctxFromSlider(){
   $('sv_ctx').value=$('sv_ctx_slider').value;
-  onServingEdit(); refreshRunnerPlacement();
+  onServingEdit(); _reflow();
 }
 function ctxFromNum(){
   const sl=$('sv_ctx_slider');
   sl.value=Math.min(parseInt($('sv_ctx').value)||8192, parseInt(sl.max));
-  onServingEdit(); refreshRunnerPlacement();
+  onServingEdit(); _reflow();
 }
+// Sliders fire on every pixel of travel. The label follows the thumb at once
+// (that has to feel immediate), the backend work is debounced behind it.
+function _replan(){ scheduleRecompute(); }
 function mrrFromSlider(){
   $('max_running_requests').value=$('mrr_slider').value;
-  onServingEdit(); doPlan(); refreshRunnerPlacement();
+  onServingEdit(); _replan();
 }
 function mrrFromNum(){
   const v=parseInt($('max_running_requests').value);
-  if(v) $('mrr_slider').value=Math.min(v, 64);
-  onServingEdit(); doPlan(); refreshRunnerPlacement();
+  // The numeric field is authoritative and unbounded. A hard 64 here used to
+  // silently swallow anything larger; the real limit is the plan's reject,
+  // which says WHY, so the slider grows to represent what was typed instead.
+  if(v) setMrrCap(Math.max(window._mrrCap||64, v));
+  if(v) $('mrr_slider').value=v;
+  onServingEdit(); _replan();
+}
+// Slider bounds follow the hard limits the planner reports, never a preset's
+// value: applying a template is a starting point, not a ceiling.
+window._mrrCap=null;
+function setMrrCap(cap){
+  cap=Math.max(1, Math.round(cap||64));
+  window._mrrCap=cap;
+  const sl=$('mrr_slider'); if(!sl) return;
+  sl.max=cap;
+  const note=$('mrr_max');
+  if(note) note.textContent='max '+cap.toLocaleString();
 }
 function onServingEdit(){ markPresetDrift(); updateSectionSummaries(); }
 // ---- single-GPU card selector (tp=1): writes the stock --base-gpu-id ------
@@ -5557,9 +6566,9 @@ async function resolveFlags(){
   if(!window._flagCat) return;
   const model=$('model').value.trim();
   try{
-    const r=await fetch('/api/resolve_flags',{method:'POST',
-      body:JSON.stringify({settings:collectFlagSettings(), model})});
-    const d=await r.json(); if(!d.ok) return;
+    const d=await api('/api/resolve_flags',{key:'resolve_flags',
+      body:{settings:collectFlagSettings(), model}});
+    if(!d.ok) return;
     applyFieldStates(d.fields); renderFlagWarnings(d.warnings);
   }catch(e){}
 }
@@ -5577,12 +6586,9 @@ function applyFieldStates(fields){
       if(st.error) parts.push(st.error);
       help.innerHTML = parts.length? '<span class="'+(st.error?'nofitc':'muted')+'">'+esc(parts.join(' · '))+'</span>':'';
     }
-    if(st.options && el.tagName==='SELECT'){
-      const cur=el.value;
-      el.innerHTML='<option value="">(default)</option>'
-        +st.options.map(a=>'<option value="'+esc(String(a))+'">'+esc(String(a))+'</option>').join('');
-      el.value=cur;
-    }
+    if(st.options && el.tagName==='SELECT')
+      setHTML(el, '<option value="">(default)</option>'
+        +st.options.map(a=>'<option value="'+esc(String(a))+'">'+esc(String(a))+'</option>').join(''));
   }
 }
 function renderFlagWarnings(ws){
@@ -5594,7 +6600,195 @@ function renderFlagWarnings(ws){
 }
 async function onRunnerModel(){
   const model=$('model').value.trim(); if(!model) return;
-  loadConfigProfiles(); resolveFlags(); refreshRunnerPlacement(); schedulePlan();
+  loadConfigProfiles(); scheduleRecompute();
+}
+
+// ===========================================================================
+// Live propagation: ONE call, ONE consistent answer.
+//
+// Every dimension the fork exposes feeds every dependent value, and all of
+// that arithmetic lives server-side already. What the page used to do was ask
+// three separate questions about the same configuration -- /api/plan,
+// /api/placement and /api/resolve_flags, fired together on every edit -- and
+// paint whichever answer arrived last. With three independent latencies the
+// panels could end up describing two different configurations at once.
+//
+// /api/recompute answers all three about one configuration. One call cannot
+// disagree with itself. It is also one round trip instead of three, which is
+// most of why editing feels immediate now.
+// ===========================================================================
+function recomputeSections(){
+  // Only what the visible mode actually shows.
+  return viewMode()==='simple'
+    ? ['plan','placement']
+    : ['plan','placement','fields'];
+}
+async function recomputeNow(){
+  const model=$('model').value.trim();
+  if(!model){ renderSimpleCards(null); return; }
+  const coloErr=coloBlockError();
+  if(coloErr){
+    $('verdict').innerHTML='<div class="verdict nofit">PLAN BLOCKED</div>';
+    $('split').innerHTML='<ul class="reasons"><li>'+esc(coloErr)+'</li></ul>';
+    renderSimpleVerdict({valid:false, reasons:[coloErr]});
+    return;
+  }
+  const flags=runnerFlags();
+  const body=Object.assign({}, payload(), {
+    sections: recomputeSections(),
+    settings: collectFlagSettings(),
+    placement_request: {
+      model,
+      gguf_choice: ($('gguf_pick').style.display!=='none'?$('gguf_choice').value:null),
+      flags: flags,
+      stock_compare: flagsAreForkish(flags),
+    },
+  });
+  const rp=$('runner_placement');
+  stale(rp,true);
+  let d;
+  try{
+    d=await api('/api/recompute',{key:'recompute', body:body, timeout:20000});
+  }catch(e){
+    // Superseded by a newer edit: the newer answer owns the panels.
+    if(apiAborted(e)) return;
+    $('verdict').innerHTML='<div class="verdict nofit">PLAN ERROR</div>';
+    $('split').innerHTML='<ul class="reasons"><li>'+esc(apiError(e))+'</li></ul>';
+    return;
+  } finally { stale(rp,false); }
+  if(d.fields && d.fields.ok){
+    applyFieldStates(d.fields.fields); renderFlagWarnings(d.fields.warnings);
+  }
+  if(d.placement) applyPlacementResult(d.placement);
+  if(d.plan){ render(d.plan); renderSimpleVerdict(d.plan); }
+  renderSimpleCards(d.placement && d.placement.ok ? d.placement.placement : null);
+}
+const scheduleRecompute=debounce(recomputeNow, 180);
+
+// ===========================================================================
+// Simple view: per card, what this configuration puts on it, and one slider
+// for how much of the card it may have. No breakdown, no ratios -- those are
+// the expert view. The numbers come from the same placement result the
+// expert view renders granularly; nothing here is computed in the browser.
+// ===========================================================================
+function cardBudgetMib(c){
+  // The budget slider writes the existing per-card reserve: budget = total
+  // minus what is kept free. One mechanism, two presentations.
+  const total=c.total_mib||0;
+  const keep=Math.round((c.reserve_gb||0)*1024);
+  return Math.max(0, total-keep);
+}
+function setCardBudgetMib(i, mib){
+  const c=CARDS[i]; if(!c) return;
+  const total=c.total_mib||0;
+  c.reserve_gb=Math.max(0, (total-Math.min(mib,total)))/1024;
+}
+function simpleBudgetInput(i){
+  const c=CARDS[i]; if(!c) return;
+  const sl=$('csb_'+i); if(!sl) return;
+  setCardBudgetMib(i, parseInt(sl.value)||0);
+  // The label follows the thumb at once; the re-plan is debounced behind it.
+  const lbl=$('csv_'+i);
+  if(lbl) lbl.textContent=fmtGiB(cardBudgetMib(c))+' of '+fmtGiB(c.total_mib);
+  scheduleRecompute();
+}
+// Distinct from the placement renderer's fmtMib: the simple view spells the
+// unit out, because it shows one number per card and has the room.
+function fmtGiB(m){
+  if(m==null||isNaN(m)) return 'n/a';
+  return (m/1024).toFixed(1)+' GiB';
+}
+function renderSimpleCards(placement){
+  const box=$('simple_cards'); if(!box) return;
+  const incl=CARDS.filter(c=>c.include);
+  if(!incl.length){ setHTML(box,'<span class="muted">no cards selected.</span>'); return; }
+  // Placement reports per PHYSICAL card, keyed in CUDA space; map back onto
+  // the card rows so a number is never attributed to the wrong card.
+  const used={};
+  (placement&&placement.cards||[]).forEach(pc=>{ used[pc.gpu_index]=pc; });
+  let h='';
+  CARDS.forEach((c,i)=>{
+    if(!c.include) return;
+    const key=(c.cuda_index!=null?c.cuda_index:i);
+    const pc=used[key];
+    const total=c.total_mib||0;
+    const budget=cardBudgetMib(c);
+    const need=pc?pc.total_mib:null;
+    const pctNeed=(need!=null&&total)?Math.min(100, need/total*100):0;
+    const pctCap=total?Math.min(100, budget/total*100):100;
+    let cls='';
+    if(need!=null&&need>budget) cls=' over';
+    else if(need!=null&&budget&&need>budget*0.95) cls=' tight';
+    const idx=devLabel(c.cuda_index, c.nvml_index);
+    h+='<div class="cardsimple" data-key="cs_'+i+'">'
+      +'<div class="cs-h"><span class="cs-n">'+esc(c.name||('card '+i))
+      +(idx?' <span class="muted" style="font-weight:400">['+esc(idx)+']</span>':'')+'</span>'
+      +'<span class="cs-u">'+(need!=null
+          ? esc(fmtGiB(need))+' used of '+esc(fmtGiB(total))
+          : 'usage not computed yet')+'</span></div>'
+      +'<div class="csbar"><div class="fill'+cls+'" style="width:'+pctNeed.toFixed(1)+'%"></div>'
+      +'<div class="cap" style="left:'+pctCap.toFixed(1)+'%" title="budget"></div></div>'
+      +'<div class="csrow"><label class="muted" style="font-size:.7rem;min-width:9rem">'
+      +'maximum VRAM to use</label>'
+      +'<input type="range" id="csb_'+i+'" min="0" max="'+total+'" step="256" value="'+budget+'"'
+      +' title="'+esc(tip('card_budget'))+'" oninput="simpleBudgetInput('+i+')">'
+      +'<span class="cs-v" id="csv_'+i+'">'+esc(fmtGiB(budget))+' of '+esc(fmtGiB(total))+'</span>'
+      +'</div>';
+    if(need!=null&&need>budget)
+      h+='<div class="reasons" style="font-size:.7rem;margin-top:.2rem">'
+        +'needs '+esc(fmtGiB(need-budget))+' more than this budget allows.</div>';
+    h+='</div>';
+  });
+  setHTML(box,h);
+}
+function renderSimpleVerdict(d){
+  const box=$('simple_verdict'); if(!box||!d) return;
+  if(d.valid===false){
+    setHTML(box,'<div class="verdict nofit">REJECTED</div><ul class="reasons">'
+      +(d.reasons||[]).map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>');
+    return;
+  }
+  const cap=d.capacity, off=d.offload;
+  let h;
+  if(d.fits) h='<div class="verdict fit">FITS IN VRAM &check;</div>';
+  else if(off&&off.status==='ram_offload')
+    h='<div class="verdict offload">FITS WITH ~'+off.offloaded_gib.toFixed(1)
+      +' GiB ON HOST RAM &mdash; slower (PCIe-bound)</div>';
+  else h='<div class="verdict nofit">DOES NOT FIT</div>';
+  if(cap&&cap.max_context_tokens)
+    h+='<div class="adv">context that fits: <b>'
+      +Math.round(cap.max_context_tokens).toLocaleString()+'</b> tokens</div>';
+  if(!d.fits&&(d.infeasible_reasons||[]).length)
+    h+='<ul class="reasons">'
+      +d.infeasible_reasons.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';
+  h+='<div class="legend">Switch to <b>expert</b> for the per-card breakdown '
+    +'and every dimension this fork exposes.</div>';
+  setHTML(box,h);
+}
+// ---- tuning objective template -------------------------------------------
+// Sets --rank-perf-tune and nothing else. The point of a template here is to
+// move the starting point, not to fence the controls in: everything stays
+// adjustable afterwards, and a value that genuinely cannot work is refused
+// by the planner with a reason rather than by a slider that stops early.
+const TUNE_LABELS={both:'balanced', maxkv:'max KV', dec:'max decode', enc:'max prefill'};
+function applyTune(mode){
+  window._flagSettings=window._flagSettings||{};
+  if(mode==='both') delete window._flagSettings.rank_perf_tune;
+  else window._flagSettings.rank_perf_tune=mode;
+  const el=$('fl_rank_perf_tune');
+  if(el) el.value=(mode==='both'?'':mode);
+  markTune();
+  markPresetDrift(); updateSectionSummaries(); scheduleRecompute();
+}
+function markTune(){
+  const cur=(window._flagSettings||{}).rank_perf_tune||'both';
+  for(const k of Object.keys(TUNE_LABELS)){
+    const b=$('tune_'+k); if(!b) continue;
+    b.className='mini'+(k===cur?'':' secondary');
+  }
+  const note=$('tune_note');
+  if(note) note.textContent='objective: '+(TUNE_LABELS[cur]||cur)
+    +' — every control below stays free to move past it.';
 }
 function runnerFlags(){
   const s=window._flagSettings||{};
@@ -5650,13 +6844,17 @@ function flagsAreForkish(f){
 }
 async function refreshRunnerPlacement(){
   const model=$('model').value.trim(); if(!model) return;
+  const rp=$('runner_placement');
   try{
     const flags=runnerFlags();
     const wantStock=flagsAreForkish(flags);
-    const r=await fetch('/api/placement',{method:'POST',body:JSON.stringify(
-      {model, gguf_choice: ($('gguf_pick').style.display!=='none'?$('gguf_choice').value:null),
-       flags, stock_compare: wantStock})});
-    const d=await r.json();
+    // Keyed 'placement_runner': the previous call is aborted, so the panel
+    // always shows the answer to the CURRENT flag set. Dimming while it is
+    // out keeps the previous numbers readable instead of blanking them.
+    stale(rp,true);
+    const d=await api('/api/placement',{key:'placement_runner',
+      body:{model, gguf_choice: ($('gguf_pick').style.display!=='none'?$('gguf_choice').value:null),
+            flags, stock_compare: wantStock}});
     let html;
     if(d.ok){
       const mainH=renderPlacement(d.placement);
@@ -5680,16 +6878,42 @@ async function refreshRunnerPlacement(){
     } else html='<span class="reasons">'+esc(d.error)+'</span>';
     // ONE renderer, mirrored: the right-column overview AND the GPU
     // offload/split section (config + its effect live together).
-    $('runner_placement').innerHTML = html;
-    const gp=$('gpu_placement'); if(gp) gp.innerHTML=html;
-  }catch(e){ $('runner_placement').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
+    setHTML(rp, html);
+    setHTML($('gpu_placement'), html);
+  }catch(e){
+    if(apiAborted(e)) return;
+    setHTML(rp,'<span class="reasons">'+esc(apiError(e))+'</span>');
+  } finally { stale(rp,false); }
+}
+// ONE renderer for a placement answer, whichever call produced it: the
+// right-column overview AND the GPU offload/split section, always in step.
+function applyPlacementResult(d){
+  let html;
+  if(d && d.ok){
+    const mainH=renderPlacement(d.placement);
+    const stock=d.stock;
+    if(stock){
+      let stockH;
+      if(stock.legal && stock.placement)
+        stockH='<div class="sxs-h">plain normal-TP (stock, tp='+stock.tp+')</div>'
+          +'<div class="muted" style="font-size:.68rem;margin-bottom:.2rem">'+esc(stock.note||'')+'</div>'
+          +renderPlacement(stock.placement);
+      else
+        stockH='<div class="sxs-h">plain normal-TP (stock)</div>'
+          +'<div class="muted" style="font-size:.7rem">'+esc(stock.note||'')+'</div>';
+      html='<div class="sxs"><div><div class="sxs-h">planned config</div>'+mainH+'</div>'
+        +'<div>'+stockH+'</div></div>';
+    } else html=mainH;
+  } else html='<span class="reasons">'+esc((d&&d.error)||'placement unavailable')+'</span>';
+  setHTML($('runner_placement'), html);
+  setHTML($('gpu_placement'), html);
 }
 async function loadConfigProfiles(){
   const model=$('model').value.trim();
   try{
     const q=model? ('?model='+encodeURIComponent(model)):'';
-    const r=await fetch('/api/config_profiles'+q); const d=await r.json();
-    if(!d.ok){ $('profile_pick').innerHTML='<span class="reasons">'+esc(d.error||'error')+'</span>'; return; }
+    const d=await api('/api/config_profiles'+q,{key:'profiles'});
+    if(!d.ok){ setHTML($('profile_pick'),'<span class="reasons">'+esc(d.error||'error')+'</span>'); return; }
     // Draft-model candidates + MTP-head fact for the Speculative section's
     // selector and no-MTP hint (matched server-side per selected model).
     window._draftCandidates=d.draft_candidates||[];
@@ -5705,8 +6929,11 @@ async function loadConfigProfiles(){
         +esc((p.info||[]).join(' | '))+'">'+esc(p.name)
         +(i>=nGen?' (saved)':'')+'</option>').join('')
       +'</select>';
-    $('profile_pick').innerHTML=h;
-  }catch(e){ $('profile_pick').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
+    setHTML($('profile_pick'), h);
+  }catch(e){
+    if(apiAborted(e)) return;
+    setHTML($('profile_pick'),'<span class="reasons">'+esc(apiError(e))+'</span>');
+  }
 }
 // Mirror a profile's serving-identity value into its ONE authoritative field
 // (the SERVING group / the model selector) -- the user can still override it
@@ -5758,15 +6985,16 @@ function applyProfile(i){
   const sl=$('sv_ctx_slider');
   sl.value=Math.min(parseInt($('sv_ctx').value)||8192, parseInt(sl.max));
   const mv=parseInt($('max_running_requests').value);
-  if(mv) $('mrr_slider').value=Math.min(mv, 64);
+  if(mv){ setMrrCap(Math.max(window._mrrCap||64, mv)); $('mrr_slider').value=mv; }
   // Preset prefill reaches the co-location controls too: the profile's
   // tp_size / rank_gpu_id map back onto the tp mirror + per-card steppers
   // (reverse-populated, never redistributed).
   window._coloRedistribute=false;
   updateGpuPick(); updateColoUI(); renderDraftPick(); updateSpecDraftHint();
   window._presetBase=presetSnapshot();
-  markPresetDrift(); updateSectionSummaries();
-  resolveFlags(); refreshRunnerPlacement(); doPlan();
+  markPresetDrift(); updateSectionSummaries(); markTune();
+  // One consistent recompute for the whole applied preset.
+  scheduleRecompute();
 }
 // DISPLAY the applied profile's launch env + exact argv (not just the CLI
 // flags): a launched profile must match the reference command exactly, and
@@ -5924,45 +7152,11 @@ async function refreshGpuState() {
   } catch(e) { $('gpu_state_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
 }
 
-// ---- #149 live widget (client-side delta rates off /metrics) ----
-window._liveTimer = null; window._livePrev = null;
-async function liveScrape() {
-  const target = $('live_target').value.trim();
-  const res = parseFloat($('live_res').value) || 250;
-  const r = await fetch('/api/live', {method:'POST', body: JSON.stringify({target, resolution_ms:res})});
-  const d = await r.json();
-  if (!d.ok) { $('live_out').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; return d; }
-  const s = d.snapshot; let rates = null;
-  if (window._livePrev) {
-    const dt = s.t - window._livePrev.t;
-    const pfx = dt>0 ? Math.max(0, s.prompt_tokens_total - window._livePrev.prompt_tokens_total)/dt : 0;
-    const dec = dt>0 ? Math.max(0, s.generation_tokens_total - window._livePrev.generation_tokens_total)/dt : 0;
-    rates = {dt, pfx, dec};
-  }
-  window._livePrev = s;
-  let h = '<b>resolution:</b> '+d.resolution_ms+'ms (floor 30ms)<br>';
-  if (rates) {
-    h += '<b>prefill:</b> '+rates.pfx.toFixed(1)+' tok/s &nbsp; '
-       + '<b>decode:</b> '+rates.dec.toFixed(1)+' tok/s<br>';
-  } else { h += '<span class="muted">(first sample — rates on next tick)</span><br>'; }
-  h += '<b>MTP accept rate:</b> '+(s.spec_accept_rate*100).toFixed(1)+'% &nbsp; '
-     + '<b>adaptive-k:</b> '+s.spec_num_steps+' &nbsp; '
-     + '<b>ema accept len:</b> '+s.spec_ema_accept_len.toFixed(2);
-  $('live_out').innerHTML = h;
-  return d;
-}
-async function toggleLive() {
-  if (window._liveTimer) {
-    clearInterval(window._liveTimer); window._liveTimer=null; window._livePrev=null;
-    $('live_btn').textContent = 'start live'; return;
-  }
-  const res = Math.max(30, parseFloat($('live_res').value) || 250);
-  window._livePrev = null;
-  $('live_btn').textContent = 'stop live';
-  await liveScrape();
-  window._liveTimer = setInterval(liveScrape, res);
-}
-async function remeasureNow() { window._livePrev = null; await liveScrape(); }
+// The #149 live widget that used to sit here is gone. It addressed
+// live_target / live_res / live_btn / live_out, none of which have existed
+// in the markup since the landing strip replaced it, so its interval fetched
+// nothing and its output went nowhere. The landing top strip (stripTile,
+// LAND_POLL_MS) is the live rate view. POST /api/live went with it.
 
 // ---- #150 scenario builder + cache-flush confirm gate ----
 async function previewScenario() {
@@ -6049,8 +7243,8 @@ function pickFromDropdown() {
   $('model').value = m.path;
   window._modelMeta = {format: m.format, variants: m.gguf_variants||[]};
   if (m.gguf_variants && m.gguf_variants.length>1) {
-    $('gguf_choice').innerHTML = m.gguf_variants
-      .map(v=>'<option value="'+esc(v.filename)+'">'+esc(v.quant)+' ('+v.size_gib+'G)</option>').join('');
+    setHTML($('gguf_choice'), m.gguf_variants
+      .map(v=>'<option value="'+esc(v.filename)+'">'+esc(v.quant)+' ('+v.size_gib+'G)</option>').join(''));
     $('gguf_pick').style.display='';
   } else {
     $('gguf_pick').style.display='none';
@@ -6092,12 +7286,17 @@ function serverSettings() {
 // Sticky-bar status chip: stopped (grey) / loading (amber, while booting) /
 // ready (green) / error (red). Fed by every status render below.
 function updateStatusChip(state) {
-  const chip=$('status_chip'); if(!chip) return;
   const s=String(state||'stopped');
-  if(s==='ready'){ chip.className='chip ready'; chip.textContent='ready'; }
-  else if(s==='booting'){ chip.className='chip loading'; chip.textContent='loading…'; }
-  else if(s==='error'){ chip.className='chip error'; chip.textContent='error'; }
-  else { chip.className='chip'; chip.textContent=s; }
+  let cls='chip', txt=s;
+  if(s==='ready'){ cls='chip ready'; txt='ready'; }
+  else if(s==='booting'){ cls='chip loading'; txt='loading…'; }
+  else if(s==='error'){ cls='chip error'; txt='error'; }
+  // Both modes show the same state; simple mode simply has fewer buttons
+  // around it.
+  for(const id of ['status_chip','simple_status_chip']){
+    const chip=$(id); if(!chip) continue;
+    chip.className=cls; chip.textContent=txt;
+  }
 }
 // While the managed server boots, poll status until it settles so the chip
 // flips loading -> ready/error without manual refreshes (bounded, 2s tick).
@@ -6107,8 +7306,8 @@ function pollStatusUntilSettled(){
   window._bootPoll=setInterval(async ()=>{
     if(--left<0){ clearInterval(window._bootPoll); window._bootPoll=null; return; }
     try{
-      const d=await (await fetch('/api/server_status')).json();
-      $('sv_out').innerHTML=renderServerStatus(d);
+      const d=await api('/api/server_status',{key:'boot_status', timeout:1800});
+      setHTML($('sv_out'), renderServerStatus(d));
       const st=(d.status&&d.status.state)||d.state;
       if(st!=='booting'){ clearInterval(window._bootPoll); window._bootPoll=null; }
     }catch(e){}
@@ -6118,8 +7317,10 @@ function renderServerStatus(d) {
   if (!d) return '';
   const st=(d.status&&d.status.state)||d.state;
   updateStatusChip(st);
-  const bl=$('boot_log');
-  if(bl && (st==='error'||st==='booting')) bl.open=true;
+  // Open the boot log ONCE when the boot starts or fails. openDetails records
+  // that it was opened for the reader, so re-collapsing it sticks instead of
+  // being undone by the next 2 s poll.
+  if(st==='error'||st==='booting') openDetails($('boot_log'));
   if (!d.ok && d.error) {
     let h = '<div class="reasons">'+esc(d.error)+'</div>';
     if (d.busy) h += '<div class="muted">restart is guarded while a live job is in-flight.</div>';
@@ -6199,7 +7400,7 @@ async function dlTargets() {
     $('dl_btn').disabled = !d.writable;
     if (d.gguf_variants && d.gguf_variants.length) {
       $('dl_variants').style.display='';
-      $('dl_quant').innerHTML = d.gguf_variants.map(v=>'<option value="'+esc(v.quant)+'">'+esc(v.quant)+' ('+esc(v.filename)+')</option>').join('');
+      setHTML($('dl_quant'), d.gguf_variants.map(v=>'<option value="'+esc(v.quant)+'">'+esc(v.quant)+' ('+esc(v.filename)+')</option>').join(''));
     } else { $('dl_variants').style.display='none'; }
     if (d.repo_error) note += '<br><span class="reasons">'+esc(d.repo_error)+'</span>';
     $('dl_out').innerHTML = note;
@@ -6261,42 +7462,72 @@ function verdictClass(v) {
 async function autofillQuality() {
   // Use the currently running managed server (endpoint + served model) so the
   // Quality run targets whatever is loaded, without retyping it.
+  // Autofill FILLS; it does not overwrite. Switching to this tab used to
+  // stamp over whatever endpoint or model name had been typed by hand.
   try {
-    const s = (await (await fetch('/api/server_status')).json()).status || {};
+    const d = await api('/api/server_status',{key:'quality_autofill', timeout:3000});
+    const s = (d && d.status) || {};
     if (s.state === 'ready' && s.port) {
-      $('q_endpoint').value = '127.0.0.1:' + s.port;
-      if (s.served_model_name) $('q_model').value = s.served_model_name;
+      if (!$('q_endpoint').value.trim()) $('q_endpoint').value = '127.0.0.1:' + s.port;
+      if (s.served_model_name && !$('q_model').value.trim())
+        $('q_model').value = s.served_model_name;
     }
   } catch(e) {}
+}
+// The chess suite follows the same line as the benchmark window: a run is
+// visibly RUNNING until it is finished, and the outcome is a table of
+// measure and value rather than a paragraph. The verdict stays a verdict --
+// it is a judgement, not a measurement, and reads as one.
+function qualityTableHtml(d){
+  const tk=d.tokens||{};
+  const rows=[];
+  rows.push({k:'verdict', v:d.verdict, cls:verdictClass(d.verdict)});
+  if(d.representation) rows.push({k:'representation', v:d.representation});
+  if(tk.prompt!=null) rows.push({k:'prompt tokens', v:tk.prompt});
+  if(tk.completion!=null) rows.push({k:'completion tokens', v:tk.completion});
+  if(tk.total!=null) rows.push({k:'total tokens', v:tk.total});
+  if(d.pieces_correct!=null) rows.push({k:'pieces correct', v:d.pieces_correct?'yes':'no'});
+  if(d.highlight_ok!=null) rows.push({k:'move highlighted', v:d.highlight_ok?'yes':'no'});
+  return '<table class="mx"><tr><th style="text-align:left">measure</th>'
+    +'<th style="text-align:left">value</th></tr>'
+    +rows.map(r=>'<tr data-key="q_'+r.k.replace(/ /g,'_')+'">'
+      +'<td style="text-align:left">'+esc(r.k)+'</td>'
+      +'<td style="text-align:left" class="'+(r.cls||'')+'"><b>'+esc(String(r.v))+'</b></td></tr>'
+      ).join('')+'</table>';
 }
 async function qualityRun() {
   if (!$('q_endpoint').value.trim() || !$('q_model').value.trim()) await autofillQuality();
   const endpoint = $('q_endpoint').value.trim();
   const model = $('q_model').value.trim();
-  if (!endpoint || !model) { $('q_status').innerHTML = '<span class="reasons">endpoint + model required</span>'; return; }
-  $('q_btn').disabled = true; $('q_status').innerHTML = 'calling the model (backend-side)…';
+  if (!endpoint || !model) { setHTML($('q_status'), '<span class="reasons">endpoint + model required</span>'); return; }
+  $('q_btn').disabled = true;
+  setHTML($('q_status'), '<span class="chip loading">running</span> calling the model (backend-side)…');
+  setHTML($('q_result'), '<span class="muted">waiting for the model…</span>');
   const budget = $('q_budget').value.trim();
   try {
+    // Not routed through api(): a quality run is a deliberate act and must
+    // not be aborted because something else asked a newer question.
     const r = await fetch('/api/quality_run', {method:'POST', body: JSON.stringify({
       endpoint, model, thinking: $('q_think').checked,
       thinking_budget: budget!==''?parseInt(budget):null})});
     const d = await r.json();
-    if (!d.ok) { $('q_status').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; return; }
+    if (!d.ok) {
+      setHTML($('q_status'), '<span class="reasons">'+esc(d.error)+'</span>');
+      setHTML($('q_result'), '');
+      return;
+    }
     window._lastQuality = d;
     $('q_svg').innerHTML = d.svg ? d.svg : '<span class="muted">no SVG extracted</span>';
-    const tk = d.tokens||{};
-    let h = '<div class="verdict '+verdictClass(d.verdict)+'">'+esc(d.verdict)+'</div>';
-    h += '<div class="legend"><b>tokens:</b> prompt '+(tk.prompt??'?')+' / completion '+(tk.completion??'?')+' / total '+(tk.total??'?')
-       + ' &nbsp; <b>representation:</b> '+esc(d.representation||'?')+'</div>';
-    h += '<div style="margin:.4rem 0">'+esc(d.report||'')+'</div>';
+    let h = qualityTableHtml(d);
+    if (d.report) h += '<div class="legend" style="margin-top:.4rem">'+esc(d.report)+'</div>';
     if (d.offer_download && d.svg)
-      h += '<button class="mini secondary" onclick="dlSvg()">download raw SVG</button>';
+      h += '<div class="actions" style="margin-top:.4rem"><button class="mini secondary" onclick="dlSvg()">download raw SVG</button></div>';
     else if (d.offer_download && d.raw)
-      h += '<button class="mini secondary" onclick="dlRaw()">download raw answer</button>';
-    $('q_result').innerHTML = h;
-    $('q_status').innerHTML = 'done.';
+      h += '<div class="actions" style="margin-top:.4rem"><button class="mini secondary" onclick="dlRaw()">download raw answer</button></div>';
+    setHTML($('q_result'), h);
+    setHTML($('q_status'), '<span class="chip ready">finished</span>');
     if ($('q_save').checked) await saveShot(d);
-  } catch(e) { $('q_status').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
+  } catch(e) { setHTML($('q_status'), '<span class="reasons">'+esc(''+e)+'</span>'); }
   finally { $('q_btn').disabled = false; }
 }
 function dlSvg() { const d=window._lastQuality; if(d&&d.svg) dlBlob(d.svg, 'chess.svg', 'image/svg+xml'); }
@@ -6405,20 +7636,93 @@ function benchPreset(p){
     if(el && !el.disabled) el.checked=ids.includes(t.test_id);
   }
 }
+// ===========================================================================
+// Benchmark window.
+//
+// Running and finished are separate panels: a table that is still filling
+// must never be mistaken for a complete result. Each finished run keeps its
+// own table of configuration / measure / value, so two runs can be read
+// against each other instead of one overwriting the other.
+//
+// ttft_ms and prefill tok/s are recorded by bench_suite per test and were
+// previously dropped on the floor here -- benchEvent read only status and
+// metric. They are measures, so they go in the measure column.
+// ===========================================================================
+const BENCH_STATUS_CLASS={pass:'st-pass',warn:'st-warn',fail:'st-fail',
+                          skip:'st-skip',blocked:'st-blocked'};
+function benchMeasures(r){
+  // Every number this test produced, one row each. Absent stays absent.
+  const out=[];
+  const m=r.metric||{};
+  if(m.name && m.name!=='none' && m.value!=null)
+    out.push({k:m.name, v:m.value, u:m.unit||''});
+  const d=r.detail||{};
+  if(d.ttft_ms!=null) out.push({k:'time to first token', v:(+d.ttft_ms).toFixed(1), u:'ms'});
+  if(d.prefill_tps!=null) out.push({k:'prefill', v:(+d.prefill_tps).toFixed(1), u:'tok/s'});
+  if(d.prompt_tokens!=null) out.push({k:'prompt', v:d.prompt_tokens, u:'tokens'});
+  return out;
+}
+function benchRowHtml(r){
+  const cls=BENCH_STATUS_CLASS[r.status]||'';
+  const ms=benchMeasures(r);
+  const note=r.reason||(r.detail&&r.detail.http_code!=null?('http '+r.detail.http_code):'')||'';
+  return '<tr data-key="bnr_'+r.test_id+'"><td>'+r.test_id+'</td>'
+    +'<td style="text-align:left">'+esc(r.label||'')+'</td>'
+    +'<td class="'+cls+'"><b>'+esc(r.status)+'</b></td>'
+    +'<td style="text-align:left">'+(ms.length
+        ? ms.map(x=>esc(x.k)+' <b>'+esc(String(x.v))+'</b>'+(x.u?' '+esc(x.u):'')).join('<br>')
+        : '<span class="muted">&mdash;</span>')+'</td>'
+    +'<td style="text-align:left" class="muted">'+esc(note)+'</td></tr>';
+}
+function benchTableHtml(rows){
+  return '<table class="mx"><tr><th>#</th><th>test</th><th>status</th>'
+    +'<th style="text-align:left">measure / value</th><th style="text-align:left">note</th></tr>'
+    +rows.map(benchRowHtml).join('')+'</table>';
+}
+function renderBenchRunning(){
+  const rows=window._benchResults||[];
+  const box=$('bn_running_box');
+  if(!window._benchActive){ if(box) box.style.display='none'; return; }
+  if(box) box.style.display='';
+  setHTML($('bn_running'),
+    '<div class="muted">'+rows.length+' of '+(window._benchSelected||0)
+    +' test(s) done&hellip;</div>'+benchTableHtml(rows));
+}
+function renderBenchFinished(){
+  const runs=window._benchRuns||[];
+  if(!runs.length){ setHTML($('bn_out'),'<span class="muted">no run yet.</span>'); return; }
+  let h='';
+  // Newest first: the run just finished is the one being read.
+  for(let i=runs.length-1;i>=0;i--){
+    const run=runs[i];
+    h+='<details data-key="bnrun_'+run.id+'"'+(i===runs.length-1?' open':'')+'>'
+      +'<summary style="cursor:pointer"><b>'+esc(run.label)+'</b> '
+      +'<span class="muted">'+esc(run.summary)+'</span></summary>'
+      +'<div class="legend">configuration: '+esc(run.config)+'</div>'
+      +benchTableHtml(run.results)+'</details>';
+  }
+  setHTML($('bn_out'), h);
+}
 async function benchRun(){
   const d=window._benchCatalog;
   const endpoint=$('bn_endpoint').value.trim();
-  if(!endpoint){ $('bn_out').innerHTML='<span class="reasons">endpoint required</span>'; return; }
+  if(!endpoint){ setHTML($('bn_out'),'<span class="reasons">endpoint required</span>'); return; }
   const selected=[];
   if(d) for(const t of d.tests){ const el=$('bnt_'+t.test_id); if(el&&el.checked) selected.push(t.test_id); }
-  if(!selected.length){ $('bn_out').innerHTML='<span class="reasons">select at least one test (or a preset).</span>'; return; }
+  if(!selected.length){ setHTML($('bn_out'),'<span class="reasons">select at least one test (or a preset).</span>'); return; }
   window._benchResults=[];
+  window._benchSelected=selected.length;
+  window._benchActive=true;
+  window._benchError=null;
   $('bn_run_btn').disabled=true;
-  $('bn_out').innerHTML='<table class="mx" id="bn_table"><tr><th>#</th><th>test</th><th>status</th>'
-    +'<th>metric</th><th>note</th></tr></table><div id="bn_done" class="muted">running&hellip;</div>';
+  renderBenchRunning();
+  benchLeadStart(endpoint);
+  const model=$('bn_model').value.trim();
   try{
-    const body={endpoint, model:$('bn_model').value.trim(), selected, force:$('bn_force').checked};
+    const body={endpoint, model, selected, force:$('bn_force').checked};
     if(d && d.capabilities) body.capabilities=d.capabilities;
+    // Streamed, so it is deliberately NOT routed through api(): aborting a
+    // benchmark because a newer request arrived would be wrong.
     const resp=await fetch('/api/bench_run',{method:'POST',body:JSON.stringify(body)});
     const reader=resp.body.getReader(); const dec=new TextDecoder(); let buf='';
     while(true){
@@ -6430,30 +7734,169 @@ async function benchRun(){
         if(line.startsWith('data:')) benchEvent(JSON.parse(line.slice(5)));
       }
     }
-  }catch(e){ const el=$('bn_done'); if(el) el.innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
-  finally{ $('bn_run_btn').disabled=false; }
+  }catch(e){ window._benchError=''+e; }
+  finally{
+    $('bn_run_btn').disabled=false;
+    benchFinish(endpoint, model);
+  }
+}
+function benchFinish(endpoint, model){
+  window._benchActive=false;
+  const rows=window._benchResults||[];
+  const counts=window._benchCounts||{};
+  const summary=window._benchError
+    ? ('failed — '+window._benchError)
+    : (Object.keys(counts).map(k=>k+' '+counts[k]).join(' · ')||(rows.length+' test(s)'));
+  window._benchRuns=(window._benchRuns||[]);
+  window._benchRuns.push({
+    id: Date.now(),
+    label: new Date().toLocaleTimeString(),
+    summary: summary,
+    config: endpoint+(model?(' · '+model):'')+' · '+rows.length+' test(s)',
+    results: rows.slice(),
+  });
+  window._benchCounts=null;
+  renderBenchRunning();
+  renderBenchFinished();
 }
 function benchEvent(ev){
   if(ev.event==='result' && ev.result){
-    const r=ev.result; window._benchResults.push(r);
-    const m=r.metric||{};
-    const mtxt=(m.name && m.name!=='none' && m.value!=null)
-      ? (m.name+'='+m.value+(m.unit?' '+m.unit:'')) : '';
-    const cls={pass:'st-pass',warn:'st-warn',fail:'st-fail',skip:'st-skip',blocked:'st-blocked'}[r.status]||'';
-    const row=document.createElement('tr');
-    row.innerHTML='<td>'+r.test_id+'</td><td style="text-align:left">'+esc(r.label||'')+'</td>'
-      +'<td class="'+cls+'"><b>'+esc(r.status)+'</b></td><td>'+esc(mtxt)+'</td>'
-      +'<td style="text-align:left" class="muted">'
-      +esc(r.reason||(r.detail&&r.detail.http_code!=null?('http '+r.detail.http_code):'')||'')+'</td>';
-    const tb=$('bn_table'); if(tb) tb.appendChild(row);
+    window._benchResults.push(ev.result);
+    renderBenchRunning();
   } else if(ev.event==='done'){
-    const el=$('bn_done');
-    if(el) el.innerHTML='done &mdash; '+Object.keys(ev.counts||{})
-      .map(k=>k+' '+ev.counts[k]).join(' · ');
+    window._benchCounts=ev.counts||{};
   } else if(ev.event==='error'){
-    const el=$('bn_done');
-    if(el) el.innerHTML='<span class="reasons">'+esc(ev.error)+'</span>';
+    window._benchError=ev.error;
   }
+}
+// ---- lead metrics: ms per round, polled off the engine's device timer -----
+// A delta between two polls, computed host-side. The first poll only seeds
+// the window, which the panel says rather than showing an empty table.
+window._benchLeadTimer=null;
+const BENCH_LEAD_MS=2000;
+const LEAD_LABELS={
+  ms_per_verify_round:'ms / verify round',
+  ms_per_decode_round:'ms / decode round',
+  ms_per_1k_prefill_tokens:'ms / 1k prefill tokens',
+  ms_per_draft_pass:'ms / draft pass',
+  accept_length:'accepted tokens per round',
+  verify_ct:'verify rounds in window',
+};
+function benchLeadStart(endpoint){
+  benchLeadStop();
+  benchLeadPoll(endpoint);
+  window._benchLeadTimer=setInterval(()=>benchLeadPoll(endpoint), BENCH_LEAD_MS);
+}
+function benchLeadStop(){
+  if(window._benchLeadTimer){ clearInterval(window._benchLeadTimer); window._benchLeadTimer=null; }
+}
+async function benchLeadPoll(endpoint){
+  try{
+    const d=await api('/api/bench_lead_metrics',
+      {key:'lead', body:{endpoint}, timeout:BENCH_LEAD_MS-200});
+    if(!d.ok){ setHTML($('bn_lead'),'<span class="muted">'+esc(d.error||'')+'</span>'); return; }
+    const m=d.metrics||{};
+    // Kept for the discussion export: the round times are the lead numbers
+    // worth sharing, and they exist only while a server is busy.
+    if(Object.keys(m).length) window._leadMetrics=m;
+    const keys=Object.keys(LEAD_LABELS).filter(k=>m[k]!=null);
+    let h='';
+    if(keys.length)
+      h='<table class="mx"><tr><th style="text-align:left">measure</th><th>value</th></tr>'
+        +keys.map(k=>'<tr data-key="lead_'+k+'"><td style="text-align:left">'+esc(LEAD_LABELS[k])
+          +'</td><td><b>'+(+m[k]).toFixed(2)+'</b></td></tr>').join('')+'</table>';
+    // A metric the engine did not export is absent, never zero -- the note
+    // says which, so an empty panel never reads as "the round took no time".
+    for(const n of (d.notes||[])) h+='<div class="muted">'+esc(n)+'</div>';
+    if(d.window_s!=null) h+='<div class="legend">window '+d.window_s+' s</div>';
+    setHTML($('bn_lead'), h||'<span class="muted">nothing reported.</span>');
+  }catch(e){}
+}
+
+// ===========================================================================
+// Discussion export: bundle composer, preview, gated send.
+//
+// Steering only, like the pairing tab: the bundles, the redaction and the
+// Markdown all come from planner/discussion_export.py. This assembles the
+// data the page already holds and renders what the server returns -- it does
+// not compose Markdown and it does not decide what may be shared.
+// ===========================================================================
+function discussionData(){
+  // Whatever this session actually measured. Sections with no data are
+  // simply absent from the report; nothing is invented to fill a bundle.
+  const s=window._lastSnapshot||null;
+  const n=s? normalizeStartConfig(s) : null;
+  const c=(n&&n.cfg)||{};
+  const runs=window._benchRuns||[];
+  const last=runs.length? runs[runs.length-1] : null;
+  const out={};
+  if(last) out.bench_results=last.results;
+  if(window._leadMetrics) out.lead_metrics=window._leadMetrics;
+  const gpus=(s&&s.gpus)||[];
+  out.system={
+    cards: gpus.map(g=>g.name),
+    model: c.model_path||$('bn_model').value.trim()||null,
+    quant: c.kv_cache_dtype||null,
+  };
+  if(n&&n.argv) out.launch_flags=n.argv;
+  if(window._lastQuality) out.quality=window._lastQuality;
+  const notes=$('sh_notes'); if(notes && notes.value.trim()) out.notes=notes.value.trim();
+  return out;
+}
+function discussionGroups(){
+  const out=[];
+  for(const el of document.querySelectorAll('#dx_groups input[type=checkbox]'))
+    if(el.checked) out.push(el.getAttribute('data-group'));
+  return out;
+}
+async function discussionPreview(){
+  setHTML($('dx_out'),'building…');
+  try{
+    const d=await api('/api/discussion_preview',{key:'dx', body:{
+      data:discussionData(), bundle:($('dx_bundle').value||'bench_system'),
+      energy_groups:discussionGroups()}});
+    if(!d.ok){ setHTML($('dx_out'),'<span class="reasons">'+esc(d.error||'')+'</span>'); return; }
+    renderDiscussionOptions(d);
+    $('dx_preview').textContent=d.markdown;
+    $('dx_wrap').style.display='';
+    // The gate is stated plainly rather than by disabling a button with no
+    // explanation: "no target configured" is information, not a failure.
+    setHTML($('dx_gate'), d.can_send
+      ? '<span class="fitc">ready to post to '+esc(d.target||'')+'</span>'
+      : '<span class="reasons">'+esc(d.reason||'')+'</span>');
+    $('dx_btn').disabled=!d.can_send;
+    setHTML($('dx_out'),'');
+  }catch(e){ if(!apiAborted(e)) setHTML($('dx_out'),'<span class="reasons">'+esc(apiError(e))+'</span>'); }
+}
+function renderDiscussionOptions(d){
+  const sel=$('dx_bundle');
+  if(sel && !sel.options.length && (d.bundles||[]).length){
+    setHTML(sel, d.bundles.map(b=>'<option value="'+esc(b.key)+'">'+esc(b.label)+'</option>').join(''));
+    sel.value='bench_system';
+  }
+  const cur=(d.bundles||[]).find(b=>b.key===(sel&&sel.value));
+  if(cur) $('dx_bundle_note').textContent=cur.note||'';
+  const box=$('dx_groups');
+  if(box && !box.children.length && (d.energy_groups||[]).length)
+    setHTML(box, d.energy_groups.map(g=>
+      '<label style="display:inline-block;margin-right:.6rem"><input type="checkbox" checked '
+      +'style="width:auto" data-group="'+esc(g.key)+'" onchange="discussionPreview()"> '
+      +esc(g.label)+'</label>').join(''));
+}
+async function discussionSubmit(){
+  if(!confirm('Post the previewed report to the configured GitHub discussion? '
+              +'This sends data to an EXTERNAL service.')) return;
+  $('dx_btn').disabled=true; setHTML($('dx_out'),'posting…');
+  try{
+    const d=await api('/api/discussion_submit',{key:'dx_submit', body:{
+      data:discussionData(), bundle:($('dx_bundle').value||'bench_system'),
+      energy_groups:discussionGroups(), confirmed:true}, timeout:40000});
+    setHTML($('dx_out'), d.sent
+      ? ('<span class="fitc">'+esc(d.action||'posted')+'</span> — '
+         +'<a href="'+esc(d.url||'#')+'" target="_blank">'+esc(d.url||'')+'</a>')
+      : '<span class="reasons">'+esc(d.reason||d.error||'not sent')+'</span>');
+  }catch(e){ if(!apiAborted(e)) setHTML($('dx_out'),'<span class="reasons">'+esc(apiError(e))+'</span>'); }
+  finally{ $('dx_btn').disabled=false; }
 }
 
 // ---- GitHub share (#152) -- preview first, explicit confirm, PAT per-use ----
@@ -6521,9 +7964,18 @@ async function shareSubmit(){
   finally{ $('sh_btn').disabled=false; $('sh_token').value=''; }
 }
 
+// The page opens the way it was left: simple unless expert was chosen.
+applyViewMode();
 // Landing is the default view (live monitor of any reachable server).
 showTab('landing');
 </script>
 </body>
 </html>
 """
+
+# The page is assembled once, at import time, with every vendored asset
+# inlined. INDEX_HTML stays a plain string constant: the handler serves it
+# verbatim and the tests read it directly, exactly as before.
+INDEX_HTML = _INDEX_TEMPLATE.replace(
+    "/*__VENDOR_MORPHDOM__*/", _vendored_js("morphdom-umd.min.js")
+)

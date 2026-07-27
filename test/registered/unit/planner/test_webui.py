@@ -9,12 +9,16 @@ testing the API IS testing the UI's contract.
 
 import json
 import os
+import re
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from unittest import mock
+
+import pytest
 
 from sglang.srt.planner import webui
 from sglang.srt.planner.hardware import hardware_from_manual  # noqa: F401
@@ -267,10 +271,6 @@ class TestHttpRoundTrip(WebUIFixture):
             "will_flush": True, "target_running_server": False})
         self.assertTrue(w["warn"])
         self.assertFalse(w["mandatory"])            # fresh server = informative
-        # live scrape of a nonexistent target fails gracefully (no raise).
-        live = self._post("/api/live", {"target": "127.0.0.1:1"})
-        self.assertFalse(live["ok"])
-        self.assertIn("error", live)
 
 
 class TestEnergyRoutePayloads(CustomTestCase):
@@ -2089,3 +2089,883 @@ class TestColocationControls(CustomTestCase):
         self.assertLess(i_colo, i_snap)
         self.assertIn("window._coloRedistribute=false;\n  updateGpuPick(); updateColoUI();",
                       html)
+
+
+# ===========================================================================
+# Update foundation (dashboard rework): the front end is one embedded script,
+# so a syntax slip in it is invisible to every Python test and shows up only
+# as a blank page in a browser. These tests close that gap and pin the
+# state-preserving update rules that the rework exists to enforce.
+# ===========================================================================
+
+
+def _index_script() -> str:
+    """The embedded <script> body of INDEX_HTML."""
+    m = re.search(r"<script>(.*)</script>", webui.INDEX_HTML, re.S)
+    assert m, "INDEX_HTML has no <script> block"
+    return m.group(1)
+
+
+class TestIndexScriptParses(CustomTestCase):
+    def test_embedded_javascript_is_syntactically_valid(self):
+        esprima = pytest.importorskip("esprima")
+        src = _index_script()
+        # The parser is an ES2017 implementation; the page uses two later
+        # operators. Rewriting them keeps this a pure syntax check without
+        # holding the page back to ES2017.
+        norm = src.replace("??", "||").replace("?.", ".")
+        try:
+            esprima.parseScript(norm)
+        except Exception as e:  # pragma: no cover - only on a real break
+            self.fail(f"INDEX_HTML script does not parse: {e}")
+
+
+class TestUpdateFoundation(CustomTestCase):
+    """A refresh may change numbers and nothing else."""
+
+    def test_patcher_and_bounded_fetch_helpers_exist(self):
+        js = _index_script()
+        for fn in ("function setHTML(", "function _beforeElUpdated(",
+                   "function _nodeKey(", "function openDetails(",
+                   "async function api(", "function apiAborted(",
+                   "function stale(", "function debounce("):
+            self.assertIn(fn, js, fn)
+
+    def test_dom_patching_uses_the_vendored_library(self):
+        # The tree diff is morphdom (MIT, vendored); only the policy is ours.
+        js = _index_script()
+        self.assertIn("morphdom(el,holder,{childrenOnly:true", js)
+        self.assertIn("onBeforeElUpdated:_beforeElUpdated", js)
+
+    def test_every_backend_call_is_bounded(self):
+        # api() is the only fetch entry point that may be used for polling;
+        # it carries the AbortController and the timeout.
+        js = _index_script()
+        self.assertIn("new AbortController()", js)
+        self.assertIn("opts.timeout||API_TIMEOUT_MS", js)
+
+    def test_landing_poll_patches_instead_of_replacing(self):
+        # The 2 s landing poll used to rewrite landing_config wholesale, which
+        # closed the two <details> inside it on every tick.
+        js = _index_script()
+        self.assertIn("setHTML($('landing_config')", js)
+        self.assertNotIn("$('landing_config').innerHTML", js)
+
+    def test_collapses_carry_a_stable_identity(self):
+        js = _index_script()
+        for key in ('data-key="cfg_launch"', 'data-key="cfg_raw"'):
+            self.assertIn(key, js, key)
+
+    def test_details_open_state_survives_a_patch(self):
+        js = _index_script()
+        i = js.index("function _beforeElUpdated(")
+        body = js[i:i + 1200]
+        # the LIVE open state is written back onto the incoming markup, so
+        # morphdom's attribute sync cannot close what the reader opened
+        self.assertIn("fromEl.tagName==='DETAILS'", body)
+        self.assertIn("toEl.setAttribute('open','')", body)
+
+    def test_edited_field_is_skipped_entirely(self):
+        js = _index_script()
+        i = js.index("function _beforeElUpdated(")
+        body = js[i:i + 1200]
+        self.assertIn("if(_isField(fromEl)&&_busy(fromEl)) return false;", body)
+
+    def test_scroll_position_survives_a_patch(self):
+        js = _index_script()
+        i = js.index("function _beforeElUpdated(")
+        body = js[i:i + 1200]
+        self.assertIn("fromEl.scrollTop||fromEl.scrollLeft", body)
+
+    def test_flag_rows_describe_their_current_value(self):
+        # The patcher treats markup as the description of state, so a row
+        # that renders an empty control would wipe what the user entered.
+        js = _index_script()
+        i = js.index("function flagRowHtml(")
+        body = js[i:i + 2000]
+        self.assertIn("const cur=_flagValue(f.id);", body)
+        self.assertIn("value=\"'+esc(cur)+'\"", body)
+        self.assertIn("(cur?' checked':'')", body)
+        self.assertIn("(String(a)===cur?' selected':'')", body)
+
+    def test_search_only_closes_what_search_opened(self):
+        # Clearing the flag search must not slam shut a section the reader
+        # opened by hand.
+        js = _index_script()
+        self.assertIn("_searchOpened", js)
+        self.assertNotIn("else { det.style.display=''; det.open=false; }", js)
+
+    def test_boot_log_is_opened_once_not_every_poll(self):
+        js = _index_script()
+        self.assertIn("openDetails($('boot_log'))", js)
+        self.assertNotIn("bl.open=true", js)
+
+    def test_quality_autofill_fills_but_does_not_overwrite(self):
+        js = _index_script()
+        i = js.index("async function autofillQuality()")
+        body = js[i:i + 900]
+        self.assertIn("if (!$('q_endpoint').value.trim())", body)
+        self.assertIn("!$('q_model').value.trim()", body)
+
+    def test_sliders_are_debounced(self):
+        js = _index_script()
+        # sliders route through the debounced recompute, not a call per tick
+        self.assertIn("function _replan(){ scheduleRecompute(); }", js)
+        self.assertIn("function _reflow(){ scheduleRecompute(); }", js)
+        self.assertIn("const scheduleRecompute=debounce(", js)
+        # one POST per pixel of slider travel is what this replaced
+        self.assertNotIn("onServingEdit(); doPlan(); refreshRunnerPlacement();", js)
+
+    def test_dead_live_widget_is_gone(self):
+        js = _index_script()
+        for sym in ("function liveScrape", "function toggleLive",
+                    "function remeasureNow", "$('live_target')",
+                    "$('live_res')", "$('live_btn')", "$('live_out')"):
+            self.assertNotIn(sym, js, sym)
+        self.assertFalse(hasattr(webui, "live_snapshot_payload"))
+
+    def test_orphaned_live_route_is_gone(self):
+        # The route addressed DOM ids that have not existed since the landing
+        # strip replaced the widget. Nothing may answer on it now.
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{srv.server_address[1]}/api/live",
+                data=json.dumps({"target": "127.0.0.1:1"}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(req, timeout=10)
+            self.assertEqual(cm.exception.code, 404)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=5)
+
+
+class TestVendoredAssets(CustomTestCase):
+    """Third-party front-end code is vendored, licensed and inlined.
+
+    The page makes no external requests, so a CDN link would simply be a
+    broken page on a machine without internet. Everything is in the tree.
+    """
+
+    def test_morphdom_is_vendored_with_its_licence(self):
+        d = os.path.join(os.path.dirname(webui.__file__), "assets")
+        js = os.path.join(d, "morphdom-umd.min.js")
+        lic = os.path.join(d, "morphdom.LICENSE")
+        self.assertTrue(os.path.exists(js), js)
+        self.assertTrue(os.path.exists(lic), lic)
+        with open(lic, encoding="utf-8") as f:
+            self.assertIn("MIT License", f.read())
+
+    def test_page_inlines_it_and_links_nothing_external(self):
+        html = webui.INDEX_HTML
+        self.assertIn("global.morphdom=", html)      # the library itself
+        self.assertNotIn("/*__VENDOR_MORPHDOM__*/", html)   # placeholder filled
+        # no external fetch of code or styling, at all
+        for bad in ("cdn.", "unpkg.com", "jsdelivr", "googleapis",
+                    "<script src=", "<link rel=\"stylesheet\""):
+            self.assertNotIn(bad, html, bad)
+
+
+# ===========================================================================
+# Etappe 3: simple / expert views and live propagation.
+# ===========================================================================
+
+
+class TestRecomputeEndpoint(WebUIFixture):
+    """One call, one consistent answer about one configuration."""
+
+    def test_returns_all_three_sections(self):
+        d = webui.recompute_payload(self._payload())
+        self.assertTrue(d["ok"])
+        for k in ("plan", "placement", "fields"):
+            self.assertIn(k, d, k)
+        self.assertTrue(d["plan"].get("valid", True))
+        self.assertTrue(d["fields"]["ok"])
+
+    def test_sections_are_selectable(self):
+        # The simple view asks only for what it shows.
+        d = webui.recompute_payload(dict(self._payload(), sections=["plan"]))
+        self.assertIn("plan", d)
+        self.assertNotIn("placement", d)
+        self.assertNotIn("fields", d)
+
+    def test_one_broken_section_does_not_sink_the_answer(self):
+        # A rejected plan must still return the per-field states that explain
+        # the rejection, so the panels can say WHY rather than going blank.
+        p = dict(self._payload(), model="/definitely/not/a/model")
+        d = webui.recompute_payload(p)
+        self.assertTrue(d["ok"])
+        self.assertIn("fields", d)
+        self.assertFalse(d["plan"].get("valid", True))
+
+    def test_placement_request_is_honoured(self):
+        p = dict(self._payload())
+        p["placement_request"] = {"model": p["model"], "flags": {"tp_size": 3}}
+        d = webui.recompute_payload(p)
+        self.assertTrue(d["placement"]["ok"], d["placement"].get("error"))
+        self.assertEqual(d["placement"]["placement"]["tp_size"], 3)
+
+
+class TestRecomputeRoute(TestHttpRoundTrip):
+    def test_recompute_over_http(self):
+        d = self._post("/api/recompute", dict(self._payload(), sections=["plan"]))
+        self.assertTrue(d["ok"])
+        self.assertIn("plan", d)
+
+
+class TestSimpleExpertViews(CustomTestCase):
+    def test_mode_switch_exists_and_persists(self):
+        js = _index_script()
+        for fn in ("function setViewMode(", "function applyViewMode(",
+                   "function viewMode("):
+            self.assertIn(fn, js, fn)
+        self.assertIn("localStorage.setItem('view_mode'", js)
+
+    def test_visibility_is_one_class_on_body(self):
+        # A mode switch must cost no backend call and must not disturb any
+        # control's value; CSS-only visibility is what guarantees that.
+        html = webui.INDEX_HTML
+        self.assertIn("body.mode-simple .expert-only { display: none !important; }", html)
+        self.assertIn("body.mode-expert .simple-only { display: none !important; }", html)
+        self.assertIn('<div class="simple-only">', html)
+        self.assertIn('<div class="cols runner expert-only">', html)
+
+    def test_simple_view_shows_one_bar_and_one_slider_per_card(self):
+        js = _index_script()
+        i = js.index("function renderSimpleCards(")
+        body = js[i:i + 3000]
+        self.assertIn('class="csbar"', body)          # one bar, whole-card
+        self.assertIn('type="range" id="csb_', body)  # one budget slider
+        # the granular segment view belongs to the expert mode only
+        self.assertNotIn("segments", body)
+
+    def test_simple_budget_slider_writes_the_existing_reserve(self):
+        # One mechanism, two presentations -- not a second, parallel notion
+        # of "how much VRAM may this card give".
+        js = _index_script()
+        self.assertIn("function setCardBudgetMib(", js)
+        i = js.index("function setCardBudgetMib(")
+        self.assertIn("c.reserve_gb=", js[i:i + 400])
+
+    def test_live_propagation_is_one_call(self):
+        js = _index_script()
+        self.assertIn("const scheduleRecompute=debounce(recomputeNow", js)
+        self.assertIn("api('/api/recompute'", js)
+        # the three-way race is gone from the edit path
+        self.assertNotIn("resolveFlags(); refreshRunnerPlacement(); schedulePlan();", js)
+        self.assertNotIn("resolveFlags(); refreshRunnerPlacement(); doPlan();", js)
+
+    def test_no_arithmetic_is_duplicated_in_the_browser(self):
+        # The simple view renders the placement result; it does not derive it.
+        js = _index_script()
+        i = js.index("function renderSimpleCards(")
+        body = js[i:i + 3000]
+        self.assertIn("pc?pc.total_mib:null", body)
+
+
+class TestTemplatesAreStartingPoints(CustomTestCase):
+    """A template moves the starting point; it never fences a control in."""
+
+    def test_tuning_objectives_offered(self):
+        html = webui.INDEX_HTML
+        for key in ("tune_both", "tune_maxkv", "tune_dec", "tune_enc"):
+            self.assertIn(key, html, key)
+        # the four map onto the fork's own --rank-perf-tune enum
+        from sglang.srt.planner import flags as flagsmod
+        allowed = set(flagsmod.catalog()["rank_perf_tune"].allowed)
+        self.assertEqual(allowed, {"both", "dec", "enc", "maxkv"})
+
+    def test_concurrency_slider_is_not_capped_at_a_constant(self):
+        js = _index_script()
+        # the old hard 64 silently swallowed anything larger
+        self.assertNotIn("$('mrr_slider').value=Math.min(v, 64)", js)
+        self.assertNotIn("$('mrr_slider').value=Math.min(mv, 64)", js)
+        self.assertIn("function setMrrCap(", js)
+        # the range follows what the planner reports as fitting
+        self.assertIn("d.kv_by_concurrency||[]).filter(r=>r.fits)", js)
+
+    def test_context_slider_bound_to_computed_capacity_not_a_preset(self):
+        js = _index_script()
+        self.assertIn("setCtxCap(cap ? cap.max_context_tokens : null)", js)
+
+
+class TestTradeoffTooltips(CustomTestCase):
+    """Every control says what it gives and what it costs, from ONE source."""
+
+    def test_registry_entries_have_both_halves(self):
+        from sglang.srt.planner import tooltips as tipsmod
+        for key, t in tipsmod.TRADEOFFS.items():
+            self.assertTrue(t.gain.strip(), key)
+            self.assertTrue(t.cost.strip(), key)
+            # two half-sentences, not an essay
+            self.assertLess(len(t.gain), 200, key)
+            self.assertLess(len(t.cost), 200, key)
+
+    def test_rendered_line_states_the_cost(self):
+        from sglang.srt.planner import tooltips as tipsmod
+        txt = tipsmod.describe("rank_kv_ratio=speed")
+        self.assertIn("Costs:", txt)
+
+    def test_numbers_are_never_invented(self):
+        # A trade-off that points at a study must say the study has not been
+        # run rather than quoting a figure from nowhere.
+        from sglang.srt.planner import tooltips as tipsmod
+        txt = tipsmod.describe("rank_kv_ratio=speed", measurements={})
+        self.assertIn("Not measured on this rig", txt)
+        txt2 = tipsmod.describe(
+            "rank_kv_ratio=speed", measurements={"mlp_crossover": "+6% prefill"}
+        )
+        self.assertIn("Measured here: +6% prefill", txt2)
+        self.assertNotIn("Not measured", txt2)
+
+    def test_unknown_key_falls_back(self):
+        from sglang.srt.planner import tooltips as tipsmod
+        self.assertEqual(tipsmod.describe("nope", fallback="old text"), "old text")
+
+    def test_fork_flags_are_covered(self):
+        # A knob this fork invented has no documentation anywhere else, so it
+        # is the one that most needs to state its cost. Env-only vectors are
+        # excluded: they mirror a --rank-*-ratio flag that is covered.
+        from sglang.srt.planner import flags as flagsmod
+        from sglang.srt.planner import tooltips as tipsmod
+        fork = [
+            k for k, v in flagsmod.catalog().items()
+            if v.source == "fork" and not v.is_env
+        ]
+        missing = tipsmod.missing_coverage(fork)
+        self.assertEqual(missing, [], f"fork flags without a trade-off: {missing}")
+
+    def test_catalog_payload_carries_the_text(self):
+        d = webui.flag_catalog_payload()
+        specs = {f["id"]: f for g in d["groups"].values() for f in g}
+        self.assertIn("Costs:", specs["rank_kv_ratio"]["tradeoff"])
+        # enums whose options pull opposite ways get a line per option
+        by_value = specs["rank_kv_ratio"]["tradeoff_by_value"]
+        self.assertIn("speed", by_value)
+        self.assertIn("capacity", by_value)
+        self.assertNotEqual(by_value["speed"], by_value["capacity"])
+        self.assertIn("tooltips", d)
+
+    def test_frontend_holds_no_copy_of_the_text(self):
+        # The browser renders what the server sends. If a sentence were
+        # inlined in the JS it would drift from the registry silently.
+        js = _index_script()
+        from sglang.srt.planner import tooltips as tipsmod
+        for key, t in tipsmod.TRADEOFFS.items():
+            self.assertNotIn(t.gain, js, key)
+            self.assertNotIn(t.cost, js, key)
+        self.assertIn("function tip(key){", js)
+        self.assertIn("window._tips=d.tooltips", js)
+
+
+class TestTooltipsRoute(TestHttpRoundTrip):
+    def test_tooltips_endpoint(self):
+        d = json.loads(self._get("/api/tooltips"))
+        self.assertTrue(d["ok"])
+        self.assertIn("rank_kv_ratio=speed", d["tooltips"])
+
+
+# ===========================================================================
+# Etappe 4: task #214 rig pairing over HTTP.
+#
+# The endpoints are thin adapters over rigmon/pairing.py. What is asserted
+# here is the CONTRACT the architecture depends on: one endpoint per step,
+# small bodies, state on the host, and no rule about pairing validity living
+# in the browser.
+# ===========================================================================
+
+
+class TestRigPairRoutes(TestHttpRoundTrip):
+    def setUp(self):
+        super().setUp()
+        from sglang.srt.rigmon import pairing
+        self.pairing = pairing
+        self._real_opener = pairing.STORE._opener
+        self._real_sync = pairing.STORE.synchronous
+        pairing.STORE._opener = lambda url, timeout: json.dumps(
+            {"nodes": []} if url.endswith("/api/nodes") else {"nodes": {}}
+        ).encode()
+        pairing.STORE.synchronous = True
+
+    def tearDown(self):
+        self.pairing.STORE._opener = self._real_opener
+        self.pairing.STORE.synchronous = self._real_sync
+        super().tearDown()
+
+    def test_a_curl_per_step_drives_the_whole_flow(self):
+        d = self._post("/api/rig_pair/start", {"target": "far:8770"})
+        self.assertTrue(d["ok"], d.get("error"))
+        sid = d["session"]["session_id"]
+        self.assertEqual(d["session"]["next_step"], "reach")
+
+        d = self._post("/api/rig_pair/advance", {"session_id": sid})
+        self.assertTrue(d["ok"])
+
+        d = json.loads(self._get(f"/api/rig_pair/status?session_id={sid}"))
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["session"]["session_id"], sid)
+        self.assertEqual(len(d["session"]["steps"]), len(self.pairing.STEPS))
+
+    def test_state_is_readable_after_the_fact(self):
+        # This is what makes a browser reload resume instead of restart.
+        sid = self._post("/api/rig_pair/start", {"target": "far:8770"})["session"][
+            "session_id"
+        ]
+        self._post("/api/rig_pair/advance", {"session_id": sid})
+        again = json.loads(self._get(f"/api/rig_pair/status?session_id={sid}"))
+        self.assertNotEqual(again["session"]["steps"][0]["state"], "pending")
+
+    def test_reset_keeps_the_target(self):
+        sid = self._post("/api/rig_pair/start", {"target": "far:8770"})["session"][
+            "session_id"
+        ]
+        self._post("/api/rig_pair/advance", {"session_id": sid})
+        d = self._post("/api/rig_pair/reset", {"session_id": sid})
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["session"]["target"], "far:8770")
+        self.assertEqual(d["session"]["steps"][0]["state"], "pending")
+
+    def test_missing_target_says_what_to_pass(self):
+        d = self._post("/api/rig_pair/start", {})
+        self.assertFalse(d["ok"])
+        self.assertTrue(d["remedy"])
+
+    def test_unknown_session_is_reported_not_crashed(self):
+        d = self._post("/api/rig_pair/advance", {"session_id": "nope"})
+        self.assertFalse(d["ok"])
+        self.assertIn("no such pairing session", d["error"])
+
+    def test_status_without_an_id_lists_sessions(self):
+        self._post("/api/rig_pair/start", {"target": "far:8770"})
+        d = json.loads(self._get("/api/rig_pair/status"))
+        self.assertTrue(d["ok"])
+        self.assertGreaterEqual(len(d["sessions"]), 1)
+
+
+class TestRigPairUiIsSteeringOnly(CustomTestCase):
+    """No pairing rule may live in the browser.
+
+    The same flow has to behave identically when driven by a shell script; a
+    rule implemented here would simply be absent there.
+    """
+
+    def test_tab_exists(self):
+        html = webui.INDEX_HTML
+        self.assertIn('id="view_pair"', html)
+        self.assertIn("onclick=\"showTab('pair')\"", html)
+
+    def test_frontend_decides_nothing(self):
+        js = _index_script()
+        i = js.index("const PAIR_POLL_MS")
+        body = js[i:js.index("// Shared granular placement renderer")]
+        # no compatibility, reachability or transport logic client-side
+        for forbidden in ("check_compatibility", "NCCL_", "nccl", "sm86",
+                          "choose_transport", "verdict==='ok'?'ok'"):
+            if forbidden == "verdict==='ok'?'ok'":
+                continue
+            self.assertNotIn(forbidden, body, forbidden)
+        # it renders server-supplied verdicts and remedies verbatim
+        self.assertIn("st.remedy", body)
+        self.assertIn("r.remedy", body)
+
+    def test_client_state_is_only_the_session_id(self):
+        js = _index_script()
+        self.assertIn("localStorage.setItem('pair_session'", js)
+
+    def test_no_cross_rig_boot_is_offered(self):
+        js = _index_script()
+        i = js.index("function pairStepBody(")
+        body = js[i:i + 4000]
+        self.assertIn("never starts a run by itself", body)
+        self.assertNotIn("serverStart", body)
+
+
+# ===========================================================================
+# Etappe 5: the benchmark and chess windows.
+# ===========================================================================
+
+
+class TestBenchLeadMetrics(CustomTestCase):
+    """ms per round is the yardstick; absent must never read as zero."""
+
+    def setUp(self):
+        webui._LEAD_PREV.clear()
+
+    def tearDown(self):
+        webui._LEAD_PREV.clear()
+
+    def test_endpoint_required(self):
+        d = webui.bench_lead_metrics_payload({"endpoint": ""})
+        self.assertFalse(d["ok"])
+
+    def test_first_call_only_seeds_the_window(self):
+        # A delta needs two samples. Saying so beats showing an empty table
+        # that looks like a measurement of nothing.
+        class _Sample:
+            up = True
+            reason = None
+            metrics = {}
+            info = {}
+            per_rank = {}
+            per_rank_phase = {}
+
+        with mock.patch(
+            "sglang.srt.rigmon.sources.EngineScraper.scrape",
+            return_value=_Sample(),
+        ):
+            d = webui.bench_lead_metrics_payload({"endpoint": "127.0.0.1:30000"})
+            self.assertTrue(d["ok"])
+            self.assertEqual(d["metrics"], {})
+            self.assertIn("next poll", " ".join(d["notes"]))
+
+    def test_missing_device_timer_is_explained_not_zeroed(self):
+        class _Sample:
+            up = True
+            reason = None
+            metrics = {}
+            info = {}
+            per_rank = {}
+            per_rank_phase = {}
+
+        with mock.patch(
+            "sglang.srt.rigmon.sources.EngineScraper.scrape",
+            return_value=_Sample(),
+        ):
+            webui.bench_lead_metrics_payload({"endpoint": "127.0.0.1:30000"})
+            d = webui.bench_lead_metrics_payload({"endpoint": "127.0.0.1:30000"})
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["metrics"], {})
+        joined = " ".join(d["notes"])
+        self.assertIn("absent, not zero", joined)
+        self.assertIn("SGLANG_ENABLE_METRICS_DEVICE_TIMER", joined)
+
+    def test_unreachable_engine_reports_rather_than_raises(self):
+        d = webui.bench_lead_metrics_payload({"endpoint": "127.0.0.1:1"})
+        self.assertFalse(d["ok"])
+        self.assertTrue(d["error"])
+
+
+class TestBenchLeadMetricsRoute(TestHttpRoundTrip):
+    def test_route(self):
+        d = self._post("/api/bench_lead_metrics", {"endpoint": ""})
+        self.assertFalse(d["ok"])
+
+
+class TestBenchWindow(CustomTestCase):
+    def test_running_and_finished_are_separate(self):
+        # A table still filling must never be mistaken for a complete result.
+        html = webui.INDEX_HTML
+        self.assertIn('id="bn_running_box"', html)
+        self.assertIn("<legend>finished runs</legend>", html)
+        js = _index_script()
+        self.assertIn("function renderBenchRunning(", js)
+        self.assertIn("function renderBenchFinished(", js)
+
+    def test_results_are_configuration_measure_value_tables(self):
+        js = _index_script()
+        self.assertIn("function benchTableHtml(", js)
+        self.assertIn("measure / value", js)
+        i = js.index("function renderBenchFinished(")
+        self.assertIn("configuration:", js[i:i + 1200])
+
+    def test_recorded_measures_are_no_longer_dropped(self):
+        # bench_suite records these per test; the old renderer read only
+        # status and metric and threw the rest away.
+        js = _index_script()
+        i = js.index("function benchMeasures(")
+        body = js[i:i + 900]
+        self.assertIn("d.ttft_ms", body)
+        self.assertIn("d.prefill_tps", body)
+
+    def test_lead_metrics_are_ms_per_round(self):
+        js = _index_script()
+        self.assertIn("ms_per_verify_round:'ms / verify round'", js)
+        self.assertIn("ms_per_1k_prefill_tokens:'ms / 1k prefill tokens'", js)
+
+    def test_a_run_is_never_aborted_by_a_newer_request(self):
+        # api() aborts the previous call under the same key, which is right
+        # for a poll and wrong for a benchmark.
+        js = _index_script()
+        i = js.index("async function benchRun(")
+        body = js[i:js.index("function benchFinish(")]
+        self.assertIn("deliberately NOT routed through api()", body)
+
+    def test_lead_poll_stops_when_the_tab_is_left(self):
+        js = _index_script()
+        self.assertIn("if (t!=='bench') benchLeadStop();", js)
+
+
+class TestChessWindow(CustomTestCase):
+    """Same design line as the benchmark window."""
+
+    def test_result_is_a_measure_value_table(self):
+        js = _index_script()
+        self.assertIn("function qualityTableHtml(", js)
+        i = js.index("function qualityTableHtml(")
+        body = js[i:i + 1400]
+        self.assertIn("prompt tokens", body)
+        self.assertIn("completion tokens", body)
+
+    def test_running_state_is_visible(self):
+        js = _index_script()
+        i = js.index("async function qualityRun(")
+        body = js[i:i + 2000]
+        self.assertIn('chip loading', body)
+        self.assertIn('chip ready', body)
+
+    def test_verdict_stays_a_verdict(self):
+        # It is a judgement, not a measurement, and has to read as one.
+        js = _index_script()
+        i = js.index("function qualityTableHtml(")
+        self.assertIn("verdictClass(d.verdict)", js[i:i + 1400])
+
+
+# ===========================================================================
+# Etappe 6: the discussion export. Built, tested, and deliberately NOT armed.
+# ===========================================================================
+
+
+class TestDiscussionExport(CustomTestCase):
+    def setUp(self):
+        from sglang.srt.planner import discussion_export as dx
+        self.dx = dx
+        self._env = {k: os.environ.get(k) for k in (dx.TARGET_ENV, dx.PAT_FILE_ENV)}
+        for k in self._env:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _payload(self):
+        return {
+            "bench_results": [{
+                "test_id": 1, "label": "basic", "status": "pass",
+                "metric": {"name": "tok_s", "value": 42, "unit": "tok/s"},
+                "detail": {"ttft_ms": 120.5, "prefill_tps": 900.0},
+            }],
+            "lead_metrics": {"ms_per_verify_round": 18.4},
+            "system": {
+                "cards": ["RTX 5090", "RTX 3080"],
+                "driver": "580.00",
+                "model": "/home/someone/models/Qwen3.6-27B",
+            },
+            "launch_flags": ["--model", "/home/someone/models/Q", "--host", "192.168.0.89"],
+            "energy": {"j_per_decode_token": 0.42, "avg_decode_watts": 310.0,
+                       "per_card": [{"name": "RTX 5090", "j_per_decode_token": 0.2,
+                                     "watts": 200, "efficiency": 1.8}]},
+        }
+
+    # -- the gate ---------------------------------------------------------
+
+    def test_nothing_is_armed_without_a_target(self):
+        d = self.dx.preview(self._payload(), "bench_system")
+        self.assertFalse(d["can_send"])
+        self.assertEqual(d["reason"], "no target configured")
+
+    def test_submit_without_a_target_sends_nothing(self):
+        def _boom(req):  # pragma: no cover - must never run
+            raise AssertionError("a request was made with no target configured")
+
+        d = self.dx.submit(self._payload(), "bench_system", confirmed=True,
+                           opener=_boom)
+        self.assertFalse(d["sent"])
+        self.assertIn("no target", d["reason"])
+
+    def test_target_without_a_token_still_sends_nothing(self):
+        os.environ[self.dx.TARGET_ENV] = "D_kwDOABCD"
+        d = self.dx.preview(self._payload(), "bench_system")
+        self.assertFalse(d["can_send"])
+        self.assertIn(self.dx.PAT_FILE_ENV, d["reason"])
+
+    def test_confirm_is_required_even_when_armed(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".pat", delete=False) as f:
+            f.write("ghp_notarealtokenatall")
+            path = f.name
+        try:
+            os.environ[self.dx.TARGET_ENV] = "D_kwDOABCD"
+            os.environ[self.dx.PAT_FILE_ENV] = path
+
+            def _boom(req):  # pragma: no cover - must never run
+                raise AssertionError("a request was made without confirmation")
+
+            d = self.dx.submit(self._payload(), "bench_system", opener=_boom)
+            self.assertFalse(d["sent"])
+            self.assertIn("not confirmed", d["reason"])
+        finally:
+            os.unlink(path)
+
+    # -- redaction --------------------------------------------------------
+
+    def test_system_details_are_always_scrubbed(self):
+        md = self.dx.build_markdown(self._payload(), "full")
+        self.assertNotIn("/home/someone", md)
+        self.assertNotIn("192.168.0.89", md)
+        # what SHOULD survive
+        self.assertIn("RTX 5090", md)
+        self.assertIn("580.00", md)
+
+    def test_notes_are_scrubbed_too(self):
+        p = dict(self._payload(), notes="ran on 10.0.0.5 at /srv/models/foo")
+        md = self.dx.build_markdown(p, "full")
+        self.assertNotIn("10.0.0.5", md)
+        self.assertNotIn("/srv/models", md)
+
+    # -- bundles ----------------------------------------------------------
+
+    def test_bundles_select_sections(self):
+        only = self.dx.build_markdown(self._payload(), "bench")
+        self.assertIn("## Benchmark", only)
+        self.assertNotIn("## System", only)
+        self.assertNotIn("## Energy", only)
+        both = self.dx.build_markdown(self._payload(), "bench_system")
+        self.assertIn("## System", both)
+        self.assertNotIn("## Energy", both)
+        full = self.dx.build_markdown(self._payload(), "bench_system_energy")
+        self.assertIn("## Energy", full)
+
+    def test_energy_groups_are_selectable(self):
+        md = self.dx.build_markdown(
+            self._payload(), "bench_system_energy", energy_groups=["per_token"]
+        )
+        self.assertIn("Energy per token", md)
+        self.assertNotIn("Average power", md)
+
+    def test_lead_metrics_reach_the_report(self):
+        md = self.dx.build_markdown(self._payload(), "bench")
+        self.assertIn("ms / verify round", md)
+
+    def test_unknown_bundle_is_refused(self):
+        with self.assertRaises(self.dx.DiscussionError):
+            self.dx.build_markdown(self._payload(), "nope")
+
+    def test_preview_is_what_would_be_posted(self):
+        # A preview assembled differently from the payload is not a preview.
+        pv = self.dx.preview(self._payload(), "bench_system")
+        md = self.dx.build_markdown(self._payload(), "bench_system")
+        self.assertEqual(pv["markdown"], md)
+
+    # -- the send path, against a mocked API ------------------------------
+
+    def _armed(self):
+        f = tempfile.NamedTemporaryFile("w", suffix=".pat", delete=False)
+        f.write("ghp_notarealtokenatall")
+        f.close()
+        os.environ[self.dx.TARGET_ENV] = "D_kwDOABCD"
+        os.environ[self.dx.PAT_FILE_ENV] = f.name
+        return f.name
+
+    def test_first_submit_adds_a_comment(self):
+        path = self._armed()
+        seen = []
+
+        def opener(req):
+            seen.append(json.loads(req.data.decode()))
+            if "comments(first" in seen[-1]["query"]:
+                return json.dumps({"data": {"node": {"comments": {"nodes": []}}}}).encode()
+            return json.dumps({"data": {"addDiscussionComment": {
+                "comment": {"id": "C_1", "url": "https://example/x"}}}}).encode()
+
+        try:
+            d = self.dx.submit(self._payload(), "bench_system",
+                               confirmed=True, opener=opener)
+            self.assertTrue(d["sent"])
+            self.assertEqual(d["action"], "created")
+        finally:
+            os.unlink(path)
+
+    def test_resubmit_updates_in_place(self):
+        path = self._armed()
+
+        def opener(req):
+            q = json.loads(req.data.decode())["query"]
+            if "comments(first" in q:
+                return json.dumps({"data": {"node": {"comments": {"nodes": [
+                    {"id": "C_old", "body": self.dx.MARKER + " old",
+                     "viewerDidAuthor": True}]}}}}).encode()
+            return json.dumps({"data": {"updateDiscussionComment": {
+                "comment": {"id": "C_old", "url": "https://example/x"}}}}).encode()
+
+        try:
+            d = self.dx.submit(self._payload(), "bench_system",
+                               confirmed=True, opener=opener)
+            self.assertEqual(d["action"], "updated")
+        finally:
+            os.unlink(path)
+
+    def test_token_never_leaves_except_in_the_header(self):
+        path = self._armed()
+        seen = []
+
+        def opener(req):
+            seen.append(req)
+            return json.dumps({"data": {"node": {"comments": {"nodes": []}}}}).encode()
+
+        try:
+            try:
+                self.dx.submit(self._payload(), "bench_system",
+                               confirmed=True, opener=opener)
+            except self.dx.DiscussionError:
+                pass
+            req = seen[0]
+            self.assertNotIn("ghp_", req.full_url)
+            self.assertIn("ghp_", req.headers.get("Authorization", ""))
+            self.assertNotIn("ghp_", req.data.decode())
+        finally:
+            os.unlink(path)
+
+    def test_api_errors_are_token_redacted(self):
+        path = self._armed()
+
+        def opener(req):
+            return json.dumps({"errors": [{"message": "bad credentials ghp_notarealtokenatall"}]}).encode()
+
+        try:
+            with self.assertRaises(self.dx.DiscussionError) as cm:
+                self.dx.submit(self._payload(), "bench_system",
+                               confirmed=True, opener=opener)
+            self.assertNotIn("ghp_notarealtokenatall", str(cm.exception))
+            self.assertIn("<redacted-token>", str(cm.exception))
+        finally:
+            os.unlink(path)
+
+
+class TestDiscussionRoutes(TestHttpRoundTrip):
+    def test_preview_route_reports_the_gate(self):
+        d = self._post("/api/discussion_preview", {"data": {}, "bundle": "bench"})
+        self.assertTrue(d["ok"])
+        self.assertFalse(d["can_send"])
+        self.assertIn("bundles", d)
+
+    def test_submit_route_sends_nothing_when_unarmed(self):
+        d = self._post("/api/discussion_submit",
+                       {"data": {}, "bundle": "bench", "confirmed": True})
+        self.assertFalse(d["sent"])
+
+
+class TestDiscussionUi(CustomTestCase):
+    def test_composer_exists_and_states_the_gate(self):
+        html = webui.INDEX_HTML
+        self.assertIn('id="dx_bundle"', html)
+        self.assertIn('id="dx_preview"', html)
+        self.assertIn("Nothing is created automatically", html)
+
+    def test_frontend_composes_no_markdown(self):
+        js = _index_script()
+        i = js.index("function discussionData(")
+        body = js[i:js.index("// ---- GitHub share (#152)")]
+        for forbidden in ("## Benchmark", "## System", "|---|", "scrub"):
+            self.assertNotIn(forbidden, body, forbidden)
+
+    def test_send_needs_an_explicit_confirm(self):
+        js = _index_script()
+        i = js.index("async function discussionSubmit(")
+        self.assertIn("confirm(", js[i:i + 600])
