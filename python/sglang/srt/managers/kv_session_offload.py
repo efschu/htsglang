@@ -200,23 +200,103 @@ def owned_counts_even(seq_len: int, dcp_size: int) -> List[int]:
     ]
 
 
-def prefill_spill_deep_gate(prefill_spill: bool, spec_active: bool) -> bool:
-    """PS2 MASTER GATE (V1). On top of ``--kv-session-offload-prefill`` the deep
-    path is disabled under speculative decoding.
+def prefill_spill_deep_reject_reason(
+    spec_active: bool,
+    spec_in_tick_ready: bool,
+    resume_under_spec: bool,
+    dflash_prefill_append: bool,
+) -> Optional[str]:
+    """The condition that blocks PS2 under speculative decoding, or ``None``.
 
-    Reason, hard: under an active spec algorithm the target prefill is followed
-    by a DRAFT extend that reuses the SAME ScheduleBatch, hence the same
-    ``out_cache_loc`` (``eagle_worker_v2._draft_extend_for_prefill`` ->
-    ``ForwardBatch.init_new(batch, self.draft_runner)``). For a born-spilled
-    prompt that tensor holds HOST SENTINELS, which the draft pool -- a separate,
-    non-DCP-sharded pool sized to the context -- cannot address: the draft write
-    would land out of bounds. Routing a born-spilled prefill's draft KV is
-    separate work (the decode side solved the analogous problem with the
-    spec-in-tick draft snapshot). Until then PS2 declines rather than admitting
-    a prompt that would crash. PS1 born-spilled admission is unaffected.
+    The mechanical problem: the target prefill is followed by a DRAFT extend
+    that reuses the SAME ScheduleBatch and hence the same ``out_cache_loc``
+    (``eagle_worker_v2._draft_extend_for_prefill`` -> ``ForwardBatch.init_new(
+    batch, self.draft_runner)``). For a born-spilled prompt that tensor holds
+    HOST SENTINELS, which the draft pool -- a separate pool sharing the target's
+    slot id space -- cannot address, so the draft write would land out of
+    bounds.
 
-    Rank-uniform: both inputs are replicated config."""
-    return bool(prefill_spill) and not bool(spec_active)
+    That is a PLACEMENT problem, and for the common configuration it dissolves:
+    the draft extend of a born-spilled prefill produces nothing anyone reads, so
+    it is skipped outright (``EagleDraftWorkerBase.born_spilled_stub_draft_
+    input`` carries the argument). The three conditions below are the ones under
+    which the prompt's draft KV IS read again, and only there does PS2 decline:
+
+      * ``spec_in_tick_ready`` -- the spilled session drafts on device during
+        the spill tick and attends the prompt's draft KV through the
+        ``spec_in_tick_draft_pre`` req_to_token surgery;
+      * ``resume_under_spec`` (KVSO_RESUME=1) -- the session waves back and
+        rejoins the live spec decode batch, whose draft attends the prompt
+        positions on device;
+      * ``dflash_prefill_append`` -- DFLASH appends the prompt's context
+        features to its own draft KV in ``dflash_worker_v2.prefill_after_
+        target``, a second write path that the skip above does not cover. This
+        is a BOOT-time predicate on purpose: under cross-algorithm switching
+        that append runs on every prefill regardless of which rung is active
+        (``cross_algo_worker.py:1737``), so keying it to the active rung would
+        miss it.
+
+    Lifting the first two is the same work: give the born-spilled prefill's
+    draft KV a home outside the target's slot space (a draft-pool-only carve
+    plus the existing device-resident ``draft_dev_k/v`` snapshot format), which
+    is what ``--draft-kv-layout`` (#108) is about.
+
+    Rank-uniform: every input is replicated config or a rank-0-broadcast rung
+    id (``_effective_spec_algorithm``)."""
+    if not spec_active:
+        return None
+    if spec_in_tick_ready:
+        return (
+            "spec-in-tick is armed (--kv-session-offload-spec-in-tick + "
+            "KVSO_ALLOW_SPEC=1): the spilled session drafts on device and "
+            "attends the prompt's draft KV, which a born-spilled prefill never "
+            "wrote. Drop spec-in-tick to use PS2, or vice versa."
+        )
+    if resume_under_spec:
+        return (
+            "resume-under-spec is armed (KVSO_RESUME=1): a session that waves "
+            "back rejoins the live spec batch and its draft attends the prompt "
+            "positions, which a born-spilled prefill never wrote. Drop "
+            "KVSO_RESUME to use PS2, or vice versa."
+        )
+    if dflash_prefill_append:
+        return (
+            "a DFLASH-family drafter is configured (primary or cross-algorithm "
+            "secondary): its prefill append "
+            "(dflash_worker_v2.prefill_after_target) writes the born-spilled "
+            "prompt's draft KV through a second path that the skip does not "
+            "cover."
+        )
+    return None
+
+
+def prefill_spill_deep_gate(
+    prefill_spill: bool,
+    spec_active: bool,
+    spec_in_tick_ready: bool = False,
+    resume_under_spec: bool = False,
+    dflash_prefill_append: bool = False,
+) -> bool:
+    """PS2 MASTER GATE. ``--kv-session-offload-prefill`` AND no blocking spec
+    condition (``prefill_spill_deep_reject_reason`` carries the reasoning and
+    the exact wording of each block).
+
+    PS1 born-spilled admission is unaffected by all of this -- it prefills on
+    device and rides the decode-OOM spill, so its draft extend is a normal
+    device write.
+
+    Rank-uniform: every input is replicated config."""
+    if not prefill_spill:
+        return False
+    return (
+        prefill_spill_deep_reject_reason(
+            spec_active,
+            spec_in_tick_ready,
+            resume_under_spec,
+            dflash_prefill_append,
+        )
+        is None
+    )
 
 
 def prefill_spill_deep_ok(

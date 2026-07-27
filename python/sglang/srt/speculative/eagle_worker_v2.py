@@ -1324,6 +1324,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # kv-session-offload PS2: a born-spilled prefill has host sentinels in
+        # out_cache_loc -- the draft write would land outside the draft pool.
+        # See born_spilled_stub_draft_input for why skipping is sound.
+        if getattr(batch, "kv_session_prefill_spill", False):
+            return self.born_spilled_stub_draft_input(batch, next_token_ids)
+
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
@@ -1979,6 +1985,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
+            # kv-session-offload PS2: the draft extend of a born-spilled
+            # prefill is skipped, so the per-token FULL capture feeds nothing
+            # -- and a born-spilled prompt is by definition long enough that
+            # the capture is a large allocation at the moment device memory is
+            # scarcest. A request that asked for hidden states itself keeps it.
+            if getattr(batch, "kv_session_prefill_spill", False) and not getattr(
+                batch, "return_hidden_states", False
+            ):
+                target_capture_mode = CaptureHiddenMode.NULL
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
 
