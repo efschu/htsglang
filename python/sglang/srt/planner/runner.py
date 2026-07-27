@@ -108,6 +108,9 @@ __all__ = [
     "suggest_num_prompts",
     "HarnessOutcome",
     "SubprocessHarness",
+    "load_study",
+    "render_study_text",
+    "render_dry_run_text",
 ]
 
 
@@ -161,7 +164,7 @@ class TimeBudget:
             )
 
     def verdict(self, duration_s: float) -> str:
-        """"" (in band) | "short" | "over_target" | "ceiling"."""
+        """ "" (in band) | "short" | "over_target" | "ceiling"."""
         if duration_s > self.ceiling_s:
             return "ceiling"
         if duration_s > self.target_high_s:
@@ -455,9 +458,7 @@ def own_vram_gate(
         "own_holding": [],
     }
     if nvml is None:
-        record["reason"] = (
-            "NVML unavailable; the gate could not look and did not block"
-        )
+        record["reason"] = "NVML unavailable; the gate could not look and did not block"
         return record
 
     start = clock()
@@ -547,6 +548,7 @@ def card_state(samples: Sequence[Any]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Metrics for one window
 # ---------------------------------------------------------------------------
+
 
 def _is_harness_field(spec: str) -> bool:
     """Whether a scenario's ``metric_fields`` entry names a real harness field.
@@ -825,11 +827,7 @@ class StudyResult:
     notes: List[str] = dataclasses.field(default_factory=list)
 
     def points_for(self, arm: str, role: str = "") -> List[PointResult]:
-        return [
-            p
-            for p in self.points
-            if p.arm == arm and (not role or p.role == role)
-        ]
+        return [p for p in self.points if p.arm == arm and (not role or p.role == role)]
 
     def to_json(self) -> dict:
         return {
@@ -927,7 +925,9 @@ def arm_result_from_points(
     for p in usable:
         for w in p.windows:
             slot = windows.setdefault(w.window, {})
-            excluded[w.window] = excluded.get(w.window, False) or w.excluded_from_headline
+            excluded[w.window] = (
+                excluded.get(w.window, False) or w.excluded_from_headline
+            )
             for key, value in w.metrics.items():
                 slot.setdefault(key, []).append(float(value))
             for key, n in w.samples.items():
@@ -955,9 +955,7 @@ def arm_result_from_points(
         results.append(
             WindowResult(
                 window=key,
-                metrics={
-                    m: statistics.median(v) for m, v in slot.items() if v
-                },
+                metrics={m: statistics.median(v) for m, v in slot.items() if v},
                 samples=dict(samples.get(key, {})),
                 excluded_from_headline=excluded.get(key, False),
                 note="; ".join(notes.get(key, [])),
@@ -982,18 +980,14 @@ def arm_result_from_points(
         "boots_run": len(points),
         "boots_used": len(usable),
         "boots_throttled": throttled,
-        "boots_aborted": [
-            {"repeat": p.repeat, "reason": p.aborted} for p in dropped
-        ],
+        "boots_aborted": [{"repeat": p.repeat, "reason": p.aborted} for p in dropped],
         "state_note": (
             f"{throttled} of {len(usable)} boots ran throttled; kept and "
             "marked, not dropped"
             if throttled
             else "no throttling observed in the boots used"
         ),
-        "newest_point_age_s": (
-            min(p.age_s() for p in usable) if usable else None
-        ),
+        "newest_point_age_s": (min(p.age_s() for p in usable) if usable else None),
     }
     return ArmResult(
         label=label,
@@ -1091,13 +1085,57 @@ class Study:
     def steps(self) -> List[WindowStep]:
         return window_plan(self.scenario, self.window_drivers)
 
+    def dry_run(self) -> Dict[str, Any]:
+        """Everything the study would do, without doing any of it.
+
+        The point of a dry run here is not reassurance: it is that the two
+        failure modes which cost the most (a harness command that cannot
+        express an axis, and a missing device timer that empties every round
+        time) are both visible before the first boot, and both take multiple
+        boots to notice afterwards.
+        """
+        plan = self.plan()
+        arms = []
+        for arm in self.arms:
+            cmd = self.harness_command(arm)
+            arms.append(
+                {
+                    "label": arm.label,
+                    "runnable": bool(cmd.get("runnable")),
+                    "reason": cmd.get("reason", ""),
+                    "command": cmd.get("command", ""),
+                    "env": self._launch_env(arm),
+                    "launch": _launch_argv(arm),
+                }
+            )
+        primary = self.scenario.primary_metric
+        return {
+            "scenario": self.scenario.key,
+            "question": self.scenario.question,
+            "primary_metric": primary.key if primary else "",
+            "boots": len(plan),
+            "schedule": [b.to_json() for b in plan],
+            "windows": [s.to_json() for s in self.steps()],
+            "arms": arms,
+            "preflight": self.preflight(),
+            "budget": dataclasses.asdict(self.policy.budget),
+            "estimated_load_s": len(plan)
+            * len([s for s in self.steps() if not s.undrivable_reason])
+            * self.policy.budget.target_high_s,
+            "runnable": all(a["runnable"] for a in arms),
+        }
+
     def preflight(self) -> List[str]:
         """What the operator has to know before this runs, in order."""
+        tail = (
+            f"then {self.policy.comparison_repeats}x interleaved over "
+            f"{len(self.arms)} arms"
+            if len(self.arms) > 1
+            else "one arm only, so the floor is the whole schedule"
+        )
         out = [
             f"schedule: {len(self.plan())} boots "
-            f"({self.policy.noise_floor_boots} A-vs-A first, then "
-            f"{self.policy.comparison_repeats}x interleaved over "
-            f"{len(self.arms)} arms)",
+            f"({self.policy.noise_floor_boots} A-vs-A first, {tail})",
             (
                 "the floor is measured boot-to-boot; repeats inside one boot "
                 "are not offered"
@@ -1287,9 +1325,7 @@ class Study:
 
         return EngineScraper(base_url)
 
-    def _run_windows(
-        self, result: PointResult, arm: Arm, cmd: Dict[str, Any]
-    ) -> None:
+    def _run_windows(self, result: PointResult, arm: Arm, cmd: Dict[str, Any]) -> None:
         scraper = self._scraper(arm)
         metric_fields = cmd.get("metric_fields") or {}
         for step in self.steps():
@@ -1325,9 +1361,7 @@ class Study:
             t1 = self.clock()
             after = scraper.scrape()
 
-            duration = (
-                outcome.duration_s if outcome is not None else max(0.0, t1 - t0)
-            )
+            duration = outcome.duration_s if outcome is not None else max(0.0, t1 - t0)
             result.durations_s[step.window] = duration
             verdict = self.policy.budget.verdict(duration)
             result.budget_verdicts[step.window] = verdict
@@ -1367,9 +1401,7 @@ class Study:
 
             if outcome is not None and outcome.result:
                 self._absorb_conditions(result, outcome.result)
-                result.provenance.setdefault("harness", []).append(
-                    outcome.to_json()
-                )
+                result.provenance.setdefault("harness", []).append(outcome.to_json())
 
     def _absorb_conditions(
         self, result: PointResult, harness_result: Dict[str, Any]
@@ -1452,8 +1484,7 @@ class Study:
 
         for arm in self.arms:
             points = [
-                p for p in out.points
-                if p.arm == arm.label and p.role == "comparison"
+                p for p in out.points if p.arm == arm.label and p.role == "comparison"
             ] or out.points_for(arm.label)
             out.arms.append(arm_result_from_points(arm.label, points, self.scenario))
 
@@ -1466,12 +1497,7 @@ class Study:
                     )
                 )
 
-        durations = [
-            d
-            for p in out.points
-            for d in p.durations_s.values()
-            if d > 0
-        ]
+        durations = [d for p in out.points for d in p.durations_s.values() if d > 0]
         if durations:
             advice = suggest_num_prompts(
                 statistics.median(durations),
@@ -1484,8 +1510,7 @@ class Study:
         aborted = [p for p in out.points if p.aborted]
         if aborted and len(aborted) == len(out.points):
             out.aborted = (
-                "every point aborted; the first reason was: "
-                f"{aborted[0].aborted}"
+                "every point aborted; the first reason was: " f"{aborted[0].aborted}"
             )
         return out
 
@@ -1494,6 +1519,115 @@ class Study:
             if not step.excluded_from_headline and not step.undrivable_reason:
                 return step.window
         return DEFAULT_WINDOW
+
+
+def _launch_argv(arm: Arm) -> List[str]:
+    try:
+        return list(arm.settings.launch_command())
+    except Exception:
+        return []
+
+
+def load_study(path: str, **overrides) -> Study:
+    """Build a :class:`Study` from a JSON description.
+
+    A study is data for the same reason a scenario is: a new comparison is a
+    new file, not a new code path, and the file is the thing that gets
+    attached to a result when somebody asks six weeks later what exactly ran.
+
+    ::
+
+        {
+          "scenario": "noise_floor",
+          "policy": {"noise_floor_boots": 3, "comparison_repeats": 2,
+                     "num_prompts": 64,
+                     "env": {"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"}},
+          "point": {},
+          "arms": [
+            {"label": "even",   "settings": {...}, "conditions": {...}},
+            {"label": "uneven", "settings": {...}, "env": {...}}
+          ]
+        }
+
+    ``settings`` is a ``server_manager.LaunchSettings`` field mapping and is
+    validated on construction, so a bad rank map fails here rather than after
+    the first boot.
+    """
+    from sglang.srt.planner.scenarios import SCENARIOS, load_scenarios
+    from sglang.srt.planner.server_manager import LaunchSettings
+
+    with open(path) as f:
+        spec = json.load(f)
+
+    registry = dict(SCENARIOS)
+    if spec.get("scenario_file"):
+        load_scenarios(spec["scenario_file"], into=registry)
+    key = spec.get("scenario")
+    scenario = registry.get(key)
+    if scenario is None:
+        raise KeyError(
+            f"no scenario {key!r}. Known: {', '.join(sorted(registry))}. "
+            "A new question is a new scenario entry (or a scenario_file), not "
+            "a new flag."
+        )
+
+    policy_spec = dict(spec.get("policy") or {})
+    budget = policy_spec.pop("budget", None)
+    policy = RunPolicy(**policy_spec)
+    if budget:
+        policy.budget = TimeBudget(**budget)
+
+    arms = []
+    for entry in spec.get("arms") or []:
+        settings = LaunchSettings(**entry["settings"]).validate()
+        arms.append(
+            Arm(
+                label=entry["label"],
+                settings=settings,
+                env=dict(entry.get("env") or {}),
+                conditions=dict(entry.get("conditions") or {}),
+                note=entry.get("note", ""),
+            )
+        )
+    if not arms:
+        raise ValueError(f"{path}: a study needs at least one arm")
+
+    return Study(
+        scenario, arms, policy=policy, point=spec.get("point") or {}, **overrides
+    )
+
+
+def render_dry_run_text(dry: Dict[str, Any]) -> str:
+    lines = [
+        f"Study: {dry['scenario']}",
+        f"Question: {dry['question']}",
+        f"Yardstick: {dry['primary_metric'] or '(none declared)'}",
+        "",
+        f"{dry['boots']} boots, load only ~{dry['estimated_load_s']:.0f}s at the "
+        "top of the band (boot and teardown come on top):",
+    ]
+    for b in dry["schedule"]:
+        lines.append(f"  {b['order']:>2}. {b['arm']} r{b['repeat']}  [{b['role']}]")
+    lines += ["", "Windows:"]
+    for w in dry["windows"]:
+        mark = " [excluded from headline]" if w["excluded_from_headline"] else ""
+        how = "harness" if w["drives_harness"] else "driver"
+        if w["undrivable_reason"]:
+            how = "NOT MEASURED"
+        lines.append(f"  {w['window']:<20} {how}{mark}")
+        if w["undrivable_reason"]:
+            lines.append(f"      {w['undrivable_reason']}")
+    lines += ["", "Arms:"]
+    for a in dry["arms"]:
+        lines.append(f"  {a['label']}: {'runnable' if a['runnable'] else 'BLOCKED'}")
+        if a["reason"]:
+            lines.append(f"      {a['reason']}")
+        if a["command"]:
+            lines.append(f"      {a['command']}")
+    lines += ["", "Before running:"]
+    for p in dry["preflight"]:
+        lines.append(f"  - {p}")
+    return "\n".join(lines)
 
 
 def render_study_text(result: StudyResult) -> str:
@@ -1512,9 +1646,7 @@ def render_study_text(result: StudyResult) -> str:
             if verdict:
                 marks.append(f"{window}:{verdict}")
         suffix = f"  [{', '.join(marks)}]" if marks else ""
-        lines.append(
-            f"  {p.order:>2}. {p.arm} r{p.repeat} ({p.role}){suffix}"
-        )
+        lines.append(f"  {p.order:>2}. {p.arm} r{p.repeat} ({p.role}){suffix}")
         if p.aborted:
             lines.append(f"      {p.aborted}")
     if result.noise:
@@ -1526,9 +1658,7 @@ def render_study_text(result: StudyResult) -> str:
     if result.comparisons:
         lines += ["", "Comparisons:"]
         for c in result.comparisons:
-            lines.append(
-                f"  [{c.verdict}] {c.metric} in {c.window}: {c.reason}"
-            )
+            lines.append(f"  [{c.verdict}] {c.metric} in {c.window}: {c.reason}")
     if result.notes:
         lines += ["", "Notes:"]
         for n in result.notes:

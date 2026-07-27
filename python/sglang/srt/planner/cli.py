@@ -281,6 +281,36 @@ def build_parser() -> argparse.ArgumentParser:
         default="http://127.0.0.1:30000",
         help="Engine base URL a scenario's harness command should target.",
     )
+    rn = p.add_argument_group(
+        "running a scenario (the executor)",
+        "A scenario says what to measure and comparison.py says what may be "
+        "concluded; --run-study is what runs in between. The A-vs-A noise "
+        "floor is always the head of the schedule, so nothing here can hand a "
+        "comparison a threshold derived from the runs it is meant to judge.",
+    )
+    rn.add_argument(
+        "--run-study",
+        default="",
+        metavar="PATH",
+        help="Run a study described by a JSON file: which scenario, which "
+        "arms, which policy. Boots one server per measurement point and tears "
+        "it down again. Needs GPUs.",
+    )
+    rn.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --run-study: print the boot schedule, the windows, the "
+        "harness command per arm and the preflight, and boot nothing. The two "
+        "failures worth catching early — an axis the harness cannot express "
+        "and a missing device timer — are both visible here.",
+    )
+    rn.add_argument(
+        "--study-out",
+        default="",
+        metavar="PATH",
+        help="Write the study result as JSON. Carries every point with its "
+        "card state, its age and its abort reason, not just the figures.",
+    )
     return p
 
 
@@ -382,6 +412,60 @@ def _run_scenario(args) -> int:
         for e in cmd["external"]:
             print(f"  before it: set {e['label']} = {e['value']} ({e['apply']})")
     return 0
+
+
+def _run_study(args) -> int:
+    """Run (or dry-run) a study file.
+
+    A blocked arm ends the invocation before anything boots. The alternative
+    would be a sweep that ran its first point, discovered the axis it cannot
+    set, and left a half-measured server behind.
+    """
+    from sglang.srt.planner.runner import (
+        load_study,
+        render_dry_run_text,
+        render_study_text,
+    )
+
+    try:
+        study = load_study(args.run_study)
+    except Exception as e:
+        print(f"error: {args.run_study}: {e}", file=sys.stderr)
+        return 2
+
+    dry = study.dry_run()
+    if args.dry_run:
+        if args.json:
+            print(json.dumps(dry, indent=1, default=str))
+        else:
+            print(render_dry_run_text(dry))
+        return 0 if dry["runnable"] else 1
+
+    if not dry["runnable"]:
+        print(render_dry_run_text(dry), file=sys.stderr)
+        print(
+            "\nrefusing to start: an arm above is blocked. Running it anyway "
+            "would repeat one point and look like a completed sweep.",
+            file=sys.stderr,
+        )
+        return 1
+
+    from sglang.srt.planner.server_manager import SglangSupervisor
+    from sglang.srt.rigmon.sources import GpuSampler
+
+    study.supervisor = SglangSupervisor()
+    study.sampler = GpuSampler(profile_every=0)
+    study.nvml = study.supervisor._nvml_mod()
+
+    result = study.run()
+    if args.study_out:
+        with open(args.study_out, "w") as f:
+            json.dump(result.to_json(), f, indent=1, default=str)
+    if args.json:
+        print(json.dumps(result.to_json(), indent=1, default=str))
+    else:
+        print(render_study_text(result))
+    return 1 if result.aborted else 0
 
 
 def _load_hardware(args):
@@ -723,6 +807,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.levers:
         return _run_levers(args)
+
+    if args.run_study:
+        return _run_study(args)
 
     if args.scenario or args.scenario_question or args.list_scenarios:
         return _run_scenario(args)
