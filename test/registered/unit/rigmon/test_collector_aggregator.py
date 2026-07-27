@@ -115,7 +115,7 @@ class TestCollector(CustomTestCase):
         cfg = CollectorConfig(node_id="node-a", tiers=TIERS, engine_url="", **kw)
         return Collector(
             config=cfg,
-            sampler=GpuSampler(FakeBackend(), profile_every=3),
+            sampler=GpuSampler(FakeBackend(), counters_every=3),
             scraper=FakeScraper(),
             clock=FakeClock(),
         )
@@ -140,7 +140,7 @@ class TestCollector(CustomTestCase):
         backend = FakeBackend()
         c = Collector(
             config=CollectorConfig(node_id="n", tiers=TIERS, engine_url=""),
-            sampler=GpuSampler(backend, profile_every=3),
+            sampler=GpuSampler(backend, counters_every=3),
             scraper=FakeScraper(),
             clock=FakeClock(),
         )
@@ -151,10 +151,15 @@ class TestCollector(CustomTestCase):
 
     def test_profiling_can_be_switched_off_entirely(self):
         backend = FakeBackend()
-        s = GpuSampler(backend, profile_every=0)
+        s = GpuSampler(backend, counters_every=0)
         for _ in range(5):
             s.sample()
         self.assertEqual(backend.profiling_calls, 0)
+
+    def test_legacy_profile_every_keyword_still_maps(self):
+        # The pre-rename spelling; the planner CLI still passes it.
+        s = GpuSampler(FakeBackend(), profile_every=4)
+        self.assertEqual(s.counters_every, 4)
 
     def test_snapshot_reports_field_availability_and_backend(self):
         c = self._collector()
@@ -175,7 +180,7 @@ class TestCollector(CustomTestCase):
     def test_engine_down_does_not_break_the_loop(self):
         c = Collector(
             config=CollectorConfig(node_id="n", tiers=TIERS, engine_url=""),
-            sampler=GpuSampler(FakeBackend(), profile_every=0),
+            sampler=GpuSampler(FakeBackend(), counters_every=0),
             scraper=FakeScraper(up=False),
             clock=FakeClock(),
         )
@@ -187,7 +192,7 @@ class TestCollector(CustomTestCase):
     def test_null_backend_host_still_collects_engine_metrics(self):
         c = Collector(
             config=CollectorConfig(node_id="n", tiers=TIERS, engine_url=""),
-            sampler=GpuSampler(NullBackend("no GPU on this host"), profile_every=0),
+            sampler=GpuSampler(NullBackend("no GPU on this host"), counters_every=0),
             scraper=FakeScraper(),
             clock=FakeClock(),
         )
@@ -213,7 +218,7 @@ class TestPushIngest(CustomTestCase):
         client = PushClient("http://agg:8770", "secret", "node-b", opener=opener)
         col = Collector(
             config=CollectorConfig(node_id="node-b", tiers=TIERS, engine_url=""),
-            sampler=GpuSampler(FakeBackend(), profile_every=0),
+            sampler=GpuSampler(FakeBackend(), counters_every=0),
             scraper=FakeScraper(),
             push=client,
             clock=FakeClock(),
@@ -268,7 +273,7 @@ class TestPushIngest(CustomTestCase):
         client = PushClient("http://agg", "secret", "node-b", opener=opener)
         col = Collector(
             config=CollectorConfig(node_id="node-b", tiers=TIERS, engine_url=""),
-            sampler=GpuSampler(FakeBackend(), profile_every=0),
+            sampler=GpuSampler(FakeBackend(), counters_every=0),
             scraper=FakeScraper(),
             push=client,
             clock=FakeClock(),
@@ -340,7 +345,7 @@ class TestAggregatorReads(CustomTestCase):
         agg = Aggregator(AggregatorConfig(tiers=TIERS))
         col = Collector(
             config=CollectorConfig(node_id="node-a", tiers=TIERS, engine_url=""),
-            sampler=GpuSampler(FakeBackend(), profile_every=0),
+            sampler=GpuSampler(FakeBackend(), counters_every=0),
             scraper=FakeScraper(),
             clock=FakeClock(),
         )

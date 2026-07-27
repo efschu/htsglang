@@ -75,7 +75,7 @@ comparison point does not apply to that engine.
 | [17](#f17) | HiCache under asymmetric-TP/DCP | Boot-checked | yes (base) | n/a | partial | partial |
 | [18](#f18) | TP greater than num_kv_heads | Boot-checked | partial | partial | partial | partial |
 | [19](#f19) | Broad model bring-up under asymmetric-TP | Boot-checked | n/a | n/a | n/a | n/a |
-| [20](#f20) | Session KV spill | Exp | partial | partial | partial | partial |
+| [20](#f20) | Session KV spill | Exp, Boot-checked | partial | partial | partial | partial |
 | [21](#f21) | HTCCL cross-vendor collectives | Cross-checked | no | no | partial | partial |
 | [22](#f22) | fp8 dequant fallback (W8A16) | Cross-checked* | no | no | partial | unverified |
 | [23](#f23) | Turing/gfx900 without sgl-kernel | Cross-checked | no | no | partial | partial |
@@ -271,7 +271,9 @@ class, same pool in every arm.
 **Without a hardware boot:** fast-lane priority scheduling (`Built` only); solo draft placement,
 which has no dedicated boot and runs only inside the weightless-lane, cross-host TP=4 and TP=5
 configurations above; cross-vendor CUDA-graph capture; MoE-model hibernation (not built); a session
-KV spill coinciding with a speculative tick; three co-resident spilled sessions; tree speculation at
+KV spill landing in the same round as a drafter-in-tick step; more than one simultaneously spilled
+session (the mechanics are unit-tested; boots show one spilled session among up to three
+co-resident ones); tree speculation at
 `--speculative-eagle-topk > 1` under weighted DCP (gated off); the `fp8.py` `Fp8Config` family on
 the capability probe. Gemma-4 does not run under uneven DCP, since `SWAKVPool` carries no DCP mask,
 and it refuses the flashinfer backend. Throughput under SWA-DCP has not been taken.
@@ -579,17 +581,31 @@ code.
 <a id="f20"></a>
 ### 20. Session KV spill
 
-`--enable-kv-session-offload` plus tick/margin/hysteresis flags — on VRAM overflow, the newest
-in-flight request's KV shard offloads to host RAM while it keeps decoding; FCFS-by-arrival victim
-order. **Exp** — S1 scope only (single spilled request, eager path); overlap and multi-request are
-planned, not built. Numbers above.
+`--enable-kv-session-offload` plus tick/margin/hysteresis/pool flags — on VRAM overflow, the newest
+in-flight session's KV shard moves to a pinned host pool while the session keeps decoding through a
+bs=1 host-streamed spill tick interleaved with the device batches; FCFS-by-arrival victim order,
+stock retraction as fallback. **Exp, Boot-checked** — decode-side spill, restore and prefill-side
+admission all run on hardware with speculation active; spill rows in the combinations table above,
+admission checks below.
 
-| Item | Detail |
+| Area | State |
 |---|---|
-| Green in the boot matrix | RAM-budget-sized host pool (1.00 GB/rank of 24 GiB), prefill-side spill, configurable wave-back threshold |
-| Fixed | a sentinel-row radix-tree leak |
-| Restore readiness | must count radix-evictable tokens, not the free list alone: a finished neighbour session returns its KV into the radix tree as evictable, so a free-list-only gate deadlocks precisely when the most memory is available. The commit path stays authoritative and evicts before re-checking |
-| Not validated | a spill coinciding with a speculative tick; three co-resident spilled sessions |
+| Spill | whole-session, or a partial tail segment with hybrid device+host attention across the boundary; multiple concurrent spilled sessions (per-session host regions, `--kv-session-offload-max-spills`); host pool sized from a node-wide RAM budget (`--kv-session-offload-host-ram-gib`) |
+| Decode while spilled | spill tick at a static interval or under a self-calibrating cadence with an anti-starvation floor; eager by default, a bucketed CUDA-graph tick behind `SGLANG_KVSO_SPILL_GRAPH=1` (per-rung graph==eager at machine zero) |
+| Restore | FIFO with margin and hysteresis; incremental wave-back behind a configurable free-token threshold; readiness counts radix-evictable tokens, not the free list alone — a finished neighbour session returns its KV as evictable, so a free-list-only gate deadlocks precisely when the most memory is available. The commit path stays authoritative and evicts before re-checking |
+| Speculation | a spilled session decodes under MTP/NEXTN: the draft-KV share spills and restores with the session, with on-device resume and draft backfill; the drafter can run inside the spill tick (`--kv-session-offload-spec-in-tick`); every spill+spec boot rides the `KVSO_ALLOW_SPEC=1` opt-in gate |
+| Prefill-side spill | `--kv-session-offload-prefill`: a prompt beyond the device budget is admitted born-spilled — no device KV slots allocated — and handed to the spill tick; runs under speculative decoding and under the overlap scheduler |
+| Scheduler integration | overlap scheduler supported (the spec deferred-commit hazard takes a post-verify snapshot); DFLASH rungs stay out of the spill tick |
+| Bounds that hold | GDN/Mamba state stays device-resident — the KV shard and the draft share spill, the recurrent state does not; more than one simultaneously spilled session is unit-tested (victim ordering, fast-lane multi-eviction) but not yet shown on hardware — boots show one spilled session among up to three co-resident ones, and three co-resident sessions are already the ceiling of this scheduler's admission arithmetic (a flag-OFF control shows the identical ceiling); a spill landing in the same round as a drafter-in-tick step has not been observed in validation; the concurrent two-stream dispatch (`SGLANG_KVSO_DECOUPLE=1`: device batch and spill tick in the same iteration, own stream, flashinfer workspace and DCP communicator for the spill lane) runs stably but holds the serial rate — only the token-sharding collectives have their own communicator, and the two lanes serialize behind the shared tensor-parallel one, so the default tick stays time-multiplexed with the device batch |
+
+| Configuration | Metric | Value |
+|---|---|---|
+| Qwen3.6-27B-FP8, uneven TP=3/DCP=3, MTP; feature armed vs off | ms per verify round | 37.74 vs 37.92, inside the 0.09-0.85 % boot-to-boot band |
+| born-spilled deep prompt, 1829 tokens against a 1306-token device budget, MTP | admissions with no device KV allocation | 2 of 2, on all three ranks, handed over to the spill tick |
+| same, drafter-in-tick requested without its gate | declined admissions | declined on all three ranks, naming the condition; the request is still served through the ordinary path |
+| the spilled session's output | coherence | 200 tokens, valid, no repetition flags |
+| spill under NEXTN k=3, restore margin 1024, hysteresis 40 | restores | 3 of 3 boots (decode figures in the combinations table) |
+| host pool from the RAM budget | per-rank pool | 1.00 GB of a 24 GiB node budget |
 
 **Upstream:** sglang retracts — frees and re-prefills — on exhaustion, rather than keeping a spilled
 request decoding.

@@ -24,7 +24,7 @@ import dataclasses
 import os
 import socket
 import uuid
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 from sglang.srt.rigmon.series import DEFAULT_TIERS, TierSpec, parse_tier_spec
 
@@ -56,8 +56,10 @@ class CollectorConfig:
     #: Base cadence in seconds. Guaranteed server-side, which is the whole
     #: reason collection moved off the browser.
     interval_s: float = 1.0
-    #: Read the expensive profiling counters every Nth tick (0 = never).
-    profile_every: int = 10
+    #: Read the expensive GPM/DCGM profiling counters every Nth tick
+    #: (0 = never). Not to be confused with the persisted hardware
+    #: measurement record (``hw_profile-*.json``).
+    counters_every: int = 10
     tiers: Tuple[TierSpec, ...] = DEFAULT_TIERS
     #: Local engine to join with (blank disables the engine side).
     engine_url: str = "http://127.0.0.1:30000"
