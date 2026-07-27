@@ -254,5 +254,54 @@ class TestHarnessBinding(CustomTestCase):
         self.assertIn("restore_transient", out["windows"])
 
 
+class TestTheYardstick(CustomTestCase):
+    """ms per round is the comparison basis; throughput rides along, demoted.
+
+    The noise floors that force this were measured boot-to-boot on this rig:
+    0.08-0.37 % (device) and 0.98-1.46 % (host) for the round time against
+    2.7-4.2 % for raw tok/s.
+    """
+
+    def test_throughput_is_never_a_primary_metric(self):
+        for key, s in SCENARIOS.items():
+            pm = s.primary_metric
+            self.assertIsNotNone(pm, key)
+            self.assertNotEqual(pm.unit, "tok/s", f"{key} decides on throughput")
+
+    def test_throughput_metrics_carry_the_reason_they_are_not_decisive(self):
+        for key, s in SCENARIOS.items():
+            for m in s.metrics:
+                if m.unit == "tok/s":
+                    self.assertTrue(
+                        m.context_only, f"{key}: {m.key} is shown without a caveat"
+                    )
+
+    def test_a_round_time_never_travels_without_its_accept_length(self):
+        """Under speculation a round time alone describes an unknown amount of
+        work: tok/s = accept length / round time."""
+        for key, s in SCENARIOS.items():
+            keys = {m.key for m in s.metrics}
+            if any("verify_round" in k for k in keys):
+                self.assertIn("accept_length", keys, f"{key} has no accept length")
+
+    def test_generating_scenarios_measure_a_round_time(self):
+        for key in ("noise_floor", "power_target_sweep"):
+            keys = {m.key for m in SCENARIOS[key].metrics}
+            self.assertIn("ms_per_verify_round", keys)
+
+    def test_every_harness_field_maps_to_a_declared_metric(self):
+        for key, s in SCENARIOS.items():
+            if not s.harness:
+                continue
+            declared = {m.key for m in s.metrics}
+            for mk in s.harness.metric_fields:
+                self.assertIn(mk, declared, f"{key}: {mk} is not a declared metric")
+
+    def test_the_noise_floor_is_established_per_metric_not_once(self):
+        rule = SCENARIOS["noise_floor"].stop_rules[0].condition
+        self.assertIn("round time", rule)
+        self.assertIn("throughput", rule)
+
+
 if __name__ == "__main__":
     unittest.main()

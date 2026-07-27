@@ -42,6 +42,17 @@ single mean over a transition is not accepted.
 measured against itself. Without that floor there is no threshold below which a
 difference must not be reported, and this project has repeatedly found
 differences that were content variance rather than effect.
+
+**Milliseconds per round is the primary metric; throughput is a companion.**
+Measured boot-to-boot on this rig the noise floor of ms per verify round is
+0.08-0.37 % at the device level and 0.98-1.46 % at the host level, against
+2.7-4.2 % for raw tok/s — a resolution difference of 10-30x. Beyond the
+numbers, tok/s follows the output CONTENT (r = 0.90), so two arms that
+generated different text are not comparable at all, and under speculation
+``tok/s = accept length / round time`` fuses two quantities into one. Every
+scenario here therefore makes a round time its primary metric and carries
+accept length and verify count alongside it; throughput may be reported next
+to them, never as the comparison.
 """
 
 from __future__ import annotations
@@ -108,10 +119,16 @@ class Window:
         return dataclasses.asdict(self)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class Metric:
     """The measured quantity. ``direction`` says which way is better, so a
-    result table can be read without knowing the metric."""
+    result table can be read without knowing the metric.
+
+    Frozen because the shared instances below (the round-time yardstick, the
+    accept length, the demoted throughput) are referenced by several scenarios
+    at once; a mutable shared instance is the shape of bug this project has
+    hit repeatedly.
+    """
 
     key: str
     label: str
@@ -119,6 +136,10 @@ class Metric:
     direction: str = "higher_better"  # higher_better | lower_better | neutral
     source: str = ""
     primary: bool = False
+    #: Reported for orientation but not used to decide. Set with a reason: a
+    #: metric that is shown without being trusted has to say which it is, or a
+    #: reader will compare it anyway.
+    context_only: str = ""
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -238,6 +259,69 @@ class Scenario:
 
 
 # ---------------------------------------------------------------------------
+# Shared metric vocabulary
+# ---------------------------------------------------------------------------
+
+#: The comparison yardstick. Used wherever a scenario compares two arms of a
+#: generating server; the noise floor quoted in the module docstring is the
+#: reason it outranks throughput.
+MS_PER_VERIFY_ROUND = Metric(
+    "ms_per_verify_round",
+    "time per verify round",
+    "ms",
+    "lower_better",
+    source="collector: forward_execution_seconds_total{category=target_verify} "
+    "over the round count (needs SGLANG_ENABLE_METRICS_DEVICE_TIMER=1)",
+    primary=True,
+)
+MS_PER_DECODE_ROUND = Metric(
+    "ms_per_decode_round",
+    "time per decode step",
+    "ms",
+    "lower_better",
+    source="collector: forward_execution_seconds_total{category=decode}; the "
+    "yardstick on a server running without speculation",
+)
+MS_PER_1K_PREFILL = Metric(
+    "ms_per_1k_prefill_tokens",
+    "prefill time per 1000 prompt tokens",
+    "ms",
+    "lower_better",
+    source="collector: forward_execution_seconds_total{category=extend|"
+    "split_prefill} over prompt tokens; comparable only at a fixed chunk size",
+)
+#: Never omitted next to a round time: under speculation a round time without
+#: its accept length describes a different amount of work in each arm.
+ACCEPT_LENGTH = Metric(
+    "accept_length",
+    "accepted tokens per verify round",
+    "tokens",
+    "higher_better",
+    source="engine: sglang:spec_accept_length, or meta_info.spec_accept_length "
+    "per request",
+)
+VERIFY_CT = Metric(
+    "verify_ct",
+    "verify rounds in the window",
+    "rounds",
+    "neutral",
+    source="engine: meta_info.spec_verify_ct, or generated tokens / accept "
+    "length when only the exposition is available",
+)
+#: Throughput, demoted on purpose.
+TOK_S_CONTEXT = Metric(
+    "tok_s",
+    "group throughput",
+    "tok/s",
+    source="engine counter delta",
+    context_only="2.7-4.2 % boot-to-boot noise against 0.08-0.37 % for the "
+    "round time, follows the output content (r = 0.90), and under speculation "
+    "fuses accept length with round time. Shown for orientation; compare the "
+    "round times.",
+)
+
+
+# ---------------------------------------------------------------------------
 # Shared window vocabulary
 # ---------------------------------------------------------------------------
 
@@ -321,9 +405,12 @@ _register(
             )
         ],
         metrics=[
-            Metric("tok_s", "group throughput", "tok/s", primary=True,
-                   source="engine counter delta"),
+            MS_PER_VERIFY_ROUND,
+            ACCEPT_LENGTH,
+            VERIFY_CT,
+            MS_PER_1K_PREFILL,
             Metric("ttft_p50", "TTFT median", "ms", "lower_better"),
+            TOK_S_CONTEXT,
         ],
         stop_rules=[
             StopRule(
@@ -331,7 +418,10 @@ _register(
                 "spread established",
                 "Stop once the relative standard deviation over the repeats is "
                 "stable; report it as the detection threshold for every "
-                "comparison that follows.",
+                "comparison that follows. Establish it separately for the "
+                "round time and for throughput — they differ by 10-30x, and a "
+                "threshold taken from the coarser one would discard real "
+                "effects.",
                 kind="saturation",
             )
         ],
@@ -352,7 +442,14 @@ _register(
                 "--output-details",
             ],
             axis_flags={'repeat': '(repeat the whole invocation)'},
-            metric_fields={'tok_s': 'output_throughput', 'ttft_p50': 'median_ttft_ms'},
+            metric_fields={
+                'ms_per_verify_round': '(collector: round_time over the same wall clock)',
+                'accept_length': '(engine: sglang:spec_accept_length; meta_info.spec_accept_length per request)',
+                'verify_ct': '(engine: meta_info.spec_verify_ct, summed over the window)',
+                'ms_per_1k_prefill_tokens': '(collector: round_time.ms_per_1k_prefill_tokens)',
+                'ttft_p50': 'median_ttft_ms',
+                'tok_s': 'output_throughput',
+            },
             external_axes=[],
             note=(
                 "Percentiles and throughput come from the harness; card state "
@@ -392,9 +489,11 @@ _register(
             )
         ],
         metrics=[
-            Metric("tok_s", "group throughput", "tok/s", primary=True),
+            MS_PER_VERIFY_ROUND,
+            ACCEPT_LENGTH,
             Metric("j_per_token", "energy per token", "J/tok", "lower_better",
                    source="NVML total-energy counter difference, not integrated power"),
+            TOK_S_CONTEXT,
             Metric("clock_ratio", "achieved clock / max clock", "fraction"),
             Metric("throttle_share", "share of samples throttled", "fraction",
                    "lower_better"),
@@ -434,7 +533,12 @@ _register(
                 "--output-details",
             ],
             axis_flags={},
-            metric_fields={'tok_s': 'output_throughput', 'j_per_token': '(collector: energy counter delta / generated tokens)'},
+            metric_fields={
+                'ms_per_verify_round': '(collector: round_time over the same wall clock)',
+                'accept_length': '(engine: sglang:spec_accept_length; meta_info.spec_accept_length per request)',
+                'j_per_token': '(collector: energy counter delta / generated tokens)',
+                'tok_s': 'output_throughput',
+            },
             external_axes=['power_limit_w'],
             note=(
                 "Percentiles and throughput come from the harness; card state "
@@ -485,7 +589,20 @@ _register(
             Metric("restore_gbs", "restore bandwidth", "GB/s", primary=True,
                    source="bytes paged in / restore window duration"),
             Metric("restore_ms", "restore duration", "ms", "lower_better"),
-            Metric("steady_tok_s", "steady-state throughput after restore", "tok/s"),
+            Metric(
+                "steady_ms_per_verify_round",
+                "time per verify round once restored",
+                "ms",
+                "lower_better",
+                source="collector, per window; comparable with the pre_spill "
+                "window, which the restore transient is not",
+            ),
+            ACCEPT_LENGTH,
+            dataclasses.replace(
+                TOK_S_CONTEXT,
+                key="steady_tok_s",
+                label="steady-state throughput after restore",
+            ),
         ],
         windows=SPILL_WINDOWS,
         stop_rules=[
@@ -518,7 +635,12 @@ _register(
                 "--output-details",
             ],
             axis_flags={},
-            metric_fields={'steady_tok_s': 'output_throughput', 'restore_gbs': '(collector: spill-path counters, per window)', 'restore_ms': '(collector: restore window duration)'},
+            metric_fields={
+                'steady_ms_per_verify_round': '(collector: round_time over the same wall clock)',
+                'restore_gbs': '(collector: spill-path counters, per window)',
+                'restore_ms': '(collector: restore window duration)',
+                'steady_tok_s': 'output_throughput',
+            },
             external_axes=['ram_clock', 'spill_state'],
             note=(
                 "Percentiles and throughput come from the harness; card state "
@@ -578,7 +700,10 @@ _register(
             Metric("queue_wait_ms", "queueing time before prefill", "ms",
                    "lower_better",
                    source="the term the offload actually attacks"),
-            Metric("prefill_tok_s", "prompt throughput", "tok/s"),
+            MS_PER_1K_PREFILL,
+            dataclasses.replace(
+                TOK_S_CONTEXT, key="prefill_tok_s", label="prompt throughput"
+            ),
         ],
         windows=[
             Window(
@@ -628,7 +753,13 @@ _register(
                 "--output-details",
             ],
             axis_flags={'concurrency': '--max-concurrency', 'prompt_len': '--random-input-len'},
-            metric_fields={'ttft_p95': 'p95_ttft_ms', 'ttft_p50': 'median_ttft_ms', 'prefill_tok_s': 'input_throughput', 'queue_wait_ms': '(engine: sglang:num_queue_reqs and the scheduler wait histogram)'},
+            metric_fields={
+                'ttft_p95': 'p95_ttft_ms',
+                'ttft_p50': 'median_ttft_ms',
+                'ms_per_1k_prefill_tokens': '(collector: round_time.ms_per_1k_prefill_tokens)',
+                'queue_wait_ms': '(engine: sglang:num_queue_reqs and the scheduler wait histogram)',
+                'prefill_tok_s': 'input_throughput',
+            },
             external_axes=['topology'],
             note=(
                 "Percentiles and throughput come from the harness; card state "
@@ -669,10 +800,23 @@ _register(
             ),
         ],
         metrics=[
-            Metric("victim_tok_s", "victim session throughput", "tok/s",
-                   primary=True),
-            Metric("bystander_tok_s", "non-victim session throughput", "tok/s",
-                   source="the term that decides whether the cost is confined"),
+            Metric(
+                "victim_ms_per_verify_round",
+                "victim session: time per verify round",
+                "ms",
+                "lower_better",
+                primary=True,
+                source="collector, per window",
+            ),
+            Metric(
+                "bystander_ms_per_verify_round",
+                "non-victim sessions: time per verify round",
+                "ms",
+                "lower_better",
+                source="the term that decides whether the cost is confined to "
+                "the victim",
+            ),
+            ACCEPT_LENGTH,
             Metric("e2e_p95", "end-to-end latency p95", "ms", "lower_better"),
             Metric("restore_ms", "restore duration", "ms", "lower_better"),
         ],
@@ -707,7 +851,13 @@ _register(
                 "--output-details",
             ],
             axis_flags={'sessions': '--max-concurrency', 'context_len': '--random-input-len'},
-            metric_fields={'e2e_p95': 'p95_e2e_latency_ms', 'victim_tok_s': '(collector: per-window throughput of the spilled session)', 'bystander_tok_s': '(collector: per-window throughput of the others)', 'restore_ms': '(collector: restore window duration)'},
+            metric_fields={
+                'victim_ms_per_verify_round': '(collector: round_time of the spilled session, per window)',
+                'bystander_ms_per_verify_round': '(collector: round_time of the others, per window)',
+                'accept_length': '(engine: sglang:spec_accept_length; meta_info.spec_accept_length per request)',
+                'e2e_p95': 'p95_e2e_latency_ms',
+                'restore_ms': '(collector: restore window duration)',
+            },
             external_axes=['spill_enabled'],
             note=(
                 "Percentiles and throughput come from the harness; card state "

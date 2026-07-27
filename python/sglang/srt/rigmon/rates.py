@@ -13,12 +13,38 @@
 # ==============================================================================
 """Rate semantics: what is a group quantity, what is a per-rank quantity.
 
+**Milliseconds per round is the yardstick; tok/s is a companion.** The two
+measure the same machine at different resolutions, and the gap is an order of
+magnitude or more. Measured boot-to-boot on this rig: ms per verify round has
+a 0.08-0.37 % noise floor at the device level and 0.98-1.46 % at the host
+level, while raw tok/s sits at 2.7-4.2 %. Two reasons behind the numbers:
+
+* tok/s tracks the output CONTENT (r = 0.90 on this project's own runs), so
+  two arms that generated different text are not comparable at all, while a
+  round time is content-blind as long as batch size and resident tokens match;
+* under speculation ``tok/s = accept length / round time`` mixes two
+  quantities. A round time without its accept length and verify count cannot
+  be placed, which is why :class:`RoundTime` carries all three or none.
+
+So tok/s may be shown next to a round time, never alone and never as the basis
+for a decision. :class:`GroupThroughput` keeps that in its own field notes.
+
 **Tokens are not attributable to a card.** Under tensor parallelism every rank
 holds a shard of every layer and the group produces a token jointly; there is
 no rank-local token count to report. Splitting group tok/s by shard size, by
 FLOP share, or by anything else would produce a number that looks per-card and
 means nothing. So this module publishes exactly one throughput figure —
 :class:`GroupThroughput` — and it belongs to the group.
+
+**Nor is a per-rank round time worth showing raw.** In lockstep the WALL time
+of a round is near-identical on every rank by construction: the ranks enter
+and leave the collective together. Three near-equal bars would hide the one
+thing that differs. The informative decomposition is COMPUTE time against
+COLLECTIVE WAIT per rank — the rank with the least wait is the one the others
+are waiting for. :class:`RankShare` therefore carries
+``compute_ms_per_round`` and ``collective_wait_ms_per_round`` as separate
+fields, and leaves them ``None`` when the source cannot separate them rather
+than filling both from one number.
 
 **Work and energy, however, ARE attributable**, and they carry more decision
 value than a split token count would. Each card reports its own power, clock,
@@ -63,11 +89,18 @@ __all__ = [
     "Caveat",
     "PeakCapability",
     "GroupThroughput",
+    "RoundTime",
     "RankShare",
     "RankView",
+    "PREFILL_CATEGORIES",
+    "VERIFY_CATEGORIES",
+    "DECODE_CATEGORIES",
+    "DRAFT_CATEGORIES",
     "peaks_from_hw_profile",
     "idle_floor_from_power_profile",
     "group_throughput",
+    "round_time",
+    "phase_seconds",
     "rank_shares",
     "pacing_rank",
 ]
@@ -130,6 +163,39 @@ CAVEAT_SINGLE_RANK_EXPORT = Caveat(
     "instead of describing each rank. Start the server with "
     "--enable-metrics-for-all-schedulers for a real per-rank breakdown.",
     severity="warning",
+)
+CAVEAT_TOKS_IS_NOT_THE_YARDSTICK = Caveat(
+    "toks_is_not_the_yardstick",
+    "Throughput is shown for orientation, not for decisions. Its boot-to-boot "
+    "noise floor is 2.7-4.2 % against 0.08-0.37 % for ms per verify round, it "
+    "tracks the output content (r = 0.90), and under speculation it is accept "
+    "length divided by round time — two quantities in one number. Compare "
+    "round times.",
+)
+CAVEAT_NO_FORWARD_TIMER = Caveat(
+    "no_forward_timer",
+    "The engine exports no forward-time counter, so round times are "
+    "unavailable — not zero. sglang:forward_execution_seconds_total is fed "
+    "only by the CUDA-event device timer, which the scheduler installs under "
+    "SGLANG_ENABLE_METRICS_DEVICE_TIMER=1. Set it (together with "
+    "--enable-metrics-for-all-schedulers for the per-rank split) and the "
+    "phase-labelled round times appear.",
+    severity="warning",
+)
+CAVEAT_ROUNDS_DERIVED = Caveat(
+    "rounds_derived",
+    "The engine publishes no round counter, so the number of rounds in the "
+    "window is derived as generated tokens divided by accept length. That "
+    "holds while the accept length is stable across the window and drifts "
+    "with it otherwise; the round time inherits that, which is why accept "
+    "length is reported next to it rather than folded in.",
+)
+CAVEAT_WAIT_NOT_SEPARABLE = Caveat(
+    "wait_not_separable",
+    "Compute and collective wait could not be separated for at least one "
+    "rank, so no wait figure is given for it. Under lockstep the WALL time "
+    "per round is near-identical on every rank by construction; showing it "
+    "per card would draw equal bars and hide the imbalance that matters.",
 )
 
 
@@ -217,6 +283,158 @@ class GroupThroughput:
         return dataclasses.asdict(self)
 
 
+#: Forward-mode categories, grouped into the phases a reader thinks in. The
+#: engine already labels its forward-time counter with these, so the phase
+#: split costs a parser branch rather than a measurement path.
+PREFILL_CATEGORIES = ("extend", "split_prefill")
+VERIFY_CATEGORIES = ("target_verify",)
+DECODE_CATEGORIES = ("decode",)
+DRAFT_CATEGORIES = ("eagle_draft", "eagle_draft_extend")
+
+
+def phase_seconds(
+    per_rank_phase: Optional[Dict[int, Dict[str, float]]],
+    prev_per_rank_phase: Optional[Dict[int, Dict[str, float]]],
+) -> Dict[int, Dict[str, float]]:
+    """Difference the phase-labelled forward-time counters over the window.
+
+    Returns ``rank -> {category: seconds spent in that category}``. Categories
+    are kept individually; grouping them into prefill/verify/decode is the
+    caller's business, because a reader who wants the drafter's own cost
+    separately must not have to unpick a pre-summed number.
+    """
+    if not per_rank_phase or not prev_per_rank_phase:
+        return {}
+    out: Dict[int, Dict[str, float]] = {}
+    for rank, cur in per_rank_phase.items():
+        prev = prev_per_rank_phase.get(rank)
+        if not prev:
+            continue
+        row = {}
+        for category, value in cur.items():
+            before = prev.get(category)
+            if before is not None and value >= before:
+                row[category] = value - before
+        if row:
+            out[rank] = row
+    return out
+
+
+@dataclasses.dataclass
+class RoundTime:
+    """Milliseconds per forward round, per phase — the comparison yardstick.
+
+    Every field that can be misread alone travels with what places it:
+    ``accept_length`` and ``verify_ct`` sit next to the verify-round time
+    because under speculation a round time without them says nothing about
+    tokens, and ``rounds_source`` says whether the round count was counted or
+    derived.
+    """
+
+    #: The speculative verify round: the unit the decode lever moves.
+    ms_per_verify_round: Optional[float] = None
+    #: The non-speculative decode step, for a server running without spec.
+    ms_per_decode_round: Optional[float] = None
+    #: Prefill time per 1000 prompt tokens. Deliberately not "per pass": the
+    #: engine publishes no pass counter, and under chunked prefill a "pass" is
+    #: a chunk whose size is a server setting. Per 1000 tokens is comparable
+    #: across arms as long as the chunk size is held fixed.
+    ms_per_1k_prefill_tokens: Optional[float] = None
+    #: The drafter's own passes, separate from the verify they feed.
+    ms_per_draft_pass: Optional[float] = None
+
+    #: Accepted tokens per verify round. Without it a round time cannot be
+    #: converted into tokens, and a comparison of round times across differing
+    #: accept lengths is comparing different work.
+    accept_length: Optional[float] = None
+    #: Verify rounds counted in the window.
+    verify_ct: Optional[float] = None
+    #: Decode/verify rounds the window was divided by.
+    rounds: Optional[float] = None
+    #: "engine counter" | "derived from generated tokens / accept length" |
+    #: "unavailable".
+    rounds_source: str = "unavailable"
+    #: Which phases the group actually spent time in during this window.
+    phase_seconds: Dict[str, float] = dataclasses.field(default_factory=dict)
+
+    def to_json(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+def round_time(
+    metrics: Optional[Dict[str, float]],
+    prev_metrics: Optional[Dict[str, float]],
+    phase_delta: Optional[Dict[int, Dict[str, float]]],
+    dt_s: Optional[float] = None,
+) -> RoundTime:
+    """Assemble the round-time yardstick from one collector window.
+
+    The phase seconds are GPU-busy seconds per rank; a round is executed by
+    every rank at once, so the group's time in a phase is the MAXIMUM over the
+    ranks, not the sum — the group leaves the round when its slowest rank does.
+    """
+    rt = RoundTime()
+    if not phase_delta:
+        return rt
+
+    group: Dict[str, float] = {}
+    for row in phase_delta.values():
+        for category, seconds in row.items():
+            group[category] = max(group.get(category, 0.0), seconds)
+    rt.phase_seconds = group
+    if metrics:
+        rt.accept_length = metrics.get("spec_accept_length")
+
+    def _phase_total(categories) -> float:
+        return sum(group.get(c, 0.0) for c in categories)
+
+    # Round count. The engine publishes no counter for it, so it is derived
+    # from generated tokens over accept length; without an accept length the
+    # rounds stay unknown and every per-round figure stays None rather than
+    # being silently divided by the token count.
+    rounds = None
+    if prev_metrics and metrics:
+        gen = metrics.get("generation_tokens_total")
+        gen0 = prev_metrics.get("generation_tokens_total")
+        if gen is not None and gen0 is not None and gen >= gen0:
+            produced = gen - gen0
+            accept = rt.accept_length
+            if accept and accept > 0:
+                rounds = produced / accept
+                rt.rounds_source = (
+                    "derived from generated tokens / accept length"
+                )
+            elif produced > 0 and not _phase_total(VERIFY_CATEGORIES):
+                # No speculation: one generated token per decode round.
+                rounds = produced
+                rt.rounds_source = "generated tokens (one per decode round)"
+    rt.rounds = rounds
+
+    if rounds and rounds > 0:
+        verify_s = _phase_total(VERIFY_CATEGORIES)
+        decode_s = _phase_total(DECODE_CATEGORIES)
+        draft_s = _phase_total(DRAFT_CATEGORIES)
+        if verify_s:
+            rt.ms_per_verify_round = verify_s * 1000.0 / rounds
+            rt.verify_ct = rounds
+        if decode_s:
+            rt.ms_per_decode_round = decode_s * 1000.0 / rounds
+        if draft_s:
+            rt.ms_per_draft_pass = draft_s * 1000.0 / rounds
+
+    # Prefill is not divided by decode rounds: a prefill pass is a different
+    # unit. A per-pass time would need a pass count the engine does not
+    # publish, so what is reported is time per 1000 prompt tokens when the
+    # prompt counter moved, and nothing otherwise.
+    prefill_s = _phase_total(PREFILL_CATEGORIES)
+    if prefill_s and prev_metrics and metrics:
+        prompt = metrics.get("prompt_tokens_total")
+        prompt0 = prev_metrics.get("prompt_tokens_total")
+        if prompt is not None and prompt0 is not None and prompt > prompt0:
+            rt.ms_per_1k_prefill_tokens = prefill_s * 1000.0 / ((prompt - prompt0) / 1000.0)
+    return rt
+
+
 def group_throughput(
     metrics: Optional[Dict[str, float]],
     prev_metrics: Optional[Dict[str, float]] = None,
@@ -279,6 +497,19 @@ class RankShare:
     # -- time split (exact, from activity) ----------------------------------
     active_share: Optional[float] = None
     wait_share: Optional[float] = None
+
+    # -- round time, decomposed --------------------------------------------
+    #: GPU-busy milliseconds this rank spent per round. The half of the round
+    #: that differs between ranks.
+    compute_ms_per_round: Optional[float] = None
+    #: Milliseconds per round this rank spent NOT computing while the group's
+    #: round was in flight, i.e. waiting on the collective. Together with
+    #: ``compute_ms_per_round`` it sums to the group's round time, which is
+    #: near-identical on every rank and therefore not reported per rank.
+    collective_wait_ms_per_round: Optional[float] = None
+    #: This rank's GPU seconds in the window, per forward category. Kept so a
+    #: reader can ask "where did this rank's time go" without a second scrape.
+    phase_seconds: Dict[str, float] = dataclasses.field(default_factory=dict)
 
     # -- achieved vs peak ---------------------------------------------------
     membw_achieved_frac: Optional[float] = None
@@ -393,6 +624,8 @@ def rank_shares(
     rank_gpu_id: Optional[Sequence[int]] = None,
     engine_rates: Optional[Dict[int, Dict[str, float]]] = None,
     single_rank_export: bool = False,
+    phase_delta: Optional[Dict[int, Dict[str, float]]] = None,
+    round_times: Optional["RoundTime"] = None,
 ) -> RankView:
     """Assemble the per-rank view from a card sample plus probe peaks.
 
@@ -405,9 +638,16 @@ def rank_shares(
     device counters where present. Precedence order for work and active share:
     engine counters (exact attribution) > GPM (measured silicon) > coarse NVML
     utilization (a busy-time proxy). Whichever was used is recorded per rank.
+
+    ``phase_delta`` (from :func:`phase_seconds`) and ``round_times`` (from
+    :func:`round_time`) add the compute-against-wait decomposition. Both are
+    optional: without them the per-rank rows carry no round-time fields at all,
+    which is the honest state — a raw per-rank round time would be the group's
+    round time repeated, and that hides exactly what the decomposition shows.
     """
     peaks = peaks or {}
     engine_rates = engine_rates or {}
+    phase_delta = phase_delta or {}
     caveats: List[Caveat] = [CAVEAT_POWER_COMPARABILITY]
     if not peaks:
         caveats.append(CAVEAT_NO_PEAKS)
@@ -459,6 +699,30 @@ def rank_shares(
             s.active_share = max(0.0, min(1.0, c.sm_active))
             s.wait_share = 1.0 - s.active_share
             s.work_source = c.activity_source
+
+        # Round time, decomposed. Compute comes from this rank's own GPU-busy
+        # seconds in the round-bearing phases; wait is what is left of the
+        # group's round after that. Only the engine's forward-time counter can
+        # carry this: a coarse utilization sample says how busy the CARD was,
+        # which for co-located ranks is not the same question.
+        rank_phase = phase_delta.get(rank) if rank is not None else None
+        if rank_phase:
+            s.phase_seconds = dict(rank_phase)
+        if rank_phase and round_times and round_times.rounds:
+            round_categories = VERIFY_CATEGORIES + DECODE_CATEGORIES + DRAFT_CATEGORIES
+            busy_s = sum(rank_phase.get(cat, 0.0) for cat in round_categories)
+            if busy_s > 0:
+                s.compute_ms_per_round = busy_s * 1000.0 / round_times.rounds
+                group_ms = round_times.ms_per_verify_round
+                if group_ms is None:
+                    group_ms = round_times.ms_per_decode_round
+                if group_ms is not None:
+                    if round_times.ms_per_draft_pass:
+                        group_ms += round_times.ms_per_draft_pass
+                    s.collective_wait_ms_per_round = max(
+                        0.0, group_ms - s.compute_ms_per_round
+                    )
+
         # Achieved rates. Engine counters win: they attribute work to the rank
         # that did it, which the device counters cannot do for co-located ranks.
         if er and "achieved_gbs" in er:
@@ -529,6 +793,13 @@ def rank_shares(
 
     if any(s.wait_share is not None for s in shares):
         caveats.append(CAVEAT_WAIT_COSTS_POWER)
+    if shares and not any(s.compute_ms_per_round is not None for s in shares):
+        caveats.append(CAVEAT_WAIT_NOT_SEPARABLE)
+    elif any(
+        s.compute_ms_per_round is not None and s.collective_wait_ms_per_round is None
+        for s in shares
+    ):
+        caveats.append(CAVEAT_WAIT_NOT_SEPARABLE)
 
     group_power = _sum_distinct("power_w")
     pacer, basis = pacing_rank(shares)
@@ -550,7 +821,35 @@ def pacing_rank(shares: Sequence[RankShare]) -> tuple:
     large enough to mean anything — a five-point difference in a coarse
     utilization reading is noise, and naming a pacer from it would be a guess
     dressed as a finding.
+
+    The millisecond decomposition is preferred where it exists: a wait
+    expressed in ms per round is directly readable as "this is what the group
+    loses to imbalance each round", and it comes from the CUDA-event forward
+    timer rather than from a sampled utilization figure.
     """
+    ms = [s for s in shares if s.collective_wait_ms_per_round is not None]
+    if len(ms) >= 2:
+        ms_sorted = sorted(ms, key=lambda s: s.collective_wait_ms_per_round)
+        best, second = ms_sorted[0], ms_sorted[1]
+        spread = second.collective_wait_ms_per_round - best.collective_wait_ms_per_round
+        round_ms = (best.compute_ms_per_round or 0.0) + best.collective_wait_ms_per_round
+        # Below a twentieth of the round the difference is not worth naming a
+        # pacer over; the ranks are effectively balanced.
+        if round_ms > 0 and spread < 0.05 * round_ms:
+            return (
+                None,
+                f"no clear pacer: collective wait within {spread:.2f} ms per "
+                f"round of each other, under 5 % of the {round_ms:.2f} ms "
+                "round",
+            )
+        return (
+            best.rank if best.rank is not None else best.gpu_index,
+            f"lowest collective wait ({best.collective_wait_ms_per_round:.2f} ms "
+            f"per round vs next {second.collective_wait_ms_per_round:.2f} ms) — "
+            f"the group waits on this rank, and the difference is what "
+            f"rebalancing could recover",
+        )
+
     have = [s for s in shares if s.wait_share is not None]
     if len(have) < 2:
         return (None, None)

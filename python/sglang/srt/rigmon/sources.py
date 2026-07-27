@@ -679,9 +679,21 @@ _LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
 #: are derived from the shapes actually executed, so differencing them gives
 #: achieved rates that can be put against the probe's measured peaks.
 #:
-#: Caveat that must travel with them: unless the server runs with
-#: ``--enable-metrics-for-all-schedulers`` only TP rank 0 exports, and every
-#: series then carries ``tp_rank="0"`` regardless of which rank did the work.
+#: Two caveats travel with them:
+#:
+#: * unless the server runs with ``--enable-metrics-for-all-schedulers`` only
+#:   TP rank 0 exports, and every series then carries ``tp_rank="0"``
+#:   regardless of which rank did the work;
+#: * ``forward_execution_seconds_total`` is fed exclusively by
+#:   ``utils.device_timer.DeviceTimer``, which the scheduler installs only
+#:   under ``SGLANG_ENABLE_METRICS_DEVICE_TIMER=1``. Without that variable the
+#:   counter is absent entirely — not zero, absent — and every figure derived
+#:   from it is unavailable rather than wrong.
+#:
+#: The timer itself is the cheap kind the measurement budget allows: CUDA
+#: events recorded around the forward, drained one iteration late through a
+#: non-blocking ``Event.query()``, so no synchronisation stands in the hot
+#: loop.
 PER_RANK_KEYS = {
     "forward_execution_seconds_total": "sglang:forward_execution_seconds_total",
     "estimated_flops_per_gpu_total": "sglang:estimated_flops_per_gpu_total",
@@ -689,6 +701,18 @@ PER_RANK_KEYS = {
     "estimated_write_bytes_per_gpu_total": "sglang:estimated_write_bytes_per_gpu_total",
     "fwd_occupancy": "sglang:fwd_occupancy",
 }
+
+#: The forward-time counter carries a ``category`` label naming the forward
+#: mode, so the phase split (prefill against decode/verify) is ALREADY in the
+#: exposition — it needs no second measurement path, only a parser that does
+#: not collapse the label. Summing it away is what makes ms/prefill and
+#: ms/verify-round unobtainable; keeping it costs one extra dict per rank.
+#:
+#: Values emitted by the engine: ``extend`` and ``split_prefill`` (prefill),
+#: ``target_verify`` (the speculative verify round), ``decode`` (the
+#: non-speculative decode step), ``eagle_draft`` / ``eagle_draft_extend`` (the
+#: drafter's own passes) and ``idle``.
+FORWARD_TIME_METRIC = "sglang:forward_execution_seconds_total"
 
 #: Prometheus names the collector keeps, mapped to short keys.
 _ENGINE_KEYS = {
@@ -763,6 +787,13 @@ class EngineSample:
     #: tp_rank -> {short key: cumulative value}. Empty when the server does not
     #: export per-rank series.
     per_rank: Dict[int, Dict[str, float]] = dataclasses.field(default_factory=dict)
+    #: tp_rank -> {forward category: cumulative GPU seconds}. The phase split
+    #: kept rather than summed away, because ms/prefill and ms/verify-round are
+    #: the yardstick and both need it. Empty when the forward-time counter is
+    #: absent (no ``SGLANG_ENABLE_METRICS_DEVICE_TIMER``).
+    per_rank_phase: Dict[int, Dict[str, float]] = dataclasses.field(
+        default_factory=dict
+    )
     #: Set when only one rank exports, i.e. the per-rank view is really the
     #: rank-0 view wearing every rank's name.
     per_rank_note: Optional[str] = None
@@ -822,6 +853,21 @@ class EngineScraper:
                 else:
                     slot[short] = value
 
+        # The phase split, kept per rank AND per category. Same series, one
+        # more dict: no extra scrape, no extra engine work.
+        per_rank_phase: Dict[int, Dict[str, float]] = {}
+        for labels, value in parsed.get(FORWARD_TIME_METRIC, []):
+            raw = labels.get("tp_rank")
+            category = labels.get("category")
+            if raw is None or not category:
+                continue
+            try:
+                rank = int(raw)
+            except ValueError:
+                continue
+            slot = per_rank_phase.setdefault(rank, {})
+            slot[category] = slot.get(category, 0.0) + value
+
         note = None
         if len(per_rank) == 1:
             note = (
@@ -848,5 +894,6 @@ class EngineScraper:
             metrics=metrics,
             info=info,
             per_rank=per_rank,
+            per_rank_phase=per_rank_phase,
             per_rank_note=note,
         )

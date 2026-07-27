@@ -39,8 +39,14 @@ from sglang.srt.rigmon.config import CollectorConfig
 from sglang.srt.rigmon.rates import (
     GroupThroughput,
     RankView,
+    CAVEAT_NO_FORWARD_TIMER,
+    CAVEAT_ROUNDS_DERIVED,
+    CAVEAT_TOKS_IS_NOT_THE_YARDSTICK,
+    RoundTime,
     engine_rank_rates,
     group_throughput,
+    phase_seconds,
+    round_time,
     peaks_from_hw_profile,
     rank_shares,
 )
@@ -260,6 +266,8 @@ class Collector:
         self._last_metrics: Optional[Dict[str, float]] = None
         self._last_metrics_ts: Optional[float] = None
         self._last_per_rank: Optional[Dict[int, Dict[str, float]]] = None
+        self._last_per_rank_phase: Optional[Dict[int, Dict[str, float]]] = None
+        self._last_round_time = RoundTime()
         self._last_view: Optional[RankView] = None
         self._last_throughput = GroupThroughput()
         self._caps: Optional[CapabilityReport] = None
@@ -276,6 +284,7 @@ class Collector:
         engine = self.scraper.scrape()
 
         dt = (now - self._last_metrics_ts) if self._last_metrics_ts else None
+        prev_metrics = self._last_metrics
         throughput = group_throughput(engine.metrics, self._last_metrics, dt)
         if engine.metrics:
             self._last_metrics = dict(engine.metrics)
@@ -295,19 +304,48 @@ class Collector:
         )
         if engine.per_rank:
             self._last_per_rank = {k: dict(v) for k, v in engine.per_rank.items()}
+
+        # Round times: the yardstick. The phase split rides on the same
+        # scrape, so this costs no additional engine work.
+        phase_delta = phase_seconds(engine.per_rank_phase, self._last_per_rank_phase)
+        rt = round_time(engine.metrics, prev_metrics, phase_delta, dt)
+        if engine.per_rank_phase:
+            self._last_per_rank_phase = {
+                k: dict(v) for k, v in engine.per_rank_phase.items()
+            }
+
         view = rank_shares(
             cards,
             self.peaks,
             rank_gpu,
             engine_rates=engine_rates,
             single_rank_export=(len(engine.per_rank or {}) == 1),
+            phase_delta=phase_delta,
+            round_times=rt,
         )
+        # Caveats that belong to the round-time layer rather than to a rank.
+        if engine.up and not engine.per_rank_phase:
+            view.caveats.append(CAVEAT_NO_FORWARD_TIMER)
+        if rt.rounds_source.startswith("derived"):
+            view.caveats.append(CAVEAT_ROUNDS_DERIVED)
+        if throughput.gen_tok_s is not None:
+            view.caveats.append(CAVEAT_TOKS_IS_NOT_THE_YARDSTICK)
 
         values = flatten_sample(cards, engine, view)
         if throughput.gen_tok_s is not None:
             values["engine.gen_tok_s"] = throughput.gen_tok_s
         if throughput.prompt_tok_s is not None:
             values["engine.prompt_tok_s"] = throughput.prompt_tok_s
+        # The yardstick goes into the series too, so a comparison over a past
+        # window has round times available and is not forced back onto tok/s.
+        for key, val in (
+            ("engine.ms_per_verify_round", rt.ms_per_verify_round),
+            ("engine.ms_per_decode_round", rt.ms_per_decode_round),
+            ("engine.ms_per_1k_prefill_tokens", rt.ms_per_1k_prefill_tokens),
+            ("engine.accept_length", rt.accept_length),
+        ):
+            if val is not None:
+                values[key] = val
         self.series.add(now, values)
 
         with self._lock:
@@ -315,6 +353,7 @@ class Collector:
             self._last_engine = engine
             self._last_view = view
             self._last_throughput = throughput
+            self._last_round_time = rt
             self._ticks += 1
         return values
 
@@ -344,6 +383,7 @@ class Collector:
             engine = self._last_engine
             view = self._last_view
             tp = self._last_throughput
+            rt = self._last_round_time
             ticks, missed = self._ticks, self._missed
         caps = self.capabilities()
         return {
@@ -359,6 +399,9 @@ class Collector:
             "device_backend": self.sampler.backend.name,
             "cards": [c.to_json() for c in cards],
             "engine": engine.to_json(),
+            # Round times first: they are the comparison yardstick, and the
+            # throughput block below carries its own note saying so.
+            "round_time": rt.to_json(),
             "throughput": tp.to_json(),
             "ranks": view.to_json() if view else None,
             "capabilities": caps.to_json(),

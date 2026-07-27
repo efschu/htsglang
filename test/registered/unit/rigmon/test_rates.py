@@ -9,7 +9,9 @@ from sglang.srt.rigmon.rates import (
     idle_floor_from_power_profile,
     pacing_rank,
     peaks_from_hw_profile,
+    phase_seconds,
     rank_shares,
+    round_time,
 )
 from sglang.srt.rigmon.sources import CardSample
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -356,6 +358,151 @@ class TestEngineDerivedWork(CustomTestCase):
             2.0,
         )
         self.assertNotIn(0, r)
+
+
+# ===========================================================================
+# The yardstick: ms per round, and its per-rank decomposition.
+# ===========================================================================
+
+
+#: Two collector samples, ten seconds apart, of a speculative decode. Rank 0
+#: is the fast card and does less waiting; ranks 1 and 2 wait on it.
+PHASE_PREV = {
+    0: {"target_verify": 100.0, "eagle_draft": 20.0, "extend": 5.0},
+    1: {"target_verify": 90.0, "eagle_draft": 18.0, "extend": 5.0},
+    2: {"target_verify": 90.0, "eagle_draft": 18.0, "extend": 5.0},
+}
+PHASE_CUR = {
+    0: {"target_verify": 104.0, "eagle_draft": 21.0, "extend": 5.5},
+    1: {"target_verify": 93.0, "eagle_draft": 18.8, "extend": 5.5},
+    2: {"target_verify": 93.2, "eagle_draft": 18.8, "extend": 5.5},
+}
+METRICS_PREV = {"generation_tokens_total": 10_000.0, "prompt_tokens_total": 5_000.0}
+METRICS_CUR = {
+    "generation_tokens_total": 14_000.0,
+    "prompt_tokens_total": 6_000.0,
+    "spec_accept_length": 2.0,
+}
+
+
+class TestPhaseSeconds(CustomTestCase):
+    def test_phase_labels_survive_the_difference(self):
+        d = phase_seconds(PHASE_CUR, PHASE_PREV)
+        self.assertAlmostEqual(d[0]["target_verify"], 4.0)
+        self.assertAlmostEqual(d[0]["eagle_draft"], 1.0)
+        self.assertAlmostEqual(d[1]["target_verify"], 3.0)
+
+    def test_a_counter_reset_drops_that_category_only(self):
+        d = phase_seconds({0: {"target_verify": 1.0, "decode": 9.0}},
+                          {0: {"target_verify": 100.0, "decode": 4.0}})
+        self.assertNotIn("target_verify", d[0])
+        self.assertAlmostEqual(d[0]["decode"], 5.0)
+
+    def test_without_a_previous_sample_there_is_nothing(self):
+        self.assertEqual(phase_seconds(PHASE_CUR, None), {})
+
+
+class TestRoundTime(CustomTestCase):
+    def _rt(self):
+        return round_time(
+            METRICS_CUR, METRICS_PREV, phase_seconds(PHASE_CUR, PHASE_PREV), 10.0
+        )
+
+    def test_verify_round_time_uses_the_slowest_rank(self):
+        """A round ends when its slowest rank ends it, so the group's time in a
+        phase is the maximum over ranks, never the sum."""
+        rt = self._rt()
+        # 4000 generated tokens / accept length 2 = 2000 rounds; the slowest
+        # rank spent 4.0 s verifying.
+        self.assertAlmostEqual(rt.rounds, 2000.0)
+        self.assertAlmostEqual(rt.ms_per_verify_round, 2.0)
+
+    def test_the_round_time_never_travels_without_its_accept_length(self):
+        rt = self._rt()
+        self.assertEqual(rt.accept_length, 2.0)
+        self.assertEqual(rt.verify_ct, rt.rounds)
+        self.assertIn("derived", rt.rounds_source)
+
+    def test_without_an_accept_length_speculative_rounds_stay_unknown(self):
+        rt = round_time(
+            {"generation_tokens_total": 14_000.0},
+            METRICS_PREV,
+            phase_seconds(PHASE_CUR, PHASE_PREV),
+            10.0,
+        )
+        self.assertIsNone(rt.rounds)
+        self.assertIsNone(rt.ms_per_verify_round)
+        self.assertEqual(rt.rounds_source, "unavailable")
+
+    def test_without_speculation_one_token_is_one_round(self):
+        rt = round_time(
+            {"generation_tokens_total": 1_100.0},
+            {"generation_tokens_total": 1_000.0},
+            {0: {"decode": 0.5}, 1: {"decode": 0.4}},
+            10.0,
+        )
+        self.assertAlmostEqual(rt.rounds, 100.0)
+        self.assertAlmostEqual(rt.ms_per_decode_round, 5.0)
+        self.assertIn("one per decode round", rt.rounds_source)
+
+    def test_prefill_is_per_1k_tokens_not_per_round(self):
+        rt = self._rt()
+        # 0.5 s of prefill over 1000 prompt tokens.
+        self.assertAlmostEqual(rt.ms_per_1k_prefill_tokens, 500.0)
+        self.assertFalse(hasattr(rt, "ms_per_prefill_pass"))
+
+    def test_no_phase_data_yields_no_round_times(self):
+        rt = round_time(METRICS_CUR, METRICS_PREV, {}, 10.0)
+        self.assertIsNone(rt.ms_per_verify_round)
+        self.assertEqual(rt.rounds_source, "unavailable")
+
+
+class TestPerRankDecomposition(CustomTestCase):
+    def _view(self):
+        cards = [
+            card(0, "GPU-5090", "RTX 5090"),
+            card(1, "GPU-3080a", "RTX 3080"),
+            card(2, "GPU-3080b", "RTX 3080"),
+        ]
+        delta = phase_seconds(PHASE_CUR, PHASE_PREV)
+        rt = round_time(METRICS_CUR, METRICS_PREV, delta, 10.0)
+        return rank_shares(
+            cards,
+            peaks_from_hw_profile(HW_PROFILE, POWER_PROFILE),
+            [0, 1, 2],
+            phase_delta=delta,
+            round_times=rt,
+        )
+
+    def test_compute_and_wait_are_separate_fields(self):
+        v = self._view()
+        by_rank = {r.rank: r for r in v.ranks}
+        # Rank 0: (4.0 verify + 1.0 draft) s over 2000 rounds = 2.5 ms.
+        self.assertAlmostEqual(by_rank[0].compute_ms_per_round, 2.5)
+        self.assertAlmostEqual(by_rank[1].compute_ms_per_round, 1.9)
+        # The group round is 2.0 ms verify + 0.5 ms draft = 2.5 ms, so the
+        # fast rank waits nothing and the others wait the difference.
+        self.assertAlmostEqual(by_rank[0].collective_wait_ms_per_round, 0.0)
+        self.assertAlmostEqual(by_rank[1].collective_wait_ms_per_round, 0.6)
+
+    def test_no_raw_per_rank_round_time_is_offered(self):
+        """Wall time per round is near-identical on every rank by construction;
+        offering it per card would draw equal bars and hide the imbalance."""
+        d = self._view().ranks[0].to_json()
+        self.assertNotIn("ms_per_round", d)
+        self.assertIn("compute_ms_per_round", d)
+        self.assertIn("collective_wait_ms_per_round", d)
+
+    def test_the_pacer_is_named_from_the_millisecond_wait(self):
+        v = self._view()
+        self.assertEqual(v.pacer_rank, 0)
+        self.assertIn("ms per round", v.pacer_basis)
+
+    def test_without_phase_data_no_round_fields_and_a_caveat(self):
+        cards = [card(0, "GPU-5090", "RTX 5090"), card(1, "GPU-3080a", "RTX 3080")]
+        v = rank_shares(cards, {}, [0, 1])
+        self.assertIsNone(v.ranks[0].compute_ms_per_round)
+        self.assertIn("wait_not_separable", {c.key for c in v.caveats})
 
 
 if __name__ == "__main__":
