@@ -279,6 +279,128 @@ class ModelRunnerKVCacheMixin:
             device_index = torch.cuda.current_device()
         return gguf_dequant_scratch_residual_bytes(device_index) / (1 << 30)
 
+    # ------------------------------------------------------------------
+    # #260: budget vs. physical availability under co-residence.
+    #
+    # --rank-gpu-memory-mib (and the --rank-auto-reserve-mib derivation that
+    # feeds it) is an ABSOLUTE per-rank allowance: NVML total minus the
+    # reserve. A process that shares the card -- a second sglang instance, a
+    # PD prefill server, anything -- does not reduce that number. It reduces
+    # what can be handed out. Keeping the two apart is the whole fix: the
+    # budget arithmetic below never reads free memory (only the before/after
+    # DELTA, which a static neighbour cancels out of), and the free reading
+    # is used exclusively to say, in its own words, when the plan cannot be
+    # realized.
+    # ------------------------------------------------------------------
+    def _device_occupancy_gb(self: ModelRunner, device_free_gb: float) -> Tuple:
+        """(device total, bytes held outside this process) in GiB.
+
+        ``torch.cuda.memory_reserved`` is per-PROCESS while ``mem_get_info``
+        is device-wide, so the difference is everything this process does not
+        hold: co-resident processes, sibling ranks, and every CUDA context
+        including this rank's own (contexts are not allocator memory). Named
+        that way in the messages -- it is a diagnosis aid, not an accounting
+        post.
+        """
+        try:
+            _free_b, total_b = torch.cuda.mem_get_info(self.gpu_id)
+            own_b = torch.cuda.memory_reserved(self.gpu_id)
+        except Exception:  # pragma: no cover - diagnostics only
+            return (0.0, 0.0)
+        total_gb = total_b / (1 << 30)
+        return (total_gb, max(0.0, total_gb - device_free_gb - own_b / (1 << 30)))
+
+    @staticmethod
+    def budget_physical_shortfall_gb(
+        budget_gb: float,
+        used_by_me_gb: float,
+        device_free_gb: float,
+        ranks_on_gpu: int,
+    ) -> float:
+        """GiB by which an absolute per-rank budget exceeds what the device
+        can still hand this rank, 0.0 when the budget is reachable.
+
+        Reachable = what the rank already holds + its share of the memory
+        that is physically free. Co-located ranks split the free bytes
+        evenly, the same convention ``note_post_capture_leftover`` uses.
+        """
+        reachable_gb = used_by_me_gb + device_free_gb / max(1, ranks_on_gpu)
+        return max(0.0, budget_gb - reachable_gb)
+
+    def _assert_budget_physically_available(
+        self: ModelRunner,
+        budget_mib: int,
+        budget_gb: float,
+        used_by_me_gb: float,
+        device_free_gb: float,
+    ) -> None:
+        ranks_on_gpu = self._ranks_on_my_gpu()
+        shortfall_gb = self.budget_physical_shortfall_gb(
+            budget_gb, used_by_me_gb, device_free_gb, ranks_on_gpu
+        )
+        if shortfall_gb <= 0:
+            return
+        rank_gpu_id = getattr(self.server_args, "rank_gpu_id", None) or []
+        try:
+            gpu = rank_gpu_id[self.tp_rank]
+        except (IndexError, TypeError):  # pragma: no cover - defensive
+            gpu = self.gpu_id
+        free_share_gb = device_free_gb / max(1, ranks_on_gpu)
+        total_gb, outside_gb = self._device_occupancy_gb(device_free_gb)
+        raise ValueError(
+            f"The per-rank budget of {budget_mib} MiB ({budget_gb:.2f} GiB) "
+            f"for rank {self.tp_rank} on GPU {gpu} is not physically "
+            f"available: the rank holds {used_by_me_gb:.2f} GiB and "
+            f"{free_share_gb:.2f} GiB of the device is free to it "
+            f"({device_free_gb:.2f} GiB free across {ranks_on_gpu} co-located "
+            f"rank(s), {total_gb:.2f} GiB total, {outside_gb:.2f} GiB held "
+            f"outside this process -- co-resident processes, sibling ranks "
+            f"and CUDA contexts), which is {shortfall_gb:.2f} GiB short of "
+            f"the budget. The budget is an ABSOLUTE allowance and is "
+            f"deliberately NOT reduced by that occupancy; size it for what "
+            f"the co-resident process leaves free (raise "
+            f"--rank-auto-reserve-mib on this GPU, or lower "
+            f"--rank-gpu-memory-mib), or stop that process."
+        )
+
+    @staticmethod
+    def budget_exhausted_message(
+        tp_rank: int,
+        budget_mib: int,
+        budget_gb: float,
+        posts,
+        rest_memory_gb: float,
+        device_free_gb: float,
+        occupancy: Tuple,
+    ) -> str:
+        """The per-rank "no room for KV" message, itemized.
+
+        Every post that consumed budget is named with its size, so the
+        shortfall can be read off instead of reconstructed from a boot log.
+        The driver-free line is part of it on purpose: a shortfall on a
+        shared card invites the theory that the neighbour was charged twice,
+        and the numbers that refute (or confirm) it belong in the message.
+        """
+        ledger = "; ".join(f"{name} {gb:.2f} GiB" for name, gb in posts if gb > 0.005)
+        spent_gb = sum(gb for _name, gb in posts)
+        short_mib = math.ceil(-rest_memory_gb * 1024)
+        total_gb, outside_gb = occupancy
+        return (
+            f"The per-rank budget leaves no GPU memory for the KV cache "
+            f"under --rank-gpu-memory-mib on rank {tp_rank}: the "
+            f"{budget_mib} MiB ({budget_gb:.2f} GiB) budget is spent on "
+            f"{ledger} -- {spent_gb:.2f} GiB together, {short_mib} MiB more "
+            f"than the budget, before a single KV token. Raise the budget by "
+            f"at least that much plus the KV pool you want (lower "
+            f"--rank-auto-reserve-mib for this GPU by the same amount), or "
+            f"place fewer ranks on this GPU. If using speculative decoding, "
+            f"draft weights are counted in the first post. The budget itself "
+            f"was handed out in full: {device_free_gb:.2f} GiB of the device "
+            f"is free at this point ({total_gb:.2f} GiB total, "
+            f"{outside_gb:.2f} GiB held outside this process), and a "
+            f"co-resident process does not reduce the budget."
+        )
+
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
@@ -313,12 +435,24 @@ class ModelRunnerKVCacheMixin:
             distributed=get_world_group().world_size > 1 and not uneven_memory,
             cpu_group=get_world_group().cpu_group,
         )
+        # Raw driver-level free memory of the DEVICE, kept before the
+        # accounting correction below: the physical-availability check (#260)
+        # has to reason about the bytes the card actually has left, not about
+        # this rank's accounting view of them.
+        device_free_gb = available_gpu_memory
         # Co-located ranks: mem_get_info() above charged this rank for its
         # sibling(s)' weights too. Add their own footprint back so only
         # this rank's weights are charged against its budget (no-op on the
         # default / even-TP / one-rank-per-GPU paths).
         available_gpu_memory += self._colocated_sibling_reserved_gb()
 
+        # Ledger of what the per-rank budget was spent on, in the order the
+        # posts are charged. Only read when a budget turns out to be too
+        # small -- but built unconditionally, because the whole point is that
+        # the failure message must not have to guess (#260).
+        budget_posts: list[Tuple[str, float]] = []
+        budget_gb = 0.0
+        budget_mib = 0
         if uneven_memory:
             # Absolute-budget accounting (PD disagg #99): --rank-gpu-memory-mib
             # is an ABSOLUTE per-rank allowance, so the KV budget is simply
@@ -333,18 +467,33 @@ class ModelRunnerKVCacheMixin:
             # before/after DELTA is immune: a static co-resident process
             # appears in both readings and cancels out.
             mib = self.server_args.rank_gpu_memory_mib
-            budget_gb = (
+            budget_mib = int(
                 mib if isinstance(mib, (int, float)) else mib[self.tp_rank]
-            ) / 1024.0
+            )
+            budget_gb = budget_mib / 1024.0
             used_by_me_gb = pre_model_load_memory - available_gpu_memory
             rest_memory = budget_gb - used_by_me_gb
+            budget_posts.append(("weights + runtime state", used_by_me_gb))
+            # #260: the budget is ABSOLUTE, so a co-resident process must
+            # never shrink it -- but it does bound what this rank can
+            # physically allocate. That bound gets its own check and its own
+            # words, so a foreign-occupancy shortfall is never reported as
+            # "your own weights exhausted the budget" (which is what sent a
+            # co-existence bring-up hunting through its weight accounting
+            # while the real posts were the mamba/activation reservations
+            # below).
+            self._assert_budget_physically_available(
+                budget_mib, budget_gb, used_by_me_gb, device_free_gb
+            )
             if self.mambaish_config is not None and self.post_capture_kv_active:
-                rest_memory -= (
+                mamba_precapture_gb = (
                     self.server_args.mamba_pre_capture_reserve_mb(
                         get_device_memory_capacity(self.device)
                     )
                     / 1024
                 )
+                rest_memory -= mamba_precapture_gb
+                budget_posts.append(("mamba pre-capture reserve", mamba_precapture_gb))
         else:
             slack_gb = pre_model_load_memory * (1 - self.mem_fraction_static)
             if self.mambaish_config is not None and self.post_capture_kv_active:
@@ -358,7 +507,15 @@ class ModelRunnerKVCacheMixin:
                 )
             rest_memory = available_gpu_memory - slack_gb
         if self.mambaish_config is not None:
+            before_mamba_gb = rest_memory
             rest_memory = self.handle_max_mamba_cache(rest_memory)
+            budget_posts.append(
+                (
+                    "mamba state pool + speculative intermediate state + "
+                    "prefill activation reserve",
+                    before_mamba_gb - rest_memory,
+                )
+            )
 
         # #257: GGUF dequant scratch. The GGUF path dequantizes a weight into
         # a scratch buffer before the large-M cuBLAS GEMM, and targets above
@@ -382,6 +539,7 @@ class ModelRunnerKVCacheMixin:
                 rest_memory - gguf_scratch_gb,
             )
             rest_memory -= gguf_scratch_gb
+        budget_posts.append(("GGUF dequant scratch", gguf_scratch_gb))
 
         # Measured KV-budget correction (two-boot convergence): replace the
         # blind part of the slack heuristic with the PREVIOUS boot's measured
@@ -440,17 +598,26 @@ class ModelRunnerKVCacheMixin:
             )
             if uneven_memory:
                 # In this mode --mem-fraction-static is rejected up front;
-                # phrase the fix in the budget's own unit (MiB).
-                used_gb = pre_model_load_memory - available_gpu_memory
+                # phrase the fix in the budget's own unit (MiB), and itemize
+                # (#260). "The rank already uses X for weights, which
+                # exhausts the budget" was true of only the first post: on
+                # the boot that motivated this, weights were 4.32 of a 6.65
+                # GiB budget and the other 2.50 GiB went to the mamba state
+                # pool, the speculative intermediate state and the prefill
+                # activation reserve -- none of them named. The message also
+                # states the driver-free situation, because the shortfall
+                # was read as co-residence double-counting when the budget
+                # had in fact been handed out in full.
                 raise ValueError(
-                    f"Loaded weights leave no GPU memory for the KV cache "
-                    f"under --rank-gpu-memory-mib on rank {self.tp_rank}: "
-                    f"the rank already uses {used_gb:.2f} GiB "
-                    f"(~{math.ceil(used_gb * 1024)} MiB) for weights and "
-                    f"runtime state, which exhausts the per-rank budget. "
-                    f"Raise --rank-gpu-memory-mib above that, or place "
-                    f"fewer ranks on this GPU. If using speculative "
-                    f"decoding, draft weights are now counted.{gguf_note}"
+                    self.budget_exhausted_message(
+                        tp_rank=self.tp_rank,
+                        budget_mib=budget_mib,
+                        budget_gb=budget_gb,
+                        posts=budget_posts,
+                        rest_memory_gb=rest_memory,
+                        device_free_gb=device_free_gb,
+                        occupancy=self._device_occupancy_gb(device_free_gb),
+                    )
                 )
             raise ValueError(
                 f"Loaded weights leave no GPU memory for the KV cache under "
@@ -624,9 +791,7 @@ class ModelRunnerKVCacheMixin:
             return 0
         vec = data.get("correction_bytes")
         if not isinstance(vec, list) or len(vec) != self.server_args.tp_size:
-            logger.warning(
-                "Measured KV-budget cache %s is malformed; ignoring.", path
-            )
+            logger.warning("Measured KV-budget cache %s is malformed; ignoring.", path)
             self._measured_kv_budget_provenance = "malformed"
             return 0
         # Corrections are VECTOR-SPECIFIC: they encode the previous boot's
@@ -838,8 +1003,7 @@ class ModelRunnerKVCacheMixin:
         try:
             param_bytes = sum(
                 t.nbytes
-                for t in list(self.model.parameters())
-                + list(self.model.buffers())
+                for t in list(self.model.parameters()) + list(self.model.buffers())
                 if t.device.type == "cuda"
             )
         except Exception:  # balance log must never break boot
@@ -975,9 +1139,7 @@ class ModelRunnerKVCacheMixin:
         kv_pool_b = 0
         try:
             v = self.token_to_kv_pool.get_kv_size_bytes()
-            kv_pool_b = (
-                int(sum(v)) if isinstance(v, (tuple, list)) else int(v)
-            )
+            kv_pool_b = int(sum(v)) if isinstance(v, (tuple, list)) else int(v)
         except Exception:
             kv_pool_b = 0
         pools_b = max(0, ckpt_p[0] - ckpt_w[0])
@@ -1019,15 +1181,11 @@ class ModelRunnerKVCacheMixin:
             "weights_param_bytes": int(param_bytes),
             "pools_bytes": int(pools_b),
             "kv_pool_bytes": int(kv_pool_b),
-            "kv_pool_tokens": int(
-                getattr(self.token_to_kv_pool, "size", 0) or 0
-            ),
+            "kv_pool_tokens": int(getattr(self.token_to_kv_pool, "size", 0) or 0),
             "mamba_aux_pool_bytes": int(max(0, pools_b - kv_pool_b)),
             "graphs_ws_bytes": int(graphs_ws_b),
             "draft_solo_pool_bytes": int(draft_pool_b),
-            "graphs_ws_excl_draft_pool_bytes": int(
-                max(0, graphs_ws_b - draft_pool_b)
-            ),
+            "graphs_ws_excl_draft_pool_bytes": int(max(0, graphs_ws_b - draft_pool_b)),
             "rung_tags": rung_tags,
             "frag_bytes": int(frag_b),
             "boot_transient_bytes": int(transient_b),
@@ -1035,9 +1193,7 @@ class ModelRunnerKVCacheMixin:
             "max_paused_tag_bytes": int(max_tag_b),
             "required_free_bytes": int(safety_b + max_tag_b),
             "free_bytes_at_measure": int(free_b),
-            "max_total_num_tokens": int(
-                getattr(self, "max_total_num_tokens", 0) or 0
-            ),
+            "max_total_num_tokens": int(getattr(self, "max_total_num_tokens", 0) or 0),
         }
         logger.info(
             "Measured KV-budget components (rank %d): kv-pool %.2f GiB, "
@@ -1090,10 +1246,9 @@ class ModelRunnerKVCacheMixin:
         # Structural component shift of THIS rank's balance (T156-D: the
         # small DFLASH solo pool changes draft_solo_pool_bytes by GiBs when
         # toggled/resized) -- see correction_growth_frozen.
-        component_shift = (
-            prev_draft_pool_b is not None
-            and abs(int(draft_pool_b) - prev_draft_pool_b) > (256 << 20)
-        )
+        component_shift = prev_draft_pool_b is not None and abs(
+            int(draft_pool_b) - prev_draft_pool_b
+        ) > (256 << 20)
         if self.correction_growth_frozen(
             delta_b, prev_b, prev_leftover_b, free_b, component_shift
         ):
@@ -1137,9 +1292,7 @@ class ModelRunnerKVCacheMixin:
                 json.dump(
                     {
                         "correction_bytes": corrections,
-                        "leftover_mib_at_measure": [
-                            v >> 20 for v in leftovers
-                        ],
+                        "leftover_mib_at_measure": [v >> 20 for v in leftovers],
                         "safety_mib": safety_b >> 20,
                         "max_paused_tag_mib_rank0": max_tag_b >> 20,
                         "mlp_vector": [int(v) for v in mlp_vec],
@@ -1268,8 +1421,7 @@ class ModelRunnerKVCacheMixin:
             uneven_dcp_active(sa.dcp_size)
             and sa.max_mamba_cache_size is None
             and not sa.disable_radix_cache
-            and abs(sa.mamba_full_memory_ratio - MAMBA_FULL_MEMORY_RATIO_DEFAULT)
-            < 1e-9
+            and abs(sa.mamba_full_memory_ratio - MAMBA_FULL_MEMORY_RATIO_DEFAULT) < 1e-9
         )
 
     def _auto_mamba_target_concurrency(self: ModelRunner) -> int:
@@ -1358,9 +1510,7 @@ class ModelRunnerKVCacheMixin:
             demand_size = self._auto_mamba_demand_size(ratio)
             # Never exceed what the post-weights budget can physically hold
             # (main state + spec-decode intermediate state per admitted req).
-            fit_cap = int(
-                total_rest_memory * (1 << 30) // (per_req * (1 + D / ratio))
-            )
+            fit_cap = int(total_rest_memory * (1 << 30) // (per_req * (1 + D / ratio)))
             size = min(demand_size, max(fit_cap, 0))
             reserve_gb = MAMBA_AUTO_ACTIVATION_RESERVE_MIB / 1024.0
             effective_target = self._auto_mamba_target_concurrency()
@@ -2011,9 +2161,7 @@ class ModelRunnerKVCacheMixin:
         if dcp > 1:
             prefix = cp_token_prefix(dcp)
             S = cp_token_split_factor(dcp)
-            max_ratio = max(
-                prefix[r + 1] - prefix[r] for r in range(len(prefix) - 1)
-            )
+            max_ratio = max(prefix[r + 1] - prefix[r] for r in range(len(prefix) - 1))
         else:
             S, max_ratio = 1, 1
         ctx = int(self.model_config.context_len)
@@ -2346,10 +2494,7 @@ class ModelRunnerKVCacheMixin:
                 self._wl_spill_staging_tokens = _wl_stage
                 self._wl_spill_device_tokens = _wl_phys - _wl_stage
                 _wl_cap = int(
-                    getattr(
-                        self.server_args, "weightless_kv_spill_device_cap", 0
-                    )
-                    or 0
+                    getattr(self.server_args, "weightless_kv_spill_device_cap", 0) or 0
                 )
                 if 0 < _wl_cap < self._wl_spill_device_tokens:
                     # Cap the device-resident KV even though VRAM could hold
@@ -2371,9 +2516,7 @@ class ModelRunnerKVCacheMixin:
                     self._wl_spill_device_tokens = _wl_cap
                     self._wl_spill_phys_tokens = _wl_cap + _wl_stage
                 self._wl_spill_host_tokens = _wl_spill
-                self.max_total_num_tokens = (
-                    self._wl_spill_device_tokens + _wl_spill
-                )
+                self.max_total_num_tokens = self._wl_spill_device_tokens + _wl_spill
                 # ---- Stage B2: per-rank pool shrink -------------------------
                 # Under the even-modulo DCP owner rule a single global sequence
                 # of length L occupies only L // dcp_size PER-RANK slots (each
@@ -3008,9 +3151,7 @@ class ModelRunnerKVCacheMixin:
                     # though their owned fill levels differ (S3b.4 item 3).
                     # Flag-gated on --kv-session-offload-prefill: without it
                     # not a single row is reserved.
-                    if getattr(
-                        self.server_args, "kv_session_offload_prefill", False
-                    ):
+                    if getattr(self.server_args, "kv_session_offload_prefill", False):
                         from sglang.srt.managers.kv_session_offload import (
                             prefill_stage_tokens,
                         )
@@ -3532,10 +3673,7 @@ class ModelRunnerKVCacheMixin:
             uneven_dcp_active,
         )
 
-        if (
-            uneven_dcp_active(self.dcp_size)
-            and get_world_group().world_size > 1
-        ):
+        if uneven_dcp_active(self.dcp_size) and get_world_group().world_size > 1:
             ratios = get_cp_token_ratios()
             split_factor = cp_token_split_factor(self.dcp_size)
             ratio_r = ratios[get_parallel().attn_dcp_rank]
@@ -3759,9 +3897,7 @@ class ModelRunnerKVCacheMixin:
             return
 
         bytes_per_token = [free_bytes[r] / tokens[r] for r in range(world)]
-        suggestion = suggest_unit_rebalance_multi(
-            free_bytes, bytes_per_token, families
-        )
+        suggestion = suggest_unit_rebalance_multi(free_bytes, bytes_per_token, families)
         if suggestion is None:
             # Balanced (max/min <= 1.10) or no strictly better partition
             # — in particular: active vectors that already equalize the
@@ -4035,18 +4171,16 @@ class ModelRunnerKVCacheMixin:
         p_measured = list(p_by_rank)
 
         def _context_budget(vector: list, capacities: list) -> int:
-            return min(
-                capacities[r] // vector[r] for r in range(self.dcp_size)
-            ) * sum(vector)
+            return min(capacities[r] // vector[r] for r in range(self.dcp_size)) * sum(
+                vector
+            )
 
         c_active = _context_budget(active, p_measured)
 
         if solo_curve is not None:
             alpha, beta = solo_curve
             grain = 64
-            other_ranks = [
-                r for r in range(self.dcp_size) if r != solo_host_rank
-            ]
+            other_ranks = [r for r in range(self.dcp_size) if r != solo_host_rank]
             best_vec, best_c, best_ph = None, -1, 0
             # Every non-host rank needs >= 1 unit of the remaining grain.
             for v_host in range(1, grain - len(other_ranks) + 1):
@@ -4335,18 +4469,14 @@ class ModelRunnerKVCacheMixin:
             # with post-capture sizing the (more accurate) post-capture
             # measurement runs it instead.
             self._maybe_suggest_mlp_rebalance(available_bytes)
-            self._maybe_suggest_dcp_token_vector(
-                available_bytes, allow_install=True
-            )
+            self._maybe_suggest_dcp_token_vector(available_bytes, allow_install=True)
         elif self.server_args.uneven_kv_derived_mode():
             # --rank-kv-ratio capacity/speed with post-capture sizing planned: the
             # token vector must be FINAL before pools/backends/graphs
             # snapshot it, so the measured install runs on the pre-capture
             # profiling here; the post-capture pass stays hint-only (any
             # residual delta shows up as the usual restart hint).
-            self._maybe_suggest_dcp_token_vector(
-                available_bytes, allow_install=True
-            )
+            self._maybe_suggest_dcp_token_vector(available_bytes, allow_install=True)
         config = self._config_from_budget(available_bytes)
         config.max_running_requests = self._resolve_max_num_reqs(
             config.max_total_num_tokens

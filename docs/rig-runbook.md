@@ -368,6 +368,33 @@ Several agents share this box; the cards are usually contended.
   graphs, or activation workspace (~2.3 GiB measured on a 27B-Q3 rank0),
   nor a separate speculative-draft process (~3.3 GiB measured). Budget them
   explicitly on every card that carries either.
+- **The budget is `NVML total - reserve`, and a co-resident process does not
+  change it** (#260, fixed 2026-07-28). Until then the derivation also capped
+  the budget at `free_mib - 1024`, so a neighbour was charged twice — once
+  because it really held those bytes, once through the reserve sized to cover
+  it — and the capped budgets fed the gcd reduction that derives
+  `--rank-tp-ratio`, i.e. the shard plan depended on who else was on the card
+  at launch. Now the live free reading only produces a warning naming the
+  GPU, the planned MiB, the free MiB and the MiB held by others; it never
+  moves a budget.
+- **Budget vs. what the card can hand out are two different failures, and the
+  messages now say which one you have.** "…is not physically available: the
+  rank holds X and Y is free to it (…Z held outside this process)" means the
+  neighbour, not your sizing. "…budget is spent on <post> …; <post> …" means
+  the budget arrived in full and the posts ate it — that message itemizes
+  them and prints the driver-free line so the co-residence theory can be
+  ruled out from the message alone.
+- **Under uneven DCP, weights are usually the smallest post.** Measured on
+  rank 0 of the 27B-Q3 TP=3 co-existence boot, budget 6807 MiB (5090 32607 −
+  reserve 25800): weights + runtime state 4.32 GiB, mamba state pool 0.91,
+  speculative intermediate state 0.58, prefill activation reserve 1.00, GGUF
+  dequant scratch 0.73 — 7.55 GiB against a 6.65 GiB budget, i.e. 926 MiB
+  short before a single KV token. Budget ≈ 9000 MiB (reserve ≈ 23600) is the
+  floor for that rank; anything derived only from the weight shard is ~2.5
+  GiB optimistic. `--rank-auto-reserve-mib` on the co-resident card therefore
+  has a narrow window: raising it starves rank 0, lowering it shifts shard
+  mass onto the other cards (the budgets ARE the ratio), which is why the
+  bracket around a co-existence boot is a few hundred MiB wide.
 - After killing a `launch_server` parent, check
   `nvidia-smi --query-compute-apps=pid,used_memory` for orphaned
   `sglang::scheduler_TP*` processes — they hold 5-11 GiB per card and do
