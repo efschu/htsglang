@@ -2723,3 +2723,249 @@ class TestChessWindow(CustomTestCase):
         js = _index_script()
         i = js.index("function qualityTableHtml(")
         self.assertIn("verdictClass(d.verdict)", js[i:i + 1400])
+
+
+# ===========================================================================
+# Etappe 6: the discussion export. Built, tested, and deliberately NOT armed.
+# ===========================================================================
+
+
+class TestDiscussionExport(CustomTestCase):
+    def setUp(self):
+        from sglang.srt.planner import discussion_export as dx
+        self.dx = dx
+        self._env = {k: os.environ.get(k) for k in (dx.TARGET_ENV, dx.PAT_FILE_ENV)}
+        for k in self._env:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _payload(self):
+        return {
+            "bench_results": [{
+                "test_id": 1, "label": "basic", "status": "pass",
+                "metric": {"name": "tok_s", "value": 42, "unit": "tok/s"},
+                "detail": {"ttft_ms": 120.5, "prefill_tps": 900.0},
+            }],
+            "lead_metrics": {"ms_per_verify_round": 18.4},
+            "system": {
+                "cards": ["RTX 5090", "RTX 3080"],
+                "driver": "580.00",
+                "model": "/home/someone/models/Qwen3.6-27B",
+            },
+            "launch_flags": ["--model", "/home/someone/models/Q", "--host", "192.168.0.89"],
+            "energy": {"j_per_decode_token": 0.42, "avg_decode_watts": 310.0,
+                       "per_card": [{"name": "RTX 5090", "j_per_decode_token": 0.2,
+                                     "watts": 200, "efficiency": 1.8}]},
+        }
+
+    # -- the gate ---------------------------------------------------------
+
+    def test_nothing_is_armed_without_a_target(self):
+        d = self.dx.preview(self._payload(), "bench_system")
+        self.assertFalse(d["can_send"])
+        self.assertEqual(d["reason"], "no target configured")
+
+    def test_submit_without_a_target_sends_nothing(self):
+        def _boom(req):  # pragma: no cover - must never run
+            raise AssertionError("a request was made with no target configured")
+
+        d = self.dx.submit(self._payload(), "bench_system", confirmed=True,
+                           opener=_boom)
+        self.assertFalse(d["sent"])
+        self.assertIn("no target", d["reason"])
+
+    def test_target_without_a_token_still_sends_nothing(self):
+        os.environ[self.dx.TARGET_ENV] = "D_kwDOABCD"
+        d = self.dx.preview(self._payload(), "bench_system")
+        self.assertFalse(d["can_send"])
+        self.assertIn(self.dx.PAT_FILE_ENV, d["reason"])
+
+    def test_confirm_is_required_even_when_armed(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".pat", delete=False) as f:
+            f.write("ghp_notarealtokenatall")
+            path = f.name
+        try:
+            os.environ[self.dx.TARGET_ENV] = "D_kwDOABCD"
+            os.environ[self.dx.PAT_FILE_ENV] = path
+
+            def _boom(req):  # pragma: no cover - must never run
+                raise AssertionError("a request was made without confirmation")
+
+            d = self.dx.submit(self._payload(), "bench_system", opener=_boom)
+            self.assertFalse(d["sent"])
+            self.assertIn("not confirmed", d["reason"])
+        finally:
+            os.unlink(path)
+
+    # -- redaction --------------------------------------------------------
+
+    def test_system_details_are_always_scrubbed(self):
+        md = self.dx.build_markdown(self._payload(), "full")
+        self.assertNotIn("/home/someone", md)
+        self.assertNotIn("192.168.0.89", md)
+        # what SHOULD survive
+        self.assertIn("RTX 5090", md)
+        self.assertIn("580.00", md)
+
+    def test_notes_are_scrubbed_too(self):
+        p = dict(self._payload(), notes="ran on 10.0.0.5 at /srv/models/foo")
+        md = self.dx.build_markdown(p, "full")
+        self.assertNotIn("10.0.0.5", md)
+        self.assertNotIn("/srv/models", md)
+
+    # -- bundles ----------------------------------------------------------
+
+    def test_bundles_select_sections(self):
+        only = self.dx.build_markdown(self._payload(), "bench")
+        self.assertIn("## Benchmark", only)
+        self.assertNotIn("## System", only)
+        self.assertNotIn("## Energy", only)
+        both = self.dx.build_markdown(self._payload(), "bench_system")
+        self.assertIn("## System", both)
+        self.assertNotIn("## Energy", both)
+        full = self.dx.build_markdown(self._payload(), "bench_system_energy")
+        self.assertIn("## Energy", full)
+
+    def test_energy_groups_are_selectable(self):
+        md = self.dx.build_markdown(
+            self._payload(), "bench_system_energy", energy_groups=["per_token"]
+        )
+        self.assertIn("Energy per token", md)
+        self.assertNotIn("Average power", md)
+
+    def test_lead_metrics_reach_the_report(self):
+        md = self.dx.build_markdown(self._payload(), "bench")
+        self.assertIn("ms / verify round", md)
+
+    def test_unknown_bundle_is_refused(self):
+        with self.assertRaises(self.dx.DiscussionError):
+            self.dx.build_markdown(self._payload(), "nope")
+
+    def test_preview_is_what_would_be_posted(self):
+        # A preview assembled differently from the payload is not a preview.
+        pv = self.dx.preview(self._payload(), "bench_system")
+        md = self.dx.build_markdown(self._payload(), "bench_system")
+        self.assertEqual(pv["markdown"], md)
+
+    # -- the send path, against a mocked API ------------------------------
+
+    def _armed(self):
+        f = tempfile.NamedTemporaryFile("w", suffix=".pat", delete=False)
+        f.write("ghp_notarealtokenatall")
+        f.close()
+        os.environ[self.dx.TARGET_ENV] = "D_kwDOABCD"
+        os.environ[self.dx.PAT_FILE_ENV] = f.name
+        return f.name
+
+    def test_first_submit_adds_a_comment(self):
+        path = self._armed()
+        seen = []
+
+        def opener(req):
+            seen.append(json.loads(req.data.decode()))
+            if "comments(first" in seen[-1]["query"]:
+                return json.dumps({"data": {"node": {"comments": {"nodes": []}}}}).encode()
+            return json.dumps({"data": {"addDiscussionComment": {
+                "comment": {"id": "C_1", "url": "https://example/x"}}}}).encode()
+
+        try:
+            d = self.dx.submit(self._payload(), "bench_system",
+                               confirmed=True, opener=opener)
+            self.assertTrue(d["sent"])
+            self.assertEqual(d["action"], "created")
+        finally:
+            os.unlink(path)
+
+    def test_resubmit_updates_in_place(self):
+        path = self._armed()
+
+        def opener(req):
+            q = json.loads(req.data.decode())["query"]
+            if "comments(first" in q:
+                return json.dumps({"data": {"node": {"comments": {"nodes": [
+                    {"id": "C_old", "body": self.dx.MARKER + " old",
+                     "viewerDidAuthor": True}]}}}}).encode()
+            return json.dumps({"data": {"updateDiscussionComment": {
+                "comment": {"id": "C_old", "url": "https://example/x"}}}}).encode()
+
+        try:
+            d = self.dx.submit(self._payload(), "bench_system",
+                               confirmed=True, opener=opener)
+            self.assertEqual(d["action"], "updated")
+        finally:
+            os.unlink(path)
+
+    def test_token_never_leaves_except_in_the_header(self):
+        path = self._armed()
+        seen = []
+
+        def opener(req):
+            seen.append(req)
+            return json.dumps({"data": {"node": {"comments": {"nodes": []}}}}).encode()
+
+        try:
+            try:
+                self.dx.submit(self._payload(), "bench_system",
+                               confirmed=True, opener=opener)
+            except self.dx.DiscussionError:
+                pass
+            req = seen[0]
+            self.assertNotIn("ghp_", req.full_url)
+            self.assertIn("ghp_", req.headers.get("Authorization", ""))
+            self.assertNotIn("ghp_", req.data.decode())
+        finally:
+            os.unlink(path)
+
+    def test_api_errors_are_token_redacted(self):
+        path = self._armed()
+
+        def opener(req):
+            return json.dumps({"errors": [{"message": "bad credentials ghp_notarealtokenatall"}]}).encode()
+
+        try:
+            with self.assertRaises(self.dx.DiscussionError) as cm:
+                self.dx.submit(self._payload(), "bench_system",
+                               confirmed=True, opener=opener)
+            self.assertNotIn("ghp_notarealtokenatall", str(cm.exception))
+            self.assertIn("<redacted-token>", str(cm.exception))
+        finally:
+            os.unlink(path)
+
+
+class TestDiscussionRoutes(TestHttpRoundTrip):
+    def test_preview_route_reports_the_gate(self):
+        d = self._post("/api/discussion_preview", {"data": {}, "bundle": "bench"})
+        self.assertTrue(d["ok"])
+        self.assertFalse(d["can_send"])
+        self.assertIn("bundles", d)
+
+    def test_submit_route_sends_nothing_when_unarmed(self):
+        d = self._post("/api/discussion_submit",
+                       {"data": {}, "bundle": "bench", "confirmed": True})
+        self.assertFalse(d["sent"])
+
+
+class TestDiscussionUi(CustomTestCase):
+    def test_composer_exists_and_states_the_gate(self):
+        html = webui.INDEX_HTML
+        self.assertIn('id="dx_bundle"', html)
+        self.assertIn('id="dx_preview"', html)
+        self.assertIn("Nothing is created automatically", html)
+
+    def test_frontend_composes_no_markdown(self):
+        js = _index_script()
+        i = js.index("function discussionData(")
+        body = js[i:js.index("// ---- GitHub share (#152)")]
+        for forbidden in ("## Benchmark", "## System", "|---|", "scrub"):
+            self.assertNotIn(forbidden, body, forbidden)
+
+    def test_send_needs_an_explicit_confirm(self):
+        js = _index_script()
+        i = js.index("async function discussionSubmit(")
+        self.assertIn("confirm(", js[i:i + 600])

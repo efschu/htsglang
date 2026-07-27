@@ -426,11 +426,40 @@ New module `srt/planner/discussion_export.py`.
 * Each etappe ends with the four gates of §0 at or below baseline, then a
   commit and a push.
 
+## 4a. Status per etappe
+
+| etappe | state | commit |
+| --- | --- | --- |
+| 1 plan + baseline | done | `f7af271bc3` |
+| 2 update/state foundation | done | `2321860f93` |
+| 3 simple/expert + live propagation + trade-offs | done | `43d51ccbc8` |
+| 4 rig pairing (#214) | done | `c0c28a4dcd` |
+| 5 benchmark + chess windows | done | `8a788ce8b2` |
+| 6 discussion export | done | this commit |
+
+Gates at the end: **1183 tests pass**, 38 skipped, against a baseline of
+1067 — one pre-existing unrelated failure throughout (the chess reference
+PNG is absent from the tree). ruff 18 (baseline 20), codespell 8 (baseline
+8), scoped mypy 66 (baseline 67).
+
 ## 5. Open points that only a real boot can settle
 
 Recorded here rather than claimed as done:
 
-* Cross-rig reachability against a second physical rig — the pairing flow is
-  exercised against an injected transport in tests only.
-* The GraphQL create/update path is exercised against a mocked API, the same
-  standard `github_share.py` holds itself to.
+* **Cross-rig reachability against a second physical rig.** The pairing flow
+  is exercised against an injected opener only. What is proven is the
+  sequencing, the gate logic, the honesty of the "not measured" reporting and
+  the non-blocking advance; what is not proven is that a real remote rigmon
+  answers in the shape assumed.
+* **The GraphQL create/update path** is exercised against a mocked API — the
+  same standard `github_share.py` holds itself to, and stated in its module
+  docstring for the same reason.
+* **Browser behaviour.** The DOM patching, the collapse/scroll/focus
+  preservation and the abort-on-supersede are asserted structurally (the JS is
+  parsed and the call sites are pinned by tests) but never executed in a
+  browser here. A real page load is the only thing that settles it.
+* **`ms/verify-round` against a busy server.** The endpoint differences the
+  engine's phase counter correctly against synthetic samples; the numbers a
+  real loaded server produces have not been seen.
+* **The Discussion send has never run against api.github.com**, deliberately:
+  the gate exists so that it cannot happen by accident.

@@ -2083,6 +2083,47 @@ def tooltips_payload(payload: Optional[dict] = None) -> dict:
     return {"ok": True, "tooltips": tipsmod.tooltip_map(_measured_figures())}
 
 
+def discussion_preview_payload(payload: dict) -> dict:
+    """POST /api/discussion_preview -> the exact Markdown, plus whether it could
+    be sent. Pure: no network, no token read beyond checking one exists."""
+    from sglang.srt.planner import discussion_export as dx
+
+    payload = payload or {}
+    try:
+        return dx.preview(
+            payload.get("data") or {},
+            payload.get("bundle") or "bench_system",
+            energy_groups=payload.get("energy_groups"),
+            target=payload.get("target"),
+        )
+    except dx.DiscussionError as e:
+        return {"ok": False, "error": str(e)}
+
+
+def discussion_submit_payload(payload: dict) -> dict:
+    """POST /api/discussion_submit -> post the previewed Markdown, if armed.
+
+    Gated by design: with no discussion configured this returns the preview
+    and reports "no target configured". Nothing is created automatically --
+    creating a discussion to post into is a decision for a human, not a side
+    effect of pressing a button.
+    """
+    from sglang.srt.planner import discussion_export as dx
+
+    payload = payload or {}
+    try:
+        return dx.submit(
+            payload.get("data") or {},
+            payload.get("bundle") or "bench_system",
+            energy_groups=payload.get("energy_groups"),
+            target=payload.get("target"),
+            confirmed=bool(payload.get("confirmed")),
+        )
+    except dx.DiscussionError as e:
+        # Already token-redacted by the module.
+        return {"ok": False, "error": str(e)}
+
+
 #: Last engine scrape per endpoint, so the lead metrics are a delta between
 #: two calls rather than a blocking sleep inside one. Same shape the landing
 #: strip uses client-side; kept here because ms-per-round needs the
@@ -3043,6 +3084,12 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/resolve_flags"):
                 self._json(200, resolve_flags_payload(payload))
                 return
+            if self.path.startswith("/api/discussion_preview"):
+                self._json(200, discussion_preview_payload(payload))
+                return
+            if self.path.startswith("/api/discussion_submit"):
+                self._json(200, discussion_submit_payload(payload))
+                return
             if self.path.startswith("/api/bench_lead_metrics"):
                 self._json(200, bench_lead_metrics_payload(payload))
                 return
@@ -3569,6 +3616,29 @@ _INDEX_TEMPLATE = r"""<!doctype html>
           <div style="margin-top:.4rem"><button onclick="shareSubmit()" id="sh_btn">Confirm + submit to GitHub</button></div>
         </div>
         <div id="sh_out" class="muted" style="margin-top:.4rem"></div>
+      </fieldset>
+      <fieldset>
+        <legend>share in a GitHub discussion</legend>
+        <div class="muted" style="margin-bottom:.4rem">Pick a bundle, read the
+          preview, then send. System details always pass through the
+          redaction: card models and driver versions go, host names, addresses
+          and paths do not. <b>Nothing is created automatically</b> &mdash;
+          with no discussion configured this builds the preview and says so.</div>
+        <label>bundle</label>
+        <select id="dx_bundle" onchange="discussionPreview()"></select>
+        <div id="dx_bundle_note" class="muted" style="font-size:.68rem;margin:.2rem 0"></div>
+        <label>energy metrics</label>
+        <div id="dx_groups" class="muted" style="font-size:.7rem"></div>
+        <div style="margin-top:.4rem"><button class="secondary" onclick="discussionPreview()">Build preview</button></div>
+        <div id="dx_wrap" style="display:none;margin-top:.5rem">
+          <div class="muted">this exact markdown would be posted:</div>
+          <pre id="dx_preview" style="max-height:300px;overflow:auto"></pre>
+          <div id="dx_gate" class="muted"></div>
+          <div class="actions" style="margin-top:.4rem">
+            <button onclick="discussionSubmit()" id="dx_btn">Confirm + post</button>
+          </div>
+        </div>
+        <div id="dx_out" class="muted" style="margin-top:.4rem"></div>
       </fieldset>
     </div>
     <div>
@@ -7726,6 +7796,9 @@ async function benchLeadPoll(endpoint){
       {key:'lead', body:{endpoint}, timeout:BENCH_LEAD_MS-200});
     if(!d.ok){ setHTML($('bn_lead'),'<span class="muted">'+esc(d.error||'')+'</span>'); return; }
     const m=d.metrics||{};
+    // Kept for the discussion export: the round times are the lead numbers
+    // worth sharing, and they exist only while a server is busy.
+    if(Object.keys(m).length) window._leadMetrics=m;
     const keys=Object.keys(LEAD_LABELS).filter(k=>m[k]!=null);
     let h='';
     if(keys.length)
@@ -7738,6 +7811,92 @@ async function benchLeadPoll(endpoint){
     if(d.window_s!=null) h+='<div class="legend">window '+d.window_s+' s</div>';
     setHTML($('bn_lead'), h||'<span class="muted">nothing reported.</span>');
   }catch(e){}
+}
+
+// ===========================================================================
+// Discussion export: bundle composer, preview, gated send.
+//
+// Steering only, like the pairing tab: the bundles, the redaction and the
+// Markdown all come from planner/discussion_export.py. This assembles the
+// data the page already holds and renders what the server returns -- it does
+// not compose Markdown and it does not decide what may be shared.
+// ===========================================================================
+function discussionData(){
+  // Whatever this session actually measured. Sections with no data are
+  // simply absent from the report; nothing is invented to fill a bundle.
+  const s=window._lastSnapshot||null;
+  const n=s? normalizeStartConfig(s) : null;
+  const c=(n&&n.cfg)||{};
+  const runs=window._benchRuns||[];
+  const last=runs.length? runs[runs.length-1] : null;
+  const out={};
+  if(last) out.bench_results=last.results;
+  if(window._leadMetrics) out.lead_metrics=window._leadMetrics;
+  const gpus=(s&&s.gpus)||[];
+  out.system={
+    cards: gpus.map(g=>g.name),
+    model: c.model_path||$('bn_model').value.trim()||null,
+    quant: c.kv_cache_dtype||null,
+  };
+  if(n&&n.argv) out.launch_flags=n.argv;
+  if(window._lastQuality) out.quality=window._lastQuality;
+  const notes=$('sh_notes'); if(notes && notes.value.trim()) out.notes=notes.value.trim();
+  return out;
+}
+function discussionGroups(){
+  const out=[];
+  for(const el of document.querySelectorAll('#dx_groups input[type=checkbox]'))
+    if(el.checked) out.push(el.getAttribute('data-group'));
+  return out;
+}
+async function discussionPreview(){
+  setHTML($('dx_out'),'building…');
+  try{
+    const d=await api('/api/discussion_preview',{key:'dx', body:{
+      data:discussionData(), bundle:($('dx_bundle').value||'bench_system'),
+      energy_groups:discussionGroups()}});
+    if(!d.ok){ setHTML($('dx_out'),'<span class="reasons">'+esc(d.error||'')+'</span>'); return; }
+    renderDiscussionOptions(d);
+    $('dx_preview').textContent=d.markdown;
+    $('dx_wrap').style.display='';
+    // The gate is stated plainly rather than by disabling a button with no
+    // explanation: "no target configured" is information, not a failure.
+    setHTML($('dx_gate'), d.can_send
+      ? '<span class="fitc">ready to post to '+esc(d.target||'')+'</span>'
+      : '<span class="reasons">'+esc(d.reason||'')+'</span>');
+    $('dx_btn').disabled=!d.can_send;
+    setHTML($('dx_out'),'');
+  }catch(e){ if(!apiAborted(e)) setHTML($('dx_out'),'<span class="reasons">'+esc(apiError(e))+'</span>'); }
+}
+function renderDiscussionOptions(d){
+  const sel=$('dx_bundle');
+  if(sel && !sel.options.length && (d.bundles||[]).length){
+    setHTML(sel, d.bundles.map(b=>'<option value="'+esc(b.key)+'">'+esc(b.label)+'</option>').join(''));
+    sel.value='bench_system';
+  }
+  const cur=(d.bundles||[]).find(b=>b.key===(sel&&sel.value));
+  if(cur) $('dx_bundle_note').textContent=cur.note||'';
+  const box=$('dx_groups');
+  if(box && !box.children.length && (d.energy_groups||[]).length)
+    setHTML(box, d.energy_groups.map(g=>
+      '<label style="display:inline-block;margin-right:.6rem"><input type="checkbox" checked '
+      +'style="width:auto" data-group="'+esc(g.key)+'" onchange="discussionPreview()"> '
+      +esc(g.label)+'</label>').join(''));
+}
+async function discussionSubmit(){
+  if(!confirm('Post the previewed report to the configured GitHub discussion? '
+              +'This sends data to an EXTERNAL service.')) return;
+  $('dx_btn').disabled=true; setHTML($('dx_out'),'posting…');
+  try{
+    const d=await api('/api/discussion_submit',{key:'dx_submit', body:{
+      data:discussionData(), bundle:($('dx_bundle').value||'bench_system'),
+      energy_groups:discussionGroups(), confirmed:true}, timeout:40000});
+    setHTML($('dx_out'), d.sent
+      ? ('<span class="fitc">'+esc(d.action||'posted')+'</span> — '
+         +'<a href="'+esc(d.url||'#')+'" target="_blank">'+esc(d.url||'')+'</a>')
+      : '<span class="reasons">'+esc(d.reason||d.error||'not sent')+'</span>');
+  }catch(e){ if(!apiAborted(e)) setHTML($('dx_out'),'<span class="reasons">'+esc(apiError(e))+'</span>'); }
+  finally{ $('dx_btn').disabled=false; }
 }
 
 // ---- GitHub share (#152) -- preview first, explicit confirm, PAT per-use ----
