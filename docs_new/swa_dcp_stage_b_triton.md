@@ -306,7 +306,8 @@ flag. This also means Stage B *strictly* builds on Stage A, as #91 predicted.
 | combination | why |
 |---|---|
 | SWA + uneven DCP **without** cap sizing | §3.5 |
-| SWA + uneven DCP + speculative decoding | unchanged #173 refusal (verify builds un-sharded indices); Gemma-4-31B has no MTP tensors anyway |
+| SWA + uneven DCP + **tree** speculative verify (`--speculative-eagle-topk > 1`, or the DFLASH tree-verify door) | the tree mask's row stride is the GLOBAL prefix length, which stops describing the rows the kernel walks once the prefix is owner-sharded. CHAIN verify (topk == 1) is served since #180; this row was the blanket #173 spec refusal before that |
+| SWA + uneven DCP + ngram speculation | `NGRAM_VERIFY` is not a layout the DCP verify split serves; refused by `reject_ngram_verify_under_dcp` |
 | SWA + uneven DCP + MLA / weightless-KV | unchanged #173 refusals |
 | SWA + uneven DCP + HiCache | `cache_controller._dcp_kv_transfer_pairs` compacts *both* device index streams through the owner rule; the SWA stream must stay local. #91 §3(b) already scoped this out of v1 — now it is a gate instead of a silent hole |
 | pure-SWA model (no global layers) + uneven DCP | nothing to shard (§4.1) |
@@ -332,8 +333,9 @@ Newly served: **SWA-hybrid + uneven plan + (weighted or even-modulo owner rule)
 + cap sizing + global layers present**.
 Still refused, with the same words as before: a window model on the uneven lane
 **without** the Stage-B preconditions (no cap sizing / no global layers /
-draft worker / HiCache), and every non-window refusal of #173 (weightless, MLA,
-speculative). Branch 2 (token vector without a plan) and branch 3 (even DCP
+draft worker / HiCache), and the non-window refusals of #173 that #180 did not
+lift: weightless-KV, MLA, and a TREE-masked speculative verify (chain verify is
+served). Branch 2 (token vector without a plan) and branch 3 (even DCP
 replication arithmetic over `max(full, swa)` kv bases, #169.3) are untouched.
 
 ---
@@ -392,8 +394,11 @@ perturb it.
 **H2 — the guard opens, and only where it should** (~2 min, one card): boot the
 Stage-B config and confirm the process gets past `TritonAttnBackend.__init__`.
 Then confirm each refusal of §4.2 still fires by adding it to the same command:
-`--swa-pool-sizing ratio`, `--enable-hierarchical-cache`, a speculative config.
-Each must abort at boot naming itself.
+`--swa-pool-sizing ratio`, `--enable-hierarchical-cache`, a TREE speculative
+config (`--speculative-eagle-topk 2`), `--speculative-algorithm ngram`. Each
+must abort at boot naming itself. A CHAIN speculative config
+(`--speculative-eagle-topk 1`) is the counter-case: it must boot, since #180
+serves it.
 
 **H3 — DCP-off regression, byte-identical** (~5 min): Gemma-4-31B TP=3 uneven
 **without** `--dcp-size`, `--swa-pool-sizing cap`. Sizing lines and temp-0
@@ -474,9 +479,24 @@ lands at or below the measurement noise, that is the number that goes into
    indexes the full sub-pool's *buffers* with GLOBAL allocator ids is wrong
    under a compact pool. Checked, with the result that none of them is reachable
    on this lane:
-   * `SWAKVPool.move_kv_cache` — called only from the speculative paths
-     (`spec_utils.py`, `base_spec_worker.py`), and speculative decoding is
-     refused on the lane;
+   * `SWAKVPool.move_kv_cache` — hands its `tgt_loc` / `src_loc` **unchanged**
+     to `full_kv_pool.move_kv_cache` (only the SWA sub-pool gets a translation),
+     so global allocator ids would index the compact full sub-pool directly.
+     It is unreachable on the lane, but **no longer because "speculative
+     decoding is refused"** — since #180 the lane serves a CHAIN verify. The
+     surviving reason is narrower and is about the call sites: all three are
+     TREE-only, and a tree verify is still refused at boot.
+     `eagle_worker_v2._finalize_accept_tree_path` is called under
+     `self.topk > 1`; the branch duplicator in `base_spec_worker.py` returns at
+     `topk <= 1` and builds its branch index from `topk - 1`, so it is a no-op
+     for a chain; `ngram_worker` calls the mover unconditionally but cannot
+     reach a DCP boot at all (`reject_ngram_verify_under_dcp`).
+     **Re-audit trigger:** if the tree refusal is ever lifted — the geometry
+     guard's `speculative and speculative_tree` reason, or the
+     `--speculative-eagle-topk > 1` rejects — this bullet has to be redone, and
+     the mover needs a compact-pool translation for the full sub-pool before
+     that happens. The hazard is the global-id-into-compact-pool write, not
+     speculation as such;
    * `--enable-kv-session-offload` — requires a mambaish model, so a hybrid-SWA
      model raises before reaching it;
    * HiCache — gated (§4.2); unified memory pool — pre-existing assert.
