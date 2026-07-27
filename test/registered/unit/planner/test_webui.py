@@ -2148,8 +2148,11 @@ class TestColocationControls(CustomTestCase):
         # applyProfile refreshes the co-location controls (reverse-populate,
         # never redistribute) right after filling the flag surface.
         html = webui.INDEX_HTML
+        # Both anchors are searched FROM applyProfile: the same two calls also
+        # appear in the running-config prefill earlier in the file, and this
+        # test is about the order inside applyProfile.
         i_apply = html.index("function applyProfile(")
-        i_snap = html.index("window._presetBase=presetSnapshot()")
+        i_snap = html.index("window._presetBase=presetSnapshot()", i_apply)
         i_colo = html.index("updateColoUI()", i_apply)
         self.assertLess(i_apply, i_colo)
         self.assertLess(i_colo, i_snap)
@@ -3055,3 +3058,76 @@ class TestDiscussionUi(CustomTestCase):
         js = _index_script()
         i = js.index("async function discussionSubmit(")
         self.assertIn("confirm(", js[i:i + 600])
+
+
+class TestObservabilityIsNotOptional(CustomTestCase):
+    """A server booted from this dashboard is a server that can be watched."""
+
+    def test_argv_override_still_gets_enable_metrics(self):
+        # The full-argv path is the one place a caller could otherwise decide
+        # to boot a blind server.
+        out = webui._force_enable_metrics(["python", "-m", "sglang.launch_server"])
+        self.assertIn("--enable-metrics", out)
+
+    def test_not_added_twice(self):
+        argv = ["python", "--enable-metrics"]
+        self.assertEqual(webui._force_enable_metrics(argv).count("--enable-metrics"), 1)
+
+    def test_none_stays_none(self):
+        # None means "no override": LaunchSettings.launch_command() appends the
+        # flag itself, and that path is already covered.
+        self.assertIsNone(webui._force_enable_metrics(None))
+
+    def test_launch_settings_command_has_it(self):
+        from sglang.srt.planner.server_manager import LaunchSettings
+
+        self.assertIn("--enable-metrics",
+                      LaunchSettings(model_path="/m").launch_command())
+
+    def test_page_names_the_no_metrics_state(self):
+        html = webui.INDEX_HTML
+        self.assertIn("Server started without --enable-metrics", html)
+        self.assertIn("noMetricsBanner", html)
+
+    def test_detect_reports_whether_metrics_are_served(self):
+        with mock.patch.object(webui, "_probe_sglang", return_value=True), \
+                mock.patch.object(webui, "_serves_metrics", return_value=False):
+            d = webui.detect_endpoint_payload({"endpoint": "1.2.3.4:30000"})
+        self.assertEqual(d["endpoint"], "http://1.2.3.4:30000")
+        self.assertIs(d["metrics"], False)
+
+
+class TestLaunchPayloadCompleteness(CustomTestCase):
+    """Every field LaunchSettings models must be reachable from the payload --
+    otherwise the API can only express a subset of the configurations the
+    launcher supports, and a full-argv override becomes the only real path."""
+
+    def test_spec_depth_loader_and_reserve_survive_the_mapper(self):
+        ls = webui._launch_settings_from_payload({
+            "model": "/m", "format": "gguf", "gguf_variant": "x.gguf",
+            "speculative_num_steps": 3, "speculative_eagle_topk": 1,
+            "speculative_num_draft_tokens": 4,
+            "speculative_draft_model_path": "/draft",
+            "mem_fraction_static": 0.85, "rank_auto_reserve_mib": 2700,
+            "tokenizer_path": "/tok", "load_format": "gguf",
+            "quantization": "gguf", "extra_flags": ["--enable-torch-compile"],
+        })
+        self.assertEqual(ls.speculative_num_steps, 3)
+        self.assertEqual(ls.speculative_eagle_topk, 1)
+        self.assertEqual(ls.speculative_num_draft_tokens, 4)
+        self.assertEqual(ls.speculative_draft_model_path, "/draft")
+        self.assertEqual(ls.mem_fraction_static, 0.85)
+        self.assertEqual(ls.rank_auto_reserve_mib, 2700)
+        self.assertEqual(ls.tokenizer_path, "/tok")
+        self.assertEqual(ls.load_format, "gguf")
+        self.assertEqual(ls.quantization, "gguf")
+        self.assertEqual(ls.extra_flags, ["--enable-torch-compile"])
+
+    def test_blank_values_stay_unset(self):
+        ls = webui._launch_settings_from_payload({
+            "model": "/m", "speculative_num_steps": "",
+            "mem_fraction_static": "", "rank_auto_reserve_mib": "",
+        })
+        self.assertIsNone(ls.speculative_num_steps)
+        self.assertIsNone(ls.mem_fraction_static)
+        self.assertIsNone(ls.rank_auto_reserve_mib)

@@ -1092,6 +1092,14 @@ class _RunCtx:
     rng: random.Random
     vram_free_mib: Optional[Callable[[], Optional[int]]]
     timeout: float
+    #: Every model exchange this run made, in order: the exact request body
+    #: sent and the exact answer that came back. A pass/fail verdict is not
+    #: reviewable on its own -- the reader has to be able to see what was
+    #: asked and what the model actually said. Recorded here because
+    #: ``chat()`` is the single funnel for every call the suite makes.
+    transcript: List[dict] = dataclasses.field(default_factory=list)
+    #: Which test the exchanges being recorded belong to; set by run_suite.
+    test_id: Optional[int] = None
 
     @property
     def base(self) -> str:
@@ -1099,10 +1107,35 @@ class _RunCtx:
 
     def chat(self, body: dict, stream: bool = False,
              timeout: Optional[float] = None) -> HttpResult:
-        return self.http(
+        res = self.http(
             "POST", self.base + "/v1/chat/completions", body=body,
             stream=stream, timeout=timeout or self.timeout,
         )
+        self._record(body, res, stream)
+        return res
+
+    def _record(self, body: dict, res: HttpResult, stream: bool) -> None:
+        """Append one exchange to the transcript. Bodies are stored verbatim;
+        an SSE answer is reassembled into the text the client would have seen,
+        with the raw lines kept alongside."""
+        answer = None
+        if stream and res.sse_lines:
+            asm = reassemble_stream(res.sse_lines)
+            answer = asm.get("content") or None
+        elif res.body:
+            msg, _usage, _finish = _parse_chat_json(res)
+            answer = (msg or {}).get("content") or res.body
+        self.transcript.append({
+            "test_id": self.test_id,
+            "request": body,
+            "http_code": res.status,
+            "answer": answer,
+            "raw_body": None if stream else (res.body or None),
+            "sse_lines": list(res.sse_lines) if stream and res.sse_lines else None,
+            "ttft_ms": res.ttft_ms,
+            "wall_ms": res.wall_ms,
+            "error": res.error,
+        })
 
 
 def _metric(name: str, value: Any, numeric: Optional[float] = None,
@@ -1613,6 +1646,7 @@ def run_suite(
     vram_free_mib: Optional[Callable[[], Optional[int]]] = None,
     probe: bool = True,
     timeout: float = 120.0,
+    transcript_sink: Optional[list] = None,
 ) -> Iterator[dict]:
     """Run the selected tests against a live OpenAI-compatible sglang server,
     YIELDING one result dict per test as it finishes (the webui layer streams
@@ -1650,6 +1684,10 @@ def run_suite(
         vram_free_mib=vram_free_mib,
         timeout=timeout,
     )
+    # The caller (the webui run route) reads ctx.transcript after the
+    # generator is exhausted and persists it with the run.
+    if transcript_sink is not None:
+        transcript_sink.append(ctx)
 
     runners: Dict[int, Callable[..., Tuple[str, dict, dict]]] = {
         1: _run_basic,
@@ -1691,6 +1729,7 @@ def run_suite(
             yield result
             continue
 
+        ctx.test_id = tid
         try:
             if tid in (8, 14):
                 status, metric, detail = _run_needle(

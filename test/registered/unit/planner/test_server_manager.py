@@ -734,3 +734,68 @@ class TestHfHubImportable(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGgufAndSpecArgv(unittest.TestCase):
+    """A GGUF boot is a loader identity, not a rewritten --model-path, and the
+    speculative depth is part of the configuration."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ggufargv_")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _argv(self, **kw):
+        return LaunchSettings(model_path=self.tmp, **kw).launch_command()
+
+    def test_gguf_derives_loader_and_tokenizer(self):
+        argv = self._argv(format="gguf", gguf_variant="m-Q3_K_M.gguf")
+        self.assertIn("--load-format", argv)
+        self.assertEqual(argv[argv.index("--load-format") + 1], "gguf")
+        # the .gguf file has no HF tokenizer beside it -> the model DIR is it
+        self.assertIn("--tokenizer-path", argv)
+        self.assertEqual(argv[argv.index("--tokenizer-path") + 1], self.tmp)
+        self.assertTrue(
+            argv[argv.index("--model-path") + 1].endswith("m-Q3_K_M.gguf"))
+
+    def test_explicit_loader_wins_over_the_derived_one(self):
+        argv = self._argv(format="gguf", gguf_variant="m.gguf",
+                          load_format="dummy", tokenizer_path="/tok")
+        self.assertEqual(argv[argv.index("--load-format") + 1], "dummy")
+        self.assertEqual(argv[argv.index("--tokenizer-path") + 1], "/tok")
+
+    def test_hf_format_adds_no_loader_flags(self):
+        argv = self._argv()
+        self.assertNotIn("--load-format", argv)
+        self.assertNotIn("--tokenizer-path", argv)
+
+    def test_spec_depth_and_reserve_reach_the_command(self):
+        argv = self._argv(spec_mode="mtp", speculative_num_steps=3,
+                          speculative_eagle_topk=1,
+                          speculative_num_draft_tokens=4,
+                          speculative_draft_model_path="/draft",
+                          rank_auto_reserve_mib=2700,
+                          quantization="gguf")
+        for flag, val in (("--speculative-algorithm", "NEXTN"),
+                          ("--speculative-num-steps", "3"),
+                          ("--speculative-eagle-topk", "1"),
+                          ("--speculative-num-draft-tokens", "4"),
+                          ("--speculative-draft-model-path", "/draft"),
+                          ("--rank-auto-reserve-mib", "2700"),
+                          ("--quantization", "gguf")):
+            self.assertIn(flag, argv)
+            self.assertEqual(argv[argv.index(flag) + 1], val)
+
+
+class TestModelPathRequired(unittest.TestCase):
+    def test_empty_model_path_is_rejected_before_boot(self):
+        with self.assertRaises(ValueError) as cm:
+            LaunchSettings(model_path="").validate()
+        self.assertIn("model_path is required", str(cm.exception))
+
+    def test_whitespace_only_is_rejected_too(self):
+        with self.assertRaises(ValueError):
+            LaunchSettings(model_path="   ").validate()

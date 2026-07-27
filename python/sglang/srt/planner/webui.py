@@ -1184,6 +1184,16 @@ def _launch_settings_from_payload(payload: dict):
     """Map the UI launch knobs onto a validated ``LaunchSettings``."""
     from sglang.srt.planner.server_manager import LaunchSettings
 
+    def _int_or_none(v):
+        if v in (None, ""):
+            return None
+        return int(v)
+
+    def _float_or_none(v):
+        if v in (None, ""):
+            return None
+        return float(v)
+
     def _ints(v):
         if v is None or v == "":
             return None
@@ -1212,9 +1222,27 @@ def _launch_settings_from_payload(payload: dict):
             else None
         ),
         spec_mode=payload.get("spec_mode", "off"),
+        # Speculative DEPTH is part of the configuration, not a detail: a
+        # NEXTN boot is defined by steps / topk / draft-tokens, and dropping
+        # them silently produced a differently-configured server than the one
+        # that was asked for.
+        speculative_num_steps=_int_or_none(payload.get("speculative_num_steps")),
+        speculative_eagle_topk=_int_or_none(payload.get("speculative_eagle_topk")),
+        speculative_num_draft_tokens=_int_or_none(
+            payload.get("speculative_num_draft_tokens")),
+        speculative_draft_model_path=(
+            payload.get("speculative_draft_model_path") or None),
+        mem_fraction_static=_float_or_none(payload.get("mem_fraction_static")),
+        # Loader identity -- what makes a GGUF boot a GGUF boot.
+        tokenizer_path=payload.get("tokenizer_path") or None,
+        load_format=payload.get("load_format") or None,
+        quantization=payload.get("quantization") or None,
+        rank_auto_reserve_mib=_int_or_none(payload.get("rank_auto_reserve_mib")),
         chat_template=payload.get("chat_template") or None,
         tool_call_parser=payload.get("tool_call_parser") or None,
         reasoning_parser=payload.get("reasoning_parser") or None,
+        trust_remote_code=bool(payload.get("trust_remote_code", True)),
+        extra_flags=[str(a) for a in (payload.get("extra_flags") or [])],
         vision=bool(payload.get("vision")),
         port=int(payload.get("port") or 30000),
     )
@@ -1302,6 +1330,27 @@ def _argv_from_payload(payload: dict, settings) -> Optional[list]:
     return [*head, *prof, *extra]
 
 
+def _force_enable_metrics(argv: Optional[list]) -> Optional[list]:
+    """Guarantee ``--enable-metrics`` on every server this dashboard boots.
+
+    There is deliberately no opt-out. The flag changes observability only,
+    never inference: without it /metrics is absent, and the whole live half of
+    this dashboard -- token rates, per-session throughput, MTP acceptance,
+    cache-hit, tokens per watt -- has nothing to read. A server booted from
+    here is a server that can be watched.
+
+    ``LaunchSettings.launch_command()`` already appends it, so this only has
+    to cover the argv OVERRIDE path (an explicit argv, or a profile's exact
+    argv), where a caller-supplied command would otherwise decide.
+    """
+    if argv is None:
+        return None
+    out = list(argv)
+    if "--enable-metrics" not in out:
+        out.append("--enable-metrics")
+    return out
+
+
 def server_start_payload(payload: dict) -> dict:
     """Boot the managed sglang server from the UI launch knobs. Builds a
     ``LaunchSettings`` (fail-fast validated) and hands it to the supervisor.
@@ -1319,7 +1368,7 @@ def server_start_payload(payload: dict) -> dict:
             "REPLACES the single managed instance).",
             "status": sup.status(),
         }
-    argv = _argv_from_payload(payload, settings)
+    argv = _force_enable_metrics(_argv_from_payload(payload, settings))
     try:
         status = sup.start(
             settings,
@@ -2350,6 +2399,21 @@ def flag_catalog_payload(payload: Optional[dict] = None) -> dict:
     }
 
 
+def _serves_metrics(base_url: str, timeout: float = 1.0) -> bool:
+    """True when the server exposes Prometheus /metrics, i.e. was started with
+    ``--enable-metrics``. A detected foreign server without it is a REPORTED
+    state, not a dashboard that quietly shows nothing."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            base_url.rstrip("/") + "/metrics", timeout=timeout
+        ) as r:
+            return r.getcode() == 200
+    except Exception:
+        return False
+
+
 def _probe_sglang(base_url: str, timeout: float = 0.8) -> bool:
     """True when ``base_url`` answers 200 on /get_model_info or /metrics --
     the cheap 'is this an sglang server?' reachability probe (read-only)."""
@@ -2443,6 +2507,7 @@ def detect_endpoint_payload(payload: Optional[dict] = None) -> dict:
             "probed": [port],
             "host": host,
             "explicit": True,
+            "metrics": _serves_metrics(url) if ok else None,
             "error": None if ok else f"no sglang server answering at {url}",
         }
 
@@ -2471,6 +2536,7 @@ def detect_endpoint_payload(payload: Optional[dict] = None) -> dict:
         "host": host,
         "tcp_open": open_ports,
         "explicit": False,
+        "metrics": _serves_metrics(reachable[0]) if reachable else None,
     }
 
 
@@ -3788,6 +3854,20 @@ _INDEX_TEMPLATE = r"""<!doctype html>
          REPLACES the former "throughput / spec / cache" block below -- the
          strip is the only place these numbers appear on the landing page. -->
     <div id="landing_strip" class="mstrip"><span class="muted">waiting for first snapshot&hellip;</span></div>
+    <fieldset id="live_panel">
+      <legend>VRAM in use, throughput per session, tokens per watt (live)</legend>
+      <div id="live_note" class="muted">looking for a running server&hellip;</div>
+      <div id="live_strip" class="mstrip" style="display:none"></div>
+      <div id="live_cards"></div>
+      <div class="legend" id="live_legend" style="display:none">Bars are the
+        <b>measured</b> NVML occupancy of each card, drawn with the same bar
+        the planner uses for its projection, so the two are comparable by
+        looking. Per-session rates divide the server-wide rate by the
+        concurrent requests being served. Tokens per watt is the live token
+        rate over NVML power draw &mdash; per card it says what that card
+        costs to keep in the group, the total is the figure for the whole
+        configuration.</div>
+    </fieldset>
     <fieldset>
       <legend>running model + start config</legend>
       <div id="landing_config" class="muted">waiting for first snapshot&hellip;</div>
@@ -4077,7 +4157,10 @@ _INDEX_TEMPLATE = r"""<!doctype html>
 <div class="sub">Pick the model ONCE at the top &mdash; it drives everything:
   profiles, flag resolve, plan, placement and launch. Below it: profile &rarr;
   serving identity &rarr; the one flag surface &rarr; launch. No field appears
-  twice.</div>
+  twice. The page opens on the configuration that is currently loaded, when
+  there is one; live telemetry is the Monitor tab's job.</div>
+<div id="loaded_cfg" class="adv" style="margin-bottom:var(--s3)">
+  <span class="muted">reading the running configuration&hellip;</span></div>
 
 <fieldset>
   <legend>model &mdash; the ONE selector (drives plan, profiles, placement, launch)
@@ -4105,26 +4188,6 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   <div id="model_info" class="muted" style="margin-top:.4rem;word-break:break-all"></div>
 </fieldset>
 
-<!-- ===================================================================== -->
-<!-- LIVE: what the RUNNING server is actually doing, drawn with the same   -->
-<!-- bars the planner uses for its projection. Deliberately OUTSIDE the     -->
-<!-- simple/expert gating: the measured state of the machine is not an      -->
-<!-- expert-only detail, and the planner's projection is only readable next -->
-<!-- to the measurement it is meant to predict.                             -->
-<!-- ===================================================================== -->
-<fieldset id="live_panel">
-  <legend>live &mdash; VRAM in use, throughput per session, tokens per watt</legend>
-  <div id="live_note" class="muted">looking for a running server&hellip;</div>
-  <div id="live_strip" class="mstrip" style="display:none"></div>
-  <div id="live_cards"></div>
-  <div class="legend" id="live_legend" style="display:none">Bars are the
-    <b>measured</b> NVML occupancy of each card, on the same scale as the
-    planner's projected bars below. Per-session rates divide the server-wide
-    rate by the concurrent requests it is serving. Tokens per watt is the
-    live token rate over the card's NVML power draw &mdash; per card it says
-    what that card costs to keep in the group, the total is the figure for
-    the whole configuration.</div>
-</fieldset>
 
 <!-- ===================================================================== -->
 <!-- SIMPLE view: per card, how much VRAM this configuration uses, and one -->
@@ -5424,8 +5487,9 @@ function showTab(t) {
   if (t==='pair') pairRefresh(); else pairStopPoll();
   // The landing page live-poll runs only while its tab is visible.
   if (t==='landing') startLanding(); else stopLanding();
-  // The runner's live panel polls the same snapshot, on the same rule.
-  if (t==='runner') startLive(); else stopLive();
+  // The Planner opens on the RUNNING configuration when there is one: the
+  // useful default is what is loaded, not an empty form.
+  if (t==='runner') prefillFromRunning();
 }
 
 // ===========================================================================
@@ -5911,6 +5975,10 @@ async function detectLandingEndpoint(){
     if(d.endpoint){
       $('land_endpoint').value=d.endpoint.replace(/^https?:\/\//,'');
       setLandingEndpoint();
+      if(d.metrics===false)
+        $('land_target_note').innerHTML='<span class="est">found '
+          +esc(d.endpoint)+', but it serves no /metrics &mdash; started '
+          +'without --enable-metrics, so live rates stay unavailable.</span>';
     } else if(d.explicit){
       $('land_target_note').textContent=d.error||('no sglang server at '+typed);
     } else {
@@ -6041,12 +6109,12 @@ function renderStartConfig(s, tgt){
 }
 function renderLanding(s, tgt){
   window._lastSnapshot=s;
+  renderLivePanel(s);
   // Patched, not replaced: this block carries two <details> ("full launch
   // command + env", "raw server_info") and a scrollable <pre>. Rewriting it
   // wholesale on every 2 s tick is what used to slam them shut.
   setHTML($('landing_config'), renderStartConfig(s, tgt)
-    +(s.metrics_error?'<div class="reasons" style="margin-top:.3rem">'+esc(s.metrics_error)
-      +' &mdash; token rates need --enable-metrics on the server.</div>':''));
+    +(s.metrics_error?noMetricsBanner(s.metrics_error):''));
 
   // Per-card 60s telemetry rings (rendered INSIDE the placement card blocks,
   // renderPlacement's live line -- the old standalone per-GPU chart grid is
@@ -6998,6 +7066,22 @@ function fmtGiB(m){
 // ===========================================================================
 const LIVE_POLL_MS=2000;
 window._liveTimer=null;
+// A server started WITHOUT --enable-metrics serves no /metrics, so every rate
+// on this page is unavailable -- not zero, not pending. Say which of the two
+// it is, and say what to do about it; an empty widget that never fills is the
+// worst of the three states to be shown.
+function noMetricsBanner(err){
+  return '<div class="verdict offload" style="font-size:var(--t-sm);'
+    +'font-weight:400;margin:var(--s2) 0 0">'
+    +'<b>Server started without --enable-metrics</b> &mdash; live rates '
+    +'(decode / prefill tok/s, per-session throughput, MTP acceptance, '
+    +'cache hit) are not available from this server. Per-card VRAM, power and '
+    +'utilisation come from NVML and keep working. Restart the server with '
+    +'<code>--enable-metrics</code>; a server booted from this dashboard '
+    +'always has it.'
+    +(err?'<div class="muted" style="margin-top:var(--s1)">'+esc(err)+'</div>':'')
+    +'</div>';
+}
 function vramClass(frac){
   if(frac==null) return '';
   if(frac>=0.90) return ' over';
@@ -7058,6 +7142,7 @@ function renderLivePanel(s){
     return;
   }
   window._liveT=s.t;
+  const noMetrics=!!s.metrics_error;
   const rates=s.rates||null;
   const dec=rates?rates.decode_tok_s:null, pfx=rates?rates.prefill_tok_s:null;
   const running=(s.num_running_reqs!=null)?s.num_running_reqs:null;
@@ -7074,9 +7159,13 @@ function renderLivePanel(s){
   const tpwTotal=(tokS!=null&&watts)?tokS/watts:null;
   stripPush('lv_dec',s.t,dec); stripPush('lv_pfx',s.t,pfx);
   stripPush('lv_tpw',s.t,tpwTotal);
-  const n1=(v)=>v==null?'&ndash;':Number(v).toFixed(1);
-  const n2=(v)=>v==null?'&ndash;':Number(v).toFixed(2);
-  note.style.display='none';
+  // Without /metrics a rate is UNAVAILABLE, which is a different fact from
+  // "idle at 0" -- the tiles must not be able to be read as the latter.
+  const NA='<span class="muted">n/a</span>';
+  const n1=(v)=>noMetrics?NA:(v==null?'&ndash;':Number(v).toFixed(1));
+  const n2=(v)=>noMetrics?NA:(v==null?'&ndash;':Number(v).toFixed(2));
+  note.style.display=noMetrics?'':'none';
+  if(noMetrics) setHTML(note, noMetricsBanner(s.metrics_error));
   strip.style.display=''; $('live_legend').style.display='';
   setHTML(strip,
     liveTile('decode per session',
@@ -7092,25 +7181,80 @@ function renderLivePanel(s){
       (watts!=null?Math.round(watts)+' W across '+s.gpus.length+' cards':'-- W')
       +(tokS!=null?(' &middot; '+n1(tokS)+' tok/s'):' &middot; idle'), 'lv_tpw')
    +liveTile('energy per token',
-      (tpwTotal?n1(1/tpwTotal):'&ndash;')+'<small> J/tok</small>',
-      tpwTotal?'at the current phase rate':'undefined while idle', ''));
+      (tpwTotal?n1(1/tpwTotal):(noMetrics?NA:'&ndash;'))+'<small> J/tok</small>',
+      tpwTotal?'at the current phase rate'
+        :(noMetrics?'needs /metrics for the token rate':'undefined while idle'),
+      ''));
   setHTML(cards, s.gpus.map(g=>liveCardHtml(g, tokS)).join(''));
 }
-async function livePoll(){
-  const ep=landingEndpoint();
+// The Planner's default is the configuration that is CURRENTLY LOADED. An
+// empty form is only the right starting point when nothing is running; when a
+// server is up, the thing the reader wants to edit is what that server was
+// started with. Runs once per visit and never overwrites a form the user has
+// already typed into.
+window._prefilledFrom=null;
+async function prefillFromRunning(){
+  if(window._prefillBusy) return;
+  window._prefillBusy=true;
   try{
+    const ep=landingEndpoint();
     const d=await api('/api/live_snapshot'+(ep?('?endpoint='+encodeURIComponent(ep)):''),
-                      {key:'runnerlive', timeout:LIVE_POLL_MS-200});
-    renderLivePanel(d&&d.running?d.snapshot:null);
-  }catch(e){ if(!apiAborted(e)) renderLivePanel({ok:false,error:apiError(e)}); }
+                      {key:'prefill', timeout:4000});
+    const s=(d&&d.running)?d.snapshot:null;
+    const n=s?normalizeStartConfig(s):null;
+    const cfg=(n&&n.cfg)||null;
+    if(!cfg||!cfg.model_path){ renderLoadedConfigNote(null); return; }
+    const key=cfg.model_path+'|'+(cfg.port||'');
+    renderLoadedConfigNote(cfg, n.src);
+    if(window._prefilledFrom===key) return;      // already applied this one
+    if($('model').value.trim()) return;          // never overwrite the user
+    window._prefilledFrom=key;
+    $('model').value=cfg.model_path;
+    applyRunningConfigToForm(cfg);
+    onModelChange(); onRunnerModel();
+  }catch(e){ /* the form simply stays empty */ }
+  finally{ window._prefillBusy=false; }
 }
-function startLive(){
-  if(window._liveTimer) return;
-  livePoll();
-  window._liveTimer=setInterval(livePoll, LIVE_POLL_MS);
+function applyRunningConfigToForm(cfg){
+  const direct={served_model_name:'sv_served', host:'sv_host', port:'sv_port',
+                context_length:'sv_ctx', max_running_requests:'max_running_requests'};
+  for(const k of Object.keys(direct)){
+    const el=$(direct[k]);
+    if(el && cfg[k]!=null && cfg[k]!=='') el.value=String(cfg[k]);
+  }
+  window._flagSettings=window._flagSettings||{};
+  const flags={tp_size:'tp_size', rank_gpu_id:'rank_gpu_id',
+               rank_tp_ratio:'rank_tp_ratio', rank_gpu_memory_mib:'rank_gpu_memory_mib',
+               kv_cache_dtype:'kv_cache_dtype'};
+  for(const k of Object.keys(flags)){
+    const v=cfg[k]; if(v==null||v==='') continue;
+    const str=Array.isArray(v)?v.join(','):String(v);
+    const el=$('fl_'+flags[k]); if(el) el.value=str;
+    window._flagSettings[flags[k]]=v;
+  }
+  window._presetBase=presetSnapshot();
+  markPresetDrift(); updateSectionSummaries(); updateGpuPick(); updateColoUI();
+  scheduleRecompute();
 }
-function stopLive(){
-  if(window._liveTimer){ clearInterval(window._liveTimer); window._liveTimer=null; }
+// The Planner states which configuration it is showing, always -- "the
+// running one", "the running one, edited", or "nothing loaded".
+function renderLoadedConfigNote(cfg, src){
+  const box=$('loaded_cfg'); if(!box) return;
+  if(!cfg){
+    setHTML(box,'<span class="muted">No server running &mdash; this is a fresh '
+      +'configuration. Pick a model below.</span>');
+    return;
+  }
+  const bits=[];
+  if(cfg.tp_size) bits.push('tp '+cfg.tp_size);
+  if(cfg.rank_gpu_id) bits.push('ranks on '+[].concat(cfg.rank_gpu_id).join(','));
+  if(cfg.context_length) bits.push('ctx '+cfg.context_length);
+  if(cfg.kv_cache_dtype) bits.push('kv '+cfg.kv_cache_dtype);
+  if(cfg.spec_mode) bits.push('spec '+cfg.spec_mode);
+  setHTML(box,'<b>currently loaded:</b> '+esc(cfg.model_path||'(unnamed)')
+    +(bits.length?' <span class="muted">&middot; '+esc(bits.join(' &middot; '))+'</span>':'')
+    +' <span class="muted">&mdash; read from '+esc(src||'the running server')
+    +'; the rows below start from it.</span>');
 }
 function renderSimpleCards(placement){
   const box=$('simple_cards'); if(!box) return;

@@ -482,6 +482,15 @@ class LaunchSettings:
     rank_gpu_memory_mib: Optional[List[int]] = None
     kv_cache_dtype: str = "auto"
     mem_fraction_static: Optional[float] = None
+    #: Loader / quantisation identity. A GGUF checkpoint needs its own loader
+    #: and, because the .gguf file carries no HF tokenizer, a tokenizer path
+    #: pointing at the model DIR. Rewriting --model-path onto the .gguf file
+    #: alone is not a GGUF boot.
+    tokenizer_path: Optional[str] = None
+    load_format: Optional[str] = None
+    quantization: Optional[str] = None
+    #: Fork flag: per-rank reserve carved out before the KV pool is sized.
+    rank_auto_reserve_mib: Optional[int] = None
     context_length: int = 8192
     max_running_requests: int = 16
     max_num_seqs: Optional[int] = None
@@ -490,6 +499,7 @@ class LaunchSettings:
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
+    speculative_draft_model_path: Optional[str] = None
     chat_template: Optional[str] = None
     tool_call_parser: Optional[str] = None
     reasoning_parser: Optional[str] = None
@@ -507,6 +517,13 @@ class LaunchSettings:
 
     # -- validation ------------------------------------------------------
     def validate(self) -> "LaunchSettings":
+        # Without this the launcher happily booted a child with an empty
+        # --model-path, which dies seconds later in the child's own argument
+        # parsing -- far away from the request that caused it.
+        if not (self.model_path or "").strip():
+            raise ValueError(
+                "model_path is required (pass the model dir, the .gguf file, "
+                "or an HF id)")
         if self.tp_size < 1:
             raise ValueError(f"tp_size must be >= 1 (got {self.tp_size})")
         if self.port <= 0 or self.port > 65535:
@@ -549,6 +566,27 @@ class LaunchSettings:
         extra: List[str] = []
         if self.mem_fraction_static is not None:
             extra += ["--mem-fraction-static", str(self.mem_fraction_static)]
+        # Loader identity. For a GGUF model the defaults are derived rather
+        # than demanded: the loader is gguf and the tokenizer comes from the
+        # model DIR, because the .gguf file has no HF tokenizer beside it. An
+        # explicit value always wins over the derived one.
+        load_format = self.load_format
+        tokenizer_path = self.tokenizer_path
+        if self.format == "gguf":
+            load_format = load_format or "gguf"
+            if not tokenizer_path and os.path.isdir(self.model_path):
+                tokenizer_path = self.model_path
+        if load_format:
+            extra += ["--load-format", load_format]
+        if tokenizer_path:
+            extra += ["--tokenizer-path", tokenizer_path]
+        if self.quantization:
+            extra += ["--quantization", self.quantization]
+        if self.rank_auto_reserve_mib is not None:
+            extra += ["--rank-auto-reserve-mib", str(self.rank_auto_reserve_mib)]
+        if self.speculative_draft_model_path:
+            extra += ["--speculative-draft-model-path",
+                      self.speculative_draft_model_path]
         if self.max_num_seqs is not None:
             extra += ["--max-running-requests", str(self.max_num_seqs)]
         if self.chat_template:
