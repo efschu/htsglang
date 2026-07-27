@@ -68,6 +68,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import shlex
 import signal
 import statistics
@@ -108,6 +109,7 @@ __all__ = [
     "suggest_num_prompts",
     "HarnessOutcome",
     "SubprocessHarness",
+    "expand_env",
     "load_study",
     "render_study_text",
     "render_dry_run_text",
@@ -1528,6 +1530,39 @@ def _launch_argv(arm: Arm) -> List[str]:
         return []
 
 
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def expand_env(value):
+    """Expand ``${VAR}``, ``${VAR:-default}`` and ``$VAR`` in a study spec.
+
+    Study files are checked in, so they carry no machine-specific path: a
+    shipped study names ``${MODEL_ROOT:-<MODEL_ROOT>}/...`` and the operator
+    supplies MODEL_ROOT from their own environment. The default is deliberately
+    a placeholder rather than a real path -- a study run without the
+    environment sourced then fails on a visibly bogus path instead of quietly
+    booting against whatever tree the file's author happened to have.
+
+    Applied recursively to dicts, lists and strings; other types pass through.
+    """
+    if isinstance(value, dict):
+        return {k: expand_env(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [expand_env(v) for v in value]
+    if not isinstance(value, str):
+        return value
+
+    def _sub(m: "re.Match") -> str:
+        name = m.group(1) or m.group(3)
+        default = m.group(2)
+        env = os.environ.get(name)
+        if env is not None:
+            return env
+        return default if default is not None else m.group(0)
+
+    return _ENV_REF.sub(_sub, value)
+
+
 def load_study(path: str, **overrides) -> Study:
     """Build a :class:`Study` from a JSON description.
 
@@ -1552,12 +1587,16 @@ def load_study(path: str, **overrides) -> Study:
     ``settings`` is a ``server_manager.LaunchSettings`` field mapping and is
     validated on construction, so a bad rank map fails here rather than after
     the first boot.
+
+    Every string in the file goes through :func:`expand_env`, so paths that
+    differ per machine (model cache, interpreter) are written as
+    ``${MODEL_ROOT:-<MODEL_ROOT>}/...`` instead of being baked in.
     """
     from sglang.srt.planner.scenarios import SCENARIOS, load_scenarios
     from sglang.srt.planner.server_manager import LaunchSettings
 
     with open(path) as f:
-        spec = json.load(f)
+        spec = expand_env(json.load(f))
 
     registry = dict(SCENARIOS)
     if spec.get("scenario_file"):

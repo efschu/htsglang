@@ -10,9 +10,13 @@ set -uo pipefail
 
 ARM="${1:-off}"
 PORT="${PORT:-30099}"
-REPO=/spinning/wt-fp8-det
-PY=/spinning/htsglang-gpu/.venv/bin/python
-MODEL=/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8
+# The source tree is this script's checkout; VENV and MODEL_ROOT come from the
+# environment (source your local rig env file). Their fallbacks are
+# placeholders, so an unsourced run fails on a bogus path instead of booting
+# against somebody else's venv or model cache.
+REPO="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+PY="${VENV:-<VENV>}/bin/python"
+MODEL="${MODEL_ROOT:-<MODEL_ROOT>}/Qwen3.6-27B-FP8"
 LOG=/tmp/fp8det_boot_${ARM}.log
 
 if [ "$ARM" = "on" ]; then export SGLANG_DETERMINISTIC_FP8_GEMM=1; fi

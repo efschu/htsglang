@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-"""Fit the decode-knee model against the measured MLP-split campaign."""
-import json, sys, itertools, math
-sys.path.insert(0, "/spinning/wt-knee-guard/python")
-from sglang.srt.uneven_perf import PlanInputs, PerfCostModel
+"""Fit the decode-knee model against the measured MLP-split campaign.
 
-D = "/spinning/wt-knee-guard/bench216/logs"
-MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8"
+The source tree is this file's checkout (override with REPO_ROOT); the model
+cache comes from MODEL_ROOT, so source your local rig env file first. An unset
+MODEL_ROOT leaves a placeholder path rather than somebody else's cache.
+"""
+import json, os, sys, itertools, math
+
+REPO_ROOT = os.environ.get("REPO_ROOT") or os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))
+)
+sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
+from sglang.srt.uneven_perf import PlanInputs, PerfCostModel  # noqa: E402
+
+D = os.path.join(REPO_ROOT, "bench216", "logs")
+MODEL = os.path.join(os.environ.get("MODEL_ROOT", "<MODEL_ROOT>"), "Qwen3.6-27B-FP8")
 BASE = [28447, 16320, 16320]           # budgets this campaign actually booted
 MEMBW = [1664.1, 718.2, 718.2]
 ARMS = {"base_A": None, "base_B": None, "m611_A": [6,1,1], "m611_B": [6,1,1],

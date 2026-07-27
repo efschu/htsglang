@@ -22,8 +22,11 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=l0_lib.sh
 source "$HERE/l0_lib.sh"
 
-SECOND=${SECOND:-192.168.0.89}
-KEY=${KEY:-/root/.ssh/id_ed25519_192.168.0.89}
+# Host and key come from the environment (RIG2_HOST, RIG2_KEY); source your
+# local rig env file first. The placeholder fallbacks make an unsourced run
+# fail at the first ssh rather than reaching some other machine.
+SECOND=${SECOND:-${RIG2_HOST:-<RIG2_IP>}}
+KEY=${KEY:-${RIG2_KEY:-<RIG2_SSH_KEY>}}
 SSH="ssh -i $KEY -o IdentitiesOnly=yes -o ConnectTimeout=10"
 STAGE=${STAGE:-s1}; RATIO=${RATIO:-4,3,3,2,1}; CTX=${CTX:-4096}
 LOGDIR=${LOGDIR:-/tmp/nordstern}; mkdir -p "$LOGDIR"; rm -f "$LOGDIR"/r*.log

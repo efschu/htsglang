@@ -2,8 +2,12 @@
 # Interleaved cold-boot campaign over the MLP split.
 # Order gives both the boot-to-boot A-vs-A noise floor (the _A/_B pairs of the
 # same arm) and interleaving between the two arms under test.
+#
+# VENV comes from the environment (source your local rig env file); its
+# fallback is a placeholder so an unsourced run fails visibly.
 set -u
-D=/spinning/wt-knee-guard/bench216
+D="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="${VENV:-<VENV>}"
 PORT=30000
 run_arm () {
   local ARM="$1" MLP="$2"
@@ -24,7 +28,7 @@ run_arm () {
   # clock/temperature per point, before and after the measurement
   nvidia-smi --query-gpu=index,clocks.sm,temperature.gpu,power.draw \
      --format=csv,noheader > "$D/logs/${ARM}.clocks_before.csv"
-  /spinning/htsglang-gpu/.venv/bin/python "$D/measure.py" \
+  "$VENV/bin/python" "$D/measure.py" \
      --port "$PORT" --arm "$ARM" --out "$D/logs/${ARM}.json" --reps 3
   nvidia-smi --query-gpu=index,clocks.sm,temperature.gpu,power.draw \
      --format=csv,noheader > "$D/logs/${ARM}.clocks_after.csv"

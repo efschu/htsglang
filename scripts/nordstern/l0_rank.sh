@@ -18,11 +18,18 @@
 #
 # Required env: RANK (0-4), SIDE (main|second)
 # Optional:     STAGE (s1|s2), MODEL, CTX, RATIO, MASTER, PORT, EXTRA
+#
+# Site-specific paths and addresses come from the environment (MASTER_ADDR,
+# MODEL_ROOT, VENV, REPO_ROOT on the main side; RIG2_MODEL_DIR, RIG2_VENV,
+# RIG2_SGLANG_SRC, RIG2_ROCM_VENV, RIG2_TRITON_PATH on the second side).
+# Source your local rig env file first; unset variables fall back to
+# placeholders so the rank fails on a visibly bogus path instead of picking up
+# somebody else's tree.
 set -u
 RANK=${RANK:?set RANK=0..4}
 SIDE=${SIDE:?set SIDE=main|second}
 STAGE=${STAGE:-s1}
-MASTER=${MASTER:-192.168.0.101}
+MASTER=${MASTER:-${MASTER_ADDR:-<MASTER_ADDR>}}
 PORT=${PORT:-31900}
 CTX=${CTX:-4096}
 # 4,3,3,2,1 -> kv heads [2,2,2,1,1], q heads [8,8,8,4,4]: monotonic with
@@ -73,8 +80,8 @@ if [ "$STAGE" = s2 ]; then
 fi
 
 if [ "$SIDE" = main ]; then
-  MODEL=${MODEL:-/spinning/llm_stuff/club-3090/models-cache/Llama-3.1-8B-Instruct}
-  DRAFT=${DRAFT:-/spinning/llm_stuff/club-3090/models-cache/EAGLE3-LLaMA3.1-Instruct-8B}
+  MODEL=${MODEL:-${MODEL_ROOT:-<MODEL_ROOT>}/Llama-3.1-8B-Instruct}
+  DRAFT=${DRAFT:-${MODEL_ROOT:-<MODEL_ROOT>}/EAGLE3-LLaMA3.1-Instruct-8B}
   case "$RANK" in
     0) export CUDA_VISIBLE_DEVICES=0 ;;   # RTX 5090  (torch index, NOT nvidia-smi's)
     1) export CUDA_VISIBLE_DEVICES=1 ;;   # RTX 3080
@@ -83,24 +90,30 @@ if [ "$SIDE" = main ]; then
   esac
   export GLOO_SOCKET_IFNAME=${GLOO_IFNAME:-eth0}
   export TP_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME
-  PY=/spinning/htsglang-gpu/.venv/bin/python
-  export PYTHONPATH=/spinning/wt-htccl/python
+  PY=${VENV:-<VENV>}/bin/python
+  # The main-side rank runs straight out of a checkout, so the source tree is
+  # derived from this script's location unless REPO_ROOT overrides it.
+  export PYTHONPATH=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/python
 else
-  MODEL=${MODEL:-/root/models/llama-3.1-8b}
-  DRAFT=${DRAFT:-/root/models/eagle3-llama31-8b}
+  MODEL=${MODEL:-${RIG2_MODEL_DIR:-<RIG2_MODEL_DIR>}/llama-3.1-8b}
+  DRAFT=${DRAFT:-${RIG2_MODEL_DIR:-<RIG2_MODEL_DIR>}/eagle3-llama31-8b}
   export GLOO_SOCKET_IFNAME=${GLOO_IFNAME:-enp9s0}
   export TP_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME
   cd /root
   case "$RANK" in
     3) export CUDA_VISIBLE_DEVICES=0
-       export CPATH=/root/venv-cuda/lib/python3.12/site-packages/nvidia/cu13/include:${CPATH:-}
-       PY=/root/venv-cuda/bin/python
-       export PYTHONPATH=/root/sglang-src ;;
+       R2_VENV=${RIG2_VENV:-<RIG2_VENV>}
+       export CPATH=$R2_VENV/lib/python3.12/site-packages/nvidia/cu13/include:${CPATH:-}
+       PY=$R2_VENV/bin/python
+       export PYTHONPATH=${RIG2_SGLANG_SRC:-<RIG2_SGLANG_SRC>} ;;
     4) export HIP_VISIBLE_DEVICES=0
        export PYTORCH_ROCM_ARCH=gfx900
-       export TRITON_HIP_LLD_PATH=/root/walld/venv-rocm63/lib/python3.12/site-packages/triton/backends/amd/llvm/bin/ld.lld
-       PY=/root/walld/venv-rocm63/bin/python
-       export PYTHONPATH=/root/tritoncompat:/root/triton-gcn5/python:/root/sglang-src ;;
+       R2_ROCM=${RIG2_ROCM_VENV:-<RIG2_ROCM_VENV>}
+       export TRITON_HIP_LLD_PATH=$R2_ROCM/lib/python3.12/site-packages/triton/backends/amd/llvm/bin/ld.lld
+       PY=$R2_ROCM/bin/python
+       # RIG2_TRITON_PATH: the gfx900 triton shim tree, ':'-separated, ahead of
+       # the sglang source on PYTHONPATH.
+       export PYTHONPATH=${RIG2_TRITON_PATH:-<RIG2_TRITON_PATH>}:${RIG2_SGLANG_SRC:-<RIG2_SGLANG_SRC>} ;;
     *) echo "rank $RANK is not a second-host rank" >&2; exit 2 ;;
   esac
 fi
