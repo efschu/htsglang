@@ -4563,3 +4563,41 @@ umsharder, request-less import); draft/MTP pages do not migrate (both arms
 ran without spec); prefetch_threshold=256 means shorter imports are never
 consulted; attach_hybrid_pool_to_unified_cache does not normalize HiCache
 layout flags (foreign path, 3-line candidate, worked around).
+
+# Night batch 2026-07-28: acceptance boot, HTCCL ring threshold, handover reverse, coexistence retry
+
+**Integrated acceptance boot** on be5a2ddb3b (after 5 merges of the day):
+FP8-27B TP=3 auto-performance, NEXTN, graphs, reserve 3000,2700,2700 — healthy
+in ~60 s, decode 85.5 tok/s (accept 2.857), cold prefill 20k at 1144.5 tok/s
+(cached=0), output coherent (quoted in log). No regression signal.
+
+**#244 HTCCL ring threshold (merged this commit):** the cross-rig collective
+cost was dominated by SGLANG_HTCCL_UCX_RING_MIB=1MiB — 25x too high, so the
+production 80-KiB verify all_reduce ran the flat (W-1)-payload exchange
+instead of the ring. Fix: threshold 24 KiB (SGLANG_HTCCL_UCX_RING_KIB, MiB
+name still honored), ring copy-out made _h2d_async to keep #246. Measured
+385.9 -> 198.0 us (-49 %) at 80 KiB, 8/20 KiB unchanged; byte-exact on the
+real 40G wire over 8..128 KiB incl. ragged tails, atol 0. Wire and 2080 Ti
+exonerated (raw perf 60.3 TFLOP/s fp16, 545 GB/s D2D; 1485 MHz was a wait
+symptom); the "transport is 3 %" figure was measured at the wrong operating
+point (8 KiB/world 2) — real transport share ~29 % of the 186-ms floor, and
+the layer all_reduces alone extrapolate to ~25 ms/forward (~13 %). Follow-ups
+recorded: all_gather has no ring; a 128->256 KiB cliff in the LOCAL stage
+copies; live-boot confirmation still owed (lock was busy).
+
+**#261 handover reverse (merged this commit):** TP=3 -> TP=1 reassembly via
+inverse extents on the same MigrationPlan type; round trip byte-identical at
+real blob sizes for both geometries (units=8 and 16); verify_plan bookkeeping
+made slice-wise. Draft/MTP verdict corrected: the draft pool is the MIRROR of
+owner-mode target KV (heads sharded, tokens complete) — a suffix rename would
+be wrong-sized wrong-heads data; the skip is correct, a real draft umsharder
+is a scoped second spec type (documented, not built).
+
+**#260 coexistence retry:** prescribed 29300,7000,7000 fails fail-fast (rank0
+budget below its weight shard); arithmetic-corrected 25800 also fails — and
+the new #257 error message exposes why: rank0 needs only 4.32 GiB weights +
+0.73 GiB scratch, yet the budget is exhausted, so the reserve-to-budget
+mapping under co-residence is not total-minus-reserve (free-based accounting
+double-counts the neighbour). Desk follow-up, no further boots. Positive side
+finding: the #257 scratch accounting shrank the PD footprint 25.3 -> 22.2 GiB
+at the same fraction.
