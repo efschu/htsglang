@@ -69,6 +69,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
 )
+from sglang.srt.model_executor.runner.base_runner import enter_capture_group_barrier
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -357,8 +358,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._pre_warm_aiter_chip_info()
 
         # --- capture --------------------------------------------------
+        # Group barrier -- but ONLY when every rank builds this runner.
+        # Under draft-solo placement the shadow ranks never construct a
+        # draft prefill runner, so the host must not park here (#194; see
+        # enter_capture_group_barrier for the measured deadlock).
         self.device_module.synchronize()
-        self.model_runner.tp_group.barrier()
+        enter_capture_group_barrier(self.model_runner)
         self.capture()
 
         self.raw_num_tokens = 0

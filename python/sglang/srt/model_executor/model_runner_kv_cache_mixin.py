@@ -214,7 +214,23 @@ class ModelRunnerKVCacheMixin:
         # leftover (see note_post_capture_leftover). Applied on both budget
         # paths; 0 unless SGLANG_MEASURED_KV_BUDGET is set and a matching
         # fingerprinted measurement exists.
-        correction_gb = self._measured_kv_budget_correction_bytes() / (1 << 30)
+        correction_b = self._measured_kv_budget_correction_bytes()
+        correction_gb = correction_b / (1 << 30)
+        # #188: announce the cross-boot dependency on EVERY boot with the
+        # mode on -- cold records are exactly the case that silently
+        # disagrees with its own repeat. Warning level on purpose: this is
+        # the line that tells a benchmark harness its capacity axis is not
+        # reproducible.
+        if envs.SGLANG_MEASURED_KV_BUDGET.get() and self.tp_rank == 0:
+            logger.warning(
+                "%s",
+                self.measured_budget_provenance_note(
+                    self._measured_kv_budget_provenance,
+                    self._measured_kv_budget_cache_path(),
+                    self._measured_kv_budget_ts,
+                    correction_b,
+                ),
+            )
         if correction_gb:
             logger.info(
                 "Measured KV-budget correction (rank %d): %+.2f GiB on top "
@@ -325,7 +341,66 @@ class ModelRunnerKVCacheMixin:
             vec = list(base) if isinstance(base, list) else [1] * sa.tp_size
         return [int(v) for v in vec]
 
+    # ------------------------------------------------------------------
+    # #188: this boot's KV capacity is a function of an ON-DISK record from
+    # a PREVIOUS boot, so two identical commands legitimately size
+    # differently (measured: max_total_num_tokens 380289 vs 447173). That is
+    # the design, not a defect -- but it was SILENT, which turned it into a
+    # harness trap: any capacity or byte comparison across trees compared
+    # the harness to itself. Every read now records where the number came
+    # from, and the profiler announces it on every boot (cold included).
+    # ------------------------------------------------------------------
+    #: Provenance of the last correction read. One of: "cold" (no record
+    #: yet -- this boot sizes from the heuristic and the NEXT one will not),
+    #: "malformed", "vector-reset", "safety-reset", "stored".
+    _measured_kv_budget_provenance: str = "cold"
+    _measured_kv_budget_ts: Optional[str] = None
+
+    @staticmethod
+    def measured_budget_provenance_note(
+        provenance: str,
+        path: str,
+        ts: Optional[str],
+        correction_b: int,
+    ) -> str:
+        """The boot-log line for the cross-boot dependency (see above).
+
+        Emitted on EVERY boot with the mode on, not only when a correction
+        exists: the cold case is exactly the one that silently differs from
+        its own repeat.
+        """
+        gib = 1 << 30
+        deterministic = (
+            "For a reproducible capacity (A/B runs, byte gates, capacity "
+            "comparisons across trees) pin --max-total-tokens, or unset "
+            "SGLANG_MEASURED_KV_BUDGET."
+        )
+        if provenance == "stored":
+            return (
+                f"Measured KV-budget: this boot's KV capacity is sized with "
+                f"a {correction_b / gib:+.2f} GiB correction MEASURED BY A "
+                f"PREVIOUS BOOT (record {path}, written {ts}). Identical "
+                f"commands against a different record state will size "
+                f"differently. {deterministic}"
+            )
+        if provenance == "cold":
+            return (
+                f"Measured KV-budget: no stored measurement for this "
+                f"configuration ({path}), so this boot sizes from the "
+                f"heuristic budget alone and the next identical boot will "
+                f"size differently once this boot's measurement lands. "
+                f"{deterministic}"
+            )
+        return (
+            f"Measured KV-budget: the stored measurement in {path} was "
+            f"discarded ({provenance}), so this boot sizes from the "
+            f"heuristic budget alone and re-measures; the next identical "
+            f"boot will size differently. {deterministic}"
+        )
+
     def _measured_kv_budget_correction_bytes(self: ModelRunner) -> int:
+        self._measured_kv_budget_provenance = "cold"
+        self._measured_kv_budget_ts = None
         if not envs.SGLANG_MEASURED_KV_BUDGET.get():
             return 0
         import json
@@ -341,6 +416,7 @@ class ModelRunnerKVCacheMixin:
             logger.warning(
                 "Measured KV-budget cache %s is malformed; ignoring.", path
             )
+            self._measured_kv_budget_provenance = "malformed"
             return 0
         # Corrections are VECTOR-SPECIFIC: they encode the previous boot's
         # leftover under that boot's weight distribution. The registry
@@ -363,6 +439,7 @@ class ModelRunnerKVCacheMixin:
                     stored_vec,
                     current_vec,
                 )
+            self._measured_kv_budget_provenance = "vector-reset"
             return 0
         # Same epoch rule for the SAFETY margin: the correction encodes
         # "leftover minus the safety of that epoch", and the consumption
@@ -389,7 +466,11 @@ class ModelRunnerKVCacheMixin:
                 stored_safety,
                 current_safety,
             )
+            self._measured_kv_budget_provenance = "safety-reset"
             return 0
+        self._measured_kv_budget_provenance = "stored"
+        ts = data.get("ts")
+        self._measured_kv_budget_ts = str(ts) if ts is not None else None
         return int(vec[self.tp_rank])
 
     def _ranks_on_my_gpu(self: ModelRunner) -> int:
@@ -432,6 +513,81 @@ class ModelRunnerKVCacheMixin:
             and free_b >= prev_leftover_b - (128 << 20)
         )
 
+    @staticmethod
+    def measure_free_after_own_cleanup(
+        mem_get_info, empty_cache, gpu_id
+    ) -> Tuple[int, int, int]:
+        """Driver free/total bytes measured AFTER this process handed its
+        own allocator cache back. Returns (free, total, released).
+
+        #188: the leftover used to be a single bare ``mem_get_info``, which
+        excludes whatever the caching allocator happened to be holding
+        reserved-but-free at the post-capture point. That number is
+        run-to-run variable (capture order, JIT builds that land inside
+        capture, warmup transients), so the PERSISTED correction inherited
+        that variance and two identical commands sized differently. After
+        ``empty_cache`` the reading is a stable quantity: bytes physically
+        resident on the device.
+
+        The residual allocator posts (fragmentation, boot-time transient
+        peak) are read by the caller BEFORE this runs, so the component
+        balance still reports what the allocator actually held -- the
+        cleanup normalises the MEASUREMENT, it does not hide the post.
+        """
+        free_before, _total_before = mem_get_info(gpu_id)
+        empty_cache()
+        free_b, total_b = mem_get_info(gpu_id)
+        return int(free_b), int(total_b), max(0, int(free_b) - int(free_before))
+
+    @staticmethod
+    def unaccounted_used_bytes(
+        total_b: int,
+        free_b: int,
+        ranks_on_gpu: int,
+        reserved_b: int,
+        ctx_allowance_b: int,
+    ) -> int:
+        """Bytes the driver reports used on THIS rank's share of the device
+        that this rank cannot account for.
+
+        ``total_b`` / ``free_b`` are DEVICE-wide driver numbers; both are
+        split by ``ranks_on_gpu`` here, exactly like the leftover itself, so
+        a co-located sibling's reservation is not mistaken for a foreign
+        one. ``reserved_b`` is this process's own allocator reservation.
+
+        After ``measure_free_after_own_cleanup`` every byte we hold is in
+        ``reserved_b``, and the CUDA context costs at most
+        ``ctx_allowance_b``. Anything beyond that is a FOREIGN consumer --
+        on a shared box, typically a server from the previous boot that has
+        not exited. It silently shrinks the measured leftover and therefore
+        the persisted correction, which is precisely the "the number came
+        from the previous boot" failure mode (#188).
+        """
+        ranks = max(1, int(ranks_on_gpu))
+        used_share_b = max(0, int(total_b) // ranks - int(free_b) // ranks)
+        return max(0, used_share_b - int(reserved_b) - int(ctx_allowance_b))
+
+    @staticmethod
+    def foreign_residue_warning(
+        tp_rank: int, unaccounted_b: int, free_b: int
+    ) -> Optional[str]:
+        """The LOUD line for a detected foreign consumer, or None."""
+        if unaccounted_b <= 0:
+            return None
+        gib = 1 << 30
+        return (
+            f"Measured KV-budget (rank {tp_rank}): "
+            f"{unaccounted_b / gib:.2f} GiB of this rank's device share is "
+            f"used by something this process did not allocate (own allocator "
+            f"cache already released). A leftover server from a previous "
+            f"boot is the usual cause on a shared box. The measured leftover "
+            f"({free_b / gib:.2f} GiB) is therefore too SMALL, and the "
+            f"correction persisted for the next boot will under-book the KV "
+            f"pool. Kill the foreign process and re-measure, or raise "
+            f"SGLANG_MEASURED_KV_BUDGET_CTX_ALLOWANCE_MIB if this device "
+            f"legitimately hosts a co-resident consumer."
+        )
+
     def note_post_capture_leftover(
         self: ModelRunner, draft_solo_pool_bytes: int = 0
     ) -> None:
@@ -452,7 +608,6 @@ class ModelRunnerKVCacheMixin:
         import time as _time
 
         torch.cuda.synchronize()
-        free_b, total_b = torch.cuda.mem_get_info(self.gpu_id)
 
         safety_mib = self._measured_safety_mib()
         safety_b = safety_mib << 20
@@ -461,6 +616,10 @@ class ModelRunnerKVCacheMixin:
         # every future misallocation should name the component that moved,
         # not just "card is not full". Weights double-checked against the
         # parameter/buffer tensor bytes.
+        #
+        # Read the ALLOCATOR posts first: they describe what this process was
+        # holding at the post-capture point, and the #188 cleanup below
+        # deliberately hands part of it back.
         alloc_now = torch.cuda.memory_allocated()
         reserved_now = torch.cuda.memory_reserved()
         ckpt_w = getattr(self, "_mem_ckpt_post_weights", (0, 0))
@@ -487,6 +646,27 @@ class ModelRunnerKVCacheMixin:
         peak_alloc = int(stats.get("allocated_bytes.all.peak", alloc_now))
         frag_b = max(0, reserved_now - alloc_now)
         transient_b = max(0, peak_alloc - alloc_now)
+
+        # #188: measure the leftover only AFTER releasing this process's own
+        # allocator cache, so the persisted correction encodes physically
+        # resident bytes and not run-to-run allocator slack. The posts above
+        # are already captured, so the balance still reports the pre-cleanup
+        # truth. This changes the measured number (and therefore the next
+        # boot's pool) on the SGLANG_MEASURED_KV_BUDGET path only -- the
+        # default path never enters this function.
+        free_b, total_b, released_b = self.measure_free_after_own_cleanup(
+            mem_get_info=torch.cuda.mem_get_info,
+            empty_cache=torch.cuda.empty_cache,
+            gpu_id=self.gpu_id,
+        )
+        if released_b:
+            logger.info(
+                "Measured KV-budget (rank %d): released %.2f GiB of own "
+                "allocator cache before measuring; leftover is measured "
+                "against physically resident bytes (#188).",
+                self.tp_rank,
+                released_b / gib,
+            )
         logger.info(
             "Measured KV-budget balance (rank %d): post-weights alloc "
             "%.2f/res %.2f GiB (param+buffer tensors %.2f GiB), pools "
@@ -508,6 +688,34 @@ class ModelRunnerKVCacheMixin:
         # Co-located ranks share the device's free memory: each may claim
         # only its share, or the next boot double-books the same bytes.
         ranks_on_gpu = self._ranks_on_my_gpu()
+
+        # #188: harden the reading against FOREIGN residue before it is
+        # persisted. Own allocator cache is already released above, so every
+        # used byte beyond `reserved_now` + a CUDA-context allowance belongs
+        # to somebody else -- on a shared box, typically a server from the
+        # previous boot that never exited. Report LOUDLY instead of silently
+        # persisting a too-small correction that then under-books the next
+        # boot's KV pool.
+        # `reserved_now` is the PRE-cleanup reservation while `free_b` is
+        # post-cleanup: exact for one rank per card, conservative (fewer
+        # false positives) when ranks are co-located. Deliberate -- a loud
+        # line must not cry wolf.
+        ctx_allowance_b = (
+            int(envs.SGLANG_MEASURED_KV_BUDGET_CTX_ALLOWANCE_MIB.get()) << 20
+        )
+        foreign_b = self.unaccounted_used_bytes(
+            total_b=total_b,
+            free_b=free_b,
+            ranks_on_gpu=ranks_on_gpu,
+            reserved_b=reserved_now,
+            ctx_allowance_b=ctx_allowance_b,
+        )
+        foreign_msg = self.foreign_residue_warning(
+            self.tp_rank, foreign_b, int(free_b) // ranks_on_gpu
+        )
+        if foreign_msg is not None:
+            logger.warning("%s", foreign_msg)
+
         free_b = int(free_b) // ranks_on_gpu
 
         # Explicit measured post: the largest PAUSED adaptive/rung graph tag.

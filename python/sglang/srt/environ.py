@@ -319,6 +319,13 @@ class Envs:
     # Scalar MiB or a comma list with one value per TP rank (roles differ:
     # the draft-solo host carries prompt-length-scaled serving transients).
     SGLANG_MEASURED_KV_BUDGET_SAFETY_MIB = EnvStr("400")
+    # #188: how many MiB of this rank's device share may be used by things
+    # outside its own allocator reservation (CUDA context, NCCL buffers)
+    # before the leftover measurement is reported as contaminated by a
+    # FOREIGN consumer -- e.g. a server from the previous boot that never
+    # exited, which silently shrinks the persisted correction. Raise this on
+    # a device that legitimately hosts a co-resident non-sglang consumer.
+    SGLANG_MEASURED_KV_BUDGET_CTX_ALLOWANCE_MIB = EnvInt(1024)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
