@@ -3697,3 +3697,174 @@ only. TTFT here is useless as a prefill proxy — repeated identical prompts are
 served from the radix cache (0.147-0.153 s for a 12000-token prompt in both
 arms). The trade-off between the two phases is unresolved and is the obvious
 next measurement.
+
+---
+
+# Task #216 follow-up — the prefill side, and re-fitting the decode-knee guard
+
+#216 measured what the MLP split COSTS in decode and left the other half open:
+the split exists to concentrate prefill work on the fast card, and that gain
+had never been measured. It is measured here, over four MLP vectors, together
+with a re-calibration of the guard that waved the bad vector through.
+
+Seven cold boots, interleaved (`base, 6,1,1, base, 6,1,1, 3,1,1, 4,1,1,
+base`). Held identical in every arm: `--rank-tp-ratio auto` (budgets
+`[28447,16320,16320]`, base MLP units `[63,37,36]`), the KV ownership vector
+(`SGLANG_UNEVEN_TOKEN_VECTOR=2,3,3`), `--max-total-tokens 16384`, the
+speculative configuration. Only `--rank-mlp-ratio` moves.
+
+## The measurement fallacies this campaign had to step around
+
+**TTFT is radix-cached.** #216 flagged it; the fix is to make every prefill
+request carry a first token no other request has. Prompts are random
+`input_ids` (which also fixes the length exactly -- a text prompt's token
+count is not controllable and overshoots `max_prefill_tokens` with a 400).
+Proof it worked, from the server logs: every prefill chunk in every arm
+reports `#cached-token: 0` (`base_A`: 62 chunks of 2048, all zero). Positive
+control in the same boot -- the SAME prompt sent twice -- goes 5505 ms then
+1319 ms with `#cached-token: 6144`. That 4.2x is exactly the trap.
+
+**Raw ms/output-token is acceptance-driven, not weight-driven.** The first
+decode pass used the random-token prompts and produced nonsense: ctx 400 to
+ctx 11000 appeared to cost 4.7x, and one arm returned a NEGATIVE step time.
+Random context drives the model into a degenerate output mode whose
+speculative acceptance swamps everything else. The decode arm therefore runs
+on natural text with acceptance recorded, and the reported quantity is **ms
+per speculative step** (`ms/token x accept_length`). That quantity is
+depth-invariant, which is the check that it is the right one: `6,1,1` reads
+34.63 ms at ctx 400 and 35.14 ms at ctx 11000.
+
+## Noise floor, boot-to-boot A-vs-A
+
+| pair | quantity | spread |
+|---|---|---|
+| `base_B` vs `base_C` | ms/spec-step | 0.25-0.72 % |
+| `m611_A` vs `m611_B` | ms/spec-step | 0.62-0.84 % |
+| `base_A` vs `base_B` | prefill ms | 0.03-0.87 % |
+| `base_B` vs `base_C` | prefill ms | 0.05-0.74 % |
+| `m611_A` vs `m611_B` | prefill ms | 0.94-2.46 % |
+
+## Prefill — the gain is real, and it does not grow with length
+
+Median of 3 cache-miss requests per point, `max_new_tokens=1`.
+
+| prompt tokens | base | 3,1,1 | 4,1,1 | 6,1,1 |
+|---|---|---|---|---|
+| 500 | 387.9 ms | 364.8 (+6.3 %) | 360.8 (+7.5 %) | 349.9 (+10.9 %) |
+| 1000 | 720.5 | 671.6 (+7.3 %) | 659.1 (+9.3 %) | 640.8 (+12.4 %) |
+| 2000 | 1398.4 | 1297.5 (+7.8 %) | 1269.3 (+10.2 %) | 1229.2 (+13.8 %) |
+| 4000 | 2755.4 | 2580.0 (+6.8 %) | 2509.2 (+9.8 %) | 2425.8 (+13.6 %) |
+| 8000 | 5545.0 | 5168.8 (+7.3 %) | 5041.1 (+10.0 %) | 4823.0 (+15.0 %) |
+| 11000 | 7708.5 | 7189.2 (+7.2 %) | 7000.0 (+10.1 %) | 6719.3 (+14.7 %) |
+
+The gain is **flat in prompt length** past ~2000 tokens: prefill is linear in
+L in every arm and the split changes its SLOPE, so the percentage saturates.
+`6,1,1` measures +13.0 % on the slope (0.6972 -> 0.6066 ms per prompt token)
+against the optimizer's predicted +23.7 % -- the prefill model over-predicts
+by ~1.8x, which is a separate open item from the guard.
+
+## Decode — every concentration vector costs, and the cost is monotone
+
+ms per speculative step, natural text, mean of ctx~400 and ctx~11000.
+
+| vector | ms/spec-step | vs base |
+|---|---|---|
+| base `[63,37,36]` | 30.10 | — |
+| `3,1,1` | 31.90 | **+6.0 %** |
+| `4,1,1` | 34.12 | **+13.4 %** |
+| `6,1,1` | 34.76 | **+15.5 %** |
+
+`6,1,1` at +15.5 % independently reproduces #216's +16.5 % on a different
+harness, different context-length settings and fresh boots. At ctx~400 both
+arms even land on the SAME acceptance (3.0476), so the per-token and
+per-step deltas coincide there: 9.762 -> 11.317 ms/token, +15.9 %.
+
+## The crossover — this is the number the profile generator needs
+
+Prefill saving is per PROMPT token (slope difference); decode cost is per
+OUTPUT token (per-step difference over the base arm's acceptance, 2.79).
+Break-even is the prompt:output ratio where they cancel.
+
+| vector | saves per prompt token | costs per output token | break-even prompt:output |
+|---|---|---|---|
+| `3,1,1` | 0.0473 ms | 0.648 ms | **13.7 : 1** |
+| `4,1,1` | 0.0649 ms | 1.444 ms | **22.3 : 1** |
+| `6,1,1` | 0.0906 ms | 1.673 ms | **18.5 : 1** |
+
+Read as absolute prompt sizes for `6,1,1`: 128 output tokens needs a
+2364-token prompt to break even, 256 needs 4728, 512 needs 9457, 1024 needs
+18913.
+
+**The MLP split is not a general-purpose default.** It pays only for
+prompt-dominated work at a ratio of roughly 14-22 : 1 -- retrieval-style
+extraction, classification, reranking, long-document scoring with short
+answers. For anything where the output is within an order of magnitude of the
+prompt (chat, agents, code generation, reasoning) it is a straight loss, and
+`6,1,1` in particular should not be proposed as a default. Note also that
+`4,1,1` is dominated: it costs nearly as much decode as `6,1,1` for two-thirds
+of the prefill gain, so its break-even is the WORST of the three. If a
+concentration vector is wanted at all, `3,1,1` has the best ratio.
+
+## The guard was mis-calibrated, and where
+
+Reproduced exactly, not inferred. Under the budgets #216 booted
+(`[26107,18280,18280]`) `decode_knee_detail` returns:
+
+| vector | rank-0 byte share | peak membw share | shipped verdict |
+|---|---|---|---|
+| `6,1,1` | 52.43 % | 53.67 % | **knee OK** |
+| `8,1,1` | 54.49 % | 53.67 % | rejected |
+| `10,1,1` | 55.67 % | 53.67 % | rejected |
+
+which is the #216 log verbatim. The companion round-time proxy predicted
+`6,1,1` would make decode **-22 %** where **+16.5 %** was measured.
+
+The defect is the premise, not the arithmetic: the ceiling was a rank's share
+of **probed peak** memory bandwidth, used as if it were the bandwidth the rank
+achieves. A bs=1 decode step is many small quantized GEMVs, which reach a
+fraction of a streaming benchmark's peak -- and on a mixed rig the fractions
+do not cancel. Measured here, the 5090's real decode advantage over a 3080 is
+**1.70x** where the probe reports **2.32x**. Taking the peak ratio for the
+achieved ratio puts the fast rank's ceiling far too high, so the guard admits
+exactly the concentration that makes that rank the lockstep pacer.
+
+## The correction
+
+`bw_effective ~ bw_peak ** BETA`, with `BETA` fitted on the four measured
+vectors (`_PREDICT_DECODE_BW_COMPRESSION`). `BETA = 1` is the identity the
+guard shipped with; the fit lands at **0.63**, rms 0.38 ms on ~30 ms steps.
+Effective bandwidth share becomes `[45.9 %, 27.0 %, 27.0 %]` against the peak
+`[53.7 %, 23.2 %, 23.2 %]`, and the verdicts separate cleanly:
+
+| vector | share | eff. ceiling | verdict | measured |
+|---|---|---|---|---|
+| base | 45.54 % | 45.92 % | OK | +0.0 % |
+| `3,1,1` | 51.14 % | 45.92 % | REJECT | +6.0 % |
+| `4,1,1` | 53.79 % | 45.92 % | REJECT | +13.4 % |
+| `6,1,1` | 57.03 % | 45.92 % | REJECT | +15.5 % |
+
+The second half matters more than the fit. **The guard now states the cost
+instead of silently passing it.** `decode_cost_percent` is reported for every
+candidate, accepted or rejected, in the optimizer log:
+
+```
+candidate MLP vector 6,1,1: ... predicted prefill gain +23.7%, predicted decode step +16.3%
+candidate MLP vector 4,1,1: ... predicted prefill gain +15.5%, predicted decode step +11.3%
+candidate MLP vector 3,1,1: ... predicted prefill gain +10.6%, predicted decode step  +7.2%
+```
+
+against measured +15.5 / +13.4 / +6.0 % -- within ~2 points, where the shipped
+proxy was 26-38 points out with the wrong sign. A guard's verdict is a model;
+the number next to it is what lets a reader disagree with the model, and its
+absence is why this shipped.
+
+**Sample width.** One rig (5090 + 2x 3080, PCIe, no P2P), one checkpoint
+family (FP8 dense, sm_120 native lane against sm_86 Marlin upconvert). The
+direction -- achieved bandwidth ratios are compressed against peak ratios --
+is general. The value 0.63 is not claimed to be, and is one line to re-fit.
+
+Red-then-green: `test/registered/unit/planner/test_decode_knee_calibration.py`
+fails 9 assertions at `BETA = 1.00` (the shipped model) and passes all of them
+at 0.63, so the tests pin the calibration and nothing else. Planner suite
+777 passed; the single `test_webui.py::test_reference_png_static_route`
+failure reproduces on the unmodified base commit.

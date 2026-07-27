@@ -1,0 +1,14 @@
+      3 #new-token: 1000, #cached-token: 0
+      3 #new-token: 1856, #cached-token: 0
+      3 #new-token: 1952, #cached-token: 0
+      1 #new-token: 1993, #cached-token: 0
+      3 #new-token: 2000, #cached-token: 0
+     65 #new-token: 2048, #cached-token: 0
+      1 #new-token: 2048, #cached-token: 320
+      1 #new-token: 357, #cached-token: 0
+      6 #new-token: 37, #cached-token: 320
+      9 #new-token: 400, #cached-token: 0
+      3 #new-token: 500, #cached-token: 0
+     10 #new-token: 760, #cached-token: 0
+      1 #new-token: 80, #cached-token: 0
+      6 #new-token: 9, #cached-token: 10496
