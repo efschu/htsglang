@@ -1574,6 +1574,142 @@ class ServerArgs:
             "write path, gated behind this flag.",
         ),
     ] = False
+    kv_session_offload_budget_total_tokens: A[
+        int,
+        Arg(
+            help="kv-session-offload BUDGET (#236): maximum host-resident "
+            "spill volume in TOKENS across ALL spilled sessions (host tails "
+            "plus each session's GDN-state token equivalent). 0 (DEFAULT) = "
+            "regler OFF. Protects the shared host RAM (the expert offload "
+            "uses the same memory). Several budget reglers may be armed at "
+            "once; the FIRST violated one (fixed order: count, per-session, "
+            "per-phase, total, rate) names the event. At spill ADMISSION a "
+            "violation declines the spill (stock retraction fallback, "
+            "today's behaviour); DURING an episode it DEMOTES the session: "
+            "generation is capped at the current output, the spilled work "
+            "drains back and the stock finish donates the prefix to the "
+            "radix tree / HiCache -- a continuation is a prefix hit, not a "
+            "full re-prefill.",
+        ),
+    ] = 0
+    kv_session_offload_budget_session_tokens: A[
+        int,
+        Arg(
+            help="kv-session-offload BUDGET (#236): maximum host-resident "
+            "spill volume in TOKENS PER SESSION (host tail + GDN token "
+            "equivalent). 0 (DEFAULT) = regler OFF. A session that grows "
+            "past this while spilled is DEMOTED (see "
+            "--kv-session-offload-budget-total-tokens for the demotion "
+            "semantics).",
+        ),
+    ] = 0
+    kv_session_offload_budget_prefill_tokens: A[
+        int,
+        Arg(
+            help="kv-session-offload BUDGET (#236): maximum host-resident "
+            "tokens spilled by the PREFILL path (born-spilled prompts, "
+            "write-once volume). 0 (DEFAULT) = regler OFF. Separate from the "
+            "decode budget because the phases have different cost models: a "
+            "prefill spill is write-once, a decode spill is a living "
+            "session. Gates born-spill admission coarsely (the last admitted "
+            "prompt may overshoot by one prompt; the overshoot then demotes "
+            "through the episode evaluation).",
+        ),
+    ] = 0
+    kv_session_offload_budget_decode_tokens: A[
+        int,
+        Arg(
+            help="kv-session-offload BUDGET (#236): maximum host-resident "
+            "tokens spilled by the DECODE path (decode-spill tails plus "
+            "growth of any spilled session). 0 (DEFAULT) = regler OFF. See "
+            "--kv-session-offload-budget-prefill-tokens for the phase split.",
+        ),
+    ] = 0
+    kv_session_offload_budget_rate_tokens_per_s: A[
+        float,
+        Arg(
+            help="kv-session-offload BUDGET (#236): token-bucket RATE cap in "
+            "tokens/s on the spill path's PCIe traffic (spill D2H volume + "
+            "the per-tick host-tail stream), which shares the link with the "
+            "prefill-offload ingest. 0 (DEFAULT) = regler OFF. Rate pressure "
+            "THROTTLES (defers ticks / declines spill admissions until the "
+            "bucket refills), it never demotes. Debt model: one consumption "
+            "may exceed the burst so a large tail cannot starve forever. "
+            "Refilled from a rank-uniform (MAX-reduced) clock so every rank "
+            "throttles in lock-step.",
+        ),
+    ] = 0.0
+    kv_session_offload_budget_episode_seconds: A[
+        float,
+        Arg(
+            help="kv-session-offload BUDGET (#236): maximum wall-clock "
+            "SECONDS per spill episode (from spill to restore/finish). 0.0 "
+            "(DEFAULT) = regler OFF. Bounds the DURATION rather than the "
+            "volume -- robust against misjudging a session's size. On "
+            "expiry the session is DEMOTED (work kept, liveness ends; see "
+            "--kv-session-offload-budget-total-tokens). Measured on the "
+            "rank-uniform clock.",
+        ),
+    ] = 0.0
+    kv_session_offload_budget_max_sessions: A[
+        int,
+        Arg(
+            help="kv-session-offload BUDGET (#236): maximum number of "
+            "CONCURRENTLY spilled sessions the budget admits (breadth "
+            "instead of depth). 0 (DEFAULT) = regler OFF (the physical "
+            "region count --kv-session-offload-max-spills still bounds it). "
+            "At the cap, further spills decline to stock retraction.",
+        ),
+    ] = 0
+    kv_session_offload_spill_progress_lock_tokens: A[
+        int,
+        Arg(
+            help="kv-session-offload COOLDOWN (#236, primary): a session "
+            "restored from host is not a spill victim again until it has "
+            "produced this many output tokens since the restore. 0 "
+            "(DEFAULT) = OFF. Attacks spill<->restore pendulum at the root: "
+            "no progress, no second transfer (time-based locks do that only "
+            "by accident). Blocked re-spill attempts are counted as "
+            "pendulum events. Never overrides the victim protections: the "
+            "oldest session stays tabu and a sole running session never "
+            "self-spills, lock or no lock.",
+        ),
+    ] = 0
+    kv_session_offload_spill_hysteresis_steps: A[
+        int,
+        Arg(
+            help="kv-session-offload COOLDOWN (#236, secondary): pressure "
+            "hysteresis, the spill-side MIRROR of "
+            "--kv-session-offload-restore-hysteresis-steps -- the fast-lane "
+            "shortfall must hold for this many consecutive iterations before "
+            "sessions are evicted for it. 0 (DEFAULT) = OFF (today's "
+            "immediate eviction). Applies to the elective fast-lane path "
+            "only; decode-OOM spills must yield in the same iteration "
+            "(declining them would merely reroute the pressure into the "
+            "harsher stock retraction).",
+        ),
+    ] = 0
+    kv_session_offload_spill_cooldown_seconds: A[
+        float,
+        Arg(
+            help="kv-session-offload COOLDOWN (#236, coarse upper bound on "
+            "top of the progress lock): a restored session is additionally "
+            "not a victim for this many seconds after the restore "
+            "(rank-uniform clock). 0.0 (DEFAULT) = OFF.",
+        ),
+    ] = 0.0
+    kv_session_offload_budget_demote_grace_iters: A[
+        int,
+        Arg(
+            help="kv-session-offload BUDGET (#236): scheduler iterations a "
+            "DEMOTED session may wait for its host tail to drain back to "
+            "device (where the stock finish donates the full prefix to the "
+            "radix tree / HiCache). Past the grace it finishes on host "
+            "instead: response delivered, but the tail is dropped and the "
+            "continuation pays a full re-prefill. Only consulted after a "
+            "demotion; inert while no budget regler is armed. Default 256.",
+        ),
+    ] = 256
     rank_tp_ratio: A[
         Optional[Union[List[int], str]],
         Arg(
@@ -4459,6 +4595,61 @@ class ServerArgs:
             raise ValueError(
                 "--kv-session-offload-host-ram-gib requires "
                 "--enable-kv-session-offload."
+            )
+        # #236 spill budget / cooldown flags: sub-modes of the offload
+        # feature; standalone they would silently do nothing -> reject.
+        _budget_flags = (
+            ("budget-total-tokens", self.kv_session_offload_budget_total_tokens),
+            (
+                "budget-session-tokens",
+                self.kv_session_offload_budget_session_tokens,
+            ),
+            (
+                "budget-prefill-tokens",
+                self.kv_session_offload_budget_prefill_tokens,
+            ),
+            (
+                "budget-decode-tokens",
+                self.kv_session_offload_budget_decode_tokens,
+            ),
+            (
+                "budget-rate-tokens-per-s",
+                self.kv_session_offload_budget_rate_tokens_per_s,
+            ),
+            (
+                "budget-episode-seconds",
+                self.kv_session_offload_budget_episode_seconds,
+            ),
+            ("budget-max-sessions", self.kv_session_offload_budget_max_sessions),
+            (
+                "spill-progress-lock-tokens",
+                self.kv_session_offload_spill_progress_lock_tokens,
+            ),
+            (
+                "spill-hysteresis-steps",
+                self.kv_session_offload_spill_hysteresis_steps,
+            ),
+            (
+                "spill-cooldown-seconds",
+                self.kv_session_offload_spill_cooldown_seconds,
+            ),
+        )
+        for _name, _val in _budget_flags:
+            if _val and not self.enable_kv_session_offload:
+                raise ValueError(
+                    f"--kv-session-offload-{_name} requires "
+                    "--enable-kv-session-offload."
+                )
+            if _val < 0:
+                raise ValueError(
+                    f"--kv-session-offload-{_name} must be >= 0 (0 = regler "
+                    f"OFF); got {_val}."
+                )
+        if self.kv_session_offload_budget_demote_grace_iters < 0:
+            raise ValueError(
+                "--kv-session-offload-budget-demote-grace-iters must be >= 0 "
+                f"(0 = immediate host-finish fallback); got "
+                f"{self.kv_session_offload_budget_demote_grace_iters}."
             )
         if not self.enable_kv_session_offload:
             return
