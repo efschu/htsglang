@@ -22,7 +22,7 @@ Two identities do **not** qualify as a cross-check:
 | Claim | Why it does not hold |
 |---|---|
 | Byte-/token-identity above ~109 prompt tokens on an RTX 3080 under fp8 | `gptq_marlin_gemm`, the only fp8 GEMM sm86 has, is measured run-to-run nondeterministic above that length: 0 of 1200 mismatches through M=109, first mismatch at M=128. The fix is not merged. The RTX 5090 (sm120, a different fp8 GEMM path) is unaffected at any length. |
-| Token identity between speculative and non-speculative decoding | The verify round computes k+1 tokens in one forward instead of one per token, so the reduction order differs. With repetition, presence or frequency penalties set, n-1 of n accepted tokens never reach the penalty function. The acceptance decision itself is exact integer equality against the target's argmax and cannot diverge. |
+| Token identity between speculative and non-speculative decoding | The verify round computes k+1 tokens in one forward instead of one per token, so the reduction order differs. With repetition, presence or frequency penalties set, n-1 of n accepted tokens never reach the penalty function. The acceptance decision itself is exact integer equality against the target's argmax and cannot diverge. A valid reference for a speculative arm carries the same speculative configuration. |
 
 ## Reference hardware
 

@@ -5,6 +5,9 @@ Turns the fork's manually-validated byte-identity discipline into an
 enforceable, tested contract:
 
 * :mod:`.trajectory`  -- the ``Trajectory`` data model + ``Verdict`` results.
+* :mod:`.spec_trajectory` -- ``VerifyRound`` / ``SpecRun`` and the projection
+  of a speculative run into emitted-token space, after which every primitive
+  below applies to it unchanged (#143).
 * :mod:`.primitives`  -- pure, CPU-testable comparison primitives.
 * :mod:`.classes`     -- the byte-identity CLASS registry (the contract) and
   the per-class assertion bundles.
@@ -20,6 +23,8 @@ synthetic data (see ``tests/determinism/test_*.py``).
 from .classes import CLASS_SPECS, ByteIdentityClass, check_class
 from .matrix import EXCLUDED_CASES, PINNED_SEED, TEST_MATRIX, CaseSpec, get_case
 from .primitives import (
+    check_accept_length_floor,
+    check_accept_rule_exactness,
     check_argmax_clean_trajectory,
     check_delta_band,
     check_machine_zero,
@@ -30,6 +35,7 @@ from .primitives import (
     per_step_max_abs_delta,
 )
 from .runner import evaluate_case, gpu_available, requires_gpu, run_case_config
+from .spec_trajectory import SpecRun, VerifyRound
 from .trajectory import FlipKind, Trajectory, Verdict
 
 __all__ = [
@@ -39,9 +45,13 @@ __all__ = [
     "EXCLUDED_CASES",
     "FlipKind",
     "PINNED_SEED",
+    "SpecRun",
     "TEST_MATRIX",
     "Trajectory",
+    "VerifyRound",
     "Verdict",
+    "check_accept_length_floor",
+    "check_accept_rule_exactness",
     "check_argmax_clean_trajectory",
     "check_class",
     "check_delta_band",
