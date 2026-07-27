@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
+    compute_model_identity_hash,
 )
 
 if TYPE_CHECKING:
@@ -38,7 +39,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -615,6 +616,24 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
 
+        # Page hashes cover token ids only and the backend suffix covers
+        # served_model_name + parallel geometry; the KV byte format
+        # (dtype/quantization/kv_cache_dtype) and the weights revision are in
+        # neither. Persistent-tier entries outlive the process, so without
+        # this hash a later run sharing served_model_name and storage location
+        # could silently read pages written in another byte format. The
+        # scheduler process publishes ServerArgs before any storage attach;
+        # the fallback only covers bare-controller unit tests.
+        try:
+            server_args = get_server_args()
+        except ValueError:
+            server_args = None
+        model_identity_hash = (
+            compute_model_identity_hash(server_args)
+            if server_args is not None
+            else None
+        )
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -627,6 +646,7 @@ class HiCacheController:
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
+            model_identity_hash=model_identity_hash,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,

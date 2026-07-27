@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -23,6 +24,32 @@ logger = logging.getLogger(__name__)
 STORAGE_BATCH_SIZE = 128
 
 
+def compute_model_identity_hash(server_args: Any) -> str:
+    """Compute a short hash that uniquely identifies the model and KV layout.
+
+    Storage page hashes cover token ids only, and the storage key suffix covers
+    served_model_name plus parallel geometry. Neither includes the model
+    identity (weights revision) or the KV byte format (dtype, quantization,
+    kv_cache_dtype). Entries in a persistent storage tier outlive the server
+    process, so a later run that shares the served_model_name and storage
+    location but differs in e.g. --kv-cache-dtype would silently read pages
+    written in another byte format. Incorporating this hash into the key
+    suffix turns that silent wrong hit into a clean miss.
+
+    Matches the recipe of upstream PR #24794 so keys converge with stock
+    sglang once it lands.
+    """
+    identity_parts = [
+        os.path.normpath(server_args.model_path) if server_args.model_path else "",
+        server_args.revision or "",
+        str(server_args.dtype or "auto").lower(),
+        server_args.quantization or "",
+        str(server_args.kv_cache_dtype or "auto").lower(),
+    ]
+    identity_str = "|".join(identity_parts)
+    return hashlib.sha256(identity_str.encode()).hexdigest()[:16]
+
+
 @dataclass
 class HiCacheStorageConfig:
     tp_rank: int
@@ -35,6 +62,9 @@ class HiCacheStorageConfig:
     enable_storage_metrics: bool
     is_page_first_layout: bool
     model_name: Optional[str]
+    # Hash over (model_path, revision, dtype, quantization, kv_cache_dtype),
+    # see compute_model_identity_hash(). None keeps legacy key layout.
+    model_identity_hash: Optional[str] = None
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
@@ -376,6 +406,12 @@ class HiCacheFile(HiCacheStorage):
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
         self.dcp_owner_mode = bool(getattr(storage_config, "dcp_owner_mode", False))
+        # Model identity hash keeps runs that share a served_model_name but
+        # differ in weights or KV byte format (dtype/quantization/
+        # kv_cache_dtype) from hitting each other's persisted pages. Old-layout
+        # keys (written without the hash) simply no longer match: clean miss
+        # instead of a silent wrong-format hit.
+        identity_hash = storage_config.model_identity_hash or ""
         self.config_suffix = f"_{model_name}"
         # Weighted uneven-DCP owner mode: KV pages carry FULL replicated
         # kv-heads and are token-sharded, so a page's bytes are complete on its
@@ -384,6 +420,9 @@ class HiCacheFile(HiCacheStorage):
         # written by its owner only); component pools (mamba/SWA, genuinely
         # per-rank shards) keep the rank-suffixed keys below.
         self.kv_config_suffix = f"_{model_name}"
+        if identity_hash:
+            self.config_suffix += f"_{identity_hash}"
+            self.kv_config_suffix += f"_{identity_hash}"
         if not is_mla_model:
             self.config_suffix += f"_{tp_rank}_{tp_size}"
             if not self.dcp_owner_mode:

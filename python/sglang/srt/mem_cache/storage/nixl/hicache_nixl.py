@@ -97,6 +97,11 @@ class HiCacheNixl(HiCacheStorage):
             self.config_suffix = f"_{model_name}"
         else:
             self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
+        # Isolate runs that share a served_model_name but differ in weights or
+        # KV byte format (dtype/quantization/kv_cache_dtype).
+        identity_hash = storage_config.model_identity_hash or ""
+        if identity_hash:
+            self.config_suffix += f"_{identity_hash}"
 
         sync_mode = getattr(
             nixlBind, "NIXL_THREAD_SYNC_RW", nixlBind.NIXL_THREAD_SYNC_STRICT

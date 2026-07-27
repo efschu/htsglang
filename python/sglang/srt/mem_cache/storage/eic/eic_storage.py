@@ -206,6 +206,7 @@ class EICStorage(HiCacheStorage):
         logger.debug(f"eic enable_kvget_gpu_direct: {G_EnableKVGetGPUDirect}")
 
         self.model_name = hicache_config.model_name
+        self.model_identity_hash = hicache_config.model_identity_hash or ""
 
         # rdma
         enable_kv_set_direct = config.get("enable_kvset_direct", True)
@@ -313,12 +314,21 @@ class EICStorage(HiCacheStorage):
         self.connection.register_memory(vals, meminfo)
 
     def _init_eic_prefix(self):
+        # Identity hash isolates runs that share a model_name but differ in
+        # weights or KV byte format (dtype/quantization/kv_cache_dtype).
+        identity_segment = (
+            f"_{self.model_identity_hash}" if self.model_identity_hash else ""
+        )
         if self.is_mla_model:
             self.eic_prefix = (
-                f"{self.model_name}_mla_att_{self.host_kvcache_layout}@sglang"
+                f"{self.model_name}{identity_segment}"
+                f"_mla_att_{self.host_kvcache_layout}@sglang"
             )
         else:
-            self.eic_prefix = f"{self.model_name}_mha_attn_{self.host_kvcache_layout}_{self.rank}_{self.world_size}_@sglang"
+            self.eic_prefix = (
+                f"{self.model_name}{identity_segment}"
+                f"_mha_attn_{self.host_kvcache_layout}_{self.rank}_{self.world_size}_@sglang"
+            )
 
     def _get_eic_key(self, keys: List[str]) -> str:
         return [f"{self.eic_prefix}_{key}" for key in keys]

@@ -791,13 +791,19 @@ class UMBPStore(HiCacheStorage):
         if mem_pool_host is not None:
             self.register_mem_pool_host(mem_pool_host)
 
+        self.model_identity_hash = (
+            storage_config.model_identity_hash if storage_config is not None else None
+        )
+        # Isolate runs that share a store but differ in weights or KV byte
+        # format (dtype/quantization/kv_cache_dtype).
+        id_suffix = f"_{self.model_identity_hash}" if self.model_identity_hash else ""
         self.enable_pp = self.pp_size > 1
         if self.enable_pp:
-            self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
-            self.mla_suffix = f"{self.pp_rank}"
+            self.mha_suffix = f"{self.local_rank}_{self.pp_rank}{id_suffix}"
+            self.mla_suffix = f"{self.pp_rank}{id_suffix}"
         else:
-            self.mha_suffix = f"{self.local_rank}"
-            self.mla_suffix = ""
+            self.mha_suffix = f"{self.local_rank}{id_suffix}"
+            self.mla_suffix = id_suffix.lstrip("_") if id_suffix else ""
 
         self.split_factor = 0
         if storage_config and storage_config.should_split_heads:
@@ -805,9 +811,11 @@ class UMBPStore(HiCacheStorage):
             base_rank = self.local_rank * self.split_factor
             target_ranks = [base_rank + i for i in range(self.split_factor)]
             if self.enable_pp:
-                self.mha_suffix = [f"{rank}_{self.pp_rank}" for rank in target_ranks]
+                self.mha_suffix = [
+                    f"{rank}_{self.pp_rank}{id_suffix}" for rank in target_ranks
+                ]
             else:
-                self.mha_suffix = [f"{rank}" for rank in target_ranks]
+                self.mha_suffix = [f"{rank}{id_suffix}" for rank in target_ranks]
 
         logger.info(
             "UMBPStore initialized: dram=%d MB, ssd=%s, mla=%s, rank=%d, ssd_backend=%s",

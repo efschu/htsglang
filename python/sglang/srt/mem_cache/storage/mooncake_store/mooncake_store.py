@@ -533,6 +533,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.attn_cp_rank = 0
                 self.attn_cp_size = 1
 
+            self.model_identity_hash = (
+                storage_config.model_identity_hash
+                if storage_config is not None
+                else None
+            )
             self.enable_pp = self.pp_size > 1
             if self.enable_pp:
                 self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
@@ -540,6 +545,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
+            # Isolate runs that share a served_model_name but differ in weights
+            # or KV byte format (dtype/quantization/kv_cache_dtype).
+            if self.model_identity_hash:
+                self.mha_suffix += f"_{self.model_identity_hash}"
+                self.mla_suffix += f"_{self.model_identity_hash}"
 
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
@@ -550,12 +560,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
                 base_rank = self.local_rank * self.split_factor
                 target_ranks = [base_rank + i for i in range(self.split_factor)]
+                id_suffix = (
+                    f"_{self.model_identity_hash}" if self.model_identity_hash else ""
+                )
                 if self.enable_pp:
                     self.mha_suffix = [
-                        f"{rank}_{self.pp_rank}" for rank in target_ranks
+                        f"{rank}_{self.pp_rank}{id_suffix}" for rank in target_ranks
                     ]
                 else:
-                    self.mha_suffix = [f"{rank}" for rank in target_ranks]
+                    self.mha_suffix = [f"{rank}{id_suffix}" for rank in target_ranks]
 
             self.registered_pools = {}
 
