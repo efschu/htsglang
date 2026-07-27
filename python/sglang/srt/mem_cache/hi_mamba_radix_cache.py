@@ -402,12 +402,21 @@ class HiMambaRadixCache(MambaRadixCache):
             last_node,
         )
 
-    def _inc_hit_count(self, node: TreeNode, chunked=False):
+    def _inc_hit_count(
+        self, node: TreeNode, chunked=False, force_host_write_through: bool = False
+    ):
         if self.cache_controller.write_policy == "write_back" or chunked:
-            return
-        node.hit_count += 1
+            # A hand-off (see requests_forced_host_write_through) reaches the
+            # host tier under every write policy: its device slots are freed on
+            # the same finish, so a deferred stage-at-eviction is a loss.
+            if not force_host_write_through:
+                return
+        else:
+            node.hit_count += 1
 
-        if not node.backuped and node.hit_count >= self.write_through_threshold:
+        if not node.backuped and (
+            force_host_write_through or node.hit_count >= self.write_through_threshold
+        ):
             # write to host if the node is not backuped
             self.write_backup(node)
 
@@ -885,6 +894,7 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_value,
         chunked: bool = False,
         prev_prefix_len: int = 0,
+        force_host_write_through: bool = False,
     ) -> Tuple[int, bool]:
         assert mamba_value is not None, "Mamba value should not be None here."
         node.last_access_time = get_last_access_time()
@@ -921,7 +931,7 @@ class HiMambaRadixCache(MambaRadixCache):
                     start = max(0, prev_prefix_len - total_prefix_length)
                     self.token_to_kv_pool_allocator.free(value[start:prefix_len])
                 total_prefix_length += prefix_len
-                self._inc_hit_count(node, chunked)
+                self._inc_hit_count(node, chunked, force_host_write_through)
 
             key = key[prefix_len:]
             value = value[prefix_len:]
@@ -932,7 +942,7 @@ class HiMambaRadixCache(MambaRadixCache):
         mamba_value_exist = False
         if len(key):
             new_node = self._add_new_node(node, key, value, mamba_value)
-            self._inc_hit_count(new_node, chunked)
+            self._inc_hit_count(new_node, chunked, force_host_write_through)
         elif node.mamba_value is None:
             node.mamba_value = mamba_value
             if not node.evicted:

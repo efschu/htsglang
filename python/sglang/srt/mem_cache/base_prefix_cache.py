@@ -68,6 +68,39 @@ class InsertParams:
     chunked: bool = False
     priority: int = 0
 
+    # Hierarchical-cache specific: hand every inserted node to the host tier
+    # regardless of the hit-count write-through heuristic. See
+    # ``requests_forced_host_write_through`` below.
+    force_host_write_through: bool = False
+
+
+#: Attribute a caller sets on a ``Req`` to demand that the request's final
+#: insert reaches the host tier in full.
+FORCE_HOST_WRITE_THROUGH_ATTR = "force_host_write_through"
+
+
+def requests_forced_host_write_through(req: Req) -> bool:
+    """Whether this request's finishing insert must be written through to the
+    host tier in full, bypassing the hit-count heuristic.
+
+    The hierarchical cache normally writes a node to the host tier only once it
+    has been hit ``write_through_threshold`` times -- a hit-rate heuristic, and
+    a correct one for ordinary caching: a node that never gets a second hit is
+    not worth the DMA, and dropping it costs nothing but a recompute.
+
+    A HAND-OFF is the opposite situation. When ``--enable-kv-session-offload``
+    demotes a session (spill budget exhausted, see ``_budget_demote``), the
+    donated prefix is not a caching opportunity but the session's only surviving
+    copy: the device slots are freed on the same finish. Leaving the heuristic
+    in charge silently drops exactly the leaves under the threshold -- the
+    newest tokens, the ones the session just produced. Requests marked here are
+    written through in full instead.
+
+    Unmarked requests -- everything that is not a hand-off -- keep the stock
+    heuristic byte for byte.
+    """
+    return bool(getattr(req, FORCE_HOST_WRITE_THROUGH_ATTR, False))
+
 
 @dataclasses.dataclass
 class InsertResult:

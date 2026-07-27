@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    requests_forced_host_write_through,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
@@ -792,6 +793,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_params = InsertParams(
                 prev_prefix_len=req.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
+                force_host_write_through=requests_forced_host_write_through(req),
             )
 
             # components prepare insert data + return effective cache_len
@@ -1215,7 +1217,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         value_slice[dup_start:consumed_from]
                     )
 
-            self._inc_hit_count(node, params.chunked)
+            self._inc_hit_count(node, params.chunked, params.force_host_write_through)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
@@ -1253,7 +1255,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
 
         if is_new_leaf:
-            self._inc_hit_count(target_node, params.chunked)
+            self._inc_hit_count(
+                target_node, params.chunked, params.force_host_write_through
+            )
         return result
 
     def _insert_helper_host(
@@ -1861,20 +1865,36 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         return transfers
 
-    def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
-        """Increment hit count; trigger write_backup when threshold reached."""
-        if node.evicted or chunked:
+    def _inc_hit_count(
+        self,
+        node: UnifiedTreeNode,
+        chunked: bool = False,
+        force_host_write_through: bool = False,
+    ) -> None:
+        """Increment hit count; trigger write_backup when threshold reached.
+
+        ``force_host_write_through`` marks a hand-off insert (see
+        ``requests_forced_host_write_through``): the node reaches the host tier
+        regardless of hit count and of the write policy, because the donated
+        device slots are freed by the same finish.
+        """
+        if node.evicted:
             return
-        if (
+        if chunked or (
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         ):
-            return
-        node.hit_count += 1
+            if not force_host_write_through:
+                return
+        else:
+            node.hit_count += 1
         if (
             self.cache_controller is not None
             and not node.backuped
-            and node.hit_count >= self.write_through_threshold
+            and (
+                force_host_write_through
+                or node.hit_count >= self.write_through_threshold
+            )
         ):
             self.write_backup(node)
 

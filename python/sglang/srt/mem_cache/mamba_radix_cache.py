@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    requests_forced_host_write_through,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
@@ -537,7 +538,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if value is None:
             value = torch.tensor([x for x in key.raw_token_ids()], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
-            self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
+            self.root_node,
+            key,
+            value,
+            mamba_value,
+            params.chunked,
+            prev_prefix_len,
+            params.force_host_write_through,
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
@@ -652,6 +659,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
                     prev_prefix_len=req.cache_protected_len,
+                    force_host_write_through=requests_forced_host_write_through(req),
                 )
             )
             mamba_exist = result.mamba_exist
@@ -1381,7 +1389,10 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         mamba_value,
         chunked: bool = False,
         prev_prefix_len: int = 0,
+        force_host_write_through: bool = False,
     ) -> Tuple[int, bool]:
+        # ``force_host_write_through`` is inert here (no host tier); the
+        # hierarchical subclass consumes it.
         # Update the last access time from root to leaf, so that
         # mamba will tombstone the node closer to root first
         assert mamba_value is not None, "Mamba value should not be None here."
