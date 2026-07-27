@@ -29,7 +29,7 @@ Two identities do **not** qualify as a cross-check:
 | Role | Cards and link |
 |---|---|
 | Main rig | 1x RTX 5090 (sm120, 32 GB) + 2x RTX 3080 (sm86, 20 GB) |
-| Second host | 1x RTX 2080 Ti (sm75) + 1x Radeon RX Vega 64 (gfx900, 8 GB) |
+| Second host | 1x RTX 2080 Ti (sm75) + 1x Radeon RX Vega 64 (gfx900, 8.0 GB) |
 | Interconnect | No NVLink, no CUDA P2P (GeForce, PHB topology); all cross-GPU traffic host-staged. One 3080 on PCIe Gen4 x4 at ~6.5 GB/s host-staged DMA against ~13-14 GB/s for the other two. Cross-host: 40G RoCE for data, 1 GbE for the control plane. |
 | Known state | Clock pinning refused by the driver. One 3080 in software thermal slowdown at 85-87 C for part of the measurements, 1719-1840 MHz against 1920 MHz on the identical card. |
 
@@ -110,36 +110,163 @@ geometries.
 
 ### Combinations run on hardware
 
-| Model / format | Configuration | Status and reference |
-|---|---|---|
-| Qwen3.6-27B FP8 | TP=3 on 5090 + 2x 3080, uneven TP, uneven DCP, NEXTN/MTP k=3, flashinfer, CUDA graphs | Boot-checked |
-| Qwen3.6-27B FP8 | TP=3, uneven DCP on Triton against a DCP-off ground truth, greedy, no speculation | Cross-checked — byte-identical on the short-code prompt |
-| Qwen3.6-27B FP8 | TP=3, uneven DCP, chain speculative verify, Triton against flashinfer, CUDA graphs | Cross-checked — token ids identical on all three short prompts, accept length in the same band |
-| Qwen3.6-27B FP8 | TP=3, NEXTN k=3, session KV spill with two co-resident sessions | Boot-checked |
-| Qwen3.6-27B AWQ-BF16-INT4 | TP=3, uneven TP/DCP + HiCache (host-RAM L2, file L3), 8 concurrent requests | Boot-checked — 8/8 hit, restore deterministic |
-| Qwen3.6-27B AWQ-BF16-INT4 | TP=3, uneven TP + INT4 group alignment | Boot-checked |
-| Qwen3.6-27B GGUF `UD-Q6_K_XL` + `mmproj` | TP=3, uneven TP, NEXTN/MTP, CUDA graphs | Boot-checked |
-| Qwen3.6-27B Q8-class GGUF | TP=3, uneven TP, MMQ decode threshold, CUDA graphs | Boot-checked |
-| Qwen3.6-27B GGUF `Q3_K_M` | TP=3, uneven TP + hibernate across process exit | Boot-checked |
-| Qwen3.6-27B GGUF `Q4_K_M`…`Q8_0` incl. `Q6_K` | TP=2 and TP=3, uneven TP | Boot-checked — greedy-deterministic |
-| Qwen3.6-27B GGUF `UD-Q6_K_XL` | TP=4 co-located on 3 cards, two ranks sharing one physical GPU | Boot-checked |
-| Qwen3.6-35B-A3B FP8 | TP=3 with 2 kv-heads: replicated KV on all 10 global layers + token-sharded DCP, MTP, CUDA graphs | Boot-checked |
-| Qwen3.6-35B-A3B FP8 | TP=3, uneven TP + `--rank-kv-ratio capacity`; separately + HiCache file L3 | Boot-checked; HiCache restore Cross-checked — greedy ids identical cold against restored |
-| Qwen3.6-35B-A3B FP8 | TP=3 mixed-architecture: fp8 fused MoE on sm120, Marlin W8A16 fallback on the sm86 ranks | Boot-checked — kernel-level cosine >= 0.99998 |
-| Qwen3.6-35B-A3B AWQ-4bit | single node, ctx 131072: solo prefill at TP=1 on the 5090 + decode at uneven TP=3 `1,3,3` weighted DCP, GDN state handoff | Boot-checked — byte-identical to the same build with disaggregation off |
-| Qwen3.6-35B-A3B AWQ-4bit | TP=3, uneven TP + uneven DCP + MoE expert offload | Cross-checked — 32/32 tokens identical to a TP=1 run |
-| Qwen3.5-122B-A10B GPTQ-Int4 | TP=3 + 108 GiB host RAM, uneven TP + uneven DCP + MoE expert offload | Boot-checked — self-deterministic 5/5; not bit-identical to the no-offload case, since Marlin-Int4 tiling reduces in a different order |
-| Gemma-4-31B-it int4-AutoRound | TP=1 and TP=3, uneven TP on an SWA hybrid | Boot-checked |
-| Gemma-4-31B-it int4-AutoRound | TP=3, uneven TP + EAGLE3 speculation | Cross-checked — 4/4 temp-0 probes byte-identical to the no-speculation oracle |
-| Gemma-4-31B-it int4-AutoRound | TP=3, SWA-DCP with `--swa-pool-sizing cap`, CUDA graphs; needle ~3k tokens beyond the 1024-token window | Cross-checked — byte-identical to a TP=1 solo-5090 oracle |
-| Gemma-4-31B-it GGUF `Q4_K_M` | TP=1 on the 5090 and TP=3, GGUF adapter + uneven TP | Boot-checked |
-| Gemma-4-26B-A4B-it W4A16 | TP=1, MoE SWA-hybrid bring-up | Boot-checked — 3.6k needle retrieved |
-| Llama-3.1-8B bf16 | TP=2 (5090 head + 3080 worker), weightless-KV lane + EAGLE3 chain speculation topk 1 + solo draft, CUDA graphs | Boot-checked; the lane by itself Cross-checked against a TP=1 solo oracle |
-| Llama-3.1-8B bf16 | TP=5 across two hosts, 5 cards, 4 architecture classes, ratio 4,3,3,2,1, EAGLE3 split and solo arms | Boot-checked — prose byte-identical to solo; code and mixed diverge by reduction order |
-| Qwen3.6-27B FP8 | TP=4 across two hosts over RDMA, uneven TP 6,4,4,2 + uneven DCP + NEXTN 3 + solo draft on the vendor-neutral transport, eager | Boot-checked |
-| Qwen3.5-4B fp16 | mixed-vendor TP=2 (2080 Ti + Vega 64), Triton, eager, `gloo` and `device` transports, even 2/2 and uneven 3,1 | Cross-checked — byte-exact against `torch.distributed`; model-scale byte-identical between transports on all four cells |
-| Qwen3.5-4B-FP8-dynamic | solo Vega 64, solo 2080 Ti, mixed TP=2; fp8 W8A16 dequant fallback | Cross-checked — byte-identical, solo runs as oracle |
-| Qwen2.5-1.5B, Qwen3-0.6B, Qwen3.5-2B | replicated-KV geometry, DCP and co-location falsifiers across Triton/flashinfer and NCCL/gloo | Boot-checked |
+Each row is one configuration and carries what was measured for it. A blank cell means the quantity
+was not measured for that row. Values inside the run-to-run spread are marked in place. Repeat runs
+of one setup are averaged, with the count inline; separate rows are used only where a run differs
+decisively — topology, format, speculative state, or a feature on against off.
+
+#### Qwen3.6-27B FP8
+
+| Configuration | Status | Throughput | `max_total_num_tokens` | Sessions | Other measured |
+|---|---|---|---|---|---|
+| TP=3 on 5090 + 2x 3080, uneven TP, uneven DCP, NEXTN/MTP k=3, flashinfer, CUDA graphs, no additional flags | Boot-checked | — | 98,328 | 1 | per-rank budgets `[26107,18280,18280]` MiB; ownership `[18,23,23]`; accept 3.69 / 2.82 / 3.28 |
+| same, bench boot | Boot-checked | — | 886,336 | 1 | — |
+| same, capacity KV split `[2,3,3]` | Boot-checked | 78.27 / 69.01 / 73.26 tok/s code / prose / mixed; round rate 26.298 / 26.101 / 25.900 per s | 98,328 | 1 | — |
+| same, capacity KV split `[2,3,3]` | Boot-checked | 149.28 / 121.78 / 130.44 tok/s aggregate; round rate 46.686 / 46.089 / 46.382 per s | 98,328 | 2 | — |
+| same, bandwidth KV split `[2,1,1]` | Boot-checked | 91.33 / 66.81 / 74.42 tok/s; round rate 27.035 / 25.831 / 26.155 per s — in the spread against `[2,3,3]` | 98,328 | 1 | over the six single- and dual-session points: round rate mean +0.67%, sd 1.74%, range -1.62 to +2.80%; tok/s mean +3.65%, sd 7.17% |
+| same, bandwidth KV split `[2,1,1]` | Boot-checked | 159.09 / 123.27 / 129.19 tok/s aggregate; round rate 47.715 / 46.403 / 45.631 per s — in the spread | 98,328 | 2 | — |
+| TP=3 uneven DCP, flashinfer, bs=1, ctx 131072, speculation off with `ignore_eos`, 120,420 resident tokens, capacity split `[2,3,3]` | Boot-checked | step 28.530 ms, depth term 2.2955 ms (mean of 3 cold boots; A-vs-A floor 1.07%) | 393,228 | 1 | — |
+| same, bandwidth split `[2,1,1]` | Boot-checked | step 27.813 ms (-2.51%), depth term 1.7324 ms (-24.5%, t = -17.85) (mean of 3 cold boots) | 393,228 | 1 | raw KV headroom +2.3% |
+| TP=3 uneven DCP, MTP, ctx 32768, capacity split | Boot-checked | 43.307 ms per verify round | 98,328 | 1 | KV rows 24,584 / 36,876 / 36,876; accept 3.871 over 155 verifies |
+| same, bandwidth split, vector `[34,15,15]` | Boot-checked | 41.523 ms per verify round (-4.12%, +4.3% tok/s); depth term -26.7% | 98,328 | 1 | KV rows 52,258 / 23,055 / 23,055; accept 3.871 over 155 verifies; raw KV headroom 842,856 -> 422,480 |
+| TP=3, `--rank-kv-ratio coupled`, context at model maximum | Boot-checked | — | 443,904 (`[30,17,17]`) | 1 | free VRAM at pool end 5.21 / 2.33 / 3.58 GB |
+| TP=3, `--rank-kv-ratio capacity`, context at model maximum | Boot-checked | within ±1% of `coupled` at shallow, 8k and 24k depth — in the spread | 563,456 (`[33,13,18]`), +26.9% | 1 | free VRAM at pool end 2.71 / 2.46 / 2.33 GB |
+| TP=3 uneven DCP, fp8 KV, CUDA graphs, bs=1, no speculation | Boot-checked | 40.3 / 40.2 tok/s code / prose | — | 1 | board power 729 W |
+| same + MTP with adaptive draft length | Boot-checked | 90.7 / 116.3 tok/s (2.25x / 2.89x) | — | 1 | accept 3.32; board power 640 W |
+| same + MTP, bs=16 | Boot-checked | 427 tok/s | — | 16 | — |
+| TP=3 uneven DCP, MTP, default vocab split | Boot-checked | 90.30 tok/s single code (mean of 19) | 98,328 | 1 | — |
+| same, `--rank-vocab-ratio 7,3,3` | Boot-checked | 95.19 tok/s single code, +5.41% (mean of 8); dual round rate +0.45 / -0.11 / +0.76% — in the spread | 98,328 | 1, 2 | — |
+| same, speculative k=4 against k=3 | Boot-checked | round rate -6.6 to -7.7% single, -13.3% dual; net tok/s +0.2 to +3.5% single, -6.00% dual | 98,331 | 1, 2 | accept +7.2 to +12.2% |
+| TP=3 uneven DCP, MTP, flashinfer, CUDA graphs, per-rank trace | Boot-checked | collective share of the decode span 252.2 of 1600 ms (15.8%) | — | 1 | bf16 all-reduce 27.7 us against a 31-37 us back-to-back floor |
+| same | Boot-checked | collective share 415.9 of 1760.9 ms (23.6%) | — | 2 | — |
+| TP=3 uneven, NEXTN k=3, session KV spill, pool 4200, prompt 1200, holder 1000 / victim 1400 new tokens, restore margin 1024, hysteresis 40 | Exp, Boot-checked | victim per verify round 41.7 ms / 76.5 tok/s on device; 113.5 / 8.8 at host floor; 37.9 / 69.8 restore transient incl. MTP backfill; 37.4 / 75.6 settled (mean of 3 boots, sd <= 1.5%) | — | 2 | victim 1400 tokens in 28.6 s; post-restore victim 76.98 / holder 76.06 tok/s; restored in 3 of 3 boots |
+| same, spill never restored | Exp, Boot-checked | victim per verify round 131.5 ms / 7.6 tok/s during spill; 91.5 / 10.9 settled alone on an otherwise empty GPU (mean of 3 boots) | — | 2 | victim 1400 tokens in 71.2 s; restored in 0 of 9 boots |
+| TP=3 uneven DCP, NEXTN topk 1, newest-by-arrival victim spilled, anti-starvation floor 8 | Exp, Boot-checked | spilled 2.75-2.77 tok/s; device-resident 53.8-57.9 tok/s against a ~85 tok/s solo baseline | — | 3 | device session retains 63-68% of solo; victim maximum inter-token gap 0.41 s; overlap occurred in 7 of 12 and 10 of 13 runs |
+| same, static tick 1 | Exp, Boot-checked | spilled 7.50 tok/s; device-resident 23.4 tok/s | — | 3 | — |
+| two-session spill choreography, headroom `H = P - 2p`, H = 1800 | Exp, Boot-checked | — | — | 2 | admission boundary between 2400 admitted and 2500 refused, i.e. `H/0.73` |
+| 3 cards, context uncapped at the model maximum 262,144, demand-driven mamba sizing at 7 slots | Boot-checked | — | 883,584 | 1 | free VRAM left over 8.40-10.50 GB; pool unchanged at `max_running_requests` 1 against 8 (149,437 against 146,024) and at ctx 32,768 against 262,144 |
+| same, stock flags, PP=3 even, 9 fixed mamba slots | Boot-checked | 28.28 tok/s decode; 1357.4 tok/s prefill | 146,024 | 1 | free VRAM left over 5.19 / 20.06 GB |
+| same, stock flags, PP=3 uneven, 14 fixed mamba slots | Boot-checked | 35.73 tok/s decode; 1495.0 tok/s prefill | 176,066 | 1 | free VRAM left over 6.58 / 16.10 GB |
+| TP=3 full feature set, 1172-token prompts, `cached_tokens=0` | Boot-checked | 91.92 tok/s decode; 1155.9 tok/s prefill at M=1, 1221.6 at M=8 (+5.7%) | — | 1, 8 | accept 3.130 |
+| TP=3, shackled identically to stock flags (no MTP, no overlap scheduler) | Boot-checked | 33.46 tok/s decode; 1426.7 tok/s prefill | — | 1 | 6.8% behind the uneven pipeline split on the parallelism axis alone |
+| stock flags, PP=3 even, 1172-token prompts | Boot-checked | 2597.6 tok/s aggregate prefill at M=8 | — | 8 | — |
+| stock flags, PP=3 uneven, 1172-token prompts | Boot-checked | 3000.8 tok/s aggregate prefill at M=8 (+101% over M=1) | — | 8 | — |
+| solo 5090, TP=1 | Boot-checked | — | — | — | no placement, out of memory |
+| TP=4 across two hosts over RDMA, uneven TP 6,4,4,2, uneven DCP, NEXTN 3 + solo draft, Triton, eager, ctx 8192, bs=1, unpipelined transport | Boot-checked | 16.38 / 15.67 / 16.54 slope tok/s code / prose / mixed (mean of 3) | — | 1 | accept 3.08 / 3.03 / 2.91; per-rank utilization 10-13% main rig, 50-55% on the 2080 Ti |
+| same, pipelined transport | Boot-checked | 17.31 / 17.57 / 18.36 slope tok/s (+5.7 / +12.1 / +11.0%) (mean of 3) | — | 1 | accept 3.08 / 3.03 / 2.91 |
+| same, pipelined + consumer-side async overlap | Boot-checked | 17.92 / 17.12 / 17.84 slope tok/s (+3.5 / -2.6 / -2.9%) — in the spread (mean of 3) | — | 1 | accept 3.08 / 3.03 / 2.91 |
+| same, pipelined + KV split toward the fastest card, 2080 Ti share 26.6% -> 12.5% | Boot-checked | 18.11 / 16.84 / 18.15 slope tok/s — in the spread (mean of 3) | — | 1 | — |
+| TP=4 across two hosts, uneven TP 3,2,2,1, decode by streaming, RDMA | Boot-checked | 28.4 / 28.6 / 27.1 tok/s | — | 1 | per-rank utilization 10-13 / 19-24 / 30-35%; uneven TP inert on both wires |
+| same, 1 GbE | Boot-checked | 7.8 / 7.7 / 7.5 tok/s | — | 1 | barrier 146.63 us; RDMA leads 14x at the barrier and 1.2x at 4 MiB |
+| TP=3, DFLASH, split draft placement, 450-token decode | Boot-checked | 74.88 / 64.66 tok/s code / prose (mean of 4) | — | 1 | draft KV 10.9 / 22.9 / 10.1 GB across the three cards |
+| TP=3, DFLASH, solo draft placement, 450-token decode | Boot-checked | 82.71 / 67.58 tok/s code / prose (mean of 4) | — | 1 | — |
+| TP=3 uneven, NEXTN, greedy, 1024 decode tokens | Boot-checked | 118.8 tok/s at ctx 4096; 95.3 at ctx 49152 (mean of 2) | — | 1 | — |
+| TP=4 co-located, DFLASH, greedy, 1024 decode tokens | Boot-checked | 125.7 tok/s at ctx 4096 (+6%); 98.6 at ctx 49152 (+3.5%) — in the spread at 49152 (mean of 2) | — | 1 | DFLASH runs 18.9-20.9% behind NEXTN in a multiturn regime |
+| TP=3, cross-algorithm bandit, one regime cell | WIP | 75.52 tok/s | — | 1 | per-switch cost ~2.5 ms |
+| TP=3, static winner of the same regime cell | Boot-checked | 89.22 tok/s | — | 1 | — |
+| TP=3, cross-algorithm lazy CUDA-graph capture | Boot-checked | — | — | 1 | 542.0 MiB released by inactive speculative-depth branches |
+| TP=3, DCP communication-fusion variants | Boot-checked | 80.5 / 80.6 / 80.85 tok/s — in the spread | — | 1 | — |
+
+#### Qwen3.6-27B AWQ-BF16-INT4
+
+| Configuration | Status | Throughput | `max_total_num_tokens` | Sessions | Other measured |
+|---|---|---|---|---|---|
+| TP=3, uneven TP, INT4 group alignment | Boot-checked | — | 563,763-798,528 across boots | 1 | — |
+| TP=3, uneven TP/DCP + HiCache, host-RAM L2 and file L3 | Boot-checked, restore deterministic | — | — | 8 | 8 of 8 requests hit |
+
+#### Qwen3.6-27B GGUF
+
+| Configuration | Status | Throughput | `max_total_num_tokens` | Sessions | Other measured |
+|---|---|---|---|---|---|
+| `Q6_K_XL` + MTP, TP=2 on 2x 3080, legacy K-quant dispatch | Boot-checked | 67.86 / 54.17 tok/s code / prose | — | 1 | — |
+| `Q6_K_XL` + MTP, TP=2 on 2x 3080, tuned K-quant kernels | Boot-checked | 88.38 / 72.22 tok/s (+30% / +33%) | — | 1 | argmax identical on 100 of 100 probes, without bit parity |
+| `Q6_K_XL` + MTP, TP=3 uneven, tuned K-quant kernels | Boot-checked | 118.01 / 98.62 tok/s code / prose | — | 1 | — |
+| `UD-Q6_K_XL` + `mmproj`, TP=3 uneven, NEXTN/MTP, CUDA graphs | Boot-checked | — | — | 1 | — |
+| `UD-Q6_K_XL`, TP=4 co-located on 3 cards | Boot-checked | — | — | 1 | — |
+| Q8-class, TP=3 uneven, 30 s window, greedy, MMQ decode threshold off | Boot-checked | 201.60 / 201.87 / 201.33 tok/s aggregate code / prose / mixed; per-request p50 25.2, p95 25.5 | — | 8 | kernel calls per rank 0 MMQ / 11320 MMVQ on every rank |
+| Q8-class, same, MMQ decode threshold on | Boot-checked | 222.93 / 221.46 / 221.33 tok/s (+10.6 / +9.7 / +9.9%); per-request p50 27.9, p95 28.3 | — | 8 | kernel calls 11320 MMQ / 0 MMVQ on the sm120 rank, 0 / 11320 on the two sm86 ranks |
+| `Q3_K_M`, TP=3 uneven, cold start | Boot-checked | — | — | 1 | ~50 s to ready; skippable transform stage ~44 s |
+| `Q3_K_M`, TP=3 uneven, hibernate restore across process exit | Boot-checked | — | — | 1 | 8-14 s to ready; transform stage a few seconds |
+| TP=3, weightless-KV lane, ownership `[6,5,5]` | Cross-checked against a TP=1 solo oracle | — | 67,000 | 1 | free VRAM 4.03 GB on the weight-holding head, 14.59 GB on the weightless workers |
+
+#### Qwen3.6-27B, format comparison under concurrency
+
+TP=3 uneven auto-performance, ctx 8192, CUDA graphs, one fixed 8-prompt set of a single content
+class, same pool in every arm.
+
+| Configuration | Status | Throughput | `max_total_num_tokens` | Sessions | Other measured |
+|---|---|---|---|---|---|
+| FP8, speculation off | Boot-checked | 37.8 / 81.7 / 156.7 / 270.7 tok/s aggregate; scaling 7.2x | 81,960 | 1 / 2 / 4 / 8 | weights 29.7 GB, 35.8 GB with the draft |
+| GGUF `UD-Q8_K_XL`, speculation off | Boot-checked | 50.2 / 91.3 / 157.3 / 203.3 tok/s aggregate; scaling 4.1x | 81,960 | 1 / 2 / 4 / 8 | weights 35.1 GB |
+| GGUF `UD-Q4_K_XL`, speculation off | Boot-checked | 65.2 / 106.8 / 153.0 / 189.3 tok/s aggregate; scaling 2.9x | 81,960 | 1 / 2 / 4 / 8 | weights 18.3 GB, 18.8 GB with the draft |
+| FP8, speculation on | Boot-checked | 74.8 / 62.5 / 53.9 / 41.7 tok/s per session | 81,960 | 1 / 2 / 4 / 8 | accept 2.37-2.63 |
+| GGUF `UD-Q8_K_XL`, speculation on | Boot-checked | 87.3 / 58.3 / 35.5 / 29.3 tok/s per session | 81,960 | 1 / 2 / 4 / 8 | accept 2.70-3.18 |
+| GGUF `UD-Q4_K_XL`, speculation on | Boot-checked | 87.8 / 54.7 / 31.3 / 26.8 tok/s per session | 81,960 | 1 / 2 / 4 / 8 | accept 2.70-3.06 |
+
+#### Qwen3.6-35B-A3B
+
+| Configuration | Status | Throughput | `max_total_num_tokens` | Sessions | Other measured |
+|---|---|---|---|---|---|
+| FP8, TP=3 with 2 kv-heads: replicated KV on all 10 global layers + token-sharded DCP, MTP, CUDA graphs | Boot-checked | — | — | 1 | — |
+| FP8, TP=3, `--rank-kv-ratio coupled` | Boot-checked | — | 1,911,488 pre-cap | 1 | — |
+| FP8, TP=3, `--rank-kv-ratio capacity` | Boot-checked | within ±1% of `coupled` at shallow, 8k and 24k depth — in the spread | 2,187,648 pre-cap, +14.4% | 1 | needles at ~7.1k and ~17.7k retrieved in every mode |
+| FP8, TP=3 + HiCache file L3 | Boot-checked; restore Cross-checked | — | — | 1 | greedy ids identical cold against restored |
+| FP8, TP=3 mixed-architecture: fp8 fused MoE on sm120, Marlin W8A16 fallback on the sm86 ranks | Boot-checked | — | — | 1 | kernel-level cosine >= 0.99998 |
+| AWQ-4bit, TP=3 + weighted DCP, fp8 KV, ctx 131072, chunked prefill 2048, flashinfer, no CUDA graphs | Boot-checked | time to first token 0.49 / 2.27 / 9.73 / 42.2 s at 2,048 / 8,192 / 32,768 / 122,880 prompt tokens (mean of 2-3, spread < 3%); warm prefill 4,022 / 3,717 / — / 3,117 tok/s; decode 15.9 tok/s at 2k ctx, 15.6 at 32k | — | 1 | — |
+| AWQ-4bit, solo prefill at TP=1 on the 5090 + decode at uneven TP=3 `1,3,3` weighted DCP, same fp8 KV and ctx | Boot-checked; byte-identical to the same build with disaggregation off | time to first token 0.15 / 0.46 / 3.44 / 18.9 s (3.3x / 4.9x / 2.8x / 2.2x) (mean of 2-3); solo prefill 20,160 / 16,100 / 10,520 / 8,090 tok/s; decode -13% at 2k ctx, -2% at 32k | — | 1 | proxy and handoff 40-60 ms; KV re-scatter 10.1 KiB per token, 1.2 GB for a 120k prompt, ~0.2 s of PCIe |
+| same, 32k prefill burst issued during a 512-token decode | Boot-checked | decode 29.27 -> 31.25 s (+6.7%); prefill burst 3.44 -> 3.54 s | — | 2 | — |
+| AWQ-4bit, TP=3, uneven TP + uneven DCP + MoE expert offload | Cross-checked against a TP=1 run | — | — | 1 | 32 of 32 tokens identical |
+
+#### Qwen3.5-122B-A10B GPTQ-Int4
+
+| Configuration | Status | Throughput | `max_total_num_tokens` | Sessions | Other measured |
+|---|---|---|---|---|---|
+| solo 5090, resident fraction 0.15 | Boot-checked | 4.8 tok/s | — | 1 | — |
+| TP=3 on 5090 + 2x 3080, 72 GB aggregate VRAM, with 108 GiB host RAM, resident fraction 0.25, eager | Boot-checked | 6.97 tok/s (+45%) | — | 1 | 64 resident + 16 scratch of 256 experts per layer, 176 offloaded; self-deterministic 5 of 5 |
+| same, graph-static | Boot-checked | 10.61 tok/s | — | 1 | — |
+| same, graph + hot-set | Boot-checked | 16.34 tok/s | — | 1 | — |
+
+#### Gemma-4
+
+| Configuration | Status | Throughput | `max_total_num_tokens` | Sessions | Other measured |
+|---|---|---|---|---|---|
+| 31B-it int4-AutoRound, TP=1 and TP=3 uneven, Triton, bf16 KV | Boot-checked | — | — | 1 | — |
+| 31B-it int4-AutoRound, TP=3 uneven + EAGLE3 | Boot-checked | — | — | 1 | 4 of 4 temp-0 probes byte-identical to a no-speculation run; not a valid cross-check, see legend |
+| 31B-it int4-AutoRound, TP=3, SWA-DCP with `--swa-pool-sizing cap`, CUDA graphs | Cross-checked against a TP=1 solo-5090 oracle | — | — | 1 | needle planted ~3k tokens beyond the 1024-token window retrieved byte-identically |
+| 31B-it GGUF `Q4_K_M`, TP=1 on the 5090 | Boot-checked | ~61 tok/s | — | 1 | self-deterministic |
+| 31B-it GGUF `Q4_K_M`, TP=3 uneven | Boot-checked | — | — | 1 | — |
+| 26B-A4B-it W4A16, TP=1 | Boot-checked | — | — | 1 | 3.6k needle retrieved |
+
+#### Llama-3.1-8B bf16
+
+| Configuration | Status | Throughput | `max_total_num_tokens` | Sessions | Other measured |
+|---|---|---|---|---|---|
+| TP=2, 5090 head + 3080 weightless worker, weightless-KV lane, CUDA graphs, ctx 2048, no speculation | Cross-checked against a TP=1 solo oracle | 71.67 / 69.52 / 71.80 / 71.53 tok/s one_token / code / prose / mixed; 13.95 / 14.38 / 13.93 / 13.98 ms per decode step (mean of 2 cold boots) | 16,384, configured cap | 1 | — |
+| same + EAGLE3 chain speculation, topk 1, 3 steps, 4 draft tokens, solo draft | Boot-checked | 80.67 / 120.05 / 87.20 / 86.18 tok/s (+12.6 / +72.7 / +21.5 / +20.5%); 17.06 / 17.62 / 17.69 / 17.27 ms per verify round (mean of 2 cold boots) | 16,384, configured cap | 1 | accept 1.376 / 2.116 / 1.542 / 1.488; a verify round costs 1.22-1.27 decode steps and returns 1.38-2.12 tokens |
+| same lane, decode eager | Boot-checked | 13.1 tok/s | — | 1 | — |
+| same lane, decode graph-captured | Boot-checked | 63.5 tok/s | — | 1 | — |
+| same lane, intra-rig DCP collective overlap | Boot-checked | -0.17 to +3.12% across the four content classes — in the spread | — | 1 | — |
+| TP=5 across two hosts, ratio 4,3,3,2,1 over 5090 / 3080 / 3080 / 2080 Ti / Vega 64, ctx 4096, eager, host-staged transport, no DCP, no speculation | Boot-checked; prose byte-identical to solo | 4.32 / 4.73 / 4.82 tok/s decode; 61-63 tok/s prefill | capped at 4096 | 1 | weights per rank 4.41 / 3.55 / 3.55 / 2.46 / 1.66 GB |
+| same, EAGLE3 split draft, ctx 2048 | Boot-checked | 4.88 / 4.58 / 5.39 tok/s decode; 59-60 tok/s prefill — in the spread against solo draft | 132,871 | 1 | accept 1.36 |
+| same, EAGLE3 solo draft, ctx 2048 | Boot-checked | 4.39 / 5.21 / 4.99 tok/s decode; 62-63 tok/s prefill — in the spread | 133,802 | 1 | accept 1.36 |
+| solo 5090, TP=1 | Boot-checked | 76 tok/s decode | — | 1 | — |
+
+#### Qwen3.5-4B and small vehicles
+
+| Configuration | Status | Throughput | `max_total_num_tokens` | Sessions | Other measured |
+|---|---|---|---|---|---|
+| Qwen3.5-4B fp16, mixed-vendor TP=2 on 2080 Ti + Vega 64, Triton, eager, even 2/2, host-staged `gloo` | Cross-checked against `torch.distributed` | 10.28 tok/s decode; 540.5 tok/s prefill | — | 1 | — |
+| same, even 2/2, on-GPU `device` transport | Cross-checked; byte-identical to `gloo` | 14.07 tok/s decode (+37%); 786.2 tok/s prefill (+45%) | — | 1 | — |
+| same, uneven 3,1, `gloo` | Cross-checked | 11.13 tok/s decode; 604.7 tok/s prefill | — | 1 | — |
+| same, uneven 3,1, `device` | Cross-checked; byte-identical to `gloo` | 16.51 tok/s decode (+48%); 982.0 tok/s prefill (+62%) | — | 1 | — |
+| Qwen3.5-4B-FP8-dynamic, mixed-vendor TP=2, W8A16 dequant fallback | Cross-checked; byte-identical to the solo oracles | 12.67 tok/s decode (-23%); 966 tok/s prefill | — | 1 | — |
+| Qwen3.5-4B-FP8-dynamic, solo 2080 Ti | Cross-checked | 15.23 tok/s decode | — | 1 | — |
+| Qwen3.5-4B-FP8-dynamic, solo Vega 64 | Cross-checked | — | — | 1 | weights 6.27 GB with 1.07 GB free; fp16 needs 8.8 GB and has no placement |
+| Qwen3.5-4B fp16, solo Vega 64, external Triton port | Boot-checked | 10,189-token prompt prefilled in 5.4 s, 1879 tok/s | — | 1 | the previous torch-native path ran out of memory from ~4k |
+| Qwen-0.5B fp16, solo 2080 Ti, greedy | Boot-checked | 48.9 tok/s | — | 1 | — |
+| Qwen-0.5B fp16, solo Vega 64, greedy | Boot-checked | 25.7 tok/s | — | 1 | — |
+| Qwen2.5-1.5B, TP=4 / DCP=2 | Boot-checked | — | 525,897 | 1 | — |
+| Qwen3-0.6B, Qwen3.5-2B, DCP and co-location falsifiers across Triton/flashinfer and NCCL/gloo | Boot-checked | — | — | 1 | — |
 
 **Without a hardware boot:** fast-lane priority scheduling (`Built` only); solo draft placement,
 which has no dedicated boot and runs only inside the weightless-lane, cross-host TP=4 and TP=5
@@ -147,125 +274,20 @@ configurations above; cross-vendor CUDA-graph capture; MoE-model hibernation (no
 KV spill coinciding with a speculative tick; three co-resident spilled sessions; tree speculation at
 `--speculative-eagle-topk > 1` under weighted DCP (gated off); the `fp8.py` `Fp8Config` family on
 the capability probe. Gemma-4 does not run under uneven DCP, since `SWAKVPool` carries no DCP mask,
-and it refuses the flashinfer backend, so its rows are Triton with bf16 KV.
-
-## Measured numbers
-
-### Throughput and per-round cost
-
-| Model / format | Configuration | Metric | Value |
-|---|---|---|---|
-| Llama-3.1-8B bf16 | TP=2, 5090 head + 3080 weightless worker, weightless-KV lane, EAGLE3 topk 1 / 3 steps / 4 draft tokens, solo draft, CUDA graphs, 256 tokens per run, 2 cold boots per arm, against the same lane without speculation | tok/s: one_token / code / prose / mixed | 71.67 -> 80.67 (+12.6%) / 69.52 -> 120.05 (+72.7%) / 71.80 -> 87.20 (+21.5%) / 71.53 -> 86.18 (+20.5%) |
-| Llama-3.1-8B bf16 | same | verify-round cost in plain decode steps; tokens returned per round | 1.22-1.27; 1.38-2.12 |
-| Llama-3.1-8B bf16 | TP=2 weightless-KV lane, decode graph-captured against eager | tok/s | 13.1 -> 63.5 |
-| Qwen3.5-122B-A10B GPTQ-Int4 | TP=3 on 5090 + 2x 3080, 108 GiB host RAM, 64 resident + 16 scratch of 256 experts/layer, eager, against the largest placement without offload (solo 5090) | tok/s | 4.8 -> 6.97 (+45%) |
-| Qwen3.5-122B-A10B GPTQ-Int4 | same, graph-static / graph + hot-set | tok/s | 10.61 / 16.34 |
-| Qwen3.6-27B FP8 | TP=3 uneven DCP, flashinfer, bs=1, ctx 131072, 120,420 resident tokens, KV-token split `[2,1,1]` against capacity split `[2,3,3]`, speculation off with `ignore_eos`, 6 interleaved cold boots | depth term of step time | 2.2955 -> 1.7324 ms, -24.5% (t = -17.85; A-vs-A floor 1.07%) |
-| Qwen3.6-27B FP8 | same | step time | 28.530 -> 27.813 ms (-2.51%) |
-| Qwen3.6-27B FP8 | same with MTP; accept length 3.871 and verify count 155 identical in both arms | depth term; time per verify round | -26.7%; 43.307 -> 41.523 ms (-4.12%, +4.3% tok/s) |
-| Qwen3.6-27B FP8 | TP=3 uneven DCP, fp8 KV, CUDA graphs, bs=1, MTP with adaptive draft length against no speculation, accept 3.32 | tok/s: code / prose | 40.3 -> 90.7 (2.25x) / 40.2 -> 116.3 (2.89x) |
-| Qwen3.6-27B FP8 | same | board power | 729 -> 640 W |
-| Qwen3.6-27B Q8-class GGUF | TP=3 uneven, M=8, 30 s window, greedy, MMQ decode threshold on against off | tok/s: code / prose / mixed | 201.60 -> 222.93 (+10.6%) / 201.87 -> 221.46 (+9.7%) / 201.33 -> 221.33 (+9.9%) |
-| Qwen3.6-27B Q8-class GGUF | same | per-request rate p50 / p95 | 25.2 -> 27.9 / 25.5 -> 28.3 |
-| Qwen3.6-27B Q8-class GGUF | same | kernel calls per rank, MMQ / MMVQ | rank 0 (sm120) 11320 / 0; ranks 1-2 (sm86) 0 / 11320 |
-| Qwen3.6-27B `Q6_K_XL` GGUF + MTP | TP=2 on 2x 3080, tuned K-quant kernels against the legacy dispatch | tok/s: code / prose; argmax agreement | 67.86 -> 88.38 (+30%) / 54.17 -> 72.22 (+33%); 100/100 probes identical, not bit-parity |
-| Qwen3.6-27B `Q6_K_XL` GGUF + MTP | TP=3 uneven, tuned | tok/s: code / prose | 118.01 / 98.62 |
-| Qwen3.5-4B fp16 | mixed-vendor TP=2 (2080 Ti + Vega 64), Triton, eager, on-GPU `device` transport against host-staged `gloo`, slope method | decode tok/s: even 2/2 / uneven 3,1 | 10.28 -> 14.07 (+37%) / 11.13 -> 16.51 (+48%) |
-| Qwen3.5-4B fp16 | same | prefill tok/s: even 2/2 / uneven 3,1 | 540.5 -> 786.2 (+45%) / 604.7 -> 982.0 (+62%) |
-| Qwen3.6-27B FP8 | TP=4 across two hosts over RDMA, uneven TP 6,4,4,2, NEXTN 3 + solo draft, Triton, eager, ctx 8192, bs=1, 3 reps, pipelined transport against unpipelined | slope tok/s: code / prose / mixed | 16.38 -> 17.31 (+5.7%) / 15.67 -> 17.57 (+12.1%) / 16.54 -> 18.36 (+11.0%) |
-| Qwen3.6-27B FP8 | same | accept length per content class, both arms | 3.08 / 3.03 / 2.91, identical |
-| Qwen3.6-27B FP8 | same, consumer-side async collective overlap against no overlap | slope tok/s: code / prose / mixed | 17.92 / 17.12 / 17.84, i.e. +3.5% / -2.6% / -2.9% — in the spread |
-| Qwen3.6-27B FP8 | same, KV split moved toward the fastest card (2080 Ti share 26.6% -> 12.5%) | slope tok/s: code / prose / mixed | 18.11 / 16.84 / 18.15 — in the spread |
-| Qwen3.6-27B FP8 | same, per-rank GPU utilization sampled in the measure window | utilization | main-rig ranks 10-13%; 2080 Ti 50-55% |
-| Qwen3.6-27B FP8 | TP=4 across two hosts, RDMA against 1 GbE, decode measured by streaming | tok/s, three runs | 7.8 / 7.7 / 7.5 -> 28.4 / 28.6 / 27.1 (3.6-3.7x) |
-| Qwen3.6-27B FP8 | same wire, collective latency | barrier / 4 MiB | 14x / 1.2x |
-| Llama-3.1-8B bf16 | TP=5 across two hosts, ratio 4,3,3,2,1 over 5090 / 3080 / 3080 / 2080 Ti / Vega 64, ctx 4096, eager, host-staged transport, no DCP, no speculation | decode tok/s: code / prose / mixed | 4.32 / 4.73 / 4.82 |
-| Llama-3.1-8B bf16 | solo 5090 | decode tok/s; TP=5 as a share of it | 76; 5.7-6.3% |
-| Llama-3.1-8B bf16 | TP=5, EAGLE3 split against EAGLE3 solo, ctx 2048, accept 1.36 | decode tok/s | 4.88 / 4.58 / 5.39 against 4.39 / 5.21 / 4.99 — in the spread |
-| Qwen3.6-27B FP8 | TP=3, DFLASH, split against solo draft placement, identical prompts, 450-token decode, 4 reps, 16/16 valid | tok/s: code / prose | 74.88 against 82.71 (-9.5%) / 64.66 against 67.58 (-4.3%) |
-| Qwen3.6-27B FP8 | DFLASH against NEXTN, greedy, 1024 decode tokens, mean of 2 runs; the arms also differ in placement (NEXTN at uneven TP=3, DFLASH at TP=4 co-located) | tok/s at ctx 4096 | 118.8 -> 125.7 (+6%) |
-| Qwen3.6-27B FP8 | same, ctx 49152 | tok/s | 95.3 -> 98.6 (+3.5%) — in the spread |
-| Qwen3.6-27B FP8 | same, multiturn regime | tok/s | DFLASH 18.9-20.9% below NEXTN |
-| Qwen3.6-27B FP8 | TP=3, cross-algorithm bandit against the static winner of the same regime cell | tok/s; per-switch cost | 89.22 -> 75.52; ~2.5 ms |
-| Qwen3.5-4B-FP8-dynamic | mixed TP=2 (2080 Ti + Vega 64), fp8 W8A16 dequant fallback against fp16 | decode tok/s; prefill tok/s | 16.51 -> 12.67 (-23%); 982 -> 966 |
-| Qwen3.5-4B-FP8-dynamic | solo 2080 Ti | decode tok/s | 15.23 |
-| Qwen-0.5B fp16 | solo TP=1 anchors, greedy | decode tok/s: 2080 Ti / Vega 64 | 48.9 / 25.7 |
-| Qwen3.6-27B GGUF `Q3_K_M` | TP=3 uneven, hibernate restore against cold start | time to ready | ~50 s -> 8-14 s |
-| Qwen3.6-27B GGUF `Q3_K_M` | same, skippable transform stage only | time | ~44 s -> a few seconds |
-| Qwen3.6-27B FP8 | TP=3 uneven DCP, MTP, `--rank-vocab-ratio 7,3,3` against default; baseline n=19, arm n=8 | single-session tok/s, code; dual-session round rate | 90.30 -> 95.19 (+5.41%); +0.45 / -0.11 / +0.76% — in the spread |
-| Qwen3.6-27B FP8 | TP=3 uneven DCP, speculative k=4 against k=3 | accept length; round rate single / dual; net tok/s single / dual | +7.2 to +12.2%; -6.6 to -7.7% / -13.3%; +0.2 to +3.5% / -6.00% |
-| Qwen3.6-27B FP8 | TP=3, KV-token split against capacity split with content not pinned, six points single and dual | round rate; tok/s | mean +0.67%, sd 1.74%, range -1.62 to +2.80% — in the spread; mean +3.65%, sd 7.17% — in the spread |
-| Llama-3.1-8B bf16 TP=2; Qwen3.6-27B FP8 TP=3 | intra-rig DCP collective overlap; DCP communication-fusion variants | tok/s | -0.17 to +3.12% across four content classes; 80.5 / 80.6 / 80.85 — in the spread |
-
-At greedy sampling the KV-token split changes which rank owns which context token, hence the
-LSE-merge partition and the sampled token at the first near-tie; arms therefore emit different text
-unless content is pinned. The depth-term rows above are the pinned measurement.
-
-### Capacity
-
-| Model / format | Configuration | Metric | Value |
-|---|---|---|---|
-| Qwen3.6-27B FP8 | TP=3, `--rank-kv-ratio capacity` against `coupled`, context at model maximum | `max_total_num_tokens` | 443,904 (`[30,17,17]`) -> 563,456 (`[33,13,18]`), +26.9% |
-| Qwen3.6-27B FP8 | same | free VRAM per rank at pool end | 5.21 / 2.33 / 3.58 GB -> 2.71 / 2.46 / 2.33 GB |
-| Qwen3.6-27B FP8 | same, shallow / 8k / 24k depth | decode tok/s | within ±1% |
-| Qwen3.6-35B-A3B FP8 | TP=3, `capacity` against `coupled`; the mamba ceiling binds first at these settings | `max_total_num_tokens`, pre-cap | 1,911,488 -> 2,187,648, +14.4% |
-| Qwen3.6-27B FP8 | 3 cards, context uncapped at model maximum 262,144; demand-driven mamba sizing against fixed slot counts, one binary | KV pool | 883,584 tokens at 7 demand-driven slots; 146,024 at 9 fixed slots; 176,066 at 14 fixed slots |
-| Qwen3.6-27B FP8 | same | free VRAM left over | 8.40-10.50 GB against 5.19-20.06 GB |
-| Qwen3.6-27B FP8 | same, binder candidates eliminated by measurement | KV pool at `max_running_requests` 1 against 8; at ctx 32,768 against 262,144 | 149,437 against 146,024; unchanged |
-| Qwen3.6-27B FP8 | TP=3 uneven DCP, bandwidth-oriented KV split against capacity split, deep no-speculation point | `max_total_num_tokens`; raw KV headroom | 393,228 in both arms; +2.3% |
-| Qwen3.6-27B FP8 | same, speculation-on reference at ctx 32,768, where the hybrid mamba cap conceals it | raw KV headroom | 842,856 -> 422,480 (-50%) |
-| Qwen3.6-27B FP8 | TP=3, bandwidth-oriented split against capacity split | per-rank KV rows; `max_total_num_tokens` | 52,258 / 23,055 / 23,055 against 24,584 / 36,876 / 36,876; 98,328 in both |
-| Qwen3.6-27B FP8 | TP=3 uneven, default regression boot with no new flags | per-rank budgets; ownership; `max_total_num_tokens`; accept | `[26107,18280,18280]` MiB; `[18,23,23]`; 98,328; 3.69 / 2.82 / 3.28 |
-| Qwen3.6-27B FP8 | cross-algorithm lazy CUDA-graph capture, inactive speculative-depth branches | VRAM released | 542.0 MiB |
-| Qwen3.5-122B-A10B GPTQ-Int4 | TP=3 on 3 cards, 72 GB aggregate VRAM, 108 GiB host RAM | experts per layer: resident / scratch / offloaded | 64 / 16 / 176 of 256 |
-| Qwen3.5-122B-A10B FP8 | same rig | pinned host pool required against available | ~116 GiB against 108 GiB |
-| Qwen3.6-27B | TP=3, same pool of 81,960 tokens | weights in VRAM: FP8 / GGUF Q8 / GGUF Q4 | 29.7 GB (35.8 with draft) / 35.1 GB / 18.3 GB (18.8) |
-| Qwen3.5-4B | solo Vega 64, 8.0 GB | weights: fp16 / FP8-dynamic | 8.8 GB, no placement / 6.27 GB with 1.07 GB free |
-| Qwen3.6-27B GGUF | TP=3, weightless-KV lane, ownership `[6,5,5]` | `max_total_num_tokens`; free VRAM head / workers | 67,000; 4.03 GB / 14.59 GB |
-| Qwen3.6-27B FP8 | TP=3, DFLASH split against solo draft placement | draft KV per card | 10.9 / 22.9 / 10.1 GB against concentration on one rank |
-| Llama-3.1-8B bf16 | TP=5, ratio 4,3,3,2,1; the context ceiling there is the drafter's `max_position_embeddings`, not memory | weights per rank | 4.41 / 3.55 / 3.55 / 2.46 / 1.66 GB |
-| Llama-3.1-8B bf16 | TP=5, no speculation at ctx 4096 against EAGLE3 split / solo at ctx 2048 | KV pool | capped 4096 against 132,871 / 133,802 uncapped |
-| Qwen3.6-35B-A3B AWQ | fp8 KV, single-node prefill/decode split | KV re-scatter per token; for a 120k prompt | 10.1 KiB; 1.2 GB, ~0.2 s of PCIe |
-
-### Concurrent sessions and time to first token
-
-| Model / format | Configuration | Metric | Value |
-|---|---|---|---|
-| Qwen3.6-35B-A3B AWQ | fp8 KV, ctx 131,072 both sides, no CUDA graphs, chunked prefill 2048; solo prefill on the 5090 + decode at uneven TP=3 `1,3,3` weighted DCP, against both phases distributed; 2-3 runs per cell, spread < 3% | time to first token at 2,048 / 8,192 / 32,768 / 122,880 prompt tokens | 0.49 -> 0.15 s (3.3x) / 2.27 -> 0.46 s (4.9x) / 9.73 -> 3.44 s (2.8x) / 42.2 -> 18.9 s (2.2x) |
-| Qwen3.6-35B-A3B AWQ | same | proxy and handoff overhead; decode at 2k / 32k context | 40-60 ms; -13% / -2% |
-| Qwen3.6-35B-A3B AWQ | 32k prefill burst issued during a 512-token decode | decode wall clock; prefill burst | 29.27 -> 31.25 s (+6.7%); 3.44 -> 3.54 s |
-| Qwen3.6-27B FP8 | TP=3 uneven, NEXTN k=3, pool 4200, prompt 1200, holder 1000 / victim 1400 new tokens, restore margin 1024, hysteresis 40, two co-resident sessions; mean of 3 boots, boot-to-boot sd <= 1.5% | victim ms per verify round: on device / at host floor / restore transient incl. MTP backfill / settled after restore | 41.7 / 113.5 / 37.9 / 37.4 |
-| Qwen3.6-27B FP8 | same | victim tok/s in the same four windows | 76.5 / 8.8 / 69.8 / 75.6 |
-| Qwen3.6-27B FP8 | same, when the spill is never restored: during spill / settled alone on an otherwise empty GPU | victim ms per verify round; tok/s | 131.5 / 91.5; 7.6 / 10.9 |
-| Qwen3.6-27B FP8 | same, victim request of 1400 tokens, restored against remaining at the host floor | wall clock | 28.6 s against 71.2 s (2.49x) |
-| Qwen3.6-27B FP8 | same, after restore | tok/s: victim / holder | 76.98 / 76.06 |
-| Qwen3.6-27B FP8 | same, readiness gated on free plus radix-evictable tokens against the free list alone | boots in which the victim restored | 3 of 3 against 0 of 9 |
-| Qwen3.6-27B FP8 | two-session choreography, headroom `H = P - 2p`, H = 1800 | admitted sum of new tokens | 2400 admitted, 2500 refused (`H/0.73`) |
-| Qwen3.6-27B FP8 | TP=3 uneven DCP, NEXTN topk 1, three sessions with the newest-by-arrival victim spilled, anti-starvation floor 8 | tok/s: spilled / concurrent device-resident / solo baseline | 2.75-2.77 / 53.8-57.9 / ~85, i.e. the device session retains 63-68% of solo |
-| Qwen3.6-27B FP8 | same | victim maximum inter-token gap; runs in which overlap occurred | 0.41 s; 7 of 12 and 10 of 13 |
-| Qwen3.6-27B FP8 | anti-starvation floor 8 against static tick 1 | tok/s: spilled / device | 2.75 / 57.9 against 7.50 / 23.4 |
-| Qwen3.6-27B FP8 / GGUF Q8 / GGUF Q4 | TP=3 uneven auto-performance, ctx 8192, CUDA graphs, speculation off, one fixed 8-prompt set of a single content class | aggregate tok/s at 1 / 2 / 4 / 8 sessions | FP8 37.8 / 81.7 / 156.7 / 270.7; Q8 50.2 / 91.3 / 157.3 / 203.3; Q4 65.2 / 106.8 / 153.0 / 189.3 |
-| Qwen3.6-27B FP8 / GGUF Q8 / GGUF Q4 | same | scaling 1 -> 8 sessions | 7.2x / 4.1x / 2.9x |
-| Qwen3.6-27B FP8 / GGUF Q8 / GGUF Q4 | same, speculation on | per-session tok/s at 1 / 2 / 4 / 8; accept length | 74.8 / 62.5 / 53.9 / 41.7; 87.3 / 58.3 / 35.5 / 29.3; 87.8 / 54.7 / 31.3 / 26.8. GGUF drafts better, 2.70-3.18 against FP8 2.37-2.63, and is still 30-42% slower at 4-8 sessions |
-| Qwen3.6-27B FP8 | TP=3, single against dual session | aggregate tok/s: code / prose / mixed | 78.27 -> 149.28 / 69.01 -> 121.78 / 73.26 -> 130.44 |
-| Qwen3.6-27B FP8 | TP=3 | decode tok/s at bs=1 / bs=16 | 40 / 427 |
-| Qwen3.6-27B FP8 | 8 simultaneous 1172-token prompts, `cached_tokens=0` on every request, full feature set against stock flags with an uneven pipeline split | aggregate prefill tok/s | 1221.6 against 3000.8 |
-| Qwen3.6-27B FP8 | same, M=1 against M=8 | aggregate prefill tok/s | 1155.9 -> 1221.6 (+5.7%) against 1495.0 -> 3000.8 (+101%) |
-| Qwen3.6-27B FP8 | bs=1 decode, full feature set against stock flags; and with both sides shackled identically (no MTP, no overlap scheduler) | tok/s | 91.92 against 28.28; 33.46 against 35.73, i.e. 6.8% in the pipeline split's favour |
-| Qwen3.6-27B FP8 | TP=3 uneven DCP, MTP, flashinfer, CUDA graphs, per-rank trace decomposed into communication against rank wait | collective share of the decode span: single / dual session | 252.2 of 1600 ms (15.8%) / 415.9 of 1760.9 ms (23.6%) |
-| Qwen3.6-27B FP8 | same | bf16 all-reduce against a back-to-back microbenchmark floor | 27.7 us against 31-37 us |
-| Qwen3.5-4B fp16 | solo Vega 64, server run, after the external Triton port; the previous torch-native path ran out of memory from ~4k | 10,189-token prompt | 5.4 s (1879 tok/s) |
+and it refuses the flashinfer backend. Throughput under SWA-DCP has not been taken.
 
 ### Measurement
 
 Raw tok/s tracks output content on this rig (r = 0.90) and carries a 2.6-4.2% boot-to-boot spread —
-2.60% is the worst directly measured excursion — against 0.09-0.85% for milliseconds per verify round, so any claim finer than roughly 3.5% between
-two arms is stated on the round-time axis, and the detection limit is established A-vs-A before the
-arms are compared. Decode is taken as a slope over two generation lengths at one prompt, or by
-streaming wherever a repeated prompt would be served from the prefix cache. Values inside the
-spread are marked and are not counted as gains. Two limits apply to individual rows: the
-concurrency sweep covers one content class, so only its arm-against-arm statement is load-bearing;
-and the energy figures are single runs measuring GPU board power alone.
+2.60% is the worst directly measured excursion — against 0.09-0.85% for milliseconds per verify
+round, so any claim finer than roughly 3.5% between two arms is stated on the round-time axis, and
+the detection limit is established A-vs-A before the arms are compared. Decode is taken as a slope
+over two generation lengths at one prompt, or by streaming wherever a repeated prompt would be
+served from the prefix cache. Values inside the spread are marked and are not counted as gains. Two
+limits apply to individual rows: the concurrency sweep covers one content class, so only its
+arm-against-arm statement is load-bearing; and the energy figures are single runs measuring GPU
+board power alone. Transport-level and collective-level microbenchmarks, which involve no model,
+are in section 21.
 
 ---
 
