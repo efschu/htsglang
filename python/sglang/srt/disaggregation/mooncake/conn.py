@@ -268,6 +268,9 @@ class MooncakeKVManager(CommonKVManager):
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
 
+    # Transport name used in registration error messages; subclasses override.
+    _transport_name = "Mooncake"
+
     def _batch_register_checked(self, ptrs, lens, what: str):
         """Register memory regions and abort if the transport reports failure.
 
@@ -281,7 +284,7 @@ class MooncakeKVManager(CommonKVManager):
         if ret != 0:
             total_bytes = sum(lens)
             raise RuntimeError(
-                f"Mooncake memory registration failed for {what}: "
+                f"{self._transport_name} memory registration failed for {what}: "
                 f"batch_register returned {ret} for {len(ptrs)} region(s), "
                 f"{total_bytes} bytes total, first ptr="
                 f"{hex(ptrs[0]) if ptrs else 'n/a'}"
@@ -318,8 +321,9 @@ class MooncakeKVManager(CommonKVManager):
             ret = self.engine.batch_deregister(ptrs)
             if ret != 0:
                 logger.warning(
-                    "Mooncake memory deregistration failed for %s: "
+                    "%s memory deregistration failed for %s: "
                     "batch_deregister returned %s for %d region(s).",
+                    self._transport_name,
                     what,
                     ret,
                     len(ptrs),
@@ -363,7 +367,8 @@ class MooncakeKVManager(CommonKVManager):
         ret = self.engine.batch_register([ptr], [size])
         if ret != 0:
             raise RuntimeError(
-                f"Mooncake memory registration failed for staging buffer "
+                f"{self._transport_name} memory registration failed for staging "
+                f"buffer "
                 f"(ptr={hex(ptr)}, size={size} bytes): "
                 f"batch_register returned {ret}"
             )

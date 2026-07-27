@@ -81,7 +81,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
             logger.error("Ascend Transfer Engine initialization failed.")
             raise RuntimeError("Ascend Transfer Engine initialization failed.")
 
-    def batch_register(self, ptrs: List[int], lengths: List[int]):
+    def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
         except Exception:
@@ -89,6 +89,9 @@ class AscendTransferEngine(MooncakeTransferEngine):
             ret_value = -1
         if ret_value != 0:
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+        # Returning the status is part of the MooncakeTransferEngine contract:
+        # the caller decides whether an unregistered region is fatal.
+        return ret_value
 
     @staticmethod
     def _get_transfer_protocol():
