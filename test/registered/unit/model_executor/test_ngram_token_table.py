@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -11,9 +12,22 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.model_executor.ngram_token_table import (  # noqa: E402
-    update_ngram_token_table_after_sampling,
-)
+# Import shim for the #249 default-device collection leak: an earlier
+# collected module may leave ``torch.set_default_device(<accelerator>)``
+# active; this module's sglang import chain constructs tensors at import
+# time and then dies with RuntimeError on a box without that accelerator.
+# Skip the module instead of erroring; side effects on the process are
+# identical to the crash, so every other collected module keeps its fate.
+try:
+    from sglang.srt.model_executor.ngram_token_table import (  # noqa: E402
+        update_ngram_token_table_after_sampling,
+    )
+except RuntimeError as _import_err:  # pragma: no cover - leak-dependent
+    pytest.skip(
+        f"#249 default-device collection leak broke the import chain: "
+        f"{_import_err}",
+        allow_module_level=True,
+    )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
