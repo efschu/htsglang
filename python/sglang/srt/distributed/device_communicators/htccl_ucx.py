@@ -173,9 +173,19 @@ class HTCCLUcxTransport:
         self._seq = 0
         self._staging_bufs: dict[str, torch.Tensor] = {}
         self._view_cache: dict[tuple, tuple] = {}
+        # Whether copy-OUT of a staging slot may be enqueued non_blocking.
+        # See the copy-out section below; the CPU-only tests run with this
+        # False and exercise the event bookkeeping through _async_h2d_ok.
+        self._use_cuda = self.device.type == "cuda" and torch.cuda.is_available()
+        # Completion event of the last in-flight non_blocking device read OUT
+        # of a staging slot, keyed like _staging_bufs. One persistent event
+        # per key, re-recorded per read -- mirrors the event use of the gloo
+        # plane (htccl.py, _stage/ev.synchronize()).
+        self._h2d_events: dict[str, torch.cuda.Event] = {}
         # Free list for the async collectives' staging slots, keyed by
-        # power-of-two size class. See the async section below.
-        self._async_free: dict[int, list[torch.Tensor]] = {}
+        # power-of-two size class: (buffer, completion event of its last
+        # non_blocking read, or None). See the async section below.
+        self._async_free: dict[int, list[tuple]] = {}
         self._closed = False
 
         # Everything below is per-collective bookkeeping that does not depend
@@ -324,6 +334,10 @@ class HTCCLUcxTransport:
         nbytes = numel * torch.empty((), dtype=dtype).element_size()
         buf = self._staging_bufs.get(key)
         if buf is None or buf.numel() < nbytes:
+            # A still-running async read OUT of the old, smaller buffer must
+            # complete before the tensor is dropped -- freeing pinned memory
+            # under an in-flight cudaMemcpyAsync is a use-after-free.
+            self._slot_guard(key)
             pin = self.device.type == "cuda" and torch.cuda.is_available()
             buf = torch.empty(max(nbytes, 4096), dtype=torch.uint8, pin_memory=pin)
             self._staging_bufs[key] = buf
@@ -341,6 +355,90 @@ class HTCCLUcxTransport:
     def _staging(self, key: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
         """The view half of :meth:`_slot`."""
         return self._slot(key, numel, dtype)[0]
+
+    # ------------------------------------------------------------------
+    # non_blocking copy-out (task #246)
+    #
+    # Two kinds of device-boundary copies live in this file, and only one of
+    # them must synchronize:
+    #
+    # * Copies INTO a staging slot before a post (the D2H stage-in) must be
+    #   BLOCKING: UCX reads and writes the pinned buffer from the CPU/NIC
+    #   side, outside any stream order, so the bytes must be resident before
+    #   the post is issued. That one drain per collective is irreducible on
+    #   this transport -- and it is why this transport can never be inside a
+    #   CUDA-graph capture (see CAPTURABLE_HTCCL_TRANSPORTS).
+    #
+    # * Copies OUT of a staging slot into the device-side result have only
+    #   one consumer: the compute stream itself, which orders them against
+    #   every later kernel. Blocking them (`Tensor.copy_` without
+    #   non_blocking goes through c10 memcpy_and_sync ->
+    #   cudaStreamSynchronize) drained the launch pipeline once per copy --
+    #   3 of the 4 drains of every all_gather, 1 of the 2 of every
+    #   all_reduce, 416 drains per cross-rig verify forward. These are the
+    #   copies made non_blocking here.
+    #
+    # Same pattern as the gloo plane (htccl.py: events + non_blocking); the
+    # dedicated copy stream it also uses buys nothing here, because at
+    # copy-out time the current stream is empty (the stage-in already
+    # drained it), so there is no compute to overlap the copy WITH -- a
+    # separate stream would only add a wait_stream edge.
+    #
+    # The lifetime hazard this creates -- a slot must not be rewritten (D2H
+    # stage, CPU downcast, NIC recv) while the device may still be reading
+    # it -- is NOT left as a comment-only stream-ordering argument (that is
+    # the shared-buffer bug family this repo keeps paying for): every
+    # rewrite site calls _slot_guard(key) first, and _h2d_async records the
+    # event it waits on.
+    # ------------------------------------------------------------------
+
+    def _slot_guard(self, key: str) -> None:
+        """Wait for the last async device read OUT of slot ``key``, if any.
+
+        Sub-microsecond when the copy has long completed (the steady-state
+        case: a whole layer of compute runs between two uses of one slot);
+        never a pipeline drain -- it waits on the recorded copy only, not on
+        the stream.
+        """
+        ev = self._h2d_events.get(key)
+        if ev is not None:
+            ev.synchronize()
+
+    def _async_h2d_ok(self, dst: torch.Tensor) -> bool:
+        """Whether the copy-out into ``dst`` may be enqueued non_blocking.
+
+        Separated out so the CPU-only unit tests can force it on and drive
+        the event bookkeeping without a GPU.
+        """
+        return self._use_cuda and dst.is_cuda
+
+    def _h2d_async(self, dst: torch.Tensor, host: torch.Tensor, key: str) -> None:
+        """Copy staging slot ``key`` (view ``host``) into ``dst`` without
+        draining the compute stream. ``dst`` must be contiguous (every caller
+        passes a flat view of a freshly allocated output)."""
+        if not self._async_h2d_ok(dst):
+            dst.copy_(host)
+            return
+        if host.dtype != dst.dtype:
+            # Downcast on the CPU into a pinned slot, then a same-dtype
+            # non_blocking H2D. A direct cross-dtype `copy_` also converts
+            # host-side (aten Copy.cu materialises a converted temporary on
+            # the source device), but that temporary is PAGEABLE -- and a
+            # pageable-source cudaMemcpyAsync synchronizes the stream first,
+            # which is exactly the drain being removed. Same CPU convert
+            # kernel either way, so the result bytes are identical; only the
+            # staging of the memcpy changes.
+            dn_key = key + ":dn"
+            self._slot_guard(dn_key)
+            down = self._staging(dn_key, dst.numel(), dst.dtype)
+            down.copy_(host)
+            host, key = down, dn_key
+        dst.copy_(host, non_blocking=True)
+        ev = self._h2d_events.get(key)
+        if ev is None:
+            ev = torch.cuda.Event()
+            self._h2d_events[key] = ev
+        ev.record()
 
     # ------------------------------------------------------------------
     # progress-interleaved host work
@@ -638,6 +736,13 @@ class HTCCLUcxTransport:
             # collective. Deliberately flat, deliberately duplicated.
             skey, rkeys = self._ar_keys[0]
             send_view, send_ptr, send_nbytes = self._slot(skey, n, dtype)
+            # The previous all_reduce's copy-out may still be reading this
+            # slot (the same-dtype case reads send_view itself).
+            self._slot_guard(skey)
+            # BLOCKING on purpose -- do not add non_blocking here: the posts
+            # below hand this buffer to UCX, which reads it host-side outside
+            # any stream order, so the bytes must be resident first. This is
+            # the transport's one irreducible drain per all_reduce.
             send_view.copy_(src)  # (+ upcast)
             reqs = []
             recv_views = []
@@ -656,7 +761,10 @@ class HTCCLUcxTransport:
             self.worker.wait(reqs)
             for rv in recv_views:
                 send_view.add_(rv)
-            dst.copy_(send_view)  # (+ downcast)
+            # Copy-out is non_blocking: its only consumer is the compute
+            # stream. This removes the second of the two drains every
+            # decode all_reduce used to pay.
+            self._h2d_async(dst, send_view, skey)  # (+ downcast)
             return
 
         n_chunks = (n + chunk - 1) // chunk
@@ -705,6 +813,12 @@ class HTCCLUcxTransport:
             off, count, send_view, _, _, recvs = staged[k & 1]
             for rec in recvs:
                 self._staged_add(send_view, rec[0], prog)
+            # Blocking copy-out on purpose: finish(k) must have finished
+            # READING parity k & 1 before stage-in(k+2) rewrites it -- the
+            # ownership contract above relies on program order, and a
+            # non_blocking read here would need a per-parity event guard.
+            # This branch runs only above chunk_bytes (>= 4 MiB), never in
+            # decode, and its host passes already overlap the wire.
             self._staged_copy(dst[off : off + count], send_view, prog)  # (+ downcast)
 
     def htccl_all_reduce(self, comm, inp: torch.Tensor) -> torch.Tensor:
@@ -744,6 +858,10 @@ class HTCCLUcxTransport:
             else:
                 self._wire_all_reduce_flat(host, seq)
 
+            # Blocking copy-out, unlike the single-chunk fast path above: this
+            # branch is the ring (>= ring_bytes) and the PIPELINE=0 A/B
+            # control, kept byte-for-byte as the pre-#246 baseline. Decode
+            # never reaches it.
             out.reshape(-1).copy_(host[:n])  # H2D (+ downcast)
             return out
 
@@ -824,6 +942,8 @@ class HTCCLUcxTransport:
             if has_next:
                 reqs = post(nxt)
             off, count, _, _, recvs = staged[k & 1]
+            # Blocking copy-outs on purpose -- same parity-ownership reason
+            # as the finish pass of _pipelined_all_reduce; never decode-hot.
             for i, peer in enumerate(peers):
                 self._staged_copy(dsts[peer][off : off + count], recvs[i][0], prog)
             self._staged_copy(own[off : off + count], src[off : off + count], prog)
@@ -860,12 +980,20 @@ class HTCCLUcxTransport:
                 src = inp.reshape(-1)
                 skey, rkeys = self._ag_keys[0]
                 send_view, send_ptr, send_nbytes = self._slot(skey, n, inp.dtype)
+                # BLOCKING on purpose -- do not add non_blocking here: the
+                # posts below hand this buffer to UCX, which reads it
+                # host-side outside any stream order. The transport's one
+                # irreducible drain per all_gather (was one of four).
                 send_view.copy_(src)
                 reqs = []
                 recv_views = []
                 for i, peer in enumerate(self._peers):
                     rv, rptr, rnbytes = self._slot(rkeys[i], n, inp.dtype)
                     recv_views.append(rv)
+                    # The NIC writes into this slot from the moment the recv
+                    # is posted; the previous all_gather's non_blocking
+                    # copy-out of it must have completed first.
+                    self._slot_guard(rkeys[i])
                     reqs.append(
                         self.worker.post_recv(rptr, rnbytes, _tag(seq, 0, peer, 0))
                     )
@@ -891,8 +1019,11 @@ class HTCCLUcxTransport:
                 else:
                     rows[self.rank].copy_(src)
                 self.worker.wait(reqs)
+                # Peer-row copy-outs are non_blocking: their only consumer
+                # is the compute stream. These three (W-1) copies were 3 of
+                # the 4 drains every decode all_gather used to pay.
                 for i, peer in enumerate(self._peers):
-                    rows[peer].copy_(recv_views[i])
+                    self._h2d_async(rows[peer], recv_views[i], rkeys[i])
                 if dim == 0:
                     return out_flat.view(
                         (self.world_size * input_size[0],) + tuple(input_size[1:])
@@ -976,7 +1107,14 @@ class HTCCLUcxTransport:
             seq = self._next_seq()
             n = tensor.numel()
             host = self._staging("bc", n, tensor.dtype)
+            # Both roles rewrite the slot (source: D2H stage; receiver: NIC
+            # write on recv); a previous broadcast's non_blocking copy-out
+            # must have completed first.
+            self._slot_guard("bc")
             if self.rank == src:
+                # BLOCKING on purpose -- do not add non_blocking here: the
+                # sends below hand this buffer to UCX, which reads it
+                # host-side outside any stream order.
                 host.copy_(tensor.reshape(-1))
                 reqs = []
                 for peer in range(self.world_size):
@@ -985,7 +1123,10 @@ class HTCCLUcxTransport:
                 self.worker.wait(reqs)
             else:
                 self.worker.wait(self._post_recv(src, host, seq, 0))
-                tensor.reshape(-1).copy_(host)
+                # Receiver copy-out is non_blocking: the caller's tensor is
+                # consumed on the compute stream (or is a CPU tensor, in
+                # which case _h2d_async copies synchronously).
+                self._h2d_async(tensor.reshape(-1), host, "bc")
             return tensor
 
     # ------------------------------------------------------------------
@@ -1033,15 +1174,28 @@ class HTCCLUcxTransport:
         cls = 1 << max(nbytes - 1, 4095).bit_length()
         free = self._async_free.get(cls)
         if free:
-            buf = free.pop()
+            buf, ev = free.pop()
+            if ev is not None:
+                # The buffer goes straight back into use (CPU stage-in write
+                # or NIC recv); the non_blocking read of its previous life,
+                # recorded at release, must have completed first. Same
+                # slot-lifetime rule as _slot_guard, pool-shaped.
+                ev.synchronize()
         else:
             pin = self.device.type == "cuda" and torch.cuda.is_available()
             buf = torch.empty(cls, dtype=torch.uint8, pin_memory=pin)
         view = buf[:nbytes].view(dtype)
         return (view, view.data_ptr(), nbytes, buf, cls)
 
-    def _pool_release(self, rec: tuple) -> None:
-        self._async_free.setdefault(rec[4], []).append(rec[3])
+    def _pool_release(self, rec: tuple, ev=None) -> None:
+        """Return a pool record to the free list.
+
+        ``ev`` is the completion event of the last non_blocking device read
+        out of the buffer, or None when every read of it was synchronous.
+        Stored with the buffer and waited on in _pool_acquire, so a handle's
+        result copy may be in flight while the slots are already reusable.
+        """
+        self._async_free.setdefault(rec[4], []).append((rec[3], ev))
 
     def all_reduce_async(self, comm, inp: torch.Tensor) -> "_UcxAsyncHandle":
         """Stage and post an all_reduce; complete it later with wait_async.
@@ -1062,6 +1216,15 @@ class HTCCLUcxTransport:
             )
             n = inp.numel()
             send = self._pool_acquire(n, reduce_dtype)
+            # BLOCKING on purpose, and the reason the overlap switch measured
+            # neutral: the posts below hand this buffer to UCX, which reads
+            # it host-side outside any stream order, so the drain happens at
+            # ISSUE -- exactly where the sync path pays it. Making the issue
+            # non-draining means a non_blocking D2H plus an event, with the
+            # posts deferred into wait_async behind that event -- a rework of
+            # the PROGRESS and ORDER contracts above (the wire would no
+            # longer start at issue), not a copy-flag change. Named as
+            # follow-up in task #246.
             send[0].copy_(inp.reshape(-1))  # (+ upcast); input is free after this
             recvs = [self._pool_acquire(n, reduce_dtype) for _ in self._peers]
             reqs = []
@@ -1084,6 +1247,8 @@ class HTCCLUcxTransport:
             inp = inp.contiguous()
             n = inp.numel()
             send = self._pool_acquire(n, inp.dtype)
+            # BLOCKING on purpose; same issue-time drain as all_reduce_async
+            # above, same follow-up.
             send[0].copy_(inp.reshape(-1))  # input is free after this
             recvs = [self._pool_acquire(n, inp.dtype) for _ in self._peers]
             reqs = []
@@ -1114,6 +1279,12 @@ class HTCCLUcxTransport:
                 )
             self.worker.wait(handle.reqs)
             handle.done = True
+            # Result copies below are non_blocking where the consumer is the
+            # compute stream (same rationale as the sync paths' _h2d_async);
+            # `extra` is the pinned downcast slot, released with the same
+            # event as the handle's own slots.
+            extra = None
+            async_read = False
             try:
                 if handle.op == "all_reduce":
                     acc = handle.send[0]
@@ -1122,7 +1293,21 @@ class HTCCLUcxTransport:
                     out = torch.empty(
                         handle.shape, dtype=handle.dtype, device=handle.device
                     )
-                    out.reshape(-1).copy_(acc)  # (+ downcast)
+                    flat = out.reshape(-1)
+                    if not self._async_h2d_ok(flat):
+                        flat.copy_(acc)  # (+ downcast)
+                    elif acc.dtype != flat.dtype:
+                        # Pinned CPU downcast + same-dtype non_blocking H2D;
+                        # byte-identical to the blocking converting copy_
+                        # (which also converts host-side) minus its
+                        # pageable-temporary stream drain. See _h2d_async.
+                        extra = self._pool_acquire(handle.n, flat.dtype)
+                        extra[0].copy_(acc)
+                        flat.copy_(extra[0], non_blocking=True)
+                        async_read = True
+                    else:
+                        flat.copy_(acc, non_blocking=True)
+                        async_read = True
                     return out
 
                 # all_gather -- same flat-output construction as the sync
@@ -1133,9 +1318,15 @@ class HTCCLUcxTransport:
                     W * n, dtype=handle.dtype, device=handle.device
                 )
                 rows = out_flat.view(W, n)
-                rows[self.rank].copy_(handle.send[0])
-                for i, peer in enumerate(self._peers):
-                    rows[peer].copy_(handle.recvs[i][0])
+                if self._async_h2d_ok(out_flat):
+                    rows[self.rank].copy_(handle.send[0], non_blocking=True)
+                    for i, peer in enumerate(self._peers):
+                        rows[peer].copy_(handle.recvs[i][0], non_blocking=True)
+                    async_read = True
+                else:
+                    rows[self.rank].copy_(handle.send[0])
+                    for i, peer in enumerate(self._peers):
+                        rows[peer].copy_(handle.recvs[i][0])
                 shape = handle.shape
                 dim = handle.dim
                 if dim == 0:
@@ -1146,9 +1337,18 @@ class HTCCLUcxTransport:
                     .reshape(shape[:dim] + (W * shape[dim],) + shape[dim + 1 :])
                 )
             finally:
-                self._pool_release(handle.send)
+                ev = None
+                if async_read:
+                    # One event after the last read covers every slot of this
+                    # handle: the reads are enqueued on one stream and
+                    # therefore complete in order.
+                    ev = torch.cuda.Event()
+                    ev.record()
+                self._pool_release(handle.send, ev)
                 for rec in handle.recvs:
-                    self._pool_release(rec)
+                    self._pool_release(rec, ev)
+                if extra is not None:
+                    self._pool_release(extra, ev)
 
     def poke_async(self) -> None:
         """One unlocked progress pass.
@@ -1177,6 +1377,22 @@ class HTCCLUcxTransport:
             self.barrier()
         except Exception:
             pass
+        # In-flight non_blocking reads out of the staging/pool buffers must
+        # complete before the pinned memory is dropped.
+        for ev in self._h2d_events.values():
+            try:
+                ev.synchronize()
+            except Exception:
+                pass
+        self._h2d_events.clear()
+        for free in self._async_free.values():
+            for _, ev in free:
+                if ev is not None:
+                    try:
+                        ev.synchronize()
+                    except Exception:
+                        pass
+        self._async_free.clear()
         self._staging_bufs.clear()
         self._view_cache.clear()
         # Holds raw addresses into the buffers just dropped.

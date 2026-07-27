@@ -633,14 +633,23 @@ def test_construction_is_flag_gated():
 
 
 def test_cpu_transports_are_rejected_while_cuda_graphs_are_on():
-    """shm/gloo + CUDA graphs must fail at STARTUP, not mid-capture.
+    """Host-staged transports + CUDA graphs must fail at STARTUP, not later.
 
-    Both CPU transports host-stage every collective (shm: two
+    Every non-device transport host-stages its collectives (shm: two
     cudaStreamSynchronize per op plus a spin on shm counters; gloo: a
-    cudaEventSynchronize and a gloo CPU collective per chunk). Inside a
-    capture that raises `cudaErrorStreamCaptureUnsupported` from whichever
-    kernel is capturing -- observed on arm E, where it read as an unrelated
-    CUDA fault. The constraint used to live only in a log line.
+    cudaEventSynchronize and a gloo CPU collective per chunk; ucx: blocking
+    device-boundary copies through pinned host buffers). Inside a capture
+    that raises `cudaErrorStreamCaptureUnsupported` from whichever kernel is
+    capturing -- observed on arm E, where it read as an unrelated CUDA
+    fault. The constraint used to live only in a log line.
+
+    "ucx" is in this list because its absence was a measurement-integrity
+    hole (task #246): a ucx cross-rig boot with graphs enabled passed the
+    guard and then captured at most rank-local regions, so nobody could tell
+    which regime a measurement ran in. The guard is an ALLOWLIST of the
+    capturable transports, so an unknown name -- which silently falls back
+    to the host-staged gloo plane in htccl._build_transport -- is rejected
+    too, instead of repeating the ucx gap for the next transport.
     """
     import types as _types
 
@@ -653,7 +662,7 @@ def test_cpu_transports_are_rejected_while_cuda_graphs_are_on():
     orig = rc.get_server_args
     try:
         rc.get_server_args = lambda: graphs_on
-        for transport in ("shm", "gloo"):
+        for transport in ("shm", "gloo", "ucx", "some-future-transport"):
             with pytest.raises(ValueError) as ei:
                 ps._enforce_cpu_transport_needs_eager(transport)
             msg = str(ei.value)
@@ -661,9 +670,17 @@ def test_cpu_transports_are_rejected_while_cuda_graphs_are_on():
             assert "device" in msg, msg  # names the capturable alternative
         # the GPU-driven transport is capturable and must NOT be rejected
         ps._enforce_cpu_transport_needs_eager("device")
+        # the allowlist and the registry must agree on what "capturable"
+        # means -- a transport registered as capturable but unknown to the
+        # registry (or vice versa) is how the ucx gap happened
+        from sglang.srt.distributed.device_communicators.htccl import (
+            TRANSPORT_REGISTRY,
+        )
+
+        assert ps.CAPTURABLE_HTCCL_TRANSPORTS <= set(TRANSPORT_REGISTRY)
 
         rc.get_server_args = lambda: graphs_off
-        for transport in ("shm", "gloo", "device"):
+        for transport in ("shm", "gloo", "ucx", "device"):
             ps._enforce_cpu_transport_needs_eager(transport)
     finally:
         rc.get_server_args = orig
