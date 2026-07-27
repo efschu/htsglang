@@ -335,3 +335,19 @@ Several agents share this box; the cards are usually contended.
   `nvidia-smi --query-compute-apps=pid,used_memory` for orphaned
   `sglang::scheduler_TP*` processes — they hold 5-11 GiB per card and do
   not match `pgrep -af launch_server`. Kill them by PID.
+- **GGUF boots reserve dequant scratch out of the KV budget** (#257, changed
+  2026-07-27). A GGUF dequant target larger than
+  `SGLANG_GGUF_DEQUANT_WS_CAP_MIB` (default 512 MiB) fresh-allocates its
+  full size at forward time; for Qwen3.6-27B Q3_K_M that is the lm_head
+  shard at 2.37 GiB on TP=1 (1.19 GiB on TP=2). The KV profiler now charges
+  the largest such target that is not already held in the persistent
+  workspace, so on GGUF models the KV pool is smaller than before at the
+  same `--mem-fraction-static`, and the boot log carries a
+  `GGUF dequant scratch (rank N): reserving X GiB` line. Consequence for
+  recipes: a GGUF fraction that used to boot may now be rejected up front
+  with a message naming the reservation — that rejection replaces an OOM
+  inside `ggml_dequantize` during the decode-graph warmup minutes later.
+  Non-GGUF models record no target and are unaffected.
+- A `ColdBuildWindowError` in an OLD log ("a peer may still be in nvcc") is
+  not evidence of a peer: before #257 that wrapper was attached on TP=1 too.
+  Read the chained `__cause__`, which is where the OOM was.

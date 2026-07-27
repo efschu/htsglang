@@ -259,6 +259,26 @@ class ModelRunnerKVCacheMixin:
         if get_world_group().world_size > 1:
             torch.distributed.barrier(group=get_world_group().cpu_group)
 
+    def _gguf_dequant_scratch_gb(self: ModelRunner) -> float:
+        """GGUF dequant scratch not yet allocated at profiling time, in GiB.
+
+        A budget POST, not a margin: the GGUF loader already records the
+        largest dequant target per rank while sizing its persistent
+        workspace, and this is that number minus the buffer the rank already
+        holds. Non-GGUF models never record one, so this returns 0.0 and the
+        budget arithmetic is byte-identical to before (#257).
+        """
+        try:
+            from sglang.srt.layers.quantization.gguf import (
+                gguf_dequant_scratch_residual_bytes,
+            )
+        except Exception:
+            return 0.0
+        device_index = None
+        if self.device == "cuda" and torch.cuda.is_available():
+            device_index = torch.cuda.current_device()
+        return gguf_dequant_scratch_residual_bytes(device_index) / (1 << 30)
+
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
@@ -340,6 +360,29 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
+        # #257: GGUF dequant scratch. The GGUF path dequantizes a weight into
+        # a scratch buffer before the large-M cuBLAS GEMM, and targets above
+        # the workspace cap fresh-allocate their FULL size at forward time --
+        # including in the EAGER pre-capture warmup forwards, which run after
+        # this profiling. Those bytes are neither resident nor covered by the
+        # slack above, so a KV pool sized without them is oversized by
+        # exactly the largest dequant this rank performs (2.37 GiB for the
+        # Qwen3.6-27B Q3_K_M lm_head at TP=1 -> OOM in the decode-graph
+        # warmup at --mem-fraction-static 0.90). Charge the measured demand.
+        # Zero for every non-GGUF model, so other quants are unchanged.
+        gguf_scratch_gb = self._gguf_dequant_scratch_gb()
+        if gguf_scratch_gb:
+            logger.info(
+                "GGUF dequant scratch (rank %d): reserving %.2f GiB of the "
+                "KV budget for the largest over-cap dequant target this rank "
+                "still has to allocate at forward time (%.2f -> %.2f GiB).",
+                self.tp_rank,
+                gguf_scratch_gb,
+                rest_memory,
+                rest_memory - gguf_scratch_gb,
+            )
+            rest_memory -= gguf_scratch_gb
+
         # Measured KV-budget correction (two-boot convergence): replace the
         # blind part of the slack heuristic with the PREVIOUS boot's measured
         # leftover (see note_post_capture_leftover). Applied on both budget
@@ -375,8 +418,22 @@ class ModelRunnerKVCacheMixin:
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
+            # #257: say so when the GGUF scratch post is what tipped it. The
+            # alternative is the boot that motivated this change: it looked
+            # affordable here and OOMed minutes later inside ggml_dequantize.
+            gguf_note = (
+                f" This rank also reserves {gguf_scratch_gb:.2f} GiB of GGUF "
+                f"dequant scratch (the largest over-cap dequant target it "
+                f"must allocate at forward time); that reservation is part "
+                f"of the shortfall."
+                if gguf_scratch_gb
+                else ""
+            )
+            # The suggestion has to clear that post too, otherwise it names a
+            # fraction that fails again for the same reason (gguf_scratch_gb
+            # is 0.0 off the GGUF path -> unchanged formula).
             minimum_mem_fraction_static = (
-                1 - available_gpu_memory / pre_model_load_memory
+                1 - (available_gpu_memory - gguf_scratch_gb) / pre_model_load_memory
             )
             suggested_mem_fraction_static = (
                 math.ceil(minimum_mem_fraction_static * 1000) / 1000
@@ -393,7 +450,7 @@ class ModelRunnerKVCacheMixin:
                     f"runtime state, which exhausts the per-rank budget. "
                     f"Raise --rank-gpu-memory-mib above that, or place "
                     f"fewer ranks on this GPU. If using speculative "
-                    f"decoding, draft weights are now counted."
+                    f"decoding, draft weights are now counted.{gguf_note}"
                 )
             raise ValueError(
                 f"Loaded weights leave no GPU memory for the KV cache under "
@@ -402,7 +459,7 @@ class ModelRunnerKVCacheMixin:
                 f"{suggested_mem_fraction_static:.3f} "
                 f"(minimum viable = 1 - available/pre = "
                 f"{minimum_mem_fraction_static:.4f}). If using speculative "
-                f"decoding, draft weights are now counted."
+                f"decoding, draft weights are now counted.{gguf_note}"
             )
 
         if offload_reclaim:
