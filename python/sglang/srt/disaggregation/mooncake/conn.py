@@ -256,35 +256,76 @@ class MooncakeKVManager(CommonKVManager):
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
 
+    # Transport name used in registration error messages; subclasses override.
+    _transport_name = "Mooncake"
+
+    def _batch_register_checked(self, ptrs, lens, what: str):
+        """Register memory regions and abort if the transport reports failure.
+
+        ``MooncakeTransferEngine.batch_register`` returns an int status
+        (0 = success, non-zero = failure, -1 when the underlying binding
+        raised) and only logs at DEBUG level. An unregistered region is not
+        addressable by RDMA, so continuing past a failure defers the symptom
+        to a later transfer error or a silently wrong payload.
+        """
+        ret = self.engine.batch_register(ptrs, lens)
+        if ret != 0:
+            total_bytes = sum(lens)
+            raise RuntimeError(
+                f"{self._transport_name} memory registration failed for {what}: "
+                f"batch_register returned {ret} for {len(ptrs)} region(s), "
+                f"{total_bytes} bytes total, first ptr="
+                f"{hex(ptrs[0]) if ptrs else 'n/a'}"
+            )
+
     def register_buffer_to_engine(self):
         # Batch register KV data buffers
         if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
-            self.engine.batch_register(
-                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+            self._batch_register_checked(
+                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens, "KV data buffers"
             )
 
         # Batch register auxiliary data buffers
         if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
-            self.engine.batch_register(
-                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+            self._batch_register_checked(
+                self.kv_args.aux_data_ptrs,
+                self.kv_args.aux_data_lens,
+                "auxiliary data buffers",
             )
 
-        for ptrs, lens in zip(
-            self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+        for idx, (ptrs, lens) in enumerate(
+            zip(self.kv_args.state_data_ptrs, self.kv_args.state_data_lens)
         ):
             if ptrs and lens:
-                self.engine.batch_register(ptrs, lens)
+                self._batch_register_checked(
+                    ptrs, lens, f"state data buffers (component {idx})"
+                )
 
     def deregister_buffer_to_engine(self):
+        # Deregistration runs on the teardown path. A failure here leaks a
+        # registration but cannot corrupt data, so it is logged rather than
+        # raised -- raising would mask whatever caused the teardown.
+        def _deregister(ptrs, what: str):
+            ret = self.engine.batch_deregister(ptrs)
+            if ret != 0:
+                logger.warning(
+                    "%s memory deregistration failed for %s: "
+                    "batch_deregister returned %s for %d region(s).",
+                    self._transport_name,
+                    what,
+                    ret,
+                    len(ptrs),
+                )
+
         if self.kv_args.kv_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+            _deregister(self.kv_args.kv_data_ptrs, "KV data buffers")
 
         if self.kv_args.aux_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+            _deregister(self.kv_args.aux_data_ptrs, "auxiliary data buffers")
 
-        for ptrs in self.kv_args.state_data_ptrs or []:
+        for idx, ptrs in enumerate(self.kv_args.state_data_ptrs or []):
             if ptrs:
-                self.engine.batch_deregister(ptrs)
+                _deregister(ptrs, f"state data buffers (component {idx})")
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
@@ -305,13 +346,28 @@ class MooncakeKVManager(CommonKVManager):
             "page_size": page_size,
         }
 
+    def _register_staging_memory(self, ptr: int, size: int) -> None:
+        """Register a staging buffer with the Mooncake transfer engine.
+
+        Mirrors the NIXL backend: the callback raises on failure instead of
+        handing a status code back to the caller, which previously dropped it.
+        """
+        ret = self.engine.batch_register([ptr], [size])
+        if ret != 0:
+            raise RuntimeError(
+                f"{self._transport_name} memory registration failed for staging "
+                f"buffer "
+                f"(ptr={hex(ptr)}, size={size} bytes): "
+                f"batch_register returned {ret}"
+            )
+
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
             init_staging_buffers,
         )
 
         self._staging_ctx.buffers = init_staging_buffers(
-            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self._register_staging_memory,
             self.kv_args,
             count,
             self.server_args.chunked_prefill_size,
@@ -324,7 +380,7 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         self._staging_ctx.allocator = init_staging_allocator(
-            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self._register_staging_memory,
             self.kv_args,
         )
         self.kv_buffer_tensors = None
