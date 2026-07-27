@@ -2413,7 +2413,7 @@ def apply_auto_performance(server_args) -> None:
             + (
                 "realizes on the first boot (measured install after "
                 "profiling)."
-                if server_args.uneven_kv_capacity_mode()
+                if server_args.uneven_kv_derived_mode()
                 else "pins explicitly."
             )
         )
@@ -2768,7 +2768,7 @@ def apply_auto_performance(server_args) -> None:
                         # leaves the boot stuck on this pre-boot prediction.
                         # For every other value ('coupled', unset) the previous
                         # behavior is kept byte-identical.
-                        if server_args.uneven_kv_capacity_mode():
+                        if server_args.uneven_kv_derived_mode():
                             server_args.rank_kv_capacity_seed = tok_vec
                             seeded_as = "phase-1 seed; the measured install after profiling still runs"
                         else:
@@ -2785,6 +2785,24 @@ def apply_auto_performance(server_args) -> None:
         lines.append(
             "CHOSEN: keep plain VRAM-auto split (no MLP vector override)."
         )
+
+    # --rank-kv-ratio speed needs integer weights proportional to the per-rank
+    # MEASURED memory bandwidth, and this is the only place the hardware
+    # profile is read. Park them on server_args for the phase-2 install after
+    # the post-weight-load profiling (model_runner_kv_cache_mixin.
+    # _maybe_suggest_dcp_token_vector). Always parked, not only in speed mode:
+    # it is a pure record of the profile, costs nothing, and keeps the mode
+    # switchable without re-probing. Same integer normalisation as the vocab
+    # hint -- both want "weights proportional to bandwidth", and reusing the
+    # helper keeps a single definition of that.
+    server_args.rank_kv_speed_weights = vocab_ratio_from_membw(rank_scores_bw)
+    lines.append(
+        "KV-SPEED WEIGHTS: per-rank memory-bandwidth proportion is "
+        f"{','.join(map(str, server_args.rank_kv_speed_weights))} "
+        "(consumed by --rank-kv-ratio speed / --rank-perf-tune dec; under "
+        "DCP each rank runs attention over the tokens it owns, so at bs=1 "
+        "the deep-context part of the decode step follows this vector)."
+    )
 
     # Ratio-weighted vocab sharding hint (--rank-vocab-ratio, M20 BEIFANG 2):
     # a separate opt-in flag (never applied here); the membw-weighted vocab

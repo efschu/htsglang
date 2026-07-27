@@ -438,9 +438,9 @@ def _parse_rank_vocab_ratio(value: str) -> Union[str, List[int]]:
 
 def _parse_rank_kv_ratio(value: str) -> Union[str, List[int]]:
     """Parse --rank-kv-ratio: 'coupled', 'capacity', 'auto' (alias of
-    'capacity'), or a comma-separated positive integer list."""
+    'capacity'), 'speed', or a comma-separated positive integer list."""
     mode = value.strip()
-    if mode in ("coupled", "capacity"):
+    if mode in ("coupled", "capacity", "speed"):
         return mode
     if mode == "auto":
         return "capacity"
@@ -448,8 +448,8 @@ def _parse_rank_kv_ratio(value: str) -> Union[str, List[int]]:
         return [int(part.strip()) for part in value.split(",")]
     except ValueError as e:
         raise ValueError(
-            "--rank-kv-ratio must be 'coupled', 'capacity', 'auto' or a "
-            f"comma-separated integer list, got {value!r}."
+            "--rank-kv-ratio must be 'coupled', 'capacity', 'auto', 'speed' "
+            f"or a comma-separated integer list, got {value!r}."
         ) from e
 
 
@@ -1638,12 +1638,20 @@ class ServerArgs:
             "maximizes prefill throughput (family-selective MLP "
             "concentration toward compute-strong ranks -- the measured "
             "lever); 'both' (default) targets prefill + concurrent "
-            "throughput, which ride the same lever; 'dec' is a documented "
-            "near-no-op -- the VRAM-auto split already sits at the decode "
-            "optimum (decode is flat across representable splits on "
-            "heterogeneous rigs), so only free gains apply. Only valid "
-            "with --rank-tp-ratio auto-performance.",
-            choices=["both", "dec", "enc"],
+            "throughput, which ride the same lever; 'maxkv' targets maximum "
+            "context and is an alias for the capacity semantics (it also "
+            "selects --rank-kv-ratio capacity when that flag is left at its "
+            "default). 'dec' targets decode: the WEIGHT split is a near-no-op "
+            "for it (decode is flat across representable splits, so only free "
+            "gains apply there), but the decode lever is not the weight split "
+            "-- it is the KV-TOKEN split, because under DCP each rank runs "
+            "attention over the tokens it owns and at bs=1 the slowest rank "
+            "sets the pace. 'dec' therefore also selects --rank-kv-ratio "
+            "speed when that flag is left at its default; measured worth "
+            "-24.5 % of the context-dependent part of the decode step at "
+            "120 k resident tokens (#210). Only valid with --rank-tp-ratio "
+            "auto-performance.",
+            choices=["both", "dec", "enc", "maxkv"],
         ),
     ] = "both"
     rank_mlp_ratio: A[
@@ -1717,7 +1725,20 @@ class ServerArgs:
             "proportional to its actual free-VRAM-after-weights token "
             "capacity (one-boot convergence; maximizes max_total_num_tokens; "
             "the honest cost is that deep-context decode shifts attention "
-            "work to the cards holding more tokens). A comma-separated "
+            "work to the cards holding more tokens). 'speed': the derived "
+            "counterpart — ownership shifted from the capacity proportion "
+            "toward the MEMORY-BANDWIDTH proportion of the ranks, as far as "
+            "--rank-perf-loose-ctx-percent allows, because under DCP each "
+            "rank runs attention over the tokens IT owns and at bs=1 the "
+            "slowest rank sets the pace. Measured (#210, 27B FP8 TP=3 uneven "
+            "DCP, 120 k resident tokens, bs=1, no spec): moving the vector "
+            "from [2,3,3] to [2,1,1] cut the context-dependent part of the "
+            "decode step by 24.5 % (2.296 -> 1.732 ms, boot-to-boot noise "
+            "floor 1.07 %), worth -2.5 % step time end to end and growing "
+            "linearly with resident context. 'speed' needs the per-rank "
+            "bandwidth scores, so it requires --rank-tp-ratio "
+            "auto-performance; without them it degrades to 'capacity' and "
+            "says so. A comma-separated "
             "positive integer list (one entry per rank) pins the ownership "
             "vector explicitly — the capacity-vs-depth-speed slider. "
             "Non-'coupled' values imply the weighted-DCP path (no "
@@ -1737,6 +1758,13 @@ class ServerArgs:
     # cancel the phase-2 measured install. An explicit --rank-kv-ratio
     # vector or SGLANG_UNEVEN_TOKEN_VECTOR still wins over this seed.
     rank_kv_capacity_seed: Optional[List[int]] = None
+    # Internal (no CLI flag): integer weights proportional to the per-rank
+    # MEASURED memory bandwidth, parked here by the auto-performance planner
+    # (apply_auto_performance) because that is the only place the hardware
+    # profile is read. --rank-kv-ratio speed consumes it after the
+    # post-weight-load profiling. None => no profile => 'speed' degrades to
+    # 'capacity'.
+    rank_kv_speed_weights: Optional[List[int]] = None
     random_seed: A[Optional[int], "The random seed."] = None
     watchdog_timeout: A[
         float,
@@ -5487,6 +5515,22 @@ class ServerArgs:
         profiling (one-boot convergence)."""
         return getattr(self, "rank_kv_ratio", "coupled") == "capacity"
 
+    def uneven_kv_speed_mode(self) -> bool:
+        """True for --rank-kv-ratio speed: after the post-weight-load memory
+        profiling, install the token vector shifted from the capacity
+        proportion toward the per-rank memory-bandwidth proportion, as far as
+        --rank-perf-loose-ctx-percent allows.
+
+        Same phase-2 install point as 'capacity' — the two modes differ only
+        in the objective the vector is derived for, so they share the install
+        machinery (and its rank-uniformity invariant) exactly."""
+        return getattr(self, "rank_kv_ratio", "coupled") == "speed"
+
+    def uneven_kv_derived_mode(self) -> bool:
+        """True for either derived mode ('capacity' or 'speed'), i.e. the
+        vector is computed after profiling rather than pinned by the user."""
+        return self.uneven_kv_capacity_mode() or self.uneven_kv_speed_mode()
+
     def uneven_weighted_dcp_enabled(self) -> bool:
         """True when the weighted-DCP token vector should be installed:
         the classic env pair, or any non-'coupled' --rank-kv-ratio."""
@@ -5535,11 +5579,34 @@ class ServerArgs:
                 "--rank-perf-loose-ctx-percent must be in [0, 100), got "
                 f"{self.rank_perf_loose_ctx_percent!r}."
             )
-        if self.rank_perf_tune not in ("both", "dec", "enc"):
+        if self.rank_perf_tune not in ("both", "dec", "enc", "maxkv"):
             raise ValueError(
-                "--rank-perf-tune must be one of both|dec|enc, got "
+                "--rank-perf-tune must be one of both|dec|enc|maxkv, got "
                 f"{self.rank_perf_tune!r}."
             )
+        # The tuning target also picks the KV-TOKEN ownership mode, but only
+        # when --rank-kv-ratio was left at its default. An explicit
+        # --rank-kv-ratio (any mode string or a pinned vector) always wins, so
+        # the two flags never fight and the default path stays byte-identical
+        # for tune='both'/'enc'.
+        if self.rank_kv_ratio == "coupled":
+            if self.rank_perf_tune == "dec":
+                self.rank_kv_ratio = "speed"
+                logger.info(
+                    "--rank-perf-tune dec: selecting --rank-kv-ratio speed. "
+                    "The decode lever is the KV-TOKEN split, not the weight "
+                    "split: under DCP each rank runs attention over the "
+                    "tokens it owns, so at bs=1 the deep-context part of the "
+                    "step follows token ownership. Pass --rank-kv-ratio "
+                    "explicitly to override."
+                )
+            elif self.rank_perf_tune == "maxkv":
+                self.rank_kv_ratio = "capacity"
+                logger.info(
+                    "--rank-perf-tune maxkv: selecting --rank-kv-ratio "
+                    "capacity (maximum max_total_num_tokens). Pass "
+                    "--rank-kv-ratio explicitly to override."
+                )
 
     def _resolve_auto_rank_tp_ratio(self):
         """--rank-tp-ratio auto: fill the available VRAM as well as
@@ -5801,13 +5868,14 @@ class ServerArgs:
                         "sharding only exists under uneven TP), but the "
                         "resolved plan is the even split."
                     )
-                # 'capacity' degenerates gracefully: uniform budgets ->
+                # The derived modes degenerate gracefully: uniform budgets ->
                 # even split -> nothing to rebalance.
                 logger.warning(
-                    "--rank-kv-ratio capacity: the resolved --rank-tp-ratio "
+                    "--rank-kv-ratio %s: the resolved --rank-tp-ratio "
                     "plan is the even split (uniform budgets), so there is "
                     "no token-axis KV sharding to rebalance — falling back "
-                    "to 'coupled' (no-op)."
+                    "to 'coupled' (no-op).",
+                    self.rank_kv_ratio,
                 )
                 self.rank_kv_ratio = "coupled"
             elif isinstance(self.rank_kv_ratio, list):

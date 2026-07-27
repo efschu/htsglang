@@ -628,11 +628,14 @@ _CURATED: Dict[str, dict] = {
         group="uneven-tp",
         type="enum",
         default="both",
-        allowed=("both", "dec", "enc"),
+        allowed=("both", "dec", "enc", "maxkv"),
         requires=("rank_tp_ratio",),
         hover="auto-performance tuning target: 'enc' maximizes prefill, 'both' "
-        "(default) prefill+concurrent throughput, 'dec' a near-no-op (decode "
-        "is flat across splits). Only valid with auto-performance.",
+        "(default) prefill+concurrent throughput, 'maxkv' maximum context "
+        "(selects --rank-kv-ratio capacity), 'dec' decode -- a near-no-op on "
+        "the WEIGHT split (decode is flat across splits) but it selects "
+        "--rank-kv-ratio speed, which is where the decode lever actually sits. "
+        "Only valid with auto-performance.",
     ),
     "rank_mlp_ratio": dict(
         source="fork",
@@ -677,14 +680,18 @@ _CURATED: Dict[str, dict] = {
         group="uneven-tp",
         type="list",
         default="coupled",
-        allowed=("coupled", "capacity", "auto"),
+        allowed=("coupled", "capacity", "auto", "speed"),
         requires=("rank_gpu_id", "rank_tp_ratio"),
         hover="Uneven-DCP KV-TOKEN ownership vector, DECOUPLED from the weight "
         "split. 'coupled' (default) = previous behavior; 'capacity'/'auto' = "
         "measured capacity-weighted ownership (maximizes max_total_num_tokens, "
-        "shifts deep-context attention work to bigger cards); or an explicit "
-        "per-rank integer vector. Requires --rank-gpu-id with a NON-uniform "
-        "--rank-tp-ratio plan. Env SGLANG_UNEVEN_TOKEN_VECTOR overrides.",
+        "shifts deep-context attention work to bigger cards); 'speed' = the "
+        "counterpart, ownership shifted toward the memory-bandwidth "
+        "proportion as far as --rank-perf-loose-ctx-percent allows (measured "
+        "-24.5 % on the context-dependent part of the decode step, #210); or "
+        "an explicit per-rank integer vector. Requires --rank-gpu-id with a "
+        "NON-uniform --rank-tp-ratio plan. Env SGLANG_UNEVEN_TOKEN_VECTOR "
+        "overrides.",
     ),
     # ---- fork: weightless-KV fast lane (Variant C) ------------------------
     "weightless_kv_fastlane": dict(

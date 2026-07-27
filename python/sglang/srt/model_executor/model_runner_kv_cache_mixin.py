@@ -3887,27 +3887,92 @@ class ModelRunnerKVCacheMixin:
             optimal = [v // g for v in optimal]
             c_optimal = _context_budget(optimal, p_by_rank)
 
-        # --rank-kv-ratio capacity: install the measured vector (rank-uniform
-        # decision: server args + gathered P_r only). An explicit pin (env
-        # vector or flag list) and the draft worker keep hint-only semantics.
+        # --rank-kv-ratio capacity / speed: install the measured vector
+        # (rank-uniform decision: server args + gathered P_r only). An explicit
+        # pin (env vector or flag list) and the draft worker keep hint-only
+        # semantics.
         install = (
             allow_install
-            and self.server_args.uneven_kv_capacity_mode()
+            and self.server_args.uneven_kv_derived_mode()
             and not envs.SGLANG_UNEVEN_TOKEN_VECTOR.get()
             and not self.is_draft_worker
         )
+
+        # --rank-kv-ratio speed: the objective is the DECODE step, not the
+        # context budget, so the vector is shifted from the capacity
+        # proportion toward the per-rank memory-bandwidth proportion. Under
+        # DCP each rank runs attention over the tokens it owns and at bs=1 the
+        # group waits on the slowest rank, so the deep-context part of the step
+        # follows token ownership (#210: -24.5 % on that term, 27B FP8 TP=3 at
+        # 120 k resident tokens, against a 1.07 % boot-to-boot noise floor).
+        # How far the shift may go is bounded by --rank-perf-loose-ctx-percent,
+        # measured against the EFFECTIVE budget min(kv_budget, hybrid cap) --
+        # while the hybrid mamba/SWA cap binds, the shift is free and is taken
+        # in full even at the default 0 %.
+        if install and self.server_args.uneven_kv_speed_mode():
+            from sglang.srt.distributed.utils import cp_token_speed_vector
+
+            bw = self.server_args.rank_kv_speed_weights
+            if not bw or len(bw) != self.dcp_size or any(w <= 0 for w in bw):
+                if self.tp_rank == 0:
+                    logger.warning(
+                        "Uneven DCP speed mode (--rank-kv-ratio speed): no "
+                        "per-rank memory-bandwidth scores available "
+                        "(hardware profile missing? --rank-tp-ratio is not "
+                        "auto-performance?) -- falling back to the "
+                        "capacity-optimal vector."
+                    )
+            else:
+                hard_cap = self._hybrid_kv_token_cap()
+                speed_vec, c_speed, t = cp_token_speed_vector(
+                    p_by_rank,
+                    bw,
+                    self.server_args.rank_perf_loose_ctx_percent,
+                    hard_cap=hard_cap,
+                )
+                if self.tp_rank == 0:
+                    logger.info(
+                        "Uneven DCP speed mode (--rank-kv-ratio speed): "
+                        "bandwidth weights %s, capacity-optimal vector %s "
+                        "(budget %d), loose-ctx %.1f %%, hybrid cap %s -> "
+                        "speed vector %s (budget %d, %.0f %% of the way from "
+                        "the capacity proportion to the bandwidth "
+                        "proportion).",
+                        bw,
+                        optimal,
+                        c_optimal,
+                        self.server_args.rank_perf_loose_ctx_percent,
+                        hard_cap,
+                        speed_vec,
+                        c_speed,
+                        100.0 * t,
+                    )
+                optimal, c_optimal = speed_vec, c_speed
+
         if install:
             from sglang.srt.distributed.utils import set_cp_token_ratios
 
-            if optimal != active and c_optimal > c_active:
+            # 'speed' deliberately accepts a SMALLER context budget than the
+            # active vector -- that is the trade it exists to make -- so it
+            # must not be gated on c_optimal > c_active the way 'capacity' is.
+            # The budget floor was already enforced inside
+            # cp_token_speed_vector.
+            improves = (
+                c_optimal >= 0
+                if self.server_args.uneven_kv_speed_mode()
+                else c_optimal > c_active
+            )
+            if optimal != active and improves:
+                mode = self.server_args.rank_kv_ratio
                 set_cp_token_ratios(optimal)
                 if self.tp_rank == 0:
                     logger.info(
-                        "Uneven DCP capacity mode (--rank-kv-ratio capacity): "
-                        "installed measured KV-token ownership vector %s "
-                        "(pre-boot estimate was %s), raising "
-                        "max_total_num_tokens from %d to ~%d (per-rank "
-                        "profiled capacity %s).",
+                        "Uneven DCP %s mode (--rank-kv-ratio %s): installed "
+                        "measured KV-token ownership vector %s (pre-boot "
+                        "estimate was %s), max_total_num_tokens %d -> ~%d "
+                        "(per-rank profiled capacity %s).",
+                        mode,
+                        mode,
                         optimal,
                         active,
                         c_active,
@@ -3915,12 +3980,16 @@ class ModelRunnerKVCacheMixin:
                         p_by_rank,
                     )
             elif self.tp_rank == 0:
+                mode = self.server_args.rank_kv_ratio
                 logger.info(
-                    "Uneven DCP capacity mode (--rank-kv-ratio capacity): "
-                    "pre-boot estimate %s already capacity-optimal "
+                    "Uneven DCP %s mode (--rank-kv-ratio %s): pre-boot "
+                    "estimate %s is already the %s optimum "
                     "(max_total_num_tokens=%d, per-rank profiled capacity "
                     "%s).",
+                    mode,
+                    mode,
                     active,
+                    mode,
                     c_active,
                     p_by_rank,
                 )
@@ -4056,8 +4125,8 @@ class ModelRunnerKVCacheMixin:
             self._maybe_suggest_dcp_token_vector(
                 available_bytes, allow_install=True
             )
-        elif self.server_args.uneven_kv_capacity_mode():
-            # --rank-kv-ratio capacity with post-capture sizing planned: the
+        elif self.server_args.uneven_kv_derived_mode():
+            # --rank-kv-ratio capacity/speed with post-capture sizing planned: the
             # token vector must be FINAL before pools/backends/graphs
             # snapshot it, so the measured install runs on the pre-capture
             # profiling here; the post-capture pass stays hint-only (any

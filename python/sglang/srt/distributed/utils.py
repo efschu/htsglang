@@ -595,6 +595,97 @@ def _partition_units_kv_aligned(units: int, weights: Sequence[int], groups: int)
     return out
 
 
+def cp_token_context_budget(vector: Sequence[int], capacities: Sequence[int]) -> int:
+    """Global max_total_num_tokens under the weighted owner rule.
+
+    Rank r owns vector[r] of every sum(vector) context tokens, so the unit that
+    every rank can fund is min_r(capacities[r] // vector[r]) and the global
+    budget is that unit times sum(vector). Maximised when the vector is
+    proportional to the capacities -- which is exactly what --rank-kv-ratio
+    capacity installs."""
+    n = len(vector)
+    assert len(capacities) == n and all(v > 0 for v in vector)
+    return min(capacities[r] // vector[r] for r in range(n)) * sum(vector)
+
+
+def cp_token_speed_vector(
+    capacities: Sequence[int],
+    bandwidth_weights: Sequence[int],
+    loose_ctx_percent: float,
+    grain: int = 64,
+    hard_cap: Optional[int] = None,
+) -> tuple:
+    """KV-token ownership vector for --rank-kv-ratio speed.
+
+    THE TRADE-OFF. Two vectors are of interest and they pull in opposite
+    directions on a heterogeneous rig:
+
+      * proportional to CAPACITY  -> maximises max_total_num_tokens, and hands
+        the biggest token share to whichever ranks have the most free VRAM
+        after weights -- typically the WEAK cards.
+      * proportional to BANDWIDTH -> minimises the deep-context part of the
+        decode step, because under DCP each rank runs attention over the tokens
+        it owns and at bs=1 the group waits on the slowest rank.
+
+    This walks the straight line between the two share vectors and returns the
+    most bandwidth-shifted point that still funds the allowed context, i.e. the
+    largest t in [0, 1] with
+
+        budget(partition(t*bw_share + (1-t)*cap_share)) >= floor
+
+    where floor = best_effective_budget * (1 - loose_ctx_percent/100).
+
+    `hard_cap` is the other ceiling on max_total_num_tokens (the hybrid
+    mamba/SWA cap = max_running_requests x context_len, which on hybrid models
+    routinely binds far below the KV-derived budget). It matters because the
+    user-visible quantity is min(kv_budget, hard_cap): while the cap binds, a
+    bandwidth shift costs literally nothing and should be taken in full even at
+    the default loose_ctx_percent=0. Without this the mode would refuse every
+    free gain on exactly the models where the gain is largest.
+
+    Deterministic pure function of its arguments -- every rank derives the same
+    vector from the same all-gathered capacities, which is the invariant the
+    phase-2 install depends on.
+
+    Returns (vector, budget, t) with the vector gcd-reduced."""
+    n = len(capacities)
+    assert len(bandwidth_weights) == n and n > 0
+    assert all(c > 0 for c in capacities) and all(w > 0 for w in bandwidth_weights)
+
+    def effective(vec):
+        b = cp_token_context_budget(vec, capacities)
+        return min(b, hard_cap) if hard_cap else b
+
+    cap_vec = partition_units(grain, list(capacities))
+    floor = int(effective(cap_vec) * (1.0 - float(loose_ctx_percent) / 100.0))
+
+    cap_sum = float(sum(capacities))
+    bw_sum = float(sum(bandwidth_weights))
+    cap_share = [c / cap_sum for c in capacities]
+    bw_share = [w / bw_sum for w in bandwidth_weights]
+
+    best = None
+    for i in range(grain, -1, -1):
+        t = i / float(grain)
+        blend = [
+            t * bw_share[r] + (1.0 - t) * cap_share[r] for r in range(n)
+        ]
+        # partition_units takes integer weights; scale the blend up so the
+        # rounding granularity does not swallow small differences.
+        vec = partition_units(grain, [max(1, int(round(x * 10**6))) for x in blend])
+        if any(v <= 0 for v in vec):
+            continue
+        if effective(vec) >= floor:
+            best = (vec, t)
+            break
+    if best is None:  # cap_vec itself always meets its own floor
+        best = (cap_vec, 0.0)
+    vec, t = best
+    g = math.gcd(*vec)
+    vec = [v // g for v in vec]
+    return vec, cp_token_context_budget(vec, capacities), t
+
+
 def partition_units(
     units: int, weights: Sequence[int], groups: Optional[int] = None
 ) -> list:
