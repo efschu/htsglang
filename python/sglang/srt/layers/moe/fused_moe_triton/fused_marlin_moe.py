@@ -221,9 +221,13 @@ def fused_marlin_moe(
     intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
+    # Vendor first (#171): ">= 9" here means "sm90+ has native bf16 atomicAdd",
+    # an NVIDIA statement, and the capability namespaces collide (gfx942
+    # reports (9, 4)). Marlin is CUDA-only, so off NVIDIA the branch simply
+    # does not arise.
     use_atomic_add = (
         hidden_states.dtype == torch.half
-        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+        or (_is_cuda and torch.cuda.get_device_capability(hidden_states.device)[0] >= 9)
     ) and (not is_mxfp4_marlin)
 
     intermediate_cache1 = moe_wna16_marlin_gemm(

@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     ceil_align,
     ceil_div,
     get_bool_env_var,
+    get_cuda_sm,
     get_cuda_version,
     get_device_capability,
     get_hip_version,
@@ -253,8 +254,11 @@ def fp8_native_gemm_available() -> bool:
         torch._scaled_mm(a, b, scale_a=scale, scale_b=scale, out_dtype=torch.float16)
         return True
     except Exception as e:  # noqa: BLE001 - any failure means "not available"
-        logger.info("No native fp8 GEMM on this device (%s); "
-                    "fp8 checkpoints will run through the dequant fallback.", e)
+        logger.info(
+            "No native fp8 GEMM on this device (%s); "
+            "fp8 checkpoints will run through the dequant fallback.",
+            e,
+        )
         return False
 
 
@@ -2239,13 +2243,14 @@ def can_auto_enable_marlin_fp8() -> bool:
     multimodal_gen runtime do not -- on sm8x their non-Marlin branch needs a
     native/cutlass fp8 GEMM or triton's fp8e4nv, none of which exist on Ampere.
     Gating here would silently break those; see deterministic_fp8_marlin_disabled.
+
+    Asked in the NVIDIA namespace (#171): "sm80..sm88" is an NVIDIA range and
+    Marlin has no ROCm kernel, while the raw capability reader answers in the
+    caller's vendor namespace -- gfx803 reports (8, 0), landing inside the
+    range on a card Marlin was never built for.
     """
-    try:
-        major, minor = get_device_capability()
-        sm = major * 10 + minor
-        return 80 <= sm < 89
-    except Exception:
-        return False
+    sm = get_cuda_sm()
+    return sm is not None and 80 <= sm < 89
 
 
 def apply_fp8_ptpc_linear(

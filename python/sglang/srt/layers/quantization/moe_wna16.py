@@ -29,7 +29,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_device_capability, set_weight_attrs
+from sglang.srt.utils import get_device_capability, is_hip, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +104,15 @@ class MoeWNA16Config(QuantizationConfig):
                 else capability_tuple[0] * 10 + capability_tuple[1]
             )
             awq_min_capability = AWQConfig.get_min_capability()
-            if device_capability < awq_min_capability:
+            # Vendor first (#171): AWQConfig.get_min_capability() is an NVIDIA
+            # compute capability and may only be compared against a capability
+            # read in the NVIDIA namespace. get_device_capability() answers in
+            # whichever namespace the torch build belongs to and the two
+            # COLLIDE -- gfx900 reports (9, 0), gfx1030 (10, 3) -- so on ROCm
+            # this comparison was meaningless in both directions. The floor
+            # does not apply there: moe_wna16 runs through the Triton MoE
+            # runner, which carries no NVIDIA capability requirement.
+            if not is_hip() and device_capability < awq_min_capability:
                 raise ValueError(
                     "The quantization method moe_wna16 + awq is not supported "
                     "for the current GPU. "
@@ -186,13 +194,14 @@ class MoeWNA16Config(QuantizationConfig):
         )
         # Avoid circular import
         awq_min_capability = AWQConfig.get_min_capability()
+        # Vendor first (#171): the floor is an NVIDIA number, so it may only be
+        # applied to a capability read in the NVIDIA namespace. On ROCm the
+        # reported tuple is an AMD arch (gfx900 -> (9, 0)) and the comparison
+        # is meaningless; the floor does not apply there.
+        awq_capability_ok = is_hip() or device_capability >= awq_min_capability
 
         gptq_compatible = quant_method == "gptq" and not desc_act and num_bits in [4, 8]
-        awq_compatible = (
-            quant_method == "awq"
-            and num_bits == 4
-            and device_capability >= awq_min_capability
-        )
+        awq_compatible = quant_method == "awq" and num_bits == 4 and awq_capability_ok
 
         return gptq_compatible or awq_compatible
 
@@ -533,9 +542,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
                     # dim0 = intermediate // bit8_pack_factor rows of one
                     # w1/w3 half; unit granularity follows layer.moe_tp_units
                     # (group-aligned, so row cuts stay pack-aligned).
-                    start, size = _plan_slice(
-                        loaded_weight.size(0), layer.moe_tp_units
-                    )
+                    start, size = _plan_slice(loaded_weight.size(0), layer.moe_tp_units)
                     tensor = loaded_weight.narrow(0, start, size)
                 else:
                     tensor = loaded_weight.view(
@@ -549,9 +556,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 if _uneven:
                     # dim1 = intermediate // group_size cols (the quantized
                     # input dim of down_proj).
-                    start, size = _plan_slice(
-                        loaded_weight.size(1), layer.moe_tp_units
-                    )
+                    start, size = _plan_slice(loaded_weight.size(1), layer.moe_tp_units)
                     param.data[expert_id] = loaded_weight.narrow(1, start, size)
                 else:
                     param.data[expert_id] = loaded_weight.view(

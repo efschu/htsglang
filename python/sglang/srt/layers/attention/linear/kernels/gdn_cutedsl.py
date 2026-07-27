@@ -16,16 +16,22 @@ from sglang.jit_kernel.cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rul
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.utils import cuda_sm_at_least, get_cuda_sm
 
 logger = logging.getLogger(__name__)
 
 
 def _is_blackwell() -> bool:
-    """True iff running on SM100+ (Blackwell) where the ported kernel is valid."""
-    if not torch.cuda.is_available():
-        return False
-    major, _ = torch.cuda.get_device_capability()
-    return major >= 10
+    """True iff running on SM100+ (Blackwell) where the ported kernel is valid.
+
+    "Blackwell" is an NVIDIA statement, so it is asked in the NVIDIA namespace
+    (#171). The bare ``major >= 10`` this replaces was vendor-blind and the
+    namespaces collide: gfx1030 reports ``(10, 3)`` -- the same integer as a
+    B300 -- and gfx1100 reports ``(11, 0)``, so RDNA2/RDNA3 cards identified
+    as Blackwell and were routed into a tcgen05/TMA kernel that cannot exist
+    on them.
+    """
+    return cuda_sm_at_least(10)
 
 
 class CuteDSLGDNKernel(LinearAttnKernelBase):
@@ -53,13 +59,10 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
         if self._extend_fn is not None:
             return
         if not self.supports_prefill:
-            major = (
-                torch.cuda.get_device_capability()[0]
-                if torch.cuda.is_available()
-                else -1
-            )
+            sm = get_cuda_sm()
             raise RuntimeError(
-                f"CuTe DSL GDN prefill requires SM100+ (Blackwell); got SM{major}."
+                "CuTe DSL GDN prefill requires SM100+ (Blackwell); got "
+                + (f"SM{sm}." if sm is not None else "a non-NVIDIA device.")
             )
         if head_k_dim != 128:
             raise RuntimeError(

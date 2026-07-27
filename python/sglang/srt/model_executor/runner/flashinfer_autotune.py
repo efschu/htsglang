@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import cuda_sm_at_least
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -102,7 +103,10 @@ def should_run_flashinfer_autotune(
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
         return False
 
-    if torch.cuda.get_device_capability()[0] < 9:
+    # NVIDIA namespace (#171): FlashInfer autotuning is a CUDA-only concern and
+    # "sm90+" is an NVIDIA statement, while the raw capability collides across
+    # vendors (gfx942 reports (9, 4)).
+    if not cuda_sm_at_least(9):
         return False
 
     if mr.spec_algorithm.is_speculative():
