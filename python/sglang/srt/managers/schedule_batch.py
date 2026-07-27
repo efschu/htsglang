@@ -844,6 +844,15 @@ class Req(ReqDllmMixin):
         # scheduler at admission. Used by the anti-starvation reserved-heavy-slots
         # floor. Default False keeps the standard (heavy) path unchanged.
         self.is_fast_lane = False
+        # kv-session-offload spill (latency) class, tagged by the scheduler at
+        # admission from the request's `spill_class` field: "never" | "normal"
+        # | "preferred". Consulted only by the offload manager's victim
+        # selection; the default "normal" keeps the stock FCFS order. Spelled
+        # as a literal rather than importing kv_session_offload.SPILL_CLASS_
+        # NORMAL: this module's import block is already an E402 region and Req
+        # construction is on the per-request path. The two are pinned together
+        # by test_kv_spill_class_unit.test_req_defaults_to_normal.
+        self.spill_class = "normal"
 
         # For incremental decoding
         # ----- | --------- read_ids -------|

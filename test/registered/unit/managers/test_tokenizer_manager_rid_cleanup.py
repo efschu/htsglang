@@ -409,6 +409,7 @@ def _make_tm_for_generate() -> TokenizerManager:
     tm.server_args.tokenizer_worker_num = 1
     tm.auto_create_handle_loop = Mock()
     tm._set_default_priority = Mock()
+    tm._set_default_spill_class = Mock()
     tm.request_logger = Mock()
     tm.tokenizer = None
     tm.is_pause = False

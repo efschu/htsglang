@@ -1708,6 +1708,28 @@ class ServerArgs:
             "demotion; inert while no budget regler is armed. Default 256.",
         ),
     ] = 256
+    kv_session_offload_default_spill_class: A[
+        str,
+        Arg(
+            choices=["preferred", "normal", "never"],
+            help="kv-session-offload: server-wide DEFAULT for the per-session "
+            "spill (latency) class, used for every request that does not set "
+            "`spill_class` itself. The class is the operator's / caller's "
+            "regler over WHICH session loses device residency under KV "
+            "pressure -- nothing in the runtime infers it from traffic. "
+            "'never' = latency-critical, never a spill victim (tabu like the "
+            "oldest-running session, and tabu under fast-lane pressure too: a "
+            "fast request that would only fit by evicting a 'never' session "
+            "stays queued instead). 'preferred' = latency-tolerant, offered "
+            "as the victim before any normal session, ahead of FCFS. "
+            "'normal' (DEFAULT) = today's pure FCFS order; with every session "
+            "in this class the victim selection is byte-identical to the "
+            "pre-class behaviour. Setting the default to anything but "
+            "'normal' requires --enable-kv-session-offload. Per request, send "
+            "`spill_class` on /generate or via extra_body on the OpenAI "
+            "endpoints; an explicit value always wins over this default.",
+        ),
+    ] = "normal"
     kv_session_offload_destinations: A[
         Optional[str],
         Arg(
@@ -4693,6 +4715,29 @@ class ServerArgs:
                 self.kv_session_offload_spill_cooldown_seconds,
             ),
         )
+        # Spill (latency) class: the DEFAULT is the only part validated here;
+        # per-request values are validated at the API boundary (tokenizer
+        # manager). Canonical value list lives in managers/kv_session_offload
+        # (SPILL_CLASSES); repeated as a literal so arg-parse stays free of
+        # torch imports.
+        if self.kv_session_offload_default_spill_class not in (
+            "preferred",
+            "normal",
+            "never",
+        ):
+            raise ValueError(
+                "--kv-session-offload-default-spill-class must be one of "
+                "'preferred', 'normal', 'never'; got "
+                f"{self.kv_session_offload_default_spill_class!r}."
+            )
+        if (
+            self.kv_session_offload_default_spill_class != "normal"
+            and not self.enable_kv_session_offload
+        ):
+            raise ValueError(
+                "--kv-session-offload-default-spill-class requires "
+                "--enable-kv-session-offload."
+            )
         for _name, _val in _budget_flags:
             if _val and not self.enable_kv_session_offload:
                 raise ValueError(

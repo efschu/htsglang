@@ -769,13 +769,64 @@ def assign_owner_matched_slots(
     return out
 
 
-def session_priority_key(req) -> Tuple[int, int]:
+# -- per-session spill (latency) class -----------------------------------
+#
+# A user-supplied regler, never inferred: the caller declares how tolerant a
+# session is of losing device residency. Nothing in the runtime promotes or
+# demotes a session between classes.
+#   "never"     -- latency-critical; tabu as a spill victim, exactly like the
+#                  oldest-running / sole-session rule. Tabu also under
+#                  fast-lane pressure (a fast request that only fits by
+#                  evicting a 'never' session stays queued instead).
+#   "normal"    -- today's FCFS order (DEFAULT; the whole feature is inert
+#                  while every session carries it).
+#   "preferred" -- latency-tolerant; offered as a victim BEFORE any normal
+#                  session, ahead of FCFS.
+SPILL_CLASS_NEVER = "never"
+SPILL_CLASS_NORMAL = "normal"
+SPILL_CLASS_PREFERRED = "preferred"
+SPILL_CLASSES = (SPILL_CLASS_PREFERRED, SPILL_CLASS_NORMAL, SPILL_CLASS_NEVER)
+
+# Protection rank inside session_priority_key: HIGHER = MORE protected. The
+# absent / unknown / default case must yield the NORMAL rank so that a fleet
+# which never sets the field keeps exactly today's ordering.
+_SPILL_CLASS_RANK = {
+    SPILL_CLASS_PREFERRED: 0,
+    SPILL_CLASS_NORMAL: 1,
+    SPILL_CLASS_NEVER: 2,
+}
+_SPILL_RANK_NORMAL = _SPILL_CLASS_RANK[SPILL_CLASS_NORMAL]
+
+
+def spill_class_of(req) -> str:
+    """The request's spill class, defaulting to NORMAL.
+
+    Deliberately tolerant: an unset attribute, ``None`` and an unknown string
+    all resolve to "normal". The value is validated once at the API boundary
+    (tokenizer manager) and at arg-parse (server default), so an unknown value
+    reaching here means an internal path that never carried the field -- which
+    must behave exactly like today rather than raise inside the spill hot
+    path."""
+    cls = getattr(req, "spill_class", None)
+    return cls if cls in _SPILL_CLASS_RANK else SPILL_CLASS_NORMAL
+
+
+def spill_class_rank(req) -> int:
+    return _SPILL_CLASS_RANK[spill_class_of(req)]
+
+
+def session_priority_key(req) -> Tuple[int, int, int]:
     """Pure spill-protection ordering (HIGHER key = MORE protected):
 
-        (is_fast_lane, -arrival_seq)
+        (spill_class_rank, is_fast_lane, -arrival_seq)
 
-    * Fast-lane requests rank above EVERY normal request (they are never
-      spill victims; user decision: fast beats FCFS).
+    * The per-session spill class dominates: a 'never' session outranks every
+      other, a 'preferred' one ranks below every other. With no class set
+      anywhere the leading element is the constant NORMAL rank, so the
+      ordering degenerates to the pre-class ``(is_fast_lane, -arrival_seq)``
+      -- byte-identical.
+    * Fast-lane requests rank above EVERY normal request of the same spill
+      class (they are never spill victims; user decision: fast beats FCFS).
     * Within a class, the OLDER request (smaller arrival_seq) is more
       protected -- so two fast-lane requests order FCFS among themselves,
       exactly like two normal ones.
@@ -784,7 +835,7 @@ def session_priority_key(req) -> Tuple[int, int]:
     seq = getattr(req, "kv_arrival_seq", -1)
     if seq is None:
         seq = -1
-    return (fast, -seq)
+    return (spill_class_rank(req), fast, -seq)
 
 
 def select_spill_victim(
@@ -808,9 +859,23 @@ def select_spill_victim(
     byte-identical to the pre-#236 behaviour. The cooldown can only ever
     REMOVE victims, never add one.
 
+    SPILL CLASS (user regler): a session declared ``spill_class="never"`` is
+    removed from the candidate set outright -- the same kind of tabu as the
+    sole-session rule, and it holds under fast-lane pressure too (a fast
+    request that would only fit by evicting a 'never' session stays queued;
+    the user asked for that session's latency, not the scheduler). A
+    ``"preferred"`` session sorts below every normal one and is therefore
+    offered as the victim first, ahead of FCFS. With no class set anywhere
+    both effects vanish and the selection is byte-identical.
+
     fast_pressure=False (plain decode-OOM among normal sessions): the
     OLDEST running normal session is untouchable (removed from the
-    candidate set entirely).
+    candidate set entirely). "Oldest" is resolved by the same protection
+    key, so when 'preferred' sessions are present the tabu falls on the
+    oldest NON-preferred one and every 'preferred' session -- including the
+    oldest -- stays victimizable. If ALL candidates are 'preferred' the
+    most-protected of them keeps the tabu, so a lone session still never
+    self-spills.
     fast_pressure=True (a fast-lane request needs device space): fast
     beats FCFS -- any normal session may be victimized, INCLUDING the
     oldest. Fast-lane requests are never victims either way.
@@ -835,7 +900,10 @@ def select_spill_victim(
     handled by the stock retraction fallback / an S2 multi-eviction).
     """
     candidates = [
-        i for i in range(len(reqs)) if not getattr(reqs[i], "is_fast_lane", False)
+        i
+        for i in range(len(reqs))
+        if not getattr(reqs[i], "is_fast_lane", False)
+        and spill_class_of(reqs[i]) != SPILL_CLASS_NEVER
     ]
     if not candidates:
         return None

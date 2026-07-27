@@ -129,6 +129,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
             lane=request.lane,
+            spill_class=request.spill_class,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,

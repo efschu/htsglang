@@ -694,6 +694,7 @@ def _fake_server_args(**over):
         kv_session_offload_spill_hysteresis_steps=0,
         kv_session_offload_spill_cooldown_seconds=0.0,
         kv_session_offload_budget_demote_grace_iters=256,
+        kv_session_offload_default_spill_class="normal",
         # #224 destination flags (unset -> inert; the merged validator
         # reads both the budget and the destination attribute sets)
         kv_session_offload_destinations=None,
