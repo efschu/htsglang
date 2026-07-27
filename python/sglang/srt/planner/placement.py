@@ -1206,13 +1206,19 @@ def _graph_mib_for_rank(graph_mem, r):
 def _mamba_sessions(model, flags):
     """Session-slot count behind the mamba pool. MIRRORS the sizing in
     ``PerfCostModel._mamba_pool_bytes`` (slots = ceil(min(target,48) * 5 *
-    1.25) + spec pad) so per_session * sessions == pool byte-exact -- keep
-    the two in sync."""
-    target = min(flags.max_running_requests or 16, 48)
-    ratio = 5
-    slots = math.ceil(target * ratio * 1.25)
-    d = model.spec_draft_tokens if model.spec_active else 0
-    return slots + min(target, slots // ratio) * d
+    1.25) + spec pad) so per_session * sessions == pool byte-exact -- the
+    slot arithmetic itself lives in ``mrr_balance.state_slot_count``, called
+    here with the predictor's target clamp so there is one copy of it."""
+    from sglang.srt.planner.mrr_balance import (
+        PREDICTOR_TARGET_CLAMP,
+        state_slot_count,
+    )
+
+    return state_slot_count(
+        flags.max_running_requests or 16,
+        draft_tokens=model.spec_draft_tokens if model.spec_active else 0,
+        clamp=PREDICTOR_TARGET_CLAMP,
+    )
 
 
 def _compute_breakdown(

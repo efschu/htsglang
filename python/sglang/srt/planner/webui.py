@@ -436,6 +436,14 @@ def _plan_to_dict(result, model_path: str) -> dict:
             if getattr(result, "roofline_energy", None) is not None
             else None
         ),
+        # #253: suggested --max-running-requests per target context (the
+        # GDN-state/KV balance point). Advisory — the dashboard renders it,
+        # nothing applies it.
+        "mrr_balance": (
+            dataclasses.asdict(result.mrr_balance)
+            if getattr(result, "mrr_balance", None) is not None
+            else None
+        ),
     }
 
 

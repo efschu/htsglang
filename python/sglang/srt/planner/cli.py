@@ -545,6 +545,50 @@ def _fmt_tokens(x: float) -> str:
     return f"~{int(x):,}"
 
 
+def _print_mrr_balance(result) -> None:
+    """The GDN-state / KV balance point for --max-running-requests (#253).
+
+    Printed as a SUGGESTION: the plan above was computed with whatever
+    concurrency was passed in, and this block does not change it.
+    """
+    bal = getattr(result, "mrr_balance", None)
+    if bal is None or not bal.points:
+        return
+    cur = bal.current_max_running_requests
+    print(
+        "--max-running-requests balance point (GDN state vs KV — SUGGESTION, "
+        "not applied):"
+    )
+    print(
+        f"  state pool: {bal.state_mib_per_slot:.1f} MiB/slot "
+        f"(model total, per rank {', '.join(f'{m:.1f}' for m in bal.state_mib_per_slot_per_rank)}) "
+        f"= {bal.state_mib_per_session:.0f} MiB per admitted session "
+        f"(x{bal.mamba_ratio * bal.safety_margin:g} slots), "
+        "context-independent"
+    )
+    print(
+        f"  KV cell: {bal.kv_cell_bytes / 1024:.1f} KiB/token -> one session's "
+        f"state weighs its own KV at {bal.break_even_context_tokens:,.0f} "
+        "tokens of context"
+    )
+    for p in bal.points:
+        delta = ""
+        if p.sessions_at_current is not None:
+            delta = (
+                f" (at --max-running-requests {cur}: "
+                f"{p.sessions_at_current} session(s))"
+            )
+        print(
+            f"  {p.target_context_tokens:>6,} tok/session -> "
+            f"--max-running-requests {p.recommended_max_running_requests}: "
+            f"{p.sessions} session(s), KV {_fmt_tokens(p.kv_tokens)} tok, "
+            f"state pool {p.mamba_gib:.1f} GiB [{p.binding}-bound]{delta}"
+        )
+    if bal.predictor_clamp_note:
+        print(f"  ! {bal.predictor_clamp_note}")
+    print()
+
+
 def _print_report(result, model_path: str) -> None:
     hw = result.hardware
     cap = result.capacity
@@ -614,6 +658,8 @@ def _print_report(result, model_path: str) -> None:
             )
         print(f"MLP unit partition: {cap.mlp_units}")
     print()
+
+    _print_mrr_balance(result)
 
     adv = result.advantage
     if adv is None:
@@ -970,6 +1016,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             "roofline_estimate": (
                 dataclasses.asdict(result.roofline)
                 if getattr(result, "roofline", None) is not None
+                else None
+            ),
+            "mrr_balance": (
+                dataclasses.asdict(result.mrr_balance)
+                if getattr(result, "mrr_balance", None) is not None
                 else None
             ),
         }
