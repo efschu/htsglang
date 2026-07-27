@@ -522,10 +522,22 @@ uneven-TP/DCP machinery, which has no upstream analog (see rows 1/2/18 for that 
 - **Tree speculative decoding with `--speculative-eagle-topk > 1` under asymmetric-weighted DCP
   (#76)** — implemented and GPU-tested; found silently non-greedy under weighted DCP and
   perf-negative on this rig; restored as a hard fail-fast guard with a CPU test.
-- **SWA-DCP Stage B** — **not implemented.** (Corrected 2026-07-25: previously misstated as
-  "implemented and evaluated (~+6-10%)". The DCP Triton extend path still raises
-  `NotImplementedError` for sliding windows; the ~+6-10% figure was an ex-ante design estimate, not
-  a measurement.) Gemma-4 SWA long-context is served instead by `--swa-pool-sizing` (row 19).
+- **SWA-DCP Stage B (#96)** — **implemented, CPU-pinned, NOT GPU-validated** (2026-07-26,
+  `feat/swa-dcp-triton`). The ~10 global full-attention layers of an SWA-hybrid (Gemma-4 class) are
+  token-sharded by the weighted owner rule of #173; the ~50 sliding-window layers keep their
+  unsharded local path, so no `(owner slice ∩ window)` masking arises at all (the window-sharding
+  alternative was measured against and rejected in #91 §4). Requires `--swa-pool-sizing cap`
+  (Stage A, row 19) — in ratio mode the unsharded SWA pool would be scaled by the *global* context
+  budget. Refused: HiCache, speculative decoding, MLA, weightless-KV, pure-SWA models. The
+  **~+6-10% figure remains an ex-ante design estimate, not a measurement**; the boot/coherence/
+  capacity recipe is `docs_new/swa_dcp_stage_b_triton.md` §8 and nothing in it has been run. Until
+  it has, Gemma-4 SWA long-context in production is still served by `--swa-pool-sizing` alone
+  (row 19).
+  Carried along, because Stage B is where it bites: `_plan_aware_dcp_group_q_head_counts` took
+  `max()` over a hybrid model's two kv-head bases, which is right for a workspace size and wrong
+  for a collective's per-rank counts — for 32 q heads over bases {16, 8} and ratios [5,3,2] the max
+  is `[16,10,8]`, sum 34 against a total of 32. Collectives now use the full-attention base with an
+  exhaustiveness check; single-base models are byte-identical.
 - **Replicated-KV eligibility widened to `kv == tp` (the `<` -> `<=` flip, row 1)** —
   implemented, red/green-tested on CPU, and GPU-measured; the measurement **refuted** it: at
   `kv == tp` the alignment repair that makes uneven splits work at `kv < tp` has no room to

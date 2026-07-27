@@ -1945,6 +1945,74 @@ class ModelRunnerKVCacheMixin:
             return self.model_config.get_total_num_kv_heads()
         return self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
 
+    def _swa_hybrid_dcp_lane(self: ModelRunner) -> bool:
+        """Is this rank serving SWA-hybrid uneven DCP? (#96, Stage B)
+
+        Thin adapter over the shared predicate ``swa_hybrid_dcp_lane`` -- the
+        SAME function ``TritonAttnBackend.__init__`` calls -- so the KV pool and
+        the attention backend can never be in different modes (pool sized for a
+        token split the backend does not perform, or the reverse: the classic
+        right-token/wrong-slot corruption).
+
+        The two configurations that would be silently wrong rather than merely
+        unsupported are rejected HERE, at pool construction, before a byte is
+        allocated:
+
+        * ratio-sized SWA pool. In ratio mode the SWA pool is
+          ``swa_full_tokens_ratio * full_tokens``, and under DCP ``full_tokens``
+          is the GLOBAL context C -- while the SWA pool is not sharded at all.
+          That is the pre-#90 OOM disease multiplied by the token split (the
+          measured "un-sharded SWA pool sized at the global 249472 budget and
+          OOM'd outright" in _swa_hybrid_kv_token_cap's docstring). Stage B
+          requires Stage A: --swa-pool-sizing cap (or --disable-radix-cache,
+          which routes to the same configurator).
+        * HiCache. ``cache_controller._dcp_kv_transfer_pairs`` translates device
+          indices through the owner rule and drops the unowned ones; it is
+          pool-agnostic, so it would apply that compaction to the SWA index
+          stream too, where slots are LOCAL and unsharded.
+        """
+        from sglang.srt.distributed.utils import uneven_dcp_kv_replicated
+        from sglang.srt.layers.dcp.owner import swa_hybrid_dcp_lane
+
+        if not self.is_hybrid_swa or self.is_draft_worker:
+            return False
+        if not uneven_dcp_kv_replicated(self.dcp_size):
+            return False
+        n_full = len(self.model_config.full_attention_layer_ids)
+        n_swa = len(self.model_config.swa_attention_layer_ids)
+        sa = self.server_args
+        capped = sa.swa_pool_sizing == "cap" or bool(sa.disable_radix_cache)
+        lane = swa_hybrid_dcp_lane(
+            is_hybrid_swa=True,
+            uneven_plan=True,
+            is_draft_worker=False,
+            num_full_layers=n_full,
+            num_swa_layers=n_swa,
+            swa_pool_sizing_capped=capped,
+        )
+        if not lane:
+            if n_full > 0 and n_swa > 0 and not capped:
+                raise ValueError(
+                    "SWA-hybrid uneven DCP (--dcp-size with a --rank-tp-ratio "
+                    "plan on a sliding-window model) requires the cap-sized SWA "
+                    "pool: pass --swa-pool-sizing cap (task #91 Stage A) or "
+                    "--disable-radix-cache. In ratio mode the SWA pool would be "
+                    f"sized {sa.swa_full_tokens_ratio} x the GLOBAL context "
+                    "budget while it is not token-sharded at all -- every rank "
+                    "would try to hold a multiple of its own reach and OOM. "
+                    "Alternatively drop --dcp-size."
+                )
+            return False
+        if getattr(self.server_args, "enable_hierarchical_cache", False):
+            raise ValueError(
+                "SWA-hybrid uneven DCP (#96) does not support the hierarchical "
+                "cache: the device<->host index translation applies the DCP "
+                "owner rule to every stream, but the sliding-window sub-pool is "
+                "local and unsharded, so its slots would be compacted and "
+                "dropped. Drop --enable-hierarchical-cache, or drop --dcp-size."
+            )
+        return True
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
@@ -2502,11 +2570,15 @@ class ModelRunnerKVCacheMixin:
         else:
             if self.is_hybrid_swa:
                 kwargs = {}
-                if self.is_hybrid_swa_compress:
+                if self.is_hybrid_swa_compress or self._swa_hybrid_dcp_lane():
                     kwargs = {
                         # Plan-aware per-rank SWA kv-head count (uneven TP);
                         # falls back to max(1, swa_kv_heads // tp) without a
-                        # plan.
+                        # plan. Under the SWA-hybrid DCP lane (#96) this is
+                        # passed for ANY hybrid model, not only the compress
+                        # archs: the two sub-pools then genuinely differ (full =
+                        # replicated total kv heads, swa = this rank's shard),
+                        # so the SWA sub-pool must state its own count.
                         "swa_head_num": self.model_config.get_swa_num_kv_heads(
                             get_parallel().attn_tp_size
                         ),
@@ -2514,12 +2586,53 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.v_head_dim,
                     }
+                # SWA-HYBRID UNEVEN DCP (#96, Stage B). Only the GLOBAL
+                # full-attention layers are token-sharded:
+                #   full sub-pool: rows = this rank's owned share of the global
+                #     context C, each row carrying ALL total_num_kv_heads
+                #     (the attention write gathers them) -- exactly the
+                #     HybridLinearKVPool treatment a few branches above;
+                #   swa sub-pool: UNCHANGED. Every rank holds every in-window
+                #     position of its own kv-head shard, so its size stays the
+                #     rank-local window-bounded cap and its head count stays the
+                #     per-rank SWA shard. Sharding the window instead was
+                #     measured against and rejected (see #91 section 4).
+                _swa_full_size = self.full_max_total_num_tokens
+                _swa_full_head_num = self._pool_kv_head_num()
+                if self._swa_hybrid_dcp_lane():
+                    from sglang.srt.distributed.utils import (
+                        cp_token_split_factor,
+                        get_cp_token_ratios,
+                    )
+                    from sglang.srt.layers.dcp.owner import dcp_compact_pool_rows
+
+                    _swa_S = cp_token_split_factor(self.dcp_size)
+                    _swa_ratio_r = get_cp_token_ratios()[get_parallel().attn_dcp_rank]
+                    _swa_full_size = dcp_compact_pool_rows(
+                        self.full_max_total_num_tokens, _swa_S, _swa_ratio_r
+                    )
+                    _swa_full_head_num = self.model_config.get_total_num_kv_heads()
+                    logger.info(
+                        "SWA-hybrid uneven DCP (#96): full sub-pool %d rows "
+                        "(global context %d, S=%d, ratio %d) x %d replicated kv "
+                        "heads for %d global layers; swa sub-pool %d tokens x %d "
+                        "kv heads for %d window layers (unsharded).",
+                        _swa_full_size,
+                        self.full_max_total_num_tokens,
+                        _swa_S,
+                        _swa_ratio_r,
+                        _swa_full_head_num,
+                        len(self.model_config.full_attention_layer_ids),
+                        self.swa_max_total_num_tokens,
+                        kwargs["swa_head_num"],
+                        len(self.model_config.swa_attention_layer_ids),
+                    )
                 self.token_to_kv_pool = SWAKVPool(
-                    size=self.full_max_total_num_tokens,
+                    size=_swa_full_size,
                     size_swa=self.swa_max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
-                    head_num=self._pool_kv_head_num(),
+                    head_num=_swa_full_head_num,
                     head_dim=self.model_config.head_dim,
                     swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
@@ -2605,19 +2718,17 @@ class ModelRunnerKVCacheMixin:
                     _ratios = get_cp_token_ratios()
                     _S = cp_token_split_factor(self.dcp_size)
                     _ratio_r = _ratios[get_parallel().attn_dcp_rank]
-                    # CEIL to a whole owner block: allocator slot ids reach
-                    # max_total_num_tokens itself, and any slot in a trailing
-                    # PARTIAL block (max_total % S != 0, e.g. an explicit,
-                    # unaligned --max-total-tokens) compacts to
-                    # (max_total // S) * ratio + off -- one block PAST the
-                    # floored sizing. Flooring let those top slots scatter
-                    # out of bounds once free-list churn handed them out
-                    # (async illegal-memory-access, found by the
-                    # kv-session-offload S1 test with --max-total-tokens
-                    # 3000 on S=64). Costs < one block of rows per rank.
-                    _hybrid_pool_size = (
-                        self.max_total_num_tokens // _S + 1
-                    ) * _ratio_r
+                    # This rank's OWNED rows for the global context budget.
+                    # dcp_compact_pool_rows carries the ceil-to-a-whole-owner-
+                    # block rule and the reason for it; it is shared with the
+                    # SWA-hybrid full sub-pool (#96) so the two pool families
+                    # cannot drift on a sizing rule whose off-by-one already
+                    # cost one out-of-bounds-scatter debugging round.
+                    from sglang.srt.layers.dcp.owner import dcp_compact_pool_rows
+
+                    _hybrid_pool_size = dcp_compact_pool_rows(
+                        self.max_total_num_tokens, _S, _ratio_r
+                    )
                 elif getattr(self, "_wl_spill_phys_tokens", 0):
                     # Weightless-KV B1 host spill: the DEVICE tensors are sized
                     # to the PROFILED capacity D (device slots + staging), NOT

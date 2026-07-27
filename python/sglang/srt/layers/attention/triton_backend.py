@@ -21,11 +21,13 @@ from sglang.srt.layers.dcp import (
     cp_all_gather_heads_uneven,
     cp_lse_ag_out_ar_mha_uneven,
     create_triton_kv_indices_for_dcp_triton,
+    dcp_token_sharded_layer,
     dcp_verify_mask_mode,
     dcp_verify_paged_lens,
     dcp_weighted_owner_bounds,
     dcp_weighted_write_slots,
     get_dcp_lens,
+    swa_hybrid_dcp_lane,
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -234,6 +236,25 @@ def _plan_aware_dcp_group_q_head_counts(
     cp_all_gather_heads_uneven asserts counts[rank] == local_heads, so a model
     whose reported per-rank head count disagrees with the plan fails loudly
     at the first forward instead of issuing a mismatched collective.
+
+    ONE KV-HEAD BASE HERE, NOT max() OVER BOTH (#96). The workspace-sizing
+    helpers (_plan_aware_num_q_heads, _plan_aware_dcp_gathered_q_heads) take the
+    max over a hybrid model's two kv-head bases, because over-allocating a
+    buffer is harmless and under-allocating writes out of bounds. These counts
+    are NOT a buffer size: they are a collective's per-rank byte counts and the
+    prefix sum the LSE merge slices this rank's heads back out with, so they
+    must be EXACT and EXHAUSTIVE. A hybrid model's two bases give two different
+    (each exhaustive) q partitions -- Gemma-4-31B TP=3 uneven measured q sliding
+    [8,14,10] and q full [8,16,8] -- and their per-rank max [8,16,10] sums to 34
+    against a total of 32: not a partition of anything. It would trip
+    cp_all_gather_heads_uneven's counts[rank] == local_heads assert on the rank
+    whose max is not its own count, or, where that passes, slice the wrong heads
+    out of the merge.
+
+    The base is the FULL-ATTENTION one, because those are the only layers that
+    enter a DCP collective: under the SWA-hybrid lane (#96) the sliding-window
+    layers are replicated and never gathered, and off that lane a model has one
+    base anyway (so single-base models are byte-identical to before).
     """
     from sglang.srt.distributed.utils import (
         attn_q_partition_groups,
@@ -250,26 +271,33 @@ def _plan_aware_dcp_group_q_head_counts(
         return [local_heads] * dcp_size
 
     total_q = model_config.num_attention_heads
-    kv_bases = {model_config.get_total_num_kv_heads()}
-    swa_kv = getattr(model_config.hf_text_config, "swa_num_key_value_heads", None)
-    if swa_kv:
-        kv_bases.add(swa_kv)
+    kv = model_config.get_total_num_kv_heads()
     # DCP groups are consecutive tp slices, so this rank's group is the
     # dcp_size-wide block its tp rank falls into.
     group_start = (get_parallel().attn_tp_rank // dcp_size) * dcp_size
-    return [
-        max(
-            tp_partition_size(
-                total_q,
-                tp_size,
-                r,
-                attn_q_partition_units(total_q, kv, tp_size),
-                groups=attn_q_partition_groups(kv, tp_size),
-            )
-            for kv in kv_bases
+    counts = [
+        tp_partition_size(
+            total_q,
+            tp_size,
+            r,
+            attn_q_partition_units(total_q, kv, tp_size),
+            groups=attn_q_partition_groups(kv, tp_size),
         )
         for r in range(group_start, group_start + dcp_size)
     ]
+    if dcp_size == tp_size and sum(counts) != total_q:
+        # The group spans the whole TP group, so the counts must partition the q
+        # heads exactly. Anything else means the gathered set is not the model's
+        # head set, and every consumer downstream (gather byte counts, merge
+        # slice offsets) is then wrong in a way that reads as garbage output
+        # rather than as an error. Fail here, naming the numbers.
+        raise ValueError(
+            f"DCP q-head counts {counts} sum to {sum(counts)} but the model has "
+            f"{total_q} q heads (kv base {kv}, tp {tp_size}). The per-rank q "
+            "shards must be an exhaustive partition -- a non-partition means "
+            "the head geometry helpers and the model disagree."
+        )
+    return counts
 
 
 def total_swa_kv_heads(model_config) -> Optional[int]:
@@ -306,6 +334,7 @@ def reject_unsupported_dcp_geometry(
     speculative: bool = False,
     speculative_tree: bool = False,
     sliding_window: bool = False,
+    swa_hybrid_dcp: bool = False,
 ) -> None:
     """Boot-time gate for every DCP geometry the Triton backend cannot serve.
 
@@ -332,6 +361,9 @@ def reject_unsupported_dcp_geometry(
         replication arithmetic of branch (3) deliberately does NOT apply here:
         under this lane every rank's pool row already holds every kv head, so
         the condition it checks is satisfied by construction of the pool.
+        #96 (Stage B) additionally serves SWA-HYBRID models on this lane, but
+        only under the Stage-B preconditions carried in ``swa_hybrid_dcp`` --
+        see the sliding-window sub-reason below.
 
     (2) A TOKEN VECTOR WITHOUT A PLAN. ``uneven_dcp_active`` sizes the pool by
         the weighted rule while ``uneven_dcp_kv_replicated`` decides whether
@@ -390,7 +422,17 @@ def reject_unsupported_dcp_geometry(
                 "non-deterministic under this very lane, so there is no "
                 "correct version to port. Use --speculative-eagle-topk 1"
             )
-        if sliding_window:
+        if sliding_window and not swa_hybrid_dcp:
+            # STAGE B (#96) OPENS THIS ONE, AND ONLY UNDER ITS PRECONDITIONS.
+            # ``swa_hybrid_dcp`` is swa_hybrid_dcp_lane(...): an SWA-HYBRID model
+            # (both sliding-window and global layers), cap-sized SWA pool, a
+            # --rank-tp-ratio plan, target worker. Then the token split is
+            # applied ONLY to the global full-attention layers -- the
+            # sliding-window layers keep their unsharded local path, so nothing
+            # ever has to causally mask a sparse owned-slot subset, which is
+            # what this refusal was about. Every other windowed configuration
+            # (pure-SWA model, ratio-sized SWA pool, draft worker) keeps the
+            # refusal verbatim.
             reasons.append(
                 "a sliding window is configured, and the DCP extend path "
                 "cannot causally mask a sparse owned-slot subset"
@@ -679,6 +721,27 @@ class TritonAttnBackend(AttentionBackend):
                 else tp_partition_sizes(_total_kv, _attn_tp_size, units=_total_kv)
             )
             self.num_kv_head = _total_kv
+        # SWA-HYBRID DCP LANE (#96, Stage B): the ~10 GLOBAL full-attention
+        # layers are token-sharded by the owner rule above; the ~50
+        # sliding-window layers keep their unsharded local path (each rank holds
+        # every in-window position of its own kv-head shard). The predicate is
+        # the shared swa_hybrid_dcp_lane(), the SAME function the KV-pool sizing
+        # uses, so the pool cannot be sized for one mode while the backend
+        # dispatches for the other. Configuration-only inputs, hence identical
+        # on every rank -- which is what makes the per-layer dispatch built on it
+        # safe to gate COLLECTIVES with.
+        _mc = model_runner.model_config
+        self.swa_hybrid_dcp = swa_hybrid_dcp_lane(
+            is_hybrid_swa=bool(getattr(model_runner, "is_hybrid_swa", False)),
+            uneven_plan=self.uneven_dcp,
+            is_draft_worker=self.is_draft_worker,
+            num_full_layers=len(getattr(_mc, "full_attention_layer_ids", None) or []),
+            num_swa_layers=len(getattr(_mc, "swa_attention_layer_ids", None) or []),
+            swa_pool_sizing_capped=(
+                model_runner.server_args.swa_pool_sizing == "cap"
+                or bool(model_runner.server_args.disable_radix_cache)
+            ),
+        )
         # DCP GEOMETRY GUARD -- see reject_unsupported_dcp_geometry for the
         # full reasoning of the three branches (the uneven lane and what of it
         # is still unserved; a token vector without a plan; even DCP needing
@@ -716,6 +779,7 @@ class TritonAttnBackend(AttentionBackend):
             sliding_window=(
                 self.sliding_window_size is not None and self.sliding_window_size > 0
             ),
+            swa_hybrid_dcp=self.swa_hybrid_dcp,
         )
         # The decode kernel's "// Lv" stride trick requires attn_logits.shape[-1]
         # to exactly match the layer's v_head_dim, so hybrid SWA models with
@@ -1872,6 +1936,29 @@ class TritonAttnBackend(AttentionBackend):
     ):
         pass
 
+    def _dcp_layer_token_sharded(self, layer: RadixAttention) -> bool:
+        """Is this layer's KV token-sharded across the DCP group? (#96)
+
+        THE per-layer dispatch: the write path, the extend path and the decode
+        path all ask this one question, so they cannot classify a layer
+        differently -- a layer written through the owner rule but read without it
+        (or the reverse) is silently wrong output, and a layer one rank shards
+        while another does not is a hang in the q all-gather.
+
+        GROUP-UNIFORM BY CONSTRUCTION, which is the reason it is spelled out
+        here instead of inline: both inputs are process-global configuration.
+        ``self.swa_hybrid_dcp`` comes from server args + model config, and the
+        layer's sliding window from the checkpoint's layer_types -- never from
+        anything this batch, request or rank produced. (The forbidden version of
+        this predicate is the one that asks "does THIS rank own any window
+        slots", which is exactly what sharding the window itself would have
+        forced; see docs_new/swa_dcp_stage_b_triton.md section 0.)
+        """
+        return dcp_token_sharded_layer(
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1,
+            swa_hybrid_lane=self.swa_hybrid_dcp,
+        )
+
     def _dcp_group_q_head_counts(self, local_heads: int) -> list:
         """This DCP group's per-rank q-head counts (see the module helper)."""
         return _plan_aware_dcp_group_q_head_counts(
@@ -2026,7 +2113,13 @@ class TritonAttnBackend(AttentionBackend):
         # DCP writes to the local physical shard (loc = out_cache_loc //
         # dcp_size) through the masked path so each rank only stores the tokens
         # it owns. Non-DCP keeps the original write loc and plain set_kv_buffer.
-        if self.dcp_size > 1:
+        #
+        # #96: under the SWA-hybrid lane a sliding-window layer is NOT
+        # token-sharded, so it takes the plain branch -- KVWriteLoc carries the
+        # pre-translated swa_loc, the kv heads stay this rank's SWA shard, and no
+        # dcp_kv_mask is produced at all. That write is then byte-for-byte the
+        # validated non-DCP uneven-TP SWA write.
+        if self.dcp_size > 1 and self._dcp_layer_token_sharded(layer):
             if self.uneven_dcp:
                 k, v = self._dcp_write_gather(layer, k, v)
             if self.uneven_dcp_weighted:
@@ -2143,7 +2236,10 @@ class TritonAttnBackend(AttentionBackend):
         ):
             causal = False
 
-        if self.dcp_size > 1:
+        # #96: a sliding-window layer under the SWA-hybrid lane falls THROUGH to
+        # the ordinary 2-stage window path below -- its KV is not token-sharded,
+        # so there is no owned-slot subset to mask and no cross-rank merge to do.
+        if self.dcp_size > 1 and self._dcp_layer_token_sharded(layer):
             return self._forward_extend_dcp(
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
             )
@@ -2317,6 +2413,13 @@ class TritonAttnBackend(AttentionBackend):
                 "verify must be refused at boot"
             )
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            # UNREACHABLE BY CONSTRUCTION since #96: forward_extend routes
+            # sliding-window layers to the local window path whenever the
+            # SWA-hybrid lane is on, and reject_unsupported_dcp_geometry refuses
+            # a windowed model on this lane when it is off. Kept as the assertion
+            # it now is: if a future dispatch change lets a window layer in here,
+            # the paged read would silently attend a sparse owned-slot subset
+            # with no window mask (wrong output, no crash).
             raise NotImplementedError(
                 "DCP Triton extend does not support sliding window"
             )
@@ -2677,7 +2780,12 @@ class TritonAttnBackend(AttentionBackend):
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
 
-        if self.dcp_size > 1:
+        # #96: a sliding-window layer under the SWA-hybrid lane skips the DCP
+        # gather/merge entirely and takes the stock decode call below, reading
+        # window_kv_indptr/window_kv_indices (unsharded, full->swa translated)
+        # against its local kv-head shard. Every rank does the same work for that
+        # layer, which is the point: its KV is replicated, not sharded.
+        if self.dcp_size > 1 and self._dcp_layer_token_sharded(layer):
             group = get_parallel().dcp_group
             with use_symmetric_memory(group):
                 q_for_decode = q.view(

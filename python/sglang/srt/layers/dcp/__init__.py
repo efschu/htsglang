@@ -53,6 +53,8 @@ from sglang.srt.layers.dcp.layout import (
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 from sglang.srt.layers.dcp.owner import (
     build_dcp_weighted_kv_indices,
+    dcp_compact_pool_rows,
+    dcp_token_sharded_layer,
     dcp_verify_mask_mode,
     dcp_verify_paged_lens,
     dcp_verify_window_is_disjoint,
@@ -60,6 +62,7 @@ from sglang.srt.layers.dcp.owner import (
     dcp_weighted_owner_bounds,
     dcp_weighted_read_slots,
     dcp_weighted_write_slots,
+    swa_hybrid_dcp_lane,
 )
 
 # NOTE: planner.py is intentionally NOT imported here. It depends on server_args
@@ -83,9 +86,12 @@ __all__ = [
     "cp_lse_ag_out_ar_mha_uneven",
     "cp_lse_ag_out_rs_mha",
     "cp_lse_ag_out_rs_mla",
+    "dcp_compact_pool_rows",
+    "dcp_token_sharded_layer",
     "dcp_verify_mask_mode",
     "dcp_verify_paged_lens",
     "dcp_verify_window_is_disjoint",
+    "swa_hybrid_dcp_lane",
     "dcp_weighted_owned_lengths",
     "dcp_weighted_owner_bounds",
     "dcp_weighted_read_slots",

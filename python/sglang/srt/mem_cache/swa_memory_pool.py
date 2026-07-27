@@ -178,7 +178,20 @@ class SWAKVPool(BaseSWAKVPool):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
+        """Write one layer's KV to whichever sub-pool owns it.
+
+        ``dcp_kv_mask`` (#96, SWA-hybrid uneven DCP): the owner mask of the
+        weighted token split, applicable to the FULL sub-pool ONLY. Under that
+        lane the global full-attention layers are token-sharded -- ``loc`` is
+        already the compact physical row and the mask says which rows this rank
+        owns -- while the sliding-window layers are replicated across the DCP
+        group and written unmasked. A mask arriving on the SWA branch would mean
+        the attention backend's per-layer dispatch leaked, and would drop most of
+        the window (silently wrong output, not a crash), so it is asserted away
+        rather than forwarded.
+        """
         # loc_info bundles the full loc and the pre-translated SWA loc.
         loc, swa_loc, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
@@ -187,6 +200,12 @@ class SWAKVPool(BaseSWAKVPool):
             # swa_loc is the full->SWA translation, computed once per forward by
             # the attention backend; set_kv_buffer never translates internally.
             assert swa_loc is not None
+            assert dcp_kv_mask is None, (
+                "SWAKVPool: a sliding-window layer received a DCP owner mask. "
+                "Window layers are NOT token-sharded under the SWA-hybrid DCP "
+                "lane (#96); masking one would store only this rank's owned "
+                "share of a window every rank must hold in full."
+            )
             self.swa_kv_pool.set_kv_buffer(
                 None,
                 swa_loc,
@@ -197,6 +216,10 @@ class SWAKVPool(BaseSWAKVPool):
                 layer_id_override=layer_id_pool,
             )
         else:
+            # Forward the mask only when there IS one, so sub-pool classes
+            # without a dcp_kv_mask parameter (NPU / compress variants) keep
+            # their exact call signature off the DCP lane.
+            extra = {} if dcp_kv_mask is None else {"dcp_kv_mask": dcp_kv_mask}
             self.full_kv_pool.set_kv_buffer(
                 None,
                 loc,
@@ -205,6 +228,7 @@ class SWAKVPool(BaseSWAKVPool):
                 k_scale,
                 v_scale,
                 layer_id_override=layer_id_pool,
+                **extra,
             )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):

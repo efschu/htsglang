@@ -115,7 +115,15 @@ def _make_model_runner(
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
     sa.enable_dsa_cache_layer_split = False
+    # --swa-pool-sizing (#91 Stage A). The factory reads it unconditionally, so a
+    # stub without it fails every test in this file with an AttributeError; the
+    # default is "ratio" = the byte-identical legacy behaviour.
+    sa.swa_pool_sizing = "ratio"
     mr.server_args = sa
+    # SWA-hybrid uneven-DCP lane (#96): explicitly OFF for these unit runs, so
+    # the replicated-kv-head full cell is never selected here. Stated rather
+    # than left to the MagicMock (whose auto-attribute would be truthy).
+    mr._swa_hybrid_dcp_lane.return_value = False
 
     spec = MagicMock()
     spec.is_eagle.return_value = False
