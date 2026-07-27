@@ -66,6 +66,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     cached_dequant,
     dequant_fp8_block_weight,
+    deterministic_fp8_marlin_disabled,
     dequant_fp8_weight,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
@@ -484,6 +485,34 @@ class Fp8LinearMethod(LinearMethodBase):
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
+            # #192: opt-in bit-determinism. gptq_marlin_gemm is not run-to-run
+            # reproducible on sm80..88 (#190), and this is THE site the layer
+            # bisect landed on (the MLP gate_up_proj, a MergedColumnParallelLinear
+            # with a bit-identical input hash and a divergent output). Switching
+            # it off here is safe because this class carries the paired fallback:
+            # deterministic_fp8_marlin_disabled() also forces
+            # fp8_needs_dequant_fallback() True, so use_dequant / use_block_dequant
+            # below arm the W8A16 lane in the same breath. It beats an explicit
+            # SGLANG_FORCE_FP8_MARLIN as well -- a determinism request that
+            # silently kept the nondeterministic kernel would be worse than no
+            # flag at all.
+            if self.use_marlin and deterministic_fp8_marlin_disabled():
+                self.use_marlin = False
+            elif self.use_marlin and envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+                # Coverage gap, made visible rather than assumed away:
+                # --enable-deterministic-inference pins NCCL_ALGO, the attention
+                # backends and sampling, but never touches the quantized GEMM.
+                # On sm8x fp8 it therefore cannot deliver what its name promises.
+                log_info_on_rank0(
+                    logger,
+                    "--enable-deterministic-inference is on, but this rank serves "
+                    "fp8 through Marlin on sm80..88, which is NOT run-to-run "
+                    "deterministic (#190). Deterministic inference does not cover "
+                    "the quantized GEMM. Set SGLANG_DETERMINISTIC_FP8_GEMM=1 to "
+                    "close this gap for the dense fp8 linears (at a large decode "
+                    "cost -- 2.5x to 6x depending on how much of the model is "
+                    "on sm8x ranks).",
+                )
 
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
         self.block_quant = (
@@ -1188,6 +1217,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             self.use_marlin = force_marlin or can_auto_enable_marlin_fp8()
+            # #192 coverage gap, stated rather than silently accepted. The dense
+            # Fp8LinearMethod can drop Marlin because it owns a dequant W8A16
+            # fallback; the MoE method does not. Its non-Marlin branch is the
+            # triton fused-MoE, whose block-fp8 kernel needs triton's fp8e4nv --
+            # rejected outright on Ampere ("type fp8e4nv not supported in this
+            # architecture"). Honouring the determinism flag here would leave no
+            # expert GEMM at all, i.e. a model that refuses to run, which is a
+            # worse answer than a documented gap. So Marlin stays and the
+            # experts stay nondeterministic; say so.
+            if self.use_marlin and deterministic_fp8_marlin_disabled():
+                log_info_on_rank0(
+                    logger,
+                    "SGLANG_DETERMINISTIC_FP8_GEMM is set, but fp8 MoE experts "
+                    "keep the Marlin kernel on sm80..88: there is no dequant "
+                    "fallback for the fused-MoE path on this architecture "
+                    "(triton has no fp8e4nv on Ampere). Expert GEMMs therefore "
+                    "remain run-to-run nondeterministic; only the dense fp8 "
+                    "linears are covered by the flag.",
+                )
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()

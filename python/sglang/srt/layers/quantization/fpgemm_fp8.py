@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
+    deterministic_fp8_marlin_disabled,
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
@@ -52,6 +53,18 @@ class FBGEMMFp8Config(QuantizationConfig):
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
+            # #192 coverage gap. SGLANG_DETERMINISTIC_FP8_GEMM is NOT honoured
+            # here: this method's non-Marlin branch is apply_fp8_linear, which
+            # needs cutlass or torch._scaled_mm -- neither exists on sm80..88.
+            # Dropping Marlin would leave no GEMM at all, so it stays and FBGEMM
+            # fp8 linears remain nondeterministic on those cards.
+            if self.use_marlin and deterministic_fp8_marlin_disabled():
+                logger.warning(
+                    "SGLANG_DETERMINISTIC_FP8_GEMM is set, but FBGEMM fp8 keeps "
+                    "the Marlin kernel on sm80..88: its only other route needs a "
+                    "native/cutlass fp8 GEMM, which this architecture lacks. "
+                    "These linears remain run-to-run nondeterministic (#190)."
+                )
 
     @classmethod
     def get_name(cls) -> str:
