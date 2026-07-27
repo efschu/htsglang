@@ -32,7 +32,7 @@ telemetry layer is the wrong place to add another one.
 **Profiling counters are sampled sparingly.** GPM/DCGM sampling has real
 overhead and can collide with an external profiler attached to the same
 device. The cadence for those fields is therefore decoupled from the base
-cadence (``profile_every`` in :class:`GpuSampler`), and when they are
+cadence (``counters_every`` in :class:`GpuSampler`), and when they are
 unavailable the sampler falls back to the cheap NVML utilization rates and
 says so.
 
@@ -51,7 +51,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 __all__ = [
     "FieldStatus",
@@ -626,16 +626,29 @@ def select_backend(prefer: str = "auto", pynvml_module=None) -> DeviceBackend:
 
 
 class GpuSampler:
-    """Wraps a backend with the profiling-cadence policy and the field report.
+    """Wraps a backend with the counter-cadence policy and the field report.
 
-    ``profile_every`` decouples the (expensive, collision-prone) profiling
-    counters from the base cadence: with a 1 s base and ``profile_every=10``
-    the GPM read happens every ten seconds. Set to 0 to never read them.
+    ``counters_every`` decouples the (expensive, collision-prone) GPM/DCGM
+    profiling counters from the base cadence: with a 1 s base and
+    ``counters_every=10`` the GPM read happens every ten seconds. Set to 0 to
+    never read them. The name stays off "profile": in this codebase a
+    *profile* is the persisted hardware measurement record
+    (``hw_profile-*.json``), and this cadence has nothing to do with it.
     """
 
-    def __init__(self, backend: Optional[DeviceBackend] = None, profile_every: int = 10):
+    def __init__(
+        self,
+        backend: Optional[DeviceBackend] = None,
+        counters_every: int = 10,
+        profile_every: Optional[int] = None,
+    ):
+        # ``profile_every`` is the pre-rename spelling of ``counters_every``;
+        # the planner CLI still passes it. Retire the keyword when that call
+        # site moves.
+        if profile_every is not None:
+            counters_every = profile_every
         self.backend = backend if backend is not None else select_backend()
-        self.profile_every = max(0, int(profile_every))
+        self.counters_every = max(0, int(counters_every))
         self._tick = 0
         self._fields: Optional[List[FieldStatus]] = None
 
@@ -654,7 +667,7 @@ class GpuSampler:
 
     def sample(self) -> List[CardSample]:
         want_profiling = bool(
-            self.profile_every and self._tick % self.profile_every == 0
+            self.counters_every and self._tick % self.counters_every == 0
         )
         self._tick += 1
         try:

@@ -43,9 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -53,9 +51,10 @@ from typing import List, Optional
 
 from sglang.srt.rigmon.aggregator import Aggregator, serve
 from sglang.srt.rigmon.capabilities import ProbeEnv, probe_all
-from sglang.srt.rigmon.collector import Collector, PushClient, load_cached_profiles
+from sglang.srt.rigmon.collector import Collector, load_cached_profiles
 from sglang.srt.rigmon.config import AggregatorConfig, CollectorConfig, default_node_id
 from sglang.srt.rigmon.facilities import detect_host_environment, facilities
+from sglang.srt.rigmon.kvbudget import CACHE_DIR
 from sglang.srt.rigmon.series import DEFAULT_TIERS, parse_tier_spec
 
 
@@ -151,7 +150,7 @@ def cmd_collect(args) -> int:
     cfg = CollectorConfig(
         node_id=args.node_id,
         interval_s=args.interval,
-        profile_every=args.profile_every,
+        counters_every=args.counters_every,
         tiers=_tiers(args),
         engine_url=args.engine,
         aggregator_url=args.aggregator,
@@ -193,7 +192,7 @@ def cmd_serve(args) -> int:
             CollectorConfig(
                 node_id=args.node_id,
                 interval_s=args.interval,
-                profile_every=args.profile_every,
+                counters_every=args.counters_every,
                 tiers=cfg.tiers,
                 engine_url=args.engine,
                 boot_log=args.boot_log or "",
@@ -287,13 +286,52 @@ def cmd_facilities(args) -> int:
 def cmd_snapshot(args) -> int:
     col = Collector(
         CollectorConfig(
-            node_id=args.node_id, engine_url=args.engine, profile_every=0
+            node_id=args.node_id, engine_url=args.engine, counters_every=0
         )
     )
     col.tick()
     time.sleep(1.0)
     col.tick()
-    print(json.dumps(col.snapshot(), indent=1))
+    snap = col.snapshot()
+    if args.json:
+        print(json.dumps(snap, indent=1))
+        return 0
+    engine = snap.get("engine") or {}
+    print(
+        f"node {snap['node_id']}  backend {snap['device_backend']}  "
+        f"engine {'up' if engine.get('up') else 'down'}"
+    )
+    for c in snap.get("cards") or []:
+        used = c.get("mem_used_mib")
+        total = c.get("mem_total_mib")
+        bits = []
+        if used is not None and total is not None:
+            bits.append(f"{used}/{total} MiB")
+        if c.get("util_gpu_pct") is not None:
+            bits.append(f"{c['util_gpu_pct']:.0f} % util")
+        if c.get("temp_c") is not None:
+            bits.append(f"{c['temp_c']:.0f} C")
+        if c.get("power_w") is not None:
+            bits.append(f"{c['power_w']:.0f} W")
+        throttles = [t for t in (c.get("throttle") or [])]
+        if throttles:
+            bits.append("THROTTLED: " + ",".join(throttles))
+        print(f"  card {c['index']} {c['name']}: " + ", ".join(bits))
+    rt = snap.get("round_time") or {}
+    rt_bits = [
+        f"{label} {rt[key]:.2f}"
+        for key, label in (
+            ("ms_per_verify_round", "ms/verify"),
+            ("ms_per_decode_round", "ms/decode"),
+            ("ms_per_1k_prefill_tokens", "ms/1k-prefill"),
+            ("accept_length", "accept"),
+        )
+        if rt.get(key) is not None
+    ]
+    if rt_bits:
+        print("  round time: " + ", ".join(rt_bits))
+    if not engine.get("up") and engine.get("reason"):
+        print(f"  engine down: {engine['reason']}")
     return 0
 
 
@@ -504,8 +542,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--node-id", default=default_node_id())
     c.add_argument("--interval", type=float, default=1.0,
                    help="base sample interval in seconds (default 1.0)")
-    c.add_argument("--profile-every", type=int, default=10,
-                   help="read profiling counters every Nth tick (0 = never)")
+    c.add_argument("--counters-every", type=int, default=10,
+                   help="read the GPM/DCGM profiling counters every Nth tick "
+                        "(0 = never)")
     c.add_argument("--engine", default="http://127.0.0.1:30000",
                    help="local engine base URL (blank to disable)")
     c.add_argument("--aggregator", default="",
@@ -513,7 +552,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--join-token", default="",
                    help="single-use pairing token from `join-token`")
     c.add_argument("--push-token", default="", help="an already-issued push token")
-    c.add_argument("--push-every", type=float, default=5.0)
+    c.add_argument("--push-every", type=float, default=5.0,
+                   help="push to the aggregator every N seconds (default 5.0)")
     c.add_argument("--model", action="append", default=None,
                    help="model path to present to the compatibility gate; "
                         "repeatable")
@@ -521,7 +561,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="join even when the compatibility gate blocks")
     c.add_argument("--print-token", action="store_true",
                    help="print the issued push token (it is a secret)")
-    c.add_argument("--boot-log", default="")
+    c.add_argument("--boot-log", default="",
+                   help="server boot log to watch and classify (blank to "
+                        "disable)")
     _add_resolution_arg(c)
     c.set_defaults(func=cmd_collect)
 
@@ -531,16 +573,22 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--token", default="",
                    help="shared push token; required when not on loopback")
     s.add_argument("--node-id", default=default_node_id())
-    s.add_argument("--engine", default="http://127.0.0.1:30000")
-    s.add_argument("--interval", type=float, default=1.0)
-    s.add_argument("--profile-every", type=int, default=10)
+    s.add_argument("--engine", default="http://127.0.0.1:30000",
+                   help="local engine base URL (blank to disable)")
+    s.add_argument("--interval", type=float, default=1.0,
+                   help="base sample interval in seconds (default 1.0)")
+    s.add_argument("--counters-every", type=int, default=10,
+                   help="read the GPM/DCGM profiling counters every Nth tick "
+                        "(0 = never)")
     s.add_argument("--no-local", action="store_true",
                    help="aggregator only; do not sample this host")
     s.add_argument("--ui-dir", default=None, help="directory holding index.html")
     s.add_argument("--model", action="append", default=None,
                    help="model path this node serves; the compatibility "
                         "gate compares it against a joining node. Repeatable.")
-    s.add_argument("--boot-log", default="")
+    s.add_argument("--boot-log", default="",
+                   help="server boot log to watch and classify (blank to "
+                        "disable)")
     _add_resolution_arg(s)
     s.set_defaults(func=cmd_serve)
 
@@ -558,9 +606,11 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--json", action="store_true")
     f.set_defaults(func=cmd_facilities)
 
-    n = sub.add_parser("snapshot", help="one sample, as JSON")
+    n = sub.add_parser("snapshot", help="one sample")
     n.add_argument("--node-id", default=default_node_id())
-    n.add_argument("--engine", default="http://127.0.0.1:30000")
+    n.add_argument("--engine", default="http://127.0.0.1:30000",
+                   help="local engine base URL (blank to disable)")
+    n.add_argument("--json", action="store_true")
     n.set_defaults(func=cmd_snapshot)
 
     b = sub.add_parser("boot", help="classify a boot log")
@@ -571,7 +621,7 @@ def build_parser() -> argparse.ArgumentParser:
     kv = sub.add_parser(
         "kv-budget", help="show or reset the persisted measured KV budget"
     )
-    kv.add_argument("--cache-dir", default=os.path.expanduser("~/.cache/sglang"))
+    kv.add_argument("--cache-dir", default=CACHE_DIR)
     kv.add_argument("--reset", action="store_true")
     kv.add_argument("--config-hash", default="", help="limit --reset to one file")
     kv.add_argument("--no-backup", action="store_true")

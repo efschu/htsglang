@@ -241,7 +241,7 @@ class Collector:
         clock: Callable[[], float] = time.time,
     ):
         self.config = config or CollectorConfig()
-        self.sampler = sampler or GpuSampler(profile_every=self.config.profile_every)
+        self.sampler = sampler or GpuSampler(counters_every=self.config.counters_every)
         self.scraper = scraper or EngineScraper(self.config.engine_url)
         self.series = TimeSeries(self.config.tiers)
         self.clock = clock
@@ -393,7 +393,7 @@ class Collector:
                 "interval_s": self.config.interval_s,
                 "ticks": ticks,
                 "missed_deadlines": missed,
-                "profile_every": self.config.profile_every,
+                "counters_every": self.config.counters_every,
             },
             "fields": [f.to_json() for f in self.sampler.field_report()],
             "device_backend": self.sampler.backend.name,
