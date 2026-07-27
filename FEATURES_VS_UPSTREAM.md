@@ -30,7 +30,7 @@ Two identities do **not** qualify as a cross-check:
 |---|---|
 | Main rig | 1x RTX 5090 (sm120, 32 GB) + 2x RTX 3080 (sm86, 20 GB) |
 | Second host | 1x RTX 2080 Ti (sm75) + 1x Radeon RX Vega 64 (gfx900, 8.0 GB) |
-| Interconnect | No NVLink, no CUDA P2P (GeForce, PHB topology); all cross-GPU traffic host-staged. One 3080 on PCIe Gen4 x4 at ~6.5 GB/s host-staged DMA against ~13-14 GB/s for the other two. Cross-host: 40G RoCE for data, 1 GbE for the control plane. |
+| Interconnect | No NVLink, no CUDA P2P (GeForce, PHB topology); all cross-GPU traffic host-staged. One 3080 on PCIe Gen4 x4 at ~6.5 GB/s host-staged DMA against ~13-14 GB/s for the other two. Cross-host: 40G RoCE for data, 1 GbE for the control plane. The main rig's NIC negotiates PCIe 3.0 x4 against an x16 LnkCap, so cross-host transfers cap at 3.43 GB/s: `ib_write_bw` at 1 MiB returns 3270 MiB/s over the 40G and the 100G port alike. `ib_write_lat` at 8 B is 1.47 us over 40G against 1.58 us over 100G, the RS-FEC that 100GBASE-R mandates outweighing the shorter serialisation. On a host whose NIC gets x8 or wider, the ceiling moves from the slot to the link. |
 | Known state | Clock pinning refused by the driver. One 3080 in software thermal slowdown at 85-87 C for part of the measurements, 1719-1840 MHz against 1920 MHz on the identical card. |
 
 This is an unfavourable configuration on every interconnect axis; the figures throughout are a
