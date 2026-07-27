@@ -2974,6 +2974,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else:
                 self.kv_cache_dtype = self.dtype
         elif kv_spec == "fp8_e5m2":
+            # e5m2 keeps 2 mantissa bits against e4m3's 3, and k/v scales are
+            # only ever loaded from a checkpoint -- there is no calibration
+            # step that would recover the lost precision, so an uncalibrated
+            # run stores at scale 1.0. Checkpoint scales, when present, were
+            # calibrated against e4m3's 448 maximum and leave most of e5m2's
+            # range unused. Store and load stay symmetric in either case
+            # (set_kv_buffer divides by the same scale the attention backend
+            # multiplies back), so this is a precision note, not a correctness
+            # one; e4m3 is the better default for a KV cache on every backend
+            # this stack supports.
+            logger.warning(
+                "--kv-cache-dtype fp8_e5m2 selected. e5m2 carries one mantissa "
+                "bit less than fp8_e4m3 and is used here without any KV "
+                "calibration step; prefer fp8_e4m3 unless e5m2 is required for "
+                "compatibility with an external consumer of the KV cache."
+            )
             if _is_hip:  # Using natively supported format
                 self.kv_cache_dtype = fp8_dtype
             else:
