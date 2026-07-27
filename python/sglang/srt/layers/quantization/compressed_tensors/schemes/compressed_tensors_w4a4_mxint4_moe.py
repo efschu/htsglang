@@ -18,7 +18,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_flashinfer_available, next_power_of_2, set_weight_attrs
+from sglang.srt.utils import next_power_of_2, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -35,16 +35,13 @@ if TYPE_CHECKING:
         CompressedTensorsConfig,
     )
 
-if is_flashinfer_available():
-    from flashinfer.fp4_quantization import block_scale_interleave
-    from flashinfer.fused_moe import (
-        convert_to_block_layout,
-        trtllm_mxint4_block_scale_moe,
-    )
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
+# flashinfer is imported lazily (first weight-processing / first apply), not
+# at module scope: importing flashinfer evaluates its gdn_kernels module,
+# which queries device properties and creates a CUDA context in every process
+# importing this file -- including the GPU-passive launch_server parent
+# (task #237). This scheme file sits in the quantization registry's import
+# closure, so the module-scope import taxed processes that never run the
+# kernel.
 
 
 class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
@@ -173,6 +170,12 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         num_experts,
     ):
         """Prepare quantized weights for kernel (done offline with weights)."""
+        from flashinfer.fp4_quantization import block_scale_interleave
+        from flashinfer.fused_moe import convert_to_block_layout
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
 
         epilogue_tile_m = 128
         gemm1_weights_mxint4_shuffled = []
@@ -299,6 +302,8 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from flashinfer.fused_moe import trtllm_mxint4_block_scale_moe
+
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert (

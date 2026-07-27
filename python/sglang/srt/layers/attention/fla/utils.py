@@ -15,7 +15,11 @@ import torch
 import triton
 from packaging import version
 
-from sglang.srt.utils.common import torch_release
+from sglang.srt.utils.common import (
+    get_device_capability_no_init,
+    get_device_name_no_init,
+    torch_release,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -238,11 +242,25 @@ def get_multiprocessor_count(tensor_idx: int = 0) -> int:
 
 @lru_cache(maxsize=None)
 def get_available_device() -> str:
+    # Answered from torch build/runtime metadata, NOT from
+    # triton.runtime.driver.active.get_current_target(): triton's nvidia
+    # driver resolves the current target THROUGH torch.cuda and so created a
+    # CUDA context in every process importing this module at module-scope
+    # evaluation time (server_args imports the fla chunk kernels for a
+    # constant, which puts this file in the GPU-passive launch_server
+    # parent's import closure -- task #237). The vendor answer is identical:
+    # triton's backend is "hip" on ROCm, "cuda" on NVIDIA, "xpu" on Intel.
     try:
-        return triton.runtime.driver.active.get_current_target().backend
+        if torch.version.hip is not None:
+            return "hip"
+        if torch.version.cuda is not None and torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return "xpu"
     except BaseException:
-        _cpu_device_warning()
-        return "cpu"
+        pass
+    _cpu_device_warning()
+    return "cpu"
 
 
 @lru_cache(maxsize=None)
@@ -269,14 +287,17 @@ is_amd = device_platform == "amd"
 is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
 is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
+# Module-scope device questions go through the no-init helpers (NVML-backed
+# while torch.cuda is uninitialized): this file is evaluated at import in
+# GPU-passive processes too, which must not pay a CUDA context (task #237).
 is_nvidia_hopper = is_nvidia and (
-    "NVIDIA H" in torch.cuda.get_device_name(0)
-    or torch.cuda.get_device_capability()[0] >= 9
+    "NVIDIA H" in get_device_name_no_init(0)
+    or get_device_capability_no_init()[0] >= 9
 )
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
-is_tf32_supported = is_nvidia and torch.cuda.get_device_capability(0)[0] >= 8
+is_tf32_supported = is_nvidia and get_device_capability_no_init(0)[0] >= 8
 is_gather_supported = hasattr(triton.language, "gather")
 
 

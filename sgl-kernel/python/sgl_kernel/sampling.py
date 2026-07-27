@@ -3,12 +3,25 @@ from typing import Optional, Union
 import torch
 from sgl_kernel.utils import _to_tensor_scalar_tuple
 
-try:
-    import flashinfer.sampling as _flashinfer_sampling
+# flashinfer is imported lazily on first use, not at module scope: importing
+# flashinfer cascades through modules that query device properties at import
+# and thereby create a CUDA context in every process importing sgl_kernel --
+# including GPU-passive ones (see elementwise.py for the same pattern).
+_flashinfer_sampling = None
+_has_flashinfer: Optional[bool] = None
 
-    _has_flashinfer = True
-except ImportError:
-    _has_flashinfer = False
+
+def _get_flashinfer_sampling():
+    global _flashinfer_sampling, _has_flashinfer
+    if _has_flashinfer is None:
+        try:
+            import flashinfer.sampling as flashinfer_sampling
+
+            _flashinfer_sampling = flashinfer_sampling
+            _has_flashinfer = True
+        except ImportError:
+            _has_flashinfer = False
+    return _flashinfer_sampling
 
 
 def _top_k_renorm_probs_internal(
@@ -53,10 +66,13 @@ def top_k_renorm_probs(
     This combination of ``top_k_renorm_probs`` and ``sampling_from_probs`` should be equivalent to
     ``top_k_sampling_from_probs``.
     """
-    if probs.device.type == "musa" or not _has_flashinfer:
+    fi_sampling = (
+        _get_flashinfer_sampling() if probs.device.type != "musa" else None
+    )
+    if fi_sampling is None:
         return _top_k_renorm_probs_internal(probs, *_to_tensor_scalar_tuple(top_k))
     else:
-        return _flashinfer_sampling.top_k_renorm_probs(probs, top_k)
+        return fi_sampling.top_k_renorm_probs(probs, top_k)
 
 
 top_k_renorm_prob = top_k_renorm_probs
@@ -106,10 +122,13 @@ def top_p_renorm_probs(
     ``top_p_sampling_from_probs``.
 
     """
-    if probs.device.type == "musa" or not _has_flashinfer:
+    fi_sampling = (
+        _get_flashinfer_sampling() if probs.device.type != "musa" else None
+    )
+    if fi_sampling is None:
         return _top_p_renorm_probs_internal(probs, *_to_tensor_scalar_tuple(top_p))
     else:
-        return _flashinfer_sampling.top_p_renorm_probs(probs, top_p)
+        return fi_sampling.top_p_renorm_probs(probs, top_p)
 
 
 top_p_renorm_prob = top_p_renorm_probs

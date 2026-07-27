@@ -17,7 +17,6 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils import (
-    is_flashinfer_available,
     log_info_on_rank0,
     set_weight_attrs,
 )
@@ -25,14 +24,11 @@ from sglang.srt.utils.common import is_sm100_supported, next_power_of_2
 
 _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if is_sm100_supported() else "cuda"
 
-if is_flashinfer_available():
-    from flashinfer import mxfp8_quantize, shuffle_matrix_a, shuffle_matrix_sf_a
-    from flashinfer.fp4_quantization import block_scale_interleave
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
+# flashinfer is imported lazily (first weight-processing / first apply), not
+# at module scope: importing flashinfer's fused_moe/fp4 machinery evaluates
+# modules that query device properties and so create a CUDA context in every
+# process importing this file via the quantization registry -- including the
+# GPU-passive launch_server parent (task #237).
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +209,13 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         set_weight_attrs(w2_weight_scale, scale_attrs)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
+        from flashinfer.fp4_quantization import block_scale_interleave
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            get_w2_permute_indices_with_cache,
+        )
+
         from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
 
         self._fp8.process_weights_after_loading(layer)
@@ -334,6 +337,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
+        from flashinfer import mxfp8_quantize
+        from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
