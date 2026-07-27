@@ -78,6 +78,52 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 
+class HiCacheCollectiveError(RuntimeError):
+    """A HiCache control collective cannot be issued rank-uniformly."""
+
+
+class HiCacheCollectiveTimeoutError(HiCacheCollectiveError):
+    """A HiCache control collective did not complete within its bound.
+
+    Raised on the surviving rank when a peer is dead or wedged. The alternative
+    is the failure this exists to prevent: the gloo ``cpu_group`` these control
+    collectives run on carries a two-hour default timeout, so without a bound
+    the survivor parks in ``all_reduce`` for hours after its peer dies of OOM,
+    with nothing in the log naming the reason.
+    """
+
+
+# Rank-invariant slot layout for the sidecar-pool entries of a control
+# collective. The reduced vector's LENGTH AND ORDER must never be derived from
+# rank-local state (``cc.extra_host_mem_release_queues``, ``comp_xfers``): those
+# are built from this rank's host-pool entries, which are asymmetric under
+# uneven DCP, and gloo does not reject an all_reduce whose numel differs across
+# ranks -- it wedges. Every rank therefore reduces the full PoolName universe;
+# a pool this rank does not own contributes 0, the MIN identity for "drain /
+# claim nothing", so a set divergence degrades to a no-op instead of a hang.
+_POOL_SLOT_ORDER: tuple[PoolName, ...] = tuple(PoolName)
+_POOL_SLOT_COUNT: int = len(_POOL_SLOT_ORDER)
+
+# Poll schedule for _wait_bounded. The spin window covers the latency of a
+# healthy CPU collective between local ranks, so the sleep path is only ever
+# reached once something is actually wrong.
+_COLLECTIVE_POLL_SPINS = 512
+_COLLECTIVE_POLL_MIN_S = 0.0005
+_COLLECTIVE_POLL_MAX_S = 0.05
+
+
+def _pool_slot(pool_name, offset: int) -> int:
+    """Index of ``pool_name`` inside a reduced vector starting at ``offset``."""
+    for i, known in enumerate(_POOL_SLOT_ORDER):
+        if known == pool_name:
+            return offset + i
+    raise HiCacheCollectiveError(
+        f"host pool {pool_name!r} is not a member of PoolName, so it has no "
+        "rank-invariant slot in the HiCache control collective. Add it to "
+        "PoolName instead of keying the collective off rank-local pool names."
+    )
+
+
 class UnifiedTreeNode:
     counter = 0
 
@@ -367,6 +413,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
         self.work_list: list[torch.distributed.Work] = []
+        # Deadline for every cross-rank control collective issued from this
+        # cache. See _wait_bounded: without it a dead peer parks this rank in
+        # all_reduce until the two-hour gloo group timeout expires.
+        self.collective_timeout_s = envs.SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S.get()
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -380,14 +430,65 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
-    def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
+    def _wait_bounded(self, work, label: str) -> None:
+        """Wait for ``work`` with a deadline, or raise a named error.
+
+        These control collectives run on the gloo ``cpu_group``s, whose default
+        timeout is two hours and which nothing on this path shortens. A peer
+        that dies without closing its socket (an OOM rank stuck in teardown)
+        therefore parks the survivor indefinitely. Polling ``is_completed()``
+        against a deadline is backend-agnostic and turns that wedge into an
+        exception the scheduler's own handler reports and dies on.
+
+        The healthy case costs nothing measurable: a CPU all_reduce of a few
+        ints between local ranks completes inside the initial spin window, so
+        no sleep is ever reached.
+        """
+        timeout_s = self.collective_timeout_s
+        if not timeout_s or timeout_s <= 0:
+            work.wait()
+            return
+
+        deadline = time.monotonic() + timeout_s
+        spins = 0
+        sleep_s = _COLLECTIVE_POLL_MIN_S
+        while not work.is_completed():
+            spins += 1
+            if spins <= _COLLECTIVE_POLL_SPINS:
+                continue
+            if time.monotonic() >= deadline:
+                raise HiCacheCollectiveTimeoutError(
+                    f"HiCache control collective '{label}' did not complete "
+                    f"within {timeout_s:g}s. A peer rank is dead or wedged; "
+                    "this rank aborts instead of blocking in the collective "
+                    "until the process-group timeout (2h) expires. Adjust the "
+                    "bound with SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S."
+                )
+            time.sleep(sleep_s)
+            sleep_s = min(sleep_s * 2, _COLLECTIVE_POLL_MAX_S)
+        work.wait()
+
+    def _all_reduce_attn_groups(self, tensor: torch.Tensor, op, label: str = "hicache"):
         reduced = False
-        for group in (self.attn_cp_group, self.attn_tp_group):
+        for name, group in (
+            ("attn_cp", self.attn_cp_group),
+            ("attn_tp", self.attn_tp_group),
+        ):
             if group is not None and torch.distributed.get_world_size(group=group) > 1:
-                torch.distributed.all_reduce(tensor, op=op, group=group)
+                self._wait_bounded(
+                    torch.distributed.all_reduce(
+                        tensor, op=op, group=group, async_op=True
+                    ),
+                    f"{label}/all_reduce/{name}",
+                )
                 reduced = True
         if not reduced and self.tp_world_size > 1:
-            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+            self._wait_bounded(
+                torch.distributed.all_reduce(
+                    tensor, op=op, group=self.tp_group, async_op=True
+                ),
+                f"{label}/all_reduce/tp",
+            )
 
     def _hicache_prefetch_symmetric(self) -> bool:
         """Uneven-DCP (a non-uniform token vector installed) makes the per-rank
@@ -426,10 +527,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
         cc = self.cache_controller
         if getattr(cc, "mem_pool_host", None) is None:
-            return
+            # The gate above is rank-uniform (config + uneven_dcp_active), so a
+            # rank-local early return HERE would leave the other ranks in the
+            # all_reduce below with no partner. A HybridCacheController always
+            # owns a host pool, so this is a structural break, not a state the
+            # collective may be skipped for: name it instead of hanging.
+            raise HiCacheCollectiveError(
+                "cache controller has no mem_pool_host while prefetch "
+                "symmetrization is active; the peer ranks are entering the "
+                "capacity all_reduce and this rank cannot."
+            )
         local_size = int(cc.mem_pool_host.size)
         size_tensor = torch.tensor([local_size], dtype=torch.long)
-        self._all_reduce_attn_groups(size_tensor, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_attn_groups(
+            size_tensor,
+            torch.distributed.ReduceOp.MIN,
+            label="symmetrize_prefetch_capacity",
+        )
         min_size = int(size_tensor.item())
         cc.prefetch_capacity_limit = int(0.5 * min_size)
         logger.info(
@@ -440,14 +554,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             local_size,
         )
 
-    def _barrier_attn_groups(self):
+    def _barrier_attn_groups(self, label: str = "hicache"):
         waited = False
-        for group in (self.attn_cp_group, self.attn_tp_group):
+        for name, group in (
+            ("attn_cp", self.attn_cp_group),
+            ("attn_tp", self.attn_tp_group),
+        ):
             if group is not None and torch.distributed.get_world_size(group=group) > 1:
-                torch.distributed.barrier(group=group)
+                self._wait_bounded(
+                    torch.distributed.barrier(group=group, async_op=True),
+                    f"{label}/barrier/{name}",
+                )
                 waited = True
         if not waited and self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
+            self._wait_bounded(
+                torch.distributed.barrier(group=self.tp_group, async_op=True),
+                f"{label}/barrier/tp",
+            )
 
     def _drain_async_work(self):
         """
@@ -461,7 +584,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             work.wait()
         self.work_list.clear()
 
-    def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
+    def _all_reduce(
+        self,
+        data: torch.Tensor,
+        tp_reduce_op: torch.distributed.ReduceOp,
+        label: str = "hicache",
+    ):
         """
         Synchronize data across all TP and PP ranks.
 
@@ -471,7 +599,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         Must be called in the scheduler thread.
         """
         if self.pp_rank == 0:
-            self._all_reduce_attn_groups(data, tp_reduce_op)
+            self._all_reduce_attn_groups(data, tp_reduce_op, label=label)
         self._pp_sync(data)
 
     def _pp_sync(self, data: torch.Tensor) -> None:
@@ -2065,14 +2193,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # release with nothing to tear down.
             local_ok = 1 if (host_indices is not None and not alloc_failed) else 0
             vote = torch.tensor([local_ok], dtype=torch.int)
-            self._all_reduce_attn_groups(vote, torch.distributed.ReduceOp.MIN)
+            self._all_reduce_attn_groups(
+                vote,
+                torch.distributed.ReduceOp.MIN,
+                label="prefetch_participation_vote",
+            )
             if vote[0].item() == 0:
                 if host_indices is not None:
                     self.cache_controller.append_host_mem_release(
                         host_indices=host_indices,
-                        extra_pools=[
-                            x for xfers in comp_xfers.values() for x in xfers
-                        ],
+                        extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
                     )
                 self.dec_host_lock_ref(last_host_node, anchor_lock_params)
                 return
@@ -2143,7 +2273,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             [1 - int(can_terminate), int(operation_terminated)],
             dtype=torch.int,
         )
-        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
+        self._all_reduce_attn_groups(
+            states,
+            torch.distributed.ReduceOp.MAX,
+            label="can_terminate_prefetch",
+        )
         can_terminate = states[0].item() == 0
         operation_terminated = states[1].item() == 1
         return can_terminate or operation_terminated
@@ -2172,16 +2306,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
         if self.tp_world_size > 1:
             # Reduce full completed tokens together with the sidecar pools that
-            # this prefetch actually transferred, in one all_reduce.
+            # this prefetch actually transferred, in one all_reduce. The vector
+            # spans the fixed PoolName universe, not the rank-local comp_xfers
+            # set: build_hicache_transfers can yield a different set of pools
+            # per rank, and a rank-dependent numel wedges the collective. Only
+            # the pools this rank transferred are read back, so the local
+            # semantics are unchanged whenever the sets do agree.
             sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
-            packed = torch.tensor(
-                [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
-                dtype=torch.int,
+            packed_list = [completed_tokens] + [0] * _POOL_SLOT_COUNT
+            for p in sidecar_pools:
+                packed_list[_pool_slot(p, 1)] = int(hit_pages.get(p, 0))
+            packed = torch.tensor(packed_list, dtype=torch.int)
+            self._all_reduce_attn_groups(
+                packed,
+                torch.distributed.ReduceOp.MIN,
+                label="check_prefetch_progress",
             )
-            self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
             min_completed_tokens = int(packed[0].item())
-            for i, p in enumerate(sidecar_pools, start=1):
-                hit_pages[p] = int(packed[i].item())
+            for p in sidecar_pools:
+                hit_pages[p] = int(packed[_pool_slot(p, 1)].item())
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
@@ -2254,7 +2397,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        self._barrier_attn_groups()
+        self._barrier_attn_groups(label="release_aborted_request")
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(
@@ -2363,26 +2506,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def drain_storage_control_queues(self) -> None:
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
-        extra_pool_names = list(extra_release_queues)
+        # The sidecar slots are laid out over the fixed PoolName universe, NOT
+        # over list(extra_release_queues): that dict mirrors this rank's host
+        # pools, which are asymmetric under uneven DCP, and a rank-dependent
+        # numel is exactly what wedges the all_reduce below. _pool_slot raises
+        # rather than silently dropping a pool that has no invariant slot.
         local_qsize_list = [
             cc.prefetch_revoke_queue.qsize(),
             cc.ack_backup_queue.qsize(),
             cc.host_mem_release_queue.qsize(),
-            *[
-                extra_release_queues[pool_name].qsize()
-                for pool_name in extra_pool_names
-            ],
-        ]
+        ] + [0] * _POOL_SLOT_COUNT
+        for pool_name, release_queue in extra_release_queues.items():
+            local_qsize_list[_pool_slot(pool_name, 3)] = release_queue.qsize()
         qsizes = torch.tensor(
             local_qsize_list,
             dtype=torch.int,
         )
-        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_attn_groups(
+            qsizes,
+            torch.distributed.ReduceOp.MIN,
+            label="drain_storage_control_queues",
+        )
         qsize_list = list(map(int, qsizes.tolist()))
         n_revoke, n_backup, n_release = qsize_list[:3]
         extra_release_counts = {
-            pool_name: count
-            for pool_name, count in zip(extra_pool_names, qsize_list[3:])
+            pool_name: qsize_list[_pool_slot(pool_name, 3)]
+            for pool_name in extra_release_queues
         }
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
@@ -2510,7 +2659,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 finish_count += 1
 
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        self._all_reduce(
+            finish_count_tensor,
+            torch.distributed.ReduceOp.MIN,
+            label="writing_check",
+        )
         finish_count = finish_count_tensor.item()
 
         # Process completed acks
@@ -2535,7 +2688,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     break
                 finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        self._all_reduce(
+            finish_count_tensor,
+            torch.distributed.ReduceOp.MIN,
+            label="loading_check",
+        )
         finish_count = finish_count_tensor.item()
 
         while finish_count > 0:
