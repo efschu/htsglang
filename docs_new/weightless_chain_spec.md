@@ -329,20 +329,23 @@ TARGET_VERIFY — so the existing runner's single mode is the whole story.
    `topk > 1`, with rejection sampling, with block-decode/host-spill, with
    adaptive — each raises, naming its reason.
 
-### 5.2 Byte-identity claim (GPU, deferred)
+### 5.2 Byte-identity claim — RETRACTED, see §8
 
-The lane's dual byte spec (`[[weightless-kv-lane]]`) extends as:
+This section originally read:
 
 > lane **with** chain spec at temperature 0 must be **token-identical** to lane
-> **without** spec at temperature 0, over the same prompts.
+> **without** spec at temperature 0 [...] a hard equality, not a similarity.
 
-This is a hard equality, not a similarity: greedy verify accepts exactly the
-tokens the target would have emitted, and the rank-0 accept broadcast removes
-per-rank argmax flips. A collapsed accept rate with *correct* tokens means the
-verify attention is reading the wrong slots (it still runs); a token divergence
-means the accept sync or the KV bookkeeping is wrong. Both instruments are
-needed — see `[[spec-acceptance-messfalle]]`: read
-`meta_info.spec_accept_length`, **not** `spec_ema_accept_len`.
+That is false, and Window 5 measured it false with the feature under test
+switched off. The claim's premise — "greedy verify accepts exactly the tokens
+the target would have emitted" — is true of the accept *rule* and not of the
+*logits* the rule reads. §8 replaces it with the oracle that does hold.
+
+The accept-rate instrument in the original text survives unchanged and is the
+one part of it that was right: a collapsed accept rate with *correct* tokens
+means the verify attention is reading the wrong slots (it still runs). Read
+`meta_info.spec_accept_length`, **not** `spec_ema_accept_len`
+(`[[spec-acceptance-messfalle]]`).
 
 ---
 
@@ -406,11 +409,10 @@ already breaks strict token identity at `temperature 0` on the default path, and
 consequence of DCP token-sharding plus LSE merge being a different float
 reassociation. Both hold with the feature under test switched off.
 
-Consequence for this document: **Gate 1 must be restated against the #124
-TP=1 solo oracle**, which is the oracle the lane's determinism harness already
-uses, rather than against arm A. Until that runs, lane+spec has no correctness
-oracle — Window 5 established that the old gate cannot serve as one, not that
-the composition is correct.
+Consequence for this document: Gate 1 is **replaced**, not merely restated —
+the plain TP=1 solo oracle the lane's other rows use does not carry over either,
+because speculation breaks the identity independently of the lane. §8 is the
+replacement.
 
 ---
 
@@ -428,3 +430,253 @@ the composition is correct.
   prefix read (`_wl_blockwise_prefix_return_lse`) is already on the verify path's
   extend dispatch, so the eager combination may in fact work; the graph ladder is
   what does not compose. Worth measuring before building.
+
+---
+
+## 8. The correctness oracle for lane × spec
+
+Window 5 left the feature with a measured throughput win and **no correctness
+oracle**: Gate 1 compared against a reference that is not token-identical for
+two independent reasons, both present with the feature switched off. This
+section is the replacement. It is design plus a GPU recipe; the CPU-side
+machinery is built and tested (`tests/determinism/test_spec_oracle.py`,
+`test/registered/unit/spec/test_spec_verify_dump.py`), the measured bands are
+not yet taken.
+
+### 8.1 Why the obvious candidates do not stand alone
+
+Three candidates were considered.
+
+**(a) Compare against TP=1 solo carrying the SAME spec configuration.** The
+appeal is that the spec-induced difference then sits in *both* arms. It does not
+cancel — the draft's input is the target hidden state, which the lane changes —
+but it becomes common-mode, which is what a reference arm is for. Two things
+have to be checked rather than assumed, and both hold:
+
+* *Runnability.* The lane requires `tp_size >= 2`; the reference is the plain
+  TP=1 path, where speculation is ordinary. Solo placement at TP=1 is
+  degenerate (split and solo both give an unsharded draft), so the reference may
+  use either — but which one is used must be recorded, and R7 below A/Bs them.
+* *Draft geometry.* The lane admits speculation only with
+  `--speculative-draft-placement solo` and an **unsharded** draft on the head
+  rank (§3.2). A TP=1 reference's draft is unsharded too. The draft side is
+  therefore common-mode by geometry, not by luck — the single most useful
+  property of this pairing, because it confines every difference between the
+  arms to the target forward.
+
+What (a) does **not** buy is a hard equality. Under speculation a single argmax
+flip changes `accept_len`, which changes the shape of every later forward. Two
+matched-spec arms fork structurally at the first near-tie. "0 flips over N
+tokens" is therefore unattainable *by construction*, and demanding it would
+reproduce Window 5's mistake one level up.
+
+**(b) Compare the verified logits rather than the drawn token.** This is the
+instrument that makes (a) usable: it turns "they differ" into "they differ by
+*this much*, and the fork was at a margin of *this*". It needed a tap, and there
+was none — `ModelRunner._determinism_dump_logits` hangs off `ModelRunner.sample`
+and early-returns unless `logits.shape[0] == 1`, while a verify's logits are
+consumed inside `eagle_sample` and carry `bs * (k+1)` rows. `return_logprob` is
+not a substitute: it reports post-preprocessing top-k logprobs for emitted
+tokens, while the byte-identity classes are stated on raw pre-preprocessing
+logits, and it says nothing about the rejected slots.
+
+**(c) Accept statistics.** The weakest: a correct trajectory with a poor draft
+fails it, and a wrong-context verify that keeps accepting passes it. It is kept
+as a secondary gate for one reason — it is the only instrument that sees the
+lane's characteristic failure, a verify attending over the wrong KV slots, which
+still runs and still emits self-consistent tokens and merely stops accepting.
+
+### 8.2 What was built
+
+**(a) + (b) as the primary, (c) as a secondary, plus a replay row.** Neither (a)
+nor (b) suffices alone: (a) has trajectories that fork structurally, (b) has no
+reference. Together they give a token-aligned, band-quantified, near-tie-gated
+verdict on the same evidence standard as the rest of #124.
+
+* `tests/determinism/determinism_harness/spec_trajectory.py` — `VerifyRound` /
+  `SpecRun` and the **projection into emitted-token space**. Row `i` of a verify
+  matrix is the parent of emitted token `i` of that round (the greedy kernel
+  writes `predicts[slot] = target_predict[slot]` at exactly the accepted
+  indices). After the projection a spec run *is* a `Trajectory`, so every
+  existing primitive applies unchanged and `accept_len` is never an index in the
+  oracle — which is what lets two arms with different accept lengths be compared
+  at all.
+* `ByteIdentityClass.SPEC_NEAR_TIE` — run==run bit-identity plus near-tie-only
+  divergence. Same bundle as `SELF_DET_NEAR_TIE`, separate class because the
+  reason differs and encoding a spec row under an offload-named class is how doc
+  traps start.
+* `check_accept_rule_exactness` — reference-free: every emitted token is its
+  verify row's argmax. Tests the accept *plumbing* (accept_index, the rank-0
+  `predict` broadcast a weightless worker's tokens come from, this harness's own
+  projection). It does **not** test the KV context: a verify reading the wrong
+  slots emits its own argmax perfectly consistently.
+* `check_accept_length_floor` — instrument (c), with its weakness written into
+  its docstring so it is not mistaken for a proof.
+* `python/sglang/srt/speculative/spec_verify_dump.py` — the tap (b) needed.
+  Records the full verify matrix in serving dtype plus the accept result,
+  keyed by `accept_index` rather than by an assumed chain layout. Behind the
+  existing `--determinism-logits-dump-dir`, default off, never raises into the
+  serving path, writes nothing on a weightless worker (which has no logits).
+
+Two matrix rows, both `pending_calibration=True` — they carry **no band**,
+because the #124 lesson was that a guessed band can be two orders of magnitude
+wrong and a wrong band is worse than no row:
+
+| row | reference | what it reaches |
+|---|---|---|
+| `weightless_spec_matched` | TP=1 solo, identical spec config | the lane's contribution to the target logits, with the spec shape common-mode |
+| `spec_replay_teacher_forced` | non-spec boot, fed the emitted sequence as a prompt | whether the verify attended over the right KV context |
+
+The replay row is the sharpest of the two and the cheapest to run: the reference
+does one prefill over the test arm's emitted sequence, so the two arms **cannot
+fork** and the comparison stays step-aligned for the whole window. It is still
+near-tie-gated — a single prefill over N positions is a third fp path, distinct
+from both decode and verify.
+
+### 8.3 The band is not guessable from `weightless_decode`
+
+`weightless_decode`'s measured band is 24.0 (fp16 GGUF 27B, fp32 logits). It
+does **not** transfer. The projected rows here come from a verify-shaped
+forward, and once the two arms' accept lengths differ the same token index is
+scored at different slot positions in the two arms — a further fp difference on
+top. The band must be measured on the vehicle, and tightened, never loosened,
+from what is measured.
+
+---
+
+## 9. Speculation vs. no speculation at temperature 0 — the #50-family finding
+
+Window 5's control arms showed speculation alone breaking token identity at
+`temperature 0` on the **default, non-lane** path. That is worth stating
+carefully, because "greedy speculative decoding is lossless" is the usual
+selling point and is how this project nearly built a gate.
+
+### 9.1 What is established, from the code
+
+**The accept rule is exact.** `verify_tree_greedy_func` (`eagle_utils.py:587`)
+dispatches to `sgl_verify_tree_greedy` or `verify_tree_greedy_kernel_triton`;
+both accept draft slot `i` iff `candidates[i] == target_predict[parent]` — plain
+integer equality — and write `predicts[parent] = target_predict[parent]`, with
+`target_predict = argmax(next_token_logits)` (`eagle_utils.py:1029`). There is no
+threshold, tolerance, probability comparison or coin anywhere on this path;
+`--speculative-accept-threshold-single` / `-acc` and the uniform coins are
+consumed by the **sampling** branch only (`eagle_utils.py:1107-1128`; their
+only other mention in the tree is the scheduler's runtime-update allowlist,
+not a second consumption site). `temperature 0` takes the greedy branch
+(`sampling_params.py:169-172` sets `top_k = 1`), with the caveat that the
+predicate is BATCH-wide -- `is_all_greedy = all(top_k <= 1)` over the batch's
+requests, so one non-greedy request routes the whole batch into the sampling
+branch. Gate runs are single-request, so this does not affect the oracle; it
+does mean "temperature 0 implies the greedy verify path" is a statement about
+the batch, not about the request.
+
+*Therefore a divergence cannot originate in the accept decision.* It enters
+through the target logits, or through something that changes what the logits are
+computed over. That is a real narrowing — it rules out an entire class of
+suspect — but it is **not** the same as "benign".
+
+**One structural, non-fp divergence source does exist**, and no reassociation
+argument covers it: penalties. `eagle_utils.py:989-1009` applies the round's
+accumulated penalty vector `repeat_interleave`d across all `k+1` draft positions
+(upstream's own comment: "a relaxed version of penalties for speculative
+decoding"), so the penalty state does not advance within a round; and
+`eagle_prepare_for_decode` calls `cumulate_penalty_output_tokens` once per
+round, which takes `req.output_ids[-1]` only — so when a round commits `n`
+tokens, `n-1` of them never reach the penalizers at all. With repetition /
+presence / frequency penalties set, greedy speculation is therefore **not**
+lossless, by construction. Both are inert at default sampling params, so neither
+explains Window 5; they are recorded because "greedy spec is lossless" is false
+in a way that has nothing to do with floating point.
+
+A grammar mask is **not** in this category, and the obvious guess that it is was
+checked and is wrong: `generate_token_bitmask` (`eagle_worker_v2.py:2640`) walks
+the draft tree and produces a per-draft-position mask, so the FSM does advance
+per position.
+
+### 9.2 What is NOT established
+
+That the remaining difference is *purely* floating-point reassociation. The
+expected mechanism — `k+1` positions in one forward means different batch
+shapes, a different attention kernel path and a different reduction order — is
+consistent with every observation, including the one content class that matched
+256/256 (a trajectory with no near-ties has nothing to flip). It is a plausible
+explanation, and this whole task exists because a plausible explanation is not a
+correctness proof.
+
+**The discriminator, and it is unmeasured.** A reassociation flip happens where
+the reference's own margin to the flipped-to token is small; a real verify
+defect — wrong KV context, a corrupted tree mask, a desynced accept — flips
+tokens the reference was *confident* about, and does so at large margins. That
+is exactly `check_near_tie_only_divergence`, and running it needs the verify
+logits, which is why §8's tap had to be built before this question could be
+answered at all. The margin at the divergence has never been recorded.
+
+Until it is: **no gate anywhere may use spec-on vs spec-off token identity as
+evidence** (recorded in `EXCLUDED_CASES['spec_vs_nospec_token_identity']`, with
+a `validate_matrix` guard so it cannot be re-added, and in
+`FEATURES_VS_UPSTREAM.md`'s status legend so it cannot be counted as
+`Cross-checked`).
+
+### 9.3 Upstream relevance
+
+If R8 below shows near-tie-only divergence, the finding is "upstream greedy spec
+is lossless up to fp reassociation, and the usual claim should say so" — a
+documentation point, worth an upstream issue with the margin data attached. If
+it shows confident-margin flips, it is an upstream **defect** in a path the fork
+merely inherits, and the fork's own #50 machinery (rank-0 accept broadcast) is
+the nearest relative. Either way the vehicle is plain TP=2 with no fork feature
+enabled, so the report is reproducible upstream as-is.
+
+---
+
+## 10. GPU recipe for §8 and §9
+
+Cheapest first, and deliberately ordered so a failure is diagnosable where it
+happens. `--rank-gpu-id` is CUDA order (`[[tp5-emulation-uneven-gguf-bugs]]`);
+resolve the 5090's index at runtime with `/spinning/r3val/gpu_map.py`, never
+assume it. Vehicle: the Window-5 one — **Llama-3.1-8B-Instruct dense, TP=2**,
+lane head = torch[0], `--rank-gpu-memory-mib 29000,18000`, `--context-length
+2048`, `--max-total-tokens 16384`, CUDA graphs ON, `--random-seed 1234` on
+**every** boot (sglang randomizes when unset). Spec arm: EAGLE3, `--speculative-eagle-topk 1
+--speculative-num-steps 3 --speculative-num-draft-tokens 4
+--speculative-draft-placement solo`.
+
+* **R7 — the tap, and the reference-arm assumption.** Boot TP=1 with the spec
+  config and `--determinism-logits-dump-dir /tmp/det143/solo`. Check: one
+  `rank0_verify*.pt` per verify round; `check_accept_rule_exactness` green on
+  the read-back run (`SpecRun.from_dump_records`); `mean_accept_length` matches
+  the server's `meta_info.spec_accept_length`. Then repeat with
+  `--speculative-draft-placement split`: at TP=1 the two must be **byte-identical**,
+  which is what licenses using either as the reference. If they are not, the
+  reference arm must use `solo` and the discrepancy is its own finding.
+  *Cheapest possible failure point: this needs one GPU and no lane.*
+* **R8 — §9, the upstream question, on plain TP=2 with no lane.** Two arms,
+  same seed, same prompts, spec on / spec off, both dumping. Read back, project,
+  and run `check_near_tie_only_divergence` at the first token divergence.
+  Report the **margin**, per content class, alongside the measured per-step
+  `max|d|`. This is the number §9.2 says has never been taken; it decides
+  §9.3 on its own and does not need the lane at all.
+* **R9 — band calibration for `weightless_spec_matched`.** Lane+spec vs TP=1
+  solo+spec, 256 tokens, both dumping. Record measured per-token `max|d|`
+  (median / p95 / max) over the pre-fork prefix and the fork margin. Fill the
+  band in at ~2x the measured max, clear `pending_calibration`, and record the
+  measured floor in the row's `notes` exactly as the #124 rows do. Self-det
+  rerun on the same boot for the class's run==run obligation.
+* **R10 — `spec_replay_teacher_forced`.** Take R9's lane+spec emitted sequence,
+  feed it verbatim as the prompt of a single request to a **non-spec** boot of
+  the same geometry with `max_new_tokens 1` and `--determinism-logits-dump-dir`,
+  and compare that prefill's per-position argmax against the sequence. Same
+  band procedure. A confident-margin mismatch here is the wrong-KV-context
+  signature and is the one result that would make #143 a defect rather than a
+  calibration exercise.
+* **R11 — accept-length, content-pinned.** With R9's arms producing the same
+  tokens over the compared prefix, re-take the Window-5 observation that the
+  lane's accept length runs 8-12 % below the plain path. Window 5 could not
+  attribute it because the arms emitted different continuations; over a
+  token-aligned prefix it is finally comparable. A residual deficit on identical
+  content is a real signal about the draft's input (the lane changes the target
+  hidden state the draft consumes), not about the verify.
+
+Volume note: a 128k-vocab fp32 verify matrix at k=3 is ~2 MB per round, so a
+256-token arm is a few hundred MB. Bound the gate window and clear
+`/tmp/det143` between arms.

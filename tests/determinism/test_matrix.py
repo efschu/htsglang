@@ -30,6 +30,17 @@ EXPECTED_ROWS = {
     "streaming_host_spill": ByteIdentityClass.DECODE_CLASS,
     "fp8_offload": ByteIdentityClass.SELF_DET_NEAR_TIE,
     "marlin_offload": ByteIdentityClass.SELF_DET_NEAR_TIE,
+    "weightless_spec_matched": ByteIdentityClass.SPEC_NEAR_TIE,
+    "spec_replay_teacher_forced": ByteIdentityClass.SPEC_NEAR_TIE,
+}
+
+#: Rows that are fully specified but whose fp band has NOT been measured on
+#: hardware. They must not gate until the band is filled in; keeping the
+#: expected set explicit here means a band landing silently (or a row being
+#: promoted without one) fails the suite rather than drifting.
+EXPECTED_PENDING_CALIBRATION = {
+    "weightless_spec_matched",
+    "spec_replay_teacher_forced",
 }
 
 
@@ -39,6 +50,19 @@ def test_matrix_validates():
 
 def test_matrix_covers_exactly_the_specified_gates():
     assert {c.case_id: c.expected_class for c in TEST_MATRIX} == EXPECTED_ROWS
+
+
+def test_pending_calibration_rows_are_exactly_the_expected_ones():
+    pending = {c.case_id for c in TEST_MATRIX if c.pending_calibration}
+    assert pending == EXPECTED_PENDING_CALIBRATION
+    for c in TEST_MATRIX:
+        if c.pending_calibration:
+            assert c.band is None, (
+                f"{c.case_id}: a pending row carries no band -- a value here "
+                "would read as measured"
+            )
+        elif c.expected_class is not ByteIdentityClass.MACHINE_ZERO:
+            assert c.band is not None, c.case_id
 
 
 def test_seed_pinning_discipline():

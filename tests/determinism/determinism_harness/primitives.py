@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from .spec_trajectory import SpecRun
 from .trajectory import FlipKind, Trajectory, Verdict, combine
 
 __all__ = [
@@ -31,6 +32,8 @@ __all__ = [
     "check_non_compounding",
     "check_self_determinism",
     "check_near_tie_only_divergence",
+    "check_accept_rule_exactness",
+    "check_accept_length_floor",
 ]
 
 
@@ -345,4 +348,106 @@ def check_near_tie_only_divergence(
         flip_kind=kind,
         margin_at_divergence=margin,
         max_abs_delta=band_v.max_abs_delta,
+    )
+
+
+# --------------------------------------------------------------------------
+# Speculative decoding (#143 follow-up). These two take a SpecRun rather than
+# a Trajectory pair: they are the checks that do not have -- and do not need
+# -- a reference arm.
+# --------------------------------------------------------------------------
+
+
+def check_accept_rule_exactness(
+    run: SpecRun, check: str = "accept_rule_exactness"
+) -> Verdict:
+    """Reference-free: every emitted token is the argmax of its verify row.
+
+    The greedy accept rule is EXACT integer equality against the target's own
+    argmax -- ``verify_tree_greedy_func`` accepts draft slot i iff
+    ``candidates[i] == target_predict[parent]`` and writes
+    ``predicts[parent] = target_predict[parent]``, with
+    ``target_predict = argmax(next_token_logits)`` (``eagle_utils.py:1029``).
+    There is no threshold, tolerance or approximation on this path;
+    ``--speculative-accept-threshold-single/-acc`` are consumed by the
+    SAMPLING branch only. So no fp band can excuse a violation here.
+
+    What this therefore tests is the PLUMBING, not the numerics: the
+    accept_index walk, the rank-0 ``predict`` broadcast (which is where a
+    weightless worker's tokens come from -- it has no logits of its own), and
+    this harness's own projection. What it does NOT test is whether the
+    verify forward attended over the right KV context: a verify reading the
+    wrong slots produces wrong logits and then emits their argmax perfectly
+    consistently. That question needs the teacher-forced replay row.
+
+    Exact ties are admissible for either winner -- the check is
+    ``logits[i].max() - logits[i, emitted[i]] == 0``, not an argmax index
+    comparison.
+    """
+    step = 0
+    for r_idx, rnd in enumerate(run.rounds):
+        for i, tok in enumerate(rnd.emitted):
+            row = rnd.logits[i].to(torch.float64)
+            margin = float(row.max() - row[int(tok)])
+            if margin > 0.0:
+                return Verdict(
+                    ok=False,
+                    check=check,
+                    message=(
+                        f"emitted token {int(tok)} is not the argmax of its "
+                        f"verify row (round {r_idx}, slot {i}, emitted-token "
+                        f"index {step}): row winner is "
+                        f"{int(rnd.logits[i].argmax())} by {margin:.3e}. The "
+                        "greedy accept rule is exact -- this is accept "
+                        "plumbing, not fp"
+                    ),
+                    first_divergence_step=step,
+                    flip_kind=FlipKind.CORRUPTION,
+                    margin_at_divergence=margin,
+                )
+            step += 1
+    return Verdict(
+        ok=True,
+        check=check,
+        message=f"all {step} emitted tokens are their verify row's argmax",
+    )
+
+
+def check_accept_length_floor(
+    run: SpecRun, floor: float, check: str = "accept_length_floor"
+) -> Verdict:
+    """The cheap indirect instrument: mean accept length must clear ``floor``.
+
+    Weakest of the three oracles and never the primary one -- a correct
+    trajectory with a poor draft also fails it, and a wrong-context verify
+    that happens to keep accepting would pass it. It is kept because it is
+    the only check that sees the ONE lane-specific failure mode the
+    token-level checks are blind to: a verify attending over the wrong KV
+    slots still runs, still emits self-consistent tokens, and collapses the
+    accept rate long before it crashes (``docs_new/weightless_chain_spec.md``
+    §5.2).
+
+    A failing verdict is a signal to investigate, not a proof of a defect;
+    the gate log must record the reference arm's accept length beside it.
+    """
+    if not run.rounds:
+        return Verdict(ok=False, check=check, message="empty run: no verify rounds")
+    mean = run.mean_accept_length()
+    if mean < floor:
+        return Verdict(
+            ok=False,
+            check=check,
+            message=(
+                f"mean accept length {mean:.4g} below floor {floor:.4g} over "
+                f"{len(run.rounds)} rounds (lengths {run.accept_lengths()[:16]}"
+                f"{'...' if len(run.rounds) > 16 else ''})"
+            ),
+        )
+    return Verdict(
+        ok=True,
+        check=check,
+        message=(
+            f"mean accept length {mean:.4g} >= floor {floor:.4g} over "
+            f"{len(run.rounds)} rounds"
+        ),
     )

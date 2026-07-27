@@ -80,18 +80,30 @@ class Verdict:
 
 def combine(check: str, subs: Sequence[Verdict], message: str = "") -> Verdict:
     """Bundle sub-verdicts; the composite fails iff any sub-check fails and
-    inherits the first failing sub's divergence step / flip / magnitudes."""
+    inherits the first failing sub's divergence step / flip / magnitudes.
+
+    A composite that PASSES still inherits the diagnostics of the first sub
+    that recorded a divergence. The near-tie classes pass *with* a fork -- a
+    legitimate one -- and a gate log that reports "passed" without naming the
+    fork token and its margin hides the one number a reader needs to judge
+    whether the near-tie verdict was earned or lucky.
+    """
     ok = all(s.ok for s in subs)
     v = Verdict(ok=ok, check=check, message=message, sub_verdicts=list(subs))
-    for s in subs:
-        if not s.ok:
-            v.first_divergence_step = s.first_divergence_step
-            v.flip_kind = s.flip_kind
-            v.max_abs_delta = s.max_abs_delta
-            v.margin_at_divergence = s.margin_at_divergence
-            if not message:
-                v.message = f"sub-check '{s.check}' failed"
-            break
+    donor = next((s for s in subs if not s.ok), None)
+    if donor is None:
+        donor = next((s for s in subs if s.first_divergence_step is not None), None)
+    if donor is not None:
+        v.first_divergence_step = donor.first_divergence_step
+        v.flip_kind = donor.flip_kind
+        v.max_abs_delta = donor.max_abs_delta
+        v.margin_at_divergence = donor.margin_at_divergence
+        if not message:
+            v.message = (
+                f"sub-check '{donor.check}' failed"
+                if not donor.ok
+                else donor.message
+            )
     return v
 
 

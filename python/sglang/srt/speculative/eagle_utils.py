@@ -1190,7 +1190,31 @@ def eagle_sample(
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
-    return predict, num_correct_drafts + 1, accept_index
+    accept_lens = num_correct_drafts + 1
+
+    # DEBUG tap for the #124 determinism harness (default off, guarded by
+    # --determinism-logits-dump-dir). Placed AFTER the rank-0 accept broadcast
+    # so what is recorded is the AUTHORITATIVE accept -- the same one a
+    # weightless worker receives -- paired with the head's verify logits that
+    # produced it. ModelRunner's own dump cannot see this step at all: it hangs
+    # off ModelRunner.sample and requires a single logits row, while a verify
+    # carries bs * draft_token_num of them.
+    _dump_dir = get_server_args().determinism_logits_dump_dir
+    if _dump_dir is not None:
+        from sglang.srt.speculative.spec_verify_dump import maybe_dump_verify_step
+
+        maybe_dump_verify_step(
+            dump_dir=_dump_dir,
+            tp_rank=tp_group.rank_in_group if tp_group is not None else 0,
+            logits=next_token_logits,
+            candidates=candidates,
+            predict=predict,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            draft_token_num=verify_input.draft_token_num,
+        )
+
+    return predict, accept_lens, accept_index
 
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):

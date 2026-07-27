@@ -26,18 +26,27 @@ def _load_native_hash_module() -> Any:
     try:
         from torch.utils.cpp_extension import load
 
+        from sglang.jit_kernel.baton_health import jit_build_guard
+
         abs_path = os.path.dirname(os.path.abspath(__file__))
+        sources = [f"{abs_path}/hash_binding.cpp"]
         extra_cflags = ["-O3", "-std=c++17", "-DNDEBUG"]
         if _cpu_supports_avx2():
             extra_cflags.append("-mavx2")
-        return load(
-            name="hicache_hash_cpp",
-            sources=[f"{abs_path}/hash_binding.cpp"],
-            extra_cflags=extra_cflags,
-            extra_ldflags=["-lcrypto"],
-            with_cuda=False,
-            verbose=False,
-        )
+        # This callsite is where an abandoned torch build lock was first seen
+        # stalling a run for 18 minutes with the .so already built. The guard
+        # tells baton_health which sources the artifact must be newer than, so
+        # such a lock is recognised as orphaned on the first poll instead of
+        # waited on forever.
+        with jit_build_guard("hicache_hash_cpp", sources=sources):
+            return load(
+                name="hicache_hash_cpp",
+                sources=sources,
+                extra_cflags=extra_cflags,
+                extra_ldflags=["-lcrypto"],
+                with_cuda=False,
+                verbose=False,
+            )
     except Exception as exc:
         raise RuntimeError("Failed to load HiCache native hash extension") from exc
 
