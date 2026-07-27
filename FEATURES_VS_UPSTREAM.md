@@ -1,6 +1,7 @@
 # htsglang Fork Features
 
-Comparison as of 2026-07-25, checked directly (not against memory or task lists) against two
+Comparison as of 2026-07-25 (status vocabulary updated 2026-07-26, see Changelog), checked directly
+(not against memory or task lists) against two
 branches: `integration/r3-probe` (repo `wt-merge-probe`, includes at least `4c90038a78`) and
 `feat/htccl-gfx900` (repo `wt-htccl`, tip `3cc2fc9da5`, 9 commits, of which 2 — `fa5c507476` and
 `3cc2fc9da5` — are **not yet merged** into `integration/r3-probe`; noted per row where it applies).
@@ -12,13 +13,26 @@ capability is present in upstream SGLang, upstream vLLM, `llama.cpp`, or `ik_lla
 
 ## Status legend
 
-This project is **work in progress**. Every `Fork`/`Fork status` entry records the local
-validation state observed on this fork's own rig(s) at the time of writing — 1x RTX 5090 + 2x RTX
-3080 for most rows, plus 1x RTX 2080 Ti (sm75) + 1x Radeon RX Vega 64 (gfx900) for the
-cross-vendor rows — not a claim of finished code review, exhaustive test coverage, or
-upstream-mergeable maturity. `Implemented` means code is merged and has cleared the specific
-tests/boots named in that row, nothing more; it is not shorthand for "done" in the sense of fully
-reviewed and tested — that review has not happened yet.
+**Status**
+- `Built` — merged; covered by our own tests only.
+- `Boot-checked` — executed on hardware with a real model; coherent output.
+- `Cross-checked` — validated against an independent reference (another
+  backend, a solo/TP=1 run as oracle, `torch`/`torch.distributed`, or a
+  byte-/token-identity that must hold for structural reasons). Reference and
+  scope are stated per row.
+
+All entries are work in progress. No entry implies external review or upstream-mergeable maturity.
+Reference rig: 1x RTX 5090 + 2x RTX 3080 for most rows, plus 1x RTX 2080 Ti (sm75) + 1x Radeon RX
+Vega 64 (gfx900) for the cross-vendor rows.
+
+`falsifikator-geprueft` marks a row whose own test is on record as red before its fix and green
+after.
+
+**fp8 on RTX 3080, since #190:** `gptq_marlin_gemm`, the only fp8 GEMM sm86 has, is measured
+run-to-run nondeterministic above ~109 prompt tokens (0/1200 mismatches through M=109, first
+mismatch at M=128; `fix/gdn-prefill-determinism`, not yet merged). Byte-/token-identity claims
+above that length on a 3080 are flagged per row rather than counted as `Cross-checked`; the RTX
+5090 (sm120, a different fp8 GEMM path) is unaffected at any length.
 
 ## Core concepts
 
@@ -36,10 +50,9 @@ linked by anchor to its **detail section**, which carries the fork status, key m
 and only the upstream distinctions not already implied by the matrix token.
 
 **Column definitions**
-- **Fork** — `Implemented` (merged, with the tests/boot named in the detail section — see Status
-  legend above), `WIP` (present but not complete/validated), `Exp` (highly experimental, not
-  production-ready). A trailing `*` means the capability lives only on the not-yet-merged
-  `feat/htccl-gfx900` branch.
+- **Fork** — `Built` / `Boot-checked` / `Cross-checked` (see Status legend above), `WIP` (present
+  but not complete/validated), `Exp` (highly experimental, not production-ready). A trailing `*`
+  means the capability lives only on a not-yet-merged branch, named in the detail section.
 - **SGLang / vLLM / llama.cpp / ik_llama.cpp** — `yes` / `partial` / `no` / `n/a` / `unverified`.
   `partial` always names the mechanism difference in the detail section, never left implicit.
   `unverified` means the check could not be completed with the sources available in this pass.
@@ -50,34 +63,34 @@ and only the upstream distinctions not already implied by the matrix token.
 
 | # | Feature | Fork | SGLang | vLLM | llama.cpp | ik_llama.cpp |
 |---|---|---|---|---|---|---|
-| [1](#f1) | Asymmetric tensor parallelism | Implemented | no | no | partial | partial |
-| [2](#f2) | Asymmetric decode context parallelism | Implemented | partial | partial | no | no |
-| [3](#f3) | Rank-to-GPU mapping and co-location | Implemented | no | no | no | no |
-| [4](#f4) | Solo drafter placement | Implemented | no | yes | partial | partial |
+| [1](#f1) | Asymmetric tensor parallelism | Boot-checked | no | no | partial | partial |
+| [2](#f2) | Asymmetric decode context parallelism | Cross-checked | partial | partial | no | no |
+| [3](#f3) | Rank-to-GPU mapping and co-location | Boot-checked | no | no | no | no |
+| [4](#f4) | Solo drafter placement | Built | no | yes | partial | partial |
 | [5](#f5) | Cross-algorithm drafter routing | WIP | no | no | no | no |
-| [6](#f6) | CUDA graph memory aliasing for spec branches | Implemented | partial | partial | no | no |
-| [7](#f7) | MoE expert offload + asymmetric TP/DCP | Implemented | partial | partial | partial | partial |
-| [8a](#f8a) | Bespoke GGUF adapter framework | Implemented | no | no | n/a | n/a |
-| [8b](#f8b) | Qwen3.5/3.6 GGUF | Implemented | no | no | yes | yes |
-| [8c](#f8c) | Gemma-4 GGUF | Implemented | no | no | yes | yes |
-| [8d](#f8d) | GGUF K-quant compute kernels | Implemented | partial | partial | yes | yes |
-| [8e](#f8e) | Asymmetric-TP x GGUF correctness | Implemented | no | no | n/a | n/a |
-| [8f](#f8f) | Multimodal and dynamic-quant GGUF | Implemented | partial | partial | yes | partial |
-| [9](#f9) | Hibernate checkpoint/restore | Implemented | no | partial | partial | partial |
-| [10](#f10) | Measured VRAM budget | Implemented | partial | partial | partial | partial |
-| [11](#f11) | Cross-architecture speculative determinism | Implemented | partial | partial | no | no |
-| [12](#f12) | Weightless-KV lane | Implemented | no | no | no | no |
+| [6](#f6) | CUDA graph memory aliasing for spec branches | Boot-checked | partial | partial | no | no |
+| [7](#f7) | MoE expert offload + asymmetric TP/DCP | Boot-checked | partial | partial | partial | partial |
+| [8a](#f8a) | Bespoke GGUF adapter framework | Boot-checked | no | no | n/a | n/a |
+| [8b](#f8b) | Qwen3.5/3.6 GGUF | Boot-checked | no | no | yes | yes |
+| [8c](#f8c) | Gemma-4 GGUF | Boot-checked | no | no | yes | yes |
+| [8d](#f8d) | GGUF K-quant compute kernels | Boot-checked | partial | partial | yes | yes |
+| [8e](#f8e) | Asymmetric-TP x GGUF correctness | Boot-checked | no | no | n/a | n/a |
+| [8f](#f8f) | Multimodal and dynamic-quant GGUF | Boot-checked | partial | partial | yes | partial |
+| [9](#f9) | Hibernate checkpoint/restore | Boot-checked | no | partial | partial | partial |
+| [10](#f10) | Measured VRAM budget | Boot-checked | partial | partial | partial | partial |
+| [11](#f11) | Cross-architecture speculative determinism | Boot-checked | partial | partial | no | no |
+| [12](#f12) | Weightless-KV lane | Cross-checked | no | no | no | no |
 | [13](#f13) | Rig dashboard / planner UI | Exp | n/a | n/a | n/a | n/a |
-| [14](#f14) | Single-node PD disaggregation | Implemented | yes (base) | yes (base) | no | no |
-| [15](#f15) | Asymmetric-TP quantization correctness | Implemented | partial | partial | n/a | n/a |
-| [16](#f16) | Fast-lane priority scheduling | Implemented | partial | partial | no | no |
-| [17](#f17) | HiCache under asymmetric-TP/DCP | Implemented | yes (base) | n/a | partial | partial |
-| [18](#f18) | TP greater than num_kv_heads | Implemented | partial | partial | partial | partial |
-| [19](#f19) | Broad model bring-up under asymmetric-TP | Implemented | n/a | n/a | n/a | n/a |
+| [14](#f14) | Single-node PD disaggregation | Boot-checked | yes (base) | yes (base) | no | no |
+| [15](#f15) | Asymmetric-TP quantization correctness | Boot-checked | partial | partial | n/a | n/a |
+| [16](#f16) | Fast-lane priority scheduling | Built | partial | partial | no | no |
+| [17](#f17) | HiCache under asymmetric-TP/DCP | Boot-checked | yes (base) | n/a | partial | partial |
+| [18](#f18) | TP greater than num_kv_heads | Boot-checked | partial | partial | partial | partial |
+| [19](#f19) | Broad model bring-up under asymmetric-TP | Boot-checked | n/a | n/a | n/a | n/a |
 | [20](#f20) | Session KV spill | Exp | partial | partial | partial | partial |
-| [21](#f21) | HTCCL cross-vendor collectives | Implemented | no | no | partial | partial |
-| [22](#f22) | fp8 dequant fallback (W8A16) | Implemented* | no | no | partial | unverified |
-| [23](#f23) | Turing/gfx900 without sgl-kernel | Implemented | no | no | partial | partial |
+| [21](#f21) | HTCCL cross-vendor collectives | Cross-checked | no | no | partial | partial |
+| [22](#f22) | fp8 dequant fallback (W8A16) | Cross-checked* | no | no | partial | unverified |
+| [23](#f23) | Turing/gfx900 without sgl-kernel | Cross-checked | no | no | partial | partial |
 
 ---
 
@@ -89,7 +102,7 @@ and only the upstream distinctions not already implied by the matrix token.
 **Feature:** (`--rank-tp-ratio auto`) unequal per-rank shard sizes within one TP group — see Core
 concepts.
 
-**Fork status:** Implemented — validated TP=3 on 1x RTX 5090 + 2x RTX 3080 (Qwen3.6-27B FP8);
+**Fork status:** Boot-checked — validated TP=3 on 1x RTX 5090 + 2x RTX 3080 (Qwen3.6-27B FP8);
 greedy decode is self-deterministic (byte-identical run-to-run/cold-vs-warm on the same GPUs, not
 a cross-hardware claim — see row 11). Includes 3 correctness fixes: an `o_proj`-vs-head-split
 reject-guard for 3 architectures whose attention silently used the wrong head split (`dd68fad951`);
@@ -97,11 +110,7 @@ DFLASH per-rank attention/MLP shards (`5af72c7a60`/`734f77e313`), validated gree
 units `[68,34,34]`); a `kv == tp` replicated-KV widening that was implemented, GPU-measured, and
 **reverted** (dies on first forward, see Guarded/descoped below).
 
-**Upstream:** SGLang/vLLM require equal, head-divisible shards (no). llama.cpp/ik_llama.cpp
-(`--tensor-split`/`--split-mode row`, `-ts`/`-sm`) split by whole layer or row, never by head, and
-have no per-rank broadcast execution model (partial); ik_llama.cpp's own docs list only `-sm`
-`none`/`graph`/`layer`, so whether `row`/`tensor` modes are dropped or just undocumented is
-**unverified**.
+**Upstream:** replaces sglang's requirement of equal, head-divisible shards.
 
 <a id="f2"></a>
 ### 2. Asymmetric decode context parallelism
@@ -109,15 +118,25 @@ have no per-rank broadcast execution model (partial); ik_llama.cpp's own docs li
 **Feature:** (`--rank-kv-ratio`) capacity-weighted per-rank KV ownership during decode — see Core
 concepts.
 
-**Fork status:** Implemented — token-split variant validated. The arg-gate dependency on a
+**Fork status:** Cross-checked — token-split variant validated. The arg-gate dependency on a
 non-uniform `--rank-tp-ratio` was audited and confirmed genuine, not arbitrary. A silent-ignore
 defect in `resolve_cp_token_ratios` (an explicit token vector with no plan booted green but did
-nothing) now hard-rejects instead (`4c90038a78`). Separately found and guarded: stock (non-fork)
-`--dcp-size N` under the Triton backend silently corrupts output when KV heads aren't replicated
-across the DCP group — the fork's own uneven-DCP geometry is exempt.
+nothing) now hard-rejects instead (`4c90038a78`, falsifikator-geprueft: booted green while silently
+doing nothing). Separately found and
+guarded: stock (non-fork) `--dcp-size N` under the Triton backend silently corrupts output when KV
+heads aren't replicated across the DCP group — the fork's own uneven-DCP geometry is exempt.
 
-**Upstream:** SGLang/vLLM have DCP but only a symmetric, evenly-split KV cache (partial).
-llama.cpp/ik_llama.cpp have no context-parallel decode of any kind (no).
+Two independent-reference checks, both on the main rig (27B FP8, TP=3, 5090 + 2x 3080):
+- **#173 G4** (Triton uneven-DCP vs. a DCP-off ground truth, greedy, no spec): `short_code`
+  byte-identical arm-for-arm. The same run's `chunked` (11650-token) prompt also matched, but sits
+  past the ~109-token fp8@3080 boundary (see legend) and is excluded from the tier.
+- **#180 V4** (Triton vs. flashinfer, chain speculative verify under uneven DCP, 27B FP8 TP=3, MTP,
+  greedy, CUDA graphs on, 4 prompts): token ids identical arm-for-arm on the 3 short prompts;
+  `meta_info.spec_accept_length` in the same band. The 4th prompt (11650 tokens) is separately on
+  record as cache-state-sensitive on the Triton lane (not attributed to #180) and, combined with
+  the fp8@3080 boundary, is excluded.
+
+**Upstream:** replaces sglang's DCP, which only splits KV evenly across ranks.
 
 <a id="f3"></a>
 ### 3. Rank-to-GPU mapping and co-location
@@ -125,13 +144,15 @@ llama.cpp/ik_llama.cpp have no context-parallel decode of any kind (no).
 **Feature:** (`--rank-gpu-id`, `--rank-gpu-memory-mib`) assigns each rank to an NVML-resolved
 physical GPU; duplicates co-locate multiple ranks on one GPU.
 
-**Fork status:** Implemented — co-location requires NCCL >= 2.30 (shipped in the fork's Docker
-image). `--rank-tp-ratio`/`--rank-kv-ratio` no longer require `--rank-gpu-id` to be set
+**Fork status:** Boot-checked — co-location itself is exercised on real hardware via row 18's
+TP=5-on-3-cards boot (#62), which depends on this mapping. Co-location requires NCCL >= 2.30
+(shipped in the fork's Docker image). `--rank-tp-ratio`/`--rank-kv-ratio` no longer require
+`--rank-gpu-id` to be set
 (`c51dd9c371`): sharding-ratio validity and physical placement are independent concerns, and
 coupling them blocked the cross-vendor case (row 21), where NVML cannot name an AMD rank.
 
-**Upstream:** SGLang/vLLM place ranks via `CUDA_VISIBLE_DEVICES` only, no per-rank physical-GPU
-flag (no). llama.cpp/ik_llama.cpp have no "rank" concept at all (no).
+**Upstream:** sglang places ranks via `CUDA_VISIBLE_DEVICES` only; this adds an explicit per-rank
+physical-GPU mapping.
 
 <a id="f4"></a>
 ### 4. Solo drafter placement
@@ -139,14 +160,10 @@ flag (no). llama.cpp/ik_llama.cpp have no "rank" concept at all (no).
 **Feature:** (`--speculative-draft-placement solo`) runs the draft model unsharded on one GPU,
 broadcasting its output instead of all-reducing.
 
-**Fork status:** Implemented — registered unit tests (solo placement, weight/KV planning, vocab
-broadcast).
+**Fork status:** Built — registered unit tests (solo placement, weight/KV planning, vocab
+broadcast); no hardware boot recorded for this row.
 
-**Upstream:** vLLM has the same capability (`--speculative-draft-tensor-parallel-size 1`, yes).
-SGLang has no equivalent flag (no). llama.cpp/ik_llama.cpp reach the same outcome via per-model
-device pinning (`--spec-draft-device` etc.) but have no all-reduce/broadcast primitive at all
-(partial — different mechanism); ik_llama.cpp's narrower flag set leaves one flag's presence
-(`--override-tensor-draft`) **unverified**.
+**Upstream:** no equivalent flag in sglang.
 
 <a id="f5"></a>
 ### 5. Cross-algorithm drafter routing
@@ -160,8 +177,7 @@ is not yet implemented. Lazy single-graph capture + DFLASH context-retirement (#
 is merged and validated green under CUDA graphs (arm C: 542.0 MiB released; arm G: full stack
 green).
 
-**Upstream:** no equivalent in SGLang, vLLM, llama.cpp, or ik_llama.cpp — all adapt or select a
-single drafter's parameters; none switch between resident draft algorithms.
+**Upstream:** no equivalent in sglang, which adapts or selects a single drafter's parameters.
 
 <a id="f6"></a>
 ### 6. CUDA graph memory aliasing for spec branches
@@ -169,24 +185,22 @@ single drafter's parameters; none switch between resident draft algorithms.
 **Feature:** (#93/#102) inactive speculative-depth CUDA-graph branches hold no physical VRAM via
 cuMem tag aliasing.
 
-**Fork status:** Implemented — `kv_vmm_backing` / adaptive runtime state.
+**Fork status:** Boot-checked — `kv_vmm_backing` / adaptive runtime state; the only GPU number
+recorded against this aliasing path is row 5's #156-4 arm-C boot (`f2c96f31b3`, 542.0 MiB released
+under CUDA graphs).
 
-**Upstream:** SGLang/vLLM have related VMM/cuMem machinery (a multi-spec-graph roadmap item; Sleep
-Mode's tag-based offload) but not applied to speculative CUDA-graph branches (partial).
-llama.cpp/ik_llama.cpp have no comparable alternate-depth-graph concept to alias (no).
+**Upstream:** sglang has related VMM/cuMem machinery (a multi-spec-graph roadmap item) not yet
+applied to speculative CUDA-graph branches.
 
 <a id="f7"></a>
 ### 7. MoE expert offload + asymmetric TP/DCP
 
 **Feature:** MoE expert offloading to host RAM combined with asymmetric TP and DCP (GPTQ/AWQ/FP8).
 
-**Fork status:** Implemented — validated on a 122B-A10B MoE across three mismatched GPUs.
+**Fork status:** Boot-checked — validated on a 122B-A10B MoE across three mismatched GPUs.
 
-**Upstream:** SGLang/vLLM offload weights layer-granularly (`--cpu-offload-gb`), not
-expert-granularly, and not combined with asymmetric TP/DCP (partial). llama.cpp/ik_llama.cpp have
-the same expert-granular idea (`-ot`/`-ncmoe`/`--n-cpu-moe`; ik_llama.cpp also runs its own
-`iqk_mul_mat` kernel lineage, see row 8d) but nothing to combine it with, since neither
-asymmetric-TP nor DCP exists there (partial).
+**Upstream:** sglang offloads weights layer-granularly (`--cpu-offload-gb`), not expert-granularly,
+and not combined with asymmetric TP/DCP.
 
 <a id="f8a"></a>
 ### 8a. Bespoke GGUF adapter framework
@@ -195,11 +209,10 @@ asymmetric-TP nor DCP exists there (partial).
 inverse weight transforms) on top of the generic GGUF path, plus sibling-file config/tokenizer
 loading for archs the generic metadata reader can't parse.
 
-**Fork status:** Implemented — registry with two families; unit tests (header, sizing).
+**Fork status:** Boot-checked — registry with two families; unit tests (header, sizing). Boot
+evidence comes from rows 8b-8f, which load through this registry on real hardware.
 
-**Upstream:** SGLang/vLLM's generic GGUF path can't load these arches (no). llama.cpp/ik_llama.cpp
-are GGUF's native home — their own converter/loader **is** the reference implementation, so an
-"adapter over a generic path" doesn't apply there (n/a).
+**Upstream:** sglang's generic GGUF path can't load these arches.
 
 <a id="f8b"></a>
 ### 8b. Qwen3.5/3.6 GGUF
@@ -207,12 +220,10 @@ are GGUF's native home — their own converter/loader **is** the reference imple
 **Feature:** GGUF arch `qwen35`/`qwen35moe`: GDN/RMSNorm/`out_proj` inverse transforms, plus
 NEXTN/MTP draft (including MoE draft) loaded from the same file.
 
-**Fork status:** Implemented — dense + MoE + NEXTN/MTP; K-quants Q4_K_M...Q8_0 coherent and
+**Fork status:** Boot-checked — dense + MoE + NEXTN/MTP; K-quants Q4_K_M...Q8_0 coherent and
 greedy-deterministic; validated Q6_K at asymmetric TP=3 (5090 + 2x 3080).
 
-**Upstream:** SGLang/vLLM unsupported (no). llama.cpp has native arch support and is ahead of this
-fork's port (yes). ik_llama.cpp has the arch in source; NEXTN/MTP-from-same-file loading is not
-independently verified there (yes, with caveat).
+**Upstream:** unsupported in sglang.
 
 <a id="f8c"></a>
 ### 8c. Gemma-4 GGUF
@@ -220,12 +231,11 @@ independently verified there (yes, with caveat).
 **Feature:** GGUF arch `gemma4`, dense: inverse transforms distinct from Qwen (dequantized
 `token_embd`, identity norm handling, tied `lm_head`, `k==v` shard duplication).
 
-**Fork status:** Implemented — Gemma-4-31B-it Q4_K_M validated (TP=1 on RTX 5090, ~61 tok/s,
+**Fork status:** Boot-checked — Gemma-4-31B-it Q4_K_M validated (TP=1 on RTX 5090, ~61 tok/s,
 coherent + self-deterministic; asymmetric TP=3 green). MoE/MTP/vision Gemma-4 GGUF deferred
 (fail-fast); only Q4_K_M empirically verified.
 
-**Upstream:** SGLang/vLLM unsupported (no). llama.cpp native (yes). ik_llama.cpp has the arch in
-source; MoE/vision/MTP sub-variants not independently verified (yes, with caveat).
+**Upstream:** unsupported in sglang.
 
 <a id="f8d"></a>
 ### 8d. GGUF K-quant compute kernels
@@ -233,17 +243,15 @@ source; MoE/vision/MTP sub-variants not independently verified (yes, with caveat
 **Feature:** (`sgl-kernel` MMQ/MMVQ) tuned K-quant kernels: per-device MMVQ<->MMQ crossover,
 prefill-oriented MMQ cap, batched MMVQ, quantized vocab/embedding, I-Matrix quant.
 
-**Fork status:** Implemented — merged from `feat/kquant-kernel`, kernel tests. Opt-in
+**Fork status:** Boot-checked — merged from `feat/kquant-kernel`, kernel tests. Opt-in
 `--gguf-mmq-decode-threshold` (#163, default OFF): measured **+9.7-10.6%** end-to-end tok/s
 (Qwen3.6-27B UD-Q8_K_XL, TP=3, CUDA graphs) but only the sm120 rank reroutes (confirmed by per-rank
 kernel-call counts: 11320 MMQ / 0 MMVQ on TP0, 0 MMQ / 11320 MMVQ on TP1/TP2 — 2 of 3 ranks
 unaffected). **Not byte-identical when ON** (MMQ/MMVQ reduce in a different order); flag OFF
 reproduces the prior dispatch exactly.
 
-**Upstream:** SGLang/vLLM have the base MMQ/MMVQ kernels; the crossover/cap/quantized-vocab tuning
-is fork-only (partial). llama.cpp originates the base kernels (yes, base); ik_llama.cpp runs its
-own separate `iqk_mul_mat` kernel lineage (yes, base) — the fork's per-device crossover heuristic
-is still fork-only on both.
+**Upstream:** sglang has the base MMQ/MMVQ kernels; the crossover/cap/quantized-vocab tuning is
+fork-only.
 
 <a id="f8e"></a>
 ### 8e. Asymmetric-TP x GGUF correctness
@@ -252,13 +260,12 @@ is still fork-only on both.
 coarsening, GGUF-MoE out-of-bounds expert-id fixes, per-rank local-expert-count guard; same
 alignment applied to compressed-tensors AWQ/GPTQ INT4.
 
-**Fork status:** Implemented — a series of merged bugfixes (#80, #81, #82, #109) with registered
-tests.
+**Fork status:** Boot-checked — a series of merged bugfixes (#80, #81, #82, #109) with registered
+tests. The #82/#109 class (out-of-bounds expert ids, K-quant superblock alignment under uneven
+sharding) was found via real GPU crashes/reads (falsifikator-geprueft — each guard test corresponds
+to a reproduced hardware fault).
 
-**Upstream:** SGLang/vLLM: n/a, asymmetric TP is absent upstream. llama.cpp/ik_llama.cpp: n/a for
-the same reason — the closest analog, `--split-mode row`, has no per-rank asymmetric head split
-for this bugfix class to apply to; whether `--split-mode row` itself hits a K-quant superblock
-boundary issue at an uneven GPU *count* is **unverified**.
+**Upstream:** n/a — asymmetric TP is absent from sglang, so this bugfix class doesn't apply there.
 
 <a id="f8f"></a>
 ### 8f. Multimodal and dynamic-quant GGUF
@@ -266,13 +273,10 @@ boundary issue at an uneven GPU *count* is **unverified**.
 **Feature:** load a vision tower from a companion `mmproj` GGUF; load unsloth "UD" dynamic-quant
 GGUFs (mixed precision).
 
-**Fork status:** Implemented — UD Q6_K_XL (+ mmproj) validated in the benchmark matrix; UD
+**Fork status:** Boot-checked — UD Q6_K_XL (+ mmproj) validated in the benchmark matrix; UD
 Q8_K_XL infeasible on the reference rig (size + a known Q8 loader limitation).
 
-**Upstream:** SGLang/vLLM's generic path doesn't load these variants for the affected arches
-(partial). llama.cpp is the native home for both (yes). ik_llama.cpp: community reports suggest
-multimodal support lags mainline; verdict is architecture-dependent (partial, **unverified in
-detail**).
+**Upstream:** sglang's generic path doesn't load these variants for the affected arches.
 
 <a id="f9"></a>
 ### 9. Hibernate checkpoint/restore
@@ -280,15 +284,11 @@ detail**).
 **Feature:** (#89) persists warm server state to disk so it survives process exit and reloads
 without full re-initialization.
 
-**Fork status:** Implemented and validated for dense GGUF (load 50s -> 8-14s under asymmetric
+**Fork status:** Boot-checked, validated for dense GGUF (load 50s -> 8-14s under asymmetric
 TP=3, survives process exit). The FP8 path is functional with negligible load-time benefit;
 MoE-model hibernation deferred.
 
-**Upstream:** SGLang has diffusion-server offload/wake-up only, no full LLM-server snapshot (no).
-vLLM's Sleep Mode releases/restores memory in-process; CUDA checkpoint/restore to a persistent
-snapshot is an open, unmerged RFC (partial). llama.cpp/ik_llama.cpp persist per-conversation KV
-state (`--prompt-cache`, slot save/restore) but don't snapshot weights/allocator state — the model
-reloads fresh (partial).
+**Upstream:** sglang has diffusion-server offload/wake-up only, no full LLM-server snapshot.
 
 <a id="f10"></a>
 ### 10. Measured VRAM budget
@@ -296,15 +296,11 @@ reloads fresh (partial).
 **Feature:** (`--rank-gpu-memory-mib`, component registry) per-rank absolute MiB budget derived
 from measured component usage rather than a global fraction.
 
-**Fork status:** Implemented — per-rank absolute MiB budget plus a self-calibrating KV split (boot
+**Fork status:** Boot-checked — per-rank absolute MiB budget plus a self-calibrating KV split (boot
 logs a vector hint fed back on restart).
 
-**Upstream:** SGLang/vLLM use a fraction-based global setting (`mem-fraction-static` /
-`gpu-memory-utilization`), no per-rank absolute budget (partial). llama.cpp's
-`-fit`/`--fit-params-target` sizes parameters to a declared free-memory target — conceptually
-close, but it doesn't derive a per-rank fraction from measured usage with a two-boot calibration
-vector (partial). ik_llama.cpp has a similar "auto-fit" feature, not independently confirmed to
-match the mechanism in full detail (partial).
+**Upstream:** sglang uses a fraction-based global setting (`mem-fraction-static`), no per-rank
+absolute budget.
 
 <a id="f11"></a>
 ### 11. Cross-architecture speculative determinism
@@ -312,14 +308,13 @@ match the mechanism in full detail (partial).
 **Feature:** verify-sync and CUDA-graph padding across sm86 + sm120; sampling broadcast from rank
 0.
 
-**Fork status:** Implemented — three divergence root causes resolved; the emitted greedy token
-sequence is reproducible across the mixed-architecture TP group. This is output-preserving
-reproducibility, **not** bit-identical activations (sm86/sm120 reduce in a different order).
+**Fork status:** Boot-checked — three divergence root causes resolved; the emitted greedy token
+sequence is reproducible across the mixed-architecture TP group (not bit-identical activations:
+sm86/sm120 reduce in a different order). Agreement is enforced by the rank-0 sampling broadcast,
+not an independent per-architecture comparison.
 
-**Upstream:** SGLang/vLLM have single-architecture determinism modes; mixed-GPU-architecture TP
-groups aren't addressed (partial). llama.cpp/ik_llama.cpp: no mixed-vendor TP determinism
-engineering found; the RPC backend does connect heterogeneous backends (row 21) but no analogous
-verify-sync/graph-pad work is documented (no).
+**Upstream:** sglang has single-architecture determinism modes; mixed-GPU-architecture TP groups
+aren't addressed.
 
 <a id="f12"></a>
 ### 12. Weightless-KV lane
@@ -328,14 +323,15 @@ verify-sync/graph-pad work is documented (no).
 shared name) a meta-device worker holds only KV cache and attention while a separate head holds
 the weights.
 
-**Fork status:** Implemented — chunked prefill and graph-decode paths in place. Includes per-ROLE
-KV storage precision (`--weightless-kv-worker-cache-dtype`, opt-in, default off): the weightless
-workers can hold their KV token-shard in fp8 while the head keeps its own format, since KV bytes
-cross the role boundary only in the model compute dtype. Whether that buys capacity depends on
-which rank binds the min-reduced token budget — the boot log names it (see
+**Fork status:** Cross-checked — chunked prefill and graph-decode paths in place. The lane's
+determinism harness (#124) checks output against a TP=1 solo run as reference oracle. Includes
+per-ROLE KV storage precision (`--weightless-kv-worker-cache-dtype`, opt-in, default off): the
+weightless workers can hold their KV token-shard in fp8 while the head keeps its own format, since
+KV bytes cross the role boundary only in the model compute dtype. Whether that buys capacity
+depends on which rank binds the min-reduced token budget — the boot log names it (see
 `docs_new/weightless_kv_role_precision.md`).
 
-**Upstream:** no equivalent found in SGLang, vLLM, llama.cpp, or ik_llama.cpp.
+**Upstream:** no equivalent in sglang.
 
 <a id="f13"></a>
 ### 13. Rig dashboard / planner UI
@@ -345,8 +341,7 @@ which rank binds the min-reduced token budget — the boot log names it (see
 **Fork status:** Highly experimental — functional but under active development, not
 production-ready (`tools/rig_dashboard`).
 
-**Upstream:** n/a for all four engines — external tooling; each exposes its own metrics/bench
-tooling instead (Prometheus for SGLang/vLLM; `--metrics` + `llama-bench` for llama.cpp/ik_llama.cpp).
+**Upstream:** n/a — external tooling, not a comparable upstream capability.
 
 <a id="f14"></a>
 ### 14. Single-node PD disaggregation
@@ -354,12 +349,11 @@ tooling instead (Prometheus for SGLang/vLLM; `--metrics` + `llama-bench` for lla
 **Feature:** single-node heterogeneous prefill/decode split: prefill solo on the fastest card
 (TP=1), decode distributed under asymmetric-TP/DCP, with GDN/Mamba state handoff.
 
-**Fork status:** Implemented — single-node PD pair green (#99 M1/M2), token-vector KV re-scatter,
+**Fork status:** Boot-checked — single-node PD pair green (#99 M1/M2), token-vector KV re-scatter,
 crash-robust.
 
-**Upstream:** SGLang/vLLM both provide base PD-disaggregation (yes, base); the single-node
-solo-prefill + asymmetric-TP/DCP decode + GDN handoff is the fork's own delta. llama.cpp/ik_llama.cpp
-have no PD-disaggregation concept (no).
+**Upstream:** sglang provides base PD-disaggregation; the single-node solo-prefill +
+asymmetric-TP/DCP decode + GDN handoff is the fork's own delta on top of it.
 
 <a id="f15"></a>
 ### 15. Asymmetric-TP quantization correctness
@@ -368,12 +362,12 @@ have no PD-disaggregation concept (no).
 TP>1 fix, AWQ marlin zero-point staging fix, `moe_wna16` K-mask fix, compressed-tensors/AutoRound-
 int4 group alignment.
 
-**Fork status:** Implemented — bugfixes #83, #85, GPTQ `w2_scales` (symmetric + asymmetric).
+**Fork status:** Boot-checked — bugfixes #83, #85, GPTQ `w2_scales` (symmetric + asymmetric), the
+latter found during row 7's real 122B-A10B MoE boot campaign (falsifikator-geprueft — the stock
+load defect reproduced on hardware before the fix).
 
-**Upstream:** SGLang has the underlying quant methods but a genuine stock GPTQ-MoE TP>1 load
-defect (fork-fixed) and no asymmetric-TP alignment (partial). vLLM has its own separate
-Marlin/AWQ/GPTQ stack, unaffected by the sglang-specific defect (partial). llama.cpp/ik_llama.cpp:
-n/a, asymmetric TP is absent upstream there.
+**Upstream:** sglang has the underlying quant methods but a genuine stock GPTQ-MoE TP>1 load defect
+(fork-fixed here) and no asymmetric-TP alignment.
 
 <a id="f16"></a>
 ### 16. Fast-lane priority scheduling
@@ -381,12 +375,12 @@ n/a, asymmetric TP is absent upstream there.
 **Feature:** (`--enable-fast-lane`) opt-in latency-priority class that preempts a tagged request
 into the running batch, with a reserved-heavy-slots floor + heavy-aging; default off.
 
-**Fork status:** Implemented — Variant C Stage 0 (`--enable-fast-lane`, `--fast-lane-priority`,
-`--fast-lane-reserved-heavy-slots`, `--fast-lane-heavy-aging-ms`).
+**Fork status:** Built — Variant C Stage 0 (`--enable-fast-lane`, `--fast-lane-priority`,
+`--fast-lane-reserved-heavy-slots`, `--fast-lane-heavy-aging-ms`); no hardware boot recorded for
+this row.
 
-**Upstream:** SGLang/vLLM both have priority scheduling/preemption already; this reserved-floor
-fast-lane class is the fork's addition on top (partial). llama.cpp/ik_llama.cpp only have
-OS-level thread priority or an unused JSON field, no request-level preemption (no).
+**Upstream:** sglang already has priority scheduling/preemption; this reserved-floor fast-lane
+class is the fork's addition on top.
 
 <a id="f17"></a>
 ### 17. HiCache under asymmetric-TP/DCP
@@ -395,12 +389,11 @@ OS-level thread priority or an unused JSON field, no request-level preemption (n
 per-rank layouts: global-to-owned-compact index translation, an NCCL-deadlock fix, a hybrid-SWA
 host-pool fix.
 
-**Fork status:** Implemented — DCP index translation + prefetch-deadlock + host-pool fixes.
+**Fork status:** Boot-checked — DCP index translation + prefetch-deadlock + host-pool fixes; the
+deadlock was reproduced live before the fix (falsifikator-geprueft).
 
-**Upstream:** HiCache itself is upstream SGLang (yes, base); correctness under the fork's layouts
-is the delta. vLLM uses a different KV-offload stack (n/a). llama.cpp/ik_llama.cpp only have
-explicit, manually-triggered two-tier caching (`--prompt-cache`, slot save/restore), not automatic
-hierarchical tiering (partial).
+**Upstream:** HiCache itself is upstream sglang; correctness under the fork's non-uniform layouts
+is the delta.
 
 <a id="f18"></a>
 ### 18. TP greater than num_kv_heads
@@ -409,12 +402,10 @@ hierarchical tiering (partial).
 and, via co-location, the physical GPU count — including GQA re-grouping to single-head
 geometries.
 
-**Fork status:** Implemented — validated TP=5 on 3 cards via co-location (#62).
+**Fork status:** Boot-checked — validated TP=5 on 3 cards via co-location (#62).
 
-**Upstream:** SGLang/vLLM already replicate KV under GQA when `tp > kv_heads`, but not combined
-with asymmetric-TP/token-sharded DCP (partial). llama.cpp/ik_llama.cpp sidestep the divisibility
-wall via `--split-mode row` (row-based, not head-based, partial); ik_llama.cpp's own docs list
-only `-sm none`/`graph`/`layer`, so retention of `row`/`tensor` split modes is **unverified**.
+**Upstream:** sglang already replicates KV under GQA when `tp > kv_heads`, but not combined with
+asymmetric-TP/token-sharded DCP.
 
 <a id="f19"></a>
 ### 19. Broad model bring-up under asymmetric-TP
@@ -422,11 +413,11 @@ only `-sm none`/`graph`/`layer`, so retention of `row`/`tensor` split modes is *
 **Feature:** Qwen3.6-27B (GDN) and 35B-A3B (MoE) at asymmetric TP=3; Gemma-4 31B dense and
 26B-A4B MoE SWA-hybrid; small/replicated-KV models.
 
-**Fork status:** Implemented — per-model; Gemma-4 EAGLE3 head fix (#101), 26B-A4B boot fix,
+**Fork status:** Boot-checked — per-model; Gemma-4 EAGLE3 head fix (#101), 26B-A4B boot fix,
 `--swa-pool-sizing`.
 
-**Upstream:** n/a for all four engines — this row is model-support work specific to the fork's own
-asymmetric-TP/speculative code, not a general capability comparison.
+**Upstream:** n/a — model-support work specific to the fork's own asymmetric-TP/speculative code,
+not a general capability comparison.
 
 <a id="f20"></a>
 ### 20. Session KV spill
@@ -441,10 +432,8 @@ spill, and a configurable wave-back threshold are all green in the boot matrix; 
 radix-tree leak was found and fixed (`c49472949a`). Two scenarios explicitly **not validated**:
 spec-in-tick spill coincidence, 3-session co-residency.
 
-**Upstream:** SGLang retracts (frees + re-prefills) on exhaustion rather than keep-decoding-while-
-spilled (partial). vLLM's swap/preemption pauses the request instead of continuing decode
-(partial). llama.cpp/ik_llama.cpp's `-nkvo` is a static, all-sessions setting decided at launch,
-not a dynamic per-request spill (partial).
+**Upstream:** sglang retracts (frees + re-prefills) on exhaustion rather than keep-decoding-while-
+spilled.
 
 <a id="f21"></a>
 ### 21. HTCCL cross-vendor collectives
@@ -455,11 +444,12 @@ reduces on-GPU over host-mapped memory and is CUDA-graph capturable. The `ucx` t
 cross-**host** data plane (Nordstern L1): same host-staged semantics as `gloo`, RDMA instead of
 TCP.
 
-**Fork status:** Implemented and validated — merged into `integration/r3-probe` (`73679d6b47`,
+**Fork status:** Cross-checked — merged into `integration/r3-probe` (`73679d6b47`,
 `9a10846a82`, plus `feat/htccl-gfx900`'s `aec1308973`). Correctness: known-answer tests per
 collective/dtype/world-size/transport vs `torch.distributed`; 2 real bugs found and fixed
 pre-cross-vendor (an output-buffer aliasing defect; a `reduce_scatter` wrong-axis defect for
-`dim >= 2`, `8acd4221a3`). **Cross-vendor (2080 Ti sm75 + Vega 64 gfx900), eager:** byte-exact vs
+`dim >= 2`, `8acd4221a3` — falsifikator-geprueft: RED on the old axis, GREEN after the fix on all
+three transports). **Cross-vendor (2080 Ti sm75 + Vega 64 gfx900), eager:** byte-exact vs
 `torch.distributed`; model-scale byte-identical to `gloo` (Qwen3.5-4B, even 2/2 and uneven 3,1);
 `device` transport **+37%/+48% decode, +45%/+62% prefill vs `gloo`** (16.51 vs 11.13 tok/s
 uneven-decode). **Cross-vendor with CUDA graphs: in reach, not demonstrated** — 4 CUDA-only
@@ -724,13 +714,7 @@ yet* — see the recipe below.
 6. *Validation bar.* Byte-identical output vs a solo run on one rig, the same bar the cross-vendor
    `device` transport had to clear.
 
-**Upstream:** SGLang/vLLM distributed backends are NCCL/RCCL only, never bridged (no).
-llama.cpp/ik_llama.cpp's RPC backend connects heterogeneous backends over TCP (CUDA/Metal/CPU
-confirmed, Vulkan/ROCm **unverified**) but is a backend-delegation/pipeline model, not a collective
-substituting for NCCL within one TP group, and is explicitly "proof-of-concept... fragile" per its
-own README (partial). UCX itself is a transport library, not a collective layer; UCC (its
-collective sibling) has no SGLang/vLLM integration and would not solve the vendor-neutrality
-problem this transport exists for (no).
+**Upstream:** sglang's distributed backend is NCCL/RCCL only, never bridged.
 
 <a id="f22"></a>
 ### 22. fp8 dequant fallback (W8A16)
@@ -740,20 +724,21 @@ problem this transport exists for (no).
 than a capability-number comparison (`torch.cuda.get_device_capability()` reports `(9,0)` for both
 Hopper and gfx900).
 
-**Fork status:** Implemented, GPU-validated cross-vendor — **on `feat/htccl-gfx900` (`3cc2fc9da5`),
-NOT YET merged into `integration/r3-probe`.** CUDA path verified untouched by construction.
-Correctness: Qwen3.5-4B-FP8-dynamic, solo Vega 64 vs solo 2080 Ti, vs mixed TP=2 uneven 3,1, vs
-mixed TP=2 even 2/2 — all **byte-identical**. Model fits solo on Vega 64 in fp8 (6.27 GB weights,
-1.07 GB free) where fp16 doesn't fit at all. Costs **~23% of decode** vs fp16 at the same TP
-config (12.67 vs 16.51 tok/s); on this specific pair the mixed configuration is pointless since
-the model fits solo on the 2080 Ti alone (15.23 tok/s). **Explicitly open:** the
-non-compressed-tensors `fp8.py` `Fp8Config` family (the user's own 27B/35B checkpoints) is not
-wired to the probe.
+**Fork status:** Cross-checked, GPU-validated cross-vendor — on `feat/htccl-gfx900` (`3cc2fc9da5`),
+not yet merged into `integration/r3-probe`. CUDA path unchanged by construction. Correctness:
+Qwen3.5-4B-FP8-dynamic, solo Vega 64 vs. solo 2080 Ti, vs. mixed TP=2 uneven 3,1, vs. mixed TP=2
+even 2/2 — all **byte-identical** (solo runs as oracle; neither card is in the sm80-88 range the
+fp8@3080 caveat covers). Model fits solo on Vega 64 in fp8 (6.27 GB weights, 1.07 GB free) where
+fp16 doesn't fit at all. Costs **~23% of decode** vs fp16 at the same TP config (12.67 vs 16.51
+tok/s); on this pair the mixed configuration is pointless since the model fits solo on the 2080 Ti
+alone (15.23 tok/s). Open: the non-compressed-tensors `fp8.py` `Fp8Config` family (the user's own
+27B/35B checkpoints) is not wired to the probe. A separate fused dequant-GEMV kernel for the same
+lane (design B, #189) decodes raw fp8-e4m3 bytes **bit-exact against `torch.to(float32)`** (max
+diff 0.0), with a tighter fp32 error band than the materialize-then-`F.linear` path it would
+replace (mean relative error 0.0014 vs 0.0133). Not yet merged or wired into a model boot; only a
+pre-merge semantic desk-check against #192 has been done.
 
-**Upstream:** SGLang/vLLM require a native GEMM or Marlin (sm80+); no dequant fallback (no).
-llama.cpp handles fp8 via offline conversion (`--fp8-as-q8`) rather than a runtime dequant path
-(partial). ik_llama.cpp: **unverified** whether it has its own conversion-time fp8 path, or simply
-inherits llama.cpp's GGUFs.
+**Upstream:** sglang requires a native GEMM or Marlin (sm80+); no dequant fallback.
 
 <a id="f23"></a>
 ### 23. Turing/gfx900 without sgl-kernel
@@ -762,19 +747,18 @@ inherits llama.cpp's GGUFs.
 sm80) via a two-level capability predicate (`sgl_kernel_importable()`/`sgl_kernel_runnable()`)
 instead of platform checks, with real fallbacks (`forward_native`, torch-native sampler backend).
 
-**Fork status:** Implemented and GPU-validated on both vendors — Turing support (`0eb7e68880`),
-rope/clamp_position routing (`3f0a93ac1c`), a 4th platform-vs-availability bug this time hitting
-the NVIDIA rank (`621311aa24`). Verified end-to-end on a real RTX 2080 Ti with `sgl_kernel`
+**Fork status:** Cross-checked, GPU-validated on both vendors — Turing support (`0eb7e68880`),
+rope/clamp_position routing (`3f0a93ac1c`), a 4th platform-vs-availability bug, this time on the
+NVIDIA rank (`621311aa24`, falsifikator-geprueft — reproduced on hardware before the fix). Verified
+end-to-end on a real RTX 2080 Ti with `sgl_kernel`
 absent: all 11 core modules import, server starts, coherent generation, 608 unit tests pass.
 `forward_native` measured **byte-identical between sm75 and gfx900** (not vs. the kernel path,
 which differs by a ~4.8e-07-class reduction-order difference). Mixed-vendor TP=2 (Triton,
-HTCCL/gloo) reproduced the same token ids as both solo runs. **Scope note:** gfx900 Triton support
-itself depends on the external `Said-Akbar/triton-gcn5` fork, not fork code.
+HTCCL/gloo) reproduced the same token ids as both solo runs — solo runs as the independent oracle
+on each vendor. **Scope note:** gfx900 Triton support itself depends on the external
+`Said-Akbar/triton-gcn5` fork, not fork code.
 
-**Upstream:** no capability-fallback path in SGLang/vLLM for `sgl-kernel`-class dependencies (no).
-llama.cpp/ik_llama.cpp never had this problem — their kernels compile from source for a broad
-architecture range, no cubin-only package to begin with (partial — same outcome, different
-reason).
+**Upstream:** no capability-fallback path in sglang for `sgl-kernel`-class dependencies.
 
 ---
 
@@ -785,26 +769,30 @@ No llama.cpp/ik_llama.cpp comparison here: these are internal fork decisions abo
 uneven-TP/DCP machinery, which has no upstream analog (see rows 1/2/18 for that comparison).
 
 - **Tree speculative decoding with `--speculative-eagle-topk > 1` under asymmetric-weighted DCP
-  (#76)** — implemented and GPU-tested; found silently non-greedy under weighted DCP and
-  perf-negative on this rig; restored as a hard fail-fast guard with a CPU test.
-- **SWA-DCP Stage B (#96)** — **implemented, CPU-pinned, NOT GPU-validated** (2026-07-26,
-  `feat/swa-dcp-triton`). The ~10 global full-attention layers of an SWA-hybrid (Gemma-4 class) are
-  token-sharded by the weighted owner rule of #173; the ~50 sliding-window layers keep their
-  unsharded local path, so no `(owner slice ∩ window)` masking arises at all (the window-sharding
-  alternative was measured against and rejected in #91 §4). Requires `--swa-pool-sizing cap`
-  (Stage A, row 19) — in ratio mode the unsharded SWA pool would be scaled by the *global* context
-  budget. Refused: HiCache, speculative decoding, MLA, weightless-KV, pure-SWA models. The
-  **~+6-10% figure remains an ex-ante design estimate, not a measurement**; the boot/coherence/
-  capacity recipe is `docs_new/swa_dcp_stage_b_triton.md` §8 and nothing in it has been run. Until
-  it has, Gemma-4 SWA long-context in production is still served by `--swa-pool-sizing` alone
-  (row 19).
+  (#76)** — Built and GPU-tested; found silently non-greedy under weighted DCP and
+  perf-negative on this rig; restored as a hard fail-fast guard with a CPU test
+  (falsifikator-geprueft — reproduced on hardware before the guard).
+- **SWA-DCP Stage B (#96)** — **no longer gated off: merged into `integration/r3-probe` in the
+  Window-4 merge stack (2026-07-27), together with `fix/gemma4-textonly-mask` (#186), which is its
+  required partner — either branch alone leaves H4 red.** Status: Cross-checked. The ~10 global
+  full-attention layers of an SWA-hybrid (Gemma-4 class) are token-sharded by the weighted owner
+  rule of #173; the ~50 sliding-window layers keep their unsharded local path, so no
+  `(owner slice ∩ window)` masking arises at all (the window-sharding alternative was measured
+  against and rejected in #91 §4). Requires `--swa-pool-sizing cap` (Stage A, row 19) — in ratio
+  mode the unsharded SWA pool would be scaled by the *global* context budget. Refused: HiCache,
+  speculative decoding, MLA, weightless-KV, pure-SWA models. Evidence (Window 3, on the then-
+  unmerged branch pair): Stage B boots (H4) and a needle planted ~3k tokens beyond the 1024-token
+  sliding window retrieves byte-identical to a TP=1 solo-5090 oracle (#96-H5); H6/H7 also green.
+  The **~+6-10% figure remains an ex-ante design estimate, not a measurement** — no throughput
+  number has been taken; the recipe is `docs_new/swa_dcp_stage_b_triton.md` §8.
   Carried along, because Stage B is where it bites: `_plan_aware_dcp_group_q_head_counts` took
   `max()` over a hybrid model's two kv-head bases, which is right for a workspace size and wrong
   for a collective's per-rank counts — for 32 q heads over bases {16, 8} and ratios [5,3,2] the max
   is `[16,10,8]`, sum 34 against a total of 32. Collectives now use the full-attention base with an
   exhaustiveness check; single-base models are byte-identical.
 - **Replicated-KV eligibility widened to `kv == tp` (the `<` -> `<=` flip, row 1)** —
-  implemented, red/green-tested on CPU, and GPU-measured; the measurement **refuted** it: at
+  Built, red/green-tested on CPU, and GPU-measured (falsifikator-geprueft — the CPU test was
+  written red-then-green against the flip); the GPU measurement **refuted** it: at
   `kv == tp` the alignment repair that makes uneven splits work at `kv < tp` has no room to
   operate, so it dies on the first forward. Existing `<` semantics kept, with the measured
   rationale pinned in a test. A genuinely uneven `kv == tp` would need a ragged kernel supporting
@@ -841,7 +829,8 @@ ik_llama.cpp use an entirely different compute stack (ggml), so no comparison co
   (`srt/utils/jit_cold_build.py`) rather than by raising the constant — the recorded pass stays
   outside it, so the deadline baked into the captured graph is unchanged. Opened rank-uniformly and
   unconditionally; a rank-local predicate in front of a group collective is the hang family that
-  already produced the pynccl and CustomAllreduce defects.
+  already produced the pynccl and CustomAllreduce defects. Falsifikator-geprueft: measured 6/6
+  boots RED on a cold JIT cache, 1/1 GREEN with the identical tree once warm.
 - **The JIT kernel cache does not self-heal** (`fix/jit-coldbuild-robustness`). A build killed
   mid-flight leaves `build.ninja` + `cuda.cu` + `cuda_0.o.d` and no `.so`; every later process then
   dies with `Check failed: (lib_handle_ != nullptr)`. Four such directories accumulated on the r3
@@ -959,3 +948,23 @@ process. Sources for the llama.cpp/ik_llama.cpp columns: a local `llama.cpp` che
 architecture files, and conversion-script behavior; GitHub API/raw-file fetches against
 `ikawrakow/ik_llama.cpp` `main` (no local checkout exists); WebSearch/WebFetch for project docs and
 discussion threads where neither repo answered directly.
+**This pass (2026-07-26):** replaced the single `Implemented` status token with a three-tier
+evidence classification (`Built` / `Boot-checked` / `Cross-checked`, see Status legend), applied
+per row to the existing evidence. Added a `falsifikator-geprueft` marker where a row's own test
+was red before its fix and green after. Folded in the #190 finding
+(`fix/gdn-prefill-determinism`, not yet merged): `gptq_marlin_gemm`, the only fp8 GEMM the RTX 3080
+has, is nondeterministic above roughly 109 prompt tokens; flagged the two cross-checks that
+included a long fp8@3080 prompt (row 2's #173 G4 chunked prompt, #180 V4's 4th prompt) as excluded
+past that boundary. Added three cross-checks: row 2 (#180 V4, Triton vs. flashinfer chain-verify
+parity under uneven DCP), row 12 (#124's TP=1-solo-oracle regression harness for the weightless-KV
+lane), row 22 (#189's fp8-e4m3 raw-byte decode, bit-exact against `torch`, not yet merged/wired).
+Updated the guarded/descoped SWA-DCP Stage B entry with the 2026-07-26 Window 3 finding (H4-H7
+green on an unmerged branch pair, #96-H5 needle retrieval Cross-checked against a TP=1 solo
+oracle); Stage B stays out of the main matrix since neither branch is merged.
+**This pass (2026-07-26, tone):** the overview matrix keeps its SGLang/vLLM/llama.cpp/ik_llama.cpp
+columns; every detail section's `Upstream:` line was cut down to a brief note against upstream
+sglang only (the fork's actual base), since that is where "what changed" is unambiguous. vLLM,
+llama.cpp, and ik_llama.cpp comparisons in detail sections — engine-by-engine capability lists,
+mechanism-difference asides, "no equivalent"/"ahead of" framing — are removed; those engines are
+compared only in the matrix now. No status level, measured number, or `unverified`/`not yet merged`
+marker was touched.
