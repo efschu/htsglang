@@ -44,7 +44,7 @@ import json
 import os
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 __all__ = [
     "discover_knobs",
@@ -620,6 +620,10 @@ def _kv_by_concurrency(
     """Max-KV-tokens (and mamba pool, fit) at a ladder of concurrencies, so the
     UI can show how ``max_running_requests`` trades KV cache for parallel
     slots. Cheap re-plans; failures degrade to an absent row."""
+    # PlanRejected is caught below; without this import the rung raised
+    # NameError instead of degrading to an absent row, which is the exact
+    # opposite of what the handler was written to do.
+    from sglang.srt.planner.feasibility import PlanRejected
     from sglang.srt.planner.feasibility import plan as _plan
 
     rows = []
@@ -1981,15 +1985,128 @@ def resolve_flags_payload(payload: dict) -> dict:
     }
 
 
+def recompute_payload(payload: dict) -> dict:
+    """POST /api/recompute -> plan + placement + resolved field states, once.
+
+    Every dimension the fork exposes propagates to every dependent value, and
+    all of that arithmetic already exists server-side (feasibility.plan,
+    placement.compute_placement, flags.resolve). What did not exist was a way
+    to ask for all three about the SAME configuration.
+
+    The UI used to fire ``/api/plan``, ``/api/placement`` and
+    ``/api/resolve_flags`` in parallel on every edit. Three calls, three
+    independent latencies, no ordering: a slow placement answer could land on
+    top of a newer one and leave the panels describing two different
+    configurations at once. One call cannot disagree with itself, and it is
+    one round trip instead of three.
+
+    ``sections`` selects what to compute -- the simple view asks only for the
+    parts it shows. Each section reports its own error rather than failing
+    the whole answer, because a rejected plan must still be able to show the
+    per-field reasons that explain the rejection.
+    """
+    payload = payload or {}
+    want = payload.get("sections") or ["plan", "placement", "fields"]
+    out: Dict[str, Any] = {"ok": True}
+
+    if "plan" in want:
+        try:
+            out["plan"] = plan_from_payload(payload)
+        except Exception as e:  # pragma: no cover - defensive
+            out["plan"] = {"valid": False, "reasons": [str(e)]}
+
+    if "placement" in want:
+        pl = dict(payload.get("placement_request") or {})
+        pl.setdefault("model", payload.get("model"))
+        pl.setdefault("model_cfg", payload.get("model_cfg"))
+        pl.setdefault("gguf_choice", payload.get("gguf_choice"))
+        pl.setdefault("flags", payload.get("flags") or {})
+        try:
+            out["placement"] = placement_payload(pl)
+        except Exception as e:  # pragma: no cover - defensive
+            out["placement"] = {"ok": False, "error": str(e)}
+
+    if "fields" in want:
+        try:
+            out["fields"] = resolve_flags_payload(
+                {
+                    "settings": payload.get("settings") or payload.get("flags") or {},
+                    "model": payload.get("model"),
+                    "model_cfg": payload.get("model_cfg"),
+                    "gguf_choice": payload.get("gguf_choice"),
+                }
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            out["fields"] = {"ok": False, "error": str(e)}
+
+    return out
+
+
+def _measured_figures() -> Dict[str, str]:
+    """Short figures this rig actually measured, for the trade-off tooltips.
+
+    Only findings measured HERE produce a number. A finding carried over from
+    another rig, or none at all, leaves the entry absent, and
+    ``tooltips.describe`` then says the study has not been run rather than
+    quoting somebody else's hardware.
+    """
+    out: Dict[str, str] = {}
+    try:
+        from sglang.srt.planner import crossover as crossovermod
+
+        finding = crossovermod.load_finding()
+        if finding is not None and finding.provenance == crossovermod.MEASURED_HERE:
+            rows = [r for r in finding.break_even_table() if r.get("proposable")]
+            if rows:
+                best = max(rows, key=lambda r: r.get("prefill_gain_pct") or 0.0)
+                out["mlp_crossover"] = (
+                    f"{best['prefill_gain_pct']:+.1f}% prefill / "
+                    f"{best['decode_cost_pct']:+.1f}% decode at {best['vector']}"
+                )
+    except Exception:  # pragma: no cover - a missing finding is normal
+        pass
+    return out
+
+
+def tooltips_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/tooltips -> every control's what-it-gives / what-it-costs line.
+
+    One registry (``planner/tooltips.py``) feeds the flag surface, the
+    templates, the view switch and the simple-view sliders alike, so a
+    control's stated cost is written once and cannot drift between the four
+    places it is drawn. Served on its own endpoint as well as merged into the
+    flag catalog, so a CLI reads exactly the text the UI shows.
+    """
+    from sglang.srt.planner import tooltips as tipsmod
+
+    return {"ok": True, "tooltips": tipsmod.tooltip_map(_measured_figures())}
+
+
 def flag_catalog_payload(payload: Optional[dict] = None) -> dict:
     """GET /api/flag_catalog -> the full flag catalog metadata, grouped, for
-    rendering the runner-tab flag surface (help / hover / dropdown options)."""
-    from sglang.srt.planner import flags as flagsmod
+    rendering the runner-tab flag surface (help / hover / dropdown options).
 
+    Each entry also carries its ``tradeoff`` line -- what the knob buys and
+    what it costs -- resolved from the central registry in ``tooltips.py``,
+    plus ``tradeoff_by_value`` for enums whose options pull in opposite
+    directions (``rank_kv_ratio`` capacity against speed, say). The UI renders
+    what it is given and holds no copy of the text.
+    """
+    from sglang.srt.planner import flags as flagsmod
+    from sglang.srt.planner import tooltips as tipsmod
+
+    measured = _measured_figures()
     cat = flagsmod.catalog()
     groups: Dict[str, List[dict]] = {}
     for cid, spec in cat.items():
+        by_value = {}
+        for allowed in (spec.allowed or ()):
+            txt = tipsmod.describe(f"{spec.id}={allowed}", measurements=measured)
+            if txt:
+                by_value[str(allowed)] = txt
         groups.setdefault(spec.group, []).append({
+            "tradeoff": tipsmod.describe(spec.id, measurements=measured),
+            "tradeoff_by_value": by_value,
             "id": spec.id,
             "name": spec.name,
             "type": spec.type,
@@ -2010,6 +2127,7 @@ def flag_catalog_payload(payload: Optional[dict] = None) -> dict:
     return {
         "ok": True,
         "groups": ordered,
+        "tooltips": tipsmod.tooltip_map(measured),
         "upstream_count": flagsmod.upstream_count(),
         "fork_count": flagsmod.fork_count(),
     }
@@ -2617,6 +2735,12 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
+        if self.path.startswith("/api/tooltips"):
+            try:
+                self._json(200, tooltips_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
         if self.path.startswith("/api/flag_catalog"):
             try:
                 self._json(200, flag_catalog_payload())
@@ -2748,6 +2872,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/resolve_flags"):
                 self._json(200, resolve_flags_payload(payload))
+                return
+            if self.path.startswith("/api/recompute"):
+                self._json(200, recompute_payload(payload))
                 return
             if self.path.startswith("/api/config_profiles"):
                 self._json(200, config_profiles_save(payload))
@@ -3060,12 +3187,66 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   /* A backend call that failed or timed out. The panel keeps its last good
      content; this line says why it is no longer moving. */
   .rev-error { font-size: .68rem; color: #d29922; margin-top: .25rem; }
+
+  /* ---- simple / expert -----------------------------------------------------
+     Two densities of the same page, not two different pages. Expert ADDS
+     dimensions; it never changes what a control shared by both means. */
+  .hdr { display: flex; align-items: flex-start; justify-content: space-between;
+         gap: 1rem; flex-wrap: wrap; }
+  .vmode { display: flex; border: 1px solid #30363d; border-radius: 7px;
+           overflow: hidden; flex: none; margin-top: .2rem; }
+  .vmode .vm { background: #12171e; color: #8b96a5; border: 0;
+               padding: .3rem .8rem; font: inherit; font-size: .74rem;
+               cursor: pointer; }
+  .vmode .vm.on { background: #1f6feb; color: #fff; }
+  .vmode .vm:not(.on):hover { color: #e6edf3; }
+  /* Visibility is driven by one class on <body>, so no panel has to know
+     which mode it is in and a mode switch touches no backend call. */
+  body.mode-simple .expert-only { display: none !important; }
+  body.mode-expert .simple-only { display: none !important; }
+
+  /* ---- simple view: one bar and one budget slider per card ---------------- */
+  .cardsimple { border: 1px solid #263041; border-radius: 8px;
+                padding: .5rem .6rem; margin: .4rem 0; background: #12171e; }
+  .cardsimple .cs-h { display: flex; justify-content: space-between;
+                      align-items: baseline; gap: .5rem; flex-wrap: wrap; }
+  .cardsimple .cs-n { font-weight: 600; color: #e6edf3; }
+  .cardsimple .cs-u { font-size: .72rem; color: #8b96a5; white-space: nowrap; }
+  /* One bar = everything the configuration puts on this card. The granular
+     split is the expert view's job; here the number is the whole point. */
+  .csbar { position: relative; height: 20px; border-radius: 4px;
+           background: #0d1117; border: 1px solid #263041; overflow: hidden;
+           margin: .35rem 0 .3rem; }
+  .csbar .fill { position: absolute; inset: 0 auto 0 0; background: #1f6feb; }
+  .csbar .fill.over { background: #f85149; }
+  .csbar .fill.tight { background: #d29922; }
+  /* The budget the user set, drawn as a line across the bar: the reader can
+     see at a glance whether the configuration sits under it or over it. */
+  .csbar .cap { position: absolute; top: 0; bottom: 0; width: 2px;
+                background: #e6edf3; }
+  .csrow { display: flex; align-items: center; gap: .5rem; }
+  .csrow input[type=range] { flex: 1 1 auto; min-width: 8rem; }
+  .csrow .cs-v { font-size: .72rem; color: #8b96a5; min-width: 7.5rem;
+                 text-align: right; white-space: nowrap; }
 </style>
 </head>
 <body>
-<h1>htsglang offline config planner</h1>
-<div class="sub">capacity / feasibility / split &mdash; never estimated throughput.
-  Every edit re-runs the same planner the server runs. No GPU touched.</div>
+<div class="hdr">
+  <div>
+    <h1>htsglang offline config planner</h1>
+    <div class="sub">capacity / feasibility / split &mdash; never estimated throughput.
+      Every edit re-runs the same planner the server runs. No GPU touched.</div>
+  </div>
+  <!-- Simple vs expert. Not a hiding place for broken controls: expert adds
+       dimensions, it never changes what a shared control means. The choice
+       persists, so the page opens the way it was left. -->
+  <div class="vmode" id="view_mode">
+    <button id="vm_simple" class="vm" onclick="setViewMode('simple')"
+            title="per-card VRAM as one number, one budget slider per card">simple</button>
+    <button id="vm_expert" class="vm" onclick="setViewMode('expert')"
+            title="the granular VRAM breakdown and every dimension the fork exposes">expert</button>
+  </div>
+</div>
 
 <div class="tabs">
   <button id="tab_landing" class="tab active" onclick="showTab('landing')">Landing (live monitor)</button>
@@ -3385,13 +3566,59 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   <div id="model_info" class="muted" style="margin-top:.4rem;word-break:break-all"></div>
 </fieldset>
 
-<div class="cols runner">
+<!-- ===================================================================== -->
+<!-- SIMPLE view: per card, how much VRAM this configuration uses, and one -->
+<!-- slider for how much it is ALLOWED to use. Everything else is derived  -->
+<!-- server-side and shown as the verdict. The granular breakdown, the     -->
+<!-- ratios and the full flag surface are the expert view's business.      -->
+<!-- ===================================================================== -->
+<div class="simple-only">
+  <fieldset>
+    <legend>VRAM per card &mdash; usage and budget</legend>
+    <div id="simple_cards" class="muted">pick a model above&hellip;</div>
+    <div class="legend" style="margin-top:.35rem">The slider is each card's
+      budget: how much of it this server may take. What the configuration
+      actually needs is the bar. A budget below the bar is not refused here
+      &mdash; it is reported, with the reason, in the verdict.</div>
+  </fieldset>
+  <fieldset>
+    <legend>verdict</legend>
+    <div id="simple_verdict" class="muted">waiting for a model&hellip;</div>
+  </fieldset>
+  <div class="actions" style="align-items:center;margin:.5rem 0">
+    <button onclick="serverStart()">Load model</button>
+    <button class="secondary" onclick="serverStop()">Eject</button>
+    <span class="chip" id="simple_status_chip">stopped</span>
+    <span id="simple_status_note" class="muted"></span>
+  </div>
+</div>
+
+<div class="cols runner expert-only">
   <div>
     <!-- preset bar: dropdown + save, directly above the settings panel -->
     <fieldset>
       <legend>preset &mdash; fills the settings rows below; adaptive MTP is
         always on when the checkpoint has draft layers</legend>
       <div id="profile_pick" class="muted">select a model to list presets&hellip;</div>
+      <!-- Tuning objective: the same trio the fork's --rank-perf-tune takes.
+           A template is a STARTING POINT. Applying one seeds the controls;
+           the controls keep their full range afterwards, and the limits stay
+           the hard rejects, never the value the template happened to set. -->
+      <div style="margin-top:.5rem">
+        <label>tuning objective <span class="muted">(template &mdash; a starting
+          point, not a ceiling)</span></label>
+        <div id="tune_pick" style="display:flex;gap:.3rem;flex-wrap:wrap;margin-top:.2rem">
+          <button class="mini secondary" id="tune_both" onclick="applyTune('both')"
+            title="prefill and concurrent throughput together (the default)">balanced</button>
+          <button class="mini secondary" id="tune_maxkv" onclick="applyTune('maxkv')"
+            title="maximum context: give the KV cache everything that is left">max KV</button>
+          <button class="mini secondary" id="tune_dec" onclick="applyTune('dec')"
+            title="decode throughput">max decode</button>
+          <button class="mini secondary" id="tune_enc" onclick="applyTune('enc')"
+            title="prefill throughput">max prefill</button>
+        </div>
+        <div id="tune_note" class="muted" style="font-size:.68rem;margin-top:.2rem"></div>
+      </div>
       <div style="display:flex;gap:.4rem;margin-top:.4rem;align-items:center">
         <input id="profile_save_name" placeholder="save current settings as&hellip;" style="max-width:60%">
         <button class="secondary mini" onclick="saveProfile()">save preset</button>
@@ -3429,9 +3656,10 @@ _INDEX_TEMPLATE = r"""<!doctype html>
               <span class="chg" title="changed from preset"></span></span>
             <input type="range" id="mrr_slider" min="1" max="64" step="1" value="1"
               oninput="mrrFromSlider()">
+            <span id="mrr_max" class="muted" style="font-size:.62rem"></span>
             <input type="number" id="max_running_requests" class="num"
               placeholder="auto" onchange="mrrFromNum()">
-            <span class="qmark" title="Concurrent request slots. 1 = single-user = largest KV; raising it grows the GDN/mamba pool and shrinks max context (see the KV-vs-concurrency table in the plan result). Blank: plan 1, launch 16.">?</span>
+            <span class="qmark" title="Concurrent request slots. 1 = single-user = largest KV; raising it grows the GDN/mamba pool and shrinks max context (see the KV-vs-concurrency table in the plan result). The slider range follows what the plan reports as fitting; the numeric field is free, and a value that does not fit is REJECTED with a reason rather than silently clamped. Blank: plan 1, launch 16.">?</span>
           </div>
           <div id="secflags_context"></div>
         </div>
@@ -3837,6 +4065,40 @@ function debounce(fn,ms){
   };
 }
 
+// ===========================================================================
+// Simple / expert.
+//
+// Two densities of one page, not two pages. Visibility is a single class on
+// <body>, so no panel has to know which mode it is in and switching costs no
+// backend call. Controls hidden in simple mode keep their values and are
+// still read when the configuration is assembled -- expert ADDS dimensions,
+// it never changes what a shared control means.
+// ===========================================================================
+const VIEW_MODES=['simple','expert'];
+function viewMode(){
+  try{
+    const m=localStorage.getItem('view_mode');
+    if(VIEW_MODES.indexOf(m)>=0) return m;
+  }catch(e){}
+  return 'simple';
+}
+function setViewMode(m){
+  if(VIEW_MODES.indexOf(m)<0) m='simple';
+  try{ localStorage.setItem('view_mode',m); }catch(e){}
+  applyViewMode();
+}
+function applyViewMode(){
+  const m=viewMode();
+  document.body.classList.toggle('mode-simple', m==='simple');
+  document.body.classList.toggle('mode-expert', m==='expert');
+  for(const k of VIEW_MODES){
+    const b=$('vm_'+k); if(b) b.classList.toggle('on', k===m);
+  }
+  // The mode decides which panels are worth computing, so a switch asks for
+  // the sections the newly visible panels need.
+  scheduleRecompute();
+}
+
 // Serving identity is owned by the MODEL selector + the SERVING form group,
 // NOT by the flag surface -- these catalog ids are hidden there and routed to
 // their single authoritative field instead (no fact is entered twice).
@@ -4119,6 +4381,11 @@ function render(d) {
   const off = d.offload;
   // context-length slider: clamp to the plan's capacity max when known.
   setCtxCap(cap ? cap.max_context_tokens : null);
+  // concurrency slider: the range follows the highest rung the planner
+  // reports as fitting, doubled so the reader can walk past it and see the
+  // rejection with its reason. A limit is a hard reject, not a preset value.
+  const rungs=(d.kv_by_concurrency||[]).filter(r=>r.fits).map(r=>r.concurrency);
+  setMrrCap(rungs.length? Math.max(64, Math.max.apply(null,rungs)*2) : 64);
   // Three honest states: fits-in-VRAM (fast) / fits-with-RAM-offload (slower,
   // PCIe-bound) / genuinely cannot fit (design §PART 4).
   if (d.fits) {
@@ -5247,12 +5514,38 @@ window._flagCat=null; window._flagSettings={}; window._profiles=[];
 window._flagSection={};   // catalog id -> section key (built at render time)
 async function loadFlagCatalog(){
   try{
-    const r=await fetch('/api/flag_catalog'); const d=await r.json();
+    const d=await api('/api/flag_catalog',{key:'flag_catalog'});
     if(!d.ok) return;
     window._flagCat=d;
+    // The trade-off registry rides along with the catalog: one fetch, one
+    // source. Controls that are not flags (the view switch, the objective
+    // templates, the budget sliders) look themselves up in it by key.
+    window._tips=d.tooltips||{};
     $('flag_counts').textContent=d.upstream_count+' upstream + '+d.fork_count+' fork';
     renderFlagSurface();
+    applyStaticTips();
   }catch(e){}
+}
+// ---- what it gives / what it costs, for the controls that are not flags ---
+// The text lives server-side in planner/tooltips.py, keyed the same way. This
+// only puts it on the elements; it never composes a sentence of its own, so
+// there is exactly one place to edit when a control's cost changes.
+const STATIC_TIPS={
+  vm_simple:'view_mode.simple', vm_expert:'view_mode.expert',
+  tune_both:'tune.both', tune_maxkv:'tune.maxkv',
+  tune_dec:'tune.dec', tune_enc:'tune.enc',
+  sv_ctx:'context_length', sv_ctx_slider:'context_length',
+  row_sv_ctx:'context_length',
+  max_running_requests:'max_running_requests', mrr_slider:'max_running_requests',
+  row_mrr:'max_running_requests',
+};
+function tip(key){ return (window._tips||{})[key]||''; }
+function applyStaticTips(){
+  for(const id of Object.keys(STATIC_TIPS)){
+    const el=$(id); if(!el) continue;
+    const t=tip(STATIC_TIPS[id]);
+    if(t) el.title=t;
+  }
 }
 function _surfaceSpecs(g){
   // The serving-identity ids are owned by the MODEL/SERVING sections above
@@ -5295,11 +5588,19 @@ function _flagValue(id){
   const v=(window._flagSettings||{})[id];
   return (v==null||v===false)?'':String(Array.isArray(v)?v.join(','):v);
 }
+// Hover text for a flag: its trade-off line if one is written, the value's
+// own line when the selected value pulls a different way, else the catalog's
+// hover. All of it arrives from the server; the browser stores no copy.
+function flagTip(f, cur){
+  const byVal=f.tradeoff_by_value||{};
+  return (cur && byVal[cur]) || f.tradeoff || f.hover || f.help || '';
+}
 function flagRowHtml(f){
   const src=f.source!=='upstream'? ' <span class="pill">'+esc(f.source)+'</span>':'';
   const cur=_flagValue(f.id);
-  let h='<div class="setrow" id="flrow_'+f.id+'">'
-    +'<span class="lbl" title="'+esc(f.hover||f.help||'')+'">'+esc(f.name)+src
+  const tip=flagTip(f, cur);
+  let h='<div class="setrow" id="flrow_'+f.id+'" title="'+esc(tip)+'">'
+    +'<span class="lbl" title="'+esc(tip)+'">'+esc(f.name)+src
     +' <span class="flag-q" id="flq_'+f.id+'" style="color:#e3a008"></span>'
     +'<span class="chg" title="changed from preset"></span></span>';
   if(f.type==='bool')
@@ -5464,7 +5765,9 @@ function onFlagChange(id){
   // rank_gpu_id is never overwritten).
   if(id==='tp_size') window._coloRedistribute=true;
   updateGpuPick(); updateColoUI(); markPresetDrift(); updateSectionSummaries();
-  resolveFlags(); refreshRunnerPlacement(); schedulePlan();
+  markTune();
+  // ONE consistent recompute rather than three calls racing each other.
+  scheduleRecompute();
 }
 // ---- context-length / max-running-requests: slider+numeric pairs ----------
 // The numeric field (sv_ctx / max_running_requests) stays authoritative --
@@ -5481,7 +5784,7 @@ function setCtxCap(cap){
   sl.value=Math.min(v||8192, parseInt(sl.max));
   updateSectionSummaries();
 }
-const _reflow=debounce(()=>{ refreshRunnerPlacement(); }, 180);
+function _reflow(){ scheduleRecompute(); }
 function ctxFromSlider(){
   $('sv_ctx').value=$('sv_ctx_slider').value;
   onServingEdit(); _reflow();
@@ -5493,15 +5796,30 @@ function ctxFromNum(){
 }
 // Sliders fire on every pixel of travel. The label follows the thumb at once
 // (that has to feel immediate), the backend work is debounced behind it.
-const _replan=debounce(()=>{ doPlan(); refreshRunnerPlacement(); }, 180);
+function _replan(){ scheduleRecompute(); }
 function mrrFromSlider(){
   $('max_running_requests').value=$('mrr_slider').value;
   onServingEdit(); _replan();
 }
 function mrrFromNum(){
   const v=parseInt($('max_running_requests').value);
-  if(v) $('mrr_slider').value=Math.min(v, 64);
+  // The numeric field is authoritative and unbounded. A hard 64 here used to
+  // silently swallow anything larger; the real limit is the plan's reject,
+  // which says WHY, so the slider grows to represent what was typed instead.
+  if(v) setMrrCap(Math.max(window._mrrCap||64, v));
+  if(v) $('mrr_slider').value=v;
   onServingEdit(); _replan();
+}
+// Slider bounds follow the hard limits the planner reports, never a preset's
+// value: applying a template is a starting point, not a ceiling.
+window._mrrCap=null;
+function setMrrCap(cap){
+  cap=Math.max(1, Math.round(cap||64));
+  window._mrrCap=cap;
+  const sl=$('mrr_slider'); if(!sl) return;
+  sl.max=cap;
+  const note=$('mrr_max');
+  if(note) note.textContent='max '+cap.toLocaleString();
 }
 function onServingEdit(){ markPresetDrift(); updateSectionSummaries(); }
 // ---- single-GPU card selector (tp=1): writes the stock --base-gpu-id ------
@@ -5813,7 +6131,193 @@ function renderFlagWarnings(ws){
 }
 async function onRunnerModel(){
   const model=$('model').value.trim(); if(!model) return;
-  loadConfigProfiles(); resolveFlags(); refreshRunnerPlacement(); schedulePlan();
+  loadConfigProfiles(); scheduleRecompute();
+}
+
+// ===========================================================================
+// Live propagation: ONE call, ONE consistent answer.
+//
+// Every dimension the fork exposes feeds every dependent value, and all of
+// that arithmetic lives server-side already. What the page used to do was ask
+// three separate questions about the same configuration -- /api/plan,
+// /api/placement and /api/resolve_flags, fired together on every edit -- and
+// paint whichever answer arrived last. With three independent latencies the
+// panels could end up describing two different configurations at once.
+//
+// /api/recompute answers all three about one configuration. One call cannot
+// disagree with itself. It is also one round trip instead of three, which is
+// most of why editing feels immediate now.
+// ===========================================================================
+function recomputeSections(){
+  // Only what the visible mode actually shows.
+  return viewMode()==='simple'
+    ? ['plan','placement']
+    : ['plan','placement','fields'];
+}
+async function recomputeNow(){
+  const model=$('model').value.trim();
+  if(!model){ renderSimpleCards(null); return; }
+  const coloErr=coloBlockError();
+  if(coloErr){
+    $('verdict').innerHTML='<div class="verdict nofit">PLAN BLOCKED</div>';
+    $('split').innerHTML='<ul class="reasons"><li>'+esc(coloErr)+'</li></ul>';
+    renderSimpleVerdict({valid:false, reasons:[coloErr]});
+    return;
+  }
+  const flags=runnerFlags();
+  const body=Object.assign({}, payload(), {
+    sections: recomputeSections(),
+    settings: collectFlagSettings(),
+    placement_request: {
+      model,
+      gguf_choice: ($('gguf_pick').style.display!=='none'?$('gguf_choice').value:null),
+      flags: flags,
+      stock_compare: flagsAreForkish(flags),
+    },
+  });
+  const rp=$('runner_placement');
+  stale(rp,true);
+  let d;
+  try{
+    d=await api('/api/recompute',{key:'recompute', body:body, timeout:20000});
+  }catch(e){
+    // Superseded by a newer edit: the newer answer owns the panels.
+    if(apiAborted(e)) return;
+    $('verdict').innerHTML='<div class="verdict nofit">PLAN ERROR</div>';
+    $('split').innerHTML='<ul class="reasons"><li>'+esc(apiError(e))+'</li></ul>';
+    return;
+  } finally { stale(rp,false); }
+  if(d.fields && d.fields.ok){
+    applyFieldStates(d.fields.fields); renderFlagWarnings(d.fields.warnings);
+  }
+  if(d.placement) applyPlacementResult(d.placement);
+  if(d.plan){ render(d.plan); renderSimpleVerdict(d.plan); }
+  renderSimpleCards(d.placement && d.placement.ok ? d.placement.placement : null);
+}
+const scheduleRecompute=debounce(recomputeNow, 180);
+
+// ===========================================================================
+// Simple view: per card, what this configuration puts on it, and one slider
+// for how much of the card it may have. No breakdown, no ratios -- those are
+// the expert view. The numbers come from the same placement result the
+// expert view renders granularly; nothing here is computed in the browser.
+// ===========================================================================
+function cardBudgetMib(c){
+  // The budget slider writes the existing per-card reserve: budget = total
+  // minus what is kept free. One mechanism, two presentations.
+  const total=c.total_mib||0;
+  const keep=Math.round((c.reserve_gb||0)*1024);
+  return Math.max(0, total-keep);
+}
+function setCardBudgetMib(i, mib){
+  const c=CARDS[i]; if(!c) return;
+  const total=c.total_mib||0;
+  c.reserve_gb=Math.max(0, (total-Math.min(mib,total)))/1024;
+}
+function simpleBudgetInput(i){
+  const c=CARDS[i]; if(!c) return;
+  const sl=$('csb_'+i); if(!sl) return;
+  setCardBudgetMib(i, parseInt(sl.value)||0);
+  // The label follows the thumb at once; the re-plan is debounced behind it.
+  const lbl=$('csv_'+i);
+  if(lbl) lbl.textContent=fmtMib(cardBudgetMib(c))+' of '+fmtMib(c.total_mib);
+  scheduleRecompute();
+}
+function fmtMib(m){
+  if(m==null||isNaN(m)) return 'n/a';
+  return (m/1024).toFixed(1)+' GiB';
+}
+function renderSimpleCards(placement){
+  const box=$('simple_cards'); if(!box) return;
+  const incl=CARDS.filter(c=>c.include);
+  if(!incl.length){ setHTML(box,'<span class="muted">no cards selected.</span>'); return; }
+  // Placement reports per PHYSICAL card, keyed in CUDA space; map back onto
+  // the card rows so a number is never attributed to the wrong card.
+  const used={};
+  (placement&&placement.cards||[]).forEach(pc=>{ used[pc.gpu_index]=pc; });
+  let h='';
+  CARDS.forEach((c,i)=>{
+    if(!c.include) return;
+    const key=(c.cuda_index!=null?c.cuda_index:i);
+    const pc=used[key];
+    const total=c.total_mib||0;
+    const budget=cardBudgetMib(c);
+    const need=pc?pc.total_mib:null;
+    const pctNeed=(need!=null&&total)?Math.min(100, need/total*100):0;
+    const pctCap=total?Math.min(100, budget/total*100):100;
+    let cls='';
+    if(need!=null&&need>budget) cls=' over';
+    else if(need!=null&&budget&&need>budget*0.95) cls=' tight';
+    const idx=devLabel(c.cuda_index, c.nvml_index);
+    h+='<div class="cardsimple" data-key="cs_'+i+'">'
+      +'<div class="cs-h"><span class="cs-n">'+esc(c.name||('card '+i))
+      +(idx?' <span class="muted" style="font-weight:400">['+esc(idx)+']</span>':'')+'</span>'
+      +'<span class="cs-u">'+(need!=null
+          ? esc(fmtMib(need))+' used of '+esc(fmtMib(total))
+          : 'usage not computed yet')+'</span></div>'
+      +'<div class="csbar"><div class="fill'+cls+'" style="width:'+pctNeed.toFixed(1)+'%"></div>'
+      +'<div class="cap" style="left:'+pctCap.toFixed(1)+'%" title="budget"></div></div>'
+      +'<div class="csrow"><label class="muted" style="font-size:.7rem;min-width:9rem">'
+      +'maximum VRAM to use</label>'
+      +'<input type="range" id="csb_'+i+'" min="0" max="'+total+'" step="256" value="'+budget+'"'
+      +' title="'+esc(tip('card_budget'))+'" oninput="simpleBudgetInput('+i+')">'
+      +'<span class="cs-v" id="csv_'+i+'">'+esc(fmtMib(budget))+' of '+esc(fmtMib(total))+'</span>'
+      +'</div>';
+    if(need!=null&&need>budget)
+      h+='<div class="reasons" style="font-size:.7rem;margin-top:.2rem">'
+        +'needs '+esc(fmtMib(need-budget))+' more than this budget allows.</div>';
+    h+='</div>';
+  });
+  setHTML(box,h);
+}
+function renderSimpleVerdict(d){
+  const box=$('simple_verdict'); if(!box||!d) return;
+  if(d.valid===false){
+    setHTML(box,'<div class="verdict nofit">REJECTED</div><ul class="reasons">'
+      +(d.reasons||[]).map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>');
+    return;
+  }
+  const cap=d.capacity, off=d.offload;
+  let h;
+  if(d.fits) h='<div class="verdict fit">FITS IN VRAM &check;</div>';
+  else if(off&&off.status==='ram_offload')
+    h='<div class="verdict offload">FITS WITH ~'+off.offloaded_gib.toFixed(1)
+      +' GiB ON HOST RAM &mdash; slower (PCIe-bound)</div>';
+  else h='<div class="verdict nofit">DOES NOT FIT</div>';
+  if(cap&&cap.max_context_tokens)
+    h+='<div class="adv">context that fits: <b>'
+      +Math.round(cap.max_context_tokens).toLocaleString()+'</b> tokens</div>';
+  if(!d.fits&&(d.infeasible_reasons||[]).length)
+    h+='<ul class="reasons">'
+      +d.infeasible_reasons.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';
+  h+='<div class="legend">Switch to <b>expert</b> for the per-card breakdown '
+    +'and every dimension this fork exposes.</div>';
+  setHTML(box,h);
+}
+// ---- tuning objective template -------------------------------------------
+// Sets --rank-perf-tune and nothing else. The point of a template here is to
+// move the starting point, not to fence the controls in: everything stays
+// adjustable afterwards, and a value that genuinely cannot work is refused
+// by the planner with a reason rather than by a slider that stops early.
+const TUNE_LABELS={both:'balanced', maxkv:'max KV', dec:'max decode', enc:'max prefill'};
+function applyTune(mode){
+  window._flagSettings=window._flagSettings||{};
+  if(mode==='both') delete window._flagSettings.rank_perf_tune;
+  else window._flagSettings.rank_perf_tune=mode;
+  const el=$('fl_rank_perf_tune');
+  if(el) el.value=(mode==='both'?'':mode);
+  markTune();
+  markPresetDrift(); updateSectionSummaries(); scheduleRecompute();
+}
+function markTune(){
+  const cur=(window._flagSettings||{}).rank_perf_tune||'both';
+  for(const k of Object.keys(TUNE_LABELS)){
+    const b=$('tune_'+k); if(!b) continue;
+    b.className='mini'+(k===cur?'':' secondary');
+  }
+  const note=$('tune_note');
+  if(note) note.textContent='objective: '+(TUNE_LABELS[cur]||cur)
+    +' — every control below stays free to move past it.';
 }
 function runnerFlags(){
   const s=window._flagSettings||{};
@@ -5910,6 +6414,29 @@ async function refreshRunnerPlacement(){
     setHTML(rp,'<span class="reasons">'+esc(apiError(e))+'</span>');
   } finally { stale(rp,false); }
 }
+// ONE renderer for a placement answer, whichever call produced it: the
+// right-column overview AND the GPU offload/split section, always in step.
+function applyPlacementResult(d){
+  let html;
+  if(d && d.ok){
+    const mainH=renderPlacement(d.placement);
+    const stock=d.stock;
+    if(stock){
+      let stockH;
+      if(stock.legal && stock.placement)
+        stockH='<div class="sxs-h">plain normal-TP (stock, tp='+stock.tp+')</div>'
+          +'<div class="muted" style="font-size:.68rem;margin-bottom:.2rem">'+esc(stock.note||'')+'</div>'
+          +renderPlacement(stock.placement);
+      else
+        stockH='<div class="sxs-h">plain normal-TP (stock)</div>'
+          +'<div class="muted" style="font-size:.7rem">'+esc(stock.note||'')+'</div>';
+      html='<div class="sxs"><div><div class="sxs-h">planned config</div>'+mainH+'</div>'
+        +'<div>'+stockH+'</div></div>';
+    } else html=mainH;
+  } else html='<span class="reasons">'+esc((d&&d.error)||'placement unavailable')+'</span>';
+  setHTML($('runner_placement'), html);
+  setHTML($('gpu_placement'), html);
+}
 async function loadConfigProfiles(){
   const model=$('model').value.trim();
   try{
@@ -5987,15 +6514,16 @@ function applyProfile(i){
   const sl=$('sv_ctx_slider');
   sl.value=Math.min(parseInt($('sv_ctx').value)||8192, parseInt(sl.max));
   const mv=parseInt($('max_running_requests').value);
-  if(mv) $('mrr_slider').value=Math.min(mv, 64);
+  if(mv){ setMrrCap(Math.max(window._mrrCap||64, mv)); $('mrr_slider').value=mv; }
   // Preset prefill reaches the co-location controls too: the profile's
   // tp_size / rank_gpu_id map back onto the tp mirror + per-card steppers
   // (reverse-populated, never redistributed).
   window._coloRedistribute=false;
   updateGpuPick(); updateColoUI(); renderDraftPick(); updateSpecDraftHint();
   window._presetBase=presetSnapshot();
-  markPresetDrift(); updateSectionSummaries();
-  resolveFlags(); refreshRunnerPlacement(); doPlan();
+  markPresetDrift(); updateSectionSummaries(); markTune();
+  // One consistent recompute for the whole applied preset.
+  scheduleRecompute();
 }
 // DISPLAY the applied profile's launch env + exact argv (not just the CLI
 // flags): a launched profile must match the reference command exactly, and
@@ -6287,12 +6815,17 @@ function serverSettings() {
 // Sticky-bar status chip: stopped (grey) / loading (amber, while booting) /
 // ready (green) / error (red). Fed by every status render below.
 function updateStatusChip(state) {
-  const chip=$('status_chip'); if(!chip) return;
   const s=String(state||'stopped');
-  if(s==='ready'){ chip.className='chip ready'; chip.textContent='ready'; }
-  else if(s==='booting'){ chip.className='chip loading'; chip.textContent='loading…'; }
-  else if(s==='error'){ chip.className='chip error'; chip.textContent='error'; }
-  else { chip.className='chip'; chip.textContent=s; }
+  let cls='chip', txt=s;
+  if(s==='ready'){ cls='chip ready'; txt='ready'; }
+  else if(s==='booting'){ cls='chip loading'; txt='loading…'; }
+  else if(s==='error'){ cls='chip error'; txt='error'; }
+  // Both modes show the same state; simple mode simply has fewer buttons
+  // around it.
+  for(const id of ['status_chip','simple_status_chip']){
+    const chip=$(id); if(!chip) continue;
+    chip.className=cls; chip.textContent=txt;
+  }
 }
 // While the managed server boots, poll status until it settles so the chip
 // flips loading -> ready/error without manual refreshes (bounded, 2s tick).
@@ -6722,6 +7255,8 @@ async function shareSubmit(){
   finally{ $('sh_btn').disabled=false; $('sh_token').value=''; }
 }
 
+// The page opens the way it was left: simple unless expert was chosen.
+applyViewMode();
 // Landing is the default view (live monitor of any reachable server).
 showTab('landing');
 </script>

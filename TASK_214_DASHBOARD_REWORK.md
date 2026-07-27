@@ -265,9 +265,67 @@ plus the `rank_perf_tune` objective `both / dec / enc / maxkv`) are starting
 points. Applying one seeds the controls; the controls keep their full range
 afterwards. Slider bounds come from the hard rejects
 (`flags.cross_field_errors`, `PlanRejected`, card totals), never from the
-template value.
+template value. Concretely: the concurrency slider's hard-coded `max="64"`
+silently swallowed anything larger, and now follows what the planner reports
+as fitting, while the numeric field stays free — a value that does not fit is
+rejected *with a reason* rather than clamped without one.
+
+#### 3.2.1 What a control gives and what it costs
+
+Every setting, slider, template and mode switch carries a hover line of one
+shape: what turning it up buys, and what it takes away. A knob with no cost
+would already be the default, so stating only the benefit is not a shorter
+explanation — it is a wrong one.
+
+The text lives in **one** place, `python/sglang/srt/planner/tooltips.py`,
+keyed by flag id (`rank_kv_ratio`), by flag and value for enums whose options
+pull opposite ways (`rank_kv_ratio=speed`), and by control key for the things
+that are not flags (`view_mode.expert`, `tune.maxkv`, `card_budget`). The same
+flag is drawn in the flag surface, in preset summaries and in launch commands;
+four copies of a sentence would be four chances to describe last release's
+behaviour. `flag_catalog_payload` merges it into the catalog the UI already
+fetches, `/api/tooltips` serves it on its own for a CLI, and the front end
+renders what it is given — a test asserts no sentence is inlined in the JS.
+
+It is deliberately not in `flags.py`: that module is the machine-checked
+catalog (types, allowed values, hard rejects), and a wording fix should never
+touch validation logic.
+
+**Numbers are never invented.** An entry stores a *pointer* to the study that
+would produce a figure (`measured_from="mlp_crossover"`), not a figure.
+`describe()` fills in the real number when a finding measured *on this rig*
+exists, and otherwise says "not measured on this rig yet (run the MLP-split
+crossover study)". The reader needs to be able to tell "no effect" from
+"nobody measured".
+
+`test_fork_flags_are_covered` fails when a non-env flag this fork invented has
+no entry. A knob nobody else documents is the one that most needs to state its
+cost, so adding a flag and adding its trade-off is one commit. Adding a new
+control — the MoE offload wave ordering that is on its way, for instance — is
+one to three entries in that file and nothing else; the module docstring works
+that example through.
 
 ### 3.3 Rig pairing, task #214 (etappe 4)
+
+**The whole flow runs on the host; the dashboard only steers it.** Same
+division as telemetry collection and plan computation already use: rigmon
+collects, the planner computes, the browser renders. Reachability checks, the
+remote query, the compatibility gate, the transport choice and the
+configuration generation are all server-side. No pairing logic lives in
+front-end JavaScript, and the front end knows nothing the server has not
+handed it as state.
+
+Two things follow from that, both wanted:
+
+* The same flow works **without the dashboard**. Each step is one endpoint,
+  so a `curl` per step is a complete client, and a script can drive a pairing
+  the same way the UI does.
+* The flow's state — which step, which result, which error with which remedy
+  — lives on the host, so a browser reload resumes rather than restarts. That
+  is the same state-preservation rule as §3.1, applied one level up.
+
+Long-running steps (the probe, the remote query) are asynchronous with a
+pollable status. No request blocks waiting for hardware.
 
 New module `srt/rigmon/pairing.py`. rigmon today has no client that reads a
 *remote* rigmon; it only receives pushes. This module adds one.

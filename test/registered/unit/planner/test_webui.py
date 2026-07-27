@@ -2209,8 +2209,10 @@ class TestUpdateFoundation(CustomTestCase):
 
     def test_sliders_are_debounced(self):
         js = _index_script()
-        self.assertIn("const _replan=debounce(", js)
-        self.assertIn("const _reflow=debounce(", js)
+        # sliders route through the debounced recompute, not a call per tick
+        self.assertIn("function _replan(){ scheduleRecompute(); }", js)
+        self.assertIn("function _reflow(){ scheduleRecompute(); }", js)
+        self.assertIn("const scheduleRecompute=debounce(", js)
         # one POST per pixel of slider travel is what this replaced
         self.assertNotIn("onServingEdit(); doPlan(); refreshRunnerPlacement();", js)
 
@@ -2267,3 +2269,202 @@ class TestVendoredAssets(CustomTestCase):
         for bad in ("cdn.", "unpkg.com", "jsdelivr", "googleapis",
                     "<script src=", "<link rel=\"stylesheet\""):
             self.assertNotIn(bad, html, bad)
+
+
+# ===========================================================================
+# Etappe 3: simple / expert views and live propagation.
+# ===========================================================================
+
+
+class TestRecomputeEndpoint(WebUIFixture):
+    """One call, one consistent answer about one configuration."""
+
+    def test_returns_all_three_sections(self):
+        d = webui.recompute_payload(self._payload())
+        self.assertTrue(d["ok"])
+        for k in ("plan", "placement", "fields"):
+            self.assertIn(k, d, k)
+        self.assertTrue(d["plan"].get("valid", True))
+        self.assertTrue(d["fields"]["ok"])
+
+    def test_sections_are_selectable(self):
+        # The simple view asks only for what it shows.
+        d = webui.recompute_payload(dict(self._payload(), sections=["plan"]))
+        self.assertIn("plan", d)
+        self.assertNotIn("placement", d)
+        self.assertNotIn("fields", d)
+
+    def test_one_broken_section_does_not_sink_the_answer(self):
+        # A rejected plan must still return the per-field states that explain
+        # the rejection, so the panels can say WHY rather than going blank.
+        p = dict(self._payload(), model="/definitely/not/a/model")
+        d = webui.recompute_payload(p)
+        self.assertTrue(d["ok"])
+        self.assertIn("fields", d)
+        self.assertFalse(d["plan"].get("valid", True))
+
+    def test_placement_request_is_honoured(self):
+        p = dict(self._payload())
+        p["placement_request"] = {"model": p["model"], "flags": {"tp_size": 3}}
+        d = webui.recompute_payload(p)
+        self.assertTrue(d["placement"]["ok"], d["placement"].get("error"))
+        self.assertEqual(d["placement"]["placement"]["tp_size"], 3)
+
+
+class TestRecomputeRoute(TestHttpRoundTrip):
+    def test_recompute_over_http(self):
+        d = self._post("/api/recompute", dict(self._payload(), sections=["plan"]))
+        self.assertTrue(d["ok"])
+        self.assertIn("plan", d)
+
+
+class TestSimpleExpertViews(CustomTestCase):
+    def test_mode_switch_exists_and_persists(self):
+        js = _index_script()
+        for fn in ("function setViewMode(", "function applyViewMode(",
+                   "function viewMode("):
+            self.assertIn(fn, js, fn)
+        self.assertIn("localStorage.setItem('view_mode'", js)
+
+    def test_visibility_is_one_class_on_body(self):
+        # A mode switch must cost no backend call and must not disturb any
+        # control's value; CSS-only visibility is what guarantees that.
+        html = webui.INDEX_HTML
+        self.assertIn("body.mode-simple .expert-only { display: none !important; }", html)
+        self.assertIn("body.mode-expert .simple-only { display: none !important; }", html)
+        self.assertIn('<div class="simple-only">', html)
+        self.assertIn('<div class="cols runner expert-only">', html)
+
+    def test_simple_view_shows_one_bar_and_one_slider_per_card(self):
+        js = _index_script()
+        i = js.index("function renderSimpleCards(")
+        body = js[i:i + 3000]
+        self.assertIn('class="csbar"', body)          # one bar, whole-card
+        self.assertIn('type="range" id="csb_', body)  # one budget slider
+        # the granular segment view belongs to the expert mode only
+        self.assertNotIn("segments", body)
+
+    def test_simple_budget_slider_writes_the_existing_reserve(self):
+        # One mechanism, two presentations -- not a second, parallel notion
+        # of "how much VRAM may this card give".
+        js = _index_script()
+        self.assertIn("function setCardBudgetMib(", js)
+        i = js.index("function setCardBudgetMib(")
+        self.assertIn("c.reserve_gb=", js[i:i + 400])
+
+    def test_live_propagation_is_one_call(self):
+        js = _index_script()
+        self.assertIn("const scheduleRecompute=debounce(recomputeNow", js)
+        self.assertIn("api('/api/recompute'", js)
+        # the three-way race is gone from the edit path
+        self.assertNotIn("resolveFlags(); refreshRunnerPlacement(); schedulePlan();", js)
+        self.assertNotIn("resolveFlags(); refreshRunnerPlacement(); doPlan();", js)
+
+    def test_no_arithmetic_is_duplicated_in_the_browser(self):
+        # The simple view renders the placement result; it does not derive it.
+        js = _index_script()
+        i = js.index("function renderSimpleCards(")
+        body = js[i:i + 3000]
+        self.assertIn("pc?pc.total_mib:null", body)
+
+
+class TestTemplatesAreStartingPoints(CustomTestCase):
+    """A template moves the starting point; it never fences a control in."""
+
+    def test_tuning_objectives_offered(self):
+        html = webui.INDEX_HTML
+        for key in ("tune_both", "tune_maxkv", "tune_dec", "tune_enc"):
+            self.assertIn(key, html, key)
+        # the four map onto the fork's own --rank-perf-tune enum
+        from sglang.srt.planner import flags as flagsmod
+        allowed = set(flagsmod.catalog()["rank_perf_tune"].allowed)
+        self.assertEqual(allowed, {"both", "dec", "enc", "maxkv"})
+
+    def test_concurrency_slider_is_not_capped_at_a_constant(self):
+        js = _index_script()
+        # the old hard 64 silently swallowed anything larger
+        self.assertNotIn("$('mrr_slider').value=Math.min(v, 64)", js)
+        self.assertNotIn("$('mrr_slider').value=Math.min(mv, 64)", js)
+        self.assertIn("function setMrrCap(", js)
+        # the range follows what the planner reports as fitting
+        self.assertIn("d.kv_by_concurrency||[]).filter(r=>r.fits)", js)
+
+    def test_context_slider_bound_to_computed_capacity_not_a_preset(self):
+        js = _index_script()
+        self.assertIn("setCtxCap(cap ? cap.max_context_tokens : null)", js)
+
+
+class TestTradeoffTooltips(CustomTestCase):
+    """Every control says what it gives and what it costs, from ONE source."""
+
+    def test_registry_entries_have_both_halves(self):
+        from sglang.srt.planner import tooltips as tipsmod
+        for key, t in tipsmod.TRADEOFFS.items():
+            self.assertTrue(t.gain.strip(), key)
+            self.assertTrue(t.cost.strip(), key)
+            # two half-sentences, not an essay
+            self.assertLess(len(t.gain), 200, key)
+            self.assertLess(len(t.cost), 200, key)
+
+    def test_rendered_line_states_the_cost(self):
+        from sglang.srt.planner import tooltips as tipsmod
+        txt = tipsmod.describe("rank_kv_ratio=speed")
+        self.assertIn("Costs:", txt)
+
+    def test_numbers_are_never_invented(self):
+        # A trade-off that points at a study must say the study has not been
+        # run rather than quoting a figure from nowhere.
+        from sglang.srt.planner import tooltips as tipsmod
+        txt = tipsmod.describe("rank_kv_ratio=speed", measurements={})
+        self.assertIn("Not measured on this rig", txt)
+        txt2 = tipsmod.describe(
+            "rank_kv_ratio=speed", measurements={"mlp_crossover": "+6% prefill"}
+        )
+        self.assertIn("Measured here: +6% prefill", txt2)
+        self.assertNotIn("Not measured", txt2)
+
+    def test_unknown_key_falls_back(self):
+        from sglang.srt.planner import tooltips as tipsmod
+        self.assertEqual(tipsmod.describe("nope", fallback="old text"), "old text")
+
+    def test_fork_flags_are_covered(self):
+        # A knob this fork invented has no documentation anywhere else, so it
+        # is the one that most needs to state its cost. Env-only vectors are
+        # excluded: they mirror a --rank-*-ratio flag that is covered.
+        from sglang.srt.planner import flags as flagsmod
+        from sglang.srt.planner import tooltips as tipsmod
+        fork = [
+            k for k, v in flagsmod.catalog().items()
+            if v.source == "fork" and not v.is_env
+        ]
+        missing = tipsmod.missing_coverage(fork)
+        self.assertEqual(missing, [], f"fork flags without a trade-off: {missing}")
+
+    def test_catalog_payload_carries_the_text(self):
+        d = webui.flag_catalog_payload()
+        specs = {f["id"]: f for g in d["groups"].values() for f in g}
+        self.assertIn("Costs:", specs["rank_kv_ratio"]["tradeoff"])
+        # enums whose options pull opposite ways get a line per option
+        by_value = specs["rank_kv_ratio"]["tradeoff_by_value"]
+        self.assertIn("speed", by_value)
+        self.assertIn("capacity", by_value)
+        self.assertNotEqual(by_value["speed"], by_value["capacity"])
+        self.assertIn("tooltips", d)
+
+    def test_frontend_holds_no_copy_of_the_text(self):
+        # The browser renders what the server sends. If a sentence were
+        # inlined in the JS it would drift from the registry silently.
+        js = _index_script()
+        from sglang.srt.planner import tooltips as tipsmod
+        for key, t in tipsmod.TRADEOFFS.items():
+            self.assertNotIn(t.gain, js, key)
+            self.assertNotIn(t.cost, js, key)
+        self.assertIn("function tip(key){", js)
+        self.assertIn("window._tips=d.tooltips", js)
+
+
+class TestTooltipsRoute(TestHttpRoundTrip):
+    def test_tooltips_endpoint(self):
+        d = json.loads(self._get("/api/tooltips"))
+        self.assertTrue(d["ok"])
+        self.assertIn("rank_kv_ratio=speed", d["tooltips"])
