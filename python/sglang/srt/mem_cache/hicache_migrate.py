@@ -44,13 +44,77 @@ Deliberate limits (named, not hidden)
   per key.
 * ``page_size == 1`` -- required by ``dcp_owner_mode`` (a multi-token page
   would span owner ranks); the KV rewrite inherits that.
-* Draft (``{hash}.draft``) pages are NOT migrated. They stay rank-suffixed
-  even in ``dcp_owner_mode``, so re-owning them needs the consuming boot's DCP
-  token vector. Run the handover without speculative decoding, or accept that
-  the draft pool starts cold.
-* Source geometry is a single rank (TP=1). A general N->M reshard would have
-  to reassemble the full state from several source shards first; that is a
-  strictly larger operation and is not built here.
+* Draft (``{hash}.draft``) pages are NOT migrated, and a suffix rule could not
+  do it. Draft KV is the exact MIRROR of target KV under ``dcp_owner_mode``:
+  target KV is head-REPLICATED and token-sharded (hence one complete, rank-
+  independent file per page), while draft KV is head-SHARDED and token-
+  COMPLETE. ``ModelRunner._pool_kv_head_num`` gives the draft pool this rank's
+  ``get_num_kv_heads(attn_tp_size)`` shard, and the draft worker is explicitly
+  held out of the DCP token split (``_draft_non_dcp``;
+  ``cache_controller.start_writing`` hands the draft path the RAW index pairs,
+  not ``_dcp_kv_transfer_pairs``' compacted ones). So every rank writes every
+  draft page, each under its own rank suffix, each holding a different head
+  subset -- and a TP=1 ``.draft`` blob is a different LENGTH from any TP=3
+  rank's. Renaming would deliver a wrong-sized file of other ranks' heads.
+  Carrying them needs a real byte split, sketched under "What a draft
+  migration would take" below. Run the handover without speculative decoding,
+  or accept that the draft pool starts cold.
+* Only 1->N and N->1 are built. Both directions go through the SAME full,
+  unsharded state as their pivot, so a general N->M reshard is the two chained
+  -- there is no direct shard-to-shard path here.
+
+The reverse direction (N -> 1, reassembly)
+------------------------------------------
+``plan_reverse_migration`` hands the big group's context back to the single
+card. It is not the forward plan run backwards by symmetry -- the source is now
+N rank blobs that must be REASSEMBLED into one full state before anything can
+be named:
+
+* KV pages need no reassembly at all. In ``dcp_owner_mode`` they are already
+  one shared, rank-less file per page holding full replicated kv-heads, so the
+  reverse is again a pure key rewrite -- this time ADDING the ``_0_1`` suffix a
+  TP=1 boot looks for. Outside ``dcp_owner_mode`` the reverse is refused rather
+  than guessed: per-rank KV pages there are genuine head shards, and stitching
+  them is a different operation from renaming.
+* The GDN state is interleaved back. For each layer the temporal state is
+  rank 0's heads, then rank 1's, ...; for each layer the conv state is rank 0's
+  ``q`` shard, rank 1's ``q`` shard, ... then the same for ``k`` and for ``v``.
+  The ``[query_key | query_key | value]`` rule bites here too, in mirror image:
+  a rank's conv shard is three separate ranges of the full blob, so
+  concatenating whole rank shards per layer would interleave the sub-blocks
+  wrongly.
+
+``verify_plan`` is direction-agnostic -- it only ever asks whether the bytes on
+disk match the named source extents and whether every source byte is consumed
+exactly once -- so the same gate proves both directions, and chaining them
+gives the round-trip byte gate (``TestRoundTrip`` in the unit proof).
+
+What a draft migration would take (not built)
+---------------------------------------------
+Recorded so the next slice does not have to re-derive it. A ``.draft`` page is
+a plain MHA host page, ``MHATokenToKVPoolHost.get_data_page``: a flat slice of
+``kv_buffer``, sized ``2 * layer_num * page_size * head_num * head_dim *
+itemsize``. Migrating it needs, mirroring ``MambaBlobSpec``:
+
+1. a ``DraftBlobSpec``: the DRAFT model's ``layer_num`` (independent of the
+   target model's), ``head_dim``, dtype itemsize, total kv-head count, and the
+   ``hicache_mem_layout`` -- four layouts exist and they do not agree on where
+   ``head_num`` sits. With ``page_size == 1`` (which ``dcp_owner_mode`` already
+   forces) ``layer_first``/``page_first``/``page_first_direct`` all flatten to
+   ``[2][layer][head][dim]``, so a head shard is one contiguous range per
+   (kv-half, layer) -- the same extent shape as ``temporal_extents``.
+   ``page_head`` puts heads outermost and needs its own case.
+2. head-shard widths from ``partition_sizes(total_kv_heads, ratios, ...)``,
+   imported from the runtime for the same anti-drift reason as the GDN split.
+3. the two configurations where the bytes ARE rank-independent and a pure key
+   rewrite is enough -- ``attn_kv_replicated`` (TP exceeds the draft's kv-head
+   count, so every rank holds all heads) and an MLA draft pool. Neither is
+   visible in the store; both must come from the caller's config.
+
+That is a second spec type, a second extent family with a layout switch, and a
+CLI surface for all of it -- comfortably past the point where bolting it onto
+this module is the cheap option, and none of it is checkable without a boot
+that runs speculative decoding on both sides. Hence: documented, not guessed.
 """
 
 from __future__ import annotations
@@ -295,6 +359,53 @@ def conv_extents(
     return out
 
 
+def reverse_extents(
+    spec: MambaBlobSpec, ratios: Sequence[int]
+) -> List[Tuple[int, int, int]]:
+    """``(rank, offset in THAT rank's blob, length)`` in FULL-blob order.
+
+    The inverse of ``temporal_extents`` + ``conv_extents``: concatenating these
+    ranges reproduces the unsharded blob byte for byte. Two orderings have to be
+    right at once, and neither is the obvious one:
+
+    * per layer, the temporal state runs rank 0's heads, rank 1's heads, ... --
+      so the outer loop is the layer and the inner loop is the rank, not the
+      other way round (each rank's own blob is layer-major, so consecutive
+      full-blob layers sit far apart inside one source file);
+    * per layer, the conv state runs ALL ranks' ``q`` shards, then all ranks'
+      ``k`` shards, then all ranks' ``v`` shards. A rank's conv shard is the
+      three concatenated in ITS file, so every sub-block is a separate seek.
+      Appending whole rank shards per layer -- the obvious reassembly -- would
+      produce ``[q0 k0 v0 q1 k1 v1 ...]`` and hand the recurrent path the wrong
+      channels, the same failure mode the forward direction guards against.
+    """
+    n = len(ratios)
+    shards = [spec.shard_for_rank(ratios, r) for r in range(n)]
+    out: List[Tuple[int, int, int]] = []
+    for layer in range(spec.num_layers):
+        for rank, s in enumerate(shards):
+            out.append((rank, layer * s.temporal_layer_bytes, s.temporal_layer_bytes))
+    per_channel = spec.conv_width * spec.conv_itemsize
+    # Per rank: the byte offset of its q / k / v sub-block inside one conv layer
+    # of its own blob, plus that sub-block's length.
+    sub_spans = [
+        list(
+            zip(
+                _prefix_offsets([s.key_dim, s.key_dim, s.value_dim]),
+                [s.key_dim, s.key_dim, s.value_dim],
+            )
+        )
+        for s in shards
+    ]
+    for layer in range(spec.num_layers):
+        for sub in range(3):
+            for rank, s in enumerate(shards):
+                off, length = sub_spans[rank][sub]
+                base = s.temporal_bytes + layer * s.conv_layer_bytes
+                out.append((rank, base + off * per_channel, length * per_channel))
+    return out
+
+
 def shard_sizes(spec: MambaBlobSpec, ratios: Sequence[int]) -> List[Tuple[int, int]]:
     """(heads, conv_dim) per rank -- the target blob's own geometry."""
     heads = _partition(spec.num_heads, ratios, spec.units)
@@ -380,6 +491,126 @@ def plan_migration(
     return plan
 
 
+def plan_reverse_migration(
+    entries: Sequence[StoreEntry],
+    target_dir: str,
+    *,
+    source_tp_size: int,
+    source_ratios: Sequence[int],
+    target_tp_rank: int = 0,
+    target_tp_size: int = 1,
+    mamba_spec: Optional[MambaBlobSpec],
+    dcp_owner_mode: bool = True,
+    target_dcp_owner_mode: bool = False,
+    skip_pools: Sequence[str] = (DRAFT_POOL,),
+) -> MigrationPlan:
+    """Full byte-provenance plan of the N -> 1 handover (reassembly).
+
+    ``mamba_spec`` is the FULL, unsharded geometry -- the same object the
+    forward direction consumes. The per-rank source layouts are derived from it
+    with ``shard_for_rank``, so the two directions cannot drift apart: a wrong
+    rank blob size is a hard error naming both numbers, not a silent misparse.
+
+    The returned plan has the same shape as ``plan_migration``'s and therefore
+    passes through the same ``execute_plan`` / ``verify_plan``.
+    """
+    if len(source_ratios) != source_tp_size:
+        raise ValueError(
+            f"source ratio vector {list(source_ratios)} has "
+            f"{len(source_ratios)} entries but source_tp_size={source_tp_size}"
+        )
+    if not dcp_owner_mode:
+        raise ValueError(
+            "reverse migration requires the source store to be in "
+            "dcp_owner_mode: without it every rank wrote its OWN kv-head shard "
+            "of a page, and rebuilding one full page means interleaving heads, "
+            "not renaming files. That is a different operation and is not built."
+        )
+    shard_specs = (
+        None
+        if mamba_spec is None
+        else [
+            mamba_spec.shard_for_rank(source_ratios, r) for r in range(source_tp_size)
+        ]
+    )
+    plan: MigrationPlan = []
+    # {(key, base): {rank: entry}} -- component pools arrive as one file per
+    # rank and only become a target once the set is complete.
+    mamba_groups: Dict[Tuple[str, str], Dict[int, StoreEntry]] = {}
+    for e in entries:
+        if e.pool in skip_pools:
+            continue
+        if e.is_kv:
+            # dcp_owner_mode KV keys carry no rank suffix at all, so the whole
+            # remainder IS the base suffix.
+            name = target_kv_name(
+                e, e.suffix_rest, target_dcp_owner_mode, target_tp_rank, target_tp_size
+            )
+            plan.append((os.path.join(target_dir, name), [(e.path, 0, e.size)]))
+            continue
+        if e.pool == MAMBA_POOL:
+            if mamba_spec is None:
+                raise ValueError(
+                    "the store holds mamba component blobs but no MambaBlobSpec "
+                    "was given -- refusing to guess the GDN state layout"
+                )
+            rank = _rank_of(e, source_tp_size)
+            base = strip_rank_suffix(e.suffix_rest, rank, source_tp_size)
+            want = shard_specs[rank].total_bytes
+            if e.size != want:
+                raise ValueError(
+                    f"mamba shard {os.path.basename(e.path)} is {e.size} B but "
+                    f"rank {rank} of ratios {list(source_ratios)} implies {want} B "
+                    f"(heads={shard_specs[rank].num_heads}, "
+                    f"conv_dim={shard_specs[rank].conv_dim}) -- declared source "
+                    "geometry does not match this store"
+                )
+            group = mamba_groups.setdefault((e.key, base), {})
+            if rank in group:
+                raise ValueError(
+                    f"two files claim rank {rank} of {e.key}.mamba: "
+                    f"{os.path.basename(group[rank].path)} and "
+                    f"{os.path.basename(e.path)}"
+                )
+            group[rank] = e
+            continue
+        raise ValueError(
+            f"unhandled component pool '{e.pool}' in {os.path.basename(e.path)}"
+        )
+
+    layout = None if mamba_spec is None else reverse_extents(mamba_spec, source_ratios)
+    for (key, base), group in mamba_groups.items():
+        missing = [r for r in range(source_tp_size) if r not in group]
+        if missing:
+            raise ValueError(
+                f"cannot reassemble {key}.mamba: rank blob(s) {missing} of "
+                f"{source_tp_size} are absent. A partial state would be a "
+                "plausible-looking but wrong GDN state, so this is fatal."
+            )
+        extents = [(group[rank].path, off, length) for rank, off, length in layout]
+        name = target_mamba_name(group[0], base, target_tp_rank, target_tp_size)
+        plan.append((os.path.join(target_dir, name), extents))
+    return plan
+
+
+def _rank_of(entry: StoreEntry, tp_size: int) -> int:
+    """Read the ``_{rank}_{tp_size}`` tail off a component key."""
+    m = re.search(rf"_(\d+)_{tp_size}$", entry.suffix_rest)
+    if m is None:
+        raise ValueError(
+            f"component entry '{os.path.basename(entry.path)}' has no "
+            f"'_<rank>_{tp_size}' suffix -- declared source_tp_size={tp_size} "
+            "does not match this store"
+        )
+    rank = int(m.group(1))
+    if rank >= tp_size:
+        raise ValueError(
+            f"'{os.path.basename(entry.path)}' names rank {rank} of "
+            f"tp_size {tp_size}"
+        )
+    return rank
+
+
 def execute_plan(plan: MigrationPlan, *, chunk: int = 1 << 22) -> Dict[str, int]:
     """Materialize the plan. Pure byte copies; a single-extent whole-file entry
     is copied as a file so KV migration stays a cheap rename-equivalent."""
@@ -422,6 +653,11 @@ def verify_plan(plan: MigrationPlan) -> Dict[str, int]:
        that is consumed by several targets (the mamba split) is covered
        EXACTLY once in total -- nothing duplicated, nothing dropped.
     Raises on the first violation, naming file and byte offset.
+
+    Direction-agnostic on purpose: it never looks at which geometry produced
+    the plan, only at extents and bytes. One source cut across many targets
+    (1 -> N) and many sources gathered into one target (N -> 1) are the same
+    statement to it, which is what lets the round-trip gate reuse it twice.
     """
     per_source: Dict[str, bytearray] = {}
     checked = {"targets": 0, "bytes": 0, "sources": 0}
@@ -444,21 +680,31 @@ def verify_plan(plan: MigrationPlan) -> Dict[str, int]:
                     f"{os.path.basename(src)}[{off}:{off + length}]"
                 )
             seen = per_source.setdefault(src, bytearray(os.path.getsize(src)))
-            for b in range(off, off + length):
-                if seen[b]:
-                    raise ValueError(
-                        f"source {os.path.basename(src)} byte {b} used twice"
-                    )
-                seen[b] = 1
+            # Slice-wise rather than byte-wise: the reverse direction plans
+            # hundreds of extents over blobs of tens of MiB, and a Python-level
+            # per-byte loop turns the gate into the slowest part of the run.
+            window = seen[off : off + length]
+            if len(window) != length:
+                raise ValueError(
+                    f"extent {os.path.basename(src)}[{off}:{off + length}] runs "
+                    f"past the end of the file ({os.path.getsize(src)} B)"
+                )
+            hit = window.find(1)
+            if hit >= 0:
+                raise ValueError(
+                    f"source {os.path.basename(src)} byte {off + hit} used twice"
+                )
+            seen[off : off + length] = b"\x01" * length
             pos += length
         checked["targets"] += 1
         checked["bytes"] += len(got)
     for src, seen in per_source.items():
         # KV pages are copied once as a whole; mamba blobs are cut across
         # ranks. Either way the source must end up fully covered.
-        if sum(seen) != len(seen):
+        covered = seen.count(1)
+        if covered != len(seen):
             raise ValueError(
-                f"source {os.path.basename(src)}: {len(seen) - sum(seen)} B "
+                f"source {os.path.basename(src)}: {len(seen) - covered} B "
                 "never migrated"
             )
     checked["sources"] = len(per_source)
@@ -471,18 +717,31 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
 
     p = argparse.ArgumentParser(
         prog="python -m sglang.srt.mem_cache.hicache_migrate",
-        description="Migrate a HiCache 'file' store from a TP=1 geometry to a "
-        "TP=N (uneven, weighted-DCP) geometry.",
+        description="Migrate a HiCache 'file' store between TP geometries: "
+        "TP=1 -> TP=N (uneven, weighted-DCP) by default, TP=N -> TP=1 with "
+        "--reverse.",
     )
     p.add_argument("--source-dir", required=True)
     p.add_argument("--target-dir", required=True)
+    p.add_argument(
+        "--reverse",
+        action="store_true",
+        help="hand the group's context BACK to a single card: reassemble the "
+        "N per-rank GDN shards into one full state and re-suffix the KV pages",
+    )
     p.add_argument("--source-tp-size", type=int, default=1)
     p.add_argument("--source-tp-rank", type=int, default=0)
-    p.add_argument("--target-tp-size", type=int, required=True)
+    p.add_argument(
+        "--source-ratios",
+        help="--reverse only: the resolved --rank-tp-ratio vector of the boot "
+        "that WROTE the store, e.g. 6,1,1",
+    )
+    p.add_argument("--target-tp-size", type=int, default=1)
+    p.add_argument("--target-tp-rank", type=int, default=0)
     p.add_argument(
         "--target-ratios",
-        required=True,
-        help="the consuming boot's resolved --rank-tp-ratio vector, e.g. 6,1,1",
+        help="forward only: the consuming boot's resolved --rank-tp-ratio "
+        "vector, e.g. 6,1,1",
     )
     p.add_argument(
         "--model-config",
@@ -510,7 +769,16 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
     )
     a = p.parse_args(argv)
 
-    ratios = [int(x) for x in a.target_ratios.split(",") if x.strip()]
+    if a.reverse:
+        if not a.source_ratios:
+            p.error("--reverse needs --source-ratios (the writing boot's vector)")
+        if a.source_tp_size <= 1:
+            p.error("--reverse needs --source-tp-size > 1")
+        ratios = [int(x) for x in a.source_ratios.split(",") if x.strip()]
+    else:
+        if not a.target_ratios:
+            p.error("--target-ratios is required (the consuming boot's vector)")
+        ratios = [int(x) for x in a.target_ratios.split(",") if x.strip()]
     spec = None
     if a.model_config:
         cfg = json.load(open(a.model_config))
@@ -527,27 +795,46 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
 
     entries = scan_store(a.source_dir)
     os.makedirs(a.target_dir, exist_ok=True)
-    plan = plan_migration(
-        entries,
-        a.target_dir,
-        source_tp_rank=a.source_tp_rank,
-        source_tp_size=a.source_tp_size,
-        target_tp_size=a.target_tp_size,
-        target_ratios=ratios,
-        mamba_spec=spec,
-        dcp_owner_mode=not a.no_dcp_owner_mode,
-    )
+    if a.reverse:
+        plan = plan_reverse_migration(
+            entries,
+            a.target_dir,
+            source_tp_size=a.source_tp_size,
+            source_ratios=ratios,
+            target_tp_rank=a.target_tp_rank,
+            target_tp_size=a.target_tp_size,
+            mamba_spec=spec,
+            dcp_owner_mode=not a.no_dcp_owner_mode,
+        )
+    else:
+        plan = plan_migration(
+            entries,
+            a.target_dir,
+            source_tp_rank=a.source_tp_rank,
+            source_tp_size=a.source_tp_size,
+            target_tp_size=a.target_tp_size,
+            target_ratios=ratios,
+            mamba_spec=spec,
+            dcp_owner_mode=not a.no_dcp_owner_mode,
+        )
     kv = sum(1 for e in entries if e.is_kv)
     mamba = sum(1 for e in entries if e.pool == MAMBA_POOL)
     skipped = len(entries) - kv - mamba
+    direction = (
+        f"TP={a.source_tp_size} -> TP={a.target_tp_size} (reassembly)"
+        if a.reverse
+        else f"TP={a.source_tp_size} -> TP={a.target_tp_size} (split)"
+    )
     print(
-        f"source {a.source_dir}: {kv} KV pages, {mamba} mamba blobs, "
-        f"{skipped} skipped (draft/other) -> {len(plan)} target files"
+        f"source {a.source_dir} [{direction}]: {kv} KV pages, "
+        f"{mamba} mamba blobs, {skipped} skipped (draft/other) -> "
+        f"{len(plan)} target files"
     )
     if spec is not None:
+        side = "source" if a.reverse else "target"
         for rank, (heads, conv) in enumerate(shard_sizes(spec, ratios)):
             print(
-                f"  rank {rank}: temporal heads {heads}/{spec.num_heads}, "
+                f"  {side} rank {rank}: temporal heads {heads}/{spec.num_heads}, "
                 f"conv channels {conv}/{spec.conv_dim}"
             )
     if a.dry_run:
