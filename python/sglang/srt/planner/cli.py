@@ -170,6 +170,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", type=int, default=8780)
+    web.add_argument(
+        "--model-root",
+        action="append",
+        default=None,
+        metavar="DIR",
+        dest="model_root",
+        help="Directory to scan for local models; repeat for several roots. "
+        "Replaces the generic defaults (~/.cache/huggingface/hub, ./models). "
+        "Without it the colon-separated SGLANG_PLANNER_MODEL_ROOTS (or the "
+        "older SGLANG_MODEL_ROOTS) is used, else the generic defaults.",
+    )
     mx = p.add_argument_group("combination explorer (S4)")
     mx.add_argument(
         "--matrix",
@@ -836,6 +847,11 @@ def _run_landscape(args) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if getattr(args, "model_root", None):
+        from sglang.srt.planner.server_manager import set_model_roots
+
+        set_model_roots(args.model_root)
 
     if args.serve:
         from sglang.srt.planner.webui import serve

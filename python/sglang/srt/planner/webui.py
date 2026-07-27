@@ -1154,19 +1154,28 @@ def list_models_payload(payload: Optional[dict] = None) -> dict:
     """Enumerate every local model the dashboard can serve (config-authoritative
     quant, gguf variants, vision-capable, size). Pure discovery — no GPU."""
     from sglang.srt.planner.server_manager import (
-        DEFAULT_MODEL_ROOTS,
         discover_models,
+        model_roots,
     )
 
     payload = payload or {}
     extra = payload.get("extra_roots") or None
+    roots = list(model_roots()) + list(extra or [])
     try:
         models = discover_models(extra_roots=extra)
     except Exception as e:  # pragma: no cover - defensive
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "roots": roots}
+    # ``roots`` is what was scanned; ``roots_present`` says which of them
+    # actually exist, so an empty list is diagnosable from the payload alone
+    # (a mistyped --model-root shows up as present: false, not as "no models").
     return {
         "ok": True,
-        "roots": list(DEFAULT_MODEL_ROOTS),
+        "roots": roots,
+        "roots_present": [
+            {"path": r, "exists": os.path.isdir(os.path.expanduser(r))}
+            for r in roots
+        ],
+        "count": len(models),
         "models": [_model_to_json(m) for m in models],
     }
 

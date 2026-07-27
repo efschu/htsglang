@@ -94,17 +94,87 @@ from sglang.srt.planner.energy import (
 from sglang.srt.uneven_perf import _read_gguf_metadata
 
 # ---------------------------------------------------------------------------
-# Default model roots scanned by discover_models(). ``SGLANG_MODEL_ROOTS``
-# (colon-separated directories) overrides the generic defaults.
+# Model roots scanned by discover_models().
+#
+# Three layers, most specific first:
+#   1. ``set_model_roots()``  -- the ``--model-root`` CLI flag (repeatable);
+#   2. ``SGLANG_PLANNER_MODEL_ROOTS`` / ``SGLANG_MODEL_ROOTS`` (colon-separated);
+#   3. the generic fallback (HF hub cache + ./models).
+#
+# Resolved on every call rather than frozen at import time, so a root set after
+# the module is imported (CLI parsing happens after the import) still takes
+# effect.
 # ---------------------------------------------------------------------------
+#: Fallback when neither an explicit override nor an env var is set.
+GENERIC_MODEL_ROOTS: Tuple[str, ...] = ("~/.cache/huggingface/hub", "./models")
+
+#: Process-wide override installed by ``--model-root``. None = not set.
+_MODEL_ROOTS_OVERRIDE: Optional[Tuple[str, ...]] = None
+
+
+def set_model_roots(roots: Optional[Sequence[str]]) -> None:
+    """Install the process-wide model roots (the ``--model-root`` flag). Passing
+    None/empty clears the override and falls back to env / generic defaults."""
+    global _MODEL_ROOTS_OVERRIDE
+    cleaned = tuple(str(r).strip() for r in (roots or []) if str(r).strip())
+    _MODEL_ROOTS_OVERRIDE = cleaned or None
+
+
 def _model_roots_from_env() -> Tuple[str, ...]:
-    env = os.environ.get("SGLANG_MODEL_ROOTS")
-    if env:
-        return tuple(p for p in env.split(os.pathsep) if p)
-    return ("~/.cache/huggingface/hub", "./models")
+    for var in ("SGLANG_PLANNER_MODEL_ROOTS", "SGLANG_MODEL_ROOTS"):
+        env = os.environ.get(var)
+        if env:
+            return tuple(p for p in env.split(os.pathsep) if p)
+    return GENERIC_MODEL_ROOTS
 
 
-DEFAULT_MODEL_ROOTS: Tuple[str, ...] = _model_roots_from_env()
+def model_roots() -> Tuple[str, ...]:
+    """The roots discover_models() scans when no explicit ``roots=`` is given."""
+    if _MODEL_ROOTS_OVERRIDE:
+        return _MODEL_ROOTS_OVERRIDE
+    return _model_roots_from_env()
+
+
+class _DefaultModelRoots(tuple):
+    """Backwards-compatible view of :func:`model_roots`.
+
+    Older call sites read ``DEFAULT_MODEL_ROOTS`` as a plain tuple constant.
+    Freezing it at import time is exactly the bug this replaces, so the name
+    stays but resolves live on every access.
+    """
+
+    def __new__(cls):
+        return super().__new__(cls)
+
+    def _live(self) -> Tuple[str, ...]:
+        return model_roots()
+
+    def __iter__(self):
+        return iter(self._live())
+
+    def __len__(self):
+        return len(self._live())
+
+    def __getitem__(self, i):
+        return self._live()[i]
+
+    def __contains__(self, x):
+        return x in self._live()
+
+    def __eq__(self, other):
+        return tuple(self._live()) == other
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return hash(self._live())
+
+    def __repr__(self):
+        return repr(self._live())
+
+
+DEFAULT_MODEL_ROOTS = _DefaultModelRoots()
 
 #: llama.cpp ``LLAMA_FTYPE`` enum -> human quant tag (config-authoritative GGUF
 #: quant, read from the GGUF header ``general.file_type``, NOT the file name).
@@ -335,15 +405,22 @@ def discover_models(
     ``max_depth`` allows descending one level into org-style subdirs
     (``unsloth/<model>``)."""
     root_list: List[str] = []
-    for r in (list(roots) if roots is not None else list(DEFAULT_MODEL_ROOTS)):
+    for r in (list(roots) if roots is not None else list(model_roots())):
         root_list.append(os.path.expanduser(r))
     for r in (extra_roots or []):
         root_list.append(os.path.expanduser(r))
 
     found: List[DiscoveredModel] = []
     seen_paths: set = set()
+    seen_dirs: set = set()
 
-    def scan(dir_path: str, depth: int):
+    def scan(dir_path: str, depth: int, prefix: str):
+        # Guard against a root listed twice and against symlinked self-loops
+        # (``<root>/models-cache -> <root>``): a directory is descended once.
+        real_dir = os.path.realpath(dir_path)
+        if real_dir in seen_dirs:
+            return
+        seen_dirs.add(real_dir)
         try:
             entries = sorted(os.listdir(dir_path))
         except OSError:
@@ -367,17 +444,21 @@ def discover_models(
 
             if real in seen_paths:
                 continue
-            m = _classify_model_dir(name, entry)
+            # Nested dirs keep their sub-path in the display name, so two
+            # distinct checkpoints with the same basename (``unsloth/X`` vs
+            # ``models-cache/X``) stay tellable apart instead of showing up
+            # twice under one name.
+            m = _classify_model_dir(prefix + name, entry)
             if m is not None:
                 seen_paths.add(real)
                 found.append(m)
             elif depth < max_depth:
                 # Not a model dir itself -> maybe an org dir of sub-models.
-                scan(entry, depth + 1)
+                scan(entry, depth + 1, prefix + name + "/")
 
     for root in root_list:
         if os.path.isdir(root):
-            scan(root, 0)
+            scan(root, 0, "")
     return found
 
 

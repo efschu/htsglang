@@ -33,7 +33,6 @@ from unittest import mock
 from sglang.srt.planner.server_manager import (
     DEFAULT_MODEL_ROOTS,
     DownloadInfo,
-    GgufVariant,
     LaunchSettings,
     SglangSupervisor,
     SupervisorBusyError,
@@ -180,14 +179,17 @@ class TestDiscovery(unittest.TestCase):
             "architectures": ["Qwen3ForCausalLM"]})
         ms = discover_models(roots=[self.tmp])
         self.assertEqual(len(ms), 1)
-        self.assertEqual(ms[0].name, "Some-Model")
+        # The sub-dir stays in the display name -- two org dirs may hold the
+        # same model basename.
+        self.assertEqual(ms[0].name, "unsloth/Some-Model")
 
     def test_default_roots_constant(self):
-        # Without SGLANG_MODEL_ROOTS the defaults are the generic locations.
+        # Without either env var the defaults are the generic locations.
         from sglang.srt.planner.server_manager import _model_roots_from_env
 
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SGLANG_MODEL_ROOTS", None)
+            os.environ.pop("SGLANG_PLANNER_MODEL_ROOTS", None)
             self.assertEqual(
                 _model_roots_from_env(),
                 ("~/.cache/huggingface/hub", "./models"))
@@ -196,10 +198,73 @@ class TestDiscovery(unittest.TestCase):
         # SGLANG_MODEL_ROOTS (colon-separated) replaces the generic defaults.
         from sglang.srt.planner.server_manager import _model_roots_from_env
 
-        with mock.patch.dict(
-            os.environ, {"SGLANG_MODEL_ROOTS": "/a/models:/b/cache"}
-        ):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_PLANNER_MODEL_ROOTS", None)
+            os.environ["SGLANG_MODEL_ROOTS"] = "/a/models:/b/cache"
             self.assertEqual(_model_roots_from_env(), ("/a/models", "/b/cache"))
+
+    def test_planner_env_var_wins_over_legacy(self):
+        # SGLANG_PLANNER_MODEL_ROOTS is the documented name; the older
+        # SGLANG_MODEL_ROOTS stays accepted but loses when both are set.
+        from sglang.srt.planner.server_manager import _model_roots_from_env
+
+        with mock.patch.dict(
+            os.environ,
+            {"SGLANG_PLANNER_MODEL_ROOTS": "/new", "SGLANG_MODEL_ROOTS": "/old"},
+        ):
+            self.assertEqual(_model_roots_from_env(), ("/new",))
+
+    def test_set_model_roots_override_and_clear(self):
+        # --model-root wins over the env vars; clearing restores the env layer.
+        from sglang.srt.planner.server_manager import (
+            model_roots,
+            set_model_roots,
+        )
+
+        with mock.patch.dict(
+            os.environ, {"SGLANG_PLANNER_MODEL_ROOTS": "/from/env"}
+        ):
+            try:
+                set_model_roots(["/from/flag", "/second"])
+                self.assertEqual(model_roots(), ("/from/flag", "/second"))
+                # The legacy alias reads through to the live value.
+                self.assertEqual(
+                    list(DEFAULT_MODEL_ROOTS), ["/from/flag", "/second"])
+                set_model_roots(None)
+                self.assertEqual(model_roots(), ("/from/env",))
+            finally:
+                set_model_roots(None)
+
+    def test_nested_dirs_keep_their_subpath_in_the_name(self):
+        # Two checkpoints with the same basename in different sub-dirs must
+        # stay tellable apart instead of colliding under one display name.
+        for sub in ("unsloth", "legacy"):
+            _write_config(
+                os.path.join(self.tmp, sub, "Same-Name", "config.json"),
+                {"architectures": ["Qwen3ForCausalLM"]})
+        ms = discover_models(roots=[self.tmp])
+        names = sorted(m.name for m in ms)
+        self.assertEqual(names, ["legacy/Same-Name", "unsloth/Same-Name"])
+
+    def test_symlink_loop_does_not_duplicate_models(self):
+        # A root containing a symlink back to itself must not yield the same
+        # model twice (and must not recurse forever).
+        _write_config(
+            os.path.join(self.tmp, "Only-Model", "config.json"),
+            {"architectures": ["Qwen3ForCausalLM"]})
+        try:
+            os.symlink(self.tmp, os.path.join(self.tmp, "self-link"))
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        ms = discover_models(roots=[self.tmp])
+        self.assertEqual([m.name for m in ms], ["Only-Model"])
+
+    def test_duplicate_root_scanned_once(self):
+        _write_config(
+            os.path.join(self.tmp, "Only-Model", "config.json"),
+            {"architectures": ["Qwen3ForCausalLM"]})
+        ms = discover_models(roots=[self.tmp, self.tmp])
+        self.assertEqual(len(ms), 1)
 
 
 # ===========================================================================
