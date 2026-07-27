@@ -319,6 +319,8 @@ class TestProfileAvailableBytes(CustomTestCase):
                 mem_fraction_static=mem_fraction_static,
                 _colocated_sibling_reserved_gb=lambda: 0.0,
                 _measured_kv_budget_correction_bytes=lambda: 0,
+                # #257: GGUF dequant scratch post; 0.0 off the GGUF path.
+                _gguf_dequant_scratch_gb=lambda: 0.0,
             )
         )
 
@@ -412,6 +414,8 @@ class TestProfileAvailableBytes(CustomTestCase):
                 mem_fraction_static=0.9,
                 _colocated_sibling_reserved_gb=lambda: 0.0,
                 _measured_kv_budget_correction_bytes=lambda: 0,
+                # #257: GGUF dequant scratch post; 0.0 off the GGUF path.
+                _gguf_dequant_scratch_gb=lambda: 0.0,
             )
         )
         with envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.override(0.25), patch.object(

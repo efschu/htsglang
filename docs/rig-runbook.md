@@ -217,6 +217,43 @@ section 21. What is settled:
 (MoE expert-offload work), the `*-GGUF` trees (GGUF loader work). Smaller
 smoke-test subjects: `Qwen3.5-4B-GGUF`, `Llama-3.1-8B-Instruct`.
 
+### 4.5 GGUF, TP=1 on the 5090
+
+`--model-path` must point at the **`.gguf` file**, not at the directory that
+holds it: the GGUF path is selected by `check_gguf_file(model_path)` /
+`model_path.endswith(".gguf")`. Pointing at the directory boots the model as
+an UNQUANTIZED checkpoint and dies in `unquant.py create_weights` with a
+plain OOM (30+ GiB of `torch.empty` on a 32 GiB card) — a failure that looks
+like a memory problem and is really a path problem. `--tokenizer-path` takes
+the directory.
+
+```bash
+MODEL_DIR="$MODEL_ROOT/Qwen3.6-27B-MTP-Q3_K_M-GGUF"
+setsid "$VENV/bin/python" -u -m sglang.launch_server \
+  --model-path "$MODEL_DIR/Qwen3.6-27B-Q3_K_M.gguf" \
+  --tokenizer-path "$MODEL_DIR" \
+  --tp-size 1 --base-gpu-id 0 \
+  --mem-fraction-static 0.82 \
+  --context-length 16384 --max-running-requests 4 \
+  --attention-backend flashinfer \
+  --speculative-algorithm NEXTN --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+  --trust-remote-code --enable-metrics \
+  --host 127.0.0.1 --port <free-port> \
+  > "$LOG" 2>&1 &
+```
+
+- `--base-gpu-id 0` is the 5090 in CUDA order (section 6.1).
+- `--max-running-requests` decides whether this configuration ever touches
+  the expensive GGUF path: the verify forward runs at
+  `bs x --speculative-num-draft-tokens` tokens, and only above
+  `SGLANG_GGUF_MMQ_MAX_TOKENS` (default 8) does it leave the MMVQ/MMQ
+  kernels for dequantize+cuBLAS. At `--max-running-requests 1` (M=4) the
+  2.37 GiB lm_head dequant never happens and the boot proves nothing about
+  it; from `bs>=3` (M>=12) it does. Size memory experiments accordingly.
+- The same `LD_LIBRARY_PATH` nvrtc rule as every other recipe (section 2)
+  and `--enable-metrics` (section 3) apply.
+
 ## 5. Credentials
 
 | Credential | Location | Use |
@@ -335,3 +372,26 @@ Several agents share this box; the cards are usually contended.
   `nvidia-smi --query-compute-apps=pid,used_memory` for orphaned
   `sglang::scheduler_TP*` processes — they hold 5-11 GiB per card and do
   not match `pgrep -af launch_server`. Kill them by PID.
+- **GGUF boots reserve dequant scratch out of the KV budget** (#257, changed
+  2026-07-27). A GGUF dequant target larger than
+  `SGLANG_GGUF_DEQUANT_WS_CAP_MIB` (default 512 MiB) fresh-allocates its
+  full size at forward time; for Qwen3.6-27B Q3_K_M that is the lm_head
+  shard at 2.37 GiB on TP=1 (1.19 GiB on TP=2). The KV profiler now charges
+  the largest such target that is not already held in the persistent
+  workspace, so on GGUF models the KV pool is smaller than before at the
+  same `--mem-fraction-static`, and the boot log carries a
+  `GGUF dequant scratch (rank N): reserving X GiB` line. Consequence for
+  recipes: a GGUF fraction that used to boot may now be rejected up front
+  with a message naming the reservation — that rejection replaces an OOM
+  inside `ggml_dequantize` during the decode-graph warmup minutes later.
+  Non-GGUF models record no target and are unaffected.
+  Measured on the section 4.5 recipe (TP=1, 5090, `--mem-fraction-static
+  0.90`, `--max-running-requests 4`): before, the KV pool took 3.38 GiB of
+  budget, capture ran down to 0.07 GB free and died in `capture_end` with
+  `CUDA error: out of memory`; after, the reservation is 2.20 GiB
+  (2.37 GiB target minus the 0.17 GiB the workspace already held), the
+  budget is 1.18 GiB / `max_total_num_tokens=19361`, capture keeps ~2.9 GB
+  free and the server serves. Same flags, both arms.
+- A `ColdBuildWindowError` in an OLD log ("a peer may still be in nvcc") is
+  not evidence of a peer: before #257 that wrapper was attached on TP=1 too.
+  Read the chained `__cause__`, which is where the OOM was.

@@ -615,11 +615,52 @@ def _mmq_threshold_prefers_mmq(m: int, qweight: torch.Tensor, qweight_type: int)
 # identically to the previous fresh-allocation behavior.
 # ---------------------------------------------------------------------------
 _DEQUANT_WS: dict = {}  # (device_index, dtype) -> 1-D buffer
+# (device_index, dtype) -> largest dequant TARGET this rank can be asked for,
+# in bytes, INCLUDING the over-cap ones the workspace deliberately refuses to
+# hold. See gguf_dequant_scratch_residual_bytes.
+_DEQUANT_PEAK_TARGET: dict = {}
 _dequant_out_supported: bool | None = None
 
 
 def _dequant_ws_cap_bytes() -> int:
     return int(os.environ.get("SGLANG_GGUF_DEQUANT_WS_CAP_MIB", "512")) * (1 << 20)
+
+
+def _dequant_ws_key(dtype: torch.dtype, device) -> tuple:
+    return (device.index if device.type == "cuda" else device, dtype)
+
+
+def gguf_dequant_scratch_residual_bytes(device_index: int | None = None) -> int:
+    """GGUF dequant scratch that is still UNALLOCATED at KV-profiling time.
+
+    #257. The workspace below is sized at weight-load time, i.e. before the
+    KV budget is profiled, so whatever it already holds is charged against
+    the budget automatically (it shows up as used memory). What does NOT
+    show up is the part the workspace refuses: a dequant target larger than
+    ``SGLANG_GGUF_DEQUANT_WS_CAP_MIB`` falls back to a FRESH allocation of
+    its full size on the eager path -- and the pre-capture warmup forwards
+    are eager. For Qwen3.6-27B Q3_K_M at TP=1 the lm_head shard is 2.37 GiB
+    (1.19 GiB at TP=2, #70), which is exactly the allocation that OOMed the
+    decode-graph warmup at --mem-fraction-static 0.90 while the KV pool had
+    already been sized as if that memory were free.
+
+    This is not a safety margin: it is the arithmetic difference between the
+    largest dequant this rank will perform and the buffer it already owns.
+    Returns 0 for every non-GGUF model (nothing ever records a peak), which
+    keeps the default budget path byte-identical.
+
+    MAX, not sum, across dtypes: over-cap dequants are transient (dequant ->
+    GEMM -> free, one weight at a time on one stream), so the simultaneous
+    demand is the largest single one, not their total.
+    """
+    residual = 0
+    for (idx, dtype), peak in _DEQUANT_PEAK_TARGET.items():
+        if device_index is not None and idx != device_index:
+            continue
+        buf = _DEQUANT_WS.get((idx, dtype))
+        have = buf.numel() * buf.element_size() if buf is not None else 0
+        residual = max(residual, peak - have)
+    return max(residual, 0)
 
 
 def _dequant_supports_out() -> bool:
@@ -635,13 +676,19 @@ def _dequant_supports_out() -> bool:
 
 def _reserve_dequant_workspace(numel: int, dtype: torch.dtype, device) -> None:
     """Grow the persistent workspace (load time, pre-KV-profiling)."""
+    key = _dequant_ws_key(dtype, device)
+    nbytes = numel * dtype.itemsize
+    # Record the peak target BEFORE either early return (#257): both of them
+    # mean "this dequant fresh-allocates its full size at forward time",
+    # which is precisely the demand the KV budget has to know about.
+    if nbytes > _DEQUANT_PEAK_TARGET.get(key, 0):
+        _DEQUANT_PEAK_TARGET[key] = nbytes
     if not _dequant_supports_out():
         # Old wheel: the runtime path cannot write into the workspace, so
         # holding one would only STEAL headroom. Keep legacy behavior.
         return
-    if numel * dtype.itemsize > _dequant_ws_cap_bytes():
+    if nbytes > _dequant_ws_cap_bytes():
         return
-    key = (device.index if device.type == "cuda" else device, dtype)
     buf = _DEQUANT_WS.get(key)
     if buf is None or buf.numel() < numel:
         _DEQUANT_WS[key] = torch.empty(numel, dtype=dtype, device=device)
