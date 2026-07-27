@@ -154,13 +154,55 @@ class TestTritonDcpSpecVerify(CustomTestCase):
         looks like -- the kernel grid covers fewer query blocks than there are
         draft tokens and silently drops the tail.
         """
-        seq_lens = torch.tensor([0, 1, 33], dtype=torch.int64)
         for d in (1, 3, 4):
             with self.subTest(num_draft_tokens=d):
-                self.assertTrue(dcp_verify_window_is_disjoint(seq_lens, d, d))
-                self.assertFalse(dcp_verify_window_is_disjoint(seq_lens, d, d - 1))
-                self.assertFalse(dcp_verify_window_is_disjoint(seq_lens, d, d + 1))
-        self.assertFalse(dcp_verify_window_is_disjoint(seq_lens, 0, 0))
+                self.assertTrue(dcp_verify_window_is_disjoint(d, d))
+                self.assertFalse(dcp_verify_window_is_disjoint(d, d - 1))
+                self.assertFalse(dcp_verify_window_is_disjoint(d, d + 1))
+        self.assertFalse(dcp_verify_window_is_disjoint(0, 0))
+
+    def test_the_disjointness_invariant_is_enforced_and_not_merely_stated(self):
+        """The predicate must have a CALL SITE, in both verify metadata builds.
+
+        It was extracted in #180.1 as one of three decisions of the verify
+        split; #180.2 wired the other two (``dcp_verify_paged_lens`` for the
+        paged length vector, ``dcp_verify_mask_mode`` for the guard) and left
+        this one exported, documented and uncalled -- which reads as an active
+        check while checking nothing. Both builds are covered: the eager one in
+        ``init_forward_metadata`` and the capture one in
+        ``_update_target_verify_buffers``; a graph replays the qo_indptr frozen
+        at capture, so the capture site is the one that matters most.
+
+        The check compares the verify input's ``draft_token_num`` against the
+        backend's constructor-time ``num_draft_tokens`` (the qo_indptr step).
+        Two ints, no device work -- the earlier ``(seq_lens >= 0).all()`` term
+        was vacuous AND a device->host sync, i.e. illegal inside a capture,
+        which is why the function could not be called as first written.
+        """
+        import inspect
+
+        import sglang.srt.layers.attention.triton_backend as tb
+
+        gate = tb._reject_stale_verify_window
+        self.assertIn(
+            "dcp_verify_window_is_disjoint(", inspect.getsource(gate)
+        )
+        for fn in (
+            tb.TritonAttnBackend.init_forward_metadata,
+            tb.TritonAttnBackend._update_target_verify_buffers,
+        ):
+            with self.subTest(call_site=fn.__name__):
+                self.assertIn(
+                    "_reject_stale_verify_window(", inspect.getsource(fn)
+                )
+
+        class _Stale:
+            draft_token_num = 5
+
+        with self.assertRaises(ValueError):
+            tb._reject_stale_verify_window(_Stale(), 4)
+        tb._reject_stale_verify_window(_Stale(), 5)  # in step: no raise
+        tb._reject_stale_verify_window(object(), 4)  # no declaration: inert
 
     # ------------------------------------------------ 2. index parity
 

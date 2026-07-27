@@ -358,11 +358,7 @@ def dcp_verify_paged_lens(
     return seq_lens
 
 
-def dcp_verify_window_is_disjoint(
-    seq_lens: torch.Tensor,
-    num_draft_tokens: int,
-    qo_stride: int,
-) -> bool:
+def dcp_verify_window_is_disjoint(num_draft_tokens: int, qo_stride: int) -> bool:
     """Do the paged and ragged stages together cover the attended context once?
 
     The verify invariant, checkable on integers alone: each of the ``d`` draft
@@ -375,10 +371,22 @@ def dcp_verify_window_is_disjoint(
     A mismatch is what a stale ``num_draft_tokens`` looks like: the kernel grid
     covers fewer query blocks than there are draft tokens and silently drops
     the tail, which reads as a collapsed accept rate rather than as an error.
+    That is live in this tree, not hypothetical: the Triton backend builds
+    ``qo_indptr`` from the CONSTRUCTOR-time ``self.num_draft_tokens``
+    (``server_args.speculative_num_draft_tokens``) while the verify input
+    carries the step's actual ``draft_token_num``, and the adaptive draft-length
+    ladder swaps a whole per-rung backend to keep the two in step. The check is
+    exactly the question "did that swap happen".
+
+    INTEGERS ONLY, deliberately. An earlier form also took ``seq_lens`` and
+    returned ``(seq_lens >= 0).all()``. That term is vacuous -- a length vector
+    is non-negative by construction -- and it is what kept the function
+    uncallable: it is a device->host sync, so it costs a stall per verify step
+    in eager and is illegal inside a CUDA-graph capture, which is where the two
+    call sites are. Dropping it is what turned the stated invariant into an
+    enforced one.
     """
-    if num_draft_tokens <= 0 or qo_stride != num_draft_tokens:
-        return False
-    return bool((seq_lens.to(torch.int64) >= 0).all())
+    return num_draft_tokens > 0 and qo_stride == num_draft_tokens
 
 
 def dcp_verify_mask_mode(topk: Optional[int], dflash_tree_verify: bool = False) -> str:

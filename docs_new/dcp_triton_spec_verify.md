@@ -284,8 +284,16 @@ no group), so the decisions that make verify correct are pinned without a GPU:
   may not own. This is the single most likely way to get the port wrong, because the
   non-DCP verify branch it replaces reads `seq_lens` for a *different* reason (the
   draft K/V are handed in as tensors) and looks the same.
-* `dcp_verify_window_is_disjoint(seq_lens, num_draft_tokens, qo_stride)` — the
-  invariant: paged rows + ragged rows == the full attended context, exactly once.
+* `dcp_verify_window_is_disjoint(num_draft_tokens, qo_stride)` — the invariant:
+  paged rows + ragged rows == the full attended context, exactly once. Enforced
+  at both verify metadata builds (eager and capture) through
+  `triton_backend._reject_stale_verify_window`, which compares the verify
+  input's `draft_token_num` against the backend's constructor-time
+  `num_draft_tokens` (the `qo_indptr` step) — i.e. it checks that the adaptive
+  draft-length per-rung backend swap happened. Integers only: an earlier form
+  also took `seq_lens` and returned `(seq_lens >= 0).all()`, which is vacuous
+  for a length vector and a device→host sync, hence illegal inside a graph
+  capture — that term is what kept the function uncallable.
 * `dcp_verify_mask_mode(topk, dflash_tree_verify)` — `"causal"` or `"tree"`, the one
   place the topk==1 equivalence of §2.1 is expressed.
 

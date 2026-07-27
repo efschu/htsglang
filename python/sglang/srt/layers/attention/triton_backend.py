@@ -24,6 +24,7 @@ from sglang.srt.layers.dcp import (
     dcp_token_sharded_layer,
     dcp_verify_mask_mode,
     dcp_verify_paged_lens,
+    dcp_verify_window_is_disjoint,
     dcp_weighted_owner_bounds,
     dcp_weighted_write_slots,
     get_dcp_lens,
@@ -87,6 +88,35 @@ if TYPE_CHECKING:
 _DCP_VERIFY_SPEC_INPUT_TYPES = frozenset(
     {SpecInputType.EAGLE_VERIFY, SpecInputType.DFLASH_VERIFY}
 )
+
+
+def _reject_stale_verify_window(spec_info, qo_stride: int) -> None:
+    """Enforce the M4 split's disjointness invariant at a verify metadata build.
+
+    ``qo_indptr`` is built with a uniform step of ``self.num_draft_tokens``,
+    which is read once in the constructor from
+    ``server_args.speculative_num_draft_tokens``. The verify input carries the
+    step's ACTUAL block width in ``draft_token_num``. The two are kept in step
+    by construction -- the adaptive draft-length ladder builds one backend per
+    rung and swaps the whole object -- so this is a check on that swap, not on
+    the arithmetic. If it ever misses, the grid covers fewer query blocks than
+    there are draft tokens and drops the tail, which reads as a collapsed
+    accept rate rather than as an error. Two ints, no device work: safe in the
+    eager build and inside a graph capture alike.
+    """
+    d = getattr(spec_info, "draft_token_num", None)
+    if d is None:
+        return
+    if not dcp_verify_window_is_disjoint(int(d), qo_stride):
+        raise ValueError(
+            f"uneven-DCP target-verify window is not disjoint: the verify input "
+            f"declares draft_token_num={d} while qo_indptr is built with a step "
+            f"of {qo_stride} (the backend's num_draft_tokens). The paged stage "
+            f"reads the committed prefix and the ragged stage the draft block; "
+            f"a mismatched step makes the kernel grid drop the draft tail "
+            f"silently. This backend instance is stale for the current draft "
+            f"length -- see the adaptive draft-length per-rung backend swap."
+        )
 
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
@@ -1141,6 +1171,7 @@ class TritonAttnBackend(AttentionBackend):
             # Returning a fresh tensor here would leave a replay reading
             # whatever the buffer held at capture time -- a silently wrong
             # verify context, not a crash.
+            _reject_stale_verify_window(spec_info, self.num_draft_tokens)
             self._dcp_kv_indices(
                 req_pool_indices[:bs],
                 dcp_verify_paged_lens(seq_lens[:bs], self.num_draft_tokens),
@@ -1524,6 +1555,7 @@ class TritonAttnBackend(AttentionBackend):
                 # is emphatically not seq_lens + num_draft_tokens -- through
                 # the SAME owner-rule builder decode and extend call, and the
                 # draft block never appears in kv_indices at all.
+                _reject_stale_verify_window(spec_info, self.num_draft_tokens)
                 kv_indptr, kv_indices, _ = self._dcp_kv_indices(
                     forward_batch.req_pool_indices,
                     dcp_verify_paged_lens(
