@@ -3006,7 +3006,14 @@ class ServerArgs:
     ] = None
     enable_int8_mamba_checkpoint: A[
         bool,
-        "Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.",
+        "Store radix-cached linear-attn (mamba) states in int8 in a SEPARATE "
+        "checkpoint pool, doubling cached-prefix capacity for those states. The "
+        "pool is ADDITIONAL memory: it defaults to 2x the active pool's slot "
+        "count at half the per-slot size, so enabling this adds roughly one "
+        "active pool's worth of VRAM per rank (measured 1.9-3.3 GiB) rather "
+        "than saving any. It raises cached-prefix reuse, not "
+        "--max-total-tokens, which is bounded by the ACTIVE pool. Rejected "
+        "together with --enable-hierarchical-cache and --radix-cache-backend.",
     ] = False
     int8_mamba_ckpt_size: A[
         Optional[int],
