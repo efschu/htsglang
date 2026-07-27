@@ -365,6 +365,134 @@ def cmd_kv_budget(args) -> int:
     return 0
 
 
+def cmd_probe(args) -> int:
+    """The short probe, step 3 of the join sequence.
+
+    Reads the cached stage-0 micro-probe rather than running one: a probe
+    allocates a CUDA context on every card, and this CLI also runs next to a
+    live server. `--reprobe` is the explicit opt-in that measures afresh.
+    """
+    from sglang.srt.rigmon.probe import (
+        CardState,
+        estimate_budget,
+        from_hardware_profile,
+        measure_host_link,
+    )
+    from sglang.srt.rigmon.sources import select_backend
+    from sglang.srt.rigmon.transport import choose_all_pairs
+
+    if args.reprobe:
+        from sglang.srt.uneven_perf import get_hardware_profile
+
+        hw, source, _ = get_hardware_profile()
+        print(f"probe source: {source}", file=sys.stderr)
+    else:
+        hw, _ = load_cached_profiles()
+
+    # Card state at read time: clock, temperature, throttling. A point taken
+    # under throttling is kept and marked, never dropped.
+    states = {}
+    try:
+        backend = select_backend()
+        for c in backend.sample(with_profiling=False):
+            if c.uuid:
+                states[c.uuid] = CardState(
+                    sm_clock_mhz=c.sm_clock_mhz,
+                    sm_clock_max_mhz=c.sm_clock_max_mhz,
+                    temp_c=c.temp_c,
+                    throttle_reasons=tuple(c.performance_throttles()),
+                    sampled_at=time.time(),
+                )
+        backend.close()
+    except Exception as e:
+        print(f"warning: no card state ({e})", file=sys.stderr)
+
+    result = from_hardware_profile(hw, args.node_id, card_states=states)
+
+    if args.peer:
+        host, _, port = args.peer.rpartition(":")
+        link = measure_host_link(host or args.peer, int(port or 8770))
+        result.links.append(link)
+        result.notes.append(link.note)
+
+    facs = [f.key for f in facilities(detect_host_environment()) if f.available]
+    choices = choose_all_pairs(result, available_facilities=facs)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "probe": result.to_json(),
+                    "budget": estimate_budget(len(result.cards)).to_json(),
+                    "transport": [c.to_json() for c in choices],
+                },
+                indent=1,
+            )
+        )
+        return 0
+
+    budget = estimate_budget(len(result.cards))
+    print(
+        f"cards: {len(result.cards)}  ordered pairs: {budget.ordered_pairs}  "
+        f"estimated probe cost: {budget.estimate_s:.0f} s of a "
+        f"{budget.budget_s:.0f} s budget "
+        f"({'fits' if budget.fits else 'OVER BUDGET'})"
+    )
+    print()
+    for c in result.cards:
+        state = ""
+        if c.state:
+            bits = []
+            if c.state.temp_c is not None:
+                bits.append(f"{c.state.temp_c:.0f} C")
+            if c.state.clock_ratio is not None:
+                bits.append(f"{c.state.clock_ratio * 100:.0f} % clock")
+            if c.state.throttled:
+                bits.append("THROTTLED: " + ",".join(c.state.throttle_reasons))
+            state = "  [" + ", ".join(bits) + "]" if bits else ""
+        print(
+            f"{c.id:44s} {c.total_mib or 0:>7} MiB  "
+            f"{c.gemm_tflops or 0:>7.1f} TFLOPS ({c.gemm_dtype})  "
+            f"{c.membw_gbs or 0:>7.0f} GB/s{state}"
+        )
+    for g in result.group_latencies:
+        print(
+            f"\ngroup all-reduce on {g.node_id}: "
+            f"{g.allreduce_10kb_us or 0:.1f} us at 10 kB, "
+            f"{g.allreduce_1mb_us or 0:.1f} us at 1 MB "
+            "(a group figure, not a per-pair latency)"
+        )
+    print("\nordered pairs and the transport that falls out of them:")
+    for ch in choices:
+        chosen = ch.chosen
+        m = ch.measurement or {}
+        bw = m.get("bandwidth_gbs")
+        lat = m.get("latency_us")
+        meas = []
+        if bw is not None:
+            meas.append(f"{bw:.2f} GB/s")
+        if lat is not None:
+            meas.append(f"{lat:.1f} us")
+        direction = m.get("direction", "")
+        mark = "" if direction.startswith("measured") else "  (mirrored)"
+        print(
+            f"  {ch.src} -> {ch.dst}: "
+            + (", ".join(meas) if meas else "not measured")
+            + f" => {chosen.key if chosen else 'unknown'}{mark}"
+        )
+        if chosen:
+            print(f"      {chosen.reason}")
+        for o in ch.options:
+            if o.verdict == "unavailable":
+                print(f"      unavailable: {o.label} ({', '.join(o.missing_facilities)})")
+    warnings = result.state_warnings()
+    if warnings:
+        print("\nhow to read this:")
+        for w in warnings:
+            print(f"  - {w}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m sglang.srt.rigmon",
@@ -449,6 +577,28 @@ def build_parser() -> argparse.ArgumentParser:
     kv.add_argument("--no-backup", action="store_true")
     kv.add_argument("--json", action="store_true")
     kv.set_defaults(func=cmd_kv_budget)
+
+    pr = sub.add_parser(
+        "probe",
+        help="the short probe: card rates + the ordered pair matrix, and the "
+        "transport that falls out of it",
+    )
+    pr.add_argument("--node-id", default=default_node_id())
+    pr.add_argument(
+        "--reprobe",
+        action="store_true",
+        help="measure afresh instead of reading the cache. Allocates a CUDA "
+        "context on every card, so not the default while a server runs.",
+    )
+    pr.add_argument(
+        "--peer",
+        default="",
+        metavar="HOST:PORT",
+        help="also measure the host-to-host leg to another node. It BOUNDS "
+        "the device-to-device path across the rig boundary; it is not it.",
+    )
+    pr.add_argument("--json", action="store_true")
+    pr.set_defaults(func=cmd_probe)
 
     return p
 
