@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import importlib.util
 import os
 import subprocess
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -53,6 +54,8 @@ __all__ = [
     "CapabilityReport",
     "probe_rdma",
     "probe_p2p",
+    "probe_nccl_colocation",
+    "probe_mps",
     "probe_python_module",
     "probe_all",
     "ACTIVE",
@@ -131,6 +134,56 @@ def _default_import(name: str):
     return importlib.import_module(name)
 
 
+def _default_nccl_version(
+    environ: Dict[str, str],
+) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """(raw ncclGetVersion value, library that answered, error).
+
+    Loads the library the process would actually use at RUNTIME — the
+    ``SGLANG_NCCL_SO_PATH`` override first, then the loader's ``libnccl.so.2``
+    / ``librccl.so.1``, then the pip-wheel copy that torch links against. The
+    version sglang was BUILT against is deliberately not consulted: a wheel
+    built against 2.27 headers happily runs on a 2.31 library and vice versa,
+    and it is the runtime library that decides what a communicator can do.
+    ``ncclGetVersion`` touches no GPU and creates no CUDA context.
+    """
+    import ctypes
+
+    override = environ.get("SGLANG_NCCL_SO_PATH")
+    candidates: List[str] = (
+        [override] if override else ["libnccl.so.2", "librccl.so.1"]
+    )
+    if not override:
+        # The nvidia-nccl wheel is not on the default loader path until torch
+        # is imported; probe its copy explicitly instead of importing torch.
+        try:
+            spec = importlib.util.find_spec("nvidia.nccl")
+            if spec is not None and spec.submodule_search_locations:
+                for loc in spec.submodule_search_locations:
+                    candidates.append(os.path.join(loc, "lib", "libnccl.so.2"))
+        except Exception:
+            pass
+
+    errors: List[str] = []
+    for so_file in candidates:
+        try:
+            lib = ctypes.CDLL(so_file)
+            fn = lib.ncclGetVersion
+            fn.restype = ctypes.c_int
+            fn.argtypes = [ctypes.POINTER(ctypes.c_int)]
+            raw = ctypes.c_int()
+            rc = fn(ctypes.byref(raw))
+            if rc != 0:
+                errors.append(f"{so_file}: ncclGetVersion returned {rc}")
+                continue
+            return raw.value, so_file, None
+        except OSError as e:
+            errors.append(f"{so_file}: {e}")
+        except Exception as e:
+            errors.append(f"{so_file}: {type(e).__name__}: {e}")
+    return None, None, "; ".join(errors) or "no candidate library"
+
+
 @dataclasses.dataclass
 class ProbeEnv:
     exists: Callable[[str], bool] = os.path.exists
@@ -143,6 +196,10 @@ class ProbeEnv:
     engine_info: Optional[Dict[str, Any]] = None
     #: A cached ``hw_profile-*.json``, which carries MEASURED pair bandwidths.
     hw_profile: Optional[Dict[str, Any]] = None
+    #: environ -> (raw ncclGetVersion value, answering library, error).
+    nccl_version: Callable[
+        [Dict[str, str]], Tuple[Optional[int], Optional[str], Optional[str]]
+    ] = _default_nccl_version
 
     def safe_listdir(self, path: str) -> List[str]:
         try:
@@ -402,6 +459,169 @@ def probe_p2p(env: ProbeEnv) -> Capability:
 
 
 # ---------------------------------------------------------------------------
+# Rank co-location on one physical GPU: NCCL runtime version and MPS
+# ---------------------------------------------------------------------------
+
+#: Several ranks opening one communicator on ONE physical GPU need NCCL 2.30+.
+_NCCL_COLOCATION_MIN_RAW = 23000
+
+
+def _format_nccl_version(raw: int) -> str:
+    # >= 2.9 encodes major*10000 + minor*100 + patch; older major*1000 + ...
+    if raw >= 10000:
+        return f"{raw // 10000}.{raw // 100 % 100}.{raw % 100}"
+    return f"{raw // 1000}.{raw // 100 % 10}.{raw % 100}"
+
+
+def _colocation_requested(info: Optional[Dict[str, Any]]) -> bool:
+    """True when the running engine maps several ranks onto one physical GPU
+    (duplicate entries in ``rank_gpu_id``)."""
+    raw = (info or {}).get("rank_gpu_id")
+    if not raw:
+        return False
+    if isinstance(raw, str):
+        ids = [x.strip() for x in raw.split(",") if x.strip()]
+    elif isinstance(raw, (list, tuple)):
+        ids = [str(x) for x in raw]
+    else:
+        return False
+    return len(ids) != len(set(ids))
+
+
+def probe_nccl_colocation(env: ProbeEnv) -> Capability:
+    """NCCL support for several ranks on one physical GPU.
+
+    The decisive number is the RUNTIME version — the library ``ctypes`` loads
+    when a communicator is created — not the version sglang or torch was built
+    against. The two diverge whenever ``SGLANG_NCCL_SO_PATH``, an LD path, or
+    a system libnccl overrides the wheel copy, and it is exactly that
+    divergence that has to be visible here instead of a version string copied
+    from build metadata.
+    """
+    key, label = "nccl_colocation", "NCCL multi-rank per GPU"
+    raw, source, error = env.nccl_version(env.env)
+    evidence: Dict[str, Any] = {
+        "raw_version": raw,
+        "library": source,
+        "min_required": "2.30",
+    }
+    if raw is None:
+        evidence["error"] = error
+        return Capability(
+            key,
+            label,
+            UNAVAILABLE,
+            reason=(
+                f"no NCCL runtime library could be loaded ({error}). Several "
+                "ranks on one physical GPU need NCCL >= 2.30 at runtime — "
+                "install it, or point SGLANG_NCCL_SO_PATH at the library."
+            ),
+            evidence=evidence,
+            probe="ctypes ncclGetVersion",
+        )
+    version = _format_nccl_version(raw)
+    evidence["version"] = version
+    if raw < _NCCL_COLOCATION_MIN_RAW:
+        return Capability(
+            key,
+            label,
+            UNAVAILABLE,
+            reason=(
+                f"runtime NCCL is {version} (from {source}), below 2.30: "
+                "several ranks on one physical GPU cannot open a communicator "
+                "with this library. Needs NCCL >= 2.30 — upgrade the nccl "
+                "package or set SGLANG_NCCL_SO_PATH to a newer library."
+            ),
+            evidence=evidence,
+            probe="ctypes ncclGetVersion",
+        )
+    if _colocation_requested(env.engine_info):
+        return Capability(
+            key,
+            label,
+            ACTIVE,
+            reason=f"runtime NCCL {version} (>= 2.30); the running "
+            "configuration co-locates ranks on one physical GPU",
+            evidence=evidence,
+            probe="ctypes ncclGetVersion",
+        )
+    return Capability(
+        key,
+        label,
+        AVAILABLE,
+        reason=f"runtime NCCL {version} (>= 2.30) supports several ranks per "
+        "physical GPU"
+        + (
+            "; no engine reachable, so use cannot be confirmed"
+            if env.engine_info is None
+            else "; the running configuration does not co-locate ranks"
+        ),
+        evidence=evidence,
+        probe="ctypes ncclGetVersion",
+    )
+
+
+_MPS_DEFAULT_PIPE_DIR = "/tmp/nvidia-mps"
+
+
+def probe_mps(env: ProbeEnv) -> Capability:
+    """CUDA MPS control daemon, decided by the control directory ONLY.
+
+    The check is the existence of the MPS pipe directory
+    (``CUDA_MPS_PIPE_DIRECTORY``, default ``/tmp/nvidia-mps``) — the same
+    handle CUDA clients themselves use to reach the daemon. Deliberately no
+    process-name scan: pattern-matching process lists has hit unrelated
+    processes on this project before, and the pipe directory is the interface
+    that actually decides whether a client can connect.
+    """
+    key, label = "mps", "CUDA MPS (co-location scheduler)"
+    pipe_dir = env.env.get("CUDA_MPS_PIPE_DIRECTORY") or _MPS_DEFAULT_PIPE_DIR
+    present = env.exists(pipe_dir)
+    evidence: Dict[str, Any] = {
+        "pipe_dir": pipe_dir,
+        "present": present,
+        "entries": env.safe_listdir(pipe_dir) if present else [],
+    }
+    if not present:
+        return Capability(
+            key,
+            label,
+            UNAVAILABLE,
+            reason=(
+                f"MPS control directory {pipe_dir} does not exist, so no MPS "
+                "daemon is reachable: several ranks on one physical GPU would "
+                "time-slice their kernels instead of overlapping them. Needs "
+                "`nvidia-cuda-mps-control -d` (started before the ranks)."
+            ),
+            evidence=evidence,
+            probe="MPS control directory",
+        )
+    if _colocation_requested(env.engine_info):
+        return Capability(
+            key,
+            label,
+            ACTIVE,
+            reason=f"control directory {pipe_dir} present; the running "
+            "configuration co-locates ranks on one physical GPU",
+            evidence=evidence,
+            probe="MPS control directory",
+        )
+    return Capability(
+        key,
+        label,
+        AVAILABLE,
+        reason=f"control directory {pipe_dir} present"
+        + (
+            "; no engine reachable, so use cannot be confirmed"
+            if env.engine_info is None
+            else "; the running configuration does not co-locate ranks"
+        ),
+        evidence=evidence,
+        probe="MPS control directory",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Python-module-backed capabilities
 # ---------------------------------------------------------------------------
 
@@ -498,7 +718,12 @@ def _truthy(v) -> bool:
 def probe_all(env: Optional[ProbeEnv] = None) -> CapabilityReport:
     """The full table."""
     env = env or ProbeEnv()
-    caps: List[Capability] = [probe_rdma(env), probe_p2p(env)]
+    caps: List[Capability] = [
+        probe_rdma(env),
+        probe_p2p(env),
+        probe_nccl_colocation(env),
+        probe_mps(env),
+    ]
 
     caps.append(
         probe_python_module(
