@@ -2149,7 +2149,13 @@ def maybe_stub_sgl_kernel():
         import sgl_kernel  # noqa: F401
 
         return
-    except (ImportError, OSError):
+    except (ImportError, OSError, RuntimeError):
+        # RuntimeError: the import chain (sgl_kernel -> flashinfer)
+        # constructs tensors at import time; under a leaked
+        # ``torch.set_default_device(<accelerator>)`` from an earlier
+        # collected test module (#249) that dies with "No CUDA GPUs are
+        # available" on a box without the accelerator. Treat it like any
+        # other unimportable-sgl_kernel case and stub.
         pass
 
     import importlib.abc

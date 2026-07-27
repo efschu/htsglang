@@ -6,33 +6,18 @@ import time
 import unittest
 from types import SimpleNamespace
 
-import pytest
-
-# Import shim for the #249 default-device collection leak: an earlier
-# collected module may leave ``torch.set_default_device(<accelerator>)``
-# active; this module's sglang import chain constructs tensors at import
-# time and then dies with RuntimeError on a box without that accelerator.
-# Skip the module instead of erroring; side effects on the process are
-# identical to the crash, so every other collected module keeps its fate.
-try:
-    from sglang.srt.managers.load_snapshot import (
-        LoadSnapshot,
-        ShmLoadSnapshotReader,
-        ShmLoadSnapshotWriter,
-        ZmqLoadSnapshotWriter,
-        ZmqShmLoadSnapshotReader,
-        _zmq_addr_for,
-        create_load_snapshot_reader,
-        create_load_snapshot_writer,
-        should_use_zmq,
-        zmq_reader_owner,
-    )
-except RuntimeError as _import_err:  # pragma: no cover - leak-dependent
-    pytest.skip(
-        f"#249 default-device collection leak broke the import chain: "
-        f"{_import_err}",
-        allow_module_level=True,
-    )
+from sglang.srt.managers.load_snapshot import (
+    LoadSnapshot,
+    ShmLoadSnapshotReader,
+    ShmLoadSnapshotWriter,
+    ZmqLoadSnapshotWriter,
+    ZmqShmLoadSnapshotReader,
+    _zmq_addr_for,
+    create_load_snapshot_reader,
+    create_load_snapshot_writer,
+    should_use_zmq,
+    zmq_reader_owner,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
