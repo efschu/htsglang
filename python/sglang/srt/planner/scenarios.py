@@ -237,7 +237,7 @@ class Scenario:
         }
 
     @classmethod
-    def from_json(cls, d: dict) -> "Scenario":
+    def from_json(cls, d: dict) -> Scenario:
         return cls(
             key=d["key"],
             question=d["question"],
@@ -868,6 +868,196 @@ _register(
         est_runtime_min=50,
         keywords=["spill", "latency", "concurrent", "session", "offload",
                   "latenz", "gleichzeitig", "victim", "restore"],
+    )
+)
+
+_register(
+    Scenario(
+        key="mlp_split_crossover",
+        question=(
+            "At what mix of prompt and output tokens does concentrating MLP "
+            "weight on the compute-strong rank start to pay on THIS rig?"
+        ),
+        hypothesis=(
+            "Concentration buys prefill per prompt token and costs decode per "
+            "output token, so there is a prompt:output ratio where the two "
+            "cancel. Below it the base split is faster; above it the "
+            "concentration is."
+        ),
+        falsifier=(
+            "If the prefill saving stays inside the prefill noise floor, or if "
+            "the decode cost does not grow with concentration, there is no "
+            "crossover to find on this rig and no vector should be proposed. "
+            "The ratio is a property of this card mix, this model and this "
+            "quantisation path; a value carried over from another rig "
+            "falsifies nothing."
+        ),
+        axes=[
+            Axis(
+                "mlp_vector",
+                "MLP weight split",
+                "",
+                ["base", "3,1,1", "6,1,1"],
+                kind="flag",
+                note="--rank-mlp-ratio, set at boot. 'base' is the plain "
+                "VRAM-proportional split and is the reference every other "
+                "point is read against.",
+            ),
+            Axis(
+                "phase",
+                "which half is being measured",
+                "",
+                ["random-ids", "random"],
+                kind="workload",
+                note="The harness dataset, and the two halves cannot share "
+                "one. Prefill needs unique random input ids so the radix "
+                "cache cannot serve a repeat and the prompt length is exact; "
+                "decode needs natural text, because on random ids the model "
+                "falls into a degenerate output mode whose speculative "
+                "acceptance drives the per-token time more than the weight "
+                "split does.",
+            ),
+            Axis(
+                "prompt_tokens",
+                "prompt length",
+                "tokens",
+                [500, 1000, 2000, 4000, 8000, 11000],
+                kind="workload",
+                note="The prefill gain is a SLOPE difference and saturates as "
+                "a percentage past roughly 2000 tokens, so the short points "
+                "are what separate the fixed cost from the slope.",
+            ),
+            Axis(
+                "output_tokens",
+                "generated tokens",
+                "tokens",
+                [1, 256],
+                kind="workload",
+                note="1 for the prefill points, so the measurement is prefill "
+                "and nothing else; a decode-length run for the other half.",
+            ),
+        ],
+        metrics=[
+            Metric(
+                "break_even_prompt_to_output",
+                "break-even prompt:output ratio",
+                "prompt:output",
+                "lower_better",
+                source="derived from this scenario's own arms: decode ms per "
+                "output token divided by prefill ms saved per prompt token. "
+                "Not read from the harness — it is the quantity the two "
+                "measured slopes produce.",
+                primary=True,
+            ),
+            MS_PER_1K_PREFILL,
+            MS_PER_VERIFY_ROUND,
+            ACCEPT_LENGTH,
+            VERIFY_CT,
+            Metric(
+                "max_total_num_tokens",
+                "KV pool size",
+                "tokens",
+                "higher_better",
+                source="engine: /get_server_info, read once per boot. Falls "
+                "out of every arm at no extra cost, and concentration spends "
+                "it, so it belongs in the same table as the two time terms.",
+            ),
+            Metric(
+                "cached_token_fraction",
+                "prompt tokens served from the radix cache",
+                "fraction",
+                "lower_better",
+                source="server log: #cached-token summed over the prefill "
+                "chunks, over prompt tokens. Must be 0, and the proof travels "
+                "with the result — a prefill figure taken over a warm cache "
+                "measures the cache.",
+            ),
+            TOK_S_CONTEXT,
+        ],
+        stop_rules=[
+            StopRule(
+                "prefill_slope_saturated",
+                "prefill slope established",
+                "Stop extending the prompt length once the per-prompt-token "
+                "slope between two consecutive lengths moves by less than the "
+                "prefill noise floor. The gain is a slope difference; past "
+                "saturation a longer prompt adds cost, not information.",
+                kind="saturation",
+            ),
+            StopRule(
+                "cache_bypass_broken",
+                "cache bypass broken",
+                "Abort a prefill point whose chunks report a non-zero "
+                "#cached-token. The positive control is the same prompt sent "
+                "twice in one boot; where it has been run it went 5505 -> "
+                "1319 ms, which is the size of the artefact being avoided.",
+                kind="failure",
+            ),
+            StopRule(
+                "effect_below_floor",
+                "no crossover on this rig",
+                "If the prefill difference against the base arm stays inside "
+                "the prefill noise floor at every length, report that there is "
+                "no crossover here and propose nothing. A ratio computed from "
+                "a difference below the floor is a number without a "
+                "measurement behind it.",
+                kind="failure",
+            ),
+        ],
+        confounders=[
+            "The radix cache. Repeating a prompt turns a prefill measurement "
+            "into a cache measurement; unique random input ids per request are "
+            "the bypass, and the #cached-token proof is part of the result.",
+            "Raw ms per output token is acceptance-driven, not weight-driven. "
+            "On random prompts it produced a 4.7x phantom depth term and one "
+            "negative step time; report ms per speculative step on natural "
+            "text and carry the accept length with it.",
+            "The KV ownership vector must be pinned across arms "
+            "(SGLANG_UNEVEN_TOKEN_VECTOR), or the weight split and the token "
+            "split move together and neither is attributable.",
+            "~/.cache/sglang/kv_budget-<confighash>.json carries a KV budget "
+            "from one boot into the next; the runner neutralises it, and a "
+            "manual run must too.",
+            "Clocks and temperature. The decode half is the one a clock drop "
+            "distorts most, so a throttled point is marked rather than "
+            "silently averaged in.",
+        ],
+        harness=HarnessBinding(
+            module="sglang.benchmark.serving",
+            provides="load generation, dataset selection, TTFT/ITL/e2e percentiles",
+            fixed_flags=[
+                "--backend sglang",
+                "--warmup-requests 8",
+                "--seed 1",
+                "--flush-cache",
+                "--output-details",
+            ],
+            axis_flags={
+                "phase": "--dataset-name",
+                "prompt_tokens": "--random-input-len",
+                "output_tokens": "--random-output-len",
+            },
+            metric_fields={
+                "ms_per_1k_prefill_tokens": "(collector: round_time.ms_per_1k_prefill_tokens)",
+                "ms_per_verify_round": "(collector: round_time over the same wall clock)",
+                "accept_length": "(engine: sglang:spec_accept_length; meta_info.spec_accept_length per request)",
+                "verify_ct": "(engine: meta_info.spec_verify_ct, summed over the window)",
+                "max_total_num_tokens": "(engine: /get_server_info, once per boot)",
+                "cached_token_fraction": "(server log: #cached-token per prefill chunk)",
+                "tok_s": "output_throughput",
+            },
+            external_axes=["mlp_vector"],
+            note=(
+                "The MLP split is a boot flag, so each vector is an arm rather "
+                "than a point. The phase is a point: one invocation measures "
+                "prefill or decode, never both, because the two need different "
+                "prompt material."
+            ),
+        ),
+        est_runtime_min=190,
+        keywords=["crossover", "kipppunkt", "break-even", "mlp", "split",
+                  "concentration", "konzentration", "prefill", "decode",
+                  "ratio", "verhaeltnis", "gewichtsverteilung"],
     )
 )
 

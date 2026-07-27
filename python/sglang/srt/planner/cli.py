@@ -257,6 +257,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="How many nodes are joined; the TTFT lever needs at least two.",
     )
     lv.add_argument(
+        "--workload-ratio",
+        type=float,
+        default=None,
+        metavar="PROMPT_PER_OUTPUT",
+        help="Expected prompt tokens per output token (e.g. 20 for a "
+        "4000-token prompt with a 200-token answer). The prefill lever needs "
+        "it: MLP concentration buys prefill per prompt token and costs decode "
+        "per output token, so which one wins is a property of the workload. "
+        "Without it, and without a crossover measured on this rig, no "
+        "concentration vector is proposed.",
+    )
+    lv.add_argument(
+        "--crossover-file",
+        default="",
+        metavar="PATH",
+        help="Where this rig's measured MLP-split crossover is stored "
+        "(default ~/.cache/sglang/mlp_crossover.json). Produced by the "
+        "mlp_split_crossover study; a finding for different cards, a "
+        "different model or a different quantisation is not used.",
+    )
+    lv.add_argument(
         "--scenario",
         default="",
         metavar="KEY",
@@ -342,6 +363,21 @@ def _cached_probe() -> Optional[dict]:
         return None
 
 
+def _cached_crossover(path: str = ""):
+    """This rig's measured MLP-split crossover, or None.
+
+    Absent is the normal state and is not an error: the prefill lever is
+    written to say so and to offer the measurement rather than to fall back
+    on somebody else's number.
+    """
+    try:
+        from sglang.srt.planner.crossover import load_finding
+
+        return load_finding(path or None)
+    except Exception:
+        return None
+
+
 def _run_levers(args) -> int:
     from sglang.srt.planner.levers import render_levers_text, suggest_levers
 
@@ -351,6 +387,8 @@ def _run_levers(args) -> int:
         node_count=args.nodes,
         facility_keys_available=_available_facilities(),
         keys=(args.lever.split(",") if args.lever else None),
+        crossover=_cached_crossover(getattr(args, "crossover_file", "")),
+        prompt_to_output_ratio=getattr(args, "workload_ratio", None),
     )
     if args.json:
         print(json.dumps([s.to_json() for s in out], indent=1))
@@ -600,13 +638,26 @@ def _print_report(result, model_path: str) -> None:
             )
         if adv.decode_knee_ok is not None:
             print(
-                "  decode-knee guard: "
+                "  decode-knee guard [modelled]: "
                 + (
-                    "ok (no decode regression expected)"
+                    "ok (no decode regression predicted)"
                     if adv.decode_knee_ok
-                    else "EXCEEDED (expect a decode regression)"
+                    else "EXCEEDED (a decode regression is predicted)"
                 )
             )
+            print(
+                "    Predicted, not measured. The decode side of this model is "
+                "fitted against"
+            )
+            print(
+                "    measured vectors; the prefill side is not and "
+                "over-predicts by ~1.8x,"
+            )
+            print(
+                "    so no net of the two is shown. Measure the crossover for "
+                "this rig with"
+            )
+            print("    the mlp_split_crossover study.")
     _print_roofline(getattr(result, "roofline", None))
 
 

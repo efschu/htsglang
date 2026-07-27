@@ -1,0 +1,135 @@
+{
+ "_": [
+  "MLP-split crossover, quick tier: does a crossover exist on this rig, and",
+  "roughly where. Two arms, one concentration vector.",
+  "",
+  "WHY THIS IS MEASURED AND NOT LOOKED UP. Concentrating dense-MLP units on",
+  "the compute-strong rank buys prefill per prompt token and costs decode per",
+  "output token. Both slopes depend on the card mix, the interconnect, the",
+  "model and which quantisation lane each rank ends up on, so the ratio where",
+  "they cancel is a property of THIS machine. Numbers from another rig are",
+  "shown as that rig's finding and never used here.",
+  "",
+  "WHAT ONE INVOCATION COVERS. A study run measures ONE point of the",
+  "parameter space with all arms interleaved. The point below is the prefill",
+  "half at 4000 prompt tokens. Cover the rest with the same file and a point",
+  "override:",
+  "  phase=random-ids output_tokens=1   prompt_tokens=1000",
+  "  phase=random-ids output_tokens=1   prompt_tokens=4000   (this file)",
+  "  phase=random-ids output_tokens=1   prompt_tokens=11000",
+  "  phase=random     output_tokens=256 prompt_tokens=400",
+  "",
+  "TIME. 2 noise-floor boots + 1 interleaved repeat over 2 arms = 4 boots per",
+  "point, 4 points = 16 boots. At ~3.5 min per boot (boot, weight load,",
+  "settle, 10-20 s of load) that is ~55 min.",
+  "",
+  "WHAT THE QUICK TIER CANNOT DO. The floor is two boots wide, so a",
+  "difference close to it is not resolvable, and one concentration vector",
+  "cannot produce an envelope -- it answers whether the effect exists and",
+  "roughly where it turns, not which vector to pick.",
+  "",
+  "CACHE BYPASS IS THE RESULT, NOT A DETAIL. The prefill points use",
+  "--dataset-name random-ids so every request carries input ids no other",
+  "request has; a repeated prompt is served from the radix cache and the",
+  "measurement becomes a cache measurement. Check #cached-token: 0 on every",
+  "prefill chunk in the server log and record it with the result. The",
+  "positive control is the same prompt sent twice in one boot.",
+  "",
+  "DECODE IS MEASURED ON NATURAL TEXT. Raw ms per output token over random",
+  "ids is acceptance-driven: it has produced a 4.7x phantom depth term and a",
+  "negative step time. Report ms per speculative step and carry the accept",
+  "length beside it.",
+  "",
+  "THE KV OWNERSHIP VECTOR IS PINNED in every arm, so the weight split is the",
+  "only thing that moves. Without that pin two levers move at once and",
+  "neither is attributable."
+ ],
+ "scenario": "mlp_split_crossover",
+ "point": {
+  "phase": "random-ids",
+  "prompt_tokens": 4000,
+  "output_tokens": 1
+ },
+ "policy": {
+  "noise_floor_boots": 2,
+  "comparison_repeats": 1,
+  "num_prompts": 12,
+  "settle_s": 8,
+  "reset_kv_budget": true,
+  "pin_token_vector": "2,3,3",
+  "own_vram_timeout_s": 180,
+  "budget": {
+   "target_low_s": 10.0,
+   "target_high_s": 25.0,
+   "ceiling_s": 90.0
+  },
+  "env": {
+   "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1",
+   "SGLANG_UNEVEN_DCP": "1",
+   "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
+   "SGLANG_UNEVEN_TOKEN_VECTOR": "2,3,3",
+   "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+  }
+ },
+ "arms": [
+  {
+   "label": "base",
+   "note": "reference: the plain VRAM-proportional split, no MLP concentration",
+   "settings": {
+    "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8",
+    "served_model_name": "Qwen3.6-27B",
+    "tp_size": 3,
+    "rank_gpu_id": [0, 1, 2],
+    "rank_tp_ratio": "auto",
+    "kv_cache_dtype": "fp8_e5m2",
+    "context_length": 262144,
+    "max_running_requests": 2,
+    "spec_mode": "off",
+    "trust_remote_code": true,
+    "host": "127.0.0.1",
+    "port": 30000,
+    "python_exe": "/spinning/htsglang-gpu/.venv/bin/python",
+    "extra_flags": [
+     "--enable-metrics-for-all-schedulers",
+     "--max-total-tokens", "16384"
+    ]
+   },
+   "conditions": {
+    "model": "Qwen3.6-27B-FP8",
+    "quant": "fp8",
+    "mlp_vector": "base",
+    "kv_ownership": "pinned 2,3,3"
+   }
+  },
+  {
+   "label": "mlp-3-1-1",
+   "note": "candidate: MLP units concentrated on rank 0",
+   "settings": {
+    "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8",
+    "served_model_name": "Qwen3.6-27B",
+    "tp_size": 3,
+    "rank_gpu_id": [0, 1, 2],
+    "rank_tp_ratio": "auto",
+    "kv_cache_dtype": "fp8_e5m2",
+    "context_length": 262144,
+    "max_running_requests": 2,
+    "spec_mode": "off",
+    "trust_remote_code": true,
+    "host": "127.0.0.1",
+    "port": 30000,
+    "python_exe": "/spinning/htsglang-gpu/.venv/bin/python",
+    "extra_flags": [
+     "--enable-metrics-for-all-schedulers",
+     "--max-total-tokens", "16384",
+     "--rank-mlp-ratio", "3,1,1"
+    ]
+   },
+   "conditions": {
+    "model": "Qwen3.6-27B-FP8",
+    "quant": "fp8",
+    "mlp_vector": "3,1,1",
+    "kv_ownership": "pinned 2,3,3"
+   }
+  }
+ ]
+}

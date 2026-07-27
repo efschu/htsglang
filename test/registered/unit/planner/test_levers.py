@@ -1,12 +1,22 @@
 """CPU unit tests for the five levers."""
 
+import time
 import unittest
 
+from sglang.srt.planner.crossover import (
+    MEASURED,
+    MEASURED_HERE,
+    MODELLED,
+    REFERENCE_FINDING,
+    CrossoverFinding,
+    RigDescriptor,
+)
 from sglang.srt.planner.levers import (
     LEVERS,
     RATES_KNOWN,
     STRUCTURE_ONLY,
     Confidence,
+    Evidence,
     FlagSpec,
     Lever,
     flag_available,
@@ -23,6 +33,28 @@ PROBE = {
     "created": "2026-07-21 07:06:43",
     "gpus": {"GPU-a": {"gemm_tflops": 233.9, "membw_gbs": 1664.1}},
 }
+
+#: A finding that IS from this rig, so the prefill lever may act on it. The
+#: slopes are the reference rig's, but the point of the fixture is the
+#: provenance, not the values.
+LOCAL = CrossoverFinding(
+    rig=RigDescriptor(
+        cards=("card A", "card B", "card B"),
+        model="a-model",
+        quant="fp8",
+        tp_size=3,
+        base_vector=(63, 37, 36),
+    ),
+    points=list(REFERENCE_FINDING.points),
+    provenance=MEASURED_HERE,
+    measured_at=time.time(),
+    cache_bypass_proven=True,
+)
+
+
+def _lever(key, **kw):
+    kw.setdefault("probe", PROBE)
+    return [x for x in suggest_levers(keys=[key], **kw) if x.lever.key == key][0]
 
 
 class TestLeverDefinitions(CustomTestCase):
@@ -120,11 +152,19 @@ class TestStaging(CustomTestCase):
         self.assertNotIn("--rank-perf-tune", " ".join(s.command_flags))
 
     def test_with_a_probe_suggestions_become_concrete(self):
-        s = [x for x in suggest_levers(probe=PROBE) if x.lever.key == "prefill_speed"][0]
+        s = [x for x in suggest_levers(probe=PROBE) if x.lever.key == "decode_speed"][0]
         self.assertEqual(s.stage, RATES_KNOWN)
         self.assertEqual(s.confidence, Confidence.DETAILED)
-        self.assertIn("--rank-perf-tune enc", " ".join(s.command_flags))
+        self.assertIn("--rank-kv-ratio speed", " ".join(s.command_flags))
         self.assertIn("Price:", s.statement)
+
+    def test_a_probe_alone_does_not_make_the_prefill_lever_concrete(self):
+        """Card rates say which rank is compute-strong. They do not say what
+        concentrating onto it costs in decode, and that term is half the
+        decision."""
+        s = _lever("prefill_speed", probe=PROBE)
+        self.assertEqual(s.stage, RATES_KNOWN)
+        self.assertEqual(s.confidence, Confidence.UNMEASURED)
 
     def test_fit_levers_do_not_need_a_probe_for_their_main_flag(self):
         """Fit questions are answerable without measurement; speed questions
@@ -188,6 +228,189 @@ class TestRendering(CustomTestCase):
     def test_filtering_by_key(self):
         out = suggest_levers(probe=PROBE, keys=["energy"])
         self.assertEqual([s.lever.key for s in out], ["energy"])
+
+
+class TestThePrefillLeverDoesNotGuess(CustomTestCase):
+    """What the split costs and what it buys are both rig-specific.
+
+    The lever used to hand out a concentration vector on the strength of a
+    hardware probe alone. A probe measures cards; the crossover is a property
+    of cards plus model plus quantisation path, and a vector proposed without
+    it is a guess with a flag attached.
+    """
+
+    def test_without_a_local_crossover_no_vector_is_proposed(self):
+        s = _lever("prefill_speed")
+        self.assertEqual(s.confidence, Confidence.UNMEASURED)
+        joined = " ".join(s.command_flags)
+        self.assertNotIn("--rank-mlp-ratio", joined)
+        self.assertNotIn("--rank-perf-tune", joined)
+
+    def test_it_offers_the_measurement_instead_of_a_number(self):
+        s = _lever("prefill_speed")
+        offer = s.crossover.get("offer") or []
+        self.assertEqual({t["key"] for t in offer}, {"quick", "thorough"})
+        for t in offer:
+            self.assertGreater(t["est_runtime_min"], 0, t["key"])
+
+    def test_another_rigs_finding_does_not_unlock_it(self):
+        s = _lever(
+            "prefill_speed",
+            crossover=REFERENCE_FINDING,
+            prompt_to_output_ratio=100.0,
+        )
+        self.assertEqual(s.confidence, Confidence.UNMEASURED)
+        self.assertNotIn("--rank-mlp-ratio", " ".join(s.command_flags))
+
+    def test_a_workload_ratio_alone_does_not_unlock_it(self):
+        s = _lever("prefill_speed", prompt_to_output_ratio=100.0)
+        self.assertEqual(s.confidence, Confidence.UNMEASURED)
+        self.assertNotIn("--rank-mlp-ratio", " ".join(s.command_flags))
+
+    def test_a_local_finding_without_a_workload_shows_the_turn_and_stops(self):
+        s = _lever("prefill_speed", crossover=LOCAL)
+        self.assertNotIn("--rank-mlp-ratio", " ".join(s.command_flags))
+        self.assertIn("13.7", s.statement)
+
+    def test_below_the_turn_the_base_split_is_the_answer(self):
+        s = _lever("prefill_speed", crossover=LOCAL, prompt_to_output_ratio=4.0)
+        self.assertNotIn("--rank-mlp-ratio", " ".join(s.command_flags))
+        self.assertIn("base split", s.statement.lower())
+
+    def test_above_the_turn_it_names_the_measured_vector(self):
+        s = _lever("prefill_speed", crossover=LOCAL, prompt_to_output_ratio=16.0)
+        self.assertEqual(s.confidence, Confidence.DETAILED)
+        self.assertIn("--rank-mlp-ratio 3,1,1", " ".join(s.command_flags))
+
+    def test_the_deep_vector_needs_a_prompt_dominated_mix(self):
+        s = _lever("prefill_speed", crossover=LOCAL, prompt_to_output_ratio=100.0)
+        self.assertIn("--rank-mlp-ratio 6,1,1", " ".join(s.command_flags))
+
+    def test_a_candidate_that_is_never_best_is_never_proposed(self):
+        r = 1.0
+        while r < 400.0:
+            s = _lever("prefill_speed", crossover=LOCAL, prompt_to_output_ratio=r)
+            self.assertNotIn(
+                "--rank-mlp-ratio 4,1,1",
+                " ".join(s.command_flags),
+                f"proposed at {r}:1 although no ratio makes it the best choice",
+            )
+            r += 2.5
+
+    def test_no_flag_is_emitted_without_the_vector_it_belongs_to(self):
+        """A context budget for a concentration that is not being set is a
+        flag that says nothing, and it made the lever look resolved."""
+        for kw in (
+            {},
+            {"prompt_to_output_ratio": 100.0},
+            {"crossover": LOCAL, "prompt_to_output_ratio": 2.0},
+            {"probe": None, "crossover": LOCAL, "prompt_to_output_ratio": 100.0},
+            {"heterogeneous": False, "crossover": LOCAL,
+             "prompt_to_output_ratio": 100.0},
+        ):
+            with self.subTest(**kw):
+                s = _lever("prefill_speed", **kw)
+                if "--rank-mlp-ratio" not in " ".join(s.command_flags):
+                    self.assertEqual(s.command_flags, [])
+
+    def test_the_optimizer_is_not_asked_to_pick_the_vector(self):
+        """--rank-perf-tune runs a decode-knee guard that rejects the very
+        concentration a prompt-dominated workload justifies. Naming both would
+        emit a command whose two halves disagree."""
+        s = _lever("prefill_speed", crossover=LOCAL, prompt_to_output_ratio=100.0)
+        self.assertNotIn("--rank-perf-tune", " ".join(s.command_flags))
+
+
+class TestCounterReckoningCarriesNumbers(CustomTestCase):
+    def test_the_prefill_lever_states_what_decode_pays(self):
+        s = _lever("prefill_speed", crossover=LOCAL, prompt_to_output_ratio=100.0)
+        against = s.counter_reckoning["decode_speed"]
+        self.assertIn("%", against)
+        self.assertIn("15.5", against)
+
+    def test_without_a_measurement_it_says_the_size_is_unknown(self):
+        s = _lever("prefill_speed")
+        against = s.counter_reckoning["decode_speed"]
+        self.assertNotIn("%", against.split(".")[0])
+        self.assertIn("not measured", against.lower())
+
+    def test_the_decode_lever_states_what_prefill_is_left_on_the_table(self):
+        s = _lever("decode_speed", crossover=LOCAL)
+        self.assertIn("prefill_speed", s.counter_reckoning)
+        self.assertIn("%", s.counter_reckoning["prefill_speed"])
+
+    def test_every_lever_still_names_at_least_one_opposing_direction(self):
+        for s in suggest_levers(probe=PROBE, crossover=LOCAL):
+            if s.confidence == Confidence.BLOCKED:
+                continue
+            self.assertTrue(s.counter_reckoning, s.lever.key)
+
+
+class TestMeasuredAgainstModelled(CustomTestCase):
+    def test_every_evidence_entry_declares_which_it_is(self):
+        for s in suggest_levers(probe=PROBE, crossover=LOCAL):
+            for e in s.evidence:
+                self.assertIn(e.kind, (MEASURED, MODELLED), s.lever.key)
+
+    def test_a_measured_entry_carries_its_setup(self):
+        for s in suggest_levers(probe=PROBE, crossover=LOCAL):
+            for e in s.evidence:
+                if e.kind == MEASURED:
+                    self.assertTrue(e.setup, f"{s.lever.key}: {e.statement}")
+
+    def test_a_modelled_entry_carries_its_known_error(self):
+        for s in suggest_levers(probe=PROBE, crossover=LOCAL):
+            for e in s.evidence:
+                if e.kind == MODELLED:
+                    self.assertTrue(e.caveat, f"{s.lever.key}: {e.statement}")
+
+    def test_the_prefill_model_bias_is_on_the_prefill_lever(self):
+        s = _lever("prefill_speed", crossover=LOCAL, prompt_to_output_ratio=100.0)
+        modelled = [e for e in s.evidence if e.kind == MODELLED]
+        self.assertTrue(modelled)
+        self.assertTrue(any("1.8" in e.caveat for e in modelled))
+
+    def test_no_lever_prints_a_modelled_net(self):
+        """The decode half of the cost model is fitted to measurement and the
+        prefill half is not, so their difference has no bound."""
+        for s in suggest_levers(probe=PROBE, crossover=LOCAL):
+            for e in s.evidence:
+                if e.kind != MODELLED:
+                    continue
+                self.assertNotIn("net", e.statement.lower(), s.lever.key)
+
+    def test_the_rendered_text_labels_both_kinds(self):
+        txt = render_levers_text(
+            suggest_levers(
+                probe=PROBE,
+                crossover=LOCAL,
+                prompt_to_output_ratio=100.0,
+                keys=["prefill_speed"],
+            )
+        )
+        self.assertIn("[measured]", txt)
+        self.assertIn("[modelled]", txt)
+
+    def test_a_borrowed_finding_is_rendered_as_another_rigs(self):
+        txt = render_levers_text(
+            suggest_levers(
+                probe=PROBE, crossover=REFERENCE_FINDING, keys=["prefill_speed"]
+            )
+        )
+        self.assertIn("another rig", txt.lower())
+
+    def test_json_carries_the_evidence_and_the_crossover(self):
+        d = _lever("prefill_speed", crossover=LOCAL).to_json()
+        self.assertIn("evidence", d)
+        self.assertIn("crossover", d)
+        for e in d["evidence"]:
+            self.assertIn(e["kind"], (MEASURED, MODELLED))
+
+
+class TestEvidenceType(CustomTestCase):
+    def test_an_unknown_kind_is_refused(self):
+        with self.assertRaises(ValueError):
+            Evidence(kind="a hunch", statement="x")
 
 
 if __name__ == "__main__":

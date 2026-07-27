@@ -1,0 +1,188 @@
+{
+ "_": [
+  "MLP-split crossover, thorough tier: the per-candidate break-even table and",
+  "the envelope. Four arms, three concentration vectors.",
+  "",
+  "Read the quick tier's file first -- the reasoning, the cache-bypass proof",
+  "and the pinned KV ownership vector are the same and are not repeated here.",
+  "",
+  "WHAT THIS TIER ADDS. Three candidates instead of one, so the result is not",
+  "a single break-even but an envelope: which vector is the best choice at",
+  "which prompt:output mix, and which candidate is never the best choice at",
+  "any mix and is therefore not proposable at all. That last verdict is",
+  "structural and needs at least three candidates to be visible.",
+  "",
+  "WHAT ONE INVOCATION COVERS. One point, all four arms interleaved. The",
+  "point below is the prefill half at 4000 prompt tokens. The full space:",
+  "  phase=random-ids output_tokens=1   prompt_tokens=500",
+  "  phase=random-ids output_tokens=1   prompt_tokens=1000",
+  "  phase=random-ids output_tokens=1   prompt_tokens=2000",
+  "  phase=random-ids output_tokens=1   prompt_tokens=4000   (this file)",
+  "  phase=random-ids output_tokens=1   prompt_tokens=8000",
+  "  phase=random-ids output_tokens=1   prompt_tokens=11000",
+  "  phase=random     output_tokens=256 prompt_tokens=400",
+  "",
+  "TIME. 3 noise-floor boots + 2 interleaved repeats over 4 arms = 11 boots",
+  "per point, 7 points = 77 boots. At ~3.5 min per boot that is ~270 min.",
+  "Run it overnight, or run the quick tier first and only come back here if",
+  "the quick tier found a crossover worth locating precisely.",
+  "",
+  "STOPPING EARLY IS ALLOWED AND IS IN THE SCENARIO. The prefill gain is a",
+  "SLOPE difference and saturates as a percentage past roughly 2000 tokens.",
+  "Once two consecutive lengths give the same per-prompt-token slope inside",
+  "the prefill noise floor, the remaining lengths cost time and add nothing.",
+  "",
+  "SPECULATION IS ON in the decode point of this tier, which is why the",
+  "decode metric is ms per SPECULATIVE STEP rather than ms per output token:",
+  "under speculation the per-token time fuses accept length with step time",
+  "and the two arms need not have the same accept length."
+ ],
+ "scenario": "mlp_split_crossover",
+ "point": {
+  "phase": "random-ids",
+  "prompt_tokens": 4000,
+  "output_tokens": 1
+ },
+ "policy": {
+  "noise_floor_boots": 3,
+  "comparison_repeats": 2,
+  "num_prompts": 12,
+  "settle_s": 8,
+  "reset_kv_budget": true,
+  "pin_token_vector": "2,3,3",
+  "own_vram_timeout_s": 180,
+  "budget": {
+   "target_low_s": 10.0,
+   "target_high_s": 25.0,
+   "ceiling_s": 90.0
+  },
+  "env": {
+   "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1",
+   "SGLANG_UNEVEN_DCP": "1",
+   "SGLANG_UNEVEN_DCP_WEIGHTED": "1",
+   "SGLANG_UNEVEN_TOKEN_VECTOR": "2,3,3",
+   "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+  }
+ },
+ "arms": [
+  {
+   "label": "base",
+   "note": "reference: the plain VRAM-proportional split, no MLP concentration",
+   "settings": {
+    "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8",
+    "served_model_name": "Qwen3.6-27B",
+    "tp_size": 3,
+    "rank_gpu_id": [0, 1, 2],
+    "rank_tp_ratio": "auto",
+    "kv_cache_dtype": "fp8_e5m2",
+    "context_length": 262144,
+    "max_running_requests": 2,
+    "spec_mode": "off",
+    "trust_remote_code": true,
+    "host": "127.0.0.1",
+    "port": 30000,
+    "python_exe": "/spinning/htsglang-gpu/.venv/bin/python",
+    "extra_flags": [
+     "--enable-metrics-for-all-schedulers",
+     "--max-total-tokens", "16384"
+    ]
+   },
+   "conditions": {
+    "model": "Qwen3.6-27B-FP8",
+    "quant": "fp8",
+    "mlp_vector": "base",
+    "kv_ownership": "pinned 2,3,3"
+   }
+  },
+  {
+   "label": "mlp-3-1-1",
+   "note": "candidate: mild concentration on rank 0",
+   "settings": {
+    "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8",
+    "served_model_name": "Qwen3.6-27B",
+    "tp_size": 3,
+    "rank_gpu_id": [0, 1, 2],
+    "rank_tp_ratio": "auto",
+    "kv_cache_dtype": "fp8_e5m2",
+    "context_length": 262144,
+    "max_running_requests": 2,
+    "spec_mode": "off",
+    "trust_remote_code": true,
+    "host": "127.0.0.1",
+    "port": 30000,
+    "python_exe": "/spinning/htsglang-gpu/.venv/bin/python",
+    "extra_flags": [
+     "--enable-metrics-for-all-schedulers",
+     "--max-total-tokens", "16384",
+     "--rank-mlp-ratio", "3,1,1"
+    ]
+   },
+   "conditions": {
+    "model": "Qwen3.6-27B-FP8",
+    "quant": "fp8",
+    "mlp_vector": "3,1,1",
+    "kv_ownership": "pinned 2,3,3"
+   }
+  },
+  {
+   "label": "mlp-4-1-1",
+   "note": "candidate: the intermediate step, kept so the envelope can be drawn rather than assumed",
+   "settings": {
+    "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8",
+    "served_model_name": "Qwen3.6-27B",
+    "tp_size": 3,
+    "rank_gpu_id": [0, 1, 2],
+    "rank_tp_ratio": "auto",
+    "kv_cache_dtype": "fp8_e5m2",
+    "context_length": 262144,
+    "max_running_requests": 2,
+    "spec_mode": "off",
+    "trust_remote_code": true,
+    "host": "127.0.0.1",
+    "port": 30000,
+    "python_exe": "/spinning/htsglang-gpu/.venv/bin/python",
+    "extra_flags": [
+     "--enable-metrics-for-all-schedulers",
+     "--max-total-tokens", "16384",
+     "--rank-mlp-ratio", "4,1,1"
+    ]
+   },
+   "conditions": {
+    "model": "Qwen3.6-27B-FP8",
+    "quant": "fp8",
+    "mlp_vector": "4,1,1",
+    "kv_ownership": "pinned 2,3,3"
+   }
+  },
+  {
+   "label": "mlp-6-1-1",
+   "note": "candidate: deep concentration on rank 0",
+   "settings": {
+    "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8",
+    "served_model_name": "Qwen3.6-27B",
+    "tp_size": 3,
+    "rank_gpu_id": [0, 1, 2],
+    "rank_tp_ratio": "auto",
+    "kv_cache_dtype": "fp8_e5m2",
+    "context_length": 262144,
+    "max_running_requests": 2,
+    "spec_mode": "off",
+    "trust_remote_code": true,
+    "host": "127.0.0.1",
+    "port": 30000,
+    "python_exe": "/spinning/htsglang-gpu/.venv/bin/python",
+    "extra_flags": [
+     "--enable-metrics-for-all-schedulers",
+     "--max-total-tokens", "16384",
+     "--rank-mlp-ratio", "6,1,1"
+    ]
+   },
+   "conditions": {
+    "model": "Qwen3.6-27B-FP8",
+    "quant": "fp8",
+    "mlp_vector": "6,1,1",
+    "kv_ownership": "pinned 2,3,3"
+   }
+  }
+ ]
+}

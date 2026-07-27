@@ -40,6 +40,22 @@ questions do. So an unprobed rig gets a deliberately vague suggestion, and the
 detailed one unlocks only once measurements exist. The staging is not a UI
 nicety; it is a statement about what is answerable.
 
+The prefill lever adds a third stage, because rates alone do not settle it. A
+probe says which rank is compute-strong; it does not say what moving weight
+onto that rank costs in decode, and that term is half the decision. Both terms
+depend on the card mix, the interconnect, the model and which quantisation
+lane each rank runs, so they have to be measured on the rig they are claimed
+for (:mod:`sglang.srt.planner.crossover`). Until they are, the lever proposes
+nothing and offers the measurement instead — a guessed turning point is worse
+than a missing one, and this lever previously handed out a concentration
+vector on the strength of a card probe alone.
+
+**Measured and modelled are never printed the same way.** Every figure a lever
+shows carries an :class:`Evidence` kind. A measured one names its setup; a
+modelled one names its known error. The cost model behind this feature is
+calibrated on its decode side and not on its prefill side, so a modelled NET
+of the two is not shown at all.
+
 **Gated by the build.** A lever that emits a flag this build does not have is
 worse than no lever at all. Every flag a lever wants is checked against
 ``ServerArgs`` (:func:`flag_available`), and a lever whose central knob is
@@ -66,8 +82,20 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Dict, List, Optional, Sequence
 
+from sglang.srt.planner.crossover import (
+    EVIDENCE_KINDS,
+    MEASURED,
+    MODELLED,
+    MODELLED_DECODE_NOTE,
+    MODELLED_NET_REFUSED,
+    MODELLED_PREFILL_NOTE,
+    STUDY_TIERS,
+    CrossoverFinding,
+)
+
 __all__ = [
     "Confidence",
+    "Evidence",
     "FlagSpec",
     "Lever",
     "LeverSuggestion",
@@ -89,6 +117,46 @@ class Confidence:
     VAGUE = "vague"
     DETAILED = "detailed"
     BLOCKED = "blocked"
+    #: The direction is real and the knob exists, but its SIZE has not been
+    #: measured on this rig and cannot be derived from what has. Distinct from
+    #: VAGUE, which is "no probe yet", and from BLOCKED, which is "this build
+    #: cannot do it at all".
+    UNMEASURED = "unmeasured"
+
+
+@dataclasses.dataclass(frozen=True)
+class Evidence:
+    """One figure a lever leans on, and where it came from.
+
+    ``kind`` is the whole point. A measured figure has to name the setup it
+    was taken on, because a number without its conditions travels further than
+    it should; a modelled figure has to name the error it is known to carry,
+    because otherwise a reader treats a prediction as a result.
+    """
+
+    kind: str
+    statement: str
+    #: For measured figures: rig, model, method. Required.
+    setup: str = ""
+    #: For modelled figures: the known bias or the missing calibration.
+    #: Required.
+    caveat: str = ""
+
+    def __post_init__(self):
+        if self.kind not in EVIDENCE_KINDS:
+            raise ValueError(
+                f"unknown evidence kind {self.kind!r}; one of "
+                f"{', '.join(EVIDENCE_KINDS)}"
+            )
+
+    def render(self) -> str:
+        tail = f" ({self.setup})" if self.setup else ""
+        if self.caveat:
+            tail += f" — {self.caveat}"
+        return f"[{self.kind}] {self.statement}{tail}"
+
+    def to_json(self) -> dict:
+        return dataclasses.asdict(self)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,6 +172,9 @@ class FlagSpec:
     heterogeneous_only: bool = False
     #: Requires measured per-card rates (i.e. a probe).
     needs_probe: bool = False
+    #: Requires a crossover measured on THIS rig plus a workload mix that
+    #: clears it. Cards alone do not answer the question this flag settles.
+    needs_workload: bool = False
 
     def render(self) -> str:
         return f"{self.flag} {self.value}" if self.value is not None else self.flag
@@ -131,6 +202,8 @@ class Lever:
     #: Preconditions beyond flags (topology, a second node, ...).
     preconditions: List[str] = dataclasses.field(default_factory=list)
     notes: List[str] = dataclasses.field(default_factory=list)
+    #: Every figure this lever leans on, labelled measured or modelled.
+    evidence: List[Evidence] = dataclasses.field(default_factory=list)
 
     def to_json(self) -> dict:
         return {
@@ -144,6 +217,7 @@ class Lever:
             "vague_statement": self.vague_statement,
             "preconditions": list(self.preconditions),
             "notes": list(self.notes),
+            "evidence": [e.to_json() for e in self.evidence],
         }
 
 
@@ -333,6 +407,21 @@ _register(
             "accept length the decode optimum drifts toward the compute "
             "proportion, i.e. toward the prefill lever.",
         ],
+        evidence=[
+            Evidence(
+                kind=MEASURED,
+                statement=(
+                    "Moving the KV ownership vector from [2,3,3] to [2,1,1] "
+                    "cut the context-dependent part of the decode step by "
+                    "24.5 % (2.296 -> 1.732 ms), -2.5 % end to end, growing "
+                    "linearly with resident context."
+                ),
+                setup=(
+                    "27B FP8, TP=3 uneven DCP, 120 k resident tokens, bs=1, no "
+                    "speculation, against a 1.07 % boot-to-boot noise floor"
+                ),
+            ),
+        ],
     )
 )
 
@@ -343,53 +432,83 @@ _register(
         maximises="prompt throughput",
         flags=[
             FlagSpec(
-                "--rank-tp-ratio",
-                "auto-performance",
-                "rank_tp_ratio",
-                why="Runs the split optimiser instead of the plain "
-                "VRAM-proportional split.",
+                "--rank-mlp-ratio",
+                None,  # filled from the measured crossover, or not at all
+                "rank_mlp_ratio",
+                why="Dense-MLP units concentrated on the compute-strong rank. "
+                "The vector is not a constant: it comes from this rig's "
+                "measured crossover and from the workload's prompt:output "
+                "mix, and no vector is emitted without both.",
                 heterogeneous_only=True,
                 needs_probe=True,
-            ),
-            FlagSpec(
-                "--rank-perf-tune",
-                "enc",
-                "rank_perf_tune",
-                why="Family-selective MLP concentration toward the "
-                "compute-strong ranks — the measured prefill lever.",
-                needs_probe=True,
+                needs_workload=True,
             ),
             FlagSpec(
                 "--rank-perf-loose-ctx-percent",
                 "15",
                 "rank_perf_loose_ctx_percent",
-                why="Allows the optimiser to spend some context on compute "
-                "concentration.",
+                why="Bounds how much context the concentration may spend. "
+                "Gated exactly like the vector it bounds: a context budget "
+                "emitted without a concentration to bound is a flag that says "
+                "nothing.",
+                heterogeneous_only=True,
+                needs_probe=True,
+                needs_workload=True,
             ),
         ],
         gains=[
             "Concentrates MLP mass on the compute-strong card, which is where "
             "prefill time is spent.",
-            "The compute ratio between card classes spreads wider than the "
-            "bandwidth ratio, so this lever moves further from an even split "
-            "than the decode lever does.",
+            "The gain is a change of the prefill SLOPE, so it applies to every "
+            "prompt token — but for the same reason it saturates as a "
+            "percentage and does not keep growing with prompt length.",
         ],
         costs=[
-            "The decode split ends up off its optimum — one static weight "
-            "split cannot sit at both.",
+            "Decode pays per output token: the concentrated rank streams more "
+            "weight bytes every step and paces the group in lockstep.",
             "Context is spent: concentrating mass on one card lowers the "
             "min-synced pool.",
+            "The trade only turns positive above a prompt:output ratio that is "
+            "specific to the rig, the model and the quantisation path, so it "
+            "is not a general default.",
         ],
         tradeoff_against={
             "context": "Concentration reduces the min-synced KV pool.",
-            "decode_speed": "One static split cannot hold both optima; "
-            "chunked prefill mixes the phases in one batch, so the operating "
-            "point is a weighted mean rather than either optimum.",
+            "decode_speed": "Directly opposed, per output token. One static "
+            "split cannot hold both optima, and chunked prefill mixes the "
+            "phases in one batch, so the operating point is a weighted mean "
+            "rather than either optimum.",
         },
         vague_statement=(
             "Prefill favours the compute-strong card more strongly than decode "
             "does. By how much requires measured compute throughput per card."
         ),
+        notes=[
+            "The vector is set directly rather than through "
+            "--rank-perf-tune. The optimiser's decode-knee guard rejects "
+            "concentration on the decode evidence alone, which is correct for "
+            "a decode-balanced objective; a prompt-dominated workload is the "
+            "evidence that overrides it, and that evidence lives outside the "
+            "optimiser.",
+        ],
+        evidence=[
+            Evidence(
+                kind=MODELLED,
+                statement=(
+                    "The optimiser predicts a prefill gain per candidate "
+                    "vector at parse time."
+                ),
+                caveat=MODELLED_PREFILL_NOTE,
+            ),
+            Evidence(
+                kind=MODELLED,
+                statement=(
+                    "The optimiser predicts a decode cost per candidate "
+                    "vector at parse time."
+                ),
+                caveat=MODELLED_DECODE_NOTE + " " + MODELLED_NET_REFUSED,
+            ),
+        ],
     )
 )
 
@@ -514,6 +633,11 @@ class LeverSuggestion:
     unavailable_flags: List[Dict[str, str]]
     unmet_preconditions: List[str]
     counter_reckoning: Dict[str, str]
+    #: Every figure behind this suggestion, labelled measured or modelled.
+    evidence: List[Evidence] = dataclasses.field(default_factory=list)
+    #: The crossover resolution: what is known, what is offered, what was
+    #: chosen. Empty for levers that do not depend on it.
+    crossover: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def to_json(self) -> dict:
         return {
@@ -530,7 +654,189 @@ class LeverSuggestion:
             "costs": list(self.lever.costs),
             "counter_reckoning": dict(self.counter_reckoning),
             "notes": list(self.lever.notes),
+            "evidence": [e.to_json() for e in self.evidence],
+            "crossover": dict(self.crossover),
         }
+
+
+# ---------------------------------------------------------------------------
+# The crossover, resolved against this rig and this workload
+# ---------------------------------------------------------------------------
+
+
+def _pct(value: Optional[float]) -> str:
+    return "unmeasured" if value is None else f"{value:+.1f} %"
+
+
+def _resolve_crossover(
+    finding: Optional[CrossoverFinding],
+    prompt_to_output_ratio: Optional[float],
+) -> Dict[str, Any]:
+    """What may be said about MLP concentration right now.
+
+    Returns a dict with ``usable`` (may a vector be proposed at all),
+    ``chosen`` (the vector, or None), ``table`` (every candidate with its two
+    slopes and its break-even) and ``offer`` (the study tiers, when there is
+    nothing to go on). The three refusals are separate on purpose: no finding,
+    a finding from elsewhere, and a workload that does not clear the turn are
+    different situations and read differently.
+    """
+    tiers = [t.to_json() for t in STUDY_TIERS]
+    if finding is None:
+        return {
+            "state": "unmeasured",
+            "usable": False,
+            "chosen": None,
+            "offer": tiers,
+            "reason": (
+                "This rig has no measured crossover. What the concentration "
+                "buys in prefill and costs in decode both depend on the card "
+                "mix, the model and the quantisation lane each rank runs, so "
+                "neither can be derived from the hardware probe."
+            ),
+        }
+    caveats = finding.caveats()
+    if not finding.usable_for_advice():
+        return {
+            "state": "not_usable",
+            "usable": False,
+            "chosen": None,
+            "rig": finding.rig.label(),
+            "provenance": finding.provenance,
+            "caveats": caveats,
+            "table": finding.break_even_table(),
+            "offer": tiers,
+            "reason": caveats[0] if caveats else "the finding cannot be used",
+        }
+    table = finding.break_even_table()
+    proposable = [
+        r for r in table
+        if r["proposable"] and r["break_even_prompt_to_output"] is not None
+    ]
+    cheapest = min(
+        (r["break_even_prompt_to_output"] for r in proposable), default=None
+    )
+    out: Dict[str, Any] = {
+        "state": "measured_here",
+        "usable": True,
+        "chosen": None,
+        "rig": finding.rig.label(),
+        "age_days": round(finding.age_s() / 86400.0, 1),
+        "caveats": caveats,
+        "table": table,
+        "cheapest_break_even": cheapest,
+        "dropped": [
+            {"vector": v, "reason": why} for v, why in finding.pruned()
+        ],
+        "offer": [],
+    }
+    if prompt_to_output_ratio is None:
+        out["reason"] = (
+            "No workload mix given. The turn is known; which side of it this "
+            "server runs on is not."
+        )
+        return out
+    out["prompt_to_output_ratio"] = float(prompt_to_output_ratio)
+    best = finding.best_for_ratio(float(prompt_to_output_ratio))
+    if best is None:
+        out["reason"] = (
+            f"At {float(prompt_to_output_ratio):.1f}:1 prompt to output every "
+            "candidate is a net loss"
+            + (f"; the cheapest turns at {cheapest:.1f}:1." if cheapest else ".")
+        )
+        return out
+    out["chosen"] = {
+        "vector": best.label(),
+        "break_even": best.break_even_ratio,
+        "net_ms_per_output_token": best.net_ms_per_output_token(
+            float(prompt_to_output_ratio)
+        ),
+        "prefill_gain_pct": best.prefill_gain_pct,
+        "decode_cost_pct": best.decode_cost_pct,
+    }
+    return out
+
+
+def _crossover_evidence(res: Dict[str, Any]) -> List[Evidence]:
+    """The measured half of the prefill lever's evidence, if it exists."""
+    if not res or res.get("state") not in ("measured_here", "not_usable"):
+        return []
+    rig = res.get("rig", "unknown rig")
+    elsewhere = res.get("provenance") == "measured_elsewhere"
+    setup = (
+        f"another rig: {rig}" if elsewhere else f"{rig}, measured {res.get('age_days')} days ago"
+    )
+    out = []
+    for row in res.get("table") or []:
+        be = row["break_even_prompt_to_output"]
+        out.append(
+            Evidence(
+                kind=MEASURED,
+                statement=(
+                    f"{row['vector']}: prefill {_pct(row['prefill_gain_pct'])}, "
+                    f"decode {_pct(row['decode_cost_pct'])}, break-even "
+                    + (f"{be:.1f}:1 prompt to output" if be is not None
+                       else "never")
+                    + ("" if row["proposable"] else " — not proposable, "
+                       + row["dropped_because"])
+                ),
+                setup=setup,
+            )
+        )
+    for c in res.get("caveats") or []:
+        out.append(Evidence(kind=MEASURED, statement=c, setup=setup))
+    return out
+
+
+def _counter_reckoning(
+    lever: Lever, res: Dict[str, Any]
+) -> Dict[str, str]:
+    """The per-opposing-lever price, with this rig's numbers where they exist.
+
+    The prose in ``tradeoff_against`` says which direction the conflict runs.
+    What it costs is a measurement, and stays absent — explicitly — until one
+    exists for this rig.
+    """
+    out = dict(lever.tradeoff_against)
+    if lever.key not in ("prefill_speed", "decode_speed"):
+        return out
+    rows = [
+        r for r in (res.get("table") or [])
+        if r["proposable"] and r["break_even_prompt_to_output"] is not None
+    ]
+    usable = res.get("usable") and rows
+    if lever.key == "prefill_speed":
+        if usable:
+            span = "; ".join(
+                f"{r['vector']} costs {_pct(r['decode_cost_pct'])} decode for "
+                f"{_pct(r['prefill_gain_pct'])} prefill, turning at "
+                f"{r['break_even_prompt_to_output']:.1f}:1"
+                for r in rows
+            )
+            out["decode_speed"] = (
+                out.get("decode_speed", "") + " Measured here: " + span + "."
+            )
+        else:
+            out["decode_speed"] = (
+                out.get("decode_speed", "")
+                + " How much it costs is not measured on this rig; run the "
+                "crossover study before spending decode for prefill."
+            )
+    else:
+        if usable:
+            best = max(rows, key=lambda r: r["prefill_gain_pct"] or 0.0)
+            out["prefill_speed"] = (
+                "Staying at the base split forgoes up to "
+                f"{_pct(best['prefill_gain_pct'])} prefill "
+                f"({best['vector']}), which is only worth taking above "
+                f"{best['break_even_prompt_to_output']:.1f}:1 prompt to output."
+            )
+        else:
+            out["prefill_speed"] = (
+                "What the base split forgoes in prefill is not measured on "
+                "this rig; run the crossover study to put a number on it."
+            )
+    return out
 
 
 def suggest_levers(
@@ -539,15 +845,24 @@ def suggest_levers(
     node_count: int = 1,
     facility_keys_available: Optional[Sequence[str]] = None,
     keys: Optional[Sequence[str]] = None,
+    crossover: Optional[CrossoverFinding] = None,
+    prompt_to_output_ratio: Optional[float] = None,
 ) -> List[LeverSuggestion]:
     """Resolve every lever against the evidence available right now.
 
     ``probe`` is a cached hardware-probe dict (or None). Its presence is what
     moves a lever from a vague statement to a concrete flag set — the
     structure/rates line from DESIGN_216.
+
+    ``crossover`` is this rig's measured MLP-split crossover (or None), and
+    ``prompt_to_output_ratio`` the workload's expected prompt tokens per
+    output token. The prefill lever needs both: a crossover measured
+    elsewhere, or a workload mix with no crossover behind it, each leave it
+    unresolved rather than approximately right.
     """
     stage = RATES_KNOWN if probe else STRUCTURE_ONLY
     have_facilities = set(facility_keys_available or [])
+    resolution = _resolve_crossover(crossover, prompt_to_output_ratio)
     out: List[LeverSuggestion] = []
     for key, p in LEVERS.items():
         if keys and key not in keys:
@@ -565,7 +880,9 @@ def suggest_levers(
             }
             for f in missing
         ]
+        chosen = (resolution.get("chosen") or {}).get("vector")
         flags: List[str] = []
+        withheld_for_workload = False
         for f in p.flags:
             if f in missing:
                 continue
@@ -573,6 +890,13 @@ def suggest_levers(
                 continue
             if f.needs_probe and not probe:
                 continue
+            if f.needs_workload:
+                if not chosen:
+                    withheld_for_workload = True
+                    continue
+                if f.value is None:
+                    flags.append(f"{f.flag} {chosen}")
+                    continue
             if f.value is None:
                 continue
             flags.append(f.render())
@@ -585,6 +909,12 @@ def suggest_levers(
             elif "power-target" in low and "power_target" not in have_facilities:
                 unmet.append(pre)
 
+        uses_crossover = any(f.needs_workload for f in p.flags)
+        lever_res = resolution if uses_crossover else {}
+        evidence = list(p.evidence)
+        if uses_crossover:
+            evidence = _crossover_evidence(resolution) + evidence
+
         if unavailable and not flags:
             confidence = Confidence.BLOCKED
             statement = (
@@ -594,6 +924,15 @@ def suggest_levers(
         elif stage == STRUCTURE_ONLY:
             confidence = Confidence.VAGUE
             statement = p.vague_statement
+        elif withheld_for_workload and _answered(resolution):
+            # The crossover IS measured and the workload IS known; the answer
+            # is simply that no concentration pays here. That is a resolved
+            # lever with an empty flag set, not an unmeasured one.
+            confidence = Confidence.DETAILED
+            statement = _base_split_statement(p, resolution)
+        elif withheld_for_workload:
+            confidence = Confidence.UNMEASURED
+            statement = _unmeasured_statement(p, resolution)
         else:
             confidence = Confidence.DETAILED
             statement = (
@@ -601,6 +940,14 @@ def suggest_levers(
                 + (f"Set: {' '.join(flags)}. " if flags else "")
                 + f"Price: {p.costs[0]}"
             )
+            if uses_crossover and resolution.get("chosen"):
+                ch = resolution["chosen"]
+                statement += (
+                    f" At {resolution['prompt_to_output_ratio']:.1f}:1 prompt "
+                    f"to output, {ch['vector']} nets "
+                    f"{ch['net_ms_per_output_token']:.3f} ms per output token "
+                    f"over the base split; it turns at {ch['break_even']:.1f}:1."
+                )
         out.append(
             LeverSuggestion(
                 lever=p,
@@ -610,10 +957,64 @@ def suggest_levers(
                 command_flags=flags,
                 unavailable_flags=unavailable,
                 unmet_preconditions=unmet,
-                counter_reckoning=dict(p.tradeoff_against),
+                counter_reckoning=_counter_reckoning(p, resolution),
+                evidence=evidence,
+                crossover=lever_res,
             )
         )
     return out
+
+
+def _answered(res: Dict[str, Any]) -> bool:
+    """Is the crossover question settled for this rig and this workload?"""
+    return bool(res.get("usable")) and res.get("prompt_to_output_ratio") is not None
+
+
+def _base_split_statement(lever: Lever, res: Dict[str, Any]) -> str:
+    """The answer when the workload sits below every candidate's turn."""
+    cheapest = res.get("cheapest_break_even")
+    return (
+        f"{lever.label}: at {res['prompt_to_output_ratio']:.1f}:1 prompt to "
+        "output the base split is the faster configuration on this rig"
+        + (f"; the cheapest candidate turns at {cheapest:.1f}:1" if cheapest
+           else "")
+        + f". Measured on {res['rig']}, {res['age_days']} days ago. "
+        "No concentration flag is set."
+    )
+
+
+def _unmeasured_statement(lever: Lever, res: Dict[str, Any]) -> str:
+    """What the prefill lever says when it declines to propose a vector."""
+    head = (
+        f"{lever.label}: concentrating MLP weight on the compute-strong rank "
+        "buys prefill per prompt token and costs decode per output token. "
+    )
+    state = res.get("state")
+    if state == "measured_here":
+        rows = [
+            r for r in res.get("table") or []
+            if r["proposable"] and r["break_even_prompt_to_output"] is not None
+        ]
+        turns = ", ".join(
+            f"{r['vector']} at {r['break_even_prompt_to_output']:.1f}:1"
+            for r in rows
+        )
+        return (
+            head
+            + f"Measured on this rig ({res['rig']}, {res['age_days']} days "
+            f"ago), the turn sits at: {turns}. "
+            + str(res.get("reason", ""))
+            + " Pass the expected prompt:output mix to get a vector, or none."
+        )
+    tiers = ", ".join(
+        f"{t['label']} ~{t['est_runtime_min']} min" for t in res.get("offer") or []
+    )
+    return (
+        head
+        + str(res.get("reason", ""))
+        + (f" Measure it: {tiers}." if tiers else "")
+        + " No vector is proposed until then; the base split stands."
+    )
 
 
 def render_levers_text(suggestions: Sequence[LeverSuggestion]) -> str:
@@ -637,7 +1038,14 @@ def render_levers_text(suggestions: Sequence[LeverSuggestion]) -> str:
             lines.append(f"  unavailable: {u['flag']} — {u['reason']}")
         for pre in s.unmet_preconditions:
             lines.append(f"  precondition unmet: {pre}")
+        for e in s.evidence:
+            lines.append(f"  {e.render()}")
         for k, v in s.counter_reckoning.items():
             lines.append(f"  costs {k}: {v}")
+        for t in s.crossover.get("offer") or []:
+            lines.append(
+                f"  measure it: {t['label']} ~{t['est_runtime_min']} min "
+                f"({t['study_file']}) — {t['what']}"
+            )
         lines.append("")
     return "\n".join(lines)

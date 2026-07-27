@@ -94,6 +94,11 @@
     <h2>Plan detail (from boot log)</h2>
     <div id="plantable"></div>
   </section>
+
+  <section class="panel">
+    <h2>MLP-split crossover</h2>
+    <div id="crossover"></div>
+  </section>
 </main>
 <div class="tip" id="tip"></div>
 <script>
@@ -250,6 +255,34 @@ function renderTable(s){
   <table><thead><tr><th>rank</th><th>GPU</th><th>weights GB</th><th>draft GB</th><th>KV GB</th><th>KV tok</th><th>mamba GB</th><th>free GB</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
+// ---- MLP-split crossover ----
+// Concentrating MLP units on the compute-strong rank buys prefill per prompt
+// token and costs decode per output token. Both slopes are rig-specific, so
+// this panel either shows a measurement taken HERE or says there is none and
+// offers to run it. It never fills the gap with a number from elsewhere, and
+// a finding that is stale or was taken under throttling is shown with that
+// stated rather than quietly used.
+function renderCrossover(s){
+  const box=document.getElementById('crossover'); box.innerHTML='';
+  const c=s.crossover;
+  if(!c){box.innerHTML='<div class="note">not reported by this server</div>';return;}
+  const parts=[];
+  if(c.usable){
+    parts.push(`<div class="note">measured on this rig — ${esc(c.rig)} · ${fmt(c.age_days,1)} days old</div>`);
+  }else if(c.state==='unavailable'){
+    parts.push('<div class="note">crossover module not importable here</div>');
+  }else{
+    parts.push('<div class="note">not measured on this rig. No concentration vector is proposed; the base split stands.</div>');
+  }
+  (c.caveats||[]).forEach(x=>parts.push(`<div class="note">! ${esc(x)}</div>`));
+  if((c.table||[]).length){
+    const rows=c.table.map(r=>`<tr><td>${esc(r.vector)}</td><td>${r.prefill_gain_pct!=null?fmt(r.prefill_gain_pct,1)+'%':'-'}</td><td>${r.decode_cost_pct!=null?fmt(r.decode_cost_pct,1)+'%':'-'}</td><td>${r.break_even_prompt_to_output!=null?fmt(r.break_even_prompt_to_output,1)+':1':'never'}</td><td>${r.proposable?'yes':'no — '+esc(r.dropped_because)}</td></tr>`).join('');
+    parts.push(`<table><thead><tr><th>vector</th><th>prefill</th><th>decode</th><th>break-even prompt:output</th><th>proposable</th></tr></thead><tbody>${rows}</tbody></table>`);
+  }
+  (c.offer||[]).forEach(t=>parts.push(`<div class="note">measure it — ${esc(t.label)}, ~${t.est_runtime_min} min (${esc(t.study_file)}): ${esc(t.what)}</div>`));
+  box.innerHTML=parts.join('');
+}
+
 async function tick(){
   try{
     const s=await (await fetch('/api/state')).json();
@@ -257,7 +290,7 @@ async function tick(){
     const srv=document.getElementById('srv');srv.textContent=s.server&&s.server.up?'server up':'server down';srv.className='pill '+(s.server&&s.server.up?'up':'down');
     document.getElementById('nvmlsrc').textContent='nvml: '+(s.nvml_source||'?');
     document.getElementById('ts').textContent=new Date(s.ts*1000).toLocaleTimeString();
-    renderNums(s);renderGPUs(s);renderDist(s);renderTokens(s);renderTable(s);
+    renderNums(s);renderGPUs(s);renderDist(s);renderTokens(s);renderTable(s);renderCrossover(s);
   }catch(e){document.getElementById('ts').textContent='fetch error';}
 }
 document.getElementById('theme').onclick=()=>{const r=document.documentElement;const cur=r.getAttribute('data-theme')|| (matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');r.setAttribute('data-theme',cur==='dark'?'light':'dark');};

@@ -470,6 +470,66 @@ def map_plan_gpus_to_nvml(plan, nvml):
     return mapping
 
 
+# ===========================================================================
+# MLP-split crossover: this rig's finding, or the offer to measure it
+# ===========================================================================
+_CROSSOVER_MOD: list = []   # memoised: [module] or [None]
+
+
+def _crossover_module():
+    """``sglang.srt.planner.crossover``, or None when it cannot be reached.
+
+    Two ways in, because the dashboard is a standalone process that is often
+    run against a checkout whose sglang is not the installed one: the package
+    import first, then the module file next to this checkout loaded directly.
+    The module is stdlib-only, so the direct load has nothing to satisfy.
+    The panel degrades to "not available" rather than taking the server down.
+    """
+    if _CROSSOVER_MOD:
+        return _CROSSOVER_MOD[0]
+    mod = None
+    try:
+        import sglang.srt.planner.crossover as mod  # noqa: PLC0415
+    except Exception:
+        import importlib.util  # noqa: PLC0415
+
+        src = os.path.join(
+            HERE, "..", "..", "python", "sglang", "srt", "planner", "crossover.py"
+        )
+        if os.path.isfile(src):
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    "_rig_dashboard_crossover", src
+                )
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = mod
+                spec.loader.exec_module(mod)
+            except Exception:
+                mod = None
+    _CROSSOVER_MOD.append(mod)
+    return mod
+
+
+def crossover_state(path=None):
+    """What the dashboard may say about MLP concentration on this rig.
+
+    Three outcomes, kept apart because they mean different things: no finding
+    at all, a finding that exists but must not be used (stale, taken under
+    throttling with no cache proof, or measured somewhere else), and a usable
+    one. The first two carry the offer to run the measurement; none of them
+    silently substitutes a number from another rig.
+    """
+    m = _crossover_module()
+    if m is None:
+        return {
+            "state": "unavailable",
+            "usable": False,
+            "caveats": ["sglang.srt.planner.crossover is not importable here"],
+            "offer": [],
+        }
+    return m.describe_evidence(m.load_finding(path))
+
+
 def build_state():
     nvml, nvml_src = sample_nvml()
     info = scrape_server_info()
@@ -503,6 +563,7 @@ def build_state():
         "plan": plan,
         # boot-time GPU index -> live NVML index (enumeration can diverge)
         "gpu_map": map_plan_gpus_to_nvml(plan, nvml),
+        "crossover": crossover_state(_CFG.get("crossover_file")),
     }
 
 
@@ -549,6 +610,12 @@ def main():
         default=os.environ.get("RIG_BOOT_LOG", ""),
         help="path to the sglang boot log for the uneven-TP plan",
     )
+    ap.add_argument(
+        "--crossover-file",
+        default=os.environ.get("RIG_CROSSOVER_FILE", ""),
+        help="path to this rig's measured MLP-split crossover "
+        "(default ~/.cache/sglang/mlp_crossover.json)",
+    )
     for k in DEFAULT_GEOMETRY:
         ap.add_argument(f"--{k.replace('_', '-')}", type=int, default=None)
     args = ap.parse_args()
@@ -560,11 +627,13 @@ def main():
             _G[k] = v
     _CFG["sglang"] = args.sglang.rstrip("/") if args.sglang else ""
     _CFG["boot_log"] = args.boot_log
+    _CFG["crossover_file"] = args.crossover_file
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Rig-Dashboard on http://{args.host}:{args.port}/")
     print(f"  sglang   : {_CFG['sglang'] or '(disabled)'}")
     print(f"  boot log : {_CFG['boot_log'] or '(none)'}")
+    print(f"  crossover: {_CFG['crossover_file'] or '(default cache path)'}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
