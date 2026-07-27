@@ -20,14 +20,18 @@ buffer, and both CUDA and ROCm implement that identically.
 
 Algorithms
 ----------
-Collectives are latency-shaped, not bandwidth-shaped, because the workload
-that matters is bs=1 decode: a TP all-reduce there is a few KiB, and the link
-is ~1.5 us / ~26.8 Gbit/s. So the default is a *single-step* full exchange --
-every rank posts all its receives and all its sends at once and progresses
-them together, costing one round trip regardless of world size. Only above
-``SGLANG_HTCCL_UCX_RING_MIB`` does all_reduce switch to a ring
-(reduce-scatter + all-gather), where the O(N) bandwidth of the flat exchange
-would start to cost more than the extra 2(N-1) steps.
+Small collectives are latency-shaped: a bs=1 decode all-reduce is a few KiB
+and the link is ~1.5 us / ~26.8 Gbit/s, so below ``SGLANG_HTCCL_UCX_RING_KIB``
+all_reduce is a *single-step* full exchange -- every rank posts all its
+receives and all its sends at once and progresses them together, one round
+trip regardless of world size.
+
+Above that threshold the flat exchange's O(N) bandwidth dominates and
+all_reduce switches to a ring (reduce-scatter + all-gather), which moves half
+the bytes at world 4 for 2(N-1) steps. The threshold is 24 KiB, measured, not
+assumed -- see ``_RING_BYTES``. A speculative verify all-reduce is well past
+it, so on a cross-rig group the ring is the ordinary decode path, not the
+large-payload exception.
 
 Version parity
 --------------
@@ -63,7 +67,29 @@ logger = logging.getLogger(__name__)
 _CHUNK_BYTES = int(os.environ.get("SGLANG_HTCCL_UCX_CHUNK_MIB", "4")) * 1024 * 1024
 
 # all_reduce switches from the one-step flat exchange to the ring above this.
-_RING_BYTES = int(os.environ.get("SGLANG_HTCCL_UCX_RING_MIB", "1")) * 1024 * 1024
+#
+# 24 KiB, not the 1 MiB this was set to originally. The 1 MiB came from the
+# reasoning that the flat exchange costs one round trip and the ring costs
+# 2(N-1), so the ring only pays once bandwidth beats latency -- correct in
+# shape, wrong in scale. The flat exchange puts (W-1) payloads on the wire in
+# each direction per collective; the ring puts 2(W-1)/W, i.e. half the bytes
+# at W=4. Measured cross-rig at world 4 (task #244, all_reduce, us, median of
+# 100 after 20 warmup, ranks 0-2 on rig 1 and rank 3 on rig 2):
+#
+#     KiB     10    16    20    24    32    40    48    64    80   128
+#     flat  57.9  75.6 101.1 117.5 125.8 207.9 225.3 319.0 385.9 646.3
+#     ring  93.3  99.6 106.6 112.3 120.9 138.8 145.2 168.5 195.0 270.4
+#
+# The two cross at ~22 KiB and the ring wins by 2x from 64 KiB up. A 4-token
+# MTP verify all-reduce on a 5120-hidden model is 80 KiB in the default fp32
+# staging -- the far side of the crossover, and the single most frequent
+# collective in a cross-rig decode.
+#
+# _KIB is the knob; _MIB stays accepted so an existing launch line keeps
+# working, and wins when both are set.
+_RING_BYTES = int(os.environ.get("SGLANG_HTCCL_UCX_RING_KIB", "24")) * 1024
+if os.environ.get("SGLANG_HTCCL_UCX_RING_MIB"):
+    _RING_BYTES = int(os.environ["SGLANG_HTCCL_UCX_RING_MIB"]) * 1024 * 1024
 
 # Matches SGLANG_HTCCL_FP32_REDUCE on the gloo plane: half/bfloat16 are summed
 # in fp32 so the accumulated error matches what NCCL would produce.
@@ -246,9 +272,9 @@ class HTCCLUcxTransport:
         self.barrier()
         logger.info(
             "HTCCL: ucx transport ready (rank %d/%d, UCX %s, chunk %d MiB, "
-            "ring threshold %d MiB).",
+            "ring threshold %d KiB).",
             self.rank, self.world_size, info["version_string"],
-            self.chunk_bytes // (1024 * 1024), self.ring_bytes // (1024 * 1024),
+            self.chunk_bytes // (1024 * 1024), self.ring_bytes // 1024,
         )
 
     # ------------------------------------------------------------------
@@ -849,6 +875,10 @@ class HTCCLUcxTransport:
                 else n
             )
             host = self._staging("ar", padded, reduce_dtype)
+            # The previous all_reduce's copy-out may still be reading this
+            # slot, and both the stage-in below and the wire (the NIC writes
+            # straight into `host`) rewrite it.
+            self._slot_guard("ar")
             host[:n].copy_(inp.reshape(-1))  # D2H (+ upcast)
             if padded > n:
                 host[n:].zero_()
@@ -858,11 +888,14 @@ class HTCCLUcxTransport:
             else:
                 self._wire_all_reduce_flat(host, seq)
 
-            # Blocking copy-out, unlike the single-chunk fast path above: this
-            # branch is the ring (>= ring_bytes) and the PIPELINE=0 A/B
-            # control, kept byte-for-byte as the pre-#246 baseline. Decode
-            # never reaches it.
-            out.reshape(-1).copy_(host[:n])  # H2D (+ downcast)
+            # Copy-out is non_blocking, like the single-chunk fast path: its
+            # only consumer is the compute stream. This branch stopped being
+            # "decode never reaches it" when the ring threshold dropped to
+            # 24 KiB (see _RING_BYTES) -- every cross-rig verify all-reduce
+            # comes through here now, and leaving the blocking copy in would
+            # have handed back one pipeline drain per collective in exchange
+            # for the bytes the ring saves.
+            self._h2d_async(out.reshape(-1), host[:n], "ar")  # (+ downcast)
             return out
 
     # ------------------------------------------------------------------

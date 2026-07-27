@@ -286,3 +286,4 @@ artifacts/
 
 # Locally measured planner results (machine-specific seed, not shipped)
 python/sglang/srt/planner/measured_results.jsonl
+scripts/r3val/logs/
