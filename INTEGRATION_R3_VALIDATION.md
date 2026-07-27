@@ -4531,3 +4531,35 @@ Traps found (all reproduced):
    group-collective family, new site.
 4. A running instance is not protected against a second instance's OOM: the
    PD server died collaterally without its own traceback.
+
+# KV handover slice (#121) — TP=1 -> TP=3 session migration WORKS, dense and MoE
+
+Umsharder implemented as an offline rewrite of the HiCache L3 file store
+(hicache_migrate.py + CLI + verify_plan; the park blob was the wrong vehicle
+— it lives in process memory and excludes the GDN state by invariant). KV
+pages are geometry-neutral in dcp_owner_mode (byte-for-byte rename); the GDN
+state is head-sharded and cut per the [qk|qk|v] sub-block rule.
+
+Proof on real blobs: permutation gate PASSED both arms (dense 27B-Q3: 296
+files, 233.4 MiB; MoE 35B-A3B: 198 files, 64.7 MiB) — byte-identical,
+exactly-once coverage, and every file a fresh TP=3 boot wrote itself already
+carried a migration-produced name. Handover protocol: cold TP=3 boot, store
+containing only migrated files, first request — cached_tokens 64 (dense) and
+192 of 194 (MoE); continuation correct and coherent (sharpest GDN-split
+test: a mis-cut conv state degenerates visibly). Token identity with the
+source arm is deliberately not a gate (different rank set). MoE needed no
+MoE-specific handling — experts are weights, not session state. gdn_tp_units
+differs per model (8 vs 16, GGUF 256-block divisibility) and stays an
+explicit argument.
+
+Two HiCache bugs found and fixed on the way (first consumer of these paths):
+HiCacheFile.get treated one readinto as all-or-nothing (19.6-MiB GDN page ->
+Short read, c9f3befb96); HiCacheFile.set staging names exceeded NAME_MAX on
+MoE pages and the store went silently empty (3575c472f6).
+
+Open edges (follow-up tasks): reverse TP=3->TP=1 (reassembly, plan type
+ready); live handover without server stop (park-now command, in-process
+umsharder, request-less import); draft/MTP pages do not migrate (both arms
+ran without spec); prefetch_threshold=256 means shorter imports are never
+consulted; attach_hybrid_pool_to_unified_cache does not normalize HiCache
+layout flags (foreign path, 3-line candidate, worked around).
