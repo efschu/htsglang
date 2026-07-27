@@ -1086,6 +1086,77 @@ silently dropped.
 no-op regression) and a gfx900 reject check on the second host. The CPU tests
 (19, vendor and capability mocked) pin the directions in the meantime.
 
+### #171 close-out: sweep repeated on the r3-probe-next2 tip
+
+Branch `fix/capability-gate-vendor-sweep` (base `abc1e47f02`). The earlier
+sweep classified the state of a week ago; this one covers today's, including
+the sites added since (`fp8_utils` is_blackwell/is_sm120 use, `fp8_kernel.py`,
+`aiter_backend`, the model_runner e5m2 branch).
+
+**Root, and why the per-site fix does not hold.** Five sites was never the
+shape of this bug -- it recurs because the raw reader LOOKS like it answers the
+question. The cut is at the API instead: `sglang/srt/utils/common.py` now
+exports helpers that carry the vendor in their name and answer "not
+applicable" off it -- `get_cuda_capability` / `get_cuda_sm` (None off NVIDIA),
+`cuda_sm_at_least` / `cuda_sm_below` / `cuda_sm_in_range` / `cuda_sm_major_in`
+(False off NVIDIA), and `get_hip_arch` / `hip_arch_in` for the AMD side, on
+which `is_gfx95_supported` / `is_gfx942_supported` / `mxfp_supported` now ride.
+A cross-namespace comparison is not writable through this surface, because the
+off-vendor answer is never a number. `get_device_capability()` keeps its
+behaviour and gains the docstring saying it is the raw reader, not a gate.
+
+`cuda_sm_below` is False off NVIDIA on purpose: an AMD card is not a small
+NVIDIA card, and a caller needing an AMD decision must say so in its own
+branch.
+
+**Findings, today's tree.** 91 call sites under `python/sglang/srt` reduce to
+~50 that compare. Verdicts:
+
+| site | verdict | note |
+|---|---|---|
+| `layers/fused_qk_rmsnorm_rope_gate.py:22` PDL | **real, fixed** | `major >= 9` enabled PDL -- a CUDA-only feature -- on gfx942 (9,4) / gfx950 (9,5) |
+| `attention/linear/kernels/gdn_cutedsl.py:27` | **real, fixed** | `major >= 10` called gfx1030 (10,3) and gfx1100 (11,0) Blackwell |
+| `attention/linear/kernels/kda_cutedsl.py:18` | **real, fixed** | same |
+| `attention/attention_registry.py:190` fa3 | **real, fixed** | `major == 9` admitted gfx942 to a backend with no ROCm build |
+| `quantization/marlin_utils.py:90,128` | **real, fixed** | sm80 floor cleared by gfx900 (9,0); Marlin has no ROCm kernel |
+| `quantization/marlin_utils.py:440,482` atomicAdd | **real, fixed** | `device.type != "cuda"` is not a vendor test -- ROCm is also "cuda" |
+| `moe/fused_moe_triton/fused_marlin_moe.py:226` | **real, fixed** | was "registered, not fixed"; now vendor-gated |
+| `quantization/fp8_utils.py:2244` marlin-fp8 range | **real, fixed** | sm80..88 admitted gfx803 (8,0) |
+| `quantization/moe_wna16.py:100,181` AWQ floor | **real, fixed** | NVIDIA floor on an AMD arch, wrong in both directions |
+| `quantization/quark/quark.py:290` | **real, fixed** | Quark is AMD's own format; fp8 floor 89 now answered functionally on ROCm |
+| `attention/dsa_backend.py:438,2780` | **real, fixed** | `>= 10` claimed B200 paths on gfx1030/1100; MHA_ONE_SHOT's "SM90" admitted gfx90a (90) |
+| `arg_groups/overrides.py:1169,1216` DSA | **real, fixed** | Blackwell FP8 KV + trtllm defaults decided by `major >= 10`, which RDNA satisfies |
+| `model_executor/runner/flashinfer_autotune.py:105` | **real, fixed** | was "registered, not fixed" |
+| `server_args.py:7620` | **dead, removed** | read a capability both callees ignore; also a stray CUDA context in the GPU-passive parent (#237) |
+| `model_loader/loader.py`, `model_runner.py`, `lora_moe_runner_marlin.py` | already fixed | `65beaccc5d`, `e879d35f2a`/`5972fc9d1c`, `96d34740f6` |
+| `fp8_utils.py:205,216,293,627`; `fp8_kernel.py:54-55` | harmless | HIP-intentional (`>= (9,4)`), or behind `is_cuda()` / `is_smXX_supported()`, which is vendor-safe via `_check_cuda_device_version` |
+| `attention/vision.py:1103-1116` | harmless | fully vendor-dispatched; the shape to copy |
+| `moe/utils.py:267`, `modelopt_quant.py:1899,2447`, `fp4_utils.py:157`, `compressed_tensors_w8a16_fp8.py:55`, `gdn_flashinfer.py:58,112`, `gdn_backend.py:66`, `glm4_moe_lite.py:937`, `deepseek_v2.py:2792`, `glm4_moe.py:1185`, `gemma4_vision.py:207`, `cute_dsl_arch.py:89`, `common.py:519` | harmless | already behind an `is_cuda()` / `torch.version` gate |
+| `quantization/gguf.py:317,367,532` | harmless (blind) | perf-only MMQ/MMVQ heuristics on a CUDA-only kernel path; documented, not churned |
+| `attention/minimax_sparse_ops/msa.py:44` | harmless (blind) | gfx1030 (10,3) passes the tuple test, then the functional `_load_fmha_sm100()` refuses |
+| `attention/linear/lightning_attn.py:405` | harmless (blind) | `< 8` never fires on any shipping gfx |
+| `distributed/device_communicators/torch_symm_mem.py:77` | harmless | unknown major -> warn + unavailable, fails soft |
+| `multiplex/pdmux_context.py:120`, `platforms/cuda.py:43` | harmless | CUDA-only feature / CudaPlatform, vendor is the context |
+| `layers/attention/aiter_backend.py` | no finding | reads no capability at all |
+| `model_executor/model_runner.py` e5m2 branch | no finding | dtype warning, no capability compare |
+
+**Test balance.** New `test/registered/unit/utils/test_capability_vendor_gates.py`:
+22 tests, all passing, pure CPU (`CUDA_VISIBLE_DEVICES=99`), mocked NVIDIA and
+mocked ROCm context per helper and per fixed site. Suites re-run:
+`utils/ layers/ model_executor/ model_loader/ lora/ server_args/ quantization/
+platforms/` -> **1036 passed, 46 skipped, 49 failed**, and the 49 are the
+identical pre-existing set the same command produces on the unmodified base
+(`weight_checker`, `weight_checker_comparator`, `modelopt_loader` -- all "No
+accelerator" on a GPU-less run). ruff: no new diagnostic on any changed file
+(before/after diff is line-number shift only). codespell: clean. black: clean.
+
+`test_deterministic_fp8_gemm._Env` gained the NVIDIA-namespace reader in its
+patch set, so a faked non-CUDA vendor cannot answer an NVIDIA capability
+question there either.
+
+GPU validation on the AMD side remains what it was: the ROCm directions are
+pinned by mock, not by a gfx900 boot.
+
 ### Max-context column (harness requirement #4)
 
 Throughput without capacity is only half the picture, so every comparison

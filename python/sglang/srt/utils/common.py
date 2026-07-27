@@ -64,6 +64,7 @@ from typing import (
     Callable,
     Dict,
     Generic,
+    Iterable,
     List,
     NamedTuple,
     Optional,
@@ -1154,6 +1155,22 @@ def get_device_core_count(device_id: int = 0) -> int:
 
 
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
+    """The device capability AS THIS TORCH BUILD REPORTS IT -- vendor-namespaced.
+
+    The number is only meaningful together with the vendor, and the namespaces
+    COLLIDE: gfx900 reports ``(9, 0)`` -- the same integer as NVIDIA Hopper --
+    gfx1030 reports ``(10, 3)`` like Blackwell B300, and gfx1100 reports
+    ``(11, 0)``. Comparing this against an NVIDIA threshold without checking
+    the vendor first fails in the DANGEROUS direction: the AMD card sails
+    through the gate and dies later inside a kernel that does not exist there,
+    instead of being refused at startup.
+
+    So this function is the RAW READER, not a gate. To express an NVIDIA
+    statement ("sm90 and up", "sm80..sm89") use :func:`cuda_sm_at_least`,
+    :func:`cuda_sm_in_range`, :func:`get_cuda_capability` or
+    :func:`get_cuda_sm`, all of which answer ``False``/``None`` off NVIDIA. To
+    express an AMD statement use :func:`get_hip_arch` / :func:`hip_arch_in`.
+    """
     major, minor = None, None
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         # No-init path: import-time callers (e.g. fp8_utils'
@@ -1180,6 +1197,101 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
             ) from e
 
     return major, minor
+
+
+# ------------------------------------------------------------------------------
+# Vendor-namespaced capability gates (#171)
+#
+# `get_device_capability()` above answers in whichever namespace the torch build
+# belongs to. Every threshold written in this codebase ("sm80", "sm90+", "SM100")
+# is an NVIDIA statement, and the two namespaces collide, so the threshold may
+# only be applied once the vendor is established. The helpers below carry the
+# vendor IN THEIR NAME and answer False/None off that vendor -- which makes the
+# blind comparison inexpressible rather than merely discouraged.
+#
+# On NVIDIA they read exactly what the previous comparisons read (the no-init
+# NVML path), so CUDA behaviour does not move; that is the regression criterion.
+# ------------------------------------------------------------------------------
+
+
+def get_cuda_capability(device_id: int = 0) -> Optional[Tuple[int, int]]:
+    """Compute capability in the NVIDIA namespace, or None off NVIDIA.
+
+    None means "this question does not apply here", not "old card": a ROCm,
+    XPU, NPU or CPU build has no NVIDIA compute capability at all. Returning
+    None rather than a number is deliberate -- a number would be compared.
+    """
+    if not is_cuda():
+        return None
+    try:
+        return tuple(get_device_capability_no_init(device_id))
+    except Exception:  # noqa: BLE001 - probe must never be fatal
+        return None
+
+
+def get_cuda_sm(device_id: int = 0) -> Optional[int]:
+    """``major * 10 + minor`` in the NVIDIA namespace, or None off NVIDIA."""
+    capability = get_cuda_capability(device_id)
+    if capability is None:
+        return None
+    return capability[0] * 10 + capability[1]
+
+
+def cuda_sm_at_least(major: int, minor: int = 0, device_id: int = 0) -> bool:
+    """Is this an NVIDIA device of at least sm{major}{minor}? False off NVIDIA."""
+    capability = get_cuda_capability(device_id)
+    return capability is not None and capability >= (major, minor)
+
+
+def cuda_sm_below(major: int, minor: int = 0, device_id: int = 0) -> bool:
+    """Is this an NVIDIA device below sm{major}{minor}? False off NVIDIA.
+
+    False off NVIDIA on purpose: "below sm80" is a statement about NVIDIA
+    parts, and an AMD card is not a small NVIDIA card. Callers that need to do
+    something for AMD must say so in their own AMD branch.
+    """
+    capability = get_cuda_capability(device_id)
+    return capability is not None and capability < (major, minor)
+
+
+def cuda_sm_in_range(
+    low: Tuple[int, int], high: Tuple[int, int], device_id: int = 0
+) -> bool:
+    """Is this an NVIDIA device in ``[low, high)``? False off NVIDIA."""
+    capability = get_cuda_capability(device_id)
+    return capability is not None and low <= capability < high
+
+
+def cuda_sm_major_in(majors: Iterable[int], device_id: int = 0) -> bool:
+    """Is this an NVIDIA device whose sm major is one of ``majors``?"""
+    capability = get_cuda_capability(device_id)
+    return capability is not None and capability[0] in tuple(majors)
+
+
+def get_hip_arch(device_id: int = 0) -> Optional[str]:
+    """The AMD arch name without its feature suffix (e.g. ``gfx942``), or None
+    off ROCm.
+
+    The AMD-namespace counterpart of :func:`get_cuda_capability`: the gfx
+    family is the honest identity of an AMD part, whereas the capability tuple
+    torch derives from it collides with NVIDIA's numbering.
+    """
+    if torch.version.hip is None:
+        return None
+    try:
+        return torch.cuda.get_device_properties(device_id).gcnArchName.split(":")[0]
+    except Exception:  # noqa: BLE001 - probe must never be fatal
+        return None
+
+
+def hip_arch_in(prefixes: Iterable[str], device_id: int = 0) -> bool:
+    """Does this AMD device's gfx family start with any of ``prefixes``?
+
+    False off ROCm. Prefixes so a family can be named once (``gfx95`` covers
+    gfx950/gfx951) instead of enumerating every stepping.
+    """
+    arch = get_hip_arch(device_id)
+    return arch is not None and any(arch.startswith(p) for p in prefixes)
 
 
 def get_compiler_backend(mode=None) -> str:
@@ -1224,11 +1336,7 @@ def mxfp_supported():
     """
     Returns whether the current platform supports MX types.
     """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
-        return False
+    return hip_arch_in(["gfx95"])
 
 
 @lru_cache(maxsize=1)
@@ -1236,11 +1344,7 @@ def is_gfx95_supported():
     """
     Returns whether the current platform supports MX types.
     """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx95"])
-    else:
-        return False
+    return hip_arch_in(["gfx95"])
 
 
 @lru_cache(maxsize=1)
@@ -1248,11 +1352,7 @@ def is_gfx942_supported():
     """
     Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
     """
-    if torch.version.hip:
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx942"])
-    else:
-        return False
+    return hip_arch_in(["gfx942"])
 
 
 def get_hip_version():

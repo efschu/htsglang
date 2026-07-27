@@ -46,6 +46,15 @@ class _Env:
         self._patches = [
             mock.patch.object(U, "is_cuda", lambda: self.cuda),
             mock.patch.object(U, "get_device_capability", lambda *a, **k: self.sm),
+            # The NVIDIA-namespace reader (#171): None off NVIDIA, so a fake
+            # non-CUDA vendor cannot answer an NVIDIA capability question.
+            mock.patch.object(
+                U,
+                "get_cuda_sm",
+                lambda *a, **k: (
+                    self.sm[0] * 10 + self.sm[1] if self.cuda else None
+                ),
+            ),
         ]
         for p in self._patches:
             p.start()

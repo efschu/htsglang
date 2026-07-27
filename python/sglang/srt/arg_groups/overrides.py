@@ -38,6 +38,8 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
+    cuda_sm_at_least,
+    get_cuda_sm,
     get_device_capability,
     get_device_sm,
     get_nvidia_driver_version,
@@ -1164,9 +1166,12 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     if is_npu() or is_xpu():
         return {}
 
-    import torch
-
-    major, _ = torch.cuda.get_device_capability()
+    # "Blackwell FP8, Hopper bf16" is an NVIDIA statement (#171), so it is
+    # asked in the NVIDIA namespace: the raw capability collides across
+    # vendors (gfx1030 reports (10, 3), gfx1100 (11, 0)), which would have
+    # defaulted an RDNA card to the Blackwell FP8 KV cache. Off NVIDIA the
+    # bf16 default applies, which is what the ROCm branch below assumes.
+    is_blackwell_class = cuda_sm_at_least(10)
 
     # If user specified a backend but didn't explicitly set kv_cache_dtype,
     # suggest them to be explicit about kv_cache_dtype to avoid surprises
@@ -1181,9 +1186,11 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
 
     kv_cache_dtype = view.kv_cache_dtype
     if kv_cache_dtype == "auto":
-        kv_cache_dtype = "fp8_e4m3" if major >= 10 else "bfloat16"
+        kv_cache_dtype = "fp8_e4m3" if is_blackwell_class else "bfloat16"
+        sm = get_cuda_sm()
+        where = f"SM{sm} device" if sm is not None else "this non-NVIDIA device"
         logger.warning(
-            f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."
+            f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on {where}."
         )
     if kv_cache_dtype == "bf16":
         kv_cache_dtype = "bfloat16"
@@ -1211,9 +1218,10 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     if is_npu() or is_xpu():
         return {}
 
-    import torch
-
-    major, _ = torch.cuda.get_device_capability()
+    # NVIDIA namespace (#171): "Blackwell -> trtllm, Hopper -> flashmla_kv" is
+    # an NVIDIA statement. The ROCm default is decided by the is_hip() branch
+    # below, not by a number that collides with AMD's arch numbering.
+    is_blackwell_class = cuda_sm_at_least(10)
     kv_cache_dtype = view.kv_cache_dtype
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
@@ -1240,7 +1248,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         declared["dsa_decode_backend"] = "tilelang"
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
-        default = "trtllm" if major >= 10 else "flashmla_kv"
+        default = "trtllm" if is_blackwell_class else "flashmla_kv"
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = default
         if not user_set_decode:
@@ -1250,7 +1258,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = "flashmla_sparse"
         if not user_set_decode:
-            declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
+            declared["dsa_decode_backend"] = "trtllm" if is_blackwell_class else "fa3"
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)

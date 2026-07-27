@@ -7565,9 +7565,12 @@ class ServerArgs:
 
         return capture_sizes
 
-    def _set_default_dsa_kv_cache_dtype(self, major: int, quantization: str) -> None:
+    def _set_default_dsa_kv_cache_dtype(
+        self, major: Optional[int], quantization: str
+    ) -> None:
         # Moved to the resolution pipeline (arg_groups/overrides.py:
-        # _dsa_kv_cache_dtype_default), invoked here at its legacy slot.
+        # _dsa_kv_cache_dtype_default), invoked here at its legacy slot. `major`
+        # is vestigial: the pass resolves the capability itself, vendor-first.
         from sglang.srt.arg_groups.overrides import (
             _dsa_kv_cache_dtype_default,
             run_post_process_pass,
@@ -7575,9 +7578,10 @@ class ServerArgs:
 
         run_post_process_pass(self, _dsa_kv_cache_dtype_default)
 
-    def _set_default_dsa_backends(self, major: int) -> None:
+    def _set_default_dsa_backends(self, major: Optional[int] = None) -> None:
         # Moved to the resolution pipeline (arg_groups/overrides.py:
         # _dsa_split_backend_resolution), invoked here at its legacy slot.
+        # `major` is vestigial; see _set_default_dsa_kv_cache_dtype.
         from sglang.srt.arg_groups.overrides import (
             _dsa_split_backend_resolution,
             run_post_process_pass,
@@ -7706,13 +7710,15 @@ class ServerArgs:
                     # The DSA page-size selection moved to the override registry
                     # (arg_groups/overrides.py: _deepseek_family_overrides).
 
-                    import torch
-
-                    major, _ = torch.cuda.get_device_capability()
+                    # No capability is read here: both slots forward to the
+                    # override passes, which resolve the capability themselves
+                    # and in the NVIDIA namespace (#171). The `major` argument
+                    # they still take is vestigial, and reading it here also
+                    # created a CUDA context in the GPU-passive parent (#237).
                     self._set_default_dsa_kv_cache_dtype(
-                        major, resolved_view(self).quantization
+                        None, resolved_view(self).quantization
                     )
-                    self._set_default_dsa_backends(major)
+                    self._set_default_dsa_backends(None)
 
                 if self.enable_prefill_cp:
                     assert (

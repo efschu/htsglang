@@ -13,16 +13,19 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import cuda_sm_at_least
+
 
 def _pdl_supported() -> bool:
-    """Check if Programmatic Dependent Launch is supported (NVIDIA SM >= 90)."""
-    if not torch.cuda.is_available():
-        return False
-    try:
-        major, _ = torch.cuda.get_device_capability()
-        return major >= 9
-    except Exception:
-        return False
+    """Is Programmatic Dependent Launch available here? (NVIDIA sm90+.)
+
+    PDL is a CUDA feature with no ROCm counterpart, so the question is asked
+    in the NVIDIA namespace (#171). The bare ``major >= 9`` this replaces was
+    vendor-blind, and the namespaces collide: gfx942 reports ``(9, 4)`` and
+    gfx950 ``(9, 5)``, so every CDNA3/CDNA4 card enabled PDL on a build that
+    has none.
+    """
+    return cuda_sm_at_least(9)
 
 
 _ENABLE_PDL = _pdl_supported()

@@ -27,7 +27,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_device_capability
+from sglang.srt.utils import get_device_capability, is_hip
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -287,6 +287,35 @@ class QuarkConfig(QuantizationConfig):
         }
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
+        # Vendor first (#171): get_min_capability() returns NVIDIA compute
+        # capabilities, so the floor may only be applied to a capability read
+        # in the NVIDIA namespace. get_device_capability() answers in whichever
+        # namespace the torch build belongs to and the two COLLIDE -- gfx900
+        # reports (9, 0), clearing the fp8 floor of 89 on a card with no fp8 at
+        # all, while a hypothetical AMD part numbered below the floor would be
+        # refused for a number that says nothing about it.
+        #
+        # Quark is AMD's own checkpoint format, so ROCm is the common case: ask
+        # the fp8 question FUNCTIONALLY there -- does a native fp8 GEMM exist on
+        # this device? -- which is what the floor was standing in for.
+        if is_hip():
+            from sglang.srt.layers.quantization.fp8_utils import (
+                fp8_native_gemm_available,
+            )
+
+            # 70 is the base floor every scheme clears; only the fp8 schemes
+            # (89) make a real claim, and that one is answerable by probe.
+            supported = min_capability <= 70 or fp8_native_gemm_available()
+            if error and not supported:
+                raise RuntimeError(
+                    "Quantization scheme is not supported on this ROCm device: "
+                    "it needs a native fp8 GEMM, which this device does not "
+                    "provide. (The NVIDIA minimum capability "
+                    f"{min_capability} is in a different namespace and is NOT "
+                    "comparable to the arch this build reports.)"
+                )
+            return supported
+
         capability_tuple = get_device_capability()
 
         if capability_tuple is not None:

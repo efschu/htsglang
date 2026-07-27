@@ -435,7 +435,12 @@ class DeepseekSparseAttnBackend(
         self.speculative_step_id = speculative_step_id
 
         self.device_capability = torch.cuda.get_device_capability()
-        self.device_sm_major = self.device_capability[0]
+        # NVIDIA namespace (#171): every `device_sm_major >= 10` below means
+        # "Blackwell", an NVIDIA statement, while the raw capability collides
+        # across vendors -- gfx1030 reports (10, 3) and gfx1100 (11, 0), both
+        # of which would have claimed the B200 kernel paths. -1 off NVIDIA,
+        # so those branches simply do not arise there.
+        self.device_sm_major = self.device_capability[0] if is_cuda() else -1
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
@@ -2763,7 +2768,7 @@ class DeepseekSparseAttnBackend(
         from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
             is_in_tc_piecewise_cuda_graph,
         )
-        from sglang.srt.utils import get_device_sm, is_blackwell
+        from sglang.srt.utils import get_cuda_sm, is_blackwell
 
         # Decide MHA vs MLA
         if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
@@ -2777,12 +2782,17 @@ class DeepseekSparseAttnBackend(
             assert forward_batch.seq_lens_cpu is not None
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
-            device_sm = get_device_sm()
+            # NVIDIA namespace (#171): "SM90/SM100" is an NVIDIA statement,
+            # and get_device_sm() answers in the caller's vendor namespace --
+            # gfx90a reports 90, the same integer as Hopper, which would have
+            # routed an MI200 into the H200/B200 MHA_ONE_SHOT path.
+            device_sm = get_cuda_sm()
 
             # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
             self.use_mha = (
                 (
-                    device_sm == 90 or (device_sm >= 100 and device_sm < 110)
+                    device_sm is not None
+                    and (device_sm == 90 or (100 <= device_sm < 110))
                 )  # SM90/SM100 only
                 and max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA

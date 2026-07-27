@@ -26,7 +26,7 @@ from sglang.srt.layers.quantization.utils import (
     pack_cols,
     unpack_cols,
 )
-from sglang.srt.utils import get_device_capability, is_cuda
+from sglang.srt.utils import get_cuda_sm, is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -87,9 +87,14 @@ def query_marlin_supported_quant_types(
     device_capability: Optional[int] = None,
 ):
     if device_capability is None:
-        major, minor = get_device_capability()
-        capability = major * 10 + minor
-        device_capability = -1 if capability is None else capability
+        # Vendor first (#171): "sm80" is an NVIDIA statement and Marlin has no
+        # ROCm kernel at all, so off NVIDIA the answer is "no supported types",
+        # not "compare the number". The raw capability reader answers in the
+        # caller's vendor namespace and the two COLLIDE -- gfx900 reports
+        # (9, 0) -- so the bare comparison let AMD cards past an NVIDIA floor
+        # and into a kernel that does not exist there.
+        sm = get_cuda_sm()
+        device_capability = -1 if sm is None else sm
 
     if device_capability < 80:
         return []
@@ -125,9 +130,9 @@ def _check_marlin_supported(
 ) -> tuple[bool, Optional[str]]:
 
     if device_capability is None:
-        major, minor = get_device_capability()
-        capability = major * 10 + minor
-        device_capability = -1 if capability is None else capability
+        # Vendor first (#171); see query_marlin_supported_quant_types.
+        sm = get_cuda_sm()
+        device_capability = -1 if sm is None else sm
 
     supported_types = query_marlin_supported_quant_types(
         has_zp, True, device_capability
@@ -437,6 +442,11 @@ def moe_awq_to_marlin_zero_points(
 def maybe_warn_marlin_atomic_add(device, dtype):
     if torch.compiler.is_dynamo_compiling():
         return
+    # "before SM90" is an NVIDIA statement (#171), so the vendor is checked
+    # before the number: off NVIDIA there is nothing to advise, and the raw
+    # capability would collide anyway (gfx942 reports (9, 4)).
+    if not is_cuda():
+        return
     device_capability = torch.cuda.get_device_capability(device)
     if device_capability[0] < 9 and dtype == torch.bfloat16:
         logger.info_once(
@@ -468,7 +478,10 @@ def should_use_atomic_add_reduce(
 
     # the performance of atomicAdd is better than global reduce
     # only when m*n is small and k is large
-    if n >= 2048 or k < 2048 or device.type != "cuda":
+    # Vendor first (#171): device.type is "cuda" on ROCm too, so this test
+    # alone does not establish NVIDIA, and everything below -- Marlin itself
+    # and the "sm8x has no native bf16 atomicAdd" rule -- is NVIDIA-only.
+    if n >= 2048 or k < 2048 or device.type != "cuda" or not is_cuda():
         return False
 
     # disable atomicAdd reduce by default,

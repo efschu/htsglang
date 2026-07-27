@@ -189,6 +189,18 @@ def create_flashattention_v3_backend(runner):
 
     major, minor = get_device_capability()
     if not _is_musa:
+        # Vendor first (#171): "SM80..SM90" is an NVIDIA statement, and
+        # get_device_capability() answers in the caller's vendor namespace.
+        # The two COLLIDE -- gfx942 reports (9, 4) -- so the bare major == 9
+        # let an MI300 through and it then imported a FlashAttention-3 backend
+        # whose kernels have no ROCm build at all. Refusing here is the loud
+        # direction; sailing through is the dangerous one.
+        assert not _is_hip, (
+            "FlashAttention v3 Backend requires CUDA: FA3 has no ROCm kernel. "
+            "(Any capability this build reports is in AMD's namespace and is "
+            "NOT comparable to the NVIDIA range SM80..SM90.) Use "
+            "`--attention-backend aiter` or `triton` on ROCm."
+        )
         assert (major == 8 and not runner.use_mla_backend) or major == 9, (
             "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
             "Please use `--attention-backend flashinfer`."
