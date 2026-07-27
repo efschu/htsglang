@@ -383,6 +383,42 @@ MoE expert offloading to host RAM combined with asymmetric TP and DCP (GPTQ/AWQ/
 32/32 tokens identical to a TP=1 run. Offloaded output is self-deterministic but not bit-identical
 to the no-offload case, since Marlin-Int4 tiling reduces in a different order. Numbers above.
 
+**Prefill wave order (#254).** A prefill chunk that routes to more experts than the scratch region
+holds is split into waves. `SGLANG_MOE_OFFLOAD_WAVE_ORDER` selects the axis:
+
+- `token` (default, unchanged) — waves are disjoint token subsets. Every wave re-fetches the spill
+  experts its tokens need, so a spill expert crosses PCIe once per wave. With `C` scratch slots and
+  `top_k` routed experts a wave holds roughly `C / top_k` tokens, so the wave count — and with it
+  the H2D volume — grows linearly with the chunk. At the default `C = max(8, R/4)` and `top_k = 8`
+  a wave is one or two tokens.
+- `expert` — waves are disjoint groups of at most `C` spill experts, so each spill expert is
+  streamed exactly once per chunk regardless of chunk size. It also removes the token-major failure
+  mode where a single token's spilled top-k does not fit the scratch.
+
+Byte-identical to the token order, and to the no-offload path on formats whose kernel config does
+not depend on the per-apply token count (blockwise fp8 pins `BLOCK_SIZE_K` to the quantization
+block; the unquantized path's `M <= E` heuristic flips it, which already affects the token order).
+The identity comes from taking the top-k reduction out of the wave: each routed (token, k-slot)
+pair is submitted as its own pseudo-token with `top_k == 1`, so the fused kernel writes the
+weighted contribution straight out, and it is stored at its own k-slot in a `[T, top_k, H]` buffer.
+The k-slot is fixed by the routing, so the buffer holds the same values in the same places for any
+split; the reduction runs once at the end over the full buffer, in k order. Cost: one transient
+`[T, top_k, H]` buffer per layer. Decode (single wave) is untouched.
+
+Measured on Qwen3.6-35B-A3B-AWQ, TP=1 on an RTX 5090, resident fraction 0.25 (32 resident + 8
+scratch of 128 experts per layer), eager, 2048-token chunks:
+
+| prompt tokens | token order | expert order | H2D per layer per chunk (token -> expert) |
+| --- | --- | --- | --- |
+| 331 | 9.37 s | 1.27 s | 3.09 GiB -> 0.19 GiB |
+| 771 | 21.65 s | 1.35 s | 3.09 GiB -> 0.19 GiB |
+| 1541 | — | 1.63 s | 7.20 GiB -> 0.15 GiB |
+| 3081 | — | 1.82 s | 7.20 GiB -> 0.12 GiB |
+| 6601 | aborted after 55 min | 3.38 s | 7.20 GiB -> 0.12 GiB |
+
+Generated text is identical between the two orders at every size that completed on both. The
+per-chunk H2D volume is logged (`MoE offload layer N: <order>-major prefill, W waves, X GiB H2D`).
+
 **KV-pool reclaim.** The weight VRAM the offload frees is claimed by the KV pool. No second
 sizing path exists and none is needed: the KV budget is profiled from a live free-memory reading
 taken after the weights are resident, so the reclaim lands in it by construction — provided the

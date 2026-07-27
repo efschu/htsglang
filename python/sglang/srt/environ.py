@@ -187,7 +187,6 @@ class ToolStrictLevel(IntEnum):
 
 
 class Envs:
-
     # Raise on bare server_args field assignments after resolution; mutation
     # must go through ServerArgs.override() (enabled by the test harness).
     SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
@@ -852,6 +851,20 @@ class Envs:
     # Max decode batch size eligible for the captured offload path. Buckets with
     # bs*top_k > scratch (would need >1 wave) fall back to eager. 0 = no cap.
     SGLANG_MOE_OFFLOAD_MAX_GRAPH_BS = EnvInt(0)
+    # #254: how a prefill forward that overflows the scratch region is split.
+    #   "token"  (default) -- waves are disjoint TOKEN subsets; every wave
+    #     re-fetches the spill experts its tokens need, so a spill expert is
+    #     streamed once PER WAVE (~62x per 2048-token chunk at C=16).
+    #   "expert" -- waves are disjoint SPILL-EXPERT groups; each spill expert is
+    #     streamed EXACTLY ONCE per chunk (H2D volume drops by the wave count).
+    #     Byte-identical to "token": each wave computes the per-(token, k-slot)
+    #     contributions into a fixed [T, top_k, H] buffer indexed by the k-slot
+    #     (which the routing fixes, independent of the wave split), and the top-k
+    #     reduction runs once at the end over the full buffer in k order -- the
+    #     same reduction, over the same values, as the unsplit path. Costs one
+    #     transient T*top_k*H buffer per layer (freed at the end of the forward).
+    # Decode (single-wave) is unaffected by this flag.
+    SGLANG_MOE_OFFLOAD_WAVE_ORDER = EnvStr("token")
     # #119: hand the weight VRAM freed by the expert offload to the KV pool.
     # Default ON, but STRICTLY scoped to the offload lane -- every effect is
     # additionally gated on SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0, so with
