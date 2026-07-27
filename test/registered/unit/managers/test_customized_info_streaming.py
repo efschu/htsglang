@@ -86,6 +86,14 @@ class _CustomizedInfoEngine(Engine):
 class TestCustomizedInfoStreaming(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        if not torch.cuda.is_available():
+            # This test boots a full Engine (registered for the 1-gpu CI
+            # runners). On a GPU-less box it must skip deterministically:
+            # platform state leaked by earlier tests in a full-suite run can
+            # otherwise carry the boot past accelerator detection, at which
+            # point pool sizing runs against host RAM and the allocation
+            # OOM-kills the pytest process.
+            raise unittest.SkipTest("requires a CUDA/ROCm device")
         install_customized_info_sampler()
         cls.engine = _CustomizedInfoEngine(
             model_path=MOCK_MODEL_PATH,
