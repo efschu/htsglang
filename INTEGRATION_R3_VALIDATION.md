@@ -2968,3 +2968,130 @@ GEMV exists and why it is capped at M <= 8.
    deterministic inference is on and this rank is still on Marlin, naming the
    env var that closes it. Making the hole visible is the deliverable; closing
    it silently is not.
+
+# Window 4 -- Phase 2: the merge stack (merges 2-10)
+
+Continues the window whose Phase 1 is recorded above. Merge 1
+(`9b142ce435`, `fix/mixed-arch-norm-and-guards`) was already in place at the
+start of this phase. Rollback tag `w4-rollback-before-stack` -> `a48a793744`.
+
+Every merge was preceded by a semantic pre-check of the files the branch shares
+with the tip, at hunk-region granularity -- not just "does git report a
+conflict". The hot files identified in advance were `environ.py` (5 branches),
+`server_args.py` (4), `model_runner_kv_cache_mixin.py` (4), and the
+`fp8.py` / `compressed_tensors_w8a16_fp8.py` pair.
+
+## Merge table
+
+| # | merge commit | branch | textual conflicts | semantic pre-check |
+|---|---|---|---|---|
+| 1 | `9b142ce435` | fix/mixed-arch-norm-and-guards (#208/#202/#197) | none | Phase 1, above |
+| 2 | `8d48fc3749` | fix/solo-barrier-and-budget (#194/#188) | none | zero file overlap with the tip |
+| 3a | `8759e54bd3` | fix/gemma4-textonly-mask (#186) | none | zero overlap with tip AND with its pair partner |
+| 3b | `b5f41d8e44` | feat/swa-dcp-triton (#96) | none (auto-merged) | mixin: #188 at 214-540 vs #96 at 1737+ |
+| 4 | `8090c4e271` | fix/spec-upstream-followups | none | no overlap with tip or with the merge-5 pair |
+| 5 | `4695027a40` | mleagle #138/#185/#184 | none (auto-merged) | server_args: tip 1562/5691/9575 vs branch 9552-9583 |
+| 6a | `611d2f082b` | feat/htccl-ucx-transport (#117) | none | environ: tip 319 vs branch 525/544 |
+| 6b | `56223ebd6f` | feat/htccl-ucx-l2 (#198) | none (auto-merged) | same regions as #117 |
+| 7a | `928fa38fa4` | feat/fp8-perchannel-gemv (#189) | 1 (this doc) | only shared file with the tip is this record |
+| 7b | `6311397da9` | feat/deterministic-fp8-sm8x (#192) | 2 (this doc + w8a16 imports) | the flagged pair; see below |
+| 8 | `a5f654292f` | feat/weightless-fp8-kv (#127) | none (auto-merged) | 4 shared files, all disjoint by region |
+| 10 | `30c2b953d6` | docs/status-evidence-tiers (#207) | 3 (all in FEATURES_VS_UPSTREAM.md) | doc-only, but 3 CONTENT conflicts |
+
+Merges 3a/3b are one logical step: `#186` alone leaves H4 red, so the pair was
+merged back-to-back before any suite ran. `feat/mleagle-adaptive-len` turned out
+to be an **ancestor** of `fix/mleagle-preexisting-bugs`, so merge 5 is a single
+commit carrying `a8af70e172` + `d29a13ea6b` + `3fb8884932` in the intended
+order. Likewise `feat/htccl-ucx-transport` is an ancestor of
+`feat/htccl-ucx-l2`; they were kept as two merge commits anyway so #117 and
+#198 stay separately identifiable and separately revertable.
+
+## The one real source conflict: #189 x #192
+
+Predicted by the desk analysis in the previous window, and it landed exactly
+where predicted. `fp8.py` auto-merged (#189 at 54/1070, #192 at 64/483/1197 --
+disjoint bodies). `compressed_tensors_w8a16_fp8.py` conflicted at the import
+block: #189 inserts `fp8_dequant_gemv`, #192 rewrites the adjacent single-line
+`fp8_utils` import into a two-symbol one. **Resolved by keeping both** -- the
+additions are independent symbols, and both call sites survive
+(`deterministic_fp8_marlin_disabled()` in `_marlin_available`,
+`fused_channel_gemv_applicable()` in the apply path).
+
+Semantically the two compose rather than collide: #192 sets `use_marlin=False`
+on sm80..88 and routes those cards INTO the W8A16 dequant lane; #189 supplies
+that lane's small-batch GEMV. Verified live on the merged tree, per card:
+
+| card | flag | `deterministic_fp8_marlin_disabled()` | `_marlin_available()` |
+|---|---|---|---|
+| 3080 (sm86) | `SGLANG_DETERMINISTIC_FP8_GEMM=1` | True | **False** (dequant lane) |
+| 3080 (sm86) | unset | -- | True (Marlin) |
+| 5090 (sm120) | `SGLANG_DETERMINISTIC_FP8_GEMM=1` | False | True (correctly out of scope) |
+
+The scoping is right: #192 claims sm80..88 only, and sm120 is untouched by it.
+
+**Still owed:** #189 is more accurate than the materialisation it replaces, so
+it changes values on that lane and #192's solo byte-baseline is invalidated.
+The re-baseline is recorded in Phase 3 below, not compared against the old
+numbers.
+
+## Branches deliberately NOT merged
+
+* **`feat/weightless-chain-spec` (#143)** -- skipped. Its Gate 4 (tok/s; "B must
+  beat A", the gate that catches a verify silently running eager) was never
+  measured: Window 3 got as far as R0/R2/R6 green and R1 up, then R3 blocked on
+  a pre-existing solo-placement deadlock and R4/R5 were never reached. Merging
+  it would put a feature on the integration branch on structural argument alone
+  (every hunk sits behind `if weightless_recv:` / `is_weightless_worker`). The
+  structural argument is good; it is not a measurement.
+* **`feat/offload-kv-regain` (#119)** -- skipped for time, as the plan allowed.
+  It needs a 122B A/B to say anything, and that did not fit alongside the
+  closing boots and Phase 3. It is the first candidate for the next window; it
+  is also the 5th branch to touch `model_runner_kv_cache_mixin.py`, so its
+  pre-check should be run against the post-stack file, not against `a48a793744`.
+
+## Test evidence
+
+A rolling suite of the branches' own registered tests was run after each merge
+step, and a broad sweep with a failure-set diff at the end.
+
+| after merge | rolling suite |
+|---|---|
+| 1 (baseline) | 97 passed |
+| 3 | 233 passed |
+| 5 (incl. the `test_multi_layer_eagle_graph_state.py` ratchet) | 308 passed |
+| 6 | 341 passed |
+| 7 | 378 passed |
+
+Zero failures at every step. The merge-5 ratchet requirement --
+`test_multi_layer_eagle_graph_state.py`, registered by merge 4 and re-run after
+merge 5 touched `multi_layer_eagle_worker_v2.py` -- is green.
+
+Broad sweep (`unit/{utils,spec,model_executor,distributed,layers/quantization,server_args}`
+plus the boot-constructor ratchet), failure sets compared against a clean
+worktree at `9b142ce435`:
+
+| tree | failed | passed |
+|---|---|---|
+| baseline `9b142ce435` | **36** | 1590 |
+| merge tip `a5f654292f` | **11** | 1799 |
+
+* **New failures at the tip: NONE.** The 11 are a strict subset of the 36.
+* 25 pre-existing failures were **fixed** by the stack -- the whole of
+  `test_pool_configurator.py`, which was red on `integration/r3-probe` before
+  this window with
+  `AttributeError: 'types.SimpleNamespace' object has no attribute 'swa_pool_sizing'`.
+  A previous change had added `swa_pool_sizing` to `pool_configurator.py`
+  without updating the test's fixture; #96 ships the matching fixture update.
+* The 11 residual failures are the known environment-bound set: `test_vmm_utils`
+  `KeyError: 'LOCAL_RANK'` x4, `test_uneven_tp_nccl_env` MPS-pipe x1,
+  `test_fp4_kv_cache_quant_method` x3 (`libnvrtc.so.13` absent),
+  `test_weight_checker` x2, `test_decode_bookkeeping_ownership` x1.
+
+**A flake worth recording:** the first broad run on the merge tip reported 11
+failures *including* three `test_fp4_kv_cache_quant_method` cases as
+`retry() exceed maximum number of retries`; an immediate identical re-run
+reported the same 11. An earlier cold run had produced a different transient
+count. Failure-set diffing, not failure counting, is what makes these runs
+comparable -- the counts alone drift with JIT cache warmth.
+
+All 68 changed Python files AST-compile.
