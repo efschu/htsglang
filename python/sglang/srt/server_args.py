@@ -4816,6 +4816,25 @@ class ServerArgs:
             )
         if not self.dcp_size > 1:
             return
+        # BOOT GATE (#229): NGRAM and FROZEN_KV_MTP produce target-verify
+        # layouts outside both backends' _DCP_VERIFY_SPEC_INPUT_TYPES, so any
+        # dcp_size > 1 is refused -- on every platform, before the platform
+        # branches below. Both refusals used to fire in the spec worker init
+        # or the first target-verify metadata build, i.e. after the full
+        # weight load, although they are decidable right here from
+        # (speculative_algorithm, dcp_size) alone. The gate functions carry
+        # the full analysis of why dcp_size > 1 is the exact condition.
+        from sglang.srt.speculative.spec_info import (
+            SpeculativeAlgorithm,
+            reject_frozen_kv_mtp_verify_under_dcp,
+            reject_ngram_verify_under_dcp,
+        )
+
+        _spec_algo = SpeculativeAlgorithm.from_string(self.speculative_algorithm)
+        if _spec_algo.is_ngram():
+            reject_ngram_verify_under_dcp(self.dcp_size)
+        if _spec_algo.is_frozen_kv_mtp():
+            reject_frozen_kv_mtp_verify_under_dcp(self.dcp_size)
         if is_hip():
             return
         elif is_cuda():
