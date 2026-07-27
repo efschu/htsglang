@@ -123,8 +123,7 @@ class VerifyRound:
         """
         if record.get("mode") != "target_verify":
             raise ValueError(
-                f"expected a target_verify record, got mode "
-                f"{record.get('mode')!r}"
+                f"expected a target_verify record, got mode " f"{record.get('mode')!r}"
             )
         rows = record["accepted_rows"][request]
         logits = record["logits"]

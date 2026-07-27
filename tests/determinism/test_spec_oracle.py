@@ -82,7 +82,9 @@ def _perfect_run(num_rounds: int = 4, d: int = 4, margin: float = 5.0) -> SpecRu
 
 def test_projection_is_in_emitted_token_space():
     """One row per EMITTED token, not one per verify slot."""
-    run = _run([_round([3, 4, 5, 6], [5.0] * 4, accept_len=2), _round([7, 8], [5.0] * 2)])
+    run = _run(
+        [_round([3, 4, 5, 6], [5.0] * 4, accept_len=2), _round([7, 8], [5.0] * 2)]
+    )
     traj = run.to_trajectory()
     assert traj.token_ids == [3, 4, 7, 8]
     assert traj.logits.shape == (4, VOCAB)
@@ -104,7 +106,9 @@ def test_projection_alignment_survives_different_accept_lengths():
 
 
 def test_accept_lengths_reported():
-    run = _run([_round([1, 2, 3, 4], [5.0] * 4, accept_len=3), _round([5, 6], [5.0] * 2)])
+    run = _run(
+        [_round([1, 2, 3, 4], [5.0] * 4, accept_len=3), _round([5, 6], [5.0] * 2)]
+    )
     assert run.accept_lengths() == [3, 2]
     assert run.mean_accept_length() == pytest.approx(2.5)
 
@@ -117,9 +121,7 @@ def test_empty_round_is_rejected():
 
 def test_more_emitted_than_verify_rows_is_rejected():
     with pytest.raises(ValueError):
-        VerifyRound(
-            logits=torch.zeros(2, VOCAB), candidates=[0, 1], emitted=[1, 2, 3]
-        )
+        VerifyRound(logits=torch.zeros(2, VOCAB), candidates=[0, 1], emitted=[1, 2, 3])
 
 
 # --------------------------------------------------------------------------
@@ -335,8 +337,12 @@ def test_no_matrix_row_claims_spec_vs_nospec_token_identity():
         spec_on = case.test_config.get("speculative_algorithm") is not None
         spec_off = case.reference_config.get("speculative_algorithm") is None
         if spec_on and spec_off:
-            assert case.expected_class is not ByteIdentityClass.MACHINE_ZERO, case.case_id
-            assert case.expected_class is not ByteIdentityClass.DECODE_CLASS, case.case_id
+            assert (
+                case.expected_class is not ByteIdentityClass.MACHINE_ZERO
+            ), case.case_id
+            assert (
+                case.expected_class is not ByteIdentityClass.DECODE_CLASS
+            ), case.case_id
 
 
 # --------------------------------------------------------------------------
@@ -350,9 +356,7 @@ def _dump_record(accept_lens, bs=1, d=4, vocab=VOCAB):
     for r in range(bs * d):
         logits[r, (r + 3) % vocab] = 5.0
     predict = [int((r + 3) % vocab) for r in range(bs * d)]
-    accepted_rows = [
-        list(range(b * d, b * d + accept_lens[b])) for b in range(bs)
-    ]
+    accepted_rows = [list(range(b * d, b * d + accept_lens[b])) for b in range(bs)]
     return {
         "step": 0,
         "tp_rank": 0,

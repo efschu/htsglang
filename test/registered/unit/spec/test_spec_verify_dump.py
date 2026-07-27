@@ -72,9 +72,7 @@ def _fake_step(vocab=8, bs=1, d=4):
     logits = torch.zeros(bs * d, vocab, dtype=torch.float32)
     for r in range(bs * d):
         logits[r, (r + 1) % vocab] = 5.0
-    predict = torch.tensor(
-        [(r + 1) % vocab for r in range(bs * d)], dtype=torch.int32
-    )
+    predict = torch.tensor([(r + 1) % vocab for r in range(bs * d)], dtype=torch.int32)
     candidates = torch.tensor([[0] + [(r + 1) % vocab for r in range(d - 1)]] * bs)
     accept_index = torch.tensor([list(range(d))] * bs, dtype=torch.int32)
     accept_lens = torch.tensor([d] * bs, dtype=torch.int32)
