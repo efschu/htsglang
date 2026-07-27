@@ -2192,12 +2192,130 @@ def _fork_launch_env(python_exe: Optional[str], info: List[str]) -> Dict[str, st
     return env
 
 
+def _apply_crossover_knees(
+    s: Dict[str, Any],
+    info: List[str],
+    tp: int,
+    finding,
+    prompt_to_output_ratio: Optional[float],
+) -> None:
+    """Fold this rig's measured MLP-split knee points into the max-perf
+    preset.
+
+    The knee (the prompt:output ratio at which an MLP concentration starts
+    to pay) is a property of a machine — card mix, interconnect, model,
+    quantisation lane — so NOTHING here is a built-in number: every figure
+    comes from the rig-local crossover store (``crossover.load_finding``) and
+    is emitted with its rig label and age. Three outcomes, mirroring the
+    lever logic (levers._resolve_crossover):
+
+      * a usable local finding + a workload ratio above a knee -> the
+        measured vector is applied (``--rank-mlp-ratio`` directly, with
+        ``--rank-tp-ratio auto``: the auto-performance optimizer's decode
+        -knee guard rejects exactly the concentration a prompt-dominated
+        workload justifies, so naming both would emit a command whose halves
+        disagree);
+      * a usable finding without a workload ratio (or one below every knee)
+        -> the knee table is stated, nothing is applied;
+      * no usable finding -> the preset says the knees are UNMEASURED and
+        names the study that measures them. A finding from another rig or a
+        stale one never selects anything.
+    """
+    from sglang.srt.planner.crossover import STUDY_TIERS
+
+    if finding is None:
+        info.append(
+            "MLP-split knee points: NOT measured on this rig. Where "
+            "concentration starts to pay depends on the card mix, model and "
+            "quant lane, so no vector is proposed. Measure with the "
+            "mlp_split_crossover study ("
+            + "; ".join(
+                f"{t.label} ~{t.est_runtime_min} min" for t in STUDY_TIERS
+            )
+            + ")."
+        )
+        return
+    if not finding.usable_for_advice():
+        caveats = finding.caveats()
+        info.append(
+            "MLP-split knee points: a finding exists but does not select a "
+            "vector ("
+            + (caveats[0] if caveats else "not usable for advice")
+            + ") Run the mlp_split_crossover study on this rig for a usable "
+            "one."
+        )
+        return
+    rows = [
+        r
+        for r in finding.break_even_table()
+        if r["proposable"] and r["break_even_prompt_to_output"] is not None
+    ]
+    if not rows:
+        info.append(
+            "MLP-split knee points measured on this rig ("
+            + finding.rig.label()
+            + "): no concentration vector is ever the best positive-net "
+            "choice; the base split stands at every prompt:output mix."
+        )
+        return
+    def _pct(v: Optional[float]) -> str:
+        return "unmeasured" if v is None else f"{v:+.1f} %"
+
+    info.append(
+        "MLP-split knee points (measured on this rig: "
+        + finding.rig.label()
+        + f", {finding.age_s() / 86400.0:.0f} days ago): "
+        + "; ".join(
+            f"{r['vector']} turns at "
+            f"{r['break_even_prompt_to_output']:.1f}:1 prompt:output "
+            f"(prefill {_pct(r['prefill_gain_pct'])}, decode "
+            f"{_pct(r['decode_cost_pct'])})"
+            for r in rows
+        )
+        + "."
+    )
+    if prompt_to_output_ratio is None:
+        info.append(
+            "No workload prompt:output ratio given -- knee points stated, "
+            "no concentration applied."
+        )
+        return
+    best = finding.best_for_ratio(float(prompt_to_output_ratio))
+    if best is None:
+        info.append(
+            f"At {float(prompt_to_output_ratio):.1f}:1 prompt:output every "
+            "measured concentration is a net loss -- the base split IS the "
+            "measured answer; nothing applied."
+        )
+        return
+    if len(best.vector) != tp:
+        info.append(
+            f"The measured vector {best.label()} is for TP="
+            f"{len(best.vector)}, this preset is TP={tp} -- not applicable, "
+            "nothing applied."
+        )
+        return
+    s["rank_tp_ratio"] = "auto"
+    s["rank_mlp_ratio"] = list(best.vector)
+    info.append(
+        f"Applied --rank-mlp-ratio {best.label()} from the measured "
+        f"crossover: at {float(prompt_to_output_ratio):.1f}:1 prompt:output "
+        f"it nets {best.net_ms_per_output_token(float(prompt_to_output_ratio)):.3f} "
+        f"ms per output token over the base split (turns at "
+        f"{best.break_even_ratio:.1f}:1). Set with --rank-tp-ratio auto, "
+        "not auto-performance: the optimizer's decode-knee guard would "
+        "reject this measured, workload-justified concentration."
+    )
+
+
 def profiles(
     model_cfg: Optional[dict],
     gpus: Sequence,
     base: Optional[dict] = None,
     python_exe: Optional[str] = None,
     draft_models: Optional[Sequence[Dict[str, str]]] = None,
+    crossover_finding=None,
+    prompt_to_output_ratio: Optional[float] = None,
 ) -> List[Profile]:
     """Generate LAUNCHABLE profiles for ``gpus`` (a list of ``{name,
     total_mib}`` dicts or GpuDescriptor-like objects), each with ALL fields
@@ -2230,7 +2348,16 @@ def profiles(
     concurrency-aware capacity (expert-offload presets pin the native max +
     N=1). The numbers come from ``feasibility.plan`` and need
     ``base['model_path']``; without it (or when the cost model cannot size
-    the preset) the form defaults are kept and ``info`` says so."""
+    the preset) the form defaults are kept and ``info`` says so.
+
+    ``crossover_finding`` is this rig's measured MLP-split crossover
+    (``crossover.load_finding()``, or None) and ``prompt_to_output_ratio``
+    the workload mix, both folded into the max-perf preset by
+    ``_apply_crossover_knees``: the knee points are rig measurements, so the
+    generator states them (or their absence + the study that measures them)
+    and only ever applies a vector that a LOCAL, usable finding selects for
+    the given mix. This function stays free of filesystem reads -- the
+    caller loads the finding (webui.config_profiles_get does)."""
     totals = _gpu_totals(gpus)
     ngpu = len(totals)
     kvh = model_kv_heads(model_cfg)
@@ -2656,6 +2783,9 @@ def profiles(
     )
     _apply_fork_rules(s, info)
     _apply_uneven_env(s, info, max_tokens=False)
+    _apply_crossover_knees(
+        s, info, ngpu, crossover_finding, prompt_to_output_ratio
+    )
     _apply_capacity_rules(s, info, model_cfg, gpus)
     out.append(
         Profile(
