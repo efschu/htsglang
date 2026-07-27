@@ -292,9 +292,23 @@ class TinyModelConfig:
         assert self.num_attention_heads % tp_size == 0
         return self.num_attention_heads // tp_size
 
-    def get_num_kv_heads(self, tp_size: int) -> int:
+    def get_num_kv_heads(self, tp_size: int, rank: int | None = None) -> int:
+        # `rank` mirrors `ModelConfig.get_num_kv_heads`, where an installed
+        # --rank-tp-ratio plan makes the count rank-dependent. This mock has no
+        # plan, so every rank's share is the even one and the argument is
+        # accepted and ignored -- but it must be ACCEPTED, or every caller that
+        # passes it (the flashinfer backend does) dies in the constructor.
         assert self.num_key_value_heads % tp_size == 0
         return self.num_key_value_heads // tp_size
+
+    def get_total_num_kv_heads(self) -> int:
+        """The kv-head count BEFORE any TP split, as ``ModelConfig`` defines it.
+
+        ``TritonAttnBackend.__init__`` reads this unconditionally (#169.3 needs
+        the model's kv base to decide DCP head replication), so a mock without
+        it makes every triton case in this kit die in the constructor.
+        """
+        return self.num_key_value_heads
 
 
 class MockModelRunner(ModelRunner):

@@ -197,8 +197,8 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
                     )
                 self.assertIn(fragment, str(ctx.exception))
 
-    def test_window_lane_times_chain_verify_is_permitted_but_unvalidated(self):
-        """Rebase seam between #96 and the merged #180. REGISTERED, NOT PROVEN.
+    def test_window_lane_times_chain_verify_is_permitted_and_now_settled(self):
+        """Rebase seam between #96 and the merged #180 (#191). SETTLED.
 
         Before #180 this pair could not arise: any `speculative=True` was
         refused on the uneven lane, so #96's original test listed it among the
@@ -207,20 +207,38 @@ class TestTritonDcpGeometryGuard(CustomTestCase):
         `swa_hybrid_dcp + speculative` through -- the assertion was stale, not
         the code.
 
-        What is NOT established is that the combination is *correct*. #180
-        drops `custom_mask`/`mask_indptr` under `dcp_size > 1` on the
-        target-verify branch, justified for the DCP paged path ("the dxd
-        draft->draft block IS the causal mask"). Under #96 a sliding-window
-        layer no longer takes the DCP path at all: it falls through to the
-        plain 2-stage kernel and DOES receive a mask, with `window_kv_offsets`
-        re-basing the column arithmetic. Whether the drop is still right there
-        is unverified in either direction.
+        What the correctness question turned out to be. #180 drops
+        `custom_mask`/`mask_indptr` under `dcp_size > 1` on the target-verify
+        branch (`triton_backend.py:1567-1580` eager, `:1176-1179` graph). That
+        drop is per-FORWARD, taken in the metadata build. #96's dispatch is
+        per-LAYER. So a sliding-window layer, which never enters
+        `_forward_extend_dcp`, reaches the ordinary 2-stage window kernel
+        (`:2254-2334`) with the window buffers and NO mask. The earlier version
+        of this docstring asserted the opposite -- that the window layer "DOES
+        receive a mask" -- which is not what the code does; nothing is
+        re-installed per layer.
 
-        This test pins only what the guard currently decides, so that a future
-        change to that decision is visible. It is not evidence of correctness.
-        Settle on GPU with a chain-verify (`--speculative-eagle-topk 1`) run of
-        an SWA-hybrid model on the uneven-DCP lane, asserting per layer what a
-        sliding-window layer receives under `is_target_verify()`.
+        The maskless window layer is correct, and for a kernel reason rather
+        than a dispatch one: `extend_attention_fwd` applies its
+        `SLIDING_WINDOW_SIZE` mask in BOTH stages independently of
+        `USE_CUSTOM_MASK`, per query and in absolute positions
+        (`extend_attention.py:381-387` paged, `:524-529` ragged), and the
+        ragged stage's `elif IS_CAUSAL` branch (`:514-519`) reproduces the
+        chain's lower-triangular draft block exactly. The window is therefore
+        neither widened (no out-of-window token becomes visible) nor narrowed
+        (no in-window token is lost). The paged stage never consulted the mask
+        in the first place -- `skip_prefix_custom_mask` defaults True and the
+        backend never overrides it -- so that stage is bit-identical between
+        the two arms by construction.
+
+        Evidence: `test/registered/attention/unittests/swa/test_triton.py`,
+        `test_chain_verify_on_a_window_layer_needs_no_custom_mask` and its
+        cuda-graph twin. Both arms of each geometry (mask installed / mask
+        dropped) are run against the dense window-aware reference, over prefix
+        below the window, prefix above it, and a window shorter than the draft
+        block. Mutation-checked: removing the ragged stage's causal fallback
+        fails the dropped arm only; removing either stage's window mask fails
+        both.
         """
         kw = dict(plan=True, tokens=True, window=True, swa_hybrid_dcp=True, spec=True)
         _call(3, 3, 2, **kw)
