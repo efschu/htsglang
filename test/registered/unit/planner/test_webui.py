@@ -1157,6 +1157,8 @@ class TestMonitorTargetResolution(CustomTestCase):
 
     def test_detect_endpoint_payload_probes_ports(self):
         with mock.patch.object(
+            webui, "_tcp_open", side_effect=lambda h, p, timeout=0.15: p == 30100
+        ), mock.patch.object(
             webui, "_probe_sglang",
             side_effect=lambda u, timeout=0.8: u.endswith(":30100"),
         ):
@@ -1164,6 +1166,45 @@ class TestMonitorTargetResolution(CustomTestCase):
         self.assertTrue(d["ok"])
         self.assertEqual(d["endpoint"], "http://127.0.0.1:30100")
         self.assertIn(30100, d["probed"])
+
+    def test_detect_endpoint_sweeps_the_whole_sglang_range(self):
+        # The 'detect' button must cover the documented 30000-30100 range, not
+        # just a three-port sample.
+        with mock.patch.object(webui, "_tcp_open", return_value=False):
+            d = webui.detect_endpoint_payload()
+        for p in (30000, 30017, 30100, 8000):
+            self.assertIn(p, d["probed"])
+        self.assertIsNone(d["endpoint"])
+        self.assertFalse(d["explicit"])
+
+    def test_detect_endpoint_tcp_prescan_gates_the_http_probe(self):
+        # A closed port must never reach the (expensive) HTTP probe.
+        with mock.patch.object(webui, "_tcp_open", return_value=False), \
+                mock.patch.object(webui, "_probe_sglang") as probe:
+            webui.detect_endpoint_payload()
+        probe.assert_not_called()
+
+    def test_detect_endpoint_explicit_target_skips_the_sweep(self):
+        with mock.patch.object(webui, "_tcp_open") as scan, \
+                mock.patch.object(webui, "_probe_sglang", return_value=True):
+            d = webui.detect_endpoint_payload({"endpoint": "1.2.3.4:31000"})
+        scan.assert_not_called()
+        self.assertTrue(d["explicit"])
+        self.assertEqual(d["endpoint"], "http://1.2.3.4:31000")
+        self.assertEqual(d["probed"], [31000])
+
+    def test_detect_endpoint_explicit_target_unreachable_reports_why(self):
+        with mock.patch.object(webui, "_probe_sglang", return_value=False):
+            d = webui.detect_endpoint_payload({"endpoint": "host-x:31000"})
+        self.assertIsNone(d["endpoint"])
+        self.assertIn("host-x:31000", d["error"])
+
+    def test_split_host_port_forms(self):
+        self.assertEqual(webui._split_host_port("1.2.3.4:31000"), ("1.2.3.4", 31000))
+        self.assertEqual(
+            webui._split_host_port("http://1.2.3.4:31000"), ("1.2.3.4", 31000))
+        self.assertEqual(webui._split_host_port("1.2.3.4"), ("1.2.3.4", 30000))
+        self.assertEqual(webui._split_host_port(""), (None, None))
 
 
 class TestProfileLaunchWiring(CustomTestCase):
@@ -1464,13 +1505,38 @@ class TestV3HttpRoutes(WebUIFixture):
         self.assertIn("Measured metrics", d["report"])
 
     def test_detect_endpoint_route(self):
-        with mock.patch.object(webui, "_probe_sglang", return_value=False):
+        with mock.patch.object(webui, "_tcp_open", return_value=False):
             with urllib.request.urlopen(
                 f"http://127.0.0.1:{self.port}/api/detect_endpoint", timeout=10
             ) as r:
                 d = json.loads(r.read())
         self.assertTrue(d["ok"])
         self.assertIsNone(d["endpoint"])
+
+    def test_detect_routes_answer_post_too(self):
+        # The page's detect button POSTs a body (explicit host:port / port
+        # list); a GET-only route answered {"error": "not found"}.
+        with mock.patch.object(webui, "_probe_sglang", return_value=True):
+            with self._post_raw(
+                "/api/detect_endpoint", {"endpoint": "1.2.3.4:31000"}
+            ) as r:
+                d = json.loads(r.read())
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["endpoint"], "http://1.2.3.4:31000")
+        with self._post_raw("/api/detect", {}) as r:
+            d = json.loads(r.read())
+        self.assertIn("ok", d)
+        self.assertNotIn("error", d)
+
+    def test_detect_endpoint_route_accepts_query_params(self):
+        with mock.patch.object(webui, "_probe_sglang", return_value=True):
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}"
+                "/api/detect_endpoint?endpoint=1.2.3.4:31000",
+                timeout=10,
+            ) as r:
+                d = json.loads(r.read())
+        self.assertEqual(d["endpoint"], "http://1.2.3.4:31000")
 
     def test_live_snapshot_route_accepts_endpoint_query(self):
         fake_snap = (

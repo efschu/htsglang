@@ -1748,7 +1748,13 @@ _LANDING_TARGET_KEY = None
 #: Ports probed for a reachable sglang server when neither an explicit
 #: endpoint nor a managed instance exists (the user launches servers BY HAND;
 #: the landing page must attach to them regardless of who started them).
-_MONITOR_DETECT_PORTS = (30000, 30100, 8000)
+#: Deliberately SHORT -- this list runs on every landing poll.
+_MONITOR_DETECT_PORTS = (30000, 30001, 30100, 8000)
+
+#: The explicit 'detect' button sweeps the whole documented sglang port range
+#: plus the common OpenAI-API ports. Reached only on demand, and gated behind a
+#: TCP pre-scan, so the width costs nothing when the ports are closed.
+_DETECT_SWEEP_PORTS = tuple(range(30000, 30101)) + (8000, 8080)
 
 #: Cache of the last auto-detected endpoint (re-verified first on each poll so
 #: a stable hand-started server is one cheap probe, not a port sweep).
@@ -2383,22 +2389,88 @@ def _detect_external_endpoint(
     return None
 
 
+def _tcp_open(host: str, port: int, timeout: float = 0.15) -> bool:
+    """True when something accepts a TCP connection on host:port. A closed port
+    refuses instantly, so this pre-scan makes a 100-port sweep cheap; only the
+    ports that answer get the (much more expensive) HTTP probe."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _split_host_port(text: str, default_port: int = 30000):
+    """'host:port' / 'http://host:port' / 'host' / ':port' -> (host, port)."""
+    from urllib.parse import urlsplit
+
+    t = (text or "").strip()
+    if not t:
+        return None, None
+    if "://" not in t:
+        t = "http://" + t
+    parts = urlsplit(t)
+    host = parts.hostname or "127.0.0.1"
+    port = parts.port or default_port
+    return host, int(port)
+
+
 def detect_endpoint_payload(payload: Optional[dict] = None) -> dict:
-    """GET /api/detect_endpoint -> fresh sweep of the common ports (the
-    landing page's 'detect' button). Read-only probes; never boots anything."""
-    ports = list((payload or {}).get("ports") or _MONITOR_DETECT_PORTS)
+    """GET/POST /api/detect_endpoint -> find a reachable sglang server (the
+    landing page's 'detect' button). Read-only probes; never boots anything.
+
+    Accepted payload keys (all optional):
+      ``endpoint``  an explicit ``host:port`` to verify directly -- when given,
+                    only that one target is probed and no sweep runs;
+      ``host``      the host to sweep (default 127.0.0.1);
+      ``ports``     an explicit port list, else the full sglang range
+                    30000-30100 plus the common OpenAI-API ports.
+    """
+    global _DETECTED_ENDPOINT
+    payload = payload or {}
+    explicit = (payload.get("endpoint") or "").strip()
+    if explicit:
+        host, port = _split_host_port(explicit)
+        url = f"http://{host}:{port}"
+        ok = _probe_sglang(url, timeout=1.5)
+        _DETECTED_ENDPOINT = url if ok else None
+        return {
+            "ok": True,
+            "endpoint": url if ok else None,
+            "reachable": [url] if ok else [],
+            "probed": [port],
+            "host": host,
+            "explicit": True,
+            "error": None if ok else f"no sglang server answering at {url}",
+        }
+
+    host = (payload.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    ports = [int(p) for p in (payload.get("ports") or _DETECT_SWEEP_PORTS)]
+    # Two stages: a cheap threaded TCP scan, then the HTTP identity probe only
+    # on the ports that actually accept a connection.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=32) as ex:
+        open_ports = [
+            p for p, is_open in zip(ports, ex.map(lambda p: _tcp_open(host, p), ports))
+            if is_open
+        ]
     reachable = []
-    for p in ports:
-        url = f"http://127.0.0.1:{p}"
+    for p in open_ports:
+        url = f"http://{host}:{p}"
         if _probe_sglang(url):
             reachable.append(url)
-    global _DETECTED_ENDPOINT
     _DETECTED_ENDPOINT = reachable[0] if reachable else None
     return {
         "ok": True,
         "endpoint": reachable[0] if reachable else None,
         "reachable": reachable,
         "probed": ports,
+        "host": host,
+        "tcp_open": open_ports,
+        "explicit": False,
     }
 
 
@@ -2906,7 +2978,14 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/detect_endpoint"):
             # MUST precede the /api/detect prefix check below.
             try:
-                self._json(200, detect_endpoint_payload())
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                if q.get("ports"):
+                    q["ports"] = [
+                        int(x) for x in q["ports"].replace(",", " ").split()
+                    ]
+                self._json(200, detect_endpoint_payload(q))
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
@@ -3039,6 +3118,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._sse_stream(bench_run_events(payload))
             return
         try:
+            # Detect is reachable by BOTH methods: GET (no body) for the plain
+            # button, POST for a body-carrying probe (explicit host:port, custom
+            # port list). The prefix order mirrors do_GET -- the longer
+            # "/api/detect_endpoint" must be tested first.
+            if self.path.startswith("/api/detect_endpoint"):
+                self._json(200, detect_endpoint_payload(payload))
+                return
+            if self.path.startswith("/api/detect"):
+                self._json(200, detect_hardware())
+                return
             if self.path.startswith("/api/gguf_options"):
                 self._json(200, gguf_options_for(payload))
                 return
@@ -3534,7 +3623,7 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       <input id="land_endpoint" placeholder="host:port (blank = managed instance, else auto-detect)" style="max-width:22rem">
       <button class="mini" onclick="setLandingEndpoint()">use</button>
       <button class="mini secondary" onclick="clearLandingEndpoint()" title="clear the explicit endpoint; fall back to managed / auto-detect">auto</button>
-      <button class="mini secondary" onclick="detectLandingEndpoint()" title="probe the common local ports for a reachable sglang server">detect</button>
+      <button class="mini secondary" onclick="detectLandingEndpoint()" title="empty box: sweep the local sglang ports (30000-30100, 8000, 8080). Box filled: verify that host:port.">detect</button>
       <span id="land_target_note" class="muted">resolving&hellip;</span>
     </div>
   </fieldset>
@@ -5633,15 +5722,28 @@ function clearLandingEndpoint(){
   try{ localStorage.removeItem('land_endpoint'); }catch(e){}
   $('land_endpoint').value=''; resetLandingRings(); landingPoll();
 }
+// 'detect' with something typed in the endpoint box VERIFIES that one target;
+// with the box empty it sweeps the local sglang port range. Same endpoint,
+// same button -- the input decides which of the two the user asked for.
 async function detectLandingEndpoint(){
-  $('land_target_note').textContent='probing the common local ports…';
+  const typed=($('land_endpoint').value||'').trim();
+  $('land_target_note').textContent = typed
+    ? ('probing '+typed+'…') : 'sweeping the local sglang ports…';
   try{
-    const d=await (await fetch('/api/detect_endpoint')).json();
+    const r=await fetch('/api/detect_endpoint',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(typed?{endpoint:typed}:{})});
+    const d=await r.json();
     if(d.endpoint){
       $('land_endpoint').value=d.endpoint.replace(/^https?:\/\//,'');
       setLandingEndpoint();
+    } else if(d.explicit){
+      $('land_target_note').textContent=d.error||('no sglang server at '+typed);
     } else {
-      $('land_target_note').textContent='nothing reachable on ports '+(d.probed||[]).join(', ');
+      const pr=d.probed||[];
+      const span=pr.length>4?(pr[0]+'-'+pr[pr.length-1]+' ('+pr.length+' ports)')
+                            :pr.join(', ');
+      $('land_target_note').textContent='nothing reachable on '+span;
     }
   }catch(e){ $('land_target_note').textContent=''+e; }
 }
