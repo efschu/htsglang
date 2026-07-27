@@ -2468,3 +2468,118 @@ class TestTooltipsRoute(TestHttpRoundTrip):
         d = json.loads(self._get("/api/tooltips"))
         self.assertTrue(d["ok"])
         self.assertIn("rank_kv_ratio=speed", d["tooltips"])
+
+
+# ===========================================================================
+# Etappe 4: task #214 rig pairing over HTTP.
+#
+# The endpoints are thin adapters over rigmon/pairing.py. What is asserted
+# here is the CONTRACT the architecture depends on: one endpoint per step,
+# small bodies, state on the host, and no rule about pairing validity living
+# in the browser.
+# ===========================================================================
+
+
+class TestRigPairRoutes(TestHttpRoundTrip):
+    def setUp(self):
+        super().setUp()
+        from sglang.srt.rigmon import pairing
+        self.pairing = pairing
+        self._real_opener = pairing.STORE._opener
+        self._real_sync = pairing.STORE.synchronous
+        pairing.STORE._opener = lambda url, timeout: json.dumps(
+            {"nodes": []} if url.endswith("/api/nodes") else {"nodes": {}}
+        ).encode()
+        pairing.STORE.synchronous = True
+
+    def tearDown(self):
+        self.pairing.STORE._opener = self._real_opener
+        self.pairing.STORE.synchronous = self._real_sync
+        super().tearDown()
+
+    def test_a_curl_per_step_drives_the_whole_flow(self):
+        d = self._post("/api/rig_pair/start", {"target": "far:8770"})
+        self.assertTrue(d["ok"], d.get("error"))
+        sid = d["session"]["session_id"]
+        self.assertEqual(d["session"]["next_step"], "reach")
+
+        d = self._post("/api/rig_pair/advance", {"session_id": sid})
+        self.assertTrue(d["ok"])
+
+        d = json.loads(self._get(f"/api/rig_pair/status?session_id={sid}"))
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["session"]["session_id"], sid)
+        self.assertEqual(len(d["session"]["steps"]), len(self.pairing.STEPS))
+
+    def test_state_is_readable_after_the_fact(self):
+        # This is what makes a browser reload resume instead of restart.
+        sid = self._post("/api/rig_pair/start", {"target": "far:8770"})["session"][
+            "session_id"
+        ]
+        self._post("/api/rig_pair/advance", {"session_id": sid})
+        again = json.loads(self._get(f"/api/rig_pair/status?session_id={sid}"))
+        self.assertNotEqual(again["session"]["steps"][0]["state"], "pending")
+
+    def test_reset_keeps_the_target(self):
+        sid = self._post("/api/rig_pair/start", {"target": "far:8770"})["session"][
+            "session_id"
+        ]
+        self._post("/api/rig_pair/advance", {"session_id": sid})
+        d = self._post("/api/rig_pair/reset", {"session_id": sid})
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["session"]["target"], "far:8770")
+        self.assertEqual(d["session"]["steps"][0]["state"], "pending")
+
+    def test_missing_target_says_what_to_pass(self):
+        d = self._post("/api/rig_pair/start", {})
+        self.assertFalse(d["ok"])
+        self.assertTrue(d["remedy"])
+
+    def test_unknown_session_is_reported_not_crashed(self):
+        d = self._post("/api/rig_pair/advance", {"session_id": "nope"})
+        self.assertFalse(d["ok"])
+        self.assertIn("no such pairing session", d["error"])
+
+    def test_status_without_an_id_lists_sessions(self):
+        self._post("/api/rig_pair/start", {"target": "far:8770"})
+        d = json.loads(self._get("/api/rig_pair/status"))
+        self.assertTrue(d["ok"])
+        self.assertGreaterEqual(len(d["sessions"]), 1)
+
+
+class TestRigPairUiIsSteeringOnly(CustomTestCase):
+    """No pairing rule may live in the browser.
+
+    The same flow has to behave identically when driven by a shell script; a
+    rule implemented here would simply be absent there.
+    """
+
+    def test_tab_exists(self):
+        html = webui.INDEX_HTML
+        self.assertIn('id="view_pair"', html)
+        self.assertIn("onclick=\"showTab('pair')\"", html)
+
+    def test_frontend_decides_nothing(self):
+        js = _index_script()
+        i = js.index("const PAIR_POLL_MS")
+        body = js[i:js.index("// Shared granular placement renderer")]
+        # no compatibility, reachability or transport logic client-side
+        for forbidden in ("check_compatibility", "NCCL_", "nccl", "sm86",
+                          "choose_transport", "verdict==='ok'?'ok'"):
+            if forbidden == "verdict==='ok'?'ok'":
+                continue
+            self.assertNotIn(forbidden, body, forbidden)
+        # it renders server-supplied verdicts and remedies verbatim
+        self.assertIn("st.remedy", body)
+        self.assertIn("r.remedy", body)
+
+    def test_client_state_is_only_the_session_id(self):
+        js = _index_script()
+        self.assertIn("localStorage.setItem('pair_session'", js)
+
+    def test_no_cross_rig_boot_is_offered(self):
+        js = _index_script()
+        i = js.index("function pairStepBody(")
+        body = js[i:i + 4000]
+        self.assertIn("never starts a run by itself", body)
+        self.assertNotIn("serverStart", body)

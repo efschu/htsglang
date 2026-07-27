@@ -2082,6 +2082,87 @@ def tooltips_payload(payload: Optional[dict] = None) -> dict:
     return {"ok": True, "tooltips": tipsmod.tooltip_map(_measured_figures())}
 
 
+# ===========================================================================
+# Task #214 -- rig pairing. THIN adapters only.
+#
+# The flow itself lives in rigmon/pairing.py and runs on the host; these
+# functions map an HTTP call onto it and JSON-shape the answer. One endpoint
+# per step, each taking a small body, so `curl` is a complete client and the
+# dashboard has no privileged path. Nothing here computes anything.
+# ===========================================================================
+
+
+def rig_pair_start_payload(payload: dict) -> dict:
+    """POST /api/rig_pair/start {target} -> a session, held on the host."""
+    from sglang.srt.rigmon import pairing
+
+    target = ((payload or {}).get("target") or "").strip()
+    if not target:
+        return {
+            "ok": False,
+            "error": "no target given",
+            "remedy": "Pass the far rig's rigmon aggregator as host:port.",
+        }
+    try:
+        s = pairing.STORE.create(target)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "session": s.to_json()}
+
+
+def rig_pair_advance_payload(payload: dict) -> dict:
+    """POST /api/rig_pair/advance {session_id[, step]} -> returns immediately.
+
+    The step is started and the call returns; the caller polls
+    ``/api/rig_pair/status``. A slow or unreachable far rig therefore never
+    holds an HTTP request open, and a browser reload mid-step loses nothing
+    because the state is here rather than in the page.
+    """
+    from sglang.srt.rigmon import pairing
+
+    payload = payload or {}
+    sid = (payload.get("session_id") or "").strip()
+    try:
+        s = pairing.STORE.advance(sid, payload.get("step") or None)
+    except KeyError:
+        return {"ok": False, "error": f"no such pairing session: {sid}"}
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "session": s.to_json()}
+
+
+def rig_pair_status_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/rig_pair/status?session_id=... -> the whole flow state."""
+    from sglang.srt.rigmon import pairing
+
+    sid = ((payload or {}).get("session_id") or "").strip()
+    if not sid:
+        return {
+            "ok": True,
+            "sessions": [s.to_json() for s in pairing.STORE.list()],
+        }
+    s = pairing.STORE.get(sid)
+    if s is None:
+        return {"ok": False, "error": f"no such pairing session: {sid}"}
+    return {"ok": True, "session": s.to_json()}
+
+
+def rig_pair_reset_payload(payload: dict) -> dict:
+    """POST /api/rig_pair/reset {session_id} -> clear the results, keep target.
+
+    Retrying after fixing whatever a remedy named is the normal path, so it
+    gets its own verb rather than making the caller start a fresh session and
+    retype the target.
+    """
+    from sglang.srt.rigmon import pairing
+
+    sid = ((payload or {}).get("session_id") or "").strip()
+    s = pairing.STORE.reset(sid)
+    if s is None:
+        return {"ok": False, "error": f"no such pairing session: {sid}"}
+    return {"ok": True, "session": s.to_json()}
+
+
 def flag_catalog_payload(payload: Optional[dict] = None) -> dict:
     """GET /api/flag_catalog -> the full flag catalog metadata, grouped, for
     rendering the runner-tab flag surface (help / hover / dropdown options).
@@ -2735,6 +2816,15 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
+        if self.path.startswith("/api/rig_pair/status"):
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, rig_pair_status_payload(q))
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
         if self.path.startswith("/api/tooltips"):
             try:
                 self._json(200, tooltips_payload())
@@ -2872,6 +2962,15 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/resolve_flags"):
                 self._json(200, resolve_flags_payload(payload))
+                return
+            if self.path.startswith("/api/rig_pair/start"):
+                self._json(200, rig_pair_start_payload(payload))
+                return
+            if self.path.startswith("/api/rig_pair/advance"):
+                self._json(200, rig_pair_advance_payload(payload))
+                return
+            if self.path.startswith("/api/rig_pair/reset"):
+                self._json(200, rig_pair_reset_payload(payload))
                 return
             if self.path.startswith("/api/recompute"):
                 self._json(200, recompute_payload(payload))
@@ -3256,6 +3355,32 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   <button id="tab_landscape" class="tab" onclick="showTab('landscape')">Landscape (benchmark DB)</button>
   <button id="tab_energy" class="tab" onclick="showTab('energy')">Energy (calibration)</button>
   <button id="tab_quality" class="tab" onclick="showTab('quality')">Quality</button>
+  <button id="tab_pair" class="tab" onclick="showTab('pair')">Couple a rig</button>
+</div>
+
+<div id="view_pair" style="display:none">
+  <div class="sub">Couple a second rig, one step at a time. Every step runs on
+    this host &mdash; reachability, the compatibility gate, the transport
+    choice and the configuration are all computed here, exactly like telemetry
+    collection and plan computation are. This page only sends the command and
+    shows what came back, so the same flow is drivable from a script, and
+    reloading the browser resumes rather than restarts.
+    <b>Nothing is booted across rigs</b>: the flow ends at a configuration.</div>
+  <fieldset>
+    <legend>far rig</legend>
+    <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap">
+      <input id="pair_target" placeholder="far rig's rigmon aggregator — host:port"
+        style="max-width:24rem">
+      <button class="mini" onclick="pairStart()">couple</button>
+      <button class="mini secondary" onclick="pairReset()"
+        title="clear the results and run the steps again against the same rig">retry</button>
+      <span id="pair_note" class="muted"></span>
+    </div>
+    <div class="legend" style="margin-top:.3rem">The far rig needs its rigmon
+      aggregator running (<code>python -m sglang.srt.rigmon serve</code>). Only
+      its read-only endpoints are touched; nothing is pushed or changed there.</div>
+  </fieldset>
+  <div id="pair_steps"><span class="muted">enter a rig above to begin.</span></div>
 </div>
 
 <div id="view_landing">
@@ -4846,7 +4971,7 @@ async function doIssue(kind) {
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
 function showTab(t) {
-  const TABS = ['landing','runner','bench','explore','landscape','energy','quality'];
+  const TABS = ['landing','runner','bench','explore','landscape','energy','quality','pair'];
   for (const v of TABS) $('view_'+v).style.display = t===v ? '' : 'none';
   for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
   if ((t==='explore'||t==='landscape') && !window._profLoaded) loadProfiles();
@@ -4857,8 +4982,184 @@ function showTab(t) {
     loadFlagCatalog(); refreshServerStatus();
   }
   if (t==='bench' && !window._benchInit) { window._benchInit=true; benchInit(); }
+  // Pairing state lives on the host, so entering the tab READS it rather than
+  // creating anything -- a flow started from a script shows up here.
+  if (t==='pair') pairRefresh(); else pairStopPoll();
   // The landing page live-poll runs only while its tab is visible.
   if (t==='landing') startLanding(); else stopLanding();
+}
+
+// ===========================================================================
+// Task #214 -- couple a rig. STEERING ONLY.
+//
+// Every decision in this flow is made on the host: whether the far rig is
+// reachable, whether the two are compatible, which transport the measurements
+// support, what the resulting configuration is. This code posts a command and
+// renders the state that comes back. It contains no rule about what makes a
+// pairing valid, and it must not grow one -- the same flow has to behave
+// identically when driven by a shell script, and a rule that lives here would
+// simply be absent there.
+//
+// Consequently the session id is the only client-side state, and it is kept
+// in localStorage so a reload rejoins a flow already running on the host.
+// ===========================================================================
+const PAIR_POLL_MS=1200;
+window._pairTimer=null;
+function pairSession(){
+  try{ return localStorage.getItem('pair_session')||''; }catch(e){ return ''; }
+}
+function setPairSession(id){
+  try{ if(id) localStorage.setItem('pair_session',id);
+       else localStorage.removeItem('pair_session'); }catch(e){}
+}
+function pairStopPoll(){
+  if(window._pairTimer){ clearInterval(window._pairTimer); window._pairTimer=null; }
+}
+function pairStartPoll(){
+  if(window._pairTimer) return;
+  window._pairTimer=setInterval(pairRefresh, PAIR_POLL_MS);
+}
+async function pairStart(){
+  const target=$('pair_target').value.trim();
+  if(!target){ $('pair_note').textContent='enter the far rig as host:port.'; return; }
+  $('pair_note').textContent='creating session…';
+  try{
+    const d=await api('/api/rig_pair/start',{key:'pair', body:{target}});
+    if(!d.ok){ $('pair_note').textContent=d.error+(d.remedy?(' — '+d.remedy):''); return; }
+    setPairSession(d.session.session_id);
+    renderPair(d.session);
+    pairAdvance();
+  }catch(e){ if(!apiAborted(e)) $('pair_note').textContent=apiError(e); }
+}
+async function pairAdvance(step){
+  const sid=pairSession(); if(!sid) return;
+  try{
+    const d=await api('/api/rig_pair/advance',
+      {key:'pair_advance', body:{session_id:sid, step:step||null}});
+    if(d.ok){ renderPair(d.session); pairStartPoll(); }
+    else $('pair_note').textContent=d.error;
+  }catch(e){ if(!apiAborted(e)) $('pair_note').textContent=apiError(e); }
+}
+async function pairReset(){
+  const sid=pairSession(); if(!sid) return;
+  try{
+    const d=await api('/api/rig_pair/reset',{key:'pair', body:{session_id:sid}});
+    if(d.ok) renderPair(d.session);
+  }catch(e){ if(!apiAborted(e)) $('pair_note').textContent=apiError(e); }
+}
+async function pairRefresh(){
+  const sid=pairSession();
+  if(!sid){ setHTML($('pair_steps'),'<span class="muted">enter a rig above to begin.</span>'); return; }
+  try{
+    const d=await api('/api/rig_pair/status?session_id='+encodeURIComponent(sid),
+                      {key:'pair_status', timeout:PAIR_POLL_MS-200});
+    if(!d.ok){ setPairSession(''); pairStopPoll(); return; }
+    renderPair(d.session);
+  }catch(e){}
+}
+const PAIR_TITLES={
+  reach:'1 — reach the far rig',
+  gate:'2 — compatibility gate',
+  transport:'3 — transport',
+  config:'4 — start configuration',
+};
+function pairStateClass(st){
+  if(st==='ok') return 'fitc';
+  if(st==='blocked'||st==='error') return 'nofitc';
+  return 'muted';
+}
+function renderPair(s){
+  if(!s) return;
+  if($('pair_target')!==document.activeElement && !$('pair_target').value)
+    $('pair_target').value=s.target||'';
+  $('pair_note').innerHTML='session <code>'+esc(s.session_id)+'</code> &mdash; '
+    +(s.complete?'complete':('next: '+esc(s.next_step||'—')));
+  // The host says which step runs next, so the poll simply stops when it
+  // says there is nothing running.
+  const running=(s.steps||[]).some(x=>x.state==='running');
+  if(!running) pairStopPoll();
+  let h='';
+  for(const st of (s.steps||[])){
+    const t=PAIR_TITLES[st.step]||st.step;
+    h+='<fieldset data-key="pairstep_'+st.step+'"><legend>'+esc(t)
+      +' <span class="'+pairStateClass(st.state)+'">'+esc(st.state)+'</span></legend>';
+    if(st.error)
+      h+='<div class="reasons">'+esc(st.error)+'</div>';
+    if(st.remedy)
+      h+='<div class="adv"><b>remedy:</b> '+esc(st.remedy)+'</div>';
+    h+=pairStepBody(st);
+    if(st.state==='pending'||st.state==='blocked'||st.state==='error')
+      h+='<div class="actions" style="margin-top:.4rem">'
+        +'<button class="mini" onclick="pairAdvance(\''+st.step+'\')">'
+        +(st.state==='pending'?'run this step':'run again')+'</button></div>';
+    h+='</fieldset>';
+  }
+  setHTML($('pair_steps'), h);
+}
+function pairStepBody(st){
+  const d=st.detail||{};
+  if(st.step==='reach'){
+    if(!d.url) return '';
+    let h='<div class="cfgrow"><span class="cfgk">endpoint</span>'
+      +'<span class="pill">'+esc(d.url)+'</span>';
+    if(d.rtt_ms!=null) h+='<span class="pill">'+d.rtt_ms+' ms</span>';
+    if((d.node_ids||[]).length) h+='<span class="pill">nodes: '+esc(d.node_ids.join(', '))+'</span>';
+    h+='</div>';
+    if(d.reachable && !d.identity)
+      h+='<div class="muted">reachable, but the far rig reports no identity yet.</div>';
+    return h;
+  }
+  if(st.step==='gate'){
+    const rows=d.rows||[];
+    if(!rows.length) return '';
+    // Every unmet row shows its reason AND its remedy. Nothing is greyed out
+    // without saying why, which is the capability table's rule.
+    let h='<table class="mx"><tr><th>check</th><th>verdict</th><th>this rig</th>'
+      +'<th>far rig</th><th style="text-align:left">why / what to do</th></tr>';
+    for(const r of rows){
+      h+='<tr><td style="text-align:left">'+esc(r.label||r.key)+'</td>'
+        +'<td class="'+pairStateClass(r.verdict==='ok'?'ok':(r.verdict==='block'?'blocked':''))
+        +'"><b>'+esc(r.verdict)+'</b></td>'
+        +'<td>'+esc(r.local||'')+'</td><td>'+esc(r.remote||'')+'</td>'
+        +'<td style="text-align:left">'+esc(r.reason||'')
+        +(r.remedy?('<br><span class="muted">'+esc(r.remedy)+'</span>'):'')
+        +'</td></tr>';
+    }
+    return h+'</table>';
+  }
+  if(st.step==='transport'){
+    let h='<div>'+esc(d.note||'')+'</div>';
+    if(d.offer)
+      h+='<div class="adv"><b>not measured yet.</b> '+esc(d.offer.what||'')
+        +' <span class="muted">'+esc(d.offer.cost||'')+'</span>'
+        +'<div class="actions" style="margin-top:.3rem">'
+        +'<button class="mini secondary" onclick="showTab(\'energy\')" '
+        +'title="the study machinery lives in the measurement tabs; this flow never starts a run by itself">'
+        +'open the measurement tools</button></div></div>';
+    const pairs=(d.pairs||[]).filter(p=>!p.same_node);
+    if(pairs.length){
+      h+='<table class="mx"><tr><th>pair</th><th>chosen</th>'
+        +'<th style="text-align:left">options</th></tr>';
+      for(const p of pairs)
+        h+='<tr><td style="text-align:left">'+esc(p.src)+' &rarr; '+esc(p.dst)+'</td>'
+          +'<td>'+(p.chosen?('<b>'+esc(p.chosen)+'</b>'):'<span class="muted">unknown</span>')+'</td>'
+          +'<td style="text-align:left">'+(p.options||[]).map(o=>
+              '<span class="pill" title="'+esc(o.reason||'')+'">'+esc(o.key)+': '+esc(o.verdict)+'</span>'
+            ).join(' ')+'</td></tr>';
+      h+='</table>';
+    }
+    return h;
+  }
+  if(st.step==='config'){
+    if(!d.env) return '';
+    let h='';
+    for(const n of (d.notes||[])) h+='<div class="muted">'+esc(n)+'</div>';
+    h+='<pre>'+esc(Object.keys(d.env).map(k=>k+'='+d.env[k]).join('\n'))+'</pre>';
+    h+='<div class="legend">Placeholders, not this machine\'s values: the '
+      +'block is safe to paste anywhere.</div>';
+    return h;
+  }
+  return '';
 }
 
 // ===========================================================================
@@ -6220,10 +6521,12 @@ function simpleBudgetInput(i){
   setCardBudgetMib(i, parseInt(sl.value)||0);
   // The label follows the thumb at once; the re-plan is debounced behind it.
   const lbl=$('csv_'+i);
-  if(lbl) lbl.textContent=fmtMib(cardBudgetMib(c))+' of '+fmtMib(c.total_mib);
+  if(lbl) lbl.textContent=fmtGiB(cardBudgetMib(c))+' of '+fmtGiB(c.total_mib);
   scheduleRecompute();
 }
-function fmtMib(m){
+// Distinct from the placement renderer's fmtMib: the simple view spells the
+// unit out, because it shows one number per card and has the room.
+function fmtGiB(m){
   if(m==null||isNaN(m)) return 'n/a';
   return (m/1024).toFixed(1)+' GiB';
 }
@@ -6253,7 +6556,7 @@ function renderSimpleCards(placement){
       +'<div class="cs-h"><span class="cs-n">'+esc(c.name||('card '+i))
       +(idx?' <span class="muted" style="font-weight:400">['+esc(idx)+']</span>':'')+'</span>'
       +'<span class="cs-u">'+(need!=null
-          ? esc(fmtMib(need))+' used of '+esc(fmtMib(total))
+          ? esc(fmtGiB(need))+' used of '+esc(fmtGiB(total))
           : 'usage not computed yet')+'</span></div>'
       +'<div class="csbar"><div class="fill'+cls+'" style="width:'+pctNeed.toFixed(1)+'%"></div>'
       +'<div class="cap" style="left:'+pctCap.toFixed(1)+'%" title="budget"></div></div>'
@@ -6261,11 +6564,11 @@ function renderSimpleCards(placement){
       +'maximum VRAM to use</label>'
       +'<input type="range" id="csb_'+i+'" min="0" max="'+total+'" step="256" value="'+budget+'"'
       +' title="'+esc(tip('card_budget'))+'" oninput="simpleBudgetInput('+i+')">'
-      +'<span class="cs-v" id="csv_'+i+'">'+esc(fmtMib(budget))+' of '+esc(fmtMib(total))+'</span>'
+      +'<span class="cs-v" id="csv_'+i+'">'+esc(fmtGiB(budget))+' of '+esc(fmtGiB(total))+'</span>'
       +'</div>';
     if(need!=null&&need>budget)
       h+='<div class="reasons" style="font-size:.7rem;margin-top:.2rem">'
-        +'needs '+esc(fmtMib(need-budget))+' more than this budget allows.</div>';
+        +'needs '+esc(fmtGiB(need-budget))+' more than this budget allows.</div>';
     h+='</div>';
   });
   setHTML(box,h);

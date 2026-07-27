@@ -350,6 +350,42 @@ New module `srt/rigmon/pairing.py`. rigmon today has no client that reads a
    plus environment block to copy, or a handover to the existing start path.
    No cross-rig boot happens in this task.
 
+Endpoints, one per step:
+
+| call | does |
+| --- | --- |
+| `POST /api/rig_pair/start {target}` | create a session on the host |
+| `POST /api/rig_pair/advance {session_id[, step]}` | start one step, return at once |
+| `GET /api/rig_pair/status?session_id=` | the whole flow state (omit the id to list) |
+| `POST /api/rig_pair/reset {session_id}` | clear the results, keep the target |
+
+Design points worth keeping:
+
+* **A blocked step stays current.** The flow does not walk past a gate that
+  said no; re-running the step is how a reader retries after acting on the
+  remedy.
+* **Unreachable is a state, not an exception.** "The other rig is off" is the
+  most common answer the first step gives, and it renders like any other
+  state, with a remedy.
+* **A missing capability warns rather than blocks.** No RDMA means a slower
+  pairing, not an impossible one; blocking there would hide a usable
+  transport. Only the identity checks (commit, torch, arch coverage) block.
+* **Local measurements are not reported as measured.** Having probed *this*
+  rig says nothing about the link to the other one, so a matrix with no
+  cross-rig pairs reports "not measured" and offers the probe — the same
+  honesty rule `transport.choose_all_pairs` applies to individual pairs,
+  one level up.
+* **No real environment value is emitted.** The configuration block is
+  `${VAR:-<placeholder>}` throughout, so it is safe to paste into a
+  repository, an issue or a chat.
+
+Testing without a second machine: `fetch_remote` and `PairingStore` both take
+an `opener`, the same injection seam `EngineScraper(opener=...)` and
+`capabilities.ProbeEnv` already use. `PairingStore.synchronous` runs steps
+inline so assertions do not race the worker thread; one test covers the
+threading itself by proving `advance()` returns while a step is still
+running.
+
 ### 3.4 Benchmark and chess windows (etappe 5)
 
 Running and finished runs separated. Results as tables of
