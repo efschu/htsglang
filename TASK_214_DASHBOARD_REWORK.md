@@ -167,29 +167,82 @@ Diagnosed against the current `INDEX_HTML`, with evidence.
 ### 3.1 Update foundation (etappe 2)
 
 Add a small runtime at the top of the `INDEX_HTML` script, then retrofit the
-render sites. No framework, no CDN — the file stays self-contained.
+render sites. No framework, no CDN — the page stays self-contained.
 
-* `morph(el, html)` — a state-preserving DOM patch. Parses the new markup
-  into a template and walks it against the live tree, matching children by
-  `id` first and by position second. It carries over `open` on `<details>`,
-  `scrollTop`/`scrollLeft` on any scrolled element, and the value, selection
-  range and focus of the active element. Any node containing the active
-  element is skipped entirely, so a field cannot be overwritten while it is
-  being edited. Identical markup short-circuits before touching the DOM.
-* `setHTML(el, html)` — the call site replacement for `el.innerHTML = html`,
-  with a per-element cache of the last applied string.
+The tree diff itself is **morphdom 2.7.8** (MIT, no dependencies, 12 KB),
+vendored under `srt/planner/assets/` and inlined into the page at import
+time. It supplies the algorithm; the policy is ours and lives in the
+`onBeforeElUpdated` hook next to `setHTML`. See §3.1.1 for the reasoning.
+
+* `setHTML(el, html)` — the call site replacement for `el.innerHTML = html`.
+  Runs the new markup through morphdom against the live tree instead of
+  replacing it, with a per-element cache of the last applied string so
+  identical markup does no DOM work at all. A panel the user is typing
+  inside is deferred until focus leaves it.
+* `_beforeElUpdated(fromEl, toEl)` — the policy. A field being edited is
+  skipped entirely, subtree included. The live `open` state of a `<details>`
+  is written back onto the incoming markup so the reader's collapse wins over
+  the renderer's. Scroll offsets are captured and restored.
+* `_nodeKey(n)` — `id`, or `data-key` for nodes that have no business owning
+  a global id.
+* `flagRowHtml` now renders the current value into the markup
+  (`value=`, `checked`, `selected`). Under a patcher the markup is the
+  description of state, so a row that claims to be empty would wipe what the
+  user entered. This also fixes the older bug where a flag-surface re-render
+  dropped every entered value: `_flagSettings` held the truth but nothing
+  wrote it back into the DOM.
 * `api(path, opts)` — the only fetch entry point. Adds
   `AbortSignal.timeout`, a per-key in-flight registry that aborts the
   previous request under the same key (last-write-wins becomes correct
   rather than accidental), and a generation counter so a late response is
   discarded instead of applied.
 * `stale(el)` — marks a panel as refreshing without replacing its content,
-  so a slow call shows the previous numbers dimmed instead of a spinner.
+  so a slow call shows the previous numbers dimmed instead of a spinner. The
+  dim engages only after 250 ms, so the normal fast answer produces no
+  visible change at all.
 * `debounce(fn, ms)` — one implementation, applied to every slider and text
   input that triggers a backend call.
 
 The three offending forced-state writes (§2.2, §2.3) become
 "only on first render" or "only when the user has not touched it".
+
+#### 3.1.1 Third-party code: what is taken in, and what is not
+
+The rule for this branch: prefer a small, established, permissively licensed
+library over a local reimplementation — and never replace something the repo
+already does well.
+
+**Taken in.**
+
+* **morphdom 2.7.8** (MIT, zero dependencies, 12 KB minified, single file),
+  vendored at `python/sglang/srt/planner/assets/morphdom-umd.min.js` with its
+  licence beside it. *For:* the DOM tree diff. *Why not built here:* the diff
+  is fiddly in exactly the places that matter — reordering keyed nodes, and
+  the form elements whose attribute and property values diverge
+  (`<option selected>`, `<input value>`, `<select selectedIndex>`,
+  `<textarea>`). A first local attempt was written and then dropped in favour
+  of this; it was a worse version of the same code. The page inlines it at
+  import time rather than linking it, because the dashboard must work on a
+  machine with no internet and CDN links are barred.
+* **esprima** (BSD, test-only, registered under the `test` extra in
+  `python/pyproject.toml`). *For:* parsing the embedded `<script>` in a unit
+  test. *Why:* the whole front end is one string inside a Python module, so a
+  syntax slip is invisible to every Python test and surfaces only as a blank
+  page in a browser. This closes that gap in CI.
+
+**Deliberately not replaced.** The planner already does these well, and a
+package would be a downgrade: `PerfCostModel` / `roofline` / `capacity` /
+`placement` (all sizing and cost arithmetic stays server-side),
+`planner/scrub.py` (redaction), `planner/github_share.py` (token handling,
+preview-and-confirm, update-in-place via a body marker),
+`planner/scenarios.py` plus `tools/rig_dashboard/studies/` (the study
+machinery), `rigmon/capabilities.py` and `rigmon/compat.py` (the capability
+table and the join gate).
+
+**Still open.** The GitHub Discussions API needs GraphQL. That is a single
+`POST` of a JSON body to one endpoint, which `urllib` already does in
+`github_share.py`; a GraphQL client library would be larger than the code it
+replaces. Etappe 6 follows the existing `urllib` pattern.
 
 ### 3.2 Simple and expert views (etappe 3)
 

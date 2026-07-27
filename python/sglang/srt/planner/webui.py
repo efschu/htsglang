@@ -886,45 +886,6 @@ def gpu_state_payload() -> dict:
     return {"ok": True, "cards": cards}
 
 
-def live_snapshot_payload(payload: dict) -> dict:
-    """One /metrics scrape of a RUNNING target server (#149 live widget /
-    'measure against a running server'). The client polls this at its chosen
-    resolution and computes delta rates locally — the token counters are
-    already Prometheus counters, so prefill/s + decode/s are pure client deltas.
-
-    Also echoes the CLAMPED resolution so the widget cannot poll below the
-    ~30ms floor."""
-    from sglang.srt.planner.energy import (
-        clamp_live_resolution_ms,
-        fetch_live_snapshot,
-    )
-
-    target = (payload.get("target") or "").strip()
-    if not target:
-        return {"ok": False, "error": "no target server (host:port) given"}
-    if not target.startswith("http"):
-        target = "http://" + target
-    resolution_ms = clamp_live_resolution_ms(
-        payload.get("resolution_ms", 250.0))
-    try:
-        snap = fetch_live_snapshot(target)
-    except Exception as e:
-        return {"ok": False, "error": f"scrape of {target}/metrics failed: {e}"}
-    return {
-        "ok": True,
-        "resolution_ms": resolution_ms,
-        "snapshot": {
-            "t": snap.t,
-            "prompt_tokens_total": snap.prompt_tokens_total,
-            "generation_tokens_total": snap.generation_tokens_total,
-            "spec_accept_rate": snap.spec_accept_rate,
-            "spec_num_steps": snap.spec_num_steps,
-            "spec_ema_accept_len": snap.spec_ema_accept_len,
-            "gen_throughput": snap.gen_throughput,
-        },
-    }
-
-
 def scenario_payload(payload: dict) -> dict:
     """Expand a scenario-builder config (#150) into the concrete list of
     phase/behavior run units, and attach the cache-flush warning gate so the UI
@@ -2749,9 +2710,6 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/landscape"):
                 self._json(200, landscape_from_payload(payload))
                 return
-            if self.path.startswith("/api/live"):
-                self._json(200, live_snapshot_payload(payload))
-                return
             if self.path.startswith("/api/scenario"):
                 self._json(200, scenario_payload(payload))
                 return
@@ -2846,7 +2804,21 @@ def serve(host: str = "127.0.0.1", port: int = 8780) -> None:
 # The single HTML page (inline CSS + JS, no CDN, self-contained).
 # ===========================================================================
 
-INDEX_HTML = r"""<!doctype html>
+_ASSET_DIR = os.path.join(os.path.dirname(__file__), "assets")
+
+
+def _vendored_js(name: str) -> str:
+    """Read a vendored front-end asset for inlining into the page.
+
+    The dashboard serves one self-contained page and makes no external
+    requests, so third-party JavaScript is inlined rather than linked. See
+    ``assets/README.md`` for what is vendored and why.
+    """
+    with open(os.path.join(_ASSET_DIR, name), encoding="utf-8") as f:
+        return f.read()
+
+
+_INDEX_TEMPLATE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -3077,6 +3049,17 @@ INDEX_HTML = r"""<!doctype html>
      pixel bucket; never stretched by CSS (stretching would alias samples). */
   .mtile svg.spk { display: block; margin-top: .25rem; background: #0d1117;
                    border-radius: 3px; max-width: 100%; }
+
+  /* ---- refresh affordance -------------------------------------------------
+     A panel waiting on a slow backend call keeps showing its previous
+     numbers, dimmed. Stale-while-revalidate, not a spinner that blanks the
+     panel and throws away what the reader was looking at. The transition is
+     short enough that a fast answer never registers as a flicker. */
+  .stale { opacity: .55; transition: opacity .12s linear; }
+  .stale-note { font-size: .62rem; color: #8b96a5; }
+  /* A backend call that failed or timed out. The panel keeps its last good
+     content; this line says why it is no longer moving. */
+  .rev-error { font-size: .68rem; color: #d29922; margin-top: .25rem; }
 </style>
 </head>
 <body>
@@ -3665,7 +3648,194 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 
 <script>
+/*__VENDOR_MORPHDOM__*/
 const $ = id => document.getElementById(id);
+
+// ===========================================================================
+// Update foundation.
+//
+// The rule this section exists to enforce: a refresh changes numbers and
+// nothing else. It never closes a collapse the reader opened, never discards
+// a scroll position, never overwrites a field that is being typed into, and
+// never lets a slow answer land on top of a newer one.
+//
+// Panels are still described as HTML strings -- that part of the existing
+// design is fine and keeps rendering readable -- but the string is now
+// diffed against the live tree instead of replacing it. Surviving nodes keep
+// their identity, and with it every piece of state the browser hangs off a
+// node rather than off its markup: <details open>, scrollTop, focus,
+// selection range, and the current value of an input.
+//
+// The tree diff is morphdom (MIT, vendored, inlined above -- see
+// assets/README.md). It supplies the algorithm; the rules below about what
+// must survive an update are ours and live in the onBeforeElUpdated hook.
+// ===========================================================================
+
+// Fields carry live state that markup does not describe.
+function _isField(n){
+  const t=n&&n.tagName;
+  return t==='INPUT'||t==='TEXTAREA'||t==='SELECT';
+}
+
+// True when the node is, or contains, whatever the user is working in.
+function _busy(node){
+  const a=document.activeElement;
+  if(!a||a===document.body) return false;
+  return node===a||(node.contains&&node.contains(a));
+}
+
+// Node identity for re-matching across renders: morphdom keys on id by
+// default; data-key extends that to nodes that have no business owning a
+// global id (the two collapses inside the landing start-config block).
+function _nodeKey(n){
+  if(!n||n.nodeType!==1) return '';
+  return n.id||n.getAttribute('data-key')||'';
+}
+
+// The policy hook. Returning false tells morphdom to leave the node and its
+// subtree exactly as they are.
+function _beforeElUpdated(fromEl,toEl){
+  // A field being edited is untouchable -- re-enabling or re-labelling it
+  // mid-keystroke is exactly the sort of false update this rework removes.
+  if(_isField(fromEl)&&_busy(fromEl)) return false;
+  // The open state of a collapse belongs to the reader, not to the renderer.
+  // Deliberate opens go through openDetails(), which is not undone here.
+  if(fromEl.tagName==='DETAILS'&&fromEl.open!==toEl.open){
+    if(fromEl.open) toEl.setAttribute('open',''); else toEl.removeAttribute('open');
+  }
+  // Scroll positions survive: a <pre> the reader scrolled through must not
+  // jump back to the top because a number above it changed.
+  if(fromEl.scrollTop||fromEl.scrollLeft){
+    const t=fromEl.scrollTop, l=fromEl.scrollLeft;
+    _restore.push(()=>{ fromEl.scrollTop=t; fromEl.scrollLeft=l; });
+  }
+  return true;
+}
+let _restore=[];
+
+// The replacement for `el.innerHTML = html`.
+//
+// Two short-circuits before any DOM work: identical markup does nothing at
+// all (this is what makes a 2 s poll free when nothing moved), and a panel
+// the user is typing inside is deferred until focus leaves it.
+function setHTML(el,html){
+  if(!el) return;
+  if(el._lastHTML===html) return;
+  if(_busy(el)&&_isField(document.activeElement)){
+    el._pendingHTML=html;
+    if(!el._flushBound){
+      el._flushBound=true;
+      el.addEventListener('focusout',()=>{
+        setTimeout(()=>{
+          if(el._pendingHTML!=null&&!_busy(el)){
+            const h=el._pendingHTML; el._pendingHTML=null; setHTML(el,h);
+          }
+        },0);
+      });
+    }
+    return;
+  }
+  el._pendingHTML=null;
+  const act=document.activeElement;
+  const sel=(act&&_isField(act)&&act.selectionStart!=null)
+    ?{s:act.selectionStart,e:act.selectionEnd}:null;
+  // childrenOnly: `el` itself is the container the caller owns; only its
+  // contents are described by `html`.
+  const holder=document.createElement(el.tagName==='SELECT'?'select':'div');
+  holder.innerHTML=html;
+  // Rebuilding a <select>'s own option list: the options are markup, the
+  // selection is state. morphdom's SELECT handler derives selectedIndex from
+  // the incoming markup, so the selection is put back explicitly afterwards
+  // if it is still on offer.
+  const wasSel=(el.tagName==='SELECT')?el.value:null;
+  _restore=[];
+  morphdom(el,holder,{childrenOnly:true, getNodeKey:_nodeKey,
+                      onBeforeElUpdated:_beforeElUpdated});
+  for(const f of _restore) f();
+  _restore=[];
+  if(wasSel!=null&&Array.prototype.some.call(el.options,o=>o.value===wasSel))
+    el.value=wasSel;
+  if(act&&document.contains(act)&&document.activeElement!==act){
+    try{
+      act.focus();
+      if(sel&&act.setSelectionRange) act.setSelectionRange(sel.s,sel.e);
+    }catch(e){}
+  }
+  el._lastHTML=html;
+}
+
+// A deliberate open, e.g. "the boot failed, show the log". Recorded so a
+// later poll does not keep re-opening what the reader closed again.
+function openDetails(el){
+  if(!el||el._autoOpened) return;
+  el._autoOpened=true;
+  el.open=true;
+}
+
+// ---- backend calls --------------------------------------------------------
+// Every call is bounded and cancellable. `key` names a logical slot: issuing
+// a second call under the same key aborts the first, so the answer that
+// lands is always the answer to the newest question.
+const API_TIMEOUT_MS=15000;
+window._inflight={};
+async function api(path,opts){
+  opts=opts||{};
+  const key=opts.key||path;
+  const prev=window._inflight[key];
+  if(prev){ try{ prev.abort(); }catch(e){} }
+  const ac=new AbortController();
+  window._inflight[key]=ac;
+  const timer=setTimeout(()=>{ try{ ac.abort(); }catch(e){} },
+                         opts.timeout||API_TIMEOUT_MS);
+  try{
+    const init={signal:ac.signal};
+    if(opts.body!==undefined){
+      init.method=opts.method||'POST';
+      init.body=JSON.stringify(opts.body);
+    } else if(opts.method) init.method=opts.method;
+    const r=await fetch(path,init);
+    return await r.json();
+  } finally {
+    clearTimeout(timer);
+    if(window._inflight[key]===ac) delete window._inflight[key];
+  }
+}
+// An aborted call is a superseded or timed-out call, never a real failure --
+// callers use this to stay quiet instead of painting an error over good data.
+function apiAborted(e){
+  return !!e&&(e.name==='AbortError'||e.name==='TimeoutError');
+}
+function apiError(e){ return apiAborted(e)?'':(''+(e&&e.message||e)); }
+
+// Mark a panel as refreshing without replacing what it shows.
+//
+// The dim engages only after STALE_AFTER_MS, so a fast answer -- which is
+// the normal case -- produces no visible change at all. Flashing a panel on
+// every 2 s poll would be its own kind of jitter, and a spinner that blanks
+// the panel would throw away the numbers the reader is looking at.
+const STALE_AFTER_MS=250;
+function stale(el,on){
+  if(!el) return;
+  if(on===false){
+    if(el._staleTimer){ clearTimeout(el._staleTimer); el._staleTimer=null; }
+    el.classList.remove('stale');
+    return;
+  }
+  if(el._staleTimer) return;
+  el._staleTimer=setTimeout(()=>{ el._staleTimer=null; el.classList.add('stale'); },
+                            STALE_AFTER_MS);
+}
+
+// One debounce implementation. Every control that triggers a backend call
+// on each tick (sliders above all) goes through it.
+function debounce(fn,ms){
+  let t=null;
+  return function(){
+    const args=arguments, self=this;
+    if(t) clearTimeout(t);
+    t=setTimeout(()=>{ t=null; fn.apply(self,args); },ms);
+  };
+}
 
 // Serving identity is owned by the MODEL selector + the SERVING form group,
 // NOT by the flag surface -- these catalog ids are hidden there and routed to
@@ -3827,7 +3997,7 @@ async function onModelChange() {
   if (opts.length) {
     window._modelMeta = {format:'gguf', variants: opts.map(o=>({filename:o}))};
     if (opts.length > 1) {
-      $('gguf_choice').innerHTML = opts.map(o=>'<option value="'+esc(o)+'">'+esc(o)+'</option>').join('');
+      setHTML($('gguf_choice'), opts.map(o=>'<option value="'+esc(o)+'">'+esc(o)+'</option>').join(''));
       $('gguf_pick').style.display = '';
     }
   }
@@ -3925,12 +4095,13 @@ async function doPlan() {
   $('verdict').innerHTML = '<div class="verdict">sizing…</div>';
   $('split').innerHTML = '';
   try {
-    const r = await fetch('/api/plan', {method:'POST', body: JSON.stringify(payload())});
-    const d = await r.json();
+    const d = await api('/api/plan', {key:'plan', body:payload()});
     render(d);
   } catch (e) {
+    // Superseded by a newer edit: the newer plan owns the panel, say nothing.
+    if (apiAborted(e)) return;
     $('verdict').innerHTML = '<div class="verdict nofit">PLAN ERROR</div>';
-    $('split').innerHTML = '<ul class="reasons"><li>' + esc(String(e)) + '</li></ul>';
+    $('split').innerHTML = '<ul class="reasons"><li>' + esc(apiError(e)) + '</li></ul>';
   }
 }
 
@@ -4739,10 +4910,19 @@ function stopLanding(){ if(window._landTimer){ clearInterval(window._landTimer);
 async function landingPoll(){
   let d;
   const ep=landingEndpoint();
+  const live=$('landing_live');
   try{
-    const r=await fetch('/api/live_snapshot'+(ep?('?endpoint='+encodeURIComponent(ep)):''));
-    d=await r.json();
-  }catch(e){ return; }
+    // Keyed on 'landing': a poll that is still outstanding when the next
+    // tick fires is aborted, so two snapshots can never race to paint the
+    // same panels. The timeout is just under the poll period for the same
+    // reason. While it is out, the panel dims rather than blanks.
+    stale(live,true);
+    d=await api('/api/live_snapshot'+(ep?('?endpoint='+encodeURIComponent(ep)):''),
+                {key:'landing', timeout:LAND_POLL_MS-200});
+  }catch(e){
+    if(!apiAborted(e)) $('land_target_note').textContent='snapshot unavailable: '+apiError(e);
+    return;
+  } finally { stale(live,false); }
   window._lastTarget=d && d.target;
   if(d && d.target){
     $('land_target_note').innerHTML='monitoring <b>'+esc(d.target.endpoint)+'</b> ('
@@ -4823,22 +5003,29 @@ function renderStartConfig(s, tgt){
   for(const [name,row] of groups)
     if(row.trim()) h+='<div class="cfgrow"><span class="cfgk">'+esc(name)+'</span>'+row+'</div>';
   h+='<div class="legend" style="margin-top:.25rem">source: '+esc(n.src)+'</div>';
+  // data-key gives the patcher a stable identity for these two collapses, so
+  // they are re-matched across polls even when the groups above them change
+  // shape. Without it they would fall back to positional matching, which is
+  // correct but fragile once a group appears or disappears mid-run.
   if(n.argv||n.env){
-    h+='<details style="margin-top:.3rem"><summary class="muted" style="cursor:pointer">full launch command + env</summary><pre>';
+    h+='<details data-key="cfg_launch" style="margin-top:.3rem"><summary class="muted" style="cursor:pointer">full launch command + env</summary><pre>';
     if(n.env) for(const k of Object.keys(n.env)) h+=esc(k+'='+n.env[k])+'\n';
     if(n.argv) h+=esc(n.argv.join(' '));
     h+='</pre></details>';
   }
   if(n.raw)
-    h+='<details style="margin-top:.3rem"><summary class="muted" style="cursor:pointer">raw server_info</summary>'
-      +'<pre style="max-height:260px;overflow:auto">'+esc(JSON.stringify(n.raw,null,1))+'</pre></details>';
+    h+='<details data-key="cfg_raw" style="margin-top:.3rem"><summary class="muted" style="cursor:pointer">raw server_info</summary>'
+      +'<pre data-key="cfg_raw_pre" style="max-height:260px;overflow:auto">'+esc(JSON.stringify(n.raw,null,1))+'</pre></details>';
   return h;
 }
 function renderLanding(s, tgt){
   window._lastSnapshot=s;
-  $('landing_config').innerHTML=renderStartConfig(s, tgt)
+  // Patched, not replaced: this block carries two <details> ("full launch
+  // command + env", "raw server_info") and a scrollable <pre>. Rewriting it
+  // wholesale on every 2 s tick is what used to slam them shut.
+  setHTML($('landing_config'), renderStartConfig(s, tgt)
     +(s.metrics_error?'<div class="reasons" style="margin-top:.3rem">'+esc(s.metrics_error)
-      +' &mdash; token rates need --enable-metrics on the server.</div>':'');
+      +' &mdash; token rates need --enable-metrics on the server.</div>':''));
 
   // Per-card 60s telemetry rings (rendered INSIDE the placement card blocks,
   // renderPlacement's live line -- the old standalone per-GPU chart grid is
@@ -5000,8 +5187,8 @@ async function renderLandingPlacement(s){
       gh+='<div class="cardblock"><div><b>'
         +(devLabel(g.cuda_index, g.nvml_index)||('#'+g.nvml_index))+'</b> '
         +esc(g.name)+'</div>'+cardLiveHtml(g)+'</div>';
-    $('landing_placement').innerHTML=
-      '<span class="muted">no start config for placement (external server without /get_server_info).</span>'+gh;
+    setHTML($('landing_placement'),
+      '<span class="muted">no start config for placement (external server without /get_server_info).</span>'+gh);
     return;
   }
   const flags={
@@ -5039,14 +5226,17 @@ async function renderLandingPlacement(s){
     ct[k]=g.mem_total_mib; cn[k]=g.name; });
   flags.card_total_mib=ct; flags.card_name=cn;
   try{
-    const r=await fetch('/api/placement',{method:'POST',body:JSON.stringify(
-      {model, gguf_choice: cfg.gguf_variant||null, flags})});
-    const d=await r.json();
-    $('landing_placement').innerHTML = d.ok
+    const d=await api('/api/placement',{key:'placement_landing',
+      body:{model, gguf_choice: cfg.gguf_variant||null, flags}});
+    setHTML($('landing_placement'), d.ok
       ? renderPlacement(d.placement, s.gpus, {graphCapture: window._lastGraphCapture})
       : '<span class="reasons">'+esc(d.error)+'</span>'
-        +((s.gpus&&s.gpus.length)?'':(s.nvml_error?'<div class="muted">no NVML cards ('+esc(s.nvml_error)+')</div>':''));
-  }catch(e){ $('landing_placement').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
+        +((s.gpus&&s.gpus.length)?'':(s.nvml_error?'<div class="muted">no NVML cards ('+esc(s.nvml_error)+')</div>':'')));
+  }catch(e){
+    // A superseded call is not a failure; the panel keeps the newer answer.
+    if(apiAborted(e)) return;
+    setHTML($('landing_placement'),'<span class="reasons">'+esc(apiError(e))+'</span>');
+  }
 }
 
 // ===========================================================================
@@ -5096,25 +5286,38 @@ function flagSection(f){
 // switch for bool / compact dropdown for enum / numeric or text input), a
 // pure-CSS "?" hover at the row end. Ids flrow_/fl_/flq_/flh_ are unchanged
 // so resolve()-driven greying, auto-set notes and profiles keep working.
+// The row markup describes the CURRENT value, not an empty control.
+// _flagSettings is the single source of truth for what a knob is set to, and
+// the row now says so out loud. That matters twice over: the patcher treats
+// markup as the description of state, and the old full rebuild used to drop
+// every entered value because the markup claimed the field was empty.
+function _flagValue(id){
+  const v=(window._flagSettings||{})[id];
+  return (v==null||v===false)?'':String(Array.isArray(v)?v.join(','):v);
+}
 function flagRowHtml(f){
   const src=f.source!=='upstream'? ' <span class="pill">'+esc(f.source)+'</span>':'';
+  const cur=_flagValue(f.id);
   let h='<div class="setrow" id="flrow_'+f.id+'">'
     +'<span class="lbl" title="'+esc(f.hover||f.help||'')+'">'+esc(f.name)+src
     +' <span class="flag-q" id="flq_'+f.id+'" style="color:#e3a008"></span>'
     +'<span class="chg" title="changed from preset"></span></span>';
   if(f.type==='bool')
-    h+='<label class="switch"><input type="checkbox" id="fl_'+f.id
-      +'" onchange="onFlagChange(\''+f.id+'\')"><span class="track"></span></label>';
+    h+='<label class="switch"><input type="checkbox" id="fl_'+f.id+'"'
+      +(cur?' checked':'')+' onchange="onFlagChange(\''+f.id+'\')"><span class="track"></span></label>';
   else if(f.allowed)
-    h+='<select id="fl_'+f.id+'" onchange="onFlagChange(\''+f.id+'\')"><option value="">(default)</option>'
-      +f.allowed.map(a=>'<option value="'+esc(String(a))+'">'+esc(String(a))+'</option>').join('')+'</select>';
+    h+='<select id="fl_'+f.id+'" onchange="onFlagChange(\''+f.id+'\')">'
+      +'<option value=""'+(cur===''?' selected':'')+'>(default)</option>'
+      +f.allowed.map(a=>'<option value="'+esc(String(a))+'"'
+        +(String(a)===cur?' selected':'')+'>'+esc(String(a))+'</option>').join('')+'</select>';
   else if(f.type==='int'||f.type==='float')
     h+='<input type="number" class="num" id="fl_'+f.id+'" placeholder="'
-      +(f.default!=null?esc(String(f.default)):'auto')+'" '
+      +(f.default!=null?esc(String(f.default)):'auto')+'" value="'+esc(cur)+'" '
       +(f.type==='float'?'step="any" ':'')+'onchange="onFlagChange(\''+f.id+'\')">';
   else
     h+='<input type="text" id="fl_'+f.id+'" placeholder="'
-      +(f.default!=null?esc(String(f.default)):'default')+'" onchange="onFlagChange(\''+f.id+'\')">';
+      +(f.default!=null?esc(String(f.default)):'default')+'" value="'+esc(cur)
+      +'" onchange="onFlagChange(\''+f.id+'\')">';
   h+='<span class="qmark" title="'+esc(f.help||f.hover||'')+'">?</span></div>'
     +'<div class="knob-help" id="flh_'+f.id+'"></div>';
   return h;
@@ -5133,8 +5336,12 @@ function renderFlagSurface(){
   for(const sec of SECTION_KEYS)
     bySec[sec].sort((a,b)=>(a.source!=='upstream')-(b.source!=='upstream')
       || (a.id<b.id?-1:1));
+  // Patched: the rows carry the user's current values, and the patcher keeps
+  // them. The old full rebuild dropped every entered value on the floor --
+  // window._flagSettings held the truth but nothing wrote it back into the
+  // DOM afterwards.
   for(const sec of ['context','gpu','speculative','cache','serving'])
-    $('secflags_'+sec).innerHTML=bySec[sec].map(flagRowHtml).join('');
+    setHTML($('secflags_'+sec), bySec[sec].map(flagRowHtml).join(''));
   // advanced: everything else, still grouped by catalog group for
   // navigability, all behind the ONE toggle.
   const byGrp={};
@@ -5145,7 +5352,7 @@ function renderFlagSurface(){
       +esc(g)+'</b> <span class="muted">('+byGrp[g].length+')</span></summary>'
       +byGrp[g].map(flagRowHtml).join('')+'</details>';
   }
-  $('sec_advanced').innerHTML=ah;
+  setHTML($('sec_advanced'), ah);
   $('adv_count').textContent='('+bySec.advanced.length+' more flags)';
   filterFlags();
   updateSectionSummaries();
@@ -5183,10 +5390,19 @@ function filterFlags(){
       if(hit) secHits[window._flagSection[f.id]||'advanced']++;
     }
   }
+  // A search opens the sections that have hits, so the reader can see what
+  // matched. Clearing the search must NOT slam everything shut again: only
+  // the sections the search itself opened are put back, and a section the
+  // reader opened by hand is left alone. That is what _searchOpened records.
   for(const sec of ['context','gpu','speculative','cache','serving']){
     const det=$('sec_'+sec); if(!det) continue;
-    if(q){ det.style.display=secHits[sec]?'':'none'; det.open=secHits[sec]>0; }
-    else { det.style.display=''; det.open=false; }
+    if(q){
+      det.style.display=secHits[sec]?'':'none';
+      if(secHits[sec]>0 && !det.open){ det.open=true; det._searchOpened=true; }
+    } else {
+      det.style.display='';
+      if(det._searchOpened){ det.open=false; det._searchOpened=false; }
+    }
   }
   // advanced groups: show only those with hits while searching.
   let gi=0; let det;
@@ -5195,7 +5411,9 @@ function filterFlags(){
     for(const row of det.querySelectorAll('.setrow'))
       if(row.style.display!=='none') vis++;
     det.style.display=vis?'':'none';
-    det.open=!!q && vis>0;
+    if(q){
+      if(vis>0 && !det.open){ det.open=true; det._searchOpened=true; }
+    } else if(det._searchOpened){ det.open=false; det._searchOpened=false; }
   }
   $('sec_advanced').style.display =
     q? (secHits.advanced?'':'none') : ($('advanced_toggle').checked?'':'none');
@@ -5263,23 +5481,27 @@ function setCtxCap(cap){
   sl.value=Math.min(v||8192, parseInt(sl.max));
   updateSectionSummaries();
 }
+const _reflow=debounce(()=>{ refreshRunnerPlacement(); }, 180);
 function ctxFromSlider(){
   $('sv_ctx').value=$('sv_ctx_slider').value;
-  onServingEdit(); refreshRunnerPlacement();
+  onServingEdit(); _reflow();
 }
 function ctxFromNum(){
   const sl=$('sv_ctx_slider');
   sl.value=Math.min(parseInt($('sv_ctx').value)||8192, parseInt(sl.max));
-  onServingEdit(); refreshRunnerPlacement();
+  onServingEdit(); _reflow();
 }
+// Sliders fire on every pixel of travel. The label follows the thumb at once
+// (that has to feel immediate), the backend work is debounced behind it.
+const _replan=debounce(()=>{ doPlan(); refreshRunnerPlacement(); }, 180);
 function mrrFromSlider(){
   $('max_running_requests').value=$('mrr_slider').value;
-  onServingEdit(); doPlan(); refreshRunnerPlacement();
+  onServingEdit(); _replan();
 }
 function mrrFromNum(){
   const v=parseInt($('max_running_requests').value);
   if(v) $('mrr_slider').value=Math.min(v, 64);
-  onServingEdit(); doPlan(); refreshRunnerPlacement();
+  onServingEdit(); _replan();
 }
 function onServingEdit(){ markPresetDrift(); updateSectionSummaries(); }
 // ---- single-GPU card selector (tp=1): writes the stock --base-gpu-id ------
@@ -5557,9 +5779,9 @@ async function resolveFlags(){
   if(!window._flagCat) return;
   const model=$('model').value.trim();
   try{
-    const r=await fetch('/api/resolve_flags',{method:'POST',
-      body:JSON.stringify({settings:collectFlagSettings(), model})});
-    const d=await r.json(); if(!d.ok) return;
+    const d=await api('/api/resolve_flags',{key:'resolve_flags',
+      body:{settings:collectFlagSettings(), model}});
+    if(!d.ok) return;
     applyFieldStates(d.fields); renderFlagWarnings(d.warnings);
   }catch(e){}
 }
@@ -5577,12 +5799,9 @@ function applyFieldStates(fields){
       if(st.error) parts.push(st.error);
       help.innerHTML = parts.length? '<span class="'+(st.error?'nofitc':'muted')+'">'+esc(parts.join(' · '))+'</span>':'';
     }
-    if(st.options && el.tagName==='SELECT'){
-      const cur=el.value;
-      el.innerHTML='<option value="">(default)</option>'
-        +st.options.map(a=>'<option value="'+esc(String(a))+'">'+esc(String(a))+'</option>').join('');
-      el.value=cur;
-    }
+    if(st.options && el.tagName==='SELECT')
+      setHTML(el, '<option value="">(default)</option>'
+        +st.options.map(a=>'<option value="'+esc(String(a))+'">'+esc(String(a))+'</option>').join(''));
   }
 }
 function renderFlagWarnings(ws){
@@ -5650,13 +5869,17 @@ function flagsAreForkish(f){
 }
 async function refreshRunnerPlacement(){
   const model=$('model').value.trim(); if(!model) return;
+  const rp=$('runner_placement');
   try{
     const flags=runnerFlags();
     const wantStock=flagsAreForkish(flags);
-    const r=await fetch('/api/placement',{method:'POST',body:JSON.stringify(
-      {model, gguf_choice: ($('gguf_pick').style.display!=='none'?$('gguf_choice').value:null),
-       flags, stock_compare: wantStock})});
-    const d=await r.json();
+    // Keyed 'placement_runner': the previous call is aborted, so the panel
+    // always shows the answer to the CURRENT flag set. Dimming while it is
+    // out keeps the previous numbers readable instead of blanking them.
+    stale(rp,true);
+    const d=await api('/api/placement',{key:'placement_runner',
+      body:{model, gguf_choice: ($('gguf_pick').style.display!=='none'?$('gguf_choice').value:null),
+            flags, stock_compare: wantStock}});
     let html;
     if(d.ok){
       const mainH=renderPlacement(d.placement);
@@ -5680,16 +5903,19 @@ async function refreshRunnerPlacement(){
     } else html='<span class="reasons">'+esc(d.error)+'</span>';
     // ONE renderer, mirrored: the right-column overview AND the GPU
     // offload/split section (config + its effect live together).
-    $('runner_placement').innerHTML = html;
-    const gp=$('gpu_placement'); if(gp) gp.innerHTML=html;
-  }catch(e){ $('runner_placement').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
+    setHTML(rp, html);
+    setHTML($('gpu_placement'), html);
+  }catch(e){
+    if(apiAborted(e)) return;
+    setHTML(rp,'<span class="reasons">'+esc(apiError(e))+'</span>');
+  } finally { stale(rp,false); }
 }
 async function loadConfigProfiles(){
   const model=$('model').value.trim();
   try{
     const q=model? ('?model='+encodeURIComponent(model)):'';
-    const r=await fetch('/api/config_profiles'+q); const d=await r.json();
-    if(!d.ok){ $('profile_pick').innerHTML='<span class="reasons">'+esc(d.error||'error')+'</span>'; return; }
+    const d=await api('/api/config_profiles'+q,{key:'profiles'});
+    if(!d.ok){ setHTML($('profile_pick'),'<span class="reasons">'+esc(d.error||'error')+'</span>'); return; }
     // Draft-model candidates + MTP-head fact for the Speculative section's
     // selector and no-MTP hint (matched server-side per selected model).
     window._draftCandidates=d.draft_candidates||[];
@@ -5705,8 +5931,11 @@ async function loadConfigProfiles(){
         +esc((p.info||[]).join(' | '))+'">'+esc(p.name)
         +(i>=nGen?' (saved)':'')+'</option>').join('')
       +'</select>';
-    $('profile_pick').innerHTML=h;
-  }catch(e){ $('profile_pick').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
+    setHTML($('profile_pick'), h);
+  }catch(e){
+    if(apiAborted(e)) return;
+    setHTML($('profile_pick'),'<span class="reasons">'+esc(apiError(e))+'</span>');
+  }
 }
 // Mirror a profile's serving-identity value into its ONE authoritative field
 // (the SERVING group / the model selector) -- the user can still override it
@@ -5924,45 +6153,11 @@ async function refreshGpuState() {
   } catch(e) { $('gpu_state_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
 }
 
-// ---- #149 live widget (client-side delta rates off /metrics) ----
-window._liveTimer = null; window._livePrev = null;
-async function liveScrape() {
-  const target = $('live_target').value.trim();
-  const res = parseFloat($('live_res').value) || 250;
-  const r = await fetch('/api/live', {method:'POST', body: JSON.stringify({target, resolution_ms:res})});
-  const d = await r.json();
-  if (!d.ok) { $('live_out').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; return d; }
-  const s = d.snapshot; let rates = null;
-  if (window._livePrev) {
-    const dt = s.t - window._livePrev.t;
-    const pfx = dt>0 ? Math.max(0, s.prompt_tokens_total - window._livePrev.prompt_tokens_total)/dt : 0;
-    const dec = dt>0 ? Math.max(0, s.generation_tokens_total - window._livePrev.generation_tokens_total)/dt : 0;
-    rates = {dt, pfx, dec};
-  }
-  window._livePrev = s;
-  let h = '<b>resolution:</b> '+d.resolution_ms+'ms (floor 30ms)<br>';
-  if (rates) {
-    h += '<b>prefill:</b> '+rates.pfx.toFixed(1)+' tok/s &nbsp; '
-       + '<b>decode:</b> '+rates.dec.toFixed(1)+' tok/s<br>';
-  } else { h += '<span class="muted">(first sample — rates on next tick)</span><br>'; }
-  h += '<b>MTP accept rate:</b> '+(s.spec_accept_rate*100).toFixed(1)+'% &nbsp; '
-     + '<b>adaptive-k:</b> '+s.spec_num_steps+' &nbsp; '
-     + '<b>ema accept len:</b> '+s.spec_ema_accept_len.toFixed(2);
-  $('live_out').innerHTML = h;
-  return d;
-}
-async function toggleLive() {
-  if (window._liveTimer) {
-    clearInterval(window._liveTimer); window._liveTimer=null; window._livePrev=null;
-    $('live_btn').textContent = 'start live'; return;
-  }
-  const res = Math.max(30, parseFloat($('live_res').value) || 250);
-  window._livePrev = null;
-  $('live_btn').textContent = 'stop live';
-  await liveScrape();
-  window._liveTimer = setInterval(liveScrape, res);
-}
-async function remeasureNow() { window._livePrev = null; await liveScrape(); }
+// The #149 live widget that used to sit here is gone. It addressed
+// live_target / live_res / live_btn / live_out, none of which have existed
+// in the markup since the landing strip replaced it, so its interval fetched
+// nothing and its output went nowhere. The landing top strip (stripTile,
+// LAND_POLL_MS) is the live rate view. POST /api/live went with it.
 
 // ---- #150 scenario builder + cache-flush confirm gate ----
 async function previewScenario() {
@@ -6049,8 +6244,8 @@ function pickFromDropdown() {
   $('model').value = m.path;
   window._modelMeta = {format: m.format, variants: m.gguf_variants||[]};
   if (m.gguf_variants && m.gguf_variants.length>1) {
-    $('gguf_choice').innerHTML = m.gguf_variants
-      .map(v=>'<option value="'+esc(v.filename)+'">'+esc(v.quant)+' ('+v.size_gib+'G)</option>').join('');
+    setHTML($('gguf_choice'), m.gguf_variants
+      .map(v=>'<option value="'+esc(v.filename)+'">'+esc(v.quant)+' ('+v.size_gib+'G)</option>').join(''));
     $('gguf_pick').style.display='';
   } else {
     $('gguf_pick').style.display='none';
@@ -6107,8 +6302,8 @@ function pollStatusUntilSettled(){
   window._bootPoll=setInterval(async ()=>{
     if(--left<0){ clearInterval(window._bootPoll); window._bootPoll=null; return; }
     try{
-      const d=await (await fetch('/api/server_status')).json();
-      $('sv_out').innerHTML=renderServerStatus(d);
+      const d=await api('/api/server_status',{key:'boot_status', timeout:1800});
+      setHTML($('sv_out'), renderServerStatus(d));
       const st=(d.status&&d.status.state)||d.state;
       if(st!=='booting'){ clearInterval(window._bootPoll); window._bootPoll=null; }
     }catch(e){}
@@ -6118,8 +6313,10 @@ function renderServerStatus(d) {
   if (!d) return '';
   const st=(d.status&&d.status.state)||d.state;
   updateStatusChip(st);
-  const bl=$('boot_log');
-  if(bl && (st==='error'||st==='booting')) bl.open=true;
+  // Open the boot log ONCE when the boot starts or fails. openDetails records
+  // that it was opened for the reader, so re-collapsing it sticks instead of
+  // being undone by the next 2 s poll.
+  if(st==='error'||st==='booting') openDetails($('boot_log'));
   if (!d.ok && d.error) {
     let h = '<div class="reasons">'+esc(d.error)+'</div>';
     if (d.busy) h += '<div class="muted">restart is guarded while a live job is in-flight.</div>';
@@ -6199,7 +6396,7 @@ async function dlTargets() {
     $('dl_btn').disabled = !d.writable;
     if (d.gguf_variants && d.gguf_variants.length) {
       $('dl_variants').style.display='';
-      $('dl_quant').innerHTML = d.gguf_variants.map(v=>'<option value="'+esc(v.quant)+'">'+esc(v.quant)+' ('+esc(v.filename)+')</option>').join('');
+      setHTML($('dl_quant'), d.gguf_variants.map(v=>'<option value="'+esc(v.quant)+'">'+esc(v.quant)+' ('+esc(v.filename)+')</option>').join(''));
     } else { $('dl_variants').style.display='none'; }
     if (d.repo_error) note += '<br><span class="reasons">'+esc(d.repo_error)+'</span>';
     $('dl_out').innerHTML = note;
@@ -6261,11 +6458,15 @@ function verdictClass(v) {
 async function autofillQuality() {
   // Use the currently running managed server (endpoint + served model) so the
   // Quality run targets whatever is loaded, without retyping it.
+  // Autofill FILLS; it does not overwrite. Switching to this tab used to
+  // stamp over whatever endpoint or model name had been typed by hand.
   try {
-    const s = (await (await fetch('/api/server_status')).json()).status || {};
+    const d = await api('/api/server_status',{key:'quality_autofill', timeout:3000});
+    const s = (d && d.status) || {};
     if (s.state === 'ready' && s.port) {
-      $('q_endpoint').value = '127.0.0.1:' + s.port;
-      if (s.served_model_name) $('q_model').value = s.served_model_name;
+      if (!$('q_endpoint').value.trim()) $('q_endpoint').value = '127.0.0.1:' + s.port;
+      if (s.served_model_name && !$('q_model').value.trim())
+        $('q_model').value = s.served_model_name;
     }
   } catch(e) {}
 }
@@ -6527,3 +6728,10 @@ showTab('landing');
 </body>
 </html>
 """
+
+# The page is assembled once, at import time, with every vendored asset
+# inlined. INDEX_HTML stays a plain string constant: the handler serves it
+# verbatim and the tests read it directly, exactly as before.
+INDEX_HTML = _INDEX_TEMPLATE.replace(
+    "/*__VENDOR_MORPHDOM__*/", _vendored_js("morphdom-umd.min.js")
+)

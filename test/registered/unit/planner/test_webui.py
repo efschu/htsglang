@@ -9,12 +9,16 @@ testing the API IS testing the UI's contract.
 
 import json
 import os
+import re
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from unittest import mock
+
+import pytest
 
 from sglang.srt.planner import webui
 from sglang.srt.planner.hardware import hardware_from_manual  # noqa: F401
@@ -267,10 +271,6 @@ class TestHttpRoundTrip(WebUIFixture):
             "will_flush": True, "target_running_server": False})
         self.assertTrue(w["warn"])
         self.assertFalse(w["mandatory"])            # fresh server = informative
-        # live scrape of a nonexistent target fails gracefully (no raise).
-        live = self._post("/api/live", {"target": "127.0.0.1:1"})
-        self.assertFalse(live["ok"])
-        self.assertIn("error", live)
 
 
 class TestEnergyRoutePayloads(CustomTestCase):
@@ -2089,3 +2089,181 @@ class TestColocationControls(CustomTestCase):
         self.assertLess(i_colo, i_snap)
         self.assertIn("window._coloRedistribute=false;\n  updateGpuPick(); updateColoUI();",
                       html)
+
+
+# ===========================================================================
+# Update foundation (dashboard rework): the front end is one embedded script,
+# so a syntax slip in it is invisible to every Python test and shows up only
+# as a blank page in a browser. These tests close that gap and pin the
+# state-preserving update rules that the rework exists to enforce.
+# ===========================================================================
+
+
+def _index_script() -> str:
+    """The embedded <script> body of INDEX_HTML."""
+    m = re.search(r"<script>(.*)</script>", webui.INDEX_HTML, re.S)
+    assert m, "INDEX_HTML has no <script> block"
+    return m.group(1)
+
+
+class TestIndexScriptParses(CustomTestCase):
+    def test_embedded_javascript_is_syntactically_valid(self):
+        esprima = pytest.importorskip("esprima")
+        src = _index_script()
+        # The parser is an ES2017 implementation; the page uses two later
+        # operators. Rewriting them keeps this a pure syntax check without
+        # holding the page back to ES2017.
+        norm = src.replace("??", "||").replace("?.", ".")
+        try:
+            esprima.parseScript(norm)
+        except Exception as e:  # pragma: no cover - only on a real break
+            self.fail(f"INDEX_HTML script does not parse: {e}")
+
+
+class TestUpdateFoundation(CustomTestCase):
+    """A refresh may change numbers and nothing else."""
+
+    def test_patcher_and_bounded_fetch_helpers_exist(self):
+        js = _index_script()
+        for fn in ("function setHTML(", "function _beforeElUpdated(",
+                   "function _nodeKey(", "function openDetails(",
+                   "async function api(", "function apiAborted(",
+                   "function stale(", "function debounce("):
+            self.assertIn(fn, js, fn)
+
+    def test_dom_patching_uses_the_vendored_library(self):
+        # The tree diff is morphdom (MIT, vendored); only the policy is ours.
+        js = _index_script()
+        self.assertIn("morphdom(el,holder,{childrenOnly:true", js)
+        self.assertIn("onBeforeElUpdated:_beforeElUpdated", js)
+
+    def test_every_backend_call_is_bounded(self):
+        # api() is the only fetch entry point that may be used for polling;
+        # it carries the AbortController and the timeout.
+        js = _index_script()
+        self.assertIn("new AbortController()", js)
+        self.assertIn("opts.timeout||API_TIMEOUT_MS", js)
+
+    def test_landing_poll_patches_instead_of_replacing(self):
+        # The 2 s landing poll used to rewrite landing_config wholesale, which
+        # closed the two <details> inside it on every tick.
+        js = _index_script()
+        self.assertIn("setHTML($('landing_config')", js)
+        self.assertNotIn("$('landing_config').innerHTML", js)
+
+    def test_collapses_carry_a_stable_identity(self):
+        js = _index_script()
+        for key in ('data-key="cfg_launch"', 'data-key="cfg_raw"'):
+            self.assertIn(key, js, key)
+
+    def test_details_open_state_survives_a_patch(self):
+        js = _index_script()
+        i = js.index("function _beforeElUpdated(")
+        body = js[i:i + 1200]
+        # the LIVE open state is written back onto the incoming markup, so
+        # morphdom's attribute sync cannot close what the reader opened
+        self.assertIn("fromEl.tagName==='DETAILS'", body)
+        self.assertIn("toEl.setAttribute('open','')", body)
+
+    def test_edited_field_is_skipped_entirely(self):
+        js = _index_script()
+        i = js.index("function _beforeElUpdated(")
+        body = js[i:i + 1200]
+        self.assertIn("if(_isField(fromEl)&&_busy(fromEl)) return false;", body)
+
+    def test_scroll_position_survives_a_patch(self):
+        js = _index_script()
+        i = js.index("function _beforeElUpdated(")
+        body = js[i:i + 1200]
+        self.assertIn("fromEl.scrollTop||fromEl.scrollLeft", body)
+
+    def test_flag_rows_describe_their_current_value(self):
+        # The patcher treats markup as the description of state, so a row
+        # that renders an empty control would wipe what the user entered.
+        js = _index_script()
+        i = js.index("function flagRowHtml(")
+        body = js[i:i + 2000]
+        self.assertIn("const cur=_flagValue(f.id);", body)
+        self.assertIn("value=\"'+esc(cur)+'\"", body)
+        self.assertIn("(cur?' checked':'')", body)
+        self.assertIn("(String(a)===cur?' selected':'')", body)
+
+    def test_search_only_closes_what_search_opened(self):
+        # Clearing the flag search must not slam shut a section the reader
+        # opened by hand.
+        js = _index_script()
+        self.assertIn("_searchOpened", js)
+        self.assertNotIn("else { det.style.display=''; det.open=false; }", js)
+
+    def test_boot_log_is_opened_once_not_every_poll(self):
+        js = _index_script()
+        self.assertIn("openDetails($('boot_log'))", js)
+        self.assertNotIn("bl.open=true", js)
+
+    def test_quality_autofill_fills_but_does_not_overwrite(self):
+        js = _index_script()
+        i = js.index("async function autofillQuality()")
+        body = js[i:i + 900]
+        self.assertIn("if (!$('q_endpoint').value.trim())", body)
+        self.assertIn("!$('q_model').value.trim()", body)
+
+    def test_sliders_are_debounced(self):
+        js = _index_script()
+        self.assertIn("const _replan=debounce(", js)
+        self.assertIn("const _reflow=debounce(", js)
+        # one POST per pixel of slider travel is what this replaced
+        self.assertNotIn("onServingEdit(); doPlan(); refreshRunnerPlacement();", js)
+
+    def test_dead_live_widget_is_gone(self):
+        js = _index_script()
+        for sym in ("function liveScrape", "function toggleLive",
+                    "function remeasureNow", "$('live_target')",
+                    "$('live_res')", "$('live_btn')", "$('live_out')"):
+            self.assertNotIn(sym, js, sym)
+        self.assertFalse(hasattr(webui, "live_snapshot_payload"))
+
+    def test_orphaned_live_route_is_gone(self):
+        # The route addressed DOM ids that have not existed since the landing
+        # strip replaced the widget. Nothing may answer on it now.
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{srv.server_address[1]}/api/live",
+                data=json.dumps({"target": "127.0.0.1:1"}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(req, timeout=10)
+            self.assertEqual(cm.exception.code, 404)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            thread.join(timeout=5)
+
+
+class TestVendoredAssets(CustomTestCase):
+    """Third-party front-end code is vendored, licensed and inlined.
+
+    The page makes no external requests, so a CDN link would simply be a
+    broken page on a machine without internet. Everything is in the tree.
+    """
+
+    def test_morphdom_is_vendored_with_its_licence(self):
+        d = os.path.join(os.path.dirname(webui.__file__), "assets")
+        js = os.path.join(d, "morphdom-umd.min.js")
+        lic = os.path.join(d, "morphdom.LICENSE")
+        self.assertTrue(os.path.exists(js), js)
+        self.assertTrue(os.path.exists(lic), lic)
+        with open(lic, encoding="utf-8") as f:
+            self.assertIn("MIT License", f.read())
+
+    def test_page_inlines_it_and_links_nothing_external(self):
+        html = webui.INDEX_HTML
+        self.assertIn("global.morphdom=", html)      # the library itself
+        self.assertNotIn("/*__VENDOR_MORPHDOM__*/", html)   # placeholder filled
+        # no external fetch of code or styling, at all
+        for bad in ("cdn.", "unpkg.com", "jsdelivr", "googleapis",
+                    "<script src=", "<link rel=\"stylesheet\""):
+            self.assertNotIn(bad, html, bad)
