@@ -245,6 +245,27 @@ def test_unknown_session_is_never_blocked():
     assert not reg.blocked("never-restored", output_len_now=0, now=0.0)
 
 
+def test_in_window_probe_is_non_mutating():
+    reg = SpillCooldownRegistry(progress_lock_tokens=50, cooldown_seconds=0.0)
+    reg.note_restore("r1", output_len=0, now=0.0)
+    assert reg.in_window("r1", output_len_now=10, now=0.0)
+    # expired by progress: the probe reports False but keeps the entry --
+    # only blocked() performs the lazy expiry
+    assert not reg.in_window("r1", output_len_now=50, now=0.0)
+    assert "r1" in reg._entries
+    assert not reg.blocked("r1", output_len_now=50, now=0.0)
+    assert "r1" not in reg._entries
+
+
+def test_pendulum_counters_are_split_actual_vs_blocked():
+    c = SpillBudgetCounters()
+    d = c.as_dict()
+    # the guarantee counter (actual rounds inside the lock) and the
+    # visibility counter (prevented attempts) are distinct fields
+    assert d["pendulum_events"] == 0
+    assert d["pendulum_blocked"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Victim selection under the cooldown: protections are untouchable
 # ---------------------------------------------------------------------------

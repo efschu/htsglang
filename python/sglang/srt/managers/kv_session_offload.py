@@ -1437,6 +1437,25 @@ class SpillCooldownRegistry:
     def note_restore(self, rid, output_len: int, now: float) -> None:
         self._entries[rid] = (int(output_len), float(now))
 
+    def in_window(self, rid, output_len_now: int, now: float) -> bool:
+        """Non-mutating probe: is ``rid`` still inside its cooldown window?
+        Used by the actual-pendulum detector (a spill of a within-window
+        victim = a Spill->Restore->Spill round INSIDE the lock, which the
+        blocked() exclusion exists to make impossible)."""
+        e = self._entries.get(rid)
+        if e is None:
+            return False
+        restored_len, restored_t = e
+        if (
+            self.progress_lock_tokens > 0
+            and int(output_len_now) - restored_len < self.progress_lock_tokens
+        ):
+            return True
+        return bool(
+            self.cooldown_seconds > 0
+            and float(now) - restored_t < self.cooldown_seconds
+        )
+
     def blocked(self, rid, output_len_now: int, now: float) -> bool:
         e = self._entries.get(rid)
         if e is None:
@@ -1470,7 +1489,15 @@ class SpillBudgetCounters:
         self.episodes_demoted = 0
         self.demotions_drained = 0  # handover complete: full prefix donated
         self.demotions_host_finished = 0  # grace fallback: host tail dropped
-        self.pendulum_events = 0  # re-spill attempt inside the cooldown
+        # ACTUAL pendulum rounds: a session spilled again while still inside
+        # its post-restore cooldown window. The blocked() exclusion makes this
+        # structurally impossible while the lock is armed, so this counter
+        # MUST stay 0 there -- it is the guarantee, kept as a counter so a
+        # regression is a number, not an assumption.
+        self.pendulum_events = 0
+        # PREVENTED pendulum rounds: re-spill attempts the cooldown excluded
+        # (the lock visibly working).
+        self.pendulum_blocked = 0
         self.rate_throttled_ticks = 0
         self.admission_declines = 0  # budget declines -> stock retraction
         self.prefill_gate_closures = 0  # born-spill admissions gated off
@@ -1490,6 +1517,7 @@ class SpillBudgetCounters:
             "demotions_drained": self.demotions_drained,
             "demotions_host_finished": self.demotions_host_finished,
             "pendulum_events": self.pendulum_events,
+            "pendulum_blocked": self.pendulum_blocked,
             "rate_throttled_ticks": self.rate_throttled_ticks,
             "admission_declines": self.admission_declines,
             "prefill_gate_closures": self.prefill_gate_closures,
@@ -3002,7 +3030,9 @@ class KVSessionOffloadManager:
         # #236 cooldown: recently restored sessions are excluded as victims
         # (progress lock / time cap). Pendulum accounting: when the cooldown
         # changes the outcome, a Spill->Restore->Spill round inside the lock
-        # was just prevented -- exactly the event the counter exists for.
+        # was just PREVENTED (pendulum_blocked); an ACTUAL round inside the
+        # lock (pendulum_events) is what the exclusion makes impossible and
+        # is counted defensively below, at the spill commit.
         blocked = (
             self._budget_blocked_victims(batch.reqs) if budget_armed else None
         )
@@ -3016,7 +3046,16 @@ class KVSessionOffloadManager:
         if blocked and idx != select_spill_victim(
             batch.reqs, sizes=sizes, need=need, fast_pressure=fast_pressure
         ):
-            self._budget_counters.pendulum_events += 1
+            self._budget_counters.pendulum_blocked += 1
+            if self._budget_counters.pendulum_blocked in (1, 8) or (
+                self._budget_counters.pendulum_blocked % 64 == 0
+            ):
+                self._log(
+                    "kv-session-offload BUDGET: cooldown excluded the natural "
+                    "spill victim (pendulum prevented; blocked=%d, actual=%d).",
+                    self._budget_counters.pendulum_blocked,
+                    self._budget_counters.pendulum_events,
+                )
         if idx is None:
             return False
         req = batch.reqs[idx]
@@ -3362,6 +3401,20 @@ class KVSessionOffloadManager:
         if budget_armed:
             # Episode opened: decode phase, clock started, D2H volume charged.
             self._budget_note_spill(slot, "decode", spill_count)
+            if self._budget_cooldown is not None and self._budget_cooldown.in_window(
+                req.rid, len(req.output_ids), self._budget_now
+            ):
+                # ACTUAL Spill->Restore->Spill inside the cooldown window --
+                # structurally excluded by the blocked() filter above, counted
+                # so a regression is a number (must stay 0 while armed).
+                self._budget_counters.pendulum_events += 1
+                self._log(
+                    "kv-session-offload BUDGET: PENDULUM round for rid=%s "
+                    "inside its cooldown window (events=%d) -- the progress "
+                    "lock failed to exclude it.",
+                    req.rid,
+                    self._budget_counters.pendulum_events,
+                )
 
         keep = [i for i in range(len(batch.reqs)) if i != idx]
         batch.filter_batch(keep_indices=keep)
@@ -5215,6 +5268,12 @@ class KVSessionOffloadManager:
         if slot is None:
             return
         self._free_regions.append(slot.region)
+        if getattr(self, "_budget_armed", False):
+            # One stats line per episode end (rare): the counters the policy
+            # is judged by, greppable without a dashboard.
+            self._log(
+                "kv-session-offload BUDGET stats (%s): %s", why, self.budget_stats()
+            )
         # The backend's per-session head/tail split + owned-count cache belong
         # to THIS session; a later spill re-derives from its own sentinel row.
         self.backend._sess_close_slot(rpi)
