@@ -1311,7 +1311,7 @@ class TestBenchRoutes(CustomTestCase):
         ]
 
         def fake_run(endpoint, model, selected=None, capabilities=None,
-                     preset=None, force=False):
+                     preset=None, force=False, transcript_sink=None):
             yield from results
 
         with mock.patch(
@@ -1336,7 +1336,7 @@ class TestBenchRoutes(CustomTestCase):
         captured = {}
 
         def fake_run(endpoint, model, selected=None, capabilities=None,
-                     preset=None, force=False):
+                     preset=None, force=False, transcript_sink=None):
             captured["caps"] = capabilities
             captured["force"] = force
             return iter(())
@@ -1466,7 +1466,7 @@ class TestV3HttpRoutes(WebUIFixture):
         ]
 
         def fake_run(endpoint, model, selected=None, capabilities=None,
-                     preset=None, force=False):
+                     preset=None, force=False, transcript_sink=None):
             yield from results
 
         with mock.patch(
@@ -3131,3 +3131,143 @@ class TestLaunchPayloadCompleteness(CustomTestCase):
         self.assertIsNone(ls.speculative_num_steps)
         self.assertIsNone(ls.mem_fraction_static)
         self.assertIsNone(ls.rank_auto_reserve_mib)
+
+
+class TestBenchTabAndHistory(CustomTestCase):
+    """The tests are the tab's content, and a finished run is reviewable."""
+
+    def test_tests_are_buttons_not_checkboxes(self):
+        html = webui.INDEX_HTML
+        self.assertIn('class="testbtn', html)
+        self.assertIn("function benchToggle(", html)
+        self.assertIn("window._benchSel", html)
+        # the old per-test checkbox markup is gone
+        self.assertNotIn('<input type="checkbox" id="bnt_', html)
+
+    def test_selection_survives_a_regate(self):
+        # The selection lives in one set, not in the DOM, so re-rendering the
+        # buttons after a gate change cannot silently drop it.
+        html = webui.INDEX_HTML
+        i_render = html.index("function renderBenchTests(")
+        i_set = html.index("window._benchSel.has(t.test_id)", i_render)
+        self.assertGreater(i_set, i_render)
+
+    def test_history_ui_and_download_link(self):
+        html = webui.INDEX_HTML
+        self.assertIn("/api/bench_history", html)
+        self.assertIn("/api/bench_run_detail?download=1", html)
+        self.assertIn("function benchShowRun(", html)
+
+    def test_graphs_are_columns_not_a_polyline(self):
+        # A polyline across two samples drew a stroke over half an empty
+        # field and interpolated between samples seconds apart.
+        html = webui.INDEX_HTML
+        self.assertIn("function _columns(", html)
+        self.assertIn("<rect x=", html)
+        self.assertNotIn("<polyline", html)
+
+
+class TestBenchHistoryRoutes(CustomTestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="bhroute_")
+        self._env = mock.patch.dict(
+            os.environ, {"SGLANG_PLANNER_BENCH_HISTORY": self.tmp})
+        self._env.start()
+
+    def tearDown(self):
+        self._env.stop()
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_run_is_saved_with_its_transcript_and_listed(self):
+        from sglang.srt.planner import bench_history
+
+        class _Ctx:
+            transcript = [{"test_id": 1, "request": {"messages": []},
+                           "answer": "Paris", "http_code": 200}]
+
+        def fake_run(endpoint, model, selected=None, capabilities=None,
+                     preset=None, force=False, transcript_sink=None):
+            if transcript_sink is not None:
+                transcript_sink.append(_Ctx())
+            yield {"test_id": 1, "label": "Basic", "status": "pass",
+                   "metric": {"name": "none", "value": None}, "detail": {},
+                   "deps": {}}
+
+        with mock.patch("sglang.srt.planner.bench_suite.run_suite",
+                        side_effect=fake_run):
+            evs = list(webui.bench_run_events(
+                {"endpoint": "127.0.0.1:30000", "model": "/m/Model-A"}))
+        run_id = evs[-1]["run_id"]
+        self.assertIsNotNone(run_id)
+        listed = webui.bench_history_payload({"model": "/m/Model-A"})
+        self.assertTrue(listed["ok"])
+        self.assertEqual(len(listed["runs"]), 1)
+        self.assertEqual(listed["runs"][0]["n_exchanges"], 1)
+        detail = webui.bench_run_payload({"run_id": run_id})
+        self.assertTrue(detail["ok"])
+        self.assertEqual(detail["run"]["transcript"][0]["answer"], "Paris")
+        self.assertEqual(bench_history.load_run(run_id)["model"], "/m/Model-A")
+
+    def test_a_crashed_run_is_still_stored(self):
+        # The transcript up to the failure is usually the only record of what
+        # killed it.
+        def boom(endpoint, model, selected=None, capabilities=None,
+                 preset=None, force=False, transcript_sink=None):
+            yield {"test_id": 1, "label": "Basic", "status": "pass",
+                   "metric": {"name": "none", "value": None}, "detail": {},
+                   "deps": {}}
+            raise RuntimeError("engine died")
+
+        with mock.patch("sglang.srt.planner.bench_suite.run_suite",
+                        side_effect=boom):
+            evs = list(webui.bench_run_events(
+                {"endpoint": "127.0.0.1:30000", "model": "/m/Model-B"}))
+        self.assertEqual(evs[-1]["event"], "error")
+        runs = webui.bench_history_payload({"model": "/m/Model-B"})["runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["n_tests"], 1)
+
+    def test_detail_requires_a_run_id(self):
+        d = webui.bench_run_payload({})
+        self.assertFalse(d["ok"])
+        self.assertIn("run_id", d["error"])
+
+
+class TestLiveBannerStates(CustomTestCase):
+    """Three states, and the panel is in one of them after EVERY poll.
+
+    A warning that outlives the server it was about is the failure mode here,
+    so the structural guarantee is what gets tested: the panel is not inside
+    the "a server is running" container, and the not-running branch of the
+    poll rewrites it.
+    """
+
+    def test_panel_is_outside_the_running_container(self):
+        html = webui.INDEX_HTML
+        i_panel = html.index('<fieldset id="live_panel">')
+        i_live = html.index('<div id="landing_live"')
+        self.assertLess(i_panel, i_live,
+                        "live_panel must not live inside landing_live")
+
+    def test_not_running_branch_rerenders_the_panel(self):
+        html = webui.INDEX_HTML
+        i_branch = html.index("if(!d || !d.running || !d.snapshot){")
+        i_render = html.index("renderLivePanel(null, d)", i_branch)
+        i_hide = html.index("$('landing_none').style.display=''", i_branch)
+        self.assertLess(i_render, i_hide + 1)
+
+    def test_the_three_states_are_named(self):
+        html = webui.INDEX_HTML
+        self.assertIn("No inference server running", html)
+        self.assertIn("Server started without --enable-metrics", html)
+        self.assertIn("function targetLabel(", html)
+
+    def test_no_metrics_banner_names_model_and_port(self):
+        html = webui.INDEX_HTML
+        i = html.index("function targetLabel(")
+        seg = html[i:i + 900]
+        self.assertIn("served_model_name", seg)
+        self.assertIn("' @ :'", seg)
+        self.assertIn("pid", seg)

@@ -2930,6 +2930,11 @@ def bench_run_events(payload: dict):
         "preset": preset,
     }
     counts: dict = {}
+    results: List[dict] = []
+    # run_suite records every model exchange on its context; the sink hands it
+    # back so the finished run can be stored WITH what was asked and answered.
+    sink: List[Any] = []
+    started = time.time()
     try:
         for res in bench_suite.run_suite(
             endpoint,
@@ -2938,13 +2943,88 @@ def bench_run_events(payload: dict):
             capabilities=caps,
             preset=preset,
             force=bool(payload.get("force")),
+            transcript_sink=sink,
         ):
             counts[res.get("status")] = counts.get(res.get("status"), 0) + 1
+            results.append(res)
             yield {"event": "result", "result": res}
     except Exception as e:  # pragma: no cover - defensive
+        _save_bench_run(endpoint, model, preset, caps, results, sink, started,
+                        error=str(e))
         yield {"event": "error", "error": str(e)}
         return
-    yield {"event": "done", "counts": counts}
+    run_id = _save_bench_run(endpoint, model, preset, caps, results, sink,
+                             started)
+    yield {"event": "done", "counts": counts, "run_id": run_id}
+
+
+def _save_bench_run(endpoint, model, preset, caps, results, sink, started,
+                    error=None) -> Optional[str]:
+    """Persist one finished (or crashed) run to the per-model history.
+
+    A run that ends in an exception is stored too: the transcript up to the
+    failure is usually the only record of what killed it. Storing must never
+    take the run down with it, so a write failure is reported in the payload
+    rather than raised at the client.
+    """
+    from sglang.srt.planner import bench_history
+
+    transcript = []
+    for ctx in sink:
+        transcript.extend(getattr(ctx, "transcript", []) or [])
+    record = {
+        "endpoint": endpoint,
+        "model": model or None,
+        "preset": preset,
+        "started_at": started,
+        "duration_s": round(time.time() - started, 3),
+        "capabilities": (
+            dataclasses.asdict(caps) if dataclasses.is_dataclass(caps) else None
+        ),
+        "results": results,
+        "transcript": transcript,
+        "error": error,
+    }
+    try:
+        return bench_history.save_run(record)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def bench_history_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/bench_history[?model=...] -> newest-first run summaries."""
+    from sglang.srt.planner import bench_history
+
+    payload = payload or {}
+    model = (payload.get("model") or "").strip() or None
+    try:
+        limit = int(payload.get("limit") or 50)
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        runs = bench_history.list_runs(model=model, limit=limit)
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e), "runs": []}
+    return {
+        "ok": True,
+        "model": model,
+        "root": bench_history.history_root(),
+        "runs": runs,
+    }
+
+
+def bench_run_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/bench_run_detail?run_id=... -> one stored run, transcript and
+    all. This is what the download button fetches."""
+    from sglang.srt.planner import bench_history
+
+    run_id = ((payload or {}).get("run_id") or "").strip()
+    if not run_id:
+        return {"ok": False, "error": "run_id is required"}
+    rec = bench_history.load_run(run_id)
+    if rec is None:
+        return {"ok": False, "error": f"no stored run {run_id!r}"}
+    return {"ok": True, "run": rec}
 
 
 # ===========================================================================
@@ -3130,6 +3210,41 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/power_profile"):
             try:
                 self._json(200, power_profile_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/bench_history"):
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, bench_history_payload(q))
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/bench_run_detail"):
+            # Served as a DOWNLOAD: the point of keeping the transcript is
+            # being able to take the whole request/answer series away.
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                d = bench_run_payload(q)
+                body = json.dumps(d, ensure_ascii=False, indent=1)
+                if d.get("ok") and q.get("download"):
+                    data = body.encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header(
+                        "Content-Disposition",
+                        'attachment; filename="bench-%s.json"'
+                        % (q.get("run_id") or "run"),
+                    )
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                self._send(200, body, "application/json")
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
@@ -3563,6 +3678,27 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   .actions { display: flex; gap: var(--s2); flex-wrap: wrap;
              margin-top: var(--s2); }
   a { color: var(--accent-text); }
+  /* ---- benchmark test buttons ---------------------------------------------
+     The tests are the tab's content, so they are the thing you click. A
+     selected test is a pressed button (accent border + tinted surface), a
+     gated one is disabled and carries its reason on hover. Fixed-width tiles
+     keep the grid even however long a label is. */
+  .testbtn { display: flex; flex-direction: column; align-items: flex-start;
+             gap: 2px; width: 232px; min-height: 52px; text-align: left;
+             background: var(--bg-elevated); color: var(--fg);
+             border: 1px solid var(--bd-medium); border-radius: var(--radius);
+             padding: var(--s2); font: inherit; font-size: var(--t-sm);
+             cursor: pointer; }
+  .testbtn:hover { background: var(--selected); filter: none; }
+  .testbtn.on { border-color: var(--accent-text); background: rgba(61,113,217,.16);
+                color: var(--fg-strong); }
+  .testbtn.on .tb-n { color: var(--accent-text); }
+  .testbtn.gated { opacity: .5; cursor: not-allowed; }
+  .testbtn .tb-n { font-size: var(--t-xs); color: var(--fg-muted);
+                   font-variant-numeric: tabular-nums; }
+  .testbtn .tb-l { line-height: 1.3; }
+  .testbtn .tb-t { font-size: var(--t-xs); color: var(--fg-muted); }
+  .testbtn .tb-t.warn { color: var(--warn); }
   .mx td, .mx th { text-align: center; }
   .mx .estcell { outline: 1px dashed var(--warn-dim); }
   .mx .fitc { color: var(--ok); } .mx .nofitc { color: var(--bad); }
@@ -3843,6 +3979,22 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       <span id="land_target_note" class="muted">resolving&hellip;</span>
     </div>
   </fieldset>
+  <!-- Always present, in every state. Living inside the "a server is
+       running" container is what let a warning outlive the server it was
+       about: the container was hidden, the stale text stayed. -->
+  <fieldset id="live_panel">
+    <legend>VRAM in use, throughput per session, tokens per watt (live)</legend>
+    <div id="live_note" class="muted">looking for a running server&hellip;</div>
+    <div id="live_strip" class="mstrip" style="display:none"></div>
+    <div id="live_cards"></div>
+    <div class="legend" id="live_legend" style="display:none">Bars are the
+      <b>measured</b> NVML occupancy of each card, drawn with the same bar the
+      planner uses for its projection, so the two are comparable by looking.
+      Per-session rates divide the server-wide rate by the concurrent requests
+      being served. Tokens per watt is the live token rate over NVML power
+      draw &mdash; per card it says what that card costs to keep in the group,
+      the total is the figure for the whole configuration.</div>
+  </fieldset>
   <div id="landing_none" class="muted" style="display:none;padding:1rem;border:1px solid #30363d;border-radius:8px">
     No reachable sglang server: no explicit endpoint, no managed instance,
     nothing detected on the common ports. Enter an endpoint above, hit
@@ -3854,20 +4006,6 @@ _INDEX_TEMPLATE = r"""<!doctype html>
          REPLACES the former "throughput / spec / cache" block below -- the
          strip is the only place these numbers appear on the landing page. -->
     <div id="landing_strip" class="mstrip"><span class="muted">waiting for first snapshot&hellip;</span></div>
-    <fieldset id="live_panel">
-      <legend>VRAM in use, throughput per session, tokens per watt (live)</legend>
-      <div id="live_note" class="muted">looking for a running server&hellip;</div>
-      <div id="live_strip" class="mstrip" style="display:none"></div>
-      <div id="live_cards"></div>
-      <div class="legend" id="live_legend" style="display:none">Bars are the
-        <b>measured</b> NVML occupancy of each card, drawn with the same bar
-        the planner uses for its projection, so the two are comparable by
-        looking. Per-session rates divide the server-wide rate by the
-        concurrent requests being served. Tokens per watt is the live token
-        rate over NVML power draw &mdash; per card it says what that card
-        costs to keep in the group, the total is the figure for the whole
-        configuration.</div>
-    </fieldset>
     <fieldset>
       <legend>running model + start config</legend>
       <div id="landing_config" class="muted">waiting for first snapshot&hellip;</div>
@@ -3909,15 +4047,6 @@ _INDEX_TEMPLATE = r"""<!doctype html>
         <input id="bn_model" placeholder="(auto)">
         <div style="margin-top:.5rem"><button onclick="benchProbe(false)" id="bn_probe_btn">Probe capabilities</button></div>
         <div id="bn_caps" class="muted" style="margin-top:.5rem">probe to see the gating state&hellip;</div>
-      </fieldset>
-      <fieldset>
-        <legend>tests &mdash; presets + per-test selection</legend>
-        <div class="actions" id="bn_presets"></div>
-        <label style="margin:.4rem 0"><input type="checkbox" id="bn_force" style="width:auto" onchange="benchReGate()">
-          force-run tool tests despite a missing tool parser
-          <span class="muted">(deliberately surfaces the tool-call cascade)</span></label>
-        <div id="bn_tests" class="muted">loading test catalog&hellip;</div>
-        <div style="margin-top:.5rem"><button onclick="benchRun()" id="bn_run_btn">Run selected</button></div>
       </fieldset>
       <fieldset>
         <legend>share results on GitHub (#152)</legend>
@@ -3970,6 +4099,36 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       </fieldset>
     </div>
     <div>
+      <!-- The tests ARE the tab. They get the full width and are picked by
+           clicking them, not by hunting checkboxes in a narrow column: a
+           selected test is a pressed button, a gated one is disabled and says
+           why on hover. -->
+      <fieldset>
+        <legend>tests &mdash; click to select</legend>
+        <div class="actions" id="bn_presets" style="margin-bottom:var(--s2)"></div>
+        <div id="bn_tests" class="muted">loading test catalog&hellip;</div>
+        <label style="margin:var(--s2) 0"><input type="checkbox" id="bn_force" style="width:auto" onchange="benchReGate()">
+          force-run tool tests despite a missing tool parser
+          <span class="muted">(deliberately surfaces the tool-call cascade)</span></label>
+        <div class="actions">
+          <button onclick="benchRun()" id="bn_run_btn">Run selected</button>
+          <span id="bn_sel_note" class="muted"></span>
+        </div>
+      </fieldset>
+      <!-- Past runs, per model. A verdict table is not reviewable on its own;
+           the stored run carries every request and every answer, and the
+           download is the whole series. -->
+      <fieldset>
+        <legend>history &mdash; past runs for this model</legend>
+        <div class="actions" style="margin-bottom:var(--s2)">
+          <button class="mini secondary" onclick="benchHistory()">refresh</button>
+          <label style="display:inline-flex;align-items:center;gap:var(--s1);margin:0">
+            <input type="checkbox" id="bn_hist_all" style="width:auto" onchange="benchHistory()">
+            <span class="muted">all models</span></label>
+          <span id="bn_hist_note" class="muted"></span>
+        </div>
+        <div id="bn_history" class="muted">no runs recorded yet.</div>
+      </fieldset>
       <!-- Lead metrics: how long a round TAKES. tok/s hides which phase moved;
            ms per verify round and ms per 1k prefill tokens do not. Absent is
            shown as absent, never as zero. -->
@@ -5922,29 +6081,40 @@ const STRIP_PX_PER_SAMPLE=5;
 const STRIP_SAMPLES=Math.round(RING_SECONDS*1000/LAND_POLL_MS);
 const STRIP_W=STRIP_SAMPLES*STRIP_PX_PER_SAMPLE;
 const STRIP_H=26;
+// -- column rendering -------------------------------------------------------
+// One filled column per sample, drawn from the LEFT and growing rightwards as
+// samples arrive, each column anchored on the baseline. A polyline was the
+// wrong mark here twice over: with two samples it drew a single stroke across
+// half an empty field, which reads as data that is not there, and it
+// interpolated between samples taken seconds apart. A column stands for
+// exactly one sample and for nothing in between.
+function _columns(a, w, h, max){
+  if(!a || !a.length) return '';
+  const n=Math.max(1, Math.floor(w/STRIP_PX_PER_SAMPLE));
+  const bw=Math.max(1, STRIP_PX_PER_SAMPLE-1);
+  let mx=max;
+  if(mx==null){ mx=-Infinity; for(const p of a) if(p.v>mx) mx=p.v; }
+  if(!(mx>0)) mx=1;
+  let out='';
+  const shown=a.slice(-n);
+  for(let i=0;i<shown.length;i++){
+    const v=Math.max(0, shown[i].v);
+    const bh=Math.max(1, Math.round((h-2)*Math.min(1, v/mx)));
+    out+='<rect x="'+(i*STRIP_PX_PER_SAMPLE)+'" y="'+(h-bh)+'" width="'+bw
+      +'" height="'+bh+'" fill="var(--info)"/>';
+  }
+  return out;
+}
 function stripSpark(key){
   const a=(window._ring[key]||[]).slice(-STRIP_SAMPLES);
-  let inner='';
-  if(a.length>=2){
-    let mx=-Infinity; for(const p of a) if(p.v>mx) mx=p.v;
-    if(mx<=0) mx=1;  // baseline is always 0 (activity graph)
-    const x0=STRIP_W-a.length*STRIP_PX_PER_SAMPLE+STRIP_PX_PER_SAMPLE/2;
-    const pts=a.map((p,i)=>(x0+i*STRIP_PX_PER_SAMPLE)+','
-      +(1+(STRIP_H-2)*(1-Math.max(0,p.v)/mx)).toFixed(1)).join(' ');
-    inner='<polyline fill="none" stroke="var(--info)" stroke-width="1.5" points="'+pts+'"/>';
-  }
-  return '<svg class="spk" width="'+STRIP_W+'" height="'+STRIP_H+'">'+inner+'</svg>';
+  return '<svg class="spk" width="'+STRIP_W+'" height="'+STRIP_H+'">'
+    +_columns(a, STRIP_W, STRIP_H)+'</svg>';
 }
 function sparkline(key,w,hh){
-  const a=window._ring[key]||[]; if(a.length<2) return '';
-  let mn=Infinity,mx=-Infinity;
-  for(const p of a){ if(p.v<mn)mn=p.v; if(p.v>mx)mx=p.v; }
-  if(mx<=mn) mx=mn+1;
-  const t0=a[0].t, t1=a[a.length-1].t, span=(t1-t0)||1;
-  const pts=a.map(p=>((p.t-t0)/span*w).toFixed(1)+','+(hh-((p.v-mn)/(mx-mn))*hh).toFixed(1)).join(' ');
+  const a=window._ring[key]||[]; if(!a.length) return '';
   return '<svg width="'+w+'" height="'+hh+'" style="vertical-align:middle;'
     +'background:var(--bg-input);border-radius:2px">'
-    +'<polyline fill="none" stroke="var(--info)" stroke-width="1.5" points="'+pts+'"/></svg>';
+    +_columns(a, w, hh)+'</svg>';
 }
 function landingEndpoint(){
   try{ return (localStorage.getItem('land_endpoint')||'').trim(); }catch(e){ return ''; }
@@ -6020,6 +6190,9 @@ async function landingPoll(){
     $('land_target_note').textContent='no target';
   }
   if(!d || !d.running || !d.snapshot){
+    // State 1: nothing is running. Rendered from THIS tick, so a warning
+    // about a server that has since gone away cannot survive it.
+    renderLivePanel(null, d);
     $('landing_none').style.display=''; $('landing_live').style.display='none';
     const st=d && d.status;
     $('landing_none_status').textContent = (d && d.error)? ' ('+d.error+')'
@@ -6114,7 +6287,7 @@ function renderLanding(s, tgt){
   // command + env", "raw server_info") and a scrollable <pre>. Rewriting it
   // wholesale on every 2 s tick is what used to slam them shut.
   setHTML($('landing_config'), renderStartConfig(s, tgt)
-    +(s.metrics_error?noMetricsBanner(s.metrics_error):''));
+    +(s.metrics_error?noMetricsBanner(s.metrics_error, s):''));
 
   // Per-card 60s telemetry rings (rendered INSIDE the placement card blocks,
   // renderPlacement's live line -- the old standalone per-GPU chart grid is
@@ -7070,15 +7243,33 @@ window._liveTimer=null;
 // on this page is unavailable -- not zero, not pending. Say which of the two
 // it is, and say what to do about it; an empty widget that never fills is the
 // worst of the three states to be shown.
-function noMetricsBanner(err){
+// WHICH server is meant has to be on the banner. A state line that names no
+// target reads as a statement about the server the reader has in mind, and a
+// stray process on a nearby port then looks like the real one.
+function targetLabel(s){
+  const n=s?normalizeStartConfig(s):null;
+  const cfg=(n&&n.cfg)||{};
+  const st=(s&&s.status)||null;
+  const name=cfg.served_model_name||cfg.model_path||(st&&st.served_model_name)
+             ||(st&&st.model_path)||'unnamed model';
+  let port=cfg.port||(st&&st.port)||null;
+  if(!port && s && s.endpoint){
+    const m=(''+s.endpoint).match(/:(\d+)\s*$/); if(m) port=m[1];
+  }
+  const pid=(st&&st.pid)||null;
+  return esc(String(name))+(port?(' @ :'+esc(String(port))):'')
+        +(pid?(' &middot; pid '+esc(String(pid))):'');
+}
+function noMetricsBanner(err, s){
   return '<div class="verdict offload" style="font-size:var(--t-sm);'
     +'font-weight:400;margin:var(--s2) 0 0">'
-    +'<b>Server started without --enable-metrics</b> &mdash; live rates '
-    +'(decode / prefill tok/s, per-session throughput, MTP acceptance, '
-    +'cache hit) are not available from this server. Per-card VRAM, power and '
-    +'utilisation come from NVML and keep working. Restart the server with '
-    +'<code>--enable-metrics</code>; a server booted from this dashboard '
-    +'always has it.'
+    +'<b>Server started without --enable-metrics</b>'
+    +(s?(' &mdash; <b>'+targetLabel(s)+'</b>'):'')
+    +' &mdash; live rates (decode / prefill tok/s, per-session throughput, '
+    +'MTP acceptance, cache hit) are not available from this server. Per-card '
+    +'VRAM, power and utilisation come from NVML and keep working. Restart '
+    +'the server with <code>--enable-metrics</code>; a server booted from '
+    +'this dashboard always has it.'
     +(err?'<div class="muted" style="margin-top:var(--s1)">'+esc(err)+'</div>':'')
     +'</div>';
 }
@@ -7127,18 +7318,32 @@ function liveTile(label, value, sub, spark){
     +'<div class="mt-s">'+(sub||'&nbsp;')+'</div>'
     +(spark?stripSpark(spark):'')+'</div>';
 }
-function renderLivePanel(s){
+// Exactly three states, and the panel is in one of them after EVERY poll:
+//   1. no inference server running        -- neutral, not an error;
+//   2. a server that serves no /metrics   -- warning, names the target;
+//   3. a server with metrics              -- the live readings.
+// The banner is a function of the current tick, never something set once.
+function renderLivePanel(s, envelope){
   const note=$('live_note'), strip=$('live_strip'), cards=$('live_cards');
   if(!note) return;
   if(!s||!s.ok||!s.gpus){
     note.style.display=''; strip.style.display='none';
     $('live_legend').style.display='none';
     setHTML(cards,'');
-    setHTML(note, s&&s.error
-      ? '<span class="rev-error">'+esc(s.error)+'</span>'
-      : 'No reachable server. The bars below are the planner\'s projection; '
-        +'this panel fills in once a server is running (Landing tab &rarr; '
-        +'detect, or load a model here).');
+    const st=(envelope&&envelope.status)||null;
+    const err=(s&&s.error)||(envelope&&envelope.error)||null;
+    if(err){
+      setHTML(note,'<span class="rev-error">'+esc(err)+'</span>');
+    } else if(st && st.state && st.state!=='stopped'){
+      setHTML(note,'<span class="muted">Managed server is <b>'+esc(st.state)
+        +'</b>'+(st.model_path?(' &mdash; '+esc(st.model_path)):'')
+        +(st.port?(' @ :'+esc(String(st.port))):'')
+        +' &mdash; readings appear once it is ready.</span>');
+    } else {
+      setHTML(note,'<span class="muted"><b>No inference server running.</b> '
+        +'Nothing to read here yet &mdash; start one in the Planner tab, or '
+        +'point the monitor at a running one above.</span>');
+    }
     return;
   }
   window._liveT=s.t;
@@ -7165,7 +7370,7 @@ function renderLivePanel(s){
   const n1=(v)=>noMetrics?NA:(v==null?'&ndash;':Number(v).toFixed(1));
   const n2=(v)=>noMetrics?NA:(v==null?'&ndash;':Number(v).toFixed(2));
   note.style.display=noMetrics?'':'none';
-  if(noMetrics) setHTML(note, noMetricsBanner(s.metrics_error));
+  if(noMetrics) setHTML(note, noMetricsBanner(s.metrics_error, s));
   strip.style.display=''; $('live_legend').style.display='';
   setHTML(strip,
     liveTile('decode per session',
@@ -8145,6 +8350,7 @@ function benchInit(){
   if(t && t.endpoint && !$('bn_endpoint').value.trim())
     $('bn_endpoint').value=t.endpoint.replace(/^https?:\/\//,'');
   benchProbe(true);  // catalog + presets only; nothing probed without endpoint
+  benchHistory();
 }
 function benchUseMonitor(){
   const t=window._lastTarget;
@@ -8178,33 +8384,138 @@ async function benchProbe(catalogOnly){
     renderBenchTests();
   }catch(e){ $('bn_caps').innerHTML='<span class="reasons">'+esc(''+e)+'</span>'; }
 }
+// Which tests are selected. Held in one set rather than read back out of
+// the DOM, so a re-gate (which re-renders the buttons) cannot silently drop
+// a selection the user made.
+window._benchSel=window._benchSel||new Set();
+function benchGated(t){ return t.gate_status!=null; }
 function renderBenchTests(){
   const d=window._benchCatalog; if(!d) return;
   $('bn_presets').innerHTML='<span class="muted">presets:</span> '
-    +Object.keys(d.presets).map(p=>'<button class="mini secondary" onclick="benchPreset(\''+p+'\')">'+esc(p)+'</button>').join(' ');
-  let h='';
+    +Object.keys(d.presets).map(p=>'<button class="mini secondary" onclick="benchPreset(\''+p+'\')">'+esc(p)+'</button>').join(' ')
+    +' <button class="mini secondary" onclick="benchSelectAll(true)">all runnable</button>'
+    +' <button class="mini secondary" onclick="benchSelectAll(false)">none</button>';
+  let h='<div style="display:flex;flex-wrap:wrap;gap:var(--s2)">';
   for(const t of d.tests){
-    const gated=t.gate_status!=null;  // blocked / skip: greyed with the reason
-    h+='<div style="margin:.12rem 0;opacity:'+(gated?'.45':'1')+'" title="'
-      +esc(t.gate_reason||t.expected_fail_note||'')+'">'
-      +'<label style="display:flex;gap:.35rem;align-items:flex-start;margin:0">'
-      +'<input type="checkbox" id="bnt_'+t.test_id+'" style="width:auto;margin-top:.15rem" '+(gated?'disabled':'')+'>'
-      +'<span>'+t.test_id+'. '+esc(t.label)
-      +(t.optional?' <span class="muted">(opt)</span>':'')
-      +(t.crash_prone?' <span style="color:#e3a008">(crash-prone, runs last)</span>':'')
-      +(gated?' <span class="muted">['+esc(t.gate_status)+': '+esc(t.gate_reason||'')+']</span>':'')
-      +(!gated&&t.expected_fail_note?' <span style="color:#e3a008">[expected-fail: '+esc(t.expected_fail_note)+']</span>':'')
-      +'</span></label></div>';
+    const gated=benchGated(t);
+    const on=!gated&&window._benchSel.has(t.test_id);
+    const why=gated?(t.gate_status+': '+(t.gate_reason||''))
+                   :(t.expected_fail_note?('expected-fail: '+t.expected_fail_note):'');
+    h+='<button type="button" id="bnt_'+t.test_id+'" class="testbtn'
+      +(on?' on':'')+(gated?' gated':'')+'"'+(gated?' disabled':'')
+      +' onclick="benchToggle('+t.test_id+')" title="'+esc(why)+'">'
+      +'<span class="tb-n">'+t.test_id+'</span>'
+      +'<span class="tb-l">'+esc(t.label)+'</span>'
+      +(t.crash_prone?'<span class="tb-t" title="runs last">crash-prone</span>':'')
+      +(t.optional?'<span class="tb-t">optional</span>':'')
+      +(gated?'<span class="tb-t warn">'+esc(t.gate_status)+'</span>':'')
+      +(!gated&&t.expected_fail_note?'<span class="tb-t warn">expected-fail</span>':'')
+      +'</button>';
   }
+  h+='</div>';
   $('bn_tests').innerHTML=h;
+  benchSelNote();
+}
+function benchSelNote(){
+  const n=window._benchSel.size;
+  const el=$('bn_sel_note'); if(!el) return;
+  el.textContent=n?(n+' test'+(n===1?'':'s')+' selected'):'nothing selected yet';
+}
+function benchToggle(id){
+  if(window._benchSel.has(id)) window._benchSel.delete(id);
+  else window._benchSel.add(id);
+  const b=$('bnt_'+id); if(b) b.classList.toggle('on', window._benchSel.has(id));
+  benchSelNote();
+}
+function benchSelectAll(on){
+  const d=window._benchCatalog; if(!d) return;
+  window._benchSel=new Set();
+  if(on) for(const t of d.tests) if(!benchGated(t)) window._benchSel.add(t.test_id);
+  renderBenchTests();
 }
 function benchPreset(p){
   const d=window._benchCatalog; if(!d) return;
   const ids=d.presets[p]||[];
-  for(const t of d.tests){
-    const el=$('bnt_'+t.test_id);
-    if(el && !el.disabled) el.checked=ids.includes(t.test_id);
-  }
+  window._benchSel=new Set();
+  for(const t of d.tests)
+    if(!benchGated(t) && ids.includes(t.test_id)) window._benchSel.add(t.test_id);
+  renderBenchTests();
+}
+// ---- run history ----------------------------------------------------------
+function benchHistoryModel(){
+  return $('bn_hist_all').checked ? '' : ($('bn_model').value.trim()||'');
+}
+async function benchHistory(){
+  const m=benchHistoryModel();
+  try{
+    const d=await (await fetch('/api/bench_history'+(m?('?model='+encodeURIComponent(m)):''))).json();
+    if(!d.ok){ setHTML($('bn_history'),'<span class="reasons">'+esc(d.error||'error')+'</span>'); return; }
+    $('bn_hist_note').textContent=(d.runs.length||0)+' run'
+      +((d.runs.length===1)?'':'s')+' in '+d.root;
+    if(!d.runs.length){
+      setHTML($('bn_history'), m
+        ? 'no runs recorded for this model yet.'
+        : 'no runs recorded yet.');
+      return;
+    }
+    let h='<table><tr><th>when</th><th>model</th><th>tests</th>'
+      +'<th>pass</th><th>fail</th><th>warn</th><th>skip</th>'
+      +'<th>exchanges</th><th></th></tr>';
+    for(const r of d.runs){
+      const c=r.counts||{};
+      const when=new Date((r.started_at||0)*1000).toLocaleString();
+      h+='<tr><td>'+esc(when)+'</td>'
+        +'<td>'+esc(r.model||'(unnamed)')+'</td>'
+        +'<td>'+(r.n_tests||0)+'</td>'
+        +'<td class="st-pass">'+(c.pass||0)+'</td>'
+        +'<td class="st-fail">'+(c.fail||0)+'</td>'
+        +'<td class="st-warn">'+(c.warn||0)+'</td>'
+        +'<td class="st-skip">'+(c.skip||0)+'</td>'
+        +'<td>'+(r.n_exchanges||0)+'</td>'
+        +'<td><button class="mini secondary" onclick="benchShowRun(\''+esc(r.run_id)+'\')">view</button> '
+        +'<a class="pill" href="/api/bench_run_detail?download=1&run_id='
+        +encodeURIComponent(r.run_id)+'" download>download</a></td></tr>';
+    }
+    h+='</table><div id="bn_run_detail"></div>';
+    setHTML($('bn_history'), h);
+  }catch(e){ setHTML($('bn_history'),'<span class="reasons">'+esc(''+e)+'</span>'); }
+}
+// The whole point of storing the transcript: read back what was asked and
+// what the model answered, per test, without leaving the page.
+async function benchShowRun(id){
+  const box=$('bn_run_detail'); if(!box) return;
+  setHTML(box,'<span class="muted">loading run&hellip;</span>');
+  try{
+    const d=await (await fetch('/api/bench_run_detail?run_id='+encodeURIComponent(id))).json();
+    if(!d.ok){ setHTML(box,'<span class="reasons">'+esc(d.error||'error')+'</span>'); return; }
+    const r=d.run;
+    let h='<div class="cardblock"><div class="sxs-h">run '+esc(r.run_id)+'</div>'
+      +'<div class="muted">'+esc(r.model||'(unnamed)')+' &middot; '+esc(r.endpoint||'')
+      +' &middot; '+(r.duration_s||0)+' s'
+      +(r.error?' &middot; <span class="st-fail">ended with: '+esc(r.error)+'</span>':'')
+      +'</div>';
+    for(const t of (r.results||[])){
+      h+='<div style="margin-top:var(--s2)"><b>'+t.test_id+'. '+esc(t.label||'')+'</b> '
+        +'<span class="st-'+esc(t.status||'skip')+'">'+esc(t.status||'')+'</span>'
+        +(t.reason?' <span class="muted">'+esc(t.reason)+'</span>':'')+'</div>';
+      const ex=(r.transcript||[]).filter(e=>e.test_id===t.test_id);
+      for(const e of ex){
+        const req=(((e.request||{}).messages)||[])
+          .map(m=>(m.role||'?')+': '+(typeof m.content==='string'?m.content:JSON.stringify(m.content)))
+          .join('\n\n');
+        h+='<details style="margin:var(--s1) 0"><summary class="muted">'
+          +'exchange &middot; HTTP '+(e.http_code==null?'--':e.http_code)
+          +(e.wall_ms!=null?(' &middot; '+Math.round(e.wall_ms)+' ms'):'')+'</summary>'
+          +'<div class="muted" style="margin-top:var(--s1)">request</div>'
+          +'<pre style="max-height:220px;overflow:auto">'+esc(req||JSON.stringify(e.request||{},null,1))+'</pre>'
+          +'<div class="muted">answer</div>'
+          +'<pre style="max-height:280px;overflow:auto">'+esc(e.answer==null?'(none)':e.answer)+'</pre>'
+          +'</details>';
+      }
+    }
+    h+='</div>';
+    setHTML(box,h);
+  }catch(e){ setHTML(box,'<span class="reasons">'+esc(''+e)+'</span>'); }
 }
 // ===========================================================================
 // Benchmark window.
@@ -8278,7 +8589,7 @@ async function benchRun(){
   const endpoint=$('bn_endpoint').value.trim();
   if(!endpoint){ setHTML($('bn_out'),'<span class="reasons">endpoint required</span>'); return; }
   const selected=[];
-  if(d) for(const t of d.tests){ const el=$('bnt_'+t.test_id); if(el&&el.checked) selected.push(t.test_id); }
+  if(d) for(const t of d.tests) if(window._benchSel.has(t.test_id)) selected.push(t.test_id);
   if(!selected.length){ setHTML($('bn_out'),'<span class="reasons">select at least one test (or a preset).</span>'); return; }
   window._benchResults=[];
   window._benchSelected=selected.length;
