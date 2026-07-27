@@ -4601,3 +4601,25 @@ mapping under co-residence is not total-minus-reserve (free-based accounting
 double-counts the neighbour). Desk follow-up, no further boots. Positive side
 finding: the #257 scratch accounting shrank the PD footprint 25.3 -> 22.2 GiB
 at the same fraction.
+
+# #262 — fp8-e4m3 KV on sm86: vLLM Ampere bug class EXCLUDED by hard proof
+
+Falsifier on the real RTX 3080 (capability verified 8,6; the first run
+silently landed on the 5090 via FASTEST_FIRST — re-measured with
+CUDA_DEVICE_ORDER=PCI_BUS_ID, trap documented in the test docstring), at the
+server's own call path (BatchDecodeWithPagedKVCacheWrapper, identical to
+flashinfer_backend.py:2173-2180), over all 256 finite fp8 bit patterns:
+e4m3 pool decodes with max|out-ref| = 0.0 against a pure-Python IEEE
+reference; the same bytes read as e5m2 deviate by 56992.0 (threshold 1.0) —
+the confusion would have been seen. e5m2 positive control exact. Format
+information lives at exactly one place (MHATokenToKVPool.dtype); host tier
+is uint8 raw bytes, format-neutral.
+
+Triton lane: zero kv_cache_dtype handling, but the outcome is a LOUD
+compile error on sm86 (triton rejects fp8e4nv below capability 89) — no
+silent corruption; a guard test freezes this. Side findings recorded: the
+Triton kernels quantize Q and P down to the KV format where fp8 compiles
+(e5m2 on sm86, e4m3 on sm89+) — a real precision question for that lane;
+and a latent k_scale sentinel break spot (unreachable today, assert
+candidate). e5m2 default-scale: all reachable states symmetric, no #41343
+analogue; a warning line now fires on explicit fp8_e5m2 choice.
