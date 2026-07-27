@@ -2325,6 +2325,23 @@ def config_profiles_get(payload: Optional[dict] = None) -> dict:
     # selected model ref through as the base model_path (the rules degrade
     # to the form defaults, with an info note, when it cannot be sized).
     base = {"model_path": payload["model"]} if payload.get("model") else None
+
+    # This rig's measured MLP-split crossover (or None): the max-perf preset
+    # states the knee points / their absence, and applies a vector only when
+    # a LOCAL usable finding selects one for a given prompt:output mix.
+    # profiles() itself never touches the filesystem — the load lives here.
+    try:
+        from sglang.srt.planner.crossover import load_finding
+
+        knee_finding = load_finding()
+    except Exception:  # pragma: no cover - defensive
+        knee_finding = None
+    p2o = payload.get("prompt_to_output_ratio")
+    try:
+        p2o = float(p2o) if p2o is not None else None
+    except (TypeError, ValueError):
+        p2o = None
+
     generated: List[dict] = []
     try:
         generated = [
@@ -2332,6 +2349,8 @@ def config_profiles_get(payload: Optional[dict] = None) -> dict:
             for p in flagsmod.profiles(
                 model_cfg, gpus, base=base,
                 draft_models=draft_candidates or None,
+                crossover_finding=knee_finding,
+                prompt_to_output_ratio=p2o,
             )
         ]
     except Exception as e:  # pragma: no cover - defensive

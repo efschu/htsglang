@@ -515,6 +515,17 @@ class Envs:
     # Force a fresh stage-0 hardware micro-probe for --rank-tp-ratio
     # auto-performance, ignoring the cached profile under ~/.cache/sglang.
     SGLANG_PERF_REPROBE = EnvBool(False)
+    # Refit seam for the parse-time cost model (uneven_perf.PerfCalibration).
+    # The stage-0 probe MEASURES per-card GEMM/membw/GEMV rates on every
+    # machine; the four scalars below are the model's FITTED/ASSUMED
+    # constants, fitted on the reference rig only. On other hardware they are
+    # a hypothesis — refit them there (recipe in the PerfCalibration
+    # docstring) and set the result here instead of editing code. Unset
+    # (None) keeps the shipped reference-rig values.
+    SGLANG_PERF_DECODE_GEMV_RESIDUAL_EXP = EnvFloat(None)
+    SGLANG_PERF_DECODE_PEAK_COMPRESSION_EXP = EnvFloat(None)
+    SGLANG_PERF_DECODE_NONWEIGHT_FRACTION = EnvFloat(None)
+    SGLANG_PERF_PREFILL_INVARIANT_FRACTION = EnvFloat(None)
 
     # --- HTCCL: vendor-neutral host-staged collectives (task #117) ---------
     # Route this group's TP collectives over HTCCL instead of NCCL. Needed

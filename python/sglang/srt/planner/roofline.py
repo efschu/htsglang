@@ -111,10 +111,21 @@ __all__ = [
 #: rejected by construction (design §5B.3a).
 ROOFLINE_PROVENANCE = "planner-estimate"
 
-#: Efficiency factors (documented, tunable). A real kernel reaches only a
-#: fraction of the nameplate roofline: decode is launch/overlap-limited even
-#: when bandwidth-bound (~0.7-0.8); prefill loses more to attention, softmax,
-#: norm, and imperfect GEMM tiling (~0.5-0.7). We take the middle of each band.
+#: Efficiency factors — ASSUMED, not measured, and exposed as parameters of
+#: ``estimate_roofline`` so a measured value can replace them without a code
+#: edit. A real kernel reaches only a fraction of the nameplate roofline:
+#: decode is launch/overlap-limited even when bandwidth-bound (~0.7-0.8);
+#: prefill loses more to attention, softmax, norm, and imperfect GEMM tiling
+#: (~0.5-0.7). We take the middle of each band.
+#:
+#: EFF_PREFILL additionally PRESUMES a captured/compiled prefill path. A boot
+#: whose log reports ``prefill.backend='disabled'`` runs every prefill layer
+#: eagerly, and the launch-bound overhead puts the real rate FAR below this
+#: factor times the compute roofline: measured 2026-07-27, 27B-FP8 TP=4 at
+#: ctx ~6995 with prefill.backend='disabled', 146.5 tok/s prefill in the
+#: server log (159.4 client-side) — several-fold under the graphed-path shape
+#: this estimate assumes. There is no calibrated eager knock-down yet (one
+#: anchor is not a fit); the caveat below names the assumption instead.
 EFF_DECODE = 0.75
 EFF_PREFILL = 0.60
 
@@ -877,6 +888,8 @@ def estimate_roofline(
     measured_scores=None,
     context_tokens: int = 4096,
     measured_available: bool = False,
+    eff_decode: float = EFF_DECODE,
+    eff_prefill: float = EFF_PREFILL,
 ) -> Optional[RooflineEstimate]:
     """Produce the roofline estimate for a planned config, or None when it
     cannot be sized (a card without known peak specs, or a geometry the cost
@@ -886,6 +899,12 @@ def estimate_roofline(
     is the OffloadAssessment (its ``ram_offload`` state routes active experts to
     the PCIe-fetch term). ``measured_scores`` are advantage.MeasuredCardScore
     (cached micro-probe) — used in preference to the nameplate peaks.
+
+    ``eff_decode`` / ``eff_prefill`` are the ASSUMED efficiency factors
+    (defaults: the documented module constants). They are parameters so that
+    a measured efficiency — e.g. for an eager, ``prefill.backend='disabled'``
+    prefill path, which runs far below the graphed-path default — can replace
+    the assumption without editing this module.
     """
     from sglang.srt.planner.card_library import CardLibrary
     from sglang.srt.uneven_perf import PerfCostModel
@@ -1001,20 +1020,24 @@ def estimate_roofline(
 
     slowest_high = max(t_high) if t_high else 0.0
     slowest_low = max(t_low) if t_low else 0.0
-    decode_high = (EFF_DECODE * decode_discount / slowest_high) if slowest_high > 0 else 0.0
-    decode_low = (EFF_DECODE * decode_discount / slowest_low) if slowest_low > 0 else 0.0
+    decode_high = (eff_decode * decode_discount / slowest_high) if slowest_high > 0 else 0.0
+    decode_low = (eff_decode * decode_discount / slowest_low) if slowest_low > 0 else 0.0
     bottleneck = t_low.index(slowest_low) if t_low else 0
 
     # prefill gated by the slowest rank; the TP-collective tier discount applies
     # (prefill all-reduces per layer too) but NOT the KV-donor surcharge.
     prefill_rate = min(prefill_rate_by_rank) if prefill_rate_by_rank else 0.0
-    prefill_tok_s = EFF_PREFILL * tier_disc * prefill_rate
+    prefill_tok_s = eff_prefill * tier_disc * prefill_rate
 
     caveats = [
         "ROUGH BALLPARK, NOT MEASURED — the runtime measures the real number. "
         "Expect this to be off by a large factor; it is order-of-magnitude only.",
-        f"efficiency assumed: decode x{EFF_DECODE}, prefill x{EFF_PREFILL} "
+        f"efficiency assumed: decode x{eff_decode}, prefill x{eff_prefill} "
         "(nameplate roofline is never fully reached).",
+        "the prefill factor presumes a captured/compiled prefill path; a boot "
+        "reporting prefill.backend='disabled' runs prefill eagerly and lands "
+        "far below it (measured: 27B-FP8 TP=4, ctx ~6995, 146.5 tok/s where "
+        "the graphed-path shape predicts several-fold more).",
         f"decode range spans short-context (weight-bound ceiling) to the "
         f"reference {context_tokens:,}-token context; it drops further as the "
         "context fills (KV grows linearly).",
@@ -1051,8 +1074,8 @@ def estimate_roofline(
         decode_tok_s_low=decode_low,
         prefill_tok_s=prefill_tok_s,
         reference_context_tokens=context_tokens,
-        eff_decode=EFF_DECODE,
-        eff_prefill=EFF_PREFILL,
+        eff_decode=eff_decode,
+        eff_prefill=eff_prefill,
         compute_dtype=dtype,
         gguf_marlin_dequant=gguf_marlin,
         interconnect=tier,

@@ -249,12 +249,146 @@ _PROBE_GEMV_CACHE_CEILING = 1.05
 #: though the #216 pair at ctx 400 vs 12000 moved the 6,1,1 cost only from
 #: +16.7 % to +16.4 %, so over that range it is nearly flat.
 _PREDICT_DECODE_NONWEIGHT_FRACTION = 0.28
+#: Fraction of a prefill step that does NOT move with the weight split.
+#:
+#: The prefill model books ONLY shard-proportional time: per-token GEMM
+#: FLOPs over the probe's GEMM rate, plus the per-layer all-reduce. That is
+#: a model of a step whose whole duration scales with the rank's shard --
+#: true for the large fused matmuls themselves, not for the step around
+#: them. The measured #216 campaign (and the boots it ran in) had
+#: ``prefill.backend='disabled'``: no captured prefill graph, so every
+#: layer's kernels are launched eagerly, and that launch/dispatch overhead
+#: -- plus the non-GEMM ops (norms, GDN scan, attention softmax, radix
+#: bookkeeping) -- is split-INVARIANT: it does not shrink when MLP units
+#: leave a rank. Omitting it inflated every predicted concentration gain:
+#: predicted +9.2/+15.1/+21.6 % for 3,1,1 / 4,1,1 / 6,1,1 against measured
+#: slope gains +6.4/+9.0/+13.0 % (over-prediction x1.4-1.7 with the current
+#: probe inputs; the campaign-time inputs gave 23.7 % vs 13.0 %, x1.8).
+#: A fresh graphless anchor points the same way: 27B-FP8, TP=4, ctx ~6995,
+#: ``prefill.backend='disabled'`` measured 146.5 tok/s prefill (server log;
+#: 159.4 client) -- far below any shard-proportional reading of the probe.
+#:
+#: The model therefore charges an invariant term, anchored on the base
+#: plan:  t(v) = t_sharded(v) + f/(1-f) * t_sharded(base),  which leaves
+#: candidate RANKING untouched (the term is constant across candidates) and
+#: deflates the reported gains. Fitted on the three measured #216 slope
+#: gains: at 0.35 the predictions land at +5.8/+9.3/+13.0 % (rms 0.4
+#: points). Refit recipe on other hardware: measure the prefill slope
+#: (unique random input ids per request, ``#cached-token: 0`` proven) for
+#: the base split and one concentration vector, then solve
+#:   f = (r_model - r_meas) / (r_meas * (r_model - 1))
+#: with r = t_base/t_cand from ``prefill_time_model`` at f=0 and from the
+#: measurement. Sample width: ONE rig, one checkpoint family, eager
+#: (graphless) prefill; a graph-captured prefill path has a smaller
+#: invariant share, so refit rather than reuse when that lands.
+_PREDICT_PREFILL_INVARIANT_FRACTION = 0.35
 #: TP-degree recommendation: a GPU whose best pairwise link is below this
 #: fraction of the rig's best link is called out as a drop candidate.
 _TP_DROP_LINK_FRACTION = 0.7
 #: ... provided the remaining ranks' budgets still fit the weights with
 #: this fill factor of headroom.
 _TP_DROP_FIT_FACTOR = 0.85
+
+
+@dataclasses.dataclass(frozen=True)
+class PerfCalibration:
+    """The cost model's fitted/assumed scalars, gathered into one seam.
+
+    What is MEASURED, per rig, on every machine: the stage-0 probe's GEMM
+    rate, streaming bandwidth and decode-shaped GEMV rate per card, the NCCL
+    link matrix, and the NVML totals. Those numbers never come from here.
+
+    What is NOT measured on the machine the model runs on -- the four scalars
+    below. Each was fitted (or bounded) on the reference rig (RTX 5090 +
+    2x RTX 3080, PCIe without P2P, Qwen3.6-27B-FP8, uneven TP=3) and is a
+    HYPOTHESIS on any other machine. This class exists so that refitting them
+    elsewhere is a parameter change, not a code edit: pass an instance to
+    ``PerfCostModel`` or set the matching ``SGLANG_PERF_*`` env var.
+
+    Field -> shipped value -> what pins it -> how to refit:
+
+    ``decode_gemv_residual_exp`` (0.70, ``_PREDICT_DECODE_GEMV_RESIDUAL``)
+        Exponent on the measured GEMV rate. Pinned by three measured ms-per-
+        speculative-step points (#216 follow-up). Refit: interleaved cold
+        boots of the base split plus one concentration vector, solve
+        ``beta = ln(achieved decode ratio) / ln(gemv ratio)``.
+    ``decode_peak_compression_exp`` (0.63, ``_PREDICT_DECODE_BW_COMPRESSION``)
+        Fallback exponent on the STREAMING peak when no usable GEMV rate
+        exists. Same fit, same points, larger residual (the divisor measured
+        none of the compression).
+    ``decode_nonweight_fraction`` (0.28, ``_PREDICT_DECODE_NONWEIGHT_FRACTION``)
+        Share of a bs=1 decode step that is not weight streaming. NOT
+        independently identified -- it and the exponent trade off along a
+        valley; separating them needs a profiled decode step.
+    ``prefill_invariant_fraction`` (0.35, ``_PREDICT_PREFILL_INVARIANT_FRACTION``)
+        Share of a prefill step that does not move with the weight split
+        (eager launch overhead, non-GEMM ops). Fitted on the three measured
+        #216 prefill slope gains; refit formula at the constant's definition.
+
+    A field left at None reads the module-level constant at call time, so a
+    test that patches the constant and a refit that sets the env var both
+    take effect without fighting each other.
+    """
+
+    decode_gemv_residual_exp: Optional[float] = None
+    decode_peak_compression_exp: Optional[float] = None
+    decode_nonweight_fraction: Optional[float] = None
+    prefill_invariant_fraction: Optional[float] = None
+
+    @classmethod
+    def from_env(cls) -> PerfCalibration:
+        """Overrides from the ``SGLANG_PERF_*`` refit seam (environ.py);
+        unset vars stay None and fall through to the shipped constants."""
+        from sglang.srt.environ import envs
+
+        return cls(
+            decode_gemv_residual_exp=envs.SGLANG_PERF_DECODE_GEMV_RESIDUAL_EXP.get(),
+            decode_peak_compression_exp=(
+                envs.SGLANG_PERF_DECODE_PEAK_COMPRESSION_EXP.get()
+            ),
+            decode_nonweight_fraction=(
+                envs.SGLANG_PERF_DECODE_NONWEIGHT_FRACTION.get()
+            ),
+            prefill_invariant_fraction=(
+                envs.SGLANG_PERF_PREFILL_INVARIANT_FRACTION.get()
+            ),
+        )
+
+    # -- resolved values (explicit override > shipped reference-rig fit) ----
+
+    @property
+    def gemv_residual(self) -> float:
+        v = self.decode_gemv_residual_exp
+        return _PREDICT_DECODE_GEMV_RESIDUAL if v is None else float(v)
+
+    @property
+    def peak_compression(self) -> float:
+        v = self.decode_peak_compression_exp
+        return _PREDICT_DECODE_BW_COMPRESSION if v is None else float(v)
+
+    @property
+    def nonweight_fraction(self) -> float:
+        v = self.decode_nonweight_fraction
+        return _PREDICT_DECODE_NONWEIGHT_FRACTION if v is None else float(v)
+
+    @property
+    def prefill_invariant(self) -> float:
+        v = self.prefill_invariant_fraction
+        f = _PREDICT_PREFILL_INVARIANT_FRACTION if v is None else float(v)
+        # A fraction >= 1 has no reading as "share of the step"; clamp so a
+        # bad refit value degrades to a loud, finite prediction, not a
+        # division by zero.
+        return min(max(f, 0.0), 0.95)
+
+    def overridden_fields(self) -> List[str]:
+        """Names of the fields explicitly set (for the plan log: a refit in
+        effect must be visible, or a foreign value silently poses as the
+        reference fit)."""
+        return [
+            f.name
+            for f in dataclasses.fields(self)
+            if getattr(self, f.name) is not None
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1535,6 +1669,12 @@ class PerfCostModel:
     (MLP bytes per unit) is exact.
     """
 
+    #: Class-level default so the bandwidth/prefill methods stay callable on
+    #: a bare instance (tests build one via ``__new__`` to exercise them
+    #: config-free). All-None fields read the module constants at call time;
+    #: ``__init__`` replaces this with the env-aware resolution.
+    calibration: PerfCalibration = PerfCalibration()
+
     def __init__(
         self,
         plan_inputs,
@@ -1542,6 +1682,7 @@ class PerfCostModel:
         budgets_mib: List[int],
         measured: Optional[List[dict]] = None,
         measured_mlp_vector: Optional[List[int]] = None,
+        calibration: Optional[PerfCalibration] = None,
     ):
         # ``plan_inputs`` is a PlanInputs dataclass (see above). The boot
         # path builds it via PlanInputs.from_server_args so the server and
@@ -1553,10 +1694,16 @@ class PerfCostModel:
         # the measured one (see there); ``measured_mlp_vector`` is the weight
         # vector the measurement was taken under, used to anchor the family
         # model's absolute weight bytes against the measured allocator value.
+        # ``calibration``: the fitted/assumed scalars of the speed model (the
+        # refit seam, see PerfCalibration). Default: env overrides over the
+        # shipped reference-rig fit.
         self.tp_size = plan_inputs.tp_size
         self.base_plan = list(base_plan)
         self.budgets_mib = list(budgets_mib)
         self.plan_inputs = plan_inputs
+        self.calibration = (
+            calibration if calibration is not None else PerfCalibration.from_env()
+        )
         self.measured = (
             list(measured)
             if measured is not None and len(measured) == self.tp_size
@@ -2301,10 +2448,11 @@ class PerfCostModel:
         consumes RATIOS between ranks: mixing a GEMV rate on one rank with a
         streaming rate on another would compare two different quantities."""
         peak = [max(float(b), 1e-9) for b in membw_gbs]
+        beta_peak = self.calibration.peak_compression
         if gemv_gbs is None or len(gemv_gbs) != len(peak):
             return (
                 peak,
-                _PREDICT_DECODE_BW_COMPRESSION,
+                beta_peak,
                 "streaming peak (no GEMV rate in the hardware profile; "
                 "re-probe with SGLANG_PERF_REPROBE=1 to measure it)",
             )
@@ -2314,7 +2462,7 @@ class PerfCostModel:
             if frac < _PROBE_GEMV_SATURATION_FLOOR:
                 return (
                     peak,
-                    _PREDICT_DECODE_BW_COMPRESSION,
+                    beta_peak,
                     f"streaming peak (rank {r}: GEMV {g:.0f} GB/s is "
                     f"{frac * 100:.0f} % of its streaming {p:.0f} GB/s, below "
                     f"the {_PROBE_GEMV_SATURATION_FLOOR * 100:.0f} % "
@@ -2325,12 +2473,12 @@ class PerfCostModel:
             if frac > _PROBE_GEMV_CACHE_CEILING:
                 return (
                     peak,
-                    _PREDICT_DECODE_BW_COMPRESSION,
+                    beta_peak,
                     f"streaming peak (rank {r}: GEMV {g:.0f} GB/s exceeds its "
                     f"streaming {p:.0f} GB/s, so it is reading from cache "
                     f"rather than DRAM and is not a weight-read rate)",
                 )
-        return gemv, _PREDICT_DECODE_GEMV_RESIDUAL, "measured decode GEMV rate"
+        return gemv, self.calibration.gemv_residual, "measured decode GEMV rate"
 
     def effective_decode_bw(
         self,
@@ -2382,7 +2530,7 @@ class PerfCostModel:
         if base <= 0:
             return 0.0
         ratio = self.decode_round_time(mlp_vector, membw_gbs, gemv_gbs) / base
-        f = _PREDICT_DECODE_NONWEIGHT_FRACTION
+        f = self.calibration.nonweight_fraction
         return (f + (1.0 - f) * ratio - 1.0) * 100.0
 
     def decode_knee_ok(
@@ -2494,13 +2642,13 @@ class PerfCostModel:
                 acc += fam.bytes * self._shard_fractions(fam.shard, mlp_vector)[rank]
         return acc / total_streamed
 
-    def prefill_time_model(
+    def _prefill_sharded_time(
         self, mlp_vector: List[int], gemm_tflops: List[float], min_link_gbs: float
     ) -> float:
-        """Relative prefill step time: lockstep compute max over ranks
-        (per-token flops ~ 2 x sharded params, the param-proxy) plus the
-        ring-all-reduce term over the narrowest link. Only ratios between
-        candidates are consumed."""
+        """The shard-PROPORTIONAL part of the prefill step: lockstep compute
+        max over ranks (per-token flops ~ 2 x sharded params, the
+        param-proxy) plus the ring-all-reduce term over the narrowest
+        link."""
         t_comp = 0.0
         for r in range(self.tp_size):
             params_r = 0.0
@@ -2522,6 +2670,33 @@ class PerfCostModel:
             else 0.0
         )
         return t_comp + t_comm
+
+    def prefill_time_model(
+        self, mlp_vector: List[int], gemm_tflops: List[float], min_link_gbs: float
+    ) -> float:
+        """Relative prefill step time. Only ratios between candidates are
+        consumed.
+
+        Two terms: the shard-proportional part (``_prefill_sharded_time``:
+        GEMM compute at the probe rate + per-layer all-reduce) and a split-
+        INVARIANT part -- eager per-layer launch overhead (the measured boots
+        report ``prefill.backend='disabled'``: no captured prefill graph) and
+        the non-GEMM ops, none of which shrink when MLP units leave a rank.
+        The invariant part is charged as
+        ``prefill_invariant_fraction`` of the BASE plan's step (see the
+        constant's derivation + refit formula), so it is a constant across
+        candidates: ranking is untouched, but the reported gains no longer
+        pretend the whole step scales with the shard. Without it the model
+        over-predicted every measured concentration gain by x1.4-1.8
+        (predicted +21.6 % for 6,1,1 where +13.0 % was measured)."""
+        f = self.calibration.prefill_invariant
+        t_sharded = self._prefill_sharded_time(mlp_vector, gemm_tflops, min_link_gbs)
+        if f <= 0.0:
+            return t_sharded
+        t_base = self._prefill_sharded_time(
+            self.base_plan, gemm_tflops, min_link_gbs
+        )
+        return t_sharded + f / (1.0 - f) * t_base
 
 
 # ---------------------------------------------------------------------------
@@ -2822,6 +2997,17 @@ def apply_auto_performance(server_args) -> None:
             for r, x in enumerate(_bw_eff)
         )
     )
+
+    overridden = model.calibration.overridden_fields()
+    if overridden:
+        lines.append(
+            "calibration OVERRIDDEN via SGLANG_PERF_* (refit seam): "
+            + ", ".join(
+                f"{name}={getattr(model.calibration, name):g}"
+                for name in overridden
+            )
+            + " -- these replace the reference-rig fit for this plan."
+        )
 
     base_pred = model.predict_capacity(base_plan)
     floor = (1.0 - loose / 100.0) * base_pred["ctx"]
