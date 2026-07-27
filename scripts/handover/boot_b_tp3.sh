@@ -45,6 +45,7 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   --hicache-mem-layout page_first_direct --hicache-io-backend direct \
   --hicache-storage-backend file \
   --hicache-storage-prefetch-policy wait_complete \
+  --hicache-storage-backend-extra-config "${HANDOVER_HICACHE_EXTRA:-{\"prefetch_threshold\": 64}}" \
   --enable-metrics \
   --host 127.0.0.1 --port "$PORT" \
   > "$LOG" 2>&1 &
