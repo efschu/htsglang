@@ -4397,3 +4397,44 @@ cutlass/cublas. If a cutlass FP8 path exists or can be enabled for sm120,
 that is the largest single-rank lever currently known on this rig.
 Evidence: /tmp/atc/{agg.csv,out_all.txt,prof/}, worktree
 /spinning/wt-autotune-ceiling (unchanged).
+
+# Task #107 follow-up — single-request trade: fast path vs big whole
+
+Boots on 5b42c4d859, Qwen3.6-27B-FP8, TP=3 auto, NEXTN, graphs on. Reserve
+finding first: 3000,2200,2200 reproduced the #250 GDN-scratch OOM on a second
+recipe (context 32768, congruent branch) at the first real prefill chunk —
+all arms below ran with 3000,2700,2700 (KV 453632 vs 524416, -13.5 %;
+absolute numbers not comparable to the earlier VALIDATION_107 pass).
+
+| Arm | max KV | prefill cold (26k tok) | decode single |
+|---|---|---|---|
+| A stock, no topology flags | 453632 | 1091.2 tok/s | 88.88 tok/s (accept 2.93) |
+| B colocated-congruent, budget 3000, iv 1 | 453632 (identical) | 1092.5 tok/s (+0.12 %) | 89.16 tok/s (+0.31 %) |
+
+Verdict B: exact null effect solo — both deltas an order of magnitude below
+the noise floor. The lane is pure scheduling policy, not a resource line
+item: the declared 3000-MiB budget is a boot-check entry, not a KV-pool
+deduction (VRAM identical to stock, +20 MiB runtime workspace).
+
+Arm C (prefill lane on GPU 0 only) is structurally rejected at arg
+validation (topology.py:292) — by definition of the congruent variant the
+lane computes on the decode sharding, so every TP rank participates in every
+lane forward; a card cannot opt out of the TP collective. The topology that
+allows subset placement (colocated-process) is double-gated on this rig
+(NCCL 2.28.9 < 2.30 for multi-rank per GPU; no MPS daemon) and is a
+two-server deployment, not a flag addition.
+
+Outer edge probed: TP=1 solo on the 5090 does not load — weights alone are
+28.56 GiB of 31.34 GiB usable. For this model on this rig the "fast path
+with small max KV" is not small, it is nonexistent; the trade edge is
+closed, not tight. (General feature judgment unaffected — rigs with larger
+single cards have the edge.)
+
+Measurement trap re-confirmed: random-token prompts degenerate decode
+(accept 3.81/4, 115.6 tok/s vs 91.5 at accept 2.99 on natural text). Decode
+rates must never be taken on synthetic token IDs; prefill rates are content-
+independent and random IDs remain the clean guaranteed-cold prefill input.
+
+Stranded data point from the cancelled dual-load arm, for the record: stock,
+400 decode tok under parallel cold prefill (57960 tok), reserve 2700 →
+7.35 tok/s decode at 1148.8 tok/s prefill.
