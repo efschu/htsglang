@@ -359,12 +359,34 @@ def validate_pd_topology_args(args: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def nvml_card_totals_mib() -> Optional[Dict[int, int]]:
-    """Total VRAM per CUDA-visible device index via NVML (no CUDA context).
+def reindex_totals_cuda_order(
+    nvml_totals: Mapping[int, int], cuda_to_nvml: Mapping[int, int]
+) -> Dict[int, int]:
+    """Re-key NVML-ordered totals to CUDA device indices.
 
-    Indexing follows the current CUDA_VISIBLE_DEVICES view so the ids match
-    the device indices used by the placement flags. Returns None when NVML
-    is unusable; the caller must then say so instead of silently skipping.
+    The placement flags speak CUDA order (torch.cuda), NVML enumerates by
+    PCI bus — on this project's rig CUDA's FASTEST_FIRST puts the 5090 at
+    cuda:0 while NVML lists it at index 1, so blindly reusing indices
+    attributes the wrong capacity to a card (measured during the #107 GPU
+    validation). An empty mapping means identity (orders agree or the
+    bridge is unavailable)."""
+    if not cuda_to_nvml:
+        return dict(nvml_totals)
+    out: Dict[int, int] = {}
+    for cuda_idx, nvml_idx in cuda_to_nvml.items():
+        if nvml_idx in nvml_totals:
+            out[cuda_idx] = nvml_totals[nvml_idx]
+    return out
+
+
+def nvml_card_totals_mib() -> Optional[Dict[int, int]]:
+    """Total VRAM per CUDA device index.
+
+    Totals come from NVML; the CUDA-index keying comes from the PCI-bus
+    bridge ``server_args._torch_to_nvml_gpu_index_mapping`` (the same
+    resolver the --rank-tp-ratio auto budgets use, CVD-aware). Returns None
+    when NVML is unusable; the caller must then say so instead of silently
+    skipping.
     """
     try:
         import pynvml  # type: ignore[import-not-found]
@@ -374,22 +396,11 @@ def nvml_card_totals_mib() -> Optional[Dict[int, int]]:
         logger.warning("PD topology: NVML unavailable (%s)", exc)
         return None
     try:
-        count = pynvml.nvmlDeviceGetCount()
-        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if visible is not None and visible.strip():
-            try:
-                order = [int(x) for x in visible.split(",") if x.strip()]
-            except ValueError:
-                order = list(range(count))
-            order = [i for i in order if 0 <= i < count]
-        else:
-            order = list(range(count))
-        totals: Dict[int, int] = {}
-        for cuda_idx, phys_idx in enumerate(order):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(phys_idx)
+        nvml_totals: Dict[int, int] = {}
+        for nvml_idx in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_idx)
             info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            totals[cuda_idx] = int(info.total // (1024 * 1024))
-        return totals
+            nvml_totals[nvml_idx] = int(info.total // (1024 * 1024))
     except Exception as exc:  # pragma: no cover - host dependent
         logger.warning("PD topology: NVML query failed (%s)", exc)
         return None
@@ -398,6 +409,21 @@ def nvml_card_totals_mib() -> Optional[Dict[int, int]]:
             pynvml.nvmlShutdown()
         except Exception:
             pass
+    try:
+        # Function-level import: server_args imports this module at its top
+        # (TOPOLOGY_CHOICES), so the reverse import must not run at import
+        # time. Fully resolved by the time a topology is applied.
+        from sglang.srt.server_args import _torch_to_nvml_gpu_index_mapping
+
+        mapping = _torch_to_nvml_gpu_index_mapping()
+    except Exception as exc:  # pragma: no cover - host dependent
+        logger.warning(
+            "PD topology: CUDA->NVML index bridge unavailable (%s); "
+            "assuming identical enumeration orders.",
+            exc,
+        )
+        mapping = {}
+    return reindex_totals_cuda_order(nvml_totals, mapping)
 
 
 def estimate_model_weight_mib(model_path: str) -> Optional[int]:

@@ -575,6 +575,26 @@ class TestCongruentLaneWeightSharing(CustomTestCase):
         lane.note_prefill_ran(other)
 
 
+class TestCudaOrderReindex(CustomTestCase):
+    def test_fastest_first_rig_mapping(self):
+        # This rig, measured: NVML order 3080/5090/3080, CUDA FASTEST_FIRST
+        # puts the 5090 first. cuda:0 must get the 5090's total.
+        from sglang.srt.disaggregation.topology import reindex_totals_cuda_order
+
+        nvml = {0: 20480, 1: 32607, 2: 20480}
+        cuda_to_nvml = {0: 1, 1: 0, 2: 2}
+        self.assertEqual(
+            reindex_totals_cuda_order(nvml, cuda_to_nvml),
+            {0: 32607, 1: 20480, 2: 20480},
+        )
+
+    def test_empty_mapping_is_identity(self):
+        from sglang.srt.disaggregation.topology import reindex_totals_cuda_order
+
+        nvml = {0: 1, 1: 2}
+        self.assertEqual(reindex_totals_cuda_order(nvml, {}), nvml)
+
+
 class TestServerArgsSurface(CustomTestCase):
     def test_flags_exist_in_the_disaggregation_block_and_default_off(self):
         from sglang.srt.server_args import ServerArgs
