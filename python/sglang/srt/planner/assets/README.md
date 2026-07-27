@@ -37,3 +37,44 @@ are ours and live in the `onBeforeElUpdated` hook in `webui.py`, next to
 (`npm pack morphdom` / `registry.npmjs.org/morphdom/-/morphdom-<v>.tgz`,
 `package/dist/morphdom-umd.min.js` and `package/LICENSE`) and update the
 version above. No build step is involved; the file is served as it ships.
+
+## modern-normalize 3.0.1 (MIT)
+
+* File: `modern-normalize.css` (3 KB, no dependencies)
+* Licence: `modern-normalize.LICENSE`, MIT, Sindre Sorhus / Jonathan Neal /
+  Nicolas Gallagher
+* Upstream: https://github.com/sindresorhus/modern-normalize
+
+**What it does.** Levels out the cross-browser differences that a dense
+layout trips over: default margins, the form-element font that does not
+inherit, `table` border spacing, `sub`/`sup` line-height, the tap-highlight
+and text-size-adjust behaviours. It is a reset, not a theme -- it sets no
+colours, no spacing scale and no component styles.
+
+**Why this one rather than a CSS framework.** The obvious candidates were
+weighed before choosing:
+
+* Bootstrap 5 CSS-only (5.3.8, 232 KB minified) -- class-driven, so the page's
+  existing components would have to be re-authored in its idiom, and its
+  `.table` / `.card` / `.progress` names collide with the ones already used
+  here. Rejected on size and on collision.
+* Pico.css v2 (2.1.1, 71 KB classless) -- the best-designed of the classless
+  options, but it carries 154 rules on `button`, 30 on `progress`, 30 on
+  `details`/`summary` and a full `table` box-model reset. Every one of those
+  lands underneath the hand-written cards, bars and tables on this page and
+  moves their spacing, and its default rhythm is built for prose, not for a
+  monitoring UI. Rejected on collision and density.
+* Water.css / Simple.css / MVP.css -- prose-first document themes (Simple.css
+  even caps the content column at 45rem). Wrong shape for a full-bleed
+  dashboard.
+
+What the page actually lacked was a reset and a token system, not a component
+kit. modern-normalize supplies the reset; the tokens are in the `:root` block
+in `webui.py` and their values are Grafana's published dark theme, so the
+palette, the 8px spacing grid and the type scale come from a real dense
+monitoring UI rather than being invented here.
+
+**Updating.** Replace both files from the npm tarball
+(`registry.npmjs.org/modern-normalize/-/modern-normalize-<v>.tgz`,
+`package/modern-normalize.css` and `package/license`) and update the version
+above. No build step; the file is served as it ships.

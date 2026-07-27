@@ -3261,12 +3261,12 @@ def serve(host: str = "127.0.0.1", port: int = 8780) -> None:
 _ASSET_DIR = os.path.join(os.path.dirname(__file__), "assets")
 
 
-def _vendored_js(name: str) -> str:
+def _vendored_asset(name: str) -> str:
     """Read a vendored front-end asset for inlining into the page.
 
     The dashboard serves one self-contained page and makes no external
-    requests, so third-party JavaScript is inlined rather than linked. See
-    ``assets/README.md`` for what is vendored and why.
+    requests, so third-party JavaScript and CSS are inlined rather than
+    linked. See ``assets/README.md`` for what is vendored and why.
     """
     with open(os.path.join(_ASSET_DIR, name), encoding="utf-8") as f:
         return f.read()
@@ -3279,230 +3279,364 @@ _INDEX_TEMPLATE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>htsglang config planner</title>
 <style>
-  :root { color-scheme: light dark; }
+/*__VENDOR_NORMALIZE__*/
+  /* ---- design tokens -------------------------------------------------------
+     Values are Grafana's published dark theme (grafana-data/src/themes:
+     palette.ts, createColors.ts, createSpacing.ts, createTypography.ts), not
+     invented ones. Grafana is the reference for this class of page -- a dense,
+     dark, panel-based monitoring UI -- and its scales are what make the
+     spacing come out even: one 8px grid unit, three surface levels, three
+     border weights, and colour used only to carry state.
+     The cross-browser reset above is vendored modern-normalize (MIT), inlined
+     like morphdom; see assets/README.md. */
+  :root {
+    color-scheme: dark;
+    /* surfaces: canvas < panel < elevated */
+    --bg-canvas:   #111217;
+    --bg-panel:    #181b1f;
+    --bg-elevated: #22252b;
+    --bg-input:    #0d1014;
+    /* borders: weak = decoration, medium = widget outline, strong = focus */
+    --bd-weak:   #363940;
+    --bd-medium: #44464e;
+    --bd-strong: #555760;
+    /* text */
+    --fg:          #ccccdc;
+    --fg-strong:   #e6e9f0;
+    --fg-muted:    rgba(204,204,220,.65);
+    --fg-disabled: rgba(204,204,220,.45);
+    /* interaction */
+    --accent:        #3d71d9;
+    --accent-text:   #6e9fff;
+    --hover:         rgba(204,204,220,.10);
+    --selected:      rgba(204,204,220,.16);
+    /* state -- the ONLY decorative use of colour on this page is none */
+    --ok:      #73BF69; --ok-dim:   #37872D;
+    --warn:    #EAB839; --warn-dim: #E0B400;
+    --bad:     #F2495C; --bad-dim:  #C4162A;
+    --info:    #5794F2;
+    /* 8px grid */
+    --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px;
+    /* type scale: 14 base, 12 for tile metadata */
+    --t-xs: 11px; --t-sm: 12px; --t-md: 13px; --t-lg: 14px; --t-xl: 18px;
+    --radius: 4px; --radius-lg: 6px;
+    --mono: ui-monospace, SFMono-Regular, "Roboto Mono", Menlo, monospace;
+    /* the page never grows past this; the gutter stays constant either side */
+    --page-max: 1680px;
+    --gutter: var(--s4);
+  }
   * { box-sizing: border-box; }
-  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-         margin: 0; padding: 1.2rem; line-height: 1.4;
-         background: #0e1116; color: #d7dde5; }
-  h1 { font-size: 1.15rem; margin: 0 0 .2rem; }
-  .sub { color: #8b96a5; font-size: .8rem; margin-bottom: 1rem; }
-  .cols { display: grid; grid-template-columns: 360px 1fr; gap: 1.2rem; }
+  body { font-family: var(--mono); font-size: var(--t-md); line-height: 1.45;
+         background: var(--bg-canvas); color: var(--fg);
+         margin: 0; padding: 0; }
+  /* Every top-level block sits in the same centred column, so the left and
+     right margins are equal on every tab and do not change with content. */
+  body > .hdr, body > .tabs, body > div[id^="view_"] {
+    max-width: var(--page-max); margin-left: auto; margin-right: auto;
+    padding-left: var(--gutter); padding-right: var(--gutter); }
+  h1 { font-size: var(--t-xl); font-weight: 500; margin: 0; letter-spacing: 0; }
+  .sub { color: var(--fg-muted); font-size: var(--t-sm); margin: var(--s1) 0 0;
+         max-width: 96ch; }
+  .cols { display: grid; grid-template-columns: 380px 1fr; gap: var(--s4);
+          align-items: start; }
   /* runner: full page width, settings left / results right */
   .cols.runner { grid-template-columns: minmax(420px, 5fr) 7fr; }
   @media (max-width: 820px) { .cols, .cols.runner { grid-template-columns: 1fr; } }
   @media (max-width: 1100px) { .cols.runner { grid-template-columns: 1fr; } }
-  fieldset { border: 1px solid #2a323d; border-radius: 8px; margin: 0 0 .9rem;
-             padding: .7rem .8rem; }
-  legend { color: #9fb0c3; font-size: .78rem; padding: 0 .35rem; }
-  label { display: block; font-size: .72rem; color: #9aa6b4; margin: .5rem 0 .15rem; }
+
+  /* ---- panels --------------------------------------------------------------
+     A section is separated by a surface shift plus one weak border, never by
+     whitespace -- the convention every dense monitoring UI converges on. */
+  fieldset { border: 1px solid var(--bd-weak); border-radius: var(--radius-lg);
+             background: var(--bg-panel);
+             margin: 0 0 var(--s3); padding: var(--s3); }
+  legend { color: var(--fg-muted); font-size: var(--t-sm); font-weight: 500;
+           padding: 0 var(--s1); text-transform: none; }
+  label { display: block; font-size: var(--t-sm); color: var(--fg-muted);
+          margin: var(--s2) 0 var(--s1); }
   input, select, textarea {
-    width: 100%; background: #161b22; color: #e6edf3; border: 1px solid #303a46;
-    border-radius: 5px; padding: .32rem .45rem; font: inherit; font-size: .8rem; }
-  input::placeholder { color: #5b6675; }
-  .knob-help { color: #6b7686; font-size: .66rem; margin: .1rem 0 .2rem; }
-  button { background: #1f6feb; color: #fff; border: 0; border-radius: 6px;
-           padding: .5rem .9rem; font: inherit; font-size: .8rem; cursor: pointer; }
-  button.secondary { background: #30363d; }
-  button.mini { padding: .18rem .5rem; font-size: .68rem; }
-  .cardlist { display: flex; flex-direction: column; gap: .35rem; }
+    width: 100%; background: var(--bg-input); color: var(--fg-strong);
+    border: 1px solid var(--bd-medium); border-radius: var(--radius);
+    padding: 5px 8px; font: inherit; font-size: var(--t-sm); }
+  input:focus, select:focus, textarea:focus {
+    outline: none; border-color: var(--bd-strong); }
+  input::placeholder { color: var(--fg-disabled); }
+  .knob-help { color: var(--fg-muted); font-size: var(--t-xs);
+               margin: 2px 0 var(--s1); }
+  button { background: var(--accent); color: #fff; border: 1px solid transparent;
+           border-radius: var(--radius); padding: 6px 12px; font: inherit;
+           font-size: var(--t-sm); line-height: 1.4; cursor: pointer; }
+  button:hover { filter: brightness(1.12); }
+  button:disabled { opacity: .5; cursor: default; filter: none; }
+  button.secondary { background: var(--bg-elevated); color: var(--fg);
+                     border-color: var(--bd-medium); }
+  button.secondary:hover { background: var(--selected); filter: none; }
+  button.mini { padding: 3px 8px; font-size: var(--t-xs); }
+
+  /* ---- header + tab bar ----------------------------------------------------
+     A conservative admin tab bar: one row, fixed 36px height, active tab
+     marked by a 2px underline in the accent colour and a brighter label,
+     hover by a flat tint. No pills, no colour per tab, no shadow. The bar's
+     own bottom border runs the full width so the tabs read as a strip rather
+     than as a row of loose buttons. */
+  .hdr { display: flex; align-items: flex-start; justify-content: space-between;
+         gap: var(--s4); flex-wrap: wrap;
+         padding-top: var(--s4); padding-bottom: var(--s3); }
+  .tabs { display: flex; gap: 0; margin: 0 auto var(--s4);
+          border-bottom: 1px solid var(--bd-weak); overflow-x: auto;
+          scrollbar-width: thin; }
+  .tab, button.tab { background: transparent; color: var(--fg-muted);
+    border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+    padding: 0 var(--s3); height: 36px; font-size: var(--t-md);
+    white-space: nowrap; flex: none; cursor: pointer; }
+  .tab:hover { background: var(--hover); color: var(--fg); filter: none; }
+  .tab.active, button.tab.active { background: transparent;
+    color: var(--fg-strong); border-bottom-color: var(--accent-text); }
+  .tab.active:hover { background: var(--hover); }
+
+  /* ---- tables --------------------------------------------------------------
+     Numbers are the content, so they get tabular figures and right alignment;
+     the label column stays left. */
+  table { border-collapse: collapse; width: 100%; font-size: var(--t-sm); }
+  th, td { text-align: right; padding: 4px 8px;
+           border-bottom: 1px solid var(--bd-weak);
+           font-variant-numeric: tabular-nums; }
+  th { color: var(--fg-muted); font-weight: 500; }
+  th:first-child, td:first-child { text-align: left;
+                                   font-variant-numeric: normal; }
+
+  /* ---- meters --------------------------------------------------------------
+     One bar, filled left to right, numeric label beside it -- never a stack of
+     decorative segments for a single quantity. */
+  .bar { height: 8px; background: var(--bg-input); border-radius: 2px;
+         overflow: hidden; border: 1px solid var(--bd-weak); }
+  .bar > span { display: block; height: 100%; background: var(--info); }
+  .verdict { font-size: var(--t-lg); font-weight: 500; padding: var(--s2) var(--s3);
+             border-radius: var(--radius); margin-bottom: var(--s3); }
+  .verdict.offload { background: rgba(234,184,57,.10); color: var(--warn);
+                     border: 1px solid var(--warn-dim); }
+  .fit { background: rgba(115,191,105,.10); color: var(--ok);
+         border: 1px solid var(--ok-dim); }
+  .nofit { background: rgba(242,73,92,.10); color: var(--bad);
+           border: 1px solid var(--bad-dim); }
+  .pricebar { margin-top: var(--s3); font-size: var(--t-sm);
+              color: var(--fg-muted); }
+  .pricebar input { width: 5rem; padding: 3px 6px; }
+  .measured { margin-top: var(--s3); background: var(--bg-panel);
+              border: 1px solid var(--ok-dim); border-radius: var(--radius-lg);
+              padding: var(--s3); }
+  .ms-title { font-weight: 500; color: var(--ok); font-size: var(--t-lg);
+              text-transform: uppercase; letter-spacing: .04em; }
+  .ms-note { font-size: var(--t-sm); color: var(--fg-muted);
+             margin: var(--s1) 0 var(--s2); }
+  .ms-wl { margin: var(--s2) 0; }
+  .ms-mult { font-size: var(--t-sm); color: var(--fg-strong);
+             background: var(--bg-elevated); border: 1px solid var(--ok-dim);
+             border-radius: var(--radius); padding: var(--s1) var(--s2);
+             margin: var(--s1) 0; }
+  .ms-row { border-top: 1px solid var(--bd-weak); margin-top: var(--s2);
+            padding-top: var(--s1); }
+  .ms-row-h { font-size: var(--t-md); color: var(--fg); }
+  .ms-wl-h { font-size: var(--t-sm); color: var(--fg-muted);
+             margin-top: var(--s1); }
+  .ms-phases { display: flex; gap: var(--s3); flex-wrap: wrap; }
+  .ms-phase { flex: 1 1 320px; min-width: 300px; border-radius: var(--radius);
+              padding: var(--s2); }
+  .ms-prefill { background: var(--bg-elevated);
+                border: 1px solid var(--bd-weak); }
+  .ms-decode  { background: var(--bg-elevated);
+                border: 1px solid var(--bd-weak); }
+  .ms-ph-h { font-weight: 500; font-size: var(--t-sm); letter-spacing: .04em;
+             margin-bottom: var(--s1); text-transform: uppercase; }
+  .ms-prefill .ms-ph-h { color: var(--info); }
+  .ms-decode .ms-ph-h { color: var(--ok); }
+  .ms-phase table, .ms-wl table { border-collapse: collapse; margin: var(--s1) 0;
+                                  font-size: var(--t-xs); width: 100%; }
+  .ms-phase th, .ms-phase td, .ms-wl th, .ms-wl td {
+      border: 1px solid var(--bd-weak); padding: 2px 6px; text-align: right;
+      font-variant-numeric: tabular-nums; }
+  .ms-phase th, .ms-wl th { color: var(--fg-muted); font-weight: 500; }
+  .roofline { margin-top: var(--s3); background: var(--bg-panel);
+              border: 1px solid var(--warn-dim); border-radius: var(--radius-lg);
+              padding: var(--s3); }
+  .rf-title { font-weight: 500; color: var(--warn); font-size: var(--t-lg);
+              text-transform: uppercase; letter-spacing: .04em; }
+  .rf-nums { display: flex; gap: var(--s3); margin: var(--s2) 0;
+             flex-wrap: wrap; }
+  .rf-num { background: var(--bg-elevated); border: 1px solid var(--bd-weak);
+            border-radius: var(--radius); padding: var(--s2) var(--s3); }
+  .rf-num span { display: block; font-size: var(--t-xs); color: var(--fg-muted);
+                 text-transform: uppercase; letter-spacing: .04em; }
+  .rf-num b { font-size: var(--t-xl); color: var(--fg-strong); font-weight: 500;
+              font-variant-numeric: tabular-nums; }
+  .rf-num small { display: block; font-size: var(--t-xs);
+                  color: var(--fg-muted); }
+  .rf-meas { color: var(--ok); font-weight: 500; }
+  .rf-name { color: var(--warn); }
+  .rf-caveats { margin: var(--s2) 0 0; padding-left: var(--s4);
+                font-size: var(--t-sm); color: var(--fg-muted); }
+  .rf-caveats li { margin: 2px 0; }
+  .rf-energy { margin-top: var(--s3); padding-top: var(--s2);
+               border-top: 1px solid var(--bd-weak); }
+  pre { background: var(--bg-input); border: 1px solid var(--bd-weak);
+        border-radius: var(--radius); padding: var(--s2); overflow-x: auto;
+        font-size: var(--t-sm); white-space: pre-wrap; word-break: break-word;
+        margin: var(--s2) 0; }
+  code { font-family: var(--mono); }
+  .muted { color: var(--fg-muted); font-size: var(--t-sm); }
+  .est { color: var(--warn); font-size: var(--t-xs); }
+  .reasons li { color: var(--bad); font-size: var(--t-sm); margin: 2px 0; }
+  .adv { border-left: 2px solid var(--accent); padding: var(--s1) var(--s3);
+         margin: var(--s2) 0; }
+  .knoblist { font-size: var(--t-xs); color: var(--fg-muted); }
+  .pill { display: inline-block; background: var(--bg-elevated);
+          border: 1px solid var(--bd-weak); border-radius: 9999px;
+          padding: 1px 8px; margin: 2px 2px 0 0; font-size: var(--t-xs); }
+  .actions { display: flex; gap: var(--s2); flex-wrap: wrap;
+             margin-top: var(--s2); }
+  a { color: var(--accent-text); }
+  .mx td, .mx th { text-align: center; }
+  .mx .estcell { outline: 1px dashed var(--warn-dim); }
+  .mx .fitc { color: var(--ok); } .mx .nofitc { color: var(--bad); }
+  .legend { color: var(--fg-muted); font-size: var(--t-xs);
+            margin-top: var(--s2); }
+  .cardlist { display: flex; flex-direction: column; gap: var(--s1); }
   .cardrow { display: grid; grid-template-columns: auto 1fr auto auto;
-             gap: .4rem; align-items: center; background: #12171e;
-             border: 1px solid #263041; border-radius: 6px; padding: .3rem .45rem; }
-  .cardrow input[type=text] { padding: .2rem .35rem; font-size: .74rem; }
-  .cardrow .vram { width: 5.2rem; text-align: right; }
-  .cardrow .resv { width: 4rem; text-align: right; }
-  .cardrow .cap { font-size: .64rem; color: #7f8b99; }
+             gap: var(--s2); align-items: center; background: var(--bg-elevated);
+             border: 1px solid var(--bd-weak); border-radius: var(--radius);
+             padding: var(--s1) var(--s2); }
+  .cardrow input[type=text] { padding: 2px 6px; font-size: var(--t-sm); }
+  .cardrow .vram { width: 5.4rem; text-align: right; }
+  .cardrow .resv { width: 4.2rem; text-align: right; }
+  .cardrow .cap { font-size: var(--t-xs); color: var(--fg-muted); }
   .cardrow.excluded { opacity: .45; }
   .cardrow input[type=checkbox] { width: auto; }
-  .verdict.offload { background: #33280f; color: #e3b341; border: 1px solid #7a5c14; }
-  .verdict { font-size: 1rem; font-weight: 700; padding: .55rem .7rem;
-             border-radius: 7px; margin-bottom: .8rem; }
-  .fit { background: #10331d; color: #56d364; border: 1px solid #1c6b34; }
-  .nofit { background: #3a1417; color: #ff7b72; border: 1px solid #7d2a2a; }
-  table { border-collapse: collapse; width: 100%; font-size: .76rem; }
-  th, td { text-align: right; padding: .3rem .5rem; border-bottom: 1px solid #232b35; }
-  th:first-child, td:first-child { text-align: left; }
-  .bar { height: 9px; background: #232b35; border-radius: 4px; overflow: hidden; }
-  .bar > span { display: block; height: 100%; background: #2f81f7; }
-  .pricebar { margin-top: .9rem; font-size: .78rem; color: #adbac7; }
-  .pricebar input { width: 5rem; padding: .2rem .4rem; background: #0d1117;
-                    color: #e6edf3; border: 1px solid #30363d; border-radius: 5px; }
-  .measured { margin-top: .9rem; background: #0f1a12; border: 1px solid #2ea043;
-              border-radius: 8px; padding: .7rem .8rem; }
-  .ms-title { font-weight: 700; color: #56d364; font-size: .9rem;
-              text-transform: uppercase; letter-spacing: .02em; }
-  .ms-note { font-size: .72rem; color: #9fb0a4; margin: .35rem 0 .5rem; }
-  .ms-wl { margin: .5rem 0; }
-  .ms-mult { font-size: .8rem; color: #d2f7dd; background: #10251a;
-             border: 1px solid #2ea043; border-radius: 6px; padding: .4rem .6rem;
-             margin: .4rem 0; }
-  .ms-row { border-top: 1px solid #21402b; margin-top: .6rem; padding-top: .4rem; }
-  .ms-row-h { font-size: .8rem; color: #adbac7; }
-  .ms-wl-h { font-size: .74rem; color: #8b98a5; margin-top: .35rem; }
-  .ms-phases { display: flex; gap: 1rem; flex-wrap: wrap; }
-  .ms-phase { flex: 1 1 320px; min-width: 300px; border-radius: 6px;
-              padding: .35rem .5rem; }
-  .ms-prefill { background: #0d1a22; border: 1px solid #1f3a4d; }
-  .ms-decode  { background: #10251a; border: 1px solid #235c34; }
-  .ms-ph-h { font-weight: 700; font-size: .74rem; letter-spacing: .02em;
-             margin-bottom: .2rem; }
-  .ms-prefill .ms-ph-h { color: #6cb6ff; }
-  .ms-decode .ms-ph-h { color: #56d364; }
-  .ms-phase table, .ms-wl table { border-collapse: collapse; margin: .3rem 0;
-                                  font-size: .7rem; width: 100%; }
-  .ms-phase th, .ms-phase td, .ms-wl th, .ms-wl td {
-      border: 1px solid #21402b; padding: .16rem .45rem; text-align: right; }
-  .ms-phase th, .ms-wl th { color: #7f8b99; font-weight: 600; }
-  .roofline { margin-top: .9rem; background: #191410; border: 1px dashed #7a5c14;
-              border-radius: 8px; padding: .7rem .8rem; }
-  .rf-title { font-weight: 700; color: #e3b341; font-size: .9rem;
-              text-transform: uppercase; letter-spacing: .02em; }
-  .rf-nums { display: flex; gap: 1.2rem; margin: .5rem 0; flex-wrap: wrap; }
-  .rf-num { background: #12171e; border: 1px solid #263041; border-radius: 6px;
-            padding: .4rem .7rem; }
-  .rf-num span { display: block; font-size: .66rem; color: #7f8b99;
-                 text-transform: uppercase; }
-  .rf-num b { font-size: 1.15rem; color: #e6edf3; }
-  .rf-num small { display: block; font-size: .62rem; color: #7f8b99; }
-  .rf-meas { color: #56d364; font-weight: 600; }
-  .rf-name { color: #d29922; }
-  .rf-caveats { margin: .5rem 0 0; padding-left: 1.1rem; font-size: .68rem;
-                color: #8b949e; }
-  .rf-caveats li { margin: .15rem 0; }
-  .rf-energy { margin-top: .8rem; padding-top: .6rem;
-               border-top: 1px dashed #7a5c14; }
-  pre { background: #161b22; border: 1px solid #232b35; border-radius: 6px;
-        padding: .6rem; overflow-x: auto; font-size: .74rem; white-space: pre-wrap;
-        word-break: break-word; }
-  .muted { color: #8b96a5; font-size: .72rem; }
-  .est { color: #d29922; font-size: .68rem; }
-  .reasons li { color: #ff9d96; font-size: .76rem; margin: .2rem 0; }
-  .adv { border-left: 3px solid #2f81f7; padding: .3rem .6rem; margin: .5rem 0; }
-  .knoblist { font-size: .68rem; color: #7f8b99; }
-  .pill { display: inline-block; background: #21262d; border: 1px solid #30363d;
-          border-radius: 10px; padding: .05rem .5rem; margin: .1rem .15rem 0 0;
-          font-size: .66rem; }
-  .actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .3rem; }
-  a { color: #58a6ff; }
-  .tabs { display: flex; gap: .4rem; margin-bottom: .8rem; }
-  .tab { background: #21262d; color: #9aa6b4; }
-  .tab.active { background: #1f6feb; color: #fff; }
-  .mx td, .mx th { text-align: center; }
-  .mx .estcell { outline: 1px dashed #6e5417; }
-  .mx .fitc { color: #56d364; } .mx .nofitc { color: #ff7b72; }
-  .legend { color: #8b96a5; font-size: .68rem; margin-top: .5rem; }
-  .cardblock { border: 1px solid #263041; border-radius: 8px;
-               padding: .45rem .6rem; margin: .4rem 0; background: #12171e; }
-  .segbar { display: flex; height: 14px; border-radius: 4px; overflow: hidden;
-            background: #0d1117; border: 1px solid #263041; margin: .25rem 0; }
+  .cardblock { border: 1px solid var(--bd-weak); border-radius: var(--radius-lg);
+               padding: var(--s2) var(--s3); margin: var(--s2) 0;
+               background: var(--bg-panel); }
+  .segbar { display: flex; height: 14px; border-radius: 2px; overflow: hidden;
+            background: var(--bg-input); border: 1px solid var(--bd-weak);
+            margin: var(--s1) 0; }
   .segbar span { display: block; height: 100%; }
   /* replicated segments (KV heads synced/duplicated): hatched overlay so the
      not-the-normal case is unmissable in the bar itself. */
   .segbar span.hatch { background-image: repeating-linear-gradient(
       45deg, rgba(255,255,255,.28) 0 3px, transparent 3px 7px); }
-  .seglegend { font-size: .66rem; color: #8b96a5; margin: .1rem 0; }
-  .repltag { font-size: .6rem; color: #e3a008; border: 1px solid #7a5c14;
-             border-radius: 4px; padding: 0 .25rem; margin-left: .25rem; }
-  .graphline { font-size: .68rem; color: #8b96a5; margin: .1rem 0; }
+  .seglegend { font-size: var(--t-xs); color: var(--fg-muted); margin: 2px 0; }
+  .repltag { font-size: var(--t-xs); color: var(--warn);
+             border: 1px solid var(--warn-dim); border-radius: 2px;
+             padding: 0 4px; margin-left: var(--s1); }
+  .graphline { font-size: var(--t-xs); color: var(--fg-muted); margin: 2px 0; }
   /* side-by-side planned vs plain normal-TP (runner): two equal columns,
      stacking on narrow screens. */
   .sxs { display: grid; grid-template-columns: repeat(auto-fit,
-         minmax(340px, 1fr)); gap: .7rem; align-items: start; }
-  .sxs-h { font-size: .72rem; font-weight: 700; color: #adbac7;
-           margin-bottom: .2rem; text-transform: uppercase;
-           letter-spacing: .03em; }
+         minmax(340px, 1fr)); gap: var(--s3); align-items: start; }
+  .sxs-h { font-size: var(--t-sm); font-weight: 500; color: var(--fg);
+           margin-bottom: var(--s1); text-transform: uppercase;
+           letter-spacing: .04em; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px;
-         margin-right: .25rem; }
-  .rankline { color: #8b96a5; font-size: .68rem; margin: .12rem 0 0 .2rem; }
-  .st-pass { color: #56d364; } .st-warn { color: #e3a008; }
-  .st-fail { color: #ff7b72; } .st-skip { color: #8b96a5; }
-  .st-blocked { color: #8b96a5; }
-  .cfgrow { margin: .15rem 0; }
-  .cfgrow .cfgk { display: inline-block; width: 7.5rem; color: #8b96a5;
-                  font-size: .72rem; vertical-align: top; }
-  /* -- LM-Studio-style settings rows: label left, control right, ? at end -- */
-  .setrow { display: flex; align-items: center; gap: .45rem; margin: .28rem 0;
-            font-size: .74rem; }
-  .setrow .lbl { flex: 1; min-width: 0; color: #b6c2d0; display: flex;
-                 align-items: center; gap: .25rem; overflow: hidden;
+         margin-right: var(--s1); }
+  .rankline { color: var(--fg-muted); font-size: var(--t-xs);
+              margin: 2px 0 0 var(--s1); }
+  .st-pass { color: var(--ok); } .st-warn { color: var(--warn); }
+  .st-fail { color: var(--bad); } .st-skip { color: var(--fg-muted); }
+  .st-blocked { color: var(--fg-muted); }
+  .cfgrow { margin: 2px 0; }
+  .cfgrow .cfgk { display: inline-block; width: 7.5rem; color: var(--fg-muted);
+                  font-size: var(--t-sm); vertical-align: top; }
+  /* -- settings rows: label left, control right, ? at the end --------------- */
+  .setrow { display: flex; align-items: center; gap: var(--s2);
+            margin: var(--s1) 0; font-size: var(--t-sm); }
+  .setrow .lbl { flex: 1; min-width: 0; color: var(--fg); display: flex;
+                 align-items: center; gap: var(--s1); overflow: hidden;
                  white-space: nowrap; text-overflow: ellipsis; }
   .setrow input[type=text], .setrow input[type=number], .setrow select {
-    width: auto; max-width: 42%; padding: .22rem .4rem; font-size: .74rem; }
-  .setrow input[type=number].num { width: 6.2rem; }
+    width: auto; max-width: 42%; padding: 2px 6px; font-size: var(--t-sm); }
+  .setrow input[type=number].num { width: 6.4rem;
+                                   font-variant-numeric: tabular-nums; }
   .setrow input[type=range] { flex: 1.2; width: auto; max-width: none;
-    padding: 0; accent-color: #1f6feb; background: transparent; border: 0; }
+    padding: 0; accent-color: var(--accent); background: transparent; border: 0; }
   .qmark { flex: none; width: 15px; height: 15px; border-radius: 50%;
-           border: 1px solid #465362; color: #8b96a5;
-           font-size: .62rem; line-height: 1; display: inline-flex;
+           border: 1px solid var(--bd-medium); color: var(--fg-muted);
+           font-size: var(--t-xs); line-height: 1; display: inline-flex;
            align-items: center; justify-content: center; cursor: help;
            user-select: none; }
   .chg { display: none; width: 6px; height: 6px; border-radius: 50%;
-         background: #e3a008; flex: none; }
+         background: var(--warn); flex: none; }
   .setrow.changed .chg { display: inline-block; }
   /* toggle switch (pure CSS; the real input stays a hidden checkbox) */
   .switch { position: relative; display: inline-block; width: 34px;
             height: 18px; flex: none; }
   .switch input { opacity: 0; width: 0; height: 0; position: absolute;
                   margin: 0; padding: 0; border: 0; }
-  .switch .track { position: absolute; inset: 0; background: #30363d;
-    border-radius: 10px; transition: .15s; cursor: pointer;
-    border: 1px solid #3a4552; }
+  .switch .track { position: absolute; inset: 0; background: var(--bg-elevated);
+    border-radius: 9999px; transition: .15s; cursor: pointer;
+    border: 1px solid var(--bd-medium); }
   .switch .track:before { content: ""; position: absolute; width: 12px;
-    height: 12px; left: 2px; top: 2px; background: #8b96a5;
+    height: 12px; left: 2px; top: 2px; background: var(--fg-muted);
     border-radius: 50%; transition: .15s; }
-  .switch input:checked + .track { background: #1f6feb; border-color: #1f6feb; }
+  .switch input:checked + .track { background: var(--accent);
+                                   border-color: var(--accent); }
   .switch input:checked + .track:before { transform: translateX(16px);
     background: #fff; }
   .switch input:disabled + .track { opacity: .45; cursor: default; }
   /* collapsible config sections in a fixed order */
-  .cfg-section { border: 1px solid #263041; border-radius: 7px;
-                 margin: .35rem 0; background: #10151c; }
-  .cfg-section > summary { cursor: pointer; padding: .4rem .55rem;
-    font-size: .76rem; color: #c8d3df; list-style-position: inside; }
-  .cfg-section > summary b { color: #dbe4ee; }
-  .cfg-section .sec-sum { color: #7f8b99; font-size: .66rem;
-                          margin-left: .35rem; }
-  .cfg-section .sec-body { padding: .15rem .6rem .5rem; }
-  .advrow { border: 1px dashed #3a4552; border-radius: 7px; margin: .45rem 0;
-            padding: .35rem .55rem; }
+  .cfg-section { border: 1px solid var(--bd-weak); border-radius: var(--radius);
+                 margin: var(--s1) 0; background: var(--bg-elevated); }
+  .cfg-section > summary { cursor: pointer; padding: var(--s2);
+    font-size: var(--t-sm); color: var(--fg); list-style-position: inside; }
+  .cfg-section > summary:hover { background: var(--hover); }
+  .cfg-section > summary b { color: var(--fg-strong); font-weight: 500; }
+  .cfg-section .sec-sum { color: var(--fg-muted); font-size: var(--t-xs);
+                          margin-left: var(--s1); }
+  .cfg-section .sec-body { padding: 0 var(--s2) var(--s2); }
+  .advrow { border: 1px dashed var(--bd-medium); border-radius: var(--radius);
+            margin: var(--s2) 0; padding: var(--s2); }
   /* sticky action bar (load / eject / restart + status chip) */
-  .actionbar { position: sticky; bottom: 0; z-index: 5; background: #0e1116;
-    border: 1px solid #2a323d; border-radius: 8px; padding: .55rem .7rem;
-    margin: .6rem 0 .9rem; box-shadow: 0 -8px 16px rgba(0,0,0,.4); }
-  .chip { display: inline-flex; align-items: center; gap: .3rem;
-    border-radius: 10px; padding: .12rem .55rem; font-size: .7rem;
-    border: 1px solid #30363d; background: #161b22; color: #8b96a5; }
+  .actionbar { position: sticky; bottom: 0; z-index: 5;
+    background: var(--bg-panel); border: 1px solid var(--bd-weak);
+    border-radius: var(--radius-lg); padding: var(--s2) var(--s3);
+    margin: var(--s3) 0; box-shadow: 0 -6px 12px rgba(0,0,0,.45); }
+  .chip { display: inline-flex; align-items: center; gap: var(--s1);
+    border-radius: 9999px; padding: 2px 10px; font-size: var(--t-xs);
+    border: 1px solid var(--bd-medium); background: var(--bg-elevated);
+    color: var(--fg-muted); }
   .chip:before { content: ""; width: 7px; height: 7px; border-radius: 50%;
-                 background: #6e7681; }
-  .chip.ready { color: #56d364; border-color: #1c6b34; }
-  .chip.ready:before { background: #56d364; }
-  .chip.loading { color: #e3b341; border-color: #7a5c14; }
-  .chip.loading:before { background: #e3b341; }
-  .chip.error { color: #ff7b72; border-color: #7d2a2a; }
-  .chip.error:before { background: #ff7b72; }
+                 background: var(--fg-disabled); }
+  .chip.ready { color: var(--ok); border-color: var(--ok-dim); }
+  .chip.ready:before { background: var(--ok); }
+  .chip.loading { color: var(--warn); border-color: var(--warn-dim); }
+  .chip.loading:before { background: var(--warn); }
+  .chip.error { color: var(--bad); border-color: var(--bad-dim); }
+  .chip.error:before { background: var(--bad); }
   /* hardware: per-card VRAM bar spanning the row */
   .cardrow .cardbar { grid-column: 1 / -1; }
   /* landing top strip: ONE full-width row of live metric tiles (label, big
      value, secondary line, 60s sparkline). Normal flow -- the strip pushes
      the rest of the page down, nothing overlaps; tiles wrap to a second row
      on narrow screens instead of overflowing. */
-  .mstrip { display: flex; flex-wrap: wrap; gap: .45rem; width: 100%;
-            margin: .2rem 0 .7rem; }
-  .mtile { flex: 1 1 168px; min-width: 168px; background: #12171e;
-           border: 1px solid #263041; border-radius: 8px;
-           padding: .38rem .55rem .45rem; }
-  .mtile .mt-l { font-size: .62rem; color: #7f8b99; text-transform: uppercase;
-                 letter-spacing: .03em; white-space: nowrap; overflow: hidden;
+  .mstrip { display: flex; flex-wrap: wrap; gap: var(--s2); width: 100%;
+            margin: 0 0 var(--s3); }
+  .mtile { flex: 1 1 172px; min-width: 172px; background: var(--bg-panel);
+           border: 1px solid var(--bd-weak); border-radius: var(--radius-lg);
+           padding: var(--s2); }
+  .mtile .mt-l { font-size: var(--t-xs); color: var(--fg-muted);
+                 text-transform: uppercase; letter-spacing: .04em;
+                 white-space: nowrap; overflow: hidden;
                  text-overflow: ellipsis; }
-  .mtile .mt-v { font-size: 1.2rem; font-weight: 700; color: #e6edf3;
-                 line-height: 1.3; white-space: nowrap; }
-  .mtile .mt-v small { font-size: .64rem; font-weight: 400; color: #8b96a5; }
-  .mtile .mt-s { font-size: .62rem; color: #8b96a5; line-height: 1.35;
-                 min-height: 1.7em; }
+  .mtile .mt-v { font-size: 20px; font-weight: 500; color: var(--fg-strong);
+                 line-height: 1.3; white-space: nowrap;
+                 font-variant-numeric: tabular-nums; }
+  .mtile .mt-v small { font-size: var(--t-xs); font-weight: 400;
+                       color: var(--fg-muted); }
+  .mtile .mt-s { font-size: var(--t-xs); color: var(--fg-muted);
+                 line-height: 1.4; min-height: 1.7em;
+                 font-variant-numeric: tabular-nums; }
   /* fixed-pixel sparkline: sized in JS as samples*px so ONE sample = ONE
      pixel bucket; never stretched by CSS (stretching would alias samples). */
-  .mtile svg.spk { display: block; margin-top: .25rem; background: #0d1117;
-                   border-radius: 3px; max-width: 100%; }
+  .mtile svg.spk { display: block; margin-top: var(--s1);
+                   background: var(--bg-input); border-radius: 2px;
+                   max-width: 100%; }
 
   /* ---- refresh affordance -------------------------------------------------
      A panel waiting on a slow backend call keeps showing its previous
@@ -3510,51 +3644,55 @@ _INDEX_TEMPLATE = r"""<!doctype html>
      panel and throws away what the reader was looking at. The transition is
      short enough that a fast answer never registers as a flicker. */
   .stale { opacity: .55; transition: opacity .12s linear; }
-  .stale-note { font-size: .62rem; color: #8b96a5; }
+  .stale-note { font-size: var(--t-xs); color: var(--fg-muted); }
   /* A backend call that failed or timed out. The panel keeps its last good
      content; this line says why it is no longer moving. */
-  .rev-error { font-size: .68rem; color: #d29922; margin-top: .25rem; }
+  .rev-error { font-size: var(--t-sm); color: var(--warn);
+               margin-top: var(--s1); }
 
   /* ---- simple / expert -----------------------------------------------------
      Two densities of the same page, not two different pages. Expert ADDS
      dimensions; it never changes what a control shared by both means. */
-  .hdr { display: flex; align-items: flex-start; justify-content: space-between;
-         gap: 1rem; flex-wrap: wrap; }
-  .vmode { display: flex; border: 1px solid #30363d; border-radius: 7px;
-           overflow: hidden; flex: none; margin-top: .2rem; }
-  .vmode .vm { background: #12171e; color: #8b96a5; border: 0;
-               padding: .3rem .8rem; font: inherit; font-size: .74rem;
-               cursor: pointer; }
-  .vmode .vm.on { background: #1f6feb; color: #fff; }
-  .vmode .vm:not(.on):hover { color: #e6edf3; }
+  .vmode { display: flex; border: 1px solid var(--bd-medium);
+           border-radius: var(--radius); overflow: hidden; flex: none; }
+  .vmode .vm { background: var(--bg-elevated); color: var(--fg-muted);
+               border: 0; border-radius: 0; padding: 5px 14px; font: inherit;
+               font-size: var(--t-sm); cursor: pointer; }
+  .vmode .vm.on { background: var(--accent); color: #fff; }
+  .vmode .vm:not(.on):hover { color: var(--fg-strong);
+                              background: var(--selected); filter: none; }
   /* Visibility is driven by one class on <body>, so no panel has to know
      which mode it is in and a mode switch touches no backend call. */
   body.mode-simple .expert-only { display: none !important; }
   body.mode-expert .simple-only { display: none !important; }
 
   /* ---- simple view: one bar and one budget slider per card ---------------- */
-  .cardsimple { border: 1px solid #263041; border-radius: 8px;
-                padding: .5rem .6rem; margin: .4rem 0; background: #12171e; }
+  .cardsimple { border: 1px solid var(--bd-weak); border-radius: var(--radius-lg);
+                padding: var(--s2) var(--s3); margin: var(--s2) 0;
+                background: var(--bg-panel); }
   .cardsimple .cs-h { display: flex; justify-content: space-between;
-                      align-items: baseline; gap: .5rem; flex-wrap: wrap; }
-  .cardsimple .cs-n { font-weight: 600; color: #e6edf3; }
-  .cardsimple .cs-u { font-size: .72rem; color: #8b96a5; white-space: nowrap; }
+                      align-items: baseline; gap: var(--s2); flex-wrap: wrap; }
+  .cardsimple .cs-n { font-weight: 500; color: var(--fg-strong); }
+  .cardsimple .cs-u { font-size: var(--t-sm); color: var(--fg-muted);
+                      white-space: nowrap; font-variant-numeric: tabular-nums; }
   /* One bar = everything the configuration puts on this card. The granular
-     split is the expert view's job; here the number is the whole point. */
-  .csbar { position: relative; height: 20px; border-radius: 4px;
-           background: #0d1117; border: 1px solid #263041; overflow: hidden;
-           margin: .35rem 0 .3rem; }
-  .csbar .fill { position: absolute; inset: 0 auto 0 0; background: #1f6feb; }
-  .csbar .fill.over { background: #f85149; }
-  .csbar .fill.tight { background: #d29922; }
+     split is the expert view's job; here the number is the whole point.
+     Fill colour is state, not decoration: normal / tight / over. */
+  .csbar { position: relative; height: 18px; border-radius: 2px;
+           background: var(--bg-input); border: 1px solid var(--bd-weak);
+           overflow: hidden; margin: var(--s1) 0; }
+  .csbar .fill { position: absolute; inset: 0 auto 0 0; background: var(--info); }
+  .csbar .fill.over { background: var(--bad); }
+  .csbar .fill.tight { background: var(--warn); }
   /* The budget the user set, drawn as a line across the bar: the reader can
      see at a glance whether the configuration sits under it or over it. */
   .csbar .cap { position: absolute; top: 0; bottom: 0; width: 2px;
-                background: #e6edf3; }
-  .csrow { display: flex; align-items: center; gap: .5rem; }
+                background: var(--fg-strong); }
+  .csrow { display: flex; align-items: center; gap: var(--s2); }
   .csrow input[type=range] { flex: 1 1 auto; min-width: 8rem; }
-  .csrow .cs-v { font-size: .72rem; color: #8b96a5; min-width: 7.5rem;
-                 text-align: right; white-space: nowrap; }
+  .csrow .cs-v { font-size: var(--t-sm); color: var(--fg-muted);
+                 min-width: 7.5rem; text-align: right; white-space: nowrap;
+                 font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -8088,5 +8226,7 @@ showTab('landing');
 # inlined. INDEX_HTML stays a plain string constant: the handler serves it
 # verbatim and the tests read it directly, exactly as before.
 INDEX_HTML = _INDEX_TEMPLATE.replace(
-    "/*__VENDOR_MORPHDOM__*/", _vendored_js("morphdom-umd.min.js")
+    "/*__VENDOR_MORPHDOM__*/", _vendored_asset("morphdom-umd.min.js")
+).replace(
+    "/*__VENDOR_NORMALIZE__*/", _vendored_asset("modern-normalize.css")
 )

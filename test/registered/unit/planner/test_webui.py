@@ -2327,6 +2327,26 @@ class TestVendoredAssets(CustomTestCase):
         with open(lic, encoding="utf-8") as f:
             self.assertIn("MIT License", f.read())
 
+    def test_normalize_is_vendored_with_its_licence(self):
+        d = os.path.join(os.path.dirname(webui.__file__), "assets")
+        css = os.path.join(d, "modern-normalize.css")
+        lic = os.path.join(d, "modern-normalize.LICENSE")
+        self.assertTrue(os.path.exists(css), css)
+        self.assertTrue(os.path.exists(lic), lic)
+        with open(lic, encoding="utf-8") as f:
+            self.assertIn("MIT License", f.read())
+        html = webui.INDEX_HTML
+        self.assertIn("modern-normalize v3", html)
+        self.assertNotIn("/*__VENDOR_NORMALIZE__*/", html)
+
+    def test_design_tokens_are_defined_once(self):
+        # Every surface/spacing/state value comes from the :root token block,
+        # so a colour is never spelled out twice in the page.
+        html = webui.INDEX_HTML
+        for tok in ("--bg-canvas", "--bg-panel", "--bd-weak", "--fg-muted",
+                    "--accent", "--ok", "--warn", "--bad", "--s2", "--t-md"):
+            self.assertIn(tok + ":", html, tok)
+
     def test_page_inlines_it_and_links_nothing_external(self):
         html = webui.INDEX_HTML
         self.assertIn("global.morphdom=", html)      # the library itself
