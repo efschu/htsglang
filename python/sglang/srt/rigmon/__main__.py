@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -233,6 +234,140 @@ def cmd_snapshot(args) -> int:
     return 0
 
 
+def cmd_boot(args) -> int:
+    from sglang.srt.rigmon.bootwatch import classify_boot, read_boot_log
+
+    try:
+        markers, tail = read_boot_log(args.log)
+    except OSError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    d = classify_boot(markers, tail)
+    if args.json:
+        print(json.dumps(d.to_json(), indent=1))
+        return 0
+    print(f"stage   : {d.stage_label} ({'+'.join(d.reached) or 'nothing reached'})")
+    print(f"serving : {'yes' if d.ready else 'no'}")
+    if d.diagnosis:
+        print(f"cause   : {d.diagnosis['label']}")
+        print(f"means   : {d.diagnosis['meaning']}")
+        print(f"do      : {d.diagnosis['remedy']}")
+        if d.other_matches:
+            print(f"also    : {', '.join(m['label'] for m in d.other_matches)}")
+    elif not d.ready:
+        print("cause   : no known signature matched; see the excerpt below")
+    for line in d.excerpt:
+        print(f"  | {line[:160]}")
+    return 0 if d.ready else 1
+
+
+def cmd_kv_budget(args) -> int:
+    from sglang.srt.rigmon.kvbudget import (
+        describe_budget,
+        list_budget_files,
+        reset_budget,
+    )
+
+    files = list_budget_files(args.cache_dir)
+    if not files:
+        print(f"no measured KV budget files in {args.cache_dir}")
+        return 0
+    if args.reset:
+        for path in files:
+            if args.config_hash and args.config_hash not in path:
+                continue
+            print(json.dumps(reset_budget(path, backup=not args.no_backup), indent=1))
+        return 0
+    out = []
+    for path in files:
+        try:
+            out.append(describe_budget(path))
+        except (OSError, ValueError) as e:
+            print(f"warning: {path}: {e}", file=sys.stderr)
+    if args.json:
+        print(json.dumps([b.to_json() for b in out], indent=1))
+        return 0
+    for b in out:
+        print(f"{b.config_hash}  max_total_num_tokens={b.max_total_num_tokens}  "
+              f"ranks={b.ranks}  age={b.age_s / 3600:.1f}h")
+        for c in b.components:
+            print(
+                f"  rank {c['rank']}: total={c['device_total_mib']} MiB "
+                f"free_at_measure={c['free_at_measure_mib']} MiB "
+                f"kv_tokens={c['kv_pool_tokens']} "
+                f"foreign_resident={c['foreign_residency_mib']} MiB"
+            )
+        for w in b.warnings:
+            print(f"  WARNING: {w}")
+    return 0
+
+
+def cmd_levers(args) -> int:
+    from sglang.srt.planner.levers import render_levers_text, suggest_levers
+
+    hw, _ = load_cached_profiles()
+    facs = [f.key for f in facilities(detect_host_environment()) if f.available]
+    out = suggest_levers(
+        heterogeneous=not args.homogeneous,
+        probe=hw,
+        node_count=args.nodes,
+        facility_keys_available=facs,
+        keys=(args.lever.split(",") if args.lever else None),
+    )
+    if args.json:
+        print(json.dumps([s.to_json() for s in out], indent=1))
+        return 0
+    print(render_levers_text(out))
+    return 0
+
+
+def cmd_scenario(args) -> int:
+    from sglang.srt.planner.scenarios import (
+        SCENARIOS,
+        build_harness_command,
+        plan_scenario,
+        render_scenario_text,
+        suggest,
+    )
+
+    if args.list:
+        for key, s in SCENARIOS.items():
+            print(f"{key:34s} {s.question}")
+        return 0
+    scenario = None
+    if args.key:
+        scenario = SCENARIOS.get(args.key)
+        if scenario is None:
+            print(f"error: no scenario {args.key!r}", file=sys.stderr)
+            return 2
+    elif args.question:
+        scenario = suggest(args.question)
+        if scenario is None:
+            print(
+                "No scenario matches that question. Use --list to see the "
+                "known ones, or add your own with a scenario JSON file.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        print("error: give --key, --question or --list", file=sys.stderr)
+        return 2
+    plan = plan_scenario(scenario, facilities(detect_host_environment()))
+    if args.json:
+        print(json.dumps(plan.to_json(), indent=1))
+        return 0
+    print(render_scenario_text(plan))
+    if scenario.harness:
+        first = {a.key: (a.values[0] if a.values else None) for a in scenario.axes}
+        cmd = build_harness_command(scenario, first, base_url=args.engine)
+        print()
+        print("First point drives the existing harness:")
+        print(f"  {cmd['command']}")
+        for e in cmd["external"]:
+            print(f"  before it: set {e['label']} = {e['value']} ({e['apply']})")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m sglang.srt.rigmon",
@@ -294,6 +429,37 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--node-id", default=default_node_id())
     n.add_argument("--engine", default="http://127.0.0.1:30000")
     n.set_defaults(func=cmd_snapshot)
+
+    b = sub.add_parser("boot", help="classify a boot log")
+    b.add_argument("log", help="path to the server boot log")
+    b.add_argument("--json", action="store_true")
+    b.set_defaults(func=cmd_boot)
+
+    kv = sub.add_parser(
+        "kv-budget", help="show or reset the persisted measured KV budget"
+    )
+    kv.add_argument("--cache-dir", default=os.path.expanduser("~/.cache/sglang"))
+    kv.add_argument("--reset", action="store_true")
+    kv.add_argument("--config-hash", default="", help="limit --reset to one file")
+    kv.add_argument("--no-backup", action="store_true")
+    kv.add_argument("--json", action="store_true")
+    kv.set_defaults(func=cmd_kv_budget)
+
+    lv = sub.add_parser("levers", help="the five lever profiles for this rig")
+    lv.add_argument("--homogeneous", action="store_true",
+                    help="treat the rig as uniform (skip heterogeneous-only flags)")
+    lv.add_argument("--nodes", type=int, default=1)
+    lv.add_argument("--lever", default="", help="comma-separated subset")
+    lv.add_argument("--json", action="store_true")
+    lv.set_defaults(func=cmd_levers)
+
+    sc = sub.add_parser("scenario", help="benchmark scenarios")
+    sc.add_argument("--key", default="")
+    sc.add_argument("--question", default="")
+    sc.add_argument("--list", action="store_true")
+    sc.add_argument("--engine", default="http://127.0.0.1:30000")
+    sc.add_argument("--json", action="store_true")
+    sc.set_defaults(func=cmd_scenario)
 
     return p
 

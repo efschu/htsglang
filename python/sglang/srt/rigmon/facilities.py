@@ -357,6 +357,7 @@ def facilities(
     exists: Optional[Callable[[str], bool]] = None,
     gpm_supported: Optional[bool] = None,
     gpm_reason: Optional[str] = None,
+    per_rank_metrics: bool = False,
 ) -> List[Facility]:
     """Everything the dashboard may want to measure or set, with its chain."""
     env = env or detect_host_environment()
@@ -404,6 +405,39 @@ def facilities(
                 "coarse utilization and says so."
             ),
             requirements=[_req_gpm(gpm_supported, gpm_reason)],
+        ),
+        Facility(
+            key="per_rank_engine_metrics",
+            label="per-rank engine counters (busy time, estimated work)",
+            kind=MEASURE,
+            purpose=(
+                "The engine labels its forward-time and estimated FLOP/byte "
+                "counters with tp_rank, which is an EXACT per-rank work "
+                "attribution and needs no profiling counter at all. It is the "
+                "best available source on hardware without GPM."
+            ),
+            requirements=[
+                Requirement(
+                    key="enable_metrics_for_all_schedulers",
+                    label="--enable-metrics-for-all-schedulers",
+                    satisfied=bool(per_rank_metrics),
+                    detail=(
+                        "each TP rank exports its own series"
+                        if per_rank_metrics
+                        else "only TP rank 0 exports, so every series is "
+                        "labelled tp_rank=0 regardless of which rank did the "
+                        "work"
+                    ),
+                    remedy=(
+                        None
+                        if per_rank_metrics
+                        else "restart the server with --enable-metrics "
+                        "--enable-metrics-for-all-schedulers. This is a server "
+                        "flag, not a host permission — it works inside a "
+                        "container."
+                    ),
+                )
+            ],
         ),
         Facility(
             key="rdma",

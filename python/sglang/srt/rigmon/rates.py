@@ -117,6 +117,20 @@ CAVEAT_NO_PEAKS = Caveat(
     "into FLOP/s and bytes/s.",
     severity="warning",
 )
+CAVEAT_ENGINE_WORK_ESTIMATED = Caveat(
+    "engine_work_estimated",
+    "Work per rank comes from the engine's own counters, derived from the "
+    "shapes actually executed. That is an exact attribution of work to ranks "
+    "— it is not a hardware measurement of what the silicon achieved, so it "
+    "does not capture kernel inefficiency.",
+)
+CAVEAT_SINGLE_RANK_EXPORT = Caveat(
+    "single_rank_export",
+    "Only one TP rank exports metrics, so the per-rank columns repeat rank 0 "
+    "instead of describing each rank. Start the server with "
+    "--enable-metrics-for-all-schedulers for a real per-rank breakdown.",
+    severity="warning",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +303,10 @@ class RankShare:
 
     #: "nvml-gpm" | "nvml-utilization (coarse fallback)" | "none"
     activity_source: str = "none"
+    #: Which source the work and active-share figures actually came from:
+    #: "engine forward-time counter" (exact per-rank attribution), "nvml-gpm"
+    #: (measured silicon), or the coarse utilization fallback.
+    work_source: str = "none"
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -316,10 +334,65 @@ class RankView:
         }
 
 
+def engine_rank_rates(
+    per_rank: Optional[Dict[int, Dict[str, float]]],
+    prev_per_rank: Optional[Dict[int, Dict[str, float]]],
+    dt_s: Optional[float],
+) -> Dict[int, Dict[str, float]]:
+    """Differentiate the engine's per-rank counters into rates.
+
+    ``forward_execution_seconds_total`` is GPU-busy time, so its delta divided
+    by wall time IS the rank's active share — an exact figure that needs no
+    profiling counter and is available on any card. The estimated FLOP and byte
+    counters likewise become achieved rates.
+    """
+    if not per_rank or not prev_per_rank or not dt_s or dt_s <= 0:
+        return {}
+    out: Dict[int, Dict[str, float]] = {}
+    for rank, cur in per_rank.items():
+        prev = prev_per_rank.get(rank)
+        if not prev:
+            continue
+        row: Dict[str, float] = {}
+        busy = cur.get("forward_execution_seconds_total")
+        busy0 = prev.get("forward_execution_seconds_total")
+        if busy is not None and busy0 is not None and busy >= busy0:
+            row["active_share"] = max(0.0, min(1.0, (busy - busy0) / dt_s))
+        flops, flops0 = (
+            cur.get("estimated_flops_per_gpu_total"),
+            prev.get("estimated_flops_per_gpu_total"),
+        )
+        if flops is not None and flops0 is not None and flops >= flops0:
+            row["achieved_tflops"] = (flops - flops0) / dt_s / 1e12
+        rb, rb0 = (
+            cur.get("estimated_read_bytes_per_gpu_total"),
+            prev.get("estimated_read_bytes_per_gpu_total"),
+        )
+        wb, wb0 = (
+            cur.get("estimated_write_bytes_per_gpu_total"),
+            prev.get("estimated_write_bytes_per_gpu_total"),
+        )
+        moved = 0.0
+        have = False
+        if rb is not None and rb0 is not None and rb >= rb0:
+            moved += rb - rb0
+            have = True
+        if wb is not None and wb0 is not None and wb >= wb0:
+            moved += wb - wb0
+            have = True
+        if have:
+            row["achieved_gbs"] = moved / dt_s / 1e9
+        if row:
+            out[rank] = row
+    return out
+
+
 def rank_shares(
     cards: Sequence[CardSample],
     peaks: Optional[Dict[str, PeakCapability]] = None,
     rank_gpu_id: Optional[Sequence[int]] = None,
+    engine_rates: Optional[Dict[int, Dict[str, float]]] = None,
+    single_rank_export: bool = False,
 ) -> RankView:
     """Assemble the per-rank view from a card sample plus probe peaks.
 
@@ -327,12 +400,22 @@ def rank_shares(
     co-located ranks several ranks share one card; the card's state is then
     reported for each of them and the group sums count the card once, because
     a co-located pair does not draw double the power.
+
+    ``engine_rates`` (from :func:`engine_rank_rates`) takes precedence over the
+    device counters where present. Precedence order for work and active share:
+    engine counters (exact attribution) > GPM (measured silicon) > coarse NVML
+    utilization (a busy-time proxy). Whichever was used is recorded per rank.
     """
     peaks = peaks or {}
+    engine_rates = engine_rates or {}
     caveats: List[Caveat] = [CAVEAT_POWER_COMPARABILITY]
     if not peaks:
         caveats.append(CAVEAT_NO_PEAKS)
-    if any(
+    if engine_rates:
+        caveats.append(CAVEAT_ENGINE_WORK_ESTIMATED)
+    if single_rank_export:
+        caveats.append(CAVEAT_SINGLE_RANK_EXPORT)
+    if not engine_rates and any(
         c.activity_source.startswith("nvml-utilization")
         or c.activity_source.startswith("nvidia-smi")
         for c in cards
@@ -365,17 +448,32 @@ def rank_shares(
             activity_source=c.activity_source,
             idle_w=pk.idle_w,
         )
+        er = engine_rates.get(rank) if rank is not None else None
         # Time split. `sm_active` is the share of the window in which this card
         # had work resident; the remainder is where it waited on the group.
-        if c.sm_active is not None:
+        if er and "active_share" in er:
+            s.active_share = er["active_share"]
+            s.wait_share = 1.0 - s.active_share
+            s.work_source = "engine forward-time counter"
+        elif c.sm_active is not None:
             s.active_share = max(0.0, min(1.0, c.sm_active))
             s.wait_share = 1.0 - s.active_share
-        # Achieved against peak.
-        if c.dram_active is not None:
+            s.work_source = c.activity_source
+        # Achieved rates. Engine counters win: they attribute work to the rank
+        # that did it, which the device counters cannot do for co-located ranks.
+        if er and "achieved_gbs" in er:
+            s.achieved_gbs = er["achieved_gbs"]
+            if pk.membw_gbs:
+                s.membw_achieved_frac = min(1.0, s.achieved_gbs / pk.membw_gbs)
+        elif c.dram_active is not None:
             s.membw_achieved_frac = max(0.0, min(1.0, c.dram_active))
             if pk.membw_gbs:
                 s.achieved_gbs = s.membw_achieved_frac * pk.membw_gbs
-        if c.tensor_active is not None:
+        if er and "achieved_tflops" in er:
+            s.achieved_tflops = er["achieved_tflops"]
+            if pk.gemm_tflops:
+                s.tensor_achieved_frac = min(1.0, s.achieved_tflops / pk.gemm_tflops)
+        elif c.tensor_active is not None:
             s.tensor_achieved_frac = max(0.0, min(1.0, c.tensor_active))
             if pk.gemm_tflops:
                 s.achieved_tflops = s.tensor_achieved_frac * pk.gemm_tflops
