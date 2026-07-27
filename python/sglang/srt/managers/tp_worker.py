@@ -402,11 +402,40 @@ class TpModelWorker(BaseTpWorker):
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
         )
 
+    def _num_multi_layer_eagle_draft_runners(self) -> int:
+        """How many MTP layers to load for multi-layer EAGLE.
+
+        Statically this is speculative_num_steps. Under adaptive draft length
+        (#138) speculative_num_steps is only the INITIAL rung, while every rung
+        k needs MTP layers 0..k-1 resident -- the layers hold real weights and
+        cannot be materialized at runtime -- so the ladder ceiling decides.
+        """
+        adaptive_ceiling = self.server_args.adaptive_max_candidate_steps
+        if adaptive_ceiling is None:
+            return self.server_args.speculative_num_steps
+
+        num_runners = max(self.server_args.speculative_num_steps, adaptive_ceiling)
+        # Fail here, before the weight load: MTP layer i is selected by
+        # draft_model_idx=i and a missing one surfaces as an opaque
+        # missing-parameter error deep inside the loader.
+        available = getattr(
+            self.model_config.hf_config, "num_nextn_predict_layers", None
+        )
+        if available is not None and num_runners > available:
+            raise ValueError(
+                f"Multi-layer EAGLE adaptive ladder needs {num_runners} MTP "
+                "layers (the largest candidate step), but the draft checkpoint "
+                f"provides num_nextn_predict_layers={available}. Lower the ladder "
+                "ceiling via --speculative-adaptive-config, or use a draft "
+                "checkpoint with more MTP layers."
+            )
+        return num_runners
+
     def _init_multi_layer_eagle_model_runners(self):
         from sglang.srt.model_executor.model_runner import ModelRunner
 
         self.model_runner_list.append(self.model_runner)
-        for i in range(1, self.server_args.speculative_num_steps):
+        for i in range(1, self._num_multi_layer_eagle_draft_runners()):
             self.model_runner_list.append(
                 ModelRunner(
                     model_config=self.model_config,

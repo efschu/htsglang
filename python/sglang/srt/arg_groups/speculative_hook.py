@@ -753,12 +753,13 @@ def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
 
 def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.adaptive_spec_params import (
+        adaptive_algorithm_key,
         resolve_candidate_steps_from_config,
     )
 
     candidate_steps = resolve_candidate_steps_from_config(
         cfg_path=server_args.speculative_adaptive_config,
-        algorithm=server_args.speculative_algorithm,
+        algorithm=adaptive_algorithm_key(server_args),
     )
 
     if server_args.speculative_eagle_topk is None:

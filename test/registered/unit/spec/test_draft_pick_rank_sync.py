@@ -364,5 +364,198 @@ class TestAdaptiveAcceptFeedRatchet(CustomTestCase):
         )
 
 
+def _annotate_parents(tree):
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            child.parent = node
+    return tree
+
+
+def _call_name(node):
+    """Name of a Call node, with torch.argmax spelled out."""
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        if (
+            node.func.attr == "argmax"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "torch"
+        ):
+            return "torch.argmax"
+        return node.func.attr
+    return None
+
+
+def _enclosing_func(node):
+    cur = getattr(node, "parent", None)
+    while cur is not None:
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return cur
+        cur = getattr(cur, "parent", None)
+    return None
+
+
+def _innermost_loop(node):
+    """The innermost For/While enclosing *node* within its function, or None."""
+    cur = getattr(node, "parent", None)
+    while cur is not None and not isinstance(
+        cur, (ast.FunctionDef, ast.AsyncFunctionDef)
+    ):
+        if isinstance(cur, (ast.For, ast.AsyncFor, ast.While)):
+            return cur
+        cur = getattr(cur, "parent", None)
+    return None
+
+
+# Multi-layer EAGLE pick sites. `replay` is a pick site too: the per-step
+# draft-extend graph computes fast_topk IN-graph
+# (MultiLayerEagleDraftExtendCudaGraphRunner._compute_topk), so the worker
+# receives an already-made per-rank pick that the source-level names below
+# cannot see.
+_ML_PICK_CALL_NAMES = {
+    "fast_topk",
+    "fast_sample",
+    "sample_draft_proposal",
+    "torch.argmax",
+    "replay",
+}
+
+
+class TestMultiLayerPickSiteRatchet(CustomTestCase):
+    """#185 / #50-family: the multi-layer EAGLE worker draws its chain picks
+    per rank in `_draft_extend_for_prefill` / `_draft_extend_for_decode`, one
+    per MTP rung. Each rung's pick feeds the NEXT rung's input_ids (the chain
+    rotation) and thus that rung's KV writes, so a single divergent pick on a
+    heterogeneous-GPU TP rank desynchronizes the group for the rest of the
+    sequence — exactly what `_broadcast_draft_picks` exists to prevent in
+    eagle_worker_v2.
+
+    Stricter than the eagle_worker_v2 ratchet above: the broadcast must sit in
+    the SAME innermost loop as the pick, so one broadcast at the end of the
+    function cannot vacuously cover k rungs.
+    """
+
+    def _sites(self):
+        import sglang.srt.speculative.multi_layer_eagle_worker_v2 as ml
+
+        tree = _annotate_parents(ast.parse(inspect.getsource(ml)))
+        picks, broadcasts, rotations = [], [], []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _call_name(node)
+            if name in _ML_PICK_CALL_NAMES:
+                picks.append(node)
+            elif name == "_broadcast_draft_picks":
+                broadcasts.append(node)
+            elif name == "rotate_input_ids":
+                rotations.append(node)
+        return picks, broadcasts, rotations
+
+    def test_every_pick_site_is_broadcast_inside_its_own_rung_loop(self):
+        picks, broadcasts, _ = self._sites()
+        self.assertGreaterEqual(
+            len(picks),
+            5,
+            "expected at least 5 multi-layer draft-pick sites "
+            "(prefill loop, graph replay, eager loop) — ratchet broken?",
+        )
+
+        unsynced = []
+        for pick in picks:
+            func = _enclosing_func(pick)
+            loop = _innermost_loop(pick)
+            covered = any(
+                _enclosing_func(b) is func
+                and _innermost_loop(b) is loop
+                and b.lineno > pick.lineno
+                for b in broadcasts
+            )
+            if not covered:
+                unsynced.append(
+                    (func.name if func else "<module>", pick.lineno, _call_name(pick))
+                )
+        self.assertEqual(
+            unsynced,
+            [],
+            "Multi-layer EAGLE draft pick(s) without a _broadcast_draft_picks "
+            "in the same rung loop — on heterogeneous GPUs every one of these "
+            f"desynchronizes the TP group (#185, #50 family): {unsynced}",
+        )
+
+    def test_broadcast_precedes_the_chain_rotation(self):
+        """Ordering, not just presence: the pick is rotated into the NEXT
+        rung's input_ids, so the sync has to land BEFORE the rotation."""
+        picks, broadcasts, rotations = self._sites()
+        late = []
+        for pick in picks:
+            loop = _innermost_loop(pick)
+            if loop is None:
+                continue
+            rots = [
+                r
+                for r in rotations
+                if _innermost_loop(r) is loop and r.lineno > pick.lineno
+            ]
+            if not rots:
+                continue
+            first_rot = min(r.lineno for r in rots)
+            if not any(
+                _innermost_loop(b) is loop and pick.lineno < b.lineno < first_rot
+                for b in broadcasts
+            ):
+                late.append((pick.lineno, _call_name(pick), first_rot))
+        self.assertEqual(
+            late,
+            [],
+            "Draft pick rotated into the next rung's input_ids before being "
+            f"rank-0-broadcast (pick_lineno, call, rotate_lineno): {late}",
+        )
+
+
+class TestBroadcastAdoptsRank0Picks(CustomTestCase):
+    """Semantics of the sync itself: after the broadcast every rank holds
+    rank 0's picks, and a world_size-1 run is byte-identically untouched."""
+
+    def test_divergent_rank_adopts_rank0_values(self):
+        rank0 = (torch.tensor([[5]]), torch.tensor([[0.7]]))
+        rank1_index = torch.tensor([[7]])
+        rank1_p = torch.tensor([[0.6]])
+
+        payloads = iter([rank0[0], rank0[1]])
+        fake_group = SimpleNamespace(
+            world_size=2,
+            broadcast=lambda t, src: t.copy_(next(payloads)),
+        )
+        with (
+            patch("sglang.srt.distributed.get_tp_group", return_value=fake_group),
+            patch(
+                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                return_value=False,
+            ),
+        ):
+            _broadcast_draft_picks(rank1_index, rank1_p)
+
+        self.assertTrue(torch.equal(rank1_index, rank0[0]))
+        self.assertTrue(torch.equal(rank1_p, rank0[1]))
+
+    def test_single_rank_path_is_untouched(self):
+        index = torch.tensor([[7]])
+        before = index.clone()
+        fake_group = SimpleNamespace(
+            world_size=1,
+            broadcast=lambda t, src: t.fill_(-1),
+        )
+        with (
+            patch("sglang.srt.distributed.get_tp_group", return_value=fake_group),
+            patch(
+                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                return_value=False,
+            ),
+        ):
+            _broadcast_draft_picks(index)
+        self.assertTrue(torch.equal(index, before))
+
+
 if __name__ == "__main__":
     unittest.main()

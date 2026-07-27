@@ -79,6 +79,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    _broadcast_draft_picks,
     capture_safe_tp_broadcast,
     commit_mamba_states_after_verify,
     draft_tp_context,
@@ -122,51 +123,6 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
-
-
-def _broadcast_draft_picks(
-    *tensors: Optional[torch.Tensor], solo_single_rank: bool = False
-) -> None:
-    """Sync per-rank draft decisions from TP rank 0.
-
-    Per-rank logits differ in the last bits (especially on heterogeneous
-    GPUs under uneven TP), so argmax/topk/sampling can flip on near-ties.
-    Any pick that feeds the draft chain, the candidate tree, or the verify
-    input must therefore be identical on every rank — a single divergent
-    pick silently desynchronizes the KV / recurrent state across ranks for
-    the rest of the sequence. Mirrors the verify-result sync in
-    eagle_utils.eagle_sample.
-
-    ``solo_single_rank``: under draft-solo placement
-    (--speculative-draft-placement solo) exactly ONE rank runs the draft
-    forward, so its picks are inherently rank-consistent — and the other
-    ranks never reach this code path, so a broadcast here would hang
-    (no matching participants). The one-per-round token-id broadcast
-    happens in ``EagleDraftWorker.draft`` instead.
-
-    CAPTURE / CO-LOCATION SAFETY: this helper first runs inside the draft
-    CUDA-graph capture PHASE — whose first executions are the WARMUP
-    iterations, which run on a normal (non-capturing) stream, so a
-    "currently capturing?" predicate does NOT cover them — and c10d's lazy
-    NCCL communicator init there is ncclInvalidUsage. Worse, torch's
-    bundled NCCL rejects co-located ranks outright ("Duplicate GPU
-    detected"), so c10d can never serve tp>cards rigs at all, capture or
-    eager. The broadcast therefore goes through capture_safe_tp_broadcast:
-    pynccl whenever available (warmup, capture, and eager alike — the
-    DFLASH pynccl-only pattern), c10d only as the non-CUDA fallback.
-    Payload semantics are identical (same NCCL broadcast, same bytes).
-    """
-    if solo_single_rank:
-        return
-    from sglang.srt.distributed import get_tp_group
-    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-
-    tp_group = (
-        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
-    )
-    if tp_group.world_size == 1:
-        return
-    capture_safe_tp_broadcast(tp_group, tensors, src=0)
 
 
 def _solo_gather_full_vocab_rows(
