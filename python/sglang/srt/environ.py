@@ -620,6 +620,12 @@ class Envs:
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
 
     # Hi-Cache
+    # Deadline (seconds) for the per-step HiCache control collectives. The gloo
+    # cpu_group they run on defaults to a two-hour timeout, so a rank whose peer
+    # died of OOM would otherwise sit in all_reduce for hours; on expiry the
+    # surviving rank raises HiCacheCollectiveTimeoutError instead. <= 0 restores
+    # the unbounded blocking wait.
+    SGLANG_HICACHE_COLLECTIVE_TIMEOUT_S = EnvFloat(600.0)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
