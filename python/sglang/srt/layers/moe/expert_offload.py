@@ -88,6 +88,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 _TRACE_HANDLES: Dict[str, "object"] = {}
 _TRACE_LOCK = threading.Lock()
 
+# The one layer whose per-chunk H2D volume is logged at INFO (see
+# MoEExpertOffloadCache._log_wave_h2d). Latched to the first layer that reports.
+_H2D_LOG_LAYER = None
+
 
 def write_routing_trace(
     path: str,
@@ -1185,14 +1189,23 @@ class MoEExpertOffloadCache:
     def _log_wave_h2d(self, order, waves, before):  # pragma: no cover - CUDA
         """One line per multi-wave forward with the PCIe volume it cost, so the
         token- vs expert-major difference is readable off the log instead of
-        being inferred from the wall clock. INFO on layer 0 (one line per chunk),
-        DEBUG on the rest."""
+        being inferred from the wall clock.
+
+        INFO for ONE representative layer (the first that reports; layer 0 is
+        dense in most MoE models, so keying on id 0 logs nothing), DEBUG for the
+        rest -- one line per chunk at the default log level, the full per-layer
+        picture at DEBUG.
+        """
         import logging
+
+        global _H2D_LOG_LAYER
 
         gib = (self.planner.stats.h2d_bytes - before) / float(1 << 30)
         layer_id = getattr(self.layer, "layer_id", "?")
+        if _H2D_LOG_LAYER is None:
+            _H2D_LOG_LAYER = layer_id
         logging.getLogger(__name__).log(
-            logging.INFO if layer_id == 0 else logging.DEBUG,
+            logging.INFO if layer_id == _H2D_LOG_LAYER else logging.DEBUG,
             "MoE offload layer %s: %s-major prefill, %d waves, %.2f GiB H2D",
             layer_id,
             order,
