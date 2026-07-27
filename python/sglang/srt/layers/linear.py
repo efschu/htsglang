@@ -37,7 +37,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
-from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
+from sglang.srt.layers.moe.utils import (
+    htccl_mlp_ar_overlap_comm,
+    should_skip_mlp_all_reduce,
+)
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -48,7 +51,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -2120,6 +2123,28 @@ class RowParallelLinear(LinearBase):
                 else:
                     output = tensor_model_parallel_all_reduce(output_parallel)
         else:
+            # HTCCL async overlap (SGLANG_HTCCL_UCX_OVERLAP=1): when this AR
+            # was skipped because the NEXT layer's prepare_attn absorbs it
+            # (fuse_mlp_allreduce), issue it asynchronously HERE so the wire
+            # crossing runs under the intervening host work. The handle
+            # rides on the tensor exactly like _sglang_needs_allreduce_fusion
+            # does; prepare_attn completes it. All conditions are
+            # group-uniform (env flag, transport class, published forward
+            # flags, shapes shared across the TP group). A None handle means
+            # the async issue is unavailable -- prepare_attn then falls back
+            # to its unchanged sync all-reduce.
+            if (
+                self.reduce_results
+                and self.tp_size > 1
+                and not skip_all_reduce
+                and get_forward().fuse_mlp_allreduce
+                and output_parallel.numel() > 0
+            ):
+                _comm = htccl_mlp_ar_overlap_comm()
+                if _comm is not None:
+                    _h = _comm.all_reduce_async(output_parallel)
+                    if _h is not None:
+                        output_parallel._htccl_ar_handle = (_comm, _h)
             output = output_parallel
 
         output_bias = self.bias if self.skip_bias_add else None

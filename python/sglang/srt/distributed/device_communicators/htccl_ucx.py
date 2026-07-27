@@ -71,6 +71,22 @@ _FP32_REDUCE = bool(int(os.environ.get("SGLANG_HTCCL_FP32_REDUCE", "1")))
 
 _TIMEOUT_S = float(os.environ.get("SGLANG_HTCCL_UCX_TIMEOUT_S", "300"))
 
+# Sub-block size for the pipelined staging copies, in KiB. See
+# ``_staged_copy``: the CPU passes over a chunk are interrupted this often to
+# progress the UCX worker, so the rendezvous handshake for the NEXT chunk can
+# start while this one's bytes are still being touched. 0 disables the
+# interleaving (the copies then run in one shot, as before L2).
+#
+# 256 KiB is ~7 us of memcpy at the measured in-cache bandwidth -- short
+# enough that a handshake is never delayed noticeably, long enough that the
+# per-sub-block Python slicing stays under a few percent of the copy.
+_PROGRESS_BYTES = int(os.environ.get("SGLANG_HTCCL_UCX_PROGRESS_KIB", "256")) * 1024
+
+# Set to 0 to fall back to the pre-L2 unpipelined all_reduce (stage the whole
+# payload, one exchange, then accumulate and copy out). Kept as an escape
+# hatch and as the A/B control for the pipelining measurement.
+_PIPELINE = bool(int(os.environ.get("SGLANG_HTCCL_UCX_PIPELINE", "1")))
+
 
 def _tag(seq: int, phase: int, src: int, chunk: int) -> int:
     """Pack a collective step into a 64-bit UCX tag.
@@ -86,6 +102,34 @@ def _tag(seq: int, phase: int, src: int, chunk: int) -> int:
         | ((src & 0xFF) << 24)
         | (chunk & 0xFFFFFF)
     )
+
+
+class _UcxAsyncHandle:
+    """An in-flight collective issued by one of the ``*_async`` methods.
+
+    Owns its staging slots (``send``, ``recvs`` -- pool records) until
+    ``wait_async`` releases them, and carries its own ``seq`` so handles can
+    be awaited out of issue order. See the async section of the transport
+    for the full ownership / progress / order contracts.
+    """
+
+    __slots__ = (
+        "op", "seq", "reqs", "send", "recvs",
+        "shape", "dtype", "device", "n", "dim", "done",
+    )
+
+    def __init__(self, op, seq, reqs, send, recvs, shape, dtype, device, n, dim):
+        self.op = op
+        self.seq = seq
+        self.reqs = reqs
+        self.send = send
+        self.recvs = recvs
+        self.shape = shape
+        self.dtype = dtype
+        self.device = device
+        self.n = n
+        self.dim = dim
+        self.done = False
 
 
 class HTCCLUcxTransport:
@@ -114,6 +158,8 @@ class HTCCLUcxTransport:
         device: torch.device,
         chunk_bytes: int = _CHUNK_BYTES,
         ring_bytes: int = _RING_BYTES,
+        progress_bytes: int = _PROGRESS_BYTES,
+        pipeline: bool = _PIPELINE,
     ):
         self.cpu_group = cpu_group
         self.device = device
@@ -121,11 +167,38 @@ class HTCCLUcxTransport:
         self.rank = dist.get_rank(cpu_group)
         self.chunk_bytes = max(int(chunk_bytes), 4096)
         self.ring_bytes = int(ring_bytes)
+        self.progress_bytes = int(progress_bytes)
+        self.pipeline = bool(pipeline)
         self._lock = threading.Lock()
         self._seq = 0
         self._staging_bufs: dict[str, torch.Tensor] = {}
-        self._view_cache: dict[tuple, torch.Tensor] = {}
+        self._view_cache: dict[tuple, tuple] = {}
+        # Free list for the async collectives' staging slots, keyed by
+        # power-of-two size class. See the async section below.
+        self._async_free: dict[int, list[torch.Tensor]] = {}
         self._closed = False
+
+        # Everything below is per-collective bookkeeping that does not depend
+        # on the payload, so it is built once. At 8 KiB -- the size a bs=1
+        # decode all-reduce actually is -- rebuilding a peer list and
+        # formatting its staging-buffer keys per call was ~0.4 us of a ~12 us
+        # collective.
+        self._peers = tuple(p for p in range(self.world_size) if p != self.rank)
+        # Two slot sets, one per pipeline parity. Chunk k uses parity k & 1.
+        self._ar_keys = tuple(
+            (f"ar_s{par}", tuple(f"ar_r{par}_{p}" for p in self._peers))
+            for par in (0, 1)
+        )
+        # Same two-parity layout for all_gather. Distinct keys from the
+        # all_reduce set on purpose: sharing them would be functionally safe
+        # today (collectives are strictly serialised under self._lock) but
+        # would make slot lifetime depend on that serialisation -- the exact
+        # comment-only invariant the async follow-up must not inherit.
+        self._ag_keys = tuple(
+            (f"ag_s{par}", tuple(f"ag_r{par}_{p}" for p in self._peers))
+            for par in (0, 1)
+        )
+        self._bar_slots = None
 
         if self.world_size > 256:
             raise UcxError(
@@ -226,19 +299,28 @@ class HTCCLUcxTransport:
     # result fresh and copies out of the staging buffer into it.
     # ------------------------------------------------------------------
 
-    def _staging(self, key: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
-        """A reusable host buffer view of ``numel`` elements of ``dtype``.
+    def _slot(self, key: str, numel: int, dtype: torch.dtype) -> tuple:
+        """``(view, ptr, nbytes)`` for a reusable host buffer of ``numel``.
 
-        Views are memoised per (key, numel, dtype). Re-deriving them costs a
-        slice plus a dtype `view()` on every call, which is invisible at 32 MiB
+        Memoised per (key, numel, dtype). Re-deriving the view costs a slice
+        plus a dtype `view()`; re-deriving the address and length costs three
+        more tensor method calls per post. All of that is invisible at 32 MiB
         and dominant at 8 KiB -- and 8 KiB is the size that matters, because
         that is what a bs=1 decode all-reduce looks like. Steady-state decode
         repeats the same shapes forever, so the cache hits essentially always.
+
+        ``ptr`` is safe to cache alongside the view: the view keeps the
+        backing tensor alive, and the entry is dropped the moment the backing
+        buffer is replaced (below).
+
+        Slots are addressed by *key*, and distinct keys are distinct backing
+        tensors -- that is what makes the pipeline's two parities, and the
+        send and receive sides within one parity, provably non-overlapping.
         """
         cache_key = (key, numel, dtype)
-        view = self._view_cache.get(cache_key)
-        if view is not None:
-            return view
+        rec = self._view_cache.get(cache_key)
+        if rec is not None:
+            return rec
         nbytes = numel * torch.empty((), dtype=dtype).element_size()
         buf = self._staging_bufs.get(key)
         if buf is None or buf.numel() < nbytes:
@@ -246,22 +328,90 @@ class HTCCLUcxTransport:
             buf = torch.empty(max(nbytes, 4096), dtype=torch.uint8, pin_memory=pin)
             self._staging_bufs[key] = buf
             # Views of the previous, smaller buffer must not be handed out
-            # again -- they would silently address a buffer nothing else uses.
+            # again -- they would silently address a buffer nothing else uses,
+            # and the cached ptr would be a dangling address once the old
+            # tensor is collected.
             for stale in [k for k in self._view_cache if k[0] == key]:
                 del self._view_cache[stale]
         view = buf[:nbytes].view(dtype)
-        self._view_cache[cache_key] = view
-        return view
+        rec = (view, view.data_ptr(), nbytes)
+        self._view_cache[cache_key] = rec
+        return rec
+
+    def _staging(self, key: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
+        """The view half of :meth:`_slot`."""
+        return self._slot(key, numel, dtype)[0]
+
+    # ------------------------------------------------------------------
+    # progress-interleaved host work
+    #
+    # A staged copy or accumulate over a 4 MiB chunk is a few hundred
+    # microseconds of CPU. If the UCX worker is not progressed during it, the
+    # rendezvous handshake for the NEXT chunk cannot even start -- and then
+    # the pipeline overlaps nothing, because the wire sits idle for exactly
+    # as long as the CPU is busy. Progressing every ``progress_bytes`` keeps
+    # the handshake latency at sub-block granularity.
+    # ------------------------------------------------------------------
+
+    def _staged_copy(self, dst: torch.Tensor, src: torch.Tensor, prog) -> None:
+        if prog is None:
+            dst.copy_(src)
+            return
+        n = dst.numel()
+        step = max(self.progress_bytes // dst.element_size(), 1)
+        if n <= step:
+            dst.copy_(src)
+            prog()
+            return
+        off = 0
+        while off < n:
+            end = off + step
+            if end > n:
+                end = n
+            dst[off:end].copy_(src[off:end])
+            prog()
+            off = end
+
+    def _staged_add(self, dst: torch.Tensor, src: torch.Tensor, prog) -> None:
+        if prog is None:
+            dst.add_(src)
+            return
+        n = dst.numel()
+        step = max(self.progress_bytes // dst.element_size(), 1)
+        if n <= step:
+            dst.add_(src)
+            prog()
+            return
+        off = 0
+        while off < n:
+            end = off + step
+            if end > n:
+                end = n
+            dst[off:end].add_(src[off:end])
+            prog()
+            off = end
 
     # ------------------------------------------------------------------
     # wire primitives
     # ------------------------------------------------------------------
 
-    def _post_send(self, peer: int, view: torch.Tensor, seq, phase, chunk0=0) -> list:
-        """Post ``view`` to ``peer``, split into chunk_bytes pieces."""
+    def _post_send_bytes(
+        self, peer: int, ptr: int, total: int, seq, phase, chunk0=0
+    ) -> list:
+        """Post ``total`` bytes at ``ptr`` to ``peer``, split into chunks.
+
+        The single-chunk case is spelled out separately because it is what
+        every small collective and every step of the pipeline below hits: the
+        loop's `while`, `min` and index bookkeeping are pure overhead there,
+        and at 8 KiB the whole collective is only ~12 us.
+        """
+        if total <= self.chunk_bytes:
+            return [
+                self.worker.post_send(
+                    peer, ptr, total, _tag(seq, phase, self.rank, chunk0)
+                )
+            ]
         reqs = []
-        ptr = view.data_ptr()
-        total = view.numel() * view.element_size()
         off, idx = 0, chunk0
         while off < total:
             n = min(self.chunk_bytes, total - off)
@@ -272,10 +422,14 @@ class HTCCLUcxTransport:
             idx += 1
         return reqs
 
-    def _post_recv(self, src: int, view: torch.Tensor, seq, phase, chunk0=0) -> list:
+    def _post_recv_bytes(
+        self, src: int, ptr: int, total: int, seq, phase, chunk0=0
+    ) -> list:
+        if total <= self.chunk_bytes:
+            return [
+                self.worker.post_recv(ptr, total, _tag(seq, phase, src, chunk0))
+            ]
         reqs = []
-        ptr = view.data_ptr()
-        total = view.numel() * view.element_size()
         off, idx = 0, chunk0
         while off < total:
             n = min(self.chunk_bytes, total - off)
@@ -283,6 +437,27 @@ class HTCCLUcxTransport:
             off += n
             idx += 1
         return reqs
+
+    def _post_send(self, peer: int, view: torch.Tensor, seq, phase, chunk0=0) -> list:
+        """Post ``view`` to ``peer``, split into chunk_bytes pieces."""
+        return self._post_send_bytes(
+            peer,
+            view.data_ptr(),
+            view.numel() * view.element_size(),
+            seq,
+            phase,
+            chunk0,
+        )
+
+    def _post_recv(self, src: int, view: torch.Tensor, seq, phase, chunk0=0) -> list:
+        return self._post_recv_bytes(
+            src,
+            view.data_ptr(),
+            view.numel() * view.element_size(),
+            seq,
+            phase,
+            chunk0,
+        )
 
     def _next_seq(self) -> int:
         """Collective counter.
@@ -309,17 +484,37 @@ class HTCCLUcxTransport:
         self.worker.wait(reqs)
 
     def barrier(self) -> None:
-        """One-byte all-to-all exchange. Also warms up every endpoint."""
+        """One-byte all-to-all exchange. Also warms up every endpoint.
+
+        Nothing here depends on the payload, so the slots and their addresses
+        are resolved once and the per-call path is two posts and a wait. The
+        token byte is zeroed at construction rather than per call: its VALUE
+        is never read by anyone -- the barrier is the arrival of the message,
+        not its content -- so filling it every time was 0.55 us of a 12 us
+        collective spent writing a byte no one looks at. It is still zeroed
+        once so we never put uninitialised host memory on the wire.
+        """
         with self._lock:
+            slots = self._bar_slots
+            if slots is None:
+                send_view, send_ptr, _ = self._slot("bar_s", 1, torch.uint8)
+                send_view.zero_()
+                slots = (
+                    send_ptr,
+                    tuple(
+                        (p, self._slot(f"bar_r{p}", 1, torch.uint8)[1])
+                        for p in self._peers
+                    ),
+                )
+                self._bar_slots = slots
+            send_ptr, recvs = slots
             seq = self._next_seq()
-            send = self._staging("bar_s", 1, torch.uint8)
-            send.fill_(0)
-            recvs = {
-                p: self._staging(f"bar_r{p}", 1, torch.uint8)
-                for p in range(self.world_size)
-                if p != self.rank
-            }
-            self._exchange_all(send, recvs, seq)
+            reqs = []
+            for peer, rptr in recvs:
+                reqs += self._post_recv_bytes(peer, rptr, 1, seq, 0)
+            for peer, _ in recvs:
+                reqs += self._post_send_bytes(peer, send_ptr, 1, seq, 0)
+            self.worker.wait(reqs)
 
     # ------------------------------------------------------------------
     # all_reduce
@@ -368,6 +563,150 @@ class HTCCLUcxTransport:
             reqs += self._post_send(right, blocks[send_idx], seq, phase)
             self.worker.wait(reqs)
 
+    def _pipelined_all_reduce(
+        self, inp: torch.Tensor, out: torch.Tensor, n: int, dtype, seq: int
+    ) -> None:
+        """Chunked flat all_reduce that overlaps the host passes with the wire.
+
+        The problem this exists for
+        ---------------------------
+        The unpipelined version makes four passes over the whole payload --
+        stage in, wire, accumulate, stage out -- and none of the three CPU
+        passes overlap the one that is on the wire. Measured on this link,
+        that is the entire 32 MiB regression: the four passes over 32 MiB cost
+        ~9.4 ms single-threaded against ~13 ms of wire time, and 24.3 ms was
+        observed for a transfer whose wire budget is 13 ms. Worse, at 32 MiB
+        the buffers no longer fit in L3, so each pass runs at ~13 GiB/s
+        instead of the ~34 GiB/s a 4 MiB buffer sustains.
+
+        The schedule
+        ------------
+        Chunk k occupies slot parity ``k & 1``. Per iteration::
+
+            stage-in  k+1   <- overlaps chunk k on the wire
+            wait      k
+            post      k+1   <- next chunk hits the wire BEFORE this one's
+                               accumulate, not after
+            finish    k     <- accumulate + copy out, overlaps chunk k+1
+
+        so both the CPU passes that follow the wire (accumulate, stage out)
+        and the one that precedes it (stage in) sit underneath a transfer.
+        Chunking also drags each pass back into cache, which is worth as much
+        again as the overlap.
+
+        Buffer ownership -- read this before changing anything
+        -----------------------------------------------------
+        Two slot sets, indexed by parity. Nothing is shared between them and
+        nothing is handed to a caller. Slot parity p is, strictly in this
+        program order on this one thread:
+
+            written by stage-in(k)  ->  read by the UCX send of chunk k
+            ->  waited on           ->  read+written by finish(k)
+            ->  reused by stage-in(k+2)
+
+        The rotation is what makes that safe, and it is safe only because
+        ``k+1`` never has the same parity as ``k``: stage-in(k+1) cannot touch
+        the slot chunk k is still flying out of, and stage-in(k+2) is issued
+        at the top of the next iteration, i.e. strictly after finish(k) has
+        finished reading parity ``k & 1``. This is not a comment-only
+        invariant -- ``_slot`` gives each parity a distinct backing tensor
+        keyed by name, and the pipelining tests exercise chunk boundaries,
+        ragged tails and multi-chunk accumulation order against a reference.
+        """
+        # `dtype.itemsize`, not `torch.empty((), dtype=dtype).element_size()`:
+        # the latter allocates a tensor on every collective, which is real
+        # money at 8 KiB and invisible at 32 MiB. Same reason for the
+        # single-chunk fast path below.
+        esz = dtype.itemsize
+        chunk = max(self.chunk_bytes // esz, 1)
+        peers = self._peers
+        src = inp.reshape(-1)
+        # `view`, not `reshape`: the result is written chunk by chunk, and a
+        # reshape of a non-contiguous `out` would silently return a COPY --
+        # every chunk would land in a temporary and the caller would get an
+        # untouched tensor back. `_get_out_buf` always returns an
+        # `empty_like` of an already-contiguous input, so this never fires;
+        # if it ever does, it fails loudly instead of returning garbage.
+        dst = out.view(-1)
+
+        if n <= chunk:
+            # One chunk: there is no next transfer to overlap with, so the
+            # pipeline would be pure overhead. This branch is what a bs=1
+            # decode all-reduce takes -- ~8 KiB, ~33 us end to end -- and at
+            # that size the closures, the staging dict and the extra call
+            # layers of the general path cost ~7 us, a fifth of the whole
+            # collective. Deliberately flat, deliberately duplicated.
+            skey, rkeys = self._ar_keys[0]
+            send_view, send_ptr, send_nbytes = self._slot(skey, n, dtype)
+            send_view.copy_(src)  # (+ upcast)
+            reqs = []
+            recv_views = []
+            for i, peer in enumerate(peers):
+                rv, rptr, rnbytes = self._slot(rkeys[i], n, dtype)
+                recv_views.append(rv)
+                reqs.append(
+                    self.worker.post_recv(rptr, rnbytes, _tag(seq, 0, peer, 0))
+                )
+            for peer in peers:
+                reqs.append(
+                    self.worker.post_send(
+                        peer, send_ptr, send_nbytes, _tag(seq, 0, self.rank, 0)
+                    )
+                )
+            self.worker.wait(reqs)
+            for rv in recv_views:
+                send_view.add_(rv)
+            dst.copy_(send_view)  # (+ downcast)
+            return
+
+        n_chunks = (n + chunk - 1) // chunk
+        if n_chunks > 0xFFFFFF:
+            raise UcxError(
+                f"htccl ucx: all_reduce of {n * esz} bytes needs {n_chunks} "
+                f"chunks, more than the 2^24 the tag layout encodes. Raise "
+                f"SGLANG_HTCCL_UCX_CHUNK_MIB."
+            )
+        prog = self.worker.progress if self.progress_bytes > 0 else None
+        staged: dict = {}
+
+        def stage(k: int) -> None:
+            par = k & 1
+            off = k * chunk
+            count = n - off if off + chunk > n else chunk
+            skey, rkeys = self._ar_keys[par]
+            send_view, send_ptr, send_nbytes = self._slot(skey, count, dtype)
+            self._staged_copy(send_view, src[off : off + count], prog)  # (+ upcast)
+            recvs = [self._slot(rkeys[i], count, dtype) for i in range(len(peers))]
+            staged[par] = (off, count, send_view, send_ptr, send_nbytes, recvs)
+
+        def post(k: int) -> list:
+            _, _, _, send_ptr, send_nbytes, recvs = staged[k & 1]
+            reqs = []
+            # Receives first, as everywhere else in this file: posting sends
+            # first can wedge two peers that post in the same order.
+            for i, peer in enumerate(peers):
+                reqs += self._post_recv_bytes(
+                    peer, recvs[i][1], recvs[i][2], seq, 0, k
+                )
+            for peer in peers:
+                reqs += self._post_send_bytes(peer, send_ptr, send_nbytes, seq, 0, k)
+            return reqs
+
+        stage(0)
+        reqs = post(0)
+        for k in range(n_chunks):
+            nxt = k + 1
+            has_next = nxt < n_chunks
+            if has_next:
+                stage(nxt)
+            self.worker.wait(reqs)
+            if has_next:
+                reqs = post(nxt)
+            off, count, send_view, _, _, recvs = staged[k & 1]
+            for rec in recvs:
+                self._staged_add(send_view, rec[0], prog)
+            self._staged_copy(dst[off : off + count], send_view, prog)  # (+ downcast)
+
     def htccl_all_reduce(self, comm, inp: torch.Tensor) -> torch.Tensor:
         with self._lock:
             seq = self._next_seq()
@@ -379,6 +718,15 @@ class HTCCLUcxTransport:
             n = inp.numel()
             nbytes = n * inp.element_size()
             use_ring = nbytes >= self.ring_bytes and self.world_size > 2
+
+            # Fresh output, never a staging buffer: all_reduce is documented
+            # and dispatched as out-of-place.
+            out = comm._get_out_buf(inp)
+
+            if self.pipeline and not use_ring:
+                self._pipelined_all_reduce(inp, out, n, reduce_dtype, seq)
+                return out
+
             # The ring needs equal blocks; pad up and zero the tail so every
             # rank contributes zeroes there and the sum is unaffected.
             padded = (
@@ -396,15 +744,89 @@ class HTCCLUcxTransport:
             else:
                 self._wire_all_reduce_flat(host, seq)
 
-            # Fresh output, never a staging buffer: all_reduce is documented
-            # and dispatched as out-of-place.
-            out = comm._get_out_buf(inp)
             out.reshape(-1).copy_(host[:n])  # H2D (+ downcast)
             return out
 
     # ------------------------------------------------------------------
     # all_gather
     # ------------------------------------------------------------------
+
+    def _pipelined_all_gather(
+        self, inp: torch.Tensor, out_rows: torch.Tensor, n: int, seq: int
+    ) -> None:
+        """Chunked flat all_gather that overlaps the host passes with the wire.
+
+        Same schedule and the same slot-ownership discipline as
+        :meth:`_pipelined_all_reduce` -- read the ownership section there
+        before changing anything here. The differences are exactly two:
+
+        * No arithmetic. finish(k) only scatters each peer's received chunk
+          into that peer's row of ``out_rows``, so pipelined and unpipelined
+          agree bit for bit by construction (the selftest pins that down).
+        * This rank's own slice never crosses the wire: it is copied
+          device-locally from ``inp`` into its output row inside finish(k) --
+          on a GPU that is a D2D copy that skips the host round trip
+          entirely, and doing it per chunk keeps it underneath chunk k+1's
+          transfer like every other finish pass.
+
+        ``out_rows`` is the caller's freshly allocated ``(world, *shape)``
+        output -- contiguous by construction, so the per-rank flat views
+        below are views, never copies.
+        """
+        dtype = inp.dtype
+        esz = dtype.itemsize
+        chunk = max(self.chunk_bytes // esz, 1)
+        peers = self._peers
+        src = inp.reshape(-1)
+        dsts = tuple(out_rows[p].reshape(-1) for p in range(self.world_size))
+        own = dsts[self.rank]
+
+        n_chunks = (n + chunk - 1) // chunk
+        if n_chunks > 0xFFFFFF:
+            raise UcxError(
+                f"htccl ucx: all_gather of {n * esz} bytes needs {n_chunks} "
+                f"chunks, more than the 2^24 the tag layout encodes. Raise "
+                f"SGLANG_HTCCL_UCX_CHUNK_MIB."
+            )
+        prog = self.worker.progress if self.progress_bytes > 0 else None
+        staged: dict = {}
+
+        def stage(k: int) -> None:
+            par = k & 1
+            off = k * chunk
+            count = n - off if off + chunk > n else chunk
+            skey, rkeys = self._ag_keys[par]
+            send_view, send_ptr, send_nbytes = self._slot(skey, count, dtype)
+            self._staged_copy(send_view, src[off : off + count], prog)
+            recvs = [self._slot(rkeys[i], count, dtype) for i in range(len(peers))]
+            staged[par] = (off, count, send_ptr, send_nbytes, recvs)
+
+        def post(k: int) -> list:
+            _, _, send_ptr, send_nbytes, recvs = staged[k & 1]
+            reqs = []
+            # Receives first, as everywhere else in this file.
+            for i, peer in enumerate(peers):
+                reqs += self._post_recv_bytes(
+                    peer, recvs[i][1], recvs[i][2], seq, 0, k
+                )
+            for peer in peers:
+                reqs += self._post_send_bytes(peer, send_ptr, send_nbytes, seq, 0, k)
+            return reqs
+
+        stage(0)
+        reqs = post(0)
+        for k in range(n_chunks):
+            nxt = k + 1
+            has_next = nxt < n_chunks
+            if has_next:
+                stage(nxt)
+            self.worker.wait(reqs)
+            if has_next:
+                reqs = post(nxt)
+            off, count, _, _, recvs = staged[k & 1]
+            for i, peer in enumerate(peers):
+                self._staged_copy(dsts[peer][off : off + count], recvs[i][0], prog)
+            self._staged_copy(own[off : off + count], src[off : off + count], prog)
 
     def htccl_all_gather(self, comm, inp: torch.Tensor, dim: int) -> torch.Tensor:
         """Concatenate every rank's ``inp`` along ``dim``.
@@ -421,23 +843,95 @@ class HTCCLUcxTransport:
             input_size = inp.size()
             n = inp.numel()
 
-            send = self._staging("ag_s", n, inp.dtype)
-            send.copy_(inp.reshape(-1))
-            recvs = {
-                p: self._staging(f"ag_r{p}", n, inp.dtype)
-                for p in range(self.world_size)
-                if p != self.rank
-            }
-            self._exchange_all(send, recvs, seq)
+            if self.pipeline and n <= max(self.chunk_bytes // inp.dtype.itemsize, 1):
+                # Single-chunk fast path: the same one-step flat exchange as
+                # the generic branch below, with the per-call staging dict,
+                # its eagerly formatted keys and the extra dispatch layers
+                # stripped -- the all_gather twin of the single-chunk branch
+                # in _pipelined_all_reduce. This is what a decode-sized
+                # all_gather (logits gather, DCP merges) hits, and at that
+                # size the bookkeeping was a third of the whole collective.
+                #
+                # The output is built FLAT and viewed as (world, n) rows:
+                # per-rank `select + copy` is two dispatches instead of the
+                # `select + reshape + copy` of the generic path, and for
+                # dim == 0 (the overwhelmingly common gather axis) the result
+                # is a single `view` -- no movedim, no reshape.
+                src = inp.reshape(-1)
+                skey, rkeys = self._ag_keys[0]
+                send_view, send_ptr, send_nbytes = self._slot(skey, n, inp.dtype)
+                send_view.copy_(src)
+                reqs = []
+                recv_views = []
+                for i, peer in enumerate(self._peers):
+                    rv, rptr, rnbytes = self._slot(rkeys[i], n, inp.dtype)
+                    recv_views.append(rv)
+                    reqs.append(
+                        self.worker.post_recv(rptr, rnbytes, _tag(seq, 0, peer, 0))
+                    )
+                for peer in self._peers:
+                    reqs.append(
+                        self.worker.post_send(
+                            peer, send_ptr, send_nbytes, _tag(seq, 0, self.rank, 0)
+                        )
+                    )
+                out_flat = torch.empty(
+                    self.world_size * n, dtype=inp.dtype, device=inp.device
+                )
+                rows = out_flat.view(self.world_size, n)
+                # Own slice straight from the input (on a GPU a D2D copy that
+                # never touches the host staging buffer), placed BETWEEN the
+                # posts and the wait so it runs while the wire is in flight.
+                # Above one progress block the copy is interleaved with
+                # worker progress -- a multi-hundred-us memcpy with no
+                # progress call would starve the RNDV handshake of the very
+                # transfer it is trying to hide under.
+                if 0 < self.progress_bytes < n * inp.dtype.itemsize:
+                    self._staged_copy(rows[self.rank], src, self.worker.progress)
+                else:
+                    rows[self.rank].copy_(src)
+                self.worker.wait(reqs)
+                for i, peer in enumerate(self._peers):
+                    rows[peer].copy_(recv_views[i])
+                if dim == 0:
+                    return out_flat.view(
+                        (self.world_size * input_size[0],) + tuple(input_size[1:])
+                        if len(input_size)
+                        else (self.world_size,)
+                    )
+                return (
+                    out_flat.view((self.world_size,) + tuple(input_size))
+                    .movedim(0, dim)
+                    .reshape(
+                        input_size[:dim]
+                        + (self.world_size * input_size[dim],)
+                        + input_size[dim + 1 :]
+                    )
+                )
 
             output = torch.empty(
                 (self.world_size,) + tuple(input_size),
                 dtype=inp.dtype,
                 device=inp.device,
             )
-            for p in range(self.world_size):
-                src = send if p == self.rank else recvs[p]
-                output[p].reshape(-1).copy_(src)
+
+            if self.pipeline:
+                self._pipelined_all_gather(inp, output, n, seq)
+            else:
+                # Pre-pipelining path, kept verbatim as the A/B control
+                # (SGLANG_HTCCL_UCX_PIPELINE=0).
+                send = self._staging("ag_s", n, inp.dtype)
+                send.copy_(inp.reshape(-1))
+                recvs = {
+                    p: self._staging(f"ag_r{p}", n, inp.dtype)
+                    for p in range(self.world_size)
+                    if p != self.rank
+                }
+                self._exchange_all(send, recvs, seq)
+                for p in range(self.world_size):
+                    src = send if p == self.rank else recvs[p]
+                    output[p].reshape(-1).copy_(src)
+
             output = output.movedim(0, dim)
             return output.reshape(
                 input_size[:dim]
@@ -495,6 +989,177 @@ class HTCCLUcxTransport:
             return tensor
 
     # ------------------------------------------------------------------
+    # async collectives -- issue now, wait later (task #198, block 4)
+    #
+    # The three contracts, in the order they have historically been broken:
+    #
+    # OWNERSHIP. An async collective's staging buffers are acquired from a
+    # free-list pool at issue and released only inside wait_async, after the
+    # last byte has been read out of them. They are owned by the HANDLE, not
+    # by the transport's per-call slot sets -- the sync paths' two-parity
+    # rotation is safe precisely because a sync collective cannot outlive its
+    # call, and an async one can. Nothing here may hand a pool buffer (or a
+    # view of one) to the caller; results are freshly allocated in wait.
+    # The caller's INPUT is free the moment issue returns: it is staged
+    # before the first post, and -- for all_gather -- the own-rank slice is
+    # later copied out of the STAGING slot, never re-read from the input.
+    #
+    # PROGRESS. UCX makes no progress unattended. Issue ends with a single
+    # progress pass to push eager sends onto the wire; from then on the
+    # transfer advances in hardware for eager-sized payloads (every
+    # decode-sized collective) and completes under the progress loop inside
+    # wait_async. Rendezvous-sized payloads additionally need both peers to
+    # progress, so their overlap window degrades toward the sync cost --
+    # still correct, just not faster. There is deliberately no progress
+    # thread: the worker is created THREAD_MODE_SINGLE (the fast mode), and
+    # every entry point here runs under self._lock on the caller's thread.
+    #
+    # ORDER. _next_seq counts ISSUES, under the lock, so the group-uniform
+    # contract ("every rank issues the same collectives in the same order")
+    # covers async issues exactly like sync calls. Each handle carries its
+    # seq, and every transfer's tag carries (seq, src, chunk) with exact
+    # matching -- so wait_async order is free: handles may be awaited out of
+    # issue order without any risk of crossed payloads.
+    # ------------------------------------------------------------------
+
+    def _pool_acquire(self, numel: int, dtype: torch.dtype) -> tuple:
+        """``(view, ptr, nbytes, buf, size_class)`` from the async free list.
+
+        Size classes are powers of two >= 4096, so steady-state decode
+        (same shapes forever) recycles the same few buffers and never grows
+        the pool.
+        """
+        nbytes = max(numel * dtype.itemsize, 1)
+        cls = 1 << max(nbytes - 1, 4095).bit_length()
+        free = self._async_free.get(cls)
+        if free:
+            buf = free.pop()
+        else:
+            pin = self.device.type == "cuda" and torch.cuda.is_available()
+            buf = torch.empty(cls, dtype=torch.uint8, pin_memory=pin)
+        view = buf[:nbytes].view(dtype)
+        return (view, view.data_ptr(), nbytes, buf, cls)
+
+    def _pool_release(self, rec: tuple) -> None:
+        self._async_free.setdefault(rec[4], []).append(rec[3])
+
+    def all_reduce_async(self, comm, inp: torch.Tensor) -> "_UcxAsyncHandle":
+        """Stage and post an all_reduce; complete it later with wait_async.
+
+        Always the flat exchange, never the ring: the async path exists for
+        the decode-sized collectives the consumer wants to hide behind
+        compute, and the ring's 2(N-1) lock-step phases cannot run
+        unattended anyway (each phase needs the previous one's arrival).
+        Oversized payloads stay correct -- all chunks are posted here and
+        completed in wait -- they just lean on the RNDV note above.
+        """
+        with self._lock:
+            seq = self._next_seq()
+            reduce_dtype = (
+                torch.float32
+                if _FP32_REDUCE and inp.dtype in (torch.float16, torch.bfloat16)
+                else inp.dtype
+            )
+            n = inp.numel()
+            send = self._pool_acquire(n, reduce_dtype)
+            send[0].copy_(inp.reshape(-1))  # (+ upcast); input is free after this
+            recvs = [self._pool_acquire(n, reduce_dtype) for _ in self._peers]
+            reqs = []
+            for i, peer in enumerate(self._peers):
+                reqs += self._post_recv_bytes(peer, recvs[i][1], recvs[i][2], seq, 0)
+            for peer in self._peers:
+                reqs += self._post_send_bytes(peer, send[1], send[2], seq, 0)
+            self.worker.progress()
+            return _UcxAsyncHandle(
+                "all_reduce", seq, reqs, send, recvs,
+                tuple(inp.shape), inp.dtype, inp.device, n, None,
+            )
+
+    def all_gather_async(self, comm, inp: torch.Tensor, dim: int) -> "_UcxAsyncHandle":
+        """Stage and post an all_gather; complete it later with wait_async."""
+        with self._lock:
+            seq = self._next_seq()
+            if dim < 0:
+                dim += inp.dim()
+            inp = inp.contiguous()
+            n = inp.numel()
+            send = self._pool_acquire(n, inp.dtype)
+            send[0].copy_(inp.reshape(-1))  # input is free after this
+            recvs = [self._pool_acquire(n, inp.dtype) for _ in self._peers]
+            reqs = []
+            for i, peer in enumerate(self._peers):
+                reqs += self._post_recv_bytes(peer, recvs[i][1], recvs[i][2], seq, 0)
+            for peer in self._peers:
+                reqs += self._post_send_bytes(peer, send[1], send[2], seq, 0)
+            self.worker.progress()
+            return _UcxAsyncHandle(
+                "all_gather", seq, reqs, send, recvs,
+                tuple(inp.shape), inp.dtype, inp.device, n, dim,
+            )
+
+    def wait_async(self, handle: "_UcxAsyncHandle") -> torch.Tensor:
+        """Progress the worker until ``handle`` completes; return its result.
+
+        The result is freshly allocated -- never a pool buffer, never a view
+        of one. The handle's slots go back to the free list before this
+        returns, so a handle must be awaited exactly once: a second wait
+        would read slots that a later collective may already own, and it
+        raises instead.
+        """
+        with self._lock:
+            if handle.done:
+                raise UcxError(
+                    "htccl ucx: wait_async called twice on the same handle "
+                    f"(op={handle.op}, seq={handle.seq})."
+                )
+            self.worker.wait(handle.reqs)
+            handle.done = True
+            try:
+                if handle.op == "all_reduce":
+                    acc = handle.send[0]
+                    for rec in handle.recvs:
+                        acc.add_(rec[0])
+                    out = torch.empty(
+                        handle.shape, dtype=handle.dtype, device=handle.device
+                    )
+                    out.reshape(-1).copy_(acc)  # (+ downcast)
+                    return out
+
+                # all_gather -- same flat-output construction as the sync
+                # fast path; own slice from the STAGED copy (see OWNERSHIP).
+                W = self.world_size
+                n = handle.n
+                out_flat = torch.empty(
+                    W * n, dtype=handle.dtype, device=handle.device
+                )
+                rows = out_flat.view(W, n)
+                rows[self.rank].copy_(handle.send[0])
+                for i, peer in enumerate(self._peers):
+                    rows[peer].copy_(handle.recvs[i][0])
+                shape = handle.shape
+                dim = handle.dim
+                if dim == 0:
+                    return out_flat.view((W * shape[0],) + shape[1:])
+                return (
+                    out_flat.view((W,) + shape)
+                    .movedim(0, dim)
+                    .reshape(shape[:dim] + (W * shape[dim],) + shape[dim + 1 :])
+                )
+            finally:
+                self._pool_release(handle.send)
+                for rec in handle.recvs:
+                    self._pool_release(rec)
+
+    def poke_async(self) -> None:
+        """One unlocked progress pass.
+
+        Optional: a consumer with an outstanding handle may call this
+        between compute steps to nudge RNDV handshakes along. Never
+        required for correctness -- wait_async completes everything.
+        """
+        self.worker.progress()
+
+    # ------------------------------------------------------------------
     # teardown
     # ------------------------------------------------------------------
 
@@ -514,6 +1179,8 @@ class HTCCLUcxTransport:
             pass
         self._staging_bufs.clear()
         self._view_cache.clear()
+        # Holds raw addresses into the buffers just dropped.
+        self._bar_slots = None
         try:
             self.worker.close()
         except Exception as e:  # teardown must never mask the real error

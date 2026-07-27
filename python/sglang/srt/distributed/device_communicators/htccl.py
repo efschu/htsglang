@@ -220,6 +220,42 @@ class HTCCLCommunicator:
     # all_reduce
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # async all_reduce (issue/wait split; ucx transport only today)
+    #
+    # supports_async() is deliberately shaped like handles(): its answer
+    # depends only on group-uniform state (env-selected transport, class of
+    # that transport), never on the payload -- so no rank can decide to go
+    # async while a peer goes sync. Callers must treat a None from
+    # all_reduce_async as "issue unavailable" and fall back to the sync
+    # all_reduce; wait_async must be called exactly once per handle.
+    # ------------------------------------------------------------------
+
+    def supports_async(self) -> bool:
+        t = self.transport
+        return (
+            not self.disabled
+            and t is not None
+            and hasattr(t, "all_reduce_async")
+            and t.handles("all_reduce", 0)
+        )
+
+    def all_reduce_async(self, input_: torch.Tensor):
+        """Issue a sum-all-reduce; returns a handle for wait_async, or None.
+
+        None means the async path is unavailable here (no transport, or the
+        transport has no async support) -- the caller runs the sync
+        all_reduce instead. That decision is group-uniform by construction
+        (see supports_async).
+        """
+        if not self.supports_async():
+            return None
+        return self.transport.all_reduce_async(self, input_.contiguous())
+
+    def wait_async(self, handle) -> torch.Tensor:
+        """Complete an all_reduce_async handle; returns the fresh result."""
+        return self.transport.wait_async(handle)
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """Sum-all-reduce ``input_`` across the group, host-staged.
 

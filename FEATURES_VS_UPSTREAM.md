@@ -508,6 +508,191 @@ regression vs 4 MiB is CPU-memory-bound, not link-bound — V1 makes four passes
 (stage in, wire, accumulate, stage out), ~4x32 MiB of host traffic that is not overlapped with the
 wire. Chunked pipelining of D2H against the transfer is the fix and belongs to L2.
 
+**L2 (task #198) — transport-level speed-up. Both L1 gaps closed; measured, not projected.**
+
+*Where the 12 us barrier actually was.* Profiled on the real link (phase timestamps inside the
+barrier, 2000 samples), and cross-checked against a same-host `self/sm/tcp` run whose barrier was
+**10.9 us** — i.e. the wire contributed essentially nothing and the number was ~100% software.
+The 12.37 us split: setup 1.43 (a `fill_(0)` on a byte nobody reads, plus a peer dict rebuilt with
+f-string keys per call), posting 4.29 (two ctypes crossings wrapped in eagerly formatted error
+strings, per-post `data_ptr`/`numel`/`element_size`, a `c_void_p` object per post), waiting 4.13
+(median 5-6 spin passes, each rebuilding a list and reading the clock). So ~7 us of the 12 was
+bookkeeping around two library calls.
+
+*Where the 32 MiB regression actually was.* Measured directly: the four host passes over 32 MiB
+cost **9.4 ms single-threaded**, and a 32 MiB buffer runs at ~13 GiB/s versus ~34 GiB/s for a
+4 MiB one because it no longer fits in L3. Against a ~13 ms wire budget that fully accounts for
+the 23.6 ms observed. So the fix is worth about as much for *cache locality* as for overlap.
+
+*What changed.* (a) **Pipelined `all_reduce`** — the payload is processed chunk by chunk out of
+two rotating slot sets, scheduled `stage-in(k+1) -> wait(k) -> post(k+1) -> finish(k)`, so the
+stage-in sits under chunk k's transfer and the accumulate + copy-out sit under chunk k+1's.
+(b) **Progress interleaving** — the staged copies call `ucp_worker_progress` every
+`SGLANG_HTCCL_UCX_PROGRESS_KIB` (default 256). This is load-bearing, not defensive: without it the
+rendezvous handshake for the next chunk cannot start while the CPU is inside a several-hundred-
+microsecond memcpy, and the measured 32 MiB figure falls from 17.4 to **13.8 Gbit/s**.
+(c) **Short small-message path** — precomputed barrier slots and staging records
+(`view, ptr, nbytes` memoised together), error strings built only on failure, bound ctypes function
+objects, a single-request fast path in `wait`, and a dedicated single-chunk branch in `all_reduce`
+so a decode-sized collective never builds the pipeline's closures. `SGLANG_HTCCL_UCX_PIPELINE=0`
+restores the old path as an A/B control.
+
+*Cross-rig result*, 40G RoCE, `UCX_TLS=rc`, world 2, median of 5 reps of per-cell medians, both
+directions live:
+
+| cell | L1 (#117) | L2 (#198) | |
+|---|---|---|---|
+| 8 KiB | 37.0 us / 1.77 Gbit/s | **26.6 us / 2.47 Gbit/s** | -28% latency |
+| 64 KiB | 60.2 us / 8.71 | **50.4 us / 10.39** | -16% |
+| 512 KiB | 232.9 us / 18.01 | **223.3 us / 18.78** | -4% |
+| 4 MiB | 1625.7 us / 20.64 | **1583.3 us / 21.19** | -3% (was already at the wire) |
+| 32 MiB | 24.30 ms / 11.05 | **15.42 ms / 17.41** | **-37% / +58%** |
+| barrier | 12 us (min 9.9) | **5.5 us** | -54% |
+
+The 32 MiB point moved from 53% of the 4 MiB peak to **82%** of it. The barrier's remaining 5.5 us
+is now 0.20 setup / 2.25 posting / 3.08 waiting, i.e. mostly the ctypes marshalling floor for two
+5-argument calls plus 5 poll passes over a ~1.5 us link — the next lever there is fewer crossings,
+not cheaper ones.
+
+*Sweep, for whoever tunes further:* at 32 MiB, `CHUNK_MIB=2` gave 17.72 and `CHUNK_MIB=8` gave
+17.34 Gbit/s against 17.41 at the default 4 — within ~1.5x the run-to-run spread, so the default
+was left alone rather than tuned to this one link.
+
+*Deliberately NOT pipelined:* the ring `all_reduce` (world > 2 only, and this fleet has two rigs,
+so it cannot be measured here) and `broadcast`. They inherit the cheaper post/wait path but still
+make unoverlapped host passes.
+
+**L2 block 2 — `all_gather` pipelined + single-chunk fast path; measured honestly, including the
+part that did not move.** `all_gather` now has (a) the same two-parity chunk pipeline as
+`all_reduce` (multi-chunk payloads; own rank's slice is copied device-locally inside finish(k) and
+never crosses the wire — on a GPU that is a D2D copy) and (b) a single-chunk fast path (the
+all_gather twin of `all_reduce`'s flat branch: precomputed slots, no staging dict, no per-call key
+formatting; the own slice copies straight from the input). `SGLANG_HTCCL_UCX_PIPELINE=0` keeps the
+pre-pipelining path verbatim as the A/B control. Correctness: all references EXACT (atol 0.0 —
+all_gather is pure data movement), ramp payloads, chunk-boundary/ragged/2d-axis cases, pipelined ==
+unpipelined and fastpath == generic bit-for-bit, in the registered unit test, the local selftest
+(world 2+3) and cross-rig over RDMA; a deliberate parity-bug mutation flips 8+ tests red.
+Cross-rig numbers (reps 5): 32 MiB 26.4 -> 24.9 ms (**only ~+6%**), 512 KiB 268 -> 242 us, 8 KiB
+43.2 -> 41.2 us; all_reduce and barrier unchanged (8 KiB 27.4 us, barrier 5.2 us — the standing
+rule that every change re-measures the decode path held). *Why 32 MiB barely moved, profiled not
+guessed:* phase timers on the real link show total 22.5 ms = stage 1.4 + wait 8.1 + **finish 12.6**;
+the finish pass writes 64 MiB into a FRESHLY allocated output (mandatory — returning a reused
+buffer is the `_get_out_buf` aliasing bug), and a fresh 64 MiB CPU tensor costs ~4 ms in pure
+mmap/page-fault zero-fill (measured: 6.6 ms fresh+2 copies vs 2.7 ms into a reused buffer) plus
+DRAM bandwidth the NIC's RDMA DMA is competing for. The CPU-tensor bench is therefore the WORST
+case for all_gather (its host passes are 2x all_reduce's per byte); on the GPU path the finish
+copies are H2D/D2D DMAs and the fault storm does not exist. The structure is proven by the
+all_reduce numbers; the honest end-to-end number for all_gather comes from the model run, not from
+this cell.
+
+**L2 block 3 — small-message path, second pass.** Profiled the 8 KiB all_reduce on the real link
+(phase timestamps, 48 samples): stage 4.5 / post 8.1 / wait 8.3 / finish 4.2 us + ~2 us residual
+(lock, seq, `empty_like`). Post and wait are the ctypes + UCX-internal + RTT floor; stage/finish
+are torch dispatch. What changed: (a) the single-chunk all_gather builds its output FLAT
+(`view(world, n)` rows, `select+copy` per rank instead of `select+reshape+copy`, and dim==0 — the
+common gather axis — returns a single `view`, no movedim/reshape), with the own-slice copy placed
+BETWEEN the posts and the wait so it runs while the wire is in flight (progress-interleaved above
+one progress block, so a large single-chunk copy cannot starve its own RNDV handshake); (b) `wait`
+gained an n==2 fast path (one recv + one non-inline send, the world-2 exchange shape) holding two
+locals instead of rebuilding a list per poll pass. Cross-rig (reps 5): **all_gather 8 KiB
+43.2 -> 27.0 us (-37%), 64 KiB 67 -> 49.0 us, 512 KiB 268 -> 219 us** — the small all_gather now
+costs the same as the small all_reduce; all_reduce 8 KiB 27.4 -> 26.5-27.1 us; barrier steady at
+5.2 us. *Deliberately rejected:* posting the send directly from a CPU input and fusing the last
+accumulate into the output (`torch.add(out=)`) — both only fire for fp32 CPU tensors, i.e. they
+would have tuned the harness, not the bf16/GPU model path. *C/Cython extension: skipped against
+the >2x bar* — it could recover roughly the ~5 us of Python around the two posts and the polls, on
+a 27 us collective; the honest ceiling is ~1.3x, and it would add a build step on every host,
+which the ctypes design exists to avoid.
+
+**L2 block 4 — async collectives (`all_reduce_async` / `all_gather_async` -> handle,
+`wait_async(handle)` -> out).** The three contracts from the design sketch are implemented and
+falsified-first: (i) *ownership* — async staging comes from a power-of-two-size-class free-list
+pool, acquired at issue, owned by the handle, released only inside `wait_async`; the caller's
+input is free the moment issue returns (staged before the first post; all_gather's own slice is
+later copied out of the STAGING slot, never re-read from the input); results are freshly
+allocated, never pool views; double-wait raises. A deliberate release-at-issue mutation flips 10+
+lifetime tests red. (ii) *progress* — issue ends with one progress pass (pushes eager sends onto
+the wire); completion happens under the progress loop in `wait_async`; no progress thread (worker
+is THREAD_MODE_SINGLE under the transport lock). Eager-sized payloads then move in hardware while
+the caller computes; RNDV-sized ones degrade toward sync cost but stay correct. (iii) *order* —
+`_next_seq` counts issues under the lock, handles carry their seq, tags match exactly, so waits
+may be out of issue order (tested, including a sync collective between issue and wait, and mixed
+ar+ag outstanding). *Honest transport-level overlap measurement, CPU tensors over the real link:*
+`sync(coll+busy)` vs `issue+busy+wait` shows **nothing hidden** (-6 to +4 us) — as it must: at
+8 KiB ~22 of 27 us are LOCAL software on the same CPU the busy loop runs on, only the ~5 us of
+wire is hideable, and the handle/pool overhead (~4 us) eats it. The async API's value case is the
+GPU consumer, where the model computes on the GPU while CPU+wire run the collective — that is the
+87%-idle lock-step stall this API exists to attack, and it is a model-runner measurement, not a
+transport one.
+
+**L2 block 5 — consumer-side overlap, `SGLANG_HTCCL_UCX_OVERLAP=1` (default OFF).** The MLP
+all-reduce rides the existing `fuse_mlp_allreduce` seam, which is the one legal deferral window in
+a dense decoder chain (layer N's down_proj AR is mathematically movable into layer N+1's
+`prepare_attn`, where AR + residual + layernorm happen together; everything else in the chain is a
+strict dependency). Three touch points, all no-ops with the flag off: (a)
+`should_fuse_mlp_allreduce_with_next_layer` gains a group-uniform gate (env flag + transport class
+only — no rank-local state, per the rank-local-test-before-collective rule; the structural guards
+moe_cp / dp+eagle / input_scattered / SCATTERED / is_last_layer still veto); (b)
+`RowParallelLinear.forward` issues `all_reduce_async` at the skip point and attaches
+`(comm, handle)` to the tensor exactly like the existing `_sglang_needs_allreduce_fusion` tag;
+(c) `prepare_attn`'s fusion branch checks for the handle FIRST (a kernel fusion on unreduced data
+with a handle in flight would double-reduce and orphan the requests) and falls back to the
+unchanged sync AR when no handle was attached — so an issue-side refusal degrades cleanly.
+Communicator plumbing: `HTCCLCommunicator.supports_async/all_reduce_async/wait_async`, with
+`supports_async` shaped like `handles()` (payload-independent, group-uniform); covered by seam
+unit tests (56 registered HTCCL tests green). *Honest expectation, stated before the E2E run:* the
+overlap window is the host-side layer-boundary work (tag, loop, prepare_attn entry — tens of us in
+eager mode), so this hides at most the wire+remote share of one AR per layer; the dependency
+analysis says the big idle sits elsewhere (straggler lock-step, draft-solo phases). The A/B/C
+end-to-end run is the arbiter, not this paragraph.
+
+*Overlap design sketch (analysis) — now implemented through blocks 4-5 above.*
+
+**L2 end-to-end proof (task #198, 2026-07-26).** TP=4 cross-rig working arm (Qwen3.6-27B-FP8,
+`--rank-tp-ratio 6,4,4,2 --rank-kv-ratio capacity`, NEXTN 3 + solo draft, triton backend, eager,
+ctx 8192, bs=1), slope method, 3 content classes, reps 3, same boot recipe for every arm; only the
+8 HTCCL-touched files (and one env flag) differ. Arms: **A** = pre-L2 transport (684ef3dd13
+content), **B** = L2 transport (blocks 1-3), **C** = B + `SGLANG_HTCCL_UCX_OVERLAP=1` (activation
+proven by the once-per-rank "overlap ACTIVE" log on all 4 ranks), **D** = B with
+`--rank-kv-ratio coupled` (perf-oriented KV split, 2080 Ti share 26.6% -> 12.5%).
+
+| slope tok/s | A | B | C | D | B/A | C/B |
+|---|---|---|---|---|---|---|
+| code  | 16.38 | 17.31 | 17.92 | 18.11 | +5.7% | +3.5% |
+| prose | 15.67 | 17.57 | 17.12 | 16.84 | +12.1% | -2.6% |
+| mixed | 16.54 | 18.36 | 17.84 | 18.15 | +11.0% | -2.9% |
+
+`spec_accept_length` identical across arms per content (3.08 / 3.03 / 2.91) — the arms generated
+the same tokens; zero degeneration anywhere. **Verdict: the transport work IS the end-to-end win
+(~+10% mean B/A); the async overlap (C/B) is neutral within run-to-run spread** — exactly what the
+dependency analysis predicted (the deferral window is only the host-side layer boundary), and now
+it is a measured negative result, not a guess. D (fewer tokens on the slowest card) is also
+within spread at THIS benchmark's short sequences (~0.2-2k tokens live context) — attention is a
+small compute share there; the KV-split lever belongs to long-context runs (input for #103).
+Per-rank GPU utilization, sampled during the measure window of every arm: main rig ~10-13% per
+GPU, 2080 Ti ~50-55% — stable across A/B/C/D. The slowest card is >4x as utilized as any other
+rank and paces the lock-step group; neither the faster transport nor the overlap moved that
+ratio, which makes straggler compute (not communication) the next order of magnitude
+(#103 k-matrix / split balance, #200 autotune). Raw results: `/root/crossrig/res_arm_{a,b,c,d}*.json`,
+GPU samples `gpu_{a,b,c,d}_{main,rig2}.log` (CT999). The transport is now within ~20% of the
+wire at large sizes, which makes the next order of magnitude a *scheduling* problem, not a
+transport one: in the TP=4 cross-rig L0 run the main rig was **87% idle**, waiting in lock step.
+Every collective here is synchronous — the caller blocks from post to completion — so the model's
+compute cannot cover the link. The shape of the fix, mirroring the DCP collective-overlap work
+(#128): split each collective into `all_reduce_async(inp) -> handle` and `wait(handle) -> out`,
+where the async half stages, posts, and returns immediately, and the wait half progresses the
+worker and finishes the accumulate + copy-out. The transport already has the pieces — the request
+list *is* the handle, `_pipelined_all_reduce`'s staged slot dict is already a per-collective
+carrier, and the pipeline loop already proves the CPU work can be deferred past the post. What it
+does not have, and what the follow-up task must add: (i) slot ownership that survives past the
+call, so an outstanding handle's staging buffers cannot be reused by the next collective — the
+two-parity rotation must become an allocator with a free list, and this is exactly the
+shared-buffer trap this file has been bitten by before; (ii) a rule for who progresses the worker
+while the caller is off computing, since UCX makes no progress unattended for handshakes;
+(iii) an ordering contract, because `_next_seq` assumes collectives complete in issue order.
+The consumer side (issuing the all-reduce of layer N and waiting for it after layer N+1's GEMM)
+is a model-runner change and belongs with #128's machinery, not here.
+
 *GPU staging end-to-end (TP=2 cross-rig with a real model) is written up but deliberately NOT run
 yet* — see the recipe below.
 
