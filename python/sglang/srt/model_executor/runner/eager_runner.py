@@ -321,7 +321,13 @@ class EagerRunner(BaseRunner):
             if model_runner.device_timer
             else contextlib.nullcontext()
         )
-        with ctx:
+        rank_ctx = (
+            model_runner.prefill_rank_timer.wrap(metadata={"category": category})
+            if model_runner.prefill_rank_timer
+            and forward_batch.forward_mode.is_plain_prefill()
+            else contextlib.nullcontext()
+        )
+        with ctx, rank_ctx:
             pcg_runner = model_runner.prefill_cuda_graph_runner
             if (
                 _is_hip

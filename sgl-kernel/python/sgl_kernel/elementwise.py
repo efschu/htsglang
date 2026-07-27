@@ -3,14 +3,43 @@ from typing import Optional
 import torch
 from sgl_kernel.utils import is_arch_support_pdl
 
-try:
-    import flashinfer.norm as _flashinfer_norm
+# flashinfer is imported lazily on first norm call, not at module scope:
+# importing flashinfer cascades through its jit/gemm/fused_moe internals,
+# several of which query device properties at import and thereby create a
+# CUDA context in every process importing sgl_kernel -- including GPU-passive
+# ones like an inference server's tokenizer/HTTP parent.
+_flashinfer_norm = None
+_has_flashinfer: Optional[bool] = None
 
-    _has_flashinfer = True
-except ImportError:
-    _has_flashinfer = False
+
+def _get_flashinfer_norm():
+    global _flashinfer_norm, _has_flashinfer
+    if _has_flashinfer is None:
+        try:
+            import flashinfer.norm as flashinfer_norm
+
+            _flashinfer_norm = flashinfer_norm
+            _has_flashinfer = True
+        except ImportError:
+            _has_flashinfer = False
+    return _flashinfer_norm
+
 
 _FLASHINFER_NORM_SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
+
+
+def _flashinfer_norm_for(dtype: torch.dtype):
+    """The flashinfer.norm module when it should handle this dtype, else None.
+
+    dynamo check before the lazy import: never import flashinfer while
+    tracing (see the rmsnorm docstring note on FlashInfer's untraceable JIT
+    loading path)."""
+    if (
+        dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        and not torch.compiler.is_dynamo_compiling()
+    ):
+        return _get_flashinfer_norm()
+    return None
 
 
 def _rmsnorm_internal(
@@ -112,12 +141,9 @@ def rmsnorm(
     # FlashInfer, this check can be removed.
     # See: https://github.com/flashinfer-ai/flashinfer/issues/2734
     #      https://github.com/flashinfer-ai/flashinfer/pull/2733
-    if (
-        _has_flashinfer
-        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        and not torch.compiler.is_dynamo_compiling()
-    ):
-        return _flashinfer_norm.rmsnorm(input, weight, eps, out, enable_pdl)
+    fi_norm = _flashinfer_norm_for(input.dtype)
+    if fi_norm is not None:
+        return fi_norm.rmsnorm(input, weight, eps, out, enable_pdl)
     else:
         return _rmsnorm_internal(input, weight, eps, out, enable_pdl)
 
@@ -152,12 +178,9 @@ def fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    if (
-        _has_flashinfer
-        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        and not torch.compiler.is_dynamo_compiling()
-    ):
-        _flashinfer_norm.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
+    fi_norm = _flashinfer_norm_for(input.dtype)
+    if fi_norm is not None:
+        fi_norm.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
     else:
         _fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
 
@@ -193,12 +216,9 @@ def gemma_rmsnorm(
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
     """
-    if (
-        _has_flashinfer
-        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        and not torch.compiler.is_dynamo_compiling()
-    ):
-        return _flashinfer_norm.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
+    fi_norm = _flashinfer_norm_for(input.dtype)
+    if fi_norm is not None:
+        return fi_norm.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
     else:
         return _gemma_rmsnorm_internal(input, weight, eps, out, enable_pdl)
 
@@ -233,12 +253,9 @@ def gemma_fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    if (
-        _has_flashinfer
-        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        and not torch.compiler.is_dynamo_compiling()
-    ):
-        _flashinfer_norm.gemma_fused_add_rmsnorm(
+    fi_norm = _flashinfer_norm_for(input.dtype)
+    if fi_norm is not None:
+        fi_norm.gemma_fused_add_rmsnorm(
             input, residual, weight, eps, enable_pdl
         )
     else:

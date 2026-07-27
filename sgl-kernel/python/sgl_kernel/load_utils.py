@@ -12,10 +12,94 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _get_compute_capability_nvml():
+    """Compute capability of CUDA device 0 via NVML -- WITHOUT creating a
+    CUDA context.
+
+    torch.cuda.get_device_properties() runs _lazy_init(), so importing
+    sgl_kernel used to map a full CUDA context (~hundreds of MiB) into every
+    importing process, including GPU-passive ones like an inference server's
+    tokenizer/HTTP parent. NVML reads device properties over the management
+    interface with no context. Only the sm90-vs-rest distinction matters to
+    the loader, so device 0's capability suffices.
+
+    Emulates CUDA enumeration: PCI_BUS_ID sorts by bus id; FASTEST_FIRST
+    (default) is approximated as highest capability first, which is exact
+    for position 0 whenever the fastest card also has the highest
+    capability. CUDA_VISIBLE_DEVICES may hold indices or GPU-<uuid>
+    prefixes; anything unresolvable (MIG, out-of-range) returns None and the
+    caller falls back to torch.
+    """
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        return None
+    try:
+        devices = []
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            device_uuid = pynvml.nvmlDeviceGetUUID(handle)
+            if isinstance(device_uuid, bytes):
+                device_uuid = device_uuid.decode()
+            bus_id = pynvml.nvmlDeviceGetPciInfo(handle).busId
+            if isinstance(bus_id, bytes):
+                bus_id = bus_id.decode()
+            devices.append((int(major) * 10 + int(minor), device_uuid, bus_id))
+    except Exception:
+        return None
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+    if not devices:
+        return None
+
+    pci_order = os.environ.get("CUDA_DEVICE_ORDER", "FASTEST_FIRST") == "PCI_BUS_ID"
+    if pci_order:
+        devices.sort(key=lambda d: d[2])
+    else:
+        devices.sort(key=lambda d: d[0], reverse=True)
+
+    first = devices[0]
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd is not None:
+        entry = cvd.split(",")[0].strip()
+        if entry.startswith("GPU-"):
+            matches = [d for d in devices if d[1].startswith(entry)]
+            if len(matches) != 1:
+                return None
+            first = matches[0]
+        else:
+            try:
+                index = int(entry)
+            except ValueError:
+                return None
+            if not 0 <= index < len(devices):
+                return None
+            if index > 0 and not pci_order and len({d[0] for d in devices}) > 1:
+                # FASTEST_FIRST specifies only position 0; an index into the
+                # unspecified remainder of a mixed rig cannot be emulated.
+                return None
+            first = devices[index]
+    return first[0]
+
+
 def _get_compute_capability():
     """Get the compute capability of the current GPU."""
     if not torch.cuda.is_available():
         return None
+
+    if not torch.cuda.is_initialized():
+        # Import-time path (the common case): answer via NVML so importing
+        # sgl_kernel does not create a CUDA context. Before initialization
+        # the current device is always 0.
+        compute_capability = _get_compute_capability_nvml()
+        if compute_capability is not None:
+            return compute_capability
 
     # Get the current device
     device = torch.cuda.current_device()

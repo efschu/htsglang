@@ -525,6 +525,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.device_timer = None
+        # Per-rank prefill timer (metrics_reporter installs it on the TARGET
+        # runner only). Separate from device_timer: it must pair 1:1 with
+        # plain prefill forwards (see ForwardMode.is_plain_prefill), while
+        # device_timer is shared with the draft runners and covers every
+        # forward category.
+        self.prefill_rank_timer = None
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
@@ -3931,7 +3937,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     if self.device_timer
                     else contextlib.nullcontext()
                 )
-                with ctx:
+                rank_ctx = (
+                    self.prefill_rank_timer.wrap(metadata={"category": category})
+                    if self.prefill_rank_timer
+                    and forward_batch.forward_mode.is_plain_prefill()
+                    else contextlib.nullcontext()
+                )
+                with ctx, rank_ctx:
                     ret = self.prefill_cuda_graph_runner.execute(
                         forward_batch, **kwargs
                     )

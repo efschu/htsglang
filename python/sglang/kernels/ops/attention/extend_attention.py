@@ -25,10 +25,13 @@ from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.utils.common import get_device_capability_no_init
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    CUDA_CAPABILITY = torch.cuda.get_device_capability()
+    # No-init helper: module-scope evaluation must not create a CUDA context
+    # in GPU-passive processes (task #237).
+    CUDA_CAPABILITY = get_device_capability_no_init()
 
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()

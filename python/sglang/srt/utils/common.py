@@ -250,15 +250,154 @@ def device_context(device: torch.device):
             raise ValueError(f"Unknown device module: {device}")
 
 
+# ---------------------------------------------------------------------------
+# Device capability WITHOUT a CUDA context (task #237)
+# ---------------------------------------------------------------------------
+#
+# torch.cuda.get_device_capability() runs _lazy_init(): the first call maps the
+# kernel images of every loaded module plus driver structures into the calling
+# process -- a full CUDA context, measured ~634 MiB per process. Several
+# modules answer capability questions AT IMPORT TIME, and the GPU-passive
+# launch_server parent (tokenizer manager + HTTP server) shares that import
+# closure, so it paid the context without ever running a kernel. NVML answers
+# the same question over the management interface with NO CUDA context.
+#
+# The NVML path is used only while torch.cuda is uninitialized; once a process
+# owns a context, torch is authoritative and free.
+
+
+class _NvmlDeviceInfo(NamedTuple):
+    capability: Tuple[int, int]
+    name: str
+
+
+@lru_cache(maxsize=1)
+def _nvml_cuda_device0() -> Optional[_NvmlDeviceInfo]:
+    """Resolve CUDA device 0 (the 'current' device before any set_device)
+    via NVML, honoring CUDA_VISIBLE_DEVICES and CUDA_DEVICE_ORDER.
+
+    Enumeration-order emulation:
+      - PCI_BUS_ID: sort NVML devices by PCI bus id (CUDA's documented order).
+      - FASTEST_FIRST (default): CUDA documents only that the fastest device
+        becomes device 0 (rest unspecified). Approximated as highest compute
+        capability first. Exotic mixes where a lower-capability card is
+        faster would be mis-ordered here -- but when every visible device
+        shares one capability the answer is order-independent, and the
+        heterogeneous first-position answer matches the max-capability card.
+
+    CUDA_VISIBLE_DEVICES entries may be indices or GPU-<uuid> prefixes;
+    parsing stops at the first unresolvable entry (CUDA semantics). MIG
+    entries are not resolvable here. Returns None whenever the question
+    cannot be answered from NVML; callers then fall back to torch (which
+    initializes CUDA).
+    """
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+    except Exception:
+        return None
+    try:
+        devices = []
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+            name = pynvml.nvmlDeviceGetName(handle)
+            if isinstance(name, bytes):
+                name = name.decode()
+            device_uuid = pynvml.nvmlDeviceGetUUID(handle)
+            if isinstance(device_uuid, bytes):
+                device_uuid = device_uuid.decode()
+            bus_id = pynvml.nvmlDeviceGetPciInfo(handle).busId
+            if isinstance(bus_id, bytes):
+                bus_id = bus_id.decode()
+            devices.append(
+                (
+                    (int(major), int(minor)),
+                    name,
+                    device_uuid,
+                    bus_id,
+                )
+            )
+    except Exception:
+        return None
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+    if not devices:
+        return None
+
+    pci_order = os.environ.get("CUDA_DEVICE_ORDER", "FASTEST_FIRST") == "PCI_BUS_ID"
+    if pci_order:
+        devices.sort(key=lambda d: d[3])
+    else:
+        devices.sort(key=lambda d: d[0], reverse=True)
+
+    # Only the first visible position matters: it is what
+    # get_device_capability() / get_device_name() read before any set_device.
+    first = devices[0]
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd is not None:
+        entry = cvd.split(",")[0].strip()
+        if entry.startswith("GPU-"):
+            matches = [d for d in devices if d[2].startswith(entry)]
+            if len(matches) != 1:
+                return None
+            first = matches[0]
+        else:
+            try:
+                index = int(entry)
+            except ValueError:
+                return None  # includes MIG-...; not resolvable via this path
+            if not 0 <= index < len(devices):
+                return None
+            if index > 0 and not pci_order and len({d[:2] for d in devices}) > 1:
+                # FASTEST_FIRST specifies only position 0; an index into the
+                # unspecified remainder of a mixed rig cannot be emulated.
+                return None
+            first = devices[index]
+
+    return _NvmlDeviceInfo(capability=first[0], name=first[1])
+
+
+def get_device_capability_no_init(
+    device: Optional[int] = None,
+) -> Tuple[int, int]:
+    """torch.cuda.get_device_capability(), but answered via NVML while
+    torch.cuda is uninitialized so that GPU-passive processes (import-time
+    capability checks, the launch_server parent) do not pay a CUDA context.
+    Before initialization the current device is always 0, so the NVML path
+    covers device in (None, 0). Falls back to torch -- which initializes
+    CUDA -- when NVML cannot answer.
+    """
+    if device in (0, None) and not torch.cuda.is_initialized():
+        info = _nvml_cuda_device0()
+        if info is not None:
+            return info.capability
+    return torch.cuda.get_device_capability(device)
+
+
+def get_device_name_no_init(device: Optional[int] = None) -> str:
+    """torch.cuda.get_device_name() without initializing CUDA; see
+    get_device_capability_no_init."""
+    if device in (0, None) and not torch.cuda.is_initialized():
+        info = _nvml_cuda_device0()
+        if info is not None:
+            return info.name
+    return torch.cuda.get_device_name(device)
+
+
 def _check_cuda_device_version(
     device_capability_majors: List[int], cuda_version: Tuple[int, int]
 ):
     if not is_cuda():
         return False
-    return (
-        torch.cuda.get_device_capability()[0] in device_capability_majors
-        and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
-    )
+    if tuple(map(int, torch.version.cuda.split(".")[:2])) < cuda_version:
+        return False
+    return get_device_capability_no_init()[0] in device_capability_majors
 
 
 is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
@@ -300,14 +439,17 @@ is_sm90_supported = lru_cache(maxsize=1)(
 )
 
 
-try:
-    import sgl_kernel  # noqa: F401
-
-    is_intel_amx_backend_available = hasattr(
-        torch.ops.sgl_kernel, "convert_weight_packed"
-    )
-except:
-    is_intel_amx_backend_available = False
+@lru_cache(maxsize=1)
+def _intel_amx_backend_available() -> bool:
+    """Deferred from module scope: `import sgl_kernel` initializes CUDA in
+    every process importing sglang -- sgl_kernel's loader queries
+    torch.cuda.get_device_properties() to pick its arch-specific build, and
+    common.py is in every import closure, including the GPU-passive
+    launch_server parent (task #237). First use of sgl_kernel happens where a
+    device context legitimately exists; see sgl_kernel_importable below."""
+    if not sgl_kernel_importable():
+        return False
+    return hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +529,7 @@ except:
 
 
 def cpu_has_amx_support():
-    return is_amx_tile_supported and is_intel_amx_backend_available
+    return is_amx_tile_supported and _intel_amx_backend_available()
 
 
 def use_intel_amx_backend(layer):
@@ -667,7 +809,11 @@ def get_amdgpu_memory_capacity():
 
 def get_device_sm():
     if torch.cuda.is_available() or is_musa():
-        major, minor = torch.cuda.get_device_capability()
+        # NVML path while uninitialized: import-time callers (e.g. the
+        # deep_gemm configurer) must not create a CUDA context in GPU-passive
+        # processes. On MUSA/HIP NVML cannot answer and this falls through to
+        # torch, unchanged.
+        major, minor = get_device_capability_no_init()
         return major * 10 + minor
     return 0
 
@@ -1009,7 +1155,10 @@ def get_device_core_count(device_id: int = 0) -> int:
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
-        major, minor = torch.cuda.get_device_capability(device_id)
+        # No-init path: import-time callers (e.g. fp8_utils'
+        # cutlass_fp8_supported) must not create a CUDA context in
+        # GPU-passive processes (task #237).
+        major, minor = get_device_capability_no_init(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
