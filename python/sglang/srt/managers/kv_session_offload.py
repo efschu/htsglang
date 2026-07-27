@@ -59,10 +59,10 @@ if TYPE_CHECKING:
 # Per-process singleton (one scheduler per TP-rank process). Registered by
 # KVSessionOffloadManager.__init__; consumed by ScheduleBatch's spill-tick
 # decode allocation without a scheduler back-reference.
-_MANAGER: Optional["KVSessionOffloadManager"] = None
+_MANAGER: Optional[KVSessionOffloadManager] = None
 
 
-def get_kv_session_offload_manager() -> "KVSessionOffloadManager":
+def get_kv_session_offload_manager() -> KVSessionOffloadManager:
     assert _MANAGER is not None, (
         "kv-session-offload manager not initialized in this process"
     )
@@ -792,11 +792,21 @@ def select_spill_victim(
     sizes: Optional[List[int]] = None,
     need: int = 0,
     fast_pressure: bool = False,
+    blocked: Optional[set] = None,
 ) -> Optional[int]:
     """Spill victim index, or None.
 
     Candidates are the NORMAL (non-fast-lane) requests only, ordered by
     ``session_priority_key`` (youngest = least protected).
+
+    ``blocked`` (#236 cooldown): indices excluded as victims by the
+    post-restore cooldown (progress lock / time cap). Exclusion happens AFTER
+    the oldest-tabu is resolved over the FULL normal candidate set, so the
+    protection semantics are untouched: the oldest normal session stays tabu
+    (never shifted onto the second-oldest by a blocked entry), a sole running
+    session still never self-spills, and ``blocked=None`` (the default) is
+    byte-identical to the pre-#236 behaviour. The cooldown can only ever
+    REMOVE victims, never add one.
 
     fast_pressure=False (plain decode-OOM among normal sessions): the
     OLDEST running normal session is untouchable (removed from the
@@ -831,8 +841,15 @@ def select_spill_victim(
         return None
     if not fast_pressure:
         # Oldest normal is untouchable: drop the most-protected candidate.
+        # Resolved over the FULL candidate set, BEFORE the cooldown exclusion
+        # below -- a blocked oldest must not shift the tabu onto the
+        # second-oldest.
         oldest = max(candidates, key=lambda i: session_priority_key(reqs[i]))
         candidates = [i for i in candidates if i != oldest]
+        if not candidates:
+            return None
+    if blocked:
+        candidates = [i for i in candidates if i not in blocked]
         if not candidates:
             return None
     by_youth = sorted(candidates, key=lambda i: session_priority_key(reqs[i]))
@@ -1130,6 +1147,356 @@ def wave_back_gate(
     return ua >= int(min_free_tokens), ua
 
 
+# ---------------------------------------------------------------------------
+# #236 SPILL BUDGET (pure layer)
+#
+# Bounds the KV-session spill along independent axes: session COUNT, VOLUME
+# (total / per session / per phase), RATE (tokens/s across PCIe), and a per-
+# episode TIME WINDOW. Every regler is OFF at its zero default ("open"), so an
+# unarmed budget changes not a byte of today's behaviour. Several reglers may
+# be armed at once; at every decision point they are evaluated in ONE fixed,
+# documented order and the FIRST violated regler names the event (counter +
+# log reason) -- "der erste greifende gewinnt".
+#
+# Exhaustion is a DEMOTION, not an abort: the session stops generating (loses
+# its liveness), its already-spilled work drains back to device through the
+# UNCHANGED wave-back/restore machinery and is donated to the radix tree by
+# the stock finish path -- a continuation is then a prefix hit, not a full
+# re-prefill. Under HiRadixCache the donated node migrates to the host tier
+# via HiCache's own write-through/eviction policy; the budget layer never
+# touches a cache pool directly.
+#
+# RANK-UNIFORMITY (this fork: divergence == NCCL hang): every decision here is
+# a pure function of replicated scheduler state (token counts, iteration
+# counters, arrival sequences) plus the manager's RANK-UNIFORM clock (a
+# MAX-reduced monotonic timestamp, refreshed once per iteration at an
+# unconditional call site). No function in this layer may read a rank-local
+# quantity -- in particular NOT the allocator free list and NOT the tree
+# cache: budget policy neither gates nor replaces RESTORE-READINESS, which
+# keeps counting the radix-evictable memory (#217) in the unchanged
+# _maybe_restore_flow.
+# ---------------------------------------------------------------------------
+
+# GDN/Mamba states are charged to the budget at their NATIVE dtype size (bf16,
+# itemsize 2; ~75 MB per session on the 27B, length-independent). They are
+# NEVER quantized -- the recurrent state accumulates error, so a compressed
+# state corrupts every later token. The budget layer enforces the invariant
+# instead of merely assuming it: an itemsize below bf16 is rejected loudly.
+GDN_STATE_MIN_ITEMSIZE = 2
+
+
+def gdn_token_equivalent(
+    gdn_state_bytes: int, per_token_kv_bytes: int, state_itemsize: int = 2
+) -> int:
+    """Token-equivalent budget charge of one session's GDN/Mamba state
+    (ceil(state bytes / KV bytes per token)); 0 when either size is unknown.
+
+    ``state_itemsize`` documents-and-enforces the no-quantization invariant:
+    the state is accounted at its native bf16 (or wider) size, and a caller
+    holding a sub-bf16 state is a bug upstream of the budget, not something to
+    account for."""
+    if int(state_itemsize) < GDN_STATE_MIN_ITEMSIZE:
+        raise ValueError(
+            "GDN/Mamba state must stay at its native dtype (>= bf16, itemsize "
+            f">= {GDN_STATE_MIN_ITEMSIZE}); got itemsize {int(state_itemsize)}. "
+            "GDN states are never quantized (recurrent error accumulates)."
+        )
+    g = int(gdn_state_bytes)
+    p = int(per_token_kv_bytes)
+    if g <= 0 or p <= 0:
+        return 0
+    return -(-g // p)
+
+
+class SpillBudgetConfig(NamedTuple):
+    """All #236 reglers. 0 (or 0.0) disables the individual regler; the
+    all-zero default is the OPEN budget (today's behaviour, byte-identical).
+
+    Volumes are in TOKENS (replicated units; a session's GDN state is folded
+    in as a token equivalent). ``demote_grace_iters`` is the coarse upper
+    bound on how long a demoted session may wait for its drain-handover
+    before it falls back to a host finish."""
+
+    total_tokens: int = 0
+    session_tokens: int = 0
+    prefill_tokens: int = 0
+    decode_tokens: int = 0
+    rate_tokens_per_s: float = 0.0
+    episode_seconds: float = 0.0
+    max_sessions: int = 0
+    progress_lock_tokens: int = 0
+    spill_hysteresis_steps: int = 0
+    cooldown_seconds: float = 0.0
+    demote_grace_iters: int = 256
+
+    @classmethod
+    def from_server_args(cls, sa) -> SpillBudgetConfig:
+        def g(name, default):
+            return getattr(sa, "kv_session_offload_" + name, default)
+
+        return cls(
+            total_tokens=int(g("budget_total_tokens", 0) or 0),
+            session_tokens=int(g("budget_session_tokens", 0) or 0),
+            prefill_tokens=int(g("budget_prefill_tokens", 0) or 0),
+            decode_tokens=int(g("budget_decode_tokens", 0) or 0),
+            rate_tokens_per_s=float(g("budget_rate_tokens_per_s", 0.0) or 0.0),
+            episode_seconds=float(g("budget_episode_seconds", 0.0) or 0.0),
+            max_sessions=int(g("budget_max_sessions", 0) or 0),
+            progress_lock_tokens=int(g("spill_progress_lock_tokens", 0) or 0),
+            spill_hysteresis_steps=int(g("spill_hysteresis_steps", 0) or 0),
+            cooldown_seconds=float(g("spill_cooldown_seconds", 0.0) or 0.0),
+            demote_grace_iters=int(g("budget_demote_grace_iters", 256) or 0),
+        )
+
+    @property
+    def armed(self) -> bool:
+        """Any regler set -> the budget machinery runs. All-zero (the
+        default) -> every hook is skipped, byte-identical."""
+        return bool(
+            self.total_tokens > 0
+            or self.session_tokens > 0
+            or self.prefill_tokens > 0
+            or self.decode_tokens > 0
+            or self.rate_tokens_per_s > 0
+            or self.episode_seconds > 0
+            or self.max_sessions > 0
+            or self.progress_lock_tokens > 0
+            or self.spill_hysteresis_steps > 0
+            or self.cooldown_seconds > 0
+        )
+
+    @property
+    def needs_clock(self) -> bool:
+        """Whether any regler reads wall time -> the manager must refresh the
+        rank-uniform clock every iteration."""
+        return bool(
+            self.rate_tokens_per_s > 0
+            or self.episode_seconds > 0
+            or self.cooldown_seconds > 0
+        )
+
+    @property
+    def has_volume(self) -> bool:
+        return bool(
+            self.total_tokens > 0
+            or self.session_tokens > 0
+            or self.prefill_tokens > 0
+            or self.decode_tokens > 0
+        )
+
+
+# Fixed admission evaluation order -- the first violated regler names the
+# decline. Count before volume (cheapest, structural), per-session before
+# per-phase before total (most specific first), rate last (the only regler
+# whose verdict can recover on its own next iteration).
+BUDGET_ADMISSION_ORDER = (
+    "max-sessions",
+    "session-tokens",
+    "prefill-tokens",
+    "decode-tokens",
+    "total-tokens",
+    "rate",
+)
+
+# Fixed in-episode evaluation order (demotion reasons). Per-session reglers
+# first, then the per-episode window, then the aggregate phase/total volumes
+# (which demote the youngest live session of the class, one per iteration).
+BUDGET_EPISODE_ORDER = (
+    "session-tokens",
+    "episode-window",
+    "prefill-tokens",
+    "decode-tokens",
+    "total-tokens",
+)
+
+
+def budget_admission_violation(
+    cfg: SpillBudgetConfig,
+    *,
+    n_open_slots: int,
+    spill_tokens: int,
+    phase: str,
+    session_tokens_after: int,
+    prefill_tokens_after: int,
+    decode_tokens_after: int,
+    total_tokens_after: int,
+    rate_ready: bool,
+) -> Optional[str]:
+    """First violated regler at SPILL ADMISSION, or None (admit).
+
+    A violation here DECLINES the spill (try_spill returns False; the stock
+    retraction fallback handles the pressure exactly as it does today when no
+    host region is free) -- admission never demotes. All ``*_after`` volumes
+    are the projected totals INCLUDING the candidate spill. Pure over
+    replicated inputs -> identical verdict on every rank."""
+    if cfg.max_sessions > 0 and int(n_open_slots) >= cfg.max_sessions:
+        return "max-sessions"
+    if cfg.session_tokens > 0 and int(session_tokens_after) > cfg.session_tokens:
+        return "session-tokens"
+    if (
+        phase == "prefill"
+        and cfg.prefill_tokens > 0
+        and int(prefill_tokens_after) > cfg.prefill_tokens
+    ):
+        return "prefill-tokens"
+    if (
+        phase == "decode"
+        and cfg.decode_tokens > 0
+        and int(decode_tokens_after) > cfg.decode_tokens
+    ):
+        return "decode-tokens"
+    if cfg.total_tokens > 0 and int(total_tokens_after) > cfg.total_tokens:
+        return "total-tokens"
+    if cfg.rate_tokens_per_s > 0 and int(spill_tokens) > 0 and not rate_ready:
+        return "rate"
+    return None
+
+
+def budget_episode_violation(
+    cfg: SpillBudgetConfig,
+    *,
+    session_tokens: int,
+    episode_elapsed_s: float,
+) -> Optional[str]:
+    """First violated PER-SESSION regler of a RUNNING episode, or None.
+
+    A violation DEMOTES the session (see the manager's ``_budget_demote``):
+    liveness ends, the work drains and is handed over. The aggregate volume
+    reglers (phase / total) are evaluated by the caller over all sessions --
+    they demote the youngest live session of the class, not this one."""
+    if cfg.session_tokens > 0 and int(session_tokens) > cfg.session_tokens:
+        return "session-tokens"
+    if cfg.episode_seconds > 0 and float(episode_elapsed_s) > cfg.episode_seconds:
+        return "episode-window"
+    return None
+
+
+class SpillRateBucket:
+    """Token bucket over the manager's RANK-UNIFORM clock, protecting the
+    PCIe link (the spill path shares it with the prefill-offload ingest).
+
+    DEBT MODEL, deliberately: a single consumption may exceed the burst
+    capacity (a spill tick streams its WHOLE host tail every forward, which
+    can be larger than one second of budget). Blocking such a consumer until
+    the bucket covers it in full would starve it forever; instead ``ready()``
+    gates on a NON-NEGATIVE level and ``consume`` may push the level into
+    debt, which subsequent refill pays off -- the average rate converges to
+    the configured budget and nothing stalls permanently. Exceeding a budget
+    transiently is throttling (defer the tick / decline the spill), never a
+    demotion: rate pressure recovers on its own.
+
+    Pure arithmetic over (uniform timestamps, replicated token counts) ->
+    bit-identical level on every rank."""
+
+    def __init__(self, rate_tokens_per_s: float, burst_seconds: float = 1.0):
+        self.rate = float(rate_tokens_per_s)
+        self.cap = max(1.0, self.rate * float(burst_seconds))
+        self.level = self.cap
+        self._last: Optional[float] = None
+
+    def advance(self, now: float) -> None:
+        """Refill from the uniform clock. Idempotent for a repeated ``now``."""
+        if self._last is None:
+            self._last = float(now)
+            return
+        dt = max(0.0, float(now) - self._last)
+        self._last = float(now)
+        self.level = min(self.cap, self.level + dt * self.rate)
+
+    def ready(self) -> bool:
+        return self.level >= 0.0
+
+    def consume(self, tokens: int) -> None:
+        self.level -= float(max(0, int(tokens)))
+
+
+class SpillCooldownRegistry:
+    """Post-restore cooldown against spill<->restore pendulum, ranked as in
+    the design:
+
+    (a) PROGRESS LOCK (primary): a session restored from host is not a spill
+        victim again until it has produced ``progress_lock_tokens`` output
+        tokens since the restore -- no progress, no second transfer. This
+        attacks the pendulum at its root; time-based locks only do so by
+        accident.
+    (c) TIME CAP (coarse, on top): additionally not a victim for
+        ``cooldown_seconds`` after the restore (uniform clock).
+
+    ((b), the pressure hysteresis, is stateful per manager and lives in
+    ``_maybe_spill_for_fast_lane`` -- see the manager.)
+
+    Entries expire lazily once BOTH caps have passed. All inputs are
+    replicated (output lengths) or uniform (the clock) -> every rank blocks
+    and expires identically."""
+
+    def __init__(self, progress_lock_tokens: int, cooldown_seconds: float):
+        self.progress_lock_tokens = max(0, int(progress_lock_tokens))
+        self.cooldown_seconds = max(0.0, float(cooldown_seconds))
+        self._entries: dict = {}
+
+    def note_restore(self, rid, output_len: int, now: float) -> None:
+        self._entries[rid] = (int(output_len), float(now))
+
+    def blocked(self, rid, output_len_now: int, now: float) -> bool:
+        e = self._entries.get(rid)
+        if e is None:
+            return False
+        restored_len, restored_t = e
+        if (
+            self.progress_lock_tokens > 0
+            and int(output_len_now) - restored_len < self.progress_lock_tokens
+        ):
+            return True
+        if (
+            self.cooldown_seconds > 0
+            and float(now) - restored_t < self.cooldown_seconds
+        ):
+            return True
+        # Both caps passed: the entry is spent, drop it (bounds the registry).
+        del self._entries[rid]
+        return False
+
+
+class SpillBudgetCounters:
+    """#236 visibility: without these the policy is not assessable. Plain
+    replicated integers; ``as_dict`` feeds the (later) dashboard."""
+
+    def __init__(self):
+        self.spilled_tokens_prefill = 0  # cumulative tokens host-spilled at prefill
+        self.spilled_tokens_decode = 0  # cumulative: decode spills + host growth
+        self.episodes_started = 0
+        self.episodes_restored = 0
+        self.episodes_finished_on_host = 0
+        self.episodes_demoted = 0
+        self.demotions_drained = 0  # handover complete: full prefix donated
+        self.demotions_host_finished = 0  # grace fallback: host tail dropped
+        self.pendulum_events = 0  # re-spill attempt inside the cooldown
+        self.rate_throttled_ticks = 0
+        self.admission_declines = 0  # budget declines -> stock retraction
+        self.prefill_gate_closures = 0  # born-spill admissions gated off
+        self.exhaustions: dict = {}  # reason -> count
+
+    def note_exhaustion(self, reason: str) -> None:
+        self.exhaustions[reason] = self.exhaustions.get(reason, 0) + 1
+
+    def as_dict(self) -> dict:
+        return {
+            "spilled_tokens_prefill": self.spilled_tokens_prefill,
+            "spilled_tokens_decode": self.spilled_tokens_decode,
+            "episodes_started": self.episodes_started,
+            "episodes_restored": self.episodes_restored,
+            "episodes_finished_on_host": self.episodes_finished_on_host,
+            "episodes_demoted": self.episodes_demoted,
+            "demotions_drained": self.demotions_drained,
+            "demotions_host_finished": self.demotions_host_finished,
+            "pendulum_events": self.pendulum_events,
+            "rate_throttled_ticks": self.rate_throttled_ticks,
+            "admission_declines": self.admission_declines,
+            "prefill_gate_closures": self.prefill_gate_closures,
+            "exhaustions": dict(self.exhaustions),
+        }
+
+
 class WaveBackController:
     """Opportunistic wave-back gate (S3): decides, per scheduler iteration,
     whether and how far to migrate the host tail's front block back to the
@@ -1224,6 +1591,23 @@ class SpillSlot:
         # which is also where the copy-stream D2H is joined (U9).
         "born_spilled",
         "adopted",
+        # #236 SPILL BUDGET episode state. ``budget_phase`` classifies the
+        # EPISODE ("decode" spill vs "prefill"/born-spilled -- different cost
+        # models, different budgets); ``budget_initial_tail`` is the volume the
+        # episode STARTED with (the born prompt's write-once share; growth on
+        # top is decode-phase). ``budget_demoted`` flips once when a budget
+        # exhausts: the session loses its liveness (generation capped at the
+        # current output), keeps its region, and drains through the unchanged
+        # wave-back/restore machinery toward the radix-tree handover.
+        # ``budget_tick_release`` re-allows ONE finishing host tick after the
+        # drain grace expires (the coarse fallback: host finish, tail dropped).
+        # All fields are set from replicated decisions -> rank-uniform.
+        "budget_phase",
+        "budget_initial_tail",
+        "budget_episode_start",
+        "budget_demoted",
+        "budget_demote_iter",
+        "budget_tick_release",
     )
 
     def __init__(self, req, region, spill_iter, wave, hysteresis):
@@ -1277,6 +1661,13 @@ class SpillSlot:
         # handover, so the defaults keep every existing path unchanged.
         self.born_spilled = False
         self.adopted = True
+        # #236 SPILL BUDGET episode state (inert defaults; see __slots__ note).
+        self.budget_phase = "decode"
+        self.budget_initial_tail = 0
+        self.budget_episode_start = 0.0
+        self.budget_demoted = False
+        self.budget_demote_iter = 0
+        self.budget_tick_release = False
         # RESTORE-READINESS handshake (quiescence-trap fix): when a spilled
         # session is restore-ready but its last host-tick result is still
         # pending (last_batch is its own tick), one tick is suppressed so the
@@ -1806,6 +2197,70 @@ class KVSessionOffloadManager:
             )
             self._install_regulator_device_timer()
 
+        # === #236 SPILL BUDGET. All-zero defaults -> _budget_armed False ->
+        # every budget hook below is a skipped boolean, byte-identical.
+        self._budget = SpillBudgetConfig.from_server_args(sa)
+        self._budget_armed = self._budget.armed
+        self._budget_counters = SpillBudgetCounters()
+        self._budget_bucket = (
+            SpillRateBucket(self._budget.rate_tokens_per_s)
+            if self._budget.rate_tokens_per_s > 0
+            else None
+        )
+        self._budget_cooldown = (
+            SpillCooldownRegistry(
+                self._budget.progress_lock_tokens,
+                self._budget.cooldown_seconds,
+            )
+            if (
+                self._budget.progress_lock_tokens > 0
+                or self._budget.cooldown_seconds > 0
+            )
+            else None
+        )
+        # (b) Pressure hysteresis, the spill-side MIRROR of
+        # --kv-session-offload-restore-hysteresis-steps: the fast-lane
+        # shortfall must HOLD for N consecutive iterations before sessions are
+        # evicted for it. It applies to the fast-lane path only, deliberately:
+        # a decode-OOM spill relieves pressure that must yield THIS iteration
+        # (declining it would only route the same pressure into the harsher
+        # stock retraction), while a fast-lane eviction is elective -- the
+        # waiting request simply waits one more iteration, which is exactly
+        # the flutter the mirror is meant to damp.
+        self._fast_spill_pressure_gate = (
+            RestoreHysteresis(self._budget.spill_hysteresis_steps)
+            if self._budget.spill_hysteresis_steps > 0
+            else None
+        )
+        # RANK-UNIFORM CLOCK: refreshed once per iteration (MAX all-reduce of
+        # time.monotonic over the TP cpu group) when any time-based regler is
+        # armed, so every time comparison below reads the SAME value on every
+        # rank -- a per-rank clock read would flip decisions at window
+        # boundaries and desync the collective sequence.
+        self._budget_now = time.monotonic()
+        # GDN/Mamba per-session token equivalent (charged to every episode's
+        # volume; ~75 MB bf16 on the 27B, length-independent). MAX-reduced
+        # once here (a rank-uniform init site) because both inputs are
+        # rank-local under uneven TP; the reduce runs only when a volume
+        # regler is armed (replicated config -> uniform collective count).
+        self._budget_gdn_eq = (
+            self._budget_gdn_token_equivalent() if self._budget.has_volume else 0
+        )
+        if self._budget_armed:
+            logger.info(
+                "kv-session-offload SPILL BUDGET (#236) armed: %s; "
+                "gdn_eq=%d tokens/session, demote_grace=%d iters. First "
+                "violated regler wins; exhaustion demotes (drain + radix "
+                "handover), never discards.",
+                {
+                    k: v
+                    for k, v in self._budget._asdict().items()
+                    if v not in (0, 0.0) or k == "demote_grace_iters"
+                },
+                self._budget_gdn_eq,
+                self._budget.demote_grace_iters,
+            )
+
         global _MANAGER
         _MANAGER = self
 
@@ -2046,6 +2501,313 @@ class KVSessionOffloadManager:
         admit against the binding rank. 0 until first computed / single-rank."""
         return int(getattr(self, "_dcp_budget_deficit", 0))
 
+    # -- #236 spill budget ------------------------------------------------
+
+    def _budget_gdn_token_equivalent(self) -> int:
+        """Per-session GDN/Mamba token equivalent, MAX-reduced over the TP cpu
+        group. Both inputs (mamba pool bytes, per-token KV bytes) are
+        rank-LOCAL under uneven TP, so the raw quotient would differ per rank
+        and a volume comparison against it would desync; the init-time MAX
+        (conservative: charges the largest rank's share everywhere) makes it a
+        replicated constant. Unknown pools charge 0 (dense models)."""
+        local = 0
+        try:
+            mp = getattr(self.req_to_token_pool, "mamba_pool", None)
+            fp = self.full_pool
+            if mp is not None and fp is not None:
+                n_slots = int(getattr(mp, "size", 0) or 0)
+                gib = float(getattr(mp, "mem_usage", 0.0) or 0.0)
+                per_token = (
+                    int(getattr(fp, "head_num", 0))
+                    * int(getattr(fp, "head_dim", 0))
+                    * int(getattr(fp, "layer_num", 0))
+                    * int(getattr(fp, "store_dtype", torch.bfloat16).itemsize)
+                    * 2
+                )
+                state_itemsize = GDN_STATE_MIN_ITEMSIZE
+                cache = getattr(mp, "mamba_cache", None)
+                ts = getattr(cache, "temporal_state", None)
+                if ts is not None and hasattr(ts, "dtype"):
+                    state_itemsize = ts.dtype.itemsize
+                if n_slots > 0 and gib > 0:
+                    local = gdn_token_equivalent(
+                        int(gib * (1 << 30) / (n_slots + 1)),
+                        per_token,
+                        state_itemsize,
+                    )
+        except ValueError:
+            raise  # a quantized GDN state is a hard error, never accounted
+        except Exception as e:  # noqa: BLE001 -- sizing only, never fatal
+            logger.warning(
+                "kv-session-offload budget: GDN token equivalent unavailable "
+                "(%r); GDN states are NOT charged to the volume budgets.", e
+            )
+            local = 0
+        grp = getattr(self.scheduler, "tp_cpu_group", None)
+        if grp is None or torch.distributed.get_world_size(grp) <= 1:
+            return local
+        t = torch.tensor([local], dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=grp)
+        return int(t.item())
+
+    def _budget_begin_iteration(self) -> None:
+        """Once per pre_schedule (unconditional when armed): refresh the
+        rank-uniform clock and refill the rate bucket from it. The clock
+        reduce fires every iteration while a time-based regler is armed --
+        gated purely on replicated config, so the collective count is
+        identical on every rank."""
+        if self._budget.needs_clock:
+            now = time.monotonic()
+            grp = getattr(self.scheduler, "tp_cpu_group", None)
+            if grp is not None and torch.distributed.get_world_size(grp) > 1:
+                t = torch.tensor([now], dtype=torch.float64)
+                torch.distributed.all_reduce(
+                    t, op=torch.distributed.ReduceOp.MAX, group=grp
+                )
+                # MAX = the furthest-along rank's monotonic clock. Single-node
+                # scope: CLOCK_MONOTONIC shares one base across all local
+                # processes, so the reduced value is a coherent point in time.
+                now = float(t.item())
+            self._budget_now = now
+            if self._budget_bucket is not None:
+                self._budget_bucket.advance(now)
+
+    def _budget_resident_volumes(self):
+        """(total, prefill, decode, per_slot) resident host-token volumes,
+        recomputed from replicated slot state every call (no incremental
+        drift). Each session is charged its host tail plus the GDN token
+        equivalent; a born-spilled session's write-once prompt share counts
+        as prefill, growth on top as decode."""
+        per_slot = {}
+        tot_prefill = 0
+        tot_decode = 0
+        for rpi, slot in self.spills.items():
+            req = slot.req
+            L = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
+            b = int(getattr(req, "kv_spill_boundary", 0) or 0)
+            tail = max(0, L - b)
+            sess = tail + self._budget_gdn_eq
+            per_slot[rpi] = sess
+            if slot.budget_phase == "prefill":
+                pre = min(tail, int(slot.budget_initial_tail))
+                tot_prefill += pre + self._budget_gdn_eq
+                tot_decode += tail - pre
+            else:
+                tot_decode += sess
+        return tot_prefill + tot_decode, tot_prefill, tot_decode, per_slot
+
+    def _budget_note_spill(self, slot, phase: str, spilled_tokens: int) -> None:
+        """Register a freshly opened episode (decode spill or born-spilled
+        prefill) with the budget: phase classification, episode clock start,
+        cumulative counters, and the rate-bucket charge for the D2H volume."""
+        slot.budget_phase = phase
+        slot.budget_initial_tail = int(spilled_tokens)
+        slot.budget_episode_start = self._budget_now
+        self._budget_counters.episodes_started += 1
+        if phase == "prefill":
+            self._budget_counters.spilled_tokens_prefill += int(spilled_tokens)
+        else:
+            self._budget_counters.spilled_tokens_decode += int(spilled_tokens)
+        if self._budget_bucket is not None:
+            self._budget_bucket.consume(int(spilled_tokens))
+
+    def _budget_admission_check(self, spill_tokens: int) -> Optional[str]:
+        """Budget verdict for a candidate DECODE spill of ``spill_tokens``
+        host tokens; returns the violated regler (decline -> stock
+        retraction) or None (admit). Pure over replicated volumes."""
+        total, pre, dec, _ = self._budget_resident_volumes()
+        sess_after = int(spill_tokens) + self._budget_gdn_eq
+        reason = budget_admission_violation(
+            self._budget,
+            n_open_slots=len(self.spills),
+            spill_tokens=int(spill_tokens),
+            phase="decode",
+            session_tokens_after=sess_after,
+            prefill_tokens_after=pre,
+            decode_tokens_after=dec + sess_after,
+            total_tokens_after=total + sess_after,
+            rate_ready=(
+                self._budget_bucket.ready()
+                if self._budget_bucket is not None
+                else True
+            ),
+        )
+        if reason is not None:
+            self._budget_counters.admission_declines += 1
+            self._budget_counters.note_exhaustion(reason)
+        return reason
+
+    def _budget_blocked_victims(self, reqs) -> Optional[set]:
+        """Indices in ``reqs`` currently under the post-restore cooldown
+        (progress lock / time cap), or None when the cooldown is off/idle."""
+        if self._budget_cooldown is None:
+            return None
+        blocked = {
+            i
+            for i, r in enumerate(reqs)
+            if self._budget_cooldown.blocked(
+                r.rid, len(r.output_ids), self._budget_now
+            )
+        }
+        return blocked or None
+
+    def _budget_evaluate_episodes(self) -> None:
+        """Once per iteration while sessions are spilled: demote episodes
+        whose budget is exhausted, and release the finishing tick of demoted
+        sessions whose drain grace expired. Deterministic slot order (by
+        region index -- replicated) and replicated inputs -> every rank
+        demotes the same sessions at the same iteration."""
+        cfg = self._budget
+        total, pre, dec, per_slot = self._budget_resident_volumes()
+        now = self._budget_now
+        ordered_items = sorted(self.spills.items(), key=lambda kv: kv[1].region)
+        ordered = [slot for _, slot in ordered_items]
+        # Per-session reglers first (most specific).
+        for rpi, slot in ordered_items:
+            if slot.budget_demoted:
+                continue
+            elapsed = (
+                now - float(slot.budget_episode_start)
+                if cfg.episode_seconds > 0
+                else 0.0
+            )
+            reason = budget_episode_violation(
+                cfg,
+                session_tokens=per_slot[rpi],
+                episode_elapsed_s=elapsed,
+            )
+            if reason is not None:
+                self._budget_demote(slot, reason)
+        # Aggregate reglers: one demotion per class per iteration, youngest
+        # live session of the class (FCFS-consistent; re-evaluated next iter).
+        def _youngest(phase=None):
+            live = [
+                s
+                for s in ordered
+                if not s.budget_demoted
+                and (phase is None or s.budget_phase == phase)
+            ]
+            if not live:
+                return None
+            return max(
+                live,
+                key=lambda s: getattr(s.req, "kv_arrival_seq", -1) or -1,
+            )
+
+        if cfg.prefill_tokens > 0 and pre > cfg.prefill_tokens:
+            v = _youngest("prefill")
+            if v is not None:
+                self._budget_demote(v, "prefill-tokens")
+        if cfg.decode_tokens > 0 and dec > cfg.decode_tokens:
+            v = _youngest("decode")
+            if v is not None:
+                self._budget_demote(v, "decode-tokens")
+        if cfg.total_tokens > 0 and total > cfg.total_tokens:
+            v = _youngest()
+            if v is not None:
+                self._budget_demote(v, "total-tokens")
+        # Drain grace: a demoted session waits (not ticking) for its tail to
+        # drain to device, where the stock finish donates the full prefix.
+        # Past the grace it gets ONE budget-exempt host tick to finish and
+        # deliver -- the coarse fallback that keeps the client from hanging
+        # when device memory never frees (the tail is then dropped, counted).
+        for slot in ordered:
+            if not slot.budget_demoted or slot.budget_tick_release:
+                continue
+            if self._iter_ct - slot.budget_demote_iter > cfg.demote_grace_iters:
+                slot.budget_tick_release = True
+                self._log(
+                    "kv-session-offload BUDGET: demoted rid=%s drain grace "
+                    "(%d iters) expired -> finishing on host (tail dropped).",
+                    slot.req.rid,
+                    cfg.demote_grace_iters,
+                )
+
+    def _budget_demote(self, slot, reason: str) -> None:
+        """HERABSTUFUNG, not an abort (#236): end the episode's liveness and
+        keep its work. Generation is capped at the current output (the client
+        receives everything produced so far, finished as length); the session
+        stops ticking and its host tail drains through the UNCHANGED
+        wave-back/restore machinery -- restore-readiness keeps counting the
+        radix-evictable memory (#217), the budget adds no readiness predicate
+        of its own. Once drained, the stock device finish donates the full
+        row to the radix tree: a continuation is a prefix hit, not a full
+        re-prefill. Under HiRadixCache the donated node then migrates to the
+        host tier by HiCache's own write-through/eviction policy.
+
+        PREFIX-KEY PRODUCER IDENTITY (checked, documented): the in-process
+        radix key is (token ids, extra_key) -- producer identity (model,
+        quantization, geometry) is implicit and safe because one scheduler
+        process serves exactly one model configuration for its lifetime. The
+        persistent HiCache STORAGE tier keys additionally carry model_name
+        and the TP/PP/CP geometry (hicache_storage.py config_suffix) but NOT
+        the KV dtype/quantization -- a shared storage backend can therefore
+        collide across server runs of the same model with different
+        --kv-cache-dtype. Finding reported upstream, not worked around here.
+
+        Under the spec host-finish guard (spec active, KVSO_RESUME unset) no
+        restore path exists, so the drain grace is skipped: the session
+        finishes on its next host tick (tail dropped -- the handover cannot
+        preserve it on that configuration).
+
+        Rank-uniform: reason and cap derive from replicated state."""
+        req = slot.req
+        slot.budget_demoted = True
+        slot.budget_demote_iter = self._iter_ct
+        self._budget_counters.episodes_demoted += 1
+        self._budget_counters.note_exhaustion(reason)
+        sp = getattr(req, "sampling_params", None)
+        cap = max(1, len(req.output_ids))
+        if sp is not None and (
+            getattr(sp, "max_new_tokens", None) is None or sp.max_new_tokens > cap
+        ):
+            sp.max_new_tokens = cap
+        spec_algo = getattr(self.scheduler, "spec_algorithm", None)
+        if (
+            spec_algo is not None
+            and not spec_algo.is_none()
+            and not resume_under_spec_enabled()
+        ):
+            slot.budget_tick_release = True
+        self._log(
+            "kv-session-offload BUDGET: DEMOTING rid=%s (budget '%s' "
+            "exhausted): generation capped at %d output tokens; work is kept "
+            "-- the spilled tail drains and the finish donates the prefix "
+            "(continuation = prefix hit). host_finish_fallback=%s",
+            req.rid,
+            reason,
+            cap,
+            slot.budget_tick_release,
+        )
+
+    def budget_stats(self) -> dict:
+        """Counters + the four residency states, for the dashboard. The
+        'retracted' state is not directly observable from the manager (stock
+        retraction runs in the scheduler); its budget-caused share is the
+        admission_declines counter."""
+        live = sum(1 for s in self.spills.values() if not s.budget_demoted)
+        demoted_pending = len(self.spills) - live
+        rb = getattr(self.scheduler, "running_batch", None)
+        device_resident = len(getattr(rb, "reqs", ()) or ()) if rb is not None else 0
+        out = self._budget_counters.as_dict()
+        out.update(
+            {
+                "state_device_resident": device_resident,
+                "state_spilled_live": live,
+                "state_demoted_pending": demoted_pending,
+                "state_retracted_by_budget_decline": (
+                    self._budget_counters.admission_declines
+                ),
+                "gdn_token_equivalent": self._budget_gdn_eq,
+                "rate_bucket_level": (
+                    self._budget_bucket.level
+                    if self._budget_bucket is not None
+                    else None
+                ),
+            }
+        )
+        return out
+
     def prefill_spill_free_regions(self) -> int:
         """Prefill-Spill (PS1-V1a): number of free host regions available to
         born-spill a would-be-wedged prompt this iteration. 0 when the feature
@@ -2061,11 +2823,34 @@ class KVSessionOffloadManager:
         -> no branch-local collective, no desync."""
         if not self.prefill_spill:
             return 0
+        # #236: the budget gates born-spill ADMISSION coarsely through the
+        # region count the PrefillAdder already consults -- a closed gate
+        # reads as "no free region" and the prompt takes today's chunk/wedge
+        # path. Coarse on purpose: the adder knows the prompt length, this
+        # gate does not, so the LAST admitted prompt may overshoot a volume
+        # regler by one prompt; the overshoot then demotes through the
+        # episode evaluation. All inputs replicated -> rank-uniform.
+        if getattr(self, "_budget_armed", False):
+            cfg = self._budget
+            closed = False
+            if cfg.max_sessions > 0 and len(self.spills) >= cfg.max_sessions:
+                closed = True
+            elif cfg.has_volume:
+                total, pre, _dec, _ = self._budget_resident_volumes()
+                if cfg.prefill_tokens > 0 and pre >= cfg.prefill_tokens:
+                    closed = True
+                if cfg.total_tokens > 0 and total >= cfg.total_tokens:
+                    closed = True
+            if not closed and self._budget_bucket is not None:
+                closed = not self._budget_bucket.ready()
+            if closed:
+                self._budget_counters.prefill_gate_closures += 1
+                return 0
         return len(self._free_regions)
 
     # -- slot bookkeeping -------------------------------------------------
 
-    def _slot_of(self, req) -> Optional["SpillSlot"]:
+    def _slot_of(self, req) -> Optional[SpillSlot]:
         return self.spills.get(req.req_pool_idx)
 
     def capture_tick_hidden(self, req_pool_idx: int, hidden: torch.Tensor) -> None:
@@ -2147,7 +2932,7 @@ class KVSessionOffloadManager:
         )
 
     def try_spill(
-        self, batch: "ScheduleBatch", fast_pressure=None, need: Optional[int] = None
+        self, batch: ScheduleBatch, fast_pressure=None, need: Optional[int] = None
     ) -> bool:
         """Spill the least-protected running session out of ``batch``
         (youngest NORMAL; fast-lane requests are never victims; under
@@ -2177,6 +2962,17 @@ class KVSessionOffloadManager:
             return False
         if fast_pressure is None:
             fast_pressure = self._fast_lane_pressure(batch.reqs)
+        budget_armed = getattr(self, "_budget_armed", False)
+        if budget_armed and (
+            self._budget.max_sessions > 0
+            and len(self.spills) >= self._budget.max_sessions
+        ):
+            # #236 breadth regler: at the session-count budget, decline before
+            # any victim work -- stock retraction handles the pressure, today's
+            # no-free-region behaviour.
+            self._budget_counters.admission_declines += 1
+            self._budget_counters.note_exhaustion("max-sessions")
+            return False
         # Shortfall X (tokens) + per-session spillable sizes -> minimal
         # single-session eviction (youngest sufficient; see
         # select_spill_victim). Only req-exclusive slots count as freed
@@ -2203,9 +2999,24 @@ class KVSessionOffloadManager:
             )
             for i in range(len(batch.reqs))
         ]
-        idx = select_spill_victim(
-            batch.reqs, sizes=sizes, need=need, fast_pressure=fast_pressure
+        # #236 cooldown: recently restored sessions are excluded as victims
+        # (progress lock / time cap). Pendulum accounting: when the cooldown
+        # changes the outcome, a Spill->Restore->Spill round inside the lock
+        # was just prevented -- exactly the event the counter exists for.
+        blocked = (
+            self._budget_blocked_victims(batch.reqs) if budget_armed else None
         )
+        idx = select_spill_victim(
+            batch.reqs,
+            sizes=sizes,
+            need=need,
+            fast_pressure=fast_pressure,
+            blocked=blocked,
+        )
+        if blocked and idx != select_spill_victim(
+            batch.reqs, sizes=sizes, need=need, fast_pressure=fast_pressure
+        ):
+            self._budget_counters.pendulum_events += 1
         if idx is None:
             return False
         req = batch.reqs[idx]
@@ -2371,6 +3182,22 @@ class KVSessionOffloadManager:
             return False
         spill_margin = spill_count - need  # over-eviction metric (<= block-1)
 
+        # #236 volume/rate reglers, checked BEFORE any region claim or D2H so
+        # a decline leaves no partial state. First violated regler wins;
+        # decline -> stock retraction (today's fallback), never a corrupt
+        # spill. Replicated inputs -> rank-uniform verdict.
+        if budget_armed:
+            _viol = self._budget_admission_check(spill_count)
+            if _viol is not None:
+                self._log(
+                    "kv-session-offload BUDGET: spill of rid=%s (%d tokens) "
+                    "declined by regler '%s' -> stock retraction.",
+                    req.rid,
+                    spill_count,
+                    _viol,
+                )
+                return False
+
         row = self.req_to_token_pool.req_to_token[req.req_pool_idx, :L]
         seg = row[boundary:L]  # migrating tail; wholly req-exclusive (>= protected)
         owned_mask, dev_idx = owned_device_indices(
@@ -2532,6 +3359,9 @@ class KVSessionOffloadManager:
             slot.draft_spill_L = L
             slot.spec_in_tick = True
         self.spills[req.req_pool_idx] = slot
+        if budget_armed:
+            # Episode opened: decode phase, clock started, D2H volume charged.
+            self._budget_note_spill(slot, "decode", spill_count)
 
         keep = [i for i in range(len(batch.reqs)) if i != idx]
         batch.filter_batch(keep_indices=keep)
@@ -2563,7 +3393,7 @@ class KVSessionOffloadManager:
 
     # -- spill tick -------------------------------------------------------
 
-    def _build_spill_batch(self, req: "Req") -> "ScheduleBatch":
+    def _build_spill_batch(self, req: Req) -> ScheduleBatch:
         """Decode ScheduleBatch for a spilled session (persistent across
         ticks, exactly like running_batch). Mirrors the hisparse
         staging->decode builder: the last sampled token is stashed into the
@@ -2719,7 +3549,7 @@ class KVSessionOffloadManager:
         )
         return batch
 
-    def spill_decode_alloc(self, batch: "ScheduleBatch") -> torch.Tensor:
+    def spill_decode_alloc(self, batch: ScheduleBatch) -> torch.Tensor:
         """prepare_for_decode replacement for the spill tick: no device
         allocation -- assign the next sentinel slot and write the
         req_to_token row. Counter updates stay in prepare_for_decode."""
@@ -2729,9 +3559,14 @@ class KVSessionOffloadManager:
         res = new_token_residue(p, self.S)
         sent = self.host_base + p * self.S + res
         self.req_to_token_pool.req_to_token[req.req_pool_idx, p] = sent
+        if getattr(self, "_budget_armed", False):
+            # #236: one token grown on host per tick (decode-phase volume;
+            # resident volumes are recomputed from state, this is the
+            # cumulative counter only).
+            self._budget_counters.spilled_tokens_decode += 1
         return torch.tensor([sent], dtype=torch.int64, device=batch.seq_lens.device)
 
-    def prefill_spill_extend_ready(self, batch: "ScheduleBatch") -> bool:
+    def prefill_spill_extend_ready(self, batch: ScheduleBatch) -> bool:
         """Whether ``prepare_for_extend`` must take the PS2 born-spilled-deep
         allocation instead of ``alloc_for_extend``.
 
@@ -2766,7 +3601,7 @@ class KVSessionOffloadManager:
             )
         return True
 
-    def spill_extend_alloc(self, batch: "ScheduleBatch") -> torch.Tensor:
+    def spill_extend_alloc(self, batch: ScheduleBatch) -> torch.Tensor:
         """PS2 stage A -- ``alloc_for_extend`` replacement for a born-spilled
         DEEP prompt: allocate NO device KV slots at all.
 
@@ -2854,6 +3689,10 @@ class KVSessionOffloadManager:
         slot.born_spilled = True
         slot.adopted = False
         self.spills[rpi] = slot
+        if getattr(self, "_budget_armed", False):
+            # #236: born-spilled episode -- write-once prefill phase; the
+            # admission gate ran through prefill_spill_free_regions.
+            self._budget_note_spill(slot, "prefill", n_new)
         # One verdict, one prefill: clear the admission flag so a request that
         # is later RETRACTED and re-prefilled goes through a fresh admission
         # (and does not silently claim a second host region here).
@@ -3011,6 +3850,12 @@ class KVSessionOffloadManager:
                         len(self.spills),
                     )
 
+        # #236: refresh the rank-uniform budget clock + rate bucket BEFORE any
+        # spill/adopt event of this iteration reads them. Unconditional call
+        # site when armed (replicated config) -> uniform collective count.
+        if getattr(self, "_budget_armed", False):
+            self._budget_begin_iteration()
+
         # 0. PS2 handover: a born-spilled prompt that prefilled straight into
         #    its host region last iteration leaves the running batch here and
         #    becomes a normal spilled session. Done FIRST so the reap / restore
@@ -3034,6 +3879,12 @@ class KVSessionOffloadManager:
             # note in release_finished_spilled_req). Safety net for finish
             # paths that bypass release (e.g. abort). Rank-uniform.
             running_batch.batch_is_full = False
+
+        # 1b. #236: evaluate running episodes against the armed budgets --
+        #     demote exhausted ones, release grace-expired demotions. After
+        #     the reap (fresh slot set), before restore/tick decisions.
+        if getattr(self, "_budget_armed", False) and self.spills:
+            self._budget_evaluate_episodes()
 
         if not self.spills:
             self._maybe_spill_for_fast_lane(running_batch)
@@ -3079,6 +3930,27 @@ class KVSessionOffloadManager:
         )
         max_new = getattr(fr.sampling_params, "max_new_tokens", 0) or 0
         need = len(fr.origin_input_ids) + int(max_new * ratio) + 1
+
+        # #236 (b) pressure hysteresis -- the spill-side MIRROR of the restore
+        # hysteresis: the fast-lane shortfall must HOLD for N consecutive
+        # iterations before sessions are evicted for it, so freed-then-
+        # reconsumed memory around the restore threshold does not flutter
+        # into an immediate re-eviction. Applies to this elective path only
+        # (decode-OOM spills must yield the same iteration; declining them
+        # would just route the pressure into the harsher stock retraction).
+        # The shortfall is compared against the rank-uniform admission budget
+        # (min-reduced availability minus this rank's surplus) so the streak
+        # counter advances identically on every rank. Gate off (default) ->
+        # byte-identical.
+        gate = getattr(self, "_fast_spill_pressure_gate", None)
+        if gate is not None:
+            have_u = (
+                self.allocator.available_size()
+                + self._tree_evictable_size()
+                - self.dcp_budget_deficit()
+            )
+            if not gate.update(have_u < need):
+                return
 
         spilled_any = 0
         while self._free_regions:
@@ -3287,12 +4159,20 @@ class KVSessionOffloadManager:
                 # replicated restore-readiness state on every rank.
                 slot.suppress_tick = False
                 continue
+            if getattr(slot, "budget_demoted", False) and not getattr(
+                slot, "budget_tick_release", False
+            ):
+                # #236 demoted, drain grace running: liveness is over -- no
+                # further host decode; the session waits for its wave-back
+                # drain and the radix handover. tick_release (grace expiry /
+                # spec host-finish guard) re-allows the ONE finishing tick.
+                continue
             due.append(slot)
         if not due:
             return None
         return min(due, key=lambda s: s.last_tick_iter)
 
-    def maybe_take_tick(self, running_batch) -> Optional["ScheduleBatch"]:
+    def maybe_take_tick(self, running_batch) -> Optional[ScheduleBatch]:
         """Late hook: decide whether THIS iteration runs a spill tick instead
         of the device decode batch, and for WHICH spilled session (round-
         robin). Must be called BEFORE update_running_batch so the device batch
@@ -3325,6 +4205,26 @@ class KVSessionOffloadManager:
         slot = self._pick_tick_slot(running_batch)
         if slot is None:
             return None
+
+        # #236 rate regler: a tick streams the session's WHOLE host tail H2D,
+        # the dominant PCIe consumer of the spill path. In debt -> defer the
+        # tick (throttle, transient by construction -- the bucket refills),
+        # never demote. Demoted sessions on their release tick are exempt
+        # (they must finish and deliver). Coarse per-iteration gate: deferring
+        # the picked slot defers the tick slot as a whole this iteration.
+        # Replicated tail size + uniform bucket -> rank-uniform.
+        if (
+            getattr(self, "_budget_armed", False)
+            and self._budget_bucket is not None
+            and not getattr(slot, "budget_tick_release", False)
+        ):
+            if not self._budget_bucket.ready():
+                self._budget_counters.rate_throttled_ticks += 1
+                return None
+            _r = slot.req
+            _L = len(_r.origin_input_ids) + max(0, len(_r.output_ids) - 1)
+            _tail = max(0, _L - int(getattr(_r, "kv_spill_boundary", 0) or 0))
+            self._budget_bucket.consume(_tail)
 
         if slot.batch is None:
             slot.batch = self._build_spill_batch(slot.req)
@@ -3961,6 +4861,22 @@ class KVSessionOffloadManager:
             "sentinel(s) after restore (rank %d)"
             % (req.rid, L, n_sent, self.dcp_rank)
         )
+        if getattr(self, "_budget_armed", False):
+            self._budget_counters.episodes_restored += 1
+            if slot.budget_demoted:
+                # #236 handover complete: the full row is device-resident;
+                # the capped session finishes on its next device step and the
+                # STOCK finish donates the whole prefix to the radix tree
+                # (HiRadixCache then write-backs per its own policy). The
+                # continuation is a prefix hit -- work kept, liveness gone.
+                self._budget_counters.demotions_drained += 1
+            elif self._budget_cooldown is not None:
+                # (a)/(c) cooldown arms for a LIVE restored session: not a
+                # victim again until it produced progress_lock_tokens outputs
+                # and the time cap passed.
+                self._budget_cooldown.note_restore(
+                    req.rid, len(req.output_ids), self._budget_now
+                )
         self._close_slot(req.req_pool_idx, "restored to device")
         self._log(
             "kv-session-offload RESTORE complete: rid=%s L=%d (rank %d) "
@@ -4174,7 +5090,7 @@ class KVSessionOffloadManager:
 
     # -- finish / cleanup ---------------------------------------------------
 
-    def release_finished_spilled_req(self, req: "Req"):
+    def release_finished_spilled_req(self, req: Req):
         """Finish path for a request that ends WHILE (partially) spilled: its
         row holds host sentinels in the tail [boundary, L) and REAL device
         slots in the retained head [0, boundary). Release the exclusive head
@@ -4211,6 +5127,15 @@ class KVSessionOffloadManager:
         rpi = req.req_pool_idx
         slot = self.spills.get(rpi)
         region = slot.region if slot is not None else -1
+        if getattr(self, "_budget_armed", False):
+            self._budget_counters.episodes_finished_on_host += 1
+            if slot is not None and getattr(slot, "budget_demoted", False):
+                # #236 coarse fallback fired: the demoted session finished on
+                # host before its drain completed. This path donates nothing
+                # (head freed, host tail reclaimed with the region), so the
+                # continuation pays a full re-prefill -- the pre-#236 failure
+                # floor. Counted; demotions_drained is the counterpart.
+                self._budget_counters.demotions_host_finished += 1
         boundary = int(getattr(req, "kv_spill_boundary", 0) or 0)
         protected = int(req.cache_protected_len or 0)
         head_freed = 0
