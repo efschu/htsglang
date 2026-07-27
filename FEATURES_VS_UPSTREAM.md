@@ -444,9 +444,11 @@ not a dynamic per-request spill (partial).
 <a id="f21"></a>
 ### 21. HTCCL cross-vendor collectives
 
-**Feature:** (`SGLANG_HTCCL_TRANSPORT` = `gloo`/`shm`/`device`) vendor-neutral TP collectives that
-never call NCCL/RCCL, so one TP group can mix an NVIDIA and an AMD GPU; the `device` transport
-reduces on-GPU over host-mapped memory and is CUDA-graph capturable.
+**Feature:** (`SGLANG_HTCCL_TRANSPORT` = `gloo`/`shm`/`device`/`ucx`) vendor-neutral TP collectives
+that never call NCCL/RCCL, so one TP group can mix an NVIDIA and an AMD GPU; the `device` transport
+reduces on-GPU over host-mapped memory and is CUDA-graph capturable. The `ucx` transport is the
+cross-**host** data plane (Nordstern L1): same host-staged semantics as `gloo`, RDMA instead of
+TCP.
 
 **Fork status:** Implemented and validated — merged into `integration/r3-probe` (`73679d6b47`,
 `9a10846a82`, plus `feat/htccl-gfx900`'s `aec1308973`). Correctness: known-answer tests per
@@ -461,11 +463,84 @@ assumptions were found and fixed on gfx900 in sequence; the last (`fa5c507476`, 
 `3cc2fc9da5`), **not yet merged**; symmetric decode capture and a separate NVIDIA-side
 prefill-capture assertion remain open.
 
+**`ucx` transport (Nordstern L1) — cross-host RDMA data plane.** One registry entry
+(`TRANSPORT_REGISTRY["ucx"]`) plus `htccl_ucx.py` / `htccl_ucx_bindings.py`; no dispatch site
+changed. Serves `all_reduce`, `all_gather`, `broadcast`, `reduce_scatter`, plus an internal
+`barrier`. Host-staged like `gloo` (GPU -> pinned host -> UCX -> pinned host -> GPU); there is no
+GPUDirect on this hardware, so that is the only path, not a simplification.
+
+*Binding decision — ctypes over `libucp`, not ucx-py/Cython.* The deciding constraint is that
+version parity requires loading a **specific** library path. `ucx-py` bundles or links its own UCX
+(RAPIDS `libucx-*` wheels), which hard-codes one side of the mismatch instead of resolving it, and
+is asyncio-shaped — the wrong control flow for a synchronous collective on the bs=1 decode path.
+Cython needs a compiler and UCX **headers** per host; the second rig has the runtime libraries but
+not the `-dev` package. A subprocess bridge adds an IPC hop to a ~1.5 us path. ctypes needs no
+build step, no headers, and takes the library from `SGLANG_HTCCL_UCX_LIB`. Struct layouts are
+mask-driven and over-allocated, and the transcribed offsets are asserted at import.
+
+*Version parity is enforced, not hoped for.* Mixed UCX releases do not degrade — endpoint creation
+fails with the useless `invalid bandwidth 0.00`. The rendezvous gathers each rank's version over
+the existing gloo `cpu_group` and refuses **before any endpoint exists**, naming every rank's
+version and library path and the `SGLANG_HTCCL_UCX_LIB` remedy.
+
+*Latency shaping.* Default is a single-step full exchange (all receives and sends posted together,
+one round trip at any world size); `all_reduce` switches to a ring above
+`SGLANG_HTCCL_UCX_RING_MIB`. Endpoints are persistent and wired up during construction, so no
+decode step pays a UCX handshake. `handles()` is deliberately **size-independent** (unlike `shm`'s
+slot ceiling) so two ranks can never disagree about whether a collective goes over UCX or gloo.
+
+**Fork status (`ucx`):** Implemented, validated CPU-only on real RDMA — not yet exercised with a
+GPU or a model. Local (single host, UCX `self`/`sm`/`tcp` loopback): 16 tests green across
+world 2/3/4, every collective vs a computed reference, incl. the buffer-aliasing and
+`reduce_scatter dim>=2` traps, forced multi-chunk transfers, and idempotent teardown; the 47
+pre-existing HTCCL tests still pass. **Cross-rig over 40G RoCE** (main rig 10.10.10.1 <-> second
+rig 10.10.10.2, `UCX_TLS=rc` with no TCP fallback, so a pass proves RDMA carried it): all
+collectives green on both ranks; rendezvous + wireup 0.11 s. Throughput, median, per direction
+while the reverse direction runs simultaneously — 8 KiB 35 us / 1.8 Gbit/s, 64 KiB 75 us /
+7.0 Gbit/s, 512 KiB 355 us / 11.8 Gbit/s, **4 MiB 1.61 ms / 20.8 Gbit/s (peak)**, 32 MiB 23.6 ms /
+11.4 Gbit/s; barrier median 12 us, min 9.9 us. Raw link the same day, `ucx_perftest tag_bw`
+unidirectional: 3413 MB/s (~27.3 Gbit/s), so the 4 MiB peak is **~76% of the unidirectional
+budget while moving traffic both ways**. **Two known gaps, both diagnosed:** (a) small-message
+cost is software, not wire — a 12 us barrier against a ~1.5 us link is Python/ctypes per-call
+overhead, already cut roughly in half by memoising staging views and reusing the ctypes request
+struct, and the floor for bs=1 decode until the call path is shortened further; (b) the 32 MiB
+regression vs 4 MiB is CPU-memory-bound, not link-bound — V1 makes four passes over the payload
+(stage in, wire, accumulate, stage out), ~4x32 MiB of host traffic that is not overlapped with the
+wire. Chunked pipelining of D2H against the transfer is the fix and belongs to L2.
+
+*GPU staging end-to-end (TP=2 cross-rig with a real model) is written up but deliberately NOT run
+yet* — see the recipe below.
+
+**Recipe — cross-rig GPU/model bring-up (L1 -> L2, not yet executed).**
+1. *Preconditions.* Same UCX release on both rigs (main rig: `SGLANG_HTCCL_UCX_LIB=/opt/ucx116/lib/libucp.so.0`
+   against the second rig's system 1.16.0); `/dev/infiniband` present in whatever namespace the
+   ranks run in; RoCE port ACTIVE. Note the container CT999 used for development has **no**
+   `/dev/infiniband` and no 10.10.10.x address — GPU ranks must run where both the cards and the
+   NIC are visible, which today means the PVE host or a container configured with both.
+2. *Flags.* `SGLANG_HTCCL=1 SGLANG_HTCCL_TRANSPORT=ucx`, `--nnodes 2 --node-rank {0,1}`,
+   `--dist-init-addr <LAN ip>:<port>` (control plane stays on the 1 GbE LAN; only UCX rides the
+   RoCE link). Per rank: `UCX_TLS=rc,self,sm`, `UCX_IB_GID_INDEX=3`, `UCX_NET_DEVICES=rocep4s0f1:1`
+   (main) / `rocep1s0f1:1` (second).
+3. *`--enforce-eager` is required.* Like `gloo` and `shm`, this transport synchronises with the
+   host inside every collective, so it cannot be inside a CUDA-graph capture. Only the `device`
+   transport is capturable.
+4. *Model geometry.* Same constraint the L0 run hit: `tp_size <= q/kv` units. Qwen3.5-4B cannot do
+   TP=5; for a TP=2 cross-rig smoke test any model that fits one card per rig is fine.
+5. *Expected first failures*, in likelihood order: pinned-buffer registration cost on first
+   collective (the staging buffers are `pin_memory=True` only when the rank's device is CUDA);
+   a rank-uniformity break if any code path issues a collective on one rig and not the other; and
+   the ~12 us/collective software floor showing up as poor decode tok/s — which is a known L2
+   item, not a bug.
+6. *Validation bar.* Byte-identical output vs a solo run on one rig, the same bar the cross-vendor
+   `device` transport had to clear.
+
 **Upstream:** SGLang/vLLM distributed backends are NCCL/RCCL only, never bridged (no).
 llama.cpp/ik_llama.cpp's RPC backend connects heterogeneous backends over TCP (CUDA/Metal/CPU
 confirmed, Vulkan/ROCm **unverified**) but is a backend-delegation/pipeline model, not a collective
 substituting for NCCL within one TP group, and is explicitly "proof-of-concept... fragile" per its
-own README (partial).
+own README (partial). UCX itself is a transport library, not a collective layer; UCC (its
+collective sibling) has no SGLang/vLLM integration and would not solve the vendor-neutrality
+problem this transport exists for (no).
 
 <a id="f22"></a>
 ### 22. fp8 dequant fallback (W8A16)
