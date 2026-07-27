@@ -4438,3 +4438,45 @@ independent and random IDs remain the clean guaranteed-cold prefill input.
 Stranded data point from the cancelled dual-load arm, for the record: stock,
 400 decode tok under parallel cold prefill (57960 tok), reserve 2700 →
 7.35 tok/s decode at 1148.8 tok/s prefill.
+
+# Task #107 follow-up 2 — Q3_K_M single-request trade: the fast path exists and wins
+
+Same question as the FP8 pass, on the quant where the solo-5090 variant is
+real: Qwen3.6-27B Q3_K_M GGUF (12.9 GiB, MTP intact). Both arms CUDA graphs
+on, NEXTN 3/1/4, fp8_e4m3 KV, context 32768, --enable-metrics, one boot per
+arm. Q3 numbers are NOT cross-comparable to the FP8 numbers (different
+quant, different kernel path); the arm-to-arm ratio is the result.
+
+| | S: TP=1 solo 5090 | B: TP=3 uneven DCP |
+|---|---|---|
+| max KV tokens | 155,830 | 655,520 (4.21x) |
+| prefill 20k cold | 6.244 s (3202.8 tok/s) | 18.359 s (1089.4 tok/s) |
+| decode 2400 tok | 98.5 tok/s, 26.47 ms/verify | 74.7 tok/s, 33.92 ms/verify |
+| accept length | 2.609 | 2.534 |
+
+Trade edge: solo gives up 499,690 KV tokens (4.21x) and gets prefill 2.94x,
+decode 1.32x, whole job (20k prefill + 2400 decode) 1.65x faster — 39.8 us
+saved per KV token given up. Accept length is equal; the delta is pure
+compute/collective time, not a spec effect.
+
+Decisive for a SINGLE request at context 32768: solo's 155,830 KV tokens are
+4.75x more than one maximal request can ever occupy — arm B's KV advantage
+is entirely unused. The KV axis only binds at context >~156k or under
+concurrency (at full 32k/request: solo carries 4, TP=3 carries 20; sglang
+additionally clamped solo to max_running_requests=6). Caveat: arm S ran
+mem-fraction 0.82 (0.90 OOMs, see bug below) and proportionally larger
+reserve than arm B — the edge is conservative in B's favour.
+
+Bugs found (ours):
+1. GGUF dequant scratch (2.37 GiB during decode-graph capture) is not
+   counted in the static memory budget — mem-fraction 0.90 OOMs on TP=1.
+2. The OOM surfaces as ColdBuildWindowError with a "a peer may still be in
+   nvcc" hint on a TP=1 boot with no peers; the real torch.OutOfMemoryError
+   is only in the chained traceback. jit_cold_build.py:209 needs a
+   tp_size==1 case split.
+
+API dogfood findings (handed to the dashboard round-2 branch): server_start
+returned an empty body and the server vanished mid-run; the argv builder
+cannot express a GGUF boot (no --load-format/--quantization/--tokenizer-path/
+--rank-auto-reserve-mib); format:"gguf" only rewrites --model-path; the
+payload mapper drops mem_fraction_static and all speculative depth fields.
