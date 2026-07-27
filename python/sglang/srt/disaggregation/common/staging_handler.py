@@ -388,8 +388,20 @@ class DecodeStagingHandler:
                         sock.send_multipart(
                             [b"WATERMARK", wm_round_b, wm_tail_b, sid_b]
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    # A dropped watermark leaves the peer treating the staging
+                    # region as unsafe, which shows up as a stall. Recorded so
+                    # the stall is traceable; the broadcast continues to the
+                    # remaining subscribers.
+                    logger.warning(
+                        "Failed to send WATERMARK (round=%s tail=%s session=%s) "
+                        "for room %s: %s",
+                        wm_round,
+                        wm_tail,
+                        session_id,
+                        room,
+                        e,
+                    )
 
 
 def is_watermark_ready(
@@ -809,8 +821,21 @@ def handle_staging_req(
                             session_id.encode("ascii"),
                         ]
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                # Without the response the prefill side never learns where to
+                # stage this chunk and waits for its timeout. Recorded so the
+                # stall is traceable to its cause.
+                logger.warning(
+                    "Failed to send STAGING_RSP for room %s chunk %s "
+                    "(offset=%s round=%s end=%s session=%s): %s",
+                    room,
+                    chunk_idx,
+                    offset,
+                    rnd,
+                    end,
+                    session_id,
+                    e,
+                )
 
 
 def prefetch_staging_reqs(

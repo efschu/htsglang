@@ -466,8 +466,19 @@ class MooncakeKVManager(CommonKVManager):
                     str(prefill_unique_rank).encode("ascii"),
                 ]
             )
-        except Exception:
-            pass
+        except Exception as e:
+            # The RDMA write for this chunk landed but decode was not told.
+            # Decode falls back to its own timeout; the send is not retried
+            # here. Record it so the resulting stall is traceable to its cause
+            # instead of appearing as an unexplained hang.
+            logger.warning(
+                "Failed to send CHUNK_READY for room %s chunk %s to %s:%s: %s",
+                req.room,
+                chunk_idx,
+                req.endpoint,
+                req.dst_port,
+                e,
+            )
 
     def _do_staging_transfer(
         self,
