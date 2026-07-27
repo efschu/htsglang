@@ -1753,6 +1753,25 @@ class ModelRunnerKVCacheMixin:
                 f"{host_pool.size} tokens < requested "
                 f"{self._wl_spill_host_tokens}."
             )
+        # #127 GRENZ-ASSERTION. Every host<->device move on this tier is a raw
+        # byte copy driven by host_pool.token_stride_size; nothing downstream
+        # re-derives the element type. A host tier built from a different
+        # dtype than the device pool would therefore NOT fail -- it would
+        # reinterpret KV bytes at the wrong stride and return plausible
+        # garbage. That seam was theoretical while one dtype was group-wide;
+        # with per-role precision it is not. Check it once, here, where both
+        # objects exist.
+        from sglang.srt.layers.dcp.role_kv_dtype import host_tier_stride_mismatch
+
+        _mismatch = host_tier_stride_mismatch(
+            device_store_itemsize=full_pool.store_dtype.itemsize,
+            device_head_num=full_pool.head_num,
+            device_head_dim=full_pool.head_dim,
+            host_itemsize=host_pool.dtype.itemsize,
+            host_token_stride_size=host_pool.token_stride_size,
+        )
+        if _mismatch is not None:
+            raise ValueError(f"weightless-KV host spill: {_mismatch}")
         self.wl_spill_host_pool = host_pool
         logger.info(
             "Weightless-KV host spill (B1): attached %d-token pinned host "
@@ -1942,6 +1961,16 @@ class ModelRunnerKVCacheMixin:
         whole split-placement path keeps the per-rank shard -> byte-identical.
         """
         if self.is_draft_worker and getattr(self, "is_draft_solo_host", False):
+            return self.model_config.get_total_num_kv_heads()
+        # EXCEPTION -- weightless-KV fast lane: identical reasoning. The head
+        # rank builds its model under the same weight-TP=1 override and
+        # broadcasts the FULL total_num_kv_heads each step; every rank writes
+        # all of them into its owned token slots. The HYBRID pool site already
+        # spells this out inline (`_hybrid_kv_head_num`); stating it here too
+        # keeps the plain-MHA pool (non-hybrid models on the lane) from being
+        # shaped for a per-rank shard the broadcast would not match. The lane
+        # hard-rejects speculative decoding, so no draft pool can reach this.
+        if not self.is_draft_worker and weightless_kv_active():
             return self.model_config.get_total_num_kv_heads()
         return self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
 
@@ -3339,6 +3368,7 @@ class ModelRunnerKVCacheMixin:
             and get_world_group().world_size > 1
         )
         if needs_capacity_sync:
+            local_capacity = int(token_capacity)
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,
@@ -3346,6 +3376,29 @@ class ModelRunnerKVCacheMixin:
                 group=get_world_group().cpu_group,
             )
             token_capacity = tensor.item()
+            # #127 sizing evidence. Under the even-modulo owner rule the slot
+            # space is rank-uniform, so this MIN is what turns per-rank
+            # budgets into ONE capacity: the group gets dcp_size x the
+            # SMALLEST rank's token capacity, and every other rank's surplus
+            # slots are stranded. Anyone changing a rank's per-token bytes
+            # (e.g. --weightless-kv-worker-cache-dtype fp8_e5m2) needs to know
+            # whether THIS rank is the one that binds -- otherwise the change
+            # buys nothing. Each rank logs its own line; the binding rank is
+            # the one whose local == agreed.
+            agreed = int(token_capacity)
+            stranded = local_capacity - agreed
+            logger.info(
+                "KV token sizing: rank %d local capacity %d tokens, "
+                "min-reduced across ranks to %d (%s; %d stranded on this "
+                "rank). Global addressable KV = %d x dcp_size(%d).",
+                self.tp_rank,
+                local_capacity,
+                agreed,
+                "THIS RANK BINDS" if stranded == 0 else "another rank binds",
+                stranded,
+                agreed,
+                self.dcp_size,
+            )
 
         token_capacity = self._apply_hybrid_kv_token_cap(
             token_capacity, hybrid_cap, hybrid_cap_kind

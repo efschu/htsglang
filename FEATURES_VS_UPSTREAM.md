@@ -328,7 +328,12 @@ verify-sync/graph-pad work is documented (no).
 shared name) a meta-device worker holds only KV cache and attention while a separate head holds
 the weights.
 
-**Fork status:** Implemented — chunked prefill and graph-decode paths in place.
+**Fork status:** Implemented — chunked prefill and graph-decode paths in place. Includes per-ROLE
+KV storage precision (`--weightless-kv-worker-cache-dtype`, opt-in, default off): the weightless
+workers can hold their KV token-shard in fp8 while the head keeps its own format, since KV bytes
+cross the role boundary only in the model compute dtype. Whether that buys capacity depends on
+which rank binds the min-reduced token budget — the boot log names it (see
+`docs_new/weightless_kv_role_precision.md`).
 
 **Upstream:** no equivalent found in SGLang, vLLM, llama.cpp, or ik_llama.cpp.
 

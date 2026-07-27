@@ -394,9 +394,28 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # owned token slots, so per-token bytes reflect the FULL kv-head
             # count, not this rank's uneven projection share. Stock paths keep
             # the per-rank get_num_kv_heads(tp_size).
-            from sglang.srt.distributed.utils import uneven_dcp_kv_replicated
+            # Weightless-KV fast lane: SAME geometry, different trigger. The
+            # head rank projects the FULL kv-heads (weight-TP=1 override) and
+            # broadcasts them; every rank -- head and weightless worker alike
+            # -- writes all total_num_kv_heads into its owned token slots, so
+            # the pool is built at get_total_num_kv_heads() (see
+            # model_runner_kv_cache_mixin's `_hybrid_kv_head_num` and
+            # `_pool_kv_head_num`). The lane runs with rank_tp_ratio=None, so
+            # uneven_dcp_kv_replicated() is False and this cell would
+            # otherwise be charged the ÷attn_tp_size per-rank share -- i.e.
+            # UNDER-charged by total_kv/get_num_kv_heads(tp), inflating
+            # max_total_num_tokens by the same factor and sizing the pool
+            # past the rank's budget. Add the lane explicitly so the profile
+            # math and the allocation agree.
+            from sglang.srt.distributed.utils import (
+                uneven_dcp_kv_replicated,
+                weightless_kv_active,
+            )
 
-            if uneven_dcp_kv_replicated(get_parallel().attn_dcp_size):
+            if (
+                uneven_dcp_kv_replicated(get_parallel().attn_dcp_size)
+                or weightless_kv_active()
+            ):
                 num_kv_heads_cell = model_config.get_total_num_kv_heads()
             else:
                 num_kv_heads_cell = model_config.get_num_kv_heads(tp_size)

@@ -2911,7 +2911,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def configure_kv_cache_dtype(self):
-        if self.server_args.kv_cache_dtype == "auto":
+        # #127 per-ROLE KV precision (weightless-KV lane): a weightless WORKER
+        # rank may store its KV token-shard at a different precision than the
+        # head rank, because the two roles spend their VRAM on completely
+        # different things (worker = KV only, head = weights + KV). This
+        # resolves to a SPEC STRING that is fed through the one existing
+        # branch chain below -- there is no second resolver that could drift
+        # from it. Unset / "auto" / non-lane / head rank -> identity, so the
+        # default path and every existing lane boot are byte-identical.
+        from sglang.srt.layers.dcp.role_kv_dtype import effective_kv_cache_dtype_spec
+
+        kv_spec = effective_kv_cache_dtype_spec(
+            self.server_args.kv_cache_dtype,
+            getattr(self.server_args, "weightless_kv_worker_cache_dtype", None),
+            bool(getattr(self, "is_weightless_worker", False)),
+        )
+        if kv_spec != self.server_args.kv_cache_dtype:
+            logger.info(
+                "Weightless-KV worker rank %d: per-role KV storage dtype "
+                "'%s' (group-wide --kv-cache-dtype is '%s'). This rank's KV "
+                "pool, its per-token cell size and any host overflow tier all "
+                "follow the role dtype; the cross-rank K/V broadcast is "
+                "unaffected (it travels in the model compute dtype).",
+                self.tp_rank,
+                kv_spec,
+                self.server_args.kv_cache_dtype,
+            )
+
+        if kv_spec == "auto":
             quant_config = getattr(self.model, "quant_config", None)
             kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
             if (
@@ -2924,19 +2951,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             else:
                 self.kv_cache_dtype = self.dtype
-        elif self.server_args.kv_cache_dtype == "fp8_e5m2":
+        elif kv_spec == "fp8_e5m2":
             if _is_hip:  # Using natively supported format
                 self.kv_cache_dtype = fp8_dtype
             else:
                 self.kv_cache_dtype = torch.float8_e5m2
-        elif self.server_args.kv_cache_dtype == "fp8_e4m3":
+        elif kv_spec == "fp8_e4m3":
             if _is_hip:  # Using natively supported format
                 self.kv_cache_dtype = fp8_dtype
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
-        elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
+        elif kv_spec in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
-        elif self.server_args.kv_cache_dtype == "fp4_e2m1":
+        elif kv_spec == "fp4_e2m1":
             if hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
                 logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
@@ -2946,9 +2973,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 self.kv_cache_dtype = self.dtype
         else:
-            raise ValueError(
-                f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
-            )
+            raise ValueError(f"Unsupported kv_cache_dtype: {kv_spec}.")
 
         # DFLASH: fa4 draft attention can't read the target's fp8 KV (needs K.dtype == Q.dtype),
         # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target dtype.
@@ -3649,8 +3674,49 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             m for m in self.model.modules() if isinstance(m, RadixAttention)
         ]
         layers.sort(key=lambda a: a.layer_id)
+        self._wl_verify_role_kv_scales(layers)
         self._wl_attn_layers_cache = layers
         return layers
+
+    def _wl_verify_role_kv_scales(self, layers):
+        """#127 GRENZ-ASSERTION for per-ROLE KV precision (once per process).
+
+        A worker quantizes its KV shard with the scales carried by its OWN
+        (meta-device) attention modules, while the head quantizes with the
+        scales carried by the real weights. Those are the same number only as
+        long as both are the untrained default (None / 1.0). If a checkpoint
+        or a scale file ever put a non-unit scale on one role's layers, the
+        two roles' shards would sit on different scales and the LSE merge
+        would silently combine incomparable partial attentions -- no shape,
+        dtype or NCCL check would notice. server_args refuses the known
+        source of that (--quantization-param-path); this catches any other
+        route at the point where the layers first exist.
+
+        Only runs when a role split is actually configured; on the inherited
+        path (default) it is a no-op.
+        """
+        from sglang.srt.layers.dcp.role_kv_dtype import worker_dtype_is_role_split
+
+        if not worker_dtype_is_role_split(
+            self.server_args.kv_cache_dtype,
+            getattr(self.server_args, "weightless_kv_worker_cache_dtype", None),
+        ):
+            return
+        for layer in layers:
+            for name in ("k_scale_float", "v_scale_float"):
+                scale = getattr(layer, name, None)
+                if scale is None or float(scale) == 1.0:
+                    continue
+                raise ValueError(
+                    "--weightless-kv-worker-cache-dtype is active, but "
+                    f"attention layer {layer.layer_id} on this weightless "
+                    f"worker carries a non-unit {name}={float(scale)}. The "
+                    "head rank scales its own KV shard independently, so the "
+                    "two roles would quantize against different scales and "
+                    "the cross-rank LSE merge would combine incomparable "
+                    "partials. Drop the per-role KV dtype and use the "
+                    "group-wide --kv-cache-dtype for this checkpoint."
+                )
 
     def _forward_weightless_worker(
         self, forward_batch: ForwardBatch
