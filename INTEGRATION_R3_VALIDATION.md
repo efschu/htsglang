@@ -4499,3 +4499,35 @@ swapped between arms in the original runs, so it is not an arm effect.
 Process note: pgrep -f "sglang.launch_server" hit the agent's own shell
 during teardown (documented self-kill trap, second occurrence today); fixed
 by separating kill and boot into distinct calls and filtering own PID.
+
+# Coexistence test PD(TP=1) + MAIN(TP=3), Q3_K_M 27B — DOES NOT FIT on this rig
+
+Verdict: both instances together are not bootable; the 5090 is the binding
+limit and no reserve value threads between the two failure modes (bracket
+< ~500 MiB on both sides). Load phases were not measured.
+
+Numbers: PD footprint on-GPU is ~25.3 GiB at the KV floor (2 slots x 16k) —
+~1.55x the 13.2-GiB GGUF file; weights+context dominate, KV head-room is
+only ~0.7 GiB, so PD cannot be shrunk. Remaining on the 5090 for MAIN rank0:
+7.3 GiB; rank0 actually needs ~6.6 GiB against a 4.3-GiB budget (CUDA
+context + graphs + activations are not covered by --rank-auto-reserve-mib).
+Capping the 5090 harder (30300) shifts the OOM to a 3080: the capacity-based
+split fills the 3080s' budget with KV, then the separate draft process adds
+3.34 GiB on top. Untested candidate: 29300,7000,7000 (cap the 3080s too);
+driver scripts ready under /tmp/coex/, measurement itself ~5 min.
+PD as TP=1 is the CHEAPER case than the requested TP=2 (one rank overhead,
+not two) — "does not fit" holds a fortiori.
+
+Traps found (all reproduced):
+1. mem_fraction_static is a fraction of FREE memory at boot
+   (model_runner_kv_cache_mixin.py:329) — LOWERING it on OOM increases the
+   slack and makes it worse. Runbook updated in this commit.
+2. Orphaned sglang::scheduler_TP* keep 5-11 GiB per card after the parent
+   dies and do NOT appear in pgrep -af launch_server; only
+   nvidia-smi --query-compute-apps finds them.
+3. Surviving ranks wedge instead of dying: after a peer OOMs, TP0 hangs in
+   all_reduce via unified_radix_cache._all_reduce_attn_groups
+   (drain_storage_control_queues) — the documented local-condition-before-
+   group-collective family, new site.
+4. A running instance is not protected against a second instance's OOM: the
+   PD server died collaterally without its own traceback.

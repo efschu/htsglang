@@ -318,3 +318,20 @@ Several agents share this box; the cards are usually contended.
 - **Time-box GPU runs** (10-20 s of measurement is the default), prefill the
   intended operating point instead of growing into it, and justify sample
   counts against a measured noise floor before claiming a difference.
+
+## Memory-sizing traps (added 2026-07-28)
+
+- `--mem-fraction-static` is a fraction of the GPU memory that is FREE at
+  boot, not of the total: the code computes a slack of
+  `free * (1 - fraction)` and gives the rest to the model+KV. On a busy or
+  shared card, LOWERING the fraction increases the slack and makes an OOM
+  worse. To leave room for a co-resident process, RAISE the fraction is
+  wrong too — size with `--rank-auto-reserve-mib` (absolute) instead.
+- `--rank-auto-reserve-mib` does not cover a rank's CUDA context, CUDA
+  graphs, or activation workspace (~2.3 GiB measured on a 27B-Q3 rank0),
+  nor a separate speculative-draft process (~3.3 GiB measured). Budget them
+  explicitly on every card that carries either.
+- After killing a `launch_server` parent, check
+  `nvidia-smi --query-compute-apps=pid,used_memory` for orphaned
+  `sglang::scheduler_TP*` processes — they hold 5-11 GiB per card and do
+  not match `pgrep -af launch_server`. Kill them by PID.
