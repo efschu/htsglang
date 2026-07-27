@@ -233,16 +233,23 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
             pass
         torch.distributed.barrier()
 
+        # The unlink above only clears a lock that was already there when this
+        # group started; a builder killed AFTER the barrier leaves a new one,
+        # and every later process then waits on it forever. The guard bounds
+        # that wait. See sglang.jit_kernel.baton_health.
+        from sglang.jit_kernel.baton_health import jit_build_guard
+
         nccl_allocator_libname = "nccl_allocator"
-        lib_path = torch.utils.cpp_extension.load_inline(
-            name=nccl_allocator_libname,
-            cpp_sources=nccl_allocator_source,
-            with_cuda=True,
-            extra_ldflags=["-lnccl"],
-            verbose=True,
-            is_python_module=False,
-            build_directory=out_dir,
-        )
+        with jit_build_guard(nccl_allocator_libname, build_directory=out_dir):
+            lib_path = torch.utils.cpp_extension.load_inline(
+                name=nccl_allocator_libname,
+                cpp_sources=nccl_allocator_source,
+                with_cuda=True,
+                extra_ldflags=["-lnccl"],
+                verbose=True,
+                is_python_module=False,
+                build_directory=out_dir,
+            )
         nccl_allocator_lib = ctypes.CDLL(lib_path)
         _allocator = CUDAPluggableAllocator(
             f"{out_dir}/{nccl_allocator_libname}.so",
