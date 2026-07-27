@@ -12,10 +12,16 @@ that succeeds: weights load, pools are sized, graphs are captured, the server
 reports ready. The user pays the whole model load to learn about a
 configuration error that is decidable from ``server_args`` alone.
 
-``NGRAMWorker.__init__`` is the earliest site that knows both facts (this is
-the ngram algorithm; this is the DCP size), so the refusal is stated there,
-by name, the way its siblings are: ``reject_unsupported_dcp_geometry`` in the
-Triton backend and ``reject_silently_inert_dcp`` in the flashinfer one.
+Both facts (this is the ngram algorithm; this is the DCP size) are already
+known at argument resolution, so the primary refusal lives in
+``ServerArgs._handle_dcp_validation`` (#229, covered by
+``test/registered/unit/server_args/test_spec_dcp_boot_reject.py``) and fires
+before any weights load. ``NGRAMWorker.__init__`` repeats the call as a
+backstop for directly constructed workers, named the way its siblings are:
+``reject_unsupported_dcp_geometry`` in the Triton backend and
+``reject_silently_inert_dcp`` in the flashinfer one. The gate function itself
+lives in ``spec_info``, next to the ``SpecInputType`` membership it reasons
+about.
 
 WHY ``dcp_size > 1`` AND NOT ``uneven_dcp``
 -------------------------------------------
@@ -37,6 +43,10 @@ So ``dcp_size > 1`` is the exact reachable condition, not a widening of it.
 """
 
 import unittest
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class TestNgramDcpBootReject(unittest.TestCase):
@@ -79,6 +89,24 @@ class TestNgramDcpBootReject(unittest.TestCase):
             "the DCP refusal must fire before the corpus is allocated",
         )
 
+    def test_the_frozen_worker_backstop_calls_its_gate(self):
+        """Same shape for FROZEN_KV_MTP (#229): primary gate in ServerArgs,
+        backstop as the first statement of the worker orchestrator's
+        ``__init__``, before the draft worker is built."""
+        import inspect
+
+        from sglang.srt.speculative import frozen_kv_mtp_worker_v2
+
+        src = inspect.getsource(
+            frozen_kv_mtp_worker_v2.FrozenKVMTPWorkerV2.__init__
+        )
+        self.assertIn("reject_frozen_kv_mtp_verify_under_dcp(", src)
+        self.assertLess(
+            src.index("reject_frozen_kv_mtp_verify_under_dcp("),
+            src.index("FrozenKVMTPDraftWorker("),
+            "the DCP refusal must fire before the draft worker is built",
+        )
+
     def test_the_late_detection_this_replaces_is_still_the_backstop(self):
         """Pin WHY the gate exists, so it cannot be deleted as redundant.
 
@@ -98,11 +126,12 @@ class TestNgramDcpBootReject(unittest.TestCase):
         """Every ``*_VERIFY`` type is served by the split or gated at boot.
 
         Four types end in ``_VERIFY``. Two (EAGLE, DFLASH) are served. NGRAM is
-        gated by ``reject_ngram_verify_under_dcp``. FROZEN_KV_MTP is the ONE
-        remaining hole and is pinned as such deliberately: it has the identical
-        late-detection shape (excluded from the set, no boot gate anywhere in
-        the tree), and closing it belongs to the frozen-KV-MTP worker, not
-        here. If that gate is ever added, this test is where it gets recorded.
+        gated by ``reject_ngram_verify_under_dcp`` and FROZEN_KV_MTP by
+        ``reject_frozen_kv_mtp_verify_under_dcp`` (#229 closed the last
+        late-detection hole; both gates fire in
+        ``ServerArgs._handle_dcp_validation``). If a fifth verify layout is
+        added, this test is where its DCP story gets recorded: served by the
+        split, or gated at boot.
         """
         import sglang.srt.layers.attention.triton_backend as tb
         from sglang.srt.speculative.spec_info import SpecInputType
@@ -122,9 +151,11 @@ class TestNgramDcpBootReject(unittest.TestCase):
             "serves it, and gate it at boot if not",
         )
         served = tb._DCP_VERIFY_SPEC_INPUT_TYPES
-        gated_at_boot = {SpecInputType.NGRAM_VERIFY}
-        known_late_only = {SpecInputType.FROZEN_KV_MTP_VERIFY}
-        self.assertEqual(verify_types, served | gated_at_boot | known_late_only)
+        gated_at_boot = {
+            SpecInputType.NGRAM_VERIFY,
+            SpecInputType.FROZEN_KV_MTP_VERIFY,
+        }
+        self.assertEqual(verify_types, served | gated_at_boot)
 
 
 if __name__ == "__main__":

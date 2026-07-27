@@ -74,7 +74,10 @@ from sglang.srt.speculative.frozen_kv_mtp_utils import (
     set_frozen_kv_positions,
     target_kv_pool_view,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_info import (
+    SpeculativeAlgorithm,
+    reject_frozen_kv_mtp_verify_under_dcp,
+)
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_topk,
@@ -702,6 +705,12 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        # DCP GATE -- see reject_frozen_kv_mtp_verify_under_dcp (spec_info).
+        # The primary call site is ServerArgs._handle_dcp_validation, which
+        # refuses at argument resolution, before any weights load. This call
+        # is the backstop for directly constructed workers; first statement
+        # of __init__ on purpose.
+        reject_frozen_kv_mtp_verify_under_dcp(getattr(server_args, "dcp_size", 1))
         # NOTE: intentionally does NOT call EAGLEWorkerV2.__init__ -- that builds
         # an EagleDraftWorker (with its own draft KV pool). The frozen draft owns
         # no KV, so we mirror the relevant setup and build a FrozenKVMTPDraftWorker.

@@ -300,6 +300,92 @@ class SpecInputType(IntEnum):
     NGRAM_VERIFY = auto()
 
 
+def reject_ngram_verify_under_dcp(dcp_size: int) -> None:
+    """Boot gate: NGRAM speculation has no DCP-aware target-verify build.
+
+    ``NGRAM_VERIFY`` is deliberately outside both backends'
+    ``_DCP_VERIFY_SPEC_INPUT_TYPES`` (#180.3): the M4 verify split assumes a
+    uniform ``draft_token_num`` query block per request over a LINEAR draft
+    chain, and an ngram draft is a corpus-matched TREE whose breadth comes
+    from ``--speculative-ngram-{min,max}-bfs-breadth``. That exclusion is
+    correct and stays.
+
+    Both backends refuse the combination LOUDLY, so nothing is ever computed
+    wrong -- but both refuse in the target-verify METADATA BUILD, i.e. at the
+    first verify step of the first request, after the full weight load. The
+    condition is decidable from ``server_args`` alone, so the primary call
+    site is ``ServerArgs._handle_dcp_validation`` -- argument resolution, in
+    the launcher, before anything is loaded. ``NGRAMWorker.__init__`` repeats
+    the call as a backstop for directly constructed workers.
+
+    ``dcp_size > 1`` is the exact reachable condition, not a widening of it:
+
+    * Triton's target-verify arm gates on ``self.dcp_size > 1`` and raises
+      ``NotImplementedError`` for any spec input type outside the set -- even
+      and uneven DCP alike, because either way the pool rows are compact while
+      the non-DCP verify metadata builds GLOBAL allocator ids.
+    * flashinfer's split is an ``elif`` on ``uneven_dcp`` AND membership, so an
+      ngram verify misses it and drops into the generic spec branch, which
+      leaves ``use_ragged`` False while ``_forward_extend_dcp`` runs the ragged
+      stage unconditionally -> ``AttributeError`` (the shape DFLASH verify hit
+      before it joined the set). Its even-DCP case cannot arise:
+      ``reject_silently_inert_dcp`` already refuses a ``--dcp-size`` this
+      backend would ignore.
+
+    ``dcp_size <= 1`` is inert, which is what keeps every stock boot untouched.
+    """
+    if dcp_size <= 1:
+        return
+    raise ValueError(
+        f"Speculative algorithm 'ngram' cannot run under --dcp-size {dcp_size}: "
+        "NGRAM_VERIFY is not one of the target-verify layouts the decode-context-"
+        "parallel verify split serves (EAGLE_VERIFY, DFLASH_VERIFY). The split "
+        "assumes a uniform draft-token query block per request over a LINEAR "
+        "draft chain, while an ngram draft is a corpus-matched tree; reading the "
+        "committed prefix the non-DCP way would dereference GLOBAL allocator ids "
+        "against a compact token-sharded pool. Use --dcp-size 1, or a chain "
+        "speculative algorithm (eagle / mtp with --speculative-eagle-topk 1)."
+    )
+
+
+def reject_frozen_kv_mtp_verify_under_dcp(dcp_size: int) -> None:
+    """Boot gate: FROZEN_KV_MTP has no DCP-aware target-verify build.
+
+    Same late-detection shape as ``reject_ngram_verify_under_dcp``, one door
+    over: ``FROZEN_KV_MTP_VERIFY`` is outside both backends'
+    ``_DCP_VERIFY_SPEC_INPUT_TYPES``, so under any ``dcp_size > 1`` the first
+    target-verify metadata build refuses it (Triton raises
+    ``NotImplementedError`` explicitly; flashinfer's verify split misses the
+    type and fails in the ragged stage) -- after the weights are loaded, the
+    pools are sized and the graphs are captured.
+
+    The exclusion itself is structural, not an oversight in the set: the
+    frozen draft reads the TARGET's KV cache in place (it owns no draft KV
+    pool), and decode context parallelism shards that cache by token across
+    the DCP ranks, so no single rank holds the rows the draft dereferences.
+    Serving FROZEN_KV_MTP under DCP would need a DCP-aware draft read on top
+    of the verify-split membership, which is why closing the gap is not a
+    one-line set addition.
+
+    Primary call site is ``ServerArgs._handle_dcp_validation`` (argument
+    resolution, before any load); ``FrozenKVMTPWorkerV2.__init__`` repeats the
+    call as a backstop for directly constructed workers. ``dcp_size <= 1``
+    is inert, which keeps every stock boot untouched.
+    """
+    if dcp_size <= 1:
+        return
+    raise ValueError(
+        f"Speculative algorithm 'FROZEN_KV_MTP' cannot run under --dcp-size "
+        f"{dcp_size}: FROZEN_KV_MTP_VERIFY is not one of the target-verify "
+        "layouts the decode-context-parallel verify split serves (EAGLE_VERIFY, "
+        "DFLASH_VERIFY), and the frozen draft reads the target KV cache in "
+        "place, which decode context parallelism shards by token across ranks "
+        "-- no single rank holds the rows the draft would read. Use --dcp-size "
+        "1, or a chain speculative algorithm that owns its draft KV (eagle / "
+        "mtp with --speculative-eagle-topk 1)."
+    )
+
+
 class SpecInput(ABC):
     # Per-request verify lengths for the ragged-verify graphs (see
     # sglang.srt.speculative.ragged_verify); verify inputs of algorithms with

@@ -1030,8 +1030,10 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                     gpu_buffer = torch.empty(
                         total_bytes, dtype=torch.uint8, device=f"cuda:{self.gpu_id}"
                     )
-                    self.embeddings_engine.register(
-                        gpu_buffer.data_ptr(), gpu_buffer.nbytes
+                    self.embeddings_engine.register_checked(
+                        gpu_buffer.data_ptr(),
+                        gpu_buffer.nbytes,
+                        f"the GPU landing buffer of request {self.rid}",
                     )
                     self.embeddings_buffer = gpu_buffer
                     buffer_address = gpu_buffer.data_ptr()
@@ -1237,7 +1239,11 @@ class MooncakeEmbeddingPool:
             size_bytes, dtype=torch.uint8, device=f"cuda:{gpu_id}"
         )
         self.base = self.buffer.data_ptr()
-        self.engine.register(self.base, self.buffer.nbytes)
+        # The pool is the landing area for every pooled RDMA transfer; a
+        # failed registration must fail construction, not the first read.
+        self.engine.register_checked(
+            self.base, self.buffer.nbytes, "the embedding pool buffer"
+        )
         self._segments_free: List[Tuple[int, int]] = [(0, size_bytes)]
         self._inflight: Dict[int, Tuple[int, int]] = {}
         self._next_slot_id = 0
@@ -1902,9 +1908,10 @@ class MMReceiverBase(ABC):
         )
         gpu_id = getattr(self.scheduler, "gpu_id", 0)
         embeddings = torch.empty(total_bytes, dtype=torch.uint8, device=gpu_id)
-        self.embeddings_engine.register(
+        self.embeddings_engine.register_checked(
             embeddings.data_ptr(),
             embeddings.nbytes,
+            f"the embedding buffer of request {req_id}",
         )
         self.embeddings_buffer[req_id] = embeddings
         return embeddings.data_ptr()
