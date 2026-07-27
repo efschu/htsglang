@@ -13,12 +13,18 @@ No GPU, no distributed init: layer classes accept explicit
 tp_rank/tp_size; `sgl_kernel` is stubbed out before the sglang imports.
 """
 
+import importlib.util
 import sys
 import types
 import unittest
 
 
 def _install_sgl_kernel_stub():
+    if importlib.util.find_spec("sgl_kernel") is not None:
+        # The real package is importable; stubbing it here would leave a
+        # process-wide empty-__path__ package that breaks every later
+        # ``import sgl_kernel.<submodule>`` in the same pytest run.
+        return
     def _make(name, pkg=False):
         mod = types.ModuleType(name)
         if pkg:
@@ -45,7 +51,6 @@ from sglang.srt.distributed.utils import (  # noqa: E402
     set_tp_partition_ratios,
     tp_loaded_shard_start,
     tp_partition_offset,
-    tp_partition_size,
     tp_partition_sizes,
     tp_plan_active,
 )

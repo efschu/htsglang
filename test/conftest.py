@@ -32,3 +32,22 @@ def pytest_collection_finish(session):
     torch = sys.modules.get("torch")
     if torch is not None and hasattr(torch, "set_default_device"):
         torch.set_default_device(None)
+
+
+def pytest_collectstart(collector):
+    """Reset the torch default device between collection steps as well.
+
+    The module-scope ``set_default_device`` described above pollutes not only
+    the tests that run later but also the *collection imports* of every file
+    collected after it: a module whose import chain constructs a tensor (e.g.
+    ``compressed_tensors``' nvfp4 helpers, reached through
+    ``sglang.srt.layers.quantization``) dies with ``No CUDA GPUs are
+    available`` before ``pytest_collection_finish`` ever runs.  Which files
+    are hit is a function of import-cache state, so adding a test file or
+    making an import lazy can create new victims.  Resetting at every
+    collector keeps collection imports on pristine state; the reset is a
+    no-op when nothing leaked.
+    """
+    torch = sys.modules.get("torch")
+    if torch is not None and hasattr(torch, "set_default_device"):
+        torch.set_default_device(None)

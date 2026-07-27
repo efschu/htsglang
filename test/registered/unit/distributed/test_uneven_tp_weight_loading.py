@@ -15,6 +15,7 @@ tp_rank/tp_size, and `sgl_kernel` (not installed in the CPU test env) is
 stubbed out before the sglang imports.
 """
 
+import importlib.util
 import sys
 import types
 import unittest
@@ -23,6 +24,11 @@ from unittest.mock import patch
 
 
 def _install_sgl_kernel_stub():
+    if importlib.util.find_spec("sgl_kernel") is not None:
+        # The real package is importable; stubbing it here would leave a
+        # process-wide empty-__path__ package that breaks every later
+        # ``import sgl_kernel.<submodule>`` in the same pytest run.
+        return
     """The quantization package imports sgl_kernel at module scope; the
     CPU test environment does not have it. Provide inert stubs."""
 

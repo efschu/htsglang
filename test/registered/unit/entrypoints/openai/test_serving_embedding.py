@@ -43,7 +43,13 @@ class _SglKernelMockFinder(importlib.abc.MetaPathFinder):
         return None
 
 
-if "sgl_kernel" not in sys.modules:
+if (
+    "sgl_kernel" not in sys.modules
+    and importlib.util.find_spec("sgl_kernel") is None
+):
+    # Only hijack sgl_kernel.* when the real package is genuinely absent:
+    # the finder stays on sys.meta_path for the rest of the pytest process
+    # and would otherwise feed MagicMocks to every later sgl_kernel import.
     sys.meta_path.insert(0, _SglKernelMockFinder())
 
 from fastapi import Request

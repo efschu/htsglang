@@ -14,6 +14,7 @@ No GPU, no distributed init: collectives and parallel groups are
 patched; `sgl_kernel` is stubbed before the sglang imports.
 """
 
+import importlib.util
 import sys
 import types
 import unittest
@@ -22,6 +23,11 @@ from unittest.mock import patch
 
 
 def _install_sgl_kernel_stub():
+    if importlib.util.find_spec("sgl_kernel") is not None:
+        # The real package is importable; stubbing it here would leave a
+        # process-wide empty-__path__ package that breaks every later
+        # ``import sgl_kernel.<submodule>`` in the same pytest run.
+        return
     def _make(name, pkg=False):
         mod = types.ModuleType(name)
         if pkg:
