@@ -856,6 +856,15 @@ class MoEExpertOffloadCache:
         R = self.resident_count
         pool_index = self._spill_pool_index  # None => static layout (id - R)
         moved = 0
+        # Write-after-read: the scratch slots this fetch overwrites are still
+        # being READ by the previous wave's grouped-GEMM, which was enqueued on
+        # the compute stream. Without this the copy stream can overtake that
+        # GEMM and swap an expert's weights out from under it -- silently wrong
+        # output, and timing-dependent, so it only shows up once waves get long
+        # enough for the copies to win the race (expert-major waves do; the
+        # short token-major waves happened not to). The join below covers the
+        # other direction (compute must not read before the copy lands).
+        self._stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._stream):
             for attr, spill in self._pinned.items():
                 dst = self._resident[attr]
