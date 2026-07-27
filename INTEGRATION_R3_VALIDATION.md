@@ -2561,3 +2561,89 @@ the two effects in-build.
 Merge stack (all branches rebased, pairwise intel recorded), #119-A/B, the
 integrated arm-E / determinism / 27B-working-arm closing boots, #143 R4/R5,
 #197, the `available == dcp_size x total` residual.
+
+# Window 4 -- Phase 1: fix verification (`fix/mixed-arch-norm-and-guards`)
+
+Branch tip `ef6f8bc0a2`, parent = this doc's own commit `f20624c868`, so every
+A/B below is the three fix commits ALONE -- no worktree drift. Rig1 solo, all
+boots torn down by their own PID, GPUs verified empty between arms.
+
+## Result table
+
+| # | check | expected | observed | verdict |
+|---|---|---|---|---|
+| a | stale CuTe / tvm-ffi cache | purge needed | `/tmp/root/cutlass_python_cache` already empty; 0 tvm-ffi dirs with `build.ninja` and no `.so` | nothing to purge |
+| b | **Llama-3.1-8B TP=3, NO `--rank-gpu-id`, bf16** | boots (was `cudaErrorNoKernelImageForDevice` in `rmsnorm_cute`) | **booted**, 128 tok / 2.525 s = 50.7 tok/s, coherent | **GREEN** |
+| c | same boot, `--dtype float16` | boots | **booted**, 128 tok / 2.514 s = 50.9 tok/s, coherent | **GREEN** |
+| d | per-rank `CUTE_DSL_ARCH` differs | sm_120a rank 0, sm_86 ranks 1/2 | exactly that, see log quote below | **GREEN** |
+| e | 27B `--rank-gpu-id 0,1,2` unchanged | identical to parent | identical ownership vector, KV alloc, max_total, accept lengths | **GREEN** |
+| f | #202 `--rank-tp-ratio` + `--pp-size 2` | argparse abort; `--pp-size 2` alone still boots | aborts naming itself; both single-flag cases accepted | **GREEN** |
+| g | #197 `SGLANG_GGUF_DENSE_VOCAB=1` | dense lane works, quantized lane compared | works -- but **also works without the fix**, bit-identical | **no-op on this vehicle** |
+
+`SGLANG_OPT_USE_JIT_NORM=0` was removed from the boot recipe as instructed. It
+was inert: the arms above boot without it. `boot_p1.sh` / `boot_p1dbg.sh` in
+`/spinning/r3val/` are the recipe, derived from `boot_a.sh`.
+
+## (d) The direct evidence, from the fp16 debug log
+
+    TP0] CUTE_DSL_ARCH=sm_120a for GPU 0 (live singleton not yet constructed)
+    TP2] Retargeting live CUTE_DSL DSL singleton: arch sm_120a -> sm_86
+    TP1] Retargeting live CUTE_DSL DSL singleton: arch sm_120a -> sm_86
+
+This is the bug caught in the act: both 3080 ranks had ALREADY resolved to the
+5090's `sm_120a` (driver device 0) and are corrected to `sm_86`. Rank 0 needs
+no correction because device 0 genuinely is its card.
+
+Torch device order on this rig is `0=5090, 1=3080, 2=3080`; NVML order is
+`0=3080, 1=5090, 2=3080`. The fix reads the capability through **torch**, which
+is the order `torch.cuda.set_device()` follows, so it is right for the
+divergence -- resolved at runtime, never assumed. `test_cute_dsl_arch.py` 9/9
+green, plus 88 green across the #197/#202 registered unit files.
+
+## (e) The regression, and a measurement trap worth keeping
+
+Control = `wt-merge-probe` @ `f20624c868`, fix = `wt-bugs-208` @ `ef6f8bc0a2`,
+same arm `b4_fi_mtp` (27B-FP8, TP=3 uneven DCP, flashinfer, NEXTN MTP):
+
+| quantity | control | fix |
+|---|---|---|
+| KV-token ownership vector | `[22, 21, 21]` | `[22, 21, 21]` |
+| per-rank KV alloc (#tokens) | 33814 / 32277 / 32277 | 33814 / 32277 / 32277 |
+| `max_total_num_tokens` | 98328 | 98328 |
+| `available_gpu_mem` | 10.23 GB | 10.23 GB |
+| accept code / prose / mixed | 3.5714 / 2.9412 / 2.7397 | 3.5714 / 2.9412 / 2.7397 |
+
+Identical throughout. Under `--rank-gpu-id` each worker already sees exactly one
+GPU (`SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS`), so device 0 IS the rank's own
+card and the alignment is a genuine no-op -- confirmed in the log, where all
+three ranks report "for GPU 0" but with correctly DIFFERENT archs.
+
+**TRAP, cost an arm to find:** the first comparison was run against the Jul-26
+`b4_fi_mtp` baseline and showed a 4x `max_total_num_tokens` swing. That was NOT
+the fix. `SGLANG_MEASURED_KV_BUDGET` persists per-rank corrections to
+`/root/.cache/sglang/kv_budget-<confighash>.json` and the NEXT boot with the
+same hash consumes them. The arm is therefore **path-dependent on boot order**.
+Any future A/B on this vehicle must either reset that file between arms or pin
+`SGLANG_UNEVEN_TOKEN_VECTOR` -- otherwise boot order is a hidden variable. This
+directly affects the planned SPLIT-BALANCE measurement.
+
+## (g) #197 -- correct, but its load-bearing case was NOT reproduced
+
+Vehicle: 27B-GGUF `Qwen3.6-27B-Q3_K_M.gguf`, TP=3, `--rank-gpu-id 0,1,2`,
+`--rank-tp-ratio auto-performance`, `--speculative-draft-placement solo`, no
+weightless lane. Two model-path traps on the way in: the GGUF path must name
+the `.gguf` FILE (a directory gives "Cannot find any model weights"), and plain
+even TP=3 is impossible for this model (`16 is not divisible by 3`).
+
+* flag OFF -> `_solo_init_lm_head` raises `NotImplementedError`, naming itself
+  and advertising `SGLANG_GGUF_DENSE_VOCAB=1`. The advertised hatch is real.
+* flag ON, WITH fix -> boots, coherent, accept 1.4815 / 1.3333 / 1.2987.
+* flag ON, WITHOUT fix (control on `f20624c868`) -> **also boots**, and the
+  accept lengths and text heads are **bit-identical to the fix**.
+
+So on this arm the fix changes nothing. The module/loader asymmetry it repairs
+is real in the source, but the configuration that would expose it is the
+**weightless-KV fast lane** (`r1_lane_nospec` / `r4_lane_spec`), which is where
+Window 3 recorded the packed-vocab refusal -- and that lane needs #127 merged
+before it can run. #197 is safe to merge, but it must NOT be recorded as
+hardware-validated; it is "no observable effect on the reachable vehicle".
