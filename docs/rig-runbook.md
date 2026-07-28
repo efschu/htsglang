@@ -2015,7 +2015,7 @@ them wrong is not usable at any accuracy:
 `POST /api/rig_coupling/plan` judges a pairing: the compatibility gate, the
 transport per message class, and the pooled cards with the lanes that can be
 cut from them. It is the counterpart to `/api/rig_pair/*` (§3.3 of
-`TASK_214_DASHBOARD_REWORK.md`), which *sequences* a pairing — this one
+`docs/dev/TASK_214_DASHBOARD_REWORK.md`), which *sequences* a pairing — this one
 decides whether the coupling is worth attempting and on what evidence.
 
 It **contacts nothing**. The far rig comes either from a pairing session that

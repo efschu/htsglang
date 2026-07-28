@@ -354,7 +354,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         including pure-text requests in a mixed batch, or the kernel reads a
         later request's bytes with this request's row stride. The only safe
         skip is at BATCH granularity, which is what the degeneracy check at the
-        end of this method does. See TASK_186_GEMMA4_MASK.md.
+        end of this method does. See docs/dev/TASK_186_GEMMA4_MASK.md.
 
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
