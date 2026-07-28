@@ -1,0 +1,679 @@
+SMALLBAR_P2P: GPU-zu-GPU-P2P ueber BAR1 auf Karten mit kleinem BAR1
+====================================================================
+
+Basis: NVIDIA open-gpu-kernel-modules, Tag 595.58.03
+Ziel:  BAR1-P2P (statt Mailbox-P2P) auch dort nutzbar machen, wo BAR1
+       kleiner ist als die client-sichtbare FB, z.B. RTX 3080 mit
+       256 MiB BAR1 und 10/20 GiB VRAM (Resizable BAR aus).
+
+Ausgangslage im unveraenderten Baum
+-----------------------------------
+Der offizielle Static-BAR1-Pfad existiert ab Turing
+(kbusEnableStaticBar1Mapping_TU102). Er mappt die gesamte
+client-sichtbare FB in das eigene BAR1 und reicht die BAR1-Busadresse als
+ADDR_SYSMEM-Memdesc (staticBar1.pDmaMemDesc) an Peers weiter. Drei Dinge
+verhindern das auf einer Karte mit kleinem BAR1:
+
+  1. kbusIsStaticBar1Supported_TU102 lehnt ab, sobald
+     bar1VASizeAligned < bar1MapSize.
+  2. kbusInitBar1_GM107 rundet den Startoffset der statischen Region auf
+     512 MiB auf; bei einem 256-MiB-BAR bleibt danach nichts uebrig.
+  3. Die HAL-Zeiger fuer BAR1-P2P zeigen ausserhalb von Hopper/Blackwell
+     auf Stubs.
+
+Aenderungen
+-----------
+a) Fenster-Mapping (kern_bus_tu102.c)
+   Neue Hilfsfunktionen _kbusGetStaticBar1MapSize_TU102 und
+   _kbusGetStaticBar1Offset_TU102. Reicht BAR1 nicht fuer die gesamte FB,
+   wird die Groesse berechnet als
+
+     BAR1-VA (2 MiB abgerundet) - Startoffset - Sicherheitsmarge
+
+   Sicherheitsmarge = UserD aller Kanaele + MMIO-Priv (64 KiB)
+   + Doorbell (64 KiB) + KBUS_STATIC_BAR1_DYNAMIC_RESERVE (64 MiB).
+   Ergebnis auf 2 MiB abgerundet, Mindestgroesse
+   KBUS_STATIC_BAR1_MIN_WINDOW_SIZE (64 MiB); darunter wird Static BAR1
+   weiterhin abgelehnt. kbusIsStaticBar1Supported_TU102 lehnt im Zweig
+   NV_REG_STR_RM_FORCE_STATIC_BAR1_ENABLE nicht mehr pauschal ab,
+   kbusEnableStaticBar1Mapping_TU102 mappt entsprechend weniger.
+
+   Der AUTO-Zweig bleibt unveraendert. Das Fenster wird also nur genutzt,
+   wenn es ueber die Registry ausdruecklich verlangt wird. Noetig sind
+   beide Schluessel:
+
+     NVreg_RegistryDwords="RMForceStaticBar1=1;RMPcieP2PType=1"
+
+b) Offset-Aufrundung (kern_bus_gm107.c)
+   Die 512-MiB-Aufrundung wird nur noch angewendet, wenn danach Reserve
+   und Mindestfenster noch in BAR1 passen; sonst 2-MiB-Aufrundung. Das
+   entspricht der Seitengroesse, mit der die statische Region ohnehin
+   gemappt wird (BUS_MAP_FB_FLAGS_PAGE_SIZE_2M).
+
+c) HAL-Freischaltung
+   g_kern_bus_nvoc.c: fuenf Stubs auf die _GH100-Implementierungen
+   umgebogen (kbusGetBar1P2PDmaInfo, kbusCreateP2PMappingForBar1P2P,
+   kbusRemoveP2PMappingForBar1P2P, kbusHasPcieBar1P2PMapping,
+   kbusIsPcieBar1P2PMappingSupported).
+
+   Zusaetzlich noetig und deshalb ebenfalls enthalten:
+   - g_virt_mem_allocator_nvoc.c: dmaAllocBar1P2PMapping und
+     dmaFreeBar1P2PMapping auf _GH100. Ohne diese beiden scheitert der
+     RM-seitige P2P-Mapping-Pfad (virtual_mem.c), den CUDA-P2P nutzt.
+   - kern_bus_gp100.c: kbusCreateP2PMapping_GP100 und
+     kbusRemoveP2PMapping_GP100 leiten _PCIE_BAR1 jetzt an die
+     BAR1-P2P-HALs weiter. Vor Hopper fehlte diese Weiterleitung; ohne
+     sie meldet p2pCaps zwar PCI_BAR1_SUPPORTED, die Erzeugung der
+     Verbindung scheitert aber mit NV_ERR_NOT_SUPPORTED.
+   - kern_bus_gh100.c: _kbusCreateStaticBar1IOMMUMapping verlangte
+     512-MiB-Ausrichtung der Peer-DMA-Adresse. Bei einem 2-MiB-
+     ausgerichteten Fenster ist das nicht erfuellbar. Die Forderung wird
+     auf 2 MiB gesenkt, wenn der Startoffset nicht 512-MiB-ausgerichtet
+     oder das Fenster kleiner als 512 MiB ist.
+
+d) Sicherheit: Lage des Fensters in der FB
+   Geprueft, Ergebnis:
+
+   - Die Behauptung "FB-Offset 0 ist RM-reservierter Bereich" trifft in
+     der Standardkonfiguration nicht zu. memmgrInitBaseFbRegions_GM107
+     (mem_mgr_gm107.c) legt die RM-Reservierung bei
+     bReservedMemAtBottom == NV_FALSE an das obere FB-Ende. Die Variable
+     wird im gesamten Open-Kernel-Baum nirgends auf NV_TRUE gesetzt.
+     memmgrGetClientFbAddrSpaceSize liefert die Obergrenze der
+     client-allokierbaren Regionen (heapGetClientAddrSpaceSize iteriert
+     ausdruecklich nur nicht-reservierte, nicht-RM-interne Regionen).
+     Der gemappte Bereich [0, bar1MapSize) liegt damit innerhalb der
+     client-sichtbaren FB und ausserhalb der RM-Reservierung. Das ist
+     unveraendert das Verhalten des offiziellen Static-BAR1-Pfads auf
+     Hopper/Blackwell.
+
+   - Was am unteren FB-Ende dennoch liegen kann, ist die erhaltene
+     Konsolen-/UEFI-Scanout-Flaeche; kbusInitBar1_GM107 beschreibt sie
+     mit ADDR_FBMEM ab Offset 0. Ein Peer mit Zugriff auf das Fenster
+     kann sie ueberschreiben (Anzeigefehler). Auch das gilt unveraendert
+     fuer den offiziellen Pfad.
+
+   - Ein Fenster an einem anderen FB-Offset waere mit den vorhandenen
+     Schnittstellen NICHT darstellbar und wurde deshalb nicht gebaut.
+     Die Zuordnung "BAR1-VA = FB-Physadresse + startOffset" bzw.
+     "Peer-Busadresse = dmaBaseAddress + FB-Physadresse" wird an
+     mindestens vier Stellen ohne Basisoffset vorausgesetzt:
+       _kbusUpdateStaticBar1VAMapping_TU102 (kern_bus_tu102.c)
+       kbusGetStaticFbAperture_TU102        (kern_bus_tu102.c)
+       _nvGpuOpsEncodeBar1P2PAddrs          (nv_gpu_ops.c)
+       uvm_gpu_peer_phys_address / uvm_va_range_device_p2p.c (UVM)
+     Ein FB-Basisoffset muesste zusaetzlich ueber
+     NV2080_CTRL_CMD_FB_GET_STATIC_BAR1_INFO und die UVM-P2P-Caps
+     transportiert werden. Das ist hier nicht umgesetzt.
+
+   Gewaehlt wurde daher: Fenster ab FB-Offset 0, wie im offiziellen Pfad.
+
+e) Schutz gegen Adressen ausserhalb des Fensters (nv_gpu_ops.c)
+   Deckt das Fenster nicht die gesamte FB ab, kann eine Peer-Allokation
+   oberhalb des Fensters liegen. dmaBaseAddress + FB-Physadresse zeigt
+   dann hinter das Peer-BAR1. _nvGpuOpsEncodeBar1P2PAddrs prueft das
+   jetzt gegen dmaSize und liefert NV_ERR_INVALID_ADDRESS, statt eine
+   falsche Zieladresse zu erzeugen. Beide Aufrufer werten den Status aus.
+
+Bekannte Grenzen und offene Risiken
+-----------------------------------
+1. Nicht auf Hardware getestet. Es wurde ausschliesslich Quelltext
+   geaendert und uebersetzt. Kein Modultausch, kein Laden.
+
+2. Zentrale funktionale Grenze: das Fenster deckt nur den untersten Teil
+   der FB ab (bei 256 MiB BAR1 und 20 GiB VRAM unter 1 Prozent).
+   Peer-Zugriffe auf Allokationen oberhalb des Fensters sind ueber
+   Static BAR1 P2P nicht darstellbar. Der RM-Pfad (CUDA-P2P ueber
+   virtual_mem.c/dmaAllocBar1P2PMapping_GH100) ist davon nicht betroffen,
+   weil er die Zielflaeche bedarfsweise in das Peer-BAR1 mappt (bei
+   Bedarf in den dynamischen Bereich).
+
+3. Ungeschuetzter Pfad in UVM: uvm_gpu_peer_phys_address
+   (kernel-open/nvidia-uvm/uvm_gpu.c) bildet Peer-Adressen als
+   bar1_p2p_dma_base_address + FB-Physadresse und prueft dabei
+   bar1_p2p_dma_size NICHT. Fuer CE-Kopien mit physischer Adressierung
+   kann so eine Adresse ausserhalb des Peer-Fensters entstehen. Die
+   Pruefung unter e) deckt den PTE-/Physaddr-Aufbaupfad in RM ab, nicht
+   diesen. UVM wurde bewusst nicht geaendert; das Risiko besteht fort.
+
+4. GSP: die statische BAR1-Region wird ueber GSP-RM eingerichtet. Ob die
+   GSP-Firmware einer Static-BAR1-Konfiguration auf einer Ampere-Karte
+   zustimmt, wurde nicht geprueft und kann aus dem Quelltext nicht
+   beantwortet werden.
+
+5. Die Groessen KBUS_STATIC_BAR1_MIN_WINDOW_SIZE (64 MiB) und
+   KBUS_STATIC_BAR1_DYNAMIC_RESERVE (64 MiB) sind gesetzte Werte, keine
+   gemessenen. Ist die Reserve zu klein, koennen dynamische
+   BAR1-Mappings zur Laufzeit fehlschlagen.
+
+6. Die Aenderungen in src/nvidia/generated/ betreffen NVOC-generierte
+   Dateien. Ein erneuter Generatorlauf verwirft sie.
+
+Sprache
+-------
+Quelltext-Kommentare englisch, diese Patch-Doku deutsch.
+
+Bau
+---
+make modules -j4 uebersetzt den OS-unabhaengigen Teil (src/nvidia)
+fehler- und warnungsfrei bis einschliesslich
+src/nvidia/_out/Linux_x86_64/nv-kernel.o. Alle Aenderungen dieses
+Patches liegen in diesem Teil.
+
+Die anschliessende Kernel-Interface-Schicht (kernel-open/*.ko) laesst
+sich auf dieser Maschine nicht bauen: /lib/modules/$(uname -r)/build
+existiert nicht, es sind keine Kernel-Header installiert. Das ist eine
+Eigenschaft der Umgebung, nicht Folge dieses Patches. Die .ko-Dateien
+muessen auf einem System mit passenden Kernel-Headern erzeugt werden.
+
+Diff
+----
+diff --git a/src/nvidia/generated/g_kern_bus_nvoc.c b/src/nvidia/generated/g_kern_bus_nvoc.c
+index ea7dcba..3bd6c33 100644
+--- a/src/nvidia/generated/g_kern_bus_nvoc.c
++++ b/src/nvidia/generated/g_kern_bus_nvoc.c
+@@ -1064,7 +1064,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusGetBar1P2PDmaInfo__ = &kbusGetBar1P2PDmaInfo_395e98;
++        pThis->__kbusGetBar1P2PDmaInfo__ = &kbusGetBar1P2PDmaInfo_GH100;  // SMALLBAR_P2P: stub replaced with the real implementation
+     }
+ 
+     // kbusIncreaseStaticBar1Refcount -- halified (2 hals) body
+@@ -1112,7 +1112,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusCreateP2PMappingForBar1P2P__ = &kbusCreateP2PMappingForBar1P2P_395e98;
++        pThis->__kbusCreateP2PMappingForBar1P2P__ = &kbusCreateP2PMappingForBar1P2P_GH100;  // SMALLBAR_P2P: stub replaced with the real implementation
+     }
+ 
+     // kbusRemoveP2PMappingForBar1P2P -- halified (2 hals) body
+@@ -1124,7 +1124,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusRemoveP2PMappingForBar1P2P__ = &kbusRemoveP2PMappingForBar1P2P_395e98;
++        pThis->__kbusRemoveP2PMappingForBar1P2P__ = &kbusRemoveP2PMappingForBar1P2P_GH100;  // SMALLBAR_P2P: stub replaced with the real implementation
+     }
+ 
+     // kbusHasPcieBar1P2PMapping -- halified (2 hals) body
+@@ -1136,7 +1136,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusHasPcieBar1P2PMapping__ = &kbusHasPcieBar1P2PMapping_d69453;
++        pThis->__kbusHasPcieBar1P2PMapping__ = &kbusHasPcieBar1P2PMapping_GH100;  // SMALLBAR_P2P: stub replaced with the real implementation
+     }
+ 
+     // kbusIsPcieBar1P2PMappingSupported -- halified (2 hals) body
+@@ -1148,7 +1148,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusIsPcieBar1P2PMappingSupported__ = &kbusIsPcieBar1P2PMappingSupported_d69453;
++        pThis->__kbusIsPcieBar1P2PMappingSupported__ = &kbusIsPcieBar1P2PMappingSupported_GH100;  // SMALLBAR_P2P: stub replaced with the real implementation
+     }
+ 
+     // kbusCheckFlaSupportedAndInit -- halified (2 hals) body
+diff --git a/src/nvidia/generated/g_virt_mem_allocator_nvoc.c b/src/nvidia/generated/g_virt_mem_allocator_nvoc.c
+index 2779abc..0050a13 100644
+--- a/src/nvidia/generated/g_virt_mem_allocator_nvoc.c
++++ b/src/nvidia/generated/g_virt_mem_allocator_nvoc.c
+@@ -336,7 +336,7 @@ static void __nvoc_init_funcTable_VirtMemAllocator_1(VirtMemAllocator *pThis, Gp
+     // default
+     else
+     {
+-        pThis->__dmaAllocBar1P2PMapping__ = &dmaAllocBar1P2PMapping_395e98;
++        pThis->__dmaAllocBar1P2PMapping__ = &dmaAllocBar1P2PMapping_GH100;  // SMALLBAR_P2P: stub replaced with the real implementation
+     }
+ 
+     // dmaFreeBar1P2PMapping -- halified (2 hals) body
+@@ -348,7 +348,7 @@ static void __nvoc_init_funcTable_VirtMemAllocator_1(VirtMemAllocator *pThis, Gp
+     // default
+     else
+     {
+-        pThis->__dmaFreeBar1P2PMapping__ = &dmaFreeBar1P2PMapping_d44104;
++        pThis->__dmaFreeBar1P2PMapping__ = &dmaFreeBar1P2PMapping_GH100;  // SMALLBAR_P2P: stub replaced with the real implementation
+     }
+ 
+     // dmaIsDefaultGpuUncached -- halified (2 hals) body
+diff --git a/src/nvidia/inc/kernel/gpu/bus/kern_bus.h b/src/nvidia/inc/kernel/gpu/bus/kern_bus.h
+index afb7d42..55de386 100644
+--- a/src/nvidia/inc/kernel/gpu/bus/kern_bus.h
++++ b/src/nvidia/inc/kernel/gpu/bus/kern_bus.h
+@@ -1,3 +1,24 @@
+ 
+ #include "g_kern_bus_nvoc.h"
+ 
++//
++// Static BAR1 window for GPUs with a small BAR1 (SMALLBAR_P2P)
++//
++// The official static BAR1 path (Turing+) maps the entire client-visible
++// FB into BAR1. On GPUs whose BAR1 is smaller than the FB (e.g. 256 MiB
++// BAR1 with 10/20 GiB of VRAM, resizable BAR disabled) that is impossible.
++// Instead of rejecting static BAR1 altogether, only a window starting at
++// FB offset 0 is mapped in that case.
++//
++// KBUS_STATIC_BAR1_MIN_WINDOW_SIZE
++//   Smallest window still considered useful. If less than this remains,
++//   static BAR1 is rejected as before.
++//
++// KBUS_STATIC_BAR1_DYNAMIC_RESERVE
++//   BAR1 VA kept for the dynamic region (CPU mappings outside the window,
++//   on-demand BAR1 P2P mappings via dmaAllocBar1P2PMapping, doorbell and
++//   MMIO priv). This reserve is a chosen value, not a measured one.
++//
++#define KBUS_STATIC_BAR1_MIN_WINDOW_SIZE    (64ULL << 20)
++#define KBUS_STATIC_BAR1_DYNAMIC_RESERVE    (64ULL << 20)
++
+diff --git a/src/nvidia/src/kernel/gpu/bus/arch/hopper/kern_bus_gh100.c b/src/nvidia/src/kernel/gpu/bus/arch/hopper/kern_bus_gh100.c
+index 01f08ca..9905c06 100644
+--- a/src/nvidia/src/kernel/gpu/bus/arch/hopper/kern_bus_gh100.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/hopper/kern_bus_gh100.c
+@@ -1580,15 +1580,35 @@ _kbusCreateStaticBar1IOMMUMapping
+     memdescGetPtePhysAddrsForGpu(pPeerDmaMemDesc, pSrcGpu,
+                                  AT_GPU, 0, 0, 1, &peerDmaAddr);
+ 
++    //
+     // Check the if it is aligned to max RM_PAGE_SIZE 512M.
+-    if (!NV_IS_ALIGNED64(peerDmaAddr, RM_PAGE_SIZE_512M))
++    //
++    // SMALLBAR_P2P: the 512 MiB requirement exists because the static
++    // region may be mapped with pages of up to 512 MiB. When a window is in
++    // use (start not 512 MiB aligned, or window smaller than 512 MiB) the
++    // region is mapped with 2 MiB pages instead
++    // (BUS_MAP_FB_FLAGS_PAGE_SIZE_2M in kbusEnableStaticBar1Mapping_TU102),
++    // so 2 MiB alignment is sufficient.
++    //
+     {
+-        NV_PRINTF(LEVEL_ERROR, "The peer DMA address 0x%llx is not aligned at 0x%llx\n",
+-                               peerDmaAddr, RM_PAGE_SIZE_512M);
++        NvU64 alignment = RM_PAGE_SIZE_512M;
+ 
+-        memdescUnmapIommu(pPeerDmaMemDesc, pSrcGpu->busInfo.iovaspaceId);
++        if (!NV_IS_ALIGNED64(pPeerKernelBus->bar1[peerGpuGfid].staticBar1.startOffset,
++                             RM_PAGE_SIZE_512M) ||
++            (pPeerKernelBus->bar1[peerGpuGfid].staticBar1.size < RM_PAGE_SIZE_512M))
++        {
++            alignment = RM_PAGE_SIZE_2M;
++        }
+ 
+-        return NV_ERR_INVALID_ADDRESS;
++        if (!NV_IS_ALIGNED64(peerDmaAddr, alignment))
++        {
++            NV_PRINTF(LEVEL_ERROR, "The peer DMA address 0x%llx is not aligned at 0x%llx\n",
++                                   peerDmaAddr, alignment);
++
++            memdescUnmapIommu(pPeerDmaMemDesc, pSrcGpu->busInfo.iovaspaceId);
++
++            return NV_ERR_INVALID_ADDRESS;
++        }
+     }
+ 
+     return NV_OK;
+diff --git a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
+index ac3584f..d5b2053 100644
+--- a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
+@@ -1160,7 +1160,32 @@ kbusInitBar1_GM107(OBJGPU *pGpu, KernelBus *pKernelBus, NvU32 gfid)
+         // This up to (but not including) 512MB of BAR1 space will still be allocatable in
+         // the dynamic region
+         //
+-        NvU64 bar1Offset = NV_ALIGN_UP(consoleSize + pKernelBus->p2pPcie.writeMailboxTotalSize, RM_PAGE_SIZE_512M);
++        // SMALLBAR_P2P: on GPUs with a small BAR1 (e.g. 256 MiB) the 512 MiB
++        // align-up consumes the entire BAR. It is therefore only applied if
++        // the reserve for the dynamic region and a minimum window still fit
++        // into BAR1 afterwards. Otherwise align up to 2 MiB, which is the
++        // page size kbusEnableStaticBar1Mapping_TU102 uses for the static
++        // region (BUS_MAP_FB_FLAGS_PAGE_SIZE_2M). 512 MiB pages are then not
++        // possible, which is moot for a window of that size anyway.
++        //
++        // This computation must match _kbusGetStaticBar1Offset_TU102 in
++        // kern_bus_tu102.c.
++        //
++        NvU64 bar1RawStart = consoleSize + pKernelBus->p2pPcie.writeMailboxTotalSize;
++        NvU64 bar1VASizeAligned = RM_ALIGN_DOWN(pKernelBus->bar1[gfid].mappableLength,
++                                                RM_PAGE_SIZE_2M);
++        NvU64 bar1Offset = NV_ALIGN_UP64(bar1RawStart, RM_PAGE_SIZE_512M);
++
++        if ((bar1Offset + KBUS_STATIC_BAR1_DYNAMIC_RESERVE +
++             KBUS_STATIC_BAR1_MIN_WINDOW_SIZE) > bar1VASizeAligned)
++        {
++            bar1Offset = NV_ALIGN_UP64(bar1RawStart, RM_PAGE_SIZE_2M);
++
++            NV_PRINTF(LEVEL_WARNING, "Small BAR1 (VA 0x%llx): static BAR1 start aligned to 2MB "
++                                     "instead of 512MB, offset 0x%llx\n",
++                                     bar1VASizeAligned, bar1Offset);
++        }
++
+         // Enable the static BAR1 mapping for the BAR1 P2P
+         NV_ASSERT_OK_OR_GOTO(rmStatus,
+                              kbusEnableStaticBar1Mapping_HAL(pGpu, pKernelBus, gfid, bar1Offset),
+diff --git a/src/nvidia/src/kernel/gpu/bus/arch/pascal/kern_bus_gp100.c b/src/nvidia/src/kernel/gpu/bus/arch/pascal/kern_bus_gp100.c
+index 46e22b0..9b36964 100644
+--- a/src/nvidia/src/kernel/gpu/bus/arch/pascal/kern_bus_gp100.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/pascal/kern_bus_gp100.c
+@@ -65,6 +65,17 @@ kbusCreateP2PMapping_GP100
+         return kbusCreateP2PMappingForNvlink_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, peer0, peer1, attributes);
+     }
+ 
++    //
++    // SMALLBAR_P2P: pre-Hopper this dispatch for BAR1 P2P was missing.
++    // Without it p2pCaps does report PCI_BAR1_SUPPORTED, but creating the
++    // connection fails with NV_ERR_NOT_SUPPORTED. The counterpart is
++    // kbusCreateP2PMapping_GH100.
++    //
++    if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE_BAR1, attributes))
++    {
++        return kbusCreateP2PMappingForBar1P2P_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, attributes);
++    }
++
+     if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE, attributes))
+     {
+         return kbusCreateP2PMappingForMailbox_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, peer0, peer1, attributes);
+@@ -632,6 +643,12 @@ kbusRemoveP2PMapping_GP100
+         return kbusRemoveP2PMappingForNvlink_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, peer0, peer1, attributes);
+     }
+ 
++    // SMALLBAR_P2P: counterpart to the dispatch in kbusCreateP2PMapping_GP100
++    if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE_BAR1, attributes))
++    {
++        return kbusRemoveP2PMappingForBar1P2P_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, attributes);
++    }
++
+     if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE, attributes))
+     {
+         return kbusRemoveP2PMappingForMailbox_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, peer0, peer1, attributes);
+diff --git a/src/nvidia/src/kernel/gpu/bus/arch/turing/kern_bus_tu102.c b/src/nvidia/src/kernel/gpu/bus/arch/turing/kern_bus_tu102.c
+index f06fb09..d5e9515 100644
+--- a/src/nvidia/src/kernel/gpu/bus/arch/turing/kern_bus_tu102.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/turing/kern_bus_tu102.c
+@@ -350,6 +350,118 @@ kbusGetBar1ResvdVA_TU102
+ }
+ 
+ 
++/*!
++ * @brief SMALLBAR_P2P: determine the size of the static BAR1 window
++ *
++ * If BAR1 is large enough for the entire client-visible FB, the whole FB
++ * is mapped as before. If it is not, a window is mapped:
++ *
++ *   window = BAR1 VA (2M aligned down) - bar1Offset - safety margin
++ *
++ * safety margin = UserD mappings for all channels + MMIO priv + doorbell
++ *                 + KBUS_STATIC_BAR1_DYNAMIC_RESERVE
++ * These are the same items the AUTO branch of
++ * kbusIsStaticBar1Supported_TU102 adds up, plus the fixed reserve for the
++ * dynamic BAR1 region.
++ *
++ * The result is aligned down to RM_PAGE_SIZE_2M (static BAR1 is mapped
++ * with 2 MiB pages). If it falls below KBUS_STATIC_BAR1_MIN_WINDOW_SIZE,
++ * 0 is returned and the caller rejects static BAR1.
++ *
++ * The window necessarily starts at FB offset 0, see
++ * kbusEnableStaticBar1Mapping_TU102 for the reasoning.
++ *
++ * @param[in] pGpu
++ * @param[in] pKernelBus
++ * @param[in] gfid
++ * @param[in] bar1Offset  start offset of the static region within BAR1
++ *
++ * @return size to map in bytes, or 0 if too little space remains
++ */
++static NvU64
++_kbusGetStaticBar1MapSize_TU102
++(
++    OBJGPU     *pGpu,
++    KernelBus  *pKernelBus,
++    NvU32       gfid,
++    NvU64       bar1Offset
++)
++{
++    MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
++    KernelFifo    *pKernelFifo    = GPU_GET_KERNEL_FIFO(pGpu);
++    NvU64 fullMapSize = RM_ALIGN_DOWN(memmgrGetClientFbAddrSpaceSize(pGpu, pMemoryManager),
++                                      RM_PAGE_SIZE_2M);
++    NvU64 bar1VASizeAligned = RM_ALIGN_DOWN(pKernelBus->bar1[gfid].mappableLength,
++                                            RM_PAGE_SIZE_2M);
++    NvU64 reserved;
++    NvU64 windowSize;
++    NvU32 userdSize   = 0;
++    NvU32 numChannels = kfifoGetMaxChannelsInSystem(pGpu, pKernelFifo);
++
++    // Everything fits, so map the entire client-visible FB as before
++    if ((bar1Offset + fullMapSize) <= bar1VASizeAligned)
++    {
++        return fullMapSize;
++    }
++
++    kfifoGetUserdSizeAlign_HAL(pKernelFifo, &userdSize, NULL);
++
++    reserved  = (NvU64)userdSize * numChannels;
++    reserved += 16 * RM_PAGE_SIZE;                  // MMIO priv
++    reserved += 16 * RM_PAGE_SIZE;                  // doorbell
++    reserved += KBUS_STATIC_BAR1_DYNAMIC_RESERVE;
++
++    if ((bar1Offset + reserved) >= bar1VASizeAligned)
++    {
++        return 0;
++    }
++
++    windowSize = RM_ALIGN_DOWN(bar1VASizeAligned - bar1Offset - reserved,
++                               RM_PAGE_SIZE_2M);
++
++    if (windowSize > fullMapSize)
++    {
++        windowSize = fullMapSize;
++    }
++
++    if (windowSize < KBUS_STATIC_BAR1_MIN_WINDOW_SIZE)
++    {
++        return 0;
++    }
++
++    return windowSize;
++}
++
++/*!
++ * @brief SMALLBAR_P2P: predict the start offset of the static region in BAR1
++ *
++ * Must match the computation in kbusInitBar1_GM107: align up to 512 MiB
++ * only if the reserve plus the minimum window still fit into BAR1
++ * afterwards, otherwise align up to 2 MiB.
++ */
++static NvU64
++_kbusGetStaticBar1Offset_TU102
++(
++    KernelBus  *pKernelBus,
++    NvU32       gfid,
++    NvU64       consoleSize,
++    NvU64       mailboxSize
++)
++{
++    NvU64 rawStart          = consoleSize + mailboxSize;
++    NvU64 bar1VASizeAligned = RM_ALIGN_DOWN(pKernelBus->bar1[gfid].mappableLength,
++                                            RM_PAGE_SIZE_2M);
++    NvU64 bar1Offset        = NV_ALIGN_UP64(rawStart, RM_PAGE_SIZE_512M);
++
++    if ((bar1Offset + KBUS_STATIC_BAR1_DYNAMIC_RESERVE +
++         KBUS_STATIC_BAR1_MIN_WINDOW_SIZE) > bar1VASizeAligned)
++    {
++        bar1Offset = NV_ALIGN_UP64(rawStart, RM_PAGE_SIZE_2M);
++    }
++
++    return bar1Offset;
++}
++
+ /**
+  * @brief Check if the GPU supports static BAR1
+  *
+@@ -432,12 +544,35 @@ kbusIsStaticBar1Supported_TU102
+ 
+                 if (bar1VASizeAligned < bar1MapSize)
+                 {
+-                    NV_PRINTF(LEVEL_ERROR, "BAR1 size %lld is not large enough to map FB size"
+-                                           "%lld to force static BAR1\n",
+-                                            bar1VASizeAligned, bar1MapSize);
+-                    DBG_BREAKPOINT();
++                    //
++                    // SMALLBAR_P2P: BAR1 is too small for the entire
++                    // client-visible FB. This used to be rejected here.
++                    // Now check whether a large enough window (starting at
++                    // FB offset 0) remains.
++                    //
++                    NvU64 bar1Offset = _kbusGetStaticBar1Offset_TU102(pKernelBus, gfid,
++                                                                      consoleSize, mailboxSize);
++                    NvU64 windowSize = _kbusGetStaticBar1MapSize_TU102(pGpu, pKernelBus,
++                                                                       gfid, bar1Offset);
++
++                    if (windowSize == 0)
++                    {
++                        NV_PRINTF(LEVEL_ERROR, "BAR1 size %lld is not large enough to map FB size"
++                                               "%lld to force static BAR1, and no usable window "
++                                               "remains at BAR1 offset 0x%llx\n",
++                                                bar1VASizeAligned, bar1MapSize, bar1Offset);
++
++                        return NV_ERR_INVALID_REGISTRY_KEY;
++                    }
++
++                    NV_PRINTF(LEVEL_WARNING, "Static BAR1 covers only a window of 0x%llx bytes "
++                                             "at FB offset 0 (client FB 0x%llx, BAR1 VA 0x%llx). "
++                                             "Allocations above the window use the dynamic BAR1 "
++                                             "region and are not reachable through static BAR1 "
++                                             "P2P.\n",
++                                             windowSize, bar1MapSize, bar1VASizeAligned);
+ 
+-                    return NV_ERR_INVALID_REGISTRY_KEY;
++                    return NV_OK;
+                 }
+ 
+                 return NV_OK;
+@@ -551,6 +686,57 @@ kbusEnableStaticBar1Mapping_TU102
+     bar1MapSize = RM_ALIGN_DOWN(memmgrGetClientFbAddrSpaceSize(pGpu, pMemoryManager),
+                                 RM_PAGE_SIZE_2M);
+ 
++    //
++    // SMALLBAR_P2P: if BAR1 is not large enough for the entire
++    // client-visible FB, only a window is mapped.
++    // _kbusGetStaticBar1MapSize_TU102 then returns the smaller size,
++    // otherwise it returns bar1MapSize unchanged.
++    //
++    {
++        NvU64 windowSize = _kbusGetStaticBar1MapSize_TU102(pGpu, pKernelBus, gfid, bar1Offset);
++
++        NV_CHECK_OR_RETURN(LEVEL_ERROR, windowSize != 0, NV_ERR_NOT_SUPPORTED);
++
++        if (windowSize < bar1MapSize)
++        {
++            NV_PRINTF(LEVEL_WARNING, "Static BAR1 window 0x%llx of client FB 0x%llx\n",
++                                     windowSize, bar1MapSize);
++            bar1MapSize = windowSize;
++        }
++    }
++
++    //
++    // The window starts at FB offset 0 (memdescDescribe below).
++    //
++    // Checked and deliberately chosen this way:
++    //
++    // 1. A different start offset cannot be expressed with the existing
++    //    interfaces. The relation "BAR1 VA = FB physical address +
++    //    startOffset" is assumed in several places:
++    //      - _kbusUpdateStaticBar1VAMapping_TU102 (vaLo = physAddr + startOffset)
++    //      - kbusGetStaticFbAperture_TU102 (range.start += startOffset)
++    //      - _nvGpuOpsEncodeBar1P2PAddrs in nv_gpu_ops.c (dmaBase + physAddr)
++    //      - uvm_gpu_peer_phys_address and uvm_va_range_device_p2p.c in UVM
++    //    An FB base offset would additionally have to be carried through
++    //    NV2080_CTRL_CMD_FB_GET_STATIC_BAR1_INFO and the UVM P2P caps.
++    //    That is not implemented here.
++    //
++    // 2. FB offset 0 is not the RM reserved region. With
++    //    bReservedMemAtBottom == NV_FALSE (the variable is never set to
++    //    NV_TRUE anywhere in the open kernel tree) that region sits at the
++    //    top of FB, see memmgrInitBaseFbRegions_GM107 in mem_mgr_gm107.c.
++    //    The range mapped here, [0, bar1MapSize), lies inside the
++    //    client-visible FB (memmgrGetClientFbAddrSpaceSize) and therefore
++    //    outside the RM reservation. This is also what the unmodified
++    //    static BAR1 path does on Hopper/Blackwell.
++    //
++    // 3. What can be located at the bottom of FB is the preserved console /
++    //    UEFI scanout surface (kbusInitBar1_GM107 describes it with
++    //    ADDR_FBMEM starting at offset 0). A peer with access to the window
++    //    can overwrite that surface. This is unchanged from the official
++    //    static BAR1 path as well.
++    //
++
+     //
+     // The static mapping is not backed by an allocated physical FB.
+     // Here RM describes the memory for the static mapping.
+diff --git a/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c b/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c
+index 2e2fbd5..d424ee9 100644
+--- a/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c
++++ b/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c
+@@ -3841,13 +3841,21 @@ nvGpuOpsMemGetPageSize
+  *
+  * @param[in] pAddresses        : Array of physical addresses to be encoded.
+  * @param[in] dmaBaseAddress    : IOVA base address.
++ * @param[in] dmaSize           : Size of the peer BAR1 P2P window.
+  * @param[in] count             : Count of physical addresses.
++ *
++ * SMALLBAR_P2P: the encoding assumes the target's FB physical address lies
++ * within the peer's static BAR1 window. If that window does not cover the
++ * entire FB (small BAR1), this is no longer guaranteed. Addresses outside
++ * the window would point past the peer's BAR1, so they are rejected here
++ * with an error instead of producing a wrong target address.
+  */
+-static void
++static NV_STATUS
+ _nvGpuOpsEncodeBar1P2PAddrs
+ (
+     NvU64 *pAddresses,
+     NvU64  dmaBaseAddress,
++    NvU64  dmaSize,
+     NvU64  count
+ )
+ {
+@@ -3855,8 +3863,17 @@ _nvGpuOpsEncodeBar1P2PAddrs
+ 
+     for (i = 0; i < count; i++)
+     {
++        if (pAddresses[i] >= dmaSize)
++        {
++            NV_PRINTF(LEVEL_ERROR, "BAR1P2P: FB offset 0x%llx outside peer static BAR1 "
++                                   "window of size 0x%llx\n", pAddresses[i], dmaSize);
++            return NV_ERR_INVALID_ADDRESS;
++        }
++
+         pAddresses[i] = dmaBaseAddress + pAddresses[i];
+     }
++
++    return NV_OK;
+ }
+ 
+ static
+@@ -4197,7 +4214,10 @@ nvGpuOpsBuildExternalAllocPtes
+             status = NV_ERR_INVALID_STATE;
+             goto done;
+         }
+-        _nvGpuOpsEncodeBar1P2PAddrs(physicalAddresses, dmaBaseAddress, pteCount);
++        NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
++                            _nvGpuOpsEncodeBar1P2PAddrs(physicalAddresses, dmaBaseAddress,
++                                                        dmaSize, pteCount),
++                            done);
+     }
+     else
+     {
+@@ -4531,7 +4551,10 @@ nvGpuOpsBuildExternalAllocPhysAddrs
+             status = NV_ERR_INVALID_STATE;
+             goto done;
+         }
+-        _nvGpuOpsEncodeBar1P2PAddrs(physicalAddresses, dmaBaseAddress, physAddrCount);
++        NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
++                            _nvGpuOpsEncodeBar1P2PAddrs(physicalAddresses, dmaBaseAddress,
++                                                        dmaSize, physAddrCount),
++                            done);
+     }
+     else
+     {
