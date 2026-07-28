@@ -1873,3 +1873,32 @@ them wrong is not usable at any accuracy:
    by intersection;
 4. instances that do **not** jointly fit produce **no** aggregate — the
    overflowing GPU and its MiB are named instead.
+
+### 7.2 GPU arbitration (protocol v3)
+
+Cards are handed out **when work is commissioned**, not fought over at runtime.
+The earlier scheme let a losing agent either spin in a bounded poll (which
+blocks message delivery) or sleep until the next watchdog pass (up to ~29 min
+of dead time). Both were observed; neither is acceptable latency.
+
+- **One GPU holder at a time.** Never commission two card-touching agents in
+  parallel. Further GPU work waits as a *briefing on disk*, not as a running
+  agent — an agent that has not started blocks nothing and costs nothing.
+  Desk-only agents (docs, analysis, planner, UI) run alongside freely; they are
+  what makes the serialisation free.
+- **Short windows use a ticket plus a report, never a wait.** An agent that
+  needs cards for seconds or minutes mid-flight ends its turn with a request
+  (which cards, how long, what for). That task notification wakes the operator
+  immediately, so the grant arrives in seconds, not on a cron tick.
+- **Locks are accident protection, not a queue.** `/tmp/gpu-card-N.lock` stops
+  anyone (including host processes) from booting onto a busy card. It is not the
+  mechanism that distributes work. `/tmp/gpu-quiet.lock` still guards
+  measurement windows.
+- **Declare cards granularly.** A briefing names the cards it needs. Only a
+  TP=3 run locks all three; a probe on one 3080 locks one. Most pairs of tasks
+  then do not conflict at all.
+- **Card windows late and short.** Briefings front-load desk phases, and locks
+  are released immediately after the measurement rather than at task end.
+- **After any bounded poll: act or report.** Never loop inside a single call.
+  The watchdog stays a janitor (stale locks, orphans); it is explicitly not the
+  scheduler.
