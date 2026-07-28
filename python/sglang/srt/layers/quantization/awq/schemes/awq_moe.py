@@ -54,12 +54,37 @@ class AWQMoEScheme(AWQMoESchemeBase):
             }
         )
 
+        # Per-expert MoE offload (Variant-C B2b), load-time half -- the same
+        # construction gptq_moe.create_weights uses. With a resident-expert
+        # fraction < 1.0 the expert-major tensors are built on the host instead
+        # of the ambient cuda device, so the full [E,...] AWQ stack never sits
+        # on GPU at once. The standard load path still runs the awq-marlin
+        # repack on GPU: loader.py wraps process_weights_after_loading of each
+        # module in device_loading_context, which moves CPU params to the target
+        # device and restores them on exit. No kernel change is needed.
+        #
+        # Unlike GPTQ, the AWQ qzeros are NOT a formality: AWQ is asymmetric, so
+        # w13_qzeros/w2_qzeros carry real checkpoint data that
+        # moe_awq_to_marlin_zero_points consumes at repack time and the marlin
+        # apply reads per expert afterwards (they are staged by the offload cache
+        # alongside qweight/scales). They are expert-major and therefore belong
+        # on _moe_dev too -- leaving them on the default device would keep an
+        # [E]-sized tensor on GPU and defeat part of the load-time cap.
+        #
+        # fraction >= 1.0 -> _moe_dev is None -> byte-identical stock path.
+        from sglang.srt.environ import envs as _sgl_envs
+
+        _moe_dev = (
+            "cpu" if _sgl_envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get() < 1.0 else None
+        )
+
         w13_qweight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 hidden_size,
                 2 * intermediate_size_per_partition // self.quant_config.pack_factor,
                 dtype=torch.int32,
+                device=_moe_dev,
             ),
             requires_grad=False,
         )
@@ -72,6 +97,7 @@ class AWQMoEScheme(AWQMoESchemeBase):
                 intermediate_size_per_partition,
                 hidden_size // self.quant_config.pack_factor,
                 dtype=torch.int32,
+                device=_moe_dev,
             ),
             requires_grad=False,
         )
@@ -87,6 +113,7 @@ class AWQMoEScheme(AWQMoESchemeBase):
                 num_groups_w13,
                 intermediate_size_per_partition * 2,
                 dtype=params_dtype,
+                device=_moe_dev,
             ),
             requires_grad=False,
         )
@@ -94,7 +121,13 @@ class AWQMoEScheme(AWQMoESchemeBase):
         set_weight_attrs(w13_scales, extra_weight_attrs)
 
         w2_scales = torch.nn.Parameter(
-            torch.empty(num_experts, num_groups_w2, hidden_size, dtype=params_dtype),
+            torch.empty(
+                num_experts,
+                num_groups_w2,
+                hidden_size,
+                dtype=params_dtype,
+                device=_moe_dev,
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w2_scales", w2_scales)
@@ -106,6 +139,7 @@ class AWQMoEScheme(AWQMoESchemeBase):
                 num_groups_w13,
                 2 * intermediate_size_per_partition // self.quant_config.pack_factor,
                 dtype=torch.int32,
+                device=_moe_dev,
             ),
             requires_grad=False,
         )
@@ -118,6 +152,7 @@ class AWQMoEScheme(AWQMoESchemeBase):
                 num_groups_w2,
                 hidden_size // self.quant_config.pack_factor,
                 dtype=torch.int32,
+                device=_moe_dev,
             ),
             requires_grad=False,
         )

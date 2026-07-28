@@ -393,9 +393,14 @@ the GPU, and `process_weights_after_loading` ends in
 `presplit_expert_offload_after_repack` — `[R+C]` slots stay resident, `[E-R]` go straight into the
 pinned spill pool, and the registered parameter becomes a 0-row placeholder. The fp8 method lacked
 both halves until #256, which is why a 31 GiB fp8 checkpoint OOM'd a 32 GiB card before the offload
-could act. Expert-major scales (`w13/w2_weight_scale[_inv]`) and expert biases are staged with
-their weights, so a spill expert's weight and its scale land on the same pool row and are fetched
-by the same plan. **Boot-checked** on `Qwen3.6-35B-A3B-FP8` (31 GiB, 40 layers x 256 experts),
+could act. AWQ lacked the allocation half for the same reason until #123-AWQ: only GPTQ had the
+host `create_weights`, so an AWQ MoE checkpoint still committed its whole `[E]` stack on the card
+at load and OOM'd before the presplit ran. Expert-major scales (`w13/w2_weight_scale[_inv]`) and
+expert biases are staged with their weights, so a spill expert's weight and its scale land on the
+same pool row and are fetched by the same plan. AWQ additionally stages the zero-points: it is an
+asymmetric format, so `w13/w2_qzeros` carry real per-expert checkpoint data that the repack
+consumes and the Marlin apply reads, and they are allocated on the host with the weights — where
+GPTQ leaves its (symmetric, empty) zero-points on the default device. **Boot-checked** on `Qwen3.6-35B-A3B-FP8` (31 GiB, 40 layers x 256 experts),
 TP=1 on one RTX 5090 at fraction 0.25: 20.63 GiB of weight VRAM released, 22.51 GiB in the host
 pool.
 
