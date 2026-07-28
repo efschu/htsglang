@@ -4989,3 +4989,32 @@ Finding recorded separately: GGUF-MoE has NEITHER offload half and NO guard — 
 quant-agnostic offload installer slices GGUF expert stacks unchecked while GGUF runs
 its own zero-pad/topk-remap; fail-fast guard is cheap and comes first (task #268).
 Same gap in the MoeWNA16 fallback (awq.py:363-375).
+
+# #212 — prefill satellite wired end-to-end: PD carries hybrid GDN, TTFT loses, undisturbedness wins
+
+Merged feat/prefill-satellite (e45c51cd02; runbook add/add resolved, satellite is
+section 4.8). One implemented cross-machine path for hybrid GDN: PD disaggregation
+(mooncake_tcp over the 40G line, KV rows + mamba slot, ForwardMode.PREBUILT — the
+write is the insert). The HiCache store route silently recomputes for GDN models
+(MambaRadixCache truncates matches to the deepest mamba checkpoint) — fine for dense,
+useless for hybrid; recorded. PD handshake compares only page_size + kv_cache_dtype —
+different weights pair happily; the driver's preflight closes that for our flow.
+
+Numbers (Qwen3.5-2B fp16 both sides, 6.5k cold prefill, 3 concurrent decodes, no
+spec on either path since PD forces it off): monolithic idle 0.257 s TTFT, monolithic
+under load 0.604 s (load max inter-token 6.54 ms), satellite pair 2.892 s TTFT with
+load max inter-token 3.22 ms. Attribution: 93.5 % of satellite TTFT is 2080 Ti
+compute (2385 vs 10850 tok/s), 1.8 % transport (98 MiB in ~53 ms; iperf3 1930 MB/s
+on the fast line; TX counter matched the payload exactly; no measurement was taken
+over the 1 GbE path). Honest verdict: the satellite pays in undisturbedness (the
+6.54 ms spike disappears), not TTFT — with a faster satellite card the trade flips;
+this is a statement about this 2080 Ti, not the method. Handover proven directly
+(cached_tokens=6464 on a decode arm that prefilled nothing; warm run discarded from
+measurement).
+
+Walls found: GGUF does not run on sm75 (sgl-kernel cubin floor sm_80; dead
+_has_sgl_gguf_kernels flag — loud fail not implemented, task #269); Qwen3.5-4B does
+not fit the 2080 Ti (GDN prefill scratch); flashinfer prefill needs 65616 B shared
+mem at head_dim 256 vs Turing's 65536 (triton carries it);
+--disaggregation-decode-enable-radix-cache is a hard error for Mamba models; docker
+--gpus device=N counts NVML order, not CUDA order.
