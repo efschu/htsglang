@@ -5983,3 +5983,103 @@ Schalenklasse fehlt, Aufwand B1, Laut-Fehler-Zweig greift). Distributed-Suite
   unbenutzbar (Einzelteil-vor-Verbund).
 - `--dual-group-lane-spec` bleibt default aus. Distributed-Suite 555 gruen /
   16 vorbestehend rot (unveraendert gegen b662cc98a3); 12 neue CPU-Tests.
+
+## Lane-Spec-Kette Runde 3 (feat/dual-group-lane-spec-r3, Basis 5ee0b58810)
+
+- DIE UEBERGEBENE HYPOTHESE WAR FALSCH, und die Instrumentierung hat sie in
+  einem Boot widerlegt: es gibt KEINEN Versatz zwischen Hidden-State-Zeilen
+  und Kandidaten-Positionen. Gemessen im `_verify` von Runde 1:
+  `hidden_rows=4` gegen `len(cand)=4`, `batch_input_ids == cand`,
+  `positions=[96,97,98,99]`, `extend_prefix_lens=[96]`, `extend_seq_lens=[4]`,
+  `extend_start_loc=[0]`, `out_cache_loc` vier frische Slots. Alle Achsen
+  stimmen. `preds[0]` war in Boot 2 mit 1518 sogar der RICHTIGE Token —
+  die Kontrakt-8-Korrektur aus Runde 2 (Kandidaten-Logits aus den vollen
+  Hidden States) ist vollstaendig, nicht halb.
+- DIE WURZEL IST DER REKURRENTE ZUSTAND, nicht die Indizierung. Das Ziel ist
+  ein GDN-Hybrid. Ein Verify ueber K+1 Kandidaten in EINEM fortgesetzten
+  Extend ist fuer ein reines Attention-Modell sauber: eine verworfene
+  Kandidaten-KV gibt man frei, KV ist positionsadressiert. Der GDN-Anteil
+  fuehrt zusaetzlich einen laufenden Zustand (Conv-Fenster + SSM), und ein
+  Extend schiebt diesen Zustand ueber JEDEN Kandidaten weiter, angenommen
+  oder nicht. Es gibt keinen Slot zum Freigeben — der Zustand ist EIN Wert je
+  Request. Ab der ersten Ablehnung sagt die KV "n angenommen" und der
+  rekurrente Zustand "alle K+1"; die beiden widersprechen sich fuer den Rest
+  des Requests, und der Fehler waechst: die Kette folgt ihrer eigenen
+  No-Spec-Fortsetzung drei Runden lang und laeuft dann weg (erste Abweichung
+  Index 4).
+- DAS FEHLENDE STUECK LIEGT SCHON IM CODE, nur nicht auf diesem Pfad:
+  `MambaPool.SpeculativeState` haelt `intermediate_ssm` und
+  `intermediate_conv_window` je Draft-Token-Schritt, damit der Zustand auf das
+  angenommene Praefix zurueckgesetzt werden kann. Erreichbar ist das
+  ausschliesslich ueber `ForwardMode.TARGET_VERIFY` (der `if is_target_verify:`
+  Arm in `GDNAttnBackend`). Ein handgebautes EXTEND umgeht es per
+  Konstruktion. Der Pool der Lane hat die Puffer bereits (die Args-Sicht der
+  Lane loescht `max_speculative_num_draft_tokens` nicht) — es fehlt der
+  Verify-Input, nicht der Speicher.
+- FALSIFIKATOR STATT ARGUMENT: der Verify konsumiert die Kandidaten jetzt als
+  EINZELNE DECODES (`_verify_by_decode`). Gleiche Accept-Regel, gleiche
+  emittierte Tokens, nur der bestrittene Forward getauscht — womit der
+  Zustand um genau die angenommenen Tokens weiterlaeuft. Ergebnis: die
+  Spec-Lane ist byte-identisch mit ihrer eigenen No-Spec-Lane, und die
+  Accept-Laenge steigt 1,100 -> 1,383. Das ist der Beweis, dass jedes andere
+  Teil der Kette (Vorschlagsschleife, Accept-Regel, Hidden-State-Uebergabe,
+  Buchfuehrung) korrekt ist.
+- HARNESS-BEFUND, der die Runde-2-Bewertung nachtraeglich einordnet: das Tor
+  hatte nie einen RAUSCHBODEN. Gemessen A-gegen-A auf demselben Boot,
+  identischer Anfrage: bei `max_new=64` weichen zwei No-Spec-Laeufe ab
+  INDEX 14 voneinander ab (96 Prompt + 14 ~ 110 Tokens, genau die
+  dokumentierte GDN-Prefill-Nichtreproduzierbarkeit ab ~109); mit einem
+  48-Token-Prompt schon ab Index 1, weil die Fortsetzung dort inhaltlich
+  unsicher ist. Der Boden ist also INHALTS-, nicht positionsgetrieben. Jedes
+  Kohaerenz-Urteil jenseits von ~12 Tokens auf diesem Prompt lag unter der
+  Aufloesung des Instruments. Runde 2s "Abweichung bei Index 1" war sicher
+  innerhalb der Aufloesung und bleibt gueltig; ein "gruen ueber 64 Tokens"
+  war mit diesem Prompt nie erreichbar. Das Tor laeuft jetzt bei
+  `max_new=12` und fuehrt den A-gegen-A-Boden in jedem Durchlauf mit.
+- TOR (Boot 4, Default-Pfad, ohne Env-Schalter, ohne Job-Override):
+  Boden A-gegen-A GRUEN ueber 12; Selbstlauf Spec-gegen-Spec GRUEN ueber 12;
+  **Kohaerenz No-Spec gegen Spec GRUEN ueber 12, zweimal unabhaengig**.
+  data_ptr 1058 (Ziel) + 16 (Kopf) in JEDEM der 4 Boots gruen.
+  Der alte Batch-Extend-Verify bleibt ueber `SGLANG_LANE_SPEC_VERIFY=extend`
+  erreichbar und ist dort ROT (Abweichung Index 4) — der Falsifikator laeuft
+  also weiter mit.
+- ZAHLEN (Boot 4, seriell, 96-Token-Prompt, TP=3 uneven, GGUF Q3_K_M):
+  No-Spec Prefill 88,6 ms, Decode **16,32 ms/Token** ueber 63 Schritte;
+  Spec (seqdecode) Prefill 117,7 ms, **84,71 ms je Runde**, Accept **1,383**,
+  abgeleitet **61,2 ms/Token**; Spec (Batch-Extend, Boot 3) 86,9 ms je Runde,
+  Accept 1,100, 79,0 ms/Token — und inkohaerent.
+  KORREKTUR AN DER UEBERGABE: die Basis ist NICHT 61,7 ms eager. Die
+  No-Spec-Lane laeuft in dieser Konfiguration graph-gefangen mit 16,32 ms;
+  daran gemessen ist Spekulation auf der Lane derzeit ein Faktor **3,75
+  VERLUST**. Zwei benannte strukturelle Gruende, beide noch offen: der Kopf
+  laeuft eager, und der Verify laeuft eager (`capture_hidden_mode` zwingt ihn
+  aus dem gefangenen Decode-Graphen — 63 ms je Forward gegen 16,3 ms
+  gefangen). Der seqdecode-Verify kostet zusaetzlich per Konstruktion einen
+  Forward je emittiertem Token.
+- NEBENLAEUFIGER MESSPUNKT WEITERHIN NICHT ERHOBEN, jetzt aus einem anderen
+  Grund als in Runde 2: die Kette rechnet richtig, aber in einer Form, die
+  langsamer ist als gar keine Spekulation. Eine Kartenaequivalent-Zahl wuerde
+  die Bruecke beschreiben, nicht das Feature. Sie gehoert hinter den
+  TARGET_VERIFY-Umbau.
+- ZWEITER FUND, unabhaengig und mitgefixt: die Prefill-Eingabe des Kopfes war
+  NICHT verschoben. Ein MTP-Kopf nimmt in Zeile i den Hidden-State des Ziels
+  von Position i zusammen mit dem Token von Position i+1 — so baut es
+  `EAGLEWorker._draft_extend_for_prefill`. Die Lane hat den Prompt
+  unverschoben eingespeist und damit jede Zeile der Kopf-KV gegen den
+  falschen Hidden-State grundiert. Kostet unter Greedy-Verify keine
+  Korrektheit (ein schlechter Vorschlag wird abgelehnt), drueckt aber die
+  Accept-Laenge, also genau das Einzige, was Spekulation kauft.
+- WACHE AUS DER UEBERGABE, aufgeloest: "Kopf-KV wird bei Rejection nicht
+  zurueckgerollt" stimmt weiterhin und ist weiterhin harmlos. Der eigentliche
+  Rollback-Schaden sass beim ZIEL, und nicht in der KV, sondern im rekurrenten
+  Zustand. Mit dem seqdecode-Verify entsteht gar kein Ueberschuss mehr: es
+  wird nie ueber das angenommene Praefix hinaus geschrieben.
+- `--dual-group-lane-spec` bleibt default aus. 54 CPU-Tests gruen
+  (8 lane + 46 concurrency, davon 6 neue: Job-Override, Default-Strategie,
+  Accept-Regel mit gestubbten Forwards, und ein Test, der verbietet, den
+  Default still auf den schnellen falschen Pfad zurueckzudrehen).
+- HINWEIS ZUR DOKUMENTENLAGE: `DESIGN_121` existiert in keinem Branch dieses
+  Repos als Datei, wird aber an mehreren Stellen als Quelle zitiert (u.a.
+  `DualGroupLane`-Docstring "§6", diese Datei "§11.12"). Der fortgeschriebene
+  Stand liegt deshalb hier. Wer §11 weiterfuehren will, braucht zuerst die
+  Datei.
