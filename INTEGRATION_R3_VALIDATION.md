@@ -5111,3 +5111,23 @@ suites 1450 passed / 1 pre-existing failure reproduced on base. No probe boot (t
 agents were mid-measurement; argv-parse gate covered the generation path). v2
 backlog recorded: PD/main split slider (#258 front), tipping-point explanations +
 re-measure button, satellite/link rate read paths, offload depth.
+
+# #271 — comm benchmark suite merged: 10-12 s full run, curated shareable digest, fingerprint schema v1
+
+Merged feat/comm-benchmark-suite (267264ee87, fast-forward). Own "Rig data" tab with
+community framing beside the Guide tab; one button, progress bar, noise floor as
+headline, per-arm tiles reusing the #218 provenance vocabulary plus exactly one new
+state (error — "not measured is not a failure" stays intact). Two full runs measured
+10.3/11.9 s wall against the 90 s target, with the three GPU arms honestly absent
+(cards held by the falsifier during the build window — measuring path still needs
+one free-card hardware validation) and cross_rig absent per the host-runner pattern.
+Artifact schema htsglang-rig-artifact/v1 with rig fingerprint (id hashes the
+anonymized signature; identical machines merge with sample_count), curation block
+(dedupe, error folding, delta-against, 100 KB ceiling aggregates rather than
+truncates); real two-source digest 75 rows / 39.4 KB. 68 hermetic CPU tests incl.
+the anonymization gate (a boot log must not survive) and the preview obligation
+asserted at endpoint level (unconfirmed submit makes zero network calls). Named
+deviation from #152, user-driven: opt-in PAT storage for one-click re-sharing
+(0600 in 0700 dir, forget button, existence-check only — never read back). Finding:
+HTCCL/shm is a GPU arm, not CPU (segment pinned to CUDA device); container veth
+exposes no nic_types — honest here, populated on bare metal.
