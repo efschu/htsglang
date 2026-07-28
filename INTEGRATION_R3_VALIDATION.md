@@ -4951,3 +4951,21 @@ Closing verdict (register): cross-rig TP is exhausted on this hardware at ~89 us
 decode all_reduce / ~202 us per verify all_reduce — without GDR on GeForce, host
 staging carries ~86 % of the cost. Runbook 4.3 now recommends WORKERS=2 for cross-rig
 boots.
+
+# #201 slice 1 — uneven PP boots: hybrid x PP verdict positive, --pp-layer-ratio in, PP=2 smoke green
+
+Merged feat/uneven-pp-slice1 (3 commits on c626de2e52). Verdict that unblocks the
+strand: the Mamba/GDN state is stage-local and correctly indexed (MambaPool sized on
+the stage's mamba_layer_ids, mamba_map dict translation) — no reject anywhere forbids
+PP with hybrid models; qwen3_5.py fulfills the PP contract, qwen3_next.py hard-asserts
+first==last rank (documented). #202 reject opened exactly one door: world-length
+--rank-gpu-id (pp_size x tp_size) with pairwise-disjoint stage groups; --rank-tp-ratio
+auto stays rejected under PP. Smoke intra-rig 44/20 layers on 5090+3080, 27B-Q3:
+9313-token prefill + 700 greedy tokens, 44.2 tok/s, full decode CUDA graphs under PP,
+KV split follows layers exactly (2.99 vs 1.36 GB), output coherent. 37 CPU tests green
+post-merge. Findings recorded: mixed-arch PDL crash when device!=0 without per-process
+isolation (_ENABLE_PDL probes device 0; --rank-gpu-id recipes immune; foreign code,
+not fixed); per-stage budgets no longer require a TP ratio. Effort: slice 2 (cross-rig
+stage boundary) ~1-2 days — 2080 Ti is NVIDIA, standard NCCL-p2p PP path suffices,
+HTCCL-p2p only needed for the Vega later; slice 3 (uneven TP both stages) ~3-5 days,
+dominated by the world-MIN of max_total_num_tokens.
