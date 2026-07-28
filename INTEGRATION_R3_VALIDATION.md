@@ -5707,3 +5707,36 @@ Operativ relevant bleibt hier nur:
   Blowout); min-width:0 + overflow-x:auto. UI-R5-Agent informiert, doppelt
   nicht.
 - Tests: 62 neue; volle planner-Suite auf gemergtem HEAD 1575/64/0. Marker 0.
+
+## UI-Feedback Runde 5 (feat/ui-feedback-r5, gemergt)
+
+- CAPACITY MATRIX: BEHALTEN mit Begruendung — beantwortet "passt Modell X auf
+  Rig Y, mit wieviel Kontext" fuer MEHRERE Checkpoints gegen MEHRERE (auch
+  hypothetische) Rigs gleichzeitig; das koennen Familien-Matrix (1 Modell,
+  dieses Rig) und Planner (1 Modell, 1 Config) nicht. Bedienung komplett auf
+  Chips umgebaut: Modell-Chips aus erkannten Checkpoints, Rig-Chips (live +
+  komponiert via +/- aus der Kartenbibliothek), EIN Berechnen-Knopf,
+  Ein-Satz-Erklaerung; kein Freitext mehr in der Sektion.
+- PLANNER-GRAU WURZELFIX: wizardFamilies()/wizardCommand() kehrten im
+  catch-Zweig VOR dem stale-Aufraeumen zurueck — jeder fehlgeschlagene
+  Recompute liess die Schritte dauerhaft grau. Fix: un-stale auch im
+  Fehlerpfad (nie bei abort/supersede).
+- WERTE-ZUSAMMENFALTUNG: #215-same_as_baseline zu echtem Fold verallgemeinert;
+  Schwellwert 1 % SICHTBAR in der UI-Notiz; gefaltete Stops im Basis-Header
+  benannt mit #265-Begruendung (Basis-Split = striktes Decode-Optimum).
+- NOMENKLATUR: "sessions" -> "parallel requests" ueberall, wo
+  max_running_requests gemeint ist (Loadbar, Live-Kacheln, Hebel-Profile);
+  echte Session-Konzepte (KV-Spill, Pairing, Radix) unangetastet; API/Flags
+  unveraendert (Nomenklatur-Audit-Entscheid).
+- MODELLNAME: basenameOf() ueberall prominent (Loadbar, Start-Config, Monitor-
+  Ziel) — Datei- bzw. Ordnername, voller Pfad NUR als Tooltip.
+- LIVE-POLL "springt auf null": ECHTER Concurrency-Bug — ThreadingHTTPServer,
+  ueberlappender langsamer /metrics-Scrape unter Last verschraenkte Reads/
+  Writes der Delta-Globals und triggerte den out-of-order-Zero-Clamp; Lock um
+  die read-scrape-write-Sektion + Regressionstest der Serialisierung.
+- Mitnahmen: Loadbar vergroessert + zentriert (fehlte im Sammel-Selektor),
+  Quality-History als zwei Dropdowns statt 1-D-Slider, PCIe-Gen/-Breite je
+  Karte als Tag (hardware.py berechnete es laengst, Dict reichte es nie durch).
+- Agent hatte c96724ffb1 (jtok) selbst vorgemergt, Konflikt in
+  landing_snapshot_payload sauber geloest (Lock + _jtok_live_tick ausserhalb).
+- Tests: 1592/64/0 auf gemergtem HEAD, Marker 0.
