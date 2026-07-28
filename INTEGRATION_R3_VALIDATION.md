@@ -5943,3 +5943,25 @@ Offset — Kandidat fuer Debugging/Inspektion/Kleinst-Host-Staging.
 Nachbau-Fallen: sysfs-resource-mmap nur <=32-MiB-Fenster (EINVAL ab 64),
 resource1_wc statt resource1 (PAT-Konflikt mit Treiber-WC-Reservierung).
 Code: gpu2gpu_bar.c auf probe/gdr-window.
+
+## NCCL/System-RAM-Referenz (#278-Abschluss): Direktpfad schlaegt den echten Pfad (2026-07-28)
+
+Intra-rig 5090<->3080, halber Round-trip, us, solo (NCCL 2.28.9 SHM, kein P2P):
+  20 KiB: NCCL send/recv 37,4 | all_reduce 46,6 | NIC-direkt 7,4 | NIC-stage 12,3
+  80 KiB: 44,3 | 76,7 | 16,6 | 27,1
+  1 MiB: 220,8 | 326,1 | 169,9 | 259,4
+=> DIREKT vs echter Pfad: 5,1x / 2,7x / 1,3x — groesster Gewinn exakt auf den
+Kollektivgroessen. Staging verliert bei 1 MiB sogar gegen NCCL (0,85x).
+world=3: Paarstrecke unveraendert, nur Kollektiv waechst (all_reduce 55/87/381).
+LAST-ACHSE relativiert: NCCL ist bei 20 KiB fast immun gegen NIC-Fremdstrom
+(1,16x — nutzt die NIC nicht), NIC-direkt degradiert 2,52x im p99, bleibt aber
+~2x vor NCCL. EINSCHRAENKUNG ehrlich: Last-Vergleich nur w2/20 KiB, p50-vs-p99-
+Basis, Last traf NCCL nur indirekt — fuer #279-Entscheidung Last einmal
+symmetrisch auf beide Pfade + beidseitig p99. Solo-Tabelle ist sauber.
+KONSEQUENZ: P4-Verdikt "nicht bauen" bekommt hiermit den legitimen
+WIEDERERoeFFNUNGSGRUND (neue Messung gegen den ECHTEN Pfad — W1 verglich nur
+Relay-intern): ein Kollektiv auf dem Direktpfad haette solo 2,7-5x Luft auf
+den 20/80-KiB-Kollektiven; dagegen stehen V5 (eine x4-NIC serialisiert
+Multi-Paar) und die Last-Empfindlichkeit — genau das ist die #279-Rechnung.
+Werkzeug nccl_reference.py; Bau-Bug gefixt (rang-lokale Rundenzahl ->
+Broadcast; Rank-lokaler-Test-vor-Kollektiv-Familie). Aufraeumzustand sauber.
