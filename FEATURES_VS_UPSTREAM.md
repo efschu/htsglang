@@ -386,6 +386,19 @@ MoE expert offloading to host RAM combined with asymmetric TP and DCP (GPTQ/AWQ/
 32/32 tokens identical to a TP=1 run. Offloaded output is self-deterministic but not bit-identical
 to the no-offload case, since Marlin-Int4 tiling reduces in a different order. Numbers above.
 
+**Load-time presplit (#123 for GPTQ/AWQ, #256 for fp8).** The offload only helps if the expert
+stack never has to be whole on the card, so the split is done at load: `create_weights` allocates
+the expert tensors on the host, the loader's `device_loading_context` brings one layer at a time to
+the GPU, and `process_weights_after_loading` ends in
+`presplit_expert_offload_after_repack` — `[R+C]` slots stay resident, `[E-R]` go straight into the
+pinned spill pool, and the registered parameter becomes a 0-row placeholder. The fp8 method lacked
+both halves until #256, which is why a 31 GiB fp8 checkpoint OOM'd a 32 GiB card before the offload
+could act. Expert-major scales (`w13/w2_weight_scale[_inv]`) and expert biases are staged with
+their weights, so a spill expert's weight and its scale land on the same pool row and are fetched
+by the same plan. **Boot-checked** on `Qwen3.6-35B-A3B-FP8` (31 GiB, 40 layers x 256 experts),
+TP=1 on one RTX 5090 at fraction 0.25: 20.63 GiB of weight VRAM released, 22.51 GiB in the host
+pool.
+
 **Prefill wave order (#254).** A prefill chunk that routes to more experts than the scratch region
 holds is split into waves. `SGLANG_MOE_OFFLOAD_WAVE_ORDER` selects the axis:
 
@@ -421,6 +434,13 @@ scratch of 128 experts per layer), eager, 2048-token chunks:
 
 Generated text is identical between the two orders at every size that completed on both. The
 per-chunk H2D volume is logged (`MoE offload layer N: <order>-major prefill, W waves, X GiB H2D`).
+
+The AWQ table above was the format the card could hold; the fp8 arm of #254 stayed a synthetic
+kernel gate until #256 made a 31 GiB fp8 checkpoint bootable on one card. Rerun on the real fp8
+path — `Qwen3.6-35B-A3B-FP8`, TP=1 on an RTX 5090, fraction 0.25 (64 resident + 16 scratch of 256
+experts), eager, greedy, 72 prompt tokens and 96 generated — the two orders produce byte-identical
+output, at 27-31 waves / 1.11-1.21 GiB H2D per layer per chunk for token-major against 9 waves /
+0.34 GiB for expert-major.
 
 **KV-pool reclaim.** The weight VRAM the offload frees is claimed by the KV pool. No second
 sizing path exists and none is needed: the KV budget is profiled from a live free-memory reading
