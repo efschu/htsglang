@@ -4918,3 +4918,16 @@ symlinked prerequisites (Qwen3.5-4B/9B + two gemma trees fail the same way,
 pre-existing); both dirs carry mmproj so boots are multimodal (prefill graph
 drops); one unreproduced 52-s idle gap on the first Tess boot, named not
 diagnosed; reconcile has no synthetic-GGUF unit test yet.
+
+# #255 — first RTX 5090 (sm120) Triton FP8 block-GEMM configs, measured
+
+Bounded tuning run (M=4 + M=2048, both rank-0 MLP shapes of the 27B at
+mlp-ratio [2,1,1]). Microbench verification against the untuned defaults on
+the same 5090: down-proj M=4 103.6 -> 56.4 us (-45.6 %, now 1.52x off the
+bandwidth floor instead of 2.77x); gate_up M=4 104.2 -> 85.5 us (-17.9 %);
+both M=2048 prefill shapes unchanged (defaults already good). Extrapolated
+~4.2 ms per verify round =~ 14 % decode step time — config files only, no
+code. These are the first RTX 5090 entries in configs/ (159 files, zero for
+this card before). Remaining shapes/Ms continue opportunistically via the
+idle tuner (/root/tuner). End-to-end decode confirmation rides along with
+the next regular boot measurement.
