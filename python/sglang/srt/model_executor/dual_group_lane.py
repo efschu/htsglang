@@ -958,6 +958,62 @@ def split_lane_budget(server_args, target_model_config, draft_model_config):
     return budget - draft_mib, draft_mib
 
 
+def lane_chain_verify_mask(n_cached: int, draft_token_num: int, device=None):
+    """The FULL_MASK tree mask of a topk-1 CHAIN, for ONE request.
+
+    Layout contract, taken from ``build_tree_kernel_efficient``: a flat bool
+    vector of ``seq_lens_sum * D + D * D * bs`` entries, row-major over the D
+    draft tokens, each row covering ``seq_len_i + D`` key positions. Row i
+    sees the whole committed prefix plus candidates 0..i -- a chain has no
+    branching, so the draft-to-draft block is plain lower-triangular. Written
+    out here rather than obtained from the tree kernel because that kernel
+    needs an EAGLE draft's ``parent_list``/``top_scores_index``, which the
+    lane's hand-rolled chain never builds.
+    """
+    prefix = torch.ones((draft_token_num, n_cached), dtype=torch.bool, device=device)
+    block = torch.tril(
+        torch.ones((draft_token_num, draft_token_num), dtype=torch.bool, device=device)
+    )
+    return torch.cat((prefix, block), dim=1).flatten()
+
+
+def build_lane_chain_verify_input(candidates, n_cached: int, device=None):
+    """An ``EagleVerifyInput`` describing the lane's chain as a verify TREE.
+
+    The lane proposes a chain (topk 1) and verifies it greedily itself, so
+    only the fields the TARGET forward reads have to be real: the candidate
+    ids, their absolute positions, the attention mask, and ``draft_token_num``
+    (which the GDN backend uses as the per-request stride of the verify and
+    as the step width of the intermediate state caches). The ``retrieve_*``
+    fields describe the chain topology for completeness; the tree-verify
+    sampling kernels that consume them are not on this path (the lane's
+    accept rule is its own), and the GDN backend reads them only for
+    ``topk > 1``.
+    """
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+    cand = list(candidates)
+    d = len(cand)
+    idx = torch.arange(d, dtype=torch.long, device=device)
+    next_token = torch.where(idx < d - 1, idx + 1, torch.full_like(idx, -1))
+    return EagleVerifyInput(
+        draft_token=torch.tensor(cand, dtype=torch.int64, device=device),
+        custom_mask=lane_chain_verify_mask(n_cached, d, device=device),
+        positions=torch.arange(n_cached, n_cached + d, dtype=torch.long, device=device),
+        retrieve_index=idx.view(1, d),
+        retrieve_next_token=next_token.view(1, d),
+        retrieve_next_sibling=torch.full((1, d), -1, dtype=torch.long, device=device),
+        retrieve_cum_len=None,
+        spec_steps=d - 1,
+        topk=1,
+        draft_token_num=d,
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        seq_lens_sum=n_cached,
+        seq_lens_cpu=torch.tensor([n_cached], dtype=torch.int64),
+    )
+
+
 def _lane_server_args_view(server_args):
     """A shallow, lane-scoped view of the server args.
 
@@ -1095,6 +1151,13 @@ class DualGroupLane:
                     # put boot-to-boot variance inside the gate.
                     "spec": job.get("spec"),
                     "verify": job.get("verify"),
+                    # Diagnostic cap on the accept length (see
+                    # _verify_by_target_verify). Per JOB rather than per
+                    # process for the same reason as the two above: the capped
+                    # and the uncapped side have to come from ONE boot, or the
+                    # comparison carries boot-to-boot variance instead of the
+                    # one difference it is meant to isolate.
+                    "tv_max_accept": job.get("tv_max_accept"),
                 }
             )
         # PD priority (addendum 5): work has arrived for the protected class.
@@ -1784,11 +1847,244 @@ class DualGroupLane:
         )
         return emitted, n_accept, total_ms
 
+    def _verify_state_buffers(self, draft_token_num: int):
+        """The lane pool's per-step verify state caches, or a loud refusal.
+
+        ``TARGET_VERIFY`` on a GDN hybrid is only correct because the backend
+        parks one conv window + one SSM state PER DRAFT STEP and the accepted
+        prefix is committed back afterwards. Those buffers exist only when the
+        pool was built with ``speculative_num_draft_tokens``, and their step
+        axis is exactly that wide. Checking both here turns two silent
+        failures -- an ``AttributeError`` deep inside the kernel, and an
+        out-of-bounds step index that would read another request's state --
+        into one sentence at the call site.
+        """
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+
+        pool = self.runner.req_to_token_pool
+        cache = getattr(getattr(pool, "mamba_pool", None), "mamba_cache", None)
+        if not isinstance(cache, MambaPool.SpeculativeState):
+            raise ValueError(
+                "dual-group lane verify: the lane's mamba pool carries no "
+                "MambaPool.SpeculativeState, so a TARGET_VERIFY forward would "
+                "advance the recurrent state over rejected candidates with "
+                "nothing to restore from. The pool is sized from "
+                "server_args.max_speculative_num_draft_tokens; run with "
+                f"SGLANG_LANE_SPEC_VERIFY=seqdecode instead (got {type(cache)})."
+            )
+        width = int(cache.intermediate_ssm.shape[2])
+        if width < draft_token_num:
+            raise ValueError(
+                "dual-group lane verify: the lane pool's intermediate verify "
+                f"state is {width} draft steps wide, but the lane proposes a "
+                f"chain of {draft_token_num} candidates. Lower "
+                "--dual-group-lane-spec-steps or raise the serving group's "
+                "--speculative-num-draft-tokens (the pool is sized from it)."
+            )
+        return cache
+
+    def _verify_predictions(self, out, draft_token_num: int):
+        """One argmax per CANDIDATE, without paying for the lm_head twice.
+
+        Under ``TARGET_VERIFY`` the logits processor selects no row at all
+        (``sample_indices is None``), so ``next_token_logits`` is already
+        ``[#CANDIDATE, vocab]`` -- the same tensor ``_candidate_logits`` would
+        rebuild from the captured hidden states, one lm_head application later.
+        The row count is CHECKED rather than assumed: contract 8 was exactly a
+        silent row-selection mismatch (``[#SEQUENCE, vocab]`` read
+        positionally), and it cost two rounds because nothing complained. If
+        the selection rule ever changes, this falls back to the explicit
+        reduction instead of indexing the wrong rows.
+
+        Open, measured, not explained: over 96 instrumented rounds the two
+        sources disagreed on 13 argmaxes (7 on row 1, 3 on row 0, 3 on rows
+        2-3). Every one of those rounds also carried the broken rows >= 1, so
+        the disagreement may be nothing but two lm_head applications tying on
+        a degenerate distribution -- but it has to be re-checked once the rows
+        are fixed, because if the two sources really differ then one of them
+        is the wrong tensor and only one round has ever proven which.
+        """
+        logits = getattr(out, "next_token_logits", None)
+        if logits is not None and logits.shape[0] == draft_token_num:
+            return logits.argmax(dim=-1)
+        return self._candidate_logits(out.hidden_states).argmax(dim=-1)
+
+    def _verify_by_target_verify(self, job, proposals, n_cached):
+        """Verify all K+1 candidates in ONE ``ForwardMode.TARGET_VERIFY``.
+
+        NOT THE DEFAULT YET, and the boundary is measured rather than
+        guessed -- see the round-4 status at the bottom of this docstring.
+
+        This is the forward the batched EXTEND of round 1 was trying to be,
+        minus the defect that made that one wrong: TARGET_VERIFY is the only
+        mode that reaches ``GDNAttnBackend``'s ``if is_target_verify:`` arm,
+        which parks the conv window and the SSM state of EVERY draft step in
+        ``MambaPool.SpeculativeState`` instead of letting one continued extend
+        drag the single running state over rejected candidates. After the
+        accept rule has picked a prefix,
+        ``update_mamba_state_after_mtp_verify`` scatters the state of the last
+        ACCEPTED step back into the persistent caches -- so the recurrent
+        state and the KV agree on the same prefix, which is exactly what the
+        extend path could not do.
+
+        Committing is not optional: the verify forward leaves the persistent
+        conv/ssm caches holding the LAST candidate's state regardless of what
+        was accepted. Skipping the commit would reproduce the round-1 defect
+        with more machinery.
+
+        ROUND-4 STATUS, from the accept-cap falsifier (two runs each, three
+        prompts whose no-spec noise floor was measured GREEN first):
+
+        * ``tv_max_accept=0`` -- only row 0 is ever emitted and only step 0 is
+          ever committed -- is BYTE-IDENTICAL to the lane's own no-spec
+          trajectory and reproducible run to run. So the verify INPUT (mask,
+          positions, candidate KV slots, spec_info) and the state commit are
+          right for the single-row case.
+        * Uncapped, the same request is red, and the per-round trace says
+          where: row 0 of ``preds`` tracks the no-spec continuation, rows >= 1
+          do not and are barely input-dependent (over 96 rounds row 2 took 15
+          distinct values with one of them in 39 of them, against 83 distinct
+          values on row 1). The chain ACROSS draft steps inside one forward is
+          what is not yet right; everything around it is.
+
+        Until that is fixed the default stays ``seqdecode``. Note what the
+        round-4 measurements also showed: the verify MODE was never the
+        expensive part. One TARGET_VERIFY forward costs ~67 ms against a
+        16.2 ms graph-captured decode, so at the measured accept length of
+        ~1.19 this path can be at best ~10 % cheaper than the bridge it
+        replaces. The lever is capturing the verify, not choosing its mode.
+        """
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+
+        batch = job["_batch"]
+        req = job["_req"]
+        idx = job["_req_pool_idx"]
+        device = batch.device
+        cand = [int(job["_next"][0].item())] + list(proposals)
+        d = len(cand)
+        self._verify_state_buffers(d)
+
+        # The candidates need KV slots BEFORE the forward: the attention plan
+        # reads req_to_token[idx, n_cached : n_cached + d] to build its kv
+        # indices (EagleVerifyInput.generate_attn_arg_prefill extends the
+        # paged length by draft_token_num).
+        page_size = int(self.runner.server_args.page_size or 1)
+        if page_size != 1:
+            raise ValueError(
+                "dual-group lane verify: the flat candidate allocation below "
+                f"assumes page_size 1, got {page_size}. A paged pool needs "
+                "alloc_paged_token_slots_decode with the request's last slot, "
+                "which this path does not build."
+            )
+        out_cache_loc = batch.token_to_kv_pool_allocator.alloc(d)
+        if out_cache_loc is None:
+            raise RuntimeError(
+                f"dual-group lane verify: the lane pool cannot serve {d} "
+                "candidate slots for one verify round."
+            )
+        batch.req_to_token_pool.req_to_token[idx, n_cached : n_cached + d] = (
+            out_cache_loc.to(torch.int32)
+        )
+
+        verify_input = build_lane_chain_verify_input(cand, n_cached, device=device)
+        batch.forward_mode = ForwardMode.TARGET_VERIFY
+        batch.spec_info = verify_input
+        batch.input_ids = verify_input.draft_token
+        batch.out_cache_loc = out_cache_loc
+        batch.seq_lens_sum = n_cached
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        try:
+            out, ms = self._timed_forward_raw(batch, CaptureHiddenMode.FULL)
+            preds = self._verify_predictions(out, d)
+
+            n_accept = 0
+            for i, prop in enumerate(proposals):
+                if int(preds[i].item()) != prop:
+                    break
+                n_accept += 1
+            # Falsifier knob (diagnostic, unset by default): capping the
+            # accept length isolates the verify ROW that is under suspicion.
+            # With the cap at 0 only row 0 is ever emitted and only step 0 is
+            # ever committed -- so a run that is coherent under the cap and
+            # incoherent without it puts the fault in rows/steps >= 1, and one
+            # that is incoherent under the cap puts it in row 0 or the commit.
+            cap = job.get("tv_max_accept")
+            if cap is None:
+                cap = os.environ.get("SGLANG_LANE_SPEC_TV_MAX_ACCEPT")
+            if cap is not None:
+                n_accept = min(n_accept, int(cap))
+            if self._dbg_on():
+                self._dbg(
+                    "tv_round",
+                    {
+                        "n_cached": n_cached,
+                        "cand": cand,
+                        "proposals": list(proposals),
+                        "preds": [int(x) for x in preds.tolist()],
+                        "n_accept": n_accept,
+                        "hidden_rows": int(out.hidden_states.shape[0]),
+                        "logits_rows": int(
+                            getattr(out, "next_token_logits", preds).shape[0]
+                        ),
+                        "preds_from_hidden": [
+                            int(x)
+                            for x in self._candidate_logits(out.hidden_states)
+                            .argmax(dim=-1)
+                            .tolist()
+                        ],
+                    },
+                )
+
+            # Commit the recurrent state of the LAST ACCEPTED step. topk == 1
+            # makes the tree a chain, so the accepted node's tree step is just
+            # accept_len - 1 == n_accept. mamba_track_* stay None: the lane has
+            # no radix cache, hence no prefix-cache tracking points.
+            self.runner.attn_backend.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=torch.tensor(
+                    [n_accept], dtype=torch.int64, device=device
+                ),
+                mamba_track_indices=None,
+                mamba_steps_to_track=None,
+                model=self.runner.model,
+            )
+        finally:
+            batch.spec_info = None
+            batch.forward_mode = ForwardMode.DECODE
+
+        emitted = list(proposals[:n_accept]) + [int(preds[n_accept].item())]
+        kept = n_accept + 1
+        if kept < d:
+            batch.token_to_kv_pool_allocator.free(out_cache_loc[kept:])
+
+        # Bookkeeping that prepare_for_decode would otherwise do: the verify
+        # consumed `kept` positions, and the next round starts from there.
+        new_len = n_cached + kept
+        batch.seq_lens.fill_(new_len)
+        batch.seq_lens_cpu.fill_(new_len)
+        batch.orig_seq_lens.fill_(new_len)
+        batch.seq_lens_sum = None
+        req.decode_batch_idx += kept
+        req.kv_committed_len = new_len
+        req.kv_allocated_len = new_len
+
+        job["_kv_len"] = new_len
+        job["_hidden"] = out.hidden_states[n_accept : n_accept + 1]
+        job["_next"] = preds[n_accept : n_accept + 1]
+        return emitted, n_accept, ms
+
     def _verify_mode(self, job) -> str:
         """Which verify strategy this round uses.
 
-        ``seqdecode`` unless something explicitly asks for ``extend``. The
-        default is the slow-but-correct one on purpose -- see ``_verify``.
+        ``seqdecode`` -- the correctness bridge of round 3 -- unless something
+        explicitly asks for another one. It is the only strategy that is green
+        end to end today, and a default is a claim about correctness, not
+        about ambition: ``target_verify`` is byte-exact only with its accept
+        length capped at 0 (round 4, see ``_verify_by_target_verify``), and
+        ``extend`` is the measurably wrong batched path of round 1, kept
+        reachable as a live falsifier. Both stay one explicit word away.
         """
         return (
             job.get("verify")
@@ -1806,7 +2102,9 @@ class DualGroupLane:
         least one token, which is what makes speculation free of correctness
         risk under greedy sampling.
 
-        NOT THE DEFAULT, and the reason is a property of this target rather
+        THE DISPATCHER for the three verify strategies, and itself the body of
+        the WRONG one (``extend``), kept reachable so the falsifier keeps
+        running. The reason it is wrong is a property of this target rather
         than of the arithmetic above. Verifying K+1 candidates in ONE
         continued extend is sound for a pure-attention model, where rolling
         back a rejected candidate means freeing its KV slot -- KV is
@@ -1820,14 +2118,14 @@ class DualGroupLane:
         walks away from it (first divergence at index 4, gate below the
         established noise floor).
 
-        The codebase already owns the missing piece -- ``MambaPool.
-        SpeculativeState`` keeps ``intermediate_ssm`` and
-        ``intermediate_conv_window`` per draft-token step so the state can be
-        restored to the accepted prefix -- but only ``ForwardMode.
-        TARGET_VERIFY`` reaches it (see ``GDNAttnBackend``'s
-        ``if is_target_verify:`` arm). A hand-rolled EXTEND bypasses it by
-        construction. Making the lane build a real verify input is the work
-        that turns speculation here from correct-but-slow into useful.
+        The two strategies that DO compute the right tokens:
+        ``target_verify`` (the default, ``_verify_by_target_verify``) runs the
+        same single forward in ``ForwardMode.TARGET_VERIFY``, which is the
+        only mode that reaches the per-step state caches of ``MambaPool.
+        SpeculativeState`` and can therefore restore the recurrent state to
+        the accepted prefix; ``seqdecode`` (``_verify_by_decode``) sidesteps
+        the problem by consuming the candidates one DECODE at a time, which is
+        correct at the cost of one forward per emitted token.
         """
         from array import array
 
@@ -1843,8 +2141,16 @@ class DualGroupLane:
         if self._dbg_on() and self._dbg_round == 1:
             self._dbg_state_probes(job, n_cached)
 
-        if self._verify_mode(job) == "seqdecode":
+        mode = self._verify_mode(job)
+        if mode == "target_verify":
+            return self._verify_by_target_verify(job, proposals, n_cached)
+        if mode == "seqdecode":
             return self._verify_by_decode(job, proposals, n_cached)
+        if mode != "extend":
+            raise ValueError(
+                f"dual-group lane verify: unknown strategy {mode!r} "
+                "(target_verify | seqdecode | extend)."
+            )
 
         req.full_untruncated_fill_ids = array(
             "q", list(req.origin_input_ids) + job["output_ids"][:-1] + cand
@@ -1989,9 +2295,18 @@ class DualGroupLane:
         two numbers that decide whether speculation paid, and a per-token
         average hides both.
         """
+        # ROUND wall time, not verify time. Rounds 1-3 reported the verify
+        # alone, which silently left the head's K draft forwards -- the other
+        # half of what speculation costs -- out of every ms/round and
+        # ms/token figure on this path. The verify time is kept alongside so
+        # the two structural posts (head, verify) stay separable.
+        t0 = time.perf_counter()
         proposals = self._propose(job)
         emitted, n_accept, ms = self._verify(job, proposals)
-        job["decode_ms"].append(ms)
+        round_ms = (time.perf_counter() - t0) * 1000.0
+        job["decode_ms"].append(round_ms)
+        job.setdefault("_verify_ms", []).append(ms)
+        job.setdefault("_propose_ms", []).append(round_ms - ms)
         job["output_ids"].extend(emitted)
         job.setdefault("_accept", []).append(n_accept + 1)
 
@@ -2131,6 +2446,16 @@ class DualGroupLane:
             ),
             "decode_steps": len(decode_ms),
         }
+        # The two structural posts of a speculative round, reported apart:
+        # a mean alone cannot say whether the head or the verify is what
+        # costs, and both are eager for different reasons.
+        for key, label in (
+            ("_verify_ms", "verify_ms_mean"),
+            ("_propose_ms", "propose_ms_mean"),
+        ):
+            xs = job.get(key) or []
+            if xs:
+                result[label] = round(sum(xs) / len(xs), 3)
         if job.get("prefill_wall_ms") is not None:
             result["prefill_wall_ms"] = round(job["prefill_wall_ms"], 2)
             result["prefill_wait_ms"] = round(

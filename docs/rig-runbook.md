@@ -998,6 +998,28 @@ Working recipe on this rig (validated 2026-07-28, Qwen3.6-27B-Q3_K_M-GGUF):
   [...], "max_new_tokens": N, "repeat": K}}}`; results (prefill ms, decode
   ms/step, output ids) via `/get_server_info` -> `internal_states[i]
   ["dual_group_lanes"]`.
+- **Per-job overrides for the coherence gate** (all absent by default, so the
+  lane behaves exactly as the server flags say): `"spec": false` runs the job
+  without speculation, `"verify": "seqdecode" | "target_verify" | "extend"`
+  picks the verify strategy, and `"tv_max_accept": 0` caps the accept length
+  of the TARGET_VERIFY path (the round-4 falsifier: capped it is byte-exact,
+  uncapped it is not). They exist so the reference side and every speculative
+  side come from ONE boot -- two boots would put boot-to-boot variance inside
+  the gate. `SGLANG_LANE_SPEC_VERIFY` / `SGLANG_LANE_SPEC_TV_MAX_ACCEPT` are
+  the process-wide equivalents; `SGLANG_LANE_SPEC_DEBUG=1` adds a per-round
+  trace (and costs a second lm_head per round, so never measure with it on).
+- **Concurrent mode needs a SMALLER lane pool than the serial recipe.**
+  `--dual-group-lane-concurrent` gives the lane its own graph memory pool on
+  top of everything the serial mode allocates, and with
+  `--dual-group-lane-budget-mib 1600` the boot dies in the lane's breakable
+  prefill capture with a CUDA OOM. 700 MiB carries (#274 round 4). Same
+  corridor as above, just narrower: leave the lane's capture its headroom.
+- **The gate prompt is part of the instrument.** The lane's no-spec
+  trajectory is only reproducible where the continuation is forced; on an
+  open continuation two identical no-spec runs diverge within a few tokens
+  and no coherence verdict is possible at all. Measure the A-vs-A floor of a
+  candidate prompt BEFORE using it (round 4: one of four candidates failed
+  that check), and carry the floor in every gate run.
 - **Measured (this recipe, graphs on):** lane-solo 2048-token prefill
   580 ms (283 ms/1k), greedy decode 16.6 ms/step; lane output coherent and
   consistent with the serving group's continuation. Interference: lane
