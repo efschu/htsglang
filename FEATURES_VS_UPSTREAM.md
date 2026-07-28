@@ -400,7 +400,10 @@ expert biases are staged with their weights, so a spill expert's weight and its 
 same pool row and are fetched by the same plan. AWQ additionally stages the zero-points: it is an
 asymmetric format, so `w13/w2_qzeros` carry real per-expert checkpoint data that the repack
 consumes and the Marlin apply reads, and they are allocated on the host with the weights — where
-GPTQ leaves its (symmetric, empty) zero-points on the default device. **Boot-checked** on `Qwen3.6-35B-A3B-FP8` (31 GiB, 40 layers x 256 experts),
+GPTQ leaves its (symmetric, empty) zero-points on the default device. **Boot-checked** on
+`Qwen3.6-35B-A3B-AWQ-4bit` (23.25 GiB of weights, 40 layers x 256 experts) at fraction 0.25 on a
+single RTX 3080 — a 20 GiB card carrying a checkpoint larger than itself: 11.92 GiB of weight VRAM
+released, 13.01 GiB in the host pool, card settling at 14.20 GiB. **Boot-checked** on `Qwen3.6-35B-A3B-FP8` (31 GiB, 40 layers x 256 experts),
 TP=1 on one RTX 5090 at fraction 0.25: 20.63 GiB of weight VRAM released, 22.51 GiB in the host
 pool.
 
