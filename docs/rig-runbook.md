@@ -549,6 +549,158 @@ Non-obvious points, each load-bearing:
   everyone; here that stage binds anyway, but on a split where the short stage
   could afford far more tokens this throws that capacity away (open item for
   #201 slice 3).
+### 4.8 Prefill satellite: rig 2 prefills, rig 1 decodes (#212)
+
+The satellite is the second box taking a request's prefill so the main rig
+keeps decoding undisturbed. Two servers, one PD pair, driven by
+`scripts/satellite/prefill_offload.py`.
+
+**Only PD disaggregation carries this for a hybrid GDN model.** The HiCache
+L3 store is the obvious-looking alternative and it does not work here: a
+store round trip carries KV pages, while the GDN recurrent state lives in a
+separate pool, and `MambaRadixCache._match_post_processor` truncates any
+prefix match to the deepest node that owns a mamba checkpoint
+(`value = value[:best_value_len]`). A KV-only import therefore matches zero
+tokens and the decode side recomputes the whole prompt -- it looks like it
+works right up to the point where it silently does nothing. PD's
+`setup_state_kv_args` appends a `StateType.MAMBA` component and moves the
+GDN slot with the KV, which is why the pair works. For a dense (non-hybrid)
+model the store route is viable.
+
+**The decode arm must run on the Proxmox host, not in the container.** This
+is the whole difference between measuring the feature and measuring the
+1 GbE LAN. The container has no interface on the cross-rig subnet (section
+1.1), so a container-hosted decode arm reaches the satellite only over the
+1 GbE line: measured 105 MB/s, against 15.45 Gbit/s (~1930 MB/s, iperf3
+single stream) on the 40G RoCE line. For an 8k prefill of this model the KV
+plus GDN payload is ~98 MiB, which is ~53 ms on the fast line and ~930 ms on
+the slow one -- a third of the whole satellite TTFT, spent on the wrong
+network. Pin both sides with `SGLANG_HOST_IP`; that env is what
+`get_local_ip_auto` reads, and it decides the address mooncake advertises
+and therefore which wire the bulk rides.
+
+```bash
+source /root/rig-env.sh
+
+# --- satellite (rig 2, RTX 2080 Ti) --------------------------------------
+scp -i "$RIG2_KEY" scripts/satellite/boot_satellite_prefill.sh \
+    root@"$RIG2_HOST":/root/sat_boot.sh
+ssh -i "$RIG2_KEY" root@"$RIG2_HOST" '
+  export SAT_SGLANG_SRC=<RIG2_SGLANG_SRC> SAT_VENV_PY=<RIG2_VENV>/bin/python
+  export SAT_MODEL=<RIG2_MODEL_DIR>/qwen3.5-2b SAT_SERVED_NAME=satellite-pair
+  export SAT_PORT=31212 SAT_MEM_FRAC=0.85 SAT_CTX=16384
+  export SGLANG_HOST_IP=<RDMA_R2>          # 40G address, not the LAN one
+  export SAT_CUDART12=<RIG2_VENV>/lib/python3.12/site-packages/nvidia/cuda_runtime/lib
+  setsid nohup /root/sat_boot.sh </dev/null >/root/sat_wrap.log 2>&1 & '
+
+# --- decode arm (Proxmox host, in the serving image, host network) -------
+ssh -i "$RIG1_KEY" root@"$RIG1_HOST" '
+docker run -d --name t212_decode --network host --ipc host \
+  --gpus "\"device=1\"" \
+  -v <HOST_VIEW_OF_MODEL_ROOT>/Qwen3.5-2B:/root/models/qwen3.5-2b:ro \
+  -v <HOST_VIEW_OF_WORKTREE>/python:/wtpy:ro \
+  -e PYTHONPATH=/wtpy -e SGLANG_HOST_IP=<RDMA_R1> -e MC_FORCE_TCP=1 \
+  -e SGLANG_MAMBA_SSM_DTYPE=float32 --entrypoint bash \
+  ghcr.io/efschu/htsglang-qwen35-gguf:cu130 -lc "
+    apt-get update -qq && apt-get install -y -qq libibverbs1 librdmacm1
+    pip install -q mooncake-transfer-engine==0.3.11.post1 nvidia-cuda-runtime-cu12
+    export LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/nvidia/cuda_runtime/lib
+    exec python3 -u -m sglang.launch_server --model-path /root/models/qwen3.5-2b \
+      --served-model-name satellite-pair --dtype float16 --tp-size 1 --base-gpu-id 0 \
+      --mem-fraction-static 0.45 --context-length 16384 --max-running-requests 8 \
+      --page-size 1 --trust-remote-code --enable-metrics --host 0.0.0.0 --port 31213 \
+      --disaggregation-mode decode --disaggregation-transfer-backend mooncake_tcp" '
+
+# --- gate, then measure (from the host: it is the only place that can
+#     reach both fast-line endpoints) ------------------------------------
+scp -i "$RIG1_KEY" scripts/satellite/prefill_offload.py root@"$RIG1_HOST":/root/driver.py
+ssh -i "$RIG1_KEY" root@"$RIG1_HOST" '
+  python3 /root/driver.py preflight --prefill http://<RDMA_R2>:31212 --decode http://<RDMA_R1>:31213
+  python3 /root/driver.py measure \
+    --prefill http://<RDMA_R2>:31212 --decode http://<RDMA_R1>:31213 \
+    --local http://<RDMA_R1>:31214 --bootstrap-host <RDMA_R2> --bootstrap-port 8998 \
+    --load 3 --prompt-tokens 8192 --seed <fresh> '
+```
+
+Nine things bite, in the order they bite:
+
+- **`--gpus "device=N"` counts in NVML order, not CUDA order.** On this host
+  `device=0` is a 3080 and `device=1` is the 5090 (section 6.1). A decode arm
+  on the wrong card boots fine and quietly measures the wrong hardware.
+- **GGUF does not run on the 2080 Ti.** Weights load (the loader is pure
+  Python `gguf`), the forward does not: `layers/quantization/gguf.py` gets
+  its kernels from `sgl_kernel`, which is cubin-only with a gencode floor of
+  sm_80 and holds nothing Turing can execute. The module comment promises a
+  loud failure at `GGUFConfig`; `_has_sgl_gguf_kernels` is set and never
+  read, so the real failure would be `NoneType is not callable` mid-forward.
+  The boot dies earlier anyway, on the lm_head dequant reservation
+  (`vocab 248320 x hidden x 2 B`, 1.89 GiB for the 9B) against an 11 GB card.
+  Use a safetensors checkpoint on the satellite.
+- **Qwen3.5-4B does not fit the 2080 Ti either.** 8.8 GiB of fp16 weights
+  leave ~1.6 GiB, and the two claims on it are mutually exclusive: at
+  `--mem-fraction-static 0.93` the mamba+KV pools fit but the Triton GDN
+  prefill scratch does not (`Triton Error [CUDA]: out of memory` on the first
+  real prefill, after a 4-token warmup passed); at 0.86 the profiler refuses
+  outright (`max_mamba_cache_size=0`). Qwen3.5-2B (4.3 GiB) is the size that
+  works, and `--chunked-prefill-size 512` keeps the GDN scratch small.
+- **flashinfer prefill does not fit sm75 at `head_dim 256`.** It asks for
+  65616 bytes of shared memory against Turing's 65536 and is rejected at the
+  first real prefill -- after a clean weight load and a sized KV pool, so it
+  reads as a runtime fault. `--attention-backend triton --sampling-backend
+  pytorch`, which the boot script defaults to.
+- **The pair is fp16 because the weakest member is.** Turing has no
+  bfloat16, so the satellite casts on its own; the decode arm must be given
+  `--dtype float16` too, and so must the monolithic baseline. The bootstrap
+  handshake compares `kv_cache_dtype` (`"auto"` on both) and not the
+  resolved element type, so a mismatch here produces no complaint.
+- **The handshake does not check the model.** `try_ensure_parallel_info`
+  compares `page_size` and `kv_cache_dtype`, nothing else. Two arms with
+  different weights pair and produce fluent nonsense. That is what
+  `prefill_offload.py preflight` is for -- run it before every measurement.
+  Give both arms the same `--served-model-name`, and mount the checkpoint at
+  the same path on both sides (the `-v ...:/root/models/qwen3.5-2b` above).
+  Aligning the path is free here and is a hard requirement for any
+  HiCache-store handover, whose key hashes the normalized `model_path`.
+- **`--disaggregation-decode-enable-radix-cache` is a hard ValueError for
+  Mamba/SSM models** (`mem_cache/kv_cache_builder.py`). Leave it off for
+  every hybrid GDN model; the decode arm runs a chunk cache, which costs
+  nothing because the prefix arrives over the wire rather than from that
+  side's cache.
+- **Speculative decoding is force-disabled in both PD arms**
+  (`arg_groups/pd_disaggregation_hook.py`). The monolithic baseline must run
+  without it as well, or the comparison measures the draft model.
+- **Reuse a prompt seed and the "cold" prefill is warm.** The satellite keeps
+  its own radix cache, so a repeated prompt comes back with
+  `cached_tokens > 0` carried through the PD metadata buffer and a TTFT four
+  times too good. Pass a fresh `--seed` per run. (The same effect, used
+  deliberately, is the cleanest proof that the prefix really crossed:
+  `cached_tokens=6464, details={"device": 6464}` on a decode arm that never
+  prefilled a token.)
+
+Two image gaps to patch at container start: the serving image has no
+`mooncake` (pip) and no `libibverbs1`/`librdmacm1` (apt), and the mooncake
+wheel links CUDA 12 against the image's cu130 torch, so
+`nvidia-cuda-runtime-cu12` must be on `LD_LIBRARY_PATH` or the import dies on
+`libcudart.so.12`. Same for rig 2's venv.
+
+Measured on this rig (Qwen3.5-2B fp16, 6.5k-token cold prefill, 3 concurrent
+decode streams, 40G line, task #212):
+
+| | prefill placement | cold TTFT | load ms/token median | load ms/token max |
+|---|---|---|---|---|
+| (a) monolithic, idle | 5090 | 0.257 s | -- | -- |
+| (a) monolithic, under load | 5090 | 0.604 s | 3.52 | 6.54 |
+| (b) satellite pair, under load | 2080 Ti + 40G | 2.892 s | 3.18 | 3.22 |
+
+The satellite costs 2.29 s of TTFT and buys a decode stream that never sees
+the prefill at all -- the running decodes' worst inter-token time drops from
+6.54 ms to 3.22 ms, i.e. the spike disappears rather than shrinks. The cost
+is almost entirely the satellite's own GPU: 2.72 s of the 2.89 s is 2080 Ti
+prefill compute (13 chunks, 2385 tok/s against the 5090's 10850 tok/s under
+the same load), ~53 ms is the 98 MiB transfer, and ~136 ms is handshake and
+scheduling. On a satellite whose prefill rate is close to the main card's,
+this trade turns positive; the transport is not what stands in the way.
+
 
 ## 5. Credentials
 
