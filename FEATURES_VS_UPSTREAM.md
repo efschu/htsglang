@@ -805,6 +805,83 @@ Decode-shaped cells at the resulting defaults (world 4, cross-rig, median of 100
 `all_reduce` 8 KiB 49.9 us, 20 KiB 89.5 us, 80 KiB 198.6 us; `all_gather` 8 KiB 54.2 us,
 20 KiB 99.4 us, 80 KiB 310.6 us.
 
+**A second UCX context per rank, and the half of it that pays (task #266).** Both #244 and #263
+ended pointing at the same suspect: one rank's single-threaded UCX worker, not the link. #244 found
+the same world-4 group *with no wire at all* slower than across RDMA; #263 found an `all_gather`
+ring beating the flat exchange while moving identical bytes, purely by handing the worker two
+requests at a time instead of `2(W-1)`. `SGLANG_HTCCL_UCX_WORKERS=2` builds a second UCP context and
+worker per rank, its address carried in the *same* rendezvous `all_gather_object` (no extra
+collective), and splits work across the two. Two structures were split, and they turned out to be
+independent mechanisms with **opposite signs**:
+
+| Split | Rule | Result |
+|---|---|---|
+| Flat exchange, by PEER | pair `(r, p)` rides worker `(r + p) % ways` — symmetric in the pair, so both ends agree without exchanging anything | **the win** |
+| Ring, by DIRECTION | half the payload clockwise on worker 0, half counter-clockwise on worker 1; same hop count, half the bytes per hop | **the loss** |
+
+Cross-rig, world 4, production placement, median of the per-run medians (each run itself a median of
+100 after 20 warmup), configurations interleaved within one session because this link drifts several
+percent between sessions — the same order as the effects:
+
+| | `all_reduce` | | | | `all_gather` | | | |
+|---|---|---|---|---|---|---|---|---|
+| KiB | 20 | 80 | 128 | 256 | 20 | 80 | 128 | 256 |
+| 1 worker | 96.2 | 202.9 | 275.5 | 560.6 | 100.1 | 300.8 | 452.2 | 997.5 |
+| 2 workers | **88.9** | 202.1 | 274.7 | 575.5 | **92.0** | 301.2 | 451.7 | 976.5 |
+| 2 + bidirectional ring | 89.3 | 236.8 | 301.4 | 599.1 | 92.5 | 327.6 | 487.7 | 1047.8 |
+
+So: **-7.6 % `all_reduce` and -8.1 % `all_gather` at the 20 KiB bs=1 decode size, neutral at every
+ring size.** 20 KiB is below both ring thresholds, so it is the flat exchange, and it is the most
+frequent collective in a cross-rig decode. The 80/128/256 KiB deltas are inside a run-to-run spread
+of ±3.5 % (±5 % at 20 KiB, tail-heavy above 128 KiB); the 20 KiB distributions separate — every
+2-worker sample is below every 1-worker sample but one.
+
+**The bidirectional ring is a real regression, not noise: +17 % on an 80 KiB `all_reduce`.** The
+reason it cannot win is structural. A ring step is exactly two requests in lock step, so there is no
+concurrency for a second worker to expose; halving the bytes per hop buys nothing on a link where
+#244 already established the bytes are not the cost; and every spin pass now progresses two engines
+instead of one. It ships as `SGLANG_HTCCL_UCX_RING_BIDIR`, default **off**, as the A/B control and
+for links where the bytes genuinely do dominate.
+
+Correctness and blast radius:
+
+* Byte gate at atol 0 over the real RDMA link, world 4, `all_reduce` **and** `all_gather`, at
+  8/16/23/24/25/32/80/128/256 KiB each with ragged tails (`+0/+1/+3` elements): **0 mismatches** in
+  all three configurations (1 worker; 2 workers; 2 workers + bidirectional ring). Same gate green
+  locally at worlds 2, 3 and 4. 85 registered `htccl` unit tests green.
+* The default path is unchanged and measured to be so: base commit against this change, both at
+  1 worker, interleaved in one session — 80 KiB 202.8 vs 200.0 us, 128 KiB 272.3 vs 271.8 us,
+  256 KiB 547.8 vs 557.9 us (medians of 5 runs at 256 KiB, the tail-heavy point). All inside noise.
+* The worker count is **rank-uniform and enforced**, not documented-and-hoped: a mismatch would post
+  where no peer is listening and hang rather than return a wrong answer, so the count is compared at
+  rendezvous before any endpoint exists, alongside the UCX version check, and refused with a message
+  naming the variable.
+* The all_reduce ring's bidirectional mode changes fp *summation order* for the half that travels
+  counter-clockwise — as does switching the ring threshold, and as the ring already differs from the
+  flat exchange's peer order. Every rank still sees identical bytes (a block is reduced once, on one
+  path, then all-gathered verbatim), which is the property the group needs. The `all_gather` ring is
+  bit-identical either way by construction: it does no arithmetic.
+
+**UCC was probed and is not reachable here (task #266).** `torch.distributed.is_ucc_available()` is
+`False` on both rigs (torch 2.11.0+cu130), `init_process_group(backend="ucc")` raises
+`Unknown c10d backend type UCC`, `torch.__config__.show()` carries no UCC entry, and no `libucc` is
+installed on either host. The c10d UCC backend is compiled into `libtorch`, not loaded as a runtime
+plugin, so reaching it needs: a UCC build on both hosts (which wants the UCX **development**
+headers — rig 2 has the runtime libraries only, the same gap that made the ctypes binding the right
+choice for this transport), plus a **PyTorch source build with `USE_UCC=1` on both hosts**. That is
+a multi-hour CUDA build per host on a swapless box limited to `-j4`, against two different accel
+stacks. Not a 30-minute probe; recorded as a cost, not attempted.
+
+**Where cross-rig TP stands on this hardware.** With `WORKERS=2` the decode `all_reduce` is ~89 us
+and the 4-token verify `all_reduce` ~202 us at world 4. The raw link does 80 KiB in 28.1 us, so the
+wire is ~14 % of that verify collective and the other ~86 % is per-rank host work and lock-step
+turnaround. What is left is structural for this rig: there is no GPUDirect between the NIC and these
+GeForce cards, so every byte must cross D2H and H2D and be touched by the CPU; the ring's `2(W-1)`
+hops are serially dependent; and one core per rank progresses the worker(s) — a second *context*
+does not add a core. The remaining lever of that shape is a dedicated progress **thread**, which
+would trade `THREAD_MODE_SINGLE` (the fast mode this transport deliberately uses) for a core, and is
+untested. Treat ~89 us / ~202 us per collective as this rig's floor.
+
 Transport throughput, median per direction while the reverse direction runs simultaneously, world 2,
 5 repetitions of per-cell medians:
 

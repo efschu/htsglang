@@ -236,6 +236,14 @@ matching claim in `FEATURES_VS_UPSTREAM.md` section 21, predate tasks
   `--dist-init-addr <LAN ip>:<port>` (control plane stays on the 1 GbE LAN;
   only UCX rides the 40G link); per rank `UCX_TLS=rc,self,sm`,
   `UCX_IB_GID_INDEX=3`, `UCX_NET_DEVICES=<port>`.
+- Add `SGLANG_HTCCL_UCX_WORKERS=2` on **every** rank for a cross-rig group:
+  a second UCX context per rank, with the flat exchange's peers split over
+  the two, is -7.6 % on the bs=1 decode all-reduce and -8.1 % on the decode
+  all-gather, and neutral at ring sizes (task #266, table in FEATURES section
+  21). It is rank-uniform and enforced as such — a rank left at the default 1
+  is refused at rendezvous with a message naming the variable, not a hang.
+  Leave `SGLANG_HTCCL_UCX_RING_BIDIR` at 0: splitting the ring as well
+  measured +17 % and exists only as the A/B control.
 - `ucx`/`gloo`/`shm` are host-staged: the boot must disable CUDA graphs
   (section 6.3), otherwise it is rejected at startup by design.
 - Both hosts must load the same UCX release (`SGLANG_HTCCL_UCX_LIB` points at
@@ -278,15 +286,25 @@ different devices is legal and useful — it splits (a)+(b) from (c) — and the
 server logs that (b) stays on the `small` link rather than silently implying a
 split that is not there.
 
-Genuine per-class routing inside the collective plane needs a **second UCX
-context**: a second `UcpWorker`, a second address exchange at rendezvous (one
-extra `all_gather_object`), a size-keyed worker selector, and — the part that
-carries the risk — a guarantee that every rank picks the same worker for the
-same collective, since a disagreement deadlocks rather than returning a wrong
-answer. Estimate ~200 lines plus a cross-rig validation pass; roughly a day.
-It is not built. (d) is left alone on purpose: it takes interface names rather
-than RDMA device names, and the reference bring-up deliberately keeps the
-control plane on the 1 GbE LAN.
+The **second UCX context** this section used to describe as unbuilt now exists
+(`SGLANG_HTCCL_UCX_WORKERS`, task #266): a second `UcpWorker`, its address
+carried in the same rendezvous `all_gather_object`, and a worker selector that
+every rank evaluates identically — `(rank + peer) % ways` for the flat
+exchange, which is symmetric in the pair, so the two ends agree without
+exchanging anything. The count itself is checked at rendezvous, before any
+endpoint exists, because a disagreement deadlocks rather than returning a
+wrong answer.
+
+What it did **not** turn into is per-class routing. It splits by PEER, not by
+message size: classes (a) and (b) still share both contexts, so the table
+above is unchanged. Routing 512 KiB prefill chunks to one line and 8 KiB
+decode all-reduces to another would additionally need the two contexts pinned
+to different `NET_DEVICES`, which is a one-line change on top and untested —
+and pointless on this rig, for the reason in the next paragraph. What the
+second context actually bought was latency, not routing: see FEATURES section
+21 for the numbers. (d) is left alone on purpose: it takes interface names
+rather than RDMA device names, and the reference bring-up deliberately keeps
+the control plane on the 1 GbE LAN.
 
 **Is it worth setting?** On this rig, no: measured 8 B message latency is
 1.47 us on the FEC-free 40G RoCE link vs 1.58 us on the 100G one, and the

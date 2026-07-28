@@ -15,6 +15,12 @@
 #        OP=<all_reduce|all_gather>  collective for the SIZES sweep
 #        GRAIN=<elems>     sets SGLANG_HTCCL_UCX_GRAIN_ELEMS (0 = unchunked
 #                          host passes, the pre-#263 A/B control)
+#        WORKERS=<n>       sets SGLANG_HTCCL_UCX_WORKERS (2 = second UCX
+#                          context; splits the flat exchange's peers over the
+#                          two workers, task #266)
+#        RING_BIDIR=<0|1>  sets SGLANG_HTCCL_UCX_RING_BIDIR (needs WORKERS=2;
+#                          runs the ring half each way round. Measured
+#                          negative on this link -- kept as the A/B control)
 #        GATE=1            exactness gate across the threshold, not timing
 set -u
 ITERS="${1:-200}"
@@ -32,8 +38,13 @@ PVE_PY="${PVE_MINIFORGE:-<PVE_MINIFORGE>}/bin/python3.12"
 RIG2_PY="${RIG2_VENV:-<RIG2_VENV>}/bin/python"
 SCRIPT=$R/scripts/r3val/link_collective_cost.py
 RIG2_SCRIPT="${RIG2_COST_SCRIPT:-/root/link_collective_cost.py}"
-COMM=$R/python/sglang/srt/distributed/device_communicators
-RIG2_COMM="${RIG2_SGLANG_SRC:-<RIG2_SGLANG_SRC>}/sglang/srt/distributed/device_communicators"
+# Where each side imports htccl_ucx{,_bindings} from. Overridable so two trees
+# can be A/B'd inside ONE measurement session: this link drifts a few percent
+# between sessions, which is the same order as the effects being measured, so
+# "run A, edit, run B" is not a comparison. Point COMM/RIG2_COMM at a second
+# checkout and interleave instead.
+COMM="${COMM:-$R/python/sglang/srt/distributed/device_communicators}"
+RIG2_COMM="${RIG2_COMM:-${RIG2_SGLANG_SRC:-<RIG2_SGLANG_SRC>}/sglang/srt/distributed/device_communicators}"
 
 MASTER="${RDMA_R1:-<RDMA_R1>}"
 PORT=${PORT:-29581}
@@ -51,6 +62,8 @@ EXTRA=""
 [ -n "${RING_KIB:-}" ] && EXTRA="$EXTRA SGLANG_HTCCL_UCX_RING_KIB=$RING_KIB"
 [ -n "${AG_RING_KIB:-}" ] && EXTRA="$EXTRA SGLANG_HTCCL_UCX_AG_RING_KIB=$AG_RING_KIB"
 [ -n "${GRAIN:-}" ] && EXTRA="$EXTRA SGLANG_HTCCL_UCX_GRAIN_ELEMS=$GRAIN"
+[ -n "${WORKERS:-}" ] && EXTRA="$EXTRA SGLANG_HTCCL_UCX_WORKERS=$WORKERS"
+[ -n "${RING_BIDIR:-}" ] && EXTRA="$EXTRA SGLANG_HTCCL_UCX_RING_BIDIR=$RING_BIDIR"
 
 COMMON="MASTER_ADDR=$MASTER MASTER_PORT=$PORT UCX_TLS=rc,self,sm UCX_IB_GID_INDEX=3 $EXTRA"
 PVE_ENV="$COMMON UCX_NET_DEVICES=rocep4s0f1:1 SGLANG_HTCCL_UCX_LIB=/opt/ucx116/lib/libucp.so.0 GLOO_SOCKET_IFNAME=enp4s0f1np1"

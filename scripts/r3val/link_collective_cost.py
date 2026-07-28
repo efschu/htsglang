@@ -47,16 +47,49 @@ class Phases:
     Wraps the two ctypes entry points the transport calls in a fixed order
     (first post_recv, then wait), so the timestamps come from the real call
     sites without editing the transport.
+
+    With more than one UCX worker (SGLANG_HTCCL_UCX_WORKERS, task #266) the
+    ring and the flat fast paths do not call ``UcpWorker.wait`` at all -- they
+    call the transport's ``_wait_split``, which progresses every worker in one
+    loop. Both are wrapped: ``_wait_split`` delegates to ``UcpWorker.wait``
+    when only one worker has anything outstanding, so the two nest, and
+    ``wait_in`` is recorded once (outermost) while ``wait_out`` is overwritten
+    until the outermost call returns. ``post_recv`` is wrapped on every
+    worker, otherwise a run would report the first post of the clockwise half
+    only.
     """
 
     def __init__(self, transport):
         self.t = transport
         self.w = transport.worker
-        self._orig_recv = self.w.post_recv
-        self._orig_wait = self.w.wait
+        self._workers = getattr(transport, "workers", (transport.worker,))
+        self._orig_recv = [w.post_recv for w in self._workers]
+        self._orig_wait = [w.wait for w in self._workers]
+        self._orig_split = getattr(transport, "_wait_split", None)
         self.reset()
-        self.w.post_recv = self._recv
-        self.w.wait = self._wait
+        for i, w in enumerate(self._workers):
+            w.post_recv = self._mk_recv(self._orig_recv[i])
+            w.wait = self._mk_wait(self._orig_wait[i])
+        if self._orig_split is not None:
+            transport._wait_split = self._mk_wait(self._orig_split)
+
+    def _mk_recv(self, orig):
+        def f(*a, **kw):
+            if self.first_post is None:
+                self.first_post = time.perf_counter()
+            return orig(*a, **kw)
+
+        return f
+
+    def _mk_wait(self, orig):
+        def f(*a, **kw):
+            if self.wait_in is None:
+                self.wait_in = time.perf_counter()
+            r = orig(*a, **kw)
+            self.wait_out = time.perf_counter()
+            return r
+
+        return f
 
     def reset(self):
         self.t0 = 0.0
@@ -64,21 +97,12 @@ class Phases:
         self.wait_in = None
         self.wait_out = None
 
-    def _recv(self, *a, **kw):
-        if self.first_post is None:
-            self.first_post = time.perf_counter()
-        return self._orig_recv(*a, **kw)
-
-    def _wait(self, *a, **kw):
-        if self.wait_in is None:
-            self.wait_in = time.perf_counter()
-        r = self._orig_wait(*a, **kw)
-        self.wait_out = time.perf_counter()
-        return r
-
     def restore(self):
-        self.w.post_recv = self._orig_recv
-        self.w.wait = self._orig_wait
+        for i, w in enumerate(self._workers):
+            w.post_recv = self._orig_recv[i]
+            w.wait = self._orig_wait[i]
+        if self._orig_split is not None:
+            self.t._wait_split = self._orig_split
 
     def split(self, t0, t1):
         """(stage, post, wait, finish) in seconds for one collective."""
@@ -174,7 +198,7 @@ def main():
         # Sizes straddling the ring threshold, including the ragged case the
         # ring pads (numel not a multiple of world) and the exact boundary.
         bad = 0
-        for kib in (8, 16, 23, 24, 25, 32, 80, 128):
+        for kib in (8, 16, 23, 24, 25, 32, 80, 128, 256):
             for extra in (0, 1, 3):
                 n = kib * 1024 // 4 + extra
                 x = torch.arange(n, dtype=torch.float32) * (a.rank + 1) + 1.0
@@ -199,7 +223,8 @@ def main():
         print(f"[rank {a.rank}] gate: {bad} mismatches "
               f"(all_reduce ring {t.ring_bytes // 1024} KiB, all_gather ring "
               f"{str(ag_kib) + ' KiB' if ag_kib else 'off'}, "
-              f"world {a.world})", flush=True)
+              f"workers {getattr(t, 'ways', 1)}, ring ways "
+              f"{getattr(t, '_ring_ways', 1)}, world {a.world})", flush=True)
         t.close()
         dist.destroy_process_group()
         return 1 if bad else 0

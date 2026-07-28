@@ -608,6 +608,25 @@ class Envs:
     # prepare_attn (rides the fuse_mlp_allreduce seam). Requires the ucx
     # transport; rank-uniform like every other flag in this block.
     SGLANG_HTCCL_UCX_OVERLAP = EnvBool(False)
+    # Number of independent UCX contexts/workers per rank for the collective
+    # plane (task #266). 2 splits the flat exchange's peers over the two
+    # workers by the symmetric (rank + peer) % ways rule, so no rank has all
+    # 2(W-1) requests of a decode collective on one progress engine. Measured
+    # cross-rig at world 4: -7.6 % all_reduce and -8.1 % all_gather at the
+    # 20 KiB bs=1 decode size, neutral (within noise) at every ring size.
+    # Default 1 -- the transport also runs single-host over loopback/shm,
+    # where a second context has no peers to spread. RANK-UNIFORM and more
+    # strictly so than most: a rank that disagrees posts where nobody is
+    # listening, which hangs rather than returning a wrong answer. Checked at
+    # rendezvous before any endpoint exists.
+    SGLANG_HTCCL_UCX_WORKERS = EnvInt(1)
+    # Additionally run the RING half each way round, one direction per worker
+    # (needs ..._WORKERS >= 2). Measured negative on this link -- a ring step
+    # is two requests in lock step, so there is no concurrency for a second
+    # worker to expose, and halving the bytes per hop buys nothing where the
+    # bytes were never the cost (task #244). +17 % on an 80 KiB all_reduce.
+    # Kept as the A/B control and for links where the bytes DO dominate.
+    SGLANG_HTCCL_UCX_RING_BIDIR = EnvBool(False)
     # --- per-message-class link selection (task #240) ----------------------
     # Env spelling of --collective-net-small / --collective-net-bulk. Set
     # either directly or let server-args resolution export it; the flag and

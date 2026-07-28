@@ -55,6 +55,7 @@ from sglang.srt.distributed.device_communicators.htccl_ucx_bindings import (
     UcpWorker,
     UcxError,
     UcxVersionMismatch,
+    wait_multi,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,68 @@ _AG_RING_BYTES = int(os.environ.get("SGLANG_HTCCL_UCX_AG_RING_KIB", "32")) * 102
 _FP32_REDUCE = bool(int(os.environ.get("SGLANG_HTCCL_FP32_REDUCE", "1")))
 
 _TIMEOUT_S = float(os.environ.get("SGLANG_HTCCL_UCX_TIMEOUT_S", "300"))
+
+# How many independent UCX contexts/workers this rank builds for the
+# collective plane. 1 is the shape every measurement up to task #263 was taken
+# on: one context, one worker, one endpoint per peer, everything on it.
+#
+# 2 exists because the single worker is the thing the ring was already winning
+# against. Task #263 established that an all_gather ring beats the flat
+# exchange while moving the SAME bytes, purely because it hands the worker two
+# requests at a time instead of 2(W-1); and task #244 established that the
+# same world-4 group with no wire at all is SLOWER than across the RDMA link.
+# Both point at one rank's serialised worker, not at the link.
+#
+# With 2 workers the two structures that were serialised on one worker are
+# split:
+#
+#   * the flat exchange assigns peer pair (r, p) to worker (r + p) % ways --
+#     symmetric in r and p, so both ends of a pair pick the same worker
+#     without exchanging anything;
+#   * the ring runs BIDIRECTIONALLY, half the payload clockwise on worker 0
+#     and half counter-clockwise on worker 1, so a step moves half the bytes
+#     per hop in the same number of steps.
+#
+# RANK-UNIFORM, like every other SGLANG_HTCCL* knob and more strictly than
+# most: a rank that disagrees about the worker count posts one half of a step
+# where its peer is not listening, and the collective hangs rather than
+# returning a wrong answer. wait_multi's timeout message names this.
+#
+# The default is 1 because 2 did not pay on this hardware -- see the
+# measurement in FEATURES_VS_UPSTREAM section 21 (task #266). It is kept as a
+# knob because the mechanism is real and the ceiling it runs into is this
+# rig's (one core per rank progressing both workers), not the design's.
+_WORKERS = max(int(os.environ.get("SGLANG_HTCCL_UCX_WORKERS", "1")), 1)
+
+# Above this world size the bidirectional ring falls back to the
+# unidirectional one: the direction is encoded into the 8-bit tag phase as
+# 2*step + direction, which the all-gather half of an all_reduce ring runs up
+# to 4W-5. The unidirectional ring's own phase ceiling is 2W-3.
+_BIDIR_MAX_WORLD = 64
+
+# Whether the second worker also splits the RING, half the payload each way
+# round. Off, because it measured negative and the two halves of the knob turn
+# out to be independent mechanisms with opposite signs (task #266, cross-rig
+# world 4, median of 100 after 20 warmup, interleaved A/B):
+#
+#                  all_reduce                     all_gather
+#     KiB      20      80     128     256      20      80     128     256
+#     1 wkr  96.6   203.1   277.7   573.3    99.0   304.4   463.4  1007.6
+#     2 wkr  89.3   236.8   301.4   599.1    92.5   327.6   487.7  1047.8
+#              -8%    +17%     +9%     +5%     -7%     +8%     +5%     +4%
+#
+# The gain is the FLAT exchange: (W-1) simultaneous requests per direction on
+# one worker is the cost task #263 already caught the all_gather ring beating,
+# and splitting the peers over two workers takes another 7 % off it. The loss
+# is the ring: a ring step is two requests in lock step, so there is no
+# concurrency for a second worker to expose -- halving the bytes per hop buys
+# nothing on a link where task #244 already showed the bytes are not the cost,
+# and every spin pass now progresses two engines instead of one.
+#
+# So the two are shipped separately: ..._WORKERS=2 splits the flat exchange
+# (the bs=1 decode collectives), ..._RING_BIDIR=1 additionally splits the ring
+# (the 4-token verify collectives), and only the first one pays here.
+_RING_BIDIR = bool(int(os.environ.get("SGLANG_HTCCL_UCX_RING_BIDIR", "0")))
 
 
 def _collective_net_device() -> str | None:
@@ -312,6 +375,11 @@ class HTCCLUcxTransport:
     # merely unlikely.
     HTCCL_OPS = frozenset({"all_reduce", "all_gather", "broadcast", "reduce_scatter"})
 
+    # Class-level default so _init_worker_routing reads the same attribute
+    # whether it is called from __init__ or from a test fixture that built the
+    # transport with __new__ and never went through it.
+    ring_bidir = False
+
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -322,6 +390,8 @@ class HTCCLUcxTransport:
         pipeline: bool = _PIPELINE,
         ag_ring_bytes: int = _AG_RING_BYTES,
         net_device: str | None = None,
+        workers: int = _WORKERS,
+        ring_bidir: bool = _RING_BIDIR,
     ):
         self.cpu_group = cpu_group
         self.device = device
@@ -381,12 +451,15 @@ class HTCCLUcxTransport:
 
         self.lib = UcpLibrary.instance()
         self.net_device = _collective_net_device() if net_device is None else net_device
-        self.worker = UcpWorker(
-            self.lib, timeout_s=_TIMEOUT_S, net_devices=self.net_device
+        self.ring_bidir = bool(ring_bidir)
+        self.workers = tuple(
+            UcpWorker(self.lib, timeout_s=_TIMEOUT_S, net_devices=self.net_device)
+            for _ in range(max(int(workers), 1))
         )
+        self._init_worker_routing()
 
         # One collective carries both halves of the rendezvous: the version
-        # (checked first) and the worker address (used only if the check
+        # (checked first) and the worker addresses (used only if the check
         # passes). Gathering them together keeps the group in lock step -- a
         # rank must not create endpoints while a peer is still aborting.
         info = {
@@ -394,30 +467,41 @@ class HTCCLUcxTransport:
             "version": self.lib.version(),
             "version_string": self.lib.version_string(),
             "lib_path": self.lib.path,
-            "address": self.worker.address(),
+            # List, one per worker. `address` (singular) is kept alongside it
+            # so a rank running an older tree still finds what it reads --
+            # this rendezvous is the only thing two sides of a cross-rig group
+            # exchange before any endpoint exists.
+            "address": self.workers[0].address(),
+            "addresses": [w.address() for w in self.workers],
         }
         gathered: list = [None] * self.world_size
         dist.all_gather_object(gathered, info, group=cpu_group)
         self._check_version_parity(gathered)
+        self._check_worker_parity(gathered)
 
         for peer in range(self.world_size):
             if peer == self.rank:
                 continue
-            self.worker.connect(peer, gathered[peer]["address"])
+            for i, w in enumerate(self.workers):
+                w.connect(peer, gathered[peer]["addresses"][i])
 
         # UCX wires an endpoint up lazily, on first use. Pay that here so the
         # first decode step does not: a wireup handshake is orders of
         # magnitude more expensive than the ~1.5 us the link is capable of,
-        # and it would otherwise land inside the first forward pass.
-        self.barrier()
+        # and it would otherwise land inside the first forward pass. Every
+        # worker's endpoints are warmed, not just the ones the flat exchange
+        # happens to route through at this world size.
+        self._wireup()
         logger.info(
             "HTCCL: ucx transport ready (rank %d/%d, UCX %s, chunk %d MiB, "
-            "ring threshold %d KiB, net device %s).",
+            "ring threshold %d KiB, workers %d%s, net device %s).",
             self.rank,
             self.world_size,
             info["version_string"],
             self.chunk_bytes // (1024 * 1024),
             self.ring_bytes // 1024,
+            self.ways,
+            " (bidirectional ring)" if self._ring_ways == 2 else "",
             # Deliberately NOT rank-uniform, unlike every SGLANG_HTCCL* knob:
             # the device NAME is per host (rocep4s0f1 here, rocep1s0f1 on the
             # peer). Only the link the names resolve to has to be the same,
@@ -464,6 +548,117 @@ class HTCCLUcxTransport:
             f"{'.'.join(str(v) for v in newest)}; the lowest is the one every "
             "rank must be able to load."
         )
+
+    def _check_worker_parity(self, gathered: list) -> None:
+        """Refuse a group whose ranks built different numbers of workers.
+
+        ``SGLANG_HTCCL_UCX_WORKERS`` decides which worker carries which half
+        of a collective. A rank that disagrees does not compute a wrong
+        answer, it posts where nobody is listening and the group hangs at the
+        first collective -- the failure mode this whole file is written to
+        avoid. Checked at rendezvous, before any endpoint exists, like the
+        version check.
+        """
+        counts = {len(g["addresses"]) for g in gathered}
+        if len(counts) == 1:
+            return
+        lines = [
+            f"  rank {g['rank']}: {len(g['addresses'])} worker(s)"
+            for g in sorted(gathered, key=lambda g: g["rank"])
+        ]
+        raise UcxError(
+            "HTCCL ucx: the ranks of this group built different numbers of "
+            "UCX workers. The worker a collective's half rides is derived "
+            "from that count on each side independently, so a mismatch hangs "
+            "the group instead of failing.\n"
+            + "\n".join(lines)
+            + "\n\nSet SGLANG_HTCCL_UCX_WORKERS to the same value on every "
+            "rank (it is rank-uniform, like every other SGLANG_HTCCL* knob)."
+        )
+
+    # ------------------------------------------------------------------
+    # multi-worker plumbing
+    #
+    # All of this is inert at ways == 1: _progress_all is the single worker's
+    # ctypes partial, _wait_split calls UcpWorker.wait, and every routing
+    # table below collapses to "worker 0".
+    # ------------------------------------------------------------------
+
+    def _init_worker_routing(self) -> None:
+        """Derive every worker-routing table from ``self.workers``.
+
+        A method rather than inline ``__init__`` code because the unit tests
+        build a transport with ``__new__`` and a fake worker, and a routing
+        table that only exists inside ``__init__`` is one the fixtures have to
+        re-derive by hand -- which is how a fixture silently stops mirroring
+        the thing it is standing in for.
+        """
+        self.ways = len(self.workers)
+        # Every existing call site, and the r3val harness, address worker 0 by
+        # this name. Kept as the single-worker configuration's only worker so
+        # nothing below has to branch on `ways` to reach it.
+        self.worker = self.workers[0]
+        # Worker carrying the flat exchange with each peer. Symmetric in the
+        # pair, so the two ends agree without exchanging anything; a rule that
+        # was not symmetric (say `peer % ways`) would have rank 0 posting on
+        # worker 1 while rank 1 listened on worker 0.
+        self._peer_worker = tuple(
+            (self.rank + p) % self.ways for p in range(self.world_size)
+        )
+        # Same table, resolved to the worker object. The flat fast paths index
+        # this instead of looking `self.worker` up, so the single-worker
+        # configuration pays a tuple index where it used to pay an attribute
+        # load -- not a new branch on the decode path.
+        self._peer_w = tuple(self.workers[i] for i in self._peer_worker)
+        # Bidirectional only when asked for AND with a second worker to put the
+        # second direction on: one worker running both directions would
+        # serialise them again AND double its outstanding requests, which is
+        # the opposite of what the ring is for.
+        self._ring_ways = (
+            2
+            if self.ring_bidir
+            and self.ways >= 2
+            and self.world_size <= _BIDIR_MAX_WORLD
+            else 1
+        )
+        # Progress callback handed to the interleaved host passes. Bound to
+        # the single worker's ctypes partial when there is only one, so the
+        # default configuration keeps exactly the call it had before.
+        self._progress_all = (
+            self.worker.progress if self.ways == 1 else self._progress_every
+        )
+
+    def _progress_every(self) -> None:
+        for w in self.workers:
+            w.progress()
+
+    def _wait_split(self, req_lists) -> None:
+        """Wait on ``req_lists[i]`` on ``self.workers[i]``."""
+        if self.ways == 1:
+            self.worker.wait(req_lists[0])
+            return
+        wait_multi(self.workers, req_lists, _TIMEOUT_S)
+
+    def _wireup(self) -> None:
+        """One-byte exchange with every peer on every worker.
+
+        The barrier alone is not enough once ways > 1: at world 2 the flat
+        exchange's ``(r + p) % ways`` rule routes the only peer pair to ONE
+        worker, so the other worker's endpoints would still be cold and the
+        first ring collective would pay a wireup handshake inside a forward
+        pass -- exactly what wiring up at construction exists to prevent.
+        """
+        for i, w in enumerate(self.workers):
+            send_view, send_ptr, _ = self._slot(f"wu_s{i}", 1, torch.uint8)
+            send_view.zero_()
+            seq = self._next_seq()
+            reqs = []
+            for p in self._peers:
+                rptr = self._slot(f"wu_r{i}_{p}", 1, torch.uint8)[1]
+                reqs.append(w.post_recv(rptr, 1, _tag(seq, 0, p, 0)))
+            for p in self._peers:
+                reqs.append(w.post_send(p, send_ptr, 1, _tag(seq, 0, self.rank, 0)))
+            w.wait(reqs)
 
     # ------------------------------------------------------------------
     # transport seam
@@ -668,49 +863,52 @@ class HTCCLUcxTransport:
     # ------------------------------------------------------------------
 
     def _post_send_bytes(
-        self, peer: int, ptr: int, total: int, seq, phase, chunk0=0
+        self, peer: int, ptr: int, total: int, seq, phase, chunk0=0, w=None
     ) -> list:
         """Post ``total`` bytes at ``ptr`` to ``peer``, split into chunks.
+
+        ``w`` is the worker to post on; ``None`` means worker 0, which is the
+        only one that exists in the default configuration.
 
         The single-chunk case is spelled out separately because it is what
         every small collective and every step of the pipeline below hits: the
         loop's `while`, `min` and index bookkeeping are pure overhead there,
         and at 8 KiB the whole collective is only ~12 us.
         """
+        if w is None:
+            w = self.worker
         if total <= self.chunk_bytes:
-            return [
-                self.worker.post_send(
-                    peer, ptr, total, _tag(seq, phase, self.rank, chunk0)
-                )
-            ]
+            return [w.post_send(peer, ptr, total, _tag(seq, phase, self.rank, chunk0))]
         reqs = []
         off, idx = 0, chunk0
         while off < total:
             n = min(self.chunk_bytes, total - off)
             reqs.append(
-                self.worker.post_send(
-                    peer, ptr + off, n, _tag(seq, phase, self.rank, idx)
-                )
+                w.post_send(peer, ptr + off, n, _tag(seq, phase, self.rank, idx))
             )
             off += n
             idx += 1
         return reqs
 
     def _post_recv_bytes(
-        self, src: int, ptr: int, total: int, seq, phase, chunk0=0
+        self, src: int, ptr: int, total: int, seq, phase, chunk0=0, w=None
     ) -> list:
+        if w is None:
+            w = self.worker
         if total <= self.chunk_bytes:
-            return [self.worker.post_recv(ptr, total, _tag(seq, phase, src, chunk0))]
+            return [w.post_recv(ptr, total, _tag(seq, phase, src, chunk0))]
         reqs = []
         off, idx = 0, chunk0
         while off < total:
             n = min(self.chunk_bytes, total - off)
-            reqs.append(self.worker.post_recv(ptr + off, n, _tag(seq, phase, src, idx)))
+            reqs.append(w.post_recv(ptr + off, n, _tag(seq, phase, src, idx)))
             off += n
             idx += 1
         return reqs
 
-    def _post_send(self, peer: int, view: torch.Tensor, seq, phase, chunk0=0) -> list:
+    def _post_send(
+        self, peer: int, view: torch.Tensor, seq, phase, chunk0=0, w=None
+    ) -> list:
         """Post ``view`` to ``peer``, split into chunk_bytes pieces."""
         return self._post_send_bytes(
             peer,
@@ -719,9 +917,12 @@ class HTCCLUcxTransport:
             seq,
             phase,
             chunk0,
+            w,
         )
 
-    def _post_recv(self, src: int, view: torch.Tensor, seq, phase, chunk0=0) -> list:
+    def _post_recv(
+        self, src: int, view: torch.Tensor, seq, phase, chunk0=0, w=None
+    ) -> list:
         return self._post_recv_bytes(
             src,
             view.data_ptr(),
@@ -729,6 +930,7 @@ class HTCCLUcxTransport:
             seq,
             phase,
             chunk0,
+            w,
         )
 
     def _next_seq(self) -> int:
@@ -748,12 +950,17 @@ class HTCCLUcxTransport:
         set, so the whole exchange costs one round trip rather than N-1 of
         them -- and cannot deadlock on posting order.
         """
-        reqs = []
+        pw = self._peer_worker
+        reqs = [[] for _ in self.workers]
         for peer, view in recvs.items():
-            reqs += self._post_recv(peer, view, seq, phase)
+            reqs[pw[peer]] += self._post_recv(
+                peer, view, seq, phase, 0, self.workers[pw[peer]]
+            )
         for peer in recvs:
-            reqs += self._post_send(peer, send, seq, phase)
-        self.worker.wait(reqs)
+            reqs[pw[peer]] += self._post_send(
+                peer, send, seq, phase, 0, self.workers[pw[peer]]
+            )
+        self._wait_split(reqs)
 
     def barrier(self) -> None:
         """One-byte all-to-all exchange. Also warms up every endpoint.
@@ -781,12 +988,17 @@ class HTCCLUcxTransport:
                 self._bar_slots = slots
             send_ptr, recvs = slots
             seq = self._next_seq()
-            reqs = []
+            pw = self._peer_worker
+            reqs = [[] for _ in self.workers]
             for peer, rptr in recvs:
-                reqs += self._post_recv_bytes(peer, rptr, 1, seq, 0)
+                reqs[pw[peer]] += self._post_recv_bytes(
+                    peer, rptr, 1, seq, 0, 0, self.workers[pw[peer]]
+                )
             for peer, _ in recvs:
-                reqs += self._post_send_bytes(peer, send_ptr, 1, seq, 0)
-            self.worker.wait(reqs)
+                reqs[pw[peer]] += self._post_send_bytes(
+                    peer, send_ptr, 1, seq, 0, 0, self.workers[pw[peer]]
+                )
+            self._wait_split(reqs)
 
     # ------------------------------------------------------------------
     # all_reduce
@@ -806,12 +1018,85 @@ class HTCCLUcxTransport:
         for view in recvs.values():
             _host_add_(host, view)
 
+    def _wire_all_reduce_ring_bidir(self, host: torch.Tensor, seq: int) -> None:
+        """Two rings, opposite directions, one worker each.
+
+        The unidirectional ring below moves ``n/W`` bytes per hop and takes
+        ``2(W-1)`` hops, all of them through one UCX worker. Splitting the
+        payload in half and running the second half the other way round the
+        ring keeps the hop COUNT (the halves are independent, so their steps
+        proceed together) and halves the bytes per hop -- and the two halves
+        ride separate contexts, so neither waits on the other's progress.
+
+        ``host`` is padded to a multiple of ``2 * world_size`` by the caller,
+        so both halves split into equal blocks.
+
+        REDUCTION ORDER. Each block is summed along the ring it travels, so
+        the counter-clockwise half accumulates its ranks in the opposite order
+        from the clockwise half -- and from the unidirectional ring, and from
+        the flat exchange, which sums in peer order. All three are valid
+        orders and none of them is the others' bit-for-bit equal in general
+        (fp addition is not associative; under the default fp32 reduce the
+        inputs are upcast first, which bounds the difference but does not
+        remove it). What IS guaranteed, and is what the group needs, is that
+        every rank sees the SAME bytes: a block is reduced exactly once, on
+        one path, and then all-gathered verbatim. Switching worker count
+        therefore changes the last bits of a large all_reduce exactly as
+        switching the ring threshold already does.
+        """
+        N = self.world_size
+        half = host.numel() // 2
+        block = half // N
+        parts = (host[:half], host[half:])
+        blocks = tuple(
+            tuple(parts[d][i * block : (i + 1) * block] for i in range(N))
+            for d in (0, 1)
+        )
+        tmps = (
+            self._staging("ar_ring_cw", block, host.dtype),
+            self._staging("ar_ring_ccw", block, host.dtype),
+        )
+        # d = 0 clockwise (send right, receive left), d = 1 counter-clockwise.
+        # `sign` turns both into one schedule: the block a rank sends at step
+        # s is `rank + sign * s`, the one it receives is `rank + sign * (s+1)`.
+        sign = (-1, 1)
+        dst = ((self.rank + 1) % N, (self.rank - 1) % N)
+        src = ((self.rank - 1) % N, (self.rank + 1) % N)
+        ws = self.workers
+
+        for step in range(N - 1):
+            reqs = [[], []]
+            recv_idx = [0, 0]
+            for d in (0, 1):
+                si = (self.rank + sign[d] * step) % N
+                recv_idx[d] = (self.rank + sign[d] * (step + 1)) % N
+                phase = 2 * step + d
+                reqs[d] = self._post_recv(src[d], tmps[d], seq, phase, 0, ws[d])
+                reqs[d] += self._post_send(dst[d], blocks[d][si], seq, phase, 0, ws[d])
+            self._wait_split(reqs)
+            for d in (0, 1):
+                _host_add_(blocks[d][recv_idx[d]], tmps[d])
+
+        base = 2 * (N - 1)
+        for step in range(N - 1):
+            reqs = [[], []]
+            for d in (0, 1):
+                si = (self.rank + sign[d] * (step - 1)) % N
+                ri = (self.rank + sign[d] * step) % N
+                phase = base + 2 * step + d
+                reqs[d] = self._post_recv(src[d], blocks[d][ri], seq, phase, 0, ws[d])
+                reqs[d] += self._post_send(dst[d], blocks[d][si], seq, phase, 0, ws[d])
+            self._wait_split(reqs)
+
     def _wire_all_reduce_ring(self, host: torch.Tensor, seq: int) -> None:
         """Ring reduce-scatter + all-gather. Bandwidth-optimal for large ones.
 
         ``host`` is padded to a multiple of world_size by the caller, so every
         block is the same length and the schedule is symmetric across ranks.
         """
+        if self._ring_ways == 2:
+            self._wire_all_reduce_ring_bidir(host, seq)
+            return
         N = self.world_size
         block = host.numel() // N
         blocks = [host[i * block : (i + 1) * block] for i in range(N)]
@@ -918,19 +1203,29 @@ class HTCCLUcxTransport:
             # any stream order, so the bytes must be resident first. This is
             # the transport's one irreducible drain per all_reduce.
             _host_copy_(send_view, src)  # (+ upcast)
-            reqs = []
+            # One request list per worker. At ways == 1 this is a single list
+            # and _wait_split hands it straight to UcpWorker.wait, so the
+            # hand-specialised 1-/2-request spins still apply; above that the
+            # (W-1) peers are spread over the workers by the symmetric
+            # `(rank + peer) % ways` rule, which is the point -- the flat
+            # exchange's 2(W-1) simultaneous requests on ONE worker is the
+            # cost the all_gather ring was already beating (task #263).
+            pw, pws = self._peer_worker, self._peer_w
+            reqs = [[] for _ in self.workers]
             recv_views = []
             for i, peer in enumerate(peers):
                 rv, rptr, rnbytes = self._slot(rkeys[i], n, dtype)
                 recv_views.append(rv)
-                reqs.append(self.worker.post_recv(rptr, rnbytes, _tag(seq, 0, peer, 0)))
+                reqs[pw[peer]].append(
+                    pws[peer].post_recv(rptr, rnbytes, _tag(seq, 0, peer, 0))
+                )
             for peer in peers:
-                reqs.append(
-                    self.worker.post_send(
+                reqs[pw[peer]].append(
+                    pws[peer].post_send(
                         peer, send_ptr, send_nbytes, _tag(seq, 0, self.rank, 0)
                     )
                 )
-            self.worker.wait(reqs)
+            self._wait_split(reqs)
             for rv in recv_views:
                 _host_add_(send_view, rv)
             # Copy-out is non_blocking: its only consumer is the compute
@@ -946,7 +1241,7 @@ class HTCCLUcxTransport:
                 f"chunks, more than the 2^24 the tag layout encodes. Raise "
                 f"SGLANG_HTCCL_UCX_CHUNK_MIB."
             )
-        prog = self.worker.progress if self.progress_bytes > 0 else None
+        prog = self._progress_all if self.progress_bytes > 0 else None
         staged: dict = {}
 
         def stage(k: int) -> None:
@@ -1012,12 +1307,12 @@ class HTCCLUcxTransport:
                 return out
 
             # The ring needs equal blocks; pad up and zero the tail so every
-            # rank contributes zeroes there and the sum is unaffected.
-            padded = (
-                ((n + self.world_size - 1) // self.world_size) * self.world_size
-                if use_ring
-                else n
-            )
+            # rank contributes zeroes there and the sum is unaffected. The
+            # bidirectional ring splits the payload in two first, so its
+            # divisor is 2 * world_size -- at most 2W-1 elements of padding
+            # either way, i.e. bytes the wire would not have noticed.
+            grain = self.world_size * self._ring_ways
+            padded = ((n + grain - 1) // grain) * grain if use_ring else n
             host = self._staging("ar", padded, reduce_dtype)
             # The previous all_reduce's copy-out may still be reading this
             # slot, and both the stage-in below and the wire (the NIC writes
@@ -1083,7 +1378,7 @@ class HTCCLUcxTransport:
                 f"chunks, more than the 2^24 the tag layout encodes. Raise "
                 f"SGLANG_HTCCL_UCX_CHUNK_MIB."
             )
-        prog = self.worker.progress if self.progress_bytes > 0 else None
+        prog = self._progress_all if self.progress_bytes > 0 else None
         staged: dict = {}
 
         def stage(k: int) -> None:
@@ -1168,16 +1463,52 @@ class HTCCLUcxTransport:
         # buffer host-side, outside any stream order.
         _host_copy_(rows[self.rank], inp.reshape(-1))
 
-        right = (self.rank + 1) % N
-        left = (self.rank - 1) % N
-        for step in range(N - 1):
-            # Forward the row received in the previous step; after W-1 steps
-            # every row has travelled the whole ring exactly once.
-            send_idx = (self.rank - step) % N
-            recv_idx = (self.rank - step - 1) % N
-            reqs = self._post_recv(left, rows[recv_idx], seq, step)
-            reqs += self._post_send(right, rows[send_idx], seq, step)
-            self.worker.wait(reqs)
+        if self._ring_ways == 2:
+            # Bidirectional: the left half of every row travels clockwise on
+            # worker 0, the right half counter-clockwise on worker 1. Same
+            # W-1 steps, half the bytes per hop, and the two halves do not
+            # queue behind each other on one worker -- which is the whole
+            # reason this ring beat the flat exchange in the first place.
+            #
+            # Bit-identical to the unidirectional ring by construction, not by
+            # measurement: an all_gather does no arithmetic, so every output
+            # byte is a copy of the same input byte whichever way round it
+            # came. (The all_reduce ring, which does add, is the one where
+            # direction is visible in the last bits -- see
+            # _wire_all_reduce_ring_bidir.)
+            cut = n // 2
+            spans = ((0, cut), (cut, n))
+            sign = (-1, 1)
+            dst = ((self.rank + 1) % N, (self.rank - 1) % N)
+            src = ((self.rank - 1) % N, (self.rank + 1) % N)
+            ws = self.workers
+            for step in range(N - 1):
+                reqs = [[], []]
+                for d in (0, 1):
+                    a, b = spans[d]
+                    if a == b:  # odd tiny payload: one direction carries all
+                        continue
+                    si = (self.rank + sign[d] * step) % N
+                    ri = (self.rank + sign[d] * (step + 1)) % N
+                    phase = 2 * step + d
+                    reqs[d] = self._post_recv(
+                        src[d], rows[ri][a:b], seq, phase, 0, ws[d]
+                    )
+                    reqs[d] += self._post_send(
+                        dst[d], rows[si][a:b], seq, phase, 0, ws[d]
+                    )
+                self._wait_split(reqs)
+        else:
+            right = (self.rank + 1) % N
+            left = (self.rank - 1) % N
+            for step in range(N - 1):
+                # Forward the row received in the previous step; after W-1
+                # steps every row has travelled the whole ring exactly once.
+                send_idx = (self.rank - step) % N
+                recv_idx = (self.rank - step - 1) % N
+                reqs = self._post_recv(left, rows[recv_idx], seq, step)
+                reqs += self._post_send(right, rows[send_idx], seq, step)
+                self.worker.wait(reqs)
 
         out_flat = torch.empty(N * n, dtype=dtype, device=inp.device)
         self._h2d_async(out_flat, host, "ag_ring")
@@ -1229,7 +1560,10 @@ class HTCCLUcxTransport:
                 # host-side outside any stream order. The transport's one
                 # irreducible drain per all_gather (was one of four).
                 _host_copy_(send_view, src)
-                reqs = []
+                # Per-worker request lists, same symmetric peer split as the
+                # all_reduce fast path above.
+                pw, pws = self._peer_worker, self._peer_w
+                reqs = [[] for _ in self.workers]
                 recv_views = []
                 for i, peer in enumerate(self._peers):
                     rv, rptr, rnbytes = self._slot(rkeys[i], n, inp.dtype)
@@ -1238,12 +1572,12 @@ class HTCCLUcxTransport:
                     # is posted; the previous all_gather's non_blocking
                     # copy-out of it must have completed first.
                     self._slot_guard(rkeys[i])
-                    reqs.append(
-                        self.worker.post_recv(rptr, rnbytes, _tag(seq, 0, peer, 0))
+                    reqs[pw[peer]].append(
+                        pws[peer].post_recv(rptr, rnbytes, _tag(seq, 0, peer, 0))
                     )
                 for peer in self._peers:
-                    reqs.append(
-                        self.worker.post_send(
+                    reqs[pw[peer]].append(
+                        pws[peer].post_send(
                             peer, send_ptr, send_nbytes, _tag(seq, 0, self.rank, 0)
                         )
                     )
@@ -1259,10 +1593,10 @@ class HTCCLUcxTransport:
                 # progress call would starve the RNDV handshake of the very
                 # transfer it is trying to hide under.
                 if 0 < self.progress_bytes < n * inp.dtype.itemsize:
-                    self._staged_copy(rows[self.rank], src, self.worker.progress)
+                    self._staged_copy(rows[self.rank], src, self._progress_all)
                 else:
                     _host_copy_(rows[self.rank], src)
-                self.worker.wait(reqs)
+                self._wait_split(reqs)
                 # Peer-row copy-outs are non_blocking: their only consumer
                 # is the compute stream. These three (W-1) copies were 3 of
                 # the 4 drains every decode all_gather used to pay.
@@ -1617,7 +1951,8 @@ class HTCCLUcxTransport:
         # on an otherwise clean run. Best-effort and short-fused: a rank that
         # is shutting down because a PEER already died must not block here.
         try:
-            self.worker.timeout_s = 5.0
+            for w in self.workers:
+                w.timeout_s = 5.0
             self.barrier()
         except Exception:
             pass
@@ -1641,7 +1976,8 @@ class HTCCLUcxTransport:
         self._view_cache.clear()
         # Holds raw addresses into the buffers just dropped.
         self._bar_slots = None
-        try:
-            self.worker.close()
-        except Exception as e:  # teardown must never mask the real error
-            logger.warning("HTCCL: ucx worker close failed (%s).", e)
+        for i, w in enumerate(self.workers):
+            try:
+                w.close()
+            except Exception as e:  # teardown must never mask the real error
+                logger.warning("HTCCL: ucx worker %d close failed (%s).", i, e)

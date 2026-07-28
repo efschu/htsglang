@@ -719,3 +719,69 @@ class UcpWorker:
             L.ucp_worker_destroy(self.worker)
         finally:
             L.ucp_cleanup(self.ctx)
+
+
+def wait_multi(workers, req_lists, timeout_s: float) -> None:
+    """Drive several workers until every request in every list completes.
+
+    ``workers[i]`` owns ``req_lists[i]``. A UCX worker makes no progress
+    unattended, so EVERY worker is progressed on every pass -- including one
+    whose own requests have all completed. Dropping a drained worker out of
+    the loop would be correct for this collective and wrong for the next one:
+    the peer is in the same lock-step step and may already be posting into
+    the drained worker, and nothing would answer it until this rank happened
+    to touch that worker again.
+
+    Falls through to :meth:`UcpWorker.wait` when only one worker has anything
+    outstanding, so the single-worker configuration keeps the hand-specialised
+    1- and 2-request spins of that method rather than paying this loop's
+    per-pass list rebuild.
+    """
+    pend = [[r for r in reqs if r is not None] for reqs in req_lists]
+    live = sum(1 for p in pend if p)
+    if live == 0:
+        return
+    if live == 1:
+        i = next(i for i, p in enumerate(pend) if p)
+        workers[i].wait(pend[i])
+        return
+
+    lib = workers[0].lib
+    handles = [(w._c_progress, w.worker, w._c_check, w._c_free) for w in workers]
+    spins = 0
+    deadline = time.monotonic() + timeout_s
+    remaining = live
+    while remaining:
+        for i, (progress, worker, check, free) in enumerate(handles):
+            progress(worker)
+            reqs = pend[i]
+            if not reqs:
+                continue
+            still = []
+            for req in reqs:
+                status = check(req)
+                if status == UCS_INPROGRESS:
+                    still.append(req)
+                    continue
+                free(req)
+                if status != UCS_OK:
+                    raise UcxError(
+                        f"htccl ucx: request failed: {lib.status_string(status)}"
+                    )
+            pend[i] = still
+            if not still:
+                remaining -= 1
+        spins += 1
+        if (
+            remaining
+            and not spins % UcpWorker._CLOCK_EVERY
+            and time.monotonic() > deadline
+        ):
+            raise UcxError(
+                f"htccl ucx: {sum(len(p) for p in pend)} request(s) still "
+                f"pending on {remaining} of {len(workers)} workers after "
+                f"{timeout_s:.0f}s. The peer is unreachable, or the two sides "
+                f"disagree about which worker carries which half of the "
+                f"collective -- check that SGLANG_HTCCL_UCX_WORKERS is the "
+                f"same on every rank."
+            )

@@ -144,7 +144,12 @@ def _make_transport(log, world=2, rank=0):
         for par in (0, 1)
     )
     t._bar_slots = None
-    t.worker = _FakeWorker(log)
+    # One fake worker, then the transport's own derivation of every routing
+    # table (worker per peer, ring direction count, progress callback) --
+    # called rather than copied, so this fixture cannot drift away from
+    # __init__ the way a hand-written copy of it would.
+    t.workers = (_FakeWorker(log),)
+    t._init_worker_routing()
     # Force the copy-out fast path: the device is CPU here, but the point of
     # these tests is the EVENT AND FLAG bookkeeping of the CUDA branch.
     t._async_h2d_ok = lambda dst: True
