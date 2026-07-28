@@ -5965,11 +5965,20 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   <span class="lb-name">reading the running server&hellip;</span></div>
 
 <!-- Navigation = the order of the work: watch the machine, configure it,
-     measure it, judge the answers, then the reference surfaces (what other
-     rigs can carry, what this one costs, a second rig, contributed rig data)
-     and finally your own archive. One word per tab so the bar never scrolls;
-     the long form is the title attribute. Every entry is the same button in
-     the same strip -- no grown-in special cases. -->
+     measure it, judge the answers, then the reference surfaces (what this
+     rig costs and what it can tell the project, a second rig) and finally
+     your own archive. One word per tab so the bar never scrolls; the long
+     form is the title attribute. Every entry is the same button in the same
+     strip -- no grown-in special cases.
+     The former "Rigs" tab (model x rig capacity matrix, and the per-rig
+     detail for one model that used to be its own "Landscape" tab) is gone;
+     both tools are questions the planner already answers, so they are now a
+     section of the Guide's expert step instead of a separate tab -- nothing
+     rendered there was lost, see the "capacity matrix" fieldset below.
+     Energy (per-card power calibration) and Rig data (comm benchmark + share
+     an anonymized profile) used to be two tabs answering the same underlying
+     question -- what this rig costs and what it can tell the project -- so
+     they are now one tab, Data, with both as sections. -->
 <div class="tabs">
   <button id="tab_landing" class="tab active" onclick="showTab('landing')"
     title="live monitor of any reachable sglang server">Monitor</button>
@@ -5979,14 +5988,10 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     title="behavioural benchmark suite against a running server">Benchmark</button>
   <button id="tab_quality" class="tab" onclick="showTab('quality')"
     title="rendering / instruction-following checks">Quality</button>
-  <button id="tab_explore" class="tab" onclick="showTab('explore')"
-    title="what fits where: model x rig capacity matrix, and the per-rig detail for one model">Rigs</button>
-  <button id="tab_energy" class="tab" onclick="showTab('energy')"
-    title="per-card power calibration and energy per token">Energy</button>
+  <button id="tab_data" class="tab" onclick="showTab('data')"
+    title="per-card power calibration and energy per token; run the short comm benchmark and share an anonymized rig profile to improve the project">Data</button>
   <button id="tab_pair" class="tab" onclick="showTab('pair')"
     title="couple a second rig">Pair rig</button>
-  <button id="tab_share" class="tab" onclick="showTab('share')"
-    title="run the short comm benchmark and share an anonymized rig profile to improve the project">Rig data</button>
   <button id="tab_history" class="tab" onclick="showTab('history')"
     title="your own recorded benchmark runs: browse, filter, open, delete">History</button>
   <button id="tab_about" class="tab" onclick="showTab('about')"
@@ -6417,13 +6422,139 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       is wrong or impossible, and has none.</div>
     <div id="wz_rejected"><span class="muted">loading&hellip;</span></div>
   </fieldset>
+
+  <!-- Former "Rigs" tab: what fits where, across several models and rigs at
+       once, composed from the GPU-model card library rather than the one
+       ticked set above. Same question as the rest of the guide (what does
+       the planner say fits), just asked for several models/rigs side by
+       side, so it lives here as the expert step's last section instead of
+       its own tab. -->
+  <fieldset class="cfg-section">
+    <legend>capacity matrix &mdash; several models across several rigs</legend>
+    <div class="muted" style="margin-bottom:var(--s2)">Compose rigs from the
+      GPU-model card library (or add the live one) and see which models fit
+      on each. <b>Composed rigs are ESTIMATES</b> &mdash; no measured
+      free-VRAM or interconnect (§8).</div>
+    <div class="cols">
+      <div>
+        <fieldset>
+          <legend>models (one per line: LABEL=path, or just a path)</legend>
+          <textarea id="mx_models" rows="4" placeholder="27B-AWQ=/path/to/Qwen3.6-27B-AWQ&#10;35B-A3B=/path/to/model"></textarea>
+        </fieldset>
+        <fieldset>
+          <legend>rigs (one per line: NAME=card,card,... — or 'live')</legend>
+          <textarea id="mx_rigs" rows="4" placeholder="hetero=RTX 5090,RTX 3080 20GB,RTX 3080 20GB&#10;4x4090=RTX 4090,RTX 4090,RTX 4090,RTX 4090"></textarea>
+          <div id="mx_cards" class="knoblist" style="margin-top:.5rem"></div>
+        </fieldset>
+        <button onclick="doMatrix()">Build matrix</button>
+      </div>
+      <div><div id="mx_out"></div></div>
+    </div>
+
+    <!-- #3: the old "Landscape" tab lived here as its own entry, showing a
+         one-model slice of the very same compose+feasibility computation with
+         four measured-only columns that are empty on every install (nothing in
+         the product writes a results.jsonl). It is a DRILL-DOWN of this matrix,
+         not a separate question, so it is a section here and the tab is gone. -->
+    <details class="cfg-section" style="margin-top:var(--s3)">
+      <summary style="cursor:pointer"><b>per-rig detail for one model</b>
+        <span class="muted">&mdash; one (model, quant) across several rigs, with
+        measured rows when you point it at a results.jsonl</span></summary>
+      <div class="muted" style="margin:var(--s2) 0">Rows are rigs.
+        <b>Measured</b> rows come from a results.jsonl of real runs; every other
+        row is the same planner feasibility estimate the matrix above uses. The
+        perf and energy columns are measured-only and stay empty until you supply
+        such a store &mdash; no number is invented to fill them.</div>
+      <div class="cols">
+        <div>
+          <fieldset>
+            <legend>model + quant</legend>
+            <label>Model (path / HF id)</label>
+            <input id="ls_model" placeholder="/path/to/Qwen3.6-27B-AWQ">
+            <label>quant descriptor</label>
+            <input id="ls_quant" placeholder="4b/AWQ/g128 | Q4_K_M | fp8">
+            <label>efficiency bucket (batch size)</label>
+            <input id="ls_bucket" placeholder="(optional, e.g. 16)">
+            <label>results.jsonl (measured; optional)</label>
+            <input id="ls_store" placeholder="(path to a measured store)">
+            <label><input type="checkbox" id="ls_similar" style="width:auto"> similar-quant (by bits — approximate)</label>
+          </fieldset>
+          <fieldset>
+            <legend>rigs to feasibility-check (NAME=card,card,...)</legend>
+            <textarea id="ls_rigs" rows="4" placeholder="hetero=RTX 5090,RTX 3080 20GB,RTX 3080 20GB&#10;4x4090=RTX 4090,RTX 4090,RTX 4090,RTX 4090"></textarea>
+          </fieldset>
+          <button onclick="doLandscape()">Build landscape</button>
+        </div>
+        <div><div id="ls_out"></div></div>
+      </div>
+    </details>
+  </fieldset>
 </div>
 
-<!-- #271 -- Rig data share. Its own tab rather than a panel in Benchmark:
-     benchmarking your own rig and contributing a profile to the project are
-     different impulses, and the second one needs two sentences of framing
-     that would be noise inside a measurement tab. -->
-<div id="view_share" style="display:none">
+<!-- Data tab: per-card power calibration + energy per token (formerly its own
+     "Energy" tab) and the comm benchmark + anonymized rig-profile share
+     (formerly its own "Rig data" tab, #271) are the same underlying question
+     -- what this rig costs, and what it can tell the project -- so they are
+     one tab with two sections, not two tabs. Nothing that either former tab
+     rendered was dropped; both fieldset groups are byte-for-byte what they
+     were, just under one roof. -->
+<div id="view_data" style="display:none">
+  <section id="data_energy">
+  <div class="sub">Live GPU power-state tags (#149), a live throughput/MTP
+    widget that measures against a <b>running</b> server (no boot/teardown),
+    and a configurable measurement <b>scenario</b> builder (#150). Efficiency
+    (J/token) is only comparable at the <b>same</b> power-limit context &mdash;
+    the tags below make that context explicit.</div>
+  <div class="cols">
+    <div>
+      <fieldset>
+        <legend>per-card power calibration (measured)</legend>
+        <div class="muted" style="margin-bottom:.4rem">Measures each free card's
+          board power at idle / membw / GEMM (short micro-benchmarks that briefly
+          load the GPU). <b>Do not run against a busy card</b> — the backend
+          SKIPS any card another process owns and reports it. Result is persisted
+          and overrides the energy model's power heuristic. Live GPU power-state
+          + throughput monitoring moved to the Landing tab.</div>
+        <button onclick="measurePower()" id="pw_btn">Measure per-card power</button>
+        <div id="pw_out" class="muted" style="margin-top:.6rem"></div>
+      </fieldset>
+    </div>
+    <div>
+      <fieldset>
+        <legend>scenario builder (#150)</legend>
+        <div class="cols" style="grid-template-columns:1fr 1fr;gap:.6rem">
+          <div>
+            <label>scale (1.0 = 10k prefill / 1k decode)</label>
+            <input id="sc_scale" value="1.0">
+            <label>phases</label>
+            <select id="sc_phases"><option value="both">both</option>
+              <option value="prefill">prefill-only</option>
+              <option value="decode">decode-only</option></select>
+            <label>concurrency</label>
+            <input id="sc_conc" value="1">
+          </div>
+          <div>
+            <label>behaviors (decode split)</label>
+            <select id="sc_behav"><option value="code,prose">code + prose</option>
+              <option value="code">code only</option>
+              <option value="prose">prose only</option></select>
+            <label><input type="checkbox" id="sc_multi" style="width:auto"> multiturn (growing context)</label>
+            <label>turns (multiturn)</label>
+            <input id="sc_turns" value="3">
+            <label><input type="checkbox" id="sc_cold" checked style="width:auto"> cold prefill (flush + fresh prompt)</label>
+            <label><input type="checkbox" id="sc_running" style="width:auto"> target is a RUNNING (production) server</label>
+          </div>
+        </div>
+        <div style="margin-top:.5rem"><button onclick="previewScenario()">preview scenario</button></div>
+        <div id="sc_out" class="muted" style="margin-top:.6rem"></div>
+      </fieldset>
+    </div>
+  </div>
+  </section>
+
+  <hr style="margin:var(--s3) 0;border-color:#30363d">
+
+  <section id="data_share">
   <fieldset>
     <legend>improve the project with your rig</legend>
     <p class="cs-why">
@@ -6491,6 +6622,7 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       </div>
     </div>
   </fieldset>
+  </section>
 </div>
 
 <!-- #6 -- run History. Previously the sixth fieldset of the Benchmark
@@ -6901,72 +7033,10 @@ _INDEX_TEMPLATE = r"""<!doctype html>
 </div>
 
 
-<div id="view_energy" style="display:none">
-  <div class="sub">Live GPU power-state tags (#149), a live throughput/MTP
-    widget that measures against a <b>running</b> server (no boot/teardown),
-    and a configurable measurement <b>scenario</b> builder (#150). Efficiency
-    (J/token) is only comparable at the <b>same</b> power-limit context &mdash;
-    the tags below make that context explicit.</div>
-  <div class="cols">
-    <div>
-      <fieldset>
-        <legend>per-card power calibration (measured)</legend>
-        <div class="muted" style="margin-bottom:.4rem">Measures each free card's
-          board power at idle / membw / GEMM (short micro-benchmarks that briefly
-          load the GPU). <b>Do not run against a busy card</b> — the backend
-          SKIPS any card another process owns and reports it. Result is persisted
-          and overrides the energy model's power heuristic. Live GPU power-state
-          + throughput monitoring moved to the Landing tab.</div>
-        <button onclick="measurePower()" id="pw_btn">Measure per-card power</button>
-        <div id="pw_out" class="muted" style="margin-top:.6rem"></div>
-      </fieldset>
-    </div>
-    <div>
-      <fieldset>
-        <legend>scenario builder (#150)</legend>
-        <div class="cols" style="grid-template-columns:1fr 1fr;gap:.6rem">
-          <div>
-            <label>scale (1.0 = 10k prefill / 1k decode)</label>
-            <input id="sc_scale" value="1.0">
-            <label>phases</label>
-            <select id="sc_phases"><option value="both">both</option>
-              <option value="prefill">prefill-only</option>
-              <option value="decode">decode-only</option></select>
-            <label>concurrency</label>
-            <input id="sc_conc" value="1">
-          </div>
-          <div>
-            <label>behaviors (decode split)</label>
-            <select id="sc_behav"><option value="code,prose">code + prose</option>
-              <option value="code">code only</option>
-              <option value="prose">prose only</option></select>
-            <label><input type="checkbox" id="sc_multi" style="width:auto"> multiturn (growing context)</label>
-            <label>turns (multiturn)</label>
-            <input id="sc_turns" value="3">
-            <label><input type="checkbox" id="sc_cold" checked style="width:auto"> cold prefill (flush + fresh prompt)</label>
-            <label><input type="checkbox" id="sc_running" style="width:auto"> target is a RUNNING (production) server</label>
-          </div>
-        </div>
-        <div style="margin-top:.5rem"><button onclick="previewScenario()">preview scenario</button></div>
-        <div id="sc_out" class="muted" style="margin-top:.6rem"></div>
-      </fieldset>
-    </div>
-  </div>
-</div>
-
-
 <div id="view_quality" style="display:none">
-  <!-- User-facing reminder (self-note, intentionally prominent): the test
-       design stems from the linked reddit thread; before making this
-       feature public, ask there whether using the test is OK. -->
-  <div id="quality_permission_note" style="border:1px solid #e3a008;
-       background:#241a06; color:#e3b341; border-radius:8px;
-       padding:.5rem .7rem; margin:.2rem 0 .6rem; font-size:.8rem">
-    <b>ERINNERUNG:</b> Vor Veroeffentlichung im
+  <div class="muted" style="font-size:.8rem;margin:.2rem 0 .6rem">Thanks to the
     <a href="https://www.reddit.com/r/LocalLLaMA/comments/1t53dhp/quality_comparison_between_qwen_36_27b/"
-       target="_blank">Reddit-Beitrag</a> nachfragen, ob die Nutzung dieses
-    Tests ok ist.
-  </div>
+       target="_blank">r/LocalLLaMA thread</a> this test is built on.</div>
   <div class="sub">ONESHOT chess-SVG quality benchmark (<a href="https://www.reddit.com/r/LocalLLaMA/comments/1t53dhp/quality_comparison_between_qwen_36_27b/" target="_blank">reddit reference</a>).
     The model is asked to render the position after <code>7. h4</code> as SVG,
     highlighting the last move. The model is called <b>backend-side</b> (never
@@ -7039,66 +7109,6 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       checkout and can only install, not switch.</div>
   </fieldset>
 </div>
-
-<div id="view_explore" style="display:none">
-  <div class="sub">Compose rigs from the GPU-model card library (or add the
-    live one) and see which models fit on each. <b>Composed rigs are
-    ESTIMATES</b> &mdash; no measured free-VRAM or interconnect (§8).</div>
-  <div class="cols">
-    <div>
-      <fieldset>
-        <legend>models (one per line: LABEL=path, or just a path)</legend>
-        <textarea id="mx_models" rows="4" placeholder="27B-AWQ=/path/to/Qwen3.6-27B-AWQ&#10;35B-A3B=/path/to/model"></textarea>
-      </fieldset>
-      <fieldset>
-        <legend>rigs (one per line: NAME=card,card,... — or 'live')</legend>
-        <textarea id="mx_rigs" rows="4" placeholder="hetero=RTX 5090,RTX 3080 20GB,RTX 3080 20GB&#10;4x4090=RTX 4090,RTX 4090,RTX 4090,RTX 4090"></textarea>
-        <div id="mx_cards" class="knoblist" style="margin-top:.5rem"></div>
-      </fieldset>
-      <button onclick="doMatrix()">Build matrix</button>
-    </div>
-    <div><div id="mx_out"></div></div>
-  </div>
-
-  <!-- #3: the old "Landscape" tab lived here as its own entry, showing a
-       one-model slice of the very same compose+feasibility computation with
-       four measured-only columns that are empty on every install (nothing in
-       the product writes a results.jsonl). It is a DRILL-DOWN of this matrix,
-       not a separate question, so it is a section here and the tab is gone. -->
-  <details class="cfg-section" style="margin-top:var(--s3)">
-    <summary style="cursor:pointer"><b>per-rig detail for one model</b>
-      <span class="muted">&mdash; one (model, quant) across several rigs, with
-      measured rows when you point it at a results.jsonl</span></summary>
-    <div class="muted" style="margin:var(--s2) 0">Rows are rigs.
-      <b>Measured</b> rows come from a results.jsonl of real runs; every other
-      row is the same planner feasibility estimate the matrix above uses. The
-      perf and energy columns are measured-only and stay empty until you supply
-      such a store &mdash; no number is invented to fill them.</div>
-  <div class="cols">
-    <div>
-      <fieldset>
-        <legend>model + quant</legend>
-        <label>Model (path / HF id)</label>
-        <input id="ls_model" placeholder="/path/to/Qwen3.6-27B-AWQ">
-        <label>quant descriptor</label>
-        <input id="ls_quant" placeholder="4b/AWQ/g128 | Q4_K_M | fp8">
-        <label>efficiency bucket (batch size)</label>
-        <input id="ls_bucket" placeholder="(optional, e.g. 16)">
-        <label>results.jsonl (measured; optional)</label>
-        <input id="ls_store" placeholder="(path to a measured store)">
-        <label><input type="checkbox" id="ls_similar" style="width:auto"> similar-quant (by bits — approximate)</label>
-      </fieldset>
-      <fieldset>
-        <legend>rigs to feasibility-check (NAME=card,card,...)</legend>
-        <textarea id="ls_rigs" rows="4" placeholder="hetero=RTX 5090,RTX 3080 20GB,RTX 3080 20GB&#10;4x4090=RTX 4090,RTX 4090,RTX 4090,RTX 4090"></textarea>
-      </fieldset>
-      <button onclick="doLandscape()">Build landscape</button>
-    </div>
-    <div><div id="ls_out"></div></div>
-  </div>
-  </details>
-</div>
-
 
 <script>
 /*__VENDOR_MORPHDOM__*/
@@ -8175,7 +8185,7 @@ function csRenderProfile(p){
   let h='';
   h += cp.present
     ? '<div>card probe: <b>'+cp.cards+'</b> cards, <b>'+cp.pairs+'</b> ordered pairs (from '+esc(cp.created||'?')+')</div>'
-    : '<div>card probe: <b>absent</b> &mdash; run the short probe once on the Rigs tab and its rates join the digest</div>';
+    : '<div>card probe: <b>absent</b> &mdash; run the short probe once on the Guide tab (working point section) and its rates join the digest</div>';
   h += sp.present
     ? '<div>serving studies: <b>'+sp.rows+'</b> split-probe rows for '+esc((sp.models||[]).join(', '))+'</div>'
     : '<div>serving studies: <b>absent</b> &mdash; no split-probe row on disk yet</div>';
@@ -8336,26 +8346,29 @@ async function csForgetToken(){
 }
 
 // The tab set IS the workflow order: watch the machine, configure it, measure
-// it, judge the answers, then the two archives (contributed rig data, own run
-// history). 'runner' is deliberately absent -- the Planner is no longer a tab
-// but the expert step at the end of the Guide, so #view_runner is nested
-// inside #view_wizard and inherits its visibility.
+// it, judge the answers, then the two archives (contributed + own cost data,
+// own run history). 'runner' is deliberately absent -- the Planner is no
+// longer a tab but the expert step at the end of the Guide, so #view_runner
+// is nested inside #view_wizard and inherits its visibility. 'explore' is
+// likewise absent -- the capacity matrix is now the Guide's last expert
+// section (loadProfiles() below moved with it, guarded the same way).
 function showTab(t) {
-  const TABS = ['landing','wizard','bench','quality','explore','energy','pair','share','history','about'];
+  const TABS = ['landing','wizard','bench','quality','data','pair','history','about'];
   window._tab = t;
   for (const v of TABS) $('view_'+v).style.display = t===v ? '' : 'none';
   for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
-  if (t==='explore' && !window._profLoaded) loadProfiles();
   // The archive is re-read on every entry, not once: a run that finished
   // while another tab was open must be there when you come back to look.
   if (t==='history') historyLoad();
   // #271: first visit only. Opening the tab READS state; it never measures,
-  // so this is safe to call while somebody else owns the cards.
-  if (t==='share') {
+  // so this is safe to call while somebody else owns the cards. Energy
+  // (per-card power calibration) and Rig data (comm suite + share) are one
+  // tab now, so both first-visit hooks fire together on 'data'.
+  if (t==='data') {
     if (!window._shareTabInit) { window._shareTabInit=true; csInit(); }
     else csPoll();
+    if (!window._energyInit) { window._energyInit=true; loadPowerProfile(); }
   } else csStopPoll();
-  if (t==='energy' && !window._energyInit) { window._energyInit=true; loadPowerProfile(); }
   if (t==='quality') { autofillQuality(); if(!window._qualityInit){window._qualityInit=true; loadShots();} }
   if (t==='bench' && !window._benchInit) { window._benchInit=true; benchInit(); }
   // The guide OWNS the planner form now (model picker in step 1, card set in
@@ -8368,6 +8381,9 @@ function showTab(t) {
       loadFlagCatalog(); refreshServerStatus();
       wizardInit();
     }
+    // Feeds the capacity-matrix section's card library list (former Rigs
+    // tab); guarded the same way it was when that section had its own tab.
+    if (!window._profLoaded) loadProfiles();
     wizardSyncModel();
     // Entering the guide with a checkpoint already chosen answers the
     // question rather than waiting to be asked it again. Only when there is
