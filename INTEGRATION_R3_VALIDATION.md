@@ -5241,3 +5241,29 @@ Ueberschaetzung (1,14M vs korrigiert 240k/343k). Klammer unberuehrt. Fix:
 ko-residente Lanes gegen das geteilte Residuum sizen oder KV-Zelle absent.
 Nesting-Box ist notwendig, nicht hinreichend (Attention/GDN/Vocab-Achsen +
 Kontiguitaet sind Layout, nicht Zahl) — steht so in der Eval-Doku.
+
+## UI-Konsolidierung (feat/dashboard-consolidation, eb5bd61710+404199b7c9)
+
+Gemergt. Marker-Gate 0 auf allen 7 Dateien; volle Planner-Suite auf Integration:
+1323 passed / 64 skipped / 0 failed — ERSTMALS ohne den Dauer-Fail
+test_reference_png_static_route. Wurzelursache war .gitignore:187 (*.png):
+das Schachbild war NIE committbar — jetzt zur Laufzeit aus CHESS_PGN gerendert
+(python-chess+cairosvg), Referenz und bewertete Stellung koennen nicht mehr
+divergieren.
+Alle 12+3 Nutzer-Feedback-Punkte umgesetzt: Guide ersetzt Planner (Expert-View
+als Schritt 4 genestet, Test sichert Erreichbarkeit aller Controls), Presets
+raus (benannte Profile bleiben), History eigener Tab mit Delete-Route,
+Landscape in Rigs gefaltet (war leere Spalten + Ein-Modell-Slice desselben
+Pfads), Monitor-Fixes (renderPlacement lief nur ueber rank-tragende Karten;
+simple/expert-Schalter war ausserhalb des Planners tot), Energie in
+Prefill/Decode-Kacheln + gespartes kWh je Phase, Modell-Picker in Schritt 1,
+Karten-/Verbund-Auswahl je Karte in Schritt 2, data-step-Staleness.
+BEFUND "identische Stop-Werte" = EHRLICHER KOLLAPS, kein Bug: Gewichtsbytes
+invariant unter MLP-Umverteilung => ctx identisch ueber die ganze Leiter, und
+der Basis-Split ist das strikte Decode-Optimum; max-prefill differiert (+15,2 %)
+als Beleg der Maschinerie. Jetzt Badge "= balanced" + Erklaerzeile.
+Solver-Bindung verifiziert: /api/key_solver/model + /aggregate VOR /api/key_solver
+(webui.py:4538ff), Runbook 8.7/8.8. RAM-Bandbreite bewusst absent (keine
+unprivilegierte Quelle) statt approximiert. Neue Tests fingen echten Bug:
+_note_peak KeyError bei Erst-Lesung 0.0 (waere beim ersten Poll jeder idlen
+Karte gefeuert). JS-Syntax via quickjs vor+nach geprueft.
