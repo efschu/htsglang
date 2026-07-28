@@ -5650,3 +5650,24 @@ Operativ relevant bleibt hier nur:
   vom Alt-Worktree wt-r3-merge2 besetzt (wt-final lief detached, Pushes waren
   korrekt, lokale Ref-Aufloeser sahen Altstand) — behoben: Branch an wt-final
   gebunden, wt-r3-merge2 detached.
+
+## UI-Feedback Runde 4 (feat/ui-feedback-r4, gemergt)
+
+- Quality: Erinnerungs-Banner entfernt; uebrig ein einzeiliges Danke an den
+  r/LocalLLaMA-Thread mit dem VORHANDENEN Link (nichts erfunden).
+- Rigs-Reiter aufgeloest: beide nur dort erreichbaren Funktionen (Modell-x-Rig-
+  Kapazitaetsmatrix + per-Rig-Drilldown/Landscape) byte-identisch in den
+  Expert-Schritt des Guide-Reiters gefaltet; loadProfiles-Hook mitgezogen,
+  veralteter Textverweis korrigiert.
+- Energy + Rig data -> EIN "Data"-Reiter (Abschnitte data_energy/data_share,
+  alle inneren IDs/Funktionen unveraendert). Neue Leiste: Monitor, Guide,
+  Benchmark, Quality, Data, Pair rig, History, About/Update — 8 statt 10,
+  about weiter letzter.
+- Tests: Navigation-Invarianten + Quality-Note-Tests umgestellt, planner-Suite
+  auf gemergtem HEAD 1501/64/0, Seitenskript-Syntaxtest gruen. Marker 0.
+- Zwei vom Nutzer direkt an den Agenten gereichte Zusatzwuensche abgegrenzt:
+  (a) PCIe/RDMA-Bandbreiten-/Latenz-Anzeige je allreduce = BEREITS ABGEDECKT
+  (Monitor-Telemetrie + Guide-Link-Tabelle + Comm-Suite-Kacheln im Data-Tab);
+  (b) persistenter, resetbarer J/Token-Zaehler je Modell/Quant, Prefill/Decode
+  getrennt, schaltbar + tok/s-Live-Poll-Latenz = echte neue Feature-Arbeit,
+  eigenes Briefing (beauftragt).
