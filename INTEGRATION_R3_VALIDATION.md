@@ -5092,3 +5092,22 @@ per-shape tuned tiles are microbench-verified and cannot regress (worst case equ
 the three missing shapes are queued in the idle tuner and follow the same way.
 E2E verdict for the tuning story stays honest: microbench-level -45.6 %/-17.9 % at
 M=4, production-path effect below the detection limit of this rig's TP=3 setup.
+
+# #270 — Guided-Config-Wizard v1 merged: honest family matrix, expert diff, machine-readable register
+
+Merged feat/planner-guided-wizard. New Guide tab between Monitor and Planner: Model
+(shares the Planner's field — the two can never diverge), Hardware (cards +
+capability table #234 + #214 remotes, nothing probed on open), Families (per-family
+fieldset x {spill off|on} x {local|network}; feasible rows carry the five target
+quantities with provenance pills, infeasible rows carry the engine's own refusal in
+place of numbers), generated Command with flag provenance, Expert view as a diff,
+and the rejected register rendered as data (new planner/rejected.py, levels
+blocked/not-default). Design calls held: TTFT always a pair (idle/loaded, #212
+ratio), undisturbedness its own column, PD/PP/spill report max_decode absent with
+the no-spec reason, budget-re-dividing families report kv/parallel absent naming the
+v2 split control, link gate never substitutes intra-rig numbers. Four endpoints
+documented as curl recipes in runbook 8.5. 54 new CPU tests; full planner+rigmon
+suites 1450 passed / 1 pre-existing failure reproduced on base. No probe boot (two
+agents were mid-measurement; argv-parse gate covered the generation path). v2
+backlog recorded: PD/main split slider (#258 front), tipping-point explanations +
+re-measure button, satellite/link rate read paths, offload depth.
