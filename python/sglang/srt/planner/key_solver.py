@@ -244,6 +244,41 @@ now explicit. Measured error on three arms, un-fitted: -19 %, +15 %, +11 %
 Every prediction carries an ``estimate`` label and a ``remeasure`` hook
 naming the instrument that would turn it into a ``measured`` one
 (``split_probe`` for split/throughput, ``card_probe`` for rates).
+
+
+9. N LANES: THE HULL TREE AND THE PRIORITY CLASSES
+--------------------------------------------------
+The multi-group runtime (#274) puts SEVERAL lanes over one resident weight
+set, so two things that were pairwise become set-wise.
+
+NESTING. ``nesting_bounds`` bounds the lane being solved against ONE resident
+lane; ``nesting_bounds_over`` intersects the ceilings of all of them, which
+is the same statement unrolled. But a lane set can pass every such check and
+still be unbuildable, because nesting is not transitive across SIBLINGS: on
+the rig's own ``[6,1,1]`` group the lanes ``[6,2]`` and ``[7,1]`` each nest in
+the group at almost every unit count and in each other at none, since one
+cuts after rank 0's units and the other after rank 1's. ``nesting_hull``
+is the set-wise question — does a refinement forest over all of them exist —
+and it is what a caller must ask before believing that N lanes share bytes.
+
+WHERE THIS AND ``distributed/dual_group.py`` DIFFER, deliberately and
+measurably. ``dual_group`` is given a segmentation and asks whether THAT
+grouping nests; the hull, by default, asks whether ANY grouping does. Pin a
+lane's ``shared_segments`` and the two agree at every unit count (67 of 497
+for ``[6,1,1] -> [6,2]``; DESIGN #121 records 65, which is the same set
+minus the 2 counts too small to split over 3 ranks at all). Leave it free and
+the hull additionally accepts units 3-6, where the grouping ``[0,1],[2]``
+nests although ``[0],[1,2]`` does not. Both answers are right for their
+question; a caller that has already fixed a segmentation — Slice B installs
+one — must pin it, and ``dual_group`` remains the authority for the runtime.
+
+PRIORITY. PRIO-Nachtrag 5 in the N-lane form of Nachtrag 8d: lanes carry an
+ordered ``priority_class`` and ``coresident_budget_plan`` serves the classes
+on a shared card in ascending order, each in full before the next sees
+anything. A class reached with nothing left is NAMED, never given an invented
+share. With one class the award is the even split the two-lane mapping
+already made, which is why no configuration that does not use the feature
+moves.
 """
 
 from __future__ import annotations
@@ -269,6 +304,14 @@ __all__ = [
     "water_fill",
     "project_to_grid",
     "nesting_bounds",
+    "nesting_bounds_over",
+    "nesting_hull",
+    "partition_cuts",
+    "rank_map_over_cards",
+    "OuterLane",
+    "LaneKey",
+    "HullProbe",
+    "HullTree",
     "UnitBound",
     "full_attention_layers",
     "full_attention_layers_in_window",
@@ -280,7 +323,12 @@ __all__ = [
     "estimate_instance",
     "coexistence",
     "coresident_budgets",
+    "coresident_budget_plan",
+    "CoresidentPlan",
     "aggregate",
+    "LaneTarget",
+    "LaneSolution",
+    "solve_lanes",
     "gemm_dtype_for_checkpoint",
     "ADDITIVE_ANCHOR",
     "COLLECTIVE_EFFICIENCY",
@@ -1565,6 +1613,70 @@ def _tradeoff(
 UnitBound = Tuple[Optional[int], Optional[int]]
 
 
+@dataclasses.dataclass(frozen=True)
+class OuterLane:
+    """One already-resident lane the lane being solved has to nest inside.
+
+    ``rank_of[i]`` is this lane's rank on the card the solved lane's rank
+    ``i`` sits on, or ``None`` for a card this lane does not use.
+    """
+
+    key: str
+    units: Sequence[int]
+    rank_of: Sequence[Optional[int]]
+
+
+def rank_map_over_cards(
+    inner_gpus: Sequence[int], outer_gpus: Sequence[int]
+) -> List[Optional[int]]:
+    """``rank_of`` for a pair of lanes, derived from their card maps.
+
+    When the outer lane puts SEVERAL ranks on one card the first is taken and
+    that is a real ambiguity, not a detail: which of the co-located outer
+    shards the inner lane reuses is a placement decision the card map does not
+    carry. Callers that co-locate ranks must pass ``rank_of`` explicitly
+    instead of deriving it here.
+    """
+    first: Dict[int, int] = {}
+    for r, g in enumerate(outer_gpus):
+        first.setdefault(int(g), r)
+    return [first.get(int(g)) for g in inner_gpus]
+
+
+def nesting_bounds_over(outers: Sequence[OuterLane]) -> List[UnitBound]:
+    """Box bounds from a SET of resident lanes: the intersection of ceilings.
+
+    The set-wise form of ``nesting_bounds``. Nesting inside several resident
+    lanes at once is nesting inside the SMALLEST of them on every card, so the
+    boxes intersect — ``hi_i = min`` over the outer lanes that use card ``i``,
+    unbounded where none does. A lane's shard cannot be a subset of two
+    different shards without being a subset of the smaller one, so this is the
+    definition unrolled, not a heuristic.
+
+    The intersection is NECESSARY, never sufficient (see ``nesting_bounds``),
+    and it is not the whole set-wise question either: it bounds ONE lane
+    against lanes already fixed. Whether the whole set can be arranged in a
+    refinement chain at all is ``nesting_hull``, and a satisfied box says
+    nothing about that.
+    """
+    if not outers:
+        return []
+    width = max(len(o.rank_of) for o in outers)
+    out: List[UnitBound] = []
+    for i in range(width):
+        hi: Optional[int] = None
+        for o in outers:
+            if i >= len(o.rank_of):
+                continue
+            r = o.rank_of[i]
+            if r is None:
+                continue
+            v = int(o.units[r])
+            hi = v if hi is None else min(hi, v)
+        out.append((None, hi))
+    return out
+
+
 def nesting_bounds(
     outer_units: Sequence[int],
     outer_rank_of: Sequence[Optional[int]],
@@ -1583,6 +1695,9 @@ def nesting_bounds(
     sits on, or ``None`` for a card the outer lane does not use (the
     complement card, whose shard is the only genuinely new resident bytes).
 
+    This is the ``N=2`` case of ``nesting_bounds_over`` and is implemented as
+    that call, so the pairwise and set-wise answers cannot drift apart.
+
     NOT a free lunch, and the caller has to know it: the bound is a NECESSARY
     condition for reuse, not a sufficient one. Containment must also hold for
     the axes this vector does not carry — the attention, GDN and vocab shards
@@ -1592,13 +1707,378 @@ def nesting_bounds(
     solver models counts. State them as configuration requirements; do not
     read a satisfied box as proof that the bytes really are shared.
     """
-    out: List[UnitBound] = []
-    for outer in outer_rank_of:
-        if outer is None:
-            out.append((None, None))
-        else:
-            out.append((None, int(outer_units[outer])))
-    return out
+    return nesting_bounds_over(
+        [OuterLane(key="outer", units=list(outer_units), rank_of=list(outer_rank_of))]
+    )
+
+
+# ---------------------------------------------------------------------------
+# The hull tree — set-wise nesting over N lanes (PRIO-Nachtrag 8b)
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class LaneKey:
+    """One lane's distribution key, as the shared-bytes algebra sees it.
+
+    ``ratio`` is the lane's ``--rank-tp-ratio``; ``family_ratios`` carries the
+    per-family overrides (``mlp``, ``moe``, ``vocab``) exactly as
+    ``set_tp_partition_ratios`` takes them, so a solved ``--rank-mlp-ratio``
+    enters here as ``(("mlp", units),)``. ``gpus`` is the physical card per
+    rank: two lanes only have to nest where they actually meet.
+
+    ``nests_in`` names the COARSER lane whose shards contain this lane's —
+    the ``outer`` of ``nesting_bounds``, and the FAST group of
+    ``dual_group.NestedGroupPlan`` with this lane in the BIG role.
+    ``shared_segments``, when given, PINS that relation and is read exactly as
+    ``dual_group.NestedGroupPlan.segments``: indexed by the ranks of whichever
+    of the two lanes turns out to be the COARSER, listing the finer lane's
+    ranks each covers. Which side is coarser is decided from the splits and
+    not from the direction of ``nests_in``, so a caller cannot pin the
+    relation upside down. Left ``None`` the hull DERIVES the segmentation,
+    which answers the weaker question "is there ANY grouping under which these
+    nest" — see ``nesting_hull``.
+    """
+
+    key: str
+    ratio: Tuple[int, ...]
+    gpus: Tuple[int, ...] = ()
+    family_ratios: Tuple[Tuple[str, Tuple[int, ...]], ...] = ()
+    priority_class: int = 0
+    nests_in: Optional[str] = None
+    shared_segments: Optional[Tuple[Tuple[int, ...], ...]] = None
+
+    def ratio_for(self, family: Optional[str] = None) -> Tuple[int, ...]:
+        if family is not None:
+            for name, vec in self.family_ratios:
+                if name == family:
+                    return tuple(int(x) for x in vec)
+        return tuple(int(x) for x in self.ratio)
+
+
+@dataclasses.dataclass(frozen=True)
+class HullProbe:
+    """One sharded dimension the hull has to survive.
+
+    The planner-side twin of ``dual_group.NestingProbe``: ``units`` is the
+    indivisible unit count of the dimension, ``groups`` the kv-head-group
+    alignment of the Q dimension (#116) and ``None`` elsewhere, ``family`` the
+    per-family vector the dimension shards by.
+    """
+
+    what: str
+    units: int
+    groups: Optional[int] = None
+    family: Optional[str] = None
+
+
+@dataclasses.dataclass
+class HullTree:
+    """The result of the set-wise check: a refinement forest, or why not."""
+
+    ok: bool
+    #: Coarsest first, per connected component of the "shares a card" graph.
+    order: List[str]
+    #: lane key -> the next COARSER lane it nests inside (None = a root).
+    parent: Dict[str, Optional[str]]
+    #: (child, parent) -> the derived segmentation, per probe that pinned it.
+    segments: Dict[Tuple[str, str], Tuple[Tuple[int, ...], ...]]
+    #: Pairs that had to nest and did not, each naming probe, split and cut.
+    failures: List[str]
+    #: Pairs that were checked at all (they share at least one card).
+    checked: List[Tuple[str, str]]
+    #: Pairs that share no card and were therefore NOT required to nest.
+    disjoint: List[Tuple[str, str]]
+
+    def to_json(self) -> dict:
+        return {
+            "ok": self.ok,
+            "order": list(self.order),
+            "parent": dict(self.parent),
+            "segments": {
+                f"{c}<{p}": [list(s) for s in segs]
+                for (c, p), segs in self.segments.items()
+            },
+            "failures": list(self.failures),
+            "checked": [list(p) for p in self.checked],
+            "disjoint": [list(p) for p in self.disjoint],
+        }
+
+
+def partition_cuts(
+    units: int, ratio: Sequence[int], groups: Optional[int] = None
+) -> Tuple[int, ...]:
+    """The cut points of a lane's split: ``(0, ..., units)``.
+
+    The whole nesting algebra lives in these numbers. A contiguous ordered
+    partition IS its cut set, one partition refines another exactly when its
+    cut set is a SUPERSET, and the shared shards are the same bytes exactly
+    when the cuts that bound them coincide — which is the prefix-sum argument
+    of DESIGN #121 §3.2, restated so that it composes over more than two
+    lanes.
+
+    A vector that ALREADY sums to ``units`` is taken as the split itself and
+    not re-partitioned. That is not a convenience: the solver's answer is a
+    unit vector, and ``partition_units`` cannot reproduce it, because it
+    gives every rank at least one unit while the solver's ``kv_donor`` role
+    is precisely a rank with zero. Re-splitting a solved key would compare
+    the lane against a partition nobody installs. Anything else is a ratio
+    and goes through ``partition_units``, rounding and all.
+    """
+    from sglang.srt.distributed.utils import partition_units
+
+    vec = [int(w) for w in ratio]
+    if sum(vec) != int(units) or any(w < 0 for w in vec):
+        vec = list(partition_units(int(units), vec, groups))
+    out = [0]
+    for s in vec:
+        out.append(out[-1] + int(s))
+    return tuple(out)
+
+
+def _segments_from_cuts(
+    coarse_cuts: Sequence[int], fine_cuts: Sequence[int]
+) -> Optional[Tuple[Tuple[int, ...], ...]]:
+    """For each COARSE rank, the FINE ranks it covers — ``dual_group``'s
+    ``segments``. ``None`` when the coarse split is not a union of fine
+    shards, i.e. when the two do not nest at all."""
+    index = {c: i for i, c in enumerate(fine_cuts)}
+    segs: List[Tuple[int, ...]] = []
+    for f in range(len(coarse_cuts) - 1):
+        a, b = coarse_cuts[f], coarse_cuts[f + 1]
+        if a not in index or b not in index:
+            return None
+        segs.append(tuple(range(index[a], index[b])))
+    return tuple(segs)
+
+
+def nesting_hull(
+    lanes: Sequence[LaneKey],
+    probes: Sequence[HullProbe],
+    *,
+    require_disjoint_lanes_to_nest: bool = False,
+) -> HullTree:
+    """Can these N lanes live over ONE set of resident bytes?
+
+    ``nesting_bounds`` answers the pairwise question — does the lane I am
+    solving fit inside the one lane that is already resident. With N lanes
+    that is not enough, and the gap is not a corner case: two lanes can each
+    nest perfectly inside the same coarse lane and still be incompatible with
+    EACH OTHER, because their cuts fall in different places. On the rig's own
+    ``[6,1,1]`` group, the two obvious two-rank lanes ``[6,2]`` (sharing rank
+    0) and ``[7,1]`` (sharing rank 2) nest in the group at almost every unit
+    count and nest in each other at NONE of them: one cuts after rank 0's
+    units, the other after rank 1's, and rank 1 always holds at least one
+    unit. Pairwise-against-the-root is therefore not a proof, and this
+    function is what replaces it.
+
+    The check, per pair of lanes that share at least one card, per probe:
+
+    * split both dimensions with the fork's own ``partition_units``, so the
+      rounding is the rounding the runtime will really do;
+    * require the two cut sets to be COMPARABLE (one a superset of the other).
+      Comparable means one partition refines the other, i.e. every shard of
+      the coarser lane is an exact union of shards of the finer one — that is
+      what makes the bytes the same bytes and not merely the same count;
+    * require the direction to be CONSISTENT across probes: a lane that is
+      coarser on the MLP dimension and finer on the vocabulary dimension has
+      no place in any tree, and that contradiction is reported as such;
+    * where ``segments_in_parent`` is pinned, require exactly that grouping —
+      the question ``distributed/dual_group.py`` asks, since Slice B installs
+      a segmentation rather than discovering one.
+
+    Lanes that share no card are NOT required to nest (they hold different
+    bytes on different silicon, so there is nothing to share); pass
+    ``require_disjoint_lanes_to_nest`` to check them anyway, which is what a
+    caller wanting ONE key family across the whole rig would want.
+
+    Returns the forest and, when it does not exist, every failure named down
+    to the probe, the two splits and the cut that broke it. It never repairs
+    a set into one that nests: which lane to move is a plan decision.
+    """
+    keys = [lane.key for lane in lanes]
+    if len(set(keys)) != len(keys):
+        return HullTree(
+            ok=False,
+            order=[],
+            parent={},
+            segments={},
+            failures=["duplicate lane keys: the hull would be ambiguous"],
+            checked=[],
+            disjoint=[],
+        )
+    by_key = {lane.key: lane for lane in lanes}
+    failures: List[str] = []
+    checked: List[Tuple[str, str]] = []
+    disjoint: List[Tuple[str, str]] = []
+    #: (a, b) -> True when a is COARSER than b (b refines a).
+    coarser: Dict[Tuple[str, str], bool] = {}
+    segments: Dict[Tuple[str, str], Tuple[Tuple[int, ...], ...]] = {}
+
+    for ia in range(len(lanes)):
+        for ib in range(ia + 1, len(lanes)):
+            a, b = lanes[ia], lanes[ib]
+            shared = sorted(set(int(g) for g in a.gpus) & set(int(g) for g in b.gpus))
+            if not shared and not require_disjoint_lanes_to_nest:
+                disjoint.append((a.key, b.key))
+                continue
+            checked.append((a.key, b.key))
+            direction: Optional[str] = None
+            for probe in probes:
+                ra = a.ratio_for(probe.family)
+                rb = b.ratio_for(probe.family)
+                fam = f" family {probe.family!r}" if probe.family else ""
+                try:
+                    ca = partition_cuts(probe.units, ra, probe.groups)
+                    cb = partition_cuts(probe.units, rb, probe.groups)
+                except ValueError as exc:
+                    failures.append(
+                        f"{a.key} vs {b.key}: {probe.what}{fam} with "
+                        f"{probe.units} units cannot be split at all — {exc}"
+                    )
+                    continue
+                sa, sb = set(ca), set(cb)
+                if sa == sb:
+                    this = "same"
+                elif sa >= sb:
+                    this = "b_coarser"
+                elif sb >= sa:
+                    this = "a_coarser"
+                else:
+                    only_a = sorted(sa - sb)
+                    only_b = sorted(sb - sa)
+                    failures.append(
+                        f"{a.key} vs {b.key} (sharing card(s) "
+                        f"{shared}): {probe.what}{fam} splits into "
+                        f"{list(ca)} and {list(cb)} over {probe.units} units "
+                        f"— neither cut set contains the other ({a.key} cuts "
+                        f"at {only_a} where {b.key} does not, {b.key} at "
+                        f"{only_b} where {a.key} does not). Neither lane "
+                        "refines the other, so no shard of one is a union of "
+                        "shards of the other and the bytes cannot be shared. "
+                        "This is the set-wise failure: each lane may still "
+                        "nest perfectly inside a third, coarser lane."
+                    )
+                    continue
+                if this == "same":
+                    continue
+                if direction is None:
+                    direction = this
+                elif direction != this:
+                    failures.append(
+                        f"{a.key} vs {b.key}: the refinement direction FLIPS "
+                        f"between dimensions — {probe.what}{fam} makes "
+                        f"{'a' if this == 'a_coarser' else 'b'} the coarser "
+                        "lane while an earlier dimension made the other one "
+                        "coarser. A hull tree needs one direction per pair; "
+                        "this set has none."
+                    )
+                    direction = None
+                    break
+            if direction == "a_coarser":
+                coarser[(a.key, b.key)] = True
+            elif direction == "b_coarser":
+                coarser[(b.key, a.key)] = True
+
+    # -- pinned segmentations: the question dual_group asks -----------------
+    for lane in lanes:
+        if lane.shared_segments is None or lane.nests_in is None:
+            continue
+        other = by_key.get(lane.nests_in)
+        if other is None:
+            failures.append(
+                f"{lane.key} declares nests_in={lane.nests_in!r}, which is not "
+                "in the lane set"
+            )
+            continue
+        want = tuple(tuple(int(r) for r in seg) for seg in lane.shared_segments)
+        for probe in probes:
+            fam = f" family {probe.family!r}" if probe.family else ""
+            try:
+                oc = partition_cuts(
+                    probe.units, other.ratio_for(probe.family), probe.groups
+                )
+                lc = partition_cuts(
+                    probe.units, lane.ratio_for(probe.family), probe.groups
+                )
+            except ValueError:
+                continue
+            # Which side is coarser is a property of the splits, not of the
+            # direction the caller wrote the relation in.
+            if len(set(oc)) <= len(set(lc)):
+                got = _segments_from_cuts(oc, lc)
+                coarse_key, fine_key = other.key, lane.key
+            else:
+                got = _segments_from_cuts(lc, oc)
+                coarse_key, fine_key = lane.key, other.key
+            if got != want:
+                failures.append(
+                    f"{fine_key} in {coarse_key}: {probe.what}{fam} over "
+                    f"{probe.units} units nests as "
+                    f"{[list(s) for s in got] if got else 'not at all'}, but "
+                    f"the pinned segmentation is {[list(s) for s in want]}. "
+                    f"The lane would read a shard {coarse_key}'s rank does "
+                    "not own. (A free segmentation may still exist — that is "
+                    "the weaker question this check deliberately does not "
+                    "ask, and it is where this module and dual_group differ.)"
+                )
+
+    # -- the forest: coarsest first, per connected component ----------------
+    order: List[str] = []
+    remaining = list(keys)
+    guard = 0
+    while remaining and guard <= len(keys):
+        guard += 1
+        free = [
+            k
+            for k in remaining
+            if not any(coarser.get((o, k)) for o in remaining if o != k)
+        ]
+        if not free:
+            failures.append(
+                "the refinement relation has a cycle over "
+                f"{sorted(remaining)} — no lane is coarsest, so there is no "
+                "hull tree"
+            )
+            break
+        for k in sorted(free):
+            order.append(k)
+            remaining.remove(k)
+
+    parent: Dict[str, Optional[str]] = {}
+    for i, k in enumerate(order):
+        chosen: Optional[str] = None
+        for cand in order[:i]:
+            if coarser.get((cand, k)):
+                chosen = cand
+        parent[k] = chosen
+        if chosen is not None:
+            for probe in probes:
+                try:
+                    pc = partition_cuts(
+                        probe.units,
+                        by_key[chosen].ratio_for(probe.family),
+                        probe.groups,
+                    )
+                    cc = partition_cuts(
+                        probe.units, by_key[k].ratio_for(probe.family), probe.groups
+                    )
+                except ValueError:
+                    continue
+                segs = _segments_from_cuts(pc, cc)
+                if segs is not None:
+                    segments[(k, chosen)] = segs
+                    break
+
+    return HullTree(
+        ok=not failures,
+        order=order,
+        parent=parent,
+        segments=segments,
+        failures=failures,
+        checked=checked,
+        disjoint=disjoint,
+    )
 
 
 def _role_bounds(
@@ -2249,6 +2729,14 @@ class InstanceSpec:
     #: overhead and the process post stay per instance, because those really
     #: are duplicated. ``None`` = naive duplication, weights counted twice.
     share_group: Optional[str] = None
+    #: Priority class under co-residence (PRIO-Nachtrag 5, generalized from
+    #: "PD beats Main" to ordered classes over N lanes by Nachtrag 8d).
+    #: LOWER is more protected: class 0 is served first and in full, every
+    #: higher class is a work-conserving scavenger over what the classes
+    #: below it left. Lanes of the SAME class share equally, which is why
+    #: the default (everything 0) is exactly the even split the two-lane
+    #: mapping already made.
+    priority_class: int = 0
 
 
 @dataclasses.dataclass
@@ -2509,7 +2997,7 @@ def coexistence(
                         else ""
                     )
                     + (
-                        f"; {extra_processes} extra process post(s) " f"{posts:.0f} MiB"
+                        f"; {extra_processes} extra process post(s) {posts:.0f} MiB"
                         if extra_processes
                         else ""
                     )
@@ -2519,7 +3007,136 @@ def coexistence(
     return {"fits": fits, "per_gpu": rows}
 
 
-def coresident_budgets(
+@dataclasses.dataclass
+class CoresidentPlan:
+    """The co-residence budget mapping, with the priority arithmetic shown."""
+
+    #: lane key -> per-rank budget MiB (the thing the sizing model consumes).
+    budgets: Dict[str, List[int]]
+    #: physical GPU -> what each class asked for and what it got.
+    per_gpu: List[dict]
+    #: Lanes whose class was reached with nothing left to give. They are NOT
+    #: assigned a made-up number; they keep their own resident footprint and
+    #: are named here so the caller can report the cell ``absent``.
+    starved: List[str]
+    notes: List[str]
+
+    def to_json(self) -> dict:
+        return {
+            "budgets": {k: list(v) for k, v in self.budgets.items()},
+            "per_gpu": list(self.per_gpu),
+            "starved": list(self.starved),
+            "notes": list(self.notes),
+        }
+
+
+def _award_leftover(
+    here: Sequence[InstanceEstimate],
+    want: Dict[str, float],
+    klass: Dict[str, int],
+    leftover: float,
+) -> Tuple[Dict[str, float], List[dict], List[str]]:
+    """Split one card's leftover over the priority classes on it.
+
+    Ascending class order; a class is served in FULL before the next one sees
+    anything, which is what "guaranteed" means when the guarantee has to
+    survive N lanes rather than two. Within a class the split is by what each
+    lane asked for, and the residue after every class is satisfied goes to the
+    LEAST protected non-empty class — a scavenger's whole job is to use what
+    is lying idle, and handing it back to a protected lane that already has
+    its budget would be inventing demand.
+
+    Equal classes reduce to the even split of the two-lane mapping, and that
+    is deliberate: no rig that does not USE priority classes may see its
+    numbers move.
+    """
+    rows: List[dict] = []
+    starved: List[str] = []
+    out: Dict[str, float] = {e.key: 0.0 for e in here}
+    classes = sorted({klass[e.key] for e in here})
+    if len(classes) <= 1:
+        n = len(here)
+        for e in here:
+            out[e.key] = leftover / n if n else 0.0
+        rows.append(
+            {
+                "class": classes[0] if classes else 0,
+                "lanes": [e.key for e in here],
+                "wanted_mib": round(sum(want[e.key] for e in here), 1),
+                "granted_mib": round(leftover, 1),
+                "policy": "even split (one priority class on this card)",
+            }
+        )
+        return out, rows, starved
+
+    remaining = float(leftover)
+    served: List[int] = []
+    for c in classes:
+        members = [e for e in here if klass[e.key] == c]
+        need = sum(want[e.key] for e in members)
+        if remaining <= 0.0:
+            for e in members:
+                starved.append(e.key)
+            rows.append(
+                {
+                    "class": c,
+                    "lanes": [e.key for e in members],
+                    "wanted_mib": round(need, 1),
+                    "granted_mib": 0.0,
+                    "policy": (
+                        "absent: every MiB of this card was taken by the "
+                        f"protected class(es) {served}"
+                    ),
+                }
+            )
+            continue
+        if need <= remaining:
+            for e in members:
+                out[e.key] += want[e.key]
+            remaining -= need
+            policy = "granted in full (protected)"
+        else:
+            if need > 0:
+                for e in members:
+                    out[e.key] += remaining * want[e.key] / need
+            else:
+                for e in members:
+                    out[e.key] += remaining / len(members)
+            policy = (
+                "partial: the class asked for more than the classes below it "
+                "left, so it is split in proportion to the requests"
+            )
+            need, remaining = min(need, remaining), 0.0
+        served.append(c)
+        rows.append(
+            {
+                "class": c,
+                "lanes": [e.key for e in members],
+                "wanted_mib": round(sum(want[e.key] for e in members), 1),
+                "granted_mib": round(need, 1),
+                "policy": policy,
+            }
+        )
+    if remaining > 0.0:
+        last = [e for e in here if klass[e.key] == classes[-1]]
+        for e in last:
+            out[e.key] += remaining / len(last)
+        rows.append(
+            {
+                "class": classes[-1],
+                "lanes": [e.key for e in last],
+                "wanted_mib": 0.0,
+                "granted_mib": round(remaining, 1),
+                "policy": (
+                    "residue: every class had its request met, the rest goes "
+                    "to the least protected class rather than lying idle"
+                ),
+            }
+        )
+    return out, rows, starved
+
+
+def coresident_budget_plan(
     specs: Sequence[InstanceSpec],
     estimates: Sequence[InstanceEstimate],
     gpu_total_mib: Dict[int, int],
@@ -2527,7 +3144,7 @@ def coresident_budgets(
     reserve_mib: Optional[Dict[int, int]] = None,
     process_post_mib: float = FIXED_PROCESS_POST_MIB,
     shared_process: bool = False,
-) -> Optional[Dict[str, List[int]]]:
+) -> Optional[CoresidentPlan]:
     """Per-lane, per-rank budgets under co-residence (the #260 mapping).
 
     ``estimate_instance`` sizes a lane's KV capacity against the budget the
@@ -2544,18 +3161,27 @@ def coresident_budgets(
                     - SUM_{share groups} MAX weights(g)   # shared bytes once
                     - SUM_lanes other(g)                  # pools, overhead
                     - process posts
-        budget_i(g) = weights_i(g) + other_i(g) + leftover(g) / lanes(g)
+        budget_i(g) = weights_i(g) + other_i(g) + award_i(g)
 
-    A lane keeps what it actually holds and gets an equal share of what is
-    left. Two properties are worth being explicit about, because they decide
+    A lane keeps what it actually holds and is awarded a share of what is
+    left. The award is where the PRIORITY CLASSES enter (Nachtrag 5, in the
+    N-lane form of Nachtrag 8d): the classes on a card are served in
+    ascending order, each in full before the next sees anything, so a
+    protected class gets the budget it asked for and the scavengers divide
+    the remainder. With ONE class on a card — which is every configuration
+    that does not use the feature — the award is the even split, unchanged.
+
+    Two properties are worth being explicit about, because they decide
     how far the result can be trusted:
 
-    * The EQUAL SPLIT of the leftover is a POLICY, not a derivation — a rig
-      may want to favour one lane. But the sum of the budgets is fixed
+    * The SPLIT of the leftover is a POLICY, not a derivation — even between
+      equals, waterfall between classes. But the sum of the budgets is fixed
       regardless of the split, so the per-rank capacity TOTAL is
       split-invariant; only its division between lanes is a choice. The
       usable-context figure is not strictly invariant, because
       ``min(sum P, 64 x min P)`` is not linear, and the caller is told so.
+      Priority therefore moves capacity BETWEEN lanes; it does not create
+      any.
     * A lane whose weights are the smaller half of a share group is charged
       only its OWN weights here, which is correct: the bytes it reuses were
       already paid for by the group, and the saving flows into ``leftover``
@@ -2571,20 +3197,28 @@ def coresident_budgets(
     Returns ``None`` when the mapping cannot be built — an overflowing card
     (a negative leftover has no honest division) or a lane with no local
     footprint at all. The caller then reports the KV cell ``absent`` rather
-    than dividing a number it does not have.
+    than dividing a number it does not have. A lane that is merely STARVED
+    (its class was reached with nothing left) is a different case: it is
+    named in ``starved`` and keeps its own footprint, because "this class
+    got nothing on this card" is a finding, not a hole.
     """
     reserve = dict(reserve_mib or {})
     by_key = {e.key: e for e in estimates}
     if len(by_key) != len(estimates):
         return None  # duplicate keys: the mapping would be ambiguous
 
-    leftover: Dict[int, float] = {}
+    klass = {s.key: int(s.priority_class) for s in specs}
     lanes_on: Dict[int, List[InstanceEstimate]] = {}
+    #: physical GPU -> lane key -> awarded MiB out of that card's leftover.
+    award: Dict[int, Dict[str, float]] = {}
+    per_gpu: List[dict] = []
+    starved: List[str] = []
+    notes: List[str] = []
     gpus: set = set()
     for est in estimates:
         if est.local:
             gpus |= set(est.weights_mib) | set(est.other_mib)
-    for g in gpus:
+    for g in sorted(gpus):
         here = [
             e
             for e in estimates
@@ -2607,7 +3241,43 @@ def coresident_budgets(
         )
         if left < 0:
             return None  # does not fit; there is nothing to divide
-        leftover[g] = left
+        # What each lane ASKED for on this card, beyond what it already
+        # holds there: the sum of the solo budgets of its ranks on g, minus
+        # its own resident footprint. Never negative — a lane whose solo
+        # budget is already below its footprint is asking for nothing extra,
+        # not for a refund.
+        want: Dict[str, float] = {}
+        by_spec = {s.key: s for s in specs}
+        for e in here:
+            spec = by_spec.get(e.key)
+            floor = e.weights_mib.get(g, 0.0) + e.other_mib.get(g, 0.0)
+            asked = 0.0
+            if spec is not None:
+                asked = sum(
+                    float(spec.budgets_mib[r])
+                    for r, x in enumerate(spec.rank_gpu_id)
+                    if int(x) == g and r < len(spec.budgets_mib)
+                )
+            want[e.key] = max(asked - floor, 0.0)
+        got, rows, card_starved = _award_leftover(
+            here, want, {e.key: klass.get(e.key, 0) for e in here}, left
+        )
+        award[g] = got
+        starved.extend(f"{k}@gpu{g}" for k in card_starved)
+        per_gpu.append(
+            {
+                "gpu": g,
+                "leftover_mib": round(left, 1),
+                "lanes": len(here),
+                "classes": rows,
+            }
+        )
+        if len({klass.get(e.key, 0) for e in here}) > 1:
+            notes.append(
+                f"GPU {g} carries {len(here)} lanes in "
+                f"{len({klass.get(e.key, 0) for e in here})} priority classes; "
+                "the leftover was awarded class by class, lowest class first"
+            )
 
     out: Dict[str, List[int]] = {}
     for spec in specs:
@@ -2618,18 +3288,44 @@ def coresident_budgets(
         budgets: List[int] = []
         for gpu in spec.rank_gpu_id:
             g = int(gpu)
-            n = len(lanes_on.get(g, []))
-            if n == 0:
+            if not lanes_on.get(g):
                 return None
             ranks_here = sum(1 for x in spec.rank_gpu_id if int(x) == g)
             share = (
                 est.weights_mib.get(g, 0.0)
                 + est.other_mib.get(g, 0.0)
-                + leftover.get(g, 0.0) / n
+                + award.get(g, {}).get(spec.key, 0.0)
             ) / max(ranks_here, 1)
             budgets.append(int(share))
         out[spec.key] = budgets
-    return out or None
+    if not out:
+        return None
+    return CoresidentPlan(budgets=out, per_gpu=per_gpu, starved=starved, notes=notes)
+
+
+def coresident_budgets(
+    specs: Sequence[InstanceSpec],
+    estimates: Sequence[InstanceEstimate],
+    gpu_total_mib: Dict[int, int],
+    *,
+    reserve_mib: Optional[Dict[int, int]] = None,
+    process_post_mib: float = FIXED_PROCESS_POST_MIB,
+    shared_process: bool = False,
+) -> Optional[Dict[str, List[int]]]:
+    """``coresident_budget_plan`` reduced to the budget map alone.
+
+    The mapping every caller that does not care about the priority arithmetic
+    wants, and the shape ``aggregate`` consumed before classes existed.
+    """
+    plan = coresident_budget_plan(
+        specs,
+        estimates,
+        gpu_total_mib,
+        reserve_mib=reserve_mib,
+        process_post_mib=process_post_mib,
+        shared_process=shared_process,
+    )
+    return plan.budgets if plan is not None else None
 
 
 def _capacity_under(
@@ -2728,6 +3424,7 @@ def aggregate(
                 for e in estimates
             ],
             "coexistence": bracket,
+            "coresident_plan": None,
             "aggregate": cells,
             "reasons": reasons,
         }
@@ -2758,19 +3455,28 @@ def aggregate(
     # -- KV: sum only what the lanes can hold AT THE SAME TIME --------------
     shares_a_card = any(row["lanes"] > 1 for row in bracket["per_gpu"])
     coresident: Optional[Dict[str, List[int]]] = None
+    coresident_plan: Optional[CoresidentPlan] = None
     per_lane_kv: Dict[str, Optional[float]] = {
         e.key: e.max_kv_tokens for e in estimates
     }
     if not shares_a_card:
         cells["max_kv_tokens"] = _sum("max_kv_tokens", "tokens", "a KV capacity")
     else:
-        coresident = coresident_budgets(
+        coresident_plan = coresident_budget_plan(
             specs,
             estimates,
             gpu_total_mib,
             reserve_mib=reserve_mib,
             shared_process=shared_process,
         )
+        coresident = coresident_plan.budgets if coresident_plan else None
+        if coresident_plan is not None:
+            reasons.extend(coresident_plan.notes)
+            reasons.extend(
+                f"{k}: its priority class was reached with nothing left on "
+                "that card — it holds only its own resident footprint there"
+                for k in coresident_plan.starved
+            )
         if coresident is None:
             cells["max_kv_tokens"] = _cell(
                 None,
@@ -2842,9 +3548,362 @@ def aggregate(
         "shared_process": bool(shared_process),
         "instances": out_instances,
         "coexistence": bracket,
+        "coresident_plan": (
+            coresident_plan.to_json() if coresident_plan is not None else None
+        ),
         "aggregate": cells,
         "reasons": reasons,
     }
+
+
+# ---------------------------------------------------------------------------
+# The N-lane entry point (PRIO-Nachtrag 8c)
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class LaneTarget:
+    """One lane's goal in an N-lane solve: what it is for, and where it lives.
+
+    Everything the single-lane ``solve`` takes, plus the three things only a
+    SET of lanes has: the class that decides who gets the shared card's bytes
+    first, the coarser lane this one has to nest inside, and the share group
+    whose weight bytes it reuses.
+    """
+
+    key: str
+    plan_inputs: Any
+    base_plan: Sequence[int]
+    budgets_mib: Sequence[int]
+    goal: str = "maxkv"
+    goal_b: Optional[str] = None
+    constraints: Optional[Dict[str, float]] = None
+    target_context: int = 8192
+    roles: Optional[Sequence[str]] = None
+    search_roles: bool = True
+    priority_class: int = 0
+    #: Key of the coarser lane whose shards must contain this lane's.
+    nests_in: Optional[str] = None
+    share_group: Optional[str] = None
+    kind: str = "serving"
+    min_kv_tokens: int = 4096
+    #: Explicit ``rank_of`` against ``nests_in`` when the card map is
+    #: ambiguous (a lane with two ranks on one card).
+    outer_rank_of: Optional[Sequence[Optional[int]]] = None
+
+
+@dataclasses.dataclass
+class LaneSolution:
+    """The answer for a whole set of lanes.
+
+    ``ok`` means the PLAN is realizable: every lane got a key, the keys
+    jointly fit, and the set has a hull tree. It does not mean every cell of
+    the aggregate carries a number — a lane whose priority class was reached
+    with nothing left, or a checkpoint with no measured decode baseline,
+    still yields ``absent`` cells, and those are findings the caller has to
+    read rather than failures of the plan.
+    """
+
+    ok: bool
+    #: Solve order, coarsest/least-constrained first.
+    order: List[str]
+    answers: Dict[str, SolverAnswer]
+    keys: Dict[str, List[int]]
+    specs: List[InstanceSpec]
+    #: The ``aggregate`` bracket over the solved keys (None when a lane had
+    #: no feasible key at all — there is nothing to bracket).
+    aggregate: Optional[dict]
+    hull: Optional[HullTree]
+    caveats: List[str]
+    reasons: List[str]
+
+    def to_json(self) -> dict:
+        return {
+            "ok": self.ok,
+            "order": list(self.order),
+            "keys": {k: list(v) for k, v in self.keys.items()},
+            "answers": {k: a.to_json() for k, a in self.answers.items()},
+            "aggregate": self.aggregate,
+            "hull": self.hull.to_json() if self.hull else None,
+            "caveats": list(self.caveats),
+            "reasons": list(self.reasons),
+        }
+
+
+def _lane_order(lanes: Sequence[LaneTarget]) -> Optional[List[str]]:
+    """Lanes ordered so that every ``nests_in`` target comes first. ``None``
+    on a cycle or a dangling reference — both are plan errors, not solver
+    ones, and inventing an order would hide them."""
+    keys = [t.key for t in lanes]
+    if len(set(keys)) != len(keys):
+        return None
+    by_key = {t.key: t for t in lanes}
+    order: List[str] = []
+    state: Dict[str, int] = {}
+
+    def visit(k: str) -> bool:
+        if state.get(k) == 2:
+            return True
+        if state.get(k) == 1:
+            return False
+        if k not in by_key:
+            return False
+        state[k] = 1
+        parent = by_key[k].nests_in
+        if parent is not None and not visit(parent):
+            return False
+        state[k] = 2
+        order.append(k)
+        return True
+
+    for k in keys:
+        if not visit(k):
+            return None
+    return order
+
+
+def solve_lanes(
+    lanes: Sequence[LaneTarget],
+    probe: dict,
+    gpu_total_mib: Dict[int, int],
+    *,
+    reserve_mib: Optional[Dict[int, int]] = None,
+    shared_process: bool = False,
+    prefill_tokens: int = 20000,
+    hull_probes: Optional[Sequence[HullProbe]] = None,
+) -> LaneSolution:
+    """Solve the key of EVERY lane of a multi-group runtime, jointly bracketed.
+
+    The N-lane form of ``solve``. What it does, and deliberately only this:
+
+    1. order the lanes so a lane is solved after the lane it nests inside;
+    2. solve each lane with ``solve``, under the set-wise box from EVERY
+       coarser lane already fixed (``nesting_bounds_over``) — so a lane that
+       reuses two resident lanes is bounded by the smaller of them per card,
+       not by whichever one the caller happened to pass;
+    3. close the feasibility bracket over the solved keys with ``aggregate``,
+       which prices the shared weight bytes once per share group, charges the
+       process posts unless ``shared_process``, and hands each lane its
+       priority-class share of what is left;
+    4. check the whole SET for nestability with ``nesting_hull``, because
+       step 2's boxes are pairwise-against-the-ancestors and that is not the
+       same question.
+
+    What it does NOT do, and this is the scope line, not an omission: it
+    never invents lanes. The lane count, the card sets, the roles and the
+    nesting relations come from the CALLER; the solver evaluates and
+    optimizes the keys under them. Enumerating lane STRUCTURES — how many
+    lanes, over which cards, in which direction spread — is the dispatcher's
+    search space (Slice D) and would be a combinatorial explosion bolted onto
+    a closed-form solver.
+
+    The lanes are solved in sequence, so an earlier lane does not see the
+    later ones' demand. That is a real limitation and it is named in the
+    caveats: the order is the priority order, so the protected lane is the
+    one solved unconstrained, which is the intended asymmetry rather than an
+    accident — but a joint optimum over all lanes at once this is not.
+    """
+    caveats: List[str] = []
+    reasons: List[str] = []
+    order = _lane_order(lanes)
+    if order is None:
+        return LaneSolution(
+            ok=False,
+            order=[],
+            answers={},
+            keys={},
+            specs=[],
+            aggregate=None,
+            hull=None,
+            caveats=caveats,
+            reasons=[
+                "the lanes' nests_in relations do not form a forest (a cycle, "
+                "a dangling reference or a duplicate key). No lane can be "
+                "solved before the lane it must nest inside, so no order "
+                "exists and none is invented"
+            ],
+        )
+    by_key = {t.key: t for t in lanes}
+    # Protected classes first among the lanes the nesting relation leaves
+    # unordered: the lane whose budget is guaranteed is the one that should be
+    # solved unconstrained.
+    order = _stable_priority_order(order, by_key)
+
+    answers: Dict[str, SolverAnswer] = {}
+    keys: Dict[str, List[int]] = {}
+    gpus_of: Dict[str, List[int]] = {
+        t.key: [int(g) for g in t.plan_inputs.rank_gpu_id] for t in lanes
+    }
+
+    for k in order:
+        target = by_key[k]
+        outers: List[OuterLane] = []
+        # Every ANCESTOR bounds the lane, not only the direct parent: the
+        # boxes intersect, and a chain of three lanes over one card is the
+        # first configuration where taking only the parent would be wrong.
+        ancestor = target.nests_in
+        walked: set = set()
+        while ancestor is not None and ancestor not in walked:
+            walked.add(ancestor)
+            if ancestor in keys:
+                rank_of = (
+                    list(target.outer_rank_of)
+                    if target.outer_rank_of is not None and ancestor == target.nests_in
+                    else rank_map_over_cards(gpus_of[k], gpus_of[ancestor])
+                )
+                outers.append(
+                    OuterLane(key=ancestor, units=list(keys[ancestor]), rank_of=rank_of)
+                )
+            ancestor = by_key[ancestor].nests_in if ancestor in by_key else None
+        bounds = nesting_bounds_over(outers) if outers else None
+        rates = rates_from_probe(probe, target.plan_inputs.rank_gpu_id)
+        answer = solve(
+            target.plan_inputs,
+            list(target.base_plan),
+            list(target.budgets_mib),
+            rates,
+            goal=target.goal,
+            goal_b=target.goal_b,
+            constraints=target.constraints,
+            target_context=target.target_context,
+            roles=target.roles,
+            search_roles=target.search_roles,
+            unit_bounds=bounds,
+        )
+        answers[k] = answer
+        if outers:
+            caveats.append(
+                f"{k}: bounded by the resident shards of "
+                + ", ".join(o.key for o in outers)
+                + " (per-card minimum of their unit counts)"
+            )
+        if not answer.ok or not answer.candidates:
+            reasons.append(
+                f"{k}: no key satisfies this lane under the bounds it "
+                "inherited from the lanes it nests inside — "
+                + "; ".join(answer.reasons)
+            )
+            continue
+        keys[k] = list(answer.candidates[0].units)
+
+    specs: List[InstanceSpec] = []
+    for k in order:
+        if k not in keys:
+            continue
+        t = by_key[k]
+        pi = t.plan_inputs
+        specs.append(
+            InstanceSpec(
+                key=k,
+                model_path=pi.model_path,
+                tp_size=pi.tp_size,
+                rank_gpu_id=list(pi.rank_gpu_id),
+                budgets_mib=[int(x) for x in t.budgets_mib],
+                base_plan=list(t.base_plan),
+                mlp_vector=list(keys[k]),
+                kv_cache_dtype=pi.kv_cache_dtype,
+                speculative_algorithm=pi.speculative_algorithm,
+                speculative_num_draft_tokens=pi.speculative_num_draft_tokens,
+                max_running_requests=pi.max_running_requests,
+                kind=t.kind,
+                min_kv_tokens=t.min_kv_tokens,
+                share_group=t.share_group,
+                priority_class=t.priority_class,
+            )
+        )
+
+    agg: Optional[dict] = None
+    if len(specs) == len(lanes) and specs:
+        agg = aggregate(
+            specs,
+            probe,
+            gpu_total_mib,
+            reserve_mib=reserve_mib,
+            prefill_tokens=prefill_tokens,
+            shared_process=shared_process,
+        )
+        reasons.extend(agg.get("reasons", []))
+
+    hull: Optional[HullTree] = None
+    if len(keys) == len(lanes):
+        lane_keys = [
+            LaneKey(
+                key=k,
+                ratio=tuple(int(x) for x in by_key[k].base_plan),
+                gpus=tuple(gpus_of[k]),
+                family_ratios=(("mlp", tuple(int(x) for x in keys[k])),),
+                priority_class=by_key[k].priority_class,
+                nests_in=by_key[k].nests_in,
+            )
+            for k in order
+        ]
+        probes = list(hull_probes) if hull_probes is not None else None
+        if probes is None:
+            units = {len(keys[k]): sum(keys[k]) for k in order}
+            total = sorted(set(units.values()))
+            probes = [
+                HullProbe(what="MLP units", units=int(u), family="mlp") for u in total
+            ]
+            caveats.append(
+                "the hull was checked on the MLP dimension only — pass "
+                "hull_probes with the attention, GDN and vocabulary unit "
+                "counts of the checkpoint to check the axes the key vector "
+                "does not carry. A hull that holds on one dimension is not a "
+                "hull"
+            )
+        hull = nesting_hull(lane_keys, probes)
+        if not hull.ok:
+            reasons.extend(hull.failures)
+
+    caveats.append(
+        "lanes are solved in priority order, each against the ones already "
+        "fixed — not jointly. The protected lane is therefore solved "
+        "unconstrained and the scavengers see its key as a bound, which is "
+        "the intended asymmetry; a joint Pareto optimum over all lanes at "
+        "once is not what this computes"
+    )
+    ok = (
+        len(keys) == len(lanes)
+        and (agg is not None and agg.get("fits"))
+        and (hull is None or hull.ok)
+    )
+    return LaneSolution(
+        ok=bool(ok),
+        order=order,
+        answers=answers,
+        keys=keys,
+        specs=specs,
+        aggregate=agg,
+        hull=hull,
+        caveats=caveats,
+        reasons=reasons,
+    )
+
+
+def _stable_priority_order(
+    order: Sequence[str], by_key: Dict[str, LaneTarget]
+) -> List[str]:
+    """Reorder within the nesting constraint so lower priority classes come
+    first. A lane never moves ahead of the lane it nests inside — the box has
+    to exist before it can bound anything — so priority only breaks ties the
+    nesting relation leaves open."""
+    remaining = list(order)
+    done: set = set()
+    out: List[str] = []
+    while remaining:
+        ready = [
+            k
+            for k in remaining
+            if by_key[k].nests_in is None or by_key[k].nests_in in done
+        ]
+        if not ready:  # cannot happen: `order` is already a valid topo order
+            out.extend(remaining)
+            break
+        pick = min(ready, key=lambda k: (by_key[k].priority_class, order.index(k)))
+        out.append(pick)
+        done.add(pick)
+        remaining.remove(pick)
+    return out
 
 
 # ---------------------------------------------------------------------------
