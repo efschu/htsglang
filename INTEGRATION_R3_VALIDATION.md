@@ -4720,3 +4720,16 @@ pgid, the dying one SIGKILLed the neighbour, which explains the tracebackless
 PD collateral death) and #171 (13 real vendor-blind capability gates fixed at
 the root: helpers now carry the vendor in the name; gfx900 reads as (9,0) and
 cleared every "sm90" gate before).
+
+# #252 — per-rank prefill line now splits compute vs wait; expectation falsified
+
+CollectiveClock (pooled CUDA events inside GroupCoordinator collectives,
+armed only for logged prefill forwards, 0.13 % overhead, suppressed under
+graph replay instead of faking zeros). Measured on the TP=3 FP8 boot, cold
+21765-token prefill, steady chunk: TP0 (5090) gpu-ms 1837.6 (compute 196.6,
+wait 1641.1); TP1/TP2 (3080) compute 586.5/558.5, wait 1251.0/1279.3. The
+5090 computes ~3x SHORTER and waits ~390 ms longer — the 3080s pace prefill;
+the mlp split is too conservative for the 5090 on this workload. Second
+reading: wait is ~68 % of the window on EVERY rank — collective cost, not
+skew (no-P2P/PHB rig); only the ~390 ms imbalance is recoverable by a shard
+rebalance. Feeds --rank-perf-tune enc and the #258 front.
