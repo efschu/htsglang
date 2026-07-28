@@ -6083,3 +6083,18 @@ Schalenklasse fehlt, Aufwand B1, Laut-Fehler-Zweig greift). Distributed-Suite
   `DualGroupLane`-Docstring "§6", diese Datei "§11.12"). Der fortgeschriebene
   Stand liegt deshalb hier. Wer §11 weiterfuehren will, braucht zuerst die
   Datei.
+
+## GDR-Fensterlauf (#277) — Lauf 1 CT999: Ausfuehrungsort-Verdikt (2026-07-28)
+
+Null Messdaten, Wurzel ist NICHT das Skript: CT999 hat kein /dev/infiniband
+(dokumentierte Container-Grenze, rig-runbook Z.40) — ibv_get_device_list()
+liefert leer, obwohl sysfs den NIC zeigt und rdma link ACTIVE meldet. Alle
+drei Arme + Stufe-0-Smoke brachen identisch "NIC rocep4s0f0 fehlt" ab.
+Bestanden trotzdem: RO-Compile-Probe (--ro wirkt), setpci-Degradation zu n/a.
+Nebenbefund Lock-Format: /tmp/gpu-card-N.lock muessen Verzeichnisse mit
+info-Datei sein (comm_suite-_CardWindow-Format); plain files kollidieren mit
+dem skriptinternen Protokoll ("gehalten von unknown"). Rohdaten:
+scripts/probe/results/gdr_window_20260728T183514Z.{tsv,log} (Lauf mit
+sauberem Lock-Ablauf), 183412Z = durch Lock-Kollision ungueltiger Erstlauf.
+Konsequenz: Lauf 2 auf dem PVE-Host (hat /dev/infiniband + alle 3 GPUs;
+Probe-Baum host-seitig /spinning/subvol-999-disk-0/spinning/wt-gdr-window).
