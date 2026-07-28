@@ -1,0 +1,4 @@
+# Buildausgabe (treiberversions-/maschinenspezifisch) und Laufergebnisse --
+# beide werden lokal per build.sh / gdr_window_run.sh erzeugt, nicht committet.
+bin/
+results/
