@@ -268,6 +268,8 @@ __all__ = [
     "rates_from_probe",
     "water_fill",
     "project_to_grid",
+    "nesting_bounds",
+    "UnitBound",
     "full_attention_layers",
     "full_attention_layers_in_window",
     "solve",
@@ -1559,16 +1561,73 @@ def _tradeoff(
 # ---------------------------------------------------------------------------
 
 
+UnitBound = Tuple[Optional[int], Optional[int]]
+
+
+def nesting_bounds(
+    outer_units: Sequence[int],
+    outer_rank_of: Sequence[Optional[int]],
+) -> List[UnitBound]:
+    """Box bounds that force one lane's shards to be SUBSETS of another's.
+
+    The dual-group case: an outer lane (say TP=2 over two cards) is already
+    resident, and an inner lane (TP=3 over three) must reuse it, so on every
+    shared card the inner lane's shard has to be contained in the outer
+    lane's. Containment of the unit SETS implies ``u_r <= v_r`` on the shared
+    cards, and that is exactly a box on the inner problem — the same bounds
+    the roles already express, so the solver needs no new machinery, only a
+    way to be told them.
+
+    ``outer_rank_of[i]`` is the outer lane's rank on the card inner rank ``i``
+    sits on, or ``None`` for a card the outer lane does not use (the
+    complement card, whose shard is the only genuinely new resident bytes).
+
+    NOT a free lunch, and the caller has to know it: the bound is a NECESSARY
+    condition for reuse, not a sufficient one. Containment must also hold for
+    the axes this vector does not carry — the attention, GDN and vocab shards
+    — and the unit ranges have to be laid out CONTIGUOUSLY so that the inner
+    shard is a prefix/interval of the outer one rather than merely smaller.
+    Both are properties of the partition layout, not of the count, and the
+    solver models counts. State them as configuration requirements; do not
+    read a satisfied box as proof that the bytes really are shared.
+    """
+    out: List[UnitBound] = []
+    for outer in outer_rank_of:
+        if outer is None:
+            out.append((None, None))
+        else:
+            out.append((None, int(outer_units[outer])))
+    return out
+
+
 def _role_bounds(
-    roles: Sequence[str], units: int
+    roles: Sequence[str],
+    units: int,
+    unit_bounds: Optional[Sequence[UnitBound]] = None,
 ) -> Tuple[List[int], List[int], List[float]]:
+    """Per-rank ``(lo, hi, fixed post)`` on the unit grid.
+
+    Role bounds and any explicit ``unit_bounds`` are INTERSECTED: a kv_donor
+    that is also nested stays a donor, and a nesting ceiling never widens a
+    role. An empty intersection (lo > hi) is left as-is and fails loudly in
+    ``water_fill`` rather than being silently repaired into something the
+    caller did not ask for.
+    """
     lo: List[int] = []
     hi: List[int] = []
     post: List[float] = []
-    for key in roles:
+    for i, key in enumerate(roles):
         spec = _ROLE_BY_KEY[key]
-        lo.append(int(math.ceil(spec.weight_lo * units)))
-        hi.append(int(math.floor(spec.weight_hi * units)))
+        rank_lo = int(math.ceil(spec.weight_lo * units))
+        rank_hi = int(math.floor(spec.weight_hi * units))
+        if unit_bounds is not None and i < len(unit_bounds):
+            b_lo, b_hi = unit_bounds[i]
+            if b_lo is not None:
+                rank_lo = max(rank_lo, int(b_lo))
+            if b_hi is not None:
+                rank_hi = min(rank_hi, int(b_hi))
+        lo.append(rank_lo)
+        hi.append(rank_hi)
         post.append(spec.fixed_post_mib)
     return lo, hi, post
 
@@ -1577,9 +1636,10 @@ def _solve_single(
     goal: str,
     model: KeyCostModel,
     roles: Sequence[str],
+    unit_bounds: Optional[Sequence[UnitBound]] = None,
 ) -> Optional[List[int]]:
     """The closed-form optimum for one goal under one role assignment."""
-    lo, hi, post = _role_bounds(roles, model.units)
+    lo, hi, post = _role_bounds(roles, model.units, unit_bounds)
     if sum(lo) > model.units or sum(hi) < model.units:
         return None
     a, b = _terms(goal, model, post)
@@ -1600,6 +1660,7 @@ def _candidate_set(
     *,
     segment_steps: int = 40,
     grid_steps: int = 8,
+    unit_bounds: Optional[Sequence[UnitBound]] = None,
 ) -> List[Tuple[int, ...]]:
     """The bounded search set for the combined goals (§4).
 
@@ -1608,7 +1669,7 @@ def _candidate_set(
     grid catches off-segment points; the segment gives the front its
     resolution where it matters.
     """
-    lo, hi, _ = _role_bounds(roles, model.units)
+    lo, hi, _ = _role_bounds(roles, model.units, unit_bounds)
     out: Dict[Tuple[int, ...], None] = {}
 
     def add(vec: Sequence[float]) -> None:
@@ -1679,6 +1740,7 @@ def solve(
     roles: Optional[Sequence[str]] = None,
     search_roles: bool = True,
     front_size: int = 5,
+    unit_bounds: Optional[Sequence[UnitBound]] = None,
 ) -> SolverAnswer:
     """Compute the key.
 
@@ -1715,7 +1777,7 @@ def solve(
     state_bound = _state_bound_sessions(plan_inputs, base_plan, budgets_mib)
 
     def evaluate(units: Sequence[int], rset: Sequence[str]) -> Candidate:
-        _, _, post = _role_bounds(rset, model.units)
+        _, _, post = _role_bounds(rset, model.units, unit_bounds)
         cells, raw = _predict_all(
             model,
             units,
@@ -1761,7 +1823,7 @@ def solve(
     for rset in role_sets:
         got: Dict[str, List[int]] = {}
         for g in GOALS:
-            v = _solve_single(g, model, rset)
+            v = _solve_single(g, model, rset, unit_bounds)
             if v is not None:
                 got[g] = v
         if got:
@@ -1848,7 +1910,7 @@ def solve(
     pool: List[Candidate] = []
     for rset, got in best_by_role.items():
         anchor_vecs = list(got.values())
-        for vec in _candidate_set(model, rset, anchor_vecs):
+        for vec in _candidate_set(model, rset, anchor_vecs, unit_bounds=unit_bounds):
             pool.append(evaluate(list(vec), rset))
     pool = [c for c in pool if c.feasible]
     if not pool:
