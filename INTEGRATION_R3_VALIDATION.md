@@ -5207,3 +5207,37 @@ tp_size=None=global installiert — je Quant-Pfad Sichtungstest), B2 Lane-Pools
 rang-lokal sizen oder Gruppen-Hang), B3 Lane-Graphen. C-Blocker sind
 Prozess-Globals (_TP_PARTITION_RATIOS, ParallelContext._overrides,
 is_capture_mode, geteilter Graph-Pool), nicht NCCL.
+
+## #272-Nachtrag: FP8-tp2-in-tp3-Evaluation + nesting_bounds (eval/fp8-tp2-in-tp3, 42d87f843f)
+
+Gemergt. Marker-Gate 0/0/0, 99/99 Tests (65 Solver + 34 Nesting) gruen.
+DEVICE-ORDER-BEFUND: die x8-angebundene 3080 ist cuda_index 2, NICHT 1
+(zwei unabhaengige Profil-Signale ~2x: H2D 13,4 vs 6,47 GB/s, geordnete BW zur
+5090 6,88 vs 4,52). PD-Lane = --rank-gpu-id 0,2. In alle Briefings uebernehmen.
+MACHBARKEIT 27B-FP8-Dual-Gruppe (PD uneven-DCP TP=2 auf 5090+x8-3080, Haupt
+TP=3, Nesting-Reuse): am Standard-Rezept (mrr=16 je Lane) NEIN (5090 um
+11887 MiB drueber — bindender Posten sind ZWEI GDN-State-Pools, nicht die
+Gewichte; Sharing spart bereits 14221 MiB auf der 5090). In der Ecke JA:
+mrr_pd<=2 x mrr_main<=4 sowie (4,1) passen gegen den 400-MiB-Korridor
+(bestes +777 MiB bei 1/4). Engste Karte ist die 5090, nicht die x8-3080
+(Kapazitaets-Keys konzentrieren MLP-Masse dort, State-Pool folgt).
+EIN-PROZESS-LESART (= unsere Slice-A-Architektur): +3072 MiB je Zelle,
+oeffnet zusaetzlich (1,8)/(2,8)/(4,4) — beide Lesarten ausgewiesen.
+PREIS DER NESTING-KOPPLUNG BILLIG: dec -4,15 %, enc -4,30 %, maxkv/sessions
+0 % => MEHRERE Richtungen tragen, PD dominiert nicht. Was wirklich bindet,
+ist Ko-Residenz (PDs eigenes Prefill-Optimum 1,0 sprengt um 520 MiB), nicht
+das Nesting — zwei getrennt benannte Waende.
+KANDIDATEN: A (empfohlen) PD 59,9@mrr1 + Haupt 69,18,49@mrr4: Prefill
+1882+1156=3038 tok/s, Haupt-dec 90,0; C: Haupt 59,4,5: 3504 tok/s Prefill
+fuer -17 % dec; B (erste Intuition) scheitert ehrlich um 520 MiB.
+EHRLICHE SCHLAGZEILE: die Dual-Gruppe kauft die zweite prefill-schnelle Lane
+mit ~3/4 der Rig-KV (837k -> ~240k) und fast aller Concurrency — gut fuer
+burstiges TTFT-kritisches Prefill bei wenigen Sessions, schlecht fuer
+KV-hungrig/parallel. Interferenz benannt statt geschaetzt: max(lane) <= real
+<= Summe (A: zwischen 1882 und 3038).
+DEFEKT GEFUNDEN (offen, beim Solver-Agenten): aggregate() summiert je-Lane-KV
+als ob jede Lane allein waere — bei kartenteilenden Lanes 4,8x/3,3x
+Ueberschaetzung (1,14M vs korrigiert 240k/343k). Klammer unberuehrt. Fix:
+ko-residente Lanes gegen das geteilte Residuum sizen oder KV-Zelle absent.
+Nesting-Box ist notwendig, nicht hinreichend (Attention/GDN/Vocab-Achsen +
+Kontiguitaet sind Layout, nicht Zahl) — steht so in der Eval-Doku.
