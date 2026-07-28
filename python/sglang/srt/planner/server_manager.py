@@ -93,6 +93,36 @@ from sglang.srt.planner.energy import (
 )
 from sglang.srt.uneven_perf import _read_gguf_metadata
 
+
+def _tail_lines(path: str, n: int) -> str:
+    """Last ``n`` lines of ``path`` without reading the whole file.
+
+    ``status()`` (hence ``log_tail``) is called on every ``/api/live_snapshot``
+    poll of the landing page (every ``LAND_POLL_MS``, for as long as a server
+    is being monitored -- potentially hours). The previous implementation was
+    a plain ``f.readlines()[-n:]``: O(file size), re-run from scratch on every
+    poll tick, so the server-side response time -- and with it the perceived
+    live tok/s poll latency -- grew with how long the monitored server's log
+    had been accumulating, not with ``n``. This seeks backward from the end in
+    fixed-size chunks until ``n`` newlines are found (or the file start is
+    hit), so the cost is bounded by the tail actually requested."""
+    chunk = 8192
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            data = b""
+            while pos > 0 and data.count(b"\n") <= n:
+                read_size = min(chunk, pos)
+                pos -= read_size
+                f.seek(pos)
+                data = f.read(read_size) + data
+            lines = data.splitlines(keepends=True)
+            return b"".join(lines[-n:]).decode("utf-8", "replace")
+    except OSError:
+        return "(no log)"
+
+
 # ---------------------------------------------------------------------------
 # Model roots scanned by discover_models().
 #
@@ -967,11 +997,7 @@ class SglangSupervisor:
     def log_tail(self, n: int = 60) -> str:
         if not self._log_path:
             return "(no log)"
-        try:
-            with open(self._log_path) as f:
-                return "".join(f.readlines()[-n:])
-        except Exception:
-            return "(no log)"
+        return _tail_lines(self._log_path, n)
 
     def status(self) -> dict:
         self._refresh_state()
