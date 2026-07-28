@@ -4793,3 +4793,20 @@ Bugs found:
    predicted +13.9 % prefill / +6.4 % decode step; measured +8.2 % /
    +14.4 % — the knee guard would have rejected 6,1,1 for the right reason
    with a 2.2x too-mild number.
+
+# #256 — fp8 MoE presplit: single-card fp8 offload boot now real, #254 byte gate closed on the model path
+
+Fp8MoEMethod had neither half of the offload split (create_weights committed
+~30 GiB before any byte was read; the only split was post-load). Fix: expert
+allocations on CPU under the offload flag, presplit as the LAST step of
+process_weights_after_loading (after fnuz/aiter/Marlin branches), scales
+staged with their experts. Real bug found on the way: expert biases were
+expert-major but NOT staged — under offload the runner would silently pair
+every expert with the wrong bias; both bias attrs added to the staging list.
+
+GPU proof: Qwen3.6-35B-A3B-FP8 (31 GiB) boots TP=1 on one 5090 at fraction
+0.25 — 20.63 GiB weight VRAM released to the pinned host pool, coherent
+output. The #254 residual gap is closed: token- vs expert-major is
+BYTE-IDENTICAL on this real fp8 boot (386/386 chars), with the expected
+~3.5x H2D reduction (1.11-1.21 -> 0.34 GiB per layer per chunk, 27-31 -> 9
+waves). 83/83 offload tests, 7/7 fp8 wave-order GPU gates.
