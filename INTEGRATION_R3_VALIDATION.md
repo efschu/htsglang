@@ -6153,3 +6153,14 @@ Echter Richtungs-Befund statt BAR-Effekt: der X570-Switch kostet bei
 posted writes (NIC schreibt in VRAM) nur +2,8 % @1 MiB, bei non-posted
 reads (NIC liest aus VRAM) +53 % — Switch-Pfad ist fuer Empfangen fast
 frei, fuers Senden teuer. RO: Nulleffekt auch in dieser Reihe (<=0,06 us).
+
+## Cross-Rig-Stage-0-Smoke nach iommu=pt (#277-Abschluss, 2026-07-28)
+
+Rig 2 (Host-RAM, rocep1s0f1) -> Rig 1 (5090-VRAM, rocep4s0f1) via
+gpurdma_03_transfer (2 MiB): PASS — 512/512 Sequenzmarken, 0 Fuellbyte-
+Abweichungen, RDMA_WRITE landet DIREKT im GPU-VRAM. IO_PAGE_FAULT-Zaehler
+Rig 2 vorher/nachher 0/0 (alter Boot ohne iommu=pt: 3 Faults) — der Fix
+haelt. Nicht getestet (bewusst): Rig-2-GPU-Seite (2080-Ti-Topologie-Defekt,
+sm75 zurueckgestellt), kleine Groessen (BUFSZ fest 2 MiB), Bandbreite.
+Binaries wiederverwendbar: /root/gdr-verify/ (Rig 1), /root/gpurdma_03_transfer
+(Rig 2). #277 damit ABGESCHLOSSEN; P4-Nein-Verdikt unveraendert.
