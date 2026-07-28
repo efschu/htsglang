@@ -792,6 +792,51 @@ class TestTreeSpecDcpGuardBroadened(CustomTestCase):
         )
         args._handle_weightless_kv_fastlane()  # must not raise
 
+    def test_tree_guard_fires_on_hip_too(self):
+        # #139 audit: the guard used to sit inside the `elif is_cuda()` branch,
+        # i.e. behind `if is_hip(): return`. On ROCm an uneven-DCP tree config
+        # therefore passed arg validation and only died later in the backend's
+        # defensive check, after the full weight load. The condition mirrors a
+        # backend flag, not a platform capability, so it must fire on HIP.
+        args = make_args(
+            tp_size=3,
+            dcp_size=3,
+            rank_gpu_id=[0, 1, 2],
+            rank_gpu_memory_mib=[26000, 17000, 17000],
+            rank_tp_ratio=[2, 1, 1],
+            speculative_eagle_topk=2,
+        )
+        with patch.object(
+            server_args_module, "is_hip", return_value=True
+        ), patch.object(server_args_module, "is_cuda", return_value=False):
+            with self.assertRaisesRegex(ValueError, "eagle-topk"):
+                args._handle_dcp_validation()
+
+    def test_stock_even_dcp_on_hip_still_allows_trees(self):
+        # The hoist must not start rejecting stock (head-sharded, even) DCP on
+        # HIP: without --rank-tp-ratio and without the weightless lane there is
+        # no dcp_tree_mask to protect.
+        args = make_args(tp_size=2, dcp_size=2, speculative_eagle_topk=4)
+        with patch.object(
+            server_args_module, "is_hip", return_value=True
+        ), patch.object(server_args_module, "is_cuda", return_value=False):
+            args._handle_dcp_validation()  # must not raise
+
+    def test_tree_guard_absent_without_dcp(self):
+        # #139 verdict: topk > 1 on a non-DCP path (TP=1, and plain TP without
+        # --dcp-size) reaches the stock single-wrapper EAGLE verify -- full
+        # (prefix + tree ancestors) custom mask, one attention call, no LSE
+        # merge -- which is NOT the #76 terrain. It must stay allowed.
+        for tp in (1, 2):
+            with self.subTest(tp_size=tp):
+                args = make_args(
+                    tp_size=tp,
+                    dcp_size=1,
+                    speculative_algorithm="EAGLE",
+                    speculative_eagle_topk=4,
+                )
+                self._dcp_validate(args)  # must not raise
+
 
 class TestWeightlessChainSpecAdmission(CustomTestCase):
     """#143: the lane admits CHAIN speculation, in exactly one shape.

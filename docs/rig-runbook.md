@@ -530,6 +530,43 @@ OOMs in the GDN prefill scratch on the first long prompt; 2700 MiB holds.
 A successful warmup proves nothing about prefill headroom — test with a
 real long prompt before calling a reserve value good.
 
+### 6.6 Tree speculation (`--speculative-eagle-topk > 1`) loses on this rig
+
+Measured 2026-07-28 (#139), section 4.5 recipe, Qwen3.6-27B-MTP-Q3_K_M-GGUF,
+TP=1 on the 5090, `--mem-fraction-static 0.90`, NEXTN, `--speculative-num-steps
+3`, CUDA graphs on, temp 0, 3 x ~28 s decode per arm on the same prefilled
+prompt:
+
+| arm | tok/s (3 runs) | accept | ms/verify |
+|---|---|---|---|
+| `topk 1`, `num-draft-tokens 4` | 49.80 / 49.62 / 49.55 | 1.359 | 27.37 |
+| `topk 2`, `num-draft-tokens 8` | 31.42 / 31.38 / 31.34 | 1.464 | 46.66 |
+
+**-36.8 % throughput** for **+7.7 % acceptance**: the tree doubles the verify
+width (4 -> 8 tokens), which costs +70.5 % per verify round, and the acceptance
+gain does not come close to paying for it. Within-arm spread was 0.2-0.5 %, so
+the loss is roughly 9x the 2.7-4.2 % noise floor — it is not a marginal call.
+Both arms stayed on the same GGUF kernel family (bs=1, M=4 and M=8, both at or
+below `SGLANG_GGUF_MMQ_MAX_TOKENS`=8), so this is not a dequant-path artefact.
+
+This is a *performance* verdict, not a correctness one. topk>1 at TP=1 is NOT
+the #76 terrain: with `dcp_size == 1` the flashinfer backend's `uneven_dcp` is
+False, so the verify runs the stock single-wrapper EAGLE path — one attention
+call with the full (committed prefix + tree ancestors) custom mask, no ragged
+draft->draft split and no LSE merge. The #76 guard deliberately does not fire
+there. Behaviour matched that: both arms were byte-identical 3/3 within a boot,
+and `topk 1` was byte-identical across two separate boots, i.e. none of the
+#76 non-determinism signature.
+
+**Do not use `topk 1` as a losslessness oracle on this configuration.** A
+no-speculation greedy run (self-identical 3/3) diverges from *both* speculative
+arms at temp 0 — from `topk 1` at output index 15 on a long prompt and index 73
+on a short one, from `topk 2` at index 49. The verify forward's batch shape
+(M=4/M=8 vs the M=1 no-spec decode) changes GEMM tiling and flips near-tie
+argmax; that affects the chain exactly as it affects the tree. A temp-0
+difference between `topk 1` and `topk 2` here is therefore evidence of nothing
+on its own.
+
 ## 7. Operational hygiene
 
 Several agents share this box; the cards are usually contended.
