@@ -447,10 +447,22 @@ def _plan_to_dict(result, model_path: str) -> dict:
     }
 
 
-def plan_from_payload(payload: dict) -> dict:
-    """Run ``feasibility.plan()`` for a UI form payload; return a JSON-able
-    dict (or ``{valid: False, reasons: [...]}`` for a rejected manual edit)."""
-    from sglang.srt.planner.feasibility import PlanRejected, plan
+class _PayloadRejected(ValueError):
+    """A form payload that cannot be turned into planner arguments at all."""
+
+    def __init__(self, reasons):
+        self.reasons = list(reasons)
+        super().__init__("; ".join(self.reasons))
+
+
+def _plan_call_args(payload: dict):
+    """``(model_path, hardware, plan_kwargs, form)`` for one UI form payload.
+
+    ONE place turns the form into ``feasibility.plan()`` arguments. Anything
+    that plans the same configuration a second time — the concurrency ladder,
+    the lever profiles — goes through here, so a second caller cannot end up
+    describing a slightly different configuration than the verdict does.
+    """
     from sglang.srt.planner.model import resolve_model_ref
 
     try:
@@ -458,13 +470,13 @@ def plan_from_payload(payload: dict) -> dict:
             payload["model"], gguf_choice=payload.get("gguf_choice") or None
         )
     except (ValueError, KeyError) as e:
-        return {"valid": False, "reasons": [f"model: {e}"]}
+        raise _PayloadRejected([f"model: {e}"])
 
     hw_payload = payload.get("hardware", {})
     try:
         hardware, reserve_mib = _hardware_and_reserve(payload)
     except (ValueError, KeyError) as e:
-        return {"valid": False, "reasons": [f"hardware: {e}"]}
+        raise _PayloadRejected([f"hardware: {e}"])
 
     mem = _int_list(payload.get("rank_gpu_memory_mib"))
     rank_gpu_id = _int_list(payload.get("rank_gpu_id"))
@@ -489,34 +501,56 @@ def plan_from_payload(payload: dict) -> dict:
     # vision encoder (HF: the unquantized visual blocks; GGUF: the mmproj
     # sidecar) back into the budget.
     include_vision = bool(payload.get("include_vision", False))
+    kwargs = dict(
+        tp_size=payload.get("tp_size"),
+        rank_gpu_id=rank_gpu_id,
+        rank_gpu_memory_mib=mem,
+        rank_tp_ratio=_int_list(payload.get("rank_tp_ratio")),
+        rank_mlp_ratio=_int_list(payload.get("rank_mlp_ratio")),
+        rank_moe_ratio=_int_list(payload.get("rank_moe_ratio")),
+        rank_vocab_ratio=_int_list(payload.get("rank_vocab_ratio")),
+        dcp_size=payload.get("dcp_size") or None,
+        kv_token_vector=_int_list(payload.get("kv_token_vector")),
+        user_free_reserve_mib=reserve_mib,
+        kv_cache_dtype=payload.get("kv_cache_dtype") or "auto",
+        speculative_algorithm=payload.get("speculative_algorithm") or None,
+        speculative_num_draft_tokens=payload.get("speculative_num_draft_tokens")
+        or None,
+        speculative_draft_model_path=payload.get("speculative_draft_model_path")
+        or None,
+        max_running_requests=concurrency,
+        include_vision=include_vision,
+        host_ram_mib=int(host_ram_mib) if host_ram_mib else None,
+    )
+    form = {
+        "concurrency": concurrency,
+        "include_vision": include_vision,
+        "mem": mem,
+        "rank_gpu_id": rank_gpu_id,
+        "reserve_mib": reserve_mib,
+        "host_ram_mib": host_ram_mib,
+    }
+    return model_path, hardware, kwargs, form
+
+
+def plan_from_payload(payload: dict) -> dict:
+    """Run ``feasibility.plan()`` for a UI form payload; return a JSON-able
+    dict (or ``{valid: False, reasons: [...]}`` for a rejected manual edit)."""
+    from sglang.srt.planner.feasibility import PlanRejected, plan
+
     try:
-        result = plan(
-            model_path,
-            hardware,
-            tp_size=payload.get("tp_size"),
-            rank_gpu_id=rank_gpu_id,
-            rank_gpu_memory_mib=mem,
-            rank_tp_ratio=_int_list(payload.get("rank_tp_ratio")),
-            rank_mlp_ratio=_int_list(payload.get("rank_mlp_ratio")),
-            rank_moe_ratio=_int_list(payload.get("rank_moe_ratio")),
-            rank_vocab_ratio=_int_list(payload.get("rank_vocab_ratio")),
-            dcp_size=payload.get("dcp_size") or None,
-            kv_token_vector=_int_list(payload.get("kv_token_vector")),
-            user_free_reserve_mib=reserve_mib,
-            kv_cache_dtype=payload.get("kv_cache_dtype") or "auto",
-            speculative_algorithm=payload.get("speculative_algorithm") or None,
-            speculative_num_draft_tokens=payload.get(
-                "speculative_num_draft_tokens"
-            )
-            or None,
-            speculative_draft_model_path=payload.get(
-                "speculative_draft_model_path"
-            )
-            or None,
-            max_running_requests=concurrency,
-            include_vision=include_vision,
-            host_ram_mib=int(host_ram_mib) if host_ram_mib else None,
-        )
+        model_path, hardware, kwargs, form = _plan_call_args(payload)
+    except _PayloadRejected as e:
+        return {"valid": False, "reasons": e.reasons}
+
+    mem = form["mem"]
+    rank_gpu_id = form["rank_gpu_id"]
+    reserve_mib = form["reserve_mib"]
+    host_ram_mib = form["host_ram_mib"]
+    concurrency = form["concurrency"]
+    include_vision = form["include_vision"]
+    try:
+        result = plan(model_path, hardware, **kwargs)
     except PlanRejected as e:
         return {"valid": False, "reasons": e.reasons}
     except ValueError as e:
@@ -2155,6 +2189,63 @@ def tooltips_payload(payload: Optional[dict] = None) -> dict:
     return {"ok": True, "tooltips": tipsmod.tooltip_map(_measured_figures())}
 
 
+def lever_profiles_payload(payload: dict) -> dict:
+    """POST /api/lever_profiles -> the named working points, each priced.
+
+    The whole counter-reckoning is computed HERE, not in the browser: every
+    figure comes from a planner run of that exact profile, so the page renders
+    numbers it never has to derive, and ``curl`` gets the same answer the
+    dashboard draws. The body is the ordinary plan payload plus an optional
+    ``session_target_context`` (the context the session counts are solved for).
+    """
+    from sglang.srt.planner import lever_profiles as lpmod
+
+    payload = payload or {}
+    try:
+        model_path, hardware, kwargs, _form = _plan_call_args(payload)
+    except _PayloadRejected as e:
+        return {"ok": False, "reasons": e.reasons, "profiles": []}
+
+    target = payload.get("session_target_context") or lpmod.DEFAULT_SESSION_CONTEXT
+    try:
+        return lpmod.build_profiles(
+            model_path,
+            hardware,
+            kwargs,
+            session_target_context=int(target),
+            probe=_cached_probe(),
+            crossover=_cached_crossover(),
+            prompt_to_output_ratio=payload.get("prompt_to_output_ratio"),
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "reasons": [str(e)], "profiles": []}
+
+
+def _cached_probe() -> Optional[dict]:
+    """The cached hardware probe, or None. Never triggers a probe: a
+    multi-second measurement as a side effect of drawing a panel would be a
+    surprise the reader did not ask for."""
+    try:
+        from sglang.srt.uneven_perf import get_cached_hardware_profile
+
+        profile, _ = get_cached_hardware_profile()
+        return profile
+    except Exception:
+        return None
+
+
+def _cached_crossover():
+    """This rig's measured MLP-split crossover, or None. Absent is the normal
+    state; the lever registry is written to say so rather than to quote another
+    rig's number."""
+    try:
+        from sglang.srt.planner.crossover import load_finding
+
+        return load_finding()
+    except Exception:
+        return None
+
+
 def discussion_preview_payload(payload: dict) -> dict:
     """POST /api/discussion_preview -> the exact Markdown, plus whether it could
     be sent. Pure: no network, no token read beyond checking one exists."""
@@ -3392,6 +3483,9 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/recompute"):
                 self._json(200, recompute_payload(payload))
                 return
+            if self.path.startswith("/api/lever_profiles"):
+                self._json(200, lever_profiles_payload(payload))
+                return
             if self.path.startswith("/api/config_profiles"):
                 self._json(200, config_profiles_save(payload))
                 return
@@ -3905,6 +3999,43 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   .csrow .cs-v { font-size: var(--t-sm); color: var(--fg-muted);
                  min-width: 7.5rem; text-align: right; white-space: nowrap;
                  font-variant-numeric: tabular-nums; }
+
+  /* ---- working point: one slider, four named stops, one counter-reckoning --
+     The stops sit on ONE axis (how much predicted context is spent for
+     speed), so a slider is the honest shape for them. The table underneath is
+     the whole point of the control: every stop is shown with what it buys AND
+     what it costs, in the same units, at the same time. */
+  .lprow { display: flex; align-items: center; gap: var(--s3); }
+  .lprow input[type=range] { flex: 1 1 auto; min-width: 10rem; }
+  .lprow .lp-name { font-weight: 500; color: var(--fg-strong);
+                    min-width: 7rem; text-align: right; }
+  .lp-ticks { display: flex; justify-content: space-between;
+              font-size: var(--t-xs); color: var(--fg-muted);
+              margin: 2px 0 var(--s2); gap: var(--s1); }
+  .lp-ticks span { flex: 1 1 0; text-align: center; }
+  .lp-ticks span:first-child { text-align: left; }
+  .lp-ticks span:last-child { text-align: right; }
+  .lp-ticks span.on { color: var(--fg-strong); }
+  /* A wide table on a narrow page scrolls inside its own box; the page never
+     scrolls sideways. */
+  .lp-wrap { overflow-x: auto; }
+  table.lp { width: 100%; border-collapse: collapse; font-size: var(--t-sm);
+             font-variant-numeric: tabular-nums; }
+  table.lp th, table.lp td { padding: 3px var(--s2); text-align: right;
+                             border-bottom: 1px solid var(--bd-weak);
+                             white-space: nowrap; }
+  table.lp th:first-child, table.lp td:first-child { text-align: left;
+                             color: var(--fg-muted); white-space: normal; }
+  table.lp th { color: var(--fg-muted); font-weight: 400; }
+  table.lp th.on { color: var(--fg-strong); font-weight: 500; }
+  table.lp td.on { background: var(--selected); color: var(--fg-strong); }
+  /* Colour is state: a figure better than the baseline, or worse. Nothing on
+     this table is coloured for decoration. */
+  table.lp .d-gain { color: var(--ok); }
+  table.lp .d-cost { color: var(--bad); }
+  table.lp .d-same, table.lp .d-na { color: var(--fg-muted); }
+  table.lp td .d { font-size: var(--t-xs); display: block; }
+  .lp-note { font-size: var(--t-xs); color: var(--fg-muted); margin-top: var(--s1); }
 </style>
 </head>
 <body>
@@ -4370,6 +4501,20 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       budget: how much of it this server may take. What the configuration
       actually needs is the bar. A budget below the bar is not refused here
       &mdash; it is reported, with the reason, in the verdict.</div>
+  </fieldset>
+  <!-- ONE control for the whole working point. The four stops are named
+       profiles resolved server-side; the table below is their counter-
+       reckoning, in numbers from the planner run of that exact profile. The
+       expert view keeps every individual knob. -->
+  <fieldset>
+    <legend>working point &mdash; one control, with the counter-reckoning</legend>
+    <div class="lprow">
+      <input type="range" id="lp_slider" min="0" max="0" step="1" value="0"
+             oninput="leverProfileInput()">
+      <span class="lp-name" id="lp_name">&mdash;</span>
+    </div>
+    <div id="lp_ticks" class="lp-ticks"></div>
+    <div id="lp_body" class="muted">pick a model above&hellip;</div>
   </fieldset>
   <fieldset>
     <legend>verdict</legend>
@@ -7196,6 +7341,10 @@ async function recomputeNow(){
   if(d.placement) applyPlacementResult(d.placement);
   if(d.plan){ render(d.plan); renderSimpleVerdict(d.plan); }
   renderSimpleCards(d.placement && d.placement.ok ? d.placement.placement : null);
+  // The working-point table is priced against the SAME configuration, so it
+  // follows every edit -- on its own call, because it costs four planner runs
+  // and only the simple view draws it.
+  if(viewMode()==='simple') scheduleLeverProfiles();
 }
 const scheduleRecompute=debounce(recomputeNow, 180);
 
@@ -7536,6 +7685,200 @@ function renderSimpleVerdict(d){
     +'and every dimension this fork exposes.</div>';
   setHTML(box,h);
 }
+// ===========================================================================
+// Working point: one control, four named stops, one counter-reckoning.
+//
+// Everything here is rendering. The profiles, their flag vectors and every
+// number in the table are computed by /api/lever_profiles -- a planner run
+// per profile -- so the browser never derives a figure and `curl` gets
+// exactly what the page draws. That is the architecture rule for this
+// dashboard, and it is what keeps a second surface from disagreeing with the
+// verdict about the same configuration.
+//
+// Picking a stop writes the SAME state the expert view edits (the MLP vector
+// and the tuning objective in window._flagSettings), so switching modes shows
+// the same configuration from a different distance rather than a second one.
+// ===========================================================================
+window._leverProfiles=null;
+function leverProfileKey(){
+  try{
+    const k=localStorage.getItem('lever_profile');
+    if(k) return k;
+  }catch(e){}
+  const d=window._leverProfiles;
+  return d?d.baseline:'';
+}
+function leverProfileRow(key){
+  const d=window._leverProfiles; if(!d) return null;
+  return (d.profiles||[]).filter(p=>p.key===key)[0]||null;
+}
+function leverSessionTarget(){
+  const el=$('lp_target');
+  return el&&el.value?parseInt(el.value):null;
+}
+async function refreshLeverProfiles(){
+  const model=$('model').value.trim();
+  const box=$('lp_body'); if(!box) return;
+  if(!model){ setHTML(box,'<span class="muted">pick a model above&hellip;</span>'); return; }
+  const body=Object.assign({}, payload());
+  const t=leverSessionTarget(); if(t) body.session_target_context=t;
+  stale(box,true);
+  let d;
+  try{
+    d=await api('/api/lever_profiles',{key:'lever_profiles', body:body, timeout:20000});
+  }catch(e){
+    if(apiAborted(e)) return;
+    setHTML(box,'<div class="rev-error">'+esc(apiError(e))+'</div>');
+    return;
+  } finally { stale(box,false); }
+  window._leverProfiles=d;
+  renderLeverProfiles();
+}
+const scheduleLeverProfiles=debounce(refreshLeverProfiles, 220);
+
+// The stop the slider is on, clamped to what the server actually returned.
+function leverProfileIndex(){
+  const d=window._leverProfiles; if(!d||!d.slider) return 0;
+  const steps=d.slider.steps||[];
+  const key=leverProfileKey();
+  for(let i=0;i<steps.length;i++) if(steps[i].key===key) return i;
+  return d.slider.default_index||0;
+}
+function leverProfileInput(){
+  const d=window._leverProfiles; if(!d||!d.slider) return;
+  const steps=d.slider.steps||[];
+  const i=Math.max(0, Math.min(steps.length-1, parseInt($('lp_slider').value)||0));
+  if(!steps[i]) return;
+  applyLeverProfile(steps[i].key);
+}
+// Applying a stop is an edit of the ordinary configuration state -- the same
+// fields the expert view writes. Nothing about the profile survives as a
+// separate mode, so there is no second source of truth to fall out of sync.
+function applyLeverProfile(key){
+  try{ localStorage.setItem('lever_profile', key); }catch(e){}
+  const row=leverProfileRow(key);
+  window._flagSettings=window._flagSettings||{};
+  if(row&&row.resolved){
+    if(row.is_base_split) delete window._flagSettings.rank_mlp_ratio;
+    else window._flagSettings.rank_mlp_ratio=(row.mlp_vector||[]).join(',');
+    const el=$('fl_rank_mlp_ratio');
+    if(el) el.value=window._flagSettings.rank_mlp_ratio||'';
+    if(row.tune) applyTune(row.tune);
+  }
+  renderLeverProfiles();
+  markPresetDrift(); updateSectionSummaries(); scheduleRecompute();
+}
+function lpNum(v, unit){
+  if(v==null) return '&mdash;';
+  if(unit==='tok/s') return (v>=100?Math.round(v).toLocaleString():v.toFixed(1));
+  return Math.round(v).toLocaleString();
+}
+function lpDelta(m){
+  const d=m.vs_baseline;
+  if(!d||d.pct==null) return '';
+  const cls=d.direction==='gain'?'d-gain':(d.direction==='cost'?'d-cost':'d-same');
+  const txt=d.direction==='same'?'unchanged'
+    :(d.pct>0?'+':'')+d.pct.toFixed(1)+'%';
+  return '<span class="d '+cls+'">'+txt+'</span>';
+}
+function renderLeverProfiles(){
+  const box=$('lp_body'), d=window._leverProfiles;
+  if(!box||!d) return;
+  if(d.ok===false){
+    setHTML(box,'<ul class="reasons">'
+      +(d.reasons||[]).map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>');
+    setHTML($('lp_ticks'),''); return;
+  }
+  const steps=(d.slider&&d.slider.steps)||[];
+  const idx=leverProfileIndex();
+  const cur=steps[idx]?steps[idx].key:d.baseline;
+  const sl=$('lp_slider');
+  if(sl){
+    sl.max=String(Math.max(0, steps.length-1));
+    if(String(sl.value)!==String(idx)) sl.value=String(idx);
+    sl.title=tip('lever_profile.slider')+' '+((d.slider&&d.slider.axis)||'');
+  }
+  const nm=$('lp_name');
+  if(nm) nm.textContent=(steps[idx]&&steps[idx].label)||'';
+  setHTML($('lp_ticks'), steps.map((s,i)=>
+    '<span class="'+(i===idx?'on':'')+'" title="'+esc(tip('lever_profile.'+s.key))+'">'
+    +esc(s.label)+'</span>').join(''));
+
+  const rows=(d.profiles||[]).filter(p=>p.resolved);
+  const sel=rows.filter(p=>p.key===cur)[0]||rows[0];
+  const metricKeys=((rows[0]&&rows[0].metrics)||[]).map(m=>m.key);
+  let h='<div class="lp-wrap"><table class="lp"><thead><tr><th></th>'
+    +rows.map(p=>'<th class="'+(p.key===cur?'on':'')+'" title="'
+      +esc(tip('lever_profile.'+p.key))+'">'+esc(p.label)+'</th>').join('')
+    +'</tr></thead><tbody>';
+  metricKeys.forEach(k=>{
+    const first=(rows[0].metrics||[]).filter(m=>m.key===k)[0]||{};
+    const unit=first.unit||'';
+    let label=first.label||k;
+    if(k==='sessions'&&d.session_target_context_tokens)
+      label+=' ('+d.session_target_context_tokens.toLocaleString()+' tokens)';
+    // The unit is only worth repeating when the label does not already carry
+    // it ("sessions at the target context" needs no second "sessions").
+    const uu=(unit&&label.indexOf(unit)<0)
+      ?' <span class="muted">'+esc(unit)+'</span>':'';
+    h+='<tr><td title="'+esc(first.basis||'')+'">'+esc(label)+uu+'</td>';
+    rows.forEach(p=>{
+      const m=(p.metrics||[]).filter(x=>x.key===k)[0];
+      const on=(p.key===cur?' class="on"':'');
+      if(!m||!m.available){
+        h+='<td'+(on||' class="d-na"')+' title="'+esc((m&&m.reason)||'')
+          +'">not computed</td>';
+      } else {
+        h+='<td'+on+'>'+lpNum(m.value,unit)+lpDelta(m)+'</td>';
+      }
+    });
+    h+='</tr>';
+  });
+  h+='<tr><td>MLP split</td>'+rows.map(p=>'<td'+(p.key===cur?' class="on"':'')+'>'
+    +(p.is_base_split?'<span class="muted">base</span>'
+      :esc((p.mlp_vector||[]).join(',')))+'</td>').join('')+'</tr>';
+  h+='</tbody></table></div>';
+  h+='<div class="lp-note">Deltas are against <b>'+esc(d.baseline)
+    +'</b>. Every figure is a planner run of that profile; a cell that says '
+    +'"not computed" names the missing input on hover.</div>';
+
+  if(sel){
+    h+='<div class="lp-note">'+esc(sel.axis_note||'')+'</div>';
+    h+='<div class="lp-note">why this split: '+esc(sel.selection_reason||'')
+      +(sel.same_as_baseline?' &mdash; this stop resolves to the balanced '
+        +'working point on this rig.':'')+'</div>';
+    const flags=(sel.flag_delta||[]).concat(sel.lever_flags||[]);
+    if(flags.length)
+      h+='<div class="lp-note">flags: <code>'+esc(flags.join(' '))+'</code></div>';
+    const detail=[];
+    (sel.gains||[]).forEach(x=>detail.push('<li><b>buys:</b> '+esc(x)+'</li>'));
+    (sel.costs||[]).forEach(x=>detail.push('<li><b>costs:</b> '+esc(x)+'</li>'));
+    Object.keys(sel.counter_reckoning||{}).forEach(k=>detail.push(
+      '<li><b>against '+esc(k)+':</b> '+esc(sel.counter_reckoning[k])+'</li>'));
+    (sel.evidence||[]).forEach(e=>detail.push('<li>['+esc(e.kind)+'] '
+      +esc(e.statement)+(e.setup?' <span class="muted">('+esc(e.setup)+')</span>':'')
+      +(e.caveat?' <span class="muted">&mdash; '+esc(e.caveat)+'</span>':'')+'</li>'));
+    (sel.unavailable_flags||[]).forEach(u=>detail.push('<li><b>'+esc(u.flag)
+      +':</b> '+esc(u.reason)+'</li>'));
+    if(detail.length)
+      h+='<details class="cfg-section" data-key="lp_detail"><summary><b>'
+        +esc(sel.label)+'</b> &mdash; what it buys, what it costs, and on what '
+        +'evidence</summary><div class="sec-body"><ul class="reasons">'
+        +detail.join('')+'</ul></div></details>';
+  }
+  const opts=(d.session_target_options||[]);
+  if(opts.length){
+    h+='<div class="lp-note">sessions solved for <select id="lp_target" '
+      +'style="width:auto;display:inline-block" onchange="refreshLeverProfiles()">'
+      +opts.map(o=>'<option value="'+o+'"'
+        +(o===d.session_target_context_tokens?' selected':'')+'>'
+        +o.toLocaleString()+' tokens</option>').join('')
+      +'</select> per session</div>';
+  }
+  (d.caveats||[]).forEach(c=>{ h+='<div class="lp-note">'+esc(c)+'</div>'; });
+  setHTML(box,h);
+}
+
 // ---- tuning objective template -------------------------------------------
 // Sets --rank-perf-tune and nothing else. The point of a template here is to
 // move the starting point, not to fence the controls in: everything stays

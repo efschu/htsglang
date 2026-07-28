@@ -152,6 +152,41 @@ TRADEOFFS: Dict[str, Tradeoff] = {
         "prompts dominate output.",
         measured_from="mlp_crossover",
     ),
+    # ---- lever profiles (the simple view's one control) --------------------
+    # One entry per stop of the profile slider. The NUMBERS live in the
+    # /api/lever_profiles answer, computed per rig; these say what the stop
+    # is for, which is the part that does not change with the hardware.
+    "lever_profile.slider": Tradeoff(
+        gain="One control for the whole working point: each stop is a planned "
+        "configuration with its context, throughput and session counts.",
+        cost="Four stops instead of the continuous space the expert view "
+        "spans; a point between two stops has to be built by hand.",
+    ),
+    "lever_profile.max_context": Tradeoff(
+        gain="The split that funds the largest KV pool these cards can hold.",
+        cost="Loads the weakest card in proportion to its memory, so it "
+        "carries the most attention work and paces deep-context decode.",
+    ),
+    "lever_profile.balanced": Tradeoff(
+        gain="The VRAM-auto split, unchanged, and the reference every other "
+        "profile is priced against.",
+        cost="Takes neither the context nor the throughput a directed split "
+        "would reach.",
+    ),
+    "lever_profile.max_decode": Tradeoff(
+        gain="Balances the per-step weight read across unequal cards instead "
+        "of letting the slowest one set it.",
+        cost="The measured decode optimum is flat, so the gain is small and "
+        "any context it spends is spent regardless.",
+        measured_from="mlp_crossover",
+    ),
+    "lever_profile.max_prefill": Tradeoff(
+        gain="Concentrates dense-MLP mass on the compute-strong rank, which "
+        "is where prefill time is spent.",
+        cost="Costs decode per output token and shrinks the KV pool; it pays "
+        "back only above a prompt-to-output ratio measured on this rig.",
+        measured_from="mlp_crossover",
+    ),
     # ---- simple-view controls ---------------------------------------------
     "card_budget": Tradeoff(
         gain="Caps how much of this card the server may take, leaving the "
