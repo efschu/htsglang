@@ -4793,3 +4793,88 @@ Bugs found:
    predicted +13.9 % prefill / +6.4 % decode step; measured +8.2 % /
    +14.4 % — the knee guard would have rejected 6,1,1 for the right reason
    with a 2.2x too-mild number.
+
+# #265 — the three #264 bugs, fixed and pinned against the boots that found them
+
+CPU-only: the #264 boot logs carry every number the fixes need, so all three
+are decided by unit tests on the real plan inputs (budgets `29607,17780,17780`
+= NVML totals minus the pinned reserve `3000,2700,2700`, cached probe, bf16
+SSM state). The fixture reproduces the boot's plan block exactly — per-rank
+capacity `[277031, 86160, 129224]`, ctx `492416`, units `[62,37,37]`, and the
+six candidate prefill gains `+18.5/+16.6/+16.3/+13.9/+11.5/+9.3 %`.
+
+**Bug 1 — `--rank-perf-tune enc`.** The optimizer branched only on
+`tune == "dec"`; an enc run was the `both` run minus one line, so enc
+contributed nothing of its own and "enc did nothing" could not be told from
+"enc had nothing to do". enc now states its objective and its single lever,
+and the refusal names the gate that actually bound (`enc has no effective
+lever at this operating point: … rejected by: unbootable`) instead of always
+recommending `--rank-perf-loose-ctx-percent`. Falsifier: the enc log was a
+subset of the both log — 16 of 19 new assertions red before, all green after.
+
+The floor rejection underneath it was a floating-point accident, not a
+capacity judgement. MLP re-partitioning conserves total weight bytes, so
+`sum_r P_r` — the predicted context whenever the sum binds — is the SAME
+number for every candidate; only the summation order differs. The `>=`
+rejected six candidates at a printed context identical to the floor's own
+492416. Now compared with a relative tolerance; forced 0.1 % context losses
+are still rejected, so the gate is absorbed noise, not disabled.
+
+**Bug 2 — the ladder had no bootability notion.** The KV pool follows the
+token vector scaled by the TIGHTEST rank, so a rank that is not the tightest
+keeps its unused capacity as free VRAM; concentration moves the tight rank
+onto the card being concentrated and spends exactly that slack. Plan-time
+residual = (NVML total − budget) + unused capacity × KV cell, judged against
+`derived_rank_auto_reserve_mib` and only counted when the BASE plan still
+clears it on that rank — no new constant. All three measured boots come out
+right:
+
+| arm | rank-0 residual (predicted) | rank-0 free after pools (measured) | outcome |
+|---|---|---|---|
+| `2,1,1` @ reserve 3000 | 6643 MiB | 2.02 GB | boots |
+| `6,1,1` @ reserve 3000 | 3000 MiB (< 4160) | 0.38 GB | OOM, first prefill |
+| `6,1,1` @ reserve 4500 | 4500 MiB | 1.97 GB | boots |
+
+Such a candidate is reported `UNBOOTABLE (rank 0 residual free 3000 MiB <
+derived reserve demand 4160 MiB…)` and is never accepted at any
+`--rank-perf-loose-ctx-percent`.
+
+**Bug 3 — the knee number, and what "2.2x" actually contained.** Part of the
+ratio is a base mismatch: the log's `+6.4 %` is 6,1,1 against the VRAM-AUTO
+split, while arm A was the pinned `2,1,1`. The comparable prediction was
+`+8.7 %` against a measured `+14.4 %` — 1.65x, not 2.2x. The remaining 1.65x
+is not a size error but a SIGN error: at the shipped exponent the decode pacer
+sat on a 3080 at both campaign bases, which made mild concentration a
+predicted GAIN (`2,1,1` at −2.1 %) while every measured concentration from a
+base is a cost. The non-weight fraction cannot repair that — it multiplies the
+weight-term ratio, so it damps costs and cannot create one.
+
+Fit verdict: **the model form carries all four points; it is a parameter
+refit, not a model-form defect** — but the parameters are no better separated
+than before. Joint grid, rms in percentage points over the four measured
+steps:
+
+| calibration | 3,1,1 | 4,1,1 | 6,1,1 (#216 base) | 6,1,1 vs 2,1,1 (#264) | rms |
+|---|---|---|---|---|---|
+| 0.70 / 0.28 (shipped) | +7.1 | +11.2 | +16.2 | +8.7 | 3.13 |
+| 0.50 / 0.35 (now) | +8.0 | +11.8 | +16.4 | +14.7 | 1.37 |
+| measured | +6.0 | +13.4 | +15.5 | +14.4 | — |
+
+The rms minimum is a flat valley (BETA 0.50–0.57 × fraction 0.36–0.37, rms
+1.338–1.342), so four points pin the PAIR exactly as three did. BETA is taken
+at 0.50 rather than at the minimum because rms is flat across that range while
+the pacer is not: 0.52–0.57 sits on the flip where `2,1,1` still reads as a
+gain. Cost of the choice: 0.007 rms points. The streaming-peak fallback
+exponent moves 0.63 → 0.45 so both divisors keep agreeing on the achieved
+decode ratio (2.131^0.50 = 1.46 = 2.319^0.45).
+
+Consequence, deliberately not hidden: on this rig at this reserve
+`auto-performance` now proposes NOTHING, where it used to pick `2,1,1`. That
+matches #264's own verdict (net negative here) and the refusal says which gate
+bound. Recorded in the runbook.
+
+Tests: `test/registered/unit/planner/test_perf_tune_targets.py` (new, 19
+assertions + 18 subtests; 16 red before the fix) and the #264 point added to
+`test_decode_knee_calibration.py`. Full planner suite 1082 passed, 1 skipped,
+1 pre-existing unrelated failure (`test_webui.py::test_reference_png_static_route`,
+red on the untouched tree too).

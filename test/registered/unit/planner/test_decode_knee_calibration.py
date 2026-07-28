@@ -71,6 +71,36 @@ _BUDGETS_216 = [26107, 18280, 18280]
 _BUDGETS_MEASURED = [28447, 16320, 16320]
 _MEASURED_COST_PCT = {(3, 1, 1): 6.0, (4, 1, 1): 13.4, (6, 1, 1): 15.5}
 
+#: The #264 A/B, added to the fit by task #265. Same rig, same checkpoint,
+#: different BASE plan and a different reference arm: the campaign pinned
+#: 2,1,1 (units [68,34,34]) against 6,1,1 (units [102,17,17]) and measured
+#: ms/verify 32.599 -> 37.307 = +14.4 %, prefill +8.2 %, max_total_num_tokens
+#: -47.9 %, identical greedy output on both arms.
+_BUDGETS_264 = [29607, 17780, 17780]
+_MEMBW_264 = [1664.2, 717.8, 717.4]
+_MEMBW_GEMV_264 = [1529.7, 717.8, 717.8]
+_MEASURED_264_ARM_A = [2, 1, 1]
+_MEASURED_264_ARM_B = [6, 1, 1]
+_MEASURED_264_COST_PCT = 14.4
+
+
+def _cost_between(m, cand, ref, membw, gemv):
+    """Predicted decode-step delta of ``cand`` against ``ref``, when neither
+    is the model's base plan.
+
+    ``decode_cost_percent`` answers "against the VRAM-auto split", which is
+    what the plan log prints; an A/B that pins BOTH arms asks a different
+    question, and conflating the two is where the "#264 predicted +6.4 %"
+    reading comes from. The non-weight share is anchored on the base plan's
+    weight time either way, so both arms carry the same constant."""
+    f = m.calibration.nonweight_fraction
+    t_base = m.decode_round_time(m.base_plan, membw, gemv)
+    t_cand = m.decode_round_time(list(cand), membw, gemv)
+    t_ref = m.decode_round_time(list(ref), membw, gemv)
+    return (
+        (f * t_base + (1 - f) * t_cand) / (f * t_base + (1 - f) * t_ref) - 1
+    ) * 100.0
+
 
 def _model(budgets):
     pi = PlanInputs(
@@ -207,7 +237,10 @@ class TestGemvDivisor(CustomTestCase):
         self.assertAlmostEqual(
             peak_path[0] / peak_path[1], gemv_path[0] / gemv_path[1], delta=0.05
         )
-        self.assertAlmostEqual(gemv_path[0] / gemv_path[1], 1.70, delta=0.05)
+        # 1.70 on the three #216 points alone; 1.46 once the #264 point is in
+        # the fit (task #265). The two bases must agree on whichever it is --
+        # that is what this test is for -- so the number moves with the fit.
+        self.assertAlmostEqual(gemv_path[0] / gemv_path[1], 1.46, delta=0.05)
 
     def test_the_measurement_carries_part_of_the_compression(self):
         """The divisor itself is already compressed against the streaming
@@ -253,6 +286,142 @@ class TestGemvDivisor(CustomTestCase):
         self.assertNotEqual(beta_gemv, beta_peak)
         self.assertNotEqual(basis_gemv, basis_peak)
         self.assertIn("streaming peak", basis_peak)
+
+
+@unittest.skipUnless(
+    _MODEL and os.path.isdir(_MODEL),
+    "HTSGLANG_TEST_MODEL_DIR/Qwen3.6-27B-FP8 not present",
+)
+class TestT264Point(CustomTestCase):
+    """The fourth measured point, and what it changed (task #265).
+
+    The #264 report reads "predicted +6.4 %, measured +14.4 %, 2.2x too
+    mild". Two different things are folded into that ratio and only one of
+    them is a calibration error:
+
+      * +6.4 % is the plan log's number, i.e. 6,1,1 against the VRAM-AUTO
+        split. The A/B's arm A was the pinned 2,1,1, not the auto split. The
+        comparable prediction is 6,1,1 against 2,1,1, which the shipped
+        calibration put at +8.7 % -- 1.65x too mild, not 2.2x.
+      * the remaining 1.65x is real, and it is a defect in the SHAPE of the
+        model near the base, not in the size of a percentage. At the shipped
+        exponent the model put the decode pacer on a 3080 at both campaign
+        bases, which makes mild concentration a predicted GAIN (2,1,1 at
+        -2.1 %) -- while every measured concentration from a base is a COST.
+        No value of the non-weight fraction can fix that: it multiplies the
+        weight-term ratio, so it can only damp a cost, never create one.
+    """
+
+    @staticmethod
+    def _model():
+        pi = PlanInputs(
+            tp_size=3,
+            model_path=_MODEL,
+            kv_cache_dtype="fp8_e4m3",
+            speculative_algorithm="EAGLE",
+            speculative_num_draft_tokens=4,
+            max_running_requests=16,
+            rank_gpu_id=[0, 1, 2],
+            effective_vram_mib=list(_BUDGETS_264),
+            rank_tp_ratio=list(_BUDGETS_264),
+        )
+        return PerfCostModel(pi, list(_BUDGETS_264), list(_BUDGETS_264))
+
+    def test_the_ab_pair_is_predicted_within_two_points(self):
+        m = self._model()
+        self.assertAlmostEqual(
+            _cost_between(
+                m,
+                _MEASURED_264_ARM_B,
+                _MEASURED_264_ARM_A,
+                _MEMBW_264,
+                _MEMBW_GEMV_264,
+            ),
+            _MEASURED_264_COST_PCT,
+            delta=2.0,
+        )
+
+    def test_the_shipped_exponent_missed_it_by_a_factor(self):
+        """FALSIFIER, kept as a test: at 0.70 the same pair reads +8.7 %."""
+        m = self._model()
+        with mock.patch.object(
+            uneven_perf, "_PREDICT_DECODE_GEMV_RESIDUAL", 0.70
+        ), mock.patch.object(uneven_perf, "_PREDICT_DECODE_NONWEIGHT_FRACTION", 0.28):
+            old = _cost_between(
+                m,
+                _MEASURED_264_ARM_B,
+                _MEASURED_264_ARM_A,
+                _MEMBW_264,
+                _MEMBW_GEMV_264,
+            )
+        self.assertLess(old, _MEASURED_264_COST_PCT - 4.0)
+
+    def test_concentration_from_the_base_is_never_predicted_as_a_gain(self):
+        """The structural half of the refit. Every measured concentration
+        vector on this rig costs decode time; a model that reports a gain for
+        one of them has the pacer on the wrong card, and the candidate ladder
+        then selects on the strength of a sign error."""
+        m = self._model()
+        for vec in ([2, 1, 1], [3, 1, 1], [4, 1, 1], [6, 1, 1], [8, 1, 1]):
+            with self.subTest(vec=vec):
+                self.assertGreater(
+                    m.decode_cost_percent(vec, _MEMBW_264, _MEMBW_GEMV_264),
+                    0.0,
+                )
+
+    def test_the_shipped_exponent_did_report_such_a_gain(self):
+        """FALSIFIER for the sign: 2,1,1 read -2.1 % at 0.70/0.28."""
+        m = self._model()
+        with mock.patch.object(
+            uneven_perf, "_PREDICT_DECODE_GEMV_RESIDUAL", 0.70
+        ), mock.patch.object(uneven_perf, "_PREDICT_DECODE_NONWEIGHT_FRACTION", 0.28):
+            self.assertLess(
+                m.decode_cost_percent([2, 1, 1], _MEMBW_264, _MEMBW_GEMV_264),
+                0.0,
+            )
+
+    def test_the_older_points_are_not_traded_away(self):
+        """The #216 follow-up points keep the accuracy they had. Asserted
+        here as well as in their own class, because a refit that buys the new
+        point by giving up the old ones is a worse model, not a better one."""
+        m = _model(_BUDGETS_MEASURED)
+        errors = [
+            m.decode_cost_percent(list(vec), _MEMBW, _MEMBW_GEMV) - measured
+            for vec, measured in _MEASURED_COST_PCT.items()
+        ]
+        rms = (sum(e * e for e in errors) / len(errors)) ** 0.5
+        self.assertLess(rms, 2.0, f"errors {[round(e, 2) for e in errors]}")
+
+    def test_the_four_points_together_beat_the_three_point_fit(self):
+        """The verdict the refit rests on, as one number: joint rms over all
+        four measured points, shipped calibration vs this one."""
+
+        def rms_over_four():
+            m3 = _model(_BUDGETS_MEASURED)
+            errs = [
+                m3.decode_cost_percent(list(v), _MEMBW, _MEMBW_GEMV) - meas
+                for v, meas in _MEASURED_COST_PCT.items()
+            ]
+            m4 = self._model()
+            errs.append(
+                _cost_between(
+                    m4,
+                    _MEASURED_264_ARM_B,
+                    _MEASURED_264_ARM_A,
+                    _MEMBW_264,
+                    _MEMBW_GEMV_264,
+                )
+                - _MEASURED_264_COST_PCT
+            )
+            return (sum(e * e for e in errs) / len(errs)) ** 0.5
+
+        now = rms_over_four()
+        with mock.patch.object(
+            uneven_perf, "_PREDICT_DECODE_GEMV_RESIDUAL", 0.70
+        ), mock.patch.object(uneven_perf, "_PREDICT_DECODE_NONWEIGHT_FRACTION", 0.28):
+            before = rms_over_four()
+        self.assertLess(now, before)
+        self.assertLess(now, 1.5)
 
 
 if __name__ == "__main__":

@@ -168,8 +168,10 @@ _PREDICT_KNEE_COARSE_HEADROOM_UNITS = 2
 #: not the card's streaming peak. A card 2.32x faster on a streaming benchmark
 #: is not 2.32x faster at pulling a weight shard through the GEMV kernels a
 #: bs=1 decode step is made of, and on a mixed rig the two fractions do not
-#: cancel: the measured decode advantage of the 5090 over a 3080 here is
-#: 1.70x. Reading the peak ratio as an achieved ratio puts the ceiling for the
+#: cancel: the decode advantage of the 5090 over a 3080 that the measured
+#: step times imply here is 1.46x (1.70x on the three #216 points alone,
+#: 1.46x once the #264 point is in the fit -- see the refit note below).
+#: Reading the peak ratio as an achieved ratio puts the ceiling for the
 #: fast rank far too high, and the guard then waves through exactly the
 #: concentration that makes that rank the lockstep pacer.
 #:
@@ -179,7 +181,7 @@ _PREDICT_KNEE_COARSE_HEADROOM_UNITS = 2
 #:     streaming kernels read, and reaches less: 1532 vs 1663 GB/s on the
 #:     5090, 717.4 vs 717.8 on the 3080 -- the fast card gives up 8 % of its
 #:     stream to the GEMV, the slow card gives up nothing. Ratio 2.32 -> 2.14.
-#:     That is a third of the way (26 % in log terms) to the measured 1.70,
+#:     That is a fifth of the way (22 % in log terms) to the implied 1.46,
 #:     and it costs no constant: it is read off the rig.
 #:  2. The residual exponent below, for the rest.
 #:
@@ -189,8 +191,39 @@ _PREDICT_KNEE_COARSE_HEADROOM_UNITS = 2
 #: defeated on the prefill axis: base [63,37,36] 30.10 ms, 3,1,1 31.90,
 #: 4,1,1 34.12, 6,1,1 34.76 -- rms 0.38 ms, boot-to-boot floor 0.6-0.8 %.
 #: BETA = 1 predicts -8 to -2 % for those vectors where +6 to +16 % was
-#: measured; at 0.70 the three predictions land at +7.2 / +11.3 / +16.3
-#: against measured +6.0 / +13.4 / +15.5 (rms 1.5 points).
+#: measured.
+#:
+#: REFIT #265, on the #264 A/B. That campaign added a fourth point on a
+#: different base plan: base ``2,1,1`` (units [68,34,34]) -> ``6,1,1``
+#: (units [102,17,17]), ms/verify 32.599 -> 37.307 = +14.4 %. At the previous
+#: 0.70/0.28 pair the model reads that step as +8.7 % (the plan log's
+#: base-relative +6.4 % against the VRAM-auto split, which is where the
+#: reported "2.2x too mild" comes from -- the A/B's arm A was the pinned
+#: 2,1,1, not the base). The miss is structural in the pacer, not in the
+#: size of a percentage: at 0.70 the model puts the DECODE PACER on a 3080
+#: at both campaign bases, which makes mild concentration a predicted GAIN
+#: (-2.1 % for 2,1,1) -- while every measured concentration from the base is
+#: a COST. At or below 0.50 the 5090 paces at every vector on both campaign
+#: bases, the predicted-gain region disappears, and the four points fit
+#: together.
+#:
+#: Joint (BETA, nonweight-fraction) grid over the four points, rms in
+#: percentage points:
+#:     0.70 / 0.28 (shipped)  +7.1 / +11.2 / +16.2 / +8.7   rms 3.13
+#:     0.50 / 0.35 (this)     +8.0 / +11.8 / +16.4 / +14.7  rms 1.37
+#: against measured +6.0 / +13.4 / +15.5 / +14.4. The rms optimum is a flat
+#: valley (BETA 0.50-0.57 x fraction 0.36-0.37, rms 1.338-1.342), so the four
+#: points still do NOT separate the two scalars -- they pin the pair, exactly
+#: as the three did. BETA is taken at 0.50 rather than at the rms minimum
+#: because rms is flat across the whole range while the PACER is not: the
+#: 0.52-0.57 end sits on the flip, where 2,1,1 still reads as a small gain,
+#: and 0.50 is inside the plateau where the sign is right on both bases. Cost
+#: of that choice: 0.007 rms points.
+#:
+#: What the fourth point adds is the SIGN of the curve near the base, which no
+#: value of the fraction can supply: the fraction multiplies the weight-term
+#: ratio, so it can damp a predicted cost but never turn a predicted gain into
+#: one.
 #:
 #: What the residual IS. The probe reads dense bf16; a decode step reads
 #: QUANTIZED weights through dequantising kernels -- native FP8 on sm_120,
@@ -206,15 +239,19 @@ _PREDICT_KNEE_COARSE_HEADROOM_UNITS = 2
 #: family (FP8 dense, sm_120 native lane against sm_86 Marlin upconvert).
 #: The direction -- achieved ratios are compressed relative to probed ones --
 #: is general; this particular value is not claimed to be.
-_PREDICT_DECODE_GEMV_RESIDUAL = 0.70
+_PREDICT_DECODE_GEMV_RESIDUAL = 0.50
 #: FALLBACK exponent, applied to the STREAMING peak when no usable GEMV rate
 #: is available (profile from before PROFILE_VERSION 2, or the saturation
-#: check below rejecting the measurement). Same fit, same three points, same
+#: check below rejecting the measurement). Same fit, same four points, same
 #: caveat -- but it starts from a divisor that has measured none of the
 #: compression, so it has to supply all of it. Its existence is why the
-#: fallback is NAMED and logged rather than taken silently: 0.63 and 0.70 are
-#: not interchangeable, they belong to different divisors.
-_PREDICT_DECODE_BW_COMPRESSION = 0.63
+#: fallback is NAMED and logged rather than taken silently: 0.45 and 0.50 are
+#: not interchangeable, they belong to different divisors. Held at the
+#: achieved ratio the GEMV path produces on the reference rig
+#: (2.131 ** 0.50 = 1.46 = 2.319 ** 0.45), so a rig that falls back does not
+#: silently change WHICH decode ratio the guard believes, only how much of it
+#: was measured.
+_PREDICT_DECODE_BW_COMPRESSION = 0.45
 #: Saturation floor for the GEMV probe, as a fraction of the same card's
 #: streaming rate. Below this the GEMV is not bandwidth-bound at all (a
 #: kernel that fell back to something pathological on an architecture we have
@@ -238,17 +275,18 @@ _PROBE_GEMV_CACHE_CEILING = 1.05
 #: folding it in is what takes the reported cost from "the right sign" to
 #: "within ~2 points of measured".
 #:
-#: Not independently fitted: on three measurement points this value and the
-#: exponent above trade off along a valley (rms stays within 1.6-2.0 points
-#: over f=0.00/BETA=0.75 through f=0.30/BETA=0.70), so the data pin their
-#: combination, not either one. Separating them does not need a wider
+#: Not independently fitted: this value and the exponent above trade off
+#: along a valley, so the data pin their combination, not either one. The
+#: fourth point (#264, refit #265) narrows the valley without closing it --
+#: BETA 0.50-0.57 x f 0.36-0.37 all land at rms 1.34 -- so 0.35 is the round
+#: value inside it, at rms 1.36. Separating the two does not need a wider
 #: campaign, it needs a DIRECT measurement: profile one decode step and split
 #: device time between weight-reading kernels and everything else. Then f is
 #: read off, and the exponent is what the step times alone determine. Note it
 #: is not a constant even in principle -- attention time grows with context --
 #: though the #216 pair at ctx 400 vs 12000 moved the 6,1,1 cost only from
 #: +16.7 % to +16.4 %, so over that range it is nearly flat.
-_PREDICT_DECODE_NONWEIGHT_FRACTION = 0.28
+_PREDICT_DECODE_NONWEIGHT_FRACTION = 0.35
 #: Fraction of a prefill step that does NOT move with the weight split.
 #:
 #: The prefill model books ONLY shard-proportional time: per-token GEMM
@@ -307,16 +345,16 @@ class PerfCalibration:
 
     Field -> shipped value -> what pins it -> how to refit:
 
-    ``decode_gemv_residual_exp`` (0.70, ``_PREDICT_DECODE_GEMV_RESIDUAL``)
-        Exponent on the measured GEMV rate. Pinned by three measured ms-per-
-        speculative-step points (#216 follow-up). Refit: interleaved cold
-        boots of the base split plus one concentration vector, solve
-        ``beta = ln(achieved decode ratio) / ln(gemv ratio)``.
-    ``decode_peak_compression_exp`` (0.63, ``_PREDICT_DECODE_BW_COMPRESSION``)
+    ``decode_gemv_residual_exp`` (0.50, ``_PREDICT_DECODE_GEMV_RESIDUAL``)
+        Exponent on the measured GEMV rate. Pinned by four measured ms-per-
+        speculative-step points (#216 follow-up + the #264 A/B). Refit:
+        interleaved cold boots of the base split plus one concentration
+        vector, solve ``beta = ln(achieved decode ratio) / ln(gemv ratio)``.
+    ``decode_peak_compression_exp`` (0.45, ``_PREDICT_DECODE_BW_COMPRESSION``)
         Fallback exponent on the STREAMING peak when no usable GEMV rate
         exists. Same fit, same points, larger residual (the divisor measured
         none of the compression).
-    ``decode_nonweight_fraction`` (0.28, ``_PREDICT_DECODE_NONWEIGHT_FRACTION``)
+    ``decode_nonweight_fraction`` (0.35, ``_PREDICT_DECODE_NONWEIGHT_FRACTION``)
         Share of a bs=1 decode step that is not weight streaming. NOT
         independently identified -- it and the exponent trade off along a
         valley; separating them needs a profiled decode step.
@@ -2401,6 +2439,55 @@ class PerfCostModel:
             "weights_gib": [w / 2**30 for w in weights],
         }
 
+    def residual_free_mib(
+        self,
+        mlp_vector: List[int],
+        device_total_mib: Sequence[int],
+        ranks_on_gpu: Sequence[int],
+        kv_token_vector: Sequence[int],
+    ) -> List[float]:
+        """Per-rank VRAM (MiB) a candidate leaves UNALLOCATED after the pools.
+
+        The capacity model above answers "how many KV tokens could this rank
+        fund"; this answers the question the boot actually asks next, "and how
+        much memory is still free once the pools have been built". They are
+        different numbers, and the difference is what task #264 walked into:
+        the KV pool is not sized to a rank's own capacity but to the token
+        vector, and the vector's scale is set by the TIGHTEST rank
+        (``unit = min_r P_r / ratio_r``). A rank that is not the tightest
+        therefore keeps its unused capacity as free VRAM -- and MLP
+        concentration spends exactly that slack, because it moves the tight
+        rank onto the card being concentrated.
+
+        Two terms, both exact under the plan's own assumptions:
+
+          * ``device_total/ranks - budget`` -- the reserve, i.e. the part of
+            the card the budget deliberately never claims;
+          * ``(P_r - tokens_r) * kv_cell`` -- capacity the token vector does
+            not use.
+
+        Everything the budget DOES claim (weights, mamba pool, the modelled
+        per-rank overhead) is allocated, so it is not free and is not counted
+        here. The absolute level is therefore an upper bound -- the CUDA
+        context, NCCL buffers and the graph pool live in the reserve too --
+        which is why the caller compares it against a DEMAND
+        (``derived_rank_auto_reserve_mib``) rather than against zero, and
+        only ever counts a candidate that pushes a rank from above that
+        demand to below it.
+        """
+        pred = self.predict_capacity(list(mlp_vector))
+        p = pred["p"]
+        vec = [max(int(v), 1) for v in kv_token_vector]
+        unit = min(x / v for x, v in zip(p, vec))
+        out = []
+        for r in range(self.tp_size):
+            reserve = device_total_mib[r] / max(int(ranks_on_gpu[r]), 1) - (
+                self.budgets_mib[r]
+            )
+            slack = (p[r] - unit * vec[r]) * self.kv_cell_bytes / 2**20
+            out.append(reserve + max(slack, 0.0))
+        return out
+
     # -- speed prediction ---------------------------------------------------
 
     def streamed_bytes(self, mlp_vector: List[int]) -> List[float]:
@@ -2759,6 +2846,97 @@ def _mlp_candidates(
     return out
 
 
+#: Gate names in the order the per-candidate verdict applies them.
+_GATE_ORDER = ("infeasible", "unbootable", "floor", "knee", "no gain")
+
+
+def _binding_gate(entry) -> str:
+    """Which gate rejected this candidate, in verdict precedence order."""
+    _cand, pred, gain, floor_ok, knee_ok, _reason, _res, unfundable = entry
+    if not pred["feasible"]:
+        return "infeasible"
+    if unfundable is not None:
+        return "unbootable"
+    if not floor_ok:
+        return "floor"
+    if not knee_ok:
+        return "knee"
+    return "no gain" if gain <= 0 else "accepted"
+
+
+def _no_lever_lines(tune: str, loose: float, results) -> List[str]:
+    """The refusal, when no candidate survives the gates (#265).
+
+    Before this, the optimizer printed one generic sentence that named the
+    context floor and recommended raising ``--rank-perf-loose-ctx-percent``
+    whatever the actual binding gate was. Two things were wrong with that.
+    It sent the reader to a knob that cannot help when the binding gate is
+    the decode-knee guard or fundability -- with fundability it buys an OOM
+    (#264) -- and for ``--rank-perf-tune enc`` it hid the only fact worth
+    reporting: enc's single lever is MLP concentration, so "every
+    concentrated candidate rejected" means enc has no lever at this
+    operating point, not that enc optimized and found nothing.
+
+    The refusal therefore names the tally per gate, the best forfeited
+    candidate, and only mentions the loose-ctx knob when the floor is what
+    actually binds.
+    """
+    if not results:
+        return [
+            f"tune={tune}: no representable concentration candidate on this "
+            "MLP grid -- keeping the plain VRAM-auto split."
+        ]
+    gates = [_binding_gate(e) for e in results]
+    tally = ", ".join(
+        f"{g} {gates.count(g)}" for g in _GATE_ORDER if gates.count(g)
+    )
+    best = max(results, key=lambda e: e[2])
+    best_gate = _binding_gate(best)
+    lever = (
+        "enc has no effective lever at this operating point"
+        if tune == "enc"
+        else "no candidate survives the gates"
+    )
+    head = (
+        f"tune={tune}: {lever}. {len(results)} concentration candidates "
+        f"evaluated, none accepted ({tally}). The best of them, "
+        f"{','.join(map(str, best[0]))}, would have predicted "
+        f"{best[2] * 100:+.1f}% prefill and is rejected by: {best_gate}. "
+        "Keeping the plain VRAM-auto split."
+    )
+    tail = {
+        "floor": (
+            "The floor is what binds: raise --rank-perf-loose-ctx-percent "
+            f"(now {loose:g}) to trade predicted context for prefill speed."
+        ),
+        "knee": (
+            "The decode-knee guard is what binds: the candidate would make "
+            "the strong rank the decode lockstep pacer. "
+            "--rank-perf-loose-ctx-percent does not move this gate; it is a "
+            "speed/speed trade, not a context trade."
+        ),
+        "unbootable": (
+            "Fundability is what binds: the candidate leaves a rank below "
+            "its derived reserve demand, i.e. it does not boot rather than "
+            "serving less context. --rank-perf-loose-ctx-percent cannot "
+            "accept it -- raise --rank-auto-reserve-mib on the named GPU (the "
+            "#264 case: 6,1,1 needed 4500 where the base ran at 3000)."
+        ),
+        "infeasible": (
+            "The candidates are infeasible outright: at least one rank falls "
+            "below the minimum viable token capacity. Neither "
+            "--rank-perf-loose-ctx-percent nor a bigger reserve helps; the "
+            "budgets are too small for this concentration."
+        ),
+        "no gain": (
+            "No gate binds -- the model simply predicts no prefill gain from "
+            "concentration here, so the VRAM-auto split already sits at the "
+            "prefill optimum this rig can represent."
+        ),
+    }.get(best_gate)
+    return [head] + ([tail] if tail else [])
+
+
 @dataclasses.dataclass
 class PerfDecision:
     chosen_vector: Optional[List[int]]  # None = keep the plain auto split
@@ -3024,6 +3202,109 @@ def apply_auto_performance(server_args) -> None:
         f"({100 - loose:g}% of the VRAM-auto prediction)"
     )
 
+    # --- fundability (#265) ------------------------------------------------
+    # The floor above is a CONTEXT judgement. It is not the only way a
+    # candidate can be wrong, and #264 measured the other way: 6,1,1 at the
+    # runbook reserve does not boot at all -- it OOMs in the first real
+    # prefill -- while the ladder printed "REJECTED by floor" for it, a
+    # verdict whose documented remedy (raise --rank-perf-loose-ctx-percent)
+    # trades context for an OOM instead of for speed.
+    #
+    # The mechanism is visible in the plan's own numbers. The KV pool is not
+    # sized to a rank's capacity but to the token vector, scaled by the
+    # TIGHTEST rank, so a rank that is not the tightest keeps its unused
+    # capacity as free VRAM. Concentration moves the tight rank ONTO the card
+    # being concentrated and spends exactly that slack: on the #264 rig the
+    # 5090 goes from 4589 MiB of unused-capacity slack at the base to 0 at
+    # 6,1,1, and its whole remaining headroom is then the pinned reserve
+    # (3000 MiB) against a derived demand of 4160 MiB. Raising the reserve to
+    # 4500 restores the margin, and that is the boot that ran.
+    #
+    # The check therefore asks one question per rank: does this candidate push
+    # the rank from "residual free VRAM at or above the derived reserve
+    # demand" to "below it"? Relative to the base on purpose -- a rank whose
+    # reserve is ALREADY under-pinned (the 3080s here, at 2700 against 4160)
+    # is the operator's pre-existing choice, already warned about at
+    # resolution time, and not something a candidate caused.
+    _fund_totals: Optional[List[int]] = None
+    _fund_counts: Optional[List[int]] = None
+    _fund_demand: Optional[List[int]] = None
+    _fund_token_vec: Optional[List[int]] = None
+    _fund_base: Optional[List[float]] = None
+    demand_by_gpu = getattr(server_args, "_derived_rank_auto_reserve_per_gpu", None)
+    if demand_by_gpu:
+        from collections import Counter
+
+        from sglang.srt.distributed.utils import partition_units
+
+        counts = Counter(server_args.rank_gpu_id)
+        try:
+            _fund_totals = [
+                int(profile["gpus"][uuid_by_idx[g]]["total_mib"])
+                for g in server_args.rank_gpu_id
+            ]
+            _fund_counts = [counts[g] for g in server_args.rank_gpu_id]
+            _fund_demand = [demand_by_gpu[g] for g in server_args.rank_gpu_id]
+        except (KeyError, TypeError, ValueError):
+            _fund_totals = _fund_counts = _fund_demand = None
+    if _fund_demand is not None:
+        # The vector the BOOT will use, which is not always the converged
+        # capacity optimum predict_capacity reports: 'coupled' (the default)
+        # follows the base plan, a pinned vector follows itself, and the
+        # derived modes install the capacity optimum after profiling.
+        kv_ratio = getattr(server_args, "rank_kv_ratio", "coupled")
+        if isinstance(kv_ratio, list):
+            _fund_token_vec = [max(int(v), 1) for v in kv_ratio]
+        elif server_args.uneven_kv_derived_mode():
+            _fund_token_vec = None  # per-candidate: the converged optimum
+        else:
+            _fund_token_vec = partition_units(_PREDICT_TOKEN_UNITS, base_plan)
+
+    def _residual(cand: Sequence[int]) -> Optional[List[float]]:
+        """Per-rank residual free MiB for a candidate, or None when the
+        inputs for the check are not available."""
+        if _fund_demand is None or _fund_totals is None or _fund_counts is None:
+            return None
+        vec = _fund_token_vec
+        if vec is None:
+            vec = model.predict_capacity(list(cand))["token_vector"]
+            if not vec:
+                return None
+        return model.residual_free_mib(
+            list(cand), _fund_totals, _fund_counts, vec
+        )
+
+    def _unfundable_reason(res: Optional[List[float]]) -> Optional[str]:
+        """Verdict text for the first rank a candidate pushes below the
+        derived reserve demand that the BASE plan still clears, or None."""
+        if res is None or _fund_base is None or _fund_demand is None:
+            return None
+        for r in range(server_args.tp_size):
+            if res[r] < _fund_demand[r] <= _fund_base[r]:
+                # Deliberately worded away from the floor: an unbootable
+                # candidate has no context to trade, so pointing at
+                # --rank-perf-loose-ctx-percent would buy an OOM (#264).
+                return (
+                    f"UNBOOTABLE (rank {r} residual free {int(res[r])} MiB < "
+                    f"derived reserve demand {_fund_demand[r]} MiB; the base "
+                    f"plan leaves it {int(_fund_base[r])} MiB). Not "
+                    "acceptable at any --rank-perf-loose-ctx-percent -- raise "
+                    "--rank-auto-reserve-mib on that GPU instead"
+                )
+        return None
+
+    _fund_base = _residual(base_plan)
+    if _fund_base is not None and _fund_demand is not None:
+        lines.append(
+            "fundability reference: residual free VRAM at the VRAM-auto "
+            f"split {[int(x) for x in _fund_base]} MiB per rank (reserve the "
+            "budget never claims + capacity the KV token vector does not "
+            f"use), against the derived reserve demand {_fund_demand} MiB. A "
+            "candidate that pushes a rank from above that demand to below it "
+            "is reported UNBOOTABLE and is never accepted, whatever "
+            "--rank-perf-loose-ctx-percent says."
+        )
+
     # Tuning target (per M22: decode is flat across representable splits;
     # prefill/aggregate is the lever, and 'both' rides the same lever).
     chosen: Optional[Tuple[int, ...]] = None
@@ -3163,6 +3444,22 @@ def apply_auto_performance(server_args) -> None:
                 "for the C6-class vector), so 'both' optimizes the same "
                 "objective as 'enc'."
             )
+        else:
+            # tune=enc used to fall into the 'both' branch without a word of
+            # its own, which made "enc did nothing" indistinguishable from
+            # "enc had nothing to do" (#264 bug 1). enc has exactly ONE
+            # lever -- moving MLP units onto the compute-strong rank -- so
+            # when every concentrated candidate is rejected, enc has no lever
+            # at this operating point and says so below instead of quietly
+            # returning the base split as if it had optimized something.
+            lines.append(
+                "tune=enc: objective = minimize the lockstep PREFILL time "
+                "model. The only lever is MLP concentration onto the "
+                "compute-strong rank(s); the attention/GDN/KV splits are not "
+                "touched (M22: decode is flat across them). If every "
+                "concentrated candidate is rejected below, enc has no lever "
+                "here and the refusal is reported explicitly."
+            )
         # enc/both objective: minimize the lockstep prefill time model.
         enc_scores = list(rank_scores_gemm)
         # Per-rank link penalty: a rank behind a narrow link attracts fewer
@@ -3193,22 +3490,56 @@ def apply_auto_performance(server_args) -> None:
             knee_ok, knee_reason = model.decode_knee_detail(
                 list(cand), rank_scores_bw, rank_scores_gemv
             )
-            floor_ok = pred["feasible"] and pred["ctx"] >= floor
-            results.append((cand, pred, gain, floor_ok, knee_ok, knee_reason))
-            if floor_ok and knee_ok and gain > best_gain + 1e-9:
+            # Tolerance, not slop (#265): re-partitioning the MLP family
+            # CONSERVES total weight bytes, so sum_r P_r -- and with it the
+            # predicted context whenever the sum is the binding term -- is
+            # the same number for every candidate in exact arithmetic. Only
+            # the summation ORDER differs, and a bare >= then rejects a
+            # capacity-NEUTRAL candidate on the last bits: the #264 log shows
+            # six candidates "REJECTED by floor" at a printed ctx identical to
+            # the floor's own 492416. A relative tolerance is the correct
+            # comparison for a quantity that is mathematically equal.
+            floor_ok = pred["feasible"] and (
+                pred["ctx"] >= floor
+                or math.isclose(pred["ctx"], floor, rel_tol=1e-9)
+            )
+            res = _residual(cand)
+            unfundable = _unfundable_reason(res)
+            results.append(
+                (cand, pred, gain, floor_ok, knee_ok, knee_reason, res, unfundable)
+            )
+            if (
+                floor_ok
+                and knee_ok
+                and unfundable is None
+                and gain > best_gain + 1e-9
+            ):
                 best_gain = gain
                 chosen = cand
-        for cand, pred, gain, floor_ok, knee_ok, knee_reason in sorted(
-            results, key=lambda x: -x[2]
-        )[:6]:
+        for (
+            cand,
+            pred,
+            gain,
+            floor_ok,
+            knee_ok,
+            knee_reason,
+            res,
+            unfundable,
+        ) in sorted(results, key=lambda x: -x[2])[:6]:
             if not pred["feasible"]:
                 verdict = "INFEASIBLE"
+            elif unfundable is not None:
+                # Deliberately ahead of the floor verdict: an unbootable
+                # candidate has no context to trade, so naming the floor here
+                # would send the reader to --rank-perf-loose-ctx-percent, and
+                # that knob buys an OOM (#264).
+                verdict = unfundable
             elif not floor_ok:
                 verdict = "REJECTED by floor"
             elif not knee_ok:
                 verdict = f"REJECTED by decode-knee guard -- {knee_reason}"
             else:
-                verdict = "floor OK, knee OK"
+                verdict = "floor OK, knee OK, fundable"
             # The decode cost is stated for EVERY candidate, including the
             # ones the guard accepts. A silent pass is how a +16.5 % decode
             # regression got proposed as a default (task #216): the guard's
@@ -3221,16 +3552,17 @@ def apply_auto_performance(server_args) -> None:
                 f"candidate MLP vector {','.join(map(str, cand))}: "
                 f"predicted ctx ~{int(pred['ctx'])} ({verdict}), "
                 f"predicted prefill gain {gain * 100:+.1f}%, predicted decode "
-                f"step {dec_pct:+.1f}% "
-                f"(units {model.mlp_unit_partition(list(cand)) if pred['feasible'] else 'n/a'})"
+                f"step {dec_pct:+.1f}%"
+                + (
+                    f", residual free {[int(x) for x in res]} MiB"
+                    if res is not None
+                    else ""
+                )
+                + f" (units {model.mlp_unit_partition(list(cand)) if pred['feasible'] else 'n/a'})"
             )
         if chosen is None:
-            lines.append(
-                "no candidate beats the VRAM-auto split within the context "
-                "floor + decode-knee guard -- keeping plain auto (floor/knee "
-                "binds or no predicted gain; raise "
-                "--rank-perf-loose-ctx-percent to trade context for speed "
-                "via TP-degree reduction, which stage 1 only recommends)."
+            lines.extend(
+                _no_lever_lines(tune, loose, results)
             )
 
     if chosen is not None:
