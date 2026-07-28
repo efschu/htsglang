@@ -5869,3 +5869,23 @@ Operativ relevant bleibt hier nur:
   zwar RANG-LOKAL ohne Kollektiv, waehrend der Solo-Pfad dafuer ein
   Gruppen-Kollektiv braucht. Der Lane-Mechanismus ist damit der Hebel, der
   die Sperre loesen wuerde. Zurueckgestellt als offener Posten.
+
+## #274 Slice C — Merge-Vermerk (ed567224c3)
+
+Slice-C-Zweig gemergt (6 Commits; Agent-eigener Validierungsabschnitt oben aus
+dem Branch uebernommen, Add/Add-Konflikt per Beide-behalten geloest, Marker 0).
+Kernstand: C1 Kontext-Overlay statt set_server_args-Swap (~370 Callsites lane-
+korrekt ohne Edit; 4 Boot-gefundene Globals inkl. get_attn_backend), hartes
+Serial-Tor bestanden (Boeden 33,65 / 583,75 unveraendert, data_ptr 1058);
+C2 eigener Thread + hochpriorer Stream, Rueckholen 2,49 ms, Zyklus 3,25 ms
+=> Amortisation ~0,1 s (5-s-Default ist flattern-, nicht kostengetrieben);
+C3 Kartenaequivalente seriell 0,974/0,914 vs nebenlaeufig 1,130/1,440 mit
+dokumentierter Formel; dir1 +9,7 % URSAECHLICH belegt als SM-Compute-Konkurrenz
+(prefill_wait 0,01 ms — nicht Praeemption); Machbarkeits-Fehlschaetzung ehrlich
+(NEXTN-Komplement 2684 statt 120 MiB — Stock-Loader laedt kompletten Kopf);
+Lane-NEXTN-KOPF ASSEMBLIERT (data_ptr-Gate 16 Identitaeten, rang-lokal ueber
+Komplement-Mechanismus) — offen NUR Draft-KV-Pool-Verdrahtung (memory_pool_
+config-Durchreichung, Division-durch-Null benannt) + Kette; --dual-group-lane-
+spec default aus. Familien-Achse in DESIGN_121 §11.12 (MoE = fuenfte
+Schalenklasse fehlt, Aufwand B1, Laut-Fehler-Zweig greift). Distributed-Suite
+543 gruen / 16 vorbestehend rot (Stub-Drift, unveraendert).
