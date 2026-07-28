@@ -82,6 +82,7 @@ __all__ = [
     "CouplingReport",
     "MESSAGE_CLASSES",
     "COLOCATION_NCCL_MIN",
+    "DMABUF_RDMA_CHECKS",
     "arch_of_card_name",
     "gate",
     "transport_plan",
@@ -160,6 +161,38 @@ MESSAGE_CLASSES: Tuple[Dict[str, Any], ...] = (
         "separable_from": None,
     },
 )
+
+#: The four preconditions the #214 desk evaluation asks for before a
+#: `dmabuf_rdma` HTCCL transport is even worth prototyping
+#: (``docs/EVAL_gdr_uebernahme.md`` §6.2, §9 P1). Each is read from
+#: :attr:`RigFacts.capabilities` -- never assumed -- because the host-side
+#: probe that answers most of these (``read_dmabuf_flag.sh`` needs `gdb` on
+#: `/proc/kcore` as root) cannot run inside this process, the same reason
+#: every other capability-backed row in this module reports ABSENT rather
+#: than inferring. Deliberately NOT included here: "GPU works as RDMA
+#: source" and "target BAR resizable". Both are real preconditions in the
+#: evaluation's own table, but the first is exactly the row the evaluation
+#: warns must not be inferred from PCIe topology (§1.2), and the second is
+#: about which physical card is targeted, not about whether the chain is
+#: installed -- neither belongs in a fixed four-item capability list.
+DMABUF_RDMA_CHECKS: Tuple[Tuple[str, str], ...] = (
+    ("dmabuf_open_kernel_module", "NVIDIA open kernel modules"),
+    ("dmabuf_rdma_core", "rdma-core with ibv_reg_dmabuf_mr (>= rdma-core 34)"),
+    ("dmabuf_mlx5_path", "mlx5_ib dmabuf path (kernel >= 5.12)"),
+    ("dmabuf_vmm_export", "VMM export requests POSIX_FD (vmm_utils.py)"),
+)
+
+#: Capability values that count as "this precondition holds". A rig reports
+#: its own vocabulary (bool, "ok", "open", ...); this is intentionally
+#: permissive about the spelling and strict about everything else -- a typo'd
+#: value reads as not-yet-confirmed rather than silently passing.
+_DMABUF_OK_VALUES = {"ok", "open", "available", "present", "yes", "true"}
+
+
+def _dmabuf_passed(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in _DMABUF_OK_VALUES
+    return bool(value) if value is not None else False
 
 
 # ===========================================================================
@@ -655,6 +688,127 @@ def _row_transport_available(local: RigFacts, remote: RigFacts) -> GateRow:
     )
 
 
+def _row_dmabuf_rdma(local: RigFacts, remote: RigFacts) -> GateRow:
+    """The dmabuf GPU-RDMA precondition chain (#214, EVAL_gdr_uebernahme.md
+    §6.2 / §9 P1) -- a CAPABILITY row, not a build recommendation.
+
+    Four checks decide whether a `dmabuf_rdma` HTCCL transport (the
+    evaluation's P4, explicitly NOT built now) even has a floor to stand on:
+    open kernel modules, rdma-core with `ibv_reg_dmabuf_mr`, the mlx5 dmabuf
+    kernel path, and this fork's VMM export path. This row never blocks a
+    coupling -- dmabuf_rdma is not a transport either rig plan requires, so
+    an unmet precondition here is exactly the same kind of fact as
+    `transport_available` reporting on UCX: visible and actionable, not a
+    reason to refuse the coupling.
+
+    What this row deliberately does NOT do: treat "same PCIe switch as the
+    NIC" as a precondition for a card acting as an RDMA source. The
+    evaluation's own counter-datum is that on the reference rig the 5090
+    reaches the NIC through the root complex -- not the NIC's switch -- and
+    still works as a source; the 2080 Ti failure the handover blamed on
+    topology therefore needs a different explanation, and baking the
+    hypothesis into a BLOCK would gate a working card on unproven grounds.
+    That reasoning is carried as a WARN note on every row, not as a fifth
+    check that could fail.
+    """
+    topology_note = (
+        " Not gated here: the handover's own hypothesis that an RDMA-source "
+        "failure follows from sharing (or not sharing) the NIC's PCIe "
+        "switch. On the reference rig the 5090 sits on the root complex, not "
+        "the NIC's switch, and still works as an RDMA source -- a "
+        "counter-datum to the hypothesis, not a confirmation of it "
+        "(EVAL_gdr_uebernahme.md §1.2). Only a per-card source probe may "
+        "ever decide that, never PCIe placement."
+    )
+
+    def _side(facts: RigFacts) -> Tuple[str, List[bool], List[bool]]:
+        parts: List[str] = []
+        reported: List[bool] = []
+        passed: List[bool] = []
+        for key, label in DMABUF_RDMA_CHECKS:
+            value = _cap_value(facts, key)
+            reported.append(value is not None)
+            passed.append(value is not None and _dmabuf_passed(value))
+            parts.append(f"{label}: {value if value is not None else 'not reported'}")
+        return "; ".join(parts), reported, passed
+
+    local_str, local_reported, local_passed = _side(local)
+    remote_str, remote_reported, remote_passed = _side(remote)
+    all_reported = all(local_reported) and all(remote_reported)
+    any_reported = any(local_reported) or any(remote_reported)
+    all_passed = all(local_passed) and all(remote_passed)
+
+    if not any_reported:
+        return GateRow(
+            key="dmabuf_rdma",
+            label="dmabuf GPU-RDMA precondition chain",
+            verdict=WARN,
+            reason=(
+                "None of the four dmabuf_rdma preconditions (open kernel "
+                "modules, rdma-core with ibv_reg_dmabuf_mr, mlx5 dmabuf "
+                "path, VMM export) have been probed on either rig."
+                + topology_note
+            ),
+            remedy="Run the host-side checks named in "
+            "EVAL_gdr_uebernahme.md §6.2 (uname -r / lsmod, dpkg -l "
+            "libibverbs1, /sys/class/infiniband, read_dmabuf_flag.sh) and "
+            "record the results as capabilities on each rig's profile.",
+            provenance=ABSENT,
+            evidence="absent",
+        )
+
+    if all_reported and all_passed:
+        return GateRow(
+            key="dmabuf_rdma",
+            label="dmabuf GPU-RDMA precondition chain",
+            verdict=OK,
+            local=local_str,
+            remote=remote_str,
+            reason=(
+                "Every precondition for a dmabuf_rdma transport is reported "
+                "met on both rigs. This is a capability check, not a build "
+                "recommendation: the #214 desk evaluation's verdict "
+                "(EVAL_gdr_uebernahme.md §0) is that the adoption case does "
+                "not hold at this fork's message sizes -- do not build the "
+                "transport on the strength of this row alone."
+                + topology_note
+            ),
+            provenance=MEASURED,
+            evidence="EVAL_gdr_uebernahme.md §6.2 / §9 P1",
+        )
+
+    missing = sorted(
+        {
+            label
+            for (key, label), ok in zip(DMABUF_RDMA_CHECKS, local_passed)
+            if not ok
+        }
+        | {
+            label
+            for (key, label), ok in zip(DMABUF_RDMA_CHECKS, remote_passed)
+            if not ok
+        }
+    )
+    return GateRow(
+        key="dmabuf_rdma",
+        label="dmabuf GPU-RDMA precondition chain",
+        verdict=WARN,
+        local=local_str,
+        remote=remote_str,
+        reason=(
+            "Not every dmabuf_rdma precondition is confirmed on both rigs. "
+            "Missing or unconfirmed: " + ", ".join(missing) + "."
+            + topology_note
+        ),
+        remedy="Run the host-side checks named in EVAL_gdr_uebernahme.md "
+        "§6.2 on whichever rig is unreported, or close the reported gap "
+        "(e.g. KvVmmArena._prop does not yet set requestedHandleTypes for "
+        "the POSIX_FD path, EVAL_gdr_uebernahme.md §4.3).",
+        provenance=MEASURED if all_reported else ESTIMATE,
+        evidence="EVAL_gdr_uebernahme.md §6.2 / §9 P1",
+    )
+
+
 def _row_cuda_graph(transports: Sequence["TransportChoice"]) -> GateRow:
     """Host-staged transports and CUDA graphs cannot both be on.
 
@@ -791,6 +945,7 @@ def gate(
     ]
     rows.extend(_arch_rows(local, remote, checkpoint_format))
     rows.append(_row_transport_available(local, remote))
+    rows.append(_row_dmabuf_rdma(local, remote))
     rows.append(_row_cuda_graph(transports))
     rows.append(_row_model_fit(model_fit))
     tags = set(extra_tags) | {"crossrig-tp-push"}

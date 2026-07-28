@@ -247,6 +247,68 @@ class GpuArmShapeTest(unittest.TestCase):
         self.assertEqual(res.status, "ok")
         self.assertTrue(any("all_gather" in n for n in res.notes))
 
+    def test_gdr_crossover_is_absent_when_the_binary_is_not_built(self):
+        # On this box (and any box that never built the handover binary out
+        # of tree) the arm must be absent, never an error, and must name
+        # both the missing binary and the env var that could point at it.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(comm_suite.GDR_CROSSOVER_BIN_ENV, None)
+            res = comm_suite._arm_gdr_crossover(
+                comm_suite._RunCtx(job=mock.MagicMock()))
+        self.assertEqual(res.status, "absent")
+        self.assertIn(comm_suite.GDR_CROSSOVER_BIN_ENV, res.absent_reason)
+        self.assertIn("BUILD.md", res.absent_reason)
+        self.assertIn("card window", res.absent_reason)
+
+    def test_gdr_crossover_is_absent_pointing_at_a_configured_but_missing_path(self):
+        with mock.patch.dict(os.environ,
+                             {comm_suite.GDR_CROSSOVER_BIN_ENV: "/no/such/bin"}):
+            res = comm_suite._arm_gdr_crossover(
+                comm_suite._RunCtx(job=mock.MagicMock()))
+        self.assertEqual(res.status, "absent")
+        self.assertIn("/no/such/bin", res.absent_reason)
+
+    def test_gdr_crossover_maps_the_ladder_and_finds_the_crossover_size(self):
+        payload = {
+            "pair": "5090<->3080",
+            "sizes": {
+                "8B": {"direct_us": 4.99, "staged_us": 6.6, "n": 2000},
+                "4KiB": {"direct_us": 6.08, "staged_us": 5.31, "n": 2000},
+                "64KiB": {"direct_us": 44.84, "staged_us": 15.50, "n": 2000},
+                "1MiB": {"direct_us": 634.13, "staged_us": 185.57, "n": 2000},
+            },
+        }
+        with mock.patch.object(comm_suite, "_gdr_crossover_bin",
+                               return_value="/fake/gpurdma_04_bench"), \
+             mock.patch.object(comm_suite, "_gdr_bench_run",
+                               return_value=payload):
+            res = comm_suite._arm_gdr_crossover(
+                comm_suite._RunCtx(job=mock.MagicMock()))
+        self.assertEqual(res.status, "ok")
+        self.assertIn("direct/8B", res.cells)
+        self.assertIn("staged/8B", res.cells)
+        self.assertEqual(res.cells["direct/8B"]["median_us"], 4.99)
+        # direct wins at 8B (4.99<6.6), loses starting at 4KiB (6.08>5.31)
+        self.assertEqual(res.facts["crossover_at"], "4KiB")
+        self.assertTrue(any("property of THIS rig" in n for n in res.notes))
+
+    def test_gdr_crossover_is_an_error_not_an_absence_when_the_binary_fails(self):
+        with mock.patch.object(comm_suite, "_gdr_crossover_bin",
+                               return_value="/fake/gpurdma_04_bench"), \
+             mock.patch.object(comm_suite, "_gdr_bench_run",
+                               side_effect=RuntimeError("segfault")):
+            res = comm_suite._arm_gdr_crossover(
+                comm_suite._RunCtx(job=mock.MagicMock()))
+        self.assertEqual(res.status, "error")
+        self.assertIn("segfault", res.error)
+
+    def test_gdr_crossover_is_registered_as_a_gpu_arm(self):
+        spec = next(a for a in ARMS if a.id == "gdr_crossover")
+        self.assertEqual(spec.kind, "gpu")
+        self.assertIn("gdr_crossover", comm_suite.ARM_RUNNERS)
+        self.assertIs(comm_suite.ARM_RUNNERS["gdr_crossover"],
+                      comm_suite._arm_gdr_crossover)
+
     def test_card_probe_arm_reads_the_probe_json_keys_that_exist(self):
         profile = mock.MagicMock()
         profile.to_json.return_value = {

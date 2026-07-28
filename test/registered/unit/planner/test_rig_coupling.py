@@ -232,6 +232,68 @@ class TestGate(NoNetwork):
         self.assertIn("#244", row.evidence)
         self.assertIn("rig only", row.evidence)
 
+    def test_dmabuf_rdma_row_is_absent_when_nothing_was_probed(self):
+        row = self._gate()["dmabuf_rdma"]
+        self.assertEqual(row.verdict, rc.WARN)
+        self.assertEqual(row.provenance, rc.ABSENT)
+        self.assertTrue(row.remedy)
+
+    def test_dmabuf_rdma_row_is_ok_when_every_precondition_is_met(self):
+        local = _rig("rig-a", LOCAL_CARDS, **VERSIONS)
+        far = _rig("rig-b", FAR_CARDS, **VERSIONS)
+        for facts in (local, far):
+            for key, _label in rc.DMABUF_RDMA_CHECKS:
+                facts.capabilities[key] = {"value": "ok",
+                                           "provenance": "measured", "note": ""}
+        row = {r.key: r for r in rc.gate(local, far)}["dmabuf_rdma"]
+        self.assertEqual(row.verdict, rc.OK)
+        self.assertEqual(row.provenance, rc.MEASURED)
+        self.assertIn("not a build", row.reason)
+
+    def test_dmabuf_rdma_row_warns_and_names_the_gap_when_one_side_fails(self):
+        local = _rig("rig-a", LOCAL_CARDS, **VERSIONS)
+        far = _rig("rig-b", FAR_CARDS, **VERSIONS)
+        for facts in (local, far):
+            for key, _label in rc.DMABUF_RDMA_CHECKS:
+                facts.capabilities[key] = {"value": "ok"}
+        # The one gap the evaluation itself names: KvVmmArena._prop does not
+        # yet request the POSIX_FD handle type.
+        far.capabilities["dmabuf_vmm_export"] = {"value": False}
+        row = {r.key: r for r in rc.gate(local, far)}["dmabuf_rdma"]
+        self.assertEqual(row.verdict, rc.WARN)
+        self.assertEqual(row.provenance, rc.MEASURED)
+        self.assertIn("VMM export", row.reason)
+
+    def test_dmabuf_rdma_row_is_estimate_when_only_partially_probed(self):
+        local = _rig("rig-a", LOCAL_CARDS, **VERSIONS)
+        far = _rig("rig-b", FAR_CARDS, **VERSIONS)
+        local.capabilities["dmabuf_open_kernel_module"] = {"value": "ok"}
+        row = {r.key: r for r in rc.gate(local, far)}["dmabuf_rdma"]
+        self.assertEqual(row.verdict, rc.WARN)
+        self.assertEqual(row.provenance, rc.ESTIMATE)
+
+    def test_dmabuf_rdma_row_never_blocks(self):
+        local = _rig("rig-a", LOCAL_CARDS, **VERSIONS)
+        far = _rig("rig-b", FAR_CARDS, **VERSIONS)
+        for facts in (local, far):
+            for key, _label in rc.DMABUF_RDMA_CHECKS:
+                facts.capabilities[key] = {"value": False}
+        row = {r.key: r for r in rc.gate(local, far)}["dmabuf_rdma"]
+        self.assertNotEqual(row.verdict, rc.BLOCK)
+
+    def test_dmabuf_rdma_row_treats_the_2080ti_topology_hypothesis_as_a_warn(self):
+        # The far rig carries the 2080 Ti (FAR_CARDS); the row must still
+        # never block on it, and must say the topology hypothesis is not
+        # what decides this, citing the 5090 counter-datum.
+        row = self._gate()["dmabuf_rdma"]
+        self.assertNotEqual(row.verdict, rc.BLOCK)
+        self.assertIn("5090", row.reason)
+        self.assertIn("counter-datum", row.reason)
+        self.assertIn("root complex", row.reason)
+
+    def test_dmabuf_rdma_row_is_wired_into_the_gate(self):
+        self.assertIn("dmabuf_rdma", self._gate())
+
     def test_every_row_that_is_not_ok_carries_a_reason(self):
         for row in self._gate(checkpoint_format="gguf",
                               colocation_wanted=True).values():

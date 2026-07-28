@@ -97,6 +97,22 @@ SOURCE_NAME = "comm_suite"
 #: verify, 256 KiB = a small prefill chunk.
 SIZES_KIB = (20, 80, 256)
 
+#: The direct-vs-staged size ladder for the ``gdr_crossover`` arm
+#: (docs/EVAL_gdr_uebernahme.md §9 P2, window W1): the handover's original
+#: four points (8 B, 4 KiB, 64 KiB, 1 MiB) plus 16/32/256 KiB to bracket this
+#: fork's own decode (20 KiB) and verify (80 KiB) sizes. Kept as strings, not
+#: an int tuple like SIZES_KIB, because the ladder mixes byte and KiB units.
+GDR_CROSSOVER_SIZES: Tuple[str, ...] = (
+    "8B", "4KiB", "16KiB", "32KiB", "64KiB", "256KiB", "1MiB")
+
+#: Where a locally built copy of the handover's ping-pong binary would live.
+#: Never vendored into this tree (EVAL_gdr_uebernahme.md §7: the reference C
+#: files are MIT but version-locked to the installed open-kernel-module
+#: driver's ioctl struct layout), so the arm only ever looks for it out of
+#: tree, at a path this env var can override.
+GDR_CROSSOVER_BIN_ENV = "SGLANG_GDR_CROSSOVER_BIN"
+_GDR_CROSSOVER_DEFAULT_BIN = "/spinning/gdr-uebergabe/gpurdma_04_bench"
+
 #: Iteration counts. Chosen against the 90 s box, not against precision: the
 #: suite reports a spread per cell, so a reader can see when 60 iterations
 #: were not enough rather than being told a tight number that isn't.
@@ -243,6 +259,22 @@ ARMS: Tuple[ArmSpec, ...] = (
         note="all_reduce only -- the transport implements no all_gather. "
              "Counted as a GPU arm because it pins its segment to a CUDA "
              "device for zero-copy H2D/D2H, so it cannot run device-free.",
+    ),
+    ArmSpec(
+        id="gdr_crossover",
+        label="dmabuf GPU-RDMA crossover (direct vs staged)",
+        kind="gpu",
+        question="At what payload size does a direct dmabuf RDMA write stop "
+                 "beating a host-staged one, on THIS rig?",
+        budget_s=40.0,
+        note="Runs the handover's gpurdma_04_bench ping-pong "
+             "(docs/EVAL_gdr_uebernahme.md) across "
+             "8B/4/16/32/64/256 KiB/1 MiB and reports the crossover as a "
+             "property of THIS rig, not of GPU RDMA in general (§1.4/§9 P2) "
+             "-- a rig with Resizable BAR on every card may cross over "
+             "somewhere else entirely. Needs the binary built out of tree "
+             "(SGLANG_GDR_CROSSOVER_BIN) plus an exclusive card window; "
+             "absent, naming both, when either is missing.",
     ),
     ArmSpec(
         id="cross_rig",
@@ -993,6 +1025,110 @@ def _arm_cross_rig(ctx: "_RunCtx") -> ArmResult:
     return res
 
 
+def _gdr_crossover_bin() -> Optional[str]:
+    """The handover binary, if this box has one built. Env var wins."""
+    path = os.environ.get(GDR_CROSSOVER_BIN_ENV) or _GDR_CROSSOVER_DEFAULT_BIN
+    return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
+
+
+def _gdr_bench_run(binary: str, sizes: Sequence[str], budget_s: float) -> dict:
+    """Shell out to the handover's ping-pong across the size ladder.
+
+    Kept as one seam so the result-shaping in :func:`_arm_gdr_crossover` is
+    testable without the binary -- every existing GPU arm mocks its own
+    worker call (``_worker_arm``, ``card_probe._run_probe_subprocess``)
+    rather than a raw subprocess, and this follows the same shape. Expected
+    JSON shape: ``{"pair": ..., "sizes": {"<size>": {"direct_us": ...,
+    "staged_us": ..., "n": ..., "spread_pct": ...}, ...}}``.
+    """
+    out = _tmp_out("gdr_crossover")
+    argv = [binary, "--sizes", ",".join(sizes), "--out", out]
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=budget_s)
+        if not os.path.exists(out):
+            raise RuntimeError(
+                f"{binary} produced no result file (rc={proc.returncode}). "
+                f"Output: {((proc.stdout or '') + (proc.stderr or ''))[-800:]}")
+        with open(out) as f:
+            return json.load(f)
+    finally:
+        try:
+            os.unlink(out)
+        except Exception:
+            pass
+
+
+def _arm_gdr_crossover(ctx: "_RunCtx") -> ArmResult:
+    """Direct-vs-staged crossover, as a fact about THIS rig, not about GDR.
+
+    docs/EVAL_gdr_uebernahme.md is explicit that "GDR is bad at 1 MiB" is the
+    wrong shape of claim (§1.4, the rig-is-a-lower-bound rule): the
+    handover's own tables never targeted this rig's Resizable-BAR card as an
+    RDMA destination, so the crossover point is a fact about a RIG, and this
+    arm's whole job is to produce that fact for whichever rig runs it --
+    without assuming in advance which side of the crossover it lands on.
+
+    On a box with no card window at all (this desk session; the GPU belongs
+    to another agent's exclusive slice), the driver already turns every
+    ``kind="gpu"`` arm absent before this function is even called (see
+    ``_gpu_phase``). What this function itself is responsible for is the
+    other half: even WITH a window, the handover binary is a separate,
+    out-of-tree build (never vendored, §7) that most boxes simply do not
+    have -- and that absence must be named just as specifically.
+    """
+    res = ArmResult(arm_id="gdr_crossover")
+    binary = _gdr_crossover_bin()
+    if binary is None:
+        looked_at = os.environ.get(GDR_CROSSOVER_BIN_ENV) or _GDR_CROSSOVER_DEFAULT_BIN
+        res.status = "absent"
+        res.absent_reason = (
+            "the handover's gpurdma_04_bench is not built on this box "
+            f"(looked at {looked_at}, override with ${GDR_CROSSOVER_BIN_ENV}; "
+            "build per the handover's BUILD.md -- headers are fetched at "
+            "build time, never vendored, docs/EVAL_gdr_uebernahme.md §7). "
+            "This arm also needs an exclusive GPU card window (the #271 "
+            "lock it is gated behind); declared here as a startable job, "
+            "not run -- run it from a session that actually holds a card.")
+        return res
+    try:
+        data = _gdr_bench_run(
+            binary, GDR_CROSSOVER_SIZES, ARM_BY_ID["gdr_crossover"].budget_s)
+    except Exception as e:
+        res.status = "error"
+        res.error = f"{type(e).__name__}: {e}"
+        return res
+    cells: Dict[str, dict] = {}
+    crossover: Optional[str] = None
+    for size in GDR_CROSSOVER_SIZES:
+        row = (data.get("sizes") or {}).get(size)
+        if not isinstance(row, dict):
+            continue
+        direct_us, staged_us = row.get("direct_us"), row.get("staged_us")
+        if direct_us is None or staged_us is None:
+            continue
+        cells[f"direct/{size}"] = {"median_us": direct_us, "n": row.get("n"),
+                                   "spread_pct": row.get("spread_pct")}
+        cells[f"staged/{size}"] = {"median_us": staged_us, "n": row.get("n"),
+                                   "spread_pct": row.get("spread_pct")}
+        if crossover is None and direct_us > staged_us:
+            crossover = size
+    res.cells = cells
+    res.facts = {
+        "sizes": list(GDR_CROSSOVER_SIZES),
+        "crossover_at": crossover,
+        "pair": data.get("pair"),
+    }
+    res.status = "ok"
+    res.notes.append(
+        "crossover reported as a property of THIS rig "
+        "(docs/EVAL_gdr_uebernahme.md §1.4, rig-is-a-lower-bound rule) -- do "
+        "not carry it to another rig's Resizable-BAR card or NIC generation "
+        "without re-measuring there.")
+    res.notes.extend(_spread_note(cells, ctx.floor_pct))
+    return res
+
+
 ARM_RUNNERS: Dict[str, Callable[["_RunCtx"], ArmResult]] = {
     "rig_profile": _arm_rig_profile,
     "noise_floor": _arm_noise_floor,
@@ -1002,6 +1138,7 @@ ARM_RUNNERS: Dict[str, Callable[["_RunCtx"], ArmResult]] = {
     "card_probe": _arm_card_probe,
     "collective_nccl": _arm_collective_nccl,
     "collective_htccl_shm": _arm_collective_htccl_shm,
+    "gdr_crossover": _arm_gdr_crossover,
     "cross_rig": _arm_cross_rig,
 }
 
