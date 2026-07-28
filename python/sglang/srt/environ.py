@@ -586,6 +586,19 @@ class Envs:
     # Deprecated MiB spelling of the same threshold; still honoured, and it
     # wins when both are set.
     SGLANG_HTCCL_UCX_RING_MIB = EnvInt(None)
+    # Same switch for all_gather (KiB); 0 disables the ring entirely. This
+    # ring saves no bytes -- the flat exchange already moves the (W-1) * n
+    # every rank must receive, in one round trip -- but it saves the single
+    # UCX worker per rank from progressing 2(W-1) simultaneous requests.
+    # Measured crossover cross-rig at world 4 is ~32 KiB (task #263), so a
+    # bs=1 decode gather stays flat and a 4-token verify gather rings.
+    SGLANG_HTCCL_UCX_AG_RING_KIB = EnvInt(32)
+    # Largest host-side pass in elements that stays on the calling thread;
+    # above it torch dispatches a CPU->CPU copy_/add_ through at::parallel_for.
+    # Co-located TP ranks enter their host passes together, so the OpenMP
+    # region's join lands on a descheduled thread and the 128 -> 256 KiB step
+    # cost milliseconds (task #263). 0 restores the unchunked passes.
+    SGLANG_HTCCL_UCX_GRAIN_ELEMS = EnvInt(32768)
     # Seconds before a pending UCX request is declared stuck. Guards against
     # a silent hang when a peer dies or the ranks disagree about the
     # collective sequence.

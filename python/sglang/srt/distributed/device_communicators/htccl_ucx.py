@@ -91,6 +91,28 @@ _RING_BYTES = int(os.environ.get("SGLANG_HTCCL_UCX_RING_KIB", "24")) * 1024
 if os.environ.get("SGLANG_HTCCL_UCX_RING_MIB"):
     _RING_BYTES = int(os.environ["SGLANG_HTCCL_UCX_RING_MIB"]) * 1024 * 1024
 
+# Same switch for all_gather. 32 KiB, measured, not assumed -- and it is worth
+# saying why the number exists at all, because the byte count predicts that it
+# should not: an all_gather has to deliver (W-1)*n bytes into every rank and
+# the flat exchange already moves exactly that, once, in one round trip. The
+# ring moves the same bytes in W-1 lock-step round trips, so unlike the
+# all_reduce ring (which halves the bytes at W=4) it cannot win on volume.
+#
+# It wins anyway, because the cost here is not the wire but the one
+# single-threaded UCX worker per rank. The flat exchange hands it 2(W-1)
+# simultaneous requests; the ring hands it two at a time. Measured cross-rig
+# at world 4 (task #263, us, median of 100 after 20 warmup, ranks 0-2 on rig 1
+# and rank 3 on rig 2, with the host passes of task #263 already chunked):
+#
+#     KiB      8     20     40     80    128     256
+#     flat  54.0   97.2  195.8  397.6  642.3  1321.9
+#     ring  73.3  110.2  180.2  298.6  452.0   966.9
+#
+# They cross at ~32 KiB and the ring holds ~25-30 % from 80 KiB up. A bs=1
+# decode gather (20 KiB) stays flat; a 4-token verify gather (80 KiB) rings.
+# 0 disables the ring entirely and is the A/B control.
+_AG_RING_BYTES = int(os.environ.get("SGLANG_HTCCL_UCX_AG_RING_KIB", "32")) * 1024
+
 # Matches SGLANG_HTCCL_FP32_REDUCE on the gloo plane: half/bfloat16 are summed
 # in fp32 so the accumulated error matches what NCCL would produce.
 _FP32_REDUCE = bool(int(os.environ.get("SGLANG_HTCCL_FP32_REDUCE", "1")))
@@ -112,6 +134,83 @@ _PROGRESS_BYTES = int(os.environ.get("SGLANG_HTCCL_UCX_PROGRESS_KIB", "256")) * 
 # payload, one exchange, then accumulate and copy out). Kept as an escape
 # hatch and as the A/B control for the pipelining measurement.
 _PIPELINE = bool(int(os.environ.get("SGLANG_HTCCL_UCX_PIPELINE", "1")))
+
+
+# Largest host-side pass, in elements, that torch keeps on the calling thread.
+# `at::internal::GRAIN_SIZE`; above it a CPU->CPU `copy_`/`add_` is dispatched
+# through `at::parallel_for`, which opens an OpenMP region for a pass that
+# takes single-digit microseconds.
+#
+# That is a cliff, not a tax, and it is why the 128 -> 256 KiB step cost
+# milliseconds (task #263). Co-located TP ranks leave the barrier together and
+# hit their host passes at the same instant, so N ranks x N threads land on
+# one core count and the region's join waits on a descheduled thread. Measured
+# on the rig-1 host, 3 concurrent processes, 320 KiB fp32:
+#
+#     whole buffer     median  7.91 us   max 6000.80 us
+#     grain-chunked    median 22.41 us   max   46.23 us
+#
+# Single-threaded is 2.8x slower in the median and ~130x better in the tail,
+# and under the real harness the tail IS the median. Set to 0 to restore the
+# unchunked passes as an A/B control.
+#
+# Only the passes that are not already chunked go through this: the pipelined
+# multi-chunk path splits by SGLANG_HTCCL_UCX_PROGRESS_KIB and its large-payload
+# throughput does want the parallel copy, so `_staged_copy`/`_staged_add` are
+# deliberately left alone.
+_GRAIN_ELEMS = int(os.environ.get("SGLANG_HTCCL_UCX_GRAIN_ELEMS", "32768"))
+
+
+def _grain_step(dst: torch.Tensor, src: torch.Tensor) -> int:
+    """Elements per sub-pass for ``dst``, or 0 meaning "do it in one".
+
+    Device copies are memcpys, not tensor iterators, so they are never split:
+    chunking a D2H or H2D would only add per-call overhead.
+    """
+    if (
+        not _GRAIN_ELEMS
+        or dst.numel() <= _GRAIN_ELEMS
+        or dst.device.type != "cpu"
+        or src.device.type != "cpu"
+        or not dst.is_contiguous()
+        or not src.is_contiguous()
+    ):
+        return 0
+    return _GRAIN_ELEMS
+
+
+def _host_copy_(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """``dst.copy_(src)``, kept single-threaded when both sides are host.
+
+    Byte-neutral by construction: a copy is elementwise, so splitting it into
+    contiguous sub-ranges cannot change a single output byte.
+    """
+    step = _grain_step(dst, src)
+    if not step:
+        dst.copy_(src)
+        return
+    d, s, n = dst.view(-1), src.view(-1), dst.numel()
+    off = 0
+    while off < n:
+        end = off + step if off + step < n else n
+        d[off:end].copy_(s[off:end])
+        off = end
+
+
+def _host_add_(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """``dst.add_(src)``, same split. Also byte-neutral: the accumulation is
+    elementwise, so no sub-range sees a different addend or a different order.
+    """
+    step = _grain_step(dst, src)
+    if not step:
+        dst.add_(src)
+        return
+    d, s, n = dst.view(-1), src.view(-1), dst.numel()
+    off = 0
+    while off < n:
+        end = off + step if off + step < n else n
+        d[off:end].add_(s[off:end])
+        off = end
 
 
 def _tag(seq: int, phase: int, src: int, chunk: int) -> int:
@@ -140,8 +239,17 @@ class _UcxAsyncHandle:
     """
 
     __slots__ = (
-        "op", "seq", "reqs", "send", "recvs",
-        "shape", "dtype", "device", "n", "dim", "done",
+        "op",
+        "seq",
+        "reqs",
+        "send",
+        "recvs",
+        "shape",
+        "dtype",
+        "device",
+        "n",
+        "dim",
+        "done",
     )
 
     def __init__(self, op, seq, reqs, send, recvs, shape, dtype, device, n, dim):
@@ -186,6 +294,7 @@ class HTCCLUcxTransport:
         ring_bytes: int = _RING_BYTES,
         progress_bytes: int = _PROGRESS_BYTES,
         pipeline: bool = _PIPELINE,
+        ag_ring_bytes: int = _AG_RING_BYTES,
     ):
         self.cpu_group = cpu_group
         self.device = device
@@ -193,6 +302,7 @@ class HTCCLUcxTransport:
         self.rank = dist.get_rank(cpu_group)
         self.chunk_bytes = max(int(chunk_bytes), 4096)
         self.ring_bytes = int(ring_bytes)
+        self.ag_ring_bytes = int(ag_ring_bytes)
         self.progress_bytes = int(progress_bytes)
         self.pipeline = bool(pipeline)
         self._lock = threading.Lock()
@@ -273,8 +383,11 @@ class HTCCLUcxTransport:
         logger.info(
             "HTCCL: ucx transport ready (rank %d/%d, UCX %s, chunk %d MiB, "
             "ring threshold %d KiB).",
-            self.rank, self.world_size, info["version_string"],
-            self.chunk_bytes // (1024 * 1024), self.ring_bytes // 1024,
+            self.rank,
+            self.world_size,
+            info["version_string"],
+            self.chunk_bytes // (1024 * 1024),
+            self.ring_bytes // 1024,
         )
 
     # ------------------------------------------------------------------
@@ -443,7 +556,7 @@ class HTCCLUcxTransport:
         draining the compute stream. ``dst`` must be contiguous (every caller
         passes a flat view of a freshly allocated output)."""
         if not self._async_h2d_ok(dst):
-            dst.copy_(host)
+            _host_copy_(dst, host)
             return
         if host.dtype != dst.dtype:
             # Downcast on the CPU into a pinned slot, then a same-dtype
@@ -457,7 +570,7 @@ class HTCCLUcxTransport:
             dn_key = key + ":dn"
             self._slot_guard(dn_key)
             down = self._staging(dn_key, dst.numel(), dst.dtype)
-            down.copy_(host)
+            _host_copy_(down, host)
             host, key = down, dn_key
         dst.copy_(host, non_blocking=True)
         ev = self._h2d_events.get(key)
@@ -540,7 +653,9 @@ class HTCCLUcxTransport:
         while off < total:
             n = min(self.chunk_bytes, total - off)
             reqs.append(
-                self.worker.post_send(peer, ptr + off, n, _tag(seq, phase, self.rank, idx))
+                self.worker.post_send(
+                    peer, ptr + off, n, _tag(seq, phase, self.rank, idx)
+                )
             )
             off += n
             idx += 1
@@ -550,9 +665,7 @@ class HTCCLUcxTransport:
         self, src: int, ptr: int, total: int, seq, phase, chunk0=0
     ) -> list:
         if total <= self.chunk_bytes:
-            return [
-                self.worker.post_recv(ptr, total, _tag(seq, phase, src, chunk0))
-            ]
+            return [self.worker.post_recv(ptr, total, _tag(seq, phase, src, chunk0))]
         reqs = []
         off, idx = 0, chunk0
         while off < total:
@@ -656,7 +769,7 @@ class HTCCLUcxTransport:
         # be summed into until every send has completed reading it.
         self._exchange_all(host, recvs, seq)
         for view in recvs.values():
-            host.add_(view)
+            _host_add_(host, view)
 
     def _wire_all_reduce_ring(self, host: torch.Tensor, seq: int) -> None:
         """Ring reduce-scatter + all-gather. Bandwidth-optimal for large ones.
@@ -677,7 +790,7 @@ class HTCCLUcxTransport:
             reqs = self._post_recv(left, tmp, seq, step)
             reqs += self._post_send(right, blocks[send_idx], seq, step)
             self.worker.wait(reqs)
-            blocks[recv_idx].add_(tmp)
+            _host_add_(blocks[recv_idx], tmp)
 
         for step in range(N - 1):
             send_idx = (self.rank - step + 1) % N
@@ -769,15 +882,13 @@ class HTCCLUcxTransport:
             # below hand this buffer to UCX, which reads it host-side outside
             # any stream order, so the bytes must be resident first. This is
             # the transport's one irreducible drain per all_reduce.
-            send_view.copy_(src)  # (+ upcast)
+            _host_copy_(send_view, src)  # (+ upcast)
             reqs = []
             recv_views = []
             for i, peer in enumerate(peers):
                 rv, rptr, rnbytes = self._slot(rkeys[i], n, dtype)
                 recv_views.append(rv)
-                reqs.append(
-                    self.worker.post_recv(rptr, rnbytes, _tag(seq, 0, peer, 0))
-                )
+                reqs.append(self.worker.post_recv(rptr, rnbytes, _tag(seq, 0, peer, 0)))
             for peer in peers:
                 reqs.append(
                     self.worker.post_send(
@@ -786,7 +897,7 @@ class HTCCLUcxTransport:
                 )
             self.worker.wait(reqs)
             for rv in recv_views:
-                send_view.add_(rv)
+                _host_add_(send_view, rv)
             # Copy-out is non_blocking: its only consumer is the compute
             # stream. This removes the second of the two drains every
             # decode all_reduce used to pay.
@@ -819,9 +930,7 @@ class HTCCLUcxTransport:
             # Receives first, as everywhere else in this file: posting sends
             # first can wedge two peers that post in the same order.
             for i, peer in enumerate(peers):
-                reqs += self._post_recv_bytes(
-                    peer, recvs[i][1], recvs[i][2], seq, 0, k
-                )
+                reqs += self._post_recv_bytes(peer, recvs[i][1], recvs[i][2], seq, 0, k)
             for peer in peers:
                 reqs += self._post_send_bytes(peer, send_ptr, send_nbytes, seq, 0, k)
             return reqs
@@ -879,7 +988,7 @@ class HTCCLUcxTransport:
             # slot, and both the stage-in below and the wire (the NIC writes
             # straight into `host`) rewrite it.
             self._slot_guard("ar")
-            host[:n].copy_(inp.reshape(-1))  # D2H (+ upcast)
+            _host_copy_(host[:n], inp.reshape(-1))  # D2H (+ upcast)
             if padded > n:
                 host[n:].zero_()
 
@@ -957,9 +1066,7 @@ class HTCCLUcxTransport:
             reqs = []
             # Receives first, as everywhere else in this file.
             for i, peer in enumerate(peers):
-                reqs += self._post_recv_bytes(
-                    peer, recvs[i][1], recvs[i][2], seq, 0, k
-                )
+                reqs += self._post_recv_bytes(peer, recvs[i][1], recvs[i][2], seq, 0, k)
             for peer in peers:
                 reqs += self._post_send_bytes(peer, send_ptr, send_nbytes, seq, 0, k)
             return reqs
@@ -981,6 +1088,66 @@ class HTCCLUcxTransport:
                 self._staged_copy(dsts[peer][off : off + count], recvs[i][0], prog)
             self._staged_copy(own[off : off + count], src[off : off + count], prog)
 
+    def _ag_view(self, out_flat: torch.Tensor, input_size, dim: int) -> torch.Tensor:
+        """View a flat ``world * numel`` gather result as the caller's shape.
+
+        Shared by every branch that builds the result FLAT. For ``dim == 0``
+        -- the overwhelmingly common gather axis -- this is a single ``view``:
+        no movedim, no reshape.
+        """
+        if dim == 0:
+            return out_flat.view(
+                (self.world_size * input_size[0],) + tuple(input_size[1:])
+                if len(input_size)
+                else (self.world_size,)
+            )
+        return (
+            out_flat.view((self.world_size,) + tuple(input_size))
+            .movedim(0, dim)
+            .reshape(
+                input_size[:dim]
+                + (self.world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
+        )
+
+    def _ring_all_gather(self, inp: torch.Tensor, n: int, seq: int) -> torch.Tensor:
+        """Ring all_gather over one host-side ``(world, n)`` staging block.
+
+        Taken above ``SGLANG_HTCCL_UCX_AG_RING_KIB`` (32 KiB, measured -- see
+        the table there). Note that this ring saves no bytes: an all_gather
+        must deliver ``(W-1) * n`` into every rank and the flat exchange
+        already moves exactly that in one round trip, where
+        ``_wire_all_reduce_ring`` halves its volume. What it saves is
+        concurrent work for the one single-threaded UCX worker per rank --
+        two outstanding requests per step instead of ``2(W-1)`` at once.
+        """
+        N = self.world_size
+        dtype = inp.dtype
+        # One contiguous (world, n) host block: rows are the wire units and
+        # the whole thing is one H2D copy-out at the end.
+        host = self._staging("ag_ring", N * n, dtype)
+        self._slot_guard("ag_ring")
+        rows = host.view(N, n)
+        # BLOCKING on purpose, like every other stage-in here: UCX reads this
+        # buffer host-side, outside any stream order.
+        _host_copy_(rows[self.rank], inp.reshape(-1))
+
+        right = (self.rank + 1) % N
+        left = (self.rank - 1) % N
+        for step in range(N - 1):
+            # Forward the row received in the previous step; after W-1 steps
+            # every row has travelled the whole ring exactly once.
+            send_idx = (self.rank - step) % N
+            recv_idx = (self.rank - step - 1) % N
+            reqs = self._post_recv(left, rows[recv_idx], seq, step)
+            reqs += self._post_send(right, rows[send_idx], seq, step)
+            self.worker.wait(reqs)
+
+        out_flat = torch.empty(N * n, dtype=dtype, device=inp.device)
+        self._h2d_async(out_flat, host, "ag_ring")
+        return out_flat
+
     def htccl_all_gather(self, comm, inp: torch.Tensor, dim: int) -> torch.Tensor:
         """Concatenate every rank's ``inp`` along ``dim``.
 
@@ -995,6 +1162,15 @@ class HTCCLUcxTransport:
             inp = inp.contiguous()
             input_size = inp.size()
             n = inp.numel()
+
+            if (
+                self.ag_ring_bytes
+                and self.world_size > 2
+                and (n * inp.dtype.itemsize >= self.ag_ring_bytes)
+            ):
+                return self._ag_view(
+                    self._ring_all_gather(inp, n, seq), input_size, dim
+                )
 
             if self.pipeline and n <= max(self.chunk_bytes // inp.dtype.itemsize, 1):
                 # Single-chunk fast path: the same one-step flat exchange as
@@ -1017,7 +1193,7 @@ class HTCCLUcxTransport:
                 # posts below hand this buffer to UCX, which reads it
                 # host-side outside any stream order. The transport's one
                 # irreducible drain per all_gather (was one of four).
-                send_view.copy_(src)
+                _host_copy_(send_view, src)
                 reqs = []
                 recv_views = []
                 for i, peer in enumerate(self._peers):
@@ -1050,28 +1226,14 @@ class HTCCLUcxTransport:
                 if 0 < self.progress_bytes < n * inp.dtype.itemsize:
                     self._staged_copy(rows[self.rank], src, self.worker.progress)
                 else:
-                    rows[self.rank].copy_(src)
+                    _host_copy_(rows[self.rank], src)
                 self.worker.wait(reqs)
                 # Peer-row copy-outs are non_blocking: their only consumer
                 # is the compute stream. These three (W-1) copies were 3 of
                 # the 4 drains every decode all_gather used to pay.
                 for i, peer in enumerate(self._peers):
                     self._h2d_async(rows[peer], recv_views[i], rkeys[i])
-                if dim == 0:
-                    return out_flat.view(
-                        (self.world_size * input_size[0],) + tuple(input_size[1:])
-                        if len(input_size)
-                        else (self.world_size,)
-                    )
-                return (
-                    out_flat.view((self.world_size,) + tuple(input_size))
-                    .movedim(0, dim)
-                    .reshape(
-                        input_size[:dim]
-                        + (self.world_size * input_size[dim],)
-                        + input_size[dim + 1 :]
-                    )
-                )
+                return self._ag_view(out_flat, input_size, dim)
 
             output = torch.empty(
                 (self.world_size,) + tuple(input_size),
@@ -1085,7 +1247,7 @@ class HTCCLUcxTransport:
                 # Pre-pipelining path, kept verbatim as the A/B control
                 # (SGLANG_HTCCL_UCX_PIPELINE=0).
                 send = self._staging("ag_s", n, inp.dtype)
-                send.copy_(inp.reshape(-1))
+                _host_copy_(send, inp.reshape(-1))
                 recvs = {
                     p: self._staging(f"ag_r{p}", n, inp.dtype)
                     for p in range(self.world_size)
@@ -1094,7 +1256,7 @@ class HTCCLUcxTransport:
                 self._exchange_all(send, recvs, seq)
                 for p in range(self.world_size):
                     src = send if p == self.rank else recvs[p]
-                    output[p].reshape(-1).copy_(src)
+                    _host_copy_(output[p].reshape(-1), src)
 
             output = output.movedim(0, dim)
             return output.reshape(
@@ -1267,8 +1429,16 @@ class HTCCLUcxTransport:
                 reqs += self._post_send_bytes(peer, send[1], send[2], seq, 0)
             self.worker.progress()
             return _UcxAsyncHandle(
-                "all_reduce", seq, reqs, send, recvs,
-                tuple(inp.shape), inp.dtype, inp.device, n, None,
+                "all_reduce",
+                seq,
+                reqs,
+                send,
+                recvs,
+                tuple(inp.shape),
+                inp.dtype,
+                inp.device,
+                n,
+                None,
             )
 
     def all_gather_async(self, comm, inp: torch.Tensor, dim: int) -> "_UcxAsyncHandle":
@@ -1291,8 +1461,16 @@ class HTCCLUcxTransport:
                 reqs += self._post_send_bytes(peer, send[1], send[2], seq, 0)
             self.worker.progress()
             return _UcxAsyncHandle(
-                "all_gather", seq, reqs, send, recvs,
-                tuple(inp.shape), inp.dtype, inp.device, n, dim,
+                "all_gather",
+                seq,
+                reqs,
+                send,
+                recvs,
+                tuple(inp.shape),
+                inp.dtype,
+                inp.device,
+                n,
+                dim,
             )
 
     def wait_async(self, handle: "_UcxAsyncHandle") -> torch.Tensor:
@@ -1347,9 +1525,7 @@ class HTCCLUcxTransport:
                 # fast path; own slice from the STAGED copy (see OWNERSHIP).
                 W = self.world_size
                 n = handle.n
-                out_flat = torch.empty(
-                    W * n, dtype=handle.dtype, device=handle.device
-                )
+                out_flat = torch.empty(W * n, dtype=handle.dtype, device=handle.device)
                 rows = out_flat.view(W, n)
                 if self._async_h2d_ok(out_flat):
                     rows[self.rank].copy_(handle.send[0], non_blocking=True)

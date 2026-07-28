@@ -123,6 +123,7 @@ def _make_transport(log, world=2, rank=0):
     t.rank = rank
     t.chunk_bytes = 4 << 20
     t.ring_bytes = 1 << 30
+    t.ag_ring_bytes = 0
     t.progress_bytes = 0
     t.pipeline = True
     t._lock = threading.Lock()

@@ -107,6 +107,9 @@ def main():
     ap.add_argument("--sizes", default="",
                     help="comma-separated KiB list; replaces the default "
                          "decode-shaped cells and skips the burst sweep")
+    ap.add_argument("--op", default="all_reduce",
+                    choices=("all_reduce", "all_gather"),
+                    help="collective for the --sizes sweep")
     ap.add_argument("--gate", action="store_true",
                     help="exactness gate across the ring threshold instead "
                          "of a timing run: every collective is checked "
@@ -189,9 +192,14 @@ def main():
                 if not torch.equal(g, wg):
                     bad += 1
                     print(f"  MISMATCH all_gather n={n}", flush=True)
-        ring_kib = int(os.environ.get("SGLANG_HTCCL_UCX_RING_KIB", "24"))
+        # Read the thresholds off the transport, not off the environment: the
+        # defaults live in the module, so an env-derived line would report
+        # "off" for a gate run that did exercise the ring.
+        ag_kib = t.ag_ring_bytes // 1024
         print(f"[rank {a.rank}] gate: {bad} mismatches "
-              f"(ring threshold {ring_kib} KiB, world {a.world})", flush=True)
+              f"(all_reduce ring {t.ring_bytes // 1024} KiB, all_gather ring "
+              f"{str(ag_kib) + ' KiB' if ag_kib else 'off'}, "
+              f"world {a.world})", flush=True)
         t.close()
         dist.destroy_process_group()
         return 1 if bad else 0
@@ -201,7 +209,7 @@ def main():
               f"RNDV_THRESH={res['rndv_thresh']} ==", flush=True)
     if a.sizes:
         for kib in [int(x) for x in a.sizes.split(",")]:
-            measure(f"all_reduce/{kib}KiB", kib * 1024, "all_reduce")
+            measure(f"{a.op}/{kib}KiB", kib * 1024, a.op)
         t.close()
         dist.destroy_process_group()
         if a.rank == 0 and a.out:
