@@ -222,6 +222,15 @@ matching claim in `FEATURES_VS_UPSTREAM.md` section 21, predate tasks
   root@<RIG2>:<RIG2_SGLANG_SRC>/sglang/`) and update that file. Syncing only
   the transport file is enough for the CPU-only collective harnesses, which
   import that module alone, and is NOT enough for a model boot.
+- **Bulk transfers to rig 2 (model files, KV extents, tree syncs) go over the
+  40G link, initiated from the Proxmox host — never straight from the
+  container.** The container has no `10.10.10.x` interface, so an rsync
+  started inside it silently rides the 1 GbE LAN and saturates at
+  ~105-118 MB/s; that number in a transfer log is the warning sign. Hop via
+  the host (`ssh <PVE> rsync ... root@<RDMA_R2>:...`, paths under `/spinning`
+  are host-visible) for ~10x. This matters doubly for measurements whose
+  verdict depends on the link (satellite prefill, cross-rig spill): always
+  record which interface carried the payload.
 - The launcher used is `crossrig_launch.sh` / `crossrig_rank.sh` with
   `--nnodes 4 --node-rank 0..3` (one rank per node). `--nnodes 2` is not
   expressible: `server_args` asserts `tp_size % nnodes == 0`, and the split
