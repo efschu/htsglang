@@ -5470,3 +5470,32 @@ Operativ relevant bleibt hier nur:
 - Tests: 19 neue hermetische Tests; Regressions-Sweep quantization/
   model_loader/moe_offload auf dem gemergten HEAD: 228 passed / 5 skipped
   (GPU-only) / 0 failed. Marker-Gate 0 auf allen drei Kern-Dateien.
+
+## #214 Rig-Kopplung: Urteils-Schicht (feat/rig-coupling-214, gemergt)
+
+- Delta ehrlich gerahmt (PR-Check zuerst): Pairing-SEQUENZ existierte schon
+  (rigmon/pairing.py, /api/rig_pair/*, Tab-Anbindung) — NEU ist die
+  URTEILS-Schicht: planner/rig_coupling.py + POST /api/rig_coupling/plan +
+  Anteil im Pair-Tab. #213/#234/Comm-Suite/rejected.py werden gerufen, nicht
+  nachgebaut.
+- Eingang zweiwegig, beide explizit: Pairing-Session nach reach-Schritt ODER
+  eingefuegtes rig-Artefakt v1 (Offline-Pfad = Normalfall hier). Modul oeffnet
+  selbst KEINEN Socket (Tests ersetzen urlopen/create_connection durch Raiser).
+- Gate-Tabelle je Zeile mit Verdikt+Herkunft+Beleg: tree_commit (msgspec-Falle,
+  BLOCK), nccl_colocation (Schwelle 2.30, 2.28.9=WARN/BLOCK je Anforderung),
+  GGUF-sm75 (aus Register), bf16@Turing->float16, flashinfer@Turing->triton,
+  vendor_mixed->HTCCL, transport_available (NCCL-verbs auf RoCE kaputt),
+  cuda_graph, model_fit (Planner ueber Kartenpool, ABSENT ohne Checkpoint),
+  plus alle passenden rejected.py-Zeilen mit Gegen-Nummer.
+- Transportwahl je Nachrichtenklasse (§4.3.1); measured NUR aus Cross-Rig-
+  Draht-Zeilen — Loopback-UCX wird als Draht-Beleg explizit ABGELEHNT (eigener
+  Test). Kartenpool dual-group-geformt: pool.cards + lane_candidates (je Rig +
+  eine Cross-Lane; blocked_by trifft nur die Cross-Lane).
+- Host-only-Reste als kopierbare Kommandos mit Platzhaltern + rig-env.sh;
+  Test erzwingt, dass keine echte Adresse ueberlebt.
+- Tests: 54 neue hermetisch; planner-Suite auf gemergtem HEAD 1412/64/0.
+  Marker-Gate 0 (webui, rig_coupling, runbook §8.9 neben §8.8 sauber).
+- OFFEN (Live-Fenster): echtes Rig 2 — rigmon-Aggregator dort, Comm-Suite-Lauf
+  + Artefakt-Import, ein Host-Runner-Fenster link_collective_cost ueber 40G
+  (Minuten, KEINE Karten — CPU-Tensoren); reach-Formannahme der fernen rigmon
+  weiter unbewiesen (Erbe der Etappe 4).
