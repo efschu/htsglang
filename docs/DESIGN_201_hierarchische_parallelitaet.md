@@ -1530,3 +1530,24 @@ FALSIFIKATOR (auf diesem Rig moeglich, ohne 4 gleiche Karten):
     als Metrik (dir1-Methodik).
 Einreihung: NACH Lane-Spec-Runde 3 und GDR-Fenster; (a) ist GPU-leicht und
 kann in ein bestehendes Fenster huckepack.
+
+PRIO-Nachtrag 11 (Nutzer 2026-07-28, Pfad-Dispatcher x Mehrfach-Gruppen):
+Der groessen-/lastbewusste Comm-Pfad-Dispatcher (Task #279, Folge aus der
+GDR-Matrix #278) MUSS in der Mehrfach-Gruppen-Runtime funktionieren und mit
+allem Bestand kompatibel sein (Nutzer-Wort). Architektur-Konsequenzen:
+(1) Dispatcher-Zustand lane-keyed, nie prozessweit (GraphSharedOutput-Lehre
+    der Geteilte-Puffer-Familie).
+(2) Das Saettigungssignal ist GRUPPENWEIT: mehrere Lanes teilen dieselbe
+    NIC und denselben RAM-Pfad — der Dispatcher aggregiert die Queue-Tiefen
+    aller Lanes und wird damit der gemeinsame Comm-Arbiter der Gruppen.
+    Das zahlt direkt auf die Slice-D-Zielfunktion ein (saettigende Lasten
+    nicht paaren): Slice D entscheidet WO Lasten laufen, der Dispatcher
+    entscheidet WORUEBER sie kommunizieren — gleiche Eingangsdaten
+    (Paar-Matrix, Umschlagpunkte), zwei Entscheidungsebenen.
+(3) Ueberlauf respektiert die Prioritaetsklassen aus Nachtrag 5 (PD-Verkehr
+    vor Main-Verkehr, Summen-Invarianz bleibt Testkriterium).
+(4) Graph-Safety als hartes Tor: Pfadwahl capture-stabil oder graph-sichere
+    Indirektion — Nachtrag-3-Regel (Lanes behalten Graphs+MTP) gilt.
+Eingangsdaten kommen aus #278 (Umschlagpunkte je Pfad x Richtung x Karte,
+HOL-p99-Faktor aus dem Mix-Szenario, V5-Serialisierung); Baustart erst nach
+deren Bericht.
