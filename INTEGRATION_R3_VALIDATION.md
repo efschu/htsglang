@@ -5061,3 +5061,17 @@ hosts); hybrid GDN splits its KV by FULL-ATTENTION layers, not layers (14/10 gav
 num_hidden_layers alone sizes every hybrid wrong); world-MIN on max_total_num_tokens
 remains the biggest open item (113671 both stages). Slice 3 revised 4-6 days, all
 intra-rig developable, cross-check via pp_crossrig_launch.sh.
+
+# t255 solo-5090 E2E attempt — vehicle verdict: 27B-FP8 does not boot solo (final)
+
+Three OOM boots with a context- AND fraction-independent signature: PyTorch-allocated
+memory pinned at ~28.5 GiB (weights + NEXTN spec + decode graphs) before the KV/
+workspace allocator requests its 2.37 GiB — ctx 8192/6144 and fraction 0.90/0.86
+(with expandable_segments) all identical. User verdict recorded in the register and
+runbook: TP >= 2 only; solo-direction tests pick a smaller model (no small FP8
+checkpoint exists locally). The kernel result stands on direct measurement:
+down-proj M=4 -45.6 %, gate_up M=4 -17.9 % (c626de2e52). E2E continuation moved to
+the TP=3 production path with the tuned 5090-SHARD configs (N=15872,K=5120 +
+N=5120,K=7936) — expectation honestly bounded by the 68-75 % collective floor; a
+result below the noise floor will be reported as "unter der Nachweisgrenze", with
+the microbench remaining the mechanism-level evidence.
