@@ -4931,3 +4931,23 @@ code. These are the first RTX 5090 entries in configs/ (159 files, zero for
 this card before). Remaining shapes/Ms continue opportunistically via the
 idle tuner (/root/tuner). End-to-end decode confirmation rides along with
 the next regular boot measurement.
+
+# #266 — dual UCX worker: peer-split wins on decode-size collectives, verify floor is host work
+
+Merged d6d4231e5a (fast-forward). `SGLANG_HTCCL_UCX_WORKERS` (default 1, rank-uniform,
+enforced at rendezvous), `SGLANG_HTCCL_UCX_RING_BIDIR` (default 0, A/B control only).
+
+Cross-rig world 4, interleaved within one session, median of run-medians (100 after 20
+warmup): 20-KiB all_reduce 96.2 -> 88.9 us (-7.6 %), all_gather 100.1 -> 92.0 us
+(-8.1 %) — distributions separate at 20 KiB (noise floor +-5 %). 80/128/256 KiB
+unchanged (within +-3.5 %). Bidirectional ring split is a regression (+17 % @80 KiB):
+a ring step is two lock-stepped requests, no concurrency to expose. Byte gate atol 0
+green over the real RDMA path (all_reduce + all_gather, 8..256 KiB incl. ragged tails,
+three configurations, 0 mismatches); default path measured unchanged against base
+c626de2e52. UCC probe: c10d backend not compiled into torch 2.11.0+cu130 — would need
+USE_UCC source builds on both hosts; finding recorded, not attempted.
+
+Closing verdict (register): cross-rig TP is exhausted on this hardware at ~89 us per
+decode all_reduce / ~202 us per verify all_reduce — without GDR on GeForce, host
+staging carries ~86 % of the cost. Runbook 4.3 now recommends WORKERS=2 for cross-rig
+boots.
