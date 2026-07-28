@@ -282,8 +282,11 @@ class TestEnergyRoutePayloads(CustomTestCase):
         self.assertFalse(d["ok"])
         self.assertIn("phases", d["error"])
 
-    def test_index_has_energy_tab(self):
-        self.assertIn("view_energy", webui.INDEX_HTML)
+    def test_index_has_energy_section(self):
+        # Energy calibration is now a section of the merged Data tab, not
+        # its own tab.
+        self.assertIn("view_data", webui.INDEX_HTML)
+        self.assertIn('id="data_energy"', webui.INDEX_HTML)
         self.assertIn("/api/gpu_state", webui.INDEX_HTML)
         self.assertIn("previewScenario", webui.INDEX_HTML)
 
@@ -636,10 +639,12 @@ class TestDashboardV2Index(CustomTestCase):
         ):
             self.assertIn(token, webui.INDEX_HTML, token)
 
-    def test_energy_tab_kept_for_calibration(self):
-        # per-card power CALIBRATION stays in the Energy tab; the live monitor
+    def test_energy_calibration_kept_in_data_tab(self):
+        # per-card power CALIBRATION stays reachable, now as a section of the
+        # merged Data tab (former Energy + Rig data tabs); the live monitor
         # moved to Landing.
-        self.assertIn("view_energy", webui.INDEX_HTML)
+        self.assertIn("view_data", webui.INDEX_HTML)
+        self.assertIn('id="data_energy"', webui.INDEX_HTML)
         self.assertIn("measurePower", webui.INDEX_HTML)
 
 
@@ -2025,14 +2030,27 @@ class TestLiveGraphCapture(CustomTestCase):
 
 
 class TestQualityPermissionNote(CustomTestCase):
-    def test_reminder_banner_at_top_of_quality_tab(self):
-        # User self-reminder: ask in the source reddit thread before making
-        # the chess test public. Must sit inside the quality tab.
-        self.assertIn("quality_permission_note", webui.INDEX_HTML)
-        self.assertIn("ERINNERUNG", webui.INDEX_HTML)
-        qi = webui.INDEX_HTML.index('id="view_quality"')
-        ni = webui.INDEX_HTML.index("quality_permission_note")
-        self.assertGreater(ni, qi)
+    """The pre-publication self-reminder is gone; only a short thanks and the
+    existing reddit reference remain in the quality tab."""
+
+    REDDIT_URL = (
+        "https://www.reddit.com/r/LocalLLaMA/comments/1t53dhp/"
+        "quality_comparison_between_qwen_36_27b/"
+    )
+
+    def test_reminder_note_removed(self):
+        self.assertNotIn("quality_permission_note", webui.INDEX_HTML)
+        self.assertNotIn("ERINNERUNG", webui.INDEX_HTML)
+
+    def test_thanks_and_reddit_reference_remain(self):
+        html = webui.INDEX_HTML
+        qi = html.index('id="view_quality"')
+        qend = html.index("<script>")
+        quality = html[qi:qend]
+        self.assertIn("Thanks", quality)
+        # The existing reddit link/reference survives unchanged -- nothing
+        # new is invented in its place.
+        self.assertIn(self.REDDIT_URL, quality)
 
 
 class TestColocationControls(CustomTestCase):
@@ -3326,16 +3344,20 @@ class TestBenchHistoryRoutes(CustomTestCase):
 class TestConsolidatedNavigation(CustomTestCase):
     """#1/#3/#4: the tab strip IS the workflow, and it has no duplicates.
 
-    The Planner stopped being a tab (its markup is the wizard's expert step)
-    and Landscape stopped being a tab (it was a one-model slice of the Rigs
-    matrix with four permanently-empty measured columns). Both are structural
-    claims that a later edit could quietly undo, so they are pinned here.
+    The Planner stopped being a tab (its markup is the wizard's expert step),
+    Landscape stopped being a tab (it was a one-model slice of the Rigs
+    matrix with four permanently-empty measured columns), Rigs itself
+    stopped being a tab (the matrix + landscape drill-down are now the
+    Guide's last expert-step section), and Energy + Rig data merged into one
+    Data tab (same underlying question: what this rig costs, what it can
+    tell the project). All of these are structural claims that a later edit
+    could quietly undo, so they are pinned here.
     """
 
     # "about" sits last on purpose: it is not a workflow step but the
     # dashboard's own version management (install / update / roll back).
-    ORDER = ["landing", "wizard", "bench", "quality", "explore",
-             "energy", "pair", "share", "history", "about"]
+    ORDER = ["landing", "wizard", "bench", "quality", "data",
+             "pair", "history", "about"]
 
     def test_tab_order_is_the_workflow_order(self):
         html = webui.INDEX_HTML
@@ -3380,16 +3402,26 @@ class TestConsolidatedNavigation(CustomTestCase):
                       "doPlan()", "doIssue(", "loadFlagCatalog"):
             self.assertIn(token, html, token)
 
-    def test_landscape_folded_into_rigs(self):
+    def test_rigs_tab_removed(self):
+        html = webui.INDEX_HTML
+        self.assertNotIn('id="tab_explore"', html)
+        self.assertNotIn('id="view_explore"', html)
+
+    def test_matrix_and_landscape_folded_into_guide(self):
+        # The former Rigs tab (capacity matrix) and, nested inside it, the
+        # former Landscape tab (per-rig detail for one model) both survive
+        # as the Guide's last expert-step section -- nothing rendered on
+        # either former tab was dropped.
         html = webui.INDEX_HTML
         self.assertNotIn('id="tab_landscape"', html)
         self.assertNotIn('id="view_landscape"', html)
-        # its controls survive inside the Rigs tab
-        rigs = html[html.index('<div id="view_explore"'):]
-        rigs = rigs[:rigs.index("<script>")]
-        for token in ('id="ls_model"', 'id="ls_quant"', 'id="ls_bucket"',
-                      'id="ls_store"', 'id="ls_rigs"', "doLandscape()"):
-            self.assertIn(token, rigs, token)
+        guide = html[html.index('<div id="view_wizard"'):]
+        guide = guide[:guide.index("<script>")]
+        for token in ('id="mx_models"', 'id="mx_rigs"', 'id="mx_cards"',
+                      "doMatrix()", 'id="ls_model"', 'id="ls_quant"',
+                      'id="ls_bucket"', 'id="ls_store"', 'id="ls_rigs"',
+                      "doLandscape()"):
+            self.assertIn(token, guide, token)
 
 
 class TestPresetsRemoved(CustomTestCase):
