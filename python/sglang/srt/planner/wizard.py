@@ -49,6 +49,7 @@ import dataclasses
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.planner import rejected as rejmod
+from sglang.srt.planner import wizard_lanes as lanes_mod
 from sglang.srt.planner.bench_factors import ABSENT, ESTIMATE, MEASURED
 
 __all__ = [
@@ -65,6 +66,7 @@ __all__ = [
     "cell",
     "ttft_pair",
     "link_gate",
+    "family_lanes",
     "build_matrix",
     "build_command",
 ]
@@ -536,6 +538,7 @@ def _satellite_ttft(
     context_tokens: int,
     satellite_tok_s: Optional[float],
     transport_s: Optional[float],
+    handshake_s: float = ANCHOR_PD_HANDSHAKE_S,
 ) -> Dict[str, dict]:
     """TTFT of a satellite arm: the satellite's own compute, plus the wire,
     plus the handover. The serving cards' load does not enter it -- that is
@@ -551,11 +554,11 @@ def _satellite_ttft(
         return {"idle": _absent(miss, "s"), "loaded": _absent(miss, "s")}
     ctx = max(int(context_tokens), 1)
     compute = ctx / float(satellite_tok_s)
-    total = compute + float(transport_s or 0.0) + ANCHOR_PD_HANDSHAKE_S
+    total = compute + float(transport_s or 0.0) + float(handshake_s)
     basis = (
         "satellite compute (context / its prefill rate) + transport over the "
         "measured link + the "
-        f"{ANCHOR_PD_HANDSHAKE_S:.3f} s handover measured in " + ANCHOR_STUDY
+        f"{float(handshake_s):.3f} s handover measured in " + ANCHOR_STUDY
         + ". The pair does not split idle from loaded because the serving "
         "cards' load no longer enters it -- that is what this family buys."
     )
@@ -695,7 +698,7 @@ def _variant_reasons(
     fam: FamilySpec,
     spill: str,
     locality: str,
-    ctx: "MatrixContext",
+    ctx: MatrixContext,
 ) -> List[dict]:
     """Why this cell of the matrix cannot exist. Empty means it can.
 
@@ -855,9 +858,43 @@ class MatrixContext:
     #: non-empty ``unbootable`` is a finding, and the family it describes is
     #: refused with that text rather than offered with a number.
     measured: Optional[dict] = None
+    #: ``wizard_links.read_rates`` output. When present it is the AUTHORITY
+    #: for every link, satellite and load figure below; the module constants
+    #: stay as the last rung of its ladder rather than as the first source.
+    #: None keeps the v1 behaviour exactly, which is what the existing tests
+    #: pin.
+    rates: Optional[dict] = None
+    #: Pre-built v2 blocks, computed by the caller because they need disk
+    #: reads this module deliberately does not do. Passed through so that the
+    #: page and ``curl`` see one answer.
+    tipping: Optional[dict] = None
+    offload: Optional[dict] = None
+    islands: Optional[dict] = None
+
+    # -- rate lookup -------------------------------------------------------
+
+    def rate(self, key: str, default: Optional[float] = None) -> Optional[float]:
+        """One resolved rate, or ``default`` when it is absent.
+
+        The single place the matrix reads a link/satellite/load figure. A
+        rate that resolved to ``absent`` returns ``default`` -- which for the
+        anchors is the module constant, and for the cross-rig link is None,
+        so an unmeasured wire stays unmeasured.
+        """
+        row = ((self.rates or {}).get("rates") or {}).get(key) or {}
+        v = row.get("value")
+        return float(v) if v is not None else default
+
+    def rate_source(self, key: str) -> str:
+        row = ((self.rates or {}).get("rates") or {}).get(key) or {}
+        return str(row.get("source") or row.get("way") or "")
 
 
-def _undisturbedness(moves_prefill_off: bool) -> dict:
+def _undisturbedness(
+    moves_prefill_off: bool,
+    spike_ms: float = ANCHOR_DECODE_SPIKE_MS,
+    spike_offloaded_ms: float = ANCHOR_DECODE_SPIKE_OFFLOADED_MS,
+) -> dict:
     """The decode spike, as its own quantity.
 
     Kept out of TTFT deliberately: on this rig the same change that removes
@@ -866,7 +903,7 @@ def _undisturbedness(moves_prefill_off: bool) -> dict:
     """
     if not moves_prefill_off:
         return cell(
-            ANCHOR_DECODE_SPIKE_MS,
+            spike_ms,
             ESTIMATE,
             "prefill chunks share the decode cards, so a long prompt "
             "interrupts the running decodes. The figure is the worst "
@@ -876,11 +913,11 @@ def _undisturbedness(moves_prefill_off: bool) -> dict:
             study=ANCHOR_STUDY,
         )
     return cell(
-        ANCHOR_DECODE_SPIKE_OFFLOADED_MS,
+        spike_offloaded_ms,
         ESTIMATE,
         "prefill no longer runs on the decode cards. The spike does not get "
         "smaller, it disappears: worst inter-token time "
-        f"{ANCHOR_DECODE_SPIKE_MS} -> {ANCHOR_DECODE_SPIKE_OFFLOADED_MS} ms, "
+        f"{spike_ms} -> {spike_offloaded_ms} ms, "
         f"median {ANCHOR_DECODE_MEDIAN_MS} -> "
         f"{ANCHOR_DECODE_MEDIAN_OFFLOADED_MS} ms, measured in " + ANCHOR_STUDY,
         unit="ms",
@@ -921,6 +958,132 @@ def _warm_prefix_note(ctx: MatrixContext, fam: FamilySpec) -> Optional[str]:
         "moving it, so on this workload it dominates every choice on this "
         "page. The store route is viable on a dense checkpoint."
     )
+
+
+#: How many groups a family runs, and what each is for.
+#
+# Nachtrag 8 is a requirement about STRUCTURE, not about behaviour: no
+# two-way hardcoding, ``lane_id`` rather than "the lane", lists rather than
+# pair parameters. So every family says how many lanes it has, even the ones
+# that have exactly one, and the split control of #258 will fill in the card
+# sets of the multi-lane ones rather than introduce a new field.
+#
+# The card SETS of a family whose arms divide the cards are deliberately
+# empty: which cards each arm keeps IS the split control, and that control is
+# not this task. An empty card set with a note is honest; a guessed one would
+# be a recommendation nobody made.
+def family_lanes(fam: FamilySpec, ctx: MatrixContext) -> lanes_mod.LaneSet:
+    """The lane structure of one family."""
+    ordinals = list(range(len(ctx.gpus)))
+    split_note = (
+        "the card set of this arm is the split control (task #258), which is "
+        "not part of this page yet; the lane exists, its cards do not"
+    )
+    if fam.key in ("pd_disjoint", "satellite_prefill"):
+        remote = fam.key == "satellite_prefill"
+        return lanes_mod.LaneSet(
+            (
+                lanes_mod.Lane(
+                    lane_id="prefill",
+                    label=("prefill satellite (remote host)" if remote
+                           else "prefill arm"),
+                    cards=(),
+                    goal="max_prefill",
+                    priority_class=lanes_mod.FOREGROUND,
+                    role="pd",
+                    note=(
+                        "on another machine; this rig's card ordinals do not "
+                        "address it"
+                        if remote
+                        else split_note
+                    ),
+                ),
+                lanes_mod.Lane(
+                    lane_id="decode",
+                    label="decode arm",
+                    cards=tuple(ordinals) if remote else (),
+                    goal="max_decode",
+                    priority_class=lanes_mod.FOREGROUND,
+                    role="main",
+                    note="" if remote else split_note,
+                ),
+            )
+        )
+    if fam.key == "pd_rank_reuse":
+        # The one family whose lanes deliberately SHARE a card: that overlap
+        # is the point of it, and ``LaneSet.co_residence`` is where a reader
+        # finds it rather than in prose.
+        shared = ordinals[:1]
+        return lanes_mod.LaneSet(
+            (
+                lanes_mod.Lane(
+                    lane_id="fast",
+                    label="FAST group (whole model on the strong card)",
+                    cards=tuple(shared),
+                    goal="max_decode",
+                    priority_class=lanes_mod.FOREGROUND,
+                    role="main",
+                ),
+                lanes_mod.Lane(
+                    lane_id="big",
+                    label="BIG group (every card)",
+                    cards=tuple(ordinals),
+                    goal="max_kv",
+                    priority_class=lanes_mod.SCAVENGER,
+                    role="main",
+                    note=(
+                        "shares the strong card with the FAST group; the "
+                        "shared rank's weight shard is byte-identical in both "
+                        "and only its state pool is paid twice"
+                    ),
+                ),
+            )
+        )
+    if fam.key == "extra_solo_session":
+        return lanes_mod.LaneSet(
+            (
+                lanes_mod.Lane(
+                    lane_id="main",
+                    label="the main group",
+                    cards=tuple(ordinals),
+                    priority_class=lanes_mod.FOREGROUND,
+                    role="main",
+                ),
+                lanes_mod.Lane(
+                    lane_id="side",
+                    label="the co-resident side server",
+                    cards=tuple(ordinals[-1:]),
+                    priority_class=lanes_mod.SCAVENGER,
+                    role="side",
+                    note=(
+                        "its own process, its own weights, no share in the "
+                        "main group's collective clock -- and its budget "
+                        "comes out of the card it lands on"
+                    ),
+                ),
+            )
+        )
+    if fam.key == "pp_cross_rig":
+        return lanes_mod.LaneSet(
+            (
+                lanes_mod.Lane(
+                    lane_id="stage0",
+                    label="stage 0 (this rig)",
+                    cards=tuple(ordinals),
+                    priority_class=lanes_mod.FOREGROUND,
+                    role="main",
+                ),
+                lanes_mod.Lane(
+                    lane_id="stage1",
+                    label="stage 1 (the other machine)",
+                    cards=(),
+                    priority_class=lanes_mod.FOREGROUND,
+                    role="main",
+                    note="on another machine; addressed by its own card set",
+                ),
+            )
+        )
+    return lanes_mod.single_lane(ordinals, label="the serving group")
 
 
 def _family_variant(
@@ -1083,34 +1246,47 @@ def _family_variant(
             "lower graph/spec posts on the main group."
         )
 
-    # TTFT, always as the pair.
+    # TTFT, always as the pair. Every rate comes through ``ctx.rate``, whose
+    # last rung is the module anchor -- so a rig that measured its own line
+    # is priced on it and one that did not is priced on the anchor, with the
+    # rate report saying which happened.
+    loaded_fraction = ctx.rate(
+        "loaded_prefill_fraction", LOADED_PREFILL_RATE_FRACTION
+    )
+    handshake_s = ctx.rate("pd_handshake_s", ANCHOR_PD_HANDSHAKE_S)
     prefill_cell = base.get("max_prefill") or {}
     prefill_rate = prefill_cell.get("value") if prefill_cell.get("available") else None
     if fam.key == "satellite_prefill":
         gate = link_gate(
             ctx.kv_bytes_per_token,
             ctx.state_bytes,
-            ctx.link_gbs,
+            ctx.rate("cross_rig_gbs", ctx.link_gbs),
             [ctx.context_tokens],
-            link_source=ctx.link_source,
+            link_source=ctx.rate_source("cross_rig_gbs") or ctx.link_source,
         )
         transport_s = gate["rows"][0]["seconds"] if gate.get("rows") else None
         pair = _satellite_ttft(
-            ctx.context_tokens, ctx.satellite_prefill_tok_s, transport_s
+            ctx.context_tokens,
+            ctx.rate("satellite_prefill_tok_s", ctx.satellite_prefill_tok_s),
+            transport_s,
+            handshake_s=handshake_s,
         )
     elif "pd" in fam.tags:
         pair = ttft_pair(
             prefill_rate,
             ctx.context_tokens,
-            added_s=ANCHOR_PD_HANDSHAKE_S,
+            loaded_fraction=loaded_fraction,
+            added_s=handshake_s,
             basis_extra=(
                 "plus the "
-                f"{ANCHOR_PD_HANDSHAKE_S:.3f} s handover measured in "
+                f"{handshake_s:.3f} s handover measured in "
                 + ANCHOR_STUDY
             ),
         )
     else:
-        pair = ttft_pair(prefill_rate, ctx.context_tokens)
+        pair = ttft_pair(
+            prefill_rate, ctx.context_tokens, loaded_fraction=loaded_fraction
+        )
     targets["ttft"] = {
         "pair": True,
         "idle": pair["idle"],
@@ -1137,7 +1313,13 @@ def _family_variant(
         "feasible": not reasons,
         "reasons": reasons,
         "targets": targets,
-        "undisturbedness": _undisturbedness(moves_prefill_off),
+        "undisturbedness": _undisturbedness(
+            moves_prefill_off,
+            spike_ms=ctx.rate("decode_spike_ms", ANCHOR_DECODE_SPIKE_MS),
+            spike_offloaded_ms=ctx.rate(
+                "decode_spike_offloaded_ms", ANCHOR_DECODE_SPIKE_OFFLOADED_MS
+            ),
+        ),
         "notes": notes,
         "advisories": advisories,
     }
@@ -1179,14 +1361,15 @@ def build_matrix(
                 **fam.to_json(),
                 "feasible": any(v["feasible"] for v in variants),
                 "variants": variants,
+                "lanes": family_lanes(fam, context).to_json(),
             }
         )
     gate = link_gate(
         context.kv_bytes_per_token,
         context.state_bytes,
-        context.link_gbs,
+        context.rate("cross_rig_gbs", context.link_gbs),
         contexts_for_link_gate,
-        link_source=context.link_source,
+        link_source=context.rate_source("cross_rig_gbs") or context.link_source,
     )
     return {
         "ok": True,
@@ -1204,6 +1387,75 @@ def build_matrix(
         "blocked": rejmod.register_json(rejmod.BLOCKED),
         "caveats": list(profiles.get("caveats") or []),
         "plan_fits": (plan or {}).get("fits"),
+        # -- v2 blocks. Each is composed by its own module and passed in by
+        # the caller, because each needs a disk read this module does not do.
+        # An absent block means the caller did not supply it, which is what a
+        # ``curl`` against the v1 shape sees.
+        "rates": context.rates,
+        "tipping_points": context.tipping,
+        "offload_depth": context.offload,
+        "islands": context.islands,
+        "provenance_coverage": _coverage(context, rows),
+    }
+
+
+def _coverage(ctx: MatrixContext, rows: List[dict]) -> dict:
+    """One count of measured / derived / missing over the whole answer.
+
+    The page's own summary of how much of what it just said is a measurement
+    of this rig. It is deliberately computed here, over the rendered rows,
+    rather than accumulated as each block is built: a count that is derived
+    from the output cannot drift from the output.
+    """
+    counts = {MEASURED: 0, ESTIMATE: 0, ABSENT: 0}
+
+    def _count(cell_like) -> None:
+        if isinstance(cell_like, dict) and "provenance" in cell_like:
+            key = str(cell_like["provenance"])
+            if key in counts:
+                counts[key] += 1
+
+    for row in rows:
+        for v in row.get("variants") or []:
+            if not v.get("feasible"):
+                continue
+            for t in (v.get("targets") or {}).values():
+                if isinstance(t, dict) and t.get("pair"):
+                    _count(t.get("idle"))
+                    _count(t.get("loaded"))
+                else:
+                    _count(t)
+            _count(v.get("undisturbedness"))
+    parts = [
+        ("families", counts),
+    ]
+    for name, block in (
+        ("rates", ctx.rates),
+        ("tipping_points", ctx.tipping),
+        ("offload_depth", ctx.offload),
+        ("islands", ctx.islands),
+    ):
+        cov = (block or {}).get("coverage")
+        if cov:
+            parts.append((name, cov))
+    total = {
+        MEASURED: sum(int(c.get(MEASURED, 0)) for _, c in parts),
+        ESTIMATE: sum(int(c.get(ESTIMATE, 0)) for _, c in parts),
+        ABSENT: sum(int(c.get(ABSENT, 0)) for _, c in parts),
+    }
+    n = total[MEASURED] + total[ESTIMATE] + total[ABSENT]
+    return {
+        "by_block": {name: dict(c) for name, c in parts},
+        "measured": total[MEASURED],
+        "estimate": total[ESTIMATE],
+        "absent": total[ABSENT],
+        "total": n,
+        "summary": (
+            f"{total[MEASURED]} of {n} figures on this page are measurements "
+            f"of this rig; {total[ESTIMATE]} are derived from measured "
+            f"inputs, {total[ABSENT]} are absent and name the study that "
+            "would fill them."
+        ),
     }
 
 
