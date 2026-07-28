@@ -454,6 +454,10 @@ class Envs:
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    # PP: log the stage-boundary traffic every N crossings (0 = off). Counts
+    # bytes and wall time at the two chokepoints every crossing passes through,
+    # which is the only way to put a number on a boundary that spans two hosts.
+    SGLANG_PP_BOUNDARY_STATS = EnvInt(0)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)

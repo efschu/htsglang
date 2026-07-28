@@ -46,6 +46,77 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+_PP_STATS_UNSET = object()
+
+
+class PPBoundaryStats:
+    """Byte and wall-time accounting for the pipeline stage boundary.
+
+    Every crossing goes through ``_pp_send_dict_to_next_stage`` or
+    ``_pp_recv_typed_dict``, so these two chokepoints see the whole boundary:
+    the activation proxy (``hidden_states`` + ``residual``) forward, and the
+    ``next_token_ids`` feedback from the last stage back to rank 0.
+
+    The two timings mean different things and are reported separately on
+    purpose:
+
+    * ``send`` is the ENQUEUE cost. With ``async_send=True`` the transfer is
+      handed to ``isend`` and waited on later, so this is not wire time.
+    * ``recv`` is a BLOCKING wait, i.e. pipeline bubble plus wire time. It is
+      an upper bound on the transfer, never the transfer alone.
+
+    The wire cost on its own has to come from a p2p ping-pong on the same
+    group and the same shapes (``scripts/pp/pp_link_pingpong.py``); no
+    in-server counter can separate it from the bubble.
+    """
+
+    __slots__ = ("every", "n", "nbytes", "seconds", "since_log")
+
+    def __init__(self, every: int):
+        self.every = every
+        self.n = {"send": 0, "recv": 0}
+        self.nbytes = {"send": 0, "recv": 0}
+        self.seconds = {"send": 0.0, "recv": 0.0}
+        self.since_log = 0
+
+    @staticmethod
+    def _dict_bytes(tensor_dict: Dict[str, torch.Tensor]) -> int:
+        return sum(
+            v.numel() * v.element_size()
+            for v in tensor_dict.values()
+            if isinstance(v, torch.Tensor)
+        )
+
+    def record(
+        self, kind: str, tensor_dict: Dict[str, torch.Tensor], seconds: float
+    ) -> None:
+        self.n[kind] += 1
+        self.nbytes[kind] += self._dict_bytes(tensor_dict)
+        self.seconds[kind] += seconds
+        self.since_log += 1
+        if self.since_log >= self.every:
+            self.log()
+
+    def log(self) -> None:
+        self.since_log = 0
+        parts = []
+        for kind in ("send", "recv"):
+            n = self.n[kind]
+            if not n:
+                continue
+            parts.append(
+                f"{kind} n={n} "
+                f"{self.nbytes[kind] / n / 1024:.1f} KiB/crossing "
+                f"{self.seconds[kind] / n * 1e6:.1f} us/crossing "
+                f"(total {self.nbytes[kind] / 1024 / 1024:.1f} MiB, "
+                f"{self.seconds[kind]:.3f} s)"
+            )
+        logger.info(
+            "PP boundary: %s [send=enqueue only, recv=bubble+wire]",
+            "; ".join(parts) or "no crossings yet",
+        )
+
+
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
     return (
@@ -1006,6 +1077,19 @@ class SchedulerPPMixin:
             }
         return tensor_dict
 
+    def _pp_boundary_stats(self: Scheduler) -> Optional[PPBoundaryStats]:
+        """The boundary accountant, or None when SGLANG_PP_BOUNDARY_STATS=0.
+
+        Resolved once per scheduler process and cached, so the default path
+        costs one attribute read per crossing and nothing else.
+        """
+        stats = getattr(self, "_pp_boundary_stats_obj", _PP_STATS_UNSET)
+        if stats is _PP_STATS_UNSET:
+            every = envs.SGLANG_PP_BOUNDARY_STATS.get()
+            stats = PPBoundaryStats(every) if every > 0 else None
+            self._pp_boundary_stats_obj = stats
+        return stats
+
     def _pp_send_dict_to_next_stage(
         self: Scheduler,
         tensor_dict: Dict[str, torch.Tensor],
@@ -1020,6 +1104,8 @@ class SchedulerPPMixin:
             )
         tensor_dict["__msg_type__"] = msg_type
         p2p_work = []
+        stats = self._pp_boundary_stats()
+        started = time.perf_counter() if stats else 0.0
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
@@ -1029,6 +1115,8 @@ class SchedulerPPMixin:
                 async_send=async_send,
             )
         )
+        if stats:
+            stats.record("send", tensor_dict, time.perf_counter() - started)
         return p2p_work
 
     def _pp_recv_typed_dict(
@@ -1046,10 +1134,14 @@ class SchedulerPPMixin:
             if inbox_queue:
                 return inbox_queue.popleft()
 
+        stats = self._pp_boundary_stats()
         while True:
+            started = time.perf_counter() if stats else 0.0
             tensor_dict = self.pp_group.recv_tensor_dict(
                 all_gather_group=all_gather_group
             )
+            if stats:
+                stats.record("recv", tensor_dict, time.perf_counter() - started)
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
                 if received_kind == "default":

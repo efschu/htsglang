@@ -746,6 +746,167 @@ the same load), ~53 ms is the 98 MiB transfer, and ~136 ms is handshake and
 scheduling. On a satellite whose prefill rate is close to the main card's,
 this trade turns positive; the transport is not what stands in the way.
 
+### 4.9 Pipeline parallelism CROSS-RIG, stage 1 on rig 2 (#201 slice 2)
+
+The stage boundary of section 4.7, moved onto the 40G line: stage 0 on a rig-1
+3080, stage 1 on rig 2's 2080 Ti, `--pp-layer-ratio` deciding the split.
+Measured 2026-07-28 on `Qwen3.5-4B` (safetensors, fp16), `--pp-layer-ratio
+20,12`.
+
+```bash
+source /root/rig-env.sh
+# from the dev container; it starts both nodes over ssh and returns bounded
+MODEL_NAME=Qwen3.5-4B RATIO=20,12 CTX=16384 MEMFRAC=0.85 \
+  scripts/pp/pp_crossrig_launch.sh
+```
+
+`scripts/pp/pp_crossrig_rank.sh` is the per-node launcher; it carries the env
+below. `scripts/pp/pp_link_pingpong.py` measures the boundary payload on the
+wire alone, and `scripts/pp/pp_measure.py` drives a running server.
+
+**No HTCCL, and that is the whole reason this slice was cheap.** PP's transport
+is `torch.distributed.isend/irecv` on the NCCL `device_group` plus gloo for the
+pickled metadata (`parallel_state.send_tensor_dict`). HTCCL exists for
+cross-VENDOR groups; both cards here are NVIDIA. Nothing is host-staged, so —
+unlike the cross-rig TP=4 recipe in 4.3 — **CUDA graphs stay on, on both
+stages, including the sm75 one** (`cuda graph: True` in the rig-2 decode lines).
+That is the structural difference between the two cross-rig shapes, not a
+tuning detail.
+
+Boot to "fired up" in 42 s, decode **55.1 tok/s** (18.2 ms/token, median of
+three), 8k-token prefill TTFT 3.4 s, output coherent over the full window.
+
+**Measure it against the same model on one card, not against 4.7.** The 44.2
+tok/s in 4.7 is a 27B-Q3 GGUF on a 5090+3080 and answers a different question.
+The control that answers this one is Qwen3.5-4B monolithic on the same 3080,
+same dtype, backend, context and flags:
+
+| arm | cards | decode | ms/token | 8k prefill TTFT |
+|---|---|---|---|---|
+| monolithic | 1x 3080 | 67.6 tok/s | 14.80 | 1.35 s |
+| cross-rig PP=2, 20/12 layers | 3080 + 2080 Ti | 55.1 tok/s | 18.16 | 3.42 s |
+
+The pipeline costs **18 % of decode and 2.5x the prefill TTFT** against the
+faster card alone. That is the expected sign, not a defect: PP does not beat a
+card the model already fits on — it buys the capacity to run one that does not.
+Only ~0.4 ms of the 3.4 ms/token difference is the boundary (see the table
+below); the rest is the 2080 Ti computing its twelve layers more slowly, and
+the bubble, which `--disable-overlap-schedule` (forced under PP) cannot hide for
+a single request.
+
+A-vs-A noise floor, same arm run twice: **0.2 %** (2B), **1.1 %** (monolithic
+4B), **2.1 %** (cross-rig PP). Nothing below ~2 % is reportable here.
+
+The third arm — the same two cards as a flat cross-rig **TP=2** group — has no
+number because it does not come up on plain NCCL. Two attempts: the first died
+on rig 2 with `AttributeError: 'str' object has no attribute
+'local_reader_ranks'` (the message-queue broadcaster, which 4.3 disables with
+`SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=0` for exactly this reason); with that
+set, rank 0's scheduler exits silently during `init_distributed` while rank 1
+sits in `all_reduce` forever (`py-spy`: `distributed_c10d.py:3075`). That is why
+4.3's cross-rig TP recipe runs on HTCCL/UCX rather than NCCL — and HTCCL is
+host-staged, so it forces eager. **The pipeline needs neither the broadcaster
+workaround nor HTCCL, and keeps its CUDA graphs.** Under PP each node holds
+`tp_size=1`, so no TP group ever spans the two hosts; that is the structural
+reason, not luck.
+
+**The vehicle is not free choice.** GGUF does not run on sm75 at all (4.8), so
+the 27B-Q3 checkpoint of 4.7 cannot take the rig-2 stage; and no Qwen3.5-9B
+safetensors exists on this rig, only its GGUF. Qwen3.5-4B is the largest
+safetensors checkpoint present on BOTH rigs, and per 4.8 the one that does not
+fit the 2080 Ti alone — so the pipeline buys something the card cannot do by
+itself. Turing has no bf16, so `--dtype float16` on both stages.
+
+Things that decide whether this boots at all:
+
+- **NCCL's verbs path is broken on this fabric; sockets on the same interface
+  are not.** With `NCCL_IB_HCA=rocep*s0f1 NCCL_IB_GID_INDEX=3` the first
+  5120-byte proxy tensor comes back as `IBV_WC_REM_INV_REQ_ERR(9) ...
+  req_type=Send ... hca rocep1s0f1` and the communicator dies, while UCX drives
+  the same two HCAs fine for HTCCL (4.3). `NCCL_IB_DISABLE=1` with
+  `NCCL_SOCKET_IFNAME` on the RoCE interface measures 2.07 GB/s — i.e. the
+  40G line, not the 1 GbE (0.105 GB/s, 4.8). This is the default in the rank
+  script; `NCCL_IB=1` re-arms verbs for whoever wants to chase it. For a
+  boundary that moves 10 KiB per decode microbatch, verbs would buy latency,
+  not bandwidth.
+- **Every plane must be pinned to `10.10.10.x` by name**: `--dist-init-addr
+  <RDMA_R1>:<port>`, `GLOO_SOCKET_IFNAME`, `TP_SOCKET_IFNAME`,
+  `NCCL_SOCKET_IFNAME`. Unpinned, gloo takes the default route — the 1 GbE —
+  and the run silently describes the wrong wire.
+- **`--rank-gpu-id` is rejected for `nnodes > 1`, and that rejection is
+  correct**: a world-length vector cannot name a device on another host. Each
+  node picks its card with `CUDA_VISIBLE_DEVICES` and `--base-gpu-id 0`. That
+  also leaves exactly one visible device per process, which is what the
+  mixed-architecture PDL constant needs (4.7) — the trap that recipe documents
+  cannot fire here.
+- **Multi-node PP needed no new code.** `_calculate_rank_ranges(nnodes=2,
+  pp_size=2, tp_size=1)` already puts `pp_rank 0` on node 0 and `pp_rank 1` on
+  node 1, and `check_server_args` asserts `(tp_size * pp_size) % nnodes == 0`,
+  which 2 % 2 satisfies. The `nnodes=2` that 4.3 calls "not expressible" is a
+  statement about a 3+1 TP split, not about pipelines.
+- **`--attention-backend triton` on the rig-2 stage** — flashinfer's prefill
+  asks 65616 B of shared memory against Turing's 65536 at `head_dim 256`, which
+  every Qwen3.5 size has. The backend is a per-process choice and the stages
+  share no KV pool, so the stages may differ; the numbers above are triton on
+  both, to keep one variable out.
+- **Both hosts must run the same tree**, whole `python/sglang`, not just the
+  changed file — the msgspec trap of 4.3 applies unchanged. Sync from the PVE
+  host over `10.10.10.2` (a rsync started in the container rides the 1 GbE),
+  and update `SYNCED_COMMIT.txt`.
+
+**What the boundary costs.** `scripts/pp/pp_link_pingpong.py`, NCCL sockets on
+the 40G line, `hidden_size` 2560 fp16, one-way = half a round trip:
+
+| microbatch tokens | payload | NCCL 1-way | p90 | gloo metadata |
+|---|---|---|---|---|
+| 1 (bs=1 decode) | 10.0 KiB | 142 us | 173 us | 249 us |
+| 4 | 40.0 KiB | 178 us | 264 us | 282 us |
+| 64 | 640 KiB | 632 us | 684 us | 321 us |
+| 512 | 5.0 MiB | 3.17 ms | 4.17 ms | 315 us |
+| 2048 (chunked-prefill chunk) | 20.0 MiB | 10.25 ms | 12.48 ms | 486 us |
+| 8192 | 80.0 MiB | 39.48 ms | 46.09 ms | 569 us |
+
+Two things follow, and the second is the actionable one:
+
+- The decode boundary is **~0.4 ms of an 18.2 ms round**, ~2 %. The link is not
+  what a cross-rig pipeline pays for; the stage compute and the bubble are.
+  This is the same conclusion the design document reached from the byte counts,
+  now measured on the wire.
+- **At bs=1 the pickled metadata costs MORE than the payload** — 249 us against
+  142 us, 64 % of the boundary. `send_tensor_dict` sends a size tensor plus a
+  pickled payload over gloo ahead of every crossing, although the shapes are
+  static per batch size. Caching it is the cheapest remaining win at the
+  boundary and belongs in slice 3.
+
+`SGLANG_PP_BOUNDARY_STATS=<N>` logs the in-server view every N crossings, from
+the two chokepoints every crossing passes through. On the 4B run above:
+
+```
+PP0  send n=6267 43.9 KiB/crossing 166 us (enqueue);  recv n=3133  0.0 KiB 1777 us
+PP1  send n=3133  0.0 KiB/crossing 179 us (enqueue);  recv n=6267 43.9 KiB 9201 us
+```
+
+Read it with the labels the log prints: `send` is enqueue only (the transfer is
+`isend`, waited on later) and `recv` is BLOCKING, i.e. bubble plus wire — 9.2 ms
+on stage 1 is that stage waiting for stage 0, not the 40G line. The 43.9 KiB
+average is a mix: 10.0 KiB per decode crossing and 20 MiB per 2048-token prefill
+chunk. Stage 0 sends exactly twice as often as it receives, because two
+microbatches are in flight (`pp_loop_size = pp_size`) while only one carries a
+request.
+
+**A hybrid GDN model splits its KV by FULL-ATTENTION layers, not by layers.**
+Qwen3.5 has `full_attention_interval 4`, so `--pp-layer-ratio 14,10` on the 2B
+(24 layers) puts full-attention layers 3/7/11 on stage 0 and 15/19/23 on stage
+1 — three each, and both stages reported an identical `K size: 1.17 GB` despite
+the 14:10 layer split. The 4.7 observation that "KV follows the layer split
+exactly" holds for a dense model; under a hybrid the ratio to plan against is
+the count of full-attention layers inside each stage window. A split planner
+that reads `num_hidden_layers` alone will mis-size every hybrid.
+
+`max_total_num_tokens` is still min-reduced across the WORLD group (113671 on
+both stages here), so the tighter stage sets the capacity for both — the open
+slice-3 item from 4.7, unchanged by going cross-rig.
+
 
 ## 5. Credentials
 
