@@ -73,6 +73,7 @@ Without these, three genuinely different GPUs cannot be combined into one usable
 | [19](#f19) | Broad model bring-up under asymmetric-TP | Boot-checked | n/a | n/a | n/a | n/a |
 | [14](#f14) | Single-node PD disaggregation | Boot-checked | yes (base) | yes (base) | no | no |
 | [12](#f12) | Weightless-KV lane | Cross-checked | no | no | no | no |
+| [27](#f27) | Cross-rig uneven pipeline parallelism | Boot-checked | partial | partial | partial | partial |
 
 ### Block 2 — general fork deltas
 
@@ -94,6 +95,7 @@ Everything else, ordered by how much a rig of identical GPUs (1/2/4/8 cards) gai
 | [13](#f13) | Rig dashboard / planner UI | Exp | n/a | n/a | n/a | n/a |
 | [16](#f16) | Fast-lane priority scheduling | Built | partial | partial | no | no |
 | [25](#f25) | Per-message-class link selection | Cross-checked | no | no | no | no |
+| [26](#f26) | Prefill satellite (cross-host PD for hybrid GDN) | Boot-checked | yes (base) | yes (base) | no | no |
 
 ---
 
@@ -863,6 +865,35 @@ Design notes: `docs_new/weightless_kv_role_precision.md`, `docs_new/weightless_c
 
 **Upstream:** no equivalent in sglang.
 
+<a id="f27"></a>
+### 27. Cross-rig uneven pipeline parallelism
+
+`--pp-layer-ratio` extended across hosts (`scripts/pp/pp_crossrig_launch.sh`) — the two
+pipeline stages run on different machines over the 40G RoCE line, each stage sized by
+the ratio rather than an equal layer split, so a stage can go to whichever physical GPU
+a host actually has, fast or slow, without needing HTCCL: under PP each node holds
+`tp_size=1`, so no TP group ever spans the two hosts, and the transport is plain
+`torch.distributed.isend`/`irecv` (NCCL) plus gloo for the pickled shape metadata — CUDA
+graphs stay on on both stages, including the sm75 one. **Boot-checked** — merged
+`feat/uneven-pp-slice2` (13c55d7b86).
+
+| Item | Detail |
+|---|---|
+| Vehicle | Qwen3.5-4B fp16, `--pp-layer-ratio 20,12`, stage 0 on a rig-1 3080, stage 1 on rig 2's 2080 Ti, task #201 slice 2 |
+| Cost, honestly bounded | 55.1 tok/s / 18.16 ms per token against a 67.6 tok/s / 14.80 ms monolithic control on the same 3080 (8k-prompt TTFT 3.42 s against 1.35 s; A-vs-A noise floor 1.1-2.1%) — 18% of decode and 2.5x the prefill TTFT against the faster card alone. "PP does not beat a card the model already fits on — it buys the capacity to run one that does not" |
+| Where the cost lives | only ~0.4 ms of the 3.4 ms/token difference is the stage boundary itself (NCCL 1-way 142 us at bs=1, p90 173 us); the rest is the slower stage's own compute and the pipeline bubble, which `--disable-overlap-schedule` (forced under PP) cannot hide for a single request. At bs=1 the pickled shape metadata (`send_tensor_dict`) costs more than the payload — 249 us against 142 us, 64% of the crossing; caching it is queued, not built |
+| Why this needed no new collective code | `_calculate_rank_ranges` already placed `pp_rank` per node, and `check_server_args` already asserts `(tp_size * pp_size) % nnodes == 0`. A flat cross-rig TP=2 on the same two cards does not come up at all on plain NCCL (rank 0 dies silently in `init_distributed`, rank 1 hangs in `all_reduce` forever) — the no-number is itself part of the case for row 21's HTCCL/UCX on the TP axis, and for why PP sidesteps it entirely |
+| Hybrid-model correctness | a hybrid-GDN model splits its KV pool by full-attention layers, not by total layer count — a 14:10 layer split gave 3 full-attention layers per stage and an identical KV size on both; a split planner reading `num_hidden_layers` alone sizes every hybrid stage wrong |
+| Fabric finding | NCCL's ibverbs path is broken on this RoCE fabric (`IBV_WC_REM_INV_REQ_ERR` on the first proxy tensor); NCCL over sockets on the same HCA works and measures 2.07 GB/s, the 40G line rather than the 1 GbE fallback (0.105 GB/s) |
+| Open | `max_total_num_tokens` stays min-reduced across the world group, so the tighter stage still caps both, unchanged from the intra-rig slice; a genuinely cross-vendor pipeline (the Vega 64) is unexercised — slice 1 records it as needing HTCCL-p2p later, this slice only crossed two NVIDIA cards |
+
+Recipe: rig-runbook §4.9.
+
+**Upstream:** sglang/vLLM support pipeline parallelism with an even layer split;
+per-stage ratio control for mismatched cards or mismatched hosts does not exist.
+llama.cpp's `--tensor-split`/`--split-mode layer` already gives uneven per-device layer
+splits, single-process only, no multi-node; ik_llama.cpp inherits the same mechanism
+(partial for both).
 
 ---
 
@@ -1173,6 +1204,32 @@ RoCE link with a negative control.
 
 **Upstream:** sglang exposes `--disaggregation-ib-device` for the PD bulk side only; the collective
 plane's device is left to the process-wide `UCX_NET_DEVICES`.
+
+<a id="f26"></a>
+### 26. Prefill satellite (cross-host PD for hybrid GDN)
+
+`scripts/satellite/prefill_offload.py` — a second, physically separate host takes a
+request's prefill over cross-host PD disaggregation (`mooncake_tcp`) while the main rig
+keeps decoding; for a hybrid-GDN model, `setup_state_kv_args` moves the Mamba slot with
+the KV rows, since the obvious-looking alternative (a HiCache L3 store round trip)
+silently does nothing for GDN models — `MambaRadixCache._match_post_processor` truncates
+any prefix match to the deepest node that owns a mamba checkpoint, so a KV-only import
+matches zero tokens and the decode side recomputes the whole prompt. **Boot-checked** —
+merged `feat/prefill-satellite` (e45c51cd02).
+
+| Item | Detail |
+|---|---|
+| Vehicle | Qwen3.5-2B fp16 both sides, 6.5k-token cold prefill, 3 concurrent decode streams, 40G RoCE line, task #212 |
+| Handover proven directly | `cached_tokens=6464` on a decode arm that prefilled nothing; a reused prompt seed is excluded from measurement, since the satellite's own radix cache would otherwise report a falsely warm TTFT |
+| Honest trade-off | satellite pair 2.892 s TTFT against 0.604 s monolithic-under-load, but the running decodes' worst inter-token time drops from 6.54 ms to 3.22 ms — the load spike disappears rather than shrinks. 93.5% of the satellite's TTFT is the 2080 Ti's own prefill compute (2385 against the 5090's 10850 tok/s under the same load), 1.8% transport (98 MiB in ~53 ms over the 40G line); "with a faster satellite card the trade flips; this is a statement about this 2080 Ti, not the method" |
+| Preflight gate | the PD handshake (`try_ensure_parallel_info`) compares only `page_size` and `kv_cache_dtype` — a decode/prefill pair with different weights pairs happily and produces fluent nonsense; `prefill_offload.py preflight` is the check this fork runs before every measurement |
+| Walls found | GGUF does not run on sm75 at all (`sgl_kernel` cubin floor sm_80; the promised loud failure is not implemented, task #269); Qwen3.5-4B does not fit the 2080 Ti (GDN prefill scratch); flashinfer prefill needs 65616 B shared memory at head_dim 256 against Turing's 65536 (triton carries it); `--disaggregation-decode-enable-radix-cache` is a hard error for Mamba models; Docker `--gpus device=N` counts NVML order, not CUDA order |
+
+Recipe: rig-runbook §4.8.
+
+**Upstream:** sglang/vLLM provide base cross-host PD disaggregation; the hybrid-GDN
+Mamba-slot-with-KV handoff, and the honest TTFT-vs-undisturbedness measurement, are the
+fork's delta on top of it. llama.cpp/ik_llama.cpp have no PD disaggregation.
 
 ---
 
