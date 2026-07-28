@@ -1615,8 +1615,18 @@ class FusedMoE(torch.nn.Module):
     def _install_expert_offload(self):
         """Lazily build the per-layer offload cache on first forward, once the
         expert weights are fully loaded/processed. On any error the layer falls
-        back to the resident (default) path and never retries."""
-        from sglang.srt.layers.moe.expert_offload import MoEExpertOffloadCache
+        back to the resident (default) path and never retries.
+
+        #268: the quant-path check below runs BEFORE the try/except so it is a
+        hard boot abort for GGUF-MoE / MoeWNA16 (no load-time offload half),
+        never the silent per-layer fallback used for genuine install failures.
+        """
+        from sglang.srt.layers.moe.expert_offload import (
+            MoEExpertOffloadCache,
+            assert_expert_offload_quant_supported,
+        )
+
+        assert_expert_offload_quant_supported(self.quant_method, self.layer_id)
 
         try:
             cache = MoEExpertOffloadCache(self, self._expert_offload_fraction)

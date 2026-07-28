@@ -119,7 +119,37 @@ class GGUFConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 60 if not _is_musa else 21
+        # #269: sgl-kernel's GGUF cubins are gencode-restricted to sm_80+ (no
+        # PTX fallback), so Turing (sm75; 2080/2080 Ti/T4) holds no code they
+        # can execute (#212). This was previously 60 (Pascal) -- stale, and
+        # low enough that a real sm75 card (capability 75) sailed past it
+        # unnoticed in _enforce_capability_floor's NVIDIA-namespace numeric
+        # path (model_loader/loader.py), so GGUF was only ever caught later,
+        # deep in a kernel launch. supports_current_device() below answers
+        # the same question functionally (via _has_sgl_gguf_kernels) and
+        # takes priority when it has an opinion; this number is the fallback
+        # for when it does not (e.g. that hook returns None off CUDA).
+        return 80 if not _is_musa else 21
+
+    def supports_current_device(self) -> Optional[bool]:
+        """Vendor-first, functional answer for _enforce_capability_floor
+        (#269): does a GGUF cubin actually exist for the card this process is
+        bound to, rather than "is the capability number big enough".
+
+        ``_has_sgl_gguf_kernels`` already records this precisely -- it is
+        False iff importing the sgl-kernel GGUF cubins failed at process
+        start (module import time, above), which is exactly the sm75 case
+        this exists to catch (#212). Reusing it here means the fail-fast gate
+        and the reason the import guard exists can never drift apart.
+
+        None off CUDA (MUSA/NPU/CPU take their own path in
+        _enforce_capability_floor / _get_quantization_config and are not this
+        hook's concern; returning None there defers to get_min_capability()'s
+        MUSA-specific floor above instead of reporting a false negative).
+        """
+        if _is_cuda:
+            return _has_sgl_gguf_kernels
+        return None
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
