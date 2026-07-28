@@ -1193,6 +1193,514 @@ class TestCoresidentCapacity(_Bf16StateEnv):
 
 
 # ---------------------------------------------------------------------------
+# 7c. The hull tree — set-wise nesting over N lanes
+# ---------------------------------------------------------------------------
+
+
+class TestNestingHull(CustomTestCase):
+    """Pairwise-against-the-root is not a proof for a set of lanes.
+
+    The whole point of the set-wise check: two lanes can each nest perfectly
+    inside the same coarse group and be incompatible with EACH OTHER. That
+    class is invisible to any number of pairwise checks against the root, and
+    it is the one these cases pin.
+    """
+
+    MLP = [ks.HullProbe(what="MLP units", units=136, family=None)]
+
+    @staticmethod
+    def _lane(key, ratio, gpus, **kw):
+        return ks.LaneKey(key=key, ratio=tuple(ratio), gpus=tuple(gpus), **kw)
+
+    def test_a_chain_of_three_lanes_has_a_hull(self):
+        # [4,2,1,1] refines [4,2,2] refines [6,2]: each cut set contains the
+        # coarser one's, so one resident weight set serves all three.
+        lanes = [
+            self._lane("fine", [4, 2, 1, 1], [0, 1, 2, 2]),
+            self._lane("mid", [4, 2, 2], [0, 1, 2]),
+            self._lane("coarse", [6, 2], [0, 2]),
+        ]
+        hull = ks.nesting_hull(lanes, self.MLP)
+        self.assertTrue(hull.ok, hull.failures)
+        self.assertEqual(hull.order[0], "coarse")
+        self.assertEqual(hull.parent["coarse"], None)
+        self.assertEqual(hull.parent["mid"], "coarse")
+        self.assertEqual(hull.parent["fine"], "mid")
+
+    def test_two_lanes_nest_in_the_root_and_not_in_each_other(self):
+        # THE set-wise failure class, on the rig's own [6,1,1] group: the two
+        # obvious two-rank lanes share different ranks of it, so their cuts
+        # fall in different places. Each pairwise check passes; the set fails.
+        root = self._lane("main", [6, 1, 1], [0, 1, 2])
+        share_first = self._lane("pd_a", [6, 2], [0, 1])
+        share_last = self._lane("pd_b", [7, 1], [0, 2])
+        self.assertTrue(ks.nesting_hull([root, share_first], self.MLP).ok)
+        self.assertTrue(ks.nesting_hull([root, share_last], self.MLP).ok)
+        hull = ks.nesting_hull([root, share_first, share_last], self.MLP)
+        self.assertFalse(hull.ok)
+        self.assertTrue(any("pd_a vs pd_b" in f for f in hull.failures))
+        self.assertTrue(any("neither cut set contains" in f for f in hull.failures))
+
+    def test_that_failure_holds_wherever_both_pairs_pass(self):
+        # Not a rounding accident: rank 1 of [6,1,1] always holds at least one
+        # unit, so the two lanes' single cuts can never coincide. Restricted
+        # to the unit counts where BOTH pairwise checks pass -- i.e. exactly
+        # the configurations a pairwise-against-the-root solver would wave
+        # through -- the set-wise check fails at every single one.
+        root = self._lane("main", [6, 1, 1], [0, 1, 2])
+        a = self._lane("pd_a", [6, 2], [0, 1])
+        b = self._lane("pd_b", [7, 1], [0, 2])
+        both_pass = coincide = set_fails = 0
+        for units in range(3, 300):
+            probe = [ks.HullProbe(what="MLP units", units=units)]
+            if not ks.nesting_hull([root, a], probe).ok:
+                continue
+            if not ks.nesting_hull([root, b], probe).ok:
+                continue
+            both_pass += 1
+            # Below ~7 units the two ratios round to the SAME split, so the
+            # set is trivially nestable. That is a real coincidence of the
+            # grid, not an exception to the argument, and it is counted
+            # rather than skipped.
+            if ks.partition_cuts(units, [6, 2]) == ks.partition_cuts(units, [7, 1]):
+                coincide += 1
+                self.assertTrue(ks.nesting_hull([root, a, b], probe).ok, units)
+                continue
+            set_fails += 1
+            self.assertFalse(ks.nesting_hull([root, a, b], probe).ok, units)
+        self.assertGreater(both_pass, 100)
+        self.assertLess(coincide, 10)
+        self.assertEqual(set_fails, both_pass - coincide)
+
+    def test_lanes_that_share_no_card_are_not_required_to_nest(self):
+        # Different silicon, different bytes: there is nothing to share, so
+        # demanding nestability would reject configurations that are fine.
+        a = self._lane("a", [6, 2], [0, 1])
+        b = self._lane("b", [7, 1], [2, 3])
+        self.assertTrue(ks.nesting_hull([a, b], self.MLP).ok)
+        self.assertIn(("a", "b"), ks.nesting_hull([a, b], self.MLP).disjoint)
+        strict = ks.nesting_hull([a, b], self.MLP, require_disjoint_lanes_to_nest=True)
+        self.assertFalse(strict.ok)
+
+    def test_the_known_pairwise_class_is_reproduced(self):
+        # The measured claim of DESIGN #121 §3.3, re-derived here: the
+        # [6,1,1] -> [6,2] pair does NOT nest at a substantial minority of the
+        # unit counts a real checkpoint can present.
+        big = self._lane("big", [6, 1, 1], [0, 1, 2])
+        fast = self._lane("fast", [6, 2], [0, 1])
+        bad = [
+            u
+            for u in range(3, 500)
+            if not ks.nesting_hull([big, fast], [ks.HullProbe(what="u", units=u)]).ok
+        ]
+        self.assertGreater(len(bad), 50)
+        self.assertLess(len(bad), 100)
+        self.assertIn(14, bad)  # the worked example of the design note
+
+    def test_a_direction_that_flips_between_dimensions_has_no_tree(self):
+        # A lane coarser on one axis and finer on another cannot be placed in
+        # any tree, and that contradiction is named rather than silently
+        # resolved by whichever probe happened to run last.
+        a = ks.LaneKey(
+            key="a",
+            ratio=(2, 2),
+            gpus=(0, 1),
+            family_ratios=(("vocab", (1, 1, 1, 1)),),
+        )
+        b = ks.LaneKey(
+            key="b",
+            ratio=(1, 1, 1, 1),
+            gpus=(0, 1),
+            family_ratios=(("vocab", (2, 2)),),
+        )
+        hull = ks.nesting_hull(
+            [a, b],
+            [
+                ks.HullProbe(what="MLP", units=8),
+                ks.HullProbe(what="vocab", units=8, family="vocab"),
+            ],
+        )
+        self.assertFalse(hull.ok)
+        self.assertTrue(any("FLIPS" in f for f in hull.failures))
+
+    def test_a_pinned_segmentation_is_checked_as_dual_group_checks_it(self):
+        # Two questions, deliberately kept apart: "is there ANY grouping under
+        # which these nest" (the hull's default) and "does THE grouping I am
+        # about to install nest" (what dual_group asks). At 4 units the
+        # [6,1,1]/[6,2] pair answers yes to the first and no to the second.
+        probe = [ks.HullProbe(what="u", units=4)]
+        big = self._lane("big", [6, 1, 1], [0, 1, 2])
+        free = self._lane("fast", [6, 2], [0, 1], nests_in="big")
+        self.assertTrue(ks.nesting_hull([big, free], probe).ok)
+        pinned = ks.LaneKey(
+            key="fast",
+            ratio=(6, 2),
+            gpus=(0, 1),
+            nests_in="big",
+            shared_segments=((0,), (1, 2)),
+        )
+        hull = ks.nesting_hull([big, pinned], probe)
+        self.assertFalse(hull.ok)
+        self.assertTrue(any("pinned segmentation" in f for f in hull.failures))
+
+    def test_the_pinned_mode_agrees_with_dual_group_exactly(self):
+        # The planner and the runtime must not hold two different opinions
+        # about what nests. Pinned, this module reproduces
+        # ``dual_group.nesting_failures`` at EVERY unit count -- 67 of 497 for
+        # the rig's [6,1,1] -> [6,2] pair, of which the 2 unsplittable counts
+        # are why DESIGN #121 records 65.
+        from sglang.srt.distributed.dual_group import (
+            NestedGroupPlan,
+            NestingProbe,
+            nesting_failures,
+        )
+
+        plan = NestedGroupPlan(big_ratio=(6, 1, 1), segments=((0,), (1, 2)))
+        big = self._lane("big", [6, 1, 1], [0, 1, 2])
+        pinned = ks.LaneKey(
+            key="fast",
+            ratio=(6, 2),
+            gpus=(0, 1),
+            nests_in="big",
+            shared_segments=((0,), (1, 2)),
+        )
+        free = self._lane("fast", [6, 2], [0, 1], nests_in="big")
+        pinned_bad, free_bad, runtime_bad = [], [], []
+        for units in range(1, 498):
+            probe = [ks.HullProbe(what="u", units=units)]
+            if not ks.nesting_hull([big, pinned], probe).ok:
+                pinned_bad.append(units)
+            if not ks.nesting_hull([big, free], probe).ok:
+                free_bad.append(units)
+            if nesting_failures(plan, [NestingProbe(what="u", units=units)]):
+                runtime_bad.append(units)
+        self.assertEqual(pinned_bad, runtime_bad)
+        self.assertEqual(len(runtime_bad), 67)
+        self.assertEqual(len([u for u in runtime_bad if u > 2]), 65)
+        # And the ONE documented divergence: with the segmentation left free,
+        # four counts nest under the OTHER grouping ([0,1],[2] instead of
+        # [0],[1,2]). Different question, different answer, both correct.
+        self.assertEqual(sorted(set(runtime_bad) - set(free_bad)), [3, 4, 5, 6])
+        self.assertEqual(sorted(set(free_bad) - set(runtime_bad)), [])
+
+    def test_a_solved_unit_vector_is_the_split_not_a_ratio(self):
+        # A kv_donor rank holds ZERO units, which partition_units cannot
+        # express (it gives every rank at least one). Re-splitting a solved
+        # key would compare the lane against a partition nobody installs.
+        self.assertEqual(ks.partition_cuts(136, [118, 0, 18]), (0, 118, 118, 136))
+        self.assertEqual(ks.partition_cuts(136, [136, 0]), (0, 136, 136))
+        # And a genuine ratio still goes through the fork's own rounding.
+        self.assertEqual(
+            ks.partition_cuts(14, [6, 1, 1]),
+            (0, 10, 12, 14),
+        )
+
+    def test_duplicate_lane_keys_are_refused(self):
+        a = self._lane("a", [6, 2], [0, 1])
+        hull = ks.nesting_hull([a, a], self.MLP)
+        self.assertFalse(hull.ok)
+        self.assertIn("duplicate", hull.failures[0])
+
+
+class TestSetWiseBounds(CustomTestCase):
+    """``nesting_bounds`` is the N=1-outer case of ``nesting_bounds_over``."""
+
+    def test_the_pairwise_call_is_the_set_wise_call(self):
+        pair = ks.nesting_bounds([118, 18], [0, 1, None])
+        one = ks.nesting_bounds_over(
+            [ks.OuterLane(key="o", units=[118, 18], rank_of=[0, 1, None])]
+        )
+        self.assertEqual(pair, one)
+
+    def test_several_outers_intersect_to_the_smallest_per_card(self):
+        # Nesting inside two resident lanes at once is nesting inside the
+        # smaller of them, card by card -- the definition, not a heuristic.
+        bounds = ks.nesting_bounds_over(
+            [
+                ks.OuterLane(key="x", units=[118, 18], rank_of=[0, 1, None]),
+                ks.OuterLane(key="y", units=[100, 50, 9], rank_of=[0, 1, 2]),
+            ]
+        )
+        self.assertEqual(bounds, [(None, 100), (None, 18), (None, 9)])
+
+    def test_an_empty_outer_set_bounds_nothing(self):
+        self.assertEqual(ks.nesting_bounds_over([]), [])
+
+    def test_the_rank_map_follows_the_cards(self):
+        self.assertEqual(ks.rank_map_over_cards([0, 1, 2], [0, 2]), [0, None, 1])
+        self.assertEqual(ks.rank_map_over_cards([3, 4], [0, 1]), [None, None])
+
+    def test_the_intersected_box_reaches_the_optimizer(self):
+        lo, hi, _ = ks._role_bounds(
+            ["shard", "shard", "shard"],
+            136,
+            ks.nesting_bounds_over(
+                [
+                    ks.OuterLane(key="x", units=[118, 18], rank_of=[0, 1, None]),
+                    ks.OuterLane(key="y", units=[100, 50, 9], rank_of=[0, 1, 2]),
+                ]
+            ),
+        )
+        self.assertEqual(hi, [100, 18, 9])
+        self.assertEqual(lo, [0, 0, 0])
+
+
+# ---------------------------------------------------------------------------
+# 7d. Priority classes over N lanes
+# ---------------------------------------------------------------------------
+
+
+class TestPriorityClasses(CustomTestCase):
+    """PRIO-Nachtrag 5 in its N-lane form: ordered classes, the protected one
+    guaranteed, the scavengers over what is left, and an honest ``absent``
+    where a class is reached with nothing."""
+
+    @staticmethod
+    def _est(key, weights, other, share="d"):
+        return ks.InstanceEstimate(
+            key=key,
+            kind="serving",
+            local=True,
+            feasible=True,
+            reasons=[],
+            prefill_tok_s=1000.0,
+            decode_tok_s=50.0,
+            max_kv_tokens=10000.0,
+            weights_mib=dict(weights),
+            other_mib=dict(other),
+            posts_mib={},
+            share_group=share,
+        )
+
+    @staticmethod
+    def _spec(key, gpus, budgets, prio=0):
+        return ks.InstanceSpec(
+            key=key,
+            model_path="/nonexistent",
+            tp_size=len(gpus),
+            rank_gpu_id=list(gpus),
+            budgets_mib=list(budgets),
+            share_group="d",
+            priority_class=prio,
+        )
+
+    def _three(self, total, budget=14000, prios=(0, 1, 2)):
+        specs = [
+            self._spec(k, [0], [budget], p)
+            for k, p in zip(("pd", "main", "extra"), prios)
+        ]
+        ests = [self._est(k, {0: 3000}, {0: 1000}) for k in ("pd", "main", "extra")]
+        return ks.coresident_budget_plan(specs, ests, {0: total}, shared_process=True)
+
+    def test_one_class_is_the_even_split_it_always_was(self):
+        # The backward-compatibility statement, as a test: a rig that does not
+        # USE priority classes must not see its numbers move.
+        plan = self._three(32000, prios=(0, 0, 0))
+        self.assertEqual(len(set(tuple(v) for v in plan.budgets.values())), 1)
+        self.assertEqual(plan.starved, [])
+        self.assertEqual(plan.per_gpu[0]["classes"][0]["policy"][:10], "even split")
+
+    def test_the_protected_class_gets_exactly_what_it_asked_for(self):
+        plan = self._three(32000)
+        self.assertEqual(plan.budgets["pd"], [14000])
+        self.assertEqual(plan.budgets["main"], [14000])
+        self.assertLess(plan.budgets["extra"][0], 14000)
+
+    def test_the_scavenger_still_gets_the_residue(self):
+        # Work-conserving: nothing lies idle once the protected classes are
+        # satisfied, and the card's conservation law is untouched by the
+        # policy -- available minus posts plus the shared-weight saving.
+        plan = self._three(40000)
+        handed = sum(v[0] for v in plan.budgets.values())
+        shared_saving = 2 * 3000  # three lanes, one share group, 3000 each
+        self.assertAlmostEqual(handed, 40000 + shared_saving, delta=3)
+        self.assertGreater(plan.budgets["extra"][0], 14000)
+
+    def test_a_class_reached_with_nothing_is_named_not_invented(self):
+        plan = self._three(24000, budget=20000)
+        self.assertEqual(plan.budgets["pd"], [20000])
+        self.assertIn("extra@gpu0", plan.starved)
+        self.assertEqual(plan.budgets["extra"], [4000])  # its own footprint only
+        rows = {r["class"]: r for r in plan.per_gpu[0]["classes"]}
+        self.assertEqual(rows[2]["granted_mib"], 0.0)
+        self.assertIn("absent", rows[2]["policy"])
+
+    def test_priority_moves_capacity_between_lanes_and_creates_none(self):
+        # The invariant that keeps the mapping honest: the SUM handed out is
+        # a property of the card, not of the policy.
+        flat = self._three(32000, prios=(0, 0, 0))
+        graded = self._three(32000, prios=(0, 1, 2))
+        self.assertAlmostEqual(
+            sum(v[0] for v in flat.budgets.values()),
+            sum(v[0] for v in graded.budgets.values()),
+            delta=3,
+        )
+
+    def test_the_wrapper_still_returns_the_plain_mapping(self):
+        specs = [self._spec(k, [0], [14000], 0) for k in ("pd", "main")]
+        ests = [self._est(k, {0: 3000}, {0: 1000}) for k in ("pd", "main")]
+        flat = ks.coresident_budgets(specs, ests, {0: 32000}, shared_process=True)
+        plan = ks.coresident_budget_plan(specs, ests, {0: 32000}, shared_process=True)
+        self.assertEqual(flat, plan.budgets)
+
+
+# ---------------------------------------------------------------------------
+# 7e. The N-lane entry point
+# ---------------------------------------------------------------------------
+
+
+class TestLaneOrdering(CustomTestCase):
+    """The cheap half of ``solve_lanes``: the order, and the refusals."""
+
+    @staticmethod
+    def _t(key, prio=0, nests_in=None):
+        return ks.LaneTarget(
+            key=key,
+            plan_inputs=None,
+            base_plan=[1],
+            budgets_mib=[1],
+            priority_class=prio,
+            nests_in=nests_in,
+        )
+
+    def test_a_lane_is_solved_after_the_lane_it_nests_inside(self):
+        order = ks._lane_order([self._t("b", nests_in="a"), self._t("a")])
+        self.assertEqual(order, ["a", "b"])
+
+    def test_a_cycle_has_no_order_and_none_is_invented(self):
+        self.assertIsNone(
+            ks._lane_order([self._t("a", nests_in="b"), self._t("b", nests_in="a")])
+        )
+
+    def test_a_dangling_reference_is_refused(self):
+        self.assertIsNone(ks._lane_order([self._t("a", nests_in="ghost")]))
+
+    def test_duplicate_keys_are_refused(self):
+        self.assertIsNone(ks._lane_order([self._t("a"), self._t("a")]))
+
+    def test_priority_breaks_the_ties_the_nesting_leaves_open(self):
+        lanes = [self._t("low", prio=5), self._t("high", prio=0)]
+        by_key = {t.key: t for t in lanes}
+        order = ks._stable_priority_order(ks._lane_order(lanes), by_key)
+        self.assertEqual(order, ["high", "low"])
+
+    def test_nesting_still_wins_over_priority(self):
+        # The box has to exist before it can bound anything, so a lane never
+        # moves ahead of the lane it nests inside however protected it is.
+        lanes = [self._t("outer", prio=9), self._t("inner", prio=0, nests_in="outer")]
+        by_key = {t.key: t for t in lanes}
+        order = ks._stable_priority_order(ks._lane_order(lanes), by_key)
+        self.assertEqual(order, ["outer", "inner"])
+
+    def test_a_broken_relation_is_reported_not_raised(self):
+        sol = ks.solve_lanes(
+            [self._t("a", nests_in="b"), self._t("b", nests_in="a")], _PROBE, {0: 1}
+        )
+        self.assertFalse(sol.ok)
+        self.assertTrue(sol.reasons)
+        self.assertEqual(sol.keys, {})
+
+
+@unittest.skipUnless(_have(_FP8), f"needs the 27B-FP8 checkpoint at {_FP8}")
+class TestSolveLanes(_Bf16StateEnv):
+    """End to end over the evaluation's own rig: two lanes, two classes, one
+    nesting relation, one bracket."""
+
+    TOTAL = {0: 32607, 1: 20480, 2: 20480}
+    RESERVE = {0: 3000, 1: 2700, 2: 2700}
+    MAIN_G, MAIN_B = [0, 2, 1], [29607, 17780, 17780]
+    PD_G, PD_B = [0, 2], [29607, 17780]
+
+    def _inputs(self, tp, gpus, budgets, mrr):
+        from sglang.srt.uneven_perf import PlanInputs
+
+        return PlanInputs(
+            tp_size=tp,
+            model_path=_FP8,
+            kv_cache_dtype="fp8_e4m3",
+            speculative_algorithm="NEXTN",
+            speculative_num_draft_tokens=4,
+            max_running_requests=mrr,
+            rank_gpu_id=list(gpus),
+            effective_vram_mib=list(budgets),
+        )
+
+    def _lanes(self):
+        return [
+            ks.LaneTarget(
+                key="pd",
+                plan_inputs=self._inputs(2, self.PD_G, self.PD_B, 1),
+                base_plan=self.PD_B,
+                budgets_mib=self.PD_B,
+                goal="enc",
+                priority_class=0,
+                share_group="dual",
+                kind="prefill_lane",
+            ),
+            ks.LaneTarget(
+                key="main",
+                plan_inputs=self._inputs(3, self.MAIN_G, self.MAIN_B, 4),
+                base_plan=self.MAIN_B,
+                budgets_mib=self.MAIN_B,
+                goal="maxkv",
+                priority_class=1,
+                share_group="dual",
+                nests_in="pd",
+            ),
+        ]
+
+    def _solve(self, lanes=None):
+        return ks.solve_lanes(
+            lanes or self._lanes(),
+            _PROBE,
+            self.TOTAL,
+            reserve_mib=self.RESERVE,
+            shared_process=True,
+        )
+
+    def test_both_lanes_get_a_key_in_priority_order(self):
+        sol = self._solve()
+        self.assertEqual(sol.order, ["pd", "main"])
+        self.assertEqual(set(sol.keys), {"pd", "main"})
+        self.assertEqual(sum(sol.keys["main"]), sum(sol.keys["pd"]))
+
+    def test_the_inner_lane_is_bounded_by_the_resident_one(self):
+        sol = self._solve()
+        outer = sol.keys["pd"]
+        for r, gpu in enumerate(self.MAIN_G):
+            if gpu in self.PD_G:
+                self.assertLessEqual(
+                    sol.keys["main"][r], outer[self.PD_G.index(gpu)], r
+                )
+
+    def test_the_set_is_checked_for_a_hull_not_only_the_pair(self):
+        sol = self._solve()
+        self.assertIsNotNone(sol.hull)
+        self.assertTrue(sol.hull.ok, sol.hull.failures)
+        self.assertEqual(sol.hull.parent["main"], "pd")
+
+    def test_the_protected_lane_is_served_first_on_the_shared_cards(self):
+        sol = self._solve()
+        plan = sol.aggregate["coresident_plan"]
+        self.assertIsNotNone(plan)
+        for row in plan["per_gpu"]:
+            if len(row["classes"]) < 2:
+                continue
+            self.assertEqual(row["classes"][0]["class"], 0)
+            self.assertGreaterEqual(
+                row["classes"][0]["granted_mib"], row["classes"][1]["granted_mib"]
+            )
+
+    def test_the_solution_is_json_serializable(self):
+        json.dumps(self._solve().to_json())
+
+    def test_the_sequential_limitation_is_stated(self):
+        sol = self._solve()
+        self.assertTrue(any("not jointly" in c for c in sol.caveats))
+        self.assertTrue(any("hull was checked on the MLP" in c for c in sol.caveats))
+
+
+# ---------------------------------------------------------------------------
 # 8. The JSON surface
 # ---------------------------------------------------------------------------
 
