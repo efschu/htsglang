@@ -5671,3 +5671,18 @@ Operativ relevant bleibt hier nur:
   (b) persistenter, resetbarer J/Token-Zaehler je Modell/Quant, Prefill/Decode
   getrennt, schaltbar + tok/s-Live-Poll-Latenz = echte neue Feature-Arbeit,
   eigenes Briefing (beauftragt).
+
+## GDR P1+P2 (feat/gdr-p1-p2, gemergt)
+
+- P1 dmabuf_rdma-Gate-Zeile in rig_coupling.py: 4 Voraussetzungs-Checks (open
+  modules, rdma-core mit ibv_reg_dmabuf_mr, mlx5-dmabuf, VMM-Export des Forks)
+  aus RigFacts.capabilities via vorhandenem _cap_value(); NIE BLOCK —
+  Sichtbarkeits-Zeile, kein Transport-Erfordernis; 2080-Ti-Topologie-Hypothese
+  nur als WARN-Notiz mit dem 5090-Gegendatum, ausdruecklich kein fuenfter
+  Check. Beleg zitiert EVAL_gdr_uebernahme §6.2/§9.
+- P2 Comm-Suite-Arm gdr_crossover: Groessenleiter 8B-1MiB, Binary out-of-tree
+  via Env (nie vendored, §7-Lizenzlage), subprocess-Seam mockbar; ohne Binary/
+  GPU ehrlich absent mit benanntem Fenster — deklarierter startbarer Job.
+  budget_s=40 haelt die Suite unter der 400-s-Decke (eigener Test).
+- 13 neue hermetische Tests; auf gemergtem HEAD rig_coupling+comm_suite+
+  rig_artifact 134/0 gruen, Marker 0. Zonen eingehalten (kein webui-Edit).
