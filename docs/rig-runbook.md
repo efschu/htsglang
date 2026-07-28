@@ -329,6 +329,50 @@ setsid "$VENV/bin/python" -u -m sglang.launch_server \
 - The same `LD_LIBRARY_PATH` nvrtc rule as every other recipe (section 2)
   and `--enable-metrics` (section 3) apply.
 
+### 4.6 fp8 MoE expert offload, TP=1 on the 5090
+
+New with #256: an fp8 MoE checkpoint larger than one card now boots on one
+card. `Qwen3.6-35B-A3B-FP8` is 31 GiB of weights against the 5090's 32 GiB,
+and before #256 it died in `Fp8MoEMethod.create_weights`, which committed the
+whole expert stack on the default device before the offload could split
+anything. The presplit now allocates the stack on the host and hands each
+layer's `[R+C]` resident slots to the GPU as the loader walks it.
+
+```bash
+export CUDA_VISIBLE_DEVICES=0                        # 5090 in CUDA order (6.1)
+export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
+export PYTHONPATH=$WT/python
+export SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.25      # 64 of 256 experts resident
+export SGLANG_MOE_OFFLOAD_WAVE_ORDER=expert          # or "token" (default)
+
+setsid "$VENV/bin/python" -m sglang.launch_server \
+  --model-path "$MODEL_ROOT/Qwen3.6-35B-A3B-FP8" \
+  --tp-size 1 --trust-remote-code \
+  --context-length 8192 --max-running-requests 1 \
+  --disable-cuda-graph \
+  --enable-metrics \
+  --host 127.0.0.1 --port <free-port> \
+  > "$LOG" 2>&1 &
+```
+
+- Boot takes ~2 min and settles at ~13 GiB on the card (23 GiB once the KV
+  pool has grown into the reclaim). Confirm the presplit fired before
+  trusting any measurement: the log must carry `MoE expert-offload active on
+  layer N` for every MoE layer and one `[offload-kv-regain]` line — for this
+  model, `released 20.63 GiB of weight VRAM across 40 MoE layer(s) (22.51
+  GiB moved to the pinned host pool)`. Without those lines the offload
+  declined and the run says nothing.
+- Host RAM is the new budget: the loader materializes the full expert stack
+  on the host (~30 GiB) while the pinned spill pool fills to ~22 GiB. Peak
+  observed ~45 GiB on the 98 GiB box. Do not launch this next to another
+  memory-heavy job.
+- `--disable-cuda-graph` is required unless `SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1`
+  is set; the eager offload path resolves residency per forward and is not
+  capturable. The server fails fast rather than capturing a wrong graph.
+- Wave order is a throughput knob, not a numerics knob: token-major logged
+  27-31 waves and 1.11-1.21 GiB H2D per layer per chunk here, expert-major
+  9 waves and 0.34 GiB, and greedy output was byte-identical between them.
+
 ## 5. Credentials
 
 | Credential | Location | Use |

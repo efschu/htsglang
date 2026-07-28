@@ -665,6 +665,12 @@ class MoEExpertOffloadCache:
         "w2_weight_scale",
         "w13_weight_scale_inv",
         "w2_weight_scale_inv",
+        # Optional fp8 expert biases (GPT-OSS-style). Expert-major like the
+        # weights, and read by the triton runner at the SLOT index that the
+        # offload remap produces -- so a full [E] bias next to a [R+C] weight
+        # buffer would pair every expert with the wrong bias. Stage them.
+        "w13_weight_bias",
+        "w2_weight_bias",
         # GPTQ-Int4 Marlin path (Variant-C B2b): the POST-repack marlin tensors.
         # The apply kernel reads these; for GPTQ qzeros is unused (sym) and g_idx
         # is empty (desc_act=False). All are expert-major (dim 0 == num_experts)

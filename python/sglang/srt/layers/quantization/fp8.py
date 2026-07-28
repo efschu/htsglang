@@ -1284,6 +1284,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_parallel().tp_size
 
+        # #256, Variant-C B2b load-time cap for fp8 experts. Without this the
+        # expert stack is committed on the default device (cuda) by the
+        # allocations below -- ~30 GB for a 40-layer/256-expert fp8 checkpoint,
+        # before a single weight byte is read and long before the offload split
+        # in MoEExpertOffloadCache.install() runs. On "cpu" the stack is loaded
+        # to host instead; the loader's device_loading_context then moves ONE
+        # layer at a time to GPU for process_weights_after_loading, where
+        # presplit_expert_offload_after_repack() keeps only [R+C] experts on GPU
+        # and streams the rest into the pinned host spill pool. Applied to the
+        # expert weights, which are what fills the card; the scales are handled
+        # at the WEIGHT_SCALES block below.
+        # fraction >= 1.0 -> None -> torch.empty(..., device=None), i.e. the
+        # byte-identical stock allocation.
+        _moe_dev = (
+            "cpu" if envs.SGLANG_MOE_RESIDENT_EXPERT_FRACTION.get() < 1.0 else None
+        )
+
         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
             is_aiter_moe=_use_aiter,
@@ -1324,6 +1341,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     2 * intermediate_size_per_partition,
                     hidden_size // 2,
                     dtype=torch.int8,
+                    device=_moe_dev,
                 ),
                 requires_grad=False,
             )
@@ -1333,6 +1351,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     hidden_size,
                     intermediate_size_per_partition // 2,
                     dtype=torch.int8,
+                    device=_moe_dev,
                 ),
                 requires_grad=False,
             )
@@ -1344,6 +1363,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     2 * intermediate_size_per_partition,
                     hidden_size // 8,
                     dtype=params_dtype,
+                    device=_moe_dev,
                 ),
                 requires_grad=False,
             )
@@ -1353,6 +1373,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     hidden_size,
                     intermediate_size_per_partition // 8,
                     dtype=params_dtype,
+                    device=_moe_dev,
                 ),
                 requires_grad=False,
             )
@@ -1363,6 +1384,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     w13_up_dim,
                     hidden_size,
                     dtype=params_dtype,
+                    device=_moe_dev,
                 ),
                 requires_grad=False,
             )
@@ -1372,6 +1394,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     hidden_size,
                     w2_up_dim,
                     dtype=params_dtype,
+                    device=_moe_dev,
                 ),
                 requires_grad=False,
             )
@@ -1393,6 +1416,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 if layer.moe_runner_config.is_gated
                 else intermediate_size_per_partition
             )
+            # Biases stay on the default device: they are ~4 KiB per expert, so
+            # they are not what fills the card, and the presplit stages them
+            # from wherever they live (see EXPERT_TENSOR_ATTRS -- they must be
+            # staged, since the offload remaps topk ids to slots and a full [E]
+            # bias would be indexed by slot).
             w13_weight_bias = torch.nn.Parameter(
                 torch.empty(num_experts, w13_up_dim, dtype=torch.float32),
                 requires_grad=False,
@@ -1408,6 +1436,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
         # WEIGHT_SCALES
+        # Deliberately NOT on _moe_dev: a block-fp8 expert carries ~512 B of
+        # scale against ~3 MiB of weight, so the scales are not what fills the
+        # card, and leaving them on the default device keeps their load path
+        # unchanged. What matters for #256 is that the presplit STAGES them --
+        # w13/w2_weight_scale[_inv] are in EXPERT_TENSOR_ATTRS, and _fetch
+        # copies every staged attribute with one shared fetch plan, so a scale
+        # row always lands in the same slot as its expert's weight.
         if self.is_fp4_expert:
             fp4_block_k = 32
             fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.float32
@@ -2245,6 +2280,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if self.use_marlin:
             self._prepare_marlin_moe(layer)
+
+        # #256 / Variant-C B2b: split the expert stack into a fixed-resident GPU
+        # buffer + pinned-host spill pool, per layer, while this layer's weights
+        # are the only ones on the GPU (device_loading_context). Last statement
+        # on purpose: everything above may still REPLACE w13/w2_weight and their
+        # scales (fnuz normalization, aiter shuffle, the Marlin W8A16 fallback),
+        # and the presplit must stage the tensors the kernel actually reads.
+        # No-op unless SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0.
+        from sglang.srt.layers.moe.expert_offload import (
+            presplit_expert_offload_after_repack,
+        )
+
+        presplit_expert_offload_after_repack(layer)
 
     def _prepare_marlin_moe(self, layer: Module) -> None:
         """Convert the fp8 expert weights of this rank to Marlin W8A16 format.
