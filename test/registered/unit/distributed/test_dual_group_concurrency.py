@@ -883,12 +883,13 @@ def _stub_out(token_id, vocab=8):
 
 
 class TestLaneVerifyStrategy(unittest.TestCase):
-    """#274 round 3: which verify forward the lane uses, and why.
+    """#274 rounds 3+4: which verify forward the lane uses, and why.
 
     The batched continued extend advances the target's RECURRENT state over
     rejected candidates with no way to restore it, so it stops tracking the
-    lane's own no-spec continuation. Sequential decode advances the state by
-    exactly the accepted tokens. The default must be the coherent one.
+    lane's own no-spec continuation. TARGET_VERIFY parks a state per draft
+    step and commits the accepted one; sequential decode sidesteps the problem
+    at one forward per token. The default must be a coherent one.
     """
 
     def _lane(self):
@@ -897,10 +898,35 @@ class TestLaneVerifyStrategy(unittest.TestCase):
         return DualGroupLane.__new__(DualGroupLane)
 
     def test_default_is_the_coherent_strategy(self):
+        # Round 4 built TARGET_VERIFY and did NOT promote it: it is byte-exact
+        # only with its accept length capped at 0. The default must be the
+        # strategy that is green end to end, which is still the bridge.
         self.assertEqual(self._lane()._verify_mode({}), "seqdecode")
+
+    def test_target_verify_stays_reachable_but_only_on_request(self):
+        self.assertEqual(
+            self._lane()._verify_mode({"verify": "target_verify"}), "target_verify"
+        )
 
     def test_batched_extend_stays_reachable_but_only_on_request(self):
         self.assertEqual(self._lane()._verify_mode({"verify": "extend"}), "extend")
+
+    def test_unknown_strategy_is_refused_rather_than_guessed(self):
+        import torch
+
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        lane = DualGroupLane.__new__(DualGroupLane)
+        job = {
+            "_batch": _StubBatch(),
+            "_req": None,
+            "_req_pool_idx": 0,
+            "_kv_len": 4,
+            "_next": torch.tensor([1]),
+            "verify": "fastest",
+        }
+        with self.assertRaises(ValueError):
+            lane._verify(job, [2, 3, 4])
 
     def test_the_defect_is_named_where_the_batched_path_lives(self):
         import inspect
@@ -912,6 +938,22 @@ class TestLaneVerifyStrategy(unittest.TestCase):
         # whether to "optimise" the default back to the fast, wrong path.
         self.assertIn("TARGET_VERIFY", doc)
         self.assertIn("recurrent", doc.lower())
+
+    def test_the_measured_boundary_of_target_verify_is_written_down(self):
+        """What is proven about TARGET_VERIFY, at the code that runs it.
+
+        The single-row core is byte-exact and the rest is not (round 4). A
+        future reader who only sees "TARGET_VERIFY is the right mode" would
+        promote it; the cap that proved the boundary has to be findable from
+        the same docstring.
+        """
+        import inspect
+
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        doc = inspect.getdoc(DualGroupLane._verify_by_target_verify) or ""
+        self.assertIn("tv_max_accept", doc)
+        self.assertIn("BYTE-IDENTICAL", doc)
 
     def test_seqdecode_emits_accepted_prefix_then_the_targets_own_token(self):
         """The accept rule itself, with the forwards stubbed out.
@@ -956,6 +998,214 @@ class TestLaneVerifyStrategy(unittest.TestCase):
         self.assertEqual(n_accept, 0)
         self.assertEqual(emitted, [4])
         self.assertEqual(job["_kv_len"], 6)
+
+
+class TestLaneChainVerifyInput(unittest.TestCase):
+    """#274 round 4: the TARGET_VERIFY input the lane hands to the target.
+
+    The mask layout is a CONTRACT with ``build_tree_kernel_efficient`` /
+    ``EagleVerifyInput.generate_attn_arg_prefill``; getting it wrong is silent
+    (the forward runs, the logits are just attended over the wrong keys), so
+    it is pinned here rather than discovered on the rig.
+    """
+
+    def test_chain_mask_is_prefix_visible_and_lower_triangular(self):
+        from sglang.srt.model_executor.dual_group_lane import lane_chain_verify_mask
+
+        n_cached, d = 5, 3
+        mask = lane_chain_verify_mask(n_cached, d).view(d, n_cached + d)
+        self.assertEqual(mask.numel(), n_cached * d + d * d)
+        self.assertTrue(bool(mask[:, :n_cached].all()))
+        block = mask[:, n_cached:]
+        self.assertEqual(
+            block.tolist(),
+            [[True, False, False], [True, True, False], [True, True, True]],
+        )
+
+    def test_verify_input_describes_the_chain(self):
+        from sglang.srt.model_executor.dual_group_lane import (
+            build_lane_chain_verify_input,
+        )
+
+        vi = build_lane_chain_verify_input([11, 12, 13, 14], n_cached=7)
+        self.assertEqual(vi.draft_token_num, 4)
+        self.assertEqual(vi.topk, 1)
+        self.assertEqual(vi.spec_steps, 3)
+        self.assertEqual(vi.positions.tolist(), [7, 8, 9, 10])
+        self.assertEqual(vi.draft_token.tolist(), [11, 12, 13, 14])
+        # A chain: every node's successor is the next one, none has a sibling.
+        self.assertEqual(vi.retrieve_next_token.tolist(), [[1, 2, 3, -1]])
+        self.assertEqual(vi.retrieve_next_sibling.tolist(), [[-1, -1, -1, -1]])
+        self.assertEqual(vi.custom_mask.numel(), 7 * 4 + 4 * 4)
+
+
+class _StubVerifyBatch:
+    """A ScheduleBatch stand-in with only the fields a verify round writes."""
+
+    def __init__(self, n_cached, pool_width=64):
+        import torch
+
+        self.device = "cpu"
+        self.input_ids = None
+        self.spec_info = None
+        self.forward_mode = None
+        self.capture_hidden_mode = None
+        self.out_cache_loc = None
+        self.seq_lens_sum = None
+        self.seq_lens = torch.tensor([n_cached])
+        self.seq_lens_cpu = torch.tensor([n_cached])
+        self.orig_seq_lens = torch.tensor([n_cached])
+        self.freed = []
+
+        outer = self
+
+        class _Alloc:
+            def alloc(self, n):
+                return torch.arange(100, 100 + n, dtype=torch.int64)
+
+            def free(self, idx):
+                outer.freed.append(idx.tolist())
+
+        class _Pool:
+            req_to_token = torch.zeros((2, pool_width), dtype=torch.int32)
+
+        self.token_to_kv_pool_allocator = _Alloc()
+        self.req_to_token_pool = _Pool()
+
+
+class _StubReq:
+    decode_batch_idx = 0
+    kv_committed_len = 0
+    kv_allocated_len = 0
+
+
+class TestLaneTargetVerifyRound(unittest.TestCase):
+    """#274 round 4: the accept rule and the bookkeeping of one TARGET_VERIFY.
+
+    The forward and the state commit are stubbed; what is under test is that
+    the round emits the accepted prefix plus the target's own token, frees
+    exactly the rejected slots, and ALWAYS commits the recurrent state of the
+    last accepted step -- skipping that commit reproduces the round-1 defect.
+    """
+
+    def _lane(self, target_says, n_cached=10):
+        import torch
+
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        calls = []
+
+        class _Backend:
+            def update_mamba_state_after_mtp_verify(self, **kw):
+                calls.append(kw)
+
+        class _Args:
+            page_size = 1
+
+        class _Runner:
+            attn_backend = _Backend()
+            server_args = _Args()
+            model = None
+
+        class _Fake(DualGroupLane):
+            def _verify_state_buffers(self, draft_token_num):
+                return None
+
+            def _timed_forward_raw(self, batch, capture_mode=None):
+                out = type("LogitsOutput", (), {})()
+                out.hidden_states = torch.zeros(len(target_says), 4)
+                return out, 2.5
+
+            def _candidate_logits(self, hidden_states):
+                logits = torch.zeros(len(target_says), 32)
+                for row, tok in enumerate(target_says):
+                    logits[row][tok] = 1.0
+                return logits
+
+        lane = _Fake.__new__(_Fake)
+        lane.runner = _Runner()
+        job = {
+            "_batch": _StubVerifyBatch(n_cached),
+            "_req": _StubReq(),
+            "_req_pool_idx": 0,
+            "_kv_len": n_cached,
+            "_next": torch.tensor([1]),
+        }
+        return lane, job, calls
+
+    def test_partial_accept_frees_only_the_rejected_slots(self):
+        # Candidates [1, 3, 5, 6]. The target says 3 after the first (proposal
+        # 0 accepted) and 7 where proposal 1 was 5 (rejected).
+        lane, job, calls = self._lane([3, 7, 0, 0])
+        emitted, n_accept, ms = lane._verify_by_target_verify(job, [3, 5, 6], 10)
+        self.assertEqual(emitted, [3, 7])
+        self.assertEqual(n_accept, 1)
+        self.assertEqual(ms, 2.5)
+        self.assertEqual(job["_kv_len"], 12)
+        self.assertEqual(job["_batch"].freed, [[102, 103]])
+        self.assertEqual(job["_batch"].seq_lens.tolist(), [12])
+        self.assertEqual(job["_req"].kv_committed_len, 12)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["last_correct_step_indices"].tolist(), [n_accept])
+
+    def test_full_accept_frees_nothing_and_commits_the_last_step(self):
+        lane, job, calls = self._lane([3, 5, 6, 9])
+        emitted, n_accept, _ = lane._verify_by_target_verify(job, [3, 5, 6], 10)
+        self.assertEqual(emitted, [3, 5, 6, 9])
+        self.assertEqual(n_accept, 3)
+        self.assertEqual(job["_batch"].freed, [])
+        self.assertEqual(job["_kv_len"], 14)
+        self.assertEqual(calls[0]["last_correct_step_indices"].tolist(), [3])
+
+    def test_the_verify_leaves_no_spec_input_on_the_batch(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        lane, job, _ = self._lane([9, 0, 0, 0])
+        lane._verify_by_target_verify(job, [3, 5, 6], 10)
+        # A stale EagleVerifyInput on the ScheduleBatch would put the NEXT
+        # forward (a plain decode, or the next round's prefill) into the
+        # verify plan with the previous round's mask.
+        self.assertIsNone(job["_batch"].spec_info)
+        self.assertEqual(job["_batch"].forward_mode, ForwardMode.DECODE)
+
+    def test_per_candidate_rows_are_taken_only_when_the_count_matches(self):
+        """Contract 8's failure mode, made loud.
+
+        ``next_token_logits`` is per-candidate under TARGET_VERIFY and per
+        REQUEST everywhere else. Reading it positionally when it is the latter
+        is silent and wrong, so the row count decides which source is used.
+        """
+        import torch
+
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        rebuilt = []
+
+        class _Fake(DualGroupLane):
+            def _candidate_logits(self, hidden_states):
+                rebuilt.append(hidden_states.shape)
+                return torch.zeros(hidden_states.shape[0], 8)
+
+        lane = _Fake.__new__(_Fake)
+        out = type("LogitsOutput", (), {})()
+        out.hidden_states = torch.zeros(4, 4)
+
+        out.next_token_logits = torch.zeros(4, 8)
+        out.next_token_logits[2][5] = 1.0
+        self.assertEqual(lane._verify_predictions(out, 4).tolist(), [0, 0, 5, 0])
+        self.assertEqual(rebuilt, [])
+
+        # One row per REQUEST (the shape that made round 2's accept length
+        # exactly 1.000): rebuild instead of indexing rows that are not there.
+        out.next_token_logits = torch.zeros(1, 8)
+        lane._verify_predictions(out, 4)
+        self.assertEqual(rebuilt, [torch.Size([4, 4])])
+
+    def test_candidate_slots_are_published_into_req_to_token(self):
+        lane, job, _ = self._lane([3, 7, 0, 0])
+        lane._verify_by_target_verify(job, [3, 5, 6], 10)
+        row = job["_batch"].req_to_token_pool.req_to_token[0]
+        self.assertEqual(row[10:14].tolist(), [100, 101, 102, 103])
 
 
 if __name__ == "__main__":

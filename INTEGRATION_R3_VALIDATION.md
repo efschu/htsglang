@@ -6164,3 +6164,90 @@ haelt. Nicht getestet (bewusst): Rig-2-GPU-Seite (2080-Ti-Topologie-Defekt,
 sm75 zurueckgestellt), kleine Groessen (BUFSZ fest 2 MiB), Bandbreite.
 Binaries wiederverwendbar: /root/gdr-verify/ (Rig 1), /root/gpurdma_03_transfer
 (Rig 2). #277 damit ABGESCHLOSSEN; P4-Nein-Verdikt unveraendert.
+
+## Lane-Spec-Kette Runde 4 (feat/dual-group-lane-spec-r4, Basis 640e4d7085)
+
+- DER TARGET_VERIFY-PFAD IST GEBAUT UND ERREICHT DEN GDN-ARM.
+  `build_lane_chain_verify_input` erzeugt einen `EagleVerifyInput` fuer die
+  Kette (Kandidaten, Positionen `n_cached..n_cached+K`, FULL_MASK-Maske aus
+  Praefix + unterer Dreiecksblock, `draft_token_num`, `topk=1`, chain-formige
+  `retrieve_*`); `_verify_by_target_verify` alloziert die K+1 KV-Slots VOR dem
+  Forward und veroeffentlicht sie in `req_to_token[idx, n_cached:n_cached+D]`
+  (genau die Zeile, die der Attention-Plan liest), setzt Modus/spec_info/
+  input_ids/out_cache_loc/seq_lens_sum/capture_hidden_mode, committet nach dem
+  Forward per `update_mamba_state_after_mtp_verify` den Zustand des letzten
+  ANGENOMMENEN Schritts, gibt die verworfenen Slots frei und zieht die
+  Buchfuehrung nach, die sonst `prepare_for_decode` macht. Der R3-Befund
+  bestaetigt sich dabei: der Lane-Pool HAT die `MambaPool.SpeculativeState`-
+  Puffer (die Pruefung in `_verify_state_buffers` hat nie ausgeloest).
+- ER IST TROTZDEM NICHT DER DEFAULT, und die Grenze ist gemessen. Der
+  Falsifikator ist ein per-Job-Deckel auf die Accept-Laenge
+  (`tv_max_accept`): mit Deckel 0 wird nur Zeile 0 emittiert und nur Schritt 0
+  committet.
+  TOR (je zwei Laeufe, drei Prompts, deren A-gegen-A-Boden VORHER gemessen und
+  gruen war — von vier Kandidaten-Prompts fiel einer durch):
+
+  | Arm | alphabet | squares | repeat |
+  |---|---|---|---|
+  | Boden No-Spec vs. No-Spec | gruen | gruen | gruen |
+  | Bruecke `seqdecode` vs. No-Spec | gruen | gruen | gruen |
+  | `target_verify`, Accept-Deckel 0 | **gruen** | **gruen** | **gruen** |
+  | `target_verify`, ungedeckelt | rot @1 | rot @5 | rot @5 |
+  | Falsifikator `extend` | rot | rot | rot |
+
+  Der gedeckelte Arm ist zusaetzlich lauf-zu-lauf reproduzierbar, der
+  ungedeckelte nicht (`self_tv_vs_tv` rot bei 2 bzw. 5). Damit sind
+  Verify-Input und Zustands-Commit fuer den Ein-Zeilen-Fall bewiesen; offen
+  ist die Verkettung UEBER die Draft-Schritte innerhalb eines Forwards. Die
+  Runden-Spur zeigt es direkt: Zeile 0 von `preds` folgt der
+  No-Spec-Fortsetzung, die Zeilen >= 1 sind kaum eingabeabhaengig — ueber 96
+  instrumentierte Runden nahm Zeile 2 nur 15 verschiedene Werte an (einer
+  davon in 39 Runden) gegen 83 verschiedene Werte auf Zeile 1.
+- ACCEPT-LAENGE: das Tor-Kriterium ">= 1,383" aus R3 ist auf diesen Prompts
+  nicht vergleichbar — 1,383 wurde auf dem 96-Token-Prompt aus R3 gemessen,
+  und die Accept-Laenge ist inhaltsgetrieben. Auf dem R4-Prompt (alphabet, 105
+  Token, 64 Ausgabe-Token) liegt sie bei 1,105 (`seqdecode`) und 1,189
+  (`target_verify`); auf `squares` erreichte `seqdecode` 2,0. Der belastbare
+  Vergleich ist der innerhalb EINES Boots und desselben Prompts, und dort
+  liegt `target_verify` nicht unter der Bruecke.
+- ZAHLEN (Boot 1, seriell, alphabet-Prompt 105 Token, 64 Ausgabe-Token, TP=3
+  uneven, GGUF Q3_K_M):
+
+  | Arm | Prefill ms | ms je Runde | Accept | abgeleitet ms/Token |
+  |---|---|---|---|---|
+  | No-Spec (graph-gefangen) | 88,3 | 16,17 je Schritt | — | **16,17** |
+  | `target_verify` | 114,7 | 67,65 | 1,189 | 56,90 |
+  | `seqdecode` | 117,4 | 68,95 | 1,105 | 62,40 |
+  | `extend` (inkohaerent) | 118,6 | 90,94 | 1,103 | 82,44 |
+
+  DER EIGENTLICHE BEFUND DER RUNDE: der Verify-MODUS war nie der teure
+  Posten. Ein TARGET_VERIFY-Forward kostet ~67 ms gegen 16,17 ms
+  graph-gefangenen Decode; bei Accept ~1,19 spart der Wechsel von der Bruecke
+  auf den Ein-Forward-Verify bestenfalls ~10 %. Damit der Moduswechsel allein
+  den Verlust gegen die Graph-Basis schliessen wuerde, muesste die
+  Accept-Laenge ueber ~4,2 liegen — mit K=3 unerreichbar. Der Hebel ist die
+  GRAPH-AUFNAHME von Verify und Kopf, nicht die Wahl des Verify-Modus.
+- MESSFEHLER DER RUNDEN 1-3 KORRIGIERT: die gemeldeten ms/Runde enthielten
+  nur den Verify, nicht die K Draft-Forwards des Kopfes. `_spec_step` misst
+  jetzt die ganze Runde und meldet `verify_ms_mean` und `propose_ms_mean`
+  getrennt. Die Tabelle oben stammt noch aus dem Boot vor dieser Korrektur
+  und ist damit eine UNTERGRENZE der Rundenkosten fuer alle drei Spec-Arme;
+  die No-Spec-Zeile ist unberuehrt.
+- INSTRUMENTEN-BEFUND, der jedes weitere Kohaerenz-Urteil bindet: der
+  Vergleich No-Spec gegen Spec traegt ZWEI Unterschiede. Beide Spec-Arme
+  teilen sich den Spec-Prefill, der wegen `CaptureHiddenMode.FULL` eager
+  laeuft, waehrend der No-Spec-Prefill graph-gefangen ist. Auf 24 Tokens
+  verlassen `seqdecode` UND der gedeckelte `target_verify` die No-Spec-Bahn
+  an derselben Stelle (Index 16, alphabet) und stimmen untereinander weiter
+  ueberein; auf `repeat` sind beide ueber 24 gruen. Der nutzbare Horizont des
+  Tors ist also eine Eigenschaft des Prefills, nicht des Verifys.
+- OFFEN UND EHRLICH BENANNT: `next_token_logits` und `_candidate_logits`
+  (die beiden Quellen der Kandidaten-Argmaxe) waren in 13 von 96
+  instrumentierten Runden uneins (7x Zeile 1, 3x Zeile 0, 3x Zeilen 2-3).
+  Jede dieser Runden trug auch die kaputten Zeilen >= 1, also kann es ein
+  Gleichstand auf einer entarteten Verteilung sein — nachpruefen, sobald die
+  Zeilen stimmen.
+- `--dual-group-lane-spec` bleibt default aus, der Verify-Default bleibt
+  `seqdecode`. Der Test, der ein stilles Zurueckflippen auf den schnellen
+  falschen `extend`-Pfad verbietet, bleibt bestehen und gruen; ein zweiter
+  Test haelt jetzt fest, was von `target_verify` bewiesen ist und was nicht.

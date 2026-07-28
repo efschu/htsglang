@@ -1305,3 +1305,161 @@ Mechanik-Kosten.
 bewusst. Eine Kartenaequivalent-Zahl an einer nachweislich falsch
 rechnenden Kette waere eine Zahl, die niemand benutzen darf
 (Einzelteil-vor-Verbund).
+
+### 11.16 Lane-Spec-Kette Runde 3 (feat/dual-group-lane-spec-r3, Basis 5ee0b58810)
+
+Nachtrag: Runde 3 lief, bevor diese Datei im Repo lag, und ist deshalb
+zunaechst nur in `INTEGRATION_R3_VALIDATION.md` protokolliert worden. Die
+beiden Befunde, auf denen Runde 4 aufsetzt, gehoeren hierher:
+
+**Die Wurzel ist der REKURRENTE ZUSTAND, nicht die Indizierung.** Die
+uebergebene Hypothese (Versatz zwischen Hidden-State-Zeilen und
+Kandidaten-Positionen) wurde in einem Boot widerlegt: `hidden_rows=4` gegen
+`len(cand)=4`, `positions=[96..99]`, `extend_prefix_lens=[96]`, vier frische
+`out_cache_loc`-Slots — alle Achsen stimmen. Das Ziel ist ein GDN-Hybrid und
+fuehrt neben der KV einen laufenden Zustand (Conv-Fenster + SSM). Ein Verify
+ueber K+1 Kandidaten in EINEM fortgesetzten Extend schiebt diesen Zustand
+ueber jeden Kandidaten weiter, angenommen oder nicht; es gibt keinen Slot zum
+Freigeben. Ab der ersten Ablehnung sagt die KV "n angenommen" und der Zustand
+"alle K+1".
+
+**Der Falsifikator statt des Arguments:** der Verify konsumiert die Kandidaten
+als EINZELNE DECODES (`_verify_by_decode`). Gleiche Accept-Regel, gleiche
+emittierte Tokens, nur der bestrittene Forward getauscht. Ergebnis:
+byte-identisch zur eigenen No-Spec-Lane, Accept 1,100 -> 1,383. Das ist eine
+KORREKTHEITS-BRUECKE, kein fertiges Feature: sie kostet strukturell einen
+Forward je emittiertem Token.
+
+**Harness-Befund, der jedes spaetere Urteil bindet:** das Tor hatte nie einen
+RAUSCHBODEN. Der Boden ist INHALTS-, nicht positionsgetrieben — zwei
+No-Spec-Laeufe derselben Anfrage weichen bei einem offenen Fortsetzungstext
+schon nach wenigen Tokens voneinander ab. Jedes Kohaerenz-Urteil ohne
+mitgefuehrten A-gegen-A-Boden ist kein Urteil.
+
+### 11.17 Lane-Spec-Kette Runde 4 (feat/dual-group-lane-spec-r4, Basis 640e4d7085)
+
+Auftrag war der Umbau des Lane-Verifys von der seqdecode-Bruecke auf einen
+echten `ForwardMode.TARGET_VERIFY`. Der Umbau ist gebaut, und er ist NICHT
+uebernommen worden — die Grenze ist gemessen, nicht geschaetzt.
+
+#### Wie der TARGET_VERIFY-Input gebaut wird
+
+`build_lane_chain_verify_input` erzeugt einen `EagleVerifyInput`, der die
+Kette der Lane als Verify-BAUM beschreibt: `draft_token` (die K+1
+Kandidaten), `positions` (`n_cached .. n_cached+K`), `custom_mask` im
+FULL_MASK-Layout, `draft_token_num` (die Schrittweite, mit der das
+GDN-Backend den Verify je Request zerlegt und mit der die Zwischenspeicher
+indiziert werden), `topk=1`, `spec_steps=K`, sowie die `retrieve_*`-Felder,
+die die Kette topologisch beschreiben (das GDN-Backend liest sie nur bei
+`topk > 1`, die Tree-Verify-Sampling-Kernel liegen nicht auf diesem Pfad —
+die Accept-Regel der Lane ist ihre eigene). Die Maske wird von Hand gebaut
+statt aus `build_tree_kernel_efficient` geholt, weil dieser Kernel
+`parent_list`/`top_scores_index` eines EAGLE-Drafts braucht, die die
+handgerollte Kette nie erzeugt; das Layout ist der Vertrag und steht als
+solcher im Docstring plus CPU-Test. Eingehaengt wird in `_verify`: K+1
+frische KV-Slots werden VOR dem Forward alloziert und in
+`req_to_token[idx, n_cached : n_cached+D]` veroeffentlicht (der
+Attention-Plan liest genau diese Zeile), dann `forward_mode`,
+`spec_info`, `input_ids`, `out_cache_loc`, `seq_lens_sum` und
+`capture_hidden_mode` gesetzt; nach dem Forward committet
+`update_mamba_state_after_mtp_verify` den Zustand des letzten ANGENOMMENEN
+Schritts, der Rest der Kandidaten-KV wird freigegeben, und die Buchfuehrung,
+die sonst `prepare_for_decode` macht (`seq_lens`, `orig_seq_lens`,
+`kv_committed_len`), wird explizit nachgezogen.
+
+#### Was bewiesen ist und was nicht — der Accept-Cap-Falsifikator
+
+Das Kohaerenz-Tor lief mit gemessenem A-gegen-A-Boden auf drei Prompts, die
+VORHER nach ihrem Boden ausgewaehlt wurden (der Boden ist inhaltsgetrieben:
+von vier Kandidaten hatten drei einen gruenen Boden ueber 12 Tokens, einer
+nicht — die Prompt-Wahl ist Teil des Instruments und keine Nebensache).
+
+| Arm | alphabet | squares | repeat |
+|---|---|---|---|
+| Boden No-Spec gegen No-Spec | gruen | gruen | gruen |
+| Bruecke `seqdecode` gegen No-Spec | gruen | gruen | gruen |
+| `target_verify`, Accept auf 0 gedeckelt | **gruen** | **gruen** | **gruen** |
+| `target_verify`, ungedeckelt | rot @1 | rot @5 | rot @5 |
+| Falsifikator `extend` | rot | rot | rot |
+
+Der gedeckelte Arm ist ausserdem lauf-zu-lauf reproduzierbar, der
+ungedeckelte nicht. Damit ist die Grenze scharf: mit Deckel wird nur Zeile 0
+emittiert und nur Schritt 0 committet — also sind der Verify-INPUT (Maske,
+Positionen, Kandidaten-Slots, `spec_info`) und der Zustands-Commit fuer den
+Ein-Zeilen-Fall RICHTIG. Ohne Deckel ist es rot, und die Runden-Spur sagt wo:
+Zeile 0 von `preds` folgt der No-Spec-Fortsetzung, die Zeilen >= 1 tun es
+nicht und sind kaum eingabeabhaengig (ueber 96 Runden nahm Zeile 2 nur 15
+verschiedene Werte an, einer davon in 39 Runden, gegen 83 verschiedene Werte
+auf Zeile 1). Nicht die Wahl des Modus ist offen, sondern die Verkettung
+UEBER die Draft-Schritte INNERHALB eines Forwards.
+
+Deshalb bleibt `seqdecode` der Default. Ein Default ist eine Aussage ueber
+Korrektheit, nicht ueber Ambition.
+
+#### Der Befund, der die Prioritaet von Runde 5 aendert
+
+Der Umbau war als Kostenfix gedacht — und die Messung zeigt, dass der
+VERIFY-MODUS nie der teure Posten war:
+
+| Arm | ms je Runde | Accept | abgeleitet ms/Token |
+|---|---|---|---|
+| No-Spec, graph-gefangen | 16,17 (je Schritt) | — | **16,17** |
+| `target_verify` (1 Forward/Runde) | 67,65 | 1,189 | 56,90 |
+| `seqdecode`-Bruecke | 68,95 | 1,105 | 62,40 |
+| `extend` (falsch) | 90,94 | 1,103 | 82,44 |
+
+Ein TARGET_VERIFY-Forward kostet ~67 ms gegen einen graph-gefangenen Decode
+von 16,17 ms. Bei der gemessenen Accept-Laenge von ~1,19 spart der Wechsel
+von der Bruecke auf den Ein-Forward-Verify also bestenfalls ~10 % — der
+Faktor-3,5-Verlust gegen die Graph-Basis bleibt praktisch unveraendert
+stehen. Um ihn ueber den Wechsel des Verify-Modus zu schliessen, muesste die
+Accept-Laenge ueber ~4,2 liegen, was eine Kette mit K=3 nicht kann.
+
+**Die Konsequenz fuer Runde 5, ausdruecklich:** der Hebel ist die
+GRAPH-AUFNAHME des Verifys (und des Kopfes), nicht die Wahl des
+Verify-Modus. Die Lane nimmt heute `ForwardMode.DECODE` auf, weil ihre
+Args-Sicht `speculative_algorithm=None` setzt; ihr `capture_hidden_mode`
+passt zudem nicht, was den Verify auch dann aus dem gefangenen Graphen
+draengen wuerde. Beides ist benannt und keins davon ist in Runde 4 angefasst
+worden — ein Umbau-Marathon war ausdruecklich nicht der Auftrag.
+
+#### Zwei Nebenbefunde, die zur Buchfuehrung gehoeren
+
+* **Die ms/Runde der Runden 1-3 waren zu klein.** Gemessen wurde nur der
+  Verify; die K Draft-Forwards des Kopfes — die andere Haelfte dessen, was
+  Spekulation kostet — standen in keiner Zahl. `_spec_step` misst jetzt die
+  ganze Runde und meldet `verify_ms_mean` und `propose_ms_mean` getrennt,
+  damit die beiden strukturellen Posten unterscheidbar bleiben.
+* **Der Vergleich No-Spec gegen Spec traegt zwei Unterschiede, nicht einen.**
+  Beide Spec-Arme teilen sich den Spec-PREFILL, der wegen
+  `CaptureHiddenMode.FULL` eager laeuft, waehrend der No-Spec-Prefill
+  graph-gefangen ist. Auf 24 Tokens verlassen `seqdecode` UND der gedeckelte
+  `target_verify` die No-Spec-Bahn an derselben Stelle (Index 16) und stimmen
+  untereinander weiter ueberein — der Rest ist dieser Prefill-Unterschied und
+  nicht der Verify. Der nutzbare Horizont des Tors ist damit eine Eigenschaft
+  des Prefills, nicht des Verifys, und das gehoert vor jedes weitere
+  Kohaerenz-Urteil.
+
+#### Der benannte erste Schritt von Runde 5 (Lokalisierer, ein Boot)
+
+Offen ist genau eine Frage: liegen die falschen Zeilen >= 1 an der
+VOLL-ATTENTION (der handgebauten `custom_mask` / dem `qo_indptr`-Pfad des
+Verify-Wrappers) oder am GDN (der Verkettung ueber die Draft-Schritte in
+`causal_conv1d_update` + Verify-Kernel)? Beide Teile sind im VERBAND korrekt,
+also ist Lesen wenig wert — der Falsifikator ist billiger als die Analyse:
+
+Der Verify-Forward ist zustandsREIN bis zum Commit (der SSM-Kernel laeuft mit
+`disable_state_update=True`, das Conv-Fenster wird erst von
+`fused_conv_window_scatter_with_mask` zurueckgeschrieben). Also: Conv-/SSM-
+Zustand des Slots einmal sichern, den TARGET_VERIFY-Forward laufen lassen und
+`preds` merken, Zustand zurueckspielen und die Kandidaten als EINZELNE DECODES
+durchschieben (`_verify_by_decode` rechnet genau die Wahrheit fuer jede
+Zeile). Zeile fuer Zeile vergleichen. Stimmt Zeile 1 ueberein und Zeile 2
+nicht, ist es die Rekurrenz; sind alle Zeilen >= 1 gleichzeitig falsch, ist es
+die Maske. Danach erst bauen. Der Deckel `tv_max_accept` bleibt als
+Dauer-Falsifikator liegen.
+
+Und unabhaengig davon, nach der Messlage die groessere Sache: die
+Graph-Aufnahme des Verifys. Solange ein Verify-Forward 67 ms gegen 16 ms
+gefangenen Decode kostet, entscheidet nicht der Verify-Modus ueber Gewinn
+oder Verlust der Spekulation auf der Lane.
