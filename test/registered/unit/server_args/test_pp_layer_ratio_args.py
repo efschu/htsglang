@@ -254,6 +254,36 @@ class TestPipelineRejectMatrix(PartitionEnvTestCase):
                 make_args(tp_size=2, rank_gpu_id=[0, 1, 2], rank_gpu_memory_mib=15000)
             )
 
+    # --- pipeline x placement, even TP -----------------------------------
+    def test_tp1_pipeline_placement_without_a_ratio_is_admitted(self):
+        """The plainest useful pipeline: one rank per stage, each on its own
+        card, no uneven TP anywhere. This is the intra-rig smoke shape."""
+        args = run_uneven_tp(
+            make_args(
+                tp_size=1,
+                pp_size=2,
+                rank_gpu_id=[0, 1],
+                rank_gpu_memory_mib=15000,
+            )
+        )
+        self.assertEqual(args.rank_gpu_id, [0, 1])
+        self.assertEqual(len(args._rank_mem_fraction_static), 2)
+        # Stage 0 on the 32 GiB card, stage 1 on a 20 GiB card: the same MiB
+        # budget maps to different fractions.
+        self.assertAlmostEqual(args._rank_mem_fraction_static[0], 15000 / 32768)
+        self.assertAlmostEqual(args._rank_mem_fraction_static[1], 15000 / 20480)
+
+    def test_tp1_pipeline_stages_on_one_card_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, r"stages 0 and 1 on the same"):
+            run_uneven_tp(
+                make_args(
+                    tp_size=1,
+                    pp_size=2,
+                    rank_gpu_id=[0, 0],
+                    rank_gpu_memory_mib=8000,
+                )
+            )
+
     # --- pipeline x uneven TP --------------------------------------------
     def test_ratio_under_pipeline_without_placement_is_rejected(self):
         with self.assertRaisesRegex(ValueError, r"requires --rank-gpu-id"):

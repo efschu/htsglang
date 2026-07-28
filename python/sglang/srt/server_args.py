@@ -6230,10 +6230,10 @@ class ServerArgs:
         Returns the per-stage GPU groups (stage order). The length was
         already checked against pp_size x tp_size by the caller.
 
-        Disjoint placement is the admission condition, not a style rule. Two stages
-        sharing a card hold two full weight slices plus two KV pools on it and
-        run strictly in sequence -- the pipeline serialises against itself and
-        buys no capacity, which is the entire point of splitting layers. The
+        Disjoint placement is the admission condition, not a style rule. Two
+        stages sharing a card hold two full weight slices plus two KV pools on
+        it and run strictly in sequence -- the pipeline serialises against
+        itself and buys no capacity, which is the point of splitting layers. The
         co-residence budget arithmetic below would happily size it, so the
         configuration has to be refused by name rather than left to fail as a
         late OOM.
