@@ -3838,6 +3838,91 @@ class ServerArgs:
             "no collectives in the graph).",
         ),
     ] = False
+    dual_group_lane_concurrent: A[
+        bool,
+        Arg(
+            help="Multi-group runtime (#274) slice C: run the lane CONCURRENTLY "
+            "with the serving group instead of taking turns with it. The lane "
+            "gets its own thread and its own HIGH-PRIORITY CUDA stream; the "
+            "serving group keeps the default stream and becomes the "
+            "work-conserving scavenger. PD priority is expressed where the "
+            "hardware honours it -- a high-priority stream's blocks are "
+            "scheduled ahead of the scavenger's AS BLOCKS RETIRE, i.e. "
+            "preemption at the natural grain, never mid-kernel. Off (the "
+            "default) keeps the serial slice-B tick, where a lane step costs "
+            "the serving group a whole iteration of wall time.",
+        ),
+    ] = False
+    dual_group_lane_admission_ms: A[
+        float,
+        Arg(
+            help="Two-class scheduler (concurrent mode): how long the serving "
+            "group yields at an iteration boundary to let newly arrived lane "
+            "work be SUBMITTED first. Bounds the protected class's start "
+            "latency at the cost of at most this much scavenger throughput; "
+            "0 disables the yield and leaves priority entirely to the stream.",
+        ),
+    ] = 2.0
+    dual_group_lane_lend_mib: A[
+        int,
+        Arg(
+            help="Elastic occupancy stage 2 (#274): how many MiB of the lane's "
+            "reserved budget may be LENT to the serving group while the lane "
+            "is idle. Lent segments carry evacuable content only and are "
+            "returned the moment lane work arrives (the reclaim latency is "
+            "measured and reported in the lane stats). 0 disables lending.",
+        ),
+    ] = 0
+    dual_group_lane_lend_threshold_s: A[
+        float,
+        Arg(
+            help="Amortization threshold for stage-2 lending: the lane must "
+            "have been idle at least this long before anything is lent "
+            "(hysteresis, so occupancy does not flap between jobs).",
+        ),
+    ] = 5.0
+    dual_group_lane_spec: A[
+        bool,
+        Arg(
+            help="Speculation ON THE LANE (#274): assemble the NEXTN head for "
+            "the lane the same way its target model is assembled -- complement "
+            "shards under the lane's own partition vectors, a full-width hull, "
+            "shells that replace the head's collectives with local ops -- and "
+            "share the lane target's full-vocabulary embed/lm_head shells "
+            "instead of building a second set. This is NOT the same as "
+            "--speculative-draft-placement solo: that path builds the same "
+            "SHAPE but assembles its tables with a GROUP COLLECTIVE, which the "
+            "lane's rank-local bring-up must never enter (and which refuses "
+            "GGUF packed vocab outright). Requires --dual-group-lane and a "
+            "serving group that itself runs NEXTN/EAGLE with topk 1.",
+        ),
+    ] = False
+    dual_group_lane_spec_steps: A[
+        int,
+        Arg(
+            help="Chain length of the lane's speculation (topk 1, no tree): "
+            "how many tokens the lane's NEXTN head proposes before one verify "
+            "forward of the lane target. Tree speculation is deliberately not "
+            "offered -- topk > 1 is already a measured loss on this class of "
+            "rig.",
+        ),
+    ] = 3
+    dual_group_lane_speed_dial: A[
+        Optional[float],
+        Arg(
+            help="SPEED THROUGH SACRIFICE, as one explicit knob (resource "
+            "principle 3, DESIGN_201): 0.0 keeps the configured lane capacity, "
+            "1.0 shrinks the lane to its minimum (one session, one eighth of "
+            "the configured pool budget) and spends the freed budget on being "
+            "fast -- fewer concurrent sessions and a smaller KV mean shorter "
+            "pool walks, smaller graph tiers and more free VRAM for the "
+            "serving group. Values in between interpolate both posts "
+            "geometrically. Unset (the default) leaves "
+            "--dual-group-lane-budget-mib / --dual-group-lane-max-requests "
+            "exactly as given; the dial only ever REDUCES them, and the "
+            "resolved values are logged.",
+        ),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
@@ -6641,6 +6726,30 @@ class ServerArgs:
                 raise ValueError(
                     "--dual-group-lane-max-requests must be >= 1."
                 )
+            if self.dual_group_lane_spec:
+                if self.speculative_algorithm is None:
+                    raise ValueError(
+                        "--dual-group-lane-spec needs the serving group to "
+                        "run speculation too: the lane's NEXTN head is "
+                        "assembled from the serving group's head shards "
+                        "(its rank-0 shard is shared, the rest is loaded as "
+                        "the complement). Without a speculative serving "
+                        "group there are no shards to nest into."
+                    )
+                if self.speculative_eagle_topk not in (None, 1):
+                    raise ValueError(
+                        "--dual-group-lane-spec supports topk 1 only (chain "
+                        "speculation). Tree speculation is a measured loss "
+                        "on this class of rig and is not offered on the lane."
+                    )
+                if self.dual_group_lane_spec_steps < 1:
+                    raise ValueError(
+                        "--dual-group-lane-spec-steps must be >= 1."
+                    )
+        elif self.dual_group_lane_spec:
+            raise ValueError(
+                "--dual-group-lane-spec only applies with --dual-group-lane."
+            )
         elif self.dual_group_lane_budget_mib is not None:
             raise ValueError(
                 "--dual-group-lane-budget-mib only applies with "

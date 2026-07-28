@@ -39,12 +39,59 @@ are plain attribute access, and each group offers a transactional, test-only
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+
+# ---------------------------------------------------------------------------
+# Lane scope (#274 slice C): the de-globalization primitive.
+#
+# The multi-group runtime runs several lanes over one weight set in ONE
+# process. Slice B ran them SERIALLY and could therefore afford to SWAP the
+# process-global config around each lane tick (set_server_args in, restore
+# out). That swap is exactly what forbids concurrency: while the lane's args
+# are published, a concurrent serving-group forward on another thread would
+# read the LANE's config.
+#
+# The fix is an overlay rather than a swap. A lane runs its forwards on its
+# own thread; ``lane_scope`` installs the lane's identity and config into a
+# context variable, which is per-thread by construction (a fresh thread starts
+# from the variable's default). Reads therefore resolve like this:
+#
+#   lane thread     -> overlay set        -> the lane's ServerArgs
+#   serving thread  -> overlay unset      -> the process-published ServerArgs
+#
+# and nothing has to be swapped. The ~370 ``get_server_args()`` call sites in
+# the forward machinery become lane-correct without being touched; the reads
+# whose value must survive a HAND-OFF between threads (a batch built on one
+# thread and forwarded on another) are additionally pulled onto the
+# runner/batch, because a context variable does not travel with an object.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class LaneScope:
+    """The identity + config overlay of one lane of the multi-group runtime.
+
+    ``lane_id`` is ``None`` for the serving group (the default, unscoped
+    state); lanes are numbered from 0. It keys every per-lane process
+    resource that would otherwise alias across lanes (graph memory pool,
+    dequant workspace).
+    """
+
+    lane_id: Optional[int] = None
+    server_args: Any = None
+
+
+_NO_LANE = LaneScope()
+_LANE_SCOPE: contextvars.ContextVar[LaneScope] = contextvars.ContextVar(
+    "runtime.lane_scope", default=_NO_LANE
+)
 
 
 # Imported lazily so this module has no import-time dependencies: any module can
@@ -99,16 +146,36 @@ _PARALLEL_FIELDS = frozenset(
 )
 
 
+_PARALLEL_OVERRIDES: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "parallel.overrides", default={}
+)
+
+
 class ParallelContext:
-    """Parallel-topology namespace; the only instance state is ``_overrides``."""
+    """Parallel-topology namespace.
 
-    __slots__ = ("_overrides",)
+    The only instance state is the override map, and it is CONTEXT-LOCAL
+    (#274 slice C). ``override()`` has always been a strictly scoped
+    context manager used around one thread's construction or forward
+    (weightless head, draft-solo host, dual-group lane), so context-local
+    storage is semantically identical within a thread — and it is the
+    difference between correct and silently wrong once a lane forwards
+    concurrently with the serving group: a lane's ``tp_size=1`` override
+    must not be visible to the serving group's collectives.
 
-    def __init__(self):
-        self._overrides = {}
+    A freshly started thread sees an EMPTY override map, i.e. the real
+    ``parallel_state`` topology. That is the right default: a lane thread
+    installs its own geometry explicitly at start-up.
+    """
+
+    __slots__ = ()
+
+    @property
+    def _overrides(self) -> dict:
+        return _PARALLEL_OVERRIDES.get()
 
     def _v(self, name, getter):
-        overrides = self._overrides
+        overrides = _PARALLEL_OVERRIDES.get()
         return overrides[name] if name in overrides else getter()
 
     @contextmanager
@@ -118,12 +185,13 @@ class ParallelContext:
         unknown = set(kwargs) - _PARALLEL_FIELDS
         if unknown:
             raise ValueError(f"unknown parallel field(s): {sorted(unknown)}")
-        saved = dict(self._overrides)
-        self._overrides.update(kwargs)
+        merged = dict(_PARALLEL_OVERRIDES.get())
+        merged.update(kwargs)
+        token = _PARALLEL_OVERRIDES.set(merged)
         try:
             yield self
         finally:
-            self._overrides = saved
+            _PARALLEL_OVERRIDES.reset(token)
 
     @property
     def world_size(self) -> int:
@@ -378,8 +446,11 @@ class Resources(_FlagGroupBase):
     over these slots)."""
 
     # CUDA graph memory pool shared across the prefill and decode graph
-    # backends (created lazily by model_executor.runner_utils.pool).
-    graph_memory_pool: Any = None
+    # backends, keyed by lane id (created lazily by
+    # model_executor.runner_utils.pool). ``None`` keys the serving group;
+    # a lane gets its own pool so two lanes never replay into shared
+    # capture buffers (#274 slice C).
+    graph_memory_pool: dict = dataclasses.field(default_factory=dict)
     # EPLB: per-process recorder and the publish-once location metadata
     # (owning accessors live in sglang.srt.eplb).
     expert_distribution_recorder: Any = None
@@ -575,12 +646,49 @@ class RuntimeContext:
 
     @property
     def server_args(self) -> ServerArgs:
-        """The process-wide ``ServerArgs`` (context-owned slot)."""
+        """The active ``ServerArgs``: the lane overlay when one is installed
+        in this context (see ``lane_scope``), otherwise the process-wide
+        slot.
+
+        The overlay is checked first and costs one context-variable read on
+        the default path, where it resolves to the ``None`` default.
+        """
+        lane = _LANE_SCOPE.get()
+        if lane.server_args is not None:
+            return lane.server_args
         server_args = self._server_args
         if server_args is None:
             # Verbatim legacy message: tests and user scripts may match on it.
             raise ValueError("Global server args is not set yet!")
         return server_args
+
+    @contextmanager
+    def lane_scope(self, lane_id: Optional[int], server_args: Any = None):
+        """Run a block under the identity and config of one lane (#274).
+
+        Replaces slice B's ``set_server_args`` swap: this installs an
+        overlay in a CONTEXT variable instead of overwriting the process
+        slot, so a concurrent serving-group forward on another thread keeps
+        reading the serving config. Entered once per lane worker thread (it
+        then holds for that thread's lifetime) and, for the serial mode, per
+        lane tick.
+
+        ``server_args=None`` scopes only the lane IDENTITY — used by the
+        lane's bring-up before its args view exists, and by tests.
+        """
+        current = _LANE_SCOPE.get()
+        token = _LANE_SCOPE.set(
+            LaneScope(
+                lane_id=lane_id,
+                server_args=(
+                    server_args if server_args is not None else current.server_args
+                ),
+            )
+        )
+        try:
+            yield
+        finally:
+            _LANE_SCOPE.reset(token)
 
     def set_server_args(self, server_args: ServerArgs) -> None:
         """Publish the process-wide ``ServerArgs`` into the context-owned slot.
@@ -696,6 +804,19 @@ def get_server_args() -> ServerArgs:
     return _CONTEXT.server_args
 
 
+def current_lane_id() -> Optional[int]:
+    """The lane whose scope this context is in, or ``None`` for the serving
+    group (#274). The key for every per-lane process resource — a lane that
+    shares a graph memory pool or a dequant workspace with the serving group
+    is correct only as long as the two never run at the same time."""
+    return _LANE_SCOPE.get().lane_id
+
+
+def lane_scope(lane_id: Optional[int], server_args: Any = None):
+    """Module-level shim for ``RuntimeContext.lane_scope``."""
+    return _CONTEXT.lane_scope(lane_id, server_args)
+
+
 def get_flags() -> Flags:
     return _CONTEXT.flags
 
@@ -730,3 +851,5 @@ def reset_context() -> None:
     _CONTEXT.flags = Flags()
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
+    _LANE_SCOPE.set(_NO_LANE)
+    _PARALLEL_OVERRIDES.set({})

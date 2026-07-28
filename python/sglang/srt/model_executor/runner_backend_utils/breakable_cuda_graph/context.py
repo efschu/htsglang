@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
 from contextlib import contextmanager
 
@@ -25,11 +26,18 @@ from sglang.srt.model_executor.runner_backend_utils import (
 
 logger = logging.getLogger(__name__)
 
-_in_breakable_cuda_graph = False
+# Context-local (#274 slice C): this flag is read by get_is_capture_mode(),
+# so a plain global makes the SERVING group take capture-time branches
+# whenever the concurrent lane happens to be inside a breakable-graph
+# window. A fresh thread reads False, which is the correct default for a
+# lane that is not in a graph.
+_in_breakable_cuda_graph: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "breakable_cuda_graph.active", default=False
+)
 
 
 def is_in_breakable_cuda_graph() -> bool:
-    return _in_breakable_cuda_graph
+    return _in_breakable_cuda_graph.get()
 
 
 @contextmanager
@@ -37,8 +45,7 @@ def enable_breakable_cuda_graph():
     """Mark the enclosed scope as inside a BCG capture/replay. Any exception
     raised inside is logged with the BCG-specific failure hint, then re-raised
     for the caller to handle."""
-    global _in_breakable_cuda_graph
-    _in_breakable_cuda_graph = True
+    token = _in_breakable_cuda_graph.set(True)
     try:
         yield
     except Exception as exc:
@@ -48,7 +55,7 @@ def enable_breakable_cuda_graph():
         logger.error(f"{type(exc).__name__}: {exc}\n{msg}")
         raise
     finally:
-        _in_breakable_cuda_graph = False
+        _in_breakable_cuda_graph.reset(token)
 
 
 BCG_FAILURE_HINT = (

@@ -1005,11 +1005,73 @@ Working recipe on this rig (validated 2026-07-28, Qwen3.6-27B-Q3_K_M-GGUF):
   serving decode under continuous lane prefill ~+50 % wall per verify at
   full lane duty cycle — the expected SERIAL-tick price (accept length
   unchanged), not SM contention; concurrency is slice C.
+- Serial is the default and is a zero-sum split of one wall clock; for real
+  concurrency see 4.12.
 - **FP8 27B is out of reach for the SINGLE-CARD lane**: full weights once
   (~25 GiB) + rank-0 non-weight floor (~4.7 GiB) + lane pools/graphs
   (~3 GiB) > 32.6 GiB total. The feasible FP8 dual-group shape is the
   TWO-card PD lane of docs/EVAL_272_fp8_tp2_in_tp3.md (candidate A), which
   needs real lane collectives — slice C/D.
+
+
+### 4.12 Dual-group lane, CONCURRENT (#274 slice C)
+
+`--dual-group-lane-concurrent` stops the lane and the serving group taking
+turns. The lane gets its own thread — which enters the lane scope once and
+stays in it, so every `get_server_args()` / geometry / per-lane-resource read
+on that thread resolves to the lane while the scheduler thread keeps reading
+the serving config — and its own HIGH-PRIORITY CUDA stream. PD priority lands
+where the hardware honours it: a high-priority stream's blocks are scheduled
+ahead of the scavenger's as blocks retire, i.e. preemption at the natural
+grain, never mid-kernel.
+
+```bash
+# the 4.11 recipe plus:
+--dual-group-lane-concurrent \
+--dual-group-lane-admission-ms 2.0 \
+--dual-group-lane-lend-mib 1024 --dual-group-lane-lend-threshold-s 5
+```
+
+- **What it buys depends on the LANE's load shape, and by a lot.** Measured
+  as card equivalents `E = share_serving + share_lane`, where
+  `share_c = rate_c(shared window) / rate_c(solo)`. Serial tick-sharing is a
+  zero-sum split of one wall clock and measures `E` 0.91-0.97; concurrency
+  measures **1.130** with a 2048-token-prefill lane (+16 %) and **1.440**
+  with a decode-shaped lane (+57.5 %). Two SM-saturating loads cannot both
+  run at full speed on one card — concurrency only collects the gaps there.
+  A latency-bound lane load overlaps for real.
+- **The protected class pays MORE under real concurrency than under tick
+  sharing**: lane prefill +9.7 % (concurrent) vs +0.4 % (serial). That is
+  the priority promise in a different currency — serially the lane only
+  waits but computes alone; concurrently it computes at the same time and
+  shares SMs. The serving group gains more than the lane loses.
+- **VRAM cost of concurrency**: a concurrent lane gets its OWN cuda-graph
+  memory pool and its own GGUF dequant workspace (a shared pool means shared
+  intermediate buffers, and concurrent replay corrupts them; the dequant
+  workspace's safety argument is explicitly one-stream-sequential). In serial
+  mode both stay shared, so the 4.11 budgets are unchanged there.
+- `--dual-group-lane-lend-mib` lends idle lane budget to the serving group
+  and takes it back the moment lane work arrives. Measured on this rig with
+  a 1024 MiB segment: lend 0.76 ms, **reclaim 2.49 ms (max 2.71)**. A cycle
+  costs the protected class 3.25 ms, so it amortizes after ~0.1 s of hold —
+  the 5 s default threshold is there to stop flapping, not to pay for the
+  reclaim.
+- `--dual-group-lane-speed-dial` trades lane capacity for free VRAM in one
+  knob (1.0 -> budget/8, one session). On this rig it buys VRAM, not speed:
+  1600 -> 200 MiB frees 1444 MiB with lane prefill unchanged (583.1 ->
+  583.7 ms), and giving those 1444 MiB back to rank 0 does NOT raise
+  `max_total_num_tokens` (81960 either way) because the serving KV is sized
+  by the TIGHTEST rank, which is a 3080. On a rig without that asymmetry the
+  freed bytes do become serving KV.
+- `SGLANG_DUAL_GROUP_LANE_STREAM_PRIORITY=0` makes both classes equal
+  priority. Escape hatch, not a tuning knob: NCCL collective kernels
+  spin-wait, so if the protected lane ever starved a freshly launched
+  serving all-reduce the symptom would be a group stall, and this isolates
+  that question.
+- **Byte gate**: lane output ids are identical between serial and concurrent
+  mode — but only test that with a prompt under ~109 tokens. Qwen GDN
+  prefill is not byte-reproducible beyond that (upstream, every backend), so
+  a long-prompt comparison measures the model, not the runtime.
 
 
 ## 5. Credentials

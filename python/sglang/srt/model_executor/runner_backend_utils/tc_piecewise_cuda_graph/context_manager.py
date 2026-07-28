@@ -21,6 +21,7 @@ This module deliberately does **not** own torch.compile-specific state
 
 from __future__ import annotations
 
+import contextvars
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -37,12 +38,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_in_tc_piecewise_cuda_graph = False
+_in_tc_piecewise_cuda_graph: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "tc_piecewise.in_cuda_graph", default=False
+)
 
 
 def is_in_tc_piecewise_cuda_graph() -> bool:
     """True while inside tc_piecewise CUDA graph capture/replay."""
-    return _in_tc_piecewise_cuda_graph
+    return _in_tc_piecewise_cuda_graph.get()
 
 
 @contextmanager
@@ -51,8 +54,7 @@ def enable_tc_piecewise_cuda_graph():
     capture/replay. Any exception raised inside is logged with the
     PCG-specific failure hint, then re-raised for the caller to handle.
     """
-    global _in_tc_piecewise_cuda_graph
-    _in_tc_piecewise_cuda_graph = True
+    token = _in_tc_piecewise_cuda_graph.set(True)
     try:
         yield
     except Exception as exc:
@@ -62,7 +64,7 @@ def enable_tc_piecewise_cuda_graph():
         logger.error(f"{type(exc).__name__}: {exc}\n{msg}")
         raise
     finally:
-        _in_tc_piecewise_cuda_graph = False
+        _in_tc_piecewise_cuda_graph.reset(token)
 
 
 @dataclass
@@ -77,11 +79,18 @@ class TcPiecewiseForwardContext:
     raw_num_tokens: Optional[int] = None
 
 
-_tc_piecewise_forward_context: Optional[TcPiecewiseForwardContext] = None
+# Context-local, for the same reason as model_executor.forward_context: with
+# the multi-group runtime's concurrent lane (#274 slice C) two forwards are in
+# flight in one process, and the split-op boundary resolves its forward_batch
+# and attention_layers through this slot. A plain global hands the serving
+# group the lane's layers.
+_tc_piecewise_forward_context: contextvars.ContextVar[
+    Optional[TcPiecewiseForwardContext]
+] = contextvars.ContextVar("tc_piecewise.forward_context", default=None)
 
 
 def get_tc_piecewise_forward_context() -> Optional[TcPiecewiseForwardContext]:
-    return _tc_piecewise_forward_context
+    return _tc_piecewise_forward_context.get()
 
 
 @contextmanager
@@ -95,21 +104,22 @@ def set_tc_piecewise_forward_context(
     num_tokens: Optional[int] = None,
     raw_num_tokens: Optional[int] = None,
 ):
-    global _tc_piecewise_forward_context
-    _tc_piecewise_forward_context = TcPiecewiseForwardContext(
-        forward_batch=forward_batch,
-        attention_layers=attention_layers,
-        quant_config=quant_config,
-        moe_layers=moe_layers,
-        moe_fusions=moe_fusions,
-        dsa_indexers=dsa_indexers,
-        num_tokens=num_tokens,
-        raw_num_tokens=raw_num_tokens,
+    token = _tc_piecewise_forward_context.set(
+        TcPiecewiseForwardContext(
+            forward_batch=forward_batch,
+            attention_layers=attention_layers,
+            quant_config=quant_config,
+            moe_layers=moe_layers,
+            moe_fusions=moe_fusions,
+            dsa_indexers=dsa_indexers,
+            num_tokens=num_tokens,
+            raw_num_tokens=raw_num_tokens,
+        )
     )
     try:
         yield
     finally:
-        _tc_piecewise_forward_context = None
+        _tc_piecewise_forward_context.reset(token)
 
 
 TCPCG_FAILURE_HINT = (

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -504,17 +505,32 @@ def _finalize_hull_params(
     for name, param in hull.named_parameters():
         if any(name.startswith(pfx) for pfx in composed_prefixes):
             continue  # filled by _compose_column_weights_inplace
+        # Alias FIRST, then judge. A meta parameter that gets the shared
+        # tree's storage is filled, and the NEXTN head's hull is built on
+        # meta on purpose (it has no GDN conv views to preserve, and its
+        # vocab tables would otherwise cost 2.37 GiB that are replaced by
+        # the lane target's shells moments later).
+        sp = shared_params.get(name)
+        if sp is not None and sp.shape == param.shape:
+            if param.device.type == "meta":
+                # A meta placeholder cannot take .data from a real tensor
+                # (set_data rejects the type change). Replace the Parameter
+                # OBJECT on its parent instead -- which shares the very same
+                # object, so the data_ptr gate still sees identity and the
+                # byte count is still zero.
+                parent_name, _, attr = name.rpartition(".")
+                parent = hull.get_submodule(parent_name) if parent_name else hull
+                setattr(parent, attr, sp)
+            else:
+                param.data = sp.data
+            counts["aliased"] += 1
+            continue
         if param.device.type == "meta":
             raise ValueError(
                 f"dual-group lane: hull parameter {name!r} is still on meta "
-                "after shell assembly -- the hull must be built on the target "
-                "device (lazy quantized params carry no storage anyway)."
+                "and has no counterpart in the shared tree -- it would run "
+                "with no storage at all."
             )
-        sp = shared_params.get(name)
-        if sp is not None and sp.shape == param.shape:
-            param.data = sp.data
-            counts["aliased"] += 1
-            continue
         base = name.rsplit(".", 1)[-1]
         if base in ("dt_bias", "A_log"):
             pieces = [pp[name].data for pp in part_params]
@@ -628,7 +644,7 @@ def _load_complement_model(
     return model.eval()
 
 
-def _build_hull(lane_runner) -> nn.Module:
+def _build_hull(lane_runner, device=None) -> nn.Module:
     """Construct the full-width hull tree on the TARGET device.
 
     Deliberately NOT on meta: quantized big weights are lazily-initialized
@@ -649,7 +665,7 @@ def _build_hull(lane_runner) -> nn.Module:
     )
     with lane_geometry_override(1, 0):
         with set_default_torch_dtype(lane_runner.model_config.dtype):
-            with torch.device(lane_runner.device):
+            with torch.device(device or lane_runner.device):
                 hull = _initialize_model(
                     lane_runner.model_config,
                     lane_runner.load_config,
@@ -658,7 +674,72 @@ def _build_hull(lane_runner) -> nn.Module:
     return hull.eval()
 
 
-def build_lane_model(lane_runner) -> nn.Module:
+def build_lane_draft_model(lane_runner) -> nn.Module:
+    """The NEXTN head, assembled for the lane (#274 slice C).
+
+    The head is not a separate model: it is one extra decoder layer plus a
+    concat projection, sharded across the serving group in EXACTLY the
+    geometry of the main model, and it SHARES embed_tokens / lm_head with the
+    target. So it needs no new mechanism -- the complement-load + hull +
+    shell assembly applies unchanged, with the plan's unit counts already
+    proven to nest (same families, same counts).
+
+    Two things are specific to the head:
+
+    * the vocab. The draft's embed/lm_head are the TARGET's modules, and the
+      lane target already owns full-vocabulary shells over the packed
+      per-rank shards. The draft hull is pointed at those, so the lane holds
+      one set of vocab tables, not two.
+    * WHY THIS PATH AND NOT THE EXISTING ONE. ``--speculative-draft-placement
+      solo`` builds the same SHAPE (an unsharded, collective-free draft), but
+      assembles its full tables through ``_solo_init_lm_head``, which is a
+      GROUP COLLECTIVE -- forbidden on the lane's rank-local bring-up path,
+      and refused outright for GGUF packed vocab. The lane's shells do the
+      same job rank-locally, which is why the head can exist here at all.
+    """
+    hull = build_lane_model(lane_runner, kind="draft")
+    lane_target = getattr(lane_runner, "dual_group_lane_target_model", None)
+    if lane_target is not None and hasattr(hull, "set_embed_and_head_modules"):
+        embed = getattr(getattr(lane_target, "model", None), "embed_tokens", None)
+        head = getattr(lane_target, "lm_head", None)
+        hull.set_embed_and_head_modules(embed, head)
+        freed = _drop_draft_complement_vocab(lane_runner)
+        logger.info(
+            "dual-group lane draft: embed/lm_head pointed at the lane "
+            "target's full-vocabulary shells (one set of tables, not two); "
+            "released %d MiB of the head's own vocab complement.",
+            freed,
+        )
+    return hull
+
+
+def _drop_draft_complement_vocab(lane_runner) -> int:
+    """Release the head complement's OWN vocab tables.
+
+    MEASURED, and it was a factor-20 error in the feasibility estimate: the
+    head's complement load costs 2684 MiB, not the ~120 MiB the decoder layer
+    alone suggests, because the stock loader loads the head's complete
+    checkpoint -- including its share of embed_tokens and lm_head. Those are
+    exactly the tables the lane does NOT want a second copy of; the hull was
+    just pointed at the lane target's shells instead.
+
+    Unreferenced is not enough: the complement models are held alive
+    deliberately (the shells reference their decoder-layer modules through
+    plain tuples). So the vocab modules are dropped by name and the cache is
+    released, which is what makes the head affordable at all.
+    """
+    freed_before = torch.cuda.mem_get_info(lane_runner.gpu_id)[0]
+    for part in getattr(lane_runner, "dual_group_part_models", ()) or ():
+        inner = getattr(part, "model", None)
+        if inner is not None and getattr(inner, "embed_tokens", None) is not None:
+            inner.embed_tokens = None
+        if getattr(part, "lm_head", None) is not None:
+            part.lm_head = None
+    torch.cuda.empty_cache()
+    return max(0, torch.cuda.mem_get_info(lane_runner.gpu_id)[0] - freed_before) >> 20
+
+
+def build_lane_model(lane_runner, kind: str = "target") -> nn.Module:
     """The lane ModelRunner's load_model body: complement parts + hull +
     shells + the shared-byte gate.  Rank-local by contract."""
     host_runner = lane_runner.dual_group_host_runner
@@ -688,7 +769,13 @@ def build_lane_model(lane_runner) -> nn.Module:
             part_models.append(_load_complement_model(lane_runner, plan, f))
 
     free_after_complement = torch.cuda.mem_get_info(lane_runner.gpu_id)[0]
-    hull = _build_hull(lane_runner)
+    # The NEXTN head's hull goes on META: unlike the target it has no GDN
+    # mixer whose conv views are captured at construction (its single layer
+    # is full attention), and its own vocab tables are 2.37 GiB that the
+    # lane target's shells replace immediately. Everything the head's hull
+    # still needs real is replicated and is aliased onto the shared tree's
+    # storage by _finalize_hull_params.
+    hull = _build_hull(lane_runner, device="meta" if kind == "draft" else None)
     counts = assemble_lane_shells(hull, part_models)
     fill = _finalize_hull_params(hull, host_runner.model, part_models)
 
@@ -696,10 +783,20 @@ def build_lane_model(lane_runner) -> nn.Module:
     checked = 0
     for f in shared_ranks:
         checked += verify_shared_bytes(hull, part_models[f], f)
+    if checked == 0:
+        # The gate is the whole point of the shared segment: if a segment is
+        # declared shared, its bytes MUST be the resident ones. Zero
+        # identities means the assembly silently produced a private copy.
+        raise ValueError(
+            f"dual-group lane ({kind}): shared-byte gate found 0 data_ptr "
+            f"identities across shared segments {list(shared_ranks)} -- the "
+            "lane would compute on copies, not on the serving rank's bytes."
+        )
     logger.info(
-        "dual-group lane model assembled: shells column=%d row=%d embed=%d "
+        "dual-group lane %s model assembled: shells column=%d row=%d embed=%d "
         "lm_head=%d composed=%d; params aliased=%d composed_vec=%d; "
         "shared-byte gate PASSED (%d data_ptr identities).",
+        kind,
         counts["column"],
         counts["row"],
         counts["embedding"],
@@ -740,7 +837,9 @@ def build_lane_model(lane_runner) -> nn.Module:
             "lazy/shelled",
         ),
     )
-    logger.info("%s", format_vram_posts(posts, f"cuda:{lane_runner.gpu_id}"))
+    logger.info(
+        "%s", format_vram_posts(posts, f"cuda:{lane_runner.gpu_id} ({kind})")
+    )
     # Keep references so the parts stay alive (shells hold them too, via
     # plain tuples that named_parameters() does not walk).
     lane_runner.dual_group_part_models = part_models
@@ -750,6 +849,70 @@ def build_lane_model(lane_runner) -> nn.Module:
 # ---------------------------------------------------------------------------
 # Lane runner bring-up + the serial tick driver (S1 pattern)
 # ---------------------------------------------------------------------------
+
+
+def resolve_speed_dial(server_args) -> Tuple[int, int]:
+    """Resolve --dual-group-lane-speed-dial onto the lane's two capacity
+    posts and return them (pure: the serving config is not touched, the
+    caller writes them onto the lane's own args view).
+
+    "Speed through sacrifice" is a first-class regulator, not an emergent
+    property of tuning two unrelated numbers (DESIGN_201, resource principle
+    3): one dial, both posts, logged. It only ever reduces -- the configured
+    values are the capacity end of the scale, so an unset dial is exactly the
+    old behavior.
+
+    Geometric interpolation, because both posts are capacity-like: halving
+    the sessions and halving the pool are the same KIND of step wherever you
+    are on the scale, so equal dial increments should buy equal factors.
+    """
+    dial = getattr(server_args, "dual_group_lane_speed_dial", None)
+    budget = int(server_args.dual_group_lane_budget_mib or 0)
+    requests = int(server_args.dual_group_lane_max_requests)
+    if dial is None:
+        return budget, requests
+    if not 0.0 <= float(dial) <= 1.0:
+        raise ValueError(
+            "--dual-group-lane-speed-dial must be in [0.0, 1.0], got "
+            f"{dial!r}."
+        )
+    dial = float(dial)
+    # Minimum end of the scale: one session, one eighth of the pool.
+    new_budget = max(1, int(round(budget * (0.125**dial))))
+    new_requests = max(1, int(round(requests * ((1.0 / max(requests, 1)) ** dial))))
+    if (new_budget, new_requests) != (budget, requests):
+        logger.info(
+            "dual-group lane speed dial %.2f: budget %d -> %d MiB, "
+            "max_requests %d -> %d (capacity given up for speed).",
+            dial,
+            budget,
+            new_budget,
+            requests,
+            new_requests,
+        )
+    return new_budget, new_requests
+
+
+def split_lane_budget(server_args, target_model_config, draft_model_config):
+    """Split the operator's ONE lane budget between the lane's target and its
+    NEXTN head (#274 slice C).
+
+    Resource principle 2: no VRAM is duplicated that does not have to be.
+    Both lane runners read ``--dual-group-lane-budget-mib``, so without a
+    split the head would silently claim a SECOND full budget -- the lane's
+    capacity post would double behind the operator's back. It is one budget
+    and it is divided, not two budgets that happen to share a name.
+
+    The head is one decoder layer against the target's many, so its KV need
+    is that ratio of the target's. A floor keeps the pool above the
+    page/slot minimum on models with very many layers.
+    """
+    budget = int(server_args.dual_group_lane_budget_mib or 0)
+    target_layers = max(1, int(getattr(target_model_config, "num_hidden_layers", 1)))
+    draft_layers = max(1, int(getattr(draft_model_config, "num_hidden_layers", 1)))
+    draft_mib = max(64, -(-budget * draft_layers // target_layers))
+    draft_mib = min(draft_mib, max(64, budget // 4))
+    return budget - draft_mib, draft_mib
 
 
 def _lane_server_args_view(server_args):
@@ -767,19 +930,22 @@ def _lane_server_args_view(server_args):
     import copy
 
     view = copy.copy(server_args)
+    lane_budget_mib, lane_requests = resolve_speed_dial(server_args)
+    view.dual_group_lane_budget_mib = lane_budget_mib
+    view.dual_group_lane_max_requests = lane_requests
     view.speculative_algorithm = None
     view.speculative_draft_model_path = None
     if hasattr(view, "speculative_cross_algorithm"):
         view.speculative_cross_algorithm = False
     view.dcp_size = 1
-    view.max_running_requests = server_args.dual_group_lane_max_requests
+    view.max_running_requests = lane_requests
     # The lane has no radix cache (its batches use a no-op tree-cache stub),
     # so the mamba slot ratio is 1 slot per request (with the radix cache on,
     # _calculate_mamba_ratio charges ~5 slots/request for the extra-buffer
     # strategy and a 2-slot lane pool admits zero requests -- measured boot
     # failure). One spare slot for the ping-pong margin.
     view.disable_radix_cache = True
-    view.max_mamba_cache_size = server_args.dual_group_lane_max_requests + 1
+    view.max_mamba_cache_size = lane_requests + 1
     view.rank_tp_ratio = None
     view.rank_mlp_ratio = None
     view.rank_moe_ratio = None
@@ -825,14 +991,42 @@ class DualGroupLane:
     during a tick (serial contract).
     """
 
-    def __init__(self, lane_id: int, plan: NestedGroupPlan, runner):
+    def __init__(
+        self,
+        lane_id: int,
+        plan: NestedGroupPlan,
+        runner,
+        concurrent: bool = False,
+        draft_runner=None,
+        spec_steps: int = 3,
+    ):
         self.lane_id = lane_id
         self.plan = plan
         self.runner = runner
+        # Speculation on the lane (#274 slice C): the NEXTN head runner, or
+        # None. Its presence is what turns a lane step into a verify round.
+        self.draft_runner = draft_runner
+        self.spec_steps = int(spec_steps)
         self.jobs: List[Dict[str, Any]] = []
         self.active: Optional[Dict[str, Any]] = None
         self.results: List[Dict[str, Any]] = []
         self._runtime_scope = None
+        # -- concurrency (slice C) ---------------------------------------
+        self.concurrent = bool(concurrent)
+        self.stream = None
+        self._thread = None
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._submitted = threading.Event()
+        self._stop = threading.Event()
+        self._idle_since: Optional[float] = time.monotonic()
+        self._last_wall_ms: Optional[float] = None
+        self._busy = False
+        self._admission_waits: List[float] = []
+        self.lending = None  # set by the scheduler when stage-2 lending is on
+        self.results_total = 0
+        self.prefill_tokens_total = 0
+        self.decode_steps_total = 0
 
     # -- job interface (rank-local; called from the scheduler loop) -------
 
@@ -840,26 +1034,42 @@ class DualGroupLane:
         input_ids = job.get("input_ids")
         if not input_ids:
             raise ValueError("lane job needs non-empty input_ids")
-        self.jobs.append(
-            {
-                "input_ids": [int(t) for t in input_ids],
-                "max_new_tokens": int(job.get("max_new_tokens", 32)),
-                "output_ids": [],
-                "prefill_ms": None,
-                "decode_ms": [],
-            }
-        )
+        with self._lock:
+            self.jobs.append(
+                {
+                    "input_ids": [int(t) for t in input_ids],
+                    "max_new_tokens": int(job.get("max_new_tokens", 32)),
+                    "output_ids": [],
+                    "prefill_ms": None,
+                    "decode_ms": [],
+                }
+            )
+        # PD priority (addendum 5): work has arrived for the protected class.
+        # Reclaim anything lent to the scavenger BEFORE waking the worker --
+        # the reclaim latency is the guarantee quality of that priority and
+        # is measured, not assumed.
+        if self.lending is not None:
+            self.lending.on_lane_work_arrived()
+        self._idle_since = None
+        self._wake.set()
 
     @property
     def has_work(self) -> bool:
-        return self.active is not None or bool(self.jobs)
+        with self._lock:
+            return self.active is not None or bool(self.jobs) or self._busy
 
     def stats(self) -> Dict[str, Any]:
-        return {
+        stats = {
             "lane_id": self.lane_id,
             "plan": self.plan.describe(),
             "queued": len(self.jobs),
             "active": self.active is not None,
+            # The result LIST is capped (it carries per-job token ids); the
+            # counters are monotone, so a measurement window is counted by
+            # differencing them and merely SAMPLED by the list.
+            "results_total": self.results_total,
+            "prefill_tokens_total": self.prefill_tokens_total,
+            "decode_steps_total": self.decode_steps_total,
             "results": self.results[-8:],
             "weight_added_mib": getattr(
                 self.runner, "dual_group_lane_weight_added_mib", None
@@ -867,7 +1077,138 @@ class DualGroupLane:
             "max_total_num_tokens": getattr(
                 self.runner, "max_total_num_tokens", None
             ),
+            "concurrent": self.concurrent,
+            "spec": (
+                None
+                if self.draft_runner is None
+                else {"algorithm": "nextn-chain", "steps": self.spec_steps}
+            ),
         }
+        if self._admission_waits:
+            waits = self._admission_waits[-64:]
+            stats["admission_wait_ms"] = {
+                "n": len(waits),
+                "mean": round(sum(waits) / len(waits), 4),
+                "max": round(max(waits), 4),
+            }
+        if self.lending is not None:
+            stats["lending"] = self.lending.stats()
+        return stats
+
+    # -- concurrent driver (slice C) -------------------------------------
+
+    def start_worker(self) -> None:
+        """Start the lane's own thread and its high-priority CUDA stream.
+
+        The thread is where de-globalization pays off: it enters the lane
+        scope ONCE and stays in it, so every ``get_server_args()`` /
+        geometry / per-lane-resource read on this thread resolves to the
+        lane for the thread's whole life, while the scheduler thread keeps
+        reading the serving group's values. Nothing is swapped, so the two
+        may run at the same time.
+
+        The stream carries the PD priority in the only place the hardware
+        honours it: a high-priority stream's blocks are scheduled ahead of a
+        normal-priority stream's AS BLOCKS RETIRE -- preemption at the
+        natural grain, never mid-kernel (addendum 5).
+        """
+        if self._thread is not None:
+            return
+        import os
+
+        low, high = torch.cuda.Stream.priority_range()
+        # Escape hatch, not a tuning knob: NCCL's collective kernels
+        # spin-wait, so if the protected lane ever starved the serving
+        # group's freshly launched all-reduce the symptom would be a
+        # rank-0-late group stall rather than a slowdown. Setting this to 0
+        # makes both classes equal-priority and isolates that question.
+        high = int(os.environ.get("SGLANG_DUAL_GROUP_LANE_STREAM_PRIORITY", high))
+        self.stream = torch.cuda.Stream(
+            device=self.runner.gpu_id, priority=high
+        )
+        self._thread = threading.Thread(
+            target=self._worker_loop,
+            name=f"dual-group-lane-{self.lane_id}",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info(
+            "dual-group lane %d worker started: own thread + CUDA stream "
+            "(priority %d of range [%d, %d]); the serving group keeps the "
+            "default stream.",
+            self.lane_id,
+            high,
+            low,
+            high,
+        )
+
+    def stop_worker(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._wake.set()
+        self._thread.join(timeout=10.0)
+        self._thread = None
+
+    def _worker_loop(self) -> None:
+        with self._lane_runtime_scope():
+            torch.cuda.set_device(self.runner.gpu_id)
+            while not self._stop.is_set():
+                self._wake.wait(timeout=0.05)
+                self._wake.clear()
+                if self._stop.is_set():
+                    break
+                while not self._stop.is_set():
+                    with self._lock:
+                        if self.active is None and not self.jobs:
+                            self._busy = False
+                            if self._idle_since is None:
+                                self._idle_since = time.monotonic()
+                            break
+                        self._busy = True
+                    try:
+                        with torch.cuda.stream(self.stream):
+                            self._step_locked_scope()
+                    except Exception:
+                        logger.exception(
+                            "dual-group lane %d step failed; dropping the "
+                            "active job.",
+                            self.lane_id,
+                        )
+                        with self._lock:
+                            self.active = None
+
+    def _step_locked_scope(self) -> None:
+        """One lane step on the worker thread. Already inside the lane scope
+        (entered once for the thread) -- do NOT re-enter it per step."""
+        with self._lock:
+            if self.active is None:
+                self.active = self.jobs.pop(0)
+            job = self.active
+        self._submitted.clear()
+        with torch.no_grad():
+            if job["prefill_ms"] is None:
+                self._prefill(job)
+            else:
+                self._decode_step(job)
+        if (
+            len(job["output_ids"]) >= job["max_new_tokens"]
+            or (job["output_ids"] and job["output_ids"][-1] < 0)
+        ):
+            self._finish(job)
+
+    def note_admission(self, waited_ms: float) -> None:
+        """Record how long the scheduler yielded to let the lane submit
+        first at a grain boundary (the two-class scheduler's cost to the
+        scavenger, measured rather than assumed)."""
+        self._admission_waits.append(waited_ms)
+        if len(self._admission_waits) > 512:
+            del self._admission_waits[:256]
+
+    @property
+    def idle_seconds(self) -> float:
+        since = self._idle_since
+        return 0.0 if since is None else (time.monotonic() - since)
 
     # -- the tick ---------------------------------------------------------
 
@@ -876,11 +1217,12 @@ class DualGroupLane:
         Returns True when it did work.  Rank-local; never touches a
         communicator; runs under the lane geometry override so any residual
         live geometry read sees the lane, not the serving group."""
-        if self.active is None:
-            if not self.jobs:
-                return False
-            self.active = self.jobs.pop(0)
-        job = self.active
+        with self._lock:
+            if self.active is None:
+                if not self.jobs:
+                    return False
+                self.active = self.jobs.pop(0)
+            job = self.active
         with self._lane_runtime_scope(), torch.no_grad():
             if job["prefill_ms"] is None:
                 self._prefill(job)
@@ -895,26 +1237,46 @@ class DualGroupLane:
 
     @contextlib.contextmanager
     def _lane_runtime_scope(self):
-        """The serial tick's execution scope: the lane geometry override PLUS
-        the lane's server-args view published as the process config.
+        """The lane's execution scope: its identity, its config and its
+        geometry, all CONTEXT-LOCAL (#274 slice C).
 
-        The batch/forward machinery reads ``get_server_args()`` (process
-        global) at runtime -- e.g. ``prepare_for_extend`` gates the
-        mamba-radix track machinery on it, which the lane (no radix cache,
-        its own pool without track buffers) must not enter.  Ticks are
-        strictly serial with the serving group's forwards (S1), so a scoped
-        swap is safe; slice C's concurrency must move these reads off the
-        global first (known blocker, documented)."""
-        from sglang.srt.runtime_context import get_context
+        The batch/forward machinery reads ``get_server_args()`` at runtime --
+        e.g. ``prepare_for_extend`` gates the mamba-radix track machinery on
+        it, which the lane (no radix cache, its own pool without track
+        buffers) must not enter.  Slice B published the lane's args into the
+        PROCESS slot for the duration of a tick and restored them after; that
+        swap is exactly what forbade concurrency, because a serving forward
+        running at the same time would read the lane's config.
 
-        ctx = get_context()
-        saved = ctx._server_args
-        ctx.set_server_args(self.runner.server_args)
-        try:
+        ``lane_scope`` installs an OVERLAY in a context variable instead. In
+        the serial mode this is observably the same thing (same thread, same
+        nesting); in the concurrent mode the lane worker thread carries its
+        own overlay and the scheduler thread keeps reading the serving
+        config. The lane id in the same scope keys the per-lane process
+        resources (graph memory pool, GGUF dequant workspace) that would
+        otherwise alias between lanes.
+        """
+        from sglang.srt.runtime_context import lane_scope
+
+        with lane_scope(self.scope_lane_id, self.runner.server_args):
             with lane_geometry_override(1, 0):
                 yield
-        finally:
-            ctx.set_server_args(saved)
+
+    @property
+    def scope_lane_id(self) -> Optional[int]:
+        """The identity this lane presents to the per-lane RESOURCE keys
+        (graph memory pool, GGUF dequant workspace).
+
+        In SERIAL mode it is ``None``: the lane and the serving group never
+        run at the same time, so sharing those resources is sound, and
+        keeping them shared is what makes the serial mode byte-for-byte the
+        slice-B mode (same capture pool, same workspace, same VRAM posts) --
+        the hard gate slice C is not allowed to move.
+
+        In CONCURRENT mode it is the lane id, and the extra capture pool plus
+        the extra dequant workspace are the named VRAM price of concurrency.
+        """
+        return self.lane_id if self.concurrent else None
 
     def _make_batch(self, job):
         from array import array
@@ -955,16 +1317,44 @@ class DualGroupLane:
         return batch
 
     def _timed_forward(self, batch):
+        """One lane forward, timed on the LANE's stream only.
+
+        Slice B synchronized the whole DEVICE around the forward, which is
+        correct for a serial tick and fatal for a concurrent one: it would
+        wait for the serving group's kernels too, so every lane timing would
+        include the serving group's work and the lane would serialize behind
+        it. The concurrent path times with CUDA events on the lane stream and
+        synchronizes that stream alone. Wall-clock is still reported for the
+        serial path, where the two agree.
+        """
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
         runner = self.runner
-        torch.cuda.synchronize(runner.gpu_id)
+        if self.stream is None:
+            torch.cuda.synchronize(runner.gpu_id)
+            t0 = time.perf_counter()
+            forward_batch = ForwardBatch.init_new(batch, runner)
+            logits_output = runner.forward(forward_batch).logits_output
+            next_token_ids = runner.sample(logits_output, forward_batch)
+            torch.cuda.synchronize(runner.gpu_id)
+            return next_token_ids, (time.perf_counter() - t0) * 1000.0
+
+        start_ev = torch.cuda.Event(enable_timing=True)
+        end_ev = torch.cuda.Event(enable_timing=True)
         t0 = time.perf_counter()
+        start_ev.record(self.stream)
         forward_batch = ForwardBatch.init_new(batch, runner)
         logits_output = runner.forward(forward_batch).logits_output
         next_token_ids = runner.sample(logits_output, forward_batch)
-        torch.cuda.synchronize(runner.gpu_id)
-        return next_token_ids, (time.perf_counter() - t0) * 1000.0
+        end_ev.record(self.stream)
+        self._submitted.set()
+        self.stream.synchronize()
+        wall_ms = (time.perf_counter() - t0) * 1000.0
+        self._last_wall_ms = wall_ms
+        # Device time on the lane's stream: what the lane's own kernels took,
+        # including the SM share it lost to the serving group but excluding
+        # any time spent waiting for the GIL between launches.
+        return next_token_ids, start_ev.elapsed_time(end_ev)
 
     def _prefill(self, job):
         batch = self._make_batch(job)
@@ -979,6 +1369,14 @@ class DualGroupLane:
             batch.prefill_input_ids_cpu = None
         next_token_ids, ms = self._timed_forward(batch)
         job["prefill_ms"] = ms
+        # WALL minus DEVICE is the discriminator for where a degradation
+        # comes from (#274 slice C): device time is what the lane's own
+        # kernels took on the lane stream, wall time additionally contains
+        # everything the lane waited for before its kernels could run
+        # (interpreter/GIL, launch queue, admission). A degradation that
+        # shows up in DEVICE time is SM competition; one that shows up only
+        # in the wall/device GAP is submission granularity.
+        job["prefill_wall_ms"] = self._last_wall_ms
         job["output_ids"].append(int(next_token_ids[0].item()))
         job["_batch"] = batch
         job["_next"] = next_token_ids
@@ -1028,8 +1426,20 @@ class DualGroupLane:
             ),
             "decode_steps": len(decode_ms),
         }
-        self.results.append(result)
-        self.active = None
+        if job.get("prefill_wall_ms") is not None:
+            result["prefill_wall_ms"] = round(job["prefill_wall_ms"], 2)
+            result["prefill_wait_ms"] = round(
+                job["prefill_wall_ms"] - job["prefill_ms"], 2
+            )
+        with self._lock:
+            self.results.append(result)
+            self.results_total += 1
+            self.prefill_tokens_total += result["input_len"]
+            self.decode_steps_total += result["decode_steps"]
+            self.active = None
+            if not self.jobs:
+                self._busy = False
+                self._idle_since = time.monotonic()
         logger.info(
             "dual-group lane %d job done: prefill %d tokens in %.1f ms "
             "(%.1f ms/1k), %d decode steps, mean %.2f ms/step.",
@@ -1040,6 +1450,137 @@ class DualGroupLane:
             result["decode_steps"],
             result["decode_ms_mean"] or 0.0,
         )
+
+
+class LaneLending:
+    """Elastic lane occupancy, stage 2: VRAM return with a reclaim guarantee
+    (#274 / DESIGN_201 addendum 4+5).
+
+    Stage 1 (compute share) is the scheduler's business and is free: the lane
+    simply stops submitting. Stage 2 is the one with a price, and the price
+    is what this class measures.
+
+    THE CONTRACT.  The lane's pool budget is RESERVED: it is never lent
+    without a reclaim guarantee. What may be lent is the part of it the lane
+    is demonstrably not using, and the borrower may only put EVACUABLE
+    content there -- discardable scratch, or spillable session KV. Permanent
+    posts are refused. Reclaim is therefore always possible without waiting
+    for the borrower's work to finish; it costs a free (and, for spillable
+    content, an evacuation), and that cost is the guarantee quality of the PD
+    priority.
+
+    THE HYSTERESIS.  Lending is only worth it if the borrower holds the bytes
+    long enough to earn back the reclaim. The lane must be idle for
+    ``threshold_s`` before anything is lent (#156 pattern: the threshold
+    keeps the occupancy from flapping when the lane is merely between jobs),
+    and once lent, a minimum hold prevents an immediate reversal.
+
+    WHAT IS BUILT HERE.  The mechanism, its instrumentation and the
+    discardable-scratch borrower (the content class that needs no evacuation
+    path). The spillable-session-KV borrower -- the serving group placing
+    cold sessions in the lane's idle region via the #236/#242 machinery,
+    which turns the lent bytes into serving CAPACITY rather than serving
+    scratch -- reuses this same lend/reclaim interface and is the named
+    follow-on.
+    """
+
+    def __init__(
+        self,
+        lane,
+        lend_mib: int,
+        threshold_s: float,
+        min_hold_s: float = 1.0,
+    ):
+        self.lane = lane
+        self.lend_mib = int(lend_mib)
+        self.threshold_s = float(threshold_s)
+        self.min_hold_s = float(min_hold_s)
+        self._borrowed = None
+        self._lent_at: Optional[float] = None
+        self.lend_events = 0
+        self.reclaim_events = 0
+        self.refused_min_hold = 0
+        self.lend_ms: List[float] = []
+        self.reclaim_ms: List[float] = []
+
+    @property
+    def is_lent(self) -> bool:
+        return self._borrowed is not None
+
+    def maybe_lend(self) -> bool:
+        """Called by the serving group at a grain boundary. Lends only when
+        the lane has been idle past the amortization threshold."""
+        if self._borrowed is not None or self.lend_mib <= 0:
+            return False
+        if self.lane.has_work or self.lane.idle_seconds < self.threshold_s:
+            return False
+        t0 = time.perf_counter()
+        try:
+            self._borrowed = torch.empty(
+                self.lend_mib * (1 << 20),
+                dtype=torch.uint8,
+                device=f"cuda:{self.lane.runner.gpu_id}",
+            )
+        except torch.cuda.OutOfMemoryError:
+            # The lane's idle bytes are not necessarily free bytes: the
+            # caching allocator may have handed them out already. Refusing is
+            # correct -- the reservation is the lane's, not the borrower's.
+            self.lend_mib = 0
+            logger.warning(
+                "dual-group lane %d: stage-2 lend refused (out of memory); "
+                "lending disabled for this boot.",
+                self.lane.lane_id,
+            )
+            return False
+        self._lent_at = time.monotonic()
+        self.lend_events += 1
+        self.lend_ms.append((time.perf_counter() - t0) * 1000.0)
+        return True
+
+    def on_lane_work_arrived(self) -> None:
+        """PD work arrived: give the bytes back NOW. The elapsed time is the
+        reclaim latency -- the number the priority promise is worth."""
+        if self._borrowed is None:
+            return
+        if (
+            self._lent_at is not None
+            and (time.monotonic() - self._lent_at) < self.min_hold_s
+        ):
+            # Hysteresis, one-sided: a reclaim is never REFUSED (that would
+            # break the guarantee), it is only counted, so a flapping
+            # workload is visible in the stats instead of silently paying.
+            self.refused_min_hold += 1
+        t0 = time.perf_counter()
+        self._borrowed = None
+        # Discardable scratch: the free IS the evacuation. The bytes return
+        # to the one caching allocator both lanes draw from (slice A's
+        # single-address-space property), so nothing is copied.
+        torch.cuda.empty_cache()
+        self._lent_at = None
+        self.reclaim_events += 1
+        self.reclaim_ms.append((time.perf_counter() - t0) * 1000.0)
+
+    def stats(self) -> Dict[str, Any]:
+        def _summary(xs):
+            if not xs:
+                return None
+            tail = xs[-64:]
+            return {
+                "n": len(tail),
+                "mean_ms": round(sum(tail) / len(tail), 3),
+                "max_ms": round(max(tail), 3),
+            }
+
+        return {
+            "lend_mib": self.lend_mib,
+            "threshold_s": self.threshold_s,
+            "is_lent": self.is_lent,
+            "lend_events": self.lend_events,
+            "reclaim_events": self.reclaim_events,
+            "refused_min_hold": self.refused_min_hold,
+            "lend": _summary(self.lend_ms),
+            "reclaim": _summary(self.reclaim_ms),
+        }
 
 
 class _LaneTreeCacheStub:
@@ -1100,30 +1641,172 @@ def build_dual_group_lanes(scheduler) -> List[DualGroupLane]:
 
     lane_args = _lane_server_args_view(server_args)
     lane_id = 0
+    # Speculation on the lane: ONE budget, split -- decided BEFORE the target
+    # runner sizes its pools, because afterwards it is too late.
+    lane_draft_mib = 0
+    if getattr(server_args, "dual_group_lane_spec", False):
+        _hdr = _serving_draft_runner(scheduler)
+        if _hdr is None:
+            raise ValueError(
+                "--dual-group-lane-spec: the serving group has no draft "
+                "runner to nest into."
+            )
+        target_mib, lane_draft_mib = split_lane_budget(
+            server_args, host_runner.model_config, _hdr.model_config
+        )
+        lane_args.dual_group_lane_budget_mib = target_mib
+        logger.info(
+            "dual-group lane %d budget split (one budget, not two): target "
+            "%d MiB + NEXTN head %d MiB = %d MiB.",
+            lane_id,
+            target_mib,
+            lane_draft_mib,
+            server_args.dual_group_lane_budget_mib,
+        )
+    concurrent = bool(getattr(server_args, "dual_group_lane_concurrent", False))
     logger.info(
         "dual-group lane %d bring-up (rank-local): %s", lane_id, plan.describe()
     )
-    # The whole bring-up runs under the lane's server-args view published as
-    # the process config: helpers like check_cuda_graph_backend read the
-    # GLOBAL args, not runner.server_args, and must see the lane's graph
-    # plan (measured: the lane otherwise captures/skips by the serving
-    # group's plan). Serial with everything else on this rank -- the
-    # scheduler is still initializing. Restored in `finally`.
-    from sglang.srt.runtime_context import get_context
+    # The whole bring-up runs under the lane scope: helpers like
+    # check_cuda_graph_backend read the ACTIVE args, not runner.server_args,
+    # and must see the lane's graph plan (measured: the lane otherwise
+    # captures/skips by the serving group's plan). Slice B swapped the
+    # process slot here; slice C installs the context overlay instead, so
+    # the bring-up is safe even though the other ranks are already
+    # event-loop-ready.
+    #
+    # The scope carries the same lane IDENTITY the lane will forward under,
+    # so the graph capture lands in the pool the replay will use --
+    # concurrent lanes capture into their own pool, serial lanes keep
+    # sharing the serving group's exactly as in slice B.
+    from sglang.srt.runtime_context import lane_scope
 
-    ctx = get_context()
-    saved_args = ctx._server_args
-    ctx.set_server_args(lane_args)
-    try:
+    scope_lane_id = lane_id if concurrent else None
+    with lane_scope(scope_lane_id, lane_args):
         return _build_lane_under_scope(
-            scheduler, server_args, lane_args, plan, lane_id, host_runner
+            scheduler, server_args, lane_args, plan, lane_id, host_runner,
+            concurrent, lane_draft_mib,
         )
-    finally:
-        ctx.set_server_args(saved_args)
+
+
+def _serving_draft_runner(scheduler):
+    """The serving group's draft runner, whatever the spec worker calls it.
+
+    EAGLEWorkerV2 wraps an inner EagleDraftWorker and does NOT re-export
+    ``draft_runner`` at the top level (the similarly-shaped property nearby
+    answers a different question -- which runner ran the last
+    shared-buffer-reading phase). Probing by name rather than assuming keeps
+    this working across the spec-worker variants and fails with a sentence
+    instead of an AttributeError.
+    """
+    worker = getattr(scheduler, "draft_worker", None)
+    if worker is None:
+        return None
+    for path in (
+        ("_draft_worker", "draft_runner"),
+        ("draft_runner",),
+        ("model_runner",),
+    ):
+        obj = worker
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj is not None and hasattr(obj, "model_config"):
+            return obj
+    return None
+
+
+def _build_lane_draft_runner(
+    scheduler, server_args, lane_args, plan, lane_id, lane_target_runner,
+    draft_budget_mib,
+):
+    """Bring up the lane's NEXTN head as a second lane runner (#274).
+
+    Mirrors the serving group's arrangement -- a draft runner alongside the
+    target runner in one process -- with the lane's two invariants kept:
+    rank-local (no collective anywhere on this path) and shared-byte (the
+    head's rank-0 shard is the resident one, verified by data_ptr).
+
+    Its host is the serving group's DRAFT runner, not the target runner: the
+    shards the lane's head nests into are the head's shards.
+    """
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    host_draft_runner = _serving_draft_runner(scheduler)
+    if host_draft_runner is None:
+        raise ValueError(
+            "--dual-group-lane-spec: the serving group has no draft runner "
+            "to nest into. The lane's NEXTN head is assembled from the "
+            "serving head's shards; without them there is nothing to share."
+        )
+
+    logger.info(
+        "dual-group lane %d: assembling the NEXTN head (chain, topk 1) from "
+        "the serving head's shards.",
+        lane_id,
+    )
+    import copy
+
+    draft_args = copy.copy(lane_args)
+    draft_args.dual_group_lane_budget_mib = int(draft_budget_mib)
+    with lane_geometry_override(1, 0):
+        draft_runner = ModelRunner(
+            model_config=host_draft_runner.model_config,
+            mem_fraction_static=server_args.mem_fraction_static,
+            gpu_id=lane_target_runner.gpu_id,
+            tp_rank=0,
+            tp_size=1,
+            moe_ep_rank=0,
+            moe_ep_size=1,
+            pp_rank=0,
+            pp_size=1,
+            nccl_port=host_draft_runner.dist_port,
+            server_args=draft_args,
+            is_draft_worker=True,
+            is_dual_group_lane=True,
+            is_dual_group_lane_draft=True,
+            dual_group_host_runner=host_draft_runner,
+            dual_group_plan=plan,
+            dual_group_lane_id=lane_id,
+            dual_group_lane_target_model=lane_target_runner.model,
+            # Share the lane target's request table: the head describes the
+            # SAME requests, so a second table would be duplication without
+            # a purpose (mirrors the serving group's draft arrangement).
+            req_to_token_pool=lane_target_runner.req_to_token_pool,
+        )
+        draft_runner.spec_solo_rank_local_graphs = True
+    logger.info(
+        "dual-group lane %d NEXTN head assembled (pools follow the target's).",
+        lane_id,
+    )
+    return draft_runner
+
+
+def _finish_lane_draft_runner(draft_runner, lane_id):
+    """Pools, backends and graphs of the lane's NEXTN head.
+
+    Separate from the assembly because the assembly has to happen before the
+    lane target's pools exist (transient vocab tables) while these have to
+    happen after (they must see what the target actually took). The head's KV
+    is one layer against the target's many and comes out of the SAME lane
+    budget -- the lane's capacity post does not grow behind the operator's
+    back.
+    """
+    with lane_geometry_override(1, 0):
+        draft_runner.alloc_memory_pool()
+        draft_runner.init_attention_backends()
+        draft_runner.init_cuda_graphs()
+    logger.info(
+        "dual-group lane %d NEXTN head ready: max_total_num_tokens=%d.",
+        lane_id,
+        draft_runner.max_total_num_tokens,
+    )
 
 
 def _build_lane_under_scope(
-    scheduler, server_args, lane_args, plan, lane_id, host_runner
+    scheduler, server_args, lane_args, plan, lane_id, host_runner,
+    concurrent=False, lane_draft_mib=0,
 ) -> List[DualGroupLane]:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -1150,6 +1833,25 @@ def _build_lane_under_scope(
         # the capture-group barrier and the per-warmup backend barriers --
         # the same flag the draft-solo capture uses (#194 hang family).
         runner.spec_solo_rank_local_graphs = True
+
+        # ORDER MATTERS, and it cost a boot to learn: the NEXTN head's MODEL
+        # is assembled BEFORE either runner allocates its pools.
+        #
+        # The head's complement load constructs the draft's own
+        # ParallelLMHead before anything can hand it the target's -- a
+        # transient of 1.19 GiB at this vocabulary, freed moments later by
+        # set_embed_and_head_modules. Allocating the lane target's pools
+        # first leaves ~600 MiB and that transient OOMs. Assembled here it
+        # has the whole pre-pool headroom, and the freed bytes are back
+        # before either pool is sized -- the same reasoning the serving
+        # group's early embed/head share is built on.
+        draft_runner = None
+        if getattr(server_args, "dual_group_lane_spec", False):
+            draft_runner = _build_lane_draft_runner(
+                scheduler, server_args, lane_args, plan, lane_id, runner,
+                lane_draft_mib,
+            )
+
         runner.alloc_memory_pool()
         runner.init_attention_backends()
         if server_args.dual_group_lane_eager:
@@ -1162,13 +1864,36 @@ def _build_lane_under_scope(
         # it); captures are skipped when the lane view disables them.
         runner.init_cuda_graphs()
 
-    lane = DualGroupLane(lane_id=lane_id, plan=plan, runner=runner)
+        if draft_runner is not None:
+            _finish_lane_draft_runner(draft_runner, lane_id)
+
+    lane = DualGroupLane(
+        lane_id=lane_id,
+        plan=plan,
+        runner=runner,
+        concurrent=concurrent,
+        draft_runner=draft_runner,
+        spec_steps=int(getattr(server_args, "dual_group_lane_spec_steps", 3)),
+    )
+    lend_mib = int(getattr(server_args, "dual_group_lane_lend_mib", 0) or 0)
+    if lend_mib > 0:
+        lane.lending = LaneLending(
+            lane,
+            lend_mib=lend_mib,
+            threshold_s=float(
+                getattr(server_args, "dual_group_lane_lend_threshold_s", 5.0)
+            ),
+        )
+    if concurrent:
+        lane.start_worker()
     logger.info(
         "dual-group lane %d ready: max_total_num_tokens=%d, "
-        "max_running_requests=%d, graphs=%s.",
+        "max_running_requests=%d, graphs=%s, mode=%s, lend=%d MiB.",
         lane_id,
         runner.max_total_num_tokens,
         runner.max_running_requests,
         "eager" if server_args.dual_group_lane_eager else "captured",
+        "concurrent" if concurrent else "serial",
+        lend_mib,
     )
     return [lane]
