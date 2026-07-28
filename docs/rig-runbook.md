@@ -689,7 +689,34 @@ Several agents share this box; the cards are usually contended.
   intended operating point instead of growing into it, and justify sample
   counts against a measured noise floor before claiming a difference.
 
-## Memory-sizing traps (added 2026-07-28)
+### 7.1 GPU window protocol v2: per-card locks + quiet flag (2026-07-28)
+
+The old rig-wide `/tmp/gpu-owner.lock` wasted whole-rig windows on tasks that
+only touch one card, and kept the rig blocked during pure orchestration
+phases (syncs, remote boots). Rules from now on:
+
+- **One lock per physical card**: `/tmp/gpu-card-<NVML-idx>.lock` (atomic
+  `mkdir`, then write `info` with owner/purpose/acquired, same format as
+  before). NVML index = `nvidia-smi` order. On this rig: **NVML 1 = RTX 5090
+  = cuda:0**; NVML 0 and 2 are the 3080s (cuda:1/2). Always confirm by name
+  (`nvidia-smi --query-gpu=index,name --format=csv,noheader`) — the
+  torch-vs-NVML order trap is on file.
+- **Take only the cards you need, only when occupancy is imminent** (a boot
+  within ~2 min, or a server already resident). Long non-GPU phases (rsync,
+  rig-2 setup, analysis) with no resident process on a card → that card's
+  lock must be released. A resident warm server justifies holding its card's
+  lock, idle or not.
+- **Multiple cards**: acquire in ascending NVML order; if the set cannot be
+  completed within a bounded wait, release all acquired and retry.
+- **Quiet flag for latency-critical measurement windows**:
+  `/tmp/gpu-quiet.lock` (mkdir + info incl. expected duration). While it
+  exists, other agents must not START new GPU-heavy phases (model loads,
+  graph captures, big H2D) — resident idle servers are fine. Quiet windows
+  are minutes, not hours; create it right before a measurement window,
+  remove it right after. A quiet flag older than 15 min is presumed stale.
+- **Legacy compatibility**: an existing rig-wide `/tmp/gpu-owner.lock` means
+  ALL cards are taken; new-style users must honor it. Prefer per-card locks
+  for all new work.
 
 - `--mem-fraction-static` is a fraction of the GPU memory that is FREE at
   boot, not of the total: the code computes a slack of
