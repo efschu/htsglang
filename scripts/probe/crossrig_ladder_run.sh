@@ -264,8 +264,8 @@ while [ $# -gt 0 ]; do
     *) echo "[FAIL] unbekanntes Argument: $1" >&2; exit 1 ;;
   esac
 done
-case "$PHASE" in wire|neutral|ti|gpu|intra|pressure|mix|all) ;; *)
-  echo "[FAIL] --phase muss wire|neutral|ti|gpu|intra|pressure|mix|all sein" >&2; exit 1 ;;
+case "$PHASE" in wire|neutral|ti|gpu|intra|pressure|mix|loadsym|all) ;; *)
+  echo "[FAIL] --phase muss wire|neutral|ti|gpu|intra|pressure|mix|loadsym|all sein" >&2; exit 1 ;;
 esac
 
 # Trockenlauf fasst weder den echten Lock-Namensraum noch das Netz an.
@@ -1321,6 +1321,178 @@ phase_mix() {
 }
 
 # ===========================================================================
+# Phase loadsym -- symmetrischer Lastvergleich (04_OFFEN 1a), NIC-Seite.
+#
+# Der bisherige Lastvergleich stand auf drei wackligen Beinen: nur eine
+# Groesse (20 KiB), NCCL p50 gegen NIC p99, und die Fremdlast lief ueber die
+# NIC, traf NCCL also nur indirekt. Hier wird die Last symmetrisch definiert:
+# ein ZWEITER 1-MiB-Ping-Pong-Strom desselben Kartenpaars ueber DENSELBEN
+# Pfad wie die Messstrecke. Die NCCL-Seite faehrt exakt dieselbe
+# Lastdefinition ueber ihren eigenen Pfad (System-RAM/SHM):
+# nccl_loadsym_run.sh, laeuft im Container. Beide Seiten berichten p99.
+#
+# Unabhaengige Lastverifikation (Antwort auf 04_OFFEN 1c, den verdaechtigen
+# 0,99x-Punkt): die ibv-Portzaehler (port_xmit_data/port_rcv_data) werden vor
+# und nach dem Messfenster gelesen. Liegt der Byte-Umsatz des Fensters nur
+# knapp ueber dem der Messstrecke selbst, hat die Last das Fenster NICHT
+# getroffen -- dann ist die Zeile als unverifiziert markiert zu lesen.
+# ===========================================================================
+LOADSYM_SIZES="${CR_LOADSYM_SIZES:-20480,81920,1048576}"
+LOADSYM_SECS="${CR_LOADSYM_SECS:-5}"
+LOADSYM_LOAD_SECS=$(( LOADSYM_SECS * 3 + 30 ))
+
+ibv_counters() { # <ibdev> -> "<xmit_bytes> <rcv_bytes>" (Zaehler sind 4-Byte-Worte)
+  local d="/sys/class/infiniband/$1/ports/1/counters"
+  awk -v x="$(cat "$d/port_xmit_data" 2>/dev/null || echo 0)" \
+      -v r="$(cat "$d/port_rcv_data" 2>/dev/null || echo 0)" \
+      'BEGIN { printf "%.0f %.0f", x*4, r*4 }'
+}
+
+# loadsym_unit <pair> <a_ord> <b_ord> <intra|cross> <modus> <depth> <ohne|mit>
+# a_ord sendet (Client), b_ord empfaengt (Server); cross: b_ord=-1 ist
+# Rig-2-Host-RAM. Nebenlast laeuft zwischen denselben Endpunkten.
+loadsym_unit() {
+  local pair="$1" a_ord="$2" b_ord="$3" ort="$4" modus="$5" depth="$6" load="$7"
+  local sopts="--sizes=$LOADSYM_SIZES --depth=$depth --iters=2000 --warmup=200 --secs=$LOADSYM_SECS"
+  local lopts="--sizes=1048576 --depth=1 --iters=200000 --warmup=50 --secs=$LOADSYM_LOAD_SECS"
+  local nicdev; [ "$ort" = "intra" ] && nicdev="$NIC_INTRA" || nicdev="$NIC1"
+  if [ "$DRY_RUN" = "1" ]; then
+    log "  dry-run: loadsym $pair ort=$ort modus=$modus d=$depth last=$load"
+    note "# dry-run	loadsym	$pair	$ort	$modus	$depth	$load"
+    return 0
+  fi
+  if [ "$a_ord" != "-1" ] && [ "${#HELD_LOCKS[@]}" = "0" ]; then
+    log "  ABBRUCH loadsym $pair: Rig-1-Ordinal ohne gehaltenen Kartenlock"
+    return 1
+  fi
+  clear_leftovers
+  local lpid="" lrpid="" lport=$((23456 + RANDOM % 5000))
+  if [ "$load" = "mit" ]; then
+    if [ "$ort" = "intra" ]; then
+      ( CUDA_DEVICE_ORDER=PCI_BUS_ID "$BIN" server "$b_ord" "$NIC_INTRA" "$lport" "$modus" $lopts \
+          > /dev/null 2>&1 & echo $! > /tmp/cr_loadsym_srv.pid
+        sleep 0.5
+        CUDA_DEVICE_ORDER=PCI_BUS_ID "$BIN" client 127.0.0.1 "$NIC_INTRA" "$lport" "$modus" "$a_ord" $lopts \
+          > /dev/null 2>&1 ) &
+      lpid=$!
+    else
+      lrpid=$(r2_start_bg load.log "CUDA_DEVICE_ORDER=PCI_BUS_ID $R2_BIN server -1 $NIC2 $lport $modus $lopts")
+      wait_listen_remote "$lport" 20 || log "  WARN Nebenlast-Server (fern) nicht bereit"
+      ( CUDA_DEVICE_ORDER=PCI_BUS_ID "$BIN" client "$IP2" "$NIC1" "$lport" "$modus" "$a_ord" $lopts \
+          > /dev/null 2>&1 ) &
+      lpid=$!
+    fi
+    sleep 3   # Last anlaufen lassen, nicht in die Rampe messen
+  fi
+
+  local c0 c1 t0 t1
+  c0=$(ibv_counters "$nicdev"); t0=$(date +%s.%N)
+
+  local port=$((23456 + RANDOM % 5000))
+  while [ "$port" = "$lport" ]; do port=$((23456 + RANDOM % 5000)); done
+  local srv cli n rc=0
+  srv=$(mktemp); cli=$(mktemp)
+  if [ "$ort" = "intra" ]; then
+    CUDA_DEVICE_ORDER=PCI_BUS_ID "$BIN" server "$b_ord" "$NIC_INTRA" "$port" "$modus" $sopts \
+      > "$srv" 2>&1 &
+    local spid=$!
+    if wait_listen_local "$port" "$spid" 30; then
+      CUDA_DEVICE_ORDER=PCI_BUS_ID "$BIN" client 127.0.0.1 "$NIC_INTRA" "$port" "$modus" "$a_ord" $sopts \
+        > "$cli" 2>&1 || rc=1
+    else
+      log "  FAIL loadsym $pair: Server lauscht nicht: $(tail -2 "$srv"|tr '\n' ' ')"; rc=1
+    fi
+    kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
+  else
+    local rpid
+    rpid=$(r2_start_bg srv.log "CUDA_DEVICE_ORDER=PCI_BUS_ID $R2_BIN server -1 $NIC2 $port $modus $sopts")
+    if wait_listen_remote "$port" 30; then
+      CUDA_DEVICE_ORDER=PCI_BUS_ID "$BIN" client "$IP2" "$NIC1" "$port" "$modus" "$a_ord" $sopts \
+        > "$cli" 2>&1 || rc=1
+    else
+      log "  FAIL loadsym $pair: ferner Server lauscht nicht"; rc=1
+    fi
+    r2_kill_bg "$rpid"
+  fi
+
+  c1=$(ibv_counters "$nicdev"); t1=$(date +%s.%N)
+
+  # Nebenlast beenden -- eigene PIDs zuerst, dann der Reste-Check.
+  [ -n "$lpid" ] && { kill "$lpid" 2>/dev/null; wait "$lpid" 2>/dev/null; }
+  [ -r /tmp/cr_loadsym_srv.pid ] && { kill "$(cat /tmp/cr_loadsym_srv.pid)" 2>/dev/null; rm -f /tmp/cr_loadsym_srv.pid; }
+  [ -n "$lrpid" ] && r2_kill_bg "$lrpid"
+  clear_leftovers
+
+  n=$(awk -F'\t' -v pair="$pair" -v ort="$ort" -v l="$load" '
+        $1=="DATA" {
+          # DATA modus size depth ro iters p10 median p90 bytes_per_round p99 max
+          printf "%s\t%s\t%s\t%s\t%s\tlast=%s\t%s\t%s\t%s\t%s\t%s\n",
+                 pair, ort, $2, $4, $3, l, $6, $7, $8, $9, $11; c++
+        } END { print c+0 > "/dev/stderr" }' "$cli" 2>&1 >> "$RESULTS_FILE")
+  note "$(awk -v pair="$pair" -v ort="$ort" -v m="$modus" -v d="$depth" -v l="$load" \
+             -v t0="$t0" -v t1="$t1" -v c0="$c0" -v c1="$c1" 'BEGIN {
+        split(c0, a, " "); split(c1, b, " ")
+        printf "# loadsym_verify\t%s\t%s\t%s\td%s\tlast=%s\twindow_s=%.1f\txmit_MB=%.0f\trcv_MB=%.0f",
+               pair, ort, m, d, l, t1-t0, (b[1]-a[1])/1e6, (b[2]-a[2])/1e6 }')"
+  if [ "${n:-0}" = "0" ]; then
+    log "  FAIL loadsym $pair/$ort/$modus/d=$depth/last=$load: keine DATA ($(tail -2 "$cli"|tr '\n' ' '))"
+    rc=1
+  else
+    log "  ok   loadsym $pair ort=$ort modus=$modus d=$depth last=$load -> $n Punkte"
+  fi
+  rm -f "$srv" "$cli"
+  return $rc
+}
+
+phase_loadsym() {
+  log "PHASE loadsym: symmetrischer Lastvergleich (04_OFFEN 1a) -- NIC-Seite"
+  note "# ---- Phase loadsym: p99 unter symmetrischer Nebenlast ----"
+  note "# Nebenlast = zweiter 1-MiB-Ping-Pong-Strom desselben Kartenpaars ueber"
+  note "# DENSELBEN Pfad. Die NCCL-Seite faehrt dieselbe Lastdefinition ueber"
+  note "# System-RAM (nccl_loadsym_run.sh, Container). Zeitbudget je Punkt:"
+  note "# ${LOADSYM_SECS}s. Tiefen-Achse (d=4) nur auf gdr intra -- prueft, ob"
+  note "# die Dispatcher-Hypothese (immer direkt + Tiefe >= 4) auch unter Last"
+  note "# traegt. us-Werte sind der halbe Round-trip EINER RUNDE (depth"
+  note "# Nachrichten je Runde, Zeit je Nachricht = Wert/depth)."
+  note "# pair	ort	modus	depth	size_bytes	last	n	p10_us	p50_us	p90_us	p99_us"
+  faults_begin
+
+  local o5090="${ORD1[0a:00.0]:-}" o3080="${ORD1[05:00.0]:-}"
+  if [ -z "$o5090" ] || [ -z "$o3080" ]; then
+    log "  Karten nicht aufgeloest -- Phase entfaellt"; return 1
+  fi
+  acquire_card_lock "$o5090" || return 1
+  acquire_card_lock "$o3080" || { release_card_lock "$o5090"; return 1; }
+
+  local d load modus
+  intra_ip_add && {
+    for d in 1 4; do
+      for load in ohne mit; do
+        loadsym_unit "ls_5090_x_3080" "$o5090" "$o3080" intra gdr "$d" "$load"
+      done
+    done
+    for load in ohne mit; do
+      loadsym_unit "ls_5090_x_3080" "$o5090" "$o3080" intra stage 1 "$load"
+    done
+    # A-vs-A-Rauschboden: derselbe Arm doppelt, sonst ist kein Unterschied
+    # als echt behauptbar.
+    loadsym_unit "ls_5090_x_3080_avsa" "$o5090" "$o3080" intra gdr 1 ohne
+    intra_ip_del
+  }
+
+  # Cross-rig: der 1c-Verdachtspunkt (gdr unter Last 0,99x) mit
+  # Zaehler-Beleg nachgefahren; stage als Kontrast.
+  for modus in gdr stage; do
+    for load in ohne mit; do
+      loadsym_unit "ls_5090_x_rig2host" "$o5090" -1 cross "$modus" 1 "$load"
+    done
+  done
+
+  release_card_lock "$o3080"; release_card_lock "$o5090"
+  faults_end loadsym
+}
+
+# ===========================================================================
 # Main
 # ===========================================================================
 log "crossrig_ladder_run.sh Start -- Phase=$PHASE dry_run=$DRY_RUN"
@@ -1351,6 +1523,7 @@ case "$PHASE" in
   intra)    phase_intra ;;
   pressure) phase_pressure ;;
   mix)      phase_mix ;;
+  loadsym)  phase_loadsym ;;
   all)      phase_wire; phase_neutral; phase_ti; phase_gpu; phase_intra
             phase_pressure; phase_mix ;;
 esac
