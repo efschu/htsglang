@@ -78,6 +78,10 @@ __all__ = [
     "split_probe_start_payload",
     "split_probe_status_payload",
     "scenario_suggest_payload",
+    "wizard_hardware_payload",
+    "wizard_families_payload",
+    "wizard_command_payload",
+    "wizard_rejected_payload",
     "share_preview_payload",
     "share_submit_payload",
     "serve",
@@ -3353,6 +3357,407 @@ def scenario_suggest_payload(payload: Optional[dict] = None) -> dict:
 
 
 # ===========================================================================
+# #270 -- the guided configuration wizard.
+#
+# Four read-only endpoints. None of them measures, boots or applies anything:
+# every figure is composed from studies already on disk, so the wizard cannot
+# disagree with the pages that own those studies, and ``curl`` sees exactly
+# what the page draws.
+# ===========================================================================
+
+
+def wizard_hardware_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/wizard/hardware -> step 2 of the wizard.
+
+    The local cards with their measured rates where a card probe has run and
+    the nameplate where it has not, the host-level capability table (NCCL
+    co-location, MPS, RDMA, fp8 KV, DCP, uneven TP), and the remote hosts the
+    pairing store already knows. Nothing here is probed on demand -- a
+    multi-second measurement as a side effect of opening a step would be a
+    surprise the reader did not ask for. Every card says which of the two
+    numbers it is showing.
+    """
+    from sglang.srt.rigmon import capabilities as capmod
+    from sglang.srt.rigmon.card_probe import load_card_probe, measured_card_rates
+
+    det = detect_hardware()
+    try:
+        profile = load_card_probe()
+    except Exception:  # pragma: no cover - defensive
+        profile = None
+    try:
+        rates = measured_card_rates(profile)
+    except Exception:  # pragma: no cover - defensive
+        rates = {}
+    by_name: Dict[str, dict] = {}
+    for row in rates.values():
+        by_name.setdefault(str(row.get("name") or ""), row)
+
+    cards = []
+    for g in det.get("gpus") or []:
+        m = by_name.get(str(g.get("name") or ""))
+        cards.append(
+            {
+                **g,
+                "rates": m,
+                # measured/estimate/absent, the #218 vocabulary -- not a
+                # fourth word invented here.
+                "rate_provenance": "measured" if m else "absent",
+                "rate_basis": (
+                    "the card probe measured these on this machine"
+                    if m
+                    else "no card probe on disk; run it to replace the "
+                    "nameplate ranking with a measured one"
+                ),
+            }
+        )
+
+    try:
+        report = capmod.probe_all()
+        caps = report.to_json()
+    except Exception as e:  # pragma: no cover - defensive
+        caps = {"error": str(e), "capabilities": []}
+
+    remotes = []
+    try:
+        from sglang.srt.rigmon.pairing import STORE
+
+        for s in STORE.list():
+            d = s.to_json()
+            remotes.append(
+                {
+                    "session_id": d.get("session_id"),
+                    "target": d.get("target"),
+                    "complete": d.get("complete"),
+                    "blocked": d.get("blocked"),
+                    "next_step": d.get("next_step"),
+                }
+            )
+    except Exception:  # pragma: no cover - defensive
+        remotes = []
+
+    probe_age = None
+    try:
+        probe_age = profile.age_s() if profile is not None else None
+    except Exception:  # pragma: no cover - defensive
+        probe_age = None
+
+    return {
+        "ok": True,
+        "cards": cards,
+        "host_ram_mib": det.get("host_ram_mib"),
+        "cuda_index_source": det.get("cuda_index_source"),
+        "detect_error": det.get("error"),
+        "capabilities": caps,
+        "remotes": remotes,
+        "card_probe_age_s": probe_age,
+        "remote_note": (
+            "Remote hosts come from the pairing store -- the ones this rig "
+            "has already talked to. A machine that has never answered can be "
+            "added by address on the Pair rig tab; nothing about it is "
+            "assumed until it does."
+        ),
+    }
+
+
+def _wizard_context(payload: dict, profiles: dict, plan: Optional[dict]):
+    """Everything the family matrix is evaluated against, gathered once."""
+    from sglang.srt.planner import wizard as wizmod
+
+    det = detect_hardware()
+    gpus = payload.get("gpus") or det.get("gpus") or []
+
+    caps: Dict[str, dict] = {}
+    try:
+        from sglang.srt.rigmon import capabilities as capmod
+
+        for c in capmod.probe_all().to_json().get("capabilities") or []:
+            caps[str(c.get("key"))] = c
+    except Exception:  # pragma: no cover - defensive
+        caps = {}
+
+    # An explicitly EMPTY ``remotes`` means "no remote host", not "ask the
+    # store" -- otherwise a caller could not describe a rig that has none,
+    # and a stale pairing session would silently unlock the network families.
+    if "remotes" in payload:
+        remotes = list(payload.get("remotes") or [])
+    else:
+        try:
+            from sglang.srt.rigmon.pairing import STORE
+
+            remotes = [s.to_json() for s in STORE.list()]
+        except Exception:  # pragma: no cover - defensive
+            remotes = []
+
+    # Model-shaped tags for the register check. Derived from the resolved
+    # checkpoint config, never from the file name.
+    tags: List[str] = []
+    model_cfg, _ = _resolve_model_cfg_from_payload(payload)
+    hybrid = False
+    try:
+        from sglang.srt.planner import flags as flagsmod
+
+        if model_cfg:
+            hybrid = bool(flagsmod.model_is_hybrid(model_cfg))
+            quant = flagsmod.model_quant_kind(model_cfg)
+            if quant:
+                tags.append(str(quant))
+            # The cost model synthesises a GGUF config from the header and
+            # marks it with its own ``__gguf_`` hint keys; that is the signal,
+            # not the file name.
+            if any(str(k).startswith("__gguf_") for k in model_cfg):
+                tags.append("gguf")
+            if flagsmod.model_is_moe(model_cfg):
+                tags.append("moe")
+    except Exception:  # pragma: no cover - defensive
+        pass
+    if str(payload.get("model") or "").lower().endswith(".gguf"):
+        if "gguf" not in tags:
+            tags.append("gguf")
+    if payload.get("moe_resident_expert_fraction") not in (None, "", 1.0, "1.0"):
+        tags.append("moe-offload")
+    for g in gpus:
+        name = str(g.get("name") or "").lower()
+        if "2080" in name or "titan rtx" in name or " t4" in name:
+            tags.append("sm75")
+        if "3080" in name or "3090" in name or "a6000" in name:
+            tags.append("sm86")
+
+    # KV bytes per token and the length-independent state block: both come
+    # from the plan's own balance report, so the link gate is priced on the
+    # same geometry the capacity numbers are.
+    kv_cell = None
+    state_bytes = None
+    bal = (plan or {}).get("mrr_balance") or {}
+    if bal:
+        kv_cell = bal.get("kv_cell_bytes")
+        per_session = bal.get("state_mib_per_session")
+        if per_session:
+            state_bytes = float(per_session) * (2**20)
+
+    # The link the gate prices is the one BETWEEN MACHINES. The plan's
+    # ``min_link_gbs`` is the slowest intra-rig pair and is a different
+    # quantity, so it is deliberately not reused here: substituting a PCIe
+    # figure for a network one would price a handover on a line it never
+    # crosses. Without an explicit or measured cross-rig rate the gate stays
+    # absent and names the measurement.
+    link_gbs = payload.get("link_gbs")
+    link_source = payload.get("link_source") or (
+        "supplied on the form" if link_gbs else ""
+    )
+    if not link_gbs:
+        for r in remotes:
+            rate = (r or {}).get("link_gbs")
+            if rate:
+                link_gbs = rate
+                link_source = (
+                    "measured against " + str(r.get("target") or "the remote host")
+                )
+                break
+
+    # The one source here that can turn an estimate into a measurement: a
+    # split-probe row booted on this rig for THIS model. A row for another
+    # checkpoint is not carried over -- the whole point of the label is that
+    # it names a boot of the thing on the form.
+    measured = _wizard_measured_row(payload)
+
+    return wizmod.MatrixContext(
+        gpus=list(gpus),
+        remotes=remotes,
+        capabilities=caps,
+        config_tags=tuple(dict.fromkeys(tags)),
+        spill_blockers=_wizard_spill_blockers(payload),
+        hybrid=hybrid,
+        usage_pattern=(
+            "recurring"
+            if str(payload.get("usage_pattern") or "fresh") == "recurring"
+            else "fresh"
+        ),
+        context_tokens=int(payload.get("wizard_context_tokens") or 8192),
+        link_gbs=float(link_gbs) if link_gbs else None,
+        link_source=str(link_source),
+        satellite_prefill_tok_s=(
+            float(payload["satellite_prefill_tok_s"])
+            if payload.get("satellite_prefill_tok_s")
+            else None
+        ),
+        kv_bytes_per_token=float(kv_cell) if kv_cell else None,
+        state_bytes=state_bytes,
+        measured=measured,
+    )
+
+
+def _wizard_measured_row(payload: dict) -> Optional[dict]:
+    """The split-probe baseline row for the model on the form, or None.
+
+    Read-only: the store is loaded from disk and re-runs its own ingest guard
+    on load, so a row that claims ``measured`` carries numbers. An
+    ``unbootable`` row is returned like any other -- it is a finding about
+    this configuration, not a gap in the table.
+    """
+    from sglang.srt.planner import split_probe as spmod
+
+    try:
+        model_path = _plan_call_args(payload)[0]
+    except Exception:  # pragma: no cover - defensive
+        return None
+    try:
+        store = spmod.SplitProbeStore.load()
+        latest = store.latest()
+    except Exception:  # pragma: no cover - defensive
+        return None
+    entry = latest.get(spmod.BASELINE_CANDIDATE)
+    if entry is None or str(entry.model_path or "") != str(model_path):
+        return None
+    # The age of a boot is part of reading it, so the label carries a date
+    # rather than an epoch float.
+    stamp = entry.timestamp
+    try:
+        import datetime
+
+        stamp = (
+            datetime.datetime.fromtimestamp(
+                float(entry.timestamp), datetime.timezone.utc
+            )
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+    except (TypeError, ValueError):  # already a string, or unset
+        pass
+    return {
+        "candidate": entry.candidate,
+        "timestamp": stamp,
+        "provenance": entry.provenance,
+        "unbootable": entry.unbootable,
+        "decode_tok_s": entry.decode_tok_s,
+        "prefill_tok_s": entry.prefill_tok_s,
+        "max_total_num_tokens": entry.max_total_num_tokens,
+        "ms_per_verify": entry.ms_per_verify,
+        "accept_length": entry.accept_length,
+    }
+
+
+def _wizard_spill_blockers(payload: dict) -> Dict[str, str]:
+    """Form settings that the spill lane refuses at arg parse.
+
+    Named here so the matrix can print the refusal before a boot does. The
+    conditions mirror ``_handle_kv_session_offload``; they are not re-derived
+    from a general rule, because the engine's list is the authority.
+    """
+    out: Dict[str, str] = {}
+    backend = payload.get("attention_backend")
+    if backend and str(backend) != "flashinfer":
+        out["attention_backend_not_flashinfer"] = (
+            "session KV spill accepts only --attention-backend flashinfer; "
+            f"this configuration asks for {backend!r}"
+        )
+    page = payload.get("page_size")
+    if page not in (None, "", 1, "1"):
+        out["page_size_not_1"] = (
+            "session KV spill accepts only --page-size 1; this "
+            f"configuration asks for {page!r}"
+        )
+    return out
+
+
+def wizard_families_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/wizard/families -> step 3 of the wizard.
+
+    Every deployment family this rig could carry, with the five target
+    quantities priced, and every family it could not, with the reason. The
+    four capacity/throughput targets are the working points' own figures,
+    carried through unchanged; the fifth (time to first token) has its own
+    logic per family and always comes back as a PAIR, idle and under load,
+    because load on the serving cards is what actually moves it.
+
+    Body: the ordinary plan payload, plus ``usage_pattern``
+    (``fresh``/``recurring``), ``wizard_context_tokens`` and, when a satellite
+    is in play, ``satellite_prefill_tok_s``.
+
+    Boots nothing, measures nothing, applies nothing.
+    """
+    from sglang.srt.planner import wizard as wizmod
+
+    payload = payload or {}
+    profiles = lever_profiles_payload(payload)
+    plan = _plan_for_factors(payload)
+    try:
+        ctx = _wizard_context(payload, profiles, plan)
+        return wizmod.build_matrix(profiles, context=ctx, plan=plan)
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "reasons": [str(e)], "families": []}
+
+
+def wizard_command_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/wizard/command -> the launch command for one family.
+
+    Body: ``{family, spill?, overrides?}`` plus the ordinary plan payload. The
+    argv comes from the planner's own profile generator, never from a flag
+    list assembled here, so the wizard and the runner tab launch the same
+    server. ``overrides`` is the expert view's edited flag map; the answer
+    carries the guided command, the edited one and the difference between
+    them, so an edit reads as an edit rather than as a second recommendation.
+
+    Generates text. Starts nothing.
+    """
+    from sglang.srt.planner import flags as flagsmod
+    from sglang.srt.planner import wizard as wizmod
+
+    payload = payload or {}
+    family = str(payload.get("family") or "")
+    fam = {f.key: f for f in wizmod.FAMILIES}.get(family)
+    if fam is None:
+        return {"ok": False, "error": f"unknown family {family!r}"}
+
+    profile: Optional[dict] = None
+    if fam.profile_kind:
+        try:
+            generated = config_profiles_get(payload).get("generated") or []
+        except Exception:  # pragma: no cover - defensive
+            generated = []
+        for p in generated:
+            if p.get("kind") == fam.profile_kind:
+                profile = p
+                break
+        if profile is None and generated:
+            # The preset this family launches from is not in the generated
+            # set for this rig (a single-card rig has no uneven preset, for
+            # instance). Fall back to the first one and say which, rather
+            # than emitting an argv from nowhere.
+            profile = generated[0]
+
+    out = wizmod.build_command(
+        family,
+        profile=profile,
+        spill=str(payload.get("spill") or "off"),
+        overrides=payload.get("overrides") or {},
+        python_exe=str(payload.get("python_exe") or "$VENV/bin/python"),
+    )
+    if out.get("ok"):
+        out["profile_kind_wanted"] = fam.profile_kind
+        out["profile_kind_used"] = (profile or {}).get("kind")
+        out["upstream_count"] = flagsmod.upstream_count()
+    return out
+
+
+def wizard_rejected_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/wizard/rejected -> the rejected register, as data.
+
+    The blocklist the wizard consults before it proposes anything. Two levels:
+    ``blocked`` is never offered, ``not-default`` is offered on request and
+    always with the counter-number that settled it. Every row carries its
+    evidence, because a rejection without a number is an opinion and an
+    opinion cannot bind a later attempt.
+    """
+    from sglang.srt.planner import rejected as rejmod
+
+    level = (payload or {}).get("level")
+    if level and level not in rejmod.LEVELS:
+        return {"ok": False, "error": f"unknown level {level!r}"}
+    return rejmod.register_json(level or None)
+
+
+# ===========================================================================
 # #152 -- GitHub results sharing (thin adapters over github_share.py).
 # Preview-first + explicit confirm; the PAT is per-use, never persisted,
 # never logged, never echoed, and redacted from every error message.
@@ -3535,6 +3940,23 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/flag_catalog"):
             try:
                 self._json(200, flag_catalog_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        # #270 wizard, read side. Both paths extend /api/wizard, so they are
+        # matched before any bare /api/wizard prefix could swallow them.
+        if self.path.startswith("/api/wizard/hardware"):
+            try:
+                self._json(200, wizard_hardware_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/wizard/rejected"):
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, wizard_rejected_payload(q))
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
@@ -3753,6 +4175,15 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/bench_factors"):
                 self._json(200, bench_factors_payload(payload))
+                return
+            # #270 wizard. /api/wizard/families and /api/wizard/command are
+            # distinct prefixes; neither is a prefix of the other, so the
+            # order between them does not matter.
+            if self.path.startswith("/api/wizard/families"):
+                self._json(200, wizard_families_payload(payload))
+                return
+            if self.path.startswith("/api/wizard/command"):
+                self._json(200, wizard_command_payload(payload))
                 return
             if self.path.startswith("/api/share_preview"):
                 self._json(200, share_preview_payload(payload))
@@ -4347,6 +4778,17 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   .sc-why .p.measured { color: var(--ok); border-color: var(--ok-dim); }
   .sc-why .p.estimate { color: var(--warn); border-color: var(--warn-dim); }
   .sc-why .p.absent   { color: var(--fg-muted); }
+  /* #270: the same three provenance pills, used unscoped by the guide's
+     family table. One definition, so a label cannot look like measurement on
+     one page and like a guess on another. */
+  #view_wizard .p { border: 1px solid var(--bd-weak); border-radius: 2px;
+                    padding: 0 4px; font-size: var(--t-xs); white-space: nowrap; }
+  #view_wizard .p.measured { color: var(--ok); border-color: var(--ok-dim); }
+  #view_wizard .p.estimate { color: var(--warn); border-color: var(--warn-dim); }
+  #view_wizard .p.absent   { color: var(--fg-muted); }
+  #view_wizard pre { background: var(--bg-input); border: 1px solid var(--bd-weak);
+                     border-radius: var(--radius); padding: var(--s2);
+                     font-size: var(--t-sm); margin: var(--s2) 0; }
   /* #232 tipping point: one row per split candidate, measured or not. */
   table.tp { width: 100%; border-collapse: collapse; font-size: var(--t-sm);
              font-variant-numeric: tabular-nums; margin-top: var(--s2); }
@@ -4388,6 +4830,8 @@ _INDEX_TEMPLATE = r"""<!doctype html>
 <div class="tabs">
   <button id="tab_landing" class="tab active" onclick="showTab('landing')"
     title="live monitor of any reachable sglang server">Monitor</button>
+  <button id="tab_wizard" class="tab" onclick="showTab('wizard')"
+    title="guided configuration: model, hardware, every deployment family with its numbers">Guide</button>
   <button id="tab_runner" class="tab" onclick="showTab('runner')"
     title="models, capacity planner and server launch">Planner</button>
   <button id="tab_bench" class="tab" onclick="showTab('bench')"
@@ -4402,6 +4846,90 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     title="rendering / instruction-following checks">Quality</button>
   <button id="tab_pair" class="tab" onclick="showTab('pair')"
     title="couple a second rig">Pair rig</button>
+</div>
+
+<!-- #270 -- guided configuration. Three steps, then the command. Every
+     number, every refusal and every generated flag comes from
+     /api/wizard/*, so this block renders and derives nothing: `curl` and the
+     page cannot disagree about the same rig. -->
+<div id="view_wizard" style="display:none">
+  <div class="sub">Say what you are serving and what you want most of. The
+    answer is every deployment family this rig can carry with its numbers,
+    and every family it cannot with the reason. Nothing here measures, boots
+    or applies anything &mdash; it composes studies already on disk. A figure
+    with no study behind it says <b>absent</b> and names the study that would
+    produce it, rather than showing a stand-in.</div>
+
+  <fieldset>
+    <legend>1 &mdash; model</legend>
+    <div class="setrow">
+      <span class="lbl">checkpoint</span>
+      <span id="wz_model" class="mono muted">nothing picked yet</span>
+    </div>
+    <div class="actions">
+      <button class="mini secondary" onclick="showTab('runner')">pick on the
+        Planner tab</button>
+      <span class="muted">The wizard reads the same form the Planner edits, so
+        the two never describe different configurations.</span>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>2 &mdash; hardware</legend>
+    <div id="wz_hw"><span class="muted">loading&hellip;</span></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>3 &mdash; what you want most of</legend>
+    <div class="setrow">
+      <span class="lbl" id="row_wz_target">target quantity</span>
+      <select id="wz_target" class="num" onchange="wizardFamilies()"></select>
+    </div>
+    <div class="setrow">
+      <span class="lbl" id="row_wz_usage">prompt pattern</span>
+      <select id="wz_usage" class="num" onchange="wizardFamilies()">
+        <option value="fresh">fresh long prompts</option>
+        <option value="recurring">recurring prefixes</option>
+      </select>
+    </div>
+    <div class="setrow">
+      <span class="lbl">context the answer is priced at</span>
+      <input type="number" id="wz_ctx" class="num" min="256" step="1024"
+             value="8192" onchange="wizardFamilies()">
+    </div>
+    <div class="actions">
+      <button onclick="wizardFamilies()" id="wz_btn">Show the families</button>
+      <span id="wz_note" class="muted"></span>
+    </div>
+  </fieldset>
+
+  <div id="wz_families"><span class="muted">pick a model, then show the
+    families.</span></div>
+
+  <fieldset>
+    <legend>command</legend>
+    <div id="wz_cmd"><span class="muted">choose a family above.</span></div>
+  </fieldset>
+
+  <fieldset class="cfg-section">
+    <legend>expert view &mdash; every flag, and the difference from the guide</legend>
+    <div class="muted" style="margin-bottom:var(--s2)">One flag per line,
+      <code>--flag value</code>. What you change here is shown as a difference
+      against the guided command, not as a second recommendation.</div>
+    <textarea id="wz_overrides" rows="4" style="width:100%"
+      placeholder="--context-length 32768&#10;--max-running-requests 4"
+      oninput="wizardCommandDebounced()"></textarea>
+    <div id="wz_diff" class="muted" style="margin-top:var(--s2)">no edits.</div>
+  </fieldset>
+
+  <fieldset class="cfg-section">
+    <legend>never proposed &mdash; the rejected register</legend>
+    <div class="muted" style="margin-bottom:var(--s2)">Combinations this
+      project already settled. A blocked row is never offered; a
+      not-default row is available on request and always carries the number
+      that decided it.</div>
+    <div id="wz_rejected"><span class="muted">loading&hellip;</span></div>
+  </fieldset>
 </div>
 
 <div id="view_pair" style="display:none">
@@ -6184,7 +6712,7 @@ async function doIssue(kind) {
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
 function showTab(t) {
-  const TABS = ['landing','runner','bench','explore','landscape','energy','quality','pair'];
+  const TABS = ['landing','wizard','runner','bench','explore','landscape','energy','quality','pair'];
   for (const v of TABS) $('view_'+v).style.display = t===v ? '' : 'none';
   for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
   if ((t==='explore'||t==='landscape') && !window._profLoaded) loadProfiles();
@@ -6195,6 +6723,17 @@ function showTab(t) {
     loadFlagCatalog(); refreshServerStatus();
   }
   if (t==='bench' && !window._benchInit) { window._benchInit=true; benchInit(); }
+  // The guide needs the same model list and card list the Planner does, so
+  // entering it warms them once rather than holding a second copy.
+  if (t==='wizard') {
+    if (!window._wizardInit) {
+      window._wizardInit=true;
+      if (!window._runnerInit) { window._runnerInit=true; detectGPUs(); loadModels();
+        loadFlagCatalog(); refreshServerStatus(); }
+      wizardInit();
+    }
+    wizardSyncModel();
+  }
   // The lead-metric poll runs only while its tab is visible.
   if (t!=='bench') benchLeadStop();
   // Pairing state lives on the host, so entering the tab READS it rather than
@@ -8089,6 +8628,260 @@ function renderSimpleVerdict(d){
     +'and every dimension this fork exposes.</div>';
   setHTML(box,h);
 }
+// ===========================================================================
+// #270 -- guided configuration wizard.
+//
+// Rendering only. Every figure, every refusal and every generated flag comes
+// from /api/wizard/*; nothing on this page derives a number, decides whether
+// a family is possible, or assembles an argv. That is what keeps the page and
+// `curl` from disagreeing, and it is why a family the backend refuses is
+// drawn with the backend's own words rather than a locally invented sentence.
+// ===========================================================================
+window._wizard=null; window._wizardFamily=null; window._wizardSpill='off';
+
+function wizardBody(){
+  const b=Object.assign({}, payload());
+  const u=$('wz_usage'); if(u) b.usage_pattern=u.value;
+  const c=$('wz_ctx'); if(c&&c.value) b.wizard_context_tokens=parseInt(c.value);
+  return b;
+}
+function wizardSyncModel(){
+  const m=($('model')&&$('model').value.trim())||'';
+  const el=$('wz_model'); if(!el) return;
+  setHTML(el, m?esc(m):'<span class="muted">nothing picked yet &mdash; pick '
+    +'one on the Planner tab</span>');
+}
+async function wizardInit(){
+  const sel=$('wz_target');
+  if(sel&&!sel.options.length){
+    // The target list is the backend's, so a quantity cannot exist here and
+    // nowhere else.
+    sel.innerHTML='<option value="">(loading)</option>';
+  }
+  wizardRejected();
+  try{
+    const d=await api('/api/wizard/hardware',{key:'wizard_hw'});
+    renderWizardHardware(d);
+  }catch(e){
+    if(!apiAborted(e)) setHTML($('wz_hw'),
+      '<div class="rev-error">'+esc(apiError(e))+'</div>');
+  }
+}
+function renderWizardHardware(d){
+  const box=$('wz_hw'); if(!box) return;
+  if(!d||!d.ok){ setHTML(box,'<span class="muted">'
+    +esc((d&&d.detect_error)||'no hardware detected')+'</span>'); return; }
+  let h='<table class="lp"><tr><th>card</th><th>total</th><th>memory bw</th>'
+    +'<th>fp8 GEMM</th><th>rates</th></tr>';
+  for(const c of (d.cards||[])){
+    const r=c.rates||{};
+    h+='<tr><td>'+esc(c.name||'')+'</td><td>'+fmtMib(c.total_mib)+'</td>'
+      +'<td>'+(r.membw_gbs?r.membw_gbs.toFixed(0)+' GB/s':'&mdash;')+'</td>'
+      +'<td>'+(r.gemm_fp8_tflops?r.gemm_fp8_tflops.toFixed(1)+' TF':'&mdash;')+'</td>'
+      +'<td><span class="p '+esc(c.rate_provenance)+'" title="'
+      +esc(c.rate_basis||'')+'">'+esc(c.rate_provenance)+'</span></td></tr>';
+  }
+  h+='</table>';
+  const caps=(d.capabilities&&d.capabilities.capabilities)||[];
+  if(caps.length){
+    h+='<div style="margin-top:var(--s2)">';
+    for(const c of caps)
+      h+='<span class="pill" title="'+esc(c.reason||'')+'">'+esc(c.label||c.key)
+        +': '+esc(c.state)+'</span> ';
+    h+='</div>';
+  }
+  const rem=d.remotes||[];
+  h+='<div class="legend" style="margin-top:var(--s2)">'
+    +(rem.length?('remote hosts: '+rem.map(r=>esc(r.target||'')+(r.complete?'':
+      ' (pairing incomplete)')).join(', '))
+     :'no remote host known &mdash; couple one on the <b>Pair rig</b> tab to '
+      +'unlock the network families')
+    +'. '+esc(d.remote_note||'')+'</div>';
+  setHTML(box,h);
+}
+async function wizardRejected(){
+  const box=$('wz_rejected'); if(!box) return;
+  try{
+    const d=await api('/api/wizard/rejected',{key:'wizard_rej'});
+    let h='<table class="lp"><tr><th>combination</th><th>level</th>'
+      +'<th>verdict</th><th>evidence</th></tr>';
+    for(const e of (d.entries||[]))
+      h+='<tr><td>'+esc(e.what)+'</td><td>'+esc(e.level)+'</td><td>'
+        +esc(e.verdict)+'</td><td class="muted">'+esc(e.evidence)+'</td></tr>';
+    setHTML(box,h+'</table>');
+  }catch(e){
+    if(!apiAborted(e)) setHTML(box,'<div class="rev-error">'+esc(apiError(e))+'</div>');
+  }
+}
+async function wizardFamilies(){
+  const box=$('wz_families'); if(!box) return;
+  wizardSyncModel();
+  const model=($('model')&&$('model').value.trim())||'';
+  if(!model){ setHTML(box,'<span class="muted">pick a model first.</span>'); return; }
+  stale(box,true);
+  let d;
+  try{
+    d=await api('/api/wizard/families',
+      {key:'wizard_fam', body:wizardBody(), timeout:30000});
+  }catch(e){
+    if(apiAborted(e)) return;
+    setHTML(box,'<div class="rev-error">'+esc(apiError(e))+'</div>'); return;
+  } finally { stale(box,false); }
+  window._wizard=d;
+  const sel=$('wz_target');
+  if(sel&&d.ok){
+    const cur=sel.value;
+    sel.innerHTML=(d.targets||[]).map(t=>'<option value="'+esc(t.key)+'"'
+      +(t.key===cur?' selected':'')+'>'+esc(t.label)+'</option>').join('');
+  }
+  renderWizardFamilies();
+}
+function wzCell(c){
+  if(!c) return '<span class="muted">&mdash;</span>';
+  const p='<span class="p '+esc(c.provenance)+'" title="'+esc(c.basis||'')
+    +'">'+esc(c.provenance)+'</span>';
+  if(!c.available) return p;
+  const v=c.value;
+  const s=(Math.abs(v)>=1000)?Math.round(v).toLocaleString():v.toFixed(2);
+  return '<b>'+s+'</b> '+esc(c.unit||'')+' '+p;
+}
+function renderWizardFamilies(){
+  const d=window._wizard, box=$('wz_families'); if(!box) return;
+  if(!d||!d.ok){
+    setHTML(box,'<div class="verdict nofit">no plan</div><ul class="reasons">'
+      +((d&&d.reasons)||[]).map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>');
+    return;
+  }
+  const want=($('wz_target')&&$('wz_target').value)||'max_kv';
+  let h='';
+  for(const f of (d.families||[])){
+    const fit=f.feasible;
+    h+='<fieldset><legend>'+esc(f.label)+' &mdash; '
+      +(fit?'<span class="st-pass">possible here</span>'
+           :'<span class="st-blocked">not possible here</span>')+'</legend>';
+    h+='<div class="muted">'+esc(f.purpose)+'</div>';
+    h+='<details class="cfg-section"><summary class="sec-sum">what this family '
+      +'is, in full</summary><div class="sec-body">'+esc(f.explain)+'</div></details>';
+    h+='<table class="lp"><tr><th>spill</th><th>where</th><th>context</th>'
+      +'<th>decode</th><th>prefill</th><th>parallel</th>'
+      +'<th>TTFT idle / under load</th><th>worst inter-token</th></tr>';
+    for(const v of (f.variants||[])){
+      if(!v.feasible){
+        h+='<tr><td>'+esc(v.spill)+'</td><td>'+esc(v.locality)+'</td>'
+          +'<td colspan="6" class="st-blocked">'
+          +(v.reasons||[]).map(r=>esc(r.reason)
+            +(r.source?' <span class="muted">['+esc(r.source)+']</span>':''))
+            .join('<br>')+'</td></tr>';
+        continue;
+      }
+      const t=v.targets||{}, tt=t.ttft||{};
+      h+='<tr'+(want&&t[want]&&t[want].available?' style="font-weight:600"':'')
+        +'><td>'+esc(v.spill)+'</td><td>'+esc(v.locality)+'</td>'
+        +'<td>'+wzCell(t.max_kv)+'</td><td>'+wzCell(t.max_decode)+'</td>'
+        +'<td>'+wzCell(t.max_prefill)+'</td><td>'+wzCell(t.max_parallel)+'</td>'
+        +'<td>'+wzCell(tt.idle)+' / '+wzCell(tt.loaded)+'</td>'
+        +'<td>'+wzCell(v.undisturbedness)+'</td></tr>';
+      if((v.notes||[]).length)
+        h+='<tr><td colspan="8" class="legend">'
+          +v.notes.map(n=>esc(n)).join('<br>')+'</td></tr>';
+      for(const a of (v.advisories||[]))
+        h+='<tr><td colspan="8" class="est">measured and not chosen: '
+          +esc(a.what)+' &mdash; '+esc(a.verdict)+' ['+esc(a.evidence)+']</td></tr>';
+    }
+    h+='</table>';
+    if(fit)
+      h+='<div class="actions"><button class="mini" onclick="wizardPick('
+        +"'"+esc(f.key)+"'"+')">build the command</button></div>';
+    h+='</fieldset>';
+  }
+  const g=d.link_gate||{};
+  h+='<fieldset><legend>link gate &mdash; what a handover costs on the wire</legend>';
+  if(!g.available){
+    h+='<div class="muted"><span class="p absent">absent</span> '
+      +esc(g.reason||'')+'</div>';
+  }else{
+    h+='<table class="lp"><tr><th>context</th><th>bytes moved</th>'
+      +'<th>at '+g.link_gbs.toFixed(2)+' GB/s</th></tr>';
+    for(const r of (g.rows||[]))
+      h+='<tr><td>'+r.context_tokens.toLocaleString()+'</td><td>'
+        +r.mib.toFixed(0)+' MiB</td><td>'+r.seconds.toFixed(3)+' s</td></tr>';
+    h+='</table><div class="legend">'+esc(g.basis||'')+' &mdash; link source: '
+      +esc(g.link_source||'')+'. The same bytes over 1 GbE ('
+      +g.counterfactual_1gbe_gbs+' GB/s) cost about '
+      +(g.link_gbs/g.counterfactual_1gbe_gbs).toFixed(0)+'x as long, which is '
+      +'what says whether a slower line changes the verdict or only the '
+      +'arithmetic.</div>';
+  }
+  h+='</fieldset>';
+  const mods=(d.modifiers||[]).filter(m=>m.applies);
+  if(mods.length){
+    h+='<fieldset><legend>modifiers &mdash; these ride on a family, they are not one</legend>';
+    for(const m of mods)
+      h+='<div>'+esc(m.label)+': '
+        +(m.available?'<span class="st-pass">available</span>'
+                     :'<span class="st-blocked">'+esc(m.reason)+'</span>')
+        +' <span class="legend">'+esc(m.note||'')
+        +(m.source?' ['+esc(m.source)+']':'')+'</span></div>';
+    h+='</fieldset>';
+  }
+  setHTML(box,h);
+}
+function wizardPick(key){
+  window._wizardFamily=key;
+  wizardCommand();
+}
+function wizardOverrides(){
+  const t=$('wz_overrides'); if(!t) return {};
+  const out={};
+  for(const line of (t.value||'').split('\n')){
+    const s=line.trim(); if(!s) continue;
+    const m=s.match(/^(--[A-Za-z0-9-]+)(?:[ =](.*))?$/);
+    if(!m) continue;
+    out[m[1]]=(m[2]===undefined||m[2]==='')?true:m[2].trim();
+  }
+  return out;
+}
+async function wizardCommand(){
+  const box=$('wz_cmd'); if(!box) return;
+  if(!window._wizardFamily){
+    setHTML(box,'<span class="muted">choose a family above.</span>'); return; }
+  const body=Object.assign({}, wizardBody(),
+    {family:window._wizardFamily, spill:window._wizardSpill,
+     overrides:wizardOverrides()});
+  stale(box,true);
+  let d;
+  try{
+    d=await api('/api/wizard/command',{key:'wizard_cmd', body:body, timeout:30000});
+  }catch(e){
+    if(apiAborted(e)) return;
+    setHTML(box,'<div class="rev-error">'+esc(apiError(e))+'</div>'); return;
+  } finally { stale(box,false); }
+  if(!d.ok){ setHTML(box,'<div class="rev-error">'+esc(d.error||'')+'</div>'); return; }
+  let h='<div class="muted">'+esc(d.label)+' &mdash; recipe '+esc(d.recipe)+'</div>';
+  h+='<pre style="white-space:pre-wrap;word-break:break-all">'
+    +esc(d.diff&&d.diff.length?d.edited_command:d.command)+'</pre>';
+  for(const a of (d.arms||[]))
+    h+='<div class="legend"><b>'+esc(a.role)+'</b>: '+esc(a.note)+' ['
+      +esc(a.recipe)+']</div>';
+  if((d.notes||[]).length)
+    h+='<div class="legend">'+d.notes.map(n=>esc(n)).join('<br>')+'</div>';
+  h+='<details class="cfg-section"><summary class="sec-sum">where each flag '
+    +'came from</summary><div class="sec-body"><table class="lp">'
+    +(d.provenance||[]).map(p=>'<tr><td>'+esc(p.flag)+'</td><td>'
+      +esc(p.value===null?'':''+p.value)+'</td><td class="muted">'+esc(p.why)
+      +'</td></tr>').join('')+'</table></div></details>';
+  setHTML(box,h);
+  const diff=$('wz_diff');
+  if(diff) setHTML(diff,(d.diff||[]).length
+    ? '<table class="lp"><tr><th>flag</th><th>guided</th><th>yours</th></tr>'
+      +d.diff.map(x=>'<tr><td>'+esc(x.flag)+'</td><td class="muted">'
+        +esc(x.guided===null?'(unset)':''+x.guided)+'</td><td><b>'
+        +esc(x.yours===null?'(removed)':''+x.yours)+'</b></td></tr>').join('')
+      +'</table>'
+    : 'no edits.');
+}
+const wizardCommandDebounced=debounce(wizardCommand, 400);
+
 // ===========================================================================
 // Working point: one control, four named stops, one counter-reckoning.
 //

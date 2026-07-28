@@ -198,6 +198,45 @@ TRADEOFFS: Dict[str, Tradeoff] = {
         cost="Nothing is launched: the flags land in the plan and starting a "
         "server stays a separate, explicit act.",
     ),
+    # ---- #270 guided configuration ----------------------------------------
+    # One entry per control on the guide. Each says what choosing it buys and
+    # what it costs, in the same terms the family table uses, so the control
+    # and the table cannot describe the choice differently.
+    "wizard.target": Tradeoff(
+        gain="Ranks the families by the one quantity you actually care "
+        "about, instead of by a blend nobody asked for.",
+        cost="Every quantity here is a trade against the other four: the "
+        "split that carries the most context is not the one that decodes "
+        "fastest, and the table shows both rather than choosing for you.",
+    ),
+    "wizard.usage": Tradeoff(
+        gain="Recurring prefixes remove prefill work instead of moving it, "
+        "so saying which pattern you have decides whether a topology lever "
+        "is worth anything at all.",
+        cost="On a hybrid GDN checkpoint the cross-server store route "
+        "matches zero tokens, so only the PD path carries a warm prefix "
+        "between servers -- the table says so where it applies.",
+    ),
+    "wizard.families": Tradeoff(
+        gain="Every deployment family with its five figures and their "
+        "provenance, plus every family this rig cannot carry with the "
+        "concrete reason.",
+        cost="Composed from studies already on disk: nothing here boots, "
+        "measures or applies anything, so a quantity no study has produced "
+        "comes back absent rather than approximated.",
+    ),
+    "wizard.command": Tradeoff(
+        gain="The exact launch command for the chosen family, with the "
+        "origin of every flag on it.",
+        cost="Generating text only. Nothing is started, and a family made of "
+        "two arms shows both -- launching one alone serves nothing.",
+    ),
+    "wizard.expert": Tradeoff(
+        gain="Every flag editable, with your edit shown as a difference "
+        "against the guided command.",
+        cost="An edit leaves the guided reasoning behind: the figures in the "
+        "table above still describe the guided configuration, not yours.",
+    ),
     # ---- view modes -------------------------------------------------------
     "view_mode.simple": Tradeoff(
         gain="Shows each card's VRAM as one number and one budget slider.",

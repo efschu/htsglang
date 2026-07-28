@@ -1389,3 +1389,88 @@ model / harder quant. Border cases (<2 GiB computed slack) get ONE probe
 boot with an abort criterion, never a retry ladder twiddling context or
 fraction when the OOM signature is parameter-independent. Five dead boots
 of the impossible 27B-FP8 solo vehicle are the precedent.
+### 8.5 The guided configuration (#270)
+
+Four endpoints behind the **Guide** tab. They answer one question — *which
+deployment families can this rig carry for this model, and what does each one
+give me* — and they answer it entirely from studies already on disk. None of
+them measures, boots, allocates or applies anything, so all four are safe to
+call against a dashboard someone else is using.
+
+```bash
+UI=http://127.0.0.1:8791
+
+# Step 2: the local cards, the host capability table, and the remote hosts
+# the pairing store already knows. Cached probe results only -- opening this
+# never starts a measurement.
+curl -s $UI/api/wizard/hardware | python3 -m json.tool | head -40
+
+# The blocklist, as data. `level=blocked` is what is never offered;
+# `level=not-default` is offered on request, always with its counter-number.
+curl -s "$UI/api/wizard/rejected?level=blocked" | python3 -m json.tool
+
+# Step 3: every family with its five figures, and every family that does not
+# fit with the concrete reason. Body = the ordinary plan payload plus the
+# wizard's own three inputs.
+BODY='{"model":"'$MODEL_ROOT'/Qwen3.6-27B-FP8",
+       "hardware":{"source":"manual",
+                   "gpus":["RTX 5090:32607","RTX 3080:20470","RTX 3080:20470"]},
+       "tp_size":3,"kv_cache_dtype":"fp8_e4m3",
+       "usage_pattern":"fresh","wizard_context_tokens":8192}'
+curl -s -X POST $UI/api/wizard/families -d "$BODY" | python3 -m json.tool
+
+# The launch command for one family. Generates text; starts nothing. The
+# `overrides` map is the expert view -- the answer carries the guided
+# command, the edited one, and the difference between them.
+curl -s -X POST $UI/api/wizard/command \
+  -d "$(python3 -c "import json,os;b=json.loads(os.environ['B']);\
+b.update(family='uneven_tp_dcp',spill='off',overrides={'--context-length':32768});\
+print(json.dumps(b))" B="$BODY")" | python3 -m json.tool
+```
+
+The five target quantities, and where each comes from:
+
+| quantity | source | note |
+|---|---|---|
+| `max_kv` | the `max_context` working point (§8.1's plan arithmetic) | `estimate`, or `measured` when a split-probe row for this model exists |
+| `max_decode` | the `max_decode` working point | `absent` on every PD/PP family — those run without speculation, so the plan's speculative figure does not describe them |
+| `max_prefill` | the `max_prefill` working point | same promotion path as `max_kv` |
+| `max_parallel` | the state/KV balance point (#253) | `absent` where the family re-divides the budget between arms |
+| `ttft` | **always a pair**: idle and under load | `estimate` from context / prefill rate; the loaded half uses the measured 10 850 / 25 400 tok/s ratio from #212 |
+
+`undisturbedness` is reported separately from `ttft` and is not folded into
+it. On this rig the same change that removes the decode spike (worst
+inter-token time 6.54 → 3.22 ms) **costs** 2.29 s of TTFT, so one number
+would hide one of the two.
+
+Six properties worth relying on:
+
+- **A rejected combination is never proposed.** `planner/rejected.py` is the
+  register as data, and a family whose tag set matches a `blocked` row comes
+  back infeasible with that row's verdict and evidence. `not-default` rows do
+  not block anything — they ride along on the family as an advisory with the
+  measurement that settled them.
+- **A family that does not fit is shown, not hidden.** Every infeasible cell
+  carries the sentence that stops it and where the sentence comes from: an
+  engine guard (`server_args.py` rejects spill × PD at arg parse), a hardware
+  count, a design status (`pd_rank_reuse` is a sketch, and the answer says
+  the geometry re-sharder is what is missing), or a register row.
+- **Three provenance words, no fourth.** `measured` / `estimate` / `absent`,
+  the same vocabulary §8.1 uses. An `absent` cell never carries a value, so
+  "nobody measured this" and "this is zero" stay distinguishable.
+- **The only promotion to `measured` is a split-probe row for THIS model**,
+  and only on the topology the probe actually boots (local uneven TP/DCP). A
+  row whose `unbootable` field is set refuses that family with its own text
+  rather than filling the row with numbers.
+- **The link gate stays absent without a measured cross-rig rate.** The
+  plan's `min_link_gbs` is the slowest intra-rig pair and is deliberately not
+  substituted: pricing a network handover on a PCIe figure would price it on
+  a line it never crosses.
+- **The argv comes from the shared profile generator**, never from a flag
+  list the wizard keeps of its own, so the Guide and the Planner launch the
+  same server. Two flags are the wizard's own and both say so in
+  `provenance`: `--enable-metrics` (mandatory here, §3) is added, and the
+  speculation flags are **removed** on a PD family — the engine disables
+  speculation in disaggregation mode with a warning rather than an error, so
+  a command that still names it would launch a server that quietly differs
+  from the command describing it.
