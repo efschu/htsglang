@@ -5378,3 +5378,47 @@ Gilt ab jetzt fuer FEATURES_VS_UPSTREAM, README und alle Beschreibungstexte.
   Block 1 (gerades PP ist upstream, das Delta ist das Stage-Ratio, das nur bei
   ungleichen Stages traegt). Beide Status Boot-checked.
 - README unveraendert (fuehrt keine Feature-Liste; Redesign bleibt #135).
+
+## Dashboard-Self-Update (#275, 2026-07-28, agent-dash-update) — gemergt 24ed44103a
+
+Nutzerauftrag: Dashboard in place aktualisierbar MIT Versionswahl (Weg zurueck),
+ein kontextsensitiver Knopf Install/Update/Rollback; GitHub-Release-Quelle
+existiert noch nicht -> Interface heute, Remote-Quelle als Steckstelle.
+
+- Neues Modul planner/self_update.py (stdlib-only, zyklenfrei): VersionSource
+  mit LocalGitSource (dashboard-v*-Tags + HEAD, Install via git archive,
+  atomar Stage+rename) und GitHubReleaseSource als Stub ("not configured").
+- Layout SGLANG_DASHBOARD_HOME (Default ~/.local/share/sglang-dashboard):
+  versions/<id>/ nebeneinander, current als ZEIGER-DATEI (os.replace, atomar,
+  portabler als Symlink), good/<id>-Marker (Health einmal bestanden),
+  Retention current + last-good + 3, cleanup_plan() zeigt Loeschkandidaten.
+- Supervisor (--serve-supervised): Worker meldet Wechsel per Exit-Code 43,
+  der SUPERVISOR setzt den Zeiger, startet neu, prueft HTTP 200 auf / binnen
+  45 s; Health-Fail => automatischer Rollback auf last-good. Rollback-Entscheid
+  als pure Funktion testbar. Plain --serve unveraendert (Operator-Startkommando
+  laeuft weiter), Wechsel dort sauber verweigert.
+- CODE/DATEN-TRENNUNG (hartes Gate): Zwei echte Verstoesse gefunden und
+  migriert — DEFAULT_HICACHE_STORE und DEFAULT_RESULTS_STORE zeigten ins
+  PAKETVERZEICHNIS (os.path.dirname(__file__)); jetzt Daten-Root mit einmaliger
+  idempotenter copy-forward-Migration (Legacy bleibt inertes Backup). Dazu
+  planner_data_schema.json-Stempel: aelteres Dashboard auf neuerem Store =
+  Warnung + Schreib-Verweigerung an den vier Store-Endpoints (Downgrade-Schutz).
+  PAT wird nie persistiert (nur Request-Payload) — bestaetigt.
+- Tests: 24 neue hermetische (Quelle, Install, Rollback, Halt-ohne-Fallback,
+  Retention, Schema-Guard, Daten-BYTE-IDENTITAET ueber den Lebenszyklus,
+  Migration, HTTP-Roundtrip); Live-E2E auf Port 8791: supervised gebootet,
+  HEAD installiert+geswitcht, absichtlich kaputte Version => Auto-Rollback,
+  Datenverzeichnis byte-identisch.
+- MERGE-BEFUND (Operator): Der Zweig zweigte VOR der UI-Konsolidierung ab, daher
+  zwei Konflikte in webui.py/cli.py. Aufgeloest durch Behalten der
+  Integrations-Seite (konsolidierte Tab-Leiste + showTab-Rumpf) und Aufpfropfen
+  von About/Update-Knopf, Init-Hook und Supervisor-Einstieg; Navigations-
+  Invariante (test_tab_order) um "about" als LETZTEN Eintrag erweitert (Version
+  ist kein Workflow-Schritt). Volle Planner-Suite danach 1358 passed / 64
+  skipped / 0 failed, ruff sauber, Marker-Gate 0.
+- OFFEN (vom Agenten benannt): GitHubReleaseSource braucht Release-Feed +
+  Asset-Format + Konfig-Schalter; Versionen VOR diesem Commit kennen
+  /api/version nicht (nach Downgrade dorthin fehlt der About-Tab bis zum
+  Ruecksprung — Health/Rollback funktionieren trotzdem); git archive nimmt nur
+  Committetes; kein Supervisor-Lockfile (zwei Supervisoren auf einem HOME
+  kollidierten); Tag-Disziplin dashboard-vX.Y.Z muss etabliert werden.
