@@ -1474,3 +1474,135 @@ Six properties worth relying on:
   speculation in disaggregation mode with a warning rather than an error, so
   a command that still names it would launch a server that quietly differs
   from the command describing it.
+
+### 8.6 The comm suite and the rig data share (#271)
+
+The **Rig data** tab, and the same thing from a shell. Two questions: *how
+does this rig move bytes*, and *is that worth sending to the project*. The
+first is a short benchmark; the second is a curated, anonymized digest posted
+through the #152 mechanism, behind a preview and an explicit confirmation.
+
+```bash
+UI=http://127.0.0.1:8791
+
+# What the suite would run, what the hardware profile already has on disk,
+# and whether a token is stored. Reads state; MEASURES NOTHING, so this is
+# safe against a dashboard someone else is using.
+curl -s $UI/api/commsuite/arms | python3 -m json.tool | head -30
+
+# Start. Returns at once with a job id; single-flight (a second press joins
+# the running suite instead of measuring it).
+curl -s -X POST $UI/api/commsuite/run -d '{}'
+
+# Poll. The answer carries every finished arm, so the shell and the page can
+# never disagree about what this rig reported.
+curl -s "$UI/api/commsuite/status" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)["job"]
+print(d["state"], d["progress"])
+for a in d["arms"]:
+    print("%-24s %-7s %ss" % (a["id"], a["status"], a["elapsed_s"]))'
+
+# One arm is stuck? Stop that one; the rest keeps its numbers.
+curl -s -X POST $UI/api/commsuite/cancel -d '{"arm":"collective_htccl_ucx"}'
+
+# The finished digest and the EXACT markdown that would be posted. Pure
+# render -- this sends nothing to GitHub.
+curl -s -X POST $UI/api/share/rig_preview \
+  -d '{"sources":["comm_suite","hardware_profile"]}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["report"])'
+
+# Post it. `confirmed` is mandatory and the report must be the previewed
+# text; without either, no network call is made at all.
+curl -s -X POST $UI/api/share/rig_submit -d '{
+  "report": "...the previewed markdown, verbatim...",
+  "digest": {...}, "token": "ghp_...", "confirmed": true}'
+```
+
+#### The arms, and what each one needs
+
+| arm | kind | needs | measured here |
+|---|---|---|---|
+| `rig_profile` | inventory | nothing | 0.1 s |
+| `noise_floor` | cpu | nothing | 3.9 s |
+| `collective_gloo` | cpu | nothing | 1.9 s |
+| `collective_htccl_ucx` | cpu | nothing | 2.8 s |
+| `byte_gate` | cpu | nothing | 1.6 s |
+| `card_probe` | gpu | a card window | absent under contention |
+| `collective_nccl` | gpu | a card window, >= 2 cards | absent under contention |
+| `collective_htccl_shm` | gpu | a card window | absent under contention |
+| `cross_rig` | network | a reachable peer | absent in the container |
+
+**The CPU arms run first, and that is the point.** Measured on this rig with
+all three cards held by another job: **10.3 s wall** for the whole run, five
+arms with numbers and four honestly absent. A suite that needed the cards
+would have returned nothing at all on a busy rig, which is most of the time.
+
+**HTCCL/shm is a GPU arm, not a CPU one.** `HTCCLShmTransport` pins its shared
+segment to a CUDA device for zero-copy H2D/D2H, so it cannot run device-free
+— constructing it with `torch.device("cpu")` fails in `_pin_host_memory`.
+There is no CPU-only shm cell and the suite does not invent one.
+
+**The cross-rig arm from a container is `absent (needs host runner)`.** §1.1
+applies unchanged: the dev container has no route to the fast line. Run it
+from the Proxmox host with its own dashboard on another port (§8), or export
+`COMM_SUITE_PEER=host:port` for a peer this process can actually reach. A
+loopback number carrying a wire's label would be worse than the absence.
+
+#### GPU arms and the card window
+
+The GPU arms take §7.1 v2 locks for every local card, in ascending NVML
+order, and release them together. Three refusals, each naming what stopped
+it: a card held by another owner (with the owner), a quiet flag younger than
+15 minutes (with its owner and age), and — the one that is easy to forget —
+**locks free but `memory.used` high**, which is what a PVE-host boot looks
+like from inside the container. All three end as `absent` with the sentence,
+never as a failure and never as a wait.
+
+#### What is shared, and what cannot be
+
+The digest is **curated automatically**; there is no hand-curation step and
+no way to add one from the page:
+
+- aggregates only (value, spread, n, p5/p95), each with its date and the
+  context that makes it comparable (`op`, `size_kib`, `world`, `transport`,
+  `model_family`, …). No raw logs, no sample series — `boot_log` and friends
+  are stripped by key even though no source emits them;
+- duplicates dropped by row id, newest wins;
+- failures folded into **signatures with counts** (numbers and hex normalized
+  out), so one failure class is one finding rather than fifty lines;
+- a **delta** on re-share: rows whose value has not moved outside a coarse
+  two-significant-digit grid are counted, not repeated;
+- a **100 KB ceiling** met by walking a fixed aggregation ladder
+  (`drop_distribution` → `trim_context` → `drop_notes` →
+  `group_measurements` → `capabilities_only`) — **never by truncating**, and
+  the artifact records which rung it stopped at.
+
+Never shared: hostnames, IPs, filesystem paths (model paths become families
+like `Qwen3.6 27B FP8`), GPU UUIDs (cards become `RTX 3080#0`), usernames,
+and every value that came out of the rig-env file — those leave by literal
+match, because a regex-only scrub would miss an interface name that reads as
+ordinary text. `rig_artifact.assert_anonymized` runs inside `build_digest`,
+so an artifact that reaches a preview has already passed the gate.
+
+#### One issue, one comment per rig profile
+
+Each rig gets a **fingerprint**: a stable hash of card models + VRAM class +
+count, CPU model, RAM class, NIC driver types, driver/CUDA major and OS
+family. Both sources derive it from the same function, so a comm-suite run
+and a profile share from one box land on one posting.
+
+- the **issue body is an index** of that user's rig profiles, so sharing rig
+  B never rewrites rig A;
+- **one comment per fingerprint**, updated in place;
+- two identical machines share a fingerprint on purpose and are reported as
+  **one sample with a machine count** and the range across machines
+  (`across_machines_pct`); a `label suffix` splits them on request;
+- cross-rig figures get a **compound** fingerprint (member ids + link type),
+  because a link rate is a property of the pair and the line, not of either
+  rig.
+
+When a token is available the PREVIEW already fetches and merges what that
+fingerprint published before, so the text shown is the text that lands. The
+token is optional to store: opt-in, `0600`, and the page can only ask
+*whether* one exists, never read it back.

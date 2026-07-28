@@ -63,9 +63,11 @@ __all__ = [
     "MARKER",
     "GitHubShareError",
     "build_report",
+    "find_existing_comment",
     "find_existing_issue",
     "redact",
     "submit",
+    "upsert_comment",
 ]
 
 #: Default target repository for shared results.
@@ -333,11 +335,18 @@ def find_existing_issue(
     token: str,
     repo: str = DEFAULT_REPO,
     *,
+    marker: str = MARKER,
     api: Optional[Callable[..., Tuple[int, Any]]] = None,
 ) -> Optional[dict]:
     """Find THIS user's share issue in ``repo``: the first issue CREATED BY
-    the authenticated user whose body contains :data:`MARKER`. Returns the
-    issue dict (``number`` / ``html_url`` / ...) or None."""
+    the authenticated user whose body contains ``marker``. Returns the issue
+    dict (``number`` / ``html_url`` / ...) or None.
+
+    ``marker`` is a parameter rather than the constant so a second KIND of
+    report (the #271 rig artifact) can have its own issue with the same
+    one-per-user, update-in-place semantics, instead of overwriting the
+    measured-results issue this module was written for. Default unchanged.
+    """
     api = api or _default_api
     login = _authenticated_login(token, api)
     status, issues = api(
@@ -351,9 +360,82 @@ def find_existing_issue(
             redact(f"could not list issues of {repo} (HTTP {status})", token)
         )
     for issue in issues:
-        if isinstance(issue, dict) and MARKER in (issue.get("body") or ""):
+        if isinstance(issue, dict) and marker in (issue.get("body") or ""):
             return issue
     return None
+
+
+def find_existing_comment(
+    token: str,
+    repo: str,
+    issue_number: int,
+    marker: str,
+    *,
+    api: Optional[Callable[..., Tuple[int, Any]]] = None,
+) -> Optional[dict]:
+    """The first comment on ``issue_number`` whose body contains ``marker``.
+
+    Comments are how one issue holds SEVERAL rigs (#271): the body is an
+    index, and each rig fingerprint owns one comment that is updated in
+    place. Returns the comment dict (``id`` / ``html_url`` / ``body``) or
+    None.
+    """
+    api = api or _default_api
+    status, comments = api(
+        "GET",
+        f"{API_ROOT}/repos/{repo}/issues/{issue_number}/comments?per_page=100",
+        token,
+    )
+    if status != 200 or not isinstance(comments, list):
+        raise GitHubShareError(
+            redact(
+                f"could not list comments of {repo}#{issue_number} "
+                f"(HTTP {status})", token)
+        )
+    for c in comments:
+        if isinstance(c, dict) and marker in (c.get("body") or ""):
+            return c
+    return None
+
+
+def upsert_comment(
+    token: str,
+    repo: str,
+    issue_number: int,
+    marker: str,
+    body: str,
+    *,
+    api: Optional[Callable[..., Tuple[int, Any]]] = None,
+) -> dict:
+    """Create ``body`` as a comment, or PATCH the one already carrying
+    ``marker``. Returns ``{"action", "comment_id", "url"}``.
+
+    Consent is the CALLER's to obtain: this is transport. Nothing here is
+    reachable except through :func:`submit`, which refuses without
+    ``confirmed=True``.
+    """
+    api = api or _default_api
+    if marker not in body:
+        body = body + "\n\n" + marker
+    found = find_existing_comment(token, repo, issue_number, marker, api=api)
+    if found is not None:
+        status, data = api(
+            "PATCH",
+            f"{API_ROOT}/repos/{repo}/issues/comments/{found.get('id')}",
+            token, {"body": body})
+        action = "updated"
+    else:
+        status, data = api(
+            "POST",
+            f"{API_ROOT}/repos/{repo}/issues/{issue_number}/comments",
+            token, {"body": body})
+        action = "created"
+    if status not in (200, 201) or not isinstance(data, dict):
+        raise GitHubShareError(
+            redact(f"comment {action[:-1]}e failed: HTTP {status} from GitHub",
+                   token))
+    return {"action": action, "comment_id": data.get("id"),
+            "url": data.get("html_url")}
 
 
 def submit(
@@ -364,6 +446,7 @@ def submit(
     *,
     confirmed: bool = False,
     title: str = "htsglang measured results",
+    marker: str = MARKER,
     api: Optional[Callable[..., Tuple[int, Any]]] = None,
 ) -> dict:
     """Create-or-update the user's share issue with ``report``.
@@ -390,11 +473,11 @@ def submit(
         raise GitHubShareError("no GitHub token given")
     api = api or _default_api
 
-    body = report if MARKER in report else report + "\n\n" + MARKER
+    body = report if marker in report else report + "\n\n" + marker
 
     number = existing_issue
     if number is None:
-        found = find_existing_issue(token, repo, api=api)
+        found = find_existing_issue(token, repo, marker=marker, api=api)
         if found is not None:
             number = found.get("number")
 

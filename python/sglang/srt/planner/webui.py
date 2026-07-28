@@ -82,6 +82,13 @@ __all__ = [
     "wizard_families_payload",
     "wizard_command_payload",
     "wizard_rejected_payload",
+    "commsuite_arms_payload",
+    "commsuite_run_payload",
+    "commsuite_status_payload",
+    "commsuite_cancel_payload",
+    "share_rig_preview_payload",
+    "share_rig_submit_payload",
+    "share_rig_token_payload",
     "share_preview_payload",
     "share_submit_payload",
     "serve",
@@ -3818,6 +3825,226 @@ def share_submit_payload(payload: dict) -> dict:
     return {"ok": True, **out}
 
 
+# ===========================================================================
+# #271 -- the comm-benchmark suite and the rig data share.
+#
+# Thin adapters only: the arms, the curation, the anonymization gate and the
+# GitHub binding all live in planner/comm_suite.py + planner/rig_artifact.py,
+# so `curl` and the page are the same client and neither can compute a figure
+# the other cannot.
+# ===========================================================================
+def commsuite_arms_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/commsuite/arms -> the arm catalogue + what is already there.
+
+    Opening the tab MEASURES NOTHING. This answers what the suite would run,
+    what the hardware-profile source already has on disk, and whether a token
+    is stored -- everything the page needs to draw itself before any button
+    is pressed.
+    """
+    from sglang.srt.planner import (comm_suite, github_share, rig_artifact,
+                                    rig_profile_source)
+
+    job = comm_suite.JOBS.active() or comm_suite.JOBS.latest()
+    return {
+        "ok": True,
+        "arms": comm_suite.arm_specs_json(),
+        "budget_s": round(sum(a.budget_s for a in comm_suite.ARMS), 1),
+        "job": job.to_json() if job else None,
+        "profile": rig_profile_source.available(),
+        "token_stored": rig_artifact.have_token(),
+        "default_repo": github_share.DEFAULT_REPO,
+    }
+
+
+def commsuite_run_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/commsuite/run {arms?} -> starts the suite, returns at once.
+
+    Single-flight: a second press joins the running suite rather than
+    starting a rival that would measure it.
+    """
+    from sglang.srt.planner import comm_suite
+
+    arms = (payload or {}).get("arms") or None
+    job = comm_suite.JOBS.start(arms)
+    return {"ok": True, "job": job.to_json()}
+
+
+def commsuite_status_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/commsuite/status[?job_id=...] -> the job, the arms finished so
+    far, and (once the run ends) the curated digest."""
+    from sglang.srt.planner import comm_suite
+
+    job_id = (payload or {}).get("job_id")
+    job = (comm_suite.JOBS.get(job_id) if job_id
+           else (comm_suite.JOBS.active() or comm_suite.JOBS.latest()))
+    if job is None:
+        return {"ok": True, "job": None}
+    return {"ok": True, "job": job.to_json(include_artifact=True)}
+
+
+def commsuite_cancel_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/commsuite/cancel {job_id?, arm?} -> stop one arm, or all.
+
+    Killing, not asking: a collective that is already hanging does not read
+    a flag, and the point of a per-arm cancel is that one stuck arm cannot
+    cost the other eight.
+    """
+    from sglang.srt.planner import comm_suite
+
+    body = payload or {}
+    job = (comm_suite.JOBS.get(body["job_id"]) if body.get("job_id")
+           else comm_suite.JOBS.active())
+    if job is None:
+        return {"ok": False, "error": "no suite run is in flight"}
+    cancelled = job.cancel(body.get("arm") or None)
+    return {"ok": True, "cancelled": cancelled, "job": job.to_json()}
+
+
+def _share_sections(sources, job_id=None):
+    """The rows for the requested sources. One schema, several producers."""
+    from sglang.srt.planner import comm_suite, rig_profile_source
+
+    out = []
+    if "hardware_profile" in sources:
+        out.append(rig_profile_source.to_sections())
+    if "comm_suite" in sources:
+        job = (comm_suite.JOBS.get(job_id) if job_id
+               else comm_suite.JOBS.latest())
+        if job is not None and job.results:
+            out.append(comm_suite.to_sections(job))
+    return out
+
+
+def share_rig_preview_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/share/rig_preview -> the FINISHED digest and the EXACT
+    markdown that would be posted. Pure render; posts nothing.
+
+    When a token is available the preview also FETCHES what this fingerprint
+    has already published and merges into it, so the text shown is the text
+    that would land -- including the sample count when a second machine of
+    the same profile reports. A preview that differs from the post is not a
+    preview.
+    """
+    from sglang.srt.planner import github_share, rig_artifact
+
+    body = payload or {}
+    # An explicitly EMPTY list means "nothing", not "everything": the page
+    # sends the ticked boxes, and unticking both must not silently share both.
+    sources = body.get("sources")
+    if sources is None:
+        sources = ["comm_suite", "hardware_profile"]
+    sections = _share_sections(sources, body.get("job_id"))
+    if not sections:
+        return {"ok": False,
+                "error": "nothing to share yet: run the suite, or run the "
+                         "short card probe once so the hardware profile has "
+                         "something in it"}
+    digest = rig_artifact.build_digest(
+        sections, previous=rig_artifact.load_last_digest())
+    if body.get("label_suffix"):
+        digest["label_suffix"] = body["label_suffix"]
+
+    merged_with = None
+    token = body.get("token") or rig_artifact.load_token()
+    repo = body.get("repo") or github_share.DEFAULT_REPO
+    if token:
+        try:
+            published = rig_artifact.fetch_published(
+                token, digest["fingerprint"]["id"], repo=repo,
+                label_suffix=body.get("label_suffix", ""))
+            if published:
+                digest = rig_artifact.merge_digests(published, digest)
+                rig_artifact.assert_anonymized(digest)
+                merged_with = published.get("generated_at")
+        except Exception as e:
+            # A failed lookup must not block the preview: the user can still
+            # see and post their own digest. It IS named, because quietly
+            # posting an unmerged digest would reset somebody's sample count.
+            return {
+                "ok": True,
+                "digest": digest,
+                "report": rig_artifact.build_report(digest),
+                "warning": github_share.redact(
+                    f"could not read the already-published digest, so this "
+                    f"preview is unmerged: {e}", token),
+                "token_stored": rig_artifact.have_token(),
+                "default_repo": github_share.DEFAULT_REPO,
+            }
+    return {
+        "ok": True,
+        "digest": digest,
+        "report": rig_artifact.build_report(digest),
+        "merged_with": merged_with,
+        "token_stored": rig_artifact.have_token(),
+        "default_repo": github_share.DEFAULT_REPO,
+    }
+
+
+def share_rig_submit_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/share/rig_submit {report, digest, token?, confirmed} ->
+    post the previewed report.
+
+    Refuses without ``confirmed``; the backing function performs no network
+    call in that case. The token may come from the request or from the
+    opt-in store; it is never returned, logged, or echoed into an error.
+    """
+    from sglang.srt.planner import github_share, rig_artifact
+
+    body = payload or {}
+    token = body.get("token") or rig_artifact.load_token()
+    report = body.get("report")
+    digest = body.get("digest") or {}
+    if not report:
+        return {"ok": False, "error": "no previewed report was supplied; "
+                                      "preview first, then post"}
+    if not token:
+        return {"ok": False, "error": "no GitHub token: paste one once, or "
+                                      "tick 'remember' so later shares are "
+                                      "one click"}
+    try:
+        out = rig_artifact.submit(
+            report, token, digest,
+            repo=body.get("repo") or github_share.DEFAULT_REPO,
+            confirmed=bool(body.get("confirmed")),
+            label_suffix=body.get("label_suffix", ""))
+    except github_share.GitHubShareError as e:
+        return {"ok": False, "error": github_share.redact(str(e), token)}
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False,
+                "error": github_share.redact(f"{type(e).__name__}: {e}", token)}
+    if body.get("remember_token") and body.get("token"):
+        try:
+            rig_artifact.save_token(body["token"])
+        except Exception:
+            pass
+    try:
+        rig_artifact.save_last_digest(digest)
+    except Exception:
+        pass
+    return dict({"ok": True}, **out)
+
+
+def share_rig_token_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/share/rig_token {action: save|forget, token?} -> yes/no.
+
+    Never returns the token, only whether one is stored: a value the page can
+    read back is a value anything that reaches this endpoint can read back.
+    """
+    from sglang.srt.planner import rig_artifact
+
+    body = payload or {}
+    action = body.get("action")
+    if action == "forget":
+        rig_artifact.forget_token()
+    elif action == "save":
+        if not (body.get("token") or "").strip():
+            return {"ok": False, "error": "no token given"}
+        rig_artifact.save_token(body["token"])
+    else:
+        return {"ok": False, "error": "action must be 'save' or 'forget'"}
+    return {"ok": True, "token_stored": rig_artifact.have_token()}
+
+
 class _Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype):
         data = body.encode() if isinstance(body, str) else body
@@ -3928,6 +4155,23 @@ class _Handler(BaseHTTPRequestHandler):
 
                 q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
                 self._json(200, rig_pair_status_payload(q))
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        # #271: the more specific status path must be matched BEFORE the
+        # catalogue path, or "/api/commsuite/arms" would swallow it.
+        if self.path.startswith("/api/commsuite/status"):
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, commsuite_status_payload(q))
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/commsuite/arms"):
+            try:
+                self._json(200, commsuite_arms_payload())
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
@@ -4160,6 +4404,21 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/rig_pair/reset"):
                 self._json(200, rig_pair_reset_payload(payload))
+                return
+            if self.path.startswith("/api/commsuite/run"):
+                self._json(200, commsuite_run_payload(payload))
+                return
+            if self.path.startswith("/api/commsuite/cancel"):
+                self._json(200, commsuite_cancel_payload(payload))
+                return
+            if self.path.startswith("/api/share/rig_preview"):
+                self._json(200, share_rig_preview_payload(payload))
+                return
+            if self.path.startswith("/api/share/rig_submit"):
+                self._json(200, share_rig_submit_payload(payload))
+                return
+            if self.path.startswith("/api/share/rig_token"):
+                self._json(200, share_rig_token_payload(payload))
                 return
             if self.path.startswith("/api/recompute"):
                 self._json(200, recompute_payload(payload))
@@ -4759,6 +5018,48 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   .fx-act { margin-top: auto; padding-top: var(--s1); }
   .fx-cmd { font-size: var(--t-xs); color: var(--fg-muted);
             word-break: break-all; }
+  /* #271 -- rig data share. Reuses the #218 fxtile/provenance vocabulary
+     (measured / estimate / absent) and adds ONE state it does not have:
+     `failed`. That is not a fourth provenance word -- the #218 rule is that
+     "not measured is not a failure", and this is the other case: an arm that
+     RAN and broke. A grey tile would say nobody looked. */
+  .csgrid { display: grid; gap: var(--s2);
+            grid-template-columns: repeat(auto-fill, minmax(272px, 1fr)); }
+  .cstile { background: var(--bg-elevated); border: 1px solid var(--bd-weak);
+            border-radius: var(--radius); padding: var(--s2);
+            display: flex; flex-direction: column; gap: var(--s1); }
+  .cstile.running { border-color: var(--accent); }
+  .cs-h { display: flex; align-items: baseline; gap: var(--s1);
+          font-size: var(--t-sm); color: var(--fg-strong); }
+  .cs-h .cs-n { flex: 1; min-width: 0; }
+  .csdot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+           flex: none; background: var(--fg-disabled); }
+  .csdot.ok { background: var(--ok); }
+  .csdot.warn { background: var(--warn); }
+  .csdot.error { background: var(--bad); }
+  .csdot.absent { background: var(--fg-disabled); }
+  .csdot.running { background: var(--accent); animation: cspulse 1.1s infinite; }
+  @keyframes cspulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+  .cs-q { font-size: var(--t-xs); color: var(--fg-muted); }
+  .cs-cells { font-size: var(--t-xs); font-variant-numeric: tabular-nums;
+              display: flex; flex-direction: column; gap: 1px; }
+  .cs-cells .cs-k { color: var(--fg-muted); }
+  .cs-msg { font-size: var(--t-xs); }
+  .cs-msg.error { color: var(--bad); }
+  .cs-msg.absent { color: var(--fg-muted); }
+  .cs-act { margin-top: auto; padding-top: var(--s1); }
+  .cs-bar { height: 4px; border-radius: 2px; background: var(--bd-weak);
+            overflow: hidden; }
+  .cs-bar > i { display: block; height: 100%; background: var(--accent);
+                transition: width .3s; }
+  .cs-floor { font-size: var(--t-sm); color: var(--fg-strong);
+              font-variant-numeric: tabular-nums; }
+  #cs_preview { width: 100%; min-height: 260px; max-height: 46vh;
+                overflow: auto; white-space: pre-wrap; word-break: break-word;
+                font-family: ui-monospace, monospace; font-size: var(--t-xs);
+                background: var(--bg-input); border: 1px solid var(--bd-weak);
+                border-radius: var(--radius); padding: var(--s2); }
+  .cs-why { font-size: var(--t-sm); color: var(--fg-muted); max-width: 68ch; }
   .sc-head { display: flex; align-items: baseline; gap: var(--s2);
              flex-wrap: wrap; }
   .sc-name { font-size: var(--t-lg); color: var(--fg-strong); }
@@ -4846,6 +5147,8 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     title="rendering / instruction-following checks">Quality</button>
   <button id="tab_pair" class="tab" onclick="showTab('pair')"
     title="couple a second rig">Pair rig</button>
+  <button id="tab_share" class="tab" onclick="showTab('share')"
+    title="run the short comm benchmark and share an anonymized rig profile to improve the project">Rig data</button>
 </div>
 
 <!-- #270 -- guided configuration. Three steps, then the command. Every
@@ -4929,6 +5232,80 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       not-default row is available on request and always carries the number
       that decided it.</div>
     <div id="wz_rejected"><span class="muted">loading&hellip;</span></div>
+  </fieldset>
+</div>
+
+<!-- #271 -- Rig data share. Its own tab rather than a panel in Benchmark:
+     benchmarking your own rig and contributing a profile to the project are
+     different impulses, and the second one needs two sentences of framing
+     that would be noise inside a measurement tab. -->
+<div id="view_share" style="display:none">
+  <fieldset>
+    <legend>improve the project with your rig</legend>
+    <p class="cs-why">
+      This fork is tuned on three consumer cards in one box. Most of what it
+      guesses about <em>other</em> hardware is arithmetic, not measurement.
+      Sharing an anonymized profile of your rig is what turns those guesses
+      into numbers.
+    </p>
+    <p class="cs-why">
+      <b>What is shared:</b> a curated JSON digest &mdash; card models and
+      counts, driver/CUDA/NCCL/UCX versions, and the measured points with
+      their spread and date. <b>Never:</b> hostnames, IP addresses,
+      filesystem paths, GPU serials or UUIDs, model paths, or your token.
+      You see the finished text before anything is sent, and nothing is ever
+      posted without you confirming that exact text.
+    </p>
+  </fieldset>
+
+  <fieldset>
+    <legend>1 &mdash; the short comm benchmark</legend>
+    <div class="row">
+      <button id="cs_run" class="primary" onclick="csRun()">Run comm suite</button>
+      <button id="cs_stop" class="mini secondary" onclick="csCancel()"
+              style="display:none">stop everything</button>
+      <span id="cs_budget" class="muted"></span>
+    </div>
+    <div class="cs-bar" id="cs_bar_wrap" style="display:none"><i id="cs_bar" style="width:0"></i></div>
+    <div id="cs_floor" class="cs-floor"></div>
+    <div id="cs_tiles" class="csgrid"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>2 &mdash; what this rig already knows</legend>
+    <div id="cs_profile" class="muted">reading&hellip;</div>
+    <div class="row">
+      <label><input type="checkbox" id="cs_src_suite" checked> comm-suite run</label>
+      <label><input type="checkbox" id="cs_src_profile" checked> hardware profile (cached studies)</label>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>3 &mdash; preview, then share</legend>
+    <div class="row">
+      <button id="cs_prev" class="primary" onclick="csPreview()">Prepare digest</button>
+      <span id="cs_prev_msg" class="muted"></span>
+    </div>
+    <div id="cs_preview_wrap" style="display:none">
+      <div id="cs_summary" class="muted"></div>
+      <pre id="cs_preview"></pre>
+      <div class="row">
+        <label>repository <input id="cs_repo" size="28"></label>
+        <label>label suffix
+          <input id="cs_suffix" size="10" placeholder="(optional)"
+                 title="only if you run several IDENTICAL machines and want them reported apart instead of pooled as one sample">
+        </label>
+      </div>
+      <div class="row" id="cs_token_row">
+        <label>GitHub token <input id="cs_token" type="password" size="30"></label>
+        <label><input type="checkbox" id="cs_remember"> remember it (0600 file, this machine)</label>
+        <button class="mini secondary" onclick="csForgetToken()">forget stored token</button>
+      </div>
+      <div class="row">
+        <button id="cs_submit" class="primary" onclick="csSubmit()">Post this digest</button>
+        <span id="cs_submit_msg" class="muted"></span>
+      </div>
+    </div>
   </fieldset>
 </div>
 
@@ -6711,11 +7088,209 @@ async function doIssue(kind) {
 
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
+/* ===================================================================
+   #271 -- Rig data share.
+   The page RENDERS; it never computes a status, a provenance or a
+   digest. Every one of those comes from the server, so curl and the
+   browser can never disagree about what this rig reported.
+   =================================================================== */
+function csStopPoll(){
+  if(window._csTimer){ clearInterval(window._csTimer); window._csTimer=null; }
+}
+async function csInit(){
+  const d = await api('/api/commsuite/arms',{key:'cs_arms'});
+  window._csArms = d.arms||[];
+  $('cs_budget').textContent =
+    'about '+Math.round(d.budget_s)+' s if every arm runs; CPU arms first, so a busy rig still yields a result';
+  if(!$('cs_repo').value) $('cs_repo').value = d.default_repo||'';
+  csRenderProfile(d.profile||{});
+  csTokenState(d.token_stored);
+  csRenderJob(d.job);
+  if(d.job && d.job.state==='running') csStartPoll();
+}
+function csTokenState(stored){
+  window._csTokenStored = !!stored;
+  const row=$('cs_token_row');
+  if(row) row.style.display = stored ? 'none' : '';
+  const btn=$('cs_submit');
+  if(btn) btn.textContent = stored ? 'Post this digest (1 click)' : 'Post this digest';
+}
+function csRenderProfile(p){
+  const cp=p.card_probe||{}, sp=p.split_probe||{};
+  let h='';
+  h += cp.present
+    ? '<div>card probe: <b>'+cp.cards+'</b> cards, <b>'+cp.pairs+'</b> ordered pairs (from '+esc(cp.created||'?')+')</div>'
+    : '<div>card probe: <b>absent</b> &mdash; run the short probe once on the Rigs tab and its rates join the digest</div>';
+  h += sp.present
+    ? '<div>serving studies: <b>'+sp.rows+'</b> split-probe rows for '+esc((sp.models||[]).join(', '))+'</div>'
+    : '<div>serving studies: <b>absent</b> &mdash; no split-probe row on disk yet</div>';
+  setHTML($('cs_profile'), h);
+}
+async function csRun(){
+  $('cs_run').disabled=true;
+  try{
+    await api('/api/commsuite/run',{key:'cs_run',body:{}});
+    $('cs_stop').style.display='';
+    $('cs_bar_wrap').style.display='';
+    csStartPoll();
+  }catch(e){ $('cs_run').disabled=false; }
+}
+function csStartPoll(){
+  csStopPoll();
+  window._csTimer=setInterval(csPoll,1500);
+  csPoll();
+}
+async function csPoll(){
+  let d;
+  try{ d = await api('/api/commsuite/status',{key:'cs_status'}); }
+  catch(e){ if(apiAborted(e)) return; throw e; }
+  const job=d.job;
+  csRenderJob(job);
+  if(!job || job.state!=='running'){
+    csStopPoll();
+    $('cs_run').disabled=false;
+    $('cs_stop').style.display='none';
+  }
+}
+async function csCancel(arm){
+  await api('/api/commsuite/cancel',{key:'cs_cancel',body:arm?{arm:arm}:{}});
+  csPoll();
+}
+function csRenderJob(job){
+  if(!job){ setHTML($('cs_tiles'), csTiles([], null)); return; }
+  const byId={}; for(const a of (job.arms||[])) byId[a.id]=a;
+  const prog=job.progress||{};
+  if(prog.total){
+    $('cs_bar_wrap').style.display='';
+    $('cs_bar').style.width = Math.round(100*(prog.done||0)/prog.total)+'%';
+  }
+  const floor=(byId.noise_floor||{}).facts||{};
+  $('cs_floor').textContent = floor.floor_pct!=null
+    ? ('noise floor '+floor.floor_pct+' % on '+floor.cell+
+       ' — nothing smaller than that is a difference')
+    : (job.state==='running' ? 'measuring the noise floor first…' : '');
+  setHTML($('cs_tiles'), csTiles(window._csArms||[], job));
+}
+function csTiles(arms, job){
+  const byId={}; if(job) for(const a of (job.arms||[])) byId[a.id]=a;
+  const current = job ? job.current : null;
+  let h='<div class="csgrid">';
+  for(const spec of arms){
+    const r = byId[spec.id];
+    const running = current===spec.id && (!r);
+    const st = running ? 'running' : (r ? r.status : 'absent');
+    h+='<div class="cstile'+(running?' running':'')+'" data-arm="'+esc(spec.id)+'">'
+      +'<div class="cs-h"><span class="csdot '+esc(st)+'"></span>'
+      +'<span class="cs-n">'+esc(spec.label)+'</span>'
+      +'<span class="cs-q">'+esc(spec.kind)+'</span></div>'
+      +'<div class="cs-q">'+esc(spec.question)+'</div>';
+    if(running){
+      h+='<div class="cs-msg">running… (budget '+spec.budget_s+' s)</div>';
+    }else if(r && r.cells && Object.keys(r.cells).length){
+      h+='<div class="cs-cells">';
+      for(const k of Object.keys(r.cells).sort()){
+        const c=r.cells[k]||{};
+        h+='<div><span class="cs-k">'+esc(k)+'</span> <b>'+esc(String(c.median_us!=null?c.median_us:'-'))+'</b> us'
+          +(c.spread_pct!=null?(' <span class="cs-k">±'+esc(String(c.spread_pct))+' %</span>'):'')
+          +'</div>';
+      }
+      h+='</div>';
+    }
+    if(r && r.error) h+='<div class="cs-msg error">'+esc(r.error)+'</div>';
+    if(r && r.absent_reason) h+='<div class="cs-msg absent">'+esc(r.absent_reason)+'</div>';
+    if(r && r.status==='warn' && (r.notes||[]).length)
+      h+='<div class="cs-msg">'+esc(r.notes[0])+'</div>';
+    if(r && r.elapsed_s!=null) h+='<div class="cs-q">'+r.elapsed_s+' s</div>';
+    h+='<div class="cs-act">';
+    if(running) h+='<button class="mini secondary" onclick="csCancel(\''+esc(spec.id)+'\')">stop this arm</button>';
+    else h+='<span class="cs-q">'+esc(spec.note||'')+'</span>';
+    h+='</div></div>';
+  }
+  h+='</div>';
+  return h;
+}
+async function csPreview(){
+  const sources=[];
+  if($('cs_src_suite').checked) sources.push('comm_suite');
+  if($('cs_src_profile').checked) sources.push('hardware_profile');
+  $('cs_prev').disabled=true;
+  $('cs_prev_msg').textContent='preparing the digest…';
+  try{
+    const d = await api('/api/share/rig_preview',{key:'cs_prev',body:{
+      sources: sources,
+      repo: $('cs_repo').value.trim()||undefined,
+      label_suffix: $('cs_suffix').value.trim()||undefined,
+      token: $('cs_token').value||undefined
+    }});
+    if(!d.ok){ $('cs_prev_msg').textContent=d.error||'failed'; return; }
+    window._csDigest=d.digest; window._csReport=d.report;
+    /* The preview is the POSTED text, shown verbatim -- not a rendering of
+       it. textContent, never innerHTML. */
+    $('cs_preview').textContent=d.report;
+    const cur=(d.digest||{}).curation||{}, fp=(d.digest||{}).fingerprint||{};
+    let sum='rig profile <code>'+esc(fp.id||'?')+'</code> &middot; '
+      +cur.measurement_rows+' rows &middot; '+cur.bytes+' bytes &middot; aggregation <b>'
+      +esc(cur.aggregation_level||'full')+'</b>';
+    if(cur.carried_over_unchanged) sum+=' &middot; '+cur.carried_over_unchanged+' unchanged rows not repeated';
+    if(d.merged_with) sum+=' &middot; merged into what this profile already published';
+    if((d.digest||{}).sample_count>1) sum+=' &middot; <b>'+d.digest.sample_count+' machines</b> of this profile';
+    if(d.warning) sum+='<div class="cs-msg error">'+esc(d.warning)+'</div>';
+    setHTML($('cs_summary'), sum);
+    $('cs_preview_wrap').style.display='';
+    csTokenState(d.token_stored);
+    $('cs_prev_msg').textContent='';
+  }catch(e){ if(!apiAborted(e)) $('cs_prev_msg').textContent=apiError(e); }
+  finally{ $('cs_prev').disabled=false; }
+}
+async function csSubmit(){
+  if(!window._csReport){ $('cs_submit_msg').textContent='prepare the digest first'; return; }
+  const token=$('cs_token').value;
+  if(!token && !window._csTokenStored){
+    $('cs_submit_msg').textContent='a GitHub token is needed once'; return;
+  }
+  if(!confirm('Post the previewed digest to GitHub now? This sends data to an EXTERNAL service.')) return;
+  $('cs_submit').disabled=true;
+  try{
+    const r=await fetch('/api/share/rig_submit',{method:'POST',body:JSON.stringify({
+      report: window._csReport,
+      digest: window._csDigest,
+      token: token||undefined,
+      repo: $('cs_repo').value.trim()||undefined,
+      label_suffix: $('cs_suffix').value.trim()||undefined,
+      remember_token: $('cs_remember').checked,
+      confirmed: true
+    })});
+    const d=await r.json();
+    if(!d.ok){ $('cs_submit_msg').textContent=d.error||'failed'; return; }
+    setHTML($('cs_submit_msg'),
+      'digest '+esc(d.action)+' for profile <code>'+esc(d.fingerprint)+'</code> &mdash; '
+      +'<a href="'+esc(d.comment_url||d.issue_url||'#')+'" target="_blank" rel="noopener">open on GitHub</a>');
+    csTokenState($('cs_remember').checked || window._csTokenStored);
+  }catch(e){ $('cs_submit_msg').textContent=String(e); }
+  finally{
+    $('cs_submit').disabled=false;
+    /* The token is used once and cleared. It is never kept in window state
+       and never written anywhere unless "remember" was ticked. */
+    $('cs_token').value='';
+  }
+}
+async function csForgetToken(){
+  const d=await api('/api/share/rig_token',{key:'cs_token',body:{action:'forget'}});
+  csTokenState(d.token_stored);
+  $('cs_submit_msg').textContent='stored token removed';
+}
+
 function showTab(t) {
-  const TABS = ['landing','wizard','runner','bench','explore','landscape','energy','quality','pair'];
+  const TABS = ['landing','wizard','runner','bench','explore','landscape','energy','quality','pair','share'];
   for (const v of TABS) $('view_'+v).style.display = t===v ? '' : 'none';
   for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
   if ((t==='explore'||t==='landscape') && !window._profLoaded) loadProfiles();
+  // #271: first visit only. Opening the tab READS state; it never measures,
+  // so this is safe to call while somebody else owns the cards.
+  if (t==='share') {
+    if (!window._shareTabInit) { window._shareTabInit=true; csInit(); }
+    else csPoll();
+  } else csStopPoll();
   if (t==='energy' && !window._energyInit) { window._energyInit=true; loadPowerProfile(); }
   if (t==='quality') { autofillQuality(); if(!window._qualityInit){window._qualityInit=true; loadShots();} }
   if (t==='runner' && !window._runnerInit) {
