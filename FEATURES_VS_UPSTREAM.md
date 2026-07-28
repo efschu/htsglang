@@ -80,6 +80,7 @@ comparison point does not apply to that engine.
 | [22](#f22) | fp8 dequant fallback (W8A16) | Cross-checked* | no | no | partial | unverified |
 | [23](#f23) | Turing/gfx900 without sgl-kernel | Cross-checked | no | no | partial | partial |
 | [24](#f24) | SWA-DCP | Cross-checked | no | no | no | no |
+| [25](#f25) | Per-message-class link selection | Cross-checked | no | no | no | no |
 
 ---
 
@@ -988,6 +989,31 @@ required partner — either alone leaves the boot red.
 Recipe: `docs_new/swa_dcp_stage_b_triton.md` §8.
 
 **Upstream:** no equivalent in sglang.
+
+---
+
+<a id="f25"></a>
+### 25. Per-message-class link selection
+
+`--collective-net-small` / `--collective-net-bulk` (env `SGLANG_COLLECTIVE_NET_SMALL` / `_BULK`) put
+the latency class and the bulk class on different network devices. On a host with two usable lines
+that buys small-message latency and bulk bandwidth at the same time instead of picking one; on a
+single-line host it only makes the existing choice explicit. **Cross-checked** against the real 40G
+RoCE link with a negative control.
+
+| Item | Detail |
+|---|---|
+| Mechanism | the UCX context is pinned with `ucp_config_modify(NET_DEVICES)` per instance. `UCX_NET_DEVICES` is one process-wide value and cannot address two instances or two classes; a modified config can. Unset → the call is skipped and the config is exactly the one the environment produced |
+| Reaches | (a) small and (b) large TP collectives via `small` — they share **one** UCX context, so this pins the whole collective plane; (c) PD-KV / HiCache via `bulk`, which seeds `--disaggregation-ib-device` when unset. (d) rendezvous/control is left on `--dist-init-addr` / `GLOO_SOCKET_IFNAME` on purpose |
+| Not separable | (a) from (b). One `UcpWorker`, one endpoint per peer. A genuine split needs a second UCX context, a second address exchange at rendezvous and a rank-uniform size-keyed selector (a disagreement deadlocks rather than returning a wrong answer) — ~200 lines plus cross-rig validation, not built. Setting `small` ≠ `bulk` is legal and logs that (b) stays on `small` |
+| Not rank-uniform | unlike every `SGLANG_HTCCL*` knob. The value is a local device name and the two ends of one link are called different things (`rocep4s0f1` / `rocep1s0f1`); the wire has to match, not the string |
+| Why the flags reject unknown devices | UCX does **not** fail on one. It warns `network device '...' is not available` and builds a context with no network transport, so the run completes and reports loopback numbers. Both flags validate against `/sys/class/infiniband` and `/sys/class/net` during server-args resolution and name what the host does have |
+| Evidence | cross-rig world-2 `all_reduce` over the 40G RoCE link with `UCX_TLS=rc,self,sm` and `UCX_NET_DEVICES` **unset**, driven only by `SGLANG_COLLECTIVE_NET_SMALL`: completes at 29.69 us / 184.54 us for 8 / 256 KiB. Negative control: repinned to the unwired second port `rocep4s0f0:1`, `ucp_ep_create` fails with `Destination is unreachable` — the pin is load-bearing, not decorative |
+| Default unchanged | 12 new CPU tests plus the 39 pre-existing HTCCL/UCX tests green. A/B control on the legacy `UCX_NET_DEVICES` route: 26.33 / 24.14 / 38.39 us at 8 KiB and 187.50 / 182.97 / 181.18 us at 256 KiB — the new route lands inside the old route's own repeat spread, and at 8 KiB that spread is far too wide for a 50-iteration harness to resolve a difference at all |
+| Worth it here? | no. This rig measures 1.47 us (FEC-free 40G) vs 1.58 us (100G, slot-limited to 3.43 GB/s) for an 8 B message, so there is no split worth making. The feature targets hosts whose latency-optimal and bandwidth-optimal cards differ |
+
+**Upstream:** sglang exposes `--disaggregation-ib-device` for the PD bulk side only; the collective
+plane's device is left to the process-wide `UCX_NET_DEVICES`.
 
 ---
 
