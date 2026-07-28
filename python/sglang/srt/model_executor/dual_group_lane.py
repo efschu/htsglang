@@ -39,6 +39,7 @@ Known two-segment assumptions are named in the slice report, not hidden.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -378,6 +379,7 @@ def assemble_lane_shells(
     part_dicts = [_module_dict(m) for m in part_models]
     hull_modules = list(hull.named_modules())
     counts = {"column": 0, "row": 0, "embedding": 0, "lm_head": 0, "composed": 0}
+    composed_prefixes: List[str] = []
 
     def parts_for(name: str) -> List[nn.Module]:
         parts = []
@@ -410,16 +412,44 @@ def assemble_lane_shells(
             counts["row"] += 1
         elif isinstance(module, ColumnParallelLinear):
             if name.endswith(_COMPOSED_LINEAR_SUFFIXES):
-                _compose_column_weights_inplace(module, parts_for(name))
+                parent_name = name.rsplit(".", 1)[0]
+                _compose_column_weights_inplace(
+                    module,
+                    parts_for(name),
+                    _gdn_conv_sub_sizes(parts_for(parent_name)),
+                )
                 counts["composed"] += 1
+                composed_prefixes.append(name + ".")
             else:
                 set_by_name(name, LaneColumnParallelShell(parts_for(name)))
                 counts["column"] += 1
+    hull._lane_composed_prefixes = tuple(composed_prefixes)
     return counts
 
 
+def _gdn_conv_sub_sizes(gdn_parts: Sequence[nn.Module]) -> List[List[int]]:
+    """Per-part conv-channel group widths of a GDN mixer: [q, k, v] groups,
+    each sized by that part's LOCAL head counts.  The conv1d linear itself
+    reports one flat partition; the 3-group layout is a property of the
+    mamba_v2 packed weight, so it is derived from the owning mixer."""
+    sizes = []
+    for p in gdn_parts:
+        if not hasattr(p, "local_num_k_heads"):
+            raise ValueError(
+                f"composed conv linear inside {type(p).__name__} without GDN "
+                "head attributes -- unknown packed-conv layout, refusing to "
+                "guess."
+            )
+        k = int(p.local_num_k_heads) * int(p.head_k_dim)
+        v = int(p.local_num_v_heads) * int(p.head_v_dim)
+        sizes.append([k, k, v])
+    return sizes
+
+
 def _compose_column_weights_inplace(
-    hull_linear: nn.Module, parts: Sequence[nn.Module]
+    hull_linear: nn.Module,
+    parts: Sequence[nn.Module],
+    per_part_sub_sizes: Sequence[Sequence[int]],
 ) -> None:
     """Fill a non-GEMM column-parallel weight (GDN conv1d) by value.
 
@@ -428,13 +458,18 @@ def _compose_column_weights_inplace(
     IN-PLACE ``copy_`` on purpose: RadixLinearAttention captured a VIEW of
     this storage at construction; reassigning ``.data`` would strand it.
     """
-    sub_sizes = [list(p.output_partition_sizes) for p in parts]
-    n_sub = len(sub_sizes[0])
+    n_sub = len(per_part_sub_sizes[0])
     pieces = []
     for s in range(n_sub):
         for f, p in enumerate(parts):
-            off = sum(sub_sizes[f][:s])
-            pieces.append(p.weight.data[off : off + sub_sizes[f][s]])
+            sizes = per_part_sub_sizes[f]
+            if p.weight.data.shape[0] != sum(sizes):
+                raise ValueError(
+                    f"composed column linear: part {f} weight dim0 "
+                    f"{p.weight.data.shape[0]} != declared groups {sizes}."
+                )
+            off = sum(sizes[:s])
+            pieces.append(p.weight.data[off : off + sizes[s]])
     full = torch.cat(pieces, dim=0)
     if full.shape != hull_linear.weight.shape:
         raise ValueError(
@@ -465,7 +500,10 @@ def _finalize_hull_params(
     shared_params = dict(shared_model.named_parameters())
     part_params = [dict(m.named_parameters()) for m in part_models]
     counts = {"aliased": 0, "composed_vec": 0}
+    composed_prefixes = getattr(hull, "_lane_composed_prefixes", ())
     for name, param in hull.named_parameters():
+        if any(name.startswith(pfx) for pfx in composed_prefixes):
+            continue  # filled by _compose_column_weights_inplace
         if param.device.type == "meta":
             raise ValueError(
                 f"dual-group lane: hull parameter {name!r} is still on meta "
@@ -735,6 +773,12 @@ def _lane_server_args_view(server_args):
         view.speculative_cross_algorithm = False
     view.dcp_size = 1
     view.max_running_requests = server_args.dual_group_lane_max_requests
+    # The lane has no radix cache (its batches use a no-op tree-cache stub),
+    # so the mamba slot ratio is 1 slot per request (with the radix cache on,
+    # _calculate_mamba_ratio charges ~5 slots/request for the extra-buffer
+    # strategy and a 2-slot lane pool admits zero requests -- measured boot
+    # failure). One spare slot for the ping-pong margin.
+    view.disable_radix_cache = True
     view.max_mamba_cache_size = server_args.dual_group_lane_max_requests + 1
     view.rank_tp_ratio = None
     view.rank_mlp_ratio = None
@@ -742,6 +786,21 @@ def _lane_server_args_view(server_args):
     view.rank_vocab_ratio = None
     view.rank_gpu_memory_mib = None
     view.disaggregation_topology = None
+    # Own graph-plan object: the lane's capture setup must never write into
+    # the serving group's (shared, already-captured) plan.
+    view.cuda_graph_config = copy.deepcopy(server_args.cuda_graph_config)
+    if server_args.dual_group_lane_eager:
+        # Eager bring-up: the runner machinery still builds its EagerRunner
+        # (forward dispatch needs it); only the captures are skipped. The
+        # disable flags were already RESOLVED into the phase config at
+        # __post_init__, so the phases themselves are set to DISABLED here.
+        from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+
+        view.disable_cuda_graph = True
+        view.disable_prefill_cuda_graph = True
+        view.disable_decode_cuda_graph = True
+        for phase in Phase.ALL:
+            getattr(view.cuda_graph_config, phase).backend = Backend.DISABLED
     return view
 
 
@@ -813,7 +872,7 @@ class DualGroupLane:
                 return False
             self.active = self.jobs.pop(0)
         job = self.active
-        with lane_geometry_override(1, 0), torch.no_grad():
+        with self._lane_runtime_scope(), torch.no_grad():
             if job["prefill_ms"] is None:
                 self._prefill(job)
             else:
@@ -824,6 +883,29 @@ class DualGroupLane:
         ):
             self._finish(job)
         return True
+
+    @contextlib.contextmanager
+    def _lane_runtime_scope(self):
+        """The serial tick's execution scope: the lane geometry override PLUS
+        the lane's server-args view published as the process config.
+
+        The batch/forward machinery reads ``get_server_args()`` (process
+        global) at runtime -- e.g. ``prepare_for_extend`` gates the
+        mamba-radix track machinery on it, which the lane (no radix cache,
+        its own pool without track buffers) must not enter.  Ticks are
+        strictly serial with the serving group's forwards (S1), so a scoped
+        swap is safe; slice C's concurrency must move these reads off the
+        global first (known blocker, documented)."""
+        from sglang.srt.runtime_context import get_context
+
+        ctx = get_context()
+        saved = ctx._server_args
+        ctx.set_server_args(self.runner.server_args)
+        try:
+            with lane_geometry_override(1, 0):
+                yield
+        finally:
+            ctx.set_server_args(saved)
 
     def _make_batch(self, job):
         from array import array
@@ -891,6 +973,10 @@ class DualGroupLane:
         job["output_ids"].append(int(next_token_ids[0].item()))
         job["_batch"] = batch
         job["_next"] = next_token_ids
+        # Captured NOW for the cleanup: the batch's req list is not stable
+        # across the decode preparations.
+        job["_req"] = batch.reqs[0]
+        job["_req_pool_idx"] = int(batch.reqs[0].req_pool_idx)
 
     def _decode_step(self, job):
         batch = job["_batch"]
@@ -905,16 +991,24 @@ class DualGroupLane:
         batch = job.pop("_batch", None)
         job.pop("_next", None)
         if batch is not None:
-            # Release the lane pool slots (dummy cache: free directly).
-            try:
-                batch.release_req_pool_and_kv()
-            except AttributeError:
-                idx = batch.reqs[0].req_pool_idx
-                kv_indices = batch.req_to_token_pool.req_to_token[
-                    idx, : len(batch.reqs[0].fill_ids)
-                ]
+            # Release the lane pool slots (no radix cache: free directly).
+            # Allocated tokens = prompt + one per decode step; the LAST
+            # sampled token was never written into the KV pool.
+            n_alloc = len(job["input_ids"]) + max(0, len(job["output_ids"]) - 1)
+            idx = job.get("_req_pool_idx")
+            req = job.pop("_req", None)
+            if idx is not None and req is not None:
+                kv_indices = batch.req_to_token_pool.req_to_token[idx, :n_alloc]
                 batch.token_to_kv_pool_allocator.free(kv_indices)
-                batch.req_to_token_pool.free(idx)
+                pool = batch.req_to_token_pool
+                # Hybrid pool: the GDN state slot is freed separately and
+                # takes the Req (it reads mamba_pool_idx / req_pool_idx).
+                if (
+                    hasattr(pool, "free_mamba_cache")
+                    and getattr(req, "mamba_pool_idx", None) is not None
+                ):
+                    pool.free_mamba_cache(req)
+                pool.free(req)
         decode_ms = job["decode_ms"]
         result = {
             "input_len": len(job["input_ids"]),
@@ -1001,6 +1095,30 @@ def build_dual_group_lanes(scheduler) -> List[DualGroupLane]:
     logger.info(
         "dual-group lane %d bring-up (rank-local): %s", lane_id, plan.describe()
     )
+    # The whole bring-up runs under the lane's server-args view published as
+    # the process config: helpers like check_cuda_graph_backend read the
+    # GLOBAL args, not runner.server_args, and must see the lane's graph
+    # plan (measured: the lane otherwise captures/skips by the serving
+    # group's plan). Serial with everything else on this rank -- the
+    # scheduler is still initializing. Restored in `finally`.
+    from sglang.srt.runtime_context import get_context
+
+    ctx = get_context()
+    saved_args = ctx._server_args
+    ctx.set_server_args(lane_args)
+    try:
+        return _build_lane_under_scope(
+            scheduler, server_args, lane_args, plan, lane_id, host_runner
+        )
+    finally:
+        ctx.set_server_args(saved_args)
+
+
+def _build_lane_under_scope(
+    scheduler, server_args, lane_args, plan, lane_id, host_runner
+) -> List[DualGroupLane]:
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
     with lane_geometry_override(1, 0):
         runner = ModelRunner(
             model_config=host_runner.model_config,
@@ -1032,8 +1150,9 @@ def build_dual_group_lanes(scheduler) -> List[DualGroupLane]:
                 "eager is a bring-up state, not an end state.",
                 lane_id,
             )
-        else:
-            runner.init_cuda_graphs()
+        # Always: builds the eager phase runner (forward dispatch requires
+        # it); captures are skipped when the lane view disables them.
+        runner.init_cuda_graphs()
 
     lane = DualGroupLane(lane_id=lane_id, plan=plan, runner=runner)
     logger.info(
