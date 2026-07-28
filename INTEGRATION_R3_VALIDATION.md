@@ -6234,3 +6234,28 @@ depth>=4 (loescht das 64-80-KiB-Band) und V5 (Relay serialisiert bei
 Mehr-Paar) ist die Dispatcher-Datenlage (#279) komplett bis auf die
 symmetrische Last-Messung. Naechstes Fenster: #280 (GPU->GPU-BAR-
 Schreibprobe F1-F4 — wuerde die V5-Wand umgehen: eigener PCIe-Pfad je Paar).
+## #280 GPU->GPU-BAR-Direktschreiben: ENDGUELTIG ZU an F2 — mit wertvollem F1-Primitiv (2026-07-28)
+
+F1 FIEL doch (Operator-Einwand bestaetigt): ibv_reg_dmabuf_mr zwingt den
+Treiber, die BAR1-Pages zu programmieren — bei lebender MR findet der
+(diesmal positiv kalibrierte) Fensterscan das Muster bei base=0x1a00000,
+CPU liest Bs VRAM sauber durch BAR1 (0/512 Punkte falsch). Das Mapping
+verschwindet mit ibv_dereg_mr (MR muss leben). F1a (dmabuf-mmap) bleibt
+Treiber-verweigert (can_mmap[0]).
+F2 = DIE WAND: cudaHostRegisterIoMemory liefert CUDA_ERROR_INVALID_VALUE
+in allen Varianten, dmesg woertlich: osCheckGpuBarsOverlapAddrRange —
+"phys range ... overlaps with FB or GPU BAR2". Der Treiber hat einen
+BENANNTEN Guard, der IoMemory-Registrierung NVIDIA-eigener BARs gezielt
+verweigert; IoMemory ist nur fuer FREMDE PCIe-Geraete. Ironie: die Route
+scheitert nicht an Unerreichbarkeit, sondern daran, dass der Treiber die
+Erreichbarkeit erkennt. => Verworfenes-Register, Wiedereroeffnung nur mit
+Treiber-Patch (tinygrad-Klasse, Nutzer-Entscheidung). V5-Parallel-Frage
+ohne NIC bleibt damit UNBEANTWORTBAR auf Userspace-Wegen.
+WIEDERVERWENDBARES F1-PRIMITIV (registriert): lebende dmabuf-MR + BAR1-
+Fensterscan = CPU-Lese-/Schreibzugriff auf GPU-VRAM mit auffindbarem
+Offset — Kandidat fuer Debugging/Inspektion/Kleinst-Host-Staging.
+Nachbau-Fallen: sysfs-resource-mmap nur <=32-MiB-Fenster (EINVAL ab 64),
+resource1_wc statt resource1 (PAT-Konflikt mit Treiber-WC-Reservierung).
+Code: gpu2gpu_bar.c auf probe/gdr-window.
+
+## NCCL/System-RAM-Referenz (#278-Abschluss): Direktpfad schlaegt den echten Pfad (2026-07-28)
