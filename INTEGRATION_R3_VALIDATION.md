@@ -5030,3 +5030,34 @@ counterfactual 26.12 GiB. awq_marlin confirmed on-path. Greedy generation 656 to
 coherent, self-terminating; py-spy before kill idle in event_loop_overlap; card back
 to 0 MiB, lock released. Runbook 4.6 carries the recipe incl. the UUID-vs-index
 pinning rationale (CUDA_DEVICE_ORDER=FASTEST_FIRST mismatches nvidia-smi order).
+
+# #201 slice 2 — cross-rig PP=2 boots; the stage boundary costs ~2 % of a decode round
+
+Merged feat/uneven-pp-slice2 (13c55d7b86, fast-forward; runbook 4.9, design doc part 3).
+No mechanism was missing: _calculate_rank_ranges already places pp_rank per node.
+Vehicle Qwen3.5-4B fp16 (no 9B safetensors exists; GGUF cannot run on sm75), stage 0
+on a rig-1 3080, stage 1 on the 2080 Ti, boundary over the 40G line.
+
+Boundary transfer per microbatch (NCCL sockets, hidden 2560 fp16, one-way): bs=1
+10.0 KiB in 142 us + 249 us pickled metadata — the metadata costs MORE than the
+payload at bs=1 (64 % of the crossing; shapes are static per batch size, a cache is
+the cheapest remaining lever). 2048-chunk 20 MiB in 10.25 ms; 8192 80 MiB in
+39.48 ms = 2.07 GB/s (the 40G line; 1 GbE would be 0.105). Decode crossing ~0.4 ms
+of an 18.2 ms round (~2 %).
+
+tok/s (median of 3, A-vs-A noise 1.1-2.1 %): monolithic 1x3080 67.6 tok/s /
+8k-TTFT 1.35 s; cross-rig PP=2 (20/12) 55.1 tok/s / 3.42 s. Pipeline costs 18 %
+decode against the faster card alone — expected sign, PP buys capacity, not speed.
+Full decode CUDA graphs run on BOTH stages including sm75 — the pipeline needs no
+HTCCL (host-staging forced cross-rig TP eager; PP escapes that entirely).
+
+Findings: NCCL's verbs path is broken on this RoCE line (IBV_WC_REM_INV_REQ_ERR on
+the first 5120-byte proxy tensor; sockets on the same HCA work; UCX drives the same
+HCAs fine — foreign bug, NCCL_IB_DISABLE=1 default); cross-rig TP=2 on pure NCCL
+does not come up at all (rank-0 scheduler dies silently in init_distributed, rank 1
+hangs in all_reduce — the no-number is the result; under PP no TP group ever spans
+hosts); hybrid GDN splits its KV by FULL-ATTENTION layers, not layers (14/10 gave
+3/3 full-attn per stage and identical K size — any split planner reading
+num_hidden_layers alone sizes every hybrid wrong); world-MIN on max_total_num_tokens
+remains the biggest open item (113671 both stages). Slice 3 revised 4-6 days, all
+intra-rig developable, cross-check via pp_crossrig_launch.sh.
