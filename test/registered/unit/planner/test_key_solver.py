@@ -210,6 +210,36 @@ class TestWaterFill(CustomTestCase):
         self.assertAlmostEqual(u[1], 0.0, places=9)
         self.assertAlmostEqual(sum(u), 30.0, places=6)
 
+    def test_nesting_bounds_are_a_ceiling_per_shared_card(self):
+        # The dual-group case: an inner lane reusing an outer lane's resident
+        # weights may hold at most what the outer lane holds, card by card.
+        # A card the outer lane does not use is unbounded -- it carries the
+        # complement, the only genuinely new bytes in the rig.
+        b = ks.nesting_bounds([118, 18], [0, 1, None])
+        self.assertEqual(b, [(None, 118), (None, 18), (None, None)])
+
+    def test_nesting_and_role_bounds_intersect(self):
+        # A nesting ceiling must never widen a role, and a role must never
+        # widen a nesting ceiling: the two are intersected, not overridden.
+        lo, hi, _ = ks._role_bounds(
+            ["shard", "kv_donor", "shard"], 136, [(None, 100), (None, 50), (10, None)]
+        )
+        self.assertEqual(hi[0], 100)  # nesting tightens the shard
+        self.assertEqual(hi[1], 0)  # role tightens below the nesting ceiling
+        self.assertEqual(lo[2], 10)  # an explicit floor is honoured
+
+    def test_nesting_box_is_respected_by_the_optimizer(self):
+        u = ks.water_fill(
+            [1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+            60.0,
+            [0.0, 0.0, 0.0],
+            [20.0, 10.0, 60.0],
+        )
+        self.assertLessEqual(u[0], 20.0 + 1e-9)
+        self.assertLessEqual(u[1], 10.0 + 1e-9)
+        self.assertAlmostEqual(sum(u), 60.0, places=6)
+
     def test_infeasible_bounds_raise_instead_of_lying(self):
         # Two donors and one shard that cannot hold everything: there is no
         # allocation, and the solver has to say so rather than return one.
