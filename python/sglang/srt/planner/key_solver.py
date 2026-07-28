@@ -279,6 +279,7 @@ __all__ = [
     "InstanceEstimate",
     "estimate_instance",
     "coexistence",
+    "coresident_budgets",
     "aggregate",
     "gemm_dtype_for_checkpoint",
     "ADDITIVE_ANCHOR",
@@ -2403,6 +2404,7 @@ def coexistence(
     *,
     reserve_mib: Optional[Dict[int, int]] = None,
     process_post_mib: float = FIXED_PROCESS_POST_MIB,
+    shared_process: bool = False,
 ) -> dict:
     """The #260 bracket: do these instances jointly fit?
 
@@ -2429,6 +2431,15 @@ def coexistence(
       stand-in for it. An instance with ``share_group=None`` shares with
       nobody and is counted on its own — naive duplication stays priced as
       naive duplication.
+
+    ``shared_process`` switches the third term off. Two lanes of ONE engine
+    process (the dual-group runtime) share the CUDA context, the graph pool
+    and the activation scratch, so charging a second post would invent
+    1.5-3 GiB per shared card that nobody allocates. Two independent servers
+    do pay it, which is the default. This is a property of the runtime, not
+    of the plan, so it is a parameter and not a guess: on the FP8
+    tp2-in-tp3 evaluation it moved every cell of the feasibility sweep by
+    3072 MiB, i.e. it decides three of its corners.
 
     Returns the verdict AND the per-GPU arithmetic, so a "does not fit" can
     be argued with instead of believed.
@@ -2457,7 +2468,7 @@ def coexistence(
                 shared_note.append(e.key)
             groups[gkey] = max(groups.get(gkey, 0.0), w)
         weights_total = sum(groups.values())
-        extra_processes = max(len(here) - 1, 0)
+        extra_processes = 0 if shared_process else max(len(here) - 1, 0)
         posts = extra_processes * process_post_mib
         claimed = other_total + weights_total + posts
         total = float(gpu_total_mib.get(gpu, 0))
@@ -2478,6 +2489,8 @@ def coexistence(
                 "weights_mib": round(weights_total, 1),
                 "other_mib": round(other_total, 1),
                 "process_posts_mib": round(posts, 1),
+                "shared_process": bool(shared_process),
+                "lanes": len(here),
                 "shared_weight_saving_mib": round(shared_saving, 1),
                 "claimed_mib": round(claimed, 1),
                 "available_mib": round(avail, 1),
@@ -2506,6 +2519,149 @@ def coexistence(
     return {"fits": fits, "per_gpu": rows}
 
 
+def coresident_budgets(
+    specs: Sequence[InstanceSpec],
+    estimates: Sequence[InstanceEstimate],
+    gpu_total_mib: Dict[int, int],
+    *,
+    reserve_mib: Optional[Dict[int, int]] = None,
+    process_post_mib: float = FIXED_PROCESS_POST_MIB,
+    shared_process: bool = False,
+) -> Optional[Dict[str, List[int]]]:
+    """Per-lane, per-rank budgets under co-residence (the #260 mapping).
+
+    ``estimate_instance`` sizes a lane's KV capacity against the budget the
+    caller passed for it, which is that lane's share of the card *as if it
+    were alone*. Two lanes sharing a card then both count the same free
+    bytes, and summing their capacities over-states the rig by whatever the
+    overlap is worth — measured at 3.3x and 4.8x on the FP8 tp2-in-tp3
+    candidates, 1.14M tokens against a real 240-343k. That is the bug this
+    function exists to remove.
+
+    The mapping, per physical GPU ``g``::
+
+        leftover(g) = total(g) - reserve(g)
+                    - SUM_{share groups} MAX weights(g)   # shared bytes once
+                    - SUM_lanes other(g)                  # pools, overhead
+                    - process posts
+        budget_i(g) = weights_i(g) + other_i(g) + leftover(g) / lanes(g)
+
+    A lane keeps what it actually holds and gets an equal share of what is
+    left. Two properties are worth being explicit about, because they decide
+    how far the result can be trusted:
+
+    * The EQUAL SPLIT of the leftover is a POLICY, not a derivation — a rig
+      may want to favour one lane. But the sum of the budgets is fixed
+      regardless of the split, so the per-rank capacity TOTAL is
+      split-invariant; only its division between lanes is a choice. The
+      usable-context figure is not strictly invariant, because
+      ``min(sum P, 64 x min P)`` is not linear, and the caller is told so.
+    * A lane whose weights are the smaller half of a share group is charged
+      only its OWN weights here, which is correct: the bytes it reuses were
+      already paid for by the group, and the saving flows into ``leftover``
+      where both lanes get a share of it.
+    * Consequently the budgets do NOT sum to the card. They sum to
+      ``available - posts + shared_weight_saving``, because the shared bytes
+      are handed to every lane that reads them — each lane's capacity model
+      subtracts its own weight view, so each has to be given it, and the
+      physical books stay straight because ``leftover`` charged those bytes
+      only once. Reading the total as "available minus the saving" is the
+      natural mistake and gets the sign backwards.
+
+    Returns ``None`` when the mapping cannot be built — an overflowing card
+    (a negative leftover has no honest division) or a lane with no local
+    footprint at all. The caller then reports the KV cell ``absent`` rather
+    than dividing a number it does not have.
+    """
+    reserve = dict(reserve_mib or {})
+    by_key = {e.key: e for e in estimates}
+    if len(by_key) != len(estimates):
+        return None  # duplicate keys: the mapping would be ambiguous
+
+    leftover: Dict[int, float] = {}
+    lanes_on: Dict[int, List[InstanceEstimate]] = {}
+    gpus: set = set()
+    for est in estimates:
+        if est.local:
+            gpus |= set(est.weights_mib) | set(est.other_mib)
+    for g in gpus:
+        here = [
+            e
+            for e in estimates
+            if e.local and (e.weights_mib.get(g) or e.other_mib.get(g))
+        ]
+        if not here:
+            continue
+        lanes_on[g] = here
+        groups: Dict[str, float] = {}
+        for e in here:
+            gk = e.share_group or f"__own__{e.key}"
+            groups[gk] = max(groups.get(gk, 0.0), e.weights_mib.get(g, 0.0))
+        posts = 0.0 if shared_process else max(len(here) - 1, 0) * process_post_mib
+        avail = float(gpu_total_mib.get(g, 0)) - float(reserve.get(g, 0))
+        left = (
+            avail
+            - sum(groups.values())
+            - sum(e.other_mib.get(g, 0.0) for e in here)
+            - posts
+        )
+        if left < 0:
+            return None  # does not fit; there is nothing to divide
+        leftover[g] = left
+
+    out: Dict[str, List[int]] = {}
+    for spec in specs:
+        found: Optional[InstanceEstimate] = by_key.get(spec.key)
+        if found is None or not found.local:
+            continue
+        est = found
+        budgets: List[int] = []
+        for gpu in spec.rank_gpu_id:
+            g = int(gpu)
+            n = len(lanes_on.get(g, []))
+            if n == 0:
+                return None
+            ranks_here = sum(1 for x in spec.rank_gpu_id if int(x) == g)
+            share = (
+                est.weights_mib.get(g, 0.0)
+                + est.other_mib.get(g, 0.0)
+                + leftover.get(g, 0.0) / n
+            ) / max(ranks_here, 1)
+            budgets.append(int(share))
+        out[spec.key] = budgets
+    return out or None
+
+
+def _capacity_under(
+    spec: InstanceSpec, probe: dict, budgets_mib: Sequence[int]
+) -> Optional[float]:
+    """One lane's usable context under a REPLACED budget. ``None`` when the
+    lane cannot fund a KV pool at that budget (which is a finding, not a
+    hole: it means the co-residence share is too small to serve)."""
+    from sglang.srt.uneven_perf import PlanInputs
+
+    b = [int(x) for x in budgets_mib]
+    base_plan = list(spec.base_plan or spec.budgets_mib)
+    inputs = PlanInputs(
+        tp_size=spec.tp_size,
+        model_path=spec.model_path,
+        kv_cache_dtype=spec.kv_cache_dtype,
+        speculative_algorithm=spec.speculative_algorithm,
+        speculative_num_draft_tokens=spec.speculative_num_draft_tokens,
+        max_running_requests=spec.max_running_requests,
+        rank_gpu_id=list(spec.rank_gpu_id),
+        effective_vram_mib=b,
+    )
+    try:
+        rates = rates_from_probe(probe, spec.rank_gpu_id)
+        model = build_cost_model(inputs, base_plan, b, rates)
+        units = model.perf.mlp_unit_partition(list(spec.mlp_vector or base_plan))
+        cap = model.capacity(units, [0.0] * spec.tp_size)
+    except (ValueError, KeyError, ZeroDivisionError):
+        return None
+    return float(cap["ctx"]) if cap["feasible"] else None
+
+
 def aggregate(
     specs: Sequence[InstanceSpec],
     probe: dict,
@@ -2513,6 +2669,7 @@ def aggregate(
     *,
     reserve_mib: Optional[Dict[int, int]] = None,
     prefill_tokens: int = 20000,
+    shared_process: bool = False,
 ) -> dict:
     """Aggregate throughput of several coexisting instances.
 
@@ -2520,11 +2677,24 @@ def aggregate(
     and sum — or refuse to sum and say which GPU overflowed by how much.
     Every family that adds a source goes through here; there is no per-family
     branch anywhere in this function, which is the point.
+
+    KV is the one quantity that is NOT simply summed. Throughput is additive
+    because two lanes really do produce tokens in parallel (subject to the
+    interference caveat every caller is told about), but capacity is not:
+    lanes that share a card would each count the same free bytes. So when any
+    card carries more than one lane, every lane is re-sized against its
+    co-residence share (``coresident_budgets``) before the sum, and the cell
+    says it was. Where that mapping cannot be built the cell is ``absent``.
     """
     estimates = [
         estimate_instance(s, probe, prefill_tokens=prefill_tokens) for s in specs
     ]
-    bracket = coexistence(estimates, gpu_total_mib, reserve_mib=reserve_mib)
+    bracket = coexistence(
+        estimates,
+        gpu_total_mib,
+        reserve_mib=reserve_mib,
+        shared_process=shared_process,
+    )
 
     reasons: List[str] = []
     for est in estimates:
@@ -2547,7 +2717,16 @@ def aggregate(
         return {
             "ok": True,
             "fits": False,
-            "instances": [e.to_json() for e in estimates],
+            "shares_a_card": any(r["lanes"] > 1 for r in bracket["per_gpu"]),
+            "shared_process": bool(shared_process),
+            "instances": [
+                {
+                    **e.to_json(),
+                    "coresident_kv_tokens": None,
+                    "coresident_budget_mib": None,
+                }
+                for e in estimates
+            ],
             "coexistence": bracket,
             "aggregate": cells,
             "reasons": reasons,
@@ -2575,11 +2754,93 @@ def aggregate(
 
     cells["prefill_tok_s"] = _sum("prefill_tok_s", "tok/s", "a prefill rate")
     cells["decode_tok_s"] = _sum("decode_tok_s", "tok/s", "a decode rate")
-    cells["max_kv_tokens"] = _sum("max_kv_tokens", "tokens", "a KV capacity")
+
+    # -- KV: sum only what the lanes can hold AT THE SAME TIME --------------
+    shares_a_card = any(row["lanes"] > 1 for row in bracket["per_gpu"])
+    coresident: Optional[Dict[str, List[int]]] = None
+    per_lane_kv: Dict[str, Optional[float]] = {
+        e.key: e.max_kv_tokens for e in estimates
+    }
+    if not shares_a_card:
+        cells["max_kv_tokens"] = _sum("max_kv_tokens", "tokens", "a KV capacity")
+    else:
+        coresident = coresident_budgets(
+            specs,
+            estimates,
+            gpu_total_mib,
+            reserve_mib=reserve_mib,
+            shared_process=shared_process,
+        )
+        if coresident is None:
+            cells["max_kv_tokens"] = _cell(
+                None,
+                ABSENT,
+                "these lanes share at least one card, so their solo KV "
+                "capacities cannot be added — and the co-residence budget "
+                "mapping could not be built for them (an overflowing card or "
+                "a lane with no local footprint). Rather than sum numbers "
+                "that each assume the whole card, no KV aggregate is "
+                "reported; size the lanes one at a time",
+                unit="tokens",
+            )
+        else:
+            recomputed = {
+                s.key: _capacity_under(s, probe, coresident[s.key])
+                for s in specs
+                if s.key in coresident
+            }
+            per_lane_kv = {
+                e.key: recomputed.get(e.key, e.max_kv_tokens) for e in estimates
+            }
+            starved = [k for k, v in recomputed.items() if v is None]
+            if starved:
+                cells["max_kv_tokens"] = _cell(
+                    None,
+                    ABSENT,
+                    "co-resident sizing leaves "
+                    + ", ".join(starved)
+                    + " without a fundable KV pool on its share of the "
+                    "shared card(s) — the configuration fits in bytes but "
+                    "does not serve, so there is no capacity to report",
+                    unit="tokens",
+                )
+            else:
+                total = sum(float(v) for v in recomputed.values() if v)
+                solo = sum(float(e.max_kv_tokens or 0.0) for e in estimates)
+                parts = ", ".join(
+                    f"{k} {float(v):.0f}" for k, v in recomputed.items() if v
+                )
+                cells["max_kv_tokens"] = _cell(
+                    round(total, 1),
+                    ESTIMATE,
+                    (
+                        "co-resident capacity: every lane re-sized against "
+                        "its share of the cards it shares (#260 mapping, "
+                        "leftover split evenly), then summed — "
+                        f"{parts}. The solo figures would have summed to "
+                        f"{solo:.0f}, a {solo / total:.2f}x over-count, "
+                        "because each lane sized its KV as if it owned the "
+                        "whole card. The per-rank capacity total is "
+                        "invariant under how the leftover is split; the "
+                        "usable-context figure is not exactly, because "
+                        "min(sum, 64 x weakest) is not linear"
+                    ),
+                    unit="tokens",
+                )
+
+    out_instances = []
+    for e in estimates:
+        row = e.to_json()
+        row["coresident_kv_tokens"] = per_lane_kv.get(e.key)
+        row["coresident_budget_mib"] = coresident.get(e.key) if coresident else None
+        out_instances.append(row)
+
     return {
         "ok": True,
         "fits": True,
-        "instances": [e.to_json() for e in estimates],
+        "shares_a_card": shares_a_card,
+        "shared_process": bool(shared_process),
+        "instances": out_instances,
         "coexistence": bracket,
         "aggregate": cells,
         "reasons": reasons,

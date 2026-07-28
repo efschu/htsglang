@@ -949,6 +949,250 @@ class TestAdditiveRegression(_Bf16StateEnv):
 
 
 # ---------------------------------------------------------------------------
+# 7b. Co-resident KV capacity — the aggregate() over-count
+# ---------------------------------------------------------------------------
+
+
+class TestSharedProcessBracket(CustomTestCase):
+    """``shared_process`` is a property of the RUNTIME, so it is a parameter.
+    Two lanes of one engine process share the CUDA context, the graph pool
+    and the activation scratch; charging a second post would invent memory
+    nobody allocates."""
+
+    @staticmethod
+    def _est(key, weights, other, share=None):
+        return ks.InstanceEstimate(
+            key=key,
+            kind="serving",
+            local=True,
+            feasible=True,
+            reasons=[],
+            prefill_tok_s=1000.0,
+            decode_tok_s=50.0,
+            max_kv_tokens=10000.0,
+            weights_mib=dict(weights),
+            other_mib=dict(other),
+            posts_mib={},
+            share_group=share,
+        )
+
+    def test_one_process_drops_exactly_one_post_per_shared_card(self):
+        a = self._est("a", {0: 6000, 1: 3000}, {0: 2000, 1: 1000}, share="d")
+        b = self._est("b", {0: 6000}, {0: 2000}, share="d")
+        two = ks.coexistence([a, b], {0: 20000, 1: 20000})
+        one = ks.coexistence([a, b], {0: 20000, 1: 20000}, shared_process=True)
+        h2 = {r["gpu"]: r["headroom_mib"] for r in two["per_gpu"]}
+        h1 = {r["gpu"]: r["headroom_mib"] for r in one["per_gpu"]}
+        # GPU 0 carries both lanes -> one post saved. GPU 1 carries one lane
+        # -> nothing to save, and nothing invented either.
+        self.assertAlmostEqual(h1[0] - h2[0], ks.FIXED_PROCESS_POST_MIB, places=6)
+        self.assertAlmostEqual(h1[1], h2[1], places=6)
+        self.assertTrue(one["per_gpu"][0]["shared_process"])
+        self.assertFalse(two["per_gpu"][0]["shared_process"])
+
+    def test_lane_count_is_reported_per_card(self):
+        a = self._est("a", {0: 1000}, {0: 500})
+        b = self._est("b", {0: 1000, 1: 500}, {0: 500, 1: 200})
+        rows = {
+            r["gpu"]: r for r in ks.coexistence([a, b], {0: 20000, 1: 20000})["per_gpu"]
+        }
+        self.assertEqual(rows[0]["lanes"], 2)
+        self.assertEqual(rows[1]["lanes"], 1)
+
+
+@unittest.skipUnless(_have(_FP8), f"needs the 27B-FP8 checkpoint at {_FP8}")
+class TestCoresidentCapacity(_Bf16StateEnv):
+    """The defect the FP8 tp2-in-tp3 evaluation found, and its fix.
+
+    ``estimate_instance`` sizes a lane against the budget it was given, i.e.
+    as if that lane owned its cards. Summing two such figures for lanes that
+    SHARE a card counts the same free bytes twice. The two candidates of the
+    evaluation are the regression: their corrected joint capacities are 240k
+    and 343k tokens, where the old code reported 1.14M for both.
+    """
+
+    #: The evaluation's rig, in the resolved device order (the x8-attached
+    #: 3080 is cuda_index 2, not 1 -- both profile signals agree by ~2x).
+    PD_G, MAIN_G = [0, 2], [0, 2, 1]
+    PD_B, MAIN_B = [29607, 17780], [29607, 17780, 17780]
+    TOTAL = {0: 32607, 1: 20480, 2: 20480}
+    RESERVE = {0: 3000, 1: 2700, 2: 2700}
+    #: What the broken sum produced for BOTH candidates.
+    OLD_WRONG_SUM = 1143619.0
+
+    def _spec(self, key, tp, gpus, budgets, vec, mrr, kind="serving"):
+        return ks.InstanceSpec(
+            key=key,
+            model_path=_FP8,
+            tp_size=tp,
+            rank_gpu_id=list(gpus),
+            budgets_mib=list(budgets),
+            base_plan=list(budgets),
+            mlp_vector=list(vec),
+            kv_cache_dtype="fp8_e4m3",
+            speculative_algorithm="NEXTN",
+            speculative_num_draft_tokens=4,
+            max_running_requests=mrr,
+            kind=kind,
+            share_group="dual",
+        )
+
+    def _pair(self, main_vec):
+        return [
+            self._spec("main", 3, self.MAIN_G, self.MAIN_B, main_vec, 4),
+            self._spec("pd", 2, self.PD_G, self.PD_B, [59, 9], 1, "prefill_lane"),
+        ]
+
+    def _agg(self, main_vec, **kw):
+        return ks.aggregate(
+            self._pair(main_vec),
+            _PROBE,
+            self.TOTAL,
+            reserve_mib=self.RESERVE,
+            prefill_tokens=20000,
+            **kw,
+        )
+
+    def test_candidate_a_joint_capacity(self):
+        # Candidate A of the evaluation: PD 59,9 @mrr 1 + main 69,18,49 @mrr 4.
+        out = self._agg([69, 18, 49])
+        self.assertTrue(out["fits"])
+        self.assertTrue(out["shares_a_card"])
+        kv = out["aggregate"]["max_kv_tokens"]
+        self.assertEqual(kv["provenance"], "estimate")
+        self.assertAlmostEqual(kv["value"], 240361.0, delta=2000.0)
+        rows = {i["key"]: i for i in out["instances"]}
+        self.assertAlmostEqual(
+            rows["main"]["coresident_kv_tokens"], 203646.0, delta=2000.0
+        )
+        self.assertAlmostEqual(
+            rows["pd"]["coresident_kv_tokens"], 36715.0, delta=1000.0
+        )
+
+    def test_candidate_c_joint_capacity(self):
+        out = self._agg([59, 4, 5])
+        kv = out["aggregate"]["max_kv_tokens"]
+        self.assertAlmostEqual(kv["value"], 342942.0, delta=3000.0)
+
+    def test_the_old_sum_is_not_reproduced(self):
+        # The non-regression, stated as such: whatever the model says, it must
+        # not be the number that assumed each lane owned the whole card.
+        for vec in ([69, 18, 49], [59, 4, 5]):
+            out = self._agg(vec)
+            kv = out["aggregate"]["max_kv_tokens"]["value"]
+            self.assertLess(kv, self.OLD_WRONG_SUM * 0.5, vec)
+            solo = sum(i["max_kv_tokens"] for i in out["instances"])
+            self.assertAlmostEqual(solo, self.OLD_WRONG_SUM, delta=5000.0)
+            self.assertGreater(solo / kv, 3.0)
+
+    def test_the_basis_names_the_over_count_it_removed(self):
+        out = self._agg([69, 18, 49])
+        basis = out["aggregate"]["max_kv_tokens"]["basis"]
+        self.assertIn("co-resident capacity", basis)
+        self.assertIn("over-count", basis)
+        self.assertIn("#260", basis)
+
+    def test_solo_capacities_are_still_reported_per_lane(self):
+        # The re-sizing must not destroy the standalone figure; a caller
+        # comparing "this lane alone" against "this lane beside the other"
+        # needs both, and that comparison IS the cost of co-residence.
+        out = self._agg([69, 18, 49])
+        for row in out["instances"]:
+            self.assertIsNotNone(row["max_kv_tokens"])
+            self.assertLess(row["coresident_kv_tokens"], row["max_kv_tokens"])
+
+    def test_shared_process_raises_capacity_by_the_freed_posts(self):
+        two = self._agg([69, 18, 49])
+        one = self._agg([69, 18, 49], shared_process=True)
+        self.assertGreater(
+            one["aggregate"]["max_kv_tokens"]["value"],
+            two["aggregate"]["max_kv_tokens"]["value"],
+        )
+        h2 = {r["gpu"]: r["headroom_mib"] for r in two["coexistence"]["per_gpu"]}
+        h1 = {r["gpu"]: r["headroom_mib"] for r in one["coexistence"]["per_gpu"]}
+        # The two shared cards each give back exactly one post; the third,
+        # which carries only the main lane, is untouched.
+        for g in (0, 2):
+            self.assertAlmostEqual(h1[g] - h2[g], ks.FIXED_PROCESS_POST_MIB, places=4)
+        self.assertAlmostEqual(h1[1], h2[1], places=4)
+
+    def test_disjoint_lanes_are_not_resized(self):
+        # No shared card -> nothing to divide, and the plain sum is correct.
+        # Re-sizing here would be as wrong as summing was in the shared case.
+        specs = [
+            self._spec("a", 2, [0, 2], self.PD_B, [59, 9], 2),
+            ks.InstanceSpec(
+                key="remote",
+                model_path=_FP8,
+                tp_size=2,
+                rank_gpu_id=[0, 2],
+                budgets_mib=self.PD_B,
+                base_plan=self.PD_B,
+                mlp_vector=[59, 9],
+                kv_cache_dtype="fp8_e4m3",
+                max_running_requests=2,
+                local=False,
+            ),
+        ]
+        out = ks.aggregate(specs, _PROBE, self.TOTAL, reserve_mib=self.RESERVE)
+        self.assertFalse(out["shares_a_card"])
+        rows = {i["key"]: i for i in out["instances"]}
+        self.assertIsNone(rows["a"]["coresident_budget_mib"])
+        self.assertEqual(rows["a"]["coresident_kv_tokens"], rows["a"]["max_kv_tokens"])
+
+    def test_budget_mapping_refuses_an_overflowing_card(self):
+        # A negative leftover has no honest division, so the mapping returns
+        # None and the caller reports absent instead of inventing a split.
+        specs = self._pair([69, 18, 49])
+        estimates = [
+            ks.estimate_instance(s, _PROBE, prefill_tokens=20000) for s in specs
+        ]
+        self.assertIsNone(
+            ks.coresident_budgets(
+                specs,
+                estimates,
+                {0: 8000, 1: 8000, 2: 8000},
+                reserve_mib=self.RESERVE,
+            )
+        )
+
+    def test_budget_mapping_conserves_the_cards(self):
+        # Conservation, with the sign the mapping really has:
+        #
+        #   sum_i budget_i(g) = available(g) - posts + shared_weight_saving
+        #
+        # The shared weight bytes are handed to BOTH lanes on purpose --
+        # each lane's capacity model subtracts its own weight view, so each
+        # has to be given it. The physical accounting stays right because
+        # the leftover those budgets are built from charged the shared bytes
+        # only once. Reading this line as "available minus the saving" is the
+        # natural mistake, so it is pinned with the correct sign.
+        specs = self._pair([69, 18, 49])
+        estimates = [
+            ks.estimate_instance(s, _PROBE, prefill_tokens=20000) for s in specs
+        ]
+        budgets = ks.coresident_budgets(
+            specs, estimates, self.TOTAL, reserve_mib=self.RESERVE
+        )
+        self.assertIsNotNone(budgets)
+        by_key = {e.key: e for e in estimates}
+        for gpu in (0, 2):  # the shared cards
+            handed = 0.0
+            for spec in specs:
+                for r, g in enumerate(spec.rank_gpu_id):
+                    if int(g) == gpu:
+                        handed += budgets[spec.key][r]
+            avail = self.TOTAL[gpu] - self.RESERVE[gpu]
+            saved = sum(by_key[s.key].weights_mib.get(gpu, 0.0) for s in specs) - max(
+                by_key[s.key].weights_mib.get(gpu, 0.0) for s in specs
+            )
+            self.assertAlmostEqual(
+                handed, avail - ks.FIXED_PROCESS_POST_MIB + saved, delta=3.0
+            )
+            self.assertGreater(saved, 0.0)  # the cards really are shared
+
+
+# ---------------------------------------------------------------------------
 # 8. The JSON surface
 # ---------------------------------------------------------------------------
 
