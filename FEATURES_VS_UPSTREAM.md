@@ -5,6 +5,8 @@ carries beyond upstream SGLang, and whether an equivalent capability exists in u
 upstream vLLM, `llama.cpp` or `ik_llama.cpp`. All entries are work in progress; no entry implies
 external review or upstream-mergeable maturity.
 
+Entries are ordered by who needs them: Block 1 covers the mechanisms without which three genuinely different GPUs cannot be used together at all; Block 2 covers every other fork delta, ordered by how much a rig of identical GPUs (1/2/4/8 cards) gains from it. Row numbers are stable identifiers, referenced elsewhere in this file, and are not resequenced.
+
 ## Status legend
 
 | Tier | Meaning |
@@ -49,38 +51,51 @@ Verdict tokens only; each row links to its detail section, where `partial` alway
 mechanism difference. `unverified` — the check could not be completed. `n/a` — the row's
 comparison point does not apply to that engine.
 
+### Block 1 — heterogeneous-GPU enablers
+
+Without these, three genuinely different GPUs cannot be combined into one usable TP group at all, or cannot be combined *correctly*.
+
 | # | Feature | Fork | SGLang | vLLM | llama.cpp | ik_llama.cpp |
 |---|---|---|---|---|---|---|
+| [3](#f3) | Rank-to-GPU mapping and co-location | Boot-checked | no | no | no | no |
 | [1](#f1) | Asymmetric tensor parallelism | Boot-checked | no | no | partial | partial |
 | [2](#f2) | Asymmetric decode context parallelism | Cross-checked | partial | partial | no | no |
-| [3](#f3) | Rank-to-GPU mapping and co-location | Boot-checked | no | no | no | no |
-| [4](#f4) | Solo drafter placement | Built | no | yes | partial | partial |
-| [5](#f5) | Cross-algorithm drafter routing | WIP | no | no | no | no |
-| [6](#f6) | CUDA graph memory aliasing for spec branches | Boot-checked | partial | partial | no | no |
-| [7](#f7) | MoE expert offload + asymmetric TP/DCP | Boot-checked | partial | partial | partial | partial |
+| [10](#f10) | Measured VRAM budget | Boot-checked | partial | partial | partial | partial |
+| [21](#f21) | HTCCL cross-vendor collectives | Cross-checked | no | no | partial | partial |
+| [23](#f23) | Turing/gfx900 without sgl-kernel | Cross-checked | no | no | partial | partial |
+| [22](#f22) | fp8 dequant fallback (W8A16) | Cross-checked | no | no | partial | unverified |
+| [11](#f11) | Cross-architecture speculative determinism | Boot-checked | partial | partial | no | no |
+| [8e](#f8e) | Asymmetric-TP x GGUF correctness | Boot-checked | no | no | n/a | n/a |
+| [15](#f15) | Asymmetric-TP quantization correctness | Boot-checked | partial | partial | n/a | n/a |
+| [17](#f17) | HiCache under asymmetric-TP/DCP | Boot-checked | yes (base) | n/a | partial | partial |
+| [24](#f24) | SWA-DCP | Cross-checked | no | no | no | no |
+| [18](#f18) | TP greater than num_kv_heads | Boot-checked | partial | partial | partial | partial |
+| [19](#f19) | Broad model bring-up under asymmetric-TP | Boot-checked | n/a | n/a | n/a | n/a |
+| [14](#f14) | Single-node PD disaggregation | Boot-checked | yes (base) | yes (base) | no | no |
+| [12](#f12) | Weightless-KV lane | Cross-checked | no | no | no | no |
+| [27](#f27) | Cross-rig uneven pipeline parallelism | Boot-checked | partial | partial | partial | partial |
+
+### Block 2 — general fork deltas
+
+Everything else, ordered by how much a rig of identical GPUs (1/2/4/8 cards) gains from it.
+
+| # | Feature | Fork | SGLang | vLLM | llama.cpp | ik_llama.cpp |
+|---|---|---|---|---|---|---|
 | [8a](#f8a) | Bespoke GGUF adapter framework | Boot-checked | no | no | n/a | n/a |
 | [8b](#f8b) | Qwen3.5/3.6 GGUF | Boot-checked | no | no | yes | yes |
 | [8c](#f8c) | Gemma-4 GGUF | Boot-checked | no | no | yes | yes |
 | [8d](#f8d) | GGUF K-quant compute kernels | Boot-checked | partial | partial | yes | yes |
-| [8e](#f8e) | Asymmetric-TP x GGUF correctness | Boot-checked | no | no | n/a | n/a |
 | [8f](#f8f) | Multimodal and dynamic-quant GGUF | Boot-checked | partial | partial | yes | partial |
+| [4](#f4) | Solo drafter placement | Built | no | yes | partial | partial |
+| [5](#f5) | Cross-algorithm drafter routing | WIP | no | no | no | no |
+| [6](#f6) | CUDA graph memory aliasing for spec branches | Boot-checked | partial | partial | no | no |
+| [7](#f7) | MoE expert offload + asymmetric TP/DCP | Boot-checked | partial | partial | partial | partial |
 | [9](#f9) | Hibernate checkpoint/restore | Boot-checked | no | partial | partial | partial |
-| [10](#f10) | Measured VRAM budget | Boot-checked | partial | partial | partial | partial |
-| [11](#f11) | Cross-architecture speculative determinism | Boot-checked | partial | partial | no | no |
-| [12](#f12) | Weightless-KV lane | Cross-checked | no | no | no | no |
-| [13](#f13) | Rig dashboard / planner UI | Exp | n/a | n/a | n/a | n/a |
-| [14](#f14) | Single-node PD disaggregation | Boot-checked | yes (base) | yes (base) | no | no |
-| [15](#f15) | Asymmetric-TP quantization correctness | Boot-checked | partial | partial | n/a | n/a |
-| [16](#f16) | Fast-lane priority scheduling | Built | partial | partial | no | no |
-| [17](#f17) | HiCache under asymmetric-TP/DCP | Boot-checked | yes (base) | n/a | partial | partial |
-| [18](#f18) | TP greater than num_kv_heads | Boot-checked | partial | partial | partial | partial |
-| [19](#f19) | Broad model bring-up under asymmetric-TP | Boot-checked | n/a | n/a | n/a | n/a |
 | [20](#f20) | Session KV spill | Exp, Boot-checked | partial | partial | partial | partial |
-| [21](#f21) | HTCCL cross-vendor collectives | Cross-checked | no | no | partial | partial |
-| [22](#f22) | fp8 dequant fallback (W8A16) | Cross-checked* | no | no | partial | unverified |
-| [23](#f23) | Turing/gfx900 without sgl-kernel | Cross-checked | no | no | partial | partial |
-| [24](#f24) | SWA-DCP | Cross-checked | no | no | no | no |
+| [13](#f13) | Rig dashboard / planner UI | Exp | n/a | n/a | n/a | n/a |
+| [16](#f16) | Fast-lane priority scheduling | Built | partial | partial | no | no |
 | [25](#f25) | Per-message-class link selection | Cross-checked | no | no | no | no |
+| [26](#f26) | Prefill satellite (cross-host PD for hybrid GDN) | Boot-checked | yes (base) | yes (base) | no | no |
 
 ---
 
@@ -294,9 +309,28 @@ arm-against-arm statement is load-bearing; and the energy figures are single run
 board power alone. Transport-level and collective-level microbenchmarks, which involve no model,
 are in section 21.
 
+
 ---
 
 ## Detail sections
+
+### Block 1 — heterogeneous-GPU enablers
+
+Ordered from the basic rank/shard/memory mapping through cross-vendor and cross-architecture enablement to the correctness work that non-uniform sharding forces on other subsystems, then the higher-level capabilities built on top.
+
+<a id="f3"></a>
+### 3. Rank-to-GPU mapping and co-location
+
+`--rank-gpu-id`, `--rank-gpu-memory-mib` — assigns each rank to an NVML-resolved physical GPU;
+duplicates co-locate multiple ranks on one GPU. **Boot-checked.**
+
+| Item | Detail |
+|---|---|
+| Exercised | TP=4 co-located on 3 cards, Qwen3.6-27B `UD-Q6_K_XL`; also underpins row 18 |
+| Requirement | NCCL >= 2.30, shipped in the fork's container image |
+| Decoupling | `--rank-tp-ratio` / `--rank-kv-ratio` no longer require `--rank-gpu-id`: sharding-ratio validity and physical placement are independent concerns, and coupling them blocked the cross-vendor case, where NVML cannot name an AMD rank |
+
+**Upstream:** sglang places ranks via `CUDA_VISIBLE_DEVICES` only.
 
 <a id="f1"></a>
 ### 1. Asymmetric tensor parallelism
@@ -329,231 +363,6 @@ heads are not replicated across the DCP group; the fork's own uneven-DCP geometr
 
 **Upstream:** replaces sglang's DCP, which only splits KV evenly across ranks.
 
-<a id="f3"></a>
-### 3. Rank-to-GPU mapping and co-location
-
-`--rank-gpu-id`, `--rank-gpu-memory-mib` — assigns each rank to an NVML-resolved physical GPU;
-duplicates co-locate multiple ranks on one GPU. **Boot-checked.**
-
-| Item | Detail |
-|---|---|
-| Exercised | TP=4 co-located on 3 cards, Qwen3.6-27B `UD-Q6_K_XL`; also underpins row 18 |
-| Requirement | NCCL >= 2.30, shipped in the fork's container image |
-| Decoupling | `--rank-tp-ratio` / `--rank-kv-ratio` no longer require `--rank-gpu-id`: sharding-ratio validity and physical placement are independent concerns, and coupling them blocked the cross-vendor case, where NVML cannot name an AMD rank |
-
-**Upstream:** sglang places ranks via `CUDA_VISIBLE_DEVICES` only.
-
-<a id="f4"></a>
-### 4. Solo drafter placement
-
-`--speculative-draft-placement solo` — runs the draft model unsharded on one GPU, broadcasting its
-output instead of all-reducing. **Built** — registered unit tests for solo placement, weight/KV
-planning and vocab broadcast; no dedicated hardware boot. It runs inside the weightless-lane,
-cross-host TP=4 and TP=5 configurations.
-
-**Upstream:** no equivalent flag in sglang.
-
-<a id="f5"></a>
-### 5. Cross-algorithm drafter routing
-
-`--speculative-cross-algorithm*` — NEXTN/MTP and DFLASH resident simultaneously, switched per batch
-by a bandit controller on accept-tokens/round, rank-0 decision plus TP broadcast. **WIP.**
-
-| Item | Detail |
-|---|---|
-| Implemented | dual residence, per-batch switching, bandit controller with a registered test |
-| Missing | the context-length gate from the drafter training config |
-| Validated | lazy single-graph capture and DFLASH context retirement, green under CUDA graphs; 542.0 MiB released |
-| Measured | the bandit loses its regime cell against the static winner, 75.52 against 89.22 tok/s; per-switch cost ~2.5 ms |
-
-**Upstream:** no equivalent in sglang, which adapts or selects a single drafter's parameters.
-
-<a id="f6"></a>
-### 6. CUDA graph memory aliasing for spec branches
-
-Inactive speculative-depth CUDA-graph branches hold no physical VRAM, via cuMem tag aliasing
-(`kv_vmm_backing` / adaptive runtime state). **Boot-checked** — the recorded GPU figure is
-542.0 MiB released under CUDA graphs on the lazy-capture arm.
-
-**Upstream:** sglang has related VMM/cuMem machinery, not applied to speculative CUDA-graph
-branches.
-
-<a id="f7"></a>
-### 7. MoE expert offload + asymmetric TP/DCP
-
-MoE expert offloading to host RAM combined with asymmetric TP and DCP (GPTQ/AWQ/FP8).
-**Boot-checked** on a 122B-A10B across three mismatched GPUs; **Cross-checked** on 35B-A3B AWQ, at
-32/32 tokens identical to a TP=1 run. Offloaded output is self-deterministic but not bit-identical
-to the no-offload case, since Marlin-Int4 tiling reduces in a different order. Numbers above.
-
-**Load-time presplit (#123 for GPTQ/AWQ, #256 for fp8).** The offload only helps if the expert
-stack never has to be whole on the card, so the split is done at load: `create_weights` allocates
-the expert tensors on the host, the loader's `device_loading_context` brings one layer at a time to
-the GPU, and `process_weights_after_loading` ends in
-`presplit_expert_offload_after_repack` — `[R+C]` slots stay resident, `[E-R]` go straight into the
-pinned spill pool, and the registered parameter becomes a 0-row placeholder. The fp8 method lacked
-both halves until #256, which is why a 31 GiB fp8 checkpoint OOM'd a 32 GiB card before the offload
-could act. AWQ lacked the allocation half for the same reason until #123-AWQ: only GPTQ had the
-host `create_weights`, so an AWQ MoE checkpoint still committed its whole `[E]` stack on the card
-at load and OOM'd before the presplit ran. Expert-major scales (`w13/w2_weight_scale[_inv]`) and
-expert biases are staged with their weights, so a spill expert's weight and its scale land on the
-same pool row and are fetched by the same plan. AWQ additionally stages the zero-points: it is an
-asymmetric format, so `w13/w2_qzeros` carry real per-expert checkpoint data that the repack
-consumes and the Marlin apply reads, and they are allocated on the host with the weights — where
-GPTQ leaves its (symmetric, empty) zero-points on the default device. **Boot-checked** on
-`Qwen3.6-35B-A3B-AWQ-4bit` (23.25 GiB of weights, 40 layers x 256 experts) at fraction 0.25 on a
-single RTX 3080 — a 20 GiB card carrying a checkpoint larger than itself: 11.92 GiB of weight VRAM
-released, 13.01 GiB in the host pool, card settling at 14.20 GiB. **Boot-checked** on `Qwen3.6-35B-A3B-FP8` (31 GiB, 40 layers x 256 experts),
-TP=1 on one RTX 5090 at fraction 0.25: 20.63 GiB of weight VRAM released, 22.51 GiB in the host
-pool.
-
-**Prefill wave order (#254).** A prefill chunk that routes to more experts than the scratch region
-holds is split into waves. `SGLANG_MOE_OFFLOAD_WAVE_ORDER` selects the axis:
-
-- `token` (default, unchanged) — waves are disjoint token subsets. Every wave re-fetches the spill
-  experts its tokens need, so a spill expert crosses PCIe once per wave. With `C` scratch slots and
-  `top_k` routed experts a wave holds roughly `C / top_k` tokens, so the wave count — and with it
-  the H2D volume — grows linearly with the chunk. At the default `C = max(8, R/4)` and `top_k = 8`
-  a wave is one or two tokens.
-- `expert` — waves are disjoint groups of at most `C` spill experts, so each spill expert is
-  streamed exactly once per chunk regardless of chunk size. It also removes the token-major failure
-  mode where a single token's spilled top-k does not fit the scratch.
-
-Byte-identical to the token order, and to the no-offload path on formats whose kernel config does
-not depend on the per-apply token count (blockwise fp8 pins `BLOCK_SIZE_K` to the quantization
-block; the unquantized path's `M <= E` heuristic flips it, which already affects the token order).
-The identity comes from taking the top-k reduction out of the wave: each routed (token, k-slot)
-pair is submitted as its own pseudo-token with `top_k == 1`, so the fused kernel writes the
-weighted contribution straight out, and it is stored at its own k-slot in a `[T, top_k, H]` buffer.
-The k-slot is fixed by the routing, so the buffer holds the same values in the same places for any
-split; the reduction runs once at the end over the full buffer, in k order. Cost: one transient
-`[T, top_k, H]` buffer per layer. Decode (single wave) is untouched.
-
-Measured on Qwen3.6-35B-A3B-AWQ, TP=1 on an RTX 5090, resident fraction 0.25 (32 resident + 8
-scratch of 128 experts per layer), eager, 2048-token chunks:
-
-| prompt tokens | token order | expert order | H2D per layer per chunk (token -> expert) |
-| --- | --- | --- | --- |
-| 331 | 9.37 s | 1.27 s | 3.09 GiB -> 0.19 GiB |
-| 771 | 21.65 s | 1.35 s | 3.09 GiB -> 0.19 GiB |
-| 1541 | — | 1.63 s | 7.20 GiB -> 0.15 GiB |
-| 3081 | — | 1.82 s | 7.20 GiB -> 0.12 GiB |
-| 6601 | aborted after 55 min | 3.38 s | 7.20 GiB -> 0.12 GiB |
-
-Generated text is identical between the two orders at every size that completed on both. The
-per-chunk H2D volume is logged (`MoE offload layer N: <order>-major prefill, W waves, X GiB H2D`).
-
-The AWQ table above was the format the card could hold; the fp8 arm of #254 stayed a synthetic
-kernel gate until #256 made a 31 GiB fp8 checkpoint bootable on one card. Rerun on the real fp8
-path — `Qwen3.6-35B-A3B-FP8`, TP=1 on an RTX 5090, fraction 0.25 (64 resident + 16 scratch of 256
-experts), eager, greedy, 72 prompt tokens and 96 generated — the two orders produce byte-identical
-output, at 27-31 waves / 1.11-1.21 GiB H2D per layer per chunk for token-major against 9 waves /
-0.34 GiB for expert-major.
-
-**KV-pool reclaim.** The weight VRAM the offload frees is claimed by the KV pool. No second
-sizing path exists and none is needed: the KV budget is profiled from a live free-memory reading
-taken after the weights are resident, so the reclaim lands in it by construction — provided the
-release has happened, on every rank, before anyone measures. #123's eager install (right after
-`load_model`, ahead of pool sizing) supplies the first half; #119 adds the parts that make it hold:
-
-- an **ordering invariant** — a FusedMoE layer still waiting to install when the pool is sized is a
-  hard error, not a silent fallback to the pre-#123 behaviour where the pool was sized against the
-  pre-offload footprint (the #77 "known limitation");
-- a **group-ordered release** — `gc.collect() -> empty_cache() -> barrier` before any rank reads
-  `mem_get_info()`. That reading is driver-level and therefore sees co-located siblings, while the
-  caching allocator only returns freed blocks at `empty_cache()`; unsynchronized, a rank that reads
-  early counts a sibling's already-released expert weights as still occupied. Below the offload the
-  skew was small — at f=0.25 on the 122B run it is the whole reclaim (~18 GiB on the shared card);
-- a **rank-uniform verdict** — "the reclaim is present" is a MIN over the TP group, so a rank that
-  released nothing (MoE-free shard, failed install) makes the whole group take the plain path
-  rather than half the ranks synchronizing while the other half measures unsynchronized;
-- **accounting** — released device/host bytes are tallied per rank and logged next to the resulting
-  KV budget (`[offload-kv-regain]`), so the win is readable from a boot log.
-
-No new budget term is introduced, so the #68 graph-capture reserve is untouched: the reclaim
-arrives as free bytes and is spent net of the same reserves as any other free byte. Switch:
-`SGLANG_MOE_OFFLOAD_KV_REGAIN` (default on, additionally gated on
-`SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0`, so the no-offload path is byte-identical).
-
-**Upstream:** SGLang/vLLM offload weights layer-granularly (`--cpu-offload-gb`), not
-expert-granularly, and not combined with asymmetric TP/DCP (partial). llama.cpp/ik_llama.cpp have
-the same expert-granular idea (`-ot`/`-ncmoe`/`--n-cpu-moe`; ik_llama.cpp also runs its own
-`iqk_mul_mat` kernel lineage, see row 8d) but nothing to combine it with, since neither
-asymmetric-TP nor DCP exists there (partial).
-
-<a id="f8a"></a>
-### 8a. Bespoke GGUF adapter framework
-
-`gguf_registry` + `GGUFAdapterBase` — per-model-family GGUF loaders (name maps and inverse weight
-transforms) on top of the generic GGUF path, plus sibling-file config/tokenizer loading for
-architectures the generic metadata reader cannot parse. **Boot-checked** — registry with two
-families, unit tests for header and sizing; boot evidence comes from rows 8b-8f, which load
-through it.
-
-**Upstream:** sglang's generic GGUF path cannot load these architectures.
-
-<a id="f8b"></a>
-### 8b. Qwen3.5/3.6 GGUF
-
-GGUF arch `qwen35` / `qwen35moe` — GDN/RMSNorm/`out_proj` inverse transforms, plus NEXTN/MTP draft
-including MoE draft, loaded from the same file. **Boot-checked** — dense, MoE and NEXTN/MTP;
-K-quants `Q4_K_M`…`Q8_0` coherent and greedy-deterministic; `Q6_K` validated at asymmetric TP=3.
-
-**Upstream:** unsupported in sglang.
-
-<a id="f8c"></a>
-### 8c. Gemma-4 GGUF
-
-GGUF arch `gemma4`, dense — inverse transforms distinct from Qwen: dequantized `token_embd`,
-identity norm handling, tied `lm_head`, `k==v` shard duplication. **Boot-checked** — Gemma-4-31B-it
-`Q4_K_M`, TP=1 on the 5090 at ~61 tok/s, coherent and self-deterministic; asymmetric TP=3 green.
-MoE, MTP and vision fail fast; only `Q4_K_M` is verified.
-
-**Upstream:** unsupported in sglang.
-
-<a id="f8d"></a>
-### 8d. GGUF K-quant compute kernels
-
-`sgl-kernel` MMQ/MMVQ — per-device MMVQ↔MMQ crossover, prefill-oriented MMQ cap, batched MMVQ,
-quantized vocab/embedding, I-Matrix quant. **Boot-checked** — merged with kernel tests. The
-crossover is opt-in via `--gguf-mmq-decode-threshold`, default off; it is not byte-identical when
-on, since MMQ and MMVQ reduce in a different order, and the flag off reproduces the prior dispatch
-exactly. Numbers above.
-
-**Upstream:** sglang has the base MMQ/MMVQ kernels; the crossover, cap and quantized-vocab tuning
-are fork-only.
-
-<a id="f8e"></a>
-### 8e. Asymmetric-TP x GGUF correctness
-
-Composes GGUF with row 1 — K-quant superblock alignment, GDN/MoE per-rank block coarsening,
-GGUF-MoE out-of-bounds expert-id fixes, per-rank local-expert-count guard, and the same alignment
-applied to compressed-tensors AWQ/GPTQ INT4. **Boot-checked** — merged bugfixes with registered
-tests. The out-of-bounds-expert-id and superblock-alignment class was found through real GPU
-crashes and reads; each guard test corresponds to a reproduced hardware fault (red-then-green).
-
-**Upstream:** n/a — asymmetric TP is absent from sglang, so this bugfix class does not apply there.
-
-<a id="f8f"></a>
-### 8f. Multimodal and dynamic-quant GGUF
-
-Loads a vision tower from a companion `mmproj` GGUF, and unsloth "UD" dynamic-quant GGUFs of mixed
-precision. **Boot-checked** — `UD-Q6_K_XL` with `mmproj` validated in the benchmark matrix.
-`UD-Q8_K_XL` requires mixed-dtype handling for the fused GDN `in_proj_qkvz`; without it the loader
-rejects the file.
-
-**Upstream:** sglang's generic path does not load these variants for the affected architectures.
-
-<a id="f9"></a>
-### 9. Hibernate checkpoint/restore
-
-Persists warm server state to disk so it survives process exit and reloads without full
-re-initialization. **Boot-checked** for dense GGUF under asymmetric TP=3; numbers above, as a
-documented range rather than a single raw A/B run. The FP8 path is functional but has no expensive
-transform to skip; MoE-model hibernation is deferred.
-
-**Upstream:** sglang has diffusion-server offload/wake-up only, no full LLM-server snapshot.
-
 <a id="f10"></a>
 ### 10. Measured VRAM budget
 
@@ -563,149 +372,6 @@ log emits a vector hint fed back on restart. **Boot-checked.**
 
 **Upstream:** sglang uses a fraction-based global setting (`mem-fraction-static`), with no per-rank
 absolute budget.
-
-<a id="f11"></a>
-### 11. Cross-architecture speculative determinism
-
-Verify-sync and CUDA-graph padding across sm86 + sm120, with sampling broadcast from rank 0.
-**Boot-checked** — three divergence root causes resolved; the emitted greedy token sequence is
-reproducible across the mixed-architecture TP group. Activations are not bit-identical, since sm86
-and sm120 reduce in a different order; agreement is enforced by the rank-0 sampling broadcast, not
-by an independent per-architecture comparison.
-
-**Upstream:** sglang has single-architecture determinism modes; mixed-GPU-architecture TP groups are
-not addressed.
-
-<a id="f12"></a>
-### 12. Weightless-KV lane
-
-`--weightless-kv-fastlane` — a meta-device worker holds only KV cache and attention while a separate
-head holds the weights. Unrelated to row 16's fast lane despite the shared name. **Cross-checked** —
-the determinism harness checks output against a TP=1 solo run as oracle.
-
-| Item | Detail |
-|---|---|
-| In place | chunked prefill and graph-decode paths |
-| Per-role KV precision | `--weightless-kv-worker-cache-dtype`, opt-in, default off: workers may hold their KV token-shard in fp8 while the head keeps its own format, since KV bytes cross the role boundary only in the model compute dtype. Whether this buys capacity depends on which rank binds the min-reduced token budget; the boot log names it |
-| Chain speculation | EAGLE/EAGLE3/NEXTN at `--speculative-eagle-topk 1` composes with the lane via `--speculative-draft-placement solo` hosted on the lane's head rank |
-| Refused alongside | tree verify, adaptive draft length, the block-decode/host-spill tier |
-| Open | no correctness oracle for lane plus speculation; token identity against a non-speculative run is not a valid gate, see legend |
-
-Design notes: `docs_new/weightless_kv_role_precision.md`, `docs_new/weightless_chain_spec.md`.
-
-**Upstream:** no equivalent in sglang.
-
-<a id="f13"></a>
-### 13. Rig dashboard / planner UI
-
-Capacity-planning tool reporting work-normalized J/token under asymmetric DCP
-(`tools/rig_dashboard`). **Exp** — functional but under active development, not production-ready.
-
-**Upstream:** n/a — external tooling.
-
-<a id="f14"></a>
-### 14. Single-node PD disaggregation
-
-Single-node heterogeneous prefill/decode split: prefill solo on the fastest card at TP=1, decode
-distributed under asymmetric TP/DCP, with GDN/Mamba state handoff. **Boot-checked** — pair green,
-token-vector KV re-scatter, crash-robust, byte-identical to the same build with disaggregation off.
-Numbers above.
-
-**Upstream:** sglang provides base PD-disaggregation; the single-node solo-prefill plus
-asymmetric-TP/DCP decode plus GDN handoff is the fork's delta on top of it.
-
-<a id="f15"></a>
-### 15. Asymmetric-TP quantization correctness
-
-Asymmetric-TP quant correctness plus upstream quant bugfixes — GPTQ-MoE `w2_scales` at TP>1, AWQ
-marlin zero-point staging, `moe_wna16` K-mask, compressed-tensors/AutoRound-int4 group alignment,
-and a mixed-architecture fp8 MoE path with a Marlin W8A16 fallback on sm86 ranks at kernel-level
-cosine >= 0.99998. **Boot-checked.** The GPTQ `w2_scales` defect, symmetric and asymmetric, was
-found during the 122B MoE boot campaign and reproduced on hardware before the fix (red-then-green).
-
-**Upstream:** sglang has the underlying quant methods but a genuine stock GPTQ-MoE TP>1 load defect,
-fixed here, and no asymmetric-TP alignment.
-
-<a id="f16"></a>
-### 16. Fast-lane priority scheduling
-
-`--enable-fast-lane` — opt-in latency-priority class that preempts a tagged request into the running
-batch, with a reserved-heavy-slots floor and heavy-aging; default off. Flags:
-`--fast-lane-priority`, `--fast-lane-reserved-heavy-slots`, `--fast-lane-heavy-aging-ms`.
-**Built** — no hardware boot.
-
-**Upstream:** sglang already has priority scheduling and preemption; the reserved-floor fast-lane
-class is the addition.
-
-<a id="f17"></a>
-### 17. HiCache under asymmetric-TP/DCP
-
-Makes sglang's tiered KV cache (host-RAM L2, file L3) correct under non-uniform per-rank layouts —
-global-to-owned-compact index translation, an NCCL-deadlock fix, a hybrid-SWA host-pool fix.
-**Boot-checked** — 8/8 concurrent requests hit, restore deterministic. The prefetch deadlock was
-reproduced live before the fix (red-then-green).
-
-**Upstream:** HiCache itself is upstream sglang; correctness under non-uniform layouts is the delta.
-
-<a id="f18"></a>
-### 18. TP greater than num_kv_heads
-
-Replicated KV plus token sharding, letting the TP degree exceed the model's KV-head count and, via
-co-location, the physical GPU count, including GQA re-grouping to single-head geometries.
-**Boot-checked** — Qwen3.6-35B-A3B FP8 at TP=3 with 2 kv-heads (replicated KV on all 10 global
-layers, MTP, CUDA graphs), and TP=4 co-located on 3 cards.
-
-**Upstream:** sglang already replicates KV under GQA when `tp > kv_heads`, but not combined with
-asymmetric-TP/token-sharded DCP.
-
-<a id="f19"></a>
-### 19. Broad model bring-up under asymmetric-TP
-
-**Boot-checked**, per model.
-
-| Model | Bring-up work |
-|---|---|
-| Qwen3.6-27B (GDN), Qwen3.6-35B-A3B (MoE) | asymmetric TP=3 |
-| Gemma-4-31B dense | EAGLE3 head fix; `--swa-pool-sizing` |
-| Gemma-4-26B-A4B MoE SWA-hybrid | boot fix — vision-ignore, gated-GeLU Marlin |
-| small / replicated-KV models | oracle and falsifier vehicles |
-
-**Upstream:** n/a — model-support work specific to the fork's own asymmetric-TP and speculative
-code.
-
-<a id="f20"></a>
-### 20. Session KV spill
-
-`--enable-kv-session-offload` plus tick/margin/hysteresis/pool flags — on VRAM overflow, the newest
-in-flight session's KV shard moves to a pinned host pool while the session keeps decoding through a
-bs=1 host-streamed spill tick interleaved with the device batches; FCFS-by-arrival victim order,
-stock retraction as fallback. **Exp, Boot-checked** — decode-side spill, restore and prefill-side
-admission all run on hardware with speculation active; spill rows in the combinations table above,
-admission checks below.
-
-| Area | State |
-|---|---|
-| Spill | whole-session, or a partial tail segment with hybrid device+host attention across the boundary; multiple concurrent spilled sessions (per-session host regions, `--kv-session-offload-max-spills`); host pool sized from a node-wide RAM budget (`--kv-session-offload-host-ram-gib`) |
-| Decode while spilled | spill tick at a static interval or under a self-calibrating cadence with an anti-starvation floor; eager by default, a bucketed CUDA-graph tick behind `SGLANG_KVSO_SPILL_GRAPH=1` (per-rung graph==eager at machine zero) |
-| Restore | FIFO with margin and hysteresis; incremental wave-back behind a configurable free-token threshold; readiness counts radix-evictable tokens, not the free list alone — a finished neighbour session returns its KV as evictable, so a free-list-only gate deadlocks precisely when the most memory is available. The commit path stays authoritative and evicts before re-checking |
-| Speculation | a spilled session decodes under MTP/NEXTN: the draft-KV share spills and restores with the session, with on-device resume and draft backfill; the drafter can run inside the spill tick (`--kv-session-offload-spec-in-tick`); every spill+spec boot rides the `KVSO_ALLOW_SPEC=1` opt-in gate |
-| Prefill-side spill | `--kv-session-offload-prefill`: a prompt beyond the device budget is admitted born-spilled — no device KV slots allocated — and handed to the spill tick; runs under speculative decoding and under the overlap scheduler |
-| Victim order | FCFS by arrival, plus a per-session latency class the caller sets (`spill_class` on `/generate`, `extra_body` on the OpenAI endpoints; fleet default `--kv-session-offload-default-spill-class`): `never` is tabu as a victim, including under fast-lane pressure, `preferred` is offered ahead of FCFS, `normal` is the stock order. Purely a user regler — nothing infers a class from traffic, and with every session in `normal` the selection is byte-identical to the pre-class one |
-| Spill budget | per-session/phase/total token budgets, an episode window and a rate bucket; exhaustion DEMOTES the session rather than aborting it — liveness ends, work is kept: the host tail drains and the finish donates the prefix, so a continuation is a prefix hit. The hand-over is lossless under HiCache: the donating insert is exempt from the hit-count write-through heuristic, which would otherwise drop the leaves under the threshold (the tokens the session just produced) while the same finish frees their device slots |
-| Scheduler integration | overlap scheduler supported (the spec deferred-commit hazard takes a post-verify snapshot); DFLASH rungs stay out of the spill tick |
-| Bounds that hold | GDN/Mamba state stays device-resident — the KV shard and the draft share spill, the recurrent state does not; more than one simultaneously spilled session is unit-tested (victim ordering, fast-lane multi-eviction) but not yet shown on hardware — boots show one spilled session among up to three co-resident ones, and three co-resident sessions are already the ceiling of this scheduler's admission arithmetic (a flag-OFF control shows the identical ceiling); a spill landing in the same round as a drafter-in-tick step has not been observed in validation; the concurrent two-stream dispatch (`SGLANG_KVSO_DECOUPLE=1`: device batch and spill tick in the same iteration, own stream, flashinfer workspace and DCP communicator for the spill lane) runs stably but holds the serial rate — only the token-sharding collectives have their own communicator, and the two lanes serialize behind the shared tensor-parallel one, so the default tick stays time-multiplexed with the device batch |
-
-| Configuration | Metric | Value |
-|---|---|---|
-| Qwen3.6-27B-FP8, uneven TP=3/DCP=3, MTP; feature armed vs off | ms per verify round | 37.74 vs 37.92, inside the 0.09-0.85 % boot-to-boot band |
-| born-spilled deep prompt, 1829 tokens against a 1306-token device budget, MTP | admissions with no device KV allocation | 2 of 2, on all three ranks, handed over to the spill tick |
-| same, drafter-in-tick requested without its gate | declined admissions | declined on all three ranks, naming the condition; the request is still served through the ordinary path |
-| the spilled session's output | coherence | 200 tokens, valid, no repetition flags |
-| spill under NEXTN k=3, restore margin 1024, hysteresis 40 | restores | 3 of 3 boots (decode figures in the combinations table) |
-| host pool from the RAM budget | per-rank pool | 1.00 GB of a 24 GiB node budget |
-
-**Upstream:** sglang retracts — frees and re-prefills — on exhaustion, rather than keeping a spilled
-request decoding.
 
 <a id="f21"></a>
 ### 21. HTCCL cross-vendor collectives
@@ -731,8 +397,7 @@ host-staged semantics as `gloo` but RDMA instead of TCP. **Cross-checked**, merg
 | Version parity enforced, not hoped for | mixed UCX releases do not degrade; endpoint creation fails with `invalid bandwidth 0.00`. The rendezvous gathers each rank's version over the existing `gloo` `cpu_group` and refuses **before any endpoint exists**, naming every rank's version, library path and the `SGLANG_HTCCL_UCX_LIB` remedy |
 | Latency shaping | default is a single-step full exchange, one round trip at any world size; `all_reduce` switches to a ring above `SGLANG_HTCCL_UCX_RING_KIB` (24 KiB, measured -- see the world-4 table below) and `all_gather` above `SGLANG_HTCCL_UCX_AG_RING_KIB` (32 KiB, measured; that ring saves no bytes, it saves the single UCX worker from progressing 2(W-1) requests at once). Endpoints are persistent and wired at construction, so no decode step pays a handshake. `handles()` is size-independent, unlike `shm`'s slot ceiling, so two ranks can never disagree about whether a collective goes over UCX or `gloo` |
 
-**Status (`ucx`):** implemented and validated on real RDMA, CPU-only — not yet exercised with a GPU
-or a model.
+**Status (`ucx`):** implemented and validated on real RDMA, CPU-only, and since executed end-to-end with a GPU and a model on the cross-rig TP=4 boot below (tasks #198/#204/#244/#263; rig-runbook §4.3) — the "not yet exercised" wording below predates those tasks.
 
 | Scope | Result |
 |---|---|
@@ -993,7 +658,7 @@ sequences of ~0.2-2k tokens live context, where attention is a small compute sha
 than 4x as utilized as any other rank; it paces the lock-step group, and the main rig is 87% idle
 waiting in lock step.
 
-**Cross-rig GPU/model bring-up — not yet executed.**
+**Cross-rig GPU/model bring-up — executed** (tasks #198/#204/#244/#263; see the TP=4 rows in the Qwen3.6-27B FP8 combinations table above and rig-runbook §4.3). The preconditions below are what the boot needed, kept as a record rather than rewritten as a plan.
 
 | Step | Requirement |
 |---|---|
@@ -1039,23 +704,6 @@ confirmed, Vulkan/ROCm **unverified**) but is a backend-delegation/pipeline mode
 substituting for NCCL within one TP group, and is explicitly "proof-of-concept... fragile" per its
 own README (partial).
 
-<a id="f22"></a>
-### 22. fp8 dequant fallback (W8A16)
-
-Serves fp8 checkpoints on GPUs without a native fp8 GEMM via a dequant W8A16 path
-(`CompressedTensorsW8A16Fp8`), gated by a functional capability probe rather than a
-capability-number comparison, since `torch.cuda.get_device_capability()` reports `(9,0)` for both
-Hopper and gfx900. **Cross-checked, GPU-validated cross-vendor — not merged.** The CUDA path is
-unchanged by construction.
-
-| Check | Result |
-|---|---|
-| Qwen3.5-4B-FP8-dynamic: solo Vega 64, solo 2080 Ti, mixed TP=2 uneven 3,1, mixed TP=2 even 2/2 | all byte-identical, with the solo runs as oracle; neither card is in the sm80-88 range the fp8@3080 caveat covers |
-| A separate fused dequant-GEMV kernel for the same lane | decodes raw fp8-e4m3 bytes bit-exact against `torch.to(float32)`, max diff 0.0; mean relative error 0.0014 against 0.0133 for the materialize-then-`F.linear` path it would replace. Not merged, not wired into a model boot; only a pre-merge semantic desk-check exists |
-| Open | the non-compressed-tensors `fp8.py` `Fp8Config` family is not wired to the probe |
-
-**Upstream:** sglang requires a native GEMM or Marlin (sm80+); no dequant fallback.
-
 <a id="f23"></a>
 ### 23. Turing/gfx900 without sgl-kernel
 
@@ -1073,6 +721,70 @@ platform checks, with real fallbacks (`forward_native`, torch-native sampler bac
 | Scope | gfx900 Triton support depends on an external `triton-gcn5` fork, not on fork code |
 
 **Upstream:** no capability-fallback path in sglang for `sgl-kernel`-class dependencies.
+
+<a id="f22"></a>
+### 22. fp8 dequant fallback (W8A16)
+
+Serves fp8 checkpoints on GPUs without a native fp8 GEMM via a dequant W8A16 path
+(`CompressedTensorsW8A16Fp8`), gated by a functional capability probe rather than a
+capability-number comparison, since `torch.cuda.get_device_capability()` reports `(9,0)` for both
+Hopper and gfx900. **Cross-checked, GPU-validated cross-vendor. Merged.** The CUDA path is
+unchanged by construction.
+
+| Check | Result |
+|---|---|
+| Qwen3.5-4B-FP8-dynamic: solo Vega 64, solo 2080 Ti, mixed TP=2 uneven 3,1, mixed TP=2 even 2/2 | all byte-identical, with the solo runs as oracle; neither card is in the sm80-88 range the fp8@3080 caveat covers |
+| A separate fused dequant-GEMV kernel for the same lane | decodes raw fp8-e4m3 bytes bit-exact against `torch.to(float32)`, max diff 0.0; mean relative error 0.0014 against 0.0133 for the materialize-then-`F.linear` path it would replace. Merged (#189/#192) and wired via a shape-gated `N >= K` dispatch predicate; end to end on 27B FP8, TP=3, forced dequant: +35% decode (27.59 -> 37.26 tok/s)* |
+| Open | the non-compressed-tensors `fp8.py` `Fp8Config` family is not wired to the probe |
+
+*merged after this row was first written; see the integration validation record's Design B / "#189: per-channel fp8 fused GEMV" sections.
+
+**Upstream:** sglang requires a native GEMM or Marlin (sm80+); no dequant fallback.
+
+<a id="f11"></a>
+### 11. Cross-architecture speculative determinism
+
+Verify-sync and CUDA-graph padding across sm86 + sm120, with sampling broadcast from rank 0.
+**Boot-checked** — three divergence root causes resolved; the emitted greedy token sequence is
+reproducible across the mixed-architecture TP group. Activations are not bit-identical, since sm86
+and sm120 reduce in a different order; agreement is enforced by the rank-0 sampling broadcast, not
+by an independent per-architecture comparison.
+
+**Upstream:** sglang has single-architecture determinism modes; mixed-GPU-architecture TP groups are
+not addressed.
+
+<a id="f8e"></a>
+### 8e. Asymmetric-TP x GGUF correctness
+
+Composes GGUF with row 1 — K-quant superblock alignment, GDN/MoE per-rank block coarsening,
+GGUF-MoE out-of-bounds expert-id fixes, per-rank local-expert-count guard, and the same alignment
+applied to compressed-tensors AWQ/GPTQ INT4. **Boot-checked** — merged bugfixes with registered
+tests. The out-of-bounds-expert-id and superblock-alignment class was found through real GPU
+crashes and reads; each guard test corresponds to a reproduced hardware fault (red-then-green).
+
+**Upstream:** n/a — asymmetric TP is absent from sglang, so this bugfix class does not apply there.
+
+<a id="f15"></a>
+### 15. Asymmetric-TP quantization correctness
+
+Asymmetric-TP quant correctness plus upstream quant bugfixes — GPTQ-MoE `w2_scales` at TP>1, AWQ
+marlin zero-point staging, `moe_wna16` K-mask, compressed-tensors/AutoRound-int4 group alignment,
+and a mixed-architecture fp8 MoE path with a Marlin W8A16 fallback on sm86 ranks at kernel-level
+cosine >= 0.99998. **Boot-checked.** The GPTQ `w2_scales` defect, symmetric and asymmetric, was
+found during the 122B MoE boot campaign and reproduced on hardware before the fix (red-then-green).
+
+**Upstream:** sglang has the underlying quant methods but a genuine stock GPTQ-MoE TP>1 load defect,
+fixed here, and no asymmetric-TP alignment.
+
+<a id="f17"></a>
+### 17. HiCache under asymmetric-TP/DCP
+
+Makes sglang's tiered KV cache (host-RAM L2, file L3) correct under non-uniform per-rank layouts —
+global-to-owned-compact index translation, an NCCL-deadlock fix, a hybrid-SWA host-pool fix.
+**Boot-checked** — 8/8 concurrent requests hit, restore deterministic. The prefetch deadlock was
+reproduced live before the fix (red-then-green).
+
+**Upstream:** HiCache itself is upstream sglang; correctness under non-uniform layouts is the delta.
 
 <a id="f24"></a>
 ### 24. SWA-DCP
@@ -1097,28 +809,91 @@ Recipe: `docs_new/swa_dcp_stage_b_triton.md` §8.
 
 ---
 
-<a id="f25"></a>
-### 25. Per-message-class link selection
+<a id="f18"></a>
+### 18. TP greater than num_kv_heads
 
-`--collective-net-small` / `--collective-net-bulk` (env `SGLANG_COLLECTIVE_NET_SMALL` / `_BULK`) put
-the latency class and the bulk class on different network devices. On a host with two usable lines
-that buys small-message latency and bulk bandwidth at the same time instead of picking one; on a
-single-line host it only makes the existing choice explicit. **Cross-checked** against the real 40G
-RoCE link with a negative control.
+Replicated KV plus token sharding, letting the TP degree exceed the model's KV-head count and, via
+co-location, the physical GPU count, including GQA re-grouping to single-head geometries.
+**Boot-checked** — Qwen3.6-35B-A3B FP8 at TP=3 with 2 kv-heads (replicated KV on all 10 global
+layers, MTP, CUDA graphs), and TP=4 co-located on 3 cards.
+
+**Upstream:** sglang already replicates KV under GQA when `tp > kv_heads`, but not combined with
+asymmetric-TP/token-sharded DCP.
+
+<a id="f19"></a>
+### 19. Broad model bring-up under asymmetric-TP
+
+**Boot-checked**, per model.
+
+| Model | Bring-up work |
+|---|---|
+| Qwen3.6-27B (GDN), Qwen3.6-35B-A3B (MoE) | asymmetric TP=3 |
+| Gemma-4-31B dense | EAGLE3 head fix; `--swa-pool-sizing` |
+| Gemma-4-26B-A4B MoE SWA-hybrid | boot fix — vision-ignore, gated-GeLU Marlin |
+| small / replicated-KV models | oracle and falsifier vehicles |
+
+**Upstream:** n/a — model-support work specific to the fork's own asymmetric-TP and speculative
+code.
+
+<a id="f14"></a>
+### 14. Single-node PD disaggregation
+
+Single-node heterogeneous prefill/decode split: prefill solo on the fastest card at TP=1, decode
+distributed under asymmetric TP/DCP, with GDN/Mamba state handoff. **Boot-checked** — pair green,
+token-vector KV re-scatter, crash-robust, byte-identical to the same build with disaggregation off.
+Numbers above.
+
+**Upstream:** sglang provides base PD-disaggregation; the single-node solo-prefill plus
+asymmetric-TP/DCP decode plus GDN handoff is the fork's delta on top of it.
+
+<a id="f12"></a>
+### 12. Weightless-KV lane
+
+`--weightless-kv-fastlane` — a meta-device worker holds only KV cache and attention while a separate
+head holds the weights. Unrelated to row 16's fast lane despite the shared name. **Cross-checked** —
+the determinism harness checks output against a TP=1 solo run as oracle.
 
 | Item | Detail |
 |---|---|
-| Mechanism | the UCX context is pinned with `ucp_config_modify(NET_DEVICES)` per instance. `UCX_NET_DEVICES` is one process-wide value and cannot address two instances or two classes; a modified config can. Unset → the call is skipped and the config is exactly the one the environment produced |
-| Reaches | (a) small and (b) large TP collectives via `small` — they share **one** UCX context, so this pins the whole collective plane; (c) PD-KV / HiCache via `bulk`, which seeds `--disaggregation-ib-device` when unset. (d) rendezvous/control is left on `--dist-init-addr` / `GLOO_SOCKET_IFNAME` on purpose |
-| Not separable | (a) from (b). One `UcpWorker`, one endpoint per peer. A genuine split needs a second UCX context, a second address exchange at rendezvous and a rank-uniform size-keyed selector (a disagreement deadlocks rather than returning a wrong answer) — ~200 lines plus cross-rig validation, not built. Setting `small` ≠ `bulk` is legal and logs that (b) stays on `small` |
-| Not rank-uniform | unlike every `SGLANG_HTCCL*` knob. The value is a local device name and the two ends of one link are called different things (`rocep4s0f1` / `rocep1s0f1`); the wire has to match, not the string |
-| Why the flags reject unknown devices | UCX does **not** fail on one. It warns `network device '...' is not available` and builds a context with no network transport, so the run completes and reports loopback numbers. Both flags validate against `/sys/class/infiniband` and `/sys/class/net` during server-args resolution and name what the host does have |
-| Evidence | cross-rig world-2 `all_reduce` over the 40G RoCE link with `UCX_TLS=rc,self,sm` and `UCX_NET_DEVICES` **unset**, driven only by `SGLANG_COLLECTIVE_NET_SMALL`: completes at 29.69 us / 184.54 us for 8 / 256 KiB. Negative control: repinned to the unwired second port `rocep4s0f0:1`, `ucp_ep_create` fails with `Destination is unreachable` — the pin is load-bearing, not decorative |
-| Default unchanged | 12 new CPU tests plus the 39 pre-existing HTCCL/UCX tests green. A/B control on the legacy `UCX_NET_DEVICES` route: 26.33 / 24.14 / 38.39 us at 8 KiB and 187.50 / 182.97 / 181.18 us at 256 KiB — the new route lands inside the old route's own repeat spread, and at 8 KiB that spread is far too wide for a 50-iteration harness to resolve a difference at all |
-| Worth it here? | no. This rig measures 1.47 us (FEC-free 40G) vs 1.58 us (100G, slot-limited to 3.43 GB/s) for an 8 B message, so there is no split worth making. The feature targets hosts whose latency-optimal and bandwidth-optimal cards differ |
+| In place | chunked prefill and graph-decode paths |
+| Per-role KV precision | `--weightless-kv-worker-cache-dtype`, opt-in, default off: workers may hold their KV token-shard in fp8 while the head keeps its own format, since KV bytes cross the role boundary only in the model compute dtype. Whether this buys capacity depends on which rank binds the min-reduced token budget; the boot log names it |
+| Chain speculation | EAGLE/EAGLE3/NEXTN at `--speculative-eagle-topk 1` composes with the lane via `--speculative-draft-placement solo` hosted on the lane's head rank |
+| Refused alongside | tree verify, adaptive draft length, the block-decode/host-spill tier |
+| Open | no correctness oracle for lane plus speculation; token identity against a non-speculative run is not a valid gate, see legend |
 
-**Upstream:** sglang exposes `--disaggregation-ib-device` for the PD bulk side only; the collective
-plane's device is left to the process-wide `UCX_NET_DEVICES`.
+Design notes: `docs_new/weightless_kv_role_precision.md`, `docs_new/weightless_chain_spec.md`.
+
+**Upstream:** no equivalent in sglang.
+
+<a id="f27"></a>
+### 27. Cross-rig uneven pipeline parallelism
+
+`--pp-layer-ratio` extended across hosts (`scripts/pp/pp_crossrig_launch.sh`) — the two
+pipeline stages run on different machines over the 40G RoCE line, each stage sized by
+the ratio rather than an equal layer split, so a stage can go to whichever physical GPU
+a host actually has, fast or slow, without needing HTCCL: under PP each node holds
+`tp_size=1`, so no TP group ever spans the two hosts, and the transport is plain
+`torch.distributed.isend`/`irecv` (NCCL) plus gloo for the pickled shape metadata — CUDA
+graphs stay on on both stages, including the sm75 one. **Boot-checked** — merged
+`feat/uneven-pp-slice2` (13c55d7b86).
+
+| Item | Detail |
+|---|---|
+| Vehicle | Qwen3.5-4B fp16, `--pp-layer-ratio 20,12`, stage 0 on a rig-1 3080, stage 1 on rig 2's 2080 Ti, task #201 slice 2 |
+| Cost, honestly bounded | 55.1 tok/s / 18.16 ms per token against a 67.6 tok/s / 14.80 ms monolithic control on the same 3080 (8k-prompt TTFT 3.42 s against 1.35 s; A-vs-A noise floor 1.1-2.1%) — 18% of decode and 2.5x the prefill TTFT against the faster card alone. "PP does not beat a card the model already fits on — it buys the capacity to run one that does not" |
+| Where the cost lives | only ~0.4 ms of the 3.4 ms/token difference is the stage boundary itself (NCCL 1-way 142 us at bs=1, p90 173 us); the rest is the slower stage's own compute and the pipeline bubble, which `--disable-overlap-schedule` (forced under PP) cannot hide for a single request. At bs=1 the pickled shape metadata (`send_tensor_dict`) costs more than the payload — 249 us against 142 us, 64% of the crossing; caching it is queued, not built |
+| Why this needed no new collective code | `_calculate_rank_ranges` already placed `pp_rank` per node, and `check_server_args` already asserts `(tp_size * pp_size) % nnodes == 0`. A flat cross-rig TP=2 on the same two cards does not come up at all on plain NCCL (rank 0 dies silently in `init_distributed`, rank 1 hangs in `all_reduce` forever) — the no-number is itself part of the case for row 21's HTCCL/UCX on the TP axis, and for why PP sidesteps it entirely |
+| Hybrid-model correctness | a hybrid-GDN model splits its KV pool by full-attention layers, not by total layer count — a 14:10 layer split gave 3 full-attention layers per stage and an identical KV size on both; a split planner reading `num_hidden_layers` alone sizes every hybrid stage wrong |
+| Fabric finding | NCCL's ibverbs path is broken on this RoCE fabric (`IBV_WC_REM_INV_REQ_ERR` on the first proxy tensor); NCCL over sockets on the same HCA works and measures 2.07 GB/s, the 40G line rather than the 1 GbE fallback (0.105 GB/s) |
+| Open | `max_total_num_tokens` stays min-reduced across the world group, so the tighter stage still caps both, unchanged from the intra-rig slice; a genuinely cross-vendor pipeline (the Vega 64) is unexercised — slice 1 records it as needing HTCCL-p2p later, this slice only crossed two NVIDIA cards |
+
+Recipe: rig-runbook §4.9.
+
+**Upstream:** sglang/vLLM support pipeline parallelism with an even layer split;
+per-stage ratio control for mismatched cards or mismatched hosts does not exist.
+llama.cpp's `--tensor-split`/`--split-mode layer` already gives uneven per-device layer
+splits, single-process only, no multi-node; ik_llama.cpp inherits the same mechanism
+(partial for both).
 
 ---
 
@@ -1148,12 +923,323 @@ so no comparison column applies.
 | The JIT kernel cache does not self-heal | a build killed mid-flight leaves `build.ninja` + `cuda.cu` + `cuda_0.o.d` and no `.so`; every later process then dies with `Check failed: (lib_handle_ != nullptr)`. Four such directories accumulated on one host and had to be removed by hand — one interrupted boot turns into a permanent failure. `cache_health.py` classifies entries (complete means a `.so` exists, and is never touched) and discards poison, with a host+pid build marker so a co-located rank's in-flight directory is not mistaken for wreckage |
 | Validator hygiene | the campaign's output-corruption validator mis-scored a healthy, math-heavy sample as `CORRUPT`; the faulty letter-fraction rule was removed rather than tuned |
 
+---
+
+### Block 2 — general fork deltas
+
+Ordered by benefit to a rig of identical GPUs: broad format/model support first, then speculative-decoding and capacity mechanisms that pay off on any multi-GPU rig, then narrower operational tooling.
+
+<a id="f8a"></a>
+### 8a. Bespoke GGUF adapter framework
+
+`gguf_registry` + `GGUFAdapterBase` — per-model-family GGUF loaders (name maps and inverse weight
+transforms) on top of the generic GGUF path, plus sibling-file config/tokenizer loading for
+architectures the generic metadata reader cannot parse. **Boot-checked** — registry with two
+families, unit tests for header and sizing; boot evidence comes from rows 8b-8f, which load
+through it.
+
+**Upstream:** sglang's generic GGUF path cannot load these architectures.
+
+<a id="f8b"></a>
+### 8b. Qwen3.5/3.6 GGUF
+
+GGUF arch `qwen35` / `qwen35moe` — GDN/RMSNorm/`out_proj` inverse transforms, plus NEXTN/MTP draft
+including MoE draft, loaded from the same file. **Boot-checked** — dense, MoE and NEXTN/MTP;
+K-quants `Q4_K_M`…`Q8_0` coherent and greedy-deterministic; `Q6_K` validated at asymmetric TP=3.
+
+**Upstream:** unsupported in sglang.
+
+<a id="f8c"></a>
+### 8c. Gemma-4 GGUF
+
+GGUF arch `gemma4`, dense — inverse transforms distinct from Qwen: dequantized `token_embd`,
+identity norm handling, tied `lm_head`, `k==v` shard duplication. **Boot-checked** — Gemma-4-31B-it
+`Q4_K_M`, TP=1 on the 5090 at ~61 tok/s, coherent and self-deterministic; asymmetric TP=3 green.
+MoE, MTP and vision fail fast; only `Q4_K_M` is verified.
+
+**Upstream:** unsupported in sglang.
+
+<a id="f8d"></a>
+### 8d. GGUF K-quant compute kernels
+
+`sgl-kernel` MMQ/MMVQ — per-device MMVQ↔MMQ crossover, prefill-oriented MMQ cap, batched MMVQ,
+quantized vocab/embedding, I-Matrix quant. **Boot-checked** — merged with kernel tests. The
+crossover is opt-in via `--gguf-mmq-decode-threshold`, default off; it is not byte-identical when
+on, since MMQ and MMVQ reduce in a different order, and the flag off reproduces the prior dispatch
+exactly. Numbers above.
+
+**Upstream:** sglang has the base MMQ/MMVQ kernels; the crossover, cap and quantized-vocab tuning
+are fork-only.
+
+<a id="f8f"></a>
+### 8f. Multimodal and dynamic-quant GGUF
+
+Loads a vision tower from a companion `mmproj` GGUF, and unsloth "UD" dynamic-quant GGUFs of mixed
+precision. **Boot-checked** — `UD-Q6_K_XL` with `mmproj` validated in the benchmark matrix.
+`UD-Q8_K_XL` requires mixed-dtype handling for the fused GDN `in_proj_qkvz`; without it the loader
+rejects the file.
+
+**Upstream:** sglang's generic path does not load these variants for the affected architectures.
+
+<a id="f4"></a>
+### 4. Solo drafter placement
+
+`--speculative-draft-placement solo` — runs the draft model unsharded on one GPU, broadcasting its
+output instead of all-reducing. **Built** — registered unit tests for solo placement, weight/KV
+planning and vocab broadcast; no dedicated hardware boot. It runs inside the weightless-lane,
+cross-host TP=4 and TP=5 configurations.
+
+**Upstream:** no equivalent flag in sglang.
+
+<a id="f5"></a>
+### 5. Cross-algorithm drafter routing
+
+`--speculative-cross-algorithm*` — NEXTN/MTP and DFLASH resident simultaneously, switched per batch
+by a bandit controller on accept-tokens/round, rank-0 decision plus TP broadcast. **WIP.**
+
+| Item | Detail |
+|---|---|
+| Implemented | dual residence, per-batch switching, bandit controller with a registered test |
+| Missing | the context-length gate from the drafter training config |
+| Validated | lazy single-graph capture and DFLASH context retirement, green under CUDA graphs; 542.0 MiB released |
+| Measured | the bandit loses its regime cell against the static winner, 75.52 against 89.22 tok/s; per-switch cost ~2.5 ms |
+
+**Upstream:** no equivalent in sglang, which adapts or selects a single drafter's parameters.
+
+<a id="f6"></a>
+### 6. CUDA graph memory aliasing for spec branches
+
+Inactive speculative-depth CUDA-graph branches hold no physical VRAM, via cuMem tag aliasing
+(`kv_vmm_backing` / adaptive runtime state). **Boot-checked** — the recorded GPU figure is
+542.0 MiB released under CUDA graphs on the lazy-capture arm.
+
+**Upstream:** sglang has related VMM/cuMem machinery, not applied to speculative CUDA-graph
+branches.
+
+<a id="f7"></a>
+### 7. MoE expert offload + asymmetric TP/DCP
+
+MoE expert offloading to host RAM combined with asymmetric TP and DCP (GPTQ/AWQ/FP8).
+**Boot-checked** on a 122B-A10B across three mismatched GPUs; **Cross-checked** on 35B-A3B AWQ, at
+32/32 tokens identical to a TP=1 run. Offloaded output is self-deterministic but not bit-identical
+to the no-offload case, since Marlin-Int4 tiling reduces in a different order. Numbers above.
+
+**Load-time presplit (#123 for GPTQ/AWQ, #256 for fp8).** The offload only helps if the expert
+stack never has to be whole on the card, so the split is done at load: `create_weights` allocates
+the expert tensors on the host, the loader's `device_loading_context` brings one layer at a time to
+the GPU, and `process_weights_after_loading` ends in
+`presplit_expert_offload_after_repack` — `[R+C]` slots stay resident, `[E-R]` go straight into the
+pinned spill pool, and the registered parameter becomes a 0-row placeholder. The fp8 method lacked
+both halves until #256, which is why a 31 GiB fp8 checkpoint OOM'd a 32 GiB card before the offload
+could act. AWQ lacked the allocation half for the same reason until #123-AWQ: only GPTQ had the
+host `create_weights`, so an AWQ MoE checkpoint still committed its whole `[E]` stack on the card
+at load and OOM'd before the presplit ran. Expert-major scales (`w13/w2_weight_scale[_inv]`) and
+expert biases are staged with their weights, so a spill expert's weight and its scale land on the
+same pool row and are fetched by the same plan. AWQ additionally stages the zero-points: it is an
+asymmetric format, so `w13/w2_qzeros` carry real per-expert checkpoint data that the repack
+consumes and the Marlin apply reads, and they are allocated on the host with the weights — where
+GPTQ leaves its (symmetric, empty) zero-points on the default device. **Boot-checked** on
+`Qwen3.6-35B-A3B-AWQ-4bit` (23.25 GiB of weights, 40 layers x 256 experts) at fraction 0.25 on a
+single RTX 3080 — a 20 GiB card carrying a checkpoint larger than itself: 11.92 GiB of weight VRAM
+released, 13.01 GiB in the host pool, card settling at 14.20 GiB. **Boot-checked** on `Qwen3.6-35B-A3B-FP8` (31 GiB, 40 layers x 256 experts),
+TP=1 on one RTX 5090 at fraction 0.25: 20.63 GiB of weight VRAM released, 22.51 GiB in the host
+pool.
+
+**Prefill wave order (#254).** A prefill chunk that routes to more experts than the scratch region
+holds is split into waves. `SGLANG_MOE_OFFLOAD_WAVE_ORDER` selects the axis:
+
+- `token` (default, unchanged) — waves are disjoint token subsets. Every wave re-fetches the spill
+  experts its tokens need, so a spill expert crosses PCIe once per wave. With `C` scratch slots and
+  `top_k` routed experts a wave holds roughly `C / top_k` tokens, so the wave count — and with it
+  the H2D volume — grows linearly with the chunk. At the default `C = max(8, R/4)` and `top_k = 8`
+  a wave is one or two tokens.
+- `expert` — waves are disjoint groups of at most `C` spill experts, so each spill expert is
+  streamed exactly once per chunk regardless of chunk size. It also removes the token-major failure
+  mode where a single token's spilled top-k does not fit the scratch.
+
+Byte-identical to the token order, and to the no-offload path on formats whose kernel config does
+not depend on the per-apply token count (blockwise fp8 pins `BLOCK_SIZE_K` to the quantization
+block; the unquantized path's `M <= E` heuristic flips it, which already affects the token order).
+The identity comes from taking the top-k reduction out of the wave: each routed (token, k-slot)
+pair is submitted as its own pseudo-token with `top_k == 1`, so the fused kernel writes the
+weighted contribution straight out, and it is stored at its own k-slot in a `[T, top_k, H]` buffer.
+The k-slot is fixed by the routing, so the buffer holds the same values in the same places for any
+split; the reduction runs once at the end over the full buffer, in k order. Cost: one transient
+`[T, top_k, H]` buffer per layer. Decode (single wave) is untouched.
+
+Measured on Qwen3.6-35B-A3B-AWQ, TP=1 on an RTX 5090, resident fraction 0.25 (32 resident + 8
+scratch of 128 experts per layer), eager, 2048-token chunks:
+
+| prompt tokens | token order | expert order | H2D per layer per chunk (token -> expert) |
+| --- | --- | --- | --- |
+| 331 | 9.37 s | 1.27 s | 3.09 GiB -> 0.19 GiB |
+| 771 | 21.65 s | 1.35 s | 3.09 GiB -> 0.19 GiB |
+| 1541 | — | 1.63 s | 7.20 GiB -> 0.15 GiB |
+| 3081 | — | 1.82 s | 7.20 GiB -> 0.12 GiB |
+| 6601 | aborted after 55 min | 3.38 s | 7.20 GiB -> 0.12 GiB |
+
+Generated text is identical between the two orders at every size that completed on both. The
+per-chunk H2D volume is logged (`MoE offload layer N: <order>-major prefill, W waves, X GiB H2D`).
+
+The AWQ table above was the format the card could hold; the fp8 arm of #254 stayed a synthetic
+kernel gate until #256 made a 31 GiB fp8 checkpoint bootable on one card. Rerun on the real fp8
+path — `Qwen3.6-35B-A3B-FP8`, TP=1 on an RTX 5090, fraction 0.25 (64 resident + 16 scratch of 256
+experts), eager, greedy, 72 prompt tokens and 96 generated — the two orders produce byte-identical
+output, at 27-31 waves / 1.11-1.21 GiB H2D per layer per chunk for token-major against 9 waves /
+0.34 GiB for expert-major.
+
+**KV-pool reclaim.** The weight VRAM the offload frees is claimed by the KV pool. No second
+sizing path exists and none is needed: the KV budget is profiled from a live free-memory reading
+taken after the weights are resident, so the reclaim lands in it by construction — provided the
+release has happened, on every rank, before anyone measures. #123's eager install (right after
+`load_model`, ahead of pool sizing) supplies the first half; #119 adds the parts that make it hold:
+
+- an **ordering invariant** — a FusedMoE layer still waiting to install when the pool is sized is a
+  hard error, not a silent fallback to the pre-#123 behaviour where the pool was sized against the
+  pre-offload footprint (the #77 "known limitation");
+- a **group-ordered release** — `gc.collect() -> empty_cache() -> barrier` before any rank reads
+  `mem_get_info()`. That reading is driver-level and therefore sees co-located siblings, while the
+  caching allocator only returns freed blocks at `empty_cache()`; unsynchronized, a rank that reads
+  early counts a sibling's already-released expert weights as still occupied. Below the offload the
+  skew was small — at f=0.25 on the 122B run it is the whole reclaim (~18 GiB on the shared card);
+- a **rank-uniform verdict** — "the reclaim is present" is a MIN over the TP group, so a rank that
+  released nothing (MoE-free shard, failed install) makes the whole group take the plain path
+  rather than half the ranks synchronizing while the other half measures unsynchronized;
+- **accounting** — released device/host bytes are tallied per rank and logged next to the resulting
+  KV budget (`[offload-kv-regain]`), so the win is readable from a boot log.
+
+No new budget term is introduced, so the #68 graph-capture reserve is untouched: the reclaim
+arrives as free bytes and is spent net of the same reserves as any other free byte. Switch:
+`SGLANG_MOE_OFFLOAD_KV_REGAIN` (default on, additionally gated on
+`SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0`, so the no-offload path is byte-identical).
+
+**Upstream:** SGLang/vLLM offload weights layer-granularly (`--cpu-offload-gb`), not
+expert-granularly, and not combined with asymmetric TP/DCP (partial). llama.cpp/ik_llama.cpp have
+the same expert-granular idea (`-ot`/`-ncmoe`/`--n-cpu-moe`; ik_llama.cpp also runs its own
+`iqk_mul_mat` kernel lineage, see row 8d) but nothing to combine it with, since neither
+asymmetric-TP nor DCP exists there (partial).
+
+<a id="f9"></a>
+### 9. Hibernate checkpoint/restore
+
+Persists warm server state to disk so it survives process exit and reloads without full
+re-initialization. **Boot-checked** for dense GGUF under asymmetric TP=3; numbers above, as a
+documented range rather than a single raw A/B run. The FP8 path is functional but has no expensive
+transform to skip; MoE-model hibernation is deferred.
+
+**Upstream:** sglang has diffusion-server offload/wake-up only, no full LLM-server snapshot.
+
+<a id="f20"></a>
+### 20. Session KV spill
+
+`--enable-kv-session-offload` plus tick/margin/hysteresis/pool flags — on VRAM overflow, the newest
+in-flight session's KV shard moves to a pinned host pool while the session keeps decoding through a
+bs=1 host-streamed spill tick interleaved with the device batches; FCFS-by-arrival victim order,
+stock retraction as fallback. **Exp, Boot-checked** — decode-side spill, restore and prefill-side
+admission all run on hardware with speculation active; spill rows in the combinations table above,
+admission checks below.
+
+| Area | State |
+|---|---|
+| Spill | whole-session, or a partial tail segment with hybrid device+host attention across the boundary; multiple concurrent spilled sessions (per-session host regions, `--kv-session-offload-max-spills`); host pool sized from a node-wide RAM budget (`--kv-session-offload-host-ram-gib`) |
+| Decode while spilled | spill tick at a static interval or under a self-calibrating cadence with an anti-starvation floor; eager by default, a bucketed CUDA-graph tick behind `SGLANG_KVSO_SPILL_GRAPH=1` (per-rung graph==eager at machine zero) |
+| Restore | FIFO with margin and hysteresis; incremental wave-back behind a configurable free-token threshold; readiness counts radix-evictable tokens, not the free list alone — a finished neighbour session returns its KV as evictable, so a free-list-only gate deadlocks precisely when the most memory is available. The commit path stays authoritative and evicts before re-checking |
+| Speculation | a spilled session decodes under MTP/NEXTN: the draft-KV share spills and restores with the session, with on-device resume and draft backfill; the drafter can run inside the spill tick (`--kv-session-offload-spec-in-tick`); every spill+spec boot rides the `KVSO_ALLOW_SPEC=1` opt-in gate |
+| Prefill-side spill | `--kv-session-offload-prefill`: a prompt beyond the device budget is admitted born-spilled — no device KV slots allocated — and handed to the spill tick; runs under speculative decoding and under the overlap scheduler |
+| Victim order | FCFS by arrival, plus a per-session latency class the caller sets (`spill_class` on `/generate`, `extra_body` on the OpenAI endpoints; fleet default `--kv-session-offload-default-spill-class`): `never` is tabu as a victim, including under fast-lane pressure, `preferred` is offered ahead of FCFS, `normal` is the stock order. Purely a user regler — nothing infers a class from traffic, and with every session in `normal` the selection is byte-identical to the pre-class one |
+| Spill budget | per-session/phase/total token budgets, an episode window and a rate bucket; exhaustion DEMOTES the session rather than aborting it — liveness ends, work is kept: the host tail drains and the finish donates the prefix, so a continuation is a prefix hit. The hand-over is lossless under HiCache: the donating insert is exempt from the hit-count write-through heuristic, which would otherwise drop the leaves under the threshold (the tokens the session just produced) while the same finish frees their device slots |
+| Scheduler integration | overlap scheduler supported (the spec deferred-commit hazard takes a post-verify snapshot); DFLASH rungs stay out of the spill tick |
+| Bounds that hold | GDN/Mamba state stays device-resident — the KV shard and the draft share spill, the recurrent state does not; more than one simultaneously spilled session is unit-tested (victim ordering, fast-lane multi-eviction) but not yet shown on hardware — boots show one spilled session among up to three co-resident ones, and three co-resident sessions are already the ceiling of this scheduler's admission arithmetic (a flag-OFF control shows the identical ceiling); a spill landing in the same round as a drafter-in-tick step has not been observed in validation; the concurrent two-stream dispatch (`SGLANG_KVSO_DECOUPLE=1`: device batch and spill tick in the same iteration, own stream, flashinfer workspace and DCP communicator for the spill lane) runs stably but holds the serial rate — only the token-sharding collectives have their own communicator, and the two lanes serialize behind the shared tensor-parallel one, so the default tick stays time-multiplexed with the device batch |
+
+| Configuration | Metric | Value |
+|---|---|---|
+| Qwen3.6-27B-FP8, uneven TP=3/DCP=3, MTP; feature armed vs off | ms per verify round | 37.74 vs 37.92, inside the 0.09-0.85 % boot-to-boot band |
+| born-spilled deep prompt, 1829 tokens against a 1306-token device budget, MTP | admissions with no device KV allocation | 2 of 2, on all three ranks, handed over to the spill tick |
+| same, drafter-in-tick requested without its gate | declined admissions | declined on all three ranks, naming the condition; the request is still served through the ordinary path |
+| the spilled session's output | coherence | 200 tokens, valid, no repetition flags |
+| spill under NEXTN k=3, restore margin 1024, hysteresis 40 | restores | 3 of 3 boots (decode figures in the combinations table) |
+| host pool from the RAM budget | per-rank pool | 1.00 GB of a 24 GiB node budget |
+
+**Upstream:** sglang retracts — frees and re-prefills — on exhaustion, rather than keeping a spilled
+request decoding.
+
+<a id="f13"></a>
+### 13. Rig dashboard / planner UI
+
+Capacity-planning tool reporting work-normalized J/token under asymmetric DCP
+(`tools/rig_dashboard`). **Exp** — functional but under active development, not production-ready.
+
+**Upstream:** n/a — external tooling.
+
+<a id="f16"></a>
+### 16. Fast-lane priority scheduling
+
+`--enable-fast-lane` — opt-in latency-priority class that preempts a tagged request into the running
+batch, with a reserved-heavy-slots floor and heavy-aging; default off. Flags:
+`--fast-lane-priority`, `--fast-lane-reserved-heavy-slots`, `--fast-lane-heavy-aging-ms`.
+**Built** — no hardware boot.
+
+**Upstream:** sglang already has priority scheduling and preemption; the reserved-floor fast-lane
+class is the addition.
+
+<a id="f25"></a>
+### 25. Per-message-class link selection
+
+`--collective-net-small` / `--collective-net-bulk` (env `SGLANG_COLLECTIVE_NET_SMALL` / `_BULK`) put
+the latency class and the bulk class on different network devices. On a host with two usable lines
+that buys small-message latency and bulk bandwidth at the same time instead of picking one; on a
+single-line host it only makes the existing choice explicit. **Cross-checked** against the real 40G
+RoCE link with a negative control.
+
+| Item | Detail |
+|---|---|
+| Mechanism | the UCX context is pinned with `ucp_config_modify(NET_DEVICES)` per instance. `UCX_NET_DEVICES` is one process-wide value and cannot address two instances or two classes; a modified config can. Unset → the call is skipped and the config is exactly the one the environment produced |
+| Reaches | (a) small and (b) large TP collectives via `small` — they share **one** UCX context, so this pins the whole collective plane; (c) PD-KV / HiCache via `bulk`, which seeds `--disaggregation-ib-device` when unset. (d) rendezvous/control is left on `--dist-init-addr` / `GLOO_SOCKET_IFNAME` on purpose |
+| Not separable | (a) from (b). One `UcpWorker`, one endpoint per peer. A genuine split needs a second UCX context, a second address exchange at rendezvous and a rank-uniform size-keyed selector (a disagreement deadlocks rather than returning a wrong answer) — ~200 lines plus cross-rig validation, not built. Setting `small` ≠ `bulk` is legal and logs that (b) stays on `small` |
+| Not rank-uniform | unlike every `SGLANG_HTCCL*` knob. The value is a local device name and the two ends of one link are called different things (`rocep4s0f1` / `rocep1s0f1`); the wire has to match, not the string |
+| Why the flags reject unknown devices | UCX does **not** fail on one. It warns `network device '...' is not available` and builds a context with no network transport, so the run completes and reports loopback numbers. Both flags validate against `/sys/class/infiniband` and `/sys/class/net` during server-args resolution and name what the host does have |
+| Evidence | cross-rig world-2 `all_reduce` over the 40G RoCE link with `UCX_TLS=rc,self,sm` and `UCX_NET_DEVICES` **unset**, driven only by `SGLANG_COLLECTIVE_NET_SMALL`: completes at 29.69 us / 184.54 us for 8 / 256 KiB. Negative control: repinned to the unwired second port `rocep4s0f0:1`, `ucp_ep_create` fails with `Destination is unreachable` — the pin is load-bearing, not decorative |
+| Default unchanged | 12 new CPU tests plus the 39 pre-existing HTCCL/UCX tests green. A/B control on the legacy `UCX_NET_DEVICES` route: 26.33 / 24.14 / 38.39 us at 8 KiB and 187.50 / 182.97 / 181.18 us at 256 KiB — the new route lands inside the old route's own repeat spread, and at 8 KiB that spread is far too wide for a 50-iteration harness to resolve a difference at all |
+| Worth it here? | no. This rig measures 1.47 us (FEC-free 40G) vs 1.58 us (100G, slot-limited to 3.43 GB/s) for an 8 B message, so there is no split worth making. The feature targets hosts whose latency-optimal and bandwidth-optimal cards differ |
+
+**Upstream:** sglang exposes `--disaggregation-ib-device` for the PD bulk side only; the collective
+plane's device is left to the process-wide `UCX_NET_DEVICES`.
+
+<a id="f26"></a>
+### 26. Prefill satellite (cross-host PD for hybrid GDN)
+
+`scripts/satellite/prefill_offload.py` — a second, physically separate host takes a
+request's prefill over cross-host PD disaggregation (`mooncake_tcp`) while the main rig
+keeps decoding; for a hybrid-GDN model, `setup_state_kv_args` moves the Mamba slot with
+the KV rows, since the obvious-looking alternative (a HiCache L3 store round trip)
+silently does nothing for GDN models — `MambaRadixCache._match_post_processor` truncates
+any prefix match to the deepest node that owns a mamba checkpoint, so a KV-only import
+matches zero tokens and the decode side recomputes the whole prompt. **Boot-checked** —
+merged `feat/prefill-satellite` (e45c51cd02).
+
+| Item | Detail |
+|---|---|
+| Vehicle | Qwen3.5-2B fp16 both sides, 6.5k-token cold prefill, 3 concurrent decode streams, 40G RoCE line, task #212 |
+| Handover proven directly | `cached_tokens=6464` on a decode arm that prefilled nothing; a reused prompt seed is excluded from measurement, since the satellite's own radix cache would otherwise report a falsely warm TTFT |
+| Honest trade-off | satellite pair 2.892 s TTFT against 0.604 s monolithic-under-load, but the running decodes' worst inter-token time drops from 6.54 ms to 3.22 ms — the load spike disappears rather than shrinks. 93.5% of the satellite's TTFT is the 2080 Ti's own prefill compute (2385 against the 5090's 10850 tok/s under the same load), 1.8% transport (98 MiB in ~53 ms over the 40G line); "with a faster satellite card the trade flips; this is a statement about this 2080 Ti, not the method" |
+| Preflight gate | the PD handshake (`try_ensure_parallel_info`) compares only `page_size` and `kv_cache_dtype` — a decode/prefill pair with different weights pairs happily and produces fluent nonsense; `prefill_offload.py preflight` is the check this fork runs before every measurement |
+| Walls found | GGUF does not run on sm75 at all (`sgl_kernel` cubin floor sm_80; the promised loud failure is not implemented, task #269); Qwen3.5-4B does not fit the 2080 Ti (GDN prefill scratch); flashinfer prefill needs 65616 B shared memory at head_dim 256 against Turing's 65536 (triton carries it); `--disaggregation-decode-enable-radix-cache` is a hard error for Mamba models; Docker `--gpus device=N` counts NVML order, not CUDA order |
+
+Recipe: rig-runbook §4.8.
+
+**Upstream:** sglang/vLLM provide base cross-host PD disaggregation; the hybrid-GDN
+Mamba-slot-with-KV handoff, and the honest TTFT-vs-undisturbedness measurement, are the
+fork's delta on top of it. llama.cpp/ik_llama.cpp have no PD disaggregation.
+
+---
+
 ## Scope note
 
 This matrix lists only capabilities with landed code. Planned or partially prototyped items — a
 host-RAM tiered-KV fabric for the weightless lane, a draft-KV-pool DCP layout, symmetric
 cross-vendor CUDA-graph capture (row 21), and the `fp8.py` `Fp8Config` family on non-CUDA-native
 hardware (row 22) — are excluded until they land.
+
 
 ## Sources
 
