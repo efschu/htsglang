@@ -2172,6 +2172,22 @@ def _measured_figures() -> Dict[str, str]:
                 )
     except Exception:  # pragma: no cover - a missing finding is normal
         pass
+    try:
+        from sglang.srt.rigmon.card_probe import load_card_probe
+
+        cprobe = load_card_probe()
+        if cprobe is not None and cprobe.cards:
+            fastest = max(
+                cprobe.cards, key=lambda c: c.membw_gbs or 0.0
+            )
+            age_h = (cprobe.age_s() or 0.0) / 3600.0
+            out["card_probe"] = (
+                f"{len(cprobe.cards)} cards, fastest {fastest.name} at "
+                f"{fastest.membw_gbs:.0f} GB/s; {len(cprobe.pairs)} ordered "
+                f"pairs; probed {age_h:.0f} h ago"
+            )
+    except Exception:  # pragma: no cover - no probe cached is normal
+        pass
     return out
 
 
@@ -2374,6 +2390,65 @@ def bench_lead_metrics_payload(payload: Optional[dict] = None) -> dict:
 # per step, each taking a small body, so `curl` is a complete client and the
 # dashboard has no privileged path. Nothing here computes anything.
 # ===========================================================================
+
+
+def card_probe_start_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/card_probe {node_id} -> returns immediately with a job.
+
+    The measurement is ~30 s of GPU time and runs in a SUBPROCESS: holding it
+    open across the request would time the browser out, and running it in this
+    process would give the dashboard a CUDA context on every card, next to a
+    live server. The caller polls ``GET /api/card_probe/status``.
+    """
+    from sglang.srt.rigmon import card_probe
+
+    node_id = ((payload or {}).get("node_id") or "local").strip() or "local"
+    try:
+        job = card_probe.JOBS.start(node_id)
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "job": job.to_json()}
+
+
+def card_probe_status_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/card_probe/status[?job_id=...] -> the job, plus the cache.
+
+    With no ``job_id`` it answers what the planner would read right now: the
+    cached probe if one exists, and the running job if one is going. That is
+    the shape the page needs on load, before it has ever started anything.
+    """
+    from sglang.srt.rigmon import card_probe
+
+    jid = ((payload or {}).get("job_id") or "").strip()
+    out: dict = {"ok": True}
+    if jid:
+        job = card_probe.JOBS.get(jid)
+        if job is None:
+            return {"ok": False, "error": f"no such card probe job: {jid}"}
+        out["job"] = job.to_json()
+    else:
+        active = card_probe.JOBS.active()
+        out["job"] = active.to_json() if active else None
+    try:
+        cached = card_probe.load_card_probe()
+    except Exception as e:  # pragma: no cover - defensive
+        cached, out["error"] = None, str(e)
+    out["cached"] = cached.to_json() if cached else None
+    out["measured"] = cached is not None
+    if cached is None:
+        # Named here rather than inferred in the page: the absence of a probe
+        # is what puts the planner on nameplate specs, and the surface has to
+        # be able to say so in those words.
+        out["basis"] = "nameplate-ranked, no probe cached"
+    else:
+        out["basis"] = (
+            "measured card probe of "
+            + str(len(cached.cards))
+            + " cards, "
+            + str(len(cached.pairs))
+            + " ordered pairs"
+        )
+    return out
 
 
 def rig_pair_start_payload(payload: dict) -> dict:
@@ -3270,6 +3345,17 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
+        # Before /api/card_probe: the status path is a prefix-extension of the
+        # start path, and the flat chain matches on prefixes.
+        if self.path.startswith("/api/card_probe/status"):
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, card_probe_status_payload(q))
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
         if self.path.startswith("/api/rig_pair/status"):
             try:
                 from urllib.parse import parse_qs, urlsplit
@@ -3470,6 +3556,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/bench_lead_metrics"):
                 self._json(200, bench_lead_metrics_payload(payload))
+                return
+            if self.path.startswith("/api/card_probe"):
+                self._json(200, card_probe_start_payload(payload))
                 return
             if self.path.startswith("/api/rig_pair/start"):
                 self._json(200, rig_pair_start_payload(payload))
@@ -7876,7 +7965,74 @@ function renderLeverProfiles(){
       +'</select> per session</div>';
   }
   (d.caveats||[]).forEach(c=>{ h+='<div class="lp-note">'+esc(c)+'</div>'; });
+  h+=cardProbeBar(d);
   setHTML(box,h);
+}
+
+// ---- the short card probe (#213) -----------------------------------------
+// What the button is for: every speed suggestion above ranks the cards, and
+// without a probe that ranking comes off a datasheet. The bar states which of
+// the two it currently is, so a nameplate ranking is never mistaken for a
+// measured one.
+window._cardProbeTimer=null;
+function cardProbeBar(d){
+  const b=((d||{}).basis||{}).card_probe;
+  const tt=tip('action.card_probe');
+  let txt;
+  if(!b) txt='Card rates are ranked on nameplate specs &mdash; no probe cached.';
+  else{
+    const age=b.age_s?Math.round(b.age_s/3600):0;
+    txt='Measured card probe: '+b.cards+' cards, '+b.ordered_pairs
+      +' ordered pairs'+((b.transports||[]).length?' via '
+      +esc((b.transports||[]).join(', ')):'')+', probed '+age+' h ago'
+      +(b.stale?' <b>(stale)</b>':'');
+  }
+  let h='<div class="lp-note" id="cp_bar" title="'+esc(tt)+'">'+txt
+    +' <button class="mini" id="cp_btn" onclick="cardProbeStart()" title="'
+    +esc(tt)+'">run card probe</button>'
+    +' <span class="muted" id="cp_state"></span></div>';
+  if(b&&(b.caveats||[]).length)
+    (b.caveats||[]).forEach(c=>{ h+='<div class="lp-note">'+esc(c)+'</div>'; });
+  return h;
+}
+async function cardProbeStart(){
+  const st=$('cp_state'); const btn=$('cp_btn');
+  if(btn) btn.disabled=true;
+  if(st) setHTML(st,'starting&hellip;');
+  try{
+    await api('/api/card_probe',{key:'card_probe', body:{}});
+  }catch(e){
+    if(btn) btn.disabled=false;
+    if(st) setHTML(st,'<span class="rev-error">'+esc(apiError(e))+'</span>');
+    return;
+  }
+  // Poll rather than hold the request: the run is ~30 s of GPU time, and a
+  // reload mid-probe must not lose it. The state lives on the host.
+  if(window._cardProbeTimer) clearInterval(window._cardProbeTimer);
+  window._cardProbeTimer=setInterval(cardProbePoll, 3000);
+  cardProbePoll();
+}
+async function cardProbePoll(){
+  const st=$('cp_state'); const btn=$('cp_btn');
+  let d;
+  try{ d=await api('/api/card_probe/status',{key:'card_probe_status'}); }
+  catch(e){ if(apiAborted(e)) return; return; }
+  const job=d.job;
+  if(job&&job.state==='running'){
+    if(st) setHTML(st,'measuring&hellip; '+(job.elapsed_s||0)+' s');
+    return;
+  }
+  // The poll stops itself once nothing is running.
+  if(window._cardProbeTimer){ clearInterval(window._cardProbeTimer); window._cardProbeTimer=null; }
+  if(btn) btn.disabled=false;
+  if(job&&job.state==='error'){
+    if(st) setHTML(st,'<span class="rev-error">'+esc(job.error||'failed')+'</span>');
+    return;
+  }
+  if(st) setHTML(st,'');
+  // The profiles are ranked on these rates, so they are recomputed rather
+  // than left showing the nameplate ranking they were drawn with.
+  refreshLeverProfiles();
 }
 
 // ---- tuning objective template -------------------------------------------

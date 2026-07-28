@@ -69,6 +69,13 @@ class MeasuredCardScore:
     name: str
     gemm_tflops: float
     membw_gbs: float
+    #: The card's fp8 GEMM rate, when the #213 card probe measured one. None
+    #: on a card with no fp8 tensor path and None when only the stage-0
+    #: profile is cached -- absent rather than back-filled from the bf16
+    #: figure, which would price an fp8 plan on the wrong number.
+    gemm_fp8_tflops: Optional[float] = None
+    #: Which probe these rates came from: "card-probe" or "stage-0".
+    source: str = "stage-0"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -84,6 +91,35 @@ class Advantage:
     #: "no decode regression expected" boolean from the fork's measured
     #: knee guard — only computable when measured membw scores exist.
     decode_knee_ok: Optional[bool] = None
+
+
+def _card_probe_entries() -> dict:
+    """{uuid: entry} from the cached #213 card probe, in the same shape the
+    stage-0 profile uses so the two are interchangeable at the call site.
+
+    Empty when no probe is cached. Never triggers one: a multi-second GPU
+    measurement as a side effect of computing an advantage would be a
+    surprise, and the probe has its own explicit entry points.
+    """
+    try:
+        from sglang.srt.rigmon.card_probe import load_card_probe
+
+        cprobe = load_card_probe()
+    except Exception:
+        return {}
+    if cprobe is None:
+        return {}
+    return {
+        c.uuid: {
+            "name": c.name,
+            "gemm_tflops": c.gemm_bf16_tflops,
+            "membw_gbs": c.membw_gbs,
+            "gemm_fp8_tflops": c.gemm_fp8_tflops,
+            "source": "card-probe",
+        }
+        for c in cprobe.cards
+        if c.gemm_bf16_tflops and c.membw_gbs
+    }
 
 
 def _round_range(pct: float, step: int = 5) -> Tuple[int, int]:
@@ -222,12 +258,19 @@ def compute_advantage(
         from sglang.srt.uneven_perf import get_cached_hardware_profile
 
         profile, gpus = get_cached_hardware_profile()
-        if profile is not None and inputs.rank_gpu_id:
+        # The #213 card probe measures the same two rates plus fp8, H2D/D2H
+        # and the ordered pair matrix, so where it is cached it is the richer
+        # answer about the same cards and wins per UUID. Where it is not, the
+        # stage-0 profile still answers, unchanged.
+        card_rates = _card_probe_entries()
+        if (profile is not None or card_rates) and inputs.rank_gpu_id:
             uuid_by_idx = {g["cuda_index"]: g["uuid"] for g in gpus}
+            gpu_entries = (profile or {}).get("gpus", {})
             scores = []
             membw = []
             for gid in inputs.rank_gpu_id:
-                entry = profile["gpus"].get(uuid_by_idx.get(gid, ""))
+                uuid = uuid_by_idx.get(gid, "")
+                entry = card_rates.get(uuid) or gpu_entries.get(uuid)
                 if entry is None:
                     scores = None
                     break
@@ -237,6 +280,8 @@ def compute_advantage(
                         name=entry["name"],
                         gemm_tflops=float(entry["gemm_tflops"]),
                         membw_gbs=float(entry["membw_gbs"]),
+                        gemm_fp8_tflops=entry.get("gemm_fp8_tflops"),
+                        source=entry.get("source", "stage-0"),
                     )
                 )
                 membw.append(float(entry["membw_gbs"]))
