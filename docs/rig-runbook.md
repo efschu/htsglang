@@ -470,6 +470,51 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   27-31 waves and 1.11-1.21 GiB H2D per layer per chunk here, expert-major
   9 waves and 0.34 GiB, and greedy output was byte-identical between them.
 
+**AWQ-4bit variant (#123-AWQ).** The same load-time cap now covers AWQ MoE.
+`AWQMoEScheme.create_weights` used to commit all six expert-major tensors
+(`w13/w2_qweight`, `w13/w2_scales`, `w13/w2_qzeros`) on the ambient cuda
+device, so the offload could be configured and still die during load. Measured
+2026-07-28 on `Qwen3.6-35B-A3B-AWQ-4bit`, **23.25 GiB of weights on a single
+RTX 3080 with 20.00 GiB** — a card smaller than the checkpoint.
+
+```bash
+# Pin the card by UUID, not by index: CUDA_VISIBLE_DEVICES indices follow
+# CUDA_DEVICE_ORDER (FASTEST_FIRST), which is NOT nvidia-smi order (6.1).
+export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i 0)
+export LD_LIBRARY_PATH="$VENV/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
+export PYTHONPATH=$WT/python
+export SGLANG_MOE_RESIDENT_EXPERT_FRACTION=0.25
+export SGLANG_MOE_OFFLOAD_WAVE_ORDER=expert
+
+setsid "$VENV/bin/python" -m sglang.launch_server \
+  --model-path "$MODEL_ROOT/Qwen3.6-35B-A3B-AWQ-4bit" \
+  --tp-size 1 --trust-remote-code \
+  --context-length 4096 --max-running-requests 1 \
+  --disable-cuda-graph \
+  --enable-metrics \
+  --host 127.0.0.1 --port <free-port> \
+  > "$LOG" 2>&1 &
+```
+
+- Boot 07:59:49Z -> ready 08:02:25Z (2 min 36 s; 6 shards in 67 s, then the
+  per-layer repack). Acceptance lines, both required: 40x `MoE expert-offload
+  active on layer N: 64/256 experts resident + 16 scratch (buffer=80,
+  fraction=0.250)` and `[offload-kv-regain] rank 0: expert offload released
+  11.92 GiB of weight VRAM across 40 MoE layer(s) (13.01 GiB moved to the
+  pinned host pool)`.
+- Card settles at **14.20 GiB of 20.00 GiB** (nvidia-smi 14540 MiB), KV pool
+  0.32 GiB at `max_total_num_tokens=16400`. The released 11.92 GiB is what
+  makes it fit: without the offload the weights alone want 14.20 + 11.92 =
+  **26.12 GiB on a 20.00 GiB card**, which is the OOM this recipe used to hit
+  inside `create_weights`.
+- Host RAM is the budget instead: MemAvailable fell 101.3 -> 78.7 GiB across
+  the load, i.e. ~22.6 GiB, consistent with the 13.01 GiB pinned pool plus the
+  transient loaded stack. Do not run this next to another memory-heavy job.
+- All six AWQ tensors are staged, zero-points included. AWQ is asymmetric, so
+  `w13/w2_qzeros` hold real per-expert data and must land on the same spill row
+  as their weight; GPTQ's stay empty and are left on the default device.
+- `--disable-cuda-graph` and the fp8 caveats above apply unchanged.
+
 ### 4.7 Pipeline parallelism intra-rig, uneven layer split (#201 slice 1)
 
 `--pp-size 2` with one rank per stage, each stage on its own card, and
