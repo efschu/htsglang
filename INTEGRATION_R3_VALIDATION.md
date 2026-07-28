@@ -4969,3 +4969,23 @@ not fixed); per-stage budgets no longer require a TP ratio. Effort: slice 2 (cro
 stage boundary) ~1-2 days — 2080 Ti is NVIDIA, standard NCCL-p2p PP path suffices,
 HTCCL-p2p only needed for the Vega later; slice 3 (uneven TP both stages) ~3-5 days,
 dominated by the world-MIN of max_total_num_tokens.
+
+# #123-AWQ — load-time half of expert offload for AWQ-MoE (CPU part merged, GPU proof pending)
+
+Merged feat/awq-moe-loadtime-offload (3318b8c2d1, fast-forward). create_weights now
+allocates all six expert-major tensors on _moe_dev ("cpu" when
+SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0), construction verbatim per the GPTQ sibling;
+staging is free via loader.py's device_loading_context. AWQ deviation documented in
+code: qzeros carry real checkpoint data consumed by moe_awq_to_marlin_zero_points and
+ride on _moe_dev too. Tests: tests/moe_offload/ 81 passed / 34 skipped (CUDA-gated)
+post-merge, falsifier honest (2 failed against unfixed code; first test draft was
+worthless on a CPU-only host and was itself fixed by the falsifier — meta-device
+placeholder makes the distinction observable). FEATURES_VS_UPSTREAM corrected ("#123
+for GPTQ/AWQ" overstated the AWQ side). Pending, GPU-gated: boot proof
+Qwen3.6-35B-A3B-AWQ-4bit (23.25 GiB weights) on a 20-GiB 3080 — the boot itself is
+the proof — plus runbook 4.6 recipe (draft staged outside the tree until numbers exist).
+
+Finding recorded separately: GGUF-MoE has NEITHER offload half and NO guard — the
+quant-agnostic offload installer slices GGUF expert stacks unchecked while GGUF runs
+its own zero-pad/topk-remap; fail-fast guard is cheap and comes first (task #268).
+Same gap in the MoeWNA16 fallback (awq.py:363-375).
