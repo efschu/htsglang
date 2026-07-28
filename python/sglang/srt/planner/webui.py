@@ -43,6 +43,7 @@ import dataclasses
 import json
 import os
 import re
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
@@ -118,16 +119,26 @@ __all__ = [
 
 def detect_hardware() -> dict:
     """Auto-detect the local GPUs (NVML/nvidia-smi) for the selectable card
-    list. Returns ``{ok, gpus:[{index,name,total_mib,free_mib,cuda_index}],
-    host_ram_mib, source, cuda_index_source}`` or ``{ok:False, error}`` on a
-    GPU-less host — the UI then shows only the manual/virtual add-card path
-    (still fully usable offline).
+    list. Returns ``{ok, gpus:[{index,name,total_mib,free_mib,cuda_index,
+    pcie_gen,pcie_width}], host_ram_mib, source, cuda_index_source}`` or
+    ``{ok:False, error}`` on a GPU-less host — the UI then shows only the
+    manual/virtual add-card path (still fully usable offline).
 
     ``index`` is the NVML/PCI-bus index (telemetry space); ``cuda_index`` is
     the SAME card's CUDA-order index — the space every engine flag
     (--rank-gpu-id / --base-gpu-id) is interpreted in. ``cuda_index_source``
     is "torch" (exact UUID bridge) or "heuristic" (FASTEST_FIRST emulation;
-    the UI must say so), or None when unbridged."""
+    the UI must say so), or None when unbridged.
+
+    ``pcie_gen``/``pcie_width`` (current link train, from
+    ``hardware_from_nvml``) were computed here all along but dropped on the
+    way to the UI -- ``hwmod.GpuCard`` carries them, this dict comprehension
+    just never forwarded them. This rig has an asymmetric PCIe topology
+    (every card PHB, one card on x4) that this dashboard's own capacity
+    matrix / composed-rig estimates explicitly caveat as "assumes pcie/nvlink
+    topology, not measured" -- the Hardware step showing what was actually
+    detected, card by card, is what lets a reader tell an ESTIMATE's
+    assumption apart from this rig's actual, asymmetric wiring."""
     from sglang.srt.planner import hardware as hwmod
 
     try:
@@ -151,6 +162,8 @@ def detect_hardware() -> dict:
                 "total_mib": g.total_mib,
                 "free_mib": g.free_mib,
                 "cuda_index": g.cuda_index,
+                "pcie_gen": g.pcie_gen,
+                "pcie_width": g.pcie_width,
             }
             for g in spec.gpus
         ],
@@ -1411,7 +1424,7 @@ def _force_enable_metrics(argv: Optional[list]) -> Optional[list]:
 
     There is deliberately no opt-out. The flag changes observability only,
     never inference: without it /metrics is absent, and the whole live half of
-    this dashboard -- token rates, per-session throughput, MTP acceptance,
+    this dashboard -- token rates, per-request throughput, MTP acceptance,
     cache-hit, tokens per watt -- has nothing to read. A server booted from
     here is a server that can be watched.
 
@@ -1930,6 +1943,27 @@ _LANDING_SNAPSHOT_STATE = None
 #: Which monitor target the delta state belongs to -- switching targets resets
 #: the delta math (counters from different servers must never be subtracted).
 _LANDING_TARGET_KEY = None
+
+#: Round 5 bug: the dashboard server is a ThreadingHTTPServer, and the client
+#: aborts a poll that is still in flight when the next one is due (see the
+#: 'landing' key in api()) but does NOT stop the corresponding SERVER-side
+#: request -- an /metrics scrape that runs long while a real inference load
+#: is competing for it keeps going, and the next poll's request can overtake
+#: it on a second thread. Two requests then read-modify-write
+#: _LANDING_SNAPSHOT_STATE / _LANDING_TARGET_KEY out of order: whichever
+#: finishes LAST wins, even if it started first and holds an OLDER counter
+#: snapshot, which regresses the stored state and hands the NEXT poll a
+#: t_prev that lands at or after its own t_cur. live_metrics._rates() treats
+#: that (correctly documented as "duplicate / out-of-order scrape") as a
+#: clamped, hard 0.0 -- which is exactly the symptom reported: rates
+#: flashing to zero while NVML utilisation shows real work in flight, and
+#: fewer good updates landing overall because the corrupted baseline has to
+#: be rebuilt. The critical section below (read prev, scrape, write new
+#: state) is serialized so no two requests can interleave their read and
+#: write halves -- one poll's full read-compute-write always completes
+#: before the next one's begins, which is the only granularity at which a
+#: single shared delta baseline is meaningful at all.
+_LANDING_STATE_LOCK = threading.Lock()
 
 #: Persistent joule-per-token counter (opt-in, default OFF): lazily loaded
 #: ONCE and kept as the single in-process source of truth for the lifetime of
@@ -3063,8 +3097,9 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
             label = det
 
     if target is None:
-        _LANDING_SNAPSHOT_STATE = None  # reset delta math for the next target
-        _LANDING_TARGET_KEY = None
+        with _LANDING_STATE_LOCK:
+            _LANDING_SNAPSHOT_STATE = None  # reset delta math for the next target
+            _LANDING_TARGET_KEY = None
         return {
             "ok": True,
             "running": False,
@@ -3073,24 +3108,35 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
             "status": status,
         }
 
-    key = (kind, label)
-    if key != _LANDING_TARGET_KEY:
-        # Never subtract counters from two different servers.
-        _LANDING_SNAPSHOT_STATE = None
-        _LANDING_TARGET_KEY = key
     target_info = {
         "endpoint": label,
         "kind": kind,
         "managed": kind == "managed",
     }
-    try:
-        snap, new_state = live_metrics.snapshot(
-            target, prev_state=_LANDING_SNAPSHOT_STATE
-        )
-        _LANDING_SNAPSHOT_STATE = new_state
-    except Exception as e:  # pragma: no cover - defensive
-        return {"ok": False, "running": True, "error": str(e),
-                "target": target_info}
+    # Serialized: read prev_state, scrape, write new_state as ONE step. Two
+    # concurrent polls (a slow scrape overlapping the next tick, see the note
+    # on the lock above) must never interleave their halves of this -- that
+    # is what let a request that STARTED first but FINISHED last clobber a
+    # newer state with an older one.
+    with _LANDING_STATE_LOCK:
+        key = (kind, label)
+        if key != _LANDING_TARGET_KEY:
+            # Never subtract counters from two different servers.
+            _LANDING_SNAPSHOT_STATE = None
+            _LANDING_TARGET_KEY = key
+        try:
+            snap, new_state = live_metrics.snapshot(
+                target, prev_state=_LANDING_SNAPSHOT_STATE
+            )
+            _LANDING_SNAPSHOT_STATE = new_state
+        except Exception as e:  # pragma: no cover - defensive
+            return {"ok": False, "running": True, "error": str(e),
+                    "target": target_info}
+    # Outside the lock: the jtok fold only reads `snap` (already returned by
+    # the serialized section above) and mutates the SEPARATE _JTOK_STORE
+    # object, so it does not need the delta-state lock -- keeping it out
+    # keeps that lock's critical section to just the delta math it exists
+    # to protect.
     _jtok_live_tick(snap, target_info)
     return {
         "ok": True,
@@ -5472,7 +5518,7 @@ _INDEX_TEMPLATE = r"""<!doctype html>
          margin: 0; padding: 0; }
   /* Every top-level block sits in the same centred column, so the left and
      right margins are equal on every tab and do not change with content. */
-  body > .hdr, body > .tabs, body > div[id^="view_"] {
+  body > .hdr, body > .tabs, body > #loadbar, body > div[id^="view_"] {
     max-width: var(--page-max); margin-left: auto; margin-right: auto;
     padding-left: var(--gutter); padding-right: var(--gutter); }
   h1 { font-size: var(--t-xl); font-weight: 500; margin: 0; letter-spacing: 0; }
@@ -5564,16 +5610,24 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   @media (prefers-reduced-motion: reduce) {
     .scanning { animation: none; }
   }
-  .loadbar { display: flex; align-items: baseline; gap: var(--s3);
-             flex-wrap: wrap; padding: var(--s2) var(--s3);
+  /* Round 5: this bar used to sit outside the page's centred column (it was
+     missing from the max-width/gutter selector above) and its name + numbers
+     were the smallest text on the bar -- the one line that qualifies every
+     other tab read smaller and less central than the tabs below it. It now
+     shares the same centred column as the header and every view, and its
+     content is centred within that column, name and numbers a size up from
+     the rest of the page, matching the header's h1 the same way it already
+     matches its layout. */
+  .loadbar { display: flex; align-items: baseline; justify-content: center;
+             gap: var(--s4); flex-wrap: wrap; padding: var(--s3) var(--s3);
              margin-bottom: var(--s3); border-radius: var(--radius-lg);
              background: var(--bg-panel); border: 1px solid var(--bd-weak);
-             font-size: var(--t-sm); }
+             font-size: var(--t-md); text-align: center; }
   .loadbar.off { color: var(--fg-muted); }
-  .loadbar .lb-name { font-size: var(--t-lg); color: var(--fg-strong);
+  .loadbar .lb-name { font-size: var(--t-xl); color: var(--fg-strong);
                       font-weight: 500; }
   .loadbar .lb-f { color: var(--fg-muted); }
-  .loadbar .lb-f b { color: var(--fg); font-weight: 500;
+  .loadbar .lb-f b { color: var(--fg); font-weight: 600; font-size: var(--t-lg);
                      font-variant-numeric: tabular-nums; }
   .loadbar .lb-na { color: var(--fg-muted); font-style: italic; }
   /* The bar WRAPS; it never scrolls. A scrollbar in a navigation strip hides
@@ -5715,6 +5769,31 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   .mx td, .mx th { text-align: center; }
   .mx .estcell { outline: 1px dashed var(--warn-dim); }
   .mx .fitc { color: var(--ok); } .mx .nofitc { color: var(--bad); }
+  /* Data-tab layout overlap (round 5, point 1): fixed at the root by the
+     parallel jtok-counter agent (feat/jtok-counter, merged into
+     integration/r3-probe-next2) -- a CSS-grid auto min-width blowout of the
+     7-column power table, fixed with min-width:0 on the column wrappers +
+     overflow-x:auto on the result divs. Not duplicated here; picked up via
+     the integration merge instead. */
+  /* Capacity-matrix chip controls (round 5 rebuild, #b): same toggle-button
+     idiom as .testbtn (the benchmark tab already established "selection is a
+     pressed button, not a checkbox or free text" for exactly this reason). */
+  .chiplist { display: flex; flex-wrap: wrap; gap: var(--s1); }
+  .mxchip { display: inline-flex; align-items: center; gap: 4px;
+            background: var(--bg-elevated); border: 1px solid var(--bd-weak);
+            border-radius: 9999px; padding: 2px 10px; font-size: var(--t-xs);
+            cursor: pointer; color: var(--fg-muted); }
+  .mxchip:hover { border-color: var(--bd); color: var(--fg); }
+  .mxchip.on { border-color: var(--accent-text); color: var(--accent-text);
+               background: rgba(61,113,217,.16); }
+  .mx-rig-row { border: 1px solid var(--bd-weak); border-radius: var(--radius);
+                padding: var(--s2); margin-bottom: var(--s2); }
+  .mx-rig-row .mxcount { display: inline-flex; align-items: center; gap: 3px;
+    background: var(--bg-elevated); border: 1px solid var(--bd-weak);
+    border-radius: 9999px; padding: 1px 6px; margin: 2px 3px 0 0; font-size: var(--t-xs); }
+  .mx-rig-row .mxcount button { width: 16px; height: 16px; padding: 0;
+    line-height: 1; border-radius: 50%; }
+  .mx-rig-row .mxcount.zero { opacity: .5; }
   .legend { color: var(--fg-muted); font-size: var(--t-xs);
             margin-top: var(--s2); }
   .cardlist { display: flex; flex-direction: column; gap: var(--s1); }
@@ -6612,25 +6691,43 @@ _INDEX_TEMPLATE = r"""<!doctype html>
        ticked set above. Same question as the rest of the guide (what does
        the planner say fits), just asked for several models/rigs side by
        side, so it lives here as the expert step's last section instead of
-       its own tab. -->
+       its own tab.
+
+       Round 5 verdict (kept, rebuilt): this is NOT redundant with the
+       families table above or the planner itself -- both of those answer
+       for ONE model on THIS live rig. This section is the only place that
+       compares MULTIPLE checkpoints against MULTIPLE rigs side by side,
+       including hypothetical ones this box does not have (composed from the
+       GPU-model card library), which is a genuinely different question
+       ("would this fit on a different box") that neither of the others can
+       answer. What was wrong was not the question, but that it took two
+       freeform textareas to ask it, with no explanation of what the answer
+       even meant. Rebuilt: models and rigs are ticked/composed from what the
+       backend already discovered (checkpoints under the model roots, and
+       the GPU-model card library) with buttons and chips only -- no
+       free-text path exists here anymore. -->
   <fieldset class="cfg-section">
     <legend>capacity matrix &mdash; several models across several rigs</legend>
-    <div class="muted" style="margin-bottom:var(--s2)">Compose rigs from the
-      GPU-model card library (or add the live one) and see which models fit
-      on each. <b>Composed rigs are ESTIMATES</b> &mdash; no measured
-      free-VRAM or interconnect (§8).</div>
+    <div class="muted" style="margin-bottom:var(--s2)">Answers one question:
+      <b>does model X fit on rig Y, and with how much context?</b> &mdash;
+      for several discovered checkpoints and several rigs (this one, plus any
+      you compose from the GPU-model card library) side by side.
+      <b>Composed rigs are ESTIMATES</b> &mdash; no measured free-VRAM or
+      interconnect (§8).</div>
     <div class="cols">
       <div>
         <fieldset>
-          <legend>models (one per line: LABEL=path, or just a path)</legend>
-          <textarea id="mx_models" rows="4" placeholder="27B-AWQ=/path/to/Qwen3.6-27B-AWQ&#10;35B-A3B=/path/to/model"></textarea>
+          <legend>models &mdash; tick discovered checkpoints</legend>
+          <div id="mx_model_chips" class="chiplist muted">loading discovered checkpoints&hellip;</div>
         </fieldset>
         <fieldset>
-          <legend>rigs (one per line: NAME=card,card,... — or 'live')</legend>
-          <textarea id="mx_rigs" rows="4" placeholder="hetero=RTX 5090,RTX 3080 20GB,RTX 3080 20GB&#10;4x4090=RTX 4090,RTX 4090,RTX 4090,RTX 4090"></textarea>
-          <div id="mx_cards" class="knoblist" style="margin-top:.5rem"></div>
+          <legend>rigs &mdash; this rig, or compose from the card library</legend>
+          <button type="button" id="mx_rig_live" class="mxchip on" onclick="mxToggleLive()"
+                  title="this box, as NVML reports it right now">this rig (live)</button>
+          <div id="mx_rig_builders" style="margin-top:var(--s2)"></div>
+          <button class="mini secondary" onclick="mxAddRig()">+ compose a hypothetical rig</button>
         </fieldset>
-        <button onclick="doMatrix()">Build matrix</button>
+        <button class="primary" onclick="doMatrix()">Calculate</button>
       </div>
       <div><div id="mx_out"></div></div>
     </div>
@@ -7012,15 +7109,15 @@ _INDEX_TEMPLATE = r"""<!doctype html>
        running" container is what let a warning outlive the server it was
        about: the container was hidden, the stale text stayed. -->
   <fieldset id="live_panel">
-    <legend>VRAM in use, throughput per session, tokens per watt (live)</legend>
+    <legend>VRAM in use, throughput per request, tokens per watt (live)</legend>
     <div id="live_note" class="muted">looking for a running server&hellip;</div>
     <div id="live_strip" class="mstrip" style="display:none"></div>
     <div id="live_cards"></div>
     <div class="legend" id="live_legend" style="display:none">Bars are the
       <b>measured</b> NVML occupancy of each card, drawn with the same bar the
       planner uses for its projection, so the two are comparable by looking.
-      Per-session rates divide the server-wide rate by the concurrent requests
-      being served. Tokens per watt is the live token rate over NVML power
+      Per-request rates divide the server-wide rate by the concurrent parallel
+      requests being served. Tokens per watt is the live token rate over NVML power
       draw &mdash; per card it says what that card costs to keep in the group,
       the total is the figure for the whole configuration.</div>
   </fieldset>
@@ -7263,7 +7360,11 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     from the browser); the SVG is graded deterministically against the true
     position. Verdict is honest: an unverifiable-but-rendering board is
     <b>renders-unverifiable</b>, never correct.</div>
-  <div class="cols">
+  <!-- Round 5: the reddit-credit line + the ONESHOT description above sat
+       right against "run config" below with no breathing room -- both used
+       the page's default .sub/.muted margins, which are top-only, so nothing
+       actually separated the description block from the first fieldset. -->
+  <div class="cols" style="margin-top:var(--s4)">
     <div>
       <fieldset>
         <legend>run config</legend>
@@ -7292,8 +7393,17 @@ _INDEX_TEMPLATE = r"""<!doctype html>
           <div id="q_svg" class="muted">run a check…</div>
         </fieldset>
         <fieldset>
-          <legend>history <span id="q_slide_lbl" class="muted"></span></legend>
-          <input type="range" id="q_slider" min="0" max="0" value="0" style="width:100%" oninput="showShot()">
+          <!-- Round 5: was a single 1-D slider over the flat shot list, so
+               "which model/quant" and "which run of that model/quant" were
+               the same axis -- picking a shot meant scrubbing past every
+               OTHER model's runs first. Two dropdowns instead: model+quant
+               narrows the list, run picks a specific saved shot within it
+               (newest first), no slider. -->
+          <legend>history</legend>
+          <label>model &amp; quantization</label>
+          <select id="q_hist_mq" onchange="onHistModelChange()"><option value="">no saved shots</option></select>
+          <label>run</label>
+          <select id="q_hist_run" onchange="showShot()"></select>
           <div id="q_shot" class="muted" style="margin-top:.4rem">no saved shots.</div>
         </fieldset>
       </div>
@@ -7608,7 +7718,8 @@ async function detectGPUs() {
     const det = d.gpus.map(g => ({
       name: g.name, total_mib: g.total_mib, include: true,
       reserve_gb: 0, virtual: false, free_mib: g.free_mib,
-      nvml_index: g.index, cuda_index: (g.cuda_index!=null?g.cuda_index:null) }))
+      nvml_index: g.index, cuda_index: (g.cuda_index!=null?g.cuda_index:null),
+      pcie_gen: g.pcie_gen, pcie_width: g.pcie_width }))
       .sort((a,b)=>((a.cuda_index!=null?a.cuda_index:1e9)
                    -(b.cuda_index!=null?b.cuda_index:1e9)) || (a.nvml_index-b.nvml_index));
     CARDS = det.concat(CARDS.filter(c => c.virtual));
@@ -7669,6 +7780,20 @@ function renderCards() {
         + '--rank-gpu-id/--base-gpu-id use; nvml: NVML/PCI-bus order (nvidia-smi, telemetry)';
       idxTag.textContent = ' [' + idxLbl + ']';
       nameWrap.appendChild(idxTag);
+    }
+    // What this card's link actually trains to, detected -- composed rigs
+    // in the capacity matrix / lever-profile ESTIMATES assume a topology;
+    // this is the one place that says what THIS rig's cards report instead
+    // (an asymmetric PCIe layout, e.g. one card on fewer lanes, is a real
+    // difference an estimate cannot see).
+    if (c.pcie_gen) {
+      const pcieTag = document.createElement('span'); pcieTag.className = 'cap';
+      pcieTag.title = 'PCIe link this card currently trains to (NVML), not an '
+        + 'assumption -- composed/estimated rigs elsewhere on this page cannot '
+        + 'know this.';
+      pcieTag.textContent = ' PCIe ' + c.pcie_gen + '.0'
+        + (c.pcie_width ? (' x' + c.pcie_width) : '');
+      nameWrap.appendChild(pcieTag);
     }
     // VRAM (MiB)
     const vramWrap = document.createElement('span'); vramWrap.title = 'total VRAM (MiB)';
@@ -8605,6 +8730,7 @@ function showTab(t) {
     // Feeds the capacity-matrix section's card library list (former Rigs
     // tab); guarded the same way it was when that section had its own tab.
     if (!window._profLoaded) loadProfiles();
+    if (!window._mxModelsInit) { window._mxModelsInit=true; loadMxModelChips(); }
     wizardSyncModel();
     // Entering the guide with a checkpoint already chosen answers the
     // question rather than waiting to be asked it again. Only when there is
@@ -9626,6 +9752,17 @@ function loadbarKvTokens(s){
   const v=si.max_total_num_tokens;
   return (typeof v==='number'&&v>0)?v:null;
 }
+// Round 5: "name, not path" is not satisfied by picking served_model_name
+// over model_path -- served_model_name defaults to the checkpoint path
+// itself whenever --served-model-name is not passed, so EITHER field can be
+// a full filesystem path. basenameOf() is the one place that decides what
+// counts as a displayed name; every prominent render keeps the full path
+// only as a title/tooltip, never in the running text.
+function basenameOf(p){
+  const s=String(p||'').trim();
+  if(!s) return '';
+  return s.replace(/[\\/]+$/,'').split(/[\\/]/).pop()||s;
+}
 function renderLoadbar(s){
   const box=$('loadbar'); if(!box) return;
   const n=(s&&s.ok!==false)?normalizeStartConfig(s):null;
@@ -9637,8 +9774,8 @@ function renderLoadbar(s){
       +'are planned, not observed</span>');
     return;
   }
-  const name=(c.served_model_name&&c.served_model_name!=='model')
-    ? c.served_model_name : String(c.model_path||'').split('/').pop();
+  const name=basenameOf((c.served_model_name&&c.served_model_name!=='model')
+    ? c.served_model_name : c.model_path);
   const kv=loadbarKvTokens(s);
   const seats=c.max_running_requests||c.max_num_seqs;
   const running=(s&&typeof s.num_running_reqs==='number')?s.num_running_reqs:null;
@@ -9651,7 +9788,10 @@ function renderLoadbar(s){
   let h='<span class="lb-name" title="'+esc(c.model_path||'')+'">'+esc(name||'unnamed')+'</span>';
   h+=f('quant', quant?esc(String(quant)):null);
   h+=f('KV pool', kv!=null?(kv.toLocaleString()+' tok'):null);
-  h+=f('sessions', seats!=null
+  // Round 5 nomenclature audit: this counts max_running_requests (parallel
+  // request slots the server was started with / is currently serving), not
+  // a session in any real sense, so it reads as what it measures.
+  h+=f('parallel requests', seats!=null
         ?((running!=null?(running+' / '):'')+seats)
         :null);
   h+=f('context', c.context_length!=null?Number(c.context_length).toLocaleString():null);
@@ -9682,8 +9822,8 @@ function renderStartConfig(s, tgt){
     return '<span class="pill"><span class="muted">'+esc(k)+'</span> '
       +esc(String(Array.isArray(v)?v.join(','):v))+'</span> ';
   };
-  const modelName=(c.served_model_name&&c.served_model_name!=='model')
-    ? c.served_model_name : String(c.model_path||'').split('/').pop();
+  const modelName=basenameOf((c.served_model_name&&c.served_model_name!=='model')
+    ? c.served_model_name : c.model_path);
   let h='<div style="font-size:1rem;margin-bottom:.35rem"><b>'+esc(modelName||'unknown model')+'</b>'
     +(tgt?' <span class="muted">@ '+esc(tgt.endpoint)+' ('+(tgt.managed?'managed':'external')+')</span>':'')
     +'</div>';
@@ -10721,8 +10861,8 @@ function targetLabel(s){
   const n=s?normalizeStartConfig(s):null;
   const cfg=(n&&n.cfg)||{};
   const st=(s&&s.status)||null;
-  const name=cfg.served_model_name||cfg.model_path||(st&&st.served_model_name)
-             ||(st&&st.model_path)||'unnamed model';
+  const name=basenameOf(cfg.served_model_name||cfg.model_path||(st&&st.served_model_name)
+             ||(st&&st.model_path))||'unnamed model';
   let port=cfg.port||(st&&st.port)||null;
   if(!port && s && s.endpoint){
     const m=(''+s.endpoint).match(/:(\d+)\s*$/); if(m) port=m[1];
@@ -10736,7 +10876,7 @@ function noMetricsBanner(err, s){
     +'font-weight:400;margin:var(--s2) 0 0">'
     +'<b>Server started without --enable-metrics</b>'
     +(s?(' &mdash; <b>'+targetLabel(s)+'</b>'):'')
-    +' &mdash; live rates (decode / prefill tok/s, per-session throughput, '
+    +' &mdash; live rates (decode / prefill tok/s, per-request throughput, '
     +'MTP acceptance, cache hit) are not available from this server. Per-card '
     +'VRAM, power and utilisation come from NVML and keep working. Restart '
     +'the server with <code>--enable-metrics</code>; a server booted from '
@@ -10823,8 +10963,10 @@ function renderLivePanel(s, envelope){
   const dec=rates?rates.decode_tok_s:null, pfx=rates?rates.prefill_tok_s:null;
   const running=(s.num_running_reqs!=null)?s.num_running_reqs:null;
   const queued=(s.num_queue_reqs!=null)?s.num_queue_reqs:null;
-  // Per session = the server-wide rate divided by the requests it is actually
-  // serving. With nothing running the per-session figure is undefined, not 0.
+  // Per request = the server-wide rate divided by the requests it is actually
+  // serving concurrently (max_running_requests worth of parallel requests,
+  // not sessions in any real sense). With nothing running the per-request
+  // figure is undefined, not 0.
   const per=(v)=>(v==null||running==null||running<1)?null:v/running;
   const decPer=per(dec), pfxPer=per(pfx);
   let watts=null;
@@ -10844,12 +10986,12 @@ function renderLivePanel(s, envelope){
   if(noMetrics) setHTML(note, noMetricsBanner(s.metrics_error, s));
   strip.style.display=''; $('live_legend').style.display='';
   setHTML(strip,
-    liveTile('decode per session',
+    liveTile('decode per request',
       n1(decPer)+'<small> tok/s</small>',
       'server total '+n1(dec)+' tok/s &middot; '
-      +(running==null?'sessions n/a':running+' running')
+      +(running==null?'parallel requests n/a':running+' running')
       +(queued?(' &middot; '+queued+' queued'):''), 'lv_dec')
-   +liveTile('prefill per session',
+   +liveTile('prefill per request',
       n1(pfxPer)+'<small> tok/s</small>',
       'server total '+n1(pfx)+' tok/s (non-cached)', 'lv_pfx')
    +liveTile('tokens per watt (total)',
@@ -11171,7 +11313,19 @@ async function wizardFamilies(){
       {key:'wizard_fam', body:wizardBody(), timeout:30000});
   }catch(e){
     if(apiAborted(e)) return;
-    setHTML(box,'<div class="rev-error">'+esc(apiError(e))+'</div>'); return;
+    // Round 5 fix: an earlier version returned here BEFORE the wizardFresh()
+    // call below, so any recompute that failed (timeout, a server hiccup
+    // while the model was still resolving, ...) left 'hardware'/'goal'/
+    // 'families' pinned stale FOREVER -- the [data-step].stale band ("an
+    // earlier step changed") stays up because nothing ever asks again, even
+    // though the model input above it has moved on to something new. The
+    // grey band's promise is "this is the PREVIOUS input's answer"; once this
+    // attempt against the CURRENT input has concluded -- successfully or not
+    // -- that promise is no longer true, so the marks come off either way.
+    // What replaces them is an explicit error in this box, never silence.
+    setHTML(box,'<div class="rev-error">'+esc(apiError(e))+'</div>');
+    for(const st of ['model','hardware','goal','families']) wizardFresh(st);
+    return;
   } finally { stale(box,false); }
   window._wizard=d;
   // The families table is now the current answer for the current model, card
@@ -11564,7 +11718,12 @@ async function wizardCommand(){
     d=await api('/api/wizard/command',{key:'wizard_cmd', body:body, timeout:30000});
   }catch(e){
     if(apiAborted(e)) return;
-    setHTML(box,'<div class="rev-error">'+esc(apiError(e))+'</div>'); return;
+    // Same fix as wizardFamilies() above: a failed attempt against the
+    // CURRENT input still un-stales the 'command' step -- it is no longer
+    // showing the previous input's answer, it is showing this error.
+    setHTML(box,'<div class="rev-error">'+esc(apiError(e))+'</div>');
+    wizardFresh('command');
+    return;
   } finally { stale(box,false); }
   wizardFresh('command');
   if(!d.ok){ setHTML(box,'<div class="rev-error">'+esc(d.error||'')+'</div>'); return; }
@@ -11719,29 +11878,63 @@ function renderLeverProfiles(){
   const rows=(d.profiles||[]).filter(p=>p.resolved);
   const sel=rows.filter(p=>p.key===cur)[0]||rows[0];
   const metricKeys=((rows[0]&&rows[0].metrics)||[]).map(m=>m.key);
-  // #215 honest-collapse marker. Several stops legitimately resolve to the
-  // SAME split on a given rig (the total weight bytes are invariant under an
-  // MLP redistribution, so the capacity objective is flat, and a modelled
-  // speed move inside the measured boot-to-boot noise floor is not worth a
-  // different configuration). The backend already says so per row via
-  // same_as_baseline; without it on the column head, identical columns read
-  // as a broken control rather than as the answer.
-  const baseLabel=(rows.filter(p=>p.is_base_split)[0]||{}).label||d.baseline;
-  const collapsed=rows.filter(p=>p.same_as_baseline&&!p.is_base_split);
+  // #215/#265 honest-collapse, generalized into a real fold (round 5). Stops
+  // legitimately resolve to numbers that are indistinguishable on THIS rig --
+  // the total weight bytes are invariant under an MLP redistribution, so the
+  // capacity objective is flat, and the base split is already this rig's
+  // strict decode optimum (#265), so a "different" stop often lands on the
+  // same measured-noise-floor answer. #215 only ANNOTATED the exact case
+  // (same_as_baseline) while still drawing every column separately, which
+  // read as "many options" when the finding is "these options coincide".
+  // Below, anything within LP_FOLD_THRESHOLD_PCT of the base split on EVERY
+  // priced figure is dropped from the table and named in the base column's
+  // header + a prose note instead -- a real fold, with the threshold stated
+  // where the reader can see it, not just a same/different flag.
+  const LP_FOLD_THRESHOLD_PCT = 1;
+  const baseRow=rows.filter(p=>p.is_base_split)[0]||rows[0];
+  const baseLabel=(baseRow||{}).label||d.baseline;
+  function withinFoldThreshold(p){
+    if(p===baseRow) return false;
+    if(p.same_as_baseline) return true;
+    const deltas=(p.metrics||[])
+      .map(m=>m.vs_baseline&&m.vs_baseline.pct).filter(pct=>pct!=null);
+    // Nothing comparable is not evidence of sameness -- only fold what was
+    // actually checked against the base on every figure that has a delta.
+    return deltas.length>0 && deltas.every(pct=>Math.abs(pct)<LP_FOLD_THRESHOLD_PCT);
+  }
+  const folded=rows.filter(withinFoldThreshold);
+  const foldedKeys=new Set(folded.map(p=>p.key));
+  const kept=rows.filter(p=>p===baseRow||!foldedKeys.has(p.key));
+  // The slider still lets you land on a folded stop directly (its ticks list
+  // every original step); when it does, the base column it folded into is
+  // what actually reads as "on" -- the numbers are the same numbers.
+  const curIsFolded=foldedKeys.has(cur);
+  const isOn=(p)=>p.key===cur||(curIsFolded&&p===baseRow);
   let h='<div class="lp-wrap"><table class="lp"><thead><tr><th></th>'
-    +rows.map(p=>'<th class="'+(p.key===cur?'on':'')+'" title="'
-      +esc(tip('lever_profile.'+p.key)
-        +(p.same_as_baseline&&!p.is_base_split
-          ? '\n\nResolves to the same split as ' + baseLabel + ' on this rig: '
-            + (p.selection_reason||'') : ''))+'">'+esc(p.label)
-      +(p.same_as_baseline&&!p.is_base_split
-        ? '<span class="lp-same">= '+esc(baseLabel)+'</span>' : '')
-      +'</th>').join('')
+    +kept.map(p=>{
+      const foldedHere=(p===baseRow)?folded:[];
+      return '<th class="'+(isOn(p)?'on':'')+'" title="'
+        +esc(tip('lever_profile.'+p.key)
+          +(foldedHere.length
+            ? '\n\nFolded in (within '+LP_FOLD_THRESHOLD_PCT+'% of '+baseLabel
+              +' on this rig): '+foldedHere.map(x=>x.label).join(', ')
+            : ''))+'">'+esc(p.label)
+        +(foldedHere.length
+          ? '<span class="lp-same">+'+foldedHere.length+' folded</span>' : '')
+        +'</th>';
+    }).join('')
     +'</tr></thead><tbody>';
   metricKeys.forEach(k=>{
     const first=(rows[0].metrics||[]).filter(m=>m.key===k)[0]||{};
-    const unit=first.unit||'';
-    let label=first.label||k;
+    // Round 5 nomenclature audit: the backend's "sessions" metric (label
+    // "sessions at the target context", unit "sessions") is max_running_
+    // requests capacity -- parallel request slots -- not a real session. The
+    // relabel happens here rather than in lever_profiles.py because that
+    // label/unit pair is shared with non-UI consumers (bench_factors.py,
+    // key_solver.py); only the displayed word changes, the metric key stays
+    // "sessions" so nothing server-side needs to move in lockstep.
+    const unit=(k==='sessions')?'parallel requests':(first.unit||'');
+    let label=(k==='sessions')?'parallel requests at the target context':(first.label||k);
     if(k==='sessions'&&d.session_target_context_tokens)
       label+=' ('+d.session_target_context_tokens.toLocaleString()+' tokens)';
     // The unit is only worth repeating when the label does not already carry
@@ -11749,9 +11942,9 @@ function renderLeverProfiles(){
     const uu=(unit&&label.indexOf(unit)<0)
       ?' <span class="muted">'+esc(unit)+'</span>':'';
     h+='<tr><td title="'+esc(first.basis||'')+'">'+esc(label)+uu+'</td>';
-    rows.forEach(p=>{
+    kept.forEach(p=>{
       const m=(p.metrics||[]).filter(x=>x.key===k)[0];
-      const on=(p.key===cur?' class="on"':'');
+      const on=(isOn(p)?' class="on"':'');
       if(!m||!m.available){
         h+='<td'+(on||' class="d-na"')+' title="'+esc((m&&m.reason)||'')
           +'">not computed</td>';
@@ -11761,24 +11954,29 @@ function renderLeverProfiles(){
     });
     h+='</tr>';
   });
-  h+='<tr><td>MLP split</td>'+rows.map(p=>'<td'+(p.key===cur?' class="on"':'')+'>'
+  h+='<tr><td>MLP split</td>'+kept.map(p=>'<td'+(isOn(p)?' class="on"':'')+'>'
     +(p.is_base_split?'<span class="muted">base</span>'
       :esc((p.mlp_vector||[]).join(',')))+'</td>').join('')+'</tr>';
   h+='</tbody></table></div>';
   h+='<div class="lp-note">Deltas are against <b>'+esc(d.baseline)
     +'</b>. Every figure is a planner run of that profile; a cell that says '
-    +'"not computed" names the missing input on hover.</div>';
-  // Say it in prose too, once, naming the stops. A reader who sees three
-  // identical columns must not have to hover a header to learn that the
-  // repetition is the finding.
-  if(collapsed.length)
-    h+='<div class="lp-note lp-collapse"><b>'
-      +collapsed.map(p=>esc(p.label)).join(', ')+'</b> '
-      +(collapsed.length===1?'shows':'show')+' the same numbers as <b>'
-      +esc(baseLabel)+'</b> because '+(collapsed.length===1?'it resolves':'they resolve')
-      +' to the same split on this rig &mdash; each was planned separately and '
+    +'"not computed" names the missing input on hover. Fold threshold: a stop '
+    +'within <b>&lt;'+LP_FOLD_THRESHOLD_PCT+'%</b> of '+esc(baseLabel)+' on '
+    +'every priced figure is folded into its column instead of drawn as a '
+    +'separate one.</div>';
+  // Say it in prose too, once, naming the stops. A reader who sees the same
+  // column standing in for several stops must not have to hover a header to
+  // learn that the repetition is the finding, not a missing option.
+  if(folded.length)
+    h+='<div class="lp-note lp-collapse">On this rig, <b>'
+      +folded.map(p=>esc(p.label)).join(', ')+'</b> '
+      +(folded.length===1?'falls':'fall')+' together with <b>'+esc(baseLabel)
+      +'</b> because '+(folded.length===1?'it resolves':'they resolve')
+      +' to the same split &mdash; the total weight bytes are invariant under '
+      +'an MLP redistribution, and the base split is already this rig&#39;s '
+      +'strict decode optimum (#265): each was planned separately and '
       +'landed on the same answer. That is the result, not a missing one: '
-      +esc(collapsed[0].selection_reason||'')
+      +esc(folded[0].selection_reason||'')
       +' What separates these stops further is a knob the offline model cannot '
       +'predict (KV-token ownership, <code>--rank-kv-ratio</code>) and a probe '
       +'of these cards&#39; real rates.</div>';
@@ -11809,12 +12007,17 @@ function renderLeverProfiles(){
   }
   const opts=(d.session_target_options||[]);
   if(opts.length){
-    h+='<div class="lp-note">sessions solved for <select id="lp_target" '
+    // "session_target_context" is the backend's own key for the assumed
+    // context PER PARALLEL REQUEST SLOT the capacity numbers are solved for
+    // -- the key stays as the API defines it, only the displayed word changes
+    // (round 5 nomenclature audit: this is max_running_requests capacity, not
+    // a real session).
+    h+='<div class="lp-note">parallel requests solved for <select id="lp_target" '
       +'style="width:auto;display:inline-block" onchange="refreshLeverProfiles()">'
       +opts.map(o=>'<option value="'+o+'"'
         +(o===d.session_target_context_tokens?' selected':'')+'>'
         +o.toLocaleString()+' tokens</option>').join('')
-      +'</select> per session</div>';
+      +'</select> per request</div>';
   }
   (d.caveats||[]).forEach(c=>{ h+='<div class="lp-note">'+esc(c)+'</div>'; });
   h+=cardProbeBar(d);
@@ -12183,30 +12386,107 @@ async function saveProfile(){
 async function loadProfiles() {
   window._profLoaded = true;
   const r = await fetch('/api/cards'); const d = await r.json();
-  $('mx_cards').innerHTML = '<b>library:</b> ' +
-    d.profiles.map(p=>'<span class="pill">'+esc(p.name)+' '+Math.round(p.total_mib/1024)+'GB</span>').join('');
+  window._mxCardLib = d.profiles || [];
+  renderMxRigBuilders();
 }
 
-function parseMxModels() {
-  return $('mx_models').value.split('\n').map(s=>s.trim()).filter(Boolean).map(line=>{
-    const i = line.indexOf('=');
-    return i>0 ? {label:line.slice(0,i).trim(), model:line.slice(i+1).trim()}
-               : {model:line};
-  });
+// Round 5 rebuild (#2b): models and rigs are ticked/composed, never typed.
+// Models are the SAME discovered-checkpoint list the wizard's model dropdown
+// already loads (loadModels() / window._models); rigs are "this rig (live)"
+// plus any number composed from the GPU-model card library (/api/cards --
+// the same library the old free-text rig line named cards from by hand).
+window._mxLive = true;
+window._mxRigs = [];   // [{cardName: count, ...}, ...] -- one object per hypothetical rig
+
+function mxToggleLive(){
+  window._mxLive = !window._mxLive;
+  const el=$('mx_rig_live'); if(el) el.classList.toggle('on', window._mxLive);
 }
-function parseMxRigs() {
-  return $('mx_rigs').value.split('\n').map(s=>s.trim()).filter(Boolean).map(line=>{
-    if (line.toLowerCase()==='live') return {name:'live', source:'nvml'};
-    const i = line.indexOf('=');
-    const name = i>0 ? line.slice(0,i).trim() : line;
-    const rest = i>0 ? line.slice(i+1) : line;
-    return {name, profiles: rest.split(',').map(s=>s.trim()).filter(Boolean)};
-  });
+
+async function loadMxModelChips(){
+  const box=$('mx_model_chips'); if(!box) return;
+  if(!window._models){
+    try{
+      const r=await fetch('/api/models'); const d=await r.json();
+      if(d.ok) window._models=d.models;
+    }catch(e){ /* rendered as empty below */ }
+  }
+  const models=window._models||[];
+  if(!models.length){
+    box.className='muted';
+    box.innerHTML='no checkpoints discovered under the model roots &mdash; '
+      +'add one under Models first.';
+    return;
+  }
+  box.className='chiplist';
+  box.innerHTML=models.map((m,i)=>
+    '<button type="button" class="mxchip" data-mxmodel="'+i+'" '
+    +'onclick="mxToggleModel('+i+')" title="'+esc(m.path||'')+'">'
+    +esc(m.name)+'</button>').join('');
+}
+function mxToggleModel(i){
+  const el=document.querySelector('[data-mxmodel="'+i+'"]');
+  if(el) el.classList.toggle('on');
+}
+function mxCheckedModels(){
+  const models=window._models||[];
+  return Array.from(document.querySelectorAll('.mxchip.on[data-mxmodel]')).map(el=>{
+    const m=models[+el.getAttribute('data-mxmodel')];
+    return m ? {label:m.name, model:m.path} : null;
+  }).filter(Boolean);
+}
+function mxAddRig(){ window._mxRigs.push({}); renderMxRigBuilders(); }
+function mxRemoveRig(ri){ window._mxRigs.splice(ri,1); renderMxRigBuilders(); }
+function mxBump(ri, name, delta){
+  const rig=window._mxRigs[ri]; if(!rig) return;
+  rig[name]=Math.max(0,(rig[name]||0)+delta);
+  renderMxRigBuilders();
+}
+function renderMxRigBuilders(){
+  const box=$('mx_rig_builders'); if(!box) return;
+  const lib=window._mxCardLib||[];
+  if(!lib.length){
+    box.innerHTML='<span class="muted">no card-model library entries yet '
+      +'&mdash; it fills in from detected hardware and any measured '
+      +'per-card power run (Data tab).</span>';
+    return;
+  }
+  box.innerHTML=(window._mxRigs||[]).map((rig,ri)=>{
+    const total=Object.values(rig).reduce((a,b)=>a+b,0);
+    const chips=lib.map(c=>{
+      const n=rig[c.name]||0;
+      return '<span class="mxcount'+(n?'':' zero')+'">'
+        +'<button type="button" onclick="mxBump('+ri+',\''+esc(c.name)+'\',-1)">&minus;</button> '
+        +esc(c.name)+' &times;'+n
+        +' <button type="button" onclick="mxBump('+ri+',\''+esc(c.name)+'\',1)">+</button></span>';
+    }).join('');
+    return '<div class="mx-rig-row"><b>rig '+(ri+1)+'</b> '
+      +'<span class="muted">('+total+' card'+(total===1?'':'s')+')</span><br>'
+      +chips
+      +' <button class="mini secondary" onclick="mxRemoveRig('+ri+')">remove</button></div>';
+  }).join('');
 }
 
 async function doMatrix() {
+  const models=mxCheckedModels();
+  if(!models.length){
+    $('mx_out').innerHTML='<p class="reasons">tick at least one discovered model above.</p>';
+    return;
+  }
+  const rigs=[];
+  if(window._mxLive) rigs.push({name:'live', source:'nvml'});
+  (window._mxRigs||[]).forEach((rig,ri)=>{
+    const profiles=[];
+    Object.keys(rig).forEach(name=>{ for(let k=0;k<rig[name];k++) profiles.push(name); });
+    if(profiles.length) rigs.push({name:'rig '+(ri+1), profiles});
+  });
+  if(!rigs.length){
+    $('mx_out').innerHTML='<p class="reasons">tick "this rig (live)" or add at least one '
+      +'card to a hypothetical rig.</p>';
+    return;
+  }
   $('mx_out').innerHTML = 'planning…';
-  const body = {models: parseMxModels(), rigs: parseMxRigs()};
+  const body = {models, rigs};
   const r = await fetch('/api/matrix', {method:'POST', body: JSON.stringify(body)});
   const d = await r.json();
   if (!d.ok) { $('mx_out').innerHTML = '<p class="reasons">'+esc(d.error)+'</p>'; return; }
@@ -12783,21 +13063,58 @@ async function saveShot(d) {
     loadShots();
   } catch(e) {}
 }
+// Round 5: was a single slider over the flat shot list, so "which model/
+// quant" and "which run" were one axis -- picking a shot meant scrubbing
+// past every OTHER model's saved runs first. Grouped into two dropdowns
+// instead: model+quant narrows the list, run picks a specific saved shot
+// within it (newest first). No slider.
+function _histKey(s){ return (s.model||'(unnamed model)')+' — '+(s.quant||'(no quant)'); }
 async function loadShots() {
   try {
     const r = await fetch('/api/quality_shots'); const d = await r.json();
     window._shots = (d.ok && d.shots) ? d.shots : [];
-    const sl = $('q_slider'); sl.max = Math.max(0, window._shots.length-1);
-    sl.value = sl.max;
+  } catch(e) { window._shots = []; }
+  buildHistGroups();
+}
+function buildHistGroups(){
+  const shots = window._shots || [];
+  const groups = {};
+  shots.forEach((s,i) => { (groups[_histKey(s)] = groups[_histKey(s)] || []).push(i); });
+  window._histGroups = groups;
+  const sel = $('q_hist_mq'); if (!sel) return;
+  const keys = Object.keys(groups).sort();
+  if (!keys.length) {
+    sel.innerHTML = '<option value="">no saved shots</option>';
+    setHTML($('q_hist_run'), '');
     showShot();
-  } catch(e) {}
+    return;
+  }
+  const prev = sel.value;
+  sel.innerHTML = keys.map(k =>
+    '<option value="'+esc(k)+'">'+esc(k)+' ('+groups[k].length+')</option>').join('');
+  sel.value = keys.includes(prev) ? prev : keys[keys.length-1];
+  onHistModelChange();
+}
+function onHistModelChange(){
+  const sel = $('q_hist_mq'), runSel = $('q_hist_run');
+  if (!sel || !runSel) return;
+  const shots = window._shots || [];
+  const idxs = (window._histGroups||{})[sel.value] || [];
+  const ordered = idxs.slice().reverse();   // newest run first
+  runSel.innerHTML = ordered.map(i =>
+    '<option value="'+i+'">'+esc(shots[i].ts||('run '+(i+1)))
+    +' — '+esc(shots[i].verdict||'?')+'</option>').join('');
+  showShot();
 }
 function showShot() {
   const shots = window._shots || [];
-  if (!shots.length) { $('q_shot').innerHTML = 'no saved shots.'; $('q_slide_lbl').textContent=''; return; }
-  const i = Math.min(parseInt($('q_slider').value)||0, shots.length-1);
+  const runSel = $('q_hist_run');
+  if (!shots.length || !runSel || runSel.value==='') {
+    $('q_shot').innerHTML = 'no saved shots.'; return;
+  }
+  const i = parseInt(runSel.value);
   const s = shots[i];
-  $('q_slide_lbl').textContent = '('+(i+1)+'/'+shots.length+')';
+  if (!s) { $('q_shot').innerHTML = 'no saved shots.'; return; }
   const tk = s.tokens||{};
   let h = '<div class="legend">'+esc(s.ts||'')+' — '+esc(s.model||'?')+' '+esc(s.quant||'')+'</div>';
   h += '<div class="verdict '+verdictClass(s.verdict)+'" style="font-size:.8rem">'+esc(s.verdict||'?')+'</div>';

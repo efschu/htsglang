@@ -649,7 +649,13 @@ class TestWizardInIndex(CustomTestCase):
     def test_the_view_is_a_direct_child_of_body_so_it_keeps_the_page_gutter(self):
         h = webui.INDEX_HTML
         self.assertIn('<div id="view_wizard" style="display:none">', h)
-        self.assertIn('body > .hdr, body > .tabs, body > div[id^="view_"]', h)
+        # Round 5: #loadbar joined this selector too (it was previously
+        # missing and rendered full-bleed, inconsistent with every other
+        # top-level block) -- the wizard view's own membership is unchanged.
+        self.assertIn(
+            'body > .hdr, body > .tabs, body > #loadbar, body > div[id^="view_"]',
+            h,
+        )
 
     def test_the_tab_is_in_the_switch(self):
         h = webui.INDEX_HTML
