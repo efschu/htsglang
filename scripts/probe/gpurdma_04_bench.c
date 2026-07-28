@@ -439,7 +439,15 @@ int main(int argc, char **argv)
                 struct ibv_sge sg; struct ibv_send_wr wr, *bad;
                 if (sz > 0) {
                     memset(&sg, 0, sizeof(sg));
-                    sg.addr = gdr ? 0 : (uint64_t)(uintptr_t)host_pay;
+                    /* LOKALE Adresse der Nutzlast-MR. Nicht "gdr ? 0 : host":
+                     * der Modus gdr sagt nur, dass die GEGENSEITE eine GPU-MR
+                     * haelt. Liegt die eigene Nutzlast im Host (Arm
+                     * gpu_is_server: Client laeuft mit cuda-ord = -1, also
+                     * ibv_reg_mr auf host_pay), waere addr=0 zusammen mit dem
+                     * Host-lkey eine ungueltige lokale Adresse -> "local
+                     * protection error". pay_addr ist genau die richtige
+                     * Groesse: 0 (iova) fuer die dmabuf-MR, host_pay sonst. */
+                    sg.addr = pay_addr;
                     sg.length = sz; sg.lkey = mr_pay->lkey;
                     memset(&wr, 0, sizeof(wr));
                     wr.wr_id = 1; wr.sg_list = &sg; wr.num_sge = 1;
