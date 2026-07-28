@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -257,10 +258,7 @@ class LaneRowParallelShell(nn.Module):
         # is never optional (without it the output is a partial product).
         parts = self._lane_parts
         pieces = local_row_split(input_, self._lane_in_sizes)
-        outs = [
-            p.quant_method.apply(p, piece, None)
-            for p, piece in zip(parts, pieces)
-        ]
+        outs = [p.quant_method.apply(p, piece, None) for p, piece in zip(parts, pieces)]
         out = local_row_reduce(outs)
         bias = parts[0].bias
         if bias is not None and not self.skip_bias_add:
@@ -636,9 +634,10 @@ def _load_complement_model(
 
     fams = {name: list(vec) for name, vec in plan.fast_family_ratios}
     t0 = time.perf_counter()
-    with scoped_tp_partition_ratios(
-        list(plan.fast_ratio), fams or None
-    ), lane_geometry_override(plan.fast_size, fast_rank):
+    with (
+        scoped_tp_partition_ratios(list(plan.fast_ratio), fams or None),
+        lane_geometry_override(plan.fast_size, fast_rank),
+    ):
         loader = get_model_loader(
             load_config=lane_runner.load_config,
             model_config=lane_runner.model_config,
@@ -794,8 +793,7 @@ def build_lane_model(lane_runner, kind: str = "target") -> nn.Module:
     plan: NestedGroupPlan = lane_runner.dual_group_plan
     if host_runner is None or plan is None:
         raise ValueError(
-            "dual-group lane runner needs dual_group_host_runner and "
-            "dual_group_plan."
+            "dual-group lane runner needs dual_group_host_runner and dual_group_plan."
         )
 
     free_before = torch.cuda.mem_get_info(lane_runner.gpu_id)[0]
@@ -885,9 +883,7 @@ def build_lane_model(lane_runner, kind: str = "target") -> nn.Module:
             "lazy/shelled",
         ),
     )
-    logger.info(
-        "%s", format_vram_posts(posts, f"cuda:{lane_runner.gpu_id} ({kind})")
-    )
+    logger.info("%s", format_vram_posts(posts, f"cuda:{lane_runner.gpu_id} ({kind})"))
     # Keep references so the parts stay alive (shells hold them too, via
     # plain tuples that named_parameters() does not walk).
     lane_runner.dual_group_part_models = part_models
@@ -921,8 +917,7 @@ def resolve_speed_dial(server_args) -> Tuple[int, int]:
         return budget, requests
     if not 0.0 <= float(dial) <= 1.0:
         raise ValueError(
-            "--dual-group-lane-speed-dial must be in [0.0, 1.0], got "
-            f"{dial!r}."
+            f"--dual-group-lane-speed-dial must be in [0.0, 1.0], got {dial!r}."
         )
     dial = float(dial)
     # Minimum end of the scale: one session, one eighth of the pool.
@@ -1008,7 +1003,9 @@ def _lane_server_args_view(server_args):
     # whole chunks, not fine-grained batch mixes. Tiers stay within 2x of
     # each other, so tier padding costs at most 2x on the smallest prompts.
     prefill_cfg = view.cuda_graph_config.prefill
-    keep = [t for t in prefill_cfg.bs if t in (16, 32, 64, 128, 256, 512, 1024, 1536, 2048)]
+    keep = [
+        t for t in prefill_cfg.bs if t in (16, 32, 64, 128, 256, 512, 1024, 1536, 2048)
+    ]
     if keep:
         prefill_cfg.bs = keep
         prefill_cfg.max_bs = max(keep)
@@ -1090,6 +1087,14 @@ class DualGroupLane:
                     "output_ids": [],
                     "prefill_ms": None,
                     "decode_ms": [],
+                    # Per-job overrides, both absent by default so the lane
+                    # behaves exactly as the server flags say. They exist so
+                    # the coherence gate can record its reference side and
+                    # its speculative side from ONE boot -- same weights,
+                    # same pools, same captures. Comparing two boots would
+                    # put boot-to-boot variance inside the gate.
+                    "spec": job.get("spec"),
+                    "verify": job.get("verify"),
                 }
             )
         # PD priority (addendum 5): work has arrived for the protected class.
@@ -1122,9 +1127,7 @@ class DualGroupLane:
             "weight_added_mib": getattr(
                 self.runner, "dual_group_lane_weight_added_mib", None
             ),
-            "max_total_num_tokens": getattr(
-                self.runner, "max_total_num_tokens", None
-            ),
+            "max_total_num_tokens": getattr(self.runner, "max_total_num_tokens", None),
             "concurrent": self.concurrent,
             "spec": (
                 None
@@ -1171,9 +1174,7 @@ class DualGroupLane:
         # rank-0-late group stall rather than a slowdown. Setting this to 0
         # makes both classes equal-priority and isolates that question.
         high = int(os.environ.get("SGLANG_DUAL_GROUP_LANE_STREAM_PRIORITY", high))
-        self.stream = torch.cuda.Stream(
-            device=self.runner.gpu_id, priority=high
-        )
+        self.stream = torch.cuda.Stream(device=self.runner.gpu_id, priority=high)
         self._thread = threading.Thread(
             target=self._worker_loop,
             name=f"dual-group-lane-{self.lane_id}",
@@ -1219,8 +1220,7 @@ class DualGroupLane:
                             self._step_locked_scope()
                     except Exception:
                         logger.exception(
-                            "dual-group lane %d step failed; dropping the "
-                            "active job.",
+                            "dual-group lane %d step failed; dropping the active job.",
                             self.lane_id,
                         )
                         self.drop_active()
@@ -1236,13 +1236,12 @@ class DualGroupLane:
         with torch.no_grad():
             if job["prefill_ms"] is None:
                 self._prefill(job)
-            elif self.spec_active:
+            elif self._job_spec_on(job):
                 self._spec_step(job)
             else:
                 self._decode_step(job)
-        if (
-            len(job["output_ids"]) >= job["max_new_tokens"]
-            or (job["output_ids"] and job["output_ids"][-1] < 0)
+        if len(job["output_ids"]) >= job["max_new_tokens"] or (
+            job["output_ids"] and job["output_ids"][-1] < 0
         ):
             self._finish(job)
 
@@ -1275,7 +1274,7 @@ class DualGroupLane:
         with self._lane_runtime_scope(), torch.no_grad():
             if job["prefill_ms"] is None:
                 self._prefill(job)
-            elif self.spec_active:
+            elif self._job_spec_on(job):
                 # Same three-way dispatch as the concurrent worker's
                 # ``_step_locked_scope``. Round 1 wired the speculative round
                 # into the worker path only, so a SERIAL lane assembled the
@@ -1284,9 +1283,8 @@ class DualGroupLane:
                 self._spec_step(job)
             else:
                 self._decode_step(job)
-        if (
-            len(job["output_ids"]) >= job["max_new_tokens"]
-            or (job["output_ids"] and job["output_ids"][-1] < 0)
+        if len(job["output_ids"]) >= job["max_new_tokens"] or (
+            job["output_ids"] and job["output_ids"][-1] < 0
         ):
             self._finish(job)
         return True
@@ -1339,6 +1337,16 @@ class DualGroupLane:
     @property
     def spec_active(self) -> bool:
         return self.draft_runner is not None
+
+    def _job_spec_on(self, job) -> bool:
+        """Speculation for THIS job: the server flag, unless the job says no.
+
+        ``job["spec"] is None`` -- the normal case -- keeps the flag's answer,
+        so nothing about the default path depends on this.
+        """
+        if not self.spec_active:
+            return False
+        return job.get("spec") is not False
 
     def _draft_forward(self, batch_d, hidden_states):
         """One NEXTN head forward on the lane's draft runner.
@@ -1439,6 +1447,7 @@ class DualGroupLane:
         fb = ForwardBatch.init_new(batch, runner)
         if capture_mode is not None:
             fb.capture_hidden_mode = capture_mode
+        self._last_fb = fb
         out = runner.forward(fb).logits_output
         if self.stream is None:
             torch.cuda.synchronize(runner.gpu_id)
@@ -1487,6 +1496,208 @@ class DualGroupLane:
         # any time spent waiting for the GIL between launches.
         return next_token_ids, start_ev.elapsed_time(end_ev)
 
+    # -- one-shot row/position diagnosis (env-gated, off by default) -------
+
+    def _dbg_on(self) -> bool:
+        return bool(os.environ.get("SGLANG_LANE_SPEC_DEBUG"))
+
+    def _dbg(self, tag: str, payload: dict) -> None:
+        import json
+
+        logger.info("[lane-spec-dbg] %s %s", tag, json.dumps(payload, default=str))
+
+    def _dbg_prefill_rows(self, out, input_ids):
+        """Does row i of ``hidden_states`` predict token i+1?
+
+        The prompt extend is the uncontested case: prefix empty, one request,
+        every row a real position. Teacher forcing on prose must hit far above
+        chance, and the LAST row must reproduce ``next_token_logits`` exactly
+        -- the processor derives that row from the very same tensor. Both
+        checks together separate "wrong tensor / wrong lm_head path" from
+        "right tensor, wrong row".
+        """
+        try:
+            hs = out.hidden_states
+            # Only the tail: full-vocabulary logits for every prompt row are a
+            # multi-GiB allocation on this vocabulary and OOM the lane budget.
+            tail = min(9, hs.shape[0])
+            preds = self._candidate_logits(hs[-tail:]).argmax(dim=-1)
+            tgt = torch.tensor(list(input_ids[-tail + 1 :]), device=preds.device)
+            n = min(len(tgt), preds.shape[0] - 1)
+            match = int((preds[:n] == tgt[:n]).sum().item())
+            self._dbg(
+                "prefill",
+                {
+                    "hidden_rows": int(hs.shape[0]),
+                    "n_input_ids": len(input_ids),
+                    "teacher_forcing_match_tail": f"{match}/{n}",
+                    "row_last_argmax": int(preds[-1].item()),
+                    "next_token_logits_argmax": int(
+                        out.next_token_logits.argmax(dim=-1)[0].item()
+                    ),
+                    "next_token_logits_shape": list(out.next_token_logits.shape),
+                    "preds_tail": [int(x) for x in preds[-5:].tolist()],
+                    "input_tail": list(input_ids[-5:]),
+                },
+            )
+        except Exception as exc:  # diagnosis must never take the lane down
+            self._dbg("prefill_failed", {"error": repr(exc)})
+
+    def _dbg_verify_rows(self, job, cand, proposals, out, preds, n_cached):
+        try:
+            fb = getattr(self, "_last_fb", None)
+
+            def _l(t, k=8):
+                if t is None:
+                    return None
+                if isinstance(t, torch.Tensor):
+                    return [int(x) for x in t.flatten()[:k].tolist()]
+                return list(t)[:k]
+
+            req = job["_req"]
+            self._dbg(
+                "verify",
+                {
+                    "round": self._dbg_round,
+                    "n_cached": n_cached,
+                    "cand": cand,
+                    "proposals": proposals,
+                    "hidden_rows": int(out.hidden_states.shape[0]),
+                    "preds": [int(x) for x in preds.tolist()],
+                    "next_token_logits_argmax": int(
+                        out.next_token_logits.argmax(dim=-1)[0].item()
+                    ),
+                    "batch_input_ids": _l(job["_batch"].input_ids),
+                    "extend_start_loc": _l(getattr(fb, "extend_start_loc", None)),
+                    "extend_prefix_lens": _l(getattr(fb, "extend_prefix_lens", None)),
+                    "extend_seq_lens": _l(getattr(fb, "extend_seq_lens", None)),
+                    "seq_lens": _l(getattr(fb, "seq_lens", None)),
+                    "positions": _l(getattr(fb, "positions", None)),
+                    "out_cache_loc": _l(getattr(fb, "out_cache_loc", None)),
+                    "req_kv_committed_len": getattr(req, "kv_committed_len", None),
+                    "req_already_computed": getattr(req, "already_computed", None),
+                    "req_mamba_pool_idx": str(getattr(req, "mamba_pool_idx", None)),
+                    "req_mamba_needs_clear": getattr(req, "mamba_needs_clear", None),
+                    "prefix_len": int(len(req.prefix_indices)),
+                },
+            )
+        except Exception as exc:
+            self._dbg("verify_failed", {"error": repr(exc)})
+
+    def _dbg_single_token_probe(self, job, n_cached, clear_state=False):
+        """A verify extend of LENGTH ONE at the same position.
+
+        This is exactly what a plain decode step would compute, expressed in
+        the same extend machinery the verify uses. If its prediction matches
+        the no-spec reference, extend-with-prefix carries the cached context
+        correctly and the fault is specific to MULTI-token verify rows; if it
+        does not, the fault is in the extend-with-prefix path itself (prefix
+        KV or recurrent state), independent of speculation.
+
+        Diagnosis only: it advances the target's recurrent state by one token,
+        which is not rewindable, so the round that follows it is polluted by
+        construction. Runs once, under the debug env var.
+        """
+        from array import array
+
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        batch = job["_batch"]
+        req = job["_req"]
+        idx = job["_req_pool_idx"]
+        one = [int(job["_next"][0].item())]
+        req.full_untruncated_fill_ids = array(
+            "q", list(req.origin_input_ids) + job["output_ids"][:-1] + one
+        )
+        req.prefix_indices = batch.req_to_token_pool.req_to_token[idx, :n_cached]
+        req.set_extend_range(n_cached, n_cached + 1)
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        if clear_state:
+            # Forces the deferred zeroing of this request's recurrent slot in
+            # prepare_for_extend -- the same mechanism a freshly allocated
+            # slot uses.
+            req.mamba_needs_clear = True
+        batch.prepare_for_extend()
+        if (
+            batch.input_ids is None
+            and getattr(batch, "prefill_input_ids_cpu", None) is not None
+        ):
+            batch.input_ids = batch.prefill_input_ids_cpu.to(
+                batch.device, non_blocking=True
+            )
+            batch.prefill_input_ids_cpu = None
+        out, _ = self._timed_forward_raw(batch, CaptureHiddenMode.FULL)
+        p = self._candidate_logits(out.hidden_states).argmax(dim=-1)
+        self._dbg(
+            "probe_len1",
+            {
+                "n_cached": n_cached,
+                "token_in": one,
+                "hidden_rows": int(out.hidden_states.shape[0]),
+                "pred": int(p[0].item()),
+                "next_token_logits_argmax": int(
+                    out.next_token_logits.argmax(dim=-1)[0].item()
+                ),
+                "mamba_cleared": bool(clear_state),
+            },
+        )
+        self._dbg_rollback_one(job, n_cached)
+
+    def _dbg_rollback_one(self, job, n_cached):
+        """Give one written token slot back and restore the length counters."""
+        batch = job["_batch"]
+        req = job["_req"]
+        idx = job["_req_pool_idx"]
+        surplus = batch.req_to_token_pool.req_to_token[idx, n_cached : n_cached + 1]
+        batch.token_to_kv_pool_allocator.free(surplus)
+        req.kv_committed_len = n_cached
+        req.kv_allocated_len = n_cached
+        req.already_computed = n_cached
+
+    def _dbg_decode_probe(self, job, n_cached):
+        """One DECODE step from the same state the verify starts from.
+
+        The no-spec lane decodes, the verify extends. If these two disagree on
+        the very same state and the very same input token, the disagreement is
+        the bug -- and it is not a speculation bug at all, it is the
+        continuation path.
+        """
+        batch = job["_batch"]
+        saved = batch.input_ids
+        batch.input_ids = job["_next"].to(torch.int64)
+        batch.prepare_for_decode()
+        out, _ = self._timed_forward_raw(batch)
+        self._dbg(
+            "probe_decode",
+            {
+                "n_cached": n_cached,
+                "token_in": [int(job["_next"][0].item())],
+                "next_token_logits_argmax": int(
+                    out.next_token_logits.argmax(dim=-1)[0].item()
+                ),
+            },
+        )
+        batch.input_ids = saved
+        self._dbg_rollback_one(job, n_cached)
+
+    def _dbg_state_probes(self, job, n_cached):
+        """The three numbers that separate the candidates, in one round.
+
+        1. DECODE from the clean post-prefill state -- the path the no-spec
+           lane uses, i.e. the known-good continuation.
+        2. Continued EXTEND with the recurrent state deliberately ZEROED.
+        3. Continued EXTEND with whatever state is there.
+
+        If 2 and 3 agree, the continued extend never read the stored recurrent
+        state, and the reference in step 1 is not needed to say so.
+
+        Every probe advances state that cannot be rewound, so the round that
+        follows them is meaningless by construction. Debug only.
+        """
+        self._dbg_decode_probe(job, n_cached)
+        self._dbg_single_token_probe(job, n_cached, clear_state=True)
+        self._dbg_single_token_probe(job, n_cached, clear_state=False)
+
     def _candidate_logits(self, hidden_states):
         """Full-vocabulary logits for EVERY row of ``hidden_states``.
 
@@ -1524,6 +1735,67 @@ class DualGroupLane:
             logits = softcap * torch.tanh(logits / softcap)
         return logits
 
+    def _verify_by_decode(self, job, proposals, n_cached):
+        """Verify by consuming the candidates one DECODE at a time.
+
+        THE DEFAULT, and the only strategy that computes the right tokens on
+        this target (see ``_verify`` for why the batched one does not). Same
+        accept rule, same emitted tokens; only the forward mode differs.
+
+        It buys NO latency: the number of forwards equals the number of
+        emitted tokens, which is exactly what plain decoding costs. So this
+        is a CORRECTNESS bridge, not the finished feature -- speculation on
+        the lane cannot pay until the verify is a single forward again, and
+        the way to get there is ``ForwardMode.TARGET_VERIFY`` rather than a
+        hand-rolled extend.
+
+        Two properties come for free and are worth naming: nothing beyond the
+        accepted prefix is ever written, so there is no KV surplus to roll
+        back, and the target's recurrent state advances by exactly the
+        emitted tokens instead of by the whole rejected candidate block --
+        which is precisely the defect the batched path has.
+        """
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+        batch = job["_batch"]
+        cand = [int(job["_next"][0].item())] + list(proposals)
+        total_ms = 0.0
+        n_accept = 0
+        preds: List[int] = []
+        hidden = None
+        for i, tok in enumerate(cand):
+            batch.input_ids = torch.tensor(
+                [tok], dtype=torch.int64, device=batch.device
+            )
+            batch.prepare_for_decode()
+            out, ms = self._timed_forward_raw(batch, CaptureHiddenMode.LAST)
+            total_ms += ms
+            preds.append(int(out.next_token_logits.argmax(dim=-1)[0].item()))
+            hidden = out.hidden_states[-1:]
+            if i >= len(proposals) or preds[i] != proposals[i]:
+                break
+            n_accept += 1
+
+        emitted = list(proposals[:n_accept]) + [preds[n_accept]]
+        job["_kv_len"] = n_cached + n_accept + 1
+        job["_hidden"] = hidden
+        job["_next"] = torch.tensor(
+            [preds[n_accept]], dtype=torch.int64, device=batch.device
+        )
+        return emitted, n_accept, total_ms
+
+    def _verify_mode(self, job) -> str:
+        """Which verify strategy this round uses.
+
+        ``seqdecode`` unless something explicitly asks for ``extend``. The
+        default is the slow-but-correct one on purpose -- see ``_verify``.
+        """
+        return (
+            job.get("verify")
+            or os.environ.get("SGLANG_LANE_SPEC_VERIFY")
+            or "seqdecode"
+        )
+
     def _verify(self, job, proposals):
         """One verify forward of the LANE TARGET over [last, *proposals].
 
@@ -1533,6 +1805,29 @@ class DualGroupLane:
         argmax there becomes the next token -- so a round always yields at
         least one token, which is what makes speculation free of correctness
         risk under greedy sampling.
+
+        NOT THE DEFAULT, and the reason is a property of this target rather
+        than of the arithmetic above. Verifying K+1 candidates in ONE
+        continued extend is sound for a pure-attention model, where rolling
+        back a rejected candidate means freeing its KV slot -- KV is
+        addressed per position. A hybrid GDN target also carries a RECURRENT
+        state (conv window + SSM), and one extend advances that state over
+        every candidate, accepted or not. There is no slot to free: the state
+        is a single running value per request. So from the first rejection
+        on, the KV says "n accepted tokens" and the recurrent state says "all
+        K+1", and the two disagree for the rest of the request. Measured: the
+        chain tracks its own no-spec continuation for three rounds and then
+        walks away from it (first divergence at index 4, gate below the
+        established noise floor).
+
+        The codebase already owns the missing piece -- ``MambaPool.
+        SpeculativeState`` keeps ``intermediate_ssm`` and
+        ``intermediate_conv_window`` per draft-token step so the state can be
+        restored to the accepted prefix -- but only ``ForwardMode.
+        TARGET_VERIFY`` reaches it (see ``GDNAttnBackend``'s
+        ``if is_target_verify:`` arm). A hand-rolled EXTEND bypasses it by
+        construction. Making the lane build a real verify input is the work
+        that turns speculation here from correct-but-slow into useful.
         """
         from array import array
 
@@ -1543,6 +1838,13 @@ class DualGroupLane:
         idx = job["_req_pool_idx"]
         n_cached = job["_kv_len"]
         cand = [int(job["_next"][0].item())] + list(proposals)
+
+        self._dbg_round = getattr(self, "_dbg_round", 0) + 1
+        if self._dbg_on() and self._dbg_round == 1:
+            self._dbg_state_probes(job, n_cached)
+
+        if self._verify_mode(job) == "seqdecode":
+            return self._verify_by_decode(job, proposals, n_cached)
 
         req.full_untruncated_fill_ids = array(
             "q", list(req.origin_input_ids) + job["output_ids"][:-1] + cand
@@ -1579,6 +1881,9 @@ class DualGroupLane:
         # are one lm_head application away.
         preds = self._candidate_logits(out.hidden_states).argmax(dim=-1)
 
+        if self._dbg_on() and self._dbg_round <= 2:
+            self._dbg_verify_rows(job, cand, proposals, out, preds, n_cached)
+
         n_accept = 0
         for i, prop in enumerate(proposals):
             if int(preds[i].item()) != prop:
@@ -1610,7 +1915,7 @@ class DualGroupLane:
                 batch.device, non_blocking=True
             )
             batch.prefill_input_ids_cpu = None
-        if self.spec_active:
+        if self._job_spec_on(job):
             # Speculation needs the target's hidden states: the head's input
             # is the target's hidden at the position it continues from.
             from sglang.srt.model_executor.forward_batch_info import (
@@ -1619,6 +1924,8 @@ class DualGroupLane:
 
             out, ms = self._timed_forward_raw(batch, CaptureHiddenMode.FULL)
             next_token_ids = out.next_token_logits.argmax(dim=-1)
+            if self._dbg_on():
+                self._dbg_prefill_rows(out, job["input_ids"])
             job["_hidden"] = out.hidden_states[-1:]
             job["_kv_len"] = len(job["input_ids"])
             # Prime the head's own KV over the same prompt, using the
@@ -1634,6 +1941,21 @@ class DualGroupLane:
                     batch_d.device, non_blocking=True
                 )
                 batch_d.prefill_input_ids_cpu = None
+            # The head's input is SHIFTED one position left against the
+            # target's: an MTP head at row i consumes the target's hidden
+            # state of position i together with the token at position i+1,
+            # and predicts position i+2. The same construction as
+            # ``EAGLEWorker._draft_extend_for_prefill``. Feeding the prompt
+            # unshifted primes every row of the head's KV against the wrong
+            # hidden state -- it costs no correctness under greedy verify
+            # (a bad proposal is simply rejected) but it depresses the accept
+            # length, which is the only thing speculation buys.
+            batch_d.input_ids = torch.cat(
+                (
+                    batch_d.input_ids[1:],
+                    next_token_ids.to(batch_d.input_ids.dtype).reshape(1),
+                )
+            )
             self._draft_forward(batch_d, out.hidden_states)
             job["_batch_d"] = batch_d
             # The head's OWN allocated token count. It is not the target's:
@@ -1796,6 +2118,8 @@ class DualGroupLane:
         accepts = job.get("_accept") or []
         result = {
             "input_len": len(job["input_ids"]),
+            "spec_mode": self._job_spec_on(job),
+            "verify_mode": self._verify_mode(job) if accepts else None,
             "spec_rounds": len(accepts) or None,
             "accept_len_mean": (
                 round(sum(accepts) / len(accepts), 3) if accepts else None
@@ -2065,8 +2389,14 @@ def build_dual_group_lanes(scheduler) -> List[DualGroupLane]:
     scope_lane_id = lane_id if concurrent else None
     with lane_scope(scope_lane_id, lane_args):
         return _build_lane_under_scope(
-            scheduler, server_args, lane_args, plan, lane_id, host_runner,
-            concurrent, lane_draft_mib,
+            scheduler,
+            server_args,
+            lane_args,
+            plan,
+            lane_id,
+            host_runner,
+            concurrent,
+            lane_draft_mib,
         )
 
 
@@ -2110,7 +2440,12 @@ def _serving_draft_runner(scheduler):
 
 
 def _build_lane_draft_runner(
-    scheduler, server_args, lane_args, plan, lane_id, lane_target_runner,
+    scheduler,
+    server_args,
+    lane_args,
+    plan,
+    lane_id,
+    lane_target_runner,
     draft_budget_mib,
 ):
     """Bring up the lane's NEXTN head as a second lane runner (#274).
@@ -2286,8 +2621,14 @@ def _finish_lane_draft_runner_scoped(draft_runner, lane_id):
 
 
 def _build_lane_under_scope(
-    scheduler, server_args, lane_args, plan, lane_id, host_runner,
-    concurrent=False, lane_draft_mib=0,
+    scheduler,
+    server_args,
+    lane_args,
+    plan,
+    lane_id,
+    host_runner,
+    concurrent=False,
+    lane_draft_mib=0,
 ) -> List[DualGroupLane]:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -2329,7 +2670,12 @@ def _build_lane_under_scope(
         draft_runner = None
         if getattr(server_args, "dual_group_lane_spec", False):
             draft_runner = _build_lane_draft_runner(
-                scheduler, server_args, lane_args, plan, lane_id, runner,
+                scheduler,
+                server_args,
+                lane_args,
+                plan,
+                lane_id,
+                runner,
                 lane_draft_mib,
             )
 

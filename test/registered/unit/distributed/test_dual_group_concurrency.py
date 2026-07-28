@@ -510,9 +510,7 @@ class TestLaneSpecBudget(unittest.TestCase):
     def test_the_split_conserves_the_operators_budget(self):
         from sglang.srt.model_executor.dual_group_lane import split_lane_budget
 
-        target, draft = split_lane_budget(
-            self._args(1600), self._cfg(64), self._cfg(1)
-        )
+        target, draft = split_lane_budget(self._args(1600), self._cfg(64), self._cfg(1))
         self.assertEqual(target + draft, 1600)
 
     def test_the_head_gets_its_layer_share_not_a_second_budget(self):
@@ -532,9 +530,7 @@ class TestLaneSpecBudget(unittest.TestCase):
         from sglang.srt.model_executor.dual_group_lane import split_lane_budget
 
         # A pathological ratio (half the layers) must not starve the target.
-        target, draft = split_lane_budget(
-            self._args(1600), self._cfg(2), self._cfg(1)
-        )
+        target, draft = split_lane_budget(self._args(1600), self._cfg(2), self._cfg(1))
         self.assertLessEqual(draft, 400)
         self.assertGreater(target, draft)
 
@@ -834,7 +830,7 @@ class TestLaneSpecDispatch(unittest.TestCase):
             src = inspect.getsource(fn)
             self.assertIn("_prefill", src, f"{fn.__name__} lost the prefill arm")
             self.assertIn(
-                "spec_active", src, f"{fn.__name__} does not consult spec_active"
+                "_job_spec_on", src, f"{fn.__name__} does not consult _job_spec_on"
             )
             self.assertIn(
                 "_spec_step", src, f"{fn.__name__} never runs a speculative round"
@@ -842,6 +838,124 @@ class TestLaneSpecDispatch(unittest.TestCase):
             self.assertIn(
                 "_decode_step", src, f"{fn.__name__} lost the plain decode arm"
             )
+        # The dispatch asks _job_spec_on, so the guarantee this test protects
+        # only holds if that helper is still anchored on the server flag.
+        self.assertIn(
+            "spec_active",
+            inspect.getsource(DualGroupLane._job_spec_on),
+            "_job_spec_on no longer consults spec_active",
+        )
+
+    def test_job_spec_override_defaults_to_the_server_flag(self):
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        lane = DualGroupLane.__new__(DualGroupLane)
+        lane.draft_runner = object()
+        # Absent key: the flag decides, so the default path is untouched.
+        self.assertTrue(lane._job_spec_on({}))
+        self.assertTrue(lane._job_spec_on({"spec": None}))
+        # Explicit opt-out: the gate's reference side.
+        self.assertFalse(lane._job_spec_on({"spec": False}))
+        # No head assembled: no job may speculate.
+        lane.draft_runner = None
+        self.assertFalse(lane._job_spec_on({"spec": True}))
+
+
+class _StubBatch:
+    """Just enough ScheduleBatch for the accept rule: the strategy under test
+    owns the token bookkeeping, not the allocation."""
+
+    device = "cpu"
+    input_ids = None
+
+    def prepare_for_decode(self):
+        pass
+
+
+def _stub_out(token_id, vocab=8):
+    import torch
+
+    out = type("LogitsOutput", (), {})()
+    out.next_token_logits = torch.zeros(1, vocab)
+    out.next_token_logits[0][token_id] = 1.0
+    out.hidden_states = torch.zeros(1, 4)
+    return out
+
+
+class TestLaneVerifyStrategy(unittest.TestCase):
+    """#274 round 3: which verify forward the lane uses, and why.
+
+    The batched continued extend advances the target's RECURRENT state over
+    rejected candidates with no way to restore it, so it stops tracking the
+    lane's own no-spec continuation. Sequential decode advances the state by
+    exactly the accepted tokens. The default must be the coherent one.
+    """
+
+    def _lane(self):
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        return DualGroupLane.__new__(DualGroupLane)
+
+    def test_default_is_the_coherent_strategy(self):
+        self.assertEqual(self._lane()._verify_mode({}), "seqdecode")
+
+    def test_batched_extend_stays_reachable_but_only_on_request(self):
+        self.assertEqual(self._lane()._verify_mode({"verify": "extend"}), "extend")
+
+    def test_the_defect_is_named_where_the_batched_path_lives(self):
+        import inspect
+
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        doc = inspect.getdoc(DualGroupLane._verify) or ""
+        # Not prose-policing: this is the one place a future reader decides
+        # whether to "optimise" the default back to the fast, wrong path.
+        self.assertIn("TARGET_VERIFY", doc)
+        self.assertIn("recurrent", doc.lower())
+
+    def test_seqdecode_emits_accepted_prefix_then_the_targets_own_token(self):
+        """The accept rule itself, with the forwards stubbed out.
+
+        Round shape: candidates are [last, *proposals]; the target's answer
+        after candidate i is compared against proposal i.
+        """
+        import torch
+
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        class _Fake(DualGroupLane):
+            def __init__(self, target_says):
+                self._says = list(target_says)
+
+            def _timed_forward_raw(self, batch, capture_mode=None):
+                return _stub_out(self._says.pop(0)), 1.0
+
+        # The target says 3 after the last token, and proposal 0 was 3, so it
+        # is accepted. Then it says 7 where the proposal was 5: rejected, and
+        # the target's own 7 is what the round emits.
+        lane = _Fake([3, 7])
+        job = {"_batch": _StubBatch(), "_next": torch.tensor([1])}
+        emitted, n_accept, _ = lane._verify_by_decode(job, [3, 5, 6], n_cached=10)
+        self.assertEqual(emitted, [3, 7])
+        self.assertEqual(n_accept, 1)
+        # KV advanced by exactly the emitted count, not by the whole block.
+        self.assertEqual(job["_kv_len"], 10 + 2)
+
+    def test_seqdecode_rejecting_everything_still_emits_one_token(self):
+        import torch
+
+        from sglang.srt.model_executor.dual_group_lane import DualGroupLane
+
+        class _Fake(DualGroupLane):
+            def _timed_forward_raw(self, batch, capture_mode=None):
+                return _stub_out(4), 1.0
+
+        lane = _Fake.__new__(_Fake)
+        job = {"_batch": _StubBatch(), "_next": torch.tensor([1])}
+        emitted, n_accept, _ = lane._verify_by_decode(job, [2, 2, 2], n_cached=5)
+        self.assertEqual(n_accept, 0)
+        self.assertEqual(emitted, [4])
+        self.assertEqual(job["_kv_len"], 6)
 
 
 if __name__ == "__main__":
