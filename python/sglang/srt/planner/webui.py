@@ -2683,6 +2683,127 @@ def rig_pair_reset_payload(payload: dict) -> dict:
     return {"ok": True, "session": s.to_json()}
 
 
+# ===========================================================================
+# Task #214 -- the coupling plan on top of a pairing. THIN adapter only.
+#
+# The reasoning lives in planner/rig_coupling.py and is pure: it takes facts
+# and returns a report. This function's whole job is to COLLECT those facts
+# from things already on disk or already fetched by the pairing flow, and to
+# hand them over. It opens no socket of its own -- the far rig is read by the
+# pairing flow's reach step or imported as an artifact, and everything else
+# comes back as a copyable host command.
+# ===========================================================================
+
+
+def rig_coupling_plan_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/rig_coupling/plan -> the gate, the transports, the pool.
+
+    Body, all optional::
+
+        {"session_id": "...",        # take the far rig from a pairing session
+         "remote_artifact": {...},   # or from an imported rig artifact
+         "local_artifact": {...},    # override the local side (tests, replay)
+         "model_path": "...",        # size the checkpoint onto the pool
+         "checkpoint_format": "gguf",
+         "colocation": true}
+
+    With neither ``session_id`` nor ``remote_artifact`` the answer is the
+    honest empty one: what this rig is, and what is needed to say anything
+    about a second one.
+    """
+    from sglang.srt.planner import rig_coupling as rc
+
+    p = dict(payload or {})
+    target = str(p.get("target") or "").strip()
+
+    # -- the local side ---------------------------------------------------
+    local_digest = p.get("local_artifact") or None
+    if local_digest:
+        local = rc.RigFacts.from_artifact(local_digest, "rig-a", label="this rig")
+    else:
+        try:
+            from sglang.srt.planner import comm_suite
+
+            local = rc.RigFacts.from_rig_profile(
+                comm_suite.rig_profile(), "rig-a", label="this rig"
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            local = rc.RigFacts(rig_id="rig-a", label="this rig", source="manual")
+            local.notes.append(f"local rig profile unavailable: {e}")
+
+    # -- the far side -----------------------------------------------------
+    remote_digest = p.get("remote_artifact") or None
+    remote: Optional[rc.RigFacts] = None
+    if remote_digest:
+        remote = rc.RigFacts.from_artifact(remote_digest, "rig-b", label="far rig")
+    else:
+        sid = str(p.get("session_id") or "").strip()
+        if sid:
+            from sglang.srt.rigmon import pairing
+
+            s = pairing.STORE.get(sid)
+            if s is None:
+                return {"ok": False, "error": f"no such pairing session: {sid}"}
+            reach = s.steps.get("reach")
+            target = target or s.target
+            if reach is None or reach.state != pairing.OK:
+                return {
+                    "ok": False,
+                    "error": "the pairing session has not reached the far rig yet",
+                    "remedy": "Run the reach step first (POST /api/rig_pair/"
+                    "advance with step 'reach'); this endpoint never contacts "
+                    "a rig itself.",
+                }
+            remote = rc.RigFacts.from_pairing_reach(reach.detail, "rig-b")
+    if remote is None:
+        return {
+            "ok": True,
+            "have_remote": False,
+            "local": local.to_json(),
+            "host_steps": [h.to_json() for h in rc.host_steps(target)],
+            "note": "No far rig is known yet. Couple one on this tab (its "
+            "rigmon aggregator must be running), or import its rig artifact "
+            "-- the host steps below produce one.",
+        }
+
+    # -- the pooled model fit, only when a checkpoint was named -----------
+    fit = None
+    model_path = str(p.get("model_path") or "").strip()
+    if model_path:
+        try:
+            fit = rc.model_fit_report(local.cards + remote.cards, model_path)
+        except Exception as e:
+            fit = {
+                "state": None,
+                "reason": f"the planner could not size {model_path}: {e}",
+                "provenance": rc.ABSENT,
+            }
+
+    pairs = None
+    try:
+        from sglang.srt.rigmon import card_probe
+
+        cached = card_probe.load_card_probe()
+        pairs = [m.to_json() for m in cached.pairs] if cached else None
+    except Exception:  # pragma: no cover - defensive
+        pairs = None
+
+    report = rc.couple(
+        local,
+        remote,
+        target=target,
+        checkpoint_format=(p.get("checkpoint_format") or None),
+        model_fit=fit,
+        colocation_wanted=bool(p.get("colocation")),
+        local_digest=local_digest,
+        remote_digest=remote_digest,
+        pair_matrix=pairs,
+    )
+    out = report.to_json()
+    out["have_remote"] = True
+    return out
+
+
 def flag_catalog_payload(payload: Optional[dict] = None) -> dict:
     """GET /api/flag_catalog -> the full flag catalog metadata, grouped, for
     rendering the runner-tab flag surface (help / hover / dropdown options).
@@ -4665,6 +4786,9 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/rig_pair/reset"):
                 self._json(200, rig_pair_reset_payload(payload))
                 return
+            if self.path.startswith("/api/rig_coupling/plan"):
+                self._json(200, rig_coupling_plan_payload(payload))
+                return
             if self.path.startswith("/api/commsuite/run"):
                 self._json(200, commsuite_run_payload(payload))
                 return
@@ -6112,6 +6236,41 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       its read-only endpoints are touched; nothing is pushed or changed there.</div>
   </fieldset>
   <div id="pair_steps"><span class="muted">enter a rig above to begin.</span></div>
+
+  <!-- #214 coupling plan. Its own endpoint and its own module
+       (planner/rig_coupling.py): the four steps above SEQUENCE a pairing,
+       this block JUDGES one. It contacts nothing -- the far rig is read from
+       the reach step above or from an imported artifact, and every step this
+       container may not take comes back as a command to paste. -->
+  <fieldset data-key="coupling_plan">
+    <legend>5 &mdash; coupling plan: gate, transport per message class, card pool</legend>
+    <div class="legend">Composed from facts already here: what the far rig
+      published, the artifacts on disk, the measured pair matrix and the
+      rejected register. <b>Nothing is contacted and nothing is booted.</b>
+      Steps this container cannot take &mdash; it has no interface on the
+      cross-rig subnet and no <code>/dev/infiniband</code> &mdash; are listed
+      as commands for the host, with placeholders instead of addresses.</div>
+    <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;margin-top:.3rem">
+      <input id="coup_model" style="max-width:24rem"
+        placeholder="checkpoint path (optional) — sizes the model onto the pooled cards">
+      <label title="a plan that puts several ranks on one card is blocked below the NCCL threshold, not merely warned about"><input
+        type="checkbox" id="coup_coloc"> plan co-located ranks</label>
+      <button class="mini" onclick="couplingPlan()">compose plan</button>
+      <span id="coup_note" class="muted"></span>
+    </div>
+    <details data-key="coup_import" style="margin-top:.3rem">
+      <summary>far rig by artifact instead of by address</summary>
+      <div class="legend">The offline path, and on this rig the usual one: a
+        rig that cannot be reached from this container still has a shared
+        artifact (<code>htsglang-rig-artifact/v1</code>). Paste it here and
+        the plan reads it exactly as it would read a live answer &mdash; the
+        report records which of the two it was. The host step below produces
+        the file.</div>
+      <textarea id="coup_artifact" rows="4" style="width:100%"
+        placeholder='{"schema":"htsglang-rig-artifact/v1", ...}'></textarea>
+    </details>
+    <div id="coup_out"></div>
+  </fieldset>
 </div>
 
 <div id="view_landing">
@@ -8027,6 +8186,117 @@ function pairStepBody(st){
     return h;
   }
   return '';
+}
+
+// ===========================================================================
+// #214 coupling plan. One POST, one render. Every verdict, every provenance
+// pill and every command string is composed on the host by
+// planner/rig_coupling.py -- this function decides nothing, which is why a
+// script driving the same endpoint sees exactly what the page does.
+// ===========================================================================
+function coupVerdictClass(v){
+  if(v==='ok') return 'fitc';
+  if(v==='block') return 'nofitc';
+  return 'muted';
+}
+async function couplingPlan(){
+  const body={session_id:pairSession()||null,
+              model_path:($('coup_model').value||'').trim()||null,
+              colocation:!!$('coup_coloc').checked};
+  // A pasted artifact wins over the session: it is the explicit statement of
+  // which far rig this plan is about.
+  const raw=($('coup_artifact').value||'').trim();
+  if(raw){
+    let art;
+    try{ art=JSON.parse(raw); }
+    catch(e){ $('coup_note').textContent='the pasted artifact is not JSON: '+e.message; return; }
+    body.remote_artifact=(art&&art.job&&art.job.artifact)||art.artifact||art;
+  }
+  $('coup_note').textContent='composing…';
+  try{
+    const d=await api('/api/rig_coupling/plan',{key:'coupling', body});
+    if(!d.ok){ $('coup_note').textContent=d.error+(d.remedy?(' — '+d.remedy):''); return; }
+    $('coup_note').textContent='';
+    renderCoupling(d);
+  }catch(e){ if(!apiAborted(e)) $('coup_note').textContent=apiError(e); }
+}
+function renderCoupling(d){
+  let h='';
+  if(!d.have_remote){
+    h+='<div class="reasons">'+esc(d.note||'')+'</div>';
+    h+=coupHostSteps(d.host_steps||[]);
+    setHTML($('coup_out'), h); return;
+  }
+  h+='<div class="cfgrow"><span class="cfgk">verdict</span>'
+    +'<span class="pill '+coupVerdictClass(d.verdict)+'">'+esc(d.verdict)+'</span>'
+    +'<span>'+esc(d.summary||'')+'</span></div>';
+  // The gate. Every row carries WHERE its verdict comes from; a row with
+  // provenance "absent" is a question, not an answer, and says so.
+  h+='<table class="mx"><tr><th style="text-align:left">check</th><th>verdict</th>'
+    +'<th>basis</th><th style="text-align:left">why / what to do</th></tr>';
+  for(const r of (d.gate||[])){
+    h+='<tr><td style="text-align:left">'+esc(r.label||r.key)+'</td>'
+      +'<td class="'+coupVerdictClass(r.verdict)+'"><b>'+esc(r.verdict)+'</b></td>'
+      +'<td><span class="pill" title="'+esc(r.evidence||'')+'">'+esc(r.provenance)+'</span></td>'
+      +'<td style="text-align:left">'+esc(r.reason||'')
+      +(r.remedy?('<br><span class="muted">'+esc(r.remedy)+'</span>'):'')
+      +(r.evidence?('<br><span class="muted">evidence: '+esc(r.evidence)+'</span>'):'')
+      +'</td></tr>';
+  }
+  h+='</table>';
+  // Transport per message class.
+  h+='<table class="mx" style="margin-top:.4rem"><tr><th style="text-align:left">message class</th>'
+    +'<th>control</th><th>chosen</th><th>basis</th>'
+    +'<th style="text-align:left">why / how to measure</th></tr>';
+  for(const t of (d.transports||[])){
+    h+='<tr><td style="text-align:left">'+esc(t.label)+'</td>'
+      +'<td><code>'+esc(t.flag)+'</code></td>'
+      +'<td>'+(t.chosen?('<b>'+esc(t.chosen)+'</b>'):'<span class="muted">none</span>')+'</td>'
+      +'<td><span class="pill">'+esc(t.provenance)+'</span></td>'
+      +'<td style="text-align:left">'+esc(t.reason||'')
+      +(t.note?('<br><span class="muted">'+esc(t.note)+'</span>'):'')
+      +(t.how_to_measure?('<br><span class="muted">'+esc(t.how_to_measure)+'</span>'):'')
+      +(t.evidence||[]).map(e=>'<br><span class="muted">'+esc(e.id||'')+': '
+          +esc(String(e.value))+' '+esc(e.unit||'')+'</span>').join('')
+      +'</td></tr>';
+  }
+  h+='</table>';
+  // The pool. Cards, then the lanes that can be cut from them -- never one
+  // implied verbund.
+  const pool=d.pool||{};
+  h+='<fieldset style="margin-top:.4rem"><legend>card pool ('+(pool.card_count||0)+')</legend>';
+  h+='<div class="cfgrow">'+(pool.cards||[]).map(c=>
+      '<span class="pill" title="'+esc(c.rig+' — '+(c.arch||'arch unknown')
+        +' ('+esc(c.arch_source)+')')+'">'+esc(c.label)+': '+esc(c.name)
+      +(c.vram_mib?(' '+c.vram_mib+' MiB'):'')+'</span>').join(' ')+'</div>';
+  h+='<div class="muted">'+esc(pool.note||'')+'</div>';
+  h+='<table class="mx"><tr><th style="text-align:left">lane candidate</th><th>scope</th>'
+    +'<th style="text-align:left">cards</th><th style="text-align:left">note</th></tr>';
+  for(const ln of (pool.lane_candidates||[])){
+    h+='<tr><td style="text-align:left">'+esc(ln.label)+'</td><td>'+esc(ln.scope)+'</td>'
+      +'<td style="text-align:left">'+esc((ln.cards||[]).join(', '))+'</td>'
+      +'<td style="text-align:left">'+esc(ln.note||'')
+      +((ln.blocked_by||[]).length?('<br><span class="nofitc">blocked by: '
+          +esc(ln.blocked_by.join(', '))+'</span>'):'')
+      +'</td></tr>';
+  }
+  h+='</table></fieldset>';
+  h+=coupHostSteps(d.host_steps||[]);
+  setHTML($('coup_out'), h);
+}
+function coupHostSteps(steps){
+  if(!steps.length) return '';
+  let h='<fieldset style="margin-top:.4rem"><legend>steps this dashboard may not take</legend>'
+    +'<div class="legend">Copy and run these where they say. They are not '
+    +'executed from here, and they carry placeholders rather than addresses.</div>';
+  for(const s of steps){
+    h+='<details data-key="coupstep_'+esc(s.key)+'"><summary>'+esc(s.title)
+      +' <span class="pill">'+esc(s.where)+'</span></summary>'
+      +'<div class="muted">'+esc(s.why_not_here||'')
+      +(s.runbook?(' <span class="pill">runbook '+esc(s.runbook)+'</span>'):'')+'</div>'
+      +'<pre>'+esc(s.command)+'</pre></details>';
+  }
+  return h+'</fieldset>';
 }
 
 // ===========================================================================

@@ -1874,6 +1874,66 @@ them wrong is not usable at any accuracy:
 4. instances that do **not** jointly fit produce **no** aggregate — the
    overflowing GPU and its MiB are named instead.
 
+### 8.9 The coupling plan for a second rig (#214)
+
+`POST /api/rig_coupling/plan` judges a pairing: the compatibility gate, the
+transport per message class, and the pooled cards with the lanes that can be
+cut from them. It is the counterpart to `/api/rig_pair/*` (§3.3 of
+`TASK_214_DASHBOARD_REWORK.md`), which *sequences* a pairing — this one
+decides whether the coupling is worth attempting and on what evidence.
+
+It **contacts nothing**. The far rig comes either from a pairing session that
+has already run its reach step, or from a shared artifact pasted/posted in.
+Anything that needs the fast line comes back as a `host_steps` entry: a
+command in this section's shape, with `${VAR:-<placeholder>}` throughout,
+never an address and never an execution.
+
+```bash
+UI=http://127.0.0.1:8791
+
+# From a pairing session that has reached the far rig.
+curl -s -X POST $UI/api/rig_coupling/plan \
+  -d '{"session_id":"<from /api/rig_pair/status>","model_path":"'$MODEL_ROOT'/Qwen3.5-4B"}' |
+  python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print(d["verdict"], "-", d["summary"])
+for r in d["gate"]:
+    print(" ", r["verdict"].ljust(5), r["provenance"].ljust(8),
+          r["label"][:44].ljust(46), (r["evidence"] or "")[:40])
+for t in d["transports"]:
+    print(" ", t["message_class"].ljust(9), (t["chosen"] or "-").ljust(13),
+          t["provenance"].ljust(8), t["flag"])'
+
+# Offline: the far rig as its comm-suite artifact (the host steps in the
+# answer print how to produce that file).
+curl -s -X POST $UI/api/rig_coupling/plan \
+  -d "{\"remote_artifact\": $(cat /tmp/far-rig-artifact.json)}" |
+  python3 -c 'import json,sys
+d=json.load(sys.stdin)
+for s in d["host_steps"]: print("--", s["where"], "--", s["title"])
+for ln in d["pool"]["lane_candidates"]:
+    print(ln["scope"], ln["label"], "|", ", ".join(ln["cards"]),
+          "| blocked:", ",".join(ln["blocked_by"]) or "-")'
+```
+
+What the answer is careful about:
+
+- **A verdict names its basis.** Every gate row carries `provenance`
+  (`measured` / `estimate` / `absent`) and `evidence` — a `register:<key>` row
+  of `planner/rejected.py`, a runbook section, or nothing, in which case the
+  row is a question and says so rather than defaulting to a verdict.
+- **Only a wire counts as a wire.** A transport class is `measured` only from
+  a row taken by the cross-rig arm (or tagged `pair: cross-rig`). The comm
+  suite's UCX arm runs over loopback in the container, and counting it would
+  put a number on a link nothing crossed.
+- **The classes are the four of §4.3.1**, including the honest part: `tp_bulk`
+  is not separable from `tp_small` today (one UCX context per rank carries
+  both), and the row says so instead of implying a split the code does not do.
+- **The result is a POOL, not a verbund.** `pool.lane_candidates` lists the
+  lanes that could be cut from the coupled cards — each rig on its own, and
+  one lane spanning both — with `blocked_by` naming the gate rows that hit the
+  cross lane only. A block on the cross lane leaves the intra-rig lanes usable.
+
 ### 7.2 GPU arbitration (protocol v3)
 
 Cards are handed out **when work is commissioned**, not fought over at runtime.
