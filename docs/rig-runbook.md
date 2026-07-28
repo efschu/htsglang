@@ -1377,3 +1377,15 @@ context lengths. Corollary (user, same day): any test that needs a solo
 5090 boot picks a SMALLER model (2B/4B/9B class or a Q2/Q3 quant) — no
 small FP8 checkpoint exists locally as of 2026-07-28, so fp8-path solo
 tests either download one first or move to the TP>=2 production path.
+
+### Feasibility before measurement (mandatory, 2026-07-28)
+
+Every GPU test briefing carries a PRE-COMPUTED feasibility block: weights
+(+draft) + known fixed posts (graphs ~1-2 GiB, mamba pool, scratch) against
+the card budget, with a source (ledger figure, runbook precedent, or the
+arithmetic itself). If it does not fit, do not tune the recipe — scale a
+dimension (TP up, uneven/DCP, PD/PP, expert/KV offload) or pick a smaller
+model / harder quant. Border cases (<2 GiB computed slack) get ONE probe
+boot with an abort criterion, never a retry ladder twiddling context or
+fraction when the OOM signature is parameter-independent. Five dead boots
+of the impossible 27B-FP8 solo vehicle are the precedent.
