@@ -1659,7 +1659,83 @@ fingerprint published before, so the text shown is the text that lands. The
 token is optional to store: opt-in, `0600`, and the page can only ask
 *whether* one exists, never read it back.
 
-### 8.7 The key solver: the distribution key, computed (#272)
+### 8.7 The tab layout, and where the moved endpoints live now
+
+The navigation is the order of the work, and it is the whole list:
+
+| tab | what it is | main endpoints |
+| --- | --- | --- |
+| **Monitor** | live readings from any reachable server | `GET /api/live_snapshot`, `GET /api/gpu_state`, `GET /api/detect_endpoint` |
+| **Guide** | the configuration flow, end to end | `GET /api/wizard/hardware`, `POST /api/wizard/families`, `POST /api/wizard/command`, `GET /api/wizard/rejected` — and, in its expert step, the whole planner surface (`/api/plan`, `/api/placement`, `/api/recompute`, `/api/resolve_flags`, `/api/flag_catalog`, `/api/lever_profiles`, `/api/config_profiles`, `/api/server_*`, `/api/model_download`) |
+| **Benchmark** | behavioural suite against a running server | `POST /api/bench_run` (SSE), `POST /api/bench_probe`, `POST /api/bench_factors` |
+| **Quality** | rendering / instruction-following checks | `POST /api/quality_run`, `GET /api/quality_shots`, `GET /assets/quality_chess_reference.png` |
+| **Rigs** | what fits where, plus the per-model per-rig detail | `POST /api/matrix`, `POST /api/landscape`, `GET /api/cards` |
+| **Energy** | per-card power calibration, energy per token | `GET /api/power_profile`, `POST /api/measure_power`, `GET /api/hicache_saved` |
+| **Pair rig** | couple a second rig | `POST /api/rig_pair/*` |
+| **Rig data** | comm suite + anonymized profile share | `GET /api/commsuite/arms`, `POST /api/commsuite/run`, `POST /api/share/rig_*` |
+| **History** | your own recorded benchmark runs | `GET /api/bench_history`, `GET /api/bench_run_detail`, `DELETE /api/bench_history` |
+
+Three things moved, and the endpoints did **not** change with them:
+
+- **The Planner is no longer a tab.** It is the expert step at the end of the
+  Guide. Every control it had is still there, and every endpoint it called is
+  still called from the same JavaScript — only the entry point moved. The
+  guide determines the configuration, the expert step bends it, and the result
+  is saved as a named profile. Prefabricated presets are gone from the page;
+  `GET /api/config_profiles` still returns `generated` alongside `saved`,
+  because the CLI and the family generator use them.
+- **Landscape is no longer a tab.** It was a one-model slice of the Rigs
+  matrix with four measured-only columns that are empty unless you point it at
+  a `results.jsonl`. It is now a drill-down inside **Rigs**; `POST
+  /api/landscape` is unchanged and still the way to call it from a shell.
+- **History is now a tab** instead of the sixth fieldset of the Benchmark
+  column, where it filtered itself by whatever happened to be typed in an
+  unrelated field.
+
+#### 8.7.1 Deleting stored runs
+
+`bench_history.delete_run` existed and was unit-tested from the start but had
+no route and no button, so the run store could only ever grow. It has one now.
+Deletion is permanent — it removes the stored file, transcript included.
+
+```bash
+UI=http://127.0.0.1:8791
+
+# What is stored (newest first). `limit` is honoured; the page offers
+# 50 / 200 / everything.
+curl -s "$UI/api/bench_history?limit=200" | python3 -m json.tool | head -40
+
+# One run, or a list in one call. Misses are REPORTED, not fatal: the
+# response carries `deleted` and `missing` and stays ok=true.
+curl -s -X DELETE $UI/api/bench_history \
+  -H 'Content-Type: application/json' \
+  -d '{"run_id":"20260728T103405-f284a064"}' | python3 -m json.tool
+
+curl -s -X DELETE $UI/api/bench_history \
+  -H 'Content-Type: application/json' \
+  -d '{"run_ids":["<id-a>","<id-b>"]}' | python3 -m json.tool
+```
+
+#### 8.7.2 The Quality reference image
+
+`GET /assets/quality_chess_reference.png` is **rendered on request** from
+`quality_chess.CHESS_PGN` (python-chess replays the movetext, `chess.svg`
+draws the position with the last move highlighted, cairosvg rasterises it) and
+cached in the process. It is not a checked-in screenshot, so the board the
+page shows and the position the validator grades against cannot drift apart.
+
+An `assets/quality_chess_reference.png` on disk still wins if one is present.
+Note that the repository ignores `*.png` — that rule is why this asset was
+missing in the first place — so a file dropped there is invisible to git
+unless the negation added for that directory covers it.
+
+```bash
+curl -s -o /tmp/ref.png -w '%{http_code} %{content_type} %{size_download}\n' \
+  $UI/assets/quality_chess_reference.png
+# expect: 200 image/png <~57000>
+```
+
+### 8.8 The key solver: the distribution key, computed (#272)
 
 Three endpoints behind `srt/planner/key_solver.py` + `srt/planner/solver_api.py`.
 They answer *what split should this rig use for THIS goal* by computing it

@@ -1564,7 +1564,10 @@ class TestV3IndexMarkers(CustomTestCase):
         for token in (
             "view_bench", "/api/bench_probe", "/api/bench_run",
             "/api/share_preview", "/api/share_submit", "/api/detect_endpoint",
-            "land_endpoint", "detectLandingEndpoint", "segbar",
+            # #13: the monitor target's three ambiguous buttons became two
+            # explicit actions; detectLandingEndpoint split into Connect and
+            # Find a server.
+            "land_endpoint", "landingConnect", "landingFindServer", "segbar",
             "renderStartConfig", "normalizeStartConfig", "profile_env_box",
             "renderProfileLaunch", "never persisted, never logged",
         ):
@@ -1664,9 +1667,11 @@ class TestRunnerLmStudioLayout(CustomTestCase):
         for token in ('id="sv_ctx_slider"', 'id="mrr_slider"',
                       "setCtxCap", "cap.max_context_tokens"):
             self.assertIn(token, html, token)
-        # toggle switches (pure CSS) + "?" hover + changed-from-preset dot.
+        # toggle switches (pure CSS) + "?" hover + changed-from-profile dot.
+        # The dot's wording followed the #7 rename: prefabricated presets are
+        # gone, so a row can only differ from a profile the user loaded.
         for token in ('class="switch"', 'class="track"', 'class="qmark"',
-                      "changed from preset", "markPresetDrift",
+                      "changed from the loaded profile", "markPresetDrift",
                       "presetSnapshot"):
             self.assertIn(token, html, token)
 
@@ -2461,14 +2466,26 @@ class TestSimpleExpertViews(CustomTestCase):
 class TestTemplatesAreStartingPoints(CustomTestCase):
     """A template moves the starting point; it never fences a control in."""
 
-    def test_tuning_objectives_offered(self):
+    def test_tuning_objectives_are_no_longer_a_second_preset_bar(self):
+        """#7: the objective BUTTONS are gone; the objective itself is not.
+
+        They were the second of two prefabricated starting points sitting in
+        one panel. applyTune stays -- it is how the working-point stops write
+        --rank-perf-tune -- and the flag keeps its own row in the flag
+        surface, so nothing about the knob changed except that it stopped
+        looking like a preset mechanism.
+        """
         html = webui.INDEX_HTML
         for key in ("tune_both", "tune_maxkv", "tune_dec", "tune_enc"):
-            self.assertIn(key, html, key)
-        # the four map onto the fork's own --rank-perf-tune enum
+            self.assertNotIn('id="%s"' % key, html, key)
+        self.assertIn("function applyTune(", html)
+        # the four still map onto the fork's own --rank-perf-tune enum
         from sglang.srt.planner import flags as flagsmod
         allowed = set(flagsmod.catalog()["rank_perf_tune"].allowed)
         self.assertEqual(allowed, {"both", "dec", "enc", "maxkv"})
+        self.assertEqual(set(_index_script().split("const TUNE_LABELS={")[1]
+                             .split("}")[0].replace("'", "").split(","))
+                         .__len__(), 4)
 
     def test_concurrency_slider_is_not_capped_at_a_constant(self):
         js = _index_script()
@@ -3154,10 +3171,23 @@ class TestBenchTabAndHistory(CustomTestCase):
         self.assertGreater(i_set, i_render)
 
     def test_history_ui_and_download_link(self):
+        # #6: run history moved out of the Benchmark column into its own tab.
         html = webui.INDEX_HTML
         self.assertIn("/api/bench_history", html)
         self.assertIn("/api/bench_run_detail?download=1", html)
-        self.assertIn("function benchShowRun(", html)
+        self.assertIn("function historyShowRun(", html)
+        self.assertIn('<div id="view_history"', html)
+        self.assertIn('id="tab_history"', html)
+        # explicit filters that belong to the tab itself -- the old list
+        # narrowed itself from the Benchmark tab's target field.
+        for token in ('id="hs_model"', 'id="hs_period"', 'id="hs_outcome"',
+                      'id="hs_search"', 'id="hs_limit"'):
+            self.assertIn(token, html, token)
+        # deletion is reachable at last (delete_run had no route and no button)
+        self.assertIn("function historyDelete(", html)
+        self.assertIn("function historyDeleteFiltered(", html)
+        # and the Benchmark tab no longer carries a second copy of the list
+        self.assertNotIn('id="bn_history"', html)
 
     def test_graphs_are_columns_not_a_polyline(self):
         # A polyline across two samples drew a stroke over half an empty
@@ -3234,6 +3264,487 @@ class TestBenchHistoryRoutes(CustomTestCase):
         d = webui.bench_run_payload({})
         self.assertFalse(d["ok"])
         self.assertIn("run_id", d["error"])
+
+    # ---- #6: deletion. bench_history.delete_run existed and was unit-tested
+    # from the start but had no HTTP route and no button, so the store could
+    # only ever grow. These pin the route that finally reaches it.
+    def _save(self, model="/m/Model-A"):
+        from sglang.srt.planner import bench_history
+
+        return bench_history.save_run(
+            {"model": model, "endpoint": "e", "started_at": 1.0,
+             "duration_s": 1.0, "results": [], "transcript": []})
+
+    def test_delete_removes_the_stored_run(self):
+        run_id = self._save()
+        self.assertEqual(len(webui.bench_history_payload({})["runs"]), 1)
+        d = webui.bench_history_delete_payload({"run_id": run_id})
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["deleted"], [run_id])
+        self.assertEqual(d["missing"], [])
+        self.assertEqual(webui.bench_history_payload({})["runs"], [])
+        self.assertFalse(webui.bench_run_payload({"run_id": run_id})["ok"])
+
+    def test_delete_takes_a_list_and_reports_misses_without_failing(self):
+        a, b = self._save("/m/A"), self._save("/m/B")
+        d = webui.bench_history_delete_payload(
+            {"run_ids": [a, "never-existed", b]})
+        self.assertTrue(d["ok"])
+        self.assertEqual(sorted(d["deleted"]), sorted([a, b]))
+        self.assertEqual(d["missing"], ["never-existed"])
+        self.assertEqual(webui.bench_history_payload({})["runs"], [])
+
+    def test_delete_requires_an_id(self):
+        d = webui.bench_history_delete_payload({})
+        self.assertFalse(d["ok"])
+        self.assertIn("run_id", d["error"])
+
+    def test_delete_route_over_http(self):
+        run_id = self._save()
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), webui._Handler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/bench_history",
+                data=json.dumps({"run_ids": [run_id]}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="DELETE",
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                d = json.loads(r.read())
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            th.join(timeout=5)
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["deleted"], [run_id])
+        self.assertEqual(webui.bench_history_payload({})["runs"], [])
+
+
+class TestConsolidatedNavigation(CustomTestCase):
+    """#1/#3/#4: the tab strip IS the workflow, and it has no duplicates.
+
+    The Planner stopped being a tab (its markup is the wizard's expert step)
+    and Landscape stopped being a tab (it was a one-model slice of the Rigs
+    matrix with four permanently-empty measured columns). Both are structural
+    claims that a later edit could quietly undo, so they are pinned here.
+    """
+
+    ORDER = ["landing", "wizard", "bench", "quality", "explore",
+             "energy", "pair", "share", "history"]
+
+    def test_tab_order_is_the_workflow_order(self):
+        html = webui.INDEX_HTML
+        seen = re.findall(r'id="tab_([a-z]+)"', html)
+        self.assertEqual(seen, self.ORDER)
+
+    def test_every_tab_button_has_a_view_and_vice_versa(self):
+        html = webui.INDEX_HTML
+        for key in self.ORDER:
+            self.assertIn(f'id="tab_{key}"', html, key)
+            self.assertIn(f'id="view_{key}"', html, key)
+        # the switch drives exactly this set
+        switch = html.split("function showTab(t) {")[1][:400]
+        for key in self.ORDER:
+            self.assertIn(f"'{key}'", switch, key)
+
+    def test_planner_is_the_wizard_expert_step_not_a_tab(self):
+        html = webui.INDEX_HTML
+        self.assertNotIn('id="tab_runner"', html)
+        self.assertNotIn("showTab('runner')", html)
+        # still present, but NESTED inside the wizard so it inherits its
+        # visibility instead of being switched independently.
+        self.assertIn('id="view_runner"', html)
+        self.assertLess(html.index('<div id="view_wizard"'),
+                        html.index('<div id="view_runner"'))
+        self.assertIn('data-step="expert"', html)
+
+    def test_no_planner_capability_was_dropped_on_the_way(self):
+        # The controls that only ever existed on the Planner tab must all be
+        # reachable from the wizard's expert step. This is the "nothing lost"
+        # assertion for #1.
+        html = webui.INDEX_HTML
+        for token in ('id="flag_surface"', 'id="flag_search"',
+                      'id="action_bar"', 'id="status_chip"',
+                      'id="runner_placement"', 'id="cardlist"',
+                      'id="host_ram_gb"', 'id="sv_ctx"', 'id="sv_served"',
+                      'id="tp_count"', 'id="colo_rows"',
+                      'id="gpu_pick_select"', 'id="draft_model_select"',
+                      'id="lp_slider"', 'id="simple_cards"',
+                      'id="dl_repo"', 'id="profile_save_name"',
+                      "serverStart()", "serverStop()", "serverRestart()",
+                      "doPlan()", "doIssue(", "loadFlagCatalog"):
+            self.assertIn(token, html, token)
+
+    def test_landscape_folded_into_rigs(self):
+        html = webui.INDEX_HTML
+        self.assertNotIn('id="tab_landscape"', html)
+        self.assertNotIn('id="view_landscape"', html)
+        # its controls survive inside the Rigs tab
+        rigs = html[html.index('<div id="view_explore"'):]
+        rigs = rigs[:rigs.index("<script>")]
+        for token in ('id="ls_model"', 'id="ls_quant"', 'id="ls_bucket"',
+                      'id="ls_store"', 'id="ls_rigs"', "doLandscape()"):
+            self.assertIn(token, rigs, token)
+
+
+class TestPresetsRemoved(CustomTestCase):
+    """#7: prefabricated presets are gone; named profiles stay.
+
+    Two canned starting points used to sit in one panel (a generated-preset
+    dropdown and the tuning-objective buttons) for a configuration the guide
+    already works out exactly. Saving and loading a named profile is what
+    remains.
+    """
+
+    def test_the_objective_template_buttons_are_gone(self):
+        html = webui.INDEX_HTML
+        for token in ('id="tune_both"', 'id="tune_maxkv"', 'id="tune_dec"',
+                      'id="tune_enc"', 'id="tune_pick"'):
+            self.assertNotIn(token, html, token)
+
+    def test_rank_perf_tune_is_still_reachable_and_still_written(self):
+        # Removing the buttons must not remove the knob: the flag keeps its
+        # own row in the flag surface, and the working-point stops still set
+        # it through applyTune.
+        html = webui.INDEX_HTML
+        self.assertIn("applyTune", html)
+        self.assertIn("rank_perf_tune", html)
+        ids = {
+            f["id"]
+            for flags in webui.flag_catalog_payload()["groups"].values()
+            for f in flags
+        }
+        self.assertIn("rank_perf_tune", ids)
+
+    def test_the_picker_offers_only_saved_profiles(self):
+        html = webui.INDEX_HTML
+        self.assertIn("window._profiles=(d.saved||[])", html)
+        self.assertIn(">save profile<", html)
+        self.assertNotIn("&mdash; apply a preset &mdash;", html)
+
+    def test_the_endpoint_still_returns_both_sets(self):
+        # The dashboard stopped OFFERING generated profiles; the endpoint is
+        # unchanged because the CLI and the family generator still use them.
+        d = webui.config_profiles_get({})
+        self.assertTrue(d["ok"])
+        self.assertIn("generated", d)
+        self.assertIn("saved", d)
+
+
+class TestMonitorCardsAndViewMode(CustomTestCase):
+    """#8: every card visible, and the simple/expert switch actually acts."""
+
+    def test_cards_outside_the_placement_are_still_rendered(self):
+        html = webui.INDEX_HTML
+        # renderPlacement walks pl.cards (rank-carrying cards only); the
+        # remaining NVML cards get a telemetry-only block.
+        self.assertIn("idlecard", html)
+        self.assertIn("not in this configuration", html)
+        self.assertIn("const placed=new Set((pl.cards||[]).map(c=>c.gpu_index));",
+                      html)
+
+    def test_the_view_mode_switch_reaches_the_card_breakdown(self):
+        html = webui.INDEX_HTML
+        # the VRAM key exists in both densities, picked by the body class
+        self.assertIn('class="segsum simple-only"', html)
+        self.assertIn('class="seglegend expert-only"', html)
+        self.assertIn("body.mode-simple .expert-only", html)
+        self.assertIn("body.mode-expert .simple-only", html)
+
+
+class TestEnergyPerPhase(CustomTestCase):
+    """#9: energy per token is reported per phase, and savings are named."""
+
+    def test_prefill_and_decode_are_separate_tiles(self):
+        html = webui.INDEX_HTML
+        self.assertIn("strip_energy_pfx", html)
+        self.assertIn("energy / token &mdash; DECODE", html)
+        self.assertIn("energy / token &mdash; PREFILL", html)
+        # each phase has its own ring, so one cannot overwrite the other
+        self.assertIn("stripPush('st_j',t,jtokDec)", html)
+        self.assertIn("stripPush('st_jp',t,jtokPfx)", html)
+
+    def test_saved_prefill_energy_leads_with_kwh(self):
+        html = webui.INDEX_HTML
+        self.assertIn("prefill tok recovered", html)
+        self.assertIn("saved by RAM+disk cache", html)
+
+
+class TestWizardOwnsTheFlow(CustomTestCase):
+    """#10/#11/#12: picker in step 1, card set in step 2, steps stay live."""
+
+    def test_the_model_picker_lives_in_step_one(self):
+        html = webui.INDEX_HTML
+        wiz = html.index('<div id="view_wizard"')
+        expert = html.index('data-step="expert"')
+        for token in ('id="model_search"', 'id="models_out"', 'id="model"',
+                      'id="gguf_choice"'):
+            at = html.index(token)
+            self.assertGreater(at, wiz, token)
+            self.assertLess(at, expert, f"{token} must be in step 1, not the "
+                                        f"expert step")
+
+    def test_the_card_set_is_the_hardware_step(self):
+        html = webui.INDEX_HTML
+        hw = html.index('data-step="hardware"')
+        goal = html.index('data-step="goal"')
+        for token in ('id="cardlist"', 'id="wz_unused"', "addCard(false)"):
+            at = html.index(token)
+            self.assertGreater(at, hw, token)
+            self.assertLess(at, goal, token)
+        self.assertIn("function renderUnusedCards(", html)
+        self.assertIn("available, unused", html)
+
+    def test_every_step_is_marked_and_invalidates_the_later_ones(self):
+        html = webui.INDEX_HTML
+        for step in ("model", "hardware", "goal", "families", "command",
+                     "expert"):
+            self.assertIn(f'data-step="{step}"', html, step)
+        self.assertIn("function wizardInvalidate(", html)
+        self.assertIn("[data-step].stale", html)
+        # a change in an earlier step marks the later ones
+        self.assertIn("wizardInvalidate('model')", html)
+        self.assertIn("wizardInvalidate('hardware')", html)
+        self.assertIn("wizardInvalidate('goal')", html)
+
+
+class TestStopCollapseIsExplained(CustomTestCase):
+    """#2: identical stop columns are the answer, and the page says so.
+
+    Investigated and confirmed as an HONEST COLLAPSE, not a bug: the total
+    weight bytes are invariant under an MLP redistribution, so the capacity
+    objective is flat across the candidate ladder, and the base split is the
+    strict decode optimum. The backend already flagged it per row; the page
+    did not show it.
+    """
+
+    def test_a_collapsed_column_says_so_on_its_head(self):
+        html = webui.INDEX_HTML
+        self.assertIn("lp-same", html)
+        self.assertIn("p.same_as_baseline&&!p.is_base_split", html)
+
+    def test_the_collapse_is_also_explained_in_prose(self):
+        html = webui.INDEX_HTML
+        self.assertIn("lp-collapse", html)
+        self.assertIn("landed on the same answer", html)
+        self.assertIn("--rank-kv-ratio", html)
+
+
+class TestReferencePngIsDerived(CustomTestCase):
+    """#5: the chess reference is computed, not a checked-in screenshot.
+
+    Root cause of the missing image AND of the long-standing
+    test_reference_png_static_route failure: the repository ignores ``*.png``
+    (a "Plots" rule with only two narrow negations), so the asset could never
+    be committed and was absent from every fresh checkout.
+    """
+
+    def setUp(self):
+        webui._REFERENCE_PNG_CACHE = None
+
+    def tearDown(self):
+        webui._REFERENCE_PNG_CACHE = None
+
+    def test_it_renders_the_ground_truth_board(self):
+        data = webui._reference_png_bytes()
+        self.assertIsNotNone(data)
+        self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertGreater(len(data), 1000)
+
+    def test_it_is_derived_from_the_same_movetext_the_validator_grades(self):
+        from sglang.srt.planner import quality_chess
+
+        captured = {}
+        real = quality_chess.ground_truth
+
+        def spy(pgn=quality_chess.CHESS_PGN):
+            captured["pgn"] = pgn
+            return real(pgn)
+
+        with mock.patch.object(quality_chess, "ground_truth", side_effect=spy):
+            webui._render_reference_png()
+        self.assertEqual(captured["pgn"], quality_chess.CHESS_PGN)
+
+    def test_a_file_on_disk_still_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "assets")
+            os.makedirs(path)
+            with open(os.path.join(path, "quality_chess_reference.png"),
+                      "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n" + b"pinned")
+            with mock.patch.object(
+                webui.os.path, "dirname", return_value=tmp
+            ):
+                data = webui._reference_png_bytes()
+        self.assertEqual(data, b"\x89PNG\r\n\x1a\n" + b"pinned")
+
+
+class TestMonitorTargetControls(CustomTestCase):
+    """#13: two actions with fixed meanings, not three that swap roles.
+
+    "detect" used to do what "use" did when the box had text and what "auto"
+    did when it did not, and "use" applied an address without ever checking
+    it, so a typo produced no message at all.
+    """
+
+    def test_two_actions_and_an_unpin(self):
+        html = webui.INDEX_HTML
+        self.assertIn("function landingConnect(", html)
+        self.assertIn("function landingFindServer(", html)
+        self.assertIn('id="land_unpin"', html)
+        self.assertNotIn("function detectLandingEndpoint(", html)
+        self.assertNotIn(">use<", html)
+
+    def test_connect_reports_a_refusal_instead_of_applying_it(self):
+        html = webui.INDEX_HTML
+        connect = html.split("async function landingConnect(")[1][:1400]
+        # it probes before it pins
+        self.assertIn("/api/detect_endpoint", connect)
+        self.assertIn("Nothing was changed", connect)
+
+    def test_the_mode_is_written_out_not_inferred(self):
+        html = webui.INDEX_HTML
+        self.assertIn("function renderLandingMode(", html)
+        self.assertIn("Pinned to", html)
+
+
+class TestViewModeIsOneCheckbox(CustomTestCase):
+    """#14: an opt-in checkbox, and a plain bar in the simple density."""
+
+    def test_it_is_a_checkbox_not_a_two_way_pick(self):
+        html = webui.INDEX_HTML
+        self.assertNotIn('id="vm_simple"', html)
+        self.assertIn('type="checkbox" id="vm_expert"', html)
+        # no "simple" button to click, so nobody is asked to classify
+        # themselves before seeing the page
+        self.assertNotIn("setViewMode('simple')\"", html)
+
+    def test_simple_density_gets_one_solid_bar_and_no_breakdown(self):
+        html = webui.INDEX_HTML
+        self.assertIn('class="segbar simple-only"', html)
+        self.assertIn('class="segbar expert-only"', html)
+        # the itemised legend is expert-only, so simple shows no segments
+        self.assertIn('class="seglegend expert-only"', html)
+        self.assertIn('class="segsum simple-only"', html)
+
+
+class TestLinkThroughput(CustomTestCase):
+    """#15: live PCIe / NVLink per card, each against its own ceiling."""
+
+    def setUp(self):
+        from sglang.srt.planner import live_metrics
+
+        live_metrics._LINK_PEAKS.clear()
+        live_metrics._LINK_STATE_PEAKS.clear()
+        live_metrics._NVLINK_LAST.clear()
+
+    tearDown = setUp
+
+    def test_pcie_is_sampled_and_nvlink_absence_is_not_zero(self):
+        from sglang.srt.planner import live_metrics
+
+        class _Nvml:
+            NVML_PCIE_UTIL_TX_BYTES = 0
+            NVML_PCIE_UTIL_RX_BYTES = 1
+
+            def nvmlDeviceGetPcieThroughput(self, h, kind):
+                return 2_000_000 if kind == 0 else 1_000_000   # KB/s
+
+            def nvmlDeviceGetMaxPcieLinkGeneration(self, h):
+                return 4
+
+            def nvmlDeviceGetMaxPcieLinkWidth(self, h):
+                return 16
+
+            def nvmlDeviceGetCurrPcieLinkGeneration(self, h):
+                return 4
+
+            def nvmlDeviceGetCurrPcieLinkWidth(self, h):
+                return 16
+
+            def nvmlDeviceGetNvLinkState(self, h, link):
+                raise RuntimeError("no nvlink on this board")
+
+        d = live_metrics._link_fields(_Nvml(), object(), 0, "uuid-a")
+        self.assertAlmostEqual(d["pcie_tx_gbs"], 2.0, places=6)
+        self.assertAlmostEqual(d["pcie_rx_gbs"], 1.0, places=6)
+        self.assertAlmostEqual(d["pcie_max_gbs"], 1.969 * 16, places=3)
+        # "no NVLink" is None, never 0.0 -- they are different facts
+        self.assertIsNone(d["nvlink_tx_gbs"])
+        self.assertEqual(d["nvlink_links"], 0)
+
+    def test_without_calibration_the_ceiling_is_the_highest_seen_so_far(self):
+        from sglang.srt.planner import live_metrics
+
+        rate = {"v": 3_000_000}
+
+        class _Nvml:
+            NVML_PCIE_UTIL_TX_BYTES = 0
+            NVML_PCIE_UTIL_RX_BYTES = 1
+
+            def nvmlDeviceGetPcieThroughput(self, h, kind):
+                return rate["v"] if kind == 0 else 0
+
+            def nvmlDeviceGetNvLinkState(self, h, link):
+                raise RuntimeError("none")
+
+            # no link-capability getters at all -> peak is the only ceiling
+            def __getattr__(self, name):
+                raise AttributeError(name)
+
+        n = _Nvml()
+        d = live_metrics._link_fields(n, object(), 0, "uuid-b")
+        self.assertAlmostEqual(d["pcie_max_gbs"], 3.0, places=6)
+        # a bigger sample raises the ceiling in place...
+        rate["v"] = 9_000_000
+        d = live_metrics._link_fields(n, object(), 0, "uuid-b")
+        self.assertAlmostEqual(d["pcie_max_gbs"], 9.0, places=6)
+        # ...and a smaller one never lowers it
+        rate["v"] = 1_000_000
+        d = live_metrics._link_fields(n, object(), 0, "uuid-b")
+        self.assertAlmostEqual(d["pcie_tx_gbs"], 1.0, places=6)
+        self.assertAlmostEqual(d["pcie_max_gbs"], 9.0, places=6)
+
+    def test_a_measured_peak_outranks_a_lower_capability_figure(self):
+        from sglang.srt.planner import live_metrics
+
+        class _Nvml:
+            NVML_PCIE_UTIL_TX_BYTES = 0
+            NVML_PCIE_UTIL_RX_BYTES = 1
+
+            def nvmlDeviceGetPcieThroughput(self, h, kind):
+                return 50_000_000 if kind == 0 else 0     # 50 GB/s
+
+            def nvmlDeviceGetMaxPcieLinkGeneration(self, h):
+                return 1
+
+            def nvmlDeviceGetMaxPcieLinkWidth(self, h):
+                return 4
+
+            def nvmlDeviceGetCurrPcieLinkGeneration(self, h):
+                return 1
+
+            def nvmlDeviceGetCurrPcieLinkWidth(self, h):
+                return 4
+
+            def nvmlDeviceGetNvLinkState(self, h, link):
+                raise RuntimeError("none")
+
+        d = live_metrics._link_fields(_Nvml(), object(), 0, "uuid-c")
+        # capability says 1.0 GB/s; something measured 50. The measurement
+        # wins, so a bar can never read over 100%.
+        self.assertAlmostEqual(d["pcie_max_gbs"], 50.0, places=6)
+
+    def test_the_card_line_renders_the_link_figures(self):
+        html = webui.INDEX_HTML
+        self.assertIn("function linkLiveHtml(", html)
+        self.assertIn("PCIe", html)
+        self.assertIn("linkbar", html)
+        # NVLink pending is a state of its own, not a zero
+        self.assertIn("rate on the next poll", html)
 
 
 class TestLiveBannerStates(CustomTestCase):

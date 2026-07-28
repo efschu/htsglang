@@ -193,6 +193,12 @@ work_dirs/
 
 !logo.png
 !docs_new/images/*.png
+# Front-end assets the dashboard SERVES are not plots. The blanket *.png rule
+# above silently swallowed python/sglang/srt/planner/assets/quality_chess_reference.png,
+# so it was never committable, was absent from every fresh checkout, and the
+# Quality tab's reference image 404'd. That image is now rendered from the
+# movetext instead of shipped, but the trap stays open for the next asset.
+!python/sglang/srt/planner/assets/*.png
 
 # Prerequisites
 *.d

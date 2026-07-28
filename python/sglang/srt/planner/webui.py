@@ -47,6 +47,15 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
+# #272 -- the key solver's payload functions live in their own module; this
+# file only routes to them. Imported at module level (not lazily like the
+# heavy planner modules) because solver_api itself defers its own imports.
+from sglang.srt.planner.solver_api import (
+    key_solver_aggregate_payload,
+    key_solver_model_payload,
+    key_solver_payload,
+)
+
 __all__ = [
     "discover_knobs",
     "detect_hardware",
@@ -75,6 +84,9 @@ __all__ = [
     "bench_probe_payload",
     "bench_run_events",
     "bench_factors_payload",
+    "key_solver_payload",
+    "key_solver_aggregate_payload",
+    "key_solver_model_payload",
     "split_probe_start_payload",
     "split_probe_status_payload",
     "scenario_suggest_payload",
@@ -1820,14 +1832,72 @@ def quality_shots_payload(payload: Optional[dict] = None) -> dict:
     return {"ok": True, "path": path, "shots": shots}
 
 
+#: Rendered ground-truth board, cached after the first request. The render is
+#: deterministic, so one per process is enough.
+_REFERENCE_PNG_CACHE: Optional[bytes] = None
+
+#: Edge length of the served reference board, in pixels.
+_REFERENCE_PNG_SIZE = 480
+
+
+def _render_reference_png() -> bytes:
+    """Draw the ground-truth board after the benchmark movetext as a PNG.
+
+    The image is COMPUTED from ``quality_chess.CHESS_PGN`` — python-chess
+    replays the movetext, ``chess.svg`` draws the resulting position with the
+    last move highlighted, and cairosvg rasterises it. Both libraries are
+    already declared dashboard dependencies (see ``python/pyproject.toml``),
+    because the validator itself grades against the same computed board.
+
+    Deriving the picture rather than shipping a binary is what keeps it
+    honest: the reference the user compares against and the ground truth the
+    validator scores against are the same object, so the panel cannot show a
+    board that disagrees with the verdict. A stale checked-in screenshot could
+    silently drift away from ``CHESS_PGN``; this cannot.
+    """
+    import cairosvg
+    import chess.svg
+
+    from sglang.srt.planner.quality_chess import CHESS_PGN, ground_truth
+
+    gt = ground_truth(CHESS_PGN)
+    svg = chess.svg.board(
+        gt.board,
+        lastmove=gt.last_move,
+        size=_REFERENCE_PNG_SIZE,
+        coordinates=True,
+    )
+    return cairosvg.svg2png(
+        bytestring=svg.encode("utf-8"),
+        output_width=_REFERENCE_PNG_SIZE,
+        output_height=_REFERENCE_PNG_SIZE,
+    )
+
+
 def _reference_png_bytes() -> Optional[bytes]:
-    """The chess ground-truth reference image, served as a static asset."""
+    """The chess ground-truth reference image, served as a static asset.
+
+    An ``assets/quality_chess_reference.png`` on disk wins if one is present
+    (it lets a rig pin a hand-made picture), otherwise the board is rendered
+    from the movetext. Nothing is written to disk: the repository's ``*.png``
+    ignore rule means a generated file there would be invisible to git anyway,
+    which is exactly how this asset went missing before.
+    """
+    global _REFERENCE_PNG_CACHE
+    if _REFERENCE_PNG_CACHE is not None:
+        return _REFERENCE_PNG_CACHE
     p = os.path.join(os.path.dirname(__file__), "assets", "quality_chess_reference.png")
     try:
         with open(p, "rb") as f:
-            return f.read()
+            _REFERENCE_PNG_CACHE = f.read()
+            return _REFERENCE_PNG_CACHE
+    except Exception:
+        pass
+    try:
+        _REFERENCE_PNG_CACHE = _render_reference_png()
     except Exception:
         return None
+    return _REFERENCE_PNG_CACHE
 
 
 # ===========================================================================
@@ -3269,6 +3339,34 @@ def bench_history_payload(payload: Optional[dict] = None) -> dict:
     }
 
 
+def bench_history_delete_payload(payload: Optional[dict] = None) -> dict:
+    """DELETE /api/bench_history -> drop stored runs.
+
+    ``run_id`` deletes one run; ``run_ids`` deletes a list in one call (the
+    History tab's "clean up" path). ``bench_history.delete_run`` has existed
+    and been unit-tested since the store was written but had no route and no
+    button, so a run could be created and never removed and the directory grew
+    without bound. Deleting is the user's own archive management -- it is
+    reported per id rather than failing the whole call on one miss."""
+    from sglang.srt.planner import bench_history
+
+    payload = payload or {}
+    ids = payload.get("run_ids")
+    if not ids:
+        one = (payload.get("run_id") or "").strip()
+        ids = [one] if one else []
+    ids = [str(x).strip() for x in ids if str(x).strip()]
+    if not ids:
+        return {"ok": False, "error": "run_id or run_ids is required"}
+    deleted, missing = [], []
+    for rid in ids:
+        try:
+            (deleted if bench_history.delete_run(rid) else missing).append(rid)
+        except Exception as e:  # pragma: no cover - defensive
+            return {"ok": False, "error": f"{rid}: {e}"}
+    return {"ok": True, "deleted": deleted, "missing": missing}
+
+
 def bench_run_payload(payload: Optional[dict] = None) -> dict:
     """GET /api/bench_run_detail?run_id=... -> one stored run, transcript and
     all. This is what the download button fetches."""
@@ -4435,6 +4533,20 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/bench_factors"):
                 self._json(200, bench_factors_payload(payload))
                 return
+            # #272 key solver. The two LONG paths must be tested before the
+            # short one: this chain matches on prefixes, so a leading
+            # "/api/key_solver" would swallow both "/model" and "/aggregate".
+            # All three payloads are pure reads (card probe, split-probe store,
+            # config.json) -- nothing boots, allocates or measures.
+            if self.path.startswith("/api/key_solver/model"):
+                self._json(200, key_solver_model_payload(payload))
+                return
+            if self.path.startswith("/api/key_solver/aggregate"):
+                self._json(200, key_solver_aggregate_payload(payload))
+                return
+            if self.path.startswith("/api/key_solver"):
+                self._json(200, key_solver_payload(payload))
+                return
             # #270 wizard. /api/wizard/families and /api/wizard/command are
             # distinct prefixes; neither is a prefix of the other, so the
             # order between them does not matter.
@@ -4467,6 +4579,13 @@ class _Handler(BaseHTTPRequestHandler):
                 q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
                 q.update(payload or {})
                 self._json(200, config_profiles_delete(q))
+                return
+            if self.path.startswith("/api/bench_history"):
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                q.update(payload or {})
+                self._json(200, bench_history_delete_payload(q))
                 return
         except Exception as e:  # pragma: no cover - defensive
             self._json(500, {"error": str(e)})
@@ -4772,6 +4891,19 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   .cardblock { border: 1px solid var(--bd-weak); border-radius: var(--radius-lg);
                padding: var(--s2) var(--s3); margin: var(--s2) 0;
                background: var(--bg-panel); }
+  /* A card the running configuration does not use. Still shown (it is still
+     in the machine), dimmed so the rank-carrying cards stay the foreground. */
+  .cardblock.idlecard { border-style: dashed; opacity: .72; }
+  /* Simple mode's one-line occupancy for a card: the same numbers the
+     itemised legend adds up to, without the per-segment breakdown. */
+  .segsum { font-size: var(--t-xs); color: var(--fg-muted); margin: 2px 0; }
+  /* #15: live link throughput per card, each against its own ceiling. */
+  .linkpart { display: inline-flex; align-items: center; gap: 4px;
+              margin-right: var(--s3); }
+  .linkbar { display: inline-block; width: 46px; height: 6px;
+             background: var(--bg-input); border: 1px solid var(--bd-weak);
+             border-radius: 2px; overflow: hidden; vertical-align: middle; }
+  .linkbar i { display: block; height: 100%; background: var(--accent); }
   .segbar { display: flex; height: 14px; border-radius: 2px; overflow: hidden;
             background: var(--bg-input); border: 1px solid var(--bd-weak);
             margin: var(--s1) 0; }
@@ -4911,14 +5043,14 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   /* ---- simple / expert -----------------------------------------------------
      Two densities of the same page, not two different pages. Expert ADDS
      dimensions; it never changes what a control shared by both means. */
-  .vmode { display: flex; border: 1px solid var(--bd-medium);
-           border-radius: var(--radius); overflow: hidden; flex: none; }
-  .vmode .vm { background: var(--bg-elevated); color: var(--fg-muted);
-               border: 0; border-radius: 0; padding: 5px 14px; font: inherit;
-               font-size: var(--t-sm); cursor: pointer; }
-  .vmode .vm.on { background: var(--accent); color: #fff; }
-  .vmode .vm:not(.on):hover { color: var(--fg-strong);
-                              background: var(--selected); filter: none; }
+  /* One opt-in checkbox. A two-way simple/expert pick made the user classify
+     themselves before seeing anything; an unticked box asks nothing. */
+  .vmode { flex: none; }
+  .vmode label { display: flex; align-items: center; gap: var(--s2);
+                 color: var(--fg-muted); font-size: var(--t-sm);
+                 cursor: pointer; white-space: nowrap; }
+  .vmode label:hover { color: var(--fg-strong); }
+  .vmode input[type=checkbox] { width: auto; margin: 0; cursor: pointer; }
   /* Visibility is driven by one class on <body>, so no panel has to know
      which mode it is in and a mode switch touches no backend call. */
   body.mode-simple .expert-only { display: none !important; }
@@ -4988,6 +5120,44 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   table.lp .d-same, table.lp .d-na { color: var(--fg-muted); }
   table.lp td .d { font-size: var(--t-xs); display: block; }
   .lp-note { font-size: var(--t-xs); color: var(--fg-muted); margin-top: var(--s1); }
+  /* ---- #12 wizard step staleness ------------------------------------------
+     An earlier step changed, so what is shown here was computed for the
+     previous input. The numbers stay readable -- they are marked, not wiped,
+     because "what did it say before I changed this" is the question a person
+     actually has at that moment. */
+  [data-step].stale { position: relative; }
+  [data-step].stale > :not(legend) { opacity: .55; }
+  [data-step].stale::before {
+    content: "an earlier step changed — these numbers are from the previous input";
+    display: block; font-size: var(--t-xs); color: var(--warn);
+    border-left: 2px solid var(--warn); padding-left: var(--s2);
+    margin-bottom: var(--s2); opacity: 1; }
+  /* ---- run History (#6) ----------------------------------------------------
+     A chronological archive: day headings, one clickable card per run, the
+     actions on the card rather than behind a hover. */
+  .hs-day { font-size: var(--t-xs); color: var(--fg-muted);
+            text-transform: uppercase; letter-spacing: .04em;
+            margin: var(--s3) 0 var(--s1); }
+  .hs-day:first-child { margin-top: 0; }
+  .hs-row { border: 1px solid var(--bd-weak); border-radius: var(--radius-lg);
+            padding: var(--s2) var(--s3); margin-bottom: var(--s1);
+            background: var(--bg-panel); cursor: pointer; }
+  .hs-row:hover { border-color: var(--bd); }
+  .hs-row.on { border-color: var(--accent); background: var(--selected); }
+  .hs-main { display: flex; justify-content: space-between; gap: var(--s2);
+             align-items: baseline; }
+  .hs-main b { word-break: break-all; }
+  .hs-when { color: var(--fg-muted); font-size: var(--t-xs);
+             white-space: nowrap; }
+  .hs-sub { font-size: var(--t-xs); color: var(--fg-muted); margin-top: 2px; }
+  .hs-act { margin-top: var(--s2); display: flex; gap: var(--s1);
+            flex-wrap: wrap; align-items: center; cursor: default; }
+  /* #215: a stop that resolves to the base split says so on its own column
+     head, so three identical columns read as the finding they are. */
+  table.lp th .lp-same { display: block; font-size: var(--t-xs);
+                         font-weight: 400; color: var(--warn); }
+  .lp-note.lp-collapse { border-left: 2px solid var(--warn-dim);
+                         padding-left: var(--s2); }
   /* ---- limiting factors (#218) ---------------------------------------------
      One tile per factor, all the same size, so the eye compares them rather
      than ranking them by how much text each happens to carry. Colour is
@@ -5115,40 +5285,45 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     <div class="sub">capacity / feasibility / split &mdash; never estimated throughput.
       Every edit re-runs the same planner the server runs. No GPU touched.</div>
   </div>
-  <!-- Simple vs expert. Not a hiding place for broken controls: expert adds
-       dimensions, it never changes what a shared control means. The choice
-       persists, so the page opens the way it was left. -->
+  <!-- One opt-in checkbox, not a two-way "simple / expert" pick. Offering
+       "simple" as a thing to CHOOSE asks the user to classify themselves;
+       an unticked box asks nothing. Expert ADDS dimensions -- it never
+       changes what a shared control means, and it is not a hiding place for
+       broken controls. The choice persists, so the page opens as it was left. -->
   <div class="vmode" id="view_mode">
-    <button id="vm_simple" class="vm" onclick="setViewMode('simple')"
-            title="per-card VRAM as one number, one budget slider per card">simple</button>
-    <button id="vm_expert" class="vm" onclick="setViewMode('expert')"
-            title="the granular VRAM breakdown and every dimension the fork exposes">expert</button>
+    <label id="vm_expert_lbl"
+           title="show the granular VRAM breakdown and every dimension the fork exposes">
+      <input type="checkbox" id="vm_expert"
+             onchange="setViewMode(this.checked?'expert':'simple')">
+      expert view</label>
   </div>
 </div>
 
-<!-- One word per tab, so the bar fits on a normal window without ever
-     scrolling; the long form is the title attribute. -->
+<!-- Navigation = the order of the work: watch the machine, configure it,
+     measure it, judge the answers, then the reference surfaces (what other
+     rigs can carry, what this one costs, a second rig, contributed rig data)
+     and finally your own archive. One word per tab so the bar never scrolls;
+     the long form is the title attribute. Every entry is the same button in
+     the same strip -- no grown-in special cases. -->
 <div class="tabs">
   <button id="tab_landing" class="tab active" onclick="showTab('landing')"
     title="live monitor of any reachable sglang server">Monitor</button>
   <button id="tab_wizard" class="tab" onclick="showTab('wizard')"
-    title="guided configuration: model, hardware, every deployment family with its numbers">Guide</button>
-  <button id="tab_runner" class="tab" onclick="showTab('runner')"
-    title="models, capacity planner and server launch">Planner</button>
+    title="guided configuration: model, cards, every deployment family with its numbers, and the full planner as the expert step">Guide</button>
   <button id="tab_bench" class="tab" onclick="showTab('bench')"
-    title="behavioural benchmark / quality suite">Benchmark</button>
-  <button id="tab_explore" class="tab" onclick="showTab('explore')"
-    title="model x rig capacity matrix">Rigs</button>
-  <button id="tab_landscape" class="tab" onclick="showTab('landscape')"
-    title="recorded benchmark database">Landscape</button>
-  <button id="tab_energy" class="tab" onclick="showTab('energy')"
-    title="per-card power calibration">Energy</button>
+    title="behavioural benchmark suite against a running server">Benchmark</button>
   <button id="tab_quality" class="tab" onclick="showTab('quality')"
     title="rendering / instruction-following checks">Quality</button>
+  <button id="tab_explore" class="tab" onclick="showTab('explore')"
+    title="what fits where: model x rig capacity matrix, and the per-rig detail for one model">Rigs</button>
+  <button id="tab_energy" class="tab" onclick="showTab('energy')"
+    title="per-card power calibration and energy per token">Energy</button>
   <button id="tab_pair" class="tab" onclick="showTab('pair')"
     title="couple a second rig">Pair rig</button>
   <button id="tab_share" class="tab" onclick="showTab('share')"
     title="run the short comm benchmark and share an anonymized rig profile to improve the project">Rig data</button>
+  <button id="tab_history" class="tab" onclick="showTab('history')"
+    title="your own recorded benchmark runs: browse, filter, open, delete">History</button>
 </div>
 
 <!-- #270 -- guided configuration. Three steps, then the command. Every
@@ -5163,34 +5338,71 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     with no study behind it says <b>absent</b> and names the study that would
     produce it, rather than showing a stand-in.</div>
 
-  <fieldset>
+  <fieldset data-step="model">
     <legend>1 &mdash; model</legend>
     <div class="setrow">
       <span class="lbl">checkpoint</span>
       <span id="wz_model" class="mono muted">nothing picked yet</span>
     </div>
-    <div class="actions">
-      <button class="mini secondary" onclick="showTab('runner')">pick on the
-        Planner tab</button>
-      <span class="muted">The wizard reads the same form the Planner edits, so
-        the two never describe different configurations.</span>
+    <div class="actions" style="margin-bottom:var(--s2)">
+      <button class="secondary mini" onclick="loadModels()" title="re-scan roots">rescan models</button>
+      <span class="muted">The picker lives here, in the step that needs it. The Planner form underneath reads the same fields, so the guide and the expert view can never describe different configurations.</span>
     </div>
+    <div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-start">
+      <div style="flex:2;min-width:280px">
+        <label>discovered local models</label>
+        <input id="model_search" placeholder="search models (name / format / quant)&hellip;"
+          oninput="renderModelOptions()" style="margin-bottom:.3rem">
+        <div id="models_out" class="muted">scanning&hellip;</div>
+      </div>
+      <div style="flex:2;min-width:280px">
+        <label>or type a path / HF id (config.json dir, .gguf file, GGUF dir)</label>
+        <input id="model" placeholder="/path/to/Qwen3.6-27B-AWQ or org/model" onchange="onModelChange(); onRunnerModel()">
+        <label style="margin-top:.4rem"><input type="checkbox" id="include_vision" style="width:auto"
+          onchange="doPlan(); refreshRunnerPlacement()">
+          vision tower on <span class="muted">(VL models; off = text-only sizing +
+          launch, frees VRAM for KV)</span></label>
+      </div>
+      <div id="gguf_pick" style="flex:1;min-width:220px;display:none">
+        <label>GGUF quant (several available &mdash; pick one)</label>
+        <select id="gguf_choice" onchange="onRunnerModel()"></select>
+      </div>
+    </div>
+    <div id="model_info" class="muted" style="margin-top:.4rem;word-break:break-all"></div>
   </fieldset>
 
-  <fieldset>
-    <legend>2 &mdash; hardware</legend>
+  <fieldset data-step="hardware">
+    <legend>2 &mdash; hardware &mdash; which cards go into the set</legend>
+    <div class="muted" style="margin-bottom:var(--s2)">Tick the cards this
+      configuration may use. The families below are computed for the ticked
+      subset only; an unticked card is listed as <b>available, unused</b>
+      with what adding it would buy. Hypothetical cards can be added to plan
+      a machine you do not own yet.</div>
+    <div class="actions" style="margin-bottom:var(--s2)">
+      <button class="secondary mini" onclick="detectGPUs()" title="re-query NVML">detect</button>
+      <button class="secondary mini" onclick="addCard(false)">+ add card</button>
+      <button class="secondary mini" onclick="addCard(true)" title="a hypothetical GPU you don't own yet">+ add future GPU</button>
+    </div>
+    <div id="detect_note" class="muted" style="margin-bottom:.4rem">detecting local GPUs…</div>
+    <div id="cardlist" class="cardlist"></div>
+    <div class="muted" style="margin-top:.4rem">Tick = include in the set.
+    &ldquo;keep free&rdquo; is per-card headroom (a display / another
+    process) carved off before sizing.</div>
+    <label style="margin-top:.5rem">Host RAM total (GiB) &mdash; for RAM-offload fit</label>
+    <input id="host_ram_gb" placeholder="(auto-detected; override to plan another host)">
+    <div id="wz_unused" class="muted" style="margin-top:var(--s2)"></div>
     <div id="wz_hw"><span class="muted">loading&hellip;</span></div>
   </fieldset>
 
-  <fieldset>
+  <fieldset data-step="goal">
     <legend>3 &mdash; what you want most of</legend>
     <div class="setrow">
       <span class="lbl" id="row_wz_target">target quantity</span>
-      <select id="wz_target" class="num" onchange="wizardFamilies()"></select>
+      <select id="wz_target" class="num" onchange="wizardInvalidate('goal'); wizardFamilies()"></select>
     </div>
     <div class="setrow">
       <span class="lbl" id="row_wz_usage">prompt pattern</span>
-      <select id="wz_usage" class="num" onchange="wizardFamilies()">
+      <select id="wz_usage" class="num" onchange="wizardInvalidate('goal'); wizardFamilies()">
         <option value="fresh">fresh long prompts</option>
         <option value="recurring">recurring prefixes</option>
       </select>
@@ -5198,7 +5410,7 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     <div class="setrow">
       <span class="lbl">context the answer is priced at</span>
       <input type="number" id="wz_ctx" class="num" min="256" step="1024"
-             value="8192" onchange="wizardFamilies()">
+             value="8192" onchange="wizardInvalidate('goal'); wizardFamilies()">
     </div>
     <div class="actions">
       <button onclick="wizardFamilies()" id="wz_btn">Show the families</button>
@@ -5206,23 +5418,326 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     </div>
   </fieldset>
 
-  <div id="wz_families"><span class="muted">pick a model, then show the
-    families.</span></div>
+  <div data-step="families" id="wz_families_step">
+    <div id="wz_families"><span class="muted">pick a model, then show the
+      families.</span></div>
+  </div>
 
-  <fieldset>
+  <fieldset data-step="command">
     <legend>command</legend>
     <div id="wz_cmd"><span class="muted">choose a family above.</span></div>
   </fieldset>
 
-  <fieldset class="cfg-section">
-    <legend>expert view &mdash; every flag, and the difference from the guide</legend>
-    <div class="muted" style="margin-bottom:var(--s2)">One flag per line,
-      <code>--flag value</code>. What you change here is shown as a difference
-      against the guided command, not as a second recommendation.</div>
-    <textarea id="wz_overrides" rows="4" style="width:100%"
+  <fieldset class="cfg-section" data-step="expert">
+    <legend>4 &mdash; expert view: adjust anything, then save it as a profile</legend>
+    <div class="muted" style="margin-bottom:var(--s2)">The guide above works
+      out the configuration; this is where you bend it to what you actually
+      want. Every planner control lives here &mdash; the full flag surface,
+      the per-card budgets, the working point, placement and launch. What you
+      change is shown as a difference against the guided command, not as a
+      second recommendation. When it is right, save it as a named profile.</div>
+    <label>free-text overrides &mdash; one flag per line, <code>--flag value</code></label>
+    <textarea id="wz_overrides" rows="3" style="width:100%"
       placeholder="--context-length 32768&#10;--max-running-requests 4"
       oninput="wizardCommandDebounced()"></textarea>
     <div id="wz_diff" class="muted" style="margin-top:var(--s2)">no edits.</div>
+    <div id="view_runner" style="margin-top:var(--s3)">
+  <div id="loaded_cfg" class="adv" style="margin-bottom:var(--s3)">
+    <span class="muted">reading the running configuration&hellip;</span></div>
+
+
+
+  <!-- ===================================================================== -->
+  <!-- SIMPLE view: per card, how much VRAM this configuration uses, and one -->
+  <!-- slider for how much it is ALLOWED to use. Everything else is derived  -->
+  <!-- server-side and shown as the verdict. The granular breakdown, the     -->
+  <!-- ratios and the full flag surface are the expert view's business.      -->
+  <!-- ===================================================================== -->
+  <div class="simple-only">
+    <fieldset>
+      <legend>VRAM per card &mdash; usage and budget</legend>
+      <div id="simple_cards" class="muted">pick a model above&hellip;</div>
+      <div class="legend" style="margin-top:.35rem">The slider is each card's
+        budget: how much of it this server may take. What the configuration
+        actually needs is the bar. A budget below the bar is not refused here
+        &mdash; it is reported, with the reason, in the verdict.</div>
+    </fieldset>
+    <!-- ONE control for the whole working point. The four stops are named
+         profiles resolved server-side; the table below is their counter-
+         reckoning, in numbers from the planner run of that exact profile. The
+         expert view keeps every individual knob. -->
+    <fieldset>
+      <legend>working point &mdash; one control, with the counter-reckoning</legend>
+      <div class="lprow">
+        <input type="range" id="lp_slider" min="0" max="0" step="1" value="0"
+               oninput="leverProfileInput()">
+        <span class="lp-name" id="lp_name">&mdash;</span>
+      </div>
+      <div id="lp_ticks" class="lp-ticks"></div>
+      <div id="lp_body" class="muted">pick a model above&hellip;</div>
+    </fieldset>
+    <fieldset>
+      <legend>verdict</legend>
+      <div id="simple_verdict" class="muted">waiting for a model&hellip;</div>
+    </fieldset>
+    <div class="actions" style="align-items:center;margin:.5rem 0">
+      <button onclick="serverStart()">Load model</button>
+      <button class="secondary" onclick="serverStop()">Eject</button>
+      <span class="chip" id="simple_status_chip">stopped</span>
+      <span id="simple_status_note" class="muted"></span>
+    </div>
+  </div>
+
+  <div class="cols runner expert-only">
+    <div>
+      <!-- #7 -- PROFILES, not presets.
+           The prefabricated preset dropdown and the tuning-objective template
+           buttons both used to sit here, offering two different canned
+           starting points for a configuration the guide above has already
+           worked out exactly. Both are gone. The order is now: the guide
+           determines the working point, you adjust it here, and THEN you save
+           it under a name. --rank-perf-tune is still fully editable as its own
+           row in the flag surface below; it just no longer masquerades as a
+           second preset mechanism. -->
+      <fieldset>
+        <legend>profiles &mdash; save this configuration, or load one you saved</legend>
+        <div id="profile_pick" class="muted">select a model to list your saved profiles&hellip;</div>
+        <div style="display:flex;gap:.4rem;margin-top:.4rem;align-items:center">
+          <input id="profile_save_name" placeholder="save this configuration as&hellip;" style="max-width:60%">
+          <button class="secondary mini" onclick="saveProfile()">save profile</button>
+        </div>
+        <div id="profile_msg" class="muted" style="margin-top:.3rem"></div>
+        <div id="profile_env_box" style="margin-top:.3rem"></div>
+      </fieldset>
+
+      <!-- load settings: labeled rows in fixed, collapsible sections -->
+      <fieldset>
+        <legend>load settings
+          (<span id="flag_counts" class="muted"></span>)</legend>
+        <input id="flag_search" placeholder="search all settings (name / help)&hellip;" oninput="filterFlags()">
+        <div class="muted" style="margin:.3rem 0 .4rem">Every sglang + fork flag,
+          in fixed sections; a dot marks a row changed from the loaded profile.
+          Each field re-resolves on change: greyed + hover-? when excluded /
+          incompatible / auto-set. Model identity is set above, not here.</div>
+        <div id="flag_warnings"></div>
+        <div id="flag_surface">
+
+        <details class="cfg-section" id="sec_context">
+          <summary><b>Context</b><span class="sec-sum" id="sum_context"></span></summary>
+          <div class="sec-body">
+            <div class="setrow" id="row_sv_ctx" data-hay="context-length context length tokens kv max">
+              <span class="lbl">context-length
+                <span class="chg" title="changed from the loaded profile"></span></span>
+              <input type="range" id="sv_ctx_slider" min="512" max="262144" step="512"
+                value="8192" oninput="ctxFromSlider()">
+              <input type="number" id="sv_ctx" class="num" value="8192" onchange="ctxFromNum()">
+              <span class="muted" id="sv_ctx_max" style="flex:none;font-size:.64rem"></span>
+              <span class="qmark" title="Max tokens per request (prompt + output). The slider is capped at the plan's computed KV capacity for the current config; the numeric field is free.">?</span>
+            </div>
+            <div class="setrow" id="row_mrr" data-hay="max-running-requests max running requests concurrency seqs">
+              <span class="lbl">max-running-requests
+                <span class="chg" title="changed from the loaded profile"></span></span>
+              <input type="range" id="mrr_slider" min="1" max="64" step="1" value="1"
+                oninput="mrrFromSlider()">
+              <span id="mrr_max" class="muted" style="font-size:.62rem"></span>
+              <input type="number" id="max_running_requests" class="num"
+                placeholder="auto" onchange="mrrFromNum()">
+              <span class="qmark" title="Concurrent request slots. 1 = single-user = largest KV; raising it grows the GDN/mamba pool and shrinks max context (see the KV-vs-concurrency table in the plan result). The slider range follows what the plan reports as fitting; the numeric field is free, and a value that does not fit is REJECTED with a reason rather than silently clamped. Blank: plan 1, launch 16.">?</span>
+            </div>
+            <div id="secflags_context"></div>
+          </div>
+        </details>
+
+        <details class="cfg-section" id="sec_gpu">
+          <summary><b>GPU offload / split</b><span class="sec-sum" id="sum_gpu"></span></summary>
+          <div class="sec-body">
+            <div class="setrow" id="row_tp_count"
+              data-hay="tensor parallel tp size rank count co-location colocation">
+              <span class="lbl">tensor-parallel ranks (tp)
+                <span class="chg" title="changed from the loaded profile"></span></span>
+              <input type="number" class="num" id="tp_count" min="1" step="1"
+                onchange="tpCountChanged()">
+              <span class="qmark" title="Rank count for tensor parallelism (mirrors --tp-size; the tp-size row below stays the authoritative field). More ranks than enabled cards is allowed: the extra ranks then CO-LOCATE -- several ranks share one physical card. That needs CUDA MPS and is a fork-only capability; the per-card assignment controls appear below when tp exceeds the enabled card count.">?</span>
+            </div>
+            <div id="colo_box" style="display:none">
+              <div class="muted" id="colo_note" style="margin:.2rem 0 .3rem;color:#e3a008">
+                tp exceeds the enabled card count &mdash; the extra ranks
+                CO-LOCATE (share a physical card). REQUIRES CUDA MPS on the
+                shared card(s); co-location is a fork-only capability (stock
+                sglang cannot co-locate ranks at all). Set how many ranks each
+                card hosts; the sum must equal tp. The derived --rank-gpu-id
+                (below) stays the authoritative flag.</div>
+              <div id="colo_rows"></div>
+              <div id="colo_sum" class="muted" style="margin:.15rem 0"></div>
+              <div id="colo_err" class="reasons" style="display:none;margin:.15rem 0"></div>
+              <div id="colo_manual_note" class="muted"
+                style="display:none;color:#e3a008;margin:.15rem 0">
+                manual rank_gpu_id active &mdash; the free-text rank-gpu-id
+                field holds a value these steppers cannot represent (non-integer
+                or an id outside the enabled cards); edit or clear it there to
+                re-enable the steppers.</div>
+            </div>
+            <div class="setrow" id="row_split_mode" style="display:none"
+              data-hay="even uneven sharding split rank-tp-ratio auto performance">
+              <span class="lbl">shard split across ranks
+                <span class="chg" title="changed from the loaded profile"></span></span>
+              <select id="split_mode_select" onchange="splitModeChanged()">
+                <option value="even">even (uniform shards)</option>
+                <option value="auto">uneven auto (max KV)</option>
+                <option value="auto-performance">uneven auto-performance</option>
+                <option value="custom">custom vector (rank-tp-ratio field)</option>
+              </select>
+              <span class="qmark" title="even: uniform equal-size shards on every rank (clears --rank-tp-ratio). With --rank-gpu-id set this still runs the FORK path, just with a uniform split -- stock sglang cannot co-locate ranks at all. uneven auto: VRAM-proportional shards (--rank-tp-ratio auto, budgets from NVML totals minus --rank-auto-reserve-mib). uneven auto-performance: the VRAM split plus a measured MLP-family shift toward the compute-strong card. custom: an explicit per-rank integer vector typed into the rank-tp-ratio field below, which stays authoritative.">?</span>
+            </div>
+            <div id="gpu_placement" class="muted" style="margin:.25rem 0 .4rem">
+              plan a model to see the prospective placement&hellip;</div>
+            <div class="setrow" id="row_gpu_pick" style="display:none"
+              data-hay="gpu card select base-gpu-id single-gpu pick">
+              <span class="lbl">GPU (single-card run)
+                <span class="chg" title="changed from the loaded profile"></span></span>
+              <select id="gpu_pick_select" onchange="gpuPickChanged()"></select>
+              <span class="qmark" title="Which physical card a single-GPU (tp=1) run uses. Default = the preset's rule pick (largest VRAM, then higher FLOPs, then first index); writes the stock --base-gpu-id flag, a CUDA-order index (FASTEST_FIRST) -- NOT the nvidia-smi/NVML index; both are labeled. Hidden for tp > 1, where rank-gpu-id owns the placement.">?</span>
+            </div>
+            <div id="secflags_gpu"></div>
+          </div>
+        </details>
+
+        <details class="cfg-section" id="sec_speculative">
+          <summary><b>Speculative decoding</b><span class="sec-sum" id="sum_speculative"></span></summary>
+          <div class="sec-body">
+            <div id="spec_draft_hint" class="muted"
+              style="display:none;color:#e3a008;margin:.2rem 0 .3rem"></div>
+            <div class="setrow" id="row_draft_pick"
+              data-hay="draft model eagle eagle3 speculator speculative-draft-model local">
+              <span class="lbl">draft model (local)
+                <span class="chg" title="changed from the loaded profile"></span></span>
+              <select id="draft_model_select" onchange="draftPickChanged()">
+                <option value="">(none)</option></select>
+              <span class="qmark" title="Matching LOCAL draft/speculator models for the selected base model (name-family match, EAGLE3/EAGLE heads). Picking one fills --speculative-draft-model-path below; the free-text field stays authoritative and accepts any path. Needed for speculative decoding when the checkpoint has no MTP head of its own.">?</span>
+            </div>
+            <div id="secflags_speculative"></div>
+          </div>
+        </details>
+
+        <details class="cfg-section" id="sec_cache">
+          <summary><b>Cache</b><span class="sec-sum" id="sum_cache"></span></summary>
+          <div class="sec-body"><div id="secflags_cache"></div></div>
+        </details>
+
+        <details class="cfg-section" id="sec_serving">
+          <summary><b>Serving</b><span class="sec-sum" id="sum_serving"></span></summary>
+          <div class="sec-body">
+            <div class="muted" style="margin:.2rem 0 .3rem">AUTHORITATIVE
+              serving identity &mdash; always wins over a preset's argv on
+              launch.</div>
+            <div class="setrow" id="row_sv_served" data-hay="served-model-name served model name">
+              <span class="lbl">served-model-name
+                <span class="chg" title="changed from the loaded profile"></span></span>
+              <input id="sv_served" placeholder="(default: model)" onchange="onServingEdit()">
+              <span class="qmark" title="The name the OpenAI API serves this model under.">?</span>
+            </div>
+            <div class="setrow" id="row_sv_host" data-hay="host bind address">
+              <span class="lbl">host
+                <span class="chg" title="changed from the loaded profile"></span></span>
+              <input id="sv_host" placeholder="127.0.0.1" onchange="onServingEdit()">
+              <span class="qmark" title="Bind address of the HTTP server.">?</span>
+            </div>
+            <div class="setrow" id="row_sv_port" data-hay="port">
+              <span class="lbl">port
+                <span class="chg" title="changed from the loaded profile"></span></span>
+              <input id="sv_port" value="30000" onchange="onServingEdit()">
+              <span class="qmark" title="TCP port of the HTTP server.">?</span>
+            </div>
+            <div id="secflags_serving"></div>
+          </div>
+        </details>
+
+        <div class="advrow">
+          <div class="setrow" style="margin:0" id="row_advanced">
+            <span class="lbl">Show advanced settings
+              <span class="muted" id="adv_count"></span></span>
+            <label class="switch"><input type="checkbox" id="advanced_toggle"
+              onchange="toggleAdvanced()"><span class="track"></span></label>
+          </div>
+          <div id="sec_advanced" style="display:none;margin-top:.3rem"></div>
+        </div>
+
+        </div>
+      </fieldset>
+
+      <!-- sticky action bar: load / eject / restart + status chip + boot log -->
+      <div class="actionbar" id="action_bar">
+        <div class="actions" style="margin-top:0;align-items:center">
+          <button onclick="serverStart()">Load model</button>
+          <button class="secondary" onclick="serverStop()">Eject</button>
+          <button class="secondary" onclick="serverRestart()">Restart (replace)</button>
+          <span class="chip" id="status_chip">stopped</span>
+          <button class="secondary mini" onclick="doPlan()">Plan / re-validate</button>
+          <button class="secondary mini" onclick="refreshServerStatus()">status</button>
+        </div>
+        <details id="boot_log" style="margin-top:.4rem">
+          <summary class="muted" style="cursor:pointer">boot log / status detail</summary>
+          <div id="sv_out" class="muted" style="margin-top:.3rem"></div>
+        </details>
+        <details style="margin-top:.3rem">
+          <summary class="muted" style="cursor:pointer">GitHub issue &mdash; submit results / report bug</summary>
+          <label>quant descriptor (for the issue text)</label>
+          <input id="quant" placeholder="compressed-tensors / Q4_K_M / fp8">
+          <div class="actions" style="margin-top:.4rem">
+            <button class="secondary" onclick="doIssue('results')">Submit config (RESULTS issue)</button>
+            <button class="secondary" onclick="doIssue('bug')">Report bug</button>
+          </div>
+        </details>
+      </div>
+
+
+      <details style="margin-top:.6rem">
+        <summary style="cursor:pointer"><b>download a model</b> <span class="muted">&mdash;
+          external HF fetch (occasional task)</span></summary>
+        <fieldset style="margin-top:.4rem">
+          <legend>download</legend>
+          <label>repo id (org/name)</label>
+          <input id="dl_repo" placeholder="unsloth/Qwen3.6-27B-GGUF" onchange="dlTargets()">
+          <label>model root (mount)</label>
+          <input id="dl_root" placeholder="(default first root)" onchange="dlTargets()">
+          <div id="dl_variants" style="display:none">
+            <label>GGUF quant</label>
+            <select id="dl_quant"></select>
+          </div>
+          <div style="margin-top:.5rem">
+            <button onclick="dlPreview()" id="dl_btn">Preview + download</button>
+          </div>
+          <div id="dl_out" class="muted" style="margin-top:.5rem"></div>
+        </fieldset>
+      </details>
+    </div>
+
+    <div>
+      <fieldset>
+        <legend>prospective placement + per-card fit (updates as flags change)</legend>
+        <div id="runner_placement" class="muted">plan a model to see the granular placement&hellip;</div>
+      </fieldset>
+      <div id="verdict"></div>
+      <div id="split"></div>
+      <div id="cards"></div>
+      <div id="advantage"></div>
+      <div id="pricebar" class="pricebar">
+        energy price
+        <input id="kwh_price" type="number" step="1" min="0" value="30"
+               oninput="if (window.__lastMeasured !== undefined) renderMeasured(window.__lastMeasured); if (window.__lastHicache !== undefined) renderHicacheSaved(window.__lastHicache); if (window.__lastRoofline !== undefined) renderRoofline(window.__lastRoofline, window.__lastRooflineEnergy)">
+        <span class="muted">ct/kWh (&euro;-cent; currency-agnostic &mdash; just a
+        multiplier). Costs below are in <b>ct</b>. Applies to the measured cost,
+        the HiCache kWh-saved band (#147) and, later, the virtual-rig estimate
+        (#148).</span>
+      </div>
+      <div id="measured"></div>
+      <div id="hicache_saved"></div>
+      <div id="roofline"></div>
+      <div id="flags"></div>
+      <div id="issue"></div>
+    </div>
+  </div>
+    </div>
   </fieldset>
 
   <fieldset class="cfg-section">
@@ -5309,6 +5824,80 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   </fieldset>
 </div>
 
+<!-- #6 -- run History. Previously the sixth fieldset of the Benchmark
+     tab's right column, filtered by whatever was typed in an unrelated target
+     box, capped at 50 with no way to page, name, compare or delete. It is the
+     only user-OWNED data the dashboard stores, so it is a tab: a chronological
+     list, explicit filters, a detail panel, and deletion. -->
+<div id="view_history" style="display:none">
+  <div class="sub">Every finished benchmark run, newest first, with the whole
+    request/answer series it produced. Filters are explicit controls here &mdash;
+    nothing narrows this list because of a field on another tab. Deleting is
+    permanent and removes the stored file.</div>
+  <div class="cols" style="grid-template-columns:1.1fr 1fr">
+    <div>
+      <fieldset>
+        <legend>filter</legend>
+        <div class="setrow">
+          <span class="lbl">model</span>
+          <select id="hs_model" class="num" onchange="historyLoad()">
+            <option value="">all models</option>
+          </select>
+        </div>
+        <div class="setrow">
+          <span class="lbl">period</span>
+          <select id="hs_period" class="num" onchange="historyRender()">
+            <option value="0">any time</option>
+            <option value="1">last 24 hours</option>
+            <option value="7">last 7 days</option>
+            <option value="30">last 30 days</option>
+          </select>
+        </div>
+        <div class="setrow">
+          <span class="lbl">outcome</span>
+          <select id="hs_outcome" class="num" onchange="historyRender()">
+            <option value="">any outcome</option>
+            <option value="clean">no failures</option>
+            <option value="failed">has failures</option>
+            <option value="error">ended with an error</option>
+          </select>
+        </div>
+        <div class="setrow">
+          <span class="lbl">search</span>
+          <input id="hs_search" class="num" placeholder="model / endpoint / preset"
+                 oninput="historyRender()">
+        </div>
+        <div class="setrow">
+          <span class="lbl">show</span>
+          <select id="hs_limit" class="num" onchange="historyLoad()">
+            <option value="50">newest 50</option>
+            <option value="200">newest 200</option>
+            <option value="1000">everything</option>
+          </select>
+        </div>
+        <div class="actions" style="margin-top:var(--s2)">
+          <button class="mini secondary" onclick="historyLoad()">refresh</button>
+          <button class="mini secondary" onclick="historyDeleteFiltered()"
+            title="delete every run currently listed on the left">clean up the listed runs</button>
+        </div>
+        <div id="hs_note" class="muted" style="margin-top:var(--s2)"></div>
+      </fieldset>
+      <fieldset>
+        <legend>runs</legend>
+        <div id="hs_list" class="muted">loading&hellip;</div>
+      </fieldset>
+    </div>
+    <div>
+      <fieldset>
+        <legend>run detail</legend>
+        <div id="hs_detail" class="muted">Pick a run on the left to read its
+          transcript &mdash; every request and every answer, per test.</div>
+      </fieldset>
+    </div>
+  </div>
+</div>
+
+
 <div id="view_pair" style="display:none">
   <div class="sub">Couple a second rig, one step at a time. Every step runs on
     this host &mdash; reachability, the compatibility gate, the transport
@@ -5340,15 +5929,28 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     auto-detected on the common local ports &mdash; hand-started servers are
     monitored exactly like managed ones. Charts keep a client-side 60s ring
     buffer; <b>nothing is persisted</b>.</div>
+  <!-- #13 -- the monitor target.
+       There used to be three buttons ("use", "auto", "detect") whose meaning
+       depended on whether the text box happened to be filled: "detect" with
+       text did what "use" did, "detect" without text did what "auto" did, and
+       a wrong address was applied silently, so a typo looked like the page
+       was broken. Two actions, two buttons, and the current mode is written
+       out rather than inferred. -->
   <fieldset>
     <legend>monitor target</legend>
     <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap">
-      <input id="land_endpoint" placeholder="host:port (blank = managed instance, else auto-detect)" style="max-width:22rem">
-      <button class="mini" onclick="setLandingEndpoint()">use</button>
-      <button class="mini secondary" onclick="clearLandingEndpoint()" title="clear the explicit endpoint; fall back to managed / auto-detect">auto</button>
-      <button class="mini secondary" onclick="detectLandingEndpoint()" title="empty box: sweep the local sglang ports (30000-30100, 8000, 8080). Box filled: verify that host:port.">detect</button>
-      <span id="land_target_note" class="muted">resolving&hellip;</span>
+      <input id="land_endpoint" placeholder="host:port of a running server"
+             style="max-width:22rem" onkeydown="if(event.key==='Enter')landingConnect()">
+      <button class="mini" onclick="landingConnect()"
+        title="check that address and monitor it from now on">Connect</button>
+      <button class="mini secondary" onclick="landingFindServer()"
+        title="sweep the local sglang ports (30000-30100, 8000, 8080) and connect to what is found">Find a server</button>
+      <button class="mini secondary" id="land_unpin" style="display:none"
+        onclick="clearLandingEndpoint()"
+        title="stop monitoring this fixed address; go back to the managed instance or whatever is found automatically">Unpin</button>
     </div>
+    <div id="land_mode" class="muted" style="margin-top:var(--s1)"></div>
+    <div id="land_target_note" class="muted">resolving&hellip;</div>
   </fieldset>
   <!-- Always present, in every state. Living inside the "a server is
        running" container is what let a warning outlive the server it was
@@ -5566,15 +6168,12 @@ _INDEX_TEMPLATE = r"""<!doctype html>
            the stored run carries every request and every answer, and the
            download is the whole series. -->
       <fieldset>
-        <legend>history &mdash; past runs for this model</legend>
-        <div class="actions" style="margin-bottom:var(--s2)">
-          <button class="mini secondary" onclick="benchHistory()">refresh</button>
-          <label style="display:inline-flex;align-items:center;gap:var(--s1);margin:0">
-            <input type="checkbox" id="bn_hist_all" style="width:auto" onchange="benchHistory()">
-            <span class="muted">all models</span></label>
-          <span id="bn_hist_note" class="muted"></span>
-        </div>
-        <div id="bn_history" class="muted">no runs recorded yet.</div>
+        <legend>history</legend>
+        <div class="muted">Finished runs are stored with every request and
+          every answer they contained. Browse, filter, open and delete them on
+          the <button class="mini secondary" onclick="showTab('history')">History</button>
+          tab &mdash; they are the only data this dashboard keeps for you, so
+          they get a tab rather than a scroll position in this column.</div>
       </fieldset>
       <!-- Lead metrics: how long a round TAKES. tok/s hides which phase moved;
            ms per verify round and ms per 1k prefill tokens do not. Absent is
@@ -5597,35 +6196,6 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   </div>
 </div>
 
-<div id="view_landscape" style="display:none">
-  <div class="sub">Per (model, quant): measured cross-rig spread (Mode A).
-    <b>Measured</b> rows come from a results.jsonl of real runs; the rest are
-    planner/composed <b>feasibility estimates</b>. Perf/energy columns are
-    MEASURED-only &mdash; empty until the energy module (S2.5); no number is
-    invented.</div>
-  <div class="cols">
-    <div>
-      <fieldset>
-        <legend>model + quant</legend>
-        <label>Model (path / HF id)</label>
-        <input id="ls_model" placeholder="/path/to/Qwen3.6-27B-AWQ">
-        <label>quant descriptor</label>
-        <input id="ls_quant" placeholder="4b/AWQ/g128 | Q4_K_M | fp8">
-        <label>efficiency bucket (batch size)</label>
-        <input id="ls_bucket" placeholder="(optional, e.g. 16)">
-        <label>results.jsonl (measured; optional)</label>
-        <input id="ls_store" placeholder="(path to a measured store)">
-        <label><input type="checkbox" id="ls_similar" style="width:auto"> similar-quant (by bits — approximate)</label>
-      </fieldset>
-      <fieldset>
-        <legend>rigs to feasibility-check (NAME=card,card,...)</legend>
-        <textarea id="ls_rigs" rows="4" placeholder="hetero=RTX 5090,RTX 3080 20GB,RTX 3080 20GB&#10;4x4090=RTX 4090,RTX 4090,RTX 4090,RTX 4090"></textarea>
-      </fieldset>
-      <button onclick="doLandscape()">Build landscape</button>
-    </div>
-    <div><div id="ls_out"></div></div>
-  </div>
-</div>
 
 <div id="view_energy" style="display:none">
   <div class="sub">Live GPU power-state tags (#149), a live throughput/MTP
@@ -5757,366 +6327,46 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     </div>
     <div><div id="mx_out"></div></div>
   </div>
-</div>
 
-<div id="view_runner" style="display:none">
-<div class="sub">Pick the model ONCE at the top &mdash; it drives everything:
-  profiles, flag resolve, plan, placement and launch. Below it: profile &rarr;
-  serving identity &rarr; the one flag surface &rarr; launch. No field appears
-  twice. The page opens on the configuration that is currently loaded, when
-  there is one; live telemetry is the Monitor tab's job.</div>
-<div id="loaded_cfg" class="adv" style="margin-bottom:var(--s3)">
-  <span class="muted">reading the running configuration&hellip;</span></div>
-
-<fieldset>
-  <legend>model &mdash; the ONE selector (drives plan, profiles, placement, launch)
-    <button class="secondary mini" onclick="loadModels()" title="re-scan roots">rescan</button></legend>
-  <div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-start">
-    <div style="flex:2;min-width:280px">
-      <label>discovered local models</label>
-      <input id="model_search" placeholder="search models (name / format / quant)&hellip;"
-        oninput="renderModelOptions()" style="margin-bottom:.3rem">
-      <div id="models_out" class="muted">scanning&hellip;</div>
-    </div>
-    <div style="flex:2;min-width:280px">
-      <label>or type a path / HF id (config.json dir, .gguf file, GGUF dir)</label>
-      <input id="model" placeholder="/path/to/Qwen3.6-27B-AWQ or org/model" onchange="onModelChange(); onRunnerModel()">
-      <label style="margin-top:.4rem"><input type="checkbox" id="include_vision" style="width:auto"
-        onchange="doPlan(); refreshRunnerPlacement()">
-        vision tower on <span class="muted">(VL models; off = text-only sizing +
-        launch, frees VRAM for KV)</span></label>
-    </div>
-    <div id="gguf_pick" style="flex:1;min-width:220px;display:none">
-      <label>GGUF quant (several available &mdash; pick one)</label>
-      <select id="gguf_choice" onchange="onRunnerModel()"></select>
-    </div>
-  </div>
-  <div id="model_info" class="muted" style="margin-top:.4rem;word-break:break-all"></div>
-</fieldset>
-
-
-<!-- ===================================================================== -->
-<!-- SIMPLE view: per card, how much VRAM this configuration uses, and one -->
-<!-- slider for how much it is ALLOWED to use. Everything else is derived  -->
-<!-- server-side and shown as the verdict. The granular breakdown, the     -->
-<!-- ratios and the full flag surface are the expert view's business.      -->
-<!-- ===================================================================== -->
-<div class="simple-only">
-  <fieldset>
-    <legend>VRAM per card &mdash; usage and budget</legend>
-    <div id="simple_cards" class="muted">pick a model above&hellip;</div>
-    <div class="legend" style="margin-top:.35rem">The slider is each card's
-      budget: how much of it this server may take. What the configuration
-      actually needs is the bar. A budget below the bar is not refused here
-      &mdash; it is reported, with the reason, in the verdict.</div>
-  </fieldset>
-  <!-- ONE control for the whole working point. The four stops are named
-       profiles resolved server-side; the table below is their counter-
-       reckoning, in numbers from the planner run of that exact profile. The
-       expert view keeps every individual knob. -->
-  <fieldset>
-    <legend>working point &mdash; one control, with the counter-reckoning</legend>
-    <div class="lprow">
-      <input type="range" id="lp_slider" min="0" max="0" step="1" value="0"
-             oninput="leverProfileInput()">
-      <span class="lp-name" id="lp_name">&mdash;</span>
-    </div>
-    <div id="lp_ticks" class="lp-ticks"></div>
-    <div id="lp_body" class="muted">pick a model above&hellip;</div>
-  </fieldset>
-  <fieldset>
-    <legend>verdict</legend>
-    <div id="simple_verdict" class="muted">waiting for a model&hellip;</div>
-  </fieldset>
-  <div class="actions" style="align-items:center;margin:.5rem 0">
-    <button onclick="serverStart()">Load model</button>
-    <button class="secondary" onclick="serverStop()">Eject</button>
-    <span class="chip" id="simple_status_chip">stopped</span>
-    <span id="simple_status_note" class="muted"></span>
-  </div>
-</div>
-
-<div class="cols runner expert-only">
-  <div>
-    <!-- preset bar: dropdown + save, directly above the settings panel -->
-    <fieldset>
-      <legend>preset &mdash; fills the settings rows below; adaptive MTP is
-        always on when the checkpoint has draft layers</legend>
-      <div id="profile_pick" class="muted">select a model to list presets&hellip;</div>
-      <!-- Tuning objective: the same trio the fork's --rank-perf-tune takes.
-           A template is a STARTING POINT. Applying one seeds the controls;
-           the controls keep their full range afterwards, and the limits stay
-           the hard rejects, never the value the template happened to set. -->
-      <div style="margin-top:.5rem">
-        <label>tuning objective <span class="muted">(template &mdash; a starting
-          point, not a ceiling)</span></label>
-        <div id="tune_pick" style="display:flex;gap:.3rem;flex-wrap:wrap;margin-top:.2rem">
-          <button class="mini secondary" id="tune_both" onclick="applyTune('both')"
-            title="prefill and concurrent throughput together (the default)">balanced</button>
-          <button class="mini secondary" id="tune_maxkv" onclick="applyTune('maxkv')"
-            title="maximum context: give the KV cache everything that is left">max KV</button>
-          <button class="mini secondary" id="tune_dec" onclick="applyTune('dec')"
-            title="decode throughput">max decode</button>
-          <button class="mini secondary" id="tune_enc" onclick="applyTune('enc')"
-            title="prefill throughput">max prefill</button>
-        </div>
-        <div id="tune_note" class="muted" style="font-size:.68rem;margin-top:.2rem"></div>
-      </div>
-      <div style="display:flex;gap:.4rem;margin-top:.4rem;align-items:center">
-        <input id="profile_save_name" placeholder="save current settings as&hellip;" style="max-width:60%">
-        <button class="secondary mini" onclick="saveProfile()">save preset</button>
-      </div>
-      <div id="profile_msg" class="muted" style="margin-top:.3rem"></div>
-      <div id="profile_env_box" style="margin-top:.3rem"></div>
-    </fieldset>
-
-    <!-- load settings: labeled rows in fixed, collapsible sections -->
-    <fieldset>
-      <legend>load settings
-        (<span id="flag_counts" class="muted"></span>)</legend>
-      <input id="flag_search" placeholder="search all settings (name / help)&hellip;" oninput="filterFlags()">
-      <div class="muted" style="margin:.3rem 0 .4rem">Every sglang + fork flag,
-        in fixed sections; a dot marks a row changed from the applied preset.
-        Each field re-resolves on change: greyed + hover-? when excluded /
-        incompatible / auto-set. Model identity is set above, not here.</div>
-      <div id="flag_warnings"></div>
-      <div id="flag_surface">
-
-      <details class="cfg-section" id="sec_context">
-        <summary><b>Context</b><span class="sec-sum" id="sum_context"></span></summary>
-        <div class="sec-body">
-          <div class="setrow" id="row_sv_ctx" data-hay="context-length context length tokens kv max">
-            <span class="lbl">context-length
-              <span class="chg" title="changed from preset"></span></span>
-            <input type="range" id="sv_ctx_slider" min="512" max="262144" step="512"
-              value="8192" oninput="ctxFromSlider()">
-            <input type="number" id="sv_ctx" class="num" value="8192" onchange="ctxFromNum()">
-            <span class="muted" id="sv_ctx_max" style="flex:none;font-size:.64rem"></span>
-            <span class="qmark" title="Max tokens per request (prompt + output). The slider is capped at the plan's computed KV capacity for the current config; the numeric field is free.">?</span>
-          </div>
-          <div class="setrow" id="row_mrr" data-hay="max-running-requests max running requests concurrency seqs">
-            <span class="lbl">max-running-requests
-              <span class="chg" title="changed from preset"></span></span>
-            <input type="range" id="mrr_slider" min="1" max="64" step="1" value="1"
-              oninput="mrrFromSlider()">
-            <span id="mrr_max" class="muted" style="font-size:.62rem"></span>
-            <input type="number" id="max_running_requests" class="num"
-              placeholder="auto" onchange="mrrFromNum()">
-            <span class="qmark" title="Concurrent request slots. 1 = single-user = largest KV; raising it grows the GDN/mamba pool and shrinks max context (see the KV-vs-concurrency table in the plan result). The slider range follows what the plan reports as fitting; the numeric field is free, and a value that does not fit is REJECTED with a reason rather than silently clamped. Blank: plan 1, launch 16.">?</span>
-          </div>
-          <div id="secflags_context"></div>
-        </div>
-      </details>
-
-      <details class="cfg-section" id="sec_gpu">
-        <summary><b>GPU offload / split</b><span class="sec-sum" id="sum_gpu"></span></summary>
-        <div class="sec-body">
-          <div class="setrow" id="row_tp_count"
-            data-hay="tensor parallel tp size rank count co-location colocation">
-            <span class="lbl">tensor-parallel ranks (tp)
-              <span class="chg" title="changed from preset"></span></span>
-            <input type="number" class="num" id="tp_count" min="1" step="1"
-              onchange="tpCountChanged()">
-            <span class="qmark" title="Rank count for tensor parallelism (mirrors --tp-size; the tp-size row below stays the authoritative field). More ranks than enabled cards is allowed: the extra ranks then CO-LOCATE -- several ranks share one physical card. That needs CUDA MPS and is a fork-only capability; the per-card assignment controls appear below when tp exceeds the enabled card count.">?</span>
-          </div>
-          <div id="colo_box" style="display:none">
-            <div class="muted" id="colo_note" style="margin:.2rem 0 .3rem;color:#e3a008">
-              tp exceeds the enabled card count &mdash; the extra ranks
-              CO-LOCATE (share a physical card). REQUIRES CUDA MPS on the
-              shared card(s); co-location is a fork-only capability (stock
-              sglang cannot co-locate ranks at all). Set how many ranks each
-              card hosts; the sum must equal tp. The derived --rank-gpu-id
-              (below) stays the authoritative flag.</div>
-            <div id="colo_rows"></div>
-            <div id="colo_sum" class="muted" style="margin:.15rem 0"></div>
-            <div id="colo_err" class="reasons" style="display:none;margin:.15rem 0"></div>
-            <div id="colo_manual_note" class="muted"
-              style="display:none;color:#e3a008;margin:.15rem 0">
-              manual rank_gpu_id active &mdash; the free-text rank-gpu-id
-              field holds a value these steppers cannot represent (non-integer
-              or an id outside the enabled cards); edit or clear it there to
-              re-enable the steppers.</div>
-          </div>
-          <div class="setrow" id="row_split_mode" style="display:none"
-            data-hay="even uneven sharding split rank-tp-ratio auto performance">
-            <span class="lbl">shard split across ranks
-              <span class="chg" title="changed from preset"></span></span>
-            <select id="split_mode_select" onchange="splitModeChanged()">
-              <option value="even">even (uniform shards)</option>
-              <option value="auto">uneven auto (max KV)</option>
-              <option value="auto-performance">uneven auto-performance</option>
-              <option value="custom">custom vector (rank-tp-ratio field)</option>
-            </select>
-            <span class="qmark" title="even: uniform equal-size shards on every rank (clears --rank-tp-ratio). With --rank-gpu-id set this still runs the FORK path, just with a uniform split -- stock sglang cannot co-locate ranks at all. uneven auto: VRAM-proportional shards (--rank-tp-ratio auto, budgets from NVML totals minus --rank-auto-reserve-mib). uneven auto-performance: the VRAM split plus a measured MLP-family shift toward the compute-strong card. custom: an explicit per-rank integer vector typed into the rank-tp-ratio field below, which stays authoritative.">?</span>
-          </div>
-          <div id="gpu_placement" class="muted" style="margin:.25rem 0 .4rem">
-            plan a model to see the prospective placement&hellip;</div>
-          <div class="setrow" id="row_gpu_pick" style="display:none"
-            data-hay="gpu card select base-gpu-id single-gpu pick">
-            <span class="lbl">GPU (single-card run)
-              <span class="chg" title="changed from preset"></span></span>
-            <select id="gpu_pick_select" onchange="gpuPickChanged()"></select>
-            <span class="qmark" title="Which physical card a single-GPU (tp=1) run uses. Default = the preset's rule pick (largest VRAM, then higher FLOPs, then first index); writes the stock --base-gpu-id flag, a CUDA-order index (FASTEST_FIRST) -- NOT the nvidia-smi/NVML index; both are labeled. Hidden for tp > 1, where rank-gpu-id owns the placement.">?</span>
-          </div>
-          <div id="secflags_gpu"></div>
-        </div>
-      </details>
-
-      <details class="cfg-section" id="sec_speculative">
-        <summary><b>Speculative decoding</b><span class="sec-sum" id="sum_speculative"></span></summary>
-        <div class="sec-body">
-          <div id="spec_draft_hint" class="muted"
-            style="display:none;color:#e3a008;margin:.2rem 0 .3rem"></div>
-          <div class="setrow" id="row_draft_pick"
-            data-hay="draft model eagle eagle3 speculator speculative-draft-model local">
-            <span class="lbl">draft model (local)
-              <span class="chg" title="changed from preset"></span></span>
-            <select id="draft_model_select" onchange="draftPickChanged()">
-              <option value="">(none)</option></select>
-            <span class="qmark" title="Matching LOCAL draft/speculator models for the selected base model (name-family match, EAGLE3/EAGLE heads). Picking one fills --speculative-draft-model-path below; the free-text field stays authoritative and accepts any path. Needed for speculative decoding when the checkpoint has no MTP head of its own.">?</span>
-          </div>
-          <div id="secflags_speculative"></div>
-        </div>
-      </details>
-
-      <details class="cfg-section" id="sec_cache">
-        <summary><b>Cache</b><span class="sec-sum" id="sum_cache"></span></summary>
-        <div class="sec-body"><div id="secflags_cache"></div></div>
-      </details>
-
-      <details class="cfg-section" id="sec_serving">
-        <summary><b>Serving</b><span class="sec-sum" id="sum_serving"></span></summary>
-        <div class="sec-body">
-          <div class="muted" style="margin:.2rem 0 .3rem">AUTHORITATIVE
-            serving identity &mdash; always wins over a preset's argv on
-            launch.</div>
-          <div class="setrow" id="row_sv_served" data-hay="served-model-name served model name">
-            <span class="lbl">served-model-name
-              <span class="chg" title="changed from preset"></span></span>
-            <input id="sv_served" placeholder="(default: model)" onchange="onServingEdit()">
-            <span class="qmark" title="The name the OpenAI API serves this model under.">?</span>
-          </div>
-          <div class="setrow" id="row_sv_host" data-hay="host bind address">
-            <span class="lbl">host
-              <span class="chg" title="changed from preset"></span></span>
-            <input id="sv_host" placeholder="127.0.0.1" onchange="onServingEdit()">
-            <span class="qmark" title="Bind address of the HTTP server.">?</span>
-          </div>
-          <div class="setrow" id="row_sv_port" data-hay="port">
-            <span class="lbl">port
-              <span class="chg" title="changed from preset"></span></span>
-            <input id="sv_port" value="30000" onchange="onServingEdit()">
-            <span class="qmark" title="TCP port of the HTTP server.">?</span>
-          </div>
-          <div id="secflags_serving"></div>
-        </div>
-      </details>
-
-      <div class="advrow">
-        <div class="setrow" style="margin:0" id="row_advanced">
-          <span class="lbl">Show advanced settings
-            <span class="muted" id="adv_count"></span></span>
-          <label class="switch"><input type="checkbox" id="advanced_toggle"
-            onchange="toggleAdvanced()"><span class="track"></span></label>
-        </div>
-        <div id="sec_advanced" style="display:none;margin-top:.3rem"></div>
-      </div>
-
-      </div>
-    </fieldset>
-
-    <!-- sticky action bar: load / eject / restart + status chip + boot log -->
-    <div class="actionbar" id="action_bar">
-      <div class="actions" style="margin-top:0;align-items:center">
-        <button onclick="serverStart()">Load model</button>
-        <button class="secondary" onclick="serverStop()">Eject</button>
-        <button class="secondary" onclick="serverRestart()">Restart (replace)</button>
-        <span class="chip" id="status_chip">stopped</span>
-        <button class="secondary mini" onclick="doPlan()">Plan / re-validate</button>
-        <button class="secondary mini" onclick="refreshServerStatus()">status</button>
-      </div>
-      <details id="boot_log" style="margin-top:.4rem">
-        <summary class="muted" style="cursor:pointer">boot log / status detail</summary>
-        <div id="sv_out" class="muted" style="margin-top:.3rem"></div>
-      </details>
-      <details style="margin-top:.3rem">
-        <summary class="muted" style="cursor:pointer">GitHub issue &mdash; submit results / report bug</summary>
-        <label>quant descriptor (for the issue text)</label>
-        <input id="quant" placeholder="compressed-tensors / Q4_K_M / fp8">
-        <div class="actions" style="margin-top:.4rem">
-          <button class="secondary" onclick="doIssue('results')">Submit config (RESULTS issue)</button>
-          <button class="secondary" onclick="doIssue('bug')">Report bug</button>
-        </div>
-      </details>
-    </div>
-
-    <details style="margin-top:.6rem">
-      <summary style="cursor:pointer"><b>hardware</b> <span class="muted">&mdash;
-        cards to plan on (auto-detected; open to edit or add hypothetical cards)</span></summary>
-      <fieldset style="margin-top:.4rem">
-        <legend>cards
-          <button class="secondary mini" onclick="detectGPUs()" title="re-query NVML">detect</button></legend>
-        <div id="detect_note" class="muted" style="margin-bottom:.4rem">detecting local GPUs…</div>
-        <div id="cardlist" class="cardlist"></div>
-        <div class="actions" style="margin-top:.4rem">
-          <button class="secondary mini" onclick="addCard(false)">+ add card</button>
-          <button class="secondary mini" onclick="addCard(true)" title="a hypothetical GPU you don't own yet">+ add future GPU</button>
-        </div>
-        <div class="muted" style="margin-top:.4rem">Tick = include in the plan.
-          &ldquo;keep free&rdquo; is per-card headroom (a display / another
-          process) carved off before sizing.</div>
-        <label style="margin-top:.5rem">Host RAM total (GiB) &mdash; for RAM-offload fit</label>
-        <input id="host_ram_gb" placeholder="(auto-detected; override to plan another host)">
+  <!-- #3: the old "Landscape" tab lived here as its own entry, showing a
+       one-model slice of the very same compose+feasibility computation with
+       four measured-only columns that are empty on every install (nothing in
+       the product writes a results.jsonl). It is a DRILL-DOWN of this matrix,
+       not a separate question, so it is a section here and the tab is gone. -->
+  <details class="cfg-section" style="margin-top:var(--s3)">
+    <summary style="cursor:pointer"><b>per-rig detail for one model</b>
+      <span class="muted">&mdash; one (model, quant) across several rigs, with
+      measured rows when you point it at a results.jsonl</span></summary>
+    <div class="muted" style="margin:var(--s2) 0">Rows are rigs.
+      <b>Measured</b> rows come from a results.jsonl of real runs; every other
+      row is the same planner feasibility estimate the matrix above uses. The
+      perf and energy columns are measured-only and stay empty until you supply
+      such a store &mdash; no number is invented to fill them.</div>
+  <div class="cols">
+    <div>
+      <fieldset>
+        <legend>model + quant</legend>
+        <label>Model (path / HF id)</label>
+        <input id="ls_model" placeholder="/path/to/Qwen3.6-27B-AWQ">
+        <label>quant descriptor</label>
+        <input id="ls_quant" placeholder="4b/AWQ/g128 | Q4_K_M | fp8">
+        <label>efficiency bucket (batch size)</label>
+        <input id="ls_bucket" placeholder="(optional, e.g. 16)">
+        <label>results.jsonl (measured; optional)</label>
+        <input id="ls_store" placeholder="(path to a measured store)">
+        <label><input type="checkbox" id="ls_similar" style="width:auto"> similar-quant (by bits — approximate)</label>
       </fieldset>
-    </details>
-
-    <details style="margin-top:.6rem">
-      <summary style="cursor:pointer"><b>download a model</b> <span class="muted">&mdash;
-        external HF fetch (occasional task)</span></summary>
-      <fieldset style="margin-top:.4rem">
-        <legend>download</legend>
-        <label>repo id (org/name)</label>
-        <input id="dl_repo" placeholder="unsloth/Qwen3.6-27B-GGUF" onchange="dlTargets()">
-        <label>model root (mount)</label>
-        <input id="dl_root" placeholder="(default first root)" onchange="dlTargets()">
-        <div id="dl_variants" style="display:none">
-          <label>GGUF quant</label>
-          <select id="dl_quant"></select>
-        </div>
-        <div style="margin-top:.5rem">
-          <button onclick="dlPreview()" id="dl_btn">Preview + download</button>
-        </div>
-        <div id="dl_out" class="muted" style="margin-top:.5rem"></div>
+      <fieldset>
+        <legend>rigs to feasibility-check (NAME=card,card,...)</legend>
+        <textarea id="ls_rigs" rows="4" placeholder="hetero=RTX 5090,RTX 3080 20GB,RTX 3080 20GB&#10;4x4090=RTX 4090,RTX 4090,RTX 4090,RTX 4090"></textarea>
       </fieldset>
-    </details>
-  </div>
-
-  <div>
-    <fieldset>
-      <legend>prospective placement + per-card fit (updates as flags change)</legend>
-      <div id="runner_placement" class="muted">plan a model to see the granular placement&hellip;</div>
-    </fieldset>
-    <div id="verdict"></div>
-    <div id="split"></div>
-    <div id="cards"></div>
-    <div id="advantage"></div>
-    <div id="pricebar" class="pricebar">
-      energy price
-      <input id="kwh_price" type="number" step="1" min="0" value="30"
-             oninput="if (window.__lastMeasured !== undefined) renderMeasured(window.__lastMeasured); if (window.__lastHicache !== undefined) renderHicacheSaved(window.__lastHicache); if (window.__lastRoofline !== undefined) renderRoofline(window.__lastRoofline, window.__lastRooflineEnergy)">
-      <span class="muted">ct/kWh (&euro;-cent; currency-agnostic &mdash; just a
-      multiplier). Costs below are in <b>ct</b>. Applies to the measured cost,
-      the HiCache kWh-saved band (#147) and, later, the virtual-rig estimate
-      (#148).</span>
+      <button onclick="doLandscape()">Build landscape</button>
     </div>
-    <div id="measured"></div>
-    <div id="hicache_saved"></div>
-    <div id="roofline"></div>
-    <div id="flags"></div>
-    <div id="issue"></div>
+    <div><div id="ls_out"></div></div>
   </div>
+  </details>
 </div>
-</div>
+
 
 <script>
 /*__VENDOR_MORPHDOM__*/
@@ -6334,9 +6584,8 @@ function applyViewMode(){
   const m=viewMode();
   document.body.classList.toggle('mode-simple', m==='simple');
   document.body.classList.toggle('mode-expert', m==='expert');
-  for(const k of VIEW_MODES){
-    const b=$('vm_'+k); if(b) b.classList.toggle('on', k===m);
-  }
+  const cb=$('vm_expert');
+  if(cb) cb.checked=(m==='expert');
   // The mode decides which panels are worth computing, so a switch asks for
   // the sections the newly visible panels need.
   scheduleRecompute();
@@ -6429,7 +6678,14 @@ function renderCards() {
     // checkbox (include)
     const cb = document.createElement('input');
     cb.type = 'checkbox'; cb.checked = c.include;
-    cb.onchange = () => { c.include = cb.checked; renderCards(); };
+    // #11/#12: the card SET is a wizard step. Re-ticking a card changes the
+    // set every later step is computed for, so it re-renders the unused list
+    // and marks the downstream steps stale rather than leaving numbers on
+    // screen that belong to a set that no longer exists.
+    cb.onchange = () => {
+      c.include = cb.checked; renderCards();
+      renderUnusedCards(); wizardInvalidate('hardware');
+    };
     // name + capability tag
     const nameWrap = document.createElement('span');
     const name = document.createElement('input');
@@ -6485,8 +6741,62 @@ function renderCards() {
     row.appendChild(barWrap);
     box.appendChild(row);
   });
-  updateGpuPick(); updateColoUI();
+  updateGpuPick(); updateColoUI(); renderUnusedCards();
 }
+
+// #11 -- what the cards you did NOT tick would add.
+//
+// An unticked card is not absent from the machine, it is a decision. Showing
+// it as "available, unused" with the VRAM it would contribute keeps that
+// decision visible; leaving it off the page entirely made the hardware step
+// look like it had already surveyed everything there is.
+//
+// The line is deliberately arithmetic only -- VRAM and card count are facts
+// the browser already holds. What another card does to throughput depends on
+// the split and the interconnect, which is the families table's job below,
+// so nothing is predicted here.
+function renderUnusedCards(){
+  const box=$('wz_unused'); if(!box) return;
+  const out=(typeof CARDS==='undefined')?[]:CARDS.filter(c=>!c.include);
+  const inc=(typeof CARDS==='undefined')?[]:CARDS.filter(c=>c.include);
+  if(!out.length){ box.innerHTML=''; return; }
+  const haveMib=inc.reduce((a,c)=>a+(c.total_mib||0),0);
+  let h='<b>available, unused</b> &mdash; not counted in anything below:<ul class="reasons">';
+  for(const c of out){
+    const mib=c.total_mib||0;
+    const pct=haveMib>0? Math.round(mib/haveMib*100):null;
+    h+='<li>'+esc(c.name||'(unnamed card)')+' &mdash; '+fmtMib(mib)
+      +(pct!=null?(' more VRAM to work with (+'+pct+'% of the ticked set), '):' , ')
+      +'and a '+(inc.length+1)+'-way split instead of '+(inc.length||0)
+      +(c.virtual?' <span class="est">(hypothetical card)</span>':'')
+      +'</li>';
+  }
+  h+='</ul><span class="muted">Tick one to have every step below recomputed '
+   +'for the larger set. What it does to throughput depends on the split and '
+   +'the interconnect &mdash; that is the families table, not a guess here.</span>';
+  box.innerHTML=h;
+}
+
+// ===========================================================================
+// #12 -- step granularity.
+//
+// Every step stays editable at any time; changing one must not silently leave
+// the answers of the later steps on screen. Editing step N marks steps > N
+// stale (a visible band on the fieldset) until they are recomputed. Nothing
+// is cleared and nothing has to be restarted -- the old numbers stay readable
+// while they are marked as belonging to the previous input.
+// ===========================================================================
+const WIZ_STEPS=['model','hardware','goal','families','command','expert'];
+function wizardInvalidate(from){
+  const i=WIZ_STEPS.indexOf(from);
+  if(i<0) return;
+  for(const s of WIZ_STEPS.slice(i+1)) wizardMarkStale(s, true);
+}
+function wizardMarkStale(step, stale){
+  const el=document.querySelector('[data-step="'+step+'"]');
+  if(el) el.classList.toggle('stale', !!stale);
+}
+function wizardFresh(step){ wizardMarkStale(step, false); }
 
 // The ONE model selector's state: the free-text field is the reference; the
 // discovered-models dropdown fills it; _modelMeta remembers format + GGUF
@@ -7280,11 +7590,19 @@ async function csForgetToken(){
   $('cs_submit_msg').textContent='stored token removed';
 }
 
+// The tab set IS the workflow order: watch the machine, configure it, measure
+// it, judge the answers, then the two archives (contributed rig data, own run
+// history). 'runner' is deliberately absent -- the Planner is no longer a tab
+// but the expert step at the end of the Guide, so #view_runner is nested
+// inside #view_wizard and inherits its visibility.
 function showTab(t) {
-  const TABS = ['landing','wizard','runner','bench','explore','landscape','energy','quality','pair','share'];
+  const TABS = ['landing','wizard','bench','quality','explore','energy','pair','share','history'];
   for (const v of TABS) $('view_'+v).style.display = t===v ? '' : 'none';
   for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
-  if ((t==='explore'||t==='landscape') && !window._profLoaded) loadProfiles();
+  if (t==='explore' && !window._profLoaded) loadProfiles();
+  // The archive is re-read on every entry, not once: a run that finished
+  // while another tab was open must be there when you come back to look.
+  if (t==='history') historyLoad();
   // #271: first visit only. Opening the tab READS state; it never measures,
   // so this is safe to call while somebody else owns the cards.
   if (t==='share') {
@@ -7293,18 +7611,15 @@ function showTab(t) {
   } else csStopPoll();
   if (t==='energy' && !window._energyInit) { window._energyInit=true; loadPowerProfile(); }
   if (t==='quality') { autofillQuality(); if(!window._qualityInit){window._qualityInit=true; loadShots();} }
-  if (t==='runner' && !window._runnerInit) {
-    window._runnerInit=true; detectGPUs(); loadModels();
-    loadFlagCatalog(); refreshServerStatus();
-  }
   if (t==='bench' && !window._benchInit) { window._benchInit=true; benchInit(); }
-  // The guide needs the same model list and card list the Planner does, so
-  // entering it warms them once rather than holding a second copy.
+  // The guide OWNS the planner form now (model picker in step 1, card set in
+  // step 2, the whole flag surface in the expert step), so entering it warms
+  // exactly what the Planner tab used to warm on its own first visit.
   if (t==='wizard') {
     if (!window._wizardInit) {
       window._wizardInit=true;
-      if (!window._runnerInit) { window._runnerInit=true; detectGPUs(); loadModels();
-        loadFlagCatalog(); refreshServerStatus(); }
+      window._runnerInit=true; detectGPUs(); loadModels();
+      loadFlagCatalog(); refreshServerStatus();
       wizardInit();
     }
     wizardSyncModel();
@@ -7316,9 +7631,9 @@ function showTab(t) {
   if (t==='pair') pairRefresh(); else pairStopPoll();
   // The landing page live-poll runs only while its tab is visible.
   if (t==='landing') startLanding(); else stopLanding();
-  // The Planner opens on the RUNNING configuration when there is one: the
+  // The expert step opens on the RUNNING configuration when there is one: the
   // useful default is what is loaded, not an empty form.
-  if (t==='runner') prefillFromRunning();
+  if (t==='wizard') prefillFromRunning();
 }
 
 // ===========================================================================
@@ -7541,7 +7856,51 @@ function cardLiveHtml(g){
     +sparkline(key+'_pow',80,18)
     +' &nbsp; SM '+g.sm_clock_mhz+'MHz &nbsp; '+g.temperature_c+'C'
     +' &nbsp; mem '+(g.mem_used_mib/1024).toFixed(1)+'/'+(g.mem_total_mib/1024).toFixed(1)+'G live'
-    +'</div>';
+    +'</div>'
+    +linkLiveHtml(g);
+}
+// #15 -- what is crossing this card's links right now.
+//
+// PCIe is NVML's own ~20 ms sample, so it is a rate and not a counter we have
+// to difference. NVLink counters ARE totals, so the first poll can only store
+// them and a rate appears on the second -- that reads as "pending", never as
+// zero. A card with no NVLink says so instead of reporting 0 GB/s: "no link"
+// and "an idle link" are different facts.
+//
+// Every figure is shown against a ceiling. With a calibration run that is the
+// card's link capability; without one it is the highest value seen so far,
+// which is raised the moment a bigger sample arrives -- so the reading is
+// honest from the first poll and gets sharper as the rig is used.
+function _gbs(v){ return v==null?null:(v<0.01?v.toFixed(3):v.toFixed(2)); }
+function _linkPart(label, tx, rx, max, tip){
+  if(tx==null && rx==null) return '';
+  const sum=(tx||0)+(rx||0);
+  const pct=(max&&max>0)? Math.min(100, sum/max*100) : null;
+  return '<span class="linkpart" title="'+esc(tip||'')+'">'+label+' '
+    +'<b>'+(_gbs(tx)||'--')+'</b>&uarr;/<b>'+(_gbs(rx)||'--')+'</b>&darr; GB/s'
+    +(max? (' <span class="muted">of '+_gbs(max)+'</span>'):'')
+    +(pct!=null? ('<span class="linkbar"><i style="width:'+pct.toFixed(1)+'%"></i></span>'):'')
+    +'</span>';
+}
+function linkLiveHtml(g){
+  let h='';
+  h+=_linkPart('PCIe', g.pcie_tx_gbs, g.pcie_rx_gbs, g.pcie_max_gbs,
+    'Host<->card traffic over PCIe, NVML\'s own short-window sample. '
+    +(g.pcie_gen? ('Link trains to gen '+g.pcie_gen+' x'+g.pcie_width+'. '):'')
+    +'The ceiling is the link capability, or the highest value seen so far '
+    +'when nothing has been calibrated yet.');
+  if(g.nvlink_links>0){
+    h+=(h?' &nbsp; ':'')
+      +((g.nvlink_tx_gbs==null&&g.nvlink_rx_gbs==null)
+        ? '<span class="linkpart muted" title="NVLink counters are totals; a '
+          +'rate needs two samples, so the first poll has none yet.">NVLink '
+          +g.nvlink_links+' links &mdash; rate on the next poll</span>'
+        : _linkPart('NVLink', g.nvlink_tx_gbs, g.nvlink_rx_gbs, g.nvlink_max_gbs,
+            'Card<->card traffic over '+g.nvlink_links+' active NVLink(s).'));
+  }
+  if(!h) return '';
+  return '<div class="cardlive" style="margin:.15rem 0;font-size:.72rem">'
+    +h+'</div>';
 }
 // One card's fine-grained segment bar + legend. Segments come READY-MADE from
 // the placement JSON (id/label/mib/detail/replicated) -- the hover tooltip is
@@ -7561,7 +7920,17 @@ function segBarHtml(c, total, free){
     if(!(sg.mib>0)) continue;
     ((sg.mib/total*100) < 1 ? tiny : main).push(sg);
   }
-  let bar='<div class="segbar">';
+  // SIMPLE mode: one solid fill for everything this configuration occupies,
+  // and the rest of the card empty. No segment boundaries, no colour coding,
+  // nothing to decode -- "how full is this card" is the whole question at
+  // this density. The itemised version below is the expert answer.
+  const usedPct=Math.min(100, Math.max(0, c.total_mib/total*100));
+  let bar='<div class="segbar simple-only" title="'
+    +esc('used '+fmtMib(c.total_mib)+' of '+fmtMib(total)
+         +' · free '+fmtMib(free))+'">'
+    +'<span style="width:'+usedPct.toFixed(2)+'%;background:var(--accent)"></span>'
+    +'</div>';
+  bar+='<div class="segbar expert-only">';
   for(const sg of main){
     const pct=Math.min(100, sg.mib/total*100);
     bar+='<span '+(sg.replicated?'class="hatch" ':'')
@@ -7577,7 +7946,16 @@ function segBarHtml(c, total, free){
       +esc('other ('+fmtMib(tinySum)+'): '
         +tiny.map(s=>s.label+' '+fmtMib(s.mib)).join(' · '))+'"></span>';
   bar+='</div>';
-  let leg='<div class="seglegend">';
+  // The itemised legend is the EXPERT half of the VRAM key; simple mode gets
+  // the same totals as one line. Both are emitted and the body-level
+  // mode-simple / mode-expert class picks one, so flipping the switch costs
+  // no re-render and no backend call -- and, unlike before, actually changes
+  // what a card shows. (The switch used to be inert on the monitor: the only
+  // .expert-only / .simple-only markup in the page sat in the Planner tab.)
+  let leg='<div class="segsum simple-only">used <b>'+fmtMib(c.total_mib)+'</b>'
+    +' of '+fmtMib(total)+' &middot; '+Math.round(c.total_mib/total*100)+'%'
+    +' &middot; free '+fmtMib(free)+'</div>';
+  leg+='<div class="seglegend expert-only">';
   for(const sg of main)
     leg+='<span class="dot" style="background:'+(SEG_COLORS[sg.id]||'#30363d')
       +'" title="'+esc(sg.detail||'')+'"></span>'
@@ -7695,6 +8073,23 @@ function renderPlacement(pl, liveGpus, opts){
     }
     h+='</div>';
   }
+  // Cards the PLACEMENT does not use are still cards in this machine. The
+  // loop above walks pl.cards (one block per rank-carrying card), so a rig
+  // whose running server occupies one GPU used to render exactly one block
+  // and silently drop the other two -- the monitor looked like a one-card
+  // box. Every remaining NVML card gets a telemetry-only block, marked
+  // "not in this configuration", so the card count on screen always equals
+  // the card count in the machine.
+  const placed=new Set((pl.cards||[]).map(c=>c.gpu_index));
+  for(const g of (liveGpus||[])){
+    const k=(g.cuda_index!=null? g.cuda_index : g.nvml_index);
+    if(placed.has(k)) continue;
+    h+='<div class="cardblock idlecard">'
+      +'<div><b>'+(devLabel(g.cuda_index, g.nvml_index)||('GPU'+k))+'</b> '+esc(g.name)
+      +' <span class="muted">'+fmtMib(g.mem_total_mib)+' total &middot; '
+      +'<span class="est">not in this configuration</span></span></div>'
+      +cardLiveHtml(g)+'</div>';
+  }
   h+=graphMemHtml(pl, opts);
   h+='<div class="legend">KV token vector ['+pl.token_vector.join(',')
     +'] ('+esc(pl.token_vector_source)+')'
@@ -7792,46 +8187,111 @@ function landingEndpoint(){
 function resetLandingRings(){
   window._ring={}; window._stripActive={}; window._stripHit=null;
 }
-function setLandingEndpoint(){
-  try{ localStorage.setItem('land_endpoint', $('land_endpoint').value.trim()); }catch(e){}
+// ---- #13: the monitor target, as two unambiguous actions ------------------
+//
+// The old trio was "use" / "auto" / "detect", and "detect" silently meant two
+// different things depending on whether the box had text in it: with text it
+// duplicated "use", without text it duplicated "auto". On top of that, "use"
+// applied whatever was typed without ever checking it, so a wrong address
+// produced no message at all and the monitor simply sat there -- which is the
+// "it rather doesn't work" part.
+//
+// Now: Connect always means "check what I typed and monitor it", Find a
+// server always means "sweep and connect to what you find", and Unpin appears
+// only when there is something pinned to remove. The mode is printed, not
+// inferred from an input's emptiness.
+
+// One place decides what the mode line and the Unpin button say, so the two
+// can never disagree about whether a target is pinned.
+function renderLandingMode(){
+  const pinned=landingEndpoint();
+  const btn=$('land_unpin'); if(btn) btn.style.display=pinned?'':'none';
+  const el=$('land_mode'); if(!el) return;
+  el.innerHTML = pinned
+    ? 'Pinned to <b>'+esc(pinned)+'</b> &mdash; only this address is monitored.'
+    : 'Automatic: the managed instance if there is one, otherwise a server '
+      +'found on the common local ports.';
+}
+function applyLandingEndpoint(ep){
+  try{
+    if(ep) localStorage.setItem('land_endpoint', ep);
+    else localStorage.removeItem('land_endpoint');
+  }catch(e){}
+  $('land_endpoint').value=ep||'';
+  renderLandingMode();
   resetLandingRings(); landingPoll();
 }
 function clearLandingEndpoint(){
-  try{ localStorage.removeItem('land_endpoint'); }catch(e){}
-  $('land_endpoint').value=''; resetLandingRings(); landingPoll();
+  applyLandingEndpoint('');
+  $('land_target_note').textContent='back to automatic.';
 }
-// 'detect' with something typed in the endpoint box VERIFIES that one target;
-// with the box empty it sweeps the local sglang port range. Same endpoint,
-// same button -- the input decides which of the two the user asked for.
-async function detectLandingEndpoint(){
+// Kept as the name the rest of the page already calls after a successful
+// probe; it now goes through the one apply path.
+function setLandingEndpoint(){
+  applyLandingEndpoint(($('land_endpoint').value||'').trim());
+}
+
+function _landNoMetricsNote(ep){
+  return '<span class="est">Connected to '+esc(ep)+', but it serves no '
+    +'/metrics &mdash; it was started without --enable-metrics, so token '
+    +'rates stay unavailable. Card telemetry still works.</span>';
+}
+
+// Connect: verify the typed address, then pin it. A refusal is REPORTED.
+async function landingConnect(){
   const typed=($('land_endpoint').value||'').trim();
-  $('land_target_note').textContent = typed
-    ? ('probing '+typed+'…') : 'sweeping the local sglang ports…';
+  if(!typed){
+    $('land_target_note').innerHTML='<span class="est">Type a host:port first, '
+      +'or use <b>Find a server</b>.</span>';
+    return;
+  }
+  $('land_target_note').textContent='checking '+typed+'…';
   try{
     const r=await fetch('/api/detect_endpoint',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(typed?{endpoint:typed}:{})});
+      body:JSON.stringify({endpoint:typed})});
     const d=await r.json();
     if(d.endpoint){
-      $('land_endpoint').value=d.endpoint.replace(/^https?:\/\//,'');
-      setLandingEndpoint();
-      if(d.metrics===false)
-        $('land_target_note').innerHTML='<span class="est">found '
-          +esc(d.endpoint)+', but it serves no /metrics &mdash; started '
-          +'without --enable-metrics, so live rates stay unavailable.</span>';
-    } else if(d.explicit){
-      $('land_target_note').textContent=d.error||('no sglang server at '+typed);
+      applyLandingEndpoint(d.endpoint.replace(/^https?:\/\//,''));
+      $('land_target_note').innerHTML=(d.metrics===false)
+        ? _landNoMetricsNote(d.endpoint)
+        : 'Connected to <b>'+esc(d.endpoint)+'</b>.';
+    } else {
+      $('land_target_note').innerHTML='<span class="reasons">'
+        +esc(d.error||('No sglang server answered at '+typed+'.'))
+        +' Nothing was changed &mdash; the monitor is still '
+        +(landingEndpoint()?('pinned to '+esc(landingEndpoint())):'on automatic')
+        +'.</span>';
+    }
+  }catch(e){ $('land_target_note').textContent=''+e; }
+}
+
+// Find a server: always a sweep, whatever is in the box.
+async function landingFindServer(){
+  $('land_target_note').textContent='sweeping the local sglang ports…';
+  try{
+    const r=await fetch('/api/detect_endpoint',{method:'POST',
+      headers:{'Content-Type':'application/json'}, body:'{}'});
+    const d=await r.json();
+    if(d.endpoint){
+      applyLandingEndpoint(d.endpoint.replace(/^https?:\/\//,''));
+      $('land_target_note').innerHTML=(d.metrics===false)
+        ? _landNoMetricsNote(d.endpoint)
+        : 'Found and connected to <b>'+esc(d.endpoint)+'</b>.';
     } else {
       const pr=d.probed||[];
       const span=pr.length>4?(pr[0]+'-'+pr[pr.length-1]+' ('+pr.length+' ports)')
                             :pr.join(', ');
-      $('land_target_note').textContent='nothing reachable on '+span;
+      $('land_target_note').innerHTML='<span class="reasons">No sglang server '
+        +'answered on '+esc(span)+'. If it listens elsewhere, type the address '
+        +'and press Connect.</span>';
     }
   }catch(e){ $('land_target_note').textContent=''+e; }
 }
 async function startLanding(){
   if(window._landTimer) return;
   if(!$('land_endpoint').value) $('land_endpoint').value=landingEndpoint();
+  renderLandingMode();
   await landingPoll();
   window._landTimer=setInterval(landingPoll, LAND_POLL_MS);
 }
@@ -8031,15 +8491,16 @@ function renderLandingStrip(s){
   }
   if(s.hicache)
     tierTxt+=' &middot; host pool '+((s.hicache.host_used_frac||0)*100).toFixed(0)+'% used';
-  // live energy: J/token = summed NVML watts / active-phase tok/s. The phase
-  // is whichever rate is active (decode wins when both run, chunked prefill).
-  // Undefined while idle -> '--' and a FROZEN graph (no divide-by-zero junk).
-  let phase=null, tokS=null;
-  if(dec!=null&&dec>EPS){phase='decode';tokS=dec;}
-  else if(pfx!=null&&pfx>EPS){phase='prefill';tokS=pfx;}
-  const jtok=(watts!=null&&tokS)?watts/tokS:null;
-  const tokKwh=jtok?3.6e6/jtok:null;
-  if(jtok!=null) stripPush('st_j',t,jtok);
+  // live energy: J/token = summed NVML watts / that phase's tok/s. The two
+  // phases are reported SEPARATELY -- a prefill token and a decode token cost
+  // different energy, and a single "whichever is active" figure silently
+  // changed meaning under the reader mid-run. Each is undefined while its own
+  // phase is idle -> '--' and a FROZEN graph (no divide-by-zero junk).
+  const jtokDec=(watts!=null&&dec!=null&&dec>EPS)?watts/dec:null;
+  const jtokPfx=(watts!=null&&pfx!=null&&pfx>EPS)?watts/pfx:null;
+  const kwh1M=(j)=>(j==null?null:j/3.6);   // J/token -> kWh per 1M tokens
+  if(jtokDec!=null) stripPush('st_j',t,jtokDec);
+  if(jtokPfx!=null) stripPush('st_jp',t,jtokPfx);
   // live cost per phase (ct / 1M tok at the shared kWh price)
   const priceCt=getKwhPriceCt();
   const decCt=(watts!=null&&dec!=null&&dec>EPS)?jPerTokToCtPer1M(watts/dec,priceCt):null;
@@ -8060,10 +8521,12 @@ function renderLandingStrip(s){
   const sgt=(sd&&sd.grand_total)||null;
   let savedVal=STRIP_DASH, savedSub='no savings recorded yet (#147 accumulator)';
   if(sgt&&sgt.saved_kwh_band){
-    const cb=kwhBandToCt(sgt.saved_kwh_band,priceCt);
-    savedVal=_f2(cb[0])+'&ndash;'+_f2(cb[1])+'<small> ct</small>';
-    savedSub=_f1(sgt.recovered_prefill_tokens)
-      +' tok recovered &middot; TOTAL across sessions';
+    const kb=sgt.saved_kwh_band, cb=kwhBandToCt(kb,priceCt);
+    // The headline is the kWh band -- the physical quantity. The money is the
+    // derived line, because it moves with the price and the energy does not.
+    savedVal=_f3(kb[0])+'&ndash;'+_f3(kb[1])+'<small> kWh</small>';
+    savedSub=_f2(cb[0])+'&ndash;'+_f2(cb[1])+' ct &middot; '
+      +_f1(sgt.recovered_prefill_tokens)+' prefill tok recovered';
   }
   $('landing_strip').innerHTML=
     stripTile('strip_decode','decode tok/s',
@@ -8089,12 +8552,25 @@ function renderLandingStrip(s){
       noMetrics?STRIP_DASH:hitBig, sub(tierTxt), 'st_hit',
       'Per-tier hit rate over the last prompt window: device = VRAM hot tier, '
       +'host = system RAM, storage = disk. Headline = overall across tiers.')
-   +stripTile('strip_energy','energy now',
+   +stripTile('strip_energy','energy / token &mdash; DECODE',
       noMetrics?STRIP_DASH
-        :(jtok!=null?num(jtok)+'<small> J/tok ('+phase+')</small>':STRIP_DASH),
-      sub((tokKwh!=null?_f1(tokKwh):'--')+' tok/kWh &middot; '
+        :(jtokDec!=null?num(jtokDec)+'<small> J/tok</small>':STRIP_DASH),
+      sub((jtokDec!=null?_f2(kwh1M(jtokDec)):'--')+' kWh/1M tok &middot; '
         +(watts!=null?Math.round(watts)+' W (NVML sum)':'-- W')),
-      'st_j')
+      'st_j',
+      'Energy per DECODE token: summed NVML board watts / decode tok/s. '
+      +'Reported separately from prefill because the two phases cost '
+      +'different energy per token. Undefined (--) while decode is idle.')
+   +stripTile('strip_energy_pfx','energy / token &mdash; PREFILL',
+      noMetrics?STRIP_DASH
+        :(jtokPfx!=null?num(jtokPfx)+'<small> J/tok</small>':STRIP_DASH),
+      sub((jtokPfx!=null?_f2(kwh1M(jtokPfx)):'--')+' kWh/1M tok &middot; '
+        +'non-cached prefill only'),
+      'st_jp',
+      'Energy per REAL computed prefill token: summed NVML board watts / '
+      +'non-cached prefill tok/s. Cache-served tokens are excluded here and '
+      +'counted as SAVED in the tile on the right. Undefined (--) while no '
+      +'prefill runs.')
    +stripTile('strip_cost','cost now (ct/1M tok)',
       noMetrics?STRIP_DASH
         :(decCt!=null?num(decCt,2)+'<small> ct/1M decode</small>':STRIP_DASH),
@@ -8196,9 +8672,10 @@ async function loadFlagCatalog(){
 // only puts it on the elements; it never composes a sentence of its own, so
 // there is exactly one place to edit when a control's cost changes.
 const STATIC_TIPS={
-  vm_simple:'view_mode.simple', vm_expert:'view_mode.expert',
-  tune_both:'tune.both', tune_maxkv:'tune.maxkv',
-  tune_dec:'tune.dec', tune_enc:'tune.enc',
+  // The tip lands on the LABEL: the checkbox itself is a 13px box and a
+  // tooltip anchored to it is nearly unhoverable. (vm_simple is gone with
+  // the two-way pick; applyStaticTips skips ids that are not on the page.)
+  vm_expert_lbl:'view_mode.expert',
   sv_ctx:'context_length', sv_ctx_slider:'context_length',
   row_sv_ctx:'context_length',
   max_running_requests:'max_running_requests', mrr_slider:'max_running_requests',
@@ -8268,7 +8745,7 @@ function flagRowHtml(f){
   let h='<div class="setrow" id="flrow_'+f.id+'" title="'+esc(tip)+'">'
     +'<span class="lbl" title="'+esc(tip)+'">'+esc(f.name)+src
     +' <span class="flag-q" id="flq_'+f.id+'" style="color:#e3a008"></span>'
-    +'<span class="chg" title="changed from preset"></span></span>';
+    +'<span class="chg" title="changed from the loaded profile"></span></span>';
   if(f.type==='bool')
     h+='<label class="switch"><input type="checkbox" id="fl_'+f.id+'"'
       +(cur?' checked':'')+' onchange="onFlagChange(\''+f.id+'\')"><span class="track"></span></label>';
@@ -8798,6 +9275,9 @@ function renderFlagWarnings(ws){
 async function onRunnerModel(){
   const model=$('model').value.trim(); if(!model) return;
   loadConfigProfiles(); scheduleRecompute();
+  // #12: the model is step 1. Everything below it was computed for the
+  // previous checkpoint until it is asked again.
+  wizardSyncModel(); wizardFresh('model'); wizardInvalidate('model');
 }
 
 // ===========================================================================
@@ -9016,7 +9496,7 @@ function renderLivePanel(s, envelope){
         +' &mdash; readings appear once it is ready.</span>');
     } else {
       setHTML(note,'<span class="muted"><b>No inference server running.</b> '
-        +'Nothing to read here yet &mdash; start one in the Planner tab, or '
+        +'Nothing to read here yet &mdash; configure and start one on the Guide tab, or '
         +'point the monitor at a running one above.</span>');
     }
     return;
@@ -9223,8 +9703,8 @@ function wizardBody(){
 function wizardSyncModel(){
   const m=($('model')&&$('model').value.trim())||'';
   const el=$('wz_model'); if(!el) return;
-  setHTML(el, m?esc(m):'<span class="muted">nothing picked yet &mdash; pick '
-    +'one on the Planner tab</span>');
+  setHTML(el, m?esc(m):'<span class="muted">nothing picked yet &mdash; '
+    +'choose one below</span>');
 }
 async function wizardInit(){
   const sel=$('wz_target');
@@ -9303,6 +9783,9 @@ async function wizardFamilies(){
     setHTML(box,'<div class="rev-error">'+esc(apiError(e))+'</div>'); return;
   } finally { stale(box,false); }
   window._wizard=d;
+  // The families table is now the current answer for the current model, card
+  // set and goal, so those marks come off.
+  for(const st of ['model','hardware','goal','families']) wizardFresh(st);
   const sel=$('wz_target');
   if(sel&&d.ok){
     const cur=sel.value;
@@ -9431,6 +9914,7 @@ async function wizardCommand(){
     if(apiAborted(e)) return;
     setHTML(box,'<div class="rev-error">'+esc(apiError(e))+'</div>'); return;
   } finally { stale(box,false); }
+  wizardFresh('command');
   if(!d.ok){ setHTML(box,'<div class="rev-error">'+esc(d.error||'')+'</div>'); return; }
   let h='<div class="muted">'+esc(d.label)+' &mdash; recipe '+esc(d.recipe)+'</div>';
   h+='<pre style="white-space:pre-wrap;word-break:break-all">'
@@ -9579,9 +10063,24 @@ function renderLeverProfiles(){
   const rows=(d.profiles||[]).filter(p=>p.resolved);
   const sel=rows.filter(p=>p.key===cur)[0]||rows[0];
   const metricKeys=((rows[0]&&rows[0].metrics)||[]).map(m=>m.key);
+  // #215 honest-collapse marker. Several stops legitimately resolve to the
+  // SAME split on a given rig (the total weight bytes are invariant under an
+  // MLP redistribution, so the capacity objective is flat, and a modelled
+  // speed move inside the measured boot-to-boot noise floor is not worth a
+  // different configuration). The backend already says so per row via
+  // same_as_baseline; without it on the column head, identical columns read
+  // as a broken control rather than as the answer.
+  const baseLabel=(rows.filter(p=>p.is_base_split)[0]||{}).label||d.baseline;
+  const collapsed=rows.filter(p=>p.same_as_baseline&&!p.is_base_split);
   let h='<div class="lp-wrap"><table class="lp"><thead><tr><th></th>'
     +rows.map(p=>'<th class="'+(p.key===cur?'on':'')+'" title="'
-      +esc(tip('lever_profile.'+p.key))+'">'+esc(p.label)+'</th>').join('')
+      +esc(tip('lever_profile.'+p.key)
+        +(p.same_as_baseline&&!p.is_base_split
+          ? '\n\nResolves to the same split as ' + baseLabel + ' on this rig: '
+            + (p.selection_reason||'') : ''))+'">'+esc(p.label)
+      +(p.same_as_baseline&&!p.is_base_split
+        ? '<span class="lp-same">= '+esc(baseLabel)+'</span>' : '')
+      +'</th>').join('')
     +'</tr></thead><tbody>';
   metricKeys.forEach(k=>{
     const first=(rows[0].metrics||[]).filter(m=>m.key===k)[0]||{};
@@ -9613,6 +10112,20 @@ function renderLeverProfiles(){
   h+='<div class="lp-note">Deltas are against <b>'+esc(d.baseline)
     +'</b>. Every figure is a planner run of that profile; a cell that says '
     +'"not computed" names the missing input on hover.</div>';
+  // Say it in prose too, once, naming the stops. A reader who sees three
+  // identical columns must not have to hover a header to learn that the
+  // repetition is the finding.
+  if(collapsed.length)
+    h+='<div class="lp-note lp-collapse"><b>'
+      +collapsed.map(p=>esc(p.label)).join(', ')+'</b> '
+      +(collapsed.length===1?'shows':'show')+' the same numbers as <b>'
+      +esc(baseLabel)+'</b> because '+(collapsed.length===1?'it resolves':'they resolve')
+      +' to the same split on this rig &mdash; each was planned separately and '
+      +'landed on the same answer. That is the result, not a missing one: '
+      +esc(collapsed[0].selection_reason||'')
+      +' What separates these stops further is a knob the offline model cannot '
+      +'predict (KV-token ownership, <code>--rank-kv-ratio</code>) and a probe '
+      +'of these cards&#39; real rates.</div>';
 
   if(sel){
     h+='<div class="lp-note">'+esc(sel.axis_note||'')+'</div>';
@@ -9723,6 +10236,12 @@ async function cardProbePoll(){
 // move the starting point, not to fence the controls in: everything stays
 // adjustable afterwards, and a value that genuinely cannot work is refused
 // by the planner with a reason rather than by a slider that stops early.
+// #7: the tuning-objective BUTTONS are gone (they were the second of two
+// prefabricated starting points sitting in one panel). applyTune stays,
+// because it is the mechanism the working-point stops use to write
+// --rank-perf-tune, and the flag itself remains editable as its own row in
+// the flag surface. markTune therefore has to tolerate its old widgets being
+// absent -- it looks each one up and skips it.
 const TUNE_LABELS={both:'balanced', maxkv:'max KV', dec:'max decode', enc:'max prefill'};
 function applyTune(mode){
   window._flagSettings=window._flagSettings||{};
@@ -9874,17 +10393,25 @@ async function loadConfigProfiles(){
     window._draftCandidates=d.draft_candidates||[];
     window._modelHasMtp=(d.model_has_mtp===undefined?null:d.model_has_mtp);
     renderDraftPick(); updateSpecDraftHint();
-    const nGen=(d.generated||[]).length;
-    window._profiles=(d.generated||[]).concat(d.saved||[]);
-    // LM-Studio-style preset DROPDOWN: generated presets first, user-saved
-    // after (marked); picking one applies it and fills the settings rows.
-    let h='<label for="profile_select">preset</label>'
-      +'<select id="profile_select" onchange="applyProfileSel()">'
-      +'<option value="">&mdash; apply a preset &mdash;</option>'
-      +window._profiles.map((p,i)=>'<option value="'+i+'" title="'
-        +esc((p.info||[]).join(' | '))+'">'+esc(p.name)
-        +(i>=nGen?' (saved)':'')+'</option>').join('')
-      +'</select>';
+    // #7: ONLY the user's own saved profiles. The endpoint still returns
+    // d.generated (the CLI and the family generator use it), but the
+    // dashboard no longer offers prefabricated presets: the guide works the
+    // configuration out, this panel adjusts it, and a name is given to the
+    // result. Offering a canned starting point next to a computed one is the
+    // duplication that made this panel read as two competing mechanisms.
+    window._profiles=(d.saved||[]);
+    let h;
+    if(!window._profiles.length){
+      h='<span class="muted">No saved profiles yet. Configure this page the '
+       +'way you want it, then save it under a name below.</span>';
+    } else {
+      h='<label for="profile_select">saved profile</label>'
+       +'<select id="profile_select" onchange="applyProfileSel()">'
+       +'<option value="">&mdash; load a saved profile &mdash;</option>'
+       +window._profiles.map((p,i)=>'<option value="'+i+'" title="'
+         +esc((p.info||[]).join(' | '))+'">'+esc(p.name)+'</option>').join('')
+       +'</select>';
+    }
     setHTML($('profile_pick'), h);
   }catch(e){
     if(apiAborted(e)) return;
@@ -10539,8 +11066,7 @@ function benchInit(){
   const t=window._lastTarget;
   if(t && t.endpoint && !$('bn_endpoint').value.trim())
     $('bn_endpoint').value=t.endpoint.replace(/^https?:\/\//,'');
-  benchProbe(true);  // catalog + presets only; nothing probed without endpoint
-  benchHistory();
+  benchProbe(true);  // catalog only; nothing probed without an endpoint
   // Reads what is already on disk. No measurement starts from opening a tab:
   // the first read of a running engine only opens the delta window, which the
   // round-time tile says in those words.
@@ -10636,58 +11162,195 @@ function benchPreset(p){
     if(!benchGated(t) && ids.includes(t.test_id)) window._benchSel.add(t.test_id);
   renderBenchTests();
 }
-// ---- run history ----------------------------------------------------------
-function benchHistoryModel(){
-  return $('bn_hist_all').checked ? '' : ($('bn_model').value.trim()||'');
-}
-async function benchHistory(){
-  const m=benchHistoryModel();
+// ===========================================================================
+// #6 -- run History tab.
+//
+// The list is fetched ONCE per refresh and filtered in the browser, so period
+// / outcome / text filters are instant and cannot disagree with the counts.
+// Only the model filter and the row limit go to the server, because those are
+// what the store itself indexes. Deletion goes through DELETE
+// /api/bench_history, which finally reaches bench_history.delete_run.
+// ===========================================================================
+window._hsRuns=[];        // last fetched summaries (unfiltered)
+window._hsOpen=null;      // run_id currently shown in the detail panel
+
+function historyFilterModel(){ return ($('hs_model')||{}).value||''; }
+
+async function historyLoad(){
+  const m=historyFilterModel();
+  const lim=parseInt(($('hs_limit')||{}).value||'50')||50;
+  const q='?limit='+lim+(m?('&model='+encodeURIComponent(m)):'');
+  setHTML($('hs_list'),'<span class="muted">loading&hellip;</span>');
   try{
-    const d=await (await fetch('/api/bench_history'+(m?('?model='+encodeURIComponent(m)):''))).json();
-    if(!d.ok){ setHTML($('bn_history'),'<span class="reasons">'+esc(d.error||'error')+'</span>'); return; }
-    $('bn_hist_note').textContent=(d.runs.length||0)+' run'
-      +((d.runs.length===1)?'':'s')+' in '+d.root;
-    if(!d.runs.length){
-      setHTML($('bn_history'), m
-        ? 'no runs recorded for this model yet.'
-        : 'no runs recorded yet.');
-      return;
-    }
-    let h='<table><tr><th>when</th><th>model</th><th>tests</th>'
-      +'<th>pass</th><th>fail</th><th>warn</th><th>skip</th>'
-      +'<th>exchanges</th><th></th></tr>';
-    for(const r of d.runs){
-      const c=r.counts||{};
-      const when=new Date((r.started_at||0)*1000).toLocaleString();
-      h+='<tr><td>'+esc(when)+'</td>'
-        +'<td>'+esc(r.model||'(unnamed)')+'</td>'
-        +'<td>'+(r.n_tests||0)+'</td>'
-        +'<td class="st-pass">'+(c.pass||0)+'</td>'
-        +'<td class="st-fail">'+(c.fail||0)+'</td>'
-        +'<td class="st-warn">'+(c.warn||0)+'</td>'
-        +'<td class="st-skip">'+(c.skip||0)+'</td>'
-        +'<td>'+(r.n_exchanges||0)+'</td>'
-        +'<td><button class="mini secondary" onclick="benchShowRun(\''+esc(r.run_id)+'\')">view</button> '
-        +'<a class="pill" href="/api/bench_run_detail?download=1&run_id='
-        +encodeURIComponent(r.run_id)+'" download>download</a></td></tr>';
-    }
-    h+='</table><div id="bn_run_detail"></div>';
-    setHTML($('bn_history'), h);
-  }catch(e){ setHTML($('bn_history'),'<span class="reasons">'+esc(''+e)+'</span>'); }
+    const d=await (await fetch('/api/bench_history'+q)).json();
+    if(!d.ok){ setHTML($('hs_list'),'<span class="reasons">'+esc(d.error||'error')+'</span>'); return; }
+    window._hsRuns=d.runs||[];
+    window._hsRoot=d.root||'';
+    historySyncModelOptions();
+    historyRender();
+  }catch(e){ setHTML($('hs_list'),'<span class="reasons">'+esc(''+e)+'</span>'); }
 }
+
+// The model filter is built from the runs that exist, not from a field on
+// another tab -- that indirection was the reason the list changed by itself.
+function historySyncModelOptions(){
+  const sel=$('hs_model'); if(!sel) return;
+  const cur=sel.value;
+  const names=[];
+  for(const r of window._hsRuns) if(r.model && names.indexOf(r.model)<0) names.push(r.model);
+  names.sort();
+  if(cur && names.indexOf(cur)<0) names.push(cur);
+  sel.innerHTML='<option value="">all models</option>'
+    +names.map(n=>'<option value="'+esc(n)+'"'+(n===cur?' selected':'')+'>'
+      +esc(n)+'</option>').join('');
+}
+
+function historyOutcome(r){
+  const c=r.counts||{};
+  if(r.error) return 'error';
+  return (c.fail||0)>0 ? 'failed' : 'clean';
+}
+
+function historyFiltered(){
+  const days=parseInt(($('hs_period')||{}).value||'0')||0;
+  const oc=($('hs_outcome')||{}).value||'';
+  const q=(($('hs_search')||{}).value||'').trim().toLowerCase();
+  const cutoff=days? (Date.now()/1000 - days*86400) : null;
+  return (window._hsRuns||[]).filter(r=>{
+    if(cutoff!=null && (r.started_at||0) < cutoff) return false;
+    if(oc && historyOutcome(r)!==oc) return false;
+    if(q){
+      const hay=((r.model||'')+' '+(r.endpoint||'')+' '+(r.preset||'')
+        +' '+(r.run_id||'')).toLowerCase();
+      if(hay.indexOf(q)<0) return false;
+    }
+    return true;
+  });
+}
+
+// Group by calendar day: a chronological archive reads as days, not as 200
+// undifferentiated rows.
+function historyDayKey(ts){
+  const d=new Date((ts||0)*1000);
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')
+    +'-'+String(d.getDate()).padStart(2,'0');
+}
+function _hsTime(ts){
+  const d=new Date((ts||0)*1000);
+  return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+}
+function _hsDayLabel(key,ts){
+  const today=historyDayKey(Date.now()/1000);
+  const yest=historyDayKey(Date.now()/1000-86400);
+  if(key===today) return 'today';
+  if(key===yest) return 'yesterday';
+  return new Date((ts||0)*1000).toLocaleDateString(undefined,
+    {weekday:'short', year:'numeric', month:'short', day:'numeric'});
+}
+
+function historyRender(){
+  const rows=historyFiltered();
+  const total=(window._hsRuns||[]).length;
+  const note=$('hs_note');
+  if(note) note.textContent=rows.length+' of '+total+' run'+(total===1?'':'s')
+    +' shown'+(window._hsRoot?(' · '+window._hsRoot):'');
+  if(!rows.length){
+    setHTML($('hs_list'), total
+      ? '<span class="muted">no run matches these filters.</span>'
+      : '<span class="muted">no runs recorded yet. Finish a run on the '
+        +'Benchmark tab and it appears here.</span>');
+    return;
+  }
+  let h='', day=null;
+  for(const r of rows){
+    const k=historyDayKey(r.started_at);
+    if(k!==day){ day=k;
+      h+='<div class="hs-day">'+esc(_hsDayLabel(k,r.started_at))+'</div>'; }
+    const c=r.counts||{};
+    const oc=historyOutcome(r);
+    const sel=(window._hsOpen===r.run_id)?' on':'';
+    // Title first, numbers second: a run is identified by what it ran
+    // against, not by the hash in its filename.
+    h+='<div class="hs-row'+sel+'" onclick="historyShowRun(\''+esc(r.run_id)+'\')">'
+      +'<div class="hs-main"><b>'+esc(r.model||'(unnamed model)')+'</b>'
+      +'<span class="hs-when">'+_hsTime(r.started_at)+'</span></div>'
+      +'<div class="hs-sub">'
+      +(r.preset?('<span class="pill">'+esc(r.preset)+'</span> '):'')
+      +(r.endpoint?(esc(r.endpoint)+' · '):'')
+      +(r.n_tests||0)+' tests · '+(r.n_exchanges||0)+' exchanges'
+      +(r.duration_s?(' · '+Math.round(r.duration_s)+' s'):'')
+      +'</div>'
+      +'<div class="hs-sub">'
+      +'<span class="st-pass">'+(c.pass||0)+' pass</span> '
+      +'<span class="st-fail">'+(c.fail||0)+' fail</span> '
+      +'<span class="st-warn">'+(c.warn||0)+' warn</span> '
+      +'<span class="st-skip">'+(c.skip||0)+' skip</span>'
+      +(oc==='error'?' <span class="st-fail">ended with an error</span>':'')
+      +'</div>'
+      +'<div class="hs-act" onclick="event.stopPropagation()">'
+      +'<button class="mini secondary" onclick="historyShowRun(\''+esc(r.run_id)+'\')">open</button> '
+      +'<a class="pill" href="/api/bench_run_detail?download=1&run_id='
+      +encodeURIComponent(r.run_id)+'" download>download</a> '
+      +'<button class="mini secondary" onclick="historyDelete(\''+esc(r.run_id)+'\')">delete</button>'
+      +'</div></div>';
+  }
+  setHTML($('hs_list'), h);
+}
+
+async function historyDelete(id){
+  if(!confirm('Delete run '+id+'? This removes the stored file, including its '
+    +'transcript. It cannot be undone.')) return;
+  await historyDeleteIds([id]);
+}
+
+async function historyDeleteFiltered(){
+  const ids=historyFiltered().map(r=>r.run_id);
+  if(!ids.length) return;
+  if(!confirm('Delete all '+ids.length+' listed run'+(ids.length===1?'':'s')
+    +'? This removes the stored files, including their transcripts. It cannot '
+    +'be undone.')) return;
+  await historyDeleteIds(ids);
+}
+
+async function historyDeleteIds(ids){
+  try{
+    const r=await fetch('/api/bench_history',{method:'DELETE',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({run_ids:ids})});
+    const d=await r.json();
+    if(!d.ok){ setHTML($('hs_note'),'<span class="reasons">'+esc(d.error||'error')+'</span>'); return; }
+    if(ids.indexOf(window._hsOpen)>=0){
+      window._hsOpen=null;
+      setHTML($('hs_detail'),'<span class="muted">that run was deleted.</span>');
+    }
+    await historyLoad();
+    if((d.missing||[]).length)
+      $('hs_note').textContent+=' · '+d.missing.length+' already gone';
+  }catch(e){ setHTML($('hs_note'),'<span class="reasons">'+esc(''+e)+'</span>'); }
+}
+
 // The whole point of storing the transcript: read back what was asked and
 // what the model answered, per test, without leaving the page.
-async function benchShowRun(id){
-  const box=$('bn_run_detail'); if(!box) return;
+async function historyShowRun(id){
+  const box=$('hs_detail'); if(!box) return;
+  window._hsOpen=id; historyRender();
   setHTML(box,'<span class="muted">loading run&hellip;</span>');
   try{
     const d=await (await fetch('/api/bench_run_detail?run_id='+encodeURIComponent(id))).json();
     if(!d.ok){ setHTML(box,'<span class="reasons">'+esc(d.error||'error')+'</span>'); return; }
     const r=d.run;
-    let h='<div class="cardblock"><div class="sxs-h">run '+esc(r.run_id)+'</div>'
-      +'<div class="muted">'+esc(r.model||'(unnamed)')+' &middot; '+esc(r.endpoint||'')
-      +' &middot; '+(r.duration_s||0)+' s'
-      +(r.error?' &middot; <span class="st-fail">ended with: '+esc(r.error)+'</span>':'')
+    let h='<div class="sxs-h">'+esc(r.model||'(unnamed model)')+'</div>'
+      +'<div class="muted">'+new Date((r.started_at||0)*1000).toLocaleString()
+      +(r.endpoint?(' · '+esc(r.endpoint)):'')
+      +(r.preset?(' · preset '+esc(r.preset)):'')
+      +' · '+Math.round(r.duration_s||0)+' s'
+      +' · <span class="mono">'+esc(r.run_id||'')+'</span>'
+      +(r.error?' · <span class="st-fail">ended with: '+esc(r.error)+'</span>':'')
+      +'</div>'
+      +'<div class="actions" style="margin:var(--s2) 0">'
+      +'<a class="pill" href="/api/bench_run_detail?download=1&run_id='
+      +encodeURIComponent(r.run_id)+'" download>download this run</a> '
+      +'<button class="mini secondary" onclick="historyDelete(\''+esc(r.run_id)+'\')">delete this run</button>'
       +'</div>';
     for(const t of (r.results||[])){
       h+='<div style="margin-top:var(--s2)"><b>'+t.test_id+'. '+esc(t.label||'')+'</b> '
@@ -10699,8 +11362,8 @@ async function benchShowRun(id){
           .map(m=>(m.role||'?')+': '+(typeof m.content==='string'?m.content:JSON.stringify(m.content)))
           .join('\n\n');
         h+='<details style="margin:var(--s1) 0"><summary class="muted">'
-          +'exchange &middot; HTTP '+(e.http_code==null?'--':e.http_code)
-          +(e.wall_ms!=null?(' &middot; '+Math.round(e.wall_ms)+' ms'):'')+'</summary>'
+          +'exchange · HTTP '+(e.http_code==null?'--':e.http_code)
+          +(e.wall_ms!=null?(' · '+Math.round(e.wall_ms)+' ms'):'')+'</summary>'
           +'<div class="muted" style="margin-top:var(--s1)">request</div>'
           +'<pre style="max-height:220px;overflow:auto">'+esc(req||JSON.stringify(e.request||{},null,1))+'</pre>'
           +'<div class="muted">answer</div>'
@@ -10708,7 +11371,6 @@ async function benchShowRun(id){
           +'</details>';
       }
     }
-    h+='</div>';
     setHTML(box,h);
   }catch(e){ setHTML(box,'<span class="reasons">'+esc(''+e)+'</span>'); }
 }
