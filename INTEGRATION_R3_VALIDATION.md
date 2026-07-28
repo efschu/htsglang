@@ -5347,3 +5347,34 @@ Protokoll). Volltext: /root/.claude/jobs/1481bb40/tmp/BRIEFING_q4_dmabuf_gdr.md
   Erwartung unveraendert ehrlich: Override wirkt laut Quelle erst beim
   dmabuf-ATTACH, unser Fehler ist eine Stufe frueher im EXPORT — offen ist
   nur, ob der RM-Blob den Parameter schon bei Adapter-Init liest.
+
+## FEATURES_VS_UPSTREAM Prioritaets-Reihenfolge (2026-07-28, agent-docs-reorder) — gemergt
+
+Nutzer-Regel (dauerhaft, Memory feature-doku-reihenfolge): Block 1 = Hetero-Enabler
+(ohne die drei UNTERSCHIEDLICHE Karten nicht sinnvoll nutzbar sind), Block 2 =
+uebrige Fork-Deltas absteigend nach Nutzen fuer Normal-Rigs (1/2/4/8 GLEICHE GPUs).
+Gilt ab jetzt fuer FEATURES_VS_UPSTREAM, README und alle Beschreibungstexte.
+
+- Umsetzung: Uebersichtsmatrix UND Detailteil in beide Bloecke gegliedert, je mit
+  Kriterium-Einleitung IM Dokument (damit kuenftige Editoren die Regel sehen);
+  Zeilennummern bewusst stabil gelassen (werden im Fliesstext referenziert);
+  Inhalte wortgleich uebernommen, Anker/Links 32/32 geprueft, keine Zeile verloren.
+- Grenzfall-Entscheide (begruendet): 8e/15/17 (GGUF-/Quant-/HiCache-Korrektheit
+  unter asymmetrischem TP) trotz Nutzer-Beispielliste in BLOCK 1 — Kriterium
+  woertlich angewandt, ein Normal-Rig gewinnt daraus nichts (Stock-Pfad genuegt);
+  22/23 (fp8-Fallback, Turing/gfx900-Gates) Block 1 wegen cross-vendor
+  Belegbasis; 18 (TP>kv_heads) Block 1, da Upstream den Basismechanismus hat und
+  das Fork-Delta die Hetero-Ko-Location ist; 13 (Dashboard) Block 2.
+- STATUS-AUFFRISCHUNG (nur mit Beleg, kleine Fussnoten): Zeile 21 HTCCL von
+  "not yet exercised with a GPU or a model" auf ausgefuehrt (Runbook 4.3 + #198/
+  #204/#233, TP=4 cross-rig 166,16 ms/Verify); Zeile 22 fp8-Dequant-Fallback von
+  "not merged" auf gemergt (27B-FP8-TP=3-Boot, 27,59->37,26 tok/s; Merges
+  1bebf00478/6311397da9 als HEAD-Vorfahren verifiziert, Sternchen entfernt).
+  KEIN Beleg gefunden -> unveraendert gelassen: 5 (Cross-Algo-Bandit), 13, 16, 9,
+  Teilposten von 20. Ehrlichkeit vor Frische.
+- NEU dokumentiert (waren gebaut, standen nicht im Dokument): Zeile 26
+  Prefill-Satellit (#212) -> Block 2 (Fork-Delta ist die Hybrid-GDN-Korrektheit,
+  methodisch symmetrie-agnostisch); Zeile 27 Cross-Rig uneven PP (#201 S2) ->
+  Block 1 (gerades PP ist upstream, das Delta ist das Stage-Ratio, das nur bei
+  ungleichen Stages traegt). Beide Status Boot-checked.
+- README unveraendert (fuehrt keine Feature-Liste; Redesign bleibt #135).
