@@ -266,6 +266,7 @@ def get_config(
         gguf_bespoke_arch = _peek_bespoke_gguf_arch(model)
         if gguf_bespoke_arch is None:
             kwargs["gguf_file"] = model
+        gguf_bespoke_path = model
         model = Path(model).parent
         # Skip auto-resolution for GGUF: the name-based Mistral heuristic
         # would misfire on the rewritten parent dir.
@@ -300,6 +301,14 @@ def get_config(
             # MODEL_FOR_CAUSAL_LM check below rejects conditional-generation
             # model_types, so return here. (For GGUF, the multimodal wrapper
             # stays text-only via the model_config.py force-off gate.)
+            #
+            # That sibling config.json is usually borrowed from a same-family
+            # reference repo, so it is only as correct as the two checkpoints'
+            # shared geometry. Reconcile it against the file it is supposed to
+            # describe before anyone builds a model from it.
+            from sglang.srt.model_loader.gguf_registry import reconcile_sibling_config
+
+            reconcile_sibling_config(config, gguf_bespoke_path, gguf_bespoke_arch)
             return config
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
