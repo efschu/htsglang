@@ -4474,7 +4474,10 @@ class Scheduler(
                             "active job.",
                             lane.lane_id,
                         )
-                        lane.active = None
+                        # Releases the pool slots too: with one request slot
+                        # per lane runner, dropping without freeing makes
+                        # every later job fail in alloc_req_slots.
+                        lane.drop_active()
                 continue
             self._dual_group_admit(lane)
 

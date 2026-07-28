@@ -2871,6 +2871,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return result
 
     @property
+    def is_dual_group_lane_target(self) -> bool:
+        """True only for the lane's TARGET runner (#274).
+
+        Both lane runners carry ``is_draft_worker=True`` for the
+        secondary-runner gates, but they want OPPOSITE answers wherever the
+        code asks "is this a draft model?":
+
+        * the lane TARGET is a draft worker in name only -- it runs the full
+          model and must keep the real per-layer routing, KV pool and graphs;
+        * the lane HEAD is a draft model in the ordinary sense -- one MTP
+          layer, full attention, one layer's KV pool.
+
+        The exemptions were first written as ``is_draft_worker and not
+        is_dual_group_lane``, which is true of the target AND the head, so the
+        head silently inherited the target's 64-layer geometry. That produced
+        two boot failures in a row from one root: its full-attention call
+        dispatched into the GDN backend, and then its KV pool had an empty
+        full-attention layer map. Asking this property instead of respelling
+        the condition keeps the sites from drifting apart again.
+        """
+        return self.is_dual_group_lane and not self.is_dual_group_lane_draft
+
+    @property
     def qwen3_next_config(self):
         config = self.model_config.hf_config
         if isinstance(config, Qwen3NextConfig):
@@ -3338,13 +3361,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Draft models skip here during __init__; the eagle worker calls
         # this method explicitly (force_for_draft_worker=True) after
         # init_lm_head so graphs capture the final embedding weights.
-        # A dual-group lane runner (#274) is constructed as a draft worker
+        # A dual-group lane TARGET (#274) is constructed as a draft worker
         # (secondary-runner gates) but is a PREFILL lane -- its prefill
-        # graphs are the point, so it does not take the draft skip.
+        # graphs are the point, so it does not take the draft skip. The
+        # lane's NEXTN HEAD does take it: it is a draft model in the ordinary
+        # sense (see ModelRunner.is_dual_group_lane_target).
         if (
             self.is_draft_worker
             and not force_for_draft_worker
-            and not self.is_dual_group_lane
+            and not self.is_dual_group_lane_target
         ):
             return
 

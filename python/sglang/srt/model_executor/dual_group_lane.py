@@ -282,6 +282,14 @@ class LaneVocabEmbeddingShell(nn.Module):
             raise ValueError("LaneVocabEmbeddingShell: no parts.")
         self._lane_parts = tuple(parts)
 
+    @property
+    def embedding_dim(self):
+        """Hidden width of the table. The parts are VOCAB-sharded, so every
+        part carries the full width -- this is not a per-part quantity that
+        has to be summed. It is what tells a language embedding apart from a
+        companion tower's when a target holds both (contract 5)."""
+        return getattr(self._lane_parts[0], "embedding_dim", None)
+
     def forward(self, input_):
         from sglang.srt.layers.vocab_parallel_embedding import (
             get_masked_input_and_mask,
@@ -335,6 +343,10 @@ class LaneLmHeadShell(nn.Module):
         self.quant_method = _LaneLmHeadQuantMethod(self)
         self.bias = None
         p0 = parts[0]
+        # Same discriminator as the embedding shell: the INPUT width of the
+        # head, which is the model's hidden size (the parts shard the vocab,
+        # i.e. the output).
+        self.__dict__["embedding_dim"] = getattr(p0, "embedding_dim", None)
         if hasattr(p0, "qweight"):
             # Plain attribute alias (not a registered parameter): dispatch key
             # for the GGUF quantized-resident branch.
@@ -700,7 +712,8 @@ def build_lane_draft_model(lane_runner) -> nn.Module:
     hull = build_lane_model(lane_runner, kind="draft")
     lane_target = getattr(lane_runner, "dual_group_lane_target_model", None)
     if lane_target is not None and hasattr(hull, "set_embed_and_head_modules"):
-        embed, head = _find_lane_vocab_shells(lane_target)
+        hidden_size = int(lane_runner.model_config.hidden_size)
+        embed, head = _find_lane_vocab_shells(lane_target, hidden_size)
         if embed is None or head is None:
             raise ValueError(
                 "dual-group lane head: could not locate the lane target's "
@@ -713,29 +726,65 @@ def build_lane_draft_model(lane_runner) -> nn.Module:
         hull.set_embed_and_head_modules(embed, head)
         logger.info(
             "dual-group lane draft: embed/lm_head pointed at the lane "
-            "target's full-vocabulary shells (one set of tables, not two)."
+            "target's full-vocabulary shells at width %d (one set of "
+            "tables, not two).",
+            hidden_size,
         )
     return hull
 
 
-def _find_lane_vocab_shells(lane_target: nn.Module):
-    """Locate the lane target's vocabulary shells by TYPE, not by path.
+def _find_lane_vocab_shells(lane_target: nn.Module, hidden_size: int):
+    """Locate the lane target's vocabulary shells by TYPE **and WIDTH**.
 
     The attribute path differs per model family (``model.embed_tokens`` on a
     causal-LM wrapper, ``model.model.embed_tokens`` behind a conditional-
     generation wrapper), and guessing wrong is silent: ``set_embed_and_head_
     modules`` skips a ``None`` argument, so the head keeps its own -- or, if
-    it had none, dies at its first forward with a NoneType call. Searching
-    for the shell types the lane itself installed is both family-neutral and
-    unambiguous.
+    it had none, dies at its first forward with a NoneType call. So the search
+    is by the shell types the lane itself installed, which is family-neutral.
+
+    CONTRACT 5, and the reason type alone is NOT enough: type is not unique.
+    A multimodal target carries more than one vocab-parallel table (this
+    vehicle logs ``embed=2``), and ``modules()`` returns them in registration
+    order, so "the first one of the right type" is a coin flip between the
+    LANGUAGE embedding and a companion tower's. Picking wrong is silent at
+    bring-up and surfaces one forward later as a shape error from inside a
+    fused kernel -- measured here as a cutlass signature dump out of
+    ``pre_fc_norm_embedding``, width 1152 (the companion tower) against the
+    head's 5120.
+
+    Width is the discriminator that actually means something: the head
+    concatenates its embedding output with hidden states and projects with
+    ``fc``, so the ONLY embedding it can use is the one whose ``embedding_dim``
+    is the model's hidden size. Selecting on that is family-neutral for the
+    same reason type was, and it is self-verifying: a target with no matching
+    shell, or with two, is a configuration this code must not guess about.
     """
-    embed = head = None
-    for module in lane_target.modules():
-        if isinstance(module, LaneLmHeadShell) and head is None:
-            head = module
-        elif isinstance(module, LaneVocabEmbeddingShell) and embed is None:
-            embed = module
-    return embed, head
+    embeds = [
+        m for m in lane_target.modules() if isinstance(m, LaneVocabEmbeddingShell)
+    ]
+    heads = [m for m in lane_target.modules() if isinstance(m, LaneLmHeadShell)]
+
+    def _pick(candidates, what):
+        if len(candidates) <= 1:
+            return candidates[0] if candidates else None
+        matching = [
+            c for c in candidates if getattr(c, "embedding_dim", None) == hidden_size
+        ]
+        if len(matching) == 1:
+            return matching[0]
+        widths = [getattr(c, "embedding_dim", None) for c in candidates]
+        raise ValueError(
+            f"dual-group lane head: {len(candidates)} {what} shells in the "
+            f"lane target with widths {widths}, and "
+            f"{len(matching)} of them match the model's hidden size "
+            f"{hidden_size}. The head's embedding output is concatenated with "
+            "its hidden states before `fc`, so exactly one width can be "
+            "correct. Refusing to guess -- guessing here is silent at "
+            "bring-up and fails one forward later inside a fused kernel."
+        )
+
+    return _pick(embeds, "embedding"), _pick(heads, "lm_head")
 
 
 def build_lane_model(lane_runner, kind: str = "target") -> nn.Module:
@@ -1174,8 +1223,7 @@ class DualGroupLane:
                             "active job.",
                             self.lane_id,
                         )
-                        with self._lock:
-                            self.active = None
+                        self.drop_active()
 
     def _step_locked_scope(self) -> None:
         """One lane step on the worker thread. Already inside the lane scope
@@ -1227,6 +1275,13 @@ class DualGroupLane:
         with self._lane_runtime_scope(), torch.no_grad():
             if job["prefill_ms"] is None:
                 self._prefill(job)
+            elif self.spec_active:
+                # Same three-way dispatch as the concurrent worker's
+                # ``_step_locked_scope``. Round 1 wired the speculative round
+                # into the worker path only, so a SERIAL lane assembled the
+                # NEXTN head and then never asked it for a proposal -- the
+                # chain was unreachable in the very mode that is the default.
+                self._spec_step(job)
             else:
                 self._decode_step(job)
         if (
@@ -1328,6 +1383,7 @@ class DualGroupLane:
             token = out.next_token_logits.argmax(dim=-1)
             hidden = out.hidden_states
             proposals.append(int(token[0].item()))
+            job["_kv_len_draft"] = int(job.get("_kv_len_draft") or 0) + 1
         return proposals
 
     def _make_batch(self, job, runner=None):
@@ -1431,6 +1487,43 @@ class DualGroupLane:
         # any time spent waiting for the GIL between launches.
         return next_token_ids, start_ev.elapsed_time(end_ev)
 
+    def _candidate_logits(self, hidden_states):
+        """Full-vocabulary logits for EVERY row of ``hidden_states``.
+
+        The lane's own reduction of ``LogitsProcessor._get_logits``: the lane
+        is tp_size=1 and its ``LaneLmHeadShell`` already yields full-vocab
+        logits by concatenating the per-rank shards locally, so the DP gather
+        and the TP all-gather that method performs are both no-ops here --
+        and must stay no-ops, because a collective on this path would break
+        the lane's rank-local contract. The scale/softcap tail is kept
+        because dropping it would silently change the argmax on any model
+        that sets them.
+        """
+        model = self.runner.model
+        processor = getattr(model, "logits_processor", None)
+        lm_head = getattr(model, "lm_head", None)
+        if processor is None or lm_head is None:
+            raise ValueError(
+                "dual-group lane verify: the lane target exposes no "
+                f"logits_processor/lm_head (processor={processor is not None}, "
+                f"lm_head={lm_head is not None}); per-candidate logits cannot "
+                "be computed and greedy verify would be unsound."
+            )
+        if getattr(processor, "do_tensor_parallel_all_gather", False):
+            raise ValueError(
+                "dual-group lane verify: the lane target's logits processor "
+                "wants a tensor-parallel all-gather. The lane is rank-local "
+                "by contract and its lm_head shell already produces full "
+                "vocabulary logits -- this combination is not supported."
+            )
+        logits = processor._compute_lm_head(hidden_states, lm_head)
+        if getattr(processor, "logit_scale", None) is not None:
+            logits = logits * processor.logit_scale
+        softcap = getattr(processor, "final_logit_softcapping", None)
+        if softcap:
+            logits = softcap * torch.tanh(logits / softcap)
+        return logits
+
     def _verify(self, job, proposals):
         """One verify forward of the LANE TARGET over [last, *proposals].
 
@@ -1467,7 +1560,24 @@ class DualGroupLane:
             )
             batch.prefill_input_ids_cpu = None
         out, ms = self._timed_forward_raw(batch, CaptureHiddenMode.FULL)
-        preds = out.next_token_logits.argmax(dim=-1)
+        # CONTRACT 8: NOT out.next_token_logits. That field is
+        # [#SEQUENCE, vocab] -- the logits processor selects one row per
+        # request (the last extend position) via `sample_indices`. Verify
+        # needs one row per CANDIDATE. Reading it positionally made
+        # `preds[0]` the continuation of the LAST proposal instead of the
+        # prediction after `cand[0]`, so the comparison against
+        # `proposals[0]` essentially never held: measured accept length
+        # exactly 1.000 over all 63 rounds (n_accept always 0, so preds[1:]
+        # was never even indexed and the shape mismatch stayed silent), and
+        # the emitted token continued a rejected 3-token suffix -- which is
+        # why the lane produced a repetition loop rather than the reference
+        # continuation.
+        #
+        # CaptureHiddenMode.FULL already returns the post-norm hidden states
+        # for EVERY token in the extend, which is the same tensor the
+        # processor derives its own logits from, so the per-candidate logits
+        # are one lm_head application away.
+        preds = self._candidate_logits(out.hidden_states).argmax(dim=-1)
 
         n_accept = 0
         for i, prop in enumerate(proposals):
@@ -1526,6 +1636,11 @@ class DualGroupLane:
                 batch_d.prefill_input_ids_cpu = None
             self._draft_forward(batch_d, out.hidden_states)
             job["_batch_d"] = batch_d
+            # The head's OWN allocated token count. It is not the target's:
+            # the head keeps every proposal it ever made, including rejected
+            # ones (only the target's KV is rolled back in _verify), so the
+            # two counters diverge as soon as one proposal is rejected.
+            job["_kv_len_draft"] = len(job["input_ids"])
         else:
             next_token_ids, ms = self._timed_forward(batch)
         job["prefill_ms"] = ms
@@ -1567,9 +1682,96 @@ class DualGroupLane:
         job["output_ids"].append(int(next_token_ids[0].item()))
         job["_next"] = next_token_ids
 
+    def drop_active(self) -> None:
+        """Abandon the active job AND give its pool slots back.
+
+        A tick that raises leaves the job's slots taken in both the target's
+        and the head's request tables. With ``max_running_requests`` 1 the
+        head has exactly one slot, so a single dropped job otherwise makes
+        every LATER job fail in ``alloc_req_slots`` -- one real error turning
+        into an unbounded run of misleading ones.
+        """
+        with self._lock:
+            job = self.active
+            self.active = None
+            if not self.jobs:
+                self._busy = False
+                self._idle_since = time.monotonic()
+        if job is None:
+            return
+        self._release_draft_batch(job)
+        job.pop("_batch_d", None)
+        batch = job.pop("_batch", None)
+        req = job.pop("_req", None)
+        idx = job.get("_req_pool_idx")
+        if batch is None or req is None or idx is None:
+            return
+        try:
+            pool = batch.req_to_token_pool
+            n_alloc = int(job.get("_kv_len") or 0)
+            if n_alloc > 0:
+                batch.token_to_kv_pool_allocator.free(pool.req_to_token[idx, :n_alloc])
+            if (
+                hasattr(pool, "free_mamba_cache")
+                and getattr(req, "mamba_pool_idx", None) is not None
+            ):
+                pool.free_mamba_cache(req)
+            pool.free(req)
+        except Exception:
+            logger.exception(
+                "dual-group lane %d: releasing the dropped job failed.",
+                self.lane_id,
+            )
+
+    def _release_draft_batch(self, job) -> None:
+        """Give the head's request slot and KV back.
+
+        Separate from ``_finish`` because it must also run when a job is
+        DROPPED: a lane tick that raises still leaves the head's slot taken,
+        and with one slot the lane is then permanently unable to start
+        another job -- one failure turns into every later job failing.
+        """
+        batch_d = job.get("_batch_d")
+        if batch_d is None:
+            return
+        try:
+            reqs = getattr(batch_d, "reqs", None) or []
+            for req in reqs:
+                idx = getattr(req, "req_pool_idx", None)
+                if idx is None:
+                    continue
+                pool = batch_d.req_to_token_pool
+                n_alloc = int(job.get("_kv_len_draft") or 0)
+                if n_alloc > 0:
+                    batch_d.token_to_kv_pool_allocator.free(
+                        pool.req_to_token[idx, :n_alloc]
+                    )
+                if (
+                    hasattr(pool, "free_mamba_cache")
+                    and getattr(req, "mamba_pool_idx", None) is not None
+                ):
+                    pool.free_mamba_cache(req)
+                pool.free(req)
+        except Exception:
+            # Best-effort: a failure to release must not mask the error that
+            # caused the drop, and must not itself abort the lane.
+            logger.exception(
+                "dual-group lane %d: releasing the head's batch failed.",
+                self.lane_id,
+            )
+
     def _finish(self, job):
         batch = job.pop("_batch", None)
         job.pop("_next", None)
+        # The HEAD's batch holds a slot in the head's OWN request table
+        # (contract 3), and that table has exactly `max_running_requests`
+        # entries -- one, here. Releasing only the target's batch leaks it,
+        # and the leak is invisible on the job that caused it: the NEXT job
+        # dies in `alloc_req_slots` with `available_size()=0`, which reads
+        # like a sizing problem and is a lifetime problem. Measured exactly
+        # that way -- the first job failed for its own reason, and every
+        # later job then failed for this one.
+        self._release_draft_batch(job)
         if batch is not None:
             # Release the lane pool slots (no radix cache: free directly).
             # Allocated tokens = prompt + one per decode step; the LAST
@@ -1589,6 +1791,7 @@ class DualGroupLane:
                 ):
                     pool.free_mamba_cache(req)
                 pool.free(req)
+        job.pop("_batch_d", None)
         decode_ms = job["decode_ms"]
         accepts = job.get("_accept") or []
         result = {
@@ -1997,33 +2200,72 @@ def _finish_lane_draft_runner(draft_runner, lane_id, target_runner):
     draft_runner.dual_group_lane_token_cap = int(
         getattr(target_runner, "max_total_num_tokens", 0) or 0
     )
+    # The head's graph plan is DISABLED on every phase, and that has to be
+    # decided BEFORE the scope below publishes this args view.
+    _disable_graph_phases(draft_runner.server_args)
+
+    # CONTRACT 4, SOLVED: the head's bring-up runs under the HEAD's args view,
+    # not the lane target's.
+    #
+    # The enclosing bring-up scope publishes ``lane_args`` -- the lane
+    # TARGET's config, which has graphs ENABLED (capturing the lane's prefill
+    # is the point of the lane). The head is a second runner under that scope
+    # with its OWN deep-copied graph plan, and the two disagree about who is
+    # authoritative: ``check_cuda_graph_backend`` asks the ACTIVE args (the
+    # target's -> enabled, no early return) while
+    # ``GraphSharedOutput.create_for_model_runner`` asks
+    # ``model_runner.server_args`` (the head's -> disabled -> None). So
+    # init_decode_cuda_graph walked past its own DISABLED guard and built a
+    # DecodeCudaGraphRunner, which dereferenced the None shared output ->
+    # 'NoneType' has no get_logits_buffer. Same split would have hit prefill:
+    # init_prefill_cuda_graph deliberately does NOT take the draft-worker skip
+    # for a dual-group lane runner, so the head would have captured prefill
+    # graphs against the target's plan too.
+    #
+    # Re-entering the Slice-C overlay with the head's args makes the two agree
+    # -- both phases hit their DISABLED early return, nothing is captured, and
+    # no shared-output buffer is dereferenced. This is the same mechanism, and
+    # the same reasoning, as the comment on the enclosing scope: helpers read
+    # the ACTIVE args, so the active args must be the ones belonging to the
+    # runner being brought up. The whole body is inside it (not just the graph
+    # call) so pool sizing and backend init see the head's plan as well --
+    # an attention backend that allocates cuda-graph state for a plan the head
+    # never captures is wasted lane budget.
+    #
+    # The three contracts solved before this one, each found by a boot, so the
+    # next iteration does not rediscover them:
+    #   1. the head needs its own KV sizing (its config reports the target's
+    #      64 layers; the configurator lands on cell size 0),
+    #   2. it needs init_cuda_graphs for the EAGER runner alone, otherwise
+    #      forward dispatch has no eager_runner,
+    #   3. it must NOT share the target's req_to_token_pool -- its own
+    #      ScheduleBatch allocates its own slot and at mrr 1 the two batches
+    #      deadlock on the single slot.
+    from sglang.srt.runtime_context import current_lane_id, lane_scope
+
+    # Same lane IDENTITY as the enclosing scope (read, not re-derived: it
+    # decides which graph pool / per-lane buffer the head lands in, and it
+    # must not drift from the scope the lane will forward under).
+    with lane_scope(current_lane_id(), draft_runner.server_args):
+        _finish_lane_draft_runner_scoped(draft_runner, lane_id)
+
+    logger.info(
+        "dual-group lane %d NEXTN head ready: max_total_num_tokens=%d.",
+        lane_id,
+        draft_runner.max_total_num_tokens,
+    )
+
+
+def _finish_lane_draft_runner_scoped(draft_runner, lane_id):
+    """Pools, backends and graphs of the head, under the head's args view."""
     with lane_geometry_override(1, 0):
         draft_runner.alloc_memory_pool()
         draft_runner.init_attention_backends()
         # init_cuda_graphs() is called even though the head runs eager: it
         # also builds the EAGER phase runner, without which forward dispatch
         # has no `eager_runner` at all (measured: AttributeError on the
-        # head's first forward). The head's args view has every graph phase
-        # DISABLED, so this builds the dispatcher and captures nothing.
-        _disable_graph_phases(draft_runner.server_args)
-        # STATE (2026-07-28): this is where the head's bring-up currently
-        # stops. init_cuda_graphs still enters init_decode_cuda_graph despite
-        # every phase being DISABLED, and there it dereferences
-        # model_runner.graph_shared_output, which only the serving/target
-        # bring-up ever populates -> 'NoneType' has no get_logits_buffer.
-        #
-        # Three head-dispatch contracts were solved before this one, each
-        # found by a boot, and they are listed here so the next iteration
-        # does not rediscover them:
-        #   1. the head needs its own KV sizing (its config reports the
-        #      target's 64 layers; the configurator lands on cell size 0),
-        #   2. it needs init_cuda_graphs for the EAGER runner alone,
-        #      otherwise forward dispatch has no eager_runner,
-        #   3. it must NOT share the target's req_to_token_pool -- its own
-        #      ScheduleBatch allocates its own slot and at mrr 1 the two
-        #      batches deadlock on the single slot.
-        # The next one is a shared-output buffer the head has to be given or
-        # taught to build.
+        # head's first forward). Every graph phase is DISABLED in the active
+        # view, so this builds the dispatcher and captures nothing.
         draft_runner.init_cuda_graphs()
         # NAMED GAP, not an oversight: the head runs EAGER.
         # Its decode graph would be captured by the plain DecodeCudaGraphRunner,
@@ -2041,11 +2283,6 @@ def _finish_lane_draft_runner(draft_runner, lane_id, target_runner):
             "end state.",
             lane_id,
         )
-    logger.info(
-        "dual-group lane %d NEXTN head ready: max_total_num_tokens=%d.",
-        lane_id,
-        draft_runner.max_total_num_tokens,
-    )
 
 
 def _build_lane_under_scope(
