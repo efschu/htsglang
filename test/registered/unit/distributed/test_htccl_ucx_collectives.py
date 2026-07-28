@@ -110,6 +110,27 @@ def _worker(rank, world, store, q):
         chk("all_gather/3d-dim2", t.htccl_all_gather(comm, three[rank].clone(), 2),
             torch.cat(three, dim=2))
 
+        # all_gather ring branch (world>2 by construction; the threshold is
+        # dropped so the small reference payloads reach it).
+        # Exact at atol 0 -- the ring only moves rows, it never sums.
+        if world > 2:
+            ag_ring_default = t.ag_ring_bytes
+            t.ag_ring_bytes = 1024
+            for dim in (0, 1, -1):
+                chk(f"all_gather/ring/dim={dim}",
+                    t.htccl_all_gather(comm, parts[rank].clone(), dim),
+                    torch.cat(parts, dim=dim))
+            chk("all_gather/ring/3d-dim2",
+                t.htccl_all_gather(comm, three[rank].clone(), 2),
+                torch.cat(three, dim=2))
+            ring_a = t.htccl_all_gather(comm, parts[rank].clone(), 0)
+            ring_snap = ring_a.clone()
+            ring_b = t.htccl_all_gather(comm, (parts[rank] * 3).clone(), 0)
+            if ring_a.data_ptr() == ring_b.data_ptr():
+                fails.append("all_gather/ring returned an aliased buffer")
+            chk("all_gather/ring/first-result-intact", ring_a, ring_snap)
+            t.ag_ring_bytes = ag_ring_default
+
         for src in range(world):
             payload = torch.arange(129, dtype=torch.float32) + src * 977
             tensor = payload.clone() if rank == src else torch.zeros(129)

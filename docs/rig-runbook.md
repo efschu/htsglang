@@ -81,7 +81,7 @@ definitions in `python/sglang/srt/environ.py`).
 | `SGLANG_MAMBA_SSM_DTYPE` | `bfloat16` | `environ.py` default is unset; resolution order is env > model config > `float32` (`configs/mamba_utils.py`). The Qwen3.6-27B configs pin `float32`, so without the env the GDN/SSM state pool is twice as large |
 | `CUDA_VISIBLE_DEVICES` | `99` (desk work only) | makes CUDA see no devices when the cards are occupied by other agents. Never set it for launches that use `--rank-gpu-id`: the mapping addresses the full device view |
 | `SGLANG_HTCCL` | `1` only for HTCCL runs | routes TP collectives over HTCCL instead of NCCL (default off = byte-identical stock dispatch). Required for cross-vendor (NVIDIA+AMD) groups; forceable on homogeneous groups for testing |
-| `SGLANG_HTCCL_TRANSPORT` | `device` \| `shm` \| `gloo` \| `ucx` | default `device`. Graph capability depends on this — see section 6.3. `ucx` additionally reads `SGLANG_HTCCL_UCX_LIB` (path to a specific `libucp.so.0`; both hosts must load the **same UCX release** or rendezvous rejects), `SGLANG_HTCCL_UCX_CHUNK_MIB` (4), `SGLANG_HTCCL_UCX_RING_KIB` (24; the deprecated `..._RING_MIB` still wins when set), `SGLANG_HTCCL_UCX_TIMEOUT_S` (300), `SGLANG_HTCCL_UCX_OVERLAP` (off) |
+| `SGLANG_HTCCL_TRANSPORT` | `device` \| `shm` \| `gloo` \| `ucx` | default `device`. Graph capability depends on this — see section 6.3. `ucx` additionally reads `SGLANG_HTCCL_UCX_LIB` (path to a specific `libucp.so.0`; both hosts must load the **same UCX release** or rendezvous rejects), `SGLANG_HTCCL_UCX_CHUNK_MIB` (4), `SGLANG_HTCCL_UCX_RING_KIB` (24; the deprecated `..._RING_MIB` still wins when set), `SGLANG_HTCCL_UCX_AG_RING_KIB` (32; the all_gather ring, 0 disables it), `SGLANG_HTCCL_UCX_GRAIN_ELEMS` (32768; largest host-side pass kept on the calling thread, 0 restores the unchunked passes), `SGLANG_HTCCL_UCX_TIMEOUT_S` (300), `SGLANG_HTCCL_UCX_OVERLAP` (off) |
 | `SGLANG_UNEVEN_MLP_VECTOR`, `_MOE_VECTOR`, `_VOCAB_VECTOR`, `_TOKEN_VECTOR` | only when re-applying a logged suggestion | env overrides for the per-family uneven splits; each takes precedence over its CLI flag. The server logs "restart with SGLANG_UNEVEN_MOE_VECTOR=..." when rebalancing would gain >10% |
 
 ## 3. Mandatory boot flags
@@ -187,17 +187,35 @@ without it.
 
 ### 4.3 Cross-rig (rig 1 + rig 2)
 
-Status: HTCCL `ucx` collectives are validated cross-rig on real RDMA,
-CPU-only. A cross-rig **GPU/model** boot has not been executed yet; the
-bring-up plan with expected failure modes is in `FEATURES_VS_UPSTREAM.md`
-section 21. What is settled:
+Status: executed and measured. The cross-rig TP=4 GPU/model boot runs
+Qwen3.6-27B-FP8 with the HTCCL `ucx` data plane over the 40G RoCE link; the
+most recent point (task #263) reached READY in 80 s and decoded at 166.2 ms
+per verify round. (The "not yet executed" wording that stood here, and the
+matching claim in `FEATURES_VS_UPSTREAM.md` section 21, predate tasks
+#198/#204/#233.) What is settled:
+
+- **Both hosts must run the SAME sglang tree, not just the same
+  `htccl_ucx.py`.** Requests are `msgspec` structs broadcast rank-to-rank, so
+  a field the newer side adds kills the older side at deserialization —
+  observed as `TypeError: Unexpected keyword argument 'spill_class'` in
+  `broadcast_pyobj` on the stale rank, several minutes into a boot that
+  otherwise looked healthy. Rig 2's tree lives at `<RIG2_SGLANG_SRC>` and
+  carries a `SYNCED_COMMIT.txt`; refresh the whole tree
+  (`rsync -a --delete --exclude=__pycache__ <worktree>/python/sglang/
+  root@<RIG2>:<RIG2_SGLANG_SRC>/sglang/`) and update that file. Syncing only
+  the transport file is enough for the CPU-only collective harnesses, which
+  import that module alone, and is NOT enough for a model boot.
+- The launcher used is `crossrig_launch.sh` / `crossrig_rank.sh` with
+  `--nnodes 4 --node-rank 0..3` (one rank per node). `--nnodes 2` is not
+  expressible: `server_args` asserts `tp_size % nnodes == 0`, and the split
+  here is 3+1.
 
 - **Placement is dictated by the NIC**: ranks must run where both the cards
   and the RoCE interface are visible. Rig-1 side: the Proxmox host
   (`<RDMA_R1>`). Rig-2 side: rig 2 itself (`<RDMA_R2>`). The development
   container can never be a cross-rig rank.
 - Flags/env on both sides: `SGLANG_HTCCL=1 SGLANG_HTCCL_TRANSPORT=ucx`,
-  `--enable-metrics` (mandatory, section 3), `--nnodes 2 --node-rank {0,1}`,
+  `--enable-metrics` (mandatory, section 3), `--nnodes 4 --node-rank 0..3`,
   `--dist-init-addr <LAN ip>:<port>` (control plane stays on the 1 GbE LAN;
   only UCX rides the 40G link); per rank `UCX_TLS=rc,self,sm`,
   `UCX_IB_GID_INDEX=3`, `UCX_NET_DEVICES=<port>`.

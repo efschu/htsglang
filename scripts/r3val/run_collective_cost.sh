@@ -11,6 +11,10 @@
 #        RING=<MiB>        sets SGLANG_HTCCL_UCX_RING_MIB (0 = always ring)
 #        CHUNK=<MiB>       sets SGLANG_HTCCL_UCX_CHUNK_MIB
 #        RING_KIB=<KiB>    sets SGLANG_HTCCL_UCX_RING_KIB
+#        AG_RING_KIB=<KiB> sets SGLANG_HTCCL_UCX_AG_RING_KIB (0 = never ring)
+#        OP=<all_reduce|all_gather>  collective for the SIZES sweep
+#        GRAIN=<elems>     sets SGLANG_HTCCL_UCX_GRAIN_ELEMS (0 = unchunked
+#                          host passes, the pre-#263 A/B control)
 #        GATE=1            exactness gate across the threshold, not timing
 set -u
 ITERS="${1:-200}"
@@ -45,6 +49,8 @@ EXTRA=""
 [ -n "${RING:-}" ] && EXTRA="$EXTRA SGLANG_HTCCL_UCX_RING_MIB=$RING"
 [ -n "${CHUNK:-}" ] && EXTRA="$EXTRA SGLANG_HTCCL_UCX_CHUNK_MIB=$CHUNK"
 [ -n "${RING_KIB:-}" ] && EXTRA="$EXTRA SGLANG_HTCCL_UCX_RING_KIB=$RING_KIB"
+[ -n "${AG_RING_KIB:-}" ] && EXTRA="$EXTRA SGLANG_HTCCL_UCX_AG_RING_KIB=$AG_RING_KIB"
+[ -n "${GRAIN:-}" ] && EXTRA="$EXTRA SGLANG_HTCCL_UCX_GRAIN_ELEMS=$GRAIN"
 
 COMMON="MASTER_ADDR=$MASTER MASTER_PORT=$PORT UCX_TLS=rc,self,sm UCX_IB_GID_INDEX=3 $EXTRA"
 PVE_ENV="$COMMON UCX_NET_DEVICES=rocep4s0f1:1 SGLANG_HTCCL_UCX_LIB=/opt/ucx116/lib/libucp.so.0 GLOO_SOCKET_IFNAME=enp4s0f1np1"
@@ -56,16 +62,16 @@ mkdir -p "$LOGS"
 FIRST_RIG2=$((WORLD - RIG2_RANKS))
 for r in $(seq $FIRST_RIG2 $((WORLD - 1))); do
   echo "== rank $r on rig 2 =="
-  $RIG2 "cd /root && $RIG2_ENV $RIG2_PY $RIG2_SCRIPT --rank $r --world $WORLD --iters $ITERS ${SIZES:+--sizes $SIZES} ${GATE:+--gate} --comm-dir $RIG2_COMM" \
+  $RIG2 "cd /root && $RIG2_ENV $RIG2_PY $RIG2_SCRIPT --rank $r --world $WORLD --iters $ITERS ${SIZES:+--sizes $SIZES} ${OP:+--op $OP} ${GATE:+--gate} --comm-dir $RIG2_COMM" \
     > "$LOGS/cost_${TAG}.r${r}.log" 2>&1 &
 done
 for r in $(seq 1 $((FIRST_RIG2 - 1))); do
-  $PVE "cd /tmp && $PVE_ENV $PVE_PY $SCRIPT --rank $r --world $WORLD --iters $ITERS ${SIZES:+--sizes $SIZES} ${GATE:+--gate} --comm-dir $COMM" \
+  $PVE "cd /tmp && $PVE_ENV $PVE_PY $SCRIPT --rank $r --world $WORLD --iters $ITERS ${SIZES:+--sizes $SIZES} ${OP:+--op $OP} ${GATE:+--gate} --comm-dir $COMM" \
     > "$LOGS/cost_${TAG}.r${r}.log" 2>&1 &
 done
 sleep 2
 echo "== rank 0 on rig 1 (Proxmox host) =="
-$PVE "cd /tmp && $PVE_ENV $PVE_PY $SCRIPT --rank 0 --world $WORLD --iters $ITERS ${SIZES:+--sizes $SIZES} ${GATE:+--gate} --comm-dir $COMM --out $R/scripts/r3val/logs/cost_${TAG}.json" \
+$PVE "cd /tmp && $PVE_ENV $PVE_PY $SCRIPT --rank 0 --world $WORLD --iters $ITERS ${SIZES:+--sizes $SIZES} ${OP:+--op $OP} ${GATE:+--gate} --comm-dir $COMM --out $R/scripts/r3val/logs/cost_${TAG}.json" \
   2>&1 | tee "$LOGS/cost_${TAG}.r0.log"
 wait
 echo "== done -> $LOGS/cost_${TAG}.json =="

@@ -156,6 +156,8 @@ decisively — topology, format, speculative state, or a feature on against off.
 | same, pipelined transport | Boot-checked | 17.31 / 17.57 / 18.36 slope tok/s (+5.7 / +12.1 / +11.0%) (mean of 3) | — | 1 | accept 3.08 / 3.03 / 2.91 |
 | same, pipelined + consumer-side async overlap | Boot-checked | 17.92 / 17.12 / 17.84 slope tok/s (+3.5 / -2.6 / -2.9%) — in the spread (mean of 3) | — | 1 | accept 3.08 / 3.03 / 2.91 |
 | same, pipelined + KV split toward the fastest card, 2080 Ti share 26.6% -> 12.5% | Boot-checked | 18.11 / 16.84 / 18.15 slope tok/s — in the spread (mean of 3) | — | 1 | — |
+| same, ring thresholds + host-pass grain fix (tasks #244 + #263), mixed prompt, greedy | Boot-checked | **166.16 ms per verify round** vs the 185.7 ms arm-A floor (-10.5%); 16.89 decode tok/s over an 18.9 s window | — | 1 | accept 2.807 over 114 verifies; ms/verify from accept and from verify_ct agree to 0.3% (166.16 / 165.64); repetition ratio 0.0; boot READY in 80 s, `ucx transport ready` on all 4 ranks |
+| same + locked GPU clocks on the rig-2 2080 Ti (`nvidia-smi -lgc 1350,1950`) | Boot-checked | 167.06 ms per verify round (+0.5%, inside noise) | — | 1 | byte-identical decode (same accept 2.807, same 114 verifies), so the delta is pure timing: the far rank's idle-clock ramp is not on the critical path |
 | TP=4 across two hosts, uneven TP 3,2,2,1, decode by streaming, RDMA | Boot-checked | 28.4 / 28.6 / 27.1 tok/s | — | 1 | per-rank utilization 10-13 / 19-24 / 30-35%; uneven TP inert on both wires |
 | same, 1 GbE | Boot-checked | 7.8 / 7.7 / 7.5 tok/s | — | 1 | barrier 146.63 us; RDMA leads 14x at the barrier and 1.2x at 4 MiB |
 | TP=3, DFLASH, split draft placement, 450-token decode | Boot-checked | 74.88 / 64.66 tok/s code / prose (mean of 4) | — | 1 | draft KV 10.9 / 22.9 / 10.1 GB across the three cards |
@@ -698,7 +700,7 @@ host-staged semantics as `gloo` but RDMA instead of TCP. **Cross-checked**, merg
 |---|---|
 | ctypes over `libucp`, not ucx-py or Cython | version parity requires loading a *specific* library path; `ucx-py` bundles its own UCX and hard-codes one side of the mismatch, and is asyncio-shaped, the wrong control flow for a synchronous collective on a bs=1 decode path. Cython needs a compiler and UCX headers per host, and the second rig has the runtime libraries without the `-dev` package. A subprocess bridge adds an IPC hop to a ~1.5 us path. ctypes needs no build step and no headers, and takes the library from `SGLANG_HTCCL_UCX_LIB`. Struct layouts are mask-driven, over-allocated, and the transcribed offsets are asserted at import |
 | Version parity enforced, not hoped for | mixed UCX releases do not degrade; endpoint creation fails with `invalid bandwidth 0.00`. The rendezvous gathers each rank's version over the existing `gloo` `cpu_group` and refuses **before any endpoint exists**, naming every rank's version, library path and the `SGLANG_HTCCL_UCX_LIB` remedy |
-| Latency shaping | default is a single-step full exchange, one round trip at any world size; `all_reduce` switches to a ring above `SGLANG_HTCCL_UCX_RING_KIB` (24 KiB, measured -- see the world-4 table below). Endpoints are persistent and wired at construction, so no decode step pays a handshake. `handles()` is size-independent, unlike `shm`'s slot ceiling, so two ranks can never disagree about whether a collective goes over UCX or `gloo` |
+| Latency shaping | default is a single-step full exchange, one round trip at any world size; `all_reduce` switches to a ring above `SGLANG_HTCCL_UCX_RING_KIB` (24 KiB, measured -- see the world-4 table below) and `all_gather` above `SGLANG_HTCCL_UCX_AG_RING_KIB` (32 KiB, measured; that ring saves no bytes, it saves the single UCX worker from progressing 2(W-1) requests at once). Endpoints are persistent and wired at construction, so no decode step pays a handshake. `handles()` is size-independent, unlike `shm`'s slot ceiling, so two ranks can never disagree about whether a collective goes over UCX or `gloo` |
 
 **Status (`ucx`):** implemented and validated on real RDMA, CPU-only — not yet exercised with a GPU
 or a model.
@@ -735,10 +737,52 @@ Three verdicts follow, all falsifiable from the same harness
   group the ring is the ordinary decode path. Exactness gated on the real link at world 4 across
   8/16/23/24/25/32/80/128 KiB and ragged tails: 0 mismatches, ring and flat alike.
 
-Open, not fixed here: `all_gather` has no ring and stays at ~388 us for 80 KiB; and both algorithms
-fall off a cliff between 128 and 256 KiB (256 KiB: 34.3 ms flat / 15.6 ms ring, with the *local*
-stage and finish host copies accounting for most of it) — a decode never reaches that size, a large
-batch would.
+**Both items left open by #244 are closed by task #263, and they turned out to be one bug and one
+algorithm.**
+
+*The 128 -> 256 KiB cliff was `at::parallel_for`.* Above `at::internal::GRAIN_SIZE` (32768 elements
+= 128 KiB fp32) torch dispatches a CPU->CPU `copy_`/`add_` through an OpenMP region. Co-located TP
+ranks leave the barrier together and enter their host passes at the same instant, so N ranks x N
+threads land on one core count and the region's join waits on a descheduled thread. Isolated on the
+rig-1 host, 3 concurrent processes, 320 KiB fp32: the whole-buffer copy is 7.91 us in the median
+with a **6000.80 us maximum**; split below the grain it is 22.41 us with a 46.23 us maximum. Under
+the real harness that tail *is* the median. The host passes that are not already chunked now split
+at the grain (`SGLANG_HTCCL_UCX_GRAIN_ELEMS`, 0 restores the old behaviour); the pipelined
+multi-chunk path is deliberately untouched, because its large-payload throughput does want the
+parallel copy. Byte-neutral by construction — copy and accumulate are elementwise, so no sub-range
+sees a different addend. Measured `all_reduce`, world 4, cross-rig, median of 100 after 20 warmup:
+
+| Payload | before | after |
+|---|---|---|
+| 128 KiB | 278.8 us (stage 21.1, finish 16.0) | 270.6 us (stage 20.6, finish 12.8) |
+| 256 KiB | **13678.6 us** (stage 5310.7, finish 4714.1) | **524.1 us** (stage 52.2, finish 35.0) |
+
+-96.2 % at 256 KiB, and the 128 -> 256 KiB step is linear again (1.94x for 2x the bytes). The
+same fix moves 640 KiB as one collective from ~33 ms to 1.25 ms. Nothing at or below 128 KiB
+changes: a decode-sized payload never reaches the grain, so `_grain_step` returns 0 and the code
+path is identical.
+
+*`all_gather` now has a ring too, and it wins for a reason the byte count does not predict.* An
+all_gather must deliver `(W-1) * n` bytes into every rank and the flat exchange already moves
+exactly that, once, in one round trip — where the `all_reduce` ring halves its volume (`2(W-1)/W`
+against `W-1`). A ring can therefore not win on bytes here. It wins on the one single-threaded UCX
+worker per rank: the flat exchange hands it `2(W-1)` simultaneous requests, the ring two at a time.
+Measured at the production placement, world 4, median of 100 after 20 warmup, with the grain fix in
+place:
+
+| KiB | 8 | 20 | 40 | 80 | 128 | 256 |
+|---|---|---|---|---|---|---|
+| flat | 54.0 | 97.2 | 195.8 | 397.6 | 642.3 | 1321.9 |
+| ring | 73.3 | 110.2 | 180.2 | **298.6** | **452.0** | **966.9** |
+
+They cross at ~32 KiB, which is the new default of `SGLANG_HTCCL_UCX_AG_RING_KIB` (0 disables the
+ring and is the A/B control). A bs=1 decode gather (20 KiB) stays flat; a 4-token verify gather
+(80 KiB) rings and costs 25 % less. Exactness gated on the real link at world 4 with both rings
+active, across 8/16/23/24/25/32/80/128 KiB and ragged tails: **0 mismatches at atol 0**.
+
+Decode-shaped cells at the resulting defaults (world 4, cross-rig, median of 100 after 20 warmup):
+`all_reduce` 8 KiB 49.9 us, 20 KiB 89.5 us, 80 KiB 198.6 us; `all_gather` 8 KiB 54.2 us,
+20 KiB 99.4 us, 80 KiB 310.6 us.
 
 Transport throughput, median per direction while the reverse direction runs simultaneously, world 2,
 5 repetitions of per-cell medians:
