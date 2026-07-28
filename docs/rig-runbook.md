@@ -1606,3 +1606,137 @@ When a token is available the PREVIEW already fetches and merges what that
 fingerprint published before, so the text shown is the text that lands. The
 token is optional to store: opt-in, `0600`, and the page can only ask
 *whether* one exists, never read it back.
+
+### 8.7 The key solver: the distribution key, computed (#272)
+
+Three endpoints behind `srt/planner/key_solver.py` + `srt/planner/solver_api.py`.
+They answer *what split should this rig use for THIS goal* by computing it
+from the rig profile instead of picking a canned working point. Like §8.5 they
+read only what is already on disk (the card probe, the split-probe store,
+`config.json`) — no boot, no allocation, no measurement — so all three are
+safe against a dashboard someone else is using.
+
+> **Wiring note (2026-07-28).** The payload functions are complete and
+> tested; the three dispatch lines in `webui.py:_Handler.do_POST` belong to
+> the UI strand and land with its next merge. Until then the same calls work
+> directly, which is also how the tests drive them:
+>
+> ```bash
+> cd /spinning/wt-solver && PYTHONPATH=$PWD/python \
+>   /spinning/htsglang-gpu/.venv/bin/python -c '
+> import json
+> from sglang.srt.planner.solver_api import key_solver_payload
+> print(json.dumps(key_solver_payload({...}), indent=1))'
+> ```
+
+```bash
+UI=http://127.0.0.1:8791
+M=/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8
+# The per-rank budget is the planner's derive_auto_plan output, i.e. NVML
+# total minus the reserve. Reserve 3000/2700/2700 is the recipe of 4.1.
+BUDGET='[29607,17780,17780]'
+
+# ONE goal -> one key. goal is maxkv | sessions | dec | enc.
+curl -s -X POST $UI/api/key_solver -d "{
+  \"model_path\": \"$M\", \"tp_size\": 3, \"rank_gpu_id\": [0,1,2],
+  \"rank_gpu_memory_mib\": $BUDGET, \"kv_cache_dtype\": \"fp8_e4m3\",
+  \"speculative_algorithm\": \"NEXTN\", \"speculative_num_draft_tokens\": 4,
+  \"max_running_requests\": 16, \"goal\": \"enc\"}" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+c=d["candidates"][0]
+print(" ".join(c["launch_flags"]))
+for g in ("maxkv","sessions","dec","enc"):
+    cell=c["predictions"][g]
+    print(f"  {g:9s} {cell['"'"'value'"'"']} {cell['"'"'unit'"'"']} [{cell['"'"'provenance'"'"']}]")
+print(" ", c["tradeoff"]["line"])'
+
+# TWO goals -> a 3-5 point Pareto front, endpoints plus the knee. Every point
+# carries EVERY goal, the sacrificed ones included.
+curl -s -X POST $UI/api/key_solver -d "{... , \"goal\": \"dec\", \"goal_b\": \"enc\"}"
+
+# One goal under a threshold on another ("max prefill, keep decode >= 90 tok/s").
+curl -s -X POST $UI/api/key_solver -d "{... , \"goal\": \"enc\",
+  \"constraints\": {\"dec\": 90.0}}"
+
+# Several coexisting instances: the additive answer and the bracket that
+# decides whether it counts. share_group = rank reuse (shared weight bytes
+# counted once); omit it to price naive duplication.
+curl -s -X POST $UI/api/key_solver/aggregate -d '{
+  "gpu_total_mib": {"0": 32607, "1": 20480, "2": 20480},
+  "instances": [
+    {"key":"main","model_path":"...","tp_size":3,"rank_gpu_id":[0,1,2],
+     "rank_gpu_memory_mib":[29607,17780,17780],"share_group":"dual"},
+    {"key":"lane","model_path":"...","tp_size":1,"rank_gpu_id":[0],
+     "rank_gpu_memory_mib":[26737],"share_group":"dual"}]}'
+
+# Predicted vs measured, per regression anchor. This is the honest one: it
+# prints the model's OWN error against the arms it was built from.
+curl -s -X POST $UI/api/key_solver/model -d "{\"model_path\": \"$M\",
+  \"q3_gguf_path\": \"/spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-MTP-Q3_K_M-GGUF/Qwen3.6-27B-Q3_K_M.gguf\",
+  \"small_model_path\": \"/spinning/llm_stuff/club-3090/models-cache/Qwen3.5-4B\"}"
+```
+
+#### What it computes, and what it refuses to
+
+- **One closed form, four goals.** Decode, prefill, max KV and sessions all
+  reduce to `minimize max_r (a_r + b_r*u_r)` over the MLP-unit simplex, which
+  water-filling solves exactly (bisection on one scalar). There is no sweep
+  over candidate vectors, and the derivation is in the module docstring §3.
+  A solve takes ~0.03 s, a front ~0.1 s.
+- **Roles are bounds, not branches.** `shard` is `[0, U]`, `kv_donor` is
+  `[0, 0]` (the weightless KV lane, the 0 % end), `replica` is the 100 % end
+  and is offered only when the whole model fits on that card. The continuum
+  between them is the ordinary solution space; nothing in it is excluded by
+  rule, only priced by the ledger.
+- **It says when a goal cannot move.** With the budgets fixed, `sum_r` KV
+  capacity is INVARIANT under the MLP key: the key moves KV between cards, it
+  does not create it. So `maxkv` only changes through the weakest rank, and
+  when it does not change at all the answer says so instead of selling a key
+  that changes nothing as an optimum.
+- **It refuses to invent a term.** No pair matrix on disk -> the collective
+  term of both phases is `absent` and the absolute prefill rate is not
+  produced. No host probe -> no host-tier term. No measured baseline for the
+  checkpoint -> decode is reported as a ratio, not as tok/s. Each of those
+  names its instrument.
+- **Every candidate carries a remeasure hook** — a `split_probe` job pinned
+  to exactly that vector — so the prediction and the measurement land side by
+  side and the model error stays visible.
+
+#### The regression store (what the model must reproduce)
+
+`/api/key_solver/model` re-derives these on every call; the tolerances and
+the reason each tolerance is what it is live in `REGRESSION_ANCHORS` and
+`ADDITIVE_ANCHOR`. Measured on the reference rig, Qwen3.6-27B:
+
+| anchor | measured | predicted |
+|---|---|---|
+| #264, 6,1,1 vs auto 2,1,1 (FP8, TP=3) | prefill +8.2 %, decode -13.7 % | +10.0 % / -12.7 % — **net negative**, as measured |
+| phase-dual 2,5,2 vs auto (FP8, TP=3) | prefill +3.4…+5.7 %, decode -2.5 % (below the noise floor) | +4.3 % / -4.8 % |
+| 27B-FP8 solo on the 5090 | does not boot (three OOMs, ~28.5 GiB of posts) | **unbootable**, at the only key TP=1 has |
+| hybrid layer window (#201 slice 2) | 14/10 layer split = 3/3 full-attention | 3/3 — sized on full-attention layers, never on `num_hidden_layers` |
+| Q3_K_M trade, 20k prefill (#107 f/u 2) | solo 3202.8, group 1089.4 tok/s (2.94x); KV 4.21x | 2587 / 1249 tok/s (2.07x); KV 4.84x |
+| FP8 group prefill, ~26k (independent arm) | 1149.6 tok/s | 1273 tok/s |
+| 27B-Q3 beside 27B-Q3, naive duplication | must not fit | **does not fit**, 5090 over by 2560 MiB |
+| the same pair with rank reuse | 12.9 GiB of weights held once | **fits**, 3189 MiB of headroom |
+| aggregate prefill of that pair, over the group alone | 3.94x | 3.07x |
+
+The absolute prefill model has **no fitted scalar of its own**: it uses the
+existing GEMM efficiency and takes the pair matrix at face value
+(`COLLECTIVE_EFFICIENCY = 1.0`). Its error on the three arms is -19 %, +15 %
+and +11 % — one-sided in the direction the docstring predicts, because the
+pair matrix measured one ordered pair at a time while a group collective
+contends for one shared host path. Refit recipe at the constant.
+
+#### Rules that are not tolerances
+
+Four things are asserted exactly, with no band, because a model that gets
+them wrong is not usable at any accuracy:
+
+1. `6,1,1` comes out **net negative** (decode loss > prefill gain);
+2. 27B-FP8 solo on the 5090 is **unbootable**, and the same model at TP=3 is
+   not (a verdict that fires on everything is not a verdict);
+3. a hybrid KV pool is sized on **full-attention layers**, and a layer window
+   by intersection;
+4. instances that do **not** jointly fit produce **no** aggregate — the
+   overflowing GPU and its MiB are named instead.

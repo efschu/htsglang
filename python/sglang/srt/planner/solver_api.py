@@ -1,0 +1,418 @@
+# Copyright 2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""solver_api — the JSON surface of the key solver (#272).
+
+Three payload functions, all pure reads:
+
+  * ``key_solver_payload``           — the distribution key for one goal, a
+                                       goal under constraints, or a goal pair;
+  * ``key_solver_aggregate_payload`` — several coexisting instances: the
+                                       additive throughput and the #260
+                                       bracket that decides whether it counts;
+  * ``key_solver_model_payload``     — predicted vs measured for every
+                                       regression anchor, so the model error
+                                       is visible.
+
+Neither boots, allocates nor measures anything: they read the card probe and
+the split-probe store from disk and ``config.json`` for the geometry. Both
+are therefore safe to call against a dashboard somebody else is using, the
+same contract the Guide-tab endpoints carry.
+
+WIRING (deliberately not done here). The dashboard's ``webui.py`` dispatches
+by path prefix inside ``_Handler.do_POST``; binding these needs exactly two
+lines there, next to the ``/api/lever_profiles`` block::
+
+    if self.path.startswith("/api/key_solver/model"):
+        self._json(200, key_solver_model_payload(payload))
+        return
+    if self.path.startswith("/api/key_solver/aggregate"):
+        self._json(200, key_solver_aggregate_payload(payload))
+        return
+    if self.path.startswith("/api/key_solver"):
+        self._json(200, key_solver_payload(payload))
+        return
+
+The longer prefixes must be tested FIRST or they are swallowed by the
+shorter one — the ordering rule that file already documents at several other
+pairs. The UI strand owns ``webui.py`` and does the binding; this module is
+complete
+and callable without it (``python -m`` is not offered, the planner CLI and
+the tests call the functions directly).
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import os
+from typing import Any, Dict, List, Optional
+
+from sglang.srt.planner import key_solver
+from sglang.srt.planner.bench_factors import Remeasure
+
+__all__ = [
+    "key_solver_payload",
+    "key_solver_aggregate_payload",
+    "key_solver_model_payload",
+    "cached_card_probe",
+]
+
+
+def cached_card_probe() -> Optional[dict]:
+    """The newest ``card_probe-*.json`` artifact on disk, or ``None``.
+
+    A torn or unreadable file is skipped rather than raised on: the next
+    older artifact is a usable answer, and "no probe" already has a remedy
+    path in the payload below.
+    """
+    pattern = os.path.join(
+        os.path.expanduser("~"), ".cache", "sglang", "card_probe-*.json"
+    )
+    files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    for path in files:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("cards"):
+            return dict(data)
+    return None
+
+
+def _card_probe_remedy() -> dict:
+    return Remeasure(
+        kind="job",
+        label="measure the card rates and the pair matrix",
+        path="/api/card_probe",
+        status_path="/api/card_probe/status",
+        body={"node_id": "local"},
+        cost="about 5 s over three cards; no running server is interrupted",
+    ).to_json()
+
+
+def key_solver_payload(payload: Optional[dict] = None) -> dict:
+    """``POST /api/key_solver`` — the distribution key, computed.
+
+    Body::
+
+        {"model_path": str,                    # required
+         "tp_size": int = 3,
+         "rank_gpu_id": [int] = [0..tp-1],     # --rank-gpu-id space
+         "rank_gpu_memory_mib": [int],         # required: the per-rank budget
+         "base_plan": [int] = rank_gpu_memory_mib,
+         "goal": "maxkv"|"sessions"|"dec"|"enc" = "maxkv",
+         "goal_b": same set                    # -> Pareto front
+         "constraints": {goal: min_value}      # -> constrained optimum
+         "target_context": int = 8192,
+         "roles": ["shard"|"kv_donor"|"replica"],   # pin instead of search
+         "kv_cache_dtype", "speculative_algorithm",
+         "speculative_num_draft_tokens", "speculative_draft_model_path",
+         "max_running_requests"}
+
+    ``goal`` alone gives one candidate; adding ``constraints`` gives the
+    constrained optimum; adding ``goal_b`` gives a 3-5 point front including
+    the knee. Every candidate carries every goal's predicted value — the
+    sacrificed ones too — plus its trade-off line and its remeasure hook.
+    """
+    from sglang.srt.uneven_perf import PlanInputs
+
+    p = dict(payload or {})
+    model_path = str(p.get("model_path") or "").strip()
+    if not model_path:
+        return {
+            "ok": False,
+            "reasons": ["no model_path given"],
+            "remedy": "pass the checkpoint directory or .gguf the key is for",
+        }
+
+    try:
+        tp_size = int(p.get("tp_size") or 3)
+    except (TypeError, ValueError):
+        return {"ok": False, "reasons": ["tp_size must be an integer"]}
+    if tp_size < 1:
+        return {"ok": False, "reasons": ["tp_size must be >= 1"]}
+
+    raw_ids = p.get("rank_gpu_id") or list(range(tp_size))
+    try:
+        rank_gpu_id = [int(x) for x in raw_ids]
+    except (TypeError, ValueError):
+        return {"ok": False, "reasons": ["rank_gpu_id must be a list of ints"]}
+    if len(rank_gpu_id) != tp_size:
+        return {
+            "ok": False,
+            "reasons": [
+                f"rank_gpu_id has {len(rank_gpu_id)} entries but tp_size is "
+                f"{tp_size}; the flag names one physical GPU per rank"
+            ],
+        }
+
+    budgets_in = p.get("rank_gpu_memory_mib")
+    if not budgets_in:
+        return {
+            "ok": False,
+            "reasons": [
+                "no per-rank budget given; pass rank_gpu_memory_mib. The "
+                "planner's derive_auto_plan produces it from the hardware "
+                "spec and the reserves, which is where the dashboard gets it"
+            ],
+        }
+    try:
+        budgets = [int(x) for x in budgets_in]
+        base_plan = [int(x) for x in (p.get("base_plan") or budgets)]
+    except (TypeError, ValueError):
+        return {
+            "ok": False,
+            "reasons": ["rank_gpu_memory_mib / base_plan must be lists of ints"],
+        }
+    if len(budgets) != tp_size or len(base_plan) != tp_size:
+        return {
+            "ok": False,
+            "reasons": [
+                "rank_gpu_memory_mib and base_plan need one entry per rank "
+                f"({tp_size})"
+            ],
+        }
+
+    probe = cached_card_probe()
+    if probe is None:
+        return {
+            "ok": False,
+            "reasons": [
+                "no card probe on disk — the solver has no per-card rates and "
+                "will not invent any"
+            ],
+            "remeasure": _card_probe_remedy(),
+        }
+
+    try:
+        rates = key_solver.rates_from_probe(probe, rank_gpu_id)
+    except ValueError as e:
+        return {"ok": False, "reasons": [str(e)], "remeasure": _card_probe_remedy()}
+
+    constraints_in = p.get("constraints") or {}
+    try:
+        constraints: Dict[str, float] = {
+            str(k): float(v) for k, v in dict(constraints_in).items()
+        }
+    except (TypeError, ValueError):
+        return {
+            "ok": False,
+            "reasons": ["constraints must be a {goal: minimum value} mapping"],
+        }
+    unknown = [k for k in constraints if k not in key_solver.GOALS]
+    if unknown:
+        return {
+            "ok": False,
+            "reasons": [
+                f"unknown constraint goal(s) {unknown}; known: "
+                f"{list(key_solver.GOALS)}"
+            ],
+        }
+
+    inputs = PlanInputs(
+        tp_size=tp_size,
+        model_path=model_path,
+        kv_cache_dtype=str(p.get("kv_cache_dtype") or "auto"),
+        speculative_algorithm=p.get("speculative_algorithm"),
+        speculative_num_draft_tokens=p.get("speculative_num_draft_tokens"),
+        speculative_draft_model_path=p.get("speculative_draft_model_path"),
+        max_running_requests=p.get("max_running_requests"),
+        rank_gpu_id=list(rank_gpu_id),
+        effective_vram_mib=list(budgets),
+    )
+
+    try:
+        answer = key_solver.solve(
+            inputs,
+            base_plan,
+            budgets,
+            rates,
+            goal=str(p.get("goal") or "maxkv"),
+            goal_b=(str(p["goal_b"]) if p.get("goal_b") else None),
+            constraints=constraints or None,
+            target_context=int(p.get("target_context") or 8192),
+            roles=(list(p["roles"]) if p.get("roles") else None),
+        )
+    except (ValueError, KeyError, OSError) as e:
+        return {"ok": False, "reasons": [str(e)]}
+
+    out: Dict[str, Any] = answer.to_json()
+    out["model_path"] = model_path
+    out["rank_gpu_id"] = list(rank_gpu_id)
+    out["rank_gpu_memory_mib"] = list(budgets)
+    return out
+
+
+def key_solver_aggregate_payload(payload: Optional[dict] = None) -> dict:
+    """``POST /api/key_solver/aggregate`` — several instances at once.
+
+    Body::
+
+        {"gpu_total_mib": {"0": 32607, "1": 20480, ...},   # required
+         "reserve_mib": {"0": 0, ...},
+         "prefill_tokens": int = 20000,
+         "instances": [
+           {"key": str, "model_path": str, "tp_size": int,
+            "rank_gpu_id": [int], "rank_gpu_memory_mib": [int],
+            "base_plan": [int], "mlp_vector": [int],
+            "kv_cache_dtype": str, "speculative_algorithm": str,
+            "speculative_num_draft_tokens": int, "max_running_requests": int,
+            "kind": str, "local": bool, "min_kv_tokens": int,
+            "share_group": str|null},
+           ...]}
+
+    One mechanic for every family that adds a serving source — an extra solo
+    server, a PD lane, a replicated drafter, a full replica, a foreign-rig
+    satellite. The answer is the sum over the instances IF the coexistence
+    bracket closes, and the naming of the overflowing GPU if it does not.
+
+    ``share_group`` is the dual-group runtime: instances that reuse one
+    resident weight set (rank reuse, nested shards) name the same group and
+    their weights are counted ONCE per card. Leaving it out prices naive
+    duplication, which is a different — and usually infeasible — plan.
+    """
+    p = dict(payload or {})
+    raw_instances = p.get("instances") or []
+    if not raw_instances:
+        return {"ok": False, "reasons": ["no instances given"]}
+    totals_in = p.get("gpu_total_mib") or {}
+    if not totals_in:
+        return {
+            "ok": False,
+            "reasons": [
+                "no gpu_total_mib given; the bracket needs each card's NVML "
+                "total to be able to say 'does not fit' with a number"
+            ],
+        }
+    probe = cached_card_probe()
+    if probe is None:
+        return {
+            "ok": False,
+            "reasons": ["no card probe on disk"],
+            "remeasure": _card_probe_remedy(),
+        }
+
+    try:
+        gpu_total = {int(k): int(v) for k, v in dict(totals_in).items()}
+        reserve = {int(k): int(v) for k, v in dict(p.get("reserve_mib") or {}).items()}
+        specs = []
+        for i, raw in enumerate(raw_instances):
+            d = dict(raw)
+            rgid = [int(x) for x in d["rank_gpu_id"]]
+            specs.append(
+                key_solver.InstanceSpec(
+                    key=str(d.get("key") or f"instance{i}"),
+                    model_path=str(d["model_path"]),
+                    tp_size=int(d.get("tp_size") or len(rgid)),
+                    rank_gpu_id=rgid,
+                    budgets_mib=[int(x) for x in d["rank_gpu_memory_mib"]],
+                    base_plan=(
+                        [int(x) for x in d["base_plan"]] if d.get("base_plan") else None
+                    ),
+                    mlp_vector=(
+                        [int(x) for x in d["mlp_vector"]]
+                        if d.get("mlp_vector")
+                        else None
+                    ),
+                    kv_cache_dtype=str(d.get("kv_cache_dtype") or "auto"),
+                    speculative_algorithm=d.get("speculative_algorithm"),
+                    speculative_num_draft_tokens=d.get("speculative_num_draft_tokens"),
+                    max_running_requests=d.get("max_running_requests"),
+                    kind=str(d.get("kind") or "serving"),
+                    local=bool(d.get("local", True)),
+                    min_kv_tokens=int(d.get("min_kv_tokens") or 4096),
+                    share_group=(
+                        str(d["share_group"]) if d.get("share_group") else None
+                    ),
+                )
+            )
+    except (KeyError, TypeError, ValueError) as e:
+        return {"ok": False, "reasons": [f"malformed instance list: {e}"]}
+
+    try:
+        out: Dict[str, Any] = key_solver.aggregate(
+            specs,
+            probe,
+            gpu_total,
+            reserve_mib=reserve or None,
+            prefill_tokens=int(p.get("prefill_tokens") or 20000),
+        )
+    except (ValueError, KeyError, OSError) as e:
+        return {"ok": False, "reasons": [str(e)]}
+    return out
+
+
+def key_solver_model_payload(payload: Optional[dict] = None) -> dict:
+    """``POST /api/key_solver/model`` — predicted vs measured, per anchor.
+
+    The validation loop in one call: every regression anchor is re-derived
+    from the checkpoint and the probe on disk, and reported next to the
+    measurement it was built from, with the tolerance and the reason that
+    tolerance is what it is. A model nobody can check against a measurement
+    is not a model, it is a preference.
+    """
+    p = dict(payload or {})
+    model_path = str(p.get("model_path") or "").strip()
+    if not model_path:
+        return {
+            "ok": False,
+            "reasons": [
+                "no model_path given; the anchors are Qwen3.6-27B-FP8 points, "
+                "so pass that checkpoint's directory"
+            ],
+        }
+    probe = cached_card_probe()
+    if probe is None:
+        return {
+            "ok": False,
+            "reasons": ["no card probe on disk"],
+            "remeasure": _card_probe_remedy(),
+        }
+    try:
+        rows: List[dict] = key_solver.check_regressions(model_path, probe)
+    except (ValueError, KeyError, OSError) as e:
+        return {"ok": False, "reasons": [str(e)]}
+
+    additive: Optional[dict] = None
+    q3 = str(p.get("q3_gguf_path") or "").strip()
+    if q3:
+        try:
+            additive = key_solver.check_additive_regression(
+                q3,
+                model_path,
+                probe,
+                small_model_path=(str(p.get("small_model_path") or "") or None),
+            )
+        except (ValueError, KeyError, OSError) as e:
+            additive = {"error": str(e)}
+
+    return {
+        "ok": True,
+        "model_path": model_path,
+        "noise_floor_pct": key_solver.NOISE_FLOOR_PCT,
+        "collective_efficiency": key_solver.COLLECTIVE_EFFICIENCY,
+        "anchors": rows,
+        "additive": additive,
+        "all_within_tolerance": all(r["within_tolerance"] for r in rows),
+        "all_signs_match": all(r["signs_match"] for r in rows),
+        "remeasure": Remeasure(
+            kind="job",
+            label="re-measure an anchor vector against its prediction",
+            path="/api/split_probe",
+            status_path="/api/split_probe/status",
+            body={"candidate": "6,1,1", "tp_size": 3, "model_path": model_path},
+            cost="one cold boot to READY plus a prefill and a decode window",
+        ).to_json(),
+    }
