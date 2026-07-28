@@ -5466,3 +5466,56 @@ Export (und damit GDR) auf GeForce freikommt — analog zur geohot-P2P-Praezeden
   Topologiepruefung wuerde 3080@05:00.0 <-> CX-4 zustimmen. Es fehlt allein
   ib_register_peer_memory_client im in-tree ib_core — GPL-Kernelcode, legitim
   erweiterbar, aber ein eigenes Vorhaben.
+
+### Q4-Addendum 3 (zweite, unabhaengige Analyse) — Gate-Landkarte bestaetigt, zwei Sonden-Befunde falsifiziert
+
+Auftrag war die Patchbarkeit des offenen NVIDIA-Treibers (Nutzerfrage, mit dem
+tinygrad-P2P-Unlock als Praezedenz). Ergebnis deckt sich mit Addendum 2 und
+praezisiert es an drei Stellen:
+
+- KEIN GeForce-Riegel im offenen Kernel-/RM-Code, in KEINER Version (525.60.13,
+  550.54.15, 580.126.18, 595.58.03 je per Tag geprueft). Der Capability-Entscheid
+  (subdevice_ctrl_gpu_kernel.c:513-522) lautet nur
+  `osDmabufIsSupported() && !APM && !ppc64le`.
+- Gegen das INSTALLIERTE Binary geprueft, nicht nur gegen die Quelle:
+  /usr/src/nvidia-595.58.03/nvidia/nv-kernel.o_binary ist KEIN proprietaerer
+  Blob, sondern das kompilierte OFFENE RM (modinfo: Dual MIT/GPL). Disassembliert
+  (getGpuInfos @0x2d5cc0, Index 0x3d): cmp -> osDmabufIsSupported ->
+  gpuIsApmFeatureEnabled -> sete. Vollstaendige Reloc-Liste der Funktion: kein
+  bIsGeforce, kein gpuGetChipInfo, kein SKU-Zugriff.
+- GSP nachweislich unbeteiligt: der Index wird CPU-seitig beantwortet, es gibt
+  keinen RPC-Forward. Riegel = libcuda.so (geschlossen, stripped, 91 MB).
+- tinygrad-Vergleich ist das GEGENbeispiel, nicht das Argument: dort war ein
+  HAL-Stub im offenen RM konstant FALSE (kbusIsPcieBar1P2PMappingSupported),
+  libcuda musste gar nicht angefasst werden, weil Userspace der RM-Antwort
+  glaubte. Hier sagt das RM JA und libcuda folgt trotzdem nicht.
+
+ZWEI KORREKTUREN an der Q4-Sonde (wichtig fuer kuenftige Schluesse):
+1. Der Rig-2-Gegentest war KEIN Falsifikator — Rig 2 faehrt den PROPRIETAEREN
+   595.84, fuer den DMA_BUF_SUPPORTED=0 dokumentiertes Sollverhalten ist
+   (dma-buf-Export existiert nur mit den open modules). Er schliesst weder
+   Plattform noch SKU aus. Nur Rig 1 ist aussagekraeftig. (Die Breite des
+   Schlusses war groesser als die Stichprobe — bekannte Falle.)
+2. Die FORCE_PCIE-Variante scheitert auf x86 mit diskreter GPU IMMER, unabhaengig
+   von der SKU: RmDmabufGetClientAndDevice (osapi.c:1451) verlangt dafuer
+   PDB_PROP_GPU_COHERENT_CPU_MAPPING (Grace/C2C). Auch eine H100 PCIe wuerde
+   daran scheitern. Die Messung selbst war sauber (dmabuf_cap mit -1 vorbelegt,
+   ausgegeben wurde 0 — kein stiller Fehlschlag).
+
+RESTUNSICHERHEIT ehrlich benannt: bewiesen ist, dass das RM YES antwortet; NICHT
+direkt gemessen ist, dass libcuda genau diese Antwort einholt und ueberschreibt
+(stripped). Beide Alternativen fuehren zum selben Schluss, aber der billige
+Falsifikator dafuer laeuft jetzt: "Weg A" = NV_ESC_RM_CONTROL/GET_INFO_V2
+Index 0x3d direkt am Kernel vorbei an libcuda, ~5 min, kein Reload, keine
+Modell-Last. Danach optional "Weg B" (Hypothese: NV_ESC_EXPORT_TO_DMABUF_FD ist
+im offenen Modul ungegatet — erst belegen, dann versuchen).
+
+ENTFAELLT: der geplante NVreg_GrdmaPciTopoCheckOverride-Reload. Quelltext
+bestaetigt, dass der Override erst im ATTACH-Pfad wirkt (nv-dmabuf.c:1036 ->
+nv-pci.c:2708), nicht im Export — Weg A beantwortet dieselbe Frage ohne
+rig-weites Fenster. Nebenbefund: GPU0 (3080, 05:00.0) <-> CX-4 wuerde den
+Default-Topologiecheck ohnehin bestehen (PIX).
+
+AUSGESCHLOSSEN (Nutzerentscheid, nicht Agentenarbeit): libcuda patchen oder ihre
+Policy reverse-engineeren. Artefakt: Quelltext-Klon Tag 595.58.03 unter
+/spinning/ogkm-595 (81 MB), bleibt fuer Weg A/B stehen.
