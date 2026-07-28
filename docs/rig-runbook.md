@@ -683,3 +683,82 @@ Two properties worth relying on:
 fills the ordinary configuration fields; launching stays the separate,
 explicit act it already was. From the shell, take `flags` and put them on
 your own launch line.
+
+### 8.4 The tipping point of one split candidate (#232)
+
+`POST /api/split_probe` measures ONE MLP split candidate end to end: it boots
+a server with that candidate, runs a cold ~20k prefill against random ids
+(so no prefix cache can serve it), holds a 20-30 s decode window on a fixed
+natural prompt, reads the three quantities a split trades between, and tears
+the server down. Unlike every other endpoint in this section it **boots a
+model**, so it takes the cards exclusively for the length of one candidate.
+
+The three quantities, and why all three:
+
+| quantity | source | what it answers |
+|---|---|---|
+| `decode_tok_s`, `ms_per_verify`, `accept_length` | the decode window | what the split **costs** |
+| `prefill_tok_s` | the cold 20k prefill | what it **buys** |
+| `max_total_num_tokens` | `GET /get_server_info` | what it **spends** in KV |
+| `rank_compute_wait` | the per-rank `Prefill rank batch` line (§4, #252) | where the time actually goes |
+
+```bash
+UI=http://127.0.0.1:8791
+
+# One candidate, one boot. Returns at once; ~6-8 min of exclusive GPU time.
+BODY='{"model_path":"'$MODEL_ROOT'/Qwen3.6-27B-FP8",
+       "mlp_vector":"6,1,1","tp_size":3}'
+curl -s -X POST $UI/api/split_probe -d "$BODY"
+
+# Poll. The status answer carries the whole table, so the poll and the page
+# can never disagree about which candidates are measured.
+until [ "$(curl -s $UI/api/split_probe/status |
+           python3 -c 'import json,sys; print((json.load(sys.stdin)["job"] or {}).get("state","idle"))')" \
+        != running ]; do sleep 10; done
+
+# The table, as the Benchmark tab draws it.
+curl -s $UI/api/split_probe/status | python3 -c 'import json,sys
+t=json.load(sys.stdin)["table"]; print(t["summary"])
+for r in t["rows"]:
+    if not r["measured"]:
+        print(" ", r["candidate"].ljust(8), "not measured"); continue
+    d=r.get("delta") or {}
+    print(" ", r["candidate"].ljust(8),
+          "prefill %s" % r["prefill_tok_s"], "decode %s" % r["decode_tok_s"],
+          "ms/verify %s" % r["ms_per_verify"], "maxKV %s" % r["max_total_num_tokens"],
+          ("[prefill %s%%, decode %s%%, KV %s%%]" % (d.get("prefill_pct"),
+           d.get("decode_pct"), d.get("max_kv_pct"))) if d else "")'
+```
+
+`"mlp_vector":"auto"` measures what `--rank-tp-ratio auto-performance` picks
+when left alone; every delta in the table is taken against it. The same
+thing without the dashboard:
+
+```bash
+python -m sglang.srt.planner.split_probe --run \
+  --model-path $MODEL_ROOT/Qwen3.6-27B-FP8 --candidate 6,1,1
+python -m sglang.srt.planner.split_probe          # print the table
+python -m sglang.srt.planner.split_probe --import-264   # seed the #264 rows
+```
+
+Four properties worth relying on:
+
+- **One candidate per click.** The ladder is not swept. Eight boots behind a
+  control that looks like the others is hours of GPU time, and the reader
+  usually wants one comparison.
+- **The cards are taken with a lock, released in a `finally`.** The lock is
+  an atomic `mkdir` at `~/.cache/sglang/split_probe.gpulock`, held by the
+  measuring process rather than by the dashboard, so restarting the dashboard
+  cannot strand it. A lock whose owner is gone is reclaimed and says so. A
+  card that already carries someone else's compute process stops the probe
+  before it boots — it is never taken by force.
+- **The reserve is derived and, if that is not enough, retried.** §6.5 and
+  #265: concentrating the dense MLP spends the slack the balanced plan left
+  on rank 0, so the reserve that boots `auto` need not boot `6,1,1`. The
+  probe bumps the concentrated rank by the growth in the checkpoint's own GDN
+  prefill scratch, and a boot that OOMs anyway is retried once at a raised
+  reserve; the row records both values. A candidate that still will not boot
+  is stored as `unbootable` with its reason — that is a finding, not a hole.
+- **A row that claims to be measured carries numbers.** The store re-runs its
+  guard on load, so a hand-edited `~/.cache/sglang/split_probe.jsonl` cannot
+  put an invented figure on the page.

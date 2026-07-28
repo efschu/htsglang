@@ -75,6 +75,8 @@ __all__ = [
     "bench_probe_payload",
     "bench_run_events",
     "bench_factors_payload",
+    "split_probe_start_payload",
+    "split_probe_status_payload",
     "scenario_suggest_payload",
     "share_preview_payload",
     "share_submit_payload",
@@ -2453,6 +2455,73 @@ def card_probe_status_payload(payload: Optional[dict] = None) -> dict:
     return out
 
 
+def split_probe_start_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/split_probe {model_path, mlp_vector, reserve_mib} -> a job.
+
+    Measures ONE split candidate: boot, cold 20k prefill, a decode window,
+    teardown. That is 6-8 minutes of exclusive GPU time, so it returns at once
+    with a job and the caller polls ``GET /api/split_probe/status``. One
+    measurement runs at a time -- a second request joins the first rather than
+    measuring the interference between them.
+    """
+    from sglang.srt.planner import split_probe as sp
+
+    p = payload or {}
+    model_path = str(p.get("model_path") or "").strip()
+    if not model_path:
+        return {
+            "ok": False,
+            "error": "no model_path given",
+            "remedy": "Pass the checkpoint to boot; the probe measures a split "
+            "of a real model, not of a plan.",
+        }
+    candidate = str(p.get("mlp_vector") or sp.BASELINE_CANDIDATE).strip()
+    request = {
+        "model_path": model_path,
+        "candidate": candidate,
+        "tp_size": int(p.get("tp_size") or 3),
+    }
+    if p.get("reserve_mib"):
+        request["reserve_mib"] = list(p["reserve_mib"])
+    if p.get("port"):
+        request["port"] = int(p["port"])
+    if p.get("worktree"):
+        request["worktree"] = str(p["worktree"])
+    try:
+        job = sp.JOBS.start(request)
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "job": job.to_json()}
+
+
+def split_probe_status_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/split_probe/status[?job_id=...] -> the job AND the table.
+
+    One endpoint for both, because the page needs the table on load and again
+    after every poll: splitting them would have the poll and the render read
+    two answers that can disagree about which candidates are measured.
+    """
+    from sglang.srt.planner import split_probe as sp
+
+    jid = ((payload or {}).get("job_id") or "").strip()
+    out: dict = {"ok": True}
+    if jid:
+        job = sp.JOBS.get(jid)
+        if job is None:
+            return {"ok": False, "error": f"no such split probe job: {jid}"}
+        out["job"] = job.to_json()
+    else:
+        active = sp.JOBS.active()
+        latest = active or sp.JOBS.latest()
+        out["job"] = latest.to_json() if latest else None
+    try:
+        out["table"] = sp.tipping_point_table()
+    except Exception as e:  # pragma: no cover - defensive
+        out["table"] = None
+        out["error"] = str(e)
+    return out
+
+
 def rig_pair_start_payload(payload: dict) -> dict:
     """POST /api/rig_pair/start {target} -> a session, held on the host."""
     from sglang.srt.rigmon import pairing
@@ -3438,6 +3507,16 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
+        # Before /api/split_probe, for the same prefix reason.
+        if self.path.startswith("/api/split_probe/status"):
+            try:
+                from urllib.parse import parse_qs, urlsplit
+
+                q = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                self._json(200, split_probe_status_payload(q))
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
         if self.path.startswith("/api/rig_pair/status"):
             try:
                 from urllib.parse import parse_qs, urlsplit
@@ -3647,6 +3726,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/card_probe"):
                 self._json(200, card_probe_start_payload(payload))
+                return
+            if self.path.startswith("/api/split_probe"):
+                self._json(200, split_probe_start_payload(payload))
                 return
             if self.path.startswith("/api/rig_pair/start"):
                 self._json(200, rig_pair_start_payload(payload))
@@ -4265,6 +4347,22 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   .sc-why .p.measured { color: var(--ok); border-color: var(--ok-dim); }
   .sc-why .p.estimate { color: var(--warn); border-color: var(--warn-dim); }
   .sc-why .p.absent   { color: var(--fg-muted); }
+  /* #232 tipping point: one row per split candidate, measured or not. */
+  table.tp { width: 100%; border-collapse: collapse; font-size: var(--t-sm);
+             font-variant-numeric: tabular-nums; margin-top: var(--s2); }
+  table.tp th, table.tp td { padding: 3px var(--s2); text-align: right;
+                             border-bottom: 1px solid var(--bd-weak);
+                             white-space: nowrap; }
+  table.tp th:first-child, table.tp td:first-child { text-align: left; }
+  table.tp th { color: var(--fg-muted); font-weight: 400; }
+  table.tp tr.base td { background: var(--selected); }
+  table.tp tr.unmeasured td { color: var(--fg-muted); }
+  table.tp .d { font-size: var(--t-xs); display: block; }
+  table.tp .d-gain { color: var(--ok); }
+  table.tp .d-cost { color: var(--bad); }
+  table.tp .d-same, table.tp .d-na { color: var(--fg-muted); }
+  .tp-src { font-size: var(--t-xs); color: var(--fg-muted); }
+  .tp-note { font-size: var(--t-xs); color: var(--fg-muted); margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -4501,6 +4599,32 @@ _INDEX_TEMPLATE = r"""<!doctype html>
           <span id="bn_fx_note" class="muted"></span>
         </div>
         <div id="bn_factors" class="muted">reading the studies on disk&hellip;</div>
+      </fieldset>
+      <!-- Tipping point, one measured candidate at a time (#232). The planner
+           can predict what concentrating the dense MLP buys and costs; #264
+           measured it and the prediction was out by 2.2x. So this table shows
+           what was MEASURED per candidate and says "not measured" for the
+           rest, with the button that would produce the row. One click is one
+           candidate: a sweep behind a control that looks like the others
+           would be hours of GPU time. -->
+      <fieldset>
+        <legend>tipping point &mdash; measured per split candidate</legend>
+        <div class="muted" style="margin-bottom:var(--s2)">Three numbers,
+          because a split is a trade: what it <b>costs</b> in decode, what it
+          <b>buys</b> in prefill, what it <b>spends</b> in KV. Deltas are
+          against the candidate the optimizer picks when left alone. A row
+          measured here carries its date and its clock state; a row it does
+          not have says so and never shows a modelled stand-in.</div>
+        <div class="setrow">
+          <span class="lbl" id="row_tp_model">model to boot
+            <span class="muted">(blank = the configured model)</span></span>
+          <input id="tp_model" placeholder="(configured model)">
+        </div>
+        <div class="actions" style="margin-bottom:var(--s2)">
+          <button class="mini secondary" onclick="splitProbeRefresh()">refresh</button>
+          <span id="tp_note" class="muted"></span>
+        </div>
+        <div id="bn_tipping" class="muted">reading the measured candidates&hellip;</div>
       </fieldset>
       <!-- One-click scenario. Composed server-side from the working points,
            the card-probe basis and the state/KV balance; the page renders and
@@ -9053,6 +9177,7 @@ function benchInit(){
   // the first read of a running engine only opens the delta window, which the
   // round-time tile says in those words.
   benchFactors();
+  splitProbeRefresh();
 }
 function benchUseMonitor(){
   const t=window._lastTarget;
@@ -9519,6 +9644,132 @@ function factorPollJob(statusPath){
       }catch(e){ clearInterval(t); resolve(null); }
     }, 3000);
   });
+}
+
+// ---- tipping point, one measured candidate at a time (#232) --------------
+// The table and the poll read the SAME answer, so the row list and the job
+// state can never disagree about which candidates are measured.
+window._splitProbeTimer=null;
+function tpModel(){
+  const v=$('tp_model').value.trim(); if(v) return v;
+  try{ return $('model').value.trim(); }catch(e){ return ''; }
+}
+function tpNum(v,digits){
+  if(v==null) return '<span class="d-na">&mdash;</span>';
+  return esc(Number(v).toFixed(digits==null?1:digits));
+}
+function tpDelta(pct, goodUp){
+  if(pct==null) return '';
+  const same=Math.abs(pct)<0.05;
+  const cls=same?'d-same':((pct>0)===goodUp?'d-gain':'d-cost');
+  return '<span class="d '+cls+'">'+(pct>0?'+':'')+esc(pct.toFixed(1))+'%</span>';
+}
+function tpWhen(ts){
+  if(ts==null) return '';
+  const d=new Date(ts*1000);
+  return d.toISOString().slice(0,16).replace('T',' ');
+}
+function renderTipping(t){
+  const box=$('bn_tipping'); if(!box) return;
+  if(!t){ setHTML(box,'<span class="reasons">no table</span>'); return; }
+  const cost=t.cost_note||'';
+  let h='<table class="tp"><thead><tr>'
+    +'<th>candidate</th><th>prefill tok/s</th><th>decode tok/s</th>'
+    +'<th>ms / verify</th><th>accept</th><th>max KV tokens</th>'
+    +'<th>origin</th><th></th></tr></thead><tbody>';
+  for(const r of (t.rows||[])){
+    if(!r.measured){
+      h+='<tr class="unmeasured"><td>'+esc(r.candidate)+'</td>'
+        +'<td colspan="5">'+esc(r.missing_reason||'not measured')+'</td>'
+        +'<td class="tp-src">&mdash;</td><td>'
+        +'<button class="mini secondary" title="'+esc(cost)
+        +'" onclick="splitProbeStart(\''+esc(r.candidate)+'\')">measure</button>'
+        +'</td></tr>';
+      continue;
+    }
+    const d=r.delta||{};
+    if(r.unbootable){
+      h+='<tr><td>'+esc(r.candidate)+'</td><td colspan="5"><b>unbootable.</b> '
+        +esc(r.unbootable)+'</td><td class="tp-src">'+esc(r.provenance||'')
+        +'<br>'+esc(tpWhen(r.timestamp))+'</td><td>'
+        +'<button class="mini secondary" title="'+esc(cost)
+        +'" onclick="splitProbeStart(\''+esc(r.candidate)+'\')">re-measure</button>'
+        +'</td></tr>';
+      continue;
+    }
+    h+='<tr'+(r.is_baseline?' class="base"':'')+'><td>'+esc(r.candidate)
+      +(r.chosen_vector&&r.chosen_vector!==r.candidate
+        ?(' <span class="tp-src">&rarr; '+esc(r.chosen_vector)+'</span>'):'')
+      +'</td>'
+      +'<td>'+tpNum(r.prefill_tok_s)+tpDelta(d.prefill_pct,true)+'</td>'
+      +'<td>'+tpNum(r.decode_tok_s,2)+tpDelta(d.decode_pct,true)+'</td>'
+      +'<td>'+tpNum(r.ms_per_verify,2)+tpDelta(d.ms_per_verify_pct,false)+'</td>'
+      +'<td>'+tpNum(r.accept_length,3)+'</td>'
+      +'<td>'+(r.max_total_num_tokens==null?'<span class="d-na">&mdash;</span>'
+              :esc(String(r.max_total_num_tokens)))+tpDelta(d.max_kv_pct,true)+'</td>'
+      +'<td class="tp-src">'+esc(r.provenance||'')
+      +(r.source?('<br>'+esc(r.source)):'')+'<br>'+esc(tpWhen(r.timestamp))+'</td>'
+      +'<td><button class="mini secondary" title="'+esc(cost)
+      +'" onclick="splitProbeStart(\''+esc(r.candidate)+'\')">re-measure</button></td>'
+      +'</tr>';
+  }
+  h+='</tbody></table>';
+  for(const r of (t.rows||[])){
+    if(!r.measured||!r.rank_compute_wait||!r.rank_compute_wait.length) continue;
+    h+='<div class="tp-note">'+esc(r.candidate)+' prefill, per rank: '
+      +(r.rank_compute_wait.map(function(x){
+          return 'TP'+x.rank+' '+Number(x.compute_ms).toFixed(1)+' ms compute / '
+                +Number(x.wait_ms).toFixed(1)+' ms wait';
+        }).join(' &middot; '))
+      +(r.output_verdict?(' &mdash; output: '+esc(r.output_verdict)):'')+'</div>';
+  }
+  h+='<div class="tp-note">'+esc(cost)+'</div>';
+  setHTML(box, h);
+}
+async function splitProbeRefresh(){
+  const box=$('bn_tipping'); if(!box) return;
+  stale(box,true);
+  try{
+    const d=await api('/api/split_probe/status',{key:'split_probe',method:'GET',
+      timeout:20000});
+    window._splitProbe=d;
+    const job=d.job;
+    let note=(d.table&&d.table.summary)||'';
+    if(job&&job.state==='running')
+      note='measuring '+job.candidate+' &mdash; '+(job.step||'running')
+           +' ('+Math.round(job.elapsed_s||0)+' s)';
+    else if(job&&job.state==='error') note='last job failed: '+(job.error||'');
+    $('tp_note').innerHTML=note;
+    renderTipping(d.table);
+  }catch(e){
+    if(apiAborted(e)) return;
+    setHTML(box,'<span class="reasons">'+esc(apiError(e))+'</span>');
+  } finally { stale(box,false); }
+}
+async function splitProbeStart(candidate){
+  const model=tpModel();
+  if(!model){ $('tp_note').textContent=
+    'pick a model first: the probe boots a real checkpoint, not a plan.'; return; }
+  $('tp_note').textContent='starting '+candidate+'…';
+  try{
+    const started=await (await fetch('/api/split_probe',{method:'POST',
+      body:JSON.stringify({model_path:model, mlp_vector:candidate})})).json();
+    if(started.ok===false){
+      $('tp_note').textContent=started.error||'could not start'; return;
+    }
+    splitProbePollStart();
+  }catch(e){ $('tp_note').textContent=''+e; }
+}
+function splitProbePollStart(){
+  // The only waiting is the interval; no request is held open for the boot.
+  if(window._splitProbeTimer) clearInterval(window._splitProbeTimer);
+  window._splitProbeTimer=setInterval(async function(){
+    await splitProbeRefresh();
+    const j=(window._splitProbe||{}).job;
+    if(j && j.state==='running') return;
+    clearInterval(window._splitProbeTimer); window._splitProbeTimer=null;
+    benchFactors();
+  }, 5000);
 }
 
 // ---- one-click scenario ---------------------------------------------------
