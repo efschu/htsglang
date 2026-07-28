@@ -69,6 +69,8 @@ import time
 import urllib.request
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from sglang.srt.planner.self_update import planner_data_path
+
 __all__ = [
     "Workload",
     "MeasurementConfig",
@@ -1717,8 +1719,14 @@ def compare_summary(baseline: MeasurementResult, mtp: MeasurementResult,
 # format flags and never touch the path).
 VALIDATION_MODEL = os.environ.get("SGLANG_PLANNER_VALIDATION_MODEL") or None
 _VALIDATION_MODEL_PLACEHOLDER = "<set SGLANG_PLANNER_VALIDATION_MODEL>"
-DEFAULT_RESULTS_STORE = os.path.join(
-    os.path.dirname(__file__), "measured_results.jsonl")
+# Shared planner DATA dir (~/.cache/sglang), NOT the package dir — a store
+# inside the code tree would be lost/forked on every dashboard version switch
+# (self_update code/data separation). A copy at the legacy in-package path is
+# migrated forward once, idempotently.
+DEFAULT_RESULTS_STORE = planner_data_path(
+    "measured_results.jsonl",
+    legacy=os.path.join(os.path.dirname(__file__), "measured_results.jsonl"),
+)
 
 
 def validation_config(**overrides) -> MeasurementConfig:

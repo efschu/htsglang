@@ -3332,8 +3332,10 @@ class TestConsolidatedNavigation(CustomTestCase):
     claims that a later edit could quietly undo, so they are pinned here.
     """
 
+    # "about" sits last on purpose: it is not a workflow step but the
+    # dashboard's own version management (install / update / roll back).
     ORDER = ["landing", "wizard", "bench", "quality", "explore",
-             "energy", "pair", "share", "history"]
+             "energy", "pair", "share", "history", "about"]
 
     def test_tab_order_is_the_workflow_order(self):
         html = webui.INDEX_HTML

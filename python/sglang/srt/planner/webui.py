@@ -103,6 +103,9 @@ __all__ = [
     "share_rig_token_payload",
     "share_preview_payload",
     "share_submit_payload",
+    "version_payload",
+    "version_switch_payload",
+    "version_cleanup_payload",
     "serve",
 ]
 
@@ -1106,6 +1109,9 @@ def hicache_saved_record(payload: dict) -> dict:
         hicache_recovered_from_metrics,
     )
 
+    guard = _data_guard()
+    if guard:
+        return {"ok": False, "error": guard}
     model = (payload.get("model") or "").strip()
     config_label = (payload.get("config_label") or "measured").strip()
     if not model:
@@ -1788,6 +1794,9 @@ def quality_save_payload(payload: dict) -> dict:
     Optional — only called when the user toggles 'save this shot'."""
     import time
 
+    guard = _data_guard()
+    if guard:
+        return {"ok": False, "error": guard}
     path = _quality_shots_path(payload)
     if not (payload.get("save", True)):
         return {"ok": True, "saved": False, "note": "save toggle off"}
@@ -3133,6 +3142,9 @@ def config_profiles_save(payload: dict) -> dict:
     profile (ProfileStore)."""
     from sglang.srt.planner import flags as flagsmod
 
+    guard = _data_guard()
+    if guard:
+        return {"ok": False, "error": guard}
     name = (payload.get("name") or "").strip()
     if not name:
         return {"ok": False, "error": "a profile name is required"}
@@ -3160,6 +3172,9 @@ def config_profiles_save(payload: dict) -> dict:
 
 def config_profiles_delete(payload: dict) -> dict:
     """DELETE /api/config_profiles -> remove a user-saved profile by name."""
+    guard = _data_guard()
+    if guard:
+        return {"ok": False, "error": guard}
     name = (payload.get("name") or "").strip()
     if not name:
         return {"ok": False, "error": "a profile name is required"}
@@ -3168,6 +3183,147 @@ def config_profiles_delete(payload: dict) -> dict:
     except Exception as e:  # pragma: no cover - defensive
         return {"ok": False, "error": str(e)}
     return {"ok": deleted, "name": name, "deleted": deleted}
+
+
+# ===========================================================================
+# Self-update routes (About tab): /api/version + /api/version/switch +
+# /api/version/cleanup. Thin adapters over self_update.py; the restart
+# itself is a controlled worker exit the --serve-supervised parent handles.
+# ===========================================================================
+
+#: serve()-owned state: the live server object (for the controlled restart
+#: shutdown) and whether that shutdown should signal RESTART_EXIT_CODE.
+_SERVE_STATE: dict = {"server": None, "restart": False}
+
+
+def _data_guard() -> Optional[str]:
+    """Non-None = the data dir was written by a NEWER dashboard: the
+    store-writing endpoints return this warning instead of writing an older
+    format over newer data (downgrade safety)."""
+    try:
+        from sglang.srt.planner.self_update import data_write_guard
+
+        return data_write_guard()
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def request_restart() -> bool:
+    """Controlled worker restart: shut the HTTP server down from a side
+    thread so serve() returns RESTART_EXIT_CODE. No-op (False) when not
+    running under serve()."""
+    srv = _SERVE_STATE.get("server")
+    if srv is None:
+        return False
+    _SERVE_STATE["restart"] = True
+    import threading
+
+    threading.Thread(target=srv.shutdown, daemon=True).start()
+    return True
+
+
+def _supervised() -> bool:
+    return os.environ.get("SGLANG_DASHBOARD_SUPERVISED") == "1"
+
+
+def version_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/version -> running identity + selectable versions + source
+    availability + last switch outcome + cleanup candidates."""
+    from sglang.srt.planner import self_update as su
+
+    store = su.VersionStore()
+    view = su.list_versions_view(store)
+    ident = su.runtime_identity()
+    ident["supervised"] = _supervised()
+    return {
+        "ok": True,
+        "current": ident,
+        "dashboard_home": store.home,
+        "data_dir": su.planner_data_dir(),
+        "data_schema": su.read_data_schema(),
+        "store_warning": _data_guard(),
+        "last_switch": store.last_switch(),
+        "cleanup_candidates": store.cleanup_plan(),
+        **view,
+    }
+
+
+def version_switch_payload(payload: dict) -> dict:
+    """POST /api/version/switch {action: install|switch, version, confirmed}.
+
+    install = fill versions/<id>/ from a configured source (works in any
+    serve mode; touches only the dashboard home, never the data dir).
+    switch  = write the switch request and exit the worker in a controlled
+    way; ONLY under --serve-supervised (the supervisor moves the pointer,
+    restarts, health-checks, and auto-rolls-back on failure)."""
+    from sglang.srt.planner import self_update as su
+
+    if not payload.get("confirmed"):
+        return {"ok": False, "error": "confirmation required (confirmed: true)"}
+    action = (payload.get("action") or "").strip()
+    target = (payload.get("version") or "").strip()
+    if not target:
+        return {"ok": False, "error": "a version id is required"}
+    store = su.VersionStore()
+
+    if action == "install":
+        for src in su.default_sources():
+            if not src.configured:
+                continue
+            match = next(
+                (v for v in src.list_versions() if v.id == target), None
+            )
+            if match is None:
+                continue
+            manifest = store.install(src, match)
+            return {
+                "ok": True,
+                "installed": target,
+                "manifest": manifest,
+                "note": "installed; select it again to switch (restart)",
+            }
+        return {
+            "ok": False,
+            "error": f"no configured source offers version {target!r}",
+        }
+
+    if action == "switch":
+        if not _supervised():
+            return {
+                "ok": False,
+                "error": "version switching needs the supervisor: start the "
+                "dashboard with --serve-supervised (plain --serve keeps "
+                "running the launch checkout and cannot restart itself)",
+            }
+        if not store.is_installed(target):
+            return {"ok": False, "error": f"version {target!r} is not installed"}
+        if target == store.current_id():
+            return {"ok": False, "error": f"{target} is already the current version"}
+        store.write_switch_request(target)
+        if not request_restart():
+            return {"ok": False, "error": "no running server to restart"}
+        return {
+            "ok": True,
+            "restarting": True,
+            "target": target,
+            "note": "worker restarting; the supervisor moves the pointer, "
+            "health-checks the new version and rolls back automatically "
+            "on failure",
+        }
+
+    return {"ok": False, "error": f"unknown action {action!r} (install|switch)"}
+
+
+def version_cleanup_payload(payload: dict) -> dict:
+    """POST /api/version/cleanup: without ``confirmed`` returns the deletion
+    plan; with it removes those versions (never current / last good)."""
+    from sglang.srt.planner import self_update as su
+
+    store = su.VersionStore()
+    if not payload.get("confirmed"):
+        return {"ok": True, "would_remove": store.cleanup_plan(), "removed": []}
+    removed = store.cleanup()
+    return {"ok": True, "removed": removed, "would_remove": []}
 
 
 # ===========================================================================
@@ -4317,6 +4473,12 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
+        if self.path.startswith("/api/version"):
+            try:
+                self._json(200, version_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
         if self.path.startswith("/api/power_profile"):
             try:
                 self._json(200, power_profile_payload())
@@ -4562,6 +4724,14 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/share_submit"):
                 self._json(200, share_submit_payload(payload))
                 return
+            # Specific before generic (/api/version/* before any future
+            # /api/version POST — the startswith dispatch would swallow it).
+            if self.path.startswith("/api/version/switch"):
+                self._json(200, version_switch_payload(payload))
+                return
+            if self.path.startswith("/api/version/cleanup"):
+                self._json(200, version_cleanup_payload(payload))
+                return
         except Exception as e:  # pragma: no cover - defensive
             self._json(500, {"error": str(e)})
             return
@@ -4596,8 +4766,21 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
-def serve(host: str = "127.0.0.1", port: int = 8780) -> None:
+def serve(host: str = "127.0.0.1", port: int = 8780) -> int:
+    """Run the UI server. Returns 0 on normal shutdown; RESTART_EXIT_CODE
+    when a supervised worker was asked to switch dashboard versions (the
+    supervisor moves the version pointer and restarts us)."""
     srv = ThreadingHTTPServer((host, port), _Handler)
+    _SERVE_STATE["server"] = srv
+    _SERVE_STATE["restart"] = False
+    try:
+        # Stamp the data dir's schema generation (never downgrades an
+        # existing newer stamp; see self_update.data_write_guard).
+        from sglang.srt.planner.self_update import stamp_data_schema
+
+        stamp_data_schema()
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"(data-schema stamp skipped: {e})")
     print(f"Config-Planner UI on http://{host}:{port}/")
     print("  offline planner — no GPU, no server boot; every edit re-plans.")
     try:
@@ -4606,6 +4789,12 @@ def serve(host: str = "127.0.0.1", port: int = 8780) -> None:
         pass
     finally:
         srv.server_close()
+        _SERVE_STATE["server"] = None
+    if _SERVE_STATE["restart"]:
+        from sglang.srt.planner.self_update import RESTART_EXIT_CODE
+
+        return RESTART_EXIT_CODE
+    return 0
 
 
 # ===========================================================================
@@ -5324,6 +5513,8 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     title="run the short comm benchmark and share an anonymized rig profile to improve the project">Rig data</button>
   <button id="tab_history" class="tab" onclick="showTab('history')"
     title="your own recorded benchmark runs: browse, filter, open, delete">History</button>
+  <button id="tab_about" class="tab" onclick="showTab('about')"
+    title="dashboard version: install, update or roll back in place">About / Update</button>
 </div>
 
 <!-- #270 -- guided configuration. Three steps, then the command. Every
@@ -6306,6 +6497,34 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       <div id="q_result" style="margin-top:.6rem"></div>
     </div>
   </div>
+</div>
+
+<div id="view_about" style="display:none">
+  <div class="sub">In-place self-update: installed dashboard versions live side by
+    side under the dashboard home; one pointer names the active one. A switch
+    restarts only the dashboard worker &mdash; data stores (profiles, history,
+    measurements) live in a separate data directory and are never touched.</div>
+  <fieldset>
+    <legend>running version</legend>
+    <div id="ab_current" class="muted">loading&hellip;</div>
+  </fieldset>
+  <fieldset>
+    <legend>available versions</legend>
+    <div id="ab_versions" class="muted">loading&hellip;</div>
+    <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;margin-top:.5rem">
+      <select id="ab_select" onchange="aboutSelectChanged()"></select>
+      <button id="ab_action" onclick="aboutAction()" disabled>select a version</button>
+      <button class="mini secondary" onclick="loadVersionInfo()">refresh</button>
+      <span id="ab_status" class="muted"></span>
+    </div>
+    <div id="ab_cleanup" class="muted" style="margin-top:.4rem"></div>
+    <div class="legend">Trade-off: install fills a version directory (no restart);
+      upgrade/downgrade moves the pointer and restarts the worker, so open runs on
+      other tabs end. Switching needs the --serve-supervised start mode: the
+      supervisor health-checks the new version and rolls back to the last good one
+      automatically if it fails to come up. Plain --serve serves this launch
+      checkout and can only install, not switch.</div>
+  </fieldset>
 </div>
 
 <div id="view_explore" style="display:none">
@@ -7596,7 +7815,7 @@ async function csForgetToken(){
 // but the expert step at the end of the Guide, so #view_runner is nested
 // inside #view_wizard and inherits its visibility.
 function showTab(t) {
-  const TABS = ['landing','wizard','bench','quality','explore','energy','pair','share','history'];
+  const TABS = ['landing','wizard','bench','quality','explore','energy','pair','share','history','about'];
   for (const v of TABS) $('view_'+v).style.display = t===v ? '' : 'none';
   for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
   if (t==='explore' && !window._profLoaded) loadProfiles();
@@ -7629,6 +7848,7 @@ function showTab(t) {
   // Pairing state lives on the host, so entering the tab READS it rather than
   // creating anything -- a flow started from a script shows up here.
   if (t==='pair') pairRefresh(); else pairStopPoll();
+  if (t==='about' && !window._aboutInit) { window._aboutInit=true; loadVersionInfo(); }
   // The landing page live-poll runs only while its tab is visible.
   if (t==='landing') startLanding(); else stopLanding();
   // The expert step opens on the RUNNING configuration when there is one: the
@@ -7807,6 +8027,151 @@ function pairStepBody(st){
     return h;
   }
   return '';
+}
+
+// ===========================================================================
+// About / Update tab: /api/version listing + the ONE context-sensitive
+// install/upgrade/downgrade button (confirm dialog, restart-aware polling).
+// ===========================================================================
+let _abVersions = [], _abCurrent = null;
+
+function semverKey(v){
+  const m = String(v||'').match(/^(\d+)\.(\d+)\.(\d+)/);
+  return m ? [ +m[1], +m[2], +m[3] ] : null;
+}
+function semverCmp(a,b){
+  const ka=semverKey(a), kb=semverKey(b);
+  if(!ka||!kb) return null; // non-semver (e.g. head-*): no order, just "switch"
+  for(let i=0;i<3;i++){ if(ka[i]!==kb[i]) return ka[i]<kb[i]?-1:1; }
+  return 0;
+}
+
+async function loadVersionInfo(){
+  let d;
+  try { d = await (await fetch('/api/version')).json(); }
+  catch(e){ $('ab_current').textContent = 'version API unreachable: '+e; return; }
+  if(!d.ok){ $('ab_current').textContent = 'error: '+esc(d.error||'?'); return; }
+  _abVersions = d.versions||[]; _abCurrent = d;
+  const c = d.current||{};
+  let h = 'dashboard <b>'+esc(c.version||'?')+'</b>'
+    + (c.git_hash? ' @ '+esc(c.git_hash) : '')
+    + ' &mdash; '+esc(c.origin||'?')
+    + (c.supervised? ' (supervised: switching enabled)'
+                   : ' (unsupervised: install only &mdash; start with --serve-supervised to switch)');
+  h += '<br>home: '+esc(d.dashboard_home||'?')+' &nbsp;|&nbsp; data dir (never touched by switches): '
+    + esc(d.data_dir||'?');
+  if (d.store_warning) h += '<br><span class="nofitc">'+esc(d.store_warning)+'</span>';
+  const ls = d.last_switch;
+  if (ls) {
+    h += '<br>last switch: '+esc(ls.event||'?')
+      + (ls.to? ' to '+esc(ls.to) : (ls.version? ' of '+esc(ls.version) : ''))
+      + (ls.healthy===false? ' <span class="nofitc">health FAILED'
+          + (ls.rolled_back_to? ' &mdash; rolled back to '+esc(ls.rolled_back_to) : '')
+          + '</span>' : '')
+      + (ls.at? ' ('+esc(ls.at)+')' : '');
+  }
+  $('ab_current').innerHTML = h;
+
+  let t = '<table class="mx"><tr><th>version</th><th>origin</th><th>date</th>'
+    + '<th>state</th></tr>';
+  for (const v of _abVersions) {
+    const state = [v.current?'current':null, v.good?'good':null,
+                   (v.installed&&!v.current)?'installed':null].filter(Boolean).join(', ')
+                  || 'not installed';
+    t += '<tr><td>'+esc(v.label||v.id)+'</td><td>'+esc(v.origin||'?')+'</td><td>'
+      + esc((v.date||'').slice(0,10))+'</td><td>'+esc(state)+'</td></tr>';
+  }
+  t += '</table>';
+  const srcs = (d.sources||[]).map(s =>
+    esc(s.name)+': '+(s.configured?'configured':'not configured'
+      +(s.note?' ('+esc(s.note)+')':''))).join(' &nbsp;|&nbsp; ');
+  t += '<div class="legend">sources &mdash; '+srcs+'</div>';
+  $('ab_versions').innerHTML = t;
+
+  const sel = $('ab_select'); const prev = sel.value;
+  sel.innerHTML = '';
+  for (const v of _abVersions) {
+    const o = document.createElement('option');
+    o.value = v.id; o.textContent = (v.label||v.id)+(v.current?' [current]':'');
+    sel.appendChild(o);
+  }
+  if (prev && _abVersions.some(v=>v.id===prev)) sel.value = prev;
+  $('ab_cleanup').textContent = (d.cleanup_candidates&&d.cleanup_candidates.length)
+    ? 'cleanup would remove old versions: '+d.cleanup_candidates.join(', ')
+    : '';
+  aboutSelectChanged();
+}
+
+function aboutSelectChanged(){
+  const btn = $('ab_action');
+  const v = _abVersions.find(x=>x.id===$('ab_select').value);
+  if(!v){ btn.disabled = true; btn.textContent = 'select a version'; return; }
+  const cur = (_abCurrent&&_abCurrent.current)||{};
+  if (v.current) { btn.disabled = true; btn.textContent = 'current version'; return; }
+  btn.disabled = false;
+  if (!v.installed) { btn.textContent = 'Install '+v.id; btn.dataset.action='install'; return; }
+  btn.dataset.action = 'switch';
+  const cmp = semverCmp(v.id, cur.version);
+  if (cmp===1) btn.textContent = 'Update to '+v.id;
+  else if (cmp===-1) btn.textContent = 'Roll back to '+v.id;
+  else btn.textContent = 'Switch to '+v.id;
+}
+
+async function aboutAction(){
+  const v = _abVersions.find(x=>x.id===$('ab_select').value);
+  if(!v) return;
+  const action = $('ab_action').dataset.action;
+  const msg = action==='install'
+    ? 'Install version '+v.id+' into the dashboard home?\n\nThis only fills the '
+      +'version directory; nothing restarts and the active version stays as it is. '
+      +'Data stores are not touched.'
+    : $('ab_action').textContent+'?\n\nThe version pointer moves to '+v.id+' and the '
+      +'dashboard worker RESTARTS (open runs on other tabs end). The supervisor '
+      +'health-checks the new version and rolls back to the last good one '
+      +'automatically if it fails. Data stores are not touched.';
+  if(!window.confirm(msg)) return;
+  $('ab_status').textContent = action==='install' ? 'installing…' : 'switching…';
+  let d;
+  try {
+    d = await (await fetch('/api/version/switch', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action: action, version: v.id, confirmed: true})})).json();
+  } catch(e){
+    if (action==='switch') { aboutPollRestart(v.id); return; }
+    $('ab_status').textContent = 'request failed: '+e; return;
+  }
+  if(!d.ok){ $('ab_status').textContent = 'refused: '+ (d.error||'?'); return; }
+  if(d.restarting){ aboutPollRestart(v.id); return; }
+  $('ab_status').textContent = d.note || 'done';
+  loadVersionInfo();
+}
+
+// After a switch the worker goes away; poll /api/version until the (new or
+// rolled-back) worker answers, then render the outcome the supervisor wrote.
+async function aboutPollRestart(target){
+  $('ab_status').textContent = 'restarting into '+target+'… waiting for the dashboard';
+  const t0 = Date.now();
+  const tick = async () => {
+    try {
+      const d = await (await fetch('/api/version')).json();
+      if (d && d.ok) {
+        const now = (d.current&&d.current.version)||'?';
+        const ls = d.last_switch||{};
+        $('ab_status').textContent =
+          (ls.healthy===false && ls.rolled_back_to)
+            ? 'switch to '+target+' FAILED its health check — rolled back to '
+              + ls.rolled_back_to
+            : 'now running '+now;
+        loadVersionInfo(); return;
+      }
+    } catch(e) { /* still restarting */ }
+    if (Date.now()-t0 > 120000) {
+      $('ab_status').textContent = 'dashboard did not come back within 120s — '
+        +'check the supervisor log'; return;
+    }
+    setTimeout(tick, 1500);
+  };
+  setTimeout(tick, 1500);
 }
 
 // ===========================================================================
