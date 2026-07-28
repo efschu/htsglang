@@ -438,7 +438,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
+        is_dual_group_lane: bool = False,
+        dual_group_host_runner: Optional["ModelRunner"] = None,
+        dual_group_plan: Optional[Any] = None,
+        dual_group_lane_id: int = 0,
     ):
+        # Multi-group runtime (#274): this runner is an in-process LANE over
+        # the host runner's weight bytes (dual_group_lane.py). Rank-local by
+        # contract: a lane runner exists in ONE serving rank's process only,
+        # so nothing on its init path may enter a group collective. It is
+        # constructed with is_draft_worker=True so every existing
+        # "secondary runner in this process" gate (distributed init,
+        # process-global installs) applies; lane-specific deviations are
+        # gated on is_dual_group_lane.
+        self.is_dual_group_lane = is_dual_group_lane
+        self.dual_group_host_runner = dual_group_host_runner
+        self.dual_group_plan = dual_group_plan
+        self.dual_group_lane_id = dual_group_lane_id
+        self.dual_group_lane_weight_added_mib = 0
+        self.dual_group_part_models: List[Any] = []
+        if is_dual_group_lane and not is_draft_worker:
+            raise ValueError(
+                "A dual-group lane runner must be constructed with "
+                "is_draft_worker=True (the existing secondary-runner gates)."
+            )
+
         # Parse args
         self.mem_fraction_static = mem_fraction_static
         # Set on target by `_resolve_memory_pool_config`; passed in for draft
@@ -756,8 +780,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # instead of the whole-forward wait_stream. None -> whole-forward fallback.
         self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
 
-        # CPU offload
-        set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
+        # CPU offload. set_offloader is a PROCESS-GLOBAL install (the known
+        # unguarded global of this family, DESIGN_121 §1.4): a lane runner
+        # constructing after the serving rank would silently replace the
+        # resident offloader mid-flight. The lane computes with the resident
+        # weights and needs no offloader of its own.
+        if not self.is_dual_group_lane:
+            set_offloader(
+                create_offloader_from_server_args(server_args, dp_rank=dp_rank)
+            )
 
         self._weight_checker = WeightChecker(model_runner=self)
 
@@ -1649,7 +1680,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1 and not uneven_memory,
+            # A dual-group lane runner is rank-local: the other serving ranks
+            # are not constructing one, so the distributed min-reduce would
+            # hang the group (rank-local-before-collective rule).
+            distributed=get_world_group().world_size > 1
+            and not uneven_memory
+            and not self.is_dual_group_lane,
             cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()
@@ -1956,7 +1992,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else contextlib.nullcontext()
             )
             with _wl_build_ctx:
-                if self.is_weightless_worker or self.is_draft_solo_shadow:
+                if self.is_dual_group_lane:
+                    # Multi-group runtime (#274): the lane's model is not
+                    # loaded, it is ASSEMBLED -- complement shards via the
+                    # stock loader under the lane's own scoped geometry, a
+                    # full-width hull, and shells that replace the lane
+                    # group's collectives with local ops. Rank-local.
+                    from sglang.srt.model_executor.dual_group_lane import (
+                        build_lane_model,
+                    )
+
+                    self.model = build_lane_model(self)
+                elif self.is_weightless_worker or self.is_draft_solo_shadow:
                     # B2a / draft-solo shadow: meta-model, NO weight load.
                     self.model = self._build_weightless_worker_meta_model()
                 else:
@@ -2107,7 +2154,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 logger,
             )
 
-        if self.server_args.elastic_ep_backend == "mooncake":
+        if self.is_dual_group_lane:
+            # Rank-local lane assembly: the other serving ranks are not in a
+            # model load, so the group barrier below would hang the group
+            # (rank-local-before-collective rule). Nothing to synchronize --
+            # the lane exists in this process only.
+            pass
+        elif self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
             dist.barrier(group=get_tp_group().cpu_group)
         else:
@@ -3270,7 +3323,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Draft models skip here during __init__; the eagle worker calls
         # this method explicitly (force_for_draft_worker=True) after
         # init_lm_head so graphs capture the final embedding weights.
-        if self.is_draft_worker and not force_for_draft_worker:
+        # A dual-group lane runner (#274) is constructed as a draft worker
+        # (secondary-runner gates) but is a PREFILL lane -- its prefill
+        # graphs are the point, so it does not take the draft skip.
+        if (
+            self.is_draft_worker
+            and not force_for_draft_worker
+            and not self.is_dual_group_lane
+        ):
             return
 
         # Skip prefill CG for EAGLE target on tc_piecewise: that backend
