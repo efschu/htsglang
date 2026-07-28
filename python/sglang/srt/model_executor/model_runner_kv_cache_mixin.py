@@ -4540,6 +4540,8 @@ class ModelRunnerKVCacheMixin:
                 "dual-group lane runner needs --dual-group-lane-budget-mib > 0."
             )
         budget_bytes = int(budget_mib) << 20
+        if getattr(self, "is_dual_group_lane_draft", False):
+            return self._resolve_dual_group_lane_draft_pool_config(budget_bytes)
         config = self._config_from_budget(budget_bytes)
         config.max_running_requests = self._resolve_max_num_reqs(
             config.max_total_num_tokens
@@ -4552,6 +4554,90 @@ class ModelRunnerKVCacheMixin:
             "max_total_num_tokens=%d, max_running_requests=%d.",
             self.dual_group_lane_id,
             budget_mib,
+            config.max_total_num_tokens,
+            config.max_running_requests,
+        )
+        return config
+
+    def _lane_kv_bearing_layer_count(self: ModelRunner) -> int:
+        """How many layers of THIS runner's assembled model hold KV.
+
+        Counted off the built module tree rather than derived from the model
+        CONFIG, because for the lane's NEXTN head the two disagree: the head
+        is one decoder layer, but its config is the target's (the draft
+        config is built from the same checkpoint, so it still reports the
+        target's 64 layers and the target's hybrid full-attention layer ids).
+        The configurator derives the layer count from that config, intersects
+        it with this runner's layer range, and lands on 0 -> a per-token cell
+        size of 0 -> a division by zero. Counting the attention modules that
+        actually exist is family-neutral and cannot disagree with the model
+        that will run.
+        """
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        model = getattr(self, "model", None)
+        if model is None:
+            return 0
+        return sum(1 for m in model.modules() if isinstance(m, RadixAttention))
+
+    def _resolve_dual_group_lane_draft_pool_config(
+        self: ModelRunner, budget_bytes: int
+    ) -> MemoryPoolConfig:
+        """Rank-local KV sizing for the lane's NEXTN head, from its OWN slice
+        of the lane budget.
+
+        Deliberately not the stock arrangement. A serving NEXTN draft is
+        handed the TARGET's ``memory_pool_config`` and never sizes anything;
+        the lane's head cannot take that route, because the lane target's
+        config describes the lane target's 64-layer pool and the head needs
+        its own, tiny one. So the head gets a budget post of its own
+        (``split_lane_budget``) and turns it into tokens the same way the
+        lane target does -- bytes per token, page-aligned, no profiling, no
+        collective.
+        """
+        from sglang.srt.model_executor.pool_configurator import (
+            MemoryPoolConfig,
+            create_memory_pool_configurator,
+        )
+
+        n_layers = self._lane_kv_bearing_layer_count()
+        if n_layers <= 0:
+            raise ValueError(
+                "dual-group lane head: the assembled head has no "
+                "KV-bearing attention layer -- refusing to size a pool for a "
+                "model that cannot use one."
+            )
+        kv_heads = self.model_config.get_total_num_kv_heads()
+        head_dim = self.model_config.head_dim
+        v_head_dim = getattr(self.model_config, "v_head_dim", head_dim)
+        kv_elem = torch._utils._element_size(self.kv_cache_dtype)
+        cell = kv_heads * (head_dim + v_head_dim) * n_layers * kv_elem
+        tokens = (budget_bytes // cell) // self.page_size * self.page_size
+        cap = int(getattr(self, "dual_group_lane_token_cap", 0) or 0)
+        if cap > 0 and tokens > cap:
+            tokens = cap // self.page_size * self.page_size
+        if tokens <= 0:
+            raise ValueError(
+                f"dual-group lane head: budget {budget_bytes >> 20} MiB is "
+                f"smaller than one page of its KV ({cell * self.page_size} "
+                "bytes). Raise --dual-group-lane-budget-mib or lower "
+                "--dual-group-lane-speed-dial."
+            )
+        config = MemoryPoolConfig(max_total_num_tokens=int(tokens))
+        config.max_running_requests = self._resolve_max_num_reqs(
+            config.max_total_num_tokens
+        )
+        configurator = create_memory_pool_configurator(self)
+        config = configurator.finalize_with_max_running_requests(config)
+        config.mem_fraction_static = self.server_args.mem_fraction_static
+        logger.info(
+            "dual-group lane %d HEAD pool sizing (rank-local): budget %d MiB, "
+            "%d KV-bearing layer(s), %d B/token -> max_total_num_tokens=%d, "
+            "max_running_requests=%d.",
+            self.dual_group_lane_id,
+            budget_bytes >> 20,
+            n_layers,
+            cell,
             config.max_total_num_tokens,
             config.max_running_requests,
         )
