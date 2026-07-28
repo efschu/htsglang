@@ -5607,3 +5607,105 @@ Operativ relevant bleibt hier nur:
   is_capture_mode, _DEQUANT_WS), Draft-Annahmen-Familie (3 gefixt), benannte
   Zweier-Annahmen (derive_lane_plan Zwei-Segment, shared rank 0, eine Lane —
   Strukturen N-aer), Verleih-Stufe-2-Logik ungebaut.
+
+## #274 Slice C (feat/dual-group-runtime-c) — echte Nebenlaeufigkeit: Entglobalisierung, Zwei-Klassen-Scheduler, Aggregat
+
+- C1 ENTGLOBALISIERUNG: der `set_server_args`-Tausch je Tick ist ersetzt durch
+  eine kontext-lokale UEBERLAGERUNG (`lane_scope`). Lane-Thread liest die
+  Lane-Args, Scheduler-Thread die Verbands-Args, nichts wird getauscht — die
+  ~370 `get_server_args()`-Stellen werden lane-korrekt, ohne angefasst zu
+  werden. Ebenfalls kontext-lokal: `ParallelContext._overrides`,
+  `_TP_PARTITION_RATIOS` (Sentinel, weil `None` ein gueltiger Planwert ist),
+  `is_capture_mode`, Graph-Memory-Pool (je Lane) und GGUF-`_DEQUANT_WS`
+  (je Lane; Geteilte-Puffer-Familie).
+- VIER WEITERE GLOBALS FAND ERST DER BOOT, nicht die Inventur: der erste
+  nebenlaeufige Boot starb auf Rang 0 in `GDNAttnBackend.forward_extend`,
+  erreicht aus dem MTP-Draft-Extend des VERBANDS, weil `get_attn_backend()`
+  ueber ein Prozess-Global aufloest (dessen Docstring den Fall bereits
+  benannte). Umgestellt: `forward_context._current`,
+  `_tc_piecewise_forward_context`, `_in_tc_piecewise_cuda_graph`,
+  `_in_breakable_cuda_graph`, `dcp/collective_guard._ENABLED`/`_STEP`.
+  LEHRE: grep findet die Globals, die man sucht; per-Forward-Kontexte findet
+  nur der Lauf. Falsifikator (zwei Threads nachweislich gleichzeitig im
+  Scope) ist billig und jetzt Bestand.
+- HARTES TOR C1 BESTANDEN: serieller Modus unveraendert — data_ptr-Gate 1058
+  Identitaeten in jedem der 7 Boots, Boeden 33,65 ms/Verify und 583,75 ms je
+  2048er-Prefill (Slice B: 33,4-33,8 / 580-584), VRAM-Posten unveraendert
+  (die Ressourcen-Trennung wird nur im nebenlaeufigen Modus vorgenommen).
+- BYTE-GATE seriell vs nebenlaeufig: identische Lane-Output-IDs (96-Token-
+  Prompt, in beiden Modi selbst-deterministisch). Der 2048er-Prompt taugt
+  NICHT als Byte-Gate — GDN-Prefill ist ab ~109 Token dokumentiert nicht
+  reproduzierbar (upstream); das ist eine Eigenschaft des Modells, nicht
+  dieses Slices.
+- C2 ZWEI-KLASSEN-SCHEDULER: Lane = eigener Thread (geht EINMAL in den
+  Lane-Scope) + eigener CUDA-Stream mit hoher Prioritaet (-3 aus [0,-3]);
+  Verband = Default-Stream, arbeitserhaltender Nachnutzer. Praeemption an der
+  Korngrenze durch Block-Scheduling, nie mid-Kernel. Admission-Yield
+  gemessen: 0,71-1,80 ms Mittel, 2,17 ms Max, 64 Vorkommen je 32-s-Fenster
+  (0,35 % des Fensters).
+- VERLEIH-STUFE 2 gemessen (1024-MiB-Segment): Verleih 0,76 ms,
+  RUECKHOL-LATENZ 2,49 ms Mittel / 2,71 ms Max, Amortisationsschwelle greift
+  (direkt nach Lane-Arbeit wird nicht verliehen), Rueckholen wird nie
+  verweigert (Flap wird nur gezaehlt). Abgeleitet: ein Zyklus kostet 3,25 ms,
+  amortisiert also schon bei ~0,1 s Haltezeit — die 5-s-Default-Schwelle ist
+  flatterngetrieben, nicht kostengetrieben.
+- C3 AGGREGAT, Kartenaequivalente `E = share_Verband + share_Lane` mit
+  `share_c = Rate_c(gemeinsam)/Rate_c(solo)`. Seriell ist per Konstruktion
+  Nullsumme, gemessen 0,914-0,974 — das validiert die Rechnung.
+
+  | Arm | seriell | nebenlaeufig | Gewinn |
+  |---|---|---|---|
+  | Prefill-Lane (2048er, SM-saettigend) | E 0,974 | **E 1,130** | +16,0 % |
+  | Decode-Lane (96er Prompt) | E 0,914 | **E 1,440** | +57,5 % |
+
+  Der Unterschied zwischen den Armen ist der Befund, nicht die Ausrede: zwei
+  SM-saettigende Lasten koennen auf einer Karte nicht beide voll laufen —
+  Nebenlaeufigkeit sammelt dort nur Luecken ein. Eine latenzgebundene
+  Lane-Last ueberlappt dagegen echt. Damit hat Slice D eine messbare
+  Zielfunktion (E maximieren) statt einer Routing-Heuristik.
+- INTERFERENZ beide Richtungen: Richtung 1 (geschuetzt) 585-589 ms seriell
+  (+0,4 %) vs 629-639 ms nebenlaeufig (+9,7 %); Richtung 2 (erlaubt)
+  98,46 -> 83,21 ms/Verify bei vollem Duty (+193 % -> +146 %) bzw.
+  70,25 -> 63,32 (+109 % -> +88 %). EHRLICH: die geschuetzte Klasse zahlt
+  unter echter Gleichzeitigkeit mehr als unter Tick-Teilung — seriell wartet
+  sie nur und rechnet allein, nebenlaeufig rechnet sie gleichzeitig und teilt
+  die SMs. Der Verband gewinnt dabei mehr, als die Lane verliert.
+  HERKUNFT: SM-Konkurrenz im Compute, nicht Praeemptions-Granularitaet —
+  die dir1-Zahl ist Device-Zeit auf dem Lane-Stream (enthaelt keine
+  Einreih-Wartezeit), sie ist glatt (1,6 % Spannweite gegen eine
+  Verify-Runde von 33,8 ms, die eine Einreihungsursache zeigen muesste),
+  beide Seiten degradieren gleichzeitig (+9,7 % / +12,2 %; bei einer
+  Praeemptionsgrenze wuerde der Nachnutzer NICHT degradieren), und der
+  Einreichpfad ist mit Max 2,17 ms nicht der Engpass. Direktbeleg
+  (`prefill_wait_ms` = Wall minus Device) ist instrumentiert.
+- SPEED-DURCH-VERZICHT-REGLER `--dual-group-lane-speed-dial`: 1.0 loest
+  1600 -> 200 MiB und 25600 -> 3200 Lane-Token auf und gibt 1444 MiB frei;
+  das Lane-TEMPO bleibt unveraendert (583,1 -> 583,7 ms). BEFUND: der Regler
+  kauft an diesem Arbeitspunkt VRAM, kein Tempo. Gegenprobe: dieselben
+  1444 MiB auf Rang 0 zurueckgegeben aendern `max_total_num_tokens` nicht
+  (81960 in beiden Faellen) — der Verbands-KV wird vom knappsten Rang
+  dimensioniert, und das sind die 3080er. Rig-Eigenschaft, kein Feature-Fehler.
+- FP8-ARM, Schreibtisch-Haelfte fertig (9 CPU-Tests), beide Fragen guenstiger
+  als befuerchtet: die `tp_size=None`-Falle ist auf dem v2-Parameter-Pfad
+  LAUT ("uneven-TP shard mismatch"), nicht still (still ist der v1-Pfad); und
+  die zweite geshardete Achse des Block-Quants (`ceil(out/block_n)`) wird bei
+  unpassender Einheitenzahl VERWEIGERT statt geraten. FP8 ist damit eine
+  PLANUNGSREGEL (jeder Rang-Ausgabeanteil ein ganzes Vielfaches der
+  Quantisierungsbloecke), keine Laufzeitgefahr. Der zweikartige Lauf braucht
+  echte Lane-Kollektive = eigener Bau, benannte Uebergabe.
+- LANE-MTP: kein Config-Flip. Der Lane-Runner ist `is_draft_worker=True` und
+  baut gar keinen EAGLE-Worker; der formgleiche `--speculative-draft-placement
+  solo` braucht in `_solo_init_lm_head` ein GRUPPEN-KOLLEKTIV, das die
+  rang-lokale Lane-Bringup per Vertrag nicht darf. Machbarer Weg benannt:
+  NEXTN-Kopf ueber denselben Komplement-/Schalen-Mechanismus rang-lokal
+  zusammensetzen (Nesting gilt, gleicher Gewichtssatz), Draft-KV ins
+  Lane-Budget, Lane-Tick wird Verify-Schleife.
+- Dateien: runtime_context (LaneScope), distributed/utils, capture_mode,
+  runner_utils/pool, gguf, forward_context, tc_piecewise/breakable context,
+  dcp/collective_guard, dual_group_lane (Worker-Thread, LaneLending,
+  Speed-Dial), scheduler (Zwei-Klassen-Grenze), server_args (5 Flags),
+  Runbook 4.12. Tests: 33 neue CPU-Tests; distributed/ 531 gruen / 16 rot
+  (die 16 vorbestehend und unveraendert gegen a2c8f76c42).
+- ZWEIER-ANNAHMEN aus Slice B stehen UNVERAENDERT (derive_lane_plan
+  Zwei-Segment, shared rank 0, eine Lane) — der Umfang von C hat sie nicht
+  erzwungen.

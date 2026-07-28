@@ -1232,6 +1232,14 @@ class DualGroupLane:
             batch.prefill_input_ids_cpu = None
         next_token_ids, ms = self._timed_forward(batch)
         job["prefill_ms"] = ms
+        # WALL minus DEVICE is the discriminator for where a degradation
+        # comes from (#274 slice C): device time is what the lane's own
+        # kernels took on the lane stream, wall time additionally contains
+        # everything the lane waited for before its kernels could run
+        # (interpreter/GIL, launch queue, admission). A degradation that
+        # shows up in DEVICE time is SM competition; one that shows up only
+        # in the wall/device GAP is submission granularity.
+        job["prefill_wall_ms"] = self._last_wall_ms
         job["output_ids"].append(int(next_token_ids[0].item()))
         job["_batch"] = batch
         job["_next"] = next_token_ids
@@ -1281,8 +1289,11 @@ class DualGroupLane:
             ),
             "decode_steps": len(decode_ms),
         }
-        if self._last_wall_ms is not None:
-            result["prefill_wall_ms"] = round(self._last_wall_ms, 2)
+        if job.get("prefill_wall_ms") is not None:
+            result["prefill_wall_ms"] = round(job["prefill_wall_ms"], 2)
+            result["prefill_wait_ms"] = round(
+                job["prefill_wall_ms"] - job["prefill_ms"], 2
+            )
         with self._lock:
             self.results.append(result)
             self.results_total += 1
