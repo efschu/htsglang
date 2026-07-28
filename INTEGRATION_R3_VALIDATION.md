@@ -5889,3 +5889,33 @@ config-Durchreichung, Division-durch-Null benannt) + Kette; --dual-group-lane-
 spec default aus. Familien-Achse in DESIGN_121 §11.12 (MoE = fuenfte
 Schalenklasse fehlt, Aufwand B1, Laut-Fehler-Zweig greift). Distributed-Suite
 543 gruen / 16 vorbestehend rot (Stub-Drift, unveraendert).
+
+## Lane-Spec-Kette Runde 1 (feat/dual-group-lane-spec, gemergt als WIP hinter Default-aus-Flag)
+
+- PUNKT 1 GRUEN (Rig-belegt): Draft-KV-Pool rang-lokal — Division-durch-Null-
+  Wurzel war die Draft-Config aus dem Ziel-Checkpoint (meldet 64 Ziel-Schichten,
+  Schnitt mit Kopf-Bereich = 0); Fix zaehlt RadixAttention-Module im
+  ASSEMBLIERTEN Baum (familienneutral, per Konstruktion konsistent). Rechnung:
+  4096 B/Token (1/16 des Ziels), auf Ziel-19200 gedeckelt => ~325 MiB gespart;
+  Kopf gesamt 2684 MiB Gewichte + 75 MiB Pool; 22800->21000 traegt (1418 MiB
+  frei), 19800 kippt.
+- PUNKT 2 GEBAUT, NICHT GRUEN: Vorschlagsschleife/Verify/KV-Ruecknahme/Runden-
+  Buchfuehrung stehen; VIER Dispatch-Kontrakte je von einem Boot gefunden,
+  DREI geloest (eigenes KV-Sizing; init_cuda_graphs auch fuer Eager-Runner;
+  Kopf braucht EIGENE ScheduleBatch — req_to_token_pool-Teilung streitet bei
+  mrr 1 um den einzigen Slot). OFFEN: Kontrakt 4 (init_decode_cuda_graph
+  dereferenziert graph_shared_output auch bei DISABLED-Phasen) + benannt:
+  generischer Graph-Runner baut Dummy-Batch mit spec_info=None, den ein
+  MTP-Forward dereferenziert (Verband umgeht via EAGLE-Draft-Graph-Runner).
+  Alle vier als Kommentar an der Fehlstelle dokumentiert.
+- Gates: data_ptr in jedem Boot gruen (1058 Ziel + 16 Kopf); Kohaerenz-mit-
+  Spec-Gate geschrieben, Referenz liegt bereit, lief noch nicht gegen einen
+  forwardenden Kopf.
+- ZWEI EIGENE FEHLER KORRIGIERT: _drop_draft_complement_vocab ENTFERNT (0 MiB
+  Nutzen, lief ueber ALLE Teilmodelle — embed_tokens=None am resident geteilten
+  Verband waere ein Eingriff in den laufenden Verband gewesen); Vokabular-
+  Schalen jetzt per TYP statt Attributpfad gesucht (Pfad ist familienabhaengig,
+  Danebengreifen war still).
+- Diszipliniert gestoppt statt gequetscht (~6 min/Boot, je genau ein Kontrakt);
+  --dual-group-lane-spec default aus, alle Slice-C-Belege unberuehrt,
+  distributed-Suite 543/16-vorbestehend auf gemergtem HEAD, Marker 0.
