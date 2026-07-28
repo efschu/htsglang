@@ -94,6 +94,7 @@ __all__ = [
     "wizard_families_payload",
     "wizard_command_payload",
     "wizard_rejected_payload",
+    "wizard_tipping_payload",
     "commsuite_arms_payload",
     "commsuite_run_payload",
     "commsuite_status_payload",
@@ -3822,7 +3823,7 @@ def _wizard_context(payload: dict, profiles: dict, plan: Optional[dict]):
     # it names a boot of the thing on the form.
     measured = _wizard_measured_row(payload)
 
-    return wizmod.MatrixContext(
+    ctx = wizmod.MatrixContext(
         gpus=list(gpus),
         remotes=remotes,
         capabilities=caps,
@@ -3846,6 +3847,266 @@ def _wizard_context(payload: dict, profiles: dict, plan: Optional[dict]):
         state_bytes=state_bytes,
         measured=measured,
     )
+
+    # The v2 blocks. Each needs a disk read the wizard module deliberately
+    # does not do, so the reading happens here and the result is handed in.
+    # Order matters once: the rates are the authority for the link and
+    # satellite figures the family matrix prices with, so they are resolved
+    # before anything reads them.
+    ctx.rates = _wizard_rates(payload, remotes)
+    ctx.tipping = _wizard_tipping(payload, ctx, profiles, plan)
+    ctx.offload = _wizard_offload(payload, ctx, plan)
+    ctx.islands = _wizard_islands(payload, ctx)
+    return ctx
+
+
+# ---------------------------------------------------------------------------
+# #270 v2 -- the four blocks. Each one reads a cache and hands the rows to a
+# module that does the reasoning; nothing here derives a figure of its own.
+# ---------------------------------------------------------------------------
+
+
+def _wizard_card_probe():
+    """The cached card probe, or None. Never triggers a measurement."""
+    try:
+        from sglang.srt.rigmon.card_probe import load_card_probe
+
+        return load_card_probe()
+    except Exception:  # pragma: no cover - a missing probe is the normal state
+        return None
+
+
+def _wizard_artifact_rows() -> List[dict]:
+    """Comm-suite measurements in the shared artifact's row shape.
+
+    Read from the latest finished suite run. The persisted share record is
+    deliberately NOT used: it stores ids and fingerprints only, so it can say
+    what was shared but not what any of it measured.
+    """
+    try:
+        from sglang.srt.planner import comm_suite as csmod
+
+        job = csmod.JOBS.latest()
+        if job is None or job.state != csmod.OK:
+            return []
+        sections = csmod.to_sections(job)
+        return [m.to_json() for m in sections.measurements]
+    except Exception:  # pragma: no cover - defensive
+        return []
+
+
+def _wizard_rates(payload: dict, remotes: List[dict]) -> dict:
+    """Every link / satellite / load rate, with the rung it came from."""
+    from sglang.srt.planner import wizard as wizmod
+    from sglang.srt.planner import wizard_links as linksmod
+
+    profile = _wizard_card_probe()
+    pairs: List[dict] = []
+    names: Dict[str, str] = {}
+    created = None
+    transports: List[str] = []
+    if profile is not None:
+        try:
+            pairs = [p.to_json() for p in profile.pairs]
+            names = {c.uuid: f"{c.name} #{c.cuda_index}" for c in profile.cards}
+            created = profile.created or None
+            transports = list(profile.transports)
+        except Exception:  # pragma: no cover - defensive
+            pairs, names = [], {}
+    src = linksmod.LinkSources(
+        card_probe_pairs=pairs,
+        card_names=names,
+        card_probe_created=created,
+        card_probe_transports=transports,
+        artifact_measurements=_wizard_artifact_rows(),
+        form_link_gbs=(
+            float(payload["link_gbs"]) if payload.get("link_gbs") else None
+        ),
+        form_link_source=str(payload.get("link_source") or ""),
+        form_satellite_tok_s=(
+            float(payload["satellite_prefill_tok_s"])
+            if payload.get("satellite_prefill_tok_s")
+            else None
+        ),
+        remote_targets=[
+            str(r.get("target") or "") for r in remotes if (r or {}).get("target")
+        ],
+        anchors=dict(wizmod.ANCHORS),
+        anchor_study=wizmod.ANCHOR_STUDY,
+    )
+    return linksmod.read_rates(src)
+
+
+def _wizard_tipping(payload: dict, ctx, profiles: dict, plan: Optional[dict]) -> dict:
+    """The thresholds the wizard leans on, each with its origin and button."""
+    from sglang.srt.planner import wizard as wizmod
+    from sglang.srt.planner import wizard_tipping as tipmod
+
+    split_table = None
+    try:
+        from sglang.srt.planner import split_probe as spmod
+
+        split_table = spmod.tipping_point_table()
+    except Exception:  # pragma: no cover - defensive
+        split_table = None
+
+    evidence = None
+    points: List[dict] = []
+    try:
+        from sglang.srt.planner import crossover as crossmod
+
+        finding = crossmod.load_finding()
+        evidence = crossmod.describe_evidence(finding)
+        # With no local finding the REFERENCE one is still worth showing --
+        # for size and shape, never to select a vector. ``describe_evidence``
+        # has already said which of the two this is.
+        source = finding or crossmod.REFERENCE_FINDING
+        points = [
+            dict(
+                p.to_json(),
+                label=p.label(),
+                break_even_ratio=p.break_even_ratio,
+            )
+            for p in source.points
+        ]
+    except Exception:  # pragma: no cover - defensive
+        evidence, points = None, []
+
+    busy: Dict[str, str] = {}
+    try:
+        from sglang.srt.planner import split_probe as spmod
+
+        busy = spmod.busy_cards()
+    except Exception:  # pragma: no cover - no NVML on a CPU host
+        busy = {}
+
+    # The card set the probe would take, with UUIDs where the probe cache can
+    # supply them -- without a UUID a card cannot be matched against the
+    # running-process list, and the preview says so rather than claiming free.
+    profile = _wizard_card_probe()
+    by_index: Dict[int, str] = {}
+    if profile is not None:
+        try:
+            by_index = {int(c.cuda_index): c.uuid for c in profile.cards}
+        except Exception:  # pragma: no cover - defensive
+            by_index = {}
+    gpus = [
+        dict(g, uuid=by_index.get(int(g.get("cuda_index") or g.get("index") or -1), ""))
+        for g in ctx.gpus
+    ]
+
+    base = wizmod._base_targets(profiles) if profiles.get("ok") else {}
+    prefill = base.get("max_prefill") or {}
+    try:
+        model_path = _plan_call_args(payload)[0]
+    except Exception:  # pragma: no cover - defensive
+        model_path = ""
+    cross = ((ctx.rates or {}).get("rates") or {}).get("cross_rig_gbs") or {}
+    src = tipmod.TippingSources(
+        model_path=str(model_path or ""),
+        tp_size=len(ctx.gpus),
+        gpus=gpus,
+        split_table=split_table,
+        crossover=evidence,
+        crossover_points=points,
+        advantage=(plan or {}).get("advantage"),
+        prefill_tok_s=(prefill.get("value") if prefill.get("available") else None),
+        satellite_prefill_tok_s=ctx.rate(
+            "satellite_prefill_tok_s", ctx.satellite_prefill_tok_s
+        ),
+        loaded_fraction=ctx.rate(
+            "loaded_prefill_fraction", wizmod.LOADED_PREFILL_RATE_FRACTION
+        )
+        or 0.0,
+        context_tokens=int(ctx.context_tokens),
+        kv_bytes_per_token=ctx.kv_bytes_per_token,
+        state_bytes=ctx.state_bytes,
+        link_gbs=ctx.rate("cross_rig_gbs", ctx.link_gbs),
+        link_provenance=str(cross.get("provenance") or "absent"),
+        link_source=str(cross.get("source") or ""),
+        handshake_s=ctx.rate("pd_handshake_s", wizmod.ANCHOR_PD_HANDSHAKE_S) or 0.0,
+        busy_cards=busy,
+        anchor_study=wizmod.ANCHOR_STUDY,
+        have_remote=bool(ctx.remotes),
+    )
+    return tipmod.build_tipping_points(src)
+
+
+def _wizard_offload(payload: dict, ctx, plan: Optional[dict]) -> dict:
+    """The offload depth axis, priced against the plan's own expert pool."""
+    from sglang.srt.planner import rejected as rejmod
+    from sglang.srt.planner import wizard_offload as offmod
+
+    # ``plan["offload"]`` is the feasibility layer's OffloadAssessment: three
+    # states (fits in VRAM / fits with a host tier / cannot fit) plus how many
+    # GiB have to move. ``capacity.per_rank[].offloadable_weight_gib`` is the
+    # routed-expert pool itself -- the only host-offloadable weight class.
+    off = (plan or {}).get("offload") or {}
+    cap = (plan or {}).get("capacity") or {}
+    per_rank_gib = [
+        float(r.get("offloadable_weight_gib") or 0.0)
+        for r in (cap.get("per_rank") or [])
+    ]
+    is_moe = "moe" in ctx.config_tags
+    is_gguf = "gguf" in ctx.config_tags
+    entry = rejmod.by_key("gguf_moe_expert_offload") if (is_moe and is_gguf) else None
+
+    status = str(off.get("status") or "")
+    fits_in_vram = (status == "vram") if status else (plan or {}).get("fits")
+    # The gap is what the assessment says has to move -- not a figure derived
+    # here from budget arithmetic that would then disagree with the verdict.
+    shortfall_mib = (
+        float(off["offloaded_gib"]) * 1024.0
+        if off.get("offloaded_gib")
+        else None
+    )
+    frac = payload.get("moe_resident_expert_fraction")
+    src = offmod.OffloadSources(
+        is_moe=is_moe,
+        is_gguf=is_gguf,
+        tp_size=len(ctx.gpus) or 1,
+        offloadable_mib=(sum(per_rank_gib) * 1024.0 if per_rank_gib else None),
+        per_rank_offloadable_mib=[g * 1024.0 for g in per_rank_gib],
+        current_fraction=(float(frac) if frac not in (None, "") else None),
+        fits_without_offload=(
+            bool(fits_in_vram) if fits_in_vram is not None else None
+        ),
+        shortfall_mib=shortfall_mib,
+        kv_bytes_per_token=ctx.kv_bytes_per_token,
+        host_ram_free_mib=(
+            float(off["host_ram_total_mib"])
+            if off.get("host_ram_total_mib")
+            else None
+        ),
+        cuda_graph_allowed=(
+            str(os.environ.get("SGLANG_MOE_OFFLOAD_CUDA_GRAPH") or "") == "1"
+        ),
+        blocked_verdict=(entry.verdict if entry else ""),
+        blocked_evidence=(entry.evidence if entry else ""),
+    )
+    return offmod.offload_dimension(src)
+
+
+def _wizard_islands(payload: dict, ctx) -> dict:
+    """Island families, from the measured pair matrix or a described layout."""
+    from sglang.srt.planner import wizard_islands as islmod
+
+    described = payload.get("island_sizes")
+    if described:
+        topo = islmod.described_topology(
+            [int(s) for s in described],
+            intra_tier=str(payload.get("island_intra_tier") or "nvlink"),
+        )
+    else:
+        profile = _wizard_card_probe()
+        cards = (
+            [{"uuid": c.uuid, "index": c.cuda_index} for c in profile.cards]
+            if profile is not None
+            else [{"index": g.get("index")} for g in ctx.gpus]
+        )
+        pairs = [p.to_json() for p in profile.pairs] if profile is not None else []
+        topo = islmod.islands_from_pairs(cards, pairs)
+    return islmod.island_families(topo)
 
 
 def _wizard_measured_row(payload: dict) -> Optional[dict]:
@@ -3947,6 +4208,32 @@ def wizard_families_payload(payload: Optional[dict] = None) -> dict:
         return wizmod.build_matrix(profiles, context=ctx, plan=plan)
     except Exception as e:  # pragma: no cover - defensive
         return {"ok": False, "reasons": [str(e)], "families": []}
+
+
+def wizard_tipping_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/wizard/tipping -> the thresholds, their origins, their buttons.
+
+    The same block the family matrix carries, on its own endpoint. It exists
+    because the flow around it is a loop: read a threshold, see it is an
+    estimate, start the study, come back. Re-running the whole matrix to
+    refresh one row would re-plan every family for a number that lives in one
+    of them, and the poll after a probe would be the most expensive request on
+    the page.
+
+    Reads caches. Starts nothing -- the actions it describes are started by
+    the endpoints they name.
+    """
+    payload = payload or {}
+    profiles = lever_profiles_payload(payload)
+    plan = _plan_for_factors(payload)
+    try:
+        ctx = _wizard_context(payload, profiles, plan)
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e), "points": []}
+    out = dict(ctx.tipping or {})
+    out["ok"] = True
+    out["rates"] = ctx.rates
+    return out
 
 
 def wizard_command_payload(payload: Optional[dict] = None) -> dict:
@@ -4709,14 +4996,17 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/key_solver"):
                 self._json(200, key_solver_payload(payload))
                 return
-            # #270 wizard. /api/wizard/families and /api/wizard/command are
-            # distinct prefixes; neither is a prefix of the other, so the
-            # order between them does not matter.
+            # #270 wizard. /api/wizard/families, /api/wizard/command and
+            # /api/wizard/tipping are distinct prefixes; none is a prefix of
+            # another, so the order between them does not matter.
             if self.path.startswith("/api/wizard/families"):
                 self._json(200, wizard_families_payload(payload))
                 return
             if self.path.startswith("/api/wizard/command"):
                 self._json(200, wizard_command_payload(payload))
+                return
+            if self.path.startswith("/api/wizard/tipping"):
+                self._json(200, wizard_tipping_payload(payload))
                 return
             if self.path.startswith("/api/share_preview"):
                 self._json(200, share_preview_payload(payload))
@@ -4925,6 +5215,59 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   .hdr { display: flex; align-items: flex-start; justify-content: space-between;
          gap: var(--s4); flex-wrap: wrap;
          padding-top: var(--s4); padding-bottom: var(--s3); }
+  /* ---- the loaded-model bar -----------------------------------------------
+     WHAT IS LOADED, AND HOW, is the one fact every tab is read against: a
+     capacity table, a benchmark result and a family matrix all mean something
+     different depending on which checkpoint is up and at what KV size. It
+     used to live inside the Planner's own panel, which put it four steps deep
+     inside one tab. It belongs above the tabs, where it is true for all of
+     them. Name, not path -- the path is on hover. */
+  /* ---- the rejected register ----------------------------------------------
+     Was a four-column table with two prose columns, which made the page far
+     wider than the window and still answered nothing. A card wraps; a table
+     cell does not. The definition list is a two-column grid whose label
+     column is exactly as wide as the longest label, so the text column takes
+     everything that is left and no row can push the page sideways. */
+  .rj { border: 1px solid var(--bd-weak); border-radius: var(--radius-lg);
+        padding: var(--s2) var(--s3); margin-bottom: var(--s1);
+        background: var(--bg-panel); max-width: 100%; overflow-wrap: anywhere; }
+  .rj.on { border-color: var(--bd); }
+  .rj-h { display: flex; align-items: baseline; gap: var(--s2);
+          flex-wrap: wrap; }
+  .rj-t { background: transparent; border: 1px solid var(--bd-weak);
+          border-radius: var(--radius); color: var(--fg-muted);
+          width: 22px; height: 22px; padding: 0; flex: none; cursor: pointer; }
+  .rj-w { flex: 1 1 20ch; min-width: 0; color: var(--fg); }
+  .rj-l { font-size: var(--t-xs); border-radius: 9999px; padding: 1px 8px;
+          border: 1px solid var(--bd-weak); flex: none; }
+  .rj-l.blocked { color: var(--bad); border-color: var(--bad); }
+  .rj-l.not-default { color: var(--warn); border-color: var(--warn-dim); }
+  .rj-s { font-size: var(--t-xs); color: var(--fg-muted); flex: none; }
+  .rj-b { display: grid; grid-template-columns: max-content minmax(0, 1fr);
+          gap: 2px var(--s3); margin: var(--s2) 0 0; font-size: var(--t-sm); }
+  .rj-b dt { color: var(--fg-muted); text-transform: uppercase;
+             letter-spacing: .04em; font-size: var(--t-xs); padding-top: 2px; }
+  .rj-b dd { margin: 0; min-width: 0; }
+  /* Something is being read from disk right now. Distinct from .muted (idle,
+     secondary) and from .reasons (failed): a scan in progress is neither. */
+  .scanning { color: var(--accent-text); font-size: var(--t-sm);
+              animation: scanpulse 1.1s ease-in-out infinite; }
+  @keyframes scanpulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+  @media (prefers-reduced-motion: reduce) {
+    .scanning { animation: none; }
+  }
+  .loadbar { display: flex; align-items: baseline; gap: var(--s3);
+             flex-wrap: wrap; padding: var(--s2) var(--s3);
+             margin-bottom: var(--s3); border-radius: var(--radius-lg);
+             background: var(--bg-panel); border: 1px solid var(--bd-weak);
+             font-size: var(--t-sm); }
+  .loadbar.off { color: var(--fg-muted); }
+  .loadbar .lb-name { font-size: var(--t-lg); color: var(--fg-strong);
+                      font-weight: 500; }
+  .loadbar .lb-f { color: var(--fg-muted); }
+  .loadbar .lb-f b { color: var(--fg); font-weight: 500;
+                     font-variant-numeric: tabular-nums; }
+  .loadbar .lb-na { color: var(--fg-muted); font-style: italic; }
   /* The bar WRAPS; it never scrolls. A scrollbar in a navigation strip hides
      destinations behind a gesture, which is exactly what navigation must not
      do. Labels are one word each so wrapping is rare in the first place. */
@@ -5488,6 +5831,15 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   </div>
 </div>
 
+<!-- What is loaded right now, above the tabs because it qualifies all of
+     them. Five facts and no more: the served NAME, the quantisation, the KV
+     pool the server actually reports, how many requests may run at once, and
+     the context one of them may reach. Anything unreported says so rather
+     than being left out, because "the server did not tell us" and "it is
+     small" are different answers. -->
+<div id="loadbar" class="loadbar off">
+  <span class="lb-name">reading the running server&hellip;</span></div>
+
 <!-- Navigation = the order of the work: watch the machine, configure it,
      measure it, judge the answers, then the reference surfaces (what other
      rigs can carry, what this one costs, a second rig, contributed rig data)
@@ -5544,7 +5896,7 @@ _INDEX_TEMPLATE = r"""<!doctype html>
         <label>discovered local models</label>
         <input id="model_search" placeholder="search models (name / format / quant)&hellip;"
           oninput="renderModelOptions()" style="margin-bottom:.3rem">
-        <div id="models_out" class="muted">scanning&hellip;</div>
+        <div id="models_out"><span class="scanning">scanning the model roots&hellip;</span></div>
       </div>
       <div style="flex:2;min-width:280px">
         <label>or type a path / HF id (config.json dir, .gguf file, GGUF dir)</label>
@@ -5574,7 +5926,7 @@ _INDEX_TEMPLATE = r"""<!doctype html>
       <button class="secondary mini" onclick="addCard(false)">+ add card</button>
       <button class="secondary mini" onclick="addCard(true)" title="a hypothetical GPU you don't own yet">+ add future GPU</button>
     </div>
-    <div id="detect_note" class="muted" style="margin-bottom:.4rem">detecting local GPUs…</div>
+    <div id="detect_note" style="margin-bottom:.4rem"><span class="scanning">querying NVML for local GPUs&hellip;</span></div>
     <div id="cardlist" class="cardlist"></div>
     <div class="muted" style="margin-top:.4rem">Tick = include in the set.
     &ldquo;keep free&rdquo; is per-card headroom (a display / another
@@ -5934,9 +6286,11 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   <fieldset class="cfg-section">
     <legend>never proposed &mdash; the rejected register</legend>
     <div class="muted" style="margin-bottom:var(--s2)">Combinations this
-      project already settled. A blocked row is never offered; a
-      not-default row is available on request and always carries the number
-      that decided it.</div>
+      project already tried and settled, so nobody has to try them twice.
+      Open one for three lines: what it would have bought, what it costs, and
+      why. A <b>not-default</b> row works and simply lost its comparison
+      &mdash; there is a button that hands you the flag. A <b>blocked</b> row
+      is wrong or impossible, and has none.</div>
     <div id="wz_rejected"><span class="muted">loading&hellip;</span></div>
   </fieldset>
 </div>
@@ -6870,11 +7224,13 @@ async function detectGPUs() {
                    -(b.cuda_index!=null?b.cuda_index:1e9)) || (a.nvml_index-b.nvml_index));
     CARDS = det.concat(CARDS.filter(c => c.virtual));
     noteCudaMap(d.gpus, d.cuda_index_source);
+    $('detect_note').className = 'muted';
     $('detect_note').textContent = 'detected '+d.gpus.length+' GPU(s) via '+(d.source||'nvml')
       +(d.cuda_index_source==='heuristic'
         ? ' — cuda indices are a FASTEST_FIRST emulation (no torch bridge), marked "?"'
         : '');
   } else {
+    $('detect_note').className = 'muted';
     $('detect_note').textContent = 'no GPU detected'+(d.error?' ('+d.error+')':'')
       + ' — add cards (real or hypothetical) below.';
     if (!CARDS.length) addCard(false);
@@ -7011,11 +7367,22 @@ function wizardInvalidate(from){
   if(i<0) return;
   for(const s of WIZ_STEPS.slice(i+1)) wizardMarkStale(s, true);
 }
+// A step is only marked stale once it has ACTUALLY produced an answer. The
+// band reads "these numbers are from the previous input", and on a step that
+// has never been computed there are no such numbers: greying an empty step
+// and telling the reader its contents are out of date is a false statement
+// and, on the first model pick, it greyed the entire page.
+window._wizAnswered={};
 function wizardMarkStale(step, stale){
   const el=document.querySelector('[data-step="'+step+'"]');
-  if(el) el.classList.toggle('stale', !!stale);
+  if(!el) return;
+  if(stale && !window._wizAnswered[step]) return;
+  el.classList.toggle('stale', !!stale);
 }
-function wizardFresh(step){ wizardMarkStale(step, false); }
+function wizardFresh(step){
+  window._wizAnswered[step]=true;
+  wizardMarkStale(step, false);
+}
 
 // The ONE model selector's state: the free-text field is the reference; the
 // discovered-models dropdown fills it; _modelMeta remembers format + GGUF
@@ -7816,6 +8183,7 @@ async function csForgetToken(){
 // inside #view_wizard and inherits its visibility.
 function showTab(t) {
   const TABS = ['landing','wizard','bench','quality','explore','energy','pair','share','history','about'];
+  window._tab = t;
   for (const v of TABS) $('view_'+v).style.display = t===v ? '' : 'none';
   for (const v of TABS) $('tab_'+v).classList.toggle('active', t===v);
   if (t==='explore' && !window._profLoaded) loadProfiles();
@@ -7842,6 +8210,10 @@ function showTab(t) {
       wizardInit();
     }
     wizardSyncModel();
+    // Entering the guide with a checkpoint already chosen answers the
+    // question rather than waiting to be asked it again. Only when there is
+    // no answer yet -- coming back to an answered page must not re-plan it.
+    if (($('model').value||'').trim() && !window._wizard) wizardFamiliesDebounced();
   }
   // The lead-metric poll runs only while its tab is visible.
   if (t!=='bench') benchLeadStop();
@@ -8684,6 +9056,7 @@ async function landingPoll(){
   } else {
     $('land_target_note').textContent='no target';
   }
+  renderLoadbar((d && d.running) ? d.snapshot : null);
   if(!d || !d.running || !d.snapshot){
     // State 1: nothing is running. Rendered from THIS tick, so a warning
     // about a server that has since gone away cannot survive it.
@@ -8719,6 +9092,8 @@ function normalizeStartConfig(s){
     rank_tp_ratio: si.rank_tp_ratio, rank_gpu_memory_mib: si.rank_gpu_memory_mib,
     kv_cache_dtype: si.kv_cache_dtype, context_length: si.context_length,
     max_num_seqs: si.max_running_requests,
+    max_running_requests: si.max_running_requests,
+    quantization: si.quantization||mi.quantization||null,
     spec_mode: si.speculative_algorithm||null,
     speculative_num_steps: si.speculative_num_steps,
     speculative_num_draft_tokens: si.speculative_num_draft_tokens,
@@ -8728,6 +9103,67 @@ function normalizeStartConfig(s){
     chat_template: si.chat_template, port: si.port, gguf_variant: null,
   }};
 }
+// ---- the loaded-model bar -------------------------------------------------
+// The one line that qualifies every other surface: WHICH checkpoint is up and
+// HOW it is loaded. It sits above the tabs, so it is rendered from whatever
+// snapshot arrives first -- the Monitor's poll, the Guide's prefill, or its
+// own slow fallback poll -- rather than owning a poll of its own that would
+// duplicate the Monitor's.
+//
+// The KV pool is the SERVER's own max_total_num_tokens, not a planned figure:
+// what the running server sized is the fact, and a planner estimate standing
+// in for it would be the one number on this page that silently describes a
+// configuration nobody booted.
+function loadbarKvTokens(s){
+  const w=(s&&s.server_info)||{}, si=w.server_info||{};
+  const v=si.max_total_num_tokens;
+  return (typeof v==='number'&&v>0)?v:null;
+}
+function renderLoadbar(s){
+  const box=$('loadbar'); if(!box) return;
+  const n=(s&&s.ok!==false)?normalizeStartConfig(s):null;
+  const c=(n&&n.cfg)||null;
+  if(!c||!c.model_path){
+    box.className='loadbar off';
+    setHTML(box,'<span class="lb-name">no server running</span>'
+      +'<span class="lb-f">nothing is loaded &mdash; the numbers on every tab '
+      +'are planned, not observed</span>');
+    return;
+  }
+  const name=(c.served_model_name&&c.served_model_name!=='model')
+    ? c.served_model_name : String(c.model_path||'').split('/').pop();
+  const kv=loadbarKvTokens(s);
+  const seats=c.max_running_requests||c.max_num_seqs;
+  const running=(s&&typeof s.num_running_reqs==='number')?s.num_running_reqs:null;
+  // Every field prints, including the ones the server did not report: a gap
+  // that is drawn is a gap somebody can go and fill, and a gap that is
+  // omitted looks like a field that does not exist.
+  const na='<span class="lb-na">not reported</span>';
+  const f=(k,v)=>'<span class="lb-f">'+esc(k)+' '+(v==null?na:('<b>'+v+'</b>'))+'</span>';
+  const quant=c.quantization||(c.kv_cache_dtype?null:null);
+  let h='<span class="lb-name" title="'+esc(c.model_path||'')+'">'+esc(name||'unnamed')+'</span>';
+  h+=f('quant', quant?esc(String(quant)):null);
+  h+=f('KV pool', kv!=null?(kv.toLocaleString()+' tok'):null);
+  h+=f('sessions', seats!=null
+        ?((running!=null?(running+' / '):'')+seats)
+        :null);
+  h+=f('context', c.context_length!=null?Number(c.context_length).toLocaleString():null);
+  if(c.kv_cache_dtype) h+=f('KV dtype', esc(String(c.kv_cache_dtype)));
+  box.className='loadbar';
+  setHTML(box,h);
+}
+// The fallback poll. Deliberately slow and deliberately last: whenever a tab
+// that already polls hands over a snapshot, that one wins and this timer
+// simply finds nothing new to do.
+async function loadbarPoll(){
+  try{
+    const ep=landingEndpoint();
+    const d=await api('/api/live_snapshot'+(ep?('?endpoint='+encodeURIComponent(ep)):''),
+                      {key:'loadbar', timeout:4000});
+    renderLoadbar((d&&d.running)?d.snapshot:null);
+  }catch(e){ /* leave the last known state on screen */ }
+}
+
 // Compact, grouped start-config summary: what is running + the key flags,
 // with the full argv/env and raw server_info COLLAPSED (no wall of text).
 function renderStartConfig(s, tgt){
@@ -9643,7 +10079,15 @@ async function onRunnerModel(){
   // #12: the model is step 1. Everything below it was computed for the
   // previous checkpoint until it is asked again.
   wizardSyncModel(); wizardFresh('model'); wizardInvalidate('model');
+  // ...and then it IS asked again. Picking a checkpoint is the whole input
+  // of this page; leaving the answer behind a button meant the visible
+  // effect of choosing a model was that everything below it went grey.
+  // Debounced because the field also changes when the running config is
+  // prefilled into it.
+  if(currentTab()==='wizard') wizardFamiliesDebounced();
 }
+// Which view is on screen. showTab() is the only writer.
+function currentTab(){ return window._tab||'landing'; }
 
 // ===========================================================================
 // Live propagation: ONE call, ONE consistent answer.
@@ -9928,6 +10372,7 @@ async function prefillFromRunning(){
     const s=(d&&d.running)?d.snapshot:null;
     const n=s?normalizeStartConfig(s):null;
     const cfg=(n&&n.cfg)||null;
+    renderLoadbar(s);
     if(!cfg||!cfg.model_path){ renderLoadedConfigNote(null); return; }
     const key=cfg.model_path+'|'+(cfg.port||'');
     renderLoadedConfigNote(cfg, n.src);
@@ -10119,19 +10564,93 @@ function renderWizardHardware(d){
     +'. '+esc(d.remote_note||'')+'</div>';
   setHTML(box,h);
 }
+// The rejected register. It used to be a four-column table whose two prose
+// columns pushed the page far past its own width and answered none of the
+// questions a reader has: a verdict paragraph says what was decided, not what
+// the thing would have bought, what it costs, or why the cost arises.
+//
+// So: one card per row, wrapping inside the page, collapsed by default. Open
+// it and there are exactly three short lines -- gain, cost, why -- and, for a
+// row that is merely not-default rather than blocked, the flag that turns it
+// on, wired to the expert override box so "available on request" is a click
+// instead of an instruction.
+window._rejected=null;
 async function wizardRejected(){
   const box=$('wz_rejected'); if(!box) return;
   try{
     const d=await api('/api/wizard/rejected',{key:'wizard_rej'});
-    let h='<table class="lp"><tr><th>combination</th><th>level</th>'
-      +'<th>verdict</th><th>evidence</th></tr>';
-    for(const e of (d.entries||[]))
-      h+='<tr><td>'+esc(e.what)+'</td><td>'+esc(e.level)+'</td><td>'
-        +esc(e.verdict)+'</td><td class="muted">'+esc(e.evidence)+'</td></tr>';
-    setHTML(box,h+'</table>');
+    window._rejected=d;
+    renderRejected();
   }catch(e){
     if(!apiAborted(e)) setHTML(box,'<div class="rev-error">'+esc(apiError(e))+'</div>');
   }
+}
+function renderRejected(){
+  const box=$('wz_rejected'), d=window._rejected; if(!box||!d) return;
+  const want=(($('rj_filter')||{}).value)||'all';
+  let h='<div class="actions" style="margin-bottom:var(--s2)">'
+    +'<select id="rj_filter" class="num" onchange="renderRejected()">'
+    +['all','not-default','blocked'].map(k=>'<option value="'+k+'"'
+      +(k===want?' selected':'')+'>'+(k==='all'?'all rows':k)+'</option>').join('')
+    +'</select><span class="muted">blocked = wrong or impossible, never '
+    +'offered. not-default = it works, it was measured, and it lost &mdash; '
+    +'yours on request.</span></div>';
+  let shown=0;
+  for(const e of (d.entries||[])){
+    if(want!=='all' && e.level!==want) continue;
+    shown++;
+    const open=!!(window._rjOpen||{})[e.key];
+    h+='<div class="rj'+(open?' on':'')+'">'
+      +'<div class="rj-h">'
+      +'<button class="rj-t" onclick="rejectedToggle(\''+esc(e.key)+'\')">'
+      +(open?'&minus;':'+')+'</button>'
+      +'<span class="rj-w">'+esc(e.what)+'</span>'
+      +'<span class="rj-l '+esc(e.level)+'">'+esc(e.level)+'</span>'
+      +(e.scope==='rig'?'<span class="rj-s" title="a statement about THIS '
+        +'hardware; other cards may decide it differently">this rig only</span>':'')
+      +'</div>';
+    if(open){
+      h+='<dl class="rj-b">'
+        +'<dt>gain</dt><dd>'+esc(e.gain||'&mdash;')+'</dd>'
+        +'<dt>cost</dt><dd>'+esc(e.cost||'&mdash;')+'</dd>'
+        +'<dt>why</dt><dd>'+esc(e.why||'&mdash;')+'</dd>'
+        +'<dt>evidence</dt><dd class="muted">'+esc(e.evidence||'')+'</dd>'
+        +'</dl>';
+      if(e.unlockable)
+        h+='<div class="actions"><button class="mini secondary" onclick="'
+          +'rejectedUnlock(\''+esc(e.key)+'\')">use it anyway &mdash; add '
+          +'<code>'+esc(e.unlock)+'</code></button>'
+          +'<span class="muted">goes into the expert overrides, so it shows up '
+          +'as a difference against the guided command.</span></div>';
+      else if(e.level==='blocked')
+        h+='<div class="muted">There is no switch for this one: it is refused '
+          +'by the engine or it produces the wrong answer.</div>';
+    }
+    h+='</div>';
+  }
+  if(!shown) h+='<div class="muted">no rows at this level.</div>';
+  setHTML(box,h);
+}
+function rejectedToggle(key){
+  window._rjOpen=window._rjOpen||{};
+  window._rjOpen[key]=!window._rjOpen[key];
+  renderRejected();
+}
+// "Available on request" made literal: the flag lands in the same override
+// box the expert step edits, so it is visible as an edit and the generated
+// command carries it. Nothing is applied behind the reader's back.
+function rejectedUnlock(key){
+  const d=window._rejected; if(!d) return;
+  const e=(d.entries||[]).filter(x=>x.key===key)[0];
+  if(!e||!e.unlock) return;
+  const box=$('wz_overrides'); if(!box) return;
+  const lines=(box.value||'').split('\n').map(x=>x.trim()).filter(Boolean);
+  const flag=e.unlock.split(' ')[0];
+  const kept=lines.filter(x=>x.split(' ')[0]!==flag);
+  kept.push(e.unlock);
+  box.value=kept.join('\n');
+  wizardCommandDebounced();
+  box.scrollIntoView({behavior:'smooth', block:'center'});
 }
 async function wizardFamilies(){
   const box=$('wz_families'); if(!box) return;
@@ -10212,6 +10731,7 @@ function renderWizardFamilies(){
           +esc(a.what)+' &mdash; '+esc(a.verdict)+' ['+esc(a.evidence)+']</td></tr>';
     }
     h+='</table>';
+    h+=wzLanes(f.lanes);
     if(fit)
       h+='<div class="actions"><button class="mini" onclick="wizardPick('
         +"'"+esc(f.key)+"'"+')">build the command</button></div>';
@@ -10247,7 +10767,267 @@ function renderWizardFamilies(){
         +(m.source?' ['+esc(m.source)+']':'')+'</span></div>';
     h+='</fieldset>';
   }
+  h+=wzTipping(d.tipping_points)+wzRates(d.rates)
+    +wzOffload(d.offload_depth)+wzIslands(d.islands);
+  const cov=d.provenance_coverage;
+  if(cov) h+='<div class="legend" style="margin-top:var(--s3)">'+esc(cov.summary||'')+'</div>';
   setHTML(box,h);
+}
+
+// ===========================================================================
+// #270 v2 -- rendering only, exactly like the rest of this tab.
+//
+// Four blocks: the thresholds a recommendation turns on, the rates the
+// network rows are priced with, the offload depth axis, and the island
+// families. Every figure, every origin sentence and every action already
+// exists in the payload; the page draws them and starts nothing it was not
+// handed the endpoint for.
+// ===========================================================================
+function wzProv(c){
+  if(!c) return '';
+  return '<span class="p '+esc(c.provenance||'absent')+'" title="'
+    +esc(c.basis||'')+'">'+esc(c.provenance||'absent')+'</span>';
+}
+function wzNum(c){
+  if(!c||!c.available) return '<span class="muted">&mdash;</span> '+wzProv(c);
+  const v=c.value;
+  const s=(Math.abs(v)>=1000)?Math.round(v).toLocaleString():Number(v).toFixed(2);
+  return '<b>'+s+'</b> '+esc(c.unit||'')+' '+wzProv(c);
+}
+// The button and, beside it, what pressing it costs. A measurement that
+// takes cards away from a running server is not something to discover after
+// the fact, so the preview is drawn WITH the control and the control is
+// disabled -- with the holder named -- when a card is busy.
+function wzMeasureBtn(m, key, candidate){
+  if(!m) return '';
+  const a=m.action||{}, pv=m.preview||{};
+  if(!m.available)
+    return '<span class="muted">'+esc(m.reason||'no study produces this')+'</span>';
+  const cost=[pv.duration_text, a.occupies].filter(Boolean).join(', ');
+  if(a.kind!=='job')
+    return '<span class="muted">'+esc(a.label)+' &mdash; '+esc(a.what||'')
+      +(a.command?(' ('+esc(a.command)+')'):'')
+      +(cost?(' <i>'+esc(cost)+'</i>'):'')+'</span>';
+  const arg="'"+esc(key)+"'"+(candidate?(",'"+esc(candidate)+"'"):'');
+  const blocked=!!pv.blocked;
+  return '<button class="mini secondary"'+(blocked?' disabled':'')
+    +' title="'+esc((a.what||'')+' — '+cost+'. '+(a.interruption||''))+'"'
+    +' onclick="wizardMeasureRun('+arg+')">'+esc(a.label||'measure now')+'</button>'
+    +' <span class="legend">'+esc(cost)
+    +(blocked?(' &mdash; blocked: '+esc(pv.blocked_reason||'')):'')+'</span>';
+}
+function wzTipping(t){
+  if(!t||!(t.points||[]).length) return '';
+  window._wizTipping=t;
+  let h='<fieldset><legend>tipping points &mdash; where the recommendation '
+    +'changes, and where the number came from</legend>'
+    +'<div class="muted" style="margin-bottom:var(--s2)">'+esc(t.note||'')+'</div>'
+    +'<div id="wz_measure_note" class="legend"></div>'
+    +'<table class="lp"><tr><th>threshold</th><th>value</th><th>what it tips</th>'
+    +'<th>where the number is from</th><th>side we are on</th>'
+    +'<th>measure it</th></tr>';
+  for(const p of (t.points||[])){
+    const o=p.origin||{}, s=p.side||{};
+    h+='<tr><td><b>'+esc(p.label)+'</b><div class="legend">'+esc(p.question||'')
+      +'</div></td>'
+      +'<td>'+wzNum(p.value)+'</td>'
+      +'<td class="legend">'+esc(p.tips||'')+'</td>'
+      +'<td class="legend">'+esc(o.source||'')
+      +(o.detail?('<br>'+esc(o.detail)):'')+'</td>'
+      +'<td class="legend">'+(s.available?esc(s.text||''):
+        '<span class="muted">'+esc(s.text||'unknown')+'</span>')+'</td>'
+      +'<td>'+wzMeasureBtn(p.measure, p.key)+'</td></tr>';
+    if((p.candidates||[]).length){
+      h+='<tr><td colspan="6"><details class="cfg-section"><summary class="sec-sum">'
+        +'the split ladder &mdash; which candidates are measured on this rig'
+        +'</summary><div class="sec-body"><table class="lp">'
+        +'<tr><th>candidate</th><th>decode</th><th>prefill</th><th>origin</th>'
+        +'<th></th></tr>';
+      for(const c of p.candidates){
+        h+='<tr><td>'+esc(c.candidate)+(c.is_baseline?' <span class="muted">(baseline)</span>':'')
+          +'</td><td>'+(c.decode_tok_s!=null?Number(c.decode_tok_s).toFixed(2):'&mdash;')
+          +'</td><td>'+(c.prefill_tok_s!=null?Math.round(c.prefill_tok_s).toLocaleString():'&mdash;')
+          +'</td><td class="legend"><span class="p '+esc(c.provenance)+'">'
+          +esc(c.provenance)+'</span> '+esc(c.basis||'')
+          +(c.unbootable?('<br><span class="st-blocked">'+esc(c.unbootable)+'</span>'):'')
+          +'</td><td>'+wzMeasureBtn(c.measure, p.key, c.candidate)+'</td></tr>';
+      }
+      h+='</table></div></details></td></tr>';
+    }
+  }
+  h+='</table>';
+  if(t.coverage) h+='<div class="legend">'+esc(t.coverage.summary||'')+'</div>';
+  return h+'</fieldset>';
+}
+function wzRates(r){
+  if(!r) return '';
+  let h='<fieldset><legend>link and satellite rates &mdash; which rung each '
+    +'number came off</legend><table class="lp"><tr><th>rate</th><th>value</th>'
+    +'<th>source</th><th>how to fill it / replace it</th></tr>';
+  for(const k of Object.keys(r.rates||{})){
+    const x=r.rates[k];
+    h+='<tr><td>'+esc(x.label)+'</td><td>'+wzNum(x)+'</td>'
+      +'<td class="legend">'+esc(x.source||'&mdash;')+'<br>'+esc(x.basis||'')+'</td>'
+      +'<td class="legend">'+esc(x.way||'')+'</td></tr>';
+  }
+  h+='</table>';
+  if((r.pairs||[]).length){
+    h+='<details class="cfg-section"><summary class="sec-sum">the ordered '
+      +'card-to-card matrix this rig measured</summary><div class="sec-body">'
+      +'<table class="lp"><tr><th>src &rarr; dst</th><th>bandwidth</th>'
+      +'<th>transport</th><th>peer access</th></tr>';
+    for(const p of r.pairs)
+      h+='<tr><td>'+esc(p.src)+' &rarr; '+esc(p.dst)+'</td><td>'
+        +Number(p.bandwidth_gbs).toFixed(2)+' GB/s</td><td>'+esc(p.transport)
+        +'</td><td>'+(p.peer_access?'yes':'no')+'</td></tr>';
+    h+='</table></div></details>';
+  }
+  h+='<ul class="legend">'+(r.rules||[]).map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';
+  if(r.coverage) h+='<div class="legend">'+esc(r.coverage.summary||'')+'</div>';
+  return h+'</fieldset>';
+}
+function wzOffload(o){
+  if(!o||!o.applies) return '';
+  let h='<fieldset><legend>offload depth &mdash; how much of the routed expert '
+    +'stack stays on the card</legend>';
+  if(!o.available)
+    return h+'<div class="st-blocked">'+esc(o.reason||'')+'</div>'
+      +'<div class="legend">'+esc(o.source||'')+'</div></fieldset>';
+  h+='<table class="lp"><tr><th>resident</th><th>frees</th><th>as KV</th>'
+    +'<th>what it costs</th><th>worth it for</th></tr>';
+  for(const s of (o.steps||[])){
+    h+='<tr'+(s.current?' style="font-weight:600"':'')+'><td>'+esc(s.label)+'</td>'
+      +'<td>'+wzNum(s.vram_freed_mib)+'</td><td>'+wzNum(s.kv_tokens_gained)+'</td>'
+      +'<td class="legend">'+esc(s.tradeoff.price)+' '+wzProv(s.decode_price)+'</td>'
+      +'<td class="legend">'+esc(s.tradeoff.worth_for)+'</td></tr>';
+    if((s.notes||[]).length)
+      h+='<tr><td colspan="5" class="legend">'+s.notes.map(esc).join('<br>')+'</td></tr>';
+  }
+  h+='</table>';
+  const cr=o.counter_reckoning||{};
+  h+='<div class="legend" style="margin-top:var(--s2)"><b>the counter-reckoning:</b> '
+    +esc(cr.buy_side||'')+' '+esc(cr.price_side||'')+' '+esc(cr.what_would_settle_it||'')
+    +'<br>'+esc(cr.second_order||'')+'<br>'+esc(o.wave_order_note||'')+'</div>';
+  h+='<details class="cfg-section"><summary class="sec-sum">the boots this rests '
+    +'on, and what each of them does NOT say</summary><div class="sec-body">';
+  for(const e of (o.evidence||[]))
+    h+='<div class="adv"><b>'+esc(e.model)+'</b> on '+esc(e.hardware)
+      +(e.fraction!=null?(' at fraction '+e.fraction):'')+'<br>'+esc(e.showed)
+      +'<br><span class="muted">does not transfer: '+esc(e.does_not_transfer)
+      +'</span></div>';
+  h+='</div></details>';
+  if(o.coverage) h+='<div class="legend">'+esc(o.coverage.summary||'')+'</div>';
+  return h+'</fieldset>';
+}
+function wzIslands(i){
+  if(!i) return '';
+  let h='<fieldset><legend>NVLink / P2P islands &mdash; hardware where some '
+    +'cards are closer than others</legend>';
+  if(!i.applies)
+    return h+'<div class="muted">'+esc(i.reason||'')+'</div>'
+      +'<div class="legend">'+esc(i.how_to_explore||'')+'</div></fieldset>';
+  const t=i.topology||{};
+  h+='<div class="muted">'+t.island_count+' island(s) over '+t.card_count
+    +' card(s); inside '+esc(t.intra_tier)+', across '+esc(t.inter_tier)
+    +' &mdash; '+esc(t.source||'')+'</div>';
+  for(const f of (i.families||[])){
+    const o=f.origin||{};
+    h+='<div class="adv"><b>'+esc(f.label)+'</b> &mdash; '
+      +(f.feasible?'<span class="st-pass">possible</span>':'<span class="st-blocked">out</span>')
+      +'<div class="muted">'+esc(f.purpose)+'</div>'
+      +'<div class="legend">'+esc(f.explain)+'</div>'
+      +'<div>collective advantage: '+wzNum(f.collective_advantage)+'</div>'
+      +'<div class="legend">requires: '+esc(f.requires||'')+'</div>'
+      +'<div class="legend">origin: '+esc(o.detail||'')+' &mdash; '+esc(o.caveat||'')
+      +' '+esc(o.rule||'')+'</div>'
+      +wzLanes(f.lanes)+'</div>';
+  }
+  if(i.coverage) h+='<div class="legend">'+esc(i.coverage.summary||'')+'</div>';
+  return h+'</fieldset>';
+}
+// The lane structure of one configuration. One lane today for most families;
+// the list shape is the point, and a shared card is named rather than left to
+// be inferred from two identical card sets.
+function wzLanes(l){
+  if(!l) return '';
+  let h='<div class="legend">lanes ('+l.count+'): ';
+  h+=(l.lanes||[]).map(x=>esc(x.label)+' <span class="pill">'+esc(x.priority_class)
+    +'</span>'+(x.goal?(' <span class="pill">'+esc(x.goal)+'</span>'):'')
+    +((x.cards||[]).length?(' cards '+x.cards.join(',')):' <i>cards not set</i>')).join(' &middot; ');
+  const co=l.co_residence||{};
+  for(const c of Object.keys(co))
+    h+='<br>card '+esc(c)+' is shared by '+esc(co[c].join(' + '));
+  return h+'<br>'+esc(l.note||'')+'</div>';
+}
+// Starting a measurement. The endpoint, the body and the poll path all come
+// from the payload -- this function knows no URLs of its own, so a study that
+// moves does not leave a dead button behind.
+function wzFindMeasure(key, candidate){
+  const t=window._wizTipping||{};
+  for(const p of (t.points||[])){
+    if(p.key!==key) continue;
+    if(!candidate) return p.measure;
+    for(const c of (p.candidates||[])) if(c.candidate===candidate) return c.measure;
+  }
+  return null;
+}
+async function wizardMeasureRun(key, candidate){
+  const note=$('wz_measure_note');
+  const m=wzFindMeasure(key, candidate);
+  if(!m||!m.available||!(m.action||{}).path){
+    if(note) setHTML(note,'nothing to start for this row.'); return;
+  }
+  const a=m.action;
+  if(note) setHTML(note,'starting '+esc(a.label||'the study')+'&hellip; '
+    +esc((m.preview||{}).duration_text||'')+' &mdash; '+esc(a.interruption||''));
+  try{
+    const r=await (await fetch(a.path,{method:'POST',
+      body:JSON.stringify(m.body||{})})).json();
+    if(r.ok===false){
+      if(note) setHTML(note,'<span class="reasons">'+esc(r.error||'could not start')
+        +(r.remedy?(' &mdash; '+esc(r.remedy)):'')+'</span>');
+      return;
+    }
+  }catch(e){ if(note) setHTML(note,'<span class="reasons">'+esc(''+e)+'</span>'); return; }
+  wizardMeasurePoll(a.status_path);
+}
+function wizardMeasurePoll(statusPath){
+  if(!statusPath) return;
+  if(window._wizMeasureTimer) clearInterval(window._wizMeasureTimer);
+  window._wizMeasureTimer=setInterval(async function(){
+    let d;
+    try{
+      d=await api(statusPath,{key:'wiz_measure', method:'GET', timeout:20000});
+    }catch(e){ return; }
+    const j=d&&d.job;
+    const note=$('wz_measure_note');
+    if(j && (j.state==='running'||j.state==='pending')){
+      if(note) setHTML(note,'measuring '+esc(j.candidate||j.job_id||'')+' &mdash; '
+        +esc(j.step||j.current||'running')+' ('+Math.round(j.elapsed_s||0)+' s)');
+      return;
+    }
+    clearInterval(window._wizMeasureTimer); window._wizMeasureTimer=null;
+    if(note) setHTML(note, j&&j.state==='error'
+      ? '<span class="reasons">'+esc(j.error||'the study failed')+'</span>'
+      : 'done &mdash; re-reading the thresholds.');
+    wizardTipping();
+  }, 5000);
+}
+// Refresh the thresholds alone. The families answer is a planner run per
+// working point; re-running all of it to update one row would make the poll
+// after a measurement the most expensive request on the page.
+async function wizardTipping(){
+  try{
+    const d=await api('/api/wizard/tipping',{key:'wiz_tip', body:wizardBody(),
+                                             timeout:30000});
+    if(!d||d.ok===false) return;
+    window._wizTipping=d;
+    if(window._wizard){
+      window._wizard.tipping_points=d;
+      if(d.rates) window._wizard.rates=d.rates;
+      renderWizardFamilies();
+    }
+  }catch(e){ /* the previous answer stays on screen */ }
 }
 function wizardPick(key){
   window._wizardFamily=key;
@@ -10305,6 +11085,10 @@ async function wizardCommand(){
     : 'no edits.');
 }
 const wizardCommandDebounced=debounce(wizardCommand, 400);
+// The families answer is the page's whole output, and it is expensive (a
+// planner run per working point), so it is debounced rather than fired per
+// keystroke -- but it IS fired.
+const wizardFamiliesDebounced=debounce(wizardFamilies, 600);
 
 // ===========================================================================
 // Working point: one control, four named stops, one counter-reckoning.
@@ -11058,7 +11842,13 @@ function confirmFlush(ok) {
 
 // ---- Models tab ----
 async function loadModels() {
-  $('models_out').innerHTML = 'scanning…';
+  // Work in progress reads as work in progress: the scan walks the model
+  // roots off disk and can take a moment, and grey body text is exactly what
+  // an idle, empty panel looks like. The busy line gets its own colour and a
+  // pulse so "it is scanning" and "there is nothing here" are never the same
+  // picture.
+  $('models_out').innerHTML =
+    '<span class="scanning">scanning the model roots&hellip;</span>';
   try {
     const r = await fetch('/api/models'); const d = await r.json();
     if (!d.ok) { $('models_out').innerHTML = '<span class="reasons">'+esc(d.error)+'</span>'; return; }
@@ -12429,6 +13219,11 @@ async function shareSubmit(){
 applyViewMode();
 // Landing is the default view (live monitor of any reachable server).
 showTab('landing');
+// The loaded-model bar is above the tabs, so it is filled before any tab
+// asks for anything, and then kept alive by a slow fallback poll for the
+// tabs that do not poll at all.
+loadbarPoll();
+setInterval(loadbarPoll, 10000);
 </script>
 </body>
 </html>

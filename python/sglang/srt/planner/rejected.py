@@ -76,6 +76,22 @@ class RejectedEntry:
     tags: Tuple[str, ...] = ()
     scope: str = "general"
     note: Optional[str] = None
+    #: The three short lines a reader actually needs, and they are three
+    #: rather than one because a verdict paragraph answers none of them
+    #: directly. What would this have BOUGHT; what does it COST; and WHY does
+    #: the cost arise -- the mechanism, not the measurement. One sentence
+    #: each: a rejection nobody finishes reading is a rejection nobody learns
+    #: from, and this register's whole purpose is that the next person does
+    #: not repeat the work.
+    gain: str = ""
+    cost: str = ""
+    why: str = ""
+    #: For a NOT_DEFAULT row: the exact flag that turns it on. The register
+    #: says a thing is available on request, so the request has to be one
+    #: click -- an entry that says "available" and leaves the reader to work
+    #: out how is not offering anything. Empty for BLOCKED rows: there is
+    #: nothing to hand over.
+    unlock: str = ""
 
     def to_json(self) -> dict:
         return {
@@ -87,6 +103,13 @@ class RejectedEntry:
             "tags": list(self.tags),
             "scope": self.scope,
             "note": self.note,
+            "gain": self.gain,
+            "cost": self.cost,
+            "why": self.why,
+            "unlock": self.unlock,
+            # A blocked row has no switch by definition; a not-default one is
+            # only genuinely "available on request" when the request exists.
+            "unlockable": bool(self.unlock) and self.level == NOT_DEFAULT,
         }
 
 
@@ -98,6 +121,13 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         verdict=(
             "BLOCKED: silently non-greedy (tree-mask verify logits) AND "
             "performance-negative, 80 -> 68 tok/s"
+        ),
+        gain="a wider draft tree, so more tokens can be accepted per verify step",
+        cost="wrong output, and it is slower as well: 80 -> 68 tok/s",
+        why=(
+            "the tree mask is not applied to the verify logits under uneven "
+            "DCP, so the accept decision is taken on the wrong distribution. "
+            "Nothing crashes -- the output is simply no longer the greedy one."
         ),
         level=BLOCKED,
         evidence="guard restored in 46b55054f; the engine fail-fasts on it",
@@ -113,6 +143,14 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "self-deterministic and shows no #76 pattern — so it stays "
             "available, it is just never proposed"
         ),
+        gain="+7.7 % acceptance: more of each draft survives verification",
+        cost="-36.8 % throughput, nine times the noise floor",
+        why=(
+            "every branch is drafted AND verified whether or not it is taken. "
+            "At this acceptance rate the extra verify work costs more than the "
+            "extra accepted tokens save. Correctness is not in question here."
+        ),
+        unlock="--speculative-eagle-topk 2",
         level=NOT_DEFAULT,
         evidence="#139 A/B 2026-07-28 (189945d618)",
         tags=("tree-spec", "solo-tp"),
@@ -125,6 +163,14 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "not a default: +3.9-6.0 % measured, but inside the scatter of "
             "the same measurement"
         ),
+        gain="+3.9-6.0 % in the measurement that found it",
+        cost="nothing measurable -- and no evidence the gain is real",
+        why=(
+            "the difference is inside the scatter of the same measurement "
+            "repeated, so it cannot be told apart from noise. Not refused; just "
+            "never proposed on evidence this thin."
+        ),
+        unlock="--rank-vocab-ratio 7,3,3",
         level=NOT_DEFAULT,
         evidence="task #203, longer run",
         tags=("vocab-ratio",),
@@ -134,6 +180,14 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         key="spec_k4_mixed",
         what="speculative k=4 on mixed cards",
         verdict="not a default: lost the #103 matrix",
+        gain="a longer draft, so more tokens per draft pass",
+        cost="it lost the comparison against shorter drafts on mixed cards",
+        why=(
+            "the slowest rank sets the verify clock, and a longer draft "
+            "lengthens exactly that step. On equal cards the trade looks "
+            "different."
+        ),
+        unlock="--speculative-num-steps 4",
         level=NOT_DEFAULT,
         evidence="task #103 matrix",
         tags=("spec-k4", "mixed-cards"),
@@ -148,6 +202,16 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "(69-75 % of the window) is untouched — the floor is the lever, "
             "not the split"
         ),
+        gain="+8.2 % prefill: dense MLP work moves onto the strong card",
+        cost="-13.7 % decode and -47.9 % KV",
+        why=(
+            "decode is gated by the slowest rank, so loading the strong card "
+            "makes the weak ranks the clock; and the units they gave up were "
+            "holding KV. The collective floor -- 69-75 % of the window -- does "
+            "not move at all, which is the real finding: the floor is the "
+            "lever, not the split."
+        ),
+        unlock="--rank-mlp-ratio 6,1,1",
         level=NOT_DEFAULT,
         evidence="#264 A/B 2026-07-28, INTEGRATION_R3_VALIDATION (539154288d)",
         tags=("mlp-concentration",),
@@ -159,6 +223,13 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         verdict=(
             "BLOCKED: tips into a GDN prefill-scratch OOM on the first real "
             "chunk. 2700 carries. Warmup passes and fakes success"
+        ),
+        gain="about 500 MiB more KV pool on each 3080",
+        cost="an out-of-memory abort on the first real prefill chunk",
+        why=(
+            "the GDN prefill scratch is sized per chunk and is larger than "
+            "anything warmup allocates, so the boot looks healthy right up to "
+            "the first long prompt. 2700 leaves enough room."
         ),
         level=BLOCKED,
         evidence="task #250, base and branch identical",
@@ -173,6 +244,12 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "supported'); on sm86 the runtime takes a different kernel path "
             "entirely"
         ),
+        gain="the Triton fp8 kernel path on the 3080s",
+        cost="it does not compile at all",
+        why=(
+            "Triton has no fp8e4nv type below sm89. On sm86 the runtime takes a "
+            "different kernel path entirely, so there is nothing here to tune."
+        ),
         level=BLOCKED,
         evidence="idle tuner log 2026-07-28",
         tags=("triton-fp8", "sm86"),
@@ -186,6 +263,13 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "and no PTX, so it holds no code a 2080 Ti can execute. The rank "
             "loads weights, then dies mid-forward on a missing symbol — the "
             "promised loud failure at GGUFConfig is not wired (open bug #269)"
+        ),
+        gain="a GGUF checkpoint on a Turing rank",
+        cost="the rank loads its weights and then dies mid-forward",
+        why=(
+            "sgl-kernel ships cubins with a gencode floor of sm_80 and no PTX, "
+            "so it holds no code a 2080 Ti can execute. The loud failure this "
+            "should produce at load time is not wired up yet (open bug #269)."
         ),
         level=BLOCKED,
         evidence="#212 satellite bring-up; gguf.py:40-62 comment vs the unread flag",
@@ -202,6 +286,14 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "postprocess). The engine will not refuse it; it fails late and "
             "confusingly. Fail-fast is task #268"
         ),
+        gain="host-RAM expert offload for a GGUF MoE checkpoint",
+        cost="a late and confusing failure rather than a refusal",
+        why=(
+            "the offload installer slices expert stacks with no quantisation "
+            "guard, and GGUF has no load-time half at all -- its parameters "
+            "only materialise in the postprocess. The fail-fast guard is task "
+            "#268."
+        ),
         level=BLOCKED,
         evidence="#123 finding; expert_offload.py has no GGUF/MoeWNA16 path",
         tags=("gguf", "moe-offload"),
@@ -215,6 +307,12 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "non-null --disaggregation-mode. The two re-interpret KV slot "
             "identity differently"
         ),
+        gain="parked sessions and a separate prefill arm at the same time",
+        cost="refused at argument parse",
+        why=(
+            "the two assign KV slot identity differently: a slot a spilled "
+            "session expects to reclaim means something else to a handover."
+        ),
         level=BLOCKED,
         evidence="server_args.py:4992, hard reject at arg parse",
         tags=("spill", "pd"),
@@ -226,6 +324,12 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         verdict=(
             "BLOCKED by the engine: spill S1 supports single-node pure "
             "TP/DCP only"
+        ),
+        gain="session spill on a pipeline- or data-parallel server",
+        cost="refused at argument parse",
+        why=(
+            "spill addresses one node's pure TP/DCP pool. There is no owner "
+            "rule for a slot whose tokens live on another stage."
         ),
         level=BLOCKED,
         evidence="server_args.py:5015, hard reject at arg parse",
@@ -242,6 +346,14 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "parse. Every PP number on this rig is therefore a no-spec "
             "number and must not be put next to a NEXTN one"
         ),
+        gain="speculative decoding across pipeline stages",
+        cost="the boot dies at argument parse",
+        why=(
+            "pp_size > 1 asserts that no speculative algorithm is set -- a hard "
+            "assert, not a quiet auto-disable. Every pipeline figure is "
+            "therefore a no-spec figure and must not be compared with a NEXTN "
+            "one."
+        ),
         level=BLOCKED,
         evidence="server_args.py:11214",
         tags=("pipeline-parallel", "speculation"),
@@ -254,6 +366,13 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "abandoned: no purchase in the loader (the postprocess rewrites "
             "the tensors), and the process boundary loses its purpose once "
             "weights are shared"
+        ),
+        gain="one copy of the weights serving both PD processes",
+        cost="no saving in practice, and the design loses its point",
+        why=(
+            "the postprocess rewrites the tensors after import, so the shared "
+            "pages stop being shared; and once the weights are shared the "
+            "process boundary is no longer buying isolation."
         ),
         level=BLOCKED,
         evidence="DESIGN_107, the fork in the road",
@@ -268,6 +387,13 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "non-overlappable and the single overlappable pair is 1.2 %, "
             "below the detection floor"
         ),
+        gain="collective time hidden behind compute",
+        cost="the build cost, for nothing measurable",
+        why=(
+            "15.8-23.6 % of the budget is structurally non-overlappable, and "
+            "the one pair that could overlap is 1.2 % -- below the detection "
+            "floor of the measurement that would have to prove it."
+        ),
         level=BLOCKED,
         evidence="feat/intrarig-collective-overlap (documentation branch)",
         tags=("collective-overlap",),
@@ -280,6 +406,13 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "performance-neutral: collectives that look expensive under eager "
             "are not the bottleneck inside a graph (a ~15 % phantom win, "
             "caught before shipping)"
+        ),
+        gain="about 15 %, when measured under eager execution",
+        cost="nothing at all under CUDA graphs",
+        why=(
+            "collectives that look expensive in eager mode are not the "
+            "bottleneck inside a captured graph. The win was an artefact of the "
+            "eager harness and was caught before it shipped."
         ),
         level=BLOCKED,
         evidence="full-perf-testing rule, extension 2026-07-20",
@@ -294,6 +427,13 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "lockstep; there is no concurrency to expose. "
             "SGLANG_HTCCL_UCX_RING_BIDIR stays 0"
         ),
+        gain="both directions of the ring in flight at once",
+        cost="+17 % time at 80 KiB -- a regression",
+        why=(
+            "a ring step is two requests in lockstep, so there is no "
+            "concurrency to expose; the second worker only adds "
+            "synchronisation."
+        ),
         level=BLOCKED,
         evidence="#266 A/B 2026-07-28, d6d4231e5a",
         tags=("htccl-ring-bidir",),
@@ -306,6 +446,13 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "not built before somebody with full lanes shows a need; only "
             "the CHOICE of line per message class is released (#240)"
         ),
+        gain="one transfer striped across both lines",
+        cost="unbuilt complexity",
+        why=(
+            "nobody with full lanes has shown a need. The part that does pay -- "
+            "choosing which line carries which message class -- is released "
+            "separately (#240)."
+        ),
         level=BLOCKED,
         evidence="task #240 pre-check",
         tags=("path-bundling",),
@@ -317,6 +464,13 @@ REGISTER: Tuple[RejectedEntry, ...] = (
         verdict=(
             "dropped: the benefit does not justify the work, and it collides "
             "logically with HiCache's quantise-exactly-once invariant"
+        ),
+        gain="a smaller Mamba state pool",
+        cost="the work, and a cache invariant",
+        why=(
+            "the saving is small, and it collides with quantise-exactly-once: a "
+            "state quantised on its way into the hierarchical cache would be "
+            "quantised twice."
         ),
         level=BLOCKED,
         evidence="task #193",
@@ -331,6 +485,13 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "most 0.14 % of prefill wall (~10x under the noise floor); the "
             "decode GDN path lies entirely in kernels without the decorator"
         ),
+        gain="autotuned GDN kernels",
+        cost="nothing -- the ceiling itself is zero",
+        why=(
+            "the measured ceiling is 0.00 % of decode and at most 0.14 % of "
+            "prefill, ten times under the noise floor, because the decode GDN "
+            "path lies entirely in kernels that carry no autotune decorator."
+        ),
         level=BLOCKED,
         evidence="INTEGRATION_R3_VALIDATION.md, #200 section (5b42c4d859)",
         tags=("gdn-autotune",),
@@ -343,6 +504,13 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "abandoned: c10d-UCC is not compiled into torch 2.11 and would "
             "need USE_UCC source builds on both hosts, for code hygiene at "
             "best. The floor is not in the transport"
+        ),
+        gain="UCC in place of the ucx layer",
+        cost="source builds of torch on both hosts",
+        why=(
+            "c10d-UCC is not compiled into torch 2.11, so this is a build "
+            "project for code hygiene -- and the floor is not in the transport "
+            "to begin with."
         ),
         level=BLOCKED,
         evidence="#247 check + #266 finding",
@@ -357,6 +525,15 @@ REGISTER: Tuple[RejectedEntry, ...] = (
             "all_reduce at world 4. Without GDR on GeForce, host staging is "
             "the wall (~86 % of the cost). The one untested lever left is a "
             "dedicated progress thread pinned to a core"
+        ),
+        gain="more cards in one tensor-parallel group, across two machines",
+        cost="about 89 us decode and 202 us verify per all_reduce at world 4",
+        why=(
+            "without GDR on GeForce cards every collective stages through host "
+            "memory, which is around 86 % of the cost. It works and it is "
+            "available; a third round of optimisation is what has been ruled "
+            "out. The one untested lever left is a dedicated progress thread "
+            "pinned to a core."
         ),
         level=NOT_DEFAULT,
         evidence="the #244 + #263 + #266 chain",
