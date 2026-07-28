@@ -5018,3 +5018,15 @@ not fit the 2080 Ti (GDN prefill scratch); flashinfer prefill needs 65616 B shar
 mem at head_dim 256 vs Turing's 65536 (triton carries it);
 --disaggregation-decode-enable-radix-cache is a hard error for Mamba models; docker
 --gpus device=N counts NVML order, not CUDA order.
+
+## #123-AWQ addendum — boot proof landed (27b44d4d6e, merged)
+
+Qwen3.6-35B-A3B-AWQ-4bit, 23.25 GiB of weights, booted on a 20.00 GiB RTX 3080
+(UUID-pinned, card-0 lock, quiet flag honored; parallel to the t255-ab run on the
+5090 under protocol v2 — first real two-agents-two-cards window). Load 2 min 36 s,
+40 layers at 64/256 residents + 16 scratch, offload released 11.92 GiB of weight
+VRAM (13.01 GiB to the pinned host pool), steady state 14540/20480 MiB against a
+counterfactual 26.12 GiB. awq_marlin confirmed on-path. Greedy generation 656 tokens,
+coherent, self-terminating; py-spy before kill idle in event_loop_overlap; card back
+to 0 MiB, lock released. Runbook 4.6 carries the recipe incl. the UUID-vs-index
+pinning rationale (CUDA_DEVICE_ORDER=FASTEST_FIRST mismatches nvidia-smi order).
