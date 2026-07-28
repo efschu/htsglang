@@ -3790,6 +3790,56 @@ class ServerArgs:
     ] = 1
 
     # -------------------------------------------------------------------------
+    # Multi-group runtime (#121/#274): in-process lanes over shared bytes
+    # -------------------------------------------------------------------------
+    dual_group_lane: A[
+        bool,
+        Arg(
+            help="Multi-group runtime (#274) slice B: build ONE in-process "
+            "PD lane on the serving rank that shares the plan's first "
+            "segment (rank 0). The lane is a full-width (weight-TP=1) "
+            "second runner over the SAME weight bytes: the resident shard "
+            "is shared by data_ptr identity, only the complement (what the "
+            "other cards hold) is additionally loaded, and the lane group's "
+            "collectives are local tensor ops (no communicator, no NCCL "
+            "threshold, no MPS). Requires an explicit --rank-tp-ratio whose "
+            "split NESTS for this model (checked at boot with the full "
+            "report; a ratio that divides every sharded unit count exactly "
+            "always nests) and --dual-group-lane-budget-mib. Single-node "
+            "pure TP only.",
+        ),
+    ] = False
+    dual_group_lane_budget_mib: A[
+        Optional[int],
+        Arg(
+            help="Rank-local pool budget (MiB) of the dual-group lane: KV + "
+            "mamba/GDN state + workspace of the lane runner on the shared "
+            "card. This is the ENTIRE lane pool item -- no utilization "
+            "ceiling or safety factor is applied on top; headroom for "
+            "activations and graph capture is the operator's "
+            "responsibility. Mandatory with --dual-group-lane.",
+        ),
+    ] = None
+    dual_group_lane_max_requests: A[
+        int,
+        Arg(
+            help="Concurrent requests of the dual-group lane (its own "
+            "max_running_requests; also sizes the lane's mamba/GDN state "
+            "slots). The lane is a PD prefill lane -- 1 (default) is the "
+            "intended operating point for slice B.",
+        ),
+    ] = 1
+    dual_group_lane_eager: A[
+        bool,
+        Arg(
+            help="Bring-up escape hatch: skip CUDA-graph capture for the "
+            "dual-group lane and run it eager. Eager is a debugging state, "
+            "not an end state (the lane's graphs are rank-local and cheap: "
+            "no collectives in the graph).",
+        ),
+    ] = False
+
+    # -------------------------------------------------------------------------
     # Encode prefill disaggregation
     # -------------------------------------------------------------------------
     encoder_only: A[
@@ -6566,6 +6616,37 @@ class ServerArgs:
                 "--rank-gpu-id requires --rank-gpu-memory-mib to be set "
                 "(or --rank-tp-ratio auto to derive the budgets from NVML)."
             )
+        # Multi-group runtime (#274): fail fast, before any rank boots.
+        if self.dual_group_lane:
+            if not isinstance(self.rank_tp_ratio, list):
+                raise ValueError(
+                    "--dual-group-lane requires an EXPLICIT --rank-tp-ratio "
+                    "integer list (the lane shares the plan's rank-0 "
+                    "segment; without a plan there is nothing to nest). "
+                    "'auto' is not accepted here: the lane's nesting check "
+                    "needs the vector the operator actually intends."
+                )
+            if not self.dual_group_lane_budget_mib:
+                raise ValueError(
+                    "--dual-group-lane requires --dual-group-lane-budget-mib "
+                    "(the lane's rank-local pool budget; there is no "
+                    "fallback to --mem-fraction-static)."
+                )
+            if self.pp_size > 1 or self.enable_dp_attention:
+                raise ValueError(
+                    "--dual-group-lane supports single-node pure tensor "
+                    "parallelism only (no PP, no DP attention)."
+                )
+            if self.dual_group_lane_max_requests < 1:
+                raise ValueError(
+                    "--dual-group-lane-max-requests must be >= 1."
+                )
+        elif self.dual_group_lane_budget_mib is not None:
+            raise ValueError(
+                "--dual-group-lane-budget-mib only applies with "
+                "--dual-group-lane."
+            )
+
         # ---------------------------------------------------------------
         # PLAN-ONLY validation (no device placement required).
         #

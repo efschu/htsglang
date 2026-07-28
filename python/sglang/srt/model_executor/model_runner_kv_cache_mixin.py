@@ -3206,10 +3206,14 @@ class ModelRunnerKVCacheMixin:
                     dtype=self.kv_cache_dtype,
                     head_num=_hybrid_kv_head_num,
                     head_dim=self.model_config.head_dim,
-                    # if draft worker, we only need 1 attention layer's kv pool
+                    # if draft worker, we only need 1 attention layer's kv pool.
+                    # A dual-group lane runner is constructed as a draft worker
+                    # (secondary-runner gates) but runs the FULL model: it
+                    # needs every full-attention layer's kv pool.
                     full_attention_layer_ids=(
                         [0]
                         if self.is_draft_worker
+                        and not getattr(self, "is_dual_group_lane", False)
                         else [
                             i
                             for i in config.full_attention_layer_ids
@@ -3676,6 +3680,16 @@ class ModelRunnerKVCacheMixin:
                     f"{token_capacity}. Use the profiled value instead."
                 )
             token_capacity = min(token_capacity, user_limit)
+
+        # Multi-group runtime (#274): a dual-group lane runner sizes RANK-LOCAL
+        # by contract. Its scoped server_args view makes both sync predicates
+        # below false already; this guard makes the contract independent of
+        # that view (a ReduceOp.MIN here would hang the serving group, the
+        # slice-A finding this gate exists for).
+        if getattr(self, "is_dual_group_lane", False):
+            return self._apply_hybrid_kv_token_cap(
+                token_capacity, hybrid_cap, hybrid_cap_kind
+            )
 
         # WEIGHTED uneven-DCP: decouple the reported CONTEXT budget from each
         # rank's non-uniform physical pool. token_capacity arrives as P_r =
@@ -4504,8 +4518,49 @@ class ModelRunnerKVCacheMixin:
         config.mem_fraction_static = self.server_args.mem_fraction_static
         return config
 
+    def _resolve_dual_group_lane_pool_config(self: ModelRunner) -> MemoryPoolConfig:
+        """Multi-group runtime (#274): rank-local pool sizing from the lane's
+        explicit MiB budget.
+
+        No profiling (the budget is given), no cross-rank sync (the lane is
+        rank-local; `_apply_token_constraints` short-circuits on the lane
+        flag), no barrier (`_profile_available_bytes` is never called). The
+        configurator itself is reused unchanged, so the hybrid GDN pools,
+        page alignment and request clamps stay the stock derivations -- just
+        against the lane's scoped server_args view (its own
+        max_running_requests / max_mamba_cache_size).
+        """
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        budget_mib = self.server_args.dual_group_lane_budget_mib
+        if not budget_mib or budget_mib <= 0:
+            raise ValueError(
+                "dual-group lane runner needs --dual-group-lane-budget-mib > 0."
+            )
+        budget_bytes = int(budget_mib) << 20
+        config = self._config_from_budget(budget_bytes)
+        config.max_running_requests = self._resolve_max_num_reqs(
+            config.max_total_num_tokens
+        )
+        configurator = create_memory_pool_configurator(self)
+        config = configurator.finalize_with_max_running_requests(config)
+        config.mem_fraction_static = self.server_args.mem_fraction_static
+        logger.info(
+            "dual-group lane %d pool sizing (rank-local): budget %d MiB -> "
+            "max_total_num_tokens=%d, max_running_requests=%d.",
+            self.dual_group_lane_id,
+            budget_mib,
+            config.max_total_num_tokens,
+            config.max_running_requests,
+        )
+        return config
+
     def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
-        if not self.spec_algorithm.is_none() and self.is_draft_worker:
+        if getattr(self, "is_dual_group_lane", False):
+            self.memory_pool_config = self._resolve_dual_group_lane_pool_config()
+        elif not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert (
                 self.memory_pool_config is not None
             ), "Draft worker requires memory_pool_config"

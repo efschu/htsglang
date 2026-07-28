@@ -336,6 +336,9 @@ class Scheduler(
         self.kv_session_offload = None
         # colocated-congruent PD lane (#107): None on every default path.
         self.congruent_prefill_lane = None
+        # Multi-group runtime (#274): in-process lanes over shared bytes.
+        # Empty on every default path and on every non-shared rank.
+        self.dual_group_lanes = []
         self._kv_arrival_ct = 0
         self.init_soft_watchdog(server_args)
 
@@ -592,6 +595,19 @@ class Scheduler(
             self.congruent_prefill_lane.bind_model(
                 self.tp_worker.model_runner.model
             )
+
+        # Multi-group runtime (#274) slice B: build the configured in-process
+        # lanes (one PD lane on the shared rank). AFTER the serving group's
+        # own init so the rank-local bring-up (complement load, lane pools,
+        # rank-local graph capture) cannot interleave with any group
+        # collective; the other ranks are already event-loop-ready and only
+        # wait longer for the first broadcast.
+        if getattr(self.server_args, "dual_group_lane", False):
+            from sglang.srt.model_executor.dual_group_lane import (
+                build_dual_group_lanes,
+            )
+
+            self.dual_group_lanes = build_dual_group_lanes(self)
 
         # kv-session-offload (S1): FCFS host-spill of the youngest session
         # under KV pressure. Must init before the batch-result processor
@@ -1714,6 +1730,13 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            # Multi-group runtime (#274): one lane tick per loop iteration,
+            # BEFORE the serving batch (PD priority: in a conflict the lane
+            # wins, the serving group is the work-conserving scavenger).
+            # Rank-local, no collectives -- the other ranks simply see this
+            # rank join the next collective later.
+            self._dual_group_lane_tick()
+
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
@@ -1764,6 +1787,11 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            # Multi-group runtime (#274): serial lane tick, PD priority
+            # (see event_loop_normal). Runs on the default stream before the
+            # overlap machinery touches forward_stream this iteration.
+            self._dual_group_lane_tick()
 
             self._apply_war_barrier()
 
@@ -4409,6 +4437,24 @@ class Scheduler(
             scrubbed / (1 << 30),
         )
 
+    def _dual_group_lane_tick(self) -> None:
+        """Multi-group runtime (#274): run one serial tick of every lane that
+        has work.  Rank-local by contract (lanes have no communicator); a
+        no-op on every default path and on every rank without lanes."""
+        if not self.dual_group_lanes:
+            return
+        for lane in self.dual_group_lanes:
+            if lane.has_work:
+                try:
+                    lane.tick()
+                except Exception:
+                    logger.exception(
+                        "dual-group lane %d tick failed; dropping the active "
+                        "job.",
+                        lane.lane_id,
+                    )
+                    lane.active = None
+
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(vars(get_server_args()))  # vars returns a ref to obj.__dict__
         ret["last_gen_throughput"] = self.metrics_reporter.last_gen_throughput
@@ -4439,6 +4485,11 @@ class Scheduler(
             if info_record is not None:
                 ret["dspark_info_record"] = info_record
 
+        # Multi-group runtime (#274): lane state + timings (rank 0 carries
+        # the lanes; other ranks report an empty list).
+        if self.dual_group_lanes:
+            ret["dual_group_lanes"] = [lane.stats() for lane in self.dual_group_lanes]
+
         # This field is not serializable.
         ret.pop("model_config", None)
 
@@ -4453,6 +4504,11 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                # Multi-group runtime (#274): enqueue a lane generation job
+                # ({"lane_id": 0, "input_ids": [...], "max_new_tokens": N,
+                # "repeat": K}). A command, not a server arg; ranks without
+                # the addressed lane treat it as a no-op success.
+                "dual_group_lane_prefill",
             ]
         )
 
@@ -4518,6 +4574,25 @@ class Scheduler(
                 )
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()
+            # Multi-group runtime (#274): lane job -- a command, not a server
+            # arg. Only the rank carrying the addressed lane enqueues; every
+            # other rank no-ops successfully (the control message is
+            # broadcast to all TP schedulers).
+            lane_job = remaining.pop("dual_group_lane_prefill", None)
+            if lane_job:
+                lane_id = int(lane_job.get("lane_id", 0))
+                for lane in self.dual_group_lanes:
+                    if lane.lane_id == lane_id:
+                        for _ in range(int(lane_job.get("repeat", 1))):
+                            lane.enqueue(lane_job)
+                        logger.info(
+                            "dual-group lane %d: %d job(s) enqueued "
+                            "(input_len=%d, max_new_tokens=%s).",
+                            lane_id,
+                            int(lane_job.get("repeat", 1)),
+                            len(lane_job.get("input_ids") or []),
+                            lane_job.get("max_new_tokens"),
+                        )
             if remaining:
                 get_server_args().override(source="update_server_args", **remaining)
             logger.info(f"Global server args updated! {get_server_args()=}")
