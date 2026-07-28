@@ -78,7 +78,8 @@ Three effects stack on it and only on it:
 * it is one of the two shared cards, so it also pays the extra process post.
 
 The x8-3080 carries two lanes as well but a smaller share of each. The
-briefing's assumption ("engste Karte ist mutmasslich 3080a") does not hold.
+briefing's assumption -- that the tightest card would be the x8-3080 --
+does not hold.
 
 ### 1.4 Which dimension has to be scaled — and by how much
 
@@ -107,6 +108,11 @@ puts both groups in **one** process, that post disappears and every cell
 gains 3072 MiB — `(1,8)`, `(2,8)` and `(4,4)` would then close too. Which of
 the two it is, is a property of the runtime and not something this model can
 decide; both readings are stated rather than one being assumed.
+
+Since it is a property of the runtime and not of the plan, it is now a
+**parameter** rather than this footnote: `coexistence(..., shared_process=True)`
+and `aggregate(..., shared_process=True)`. On candidate A it lifts the joint
+KV from 240361 to 332883 tokens and the 5090's headroom from 777 to 2313 MiB.
 
 ---
 
@@ -211,7 +217,7 @@ wiedervorlage candidate rather than a dead end.
 
 ## 4. Caveats — what the profile does not support
 
-### 4.1 The aggregate KV figure of `aggregate()` is wrong here
+### 4.1 The aggregate KV figure of `aggregate()` was wrong here — now fixed
 
 `estimate_instance` sizes each lane's capacity **as if that lane were alone
 on its cards**, and `aggregate()` then sums those. For lanes that share
@@ -223,12 +229,18 @@ lane against its #260 co-residence budget share:
 | A | 1 143 619 | **240 361** | **4.76x** |
 | C | 1 143 619 | **342 942** | **3.33x** |
 
-The bracket itself is right (it never used the capacity figure); it is the
-KV **cell** of the aggregate that is unsafe for overlapping instance sets.
-Follow-up for the module: `aggregate()` should either size co-resident lanes
-against the shared residual or mark the KV cell `absent` when instance
-footprints intersect. Until then, read the per-lane KV of a dual group from
-the corrected computation, not from the aggregate cell.
+The bracket itself was right (it never used the capacity figure); it was the
+KV **cell** of the aggregate that was unsafe for overlapping instance sets.
+
+**Fixed** (`fix/solver-aggregate-coresident`): when any card carries more
+than one lane, `aggregate()` now re-sizes every lane against its
+co-residence share via `coresident_budgets()` — the same #260 mapping used
+by hand above — and the KV cell says so, naming the over-count it removed.
+Where the mapping cannot be built (an overflowing card, a lane with no local
+footprint) or where a lane's share leaves it unable to fund a KV pool at all,
+the cell is `absent` with the reason rather than a number. Disjoint lanes are
+untouched and still simply sum. The two candidates of this document are the
+regression test; the module now reproduces 240361 and 342942 exactly.
 
 ### 4.2 Interference between the lanes is named, not estimated
 

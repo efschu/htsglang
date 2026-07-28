@@ -1789,14 +1789,19 @@ curl -s -X POST $UI/api/key_solver -d "{... , \"goal\": \"enc\",
 
 # Several coexisting instances: the additive answer and the bracket that
 # decides whether it counts. share_group = rank reuse (shared weight bytes
-# counted once); omit it to price naive duplication.
+# counted once); omit it to price naive duplication. shared_process=true is
+# the one-engine-process reading (no second CUDA context/graph pool per
+# shared card) -- a property of the runtime, so it is asked, not assumed.
+# THROUGHPUT is summed; KV is NOT: lanes that share a card are re-sized
+# against their co-residence share first, or the cell comes back absent.
 curl -s -X POST $UI/api/key_solver/aggregate -d '{
   "gpu_total_mib": {"0": 32607, "1": 20480, "2": 20480},
   "instances": [
     {"key":"main","model_path":"...","tp_size":3,"rank_gpu_id":[0,1,2],
      "rank_gpu_memory_mib":[29607,17780,17780],"share_group":"dual"},
     {"key":"lane","model_path":"...","tp_size":1,"rank_gpu_id":[0],
-     "rank_gpu_memory_mib":[26737],"share_group":"dual"}]}'
+     "rank_gpu_memory_mib":[26737],"share_group":"dual"}],
+  "shared_process": false}'
 
 # Predicted vs measured, per regression anchor. This is the honest one: it
 # prints the model's OWN error against the arms it was built from.
