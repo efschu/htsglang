@@ -485,6 +485,60 @@ class TestSpeedDial(unittest.TestCase):
             resolve_speed_dial(self._args(1.5))
 
 
+class TestLaneSpecBudget(unittest.TestCase):
+    """Speculation on the lane: ONE budget, split -- not two that share a name.
+
+    Both lane runners read --dual-group-lane-budget-mib, so without an
+    explicit split the NEXTN head claims a second full budget and the lane's
+    capacity post silently doubles. That is the exact failure resource
+    principle 2 forbids ("no VRAM duplicated that does not have to be, and
+    never as a side effect").
+    """
+
+    def _args(self, budget=1600):
+        class _A:
+            dual_group_lane_budget_mib = budget
+
+        return _A()
+
+    def _cfg(self, layers):
+        class _C:
+            num_hidden_layers = layers
+
+        return _C()
+
+    def test_the_split_conserves_the_operators_budget(self):
+        from sglang.srt.model_executor.dual_group_lane import split_lane_budget
+
+        target, draft = split_lane_budget(
+            self._args(1600), self._cfg(64), self._cfg(1)
+        )
+        self.assertEqual(target + draft, 1600)
+
+    def test_the_head_gets_its_layer_share_not_a_second_budget(self):
+        from sglang.srt.model_executor.dual_group_lane import split_lane_budget
+
+        _, draft = split_lane_budget(self._args(1600), self._cfg(64), self._cfg(1))
+        # One layer of 64 -> 25 MiB by ratio, lifted to the 64 MiB floor.
+        self.assertEqual(draft, 64)
+
+    def test_a_floor_keeps_the_head_pool_viable(self):
+        from sglang.srt.model_executor.dual_group_lane import split_lane_budget
+
+        _, draft = split_lane_budget(self._args(1600), self._cfg(4096), self._cfg(1))
+        self.assertGreaterEqual(draft, 64)
+
+    def test_the_head_can_never_take_more_than_a_quarter(self):
+        from sglang.srt.model_executor.dual_group_lane import split_lane_budget
+
+        # A pathological ratio (half the layers) must not starve the target.
+        target, draft = split_lane_budget(
+            self._args(1600), self._cfg(2), self._cfg(1)
+        )
+        self.assertLessEqual(draft, 400)
+        self.assertGreater(target, draft)
+
+
 class TestLaneLending(unittest.TestCase):
     """Elastic occupancy stage 2: threshold, hysteresis, reclaim."""
 

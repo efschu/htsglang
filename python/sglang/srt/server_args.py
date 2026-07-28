@@ -3881,6 +3881,32 @@ class ServerArgs:
             "(hysteresis, so occupancy does not flap between jobs).",
         ),
     ] = 5.0
+    dual_group_lane_spec: A[
+        bool,
+        Arg(
+            help="Speculation ON THE LANE (#274): assemble the NEXTN head for "
+            "the lane the same way its target model is assembled -- complement "
+            "shards under the lane's own partition vectors, a full-width hull, "
+            "shells that replace the head's collectives with local ops -- and "
+            "share the lane target's full-vocabulary embed/lm_head shells "
+            "instead of building a second set. This is NOT the same as "
+            "--speculative-draft-placement solo: that path builds the same "
+            "SHAPE but assembles its tables with a GROUP COLLECTIVE, which the "
+            "lane's rank-local bring-up must never enter (and which refuses "
+            "GGUF packed vocab outright). Requires --dual-group-lane and a "
+            "serving group that itself runs NEXTN/EAGLE with topk 1.",
+        ),
+    ] = False
+    dual_group_lane_spec_steps: A[
+        int,
+        Arg(
+            help="Chain length of the lane's speculation (topk 1, no tree): "
+            "how many tokens the lane's NEXTN head proposes before one verify "
+            "forward of the lane target. Tree speculation is deliberately not "
+            "offered -- topk > 1 is already a measured loss on this class of "
+            "rig.",
+        ),
+    ] = 3
     dual_group_lane_speed_dial: A[
         Optional[float],
         Arg(
@@ -6700,6 +6726,30 @@ class ServerArgs:
                 raise ValueError(
                     "--dual-group-lane-max-requests must be >= 1."
                 )
+            if self.dual_group_lane_spec:
+                if self.speculative_algorithm is None:
+                    raise ValueError(
+                        "--dual-group-lane-spec needs the serving group to "
+                        "run speculation too: the lane's NEXTN head is "
+                        "assembled from the serving group's head shards "
+                        "(its rank-0 shard is shared, the rest is loaded as "
+                        "the complement). Without a speculative serving "
+                        "group there are no shards to nest into."
+                    )
+                if self.speculative_eagle_topk not in (None, 1):
+                    raise ValueError(
+                        "--dual-group-lane-spec supports topk 1 only (chain "
+                        "speculation). Tree speculation is a measured loss "
+                        "on this class of rig and is not offered on the lane."
+                    )
+                if self.dual_group_lane_spec_steps < 1:
+                    raise ValueError(
+                        "--dual-group-lane-spec-steps must be >= 1."
+                    )
+        elif self.dual_group_lane_spec:
+            raise ValueError(
+                "--dual-group-lane-spec only applies with --dual-group-lane."
+            )
         elif self.dual_group_lane_budget_mib is not None:
             raise ValueError(
                 "--dual-group-lane-budget-mib only applies with "

@@ -439,9 +439,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         draft_model_idx: Optional[int] = None,
         is_dual_group_lane: bool = False,
+        is_dual_group_lane_draft: bool = False,
         dual_group_host_runner: Optional["ModelRunner"] = None,
         dual_group_plan: Optional[Any] = None,
         dual_group_lane_id: int = 0,
+        dual_group_lane_target_model: Optional[Any] = None,
     ):
         # Multi-group runtime (#274): this runner is an in-process LANE over
         # the host runner's weight bytes (dual_group_lane.py). Rank-local by
@@ -452,6 +454,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # process-global installs) applies; lane-specific deviations are
         # gated on is_dual_group_lane.
         self.is_dual_group_lane = is_dual_group_lane
+        # The lane's NEXTN head runner (#274 slice C): same lane, same plan,
+        # different model -- it shares the lane target's vocab shells.
+        self.is_dual_group_lane_draft = is_dual_group_lane_draft
+        self.dual_group_lane_target_model = dual_group_lane_target_model
         self.dual_group_host_runner = dual_group_host_runner
         self.dual_group_plan = dual_group_plan
         self.dual_group_lane_id = dual_group_lane_id
@@ -1998,11 +2004,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     # stock loader under the lane's own scoped geometry, a
                     # full-width hull, and shells that replace the lane
                     # group's collectives with local ops. Rank-local.
+                    #
+                    # The NEXTN head takes the SAME treatment: it is one more
+                    # decoder layer in the serving group's geometry, so the
+                    # assembly is the assembly -- only the vocab is special
+                    # (it points at the lane target's shells).
                     from sglang.srt.model_executor.dual_group_lane import (
+                        build_lane_draft_model,
                         build_lane_model,
                     )
 
-                    self.model = build_lane_model(self)
+                    if self.is_dual_group_lane_draft:
+                        self.model = build_lane_draft_model(self)
+                    else:
+                        self.model = build_lane_model(self)
                 elif self.is_weightless_worker or self.is_draft_solo_shadow:
                     # B2a / draft-solo shadow: meta-model, NO weight load.
                     self.model = self._build_weightless_worker_meta_model()
