@@ -3373,6 +3373,112 @@ class TestCardProbeEndpoint(CustomTestCase):
 
 
 # ===========================================================================
+# Task #232: the tipping point, one measured split candidate per click.
+#
+# What is pinned here is that the endpoint returns a JOB and never the
+# measurement, that the table and the poll come from the same answer, and
+# that an unmeasured candidate is a row with a button rather than a number.
+# ===========================================================================
+
+
+class TestSplitProbeEndpoint(CustomTestCase):
+    def _isolated(self):
+        """A fresh job store, so a test never boots a server."""
+        from sglang.srt.planner import split_probe as sp
+
+        store = sp.SplitProbeJobStore()
+        store.synchronous = True
+        store.runner = lambda req: sp.SplitProbeResult(
+            candidate=req.get("candidate", "auto"),
+            prefill_tok_s=1151.1,
+            decode_tok_s=92.55,
+            ms_per_verify=33.0,
+            max_total_num_tokens=502528,
+            timestamp=1.0,
+        )
+        return sp, store
+
+    def _with_store(self, sp, store, fn):
+        real = sp.JOBS
+        sp.JOBS = store
+        try:
+            return fn()
+        finally:
+            sp.JOBS = real
+
+    def test_a_start_without_a_model_is_refused_with_a_remedy(self):
+        d = webui.split_probe_start_payload({})
+        self.assertFalse(d["ok"])
+        self.assertIn("model_path", d["error"])
+        self.assertTrue(d["remedy"])
+
+    def test_start_returns_a_job_not_a_measurement(self):
+        sp, store = self._isolated()
+        d = self._with_store(
+            sp,
+            store,
+            lambda: webui.split_probe_start_payload(
+                {"model_path": "/m", "mlp_vector": "6,1,1"}
+            ),
+        )
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["job"]["candidate"], "6,1,1")
+        self.assertNotIn("prefill_tok_s", d)
+
+    def test_status_carries_the_table_so_the_poll_and_the_render_agree(self):
+        sp, store = self._isolated()
+        d = self._with_store(sp, store, lambda: webui.split_probe_status_payload({}))
+        self.assertTrue(d["ok"])
+        self.assertIn("table", d)
+        keys = {r["candidate"] for r in d["table"]["rows"]}
+        self.assertTrue(set(sp.LADDER).issubset(keys))
+
+    def test_an_unmeasured_candidate_is_a_row_with_a_reason_not_a_number(self):
+        from sglang.srt.planner import split_probe as sp
+
+        with tempfile.TemporaryDirectory() as d:
+            table = sp.tipping_point_table(os.path.join(d, "empty.jsonl"))
+        for row in table["rows"]:
+            self.assertFalse(row["measured"])
+            self.assertNotIn("prefill_tok_s", row)
+            self.assertIn("not measured", row["missing_reason"])
+
+    def test_unknown_job_id_is_an_error_not_an_empty_job(self):
+        sp, store = self._isolated()
+        d = self._with_store(
+            sp, store, lambda: webui.split_probe_status_payload({"job_id": "nope"})
+        )
+        self.assertFalse(d["ok"])
+        self.assertIn("nope", d["error"])
+
+    def test_status_path_is_dispatched_before_the_start_path(self):
+        with open(webui.__file__) as f:
+            text = f.read()
+        i_status = text.index('startswith("/api/split_probe/status")')
+        i_start = text.index('startswith("/api/split_probe"):', i_status)
+        self.assertLess(i_status, i_start)
+
+    def test_the_page_renders_the_table_and_stops_its_own_poll(self):
+        html = webui.INDEX_HTML
+        self.assertIn("function renderTipping(", html)
+        self.assertIn("/api/split_probe/status", html)
+        self.assertIn('id="bn_tipping"', html)
+        self.assertIn("not measured", html)
+        i = html.index("function splitProbePollStart(")
+        seg = html[i : i + 900]
+        self.assertIn("clearInterval(window._splitProbeTimer)", seg)
+
+    def test_the_measure_button_says_what_it_costs(self):
+        from sglang.srt.planner import split_probe as sp
+
+        with tempfile.TemporaryDirectory() as d:
+            table = sp.tipping_point_table(os.path.join(d, "empty.jsonl"))
+        self.assertIn("6-8 minutes", table["cost_note"])
+        # The tooltip is the cost note, so the two cannot drift apart.
+        self.assertIn('title="\'+esc(cost)', webui.INDEX_HTML)
+
+
+# ===========================================================================
 # Task #218: the limiting factors, measured one at a time, and the composed
 # one-click scenario.
 #
