@@ -6128,3 +6128,28 @@ BEFUNDE Lauf 3 (Rohdaten results/gdr_window_20260728T184446Z.*):
    die noetigen Access-Flags; der konzeptgleiche Smoke-target-Fall
    (einfacherer Code) besteht. Fix + Nachmessung nur dieser Reihe steht aus;
    erst danach ist W1 final und die P4-Transport-Entscheidung faellbar.
+
+## GDR-Fensterlauf (#277) — server+gdr-Reihe nachgemessen: W1 FINAL (2026-07-28)
+
+Probe-Bug-Wurzel: NICHT MR-Flags, sondern die Client-SGE-Adresse wurde aus
+dem MODUS abgeleitet (sg.addr = gdr ? 0 : host_pay) statt aus der eigenen
+MR — im gpu_is_server-Arm ist der Client hostseitig, bekam aber addr=0 auf
+einen Host-lkey => WC local protection error. Fix: sg.addr = pay_addr
+(a0c67380c4 auf probe/gdr-window), beweisbar neutral fuer alle schon
+gemessenen Reihen (identische Zweige). 6/6 Sub-Laeufe danach OK.
+
+server+gdr-Reihe (median us, Rohdaten results/gdr_window_serverfix_20260728T185013Z.tsv):
+8B 4,16-4,17 | 4KiB 4,61-4,65 | 64KiB 13,16-13,18 | 1MiB 161,3 (RC) / 165,7 (PIX)
+
+W1-FINALVERDIKT: NEIN, doppelt. (a) BAR-Groesse bewegt NICHTS — rc5090
+(32-GiB-BAR) vs rc3080b (256-MiB-BAR) Deltas <=0,02 us auf jeder Stufe,
+~5x UNTER dem eigenen Wiederholbarkeits-Boden (~0,10-0,13 us); dieselbe
+Kurve. (b) Es gibt in dieser Richtung gar keinen Umschlag zu verschieben:
+GDR schlaegt stage auf JEDER Groesse (8 B: 4,16 vs 5,12; 1 MiB: 161,3 vs
+188,6). => P4-Transport wird NICHT weitergebaut (Gate war "nur falls W1
+Umschlag >64 KiB schiebt").
+
+Echter Richtungs-Befund statt BAR-Effekt: der X570-Switch kostet bei
+posted writes (NIC schreibt in VRAM) nur +2,8 % @1 MiB, bei non-posted
+reads (NIC liest aus VRAM) +53 % — Switch-Pfad ist fuer Empfangen fast
+frei, fuers Senden teuer. RO: Nulleffekt auch in dieser Reihe (<=0,06 us).
