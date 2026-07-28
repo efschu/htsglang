@@ -5569,3 +5569,41 @@ Operativ relevant bleibt hier nur:
   (ein selbstumschlossener Block) — Merge trotzdem kollisionsfrei, Marker 0.
 - Tests: 52 neue hermetisch; planner+rigmon auf gemergtem HEAD 1794/64/0;
   Inline-Seitenskript jetzt syntax-geprueft per Test. Kein GPU-Zugriff.
+
+## #274 Slice B (feat/dual-group-runtime-b, gemergt) — Lane real: Loader, Pools, Graphen, Interferenz
+
+- B1 KOMPLEMENT-LOADER: data_ptr-Gate BESTANDEN — 1058 Identitaeten der
+  geteilten Shards gegen den residenten Verband-Rang-0, bei jedem Boot geprueft
+  (verify_shared_bytes + Negativtest). Posten: Komplement 5780 MiB genestet,
+  Huellen-Residuum 914 MiB, geteilter Shard 0 MiB zusaetzlich.
+- NESTING-GATE ZAHLT SICH AUS: Slice-A-Beispielratio [6,1,1]->[6,2] nestet
+  fuer das ECHTE Vehikel NICHT (4 kv-Koepfe, Min-1-Bump [2,1,1] vs [3,1]);
+  tragende Form: Basis 2,1,1 + --rank-mlp-ratio 6,1,1 --rank-vocab-ratio 6,1,1.
+- B2 LANE-SOLO-KOHAERENZ BESTANDEN: 512er+2048er Prompt kohaerent, Fortsetzung
+  deckungsgleich mit Verband; Output-IDs BYTE-IDENTISCH eager vs Graph.
+- B3 LANE-GRAPHEN: rein rang-lokal (kein Kollektiv im Graph); Decode
+  61,7->16,6 ms/Schritt (3,7x), Prefill 440->283 ms/1k.
+- B-ARM-INTERFERENZ (ein Boot, Boeden zuerst, Graphen+NEXTN): Verband-Boden
+  33,38-33,80 ms/Verify (1,3 %), Lane-Boden 580 ms/2048er-Prefill (0,16 %).
+  Richtung 1 (geschuetzt, PD unter Verband-Last): +0,9 % — PD-PRIORITAET HAELT.
+  Richtung 2 (erlaubt, Verband unter vollem Lane-Duty): ~+50 % Wall
+  (50,6 vs 33,4-33,8 ms/Verify), Accept unveraendert 1,38 => reiner serieller
+  S1-Preis (Tick-Teilung), KEINE Rechenzeit-Degradation. Das ist die Zahl,
+  die Slice C mit echter Nebenlaeufigkeit unterbieten muss.
+- FP8-AUFLAGE EHRLICH: einkartige In-Prozess-Lane traegt 27B-FP8 NICHT
+  (~25 GiB Gewichte + 4,7 GiB Rang-0-Floor + ~3 GiB Lane-Posten > 32,6 GiB);
+  machbare Form ist die ZWEIKARTIGE Lane aus EVAL_272 Kandidat A (x8-3080 =
+  cuda:2) mit echten Lane-Kollektiven — benannte Slice-C-Uebergabe
+  "FP8+kv-fp8-Arm ausstehend" inkl. FP8-Loader-Sichtungstest. Q3-only ist
+  ausdruecklich KEINE vollstaendige Quant-Pfad-Abdeckung.
+- Dateien: dual_group_lane.py (neu), model_runner(+kv_cache_mixin), scheduler,
+  attention_registry, server_args (4 Flags), 8 CPU-Tests, Runbook §4.11
+  (Boot-Rezept Budgets 22800/17780/17780 + Lane 1600, Job-API).
+- Suite distributed/ auf gemergtem HEAD: 506 gruen / 16 rot — die 16 sind
+  VORBESTEHEND verifiziert (uneven_kv_derived_mode-Read existiert identisch
+  auf f8b528dc36 und ee302b862a; Stub-Drift #95-Familie, eigener Fixposten).
+- Slice-C-Uebergaben: set_server_args-Swap je Tick (get_server_args-Reads der
+  Forward-Maschinerie an Runner/Batch ziehen), Prozess-Globals (Graph-Pool,
+  is_capture_mode, _DEQUANT_WS), Draft-Annahmen-Familie (3 gefixt), benannte
+  Zweier-Annahmen (derive_lane_plan Zwei-Segment, shared rank 0, eine Lane —
+  Strukturen N-aer), Verleih-Stufe-2-Logik ungebaut.
