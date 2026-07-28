@@ -497,3 +497,145 @@ Several agents share this box; the cards are usually contended.
 - A `ColdBuildWindowError` in an OLD log ("a peer may still be in nvcc") is
   not evidence of a peer: before #257 that wrapper was attached on TP=1 too.
   Read the chained `__cause__`, which is where the OOM was.
+
+## 8. Driving the dashboard from the host (curl only)
+
+Everything the planner dashboard draws is computed server-side and served on
+an endpoint, so `curl` is a complete client and the browser is one of two
+equal front ends. That is the architecture rule, not a convenience: a figure
+that only the page can produce is a figure the runbook cannot check.
+
+The dashboard listens on `127.0.0.1:8780` by default
+(`python -m sglang.planner --serve`). **A dashboard someone else started is
+theirs** — read from it freely, but start your own on another port
+(`--serve --port 8791`) before you POST anything that measures.
+
+### 8.1 The limiting factors, one at a time
+
+`POST /api/bench_factors` reads every factor's own study and answers with its
+provenance. It measures nothing itself: what it does is read the caches on
+disk plus, when an endpoint is given, one bounded scrape of that server's
+`/metrics`.
+
+```bash
+UI=http://127.0.0.1:8791
+
+# Every factor, with provenance and the action that would (re)measure it.
+curl -s -X POST $UI/api/bench_factors -d '{}' |
+  python3 -c 'import json,sys
+d=json.load(sys.stdin); print(d["summary"])
+for f in d["factors"]:
+    v=f["values"][0]["value"] if f["values"] else f["missing_reason"]
+    print(f["key"].ljust(20), f["provenance"].ljust(9), str(v)[:70])'
+
+# With a running server, so the round times and the per-rank compute/wait
+# split have something to read. The FIRST call only opens the delta window;
+# the round times appear on the second, which the tile says in those words.
+BODY='{"endpoint":"127.0.0.1:30000","bench_model":"Qwen3.6-27B"}'
+curl -s -X POST $UI/api/bench_factors -d "$BODY" > /dev/null
+sleep 5
+curl -s -X POST $UI/api/bench_factors -d "$BODY" | python3 -m json.tool | head -60
+```
+
+The factors and what each one limits:
+
+| key | limits | measured by |
+|---|---|---|
+| `card_rates` | the per-card ceiling every rank figure is read against | the card probe |
+| `pair_link` | the collective floor (narrowest ORDERED direction) | the card probe |
+| `round_time` | ms per verify / decode round, ms per 1k prefill tokens | the engine's forward timer |
+| `rank_balance` | per rank: compute vs collective wait, and the pacing rank | the engine's per-rank forward timer |
+| `power` | the idle floor and active anchor a J/token figure needs | the power calibration |
+| `prefix_cache` | prefill work the host cache tiers removed | the HiCache accumulator |
+| `mlp_split` | what moving MLP mass buys in prefill / costs in decode | the crossover sweep |
+| `concurrency_balance` | the concurrency that carries the most sessions | planner arithmetic (estimate) |
+
+Three provenances and they are not interchangeable: `measured` ran here and
+carries its timestamp, `estimate` is arithmetic over measured inputs, and
+`absent` means the study has not been run — it carries the reason and the
+action and **never** a stand-in number.
+
+The engine-side factors need the device timer, which is off by default:
+
+```bash
+SGLANG_ENABLE_METRICS_DEVICE_TIMER=1 python -m sglang.launch_server \
+  --enable-metrics --enable-metrics-for-all-schedulers ...
+```
+
+Without it `round_time` and `rank_balance` come back absent with exactly that
+instruction, rather than as zeros.
+
+### 8.2 Re-measuring one factor
+
+Each factor carries its own action in `remeasure`, so the sequence is read
+out of the answer rather than memorised:
+
+```bash
+curl -s -X POST $UI/api/bench_factors -d '{}' |
+  python3 -c 'import json,sys
+for f in json.load(sys.stdin)["factors"]:
+    r=f["remeasure"]
+    print(f["key"].ljust(20), r["kind"].ljust(8), r["path"] or r["command"],
+          "" if r["ready"] else "BLOCKED: "+r["blocked_reason"])'
+```
+
+`kind` decides how to run it:
+
+```bash
+# job  -- returns at once, then poll. ~30 s of GPU time on this rig.
+curl -s -X POST $UI/api/card_probe -d '{"node_id":"local"}'
+until [ "$(curl -s $UI/api/card_probe/status |
+           python3 -c 'import json,sys; print((json.load(sys.stdin)["job"] or {}).get("state","idle"))')" \
+        != running ]; do sleep 3; done
+curl -s $UI/api/card_probe/status | python3 -m json.tool | head -20
+
+# call -- short and bounded, answers directly.
+curl -s -X POST $UI/api/measure_power -d '{}' | python3 -m json.tool | head -20
+
+# poll -- nothing to start; read /api/bench_factors again (see 8.1).
+# command -- no endpoint exists; the answer prints the command to run.
+```
+
+Nothing here ever holds an HTTP request open for the length of a
+measurement. A `job` that is already running is joined, not duplicated.
+
+### 8.3 The one-click scenario, from the shell
+
+`POST /api/scenario_suggest` composes the working points, the card-probe
+basis they were ranked on, and the state/KV balance into ONE proposal. It
+computes no new number — it cannot disagree with `/api/lever_profiles` about
+the same configuration — and it starts nothing.
+
+```bash
+BODY='{"model":"'$MODEL_ROOT'/Qwen3.6-27B-AWQ-BF16-INT4",
+       "hardware":{"source":"manual",
+                   "gpus":["RTX 5090:32607","RTX 3080:20480","RTX 3080:20480"]},
+       "tp_size":3,"quant":"compressed-tensors",
+       "prompt_to_output_ratio":32}'
+
+curl -s -X POST $UI/api/scenario_suggest -d "$BODY" |
+  python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print("profile:", d["profile"], "| baseline?", d["is_baseline"])
+print("flags:  ", " ".join(d["flags"]) or "(none: this IS the planned config)")
+for r in d["reasoning"]: print(" [%s] %s" % (r["provenance"], r["statement"]))
+for m in d["expected"]:
+    print("  ", m["label"], m["value"] if m["available"] else "not computed")'
+```
+
+Two properties worth relying on:
+
+- **Conservative by construction.** With no card probe cached, the answer is
+  the balanced working point and the reasoning says why — a directed split is
+  never proposed on nameplate specs. Run the probe (8.2) and ask again to see
+  the recommendation change on evidence rather than on wording.
+- **`prompt_to_output_ratio` is the only workload input that moves it.**
+  At or above 8 it may take the prefill point, at or below 1.5 the decode
+  point, and in between neither is worth the context it spends. Add
+  `"min_context_tokens": N` to make a context requirement binding: a working
+  point that cannot hold the context is not faster, it is unusable.
+
+`"boots_nothing": true` in the answer is literal. Applying it in the browser
+fills the ordinary configuration fields; launching stays the separate,
+explicit act it already was. From the shell, take `flags` and put them on
+your own launch line.

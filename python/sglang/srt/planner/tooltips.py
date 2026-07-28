@@ -125,6 +125,79 @@ TRADEOFFS: Dict[str, Tradeoff] = {
         "until the driver or the card set changes.",
         measured_from="card_probe",
     ),
+    # ---- limiting factors, measured one at a time (#218) -------------------
+    # One entry per tile on the benchmark tab. Each says what measuring THAT
+    # factor on its own buys and what the measurement costs -- not what the
+    # underlying hardware does, which is the tile's own question line. A
+    # factor whose study has not run says so from its reading, not from here.
+    "factor.card_rates": Tradeoff(
+        gain="Replaces the nameplate table with what these cards actually "
+        "reach, which is what every per-rank ceiling is then measured "
+        "against.",
+        cost="About 30 s of GPU time, allocating on each card; a live server "
+        "loses that memory while it runs.",
+        measured_from="card_probe",
+    ),
+    "factor.pair_link": Tradeoff(
+        gain="Names the floor under every collective: the slow direction of "
+        "the slowest pair is what a verify round waits on.",
+        cost="Comes from the same probe run, so it costs nothing extra -- and "
+        "nothing without it.",
+        measured_from="card_probe",
+    ),
+    "factor.round_time": Tradeoff(
+        gain="Says how long a round takes and which phase it was spent in, "
+        "which tok/s cannot.",
+        cost="Only exists while a server is serving, and needs the device "
+        "timer switched on at boot.",
+    ),
+    "factor.rank_balance": Tradeoff(
+        gain="Splits each round into this rank's compute and its wait, so the "
+        "recoverable time is a number rather than a suspicion.",
+        cost="Needs the per-rank forward timer and a device sampler; without "
+        "both the split is absent rather than approximate.",
+    ),
+    "factor.power": Tradeoff(
+        gain="Gives each card a measured idle floor and active anchor, which "
+        "is what makes a J-per-token figure comparable at all.",
+        cost="Short micro-benchmarks per card; a card busy with another "
+        "process is skipped rather than contended.",
+        measured_from="power_profile",
+    ),
+    "factor.prefix_cache": Tradeoff(
+        gain="Counts prefill work that was never done -- the only lever here "
+        "that removes work instead of moving it.",
+        cost="Counts the host and storage tiers only, and prices them only "
+        "once a measured J-per-prefill-token band exists for the model.",
+    ),
+    "factor.mlp_split": Tradeoff(
+        gain="The only measured term for the MOVE between two splits; without "
+        "it the planner ranks splits on arithmetic alone.",
+        cost="A boot per split vector under load -- the longest study on the "
+        "list.",
+        measured_from="mlp_crossover",
+    ),
+    "factor.concurrency_balance": Tradeoff(
+        gain="Names the concurrency at which this rig carries the most "
+        "sessions at a given context, instead of leaving the state-versus-KV "
+        "trade to be guessed.",
+        cost="Arithmetic over estimated capacity, not a measurement, and it "
+        "assumes every session wants the same context.",
+    ),
+    "scenario.suggest": Tradeoff(
+        gain="Composes what has already been measured into one concrete "
+        "proposal: a working point, its flags, and each expected figure with "
+        "the instrument it came from.",
+        cost="Every expected figure is a planner estimate, and where the "
+        "evidence for a directed split is missing the proposal is the "
+        "baseline -- deliberately, not for lack of trying.",
+    ),
+    "scenario.apply": Tradeoff(
+        gain="Writes the proposal into the ordinary configuration fields, the "
+        "same ones the expert view edits.",
+        cost="Nothing is launched: the flags land in the plan and starting a "
+        "server stays a separate, explicit act.",
+    ),
     # ---- view modes -------------------------------------------------------
     "view_mode.simple": Tradeoff(
         gain="Shows each card's VRAM as one number and one budget slider.",
