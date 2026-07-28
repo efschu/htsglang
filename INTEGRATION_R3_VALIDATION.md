@@ -5607,3 +5607,46 @@ Operativ relevant bleibt hier nur:
   is_capture_mode, _DEQUANT_WS), Draft-Annahmen-Familie (3 gefixt), benannte
   Zweier-Annahmen (derive_lane_plan Zwei-Segment, shared rank 0, eine Lane —
   Strukturen N-aer), Verleih-Stufe-2-Logik ungebaut.
+
+## dmabuf-RDMA-Uebernahme-Analyse (docs/eval-gdr-uebernahme, gemergt) — Uebernahme-Fall falsifiziert, Messung bleibt
+
+- Volltext docs/EVAL_gdr_uebernahme.md (682 Zeilen). Drei Kernsaetze der
+  Uebergabe tragen AM EIGENEN STACK nicht:
+  (1) "39-45 % intra-rig" vergleicht INNERHALB des RDMA-Vehikels (blockierendes
+  memcpy-Paar um eine Loopback-Runde) — nicht gegen unseren NCCL-Pfad, der bei
+  27,7 us/AR nahe seinem eigenen Boden liegt; dazu 2,4-2,6x Aufschlag bei zwei
+  gleichzeitigen Flows (genau das IST ein Kollektiv). Groesster vermuteter
+  Hebel: falsifiziert.
+  (2) "24 % cross-rig" ist die 8-BYTE-Zeile; unsere realen Kollektive (20480 B
+  Decode / 81920 B Verify) liegen auf der Verliererseite (4 KiB schon -14,5 %,
+  64 KiB 2,89x); Gewinnerseite sind nur Spec-Broadcasts: ~3,7 us auf eine
+  166-ms-Runde.
+  (3) "86 % Staging" war Restwert, kein Messwert — instrumentierter Split sagt
+  12-17 % fuer unsere Groessen; der Rest (UCX-Progress, serielle Hops,
+  Lock-Step) verschwindet durch keinen Direktpfad.
+- Vehikelfrage geklaert: NCCLs dmabuf-Pfad doppelt tot (GeForce-Sperre der
+  Komfort-API + kein nvidia_peermem + intra-node nie NET-Transport) — HTCCL
+  waere das einzige Vehikel; echter Hook HTCCLCommunicator._select()/handles
+  (NICHT #240, das ist NIC-Pinning) mit dokumentierter Deadlock-Falle bei
+  nicht-rang-uniformer Payload.
+- VMM: (a) expandable_segments verworfen (eigener Code verweigert es bereits,
+  adaptive_graph_memory.py:338-342 — kostet #93/#102/#89); (b) dedizierte
+  Pools empfohlen; (c) groesstenteils GEBAUT: kv_vmm_backing.py + vmm_utils.py
+  existieren, fuer dmabuf fehlen ~2 Zeilen requestedHandleTypes.
+- NEU MIT SPRENGKRAFT: Cross-Rig-Tabelle wurde nur gegen die 256-MiB-BAR-3080
+  gemessen; die 5090 hat 32-GiB-BAR1 — Fenster W1 (Bench mit 5090 als Ziel)
+  kann das Cross-Rig-Verdikt kippen. BAR-Erklaerung traegt zudem nicht ueber
+  beide Tabellen (3,14 vs 0,83 GB/s in dieselbe BAR-Klasse, ~640 us unerklaert).
+  Topologie-Gegendatum: 5090 haengt am Root Complex und funktioniert trotzdem
+  als Quelle — 2080-Ti-Hypothese gehoert NICHT als Gate-Zeile verkauft.
+- PRIORITAETEN: P1 dmabuf_rdma-Gate-Zeile in #214 (Desk), P2 Comm-Suite-Arm
+  gdr_crossover (Umschlagpunkt = Rig-Eigenschaft), P3 Fenster W1+W2 (je ~30/20
+  min, kein Modell-Load) entscheiden ueber P4 (Transport: NICHT JETZT),
+  P5 = wohin der #266-Rest wirklich zeigt (Progress-Thread, Hops, Lock-Step,
+  PP-Metadata-Cache — dmabuf fasst davon nichts an).
+- REGISTER-KORREKTUR: Wiedereroeffnung "Cross-Rig-TP druecken" wird VERENGT
+  auf die ReBAR-Frage (W1) + P5-Posten — nicht mehr auf die 86-%-Zahl gestuetzt.
+- Nebenbefund Infrastruktur: lokaler Branch-Ref integration/r3-probe-next2 war
+  vom Alt-Worktree wt-r3-merge2 besetzt (wt-final lief detached, Pushes waren
+  korrekt, lokale Ref-Aufloeser sahen Altstand) — behoben: Branch an wt-final
+  gebunden, wt-r3-merge2 detached.
