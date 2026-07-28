@@ -898,9 +898,12 @@ class TestLaneVerifyStrategy(unittest.TestCase):
         return DualGroupLane.__new__(DualGroupLane)
 
     def test_default_is_the_coherent_strategy(self):
-        # Round 4 built TARGET_VERIFY and did NOT promote it: it is byte-exact
-        # only with its accept length capped at 0. The default must be the
-        # strategy that is green end to end, which is still the bridge.
+        # Round 5 made TARGET_VERIFY coherent (the row-parallel shell was
+        # handing a stride-blind GGUF kernel a strided activation) and still
+        # did NOT promote it: the two modes cost the same per round, 0.2 %
+        # apart under a 0.4 % floor, and the bridge has four boots of gate
+        # behind it against one. The switch belongs to the round that captures
+        # the verify forward, when it starts buying something.
         self.assertEqual(self._lane()._verify_mode({}), "seqdecode")
 
     def test_target_verify_stays_reachable_but_only_on_request(self):
@@ -942,18 +945,22 @@ class TestLaneVerifyStrategy(unittest.TestCase):
     def test_the_measured_boundary_of_target_verify_is_written_down(self):
         """What is proven about TARGET_VERIFY, at the code that runs it.
 
-        The single-row core is byte-exact and the rest is not (round 4). A
-        future reader who only sees "TARGET_VERIFY is the right mode" would
-        promote it; the cap that proved the boundary has to be findable from
-        the same docstring.
+        The mode is coherent since round 5, so the docstring no longer has to
+        carry a defect -- it has to carry the reason the mode is STILL not the
+        default, which is a number and not an opinion. A future reader who
+        only sees "TARGET_VERIFY is the right mode" would promote it and
+        measure nothing; the break-even has to be findable from the same
+        docstring, together with the condition that changes it.
         """
         import inspect
 
         from sglang.srt.model_executor.dual_group_lane import DualGroupLane
 
         doc = inspect.getdoc(DualGroupLane._verify_by_target_verify) or ""
-        self.assertIn("tv_max_accept", doc)
-        self.assertIn("BYTE-IDENTICAL", doc)
+        self.assertIn("4.78", doc)
+        self.assertIn("graph capture", doc)
+        # And the root cause, so nobody re-derives it from the symptom.
+        self.assertIn("local_row_split", doc)
 
     def test_seqdecode_emits_accepted_prefix_then_the_targets_own_token(self):
         """The accept rule itself, with the forwards stubbed out.
