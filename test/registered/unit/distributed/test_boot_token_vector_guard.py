@@ -85,7 +85,10 @@ def _server_args(*, plan, weighted, dcp_size=2, tp_size=2):
         weightless_kv_fastlane=False,
     )
     sa.uneven_weighted_dcp_enabled = lambda: weighted
-    sa.apply_rank_memory_budget = lambda tp_rank: None
+    # Per-rank vectors are indexed by the WORLD rank (#201); without a
+    # pipeline that is the tp_rank, which is what this stub exercises.
+    sa.world_rank = lambda pp_rank, tp_rank: pp_rank * tp_size + tp_rank
+    sa.apply_rank_memory_budget = lambda rank: None
     return sa
 
 

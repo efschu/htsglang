@@ -1100,6 +1100,26 @@ class ServerArgs:
         "The maximum micro batch size in pipeline parallelism.",
     ] = None
     pp_async_batch_depth: A[int, "The async batch depth of pipeline parallelism."] = 0
+    pp_layer_ratio: A[
+        Optional[List[int]],
+        Arg(
+            help="Model layers per pipeline stage, one entry per stage, in "
+            "stage order; the counts must sum to the model's hidden layer "
+            "count. Enables an UNEVEN layer split, e.g. --pp-size 2 "
+            "--pp-layer-ratio 52,12 puts 52 layers on stage 0 and 12 on "
+            "stage 1 -- the lever for a pipeline across cards of different "
+            "capacity. This is the CLI surface for the existing "
+            "SGLANG_PP_LAYER_PARTITION machinery and is exactly as "
+            "expressive: the split is contiguous and full-width per stage. "
+            "Note that stage 0 additionally carries embed_tokens and the "
+            "LAST stage carries the final norm + lm_head, which are not "
+            "layers -- a byte-balanced split is therefore not the same as "
+            "an equal layer count. Unset (default): the stock even split "
+            "(num_layers // pp_size, remainder on the last stages), "
+            "byte-identical to not passing the flag.",
+            type_parser=_parse_int_list,
+        ),
+    ] = None
     dp_size: A[
         int,
         Arg(
@@ -6133,12 +6153,15 @@ class ServerArgs:
     ) -> int:
         """GPU device index for a scheduler process.
 
-        With --rank-gpu-id the explicit per-rank mapping wins (pure TP:
-        pp_rank is always 0 in that mode); otherwise the classic
+        With --rank-gpu-id the explicit per-rank mapping wins, indexed by the
+        WORLD rank (pp_rank * tp_size + tp_rank) -- the same formula
+        model_runner uses to place a process in the rank grid. Without a
+        pipeline pp_rank is 0 and this reduces to the historical
+        ``rank_gpu_id[tp_rank]``. Otherwise the classic
         base_gpu_id/gpu_id_step formula applies unchanged.
         """
         if self.rank_gpu_id is not None:
-            return self.rank_gpu_id[tp_rank]
+            return self.rank_gpu_id[self.world_rank(pp_rank, tp_rank)]
         return (
             self.base_gpu_id
             + ((pp_rank % pp_size_per_node) * tp_size_per_node)
@@ -6191,9 +6214,62 @@ class ServerArgs:
             or self.uneven_kv_flag_active()
         )
 
-    def apply_rank_memory_budget(self, tp_rank: int) -> Optional[float]:
+    def world_rank(self, pp_rank: int, tp_rank: int) -> int:
+        """Index of a scheduler process in the flat rank grid.
+
+        The one formula the rank layout uses everywhere (model_runner:
+        ``rank = tp_size * pp_rank + tp_rank``, mirrored in tp_worker), and
+        the order every world-length per-rank vector (--rank-gpu-id,
+        --rank-gpu-memory-mib) is read in. Reduces to ``tp_rank`` without a
+        pipeline."""
+        return pp_rank * self.tp_size + tp_rank
+
+    def _validate_pp_stage_gpu_groups(self) -> List[List[int]]:
+        """--rank-gpu-id under a pipeline: one disjoint GPU group per stage.
+
+        Returns the per-stage GPU groups (stage order). The length was
+        already checked against pp_size x tp_size by the caller.
+
+        Disjoint placement is the admission condition, not a style rule. Two
+        stages sharing a card hold two full weight slices plus two KV pools on
+        it and run strictly in sequence -- the pipeline serialises against
+        itself and buys no capacity, which is the point of splitting layers. The
+        co-residence budget arithmetic below would happily size it, so the
+        configuration has to be refused by name rather than left to fail as a
+        late OOM.
+        """
+        groups = [
+            list(self.rank_gpu_id[s * self.tp_size : (s + 1) * self.tp_size])
+            for s in range(self.pp_size)
+        ]
+        for stage_a in range(self.pp_size):
+            for stage_b in range(stage_a + 1, self.pp_size):
+                shared = sorted(set(groups[stage_a]) & set(groups[stage_b]))
+                if shared:
+                    raise ValueError(
+                        f"--rank-gpu-id places pipeline stages {stage_a} and "
+                        f"{stage_b} on the same physical GPU(s) {shared} "
+                        f"(stage {stage_a}: {groups[stage_a]}, stage "
+                        f"{stage_b}: {groups[stage_b]}). Each stage needs its "
+                        "own group of cards: co-located stages hold both "
+                        "layer slices and both KV pools on one card and still "
+                        "run one after the other, so the split costs memory "
+                        "without buying capacity."
+                    )
+        logger.info(
+            "Pipeline placement: %s (stage -> physical GPUs, world-rank "
+            "order pp_rank * tp_size + tp_rank).",
+            {s: g for s, g in enumerate(groups)},
+        )
+        return groups
+
+    def apply_rank_memory_budget(self, rank: int) -> Optional[float]:
         """Apply this rank's --rank-gpu-memory-mib budget as its
         mem_fraction_static (worker-process side).
+
+        ``rank`` is the WORLD rank (see world_rank), which without a pipeline
+        is simply the tp_rank -- the per-rank vectors are indexed in that one
+        order everywhere.
 
         The fraction was derived once at resolution time as
         budget_mib / nvml_total_mib(this rank's physical GPU) — see
@@ -6204,7 +6280,7 @@ class ServerArgs:
         fractions = getattr(self, "_rank_mem_fraction_static", None)
         if fractions is None:
             return None
-        fraction = fractions[tp_rank]
+        fraction = fractions[rank]
         self.override("uneven_tp.rank_mem_fraction", mem_fraction_static=fraction)
         return fraction
 
@@ -6269,6 +6345,21 @@ class ServerArgs:
         budget. Explicit integer weights keep working unchanged."""
         if self.rank_gpu_id is None:
             raise ValueError("--rank-tp-ratio auto requires --rank-gpu-id.")
+        if self.pp_size > 1:
+            # The auto planner derives ONE weight vector from the whole card
+            # set named by --rank-gpu-id. Under a pipeline that set spans
+            # every stage, so the derived vector is world-length while
+            # --rank-tp-ratio must be tp_size long, and the per-stage weights
+            # would have to come from a per-stage capacity model that does not
+            # exist yet (#201 slice 3). Explicit vectors only.
+            raise ValueError(
+                "--rank-tp-ratio auto/auto-performance is not available "
+                f"under --pp-size > 1 (current: {self.pp_size}): the planner "
+                "derives a single weight vector from all cards in "
+                "--rank-gpu-id, which under a pipeline spans every stage. "
+                "Pass an explicit per-stage ratio vector of length "
+                f"--tp-size ({self.tp_size})."
+            )
 
         if self.rank_gpu_memory_mib is None:
             from collections import Counter
@@ -6508,26 +6599,40 @@ class ServerArgs:
                     "--rank-tp-ratio with identical entries is the even "
                     "split — omit the flag instead."
                 )
-            # Pure single-node tensor parallelism only — the same scope the
-            # --rank-gpu-id block below enforces, but it needs restating
-            # here: --rank-tp-ratio is legal WITHOUT --rank-gpu-id (it
+            # --rank-tp-ratio x pipeline parallelism (#202 -> #201).
+            #
+            # This check needs restating here rather than in the --rank-gpu-id
+            # block below: --rank-tp-ratio is legal WITHOUT --rank-gpu-id (it
             # describes the PARTITION, not the placement), so it walks past
             # every parallelism reject down there, all of which sit after the
             # `rank_gpu_id is None` early return.
             #
-            # It is not inert under a pipeline: configure_scheduler_process
-            # installs the plan in every scheduler process, so each PP stage
-            # would shard its TP dimension by the vector. Nothing in the
-            # uneven-TP machinery — the shard solver, the family vectors, the
-            # weighted-DCP token axis, the per-rank memory budgets — has ever
-            # been exercised with a pipeline stage in front of it, so this
-            # combination boots into an unvalidated split. Refuse it loudly
-            # instead.
-            if self.pp_size > 1:
+            # What the reject protects against: the ratio is not inert under a
+            # pipeline. configure_scheduler_process installs the plan in EVERY
+            # scheduler process, and gpu_id_for_rank used to index the
+            # placement by tp_rank alone -- so every stage sharded its TP
+            # dimension by the same vector AND landed on the same physical
+            # cards, stacking the whole pipeline onto one stage's worth of
+            # GPUs. That is the failure mode, and it is a placement failure,
+            # not a partition failure.
+            #
+            # What is opened, and its exact condition: a pipeline whose stages
+            # each own their own group of physical GPUs. Expressed as a
+            # world-length --rank-gpu-id (pp_size x tp_size entries, world-rank
+            # order pp_rank * tp_size + tp_rank) whose per-stage slices are
+            # pairwise disjoint -- see _validate_pp_stage_gpu_groups. Without
+            # that placement there is nothing that separates the stages, so the
+            # reject stands.
+            if self.pp_size > 1 and self.rank_gpu_id is None:
                 raise ValueError(
-                    f"--rank-tp-ratio is not compatible with --pp-size > 1 "
-                    f"(current: {self.pp_size}). Only pure single-node "
-                    "tensor parallelism is supported."
+                    "--rank-tp-ratio with --pp-size > 1 (current: "
+                    f"{self.pp_size}) requires --rank-gpu-id to give each "
+                    "pipeline stage its own group of physical GPUs: pass "
+                    f"{self.pp_size * self.tp_size} entries (pp_size x "
+                    "tp_size, in world-rank order pp_rank * tp_size + "
+                    "tp_rank), with no card shared between stages. Without "
+                    "an explicit placement every stage would shard by the "
+                    "same ratio onto the same cards."
                 )
 
         # Decoupled KV-token ownership (--rank-kv-ratio, task #88): requires
@@ -6578,8 +6683,18 @@ class ServerArgs:
         # PLACEMENT validation (everything below reads self.rank_gpu_id).
         # ---------------------------------------------------------------
 
-        # Length vs tp_size.
-        if len(self.rank_gpu_id) != self.tp_size:
+        # Length vs the number of ranks this launch actually places: tp_size
+        # without a pipeline, pp_size x tp_size with one (#201).
+        placed_ranks = self.tp_size * self.pp_size
+        if len(self.rank_gpu_id) != placed_ranks:
+            if self.pp_size > 1:
+                raise ValueError(
+                    f"--rank-gpu-id length ({len(self.rank_gpu_id)}) must "
+                    f"equal --pp-size x --tp-size ({self.pp_size} x "
+                    f"{self.tp_size} = {placed_ranks}) under a pipeline: one "
+                    "physical GPU per world rank, in world-rank order "
+                    "pp_rank * tp_size + tp_rank."
+                )
             raise ValueError(
                 f"--rank-gpu-id length ({len(self.rank_gpu_id)}) must equal "
                 f"--tp-size ({self.tp_size})."
@@ -6601,30 +6716,46 @@ class ServerArgs:
             # per-rank budget list is appropriate here even without a
             # --rank-tp-ratio weight vector (e.g. 28000,19000,19000 for a 5090
             # head + two 3080 workers).
-            if self.rank_tp_ratio is None and not self.weightless_kv_fastlane:
+            #
+            # A pipeline (#201) is the same case for the same reason: stages
+            # are structurally unequal BY CONSTRUCTION -- they hold different
+            # layer counts, and under --pp-layer-ratio deliberately so, plus
+            # stage 0 carries embed_tokens and the last stage lm_head. "Equal
+            # ranks, so one scalar" is a statement about a pure TP group, and
+            # a pipeline is not one. Requiring --rank-tp-ratio here would be
+            # doubly wrong: with tp_size 1 per stage there is no TP dimension
+            # to describe at all.
+            if (
+                self.rank_tp_ratio is None
+                and not self.weightless_kv_fastlane
+                and self.pp_size == 1
+            ):
                 raise ValueError(
                     "--rank-gpu-memory-mib as a list requires "
                     "--rank-tp-ratio (with even TP all ranks are "
                     "structurally equal — use a single scalar)."
                 )
-            if len(self.rank_gpu_memory_mib) != self.tp_size:
+            if len(self.rank_gpu_memory_mib) != placed_ranks:
                 raise ValueError(
                     f"--rank-gpu-memory-mib list length "
-                    f"({len(self.rank_gpu_memory_mib)}) must equal "
-                    f"--tp-size ({self.tp_size})."
+                    f"({len(self.rank_gpu_memory_mib)}) must equal the "
+                    f"number of placed ranks ({placed_ranks}"
+                    + (
+                        f" = --pp-size {self.pp_size} x --tp-size " f"{self.tp_size}"
+                        if self.pp_size > 1
+                        else f" = --tp-size {self.tp_size}"
+                    )
+                    + "), matching --rank-gpu-id."
                 )
             if any(m <= 0 for m in self.rank_gpu_memory_mib):
                 raise ValueError("--rank-gpu-memory-mib entries must be positive.")
         elif self.rank_gpu_memory_mib <= 0:
             raise ValueError("--rank-gpu-memory-mib must be positive.")
 
-        # Only pure single-node tensor parallelism is supported.
+        # Pipeline parallelism: admitted only as disjoint per-stage GPU
+        # groups (#201). Everything else stays pure single-node TP.
         if self.pp_size > 1:
-            raise ValueError(
-                f"--rank-gpu-id is not compatible with --pp-size > 1 "
-                f"(current: {self.pp_size}). Only pure tensor parallelism "
-                "is supported."
-            )
+            self._validate_pp_stage_gpu_groups()
         if self.dp_size > 1:
             raise ValueError(
                 f"--rank-gpu-id is not compatible with --dp-size > 1 "
@@ -6664,7 +6795,7 @@ class ServerArgs:
         budgets = (
             list(self.rank_gpu_memory_mib)
             if isinstance(self.rank_gpu_memory_mib, list)
-            else [self.rank_gpu_memory_mib] * self.tp_size
+            else [self.rank_gpu_memory_mib] * placed_ranks
         )
         mem_info = _query_rank_gpu_memory_mib(self.rank_gpu_id)
         for gpu_id in sorted(set(self.rank_gpu_id)):
@@ -6691,7 +6822,7 @@ class ServerArgs:
         # Underscore attribute: derived (not a CLI field), pickled to the
         # scheduler child processes with the rest of the instance.
         self._rank_mem_fraction_static = [
-            budgets[r] / mem_info[self.rank_gpu_id[r]][0] for r in range(self.tp_size)
+            budgets[r] / mem_info[self.rank_gpu_id[r]][0] for r in range(placed_ranks)
         ]
 
         # Custom all-reduce assumes symmetric peers: it allocates
@@ -9323,6 +9454,141 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
+        self._handle_pp_layer_ratio()
+
+    #: Config keys that carry a model's backbone depth, in probe order.
+    _NUM_LAYER_CONFIG_KEYS = ("num_hidden_layers", "n_layer", "num_layers")
+
+    def declared_num_hidden_layers(self) -> Optional[int]:
+        """The model's backbone depth as its ``config.json`` declares it, or
+        None when it cannot be read here.
+
+        Advisory only. It is NOT authoritative: for a GGUF checkpoint the
+        file's own ``block_count`` wins over the sibling config
+        (model_loader/gguf_registry.py: depth reconciliation), so a
+        depth-merged GGUF legitimately runs at a depth this function does not
+        know. The authoritative sum check therefore stays where the real
+        depth exists -- distributed/utils.py: get_pp_indices.
+        """
+        model_path = getattr(self, "model_path", None)
+        if not model_path:
+            return None
+        cfg_path = os.path.join(model_path, "config.json")
+        if not os.path.isfile(cfg_path):
+            return None
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except Exception:  # pragma: no cover - advisory only
+            return None
+        text_cfg = cfg.get("text_config") or {}
+        for key in self._NUM_LAYER_CONFIG_KEYS:
+            value = cfg.get(key)
+            if not isinstance(value, int):
+                value = text_cfg.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+        return None
+
+    def _model_path_is_gguf(self) -> bool:
+        """True when --model-path names (or contains) a GGUF checkpoint."""
+        model_path = getattr(self, "model_path", None) or ""
+        if model_path.endswith(".gguf"):
+            return True
+        try:
+            return os.path.isdir(model_path) and any(
+                name.endswith(".gguf") for name in os.listdir(model_path)
+            )
+        except OSError:  # pragma: no cover - advisory only
+            return False
+
+    def _handle_pp_layer_ratio(self):
+        """--pp-layer-ratio: uneven layer split across pipeline stages.
+
+        A thin, validated CLI surface over the stock uneven-PP mechanism
+        (distributed/utils.py: get_pp_indices reads SGLANG_PP_LAYER_PARTITION).
+        The flag is resolved in the launcher process and exported through the
+        environment, which the scheduler processes inherit -- the same route
+        the PD topology planner already uses for its prefill layer split.
+
+        Unset: the environment is not touched at all, so the stock even split
+        runs byte-identically.
+        """
+        ratio = self.pp_layer_ratio
+        if ratio is None:
+            return
+
+        if self.pp_size <= 1:
+            raise ValueError(
+                "--pp-layer-ratio describes how layers are split across "
+                f"pipeline stages, but --pp-size is {self.pp_size} (no "
+                "pipeline). Set --pp-size to the number of stages, or drop "
+                "the flag."
+            )
+        if len(ratio) != self.pp_size:
+            raise ValueError(
+                f"--pp-layer-ratio length ({len(ratio)}) must equal "
+                f"--pp-size ({self.pp_size}): one layer count per stage."
+            )
+        if any(not isinstance(n, int) or n < 1 for n in ratio):
+            raise ValueError(
+                "--pp-layer-ratio entries must be positive integers (every "
+                f"stage needs at least one layer), got {ratio}."
+            )
+
+        # Best-effort early sum check. get_pp_indices repeats it against the
+        # depth the model actually loads with, which is what decides; this one
+        # only exists so the common typo fails before the weight load.
+        declared = self.declared_num_hidden_layers()
+        if declared is not None and sum(ratio) != declared:
+            message = (
+                f"--pp-layer-ratio {','.join(str(n) for n in ratio)} sums to "
+                f"{sum(ratio)}, but {self.model_path} declares "
+                f"{declared} hidden layers. Every layer must be placed on "
+                "exactly one stage."
+            )
+            if self._model_path_is_gguf():
+                # A GGUF file's block_count wins over the sibling config
+                # (and it counts the MTP/NEXTN block, so the two legitimately
+                # differ by the draft depth). Do not fail on a number that is
+                # not the one the loader will use -- warn and let
+                # get_pp_indices decide.
+                logger.warning(
+                    "%s The sibling config.json is not authoritative for a "
+                    "GGUF checkpoint (the file's block_count wins, minus its "
+                    "MTP/NEXTN block), so this is a warning, not a "
+                    "rejection.",
+                    message,
+                )
+            else:
+                raise ValueError(message)
+
+        prefill_split = getattr(self, "disaggregation_prefill_layer_split", None)
+        if prefill_split is not None:
+            raise ValueError(
+                "--pp-layer-ratio and --disaggregation-prefill-layer-split "
+                "both drive the same layer-partition mechanism "
+                "(SGLANG_PP_LAYER_PARTITION) and would overwrite each other. "
+                "Use --disaggregation-prefill-layer-split for the PD prefill "
+                "group, --pp-layer-ratio for a plain pipeline."
+            )
+
+        partition = ",".join(str(n) for n in ratio)
+        preset = os.environ.get("SGLANG_PP_LAYER_PARTITION")
+        if preset is not None and preset != partition:
+            raise ValueError(
+                f"--pp-layer-ratio ({partition}) conflicts with the "
+                f"SGLANG_PP_LAYER_PARTITION already set in the environment "
+                f"({preset}). Pass one of the two, not both."
+            )
+        os.environ["SGLANG_PP_LAYER_PARTITION"] = partition
+        logger.info(
+            "--pp-layer-ratio %s: uneven pipeline layer split over %d "
+            "stages (stage 0 also holds embed_tokens, the last stage the "
+            "final norm + lm_head).",
+            partition,
+            self.pp_size,
+        )
 
     def _validate_prefill_only_disable_kv_cache_args(self):
         """Validate --prefill-only-disable-kv-cache flag/precondition constraints.

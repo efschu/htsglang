@@ -292,6 +292,21 @@ class ModelRunnerKVCacheMixin:
     # is used exclusively to say, in its own words, when the plan cannot be
     # realized.
     # ------------------------------------------------------------------
+    def _rank_vector_index(self: ModelRunner) -> int:
+        """This process's index into the per-rank vectors (--rank-gpu-id,
+        --rank-gpu-memory-mib).
+
+        Those vectors are laid out in WORLD-rank order, pp_rank * tp_size +
+        tp_rank (#201). Without a pipeline that is the tp_rank, which is what
+        this used to read directly -- under one, reading tp_rank makes every
+        stage pick stage 0's entry, so stage 1 checks its own card against
+        stage 0's budget.
+        """
+        world_rank = getattr(self.server_args, "world_rank", None)
+        if world_rank is None:  # pragma: no cover - stubbed server args
+            return self.tp_rank
+        return world_rank(self.pp_rank, self.tp_rank)
+
     def _device_occupancy_gb(self: ModelRunner, device_free_gb: float) -> Tuple:
         """(device total, bytes held outside this process) in GiB.
 
@@ -342,7 +357,7 @@ class ModelRunnerKVCacheMixin:
             return
         rank_gpu_id = getattr(self.server_args, "rank_gpu_id", None) or []
         try:
-            gpu = rank_gpu_id[self.tp_rank]
+            gpu = rank_gpu_id[self._rank_vector_index()]
         except (IndexError, TypeError):  # pragma: no cover - defensive
             gpu = self.gpu_id
         free_share_gb = device_free_gb / max(1, ranks_on_gpu)
@@ -468,7 +483,7 @@ class ModelRunnerKVCacheMixin:
             # appears in both readings and cancels out.
             mib = self.server_args.rank_gpu_memory_mib
             budget_mib = int(
-                mib if isinstance(mib, (int, float)) else mib[self.tp_rank]
+                mib if isinstance(mib, (int, float)) else mib[self._rank_vector_index()]
             )
             budget_gb = budget_mib / 1024.0
             used_by_me_gb = pre_model_load_memory - available_gpu_memory
@@ -855,7 +870,10 @@ class ModelRunnerKVCacheMixin:
         if not rank_gpu_id:
             return 1
         try:
-            return max(1, list(rank_gpu_id).count(rank_gpu_id[self.tp_rank]))
+            return max(
+                1,
+                list(rank_gpu_id).count(rank_gpu_id[self._rank_vector_index()]),
+            )
         except (IndexError, TypeError):
             return 1
 

@@ -5078,14 +5078,17 @@ def configure_scheduler_process(
     # GPU NVML total, derived once at resolution time). The MiB value is
     # the rank's ENTIRE budget — it is applied unmodified, without any
     # additional utilization ceiling. No-op on the default path.
-    rank_fraction = server_args.apply_rank_memory_budget(tp_rank)
+    world_rank = server_args.world_rank(pp_rank, tp_rank)
+    rank_fraction = server_args.apply_rank_memory_budget(world_rank)
     if rank_fraction is not None:
         logger.info(
-            "Uneven TP: rank %d uses mem_fraction_static=%.4f "
+            "Uneven TP: rank %d (PP%d TP%d) uses mem_fraction_static=%.4f "
             "(--rank-gpu-memory-mib budget on GPU %s).",
+            world_rank,
+            pp_rank,
             tp_rank,
             rank_fraction,
-            server_args.rank_gpu_id[tp_rank],
+            server_args.rank_gpu_id[world_rank],
         )
 
     # Config the process
