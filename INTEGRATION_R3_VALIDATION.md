@@ -5175,3 +5175,35 @@ Bewusst abwesend statt erfunden: Kollektiv-/Prefill-Terme ohne Paar-Matrix,
 Host-Term ohne Host-Probe, decode-tok/s ohne split_probe-Baseline (nur Ratio),
 ttft_at_n/session_max nur als benannte Interfaces; GGUF-K-Quants auf bf16
 geplant (fp8-Rate haette Rang 2,4x ueberschaetzt).
+
+## #274 Slice A Dual-Gruppen-Runtime (feat/dual-group-runtime-a, 0d155ba32d)
+
+Gemergt in integration/r3-probe-next2. Marker-Gate 0/0/0/0, merge_rc=0,
+34/34 Nesting-Tests gruen auf dem Integrationszweig.
+ARCHITEKTUR-ENTSCHEID: In-Prozess-Zweitlane (Variante a). Zwei je fuer sich
+hinreichende Belege: (1) Zweitprozess braeuchte 2 Raenge/Karte => NCCL>=2.30
++ MPS, Rig hat 2.28.9 ohne MPS — Variante a ist 1 Rang/Karte, Schwelle greift
+nicht; (2) elastische VRAM-Rueckgabe (Nachtrag-4-Stufe-2) ist ueber
+Prozessgrenzen strukturell verwehrt (fremder Allocator, graph-capturte Pools),
+in-process: ein Allocator, ein Adressraum. Dazu: FAST-Gruppen-Kollektive
+verschwinden ersatzlos (all_gather->cat, all_reduce->add, kein Kommunikator,
+kein S4b-Hang), kein zweiter CUDA-Kontext, Praeemption an Chunk-/Decode-
+Schritt-Grenzen weil EIN Scheduler-Loop beide Lanes taktet.
+FEATURE-PARITAET (PRIO-Nachtrag 3) geprueft: kein struktureller Ausschluss;
+benannter Arbeitspunkt: set_offloader ist das einzige unbewachte Prozess-Global.
+NESTING-ALGEBRA ist Korrektheits-relevant, nicht Kosmetik: fuer [6,1,1]->[6,2]
+nesten 65 von 497 Einheitenzahlen NICHT (Beispiel units=14: Verband [10,2,2]
+vs Lane [11,3] — Rang 0 haette still verschiedene "geteilte" Bytes).
+BYTE-GATE EHRLICH KORRIGIERT: bitweises Lane==Verband-Gate strukturell
+unmoeglich (Column-Split aendert GEMM-Blocking; getestet, nicht behauptet) —
+das exakte Gate ist data_ptr()-IDENTITAET der geteilten Shards.
+INTERFERENZ: nur A-Arm (Lane existiert noch nicht): 27B-Q3 TP=3 6,1,1 mit
+Graphen+NEXTN: 31,32/31,03/31,20 ms/Verify (A-vs-A-Boden 0,9 %, 41,9 tok/s),
+Kalt-Prefill 806/798 ms je 1k Token. Machbarkeit 5090: 12,4 GiB frei,
+Komplement (2/8)=3,22 GiB => ~9 GiB Rest fuer Lane-Pools.
+OFFEN (Slice B): B1 Komplement-Loader + Huellbaum-Schalen (v2-Loader lesen
+tp_size=None=global installiert — je Quant-Pfad Sichtungstest), B2 Lane-Pools
++ Prefill (FALLE: _apply_token_constraints hat ReduceOp.MIN all-reduce —
+rang-lokal sizen oder Gruppen-Hang), B3 Lane-Graphen. C-Blocker sind
+Prozess-Globals (_TP_PARTITION_RATIOS, ParallelContext._overrides,
+is_capture_mode, geteilter Graph-Pool), nicht NCCL.
