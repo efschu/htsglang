@@ -5709,3 +5709,31 @@ Operativ relevant bleibt hier nur:
 - ZWEIER-ANNAHMEN aus Slice B stehen UNVERAENDERT (derive_lane_plan
   Zwei-Segment, shared rank 0, eine Lane) — der Umfang von C hat sie nicht
   erzwungen.
+
+### #274 Slice C — Nachtrag: drei Punkte aus dem Nachlauf-Batch
+
+- DIR1-URSACHE GEKLAERT, direkt belegt: `prefill_wait_ms` (Wanduhr minus
+  Device-Zeit auf dem Lane-Stream) ist **0,01 ms** je Prefill, waehrend die
+  Device-Zeit selbst von 583 auf 627-638 ms steigt. Die +9,5 % der
+  geschuetzten Klasse liegen also VOLLSTAENDIG in der Rechenzeit: es ist
+  SM-Konkurrenz, nicht Praeemptions-Granularitaet. Der Einreichpfad des
+  Zwei-Klassen-Schedulers kostet praktisch nichts.
+- SPEED-DIAL, dritter Messpunkt (jetzt 3 gemessene Punkte):
+
+  | Dial | Budget | Lane-Token | 5090 belegt | Lane-Prefill 2048 | Lane-Decode |
+  |---|---|---|---|---|---|
+  | aus | 1600 MiB | 25600 | 30423 MiB | 583,1 ms | 56,18 Schr./s |
+  | 0.5 | 566 MiB | 9056 | 29297 MiB | 583,4 ms | 56,20 Schr./s |
+  | 1.0 | 200 MiB | 3200 | 28979 MiB | 583,7 ms | 52,43 Schr./s |
+
+  Bestaetigt den Befund: der Regler kauft VRAM (bis 1444 MiB), kein Tempo.
+- DRAFTER-LANE (TP=1-Drafter als dritter Lane-Typ) auf dem validierten
+  GGUF-Vehikel NICHT testbar: `--speculative-draft-placement solo` bricht
+  beim Boot mit einer VORBESTEHENDEN Sperre ab — `_solo_init_lm_head`
+  braucht dichte embed/lm_head-Tabellen und lehnt den GGUF-Pfad mit
+  modul-geteiltem gepacktem lm_head ab. Interessante Kreuzung: genau diese
+  Faehigkeit hat die Lane bereits — `LaneLmHeadShell` / `LaneVocabEmbedding
+  Shell` bauen volle Vokabular-Logits aus den gepackten Rang-Shards, und
+  zwar RANG-LOKAL ohne Kollektiv, waehrend der Solo-Pfad dafuer ein
+  Gruppen-Kollektiv braucht. Der Lane-Mechanismus ist damit der Hebel, der
+  die Sperre loesen wuerde. Zurueckgestellt als offener Posten.
