@@ -5291,3 +5291,39 @@ MITNAHME shared_process=True: Ein-Prozess-Runtime als Plan-Parameter
 Vorzeichen-Lehre dokumentiert: Budgets summieren NICHT auf die Karte, sondern
 auf available − posts + shared_weight_saving (erster Konservierungstest hatte
 das Vorzeichen falsch — gepinnt in Code + Testkommentar).
+
+## Q4 dmabuf-GDR-Sonde (2026-07-28, agent-q4-gdr) — Verdikt: GDR unerreichbar, CX-5-Umbau NEIN
+
+Faehigkeitssonde ohne Modell-Boot (3 Sekunden-Tests a 16 MiB, Locks nach
+Protokoll). Volltext: /root/.claude/jobs/1481bb40/tmp/BRIEFING_q4_dmabuf_gdr.md
+(Ergebnis-Abschnitt inkl. Phase-1-Tabelle); Probe-Code q4_dmabuf_probe.c ebd.
+
+- KERN: GPUDirect-RDMA scheitert am GeForce-SKU-Riegel im NVIDIA-RM
+  (DMA_BUF_SUPPORTED=0, cuMemGetHandleForAddressRange -> INVALID_VALUE), NICHT
+  an der NIC. Falsifiziert auf 4 GPUs / 3 Archs / 2 Rigs / 2 Treiberzweigen /
+  2 NIC-Generationen (Rig 2 traegt bereits eine CX-5 Ex — gleiches NEIN).
+- Software-Stack sonst VOLLSTAENDIG bereit (mlx5-dmabuf-Pfad, rdma-core 56.1
+  mit ibv_reg_dmabuf_mr, open modules 595.58.03, alle Kernel-Configs) — die
+  Topologie waere sogar PIX (NIC+3080 am selben Switch). peermem-Legacy tot
+  (MOFED-only-API, in-tree 0 Treffer auf beiden Rigs).
+- CX-5-UMBAU: behebt NICHTS am GDR-Blocker. Briefing-Annahme korrigiert: der
+  NIC-Slot ist Gen4-x4 — eine Gen4-CX-5 verdoppelte dort 3,94->7,88 GB/s OHNE
+  3080-Verlust; x8 gibt es nur im CPU-Slot (nur der kostet die Karte). Heute
+  nicht bindend: 2,07 GB/s von ~3,5 praktisch = 59 %, Staging bindet zuerst;
+  Latenzachse (202 us Verify, ~174 us Staging) gewinnt durch Umbau 0 us.
+  Reihenfolge falls je noetig: MTU -> Staging-Optimierung -> Gen4-CX-5 in den
+  vorhandenen Slot -> CPU-Slot zuletzt.
+- BAR-Mailbox (256-MiB-Fenster als Transferpfad): NEIN — gleiches MR-Gate,
+  CPU-Ersatzweg EFAULT (VM_IO/VM_PFNMAP), uncached MMIO langsamer als der
+  Copy-Engine-Pfad. Groesse war nie das Problem (gilt auch fuer 32-GiB-ReBAR).
+- NEBENBEFUNDE: (1) MTU-Mismatch auf der 40G-Strecke (Rig1 1500 / Rig2 9000) —
+  Task #276, vor der naechsten Cross-Rig-Messung beheben, sonst wird er
+  mitgemessen. (2) CT999 ohne /dev/infiniband (sysfs sichtbar, Char-Devices
+  nicht durchgereicht) — Container-RDMA braeuchte LXC-Config-Eintrag.
+- Offen/nicht getestet: NVreg_GrdmaPciTopoCheckOverride=1 (wirkt laut Quelle
+  unterhalb des bereits gescheiterten Gates; Test braeuchte rig-weites
+  Quiet-Fenster + Modul-Reload — bewusst nicht gemacht).
+- Register-Eintrag: GDR/dmabuf auf GeForce = harte Wand dieser Karten-Klasse;
+  nicht neu versuchen ohne Nicht-GeForce-Karte oder RM-seitige Aenderung.
+  Rig-Untergrenze-Regel gilt: auf Hardware mit Pro-/Datacenter-Karten bleibt
+  GDR ein echter Hebel — Feature-Design nicht dagegen gaten.
