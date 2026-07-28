@@ -3323,7 +3323,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Draft models skip here during __init__; the eagle worker calls
         # this method explicitly (force_for_draft_worker=True) after
         # init_lm_head so graphs capture the final embedding weights.
-        if self.is_draft_worker and not force_for_draft_worker:
+        # A dual-group lane runner (#274) is constructed as a draft worker
+        # (secondary-runner gates) but is a PREFILL lane -- its prefill
+        # graphs are the point, so it does not take the draft skip.
+        if (
+            self.is_draft_worker
+            and not force_for_draft_worker
+            and not self.is_dual_group_lane
+        ):
             return
 
         # Skip prefill CG for EAGLE target on tc_piecewise: that backend

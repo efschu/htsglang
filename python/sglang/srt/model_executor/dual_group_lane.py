@@ -789,6 +789,15 @@ def _lane_server_args_view(server_args):
     # Own graph-plan object: the lane's capture setup must never write into
     # the serving group's (shared, already-captured) plan.
     view.cuda_graph_config = copy.deepcopy(server_args.cuda_graph_config)
+    # Thin the lane's prefill tier ladder: the full-width lane pays a larger
+    # per-tier capture footprint than a serving shard, and the lane runs
+    # whole chunks, not fine-grained batch mixes. Tiers stay within 2x of
+    # each other, so tier padding costs at most 2x on the smallest prompts.
+    prefill_cfg = view.cuda_graph_config.prefill
+    keep = [t for t in prefill_cfg.bs if t in (16, 32, 64, 128, 256, 512, 1024, 1536, 2048)]
+    if keep:
+        prefill_cfg.bs = keep
+        prefill_cfg.max_bs = max(keep)
     if server_args.dual_group_lane_eager:
         # Eager bring-up: the runner machinery still builds its EagerRunner
         # (forward dispatch needs it); only the captures are skipped. The
@@ -1066,7 +1075,6 @@ def build_dual_group_lanes(scheduler) -> List[DualGroupLane]:
     group-collective phase.  Only the shared rank builds a lane; every other
     rank returns an empty list.
     """
-    from sglang.srt.model_executor.model_runner import ModelRunner
 
     server_args = scheduler.server_args
     if not getattr(server_args, "dual_group_lane", False):

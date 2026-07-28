@@ -959,6 +959,58 @@ second group's load safe. Without it the serving group's 3-entry vector simply
 `len(ratios) == tp_size` — and the loader falls back to the even split and
 loads the wrong units without raising anything.
 
+### 4.11 Dual-group lane, booted (#274 slice B): the in-process PD lane
+
+`--dual-group-lane` builds ONE full-width (weight-TP=1) second runner inside
+the rank-0 scheduler process: the resident shard is shared by `data_ptr`
+identity, only the complement (what the other cards hold) is additionally
+loaded, and the lane group's collectives are local tensor ops (`cat`/`add`,
+no communicator — neither the NCCL >= 2.30 co-location threshold nor MPS
+applies). Lane jobs run as SERIAL ticks with PD priority (one whole-prompt
+prefill or one greedy decode step per scheduler iteration, rank-local).
+
+Working recipe on this rig (validated 2026-07-28, Qwen3.6-27B-Q3_K_M-GGUF):
+
+```bash
+# plus the stock 4.5 GGUF flags (flashinfer, NEXTN 3/1/4, metrics, nvrtc)
+--tp 3 --rank-gpu-id 0,1,2 \
+--rank-tp-ratio 2,1,1 --rank-mlp-ratio 6,1,1 --rank-vocab-ratio 6,1,1 \
+--rank-gpu-memory-mib 22800,17780,17780 \
+--dual-group-lane --dual-group-lane-budget-mib 1600
+```
+
+- **The ratio is NOT the slice-A example.** For this model (4 kv heads)
+  plain `6,1,1` does not nest — the min-1 bump splits the 4 kv-group units
+  `[2,1,1]` while the `(6,2)` lane wants `[3,1]`. Base `2,1,1` (attention +
+  GDN) with the capacity spread moved into the mlp/vocab family vectors
+  nests exactly on every axis; the boot check enforces this with the full
+  report.
+- **Budgets:** the lane adds ~6.7 GiB weights on the 5090 (5780 MiB
+  complement + 914 MiB hull residue, logged as a posts block) plus its pool
+  budget and rank-local graphs. Rank 0's serving budget must shrink
+  accordingly (22800 here vs 28100 without the lane). Lane budget 1600 MiB
+  -> 25600 lane tokens at mrr 1; leave >= 2 GiB free before the lane's
+  graph capture or the breakable prefill capture OOMs (the full-width lane
+  pays a larger per-tier footprint than a serving shard; its tier ladder is
+  auto-thinned).
+- **Driving jobs:** POST `/set_internal_state` with
+  `{"server_args": {"dual_group_lane_prefill": {"lane_id": 0, "input_ids":
+  [...], "max_new_tokens": N, "repeat": K}}}`; results (prefill ms, decode
+  ms/step, output ids) via `/get_server_info` -> `internal_states[i]
+  ["dual_group_lanes"]`.
+- **Measured (this recipe, graphs on):** lane-solo 2048-token prefill
+  580 ms (283 ms/1k), greedy decode 16.6 ms/step; lane output coherent and
+  consistent with the serving group's continuation. Interference: lane
+  prefill under serving-decode load +0.9 % (protected quantity holds);
+  serving decode under continuous lane prefill ~+50 % wall per verify at
+  full lane duty cycle — the expected SERIAL-tick price (accept length
+  unchanged), not SM contention; concurrency is slice C.
+- **FP8 27B is out of reach for the SINGLE-CARD lane**: full weights once
+  (~25 GiB) + rank-0 non-weight floor (~4.7 GiB) + lane pools/graphs
+  (~3 GiB) > 32.6 GiB total. The feasible FP8 dual-group shape is the
+  TWO-card PD lane of docs/EVAL_272_fp8_tp2_in_tp3.md (candidate A), which
+  needs real lane collectives — slice C/D.
+
 
 ## 5. Credentials
 
