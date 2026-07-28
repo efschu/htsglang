@@ -21,6 +21,8 @@ from unittest import mock
 
 import pytest
 
+from sglang.srt.planner import jtok_counter as jc
+from sglang.srt.planner import self_update as su
 from sglang.srt.planner import webui
 from sglang.srt.planner.hardware import hardware_from_manual  # noqa: F401
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -599,6 +601,9 @@ class TestNewTabsInIndex(CustomTestCase):
             "/api/measure_power", "/api/quality_run", "/api/quality_shots",
             "/assets/quality_chess_reference.png",
             "1t53dhp",  # reddit reference link
+            # joule-per-token counter (persistent, resettable, opt-in).
+            "jtok_enabled", "jtok_out", "/api/jtok_counter",
+            "/api/jtok_counter/reset",
         ):
             self.assertIn(token, webui.INDEX_HTML, token)
 
@@ -652,6 +657,60 @@ class TestNewHttpRoutes(WebUIFixture):
                        {"model_path": "/m", "tp_size": 1, "port": 31234})
         self.assertTrue(d["ok"], d.get("error"))
         self.assertIsNotNone(self.fake.started)
+
+
+class TestJtokCounterHttpRoutes(TestNewHttpRoutes):
+    """/api/jtok_counter (GET+POST) and /api/jtok_counter/reset (POST) over a
+    real in-process HTTP round-trip -- confirms the routing prefix ordering
+    (the /reset extension is checked BEFORE the base path, same convention
+    as card_probe/card_probe-status) actually dispatches correctly, not just
+    the underlying payload functions in isolation."""
+
+    def setUp(self):
+        super().setUp()
+        self._tmp2 = tempfile.TemporaryDirectory()
+        self._store_patch = mock.patch.object(
+            jc, "DEFAULT_JTOK_STORE",
+            os.path.join(self._tmp2.name, "jtok_counter.json"),
+        )
+        self._store_patch.start()
+        _reset_jtok_state()
+
+    def tearDown(self):
+        _reset_jtok_state()
+        self._store_patch.stop()
+        self._tmp2.cleanup()
+        super().tearDown()
+
+    def test_get_default_disabled_empty(self):
+        d = json.loads(self._get("/api/jtok_counter")[0])
+        self.assertTrue(d["ok"])
+        self.assertFalse(d["enabled"])
+        self.assertEqual(d["records"], [])
+
+    def test_toggle_then_reset_all_over_http(self):
+        d = self._post("/api/jtok_counter", {"enabled": True})
+        self.assertTrue(d["ok"])
+        self.assertTrue(d["enabled"])
+
+        webui._jtok_live_tick(
+            {"launch_config": {"served_model_name": "m", "tp_size": 1,
+                                "quantization": "fp8"},
+             "rates": {"dt": 2.0, "prefill_tok_s": 100.0, "decode_tok_s": 0.0},
+             "gpus": [{"power_watts": 200.0}]},
+            {"endpoint": "http://x:1"},
+        )
+        d = json.loads(self._get("/api/jtok_counter")[0])
+        self.assertEqual(len(d["records"]), 1)
+        self.assertIsNotNone(d["records"][0]["j_per_prefill_token"])
+
+        # The /reset extension must route to the reset handler, not be
+        # swallowed by the base /api/jtok_counter (toggle) route.
+        d = self._post("/api/jtok_counter/reset", {"reset_all": True})
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["reset_count"], 1)
+        d = json.loads(self._get("/api/jtok_counter")[0])
+        self.assertIsNone(d["records"][0]["j_per_prefill_token"])
 
 
 # ===========================================================================
@@ -973,6 +1032,203 @@ class TestLandingSnapshotRoute(CustomTestCase):
             "the second concurrent poll must see the first poll's written "
             "state, not race it for the same starting baseline",
         )
+
+
+def _reset_jtok_state():
+    webui._JTOK_STORE = None
+    webui._JTOK_LAST_FLUSH_TS = 0.0
+
+
+class TestJtokCounterRoutes(CustomTestCase):
+    """The persistent joule-per-token counter's webui.py wiring: the
+    /api/jtok_counter (read/toggle) + /api/jtok_counter/reset routes, the
+    live-poll hook (_jtok_live_tick, folded into landing_snapshot_payload),
+    and the schema write-guard. No GPU/network -- NVML power and Prometheus
+    counters are fabricated dicts, exactly like TestLandingSnapshotRoute's
+    fake snapshot above."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._prev_env = os.environ.get("SGLANG_PLANNER_DATA_DIR")
+        os.environ["SGLANG_PLANNER_DATA_DIR"] = self._tmp.name
+        # DEFAULT_JTOK_STORE (like hicache's DEFAULT_HICACHE_STORE / energy's
+        # DEFAULT_RESULTS_STORE) is a module-level constant resolved ONCE at
+        # jtok_counter import time -- by the time this test class runs,
+        # jtok_counter is already imported, so the SGLANG_PLANNER_DATA_DIR
+        # override above only affects the schema-stamp GUARD lookup (which is
+        # re-resolved dynamically on every call), not the store file path.
+        # Patch the constant directly so each test's store lives in its own
+        # tmp dir instead of all tests sharing whatever path was frozen in at
+        # first import.
+        self._store_patch = mock.patch.object(
+            jc, "DEFAULT_JTOK_STORE",
+            os.path.join(self._tmp.name, "jtok_counter.json"),
+        )
+        self._store_patch.start()
+        _reset_jtok_state()
+
+    def tearDown(self):
+        _reset_jtok_state()
+        self._store_patch.stop()
+        if self._prev_env is None:
+            os.environ.pop("SGLANG_PLANNER_DATA_DIR", None)
+        else:
+            os.environ["SGLANG_PLANNER_DATA_DIR"] = self._prev_env
+        self._tmp.cleanup()
+
+    def _snap(self, dt, prefill_tok_s, decode_tok_s, watts=(150.0, 160.0)):
+        return {
+            "launch_config": {"served_model_name": "Qwen3.6-27B", "tp_size": 2,
+                              "quantization": "compressed-tensors"},
+            "rates": {"dt": dt, "prefill_tok_s": prefill_tok_s,
+                     "decode_tok_s": decode_tok_s},
+            "gpus": [{"power_watts": w} for w in watts],
+        }
+
+    def _target(self):
+        return {"endpoint": "http://127.0.0.1:8000", "kind": "managed", "managed": True}
+
+    # -- default state / read --------------------------------------------
+
+    def test_default_disabled_and_empty(self):
+        d = webui.jtok_counter_read_payload()
+        self.assertTrue(d["ok"])
+        self.assertFalse(d["enabled"])
+        self.assertEqual(d["records"], [])
+
+    # -- toggle -------------------------------------------------------------
+
+    def test_toggle_on_then_off_persists(self):
+        d = webui.jtok_counter_set_enabled_payload({"enabled": True})
+        self.assertTrue(d["ok"])
+        self.assertTrue(d["enabled"])
+        # A brand-new in-process store load (simulating a dashboard restart)
+        # must see the persisted toggle.
+        _reset_jtok_state()
+        self.assertTrue(webui.jtok_counter_read_payload()["enabled"])
+        d = webui.jtok_counter_set_enabled_payload({"enabled": False})
+        self.assertFalse(d["enabled"])
+
+    def test_toggle_requires_enabled_key(self):
+        d = webui.jtok_counter_set_enabled_payload({})
+        self.assertFalse(d["ok"])
+
+    # -- live-poll hook: phase attribution -----------------------------
+
+    def test_live_tick_noop_while_disabled(self):
+        webui._jtok_live_tick(self._snap(2.0, 100.0, 0.0), self._target())
+        self.assertEqual(webui.jtok_counter_read_payload()["records"], [])
+
+    def test_live_tick_pure_prefill_accumulates(self):
+        webui.jtok_counter_set_enabled_payload({"enabled": True})
+        webui._jtok_live_tick(self._snap(2.0, 100.0, 0.0), self._target())
+        recs = webui.jtok_counter_read_payload()["records"]
+        self.assertEqual(len(recs), 1)
+        r = recs[0]
+        self.assertEqual(r["model"], "Qwen3.6-27B")
+        self.assertEqual(r["config_label"], "tp2 compressed-tensors")
+        self.assertEqual(r["lanes"], ["http://127.0.0.1:8000"])
+        self.assertEqual(r["provenance"], "measured")
+        # joules = (150+160)*2 = 620 ; tokens = 100*2 = 200
+        self.assertAlmostEqual(r["j_per_prefill_token"], 620.0 / 200.0)
+        self.assertIsNone(r["j_per_decode_token"])
+
+    def test_live_tick_mixed_window_kept_separate(self):
+        webui.jtok_counter_set_enabled_payload({"enabled": True})
+        webui._jtok_live_tick(self._snap(2.0, 100.0, 50.0), self._target())
+        r = webui.jtok_counter_read_payload()["records"][0]
+        self.assertIsNone(r["j_per_prefill_token"])
+        self.assertIsNone(r["j_per_decode_token"])
+        self.assertEqual(r["mixed_windows"], 1)
+
+    def test_live_tick_two_endpoints_are_two_lanes(self):
+        webui.jtok_counter_set_enabled_payload({"enabled": True})
+        webui._jtok_live_tick(self._snap(2.0, 100.0, 0.0),
+                              {"endpoint": "http://127.0.0.1:8000"})
+        webui._jtok_live_tick(self._snap(2.0, 100.0, 0.0),
+                              {"endpoint": "http://127.0.0.1:9000"})
+        recs = webui.jtok_counter_read_payload()["records"]
+        self.assertEqual(len(recs), 2)
+        lanes = sorted(r["lanes"][0] for r in recs)
+        self.assertEqual(lanes, ["http://127.0.0.1:8000", "http://127.0.0.1:9000"])
+
+    def test_live_tick_never_raises_on_malformed_snapshot(self):
+        webui.jtok_counter_set_enabled_payload({"enabled": True})
+        # Missing 'gpus'/'rates' entirely must not blow up the poll response.
+        webui._jtok_live_tick({}, self._target())
+        self.assertEqual(webui.jtok_counter_read_payload()["records"], [])
+
+    # -- landing_snapshot_payload end-to-end (mocked live_metrics.snapshot) --
+
+    def test_landing_snapshot_feeds_jtok_counter(self):
+        webui.jtok_counter_set_enabled_payload({"enabled": True})
+        webui._set_supervisor(_RunningFakeSupervisor())
+        _reset_landing_state()
+        fake_snap = (self._snap(2.0, 0.0, 40.0), {"t": 1.0})
+        try:
+            with mock.patch("sglang.srt.planner.live_metrics.snapshot",
+                            return_value=fake_snap):
+                d = webui.landing_snapshot_payload()
+            self.assertTrue(d["ok"])
+            recs = webui.jtok_counter_read_payload()["records"]
+            self.assertEqual(len(recs), 1)
+            self.assertIsNotNone(recs[0]["j_per_decode_token"])
+        finally:
+            webui._set_supervisor(None)
+            _reset_landing_state()
+
+    # -- reset --------------------------------------------------------------
+
+    def test_reset_one_and_reset_all(self):
+        webui.jtok_counter_set_enabled_payload({"enabled": True})
+        webui._jtok_live_tick(self._snap(2.0, 100.0, 0.0),
+                              {"endpoint": "http://127.0.0.1:8000"})
+        webui._jtok_live_tick(self._snap(2.0, 0.0, 40.0),
+                              {"endpoint": "http://127.0.0.1:9000"})
+
+        d = webui.jtok_counter_reset_payload({
+            "model": "Qwen3.6-27B", "config_label": "tp2 compressed-tensors",
+            "lanes": ["http://127.0.0.1:8000"],
+        })
+        self.assertTrue(d["ok"])
+        by_lane = {r["lanes"][0]: r for r in
+                   webui.jtok_counter_read_payload()["records"]}
+        self.assertIsNone(by_lane["http://127.0.0.1:8000"]["j_per_prefill_token"])
+        self.assertIsNotNone(by_lane["http://127.0.0.1:9000"]["j_per_decode_token"])
+
+        d = webui.jtok_counter_reset_payload({"reset_all": True})
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["reset_count"], 2)
+        for r in webui.jtok_counter_read_payload()["records"]:
+            self.assertIsNone(r["j_per_prefill_token"])
+            self.assertIsNone(r["j_per_decode_token"])
+
+    def test_reset_missing_key_errors(self):
+        d = webui.jtok_counter_reset_payload({"model": "m"})  # no config_label/lanes
+        self.assertFalse(d["ok"])
+        d = webui.jtok_counter_reset_payload({
+            "model": "nope", "config_label": "nope", "lanes": ["nope"],
+        })
+        self.assertFalse(d["ok"])
+        self.assertIn("no such counter", d["error"])
+
+    # -- schema write-guard (mirrors test_self_update's pattern) -------
+
+    def test_newer_schema_blocks_toggle_and_reset(self):
+        with open(os.path.join(self._tmp.name, su.SCHEMA_STAMP_NAME), "w") as f:
+            json.dump({"schema_version": su.DATA_SCHEMA_VERSION + 1}, f)
+        d = webui.jtok_counter_set_enabled_payload({"enabled": True})
+        self.assertFalse(d["ok"])
+        self.assertIn("schema", d["error"])
+        d = webui.jtok_counter_reset_payload({"reset_all": True})
+        self.assertFalse(d["ok"])
+        self.assertIn("schema", d["error"])
+
+    def test_read_never_blocked_by_guard(self):
+        with open(os.path.join(self._tmp.name, su.SCHEMA_STAMP_NAME), "w") as f:
+            json.dump({"schema_version": su.DATA_SCHEMA_VERSION + 1}, f)
+        d = webui.jtok_counter_read_payload()
+        self.assertTrue(d["ok"])
 
 
 class TestConfigProfilesRoutes(CustomTestCase):

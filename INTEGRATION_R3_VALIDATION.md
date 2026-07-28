@@ -5686,3 +5686,24 @@ Operativ relevant bleibt hier nur:
   budget_s=40 haelt die Suite unter der 400-s-Decke (eigener Test).
 - 13 neue hermetische Tests; auf gemergtem HEAD rig_coupling+comm_suite+
   rig_artifact 134/0 gruen, Marker 0. Zonen eingehalten (kein webui-Edit).
+
+## J/Token-Zaehler (feat/jtok-counter, gemergt)
+
+- Persistenter, resetbarer J/Token-Zaehler (Nutzer-Wunsch via UI-R4-Agent):
+  Schluessel (model, config_label, lanes-LISTE — dual-group-ready, nie 1/2
+  hartcodiert); Prefill und Decode als ZWEI getrennte Akkumulatoren, Misch-
+  Fenster ehrlich separat (mixed_*) statt geraten aufgeteilt; provenance
+  immer measured mit sources-Liste (harness = 20-ms-Trapezintegration,
+  live_poll = Rechteckregel — unterschiedliche Guete benannt).
+- Speicherort im Daten-Root (#275-Trennung), atomare Writes, alle Pfade durch
+  den data_write_guard-Schema-Stempel; Toggle default AUS (Log-Sparsamkeit),
+  Reset je Zaehler + gesamt; Flush max alle 30 s.
+- POLL-LATENZ-BEFUND (erst gemessen, dann gefixt): log_tail() las bei JEDEM
+  ~2-s-Poll die GESAMTE Server-Logdatei (readlines()[-n:]) — Latenz wuchs mit
+  der Session-Laenge, echter Bug, kein Phantom. Fix: rueckwaertiges Chunk-Seek
+  begrenzt auf die angefragte Tail-Groesse (6 Tests inkl. Chunk-Grenzfall).
+- NEBENFIX: Data-Tab-Ueberschneidung (Nutzer-Meldung) an der Wurzel — 7-
+  Spalten-Ergebnistabelle sprengte die 380-px-Grid-Spalte (auto-min-width-
+  Blowout); min-width:0 + overflow-x:auto. UI-R5-Agent informiert, doppelt
+  nicht.
+- Tests: 62 neue; volle planner-Suite auf gemergtem HEAD 1575/64/0. Marker 0.

@@ -1965,6 +1965,18 @@ _LANDING_TARGET_KEY = None
 #: single shared delta baseline is meaningful at all.
 _LANDING_STATE_LOCK = threading.Lock()
 
+#: Persistent joule-per-token counter (opt-in, default OFF): lazily loaded
+#: ONCE and kept as the single in-process source of truth for the lifetime of
+#: this dashboard worker. Both the live-poll hook (_jtok_live_tick, called
+#: from every /api/live_snapshot poll) and the toggle/reset endpoints below
+#: mutate THIS SAME object -- never a second independently-loaded copy --
+#: so a toggle flip is visible to the very next poll tick with no disk
+#: round-trip, and the poll tick's own disk WRITE is throttled
+#: (_JTOK_FLUSH_INTERVAL_S) rather than happening on every ~2s tick.
+_JTOK_STORE = None
+_JTOK_LAST_FLUSH_TS = 0.0
+_JTOK_FLUSH_INTERVAL_S = 30.0
+
 #: Ports probed for a reachable sglang server when neither an explicit
 #: endpoint nor a managed instance exists (the user launches servers BY HAND;
 #: the landing page must attach to them regardless of who started them).
@@ -3120,6 +3132,12 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
         except Exception as e:  # pragma: no cover - defensive
             return {"ok": False, "running": True, "error": str(e),
                     "target": target_info}
+    # Outside the lock: the jtok fold only reads `snap` (already returned by
+    # the serialized section above) and mutates the SEPARATE _JTOK_STORE
+    # object, so it does not need the delta-state lock -- keeping it out
+    # keeps that lock's critical section to just the delta math it exists
+    # to protect.
+    _jtok_live_tick(snap, target_info)
     return {
         "ok": True,
         "running": True,
@@ -3134,6 +3152,163 @@ def landing_snapshot_payload(payload: Optional[dict] = None) -> dict:
             sup if kind == "managed" else None, label, snap
         ),
     }
+
+
+# ===========================================================================
+# Joule-per-token counter (persistent, resettable, opt-in, default OFF).
+#
+# Data model: a small JSON store (jtok_counter.py, design mirrors the #147
+# HiCache-savings accumulator) keyed by (model, config_label, lanes) with
+# prefill and decode kept as two ENTIRELY separate running (joules, tokens)
+# totals -- never averaged together, never blended by a guessed phase split.
+# ``lanes`` is a list (today always the one monitored endpoint) rather than a
+# hardcoded single/pair slot, so a second co-monitored target is just another
+# list element (dual-group readiness).
+#
+# Recording sources:
+#   * the live landing-page poll (every LAND_POLL_MS, piggybacked on the
+#     /api/live_snapshot request that already happens for the tok/s widget --
+#     NO extra network round-trip): a coarse rectangle-rule NVML-power * dt
+#     estimate per poll window, attributed to prefill/decode only when the
+#     window was phase-PURE (only one of the two moved); mixed windows are
+#     tracked separately, never apportioned;
+#   * a completed EnergyHarness scenario run (design #146), which is
+#     phase-pure by construction (exact request timestamps) and higher
+#     fidelity (20ms trapezoidal power integration) -- see
+#     ``energy.py: main()`` -> ``jtok_counter.record_harness_result``.
+#
+# Cost of turning this ON (surfaced verbatim in the toggle's UI copy):
+#   * poll overhead: ~0 extra network I/O (rides the existing 2s poll); a few
+#     microseconds of arithmetic per tick.
+#   * disk: one small atomic JSON rewrite at most every _JTOK_FLUSH_INTERVAL_S
+#     seconds while enabled (running TOTALS only, no per-tick log -- file
+#     size stays a few hundred bytes per (model, config_label, lane), it does
+#     not grow with session length).
+# ===========================================================================
+
+
+def _jtok_store():
+    """Lazily load the ONE in-process JtokCounterStore (see the module-level
+    docstring above _JTOK_STORE). Never raises -- a corrupt/missing store
+    loads empty+disabled (jtok_counter.JtokCounterStore.load's own guard)."""
+    global _JTOK_STORE
+    if _JTOK_STORE is None:
+        from sglang.srt.planner.jtok_counter import DEFAULT_JTOK_STORE, JtokCounterStore
+
+        _JTOK_STORE = JtokCounterStore.load(DEFAULT_JTOK_STORE)
+    return _JTOK_STORE
+
+
+def _jtok_identity(snap: dict, target_info: dict):
+    """(model, config_label, lanes) for the CURRENTLY monitored target. The
+    endpoint label IS today's one lane -- monitoring a second target (a
+    second rig, a second co-scheduled group) would simply add a second lane
+    element/record, not require a schema change."""
+    launch_config = snap.get("launch_config") or {}
+    model = launch_config.get("served_model_name") or "unknown-model"
+    if launch_config:
+        config_label = "tp%s %s" % (
+            launch_config.get("tp_size", "?"),
+            launch_config.get("quantization") or "auto",
+        )
+    else:
+        config_label = "live (external, no launch config)"
+    lanes = [target_info.get("endpoint") or "unknown-endpoint"]
+    return model, config_label, lanes
+
+
+def _jtok_live_tick(snap: dict, target_info: dict) -> None:
+    """Fold one /api/live_snapshot poll window into the persistent counter,
+    if the toggle is on. Must never break the live-monitor response: any
+    failure here is swallowed (this is a side accounting effect, not the
+    primary thing the poll is for)."""
+    global _JTOK_LAST_FLUSH_TS
+    try:
+        store = _jtok_store()
+        if not store.enabled:
+            return  # null-overhead path: no arithmetic, no dict, no disk touch
+        rates = snap.get("rates")
+        if not rates:
+            return
+        from sglang.srt.planner.jtok_counter import DEFAULT_JTOK_STORE, record_live_tick
+
+        model, config_label, lanes = _jtok_identity(snap, target_info)
+        total_watts = sum(
+            (g.get("power_watts") or 0.0) for g in (snap.get("gpus") or [])
+        )
+        record_live_tick(
+            store, model=model, config_label=config_label, lanes=lanes,
+            dt=rates.get("dt"),
+            prefill_tok_s=rates.get("prefill_tok_s") or 0.0,
+            decode_tok_s=rates.get("decode_tok_s") or 0.0,
+            total_watts=total_watts,
+        )
+        now = time.time()
+        if now - _JTOK_LAST_FLUSH_TS > _JTOK_FLUSH_INTERVAL_S:
+            store.save(DEFAULT_JTOK_STORE)
+            _JTOK_LAST_FLUSH_TS = now
+    except Exception:  # pragma: no cover - defensive: never break the poll
+        pass
+
+
+def jtok_counter_read_payload(payload: Optional[dict] = None) -> dict:
+    """GET /api/jtok_counter: the persisted view straight from the in-process
+    store (always current -- it's the same object the live-poll hook and the
+    toggle/reset endpoints below mutate, no extra disk round-trip)."""
+    from sglang.srt.planner.jtok_counter import DEFAULT_JTOK_STORE
+
+    return {"ok": True, "store_path": DEFAULT_JTOK_STORE, **_jtok_store().to_view()}
+
+
+def jtok_counter_set_enabled_payload(payload: dict) -> dict:
+    """POST /api/jtok_counter: {"enabled": bool}. Toggling OFF does not erase
+    any counter -- it only stops the live-poll hook from adding to them
+    (a harness run can still feed record_harness_result while the live-poll
+    side is off, and vice versa)."""
+    from sglang.srt.planner.jtok_counter import DEFAULT_JTOK_STORE
+
+    guard = _data_guard()
+    if guard:
+        return {"ok": False, "error": guard}
+    if "enabled" not in (payload or {}):
+        return {"ok": False, "error": "enabled (bool) is required"}
+    store = _jtok_store()
+    store.enabled = bool(payload.get("enabled"))
+    store.save(DEFAULT_JTOK_STORE)
+    global _JTOK_LAST_FLUSH_TS
+    _JTOK_LAST_FLUSH_TS = time.time()
+    return {"ok": True, **store.to_view()}
+
+
+def jtok_counter_reset_payload(payload: dict) -> dict:
+    """POST /api/jtok_counter/reset: either {"reset_all": true} or
+    {"model":..., "config_label":..., "lanes":[...]} for a single counter.
+    Resets zero the accumulators; the row (and its identity) stays."""
+    from sglang.srt.planner.jtok_counter import DEFAULT_JTOK_STORE
+
+    global _JTOK_LAST_FLUSH_TS
+    guard = _data_guard()
+    if guard:
+        return {"ok": False, "error": guard}
+    payload = payload or {}
+    store = _jtok_store()
+    if payload.get("reset_all"):
+        n = store.reset_all()
+        store.save(DEFAULT_JTOK_STORE)
+        _JTOK_LAST_FLUSH_TS = time.time()
+        return {"ok": True, "reset_count": n, **store.to_view()}
+    model = (payload.get("model") or "").strip()
+    config_label = (payload.get("config_label") or "").strip()
+    lanes = payload.get("lanes")
+    if not model or not config_label or not lanes:
+        return {"ok": False, "error": "reset requires model+config_label+lanes, "
+                                       "or reset_all=true"}
+    found = store.reset_one(model, config_label, lanes)
+    if not found:
+        return {"ok": False, "error": "no such counter"}
+    store.save(DEFAULT_JTOK_STORE)
+    _JTOK_LAST_FLUSH_TS = time.time()
+    return {"ok": True, **store.to_view()}
 
 
 def _live_graph_capture(sup, label, snap) -> dict:
@@ -4816,6 +4991,12 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as e:  # pragma: no cover - defensive
                 self._json(500, {"ok": False, "error": str(e)})
             return
+        if self.path.startswith("/api/jtok_counter"):
+            try:
+                self._json(200, jtok_counter_read_payload())
+            except Exception as e:  # pragma: no cover - defensive
+                self._json(500, {"ok": False, "error": str(e)})
+            return
         if self.path.startswith("/api/models"):
             try:
                 self._json(200, list_models_payload())
@@ -5059,6 +5240,14 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/hicache_saved"):
                 self._json(200, hicache_saved_record(payload))
+                return
+            # Before /api/jtok_counter: /reset is a prefix-extension of the
+            # base path (same flat-prefix-chain convention as card_probe below).
+            if self.path.startswith("/api/jtok_counter/reset"):
+                self._json(200, jtok_counter_reset_payload(payload))
+                return
+            if self.path.startswith("/api/jtok_counter"):
+                self._json(200, jtok_counter_set_enabled_payload(payload))
                 return
             if self.path.startswith("/api/server_start"):
                 self._json(200, server_start_payload(payload))
@@ -6598,7 +6787,7 @@ _INDEX_TEMPLATE = r"""<!doctype html>
     (J/token) is only comparable at the <b>same</b> power-limit context &mdash;
     the tags below make that context explicit.</div>
   <div class="cols">
-    <div>
+    <div style="min-width:0">
       <fieldset>
         <legend>per-card power calibration (measured)</legend>
         <div class="muted" style="margin-bottom:.4rem">Measures each free card's
@@ -6608,10 +6797,16 @@ _INDEX_TEMPLATE = r"""<!doctype html>
           and overrides the energy model's power heuristic. Live GPU power-state
           + throughput monitoring moved to the Landing tab.</div>
         <button onclick="measurePower()" id="pw_btn">Measure per-card power</button>
-        <div id="pw_out" class="muted" style="margin-top:.6rem"></div>
+        <!-- The measured table (powerTable()) has 7 columns and does not fit
+             this column's fixed 380px track once populated -- without
+             overflow-x here the table's content used to blow out the grid
+             item (browsers give grid items an automatic min-width based on
+             content, min-width:0 above defeats that) and visually overlap the
+             scenario-builder column to the right. Scroll it instead. -->
+        <div id="pw_out" class="muted" style="margin-top:.6rem;overflow-x:auto"></div>
       </fieldset>
     </div>
-    <div>
+    <div style="min-width:0">
       <fieldset>
         <legend>scenario builder (#150)</legend>
         <div class="cols" style="grid-template-columns:1fr 1fr;gap:.6rem">
@@ -6638,10 +6833,40 @@ _INDEX_TEMPLATE = r"""<!doctype html>
           </div>
         </div>
         <div style="margin-top:.5rem"><button onclick="previewScenario()">preview scenario</button></div>
-        <div id="sc_out" class="muted" style="margin-top:.6rem"></div>
+        <div id="sc_out" class="muted" style="margin-top:.6rem;overflow-x:auto"></div>
       </fieldset>
     </div>
   </div>
+
+  <!-- Persistent joule-per-token counter: opt-in (default OFF), separate
+       from the two fieldsets above -- those MEASURE (a one-off calibration /
+       a scenario preview); this ACCUMULATES what has already been measured,
+       across restarts, until reset. Fed from the live monitor's poll (while
+       a server is running) and from any completed Scenario/EnergyHarness
+       run, both NVML-measured, never modelled. -->
+  <fieldset class="cfg-section" style="margin-top:var(--s3)">
+    <legend>joule-per-token counter (persistent, resettable)</legend>
+    <div class="muted" style="margin-bottom:.4rem">Accumulates measured
+      NVML-power J/token, keyed per (model, quant/config, lane) &mdash;
+      prefill and decode kept fully SEPARATE, never averaged together.
+      Persists across dashboard restarts; only the reset buttons below zero
+      it. Fed by two measured sources: this dashboard's own live monitor poll
+      while a server is running, and any completed scenario/EnergyHarness
+      run. A poll window where both phases were active at once cannot be
+      split without guessing, so it is shown separately as "mixed", never
+      folded into the prefill/decode numbers.</div>
+    <label><input type="checkbox" id="jtok_enabled" onchange="jtokToggle()"
+      style="width:auto"> enable persistent J/token counter</label>
+    <div class="muted" style="margin:.3rem 0 .6rem"><b>Cost when ON:</b> no
+      extra network round-trip &mdash; it rides the live monitor's existing
+      poll; a small JSON file is rewritten to disk at most once every 30s
+      while enabled (running TOTALS only, a few hundred bytes per row, does
+      not grow with how long a session runs). Off by default to keep log/disk
+      usage minimal when you don't need it.</div>
+    <div id="jtok_out" style="overflow-x:auto"></div>
+    <div style="margin-top:.5rem"><button class="mini secondary"
+      onclick="jtokResetAll()">reset ALL counters</button></div>
+  </fieldset>
   </section>
 
   <hr style="margin:var(--s3) 0;border-color:#30363d">
@@ -8488,6 +8713,7 @@ function showTab(t) {
     if (!window._shareTabInit) { window._shareTabInit=true; csInit(); }
     else csPoll();
     if (!window._energyInit) { window._energyInit=true; loadPowerProfile(); }
+    if (!window._jtokInit) { window._jtokInit=true; loadJtok(); } else loadJtok();
   } else csStopPoll();
   if (t==='quality') { autofillQuality(); if(!window._qualityInit){window._qualityInit=true; loadShots();} }
   if (t==='bench' && !window._benchInit) { window._benchInit=true; benchInit(); }
@@ -12661,6 +12887,90 @@ async function measurePower() {
     else $('pw_out').innerHTML = 'measured '+esc(d.created||'')+' ('+esc(d.driver||'?')+'):'+powerTable(d.cards, d.skipped);
   } catch(e) { $('pw_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
   finally { $('pw_btn').disabled = false; }
+}
+
+// ---- joule-per-token counter (persistent, resettable, opt-in) ----
+function fmtJPerTok(v) { return v==null ? '&mdash;' : v.toFixed(3); }
+function renderJtok(d) {
+  $('jtok_enabled').checked = !!d.enabled;
+  let h = '';
+  if (!d.records || !d.records.length) {
+    h = '<span class="muted">no counters yet'
+      + (d.enabled ? ' &mdash; waiting for the next live poll or scenario run.'
+                   : ' &mdash; turn the toggle on to start accumulating.')
+      + '</span>';
+  } else {
+    h = '<table class="mx"><tr><th style="text-align:left">model</th>'
+      + '<th style="text-align:left">config</th><th style="text-align:left">lane(s)</th>'
+      + '<th>prefill J/tok</th><th>prefill tok</th>'
+      + '<th>decode J/tok</th><th>decode tok</th>'
+      + '<th>mixed</th><th style="text-align:left">source</th><th></th></tr>';
+    for (const r of d.records) {
+      const lanesArr = "["+r.lanes.map(l=>"'"+esc(l)+"'").join(',')+"]";
+      h += '<tr><td style="text-align:left">'+esc(r.model)+'</td>'
+        + '<td style="text-align:left">'+esc(r.config_label)+'</td>'
+        + '<td style="text-align:left">'+esc(r.lanes.join(' + '))+'</td>'
+        + '<td>'+fmtJPerTok(r.j_per_prefill_token)+'</td><td>'+r.prefill_tokens.toFixed(0)+'</td>'
+        + '<td>'+fmtJPerTok(r.j_per_decode_token)+'</td><td>'+r.decode_tokens.toFixed(0)+'</td>'
+        + '<td>'+r.mixed_windows+(r.mixed_j_per_token_blended!=null
+              ? (' ('+fmtJPerTok(r.mixed_j_per_token_blended)+' J/tok blended)') : '')+'</td>'
+        + '<td style="text-align:left">'+esc(r.sources.join(', '))+'</td>'
+        + '<td><button class="mini secondary" onclick="jtokReset(\''
+              +esc(r.model)+'\',\''+esc(r.config_label)+'\','+lanesArr
+              +')">reset</button></td></tr>';
+    }
+    h += '</table>';
+    const gt = d.grand_total;
+    h += '<div class="legend" style="margin-top:.4rem">grand total across all '
+      + 'counters &mdash; prefill '+fmtJPerTok(gt.j_per_prefill_token)+' J/tok ('
+      + gt.prefill_tokens.toFixed(0)+' tok), decode '+fmtJPerTok(gt.j_per_decode_token)
+      + ' J/tok ('+gt.decode_tokens.toFixed(0)+' tok). provenance: measured '
+      + '(NVML power integrated over live-poll and/or harness phase windows).</div>';
+  }
+  $('jtok_out').innerHTML = h;
+}
+async function loadJtok() {
+  try {
+    const r = await fetch('/api/jtok_counter');
+    const d = await r.json();
+    if (!d.ok) { $('jtok_out').innerHTML = '<span class="reasons">'+esc(d.error||'?')+'</span>'; return; }
+    renderJtok(d);
+  } catch(e) { $('jtok_out').innerHTML = '<span class="reasons">'+esc(''+e)+'</span>'; }
+}
+async function jtokToggle() {
+  const enabled = $('jtok_enabled').checked;
+  try {
+    const r = await fetch('/api/jtok_counter', {method:'POST', body: JSON.stringify({enabled})});
+    const d = await r.json();
+    if (!d.ok) {
+      $('jtok_enabled').checked = !enabled;  // revert: the guard refused the write
+      alert(d.error || 'could not change the toggle');
+      return;
+    }
+    renderJtok(d);
+  } catch(e) { alert(''+e); $('jtok_enabled').checked = !enabled; }
+}
+async function jtokReset(model, config_label, lanes) {
+  if (!confirm('Reset the J/token counter for '+model+' / '+config_label+' ('
+               +lanes.join(' + ')+')? This cannot be undone.')) return;
+  try {
+    const r = await fetch('/api/jtok_counter/reset',
+      {method:'POST', body: JSON.stringify({model, config_label, lanes})});
+    const d = await r.json();
+    if (!d.ok) { alert(d.error || 'reset failed'); return; }
+    renderJtok(d);
+  } catch(e) { alert(''+e); }
+}
+async function jtokResetAll() {
+  if (!confirm('Reset ALL J/token counters (every model / config / lane)? '
+               +'This cannot be undone.')) return;
+  try {
+    const r = await fetch('/api/jtok_counter/reset',
+      {method:'POST', body: JSON.stringify({reset_all: true})});
+    const d = await r.json();
+    if (!d.ok) { alert(d.error || 'reset failed'); return; }
+    renderJtok(d);
+  } catch(e) { alert(''+e); }
 }
 
 // ---- Quality tab ----

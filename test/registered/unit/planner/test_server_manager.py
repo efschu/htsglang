@@ -36,6 +36,7 @@ from sglang.srt.planner.server_manager import (
     LaunchSettings,
     SglangSupervisor,
     SupervisorBusyError,
+    _tail_lines,
     available_downloads,
     discover_models,
     download_model,
@@ -86,6 +87,63 @@ def _write_min_gguf(path, arch="qwen35", file_type=15):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
         f.write(header + body)
+
+
+# ===========================================================================
+# _tail_lines: the O(tail size) log-tail read behind status()/log_tail(),
+# on the /api/live_snapshot poll hot path (every LAND_POLL_MS while a server
+# is monitored). Must match plain readlines()[-n:] semantics exactly, without
+# reading the whole file.
+# ===========================================================================
+class TestTailLines(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="tail_")
+
+    def _write(self, name, lines):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w") as f:
+            f.writelines(lines)
+        return path
+
+    def test_matches_readlines_baseline(self):
+        lines = [f"line {i}\n" for i in range(500)]
+        path = self._write("big.log", lines)
+        # NOTE: n=0 is included deliberately -- Python's lines[-0:] equals
+        # lines[0:] (there is no negative zero), i.e. the WHOLE file, which
+        # is the plain-readlines() baseline this helper must match exactly
+        # even at that edge case.
+        for n in (0, 1, 20, 60, 499, 500, 501, 10000):
+            expected = "".join(lines[-n:])
+            self.assertEqual(_tail_lines(path, n), expected, msg=f"n={n}")
+
+    def test_crosses_chunk_boundary(self):
+        # Force multiple 8192-byte backward-seek chunks so the loop's
+        # chunk-stitching path (not just the single-chunk fast case) is hit.
+        lines = [f"{i:08d} padding padding padding\n" for i in range(5000)]
+        path = self._write("chunky.log", lines)
+        self.assertEqual(_tail_lines(path, 20), "".join(lines[-20:]))
+
+    def test_no_trailing_newline_on_last_line(self):
+        path = self._write("noeol.log", ["a\n", "b\n", "c (no eol)"])
+        self.assertEqual(_tail_lines(path, 2), "b\nc (no eol)")
+
+    def test_empty_file(self):
+        path = self._write("empty.log", [])
+        self.assertEqual(_tail_lines(path, 20), "")
+
+    def test_missing_file_returns_placeholder(self):
+        self.assertEqual(
+            _tail_lines(os.path.join(self.tmp, "nope.log"), 20), "(no log)"
+        )
+
+    def test_log_tail_uses_tail_lines(self):
+        """SglangSupervisor.log_tail() delegates to _tail_lines (the poll-hot
+        O(file size) regression this guards is exactly the earlier
+        f.readlines()[-n:] implementation of log_tail itself)."""
+        path = self._write("sup.log", [f"line {i}\n" for i in range(200)])
+        sup = SglangSupervisor.__new__(SglangSupervisor)
+        sup._log_path = path
+        self.assertEqual(sup.log_tail(10), "".join([f"line {i}\n" for i in range(190, 200)]))
 
 
 # ===========================================================================
