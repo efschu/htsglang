@@ -4764,3 +4764,32 @@ enough for the CPU harnesses but NOT for a model boot — msgspec structs
 travel rank-to-rank, and a field the newer side adds (spill_class) kills the
 older tree in broadcast_pyobj. Whole-tree sync + SYNCED_COMMIT.txt is the
 procedure; the --nnodes prescription was also corrected (4, not 2).
+
+# #264 — prefill shard rebalance A/B: thesis confirmed as diagnosis, refuted as lever
+
+TP=3 FP8, 9 full 2048 chunks per arm, cold 20k prefill, identical greedy
+output both arms (character-equal, coherent). Arm B pinned 6,1,1 (enc-tune
+is a no-op, see bug 1): the 5090's wait lead halves (367.1 -> 186.3 ms),
+window -7.6 %, prefill e2e +8.2 % — almost exactly the max-compute drop, as
+the lockstep model window = max_compute + collective_floor demands. The
+floor itself does not move (min-wait 1188.0 -> 1190.7 ms) and rises to
+74.5 % of the window. Price: decode -13.7 % (accept unchanged — pure step
+time, ms/verify +14.4 %) and max_total_num_tokens -47.9 %. NET NEGATIVE at
+this operating point; whoever wants the 390 ms must attack the collective
+floor, not the MLP concentration. Registered as discarded (no retry without
+a new reason).
+
+Bugs found:
+1. --rank-perf-tune enc IS A NO-OP: uneven_perf.py branches only on
+   tune=="dec" (:3147); enc and both share the same objective, and the
+   context floor at loose=0 rejects every concentrated candidate anyway
+   (all six report predicted ctx == floor 492416).
+2. 6,1,1 does not BOOT at the runbook reserve (3000): prefill scratch
+   scales with the MLP shard, the reserve is sized at the auto split — the
+   candidate ladder prints "REJECTED by floor" (a context verdict) for a
+   configuration that is actually unbootable; raising loose-ctx-percent
+   yields an OOM, not slower serving. Arm B needed 4500,2700,2700.
+3. Cost model at this point errs in both uncomfortable directions:
+   predicted +13.9 % prefill / +6.4 % decode step; measured +8.2 % /
+   +14.4 % — the knee guard would have rejected 6,1,1 for the right reason
+   with a 2.2x too-mild number.
