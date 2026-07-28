@@ -16,6 +16,8 @@ observed (graph replay, unreadable events).
 
 import logging
 import unittest
+
+import torch
 from types import SimpleNamespace
 
 import pytest
@@ -298,6 +300,9 @@ class TestCollectiveClock(unittest.TestCase):
             pass
         self.assertIsNone(clock.disarm())
 
+    @unittest.skipUnless(
+        torch.cuda.is_available(), "CollectiveClock spans query CUDA capture state"
+    )
     def test_armed_span_accumulates(self):
         clock = self._clock([0.0, 2.0, 5.0, 8.0])
         clock.arm()
@@ -309,6 +314,9 @@ class TestCollectiveClock(unittest.TestCase):
         self.assertEqual(len(slot.pairs), 2)
         self.assertAlmostEqual(clock.harvest(slot), 0.005)
 
+    @unittest.skipUnless(
+        torch.cuda.is_available(), "CollectiveClock spans query CUDA capture state"
+    )
     def test_nested_span_is_counted_once(self):
         # A collective implemented via other collectives must not be charged
         # once per level.
@@ -322,6 +330,9 @@ class TestCollectiveClock(unittest.TestCase):
         self.assertEqual(len(slot.pairs), 1)
         self.assertAlmostEqual(clock.harvest(slot), 0.010)
 
+    @unittest.skipUnless(
+        torch.cuda.is_available(), "CollectiveClock spans query CUDA capture state"
+    )
     def test_harvest_is_query_only_and_defers(self):
         clock = self._clock([0.0, 4.0], ready=False)
         clock.arm()
@@ -335,6 +346,9 @@ class TestCollectiveClock(unittest.TestCase):
             start.ready = True
         self.assertAlmostEqual(clock.harvest(slot), 0.004)
 
+    @unittest.skipUnless(
+        torch.cuda.is_available(), "CollectiveClock spans query CUDA capture state"
+    )
     def test_harvest_returns_events_to_the_pool(self):
         clock = CollectiveClock()
         events = [FakeEvent(0.0), FakeEvent(3.0)]
