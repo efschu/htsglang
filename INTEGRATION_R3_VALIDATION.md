@@ -5422,3 +5422,47 @@ existiert noch nicht -> Interface heute, Remote-Quelle als Steckstelle.
   Ruecksprung — Health/Rollback funktionieren trotzdem); git archive nimmt nur
   Committetes; kein Supervisor-Lockfile (zwei Supervisoren auf einem HOME
   kollidierten); Tag-Disziplin dashboard-vX.Y.Z muss etabliert werden.
+
+### Q4-Addendum 2 (Phase A, Treiber-Patch-Machbarkeit) — SELBSTKORREKTUR des Erstbefunds
+
+Frage war: laesst sich der open-source-NVIDIA-Kernelteil patchen, damit dmabuf-
+Export (und damit GDR) auf GeForce freikommt — analog zur geohot-P2P-Praezedenz?
+
+- ANTWORT: NEIN, aber aus dem GEGENTEIL des vermuteten Grundes. Es gibt nichts
+  zu patchen: der offene Kernelteil erlaubt es BEREITS.
+- Beleg (Quelltext): die Entscheidung faellt rein CPU-seitig im offenen C-Code —
+  os.c:6011 (osDmabufIsSupported -> return os_dma_buf_enabled),
+  subdevice_ctrl_gpu_kernel.c:513 (DMABUF_CAPABILITY), osinit.c:671 (uebernimmt
+  nach nv->dma_buf_supported). Der Gate-Code in 595.58.03 enthaelt KEINE SKU-,
+  GeForce- oder Board-Pruefung, nur osDmabufIsSupported() && !APM && !PPC64LE.
+- Beleg (laufender Kernel, rein lesend via /proc/kcore+gdb, kein Modul geladen,
+  kein GPU-Zugriff): os_dma_buf_enabled=1 UND nv->dma_buf_supported=1; die
+  PCI-Felder des Geraeteeintrags treffen als Selbstkontrolle exakt die 3080 auf
+  0000:05:00.0 (die Karte mit PIX zur NIC). Das im Auftrag benannte Gate
+  nv-dmabuf.c:1483 ist auf diesem System also bereits offen.
+- Blob-Gegenprobe: das ausgelieferte RM-Blob ist an osDmabufIsSupported
+  byte-gleich zu einem Bau aus der Quelle (gleicher Rumpf, je eine Relokation)
+  — kein verstecktes Gate dort.
+- KORREKTUR des Q4-Erstbefunds: "GeForce-SKU-Riegel im RM, dma_buf_supported=
+  false" war FALSCH. Der Wert ist 1. Die Beobachtung (Attribut 124 = 0,
+  cuMemGetHandleForAddressRange -> INVALID_VALUE) bleibt, ihre Ursache liegt
+  eine Ebene hoeher: in der GESCHLOSSENEN libcuda.so, die nicht Teil von
+  open-gpu-kernel-modules ist. Kein Neubau der offenen Module erreicht sie.
+- geohot-Praezedenz traegt NICHT: der P2P-Mod aendert 16 Dateien, keine davon
+  dmabuf-relevant. Gattung stimmt, Fall nicht — bei P2P liegt die Policy
+  wirklich im offenen Code.
+- GRENZE (Agent hat sie bewusst gezogen, richtig so): libcuda zu patchen oder
+  ihre Policy zu reverse-engineeren ist eine Lizenz-/Mittel-Entscheidung des
+  NUTZERS, keine Agentenarbeit. Nicht weiterverfolgt.
+- Artefakte: alle fuenf .ko wurden UNVERAENDERT gebaut (gcc-14.2.0 noetig,
+  Default-gcc scheitert an -fmin-function-alignment). NICHTS geladen, NICHTS
+  installiert, /lib/modules unberuehrt.
+- FOLGE fuer den Override-Test: Schritt "gepatchtes Modul laden" ENTFAELLT
+  (identisch zum laufenden). GrdmaPciTopoCheckOverride bleibt billiger
+  Falsifikator ohne Erwartungswert — er wirkt im attach-Pfad, den wir mangels
+  fd nie erreichen.
+- OFFENER Alternativpfad (eigenes Projekt, nicht eingeplant): nvidia_p2p_get_pages
+  ist vom laufenden Modul exportiert, nv-p2p.c ohne Riegel, NVIDIAs eigene
+  Topologiepruefung wuerde 3080@05:00.0 <-> CX-4 zustimmen. Es fehlt allein
+  ib_register_peer_memory_client im in-tree ib_core — GPL-Kernelcode, legitim
+  erweiterbar, aber ein eigenes Vorhaben.
