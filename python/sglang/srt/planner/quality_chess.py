@@ -40,8 +40,11 @@ Known-answer note (position after ``7. h4``): the true FEN is
     rnbq1b1r/ppp1kpp1/5n2/3p3p/3N1P1P/1P1Q4/P1P1P1P1/RNB1KB1R b KQ - 0 7
 
 White's dark-squared bishop never leaves c1 in this game, so it IS present on
-c1 (confirmed by the ground-truth reference image shipped alongside this
-module).  The FEN is *computed* from the movetext, never hardcoded.
+c1.  The FEN is *computed* from the movetext, never hardcoded, and so is the
+reference board the dashboard shows next to the model's answer: ``webui``
+renders ``ground_truth()`` through ``chess.svg`` + cairosvg on request rather
+than serving a checked-in screenshot, so the picture the user compares against
+and the position the validator grades against cannot drift apart.
 """
 
 from __future__ import annotations

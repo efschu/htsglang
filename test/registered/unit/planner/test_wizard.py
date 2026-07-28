@@ -653,7 +653,17 @@ class TestWizardInIndex(CustomTestCase):
 
     def test_the_tab_is_in_the_switch(self):
         h = webui.INDEX_HTML
-        self.assertIn("'landing','wizard','runner'", h)
+        self.assertIn("'landing','wizard'", h)
+        # #1: the Planner is no longer a tab. Its markup is nested INSIDE the
+        # wizard as the expert step, so it must not appear in the tab switch
+        # (it would be hidden and shown independently of its own container),
+        # and no button may navigate to it.
+        self.assertNotIn("'runner'", h.split("<script>")[1].split("showTab")[1][:400])
+        self.assertNotIn('id="tab_runner"', h)
+        self.assertNotIn("showTab('runner')", h)
+        wiz = h.index('<div id="view_wizard"')
+        run = h.index('<div id="view_runner"')
+        self.assertLess(wiz, run, "view_runner must be nested inside view_wizard")
 
     def test_the_page_calls_the_endpoints_and_derives_nothing(self):
         h = webui.INDEX_HTML
