@@ -5131,3 +5131,21 @@ deviation from #152, user-driven: opt-in PAT storage for one-click re-sharing
 (0600 in 0700 dir, forget button, existence-check only — never read back). Finding:
 HTCCL/shm is a GPU arm, not CPU (segment pinned to CUDA device); container veth
 exposes no nic_types — honest here, populated on bare metal.
+
+# Spill single-card — TP=1 kv_session_offload boot proof GREEN (functional cycle shown)
+
+Qwen3.5-4B bf16 hybrid-GDN on a single 3080 (UUID-pinned), HEAD a428a7c3fb. The
+arming line confirms the Q3 analysis exactly: mode=plain S=1 — the named TP=1
+branch, not a degenerate "even". Spill provocation needed a real pre-existing knob
+(SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION, schedule_policy.py:71) because standard
+admission reserves prompt+max_new_tokens up front. Evidence: SPILL(partial)
+L=1363 -> WAVE-BACK -> RESTORE complete L=1364 rejoining device batch, a second
+cycle one second later, and the spilled/restored session finished coherently
+(completion_tokens=2200, quote spans the restore boundary, on-topic). Verdict:
+TP=1 spill/restore is bootable and functionally correct; the "only useful with
+uneven DCP" memory line is a throughput statement, not a gate — wizard families
+carry spill on every configuration with DCP as the throughput trade-off line.
+Corner recorded (not chased, synthetic stress): the same engineered pressure spike
+also fired stock retract_decode and hard-aborted the OLDER session (500) — under
+strict FCFS the older session should never be evicted; max_spills=1 was exceeded
+by the dual-front clip trick. Backlog task filed.
