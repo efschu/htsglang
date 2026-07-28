@@ -892,6 +892,9 @@ class DualGroupLane:
         self._busy = False
         self._admission_waits: List[float] = []
         self.lending = None  # set by the scheduler when stage-2 lending is on
+        self.results_total = 0
+        self.prefill_tokens_total = 0
+        self.decode_steps_total = 0
 
     # -- job interface (rank-local; called from the scheduler loop) -------
 
@@ -929,6 +932,12 @@ class DualGroupLane:
             "plan": self.plan.describe(),
             "queued": len(self.jobs),
             "active": self.active is not None,
+            # The result LIST is capped (it carries per-job token ids); the
+            # counters are monotone, so a measurement window is counted by
+            # differencing them and merely SAMPLED by the list.
+            "results_total": self.results_total,
+            "prefill_tokens_total": self.prefill_tokens_total,
+            "decode_steps_total": self.decode_steps_total,
             "results": self.results[-8:],
             "weight_added_mib": getattr(
                 self.runner, "dual_group_lane_weight_added_mib", None
@@ -1276,6 +1285,9 @@ class DualGroupLane:
             result["prefill_wall_ms"] = round(self._last_wall_ms, 2)
         with self._lock:
             self.results.append(result)
+            self.results_total += 1
+            self.prefill_tokens_total += result["input_len"]
+            self.decode_steps_total += result["decode_steps"]
             self.active = None
             if not self.jobs:
                 self._busy = False
