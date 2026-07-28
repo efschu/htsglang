@@ -5267,3 +5267,27 @@ Solver-Bindung verifiziert: /api/key_solver/model + /aggregate VOR /api/key_solv
 unprivilegierte Quelle) statt approximiert. Neue Tests fingen echten Bug:
 _note_peak KeyError bei Erst-Lesung 0.0 (waere beim ersten Poll jeder idlen
 Karte gefeuert). JS-Syntax via quickjs vor+nach geprueft.
+
+## Solver-aggregate()-Fix + shared_process (fix/solver-aggregate-coresident, 1efffac688)
+
+Gemergt. Marker-Gate 0/0/0/0; 400/400 Tests (76 Solver + webui) gruen auf
+Integration (Basis des Fix-Branches war vor dem UI-Merge — der dortige
+png-Fail existiert auf Integration nicht mehr).
+FIX: coresident_budgets() — traegt eine Karte mehrere Lanes, wird jede Lane
+gegen ihren Ko-Residenz-Anteil gesized statt als Alleininhaberin (dasselbe
+#260-Mapping, das die Eval von Hand nutzte): leftover = total − reserve −
+Sum(MAX weights je Share-Gruppe) − Sum(other) − posts; gleicher Split als
+benannte POLICY (Kapazitaets-SUMME split-invariant, usable-ctx wegen
+min(sum, 64x schwaechster) nicht exakt). Absent statt erfunden in 3 Faellen
+(negatives leftover, kein lokaler Footprint, Anteil finanziert keinen Pool —
+Befund, kein Loch). Disjunkte Karten summieren unveraendert. Durchsatz bleibt
+additiv, Kapazitaet nicht — Asymmetrie dokumentiert.
+REGRESSION an den Eval-Kandidaten: A 240361 (alt falsch 1143619, 4,76x),
+C 342942 (3,33x) — doppelt gesichert (Aggregat < halbe alte Zahl UND
+Solo-Summen-Vergleich bleibt als Ko-Residenz-Kostenausweis daneben).
+MITNAHME shared_process=True: Ein-Prozess-Runtime als Plan-Parameter
+(1536 MiB je geteilter Karte, Default False) — Kandidat A: KV 240361 ->
+332883, 5090-Polster 777 -> 2313 MiB; entscheidet drei Ecken des mrr-Sweeps.
+Vorzeichen-Lehre dokumentiert: Budgets summieren NICHT auf die Karte, sondern
+auf available − posts + shared_weight_saving (erster Konservierungstest hatte
+das Vorzeichen falsch — gepinnt in Code + Testkommentar).
