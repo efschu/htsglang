@@ -5327,3 +5327,23 @@ Protokoll). Volltext: /root/.claude/jobs/1481bb40/tmp/BRIEFING_q4_dmabuf_gdr.md
   nicht neu versuchen ohne Nicht-GeForce-Karte oder RM-seitige Aenderung.
   Rig-Untergrenze-Regel gilt: auf Hardware mit Pro-/Datacenter-Karten bleibt
   GDR ein echter Hebel — Feature-Design nicht dagegen gaten.
+
+### Q4-Addendum (gleicher Agent, Nutzer-gesteuerte Fortsetzung): MTU-Fix beziffert, 100G-Weg-Verdikt
+
+- MTU-Fix 40G (#276) DURCHGEFUEHRT + verifiziert (Readback beidseitig 9000,
+  Jumbo-Ping 8972 verlustfrei): +3,3 % FWD / +8,1 % REV — der eigentliche
+  Schaden war die RICHTUNGS-ASYMMETRIE, die jede fruehere Cross-Rig-Messung
+  mitgemessen hat. Ursache war Laufzeit-Drift (interfaces sagte laengst 9000);
+  kein Persistenz-Fix noetig. Temporaeres (100G-IPs, iperf3) zurueckgebaut.
+- 100G-PORT-VERDIKT: kein Gewinn — beide Ports sitzen auf DERSELBEN CX-4 im
+  selben x4-Slot (CX-4 ist Gen3-Device -> Link Gen3-x4, Wand ~28 Gb/s):
+  28,2 Gb/s single, 13,9+14,2=28,1 Gb/s simultan (gemeinsames Budget, nur
+  Aufteilung). Der Slot selbst ist Gen4-faehig — erst eine Gen4-NIC (CX-5)
+  hoebe die Wand auf ~7,9 GB/s, konsistent zum Umbau-Entscheidbaum.
+- Modul-Reload (GrdmaPciTopoCheckOverride) AUSSTEHEND: braucht ~90-s-Fenster
+  (alle Card-Locks + quiet, Planner kurz stoppen wegen /dev/nvidia*-refs,
+  rmmod/modprobe, Probe, Rueckbau, Planner-Neustart). Slice B faehrt gerade
+  mit geladenem Modell (GPU-Vorrang) — Fenster kommt NACH Slice-B-GPU-Phase.
+  Erwartung unveraendert ehrlich: Override wirkt laut Quelle erst beim
+  dmabuf-ATTACH, unser Fehler ist eine Stufe frueher im EXPORT — offen ist
+  nur, ob der RM-Blob den Parameter schon bei Adapter-Init liest.
