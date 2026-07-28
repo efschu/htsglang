@@ -4733,3 +4733,34 @@ the mlp split is too conservative for the 5090 on this workload. Second
 reading: wait is ~68 % of the window on EVERY rank — collective cost, not
 skew (no-P2P/PHB rig); only the ~390 ms imbalance is recoverable by a shard
 rebalance. Feeds --rank-perf-tune enc and the #258 front.
+
+# #263 — all_gather ring, the GRAIN_SIZE cliff, and the live cross-rig confirmation
+
+all_gather ring built, default on at 32 KiB (SGLANG_HTCCL_UCX_AG_RING_KIB):
+80-KiB verify gather -24.9 % (397.6 -> 298.6 us), bs=1 decode gathers stay
+flat. The bytes argument predicts the ring should LOSE (all_gather cannot
+halve its volume) — it wins on the single-threaded UCX worker (2(W-1)
+in-flight requests vs two); reasoning recorded in code against future
+"fixes". Byte gate 0 mismatches at atol 0 on the real link.
+
+128->256 KiB cliff root-caused: at::parallel_for enters an OpenMP region
+above GRAIN_SIZE (32768 ELEMENTS, not bytes — 32768 -> 3.31 us, 32769 ->
+5.96 us), and co-located ranks leaving the barrier together oversubscribe
+the cores so the join waits on descheduled threads (whole-buffer copy max
+6000 us vs grain-chunked max 46 us under 3-way concurrency). Fix: grain-
+split the non-pipelined host passes (~46 lines, byte-neutral): 256-KiB
+all_reduce 13678.6 -> 524.1 us (-96.2 %); <=128 KiB bit-identical path.
+
+Live TP=4 cross-rig boot (uneven 6,4,4,2, NEXTN, solo draft): 166.16
+ms/verify vs the 185.7 arm-A floor = -10.5 %, accept 2.807, output coherent;
+ms/verify from accept and from spec_verify_ct agree to 0.3 %. Attribution
+note: the boot carries #244's threshold AND #263's changes together; a
+split needs one boot with RING_MIB=1. lgc pinning: no effect (+0.5 %,
+byte-identical decode) — the far rank's idle clock is not on the critical
+path. persistence_mode enabled on rig 2.
+
+Cross-rig protocol trap fixed in the runbook: syncing only htccl_ucx.py is
+enough for the CPU harnesses but NOT for a model boot — msgspec structs
+travel rank-to-rank, and a field the newer side adds (spill_class) kills the
+older tree in broadcast_pyobj. Whole-tree sync + SYNCED_COMMIT.txt is the
+procedure; the --nnodes prescription was also corrected (4, not 2).
