@@ -13,6 +13,7 @@ import os
 import pickle
 import time
 from collections import deque
+from contextlib import contextmanager
 from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 
 import torch
@@ -140,6 +141,38 @@ def get_tp_partition_ratios(family: Optional[str] = None) -> Optional[list]:
     return _TP_PARTITION_RATIOS
 
 
+@contextmanager
+def scoped_tp_partition_ratios(
+    ratios: Optional[Sequence[int]],
+    families: Optional[dict] = None,
+):
+    """Install a shard plan for the duration of a block, then restore.
+
+    The plan above is a process global with a bare setter, which is right for
+    the one plan a scheduler process installs at startup. A SECOND group in the
+    same process (the dual-group runtime, #121: a PD lane whose FAST group is
+    nested in the serving group's split) has to build and load its complement
+    shard under ITS OWN vector, and hand the process back unchanged afterwards.
+
+    Doing that without a scope is not merely untidy, it is silently wrong: the
+    only discriminator that decides whether a plan applies is
+    `len(ratios) == tp_size` (see `tp_partition_sizes`, `tp_plan_active`). A
+    2-rank group built while a 3-entry vector is installed does not raise -- it
+    falls back to the EVEN split and loads the wrong units.
+
+    Restores both the base vector and the family vectors, and is nesting-safe.
+    """
+    global _TP_PARTITION_RATIOS, _TP_PARTITION_FAMILIES
+    saved_base = _TP_PARTITION_RATIOS
+    saved_fams = _TP_PARTITION_FAMILIES
+    set_tp_partition_ratios(ratios, families)
+    try:
+        yield
+    finally:
+        _TP_PARTITION_RATIOS = saved_base
+        _TP_PARTITION_FAMILIES = saved_fams
+
+
 # ---------------------------------------------------------------------------
 # Uneven decode context parallel (uneven DCP) token-axis split.
 #
@@ -241,9 +274,9 @@ def weightless_head_counts(total: int, world_size: int) -> list:
     head rank only)."""
     head_rank = _WEIGHTLESS_KV_HEAD_RANK
     assert head_rank is not None, "weightless_head_counts() with fast lane off"
-    assert (
-        0 <= head_rank < world_size
-    ), f"weightless head_rank {head_rank} out of range for world {world_size}"
+    assert 0 <= head_rank < world_size, (
+        f"weightless head_rank {head_rank} out of range for world {world_size}"
+    )
     return [total if r == head_rank else 0 for r in range(world_size)]
 
 
@@ -337,8 +370,7 @@ def _checkpoint_size_mib(model_path: Optional[str]) -> int:
     if not os.path.isdir(model_path):
         return 0
     total = sum(
-        os.path.getsize(f)
-        for f in glob.glob(os.path.join(model_path, "*.safetensors"))
+        os.path.getsize(f) for f in glob.glob(os.path.join(model_path, "*.safetensors"))
     )
     if total == 0:
         total = sum(
@@ -347,7 +379,9 @@ def _checkpoint_size_mib(model_path: Optional[str]) -> int:
     return total // 2**20
 
 
-def resolve_cp_token_ratios(server_args, checkpoint_size_mib: Optional[int] = None) -> Optional[list]:
+def resolve_cp_token_ratios(
+    server_args, checkpoint_size_mib: Optional[int] = None
+) -> Optional[list]:
     """Token-axis split vector for uneven DCP, derived from the server args.
 
     Returns None (use even modulo) when no uneven plan applies. Otherwise a
@@ -553,7 +587,9 @@ def _balanced_group_lengths(weights: Sequence[int], groups: int, max_len: int) -
     return best[0][1]
 
 
-def _partition_units_kv_aligned(units: int, weights: Sequence[int], groups: int) -> list:
+def _partition_units_kv_aligned(
+    units: int, weights: Sequence[int], groups: int
+) -> list:
     """kv-boundary-aware q-head split (task #116).
 
     Under REPLICATED-KV geometry (TP > num_kv_heads) the q heads split in
@@ -667,9 +703,7 @@ def cp_token_speed_vector(
     best = None
     for i in range(grain, -1, -1):
         t = i / float(grain)
-        blend = [
-            t * bw_share[r] + (1.0 - t) * cap_share[r] for r in range(n)
-        ]
+        blend = [t * bw_share[r] + (1.0 - t) * cap_share[r] for r in range(n)]
         # partition_units takes integer weights; scale the blend up so the
         # rounding granularity does not swallow small differences.
         vec = partition_units(grain, [max(1, int(round(x * 10**6))) for x in blend])
@@ -974,9 +1008,7 @@ def attn_q_partition_units(
     return units
 
 
-def attn_q_partition_groups(
-    total_num_kv_heads: int, tp_size: int
-) -> Optional[int]:
+def attn_q_partition_groups(total_num_kv_heads: int, tp_size: int) -> Optional[int]:
     """kv-group count to pass as `groups` when partitioning the Q dimension
     (task #116). Returns `total_num_kv_heads` under the REPLICATED-KV
     geometry (kv < tp), so the q-head split is constrained to never straddle
@@ -1109,9 +1141,7 @@ def solve_unit_rebalance_multi(
     u = {name: list(units) for name, (units, _) in fams.items()}
 
     def capacity(r: int) -> float:
-        freed = sum(
-            (fams[name][0][r] - u[name][r]) * fams[name][1][r] for name in fams
-        )
+        freed = sum((fams[name][0][r] - u[name][r]) * fams[name][1][r] for name in fams)
         return (free_bytes[r] + freed) / bytes_per_token[r]
 
     while fams:
@@ -1130,12 +1160,11 @@ def solve_unit_rebalance_multi(
             receiver = max(
                 (r for r in range(n) if r != donor),
                 key=lambda r: (
-                    (free_bytes[r]
-                     + sum(
-                         (fams[f][0][r] - u[f][r]) * fams[f][1][r]
-                         for f in fams
-                     )
-                     - bpu[r])
+                    (
+                        free_bytes[r]
+                        + sum((fams[f][0][r] - u[f][r]) * fams[f][1][r] for f in fams)
+                        - bpu[r]
+                    )
                     / bytes_per_token[r],
                     -r,
                 ),
@@ -1224,11 +1253,7 @@ def suggest_unit_rebalance_multi(
     new_units, projected = solve_unit_rebalance_multi(
         free_bytes, bytes_per_token, usable
     )
-    changed = {
-        name: vec
-        for name, vec in new_units.items()
-        if vec != usable[name][0]
-    }
+    changed = {name: vec for name, vec in new_units.items() if vec != usable[name][0]}
     if not changed or projected <= int(cur_min):
         return None
     return changed, int(cur_min), projected
@@ -1386,13 +1411,13 @@ class StatelessProcessGroup:
         """
         if self.rank == src:
             self.expire_data()
-            key = f"broadcast_from/{src}/" f"{self.broadcast_send_counter}"
+            key = f"broadcast_from/{src}/{self.broadcast_send_counter}"
             self.store.set(key, pickle.dumps(obj))
             self.broadcast_send_counter += 1
             self.entries.append((key, time.perf_counter()))
             return obj
         else:
-            key = f"broadcast_from/{src}/" f"{self.broadcast_recv_src_counter[src]}"
+            key = f"broadcast_from/{src}/{self.broadcast_recv_src_counter[src]}"
             recv_obj = pickle.loads(self.store.get(key))
             self.broadcast_recv_src_counter[src] += 1
             return recv_obj

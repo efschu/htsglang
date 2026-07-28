@@ -907,6 +907,58 @@ that reads `num_hidden_layers` alone will mis-size every hybrid.
 both stages here), so the tighter stage sets the capacity for both — the open
 slice-3 item from 4.7, unchanged by going cross-rig.
 
+### 4.10 Dual-group runtime: picking a nestable `--rank-tp-ratio` (#121 slice A)
+
+The dual-group runtime puts a second, self-sufficient PD lane on a card that
+already carries a rank of the serving group, out of the SAME weight bytes. It
+pays only if the lane's split is **nested** in the serving group's split: the
+shared rank must occupy the identical unit range in both groups, otherwise the
+"shared" shard is a different shard and the card would hold two copies.
+
+Nesting is not automatic. `partition_units` is largest-remainder with
+minimum-one bumping, so the two groups can hand the remainder to different
+ranks. Measured for the rig pair `[6,1,1] -> [6,2]`: **65 of 497 unit counts
+do not nest**. Concretely at `units=14`, the serving group splits `[10,2,2]`
+while the lane splits `[11,3]` — rank 0 holds 10 units in one group and 11 in
+the other.
+
+Check a candidate ratio against a model before booting anything (no GPU
+needed, `CUDA_VISIBLE_DEVICES=99`):
+
+```python
+from sglang.srt.distributed.dual_group import (
+    check_nesting, derive_nested_plan, transformer_nesting_probes)
+
+plan = derive_nested_plan([6, 1, 1])          # lane shares BIG rank 0
+check_nesting(plan, transformer_nesting_probes(
+    plan,
+    num_attention_heads=..., num_kv_heads=...,
+    intermediate_size=..., linear_attn_units=...))
+```
+
+A failure names the family, the unit count, both partitions and the segment
+that broke. Two rules follow from the arithmetic:
+
+- **A ratio that divides every occurring unit count exactly always nests.**
+  That is the selection rule, not a heuristic — pick the ratio for the units
+  the model actually has, not for a round-looking number.
+- **The lane can only share the FIRST or the LAST rank of the serving group.**
+  A middle rank leaves a non-contiguous complement, which is not one unit
+  range and therefore not shareable at all. `derive_nested_plan` rejects it
+  with that reason.
+
+A second rejection class is not a violation but an undefined comparison: the
+REPLICATED-KV geometry engages on `kv_heads < tp_size`, so a model with 2 kv
+heads is replicated-kv in a TP=3 serving group and normal in a TP=2 lane. No
+shard of one geometry is a shard of the other; the message says so instead of
+producing a plausible wrong number.
+
+`scoped_tp_partition_ratios()` (`distributed/utils.py`) is what makes the
+second group's load safe. Without it the serving group's 3-entry vector simply
+**does not apply** to a 2-rank group — `tp_plan_active` gates on
+`len(ratios) == tp_size` — and the loader falls back to the even split and
+loads the wrong units without raising anything.
+
 
 ## 5. Credentials
 
