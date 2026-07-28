@@ -1373,4 +1373,7 @@ Three OOM boots with an identical, context-independent 2.37 GiB failure
 (ctx 16384 and 6144 alike): 25 GiB of weights + draft + pools leave no room
 for KV and graphs on 31.34 GiB. User verdict: solo tests stop permanently;
 this model runs at TP >= 2 only. Do not retry with different fractions or
-context lengths.
+context lengths. Corollary (user, same day): any test that needs a solo
+5090 boot picks a SMALLER model (2B/4B/9B class or a Q2/Q3 quant) — no
+small FP8 checkpoint exists locally as of 2026-07-28, so fp8-path solo
+tests either download one first or move to the TP>=2 production path.
