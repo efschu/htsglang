@@ -1008,6 +1008,12 @@ Working recipe on this rig (validated 2026-07-28, Qwen3.6-27B-Q3_K_M-GGUF):
   the gate. `SGLANG_LANE_SPEC_VERIFY` / `SGLANG_LANE_SPEC_TV_MAX_ACCEPT` are
   the process-wide equivalents; `SGLANG_LANE_SPEC_DEBUG=1` adds a per-round
   trace (and costs a second lm_head per round, so never measure with it on).
+- **Concurrent mode needs a SMALLER lane pool than the serial recipe.**
+  `--dual-group-lane-concurrent` gives the lane its own graph memory pool on
+  top of everything the serial mode allocates, and with
+  `--dual-group-lane-budget-mib 1600` the boot dies in the lane's breakable
+  prefill capture with a CUDA OOM. 700 MiB carries (#274 round 4). Same
+  corridor as above, just narrower: leave the lane's capture its headroom.
 - **The gate prompt is part of the instrument.** The lane's no-spec
   trajectory is only reproducible where the continuation is forced; on an
   open continuation two identical no-spec runs diverge within a few tokens

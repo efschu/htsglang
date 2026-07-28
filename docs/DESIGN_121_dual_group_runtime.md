@@ -1401,19 +1401,32 @@ Korrektheit, nicht ueber Ambition.
 Der Umbau war als Kostenfix gedacht — und die Messung zeigt, dass der
 VERIFY-MODUS nie der teure Posten war:
 
-| Arm | ms je Runde | Accept | abgeleitet ms/Token |
-|---|---|---|---|
-| No-Spec, graph-gefangen | 16,17 (je Schritt) | — | **16,17** |
-| `target_verify` (1 Forward/Runde) | 67,65 | 1,189 | 56,90 |
-| `seqdecode`-Bruecke | 68,95 | 1,105 | 62,40 |
-| `extend` (falsch) | 90,94 | 1,103 | 82,44 |
+Alle Zahlen von EINEM Boot unter exklusiver Kartenbelegung, alphabet-Prompt
+(105 Token), 64 Ausgabe-Token, GANZE Runde gemessen (Kopf + Verify), die
+beiden Posten getrennt ausgewiesen:
 
-Ein TARGET_VERIFY-Forward kostet ~67 ms gegen einen graph-gefangenen Decode
-von 16,17 ms. Bei der gemessenen Accept-Laenge von ~1,19 spart der Wechsel
-von der Bruecke auf den Ein-Forward-Verify also bestenfalls ~10 % — der
-Faktor-3,5-Verlust gegen die Graph-Basis bleibt praktisch unveraendert
-stehen. Um ihn ueber den Wechsel des Verify-Modus zu schliessen, muesste die
-Accept-Laenge ueber ~4,2 liegen, was eine Kette mit K=3 nicht kann.
+| Arm | Prefill | ms je Runde | davon Verify | davon Kopf | Accept | ms/Token |
+|---|---|---|---|---|---|---|
+| No-Spec, graph-gefangen | 88,7 | 16,16 je Schritt | — | — | — | **16,16** |
+| `seqdecode`-Bruecke | 120,1 | 77,15 | 68,48 | 8,67 | 1,086 | 71,04 |
+| `target_verify` | 114,1 | 77,89 | 68,83 | 9,06 | 1,086 | 71,72 |
+| `extend` (falsch) | 115,3 | 100,26 | 90,01 | 10,25 | 1,105 | 90,73 |
+
+RAUSCHBODEN, mitgemessen (derselbe Arm zweimal): No-Spec 16,205 gegen 16,212
+ms (0,04 %), `target_verify` 71,45 gegen 69,66 ms/Token, `seqdecode` 69,93
+gegen 72,39 ms/Token — der Boden auf der ms/Token-Achse liegt bei **~3,4 %**,
+weil die Accept-Laenge zwischen zwei Laeufen desselben Arms schwankt
+(1,068-1,226). Der Unterschied zwischen `seqdecode` und `target_verify`
+betraegt 1 %. **Er liegt unter der Nachweisgrenze: die beiden sind an diesem
+Arbeitspunkt ununterscheidbar.**
+
+Das ist die eigentliche Aussage. Ein TARGET_VERIFY-Forward kostet ~69 ms
+gegen einen graph-gefangenen Decode von 16,16 ms; bei Accept ~1,09 macht ein
+Forward je Runde gegenueber ~1,09 Forwards je Runde keinen messbaren
+Unterschied. Damit der Moduswechsel den Faktor-4,4-Verlust gegen die
+Graph-Basis schliessen wuerde, muesste die Accept-Laenge ueber ~4,2 liegen —
+mit K=3 unerreichbar. Die Runden 1-3 haben diese Zahlen ausserdem zu klein
+gemeldet: sie enthielten nur den Verify, nicht die 8,7-10,3 ms des Kopfes.
 
 **Die Konsequenz fuer Runde 5, ausdruecklich:** der Hebel ist die
 GRAPH-AUFNAHME des Verifys (und des Kopfes), nicht die Wahl des
@@ -1463,3 +1476,64 @@ Und unabhaengig davon, nach der Messlage die groessere Sache: die
 Graph-Aufnahme des Verifys. Solange ein Verify-Forward 67 ms gegen 16 ms
 gefangenen Decode kostet, entscheidet nicht der Verify-Modus ueber Gewinn
 oder Verlust der Spekulation auf der Lane.
+
+#### Der nebenlaeufige Punkt: Kartenaequivalente MIT Spekulation auf der Lane
+
+Runde 3 hatte diesen Punkt bewusst zurueckgestellt. Er wird hier erhoben, und
+zwar fuer die KOHAERENTE Konfiguration (Default `seqdecode`) — eine
+Aggregat-Zahl an einem Arm, der die falschen Tokens rechnet, waere unbenutzbar
+(Einzelteil-vor-Verbund).
+
+Formel unveraendert aus 11.5, beide Klassen auf der WANDUHR gezaehlt:
+
+    share_c = Rate_c(gemeinsames Fenster) / Rate_c(solo)
+    E       = share_Verband + share_Lane
+
+METHODIK-KORREKTUR, die der erste Versuch erzwungen hat: die Lane-Rate darf
+NICHT aus den selbstgemeldeten ms je Runde abgeleitet werden. Die sagen, wie
+schnell ein Tick LAEUFT, nicht wieviel die Lane SCHAFFT — im seriellen Modus
+wechseln sich Tick und Serving-Iteration ab, die Tick-Zeit bleibt also fast
+gleich, waehrend die Zeit ZWISCHEN den Ticks waechst. So gerechnet kam fuer
+den seriellen Modus E = 1,23 heraus, fuer eine Betriebsart, die per
+Konstruktion eine Nullsummen-Teilung einer Wanduhr ist. Beide Klassen zaehlen
+jetzt geleistete Arbeit je Wandsekunde des Fensters; Anfragen, die ueber das
+Fenster hinauslaufen, fallen raus.
+
+Gepaarte Boots, identische Konfiguration ausser dem Nebenlaeufigkeits-Schalter
+(Lane-Budget 700 MiB, Default-Verify, 45-s-Fenster, 105-Token-Prompt,
+32 Ausgabe-Token je Lane-Job):
+
+| Modus | share_Verband | share_Lane | **E** |
+|---|---|---|---|
+| seriell | 40,2 -> 13,1 tok/s (**0,325**) | 12,80 -> 9,53 tok/s (**0,744**) | **1,069** |
+| nebenlaeufig | 39,6 -> 35,2 tok/s (**0,895**) | 10,42 -> 10,44 tok/s (**1,002**) | **1,897** |
+
+    E 1,069 -> 1,897 = +77,4 % Aggregat
+
+Rauschboden dazu: der Lane-Solo-Arm zweimal gemessen weicht um 0,69 % ab, die
+drei Verband-Solo-Laeufe um 1,1 % — der Effekt ist zwei Groessenordnungen
+groesser als der Boden.
+
+DREI EHRLICHE ANMERKUNGEN dazu:
+* `share_Lane` = 1,002 heisst, die Lane verliert im nebenlaeufigen Modus
+  NICHTS an den Verband; der Verband gibt 10,5 % ab. Die Lane ist hier die
+  PD-priorisierte Klasse, und die Prioritaet haelt.
+* Der Gewinn ist groesser als der der no-spec-Lane in 11.5 (+57,5 % im
+  Decode-Arm). Der Grund ist derselbe wie der Grund fuer den Verlust an
+  Absolutgeschwindigkeit: ein EAGER Lane-Tick besteht zu einem grossen Teil
+  aus CPU-Startzeit, und genau diese Luecken sammelt der Verband ein. Der
+  Kartenaequivalent-Gewinn misst hier also mit, dass die Lane langsam ist —
+  er wird KLEINER, wenn Runde 5 den Verify graph-faengt, und das ist kein
+  Widerspruch, sondern die richtige Reihenfolge.
+* Die SOLO-Rate der Lane ist im nebenlaeufigen Boot niedriger (10,42 gegen
+  12,80 tok/s). Der eigene Graph-Pool und die eigene Dequant-Werkstatt der
+  Nebenlaeufigkeit kosten also nicht nur VRAM. E ist ein Verhaeltnis INNERHALB
+  eines Modus und davon unberuehrt, aber wer absolute Lane-Durchsaetze
+  vergleicht, muss diesen Posten mitfuehren.
+
+BOOT-BEFUND, der ins Runbook gehoert: mit dem seriellen Rezept
+(`--dual-group-lane-budget-mib 1600`) kippt der NEBENLAEUFIGE Boot beim
+Aufnehmen des breakable-Prefill-Graphen der Lane in ein CUDA-OOM — der eigene
+Graph-Memory-Pool der Nebenlaeufigkeit kommt oben drauf. 700 MiB Lane-Budget
+traegt. Das ist derselbe Korridor, den 4.11 fuer den seriellen Fall nennt, nur
+enger.

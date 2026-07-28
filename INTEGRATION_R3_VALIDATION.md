@@ -6210,29 +6210,57 @@ Binaries wiederverwendbar: /root/gdr-verify/ (Rig 1), /root/gpurdma_03_transfer
   (`target_verify`); auf `squares` erreichte `seqdecode` 2,0. Der belastbare
   Vergleich ist der innerhalb EINES Boots und desselben Prompts, und dort
   liegt `target_verify` nicht unter der Bruecke.
-- ZAHLEN (Boot 1, seriell, alphabet-Prompt 105 Token, 64 Ausgabe-Token, TP=3
-  uneven, GGUF Q3_K_M):
+- ZAHLEN (exklusive Kartenbelegung, alphabet-Prompt 105 Token, 64
+  Ausgabe-Token, TP=3 uneven, GGUF Q3_K_M; GANZE Runde gemessen, Kopf und
+  Verify getrennt ausgewiesen):
 
-  | Arm | Prefill ms | ms je Runde | Accept | abgeleitet ms/Token |
-  |---|---|---|---|---|
-  | No-Spec (graph-gefangen) | 88,3 | 16,17 je Schritt | — | **16,17** |
-  | `target_verify` | 114,7 | 67,65 | 1,189 | 56,90 |
-  | `seqdecode` | 117,4 | 68,95 | 1,105 | 62,40 |
-  | `extend` (inkohaerent) | 118,6 | 90,94 | 1,103 | 82,44 |
+  | Arm | Prefill ms | ms je Runde | davon Verify | davon Kopf | Accept | ms/Token |
+  |---|---|---|---|---|---|---|
+  | No-Spec (graph-gefangen) | 88,7 | 16,16 je Schritt | — | — | — | **16,16** |
+  | `seqdecode` (Default) | 120,1 | 77,15 | 68,48 | 8,67 | 1,086 | 71,04 |
+  | `target_verify` | 114,1 | 77,89 | 68,83 | 9,06 | 1,086 | 71,72 |
+  | `extend` (inkohaerent) | 115,3 | 100,26 | 90,01 | 10,25 | 1,105 | 90,73 |
 
-  DER EIGENTLICHE BEFUND DER RUNDE: der Verify-MODUS war nie der teure
-  Posten. Ein TARGET_VERIFY-Forward kostet ~67 ms gegen 16,17 ms
-  graph-gefangenen Decode; bei Accept ~1,19 spart der Wechsel von der Bruecke
-  auf den Ein-Forward-Verify bestenfalls ~10 %. Damit der Moduswechsel allein
-  den Verlust gegen die Graph-Basis schliessen wuerde, muesste die
-  Accept-Laenge ueber ~4,2 liegen — mit K=3 unerreichbar. Der Hebel ist die
+  RAUSCHBODEN mitgemessen (derselbe Arm zweimal): No-Spec 16,205 gegen 16,212
+  ms (0,04 %); auf der ms/Token-Achse **~3,4 %**, weil die Accept-Laenge
+  zwischen zwei Laeufen desselben Arms schwankt (1,068-1,226). Der Abstand
+  zwischen `seqdecode` und `target_verify` betraegt 1 % und liegt damit UNTER
+  der Nachweisgrenze — die beiden sind an diesem Arbeitspunkt
+  ununterscheidbar. Ein TARGET_VERIFY-Forward kostet ~69 ms gegen 16,16 ms
+  graph-gefangenen Decode; bei Accept ~1,09 macht ein Forward je Runde
+  gegenueber ~1,09 Forwards keinen messbaren Unterschied. Der Hebel ist die
   GRAPH-AUFNAHME von Verify und Kopf, nicht die Wahl des Verify-Modus.
+  (Gegenprobe: dieselbe Tabelle wurde in einem frueheren Boot unter
+  paralleler RDMA-Last erhoben und stimmt auf ~1 % ueberein — die Stoerlast
+  hat diese Zahlen nicht bewegt.)
+- NEBENLAEUFIGER MESSPUNKT ERHOBEN (Runde 3 hatte ihn zurueckgestellt), fuer
+  die KOHAERENTE Konfiguration. Gepaarte Boots, identisch ausser dem
+  Nebenlaeufigkeits-Schalter, Lane-Budget 700 MiB, 45-s-Fenster:
+
+  | Modus | share_Verband | share_Lane | **E** |
+  |---|---|---|---|
+  | seriell | 40,2 -> 13,1 tok/s (0,325) | 12,80 -> 9,53 tok/s (0,744) | **1,069** |
+  | nebenlaeufig | 39,6 -> 35,2 tok/s (0,895) | 10,42 -> 10,44 tok/s (1,002) | **1,897** |
+
+  E 1,069 -> 1,897 = **+77,4 % Aggregat**; Rauschboden 0,69 % (Lane solo
+  zweimal) bzw. 1,1 % (Verband solo dreimal). METHODIK-KORREKTUR unterwegs:
+  die Lane-Rate darf nicht aus den selbstgemeldeten ms je Runde abgeleitet
+  werden (die messen, wie schnell ein Tick LAEUFT, nicht wieviel die Lane
+  SCHAFFT) — so gerechnet kam fuer den seriellen Modus E = 1,23 heraus, fuer
+  eine per Konstruktion nullsummige Betriebsart. Jetzt zaehlen beide Klassen
+  geleistete Arbeit je Wandsekunde. EHRLICH DAZU: der Gewinn ist groesser als
+  der der no-spec-Lane (+57,5 %, 11.5), weil ein EAGER Lane-Tick viel
+  CPU-Startzeit enthaelt, die der Verband einsammelt — er wird also KLEINER,
+  wenn Runde 5 den Verify graph-faengt. Und die SOLO-Rate der Lane ist im
+  nebenlaeufigen Boot niedriger (10,42 gegen 12,80 tok/s): der eigene
+  Graph-Pool kostet nicht nur VRAM.
+- BOOT-BEFUND fuers Runbook: mit dem seriellen Rezept (Lane-Budget 1600) kippt
+  der NEBENLAEUFIGE Boot beim Aufnehmen des breakable-Prefill-Graphen der Lane
+  in ein CUDA-OOM; 700 MiB Lane-Budget traegt.
 - MESSFEHLER DER RUNDEN 1-3 KORRIGIERT: die gemeldeten ms/Runde enthielten
   nur den Verify, nicht die K Draft-Forwards des Kopfes. `_spec_step` misst
   jetzt die ganze Runde und meldet `verify_ms_mean` und `propose_ms_mean`
-  getrennt. Die Tabelle oben stammt noch aus dem Boot vor dieser Korrektur
-  und ist damit eine UNTERGRENZE der Rundenkosten fuer alle drei Spec-Arme;
-  die No-Spec-Zeile ist unberuehrt.
+  getrennt. Die Tabelle oben traegt diese Korrektur bereits.
 - INSTRUMENTEN-BEFUND, der jedes weitere Kohaerenz-Urteil bindet: der
   Vergleich No-Spec gegen Spec traegt ZWEI Unterschiede. Beide Spec-Arme
   teilen sich den Spec-Prefill, der wegen `CaptureHiddenMode.FULL` eager
