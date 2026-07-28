@@ -69,6 +69,8 @@ import re
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from sglang.srt.planner.self_update import planner_data_path
+
 __all__ = [
     "JOULES_PER_KWH",
     "HICACHE_CACHE_SOURCES",
@@ -465,7 +467,11 @@ class HiCacheSavingsStore:
         return store
 
 
-#: Default on-disk location, next to the measured results store.
-DEFAULT_HICACHE_STORE = os.path.join(
-    os.path.dirname(__file__), "hicache_savings.json"
+#: Default on-disk location: the shared planner DATA dir (~/.cache/sglang),
+#: NOT the package dir — a store inside the code tree would be lost/forked on
+#: every dashboard version switch (self_update code/data separation). A copy
+#: at the legacy in-package path is migrated forward once, idempotently.
+DEFAULT_HICACHE_STORE = planner_data_path(
+    "hicache_savings.json",
+    legacy=os.path.join(os.path.dirname(__file__), "hicache_savings.json"),
 )

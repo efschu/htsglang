@@ -168,6 +168,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Serve the thin web UI (stdlib HTTP, no CDN) instead of a "
         "one-shot plan; --model becomes optional.",
     )
+    web.add_argument(
+        "--serve-supervised",
+        action="store_true",
+        help="Like --serve, but under the self-update supervisor: serves "
+        "the installed 'current' dashboard version (falling back to this "
+        "checkout), health-checks each start, and auto-rolls-back to the "
+        "last good version on failure. Enables the About-tab "
+        "install/upgrade/downgrade button; plain --serve keeps working "
+        "unchanged and refuses version switches.",
+    )
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", type=int, default=8780)
     mx = p.add_argument_group("combination explorer (S4)")
@@ -837,11 +847,17 @@ def _run_landscape(args) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
+    if args.serve_supervised:
+        from sglang.srt.planner.self_update import run_supervisor
+
+        return run_supervisor(host=args.host, port=args.port)
+
     if args.serve:
         from sglang.srt.planner.webui import serve
 
-        serve(host=args.host, port=args.port)
-        return 0
+        # serve() returns RESTART_EXIT_CODE when a supervised worker was
+        # asked to switch versions; the plain foreground path exits 0.
+        return serve(host=args.host, port=args.port)
 
     if args.list_cards:
         from sglang.srt.planner.card_library import CardLibrary
