@@ -5286,6 +5286,86 @@ class ServerArgs:
             )
         return None
 
+    def _reject_tree_verify_under_uneven_dcp(self):
+        """TREE-SPEC GUARD (restored, #76; broadened + hoisted, #139).
+
+        topk > 1 tree/branching speculation is NOT correct under uneven-weighted
+        DCP -- and the runtime machinery it would activate keys off the SUPERSET
+        condition. flashinfer_backend.py sets
+
+            uneven_dcp    = uneven_dcp_kv_replicated(dcp_size) or weightless_kv
+            dcp_tree_mask = uneven_dcp and speculative_eagle_topk > 1
+
+        i.e. ANY cross-rank uneven-DCP variant (a --rank-tp-ratio plan with
+        dcp_size > 1, even-modulo OR weighted) and the weightless-KV fast lane
+        would all enable the unvalidated tree mask. This guard covers the whole
+        superset, so no DCP variant can reach the tree mask without an explicit,
+        audited un-guarding. ``uneven_weighted_dcp`` is not tested separately:
+        it is a subset of ``rank_tp_ratio is not None``. The check is
+        intentionally independent of --speculative-algorithm, mirroring the
+        activation condition at flashinfer_backend.dcp_tree_mask exactly.
+
+        The tree-drafting feature (flashinfer_backend.py:
+        _build_dcp_ragged_tree_mask + the ragged draft->draft custom-mask
+        verify) was implemented and GPU-validated, and it FAILS the
+        lossless-greedy invariant: at temp 0 a topk>1 tree produces
+        NON-deterministic (run-to-run A != B) and NON-greedy output that
+        diverges from the topk=1 chain oracle, whereas topk=1 is
+        bitwise-deterministic. Root cause (for a future real fix): the DCP
+        verify splits attention into a paged token-sharded prefix read and a
+        ragged draft->draft read merged by LSE; the draft->draft tree sub-mask
+        sliced from the EAGLE FULL_MASK does not reproduce each draft node's
+        exact (committed-prefix + true tree ancestors) context, so per-node
+        verify logits become tree-topology-dependent and the target argmax flips
+        as the (run-to-run varying) draft tree changes. Reproduces with CUDA
+        graphs OFF, so it is a mask/LSE-merge semantics bug, not a
+        graph-capture artefact. Until the ancestor semantics in
+        _build_dcp_ragged_tree_mask vs the paged/ragged LSE-merge are audited,
+        hard-error instead of silently emitting wrong tokens. topk == 1 keeps
+        the byte-identical, correct plain-causal chain path.
+
+        HARDENED (#98 sighting): the trigger is not read as "topk > 1" but as
+        "anything that would activate a tree-masked verify" -- see
+        tree_verify_activation_reason(). Upstream is carrying a SECOND door onto
+        this exact terrain (--speculative-dflash-tree-verify, PRs
+        #31069/#29587/#29907), and a guard that names one flag is a guard that a
+        merge walks past.
+
+        HOISTED (#139 audit): this used to live inside the ``elif is_cuda()``
+        branch of _handle_dcp_validation, i.e. BEHIND the ``if is_hip(): return``
+        early exit -- so on ROCm an uneven-DCP tree config was never rejected at
+        arg-validation time and only died later, in the backend's defensive
+        check, after the full weight load. The condition is platform-independent
+        (it mirrors a backend flag, not a platform capability), so it belongs
+        with the other platform-independent boot gates. Stock even DCP on HIP is
+        untouched: without --rank-tp-ratio and without the weightless lane the
+        guard cannot fire.
+
+        NOT a guard against trees in general: with dcp_size == 1 (TP=1, or plain
+        even/uneven TP without DCP) ``uneven_dcp`` is False, the verify runs the
+        stock single-wrapper EAGLE path with the full (prefix + tree ancestors)
+        custom mask, and topk > 1 stays allowed. The caller only reaches here
+        when dcp_size > 1.
+        """
+        tree_reason = self.tree_verify_activation_reason()
+        if (
+            self.rank_tp_ratio is not None or self.weightless_kv_fastlane
+        ) and tree_reason is not None:
+            raise ValueError(
+                "Tree/branching speculative decoding "
+                f"({tree_reason}) "
+                "is not supported under any cross-rank DCP variant that "
+                "activates the DCP tree mask (uneven-hybrid DCP via "
+                "--rank-tp-ratio -- even-modulo or weighted -- or the "
+                "--weightless-kv-fastlane): the tree-masked draft->draft "
+                "verify attention on this path produces "
+                "tree-topology-dependent verify logits, giving "
+                "non-deterministic and non-greedy output (verified against a "
+                "topk=1 oracle at temp 0, #76). Use --speculative-eagle-topk "
+                "1 (linear chain speculation), which is correct and "
+                "bitwise-deterministic under uneven-DCP."
+            )
+
     def _handle_dcp_validation(self):
         # Decode context parallel (DCP) is currently implemented and validated
         # only on AMD HIP/ROCm. Reject invalid or unverified configurations
@@ -5317,6 +5397,7 @@ class ServerArgs:
             reject_ngram_verify_under_dcp(self.dcp_size)
         if _spec_algo.is_frozen_kv_mtp():
             reject_frozen_kv_mtp_verify_under_dcp(self.dcp_size)
+        self._reject_tree_verify_under_uneven_dcp()
         if is_hip():
             return
         elif is_cuda():
@@ -5341,64 +5422,6 @@ class ServerArgs:
                 and len(set(self.rank_tp_ratio)) > 1
                 and self.dcp_size == self.tp_size
             )
-            # TREE-SPEC GUARD (restored, #76; broadened, #139): topk > 1
-            # tree/branching speculation is NOT correct under uneven-weighted
-            # DCP -- and the runtime machinery it would activate keys off the
-            # SUPERSET condition. flashinfer_backend.py sets
-            #   uneven_dcp = uneven_dcp_kv_replicated(dcp_size) or weightless_kv
-            #   dcp_tree_mask = uneven_dcp and speculative_eagle_topk > 1
-            # i.e. ANY cross-rank uneven-DCP variant (a --rank-tp-ratio plan
-            # with dcp_size > 1, even-modulo OR weighted) and the weightless-KV
-            # fast lane would all enable the unvalidated tree mask. Guard the
-            # whole superset here so no DCP variant can reach the tree mask
-            # without an explicit, audited un-guarding (see the root-cause note
-            # below). This check is intentionally independent of
-            # --speculative-algorithm: it mirrors the activation condition at
-            # flashinfer_backend.dcp_tree_mask exactly. The tree-drafting feature
-            # (flashinfer_backend.py: _build_dcp_ragged_tree_mask + the ragged
-            # draft->draft custom-mask verify) was implemented and GPU-validated,
-            # and it FAILS the lossless-greedy invariant: at temp 0 a topk>1 tree
-            # produces NON-deterministic (run-to-run A != B) and NON-greedy output
-            # that diverges from the topk=1 chain oracle, whereas topk=1 is
-            # bitwise-deterministic. Root cause (for a future real fix): the DCP
-            # verify splits attention into a paged token-sharded prefix read and a
-            # ragged draft->draft read merged by LSE; the draft->draft tree
-            # sub-mask sliced from the EAGLE FULL_MASK does not reproduce each
-            # draft node's exact (committed-prefix + true tree ancestors) context,
-            # so per-node verify logits become tree-topology-dependent and the
-            # target argmax flips as the (run-to-run varying) draft tree changes.
-            # Reproduces with CUDA graphs OFF, so it is a mask/LSE-merge semantics
-            # bug, not a graph-capture artefact. Until the ancestor semantics in
-            # _build_dcp_ragged_tree_mask vs the paged/ragged LSE-merge are
-            # audited, hard-error instead of silently emitting wrong tokens.
-            # topk == 1 keeps the byte-identical, correct plain-causal chain path.
-            #
-            # HARDENED (#98 sighting): the trigger is no longer read as "topk >
-            # 1" but as "anything that would activate a tree-masked verify" --
-            # see tree_verify_activation_reason(). Upstream is carrying a
-            # SECOND door onto this exact terrain
-            # (--speculative-dflash-tree-verify, PRs #31069/#29587/#29907), and
-            # a guard that names one flag is a guard that a merge walks past.
-            tree_reason = self.tree_verify_activation_reason()
-            if (
-                uneven_weighted_dcp
-                or self.rank_tp_ratio is not None
-                or self.weightless_kv_fastlane
-            ) and tree_reason is not None:
-                raise ValueError(
-                    "Tree/branching speculative decoding "
-                    f"({tree_reason}) "
-                    "is not supported under any cross-rank DCP variant that "
-                    "activates the DCP tree mask (uneven-hybrid DCP via "
-                    "--rank-tp-ratio -- even-modulo or weighted -- or the "
-                    "--weightless-kv-fastlane): the tree-masked draft->draft "
-                    "verify attention on this path produces "
-                    "tree-topology-dependent verify logits, giving "
-                    "non-deterministic and non-greedy output (verified against a "
-                    "topk=1 oracle at temp 0, #76). Use --speculative-eagle-topk "
-                    "1 (linear chain speculation), which is correct and "
-                    "bitwise-deterministic under uneven-DCP."
-                )
             # #143: the weightless-KV fast lane joins the uneven-weighted path as
             # a supported spec+DCP config, for CHAIN speculation only. Its own
             # admission rules (solo placement, solo rank == head rank, fixed k,
