@@ -74,6 +74,8 @@ __all__ = [
     "detect_endpoint_payload",
     "bench_probe_payload",
     "bench_run_events",
+    "bench_factors_payload",
+    "scenario_suggest_payload",
     "share_preview_payload",
     "share_submit_payload",
     "serve",
@@ -3202,6 +3204,86 @@ def bench_run_payload(payload: Optional[dict] = None) -> dict:
 
 
 # ===========================================================================
+# Task #218 -- the limiting factors, one measurement each, and the composed
+# suggestion. Both are THIN adapters over planner/bench_factors.py; the rules
+# and the prose live there, and these only map an HTTP body onto them.
+#
+# Neither endpoint measures anything itself. ``/api/bench_factors`` reads the
+# studies that are on disk plus at most one bounded scrape of a running
+# engine; a factor with no study comes back absent with the action that would
+# produce it, so the page never has to invent a placeholder. Starting a
+# measurement stays what it already was: the factor's own endpoint, run
+# asynchronously and polled.
+# ===========================================================================
+
+
+def _plan_for_factors(payload: dict) -> Optional[dict]:
+    """The plan answer for this body, or None when there is nothing to plan.
+
+    Only the state/KV balance factor needs it, and a benchmark tab pointed at
+    an external server frequently has no model picked at all. A missing plan
+    is a normal state here, not an error, so it is swallowed into None and the
+    factor says what is missing in its own words.
+    """
+    if not (payload or {}).get("model"):
+        return None
+    try:
+        d = plan_from_payload(payload)
+    except Exception:  # pragma: no cover - defensive
+        return None
+    return d if d.get("valid") is not False else None
+
+
+def bench_factors_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/bench_factors -> every limiting factor, read separately.
+
+    Body: ``{endpoint?}`` plus, optionally, the ordinary plan payload (the
+    state/KV balance factor is the only one that needs it). Read-only and
+    non-blocking: nothing here allocates on a card, boots a server or waits on
+    a job. Each factor answers with its own provenance, its own timestamp and
+    the action that would (re)measure it -- ``curl`` gets exactly what the
+    page draws.
+    """
+    from sglang.srt.planner import bench_factors
+
+    payload = payload or {}
+    try:
+        return bench_factors.read_factors(
+            payload, plan=_plan_for_factors(payload)
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "error": str(e), "factors": []}
+
+
+def scenario_suggest_payload(payload: Optional[dict] = None) -> dict:
+    """POST /api/scenario_suggest -> one concrete proposal for this rig.
+
+    Composes the endpoints that already exist -- the working points from
+    ``/api/lever_profiles``, the card probe basis they were ranked on, and the
+    state/KV balance from the plan -- into a single answer: which working
+    point, which flags, which expected figures and where each came from. It
+    computes no new number, so it cannot disagree with the working-point table
+    about the same configuration.
+
+    Boots nothing. The answer carries flags and a profile key; applying them
+    is a separate call the user makes.
+    """
+    from sglang.srt.planner import bench_factors
+
+    payload = payload or {}
+    profiles = lever_profiles_payload(payload)
+    try:
+        return bench_factors.suggest_scenario(
+            profiles,
+            plan=_plan_for_factors(payload),
+            prompt_to_output_ratio=payload.get("prompt_to_output_ratio"),
+            min_context_tokens=payload.get("min_context_tokens"),
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": False, "reasons": [str(e)]}
+
+
+# ===========================================================================
 # #152 -- GitHub results sharing (thin adapters over github_share.py).
 # Preview-first + explicit confirm; the PAT is per-use, never persisted,
 # never logged, never echoed, and redacted from every error message.
@@ -3509,6 +3591,12 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/landscape"):
                 self._json(200, landscape_from_payload(payload))
                 return
+            # MUST precede the /api/scenario prefix check below: the flat
+            # chain matches on prefixes, and "/api/scenario" swallows
+            # "/api/scenario_suggest" if it is tested first.
+            if self.path.startswith("/api/scenario_suggest"):
+                self._json(200, scenario_suggest_payload(payload))
+                return
             if self.path.startswith("/api/scenario"):
                 self._json(200, scenario_payload(payload))
                 return
@@ -3580,6 +3668,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith("/api/bench_probe"):
                 self._json(200, bench_probe_payload(payload))
+                return
+            if self.path.startswith("/api/bench_factors"):
+                self._json(200, bench_factors_payload(payload))
                 return
             if self.path.startswith("/api/share_preview"):
                 self._json(200, share_preview_payload(payload))
@@ -4125,6 +4216,55 @@ _INDEX_TEMPLATE = r"""<!doctype html>
   table.lp .d-same, table.lp .d-na { color: var(--fg-muted); }
   table.lp td .d { font-size: var(--t-xs); display: block; }
   .lp-note { font-size: var(--t-xs); color: var(--fg-muted); margin-top: var(--s1); }
+  /* ---- limiting factors (#218) ---------------------------------------------
+     One tile per factor, all the same size, so the eye compares them rather
+     than ranking them by how much text each happens to carry. Colour is
+     state and nothing else: the provenance dot is the only coloured mark,
+     and a tile with no study is grey rather than red -- "not measured" is
+     not a failure. */
+  .fxgrid { display: grid; gap: var(--s2);
+            grid-template-columns: repeat(auto-fill, minmax(258px, 1fr)); }
+  .fxtile { background: var(--bg-elevated); border: 1px solid var(--bd-weak);
+            border-radius: var(--radius); padding: var(--s2);
+            display: flex; flex-direction: column; gap: var(--s1); }
+  .fxtile .fx-h { display: flex; align-items: baseline; gap: var(--s1);
+                  font-size: var(--t-sm); color: var(--fg-strong); }
+  .fxtile .fx-h .fx-n { flex: 1; min-width: 0; }
+  .fxdot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+           flex: none; background: var(--fg-disabled); }
+  .fxdot.measured { background: var(--ok); }
+  .fxdot.estimate { background: var(--warn); }
+  .fxdot.absent   { background: var(--fg-disabled); }
+  .fx-src { font-size: var(--t-xs); color: var(--fg-muted); }
+  .fx-vals { font-size: var(--t-xs); font-variant-numeric: tabular-nums;
+             display: flex; flex-direction: column; gap: 1px; }
+  .fx-vals .fx-k { color: var(--fg-muted); }
+  .fx-vals b { color: var(--fg-strong); font-weight: 500; }
+  /* The absent case gets its own block rather than an empty value list: a row
+     of dashes reads as "measured, and it was nothing". */
+  .fx-none { font-size: var(--t-xs); color: var(--fg-muted); }
+  .fx-act { margin-top: auto; padding-top: var(--s1); }
+  .fx-cmd { font-size: var(--t-xs); color: var(--fg-muted);
+            word-break: break-all; }
+  .sc-head { display: flex; align-items: baseline; gap: var(--s2);
+             flex-wrap: wrap; }
+  .sc-name { font-size: var(--t-lg); color: var(--fg-strong); }
+  table.sc { width: 100%; border-collapse: collapse; font-size: var(--t-sm);
+             font-variant-numeric: tabular-nums; margin-top: var(--s2); }
+  table.sc th, table.sc td { padding: 3px var(--s2); text-align: right;
+                             border-bottom: 1px solid var(--bd-weak); }
+  table.sc th:first-child, table.sc td:first-child { text-align: left;
+                             color: var(--fg-muted); }
+  table.sc th { color: var(--fg-muted); font-weight: 400; }
+  table.sc .d-gain { color: var(--ok); }
+  table.sc .d-cost { color: var(--bad); }
+  table.sc .d-same, table.sc .d-na { color: var(--fg-muted); }
+  .sc-why { font-size: var(--t-xs); margin: 2px 0; color: var(--fg-muted); }
+  .sc-why .p { border: 1px solid var(--bd-weak); border-radius: 2px;
+               padding: 0 4px; margin-right: var(--s1); font-size: var(--t-xs); }
+  .sc-why .p.measured { color: var(--ok); border-color: var(--ok-dim); }
+  .sc-why .p.estimate { color: var(--warn); border-color: var(--warn-dim); }
+  .sc-why .p.absent   { color: var(--fg-muted); }
 </style>
 </head>
 <body>
@@ -4342,6 +4482,56 @@ _INDEX_TEMPLATE = r"""<!doctype html>
           <button onclick="benchRun()" id="bn_run_btn">Run selected</button>
           <span id="bn_sel_note" class="muted"></span>
         </div>
+      </fieldset>
+      <!-- Limiting factors, one measurement each (#218). "Is this rig slow?"
+           is not answerable; "which of these eight things is holding it
+           back?" is, but only if each is measured on its own. Every tile
+           carries its own provenance and its own re-measure action, and a
+           factor with no study says so rather than showing a placeholder. -->
+      <fieldset>
+        <legend>limiting factors &mdash; one measurement each</legend>
+        <div class="muted" style="margin-bottom:var(--s2)">Each tile is a
+          separate study with its own provenance. <b>Measured</b> ran on this
+          rig; <b>estimate</b> is planner arithmetic over measured inputs;
+          <b>not measured</b> names the study that would produce the number
+          and never stands in for one. Re-measuring starts the factor's own
+          job and polls it &mdash; the page never blocks on it.</div>
+        <div class="actions" style="margin-bottom:var(--s2)">
+          <button class="mini secondary" onclick="benchFactors()">refresh</button>
+          <span id="bn_fx_note" class="muted"></span>
+        </div>
+        <div id="bn_factors" class="muted">reading the studies on disk&hellip;</div>
+      </fieldset>
+      <!-- One-click scenario. Composed server-side from the working points,
+           the card-probe basis and the state/KV balance; the page renders and
+           nothing else. Applying writes the ordinary configuration fields --
+           it starts nothing. -->
+      <fieldset>
+        <legend>scenario &mdash; one proposal for this rig and model</legend>
+        <div class="muted" style="margin-bottom:var(--s2)">Built from what has
+          already been measured. Where the evidence for a directed split is
+          missing the proposal is the balanced working point, said plainly
+          &mdash; a recommendation is only worth more than the reference
+          configuration when something measured says so.</div>
+        <div class="setrow">
+          <span class="lbl" id="row_sc_ratio">prompt-to-output ratio
+            <span class="muted">(blank = unknown)</span></span>
+          <input type="number" id="sc_ratio" class="num" min="0" step="0.5"
+                 placeholder="(optional)">
+        </div>
+        <div class="setrow">
+          <span class="lbl" id="row_sc_ctx">context the workload needs</span>
+          <input type="number" id="sc_ctx" class="num" min="0" step="1024"
+                 placeholder="(optional)">
+        </div>
+        <div class="actions">
+          <button onclick="scenarioSuggest()" id="sc_btn">Build suggestion</button>
+          <button class="mini secondary" onclick="scenarioApply()" id="sc_apply"
+                  disabled>Apply to the plan</button>
+          <span id="sc_note" class="muted"></span>
+        </div>
+        <div id="bn_scenario" class="muted" style="margin-top:var(--s2)">no
+          suggestion built yet.</div>
       </fieldset>
       <!-- Past runs, per model. A verdict table is not reviewable on its own;
            the stored run carries every request and every answer, and the
@@ -6775,6 +6965,7 @@ const STATIC_TIPS={
   row_sv_ctx:'context_length',
   max_running_requests:'max_running_requests', mrr_slider:'max_running_requests',
   row_mrr:'max_running_requests',
+  sc_btn:'scenario.suggest', sc_apply:'scenario.apply',
 };
 function tip(key){ return (window._tips||{})[key]||''; }
 function applyStaticTips(){
@@ -8858,6 +9049,10 @@ function benchInit(){
     $('bn_endpoint').value=t.endpoint.replace(/^https?:\/\//,'');
   benchProbe(true);  // catalog + presets only; nothing probed without endpoint
   benchHistory();
+  // Reads what is already on disk. No measurement starts from opening a tab:
+  // the first read of a running engine only opens the delta window, which the
+  // round-time tile says in those words.
+  benchFactors();
 }
 function benchUseMonitor(){
   const t=window._lastTarget;
@@ -9199,6 +9394,238 @@ async function benchLeadPoll(endpoint){
     if(d.window_s!=null) h+='<div class="legend">window '+d.window_s+' s</div>';
     setHTML($('bn_lead'), h||'<span class="muted">nothing reported.</span>');
   }catch(e){}
+}
+
+// ===========================================================================
+// Limiting factors, one measurement each (#218).
+//
+// Everything below RENDERS. Which factors exist, what each one limits, what
+// its provenance is and what would re-measure it all come from
+// /api/bench_factors, i.e. from planner/bench_factors.py -- so `curl` gets
+// exactly what the page draws and there is no second opinion about whether a
+// study has been run. The browser never decides that a number is missing and
+// it never fills one in.
+//
+// A factor with no study renders its reason and its action, NOT a dash: an
+// empty value row is indistinguishable from a measured zero once it is on
+// screen, and that confusion is the one this whole panel exists to prevent.
+// ===========================================================================
+function benchFactorsBody(){
+  // The plan payload rides along so the state/KV balance factor and the
+  // scenario have a configuration to reason about; with no model picked the
+  // server simply reports that, which is the honest state for a benchmark tab
+  // pointed at somebody else's server.
+  let b={};
+  try{ if($('model').value.trim()) b=Object.assign({}, payload()); }catch(e){}
+  b.endpoint=$('bn_endpoint').value.trim();
+  b.bench_model=$('bn_model').value.trim();
+  return b;
+}
+async function benchFactors(){
+  const box=$('bn_factors'); if(!box) return;
+  stale(box,true);
+  try{
+    const d=await api('/api/bench_factors',{key:'bench_factors',
+      body:benchFactorsBody(), timeout:20000});
+    if(!d.ok){ setHTML(box,'<span class="reasons">'+esc(d.error||'error')+'</span>'); return; }
+    window._benchFactors=d;
+    $('bn_fx_note').textContent=d.summary||'';
+    renderFactors(d);
+  }catch(e){
+    if(apiAborted(e)) return;
+    setHTML(box,'<span class="reasons">'+esc(apiError(e))+'</span>');
+  } finally { stale(box,false); }
+}
+function fxAge(f){
+  if(f.age_s==null) return '';
+  const h=f.age_s/3600;
+  if(h<1) return ' &middot; '+Math.max(1,Math.round(f.age_s/60))+' min ago';
+  if(h<48) return ' &middot; '+Math.round(h)+' h ago';
+  return ' &middot; '+Math.round(h/24)+' d ago';
+}
+function fxAction(f){
+  const r=f.remeasure||{};
+  if(r.kind==='derived')
+    return '<div class="fx-cmd">'+esc(r.label)+'</div>';
+  if(r.kind==='command')
+    return '<div class="fx-cmd">no endpoint runs this &mdash; <code>'
+      +esc(r.command||'')+'</code></div>';
+  const dis=(r.ready===false);
+  const why=dis?(r.blocked_reason||''):(r.cost||'');
+  return '<button class="mini secondary" onclick="factorRemeasure(\''+esc(f.key)
+    +'\')" id="fxb_'+esc(f.key)+'"'+(dis?' disabled':'')
+    +' title="'+esc(why)+'">'+esc(r.label||'measure again')+'</button>'
+    +(dis?'<div class="fx-cmd">'+esc(r.blocked_reason||'')+'</div>':'');
+}
+function renderFactors(d){
+  let h='<div class="fxgrid">';
+  for(const f of (d.factors||[])){
+    h+='<div class="fxtile" data-key="fx_'+esc(f.key)+'">'
+      +'<div class="fx-h" title="'+esc(f.question)+'">'
+      +'<span class="fxdot '+esc(f.provenance)+'"></span>'
+      +'<span class="fx-n" title="'+esc(tip(f.tooltip_key))+'">'+esc(f.label)+'</span>'
+      +'</div>'
+      +'<div class="fx-src">'+esc(f.provenance)
+      +(f.source?(' &middot; '+esc(f.source)):'')+fxAge(f)+'</div>';
+    if(f.available){
+      h+='<div class="fx-vals">';
+      for(const v of (f.values||[])){
+        h+='<div><span class="fx-k">'+esc(v.label)+'</span> '
+          +(v.value==null?'<span class="fx-k">not measured</span>'
+                         :('<b>'+esc(String(v.value))+'</b>'
+                           +(v.unit?(' '+esc(v.unit)):'')))
+          +(v.note?(' <span class="fx-k">'+esc(v.note)+'</span>'):'')+'</div>';
+      }
+      h+='</div>';
+    } else {
+      h+='<div class="fx-none"><b>study not run.</b> '+esc(f.missing_reason)+'</div>';
+    }
+    for(const n of (f.notes||[])) if(n) h+='<div class="fx-cmd">'+esc(n)+'</div>';
+    h+='<div class="fx-act">'+fxAction(f)+'</div></div>';
+  }
+  h+='</div>';
+  setHTML($('bn_factors'), h);
+}
+// Re-measuring never blocks the page: a job endpoint answers at once and is
+// polled, a call endpoint is short and bounded. Either way the tile goes back
+// to reading its own study when the action finishes.
+async function factorRemeasure(key){
+  const d=window._benchFactors; if(!d) return;
+  const f=(d.factors||[]).filter(x=>x.key===key)[0]; if(!f) return;
+  const r=f.remeasure||{};
+  const btn=$('fxb_'+key);
+  if(btn){ btn.disabled=true; btn.textContent='running…'; }
+  try{
+    const started=await (await fetch(r.path,{method:'POST',
+      body:JSON.stringify(r.body||{})})).json();
+    if(started.ok===false){
+      $('bn_fx_note').textContent=started.error||'could not start';
+    } else if(r.kind==='job' && r.status_path){
+      await factorPollJob(r.status_path);
+    }
+  }catch(e){ $('bn_fx_note').textContent=''+e; }
+  finally{ benchFactors(); }
+}
+function factorPollJob(statusPath){
+  // Resolves when nothing is running any more. The interval is the only
+  // waiting that happens; no request is ever held open for the measurement.
+  return new Promise(resolve=>{
+    const t=setInterval(async()=>{
+      try{
+        const s=await (await fetch(statusPath)).json();
+        const job=s.job;
+        if(job && job.state==='running') return;
+        clearInterval(t); resolve(s);
+      }catch(e){ clearInterval(t); resolve(null); }
+    }, 3000);
+  });
+}
+
+// ---- one-click scenario ---------------------------------------------------
+// Composed by /api/scenario_suggest out of the endpoints that already exist.
+// Applying goes through applyLeverProfile(), i.e. the SAME control the
+// working-point slider drives, so a suggestion and a slider move produce one
+// configuration rather than two that disagree.
+window._scenario=null;
+async function scenarioSuggest(){
+  const box=$('bn_scenario'); if(!box) return;
+  const body=benchFactorsBody();
+  const ratio=$('sc_ratio').value.trim(); if(ratio) body.prompt_to_output_ratio=parseFloat(ratio);
+  const ctx=$('sc_ctx').value.trim(); if(ctx) body.min_context_tokens=parseInt(ctx);
+  $('sc_btn').disabled=true; stale(box,true);
+  try{
+    const d=await api('/api/scenario_suggest',{key:'scenario_suggest',
+      body:body, timeout:30000});
+    if(!d.ok){
+      window._scenario=null; $('sc_apply').disabled=true;
+      setHTML(box,'<ul class="reasons">'
+        +(d.reasons||['no suggestion possible']).map(x=>'<li>'+esc(x)+'</li>').join('')
+        +'</ul>');
+      return;
+    }
+    window._scenario=d; $('sc_apply').disabled=false;
+    renderScenario(d);
+  }catch(e){
+    if(apiAborted(e)) return;
+    setHTML(box,'<span class="reasons">'+esc(apiError(e))+'</span>');
+  } finally { $('sc_btn').disabled=false; stale(box,false); }
+}
+function scDelta(m){
+  const d=m.vs_baseline;
+  if(!d||d.pct==null) return '';
+  const cls=d.direction==='gain'?'d-gain':(d.direction==='cost'?'d-cost':'d-same');
+  const txt=d.direction==='same'?'unchanged':((d.pct>0?'+':'')+d.pct.toFixed(1)+'%');
+  return ' <span class="'+cls+'">'+txt+'</span>';
+}
+function renderScenario(d){
+  let h='<div class="sc-head"><span class="sc-name">'+esc(d.profile_label||d.profile)
+    +'</span>'+(d.is_baseline?'<span class="pill">the reference working point</span>':'')
+    +'</div>';
+  h+='<div class="sc-why">'+esc(d.axis_note||'')+'</div>';
+  h+='<table class="sc"><tr><th>expected</th><th>value</th></tr>';
+  for(const m of (d.expected||[])){
+    h+='<tr data-key="sc_'+esc(m.key)+'"><td title="'+esc(m.basis||'')+'">'
+      +esc(m.label||m.key)+(m.unit?(' <span class="muted">'+esc(m.unit)+'</span>'):'')+'</td>';
+    // Same formatter the working-point table uses, so the two surfaces round
+    // the same figure the same way.
+    h+=m.available
+      ? ('<td>'+lpNum(m.value, m.unit)+scDelta(m)+'</td>')
+      : ('<td class="d-na" title="'+esc(m.reason||'')+'">not computed</td>');
+    h+='</tr>';
+  }
+  if(d.concurrency && d.concurrency.available)
+    h+='<tr data-key="sc_mrr"><td title="'+esc(d.concurrency.basis||'')
+      +'">--max-running-requests <span class="muted">at '
+      +esc(String(d.concurrency.target_context_tokens))+' tokens</span></td>'
+      +'<td>'+esc(String(d.concurrency.recommended))+'</td></tr>';
+  h+='</table>';
+  h+='<div class="lp-note">Every expected figure is a planner estimate; the '
+    +'instrument behind each one is on the row&rsquo;s hover.</div>';
+  if((d.flags||[]).length)
+    h+='<div class="lp-note">flags: <code>'+esc(d.flags.join(' '))+'</code></div>';
+  else
+    h+='<div class="lp-note">no flag change: this working point IS the '
+      +'configuration the plan already describes.</div>';
+  h+='<div style="margin-top:var(--s2)">';
+  for(const r of (d.reasoning||[]))
+    h+='<div class="sc-why"><span class="p '+esc(r.provenance)+'">'
+      +esc(r.provenance)+'</span>'+esc(r.statement)
+      +(r.basis?(' <span class="muted">['+esc(r.basis)+']</span>'):'')+'</div>';
+  h+='</div>';
+  const detail=[];
+  (d.gains||[]).forEach(x=>detail.push('<li><b>buys:</b> '+esc(x)+'</li>'));
+  (d.costs||[]).forEach(x=>detail.push('<li><b>costs:</b> '+esc(x)+'</li>'));
+  (d.caveats||[]).forEach(x=>detail.push('<li>'+esc(x)+'</li>'));
+  if(detail.length)
+    h+='<details class="cfg-section" data-key="sc_detail"><summary><b>what it '
+      +'buys, what it costs, and what qualifies it</b></summary><ul class="knoblist">'
+      +detail.join('')+'</ul></details>';
+  h+='<div class="lp-note">'+esc(d.note||'')+'</div>';
+  setHTML($('bn_scenario'), h);
+}
+// Writes the ordinary configuration state and NOTHING else -- no server is
+// started, no flag is sent anywhere. The plan view then recomputes as it does
+// after any manual edit.
+function scenarioApply(){
+  const d=window._scenario; if(!d||!d.apply) return;
+  const a=d.apply;
+  let wrote=0;
+  if(a.lever_profile && window._leverProfiles){ applyLeverProfile(a.lever_profile); wrote++; }
+  else {
+    window._flagSettings=window._flagSettings||{};
+    for(const k of Object.keys(a.settings||{})){
+      window._flagSettings[k]=a.settings[k];
+      const el=$('fl_'+k); if(el) el.value=String(a.settings[k]);
+      wrote++;
+    }
+    scheduleRecompute();
+  }
+  if(a.max_running_requests!=null){
+    const el=$('max_running_requests');
+    if(el){ el.value=String(a.max_running_requests); mrrFromNum(); wrote++; }
+  }
+  $('sc_note').textContent='applied to the plan: '+wrote
+    +' field'+(wrote===1?'':'s')+' written. Nothing was started.';
 }
 
 // ===========================================================================

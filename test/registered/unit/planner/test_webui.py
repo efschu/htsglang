@@ -12,6 +12,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -3369,3 +3370,355 @@ class TestCardProbeEndpoint(CustomTestCase):
         seg = html[i:i + 1400]
         self.assertIn("clearInterval(window._cardProbeTimer)", seg)
         self.assertIn("refreshLeverProfiles()", seg)
+
+
+# ===========================================================================
+# Task #218: the limiting factors, measured one at a time, and the composed
+# one-click scenario.
+#
+# What is pinned here is the CONTRACT the surface rests on: every factor
+# carries its own provenance, a factor with no study says so instead of
+# showing a number, the suggestion never disagrees with the working-point
+# table it is composed from, and applying a suggestion starts nothing.
+# ===========================================================================
+
+
+class TestBenchFactors(WebUIFixture):
+    def _factors(self, payload=None):
+        d = webui.bench_factors_payload(payload or {})
+        self.assertTrue(d["ok"], d.get("error"))
+        return {f["key"]: f for f in d["factors"]}, d
+
+    def test_every_factor_answers_with_a_provenance_and_an_action(self):
+        from sglang.srt.planner import bench_factors as bfm
+
+        by_key, d = self._factors()
+        self.assertEqual(set(by_key), set(bfm.FACTOR_KEYS))
+        for key, f in by_key.items():
+            self.assertIn(
+                f["provenance"], (bfm.MEASURED, bfm.ESTIMATE, bfm.ABSENT), key
+            )
+            self.assertTrue(f["question"].strip(), key)
+            self.assertTrue(f["remeasure"]["kind"], key)
+            self.assertTrue(f["remeasure"]["label"], key)
+        self.assertEqual(
+            sum(d["counts"].values()), len(bfm.FACTOR_KEYS)
+        )
+
+    def test_a_missing_study_carries_no_number_at_all(self):
+        # The whole point: absent must be distinguishable from measured-zero.
+        from sglang.srt.planner import bench_factors as bfm
+
+        by_key, _ = self._factors()
+        for key, f in by_key.items():
+            if f["provenance"] != bfm.ABSENT:
+                continue
+            self.assertFalse(f["available"], key)
+            self.assertEqual(f["values"], [], key)
+            self.assertTrue(f["missing_reason"].strip(), key)
+            self.assertIsNone(f["measured_at"], key)
+
+    def test_no_endpoint_is_stated_rather_than_reported_as_a_zero(self):
+        by_key, _ = self._factors()
+        for key in ("round_time", "rank_balance"):
+            f = by_key[key]
+            self.assertFalse(f["available"])
+            self.assertIn("running server", f["missing_reason"])
+
+    def test_a_cached_probe_is_read_without_touching_a_gpu(self):
+        # Written here, read back through the endpoint: no NVML, no CUDA.
+        from sglang.srt.rigmon import card_probe as cp
+
+        prof = cp.CardProbeProfile(
+            created=time.time() - 3600,
+            created_str="now",
+            driver="999.0",
+            cards=[
+                cp.CardProbeMeasurement(
+                    uuid="GPU-a", name="Card A", cuda_index=0,
+                    membw_read_gbs=900.0, membw_gemv_gbs=850.0,
+                    gemm_bf16_tflops=200.0,
+                ),
+                cp.CardProbeMeasurement(
+                    uuid="GPU-b", name="Card B", cuda_index=1,
+                    membw_read_gbs=700.0, gemm_bf16_tflops=60.0,
+                ),
+            ],
+            pairs=[
+                cp.PairMeasurement("GPU-a", "GPU-b", bandwidth_gbs=5.5),
+                cp.PairMeasurement("GPU-b", "GPU-a", bandwidth_gbs=4.25),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "probe.json")
+            cp.save_card_probe(prof, path)
+            by_key, _ = self._factors({"card_probe_path": path})
+        rates = by_key["card_rates"]
+        self.assertTrue(rates["available"])
+        self.assertEqual(rates["provenance"], "measured")
+        self.assertEqual(len(rates["values"]), 2)
+        self.assertIsNotNone(rates["measured_at"])
+        self.assertGreater(rates["age_s"], 0)
+        link = by_key["pair_link"]
+        # The NARROWEST ordered direction, not the mean and not the best.
+        narrow = [v for v in link["values"] if v["key"] == "narrowest"][0]
+        self.assertEqual(narrow["value"], 4.25)
+
+    def test_an_action_that_cannot_run_is_blocked_with_its_reason(self):
+        by_key, _ = self._factors()
+        pc = by_key["prefix_cache"]["remeasure"]
+        # No model and no endpoint on the tab -> recording cannot key or
+        # scrape anything, and the surface says which is missing.
+        self.assertFalse(pc["ready"])
+        self.assertIn("model", pc["blocked_reason"])
+
+    def test_the_action_carries_what_the_endpoint_needs(self):
+        by_key, _ = self._factors(
+            {"bench_model": "some/model", "endpoint": "127.0.0.1:30000"}
+        )
+        pc = by_key["prefix_cache"]["remeasure"]
+        self.assertTrue(pc["ready"])
+        self.assertEqual(pc["body"]["model"], "some/model")
+        self.assertEqual(pc["body"]["target"], "http://127.0.0.1:30000")
+
+    def test_the_only_no_endpoint_factor_without_a_button_says_the_command(self):
+        by_key, _ = self._factors()
+        mlp = by_key["mlp_split"]["remeasure"]
+        self.assertEqual(mlp["kind"], "command")
+        self.assertTrue(mlp["command"].strip())
+        self.assertFalse(mlp["path"])
+
+    def test_the_balance_factor_is_an_estimate_not_a_measurement(self):
+        by_key, _ = self._factors(self._payload())
+        bal = by_key["concurrency_balance"]
+        self.assertTrue(bal["available"], bal.get("missing_reason"))
+        self.assertEqual(bal["provenance"], "estimate")
+        self.assertTrue(any("arithmetic" in bal["source"] for _ in (0,)))
+
+
+class TestBenchFactorsRoute(TestHttpRoundTrip):
+    def test_factors_endpoint_over_http(self):
+        d = self._post("/api/bench_factors", {})
+        self.assertTrue(d["ok"])
+        self.assertTrue(d["factors"])
+        self.assertIn("limiting factors measured", d["summary"])
+
+
+class TestScenarioSuggest(WebUIFixture):
+    def test_the_suggestion_agrees_with_the_lever_profile_baseline(self):
+        # One composition, one set of numbers. If the suggestion recomputed
+        # anything the two surfaces could disagree about the same config.
+        body = self._payload()
+        profiles = webui.lever_profiles_payload(body)
+        self.assertTrue(profiles["ok"], profiles.get("reasons"))
+        sug = webui.scenario_suggest_payload(body)
+        self.assertTrue(sug["ok"], sug.get("reasons"))
+        base_row = [
+            p for p in profiles["profiles"]
+            if p.get("key") == profiles["baseline"] and p.get("resolved")
+        ][0]
+        self.assertEqual(sug["baseline"]["key"], profiles["baseline"])
+        self.assertEqual(sug["baseline"]["metrics"], base_row["metrics"])
+
+    def test_without_a_workload_shape_the_answer_is_the_baseline(self):
+        sug = webui.scenario_suggest_payload(self._payload())
+        self.assertTrue(sug["ok"])
+        self.assertTrue(sug["is_baseline"])
+        self.assertEqual(sug["flags"], [])
+        joined = " ".join(r["statement"] for r in sug["reasoning"])
+        self.assertTrue(
+            "prompt-to-output ratio" in joined or "same configuration" in joined
+            or "nameplate" in joined,
+            joined,
+        )
+
+    def test_every_step_names_the_provenance_it_rests_on(self):
+        from sglang.srt.planner import bench_factors as bfm
+
+        sug = webui.scenario_suggest_payload(self._payload())
+        self.assertTrue(sug["reasoning"])
+        for r in sug["reasoning"]:
+            self.assertIn(
+                r["provenance"], (bfm.MEASURED, bfm.ESTIMATE, bfm.ABSENT)
+            )
+            self.assertTrue(r["statement"].strip())
+
+    def test_every_expected_figure_carries_its_instrument(self):
+        sug = webui.scenario_suggest_payload(self._payload())
+        self.assertTrue(sug["expected"])
+        for m in sug["expected"]:
+            self.assertTrue((m["basis"] or "").strip(), m["key"])
+            self.assertEqual(m["provenance"], "estimate")
+            if not m["available"]:
+                self.assertIsNone(m["value"], m["key"])
+
+    def test_the_suggestion_starts_nothing(self):
+        sug = webui.scenario_suggest_payload(self._payload())
+        self.assertTrue(sug["boots_nothing"])
+        self.assertIn("lever_profile", sug["apply"])
+        self.assertIn("Nothing was started", sug["note"] + " " + sug["note"])
+
+    def test_an_unplannable_body_returns_reasons_not_a_recommendation(self):
+        sug = webui.scenario_suggest_payload({"model": ""})
+        self.assertFalse(sug["ok"])
+        self.assertTrue(sug["reasons"])
+
+    def test_an_unmeasured_rig_never_proposes_a_directed_split(self):
+        # The conservative gate: with no probe of these cards, the answer is
+        # the reference configuration, and the reason says why.
+        from sglang.srt.planner import bench_factors as bfm
+
+        profiles = {
+            "ok": True,
+            "baseline": "balanced",
+            "distinct_working_points": 2,
+            "basis": {"speed_scores": {"measured": False, "sources": ["nameplate"]},
+                      "card_probe": None, "min_link_gbs": 8.0,
+                      "min_link_source": "assumed"},
+            "profiles": [
+                {"key": "balanced", "label": "balanced", "resolved": True,
+                 "is_base_split": True, "metrics": [], "tune": "both"},
+                {"key": "max_prefill", "label": "max prefill", "resolved": True,
+                 "is_base_split": False, "mlp_vector": [2, 1, 1], "tune": "enc",
+                 "flag_delta": ["--rank-mlp-ratio 2,1,1"],
+                 "metrics": [{"key": "prefill_tok_s", "available": True,
+                              "value": 100.0, "basis": "x",
+                              "vs_baseline": {"pct": 9.0, "direction": "gain"}}]},
+            ],
+        }
+        sug = bfm.suggest_scenario(profiles, prompt_to_output_ratio=32.0)
+        self.assertTrue(sug["ok"])
+        self.assertTrue(sug["is_baseline"])
+        joined = " ".join(r["statement"] for r in sug["reasoning"])
+        self.assertIn("nameplate", joined)
+        self.assertTrue(
+            any(r["provenance"] == bfm.ABSENT for r in sug["reasoning"])
+        )
+
+    def test_a_measured_rig_takes_the_prefill_point_on_a_prompt_workload(self):
+        from sglang.srt.planner import bench_factors as bfm
+
+        profiles = {
+            "ok": True,
+            "baseline": "balanced",
+            "distinct_working_points": 2,
+            "basis": {"speed_scores": {"measured": True, "sources": ["measured"]},
+                      "card_probe": {"cards": 3, "ordered_pairs": 6},
+                      "min_link_gbs": 4.3, "min_link_source": "measured"},
+            "profiles": [
+                {"key": "balanced", "label": "balanced", "resolved": True,
+                 "is_base_split": True, "metrics": [], "tune": "both"},
+                {"key": "max_prefill", "label": "max prefill", "resolved": True,
+                 "is_base_split": False, "mlp_vector": [2, 1, 1], "tune": "enc",
+                 "flag_delta": ["--rank-mlp-ratio 2,1,1"], "lever_flags": [],
+                 "metrics": [{"key": "prefill_tok_s", "available": True,
+                              "value": 100.0, "basis": "x",
+                              "vs_baseline": {"pct": 9.0, "direction": "gain"}}]},
+            ],
+        }
+        sug = bfm.suggest_scenario(profiles, prompt_to_output_ratio=32.0)
+        self.assertEqual(sug["profile"], "max_prefill")
+        self.assertIn("--rank-mlp-ratio 2,1,1", sug["flags"])
+        self.assertEqual(sug["apply"]["settings"]["rank_mlp_ratio"], "2,1,1")
+        self.assertEqual(sug["apply"]["settings"]["rank_perf_tune"], "enc")
+
+    def test_a_stop_that_resolves_back_to_the_baseline_is_not_proposed(self):
+        from sglang.srt.planner import bench_factors as bfm
+
+        profiles = {
+            "ok": True, "baseline": "balanced", "distinct_working_points": 2,
+            "basis": {"speed_scores": {"measured": True, "sources": ["m"]},
+                      "card_probe": {"cards": 3, "ordered_pairs": 6},
+                      "min_link_gbs": 4.3, "min_link_source": "measured"},
+            "profiles": [
+                {"key": "balanced", "label": "balanced", "resolved": True,
+                 "is_base_split": True, "metrics": [], "tune": "both"},
+                # Resolved back to the base split: proposing it as an
+                # improvement over the baseline would be proposing the
+                # baseline twice.
+                {"key": "max_prefill", "label": "max prefill", "resolved": True,
+                 "is_base_split": True, "metrics": [], "tune": "enc"},
+            ],
+        }
+        sug = bfm.suggest_scenario(profiles, prompt_to_output_ratio=32.0)
+        self.assertTrue(sug["is_baseline"])
+
+
+class TestScenarioSuggestRoute(TestHttpRoundTrip):
+    def test_suggest_is_dispatched_before_the_scenario_prefix(self):
+        # /api/scenario is a prefix of /api/scenario_suggest in a flat chain.
+        with open(webui.__file__) as f:
+            text = f.read()
+        i_sug = text.index('startswith("/api/scenario_suggest")')
+        i_sc = text.index('startswith("/api/scenario"):', i_sug)
+        self.assertLess(i_sug, i_sc)
+
+    def test_the_two_endpoints_stay_separate_over_http(self):
+        sc = self._post("/api/scenario", {"phases": "both", "concurrency": 2})
+        self.assertTrue(sc["ok"])
+        self.assertIn("summary", sc)
+        sug = self._post("/api/scenario_suggest", {"model": ""})
+        self.assertFalse(sug["ok"])
+        self.assertIn("reasons", sug)
+
+
+class TestFactorTooltipCoverage(CustomTestCase):
+    """Every tile and the suggestion say what they give and what they cost."""
+
+    def test_every_factor_has_a_tradeoff(self):
+        from sglang.srt.planner import bench_factors as bfm
+        from sglang.srt.planner import tooltips as tipsmod
+
+        missing = [
+            f.key for f in bfm.FACTORS if f.tooltip_key not in tipsmod.TRADEOFFS
+        ]
+        self.assertEqual(missing, [], f"factors without a trade-off: {missing}")
+
+    def test_the_suggestion_controls_have_one_too(self):
+        from sglang.srt.planner import tooltips as tipsmod
+
+        for key in ("scenario.suggest", "scenario.apply"):
+            self.assertIn(key, tipsmod.TRADEOFFS)
+        self.assertIn("scenario.suggest", webui.tooltips_payload()["tooltips"])
+
+    def test_the_page_looks_the_text_up_rather_than_holding_it(self):
+        js = _index_script()
+        self.assertIn("tip(f.tooltip_key)", js)
+        self.assertIn("sc_btn:'scenario.suggest'", js)
+
+
+class TestFactorPanelRendering(CustomTestCase):
+    def test_the_panel_is_wired_to_the_endpoints_and_nothing_else(self):
+        js = _index_script()
+        for fn in ("function benchFactors(", "function renderFactors(",
+                   "async function factorRemeasure(", "function factorPollJob(",
+                   "async function scenarioSuggest(", "function renderScenario(",
+                   "function scenarioApply("):
+            self.assertIn(fn, js, fn)
+        self.assertIn("'/api/bench_factors'", js)
+        self.assertIn("'/api/scenario_suggest'", js)
+        # The tab seeds itself from disk on entry; it starts no measurement.
+        i = js.index("function benchInit(")
+        self.assertIn("benchFactors();", js[i:i + 600])
+
+    def test_absent_is_drawn_as_absent_not_as_a_dash(self):
+        js = _index_script()
+        self.assertIn("study not run.", js)
+        # ...and the provenance dot is the only coloured mark on the tile.
+        self.assertIn(".fxdot.measured", webui.INDEX_HTML)
+        self.assertIn(".fxdot.absent", webui.INDEX_HTML)
+
+    def test_applying_goes_through_the_existing_control(self):
+        js = _index_script()
+        i = js.index("function scenarioApply(")
+        seg = js[i:i + 900]
+        self.assertIn("applyLeverProfile(a.lever_profile)", seg)
+        # No launch, no server call: the button writes fields.
+        self.assertNotIn("/api/server_start", seg)
+        self.assertNotIn("fetch(", seg)
+
+    def test_the_polling_helper_stops_itself(self):
+        js = _index_script()
+        i = js.index("function factorPollJob(")
+        seg = js[i:i + 700]
+        self.assertIn("clearInterval(t)", seg)
