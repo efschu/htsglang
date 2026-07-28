@@ -273,6 +273,32 @@ class TestPipelineRejectMatrix(PartitionEnvTestCase):
         self.assertAlmostEqual(args._rank_mem_fraction_static[0], 15000 / 32768)
         self.assertAlmostEqual(args._rank_mem_fraction_static[1], 15000 / 20480)
 
+    def test_per_stage_budget_list_needs_no_ratio_under_a_pipeline(self):
+        """Stages are structurally unequal by construction (different layer
+        counts), so a per-rank budget list is meaningful without a
+        --rank-tp-ratio -- which with tp_size 1 per stage could not even be
+        expressed."""
+        args = run_uneven_tp(
+            make_args(
+                tp_size=1,
+                pp_size=2,
+                rank_gpu_id=[0, 1],
+                rank_gpu_memory_mib=[24000, 16000],
+            )
+        )
+        self.assertAlmostEqual(args._rank_mem_fraction_static[0], 24000 / 32768)
+        self.assertAlmostEqual(args._rank_mem_fraction_static[1], 16000 / 20480)
+
+    def test_budget_list_without_a_ratio_is_still_rejected_without_a_pipeline(self):
+        with self.assertRaisesRegex(ValueError, r"requires\s+--rank-tp-ratio"):
+            run_uneven_tp(
+                make_args(
+                    tp_size=2,
+                    rank_gpu_id=[0, 1],
+                    rank_gpu_memory_mib=[15000, 15000],
+                )
+            )
+
     def test_tp1_pipeline_stages_on_one_card_are_rejected(self):
         with self.assertRaisesRegex(ValueError, r"stages 0 and 1 on the same"):
             run_uneven_tp(

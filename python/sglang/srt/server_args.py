@@ -6716,7 +6716,20 @@ class ServerArgs:
             # per-rank budget list is appropriate here even without a
             # --rank-tp-ratio weight vector (e.g. 28000,19000,19000 for a 5090
             # head + two 3080 workers).
-            if self.rank_tp_ratio is None and not self.weightless_kv_fastlane:
+            #
+            # A pipeline (#201) is the same case for the same reason: stages
+            # are structurally unequal BY CONSTRUCTION -- they hold different
+            # layer counts, and under --pp-layer-ratio deliberately so, plus
+            # stage 0 carries embed_tokens and the last stage lm_head. "Equal
+            # ranks, so one scalar" is a statement about a pure TP group, and
+            # a pipeline is not one. Requiring --rank-tp-ratio here would be
+            # doubly wrong: with tp_size 1 per stage there is no TP dimension
+            # to describe at all.
+            if (
+                self.rank_tp_ratio is None
+                and not self.weightless_kv_fastlane
+                and self.pp_size == 1
+            ):
                 raise ValueError(
                     "--rank-gpu-memory-mib as a list requires "
                     "--rank-tp-ratio (with even TP all ranks are "

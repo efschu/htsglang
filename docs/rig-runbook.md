@@ -452,6 +452,77 @@ setsid "$VENV/bin/python" -m sglang.launch_server \
   27-31 waves and 1.11-1.21 GiB H2D per layer per chunk here, expert-major
   9 waves and 0.34 GiB, and greedy output was byte-identical between them.
 
+### 4.7 Pipeline parallelism intra-rig, uneven layer split (#201 slice 1)
+
+`--pp-size 2` with one rank per stage, each stage on its own card, and
+`--pp-layer-ratio` deciding how the 64 layers are shared. Measured
+2026-07-28 on `Qwen3.6-27B-MTP-Q3_K_M-GGUF`, 44 layers on the 5090 and 20 on
+a 3080.
+
+```bash
+MODEL_DIR="$MODEL_ROOT/Qwen3.6-27B-MTP-Q3_K_M-GGUF"
+setsid "$VENV/bin/python" -u -m sglang.launch_server \
+  --model-path "$MODEL_DIR/Qwen3.6-27B-Q3_K_M.gguf" \
+  --tokenizer-path "$MODEL_DIR" \
+  --tp-size 1 --pp-size 2 \
+  --pp-layer-ratio 44,20 \
+  --rank-gpu-id 0,1 --rank-gpu-memory-mib 24000,16000 \
+  --disable-overlap-schedule \
+  --context-length 16384 --max-running-requests 4 \
+  --attention-backend flashinfer \
+  --trust-remote-code --enable-metrics \
+  --host 127.0.0.1 --port <free-port> \
+  > "$LOG" 2>&1 &
+```
+
+Measured: boot to "fired up" in ~100 s, 9313-token prefill + 700 tokens of
+greedy decode in 16.6 s, steady-state **44.2 tok/s** with `cuda graph: True`.
+Output was coherent over the full 700 tokens.
+
+Non-obvious points, each load-bearing:
+
+- **`--disable-overlap-schedule` is mandatory, and speculation is refused.**
+  `server_args.py` asserts `disable_overlap_schedule and speculative_algorithm
+  is None` whenever `pp_size > 1`. It is a hard assert, not an auto-disable —
+  a PP boot without the flag dies at arg parse. Every PP number on this rig is
+  therefore a **no-spec** number and must not be compared against a NEXTN one.
+- **Full decode CUDA graphs DO work under PP** (`cuda graph: True` above); only
+  *piecewise* graphs are silently switched off. The graph plan is negotiated
+  per `tp_group`, i.e. per stage, so stages negotiate independently.
+- **`--rank-gpu-id` is what makes the pipeline safe on mixed cards**, for a
+  reason that has nothing to do with placement: it forces
+  `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1`, so each process sees its own card
+  as `cuda:0`. Without it, a stage on `cuda:1` still answers architecture
+  questions about **device 0**. Booting the same topology with
+  `--base-gpu-id 0` instead dies on the 3080 in
+  `layers/fused_qk_rmsnorm_rope_gate.py` with
+  `PTXASError: Modifier '.launch_dependents' requires .target sm_90 or higher`
+  — `_ENABLE_PDL` is a module-level constant computed once from
+  `cuda_sm_at_least(9, device_id=0)`, which on this rig is the sm_120 5090, so
+  the sm_86 stage emits a Hopper instruction and `ptxas` refuses it. This is a
+  **mixed-architecture bug independent of PP** (any process whose compute
+  device is not device 0 and differs in architecture from it); a pipeline is
+  simply the first configuration on this rig that produces one. Not fixed
+  here — use `--rank-gpu-id`.
+- **Per-stage budgets are a list, and that is correct**: under a pipeline
+  `--rank-gpu-memory-mib` accepts one value per stage without a
+  `--rank-tp-ratio`, because stages are structurally unequal by construction
+  (different layer counts, and stage 0 additionally carries `embed_tokens`
+  while the last carries `lm_head`). A single scalar sized for the 3080 leaves
+  the 44-layer stage short: at 15000 MiB it rejected with
+  `weights + runtime state 10.86 GiB; mamba state pool ... 1.75 GiB; GGUF
+  dequant scratch 2.20 GiB — 175 MiB more than the budget`.
+- **`--pp-layer-ratio` must sum to the BACKBONE depth, 64 — not to the GGUF's
+  `block_count` of 65.** The extra block is the MTP/NEXTN draft
+  (`model_loader/gguf_registry.py` subtracts it). `52,13` is the trap.
+- Observed KV split follows the layer split exactly: 2.99 GB K on the 44-layer
+  stage against 1.36 GB on the 20-layer stage (ratio 2.2 = 44/20), at an
+  identical `max_total_num_tokens=142714`. The token count is still
+  min-reduced across the WORLD group, so the deeper stage sets it for
+  everyone; here that stage binds anyway, but on a split where the short stage
+  could afford far more tokens this throws that capacity away (open item for
+  #201 slice 3).
+
 ## 5. Credentials
 
 | Credential | Location | Use |
