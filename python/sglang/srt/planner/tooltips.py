@@ -110,10 +110,21 @@ MEASUREMENT_SOURCES = {
         "the #254 offload wave-order study (Qwen3.6-35B-A3B-AWQ, single 5090, "
         "resident expert fraction 0.25)"
     ),
+    "card_probe": "the short card probe",
 }
 
 
 TRADEOFFS: Dict[str, Tradeoff] = {
+    # ---- measurement actions ----------------------------------------------
+    "action.card_probe": Tradeoff(
+        gain="Ranks the cards on measured rates instead of datasheet ones: "
+        "bandwidth, the decode GEMV read, bf16 and fp8 GEMM, host transfer, "
+        "and both directions of every pair.",
+        cost="About 30 s of GPU time per card, allocating on each one while it "
+        "runs, so a live server loses that memory for the duration. Cached "
+        "until the driver or the card set changes.",
+        measured_from="card_probe",
+    ),
     # ---- view modes -------------------------------------------------------
     "view_mode.simple": Tradeoff(
         gain="Shows each card's VRAM as one number and one budget slider.",

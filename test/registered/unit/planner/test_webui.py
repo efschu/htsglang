@@ -3271,3 +3271,101 @@ class TestLiveBannerStates(CustomTestCase):
         self.assertIn("served_model_name", seg)
         self.assertIn("' @ :'", seg)
         self.assertIn("pid", seg)
+
+
+class TestCardProbeEndpoint(CustomTestCase):
+    """POST /api/card_probe + GET /api/card_probe/status (#213).
+
+    The point under test is not the measurement (that needs cards) but the
+    contract around it: the start call returns instead of blocking, the
+    status call answers before anything has ever been started, and the
+    absence of a probe is stated in the words the surface uses.
+    """
+
+    def _isolated_store(self):
+        """A fresh job store, so a test never starts a real probe."""
+        from sglang.srt.rigmon import card_probe
+
+        store = card_probe.ProbeJobStore()
+        store.synchronous = True
+        return card_probe, store
+
+    def test_status_without_a_probe_names_the_nameplate_basis(self):
+        from sglang.srt.rigmon import card_probe
+
+        real = card_probe.load_card_probe
+        card_probe.load_card_probe = lambda *a, **k: None
+        try:
+            d = webui.card_probe_status_payload({})
+        finally:
+            card_probe.load_card_probe = real
+        self.assertTrue(d["ok"])
+        self.assertFalse(d["measured"])
+        self.assertIsNone(d["cached"])
+        self.assertEqual(d["basis"], "nameplate-ranked, no probe cached")
+
+    def test_status_with_a_probe_reports_measured(self):
+        from sglang.srt.rigmon import card_probe
+
+        prof = card_probe.CardProbeProfile(
+            created=1000.0,
+            cards=[card_probe.CardProbeMeasurement(
+                uuid="u", name="card", cuda_index=0, membw_read_gbs=700.0,
+                gemm_bf16_tflops=60.0)],
+            pairs=[],
+        )
+        real = card_probe.load_card_probe
+        card_probe.load_card_probe = lambda *a, **k: prof
+        try:
+            d = webui.card_probe_status_payload({})
+        finally:
+            card_probe.load_card_probe = real
+        self.assertTrue(d["measured"])
+        self.assertIn("measured card probe of 1 cards", d["basis"])
+        self.assertIsNotNone(d["cached"])
+
+    def test_start_returns_a_job_rather_than_the_result(self):
+        card_probe, store = self._isolated_store()
+        prof = card_probe.CardProbeProfile(created=1000.0)
+        store.runner = lambda node_id: (prof, "/tmp/x.json")
+        real_jobs = card_probe.JOBS
+        card_probe.JOBS = store
+        try:
+            d = webui.card_probe_start_payload({})
+        finally:
+            card_probe.JOBS = real_jobs
+        self.assertTrue(d["ok"])
+        self.assertIn("job_id", d["job"])
+        # A job, not a profile: the caller polls for the numbers.
+        self.assertNotIn("cards", d)
+
+    def test_unknown_job_id_is_an_error_not_an_empty_job(self):
+        card_probe, store = self._isolated_store()
+        real_jobs = card_probe.JOBS
+        card_probe.JOBS = store
+        try:
+            d = webui.card_probe_status_payload({"job_id": "nope"})
+        finally:
+            card_probe.JOBS = real_jobs
+        self.assertFalse(d["ok"])
+        self.assertIn("nope", d["error"])
+
+    def test_status_path_is_dispatched_before_the_start_path(self):
+        # The flat chain matches on prefixes and /api/card_probe is a prefix
+        # of /api/card_probe/status.
+        src = webui.__file__
+        with open(src) as f:
+            text = f.read()
+        i_status = text.index('startswith("/api/card_probe/status")')
+        i_start = text.index('startswith("/api/card_probe"):', i_status)
+        self.assertLess(i_status, i_start)
+
+    def test_the_page_offers_the_probe_and_stops_its_own_poll(self):
+        html = webui.INDEX_HTML
+        self.assertIn("function cardProbeBar(", html)
+        self.assertIn("/api/card_probe/status", html)
+        self.assertIn("no probe cached", html)
+        i = html.index("async function cardProbePoll(")
+        seg = html[i:i + 1400]
+        self.assertIn("clearInterval(window._cardProbeTimer)", seg)
+        self.assertIn("refreshLeverProfiles()", seg)

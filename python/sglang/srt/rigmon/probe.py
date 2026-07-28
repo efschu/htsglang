@@ -163,6 +163,20 @@ class CardRate:
     #: its dtype is not a ceiling — fp8 and bf16 differ by a factor of two on
     #: the cards this fork targets, and Ampere has no fp8 tensor path at all.
     gemm_dtype: str = "bfloat16"
+    #: The fp8 ceiling as its own number rather than a second ``gemm_tflops``
+    #: with a different ``gemm_dtype``: a rig where only some cards have an
+    #: fp8 tensor path has to show both figures side by side, and ``None``
+    #: here is the honest answer for the cards that do not (see
+    #: ``card_probe.CardProbeMeasurement.fp8_note`` for why).
+    gemm_fp8_tflops: Optional[float] = None
+    #: The decode-shaped weight read (task #231's divisor). Kept apart from
+    #: ``membw_gbs``, which is the streaming peak: collapsing them returns the
+    #: larger, and the decode number is then lost exactly where it is used.
+    membw_gemv_gbs: Optional[float] = None
+    #: Host<->device, each direction alone. Absent from the stage-0 profile;
+    #: filled in by ``card_probe``.
+    h2d_gbs: Optional[float] = None
+    d2h_gbs: Optional[float] = None
     state: Optional[CardState] = None
 
     @property
@@ -487,6 +501,10 @@ def from_hardware_profile(
                 total_mib=g.get("total_mib"),
                 gemm_tflops=g.get("gemm_tflops"),
                 membw_gbs=g.get("membw_gbs"),
+                # PROFILE_VERSION 2 carries the GEMV rate; older profiles do
+                # not, and the field then stays absent rather than being
+                # back-filled from the streaming peak.
+                membw_gemv_gbs=g.get("membw_gemv_gbs"),
                 state=states.get(str(uuid)),
             )
         )

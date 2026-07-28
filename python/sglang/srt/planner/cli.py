@@ -313,6 +313,39 @@ def build_parser() -> argparse.ArgumentParser:
         default="http://127.0.0.1:30000",
         help="Engine base URL a scenario's harness command should target.",
     )
+    cprobe = p.add_argument_group(
+        "the short card probe (#213)",
+        "Measured card rates and the ordered pair matrix, which is what "
+        "separates a concrete speed suggestion from a nameplate ranking. "
+        "Reading the cache is free; --card-probe-run costs about 30 s of GPU "
+        "time and allocates on every card while it runs.",
+    )
+    cprobe.add_argument(
+        "--card-probe",
+        action="store_true",
+        help="Print the cached card probe: membw, the decode GEMV rate, bf16 "
+        "and fp8 GEMM, H2D/D2H, and both directions of every card pair with "
+        "the path each was measured over. Exits non-zero when nothing is "
+        "cached rather than printing an estimate.",
+    )
+    cprobe.add_argument(
+        "--card-probe-run",
+        action="store_true",
+        help="With --card-probe: measure now instead of reading the cache. "
+        "Needs the GPUs to itself for the duration.",
+    )
+    cprobe.add_argument(
+        "--card-probe-no-pairs",
+        action="store_true",
+        help="With --card-probe-run: cards only, skip the pair matrix.",
+    )
+    cprobe.add_argument(
+        "--card-probe-node-id",
+        default="local",
+        help="Node label stored with the measurement; only matters once two "
+        "rigs are joined and card ids have to stay distinct.",
+    )
+
     rn = p.add_argument_group(
         "running a scenario (the executor)",
         "A scenario says what to measure and comparison.py says what may be "
@@ -387,6 +420,46 @@ def _cached_crossover(path: str = ""):
         return load_finding(path or None)
     except Exception:
         return None
+
+
+def _run_card_probe(args) -> int:
+    """--card-probe: print the cached probe, or measure and print it.
+
+    Reading is the default and measuring is the opt-in, for the same reason
+    the rigmon CLI reads rather than probes: this can run next to a live
+    server, and a multi-second allocation on every card as a side effect of
+    printing a table would be a surprise.
+    """
+    from sglang.srt.rigmon import card_probe as cpmod
+
+    if args.card_probe_run:
+        profile = cpmod.run_card_probe(
+            node_id=args.card_probe_node_id,
+            include_pairs=not args.card_probe_no_pairs,
+            progress=(
+                None
+                if args.json
+                else lambda d, t, label: print(
+                    f"[{d}/{t}] {label}", file=sys.stderr
+                )
+            ),
+        )
+    else:
+        profile = cpmod.load_card_probe()
+        if profile is None:
+            print(
+                "error: no cached card probe for these cards. Run it with "
+                "--card-probe --card-probe-run (about 30 s of GPU time); "
+                "until then every speed suggestion is ranked on nameplate "
+                "card specs.",
+                file=sys.stderr,
+            )
+            return 1
+    if args.json:
+        print(json.dumps(profile.to_json(), indent=1))
+    else:
+        print(cpmod.format_text(profile))
+    return 0
 
 
 def _run_levers(args) -> int:
@@ -917,6 +990,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"{(str(p.tdp_w) + 'W') if p.tdp_w else '-'}"
             )
         return 0
+
+    if args.card_probe:
+        return _run_card_probe(args)
 
     if args.levers:
         return _run_levers(args)

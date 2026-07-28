@@ -655,19 +655,27 @@ def _profile_for(library, name):
 
 
 def _measured_by_index(hardware, measured_scores):
-    """{gpu_index: (membw_gbs, gemm_tflops)} of MEASURED micro-probe scores.
+    """{gpu_index: (membw_gbs, gemm_bf16_tflops, gemm_fp8_tflops_or_None)}.
 
     Preference: match the live rig's cached probe by GPU **UUID** (the profile
     is keyed by UUID, and ``HardwareSpec`` carries the NVML UUID per card) — this
     sidesteps the torch-cuda-vs-NVML device-order trap that a bare index map
     would fall into. ``measured_scores`` (advantage.MeasuredCardScore) is folded
-    in as a secondary source for indices the UUID match didn't cover."""
+    in as a secondary source for indices the UUID match didn't cover.
+
+    The fp8 slot is filled only by the #213 card probe, which measures it; the
+    stage-0 profile has no fp8 GEMM and leaves it None, which keeps an fp8 plan
+    on the nameplate fp8 figure rather than on a bf16 number wearing an fp8
+    label.
+    """
     out = {}
     for s in measured_scores or []:
         mb = getattr(s, "membw_gbs", None)
         gf = getattr(s, "gemm_tflops", None)
         if mb and gf:
-            out[s.gpu_index] = (float(mb), float(gf))
+            out[s.gpu_index] = (
+                float(mb), float(gf), getattr(s, "gemm_fp8_tflops", None)
+            )
     # UUID-matched live probe (authoritative when this IS the booted rig).
     if hardware.source in ("pynvml", "nvidia-smi", "nvml"):
         try:
@@ -682,6 +690,25 @@ def _measured_by_index(hardware, measured_scores):
                         out[g.index] = (
                             float(ent["membw_gbs"]),
                             float(ent["gemm_tflops"]),
+                            None,
+                        )
+        except Exception:
+            pass
+        # The card probe measures the same two rates plus fp8, so it wins
+        # where it exists. Same UUID match, applied last.
+        try:
+            from sglang.srt.rigmon.card_probe import load_card_probe
+
+            cprobe = load_card_probe()
+            if cprobe is not None:
+                by_uuid = cprobe.by_uuid()
+                for g in hardware.gpus:
+                    c = by_uuid.get(getattr(g, "uuid", None) or "")
+                    if c and c.membw_gbs and c.gemm_bf16_tflops:
+                        out[g.index] = (
+                            float(c.membw_gbs),
+                            float(c.gemm_bf16_tflops),
+                            c.gemm_fp8_tflops,
                         )
         except Exception:
             pass
@@ -713,7 +740,13 @@ def _rank_peaks(model, hardware, library, measured_scores, dtype):
             membw, membw_src = float(prof.peak_membw_gbs), "nameplate-peak"
 
         flops = flops_src = None
-        if ms is not None:
+        if ms is not None and dtype == "fp8" and ms[2]:
+            # An fp8 plan priced on the card's own fp8 GEMM rate (#213). Only
+            # taken when that rate was actually measured on THIS card: on a
+            # card with no fp8 tensor path there is nothing to measure, and
+            # the bf16 figure below is then the honest ceiling.
+            flops, flops_src = float(ms[2]), "measured(fp8)"
+        elif ms is not None:
             # The measured GEMM probe is one bf16 number; it is the real
             # achievable compute, so it wins over the dtype-specific nameplate.
             flops, flops_src = ms[1], "measured"

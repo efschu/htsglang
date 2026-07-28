@@ -410,14 +410,27 @@ def cmd_probe(args) -> int:
     allocates a CUDA context on every card, and this CLI also runs next to a
     live server. `--reprobe` is the explicit opt-in that measures afresh.
     """
-    from sglang.srt.rigmon.probe import (
-        CardState,
-        estimate_budget,
-        from_hardware_profile,
-        measure_host_link,
-    )
+    from sglang.srt.rigmon.probe import CardState, from_hardware_profile
     from sglang.srt.rigmon.sources import select_backend
-    from sglang.srt.rigmon.transport import choose_all_pairs
+
+    if getattr(args, "card_probe", False):
+        from sglang.srt.rigmon import card_probe as cpmod
+
+        if args.reprobe:
+            profile = cpmod.run_card_probe(node_id=args.node_id)
+        else:
+            profile = cpmod.load_card_probe()
+            if profile is None:
+                print(
+                    "no cached card probe for these cards. Add --reprobe to "
+                    "measure (about 30 s of GPU time).",
+                    file=sys.stderr,
+                )
+                return 1
+        # The card probe carries its own state, measured with the numbers
+        # rather than sampled afterwards, so it is not re-attached here.
+        result = cpmod.to_probe_result(profile)
+        return _render_probe(args, result)
 
     if args.reprobe:
         from sglang.srt.uneven_perf import get_hardware_profile
@@ -446,6 +459,18 @@ def cmd_probe(args) -> int:
         print(f"warning: no card state ({e})", file=sys.stderr)
 
     result = from_hardware_profile(hw, args.node_id, card_states=states)
+    return _render_probe(args, result)
+
+
+def _render_probe(args, result) -> int:
+    """Print a :class:`ProbeResult` and the transport choice it implies.
+
+    Shared by both sources (stage-0 profile and the #213 card probe) so the
+    two are read the same way; a difference in the numbers must come from the
+    measurement, never from the renderer.
+    """
+    from sglang.srt.rigmon.probe import estimate_budget, measure_host_link
+    from sglang.srt.rigmon.transport import choose_all_pairs
 
     if args.peer:
         host, _, port = args.peer.rpartition(":")
@@ -488,10 +513,22 @@ def cmd_probe(args) -> int:
             if c.state.throttled:
                 bits.append("THROTTLED: " + ",".join(c.state.throttle_reasons))
             state = "  [" + ", ".join(bits) + "]" if bits else ""
+        extra = []
+        # Only what was actually measured: the stage-0 profile has none of
+        # these, and a zero in their place would read as a measurement.
+        if c.membw_gemv_gbs:
+            extra.append(f"gemv {c.membw_gemv_gbs:.0f} GB/s")
+        if c.gemm_fp8_tflops:
+            extra.append(f"fp8 {c.gemm_fp8_tflops:.1f} TFLOPS")
+        if c.h2d_gbs or c.d2h_gbs:
+            extra.append(
+                f"H2D/D2H {c.h2d_gbs or 0:.1f}/{c.d2h_gbs or 0:.1f} GB/s"
+            )
         print(
             f"{c.id:44s} {c.total_mib or 0:>7} MiB  "
             f"{c.gemm_tflops or 0:>7.1f} TFLOPS ({c.gemm_dtype})  "
             f"{c.membw_gbs or 0:>7.0f} GB/s{state}"
+            + ("  " + ", ".join(extra) if extra else "")
         )
     for g in result.group_latencies:
         print(
@@ -523,7 +560,7 @@ def cmd_probe(args) -> int:
         for o in ch.options:
             if o.verdict == "unavailable":
                 print(f"      unavailable: {o.label} ({', '.join(o.missing_facilities)})")
-    warnings = result.state_warnings()
+    warnings = list(result.state_warnings()) + list(result.notes)
     if warnings:
         print("\nhow to read this:")
         for w in warnings:
@@ -639,6 +676,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="measure afresh instead of reading the cache. Allocates a CUDA "
         "context on every card, so not the default while a server runs.",
+    )
+    pr.add_argument(
+        "--card-probe",
+        action="store_true",
+        help="use the #213 card probe instead of the stage-0 profile: both "
+        "directions of every pair actually measured (nothing mirrored), plus "
+        "fp8 GEMM and H2D/D2H. Reads its own cache; add --reprobe to measure.",
     )
     pr.add_argument(
         "--peer",

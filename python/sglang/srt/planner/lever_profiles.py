@@ -337,13 +337,38 @@ def _rank_scores(roofline) -> Optional[Dict[str, Any]]:
         "membw_gbs": bw,
         "gemm_tflops": gemm,
         "sources": sources,
-        "measured": all(r.membw_source == "measured" for r in per_rank)
-        and all(r.flops_source == "measured" for r in per_rank),
+        # ``startswith`` rather than equality: the compute source carries the
+        # dtype it was measured in ("measured(fp8)" when the card probe priced
+        # the fp8 path on this card), and a dtype suffix must not read as
+        # "not measured".
+        "measured": all(r.membw_source.startswith("measured") for r in per_rank)
+        and all(r.flops_source.startswith("measured") for r in per_rank),
     }
 
 
 def _min_link_gbs() -> Tuple[float, str]:
-    """The narrowest measured pair link, or the documented fallback."""
+    """The narrowest measured pair link, or the documented fallback.
+
+    The #213 card probe measures both directions of every pair, so when it is
+    cached the minimum is taken over the ORDERED matrix — an asymmetric route
+    (a card on a x4 slot) has a slow direction, and that direction is the one
+    a collective waits on.
+    """
+    try:
+        from sglang.srt.rigmon.card_probe import load_card_probe
+
+        cprobe = load_card_probe()
+        bws = [
+            p.bandwidth_gbs for p in (cprobe.pairs if cprobe else []) if p.bandwidth_gbs
+        ]
+        if bws:
+            transports = cprobe.transports
+            label = "measured ordered pair matrix"
+            if transports:
+                label += " via " + ", ".join(transports)
+            return float(min(bws)), label
+    except Exception:
+        pass
     try:
         from sglang.srt.uneven_perf import get_cached_hardware_profile
 
@@ -355,6 +380,34 @@ def _min_link_gbs() -> Tuple[float, str]:
     except Exception:
         pass
     return _FALLBACK_LINK_GBS, "assumed (no probed link matrix)"
+
+
+def _card_probe_basis() -> Optional[Dict[str, Any]]:
+    """What the cached card probe contributes, or None when none is cached.
+
+    ``None`` here is what makes the nameplate fallback visible: the surface
+    can say "ranked on nameplate specs, no probe cached" because the probe
+    block is genuinely absent, not because a placeholder was filled in.
+    """
+    try:
+        from sglang.srt.rigmon.card_probe import load_card_probe
+
+        cprobe = load_card_probe()
+    except Exception:
+        return None
+    if cprobe is None:
+        return None
+    return {
+        "created": cprobe.created,
+        "created_str": cprobe.created_str,
+        "age_s": cprobe.age_s(),
+        "stale": cprobe.is_stale(),
+        "driver": cprobe.driver,
+        "cards": len(cprobe.cards),
+        "ordered_pairs": len(cprobe.pairs),
+        "transports": cprobe.transports,
+        "caveats": cprobe.caveats(),
+    }
 
 
 def _candidates(model, base_plan: List[int], scores) -> List[List[int]]:
@@ -759,8 +812,10 @@ def build_profiles(
         caveats.append(
             "The speed objectives are ranked on nameplate card specs ("
             + ", ".join(scores["sources"])
-            + "), not on a probe of these cards. Run the hardware probe to "
-            "rank them on measured rates."
+            + "), not on a probe of these cards. Run the card probe "
+            "(POST /api/card_probe, or `python -m sglang.planner --card-probe "
+            "--run`; about 30 s of GPU time for this rig) to rank them on "
+            "measured rates."
         )
 
     cands = _candidates(model, base_plan, scores)
@@ -936,6 +991,7 @@ def build_profiles(
             ),
             "min_link_gbs": min_link,
             "min_link_source": link_source,
+            "card_probe": _card_probe_basis(),
         },
         "caveats": caveats,
         "profiles": rows,
