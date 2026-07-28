@@ -458,7 +458,25 @@ def local_column_gather(parts, per_part_sub_sizes):
 
 
 def local_row_split(x, per_part_sizes):
-    """Split a full-width row-parallel input into the FAST ranks' slices."""
+    """Split a full-width row-parallel input into the FAST ranks' slices.
+
+    Each slice is handed out CONTIGUOUS. On a real rank the row-parallel input
+    is that rank's own activation tensor -- densely packed, row stride equal to
+    its shard width. The shell's slice of a full-width tensor is the only place
+    in the system where a kernel sees that input strided (row stride = FULL
+    width), and not every kernel reads strides: GGUF's ``fused_mul_mat_gguf``
+    picks the mat-VEC kernel for ``x.shape[0] <= 8`` -- exactly the K+1 rows of
+    a lane verify forward -- and that kernel quantizes the activation assuming
+    a contiguous row stride. With a view it therefore reads row i at the full
+    width's offset: row 0 lands on the right bytes and every row after it does
+    not. That is #274's rows>=1 defect, measured to the module
+    (``mlp.down_proj``, rows 1-3 wrong while ``linear_attn`` and
+    ``mlp.gate_up_proj`` are exact).
+
+    A one-row input (plain decode) and a single-part split are contiguous
+    already, so this copies only in the case that was broken -- the paths that
+    were byte-green stay bit-for-bit unchanged.
+    """
     total = sum(per_part_sizes)
     if x.shape[-1] != total:
         raise ValueError(
@@ -468,7 +486,8 @@ def local_row_split(x, per_part_sizes):
     out = []
     off = 0
     for size in per_part_sizes:
-        out.append(x[..., off : off + size])
+        piece = x[..., off : off + size]
+        out.append(piece if piece.is_contiguous() else piece.contiguous())
         off += size
     return out
 

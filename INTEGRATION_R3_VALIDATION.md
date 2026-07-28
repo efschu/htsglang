@@ -6373,3 +6373,115 @@ Code: gpu2gpu_bar.c auf probe/gdr-window.
   `seqdecode`. Der Test, der ein stilles Zurueckflippen auf den schnellen
   falschen `extend`-Pfad verbietet, bleibt bestehen und gruen; ein zweiter
   Test haelt jetzt fest, was von `target_verify` bewiesen ist und was nicht.
+
+## Lane-Spec-Kette Runde 5 (feat/dual-group-lane-spec-r5, Basis b7e744eada)
+
+- DIE WURZEL DER KAPUTTEN ZEILEN >= 1 LIEGT NICHT IM VERIFY. Sie liegt in
+  `local_row_split`: der Row-Parallel-Shell reichte jeder Part-Scheibe eine
+  GESTRIDETE Sicht `x[..., off:off+size]` auf die volle Aktivierung. Auf einem
+  echten Rang ist die Row-Parallel-Eingabe die eigene, dicht gepackte
+  Aktivierung dieses Rangs — die Shell ist die einzige Stelle im System, an der
+  ein Kernel diese Eingabe gestridet sieht. GGUFs `fused_mul_mat_gguf` waehlt
+  fuer `x.shape[0] <= 8` den mat-VEC-Kernel (`ggml_mul_mat_vec_a8`), und der
+  quantisiert die Aktivierung mit angenommener kontiguierlicher Zeilen-Schrittweite.
+  K+1 = 4 Zeilen eines Lane-Verifys liegen genau in diesem Fenster: Zeile 0
+  trifft die richtigen Bytes, jede weitere nicht. Der Fix ist eine Zeile —
+  `local_row_split` gibt kontigue Scheiben heraus — und kopiert nur im kaputten
+  Fall (eine Zeile oder ein einziger Part sind ohnehin dicht, die byte-gruenen
+  Decode-Pfade bleiben bitgleich).
+- WIE ES LOKALISIERT WURDE, in einem Boot statt per Vermutung: der
+  Verify-Forward ist bis zum Commit zustands-rein, also conv/SSM snapshotten,
+  TARGET_VERIFY fahren, restaurieren, dieselben Kandidaten als D DECODES fahren
+  (das bekannt gute Orakel) und Zeile i gegen Schritt i vergleichen — erst je
+  Decoder-Layer, dann je Submodul. Zeile 0 ist unter dem Accept-Deckel
+  byte-gruen, ihre Differenz ist damit der Zahlen-Boden des Vergleichs; das
+  Instrument eicht sich selbst. Ergebnis (relative Max-Differenz je Zeile):
+
+  | Modul (Layer 0) | Zeile 0 | Zeile 1 | Zeile 2 | Zeile 3 |
+  |---|---|---|---|---|
+  | `linear_attn` (conv + Scan, GDN) | 2e-5 | 1,8e-4 | 1,7e-4 | 8,5e-5 |
+  | `mlp.gate_up_proj` | 0,0015 | 0,0028 | 0,0058 | 0,0087 |
+  | **`mlp.down_proj`** | 0,0057 | **1,157** | **0,830** | **1,088** |
+
+  Der GDN-Kern war die ganze Zeit exakt: conv-Ein- UND -Ausgabe sowie `a`/`b`
+  des Scans sind ueber alle vier Zeilen BITGLEICH, der Scan-Ausgang liegt bei
+  0,0025-0,0037. Damit sind Maske und GDN-Kette beide entlastet — die Frage aus
+  Runde 4 ("Full-Attn-Maske oder GDN-Kette?") hat die Antwort "weder noch": der
+  erste divergente Layer ist Layer 0, ein LINEAR-Layer, und der erste
+  Full-Attn-Layer ist erst Layer 3. Nach dem Fix: `mlp.down_proj` 1,157 ->
+  0,00037, und `tv_preds` == `sd_preds` auf allen K+1 Zeilen.
+- TOR, ungedeckelt, 12 Tokens, A-gegen-A-Boden im selben Boot ZUERST gemessen:
+
+  | Arm | alphabet | squares | repeat |
+  |---|---|---|---|
+  | Boden No-Spec vs. No-Spec | gruen | gruen | gruen |
+  | `target_verify` gegen sich selbst | gruen | gruen | gruen |
+  | `target_verify` vs. No-Spec | **gruen** | gruen* | **gruen** |
+  | `seqdecode` vs. No-Spec | gruen | gruen* | gruen |
+  | `target_verify` vs. `seqdecode` | gruen | gruen | gruen |
+
+  (*) squares meldet fuer BEIDE Spec-Arme "Divergenz bei 12" — bei Accept 2,0
+  emittiert eine Runde ueber `max_new_tokens` hinaus, die Ausgabe ist also
+  laenger als die Referenz und der Vergleich stoesst ans Laengenende. Dass die
+  seit Runde 3 byte-gruene Bruecke denselben Wert liefert, weist es als
+  Harness-Artefakt aus, nicht als Inkohaerenz; `tv_vs_sd` ist dort voll gruen.
+  Zum Vergleich Runde 4 auf denselben Prompts: rot @1 / @5 / @5.
+- GEGENPROBE, dass der Fix nur das Kaputte aendert: die No-Spec-Bahn der Lane
+  ist auf allen drei Prompts BYTE-IDENTISCH mit der aus Runde 4 (12 Tokens).
+  Der Prefill laeuft mit >8 Zeilen ueber den MMQ-Kernel, und der liest die
+  Strides offenbar korrekt — die Runden 1-4 haben also keinen stillen
+  Prefill-Fehler getragen. Betroffen war ausschliesslich das <= 8-Zeilen-Fenster,
+  das erst der Verify betreten hat.
+- ACCEPT: `target_verify` liegt auf keinem Prompt unter der Bruecke
+  (1,0 / 2,0 / 1,222 gegen 1,0 / 2,0 / 1,100) und ist jetzt lauf-zu-lauf
+  reproduzierbar (zwei Laeufe, Accept beide Male exakt 1,086; in Runde 4 war
+  genau das rot).
+- ZAHLEN (alphabet, 105 Prompt-Token, 64 Ausgabe-Token, TP=3 uneven, GGUF
+  Q3_K_M, ganze Runde gemessen, Boden mitgefahren):
+
+  | Arm | Prefill ms | ms je Runde | davon Verify | davon Kopf | Accept | ms/Token |
+  |---|---|---|---|---|---|---|
+  | No-Spec (graph-gefangen) | 88,94 | 16,099 | — | — | — | **16,099** |
+  | No-Spec (Boden, derselbe Arm) | 89,26 | 16,119 | — | — | — | 16,119 |
+  | `seqdecode` (Default) | 116,77 | 76,849 | 68,556 | 8,293 | 1,145 | 67,117 |
+  | `target_verify` | 127,86 | 77,008 | 68,402 | 8,606 | 1,086 | 70,910 |
+  | `target_verify` (Boden) | 115,27 | 77,336 | 68,706 | 8,629 | 1,086 | 71,212 |
+
+  RAUSCHBODEN: No-Spec 16,099 gegen 16,119 (0,12 %), `target_verify` gegen sich
+  selbst 77,008 gegen 77,336 (0,43 %). Der Abstand zwischen Bruecke und
+  `target_verify` betraegt je Runde 0,2 % und liegt damit UNTER dem Boden — der
+  Kernbefund aus Runde 4 haelt: der Verify-MODUS ist nicht der Hebel. Der
+  Unterschied auf der ms/Token-Achse (67,1 gegen 70,9) ist reine Accept-Differenz
+  und damit inhaltsgetrieben.
+- BREAK-EVEN, ehrlich gerechnet: eine Spec-Runde kostet 77,0 ms gegen 16,099 ms
+  je graph-gefangenem Decode-Schritt, also lohnt Spekulation ab Accept
+  **4,78** — mit K=3 (max. 4) unerreichbar. Waere NUR der Verify gefangen
+  (68,4 -> ~16,2 ms, Kopf weiter eager mit 8,6): Runde ~24,8 ms, Break-even
+  Accept **1,54** — das liegt im gemessenen Band (1,086-2,0) und waere auf
+  `squares` bereits ein Gewinn. Die Graph-Aufnahme ist damit quantifiziert die
+  Bedingung, unter der die Lane-Spekulation ueberhaupt bezahlen kann.
+- NICHT GEMACHT, mit Grund: die GRAPH-AUFNAHME des Verify (Auftragspunkt 2) und
+  der neue Nebenlaeufigkeits-Punkt E (Punkt 4). Die Wurzelsuche hat vier der
+  sechs Boots gekostet (zwei davon an Auswerte-Fehlern im Instrument, nicht an
+  Messungen — seit Boot 3 schreibt das Orakel die Roh-Tensoren vor der Analyse
+  auf Platte, damit ein Auswerte-Fehler eine Neu-Auswertung kostet und keinen
+  Neu-Boot). Punkt E braucht gepaarte Boots und war damit nicht mehr drin; der
+  +77,4 % aus Runde 4 traegt seinen Schrumpf-Vorbehalt unveraendert weiter.
+  Vorarbeit fuer Runde 6 ist benannt: die Lane captured DECODE, weil ihre
+  Args-View `speculative_algorithm` cleart — `DecodeCudaGraphRunner` waehlt
+  `capture_forward_mode` allein an `model_runner.spec_algorithm.is_speculative()`
+  und setzt sonst `num_tokens_per_bs = 1` und `capture_hidden_mode = NULL`.
+- 13/96-ARGMAX-CHECK: NICHT nachgezogen. Das Instrument ist die
+  Pro-Runden-Debug-Spur, die je Runde eine zusaetzliche lm_head-Anwendung ueber
+  alle Zeilen kostet und die Messtabelle desselben Boots verzerrt haette; ein
+  Debug-Job in Runde 6 klaert es. Was Runde 5 zeigt: auf den verglichenen Zeilen
+  stimmen die beiden Quellen ueberein — die `tv_preds` des Orakels kommen aus
+  `next_token_logits` und trafen das Decode-Orakel auf allen K+1 Zeilen.
+- `--dual-group-lane-spec` bleibt default aus, der Verify-Default bleibt
+  `seqdecode` — nicht mehr aus Korrektheitsgruenden, sondern weil beide Modi je
+  Runde gleich teuer sind (0,2 % unter dem Boden) und die Bruecke vier Boots Tor
+  hinter sich hat gegen einen. Der Wechsel gehoert in dieselbe Runde wie die
+  Graph-Aufnahme, wo er zum ersten Mal etwas einbringt. 100 CPU-Tests gruen; zwei
+  neue pinnen den Kontrakt (`local_row_split` gibt kontigue Scheiben heraus und
+  kopiert nicht, wo die Scheibe schon dicht ist), zwei bestehende wurden auf den
+  Runde-5-Stand nachgezogen.

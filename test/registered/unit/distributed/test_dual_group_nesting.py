@@ -317,6 +317,37 @@ class TestLocalCollectives(unittest.TestCase):
         got = local_row_reduce([parts[0] @ w[:, :384].t(), parts[1] @ w[:, 384:].t()])
         torch.testing.assert_close(got, x @ w.t(), rtol=1e-4, atol=1e-3)
 
+    def test_row_split_hands_out_contiguous_slices(self):
+        """The contract a stride-blind kernel depends on (#274, round 5).
+
+        On a real rank the row-parallel input is that rank's own densely packed
+        activation. The shell's slice of a FULL-width tensor is the only place
+        that input can arrive strided, and GGUF's mat-VEC kernel -- which
+        ``fused_mul_mat_gguf`` selects for <= 8 rows, i.e. exactly a lane verify
+        of K+1 candidates -- reads the activation with an assumed contiguous row
+        stride. Under a view it lands on row 0 and misses every row after it,
+        which is precisely how the lane's rows >= 1 broke while row 0 stayed
+        byte-exact. Values must of course be unchanged: this asserts both.
+        """
+        x = torch.arange(4 * 40, dtype=torch.float32).reshape(4, 40)
+        parts = local_row_split(x, [30, 10])
+        for i, p in enumerate(parts):
+            self.assertTrue(p.is_contiguous(), f"part {i} is not contiguous")
+        self.assertTrue(torch.equal(parts[0], x[:, :30]))
+        self.assertTrue(torch.equal(parts[1], x[:, 30:]))
+
+    def test_row_split_does_not_copy_when_the_slice_is_already_dense(self):
+        """One row, or one part, is contiguous already -- the byte-green decode
+        path must stay literally the same tensor, not a copy of it."""
+        x = torch.randn(4, 40)
+        # One part: the slice is the whole tensor, so no copy is made.
+        self.assertEqual(local_row_split(x, [40])[0].data_ptr(), x.data_ptr())
+        # One row: every slice is dense already, so none is copied.
+        one = torch.randn(1, 40)
+        parts = local_row_split(one, [30, 10])
+        self.assertEqual(parts[0].data_ptr(), one.data_ptr())
+        self.assertEqual(parts[1].data_ptr(), one.data_ptr() + 30 * one.element_size())
+
     def test_row_split_rejects_a_width_mismatch(self):
         with self.assertRaises(ValueError) as ctx:
             local_row_split(torch.zeros(2, 10), [6, 3])

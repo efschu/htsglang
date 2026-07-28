@@ -1761,6 +1761,478 @@ class DualGroupLane:
         self._dbg_single_token_probe(job, n_cached, clear_state=True)
         self._dbg_single_token_probe(job, n_cached, clear_state=False)
 
+    # -- the row oracle: WHICH sublayer breaks rows >= 1 (round 5) ---------
+
+    def _lane_decoder_layers(self):
+        """The target's decoder layers, in layer_id order.
+
+        Named-module walk rather than an attribute path: the lane's target is
+        an assembled hull whose container attribute differs per model family,
+        and a wrong path here would silently yield an empty hook set (a
+        diagnostic that always says "no divergence" is worse than none).
+        """
+        import re
+
+        found = {}
+        for name, mod in self.runner.model.named_modules():
+            m = re.fullmatch(r"(?:.*\.)?layers\.(\d+)", name)
+            if m:
+                found[int(m.group(1))] = mod
+        if not found:
+            raise ValueError(
+                "dual-group lane row oracle: no `layers.<i>` modules under the "
+                "lane target; the oracle cannot attribute a divergence to a "
+                "layer."
+            )
+        return [found[i] for i in sorted(found)]
+
+    def _snapshot_recurrent(self):
+        """Clone the lane's persistent conv + SSM state (all layers, all slots).
+
+        The verify forward is state-PURE up to the commit, so a snapshot taken
+        here and restored afterwards makes the two oracle arms start from
+        literally the same recurrent state -- which is the whole point: any
+        row difference is then the forward's, not the state's.
+        """
+        cache = self.runner.req_to_token_pool.mamba_pool.mamba_cache
+        return (
+            [c.clone() for c in cache.conv],
+            cache.temporal.clone(),
+        )
+
+    def _restore_recurrent(self, snap):
+        cache = self.runner.req_to_token_pool.mamba_pool.mamba_cache
+        conv, temporal = snap
+        for dst, src in zip(cache.conv, conv):
+            dst.copy_(src)
+        cache.temporal.copy_(temporal)
+
+    def _dbg_row_oracle(self, job, proposals, n_cached):
+        """Per-LAYER comparison of the TARGET_VERIFY rows against a decode oracle.
+
+        Round 4 proved WHERE the fault is not (verify input, candidate KV
+        slots, state commit -- all green with the accept cap at 0) and left one
+        question: inside one verify forward, is the chain across draft steps
+        broken by the FULL-ATTENTION mask or by the GDN recurrence? Both would
+        look the same from outside: row 0 right, rows >= 1 progressively less
+        input-dependent.
+
+        This separates them in ONE round, on the rig, without a second boot.
+        The verify forward is state-pure until the commit, so:
+
+        1. snapshot conv/SSM, run the TARGET_VERIFY forward with a hook on
+           every decoder layer, restore the snapshot and free the KV slots;
+        2. run the same candidates as D plain DECODEs -- the known-good
+           continuation, one row per step -- with the same hooks;
+        3. compare layer by layer, row i against step i.
+
+        Row 0 is byte-green under the cap, so ITS per-layer difference is the
+        numeric floor of the comparison (two different kernels, same math).
+        The first layer where row 1 leaves that floor is the culprit, and its
+        membership in ``attn_backend.full_attn_layers`` is the answer:
+        full-attn layer -> the mask; linear layer -> the GDN chain.
+        """
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+
+        batch = job["_batch"]
+        req = job["_req"]
+        idx = job["_req_pool_idx"]
+        device = batch.device
+        cand = [int(job["_next"][0].item())] + list(proposals)
+        d = len(cand)
+
+        layers = self._lane_decoder_layers()
+        full_attn = set(getattr(self.runner.attn_backend, "full_attn_layers", []) or [])
+        rec: List[List[torch.Tensor]] = [[] for _ in layers]
+        rec_in: List[List[torch.Tensor]] = [[] for _ in layers]
+
+        def _first_2d(args):
+            for t in args:
+                if (
+                    isinstance(t, torch.Tensor)
+                    and t.dim() == 2
+                    and t.is_floating_point()
+                ):
+                    return t
+            return None
+
+        def _mk_hook(i):
+            def _hook(_mod, inp, kwargs, out):
+                h = out[0] if isinstance(out, tuple) else out
+                if isinstance(h, torch.Tensor):
+                    rec[i].append(h.detach().float().cpu())
+                # The decoder layer takes its hidden states positionally on
+                # some model families and by keyword on others; scan both, or
+                # the layer-input column silently reads None.
+                hin = _first_2d(list(inp) + list(kwargs.values()))
+                if hin is not None:
+                    rec_in[i].append(hin.detach().float().cpu())
+
+            return _hook
+
+        handles = [
+            mod.register_forward_hook(_mk_hook(i), with_kwargs=True)
+            for i, mod in enumerate(layers)
+        ]
+
+        # Sub-module resolution inside the FIRST divergent layer: "layer 0 is
+        # wrong" names a layer, not a kernel. Hooking every named child of
+        # layer 0 turns the verdict into a module name in execution order.
+        sub_names = [n for n, _ in layers[0].named_modules() if n]
+        sub_rec: Dict[str, List[torch.Tensor]] = {n: [] for n in sub_names}
+
+        def _mk_sub_hook(name):
+            def _hook(_mod, _inp, out):
+                t = out[0] if isinstance(out, tuple) and out else out
+                if isinstance(t, torch.Tensor):
+                    sub_rec[name].append(t.detach().float().cpu())
+
+            return _hook
+
+        handles += [
+            mod.register_forward_hook(_mk_sub_hook(n))
+            for n, mod in layers[0].named_modules()
+            if n
+        ]
+
+        # Inside the first GDN layer: the conv chain and the recurrent scan are
+        # two separate kernels, and "layer 0 is wrong" does not say which. Spy
+        # on both, test-side (module attribute + bound method), reverted below
+        # -- no probe is left in the hot path.
+        import sglang.srt.layers.attention.linear.gdn_backend as _gdnb
+
+        conv_rec: List[torch.Tensor] = []
+        attn_rec: List[torch.Tensor] = []
+        _orig_conv = _gdnb.causal_conv1d_update
+        _lin = getattr(self.runner.attn_backend, "linear_attn_backend", None)
+        _orig_fx = getattr(_lin, "forward_extend", None)
+        _orig_fd = getattr(_lin, "forward_decode", None)
+
+        def _conv_spy(*a, **kw):
+            out = _orig_conv(*a, **kw)
+            conv_rec.append(
+                {
+                    "x": a[0].detach().float().cpu(),
+                    "out": out.detach().float().cpu(),
+                }
+            )
+            return out
+
+        def _mk_attn_spy(fn):
+            def _spy(*a, **kw):
+                out = fn(*a, **kw)
+                if isinstance(out, torch.Tensor):
+                    attn_rec.append(
+                        {
+                            "a": kw["a"].detach().float().cpu(),
+                            "b": kw["b"].detach().float().cpu(),
+                            "out": out.detach().float().cpu(),
+                        }
+                    )
+                return out
+
+            return _spy
+
+        _gdnb.causal_conv1d_update = _conv_spy
+        if _orig_fx is not None:
+            _lin.forward_extend = _mk_attn_spy(_orig_fx)
+        if _orig_fd is not None:
+            _lin.forward_decode = _mk_attn_spy(_orig_fd)
+        # Module hooks do not fire inside a replayed cuda graph, and the lane's
+        # DECODE is captured -- so the decode arm would record nothing and the
+        # oracle would report "no divergence" for the wrong reason. Force both
+        # arms eager for the duration; lane-local, restored below.
+        saved_graph_runner = self.runner.decode_cuda_graph_runner
+        self.runner.decode_cuda_graph_runner = None
+
+        # Everything the two arms touch, saved before either runs.
+        snap_state = self._snapshot_recurrent()
+        saved = {
+            "seq_lens": batch.seq_lens.clone(),
+            "seq_lens_cpu": batch.seq_lens_cpu.clone(),
+            "orig_seq_lens": batch.orig_seq_lens.clone(),
+            "seq_lens_sum": batch.seq_lens_sum,
+            "input_ids": batch.input_ids,
+            "decode_batch_idx": req.decode_batch_idx,
+            "kv_committed_len": req.kv_committed_len,
+            "kv_allocated_len": req.kv_allocated_len,
+            "already_computed": getattr(req, "already_computed", None),
+            "row": batch.req_to_token_pool.req_to_token[
+                idx, n_cached : n_cached + d
+            ].clone(),
+        }
+
+        def _restore():
+            batch.seq_lens.copy_(saved["seq_lens"])
+            batch.seq_lens_cpu.copy_(saved["seq_lens_cpu"])
+            batch.orig_seq_lens.copy_(saved["orig_seq_lens"])
+            batch.seq_lens_sum = saved["seq_lens_sum"]
+            batch.input_ids = saved["input_ids"]
+            req.decode_batch_idx = saved["decode_batch_idx"]
+            req.kv_committed_len = saved["kv_committed_len"]
+            req.kv_allocated_len = saved["kv_allocated_len"]
+            if saved["already_computed"] is not None:
+                req.already_computed = saved["already_computed"]
+            batch.req_to_token_pool.req_to_token[idx, n_cached : n_cached + d] = saved[
+                "row"
+            ]
+            self._restore_recurrent(snap_state)
+
+        def _take_per_forward():
+            """Drain the kernel spies and clear them.
+
+            The spies fire once per GDN LAYER per forward, so a flat list is
+            layer-major within a forward. Draining after each forward is what
+            makes ``[forward][layer]`` addressable -- reading the flat list as
+            if it were step-major compares layer 1 against step 1, which is a
+            different tensor entirely.
+            """
+            c, a_ = list(conv_rec), list(attn_rec)
+            conv_rec.clear()
+            attn_rec.clear()
+            return c, a_
+
+        def _take_rows():
+            r_out = [list(x) for x in rec]
+            r_in = [list(x) for x in rec_in]
+            for x in rec:
+                x.clear()
+            for x in rec_in:
+                x.clear()
+            return r_out, r_in
+
+        def _take_sub():
+            s = {n: list(v) for n, v in sub_rec.items()}
+            for v in sub_rec.values():
+                v.clear()
+            return s
+
+        def _run_tv():
+            out_cache_loc = batch.token_to_kv_pool_allocator.alloc(d)
+            batch.req_to_token_pool.req_to_token[idx, n_cached : n_cached + d] = (
+                out_cache_loc.to(torch.int32)
+            )
+            verify_input = build_lane_chain_verify_input(cand, n_cached, device=device)
+            batch.forward_mode = ForwardMode.TARGET_VERIFY
+            batch.spec_info = verify_input
+            batch.input_ids = verify_input.draft_token
+            batch.out_cache_loc = out_cache_loc
+            batch.seq_lens_sum = n_cached
+            try:
+                out_tv, _ = self._timed_forward_raw(batch, CaptureHiddenMode.FULL)
+                preds = [int(x) for x in self._verify_predictions(out_tv, d).tolist()]
+            finally:
+                batch.spec_info = None
+                batch.forward_mode = ForwardMode.DECODE
+            batch.token_to_kv_pool_allocator.free(out_cache_loc)
+            return preds
+
+        try:
+            # -- arm A: the single TARGET_VERIFY forward ----------------------
+            tv_preds = _run_tv()
+            tv_rows, tv_in = _take_rows()
+            tv_conv, tv_attn = _take_per_forward()
+            tv_sub = _take_sub()
+            _restore()
+
+            # -- arm A2: the SAME forward again from the same restored state.
+            # A verify that does not even reproduce itself is reading memory
+            # nobody wrote -- a different bug from a wrong chain, and worth one
+            # forward to exclude.
+            tv2_preds = _run_tv()
+            tv2_rows, _ = _take_rows()
+            _take_per_forward()
+            _take_sub()
+            _restore()
+
+            # -- arm B: the same candidates as D plain DECODEs ----------------
+            sd_preds = []
+            sd_conv, sd_attn, sd_sub = [], [], []
+            for tok in cand:
+                batch.input_ids = torch.tensor([tok], dtype=torch.int64, device=device)
+                batch.prepare_for_decode()
+                out_sd, _ = self._timed_forward_raw(batch, CaptureHiddenMode.LAST)
+                sd_preds.append(int(out_sd.next_token_logits.argmax(dim=-1)[0].item()))
+                c, a_ = _take_per_forward()
+                sd_conv.append(c)
+                sd_attn.append(a_)
+                sd_sub.append(_take_sub())
+            sd_rows, sd_in = _take_rows()
+            surplus = batch.req_to_token_pool.req_to_token[idx, n_cached : n_cached + d]
+            batch.token_to_kv_pool_allocator.free(surplus)
+            _restore()
+        finally:
+            for h in handles:
+                h.remove()
+            self.runner.decode_cuda_graph_runner = saved_graph_runner
+            _gdnb.causal_conv1d_update = _orig_conv
+            if _orig_fx is not None:
+                _lin.forward_extend = _orig_fx
+            if _orig_fd is not None:
+                _lin.forward_decode = _orig_fd
+
+        dump_path = os.environ.get("SGLANG_LANE_SPEC_ORACLE_DUMP")
+        if dump_path and not os.path.exists(dump_path):
+            # Raw tensors to disk BEFORE any analysis: a bug in the comparison
+            # below then costs a re-analysis, not a re-boot. Layers are capped
+            # so the dump stays small.
+            torch.save(
+                {
+                    "cand": cand,
+                    "d": d,
+                    "n_cached": n_cached,
+                    "tv_preds": tv_preds,
+                    "sd_preds": sd_preds,
+                    "tv2_preds": tv2_preds,
+                    "full_attn_layers": sorted(full_attn),
+                    "tv_conv": tv_conv[:2],
+                    "sd_conv": [f[:2] for f in sd_conv],
+                    "tv_attn": tv_attn[:2],
+                    "sd_attn": [f[:2] for f in sd_attn],
+                    "tv_rows": [r[0] if r else None for r in tv_rows[:8]],
+                    "tv2_rows": [r[0] if r else None for r in tv2_rows[:8]],
+                    "sd_rows": [r[:d] for r in sd_rows[:8]],
+                    "tv_in": [r[0] if r else None for r in tv_in[:8]],
+                    "sd_in": [r[:d] for r in sd_in[:8]],
+                    "tv_sub": tv_sub,
+                    "sd_sub": sd_sub,
+                },
+                dump_path,
+            )
+
+        # -- the comparison ---------------------------------------------------
+        def _rows(rel_a, rel_b):
+            """Relative max-diff of row i in a against row i in b, per row."""
+            per_row = []
+            for i in range(d):
+                x, y = rel_a(i), rel_b(i)
+                if x is None or y is None or x.numel() != y.numel():
+                    per_row.append(None)
+                    continue
+                denom = float(y.abs().max().item()) or 1.0
+                per_row.append(round(float((x - y).abs().max().item()) / denom, 6))
+            return per_row
+
+        report = []
+        for li in range(len(layers)):
+            if not tv_rows[li] or len(sd_rows[li]) < d:
+                continue
+            tv_h = tv_rows[li][0]
+            if tv_h.shape[0] != d:
+                continue
+            entry = {
+                "layer": li,
+                "kind": "full" if li in full_attn else "linear",
+                "rel_maxdiff_per_row": _rows(
+                    lambda i: tv_h[i].reshape(-1),
+                    lambda i: sd_rows[li][i].reshape(-1),
+                ),
+            }
+            if tv_in[li] and len(sd_in[li]) >= d and tv_in[li][0].shape[0] == d:
+                tv_hi = tv_in[li][0]
+                entry["in_rel_maxdiff_per_row"] = _rows(
+                    lambda i: tv_hi[i].reshape(-1),
+                    lambda i: sd_in[li][i].reshape(-1),
+                )
+            report.append(entry)
+
+        # First GDN layer, split into its two kernels. TV runs ONE call whose
+        # tensors carry D rows; the decode arm runs D calls of one row each.
+        # The TV row split is by equal share of the flattened tensor rather
+        # than by a named axis: the conv kernel's layout is [1, dim, D]
+        # (token-minor) while the scan's is [1, D, HV, V] (token-major), and
+        # only the conv case needs the transposed read.
+        def _chunk(t, i):
+            flat = t.reshape(-1)
+            w = flat.numel() // d
+            return flat[i * w : (i + 1) * w]
+
+        def _conv_row(t, i):
+            return t[0, :, i].reshape(-1) if t.dim() == 3 else _chunk(t, i)
+
+        inside = {}
+        if tv_conv and len(sd_conv) >= d and all(f for f in sd_conv[:d]):
+            c = tv_conv[0]
+            for key, field in (("conv_in", "x"), ("conv_out", "out")):
+                inside[f"{key}_rel_maxdiff_per_row"] = _rows(
+                    lambda i, f=field: _conv_row(c[f], i),
+                    lambda i, f=field: sd_conv[i][0][f].reshape(-1),
+                )
+            inside["conv_shapes"] = [
+                list(c["out"].shape),
+                list(sd_conv[0][0]["out"].shape),
+            ]
+        if tv_attn and len(sd_attn) >= d and all(f for f in sd_attn[:d]):
+            t = tv_attn[0]
+            for field in ("a", "b", "out"):
+                inside[f"ssm_{field}_rel_maxdiff_per_row"] = _rows(
+                    lambda i, f=field: _chunk(t[f], i),
+                    lambda i, f=field: sd_attn[i][0][f].reshape(-1),
+                )
+            inside["ssm_shapes"] = [
+                list(t["out"].shape),
+                list(sd_attn[0][0]["out"].shape),
+            ]
+
+        # Layer 0's children, in execution order: the first one whose row 1
+        # leaves row 0's floor is the module that breaks the chain.
+        submods = []
+        for name in sub_names:
+            tv_t = tv_sub.get(name) or []
+            if not tv_t or any(not sd_sub[i].get(name) for i in range(d)):
+                continue
+            t = tv_t[0]
+            per_row = _rows(
+                lambda i, t=t: _chunk(t, i),
+                lambda i, n=name: sd_sub[i][n][0].reshape(-1),
+            )
+            submods.append(
+                {
+                    "module": name,
+                    "shapes": [list(t.shape), list(sd_sub[0][name][0].shape)],
+                    "rel_maxdiff_per_row": per_row,
+                }
+            )
+
+        # Self-repeat: TV against TV from the same restored state.
+        selfrep = []
+        if tv2_rows and tv_rows and tv_rows[0] and tv2_rows[0] is not None:
+            t1, t2 = tv_rows[0][0], tv2_rows[0]
+            selfrep = _rows(lambda i: t1[i].reshape(-1), lambda i: t2[i].reshape(-1))
+
+        # The verdict: the first layer whose row 1 leaves row 0's floor by more
+        # than 10x (and by more than 1e-3 absolute-relative, so a floor of
+        # exactly 0 cannot manufacture a hit).
+        culprit = None
+        for e in report:
+            r = e["rel_maxdiff_per_row"]
+            if len(r) < 2 or r[0] is None or r[1] is None:
+                continue
+            if r[1] > max(10.0 * r[0], 1e-3):
+                culprit = e
+                break
+        self._dbg(
+            "row_oracle",
+            {
+                "n_cached": n_cached,
+                "cand": cand,
+                "proposals": list(proposals),
+                "tv_preds": tv_preds,
+                "tv2_preds": tv2_preds,
+                "sd_preds": sd_preds,
+                "tv_vs_tv2_layer0_per_row": selfrep,
+                "n_layers": len(layers),
+                "full_attn_layers": sorted(full_attn),
+                "first_divergent_layer": culprit,
+                "inside_first_gdn_layer": inside,
+                "layer0_submodules": submods,
+                "per_layer": report,
+            },
+        )
+
     def _candidate_logits(self, hidden_states):
         """Full-vocabulary logits for EVERY row of ``hidden_states``.
 
@@ -1801,9 +2273,10 @@ class DualGroupLane:
     def _verify_by_decode(self, job, proposals, n_cached):
         """Verify by consuming the candidates one DECODE at a time.
 
-        THE DEFAULT, and the only strategy that computes the right tokens on
-        this target (see ``_verify`` for why the batched one does not). Same
-        accept rule, same emitted tokens; only the forward mode differs.
+        THE DEFAULT. Since round 5 it is no longer the ONLY strategy that
+        computes the right tokens -- ``target_verify`` does too -- but it is
+        still the one with the most gate behind it (see ``_verify_mode``).
+        Same accept rule, same emitted tokens; only the forward mode differs.
 
         It buys NO latency: the number of forwards equals the number of
         emitted tokens, which is exactly what plain decoding costs. So this
@@ -1896,13 +2369,17 @@ class DualGroupLane:
         the selection rule ever changes, this falls back to the explicit
         reduction instead of indexing the wrong rows.
 
-        Open, measured, not explained: over 96 instrumented rounds the two
-        sources disagreed on 13 argmaxes (7 on row 1, 3 on row 0, 3 on rows
-        2-3). Every one of those rounds also carried the broken rows >= 1, so
-        the disagreement may be nothing but two lm_head applications tying on
-        a degenerate distribution -- but it has to be re-checked once the rows
-        are fixed, because if the two sources really differ then one of them
-        is the wrong tensor and only one round has ever proven which.
+        Still open, and honestly still open: over 96 instrumented rounds the
+        two sources disagreed on 13 argmaxes (7 on row 1, 3 on row 0, 3 on
+        rows 2-3). Every one of those rounds also carried round 4's broken
+        rows >= 1, so the disagreement may be nothing but two lm_head
+        applications tying on a degenerate distribution. Round 5 fixed the rows
+        but did NOT re-measure this: the instrument is the per-round debug
+        trace, which adds an lm_head over every row and would have distorted
+        the timing table that round 5 also had to produce. One debug job
+        settles it. What round 5 does establish is that on the rows it did
+        compare, the two sources agree -- the oracle's ``tv_preds`` come from
+        ``next_token_logits`` and matched the decode oracle on all K+1 rows.
         """
         logits = getattr(out, "next_token_logits", None)
         if logits is not None and logits.shape[0] == draft_token_num:
@@ -1912,8 +2389,8 @@ class DualGroupLane:
     def _verify_by_target_verify(self, job, proposals, n_cached):
         """Verify all K+1 candidates in ONE ``ForwardMode.TARGET_VERIFY``.
 
-        NOT THE DEFAULT YET, and the boundary is measured rather than
-        guessed -- see the round-4 status at the bottom of this docstring.
+        COHERENT since round 5, and still not the default -- see the status at
+        the bottom of this docstring for why those are two separate questions.
 
         This is the forward the batched EXTEND of round 1 was trying to be,
         minus the defect that made that one wrong: TARGET_VERIFY is the only
@@ -1932,27 +2409,32 @@ class DualGroupLane:
         was accepted. Skipping the commit would reproduce the round-1 defect
         with more machinery.
 
-        ROUND-4 STATUS, from the accept-cap falsifier (two runs each, three
-        prompts whose no-spec noise floor was measured GREEN first):
+        ROUND-5 STATUS. Round 4 left this path byte-exact with the accept
+        length capped at 0 and red without the cap: row 0 of ``preds`` tracked
+        the no-spec continuation, rows >= 1 did not. The cause was NOT in this
+        file and not in the verify input -- it was ``local_row_split`` handing
+        the row-parallel shells a STRIDED view of the full-width activation,
+        which GGUF's mat-VEC kernel (selected for <= 8 rows, i.e. exactly the
+        K+1 rows of a verify) reads as if it were contiguous. Row 0 landed on
+        the right bytes; every row after it did not. Localised by running this
+        forward and a decode oracle from the same restored recurrent state and
+        comparing layer by layer, then module by module: ``linear_attn`` exact
+        on all rows, ``mlp.down_proj`` off by 100 % on rows 1-3.
 
-        * ``tv_max_accept=0`` -- only row 0 is ever emitted and only step 0 is
-          ever committed -- is BYTE-IDENTICAL to the lane's own no-spec
-          trajectory and reproducible run to run. So the verify INPUT (mask,
-          positions, candidate KV slots, spec_info) and the state commit are
-          right for the single-row case.
-        * Uncapped, the same request is red, and the per-round trace says
-          where: row 0 of ``preds`` tracks the no-spec continuation, rows >= 1
-          do not and are barely input-dependent (over 96 rounds row 2 took 15
-          distinct values with one of them in 39 of them, against 83 distinct
-          values on row 1). The chain ACROSS draft steps inside one forward is
-          what is not yet right; everything around it is.
+        With the slices contiguous, uncapped ``target_verify`` is byte-green
+        against the lane's own no-spec trajectory on all three gate prompts
+        (floor measured first in the same boot), reproducible run to run, and
+        its accept length is >= the bridge's on every prompt.
 
-        Until that is fixed the default stays ``seqdecode``. Note what the
-        round-4 measurements also showed: the verify MODE was never the
-        expensive part. One TARGET_VERIFY forward costs ~67 ms against a
-        16.2 ms graph-captured decode, so at the measured accept length of
-        ~1.19 this path can be at best ~10 % cheaper than the bridge it
-        replaces. The lever is capturing the verify, not choosing its mode.
+        The default nonetheless stays ``seqdecode``, and the reason is a
+        measurement rather than a doubt: the verify MODE is not the lever.
+        One TARGET_VERIFY forward costs ~68.4 ms against a 16.1 ms
+        graph-captured decode, and a whole round costs 77.0 ms either way
+        (0.2 % apart, under a 0.4 % floor). Speculation on the lane breaks even
+        only above accept 4.78, which K=3 cannot reach. Promote this to the
+        default together with the graph capture that makes it ONE captured
+        forward instead of K+1 -- that is the round where the choice starts
+        paying, and where a second green gate can be taken alongside it.
         """
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
@@ -2079,12 +2561,15 @@ class DualGroupLane:
         """Which verify strategy this round uses.
 
         ``seqdecode`` -- the correctness bridge of round 3 -- unless something
-        explicitly asks for another one. It is the only strategy that is green
-        end to end today, and a default is a claim about correctness, not
-        about ambition: ``target_verify`` is byte-exact only with its accept
-        length capped at 0 (round 4, see ``_verify_by_target_verify``), and
-        ``extend`` is the measurably wrong batched path of round 1, kept
-        reachable as a live falsifier. Both stay one explicit word away.
+        explicitly asks for another one. Since round 5 ``target_verify`` is
+        green too, so the tie is no longer broken by correctness but by
+        evidence and by benefit: the bridge has four boots of gate behind it
+        against one, and the two cost the same per round (0.2 % apart, under
+        the floor), so switching today buys nothing and risks something. The
+        switch belongs to the round that captures the verify forward -- see
+        ``_verify_by_target_verify``. ``extend`` remains the measurably wrong
+        batched path of round 1, kept reachable as a live falsifier. Both stay
+        one explicit word away.
         """
         return (
             job.get("verify")
@@ -2140,6 +2625,18 @@ class DualGroupLane:
         self._dbg_round = getattr(self, "_dbg_round", 0) + 1
         if self._dbg_on() and self._dbg_round == 1:
             self._dbg_state_probes(job, n_cached)
+        # Row oracle (round 5): its own env gate, because it is expensive
+        # (one extra verify forward + D decodes) and, unlike the probes above,
+        # it restores every piece of state it touches -- so the round that
+        # follows it is NOT polluted and the run stays comparable. A fault in
+        # the diagnosis never takes the lane down: it is reported and the round
+        # proceeds (state is restored inside, before the analysis).
+        oracle_rounds = os.environ.get("SGLANG_LANE_SPEC_ROW_ORACLE")
+        if oracle_rounds and self._dbg_round <= int(oracle_rounds):
+            try:
+                self._dbg_row_oracle(job, proposals, n_cached)
+            except Exception as exc:
+                self._dbg("row_oracle_failed", {"error": repr(exc)})
 
         mode = self._verify_mode(job)
         if mode == "target_verify":
