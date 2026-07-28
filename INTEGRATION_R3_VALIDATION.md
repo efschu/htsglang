@@ -4794,7 +4794,6 @@ Bugs found:
    +14.4 % — the knee guard would have rejected 6,1,1 for the right reason
    with a 2.2x too-mild number.
 
-<<<<<<< HEAD
 # #256 — fp8 MoE presplit: single-card fp8 offload boot now real, #254 byte gate closed on the model path
 
 Fp8MoEMethod had neither half of the offload split (create_weights committed
@@ -4811,7 +4810,7 @@ output. The #254 residual gap is closed: token- vs expert-major is
 BYTE-IDENTICAL on this real fp8 boot (386/386 chars), with the expected
 ~3.5x H2D reduction (1.11-1.21 -> 0.34 GiB per layer per chunk, 27-31 -> 9
 waves). 83/83 offload tests, 7/7 fp8 wave-order GPU gates.
-=======
+
 # #265 — the three #264 bugs, fixed and pinned against the boots that found them
 
 CPU-only: the #264 boot logs carry every number the fixes need, so all three
@@ -4896,20 +4895,3 @@ assertions + 18 subtests; 16 red before the fix) and the #264 point added to
 `test_decode_knee_calibration.py`. Full planner suite 1082 passed, 1 skipped,
 1 pre-existing unrelated failure (`test_webui.py::test_reference_png_static_route`,
 red on the untouched tree too).
->>>>>>> origin/fix/uneven-perf-enc-bootability-knee
-
-# #265 — enc objective, candidate bootability, knee refit (merged this commit)
-
-enc now names its objective and refuses honestly when no lever exists
-(gates tallied, binding one named); the old floor rejection was FP summation
-noise — MLP repartitioning conserves total weight bytes. Bootability is
-judged from the plan's own numbers (capacity slack of the tight rank, not
-scratch — the briefing premise did not carry: per-layer MLP scratch moves
-only ~60 MiB between arms); all three measured #264 boots reproduce. Knee
-refit: the "2.2x" contained a base mismatch (comparable prediction +8.7 %,
-so 1.65x) and the remainder was a SIGN error (pacer at 0.70 sat on a 3080,
-predicting mild concentration as a gain); GEMV exponent 0.70->0.50,
-non-weight 0.35, peak fallback 0.45 — joint rms 3.13 -> 1.37, the #216/#230
-points stay in band. VISIBLE BEHAVIOR CHANGE: at the runbook operating
-point auto-performance now proposes NO mlp vector and says which gate
-bound (matches the #264 net-negative verdict); recorded in the runbook.
