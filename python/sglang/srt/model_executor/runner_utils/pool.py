@@ -11,30 +11,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Process-wide CUDA graph memory pool shared across the prefill and
-decode graph backends. The two phases never replay concurrently, so
-sharing one pool reserves only the larger phase's capture footprint.
+"""CUDA graph memory pool shared across the prefill and decode graph
+backends. The two phases never replay concurrently, so sharing one pool
+reserves only the larger phase's capture footprint.
+
+PER LANE, not per process (#274 slice C). Graphs that share a memory pool
+share the buffers their intermediate allocations live in: replaying two such
+graphs AT THE SAME TIME lets one graph's activations overwrite the other's.
+That is exactly what the multi-group runtime does once its lanes stop taking
+turns, so the pool is keyed by the lane in scope -- ``None`` for the serving
+group, 0..N for the lanes. Each key reserves its own capture footprint; that
+extra VRAM is the price of concurrency and is a named post in the lane's
+ledger, not a leak.
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
-from sglang.srt.runtime_context import get_resources
+from sglang.srt.runtime_context import current_lane_id, get_resources
 
 
 def get_global_graph_memory_pool() -> Optional[Any]:
-    return get_resources().graph_memory_pool
+    return get_resources().graph_memory_pool.get(current_lane_id())
 
 
 def set_global_graph_memory_pool(val: Any) -> None:
-    get_resources().graph_memory_pool = val
+    get_resources().graph_memory_pool[current_lane_id()] = val
 
 
 def get_or_create_global_graph_memory_pool(device_module: Any) -> Any:
-    """Return the shared graph memory pool, creating it on first use so
-    later backends reuse the same handle."""
-    resources = get_resources()
-    if resources.graph_memory_pool is None:
-        resources.graph_memory_pool = device_module.graph_pool_handle()
-    return resources.graph_memory_pool
+    """Return this lane's graph memory pool, creating it on first use so
+    later backends of the SAME lane reuse the same handle."""
+    pools = get_resources().graph_memory_pool
+    key = current_lane_id()
+    if pools.get(key) is None:
+        pools[key] = device_module.graph_pool_handle()
+    return pools[key]

@@ -644,10 +644,10 @@ def _mmq_threshold_prefers_mmq(m: int, qweight: torch.Tensor, qweight_type: int)
 # in-tree kernel). With an older installed wheel this degrades byte-
 # identically to the previous fresh-allocation behavior.
 # ---------------------------------------------------------------------------
-_DEQUANT_WS: dict = {}  # (device_index, dtype) -> 1-D buffer
-# (device_index, dtype) -> largest dequant TARGET this rank can be asked for,
-# in bytes, INCLUDING the over-cap ones the workspace deliberately refuses to
-# hold. See gguf_dequant_scratch_residual_bytes.
+_DEQUANT_WS: dict = {}  # (lane_id, device_index, dtype) -> 1-D buffer
+# (lane_id, device_index, dtype) -> largest dequant TARGET this rank can be
+# asked for, in bytes, INCLUDING the over-cap ones the workspace deliberately
+# refuses to hold. See gguf_dequant_scratch_residual_bytes.
 _DEQUANT_PEAK_TARGET: dict = {}
 _dequant_out_supported: bool | None = None
 
@@ -657,7 +657,27 @@ def _dequant_ws_cap_bytes() -> int:
 
 
 def _dequant_ws_key(dtype: torch.dtype, device) -> tuple:
-    return (device.index if device.type == "cuda" else device, dtype)
+    """Workspace key: LANE, device, dtype (#274 slice C).
+
+    The workspace is a single reused buffer, and its safety argument is
+    sequential: "within one forward the dequant -> GEMM pairs run back-to-back
+    on the same CUDA stream, so each GEMM consumes the dequant before the next
+    one overwrites it". Both premises break the moment two lanes forward at
+    the same time on one device: two streams, interleaved pairs, one buffer --
+    lane B's dequant overwrites the weight lane A's GEMM is still reading.
+    That is silent numerical corruption, not a crash.
+
+    Keying by lane restores the premise per lane (each lane keeps its own
+    strictly sequential dequant->GEMM chain on its own stream). The falsifier
+    for the shared form is in test_dual_group_concurrency.py.
+    """
+    from sglang.srt.runtime_context import current_lane_id
+
+    return (
+        current_lane_id(),
+        device.index if device.type == "cuda" else device,
+        dtype,
+    )
 
 
 def gguf_dequant_scratch_residual_bytes(device_index: int | None = None) -> int:
@@ -684,10 +704,11 @@ def gguf_dequant_scratch_residual_bytes(device_index: int | None = None) -> int:
     demand is the largest single one, not their total.
     """
     residual = 0
-    for (idx, dtype), peak in _DEQUANT_PEAK_TARGET.items():
+    for key, peak in _DEQUANT_PEAK_TARGET.items():
+        _lane, idx, _dtype = key
         if device_index is not None and idx != device_index:
             continue
-        buf = _DEQUANT_WS.get((idx, dtype))
+        buf = _DEQUANT_WS.get(key)
         have = buf.numel() * buf.element_size() if buf is not None else 0
         residual = max(residual, peak - have)
     return max(residual, 0)
@@ -737,10 +758,7 @@ def _ggml_dequantize_ws(
     """
     numel = rows * cols
     if _dequant_supports_out() and numel * dtype.itemsize <= _dequant_ws_cap_bytes():
-        key = (
-            qweight.device.index if qweight.device.type == "cuda" else qweight.device,
-            dtype,
-        )
+        key = _dequant_ws_key(dtype, qweight.device)
         buf = _DEQUANT_WS.get(key)
         if buf is None or buf.numel() < numel:
             buf = torch.empty(numel, dtype=dtype, device=qweight.device)
@@ -774,10 +792,7 @@ def _mul_mat_dequant_chunked(
     before chunk i+1's dequant overwrites it. The per-chunk GEMM outputs are
     small (M x rows total) and land in the graph pool during capture.
     """
-    key = (
-        qweight.device.index if qweight.device.type == "cuda" else qweight.device,
-        x.dtype,
-    )
+    key = _dequant_ws_key(x.dtype, qweight.device)
     buf = _DEQUANT_WS.get(key)
     if buf is None or buf.numel() < cols:
         # No (or too small a) workspace exists on this rank. Allocating up

@@ -6,6 +6,7 @@
 # Adapted from
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+import contextvars
 import dataclasses
 import logging
 import math
@@ -90,6 +91,23 @@ def divide(numerator, denominator):
 _TP_PARTITION_RATIOS: Optional[list] = None
 _TP_PARTITION_FAMILIES: dict = {}
 
+# CONTEXT-LOCAL OVERLAY over the two process globals above (#274 slice C).
+#
+# The globals stay the process's ONE installed plan (written once at start-up
+# by set_tp_partition_ratios, inherited by every thread). A second group in
+# the same process needs its own vector while it builds, loads or forwards --
+# and once lanes run CONCURRENTLY, a swap of the globals would be read by the
+# other lane's forward. The overlay is a context variable, so it is per-thread
+# by construction: a lane worker thread installs its vector once, and the
+# serving group's thread keeps reading the installed plan.
+#
+# Sentinel-based rather than None-based: None is a MEANINGFUL plan value
+# ("even split"), so "no overlay" needs its own marker.
+_NO_OVERLAY = object()
+_TP_PARTITION_OVERLAY: contextvars.ContextVar = contextvars.ContextVar(
+    "distributed.tp_partition_overlay", default=_NO_OVERLAY
+)
+
 
 def set_tp_partition_ratios(
     ratios: Optional[Sequence[int]],
@@ -103,6 +121,17 @@ def set_tp_partition_ratios(
     base vector and must have the same length; empty/None entries are
     ignored. Every call replaces the complete plan (base + families)."""
     global _TP_PARTITION_RATIOS, _TP_PARTITION_FAMILIES
+    _TP_PARTITION_RATIOS, _TP_PARTITION_FAMILIES = _normalize_partition_plan(
+        ratios, families
+    )
+
+
+def _normalize_partition_plan(
+    ratios: Optional[Sequence[int]],
+    families: Optional[dict] = None,
+) -> tuple:
+    """Validate and normalize a (base, families) shard plan; shared by the
+    process-wide setter and the context-local scope."""
     base = list(ratios) if ratios else None
     fams: dict = {}
     if families:
@@ -127,18 +156,25 @@ def set_tp_partition_ratios(
                     f"integers, got {vec}."
                 )
             fams[name] = vec
-    _TP_PARTITION_RATIOS = base
-    _TP_PARTITION_FAMILIES = fams
+    return base, fams
 
 
 def get_tp_partition_ratios(family: Optional[str] = None) -> Optional[list]:
-    """The installed weight vector: the family's own vector when one is
-    installed under `family`, otherwise the base vector (or None)."""
+    """The active weight vector: the family's own vector when one is
+    installed under `family`, otherwise the base vector (or None).
+
+    Reads the context-local overlay first (a lane's own plan, #274), then
+    the process-installed plan."""
+    overlay = _TP_PARTITION_OVERLAY.get()
+    if overlay is not _NO_OVERLAY:
+        base, fams = overlay
+    else:
+        base, fams = _TP_PARTITION_RATIOS, _TP_PARTITION_FAMILIES
     if family is not None:
-        vec = _TP_PARTITION_FAMILIES.get(family)
+        vec = fams.get(family)
         if vec is not None:
             return vec
-    return _TP_PARTITION_RATIOS
+    return base
 
 
 @contextmanager
@@ -161,16 +197,18 @@ def scoped_tp_partition_ratios(
     falls back to the EVEN split and loads the wrong units.
 
     Restores both the base vector and the family vectors, and is nesting-safe.
+
+    Slice C (#274): the scope writes a CONTEXT-LOCAL overlay, not the process
+    globals. Within one thread that is the same observable behavior as before
+    (install, restore); across threads it is the difference between correct
+    and silently wrong -- a lane loading its complement under a 2-entry vector
+    must not make the serving group's concurrent forward read that vector.
     """
-    global _TP_PARTITION_RATIOS, _TP_PARTITION_FAMILIES
-    saved_base = _TP_PARTITION_RATIOS
-    saved_fams = _TP_PARTITION_FAMILIES
-    set_tp_partition_ratios(ratios, families)
+    token = _TP_PARTITION_OVERLAY.set(_normalize_partition_plan(ratios, families))
     try:
         yield
     finally:
-        _TP_PARTITION_RATIOS = saved_base
-        _TP_PARTITION_FAMILIES = saved_fams
+        _TP_PARTITION_OVERLAY.reset(token)
 
 
 # ---------------------------------------------------------------------------

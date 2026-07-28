@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -752,6 +753,48 @@ def build_lane_model(lane_runner) -> nn.Module:
 # ---------------------------------------------------------------------------
 
 
+def resolve_speed_dial(server_args) -> Tuple[int, int]:
+    """Resolve --dual-group-lane-speed-dial onto the lane's two capacity
+    posts and return them (pure: the serving config is not touched, the
+    caller writes them onto the lane's own args view).
+
+    "Speed through sacrifice" is a first-class regulator, not an emergent
+    property of tuning two unrelated numbers (DESIGN_201, resource principle
+    3): one dial, both posts, logged. It only ever reduces -- the configured
+    values are the capacity end of the scale, so an unset dial is exactly the
+    old behavior.
+
+    Geometric interpolation, because both posts are capacity-like: halving
+    the sessions and halving the pool are the same KIND of step wherever you
+    are on the scale, so equal dial increments should buy equal factors.
+    """
+    dial = getattr(server_args, "dual_group_lane_speed_dial", None)
+    budget = int(server_args.dual_group_lane_budget_mib or 0)
+    requests = int(server_args.dual_group_lane_max_requests)
+    if dial is None:
+        return budget, requests
+    if not 0.0 <= float(dial) <= 1.0:
+        raise ValueError(
+            "--dual-group-lane-speed-dial must be in [0.0, 1.0], got "
+            f"{dial!r}."
+        )
+    dial = float(dial)
+    # Minimum end of the scale: one session, one eighth of the pool.
+    new_budget = max(1, int(round(budget * (0.125**dial))))
+    new_requests = max(1, int(round(requests * ((1.0 / max(requests, 1)) ** dial))))
+    if (new_budget, new_requests) != (budget, requests):
+        logger.info(
+            "dual-group lane speed dial %.2f: budget %d -> %d MiB, "
+            "max_requests %d -> %d (capacity given up for speed).",
+            dial,
+            budget,
+            new_budget,
+            requests,
+            new_requests,
+        )
+    return new_budget, new_requests
+
+
 def _lane_server_args_view(server_args):
     """A shallow, lane-scoped view of the server args.
 
@@ -767,19 +810,22 @@ def _lane_server_args_view(server_args):
     import copy
 
     view = copy.copy(server_args)
+    lane_budget_mib, lane_requests = resolve_speed_dial(server_args)
+    view.dual_group_lane_budget_mib = lane_budget_mib
+    view.dual_group_lane_max_requests = lane_requests
     view.speculative_algorithm = None
     view.speculative_draft_model_path = None
     if hasattr(view, "speculative_cross_algorithm"):
         view.speculative_cross_algorithm = False
     view.dcp_size = 1
-    view.max_running_requests = server_args.dual_group_lane_max_requests
+    view.max_running_requests = lane_requests
     # The lane has no radix cache (its batches use a no-op tree-cache stub),
     # so the mamba slot ratio is 1 slot per request (with the radix cache on,
     # _calculate_mamba_ratio charges ~5 slots/request for the extra-buffer
     # strategy and a 2-slot lane pool admits zero requests -- measured boot
     # failure). One spare slot for the ping-pong margin.
     view.disable_radix_cache = True
-    view.max_mamba_cache_size = server_args.dual_group_lane_max_requests + 1
+    view.max_mamba_cache_size = lane_requests + 1
     view.rank_tp_ratio = None
     view.rank_mlp_ratio = None
     view.rank_moe_ratio = None
@@ -825,7 +871,7 @@ class DualGroupLane:
     during a tick (serial contract).
     """
 
-    def __init__(self, lane_id: int, plan: NestedGroupPlan, runner):
+    def __init__(self, lane_id: int, plan: NestedGroupPlan, runner, concurrent: bool = False):
         self.lane_id = lane_id
         self.plan = plan
         self.runner = runner
@@ -833,6 +879,19 @@ class DualGroupLane:
         self.active: Optional[Dict[str, Any]] = None
         self.results: List[Dict[str, Any]] = []
         self._runtime_scope = None
+        # -- concurrency (slice C) ---------------------------------------
+        self.concurrent = bool(concurrent)
+        self.stream = None
+        self._thread = None
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._submitted = threading.Event()
+        self._stop = threading.Event()
+        self._idle_since: Optional[float] = time.monotonic()
+        self._last_wall_ms: Optional[float] = None
+        self._busy = False
+        self._admission_waits: List[float] = []
+        self.lending = None  # set by the scheduler when stage-2 lending is on
 
     # -- job interface (rank-local; called from the scheduler loop) -------
 
@@ -840,22 +899,32 @@ class DualGroupLane:
         input_ids = job.get("input_ids")
         if not input_ids:
             raise ValueError("lane job needs non-empty input_ids")
-        self.jobs.append(
-            {
-                "input_ids": [int(t) for t in input_ids],
-                "max_new_tokens": int(job.get("max_new_tokens", 32)),
-                "output_ids": [],
-                "prefill_ms": None,
-                "decode_ms": [],
-            }
-        )
+        with self._lock:
+            self.jobs.append(
+                {
+                    "input_ids": [int(t) for t in input_ids],
+                    "max_new_tokens": int(job.get("max_new_tokens", 32)),
+                    "output_ids": [],
+                    "prefill_ms": None,
+                    "decode_ms": [],
+                }
+            )
+        # PD priority (addendum 5): work has arrived for the protected class.
+        # Reclaim anything lent to the scavenger BEFORE waking the worker --
+        # the reclaim latency is the guarantee quality of that priority and
+        # is measured, not assumed.
+        if self.lending is not None:
+            self.lending.on_lane_work_arrived()
+        self._idle_since = None
+        self._wake.set()
 
     @property
     def has_work(self) -> bool:
-        return self.active is not None or bool(self.jobs)
+        with self._lock:
+            return self.active is not None or bool(self.jobs) or self._busy
 
     def stats(self) -> Dict[str, Any]:
-        return {
+        stats = {
             "lane_id": self.lane_id,
             "plan": self.plan.describe(),
             "queued": len(self.jobs),
@@ -867,7 +936,133 @@ class DualGroupLane:
             "max_total_num_tokens": getattr(
                 self.runner, "max_total_num_tokens", None
             ),
+            "concurrent": self.concurrent,
         }
+        if self._admission_waits:
+            waits = self._admission_waits[-64:]
+            stats["admission_wait_ms"] = {
+                "n": len(waits),
+                "mean": round(sum(waits) / len(waits), 4),
+                "max": round(max(waits), 4),
+            }
+        if self.lending is not None:
+            stats["lending"] = self.lending.stats()
+        return stats
+
+    # -- concurrent driver (slice C) -------------------------------------
+
+    def start_worker(self) -> None:
+        """Start the lane's own thread and its high-priority CUDA stream.
+
+        The thread is where de-globalization pays off: it enters the lane
+        scope ONCE and stays in it, so every ``get_server_args()`` /
+        geometry / per-lane-resource read on this thread resolves to the
+        lane for the thread's whole life, while the scheduler thread keeps
+        reading the serving group's values. Nothing is swapped, so the two
+        may run at the same time.
+
+        The stream carries the PD priority in the only place the hardware
+        honours it: a high-priority stream's blocks are scheduled ahead of a
+        normal-priority stream's AS BLOCKS RETIRE -- preemption at the
+        natural grain, never mid-kernel (addendum 5).
+        """
+        if self._thread is not None:
+            return
+        import os
+
+        low, high = torch.cuda.Stream.priority_range()
+        # Escape hatch, not a tuning knob: NCCL's collective kernels
+        # spin-wait, so if the protected lane ever starved the serving
+        # group's freshly launched all-reduce the symptom would be a
+        # rank-0-late group stall rather than a slowdown. Setting this to 0
+        # makes both classes equal-priority and isolates that question.
+        high = int(os.environ.get("SGLANG_DUAL_GROUP_LANE_STREAM_PRIORITY", high))
+        self.stream = torch.cuda.Stream(
+            device=self.runner.gpu_id, priority=high
+        )
+        self._thread = threading.Thread(
+            target=self._worker_loop,
+            name=f"dual-group-lane-{self.lane_id}",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info(
+            "dual-group lane %d worker started: own thread + CUDA stream "
+            "(priority %d of range [%d, %d]); the serving group keeps the "
+            "default stream.",
+            self.lane_id,
+            high,
+            low,
+            high,
+        )
+
+    def stop_worker(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._wake.set()
+        self._thread.join(timeout=10.0)
+        self._thread = None
+
+    def _worker_loop(self) -> None:
+        with self._lane_runtime_scope():
+            torch.cuda.set_device(self.runner.gpu_id)
+            while not self._stop.is_set():
+                self._wake.wait(timeout=0.05)
+                self._wake.clear()
+                if self._stop.is_set():
+                    break
+                while not self._stop.is_set():
+                    with self._lock:
+                        if self.active is None and not self.jobs:
+                            self._busy = False
+                            if self._idle_since is None:
+                                self._idle_since = time.monotonic()
+                            break
+                        self._busy = True
+                    try:
+                        with torch.cuda.stream(self.stream):
+                            self._step_locked_scope()
+                    except Exception:
+                        logger.exception(
+                            "dual-group lane %d step failed; dropping the "
+                            "active job.",
+                            self.lane_id,
+                        )
+                        with self._lock:
+                            self.active = None
+
+    def _step_locked_scope(self) -> None:
+        """One lane step on the worker thread. Already inside the lane scope
+        (entered once for the thread) -- do NOT re-enter it per step."""
+        with self._lock:
+            if self.active is None:
+                self.active = self.jobs.pop(0)
+            job = self.active
+        self._submitted.clear()
+        with torch.no_grad():
+            if job["prefill_ms"] is None:
+                self._prefill(job)
+            else:
+                self._decode_step(job)
+        if (
+            len(job["output_ids"]) >= job["max_new_tokens"]
+            or (job["output_ids"] and job["output_ids"][-1] < 0)
+        ):
+            self._finish(job)
+
+    def note_admission(self, waited_ms: float) -> None:
+        """Record how long the scheduler yielded to let the lane submit
+        first at a grain boundary (the two-class scheduler's cost to the
+        scavenger, measured rather than assumed)."""
+        self._admission_waits.append(waited_ms)
+        if len(self._admission_waits) > 512:
+            del self._admission_waits[:256]
+
+    @property
+    def idle_seconds(self) -> float:
+        since = self._idle_since
+        return 0.0 if since is None else (time.monotonic() - since)
 
     # -- the tick ---------------------------------------------------------
 
@@ -876,11 +1071,12 @@ class DualGroupLane:
         Returns True when it did work.  Rank-local; never touches a
         communicator; runs under the lane geometry override so any residual
         live geometry read sees the lane, not the serving group."""
-        if self.active is None:
-            if not self.jobs:
-                return False
-            self.active = self.jobs.pop(0)
-        job = self.active
+        with self._lock:
+            if self.active is None:
+                if not self.jobs:
+                    return False
+                self.active = self.jobs.pop(0)
+            job = self.active
         with self._lane_runtime_scope(), torch.no_grad():
             if job["prefill_ms"] is None:
                 self._prefill(job)
@@ -895,26 +1091,46 @@ class DualGroupLane:
 
     @contextlib.contextmanager
     def _lane_runtime_scope(self):
-        """The serial tick's execution scope: the lane geometry override PLUS
-        the lane's server-args view published as the process config.
+        """The lane's execution scope: its identity, its config and its
+        geometry, all CONTEXT-LOCAL (#274 slice C).
 
-        The batch/forward machinery reads ``get_server_args()`` (process
-        global) at runtime -- e.g. ``prepare_for_extend`` gates the
-        mamba-radix track machinery on it, which the lane (no radix cache,
-        its own pool without track buffers) must not enter.  Ticks are
-        strictly serial with the serving group's forwards (S1), so a scoped
-        swap is safe; slice C's concurrency must move these reads off the
-        global first (known blocker, documented)."""
-        from sglang.srt.runtime_context import get_context
+        The batch/forward machinery reads ``get_server_args()`` at runtime --
+        e.g. ``prepare_for_extend`` gates the mamba-radix track machinery on
+        it, which the lane (no radix cache, its own pool without track
+        buffers) must not enter.  Slice B published the lane's args into the
+        PROCESS slot for the duration of a tick and restored them after; that
+        swap is exactly what forbade concurrency, because a serving forward
+        running at the same time would read the lane's config.
 
-        ctx = get_context()
-        saved = ctx._server_args
-        ctx.set_server_args(self.runner.server_args)
-        try:
+        ``lane_scope`` installs an OVERLAY in a context variable instead. In
+        the serial mode this is observably the same thing (same thread, same
+        nesting); in the concurrent mode the lane worker thread carries its
+        own overlay and the scheduler thread keeps reading the serving
+        config. The lane id in the same scope keys the per-lane process
+        resources (graph memory pool, GGUF dequant workspace) that would
+        otherwise alias between lanes.
+        """
+        from sglang.srt.runtime_context import lane_scope
+
+        with lane_scope(self.scope_lane_id, self.runner.server_args):
             with lane_geometry_override(1, 0):
                 yield
-        finally:
-            ctx.set_server_args(saved)
+
+    @property
+    def scope_lane_id(self) -> Optional[int]:
+        """The identity this lane presents to the per-lane RESOURCE keys
+        (graph memory pool, GGUF dequant workspace).
+
+        In SERIAL mode it is ``None``: the lane and the serving group never
+        run at the same time, so sharing those resources is sound, and
+        keeping them shared is what makes the serial mode byte-for-byte the
+        slice-B mode (same capture pool, same workspace, same VRAM posts) --
+        the hard gate slice C is not allowed to move.
+
+        In CONCURRENT mode it is the lane id, and the extra capture pool plus
+        the extra dequant workspace are the named VRAM price of concurrency.
+        """
+        return self.lane_id if self.concurrent else None
 
     def _make_batch(self, job):
         from array import array
@@ -955,16 +1171,44 @@ class DualGroupLane:
         return batch
 
     def _timed_forward(self, batch):
+        """One lane forward, timed on the LANE's stream only.
+
+        Slice B synchronized the whole DEVICE around the forward, which is
+        correct for a serial tick and fatal for a concurrent one: it would
+        wait for the serving group's kernels too, so every lane timing would
+        include the serving group's work and the lane would serialize behind
+        it. The concurrent path times with CUDA events on the lane stream and
+        synchronizes that stream alone. Wall-clock is still reported for the
+        serial path, where the two agree.
+        """
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
         runner = self.runner
-        torch.cuda.synchronize(runner.gpu_id)
+        if self.stream is None:
+            torch.cuda.synchronize(runner.gpu_id)
+            t0 = time.perf_counter()
+            forward_batch = ForwardBatch.init_new(batch, runner)
+            logits_output = runner.forward(forward_batch).logits_output
+            next_token_ids = runner.sample(logits_output, forward_batch)
+            torch.cuda.synchronize(runner.gpu_id)
+            return next_token_ids, (time.perf_counter() - t0) * 1000.0
+
+        start_ev = torch.cuda.Event(enable_timing=True)
+        end_ev = torch.cuda.Event(enable_timing=True)
         t0 = time.perf_counter()
+        start_ev.record(self.stream)
         forward_batch = ForwardBatch.init_new(batch, runner)
         logits_output = runner.forward(forward_batch).logits_output
         next_token_ids = runner.sample(logits_output, forward_batch)
-        torch.cuda.synchronize(runner.gpu_id)
-        return next_token_ids, (time.perf_counter() - t0) * 1000.0
+        end_ev.record(self.stream)
+        self._submitted.set()
+        self.stream.synchronize()
+        wall_ms = (time.perf_counter() - t0) * 1000.0
+        self._last_wall_ms = wall_ms
+        # Device time on the lane's stream: what the lane's own kernels took,
+        # including the SM share it lost to the serving group but excluding
+        # any time spent waiting for the GIL between launches.
+        return next_token_ids, start_ev.elapsed_time(end_ev)
 
     def _prefill(self, job):
         batch = self._make_batch(job)
@@ -1028,8 +1272,14 @@ class DualGroupLane:
             ),
             "decode_steps": len(decode_ms),
         }
-        self.results.append(result)
-        self.active = None
+        if self._last_wall_ms is not None:
+            result["prefill_wall_ms"] = round(self._last_wall_ms, 2)
+        with self._lock:
+            self.results.append(result)
+            self.active = None
+            if not self.jobs:
+                self._busy = False
+                self._idle_since = time.monotonic()
         logger.info(
             "dual-group lane %d job done: prefill %d tokens in %.1f ms "
             "(%.1f ms/1k), %d decode steps, mean %.2f ms/step.",
@@ -1040,6 +1290,137 @@ class DualGroupLane:
             result["decode_steps"],
             result["decode_ms_mean"] or 0.0,
         )
+
+
+class LaneLending:
+    """Elastic lane occupancy, stage 2: VRAM return with a reclaim guarantee
+    (#274 / DESIGN_201 addendum 4+5).
+
+    Stage 1 (compute share) is the scheduler's business and is free: the lane
+    simply stops submitting. Stage 2 is the one with a price, and the price
+    is what this class measures.
+
+    THE CONTRACT.  The lane's pool budget is RESERVED: it is never lent
+    without a reclaim guarantee. What may be lent is the part of it the lane
+    is demonstrably not using, and the borrower may only put EVACUABLE
+    content there -- discardable scratch, or spillable session KV. Permanent
+    posts are refused. Reclaim is therefore always possible without waiting
+    for the borrower's work to finish; it costs a free (and, for spillable
+    content, an evacuation), and that cost is the guarantee quality of the PD
+    priority.
+
+    THE HYSTERESIS.  Lending is only worth it if the borrower holds the bytes
+    long enough to earn back the reclaim. The lane must be idle for
+    ``threshold_s`` before anything is lent (#156 pattern: the threshold
+    keeps the occupancy from flapping when the lane is merely between jobs),
+    and once lent, a minimum hold prevents an immediate reversal.
+
+    WHAT IS BUILT HERE.  The mechanism, its instrumentation and the
+    discardable-scratch borrower (the content class that needs no evacuation
+    path). The spillable-session-KV borrower -- the serving group placing
+    cold sessions in the lane's idle region via the #236/#242 machinery,
+    which turns the lent bytes into serving CAPACITY rather than serving
+    scratch -- reuses this same lend/reclaim interface and is the named
+    follow-on.
+    """
+
+    def __init__(
+        self,
+        lane,
+        lend_mib: int,
+        threshold_s: float,
+        min_hold_s: float = 1.0,
+    ):
+        self.lane = lane
+        self.lend_mib = int(lend_mib)
+        self.threshold_s = float(threshold_s)
+        self.min_hold_s = float(min_hold_s)
+        self._borrowed = None
+        self._lent_at: Optional[float] = None
+        self.lend_events = 0
+        self.reclaim_events = 0
+        self.refused_min_hold = 0
+        self.lend_ms: List[float] = []
+        self.reclaim_ms: List[float] = []
+
+    @property
+    def is_lent(self) -> bool:
+        return self._borrowed is not None
+
+    def maybe_lend(self) -> bool:
+        """Called by the serving group at a grain boundary. Lends only when
+        the lane has been idle past the amortization threshold."""
+        if self._borrowed is not None or self.lend_mib <= 0:
+            return False
+        if self.lane.has_work or self.lane.idle_seconds < self.threshold_s:
+            return False
+        t0 = time.perf_counter()
+        try:
+            self._borrowed = torch.empty(
+                self.lend_mib * (1 << 20),
+                dtype=torch.uint8,
+                device=f"cuda:{self.lane.runner.gpu_id}",
+            )
+        except torch.cuda.OutOfMemoryError:
+            # The lane's idle bytes are not necessarily free bytes: the
+            # caching allocator may have handed them out already. Refusing is
+            # correct -- the reservation is the lane's, not the borrower's.
+            self.lend_mib = 0
+            logger.warning(
+                "dual-group lane %d: stage-2 lend refused (out of memory); "
+                "lending disabled for this boot.",
+                self.lane.lane_id,
+            )
+            return False
+        self._lent_at = time.monotonic()
+        self.lend_events += 1
+        self.lend_ms.append((time.perf_counter() - t0) * 1000.0)
+        return True
+
+    def on_lane_work_arrived(self) -> None:
+        """PD work arrived: give the bytes back NOW. The elapsed time is the
+        reclaim latency -- the number the priority promise is worth."""
+        if self._borrowed is None:
+            return
+        if (
+            self._lent_at is not None
+            and (time.monotonic() - self._lent_at) < self.min_hold_s
+        ):
+            # Hysteresis, one-sided: a reclaim is never REFUSED (that would
+            # break the guarantee), it is only counted, so a flapping
+            # workload is visible in the stats instead of silently paying.
+            self.refused_min_hold += 1
+        t0 = time.perf_counter()
+        self._borrowed = None
+        # Discardable scratch: the free IS the evacuation. The bytes return
+        # to the one caching allocator both lanes draw from (slice A's
+        # single-address-space property), so nothing is copied.
+        torch.cuda.empty_cache()
+        self._lent_at = None
+        self.reclaim_events += 1
+        self.reclaim_ms.append((time.perf_counter() - t0) * 1000.0)
+
+    def stats(self) -> Dict[str, Any]:
+        def _summary(xs):
+            if not xs:
+                return None
+            tail = xs[-64:]
+            return {
+                "n": len(tail),
+                "mean_ms": round(sum(tail) / len(tail), 3),
+                "max_ms": round(max(tail), 3),
+            }
+
+        return {
+            "lend_mib": self.lend_mib,
+            "threshold_s": self.threshold_s,
+            "is_lent": self.is_lent,
+            "lend_events": self.lend_events,
+            "reclaim_events": self.reclaim_events,
+            "refused_min_hold": self.refused_min_hold,
+            "lend": _summary(self.lend_ms),
+            "reclaim": _summary(self.reclaim_ms),
+        }
 
 
 class _LaneTreeCacheStub:
@@ -1100,30 +1481,33 @@ def build_dual_group_lanes(scheduler) -> List[DualGroupLane]:
 
     lane_args = _lane_server_args_view(server_args)
     lane_id = 0
+    concurrent = bool(getattr(server_args, "dual_group_lane_concurrent", False))
     logger.info(
         "dual-group lane %d bring-up (rank-local): %s", lane_id, plan.describe()
     )
-    # The whole bring-up runs under the lane's server-args view published as
-    # the process config: helpers like check_cuda_graph_backend read the
-    # GLOBAL args, not runner.server_args, and must see the lane's graph
-    # plan (measured: the lane otherwise captures/skips by the serving
-    # group's plan). Serial with everything else on this rank -- the
-    # scheduler is still initializing. Restored in `finally`.
-    from sglang.srt.runtime_context import get_context
+    # The whole bring-up runs under the lane scope: helpers like
+    # check_cuda_graph_backend read the ACTIVE args, not runner.server_args,
+    # and must see the lane's graph plan (measured: the lane otherwise
+    # captures/skips by the serving group's plan). Slice B swapped the
+    # process slot here; slice C installs the context overlay instead, so
+    # the bring-up is safe even though the other ranks are already
+    # event-loop-ready.
+    #
+    # The scope carries the same lane IDENTITY the lane will forward under,
+    # so the graph capture lands in the pool the replay will use --
+    # concurrent lanes capture into their own pool, serial lanes keep
+    # sharing the serving group's exactly as in slice B.
+    from sglang.srt.runtime_context import lane_scope
 
-    ctx = get_context()
-    saved_args = ctx._server_args
-    ctx.set_server_args(lane_args)
-    try:
+    scope_lane_id = lane_id if concurrent else None
+    with lane_scope(scope_lane_id, lane_args):
         return _build_lane_under_scope(
-            scheduler, server_args, lane_args, plan, lane_id, host_runner
+            scheduler, server_args, lane_args, plan, lane_id, host_runner, concurrent
         )
-    finally:
-        ctx.set_server_args(saved_args)
 
 
 def _build_lane_under_scope(
-    scheduler, server_args, lane_args, plan, lane_id, host_runner
+    scheduler, server_args, lane_args, plan, lane_id, host_runner, concurrent=False
 ) -> List[DualGroupLane]:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -1162,13 +1546,28 @@ def _build_lane_under_scope(
         # it); captures are skipped when the lane view disables them.
         runner.init_cuda_graphs()
 
-    lane = DualGroupLane(lane_id=lane_id, plan=plan, runner=runner)
+    lane = DualGroupLane(
+        lane_id=lane_id, plan=plan, runner=runner, concurrent=concurrent
+    )
+    lend_mib = int(getattr(server_args, "dual_group_lane_lend_mib", 0) or 0)
+    if lend_mib > 0:
+        lane.lending = LaneLending(
+            lane,
+            lend_mib=lend_mib,
+            threshold_s=float(
+                getattr(server_args, "dual_group_lane_lend_threshold_s", 5.0)
+            ),
+        )
+    if concurrent:
+        lane.start_worker()
     logger.info(
         "dual-group lane %d ready: max_total_num_tokens=%d, "
-        "max_running_requests=%d, graphs=%s.",
+        "max_running_requests=%d, graphs=%s, mode=%s, lend=%d MiB.",
         lane_id,
         runner.max_total_num_tokens,
         runner.max_running_requests,
         "eager" if server_args.dual_group_lane_eager else "captured",
+        "concurrent" if concurrent else "serial",
+        lend_mib,
     )
     return [lane]
