@@ -717,6 +717,11 @@ phases (syncs, remote boots). Rules from now on:
 - **Legacy compatibility**: an existing rig-wide `/tmp/gpu-owner.lock` means
   ALL cards are taken; new-style users must honor it. Prefer per-card locks
   for all new work.
+- **Host-side processes are invisible to the container's compute-apps
+  query** (PID namespace) — a PVE-host boot shows up ONLY as
+  `memory.used > 0` on the card. Card-is-free checks therefore go by
+  `nvidia-smi --query-gpu=index,memory.used` (expect ~0-10 MiB), never by an
+  empty compute-apps list alone.
 
 - `--mem-fraction-static` is a fraction of the GPU memory that is FREE at
   boot, not of the total: the code computes a slack of
