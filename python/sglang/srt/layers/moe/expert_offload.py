@@ -294,6 +294,59 @@ def scratch_slot_count(resident_count: int) -> int:
     return max(8, resident_count // 4)
 
 
+# --- #268: quant-path fail-fast for the expert-offload installer -----------
+# GGUF-MoE (GGUFMoEMethod / GGUFMoEAscendMethod) and MoeWNA16 (MoeWNA16Method)
+# have no load-time offload half: unlike fp8 / GPTQ-Marlin / AWQ-Marlin, their
+# per-expert tensors either aren't materialized yet at install time
+# (GGUFUninitializedParameter only takes real shape in the loader postprocess
+# step, #123) or use a quant layout the offload cache's tensor-slicing/LRU
+# fetch was never validated against. Installing the cache on one of these
+# quant methods anyway would run EXPERT_TENSOR_ATTRS slicing over a parameter
+# that is either not a real tensor yet (crash) or real but semantically
+# unsupported (silently wrong per-expert weights, not a crash) -- undefined
+# behavior either way, so this must hard-abort before install(), not fall
+# back to the try/except's silent per-layer degrade.
+_OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES = (
+    "GGUFMoEMethod",
+    "GGUFMoEAscendMethod",
+    "MoeWNA16Method",
+)
+
+
+def assert_expert_offload_quant_supported(quant_method, layer_id=None) -> None:
+    """Fail-fast guard (#268) for the MoE expert-offload installer.
+
+    Call this BEFORE constructing a ``MoEExpertOffloadCache`` for a layer.
+    Raises ``RuntimeError`` if ``quant_method`` belongs to a quant path that
+    has no load-time offload half (GGUF-MoE, MoeWNA16). No-op for every
+    supported quant method (fp8, GPTQ-Marlin, AWQ-Marlin, unquantized) --
+    those are matched by NOT being in the unsupported set, so a new supported
+    quant method never needs to be added here.
+
+    Matched by class name (not isinstance) to avoid importing
+    ``sglang.srt.layers.quantization.gguf`` / ``.moe_wna16`` from this module
+    at call sites that must stay import-light (this file is imported from the
+    hot FusedMoE construction path).
+    """
+    name = type(quant_method).__name__
+    if name in _OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES:
+        layer_tag = f" (layer_id={layer_id})" if layer_id is not None else ""
+        raise RuntimeError(
+            f"MoE expert-offload (SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0) "
+            f"is not supported for quant method {name!r}{layer_tag}. "
+            "GGUF-MoE and MoeWNA16 have no load-time offload half: "
+            "GGUFUninitializedParameter only materializes a real tensor in "
+            "the loader postprocess step (#123), and MoeWNA16's per-expert "
+            "tensor layout was never validated against the offload cache's "
+            "slice/fetch path -- installing the cache here would either crash "
+            "on an uninitialized parameter or silently run with undefined "
+            "per-expert weight contents. Supported quant paths for "
+            "--moe-resident-expert-fraction < 1.0: fp8, GPTQ (Marlin), AWQ "
+            "(Marlin). Leave --moe-resident-expert-fraction at 1.0 (or unset) "
+            "for this checkpoint's quant type, or use a supported quant path."
+        )
+
+
 # ===========================================================================
 # Stage-3: CUDA-graph-capturable routing math (host-sync-free).
 #
