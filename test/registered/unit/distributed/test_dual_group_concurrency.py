@@ -332,6 +332,127 @@ class TestCaptureModeIsolation(unittest.TestCase):
         self.assertFalse(out["forward"])
 
 
+class TestForwardContextIsolation(unittest.TestCase):
+    """The bug the first concurrent boot found, as a falsifier.
+
+    ``get_attn_backend()`` resolves through a per-forward context that was a
+    plain module global, with a docstring saying exactly what would happen
+    if worker threads ever shared a process. They now do. The measured
+    failure: the lane published its GDN backend, and the serving group's
+    draft extend -- forwarding on the scheduler thread at that same moment --
+    read it, so a full-attention call landed in ``GDNAttnBackend.forward_
+    extend`` and asserted on a positional mismatch (``mixed_qkv``). The whole
+    server died on rank 0 and took the group with it via gloo.
+    """
+
+    def tearDown(self):
+        from sglang.srt.model_executor.forward_context import set_forward_context
+
+        set_forward_context(None)
+
+    def test_two_threads_see_their_own_attention_backend(self):
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+            get_attn_backend,
+        )
+
+        serving_backend = object()
+        lane_backend = object()
+        rv = _Rendezvous()
+
+        def lane_thread(barrier):
+            with forward_context(ForwardContext(attn_backend=lane_backend)):
+                barrier.wait()
+                barrier.wait()
+                return get_attn_backend()
+
+        def serving_thread(barrier):
+            with forward_context(ForwardContext(attn_backend=serving_backend)):
+                barrier.wait()
+                seen = get_attn_backend()
+                barrier.wait()
+                return seen
+
+        out = rv.run({"lane": lane_thread, "serving": serving_thread})
+        self.assertIs(out["lane"], lane_backend)
+        self.assertIs(out["serving"], serving_backend)
+
+    def test_a_fresh_thread_has_no_forward_context(self):
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+            has_forward_context,
+        )
+
+        seen = {}
+
+        def body():
+            seen["has"] = has_forward_context()
+
+        with forward_context(ForwardContext(attn_backend=object())):
+            t = threading.Thread(target=body)
+            t.start()
+            t.join()
+        # Not inherited: a lane thread must publish its own, and reading an
+        # unpublished context asserts instead of silently using the other
+        # lane's backend.
+        self.assertFalse(seen["has"])
+
+    def test_graph_window_flags_do_not_leak_across_threads(self):
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (  # noqa: E501
+            enable_breakable_cuda_graph,
+            is_in_breakable_cuda_graph,
+        )
+
+        rv = _Rendezvous()
+
+        def in_graph(barrier):
+            with enable_breakable_cuda_graph():
+                barrier.wait()
+                barrier.wait()
+                return is_in_breakable_cuda_graph()
+
+        def outside(barrier):
+            barrier.wait()
+            seen = is_in_breakable_cuda_graph()
+            barrier.wait()
+            return seen
+
+        out = rv.run({"in": in_graph, "out": outside})
+        self.assertTrue(out["in"])
+        # get_is_capture_mode() reads this flag, so a leak makes the serving
+        # group take capture-time branches during a lane graph window.
+        self.assertFalse(out["out"])
+
+    def test_dcp_guard_toggle_does_not_leak_across_threads(self):
+        from sglang.srt.layers.dcp.collective_guard import (
+            guard_enabled,
+            set_guard_enabled,
+        )
+
+        rv = _Rendezvous()
+
+        def lane_replay(barrier):
+            set_guard_enabled(False)  # what a decode-graph replay does
+            barrier.wait()
+            barrier.wait()
+            return guard_enabled()
+
+        def serving_forward(barrier):
+            barrier.wait()
+            seen = guard_enabled()
+            barrier.wait()
+            return seen
+
+        out = rv.run({"lane": lane_replay, "serving": serving_forward})
+        self.assertFalse(out["lane"])
+        # If this leaked, rank 0 would skip a handshake the other ranks still
+        # perform -- the rank-divergence hang the guard exists to catch,
+        # caused by the guard.
+        self.assertTrue(out["serving"])
+
+
 class TestSpeedDial(unittest.TestCase):
     """Speed through sacrifice as one explicit regulator."""
 

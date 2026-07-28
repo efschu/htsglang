@@ -40,6 +40,7 @@ guard is enabled, so every other code path stays byte-identical.
 
 from __future__ import annotations
 
+import contextvars
 import datetime
 import zlib
 from typing import Optional
@@ -50,8 +51,15 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 # Per-forward monotonic step counter and a rolling running signature. Reset at
 # the start of every guarded forward by ``dcp_forward_guard``.
-_STEP: int = 0
-_ENABLED: bool = True
+# CONTEXT-LOCAL (#274 slice C): both are per-forward state of the thread that
+# is forwarding. With the multi-group runtime's concurrent lane, a lane decode
+# replay toggling the guard off/on mid-way through the serving group's guarded
+# forward would make rank 0 skip a handshake the other ranks still perform --
+# the rank-divergence hang this guard exists to catch, caused by the guard.
+_STEP: contextvars.ContextVar[int] = contextvars.ContextVar("dcp_guard.step", default=0)
+_ENABLED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "dcp_guard.enabled", default=True
+)
 # Timeout for the end-of-forward monitored barrier. Generous vs a decode step
 # (~10s ms) yet finite, so a genuine divergence surfaces in seconds not never.
 _BARRIER_TIMEOUT = datetime.timedelta(seconds=30)
@@ -65,12 +73,11 @@ def set_guard_enabled(enabled: bool) -> None:
     """Enable/disable the anti-hang guard for this process. The forward/graph
     integration disables it inside captured CUDA-graph regions (where a gloo
     collective is not capturable and the sequence is already fixed)."""
-    global _ENABLED
-    _ENABLED = enabled
+    _ENABLED.set(enabled)
 
 
 def guard_enabled() -> bool:
-    return _ENABLED
+    return _ENABLED.get()
 
 
 def _op_signature(op_tag: str, step: int) -> int:
@@ -80,8 +87,7 @@ def _op_signature(op_tag: str, step: int) -> int:
 
 
 def reset_forward_guard() -> None:
-    global _STEP
-    _STEP = 0
+    _STEP.set(0)
 
 
 def guard_dcp_step(op_tag: str, cp_group: GroupCoordinator) -> None:
@@ -91,9 +97,8 @@ def guard_dcp_step(op_tag: str, cp_group: GroupCoordinator) -> None:
 
     No-op when the guard is disabled or the group is size 1 (nothing to
     diverge)."""
-    global _STEP
-    if not _ENABLED or cp_group.world_size <= 1:
-        _STEP += 1
+    if not _ENABLED.get() or cp_group.world_size <= 1:
+        _STEP.set(_STEP.get() + 1)
         return
     # PRESENCE check first, with a BOUNDED timeout. A COUNT divergence (a rank
     # issues fewer DCP collectives and leaves the forward early) would otherwise
@@ -110,12 +115,12 @@ def guard_dcp_step(op_tag: str, cp_group: GroupCoordinator) -> None:
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(
             "weightless-KV anti-hang guard: DCP collective COUNT divergence at "
-            f"step {_STEP} on rank {cp_group.rank_in_group} (op {op_tag!r}). A "
+            f"step {_STEP.get()} on rank {cp_group.rank_in_group} (op {op_tag!r}). A "
             "rank issued a different NUMBER of DCP collectives (one side reached "
             "this step, another did not) -- this would otherwise be a silent "
             f"NCCL hang. Underlying: {e}"
         ) from e
-    sig = _op_signature(op_tag, _STEP)
+    sig = _op_signature(op_tag, _STEP.get())
     local = torch.tensor([sig], dtype=torch.int64)
     gathered = [torch.empty_like(local) for _ in range(cp_group.world_size)]
     # Fixed shape [1] on every rank (and presence already confirmed above) ->
@@ -127,13 +132,13 @@ def guard_dcp_step(op_tag: str, cp_group: GroupCoordinator) -> None:
         rank = cp_group.rank_in_group
         raise RuntimeError(
             "weightless-KV anti-hang guard: DCP collective-sequence DIVERGENCE "
-            f"at step {_STEP} on rank {rank} (op {op_tag!r}, sig {sig}). "
+            f"at step {_STEP.get()} on rank {rank} (op {op_tag!r}, sig {sig}). "
             f"Per-rank signatures: {vals}. The head rank and the weightless KV "
             "workers issued a different DCP collective order/type at this step "
             "-- this would otherwise be a silent NCCL hang. Fix the forward so "
             "every rank issues the identical DCP-collective sequence."
         )
-    _STEP += 1
+    _STEP.set(_STEP.get() + 1)
 
 
 class dcp_forward_guard:
@@ -159,7 +164,7 @@ class dcp_forward_guard:
         if exc_type is not None:
             return False
         cp = self.cp_group
-        if not _ENABLED or cp is None or cp.world_size <= 1:
+        if not _ENABLED.get() or cp is None or cp.world_size <= 1:
             return False
         try:
             torch.distributed.monitored_barrier(
@@ -174,14 +179,14 @@ class dcp_forward_guard:
                 f"workers). Underlying: {e}"
             ) from e
         # Reconcile the final step count too (cheap, catches any residual skew).
-        local = torch.tensor([_STEP], dtype=torch.int64)
+        local = torch.tensor([_STEP.get()], dtype=torch.int64)
         gathered = [torch.empty_like(local) for _ in range(cp.world_size)]
         torch.distributed.all_gather(gathered, local, group=cp.cpu_group)
         counts = [int(t.item()) for t in gathered]
-        if any(c != _STEP for c in counts):
+        if any(c != _STEP.get() for c in counts):
             raise RuntimeError(
                 "weightless-KV anti-hang guard: DCP step-count MISMATCH across "
-                f"ranks {counts} (this rank {cp.rank_in_group} = {_STEP}). The "
+                f"ranks {counts} (this rank {cp.rank_in_group} = {_STEP.get()}). The "
                 "head rank and the weightless KV workers issued a different "
                 "number of DCP collectives this forward."
             )
